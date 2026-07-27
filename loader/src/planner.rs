@@ -133,15 +133,13 @@ impl StorageCompiler<'_> {
             self.values.insert(expr_id, value);
         }
         assign_persistent_offsets(&mut self.program)?;
-        // `BulkExtentWrite` / `SlabScatter` address a single contiguous device
-        // arena. Backends without one must keep plain per-buffer
-        // `ExtentWrite`s — they have no arena base to resolve an
-        // arena-relative destination against.
-        if self.program.target.backend.uses_persistent_arena() {
-            coalesce_persistent_arena_writes(&mut self.program)?;
-            hoist_bulk_extent_writes(&mut self.program)?;
-            build_slab_scatter_writes(&mut self.program)?;
-        }
+        // `BulkExtentWrite` / `SlabScatter` address the single contiguous device
+        // arena every backend loads into. There was a guard here for a backend
+        // that had no arena and needed plain per-buffer `ExtentWrite`s; no such
+        // backend was ever written, and the guard admitted all three.
+        coalesce_persistent_arena_writes(&mut self.program)?;
+        hoist_bulk_extent_writes(&mut self.program)?;
+        build_slab_scatter_writes(&mut self.program)?;
         merge_adjacent_extent_writes(&mut self.program)?;
         recompute_memory_plan(&mut self.program)?;
         validate_target_support(&self.program)?;
@@ -464,6 +462,14 @@ impl StorageCompiler<'_> {
                 None
             }
         };
+        let transform = self.with_block_scale_source(
+            TransformSpec {
+                from: None,
+                to: Some(scheme),
+                ..TransformSpec::default()
+            },
+            source.as_ref(),
+        );
         let mut outputs = Vec::with_capacity(metadata_outputs.len() + 1);
         outputs.push(out);
         for metadata in metadata_outputs {
@@ -475,11 +481,7 @@ impl StorageCompiler<'_> {
             None,
             inputs,
             outputs.clone(),
-            TransformSpec {
-                from: None,
-                to: Some(scheme),
-                ..TransformSpec::default()
-            },
+            transform,
         );
         for (decl, buffer) in metadata_outputs.iter().zip(outputs.iter().skip(1)) {
             if !self.finalized_names.insert(decl.name.clone()) {
@@ -516,6 +518,7 @@ impl StorageCompiler<'_> {
                 None
             }
         };
+        let transform = self.with_block_scale_source(transform, source.as_ref());
         for meta in metadata {
             inputs.push(self.ensure_buffer(*meta)?);
         }
@@ -645,6 +648,31 @@ impl StorageCompiler<'_> {
         });
         self.program.schedule.push(instr);
         Ok(())
+    }
+
+    /// The checkpoint tensor holding `source`'s block scales, if it has any.
+    ///
+    /// Block-scaled FP8 (DeepSeek-V3 and its descendants) ships the factors in a
+    /// sibling tensor whose name is the payload's plus `_scale_inv`. The naming
+    /// convention is the checkpoint's, so it is read off the tensor table here
+    /// rather than reconstructed by whoever consumes the instruction.
+    fn block_scale_source(&self, source: &SourceExtent) -> Option<TensorId> {
+        let raw = self.metadata.tensor(source.tensor_id)?;
+        if !matches!(raw.encoding, Encoding::Raw(DType::F8E4M3)) {
+            return None;
+        }
+        self.metadata
+            .tensor_by_name(&format!("{}_scale_inv", raw.name))
+            .map(|scale| scale.id)
+    }
+
+    fn with_block_scale_source(
+        &self,
+        mut transform: TransformSpec,
+        source: Option<&SourceExtent>,
+    ) -> TransformSpec {
+        transform.metadata_source = source.and_then(|source| self.block_scale_source(source));
+        transform
     }
 
     fn source_extent(&self, source: &SourceView) -> Result<SourceExtent, CompileError> {

@@ -16,7 +16,7 @@
 
 #include "mtl4_context.hpp"
 #include "observability.hpp"
-#include "pie_driver/elastic.hpp"
+#include "elastic.hpp"
 
 #include <chrono>
 #include <cstdio>

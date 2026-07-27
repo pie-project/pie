@@ -18,9 +18,8 @@ constexpr static const int32_t PIE_LOADER_NO_AXIS = -1;
 /// defaults on `PieLoaderStorageInstrView::buffer_id` and `slab_file_id`.
 constexpr static const uint32_t PIE_LOADER_NO_BUFFER = UINT32_MAX;
 
-/// The LOW IR version. A driver that reads a plan with a different version is
-/// reading a layout it was not compiled against.
-constexpr static const uint32_t PIE_LOADER_PLAN_VERSION = 5;
+/// Sentinel for "no source tensor", on the optional tensor-id fields.
+constexpr static const uint32_t PIE_LOADER_NO_TENSOR = UINT32_MAX;
 
 constexpr static const uint32_t PIE_LOADER_TILE_MAP_CAST = (1 << 0);
 
@@ -220,15 +219,15 @@ struct PieLoaderCheckpointFileView {
   PieLoaderCheckpointFormat format;
 };
 
-struct PieLoaderCheckpointFileSlice {
-  const PieLoaderCheckpointFileView *ptr;
+template<typename T>
+struct PieLoaderSlice {
+  const T *ptr;
   size_t len;
 };
 
-struct PieLoaderI64Slice {
-  const int64_t *ptr;
-  size_t len;
-};
+using PieLoaderCheckpointFileSlice = PieLoaderSlice<PieLoaderCheckpointFileView>;
+
+using PieLoaderI64Slice = PieLoaderSlice<int64_t>;
 
 /// An optional [`PieLoaderDType`], as a signed integer so that `-1` is "unset".
 ///
@@ -295,9 +294,6 @@ struct PieLoaderCheckpoint {
   PieLoaderCheckpointFileSlice files;
   /// Every tensor in every file, in the order the reader found them.
   PieLoaderRawTensorSlice tensors;
-  /// The directory this was opened from, echoed back so a driver need not
-  /// carry it alongside the handle.
-  PieLoaderBytes snapshot_dir;
   void *owner;
 };
 
@@ -342,7 +338,6 @@ struct PieLoaderTargetSpec {
   uint64_t max_tile_bytes;
   uint32_t preferred_alignment;
   uint32_t tile_map_mask;
-  bool fp8_native;
   bool native_mxfp4_moe;
   /// Which fused transform chains this build has kernels for
   /// (`PIE_LOADER_FUSION_*`).
@@ -367,10 +362,7 @@ struct PieLoaderTargetSpec {
   uint32_t block_scale_rows;
 };
 
-struct PieLoaderU32Slice {
-  const uint32_t *ptr;
-  size_t len;
-};
+using PieLoaderU32Slice = PieLoaderSlice<uint32_t>;
 
 /// [`crate::types::RepackSpec`], flattened. All eleven fields, because a repack
 /// is opaque to the type checker and therefore has to state everything.
@@ -430,10 +422,7 @@ struct PieLoaderExprNode {
   PieLoaderQuantSpecView quant;
 };
 
-struct PieLoaderExprNodeSlice {
-  const PieLoaderExprNode *ptr;
-  size_t len;
-};
+using PieLoaderExprNodeSlice = PieLoaderSlice<PieLoaderExprNode>;
 
 /// One declared tensor: a name, the expression that produces it, and what the
 /// driver believes the result is.
@@ -455,10 +444,7 @@ struct PieLoaderTensorContractView {
   PieLoaderEncodingSpec encoding;
 };
 
-struct PieLoaderTensorContractSlice {
-  const PieLoaderTensorContractView *ptr;
-  size_t len;
-};
+using PieLoaderTensorContractSlice = PieLoaderSlice<PieLoaderTensorContractView>;
 
 /// Everything one driver rank declares.
 struct PieLoaderModelContractView {
@@ -509,10 +495,7 @@ struct PieLoaderSourceTensorView {
   PieLoaderI64Slice shape;
 };
 
-struct PieLoaderSourceTensorSlice {
-  const PieLoaderSourceTensorView *ptr;
-  size_t len;
-};
+using PieLoaderSourceTensorSlice = PieLoaderSlice<PieLoaderSourceTensorView>;
 
 struct PieLoaderTensorDeclView {
   uint32_t id;
@@ -526,10 +509,7 @@ struct PieLoaderTensorDeclView {
   uint32_t alignment;
 };
 
-struct PieLoaderTensorDeclSlice {
-  const PieLoaderTensorDeclView *ptr;
-  size_t len;
-};
+using PieLoaderTensorDeclSlice = PieLoaderSlice<PieLoaderTensorDeclView>;
 
 struct PieLoaderBufferDeclView {
   uint32_t id;
@@ -542,10 +522,7 @@ struct PieLoaderBufferDeclView {
   uint64_t persistent_offset;
 };
 
-struct PieLoaderBufferDeclSlice {
-  const PieLoaderBufferDeclView *ptr;
-  size_t len;
-};
+using PieLoaderBufferDeclSlice = PieLoaderSlice<PieLoaderBufferDeclView>;
 
 struct PieLoaderDimSpecView {
   int64_t count;
@@ -553,10 +530,7 @@ struct PieLoaderDimSpecView {
   int64_t dst_stride;
 };
 
-struct PieLoaderDimSpecSlice {
-  const PieLoaderDimSpecView *ptr;
-  size_t len;
-};
+using PieLoaderDimSpecSlice = PieLoaderSlice<PieLoaderDimSpecView>;
 
 struct PieLoaderStridedExtentView {
   uint64_t base_offset;
@@ -584,10 +558,7 @@ struct PieLoaderSlabPlacementView {
   uint64_t bytes;
 };
 
-struct PieLoaderSlabPlacementSlice {
-  const PieLoaderSlabPlacementView *ptr;
-  size_t len;
-};
+using PieLoaderSlabPlacementSlice = PieLoaderSlice<PieLoaderSlabPlacementView>;
 
 /// The flattened instruction. Rust's `StorageInstr` is a sum type whose variants
 /// carry disjoint payloads; C has no such thing, so this is the union of all
@@ -630,6 +601,14 @@ struct PieLoaderStorageInstrView {
   uint32_t transform_source_cols;
   uint32_t transform_target_cols;
   uint64_t transform_scratch_bytes;
+  /// Source tensor holding this transform's input block scales, or
+  /// [`PIE_LOADER_NO_TENSOR`].
+  ///
+  /// Index into `PieLoaderPlan::sources`, the same space `source.tensor_id`
+  /// uses, so the executor reaches the scales' name and shape the way it
+  /// reaches the payload's — instead of appending `_scale_inv` to a name and
+  /// hoping the checkpoint agrees.
+  uint32_t transform_metadata_source;
   PieLoaderBytes name;
   uint32_t slab_file_id;
   uint64_t slab_file_offset;
@@ -637,10 +616,7 @@ struct PieLoaderStorageInstrView {
   PieLoaderSlabPlacementSlice slab_placements;
 };
 
-struct PieLoaderStorageInstrSlice {
-  const PieLoaderStorageInstrView *ptr;
-  size_t len;
-};
+using PieLoaderStorageInstrSlice = PieLoaderSlice<PieLoaderStorageInstrView>;
 
 struct PieLoaderMemoryPlanView {
   uint64_t persistent_bytes;
@@ -648,22 +624,6 @@ struct PieLoaderMemoryPlanView {
   uint64_t transform_scratch_peak_bytes;
   uint64_t checkpoint_read_bytes;
   uint64_t device_write_bytes;
-};
-
-struct PieLoaderOptimizerPassStatsView {
-  PieLoaderBytes name;
-  uint64_t exprs_before;
-  uint64_t exprs_after;
-  uint64_t rewrites;
-};
-
-struct PieLoaderOptimizerPassStatsSlice {
-  const PieLoaderOptimizerPassStatsView *ptr;
-  size_t len;
-};
-
-struct PieLoaderOptimizerReportView {
-  PieLoaderOptimizerPassStatsSlice passes;
 };
 
 /// The target the plan was compiled against. The driver reads it back to assert
@@ -699,24 +659,7 @@ struct PieLoaderQuantAttachmentView {
   PieLoaderScaleForm scale_form;
 };
 
-struct PieLoaderQuantAttachmentSlice {
-  const PieLoaderQuantAttachmentView *ptr;
-  size_t len;
-};
-
-/// How much of the caller's declared contract the plan delivers.
-///
-/// `covered < demanded` means the loader did not build something the driver said
-/// it would bind. An absent *optional* demand is dropped from both counts rather
-/// than only from `covered`, so a tied-embedding checkpoint that legitimately
-/// has no `lm_head.weight` still reports full coverage.
-///
-/// A driver that declared nothing gets `0 / 0`, which passes — the declaration
-/// is opt-in per model family, not a flag day.
-struct PieLoaderContractCoverageView {
-  size_t covered;
-  size_t demanded;
-};
+using PieLoaderQuantAttachmentSlice = PieLoaderSlice<PieLoaderQuantAttachmentView>;
 
 /// The compiled plan, as the driver sees it.
 ///
@@ -731,7 +674,6 @@ struct PieLoaderContractCoverageView {
 /// `owner` is the opaque handle to the arena keeping every slice above alive. It
 /// is consumed by `pie_loader_release`; the driver must not dereference it.
 struct PieLoaderPlan {
-  uint32_t version;
   PieLoaderCheckpointFileSlice files;
   PieLoaderSourceTensorSlice sources;
   PieLoaderTensorDeclSlice tensors;
@@ -739,12 +681,9 @@ struct PieLoaderPlan {
   PieLoaderStorageInstrSlice instrs;
   PieLoaderU32Slice schedule;
   PieLoaderMemoryPlanView memory;
-  PieLoaderOptimizerReportView optimizer;
   uint64_t compiler_version;
   PieLoaderTargetView target;
   PieLoaderQuantAttachmentSlice attachments;
-  /// Measured against `PieLoaderRequest::demands` at compile time.
-  PieLoaderContractCoverageView coverage;
   /// The name of the materialized weights this plan produces, as 16 hex
   /// digits. Stable for as long as nothing that decides the bytes changes, so
   /// a driver can use it to key an artifact cache.

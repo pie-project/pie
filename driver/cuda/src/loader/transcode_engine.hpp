@@ -379,7 +379,8 @@ private:
     };
 
     // Resolve the per-group FP8 block scale for an Encode-source tile: loads/
-    // caches `<weight>_scale_inv`, slices the rank-local block for TP shards,
+    // caches the scale tensor the instruction names, slices the rank-local
+    // block for TP shards,
     // and offsets to the tile's first scale row. Shared by the BF16 dequant and
     // the fused FP8->MXFP4 paths so both see identical scale data.
     Fp8TileScale fp8_tile_scale(
@@ -399,18 +400,22 @@ private:
         const auto& weight_info = plan_index_.source(instr.source.tensor_id);
         const std::string weight_name =
             pie_loader::bytes_to_string(weight_info.name);
-        const std::string scale_name = weight_name + "_scale_inv";
-        const auto* scale_info = plan_index_.find_source(scale_name);
-        if (scale_info == nullptr) {
+        // Which tensor holds the block scales is the checkpoint's naming
+        // convention, and the loader read the tensor table. It says so on the
+        // instruction rather than leaving this to rebuild the name and hope.
+        if (instr.transform_metadata_source == pie_loader::PIE_LOADER_NO_TENSOR) {
             throw std::runtime_error(
                 "rust storage executor: FP8 Encode source '" + weight_name +
-                "' has no '_scale_inv' sibling tensor");
+                "' has no block-scale tensor on its instruction");
         }
+        const auto& scale_info =
+            plan_index_.source(instr.transform_metadata_source);
         const auto scale_shape =
-            pie_loader::i64_slice_to_vector(scale_info->shape);
+            pie_loader::i64_slice_to_vector(scale_info.shape);
         if (scale_shape.size() != 2) {
             throw std::runtime_error(
-                "rust storage executor: FP8 Encode scale '" + scale_name +
+                "rust storage executor: FP8 Encode scale '" +
+                pie_loader::bytes_to_string(scale_info.name) +
                 "' must be 2-D (block-scaled FP8)");
         }
         // Get the FULL (un-sharded) weight shape from the checkpoint so we
@@ -451,7 +456,8 @@ private:
         const std::uint64_t rank_row_off_full = base_byte / true_cols;
         const std::uint64_t rank_col_off_full = base_byte % true_cols;
 
-        if (dtype_from_rust(scale_info->dtype) != DType::FP32) {
+        const std::string scale_name = pie_loader::bytes_to_string(scale_info.name);
+        if (dtype_from_rust(scale_info.dtype) != DType::FP32) {
             throw std::runtime_error(
                 "rust storage executor: FP8 Encode scale '" + scale_name +
                 "' must be FP32");
@@ -461,7 +467,7 @@ private:
         const std::size_t scale_nbytes =
             static_cast<std::size_t>(scale_rows) * scale_cols * sizeof(float);
         ensure_fp8_scale_loaded(
-            scale_name, *scale_info, scale_nbytes, *scale_info);
+            scale_name, scale_info, scale_nbytes, scale_info);
         const auto& cached_scale = fp8_scale_cache_[scale_name];
         const float* scale_full_ptr =
             static_cast<const float*>(cached_scale.data);

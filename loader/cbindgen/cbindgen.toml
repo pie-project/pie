@@ -24,7 +24,6 @@ parse_deps = false
 # means a *wanted* constant must never share a name across backend modules,
 # because cbindgen would silently emit whichever it saw first.
 exclude = [
-  "LOAD_PLAN_VERSION",
   "TILE_MAP_CAST",
   "TILE_MAP_DECODE",
   "TILE_MAP_ENCODE",

@@ -1,6 +1,6 @@
 //! Reference lowering.
 //!
-//! The host executor (`crate::host`) is a correctness oracle, not a
+//! The host executor (`crate::host_executor`) is a correctness oracle, not a
 //! production path (§10.3): it exists so a plan can be run without a GPU and
 //! compared against `crate::reference`. Its virtue is that it does the most
 //! obvious thing, so it deliberately declines every optimization — no fusion,

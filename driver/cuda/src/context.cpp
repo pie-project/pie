@@ -738,8 +738,8 @@ int Context::Impl::load_model(
         cfg,
         tp_comm_,
         runtime_quant,
-        static_cast<pie_driver::Mxfp4MoeRequest>(load.mxfp4_moe),
-        static_cast<pie_driver::Component>(load.component)));
+        static_cast<model::Mxfp4MoeRequest>(load.mxfp4_moe),
+        static_cast<model::Component>(load.component)));
     auto& engine = *engine_p;
     media_hidden_size_ = engine.hf_config().hidden_size;
 

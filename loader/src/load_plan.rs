@@ -8,9 +8,8 @@ use crate::types::{
 
 pub use crate::ffi::types::{
     PIE_LOADER_FUSION_FP8_TO_MXFP4 as FUSION_FP8_TO_MXFP4,
-    PIE_LOADER_PLAN_VERSION as LOAD_PLAN_VERSION, PIE_LOADER_TILE_MAP_CAST as TILE_MAP_CAST,
-    PIE_LOADER_TILE_MAP_DECODE as TILE_MAP_DECODE, PIE_LOADER_TILE_MAP_ENCODE as TILE_MAP_ENCODE,
-    PIE_LOADER_TILE_MAP_REBLOCK as TILE_MAP_REBLOCK,
+    PIE_LOADER_TILE_MAP_CAST as TILE_MAP_CAST, PIE_LOADER_TILE_MAP_DECODE as TILE_MAP_DECODE,
+    PIE_LOADER_TILE_MAP_ENCODE as TILE_MAP_ENCODE, PIE_LOADER_TILE_MAP_REBLOCK as TILE_MAP_REBLOCK,
     PIE_LOADER_TILE_MAP_REORDER as TILE_MAP_REORDER, PIE_LOADER_TILE_MAP_REPACK as TILE_MAP_REPACK,
     PIE_LOADER_TILE_MAP_TRANSCODE as TILE_MAP_TRANSCODE,
 };
@@ -369,6 +368,15 @@ pub struct TransformSpec {
     pub repack: RepackSpec,
     pub scratch_bytes: u64,
     pub fusion: TransformFusion,
+    /// The checkpoint tensor holding this transform's *input* block scales.
+    ///
+    /// A block-scaled FP8 source is two tensors on disk: the payload and a
+    /// sibling of per-group factors. Only the payload is named by the contract,
+    /// so the executor used to rebuild the sibling's name by appending
+    /// `_scale_inv` and look it up — the same guess-the-loader's-answer
+    /// anti-pattern `attachments` removed from the output side (§12 row 10).
+    /// The loader reads the tensor table, so the loader answers.
+    pub metadata_source: Option<TensorId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -423,7 +431,6 @@ pub enum StorageInstr {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoadPlan {
-    pub version: u32,
     pub compiler_version: u64,
     pub target: StorageTarget,
     pub optimizer: OptimizerReport,
@@ -441,7 +448,6 @@ pub struct LoadPlan {
 impl LoadPlan {
     pub fn empty(target: StorageTarget) -> Self {
         Self {
-            version: LOAD_PLAN_VERSION,
             compiler_version: compiler_version(),
             target,
             optimizer: OptimizerReport::default(),
@@ -454,97 +460,6 @@ impl LoadPlan {
             memory: MemoryPlan::default(),
             attachments: Vec::new(),
         }
-    }
-
-    pub fn summary(&self) -> LoadPlanSummary {
-        let mut s = LoadPlanSummary {
-            tensor_count: self.tensors.len(),
-            buffer_count: self.buffers.len(),
-            schedule_len: self.schedule.len(),
-            persistent_bytes: self.memory.persistent_bytes,
-            checkpoint_read_bytes: self.memory.checkpoint_read_bytes,
-            device_write_bytes: self.memory.device_write_bytes,
-            ..LoadPlanSummary::default()
-        };
-        for instr in &self.instrs {
-            match instr {
-                StorageInstr::Allocate { .. } => s.allocate_count += 1,
-                StorageInstr::ExtentWrite { source, .. } => {
-                    s.extent_write_count += 1;
-                    s.extent_write_bytes += source.span_bytes;
-                }
-                StorageInstr::BulkExtentWrite { source, .. } => {
-                    s.bulk_extent_write_count += 1;
-                    s.bulk_extent_write_bytes += source.span_bytes;
-                }
-                StorageInstr::SlabScatter {
-                    placements,
-                    span_bytes,
-                    ..
-                } => {
-                    s.slab_scatter_count += 1;
-                    s.slab_scatter_placement_count += placements.len();
-                    s.slab_scatter_span_bytes += span_bytes;
-                    s.slab_scatter_payload_bytes += placements.iter().map(|p| p.bytes).sum::<u64>();
-                }
-                StorageInstr::TileMap { .. } => s.tile_map_count += 1,
-                StorageInstr::CreateView { .. } => s.create_view_count += 1,
-                StorageInstr::Release { .. } => s.release_count += 1,
-                StorageInstr::Finalize { .. } => s.finalize_count += 1,
-            }
-        }
-        s
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct LoadPlanSummary {
-    pub tensor_count: usize,
-    pub buffer_count: usize,
-    pub schedule_len: usize,
-    pub persistent_bytes: u64,
-    pub checkpoint_read_bytes: u64,
-    pub device_write_bytes: u64,
-    pub allocate_count: usize,
-    pub extent_write_count: usize,
-    pub extent_write_bytes: u64,
-    pub bulk_extent_write_count: usize,
-    pub bulk_extent_write_bytes: u64,
-    pub slab_scatter_count: usize,
-    pub slab_scatter_placement_count: usize,
-    pub slab_scatter_span_bytes: u64,
-    pub slab_scatter_payload_bytes: u64,
-    pub tile_map_count: usize,
-    pub create_view_count: usize,
-    pub release_count: usize,
-    pub finalize_count: usize,
-}
-
-impl std::fmt::Display for LoadPlanSummary {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "tensors={} buffers={} schedule={} \
-             alloc={} extent_write={} bulk={} slab={} ({}placements, {:.1}MiB payload, {:.1}MiB span) \
-             tile_map={} view={} finalize={} \
-             persistent={:.1}MiB read={:.1}MiB write={:.1}MiB",
-            self.tensor_count,
-            self.buffer_count,
-            self.schedule_len,
-            self.allocate_count,
-            self.extent_write_count,
-            self.bulk_extent_write_count,
-            self.slab_scatter_count,
-            self.slab_scatter_placement_count,
-            self.slab_scatter_payload_bytes as f64 / (1024.0 * 1024.0),
-            self.slab_scatter_span_bytes as f64 / (1024.0 * 1024.0),
-            self.tile_map_count,
-            self.create_view_count,
-            self.finalize_count,
-            self.persistent_bytes as f64 / (1024.0 * 1024.0),
-            self.checkpoint_read_bytes as f64 / (1024.0 * 1024.0),
-            self.device_write_bytes as f64 / (1024.0 * 1024.0),
-        )
     }
 }
 

@@ -20,9 +20,8 @@ use crate::types::{BackendKind, DType, QuantScheme, RepackLayout, RowMap};
 /// defaults on `PieLoaderStorageInstrView::buffer_id` and `slab_file_id`.
 pub const PIE_LOADER_NO_BUFFER: u32 = u32::MAX;
 
-/// The LOW IR version. A driver that reads a plan with a different version is
-/// reading a layout it was not compiled against.
-pub const PIE_LOADER_PLAN_VERSION: u32 = 5;
+/// Sentinel for "no source tensor", on the optional tensor-id fields.
+pub const PIE_LOADER_NO_TENSOR: u32 = u32::MAX;
 
 // Tile-map capability bits. A driver ORs together the transforms its kernels
 // implement and passes the result as `PieLoaderTargetSpec::tile_map_mask`; the
@@ -442,78 +441,9 @@ impl Default for PieLoaderBytes {
     }
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct PieLoaderU32Slice {
-    pub ptr: *const u32,
-    pub len: usize,
-}
+pub type PieLoaderU32Slice = PieLoaderSlice<u32>;
 
-impl Default for PieLoaderU32Slice {
-    fn default() -> Self {
-        Self {
-            ptr: std::ptr::null(),
-            len: 0,
-        }
-    }
-}
-
-/// One tensor the driver promises to bind after the load.
-///
-/// This is the driver's half of the contract (§10.2.1). Today the loader's
-/// `arch/` passes decide *both* what the model needs and how to build it, so a
-/// pass that invents an output name the driver never binds — or computes a shape
-/// the driver disagrees with — is caught by nothing. Declaring the demand makes
-/// `pie_loader_verify` a real check rather than a self-comparison.
-///
-/// State only what you know. `shape.len == 0` means "do not check the shape",
-/// which is the honest answer for a tensor whose runtime layout the driver reads
-/// off the loaded tensor rather than predicting. The encoding is deliberately
-/// absent from this struct: it is the loader's choice under the runtime quant
-/// policy, and binders probe it afterwards.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct PieLoaderTensorDemand {
-    pub name: PieLoaderBytes,
-    /// The shape *this rank* expects, already divided by the TP size. Empty to
-    /// demand presence without a shape.
-    pub shape: PieLoaderI64Slice,
-    /// Absence is not a violation, e.g. `lm_head.weight` under
-    /// `tie_word_embeddings`.
-    pub optional: bool,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct PieLoaderTensorDemandSlice {
-    pub ptr: *const PieLoaderTensorDemand,
-    pub len: usize,
-}
-
-impl Default for PieLoaderTensorDemandSlice {
-    fn default() -> Self {
-        Self {
-            ptr: std::ptr::null(),
-            len: 0,
-        }
-    }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct PieLoaderI64Slice {
-    pub ptr: *const i64,
-    pub len: usize,
-}
-
-impl Default for PieLoaderI64Slice {
-    fn default() -> Self {
-        Self {
-            ptr: std::ptr::null(),
-            len: 0,
-        }
-    }
-}
+pub type PieLoaderI64Slice = PieLoaderSlice<i64>;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -525,12 +455,14 @@ pub struct PieLoaderDimSpecView {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
-pub struct PieLoaderDimSpecSlice {
-    pub ptr: *const PieLoaderDimSpecView,
+pub struct PieLoaderSlice<T> {
+    pub ptr: *const T,
     pub len: usize,
 }
 
-impl Default for PieLoaderDimSpecSlice {
+pub type PieLoaderDimSpecSlice = PieLoaderSlice<PieLoaderDimSpecView>;
+
+impl<T> Default for PieLoaderSlice<T> {
     fn default() -> Self {
         Self {
             ptr: std::ptr::null(),
@@ -579,21 +511,7 @@ pub struct PieLoaderTensorDeclView {
     pub alignment: u32,
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct PieLoaderTensorDeclSlice {
-    pub ptr: *const PieLoaderTensorDeclView,
-    pub len: usize,
-}
-
-impl Default for PieLoaderTensorDeclSlice {
-    fn default() -> Self {
-        Self {
-            ptr: std::ptr::null(),
-            len: 0,
-        }
-    }
-}
+pub type PieLoaderTensorDeclSlice = PieLoaderSlice<PieLoaderTensorDeclView>;
 
 /// How a scale tensor's entries map onto the tensor they scale.
 #[repr(u32)]
@@ -635,37 +553,7 @@ pub struct PieLoaderQuantAttachmentView {
     pub scale_form: PieLoaderScaleForm,
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct PieLoaderQuantAttachmentSlice {
-    pub ptr: *const PieLoaderQuantAttachmentView,
-    pub len: usize,
-}
-
-impl Default for PieLoaderQuantAttachmentSlice {
-    fn default() -> Self {
-        Self {
-            ptr: std::ptr::null(),
-            len: 0,
-        }
-    }
-}
-
-/// How much of the caller's declared contract the plan delivers.
-///
-/// `covered < demanded` means the loader did not build something the driver said
-/// it would bind. An absent *optional* demand is dropped from both counts rather
-/// than only from `covered`, so a tied-embedding checkpoint that legitimately
-/// has no `lm_head.weight` still reports full coverage.
-///
-/// A driver that declared nothing gets `0 / 0`, which passes — the declaration
-/// is opt-in per model family, not a flag day.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct PieLoaderContractCoverageView {
-    pub covered: usize,
-    pub demanded: usize,
-}
+pub type PieLoaderQuantAttachmentSlice = PieLoaderSlice<PieLoaderQuantAttachmentView>;
 
 /// Which on-disk format a checkpoint file uses.
 #[repr(u32)]
@@ -698,21 +586,7 @@ pub struct PieLoaderCheckpointFileView {
     pub format: PieLoaderCheckpointFormat,
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct PieLoaderCheckpointFileSlice {
-    pub ptr: *const PieLoaderCheckpointFileView,
-    pub len: usize,
-}
-
-impl Default for PieLoaderCheckpointFileSlice {
-    fn default() -> Self {
-        Self {
-            ptr: std::ptr::null(),
-            len: 0,
-        }
-    }
-}
+pub type PieLoaderCheckpointFileSlice = PieLoaderSlice<PieLoaderCheckpointFileView>;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -730,21 +604,7 @@ pub struct PieLoaderSourceTensorView {
     pub shape: PieLoaderI64Slice,
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct PieLoaderSourceTensorSlice {
-    pub ptr: *const PieLoaderSourceTensorView,
-    pub len: usize,
-}
-
-impl Default for PieLoaderSourceTensorSlice {
-    fn default() -> Self {
-        Self {
-            ptr: std::ptr::null(),
-            len: 0,
-        }
-    }
-}
+pub type PieLoaderSourceTensorSlice = PieLoaderSlice<PieLoaderSourceTensorView>;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -759,21 +619,7 @@ pub struct PieLoaderBufferDeclView {
     pub persistent_offset: u64,
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct PieLoaderBufferDeclSlice {
-    pub ptr: *const PieLoaderBufferDeclView,
-    pub len: usize,
-}
-
-impl Default for PieLoaderBufferDeclSlice {
-    fn default() -> Self {
-        Self {
-            ptr: std::ptr::null(),
-            len: 0,
-        }
-    }
-}
+pub type PieLoaderBufferDeclSlice = PieLoaderSlice<PieLoaderBufferDeclView>;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -783,21 +629,7 @@ pub struct PieLoaderSlabPlacementView {
     pub bytes: u64,
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct PieLoaderSlabPlacementSlice {
-    pub ptr: *const PieLoaderSlabPlacementView,
-    pub len: usize,
-}
-
-impl Default for PieLoaderSlabPlacementSlice {
-    fn default() -> Self {
-        Self {
-            ptr: std::ptr::null(),
-            len: 0,
-        }
-    }
-}
+pub type PieLoaderSlabPlacementSlice = PieLoaderSlice<PieLoaderSlabPlacementView>;
 
 /// The flattened instruction. Rust's `StorageInstr` is a sum type whose variants
 /// carry disjoint payloads; C has no such thing, so this is the union of all
@@ -842,6 +674,14 @@ pub struct PieLoaderStorageInstrView {
     pub transform_source_cols: u32,
     pub transform_target_cols: u32,
     pub transform_scratch_bytes: u64,
+    /// Source tensor holding this transform's input block scales, or
+    /// [`PIE_LOADER_NO_TENSOR`].
+    ///
+    /// Index into `PieLoaderPlan::sources`, the same space `source.tensor_id`
+    /// uses, so the executor reaches the scales' name and shape the way it
+    /// reaches the payload's — instead of appending `_scale_inv` to a name and
+    /// hoping the checkpoint agrees.
+    pub transform_metadata_source: u32,
     pub name: PieLoaderBytes,
     pub slab_file_id: u32,
     pub slab_file_offset: u64,
@@ -878,6 +718,7 @@ impl Default for PieLoaderStorageInstrView {
             transform_source_cols: 0,
             transform_target_cols: 0,
             transform_scratch_bytes: 0,
+            transform_metadata_source: PIE_LOADER_NO_TENSOR,
             name: PieLoaderBytes::default(),
             slab_file_id: PIE_LOADER_NO_BUFFER,
             slab_file_offset: 0,
@@ -887,21 +728,7 @@ impl Default for PieLoaderStorageInstrView {
     }
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct PieLoaderStorageInstrSlice {
-    pub ptr: *const PieLoaderStorageInstrView,
-    pub len: usize,
-}
-
-impl Default for PieLoaderStorageInstrSlice {
-    fn default() -> Self {
-        Self {
-            ptr: std::ptr::null(),
-            len: 0,
-        }
-    }
-}
+pub type PieLoaderStorageInstrSlice = PieLoaderSlice<PieLoaderStorageInstrView>;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -911,37 +738,6 @@ pub struct PieLoaderMemoryPlanView {
     pub transform_scratch_peak_bytes: u64,
     pub checkpoint_read_bytes: u64,
     pub device_write_bytes: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct PieLoaderOptimizerPassStatsView {
-    pub name: PieLoaderBytes,
-    pub exprs_before: u64,
-    pub exprs_after: u64,
-    pub rewrites: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct PieLoaderOptimizerPassStatsSlice {
-    pub ptr: *const PieLoaderOptimizerPassStatsView,
-    pub len: usize,
-}
-
-impl Default for PieLoaderOptimizerPassStatsSlice {
-    fn default() -> Self {
-        Self {
-            ptr: std::ptr::null(),
-            len: 0,
-        }
-    }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct PieLoaderOptimizerReportView {
-    pub passes: PieLoaderOptimizerPassStatsSlice,
 }
 
 /// The target the plan was compiled against. The driver reads it back to assert
@@ -995,7 +791,6 @@ impl From<&crate::load_plan::StorageTarget> for PieLoaderTargetView {
 #[repr(C)]
 #[derive(Debug)]
 pub struct PieLoaderPlan {
-    pub version: u32,
     pub files: PieLoaderCheckpointFileSlice,
     pub sources: PieLoaderSourceTensorSlice,
     pub tensors: PieLoaderTensorDeclSlice,
@@ -1003,12 +798,9 @@ pub struct PieLoaderPlan {
     pub instrs: PieLoaderStorageInstrSlice,
     pub schedule: PieLoaderU32Slice,
     pub memory: PieLoaderMemoryPlanView,
-    pub optimizer: PieLoaderOptimizerReportView,
     pub compiler_version: u64,
     pub target: PieLoaderTargetView,
     pub attachments: PieLoaderQuantAttachmentSlice,
-    /// Measured against `PieLoaderRequest::demands` at compile time.
-    pub coverage: PieLoaderContractCoverageView,
     /// The name of the materialized weights this plan produces, as 16 hex
     /// digits. Stable for as long as nothing that decides the bytes changes, so
     /// a driver can use it to key an artifact cache.

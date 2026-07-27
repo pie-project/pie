@@ -5,16 +5,16 @@
 //! `extern "C"` functions the driver calls. The generated header
 //! (`loader/include/pie_loader.h`) is the C view of exactly these three files.
 //!
-//! This module replaces `inproc.rs`: where that offered a Rust-to-Rust compile
-//! helper and a JSON serializer, this offers the one boundary the design
-//! actually has (§10).
+//! This is the only boundary the design has (§10). There is no serialized form:
+//! a plan is compiled and executed in one process, so a JSON round-trip would be
+//! a second representation to keep in step with no reader on the far end.
 
 pub mod arena;
 pub mod checkpoint;
 pub mod contract;
 pub mod entry;
-pub mod inproc;
 pub mod types;
+pub mod view;
 
 pub use entry::{
     PieLoaderDiagnostic, PieLoaderDiagnostics, PieLoaderSeverity, PieLoaderStatus,

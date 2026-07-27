@@ -511,6 +511,7 @@ add_library(pie_driver_cuda_lib STATIC
   src/kernels/head_dim_pad.cu
   src/kernels/kv_paged.cu
   src/kernels/moe_dispatch.cu
+  src/kernels/moe_grouped_gemm.cu
   src/kernels/mxfp4_marlin.cu
   src/kernels/pack_dense_mask.cu
   src/kernels/quant_bf16_to_fp8.cu
@@ -553,10 +554,34 @@ target_include_directories(pie_driver_cuda_lib
     ${flashinfer_SOURCE_DIR}/3rdparty/cutlass/tools/util/include
     ${flashinfer_SOURCE_DIR}/3rdparty/spdlog/include)
 
+# ---- the loader archive ----------------------------------------------------
+#
+# Authoring a contract reads the checkpoint's tensor table, which means calling
+# into `pie-loader` — and `pie-loader` is an rlib the *worker* links, not
+# something a C++ binary can pull in. `cargo rustc -p pie-loader --lib
+# --crate-type staticlib` emits an archive that does link. Anything reaching
+# `pie_driver_cuda_lib`'s `loaded_model.cpp` needs it. When it is there those
+# targets are built; when it is not they are skipped, because failing the whole
+# build for everyone who has not run that command would be worse than not
+# building a diagnostic tool and two structural tests.
+if(NOT PIE_LOADER_STATICLIB)
+  find_library(PIE_LOADER_STATICLIB
+    NAMES pie_loader
+    PATHS ${CMAKE_CURRENT_SOURCE_DIR}/../../target/debug
+    NO_DEFAULT_PATH)
+endif()
+
 # ---- pie_driver_cuda (standalone diagnostic executable) --------------------
 
-add_executable(pie_driver_cuda src/main.cpp)
-target_link_libraries(pie_driver_cuda PRIVATE pie_driver_cuda_lib)
+if(PIE_LOADER_STATICLIB)
+  add_executable(pie_driver_cuda src/main.cpp)
+  target_link_libraries(pie_driver_cuda PRIVATE pie_driver_cuda_lib
+    ${PIE_LOADER_STATICLIB} dl pthread)
+else()
+  message(STATUS
+    "pie_driver_cuda: skipped (no libpie_loader.a; build one with "
+    "`cargo rustc -p pie-loader --lib --crate-type staticlib`)")
+endif()
 
 # ---- FlashInfer generated CUTLASS MoE (vendored) ---------------------------
 # Pre-generated FlashInfer CUTLASS grouped-GEMM MoE launchers, vendored under
@@ -829,30 +854,18 @@ pie_add_cuda_target(test_ptir_decoder_limits
 
 # The contract this driver authors (§12 row 12).
 # Set PIE_TEST_SNAPSHOT to also author it against a real checkpoint.
-#
-# Authoring reads the checkpoint's tensor table, which means calling into
-# `pie-loader` — and `pie-loader` is an rlib the *worker* links, not something a
-# C++ test binary can pull in. `cargo rustc -p pie-loader --lib --crate-type
-# staticlib` emits an archive that does link. When it is there this test is
-# built; when it is not the target is skipped, because failing the whole build
-# for everyone who has not run that command would be worse than not running one
-# test.
-if(NOT PIE_LOADER_STATICLIB)
-  find_library(PIE_LOADER_STATICLIB
-    NAMES pie_loader
-    PATHS ${CMAKE_CURRENT_SOURCE_DIR}/../../target/debug
-    NO_DEFAULT_PATH)
-endif()
 if(PIE_LOADER_STATICLIB)
+  # Links the driver lib: authoring is now the arch table's `author_contract`
+  # hook, so reaching a family's contract means reaching its registry row.
   pie_add_cuda_target(test_model_contract
-    SOURCES tests/model_contract_test.cpp src/model/config.cpp
+    SOURCES tests/model_contract_test.cpp
     INCLUDE_DIRS
       ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
       ${CMAKE_CURRENT_SOURCE_DIR}/../abi/include
       ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include
       ${PIE_DRIVER_ABI_INCLUDE_DIR}
       ${PIE_LOADER_INCLUDE_DIR}
-    LIBS nlohmann_json::nlohmann_json ${PIE_LOADER_STATICLIB} dl pthread)
+    LIBS pie_driver_cuda_lib nlohmann_json::nlohmann_json ${PIE_LOADER_STATICLIB} dl pthread)
 else()
   message(STATUS
     "test_model_contract: skipped (no libpie_loader.a; build one with "
@@ -1110,7 +1123,15 @@ pie_add_cuda_target(test_precomputed_embeddings
     ${PIE_DRIVER_ABI_INCLUDE_DIR} ${PIE_LOADER_INCLUDE_DIR}
   LIBS CUDA::cudart)
 # Structural proof for model/registry.{hpp,cpp}: every model_type resolves to its
-# intended family/binder; unrecognized archs are rejected. No GPU, no weights.
-pie_add_cuda_target(test_model_registry
-  SOURCES tests/model_registry_test.cpp
-  LIBS pie_driver_cuda_lib)
+# intended family/binder and declares what it binds; unrecognized archs are
+# rejected. No GPU, no weights — but `pie_driver_cuda_lib` reaches
+# `loaded_model.cpp`, which calls the loader, so it needs the staticlib.
+if(PIE_LOADER_STATICLIB)
+  pie_add_cuda_target(test_model_registry
+    SOURCES tests/model_registry_test.cpp
+    LIBS pie_driver_cuda_lib ${PIE_LOADER_STATICLIB} dl pthread)
+else()
+  message(STATUS
+    "test_model_registry: skipped (no libpie_loader.a; build one with "
+    "`cargo rustc -p pie-loader --lib --crate-type staticlib`)")
+endif()

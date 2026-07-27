@@ -38,7 +38,6 @@ struct DeviceTarget {
     std::uint32_t tp_size = 1;
     std::uint64_t max_tile_bytes = 0;
     std::uint32_t preferred_alignment = 0;
-    bool fp8_native = false;
     bool native_mxfp4_moe = false;
     /// Which fused transform chains this build has kernels for
     /// (`PIE_LOADER_FUSION_*`), ORed together.
@@ -83,7 +82,6 @@ inline PieLoaderTargetSpec target_spec(const DeviceTarget& target) {
         .max_tile_bytes = target.max_tile_bytes,
         .preferred_alignment = target.preferred_alignment,
         .tile_map_mask = target.tile_map_mask,
-        .fp8_native = target.fp8_native,
         .native_mxfp4_moe = target.native_mxfp4_moe,
         .fusion_mask = target.fusion_mask,
         .encode_scratch_dtype = static_cast<std::uint32_t>(target.encode_scratch_dtype),

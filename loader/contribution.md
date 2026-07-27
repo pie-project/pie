@@ -59,11 +59,12 @@ and nothing detects it.
    silent corruption into compile-time errors. Showing that on our own system is
    worth more than showing it on someone else's.
 
-4. **The existing defense against exactly this is vacuous.** The C++ driver
-   already contains what looks like the coverage check C3 proposes:
+4. **The existing defense against exactly this was vacuous.** The C++ driver
+   used to contain what looks like the coverage check C3 proposes (the code
+   below is quoted from history; it is no longer in the tree):
 
    ```cpp
-   // driver/cuda/src/model/loaded_model.cpp:327
+   // driver/cuda/src/model/loaded_model.cpp, deleted
    if (planned_load.covered_contract_count != planned_load.runtime_tensor_count) {
        throw std::runtime_error(
            "engine: Rust loader did not cover the full RuntimeABI; covered " ...);
@@ -79,7 +80,20 @@ and nothing detects it.
    missing because nobody wanted it; it is missing because a coverage claim is
    meaningless unless the contract has an author independent of the compiler.
    That is the property the paper supplies, and this is the specimen that shows
-   good intentions are not sufficient without it. **Also do not fix this before
+   good intentions are not sufficient without it.
+
+   **The specimen has a second act, and it is the better half of the story.**
+   The driver did eventually get an independent contract, the check moved to
+   Rust as `verify.rs::ContractCoverage::measure`, and it was *still* vacuous —
+   because the driver went on to author the contract rather than merely declare
+   it, so the demand list became the compiler's own input and the ratio could
+   only ever be `n/n`. A vacuous check does not become sound by moving to a
+   stronger language, and it does not become sound by acquiring a second author
+   if that author is upstream of the thing being checked. Both versions are now
+   deleted; what survives is the comparison that was never circular, of each
+   demand's name, shape and encoding against the emitted plan. For the paper
+   this is worth more than the original specimen: it shows the failure mode
+   surviving one honest attempt to fix it. **Also do not fix this before
    writing the paper.**
 
 ### 1.3 The intellectual move
