@@ -127,6 +127,16 @@ bool moe_path_log_enabled() {
 // same number of weight reads; 8 halves the padding. Measured on
 // Qwen3.6-35B-A3B, 128 requests x 256 tokens: 1197 tok/s at 8 against
 // 1107 at 16, and it falls off either side (921 at 32, 586 at 64).
+//
+// The optimum tracks the per-expert weight size, so it is NOT the same at
+// every tp. Re-measured after the gather/scatter widening (128x256 again):
+// tp=1 still prefers 8 (1499 against 1432 at 16), but tp=2, where each
+// expert weight is half the size and the batch count matters more than the
+// padded rows, prefers 16 (3226 against 3184; the decode step itself goes
+// 41.2 -> 39.7 ms, gate_up 11.3 -> 10.3 and down 8.7 -> 7.8). 32 is worse
+// at both. 8 is kept as the default because it is the safe choice across
+// topologies; set PIE_QWEN35_MOE_ALIGNED_DECODE_BLOCK=16 for a tp=2
+// throughput deployment.
 int qwen35_moe_aligned_decode_block_size() {
     static const int block = [] {
         const char* v = std::getenv("PIE_QWEN35_MOE_ALIGNED_DECODE_BLOCK");
