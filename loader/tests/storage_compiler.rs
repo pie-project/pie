@@ -15,7 +15,7 @@ fn stored_contract(name: &str) -> ModelContract {
     serde_json::from_str(&text).unwrap_or_else(|err| panic!("{name}: parsing: {err}"))
 }
 use pie_loader::checkpoint::{CheckpointFile, CheckpointMetadata, RawTensor};
-use pie_loader::contract::{Expr, ModelContract, TensorContract};
+use pie_loader::contract::{Expr, ModelContract, TensorContract, TensorType};
 use pie_loader::plan::compile as compile_load_plan;
 use pie_loader::plan::{StorageInstr, StorageTarget, TileMapKind};
 use pie_loader::types::{
@@ -1402,4 +1402,65 @@ fn a_padded_head_dim_zeroes_the_buffer_before_it_writes_the_rows() {
     assert_eq!(program.memory.device_write_bytes, 32);
     assert_eq!(program.memory.persistent_bytes, 40);
     assert_eq!(program.buffer(filled).unwrap().bytes, 40);
+}
+
+/// A block scale is bytes in the file and an exponent to the GEMM.
+///
+/// DeepSeek-V4 pairs FP8-E4M3 weights with OCP Microscaling E8M0 scales --
+/// a combination `QuantScheme::Mxfp4E2M1E8M0` cannot name, because that symbol
+/// bundles the element format together with the scale format. The driver used
+/// to bridge the gap by copying the scales to the host and running `ldexpf`
+/// over them at bind time.
+///
+/// No new expression is needed for this. `Bitcast` names the reading of the
+/// bytes and the declaration names the type wanted, so the existing
+/// dtype-mismatch rule inserts the cast -- which is the whole argument for
+/// `E8M0` being a dtype rather than an arithmetic escape hatch.
+#[test]
+fn an_e8m0_block_scale_read_as_fp32_lowers_to_a_cast() {
+    let metadata = CheckpointMetadata {
+        files: vec![CheckpointFile {
+            id: FileId(0),
+            path: "model.safetensors".to_string(),
+            size_bytes: 1 << 20,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors: vec![sized_raw(0, "w.scale", 0, 64, &[8, 8], DType::U8)],
+    };
+    let target = StorageTarget {
+        backend: BackendKind::Cuda,
+        tile_map_mask: u32::MAX,
+        ..StorageTarget::default()
+    };
+    let contract = ModelContract {
+        abi_version: 1,
+        alignment: 1,
+        tensors: vec![TensorContract::new(
+            "runtime.w.scale",
+            Expr::Bitcast {
+                src: Box::new(Expr::src("w.scale")),
+                out: TensorType {
+                    shape: vec![8, 8],
+                    encoding: Encoding::Raw(DType::E8M0),
+                },
+            },
+            vec![8, 8],
+            Encoding::Raw(DType::F32),
+        )],
+    };
+    let program = compile_load_plan(&metadata, &contract, target).unwrap();
+    let casts = program
+        .instrs
+        .iter()
+        .filter(|instr| {
+            matches!(
+                instr,
+                StorageInstr::TileMap {
+                    kind: TileMapKind::Cast,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(casts, 1, "expected exactly one Cast, got plan {program:#?}");
 }

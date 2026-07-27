@@ -83,6 +83,7 @@ enum class PieLoaderDType : uint32_t {
   U16 = 9,
   U8 = 10,
   Bool = 11,
+  E8M0 = 12,
 };
 
 enum class PieLoaderEncodingKind : uint32_t {

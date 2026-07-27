@@ -35,6 +35,15 @@ void launch_cast_bf16_to_fp32(
     std::size_t   n,
     cudaStream_t  stream);
 
+/// `dst[i] = 2^(src[i] - 127)` for `n` E8M0 elements. Block-scaled FP8
+/// checkpoints (DeepSeek-V4) ship their per-tile scales in OCP Microscaling's
+/// exponent-only format, while the FP8 GEMM wants fp32 scales.
+void launch_cast_e8m0_to_fp32(
+    const void*   src_e8m0,
+    void*         dst_fp32,
+    std::size_t   n,
+    cudaStream_t  stream);
+
 /// In-place marlin scale permutation. Marlin's gptq W4A16 kernel reads
 /// per-group scales in a specific 64-wide column-interleaved layout
 /// rather than the row-major `[groups, N]` shape that GPTQ checkpoints

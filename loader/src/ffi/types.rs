@@ -99,6 +99,7 @@ pub enum PieLoaderDType {
     U16 = 9,
     U8 = 10,
     Bool = 11,
+    E8M0 = 12,
 }
 
 impl From<DType> for PieLoaderDType {
@@ -116,6 +117,7 @@ impl From<DType> for PieLoaderDType {
             DType::U16 => Self::U16,
             DType::U8 => Self::U8,
             DType::Bool => Self::Bool,
+            DType::E8M0 => Self::E8M0,
         }
     }
 }
@@ -137,6 +139,7 @@ impl From<PieLoaderDType> for DType {
             PieLoaderDType::U16 => Self::U16,
             PieLoaderDType::U8 => Self::U8,
             PieLoaderDType::Bool => Self::Bool,
+            PieLoaderDType::E8M0 => Self::E8M0,
         }
     }
 }
@@ -295,6 +298,7 @@ impl TryFrom<u32> for PieLoaderDType {
             9 => Self::U16,
             10 => Self::U8,
             11 => Self::Bool,
+            12 => Self::E8M0,
             other => return Err(other),
         })
     }

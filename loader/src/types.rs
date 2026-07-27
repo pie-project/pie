@@ -25,6 +25,13 @@ pub enum DType {
     BF16,
     F8E4M3,
     F8E5M2,
+    /// OCP Microscaling's 8-bit exponent-only scale format: the stored byte
+    /// `b` denotes `2^(b - 127)`. It carries no sign and no mantissa, so it
+    /// only ever appears as the scale beside a block-scaled tensor -- which is
+    /// why `QuantScheme` long knew it only as half of `Mxfp4E2M1E8M0`.
+    /// DeepSeek-V4 pairs it with FP8-E4M3 weights instead, a combination that
+    /// composite cannot name.
+    E8M0,
     I32,
     I16,
     I8,
@@ -39,14 +46,14 @@ impl DType {
         match self {
             Self::F32 | Self::I32 | Self::U32 => 4,
             Self::F16 | Self::BF16 | Self::I16 | Self::U16 => 2,
-            Self::F8E4M3 | Self::F8E5M2 | Self::I8 | Self::U8 | Self::Bool => 1,
+            Self::F8E4M3 | Self::F8E5M2 | Self::E8M0 | Self::I8 | Self::U8 | Self::Bool => 1,
         }
     }
 
     pub fn is_float(self) -> bool {
         matches!(
             self,
-            Self::F32 | Self::F16 | Self::BF16 | Self::F8E4M3 | Self::F8E5M2
+            Self::F32 | Self::F16 | Self::BF16 | Self::F8E4M3 | Self::F8E5M2 | Self::E8M0
         )
     }
 

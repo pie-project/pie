@@ -37,8 +37,51 @@ inline ShardAxis dsv4_shard_axis(std::string_view name) {
 
 }  // namespace contract_detail
 
+/// Decode the block scales that ride beside DeepSeek-V4's FP8 weights.
+///
+/// The checkpoint stores one byte per tile of the weight, and that byte is OCP
+/// Microscaling's E8M0: it denotes `2^(b - 127)`. The FP8 GEMM wants fp32.
+/// Both halves of that are sayable -- `Bitcast` names how the bytes are to be
+/// read, and the declaration names the type wanted -- so the planner inserts
+/// the cast itself.
+///
+/// `QuantScheme::Mxfp4E2M1E8M0` cannot name this pairing: that symbol bundles
+/// the element format together with the scale format, and E8M0 beside
+/// FP8-E4M3 is a combination it has no name for. Which is why the driver used
+/// to copy every scale to the host, run `ldexpf` over it and upload the result
+/// during bind -- arithmetic the algebra has no vocabulary for, done outside
+/// the loader entirely.
+inline void dsv4_block_scales_to_fp32(ContractBuilder& b) {
+    constexpr std::string_view kSuffix = ".scale";
+    for (const SourceTensor& raw : b.tensors()) {
+        if (!contract_detail::ends_with(raw.name, kSuffix) ||
+            !contract_detail::is_raw(raw.encoding, PieLoaderDType::U8)) {
+            continue;
+        }
+        // Only a companion to an FP8 weight is an E8M0 exponent. A `.scale`
+        // beside anything else is some other convention, and guessing is how
+        // a scale tensor gets silently reinterpreted.
+        const std::string weight =
+            std::string(raw.name.substr(0, raw.name.size() - kSuffix.size())) + ".weight";
+        const SourceTensor* companion = b.find(weight);
+        if (companion == nullptr ||
+            !contract_detail::is_raw(companion->encoding, PieLoaderDType::F8E4M3)) {
+            continue;
+        }
+        std::vector<std::int64_t> shape = contract_detail::shape_of(raw);
+        auto [expr, local] = b.shard(
+            b.contract().bitcast(b.contract().src(std::string(raw.name)), shape,
+                                 pie_loader::raw(PieLoaderDType::E8M0)),
+            shape, b.shard_axis(raw.name));
+        b.define(b.output_name(raw.name), expr, pie_loader::raw(PieLoaderDType::F32),
+                 std::move(local));
+        b.consume(raw.id);
+    }
+}
+
 inline void author_deepseek_v4_contract(ContractBuilder& b) {
     b.shard_axis_fn(contract_detail::dsv4_shard_axis);
+    dsv4_block_scales_to_fp32(b);
     author_dense_contract(b);
 }
 }  // namespace pie_cuda_driver::model

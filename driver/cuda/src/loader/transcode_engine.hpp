@@ -125,6 +125,9 @@ private:
         } else if (src.dtype() == DType::BF16 && dst_dtype == DType::FP32) {
             kernels::launch_cast_bf16_to_fp32(
                 src.data(), dst, src.numel(), /*stream=*/0);
+        } else if (src.dtype() == DType::E8M0 && dst_dtype == DType::FP32) {
+            kernels::launch_cast_e8m0_to_fp32(
+                src.data(), dst, src.numel(), /*stream=*/0);
         } else {
             throw std::runtime_error(
                 "rust storage executor: unsupported TileMap Cast " +

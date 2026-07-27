@@ -687,6 +687,7 @@ fn decode_values(bytes: &[u8], dtype: DType) -> Result<Vec<f64>, Error> {
                 DType::U32 => u32::from_le_bytes(chunk.try_into().unwrap()) as f64,
                 DType::U16 => u16::from_le_bytes(chunk.try_into().unwrap()) as f64,
                 DType::U8 | DType::Bool => chunk[0] as f64,
+                DType::E8M0 => (chunk[0] as f64 - 127.0).exp2(),
                 DType::F8E4M3 | DType::F8E5M2 => {
                     return Err(invalid("host Cast does not implement FP8"));
                 }
@@ -713,6 +714,9 @@ fn encode_values(values: &[f64], dtype: DType) -> Result<Vec<u8>, Error> {
             DType::U16 => out.extend_from_slice(&(value as u16).to_le_bytes()),
             DType::U8 => out.push(value as u8),
             DType::Bool => out.push(u8::from(value != 0.0)),
+            DType::E8M0 => {
+                return Err(invalid("host Cast does not encode to E8M0"));
+            }
             DType::F8E4M3 | DType::F8E5M2 => {
                 return Err(invalid("host Cast does not implement FP8"));
             }

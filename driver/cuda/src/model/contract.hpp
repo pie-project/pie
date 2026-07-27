@@ -417,6 +417,17 @@ public:
         }
     }
 
+    /// The name a source tensor is published under, given the prefix.
+    ///
+    /// The counterpart to `source_name`: a pass that walks `tensors()` already
+    /// holds the raw name and publishes it through this.
+    std::string output_name(std::string_view raw_name) const {
+        if (!source_prefix_.empty() && raw_name.rfind(source_prefix_, 0) == 0) {
+            return std::string(raw_name.substr(source_prefix_.size()));
+        }
+        return std::string(raw_name);
+    }
+
     /// The name a source tensor has in the checkpoint, given the prefix.
     ///
     /// A pass that goes looking for one specific tensor names it the way the
@@ -905,13 +916,6 @@ private:
     bool source_name_allowed(std::string_view raw_name) const {
         return source_prefix_.empty() ||
                raw_name.rfind(source_prefix_, 0) == 0;
-    }
-
-    std::string output_name(std::string_view raw_name) const {
-        if (!source_prefix_.empty() && raw_name.rfind(source_prefix_, 0) == 0) {
-            return std::string(raw_name.substr(source_prefix_.size()));
-        }
-        return std::string(raw_name);
     }
 
     // -- runtime quantization ------------------------------------------------

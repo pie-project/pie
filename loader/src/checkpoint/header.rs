@@ -72,6 +72,13 @@ pub fn dtype_from_safetensors(s: &str) -> Result<DType, Error> {
         // + `*_scales` (`F8_E8M0`) tensor pairs recognised by schema/name in
         // the storage compiler. Real gpt-oss checkpoints already declare these
         // as `U8`; the packed tags are accepted for C++ parity.
+        //
+        // `F8_E8M0` deliberately does NOT map to `DType::E8M0`, even though
+        // that dtype now exists: the same tag names MXFP4's scales, which the
+        // repack path reads as bytes. A contract that wants the exponent
+        // decoded says so with `Bitcast(.., E8M0)` -- naming the reading is
+        // that node's whole job, and it leaves the file's tag meaning what
+        // gpt-oss means by it.
         "F4_E2M1" | "F8_E8M0" => DType::U8,
         // LoadPlan v4 has no 64-bit runtime dtype or executor contract.
         // Reject explicitly rather than narrowing checkpoint metadata.
