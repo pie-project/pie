@@ -261,19 +261,17 @@ async fn main(input: Input) -> Result<Output> {
     // prefix written so far and writes only its own tokens, so the
     // concatenation equals the one-shot fire (section 17).
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
-    let chunk = input
-        .prefill_chunk
-        .unwrap_or(u32::MAX)
-        .min(max_embed_length().max(1) as u32)
-        .min(n)
-        .max(1);
+    // The split is `prefill_chunks` (SDK), which spreads the remainder over the
+    // FIRST chunks so the last one is never a sliver. Every inferlet in this
+    // tree uses it, which is what makes their chunk boundaries identical: a
+    // text difference above the ceiling is then a policy difference, not a
+    // difference in the attention tile decomposition (§11.4).
+    let spans = prefill_chunks(n, input.prefill_chunk);
     let pipe = Pipeline::new();
 
     let mut g0 = 0i32;
-    let mut base = 0u32;
-    while base < n {
-        let len = chunk.min(n - base);
-        let end = base + len;
+    for &(base, end) in &spans {
+        let len = end - base;
 
         let toks_p =
             Channel::from(prompt_i32[base as usize..end as usize].to_vec()).named("toks_p");
@@ -322,7 +320,6 @@ async fn main(input: Input) -> Result<Output> {
             .await
             .map_err(|e| format!("g0 take @{base}: {e}"))?[0];
 
-        base = end;
     }
     generated.push(g0 as u32);
 

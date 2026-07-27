@@ -296,6 +296,41 @@ async def test_trackb_above_the_one_shot_ceiling(client, args):
         print(f"    {name}: {kv_field}={kv} (> 8192), budget still enforced")
 
 
+async def test_policies_agree_with_the_baseline_past_the_ceiling(client, args):
+    """All five programs must write the same KV for a 15K-token prompt.
+
+    With eviction disabled, every policy here is the baseline plus observation,
+    so past the ceiling -- where all of them are splitting the prompt into
+    multiple fires and stitching the results -- they must all still produce the
+    baseline's continuation. An off-by-one in a chunk's write offsets, a
+    `page_indptr` that does not cover the prefix, a `kv_len` that is not
+    cumulative: none of those change whether the program *runs*, and all of them
+    would show up here.
+
+    Note what this does NOT test, because the docstring above explains why the
+    prompt is decisive: a decisive prompt is deliberately insensitive to
+    last-bit differences, and different chunk boundaries only move last bits.
+    So this will not detect one program splitting 7516/7516 where another splits
+    8192/6840 -- `test_snapkv_observes_the_final_chunk` and the shared
+    `prefill_chunks` helper cover that. What it detects is a chunk that wrote
+    the wrong thing, which is the failure that survives everything else.
+    """
+    prompt = _prompt_for(_LONG_TARGET_TOKENS, decisive=True)
+    common = {"seed": 4242, "max_tokens": 24, "temperature": 0.0001}
+    base = _parse(await run_inferlet(client, "naive-baseline", {**common, "prompt": prompt}))
+    assert base["text"].strip(), "baseline produced nothing to compare against"
+
+    for name in ("quest-attention", "trackb-h2o", "trackb-snapkv", "tova-attention"):
+        r = await _policy(client, name, prompt=prompt, **common)
+        assert r["text"] == base["text"], (
+            f"{name} disagrees with the baseline past the ceiling, with nothing "
+            f"evicted -- some chunk did not write the prompt it was given.\n"
+            f"  baseline: {base['text']!r}\n"
+            f"  {name}: {r['text']!r}"
+        )
+    print("    4 policies reproduce the baseline exactly on a >8192-token prompt")
+
+
 run_tests(
     [
         test_chunking_is_exact,
@@ -304,6 +339,7 @@ run_tests(
         test_trackb_chunking_is_exact,
         test_snapkv_observes_the_final_chunk,
         test_trackb_above_the_one_shot_ceiling,
+        test_policies_agree_with_the_baseline_past_the_ceiling,
     ],
     description="Chunked prefill (Track A + Track B)",
 )

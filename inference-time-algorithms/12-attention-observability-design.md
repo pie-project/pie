@@ -1818,3 +1818,41 @@ per-step cost does -- so on a production-sized model every crossover here moves
 earlier, and what survives is the ordering, which is set by real per-layer
 work: SnapKV (none) < H2O (a `[kv_max]` fold) < Quest (`envelope_dot` over
 every page).
+
+### 18.6 One chunking rule, in the SDK
+
+§18.1 arrived at even chunking for SnapKV. Leaving it there would have been a
+bug in waiting: the other four programs still chunked greedily, so above the
+one-shot ceiling they would lay their prompts down at **different boundaries
+than the baseline they are compared against**. At `n = 15032` with a ceiling of
+8192, greedy gives `8192 + 6840` and even gives `7516 + 7516`. Nothing about
+that is wrong numerically -- both cover the prompt -- but it means
+`test_policies_agree_with_the_baseline_past_the_ceiling` would have been
+comparing two different computations and calling their agreement a result.
+
+The rule now lives once, in the SDK, as
+`inferlet::ptir::prefill_chunks(n, cap) -> Vec<(u32, u32)>`, exported from
+`ptir::prelude`. All five inferlets call it. It resolves the ceiling from
+`max_embed_length()` unless the caller overrides it, so a test can force the
+multi-chunk path on a short prompt (`prefill_chunk` in every Track A/B
+inferlet's input) without knowing the driver's limit.
+
+The interesting part is the doc comment, because the obvious implementation is
+the wrong one. `chunk = ceil(n / ceil(n/cap))` gets the chunk *count* right and
+then piles the entire remainder onto the final chunk: with `n = qk + r` and
+`r > 0` the tail is `q + r - k + 1`, which can be as small as 1. The fix is
+variable-size chunks -- spread the remainder over the *first* `r` chunks, so
+chunk `i` gets `n/k + (i < n%k)` and the final chunk is `floor(n/k)`, provably
+the largest a last chunk can be. For SnapKV that is the difference between an
+observation window that sees 32 rows and one that sees 7.
+
+Five unit tests in `sdk/rust/inferlet/src/ptir.rs` pin the contract, over a
+grid of prompt lengths and ceilings: the spans tile `[0, n)` with no gap,
+overlap or empty chunk and none exceeds the cap; the count is the minimum the
+cap allows; **every chunk is within one token of every other, and the last
+chunk is always one of the shortest**; and the `n = 1302, cap = 37` case that
+motivated the rule produces a 36-token tail where greedy produced 7. The
+arithmetic is factored out of `prefill_chunks` into a private `even_spans` for
+exactly this reason -- `max_embed_length()` reaches the host, so the public
+function cannot run off-device, and a rule this easy to get subtly wrong should
+not be testable only through a GPU.

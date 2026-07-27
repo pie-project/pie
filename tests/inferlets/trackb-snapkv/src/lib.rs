@@ -247,37 +247,23 @@ async fn main(input: Input) -> Result<Output> {
     // tap goes on the final chunk alone, and the earlier chunks run the plain
     // prefill -- which also means they do not pay the capture variant's cost.
     //
-    // The chunks are EVEN, and evenness here has to mean *within one token*,
-    // not "a fixed width plus whatever is left". A fixed width of
-    // `ceil(n / ceil(n / C))` gives the right chunk COUNT but can still leave a
-    // sliver: at n=1302, C=37 it lays down 35 chunks of 37 and a final chunk of
-    // SEVEN. A final chunk shorter than `window` narrows the observation to
-    // whatever happened to be left over, and SnapKV then ranks pages by a
-    // 7-row window while believing it used 32 -- wrong, and invisible, because
-    // a truncated window still produces a plausible ranking.
-    //
-    // So the remainder is spread over the FIRST chunks instead: with
-    // `k = ceil(n / C)`, `q = n / k`, `r = n % k`, chunk `i` is `q + (i < r)`.
-    // Every chunk is within one token of every other, and the final chunk is
-    // `q = floor(n / k)`, the largest value any last chunk can have. In
-    // production (C = 8192) that is thousands of tokens, so the window is
-    // always whole.
+    // The split is `prefill_chunks`, whose docs explain why it spreads the
+    // remainder over the FIRST chunks: a "C tokens at a time until the
+    // remainder" split can leave a final chunk of one token, and a final chunk
+    // shorter than `window` silently truncates SnapKV's observation to whatever
+    // was left over. That produces a plausible ranking, which is worse than an
+    // implausible one. Using the shared helper also guarantees this inferlet
+    // picks the SAME chunk boundaries as the baseline it is compared against,
+    // so a text difference above the ceiling means a policy difference and not
+    // a difference in the attention tile decomposition (§11.4).
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
-    let cap = input
-        .prefill_chunk
-        .unwrap_or(u32::MAX)
-        .min(max_embed_length().max(1) as u32)
-        .min(n)
-        .max(1);
-    let k = n.div_ceil(cap).max(1);
-    let (q, r) = (n / k, n % k);
+    let spans = prefill_chunks(n, input.prefill_chunk);
+    let k = spans.len() as u32;
     let pipe = Pipeline::new();
 
     // Non-final chunks: plain prefill, no tap, sampled token discarded.
-    let mut base = 0u32;
-    for i in 0..k - 1 {
-        let chunk = q + u32::from(i < r);
-        let end = base + chunk;
+    for &(base, end) in &spans[..spans.len() - 1] {
+        let chunk = end - base;
         let toks_c =
             Channel::from(prompt_i32[base as usize..end as usize].to_vec()).named("toks_c");
         let embed_indptr_c = Channel::from(vec![0u32, chunk]).named("embed_indptr_c");
@@ -322,10 +308,10 @@ async fn main(input: Input) -> Result<Output> {
             .get::<i32>()
             .await
             .map_err(|e| format!("prefill chunk take @{base}: {e}"))?;
-        base = end;
     }
 
     // ── FINAL CHUNK `[base, n)`: the observed one. ──
+    let base = spans[spans.len() - 1].0;
     let tail = n - base;
     let toks_p =
         Channel::from(prompt_i32[base as usize..n as usize].to_vec()).named("toks_p");
@@ -592,7 +578,7 @@ async fn main(input: Input) -> Result<Output> {
         page_budget,
         prompt_pages,
         prefill_chunks: k,
-        prefill_final: q,
+        prefill_final: tail,
         page_size,
         layers_observed,
         live_scored: prefill_scores[..live]
