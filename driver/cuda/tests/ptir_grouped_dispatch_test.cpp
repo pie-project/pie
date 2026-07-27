@@ -19,11 +19,37 @@
 #include "pie_native/ptir/plan.hpp"
 #include "pipeline/dispatch.hpp"
 
+#include <map>
+
+#include "support/host_kernels.hpp"
+
 using pie_cuda_driver::pipeline::Dispatch;
 using pie_cuda_driver::pipeline::DispatchStats;
 using pie_cuda_driver::pipeline::RetryableLaunchError;
 
 namespace {
+
+// The driver no longer generates kernels, so registration needs the table the
+// engine would supply. `pie-codegen` writes it beside the traces; see
+// support/host_kernels.hpp.
+// Cached by name: the returned slice borrows the fixture's storage, so the
+// fixture has to outlive every registration that uses it.
+const pie_cuda_driver::tests::HostKernelFixture& load_host_kernels(
+    const std::string& golden_directory, const std::string& name) {
+    static std::map<std::string, pie_cuda_driver::tests::HostKernelFixture>
+        cache;
+    auto found = cache.find(name);
+    if (found != cache.end()) return found->second;
+    pie_cuda_driver::tests::HostKernelFixture fixture;
+    std::string error;
+    const std::string path =
+        golden_directory + "-kernels/" + name + ".kernels";
+    if (!fixture.load(path, &error)) {
+        std::fprintf(stderr, "host kernel fixture: %s\n", error.c_str());
+        std::abort();
+    }
+    return cache.emplace(name, std::move(fixture)).first->second;
+}
 
 int failures = 0;
 
@@ -142,7 +168,7 @@ std::uint64_t run_case(
                 container_bytes.data(), container_bytes.size()},
             pie_native::ByteSlice{
                 sidecar_bytes.data(), sidecar_bytes.size()},
-            PieEmittedKernelSlice{},
+            load_host_kernels(golden_directory, "section3_masked_gumbel").slice(),
             PieU64Slice{},
             &error) == PIE_STATUS_OK,
         "register grouped program: " + error);
@@ -480,7 +506,7 @@ std::vector<std::int32_t> run_nucleus_case(
             hash,
             {container_bytes.data(), container_bytes.size()},
             {sidecar_bytes.data(), sidecar_bytes.size()},
-            PieEmittedKernelSlice{},
+            load_host_kernels(golden_directory, "nucleus_sample").slice(),
             PieU64Slice{},
             &error) == PIE_STATUS_OK,
         "register nucleus program: " + error);
@@ -722,7 +748,7 @@ void run_structured_mask_golden(const std::string& golden_directory) {
             hash,
             {container_bytes.data(), container_bytes.size()},
             {sidecar_bytes.data(), sidecar_bytes.size()},
-            PieEmittedKernelSlice{},
+            load_host_kernels(golden_directory, "structured_masks").slice(),
             PieU64Slice{},
             &error) == PIE_STATUS_OK,
         "register structured-mask golden: " + error);
@@ -915,7 +941,7 @@ void run_declared_phase_case(
                 hash,
                 {container_bytes.data(), container_bytes.size()},
                 {sidecar_bytes.data(), sidecar_bytes.size()},
-                PieEmittedKernelSlice{},
+                load_host_kernels(golden_directory, "staged_dispatch").slice(),
             PieU64Slice{},
                 &error) == PIE_STATUS_UNSUPPORTED,
             "model without attention hook coverage rejects registration");
@@ -928,7 +954,7 @@ void run_declared_phase_case(
             hash,
             {container_bytes.data(), container_bytes.size()},
             {sidecar_bytes.data(), sidecar_bytes.size()},
-            PieEmittedKernelSlice{},
+            load_host_kernels(golden_directory, "staged_dispatch").slice(),
             PieU64Slice{},
             &error) == PIE_STATUS_OK,
         "register staged program: " + error);
@@ -1447,7 +1473,7 @@ std::vector<std::uint8_t> run_beam_case(
             hash,
             {container_bytes.data(), container_bytes.size()},
             {sidecar_bytes.data(), sidecar_bytes.size()},
-            PieEmittedKernelSlice{},
+            load_host_kernels(golden_directory, "beam_epilogue").slice(),
             PieU64Slice{},
             &error) == PIE_STATUS_OK,
         "register beam program: " + error);
@@ -1711,7 +1737,7 @@ void run_mtp_direct_case(const std::string& golden_directory) {
             hash,
             {container_bytes.data(), container_bytes.size()},
             {sidecar_bytes.data(), sidecar_bytes.size()},
-            PieEmittedKernelSlice{},
+            load_host_kernels(golden_directory, "mtp_verify_tail").slice(),
             PieU64Slice{},
             &error) == PIE_STATUS_OK,
         "register MtpLogits fixture: " + error);
@@ -1929,7 +1955,7 @@ void run_parallel_signature_case(const std::string& golden_directory) {
                 result.hash,
                 {canonical.data(), canonical.size()},
                 {sidecar.data(), sidecar.size()},
-                PieEmittedKernelSlice{},
+                load_host_kernels(golden_directory, "mtp_verify_tail").slice(),
             PieU64Slice{},
                 &error) == PIE_STATUS_OK,
             "parallel-signature program registration: " + error);

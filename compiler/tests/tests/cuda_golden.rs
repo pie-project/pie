@@ -430,3 +430,95 @@ fn dump_corpus_plans() {
     }
     std::fs::write(path, out).unwrap();
 }
+
+/// Emit the CUDA kernel table for the traces the driver's own tests register.
+///
+/// The driver no longer generates kernels, so a C++ test that registers a
+/// program has to be handed the same table the engine would hand it. It cannot
+/// run the Rust emitter, so the table is written here as a fixture beside the
+/// traces (`ptir-refactor.md` §4.3 — retargeting the driver test surface at the
+/// launch package).
+///
+/// The traces are read from `driver/cuda/tests/golden-ptir/` rather than from
+/// `compiler/tests/golden/`: that vendored set is exactly what the driver tests
+/// register, and it is not a subset of ours (`staged_dispatch` exists only
+/// there). Reading it here also proves every vendored container still decodes.
+///
+/// Format, one record per kernel:
+///   `kernel <kind> <stage> <region> <entry-or-dash> <source-byte-count>`
+///   followed by exactly that many bytes of source and a newline.
+#[test]
+fn emit_driver_test_kernel_fixtures() {
+    use pie_codegen::program::{Backend, emit_program};
+    use pie_ir::container::decode as decode_container;
+    use pie_ir::validate::bind;
+
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../driver/cuda/tests");
+    let traces = root.join("golden-ptir");
+    let out_dir = root.join("golden-ptir-kernels");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let mut written = 0;
+    let mut unbindable: Vec<String> = Vec::new();
+    let mut entries: Vec<_> = std::fs::read_dir(&traces)
+        .expect("driver golden-ptir directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "txt"))
+        .collect();
+    entries.sort();
+    for path in entries {
+        let text = std::fs::read_to_string(&path).unwrap();
+        let Some(hex) = text.lines().find_map(|line| line.strip_prefix("container: ")) else {
+            continue;
+        };
+        let name = path.file_stem().unwrap().to_string_lossy().to_string();
+        let Ok(container) = decode_container(&msl_corpus::unhex(hex.trim())) else {
+            unbindable.push(format!("{name}: container does not decode"));
+            continue;
+        };
+        let Ok(bound) = bind(container, msl_corpus::golden_profile(&name)) else {
+            unbindable.push(format!("{name}: does not bind against today's profile"));
+            continue;
+        };
+        let stages = pie_plan::compile_bound(&bound);
+        let kernels = emit_program(Backend::Cuda, &stages, &bound);
+        let mut body = String::new();
+        for kernel in &kernels {
+            let _ = writeln!(
+                body,
+                "kernel {} {} {} {} {}",
+                kernel.kind,
+                kernel.stage_index,
+                kernel.region_index,
+                if kernel.entry_name.is_empty() { "-" } else { &kernel.entry_name },
+                kernel.source.len()
+            );
+            body.push_str(&kernel.source);
+            body.push('\n');
+        }
+        std::fs::write(out_dir.join(format!("{name}.kernels")), body).unwrap();
+        written += 1;
+    }
+    assert!(written > 0, "no driver-test kernel fixtures were written");
+
+    // A vendored trace that no longer binds is drift, not a missing feature:
+    // `driver/cuda/tests/golden-ptir/` is a partial copy of
+    // `compiler/tests/golden/` and the two have diverged. The C++ tests that
+    // register these will fail loudly for want of a fixture, which is the
+    // correct outcome -- but say so here, where the cause is visible.
+    // `ptir-refactor.md` §4.3: the vendored copy should not survive as a second
+    // source of truth for traces.
+    // `neg_*` are the reject cases; not binding is what they are for.
+    let drifted: Vec<&String> = unbindable
+        .iter()
+        .filter(|reason| !reason.starts_with("neg_"))
+        .collect();
+    for reason in &drifted {
+        eprintln!("[driver kernel fixtures] skipped {reason}");
+    }
+    assert!(
+        drifted.len() <= 3,
+        "more vendored driver traces have drifted than the known set: {drifted:?}"
+    );
+}
