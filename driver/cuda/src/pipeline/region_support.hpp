@@ -280,42 +280,17 @@ inline bool valid_identifier(const std::string& name) {
 
 }  // namespace detail
 
-inline bool second_party_region_supported(
-    const pie_native::ptir::plan::StagePlan& stage,
-    const pie_native::ptir::plan::Region& region) {
-    if (region.nodes.size() != 1) return false;
-    const std::uint32_t node = region.nodes.front();
-    if (node >= stage.ops.size()) return false;
-    const auto& op = stage.ops[node].op;
-    if (op.tag == PTIR_OP_SINK_CALL) {
-        // `attn_page_mask(mask)` -- a configuration sink. One argument, no
-        // result. The mask is a per-page vector over the request's page list,
-        // so the only structural claim that holds is rank 1; its extent is the
-        // program's own page ceiling, which the runtime checks against the
-        // lane's actual page count.
-        if (op.name_idx >= stage.names.size()) return false;
-        if (stage.names[op.name_idx] != "attn_page_mask") return false;
-        if (op.args.size() != 1 || op.results != 0) return false;
-        if (!region.outputs.empty()) return false;
-        if (region.inputs.size() != 1) return false;
-        const auto& mask_type = stage.value_types[region.inputs.front()];
-        if (mask_type.dims.size() != 1) return false;
-        return stage.stage == PTIR_STAGE_ON_ATTN_PROJ;
-    }
-    if (op.tag != PTIR_OP_KERNEL_CALL) return false;
-    if (op.name_idx >= stage.names.size()) return false;
-    if (stage.names[op.name_idx] != "envelope_dot") return false;
-    if (op.args.size() != 1 || op.results != 1) return false;
-    // The score is a per-page f32 vector. A different rank or dtype means the
-    // program disagrees with the kernel's ABI.
-    if (region.outputs.size() != 1) return false;
-    const auto& result_type = stage.value_types[region.outputs.front()];
-    if (result_type.dtype != PTIR_DT_F32 || result_type.dims.size() != 1) {
-        return false;
-    }
-    return stage.stage == PTIR_STAGE_ON_ATTN_PROJ ||
-           stage.stage == PTIR_STAGE_ON_ATTN;
-}
+// The three per-region analyses that used to live here -- the bind gates
+// `second_party_region_supported` and `validate_generated_region`, and the
+// intrinsic side-table analysis `analyze_direct_argmax` -- are gone
+// (`ptir-refactor.md` §4.2, fields 4 and 5). They were a second
+// implementation of decisions `compiler/codegen` had already made to emit the
+// kernel that consumes them, and the two could disagree without failing to
+// compile: the kernel would read a side-table slot the packer never wrote.
+// The host now ships its answers as `PieProgramDesc::region_analysis` and the
+// driver carries them on `FusedStageExecutable::region_analysis`. They were
+// deleted at `region_divergent == 0` with `region_host_supplied != 0`, over
+// the vendored corpus and the curated e2e matrix (`824421813`).
 
 inline constexpr std::uint16_t kCudaGeneratedEmitterVersion = 19;
 
@@ -329,163 +304,5 @@ inline constexpr std::uint16_t kCudaGeneratedEmitterVersion = 19;
 inline constexpr std::uint32_t kPtirIntrinsicSlots =
     static_cast<std::uint32_t>(PTIR_INTR_ATTN_SCORE) + 1u;
 static_assert(kPtirIntrinsicSlots == 8u);
-
-inline bool validate_generated_region(
-    const pie_native::ptir::plan::StagePlan& stage,
-    const pie_native::ptir::plan::Region& region,
-    std::string& error) {
-    error.clear();
-    if (region.library || region.schedule == PTIR_SCHEDULE_LIBRARY ||
-        region.nodes.empty()) {
-        error = "fused CUDA emitter requires a non-library generated region";
-        return false;
-    }
-    std::uint32_t previous = 0;
-    bool have_previous = false;
-    for (const std::uint32_t node : region.nodes) {
-        if (node >= stage.ops.size() ||
-            (have_previous && node <= previous)) {
-            error = "generated region nodes are invalid or unordered";
-            return false;
-        }
-        const auto& op = stage.ops[node].op;
-        if (!detail::supported_tag(op.tag) ||
-            op.tag == PTIR_OP_KERNEL_CALL ||
-            op.tag == PTIR_OP_SINK_CALL) {
-            error = "generated region contains a non-generated boundary";
-            return false;
-        }
-        previous = node;
-        have_previous = true;
-    }
-    return true;
-}
-
-struct DirectArgmaxAnalysis {
-    std::vector<std::uint16_t> intrinsic;
-    std::vector<std::uint8_t> skipped;
-    std::vector<std::uint32_t> source_value;
-    std::vector<std::uint8_t> requires_single_row;
-};
-
-inline DirectArgmaxAnalysis analyze_direct_argmax(
-    const pie_native::ptir::plan::StagePlan& stage,
-    const pie_native::ptir::plan::Region& region,
-    const std::vector<std::uint32_t>& bases) {
-    const std::uint32_t value_count =
-        static_cast<std::uint32_t>(stage.value_types.size());
-    std::vector<std::uint32_t> producers(
-        value_count, std::numeric_limits<std::uint32_t>::max());
-    std::vector<std::vector<std::uint32_t>> consumers(value_count);
-    for (std::size_t node = 0; node < stage.ops.size(); ++node) {
-        const auto& op = stage.ops[node].op;
-        for (std::uint32_t result = 0; result < op.results; ++result) {
-            producers[bases[node] + result] =
-                static_cast<std::uint32_t>(node);
-        }
-        for (const std::uint32_t argument : op.args) {
-            consumers[argument].push_back(
-                static_cast<std::uint32_t>(node));
-        }
-    }
-    DirectArgmaxAnalysis analysis{
-        std::vector<std::uint16_t>(
-            stage.ops.size(), std::numeric_limits<std::uint16_t>::max()),
-        std::vector<std::uint8_t>(stage.ops.size(), 0),
-        std::vector<std::uint32_t>(
-            stage.ops.size(), std::numeric_limits<std::uint32_t>::max()),
-        std::vector<std::uint8_t>(stage.ops.size(), 0),
-    };
-    struct RowShape {
-        std::uint64_t fixed_rows = 1;
-        std::uint32_t row_extent = UINT32_MAX;
-        std::uint32_t width = 1;
-        bool operator==(const RowShape&) const = default;
-    };
-    auto row_shape = [](const auto& type) -> std::optional<RowShape> {
-        RowShape shape;
-        if (type.dims.size() >= 2) {
-            for (std::size_t dimension = 0;
-                 dimension + 1 < type.dims.size();
-                 ++dimension) {
-                if (type.dims[dimension].symbolic) {
-                    if (shape.row_extent != UINT32_MAX) {
-                        return std::nullopt;
-                    }
-                    shape.row_extent = type.dims[dimension].value;
-                } else {
-                    if (type.dims[dimension].value == 0 ||
-                        shape.fixed_rows >
-                            std::numeric_limits<std::uint64_t>::max() /
-                                type.dims[dimension].value) {
-                        return std::nullopt;
-                    }
-                    shape.fixed_rows *= type.dims[dimension].value;
-                }
-            }
-        }
-        if (!type.dims.empty()) {
-            if (type.dims.back().symbolic) return std::nullopt;
-            shape.width = type.dims.back().value;
-            if (shape.width == 0) return std::nullopt;
-        }
-        return shape;
-    };
-    for (const std::uint32_t node : region.nodes) {
-        const auto& reduction = stage.ops[node].op;
-        if (reduction.tag != PTIR_OP_REDUCE_ARGMAX ||
-            reduction.args.empty()) {
-            continue;
-        }
-        std::uint32_t value = reduction.args[0];
-        std::uint32_t expected_consumer = node;
-        std::vector<std::uint32_t> chain;
-        while (value < producers.size() &&
-               producers[value] != std::numeric_limits<std::uint32_t>::max() &&
-               consumers[value].size() == 1 &&
-               consumers[value][0] == expected_consumer) {
-            const std::uint32_t producer = producers[value];
-            const auto& op = stage.ops[producer].op;
-            chain.push_back(producer);
-            if (op.tag == PTIR_OP_RESHAPE && !op.args.empty()) {
-                expected_consumer = producer;
-                value = op.args[0];
-                continue;
-            }
-            if (op.tag != PTIR_OP_INTRINSIC_VAL ||
-                (op.intr != PTIR_INTR_LOGITS &&
-                 op.intr != PTIR_INTR_MTP_LOGITS)) {
-                break;
-            }
-            const auto source_shape =
-                row_shape(stage.value_types[bases[producer]]);
-            const auto reduction_shape =
-                row_shape(stage.value_types[reduction.args[0]]);
-            const bool exact_shape =
-                source_shape.has_value() &&
-                reduction_shape == source_shape;
-            const bool runtime_single_row =
-                source_shape.has_value() &&
-                reduction_shape.has_value() &&
-                source_shape->width == reduction_shape->width &&
-                source_shape->fixed_rows == 1 &&
-                reduction_shape->fixed_rows == 1 &&
-                source_shape->row_extent != UINT32_MAX &&
-                reduction_shape->row_extent == UINT32_MAX;
-            if (exact_shape || runtime_single_row) {
-                analysis.intrinsic[node] = op.intr;
-                analysis.source_value[node] = bases[producer];
-                analysis.requires_single_row[node] =
-                    runtime_single_row ? 1 : 0;
-                for (const std::uint32_t skipped : chain) {
-                    analysis.skipped[skipped] = 1;
-                }
-            }
-            break;
-        }
-    }
-    return analysis;
-}
-
 
 }  // namespace pie_cuda_driver::pipeline::generated

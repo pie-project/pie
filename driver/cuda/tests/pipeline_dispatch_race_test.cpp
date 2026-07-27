@@ -25,6 +25,7 @@
 #include <cuda_runtime.h>
 
 #include "pie_native/ptir/container.hpp"
+#include "support/host_kernels.hpp"
 #include "pipeline/dispatch.hpp"
 
 using pie_cuda_driver::pipeline::Dispatch;
@@ -139,6 +140,19 @@ int main() {
     if (!expect(!bytes.empty() && !sidecar.empty() && hash != 0,
                 "load golden PTIR")) return 1;
 
+    // The launch package the engine would have handed the driver. Kept beside
+    // the trace by `cargo test -p pie-compiler-tests --test cuda_golden
+    // emit_driver_test_kernel`; the driver derives none of it any more.
+    const std::string fixture = "../tests/golden-ptir-kernels/greedy_argmax";
+    pie_cuda_driver::tests::HostKernelFixture host_kernels;
+    pie_cuda_driver::tests::HostIdentityFixture host_identities;
+    pie_cuda_driver::tests::HostRegionFixture host_regions;
+    std::string fixture_error;
+    if (!expect(host_kernels.load(fixture + ".kernels", &fixture_error) &&
+                    host_identities.load(fixture + ".identities", &fixture_error) &&
+                    host_regions.load(fixture + ".regions", &fixture_error),
+                fixture_error.c_str())) return 1;
+
     setenv("PIE_CUDA_FORCE_RETRY_ONCE", "1", 1);
     Dispatch dispatch;
     std::string err;
@@ -147,6 +161,9 @@ int main() {
                     hash,
                     pie_native::ByteSlice{bytes.data(), bytes.size()},
                     pie_native::ByteSlice{sidecar.data(), sidecar.size()},
+                    host_kernels.slice(),
+                    host_identities.slice(),
+                    host_regions.slice(),
                     &err) == PIE_STATUS_OK,
                 err.c_str())) return 1;
 

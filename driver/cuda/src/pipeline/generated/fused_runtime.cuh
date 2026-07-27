@@ -847,7 +847,8 @@ inline bool generated_stage_supported(
     };
     if (executable.signature_hash != stage.signature_hash ||
         executable.signature != stage.signature ||
-        executable.regions.size() != stage.fused.regions.size()) {
+        executable.regions.size() != stage.fused.regions.size() ||
+        executable.region_analysis.size() != stage.fused.regions.size()) {
         return fail("compiled fused stage identity mismatch");
     }
     for (std::size_t index = 0;
@@ -856,7 +857,8 @@ inline bool generated_stage_supported(
         const auto& region = stage.fused.regions[index];
         if (region.library) {
             if (region.library_op == PTIR_LIBRARY_SECOND_PARTY) {
-                if (!second_party_region_supported(stage, region)) {
+                if (!executable.region_analysis[index]
+                         .second_party_supported()) {
                     return fail(
                         "fused stage still requires a second-party library");
                 }
@@ -884,13 +886,12 @@ inline bool generated_stage_supported(
 inline std::optional<std::uint32_t>
 generated_compact_argmax_value(
     const plan::StagePlan& stage,
-    const std::vector<std::uint32_t>& bases) {
+    const std::vector<std::uint32_t>& bases,
+    const StageRegionAnalysis& direct) {
     if (stage.fused.regions.size() != 1 ||
         stage.fused.regions.front().library) {
         return std::nullopt;
     }
-    const DirectArgmaxAnalysis direct = analyze_direct_argmax(
-        stage, stage.fused.regions.front(), bases);
     std::vector<std::uint32_t> aliases(stage.value_types.size());
     for (std::uint32_t value = 0; value < aliases.size(); ++value) {
         aliases[value] = value;
@@ -914,9 +915,12 @@ generated_compact_argmax_value(
             continue;
         }
         if (op.tag == PTIR_OP_REDUCE_ARGMAX && op.results == 1) {
+            const StageRegionArgmax* record =
+                direct.argmax_for(static_cast<std::uint32_t>(node));
             if (argmax_value != UINT32_MAX ||
                 resolve_alias(op.args[0]) != intrinsic_value ||
-                direct.intrinsic[node] != PTIR_INTR_LOGITS) {
+                record == nullptr ||
+                record->intrinsic != PTIR_INTR_LOGITS) {
                 return std::nullopt;
             }
             argmax_value = bases[node];
@@ -1229,7 +1233,10 @@ inline GroupedLaunchResult run_generated_stage(
             break;
         }
     }
-    for (const auto& region : stage.fused.regions) {
+    for (std::size_t region_index = 0;
+         region_index < stage.fused.regions.size();
+         ++region_index) {
+        const auto& region = stage.fused.regions[region_index];
         if (region.library) {
             if (region.library_op == PTIR_LIBRARY_NUCLEUS_SAMPLE) {
                 for (const std::uint32_t node : region.nodes) {
@@ -1250,12 +1257,12 @@ inline GroupedLaunchResult run_generated_stage(
             }
             continue;
         }
-        const DirectArgmaxAnalysis direct =
-            analyze_direct_argmax(stage, region, bases);
+        const StageRegionAnalysis& direct =
+            executable.region_analysis[region_index];
         for (const std::uint32_t node : region.nodes) {
-            if (direct.requires_single_row[node] != 0) {
-                const std::uint32_t source =
-                    direct.source_value[node];
+            const StageRegionArgmax* record = direct.argmax_for(node);
+            if (record != nullptr && record->requires_single_row != 0) {
+                const std::uint32_t source = record->source_value;
                 for (std::uint32_t lane = 0;
                      lane < lane_count;
                      ++lane) {
@@ -1276,12 +1283,11 @@ inline GroupedLaunchResult run_generated_stage(
                     region.outputs.begin(),
                     region.outputs.end(),
                     bases[node]) == region.outputs.end();
-            if (direct.skipped[node] == 0 && !internal_reshape) {
-                continue;
-            }
+            const bool skipped = direct.is_skipped(node);
+            if (!skipped && !internal_reshape) continue;
             for (std::uint32_t result = 0; result < op.results; ++result) {
                 maximum_value_bytes[bases[node] + result] = 4;
-                if (direct.skipped[node] != 0) {
+                if (skipped) {
                     temporary_elided[bases[node] + result] = 1;
                 }
             }
@@ -1318,7 +1324,8 @@ inline GroupedLaunchResult run_generated_stage(
         }
     }
     const std::optional<std::uint32_t> direct_argmax_value =
-        generated_compact_argmax_value(stage, bases);
+        generated_compact_argmax_value(
+            stage, bases, executable.region_analysis.front());
     std::vector<std::uint32_t> host_offsets(value_count);
     std::size_t scratch_stride = 0;
     std::size_t temporary_offset_size = 0;

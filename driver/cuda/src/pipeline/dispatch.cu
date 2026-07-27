@@ -78,6 +78,33 @@ public:
         }
     }
 
+    // The host's region analysis rides the same table, keyed the same way.
+    // It is the other half of one contract: the kernel above was emitted from
+    // these answers, and the packer fills its side tables from them.
+    void adopt(PieRegionAnalysisSlice slice) {
+        if (slice.ptr == nullptr) return;
+        for (std::size_t i = 0; i < slice.len; ++i) {
+            const PieRegionAnalysis& region = slice.ptr[i];
+            generated::StageRegionAnalysis analysis;
+            analysis.flags = region.flags;
+            analysis.direct_argmax.reserve(region.direct_argmax.len);
+            for (std::size_t j = 0; j < region.direct_argmax.len; ++j) {
+                const PieDirectArgmax& record = region.direct_argmax.ptr[j];
+                analysis.direct_argmax.push_back(
+                    generated::StageRegionArgmax{
+                        record.node,
+                        record.source_value,
+                        record.intrinsic,
+                        record.requires_single_row});
+            }
+            analysis.skipped.assign(
+                region.skipped.ptr, region.skipped.ptr + region.skipped.len);
+            regions_.emplace(
+                Key{region.stage_index, region.region_index},
+                std::move(analysis));
+        }
+    }
+
     static generated::ModuleCache::HostRegion lookup(
         void* context, std::size_t stage_index, std::size_t region_index) {
         auto* self = static_cast<HostEmittedKernels*>(context);
@@ -86,6 +113,16 @@ public:
             static_cast<std::uint32_t>(region_index)});
         if (found == self->sources_.end()) return {};
         return {&found->second.entry, &found->second.source};
+    }
+
+    static const generated::StageRegionAnalysis* lookup_region(
+        void* context, std::size_t stage_index, std::size_t region_index) {
+        auto* self = static_cast<HostEmittedKernels*>(context);
+        const auto found = self->regions_.find(Key{
+            static_cast<std::uint32_t>(stage_index),
+            static_cast<std::uint32_t>(region_index)});
+        if (found == self->regions_.end()) return nullptr;
+        return &found->second;
     }
 
 private:
@@ -111,6 +148,7 @@ private:
         }
     };
     std::unordered_map<Key, Region, KeyHash> sources_;
+    std::unordered_map<Key, generated::StageRegionAnalysis, KeyHash> regions_;
 };
 
 }  // namespace
@@ -2451,10 +2489,7 @@ DispatchStats Dispatch::stats() const {
     result.identity_host_supplied = identities.host_supplied;
     result.identity_derived = identities.derived;
     result.identity_divergent = identities.divergent;
-    const auto regions = impl_->cache.region_stats();
-    result.region_host_supplied = regions.host_supplied;
-    result.region_derived = regions.derived;
-    result.region_divergent = regions.divergent;
+    result.region_host_supplied = impl_->cache.region_stats().host_supplied;
     result.channel_slot_capacity = impl_->channels.capacity_slots();
     return result;
 }
@@ -3069,13 +3104,15 @@ int Dispatch::register_program(std::uint64_t program_hash,
     // up without rescanning; an empty table leaves every lookup null and the
     // in-driver emitter runs exactly as before.
     HostEmittedKernels host_kernels(emitted);
+    host_kernels.adopt(region_analysis);
     const auto compiled_program = impl_->fused_modules.compile_program(
             program_hash,
             *plans,
             compile_failure,
             compile_error,
             HostEmittedKernels::lookup,
-            &host_kernels);
+            &host_kernels,
+            HostEmittedKernels::lookup_region);
     if (compiled_program == nullptr) {
         if (err) *err = std::move(compile_error);
         return compile_failure == generated::CompileFailureKind::Deterministic

@@ -52,119 +52,38 @@ const pie_cuda_driver::tests::HostKernelFixture& load_host_kernels(
     return cache.emplace(name, std::move(fixture)).first->second;
 }
 
-// The stage identities the host would ship in the same launch package. Handed
-// over as a fixture for the same reason the kernels are: a C++ test cannot run
-// the host planner. Supplying them is what makes the driver's divergence
-// counter mean something -- with an empty slice the driver silently falls back
-// to its own derivation and `identity_divergent` stays zero because nothing
-// was ever compared.
-const std::vector<std::uint64_t>& load_host_stage_identities(
-    const std::string& golden_directory, const std::string& name) {
-    static std::map<std::string, std::vector<std::uint64_t>> cache;
+// The stage identities and per-region analysis the host would ship in the same
+// launch package. Handed over as fixtures for the same reason the kernels are:
+// a C++ test cannot run the host planner.
+template <typename Fixture>
+const Fixture& load_fixture(
+    const std::string& golden_directory,
+    const std::string& name,
+    const char* suffix) {
+    static std::map<std::string, Fixture> cache;
     auto found = cache.find(name);
     if (found != cache.end()) return found->second;
-    const std::string path =
-        golden_directory + "-kernels/" + name + ".identities";
-    std::ifstream input(path);
-    if (!input) {
-        std::fprintf(
-            stderr, "host stage identity fixture: cannot open %s\n",
-            path.c_str());
+    Fixture fixture;
+    std::string error;
+    if (!fixture.load(golden_directory + "-kernels/" + name + suffix, &error)) {
+        std::fprintf(stderr, "%s\n", error.c_str());
         std::abort();
-    }
-    std::vector<std::uint64_t> identities;
-    std::string line;
-    while (std::getline(input, line)) {
-        if (line.find_first_not_of(" \t\r\n") == std::string::npos) continue;
-        identities.push_back(std::stoull(line, nullptr, 16));
-    }
-    return cache.emplace(name, std::move(identities)).first->second;
-}
-
-PieU64Slice host_stage_identities(
-    const std::string& golden_directory, const std::string& name) {
-    const std::vector<std::uint64_t>& identities =
-        load_host_stage_identities(golden_directory, name);
-    return PieU64Slice{identities.data(), identities.size()};
-}
-
-// The per-region analysis, same fixture path and same reason. The nested
-// `direct_argmax` and `skipped` slices point into the cached vectors, so the
-// whole record has to be cached together rather than rebuilt per call.
-struct HostRegionFixture {
-    std::vector<PieRegionAnalysis> regions;
-    std::vector<std::vector<PieDirectArgmax>> argmax;
-    std::vector<std::vector<std::uint32_t>> skipped;
-};
-
-const HostRegionFixture& load_host_region_analysis(
-    const std::string& golden_directory, const std::string& name) {
-    static std::map<std::string, HostRegionFixture> cache;
-    auto found = cache.find(name);
-    if (found != cache.end()) return found->second;
-    const std::string path = golden_directory + "-kernels/" + name + ".regions";
-    std::ifstream input(path);
-    if (!input) {
-        std::fprintf(
-            stderr, "host region analysis fixture: cannot open %s\n",
-            path.c_str());
-        std::abort();
-    }
-    HostRegionFixture fixture;
-    std::string line;
-    while (std::getline(input, line)) {
-        std::istringstream fields(line);
-        std::string kind;
-        if (!(fields >> kind)) continue;
-        if (kind == "region") {
-            PieRegionAnalysis region{};
-            std::uint32_t argmax_count = 0;
-            fields >> region.stage_index >> region.region_index >>
-                region.flags >> argmax_count;
-            std::vector<std::uint32_t> skipped;
-            std::uint32_t node = 0;
-            while (fields >> node) skipped.push_back(node);
-            fixture.skipped.push_back(std::move(skipped));
-            fixture.argmax.emplace_back();
-            fixture.argmax.back().reserve(argmax_count);
-            fixture.regions.push_back(region);
-        } else if (kind == "argmax") {
-            if (fixture.argmax.empty()) {
-                std::fprintf(
-                    stderr, "host region analysis fixture: %s has an argmax "
-                    "record before any region\n", path.c_str());
-                std::abort();
-            }
-            PieDirectArgmax record{};
-            std::uint32_t intrinsic = 0;
-            std::uint32_t single_row = 0;
-            fields >> record.node >> record.source_value >> intrinsic >>
-                single_row;
-            record.intrinsic = static_cast<std::uint16_t>(intrinsic);
-            record.requires_single_row =
-                static_cast<std::uint8_t>(single_row);
-            fixture.argmax.back().push_back(record);
-        }
-    }
-    // The nested pointers are taken only after every vector has stopped
-    // growing; taken during the parse they would dangle on the next
-    // reallocation.
-    for (std::size_t i = 0; i < fixture.regions.size(); ++i) {
-        fixture.regions[i].direct_argmax =
-            PieDirectArgmaxSlice{fixture.argmax[i].data(),
-                                 fixture.argmax[i].size()};
-        fixture.regions[i].skipped =
-            PieU32Slice{fixture.skipped[i].data(), fixture.skipped[i].size()};
     }
     return cache.emplace(name, std::move(fixture)).first->second;
 }
 
+PieU64Slice host_stage_identities(
+    const std::string& golden_directory, const std::string& name) {
+    return load_fixture<pie_cuda_driver::tests::HostIdentityFixture>(
+               golden_directory, name, ".identities")
+        .slice();
+}
+
 PieRegionAnalysisSlice host_region_analysis(
     const std::string& golden_directory, const std::string& name) {
-    const HostRegionFixture& fixture =
-        load_host_region_analysis(golden_directory, name);
-    return PieRegionAnalysisSlice{fixture.regions.data(),
-                                  fixture.regions.size()};
+    return load_fixture<pie_cuda_driver::tests::HostRegionFixture>(
+               golden_directory, name, ".regions")
+        .slice();
 }
 
 int failures = 0;
@@ -319,15 +238,13 @@ std::uint64_t run_case(
             std::to_string(registration_stats.identity_host_supplied) +
             " divergent=" +
             std::to_string(registration_stats.identity_divergent));
-    // Same gate for `region_support.hpp`. Read as a pair for the same reason.
+    // `region_support.hpp`'s copies are deleted, so this is no longer a
+    // divergence gate: registration cannot get this far without the host's
+    // table, and the assertion records that the fixture is what supplied it.
     expect(
-        registration_stats.region_host_supplied != 0 &&
-            registration_stats.region_divergent == 0,
-        "the driver derives the host's region analysis, and says so: "
-        "host_supplied=" +
-            std::to_string(registration_stats.region_host_supplied) +
-            " divergent=" +
-            std::to_string(registration_stats.region_divergent));
+        registration_stats.region_host_supplied != 0,
+        "registration consumed the host's region analysis: host_supplied=" +
+            std::to_string(registration_stats.region_host_supplied));
 
     std::vector<std::uint64_t> hashes(lane_count, hash);
     std::vector<std::uint64_t> instances(lane_count);

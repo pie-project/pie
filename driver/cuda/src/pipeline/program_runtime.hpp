@@ -41,7 +41,6 @@
 #include "pie_native/ptir/container.hpp"
 #include "pie_native/ptir/plan.hpp"
 #include "pipeline/program_identity.hpp"
-#include "pipeline/region_support.hpp"
 #include "pipeline/tier0/tier0_runner.hpp"
 #include "pie_native/ptir/trace.hpp"
 
@@ -408,25 +407,23 @@ class PtirProgramCache {
         return true;
     }
 
-    // How often the host's per-region analysis was supplied, and how often it
-    // disagreed with what this driver derived. Same shape and the same reason
-    // as the stage identities above: `region_support.hpp`'s bind gates and
-    // `analyze_direct_argmax` are decisions about the program, and the host has
-    // already made them to emit the kernel that consumes them.
-    //
-    // A disagreement here is worse than a wrong graph key: the emitted kernel
-    // reads intrinsic side-table slots the host packer fills from *its*
-    // analysis, so a divergence means the kernel reads a slot nobody wrote.
+    // The host's per-region analysis (`region_support.hpp`'s former bind gates
+    // and `analyze_direct_argmax`) is now the only copy: the driver's was
+    // deleted once this counter read `divergent == 0` with `host_supplied != 0`
+    // over the vendored corpus and the curated matrix. `derived` and
+    // `divergent` are gone with it -- there is nothing left to derive or
+    // disagree with -- and what remains is the shape check, which stopped
+    // being a diagnostic and became load-bearing the moment the driver started
+    // indexing this table instead of rebuilding it.
     struct RegionStats {
         std::uint64_t host_supplied = 0;
-        std::uint64_t derived = 0;
-        std::uint64_t divergent = 0;
     };
     const RegionStats& region_stats() const { return region_stats_; }
 
-    // Compare the host's region table against what this driver derives.
-    // Returns false only when the host described a set of regions this program
-    // does not have, which is an ABI bug rather than a divergence.
+    // Validate the host's region table against the program's actual shape.
+    // Returns false when it names regions this program does not have, which is
+    // an ABI bug: the module cache indexes this table by `(stage, region)` and
+    // a short or misaddressed one silently binds the wrong kernel contract.
     bool adopt_host_region_analysis(
         std::uint64_t hash,
         const PieRegionAnalysis* host,
@@ -440,7 +437,9 @@ class PtirProgramCache {
             derived_regions += stage.fused.regions.size();
         }
         if (host == nullptr || host_len == 0) {
-            region_stats_.derived += derived_regions;
+            // Not an error here: a program with no fused regions needs no
+            // table, and the module cache is the one that refuses a fused
+            // region with nothing behind it.
             return true;
         }
         if (host_len != derived_regions) {
@@ -473,87 +472,12 @@ class PtirProgramCache {
                 }
                 return false;
             }
-            if (!region_analysis_agrees(stage, supplied)) {
-                ++region_stats_.divergent;
-            }
         }
         region_stats_.host_supplied += host_len;
         return true;
     }
 
   private:
-    // Re-derive one region's analysis and compare against the host's. Prints
-    // the first field that differs, because "they differ" is not actionable
-    // and the whole point of the counter is to be able to act on it.
-    static bool region_analysis_agrees(
-        const plan::StagePlan& stage,
-        const PieRegionAnalysis& host) {
-        const plan::Region& region = stage.fused.regions[host.region_index];
-
-        std::uint32_t flags = 0;
-        if (generated::second_party_region_supported(stage, region)) {
-            flags |= PIE_REGION_SECOND_PARTY_SUPPORTED;
-        }
-        std::string ignored;
-        if (generated::validate_generated_region(stage, region, ignored)) {
-            flags |= PIE_REGION_GENERATED_VALID;
-        }
-
-        std::vector<std::uint32_t> bases(stage.ops.size());
-        std::uint32_t planned_values = 0;
-        for (std::size_t node = 0; node < stage.ops.size(); ++node) {
-            bases[node] = planned_values;
-            planned_values += stage.ops[node].op.results;
-        }
-        const generated::DirectArgmaxAnalysis direct =
-            generated::analyze_direct_argmax(stage, region, bases);
-
-        auto complain = [&](const char* field) {
-            std::fprintf(
-                stderr,
-                "[pie-driver-cuda] stage %u region %u analysis divergence: %s\n",
-                host.stage_index,
-                host.region_index,
-                field);
-            return false;
-        };
-
-        if (flags != host.flags) return complain("flags");
-
-        std::size_t supplied = 0;
-        for (std::size_t node = 0; node < direct.intrinsic.size(); ++node) {
-            if (direct.intrinsic[node] ==
-                std::numeric_limits<std::uint16_t>::max()) {
-                continue;
-            }
-            if (supplied >= host.direct_argmax.len) {
-                return complain("direct argmax count");
-            }
-            const PieDirectArgmax& entry = host.direct_argmax.ptr[supplied++];
-            if (entry.node != node ||
-                entry.intrinsic != direct.intrinsic[node] ||
-                entry.source_value != direct.source_value[node] ||
-                entry.requires_single_row != direct.requires_single_row[node]) {
-                return complain("direct argmax record");
-            }
-        }
-        if (supplied != host.direct_argmax.len) {
-            return complain("direct argmax count");
-        }
-
-        supplied = 0;
-        for (std::size_t node = 0; node < direct.skipped.size(); ++node) {
-            if (direct.skipped[node] == 0) continue;
-            if (supplied >= host.skipped.len ||
-                host.skipped.ptr[supplied++] != node) {
-                return complain("skipped nodes");
-            }
-        }
-        if (supplied != host.skipped.len) return complain("skipped nodes");
-
-        return true;
-    }
-
     struct DecodedProgram {
         Trace trace;
         std::vector<std::uint8_t> container_bytes;

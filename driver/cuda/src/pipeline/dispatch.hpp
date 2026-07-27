@@ -105,12 +105,12 @@ struct DispatchStats {
     std::uint64_t identity_host_supplied = 0;
     std::uint64_t identity_derived = 0;
     std::uint64_t identity_divergent = 0;
-    /// The same pair for the per-region analysis (`region_support.hpp`'s bind
-    /// gates and `analyze_direct_argmax`). Deleting that file's copies is
-    /// gated on `region_divergent == 0 && region_host_supplied > 0`.
+    /// Regions whose analysis the host shipped. `region_support.hpp`'s copies
+    /// are gone, so this is no longer half of a divergence gate -- it is the
+    /// count of regions the driver was told about rather than worked out, and
+    /// a program with fused regions that registers with this at zero would
+    /// have failed in the module cache first.
     std::uint64_t region_host_supplied = 0;
-    std::uint64_t region_derived = 0;
-    std::uint64_t region_divergent = 0;
     std::uint64_t descriptor_readback_batches = 0;
     std::uint64_t descriptor_readback_cells = 0;
     std::uint64_t descriptor_readback_bytes = 0;

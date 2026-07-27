@@ -50,11 +50,49 @@ struct FusedRegionExecutable {
     FusedRegionExecutable& operator=(const FusedRegionExecutable&) = delete;
 };
 
+// One `argmax` that reads a logits intrinsic's device buffer directly, and
+// the nodes that rewrite makes redundant. Decided by the host
+// (`compiler/codegen/src/region_analysis.rs`), because the kernel that reads
+// these slots was emitted from the same answer.
+struct StageRegionArgmax {
+    std::uint32_t node = 0;
+    std::uint32_t source_value = 0;
+    std::uint16_t intrinsic = 0;
+    std::uint8_t requires_single_row = 0;
+};
+
+// The host's verdict on one fused region, in the driver's own storage so it
+// outlives the registration call that carried it.
+struct StageRegionAnalysis {
+    std::uint32_t flags = 0;
+    std::vector<StageRegionArgmax> direct_argmax;
+    std::vector<std::uint32_t> skipped;
+
+    bool second_party_supported() const {
+        return (flags & PIE_REGION_SECOND_PARTY_SUPPORTED) != 0;
+    }
+    // Dense lookup by node, for the two launch-path consumers that ask
+    // "does this node have a rewrite" once per node.
+    const StageRegionArgmax* argmax_for(std::uint32_t node) const {
+        for (const StageRegionArgmax& record : direct_argmax) {
+            if (record.node == node) return &record;
+        }
+        return nullptr;
+    }
+    bool is_skipped(std::uint32_t node) const {
+        return std::find(skipped.begin(), skipped.end(), node) !=
+            skipped.end();
+    }
+};
+
 struct FusedStageExecutable {
     std::uint64_t runtime_id = 0;
     std::uint64_t signature_hash = 0;
     std::vector<std::uint8_t> signature;
     std::vector<std::shared_ptr<FusedRegionExecutable>> regions;
+    // Parallel to `regions`, including the library ones: the bind gates apply
+    // to those and only those.
+    std::vector<StageRegionAnalysis> region_analysis;
 };
 
 struct FusedProgramExecutable {
@@ -112,6 +150,11 @@ class ModuleCache {
     };
     using HostSource = HostRegion (*)(
         void* context, std::size_t stage_index, std::size_t region_index);
+    // The host's per-region analysis, looked up the same way. Null means the
+    // caller shipped none, which is a registration failure for any program
+    // with fused regions -- the driver no longer derives these.
+    using HostRegionAnalysis = const StageRegionAnalysis* (*)(
+        void* context, std::size_t stage_index, std::size_t region_index);
 
     std::shared_ptr<const FusedProgramExecutable> compile_program(
         std::uint64_t program_hash,
@@ -119,7 +162,8 @@ class ModuleCache {
         CompileFailureKind& failure_kind,
         std::string& error,
         HostSource host_source = nullptr,
-        void* host_context = nullptr) {
+        void* host_context = nullptr,
+        HostRegionAnalysis host_region_analysis = nullptr) {
         std::lock_guard<std::mutex> lock(mutex_);
         failure_kind = CompileFailureKind::None;
         error.clear();
@@ -213,6 +257,27 @@ class ModuleCache {
             stage->signature_hash = plan.signature_hash;
             stage->signature = plan.signature;
             stage->regions.resize(plan.fused.regions.size());
+            stage->region_analysis.resize(plan.fused.regions.size());
+            for (std::size_t region_index = 0;
+                 region_index < plan.fused.regions.size();
+                 ++region_index) {
+                const StageRegionAnalysis* analysis =
+                    host_region_analysis != nullptr
+                        ? host_region_analysis(
+                              host_context, this_stage, region_index)
+                        : nullptr;
+                if (analysis == nullptr) {
+                    failure_kind = CompileFailureKind::Deterministic;
+                    error =
+                        "no host region analysis for stage " +
+                        std::to_string(this_stage) + " region " +
+                        std::to_string(region_index) +
+                        "; the driver no longer derives its own";
+                    remember_negative(key, error);
+                    return nullptr;
+                }
+                stage->region_analysis[region_index] = *analysis;
+            }
             for (std::size_t region_index = 0;
                  region_index < plan.fused.regions.size();
                  ++region_index) {
@@ -734,7 +799,7 @@ class ModuleCache {
                 return false;
             }
             if (region.library_op == PTIR_LIBRARY_SECOND_PARTY) {
-                if (!second_party_region_supported(plan, region)) {
+                if (!stage.region_analysis[index].second_party_supported()) {
                     error = "CUDA second-party library is unavailable";
                     return false;
                 }

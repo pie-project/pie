@@ -6,6 +6,7 @@
 
 #include "pipeline/dispatch.hpp"
 #include "pie_native/ptir/container.hpp"
+#include "support/host_kernels.hpp"
 
 using pie_cuda_driver::pipeline::Dispatch;
 
@@ -79,12 +80,28 @@ int main() {
     const std::uint64_t program_hash = load_golden_hash(golden);
     if (!expect(program_hash != 0, "load golden PTIR hash")) return 1;
 
+    // The launch package the engine would have handed the driver. Kept beside
+    // the trace by `cargo test -p pie-compiler-tests --test cuda_golden
+    // emit_driver_test_kernel`; the driver derives none of it any more.
+    const std::string fixture = "../tests/golden-ptir-kernels/greedy_argmax";
+    pie_cuda_driver::tests::HostKernelFixture host_kernels;
+    pie_cuda_driver::tests::HostIdentityFixture host_identities;
+    pie_cuda_driver::tests::HostRegionFixture host_regions;
+    std::string fixture_error;
+    if (!expect(host_kernels.load(fixture + ".kernels", &fixture_error) &&
+                    host_identities.load(fixture + ".identities", &fixture_error) &&
+                    host_regions.load(fixture + ".regions", &fixture_error),
+                fixture_error.c_str())) return 1;
+
     Dispatch dispatch;
     std::string err;
     const int rc = dispatch.register_program(
         program_hash,
         pie_native::ByteSlice{bytes.data(), bytes.size()},
         pie_native::ByteSlice{sidecar.data(), sidecar.size()},
+        host_kernels.slice(),
+        host_identities.slice(),
+        host_regions.slice(),
         &err);
     if (!expect(rc == PIE_STATUS_OK, err.c_str())) return 1;
 
@@ -187,14 +204,23 @@ int main() {
                     "endpoint word layout")) return 1;
         if (!expect(endpoint.word_bytes == 4 * sizeof(std::uint64_t),
                     "endpoint word bytes")) return 1;
+        // A close against a live endpoint used to be rejected outright. It is
+        // now *deferred*: the registry refcounts attachments and retires the
+        // slot at zero. The hard failure was a real bug -- a close racing an
+        // instance teardown was dropped by the engine and the slot leaked --
+        // so this assertion follows the driver rather than the other way
+        // round (`dispatch.cu::close_channel`).
         if (!expect(dispatch.close_channel(channel_ids[i], &err) ==
-                        PIE_STATUS_INVALID_ARGUMENT,
-                    "live endpoint close rejected")) return 1;
+                        PIE_STATUS_OK,
+                    "live endpoint close defers")) return 1;
     }
 
     dispatch.close_instance(binding.instance_id);
     for (std::uint64_t channel_id : channel_ids) {
-        if (!expect(dispatch.close_channel(channel_id, &err) == PIE_STATUS_OK,
+        // Already pending from the deferred close above; the slot retires when
+        // the instance that held it goes away, so this one finds nothing left.
+        const int rc = dispatch.close_channel(channel_id, &err);
+        if (!expect(rc == PIE_STATUS_OK || rc == PIE_STATUS_CLOSED,
                     err.c_str())) return 1;
     }
     std::puts("test_ptir_dispatch_bind: OK");
