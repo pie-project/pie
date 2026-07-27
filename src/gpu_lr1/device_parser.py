@@ -430,6 +430,12 @@ def _mask_kernel(
     probe = scratch + WINDOW
     high_water = 0
 
+    # Every `blocks`-th item, not a contiguous run of them. A run would let a
+    # block resolve which configuration it is in once instead of searching per
+    # item, which was tried and is worse: the groups of one state cost wildly
+    # different amounts - most die on their first terminal, a few replay whole
+    # readings - so a block handed a run gets all of one state's expensive ones.
+    # Striding mixes them. 37 us against 49.
     item = block
     while item < total:
         # Which configuration owns this item. Rows that contribute nothing have
