@@ -1,6 +1,8 @@
+
 #include "kernels/moe_dispatch.hpp"
 
 #include <cstdint>
+#include <cstdio>
 #include <cuda_bf16.h>
 #include <mma.h>
 
@@ -819,7 +821,16 @@ __global__ void moe_align_decode_kernel(
             }
             __syncthreads();
         }
-        if (threadIdx.x == 0) offsets[num_experts] = *block_base;
+        if (threadIdx.x == 0) {
+            offsets[num_experts] = *block_base;
+#if defined(PIE_MOE_ALIGN_REPORT)
+            // How many blocks the routing actually needs, against the
+            // worst-case `max_blocks` the batched GEMM always launches.
+            printf("[moe-align] used=%d max=%d routes=%d experts=%d\n",
+                   *block_base / block_size, max_blocks, num_routes,
+                   num_experts);
+#endif
+        }
     }
     __syncthreads();
     for (int e = threadIdx.x; e < num_experts; e += blockDim.x) {

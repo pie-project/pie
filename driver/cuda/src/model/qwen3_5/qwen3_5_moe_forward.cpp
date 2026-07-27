@@ -22,6 +22,7 @@
 #include "kernels/gather_rows.hpp"
 #include "kernels/kv_paged.hpp"
 #include "kernels/moe_dispatch.hpp"
+#include "kernels/moe_grouped_gemm.hpp"
 #include "kernels/residual_add.hpp"
 #include <mutex>
 #include <set>
@@ -155,6 +156,17 @@ bool moe_path_log_enabled() {
 // experts) are NOT free either. A MoE kernel that skips fully-padded blocks
 // the way vLLM's `fused_moe_kernel` does would recover far more than this,
 // and would want the shared expert folded in as well.
+// Skips the padding blocks that the static batch-count bound forces on the
+// cuBLAS path. On by default; set to 0 to fall back to cuBLAS.
+bool moe_grouped_gemm_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_QWEN35_MOE_GROUPED_GEMM");
+        if (v == nullptr || v[0] == '\0') return true;
+        return v[0] != '0';
+    }();
+    return enabled;
+}
+
 bool shared_fold_enabled() {
     static const bool enabled = [] {
         const char* v = std::getenv("PIE_QWEN35_MOE_FOLD_SHARED");
@@ -1624,16 +1636,41 @@ bool moe_block(
                         });
 
                     // Aligned gate_up: M=block_size, N=2*Im, K=H.
+                    // cuBLAS must be launched with the worst-case batch
+                    // count under graph capture, and that bound cannot drop
+                    // below the expert count while the routing needs about a
+                    // third of it. The grouped kernel takes the same bound as
+                    // a grid but returns immediately on padding blocks.
+                    // Decided per projection: the kernel wins on the short-K
+                    // one and loses on the long-K one, so they do not share
+                    // an answer.
+                    const bool grouped_ok =
+                        moe_grouped_gemm_enabled() && !fold_shared;
+                    const bool grouped_gu = grouped_ok &&
+                        kernels::moe_grouped_gemm_bf16_supported(
+                            block, 2 * Im, H);
+                    const bool grouped_dn = grouped_ok &&
+                        kernels::moe_grouped_gemm_bf16_supported(
+                            block, H, Im);
                     profile_cuda_detail_stage(
                         profile, profile ? &profile->moe_gate_up_ms : nullptr,
                         stream, [&] {
-                            ops::gemm_batched_act_x_wt_bf16(cublas.handle(),
-                                reinterpret_cast<const void* const*>(
-                                    moe_ws.b_gu_ptrs.data()),
-                                reinterpret_cast<const void* const*>(
-                                    moe_ws.a_gu_ptrs.data()),
-                                reinterpret_cast<void* const*>(moe_ws.c_gu_ptrs.data()),
-                                block, 2 * Im, H, max_blocks);
+                            if (grouped_gu) {
+                                kernels::launch_moe_grouped_gemm_bf16(
+                                    moe_ws.aligned_expert_in.data(),
+                                    Lw.moe_gate_up_proj->data(),
+                                    moe_ws.aligned_gate_up.data(),
+                                    moe_ws.aligned_expert_ids.data(),
+                                    max_blocks, block, 2 * Im, H, stream);
+                            } else {
+                                ops::gemm_batched_act_x_wt_bf16(cublas.handle(),
+                                    reinterpret_cast<const void* const*>(
+                                        moe_ws.b_gu_ptrs.data()),
+                                    reinterpret_cast<const void* const*>(
+                                        moe_ws.a_gu_ptrs.data()),
+                                    reinterpret_cast<void* const*>(moe_ws.c_gu_ptrs.data()),
+                                    block, 2 * Im, H, max_blocks);
+                            }
                         });
 
                     profile_cuda_detail_stage(
@@ -1649,13 +1686,22 @@ bool moe_block(
                     profile_cuda_detail_stage(
                         profile, profile ? &profile->moe_down_ms : nullptr,
                         stream, [&] {
-                            ops::gemm_batched_act_x_wt_bf16(cublas.handle(),
-                                reinterpret_cast<const void* const*>(
-                                    moe_ws.b_dn_ptrs.data()),
-                                reinterpret_cast<const void* const*>(
-                                    moe_ws.a_dn_ptrs.data()),
-                                reinterpret_cast<void* const*>(moe_ws.c_dn_ptrs.data()),
-                                block, H, Im, max_blocks);
+                            if (grouped_dn) {
+                                kernels::launch_moe_grouped_gemm_bf16(
+                                    moe_ws.aligned_act.data(),
+                                    Lw.moe_down_proj->data(),
+                                    moe_ws.aligned_out.data(),
+                                    moe_ws.aligned_expert_ids.data(),
+                                    max_blocks, block, H, Im, stream);
+                            } else {
+                                ops::gemm_batched_act_x_wt_bf16(cublas.handle(),
+                                    reinterpret_cast<const void* const*>(
+                                        moe_ws.b_dn_ptrs.data()),
+                                    reinterpret_cast<const void* const*>(
+                                        moe_ws.a_dn_ptrs.data()),
+                                    reinterpret_cast<void* const*>(moe_ws.c_dn_ptrs.data()),
+                                    block, H, Im, max_blocks);
+                            }
                         });
 
                     profile_cuda_detail_stage(

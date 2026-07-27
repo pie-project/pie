@@ -511,6 +511,7 @@ add_library(pie_driver_cuda_lib STATIC
   src/kernels/head_dim_pad.cu
   src/kernels/kv_paged.cu
   src/kernels/moe_dispatch.cu
+  src/kernels/moe_grouped_gemm.cu
   src/kernels/mxfp4_marlin.cu
   src/kernels/pack_dense_mask.cu
   src/kernels/quant_bf16_to_fp8.cu
