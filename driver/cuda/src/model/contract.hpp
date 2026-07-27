@@ -438,10 +438,48 @@ public:
     /// the generic tail does not publish it a second time.
     void consume(std::uint32_t id) { consumed_.insert(id); }
 
-    /// The `[start, len)` this rank owns of a `full`-long axis.
+    /// The `[start, len)` this rank owns of a `full`-long axis, as numbers.
+    ///
+    /// **`Repack` only.** A repack spec carries `source_row_offset` as an
+    /// integer a kernel reads, so the escape hatch has nowhere to put a `Shard`
+    /// node and the rank has to be resolved here. Everything affine must use
+    /// [`band`] or [`split`] instead: baking `start + tp_rank * len` into a
+    /// `Slice` makes the contract a second per-rank input to compilation, and
+    /// §6.3's rank-uniformity guarantee rests on the target being the only one.
     std::pair<std::int64_t, std::int64_t> local_range(std::int64_t full,
                                                       const std::string& what) const {
         return contract_detail::local_range(full, target_, what);
+    }
+
+    /// Record that `expr` is split across ranks along `axis`.
+    ///
+    /// Left alone when there is nothing to split, so a single-GPU contract is
+    /// identical to one authored without sharding.
+    Node split(Node expr, std::uint8_t axis) {
+        return target_.tp_size <= 1 ? expr : contract_.shard(expr, axis);
+    }
+
+    /// This rank's share of a `full`-long axis.
+    ///
+    /// A declared shape, never an offset. Divisibility is not checked here: the
+    /// loader rejects an indivisible `Shard` with a message that names the
+    /// tensor and the axis, and checking the same fact twice is how the
+    /// per-family divisibility table over `config.json` used to drift.
+    std::int64_t local_extent(std::int64_t full) const {
+        const std::int64_t world = std::max<std::int64_t>(1, target_.tp_size);
+        return full % world == 0 ? full / world : full;
+    }
+
+    /// The `[start, start + len)` band of `expr`, split across ranks.
+    ///
+    /// Returns the expression and the extent this rank ends up holding, so a
+    /// caller states a declared shape without ever computing an offset. This is
+    /// what a fused source wants: slice the band out first — that part is the
+    /// same on every rank — and let `Resolver::specialize`, the loader's one
+    /// rank-aware pass, do the arithmetic.
+    std::pair<Node, std::int64_t> band(Node expr, std::uint8_t axis, std::int64_t start,
+                                       std::int64_t len) {
+        return {split(contract_.slice(expr, axis, start, len), axis), local_extent(len)};
     }
 
 
@@ -539,16 +577,14 @@ public:
             const std::int64_t experts = raw.shape[0];
             const std::int64_t full_i = raw.shape[1] / 2;
             const std::int64_t hidden = raw.shape[2];
-            const auto [local_start, local_i] =
-                local_range(full_i, "the intermediate size of '" + std::string(raw.name) + "'");
             // Gate rows [0, I) and up rows [I, 2I) are sharded independently
             // and re-joined, so the local halves stay adjacent per expert.
             const Node src = contract_.src(std::string(raw.name));
+            auto [gate, local_i] = band(src, 1, 0, full_i);
+            auto [up, up_extent] = band(src, 1, full_i, full_i);
+            (void)up_extent;
             push_expr(std::string(raw.name), raw, {experts, 2 * local_i, hidden},
-                      contract_.cat(std::vector<Node>{
-                                         contract_.slice(src, 1, local_start, local_i),
-                                         contract_.slice(src, 1, full_i + local_start, local_i)},
-                                     1));
+                      contract_.cat(std::vector<Node>{gate, up}, 1));
         }
     }
 

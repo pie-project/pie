@@ -33,12 +33,10 @@ inline void phi3_qkv_split(ContractBuilder& b, const SourceTensor& raw) {
                  {"k_proj", q_rows, kv_rows},
                  {"v_proj", q_rows + kv_rows, kv_rows}};
     for (const auto& spec : specs) {
-        const auto [local_start, local_rows] =
-            b.local_range(spec.rows, "the row count of '" + std::string(raw.name) + "'");
+        auto [expr, local_rows] =
+            b.band(b.contract().src(std::string(raw.name)), 0, spec.start, spec.rows);
         b.push_expr(base + ".self_attn." + std::string(spec.proj) + ".weight", raw,
-                  {local_rows, cols},
-                  b.contract().slice(b.contract().src(std::string(raw.name)), 0,
-                                   spec.start + local_start, local_rows));
+                  {local_rows, cols}, expr);
     }
 }
 
@@ -56,12 +54,10 @@ inline void phi3_gate_up_split(ContractBuilder& b, const SourceTensor& raw) {
         std::int64_t start;
     } specs[] = {{"gate_proj", 0}, {"up_proj", half_rows}};
     for (const auto& spec : specs) {
-        const auto [local_start, local_rows] = b.local_range(
-            half_rows, "half the row count of '" + std::string(raw.name) + "'");
+        auto [expr, local_rows] =
+            b.band(b.contract().src(std::string(raw.name)), 0, spec.start, half_rows);
         b.push_expr(base + ".mlp." + std::string(spec.proj) + ".weight", raw,
-                  {local_rows, cols},
-                  b.contract().slice(b.contract().src(std::string(raw.name)), 0,
-                                   spec.start + local_start, local_rows));
+                  {local_rows, cols}, expr);
     }
 }
 /// Split Phi-3's fused QKV and gate/up back into the six tensors the

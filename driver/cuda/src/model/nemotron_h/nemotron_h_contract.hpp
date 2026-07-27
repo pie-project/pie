@@ -44,8 +44,7 @@ inline void nemotron_h_layer_packed_experts(ContractBuilder& b, const std::strin
         }
     }
 
-    const auto [local_start, local_intermediate] =
-        b.local_range(full_intermediate, "the intermediate size of '" + base + "'");
+    const std::int64_t local_intermediate = b.local_extent(full_intermediate);
     const std::int64_t expert_count = static_cast<std::int64_t>(up.size());
 
     // Each expert contributes its local row band; the pack is their
@@ -54,8 +53,7 @@ inline void nemotron_h_layer_packed_experts(ContractBuilder& b, const std::strin
     std::vector<Node> up_parts;
     up_parts.reserve(up.size());
     for (const SourceTensor* raw : up) {
-        up_parts.push_back(b.contract().slice(b.contract().src(std::string(raw->name)), 0,
-                                            local_start, local_intermediate));
+        up_parts.push_back(b.split(b.contract().src(std::string(raw->name)), 0));
     }
     b.define(up_name, b.contract().cat(up_parts, 0), pie_loader::raw(PieLoaderDType::BF16),
            std::vector<std::int64_t>{expert_count * local_intermediate, hidden});
