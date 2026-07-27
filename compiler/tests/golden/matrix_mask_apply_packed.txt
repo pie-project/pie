@@ -6,6 +6,6 @@ sidecar: 50544942020000000be0db922b5f4f32010000000001000000000000000301010000000
 plan: stage=epilogue signature=0x6612fe00a51d7edc source_ops=6 normalized_ops=6 singleton_regions=6 fused_regions=1 library_regions=0 static_scratch_bytes=8 direct_sink_bytes=0
 readiness: chan=0 phase=0x03 dir=NeedsEmpty
 class: chan=0 FullRing
-inputs 0: PassInputs { logits: Some(F32([0.0, 0.0, 9.0, 1.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 4.0, 0.0, 3.0, 0.0, 9.0])), mtp_logits: None, mtp_drafts: None, hidden: None, value_head: None, query: [] }
+inputs 0: PassInputs { logits: Some(F32([0.0, 0.0, 9.0, 1.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 4.0, 0.0, 3.0, 0.0, 9.0])), mtp_logits: None, mtp_drafts: None, hidden: None, value_head: None, query: [], attn_score: [] }
 step 0: committed=true missed=None sinks=0
 take chan=0 = I32([5, 3])
