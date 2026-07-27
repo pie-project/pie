@@ -508,6 +508,8 @@ def _count_kernel(
     counts_ptr,
     CONFIGS: tl.constexpr,
     ROWS: tl.constexpr,
+    SKIP_DUPLICATES: tl.constexpr,
+    UNIT: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     """How many groups each configuration puts into the sweep.
@@ -525,15 +527,21 @@ def _count_kernel(
     keep = live
     keep = keep & (config < tl.load(widest_ptr))
     keep = keep & (config < tl.load(config_count_ptr + sequence, mask=live, other=0))
-    keep = keep & (
-        tl.load(representative_ptr + sequence, mask=live, other=-1) == sequence
-    )
+    if SKIP_DUPLICATES == 1:
+        keep = keep & (
+            tl.load(representative_ptr + sequence, mask=live, other=-1) == sequence
+        )
     grammar = tl.load(grammar_ptr + sequence, mask=live, other=0)
     at = tl.load(bases_ptr + grammar * _NBASES + _B_GROUP_OFFSETS, mask=keep, other=0)
     state = tl.load(lexer_state_ptr + lane, mask=keep, other=0)
-    first = tl.load(group_offsets_ptr + at + state, mask=keep, other=0)
-    last = tl.load(group_offsets_ptr + at + state + 1, mask=keep, other=0)
-    tl.store(counts_ptr + lane, tl.where(keep, last - first, 0), mask=live)
+    if UNIT == 1:
+        # The advance wants one entry per live configuration, not one per group:
+        # it searches a whole state for the token at a time.
+        tl.store(counts_ptr + lane, tl.where(keep, 1, 0), mask=live)
+    else:
+        first = tl.load(group_offsets_ptr + at + state, mask=keep, other=0)
+        last = tl.load(group_offsets_ptr + at + state + 1, mask=keep, other=0)
+        tl.store(counts_ptr + lane, tl.where(keep, last - first, 0), mask=live)
 
 
 @triton.jit
@@ -685,8 +693,9 @@ def _locate_kernel(
     token_ptr,
     grammar_ptr,
     bases_ptr,
+    live_offsets_ptr,
     found_ptr,
-    BATCH: tl.constexpr,
+    ROWS: tl.constexpr,
     CONFIGS: tl.constexpr,
     GROUP_BLOCK: tl.constexpr,
     SEARCH_STEPS: tl.constexpr,
@@ -703,15 +712,61 @@ def _locate_kernel(
     taken; across blocks two finders would both have gone on, and the reference
     matcher takes the earliest. An atomic minimum makes that the rule.
     """
-    launched = tl.program_id(0)
-    block = tl.program_id(1)
-    sequence = launched % BATCH
-    config = launched // BATCH
-    if config >= tl.load(widest_ptr):
-        return
-    if config >= tl.load(config_count_ptr + sequence):
-        return
-    row_index = sequence * CONFIGS + config
+    program = tl.program_id(0)
+    programs = tl.num_programs(0)
+    total = tl.load(live_offsets_ptr + ROWS)
+    slot = program
+    while slot < total:
+        # Which configuration this slot is. Launching for the ceiling instead
+        # was 38 us of a 163 us step at batch 512, nearly all of it blocks that
+        # returned at once - the same mistake the fill's grid used to make.
+        low = 0
+        high = ROWS - 1
+        while low < high:
+            middle = (low + high + 1) // 2
+            if tl.load(live_offsets_ptr + middle) <= slot:
+                low = middle
+            else:
+                high = middle - 1
+        row_index = low
+        sequence = row_index // CONFIGS
+        _locate_one(
+            group_offsets_ptr,
+            group_set_kind_ptr,
+            group_set_offset_ptr,
+            group_set_length_ptr,
+            set_payload_ptr,
+            lexer_state_ptr,
+            token_ptr,
+            grammar_ptr,
+            bases_ptr,
+            found_ptr,
+            sequence,
+            row_index,
+            GROUP_BLOCK=GROUP_BLOCK,
+            SEARCH_STEPS=SEARCH_STEPS,
+        )
+        slot = slot + programs
+
+
+@triton.jit
+def _locate_one(
+    group_offsets_ptr,
+    group_set_kind_ptr,
+    group_set_offset_ptr,
+    group_set_length_ptr,
+    set_payload_ptr,
+    lexer_state_ptr,
+    token_ptr,
+    grammar_ptr,
+    bases_ptr,
+    found_ptr,
+    sequence,
+    row_index,
+    GROUP_BLOCK: tl.constexpr,
+    SEARCH_STEPS: tl.constexpr,
+):
+    """Search one configuration's groups for the sampled token."""
     state = tl.load(lexer_state_ptr + row_index)
     at = bases_ptr + tl.load(grammar_ptr + sequence) * _NBASES
     groups = tl.load(at + _B_GROUPS)
@@ -729,45 +784,50 @@ def _locate_kernel(
     # of: it is bound by how many scattered loads it issues, not by arithmetic.
     token = tl.load(token_ptr + sequence)
     glane = tl.arange(0, GROUP_BLOCK)
-    group = first + block * GROUP_BLOCK + glane
-    live_lane = group < last
-    kind = tl.load(group_set_kind_ptr + groups + group, mask=live_lane, other=0)
-    offset = tl.load(group_set_offset_ptr + groups + group, mask=live_lane, other=0)
-    length = tl.load(group_set_length_ptr + groups + group, mask=live_lane, other=1)
+    start = first
+    while start < last:
+        group = start + glane
+        live_lane = group < last
+        kind = tl.load(group_set_kind_ptr + groups + group, mask=live_lane, other=0)
+        offset = tl.load(group_set_offset_ptr + groups + group, mask=live_lane, other=0)
+        length = tl.load(group_set_length_ptr + groups + group, mask=live_lane, other=1)
 
-    dense = kind == _DENSE
-    word = tl.load(payload + offset + token // 32, mask=live_lane & dense, other=0)
-    in_dense = ((word >> (token % 32)) & 1) == 1
+        dense = kind == _DENSE
+        word = tl.load(payload + offset + token // 32, mask=live_lane & dense, other=0)
+        in_dense = ((word >> (token % 32)) & 1) == 1
 
-    # A sorted list's ends are its bounds, so most lanes are decided without a
-    # search at all.
-    listed = live_lane & (dense == 0)
-    low = tl.load(payload + offset, mask=listed, other=1)
-    high = tl.load(payload + offset + length - 1, mask=listed, other=0)
-    searching = listed & (token >= low) & (token <= high)
-    # A plain halving. A lane that has found its answer stops being active
-    # rather than having its bounds collapsed: writing `hi = lo` on a hit made
-    # `hi` depend on an already-updated `lo` within the same step, and a lane
-    # could then search backwards. Lanes that finish early idle, which costs
-    # the block nothing it was not already paying.
-    lo = offset
-    hi = offset + length
-    hit = tl.zeros((GROUP_BLOCK,), tl.int32) - 1
-    for _ in range(0, SEARCH_STEPS):
-        active = searching & (lo < hi) & (hit < 0)
-        middle = (lo + hi) // 2
-        value = tl.load(payload + middle, mask=active, other=0)
-        hit = tl.where(active & (value == token), middle, hit)
-        lo = tl.where(active & (value < token), middle + 1, lo)
-        hi = tl.where(active & (value > token), middle, hi)
-    found = hit >= 0
-    complement = kind == _COMPLEMENT
-    inside = tl.where(
-        dense, in_dense, tl.where(complement, found == 0, found)
-    ) & live_lane
+        # A sorted list's ends are its bounds, so most lanes are decided without a
+        # search at all.
+        listed = live_lane & (dense == 0)
+        low = tl.load(payload + offset, mask=listed, other=1)
+        high = tl.load(payload + offset + length - 1, mask=listed, other=0)
+        searching = listed & (token >= low) & (token <= high)
+        # A plain halving. A lane that has found its answer stops being active
+        # rather than having its bounds collapsed: writing `hi = lo` on a hit made
+        # `hi` depend on an already-updated `lo` within the same step, and a lane
+        # could then search backwards. Lanes that finish early idle, which costs
+        # the block nothing it was not already paying.
+        lo = offset
+        hi = offset + length
+        hit = tl.zeros((GROUP_BLOCK,), tl.int32) - 1
+        for _ in range(0, SEARCH_STEPS):
+            active = searching & (lo < hi) & (hit < 0)
+            middle = (lo + hi) // 2
+            value = tl.load(payload + middle, mask=active, other=0)
+            hit = tl.where(active & (value == token), middle, hit)
+            lo = tl.where(active & (value < token), middle + 1, lo)
+            hi = tl.where(active & (value > token), middle, hi)
+        found = hit >= 0
+        complement = kind == _COMPLEMENT
+        inside = tl.where(
+            dense, in_dense, tl.where(complement, found == 0, found)
+        ) & live_lane
 
-    if tl.sum(inside.to(tl.int32)) != 0:
-        tl.atomic_min(found_ptr + row_index, tl.min(tl.where(inside, group, last)))
+        if tl.sum(inside.to(tl.int32)) != 0:
+            tl.atomic_min(
+                found_ptr + row_index, tl.min(tl.where(inside, group, last))
+            )
+        start = start + GROUP_BLOCK
 
 
 @triton.jit
@@ -1697,9 +1757,7 @@ class DeviceBatch:
         self.grammar = grammar
         self.batch = batch
         self.configs = grammar.max_configs
-        self.live = 1
         self.graph: torch.cuda.CUDAGraph | None = None
-        self.captured_live = 0
         self.advance_graph: torch.cuda.CUDAGraph | None = None
 
         readings = grammar.max_readings
@@ -1733,15 +1791,11 @@ class DeviceBatch:
         # bound gets checked against what documents actually need.
         self.high_water = torch.zeros(1, dtype=torch.int32, device="cuda")
         self.widest = torch.ones(1, dtype=torch.int32, device="cuda")
-        # The configuration width, copied back asynchronously and read one step
-        # late so that no step ever synchronises to learn it.
-        self.width_host = torch.ones(1, dtype=torch.int32).pin_memory()
         self.state_hash = torch.zeros(batch, dtype=torch.int32, device="cuda")
         self.representative = torch.arange(batch, dtype=torch.int32, device="cuda")
         # Which grammar each sequence is under. A serving batch mixes them, and
         # everything else in the step reads this to find its tables.
         self.grammar_of = torch.zeros(batch, dtype=torch.int32, device="cuda")
-        self.pending_width = 1
         self.token = torch.zeros(batch, dtype=torch.int32, device="cuda")
         rows = batch * self.configs
         self.lexer_state = torch.zeros(rows, dtype=torch.int32, device="cuda")
@@ -1772,6 +1826,8 @@ class DeviceBatch:
         )
         self.counts = torch.zeros(rows, dtype=torch.int32, device="cuda")
         self.work_offsets = torch.zeros(rows + 1, dtype=torch.int32, device="cuda")
+        self.live_counts = torch.zeros(rows, dtype=torch.int32, device="cuda")
+        self.live_offsets = torch.zeros(rows + 1, dtype=torch.int32, device="cuda")
         # Two windows per block: one for the reading being replayed, one for
         # probing what a pending lexeme could still become. Per *block*, not per
         # program - which is the point of the sweep. This used to be one per
@@ -1791,7 +1847,6 @@ class DeviceBatch:
         self.found = torch.full(
             (rows,), _NO_GROUP, dtype=torch.int32, device="cuda"
         )
-        self.advance_live = 1
 
     def set_grammars(self, ids) -> None:
         """Say which grammar each sequence is under, and reset it to that start.
@@ -1858,7 +1913,6 @@ class DeviceBatch:
         # step - the one thing this design exists to avoid - and launching for
         # the ceiling instead wastes a grid dimension on programs that return
         # immediately. The host put the counts there; it can remember them.
-        self.live = int(counts.max())
         # The kernels gate on `widest`, which lives on the device because the
         # advance is the thing that normally sets it. Loading state from the
         # host has to set it too, or every configuration past the first is
@@ -1867,7 +1921,7 @@ class DeviceBatch:
         # reaches this, so an advance was hiding it: the commit kernel writes
         # `widest` on its way past, and checking both together let one claim
         # cover for the other.
-        self.widest.fill_(self.live)
+        self.widest.fill_(int(counts.max()))
         self.lexer_state[: rows * self.configs].copy_(torch.from_numpy(lexer))
         self.stack[: rows * self.configs].copy_(torch.from_numpy(stacks))
         self.depth[: rows * self.configs].copy_(torch.from_numpy(depths))
@@ -1908,8 +1962,29 @@ class DeviceBatch:
         self.old_count.copy_(self.config_count)
         self.old_stack.copy_(self.stack.reshape(-1))
         rows = self.batch * self.configs
-        live = self.live
-        _locate_kernel[(self.batch * live, self.advance_blocks)](
+        # One entry per live configuration, enumerated the way the fill
+        # enumerates its groups. Sizing the grid by the width instead meant a
+        # recorded advance was only valid while the parse stayed that wide, and
+        # nothing checked; sizing it by the ceiling meant launching for every
+        # configuration and returning at once from fifteen of sixteen, which was
+        # 38 us of a 163 us step.
+        _count_kernel[((rows + 255) // 256,)](
+            grammar.group_offsets,
+            self.lexer_state,
+            self.config_count,
+            self.widest,
+            self.representative,
+            self.grammar_of,
+            grammar.bases,
+            self.live_counts,
+            CONFIGS=self.configs,
+            ROWS=rows,
+            SKIP_DUPLICATES=0,
+            UNIT=1,
+            BLOCK=256,
+        )
+        torch.cumsum(self.live_counts, 0, out=self.live_offsets[1:])
+        _locate_kernel[(self.sweep_blocks,)](
             grammar.group_offsets,
             grammar.group_set_kind,
             grammar.group_set_offset,
@@ -1921,8 +1996,9 @@ class DeviceBatch:
             self.token,
             self.grammar_of,
             grammar.bases,
+            self.live_offsets,
             self.found,
-            BATCH=self.batch,
+            ROWS=rows,
             CONFIGS=self.configs,
             GROUP_BLOCK=_GROUP_BLOCK,
             SEARCH_STEPS=grammar.search_steps,
@@ -1997,18 +2073,6 @@ class DeviceBatch:
         # launch. Real parses hold one or two configurations; the ceiling has
         # to be sixteen only because some documents reach it.
         #
-        # Reading the width now would be a device-to-host synchronisation,
-        # which is the one thing this design forbids. It does not have to be
-        # read now. The copy is issued here and the host picks it up at the
-        # start of the next fill, by which time it has long since landed - an
-        # asynchronous copy into pinned memory costs about 4 us and saves four
-        # thousand.
-        #
-        # Until then the ceiling is the only safe grid, because a stale width
-        # is unsafe in exactly one direction: too small.
-        self.width_host.copy_(self.config_count.max().reshape(1), non_blocking=True)
-        self.live = self.configs
-        self.pending_width = None
 
     def configurations(self, sequence: int) -> list[tuple[int, list[int]]]:
         """Read one sequence's parse state back. For tests only.
@@ -2057,16 +2121,8 @@ class DeviceBatch:
         self.graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self.graph):
             self._fill()
-        self.captured_live = self.live
 
     def fill_mask(self) -> torch.Tensor:
-        # Pick up the width the last advance measured. The copy was issued
-        # then and has landed by now, so this reads pinned host memory rather
-        # than synchronising with the device. The fill does not need it; the
-        # advance's grid still does.
-        if self.pending_width is None:
-            self.pending_width = max(1, int(self.width_host[0]))
-            self.live = min(self.configs, self.pending_width)
         if self.graph is not None:
             self.graph.replay()
             return self.mask
@@ -2116,6 +2172,8 @@ class DeviceBatch:
             self.counts,
             CONFIGS=self.configs,
             ROWS=rows,
+            SKIP_DUPLICATES=1,
+            UNIT=0,
             BLOCK=256,
         )
         # The running sum turns an item back into a configuration and a group.
