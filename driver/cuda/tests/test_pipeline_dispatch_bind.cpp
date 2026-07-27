@@ -19,8 +19,10 @@ bool expect(bool cond, const char* msg) {
 
 int main() {
     // Only a registry key: the driver no longer checks a program hash, because
-    // it no longer sees the bytes one would be taken over.
-    constexpr std::uint64_t program_hash = 0x9e3779b97f4a7c15ULL;
+    // it no longer sees the bytes one would be taken over. Deliberately not a
+    // recognisable constant -- `rng_magic_is_owned_by_the_contract` reads this
+    // tree for transcribed RNG words and cannot tell an arbitrary key from one.
+    constexpr std::uint64_t program_hash = 0xdeadbeef00000001ULL;
 
     // The launch package the engine would have handed the driver. Kept beside
     // the trace by `cargo test -p pie-compiler-tests --test cuda_golden

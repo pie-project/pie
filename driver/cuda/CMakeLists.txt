@@ -807,11 +807,10 @@ enable_testing()
 # lib would duplicate those symbols) and test_ptir_grouped_dispatch_asan (it
 # must compile its own -fsanitize=address copies of what it exercises).
 
-# Runtime fixtures/scripts consumed by tests but not compiled: golden PTIR
-# containers (tests/golden-ptir, read by test_ptir_container/golden_exec via
-# TEST_ARGS), the load-parity harness (tests/load_parity/run.py, driven
-# manually against a live GPU + recipe), the qwen3.5 multi-request parity
-# script, and the tier0/tier1/masked-attention host reference headers
+# Runtime fixtures/scripts consumed by tests but not compiled: the load-parity
+# harness (tests/load_parity/run.py, driven manually against a live GPU +
+# recipe), the qwen3.5 multi-request parity script, and the
+# tier0/tier1/masked-attention host reference headers
 # (#include-only, no standalone translation unit). Listed as a SOURCES-only
 # custom target so IDE-generating generators surface them in the project tree
 # and so a reader can tell "not compiled" from "forgotten".
@@ -825,23 +824,7 @@ add_custom_target(pie_driver_cuda_test_fixtures SOURCES
   tests/load_parity/oracle.py
   tests/load_parity/parse_cache.py
   tests/load_parity/run.py
-  tests/load_parity/spec.py
-  tests/golden-ptir/beam_epilogue.txt
-  tests/golden-ptir/counter_pingpong.txt
-  tests/golden-ptir/dfa_ingraph.txt
-  tests/golden-ptir/greedy_argmax.txt
-  tests/golden-ptir/mtp_verify_tail.txt
-  tests/golden-ptir/nucleus_sample.txt
-  tests/golden-ptir/neg_body_type_error.txt
-  tests/golden-ptir/neg_intrinsic_wrong_stage.txt
-  tests/golden-ptir/neg_model_gated_missing.txt
-  tests/golden-ptir/neg_sink_at_epilogue.txt
-  tests/golden-ptir/neg_spsc_second_producer.txt
-  tests/golden-ptir/neg_t10_nonreplayable.txt
-  tests/golden-ptir/pivot_predicates_multistage.txt
-  tests/golden-ptir/section3_masked_gumbel.txt
-  tests/golden-ptir/staged_dispatch.txt
-  tests/golden-ptir/structured_masks.txt)
+  tests/load_parity/spec.py)
 
 # The contract this driver authors (§12 row 12).
 # Set PIE_TEST_SNAPSHOT to also author it against a real checkpoint.
