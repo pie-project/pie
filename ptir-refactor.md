@@ -791,9 +791,13 @@ would destroy the evidence that the planner changed.
 `section3_masked_gumbel`, which is one of the 13. Its embedded `PTRP` bytes are
 stale, so the driver decodes no region plans and registration fails with "PTIR
 launch has no compiler region plans" — the test compiles and runs again (phase
-2′) but cannot pass until the goldens say something true. Two of the three
-drifted vendored copies were refreshed from `compiler/tests/golden/`; that fixed
-the drift and exposed this underneath it. During the move, the panic
+2′) but cannot pass until the goldens say something true.
+
+Refreshing the drifted vendored copies from `compiler/tests/golden/` was tried
+and reverted: it fixes the drift and immediately breaks `ptir_golden_exec`,
+which passes today *because* it reads the older bytes. The two copies are stale
+in opposite directions, so there is no edit to `golden-ptir/` that satisfies
+both — only re-blessing the 13, which is the decision §7.1 is asking for. During the move, the panic
 payloads were diffed against the old suite's: 13/13 byte-identical over 217,921
 bytes, which is what proved the consolidation was behaviour-preserving.
 
