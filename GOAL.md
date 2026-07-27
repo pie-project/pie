@@ -525,19 +525,48 @@ Rust is 352 us. This is the shape of most of what was slow here: not arithmetic,
 but a ceiling paid for as if it were the work.
 
 **Coverage and acceptance on real schemas.** Of 533 JSONSchemaBench schemas,
-**431 compile to LALR(1) tables**. Feeding each schema's model-generated
-instance through the matcher one byte at a time accepts **416 of them**. The
-remaining refusals split into 37 lexers over budget (length bounds unrolled
-into the DFA), 35 the front end cannot lower, 21 genuine LALR conflicts and 9
-over the production budget.
+**469 compile** at the default lexer budget and feeding each schema's
+model-generated instance through the matcher one byte at a time accepts **451**.
+It was 431 and 416, and what moved it was reading the failures rather than
+counting them.
 
-The acceptance figure is measured differently than it was: the corpus was
-generated with a 256-token budget, so 88 of its instances stop mid-document.
-Asking whether the parser can *terminate* there is the wrong question, because
-the document does not terminate either. A truncated instance now counts as
-accepted when every byte of it was legal, and the two kinds of failure are
-counted apart. Under the old rule the same code reports a lower number for a
-reason that has nothing to do with the parser.
+Counting keywords does not say why a schema fails - `type` and `properties` are
+in all of them - so rank each keyword by how much more often it appears in a
+failing schema than in one that compiles, then read the error the pipeline had
+been collapsing into a four-value code. Four causes, and three are now fixed:
+
+| cause | was | fix |
+|---|---|---|
+| reduce/reduce conflicts, `oneOf` in 86% at lift 6.5 | 109 attempts | collapse object branches into one object |
+| a pattern that also carries a length bound | 39 | narrow the repeat the bound constrains |
+| `$ref` to anything but `#/definitions/X` | 24 | follow the JSON pointer |
+| `allOf` branches that disagree | 20 | compute the conjunction where one exists |
+
+**Coverage is a budget, not a wall.** The lexer budget was reported at 4,000
+states as though it were a limit. It is not:
+
+| lexer states | compile | accepted | refused by the lexer |
+|---:|---:|---:|---:|
+| 4,000 | 456 | 440 | 38 |
+| 20,000 (default) | 469 | 451 | 21 |
+| 80,000 | 477 | 458 | **1** |
+
+At 80,000 states one schema fails on the lexer and what is left is 28 conflicts,
+17 the front end cannot lower and 10 over the production budget. The price falls
+entirely on the tail: the median schema compiles in 17.6 ms and costs 0.05 MB of
+tables at every budget, because it comes nowhere near the ceiling. Reporting a
+single coverage figure without the budget it was measured at is what made this
+look like a wall.
+
+The remaining refusals split into 21 lexers over budget, 17 the front end cannot
+lower - `not`, and `anyOf` inside `allOf`, both of which need a real
+intersection - 16 genuine LALR conflicts and 10 over the production budget.
+
+**Five documents are refused that their schemas accept.** Asking a real
+validator whether each refused instance actually satisfies its schema finds
+five that do, all refusing at the final byte, all built from `$ref` and `oneOf`.
+That is a bug in the parser rather than a coverage limit, and it is recorded
+here rather than folded into the coverage number.
 
 **Objects accept their properties in any order.** A JSON object is a set, but a
 grammar describes a sequence, so the standard answer - XGrammar's too - fixes
