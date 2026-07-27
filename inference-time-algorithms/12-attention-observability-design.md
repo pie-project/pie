@@ -1431,6 +1431,15 @@ is expensive enough to dominate the host side of a decode step.
 
 ## 15. Track B: where each eviction policy pays for itself
 
+> **Superseded by §18.4 and §18.5.** The table below was measured with a page
+> count extrapolated from the target context length rather than probed, so its
+> `@1` columns were a ~80% budget that evicted rather than the zero-benefit
+> reference they are described as. The *shape* of every conclusion here holds;
+> the overhead numbers in §15.1 are understated and are corrected in §18.5,
+> where they turn out to agree better with §14.4 than the numbers below did.
+> §15.2's ordering is unaffected. Kept as written because the correction is
+> more instructive than the corrected text would be alone.
+
 §14 measured Quest. `tests/inferlets/bench_trackb.py` applies the identical
 method -- differenced endpoints, independently minimised, interleaved across
 rounds, `reserve_tokens` pinned, `report` off -- to the two Track B policies
@@ -1604,7 +1613,7 @@ The fix is not a tolerance. It is to pin the assertion to a prompt whose
 continuation is **decisive**: on an ambiguous prompt the next-token distribution
 is nearly flat and a 1-ulp difference flips the argmax, but on a prompt whose
 answer the model is sure of the argmax has a real margin and cannot be flipped.
-`test_quest_chunked_prefill` uses such a prompt and asserts **exact text
+`test_chunked_prefill` uses such a prompt and asserts **exact text
 equality over 32 tokens** at chunk widths 37, 128 and 999 -- all deliberately
 not multiples of the 16-token KV page, so every boundary lands mid-page and the
 write offsets have to be right. The single-token argmax was checked separately
@@ -1614,28 +1623,198 @@ isolates the prefill's own output from any downstream amplification.
 ### 17.2 The measurement the ceiling was hiding
 
 Same method as §14.2 -- Qwen3-0.6B, 28 layers, page size 16, L40S, ms/token,
-min of 7 interleaved rounds, `report=false`. Ratios are quest/baseline, so
-**below 1.00 is a win**:
+`report=false`. Ratios are quest/baseline, so **below 1.00 is a win**. Numbers
+below are the re-measurement described in §18.3: min of **15** rounds, with the
+page count probed rather than extrapolated (the first version of this table had
+a slightly short `budget=100%` and one visible outlier; both are gone).
 
 | ctx | pages | baseline | budget=100% | budget=50% | budget=25% |
 |---|---|---|---|---|---|
-| 1024 | 80 | 4.61 ms | 1.36x | 1.19x | 1.19x |
-| 2048 | 158 | 4.84 ms | 1.43x | 1.19x | 1.11x |
-| 4096 | 314 | 6.91 ms | 1.37x | 0.93x | **0.80x** |
-| 6144 | 471 | 9.70 ms | 1.23x | 0.86x | **0.67x** |
-| 8192 | 627 | 10.91 ms | 1.23x | 0.85x | **0.66x** |
-| 12288 | 940 | 15.19 ms | 1.31x | 0.76x | **0.75x** |
-| 16384 | 1253 | 19.74 ms | 1.13x | 0.70x | **0.49x** |
+| 1024 | 86 | 3.59 ms | 1.61x | 1.54x | 1.34x |
+| 2048 | 164 | 4.57 ms | 1.52x | 1.28x | 1.18x |
+| 4096 | 320 | 6.87 ms | 1.37x | 1.01x | **0.87x** |
+| 6144 | 477 | 8.87 ms | 1.28x | 0.90x | **0.73x** |
+| 8192 | 633 | 11.20 ms | 1.21x | 0.84x | **0.65x** |
+| 12288 | 946 | 15.37 ms | 1.18x | 0.76x | **0.56x** |
+| 16384 | 1259 | 19.70 ms | 1.13x | 0.72x | **0.51x** |
 
-**At 16K context and a quarter budget Quest is 2.04x faster than the baseline.**
+**At 16K context and a quarter budget Quest is 1.96x faster than the baseline.**
 The crossover is unchanged at ~4K -- lifting the ceiling did not move it, which
 is the right outcome, since the ceiling was an artifact of the harness and not a
 property of the policy.
 
-The `budget=100%` column is still the constant: in absolute terms the overhead
-is 1.65, 2.08, 2.58, 2.19, 2.48, 4.77 and 2.54 ms across the seven contexts --
-flat at ~2.5 ms with one outlier at 12288 that the shared host explains (the
-same row's 0.76x/0.75x pair is visibly noisier than its neighbours in both
-directions). Seven contexts spanning 16x now say what four spanning 6x could
-only suggest: **the overhead does not scale with context and the saving does**,
-so the ratio improves without bound as the context grows.
+Every column is now strictly monotone in the context, which the seven-context
+table at 7 rounds was not. That is worth more than any single cell: the trend is
+the claim, and a monotone trend across a 16x span is not something host noise
+produces by accident.
+
+The `budget=100%` column is the constant: in absolute terms the overhead is
+2.20, 2.40, 2.52, 2.44, 2.31, 2.70 and 2.65 ms across the seven contexts --
+**flat at ~2.5 ms over a 16x range, with no outlier.** Seven contexts spanning
+16x say what four spanning 6x could only suggest: **the overhead does not scale
+with context and the saving does**, so the ratio improves without bound as the
+context grows. §18.5 measures the same constant a third way, from SnapKV.
+
+## 18. Track B past the ceiling, and a budget the benchmark did not have
+
+§17 lifted the one-shot prefill ceiling for Quest and the naive baseline. Track
+B had the identical ceiling and it mattered more there, because §15 put
+SnapKV's crossover at ~2.3K and H2O's at ~4.1K -- the entire range in which
+these policies pay was above the point at which they could be run.
+
+Propagating the fix was mechanical for H2O and TOVA, which observe the decode
+fire and leave prefill alone. SnapKV is the exception, and it is the reason
+this is a section rather than a footnote.
+
+### 18.1 SnapKV is the only policy for which chunking is not mechanical
+
+SnapKV is observed **during prefill**. The capture records the last `window`
+query rows *of the fire it is attached to* (§12.3), so under chunking only the
+final chunk's window is the prompt's tail. An earlier chunk's window is a
+perfectly well-defined observation -- of the wrong thing. `attn_score.hpp`
+already anticipated this and blessed the resolution: *"the final firing is the
+one whose window matches SnapKV, so a policy that simply acts on the most
+recent firing gets SnapKV's semantics for free."*
+
+So the tap goes on the final chunk alone. That is not only correct but cheaper:
+the earlier chunks run the plain prefill kernel and never pay the capture
+variant's 1.24-1.94x (§12.7).
+
+Which makes the final chunk's **size** load-bearing, and the obvious even split
+is not even enough. A fixed width of `ceil(n / ceil(n / C))` gives the right
+chunk *count*, but the remainder still lands entirely on the last chunk: at
+n=1302, C=37 it lays down 35 chunks of 37 and a final chunk of **seven**,
+truncating a 32-row window to 7 rows. The fix is to spread the remainder over
+the *first* chunks instead -- with `k = ceil(n / C)`, chunk `i` gets
+`n/k + (i < n mod k)` -- so every chunk is within one token of every other and
+the final chunk is `floor(n / k)`, the largest value a last chunk can take. At
+C = 8192 that is thousands of tokens and the window is never in danger.
+
+### 18.2 The discriminator, which took two tries to find
+
+A truncated window is invisible in the output: it still produces a plausible
+ranking and a coherent continuation. Testing it needs a quantity that moves.
+
+The first choice, the keep-set, barely moves at all. At a 24-page budget on a
+1302-token prompt, forcing the window down to **four** rows changed 2 of the 24
+kept pages -- while merely changing the chunk width with the window intact
+changed 1. No margin, and a test with no margin is a coin flip.
+
+`tail_page_share` -- observed mass on the prompt's last page over total
+observed mass -- separates cleanly, because a narrower window means fewer query
+rows and all of them sit near the end of the prompt, which inflates the last
+page's share:
+
+| final chunk | 36 | 127 | 635 | 19 | 9 | 4 |
+|---|---|---|---|---|---|---|
+| `tail_page_share` | .0507 | .0506 | .0507 | .0852 | .1801 | .2702 |
+| window | whole | whole | whole | cut | cut | cut |
+
+Whole-window noise is 0.2%; the smallest truncation signal is +68%. A 2% band
+sits two orders of magnitude clear of the noise and still trips on the mildest
+truncation. That is the assertion in `test_chunked_prefill.py`, along with
+`tail_page_share > 0`, which separately catches a tap attached to the wrong
+chunk entirely (an earlier chunk cannot see the last page at all, so it reports
+exactly zero).
+
+### 18.3 The benchmark was measuring a budget it did not have
+
+Re-running `bench_trackb.py` over seven contexts produced something that could
+not be true: `snapkv@1` at **1.05x**, a policy that evicts nothing running
+*faster* than not evicting anything.
+
+The cause was in the harness, not the policy. `bench_trackb` derived the page
+count as `(ctx + LONG_TOKENS) // PAGE_SIZE`. But `ctx` is a *target*:
+`_prompt_for` lays down `round(ctx / 9)` repetitions of a unit that tokenizes
+to slightly more than 9, so the real prompt runs about 25% long -- ctx=12288
+measures 15032 tokens. The estimate therefore under-counted pages by ~25%, and
+**`budget=1.0` was really a ~80% budget that evicted**.
+
+That is not a small error in a small place. The `@1` column is the column whose
+entire job is to price a policy with its benefit set to zero, and every
+overhead number in §15 was read off it. Those numbers were understated by an
+unintended benefit.
+
+Both benchmarks now probe the real page count, and both add the arithmetic the
+budget has to satisfy: the probe stops after `SHORT_TOKENS`, so the
+`LONG_TOKENS` the measured endpoint decodes have to be added back, which is 8%
+of the pages at ctx=1024. Two guards now assert the properties that would have
+caught this:
+
+- `assert_full_budget_is_overhead` -- a full budget cannot beat the baseline,
+  because the policy does everything the baseline does and then some. If it
+  wins, the budget is not full.
+- `assert_monotone_baseline` -- the baseline attends over the whole prefix, so
+  its per-token cost is necessarily increasing in the context. If the measured
+  baseline is not increasing, the run's noise floor is above its signal and
+  every ratio derived from it is meaningless. This one is not hypothetical
+  either: a 7-round sweep taken at host load 35 failed it (10.12 ms at 4096 vs
+  9.04 ms at 6144). `PIE_BENCH_REPS` exists so the answer is more rounds rather
+  than a wider tolerance.
+
+### 18.4 The corrected Track B table
+
+Qwen3-0.6B, 28 layers, page size 16, L40S, ms/token, **min of 15** interleaved
+rounds, `report=false`, page counts probed. Ratios are baseline/policy, so
+**>1.00x is a win**.
+
+| ctx | pages | baseline | h2o@1 | h2o@.5 | h2o@.25 | snap@1 | snap@.5 | snap@.25 |
+|---|---|---|---|---|---|---|---|---|
+| 1024 | 86 | 3.51 ms | 0.51x | 0.55x | 0.59x | 0.60x | 0.72x | 0.76x |
+| 2048 | 165 | 4.32 ms | 0.47x | 0.61x | 0.66x | 0.65x | 0.76x | 0.83x |
+| 4096 | 321 | 7.03 ms | 0.61x | 0.81x | 0.59x | 0.71x | 1.02x | 1.24x |
+| 6144 | 478 | 8.64 ms | 0.59x | 0.84x | 1.01x | 0.79x | 1.16x | 1.38x |
+| 8192 | 634 | 11.16 ms | 0.62x | 0.93x | 1.25x | 0.85x | 1.23x | 1.50x |
+| 12288 | 946 | 15.31 ms | 0.65x | 0.96x | 1.37x | 0.88x | 1.22x | **1.81x** |
+| 16384 | 1259 | 19.85 ms | 0.65x | 1.05x | 1.47x | 0.90x | 1.31x | 1.63x |
+
+Every `@1` cell is now below 1.00x, as it must be. Crossovers at a quarter
+budget: **SnapKV ~2.9K, H2O ~6.1K**. (`h2o@.25` at 4096 reads 0.59x, below both
+its neighbours -- a residual noise artifact of the shared host, not a feature.
+`snapkv@.25` likewise loses a little between 12288 and 16384.)
+
+### 18.5 What the corrected numbers say, which is more than the wrong ones did
+
+Converting the `@1` ratios to absolute per-step overhead is where the table
+stops being a benchmark and starts being an argument:
+
+| ctx | 1024 | 2048 | 4096 | 6144 | 8192 | 12288 | 16384 |
+|---|---|---|---|---|---|---|---|
+| SnapKV | 2.34 | 2.33 | 2.87 | 2.30 | 1.97 | 2.09 | 2.21 ms |
+| H2O | 3.37 | 4.87 | 4.49 | 6.00 | 6.84 | 8.24 | 10.69 ms |
+| H2O − SnapKV | 1.03 | 2.55 | 1.62 | 3.71 | 4.87 | 6.16 | 8.48 ms |
+
+**SnapKV's overhead is flat at ~2.3 ms/step across a 16x range of context.**
+H2O's grows roughly linearly, and the difference between them -- H2O's own
+work, the per-layer `[kv_max]` fold and rank -- is the part that grows.
+
+This separates the two costs cleanly, which the four-context table in §15 could
+only hint at. SnapKV decides its keep-set once during prefill and afterwards
+re-applies a mask that is already resident on the device: no score, no fold, no
+ranking, nothing per layer that depends on the context. What is left is the
+cost of *having a hook at all*.
+
+And that number now closes a loop that §15 left open. Three instruments:
+
+| instrument | what it measures | value |
+|---|---|---|
+| Quest `budget=100%` (§14.3, §17.2) | end-to-end, benefit removed | ~2.5 ms |
+| `nsys --cuda-graph-trace=node` (§14.4) | ~1.5 ms host launch + ~1.0 ms GPU | ~2.5 ms |
+| SnapKV `budget=100%` (here) | end-to-end, policy work ~0 | **~2.3 ms** |
+
+§15 reported SnapKV's overhead as 1.32 ms and called it agreement with §14.4.
+It was not: 1.32 ms matched only the *launch* component and was silently short
+of the total, because the budget was evicting. The corrected 2.3 ms agrees with
+both other instruments on the whole quantity. **The conclusion of §15.1
+survives and is strengthened: SnapKV is at the floor, and the floor is the CUDA
+graph replay the hook costs (§14.4), which cannot be moved from inside this
+document.**
+
+The practical consequence is unchanged in direction and larger in size than
+§15 estimated. On a 0.6B model a ~2.3 ms/step constant is most of the budget,
+which is why these crossovers sit where they do. That constant is set by the
+engine's launch path and does not grow with the model, while the baseline
+per-step cost does -- so on a production-sized model every crossover here moves
+earlier, and what survives is the ordering, which is set by real per-layer
+work: SnapKV (none) < H2O (a `[kv_max]` fold) < Quest (`envelope_dot` over
+every page).
