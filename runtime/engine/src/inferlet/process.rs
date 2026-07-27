@@ -325,6 +325,13 @@ pub(crate) async fn ensure_execution_admitted(ctx: &mut ProcessCtx) {
         None => None,
     };
     ctx.admit_execution(permit, duration_us(started.elapsed()));
+    // The planner registers at spawn (registration order is the FCFS clock),
+    // but only from here on can this process hold pooled pages. Its wedge
+    // predicate needs that distinction: an unadmitted process is neither
+    // running nor able to free anything.
+    if let Some(planner) = crate::planner::planner() {
+        planner.note_admitted(ctx.id());
+    }
     if crate::scheduler::fire_timing_enabled() {
         crate::scheduler::fire_timing_write(&serde_json::json!({
             "schema": 1,

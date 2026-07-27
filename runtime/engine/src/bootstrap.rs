@@ -408,8 +408,10 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                     "[planner-trace] queue={} head_pages={} head_kind={} accum={} \
                      free={}/{} host_free={}/{} parks={} serves={} evictions={} \
                      evict_rollbacks={} restores={} restore_failures={} gate_parks={} \
-                     hogs={} starved={} e6_relax={} d2h_pages={} h2d_pages={} d2h_ms={} h2d_ms={} \
-                     resident={} evicting={} evicted={} restoring={}",
+                     hogs={} starved={} salvaged={} swapfull={}/{} e6_relax={} \
+                     d2h_pages={} h2d_pages={} d2h_ms={} h2d_ms={} \
+                     resident={} evicting={} evicted={} restoring={} admitted={} \
+                     runners=[{}]",
                     d.queue.len(),
                     d.queue.first().map_or(0, |w| w.pages),
                     d.queue.first().map_or("-", |w| w.kind),
@@ -427,6 +429,9 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                     d.gate_parks_total,
                     d.hog_failures_total,
                     d.starvations_total,
+                    d.salvages_total,
+                    d.host_swap_exhaustions_total,
+                    d.host_swap_unblocks_total,
                     d.e6_relaxations_total,
                     d.d2h_pages_total,
                     d.h2d_pages_total,
@@ -436,6 +441,12 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                     d.proc_states[1],
                     d.proc_states[2],
                     d.proc_states[3],
+                    d.admitted_procs,
+                    d.runners
+                        .iter()
+                        .map(|(seq, held, progressed)| format!("{seq}:h{held}:p{progressed}"))
+                        .collect::<Vec<_>>()
+                        .join(","),
                 );
             }
         });

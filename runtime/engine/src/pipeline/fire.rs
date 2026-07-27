@@ -1238,19 +1238,28 @@ pub async fn submit_frame<C: FireContext>(
         };
         let pipeline: Resource<Pipeline> = Resource::new_borrow(this.rep());
         let fwd: Resource<ForwardPass> = Resource::new_borrow(rep);
-        if let Err(error) = submit_pass_stamped(ctx, pipeline, fwd, Some(stamp)).await? {
+        let outcome = submit_pass_stamped(ctx, pipeline, fwd, Some(stamp)).await;
+        if !matches!(outcome, Ok(Ok(()))) && index > 0 {
             // Mid-frame failure: the fires already submitted stand and
             // execute as a truncated frame; tell the scheduler how many
-            // exist so the frame can still seal.
-            if index > 0 {
-                let first: Resource<ForwardPass> = Resource::new_borrow(fired[0].1);
-                if let Ok(pass) = ctx.resources().get(&first)
-                    && let Ok(bound) = pass.bound()
-                {
-                    let _ = bound.scheduler.frame_truncate(lane, seq, index as u32);
-                }
+            // exist so the frame can still seal. This must cover the host
+            // trap path too — returning through `?` without truncating
+            // strands the frame arrival-incomplete, and the wait-all gate
+            // then holds the whole fleet on a frame that can never
+            // complete (CONTENTION_FOLLOWUP §20.8).
+            let first: Resource<ForwardPass> = Resource::new_borrow(fired[0].1);
+            if let Ok(pass) = ctx.resources().get(&first)
+                && let Ok(bound) = pass.bound()
+            {
+                let _ = bound.scheduler.frame_truncate(lane, seq, index as u32);
             }
-            return Ok(Err(format!("pipeline: frame slot {slot}: {error}")));
+        }
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                return Ok(Err(format!("pipeline: frame slot {slot}: {error}")));
+            }
+            Err(error) => return Err(error),
         }
     }
     Ok(Ok(()))

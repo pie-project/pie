@@ -66,6 +66,17 @@ pub(crate) fn notify_process_suspend(pid: ProcessId) {
     post_pipeline_leave(pid, Some(pid), LeaveKind::Suspend);
 }
 
+/// `pid` is runnable again after a suspend (restore committed, or the
+/// eviction rolled back). Undoes the wait-set consequences of
+/// [`notify_process_suspend`]. Process-keyed, fire-and-forget: a missed
+/// resume is fail-safe (the fleet just stops waiting for the process).
+pub(crate) fn notify_process_resume(pid: ProcessId) {
+    let handles = super::handle_registry().read().unwrap();
+    for handle in handles.iter().flatten() {
+        let _ = handle.send(SchedulerItem::ProcessResume(pid));
+    }
+}
+
 /// Terminate `pid`'s lanes, fire-and-forget (queued fires are rejected).
 /// Process-keyed. The waited sibling is [`notify_process_terminate`].
 pub(crate) fn post_process_terminate(pid: ProcessId) {
@@ -560,6 +571,10 @@ enum SchedulerItem {
     /// waits for this exact process's first fire (identity-paired with the
     /// release above — the two race through the mailbox in either order).
     ExecutionSlotConsumed(ProcessId),
+    /// The planner concluded a suspended process is runnable again (restore
+    /// committed, or the eviction rolled back): its lanes may rejoin the
+    /// wait-set and batch full frames again. Process-keyed.
+    ProcessResume(ProcessId),
     /// A frame submit failed mid-way host-side: only `submitted` of the
     /// declared fires exist. The frame policy adjusts the lane frame's
     /// expected count so it can still seal (frame mode only; a no-op
@@ -2647,6 +2662,9 @@ impl BatchScheduler {
                 }
             }
 
+            SchedulerItem::ProcessResume(pid) => {
+                frame_policy.on_process_resume(pid);
+            }
             SchedulerItem::FrameTruncate {
                 lane,
                 seq,
