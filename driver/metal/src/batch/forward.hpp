@@ -100,7 +100,7 @@ struct MemberForwardDesc {
     bool has_attention_mask = false;
     std::uint32_t attention_mask_stride = 0;
     std::vector<std::uint8_t> attention_mask;
-    pie_native::ptir::StructuredMaskDescriptor structured_mask;
+    pie_native::launch::StructuredMaskDescriptor structured_mask;
 
     // Local indices into `token_ids` (NOT global) whose logits must be
     // materialized — the fire's `sampling_indices` slice, member-relative

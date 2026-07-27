@@ -15,9 +15,7 @@
 
 #include <cuda_runtime.h>
 
-#include "pie_native/ptir/bound.hpp"
-#include "pie_native/ptir/container.hpp"
-#include "pie_native/ptir/plan.hpp"
+#include "pie_native/launch/plan.hpp"
 #include "pipeline/dispatch.hpp"
 
 #include <map>
@@ -44,7 +42,7 @@ const pie_cuda_driver::tests::HostKernelFixture& load_host_kernels(
     pie_cuda_driver::tests::HostKernelFixture fixture;
     std::string error;
     const std::string path =
-        golden_directory + "-kernels/" + name + ".kernels";
+        golden_directory + "/" + name + ".kernels";
     if (!fixture.load(path, &error)) {
         std::fprintf(stderr, "host kernel fixture: %s\n", error.c_str());
         std::abort();
@@ -65,18 +63,31 @@ const Fixture& load_fixture(
     if (found != cache.end()) return found->second;
     Fixture fixture;
     std::string error;
-    if (!fixture.load(golden_directory + "-kernels/" + name + suffix, &error)) {
+    if (!fixture.load(golden_directory + "/" + name + suffix, &error)) {
         std::fprintf(stderr, "%s\n", error.c_str());
         std::abort();
     }
     return cache.emplace(name, std::move(fixture)).first->second;
 }
 
-PieU64Slice host_stage_identities(
+// The program itself, in the shape the driver receives it. Registration used
+// to take container + sidecar bytes and decode them; it now takes this table,
+// which the host builds and the driver only reads.
+const PieLaunchPackage& host_launch(
     const std::string& golden_directory, const std::string& name) {
-    return load_fixture<pie_cuda_driver::tests::HostIdentityFixture>(
-               golden_directory, name, ".identities")
-        .slice();
+    return load_fixture<pie_cuda_driver::tests::HostLaunchFixture>(
+               golden_directory, name, ".launch")
+        .package();
+}
+
+// A registry key, nothing more: the driver no longer sees bytes to hash. Stable
+// per program name so two programs never collide inside one Dispatch.
+std::uint64_t program_key(const std::string& name) {
+    std::uint64_t hash = 0xcbf29ce484222325ULL;
+    for (const char byte : name) {
+        hash = (hash ^ static_cast<std::uint8_t>(byte)) * 0x100000001b3ULL;
+    }
+    return hash;
 }
 
 PieRegionAnalysisSlice host_region_analysis(
@@ -105,36 +116,6 @@ void expect_impl(bool condition, const std::string& message) {
         const bool expect_ok_ = (condition);   \
         expect_impl(expect_ok_, (message));    \
     } while (0)
-
-std::string trim(const std::string& value) {
-    const std::size_t first = value.find_first_not_of(" \t\r\n");
-    if (first == std::string::npos) return {};
-    const std::size_t last = value.find_last_not_of(" \t\r\n");
-    return value.substr(first, last - first + 1);
-}
-
-std::string golden_field(const std::string& path, const std::string& key) {
-    std::ifstream input(path);
-    std::string line;
-    while (std::getline(input, line)) {
-        const std::size_t separator = line.find(':');
-        if (separator == std::string::npos) continue;
-        if (trim(line.substr(0, separator)) == key) {
-            return trim(line.substr(separator + 1));
-        }
-    }
-    return {};
-}
-
-std::vector<std::uint8_t> hex_bytes(const std::string& value) {
-    std::vector<std::uint8_t> result;
-    result.reserve(value.size() / 2);
-    for (std::size_t index = 0; index + 1 < value.size(); index += 2) {
-        result.push_back(static_cast<std::uint8_t>(
-            std::stoul(value.substr(index, 2), nullptr, 16)));
-    }
-    return result;
-}
 
 std::uint16_t bf16_bits(float value) {
     std::uint32_t bits = 0;
@@ -187,35 +168,19 @@ std::uint64_t run_case(
     constexpr std::uint32_t vocab = 32;
     constexpr std::uint64_t no_ticket =
         std::numeric_limits<std::uint64_t>::max();
-    const std::string path =
-        golden_directory + "/section3_masked_gumbel.txt";
-    const std::vector<std::uint8_t> container_bytes =
-        hex_bytes(golden_field(path, "container"));
-    const std::vector<std::uint8_t> sidecar_bytes =
-        hex_bytes(golden_field(path, "sidecar"));
-    const std::uint64_t hash =
-        std::stoull(golden_field(path, "hash"), nullptr, 16);
-
-    pie_native::ptir::container::Container container;
-    pie_native::ptir::container::DecodeError decode_error;
-    expect(
-        pie_native::ptir::container::decode(
-            container_bytes.data(), container_bytes.size(),
-            container, &decode_error),
-        "decode section3 fixture: " + decode_error.detail);
-    expect(container.channels.size() == 5, "section3 channel count");
+    const std::uint64_t hash = program_key("section3_masked_gumbel");
+    const PieLaunchPackage& package =
+        host_launch(golden_directory, "section3_masked_gumbel");
+    const PieLaunchChannelSlice channels = package.channels;
+    expect(channels.len == 5, "section3 channel count");
 
     Dispatch dispatch;
     std::string error;
     expect(
         dispatch.register_program(
             hash,
-            pie_native::ByteSlice{
-                container_bytes.data(), container_bytes.size()},
-            pie_native::ByteSlice{
-                sidecar_bytes.data(), sidecar_bytes.size()},
+            package,
             load_host_kernels(golden_directory, "section3_masked_gumbel").slice(),
-            host_stage_identities(golden_directory, "section3_masked_gumbel"),
             host_region_analysis(golden_directory, "section3_masked_gumbel"),
             &error) == PIE_STATUS_OK,
         "register grouped program: " + error);
@@ -227,17 +192,6 @@ std::uint64_t run_case(
             registration_stats.generated_stage_cache_entries != 0 &&
             registration_stats.generated_program_cache_entries == 1,
         "registration compiles every generated fused region before publishing");
-    // The gate on deleting `program_identity.hpp`'s driver copy. Both halves
-    // matter: `divergent == 0` alone is also what a comparison that never ran
-    // reports, and until this fixture existed no C++ caller supplied a table.
-    expect(
-        registration_stats.identity_host_supplied != 0 &&
-            registration_stats.identity_divergent == 0,
-        "the driver derives the host's stage identities, and says so: "
-        "host_supplied=" +
-            std::to_string(registration_stats.identity_host_supplied) +
-            " divergent=" +
-            std::to_string(registration_stats.identity_divergent));
     // `region_support.hpp`'s copies are deleted, so this is no longer a
     // divergence gate: registration cannot get this far without the host's
     // table, and the assertion records that the fixture is what supplied it.
@@ -278,24 +232,18 @@ std::uint64_t run_case(
             expected_tokens[lane] = (lane * 5 + 3) % vocab;
             continue;
         }
-        endpoints[lane].resize(container.channels.size());
-        channel_ids[lane].resize(container.channels.size());
-        for (std::size_t dense = 0; dense < container.channels.size(); ++dense) {
-            const auto& source = container.channels[dense];
+        endpoints[lane].resize(channels.len);
+        channel_ids[lane].resize(channels.len);
+        for (std::size_t dense = 0; dense < channels.len; ++dense) {
+            const PieLaunchChannel& source = channels.ptr[dense];
             const std::uint64_t id =
                 10000 + static_cast<std::uint64_t>(lane) * 100 + dense;
             channel_ids[lane][dense] = id;
-            PieChannelDesc descriptor{};
-            descriptor.abi_version = PIE_DRIVER_ABI_VERSION;
-            descriptor.channel_id = id;
-            descriptor.shape = {source.shape.dims, source.shape.rank};
-            descriptor.dtype = source.dtype;
-            descriptor.host_role = source.host_role;
-            descriptor.seeded = source.seeded;
+            PieChannelDesc descriptor =
+                pie_cuda_driver::tests::channel_desc_from(
+                    source, id, id * 2 + 1, id * 2 + 2);
             descriptor.extern_dir = PIE_CHANNEL_EXTERN_NONE;
-            descriptor.capacity = source.capacity;
-            descriptor.reader_wait_id = id * 2 + 1;
-            descriptor.writer_wait_id = id * 2 + 2;
+            descriptor.extern_name = {nullptr, 0};
             expect(
                 dispatch.register_channel(
                     descriptor, &endpoints[lane][dense], &error) ==
@@ -550,29 +498,19 @@ std::vector<std::int32_t> run_nucleus_case(
     constexpr std::uint32_t vocab = 8;
     constexpr std::uint64_t no_ticket =
         std::numeric_limits<std::uint64_t>::max();
-    const std::string path = golden_directory + "/nucleus_sample.txt";
-    const auto container_bytes =
-        hex_bytes(golden_field(path, "container"));
-    const auto sidecar_bytes = hex_bytes(golden_field(path, "sidecar"));
-    const auto hash = std::stoull(golden_field(path, "hash"), nullptr, 16);
-    pie_native::ptir::container::Container container;
-    pie_native::ptir::container::DecodeError decode_error;
-    expect(
-        pie_native::ptir::container::decode(
-            container_bytes.data(), container_bytes.size(),
-            container, &decode_error),
-        "decode nucleus fixture: " + decode_error.detail);
-    expect(container.channels.size() == 3, "nucleus channel count");
+    const std::uint64_t hash = program_key("nucleus_sample");
+    const PieLaunchPackage& package =
+        host_launch(golden_directory, "nucleus_sample");
+    const PieLaunchChannelSlice channels = package.channels;
+    expect(channels.len == 3, "nucleus channel count");
 
     Dispatch dispatch;
     std::string error;
     expect(
         dispatch.register_program(
             hash,
-            {container_bytes.data(), container_bytes.size()},
-            {sidecar_bytes.data(), sidecar_bytes.size()},
+            package,
             load_host_kernels(golden_directory, "nucleus_sample").slice(),
-            host_stage_identities(golden_directory, "nucleus_sample"),
             host_region_analysis(golden_directory, "nucleus_sample"),
             &error) == PIE_STATUS_OK,
         "register nucleus program: " + error);
@@ -601,24 +539,18 @@ std::vector<std::int32_t> run_nucleus_case(
         0, 0, 0, 2, 5, 0};
 
     for (std::uint32_t lane = 0; lane < lane_count; ++lane) {
-        endpoints[lane].resize(container.channels.size());
-        std::vector<std::uint64_t> ids(container.channels.size());
-        for (std::size_t dense = 0; dense < container.channels.size(); ++dense) {
-            const auto& source = container.channels[dense];
+        endpoints[lane].resize(channels.len);
+        std::vector<std::uint64_t> ids(channels.len);
+        for (std::size_t dense = 0; dense < channels.len; ++dense) {
+            const PieLaunchChannel& source = channels.ptr[dense];
             const std::uint64_t id =
                 40000 + static_cast<std::uint64_t>(lane) * 100 + dense;
             ids[dense] = id;
-            PieChannelDesc descriptor{};
-            descriptor.abi_version = PIE_DRIVER_ABI_VERSION;
-            descriptor.channel_id = id;
-            descriptor.shape = {source.shape.dims, source.shape.rank};
-            descriptor.dtype = source.dtype;
-            descriptor.host_role = source.host_role;
-            descriptor.seeded = source.seeded;
+            PieChannelDesc descriptor =
+                pie_cuda_driver::tests::channel_desc_from(
+                    source, id, id * 2 + 1, id * 2 + 2);
             descriptor.extern_dir = PIE_CHANNEL_EXTERN_NONE;
-            descriptor.capacity = source.capacity;
-            descriptor.reader_wait_id = id * 2 + 1;
-            descriptor.writer_wait_id = id * 2 + 2;
+            descriptor.extern_name = {nullptr, 0};
             expect(
                 dispatch.register_channel(
                     descriptor, &endpoints[lane][dense], &error) ==
@@ -788,34 +720,19 @@ void run_structured_mask_golden(const std::string& golden_directory) {
     constexpr std::uint32_t lane_count = 2;
     constexpr std::uint64_t no_ticket =
         std::numeric_limits<std::uint64_t>::max();
-    const std::string path =
-        golden_directory + "/structured_masks.txt";
-    const auto container_bytes =
-        hex_bytes(golden_field(path, "container"));
-    const auto sidecar_bytes =
-        hex_bytes(golden_field(path, "sidecar"));
-    const auto hash =
-        std::stoull(golden_field(path, "hash"), nullptr, 16);
-    pie_native::ptir::container::Container container;
-    pie_native::ptir::container::DecodeError decode_error;
-    expect(
-        pie_native::ptir::container::decode(
-            container_bytes.data(),
-            container_bytes.size(),
-            container,
-            &decode_error),
-        "decode structured-mask golden: " + decode_error.detail);
-    expect(container.channels.size() == 7, "structured-mask channel count");
+    const std::uint64_t hash = program_key("structured_masks");
+    const PieLaunchPackage& package =
+        host_launch(golden_directory, "structured_masks");
+    const PieLaunchChannelSlice channels = package.channels;
+    expect(channels.len == 7, "structured-mask channel count");
 
     Dispatch dispatch;
     std::string error;
     expect(
         dispatch.register_program(
             hash,
-            {container_bytes.data(), container_bytes.size()},
-            {sidecar_bytes.data(), sidecar_bytes.size()},
+            package,
             load_host_kernels(golden_directory, "structured_masks").slice(),
-            host_stage_identities(golden_directory, "structured_masks"),
             host_region_analysis(golden_directory, "structured_masks"),
             &error) == PIE_STATUS_OK,
         "register structured-mask golden: " + error);
@@ -834,24 +751,18 @@ void run_structured_mask_golden(const std::string& golden_directory) {
     const std::uint32_t owners[4] = {0, 1, 2, 3};
 
     for (std::uint32_t lane = 0; lane < lane_count; ++lane) {
-        endpoints[lane].resize(container.channels.size());
-        std::vector<std::uint64_t> ids(container.channels.size());
+        endpoints[lane].resize(channels.len);
+        std::vector<std::uint64_t> ids(channels.len);
         for (std::size_t channel = 0;
-             channel < container.channels.size();
+             channel < channels.len;
              ++channel) {
-            const auto& source = container.channels[channel];
+            const PieLaunchChannel& source = channels.ptr[channel];
             ids[channel] = 80000 + lane * 32 + channel;
-            PieChannelDesc descriptor{};
-            descriptor.abi_version = PIE_DRIVER_ABI_VERSION;
-            descriptor.channel_id = ids[channel];
-            descriptor.shape = {source.shape.dims, source.shape.rank};
-            descriptor.dtype = source.dtype;
-            descriptor.host_role = source.host_role;
-            descriptor.seeded = source.seeded;
+            PieChannelDesc descriptor =
+                pie_cuda_driver::tests::channel_desc_from(
+                    source, ids[channel], ids[channel] * 2 + 1, ids[channel] * 2 + 2);
             descriptor.extern_dir = PIE_CHANNEL_EXTERN_NONE;
-            descriptor.capacity = source.capacity;
-            descriptor.reader_wait_id = ids[channel] * 2 + 1;
-            descriptor.writer_wait_id = ids[channel] * 2 + 2;
+            descriptor.extern_name = {nullptr, 0};
             expect(
                 dispatch.register_channel(
                     descriptor, &endpoints[lane][channel], &error) ==
@@ -977,27 +888,16 @@ void run_declared_phase_case(
     WriteBoundCase write_bound_case = WriteBoundCase::None) {
     constexpr std::uint64_t no_ticket =
         std::numeric_limits<std::uint64_t>::max();
-    const std::string path =
-        golden_directory + "/staged_dispatch.txt";
-    const auto container_bytes =
-        hex_bytes(golden_field(path, "container"));
-    const auto sidecar_bytes =
-        hex_bytes(golden_field(path, "sidecar"));
-    const auto hash =
-        std::stoull(golden_field(path, "hash"), nullptr, 16);
-    pie_native::ptir::container::Container container;
-    pie_native::ptir::container::DecodeError decode_error;
+    const std::uint64_t hash = program_key("staged_dispatch");
+    const PieLaunchPackage& package =
+        host_launch(golden_directory, "staged_dispatch");
+    const PieLaunchChannelSlice channels = package.channels;
     expect(
-        pie_native::ptir::container::decode(
-            container_bytes.data(), container_bytes.size(),
-            container, &decode_error),
-        "decode staged fixture: " + decode_error.detail);
-    expect(
-        container.stages.size() == 4 &&
-            container.stages[0].stage == PTIR_STAGE_PROLOGUE &&
-            container.stages[1].stage == PTIR_STAGE_ON_ATTN_PROJ &&
-            container.stages[2].stage == PTIR_STAGE_ON_ATTN &&
-            container.stages[3].stage == PTIR_STAGE_EPILOGUE,
+        package.stages.len == 4 &&
+            package.stages.ptr[0].kind == PTIR_STAGE_PROLOGUE &&
+            package.stages.ptr[1].kind == PTIR_STAGE_ON_ATTN_PROJ &&
+            package.stages.ptr[2].kind == PTIR_STAGE_ON_ATTN &&
+            package.stages.ptr[3].kind == PTIR_STAGE_EPILOGUE,
         "staged fixture preserves all declared phase identities");
 
     std::string error;
@@ -1006,10 +906,8 @@ void run_declared_phase_case(
         expect(
             unsupported.register_program(
                 hash,
-                {container_bytes.data(), container_bytes.size()},
-                {sidecar_bytes.data(), sidecar_bytes.size()},
+                package,
                 load_host_kernels(golden_directory, "staged_dispatch").slice(),
-            host_stage_identities(golden_directory, "staged_dispatch"),
             host_region_analysis(golden_directory, "staged_dispatch"),
                 &error) == PIE_STATUS_UNSUPPORTED,
             "model without attention hook coverage rejects registration");
@@ -1020,32 +918,24 @@ void run_declared_phase_case(
     expect(
         dispatch.register_program(
             hash,
-            {container_bytes.data(), container_bytes.size()},
-            {sidecar_bytes.data(), sidecar_bytes.size()},
+            package,
             load_host_kernels(golden_directory, "staged_dispatch").slice(),
-            host_stage_identities(golden_directory, "staged_dispatch"),
             host_region_analysis(golden_directory, "staged_dispatch"),
             &error) == PIE_STATUS_OK,
         "register staged program: " + error);
 
     std::vector<PieChannelEndpointBinding> endpoints(
-        container.channels.size());
-    std::vector<std::uint64_t> channel_ids(container.channels.size());
-    for (std::size_t dense = 0; dense < container.channels.size(); ++dense) {
-        const auto& source = container.channels[dense];
+        channels.len);
+    std::vector<std::uint64_t> channel_ids(channels.len);
+    for (std::size_t dense = 0; dense < channels.len; ++dense) {
+        const PieLaunchChannel& source = channels.ptr[dense];
         channel_ids[dense] =
             (fail_after_first_layer ? 200000 : 100000) + dense;
-        PieChannelDesc descriptor{};
-        descriptor.abi_version = PIE_DRIVER_ABI_VERSION;
-        descriptor.channel_id = channel_ids[dense];
-        descriptor.shape = {source.shape.dims, source.shape.rank};
-        descriptor.dtype = source.dtype;
-        descriptor.host_role = source.host_role;
-        descriptor.seeded = source.seeded;
+        PieChannelDesc descriptor =
+            pie_cuda_driver::tests::channel_desc_from(
+                source, channel_ids[dense], channel_ids[dense] * 2 + 1, channel_ids[dense] * 2 + 2);
         descriptor.extern_dir = PIE_CHANNEL_EXTERN_NONE;
-        descriptor.capacity = source.capacity;
-        descriptor.reader_wait_id = channel_ids[dense] * 2 + 1;
-        descriptor.writer_wait_id = channel_ids[dense] * 2 + 2;
+        descriptor.extern_name = {nullptr, 0};
         expect(
             dispatch.register_channel(
                 descriptor, &endpoints[dense], &error) ==
@@ -1108,7 +998,7 @@ void run_declared_phase_case(
     PieTerminalCell* terminals[] = {&terminal};
     const std::uint32_t row_attribution[] = {0, 0};
     const std::uint32_t ticket_indptr[] = {
-        0, static_cast<std::uint32_t>(container.channels.size())};
+        0, static_cast<std::uint32_t>(channels.len)};
     const std::uint64_t expected_heads[] = {
         0, 0, no_ticket, no_ticket, no_ticket,
         0, 0, 0, 0, 0, 0,
@@ -1330,7 +1220,7 @@ void run_declared_phase_case(
     cudaFree(fixed_w_page);
     cudaFree(fixed_w_off);
     cudaFree(fixed_valid);
-    pie_native::ptir::ResolvedPrograms resolved;
+    pie_native::launch::ResolvedPrograms resolved;
     expect(
         dispatch.resolve_descriptors(
             view, 16, 4, resolved, &error, false, launch.get()) &&
@@ -1469,55 +1359,31 @@ std::vector<std::uint8_t> run_beam_case(
     constexpr std::uint32_t vocab = 8;
     constexpr std::uint64_t no_ticket =
         std::numeric_limits<std::uint64_t>::max();
-    const std::string path = golden_directory + "/beam_epilogue.txt";
-    const auto container_bytes =
-        hex_bytes(golden_field(path, "container"));
-    const auto sidecar_bytes = hex_bytes(golden_field(path, "sidecar"));
-    const auto hash = std::stoull(golden_field(path, "hash"), nullptr, 16);
-    pie_native::ptir::container::Container container;
-    pie_native::ptir::container::DecodeError decode_error;
-    expect(
-        pie_native::ptir::container::decode(
-            container_bytes.data(), container_bytes.size(),
-            container, &decode_error),
-        "decode beam fixture: " + decode_error.detail);
-    expect(container.channels.size() == 16, "beam channel count");
-    pie_native::ptir::bound::Bound bound;
-    std::string plan_error;
-    expect(
-        pie_native::ptir::bound::parse_sidecar(
-            sidecar_bytes.data(), sidecar_bytes.size(), bound, &plan_error) &&
-            bound.plans.size() == 1,
-        "beam fixture carries one compiler region plan: " + plan_error);
-    pie_native::ptir::plan::StagePlan decoded_plan;
-    if (!bound.plans.empty()) {
-        expect(
-            pie_native::ptir::plan::decode(
-                bound.plans[0].bytes.data(),
-                bound.plans[0].bytes.size(),
-                decoded_plan,
-                &plan_error),
-            "decode beam compiler region plan: " + plan_error);
-    }
+    const std::uint64_t hash = program_key("beam_epilogue");
+    const PieLaunchPackage& package =
+        host_launch(golden_directory, "beam_epilogue");
+    const PieLaunchChannelSlice channels = package.channels;
+    expect(channels.len == 16, "beam channel count");
+    expect(package.plans.len == 1, "beam fixture carries one region plan");
+    const PieLaunchStagePlan& stage_plan = package.plans.ptr[0];
     std::size_t topk_regions = 0;
-    for (const auto& region : decoded_plan.fused.regions) {
-        if (!region.library ||
-            region.library_op != PTIR_LIBRARY_TOP_K) {
+    for (std::size_t i = 0; i < stage_plan.fused.len; ++i) {
+        const PieLaunchRegion& region = stage_plan.fused.ptr[i];
+        if (region.kind != PIE_REGION_LIBRARY ||
+            region.library != PTIR_LIBRARY_TOP_K) {
             continue;
         }
         ++topk_regions;
         expect(
-            region.nodes.size() == 1 &&
-                decoded_plan.ops[region.nodes.front()].op.tag ==
-                    PTIR_OP_TOP_K,
+            region.nodes.len == 1 &&
+                stage_plan.ops.ptr[region.nodes.ptr[0]].code == PTIR_OP_TOP_K,
             "beam workload has an opcode-derived TopK library cut");
     }
-    const auto has_opcode = [&](std::uint8_t tag) {
-        return std::any_of(
-            decoded_plan.ops.begin(), decoded_plan.ops.end(),
-            [tag](const auto& normalized) {
-                return normalized.op.tag == tag;
-            });
+    const auto has_opcode = [&](std::uint16_t tag) {
+        for (std::size_t i = 0; i < stage_plan.ops.len; ++i) {
+            if (stage_plan.ops.ptr[i].code == tag) return true;
+        }
+        return false;
     };
     expect(
         topk_regions == 1 &&
@@ -1525,14 +1391,16 @@ std::vector<std::uint8_t> run_beam_case(
             has_opcode(PTIR_OP_REM) &&
             has_opcode(PTIR_OP_GATHER),
         "beam workload keeps index arithmetic and gathers as generic SSA");
-    std::vector<std::uint8_t> consumes(container.channels.size(), 0);
-    std::vector<std::uint8_t> publishes(container.channels.size(), 0);
-    for (const auto& op : container.stages[0].ops) {
-        if (op.tag == PTIR_OP_CHAN_TAKE) {
-            consumes[static_cast<std::size_t>(op.chan)] = 1;
-        } else if (op.tag == PTIR_OP_CHAN_PUT) {
-            publishes[static_cast<std::size_t>(op.chan)] = 1;
-        }
+    // The package states a stage's channel effects outright; the ticket
+    // expectations below are the same two sets the driver's readiness uses.
+    std::vector<std::uint8_t> consumes(channels.len, 0);
+    std::vector<std::uint8_t> publishes(channels.len, 0);
+    const PieLaunchStage& body = package.stages.ptr[0];
+    for (std::size_t i = 0; i < body.takes.len; ++i) {
+        consumes[body.takes.ptr[i]] = 1;
+    }
+    for (std::size_t i = 0; i < body.puts.len; ++i) {
+        publishes[body.puts.ptr[i].channel] = 1;
     }
 
     Dispatch dispatch;
@@ -1540,10 +1408,8 @@ std::vector<std::uint8_t> run_beam_case(
     expect(
         dispatch.register_program(
             hash,
-            {container_bytes.data(), container_bytes.size()},
-            {sidecar_bytes.data(), sidecar_bytes.size()},
+            package,
             load_host_kernels(golden_directory, "beam_epilogue").slice(),
-            host_stage_identities(golden_directory, "beam_epilogue"),
             host_region_analysis(golden_directory, "beam_epilogue"),
             &error) == PIE_STATUS_OK,
         "register beam program: " + error);
@@ -1560,24 +1426,18 @@ std::vector<std::uint8_t> run_beam_case(
     std::vector<std::uint32_t> unit_extents(lane_count, 1);
 
     for (std::uint32_t lane = 0; lane < lane_count; ++lane) {
-        endpoints[lane].resize(container.channels.size());
-        std::vector<std::uint64_t> ids(container.channels.size());
-        for (std::size_t dense = 0; dense < container.channels.size(); ++dense) {
-            const auto& source = container.channels[dense];
+        endpoints[lane].resize(channels.len);
+        std::vector<std::uint64_t> ids(channels.len);
+        for (std::size_t dense = 0; dense < channels.len; ++dense) {
+            const PieLaunchChannel& source = channels.ptr[dense];
             const std::uint64_t id =
                 70000 + static_cast<std::uint64_t>(lane) * 100 + dense;
             ids[dense] = id;
-            PieChannelDesc descriptor{};
-            descriptor.abi_version = PIE_DRIVER_ABI_VERSION;
-            descriptor.channel_id = id;
-            descriptor.shape = {source.shape.dims, source.shape.rank};
-            descriptor.dtype = source.dtype;
-            descriptor.host_role = source.host_role;
-            descriptor.seeded = source.seeded;
+            PieChannelDesc descriptor =
+                pie_cuda_driver::tests::channel_desc_from(
+                    source, id, id * 2 + 1, id * 2 + 2);
             descriptor.extern_dir = PIE_CHANNEL_EXTERN_NONE;
-            descriptor.capacity = source.capacity;
-            descriptor.reader_wait_id = id * 2 + 1;
-            descriptor.writer_wait_id = id * 2 + 2;
+            descriptor.extern_name = {nullptr, 0};
             expect(
                 dispatch.register_channel(
                     descriptor, &endpoints[lane][dense], &error) ==
@@ -1641,15 +1501,15 @@ std::vector<std::uint8_t> run_beam_case(
         publish_bytes(
             endpoints[lane][12], host_input, sizeof(host_input));
         terminal_ptrs[lane] = &terminals[lane];
-        for (std::size_t dense = 0; dense < container.channels.size(); ++dense) {
+        for (std::size_t dense = 0; dense < channels.len; ++dense) {
             const bool consumes_or_replaces_seed =
                 consumes[dense] ||
-                (container.channels[dense].seeded && publishes[dense]);
+                ((channels.ptr[dense].flags & PIE_CHANNEL_SEEDED) != 0 && publishes[dense]);
             expected_heads.push_back(
                 consumes_or_replaces_seed ? 0 : no_ticket);
             expected_tails.push_back(
                 publishes[dense]
-                    ? (container.channels[dense].seeded ? 1 : 0)
+                    ? ((channels.ptr[dense].flags & PIE_CHANNEL_SEEDED) != 0 ? 1 : 0)
                     : no_ticket);
         }
         ticket_indptr.push_back(
@@ -1785,30 +1645,17 @@ void run_mtp_direct_case(const std::string& golden_directory) {
     constexpr std::uint32_t logits_stride = 10;
     constexpr std::uint64_t no_ticket =
         std::numeric_limits<std::uint64_t>::max();
-    const std::string path =
-        golden_directory + "/mtp_verify_tail.txt";
-    const auto container_bytes =
-        hex_bytes(golden_field(path, "container"));
-    const auto sidecar_bytes =
-        hex_bytes(golden_field(path, "sidecar"));
-    const auto hash =
-        std::stoull(golden_field(path, "hash"), nullptr, 16);
-    pie_native::ptir::container::Container container;
-    pie_native::ptir::container::DecodeError decode_error;
-    expect(
-        pie_native::ptir::container::decode(
-            container_bytes.data(), container_bytes.size(),
-            container, &decode_error),
-        "decode MtpLogits fixture: " + decode_error.detail);
+    const std::uint64_t hash = program_key("mtp_verify_tail");
+    const PieLaunchPackage& package =
+        host_launch(golden_directory, "mtp_verify_tail");
+    const PieLaunchChannelSlice channels = package.channels;
     Dispatch dispatch;
     std::string error;
     expect(
         dispatch.register_program(
             hash,
-            {container_bytes.data(), container_bytes.size()},
-            {sidecar_bytes.data(), sidecar_bytes.size()},
+            package,
             load_host_kernels(golden_directory, "mtp_verify_tail").slice(),
-            host_stage_identities(golden_directory, "mtp_verify_tail"),
             host_region_analysis(golden_directory, "mtp_verify_tail"),
             &error) == PIE_STATUS_OK,
         "register MtpLogits fixture: " + error);
@@ -1828,24 +1675,18 @@ void run_mtp_direct_case(const std::string& golden_directory) {
         0xff, 0xff, 0x04, 0xff,
     };
     for (std::uint32_t lane = 0; lane < lane_count; ++lane) {
-        endpoints[lane].resize(container.channels.size());
-        std::vector<std::uint64_t> ids(container.channels.size());
+        endpoints[lane].resize(channels.len);
+        std::vector<std::uint64_t> ids(channels.len);
         for (std::size_t channel = 0;
-             channel < container.channels.size();
+             channel < channels.len;
              ++channel) {
-            const auto& source = container.channels[channel];
+            const PieLaunchChannel& source = channels.ptr[channel];
             ids[channel] = 90000 + lane * 16 + channel;
-            PieChannelDesc descriptor{};
-            descriptor.abi_version = PIE_DRIVER_ABI_VERSION;
-            descriptor.channel_id = ids[channel];
-            descriptor.shape = {source.shape.dims, source.shape.rank};
-            descriptor.dtype = source.dtype;
-            descriptor.host_role = source.host_role;
-            descriptor.seeded = source.seeded;
+            PieChannelDesc descriptor =
+                pie_cuda_driver::tests::channel_desc_from(
+                    source, ids[channel], ids[channel] * 2 + 1, ids[channel] * 2 + 2);
             descriptor.extern_dir = PIE_CHANNEL_EXTERN_NONE;
-            descriptor.capacity = source.capacity;
-            descriptor.reader_wait_id = ids[channel] * 2 + 1;
-            descriptor.writer_wait_id = ids[channel] * 2 + 2;
+            descriptor.extern_name = {nullptr, 0};
             expect(
                 dispatch.register_channel(
                     descriptor, &endpoints[lane][channel], &error) ==
@@ -1992,7 +1833,7 @@ void run_parallel_signature_case(const std::string& golden_directory) {
     struct Program {
         std::uint64_t hash = 0;
         std::uint64_t instance = 0;
-        pie_native::ptir::container::Container container;
+        PieLaunchChannelSlice channels{};
         std::vector<PieChannelEndpointBinding> endpoints;
         std::vector<std::uint64_t> channel_ids;
     };
@@ -2004,57 +1845,33 @@ void run_parallel_signature_case(const std::string& golden_directory) {
                        std::uint32_t geometry_class,
                        const std::vector<PieChannelValueDesc>& seeds) {
         Program result;
-        const std::string path =
-            golden_directory + "/" + name + ".txt";
-        const auto canonical =
-            hex_bytes(golden_field(path, "container"));
-        const auto sidecar =
-            hex_bytes(golden_field(path, "sidecar"));
-        result.hash =
-            std::stoull(golden_field(path, "hash"), nullptr, 16);
-        pie_native::ptir::container::DecodeError decode_error;
-        expect(
-            pie_native::ptir::container::decode(
-                canonical.data(),
-                canonical.size(),
-                result.container,
-                &decode_error),
-            "parallel-signature container decode: " +
-                decode_error.detail);
+        result.hash = program_key(name);
+        const PieLaunchPackage& package = host_launch(golden_directory, name);
+        result.channels = package.channels;
         expect(
             dispatch.register_program(
                 result.hash,
-                {canonical.data(), canonical.size()},
-                {sidecar.data(), sidecar.size()},
+                package,
                 // `name`, not a fixed golden: this lambda prepares whichever
                 // program it is asked for, and handing it another program's
                 // kernel table publishes a kernel built for a different plan.
                 load_host_kernels(golden_directory, name).slice(),
-                host_stage_identities(golden_directory, name),
                 host_region_analysis(golden_directory, name),
                 &error) == PIE_STATUS_OK,
             "parallel-signature program registration: " + error);
         result.instance = instance;
-        result.endpoints.resize(result.container.channels.size());
-        result.channel_ids.resize(result.container.channels.size());
+        result.endpoints.resize(result.channels.len);
+        result.channel_ids.resize(result.channels.len);
         for (std::size_t channel = 0;
-             channel < result.container.channels.size();
+             channel < result.channels.len;
              ++channel) {
-            const auto& source = result.container.channels[channel];
+            const PieLaunchChannel& source = result.channels.ptr[channel];
             result.channel_ids[channel] = channel_base + channel;
-            PieChannelDesc descriptor{};
-            descriptor.abi_version = PIE_DRIVER_ABI_VERSION;
-            descriptor.channel_id = result.channel_ids[channel];
-            descriptor.shape = {source.shape.dims, source.shape.rank};
-            descriptor.dtype = source.dtype;
-            descriptor.host_role = source.host_role;
-            descriptor.seeded = source.seeded;
+            PieChannelDesc descriptor =
+                pie_cuda_driver::tests::channel_desc_from(
+                    source, result.channel_ids[channel], result.channel_ids[channel] * 2 + 1, result.channel_ids[channel] * 2 + 2);
             descriptor.extern_dir = PIE_CHANNEL_EXTERN_NONE;
-            descriptor.capacity = source.capacity;
-            descriptor.reader_wait_id =
-                result.channel_ids[channel] * 2 + 1;
-            descriptor.writer_wait_id =
-                result.channel_ids[channel] * 2 + 2;
+            descriptor.extern_name = {nullptr, 0};
             expect(
                 dispatch.register_channel(
                     descriptor,

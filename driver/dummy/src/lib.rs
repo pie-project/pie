@@ -14,12 +14,13 @@ use pie_driver_abi::{
     PIE_GEOMETRY_CLASS_HOST, PIE_TERMINAL_OUTCOME_FAILED, PIE_TERMINAL_OUTCOME_RETRY,
     PIE_TERMINAL_OUTCOME_SUCCESS, PieBytes, PieChannelDesc, PieChannelEndpointBinding,
     PieChannelValueDescSlice, PieCompletion, PieEncodeDesc, PieFrameDesc, PieInstanceBinding,
-    PieInstanceDesc, PieKvCopyDesc, PiePoolResizeDesc, PieProgramDesc, PieRuntimeCallbacks,
-    PieStateCopyDesc, PieStepDesc, PieTerminalCell, PieTerminalCellPtrSlice, PieU32Slice,
-    PieU64Slice, validate_channel_desc, validate_completion, validate_encode_desc,
-    validate_frame_desc, validate_instance_desc, validate_kv_copy_desc, validate_pool_resize_desc,
-    validate_program_desc, validate_state_copy_desc,
+    PieInstanceDesc, PieKvCopyDesc, PiePoolResizeDesc, PieRuntimeCallbacks, PieStateCopyDesc,
+    PieStepDesc, PieTerminalCell, PieTerminalCellPtrSlice, PieU32Slice, PieU64Slice,
+    validate_channel_desc, validate_completion, validate_encode_desc, validate_frame_desc,
+    validate_instance_desc, validate_kv_copy_desc, validate_pool_resize_desc,
+    validate_state_copy_desc,
 };
+use pie_driver_abi::plan::ProgramRegistration;
 use pie_eval::interp::{
     ExternChannel, HostError, Instance as InterpInstance, NoKernels, PassInputs, StepError, Value,
 };
@@ -456,17 +457,19 @@ impl DummyDriver {
         Ok(self.capabilities.clone())
     }
 
-    pub fn register_program(&mut self, desc: &PieProgramDesc) -> Result<u64> {
-        validate_program_desc(desc).map_err(|err| anyhow!(err))?;
-        ensure_abi(desc.abi_version)?;
+    /// Registers a program.
+    ///
+    /// Unlike a native driver this takes the owned registration rather than
+    /// [`PieProgramDesc`], because the reference driver interprets PTIR: it
+    /// links the compiler's own IR, so it cannot drift from it. The C ABI
+    /// carries only the launch package.
+    pub fn register_program(&mut self, desc: &ProgramRegistration) -> Result<u64> {
         self.record_op("register_program");
-        let canonical_bytes = copy_bytes(desc.canonical_bytes, "program.canonical_bytes")?;
-        let _sidecar = copy_bytes(desc.sidecar_bytes, "program.sidecar_bytes")?;
         ensure!(
-            !canonical_bytes.is_empty(),
-            "program registration requires canonical PTIR bytes"
+            !desc.reference_ptir.is_empty(),
+            "the reference driver requires ProgramRegistration::reference_ptir"
         );
-        let hash = pie_ir::container_hash(&canonical_bytes);
+        let hash = pie_ir::container_hash(&desc.reference_ptir);
         if desc.program_hash != 0 {
             ensure!(
                 desc.program_hash == hash,
@@ -474,7 +477,7 @@ impl DummyDriver {
                 desc.program_hash
             );
         }
-        let container = container::decode(&canonical_bytes)
+        let container = container::decode(&desc.reference_ptir)
             .map_err(|err| anyhow!("program decode failed: {err}"))?;
         let bound = pie_ir::validate::bind(container, self.model_profile()).map_err(|err| {
             anyhow!(
@@ -2448,13 +2451,10 @@ mod tests {
             }
         }
         let program_id = driver
-            .register_program(&PieProgramDesc {
+            .register_program(&ProgramRegistration {
                 program_hash: pie_ir::container_hash(&bytes),
-                canonical_bytes: PieBytes {
-                    ptr: bytes.as_ptr(),
-                    len: bytes.len(),
-                },
-                ..PieProgramDesc::default()
+                reference_ptir: bytes.clone(),
+                ..ProgramRegistration::default()
             })
             .unwrap();
         let seed_descs = seeds
@@ -2538,13 +2538,10 @@ mod tests {
     fn register_test_program(driver: &mut DummyDriver, container: TraceContainer) -> u64 {
         let bytes = container.encode();
         driver
-            .register_program(&PieProgramDesc {
+            .register_program(&ProgramRegistration {
                 program_hash: pie_ir::container_hash(&bytes),
-                canonical_bytes: PieBytes {
-                    ptr: bytes.as_ptr(),
-                    len: bytes.len(),
-                },
-                ..PieProgramDesc::default()
+                reference_ptir: bytes.clone(),
+                ..ProgramRegistration::default()
             })
             .unwrap()
     }
@@ -3533,7 +3530,11 @@ mod tests {
     #[test]
     fn invalid_descriptors_fail_synchronously() {
         let (mut driver, callbacks) = driver_with_callbacks(0);
-        assert!(driver.register_program(&PieProgramDesc::default()).is_err());
+        assert!(
+            driver
+                .register_program(&ProgramRegistration::default())
+                .is_err()
+        );
         let err = driver
             .bind_instance(&PieInstanceDesc {
                 program_id: 1,

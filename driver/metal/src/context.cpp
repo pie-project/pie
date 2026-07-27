@@ -451,7 +451,6 @@ class Context::Impl {
     int register_program(const PieProgramDesc& program, std::uint64_t* program_id) {
         std::uint64_t id = 0;
         pipeline::ExecPlan compile_plan;
-        std::vector<std::uint8_t> compile_canonical;
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
             const int status = registry_.register_program(program, &id);
@@ -473,7 +472,6 @@ class Context::Impl {
                 return PIE_STATUS_UNSUPPORTED;
             }
             compile_plan = record.plan;
-            compile_canonical = record.canonical_bytes;
         }
 
 #if defined(__APPLE__)
@@ -503,7 +501,6 @@ class Context::Impl {
                     compile_plan,
                     compile_emitted,
                     compile_error,
-                    compile_canonical,
                     &compile_failure);
             }
         });
@@ -1909,7 +1906,7 @@ class Context::Impl {
         std::string& failure) {
         desc.sequence_id = member.instance_id;
 
-        pie_native::ptir::FireGeometry resolved;
+        pie_native::launch::FireGeometry resolved;
         const bool device_geometry =
             interp::requires_descriptor_resolution(program.plan.trace);
         if (device_geometry) {
@@ -1959,7 +1956,7 @@ class Context::Impl {
             }
             const std::uint32_t device_pages =
                 effective_total_pages(cfg_, facts_.has_linear_attn);
-            if (!pie_native::ptir::validate_fire_geometry(
+            if (!pie_native::launch::validate_fire_geometry(
                     resolved, device_pages, cfg_.batching.kv_page_size, &failure)) {
                 return ForwardBuildResult::Failed;
             }

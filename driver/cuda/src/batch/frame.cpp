@@ -1002,7 +1002,7 @@ void prepare_step(
             : nullptr;
     bool use_structured_mask = false;
     bool pack_structured_mask = false;
-    std::vector<pie_native::ptir::StructuredMaskDescriptor>
+    std::vector<pie_native::launch::StructuredMaskDescriptor>
         effective_structured_masks = s.composed.structured_masks;
     const auto mask_coverage = pipeline::structured_mask_coverage(
         effective_structured_masks);

@@ -154,16 +154,16 @@ private:
 }  // namespace
 
 // Shared pure-host PTIR decode model (trace/op-table/container/bound/
-// fire-geometry) now lives in pie_native::ptir (driver/common); bring it into
+// fire-geometry) now lives in pie_native::launch (driver/common); bring it into
 // scope so the CUDA-side tier-0/1 code below can use it unqualified.
-using namespace pie_native::ptir;
+using namespace pie_native::launch;
 
 // `store/kv_cache.hpp` (pulled in for the `envelope_dot` KV geometry) declares
 // its own `pie_cuda_driver::DType`, which sits closer in the lookup chain than
 // the using-directive above and would silently retarget every unqualified
 // `DType` in this file. Pin the PTIR one explicitly; the cache's own dtype is
 // spelled `pie_cuda_driver::DType` where it is needed.
-using DType = pie_native::ptir::DType;
+using DType = pie_native::launch::DType;
 
 struct CallbackFence {
     std::atomic<std::uint32_t> pending{0};
@@ -2485,10 +2485,6 @@ DispatchStats Dispatch::stats() const {
     result.generated_stage_cache_entries = generated.stage_entries;
     result.generated_program_cache_entries = generated.program_entries;
     result.generated_negative_cache_entries = generated.negative_entries;
-    const auto identities = impl_->cache.identity_stats();
-    result.identity_host_supplied = identities.host_supplied;
-    result.identity_derived = identities.derived;
-    result.identity_divergent = identities.divergent;
     result.region_host_supplied = impl_->cache.region_stats().host_supplied;
     result.channel_slot_capacity = impl_->channels.capacity_slots();
     return result;
@@ -2916,18 +2912,13 @@ void Dispatch::reserve_channel_slots(std::uint32_t min_slots) {
 }
 
 int Dispatch::register_program(std::uint64_t program_hash,
-                                   pie_native::ByteSlice canonical,
-                                   pie_native::ByteSlice sidecar,
+                                   const PieLaunchPackage& package,
                                    PieEmittedKernelSlice emitted,
-                                   PieU64Slice stage_identities,
                                    PieRegionAnalysisSlice region_analysis,
                                    std::string* err) {
     if (err) err->clear();
     std::string derr;
-    const Trace* trace = impl_->cache.get_or_decode(
-        program_hash,
-        reinterpret_cast<const std::uint8_t*>(canonical.ptr), canonical.size(),
-        reinterpret_cast<const std::uint8_t*>(sidecar.ptr), sidecar.size(), &derr);
+    const Trace* trace = impl_->cache.adopt(program_hash, package, &derr);
     if (trace == nullptr) {
         if (err) *err = derr;
         return PIE_STATUS_DRIVER_ERROR;
@@ -2947,15 +2938,6 @@ int Dispatch::register_program(std::uint64_t program_hash,
         if (err) *err = "ptir program has no compiler region plans";
         return PIE_STATUS_INVALID_ARGUMENT;
     }
-    std::string identity_error;
-    if (!impl_->cache.adopt_host_stage_identities(
-            program_hash,
-            stage_identities.ptr,
-            stage_identities.len,
-            &identity_error)) {
-        if (err) *err = identity_error;
-        return PIE_STATUS_INVALID_ARGUMENT;
-    }
     std::string region_error;
     if (!impl_->cache.adopt_host_region_analysis(
             program_hash,
@@ -2967,6 +2949,18 @@ int Dispatch::register_program(std::uint64_t program_hash,
     }
     bool needs_kv_envelopes = false;
     for (const plan::StagePlan& stage : *plans) {
+        // The host already decided whether the grouped interpreter can run
+        // this stage, and said so in the envelope. Re-deriving it here is how
+        // the two verdicts drift.
+        if (!stage.grouped.valid) {
+            if (err) {
+                *err = stage.grouped.error.empty()
+                    ? std::string("ptir stage is not executable by the CUDA "
+                                  "grouped runtime")
+                    : stage.grouped.error;
+            }
+            return PIE_STATUS_UNSUPPORTED;
+        }
         if ((stage.stage == PTIR_STAGE_ON_ATTN_PROJ ||
              stage.stage == PTIR_STAGE_ON_ATTN) &&
             !impl_->attention_hook_coverage) {
@@ -3021,8 +3015,6 @@ int Dispatch::register_program(std::uint64_t program_hash,
                 // Second-party kernels are named, not generic: the fused
                 // runtime dispatches them by name, so a name it cannot launch
                 // has to be refused at bind rather than silently skipped.
-                // `grouped_supported_tag` deliberately still excludes the tag —
-                // the grouped interpreter has no arm for it.
                 const std::string& name =
                     op.name_idx < stage.names.size()
                         ? stage.names[op.name_idx]
@@ -3054,13 +3046,6 @@ int Dispatch::register_program(std::uint64_t program_hash,
                     return PIE_STATUS_UNSUPPORTED;
                 }
                 continue;
-            }
-            if (!grouped_supported_tag(op.tag)) {
-                if (err) {
-                    *err =
-                        "ptir region plan contains an unsupported generic CUDA op";
-                }
-                return PIE_STATUS_UNSUPPORTED;
             }
             if (op.tag != PTIR_OP_INTRINSIC_VAL) continue;
             const bool valid =
@@ -3204,8 +3189,7 @@ int Dispatch::bind_instance(std::uint64_t instance_id,
     std::uint64_t bind_instance_us = 0;
     std::uint64_t bind_topology_us = 0;
     std::string derr;
-    const Trace* trace = impl_->cache.get_or_decode(
-        program_hash, nullptr, 0, nullptr, 0, &derr);
+    const Trace* trace = impl_->cache.find(program_hash, &derr);
     if (bind_timing) {
         const auto now = fire_timing::Clock::now();
         bind_decode_us = fire_timing::duration_us(bind_mark, now);
@@ -4163,7 +4147,6 @@ void execute_declared_phase(
                 if (next.complete ||
                     next.plan->signature_hash !=
                         first.plan->signature_hash ||
-                    next.plan->signature != first.plan->signature ||
                     *next.topology != *first.topology) {
                     continue;
                 }

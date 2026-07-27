@@ -6,7 +6,7 @@
 //!
 //! The header is the *only* definition of the loader's C vocabulary. It replaces
 //! the hand-written `PieLoader*` structs that used to live in
-//! `driver/common/include/pie_native/load_plan.hpp`, where a second copy of the
+//! `driver/{cuda,metal}/src/loader/load_plan.hpp`, where a second copy of the
 //! same enums drifted out of order from the Rust ones without anything noticing
 //! (see `loader/architecture.md` §9).
 

@@ -183,6 +183,141 @@ inline int validate_model_load_desc(const PieModelLoadDesc* desc,
     return PIE_STATUS_OK;
 }
 
+inline int validate_launch_ops(const PieLaunchOpSlice& ops) noexcept {
+    int status = validate_slice(ops.ptr, ops.len);
+    if (status != PIE_STATUS_OK) return status;
+    for (std::size_t i = 0; i < ops.len; ++i) {
+        status = validate_slice(ops.ptr[i].args.ptr, ops.ptr[i].args.len);
+        if (status != PIE_STATUS_OK) return status;
+        status = validate_slice(ops.ptr[i].shape.ptr,
+                                ops.ptr[i].shape.len);
+        if (status != PIE_STATUS_OK) return status;
+    }
+    return PIE_STATUS_OK;
+}
+
+inline int validate_launch_regions(const PieLaunchRegionSlice& regions) noexcept {
+    int status = validate_slice(regions.ptr, regions.len);
+    if (status != PIE_STATUS_OK) return status;
+    for (std::size_t i = 0; i < regions.len; ++i) {
+        const PieLaunchRegion& region = regions.ptr[i];
+        status = validate_slice(region.nodes.ptr, region.nodes.len);
+        if (status != PIE_STATUS_OK) return status;
+        status = validate_slice(region.inputs.ptr, region.inputs.len);
+        if (status != PIE_STATUS_OK) return status;
+        status = validate_slice(region.outputs.ptr, region.outputs.len);
+        if (status != PIE_STATUS_OK) return status;
+        status = validate_slice(region.sinks.ptr, region.sinks.len);
+        if (status != PIE_STATUS_OK) return status;
+    }
+    return PIE_STATUS_OK;
+}
+
+// The launch package's tables. A driver walks these directly -- there is no
+// decode step to reject a malformed program first -- so a bad slice here is a
+// segfault rather than an error return. The nested slices are two and three
+// levels down, where a top-level check does not reach.
+inline int validate_launch_package(const PieLaunchPackage& launch) noexcept {
+    int status = validate_slice(launch.values.ptr, launch.values.len);
+    if (status != PIE_STATUS_OK) return status;
+    for (std::size_t i = 0; i < launch.values.len; ++i) {
+        status = validate_slice(launch.values.ptr[i].shape.ptr,
+                                launch.values.ptr[i].shape.len);
+        if (status != PIE_STATUS_OK) return status;
+    }
+    status = validate_slice(launch.channels.ptr, launch.channels.len);
+    if (status != PIE_STATUS_OK) return status;
+    for (std::size_t i = 0; i < launch.channels.len; ++i) {
+        const PieLaunchChannel& channel = launch.channels.ptr[i];
+        status = validate_slice(channel.shape.ptr, channel.shape.len);
+        if (status != PIE_STATUS_OK) return status;
+        status = validate_bytes(channel.extern_name);
+        if (status != PIE_STATUS_OK) return status;
+    }
+    status = validate_slice(launch.ports.ptr, launch.ports.len);
+    if (status != PIE_STATUS_OK) return status;
+    for (std::size_t i = 0; i < launch.ports.len; ++i) {
+        const PieLaunchPort& port = launch.ports.ptr[i];
+        status = validate_slice(port.const_shape.ptr, port.const_shape.len);
+        if (status != PIE_STATUS_OK) return status;
+        status = validate_bytes(port.const_data);
+        if (status != PIE_STATUS_OK) return status;
+    }
+    status = validate_slice(launch.names.ptr, launch.names.len);
+    if (status != PIE_STATUS_OK) return status;
+    for (std::size_t i = 0; i < launch.names.len; ++i) {
+        status = validate_bytes(launch.names.ptr[i]);
+        if (status != PIE_STATUS_OK) return status;
+    }
+    status = validate_slice(launch.stages.ptr, launch.stages.len);
+    if (status != PIE_STATUS_OK) return status;
+    for (std::size_t i = 0; i < launch.stages.len; ++i) {
+        const PieLaunchStage& stage = launch.stages.ptr[i];
+        status = validate_launch_ops(stage.ops);
+        if (status != PIE_STATUS_OK) return status;
+        status = validate_slice(stage.puts.ptr, stage.puts.len);
+        if (status != PIE_STATUS_OK) return status;
+        status = validate_slice(stage.takes.ptr, stage.takes.len);
+        if (status != PIE_STATUS_OK) return status;
+        status = validate_slice(stage.reads.ptr, stage.reads.len);
+        if (status != PIE_STATUS_OK) return status;
+    }
+    // Plans are parallel to stages: the driver indexes one with the other.
+    if (launch.plans.len != launch.stages.len) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    status = validate_slice(launch.plans.ptr, launch.plans.len);
+    if (status != PIE_STATUS_OK) return status;
+    for (std::size_t i = 0; i < launch.plans.len; ++i) {
+        const PieLaunchStagePlan& plan = launch.plans.ptr[i];
+        status = validate_launch_ops(plan.ops);
+        if (status != PIE_STATUS_OK) return status;
+        // `source_op_counts` is parallel to `ops`; `source_ops` is its
+        // concatenation, so a short table would run a walk off the end.
+        if (plan.source_op_counts.len != plan.ops.len) {
+            return PIE_STATUS_INVALID_ARGUMENT;
+        }
+        status = validate_slice(plan.source_ops.ptr, plan.source_ops.len);
+        if (status != PIE_STATUS_OK) return status;
+        status =
+            validate_slice(plan.source_op_counts.ptr, plan.source_op_counts.len);
+        if (status != PIE_STATUS_OK) return status;
+        status = validate_slice(plan.value_types.ptr, plan.value_types.len);
+        if (status != PIE_STATUS_OK) return status;
+        for (std::size_t v = 0; v < plan.value_types.len; ++v) {
+            const PieLaunchPlanValue& type = plan.value_types.ptr[v];
+            if (type.extents.len != type.dims.len) {
+                return PIE_STATUS_INVALID_ARGUMENT;
+            }
+            status = validate_slice(type.extents.ptr, type.extents.len);
+            if (status != PIE_STATUS_OK) return status;
+            status = validate_slice(type.dims.ptr, type.dims.len);
+            if (status != PIE_STATUS_OK) return status;
+        }
+        status = validate_slice(plan.channel_bindings.ptr,
+                                plan.channel_bindings.len);
+        if (status != PIE_STATUS_OK) return status;
+        status = validate_slice(plan.names.ptr, plan.names.len);
+        if (status != PIE_STATUS_OK) return status;
+        for (std::size_t n = 0; n < plan.names.len; ++n) {
+            status = validate_bytes(plan.names.ptr[n]);
+            if (status != PIE_STATUS_OK) return status;
+        }
+        status = validate_launch_regions(plan.singleton);
+        if (status != PIE_STATUS_OK) return status;
+        status = validate_launch_regions(plan.fused);
+        if (status != PIE_STATUS_OK) return status;
+        status = validate_slice(plan.used_extents.ptr, plan.used_extents.len);
+        if (status != PIE_STATUS_OK) return status;
+        status =
+            validate_slice(plan.channel_rules.ptr, plan.channel_rules.len);
+        if (status != PIE_STATUS_OK) return status;
+        status = validate_bytes(plan.error);
+        if (status != PIE_STATUS_OK) return status;
+    }
+    return PIE_STATUS_OK;
+}
+
 inline int validate_program_desc(const PieProgramDesc* desc,
                                  std::uint64_t* program_id) noexcept {
     if (desc == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
@@ -191,18 +326,9 @@ inline int validate_program_desc(const PieProgramDesc* desc,
     if (desc->reserved0 != 0 || program_id == nullptr) {
         return PIE_STATUS_INVALID_ARGUMENT;
     }
-    status = validate_bytes(desc->canonical_bytes);
-    if (status != PIE_STATUS_OK) return status;
-    status = validate_bytes(desc->sidecar_bytes);
-    if (status != PIE_STATUS_OK) return status;
-    // The launch package's tables. A driver walks these before it has decoded
-    // anything, so a malformed slice here is a segfault rather than a rejected
-    // program -- and the nested slices are two levels down, where a top-level
-    // check does not reach.
     status = validate_slice(desc->emitted_kernels.ptr, desc->emitted_kernels.len);
     if (status != PIE_STATUS_OK) return status;
-    status =
-        validate_slice(desc->stage_identities.ptr, desc->stage_identities.len);
+    status = validate_launch_package(desc->launch);
     if (status != PIE_STATUS_OK) return status;
     status =
         validate_slice(desc->region_analysis.ptr, desc->region_analysis.len);

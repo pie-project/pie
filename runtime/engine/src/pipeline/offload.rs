@@ -1099,8 +1099,8 @@ async fn surrogate(
         driver_id,
         pie_driver_abi::ProgramRegistration {
             program_hash: program.hash,
-            canonical_bytes: program.bytes.clone(),
-            sidecar_bytes: program.sidecar.clone(),
+            launch: program.launch().clone(),
+            reference_ptir: program.bytes.clone(),
             ..Default::default()
         },
     )

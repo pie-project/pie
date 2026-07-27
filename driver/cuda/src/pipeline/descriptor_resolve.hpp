@@ -30,15 +30,15 @@
 #include "pipeline/channel_registry.hpp"
 #include "pie_native/fire/descriptor.hpp"
 #include "pie_native/fire/fire_geometry.hpp"
-#include "pie_native/ptir/trace.hpp"
+#include "pie_native/launch/program.hpp"
 
 namespace pie_cuda_driver::pipeline {
 
 // Shared pure-host PTIR decode model (trace/op-table/container/bound/
-// fire-geometry) now lives in pie_native::ptir (driver/common); bring it into
+// fire-geometry) now lives in pie_native::launch (driver/common); bring it into
 // scope so the CUDA-side tier-0/1 code below can use it unqualified.
-using namespace pie_native::ptir;
-using namespace pie_native::ptir::descriptor;
+using namespace pie_native::launch;
+using namespace pie_native::launch::descriptor;
 
 namespace detail {
 

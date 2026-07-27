@@ -39,9 +39,9 @@
 namespace pie_cuda_driver::pipeline {
 
 // Shared pure-host PTIR decode model (trace/op-table/container/bound/
-// fire-geometry) now lives in pie_native::ptir (driver/common); bring it into
+// fire-geometry) now lives in pie_native::launch (driver/common); bring it into
 // scope so the CUDA-side tier-0/1 code below can use it unqualified.
-using namespace pie_native::ptir;
+using namespace pie_native::launch;
 
 inline int mtp_global_history_tokens(
     int input_position,

@@ -3550,11 +3550,11 @@ mod tests {
 /// evidenced step rather than a leap.
 pub fn stage_identity(stage: &CompiledStage) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    let mut add_byte = |hash: &mut u64, byte: u8| {
+    let add_byte = |hash: &mut u64, byte: u8| {
         *hash ^= u64::from(byte);
         *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     };
-    let mut add_u32 = |hash: &mut u64, value: u32| {
+    let add_u32 = |hash: &mut u64, value: u32| {
         for shift in (0..32).step_by(8) {
             add_byte(hash, (value >> shift) as u8);
         }

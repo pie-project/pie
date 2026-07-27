@@ -13,6 +13,7 @@
 
 pub mod capabilities;
 pub mod geometry;
+pub mod image;
 pub mod local;
 pub mod plan;
 pub mod remote;

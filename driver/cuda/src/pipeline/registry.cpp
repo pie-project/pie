@@ -12,13 +12,11 @@ int Registry::register_program(
         return PIE_STATUS_OK;
     }
 
-    if (program.canonical_bytes.len == 0) return PIE_STATUS_INVALID_ARGUMENT;
+    if (program.launch.stages.len == 0) return PIE_STATUS_INVALID_ARGUMENT;
     const int rc = dispatch_.register_program(
         program.program_hash,
-        pie_native::ByteSlice{program.canonical_bytes.ptr, program.canonical_bytes.len},
-        pie_native::ByteSlice{program.sidecar_bytes.ptr, program.sidecar_bytes.len},
+        program.launch,
         program.emitted_kernels,
-        program.stage_identities,
         program.region_analysis,
         err);
     if (rc != PIE_STATUS_OK) return rc;

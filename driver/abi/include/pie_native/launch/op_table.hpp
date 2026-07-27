@@ -1,6 +1,6 @@
 #pragma once
 
-// PTIR op table — the shared pure-host view of the closed first-party op set
+// The op table — the driver-side view of the closed first-party op set
 // (CUDA-free; consumed by both the CUDA and Metal drivers).
 //
 // SOURCE OF TRUTH: echo's generated `ptir_abi.h` (from pie-sampling-ir
@@ -22,7 +22,7 @@
 
 #include <ptir_abi.h>   // PTIR_OP_* tag constants, PtirDType/Stage/Port/… enums
 
-namespace pie_native::ptir {
+namespace pie_native::launch {
 
 // Element dtype — values mirror PtirDType (F32=0,I32=1,U32=2,Bool=3, Act=4).
 // Act is a channel-decl-only late-bound activation dtype; program ops see F32.
@@ -176,4 +176,4 @@ inline constexpr bool op_is_known(OpCode c) { return op_info(c).arity != 0xFF; }
 inline constexpr std::string_view op_name(OpCode c) { return op_info(c).name; }
 inline constexpr std::uint32_t op_result_count(OpCode c) { return op_info(c).results; }
 
-}  // namespace pie_native::ptir
+}  // namespace pie_native::launch

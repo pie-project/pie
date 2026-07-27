@@ -3,12 +3,9 @@
 //! Regenerate with
 //! `PTIR_REGEN=1 cargo test -p pie-compiler-tests --test ptir_header`.
 //!
-//! Two copies are checked in: the canonical one under `compiler/codegen/include`
-//! and the mirror the native drivers actually `#include` (their include path is
-//! rooted at `driver/common/include`). Both are written from the same string, so
-//! the mirror cannot drift — it used to be maintained by hand and nothing
-//! verified it. The mirror goes away when the drivers stop carrying their own
-//! PTIR decode headers.
+//! One copy is checked in, under `compiler/codegen/include`; the native drivers
+//! put that directory on their include path directly. The hand-maintained
+//! driver mirror is gone.
 
 use std::path::{Path, PathBuf};
 
@@ -58,7 +55,7 @@ fn drivers_do_not_retype_generated_tags() {
     // (file, constant-name fragment, the generated prefix it must derive from)
     let guarded = [
         ("driver/abi/include/pie_native/fire/descriptor.hpp", "kPort", "PTIR_PORT_"),
-        ("driver/common/include/pie_native/ptir/trace.hpp", "StageKind", "PTIR_STAGE_"),
+        ("driver/abi/include/pie_native/launch/program.hpp", "StageKind", "PTIR_STAGE_"),
     ];
     for (relative, fragment, prefix) in guarded {
         let path = root.join(relative);

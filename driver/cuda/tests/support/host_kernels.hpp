@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "pie_driver_abi.h"
+#include "pie_native/launch/image.hpp"
 
 namespace pie_cuda_driver::tests {
 
@@ -94,38 +95,15 @@ class HostKernelFixture {
     std::vector<PieEmittedKernel> views_;
 };
 
-// The stage identities and the per-region analysis travel the same way and for
+// The launch package and the per-region analysis travel the same way and for
 // the same reason: registration needs what the host decided, and a C++ test
 // cannot run the host planner. Both are written beside the kernels by the same
 // `emit_driver_test_kernel_fixtures`.
 //
-//   `<name>.identities` -- one 16-hex stage identity per line.
-//   `<name>.regions`    -- `region <stage> <region> <flags> <argmax-count> [skipped...]`
-//                          followed by `argmax <node> <source_value> <intrinsic> <single_row>`.
-class HostIdentityFixture {
-  public:
-    bool load(const std::string& path, std::string* err) {
-        std::ifstream in(path);
-        if (!in) {
-            if (err) *err = "cannot open host identity fixture: " + path;
-            return false;
-        }
-        std::string line;
-        while (std::getline(in, line)) {
-            if (line.find_first_not_of(" \t\r\n") == std::string::npos) continue;
-            identities_.push_back(std::stoull(line, nullptr, 16));
-        }
-        return true;
-    }
-
-    PieU64Slice slice() const {
-        return PieU64Slice{identities_.data(), identities_.size()};
-    }
-
-  private:
-    std::vector<std::uint64_t> identities_;
-};
-
+//   `<name>.launch`  -- a relocatable image of the `PieLaunch*` records
+//                       (`pie_native::launch::PackageImage`).
+//   `<name>.regions` -- `region <stage> <region> <flags> <argmax-count> [skipped...]`
+//                       followed by `argmax <node> <source_value> <intrinsic> <single_row>`.
 class HostRegionFixture {
   public:
     bool load(const std::string& path, std::string* err) {
@@ -188,5 +166,36 @@ class HostRegionFixture {
     std::vector<std::vector<PieDirectArgmax>> argmax_;
     std::vector<std::vector<std::uint32_t>> skipped_;
 };
+
+using HostLaunchFixture = pie_native::launch::PackageImage;
+
+// A channel declaration in the shape `register_channel` wants it. Tests used to
+// read this off a decoded container; the launch package carries the same facts
+// as flags, so this is a re-encoding, not a decode.
+inline PieChannelDesc channel_desc_from(
+    const PieLaunchChannel& source,
+    std::uint64_t channel_id,
+    std::uint64_t reader_wait_id,
+    std::uint64_t writer_wait_id) {
+    PieChannelDesc desc{};
+    desc.abi_version = PIE_DRIVER_ABI_VERSION;
+    desc.channel_id = channel_id;
+    desc.shape = {source.shape.ptr, source.shape.len};
+    desc.dtype = source.dtype;
+    desc.host_role = (source.flags & PIE_CHANNEL_HOST_VISIBLE) == 0
+        ? PIE_CHANNEL_HOST_ROLE_NONE
+        : ((source.flags & PIE_CHANNEL_HOST_READER) != 0
+               ? PIE_CHANNEL_HOST_ROLE_READER
+               : PIE_CHANNEL_HOST_ROLE_WRITER);
+    desc.seeded = (source.flags & PIE_CHANNEL_SEEDED) != 0 ? 1 : 0;
+    desc.extern_dir = source.extern_dir < 0
+        ? PIE_CHANNEL_EXTERN_NONE
+        : static_cast<std::uint8_t>(source.extern_dir + 1);
+    desc.capacity = source.capacity;
+    desc.reader_wait_id = reader_wait_id;
+    desc.writer_wait_id = writer_wait_id;
+    desc.extern_name = {source.extern_name.ptr, source.extern_name.len};
+    return desc;
+}
 
 }  // namespace pie_cuda_driver::tests

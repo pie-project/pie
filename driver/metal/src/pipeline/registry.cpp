@@ -23,56 +23,60 @@ DType ChannelRecord::program_dtype() const {
     }
 }
 
+namespace {
+
+std::uint8_t host_role_for(const pie_native::launch::Channel& channel) {
+    if (!channel.host_visible) return PIE_CHANNEL_HOST_ROLE_NONE;
+    return channel.host_reader ? PIE_CHANNEL_HOST_ROLE_READER
+                               : PIE_CHANNEL_HOST_ROLE_WRITER;
+}
+
+std::uint8_t extern_dir_for(const pie_native::launch::Channel& channel) {
+    if (channel.extern_dir == 0) return PIE_CHANNEL_EXTERN_IMPORT;
+    if (channel.extern_dir == 1) return PIE_CHANNEL_EXTERN_EXPORT;
+    return PIE_CHANNEL_EXTERN_NONE;
+}
+
+std::uint8_t channel_dtype_for(DType dtype) {
+    switch (dtype) {
+        case DType::I32: return PIE_CHANNEL_DTYPE_I32;
+        case DType::U32: return PIE_CHANNEL_DTYPE_U32;
+        case DType::Bool: return PIE_CHANNEL_DTYPE_BOOL;
+        case DType::Act: return PIE_CHANNEL_DTYPE_ACT;
+        default: return PIE_CHANNEL_DTYPE_F32;
+    }
+}
+
+std::uint32_t cell_bytes_for(const pie_native::launch::Channel& channel) {
+    return static_cast<std::uint32_t>(wire_cell_bytes(
+        channel.type.dtype == DType::Act ? DType::F32 : channel.type.dtype,
+        static_cast<std::size_t>(channel.type.shape.numel())));
+}
+
+}  // namespace
+
 int Registry::register_program(
     const PieProgramDesc& program,
     std::uint64_t* program_id) {
     const auto found = program_ids_by_hash_.find(program.program_hash);
     if (found != program_ids_by_hash_.end()) {
-        const ProgramRecord& existing = programs_.at(found->second);
-        if (program.canonical_bytes.len != 0 &&
-            (program.canonical_bytes.len != existing.canonical_bytes.size() ||
-             std::memcmp(
-                 program.canonical_bytes.ptr,
-                 existing.canonical_bytes.data(),
-                 existing.canonical_bytes.size()) != 0)) {
-            std::cerr
-                << "[pie-driver-metal] register_program: program hash collision\n";
-            return PIE_STATUS_INVALID_ARGUMENT;
-        }
         if (program_id != nullptr) *program_id = found->second;
         return PIE_STATUS_OK;
     }
-    if (program.canonical_bytes.len == 0) {
+    if (program.launch.stages.len == 0) {
         return PIE_STATUS_INVALID_ARGUMENT;
     }
 
     ProgramRecord record;
     record.program_id = next_program_id_++;
     record.program_hash = program.program_hash;
-    record.canonical_bytes.assign(
-        program.canonical_bytes.ptr,
-        program.canonical_bytes.ptr + program.canonical_bytes.len);
     std::string decode_error;
-    if (!pie_native::decode_ptir_channels(
-            program.canonical_bytes.ptr,
-            program.canonical_bytes.len,
-            record.channels,
-            &decode_error)) {
+    if (!adopt_launch_package(program.launch, record.plan, &decode_error)) {
         std::cerr << "[pie-driver-metal] register_program: "
                   << decode_error << "\n";
         return PIE_STATUS_INVALID_ARGUMENT;
     }
-    if (!build_exec_plan(
-            program.canonical_bytes.ptr,
-            program.canonical_bytes.len,
-            program.sidecar_bytes.ptr,
-            program.sidecar_bytes.len,
-            record.plan,
-            &decode_error)) {
-        std::cerr << "[pie-driver-metal] register_program: "
-                  << decode_error << "\n";
-        return PIE_STATUS_INVALID_ARGUMENT;
-    }
+    record.channels = record.plan.trace.channels;
     // Snapshot the host-emitted kernel table into `record` so it survives
     // the caller's PieProgramDesc lifetime and the worker-thread hop
     // `Context::Impl::register_program` performs before it hands the record
@@ -116,10 +120,19 @@ int Registry::register_channel(
     if (channels_.find(channel.channel_id) != channels_.end()) {
         return PIE_STATUS_INVALID_ARGUMENT;
     }
-    pie_native::PtirChannelDecl geometry;
-    geometry.dtype = channel.dtype;
-    geometry.dims.assign(channel.shape.ptr, channel.shape.ptr + channel.shape.len);
-    const std::uint32_t cell_bytes = geometry.cell_bytes();
+    std::size_t numel = 1;
+    for (std::size_t i = 0; i < channel.shape.len; ++i) {
+        numel *= channel.shape.ptr[i];
+    }
+    DType endpoint_dtype = DType::F32;
+    switch (channel.dtype) {
+        case PIE_CHANNEL_DTYPE_I32: endpoint_dtype = DType::I32; break;
+        case PIE_CHANNEL_DTYPE_U32: endpoint_dtype = DType::U32; break;
+        case PIE_CHANNEL_DTYPE_BOOL: endpoint_dtype = DType::Bool; break;
+        default: endpoint_dtype = DType::F32; break;
+    }
+    const std::uint32_t cell_bytes = static_cast<std::uint32_t>(
+        wire_cell_bytes(endpoint_dtype, numel));
     if (cell_bytes == 0) return PIE_STATUS_INVALID_ARGUMENT;
 
     ChannelRecord record;
@@ -200,8 +213,8 @@ int Registry::bind_instance(
         }
         const std::size_t channel =
             static_cast<std::size_t>(id - instance.channel_ids.ptr);
-        if (!program.channels[channel].seeded ||
-            seed.bytes.len != program.channels[channel].cell_bytes() ||
+        if (!program.channels[channel].has_seed ||
+            seed.bytes.len != cell_bytes_for(program.channels[channel]) ||
             seed.bytes.ptr == nullptr) {
             return PIE_STATUS_INVALID_ARGUMENT;
         }
@@ -212,12 +225,12 @@ int Registry::bind_instance(
         if (endpoint == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
         const auto& decl = program.channels[i];
         const auto& endpoint_desc = endpoint->desc;
-        if (endpoint_desc.dtype != decl.dtype ||
+        if (endpoint_desc.dtype != channel_dtype_for(decl.type.dtype) ||
             endpoint_desc.capacity != decl.capacity ||
-            endpoint_desc.host_role != decl.host_role ||
-            endpoint_desc.seeded != static_cast<std::uint8_t>(decl.seeded) ||
-            endpoint->shape != decl.dims ||
-            (decl.extern_dir == PIE_CHANNEL_EXTERN_NONE
+            endpoint_desc.host_role != host_role_for(decl) ||
+            endpoint_desc.seeded != static_cast<std::uint8_t>(decl.has_seed) ||
+            endpoint->shape != decl.type.shape.dims ||
+            (extern_dir_for(decl) == PIE_CHANNEL_EXTERN_NONE
                  ? endpoint_desc.extern_dir != PIE_CHANNEL_EXTERN_NONE ||
                        !endpoint->attachments.empty()
                  : endpoint_desc.extern_dir == PIE_CHANNEL_EXTERN_NONE ||
@@ -226,7 +239,7 @@ int Registry::bind_instance(
                            endpoint->attachments.begin(),
                            endpoint->attachments.end(),
                            [&](const auto& attachment) {
-                               return attachment.second == decl.extern_dir;
+                               return attachment.second == extern_dir_for(decl);
                            }))) {
             return PIE_STATUS_INVALID_ARGUMENT;
         }
@@ -268,7 +281,7 @@ int Registry::bind_instance(
 
     for (std::size_t i = 0; i < record.channel_ids.size(); ++i) {
         find_channel(record.channel_ids[i])
-            ->attachments.emplace(instance_id, program.channels[i].extern_dir);
+            ->attachments.emplace(instance_id, extern_dir_for(program.channels[i]));
     }
     if (binding != nullptr) {
         std::memset(binding, 0, sizeof(*binding));

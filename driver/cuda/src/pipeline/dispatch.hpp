@@ -32,9 +32,9 @@
 namespace pie_cuda_driver::pipeline {
 
 // Shared pure-host PTIR decode model (trace/op-table/container/bound/
-// fire-geometry) now lives in pie_native::ptir (driver/common); bring it into
+// fire-geometry) now lives in pie_native::launch (driver/common); bring it into
 // scope so the CUDA-side tier-0/1 code below can use it unqualified.
-using namespace pie_native::ptir;
+using namespace pie_native::launch;
 
 class RetryableLaunchError : public std::runtime_error {
   public:
@@ -97,14 +97,6 @@ struct DispatchStats {
     std::uint64_t generated_stage_cache_entries = 0;
     std::uint64_t generated_program_cache_entries = 0;
     std::uint64_t generated_negative_cache_entries = 0;
-    /// Stage identities the host shipped, versus ones this driver had to
-    /// derive because none arrived. Deleting `program_identity.hpp`'s copy is
-    /// gated on `identity_divergent == 0` -- but only once
-    /// `identity_host_supplied > 0`, because a comparison that never ran also
-    /// reports zero divergence.
-    std::uint64_t identity_host_supplied = 0;
-    std::uint64_t identity_derived = 0;
-    std::uint64_t identity_divergent = 0;
     /// Regions whose analysis the host shipped. `region_support.hpp`'s copies
     /// are gone, so this is no longer half of a divergence gate -- it is the
     /// count of regions the driver was told about rather than worked out, and
@@ -170,16 +162,12 @@ class Dispatch {
     // any registration traffic) so grow() never fires mid-ramp.
     void reserve_channel_slots(std::uint32_t min_slots);
 
-    // `emitted` is the host's generated kernels for this program, or an empty
-    // slice when the host did not generate any (it only does so for a driver
-    // that advertised `codegen_backend`). Where present it is preferred over
-    // the in-driver emitter; the two are pinned byte-for-byte by
-    // `compiler/tests/golden-cuda/` until the in-driver copy is deleted.
+    // `package` is the program in the shape this driver executes it; the
+    // driver has no other source for it. `emitted` is the host's generated
+    // kernels, which the driver cannot regenerate -- its emitters are gone.
     int register_program(std::uint64_t program_hash,
-                         pie_native::ByteSlice canonical,
-                         pie_native::ByteSlice sidecar,
+                         const PieLaunchPackage& package,
                          PieEmittedKernelSlice emitted,
-                         PieU64Slice stage_identities,
                          PieRegionAnalysisSlice region_analysis,
                          std::string* err);
 

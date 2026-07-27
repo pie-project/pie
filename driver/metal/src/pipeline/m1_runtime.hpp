@@ -54,7 +54,7 @@ struct M1ResolvedShape {
 };
 
 M1ResolvedShape resolve_m1_shape_for_test(
-    const pie_native::ptir::plan::ValueType& type,
+    const pie_native::launch::plan::ValueType& type,
     const M1RuntimeExtents& extents);
 
 struct M1DeviceInputs {
@@ -120,7 +120,6 @@ class M1Runtime {
         const ExecPlan& plan,
         std::span<const HostEmittedKernel> emitted_kernels,
         std::string& error,
-        std::span<const std::uint8_t> canonical_bytes = {},
         M1CompileFailureKind* failure_kind = nullptr);
 
     M1PrepareOutcome prepare(
@@ -185,7 +184,7 @@ class M1Runtime {
         const std::shared_ptr<M1ProgramExecutable>& program) const;
     void inject_stage_cache_entry_for_test(
         std::uint64_t signature_hash,
-        std::vector<std::uint8_t> canonical_signature);
+        std::vector<std::uint8_t> stage_identity);
     void inject_compile_failure_for_test(
         std::string function_substring,
         std::string error,

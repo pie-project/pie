@@ -13,7 +13,7 @@
 #include <string>
 #include <vector>
 
-namespace pie_native::ptir {
+namespace pie_native::launch {
 
 enum class StructuredMaskKind : std::uint8_t {
     None = 0,
@@ -282,4 +282,4 @@ inline bool validate_kv_write_containment(
     return true;
 }
 
-}  // namespace pie_native::ptir
+}  // namespace pie_native::launch

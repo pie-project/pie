@@ -824,8 +824,8 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
             let channel_reps: Vec<u32> = channels.iter().map(|c| c.rep()).collect();
             let program_registration = crate::driver::ProgramRegistration {
                 program_hash: prog.hash,
-                canonical_bytes: prog.bytes.clone(),
-                sidecar_bytes: prog.sidecar.clone(),
+                launch: prog.launch().clone(),
+                reference_ptir: prog.bytes.clone(),
                 ..Default::default()
             };
             if bind_timing.is_some() {

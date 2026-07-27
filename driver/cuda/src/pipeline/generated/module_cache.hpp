@@ -88,7 +88,6 @@ struct StageRegionAnalysis {
 struct FusedStageExecutable {
     std::uint64_t runtime_id = 0;
     std::uint64_t signature_hash = 0;
-    std::vector<std::uint8_t> signature;
     std::vector<std::shared_ptr<FusedRegionExecutable>> regions;
     // Parallel to `regions`, including the library ones: the bind gates apply
     // to those and only those.
@@ -158,7 +157,7 @@ class ModuleCache {
 
     std::shared_ptr<const FusedProgramExecutable> compile_program(
         std::uint64_t program_hash,
-        const std::vector<pie_native::ptir::plan::StagePlan>& plans,
+        const std::vector<pie_native::launch::plan::StagePlan>& plans,
         CompileFailureKind& failure_kind,
         std::string& error,
         HostSource host_source = nullptr,
@@ -237,8 +236,7 @@ class ModuleCache {
             const auto existing_stage = stages_.find(key);
             if (existing_stage != stages_.end()) {
                 if (existing_stage->second->signature_hash !=
-                        plan.signature_hash ||
-                    existing_stage->second->signature != plan.signature) {
+                    plan.signature_hash) {
                     failure_kind = CompileFailureKind::Deterministic;
                     error = "CUDA fused stage cache identity collision";
                     return nullptr;
@@ -255,7 +253,6 @@ class ModuleCache {
             }
             auto stage = std::make_shared<FusedStageExecutable>();
             stage->signature_hash = plan.signature_hash;
-            stage->signature = plan.signature;
             stage->regions.resize(plan.fused.regions.size());
             stage->region_analysis.resize(plan.fused.regions.size());
             for (std::size_t region_index = 0;
@@ -658,7 +655,7 @@ class ModuleCache {
     }
 
     static std::string stage_key(
-        const pie_native::ptir::plan::StagePlan& plan,
+        const pie_native::launch::plan::StagePlan& plan,
         int major,
         int minor,
         int nvrtc_major,
@@ -701,7 +698,6 @@ class ModuleCache {
         add_u32(static_cast<std::uint32_t>(nvrtc_minor));
         add_u8(plan.stage);
         add_u64(plan.signature_hash);
-        add_bytes(plan.signature);
         add_u32(static_cast<std::uint32_t>(
             plan.channel_bindings.size()));
         add_u32(static_cast<std::uint32_t>(plan.names.size()));
@@ -719,11 +715,9 @@ class ModuleCache {
             add_u32(op.lit_bits);
             add_u16(op.intr);
             add_u8(op.dtype);
-            add_u8(op.shape.rank);
-            for (std::uint8_t dimension = 0;
-                 dimension < op.shape.rank;
-                 ++dimension) {
-                add_u32(op.shape.dims[dimension]);
+            add_u8(static_cast<std::uint8_t>(op.shape.rank()));
+            for (std::uint32_t dimension : op.shape.dims) {
+                add_u32(dimension);
             }
             add_u32(op.imm);
             add_u32(op.imm2);
@@ -766,7 +760,7 @@ class ModuleCache {
     }
 
     static bool complete_stage_coverage(
-        const pie_native::ptir::plan::StagePlan& plan,
+        const pie_native::launch::plan::StagePlan& plan,
         const FusedStageExecutable& stage,
         std::string& error) {
         if (plan.fused.whole_stage_fallback ||

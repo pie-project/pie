@@ -173,16 +173,6 @@ impl DriverBackend {
                     .and_then(|program| program.emitted(backend))
             });
 
-        // The stage identities go to every driver, not just the ones that read
-        // host-emitted kernels: they are plan analysis, not code generation.
-        let stage_identities = if desc.stage_identities.is_empty() {
-            registered
-                .as_ref()
-                .map(|program| program.stage_identities())
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
 
         // The region analysis is the other half of the CUDA emitter's own
         // contract -- which regions bind, and how the kernel's intrinsic side
@@ -200,10 +190,7 @@ impl DriverBackend {
         };
 
         let owned;
-        let desc = if emitted.is_some()
-            || !stage_identities.is_empty()
-            || !region_analysis.is_empty()
-        {
+        let desc = if emitted.is_some() || !region_analysis.is_empty() {
             let mut next = desc.clone();
             if let Some(emitted) = emitted {
                 next.emitter_version = emitted.emitter_version;
@@ -219,9 +206,6 @@ impl DriverBackend {
                         error: kernel.error.clone(),
                     })
                     .collect();
-            }
-            if !stage_identities.is_empty() {
-                next.stage_identities = stage_identities;
             }
             if !region_analysis.is_empty() {
                 next.region_analysis = region_analysis;

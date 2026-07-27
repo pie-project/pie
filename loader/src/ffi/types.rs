@@ -2,7 +2,7 @@
 //!
 //! These types are the loader's published vocabulary: the driver walks them in
 //! place, so every field here is part of the ABI. They replace the hand-written
-//! `PieLoader*` structs in `driver/common/include/pie_native/load_plan.hpp`,
+//! `PieLoader*` structs in `driver/{cuda,metal}/src/loader/load_plan.hpp`,
 //! which the generated header (`loader/include/pie_loader.h`) supersedes.
 //!
 //! Two rules govern this module:

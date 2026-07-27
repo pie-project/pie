@@ -35,7 +35,7 @@
 #include <cstdint>
 #include <vector>
 
-#include "pie_native/ptir/plan.hpp"
+#include "pie_native/launch/plan.hpp"
 
 namespace pie::metal::pipeline {
 
@@ -54,7 +54,7 @@ struct M1ChannelEffect {
 struct M1OpMeta {
     std::uint32_t node = 0;
     std::uint32_t result_base = 0;
-    pie_native::ptir::container::COp op;
+    pie_native::launch::plan::PlanOp op;
 };
 
 // Walk the plan's singleton partition and populate `M1OpMeta` per op. This
@@ -65,7 +65,7 @@ struct M1OpMeta {
 // itself assumes the plan is well-formed and result bases are the running
 // prefix sum of `op.results` in container order.
 inline std::vector<M1OpMeta> collect_singleton_metadata(
-    const pie_native::ptir::plan::StagePlan& plan) {
+    const pie_native::launch::plan::StagePlan& plan) {
     std::vector<M1OpMeta> operations;
     operations.reserve(plan.ops.size());
     std::uint32_t result_base = 0;

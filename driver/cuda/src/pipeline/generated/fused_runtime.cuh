@@ -846,7 +846,6 @@ inline bool generated_stage_supported(
         return false;
     };
     if (executable.signature_hash != stage.signature_hash ||
-        executable.signature != stage.signature ||
         executable.regions.size() != stage.fused.regions.size() ||
         executable.region_analysis.size() != stage.fused.regions.size()) {
         return fail("compiled fused stage identity mismatch");

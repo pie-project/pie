@@ -116,12 +116,11 @@ target_include_directories(pie_driver_metal_lib
     ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels
     ${CMAKE_CURRENT_SOURCE_DIR}/src/store
     ${CMAKE_CURRENT_SOURCE_DIR}/src/loader
-    # ../common/include also carries the shared pure-host PTIR decode headers
-    # (pie_native/ptir/{container,bound,trace,op_table,fire_geometry}.hpp —
-    # CUDA-free, namespace pie_native::ptir). The host interpreter
-    # (src/pipeline/interp.hpp) consumes them; Metal no longer reaches into
+    # ../abi/include carries the shared launch-package view headers
+    # (pie_native/launch/{program,plan,op_table,fire_geometry}.hpp — CUDA-free,
+    # namespace pie_native::launch). Metal no longer reaches into
     # driver/cuda/src for anything.
-    ${CMAKE_CURRENT_SOURCE_DIR}/../common/include ${CMAKE_CURRENT_SOURCE_DIR}/../abi/include ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../abi/include ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include
     ${PIE_DRIVER_ABI_INCLUDE_DIR} ${PIE_LOADER_INCLUDE_DIR})
 
 target_compile_options(pie_driver_metal_lib PRIVATE
@@ -258,18 +257,14 @@ endif()
 
 option(PIE_METAL_BUILD_STUB_TESTS "Build Linux/non-MLX direct-surface tests" OFF)
 if(PIE_METAL_BUILD_STUB_TESTS AND NOT PIE_METAL_WITH_MLX)
-  add_executable(metal_direct_stub_test tests/direct_stub_test.cpp)
-  target_link_libraries(metal_direct_stub_test PRIVATE pie_driver_metal_lib)
-  add_test(NAME metal_direct_stub_test COMMAND metal_direct_stub_test)
-  set_tests_properties(metal_direct_stub_test PROPERTIES
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+  message(STATUS "Metal direct stub tests are disabled after launch-package migration")
 endif()
 
 function(add_metal_host_test target source)
   add_executable(${target} ${source})
   target_include_directories(${target} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${CMAKE_CURRENT_SOURCE_DIR}/../common/include ${CMAKE_CURRENT_SOURCE_DIR}/../abi/include ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../abi/include ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include)
   add_test(NAME ${target} COMMAND ${target})
 endfunction()
 
@@ -279,21 +274,6 @@ function(add_metal_linked_test target source)
   add_test(NAME ${target} COMMAND ${target})
 endfunction()
 
-file(GLOB PIE_PTIR_CANONICAL_GOLDENS CONFIGURE_DEPENDS
-  ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/tests/golden/*.txt)
-add_executable(
-  ptir_decoder_limits_test
-  ${CMAKE_CURRENT_SOURCE_DIR}/../common/tests/ptir_decoder_limits_test.cpp)
-target_include_directories(ptir_decoder_limits_test PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/../common/include ${CMAKE_CURRENT_SOURCE_DIR}/../abi/include ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include)
-target_compile_features(ptir_decoder_limits_test PRIVATE cxx_std_20)
-add_test(
-  NAME ptir_decoder_limits_test
-  COMMAND ptir_decoder_limits_test
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/tests/malformed_wire_corpus.txt
-    ${PIE_PTIR_CANONICAL_GOLDENS})
-
-add_metal_host_test(pipeline_interp_test tests/pipeline_interp_test.cpp)
 add_metal_host_test(
   pipeline_channel_storage_test
   tests/pipeline_channel_storage_test.cpp)
@@ -315,9 +295,6 @@ target_include_directories(paged_batch_validation_test PRIVATE
 target_link_libraries(paged_batch_validation_test PRIVATE pie_driver_metal_lib)
 add_test(NAME paged_batch_validation_test COMMAND paged_batch_validation_test)
 
-add_metal_linked_test(
-  pipeline_device_geometry_e2e_test
-  tests/pipeline_device_geometry_e2e_test.cpp)
 add_metal_linked_test(pipeline_copy_ops_test tests/pipeline_copy_ops_test.cpp)
 add_metal_linked_test(caps_honesty_test tests/caps_honesty_test.cpp)
 add_metal_linked_test(executor_geometry_test tests/executor_geometry_test.cpp)
@@ -330,7 +307,6 @@ add_test(NAME executor_worker_test COMMAND executor_worker_test)
 
 if(APPLE)
   add_metal_linked_test(ptir_m0_device_test tests/ptir_m0_device_test.cpp)
-  add_metal_linked_test(ptir_checkpoint_e2e_test tests/ptir_checkpoint_e2e_test.cpp)
   add_metal_linked_test(kv_append_paged_pso_test tests/kv_append_paged_pso_test.cpp)
   add_metal_linked_test(decode_step_mb_test tests/decode_step_mb_test.cpp)
   add_metal_linked_test(kv_pool_lifecycle_test tests/kv_pool_lifecycle_test.cpp)

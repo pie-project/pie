@@ -251,7 +251,7 @@ std::uint32_t symbolic_extent(
 }
 
 bool describe_value(
-    const pie_native::ptir::plan::ValueType& type,
+    const pie_native::launch::plan::ValueType& type,
     const M1RuntimeExtents& extents,
     DeviceValueDesc& descriptor) {
     descriptor = {};
@@ -310,7 +310,7 @@ std::size_t wire_value_bytes(const DeviceValueDesc& descriptor) {
 }
 
 std::uint64_t combined_signature(
-    const std::vector<pie_native::ptir::plan::StagePlan>& plans) {
+    const std::vector<pie_native::launch::plan::StagePlan>& plans) {
     std::vector<std::uint8_t> bytes;
     bytes.reserve(plans.size() * sizeof(std::uint64_t));
     for (const auto& plan : plans) {
@@ -326,7 +326,7 @@ std::uint64_t combined_signature(
 }  // namespace
 
 M1ResolvedShape resolve_m1_shape_for_test(
-    const pie_native::ptir::plan::ValueType& type,
+    const pie_native::launch::plan::ValueType& type,
     const M1RuntimeExtents& extents) {
     DeviceValueDesc descriptor;
     if (!describe_value(type, extents, descriptor)) return {};
@@ -383,13 +383,13 @@ struct M1RegionExecutable {
 };
 
 struct M2FusedRegionExecutable {
-    pie_native::ptir::plan::Region region;
+    pie_native::launch::plan::Region region;
     Pso pso{};
     int ordinal = -1;
 };
 
 struct M3GroupedRegionExecutable {
-    pie_native::ptir::plan::Region region;
+    pie_native::launch::plan::Region region;
     Pso pso{};
     bool parallel_nucleus = false;
     bool parallel_topk = false;
@@ -405,17 +405,16 @@ struct M1StageExecutable {
     std::string fused_reason;
     std::string grouped_reason;
     std::string cache_identity;
-    std::vector<std::uint8_t> canonical_signature;
+    std::vector<std::uint8_t> stage_identity;
 };
 
 struct M1ProgramStage {
     std::shared_ptr<M1StageExecutable> executable;
-    pie_native::ptir::plan::StagePlan plan;
+    pie_native::launch::plan::StagePlan plan;
 };
 
 struct M1ProgramExecutable {
     std::uint64_t program_hash = 0;
-    std::vector<std::uint8_t> canonical_bytes;
     std::vector<M1ProgramStage> stages;
     std::vector<M1ChannelEffect> effects;
     Pso readiness{};
@@ -588,19 +587,25 @@ std::uint8_t m3_schedule_bucket(const M1RuntimeExtents& extents) {
                      32 - std::countl_zero(rows - 1));
 }
 
+std::vector<std::uint8_t> identity_bytes(std::uint64_t identity) {
+    std::vector<std::uint8_t> bytes(sizeof(identity));
+    std::memcpy(bytes.data(), &identity, sizeof(identity));
+    return bytes;
+}
+
 std::string m3_stage_key(
     const M1ProgramStage& stage,
     const M1RuntimeExtents& extents) {
-    if (stage.plan.signature.empty()) return {};
+    if (stage.plan.identity == 0) return {};
     std::string key(
-        reinterpret_cast<const char*>(stage.plan.signature.data()),
-        stage.plan.signature.size());
+        reinterpret_cast<const char*>(&stage.plan.identity),
+        sizeof(stage.plan.identity));
     key.push_back(static_cast<char>(m3_schedule_bucket(extents)));
     return key;
 }
 
 std::size_t m3_used_channel_slots(
-    const pie_native::ptir::plan::StagePlan& stage) {
+    const pie_native::launch::plan::StagePlan& stage) {
     std::size_t count = 0;
     for (const auto& normalized : stage.ops) {
         if (normalized.op.chan >= 0) {
@@ -855,27 +860,12 @@ std::shared_ptr<M1ProgramExecutable> M1Runtime::compile_program(
     const ExecPlan& plan,
     std::span<const HostEmittedKernel> emitted_kernels,
     std::string& error,
-    std::span<const std::uint8_t> canonical_bytes,
     M1CompileFailureKind* failure_kind) {
     if (failure_kind != nullptr) {
         *failure_kind = M1CompileFailureKind::None;
     }
     if (const auto found = impl_->programs.find(program_hash);
         found != impl_->programs.end()) {
-        if (!canonical_bytes.empty() &&
-            (found->second->canonical_bytes.empty() ||
-             found->second->canonical_bytes.size() !=
-                 canonical_bytes.size() ||
-             !std::equal(
-                 canonical_bytes.begin(),
-                 canonical_bytes.end(),
-                 found->second->canonical_bytes.begin()))) {
-            error = "Metal M1 program hash collision";
-            if (failure_kind != nullptr) {
-                *failure_kind = M1CompileFailureKind::Deterministic;
-            }
-            return nullptr;
-        }
         ++impl_->stats.memory_hits;
         return found->second;
     }
@@ -909,10 +899,8 @@ std::shared_ptr<M1ProgramExecutable> M1Runtime::compile_program(
                 ? "Metal M1 plan is not executable"
                 : plan.reject_reason);
     }
-    if (plan.bound.version < 2 ||
-        (plan.region_plans.empty() && !plan.trace.stages.empty())) {
-        return reject_deterministic(
-            "Metal M1 requires PTIB v2 with PTRP v4/compiler v3 plans");
+    if (plan.region_plans.empty() && !plan.trace.stages.empty()) {
+        return reject_deterministic("Metal M1 requires launch stage plans");
     }
     if (plan.region_plans.size() != plan.trace.stages.size()) {
         return reject_deterministic("Metal M1 plan/stage count mismatch");
@@ -966,8 +954,6 @@ std::shared_ptr<M1ProgramExecutable> M1Runtime::compile_program(
 
     auto executable = std::make_shared<M1ProgramExecutable>();
     executable->program_hash = program_hash;
-    executable->canonical_bytes.assign(
-        canonical_bytes.begin(), canonical_bytes.end());
     executable->requires_m2_placement = requires_m2_placement;
     executable->effects.resize(plan.trace.channels.size());
     for (std::size_t channel = 0; channel < plan.trace.channels.size();
@@ -976,20 +962,11 @@ std::shared_ptr<M1ProgramExecutable> M1Runtime::compile_program(
         effect.capacity = plan.trace.channels[channel].capacity;
         effect.take = plan.takes_channel(static_cast<std::uint32_t>(channel));
         effect.put = plan.puts_channel(static_cast<std::uint32_t>(channel));
-        const auto readiness = std::find_if(
-            plan.bound.readiness.begin(),
-            plan.bound.readiness.end(),
-            [channel](const auto& entry) {
-                return entry.chan == channel;
-            });
-        if (readiness != plan.bound.readiness.end()) {
-            effect.requires_full =
-                readiness->dir ==
-                pie_native::ptir::container::Direction::NeedsFull;
-            effect.requires_empty =
-                readiness->dir ==
-                pie_native::ptir::container::Direction::NeedsEmpty;
-        }
+        effect.requires_full =
+            plan.takes_channel(static_cast<std::uint32_t>(channel)) ||
+            plan.reads_channel(static_cast<std::uint32_t>(channel));
+        effect.requires_empty =
+            plan.puts_channel(static_cast<std::uint32_t>(channel));
     }
 
     HostEmittedKernels host_kernels(emitted_kernels);
@@ -1054,8 +1031,8 @@ std::shared_ptr<M1ProgramExecutable> M1Runtime::compile_program(
             stage_plan.signature_hash);
         if (const auto found = impl_->stage_cache.find(identity);
             found != impl_->stage_cache.end()) {
-            if (found->second->canonical_signature !=
-                stage_plan.signature) {
+            if (found->second->stage_identity !=
+                identity_bytes(stage_plan.identity)) {
                 return reject_deterministic(
                     "Metal M1 stage signature hash collision");
             }
@@ -1066,8 +1043,8 @@ std::shared_ptr<M1ProgramExecutable> M1Runtime::compile_program(
         }
         if (const auto found = pending_stages.find(identity);
             found != pending_stages.end()) {
-            if (found->second->canonical_signature !=
-                stage_plan.signature) {
+            if (found->second->stage_identity !=
+                identity_bytes(stage_plan.identity)) {
                 return reject_deterministic(
                     "Metal M1 stage signature hash collision");
             }
@@ -1083,7 +1060,7 @@ std::shared_ptr<M1ProgramExecutable> M1Runtime::compile_program(
         }
         auto stage = std::make_shared<M1StageExecutable>();
         stage->cache_identity = identity;
-        stage->canonical_signature = stage_plan.signature;
+        stage->stage_identity = identity_bytes(stage_plan.identity);
         const std::filesystem::path directory =
             impl_->cache_dir / identity;
         for (std::size_t region = 0; region < operations.size(); ++region) {
@@ -1118,8 +1095,8 @@ std::shared_ptr<M1ProgramExecutable> M1Runtime::compile_program(
                     transaction)) {
                 return reject_retryable(
                     "Metal M1 compile failed for " +
-                    std::string(pie_native::ptir::op_name(
-                        static_cast<pie_native::ptir::OpCode>(
+                    std::string(pie_native::launch::op_name(
+                        static_cast<pie_native::launch::OpCode>(
                             operations[region].op.tag))) +
                     ": " + error);
             }
@@ -3249,12 +3226,12 @@ std::string M1Runtime::m3_stage_group_key(
 
 void M1Runtime::inject_stage_cache_entry_for_test(
     std::uint64_t signature_hash,
-    std::vector<std::uint8_t> canonical_signature) {
+    std::vector<std::uint8_t> stage_identity) {
     const std::string identity = encode_cache_identity(
         impl_->context->device_cache_id(), signature_hash);
     auto stage = std::make_shared<M1StageExecutable>();
     stage->cache_identity = identity;
-    stage->canonical_signature = std::move(canonical_signature);
+    stage->stage_identity = std::move(stage_identity);
     impl_->stage_cache[identity] = std::move(stage);
 }
 

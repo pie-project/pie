@@ -504,17 +504,17 @@ fn emit_driver_test_kernel_fixtures() {
         }
         std::fs::write(out_dir.join(format!("{name}.kernels")), body).unwrap();
 
-        // The stage identities travel with the kernels for the same reason:
-        // the driver's C++ tests cannot run the host's planner, so anything
-        // the launch package carries has to be handed to them as a fixture.
-        // Without this the driver's own divergence counter is unreadable --
-        // no C++ caller supplies a table, so `divergent` stays zero because
-        // the comparison never happens.
-        let mut identities = String::new();
-        for stage in &stages {
-            let _ = writeln!(identities, "{:016x}", pie_plan::stage_identity(stage));
-        }
-        std::fs::write(out_dir.join(format!("{name}.identities")), identities).unwrap();
+        // The launch package travels with the kernels for the same reason: the
+        // driver's C++ tests cannot run the host's planner, and the driver no
+        // longer decodes PTIR, so the one thing it *does* accept has to be
+        // handed to them as a fixture. Written as a relocatable image of the
+        // very same `#[repr(C)]` records the engine ships (see
+        // `pie_driver_abi::image`), not as a second wire format.
+        std::fs::write(
+            out_dir.join(format!("{name}.launch")),
+            pie_driver_abi::image::encode(&pie_codegen::launch::build(&bound, &stages)),
+        )
+        .unwrap();
 
         // Same reasoning for the region analysis. Its record is nested, so it
         // is written as one line per region followed by one line per direct

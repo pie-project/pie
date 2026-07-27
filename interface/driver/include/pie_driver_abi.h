@@ -49,6 +49,11 @@
 #define PIE_DEVICE_GEOMETRY_PORTS ((((((PIE_DEVICE_PORT_EMBED_TOKENS | PIE_DEVICE_PORT_PAGES) | PIE_DEVICE_PORT_POSITIONS) | PIE_DEVICE_PORT_PAGE_INDPTR) | PIE_DEVICE_PORT_W_SLOT) | PIE_DEVICE_PORT_KV_LEN) | PIE_DEVICE_PORT_W_OFF)
 
 /**
+ * `"PIELPKG\0"`, little-endian.
+ */
+#define IMAGE_MAGIC 20067531595532624
+
+/**
  * Current direct local ABI version.
  *
  * v14 (Project Venus): the launch unit is the sealed **frame** — one
@@ -64,7 +69,7 @@
  * itself in `region_support.hpp`. Additive, and empty means "not supplied",
  * but the struct grew, so drivers and workers ship together.
  */
-#define PIE_DRIVER_ABI_VERSION 17
+#define PIE_DRIVER_ABI_VERSION 18
 
 #define PIE_MODEL_COMPONENT_FULL 0
 
@@ -124,6 +129,11 @@
  * The frame can never fit within the driver's physical budget ceiling.
  */
 #define PIE_STATUS_IMPOSSIBLE -7
+
+/**
+ * Sentinel for [`PieLaunchOp::channel`] on ops that touch no channel.
+ */
+#define PIE_NO_CHANNEL UINT32_MAX
 
 #define PIE_GEOMETRY_CLASS_HOST 0
 
@@ -226,6 +236,95 @@
  * The region is a well-formed generated region.
  */
 #define PIE_REGION_GENERATED_VALID (1 << 1)
+
+/**
+ * Where a value comes from. Mirrors `pie_ir` value sources.
+ */
+#define PIE_VALUE_CONST 0
+
+#define PIE_VALUE_INTRINSIC 1
+
+#define PIE_VALUE_HOST_INPUT 2
+
+#define PIE_VALUE_CHANNEL_TAKE 3
+
+#define PIE_VALUE_CHANNEL_READ 4
+
+#define PIE_VALUE_OP_RESULT 5
+
+/**
+ * A host input is bound at submit time, not late.
+ */
+#define PIE_HOST_SUBMIT_BOUND 0
+
+#define PIE_HOST_LATE_BOUND 1
+
+/**
+ * The channel is pre-filled with a seed cell at instantiation.
+ */
+#define PIE_CHANNEL_SEEDED (1 << 0)
+
+/**
+ * The host reads or writes this channel.
+ */
+#define PIE_CHANNEL_HOST_VISIBLE (1 << 1)
+
+/**
+ * The host is the *reader* — the channel is a program output.
+ */
+#define PIE_CHANNEL_HOST_READER (1 << 2)
+
+/**
+ * The region is served by a generated kernel.
+ */
+#define PIE_REGION_GENERATED 0
+
+/**
+ * The region is served by a vendor or second-party library call.
+ */
+#define PIE_REGION_LIBRARY 1
+
+/**
+ * A dimension is a literal extent, not a symbolic one.
+ */
+#define PIE_EXTENT_STATIC 255
+
+/**
+ * The stage reads the `query` intrinsic.
+ */
+#define PIE_STAGE_REQUIRES_QUERY (1 << 0)
+
+/**
+ * The stage reads the `layer` intrinsic.
+ */
+#define PIE_STAGE_REQUIRES_LAYER (1 << 1)
+
+/**
+ * The stage reads the `attn_score` intrinsic.
+ */
+#define PIE_STAGE_REQUIRES_ATTN_SCORE (1 << 2)
+
+/**
+ * The stage names a second-party kernel.
+ */
+#define PIE_STAGE_REQUIRES_KERNEL_CALL (1 << 3)
+
+/**
+ * The stage writes the `attn_page_mask` sink.
+ */
+#define PIE_STAGE_REQUIRES_PAGE_MASK (1 << 4)
+
+/**
+ * The stage reads multi-token-prediction draft rows.
+ */
+#define PIE_STAGE_REQUIRES_MTP_ROWS (1 << 5)
+
+/**
+ * Every op in the stage is coverable by the grouped launch path, and its
+ * intrinsics and runtime extents are ones that path supports. When clear,
+ * `error` says why and the stage must take the fused path.
+ */
+#define PIE_STAGE_GROUPED_VALID (1 << 6)
 
 #define CHANNEL_TICKET_NONE UINT64_MAX
 
@@ -379,16 +478,6 @@ typedef struct PieEmittedKernelSlice {
 } PieEmittedKernelSlice;
 
 /**
- * Borrowed immutable `u64` slice.
- *
- * `ptr` may be null only when `len == 0`.
- */
-typedef struct PieU64Slice {
-  const uint64_t *ptr;
-  size_t len;
-} PieU64Slice;
-
-/**
  * One `argmax` in a generated region that reads a logits intrinsic's device
  * buffer directly, skipping the intrinsic materialisation and the reshapes
  * between them.
@@ -476,6 +565,518 @@ typedef struct PieRegionAnalysisSlice {
 } PieRegionAnalysisSlice;
 
 /**
+ * One declared SSA value: its type and its producer.
+ */
+typedef struct PieLaunchValue {
+  /**
+   * Trace-global value id. The table is dense and ascending, so this is the
+   * index, but it is carried explicitly so a driver never has to assume so.
+   */
+  uint32_t id;
+  /**
+   * `PIE_VALUE_*`.
+   */
+  uint8_t source;
+  /**
+   * Element dtype (`PTIR_DT_*`).
+   */
+  uint8_t dtype;
+  /**
+   * `PTIR_INTR_*` when `source` is `PIE_VALUE_INTRINSIC`.
+   */
+  uint8_t intrinsic;
+  /**
+   * `PIE_HOST_*` when `source` is `PIE_VALUE_HOST_INPUT`.
+   */
+  uint8_t host_avail;
+  /**
+   * Request-table selector when `source` is `PIE_VALUE_HOST_INPUT`.
+   */
+  uint32_t host_key;
+  /**
+   * Channel id when `source` is a channel take or read.
+   */
+  uint32_t channel;
+  /**
+   * Literal payload when `source` is `PIE_VALUE_CONST`, raw bits per dtype.
+   */
+  uint32_t literal_bits;
+  /**
+   * Reserved; must be zero.
+   */
+  uint32_t reserved0;
+  /**
+   * Row-major logical shape. Empty is scalar.
+   */
+  struct PieU32Slice shape;
+} PieLaunchValue;
+
+/**
+ * Borrowed view of a value table.
+ */
+typedef struct PieLaunchValueSlice {
+  const struct PieLaunchValue *ptr;
+  size_t len;
+} PieLaunchValueSlice;
+
+/**
+ * One channel declaration: a bounded ring of `capacity + 1` typed cells.
+ */
+typedef struct PieLaunchChannel {
+  uint32_t id;
+  /**
+   * Logical capacity; the ring holds `capacity + 1` cells.
+   */
+  uint32_t capacity;
+  /**
+   * Cell element dtype (`PTIR_DT_*`).
+   */
+  uint8_t dtype;
+  /**
+   * `PIE_CHANNEL_*` bits.
+   */
+  uint8_t flags;
+  /**
+   * -1 private, 0 import, 1 export.
+   */
+  int8_t extern_dir;
+  /**
+   * Reserved; must be zero.
+   */
+  uint8_t reserved0;
+  /**
+   * Reserved; must be zero.
+   */
+  uint32_t reserved1;
+  /**
+   * Cell shape.
+   */
+  struct PieU32Slice shape;
+  /**
+   * Rendezvous name when `extern_dir` is not -1.
+   */
+  struct PieBytes extern_name;
+} PieLaunchChannel;
+
+/**
+ * Borrowed view of a channel table.
+ */
+typedef struct PieLaunchChannelSlice {
+  const struct PieLaunchChannel *ptr;
+  size_t len;
+} PieLaunchChannelSlice;
+
+/**
+ * One descriptor-port binding: a forward-pass input port fed by a channel.
+ */
+typedef struct PieLaunchPort {
+  /**
+   * `PTIR_PORT_*`.
+   */
+  uint8_t port;
+  /**
+   * Nonzero when the port was const-folded and consumes no channel.
+   */
+  uint8_t is_const;
+  /**
+   * Const payload dtype when `is_const`.
+   */
+  uint8_t const_dtype;
+  /**
+   * Reserved; must be zero.
+   */
+  uint8_t reserved0;
+  /**
+   * Channel id when not const-folded.
+   */
+  uint32_t channel;
+  /**
+   * Const payload shape when `is_const`.
+   */
+  struct PieU32Slice const_shape;
+  /**
+   * Const payload bytes when `is_const`.
+   */
+  struct PieBytes const_data;
+} PieLaunchPort;
+
+/**
+ * Borrowed view of a port table.
+ */
+typedef struct PieLaunchPortSlice {
+  const struct PieLaunchPort *ptr;
+  size_t len;
+} PieLaunchPortSlice;
+
+/**
+ * Borrowed view of a table of byte strings.
+ */
+typedef struct PieBytesSlice {
+  const struct PieBytes *ptr;
+  size_t len;
+} PieBytesSlice;
+
+/**
+ * One op in a stage DAG, in SSA order.
+ */
+typedef struct PieLaunchOp {
+  /**
+   * `PTIR_OP_*`.
+   */
+  uint16_t code;
+  /**
+   * SSA ids this op defines (`top_k`/`sort_desc` define two).
+   */
+  uint16_t result_count;
+  /**
+   * First SSA id this op defines.
+   */
+  uint32_t result_id;
+  /**
+   * `PTIR_INTR_*`, for `intrinsic_val`.
+   */
+  uint16_t intrinsic;
+  /**
+   * Literal dtype, for `const`.
+   */
+  uint8_t lit_dtype;
+  /**
+   * Element dtype (`PTIR_DT_*`) — the result's, or the target of a `cast`.
+   */
+  uint8_t dtype;
+  /**
+   * `pivot_threshold` predicate tag.
+   */
+  uint8_t pred_tag;
+  /**
+   * RNG kind (0 uniform, 1 gumbel).
+   */
+  uint8_t rng_kind;
+  /**
+   * Reserved; must be zero.
+   */
+  uint16_t reserved0;
+  /**
+   * Raw literal bits, for `const`.
+   */
+  uint32_t lit_bits;
+  /**
+   * `pivot_threshold` predicate payload — always a value id.
+   */
+  uint32_t pred_payload;
+  /**
+   * Channel slot for `chan_take`/`chan_read`/`chan_put`, else
+   * [`PIE_NO_CHANNEL`].
+   */
+  uint32_t channel;
+  /**
+   * Name-table index for `kernel_call`/`sink_call`.
+   */
+  uint32_t name_index;
+  /**
+   * Op-specific immediates (`top_k` k, transpose axes, iota len, …).
+   */
+  uint32_t imm;
+  uint32_t imm2;
+  uint32_t imm3;
+  /**
+   * Reserved; must be zero.
+   */
+  uint32_t reserved1;
+  /**
+   * Operand value ids, in op-defined order.
+   */
+  struct PieU32Slice args;
+  /**
+   * Trace-known result shape (or the target shape of a broadcast/reshape).
+   */
+  struct PieU32Slice shape;
+} PieLaunchOp;
+
+/**
+ * Borrowed view of an op table.
+ */
+typedef struct PieLaunchOpSlice {
+  const struct PieLaunchOp *ptr;
+  size_t len;
+} PieLaunchOpSlice;
+
+/**
+ * A `(channel, value)` pair — a stage effect or a region's direct sink.
+ */
+typedef struct PieLaunchPut {
+  uint32_t channel;
+  uint32_t value;
+} PieLaunchPut;
+
+/**
+ * Borrowed view of a put table.
+ */
+typedef struct PieLaunchPutSlice {
+  const struct PieLaunchPut *ptr;
+  size_t len;
+} PieLaunchPutSlice;
+
+/**
+ * One stage program: the op DAG the driver launches, its channel effects, and
+ * its declared outputs.
+ */
+typedef struct PieLaunchStage {
+  /**
+   * Attachment point: Prologue 0, OnAttnProj 1, OnAttn 2, Epilogue 3.
+   */
+  uint8_t kind;
+  /**
+   * Reserved; must be zero.
+   */
+  uint8_t reserved0;
+  uint16_t reserved1;
+  /**
+   * Reserved; must be zero.
+   */
+  uint32_t reserved2;
+  struct PieLaunchOpSlice ops;
+  /**
+   * Channel effects committed at pass end, in order.
+   */
+  struct PieLaunchPutSlice puts;
+  /**
+   * Channels this stage consumes — readiness needs them full.
+   */
+  struct PieU32Slice takes;
+  /**
+   * Channels this stage peeks — readiness needs them full.
+   */
+  struct PieU32Slice reads;
+} PieLaunchStage;
+
+/**
+ * Borrowed view of a stage table.
+ */
+typedef struct PieLaunchStageSlice {
+  const struct PieLaunchStage *ptr;
+  size_t len;
+} PieLaunchStageSlice;
+
+/**
+ * Borrowed immutable `u8` slice.
+ *
+ * `ptr` may be null only when `len == 0`.
+ */
+typedef struct PieU8Slice {
+  const uint8_t *ptr;
+  size_t len;
+} PieU8Slice;
+
+/**
+ * One normalized value's type: a dtype plus a per-dimension extent, where each
+ * extent is either a literal or one of the runtime extents the lane supplies.
+ */
+typedef struct PieLaunchPlanValue {
+  /**
+   * Element dtype (`PTIR_DT_*`).
+   */
+  uint8_t dtype;
+  /**
+   * Reserved; must be zero.
+   */
+  uint8_t reserved0;
+  uint16_t reserved1;
+  /**
+   * Per-dimension extent kind: `PIE_EXTENT_STATIC`, or KvLen 0, PageCount
+   * 1, RowCount 2, TokenCount 3, SampledRows 4, QueryLen 5, KeyLen 6.
+   */
+  struct PieU8Slice extents;
+  /**
+   * Per-dimension literal extent; meaningful where `extents` is static.
+   */
+  struct PieU32Slice dims;
+} PieLaunchPlanValue;
+
+/**
+ * Borrowed view of a normalized value-type table.
+ */
+typedef struct PieLaunchPlanValueSlice {
+  const struct PieLaunchPlanValue *ptr;
+  size_t len;
+} PieLaunchPlanValueSlice;
+
+/**
+ * One region: a contiguous run of normalized ops served by one launch.
+ */
+typedef struct PieLaunchRegion {
+  /**
+   * `PIE_REGION_GENERATED` or `PIE_REGION_LIBRARY`.
+   */
+  uint8_t kind;
+  /**
+   * Which library call, when `kind` is `PIE_REGION_LIBRARY`: NucleusSample
+   * 0, TopK 1, Sort 2, Scan 3, MatMul 4, SecondParty 5.
+   */
+  uint8_t library;
+  /**
+   * Launch shape the host chose: Effects 0, OneCtaPerRow 1,
+   * HierarchicalRow 2, Library 3.
+   */
+  uint8_t schedule;
+  /**
+   * Reserved; must be zero.
+   */
+  uint8_t reserved0;
+  /**
+   * Reserved; must be zero.
+   */
+  uint32_t reserved1;
+  /**
+   * Normalized op indices in this region, ascending.
+   */
+  struct PieU32Slice nodes;
+  /**
+   * Values the region reads from outside itself.
+   */
+  struct PieU32Slice inputs;
+  /**
+   * Values the region publishes.
+   */
+  struct PieU32Slice outputs;
+  /**
+   * Channel slots the region writes directly from the kernel.
+   */
+  struct PieLaunchPutSlice sinks;
+} PieLaunchRegion;
+
+/**
+ * Borrowed view of a region table.
+ */
+typedef struct PieLaunchRegionSlice {
+  const struct PieLaunchRegion *ptr;
+  size_t len;
+} PieLaunchRegionSlice;
+
+/**
+ * One lane-binding rule: normalized value `value` is bound through local
+ * channel slot `local`.
+ */
+typedef struct PieLaunchChannelRule {
+  uint32_t value;
+  uint32_t local;
+} PieLaunchChannelRule;
+
+/**
+ * Borrowed view of a channel-rule table.
+ */
+typedef struct PieLaunchChannelRuleSlice {
+  const struct PieLaunchChannelRule *ptr;
+  size_t len;
+} PieLaunchChannelRuleSlice;
+
+/**
+ * The per-program launch plan for one stage: the normalized program the
+ * emitted kernels were generated from, its region partitions, and the
+ * lane-binding metadata the driver used to derive itself.
+ */
+typedef struct PieLaunchStagePlan {
+  /**
+   * Canonical signature of the normalized stage.
+   */
+  uint64_t signature_hash;
+  /**
+   * Graph-cache identity — what the driver keys a captured CUDA graph on.
+   */
+  uint64_t identity;
+  /**
+   * `PIE_STAGE_REQUIRES_*` bits.
+   */
+  uint32_t flags;
+  /**
+   * Draft rows the stage reads when `PIE_STAGE_REQUIRES_MTP_ROWS` is set.
+   */
+  uint32_t mtp_rows;
+  /**
+   * Normalized ops, in SSA order. `channel` indexes `channel_bindings`.
+   */
+  struct PieLaunchOpSlice ops;
+  /**
+   * One entry per normalized op, listing the source op positions it covers.
+   */
+  struct PieU32Slice source_ops;
+  /**
+   * `source_ops` is a flattened ragged array; this is its per-op length.
+   */
+  struct PieU32Slice source_op_counts;
+  /**
+   * One entry per normalized SSA value.
+   */
+  struct PieLaunchPlanValueSlice value_types;
+  /**
+   * Local channel slot → program-global dense channel index.
+   */
+  struct PieU32Slice channel_bindings;
+  /**
+   * Local name slot → canonical second-party kernel name.
+   */
+  struct PieBytesSlice names;
+  /**
+   * One-launch-per-op partition.
+   */
+  struct PieLaunchRegionSlice singleton;
+  /**
+   * Fused partition — what `emitted_kernels` was generated from.
+   */
+  struct PieLaunchRegionSlice fused;
+  /**
+   * Runtime extents any value in the stage depends on, ascending.
+   */
+  struct PieU8Slice used_extents;
+  /**
+   * Values bound through a channel, in normalized value order.
+   */
+  struct PieLaunchChannelRuleSlice channel_rules;
+  /**
+   * Why `PIE_STAGE_GROUPED_VALID` is clear. Empty when it is set.
+   */
+  struct PieBytes error;
+} PieLaunchStagePlan;
+
+/**
+ * Borrowed view of a per-stage launch plan table.
+ */
+typedef struct PieLaunchStagePlanSlice {
+  const struct PieLaunchStagePlan *ptr;
+  size_t len;
+} PieLaunchStagePlanSlice;
+
+/**
+ * **The launch package** — a program in the shape a driver executes it.
+ *
+ * This is what replaced `canonical_bytes` + `sidecar_bytes`. The compiler
+ * owns what a program *is*; the driver owns firing it. Nothing here requires
+ * the driver to know PTIR: there is no container, no sidecar, no wire format,
+ * and no identity to re-check (`program_hash` on `PieProgramDesc` is the key).
+ *
+ * `stages` and `plans` are parallel arrays in attachment order — `plans[i]` is
+ * the launch plan for `stages[i]`, and `(stage_index, region_index)` joins
+ * both to `emitted_kernels` and to `region_analysis`.
+ */
+typedef struct PieLaunchPackage {
+  /**
+   * SSA value table, indexed by value id.
+   */
+  struct PieLaunchValueSlice values;
+  struct PieLaunchChannelSlice channels;
+  struct PieLaunchPortSlice ports;
+  /**
+   * Program-wide name table for second-party kernels and sinks.
+   */
+  struct PieBytesSlice names;
+  struct PieLaunchStageSlice stages;
+  /**
+   * One launch plan per stage, in the same order as `stages`.
+   */
+  struct PieLaunchStagePlanSlice plans;
+} PieLaunchPackage;
+
+/**
  * Static program registration descriptor.
  */
 typedef struct PieProgramDesc {
@@ -485,11 +1086,9 @@ typedef struct PieProgramDesc {
    */
   uint32_t reserved0;
   /**
-   * Stable C3 registration/cache key; canonical bytes are only needed on first registration.
+   * Stable C3 registration/cache key.
    */
   uint64_t program_hash;
-  struct PieBytes canonical_bytes;
-  struct PieBytes sidecar_bytes;
   /**
    * Kernels the host generated for this program, in the driver's own
    * backend. Empty for a driver that has no code generation (the dummy
@@ -506,25 +1105,14 @@ typedef struct PieProgramDesc {
   uint32_t reserved1;
   struct PieEmittedKernelSlice emitted_kernels;
   /**
-   * The graph-cache identity of each stage, in plan order — the first field
-   * of the launch package proper (`ptir-refactor.md` §2.3).
-   *
-   * The CUDA driver derives exactly this from the decoded plan today. While
-   * both exist it compares the two and counts divergence; the host's value
-   * is authoritative once that counter has stayed at zero, which is what
-   * turns deleting the driver's copy into an evidenced step.
-   *
-   * Empty means "not supplied" — a driver must keep deriving.
-   */
-  struct PieU64Slice stage_identities;
-  /**
    * Per-region bind verdicts and intrinsic side-table analysis, joined to
    * `emitted_kernels` on `(stage_index, region_index)`.
-   *
-   * Same contract as `stage_identities`: the driver derives its own while
-   * both exist, compares, and counts. Empty means "not supplied".
    */
   struct PieRegionAnalysisSlice region_analysis;
+  /**
+   * The program itself, in the shape the driver executes it.
+   */
+  struct PieLaunchPackage launch;
 } PieProgramDesc;
 
 /**
@@ -583,6 +1171,16 @@ typedef struct PieChannelEndpointBinding {
   uint32_t poison_word_index;
   uint32_t closed_word_index;
 } PieChannelEndpointBinding;
+
+/**
+ * Borrowed immutable `u64` slice.
+ *
+ * `ptr` may be null only when `len == 0`.
+ */
+typedef struct PieU64Slice {
+  const uint64_t *ptr;
+  size_t len;
+} PieU64Slice;
 
 /**
  * One channel-value payload used for PTIR seeds and host puts.
@@ -669,16 +1267,6 @@ typedef struct PieTerminalCellPtrSlice {
   struct PieTerminalCell *const *ptr;
   size_t len;
 } PieTerminalCellPtrSlice;
-
-/**
- * Borrowed immutable `u8` slice.
- *
- * `ptr` may be null only when `len == 0`.
- */
-typedef struct PieU8Slice {
-  const uint8_t *ptr;
-  size_t len;
-} PieU8Slice;
 
 /**
  * Flattened mask words with request and row partitions.

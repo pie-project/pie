@@ -1,31 +1,9 @@
 #pragma once
 
-// Metal's temporary production PTIR engine executes channel-plane programs on
-// the CPU until Decision 7's generated singleton path passes its M1 gates.
-// M0 keeps this interpreter as the behavior oracle while moving its channel
-// authority into device-bindable Shared storage. This is a C++ mirror of the
-// canonical interpreter
-// (compiler/eval/src/interp.rs, the dummy driver's engine). Behavior is
-// pinned to that oracle: same readiness rule, same register-semantics commit
-// (take pops once, last put wins), same op semantics (argmax tie-break,
-// sort_desc NaN order, left-aligned broadcast, splitmix64/hash_uniform RNG).
-//
-// Decoded program model comes from the shared pure-host PTIR headers under
-// driver/common/include/pie_native/ptir (container.hpp / bound.hpp /
-// trace.hpp / op_table.hpp — all CUDA-free, namespace pie_native::ptir). One
-// divergence from interp.rs is accepted: the
-// translated Trace separates stage puts from op order, so a take AFTER a put
-// of the same channel WITHIN one stage resolves to the committed cell, not
-// the pending put. Cross-stage put→take visibility is preserved (the pending
-// overlay applies at stage granularity).
-//
-// Scope (direct_ffi_fix.md Phase 3 baseline; metal_ptir_plan.md Phase 1
-// extends it): programs whose values are Const / ChannelTake / ChannelRead /
-// OpResult / Intrinsic(Logits). MtpLogits remains decodable only for oracle
-// tests and is rejected from production until bounded device storage exists.
-// Host inputs, per-layer taps, and other model
-// intrinsics (hidden/query/value-head) are not executable here — they need
-// backend feature work this increment does not add.
+// Metal launch-runtime host helpers. The PTIR decoder/interpreter that used to
+// live here is gone: registration now adopts a typed PieLaunchPackage built by
+// the host. What remains is the channel-cell codec/ring storage and the small
+// CPU fallback used by the direct/stub path and descriptor resolver.
 
 #include <algorithm>
 #include <atomic>
@@ -35,24 +13,24 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
-#include "pie_native/ptir/bound.hpp"
-#include "pie_native/ptir/plan.hpp"
-#include "pie_native/ptir/container.hpp"
-#include "pie_native/ptir/op_table.hpp"
+#include <pie_driver_abi.h>
 #include <rng_contract.generated.h>
-#include "pie_native/ptir/trace.hpp"
+
+#include "pie_native/launch/plan.hpp"
+#include "pie_native/launch/program.hpp"
 #include "pipeline/shared_storage.hpp"
 
 namespace pie::metal::pipeline {
 
-namespace cptir = pie_native::ptir;
-using cptir::DType;
-using cptir::OpCode;
-using cptir::Trace;
+namespace launch = pie_native::launch;
+using launch::DType;
+using launch::OpCode;
+using launch::Trace;
 
 // ─────────────────────────────── values ────────────────────────────────────
 
@@ -92,28 +70,16 @@ inline Value zeros(DType dtype, std::size_t numel) {
     }
 }
 
-inline bool value_matches(const Value& v, const cptir::TensorType& ty) {
+inline bool value_matches(const Value& v, const launch::TensorType& ty) {
     const DType want = ty.dtype == DType::Act ? DType::F32 : ty.dtype;
     return v.dtype == want && v.len() == std::max<std::uint64_t>(ty.shape.numel(), 1);
 }
 
 inline std::vector<float> lanes_f32(const Value& v) {
     switch (v.dtype) {
-        case DType::I32: {
-            std::vector<float> o(v.i.size());
-            for (std::size_t k = 0; k < o.size(); ++k) o[k] = static_cast<float>(v.i[k]);
-            return o;
-        }
-        case DType::U32: {
-            std::vector<float> o(v.u.size());
-            for (std::size_t k = 0; k < o.size(); ++k) o[k] = static_cast<float>(v.u[k]);
-            return o;
-        }
-        case DType::Bool: {
-            std::vector<float> o(v.b.size());
-            for (std::size_t k = 0; k < o.size(); ++k) o[k] = v.b[k] ? 1.0f : 0.0f;
-            return o;
-        }
+        case DType::I32: { std::vector<float> o(v.i.size()); for (std::size_t k = 0; k < o.size(); ++k) o[k] = static_cast<float>(v.i[k]); return o; }
+        case DType::U32: { std::vector<float> o(v.u.size()); for (std::size_t k = 0; k < o.size(); ++k) o[k] = static_cast<float>(v.u[k]); return o; }
+        case DType::Bool: { std::vector<float> o(v.b.size()); for (std::size_t k = 0; k < o.size(); ++k) o[k] = v.b[k] ? 1.0f : 0.0f; return o; }
         default: return v.f;
     }
 }
@@ -131,30 +97,14 @@ inline std::vector<std::int64_t> lanes_i64(const Value& v) {
 
 inline Value from_i64(DType dtype, const std::vector<std::int64_t>& x) {
     switch (dtype) {
-        case DType::U32: {
-            std::vector<std::uint32_t> o(x.size());
-            for (std::size_t k = 0; k < x.size(); ++k) o[k] = static_cast<std::uint32_t>(x[k]);
-            return Value::u32(std::move(o));
-        }
-        case DType::Bool: {
-            std::vector<std::uint8_t> o(x.size());
-            for (std::size_t k = 0; k < x.size(); ++k) o[k] = x[k] != 0;
-            return Value::boolean(std::move(o));
-        }
-        case DType::F32: case DType::Act: {
-            std::vector<float> o(x.size());
-            for (std::size_t k = 0; k < x.size(); ++k) o[k] = static_cast<float>(x[k]);
-            return Value::f32(std::move(o));
-        }
-        default: {
-            std::vector<std::int32_t> o(x.size());
-            for (std::size_t k = 0; k < x.size(); ++k) o[k] = static_cast<std::int32_t>(x[k]);
-            return Value::i32(std::move(o));
-        }
+        case DType::U32: { std::vector<std::uint32_t> o(x.size()); for (std::size_t k = 0; k < x.size(); ++k) o[k] = static_cast<std::uint32_t>(x[k]); return Value::u32(std::move(o)); }
+        case DType::Bool: { std::vector<std::uint8_t> o(x.size()); for (std::size_t k = 0; k < x.size(); ++k) o[k] = x[k] != 0; return Value::boolean(std::move(o)); }
+        case DType::F32: case DType::Act: { std::vector<float> o(x.size()); for (std::size_t k = 0; k < x.size(); ++k) o[k] = static_cast<float>(x[k]); return Value::f32(std::move(o)); }
+        default: { std::vector<std::int32_t> o(x.size()); for (std::size_t k = 0; k < x.size(); ++k) o[k] = static_cast<std::int32_t>(x[k]); return Value::i32(std::move(o)); }
     }
 }
 
-// Scalar-broadcast index rule shared by every elementwise op (interp.rs pick).
+// Scalar-broadcast index rule shared by every elementwise op.
 inline std::size_t pick(std::size_t len, std::size_t i) { return len == 1 ? 0 : i; }
 
 // ─────────────────────────── wire cell codec ───────────────────────────────
@@ -163,48 +113,20 @@ inline std::size_t wire_cell_bytes(DType dtype, std::size_t numel) {
     return dtype == DType::Bool ? (numel + 7) / 8 : numel * 4;
 }
 
-// Decode one ring cell (bool cells are LSB-first bit-packed, D1).
 inline bool decode_wire(const std::uint8_t* bytes, std::size_t len, DType dtype,
                         std::size_t numel, Value& out) {
     if (len != wire_cell_bytes(dtype, numel)) return false;
     switch (dtype) {
-        case DType::Bool: {
-            std::vector<std::uint8_t> o(numel);
-            for (std::size_t j = 0; j < numel; ++j) o[j] = (bytes[j / 8] >> (j % 8)) & 1;
-            out = Value::boolean(std::move(o));
-            return true;
-        }
-        case DType::I32: {
-            std::vector<std::int32_t> o(numel);
-            std::memcpy(o.data(), bytes, len);
-            out = Value::i32(std::move(o));
-            return true;
-        }
-        case DType::U32: {
-            std::vector<std::uint32_t> o(numel);
-            std::memcpy(o.data(), bytes, len);
-            out = Value::u32(std::move(o));
-            return true;
-        }
-        default: {
-            std::vector<float> o(numel);
-            std::memcpy(o.data(), bytes, len);
-            out = Value::f32(std::move(o));
-            return true;
-        }
+        case DType::Bool: { std::vector<std::uint8_t> o(numel); for (std::size_t j = 0; j < numel; ++j) o[j] = (bytes[j / 8] >> (j % 8)) & 1; out = Value::boolean(std::move(o)); return true; }
+        case DType::I32: { std::vector<std::int32_t> o(numel); std::memcpy(o.data(), bytes, len); out = Value::i32(std::move(o)); return true; }
+        case DType::U32: { std::vector<std::uint32_t> o(numel); std::memcpy(o.data(), bytes, len); out = Value::u32(std::move(o)); return true; }
+        default: { std::vector<float> o(numel); std::memcpy(o.data(), bytes, len); out = Value::f32(std::move(o)); return true; }
     }
 }
 
-// Encode one ring cell in place (dst holds wire_cell_bytes).
 inline void encode_wire(const Value& v, std::uint8_t* dst) {
     switch (v.dtype) {
-        case DType::Bool: {
-            const std::size_t packed = (v.b.size() + 7) / 8;
-            std::memset(dst, 0, packed);
-            for (std::size_t j = 0; j < v.b.size(); ++j)
-                if (v.b[j] != 0) dst[j / 8] |= static_cast<std::uint8_t>(1u << (j % 8));
-            break;
-        }
+        case DType::Bool: { const std::size_t packed = (v.b.size() + 7) / 8; std::memset(dst, 0, packed); for (std::size_t j = 0; j < v.b.size(); ++j) if (v.b[j] != 0) dst[j / 8] |= static_cast<std::uint8_t>(1u << (j % 8)); break; }
         case DType::I32: std::memcpy(dst, v.i.data(), v.i.size() * 4); break;
         case DType::U32: std::memcpy(dst, v.u.data(), v.u.size() * 4); break;
         default: std::memcpy(dst, v.f.data(), v.f.size() * 4); break;
@@ -213,13 +135,10 @@ inline void encode_wire(const Value& v, std::uint8_t* dst) {
 
 // ───────────────────────────── exec plan ───────────────────────────────────
 
-// Per-stage execution index over the translated Trace: the stage's global SSA
-// id range and each op keyed by its first result id (roots resolve inline).
 struct StagePlan {
     std::size_t stage_index = 0;
-    std::uint32_t base = 0;
-    std::uint32_t end = 0;
-    std::unordered_map<std::uint32_t, const cptir::Op*> op_by_result;
+    std::vector<std::uint32_t> value_ids;
+    std::unordered_map<std::uint32_t, const launch::Op*> op_by_result;
 };
 
 struct ConstPortValue {
@@ -227,36 +146,31 @@ struct ConstPortValue {
     Value value;
 };
 
-// A registered program's decoded, executability-classified form.
-//
-// Classification, not a capability flag (metal_ptir_plan.md §3.2): a program
-// that reads Intrinsic(Logits)/Intrinsic(MtpLogits) is `executable` — it just
-// additionally needs a forward pass before `step()` (`needs_logits` /
-// `needs_mtp_logits`). Only genuinely unsupported constructs (HostInput,
-// per-layer taps, and non-logits intrinsics — hidden/query/value-head) still
-// hard-reject with `executable = false` + a precise `reject_reason`.
 struct ExecPlan {
     Trace trace;
-    cptir::bound::Bound bound;
-    std::vector<StagePlan> stages;  // container order (mirrors trace.stages)
-    std::vector<cptir::plan::StagePlan> region_plans;
+    std::vector<StagePlan> stages;
+    std::vector<launch::plan::StagePlan> region_plans;
     std::vector<ConstPortValue> const_ports;
     bool executable = false;
     std::string reject_reason;
-    // Set together with `executable = true` when the program reads the base
-    // Intrinsic(Logits) / Intrinsic(MtpLogits) root(s) — the launch path must
-    // run the Metal forward and bind `PassInputs` before `step()`.
     bool needs_logits = false;
     bool needs_mtp_logits = false;
 
-    // One fire consumes (takes) dense channel `c` — a stage ChanTake or a
-    // consuming descriptor port. Register-like: at most once per fire.
     bool takes_channel(std::uint32_t c) const {
-        for (const auto& st : trace.stages)
-            for (auto t : st.takes)
-                if (t == c) return true;
+        for (const auto& st : trace.stages) {
+            for (auto t : st.takes) if (t == c) return true;
+        }
         for (const auto& p : trace.ports)
-            if (!p.is_const && p.channel == c && cptir::port_consumes(p.port)) return true;
+            if (!p.is_const && p.channel == c && launch::port_consumes(p.port)) return true;
+        return false;
+    }
+
+    bool reads_channel(std::uint32_t c) const {
+        for (const auto& st : trace.stages)
+            for (auto r : st.reads)
+                if (r == c) return true;
+        for (const auto& p : trace.ports)
+            if (!p.is_const && p.channel == c && !launch::port_consumes(p.port)) return true;
         return false;
     }
 
@@ -268,80 +182,59 @@ struct ExecPlan {
     }
 
     bool requires_channel_input(std::uint32_t c) const {
-        return std::any_of(
-            bound.readiness.begin(), bound.readiness.end(),
-            [c](const auto& entry) {
-                return entry.chan == c &&
-                       entry.dir == cptir::container::Direction::NeedsFull;
-            });
+        return takes_channel(c) || reads_channel(c);
     }
 
-    // True if the launch path must run the forward before `step()`.
     bool needs_forward() const {
         return needs_logits || needs_mtp_logits || !trace.ports.empty();
     }
 };
 
-inline int bounded_mtp_row_base(
-    const ExecPlan& plan,
-    std::uint32_t vocab) {
+inline int bounded_mtp_row_base(const ExecPlan& plan, std::uint32_t vocab) {
     if (!plan.needs_mtp_logits || vocab == 0) return -1;
     std::uint64_t rows = 0;
-    for (const cptir::Value& value : plan.trace.values) {
-        if (value.source != cptir::ValueSource::Intrinsic ||
-            value.intrinsic != cptir::Intrinsic::Logits) {
-            continue;
-        }
-        const std::uint64_t numel =
-            value.type.shape.numel();
+    for (const launch::Value& value : plan.trace.values) {
+        if (value.source != launch::ValueSource::Intrinsic ||
+            value.intrinsic != launch::Intrinsic::Logits) continue;
+        const std::uint64_t numel = value.type.shape.numel();
         if (numel % vocab != 0) return -1;
         rows = std::max(rows, numel / vocab);
     }
-    return rows <=
-                   static_cast<std::uint64_t>(
-                       std::numeric_limits<int>::max())
-               ? static_cast<int>(rows)
-               : -1;
+    return rows <= static_cast<std::uint64_t>(std::numeric_limits<int>::max())
+        ? static_cast<int>(rows)
+        : -1;
 }
 
-// Classify an already-translated Trace: split "rejected" (executable=false,
-// a precise reason) from "needs forward inputs" (needs_logits). Pure function
-// over the decoded Trace
-// — no container/sidecar bytes involved — so callers (registration AND
-// tests) can classify a hand-built Trace directly.
 inline void classify_exec_plan(ExecPlan& out) {
     out.executable = true;
     out.needs_logits = false;
     out.needs_mtp_logits = false;
     out.reject_reason.clear();
-    for (const cptir::Value& v : out.trace.values) {
-        if (v.source == cptir::ValueSource::Intrinsic) {
+    for (const launch::Value& v : out.trace.values) {
+        if (v.source == launch::ValueSource::Intrinsic) {
             switch (v.intrinsic) {
-                case cptir::Intrinsic::Logits:
+                case launch::Intrinsic::Logits:
                     out.needs_logits = true;
                     break;
-                case cptir::Intrinsic::MtpLogits:
-                case cptir::Intrinsic::MtpDrafts:
+                case launch::Intrinsic::MtpLogits:
+                case launch::Intrinsic::MtpDrafts:
                     out.needs_logits = true;
                     out.needs_mtp_logits = true;
                     break;
                 default:
-                    // The Metal forward exposes no per-layer taps, layer
-                    // ordinal, or auxiliary heads in this increment.
                     out.executable = false;
                     out.reject_reason =
                         "program reads an unsupported model intrinsic "
-                        "(hidden/query/value-head/layer/attn-score; Metal forward "
-                        "not wired)";
+                        "(hidden/query/value-head/layer/attn-score; Metal forward not wired)";
                     break;
             }
-        } else if (v.source == cptir::ValueSource::HostInput) {
+        } else if (v.source == launch::ValueSource::HostInput) {
             out.executable = false;
             out.reject_reason = "program reads a submit-bound host input (not executable on Metal)";
         }
     }
-    for (const cptir::Stage& st : out.trace.stages) {
-        if (st.kind == cptir::StageKind::OnAttnProj || st.kind == cptir::StageKind::OnAttn) {
+    for (const launch::Stage& st : out.trace.stages) {
+        if (st.kind == launch::StageKind::OnAttnProj || st.kind == launch::StageKind::OnAttn) {
             out.executable = false;
             out.reject_reason = "program attaches per-layer taps (Metal forward not wired)";
         }
@@ -352,303 +245,89 @@ inline void classify_exec_plan(ExecPlan& out) {
     }
 }
 
-inline bool validate_region_plan_safety(
-    const cptir::plan::StagePlan& plan,
-    std::string& error) {
-    for (const auto& type : plan.value_types) {
-        std::uint64_t product = 1;
-        if (type.dims.size() > 4 || type.dtype > PTIR_DT_BOOL) {
-            error = "invalid normalized value type";
-            return false;
-        }
-        for (const auto& dimension : type.dims) {
-            if (dimension.symbolic) {
-                if (dimension.value < PTIR_EXTENT_KV_LEN ||
-                    dimension.value > PTIR_EXTENT_KEY_LEN) {
-                    error = "invalid symbolic extent role";
-                    return false;
-                }
-            } else if (
-                dimension.value == 0 ||
-                product >
-                    std::numeric_limits<std::uint32_t>::max() /
-                        dimension.value) {
-                error = "normalized value shape product exceeds u32";
-                return false;
-            } else {
-                product *= dimension.value;
-            }
-        }
+inline Value const_port_value(const launch::PortBinding& port) {
+    const std::size_t count = std::max<std::uint64_t>(port.const_type.shape.numel(), 1);
+    const std::uint8_t* data = port.const_data.data();
+    if (port.const_type.dtype == DType::Bool) {
+        std::vector<std::uint8_t> values(data, data + std::min(count, port.const_data.size()));
+        values.resize(count, 0);
+        for (std::uint8_t& value : values) value = value != 0;
+        return Value::boolean(std::move(values));
     }
-    std::uint32_t result_base = 0;
-    for (const auto& normalized : plan.ops) {
-        const auto& op = normalized.op;
-        if (!cptir::op_is_known(static_cast<OpCode>(op.tag))) {
-            error = "unknown normalized operation";
-            return false;
-        }
-        if (result_base >
-                std::numeric_limits<std::uint32_t>::max() -
-                    op.results ||
-            result_base + op.results > plan.value_types.size()) {
-            error = "normalized result range is invalid";
-            return false;
-        }
-        for (const std::uint32_t argument : op.args) {
-            if (argument >= result_base) {
-                error = "normalized SSA operand is not a prior value";
-                return false;
-            }
-        }
-        if (op.tag == PTIR_OP_PIVOT_THRESHOLD &&
-            (op.pred_tag > 2 || op.pred_payload >= result_base)) {
-            error = "pivot predicate payload is out of range";
-            return false;
-        }
-        if ((op.tag == PTIR_OP_CHAN_TAKE ||
-             op.tag == PTIR_OP_CHAN_READ ||
-             op.tag == PTIR_OP_CHAN_PUT) &&
-            (op.chan < 0 ||
-             static_cast<std::size_t>(op.chan) >=
-                 plan.channel_bindings.size())) {
-            error = "normalized channel slot is invalid";
-            return false;
-        }
-        result_base += op.results;
-    }
-    if (result_base != plan.value_types.size()) {
-        error = "normalized value layout does not match results";
-        return false;
-    }
-    return true;
+    Value out;
+    if (decode_wire(data, port.const_data.size(), port.const_type.dtype, count, out)) return out;
+    return zeros(port.const_type.dtype, count);
 }
 
-inline bool decode_const_ports(
-    const std::uint8_t* data,
-    std::size_t len,
-    std::vector<ConstPortValue>& ports,
-    std::string& error) {
-    ports.clear();
-    cptir::container::detail::Cur cursor{data, len};
-    if (data == nullptr || len < 24 ||
-        std::memcmp(data, PTIR_MAGIC, 4) != 0) {
-        error = "invalid PTIR header while decoding const ports";
-        return false;
-    }
-    cursor.skip(4);
-    const std::uint16_t version = cursor.u16();
-    if (version != PTIR_VERSION && version != PTIR_VERSION_EXTERN) {
-        error = "unsupported PTIR version while decoding const ports";
-        return false;
-    }
-    cursor.u16();
-    const std::uint32_t name_count = cursor.u32();
-    const std::uint32_t channel_count = cursor.u32();
-    const std::uint32_t port_count = cursor.u32();
-    cursor.u32();
-    if (version == PTIR_VERSION_EXTERN) cursor.u32();
-    for (std::uint32_t name = 0; name < name_count; ++name) {
-        const std::uint16_t size = cursor.u16();
-        cursor.skip(size);
-    }
-    for (std::uint32_t channel = 0; channel < channel_count; ++channel) {
-        cursor.u8();
-        cursor.shape();
-        cursor.u32();
-        cursor.u8();
-        cursor.u8();
-    }
-    for (std::uint32_t index = 0; index < port_count; ++index) {
-        const std::uint8_t port = cursor.u8();
-        const std::uint8_t source = cursor.u8();
-        if (source == 0) {
-            cursor.u32();
-            continue;
-        }
-        if (source != 1) {
-            error = "invalid PTIR const-port source";
-            return false;
-        }
-        const std::uint8_t dtype = cursor.u8();
-        const cptir::container::CShape shape = cursor.shape();
-        std::size_t count = 1;
-        for (std::uint8_t dimension = 0; dimension < shape.rank;
-             ++dimension) {
-            if (shape.dims[dimension] == 0 ||
-                count > std::numeric_limits<std::size_t>::max() /
-                            shape.dims[dimension]) {
-                error = "invalid PTIR const-port shape";
-                return false;
-            }
-            count *= shape.dims[dimension];
-        }
-        const std::size_t element_bytes =
-            dtype == PTIR_DT_BOOL ? 1 : 4;
-        if (dtype > PTIR_DT_BOOL ||
-            count > std::numeric_limits<std::size_t>::max() /
-                        element_bytes ||
-            !cursor.need(count * element_bytes)) {
-            error = "invalid PTIR const-port payload";
-            return false;
-        }
-        const std::uint8_t* payload = data + cursor.i;
-        ConstPortValue decoded;
-        decoded.port = port;
-        if (dtype == PTIR_DT_F32) {
-            std::vector<float> values(count);
-            std::memcpy(values.data(), payload, count * sizeof(float));
-            decoded.value = Value::f32(std::move(values));
-        } else if (dtype == PTIR_DT_I32) {
-            std::vector<std::int32_t> values(count);
-            std::memcpy(
-                values.data(), payload, count * sizeof(std::int32_t));
-            decoded.value = Value::i32(std::move(values));
-        } else if (dtype == PTIR_DT_U32) {
-            std::vector<std::uint32_t> values(count);
-            std::memcpy(
-                values.data(), payload, count * sizeof(std::uint32_t));
-            decoded.value = Value::u32(std::move(values));
-        } else {
-            std::vector<std::uint8_t> values(payload, payload + count);
-            for (std::uint8_t& value : values) value = value != 0;
-            decoded.value = Value::boolean(std::move(values));
-        }
-        cursor.skip(count * element_bytes);
-        ports.push_back(std::move(decoded));
-    }
-    if (cursor.err) {
-        error = "PTIR const-port payload overruns container";
-        return false;
-    }
-    return true;
-}
-
-// Decode + classify. Registration never fails on executability — the launch
-// path rejects with `reject_reason` instead.
-inline bool build_exec_plan(const std::uint8_t* container_bytes, std::size_t container_len,
-                            const std::uint8_t* sidecar_bytes, std::size_t sidecar_len,
-                            ExecPlan& out, std::string* error) {
-    out = {};
-    cptir::container::Container c;
-    cptir::container::DecodeError derr;
-    if (!cptir::container::decode(container_bytes, container_len, c, &derr)) {
-        if (error != nullptr) *error = "container decode: " + derr.detail;
-        return false;
-    }
-    std::string const_error;
-    if (!decode_const_ports(
-            container_bytes,
-            container_len,
-            out.const_ports,
-            const_error)) {
-        if (error != nullptr) *error = const_error;
-        return false;
-    }
-    if (sidecar_bytes == nullptr || sidecar_len == 0) {
-        out.executable = false;
-        out.reject_reason = "program has no PTIB sidecar";
-        return true;
-    }
-    std::string serr;
-    if (!cptir::bound::parse_sidecar(sidecar_bytes, sidecar_len, out.bound, &serr)) {
-        if (error != nullptr) *error = "sidecar decode: " + serr;
-        return false;
-    }
-    cptir::container::Container translated_container = c;
-    for (auto& stage : translated_container.stages) {
-        std::vector<cptir::container::COp> lowered;
-        lowered.reserve(stage.ops.size());
-        for (auto op : stage.ops) {
-            if (op.tag == PTIR_OP_KERNEL_CALL) {
-                if (op.name_idx >= c.names.size() ||
-                    c.names[op.name_idx] != "metal.identity" ||
-                    op.args.size() != 1) {
-                    out.executable = false;
-                    out.reject_reason =
-                        "program requests an unsupported Metal semantic "
-                        "kernel boundary";
-                    return true;
-                }
-                op.tag = PTIR_OP_RESHAPE;
-                lowered.push_back(std::move(op));
-            } else if (op.tag == PTIR_OP_SINK_CALL) {
-                if (op.name_idx >= c.names.size() ||
-                    c.names[op.name_idx] != "metal.discard") {
-                    out.executable = false;
-                    out.reject_reason =
-                        "program requests an unsupported Metal semantic "
-                        "sink boundary";
-                    return true;
-                }
-            } else {
-                lowered.push_back(std::move(op));
-            }
-        }
-        stage.ops = std::move(lowered);
-    }
-    auto translated = cptir::bound::container_to_trace(
-        translated_container, out.bound);
-    if (!translated.ok) {
-        out.executable = false;
-        out.reject_reason = translated.error;
-        return true;
-    }
-    out.trace = std::move(translated.trace);
-    if (out.bound.version >= 2) {
-        if (out.bound.plans.size() != c.stages.size()) {
-            if (error != nullptr) *error = "compiler plan count does not match stages";
-            return false;
-        }
-        for (const cptir::bound::StagePlan& encoded : out.bound.plans) {
-            cptir::plan::StagePlan plan;
-            std::string plan_error;
-            if (!cptir::plan::decode(
-                    encoded.bytes.data(), encoded.bytes.size(), plan, &plan_error)) {
-                if (error != nullptr) *error = "compiler plan decode: " + plan_error;
-                return false;
-            }
-            if (plan.stage != encoded.stage || plan.signature_hash == 0) {
-                if (error != nullptr) *error = "compiler plan identity mismatch";
-                return false;
-            }
-            if (!validate_region_plan_safety(plan, plan_error)) {
-                if (error != nullptr) {
-                    *error =
-                        "compiler plan validation: " + plan_error;
-                }
-                return false;
-            }
-            out.region_plans.push_back(std::move(plan));
-        }
-    }
-
-    std::uint32_t base = 0;
+inline void rebuild_stage_indexes(ExecPlan& out) {
+    out.stages.clear();
+    out.stages.reserve(out.trace.stages.size());
     for (std::size_t si = 0; si < out.trace.stages.size(); ++si) {
+        const launch::Stage& stage = out.trace.stages[si];
         StagePlan plan;
         plan.stage_index = si;
-        plan.base = base;
-        base += static_cast<std::uint32_t>(out.bound.stages[si].value_types.size());
-        plan.end = base;
-        for (const cptir::Op& op : out.trace.stages[si].ops) plan.op_by_result.emplace(op.result_id, &op);
+        std::unordered_map<std::uint32_t, const launch::Op*> producer;
+        std::set<std::uint32_t> ids;
+        for (const launch::Op& op : stage.ops) {
+            plan.op_by_result.emplace(op.result_id, &op);
+            for (std::uint32_t r = 0; r < op.result_count; ++r) {
+                producer.emplace(op.result_id + r, &op);
+            }
+        }
+        auto mark = [&](auto&& self, std::uint32_t value) -> void {
+            if (value >= out.trace.values.size()) return;
+            auto produced = producer.find(value);
+            if (produced != producer.end()) {
+                const launch::Op* op = produced->second;
+                ids.insert(op->result_id);
+                for (std::uint32_t arg : op->args) self(self, arg);
+                return;
+            }
+            ids.insert(value);
+        };
+        for (const launch::Op& op : stage.ops) {
+            ids.insert(op.result_id);
+            for (std::uint32_t arg : op.args) mark(mark, arg);
+        }
+        for (const launch::ChannelPut& put : stage.puts) mark(mark, put.value);
+        plan.value_ids.assign(ids.begin(), ids.end());
         out.stages.push_back(std::move(plan));
     }
+}
 
+inline bool adopt_launch_package(const PieLaunchPackage& package, ExecPlan& out, std::string* error) {
+    out = {};
+    if (package.stages.len == 0) {
+        if (error != nullptr) *error = "launch package has no stages";
+        return false;
+    }
+    if (package.plans.len != package.stages.len) {
+        if (error != nullptr) *error = "launch package plan/stage count mismatch";
+        return false;
+    }
+    out.trace = launch::adopt(package);
+    out.region_plans.reserve(package.plans.len);
+    for (std::size_t i = 0; i < package.plans.len; ++i) {
+        out.region_plans.push_back(
+            launch::plan::adopt(package.stages.ptr[i].kind, package.plans.ptr[i]));
+    }
+    for (const launch::PortBinding& port : out.trace.ports) {
+        if (!port.is_const) continue;
+        out.const_ports.push_back(ConstPortValue{port.port, const_port_value(port)});
+    }
+    rebuild_stage_indexes(out);
     classify_exec_plan(out);
-    for (const auto& stage : c.stages) {
+    for (const auto& stage : out.trace.stages) {
         for (const auto& op : stage.ops) {
-            if ((op.tag == PTIR_OP_KERNEL_CALL ||
-                 op.tag == PTIR_OP_SINK_CALL) &&
-                (op.name_idx >= c.names.size() ||
-                 c.names[op.name_idx] !=
-                     (op.tag == PTIR_OP_KERNEL_CALL
-                          ? "metal.identity"
-                          : "metal.discard"))) {
+            if ((op.code == OpCode::KernelCall || op.code == OpCode::SinkCall) &&
+                (op.imm >= out.trace.names.size() ||
+                 out.trace.names[op.imm] !=
+                     (op.code == OpCode::KernelCall ? "metal.identity" : "metal.discard"))) {
                 out.executable = false;
                 out.needs_logits = false;
                 out.needs_mtp_logits = false;
                 out.reject_reason =
-                    "program requests an unsupported Metal semantic "
-                    "library boundary";
+                    "program requests an unsupported Metal semantic library boundary";
             }
         }
     }
@@ -816,7 +495,7 @@ inline InterpInstance make_instance(const ExecPlan& plan,
                                     const std::map<std::uint32_t, Value>& seeds) {
     InterpInstance inst;
     for (std::size_t ci = 0; ci < plan.trace.channels.size(); ++ci) {
-        const cptir::Channel& decl = plan.trace.channels[ci];
+        const launch::Channel& decl = plan.trace.channels[ci];
         auto shared = externs.find(static_cast<std::uint32_t>(ci));
         if (shared != externs.end()) {
             inst.channels.push_back(shared->second);
@@ -836,7 +515,7 @@ enum class HostOp { Ok, WouldBlock, Poisoned, WrongRole, TypeMismatch };
 
 inline HostOp host_put(InterpInstance& inst, const ExecPlan& plan, std::uint32_t chan, Value v) {
     if (inst.poisoned) return HostOp::Poisoned;
-    const cptir::Channel& decl = plan.trace.channels[chan];
+    const launch::Channel& decl = plan.trace.channels[chan];
     if (!decl.host_visible || decl.host_reader) return HostOp::WrongRole;
     if (!value_matches(v, decl.type)) return HostOp::TypeMismatch;
     ChannelState& st = *inst.channels[chan];
@@ -845,7 +524,7 @@ inline HostOp host_put(InterpInstance& inst, const ExecPlan& plan, std::uint32_t
 
 inline HostOp host_take(InterpInstance& inst, const ExecPlan& plan, std::uint32_t chan, Value& out) {
     if (inst.poisoned) return HostOp::Poisoned;
-    const cptir::Channel& decl = plan.trace.channels[chan];
+    const launch::Channel& decl = plan.trace.channels[chan];
     if (!decl.host_reader) return HostOp::WrongRole;
     ChannelState& st = *inst.channels[chan];
     return st.pop(out) ? HostOp::Ok : HostOp::WouldBlock;
@@ -857,7 +536,7 @@ namespace detail {
 
 inline float neg_inf() { return -std::numeric_limits<float>::infinity(); }
 
-inline std::size_t canonical_rows(const cptir::Shape& shape) {
+inline std::size_t canonical_rows(const launch::Shape& shape) {
     if (shape.dims.size() < 2) return 1;
     std::size_t rows = 1;
     for (std::size_t dimension = 0;
@@ -1091,7 +770,7 @@ inline Value gather_flat(const Value& v, const std::vector<std::size_t>& idx) {
 // Left-aligned broadcast replicate (interp.rs broadcast_value), dtype-
 // preserving: source dims align to the LEADING target dims; missing/1 dims
 // replicate.
-inline Value broadcast_value(const Value& v, const cptir::Shape& src, const cptir::Shape& target) {
+inline Value broadcast_value(const Value& v, const launch::Shape& src, const launch::Shape& target) {
     const std::size_t r = target.dims.size();
     auto sdim = [&](std::size_t i) -> std::uint64_t {
         return i < src.dims.size() ? src.dims[i] : 1;
@@ -1165,10 +844,10 @@ struct Overlay {
 
 // Evaluate one compute op (SSA args already in `vals`). Mirrors interp.rs
 // eval_op case for case; returns false + `error` on a semantic fault.
-inline bool eval_op(const cptir::Op& op, const Trace& trace, std::vector<Value>& vals,
+inline bool eval_op(const launch::Op& op, const Trace& trace, std::vector<Value>& vals,
                     std::string& error) {
     auto v = [&](std::uint32_t id) -> const Value& { return vals[id]; };
-    auto ty = [&](std::uint32_t id) -> const cptir::TensorType& { return trace.values[id].type; };
+    auto ty = [&](std::uint32_t id) -> const launch::TensorType& { return trace.values[id].type; };
     auto fault = [&](const std::string& m) {
         error = m;
         return false;
@@ -1372,7 +1051,7 @@ inline bool eval_op(const cptir::Op& op, const Trace& trace, std::vector<Value>&
         }
 
         case OpCode::ReduceSum: case OpCode::ReduceMax: case OpCode::ReduceMin: {
-            const cptir::TensorType& t = ty(a0);
+            const launch::TensorType& t = ty(a0);
             const std::size_t rows = canonical_rows(t.shape);
             const Value& data = v(a0);
             const std::size_t len = rows == 0 ? 0 : data.len() / rows;
@@ -1436,7 +1115,7 @@ inline bool eval_op(const cptir::Op& op, const Trace& trace, std::vector<Value>&
             return out(from_i64(t.dtype, o));
         }
         case OpCode::ReduceArgmax: {
-            const cptir::TensorType& t = ty(a0);
+            const launch::TensorType& t = ty(a0);
             const std::size_t rows = canonical_rows(t.shape);
             const Value& data = v(a0);
             const std::size_t len = rows == 0 ? 0 : data.len() / rows;
@@ -1455,7 +1134,7 @@ inline bool eval_op(const cptir::Op& op, const Trace& trace, std::vector<Value>&
             return out(Value::i32(std::move(o)));
         }
         case OpCode::CumSum: case OpCode::CumProd: {
-            const cptir::TensorType& t = ty(a0);
+            const launch::TensorType& t = ty(a0);
             const std::size_t rows = canonical_rows(t.shape);
             const auto x = lanes_f32(v(a0));
             const std::size_t len = rows == 0 ? 0 : x.size() / rows;
@@ -1477,7 +1156,7 @@ inline bool eval_op(const cptir::Op& op, const Trace& trace, std::vector<Value>&
         case OpCode::Reshape:
             return out(v(a0));  // metadata only (row-major)
         case OpCode::Transpose: {
-            const cptir::TensorType& t = ty(a0);
+            const launch::TensorType& t = ty(a0);
             if (t.shape.dims.size() != 2) return fault("transpose rank");
             const std::size_t m = t.shape.dims[0];
             const std::size_t n = t.shape.dims[1];
@@ -1496,7 +1175,7 @@ inline bool eval_op(const cptir::Op& op, const Trace& trace, std::vector<Value>&
             return true;
         }
         case OpCode::TopK: {
-            const cptir::TensorType& t = ty(a0);
+            const launch::TensorType& t = ty(a0);
             const std::size_t rows = canonical_rows(t.shape);
             const auto x = lanes_f32(v(a0));
             const std::size_t len = rows == 0 ? 0 : x.size() / rows;
@@ -1517,8 +1196,8 @@ inline bool eval_op(const cptir::Op& op, const Trace& trace, std::vector<Value>&
             return true;
         }
         case OpCode::Matmul: {
-            const cptir::TensorType& ta = ty(a0);
-            const cptir::TensorType& tb = ty(a1);
+            const launch::TensorType& ta = ty(a0);
+            const launch::TensorType& tb = ty(a1);
             if (ta.shape.dims.size() != 2 || tb.shape.dims.size() != 2) return fault("matmul rank");
             const std::size_t m = ta.shape.dims[0];
             const std::size_t kk = ta.shape.dims[1];
@@ -1535,21 +1214,18 @@ inline bool eval_op(const cptir::Op& op, const Trace& trace, std::vector<Value>&
             return out(Value::f32(std::move(o)));
         }
         case OpCode::PivotThreshold: {
-            const cptir::TensorType& t = ty(a0);
+            const launch::TensorType& t = ty(a0);
             const std::size_t rows = canonical_rows(t.shape);
             const auto x = lanes_f32(v(a0));
             const std::size_t len = rows == 0 ? 0 : x.size() / rows;
             std::vector<std::uint8_t> keep(x.size(), 0);
-            // Predicate payloads are VALUE IDS on the wire for all three tags
-            // (compiler/ir/src/container.rs decode) — RankLe included. Already
-            // mapped to a global trace id by container_to_trace (bound.hpp
-            // gid()), same as any other op operand — no stage-local rebasing
-            // needed here.
+            // Predicate payloads are launch-package value ids, same as any
+            // other op operand — no stage-local rebasing needed here.
             for (std::size_t r = 0; r < rows; ++r) {
                 const float* row = x.data() + r * len;
                 std::uint8_t* k = keep.data() + r * len;
                 switch (op.predicate.tag) {
-                    case cptir::PredTag::RankLe: {
+                    case launch::PredTag::RankLe: {
                         const auto kv = lanes_i64(v(op.predicate.payload));
                         const std::int64_t kk = std::clamp<std::int64_t>(
                             kv[pick(kv.size(), r)], 0, static_cast<std::int64_t>(len));
@@ -1562,7 +1238,7 @@ inline bool eval_op(const cptir::Op& op, const Trace& trace, std::vector<Value>&
                         }
                         break;
                     }
-                    case cptir::PredTag::CummassLe: {
+                    case launch::PredTag::CummassLe: {
                         const auto pv = lanes_f32(v(op.predicate.payload));
                         const float p = pv[pick(pv.size(), r)];
                         const auto order = sort_desc_order(row, len);
@@ -1573,7 +1249,7 @@ inline bool eval_op(const cptir::Op& op, const Trace& trace, std::vector<Value>&
                         }
                         break;
                     }
-                    case cptir::PredTag::ProbGe: {
+                    case launch::PredTag::ProbGe: {
                         const auto tv = lanes_f32(v(op.predicate.payload));
                         const float thr = tv[pick(tv.size(), r)];
                         for (std::size_t i = 0; i < len; ++i) k[i] = row[i] >= thr ? 1 : 0;
@@ -1585,7 +1261,7 @@ inline bool eval_op(const cptir::Op& op, const Trace& trace, std::vector<Value>&
         }
 
         case OpCode::Gather: {
-            const cptir::TensorType& ts = ty(a0);
+            const launch::TensorType& ts = ty(a0);
             std::size_t rest = 1;
             for (std::size_t d = 1; d < ts.shape.dims.size(); ++d) rest *= ts.shape.dims[d];
             const std::size_t n0 = ts.shape.dims.empty() ? 1 : ts.shape.dims[0];
@@ -1604,7 +1280,7 @@ inline bool eval_op(const cptir::Op& op, const Trace& trace, std::vector<Value>&
             return out(gather_flat(v(a0), flat));
         }
         case OpCode::GatherRow: {
-            const cptir::TensorType& ts = ty(a0);
+            const launch::TensorType& ts = ty(a0);
             if (ts.shape.dims.size() != 2) return fault("gather_row");
             const std::size_t m = ts.shape.dims[0];
             const std::size_t n = ts.shape.dims[1];
@@ -1619,7 +1295,7 @@ inline bool eval_op(const cptir::Op& op, const Trace& trace, std::vector<Value>&
             return out(gather_flat(v(a0), flat));
         }
         case OpCode::ScatterAdd: case OpCode::ScatterSet: {
-            const cptir::TensorType& tb = ty(a0);
+            const launch::TensorType& tb = ty(a0);
             std::size_t rest = 1;
             for (std::size_t d = 1; d < tb.shape.dims.size(); ++d) rest *= tb.shape.dims[d];
             const std::size_t n0 = tb.shape.dims.empty() ? 1 : tb.shape.dims[0];
@@ -1663,7 +1339,7 @@ inline bool eval_op(const cptir::Op& op, const Trace& trace, std::vector<Value>&
         case OpCode::MaskApplyPacked: {
             // Per-row over the LAST axis: bit index is the column, the single
             // packed word row broadcasts across rows.
-            const cptir::Shape& ls = ty(a0).shape;
+            const launch::Shape& ls = ty(a0).shape;
             const std::size_t n = ls.dims.empty() ? 1 : ls.dims.back();
             const auto x = lanes_f32(v(a0));
             const Value& mask = v(a1);
@@ -1724,7 +1400,7 @@ inline bool eval_op(const cptir::Op& op, const Trace& trace, std::vector<Value>&
             const std::uint64_t seed_eff =
                 ptir_rng_seed_eff_stream(0, op.imm);
             const std::size_t n = static_cast<std::size_t>(op.result_type.shape.numel());
-            return out(Value::f32(rng_lanes(seed_eff, n, op.rng_kind == cptir::RngKind::Gumbel)));
+            return out(Value::f32(rng_lanes(seed_eff, n, op.rng_kind == launch::RngKind::Gumbel)));
         }
         case OpCode::RngKeyed: {
             const auto st = lanes_i64(v(a0));
@@ -1734,7 +1410,7 @@ inline bool eval_op(const cptir::Op& op, const Trace& trace, std::vector<Value>&
                 static_cast<std::uint32_t>(key),
                 static_cast<std::uint32_t>(ctr));
             const std::size_t n = static_cast<std::size_t>(op.result_type.shape.numel());
-            return out(Value::f32(rng_lanes(seed64, n, op.rng_kind == cptir::RngKind::Gumbel)));
+            return out(Value::f32(rng_lanes(seed64, n, op.rng_kind == launch::RngKind::Gumbel)));
         }
         case OpCode::KernelCall:
             if (op.args.size() != 1) {
@@ -1746,24 +1422,23 @@ inline bool eval_op(const cptir::Op& op, const Trace& trace, std::vector<Value>&
 
         default:
             return fault(std::string("op not executable on the Metal host interpreter: ") +
-                         std::string(cptir::op_name(op.code)));
+                         std::string(launch::op_name(op.code)));
     }
 }
 
 inline bool exec_stage(InterpInstance& inst, const ExecPlan& plan, const StagePlan& sp,
                        const PassInputs& in, Overlay& ov, std::vector<Value>& vals,
                        std::string& error) {
-    const cptir::Stage& stage = plan.trace.stages[sp.stage_index];
-    for (std::uint32_t id = sp.base; id < sp.end;) {
+    const launch::Stage& stage = plan.trace.stages[sp.stage_index];
+    for (std::uint32_t id : sp.value_ids) {
         auto found = sp.op_by_result.find(id);
         if (found != sp.op_by_result.end()) {
             if (!eval_op(*found->second, plan.trace, vals, error)) return false;
-            id += found->second->result_count;
             continue;
         }
-        const cptir::Value& root = plan.trace.values[id];
+        const launch::Value& root = plan.trace.values[id];
         switch (root.source) {
-            case cptir::ValueSource::Const: {
+            case launch::ValueSource::Const: {
                 switch (root.lit.dtype) {
                     case DType::I32: vals[id] = Value::i32({root.lit.as_i32()}); break;
                     case DType::U32: vals[id] = Value::u32({root.lit.as_u32()}); break;
@@ -1772,19 +1447,19 @@ inline bool exec_stage(InterpInstance& inst, const ExecPlan& plan, const StagePl
                 }
                 break;
             }
-            case cptir::ValueSource::ChannelTake:
+            case launch::ValueSource::ChannelTake:
                 vals[id] = ov.take(inst, root.channel);
                 break;
-            case cptir::ValueSource::ChannelRead:
+            case launch::ValueSource::ChannelRead:
                 vals[id] = ov.resolve(inst, root.channel);
                 break;
-            case cptir::ValueSource::Intrinsic: {
+            case launch::ValueSource::Intrinsic: {
                 // Only bounded logits/MTP roots reach here — classify_exec_plan()
                 // rejects every other intrinsic before a program is
                 // launchable, so any other tag means a plan/interp drift.
-                if (root.intrinsic != cptir::Intrinsic::Logits &&
-                    root.intrinsic != cptir::Intrinsic::MtpLogits &&
-                    root.intrinsic != cptir::Intrinsic::MtpDrafts) {
+                if (root.intrinsic != launch::Intrinsic::Logits &&
+                    root.intrinsic != launch::Intrinsic::MtpLogits &&
+                    root.intrinsic != launch::Intrinsic::MtpDrafts) {
                     error = "unresolved value root (unsupported intrinsic) reached execution";
                     return false;
                 }
@@ -1794,7 +1469,7 @@ inline bool exec_stage(InterpInstance& inst, const ExecPlan& plan, const StagePl
                 }
                 const std::uint64_t want = std::max<std::uint64_t>(root.type.shape.numel(), 1);
                 const bool drafts =
-                    root.intrinsic == cptir::Intrinsic::MtpDrafts;
+                    root.intrinsic == launch::Intrinsic::MtpDrafts;
                 const std::uint64_t rows_needed =
                     drafts ? want : (want / in.vocab);
                 if (!drafts && want % in.vocab != 0) {
@@ -1802,7 +1477,7 @@ inline bool exec_stage(InterpInstance& inst, const ExecPlan& plan, const StagePl
                     return false;
                 }
                 std::uint32_t base_row = 0;
-                if ((root.intrinsic == cptir::Intrinsic::MtpLogits ||
+                if ((root.intrinsic == launch::Intrinsic::MtpLogits ||
                      drafts) &&
                     in.mtp_draft_row >= 0) {
                     base_row = static_cast<std::uint32_t>(in.mtp_draft_row);
@@ -1853,11 +1528,10 @@ inline bool exec_stage(InterpInstance& inst, const ExecPlan& plan, const StagePl
                 error = "unresolved value root (intrinsic/host input) reached execution";
                 return false;
         }
-        id += 1;
     }
     // Puts land on the pass overlay at stage end (register semantics: the
     // Trace model carries no put position within the stage; last put wins).
-    for (const cptir::ChannelPut& p : stage.puts) {
+    for (const launch::ChannelPut& p : stage.puts) {
         ov.pending.insert_or_assign(p.channel, vals[p.value]);
         ov.put[p.channel] = 1;
     }
@@ -1879,15 +1553,19 @@ inline StepResult step(InterpInstance& inst, const ExecPlan& plan, const PassInp
         return result;
     }
 
-    for (const auto& e : plan.bound.readiness) {
-        const ChannelState& st = *inst.channels[e.chan];
-        const bool ok = e.dir == cptir::container::Direction::NeedsFull
-                            ? !st.empty()
-                            : !st.full();
-        if (!ok) {
+    for (std::size_t channel = 0; channel < inst.channels.size(); ++channel) {
+        const ChannelState& st = *inst.channels[channel];
+        if ((plan.takes_channel(static_cast<std::uint32_t>(channel)) ||
+             plan.reads_channel(static_cast<std::uint32_t>(channel))) && st.empty()) {
             result.ok = true;
             result.committed = false;
-            result.missed_channel = e.chan;
+            result.missed_channel = static_cast<std::uint32_t>(channel);
+            return result;
+        }
+        if (plan.puts_channel(static_cast<std::uint32_t>(channel)) && st.full()) {
+            result.ok = true;
+            result.committed = false;
+            result.missed_channel = static_cast<std::uint32_t>(channel);
             return result;
         }
     }
@@ -1897,7 +1575,7 @@ inline StepResult step(InterpInstance& inst, const ExecPlan& plan, const PassInp
     ov.put.assign(inst.channels.size(), 0);
     std::vector<Value> vals(plan.trace.values.size());
 
-    auto run_kind = [&](cptir::StageKind kind) -> bool {
+    auto run_kind = [&](launch::StageKind kind) -> bool {
         for (const StagePlan& sp : plan.stages) {
             if (plan.trace.stages[sp.stage_index].kind != kind) continue;
             if (!detail::exec_stage(inst, plan, sp, in, ov, vals, result.error)) return false;
@@ -1905,18 +1583,18 @@ inline StepResult step(InterpInstance& inst, const ExecPlan& plan, const PassInp
         return true;
     };
 
-    if (!run_kind(cptir::StageKind::Prologue)) {
+    if (!run_kind(launch::StageKind::Prologue)) {
         inst.poisoned = true;
         return result;
     }
-    for (const cptir::PortBinding& p : plan.trace.ports) {
+    for (const launch::PortBinding& p : plan.trace.ports) {
         if (p.is_const) continue;
-        if (cptir::port_consumes(p.port)) {
+        if (launch::port_consumes(p.port)) {
             (void)ov.take(inst, p.channel);
         }
         // Port values feed the forward, which this increment does not run.
     }
-    if (!run_kind(cptir::StageKind::Epilogue)) {
+    if (!run_kind(launch::StageKind::Epilogue)) {
         inst.poisoned = true;
         return result;
     }

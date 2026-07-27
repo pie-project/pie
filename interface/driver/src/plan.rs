@@ -94,8 +94,6 @@ pub const RS_FLAG_FOLD: u8 = 2;
 #[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProgramRegistration {
     pub program_hash: u64,
-    pub canonical_bytes: Vec<u8>,
-    pub sidecar_bytes: Vec<u8>,
     /// Kernels the host generated for this driver's backend, empty unless the
     /// driver advertised a
     /// [`codegen_backend`](crate::capabilities::DriverCapabilities::codegen_backend).
@@ -105,20 +103,195 @@ pub struct ProgramRegistration {
     /// driver's compile-cache key, so a bump must miss rather than reuse.
     #[serde(default)]
     pub emitter_version: u32,
-    /// Each stage's graph-cache identity, in plan order
-    /// (`pie_plan::stage_identity`).
-    ///
-    /// The first field of the launch package: a decision the CUDA driver
-    /// currently re-derives from the plan. Empty means "not supplied", so a
-    /// driver that receives nothing keeps deriving.
-    #[serde(default)]
-    pub stage_identities: Vec<u64>,
     /// Per-region bind verdicts and intrinsic side-table analysis, joined to
     /// `emitted_kernels` on `(stage_index, region_index)`.
-    ///
-    /// Same contract as `stage_identities`: empty means "not supplied".
     #[serde(default)]
     pub region_analysis: Vec<RegionAnalysis>,
+    /// The program itself, in the shape a driver executes it.
+    #[serde(default)]
+    pub launch: LaunchPackage,
+    /// The canonical PTIR container, for the in-workspace reference driver
+    /// only.
+    ///
+    /// `pie-driver-dummy` is a Rust crate that links the compiler's own IR and
+    /// interpreter, so it cannot drift from them the way a hand-written C++
+    /// mirror can. It is the one consumer that still wants PTIR.
+    ///
+    /// This is deliberately **not** part of the C ABI: [`PieProgramDesc`] has
+    /// no counterpart field, so a native driver cannot see PTIR even by
+    /// accident.
+    ///
+    /// [`PieProgramDesc`]: crate::local::PieProgramDesc
+    #[serde(default)]
+    pub reference_ptir: Vec<u8>,
+}
+
+/// **The launch package** — the owned counterpart of
+/// [`PieLaunchPackage`](crate::local::PieLaunchPackage).
+///
+/// This is what a driver receives instead of PTIR. `stages` and `plans` are
+/// parallel arrays in attachment order.
+#[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchPackage {
+    pub values: Vec<LaunchValue>,
+    pub channels: Vec<LaunchChannel>,
+    pub ports: Vec<LaunchPort>,
+    /// Program-wide name table for second-party kernels and sinks.
+    pub names: Vec<String>,
+    pub stages: Vec<LaunchStage>,
+    pub plans: Vec<LaunchStagePlan>,
+}
+
+/// One declared SSA value. Owned counterpart of
+/// [`PieLaunchValue`](crate::local::PieLaunchValue).
+#[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchValue {
+    pub id: u32,
+    /// `PIE_VALUE_*`.
+    pub source: u8,
+    pub dtype: u8,
+    /// `PTIR_INTR_*` when `source` is `PIE_VALUE_INTRINSIC`.
+    pub intrinsic: u8,
+    /// `PIE_HOST_*` when `source` is `PIE_VALUE_HOST_INPUT`.
+    pub host_avail: u8,
+    pub host_key: u32,
+    pub channel: u32,
+    pub literal_bits: u32,
+    pub shape: Vec<u32>,
+}
+
+/// One op in a stage DAG. Owned counterpart of
+/// [`PieLaunchOp`](crate::local::PieLaunchOp).
+#[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchOp {
+    /// `PTIR_OP_*`.
+    pub code: u16,
+    pub result_count: u16,
+    pub result_id: u32,
+    /// `PTIR_INTR_*`, for `intrinsic_val`.
+    pub intrinsic: u16,
+    pub lit_dtype: u8,
+    pub dtype: u8,
+    pub pred_tag: u8,
+    pub rng_kind: u8,
+    pub lit_bits: u32,
+    pub pred_payload: u32,
+    /// Channel slot, or `u32::MAX` when the op touches no channel.
+    pub channel: u32,
+    pub name_index: u32,
+    pub imm: u32,
+    pub imm2: u32,
+    pub imm3: u32,
+    pub args: Vec<u32>,
+    pub shape: Vec<u32>,
+}
+
+/// One channel declaration. Owned counterpart of
+/// [`PieLaunchChannel`](crate::local::PieLaunchChannel).
+#[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchChannel {
+    pub id: u32,
+    pub capacity: u32,
+    pub dtype: u8,
+    /// `PIE_CHANNEL_*` bits.
+    pub flags: u8,
+    /// -1 private, 0 import, 1 export.
+    pub extern_dir: i8,
+    pub shape: Vec<u32>,
+    pub extern_name: Vec<u8>,
+}
+
+/// One descriptor-port binding. Owned counterpart of
+/// [`PieLaunchPort`](crate::local::PieLaunchPort).
+#[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchPort {
+    /// `PTIR_PORT_*`.
+    pub port: u8,
+    pub is_const: bool,
+    pub const_dtype: u8,
+    pub channel: u32,
+    pub const_shape: Vec<u32>,
+    pub const_data: Vec<u8>,
+}
+
+/// A `(channel, value)` pair. Owned counterpart of
+/// [`PieLaunchPut`](crate::local::PieLaunchPut).
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchPut {
+    pub channel: u32,
+    pub value: u32,
+}
+
+/// One stage program. Owned counterpart of
+/// [`PieLaunchStage`](crate::local::PieLaunchStage).
+#[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchStage {
+    /// Prologue 0, OnAttnProj 1, OnAttn 2, Epilogue 3.
+    pub kind: u8,
+    pub ops: Vec<LaunchOp>,
+    pub puts: Vec<LaunchPut>,
+    pub takes: Vec<u32>,
+    pub reads: Vec<u32>,
+}
+
+/// One region. Owned counterpart of
+/// [`PieLaunchRegion`](crate::local::PieLaunchRegion).
+#[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchRegion {
+    /// `PIE_REGION_GENERATED` or `PIE_REGION_LIBRARY`.
+    pub kind: u8,
+    pub library: u8,
+    pub schedule: u8,
+    pub nodes: Vec<u32>,
+    pub inputs: Vec<u32>,
+    pub outputs: Vec<u32>,
+    pub sinks: Vec<LaunchPut>,
+}
+
+/// One normalized value type. Owned counterpart of
+/// [`PieLaunchPlanValue`](crate::local::PieLaunchPlanValue).
+#[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchPlanValue {
+    pub dtype: u8,
+    /// Per-dimension extent kind: `PIE_EXTENT_STATIC` or a runtime extent.
+    pub extents: Vec<u8>,
+    /// Per-dimension literal extent, meaningful where `extents` is static.
+    pub dims: Vec<u32>,
+}
+
+/// One lane-binding rule. Owned counterpart of
+/// [`PieLaunchChannelRule`](crate::local::PieLaunchChannelRule).
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchChannelRule {
+    pub value: u32,
+    pub local: u32,
+}
+
+/// The per-program launch plan for one stage. Owned counterpart of
+/// [`PieLaunchStagePlan`](crate::local::PieLaunchStagePlan).
+#[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchStagePlan {
+    pub signature_hash: u64,
+    /// Graph-cache identity (`pie_plan::stage_identity`).
+    pub identity: u64,
+    /// `PIE_STAGE_REQUIRES_*` bits.
+    pub flags: u32,
+    pub mtp_rows: u32,
+    pub ops: Vec<LaunchOp>,
+    /// Source op positions each normalized op covers.
+    pub source_ops: Vec<Vec<u32>>,
+    pub value_types: Vec<LaunchPlanValue>,
+    /// Local channel slot → program-global dense channel index.
+    pub channel_bindings: Vec<u32>,
+    /// Local name slot → canonical second-party kernel name.
+    pub names: Vec<String>,
+    pub singleton: Vec<LaunchRegion>,
+    pub fused: Vec<LaunchRegion>,
+    /// Runtime extents any value in the stage depends on, ascending.
+    pub used_extents: Vec<u8>,
+    pub channel_rules: Vec<LaunchChannelRule>,
+    /// Why `PIE_STAGE_GROUPED_VALID` is clear. Empty when it is set.
+    pub error: String,
 }
 
 /// Every per-region decision the host made. The owned counterpart of

@@ -32,8 +32,8 @@
 #include <type_traits>
 #include <vector>
 
-#include "pie_native/ptir/op_table.hpp"
-#include "pie_native/ptir/plan.hpp"
+#include "pie_native/launch/op_table.hpp"
+#include "pie_native/launch/plan.hpp"
 #include <rng_contract.generated.h>
 
 namespace pie_cuda_driver::pipeline::generated {
@@ -90,12 +90,6 @@ struct GeneratedOpParams {
     std::uint64_t rng_seed;
 };
 
-struct GeneratedOpMeta {
-    std::uint32_t node = 0;
-    std::uint32_t result_base = 0;
-    pie_native::ptir::container::COp op;
-};
-
 struct GeneratedKernelSource {
     bool ok = false;
     std::string error;
@@ -107,7 +101,6 @@ struct GeneratedKernelSource {
 using M1Status = GeneratedStatus;
 using M1ValueDesc = GeneratedValueDesc;
 using M1OpParams = GeneratedOpParams;
-using SingletonOpMeta = GeneratedOpMeta;
 using SingletonSource = GeneratedKernelSource;
 
 static_assert(std::is_standard_layout_v<GeneratedStatus>);
@@ -145,8 +138,8 @@ inline constexpr bool supported_tag(std::uint8_t tag) {
 }
 
 inline bool same_type(
-    const pie_native::ptir::plan::ValueType& left,
-    const pie_native::ptir::plan::ValueType& right) {
+    const pie_native::launch::plan::ValueType& left,
+    const pie_native::launch::plan::ValueType& right) {
     return left.dtype == right.dtype &&
         left.dims.size() == right.dims.size() &&
         std::equal(
@@ -159,8 +152,8 @@ inline bool same_type(
 }
 
 inline bool nucleus_library_region_valid(
-    const pie_native::ptir::plan::StagePlan& stage,
-    const pie_native::ptir::plan::Region& region) {
+    const pie_native::launch::plan::StagePlan& stage,
+    const pie_native::launch::plan::Region& region) {
     if (!region.library ||
         region.library_op != PTIR_LIBRARY_NUCLEUS_SAMPLE ||
         region.schedule != PTIR_SCHEDULE_LIBRARY ||
@@ -211,7 +204,7 @@ inline bool nucleus_library_region_valid(
             logits_type.dims.back().value) {
         return false;
     }
-    const std::vector<pie_native::ptir::plan::Dimension> row_dims(
+    const std::vector<pie_native::launch::plan::Dimension> row_dims(
         logits_type.dims.begin(), logits_type.dims.end() - 1);
     return top_p_type.dtype == PTIR_DT_F32 &&
         (top_p_type.dims.empty() ||
@@ -229,8 +222,8 @@ inline bool nucleus_library_region_valid(
 }
 
 inline bool library_region_valid(
-    const pie_native::ptir::plan::StagePlan& stage,
-    const pie_native::ptir::plan::Region& region) {
+    const pie_native::launch::plan::StagePlan& stage,
+    const pie_native::launch::plan::Region& region) {
     if (!region.library) {
         return region.schedule != PTIR_SCHEDULE_LIBRARY;
     }

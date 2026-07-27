@@ -13,16 +13,15 @@
 //!    channel/stage counts — P2.3) once, and cache by hash.
 //!
 //! Pure host-side (no GPU). The driver keeps its own compile cache under the same
-//! hash; the host→driver ship (container bytes + the PTIB `BoundTrace` sidecar)
-//! rides the request path separately.
+//! hash; the host→driver ship is the typed [`RegisteredProgram::launch`] package.
 //!
 //! [`model_profile`] builds the bind-time [`ModelProfile`] from the loaded
 //! model: program-registration input, not fire-time glue.
 //!
 //! The registry probes ([`Registry::lookup`]/[`Registry::len`], the free
-//! [`lookup`]) and [`RegisteredProgram::stage_signature`] are `#[cfg(test)]`:
-//! production carries the `Arc<RegisteredProgram>` that [`register`] returns
-//! rather than probing by hash. [`Pricing`] is the one thing computed on the
+//! [`lookup`]) are `#[cfg(test)]`: production carries the
+//! `Arc<RegisteredProgram>` that [`register`] returns rather than probing by
+//! hash. [`Pricing`] is the one thing computed on the
 //! production path with no production consumer yet — thrust-2 capacity
 //! accounting is unwired — so it carries an annotated `allow` instead of a
 //! blanket module-level one.
@@ -41,8 +40,6 @@ use pie_ir::op::Op;
 use pie_ir::registry::{ModelProfile, Port};
 use pie_ir::validate::{BoundTrace, ValidateError, bind};
 use pie_plan::CompiledStage;
-#[cfg(test)]
-use pie_plan::StageSignature;
 
 /// Registration-time pricing (thrust-3 P2.3): per-instance costs computed once
 /// per program and attached to its identity (feeds thrust-2's capacity
@@ -68,11 +65,9 @@ pub struct RegisteredProgram {
     pub hash: u64,
     /// The validated, typed artifact (types, readiness, §7.1 classes).
     pub bound: BoundTrace,
-    /// Compiler-owned normalized stages, signatures, and region partitions.
-    /// Retained from the compile so [`Self::stage_signature`] can probe it;
-    /// the driver reads the same information out of [`Self::sidecar`], so
-    /// production never reads this field.
-    #[allow(dead_code)]
+    /// Compiler-owned normalized stages, signatures, and region partitions —
+    /// the input every host-side derivation reads: [`Self::launch`],
+    /// [`Self::region_analysis`], and backend emission.
     pub compiled_stages: Vec<CompiledStage>,
     /// Backend source generated for this program, keyed by the backend a
     /// driver advertised. Emitted lazily and cached here because generation is
@@ -81,11 +76,9 @@ pub struct RegisteredProgram {
     emitted: Mutex<HashMap<Backend, Arc<EmittedProgram>>>,
     /// Dense-channel `(consume, publish)` mask, derived once from immutable IR.
     pub channel_accesses: Vec<(bool, bool)>,
-    /// The PTIB typed sidecar (`encode_bound(&bound)`) — the wire form of
-    /// `BoundTrace` shipped beside the container bytes to the driver
-    /// (seed-independent, hash-keyed; its inner `container_hash` == [`Self::hash`],
-    /// which the driver asserts). Charlie's `bound.hpp` reads exactly this.
-    pub sidecar: Vec<u8>,
+    /// This program in the shape a driver executes it, built on first use.
+    /// See [`Self::launch`].
+    launch: std::sync::OnceLock<pie_driver_abi::plan::LaunchPackage>,
     /// Registration-time pricing. Computed by [`price`] on every register,
     /// but nothing consumes it yet (thrust-2 capacity accounting is
     /// unwired) — the `allow` marks that gap rather than hiding it.
@@ -102,18 +95,14 @@ pub struct EmittedProgram {
 }
 
 impl RegisteredProgram {
-    /// Each stage's graph-cache identity, in plan order.
+    /// **The launch package** — this program in the shape a driver executes it.
     ///
-    /// The CUDA driver derives exactly this from the decoded plan
-    /// (`program_identity.hpp`). Shipping it is the first field of the launch
-    /// package: while both exist the driver compares and counts divergence,
-    /// which is what makes deleting its copy an evidenced step rather than a
-    /// leap (`ptir-refactor.md` §4.2).
-    pub fn stage_identities(&self) -> Vec<u64> {
-        self.compiled_stages
-            .iter()
-            .map(pie_plan::stage_identity)
-            .collect()
+    /// This is what replaced the container bytes and the PTIB sidecar. A driver
+    /// receives typed records instead of PTIR, so it has no wire format to parse and no
+    /// plan to re-derive (`ptir-refactor.md` §2.3).
+    pub fn launch(&self) -> &pie_driver_abi::plan::LaunchPackage {
+        self.launch
+            .get_or_init(|| pie_codegen::launch::build(&self.bound, &self.compiled_stages))
     }
 
     /// Every per-region decision the CUDA driver derives for itself in
@@ -162,19 +151,6 @@ impl RegisteredProgram {
                 kernels: emit_program(backend, &self.compiled_stages, &self.bound),
             })
         })))
-    }
-}
-
-impl RegisteredProgram {
-    /// Per-stage signature lookup — asserted by this module's sidecar
-    /// round-trip test; production reads the signatures through the sidecar
-    /// the driver receives.
-    #[cfg(test)]
-    pub fn stage_signature(&self, stage: pie_ir::registry::Stage) -> Option<&StageSignature> {
-        self.compiled_stages
-            .iter()
-            .find(|compiled| compiled.normalized.stage == stage)
-            .map(|compiled| &compiled.signature)
     }
 }
 
@@ -242,16 +218,14 @@ impl Registry {
                 eprintln!("  metrics={:?}", stage.metrics());
             }
         }
-        // The PTIB sidecar is the host→driver wire form of `BoundTrace`
-        // (seed-independent, hash-keyed) — computed once, cached beside pricing.
-        let sidecar = pie_plan::sidecar::encode_bound_with_plans(&bound, &compiled_stages);
+        let launch = std::sync::OnceLock::new();
         let entry = Arc::new(RegisteredProgram {
             bytes,
             hash,
             bound,
             compiled_stages,
             channel_accesses,
-            sidecar,
+            launch,
             pricing,
             emitted: Mutex::new(HashMap::new()),
         });
@@ -681,28 +655,6 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_roundtrips_and_matches_identity() {
-        // The PTIB sidecar is the host→driver ship artifact; its inner
-        // container_hash must equal the program identity (the driver asserts it).
-        let mut r = reg(4);
-        let bytes = greedy(VOCAB).encode();
-        let prog = r.register(bytes.clone(), &prof(VOCAB)).unwrap();
-        let decoded = pie_plan::sidecar::decode_bound(&prog.sidecar).unwrap();
-        assert_eq!(
-            decoded.container_hash, prog.hash,
-            "PTIB inner hash == container identity"
-        );
-        assert_eq!(decoded.container_hash, container_hash(&bytes));
-        assert!(!prog.sidecar.is_empty());
-        assert_eq!(decoded.stage_plans.len(), prog.compiled_stages.len());
-        let signature = prog
-            .stage_signature(Stage::Epilogue)
-            .expect("epilogue signature");
-        let plan = pie_plan::decode_plan_header(&decoded.stage_plans[0].1).unwrap();
-        assert_eq!(plan.signature_hash, signature.hash);
-    }
-
-    #[test]
     fn distinct_containers_are_separate() {
         let mut r = reg(8);
         let a = r.register(greedy(8).encode(), &prof(8)).unwrap();
@@ -725,7 +677,7 @@ mod tests {
                 bound: program.bound.clone(),
                 compiled_stages: program.compiled_stages.clone(),
                 channel_accesses: program.channel_accesses.clone(),
-                sidecar: program.sidecar.clone(),
+                launch: program.launch.clone(),
                 pricing: program.pricing,
                 emitted: Mutex::new(HashMap::new()),
             }),

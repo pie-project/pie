@@ -9,7 +9,6 @@
 
 #include <pie_driver_abi.h>
 
-#include "pie_native/ptir_channels.hpp"
 #include "pipeline/interp.hpp"
 
 namespace pie::metal::pipeline {
@@ -32,8 +31,7 @@ struct HostEmittedKernel {
 struct ProgramRecord {
     std::uint64_t program_id = 0;
     std::uint64_t program_hash = 0;
-    std::vector<std::uint8_t> canonical_bytes;
-    std::vector<pie_native::PtirChannelDecl> channels;
+    std::vector<pie_native::launch::Channel> channels;
     ExecPlan plan;
     std::vector<HostEmittedKernel> emitted_kernels;
     std::shared_ptr<M1ProgramExecutable> m1_executable;

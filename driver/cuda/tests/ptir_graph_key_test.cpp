@@ -17,7 +17,6 @@
 #include "cuda_check.hpp"
 #include "model/workspace.hpp"
 #include "pipeline/batch_compose.hpp"
-#include "pipeline/program_identity.hpp"
 
 using namespace pie_cuda_driver;
 
@@ -26,13 +25,6 @@ int g_pass = 0, g_fail = 0;
 void expect(bool ok, const char* what) {
     if (ok) { ++g_pass; std::printf("  PASS  %s\n", what); }
     else    { ++g_fail; std::printf("  FAIL  %s\n", what); }
-}
-
-std::uint64_t program_set(
-    std::initializer_list<std::uint64_t> identities) {
-    pie_cuda_driver::pipeline::ProgramSetIdentityFold fold;
-    for (const std::uint64_t identity : identities) fold.add(identity, 0);
-    return fold.finish();
 }
 }
 
@@ -48,23 +40,8 @@ int main() {
             !(key == ForwardGraphKey{4, 4, 8}),
         "request, token, and model variants remain key dimensions");
 
-    std::uint64_t setA = program_set({0x1111, 0x2222});
-    std::uint64_t setB = program_set({0x1111, 0x3333});
-    expect(
-        setA != setB && H(key) == H(ForwardGraphKey{4, 4, 7}),
-        "program-set identity does not affect the model graph key");
-
-    // (c) order-independent, with exact lane/stage multiplicity.
-    expect(program_set({0xAA, 0xBB, 0xCC}) ==
-           program_set({0xCC, 0xAA, 0xBB}), "fold is order-independent");
-    expect(program_set({0xAA, 0xBB, 0xAA}) !=
-           program_set({0xAA, 0xBB}), "fold includes duplicate stage count");
-    expect(program_set({}) == 0, "empty set folds to 0 (== non-PTIR)");
-    expect(program_set({0xAA}) != program_set({0xBB}),
-           "distinct singletons fold distinctly");
-    // a single-program fleet vs a two-program fleet must differ.
-    expect(program_set({0xAA}) != program_set({0xAA, 0xBB}),
-           "adding a program changes the set identity");
+    expect(H(key) == H(ForwardGraphKey{4, 4, 7}),
+           "equal keys hash equally");
 
     ForwardGraphCache cache;
     expect(cache.get(key) == nullptr, "graph cache records a miss");
@@ -132,8 +109,8 @@ int main() {
         pie_cuda_driver::model::workspace_mtp_draft_row_base(1024) == 1024 &&
             pie_cuda_driver::model::workspace_logits_rows(1024, 40) == 1064,
         "workspace reserves every target token row before MTP drafts");
-    const pie_native::ptir::StructuredMaskDescriptor sliding_masks[] = {
-        {pie_native::ptir::StructuredMaskKind::SlidingWindow, 8, 0, 4},
+    const pie_native::launch::StructuredMaskDescriptor sliding_masks[] = {
+        {pie_native::launch::StructuredMaskKind::SlidingWindow, 8, 0, 4},
     };
     const std::uint32_t tail_positions[] = {6, 7};
     const std::uint32_t arbitrary_positions[] = {1, 7};
@@ -156,7 +133,7 @@ int main() {
         static_cast<std::uint32_t>(std::numeric_limits<int>::max()) + 2u;
     expect(
         !pie_cuda_driver::pipeline::runtime_window_for_tail_aligned(
-             std::span<const pie_native::ptir::StructuredMaskDescriptor>(
+             std::span<const pie_native::launch::StructuredMaskDescriptor>(
                  &oversized_window, 1),
              tail_positions, tail_qo, tail_pages, tail_last, 16)
              .has_value(),
@@ -208,7 +185,7 @@ int main() {
         pie_native::slice_from_u32(buffered_rs_slots, 2);
     mixed_view.rs_buffer_slot_indptr =
         pie_native::slice_from_u32(buffered_rs_indptr, 3);
-    pie_native::ptir::ResolvedPrograms resolved;
+    pie_native::launch::ResolvedPrograms resolved;
     resolved.per_program.resize(2);
     resolved.is_device_geometry = {1, 0};
     resolved.device_count = 1;
@@ -223,7 +200,7 @@ int main() {
     device.sampling_indptr = {0, 1};
     device.has_kv_family = true;
     device.structured_mask.kind =
-        pie_native::ptir::StructuredMaskKind::SlidingWindow;
+        pie_native::launch::StructuredMaskKind::SlidingWindow;
     device.structured_mask.key_len = 16;
     device.structured_mask.window = 4;
     pie_cuda_driver::pipeline::ComposedBatch mixed;
@@ -245,15 +222,15 @@ int main() {
             mixed.rs_slot_ids != mixed.rs_buffer_slot_ids &&
             mixed.structured_masks.size() == 2 &&
             mixed.structured_masks[0].kind ==
-                pie_native::ptir::StructuredMaskKind::None &&
+                pie_native::launch::StructuredMaskKind::None &&
             mixed.structured_masks[1].kind ==
-                pie_native::ptir::StructuredMaskKind::SlidingWindow,
+                pie_native::launch::StructuredMaskKind::SlidingWindow,
         "B=2 device/wire composition preserves native wire masking and "
         "request-order folded RS");
-    const pie_native::ptir::StructuredMaskDescriptor no_masks[2]{};
-    const pie_native::ptir::StructuredMaskDescriptor explicit_masks[2] = {
+    const pie_native::launch::StructuredMaskDescriptor no_masks[2]{};
+    const pie_native::launch::StructuredMaskDescriptor explicit_masks[2] = {
         sliding_masks[0], sliding_masks[0]};
-    const pie_native::ptir::StructuredMaskDescriptor mixed_masks[2] = {
+    const pie_native::launch::StructuredMaskDescriptor mixed_masks[2] = {
         {}, sliding_masks[0]};
     expect(
         pie_cuda_driver::pipeline::structured_mask_coverage(no_masks) ==

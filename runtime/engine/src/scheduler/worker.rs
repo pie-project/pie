@@ -1667,7 +1667,7 @@ struct SchedulerControl {
     active_senders: AtomicUsize,
     shutdown_wait: Condvar,
     shutdown_gate: Mutex<()>,
-    program_ids: Mutex<HashMap<u64, (u64, Vec<u8>, Vec<u8>)>>,
+    program_ids: Mutex<HashMap<u64, (u64, pie_driver_abi::plan::LaunchPackage)>>,
     accepting: AtomicBool,
     stats: Arc<SchedulerStats>,
 }
@@ -1836,15 +1836,14 @@ impl SchedulerHandle {
         let program_hash = plan.program_hash;
         {
             let program_ids = self.inner.program_ids.lock().unwrap();
-            if let Some((program_id, canonical, sidecar)) = program_ids.get(&program_hash) {
-                if canonical != &plan.canonical_bytes || sidecar != &plan.sidecar_bytes {
+            if let Some((program_id, launch)) = program_ids.get(&program_hash) {
+                if launch != &plan.launch {
                     return Err(anyhow!("program hash collision for 0x{program_hash:016x}"));
                 }
                 return Ok(*program_id);
             }
         }
-        let canonical = plan.canonical_bytes.clone();
-        let sidecar = plan.sidecar_bytes.clone();
+        let launch = plan.launch.clone();
         let program_id = self
             .request(|response| SchedulerItem::RegisterProgram { plan, response })
             .await??;
@@ -1852,7 +1851,7 @@ impl SchedulerHandle {
             .program_ids
             .lock()
             .unwrap()
-            .insert(program_hash, (program_id, canonical, sidecar));
+            .insert(program_hash, (program_id, launch));
         Ok(program_id)
     }
 
@@ -1896,8 +1895,8 @@ impl SchedulerHandle {
         let cached = {
             let program_ids = self.inner.program_ids.lock().unwrap();
             match program_ids.get(&program_hash) {
-                Some((program_id, canonical, sidecar)) => {
-                    if canonical != &program.canonical_bytes || sidecar != &program.sidecar_bytes {
+                Some((program_id, launch)) => {
+                    if launch != &program.launch {
                         return Err(anyhow!("program hash collision for 0x{program_hash:016x}"));
                     }
                     Some(*program_id)
@@ -1910,10 +1909,7 @@ impl SchedulerHandle {
                 bind.program_id = program_id;
                 (None, None)
             }
-            None => (
-                Some(program.clone()),
-                Some((program.canonical_bytes, program.sidecar_bytes)),
-            ),
+            None => (Some(program.clone()), Some(program.launch)),
         };
         let (registered, program_id, bound) = self
             .request(|response| SchedulerItem::RegisterChannelsBind {
@@ -1924,12 +1920,12 @@ impl SchedulerHandle {
                 response,
             })
             .await??;
-        if let Some((canonical, sidecar)) = cache_fill {
+        if let Some(launch) = cache_fill {
             self.inner
                 .program_ids
                 .lock()
                 .unwrap()
-                .insert(program_hash, (program_id, canonical, sidecar));
+                .insert(program_hash, (program_id, launch));
         }
         Ok((registered, bound))
     }
@@ -4387,8 +4383,7 @@ mod tests {
         .encode();
         ProgramRegistration {
             program_hash: pie_ir::container_hash(&bytes),
-            canonical_bytes: bytes,
-            sidecar_bytes: Vec::new(),
+            reference_ptir: bytes,
             ..Default::default()
         }
     }
@@ -5852,8 +5847,7 @@ mod tests {
             driver_id,
             ProgramRegistration {
                 program_hash: pie_ir::container_hash(&exporter_bytes),
-                canonical_bytes: exporter_bytes,
-                sidecar_bytes: Vec::new(),
+                reference_ptir: exporter_bytes,
                 ..Default::default()
             },
         )
@@ -5862,8 +5856,7 @@ mod tests {
             driver_id,
             ProgramRegistration {
                 program_hash: pie_ir::container_hash(&importer_bytes),
-                canonical_bytes: importer_bytes,
-                sidecar_bytes: Vec::new(),
+                reference_ptir: importer_bytes,
                 ..Default::default()
             },
         )

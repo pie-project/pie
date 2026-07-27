@@ -18,6 +18,7 @@ use super::command::{
     ChannelRegistrationPlan, KvCopyPlan, LaunchPlan, PoolResizePlan, ProgramRegistration,
     StateCopyPlan,
 };
+use super::launch_abi::LaunchPackageBorrow;
 use super::instance::InstanceBindingPlan;
 use super::submission::{FrameSubmission, StepSubmission};
 
@@ -112,12 +113,10 @@ impl MaskWordsStorage {
 }
 
 pub struct ProgramDescBorrow<'a> {
-    _bytes: &'a [u8],
-    _sidecar: &'a [u8],
-    _stage_identities: &'a [u64],
     // The ABI slice points into this vector's heap buffer, which a move of the
     // struct does not relocate. It must never be mutated after `raw` is built.
     _kernels: Vec<PieEmittedKernel>,
+    _launch: LaunchPackageBorrow<'a>,
     // Two levels, same rule: `_regions` holds the pointers into `_direct_argmax`'s
     // inner buffers, and moving either vector moves headers, not heap.
     _direct_argmax: Vec<Vec<PieDirectArgmax>>,
@@ -185,24 +184,23 @@ impl<'a> ProgramDescBorrow<'a> {
             len: regions.len(),
         };
 
+        let launch = LaunchPackageBorrow::new(&program.launch);
+        let raw_launch = launch.as_raw();
+
         Self {
-            _bytes: &program.canonical_bytes,
-            _sidecar: &program.sidecar_bytes,
-            _stage_identities: &program.stage_identities,
             _kernels: kernels,
+            _launch: launch,
             _direct_argmax: direct_argmax,
             _regions: regions,
             raw: PieProgramDesc {
                 abi_version: PIE_DRIVER_ABI_VERSION,
                 reserved0: 0,
                 program_hash: program.program_hash,
-                canonical_bytes: bytes_slice(&program.canonical_bytes),
-                sidecar_bytes: bytes_slice(&program.sidecar_bytes),
                 emitter_version: program.emitter_version,
                 reserved1: 0,
                 emitted_kernels,
-                stage_identities: u64_slice(&program.stage_identities),
                 region_analysis,
+                launch: raw_launch,
             },
         }
     }

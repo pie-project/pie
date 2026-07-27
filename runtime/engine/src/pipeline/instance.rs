@@ -931,8 +931,7 @@ mod tests {
             .encode();
             ProgramRegistration {
                 program_hash: pie_ir::container_hash(&bytes),
-                canonical_bytes: bytes,
-                sidecar_bytes: Vec::new(),
+                reference_ptir: bytes,
                 ..Default::default()
             }
         }

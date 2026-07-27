@@ -7,9 +7,9 @@
 
 #include <ptir_abi.h>
 
-#include "pie_native/ptir/trace.hpp"
+#include "pie_native/launch/program.hpp"
 
-namespace pie_native::ptir::descriptor {
+namespace pie_native::launch::descriptor {
 
 // Derived from the generated header, not retyped. `ptir_abi.h` is emitted from
 // `pie_ir::registry`, which is the only place a port tag is decided; hand-copied
@@ -321,4 +321,4 @@ inline std::uint32_t last_page_len(
                : ((length - 1) % page_size) + 1;
 }
 
-}  // namespace pie_native::ptir::descriptor
+}  // namespace pie_native::launch::descriptor

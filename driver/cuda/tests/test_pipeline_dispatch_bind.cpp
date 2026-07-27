@@ -1,11 +1,9 @@
 #include <cstdint>
 #include <cstdio>
-#include <fstream>
 #include <string>
 #include <vector>
 
 #include "pipeline/dispatch.hpp"
-#include "pie_native/ptir/container.hpp"
 #include "support/host_kernels.hpp"
 
 using pie_cuda_driver::pipeline::Dispatch;
@@ -17,125 +15,49 @@ bool expect(bool cond, const char* msg) {
     return cond;
 }
 
-std::string trim(const std::string& s) {
-    const std::size_t a = s.find_first_not_of(" \t\r\n");
-    if (a == std::string::npos) return "";
-    const std::size_t b = s.find_last_not_of(" \t\r\n");
-    return s.substr(a, b - a + 1);
-}
-
-std::vector<std::uint8_t> hex_to_bytes(const std::string& hex) {
-    std::vector<std::uint8_t> out;
-    for (std::size_t i = 0; i + 1 < hex.size(); i += 2) {
-        out.push_back(static_cast<std::uint8_t>(
-            std::stoul(hex.substr(i, 2), nullptr, 16)));
-    }
-    return out;
-}
-
-std::vector<std::uint8_t> load_golden_container(const std::string& path) {
-    std::ifstream in(path);
-    std::string line;
-    while (std::getline(in, line)) {
-        const auto colon = line.find(':');
-        if (colon == std::string::npos) continue;
-        if (trim(line.substr(0, colon)) != "container") continue;
-        return hex_to_bytes(trim(line.substr(colon + 1)));
-    }
-    return {};
-}
-
-std::vector<std::uint8_t> load_golden_sidecar(const std::string& path) {
-    std::ifstream in(path);
-    std::string line;
-    while (std::getline(in, line)) {
-        const auto colon = line.find(':');
-        if (colon == std::string::npos) continue;
-        if (trim(line.substr(0, colon)) != "sidecar") continue;
-        return hex_to_bytes(trim(line.substr(colon + 1)));
-    }
-    return {};
-}
-
-std::uint64_t load_golden_hash(const std::string& path) {
-    std::ifstream in(path);
-    std::string line;
-    while (std::getline(in, line)) {
-        const auto colon = line.find(':');
-        if (colon == std::string::npos) continue;
-        if (trim(line.substr(0, colon)) != "hash") continue;
-        return std::stoull(trim(line.substr(colon + 1)), nullptr, 16);
-    }
-    return 0;
-}
-
 }  // namespace
 
 int main() {
-    const std::string golden = "../tests/golden-ptir/greedy_argmax.txt";
-    const auto bytes = load_golden_container(golden);
-    if (!expect(!bytes.empty(), "load golden PTIR")) return 1;
-    const auto sidecar = load_golden_sidecar(golden);
-    if (!expect(!sidecar.empty(), "load golden PTIB")) return 1;
-    const std::uint64_t program_hash = load_golden_hash(golden);
-    if (!expect(program_hash != 0, "load golden PTIR hash")) return 1;
+    // Only a registry key: the driver no longer checks a program hash, because
+    // it no longer sees the bytes one would be taken over.
+    constexpr std::uint64_t program_hash = 0x9e3779b97f4a7c15ULL;
 
     // The launch package the engine would have handed the driver. Kept beside
     // the trace by `cargo test -p pie-compiler-tests --test cuda_golden
     // emit_driver_test_kernel`; the driver derives none of it any more.
-    const std::string fixture = "../tests/golden-ptir-kernels/greedy_argmax";
+    const std::string fixture = "golden-ptir-kernels/greedy_argmax";
     pie_cuda_driver::tests::HostKernelFixture host_kernels;
-    pie_cuda_driver::tests::HostIdentityFixture host_identities;
+    pie_cuda_driver::tests::HostLaunchFixture host_launch;
     pie_cuda_driver::tests::HostRegionFixture host_regions;
     std::string fixture_error;
-    if (!expect(host_kernels.load(fixture + ".kernels", &fixture_error) &&
-                    host_identities.load(fixture + ".identities", &fixture_error) &&
-                    host_regions.load(fixture + ".regions", &fixture_error),
-                fixture_error.c_str())) return 1;
+    // Sequence the loads BEFORE the message: C++ call arguments are
+    // unsequenced, so passing `fixture_error.c_str()` alongside the call that
+    // fills it reports an empty reason for every real failure.
+    const bool fixtures_ok =
+        host_kernels.load(fixture + ".kernels", &fixture_error) &&
+        host_launch.load(fixture + ".launch", &fixture_error) &&
+        host_regions.load(fixture + ".regions", &fixture_error);
+    if (!expect(fixtures_ok, fixture_error.c_str())) return 1;
 
     Dispatch dispatch;
     std::string err;
     const int rc = dispatch.register_program(
         program_hash,
-        pie_native::ByteSlice{bytes.data(), bytes.size()},
-        pie_native::ByteSlice{sidecar.data(), sidecar.size()},
+        host_launch.package(),
         host_kernels.slice(),
-        host_identities.slice(),
         host_regions.slice(),
         &err);
     if (!expect(rc == PIE_STATUS_OK, err.c_str())) return 1;
 
     std::vector<std::uint64_t> channel_ids(2);
-    pie_native::ptir::container::Container container;
-    pie_native::ptir::container::DecodeError decode_error;
-    if (!expect(
-            pie_native::ptir::container::decode(
-                bytes.data(), bytes.size(), container, &decode_error),
-            decode_error.detail.c_str())) return 1;
-    if (!expect(container.channels.size() == channel_ids.size(),
+    const PieLaunchChannelSlice declared = host_launch.package().channels;
+    if (!expect(declared.len == channel_ids.size(),
                 "golden channel count")) return 1;
     std::vector<PieChannelEndpointBinding> endpoints(channel_ids.size());
     for (std::size_t i = 0; i < channel_ids.size(); ++i) {
         channel_ids[i] = 1000 + i;
-        const auto& source = container.channels[i];
-        PieChannelDesc desc{};
-        desc.abi_version = PIE_DRIVER_ABI_VERSION;
-        desc.channel_id = channel_ids[i];
-        desc.shape = {.ptr = source.shape.dims, .len = source.shape.rank};
-        desc.dtype = source.dtype;
-        desc.host_role = source.host_role;
-        desc.seeded = source.seeded;
-        desc.extern_dir = source.extern_dir < 0
-            ? PIE_CHANNEL_EXTERN_NONE
-            : static_cast<std::uint8_t>(source.extern_dir + 1);
-        desc.capacity = source.capacity;
-        desc.reader_wait_id = 2000 + i;
-        desc.writer_wait_id = 3000 + i;
-        desc.extern_name = {
-            .ptr = reinterpret_cast<const std::uint8_t*>(
-                source.extern_name.data()),
-            .len = source.extern_name.size(),
-        };
+        const PieChannelDesc desc = pie_cuda_driver::tests::channel_desc_from(
+            declared.ptr[i], channel_ids[i], 2000 + i, 3000 + i);
         if (!expect(
                 dispatch.register_channel(desc, &endpoints[i], &err) ==
                     PIE_STATUS_OK,

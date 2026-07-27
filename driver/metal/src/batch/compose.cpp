@@ -165,7 +165,7 @@ bool build_member_forward_desc(
     std::size_t member_count,
     bool has_linear_attn,
     std::uint32_t page_size,
-    const pie_native::ptir::FireGeometry* resolved,
+    const pie_native::launch::FireGeometry* resolved,
     MemberForwardDesc& desc,
     std::string& error) {
     page_size = std::max<std::uint32_t>(page_size, 1);

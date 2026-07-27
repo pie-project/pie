@@ -19,3 +19,4 @@ path = "src/lib.rs"
 [dependencies]
 pie-ir = { path = "../ir" }
 pie-plan = { path = "../plan" }
+pie-driver-abi = { path = "../../interface/driver" }
