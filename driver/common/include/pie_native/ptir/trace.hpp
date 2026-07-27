@@ -189,7 +189,10 @@ struct Output {
 // like the pentathlon composition). Must match the wire byte-for-byte — the
 // decode casts the wire byte directly (bound.hpp `(StageKind)cs.stage`).
 enum class StageKind : std::uint8_t {
-    Prologue = 0, OnAttnProj = 1, OnAttn = 2, Epilogue = 3,
+    Prologue = PTIR_STAGE_PROLOGUE,
+    OnAttnProj = PTIR_STAGE_ON_ATTN_PROJ,
+    OnAttn = PTIR_STAGE_ON_ATTN,
+    Epilogue = PTIR_STAGE_EPILOGUE,
 };
 
 // One stage program: a straight-line SSA op DAG plus its channel effects and

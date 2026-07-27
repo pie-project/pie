@@ -5,20 +5,27 @@
 #include <span>
 #include <vector>
 
+#include <ptir_abi.h>
+
 #include "pie_native/ptir/trace.hpp"
 
 namespace pie_native::ptir::descriptor {
 
-inline constexpr std::uint8_t kPortEmbedTokens = 0;
-inline constexpr std::uint8_t kPortEmbedIndptr = 1;
-inline constexpr std::uint8_t kPortPositions = 2;
-inline constexpr std::uint8_t kPortPages = 3;
-inline constexpr std::uint8_t kPortPageIndptr = 4;
-inline constexpr std::uint8_t kPortKvLen = 5;
-inline constexpr std::uint8_t kPortWSlot = 6;
-inline constexpr std::uint8_t kPortWOff = 7;
-inline constexpr std::uint8_t kPortReadout = 8;
-inline constexpr std::uint8_t kPortAttnMask = 9;
+// Derived from the generated header, not retyped. `ptir_abi.h` is emitted from
+// `pie_ir::registry`, which is the only place a port tag is decided; hand-copied
+// copies of exactly this kind were how three wrong op tags reached the CUDA and
+// Metal emitters (ptir-refactor.md §3.2), and nothing would have caught a wrong
+// port tag here — a swapped pair silently fills the wrong geometry field.
+inline constexpr std::uint8_t kPortEmbedTokens = PTIR_PORT_EMBED_TOKENS;
+inline constexpr std::uint8_t kPortEmbedIndptr = PTIR_PORT_EMBED_INDPTR;
+inline constexpr std::uint8_t kPortPositions = PTIR_PORT_POSITIONS;
+inline constexpr std::uint8_t kPortPages = PTIR_PORT_PAGES;
+inline constexpr std::uint8_t kPortPageIndptr = PTIR_PORT_PAGE_INDPTR;
+inline constexpr std::uint8_t kPortKvLen = PTIR_PORT_KV_LEN;
+inline constexpr std::uint8_t kPortWSlot = PTIR_PORT_W_SLOT;
+inline constexpr std::uint8_t kPortWOff = PTIR_PORT_W_OFF;
+inline constexpr std::uint8_t kPortReadout = PTIR_PORT_READOUT;
+inline constexpr std::uint8_t kPortAttnMask = PTIR_PORT_ATTN_MASK;
 
 inline bool is_device_geometry_trace(const Trace& trace) {
     bool has_write_desc = false;
