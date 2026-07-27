@@ -758,7 +758,8 @@ void moe_layer(
             Lw.expert_down_packed != nullptr &&
             !nem_ws.flashinfer_moe_workspace.empty() &&
             !nem_ws.flashinfer_moe_map.empty()) {
-            const bool ran = ops::flashinfer_cutlass_moe_bf16_relu2(
+            const bool ran = ops::flashinfer_cutlass_moe_bf16(
+                ops::MoeActivation::Relu2,
                 static_cast<const std::uint16_t*>(ws.norm_x.data()),
                 nem_ws.topk_idx.data(),
                 nem_ws.topk_weights.data(),
@@ -1303,6 +1304,7 @@ NemotronHWorkspace NemotronHWorkspace::allocate(
     if (ops::flashinfer_cutlass_moe_enabled()) {
         ws.flashinfer_moe_workspace_bytes =
             ops::flashinfer_cutlass_moe_workspace_bytes(
+            ops::MoeActivation::Relu2,
                 static_cast<int>(N), static_cast<int>(H),
                 static_cast<int>(I), static_cast<int>(E),
                 static_cast<int>(K), T, 0);
@@ -1368,6 +1370,7 @@ std::size_t nemotron_h_workspace_bytes(
     bytes += routes * (6 * sizeof(void*) + sizeof(float));
     if (ops::flashinfer_cutlass_moe_enabled()) {
         bytes += ops::flashinfer_cutlass_moe_workspace_bytes(
+            ops::MoeActivation::Relu2,
             static_cast<int>(N), static_cast<int>(H), static_cast<int>(I),
             static_cast<int>(E), static_cast<int>(K), T, 0);
         bytes += i32(routes);

@@ -65,11 +65,23 @@ void launch_sigmoid_gate_inplace_bf16(
 // deinterleave that an unfused path would need.
 //
 //     y[n, i] = silu(packed[n, i]) * packed[n, I + i]
+// Swap the two I-sized halves of each expert's [E, 2*I, H] gate/up weight,
+// in place. Used once at bind time to move qwen3_5_moe's weights from the
+// HuggingFace [gate|up] order to the [linear|gate] order flashinfer's
+// CUTLASS MoE reads, so both MoE paths can share one copy of a tensor far
+// too large to duplicate.
+void launch_swap_gate_up_halves_bf16(
+    void* weights, int num_experts, int inter_size, int hidden,
+    cudaStream_t stream);
+
+// `gate_second` selects the [linear|gate] order flashinfer's CUTLASS MoE
+// requires; the default is HuggingFace's [gate|up].
 void launch_chunked_swiglu_bf16(
-    const void* packed,  // [N, 2*I] bf16 (gate first, up second)
+    const void* packed,  // [N, 2*I] bf16
     void*       y,       // [N, I]   bf16
     int N, int I,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    bool gate_second = false);
 
 void launch_chunked_swiglu_strided_bf16(
     const void* packed,  // [N, row_stride] bf16 (gate first, up second)

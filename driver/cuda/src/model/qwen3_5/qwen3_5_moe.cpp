@@ -1,4 +1,5 @@
 #include "model/qwen3_5/qwen3_5_moe.hpp"
+#include "kernels/swiglu.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -53,6 +54,11 @@ bool fused_gdn_projection_weights_enabled() {
 // Padding the fused weight up to a multiple of 8 would recover the saved
 // launch as well -- the swiglu and scalar-gate kernels already take the
 // row stride as an argument -- but is worth only ~0.3 ms more.
+bool env_on(const char* name) {
+    const char* v = std::getenv(name);
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+}
+
 bool fused_shared_scalar_gate_enabled() {
     static const bool enabled = [] {
         const char* v = std::getenv("PIE_QWEN35_FUSED_SHARED_SCALAR_GATE");
@@ -210,6 +216,11 @@ DeviceTensor concat_axis0_bf16(
 }
 
 }  // namespace
+
+bool qwen35_moe_gate_up_swapped() {
+    static const bool swapped = env_on("PIE_QWEN35_MOE_FLASHINFER");
+    return swapped;
+}
 
 Qwen3_5MoeWeights bind_qwen3_5_moe(const LoadedModel& engine) {
     const auto& cfg = engine.hf_config();
@@ -369,6 +380,18 @@ Qwen3_5MoeWeights bind_qwen3_5_moe(const LoadedModel& engine) {
         // combined routed+shared partial sum.
         Lw.moe_router       = &must(engine, lp + "mlp.gate.weight");
         Lw.moe_gate_up_proj = &must(engine, lp + "mlp.experts.gate_up_proj");
+        // flashinfer's CUTLASS MoE reads fc1's output as [linear|gate];
+        // HuggingFace stores [gate|up]. Reorder the resident weight once
+        // here rather than duplicating a tensor this large, and tell the
+        // swiglu kernels which order they are reading.
+        if (qwen35_moe_gate_up_swapped()) {
+            const auto& t = *Lw.moe_gate_up_proj;
+            const int inter = static_cast<int>(t.shape()[1]) / 2;
+            const int hid = static_cast<int>(t.shape()[2]);
+            kernels::launch_swap_gate_up_halves_bf16(
+                const_cast<void*>(t.data()),
+                static_cast<int>(t.shape()[0]), inter, hid, /*stream=*/nullptr);
+        }
         Lw.moe_down_proj    = &must(engine, lp + "mlp.experts.down_proj");
         if (has_shared_expert) {
             Lw.shared_gate_proj = &must(engine, lp + "mlp.shared_expert.gate_proj.weight");
