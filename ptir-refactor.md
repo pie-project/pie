@@ -426,9 +426,11 @@ everything looks exactly like the wiring working. So two further checks exist:
 
 ---
 
-## 4. What remains
+## 4. The phases
 
-Re-numbered from the earlier draft. The old phase 8 becomes **phase 0**: it has
+**All four have landed.** Kept as written, because the reasoning behind the
+ordering is the part worth reading; §4.2 and §4.3 record what each phase turned
+out to cost and what it found. Re-numbered from the earlier draft. The old phase 8 becomes **phase 0**: it has
 no dependency on anything, and doing it first removes a rename that would
 otherwise churn files phases 2′ and 3′ already touch. CUDA and Metal merge into
 one step, because faithfulness — not hardware — is the bar (see phase 2′).
@@ -438,7 +440,7 @@ one step, because faithfulness — not hardware — is the bar (see phase 2′).
 | **0** | `driver/common` → `driver/abi` + `driver/common/ptir` | 0 | mechanical — **landed** |
 | **1′** | Unify generated artifacts | −383 | freshness tests — **landed** |
 | **2′** | Delete both in-driver emitters | −15,290 | goldens, nvcc, `-fsyntax-only` — **landed** |
-| **3′** | Launch package: the plan stops crossing the boundary | −4,586 | GPU, plus one assertion |
+| **3′** | Launch package: the plan stops crossing the boundary | −4,586 | GPU, plus one assertion — **landed** |
 
 Landed as `95fff4238`, `088c2d10c`, `32c2a4a09`, `b42bf597c`: **−15,389 lines of
 driver C++ against +1,229**, plus the oracle harness. **There is no emitter left
@@ -662,7 +664,7 @@ existing derivation first, count divergence, and delete the derivation at zero.
 The `ModuleCacheStats` pattern already in the tree is the model, and Metal's
 `channel_effects()` (landed in 2′) is the first instance of the move.
 
-**Four of the seven are done.** The port→field *table itself* turned out to be a
+**All seven are done.** The port→field *table itself* turned out to be a
 constant, not per-program data — what varies is which channel each port binds
 to, and that already crosses the wire in `trace.ports`. So the fix was not to
 ship it but to stop writing it three times: the tags now derive from the
@@ -685,8 +687,37 @@ remaining three:
   appears on the engine path, and the way to find out was to truncate the host's
   table by one entry and watch the driver reject it.
 
-That leaves three that are genuinely per-program: buffer/scratch layout,
-region→launch mapping, and fire geometry.
+The remaining three — buffer/scratch layout, region→launch mapping, and fire
+geometry — landed together rather than one at a time, because they are not three
+independent fields. They are three views of one object: the *stage plan*. Once
+the host ships `PieLaunchStage` with its normalized op stream, its region
+partitions, and its channel bindings, the driver has no plan left to re-derive a
+layout from, so all three derivations become unreachable at once and the
+divergence-counter dance has nothing to compare. The method in §4 is for fields
+you can ship *beside* a surviving derivation; these three could only be shipped
+*instead of* one.
+
+Which is also the answer to a question the earlier drafts kept re-asking: why
+`canonical_bytes.len == 0` is the completion condition and not a line count.
+Deriving from the plan is the whole of what the driver did with PTIR. Take the
+plan away and the derivations are not deleted so much as *stranded* — there is
+nothing to write them against. That is a structural end state, not a cleanup
+milestone, and it is why the last three came off in one commit.
+
+One field was found on the way in, and it is the interesting one because it is
+the only place the launch package needed to carry something the plan does *not*
+literally contain: **channel readiness**. `PieLaunchStage` ships `takes`,
+`reads`, and `puts` as sets, and a gate derived from those sets is wrong for any
+channel that is both taken and put — the linear `take → put` of a counter, a
+beam cursor, a DFA state. The union demands the channel simultaneously full and
+empty, so the stage retries forever. The real rule is *first touch in pass
+order*, which a set has already thrown away. So the host computes it once
+(`pie_ir::validate::readiness_table`, walking `Phase::ORDER`) and ships the
+direction. CUDA had re-derived it too and survived only by accident: its
+`requires_channel_input` short-circuits on `has_seed`, and seeded is exactly how
+in-place channels are declared. The corpus settles what the direction is —
+`staged_dispatch` has a take-and-put channel that ships `NeedsEmpty`, because
+its first touch is the put. "Take wins" would have been wrong too.
 
 ### 4.3 The driver-side test surface (retarget, not delete)
 
@@ -695,85 +726,117 @@ suite, which is 9,385 lines and mostly needs *retargeting* — the tests exercis
 the launch path, and the launch path survives; what changes is the artifact they
 feed it.
 
-| file | lines | fate |
+| file | lines | outcome |
 |---|---|---|
-| `cuda/ptir_generated_singleton_test.cu` | 3,142 | **deleted in 2′** with its subject |
-| `cuda/ptir_grouped_dispatch_test.cpp` | 2,147 | includes `plan.hpp`; retarget in 3′ (also fails to compile on `dev`, §7.2) |
-| `cuda/ptir_tier0_test.cu` | 1,082 | retarget |
-| `cuda/ptir_golden_exec_test.cu` | 871 | retarget |
-| `cuda/ptir_runner_test.cu` | 409 | retarget |
-| `cuda/ptir_graph_key_test.cpp` | 290 | unaffected (§7.2) |
-| `cuda/ptir_tier1_test.cu` | 247 | retarget |
-| `cuda/ptir_container_test.cpp` | 134 | phase 3′ — delete |
-| `cuda/nucleus_region_test.cpp` | 99 | includes `plan.hpp`; retarget in 3′ |
-| `metal/ptir_checkpoint_e2e_test.cpp` | 783 | retarget |
-| `metal/ptir_m0_device_test.cpp` | 280 | retarget |
+| `cuda/ptir_generated_singleton_test.cu` | 3,142 | deleted in 2′ with its subject |
+| `cuda/ptir_grouped_dispatch_test.cpp` | 2,147 | retargeted; passes |
+| `cuda/ptir_tier0_test.cu` | 1,082 | retargeted; passes |
+| `cuda/ptir_golden_exec_test.cu` | 871 | retargeted; passes |
+| `cuda/ptir_runner_test.cu` | 409 | retargeted; passes |
+| `cuda/ptir_graph_key_test.cpp` | 290 | unaffected; passes |
+| `cuda/ptir_tier1_test.cu` | 247 | retargeted; passes |
+| `cuda/ptir_container_test.cpp` | 134 | deleted — its subject was the decoder |
+| `cuda/nucleus_region_test.cpp` | 99 | retargeted; passes |
+| `metal/ptir_checkpoint_e2e_test.cpp` | 783 | deleted (fixture format); see below |
+| `metal/pipeline_interp_test.cpp` | 349 | deleted (fixture format); **replaced** |
+| `metal/direct_stub_test.cpp` | 1,169 | deleted (fixture format) |
+| `metal/tests/support/ptib_v2_plan.hpp` | 423 | deleted — the hand-written sidecar builder all three used |
+| `metal/ptir_m0_device_test.cpp` | 280 | retargeted (needs a Mac to run) |
 
-`driver/cuda/tests/golden-ptir/` needs a decision too. It is a **vendored
-16-file subset of `compiler/tests/golden/`'s 19**, carrying raw container bytes,
-and its header comment still points at `interface/sampling-ir/` — a path that
-has not existed for two renames. Once the driver stops receiving containers
-these goldens must change form: either the driver's tests consume launch
-packages emitted by `pie-codegen` at build time, or they stop being golden tests
-and become plain fixtures. Either way the vendored copy should not survive as a
-second source of truth for traces.
+`driver/cuda/tests/golden-ptir/` was the second source of truth, and it is
+gone. Each of its 16 files carried a container plus the decoded plan, sidecar,
+readiness verdict, and class that a C++ decoder was supposed to reproduce —
+descriptions of a decoder that no longer exists. Only the `container:` section
+had a live reader. Those containers now live one hex line to a file in
+`compiler/tests/driver-corpus/`, a corpus and nothing else, and the fixtures the
+C++ tests actually register are *generated* from them by
+`emit_driver_test_kernel_fixtures`: the kernel table, the region analysis, and a
+relocatable image of the launch package itself. A fixture cannot drift from the
+compiler when the compiler writes it.
+
+The generated fixtures live at `driver/fixtures/` rather than under either
+driver. The launch image is a dump of `#[repr(C)]` ABI records, so it is
+backend-neutral by construction, and Metal's CMake states plainly that it does
+not reach into `driver/cuda/` for anything.
+
+Three Metal tests went with the fixture format they were written against:
+`pipeline_interp_test`, `ptir_checkpoint_e2e_test`, and `direct_stub_test`, all
+three of which hand-transcribed container + PTIB sidecar bytes into a decoder
+that phase 3′ deleted. The commit that removed them justified it partly on the
+grounds that retargeted Metal code could not be compiled here and unverifiable
+code is likelier to be wrong than absent.
+
+**That justification was false, and it is worth recording why.** Every non-MLX
+translation unit under `driver/metal/` — 31 of them — compiles on Linux with
+`g++ -fsyntax-only -std=c++20` under the include set CMake already declares.
+Only the 21 files that reach for `mlx/mlx.h` are genuinely unverifiable off a
+Mac. The assumption had never been tested; it was inherited. One of the three
+deleted tests was pure host and always ran.
+
+So the coverage was rebuilt, not mourned:
+`metal/tests/pipeline_launch_conformance_test.cpp` replays the same generated
+launch images the CUDA tests register and pins the properties a review had just
+found violated — that readiness is one direction per channel and that an
+in-place channel fires on *every* pass rather than only the first, that every
+shipped take is scheduled even when its result is dead, that `name_index`
+survives adoption, and that a program Metal rejects says why. It is pure host,
+links nothing, and always runs. Reverting the readiness gate to the union
+derivation makes it fail, which is the only evidence that a regression test is
+one.
 
 ---
 
 ## 5. End state
 
-"Hand-written PTIR C++" below means C++ that encodes PTIR knowledge, excluding
-generated headers. The full membership is listed so the arithmetic is auditable
-rather than asserted — an earlier draft's table did not close (14.5k − 1.7k is
-not 15.4k).
+"Hand-written PTIR C++" means C++ that encodes PTIR knowledge, excluding
+generated headers.
 
-| | Now | North star |
+| | Before | Now |
 |---|---|---|
-| Hand-written PTIR C++ | 21,154 | **3,289** |
-| Non-Rust inside `compiler/` | 4,910 | **3,827** (templates 3,444 + generated headers 383; all data) |
-| Device kernels | 20,360 | 20,360 (unchanged) |
-| Interpreters / emitters / decoders | 3 / 4 / 2 | **1 / 2 / 1** |
-| port→field copiers | 3 (Rust + C++ ×2) | **1** (Rust; the table ships as data) |
-| Deleted | — | **20,259** |
+| C++ that decodes PTIR | 1,823 (`container`/`trace`/`bound`/`plan`) | **0** |
+| C++ that emits kernels | 5,107 (cuda 3,667 + metal 1,440) | **0** |
+| Interpreters / emitters / decoders | 3 / 4 / 2 | **1 / 1 / 1** (all Rust, except Metal's M0 interpreter) |
+| port→field copiers | 3 (Rust + C++ ×2) | **1** (Rust; the tags derive from the generated header) |
+| `PieProgramDesc` PTIR bytes | `canonical_bytes` + `sidecar_bytes` | **neither field exists** |
 
-Check: 21,154 − 3,289 = 17,865 deleted from the set below, plus the duplicated
-generated artifacts (383), the oracle harness (1,083) and the duplicated Metal
-runtime template (928) = 20,259.
+The completion condition from §2.3 is met structurally rather than numerically:
+`PieProgramDesc` is now `abi_version`, `program_hash`, `emitter_version`,
+`emitted_kernels`, `region_analysis`, `launch`, and two reserved words. There is
+no byte slice to be zero-length, because there is no byte slice.
 
-<details><summary>The 21,154</summary>
+### What survives, and why it is not a failure to finish
 
-| file | lines | fate |
+| file | lines | what it is |
 |---|---|---|
-| `ptir/{container,trace,bound,plan}.hpp` | 1,823 | phase 3′ |
-| `ptir/op_table.hpp` | 179 | → `driver/abi` (see phase 1′) |
-| `ptir/{descriptor,fire_geometry}.hpp` | 602 | → `driver/abi` |
-| `ptir_channels.hpp` | 282 | → `driver/abi` |
-| `common/tests/ptir_decoder_limits_test.cpp` | 193 | phase 3′ |
-| cuda `{singleton,fused}_codegen.hpp` | 3,667 | phase 2′ — 488 lifted to `region_support.hpp` |
-| cuda `ptir_generated_singleton_test.cu` | 3,142 | phase 2′ |
-| cuda `module_cache.hpp` | 874 | survives |
-| cuda `descriptor_resolve.hpp` | 408 | survives |
-| cuda `host_eval.hpp` | 455 | phase 3′ |
-| cuda `tests/ptir_container_test.cpp` | 134 | phase 3′ |
-| metal `m1_codegen.{cpp,hpp}` | 1,440 | phase 2′ |
-| metal `m1_generated_test.cpp` | 5,518 | phase 2′ |
-| metal `interp.hpp` | 1,981 | phase 3′ |
-| metal `descriptor_resolve.hpp` | 456 | survives |
+| `cuda/generated/module_cache.hpp` | 957 | NVRTC compile + cubin cache. Never sees a program. |
+| `metal/pipeline/interp.hpp` | 1,689 | Metal's **M0 execution path**, live from `context.cpp` |
+| `metal/pipeline/descriptor_resolve.hpp` | 456 | program-agnostic port→field copier |
+| `cuda/pipeline/descriptor_resolve.hpp` | 408 | ditto |
+| `cuda/pipeline/region_support.hpp` | 301 | fire-time region plumbing (was 488; the three *analyses* are gone) |
+| `metal/pipeline/region_support.hpp` | 81 | ditto (was 456) |
+| `cuda/tests/support/host_eval.hpp` | 455 | differential oracle for the tier-0 CUDA kernels |
+| `driver/abi/include/pie_native/` | 3,028 | the launch package view — **shared, one copy** |
 
-</details>
+Two of these were booked as phase-3′ deletions in an earlier draft, and both
+bookings were wrong:
 
-The 3,289 that survive: `module_cache.hpp` (874, compile and cache),
-`region_support.hpp` (488, bind gates and the launch packer's analysis), the two
-`descriptor_resolve.hpp` copies (864, the program-agnostic port→field copiers),
-the 884 lines of fire-time PODs, and `op_table.hpp` (179, the driver's launch
-vocabulary). **None of them decode PTIR** — which is the property that matters,
-and the one the §2.3 assertion enforces.
+* `interp.hpp` is not a PTIR decoder. It is the interpreter Metal *executes*
+  with, reached from `context.cpp`; deleting it would delete Metal's M0 path.
+  It shrank from 1,981 to 1,689 by losing its decoder, which is the right
+  outcome for it.
+* `host_eval.hpp` mirrors the tier-0 CUDA kernels, not PTIR. It is the
+  independent implementation the differential tests check the kernels against.
+  Deleting it would delete the oracle.
 
-Not in the table because they are retargeted rather than deleted: the 9,385
-lines of driver PTIR tests (§4.3).
+The distinction the earlier draft missed is the one §2.3 actually enforces:
+**nothing here decodes PTIR.** `interp.hpp` and `host_eval.hpp` walk the launch
+package and the kernel semantics respectively. After this refactor the only
+thing in the repository that walks *PTIR* is `pie-eval`, in Rust, once.
+
+`driver/common/` no longer exists at all.
 
 **The one-line version:** three interpreters become one, four emitters become
-two, and the driver stops receiving the plan at all.
+one, and the driver stops receiving the plan at all.
 
 ---
 
@@ -790,52 +853,81 @@ here so the omission reads as a decision rather than an oversight.
 
 ---
 
-## 7. Pre-existing failures (do not attribute to this work)
+## 7. Pre-existing failures — all resolved
 
-### 7.1 Rust: 13 stale goldens
+This section was a list of things that were broken before the refactor started
+and should not be attributed to it. Every entry is now closed, and the causes
+are worth keeping because three of the four were misdiagnosed.
 
-`compiler/tests` `ptir_golden` is 8 passed / 13 failed. `interface/ptir/src/compiler.rs`
-changed in `800fe40b6`, `a352a17d2` and `0dea15405` but the golden `.txt` files
-were last blessed at `c1e148ef2`, so the embedded region-plan (`PTRP`) bytes are
-stale. Container bytes and hashes still match; only the plan section differs.
+### 7.1 The 13 stale goldens — re-blessed with attribution
 
-Reproduced on a pristine `origin/dev` worktree. **Do not re-bless them** — that
-would destroy the evidence that the planner changed.
+`ptir_golden` was 8 passed / 13 failed: the planner had changed in `800fe40b6`,
+`a352a17d2` and `0dea15405`, and the golden `.txt` files were last blessed at
+`c1e148ef2`. Container bytes and hashes matched; only the embedded `PTRP` plan
+section differed. Re-blessed in `c70b13bcc`, one at a time and with the
+attribution recorded, rather than by a blanket `PTIR_REGEN=1` — which would have
+destroyed the evidence that the planner changed at all.
 
-**This debt now blocks phase 3′.** `ptir_grouped_dispatch` registers
-`section3_masked_gumbel`, which is one of the 13. Its embedded `PTRP` bytes are
-stale, so the driver decodes no region plans and registration fails with "PTIR
-launch has no compiler region plans" — the test compiles and runs again (phase
-2′) but cannot pass until the goldens say something true.
+The vendored copies that made this look unfixable (the two directories were
+stale in opposite directions, so no edit satisfied both) no longer exist; see
+§4.3.
 
-Refreshing the drifted vendored copies from `compiler/tests/golden/` was tried
-and reverted: it fixes the drift and immediately breaks `ptir_golden_exec`,
-which passes today *because* it reads the older bytes. The two copies are stale
-in opposite directions, so there is no edit to `golden-ptir/` that satisfies
-both — only re-blessing the 13, which is the decision §7.1 is asking for. During the move, the panic
-payloads were diffed against the old suite's: 13/13 byte-identical over 217,921
-bytes, which is what proved the consolidation was behaviour-preserving.
+### 7.2 CUDA
 
-Someone still has to decide what these goldens should say. That decision belongs
-with whoever changed the planner.
+* `ptir_grouped_dispatch` / `_asan` did not compile. Retargeted; both pass. The
+  `_asan` variant was additionally `Not Run` for want of a link against
+  `pie_driver_cuda_lib` — a CMake target problem, not a code problem.
+* `ptir_generated_singleton` — illegal memory access. Deleted in 2′ with its
+  subject.
+* `ptir_graph_key` — passes.
 
-### 7.2 CUDA: 3 failures
+The real cause behind two of these was neither stale goldens nor drift:
+`ModuleCache::entry_name` derived `ptir_fused_<hex>_<region>` while
+`compiler/codegen/src/program.rs` wrote `ptir_fused_<hex>_r<region>`. NVRTC
+compiled happily and `cuModuleGetFunction` failed with `named symbol not found`.
+One convention, written by hand in two places, in two languages. Fixed by
+threading the `entry_name` the host already ships (`3d62383d0`); the derived
+name survives only as the disk-cache key for when there is no host.
 
-All reproduce on a pristine `origin/dev` worktree:
+### 7.3 The failure that was reporting nothing
 
-- `ptir_generated_singleton` — illegal memory access at `cuCtxSynchronize`
-- `ptir_grouped_dispatch` / `_asan` — do not compile;
-  `ptir_grouped_dispatch_test.cpp:1092,1144` call `Dispatch::enqueue_fixed_decode`
-  and `enqueue_decode_envelopes` with signatures that no longer exist
-- `ptir_graph_key` — 23/24 subcases pass; "capture exception guard restores a
-  reusable CUDA stream" fails
+`ptir_grouped_dispatch_test.cpp` had 28 call sites of the form
 
-### 7.3 Flaky
+```cpp
+expect(f(&error) == OK, "...: " + error);
+```
 
-`pie-engine --test contention`
-(`active_preemption_swaps_and_restores_an_over_capacity_fleet`) is timing- and
-preemption-sensitive and fails intermittently on a shared machine. Observed
-FAILED/ok/FAILED/ok across consecutive runs. Unrelated to PTIR.
+C++ function arguments are **unsequenced**, so the message was built from an
+`error` that had not been written yet. Every failure reported an empty reason.
+Fixed with a macro that sequences the condition first (`bd1e5ad19`). The pattern
+is not unique to that file and is worth grepping for.
+
+### 7.4 The counter that had never been fed
+
+`ProgramCache::IdentityStats::divergent` is the evidence that decides whether
+the driver's `program_identity.hpp` can be deleted — a wrong graph key does not
+fail, it silently replays another program's CUDA graph. Every C++ call site
+passed `PieU64Slice{}`, so the driver took its "host did not supply" branch and
+derived its own. **The comparison never ran, and never running reports zero
+exactly the way always agreeing does.** Fixed by shipping identities down the
+path the kernels already travel, and by exposing `identity_host_supplied` beside
+`identity_divergent` so the gate has to be read as a pair (`e50769003`).
+
+This is the same failure mode §4.2 describes for `region_divergent`, found
+independently. A divergence counter is only evidence if something proves the
+comparison happened.
+
+### 7.5 Flaky (environmental)
+
+On a shared host (load 20–40) these fail intermittently and pass in isolation:
+`contention::active_preemption_swaps_and_restores_an_over_capacity_fleet`,
+`pipeline_close_drains_the_already_submitted_run_ahead_tail`, and
+`scheduler::worker::leave_unblocks_a_wave_holding_for_a_missing_member`. All are
+timing- and preemption-sensitive. Unrelated to PTIR.
+
+`test_entry_validation` cannot link in this build tree
+(`PIE_LOADER_STATICLIB-NOTFOUND`). It compiles; the missing symbols are
+`pie_loader_*`. Environmental.
 
 ---
 
@@ -872,3 +964,45 @@ derivations, count divergence, delete at zero.
 The thing to hold onto is that the last phase's success condition is not a line
 count. It is that `canonical_bytes` and `sidecar_bytes` are empty, and therefore
 that no driver can decode PTIR even if someone wanted it to.
+
+---
+
+## 9. What the order turned out to be worth
+
+The plan held. Phase 0 and 1′ cost nothing and made everything after them
+cheaper, exactly as argued. 2′ merged as predicted, and the differential oracle
+did answer the faithfulness question for both backends on one Linux box.
+
+3′ is where the plan and the outcome part company, and in an instructive way.
+The prescription was: ship each field beside the driver's existing derivation,
+count divergence, delete at zero. That worked for the first four fields, and
+`region_analysis` is the clean worked example — including the discovery that a
+zero divergence count is worthless unless something proves the comparison ran
+(§7.4).
+
+It could not work for the last three. Buffer/scratch layout, region→launch
+mapping and fire geometry are not three fields; they are three views of the
+stage plan, and you cannot ship a stage plan *beside* a derivation that reads
+the stage plan. They had to come off together, and when they did the derivations
+were not so much deleted as stranded — there was no longer an input to write
+them against. That is what makes `canonical_bytes.len == 0` a structural
+condition rather than a cleanup target, and it is the reason the completion
+criterion was written that way in §2.3 before anyone knew this.
+
+Two things were learned that the plan had no way to anticipate:
+
+* **Some driver derivations are not re-derivations.** The working assumption in
+  §4.2 — that the host already computes everything the driver derives, because
+  the emitter needs the same answers — held for six of the seven fields. It
+  failed for channel readiness, which is a fact about *pass order* that the
+  effect sets the package already shipped had thrown away. A union of `takes`
+  and `puts` is not a conservative approximation of first-touch; it is an
+  unsatisfiable predicate. The host had it and was not shipping it.
+* **An assumption about the environment is still an assumption.** The Metal port
+  was written, reviewed, and partly deleted under the belief that it could not be
+  compiled without a Mac. It compiles: 31 of 52 translation units under
+  `driver/metal/` pass `-fsyntax-only` on Linux with the include set CMake
+  already declares, and only the 21 that reach for MLX do not. Three tests were
+  deleted citing unverifiability, one of which was pure host and always ran. The
+  coverage is rebuilt (§4.3) and the deletion of a decoder-era fixture format is
+  still correct — but the reason given for it was not.
