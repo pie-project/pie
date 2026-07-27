@@ -1,7 +1,7 @@
 # PTIR Refactor: `compiler/` — design, status, and remaining work
 
 Date: 2026-07-27
-Status: **phases 1–3 landed and verified; phases 0–3′ remaining (§4).**
+Status: **phases 0, 1′ and 2′ landed and verified; phase 3′ remaining.**
 Baseline: merge-base with `origin/dev` is `9bda961fb`. `origin/dev` has since
 advanced 28 commits, several of them in the launch path — re-merge before
 starting phase 3′, which is the phase that touches it.
@@ -437,14 +437,29 @@ one step, because faithfulness — not hardware — is the bar (see phase 2′).
 |---|---|---|---|
 | **0** | `driver/common` → `driver/abi` + `driver/common/ptir` | 0 | mechanical — **landed** |
 | **1′** | Unify generated artifacts | −383 | freshness tests — **landed** |
-| **2′** | Delete both in-driver emitters | −15,290 | goldens + `driver_sources == 0` |
+| **2′** | Delete both in-driver emitters | −15,290 | goldens, nvcc, `-fsyntax-only` — **landed** |
 | **3′** | Launch package: the plan stops crossing the boundary | −4,586 | GPU, plus one assertion |
 
-Total **−20,259**, of which 3,142 is `ptir_generated_singleton_test.cu` — the
-test of the emitter being deleted, which had already failed on `dev` since
-before this work started. The Δ column is measured after implementation, not
-projected; it does not count the driver-side test surface that needs
-*retargeting* rather than deletion (§4.3).
+Landed as `95fff4238`, `088c2d10c`, `32c2a4a09`, `b42bf597c`: **−15,389 lines of
+driver C++ against +1,229**, plus the oracle harness. **There is no emitter left
+in any driver.**
+
+Two things phase 2′ turned up that were not in the plan:
+
+- The host emitted only the *grouped* Metal readiness/commit kernels, while the
+  M1 and M2 launch paths bind the single-lane forms. Different buffer shapes —
+  it links and cannot run. `emit_program` now takes the bound trace, and
+  `channel_effects()` derives the per-program effect table the driver used to
+  build for itself. That is a phase 3′ move landed early: a decision the driver
+  was re-deriving now arrives as data.
+- `descriptor.hpp` and `trace.hpp` re-typed `PTIR_PORT_*` and `PTIR_STAGE_*` as
+  bare integers — the same bug class the oracle caught three times (§3.2), still
+  live. Fixed, and `drivers_do_not_retype_generated_tags` now gates it, because
+  the oracle that would have caught it is gone with the emitters.
+
+The Δ column is measured after implementation, not projected; it does not count
+the driver-side test surface that needs *retargeting* rather than deletion
+(§4.3).
 
 Old→new: 8→0, 4→1′, 5+6→2′, 7→3′.
 
@@ -644,7 +659,19 @@ currently books as permanent survivors.
 
 Sequence it the way §4's phase 3′ says: ship each field alongside the driver's
 existing derivation first, count divergence, and delete the derivation at zero.
-The `ModuleCacheStats` pattern already in the tree is the model.
+The `ModuleCacheStats` pattern already in the tree is the model, and Metal's
+`channel_effects()` (landed in 2′) is the first instance of the move.
+
+**Two of the seven are done.** The port→field *table itself* turned out to be a
+constant, not per-program data — what varies is which channel each port binds
+to, and that already crosses the wire in `trace.ports`. So the fix was not to
+ship it but to stop writing it three times: the tags now derive from the
+generated header and a test gates it. Per-op launch class is likewise a constant
+that `op_table.hpp` owns correctly; it only needs to move, not to be shipped.
+
+That leaves the five that are genuinely per-program: buffer/scratch layout,
+region→launch mapping, fire geometry, the bind-time region verdicts, and the
+intrinsic side-table analysis.
 
 ### 4.3 The driver-side test surface (retarget, not delete)
 
