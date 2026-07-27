@@ -50,6 +50,26 @@ _NO_GROUP = 2**31 - 1
 ACCEPT = -(2**31)
 SPARSE, COMPLEMENT, DENSE = 0, 1, 2
 
+# Where each grammar's run of an array starts, inside the shared arena. One
+# index per array whose elements a kernel addresses; arrays a grammar indexes
+# together share a base.
+_B_GROUP_OFFSETS = tl.constexpr(0)
+_B_GROUPS = tl.constexpr(1)
+_B_SET_PAYLOAD = tl.constexpr(2)
+_B_READING_OFFSETS = tl.constexpr(3)
+_B_READING_INDEX = tl.constexpr(4)
+_B_READINGS = tl.constexpr(5)
+_B_READING_TERM_OFFSETS = tl.constexpr(6)
+_B_READING_TERMINALS = tl.constexpr(7)
+_B_ACTION_OFFSETS = tl.constexpr(8)
+_B_ACTIONS = tl.constexpr(9)
+_B_GOTO_OFFSETS = tl.constexpr(10)
+_B_GOTOS = tl.constexpr(11)
+_B_PRODUCTIONS = tl.constexpr(12)
+_B_PENDING_OFFSETS = tl.constexpr(13)
+_B_PENDING_TERMINALS = tl.constexpr(14)
+_NBASES = tl.constexpr(15)
+
 _ACCEPT = tl.constexpr(ACCEPT)
 _SPARSE = tl.constexpr(SPARSE)
 _COMPLEMENT = tl.constexpr(COMPLEMENT)
@@ -372,6 +392,8 @@ def _mask_kernel(
     stack_ptr,
     stack_depth_ptr,
     work_offsets_ptr,
+    grammar_ptr,
+    bases_ptr,
     scratch_ptr,
     admitted_ptr,
     overflow_ptr,
@@ -425,25 +447,30 @@ def _mask_kernel(
         sequence = row_index // CONFIGS
         state = tl.load(lexer_state_ptr + row_index)
         depth = tl.load(stack_depth_ptr + row_index)
-        group = tl.load(group_offsets_ptr + state) + slot
+        # The sequence's grammar decides where in the arena every table starts.
+        # Rebasing the pointers rather than every index means the replay below
+        # is the same code it was when there was only one grammar.
+        at = bases_ptr + tl.load(grammar_ptr + sequence) * _NBASES
+        my_group_offsets = group_offsets_ptr + tl.load(at + _B_GROUP_OFFSETS)
+        group = tl.load(my_group_offsets + state) + slot
 
         admitted, reach = _replay_group(
-            group_offsets_ptr,
-            reading_offsets_ptr,
-            reading_index_ptr,
-            reading_next_state_ptr,
-            reading_term_offsets_ptr,
-            reading_terminals_ptr,
-            action_offsets_ptr,
-            action_terminals_ptr,
-            action_values_ptr,
-            goto_offsets_ptr,
-            goto_nonterminals_ptr,
-            goto_targets_ptr,
-            production_lhs_ptr,
-            production_arity_ptr,
-            pending_offsets_ptr,
-            pending_terminals_ptr,
+            my_group_offsets,
+            reading_offsets_ptr + tl.load(at + _B_READING_OFFSETS),
+            reading_index_ptr + tl.load(at + _B_READING_INDEX),
+            reading_next_state_ptr + tl.load(at + _B_READINGS),
+            reading_term_offsets_ptr + tl.load(at + _B_READING_TERM_OFFSETS),
+            reading_terminals_ptr + tl.load(at + _B_READING_TERMINALS),
+            action_offsets_ptr + tl.load(at + _B_ACTION_OFFSETS),
+            action_terminals_ptr + tl.load(at + _B_ACTIONS),
+            action_values_ptr + tl.load(at + _B_ACTIONS),
+            goto_offsets_ptr + tl.load(at + _B_GOTO_OFFSETS),
+            goto_nonterminals_ptr + tl.load(at + _B_GOTOS),
+            goto_targets_ptr + tl.load(at + _B_GOTOS),
+            production_lhs_ptr + tl.load(at + _B_PRODUCTIONS),
+            production_arity_ptr + tl.load(at + _B_PRODUCTIONS),
+            pending_offsets_ptr + tl.load(at + _B_PENDING_OFFSETS),
+            pending_terminals_ptr + tl.load(at + _B_PENDING_TERMINALS),
             stack_ptr,
             scratch_ptr,
             overflow_ptr,
@@ -476,6 +503,8 @@ def _count_kernel(
     config_count_ptr,
     widest_ptr,
     representative_ptr,
+    grammar_ptr,
+    bases_ptr,
     counts_ptr,
     CONFIGS: tl.constexpr,
     ROWS: tl.constexpr,
@@ -499,9 +528,11 @@ def _count_kernel(
     keep = keep & (
         tl.load(representative_ptr + sequence, mask=live, other=-1) == sequence
     )
+    grammar = tl.load(grammar_ptr + sequence, mask=live, other=0)
+    at = tl.load(bases_ptr + grammar * _NBASES + _B_GROUP_OFFSETS, mask=keep, other=0)
     state = tl.load(lexer_state_ptr + lane, mask=keep, other=0)
-    first = tl.load(group_offsets_ptr + state, mask=keep, other=0)
-    last = tl.load(group_offsets_ptr + state + 1, mask=keep, other=0)
+    first = tl.load(group_offsets_ptr + at + state, mask=keep, other=0)
+    last = tl.load(group_offsets_ptr + at + state + 1, mask=keep, other=0)
     tl.store(counts_ptr + lane, tl.where(keep, last - first, 0), mask=live)
 
 
@@ -514,6 +545,8 @@ def _scatter_kernel(
     set_payload_ptr,
     lexer_state_ptr,
     work_offsets_ptr,
+    grammar_ptr,
+    bases_ptr,
     admitted_ptr,
     mask_ptr,
     mask_words,
@@ -551,18 +584,21 @@ def _scatter_kernel(
             row_index = low
             sequence = row_index // CONFIGS
             state = tl.load(lexer_state_ptr + row_index)
+            at = bases_ptr + tl.load(grammar_ptr + sequence) * _NBASES
+            groups = tl.load(at + _B_GROUPS)
+            payload = set_payload_ptr + tl.load(at + _B_SET_PAYLOAD)
             group = (
-                tl.load(group_offsets_ptr + state)
+                tl.load(group_offsets_ptr + tl.load(at + _B_GROUP_OFFSETS) + state)
                 + item
                 - tl.load(work_offsets_ptr + row_index)
             )
-            kind = tl.load(group_set_kind_ptr + group)
+            kind = tl.load(group_set_kind_ptr + groups + group)
             wanted = kind == _COMPLEMENT
             if COMPLEMENTS_ONLY == 0:
                 wanted = kind != _COMPLEMENT
             if wanted:
-                offset = tl.load(group_set_offset_ptr + group)
-                length = tl.load(group_set_length_ptr + group)
+                offset = tl.load(group_set_offset_ptr + groups + group)
+                length = tl.load(group_set_length_ptr + groups + group)
                 row = mask_ptr + sequence * mask_words
                 if kind == _COMPLEMENT:
                     for start in range(0, mask_words, BLOCK):
@@ -574,9 +610,7 @@ def _scatter_kernel(
                     for start in range(0, length, BLOCK):
                         lane = start + tl.arange(0, BLOCK)
                         live = lane < length
-                        token = tl.load(
-                            set_payload_ptr + offset + lane, mask=live, other=0
-                        )
+                        token = tl.load(payload + offset + lane, mask=live, other=0)
                         tl.atomic_and(
                             row + token // 32,
                             (~(1 << (token % 32))).to(tl.int32),
@@ -586,9 +620,7 @@ def _scatter_kernel(
                     for start in range(0, length, BLOCK):
                         lane = start + tl.arange(0, BLOCK)
                         live = lane < length
-                        token = tl.load(
-                            set_payload_ptr + offset + lane, mask=live, other=0
-                        )
+                        token = tl.load(payload + offset + lane, mask=live, other=0)
                         tl.atomic_or(
                             row + token // 32,
                             (1 << (token % 32)).to(tl.int32),
@@ -598,9 +630,7 @@ def _scatter_kernel(
                     for start in range(0, mask_words, BLOCK):
                         lane = start + tl.arange(0, BLOCK)
                         live = lane < mask_words
-                        value = tl.load(
-                            set_payload_ptr + offset + lane, mask=live, other=0
-                        )
+                        value = tl.load(payload + offset + lane, mask=live, other=0)
                         tl.atomic_or(row + lane, value, mask=live)
         item = item + blocks
 
@@ -653,6 +683,8 @@ def _locate_kernel(
     config_count_ptr,
     widest_ptr,
     token_ptr,
+    grammar_ptr,
+    bases_ptr,
     found_ptr,
     BATCH: tl.constexpr,
     CONFIGS: tl.constexpr,
@@ -681,8 +713,12 @@ def _locate_kernel(
         return
     row_index = sequence * CONFIGS + config
     state = tl.load(lexer_state_ptr + row_index)
-    first = tl.load(group_offsets_ptr + state)
-    last = tl.load(group_offsets_ptr + state + 1)
+    at = bases_ptr + tl.load(grammar_ptr + sequence) * _NBASES
+    groups = tl.load(at + _B_GROUPS)
+    payload = set_payload_ptr + tl.load(at + _B_SET_PAYLOAD)
+    my_group_offsets = group_offsets_ptr + tl.load(at + _B_GROUP_OFFSETS)
+    first = tl.load(my_group_offsets + state)
+    last = tl.load(my_group_offsets + state + 1)
 
     # Find the group holding the token a block of groups at a time rather than
     # one per program. A state can have hundreds of groups and only one of them
@@ -695,21 +731,19 @@ def _locate_kernel(
     glane = tl.arange(0, GROUP_BLOCK)
     group = first + block * GROUP_BLOCK + glane
     live_lane = group < last
-    kind = tl.load(group_set_kind_ptr + group, mask=live_lane, other=0)
-    offset = tl.load(group_set_offset_ptr + group, mask=live_lane, other=0)
-    length = tl.load(group_set_length_ptr + group, mask=live_lane, other=1)
+    kind = tl.load(group_set_kind_ptr + groups + group, mask=live_lane, other=0)
+    offset = tl.load(group_set_offset_ptr + groups + group, mask=live_lane, other=0)
+    length = tl.load(group_set_length_ptr + groups + group, mask=live_lane, other=1)
 
     dense = kind == _DENSE
-    word = tl.load(
-        set_payload_ptr + offset + token // 32, mask=live_lane & dense, other=0
-    )
+    word = tl.load(payload + offset + token // 32, mask=live_lane & dense, other=0)
     in_dense = ((word >> (token % 32)) & 1) == 1
 
     # A sorted list's ends are its bounds, so most lanes are decided without a
     # search at all.
     listed = live_lane & (dense == 0)
-    low = tl.load(set_payload_ptr + offset, mask=listed, other=1)
-    high = tl.load(set_payload_ptr + offset + length - 1, mask=listed, other=0)
+    low = tl.load(payload + offset, mask=listed, other=1)
+    high = tl.load(payload + offset + length - 1, mask=listed, other=0)
     searching = listed & (token >= low) & (token <= high)
     # A plain halving. A lane that has found its answer stops being active
     # rather than having its bounds collapsed: writing `hi = lo` on a hit made
@@ -718,15 +752,15 @@ def _locate_kernel(
     # the block nothing it was not already paying.
     lo = offset
     hi = offset + length
-    at = tl.zeros((GROUP_BLOCK,), tl.int32) - 1
+    hit = tl.zeros((GROUP_BLOCK,), tl.int32) - 1
     for _ in range(0, SEARCH_STEPS):
-        active = searching & (lo < hi) & (at < 0)
+        active = searching & (lo < hi) & (hit < 0)
         middle = (lo + hi) // 2
-        value = tl.load(set_payload_ptr + middle, mask=active, other=0)
-        at = tl.where(active & (value == token), middle, at)
+        value = tl.load(payload + middle, mask=active, other=0)
+        hit = tl.where(active & (value == token), middle, hit)
         lo = tl.where(active & (value < token), middle + 1, lo)
         hi = tl.where(active & (value > token), middle, hi)
-    found = at >= 0
+    found = hit >= 0
     complement = kind == _COMPLEMENT
     inside = tl.where(
         dense, in_dense, tl.where(complement, found == 0, found)
@@ -758,6 +792,8 @@ def _candidate_kernel(
     stack_ptr,
     stack_depth_ptr,
     found_ptr,
+    grammar_ptr,
+    bases_ptr,
     scratch_ptr,
     cand_valid_ptr,
     cand_lexer_ptr,
@@ -804,19 +840,44 @@ def _candidate_kernel(
             depth = tl.load(stack_depth_ptr + row_index)
             base = row_index * STACK_STRIDE
             out_base = row_index * MAX_READINGS
-            use = tl.load(reading_offsets_ptr + group)
-            use_end = tl.load(reading_offsets_ptr + group + 1)
+            at = bases_ptr + tl.load(grammar_ptr + sequence) * _NBASES
+            reading_offsets = reading_offsets_ptr + tl.load(at + _B_READING_OFFSETS)
+            reading_index = reading_index_ptr + tl.load(at + _B_READING_INDEX)
+            reading_next_state = reading_next_state_ptr + tl.load(at + _B_READINGS)
+            reading_term_offsets = reading_term_offsets_ptr + tl.load(
+                at + _B_READING_TERM_OFFSETS
+            )
+            reading_terminals = reading_terminals_ptr + tl.load(
+                at + _B_READING_TERMINALS
+            )
+            action_offsets = action_offsets_ptr + tl.load(at + _B_ACTION_OFFSETS)
+            actions = tl.load(at + _B_ACTIONS)
+            action_terminals = action_terminals_ptr + actions
+            action_values = action_values_ptr + actions
+            goto_offsets = goto_offsets_ptr + tl.load(at + _B_GOTO_OFFSETS)
+            gotos = tl.load(at + _B_GOTOS)
+            goto_nonterminals = goto_nonterminals_ptr + gotos
+            goto_targets = goto_targets_ptr + gotos
+            productions = tl.load(at + _B_PRODUCTIONS)
+            production_lhs = production_lhs_ptr + productions
+            production_arity = production_arity_ptr + productions
+            pending_offsets = pending_offsets_ptr + tl.load(at + _B_PENDING_OFFSETS)
+            pending_terminals = pending_terminals_ptr + tl.load(
+                at + _B_PENDING_TERMINALS
+            )
+            use = tl.load(reading_offsets + group)
+            use_end = tl.load(reading_offsets + group + 1)
             index = 0
             while use < use_end and index < MAX_READINGS:
-                reading = tl.load(reading_index_ptr + use)
-                term = tl.load(reading_term_offsets_ptr + reading)
-                term_end = tl.load(reading_term_offsets_ptr + reading + 1)
+                reading = tl.load(reading_index + use)
+                term = tl.load(reading_term_offsets + reading)
+                term_end = tl.load(reading_term_offsets + reading + 1)
                 top = tl.load(stack_ptr + base + depth - 1)
                 alive = 1
                 copy_depth = depth
                 floor = depth
                 while term < term_end and alive == 1:
-                    terminal = tl.load(reading_terminals_ptr + term)
+                    terminal = tl.load(reading_terminals + term)
                     settled = 0
                     # Bounded, but not fixed. A reduction chain ends at the first
                     # shift, and on real documents that is two to four steps, while the
@@ -828,13 +889,13 @@ def _candidate_kernel(
                     while settled == 0 and alive == 1 and spins < MAX_REDUCTIONS:
                         spins = spins + 1
                         if settled == 0 and alive == 1:
-                            row = tl.load(action_offsets_ptr + top)
-                            row_end = tl.load(action_offsets_ptr + top + 1)
-                            entry = _search(action_terminals_ptr, row, row_end, terminal)
+                            row = tl.load(action_offsets + top)
+                            row_end = tl.load(action_offsets + top + 1)
+                            entry = _search(action_terminals, row, row_end, terminal)
                             if entry < 0:
                                 alive = 0
                             else:
-                                value = tl.load(action_values_ptr + entry)
+                                value = tl.load(action_values + entry)
                                 if value == _ACCEPT:
                                     alive = 0
                                 elif value > 0:
@@ -851,7 +912,7 @@ def _candidate_kernel(
                                         settled = 1
                                 else:
                                     production = -value - 1
-                                    arity = tl.load(production_arity_ptr + production)
+                                    arity = tl.load(production_arity + production)
                                     if copy_depth <= arity:
                                         alive = 0
                                     else:
@@ -864,11 +925,11 @@ def _candidate_kernel(
                                             floor,
                                             copy_depth - 1,
                                         )
-                                        lhs = tl.load(production_lhs_ptr + production)
-                                        grow = tl.load(goto_offsets_ptr + exposed)
-                                        grow_end = tl.load(goto_offsets_ptr + exposed + 1)
+                                        lhs = tl.load(production_lhs + production)
+                                        grow = tl.load(goto_offsets + exposed)
+                                        grow_end = tl.load(goto_offsets + exposed + 1)
                                         target = _search(
-                                            goto_nonterminals_ptr, grow, grow_end, lhs
+                                            goto_nonterminals, grow, grow_end, lhs
                                         )
                                         if target < 0:
                                             alive = 0
@@ -879,7 +940,7 @@ def _candidate_kernel(
                                             alive = 0
                                             tl.store(overflow_ptr + sequence, 1)
                                         else:
-                                            top = tl.load(goto_targets_ptr + target)
+                                            top = tl.load(goto_targets + target)
                                             tl.store(
                                                 scratch_ptr + scratch + copy_depth - floor, top
                                             )
@@ -888,14 +949,14 @@ def _candidate_kernel(
                         alive = 0
                     term = term + 1
 
-                next_state = tl.load(reading_next_state_ptr + reading)
+                next_state = tl.load(reading_next_state + reading)
                 if alive == 1:
-                    pend = tl.load(pending_offsets_ptr + next_state)
-                    pend_end = tl.load(pending_offsets_ptr + next_state + 1)
+                    pend = tl.load(pending_offsets + next_state)
+                    pend_end = tl.load(pending_offsets + next_state + 1)
                     if pend < pend_end:
                         any_ok = 0
                         while pend < pend_end and any_ok == 0:
-                            terminal = tl.load(pending_terminals_ptr + pend)
+                            terminal = tl.load(pending_terminals + pend)
                             probe_depth = copy_depth
                             probe_floor = copy_depth
                             probe_top = top
@@ -909,20 +970,20 @@ def _candidate_kernel(
                             ):
                                 probe_spins = probe_spins + 1
                                 if probe_settled == 0 and probe_alive == 1:
-                                    row = tl.load(action_offsets_ptr + probe_top)
-                                    row_end = tl.load(action_offsets_ptr + probe_top + 1)
-                                    entry = _search(action_terminals_ptr, row, row_end, terminal)
+                                    row = tl.load(action_offsets + probe_top)
+                                    row_end = tl.load(action_offsets + probe_top + 1)
+                                    entry = _search(action_terminals, row, row_end, terminal)
                                     if entry < 0:
                                         probe_alive = 0
                                     else:
-                                        value = tl.load(action_values_ptr + entry)
+                                        value = tl.load(action_values + entry)
                                         if value == _ACCEPT:
                                             probe_settled = 1
                                         elif value > 0:
                                             probe_settled = 1
                                         else:
                                             production = -value - 1
-                                            arity = tl.load(production_arity_ptr + production)
+                                            arity = tl.load(production_arity + production)
                                             if probe_depth <= arity:
                                                 probe_alive = 0
                                             else:
@@ -947,11 +1008,11 @@ def _candidate_kernel(
                                                 exposed = tl.where(
                                                     probe_depth - 1 >= probe_floor, held, under
                                                 )
-                                                lhs = tl.load(production_lhs_ptr + production)
-                                                grow = tl.load(goto_offsets_ptr + exposed)
-                                                grow_end = tl.load(goto_offsets_ptr + exposed + 1)
+                                                lhs = tl.load(production_lhs + production)
+                                                grow = tl.load(goto_offsets + exposed)
+                                                grow_end = tl.load(goto_offsets + exposed + 1)
                                                 target = _search(
-                                                    goto_nonterminals_ptr, grow, grow_end, lhs
+                                                    goto_nonterminals, grow, grow_end, lhs
                                                 )
                                                 if target < 0:
                                                     probe_alive = 0
@@ -962,7 +1023,7 @@ def _candidate_kernel(
                                                     probe_alive = 0
                                                     tl.store(overflow_ptr + sequence, 1)
                                                 else:
-                                                    probe_top = tl.load(goto_targets_ptr + target)
+                                                    probe_top = tl.load(goto_targets + target)
                                                     tl.store(
                                                         scratch_ptr
                                                         + probe
@@ -1146,6 +1207,7 @@ def _hash_kernel(
     stack_ptr,
     stack_depth_ptr,
     config_count_ptr,
+    grammar_ptr,
     hash_ptr,
     CONFIGS: tl.constexpr,
     STACK_STRIDE: tl.constexpr,
@@ -1162,6 +1224,10 @@ def _hash_kernel(
     sequence = tl.program_id(0)
     count = tl.load(config_count_ptr + sequence)
     digest = 2166136261
+    # The grammar is part of the state. Two sequences under different schemas
+    # can sit at the same parser state with the same stack and still admit
+    # different tokens, so sharing a mask between them would be wrong.
+    digest = (digest ^ tl.load(grammar_ptr + sequence)) * 16777619
     digest = (digest ^ count) * 16777619
     for config in range(0, CONFIGS):
         if config < count:
@@ -1185,6 +1251,7 @@ def _dedup_kernel(
     stack_ptr,
     stack_depth_ptr,
     config_count_ptr,
+    grammar_ptr,
     hash_ptr,
     representative_ptr,
     BATCH: tl.constexpr,
@@ -1200,11 +1267,14 @@ def _dedup_kernel(
     sequence = tl.program_id(0)
     mine = tl.load(hash_ptr + sequence)
     count = tl.load(config_count_ptr + sequence)
+    grammar = tl.load(grammar_ptr + sequence)
     found = sequence
     for other in range(0, BATCH):
         if other < sequence and found == sequence:
             if tl.load(hash_ptr + other) == mine:
-                if tl.load(config_count_ptr + other) == count:
+                if tl.load(config_count_ptr + other) == count and tl.load(
+                    grammar_ptr + other
+                ) == grammar:
                     same = 1
                     for config in range(0, CONFIGS):
                         if config < count:
@@ -1321,8 +1391,53 @@ def _nullable_chain(arrays: dict) -> int:
     return longest
 
 
+
+
+# Which base each uploaded array is addressed through.
+_ARENA = {
+    "group_offsets": _B_GROUP_OFFSETS,
+    "group_set_kind": _B_GROUPS,
+    "group_set_offset": _B_GROUPS,
+    "group_set_length": _B_GROUPS,
+    "set_payload": _B_SET_PAYLOAD,
+    "reading_offsets": _B_READING_OFFSETS,
+    "reading_index": _B_READING_INDEX,
+    "reading_next_state": _B_READINGS,
+    "reading_term_offsets": _B_READING_TERM_OFFSETS,
+    "reading_terminals": _B_READING_TERMINALS,
+    "action_offsets": _B_ACTION_OFFSETS,
+    "action_terminals": _B_ACTIONS,
+    "action_values": _B_ACTIONS,
+    "goto_offsets": _B_GOTO_OFFSETS,
+    "goto_nonterminals": _B_GOTOS,
+    "goto_targets": _B_GOTOS,
+    "production_lhs": _B_PRODUCTIONS,
+    "production_arity": _B_PRODUCTIONS,
+    "pending_offsets": _B_PENDING_OFFSETS,
+    "pending_terminals": _B_PENDING_TERMINALS,
+}
+
+# One base per array, but the CSR offset arrays carry a sentinel element, so
+# concatenating them shifts every following grammar by one. The base is
+# whatever the concatenation actually produced, computed rather than derived.
+_SIGNED = {"action_values"}
+
+
 class DeviceGrammar:
-    """A compiled grammar, resident on the GPU."""
+    """One or more compiled grammars, resident on the GPU as one arena.
+
+    A serving batch does not hold one grammar. Requests arrive with their own
+    schemas, so the sequences in a step are under different grammars, and a
+    design whose kernels are shaped by one grammar's tables cannot serve them.
+
+    The tables are therefore laid end to end and a sequence carries the index of
+    the grammar it is under. Every lookup a kernel makes is into a run that
+    starts at `bases[grammar, which array]`, so the arithmetic is one addition
+    and no branch; the replay itself does not know there is more than one
+    grammar. What has to be shared is the vocabulary, since the mask is a row
+    over it - which is what a serving engine has anyway.
+    """
+
     def __init__(
         self,
         compiled,
@@ -1331,57 +1446,35 @@ class DeviceGrammar:
         max_configs: int = 16,
         window: int | None = None,
     ):
-        arrays = compiled.device_arrays()
-        self.vocab_size = int(arrays["vocab_size"])
-        self.mask_words = int(arrays["bitset_words"])
-        self.start_parser_state = int(arrays["start_parser_state"])
-        offsets = np.frombuffer(arrays["group_offsets"], dtype=np.uint32)
-        self.max_groups_per_state = int(np.diff(offsets).max()) if offsets.size > 1 else 1
-        # Sixty-four was a guess and real documents reach ninety. A stack that
-        # overflows is not a slow parser, it is a wrong one: the replay is
-        # declared dead and the mask silently narrows. Every write is now
-        # bounds-checked and an overflow is recorded rather than absorbed, so
-        # the limit being too small is something that can be found out.
+        many = list(compiled) if isinstance(compiled, (list, tuple)) else [compiled]
+        self.count = len(many)
+        every = [item.device_arrays() for item in many]
+
+        self.vocab_size = int(every[0]["vocab_size"])
+        self.mask_words = int(every[0]["bitset_words"])
+        for arrays in every:
+            if int(arrays["vocab_size"]) != self.vocab_size:
+                raise ValueError("grammars in one batch must share a vocabulary")
+        self.start_parser_states = [int(a["start_parser_state"]) for a in every]
+        self.start_parser_state = self.start_parser_states[0]
+
+        # Ceilings are the maximum over the pool. They cost launch shape, not
+        # memory, now that the scratch is per block rather than per program.
         self.max_stack = max_stack
-        # How many reductions a single terminal may take before the parser is
-        # declared stuck. Sixteen was a guess, and it was wrong: a `}` closing
-        # a document nested thirty-seven deep needs more, and a reading that
-        # runs out is treated as dead, so the mask silently refused a token the
-        # reference matcher allowed. It took a corpus document 137 bytes long
-        # to reach; the earlier check stopped at 31.
-        #
-        # A settle is a shift. Every step before it either pops or replaces the
-        # top, so a chain longer than the stack can hold is not making progress
-        # towards one.
-        self.max_reductions = max_reductions if max_reductions is not None else max_stack
+        self.max_reductions = (
+            max_reductions if max_reductions is not None else max_stack
+        )
         self.max_configs = max_configs
-        readings = np.frombuffer(arrays["reading_offsets"], dtype=np.uint32)
-        # An advance keeps every reading that survives, not just the first, so
-        # the candidate buffers are sized by the widest group in the grammar.
-        self.max_readings = int(np.diff(readings).max()) if readings.size > 1 else 1
-        # How far a replay's stack pointer can travel above where it started.
-        #
-        # A replay used to copy the whole stack, which cost 1.7 GB of scratch at
-        # batch 512 and was almost entirely waste: it only ever reads the entry
-        # it has just exposed and writes the one above, so everything below its
-        # own first push is still the sequence's stack and can be read in place.
-        # What has to be private is the excursion, and that is bounded by the
-        # grammar rather than by the stack: per terminal the chain is
-        # `reduce* shift`, where an arity-0 reduce pushes without popping, an
-        # arity-1 reduce is net zero and an arity-2-or-more reduce takes the top
-        # back below where the replay began, emptying the window. So the bound
-        # is one per terminal in the reading, plus the longest run of arity-0
-        # reductions, and both are compile-time properties.
-        #
-        # Guessing this number is what shipped two bugs, so it is computed, and
-        # a replay that would exceed it raises the overflow flag rather than
-        # quietly narrowing the mask.
-        terms = np.frombuffer(arrays["reading_term_offsets"], dtype=np.uint32)
-        per_reading = int(np.diff(terms).max()) if terms.size > 1 else 1
-        chain = _nullable_chain(arrays)
-        self.max_reading_terms = per_reading
-        self.nullable_chain = chain
-        needed = per_reading * (1 + chain) + 2
+
+        def widest(arrays, name):
+            values = np.frombuffer(arrays[name], dtype=np.uint32)
+            return int(np.diff(values).max()) if values.size > 1 else 1
+
+        self.max_groups_per_state = max(widest(a, "group_offsets") for a in every)
+        self.max_readings = max(widest(a, "reading_offsets") for a in every)
+        self.max_reading_terms = max(widest(a, "reading_term_offsets") for a in every)
+        self.nullable_chain = max(_nullable_chain(a) for a in every)
+        needed = self.max_reading_terms * (1 + self.nullable_chain) + 2
         # Capped at the stack: a window that large is no worse than the copy it
         # replaces, and the overflow flag makes a grammar that genuinely needs
         # more visible rather than silently mis-masked.
@@ -1389,73 +1482,40 @@ class DeviceGrammar:
             max_stack, 1 << max(3, int(np.ceil(np.log2(max(needed, 2)))))
         )
         self.window_bound = needed
-        lengths = np.frombuffer(arrays["group_set_length"], dtype=np.uint32)
-        longest = int(lengths.max()) if lengths.size else 1
+
+        longest = 1
+        for arrays in every:
+            lengths = np.frombuffer(arrays["group_set_length"], dtype=np.uint32)
+            if lengths.size:
+                longest = max(longest, int(lengths.max()))
         # The lanes of a block search in lockstep, so the loop runs a fixed
-        # number of times and every lane must have finished by it. A scalar
-        # search over `n` needs ceil(log2(n)) steps, but a masked one is not
-        # a clean halving - a lane that has already found its answer still
-        # carries its bounds through the remaining iterations - and a bound
-        # tight enough for the scalar case left five schemas disagreeing with
-        # the reference matcher. The margin is cheap: the extra iterations are
-        # masked off for every lane that has finished.
-        # Lanes search in lockstep, so the loop runs a fixed number of times
-        # and every lane must have finished by then. A halving over `n` needs
-        # ceil(log2(n)) steps; the margin covers the ends being inclusive.
+        # number of times and every lane must have finished by it. A halving
+        # over `n` needs ceil(log2(n)) steps; the margin covers the ends being
+        # inclusive, and a bound tight enough for the scalar case left five
+        # schemas disagreeing with the reference matcher.
         self.search_steps = max(2, int(np.ceil(np.log2(longest + 2))) + 2)
 
-        def upload(name: str, dtype=torch.int32) -> torch.Tensor:
-            return torch.frombuffer(bytearray(arrays[name]), dtype=dtype).cuda()
-
-        for name in (
-            "group_offsets",
-            "reading_index",
-            "group_set_kind",
-            "group_set_offset",
-            "group_set_length",
-            "set_payload",
-            "reading_offsets",
-            "reading_next_state",
-            "reading_term_offsets",
-            "reading_terminals",
-            "action_offsets",
-            "action_terminals",
-            "action_values",
-            "goto_offsets",
-            "goto_nonterminals",
-            "goto_targets",
-            "production_lhs",
-            "production_arity",
-            "pending_offsets",
-            "pending_terminals",
-        ):
-            setattr(self, name, upload(name))
+        bases = np.zeros((self.count, int(_NBASES.value)), dtype=np.int32)
+        for name, slot in _ARENA.items():
+            dtype = np.int32 if name in _SIGNED else np.uint32
+            runs = [np.frombuffer(arrays[name], dtype=dtype) for arrays in every]
+            at = 0
+            for index, run in enumerate(runs):
+                bases[index, int(slot.value)] = at
+                at += run.size
+            joined = np.concatenate(runs) if runs else np.zeros(1, dtype=dtype)
+            setattr(
+                self,
+                name,
+                torch.from_numpy(joined.astype(np.int32).copy()).cuda(),
+            )
+        self.bases = torch.from_numpy(bases.reshape(-1).copy()).cuda()
+        self._resident = sum(
+            getattr(self, name).numel() * 4 for name in _ARENA
+        ) + self.bases.numel() * 4
 
     def resident_bytes(self) -> int:
-        return sum(
-            getattr(self, name).numel() * 4
-            for name in (
-                "group_offsets",
-                "group_set_kind",
-                "group_set_offset",
-                "group_set_length",
-                "set_payload",
-                "reading_offsets",
-                "reading_next_state",
-                "reading_term_offsets",
-                "reading_terminals",
-                "action_offsets",
-                "action_terminals",
-                "action_values",
-                "goto_offsets",
-                "goto_nonterminals",
-                "goto_targets",
-                "production_lhs",
-                "production_arity",
-                "pending_offsets",
-                "pending_terminals",
-            )
-        )
+        return self._resident
 
     def new_batch(self, batch: int) -> "DeviceBatch":
         return DeviceBatch(self, batch)
@@ -1509,6 +1569,9 @@ class DeviceBatch:
         self.width_host = torch.ones(1, dtype=torch.int32).pin_memory()
         self.state_hash = torch.zeros(batch, dtype=torch.int32, device="cuda")
         self.representative = torch.arange(batch, dtype=torch.int32, device="cuda")
+        # Which grammar each sequence is under. A serving batch mixes them, and
+        # everything else in the step reads this to find its tables.
+        self.grammar_of = torch.zeros(batch, dtype=torch.int32, device="cuda")
         self.pending_width = 1
         self.token = torch.zeros(batch, dtype=torch.int32, device="cuda")
         rows = batch * self.configs
@@ -1561,6 +1624,32 @@ class DeviceBatch:
             dtype=torch.int32,
             device="cuda",
         )
+
+    def set_grammars(self, ids) -> None:
+        """Say which grammar each sequence is under, and reset it to that start.
+
+        A serving batch is heterogeneous by default - requests bring their own
+        schemas - so this is the ordinary case rather than a special one. The
+        step's shape does not change with the mixture: the tables are one arena,
+        the work list is built from whatever the sequences are, and the grid is
+        fixed, so the same CUDA graph covers any assignment.
+        """
+        values = torch.as_tensor(ids, dtype=torch.int32).reshape(-1)
+        if values.numel() != self.batch:
+            raise ValueError(
+                f"{values.numel()} grammar ids for a batch of {self.batch}"
+            )
+        if int(values.max()) >= self.grammar.count:
+            raise ValueError("grammar id past the end of the pool")
+        self.grammar_of.copy_(values.cuda())
+        starts = torch.tensor(
+            self.grammar.start_parser_states, dtype=torch.int32
+        )[values.long()]
+        rows = self.stack.reshape(self.batch, self.configs, -1)
+        rows[:, :, 0] = starts.reshape(self.batch, 1).cuda()
+        self.depth.fill_(1)
+        self.config_count.fill_(1)
+        self.lexer_state.zero_()
 
     def set_configurations(
         self, sequence: int, configurations: list[tuple[int, list[int]]]
@@ -1662,6 +1751,8 @@ class DeviceBatch:
             self.config_count,
             self.widest,
             self.token,
+            self.grammar_of,
+            grammar.bases,
             self.found,
             BATCH=self.batch,
             CONFIGS=self.configs,
@@ -1689,6 +1780,8 @@ class DeviceBatch:
             self.stack,
             self.depth,
             self.found,
+            self.grammar_of,
+            grammar.bases,
             self.advance_scratch,
             self.cand_valid,
             self.cand_lexer,
@@ -1819,6 +1912,7 @@ class DeviceBatch:
             self.stack,
             self.depth,
             self.config_count,
+            self.grammar_of,
             self.state_hash,
             CONFIGS=self.configs,
             STACK_STRIDE=grammar.max_stack,
@@ -1829,6 +1923,7 @@ class DeviceBatch:
             self.stack,
             self.depth,
             self.config_count,
+            self.grammar_of,
             self.state_hash,
             self.representative,
             BATCH=self.batch,
@@ -1843,6 +1938,8 @@ class DeviceBatch:
             self.config_count,
             self.widest,
             self.representative,
+            self.grammar_of,
+            grammar.bases,
             self.counts,
             CONFIGS=self.configs,
             ROWS=rows,
@@ -1877,6 +1974,8 @@ class DeviceBatch:
             self.stack,
             self.depth,
             self.work_offsets,
+            self.grammar_of,
+            grammar.bases,
             self.scratch,
             self.admitted,
             self.overflow,
@@ -1897,6 +1996,8 @@ class DeviceBatch:
                 grammar.set_payload,
                 self.lexer_state,
                 self.work_offsets,
+                self.grammar_of,
+                grammar.bases,
                 self.admitted,
                 self.mask,
                 grammar.mask_words,
