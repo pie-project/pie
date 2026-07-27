@@ -30,7 +30,6 @@
 
 #include "pie_native/launch_view.hpp"
 #include "loader/load_plan.hpp"
-#include "pie_native/ptir_channels.hpp"
 #include "pipeline/interp.hpp"
 #include "pipeline/descriptor_resolve.hpp"
 #include "pipeline/registry.hpp"
