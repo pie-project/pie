@@ -215,6 +215,10 @@ const DeviceTensor& must(const LoadedModel& e, const std::string& name) {
     return e.get(name);
 }
 
+const DeviceTensor* optional_tensor(const LoadedModel& e, const std::string& name) {
+    return e.has(name) ? &e.get(name) : nullptr;
+}
+
 float read_bf16_scalar_once(const DeviceTensor& t) {
     if (t.empty()) return 1.f;
     std::uint16_t bits = 0;
@@ -318,59 +322,6 @@ int gemma4_plan_debug_limit() {
         return std::max(0, std::atoi(v));
     }();
     return limit;
-}
-
-DeviceTensor make_gate_up_fused_weight(const DeviceTensor& gate,
-                                       const DeviceTensor& up)
-{
-    if (gate.dtype() != DType::BF16 || up.dtype() != DType::BF16 ||
-        gate.shape().size() != 2 || up.shape().size() != 2 ||
-        gate.shape()[0] != up.shape()[0] ||
-        gate.shape()[1] != up.shape()[1]) {
-        throw std::runtime_error(
-            "gemma4: cannot fuse gate/up projections with mismatched shapes");
-    }
-    const std::int64_t I = gate.shape()[0];
-    const std::int64_t H = gate.shape()[1];
-    DeviceTensor fused = DeviceTensor::allocate(DType::BF16, {2 * I, H});
-    const std::size_t bytes =
-        static_cast<std::size_t>(I) * static_cast<std::size_t>(H) *
-        sizeof(std::uint16_t);
-    auto* dst = static_cast<std::uint8_t*>(fused.data());
-    CUDA_CHECK(cudaMemcpy(dst, gate.data(), bytes, cudaMemcpyDeviceToDevice));
-    CUDA_CHECK(cudaMemcpy(dst + bytes, up.data(), bytes, cudaMemcpyDeviceToDevice));
-    return fused;
-}
-
-DeviceTensor make_qkv_fused_weight(const DeviceTensor& q,
-                                   const DeviceTensor& k,
-                                   const DeviceTensor& v)
-{
-    if (q.dtype() != DType::BF16 || k.dtype() != DType::BF16 ||
-        v.dtype() != DType::BF16 || q.shape().size() != 2 ||
-        k.shape().size() != 2 || v.shape().size() != 2 ||
-        q.shape()[1] != k.shape()[1] || q.shape()[1] != v.shape()[1] ||
-        k.shape()[0] != v.shape()[0]) {
-        throw std::runtime_error(
-            "gemma4: cannot fuse q/k/v projections with mismatched shapes");
-    }
-    const std::int64_t Hq = q.shape()[0];
-    const std::int64_t Hk = k.shape()[0];
-    const std::int64_t H = q.shape()[1];
-    DeviceTensor fused = DeviceTensor::allocate(DType::BF16, {Hq + 2 * Hk, H});
-    const std::size_t q_bytes =
-        static_cast<std::size_t>(Hq) * static_cast<std::size_t>(H) *
-        sizeof(std::uint16_t);
-    const std::size_t kv_bytes =
-        static_cast<std::size_t>(Hk) * static_cast<std::size_t>(H) *
-        sizeof(std::uint16_t);
-    auto* dst = static_cast<std::uint8_t*>(fused.data());
-    CUDA_CHECK(cudaMemcpy(dst, q.data(), q_bytes, cudaMemcpyDeviceToDevice));
-    CUDA_CHECK(cudaMemcpy(dst + q_bytes, k.data(), kv_bytes,
-                          cudaMemcpyDeviceToDevice));
-    CUDA_CHECK(cudaMemcpy(dst + q_bytes + kv_bytes, v.data(), kv_bytes,
-                          cudaMemcpyDeviceToDevice));
-    return fused;
 }
 
 bool prepare_row_decode_kv_table(
@@ -820,14 +771,6 @@ Gemma4Weights bind_gemma4(const LoadedModel& engine) {
     const bool fuse_dense_gate_up = gemma4_dense_gate_up_fused_enabled(cfg);
     const bool fuse_dense_qkv =
         !cfg.gemma4_enable_moe && gemma4_dense_qkv_fused_enabled();
-    if (fuse_dense_gate_up) {
-        w.owned_gate_up_fused.reserve(
-            static_cast<std::size_t>(cfg.num_hidden_layers));
-    }
-    if (fuse_dense_qkv) {
-        w.owned_qkv_fused.reserve(
-            static_cast<std::size_t>(cfg.num_hidden_layers));
-    }
     const std::string p = kPrefix;
     w.embed           = &must(engine, p + "embed_tokens.weight");
     // PLE (Per-Layer Embeddings) machinery is optional — Gemma-4 E2B /
@@ -994,11 +937,14 @@ Gemma4Weights bind_gemma4(const LoadedModel& engine) {
             Lw.k_norm = &engine.get(lp + "self_attn.k_norm.weight");
         }
         Lw.o_proj = &must(engine, lp + "self_attn.o_proj.weight");
+        // The contract publishes the fused bank and views of it under the
+        // original names, so binding q/k/v above is unaffected by whether the
+        // join happened. A shared layer reads its K/V from another layer and
+        // must not run a fused QKV gemm, so it declines the bank.
         if (fuse_dense_qkv && !is_shared && !Lw.use_k_as_v &&
             Lw.k_proj != nullptr && Lw.v_proj != nullptr) {
-            w.owned_qkv_fused.push_back(
-                make_qkv_fused_weight(*Lw.q_proj, *Lw.k_proj, *Lw.v_proj));
-            Lw.qkv_proj_fused = &w.owned_qkv_fused.back();
+            Lw.qkv_proj_fused =
+                optional_tensor(engine, lp + "self_attn.qkv_proj.fused.weight");
         }
 
         // MLP (intermediate may be 2× when use_double_wide_mlp + shared).
@@ -1008,9 +954,8 @@ Gemma4Weights bind_gemma4(const LoadedModel& engine) {
         Lw.intermediate = static_cast<int>(Lw.gate_proj->shape()[0]);
         w.per_layer_intermediate[i] = Lw.intermediate;
         if (fuse_dense_gate_up) {
-            w.owned_gate_up_fused.push_back(
-                make_gate_up_fused_weight(*Lw.gate_proj, *Lw.up_proj));
-            Lw.gate_up_proj_fused = &w.owned_gate_up_fused.back();
+            Lw.gate_up_proj_fused =
+                optional_tensor(engine, lp + "mlp.gate_up_proj.fused.weight");
         }
 
         // PLE per-layer triple. HF names match `per_layer_input_gate`,

@@ -428,6 +428,15 @@ public:
         return std::string(source_prefix_) + std::string(bound_name);
     }
 
+    /// Where the decoder's layers are named, up to the layer index.
+    ///
+    /// Only the fused-projection pass needs it, and only because it goes
+    /// looking for specific names instead of walking `tensors()`. Matching on
+    /// the `.self_attn.q_proj.weight` suffix alone would be prefix-free but
+    /// wrong: Gemma-4's vision and audio towers have projections of that name
+    /// too, and fusing one would consume weights its bind path still reads.
+    void decoder_layer_prefix(std::string_view prefix) { decoder_layer_prefix_ = prefix; }
+
     /// Tensor-parallel shard-axis strategy, keyed by tensor name. Defaults to
     /// the HF convention; a family whose checkpoint names the same operator
     /// differently (DeepSeek-V4's native `.ffn.experts.w*`) registers its own.
@@ -802,7 +811,8 @@ public:
         std::uint64_t qkv_bytes = 0;
         std::uint64_t gate_up_bytes = 0;
         for (std::uint32_t layer = 0; layer < facts_.num_hidden_layers; ++layer) {
-            const std::string p = "model.layers." + std::to_string(layer) + ".";
+            const std::string p =
+                std::string(decoder_layer_prefix_) + std::to_string(layer) + ".";
             const std::string s = source_name(p);
             if (auto candidate = fused_join_candidate(
                     p + "self_attn.qkv_proj.fused.weight",
@@ -1012,6 +1022,7 @@ private:
 
     std::string_view source_prefix_;
     ShardAxis (*shard_axis_fn_)(std::string_view) = hf_shard_axis;
+    std::string_view decoder_layer_prefix_ = "model.layers.";
     bool shard_embed_tokens_ = false;
     bool replicate_lm_head_ = false;
     bool allow_bf16_rq_ = false;

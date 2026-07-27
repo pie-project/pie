@@ -15,6 +15,9 @@ namespace pie_cuda_driver::model {
 /// gemma4, gemma4_text.
 inline void author_gemma4_contract(ContractBuilder& b) {
     b.allow_encode_scope();
+    // The decoder is nested; the vision and audio towers are not, and they
+    // have `self_attn.q_proj.weight` of their own.
+    b.decoder_layer_prefix("model.language_model.layers.");
     author_dense_contract(b);
 }
 
