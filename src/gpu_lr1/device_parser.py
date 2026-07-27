@@ -29,6 +29,7 @@ pure function of the grammar and the vocabulary.
 from __future__ import annotations
 
 import argparse
+import bisect
 import json
 from pathlib import Path
 
@@ -1492,43 +1493,67 @@ def _run_rise(arrays: dict, cap: int = 48) -> tuple[dict[int, int], set[int]]:
     maximum over all of them. A terminal whose run is still growing when the cap
     is reached is reported as growing, and its run is then charged its length.
     """
-    action_offsets = np.frombuffer(arrays["action_offsets"], dtype=np.uint32)
-    action_terminals = np.frombuffer(arrays["action_terminals"], dtype=np.uint32)
-    action_values = np.frombuffer(arrays["action_values"], dtype=np.int32)
-    goto_offsets = np.frombuffer(arrays["goto_offsets"], dtype=np.uint32)
-    goto_nonterminals = np.frombuffer(arrays["goto_nonterminals"], dtype=np.uint32)
-    goto_targets = np.frombuffer(arrays["goto_targets"], dtype=np.uint32)
-    production_lhs = np.frombuffer(arrays["production_lhs"], dtype=np.uint32)
-    production_arity = np.frombuffer(arrays["production_arity"], dtype=np.uint32)
+    # Python lists and `bisect`, not numpy views. Every lookup here is a single
+    # scalar search, and a numpy call costs about a microsecond of interpreter
+    # before it does any work - which at tens of thousands of table entries was
+    # half a second of grammar construction.
+    action_offsets = np.frombuffer(arrays["action_offsets"], dtype=np.uint32).tolist()
+    action_terminals = np.frombuffer(
+        arrays["action_terminals"], dtype=np.uint32
+    ).tolist()
+    action_values = np.frombuffer(arrays["action_values"], dtype=np.int32).tolist()
+    goto_offsets = np.frombuffer(arrays["goto_offsets"], dtype=np.uint32).tolist()
+    goto_nonterminals = np.frombuffer(
+        arrays["goto_nonterminals"], dtype=np.uint32
+    ).tolist()
+    goto_targets = np.frombuffer(arrays["goto_targets"], dtype=np.uint32).tolist()
+    production_lhs = np.frombuffer(arrays["production_lhs"], dtype=np.uint32).tolist()
+    production_arity = np.frombuffer(
+        arrays["production_arity"], dtype=np.uint32
+    ).tolist()
 
     def action(state: int, terminal: int) -> int | None:
-        low, high = int(action_offsets[state]), int(action_offsets[state + 1])
-        row = action_terminals[low:high]
-        at = int(np.searchsorted(row, terminal))
-        if at >= row.size or row[at] != terminal:
+        low, high = action_offsets[state], action_offsets[state + 1]
+        at = bisect.bisect_left(action_terminals, terminal, low, high)
+        if at >= high or action_terminals[at] != terminal:
             return None
-        return int(action_values[low + at])
+        return action_values[at]
 
     def goto(state: int, nonterminal: int) -> int | None:
-        low, high = int(goto_offsets[state]), int(goto_offsets[state + 1])
-        row = goto_nonterminals[low:high]
-        at = int(np.searchsorted(row, nonterminal))
-        if at >= row.size or row[at] != nonterminal:
+        low, high = goto_offsets[state], goto_offsets[state + 1]
+        at = bisect.bisect_left(goto_nonterminals, nonterminal, low, high)
+        if at >= high or goto_nonterminals[at] != nonterminal:
             return None
-        return int(goto_targets[low + at])
+        return goto_targets[at]
 
     rise: dict[int, int] = {}
     growing: set[int] = set()
-    for state in range(action_offsets.size - 1):
-        low, high = int(action_offsets[state]), int(action_offsets[state + 1])
+    for state in range(len(action_offsets) - 1):
+        low, high = action_offsets[state], action_offsets[state + 1]
         for entry in range(low, high):
-            terminal = int(action_terminals[entry])
+            value = action_values[entry]
+            # A reduction that pops anything ends the segment on its first move,
+            # so it can only ever contribute nothing. Most entries are one.
+            if value < 0 and value != ACCEPT:
+                if production_arity[-value - 1] > 0:
+                    continue
+            terminal = action_terminals[entry]
             window: list[int] = []
             best = 0
             alive = True
             step = 0
+            # Where the trajectory has been, as (top, depth). Repeating one at
+            # the same depth means it is going round without growing, which is
+            # the ordinary case once repetitions are left-recursive - and there
+            # is nothing further to learn from spinning the cap out.
+            seen: set[tuple[int, int]] = set()
             while alive and step < cap:
                 step += 1
+                mark = (window[-1] if window else state, len(window))
+                if mark in seen:
+                    alive = False
+                    break
+                seen.add(mark)
                 settled = False
                 spins = 0
                 while not settled and alive and spins < cap:
@@ -1542,7 +1567,7 @@ def _run_rise(arrays: dict, cap: int = 48) -> tuple[dict[int, int], set[int]]:
                         settled = True
                     else:
                         production = -value - 1
-                        arity = int(production_arity[production])
+                        arity = production_arity[production]
                         if arity > len(window):
                             # Past the floor: the exposed state is the
                             # sequence's, not ours, and the segment ends.
@@ -1551,7 +1576,7 @@ def _run_rise(arrays: dict, cap: int = 48) -> tuple[dict[int, int], set[int]]:
                             for _ in range(arity):
                                 window.pop()
                             exposed = window[-1] if window else state
-                            target = goto(exposed, int(production_lhs[production]))
+                            target = goto(exposed, production_lhs[production])
                             if target is None:
                                 alive = False
                             else:
@@ -1592,11 +1617,20 @@ def _window_bound(arrays: dict, nullable: int) -> int:
     lengths = np.diff(np.append(at, terminals.size))
     heads = terminals[at]
 
+    # A table indexed by terminal, not a comprehension over runs: a wide
+    # grammar has a hundred thousand runs and only a few hundred terminals.
     default = max(rise.values()) if rise else 1
-    per_run = np.array(
-        [rise.get(int(term), default) for term in heads], dtype=np.int64
-    )
-    grows = np.array([int(term) in growing for term in heads], dtype=bool)
+    width = int(terminals.max()) + 1
+    rise_of = np.full(width, default, dtype=np.int64)
+    for terminal, value in rise.items():
+        if terminal < width:
+            rise_of[terminal] = value
+    grows_of = np.zeros(width, dtype=bool)
+    for terminal in growing:
+        if terminal < width:
+            grows_of[terminal] = True
+    per_run = rise_of[heads]
+    grows = grows_of[heads]
     # A run of `k` copies cannot push more than `k` shifts and their nullable
     # reductions, whatever the saturated figure says: charging a run of one the
     # rise a run of fifty reaches is what left one schema at 202 for an
@@ -1642,15 +1676,21 @@ def _nullable_chain(arrays: dict) -> int:
         return 0
 
     states = np.searchsorted(action_offsets, entries, side="right") - 1
+    # Lists and `bisect` again: one scalar search per entry, and a numpy call
+    # costs more interpreter than the search costs work.
+    lhs_of = production_lhs[production].tolist()
+    terminal_of = action_terminals.tolist()
+    goto_low = goto_offsets.tolist()
+    nonterminals = goto_nonterminals.tolist()
+    targets = goto_targets.tolist()
     step: dict[tuple[int, int], int] = {}
     for entry, state in zip(entries.tolist(), states.tolist()):
-        lhs = int(production_lhs[production[entry]])
-        low, high = int(goto_offsets[state]), int(goto_offsets[state + 1])
-        row = goto_nonterminals[low:high]
-        at = np.searchsorted(row, lhs)
-        if at >= row.size or row[at] != lhs:
+        lhs = lhs_of[entry]
+        low, high = goto_low[state], goto_low[state + 1]
+        at = bisect.bisect_left(nonterminals, lhs, low, high)
+        if at >= high or nonterminals[at] != lhs:
             continue
-        step[(int(action_terminals[entry]), state)] = int(goto_targets[low + at])
+        step[(terminal_of[entry], state)] = targets[at]
 
     longest = 0
     settled: dict[tuple[int, int], int] = {}
