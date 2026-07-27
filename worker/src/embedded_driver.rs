@@ -547,7 +547,11 @@ pub(crate) fn create_driver_backend(
             let config_path = toml_path.to_string_lossy();
             let (backend, _facts) =
                 pie_engine::driver::DriverBackend::cuda_create(config_path.as_bytes())?;
-            (backend, opts.runtime_quant.as_str(), opts.mxfp4_moe.as_str())
+            (
+                backend,
+                opts.runtime_quant.as_str(),
+                opts.mxfp4_moe.as_str(),
+            )
         }
         #[cfg(feature = "driver-metal")]
         DriverOptions::Metal(opts) => {

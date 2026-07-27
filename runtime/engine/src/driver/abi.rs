@@ -5,10 +5,10 @@
 
 use pie_driver_abi::{
     PIE_DRIVER_ABI_VERSION, PieBytes, PieChannelDesc, PieChannelValueDesc,
-    PieChannelValueDescSlice, PieEncodeDesc, PieInstanceDesc, PieKvCopyDesc, PieKvMoveCellSlice,
-    PieMaskWordsDesc, PieMutBytes, PiePoolRangeSlice, PiePoolResizeDesc, PieProgramDesc,
-    PieStateCopyDesc, PieStateCopyRangeSlice, PieTerminalCellPtrSlice, PieU8Slice, PieU32MutSlice,
-    PieU32Slice, PieU64Slice,
+    PieChannelValueDescSlice, PieEmittedKernelSlice, PieEncodeDesc, PieInstanceDesc, PieKvCopyDesc,
+    PieKvMoveCellSlice, PieMaskWordsDesc, PieMutBytes, PiePoolRangeSlice, PiePoolResizeDesc,
+    PieProgramDesc, PieStateCopyDesc, PieStateCopyRangeSlice, PieTerminalCellPtrSlice, PieU8Slice,
+    PieU32MutSlice, PieU32Slice, PieU64Slice,
 };
 
 use super::command::{
@@ -124,6 +124,12 @@ impl<'a> ProgramDescBorrow<'a> {
                 program_hash: program.program_hash,
                 canonical_bytes: bytes_slice(&program.canonical_bytes),
                 sidecar_bytes: bytes_slice(&program.sidecar_bytes),
+                // Host code generation is not wired in yet: the native drivers
+                // still emit their own kernels. When it is, this is where the
+                // `compiler/codegen` output is attached.
+                emitter_version: 0,
+                reserved1: 0,
+                emitted_kernels: PieEmittedKernelSlice::default(),
             },
         }
     }

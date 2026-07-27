@@ -139,14 +139,30 @@ fn rust_layout_matches_committed_header_contract() {
         snapshot_dir => 32
     );
     assert_layout!(
+        PieEmittedKernel,
+        64,
+        8,
+        kind => 0,
+        stage_index => 4,
+        region_index => 8,
+        reserved0 => 12,
+        entry_name => 16,
+        source => 32,
+        error => 48
+    );
+    assert_layout!(PieEmittedKernelSlice, 16, 8, ptr => 0, len => 8);
+    assert_layout!(
         PieProgramDesc,
-        48,
+        72,
         8,
         abi_version => 0,
         reserved0 => 4,
         program_hash => 8,
         canonical_bytes => 16,
-        sidecar_bytes => 32
+        sidecar_bytes => 32,
+        emitter_version => 48,
+        reserved1 => 52,
+        emitted_kernels => 56
     );
     assert_layout!(
         PieInstanceDesc,

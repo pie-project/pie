@@ -25,7 +25,7 @@ use crate::geometry::GeometryClass;
 /// hoisted out of the per-step sections. Admission is folded into the launch
 /// call itself ([`PIE_STATUS_EXHAUSTED`] / [`PIE_STATUS_IMPOSSIBLE`]); the
 /// v12 prepare/lease surface and the v13 `settle_defer` lever are deleted.
-pub const PIE_DRIVER_ABI_VERSION: u32 = 14;
+pub const PIE_DRIVER_ABI_VERSION: u32 = 15;
 pub const PIE_MODEL_COMPONENT_FULL: u32 = 0;
 pub const PIE_MODEL_COMPONENT_TEXT: u32 = 1;
 pub const PIE_MODEL_COMPONENT_ENCODE: u32 = 2;
@@ -466,6 +466,66 @@ impl Default for PieModelLoadDesc {
     }
 }
 
+/// What an emitted kernel is for. The driver switches on this to decide which
+/// launch path a compiled entry belongs to, so it never has to re-derive from
+/// the plan what the host already decided.
+pub const PIE_KERNEL_SINGLETON: u32 = 0;
+pub const PIE_KERNEL_FUSED: u32 = 1;
+pub const PIE_KERNEL_GROUPED: u32 = 2;
+pub const PIE_KERNEL_READINESS: u32 = 3;
+pub const PIE_KERNEL_COMMIT: u32 = 4;
+
+/// One host-emitted kernel: the backend source, its entry point, and where it
+/// belongs in the program.
+///
+/// The host runs the code generator (`compiler/codegen`) and ships the result;
+/// the driver compiles and launches it. `source.len == 0` means the host could
+/// not emit this kernel, and `error` says why — that is not fatal by itself,
+/// because a driver may have a slower path for the same region (a fused region
+/// that exceeds a channel-binding limit falls back to one launch per op). A
+/// driver MUST NOT treat a missing kernel as a reason to re-derive the source
+/// itself; the whole point is that only one implementation exists.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PieEmittedKernel {
+    /// `PIE_KERNEL_*`.
+    pub kind: u32,
+    /// Stage index in container order.
+    pub stage_index: u32,
+    /// Region index within the stage's partition for this `kind`.
+    pub region_index: u32,
+    /// Reserved; must be zero.
+    pub reserved0: u32,
+    /// Entry-point symbol, a C identifier. Empty when `source` is empty.
+    pub entry_name: PieBytes,
+    /// Backend source (CUDA C or MSL). Empty when emission failed.
+    pub source: PieBytes,
+    /// Why emission failed, when `source` is empty. Empty otherwise.
+    pub error: PieBytes,
+}
+
+impl Default for PieEmittedKernel {
+    fn default() -> Self {
+        Self {
+            kind: PIE_KERNEL_SINGLETON,
+            stage_index: 0,
+            region_index: 0,
+            reserved0: 0,
+            entry_name: PieBytes::default(),
+            source: PieBytes::default(),
+            error: PieBytes::default(),
+        }
+    }
+}
+
+/// Borrowed view of a host-emitted kernel table.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PieEmittedKernelSlice {
+    pub ptr: *const PieEmittedKernel,
+    pub len: usize,
+}
+
 /// Static program registration descriptor.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -477,6 +537,17 @@ pub struct PieProgramDesc {
     pub program_hash: u64,
     pub canonical_bytes: PieBytes,
     pub sidecar_bytes: PieBytes,
+    /// Kernels the host generated for this program, in the driver's own
+    /// backend. Empty for a driver that has no code generation (the dummy
+    /// driver interprets, and the native drivers ignore the table for stages
+    /// they run on a prebuilt path).
+    ///
+    /// The emitter version the host built these with, so a driver's compile
+    /// cache keys on it: a bump must miss, not silently reuse a stale cubin.
+    pub emitter_version: u32,
+    /// Reserved; must be zero.
+    pub reserved1: u32,
+    pub emitted_kernels: PieEmittedKernelSlice,
 }
 
 impl Default for PieProgramDesc {
@@ -487,6 +558,9 @@ impl Default for PieProgramDesc {
             program_hash: 0,
             canonical_bytes: PieBytes::default(),
             sidecar_bytes: PieBytes::default(),
+            emitter_version: 0,
+            reserved1: 0,
+            emitted_kernels: PieEmittedKernelSlice::default(),
         }
     }
 }
@@ -1394,7 +1468,10 @@ pub unsafe fn validate_step_desc(desc: &PieStepDesc, roster_len: usize) -> PieAb
         desc.sub_batch_indptr,
         "step sub_batch_indptr ptr/len mismatch",
     )?;
-    validate_u32_slice(desc.sub_batch_class, "step sub_batch_class ptr/len mismatch")?;
+    validate_u32_slice(
+        desc.sub_batch_class,
+        "step sub_batch_class ptr/len mismatch",
+    )?;
     unsafe {
         validate_csr(
             desc.sub_batch_indptr,
@@ -1846,10 +1923,7 @@ pub unsafe fn validate_frame_desc(desc: &PieFrameDesc) -> PieAbiValidationResult
     validate_reserved_zero("frame reserved0 must be zero", desc.reserved0)?;
     validate_reserved_zero("frame reserved1 must be zero", desc.reserved1)?;
     validate_u64_slice(desc.instance_ids, "frame instance_ids ptr/len mismatch")?;
-    validate_u32_slice(
-        desc.kv_translation,
-        "frame kv_translation ptr/len mismatch",
-    )?;
+    validate_u32_slice(desc.kv_translation, "frame kv_translation ptr/len mismatch")?;
     validate_u32_slice(
         desc.kv_translation_indptr,
         "frame kv_translation_indptr ptr/len mismatch",
@@ -2903,10 +2977,7 @@ mod tests {
     #[test]
     fn frame_validator_rejects_missing_steps_dup_roster_and_translation_csr() {
         let step = PieStepDesc::default();
-        let steps = PieStepDescSlice {
-            ptr: &step,
-            len: 1,
-        };
+        let steps = PieStepDescSlice { ptr: &step, len: 1 };
 
         let empty = PieFrameDesc::default();
         let err = unsafe { validate_frame_desc(&empty) }.unwrap_err();

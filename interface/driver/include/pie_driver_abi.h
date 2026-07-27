@@ -59,7 +59,7 @@
  * call itself ([`PIE_STATUS_EXHAUSTED`] / [`PIE_STATUS_IMPOSSIBLE`]); the
  * v12 prepare/lease surface and the v13 `settle_defer` lever are deleted.
  */
-#define PIE_DRIVER_ABI_VERSION 14
+#define PIE_DRIVER_ABI_VERSION 15
 
 #define PIE_MODEL_COMPONENT_FULL 0
 
@@ -197,6 +197,21 @@
 
 #define PIE_ELASTIC_POOL_WORKSPACE 2
 
+/**
+ * What an emitted kernel is for. The driver switches on this to decide which
+ * launch path a compiled entry belongs to, so it never has to re-derive from
+ * the plan what the host already decided.
+ */
+#define PIE_KERNEL_SINGLETON 0
+
+#define PIE_KERNEL_FUSED 1
+
+#define PIE_KERNEL_GROUPED 2
+
+#define PIE_KERNEL_READINESS 3
+
+#define PIE_KERNEL_COMMIT 4
+
 #define CHANNEL_TICKET_NONE UINT64_MAX
 
 #define RS_FLAG_RESET 1
@@ -298,6 +313,57 @@ typedef struct PieModelLoadDesc {
 } PieModelLoadDesc;
 
 /**
+ * One host-emitted kernel: the backend source, its entry point, and where it
+ * belongs in the program.
+ *
+ * The host runs the code generator (`compiler/codegen`) and ships the result;
+ * the driver compiles and launches it. `source.len == 0` means the host could
+ * not emit this kernel, and `error` says why — that is not fatal by itself,
+ * because a driver may have a slower path for the same region (a fused region
+ * that exceeds a channel-binding limit falls back to one launch per op). A
+ * driver MUST NOT treat a missing kernel as a reason to re-derive the source
+ * itself; the whole point is that only one implementation exists.
+ */
+typedef struct PieEmittedKernel {
+  /**
+   * `PIE_KERNEL_*`.
+   */
+  uint32_t kind;
+  /**
+   * Stage index in container order.
+   */
+  uint32_t stage_index;
+  /**
+   * Region index within the stage's partition for this `kind`.
+   */
+  uint32_t region_index;
+  /**
+   * Reserved; must be zero.
+   */
+  uint32_t reserved0;
+  /**
+   * Entry-point symbol, a C identifier. Empty when `source` is empty.
+   */
+  struct PieBytes entry_name;
+  /**
+   * Backend source (CUDA C or MSL). Empty when emission failed.
+   */
+  struct PieBytes source;
+  /**
+   * Why emission failed, when `source` is empty. Empty otherwise.
+   */
+  struct PieBytes error;
+} PieEmittedKernel;
+
+/**
+ * Borrowed view of a host-emitted kernel table.
+ */
+typedef struct PieEmittedKernelSlice {
+  const struct PieEmittedKernel *ptr;
+  size_t len;
+} PieEmittedKernelSlice;
+
+/**
  * Static program registration descriptor.
  */
 typedef struct PieProgramDesc {
@@ -312,6 +378,21 @@ typedef struct PieProgramDesc {
   uint64_t program_hash;
   struct PieBytes canonical_bytes;
   struct PieBytes sidecar_bytes;
+  /**
+   * Kernels the host generated for this program, in the driver's own
+   * backend. Empty for a driver that has no code generation (the dummy
+   * driver interprets, and the native drivers ignore the table for stages
+   * they run on a prebuilt path).
+   *
+   * The emitter version the host built these with, so a driver's compile
+   * cache keys on it: a bump must miss, not silently reuse a stale cubin.
+   */
+  uint32_t emitter_version;
+  /**
+   * Reserved; must be zero.
+   */
+  uint32_t reserved1;
+  struct PieEmittedKernelSlice emitted_kernels;
 } PieProgramDesc;
 
 /**
