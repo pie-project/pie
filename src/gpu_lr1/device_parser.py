@@ -2367,6 +2367,18 @@ class DeviceBatch:
         # to be sixteen only because some documents reach it.
         #
 
+    def warmup(self) -> None:
+        """Compile the kernels now rather than during a decode step.
+
+        Triton compiles on first use, and first use would otherwise be inside a
+        step - a serving engine sees that as a latency spike of tens of
+        milliseconds on one token. Nothing here depends on the state, so it can
+        be run against whatever the batch currently holds.
+        """
+        self._fill()
+        self._advance()
+        torch.cuda.synchronize()
+
     def problems(self) -> tuple[torch.Tensor, torch.Tensor]:
         """`(terminated, overflow)`, on the device, one entry per sequence.
 
