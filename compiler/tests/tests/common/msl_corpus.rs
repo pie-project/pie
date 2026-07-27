@@ -267,31 +267,7 @@ pub fn corpus_stages() -> Vec<CorpusStage> {
     stages
 }
 
-/// The corpus file the C++ oracle reads. One `plan:` line per stage.
-pub fn render_corpus(stages: &[CorpusStage]) -> String {
-    let mut out = String::new();
-    out.push_str(
-        "# GENERATED — bless with `PTIR_REGEN=1 cargo test -p pie-compiler-tests --test metal_msl_golden`.\n",
-    );
-    out.push_str("# Stage plans (PTRP wire form) for every golden that binds, in corpus order.\n");
-    out.push_str(
-        "# Transitional: the input side of the C++ emitter oracle. See oracle/README.md.\n",
-    );
-    for stage in stages {
-        out.push_str(&format!(
-            "plan: id={} golden={} stage_index={} stage_tag={} bytes={}\n",
-            stage.id(),
-            stage.golden,
-            stage.stage_index,
-            stage.stage_tag,
-            hex(&stage.wire),
-        ));
-    }
-    out
-}
-
-/// The op tag byte at `node`, the way the C++ oracle reads
-/// `stage.ops[node].op.tag`.
+/// The op tag byte at `node` — `stage.ops[node].op.tag`.
 pub fn op_tag(stage: &CompiledStage, node: u32) -> u8 {
     pie_codegen::metal::OpView::of(&stage.normalized.ops[node as usize]).tag
 }
