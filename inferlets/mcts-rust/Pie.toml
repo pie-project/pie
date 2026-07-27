@@ -16,4 +16,7 @@ branch_factor = {type = "int", optional = true, description = "Children proposed
 rollout_tokens = {type = "int", optional = true, description = "Max tokens for a rollout continuation (default 128)"}
 final_tokens = {type = "int", optional = true, description = "Max tokens for the final synthesized answer (default 256)"}
 exploration_constant = {type = "float", optional = true, description = "UCB1 exploration constant c (default 1.414)"}
+candidate_attempts = {type = "int", optional = true, description = "Maximum agent-action attempts per expansion before it is skipped (default 3)"}
+early_stop_score = {type = "float", optional = true, description = "Optional score threshold for adaptive early stopping; omit for fixed-budget runs"}
+min_iterations = {type = "int", optional = true, description = "Minimum completed simulations before adaptive early stopping (default 1)"}
 show_trace = {type = "bool", optional = true, description = "Include the best reasoning path and MCTS summary in the output (default true)"}
