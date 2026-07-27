@@ -105,6 +105,14 @@ pub struct ProgramRegistration {
     /// driver's compile-cache key, so a bump must miss rather than reuse.
     #[serde(default)]
     pub emitter_version: u32,
+    /// Each stage's graph-cache identity, in plan order
+    /// (`pie_plan::stage_identity`).
+    ///
+    /// The first field of the launch package: a decision the CUDA driver
+    /// currently re-derives from the plan. Empty means "not supplied", so a
+    /// driver that receives nothing keeps deriving.
+    #[serde(default)]
+    pub stage_identities: Vec<u64>,
 }
 
 /// One host-emitted kernel. The owned counterpart of

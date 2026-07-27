@@ -160,12 +160,24 @@ impl DriverBackend {
         // Attach host-generated kernels, if this driver reads them and the
         // program is still in the cache. Generation is memoised per program per
         // backend, so a re-registration costs a lookup.
+        // The stage identities go to every driver, not just the ones that read
+        // host-emitted kernels: they are plan analysis, not code generation.
+        let registered = crate::pipeline::program::lookup(desc.program_hash);
+        let stage_identities = if desc.stage_identities.is_empty() {
+            registered
+                .as_ref()
+                .map(|program| program.stage_identities())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let owned;
         let desc = match self
             .codegen_backend()
             .filter(|_| desc.emitted_kernels.is_empty())
             .and_then(|backend| {
-                crate::pipeline::program::lookup(desc.program_hash)
+                registered
+                    .as_ref()
                     .and_then(|program| program.emitted(backend))
             }) {
             Some(emitted) => {
@@ -183,6 +195,14 @@ impl DriverBackend {
                             error: kernel.error.clone(),
                         })
                         .collect(),
+                    stage_identities,
+                    ..desc.clone()
+                };
+                &owned
+            }
+            None if !stage_identities.is_empty() => {
+                owned = ProgramRegistration {
+                    stage_identities,
                     ..desc.clone()
                 };
                 &owned

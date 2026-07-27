@@ -101,6 +101,20 @@ pub struct EmittedProgram {
 }
 
 impl RegisteredProgram {
+    /// Each stage's graph-cache identity, in plan order.
+    ///
+    /// The CUDA driver derives exactly this from the decoded plan
+    /// (`program_identity.hpp`). Shipping it is the first field of the launch
+    /// package: while both exist the driver compares and counts divergence,
+    /// which is what makes deleting its copy an evidenced step rather than a
+    /// leap (`ptir-refactor.md` §4.2).
+    pub fn stage_identities(&self) -> Vec<u64> {
+        self.compiled_stages
+            .iter()
+            .map(pie_plan::stage_identity)
+            .collect()
+    }
+
     /// Backend source for this program, generated on first ask and cached.
     ///
     /// `backend` is what the driver advertised in

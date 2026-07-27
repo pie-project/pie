@@ -59,7 +59,7 @@
  * call itself ([`PIE_STATUS_EXHAUSTED`] / [`PIE_STATUS_IMPOSSIBLE`]); the
  * v12 prepare/lease surface and the v13 `settle_defer` lever are deleted.
  */
-#define PIE_DRIVER_ABI_VERSION 15
+#define PIE_DRIVER_ABI_VERSION 16
 
 #define PIE_MODEL_COMPONENT_FULL 0
 
@@ -364,6 +364,16 @@ typedef struct PieEmittedKernelSlice {
 } PieEmittedKernelSlice;
 
 /**
+ * Borrowed immutable `u64` slice.
+ *
+ * `ptr` may be null only when `len == 0`.
+ */
+typedef struct PieU64Slice {
+  const uint64_t *ptr;
+  size_t len;
+} PieU64Slice;
+
+/**
  * Static program registration descriptor.
  */
 typedef struct PieProgramDesc {
@@ -393,6 +403,18 @@ typedef struct PieProgramDesc {
    */
   uint32_t reserved1;
   struct PieEmittedKernelSlice emitted_kernels;
+  /**
+   * The graph-cache identity of each stage, in plan order — the first field
+   * of the launch package proper (`ptir-refactor.md` §2.3).
+   *
+   * The CUDA driver derives exactly this from the decoded plan today. While
+   * both exist it compares the two and counts divergence; the host's value
+   * is authoritative once that counter has stayed at zero, which is what
+   * turns deleting the driver's copy into an evidenced step.
+   *
+   * Empty means "not supplied" — a driver must keep deriving.
+   */
+  struct PieU64Slice stage_identities;
 } PieProgramDesc;
 
 /**
@@ -461,16 +483,6 @@ typedef struct PieChannelEndpointBinding {
   uint32_t poison_word_index;
   uint32_t closed_word_index;
 } PieChannelEndpointBinding;
-
-/**
- * Borrowed immutable `u64` slice.
- *
- * `ptr` may be null only when `len == 0`.
- */
-typedef struct PieU64Slice {
-  const uint64_t *ptr;
-  size_t len;
-} PieU64Slice;
 
 /**
  * One channel-value payload used for PTIR seeds and host puts.

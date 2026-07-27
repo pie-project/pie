@@ -165,6 +165,7 @@ class Dispatch {
                          pie_native::ByteSlice canonical,
                          pie_native::ByteSlice sidecar,
                          PieEmittedKernelSlice emitted,
+                         PieU64Slice stage_identities,
                          std::string* err);
 
     int register_channel(const PieChannelDesc& channel,

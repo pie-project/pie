@@ -25,7 +25,7 @@ use crate::geometry::GeometryClass;
 /// hoisted out of the per-step sections. Admission is folded into the launch
 /// call itself ([`PIE_STATUS_EXHAUSTED`] / [`PIE_STATUS_IMPOSSIBLE`]); the
 /// v12 prepare/lease surface and the v13 `settle_defer` lever are deleted.
-pub const PIE_DRIVER_ABI_VERSION: u32 = 15;
+pub const PIE_DRIVER_ABI_VERSION: u32 = 16;
 pub const PIE_MODEL_COMPONENT_FULL: u32 = 0;
 pub const PIE_MODEL_COMPONENT_TEXT: u32 = 1;
 pub const PIE_MODEL_COMPONENT_ENCODE: u32 = 2;
@@ -548,6 +548,16 @@ pub struct PieProgramDesc {
     /// Reserved; must be zero.
     pub reserved1: u32,
     pub emitted_kernels: PieEmittedKernelSlice,
+    /// The graph-cache identity of each stage, in plan order — the first field
+    /// of the launch package proper (`ptir-refactor.md` §2.3).
+    ///
+    /// The CUDA driver derives exactly this from the decoded plan today. While
+    /// both exist it compares the two and counts divergence; the host's value
+    /// is authoritative once that counter has stayed at zero, which is what
+    /// turns deleting the driver's copy into an evidenced step.
+    ///
+    /// Empty means "not supplied" — a driver must keep deriving.
+    pub stage_identities: PieU64Slice,
 }
 
 impl Default for PieProgramDesc {
@@ -561,6 +571,7 @@ impl Default for PieProgramDesc {
             emitter_version: 0,
             reserved1: 0,
             emitted_kernels: PieEmittedKernelSlice::default(),
+            stage_identities: PieU64Slice::default(),
         }
     }
 }

@@ -111,6 +111,7 @@ impl MaskWordsStorage {
 pub struct ProgramDescBorrow<'a> {
     _bytes: &'a [u8],
     _sidecar: &'a [u8],
+    _stage_identities: &'a [u64],
     raw: PieProgramDesc,
 }
 impl<'a> ProgramDescBorrow<'a> {
@@ -118,6 +119,7 @@ impl<'a> ProgramDescBorrow<'a> {
         Self {
             _bytes: &program.canonical_bytes,
             _sidecar: &program.sidecar_bytes,
+            _stage_identities: &program.stage_identities,
             raw: PieProgramDesc {
                 abi_version: PIE_DRIVER_ABI_VERSION,
                 reserved0: 0,
@@ -130,6 +132,7 @@ impl<'a> ProgramDescBorrow<'a> {
                 emitter_version: 0,
                 reserved1: 0,
                 emitted_kernels: PieEmittedKernelSlice::default(),
+                stage_identities: u64_slice(&program.stage_identities),
             },
         }
     }

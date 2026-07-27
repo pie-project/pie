@@ -142,6 +142,8 @@ std::uint64_t run_case(
                 container_bytes.data(), container_bytes.size()},
             pie_native::ByteSlice{
                 sidecar_bytes.data(), sidecar_bytes.size()},
+            PieEmittedKernelSlice{},
+            PieU64Slice{},
             &error) == PIE_STATUS_OK,
         "register grouped program: " + error);
     const DispatchStats registration_stats = dispatch.stats();
@@ -478,6 +480,8 @@ std::vector<std::int32_t> run_nucleus_case(
             hash,
             {container_bytes.data(), container_bytes.size()},
             {sidecar_bytes.data(), sidecar_bytes.size()},
+            PieEmittedKernelSlice{},
+            PieU64Slice{},
             &error) == PIE_STATUS_OK,
         "register nucleus program: " + error);
 
@@ -718,6 +722,8 @@ void run_structured_mask_golden(const std::string& golden_directory) {
             hash,
             {container_bytes.data(), container_bytes.size()},
             {sidecar_bytes.data(), sidecar_bytes.size()},
+            PieEmittedKernelSlice{},
+            PieU64Slice{},
             &error) == PIE_STATUS_OK,
         "register structured-mask golden: " + error);
     std::vector<std::uint64_t> hashes(lane_count, hash);
@@ -909,6 +915,8 @@ void run_declared_phase_case(
                 hash,
                 {container_bytes.data(), container_bytes.size()},
                 {sidecar_bytes.data(), sidecar_bytes.size()},
+                PieEmittedKernelSlice{},
+            PieU64Slice{},
                 &error) == PIE_STATUS_UNSUPPORTED,
             "model without attention hook coverage rejects registration");
     }
@@ -920,6 +928,8 @@ void run_declared_phase_case(
             hash,
             {container_bytes.data(), container_bytes.size()},
             {sidecar_bytes.data(), sidecar_bytes.size()},
+            PieEmittedKernelSlice{},
+            PieU64Slice{},
             &error) == PIE_STATUS_OK,
         "register staged program: " + error);
 
@@ -1088,9 +1098,15 @@ void run_declared_phase_case(
         .page_capacity = 4,
         .dummy_page = 3,
     };
+    // Composition split into stage (validate + build the lane tables) and
+    // enqueue (submit) after the frame pipeline grew a FramePrepare phase.
     expect(
-        dispatch.enqueue_fixed_decode(
-            view, 16, 4, fixed_buffers, &error, *launch),
+        dispatch.stage_fixed_decode(
+            view, 16, 4, fixed_buffers, &error, *launch,
+            Dispatch::FixedDecodeScope{}),
+        "fixed decode stages geometry: " + error);
+    expect(
+        dispatch.enqueue_fixed_decode(fixed_buffers, &error, *launch),
         "fixed decode composes staged geometry on device: " + error);
     cudaStreamSynchronize(stream);
     std::uint32_t fixed_token = 0;
@@ -1141,12 +1157,16 @@ void run_declared_phase_case(
                 envelope_pages, &template_page, sizeof(template_page),
                 cudaMemcpyHostToDevice, stream);
             expect(
-                dispatch.enqueue_decode_envelopes(
+                dispatch.stage_decode_envelopes(
                     view,
                     std::span<const std::uint32_t>(program_starts, 1),
                     std::span<const std::uint32_t>(program_starts, 1),
                     std::span<const std::uint32_t>(
                         template_page_indptr, 2),
+                    envelope_buffers, &error, staged_launch),
+                "decode envelope stages geometry: " + error);
+            expect(
+                dispatch.enqueue_decode_envelopes(
                     envelope_buffers, &error, staged_launch),
                 "decode envelope composes staged geometry on device: " +
                     error);
@@ -1427,6 +1447,8 @@ std::vector<std::uint8_t> run_beam_case(
             hash,
             {container_bytes.data(), container_bytes.size()},
             {sidecar_bytes.data(), sidecar_bytes.size()},
+            PieEmittedKernelSlice{},
+            PieU64Slice{},
             &error) == PIE_STATUS_OK,
         "register beam program: " + error);
     std::vector<std::uint64_t> hashes(lane_count, hash);
@@ -1689,6 +1711,8 @@ void run_mtp_direct_case(const std::string& golden_directory) {
             hash,
             {container_bytes.data(), container_bytes.size()},
             {sidecar_bytes.data(), sidecar_bytes.size()},
+            PieEmittedKernelSlice{},
+            PieU64Slice{},
             &error) == PIE_STATUS_OK,
         "register MtpLogits fixture: " + error);
 
@@ -1905,6 +1929,8 @@ void run_parallel_signature_case(const std::string& golden_directory) {
                 result.hash,
                 {canonical.data(), canonical.size()},
                 {sidecar.data(), sidecar.size()},
+                PieEmittedKernelSlice{},
+            PieU64Slice{},
                 &error) == PIE_STATUS_OK,
             "parallel-signature program registration: " + error);
         result.instance = instance;

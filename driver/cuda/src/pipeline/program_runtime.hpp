@@ -350,6 +350,61 @@ class PtirProgramCache {
             : &it->second.graph_stage_identities;
     }
 
+    // How often the host's stage identities were supplied, and how often they
+    // disagreed with what this driver derived.
+    //
+    // `compiled_stage_identity` is a decision about the program, so it belongs
+    // to the host (`ptir-refactor.md` §4.2). Both are computed while both
+    // exist, because a wrong graph key is silent: it does not fail, it reuses
+    // the wrong CUDA graph. Deleting the driver's copy is gated on
+    // `divergent == 0` over real workloads, which is the same evidence
+    // `ModuleCacheStats` gave before the emitters were deleted.
+    struct IdentityStats {
+        std::uint64_t host_supplied = 0;
+        std::uint64_t derived = 0;
+        std::uint64_t divergent = 0;
+    };
+    const IdentityStats& identity_stats() const { return identity_stats_; }
+
+    // Compare the host's table against what registration derived. Returns
+    // false only when the host supplied a table of the wrong length, which is
+    // an ABI bug rather than a divergence.
+    bool adopt_host_stage_identities(
+        std::uint64_t hash,
+        const std::uint64_t* host,
+        std::size_t host_len,
+        std::string* err) {
+        auto it = programs_.find(hash);
+        if (it == programs_.end()) return true;
+        auto& derived = it->second.graph_stage_identities;
+        if (host == nullptr || host_len == 0) {
+            identity_stats_.derived += derived.size();
+            return true;
+        }
+        if (host_len != derived.size()) {
+            if (err) {
+                *err = "host supplied " + std::to_string(host_len) +
+                    " stage identities for a program with " +
+                    std::to_string(derived.size()) + " stages";
+            }
+            return false;
+        }
+        for (std::size_t i = 0; i < host_len; ++i) {
+            if (host[i] != derived[i]) {
+                ++identity_stats_.divergent;
+                std::fprintf(
+                    stderr,
+                    "[pie-driver-cuda] stage %zu identity divergence: host "
+                    "%016llx vs driver %016llx\n",
+                    i,
+                    static_cast<unsigned long long>(host[i]),
+                    static_cast<unsigned long long>(derived[i]));
+            }
+        }
+        identity_stats_.host_supplied += host_len;
+        return true;
+    }
+
   private:
     struct DecodedProgram {
         Trace trace;
@@ -365,6 +420,7 @@ class PtirProgramCache {
         return nullptr;
     }
     std::unordered_map<std::uint64_t, DecodedProgram> programs_;
+    IdentityStats identity_stats_;
 };
 
 // Per-instance execution context: the shared cached `Trace` + a channel VIEW

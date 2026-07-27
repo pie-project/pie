@@ -2864,6 +2864,7 @@ int Dispatch::register_program(std::uint64_t program_hash,
                                    pie_native::ByteSlice canonical,
                                    pie_native::ByteSlice sidecar,
                                    PieEmittedKernelSlice emitted,
+                                   PieU64Slice stage_identities,
                                    std::string* err) {
     if (err) err->clear();
     std::string derr;
@@ -2888,6 +2889,15 @@ int Dispatch::register_program(std::uint64_t program_hash,
     const auto* plans = impl_->cache.plans(program_hash);
     if (plans == nullptr || plans->empty()) {
         if (err) *err = "ptir program has no compiler region plans";
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    std::string identity_error;
+    if (!impl_->cache.adopt_host_stage_identities(
+            program_hash,
+            stage_identities.ptr,
+            stage_identities.len,
+            &identity_error)) {
+        if (err) *err = identity_error;
         return PIE_STATUS_INVALID_ARGUMENT;
     }
     bool needs_kv_envelopes = false;
