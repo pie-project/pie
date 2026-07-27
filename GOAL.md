@@ -678,9 +678,9 @@ streams, schema 2:
 
 | batch | forward pass | ours alone | ours overlapped | XGrammar alone | XGrammar overlapped |
 |---:|---:|---:|---:|---:|---:|
-| 32 | 6,555 us | 336 | **+93** | 856 | **+51** |
-| 128 | 9,430 us | 372 | **+145** | 3,308 | **+116** |
-| 512 | 22,108 us | 451 | **+202** | 11,746 | **+419** |
+| 32 | 6,535 us | 333 | **+108** | 857 | **+47** |
+| 128 | 9,435 us | 360 | **+148** | 3,297 | **+154** |
+| 512 | 22,111 us | 381 | **+113** | 12,362 | **+506** |
 
 Correcting it the first time went against us and was recorded that way: at
 batch 512 ours then cost 3,381 us alone and 3,334 us overlapped, against
@@ -702,10 +702,13 @@ against XGrammar's 419.
 So the honest statement is narrower than either previous version. Device work
 does compete with the forward pass for the same multiprocessors, and 45% of
 ours fails to hide where 96% of XGrammar's host work does. That penalty is
-real. It is simply smaller than the twenty-five-fold difference in what there
-is to hide, once the work is the work rather than the ceilings. At batch 32 and
-128 XGrammar still adds less - 51 against 93, and 116 against 145 - and those
-are 0.6% and 0.3% of a step.
+real. It is simply smaller than the thirty-fold difference in what there is to
+hide, once the work is the work rather than the ceilings. At batch 32 XGrammar
+still adds less - 47 against 108, which is 0.9% of a step - and at 128 the two
+are level.
+
+Captured, which is what a serving loop replays, a whole grammar step is 133 us
+at batch 512 and 56 us at batch 1: fill 84 and 29, advance 49 and 27.
 
 **The fill cannot be captured (q22).** This is the structural finding and it is
 binary rather than a matter of microseconds. A CUDA graph records device work;
