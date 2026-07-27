@@ -2430,6 +2430,8 @@ DispatchStats Dispatch::stats() const {
     result.generated_disk_writes = generated.disk_writes;
     result.generated_disk_errors = generated.disk_errors;
     result.generated_negative_hits = generated.negative_hits;
+    result.generated_host_sources = generated.host_sources;
+    result.generated_driver_sources = generated.driver_sources;
     result.generated_stage_cache_entries = generated.stage_entries;
     result.generated_program_cache_entries = generated.program_entries;
     result.generated_negative_cache_entries = generated.negative_entries;

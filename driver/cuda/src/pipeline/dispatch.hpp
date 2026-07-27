@@ -90,6 +90,10 @@ struct DispatchStats {
     std::uint64_t generated_disk_writes = 0;
     std::uint64_t generated_disk_errors = 0;
     std::uint64_t generated_negative_hits = 0;
+    /// Fused regions compiled from host-generated source, versus regenerated
+    /// in-driver. Distinguishes a live host path from a silent fallback.
+    std::uint64_t generated_host_sources = 0;
+    std::uint64_t generated_driver_sources = 0;
     std::uint64_t generated_stage_cache_entries = 0;
     std::uint64_t generated_program_cache_entries = 0;
     std::uint64_t generated_negative_cache_entries = 0;
