@@ -214,13 +214,20 @@ using ShardAxis = std::optional<std::uint8_t>;
 /// the same operator says so with `shard_axis_fn` — DeepSeek-V4 is the one such
 /// family, and its rule lives in its own header.
 inline ShardAxis hf_shard_axis(std::string_view name) {
-    if (contains(name, ".mlp.experts.")) {
-        if (ends_with_any(name, {".gate_proj.weight_packed", ".gate_proj.weight_scale",
-                                 ".up_proj.weight_packed", ".up_proj.weight_scale"})) {
-            return std::uint8_t{0};
-        }
-        if (ends_with_any(name, {".down_proj.weight_packed", ".down_proj.weight_scale"})) {
-            return std::uint8_t{1};
+    // A companion scale splits exactly like the weight it scales, so ask about
+    // the weight. Stating it as two lists instead -- every `<proj>.weight` in
+    // one, every `<proj>.weight_scale_inv` beside it -- is what this was, and
+    // the axis-0 list grew its scale entries while the axis-1 list never did:
+    // `o_proj`, `down_proj` and `w2` handed a rank its slice of the weight and
+    // the whole model's scale next to it. Whether the scale has an axis to
+    // split at all is a question about its shape, and
+    // `ContractBuilder::splittable_axis` answers that one.
+    for (const std::string_view suffix :
+         {".weight_scale_inv", ".weight_scale", ".weight_packed", ".scale"}) {
+        if (ends_with(name, suffix)) {
+            const std::string_view base = name.substr(0, name.size() - suffix.size());
+            const ShardAxis of_weight = hf_shard_axis(std::string(base) + ".weight");
+            return of_weight.has_value() ? of_weight : hf_shard_axis(base);
         }
     }
     if (ends_with_any(
@@ -231,12 +238,7 @@ inline ShardAxis hf_shard_axis(std::string_view name) {
              ".gate_proj.weight",     ".up_proj.weight",
              ".sinks",                ".w1.weight",
              ".w3.weight",            ".w1.bias",
-             ".w3.bias",              ".q_proj.weight_scale",
-             ".q_proj.weight_scale_inv", ".k_proj.weight_scale",
-             ".k_proj.weight_scale_inv", ".v_proj.weight_scale",
-             ".v_proj.weight_scale_inv", ".gate_proj.weight_scale",
-             ".gate_proj.weight_scale_inv", ".up_proj.weight_scale",
-             ".up_proj.weight_scale_inv", ".linear_attn.in_proj_z.weight",
+             ".w3.bias",              ".linear_attn.in_proj_z.weight",
              ".linear_attn.in_proj_b.weight", ".linear_attn.in_proj_a.weight",
              ".linear_attn.dt_bias",  ".linear_attn.A_log",
              ".self_attn.q_b_proj.weight", ".self_attn.kv_b_proj.weight"})) {
@@ -532,8 +534,38 @@ public:
     }
 
     void push_direct(const SourceTensor& raw, std::string output, ShardAxis axis) {
-        auto [expr, shape] = shard(contract_.src(std::string(raw.name)), shape_of(raw), axis);
+        std::vector<std::int64_t> raw_shape = shape_of(raw);
+        axis = splittable_axis(raw.name, raw_shape, axis);
+        auto [expr, shape] =
+            shard(contract_.src(std::string(raw.name)), std::move(raw_shape), axis);
         define(std::move(output), expr, raw.encoding, std::move(shape));
+    }
+
+    /// True for a tensor that only scales another one.
+    static bool is_companion_scale(std::string_view name) {
+        return ends_with_any(name, {".weight_scale_inv", ".weight_scale", ".scale"});
+    }
+
+    /// Demote a companion scale to "replicate" when it has nothing to split.
+    ///
+    /// A scale follows its weight, but only a block or per-channel scale has
+    /// an axis of its own: a per-tensor scale is one number for a whole
+    /// projection and follows it vacuously. Asking `hf_shard_axis` about that
+    /// is asking a question about the name when the answer is in the shape.
+    ///
+    /// A scale that *does* have the axis and does not divide is left alone on
+    /// purpose -- the loader rejects it by name, which is how a 1536-wide FP8
+    /// expert says it has 12 blocks and cannot go to 8 ranks.
+    static ShardAxis splittable_axis(std::string_view name,
+                                     const std::vector<std::int64_t>& shape, ShardAxis axis) {
+        if (!axis.has_value() || !is_companion_scale(name)) {
+            return axis;
+        }
+        const std::size_t index = *axis;
+        if (index >= shape.size() || shape[index] <= 1) {
+            return std::nullopt;
+        }
+        return axis;
     }
 
     /// Partition an expression and its shape across ranks along `axis`.
