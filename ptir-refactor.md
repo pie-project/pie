@@ -662,16 +662,31 @@ existing derivation first, count divergence, and delete the derivation at zero.
 The `ModuleCacheStats` pattern already in the tree is the model, and Metal's
 `channel_effects()` (landed in 2′) is the first instance of the move.
 
-**Two of the seven are done.** The port→field *table itself* turned out to be a
+**Four of the seven are done.** The port→field *table itself* turned out to be a
 constant, not per-program data — what varies is which channel each port binds
 to, and that already crosses the wire in `trace.ports`. So the fix was not to
 ship it but to stop writing it three times: the tags now derive from the
 generated header and a test gates it. Per-op launch class is likewise a constant
 that `op_table.hpp` owns correctly; it only needs to move, not to be shipped.
 
-That leaves the five that are genuinely per-program: buffer/scratch layout,
-region→launch mapping, fire geometry, the bind-time region verdicts, and the
-intrinsic side-table analysis.
+The **bind-time region verdicts** and the **intrinsic side-table analysis**
+followed in `824421813` + `cb45a3ed3`, and they are the first end-to-end run of
+the method on a genuinely per-program field. Two notes worth carrying to the
+remaining three:
+
+* Both already existed in `compiler/codegen`, because the emitter needs the same
+  answers to *generate* the kernel that consumes them. That is the general
+  shape, not a coincidence — the driver's derivations are mostly re-derivations,
+  so the host side of each remaining field is likely already written.
+* `region_divergent == 0` is also what a comparison that never ran reports
+  (`e50769003`). The fixture path has to be built *with* the counter, not after,
+  and the gate read as the pair `host_supplied != 0 && divergent == 0`. The
+  vendored corpus did not cover the second-party branch at all; that only
+  appears on the engine path, and the way to find out was to truncate the host's
+  table by one entry and watch the driver reject it.
+
+That leaves three that are genuinely per-program: buffer/scratch layout,
+region→launch mapping, and fire geometry.
 
 ### 4.3 The driver-side test surface (retarget, not delete)
 
