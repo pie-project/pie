@@ -56,11 +56,11 @@ namespace {
 
 // A (stage, region) index over the host's emitted kernel table.
 //
-// The host runs the same emitter this driver carries
-// (`compiler/codegen/src/cuda/`), so where it supplied source we compile that
-// instead of regenerating it. An entry whose `source` is empty is a *recorded*
-// failure, not an omission -- the host is saying it could not emit that region
-// -- so it is left absent here and the driver's own path decides what to do.
+// The host (`compiler/codegen/src/cuda/`) is the only emitter, so both the
+// source *and* the entry symbol it named are carried through unchanged. An
+// entry whose `source` is empty is a *recorded* failure, not an omission --
+// the host is saying it could not emit that region -- so it is left absent
+// here and registration refuses the program.
 class HostEmittedKernels {
 public:
     explicit HostEmittedKernels(PieEmittedKernelSlice slice) {
@@ -72,22 +72,34 @@ public:
             }
             sources_.emplace(
                 Key{kernel.stage_index, kernel.region_index},
-                std::string(
-                    reinterpret_cast<const char*>(kernel.source.ptr),
-                    kernel.source.len));
+                Region{
+                    to_string(kernel.entry_name),
+                    to_string(kernel.source)});
         }
     }
 
-    static const std::string* lookup(
+    static generated::ModuleCache::HostRegion lookup(
         void* context, std::size_t stage_index, std::size_t region_index) {
         auto* self = static_cast<HostEmittedKernels*>(context);
         const auto found = self->sources_.find(Key{
             static_cast<std::uint32_t>(stage_index),
             static_cast<std::uint32_t>(region_index)});
-        return found == self->sources_.end() ? nullptr : &found->second;
+        if (found == self->sources_.end()) return {};
+        return {&found->second.entry, &found->second.source};
     }
 
 private:
+    template <typename Slice>
+    static std::string to_string(const Slice& slice) {
+        if (slice.ptr == nullptr || slice.len == 0) return {};
+        return std::string(
+            reinterpret_cast<const char*>(slice.ptr), slice.len);
+    }
+
+    struct Region {
+        std::string entry;
+        std::string source;
+    };
     struct Key {
         std::uint32_t stage;
         std::uint32_t region;
@@ -98,7 +110,7 @@ private:
             return (static_cast<std::size_t>(key.stage) << 32) ^ key.region;
         }
     };
-    std::unordered_map<Key, std::string, KeyHash> sources_;
+    std::unordered_map<Key, Region, KeyHash> sources_;
 };
 
 }  // namespace

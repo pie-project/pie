@@ -5,7 +5,8 @@
 
 use pie_driver_abi::{
     PIE_DRIVER_ABI_VERSION, PieBytes, PieChannelDesc, PieChannelValueDesc,
-    PieChannelValueDescSlice, PieEmittedKernelSlice, PieEncodeDesc, PieInstanceDesc, PieKvCopyDesc,
+    PieChannelValueDescSlice, PieEmittedKernel, PieEmittedKernelSlice, PieEncodeDesc,
+    PieInstanceDesc, PieKvCopyDesc,
     PieKvMoveCellSlice, PieMaskWordsDesc, PieMutBytes, PiePoolRangeSlice, PiePoolResizeDesc,
     PieProgramDesc, PieStateCopyDesc, PieStateCopyRangeSlice, PieTerminalCellPtrSlice, PieU8Slice,
     PieU32MutSlice, PieU32Slice, PieU64Slice,
@@ -112,26 +113,47 @@ pub struct ProgramDescBorrow<'a> {
     _bytes: &'a [u8],
     _sidecar: &'a [u8],
     _stage_identities: &'a [u64],
+    // The ABI slice points into this vector's heap buffer, which a move of the
+    // struct does not relocate. It must never be mutated after `raw` is built.
+    _kernels: Vec<PieEmittedKernel>,
     raw: PieProgramDesc,
 }
 impl<'a> ProgramDescBorrow<'a> {
     pub fn new(program: &'a ProgramRegistration) -> Self {
+        // The driver no longer carries an emitter, so a fused region with no
+        // host source is a registration failure rather than a slower path.
+        // Dropping the table here left every fused program unregisterable.
+        let kernels: Vec<PieEmittedKernel> = program
+            .emitted_kernels
+            .iter()
+            .map(|kernel| PieEmittedKernel {
+                kind: kernel.kind,
+                stage_index: kernel.stage_index,
+                region_index: kernel.region_index,
+                reserved0: 0,
+                entry_name: bytes_slice(kernel.entry_name.as_bytes()),
+                source: bytes_slice(kernel.source.as_bytes()),
+                error: bytes_slice(kernel.error.as_bytes()),
+            })
+            .collect();
+        let emitted_kernels = PieEmittedKernelSlice {
+            ptr: kernels.as_ptr(),
+            len: kernels.len(),
+        };
         Self {
             _bytes: &program.canonical_bytes,
             _sidecar: &program.sidecar_bytes,
             _stage_identities: &program.stage_identities,
+            _kernels: kernels,
             raw: PieProgramDesc {
                 abi_version: PIE_DRIVER_ABI_VERSION,
                 reserved0: 0,
                 program_hash: program.program_hash,
                 canonical_bytes: bytes_slice(&program.canonical_bytes),
                 sidecar_bytes: bytes_slice(&program.sidecar_bytes),
-                // Host code generation is not wired in yet: the native drivers
-                // still emit their own kernels. When it is, this is where the
-                // `compiler/codegen` output is attached.
-                emitter_version: 0,
+                emitter_version: program.emitter_version,
                 reserved1: 0,
-                emitted_kernels: PieEmittedKernelSlice::default(),
+                emitted_kernels,
                 stage_identities: u64_slice(&program.stage_identities),
             },
         }

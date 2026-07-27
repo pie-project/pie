@@ -98,7 +98,19 @@ class ModuleCache {
     // not supply this program's kernels. Indexed by (stage, region) because
     // that is the identity the host emits under; see
     // `compiler/codegen/src/program.rs`.
-    using HostSource = const std::string* (*)(
+    //
+    // The entry name travels with the source rather than being re-derived
+    // here. `entry_name` below and `compiler/codegen`'s `format!` are two
+    // hand-written spellings of one convention, and they had already drifted
+    // (`_r0` on the host, `_0` here) the moment the emitter moved out of the
+    // driver -- a divergence that surfaces as `named symbol not found` at
+    // module load, long after the kernel compiled cleanly. The host is the
+    // emitter, so the host names the symbol.
+    struct HostRegion {
+        const std::string* entry = nullptr;
+        const std::string* source = nullptr;
+    };
+    using HostSource = HostRegion (*)(
         void* context, std::size_t stage_index, std::size_t region_index);
 
     std::shared_ptr<const FusedProgramExecutable> compile_program(
@@ -206,8 +218,17 @@ class ModuleCache {
                  ++region_index) {
                 const auto& region = plan.fused.regions[region_index];
                 if (region.library) continue;
+                const HostRegion host_region =
+                    host_source != nullptr
+                        ? host_source(host_context, this_stage, region_index)
+                        : HostRegion{};
+                // The host names the symbol; the derived spelling is only a
+                // fallback for the (now unreachable) no-host case, kept so the
+                // disk-cache key stays well defined.
                 const std::string entry =
-                    entry_name(plan.signature_hash, region_index);
+                    host_region.entry != nullptr && !host_region.entry->empty()
+                        ? *host_region.entry
+                        : entry_name(plan.signature_hash, region_index);
                 std::shared_ptr<FusedRegionExecutable> executable;
                 if (auto cubin = load_cached_cubin(
                         key, region_index, entry)) {
@@ -232,10 +253,7 @@ class ModuleCache {
                     // emitter is gone, and silently diverging from the host's
                     // decision is the bug this seam exists to prevent.
                     GeneratedKernelSource source;
-                    const std::string* supplied =
-                        host_source != nullptr
-                            ? host_source(host_context, this_stage, region_index)
-                            : nullptr;
+                    const std::string* supplied = host_region.source;
                     if (supplied == nullptr) {
                         failure_kind = CompileFailureKind::Deterministic;
                         error =
