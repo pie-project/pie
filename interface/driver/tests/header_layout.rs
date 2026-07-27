@@ -153,7 +153,7 @@ fn rust_layout_matches_committed_header_contract() {
     assert_layout!(PieEmittedKernelSlice, 16, 8, ptr => 0, len => 8);
     assert_layout!(
         PieProgramDesc,
-        72,
+        88,
         8,
         abi_version => 0,
         reserved0 => 4,
@@ -162,7 +162,8 @@ fn rust_layout_matches_committed_header_contract() {
         sidecar_bytes => 32,
         emitter_version => 48,
         reserved1 => 52,
-        emitted_kernels => 56
+        emitted_kernels => 56,
+        stage_identities => 72
     );
     assert_layout!(
         PieInstanceDesc,
