@@ -109,6 +109,10 @@ struct ModelFacts {
     std::string quant_method;
     std::uint32_t num_hidden_layers = 0;
     std::uint32_t num_experts = 0;
+    /// `head_dim`. TP splits an attention projection by rows, and whether a
+    /// row split lands on a head boundary is not a question the row count can
+    /// answer -- see `ContractBuilder::check_head_granularity`.
+    std::uint32_t head_dim = 0;
 };
 
 namespace contract_detail {
@@ -536,6 +540,7 @@ public:
     void push_direct(const SourceTensor& raw, std::string output, ShardAxis axis) {
         std::vector<std::int64_t> raw_shape = shape_of(raw);
         axis = splittable_axis(raw.name, raw_shape, axis);
+        check_head_granularity(raw.name, raw_shape, axis);
         auto [expr, shape] =
             shard(contract_.src(std::string(raw.name)), std::move(raw_shape), axis);
         define(std::move(output), expr, raw.encoding, std::move(shape));
@@ -566,6 +571,41 @@ public:
             return std::nullopt;
         }
         return axis;
+    }
+
+    /// A row-parallel attention projection has to split on a head boundary.
+    ///
+    /// The loader asks whether `tp_size` divides the row count, and for a
+    /// projection of `heads * head_dim` rows that is the weaker question: four
+    /// KV heads of 256 make 1024 rows, 1024 divides eight ways, and the same
+    /// forward pass then computes `num_key_value_heads / tp_size` and gets
+    /// zero heads a rank. Both divisions succeed and they disagree, so the
+    /// sharper one belongs here, where `head_dim` is known and the loader's is
+    /// not -- 1024 is just 1024 by the time it gets there.
+    void check_head_granularity(std::string_view name, const std::vector<std::int64_t>& shape,
+                                ShardAxis axis) const {
+        const std::int64_t d = facts_.head_dim;
+        const std::int64_t world = target_.tp_size;
+        if (!axis.has_value() || *axis != 0 || world <= 1 || d <= 0 || shape.empty()) {
+            return;
+        }
+        if (!ends_with_any(name, {".q_proj.weight", ".k_proj.weight", ".v_proj.weight",
+                                  ".q_proj.bias", ".k_proj.bias", ".v_proj.bias"})) {
+            return;
+        }
+        // A fused or otherwise non-head-shaped projection is not this rule's
+        // business; `local_range` still has the row count covered.
+        if (shape[0] % d != 0) {
+            return;
+        }
+        const std::int64_t heads = shape[0] / d;
+        if (heads % world == 0) {
+            return;
+        }
+        fail(std::string(name) + " is " + std::to_string(heads) + " head(s) of " +
+             std::to_string(d) + ", which tp_size " + std::to_string(target_.tp_size) +
+             " does not divide; a rank cannot hold part of an attention head, so use a "
+             "tp_size that divides the head count or run single-GPU");
     }
 
     /// Partition an expression and its shape across ranks along `axis`.

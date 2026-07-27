@@ -355,6 +355,7 @@ void author_real_contract(const std::string& snapshot, const char* dest) {
         .quant_method = hf.quant_method,
         .num_hidden_layers = static_cast<std::uint32_t>(std::max(0, hf.num_hidden_layers)),
         .num_experts = static_cast<std::uint32_t>(std::max(0, hf.num_experts)),
+        .head_dim = static_cast<std::uint32_t>(std::max(0, hf.head_dim)),
     };
 
     namespace model = pie_cuda_driver::model;

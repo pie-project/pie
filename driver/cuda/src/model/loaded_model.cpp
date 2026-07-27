@@ -173,6 +173,7 @@ LoadedModel LoadedModel::load(
         .quant_method = e.hf_.quant_method,
         .num_hidden_layers = static_cast<std::uint32_t>(std::max(0, e.hf_.num_hidden_layers)),
         .num_experts = static_cast<std::uint32_t>(std::max(0, e.hf_.num_experts)),
+        .head_dim = static_cast<std::uint32_t>(std::max(0, e.hf_.head_dim)),
     };
     pie_loader::ModelContract contract;
     {
