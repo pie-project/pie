@@ -17,6 +17,7 @@ pie-driver-abi = { path = "../../interface/driver" }
 pie-driver-dummy = { path = "../../driver/dummy" }
 pie-ir = { path = "../../compiler/ir" }
 pie-plan = { path = "../../compiler/plan" }
+pie-codegen = { path = "../../compiler/codegen" }
 pie-eval = { path = "../../compiler/eval" }
 pie-client = { path = "../../client/rust" }
 tokio = { version = "1.53", features = ["full"] }

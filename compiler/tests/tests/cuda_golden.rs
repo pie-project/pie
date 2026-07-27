@@ -284,3 +284,96 @@ fn emitter_version_matches_oracle() {
         .unwrap();
     assert_eq!(recorded, CUDA_GENERATED_EMITTER_VERSION);
 }
+
+/// Whole-program emission: the table a driver receives.
+///
+/// The per-region emitters are pinned against the C++ oracle above; this pins
+/// the walk around them — that every region gets an entry, that entry names are
+/// the ones the drivers used to generate for themselves, and that a failure is
+/// recorded rather than dropped.
+#[test]
+fn emit_program_covers_every_region() {
+    use pie_codegen::program::{Backend, KERNEL_FUSED, emit_program};
+
+    let stages: Vec<_> = corpus_stages()
+        .into_iter()
+        .map(|stage| stage.plan)
+        .collect();
+    let kernels = emit_program(Backend::Cuda, &stages);
+
+    let expected: usize = stages.iter().map(|stage| stage.fused.regions.len()).sum();
+    assert_eq!(
+        kernels.len(),
+        expected,
+        "CUDA emission must produce one kernel per fused region"
+    );
+    for kernel in &kernels {
+        assert_eq!(kernel.kind, KERNEL_FUSED);
+        // Exactly one of source/error is set: a kernel is either emitted or
+        // explained, never silently absent.
+        assert_ne!(
+            kernel.source.is_empty(),
+            kernel.error.is_empty(),
+            "kernel {}#{} has neither source nor error",
+            kernel.stage_index,
+            kernel.region_index
+        );
+        if !kernel.source.is_empty() {
+            let stage = &stages[kernel.stage_index as usize];
+            let entry = format!(
+                "ptir_fused_{:016x}_r{}",
+                stage.signature.hash, kernel.region_index
+            );
+            assert_eq!(kernel.entry_name, entry);
+            assert!(
+                kernel.source.contains(&entry),
+                "the source defines its entry"
+            );
+        }
+    }
+}
+
+/// The Metal walk emits four families; check each shows up and is named the way
+/// `m1_runtime.cpp` names them.
+#[test]
+fn emit_program_metal_covers_every_family() {
+    use pie_codegen::program::{
+        Backend, KERNEL_COMMIT, KERNEL_FUSED, KERNEL_GROUPED, KERNEL_READINESS, KERNEL_SINGLETON,
+        emit_program,
+    };
+
+    let stages: Vec<_> = corpus_stages()
+        .into_iter()
+        .map(|stage| stage.plan)
+        .collect();
+    let kernels = emit_program(Backend::Metal, &stages);
+    for kind in [
+        KERNEL_SINGLETON,
+        KERNEL_FUSED,
+        KERNEL_GROUPED,
+        KERNEL_READINESS,
+        KERNEL_COMMIT,
+    ] {
+        assert!(
+            kernels.iter().any(|kernel| kernel.kind == kind),
+            "no kernel of kind {kind} was emitted"
+        );
+    }
+    for kernel in &kernels {
+        assert_ne!(
+            kernel.source.is_empty(),
+            kernel.error.is_empty(),
+            "kernel kind={} {}#{} has neither source nor error",
+            kernel.kind,
+            kernel.stage_index,
+            kernel.region_index
+        );
+        if !kernel.source.is_empty() {
+            assert!(
+                kernel.source.contains(&kernel.entry_name),
+                "the source defines its entry `{}`",
+                kernel.entry_name
+            );
+        }
+    }
+}

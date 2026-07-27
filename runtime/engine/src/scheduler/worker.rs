@@ -4389,6 +4389,7 @@ mod tests {
             program_hash: pie_ir::container_hash(&bytes),
             canonical_bytes: bytes,
             sidecar_bytes: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -5853,6 +5854,7 @@ mod tests {
                 program_hash: pie_ir::container_hash(&exporter_bytes),
                 canonical_bytes: exporter_bytes,
                 sidecar_bytes: Vec::new(),
+                ..Default::default()
             },
         )
         .await?;
@@ -5862,6 +5864,7 @@ mod tests {
                 program_hash: pie_ir::container_hash(&importer_bytes),
                 canonical_bytes: importer_bytes,
                 sidecar_bytes: Vec::new(),
+                ..Default::default()
             },
         )
         .await?;

@@ -27,11 +27,13 @@
 //! accounting is unwired — so it carries an annotated `allow` instead of a
 //! blanket module-level one.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use lru::LruCache;
+use pie_codegen::program::{Backend, EmittedKernel, emit_program};
 use pie_ir::container::{self, ContainerDecodeError, PortSource, TraceContainer};
 use pie_ir::container_hash;
 use pie_ir::op::Op;
@@ -71,6 +73,11 @@ pub struct RegisteredProgram {
     /// production never reads this field.
     #[allow(dead_code)]
     pub compiled_stages: Vec<CompiledStage>,
+    /// Backend source generated for this program, keyed by the backend a
+    /// driver advertised. Emitted lazily and cached here because generation is
+    /// tens of kilobytes per region and a program is registered once but bound
+    /// many times.
+    emitted: Mutex<HashMap<Backend, Arc<EmittedProgram>>>,
     /// Dense-channel `(consume, publish)` mask, derived once from immutable IR.
     pub channel_accesses: Vec<(bool, bool)>,
     /// The PTIB typed sidecar (`encode_bound(&bound)`) — the wire form of
@@ -83,6 +90,34 @@ pub struct RegisteredProgram {
     /// unwired) — the `allow` marks that gap rather than hiding it.
     #[allow(dead_code)]
     pub pricing: Pricing,
+}
+
+/// The generated kernels for one backend, plus the emitter version a driver's
+/// compile cache must key on.
+#[derive(Debug)]
+pub struct EmittedProgram {
+    pub emitter_version: u32,
+    pub kernels: Vec<EmittedKernel>,
+}
+
+impl RegisteredProgram {
+    /// Backend source for this program, generated on first ask and cached.
+    ///
+    /// `backend` is what the driver advertised in
+    /// `DriverCapabilities::codegen_backend`; an unrecognised name means the
+    /// driver generates its own kernels, and nothing is emitted. That is what
+    /// lets the CUDA and Metal drivers move off their in-driver emitters
+    /// independently.
+    pub fn emitted(&self, backend: &str) -> Option<Arc<EmittedProgram>> {
+        let backend = Backend::parse(backend)?;
+        let mut cache = self.emitted.lock().unwrap();
+        Some(Arc::clone(cache.entry(backend).or_insert_with(|| {
+            Arc::new(EmittedProgram {
+                emitter_version: backend.emitter_version(),
+                kernels: emit_program(backend, &self.compiled_stages),
+            })
+        })))
+    }
 }
 
 impl RegisteredProgram {
@@ -173,6 +208,7 @@ impl Registry {
             channel_accesses,
             sidecar,
             pricing,
+            emitted: Mutex::new(HashMap::new()),
         });
         self.inner.put(hash, entry.clone());
         Ok(entry)
@@ -252,7 +288,7 @@ fn price(c: &TraceContainer) -> Pricing {
 // Process-wide registry
 // ---------------------------------------------------------------------------
 
-use std::sync::{LazyLock, Mutex, MutexGuard};
+use std::sync::{LazyLock, MutexGuard};
 
 static GLOBAL: LazyLock<Mutex<Registry>> = LazyLock::new(|| {
     Mutex::new(Registry::new(
@@ -648,6 +684,7 @@ mod tests {
                 channel_accesses: program.channel_accesses.clone(),
                 sidecar: program.sidecar.clone(),
                 pricing: program.pricing,
+                emitted: Mutex::new(HashMap::new()),
             }),
         );
         assert!(matches!(

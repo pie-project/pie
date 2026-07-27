@@ -826,6 +826,7 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
                 program_hash: prog.hash,
                 canonical_bytes: prog.bytes.clone(),
                 sidecar_bytes: prog.sidecar.clone(),
+                ..Default::default()
             };
             if bind_timing.is_some() {
                 bind_stages[2] = crate::scheduler::fire_timing_now_us();

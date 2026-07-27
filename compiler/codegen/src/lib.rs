@@ -28,4 +28,5 @@ pub mod cuda;
 pub mod header;
 pub mod metal;
 pub mod op_view;
+pub mod program;
 pub mod rng;

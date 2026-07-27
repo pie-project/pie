@@ -1101,6 +1101,7 @@ async fn surrogate(
             program_hash: program.hash,
             canonical_bytes: program.bytes.clone(),
             sidecar_bytes: program.sidecar.clone(),
+            ..Default::default()
         },
     )
     .await?;
@@ -1751,6 +1752,7 @@ mod tests {
             supports_media_encode: false,
             snapshot_dir: String::new(),
             kv_handle: None,
+            codegen_backend: String::new(),
         }
     }
 

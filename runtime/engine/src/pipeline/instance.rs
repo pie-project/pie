@@ -933,6 +933,7 @@ mod tests {
                 program_hash: pie_ir::container_hash(&bytes),
                 canonical_bytes: bytes,
                 sidecar_bytes: Vec::new(),
+                ..Default::default()
             }
         }
 

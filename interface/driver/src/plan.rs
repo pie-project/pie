@@ -96,6 +96,35 @@ pub struct ProgramRegistration {
     pub program_hash: u64,
     pub canonical_bytes: Vec<u8>,
     pub sidecar_bytes: Vec<u8>,
+    /// Kernels the host generated for this driver's backend, empty unless the
+    /// driver advertised a
+    /// [`codegen_backend`](crate::capabilities::DriverCapabilities::codegen_backend).
+    #[serde(default)]
+    pub emitted_kernels: Vec<EmittedKernel>,
+    /// The emitter version `emitted_kernels` was built with; part of the
+    /// driver's compile-cache key, so a bump must miss rather than reuse.
+    #[serde(default)]
+    pub emitter_version: u32,
+}
+
+/// One host-emitted kernel. The owned counterpart of
+/// [`PieEmittedKernel`](crate::local::PieEmittedKernel).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmittedKernel {
+    /// `PIE_KERNEL_*`.
+    pub kind: u32,
+    pub stage_index: u32,
+    pub region_index: u32,
+    /// Entry-point symbol; empty when emission failed.
+    pub entry_name: String,
+    /// Backend source; empty when emission failed.
+    pub source: String,
+    /// Why emission failed. Empty on success.
+    ///
+    /// A failure is not necessarily fatal: a driver may have a slower path for
+    /// the same region, and recording *why* is what lets it tell a deliberate
+    /// fallback from a bug.
+    pub error: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

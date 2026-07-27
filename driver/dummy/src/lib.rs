@@ -309,6 +309,9 @@ impl DummyDriver {
                 page_size: 1,
             },
             capabilities: DriverCapabilities {
+                // The dummy driver interprets PTIR directly; it has no kernels
+                // to compile, so it asks for no generated source.
+                codegen_backend: String::new(),
                 abi_version: pie_driver_abi::PIE_DRIVER_ABI_VERSION,
                 total_pages: options.total_pages,
                 kv_page_size: options.kv_page_size,
