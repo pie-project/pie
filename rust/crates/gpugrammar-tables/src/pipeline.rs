@@ -122,7 +122,16 @@ fn compile_at(
     limits: Limits,
     options: &JsonSchemaOptions,
 ) -> std::result::Result<Artifact, Failure> {
-    let grammar = json_schema_to_grammar(schema, options).map_err(|_| Failure::Lowering)?;
+    let grammar = json_schema_to_grammar(schema, options).map_err(|error| {
+        // The reason a schema cannot be lowered is the whole diagnostic - which
+        // keyword, in what shape - and collapsing it to a code left the largest
+        // remaining coverage gap undiagnosable. Kept behind an environment
+        // variable rather than a return type so the hot path stays a code.
+        if std::env::var_os("GPUGRAMMAR_WHY").is_some() {
+            eprintln!("lowering: {error:#}");
+        }
+        Failure::Lowering
+    })?;
     let lexicon = extract_within(&grammar, &analyze(&grammar), limits.terminals);
     // Ask from the declared bounds first: a length bound is unrolled into the
     // automaton, so a schema that cannot fit is cheaper to refuse than to build.
@@ -131,7 +140,12 @@ fn compile_at(
     let lexer = build_lexer_within(automata, limits.lexer_states).ok_or(Failure::Lexer)?;
     let groups = group_vocabulary(&lexer, vocabulary);
     let cfg = flatten_within(&lexicon, limits.productions).ok_or(Failure::Productions)?;
-    let tables = build(&cfg).map_err(|_| Failure::Conflict)?;
+    let tables = build(&cfg).map_err(|error| {
+        if std::env::var_os("GPUGRAMMAR_WHY").is_some() {
+            eprintln!("conflict: {error:#}");
+        }
+        Failure::Conflict
+    })?;
     emit(&lexicon, &lexer, &groups, &cfg, &tables, vocabulary.len()).map_err(|_| Failure::Emit)
 }
 

@@ -11,24 +11,31 @@ use crate::frontend::{FrontendExpr as Expr, FrontendGrammar, FrontendRule};
 use crate::regex::regex_to_expr;
 
 pub(super) fn convert(schema: &Value, options: &JsonSchemaOptions) -> Result<FrontendGrammar> {
-    Converter::new(options).convert(schema)
+    Converter::new(options, schema).convert(schema)
 }
 
 struct Converter<'a> {
     options: &'a JsonSchemaOptions,
     rules: Vec<FrontendRule>,
     names: HashSet<String>,
+    /// The whole schema, so a `$ref` can be resolved as the JSON pointer it is.
+    document: &'a Value,
+    /// Pointers already turned into rules, so two references to the same place
+    /// share one and a recursive one terminates.
+    pointers: HashSet<String>,
     counter: usize,
     /// Lexeme rules already declared, keyed by shape.
     lexemes: HashMap<String, String>,
 }
 
 impl<'a> Converter<'a> {
-    fn new(options: &'a JsonSchemaOptions) -> Self {
+    fn new(options: &'a JsonSchemaOptions, document: &'a Value) -> Self {
         Self {
             options,
             rules: Vec::new(),
             names: HashSet::new(),
+            document,
+            pointers: HashSet::new(),
             counter: 0,
             lexemes: HashMap::new(),
         }
@@ -116,9 +123,36 @@ impl<'a> Converter<'a> {
                 return Ok(Expr::RuleRef("root".to_string()));
             }
             for prefix in ["#/definitions/", "#/$defs/"] {
+                // Only a direct child of the root's definitions block, which is
+                // what `register_definitions` declares. A pointer that goes on
+                // through nested blocks - `#/definitions/a/definitions/b`, which
+                // this corpus has plenty of - sanitises to a name nobody
+                // defines, and that was most of the "undefined frontend rule"
+                // refusals. Those fall through to the general pointer path.
                 if let Some(name) = reference.strip_prefix(prefix) {
-                    return Ok(Expr::RuleRef(sanitize_rule_name(name)));
+                    if !name.contains('/') {
+                        return Ok(Expr::RuleRef(sanitize_rule_name(name)));
+                    }
                 }
+            }
+            // Any other pointer into the document. `$ref` is a JSON pointer,
+            // not a name in a definitions block, and schemas in the wild point
+            // at properties, items and definition blocks under other names -
+            // `#/properties/author`, `#/defs/scope`. Resolving the pointer and
+            // lowering what it finds treats all of them alike, and the result
+            // is named after the pointer so that two references to the same
+            // place share one rule and a recursive one terminates.
+            if let Some(pointer) = reference.strip_prefix('#') {
+                let name = format!("ref_{}", sanitize_rule_name(pointer));
+                if !self.pointers.insert(name.clone()) {
+                    return Ok(Expr::RuleRef(name));
+                }
+                let target = resolve_pointer(self.document, pointer)
+                    .ok_or_else(|| anyhow!("$ref points nowhere: {reference}"))?
+                    .clone();
+                let body = self.visit(&target, &name)?;
+                self.define_named(name.clone(), body)?;
+                return Ok(Expr::RuleRef(name));
             }
             bail!("unsupported $ref: {}", reference);
         }
@@ -1051,59 +1085,236 @@ fn strip_keys(schema: &Value, drop: &[&str]) -> Value {
     )
 }
 
+/// Keywords that describe a schema without constraining what it accepts.
+///
+/// Two `allOf` branches that disagree only about their prose are not in
+/// conflict, and refusing them cost real schemas: `allOf` carries a lift of 21
+/// over the corpus's lowering failures, and most of those branches differ only
+/// here or in a bound that has a perfectly good intersection.
+const ANNOTATIONS: &[&str] = &[
+    "$comment",
+    "$id",
+    "$schema",
+    "default",
+    "definitions",
+    "deprecated",
+    "description",
+    "examples",
+    "readOnly",
+    "title",
+    "writeOnly",
+    "$defs",
+];
+
 /// Combine `allOf` branches into one schema.
 ///
 /// A grammar cannot intersect two languages, so the branches have to be merged
-/// before lowering. That is exact for the shape `allOf` is actually used in -
-/// several partial object descriptions, each naming properties and requirements
-/// the others do not - because a conjunction of those is the union of their
-/// properties and requirements. It is refused rather than approximated whenever
-/// two branches say something different about the same thing, since a mask that
-/// is nearly right is a mask that lets an invalid token through.
+/// before lowering, and the merge has to be exact: a mask that is nearly right
+/// is a mask that lets an invalid token through. Most of JSON Schema's
+/// keywords do have an exact conjunction - a bound meets its partner at the
+/// tighter of the two, a set of types at its intersection, two property maps at
+/// their union with shared names merged in turn - so the merge computes it, and
+/// refuses only where it genuinely cannot.
 fn merge_all_of(parent: &Value, branches: &[Value]) -> Result<Value> {
-    let mut merged = serde_json::Map::new();
-    for (key, value) in parent.as_object().expect("checked by the caller") {
-        if key != "allOf" {
-            merged.insert(key.clone(), value.clone());
+    let mut merged = Value::Object(
+        parent
+            .as_object()
+            .expect("checked by the caller")
+            .iter()
+            .filter(|(key, _)| key.as_str() != "allOf")
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    );
+    for branch in branches {
+        merged = meet(&merged, branch)?;
+    }
+    Ok(merged)
+}
+
+/// The conjunction of two schemas, or an error if it cannot be computed.
+fn meet(left: &Value, right: &Value) -> Result<Value> {
+    let (Some(left_object), Some(right_object)) = (left.as_object(), right.as_object()) else {
+        // `true` and `false` as schemas: one accepts everything, the other
+        // nothing, and neither shape appears in the corpus.
+        bail!("allOf branches must be objects");
+    };
+    let mut merged = left_object.clone();
+
+    // A branch that is itself an `allOf` is flattened rather than refused: the
+    // conjunction is associative, so the inner branches simply join the outer.
+    if let Some(inner) = right_object.get("allOf") {
+        let inner = inner
+            .as_array()
+            .ok_or_else(|| anyhow!("allOf must be an array"))?;
+        let rest = Value::Object(
+            right_object
+                .iter()
+                .filter(|(key, _)| key.as_str() != "allOf")
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        );
+        let mut folded = meet(&Value::Object(merged), &rest)?;
+        for branch in inner {
+            folded = meet(&folded, branch)?;
         }
+        return Ok(folded);
     }
 
-    for branch in branches {
-        let branch = branch
-            .as_object()
-            .ok_or_else(|| anyhow!("allOf branches must be objects"))?;
-        for (key, value) in branch {
-            match (key.as_str(), merged.get_mut(key)) {
-                (_, None) => {
-                    merged.insert(key.clone(), value.clone());
-                }
-                ("properties", Some(Value::Object(into))) => {
-                    for (name, schema) in value
-                        .as_object()
-                        .ok_or_else(|| anyhow!("properties must be an object"))?
-                    {
-                        if into.get(name).is_some_and(|existing| existing != schema) {
-                            bail!("allOf branches disagree about property '{name}'");
-                        }
-                        into.insert(name.clone(), schema.clone());
-                    }
-                }
-                ("required", Some(Value::Array(into))) => {
-                    for name in value
-                        .as_array()
-                        .ok_or_else(|| anyhow!("required must be an array"))?
-                    {
-                        if !into.contains(name) {
-                            into.push(name.clone());
-                        }
-                    }
-                }
-                (_, Some(existing)) if existing == value => {}
-                (key, _) => bail!("allOf branches disagree about '{key}'"),
-            }
+    for (key, value) in right_object {
+        let Some(existing) = merged.get(key) else {
+            merged.insert(key.clone(), value.clone());
+            continue;
+        };
+        if existing == value {
+            continue;
         }
+        let combined = match key.as_str() {
+            // Prose. Whichever is kept, the language is the same.
+            key if ANNOTATIONS.contains(&key) => continue,
+
+            // A bound meets its partner at whichever is tighter.
+            "minLength" | "minItems" | "minProperties" | "minimum" | "exclusiveMinimum" => {
+                tighter(existing, value, true)?
+            }
+            "maxLength" | "maxItems" | "maxProperties" | "maximum" | "exclusiveMaximum" => {
+                tighter(existing, value, false)?
+            }
+
+            // Both must hold, and `false` admits nothing beyond what is named.
+            "additionalProperties" | "additionalItems" | "unevaluatedProperties" => {
+                if existing == &Value::Bool(false) || value == &Value::Bool(false) {
+                    Value::Bool(false)
+                } else {
+                    meet(existing, value)?
+                }
+            }
+            "uniqueItems" => Value::Bool(
+                existing.as_bool().unwrap_or(false) || value.as_bool().unwrap_or(false),
+            ),
+
+            // Sets meet at their intersection, and an empty one is a schema
+            // nothing satisfies - which is a refusal rather than a merge.
+            "type" => {
+                let both = intersect(&as_set(existing), &as_set(value));
+                if both.is_empty() {
+                    bail!("allOf branches ask for incompatible types");
+                }
+                if both.len() == 1 {
+                    Value::String(both[0].clone())
+                } else {
+                    Value::Array(both.into_iter().map(Value::String).collect())
+                }
+            }
+            "enum" => {
+                let left = existing
+                    .as_array()
+                    .ok_or_else(|| anyhow!("enum must be an array"))?;
+                let right = value
+                    .as_array()
+                    .ok_or_else(|| anyhow!("enum must be an array"))?;
+                let both: Vec<Value> = left
+                    .iter()
+                    .filter(|entry| right.contains(entry))
+                    .cloned()
+                    .collect();
+                if both.is_empty() {
+                    bail!("allOf branches ask for disjoint enums");
+                }
+                Value::Array(both)
+            }
+
+            // A property named by both branches has to satisfy both.
+            "properties" | "patternProperties" | "definitions" | "$defs" => {
+                let (Some(left), Some(right)) = (existing.as_object(), value.as_object())
+                else {
+                    bail!("{key} must be an object");
+                };
+                let mut into = left.clone();
+                for (name, schema) in right {
+                    match into.get(name) {
+                        Some(held) if held != schema => {
+                            let combined = meet(held, schema)?;
+                            into.insert(name.clone(), combined);
+                        }
+                        _ => {
+                            into.insert(name.clone(), schema.clone());
+                        }
+                    }
+                }
+                Value::Object(into)
+            }
+            "required" => {
+                let mut into = existing
+                    .as_array()
+                    .ok_or_else(|| anyhow!("required must be an array"))?
+                    .clone();
+                for name in value
+                    .as_array()
+                    .ok_or_else(|| anyhow!("required must be an array"))?
+                {
+                    if !into.contains(name) {
+                        into.push(name.clone());
+                    }
+                }
+                Value::Array(into)
+            }
+            "items" => meet(existing, value)?,
+
+            // `$ref` cannot be met without resolving it, and two different
+            // patterns have no intersection expressible as a pattern.
+            key => bail!("allOf branches disagree about '{key}'"),
+        };
+        merged.insert(key.clone(), combined);
     }
     Ok(Value::Object(merged))
+}
+
+/// Whichever of two numeric bounds is the tighter.
+fn tighter(left: &Value, right: &Value, lower: bool) -> Result<Value> {
+    let (Some(a), Some(b)) = (left.as_f64(), right.as_f64()) else {
+        bail!("a bound must be a number");
+    };
+    let keep_left = if lower { a >= b } else { a <= b };
+    Ok(if keep_left {
+        left.clone()
+    } else {
+        right.clone()
+    })
+}
+
+fn as_set(value: &Value) -> Vec<String> {
+    match value {
+        Value::String(name) => vec![name.clone()],
+        Value::Array(names) => names
+            .iter()
+            .filter_map(|name| name.as_str().map(str::to_string))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn intersect(left: &[String], right: &[String]) -> Vec<String> {
+    left.iter()
+        .filter(|name| right.contains(name))
+        .cloned()
+        .collect()
+}
+
+/// Follow a JSON pointer into the document, unescaping as RFC 6901 says.
+fn resolve_pointer<'v>(document: &'v Value, pointer: &str) -> Option<&'v Value> {
+    let mut here = document;
+    for token in pointer.trim_start_matches('/').split('/') {
+        if token.is_empty() {
+            continue;
+        }
+        let token = token.replace("~1", "/").replace("~0", "~");
+        here = match here {
+            Value::Object(map) => map.get(&token)?,
+            Value::Array(items) => items.get(token.parse::<usize>().ok()?)?,
+            _ => return None,
+        };
+    }
+    Some(here)
 }
 
 fn integer_bounds(schema: &Value) -> Result<(Option<i64>, Option<i64>)> {
