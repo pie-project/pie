@@ -10,7 +10,7 @@
 // emit_driver_test_kernel_fixtures`, so this pins the same cross-language
 // vectors -- one compile further down the pipeline than it used to.
 //
-//   ./ptir_golden_exec_test tests/golden-ptir-kernels
+//   ./ptir_golden_exec_test ../fixtures
 
 #include <algorithm>
 #include <cstdint>
@@ -705,7 +705,7 @@ void run_async_writer_seed_pull() {
 }
 
 int main(int argc, char** argv) {
-    std::string dir = argc > 1 ? argv[1] : "tests/golden-ptir-kernels";
+    std::string dir = argc > 1 ? argv[1] : "../fixtures";
     cudaDeviceProp p{}; cudaGetDeviceProperties(&p, 0);
     std::printf("PTIR cross-backend golden step-exec — device: %s (sm_%d%d), packages: %s\n\n",
                 p.name, p.major, p.minor, dir.c_str());

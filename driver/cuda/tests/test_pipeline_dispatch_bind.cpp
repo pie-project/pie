@@ -27,7 +27,7 @@ int main() {
     // The launch package the engine would have handed the driver. Kept beside
     // the trace by `cargo test -p pie-compiler-tests --test cuda_golden
     // emit_driver_test_kernel`; the driver derives none of it any more.
-    const std::string fixture = "golden-ptir-kernels/greedy_argmax";
+    const std::string fixture = "../../fixtures/greedy_argmax";
     pie_cuda_driver::tests::HostKernelFixture host_kernels;
     pie_cuda_driver::tests::HostLaunchFixture host_launch;
     pie_cuda_driver::tests::HostRegionFixture host_regions;

@@ -459,7 +459,7 @@ fn emit_driver_test_kernel_fixtures() {
 
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let traces = manifest.join("driver-corpus");
-    let out_dir = manifest.join("../../driver/cuda/tests/golden-ptir-kernels");
+    let out_dir = manifest.join("../../driver/fixtures");
     std::fs::create_dir_all(&out_dir).unwrap();
 
     let mut written = 0;

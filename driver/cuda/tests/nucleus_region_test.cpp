@@ -10,7 +10,7 @@
 
 int main(int argc, char** argv) {
     const std::string path =
-        (argc > 1 ? argv[1] : "tests/golden-ptir-kernels") +
+        (argc > 1 ? argv[1] : "../fixtures") +
         std::string("/nucleus_sample.launch");
     pie_native::launch::PackageImage image;
     std::string error;

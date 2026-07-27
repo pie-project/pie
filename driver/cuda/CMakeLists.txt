@@ -990,7 +990,7 @@ pie_add_cuda_target(test_grouped_copy
 pie_add_cuda_target(test_nucleus_region
   SOURCES tests/nucleus_region_test.cpp
   INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/../abi/include ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include ${PIE_DRIVER_ABI_INCLUDE_DIR} ${PIE_LOADER_INCLUDE_DIR}
-  TEST_ARGS ${CMAKE_CURRENT_SOURCE_DIR}/tests/golden-ptir-kernels)
+  TEST_ARGS ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures)
 pie_add_cuda_target(test_page_translation
   SOURCES tests/page_translation_test.cpp)
 pie_add_cuda_target(test_ptir_graph_key
@@ -1035,7 +1035,7 @@ pie_add_cuda_target(test_ptir_grouped_dispatch
   SOURCES tests/ptir_grouped_dispatch_test.cpp
   INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/tests
   LIBS pie_driver_cuda_lib
-  TEST_ARGS ${CMAKE_CURRENT_SOURCE_DIR}/tests/golden-ptir-kernels)
+  TEST_ARGS ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   # Keeps its own copies of the sources under test: -fsanitize=address below is
   # PRIVATE, so linking pie_driver_cuda_lib would hand it uninstrumented
@@ -1056,7 +1056,7 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
       ${CMAKE_CURRENT_SOURCE_DIR}/../abi/include ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include
       ${PIE_DRIVER_ABI_INCLUDE_DIR} ${PIE_LOADER_INCLUDE_DIR}
     LIBS pie_driver_cuda_lib CUDA::cudart CUDA::cuda_driver CUDA::nvrtc
-    TEST_ARGS ${CMAKE_CURRENT_SOURCE_DIR}/tests/golden-ptir-kernels)
+    TEST_ARGS ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures)
   target_compile_options(test_ptir_grouped_dispatch_asan PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-fsanitize=address>
     $<$<COMPILE_LANGUAGE:CXX>:-fno-omit-frame-pointer>
@@ -1072,7 +1072,7 @@ pie_add_cuda_target(test_ptir_golden_exec
   SOURCES tests/ptir_golden_exec_test.cu
   INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/../abi/include ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include ${PIE_DRIVER_ABI_INCLUDE_DIR} ${PIE_LOADER_INCLUDE_DIR}
   LIBS CUDA::cudart
-  TEST_ARGS ${CMAKE_CURRENT_SOURCE_DIR}/tests/golden-ptir-kernels)
+  TEST_ARGS ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures)
 pie_add_cuda_target(test_entry_validation
   SOURCES tests/entry_validation_test.cpp
   LIBS pie_driver_cuda_lib)

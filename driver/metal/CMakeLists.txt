@@ -281,6 +281,24 @@ add_metal_host_test(
   pipeline_descriptor_resolve_test
   tests/pipeline_descriptor_resolve_test.cpp)
 
+# The only host-runnable coverage of `interp.hpp`, which is live code
+# (`context.cpp` reaches `pipeline::step`). It replays the same relocatable
+# launch-package images the CUDA driver tests register -- the image is an ABI
+# record dump, so it is backend-neutral, which is why the fixtures live at
+# `driver/fixtures/` and not under either driver.
+add_executable(pipeline_launch_conformance_test
+  tests/pipeline_launch_conformance_test.cpp)
+target_include_directories(pipeline_launch_conformance_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/../abi/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../interface/driver/include)
+# The fixture directory is generated, so it is passed as an absolute path
+# rather than relied on as a working directory that may not exist yet.
+add_test(NAME pipeline_launch_conformance_test
+  COMMAND pipeline_launch_conformance_test
+    ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures)
+
 add_executable(heap_layout_slot_test tests/heap_layout_slot_test.cpp)
 target_include_directories(heap_layout_slot_test PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
