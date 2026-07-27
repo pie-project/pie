@@ -114,9 +114,21 @@ impl Lowering {
     ///
     /// This is the cost model of `spec.md` §3.3, and it is known before any I/O
     /// happens. A whole tensor, a row shard and a strided expert select all
-    /// cost 1; a fusion of three sources costs 3; an expression the affine
-    /// fragment cannot fold costs one copy per stretch, which is the signal
-    /// that a gather kernel is the right lowering.
+    /// cost 1; a fusion of three sources costs 3.
+    ///
+    /// `plan/build.rs` reads it to decide a lowering: cost 1 is one rectangle
+    /// covering the whole destination, so the tensor aliases the checkpoint
+    /// bytes or views a buffer instead of copying. That is the cheapest thing
+    /// the loader does and it is this number that selects it.
+    ///
+    /// It does *not* decide whether to slab-scatter. That choice weighs one
+    /// over-read against many small reads, so its inputs are the gaps between
+    /// source ranges and the ratio of span to payload — and it coalesces
+    /// *across tensors*, sorted by file offset. A `Lowering` is one tensor's
+    /// expression and has neither, which is why the decision lives in
+    /// `plan/passes/rewrite.rs` after the offsets are assigned, and why
+    /// `spec.md` §3.3 calls its thresholds a loader policy rather than a
+    /// function of the algebra.
     pub fn cost(&self) -> usize {
         self.copy_pieces().len() + usize::from(self.needs_zero_fill())
     }

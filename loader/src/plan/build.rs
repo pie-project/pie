@@ -246,10 +246,18 @@ impl Builder<'_> {
             .ok_or_else(|| Error::Overflow(format!("'{}' size overflow", decl.name)))?;
         let rects = lowering.byte_pieces(&decl.encoding)?;
 
-        // One copy covering the whole output can often avoid a copy entirely.
-        // Not when the destination has holes: aliasing or viewing a source
-        // would hand back bytes the expression says are zero.
-        if let [rect] = rects.as_slice()
+        // `spec.md` §3.3's cost model, deciding the lowering. A cost of 1 is a
+        // single rectangle covering the whole destination, and the cheapest way
+        // to execute one copy is not to: the tensor can alias the checkpoint
+        // bytes, or view a buffer that already holds them. Everything above 1
+        // has to move something.
+        //
+        // A hole is priced into `cost`, so `cost == 1` already excludes a
+        // padded destination — aliasing one would hand back bytes the
+        // expression says are zero. The check is spelled out anyway, because a
+        // silent wrong answer here is indistinguishable from a correct one.
+        if lowering.cost() == 1
+            && let [rect] = rects.as_slice()
             && !lowering.needs_zero_fill()
             && rect.dst_offset == 0
             && rect.bytes() == output_bytes

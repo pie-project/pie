@@ -186,6 +186,14 @@ pub(super) fn flush_pending_bulk(
 /// Coalescing thresholds for the slab-scatter pass, bundled so the knobs are
 /// passed by name — a transposed pair of same-typed positional args would
 /// silently change coalescing behavior.
+///
+/// These are `spec.md` §3.3's "loader policy informed by measured bandwidth",
+/// and they are not on `StorageTarget` because they are not facts about a
+/// device: every backend reads files the same way. They are also not a function
+/// of `Lowering::cost` — a slab groups writes from *different tensors* by file
+/// offset, so the quantities that decide it (the gap between two sources, the
+/// ratio of span to payload) do not exist until offsets are assigned and no
+/// single expression has them.
 #[derive(Clone, Copy)]
 pub(super) struct SlabConfig {
     max_slab_bytes: u64,

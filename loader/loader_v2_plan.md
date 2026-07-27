@@ -327,9 +327,7 @@ Production reads exactly two things off a `Lowering`: `pieces()` and
 > *"The threshold is a loader policy informed by measured bandwidth. **Today
 > this decision does not exist**; passes hard-code one lowering each."*
 
-So of the three claims in "the cost model is in the grammar, is computable
-before any I/O, and feeds a real planning decision", the first two hold and the
-third does not. v2 closes it in `plan/build.rs`:
+**Landed differently, and the plan above was wrong.** The sketch was:
 
 ```rust
 match lowering.cost() {
@@ -338,9 +336,47 @@ match lowering.cost() {
 }
 ```
 
-That is **one plan instruction** (`Gather`, a descriptor buffer plus a kernel),
-not one algebra operator — and it is the first place a number from `Lowering`
-changes what the plan says.
+Two things were wrong with it.
+
+First, `Gather` already exists. It is `StorageInstr::SlabScatter` — one
+over-read of a file region plus a device-side descriptor buffer of placements —
+and `driver/cuda/src/loader/load_plan_executor.hpp` has had the kernel for it
+all along. Adding a second instruction for the same idea would have been the
+thing §4.1 is against.
+
+Second, and this is the real error: **that decision cannot be a function of a
+`Lowering`.** A slab groups writes from *different tensors*, sorted by file
+offset, and what decides it is the gap between two source ranges and the ratio
+of span to payload. A `Lowering` is one tensor's expression; it has neither the
+gaps nor the neighbours. The quantities do not even exist until arena offsets
+are assigned. So the decision belongs to a pass over the whole schedule, after
+`assign-persistent-offsets`, which is exactly where
+`plan/passes/rewrite.rs::build_slab_scatter_writes` already makes it. The
+existing placement was right and the plan was wrong about it.
+
+What was actually missing was the *other* direction. `cost()` had no reader,
+but the decision it can make was already being made — spelled as a slice
+pattern where nobody would recognise it:
+
+```rust
+if let [rect] = rects.as_slice() && rect.dst_offset == 0 && rect.bytes() == output_bytes
+```
+
+That is `cost() == 1`: one rectangle covering the whole destination, so the
+tensor can alias the checkpoint's bytes or view a buffer instead of copying.
+It is the most valuable choice the compiler makes — a whole-tensor load moves
+nothing — and §3.3's cost model selects it. `plan/build.rs` now says so.
+
+So §3.3's claim splits in two, and both halves are now true: the cost model
+*does* decide a lowering (at cost 1), and the slab thresholds *are* a loader
+policy rather than a function of the algebra — which is what §3.3's own
+sentence said before the sketch above talked us out of it. They stay off
+`StorageTarget`: they are not facts about a device, since every backend reads
+files the same way, and §13 already has enough `TargetSpec` accumulation.
+
+`run_count()` and `mean_run_elements()` keep no production reader and are kept
+deliberately: they are measurements of the fold, they are what the §3.3 table
+is built from, and `contract/compile.rs`'s tests are their readers.
 
 ### 4.6 The rewrite laws get a home
 
@@ -440,8 +476,8 @@ policy for the shrunk operator set.
 | constructors | 8 + 2 escape hatches | **9 + 1 escape hatch** |
 | leaves the algebra | — | `Quantize` → record field |
 | unreachable | `Pad` | — (`Fill` added) |
-| new plan instructions | — | `Fill`, `Gather` |
-| §3.3 cost model | computed, discarded | **decides the lowering** |
+| new plan instructions | — | `Fill` (`Gather` was already `SlabScatter` — §4.5) |
+| §3.3 cost model | computed, discarded | **decides the no-copy lowering at cost 1** |
 | §3.4 laws | stated | checked; one implementable |
 | code behind the algebra | 8 files per primitive | **2** |
 
@@ -550,6 +586,36 @@ same time as them.
 
 Steps 1–6 are pure refactor: if the goldens move, the step is wrong. Step 7 is
 the only one that changes what the loader can do.
+
+### What landed, against the table
+
+Steps 1–6 landed as one commit rather than six, because the middle IR could not
+be deleted incrementally: `frontend.rs` and `planner.rs` had to fuse in the same
+edit that removed the thing they passed between them.
+
+| # | outcome |
+| --- | --- |
+| 1–4 | `b36f373c6`. Goldens moved by **exactly** `optimizer` → `passes`; every instruction, buffer, offset and byte count byte-identical. The `live-normalization` pass turned out to be dead in all 14 plans. |
+| 5 | partly. The arrow reversed — `plan` owns the tile-map bits and `ffi/types.rs` restates them under the C names, pinned by a `const` assertion, because cbindgen emits literals and cannot follow a path. No `abi/` directory and no `abi_enum!`: the six `ffi/` modules were judged sound in the row-13 review and a macro would have bought nothing. |
+| 6 | `978257c21`. `Backend` → `match`; `Release`, `Reorder`, three `QuantSpec` fields and `old_to_new` deleted; `testkit` is a default-on feature that `worker/Cargo.toml` turns off, which makes "nothing in the driver path reaches the oracle" a build check. |
+| 7 | `Fill` landed (`d3100d497`). `Gather` did **not**, and should not — see §4.5: it already exists as `SlabScatter`, and the decision the plan wanted to wire to `cost()` structurally cannot be one. Goldens unchanged, because no contract pads yet. |
+| 8 | spec.md §3.3 rewritten around the split in §4.5; the `[4, 4]` pad row is now pinned by a test so the document and the compiler cannot drift. |
+
+Two things the table did not predict.
+
+**The measured win was not in the plan at all.** Compiling was O(N²) — 2149 ms
+for 32k tensors — and the cause was six `iter().find()` calls in per-instruction
+loops, every one of them looking up a dense id. `plan/index.rs` makes density an
+invariant rather than a cache, and the same checkpoint now takes 138 ms.
+`tests/scale_probe.rs` asserts the shape of the curve, not a wall-clock number.
+
+**Writing the `Fill` test found a bug in a pass that already existed.**
+`hoist-bulk-arena-writes` partitions the schedule into allocations, bulk writes
+and everything else — so a fill landed in "everything else" and ran *after* the
+writes it was meant to precede. A fill in the wrong place is the one reordering
+error that is silent: the plan still validates and still has the right
+instruction count. `validate-fill-order` makes it an invariant, so the next pass
+that reorders is told rather than trusted.
 
 ---
 

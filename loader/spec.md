@@ -255,7 +255,10 @@ The third rule is what keeps the cost model from lying about what will happen.
 It costs something: a head-dim pad lands its surviving bands in a destination
 that skips, so it is one copy per band rather than one for all of them.
 Lifting it means teaching both drivers a scattering copy, which is tracked in
-§8; until then the model reports what the machine will actually do.
+§8; until then the model reports what the machine will actually do. The `[4, 4]`
+row of the table below is pinned by
+`tests/algebra.rs::padding_a_head_dim_leaves_zeros_and_folds_the_copies`, so
+the number in this document and the number in the compiler cannot drift.
 
 What the model then reports:
 
@@ -268,15 +271,32 @@ What the model then reports:
 | q/k/v fusion, each shard strided | 1024 | 3 |
 | head-dim pad of `[4, 4]` by one column | one per band | 5 |
 
-And the decision it feeds:
+And the decision it feeds. A cost of **1** is one rectangle covering the whole
+destination, and the cheapest way to execute one copy is not to: the tensor
+aliases the checkpoint's bytes, or views a buffer that already holds them.
+`plan/build.rs` reads `Lowering::cost` for exactly this, and it is the most
+valuable choice the compiler makes — a whole-tensor load moves nothing. Every
+cost above 1 has to move something.
 
-- **few pieces** → DMA / `cudaMemcpy` per piece.
-- **many pieces** — an expression whose runs genuinely do not fold, because the
-  strides are irregular rather than merely numerous → materialize a descriptor
-  buffer and run a gather kernel.
+There is a second decision, and it is deliberately **not** a function of this
+number:
 
-The threshold is a loader policy informed by measured bandwidth. Today this
-decision does not exist; passes hard-code one lowering each.
+- **few pieces** → DMA / `cudaMemcpy` per piece (`ExtentWrite`,
+  `BulkExtentWrite`).
+- **many pieces**, close together in the file → one over-read plus a descriptor
+  buffer of placements, scattered on the device (`SlabScatter`).
+
+That choice weighs one over-read against many small reads, so its inputs are
+the *gaps* between source ranges and the ratio of span to payload — and it
+coalesces across **different tensors**, sorted by file offset. A `Lowering` is
+one tensor's expression and has neither the gaps nor the neighbours, so it
+cannot decide this and should not pretend to. The decision belongs to a pass
+over the whole schedule, after arena offsets are assigned, which is where
+`plan/passes/rewrite.rs` makes it.
+
+Its thresholds are a loader policy informed by measured bandwidth, and they are
+not on `StorageTarget`: they are not facts about a device, because every
+backend reads files the same way.
 
 ### 3.4 Rewrite laws
 
