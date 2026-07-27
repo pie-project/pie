@@ -22,8 +22,8 @@
 #include <cuda_runtime.h>
 #include <nvrtc.h>
 
-#include "pie_native/ptir/ptir_abi.h"
-#include "pipeline/generated/fused_codegen.hpp"
+#include <ptir_abi.h>
+#include "pipeline/region_support.hpp"
 
 namespace pie_cuda_driver::pipeline::generated {
 
@@ -226,24 +226,30 @@ class ModuleCache {
                     }
                 }
                 if (executable == nullptr) {
-                    // The host runs the same emitter (`compiler/codegen`), so
-                    // prefer what it shipped and only fall back to the
-                    // in-driver copy while both exist. The two are pinned
-                    // byte-for-byte by `compiler/tests/golden-cuda/`.
+                    // The host is the only emitter now (`compiler/codegen`).
+                    // A region with no supplied source is a deterministic
+                    // failure, not a cue to generate one here: the in-driver
+                    // emitter is gone, and silently diverging from the host's
+                    // decision is the bug this seam exists to prevent.
                     GeneratedKernelSource source;
                     const std::string* supplied =
                         host_source != nullptr
                             ? host_source(host_context, this_stage, region_index)
                             : nullptr;
-                    if (supplied != nullptr) {
-                        source.ok = true;
-                        source.entry_name = entry;
-                        source.source = *supplied;
-                        ++stats_.host_sources;
-                    } else {
-                        source = emit_fused_region_cuda(entry, plan, region);
-                        ++stats_.driver_sources;
+                    if (supplied == nullptr) {
+                        failure_kind = CompileFailureKind::Deterministic;
+                        error =
+                            "no host-emitted kernel for stage " +
+                            std::to_string(this_stage) + " region " +
+                            std::to_string(region_index) +
+                            "; the driver no longer generates its own";
+                        remember_negative(key, error);
+                        return nullptr;
                     }
+                    source.ok = true;
+                    source.entry_name = entry;
+                    source.source = *supplied;
+                    ++stats_.host_sources;
                     if (!source.ok) {
                         failure_kind = CompileFailureKind::Deterministic;
                         error = source.error;

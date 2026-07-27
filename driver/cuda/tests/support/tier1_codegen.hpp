@@ -28,7 +28,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include "pie_native/ptir/rng_contract.generated.h"
+#include <rng_contract.generated.h>
 #include "pie_native/ptir/trace.hpp"
 
 namespace pie_cuda_driver::pipeline {

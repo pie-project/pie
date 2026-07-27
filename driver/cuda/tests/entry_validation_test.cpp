@@ -8,7 +8,7 @@
 #include "entry_validation.hpp"
 #include "kernels/slab_scatter.hpp"
 #include "pie_native/abi_validation.hpp"
-#include "pie_native/ptir/fire_geometry.hpp"
+#include "pie_native/fire/fire_geometry.hpp"
 #include "store/recurrent_state_cache.hpp"
 
 namespace {

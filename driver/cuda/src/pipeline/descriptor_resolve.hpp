@@ -28,8 +28,8 @@
 #include <vector>
 
 #include "pipeline/channel_registry.hpp"
-#include "pie_native/ptir/descriptor.hpp"
-#include "pie_native/ptir/fire_geometry.hpp"
+#include "pie_native/fire/descriptor.hpp"
+#include "pie_native/fire/fire_geometry.hpp"
 #include "pie_native/ptir/trace.hpp"
 
 namespace pie_cuda_driver::pipeline {

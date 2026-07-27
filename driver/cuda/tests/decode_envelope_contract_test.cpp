@@ -2,7 +2,7 @@
 #include <iostream>
 #include <vector>
 
-#include "pie_native/ptir/descriptor.hpp"
+#include "pie_native/fire/descriptor.hpp"
 
 namespace ptir = pie_native::ptir;
 namespace descriptor = pie_native::ptir::descriptor;

@@ -21,7 +21,7 @@
 #include <vector>
 
 #include "pie_native/ptir/op_table.hpp"
-#include "pie_native/ptir/rng_contract.generated.h"
+#include <rng_contract.generated.h>
 #include "pipeline/tier0/tier0_kernels.cuh"  // for the BinKind/UnKind/... enums (host-safe)
 
 namespace pie_cuda_driver::pipeline::host_eval {

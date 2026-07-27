@@ -1,7 +1,12 @@
 # `compiler/tests/oracle/` — the transitional C++ emitter oracles
 
-**Delete this directory when the C++ emitters are deleted.** Nothing links it
-into a build.
+**Delete this directory when the C++ emitters are deleted** — but **keep
+`../golden-msl/` and `../golden-cuda/`.** The Rust suites never read
+`corpus/stage_plans.txt`; they re-derive the plans from the 19 traces in
+`../golden/` through `pie-plan` and compare against the golden directories. The
+corpus is an input for the C++ side only. So the goldens keep working with no
+C++ present, and they are the only regression net the Rust emitters have once
+the oracles are gone. Nothing links this directory into a build.
 
 Both backends' emitters were ported from C++ to Rust (`compiler/codegen/src/`).
 These harnesses are how the ports were proven, and how they stay proven while
@@ -87,7 +92,7 @@ Same corpus file, same argument: the plans come from `corpus/stage_plans.txt`.
 |---|---|
 | `emit_singleton_region_cuda` | 263 — every tag byte, plus seven entry-name cases |
 | `emit_fused_region_cuda` | 320 — every region of every stage, bodies pinned by hash |
-| `emit_fused_region_cuda_verbatim` | 36 — one region per stage, kept whole so a diff is readable |
+| `emit_fused_region_cuda_verbatim` | 36 — kept whole so a diff is readable |
 | `validate_generated_region` | 320 |
 | `second_party_region_supported` | 320 |
 | `singleton_runtime_cuda_source` | 1 — the 45 KB runtime, pinned by hash |

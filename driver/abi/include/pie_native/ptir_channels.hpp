@@ -8,7 +8,7 @@
 #include <utility>
 #include <vector>
 
-#include "pie_native/ptir/ptir_abi.h"
+#include <ptir_abi.h>
 
 namespace pie_native {
 

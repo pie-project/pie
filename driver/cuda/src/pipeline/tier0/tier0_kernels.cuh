@@ -28,7 +28,7 @@
 #include <math_constants.h>
 
 #include "pie_native/ptir/op_table.hpp"
-#include "pie_native/ptir/rng_contract.generated.h"
+#include <rng_contract.generated.h>
 
 namespace pie_cuda_driver::pipeline {
 

@@ -27,7 +27,7 @@
 
 #include "pie_native/launch_view.hpp"
 
-#include "pie_native/ptir/fire_geometry.hpp"
+#include "pie_native/fire/fire_geometry.hpp"
 
 namespace pie_cuda_driver::pipeline {
 

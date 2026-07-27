@@ -41,16 +41,6 @@ fn generated_rng_artifacts_are_uptodate() {
         &root.join("compiler/codegen/include/ptir_rng.generated.metal"),
         &msl,
     );
-    // The mirrors the native drivers compile against, written from the same
-    // strings so they cannot drift.
-    check_or_regenerate(
-        &root.join("driver/common/include/pie_native/ptir/rng_contract.generated.h"),
-        &cuda,
-    );
-    check_or_regenerate(
-        &root.join("driver/metal/src/kernels/ptir_rng.generated.metal"),
-        &msl,
-    );
 }
 
 #[test]
@@ -197,7 +187,8 @@ fn rng_magic_is_owned_by_the_contract() {
         Path::new("compiler/ir/src/rng.rs"),
         Path::new("compiler/codegen/include/rng_contract.generated.h"),
         Path::new("compiler/codegen/include/ptir_rng.generated.metal"),
-        Path::new("driver/common/include/pie_native/ptir/rng_contract.generated.h"),
+        // Staged into driver/metal/src/kernels by CMake at configure time so
+        // ptir_m0.metal / ptir_m1_runtime.metal can `#include` it by name.
         Path::new("driver/metal/src/kernels/ptir_rng.generated.metal"),
     ];
     let unrelated_stride_users = [

@@ -20,7 +20,7 @@
 #include <cstdint>
 #include <string_view>
 
-#include "pie_native/ptir/ptir_abi.h"   // PTIR_OP_* tag constants, PtirDType/Stage/Port/… enums
+#include <ptir_abi.h>   // PTIR_OP_* tag constants, PtirDType/Stage/Port/… enums
 
 namespace pie_native::ptir {
 

@@ -43,8 +43,4 @@ fn ptir_header_uptodate() {
     let root = repo_root();
     let expected = generate_c_header();
     check_or_regenerate(&root.join("compiler/codegen/include/ptir_abi.h"), &expected);
-    check_or_regenerate(
-        &root.join("driver/common/include/pie_native/ptir/ptir_abi.h"),
-        &expected,
-    );
 }

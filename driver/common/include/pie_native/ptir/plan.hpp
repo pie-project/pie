@@ -8,7 +8,7 @@
 #include <vector>
 
 #include "pie_native/ptir/container.hpp"
-#include "pie_native/ptir/ptir_abi.h"
+#include <ptir_abi.h>
 
 namespace pie_native::ptir::plan {
 
