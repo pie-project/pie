@@ -28,7 +28,6 @@ namespace pie_native::launch {
 
 using ValueId   = std::uint32_t;   // SSA value id, unique within a program
 using ChannelId = std::uint32_t;   // channel index within a program
-using InputKey  = std::uint32_t;   // host-input selector into the request table
 using ProgramId = std::uint32_t;
 
 // Trace-known logical shape: an ordered dim list (row-major). Empty = scalar.
@@ -85,7 +84,6 @@ enum class RngKind : std::uint8_t { Uniform = 0, Gumbel = 1 };
 enum class ValueSource : std::uint8_t {
     Const       = PIE_VALUE_CONST,         // trace-known literal
     Intrinsic   = PIE_VALUE_INTRINSIC,     // stage-scoped intrinsic (logits/hidden/…)
-    HostInput   = PIE_VALUE_HOST_INPUT,    // submit- or late-bound host tensor
     ChannelTake = PIE_VALUE_CHANNEL_TAKE,  // consumes a full cell, marks it empty
     ChannelRead = PIE_VALUE_CHANNEL_READ,  // peeks a full cell without consuming
     OpResult    = PIE_VALUE_OP_RESULT,     // produced by an op in this stage's DAG
@@ -100,11 +98,6 @@ enum class Intrinsic : std::uint8_t {
     Layer = PTIR_INTR_LAYER,
     MtpDrafts = PTIR_INTR_MTP_DRAFTS,
     AttnScore = PTIR_INTR_ATTN_SCORE,
-};
-
-enum class HostAvailability : std::uint8_t {
-    SubmitBound = PIE_HOST_SUBMIT_BOUND,
-    LateBound = PIE_HOST_LATE_BOUND,
 };
 
 // A literal payload (dtype + 4 raw bytes, interpreted per dtype).
@@ -132,8 +125,6 @@ struct Value {
     // Source-specific payload:
     Literal          lit;                                   // Const
     Intrinsic        intrinsic = Intrinsic::Logits;         // Intrinsic
-    InputKey         host_key = 0;                          // HostInput
-    HostAvailability host_avail = HostAvailability::SubmitBound;  // HostInput
     ChannelId        channel = 0;                           // ChannelTake / ChannelRead
 };
 
@@ -288,8 +279,6 @@ inline Trace adopt(const PieLaunchPackage& package) {
         value.lit.dtype = static_cast<DType>(src.dtype);
         value.lit.bits = src.literal_bits;
         value.intrinsic = static_cast<Intrinsic>(src.intrinsic);
-        value.host_key = src.host_key;
-        value.host_avail = static_cast<HostAvailability>(src.host_avail);
         value.channel = src.channel;
         trace.values.push_back(std::move(value));
     }

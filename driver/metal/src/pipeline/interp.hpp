@@ -229,9 +229,6 @@ inline void classify_exec_plan(ExecPlan& out) {
                         "(hidden/query/value-head/layer/attn-score; Metal forward not wired)";
                     break;
             }
-        } else if (v.source == launch::ValueSource::HostInput) {
-            out.executable = false;
-            out.reject_reason = "program reads a submit-bound host input (not executable on Metal)";
         }
     }
     for (const launch::Stage& st : out.trace.stages) {

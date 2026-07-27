@@ -30,7 +30,7 @@ use crate::geometry::GeometryClass;
 /// verdicts and intrinsic side-table analysis the CUDA driver derives for
 /// itself in `region_support.hpp`. Additive, and empty means "not supplied",
 /// but the struct grew, so drivers and workers ship together.
-pub const PIE_DRIVER_ABI_VERSION: u32 = 18;
+pub const PIE_DRIVER_ABI_VERSION: u32 = 19;
 pub const PIE_MODEL_COMPONENT_FULL: u32 = 0;
 pub const PIE_MODEL_COMPONENT_TEXT: u32 = 1;
 pub const PIE_MODEL_COMPONENT_ENCODE: u32 = 2;
@@ -611,14 +611,9 @@ pub struct PieRegionAnalysisSlice {
 /// Where a value comes from. Mirrors `pie_ir` value sources.
 pub const PIE_VALUE_CONST: u8 = 0;
 pub const PIE_VALUE_INTRINSIC: u8 = 1;
-pub const PIE_VALUE_HOST_INPUT: u8 = 2;
-pub const PIE_VALUE_CHANNEL_TAKE: u8 = 3;
-pub const PIE_VALUE_CHANNEL_READ: u8 = 4;
-pub const PIE_VALUE_OP_RESULT: u8 = 5;
-
-/// A host input is bound at submit time, not late.
-pub const PIE_HOST_SUBMIT_BOUND: u8 = 0;
-pub const PIE_HOST_LATE_BOUND: u8 = 1;
+pub const PIE_VALUE_CHANNEL_TAKE: u8 = 2;
+pub const PIE_VALUE_CHANNEL_READ: u8 = 3;
+pub const PIE_VALUE_OP_RESULT: u8 = 4;
 
 /// One declared SSA value: its type and its producer.
 #[repr(C)]
@@ -633,10 +628,8 @@ pub struct PieLaunchValue {
     pub dtype: u8,
     /// `PTIR_INTR_*` when `source` is `PIE_VALUE_INTRINSIC`.
     pub intrinsic: u8,
-    /// `PIE_HOST_*` when `source` is `PIE_VALUE_HOST_INPUT`.
-    pub host_avail: u8,
-    /// Request-table selector when `source` is `PIE_VALUE_HOST_INPUT`.
-    pub host_key: u32,
+    /// Reserved; must be zero.
+    pub reserved1: u8,
     /// Channel id when `source` is a channel take or read.
     pub channel: u32,
     /// Literal payload when `source` is `PIE_VALUE_CONST`, raw bits per dtype.

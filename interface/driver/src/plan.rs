@@ -152,9 +152,6 @@ pub struct LaunchValue {
     pub dtype: u8,
     /// `PTIR_INTR_*` when `source` is `PIE_VALUE_INTRINSIC`.
     pub intrinsic: u8,
-    /// `PIE_HOST_*` when `source` is `PIE_VALUE_HOST_INPUT`.
-    pub host_avail: u8,
-    pub host_key: u32,
     pub channel: u32,
     pub literal_bits: u32,
     pub shape: Vec<u32>,

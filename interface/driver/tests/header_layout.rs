@@ -95,7 +95,7 @@ fn contract_source() -> String {
     contract!(out, PieKvCopyDesc, abi_version, src_domain, src_device_ordinal, dst_domain, dst_device_ordinal, reserved0, src_page_ids, dst_page_ids, cells);
     contract!(out, PieStateCopyDesc, abi_version, reserved0, slot_ranges);
     contract!(out, PiePoolResizeDesc, abi_version, reserved0, pool_id, target_pages, map_ranges, unmap_ranges);
-    contract!(out, PieLaunchValue, id, source, dtype, intrinsic, host_avail, host_key, channel, literal_bits, reserved0, shape);
+    contract!(out, PieLaunchValue, id, source, dtype, intrinsic, reserved1, channel, literal_bits, reserved0, shape);
     contract!(out, PieLaunchValueSlice, ptr, len);
     contract!(out, PieLaunchOp, code, result_count, result_id, intrinsic, lit_dtype, dtype, pred_tag, rng_kind, reserved0, lit_bits, pred_payload, channel, name_index, imm, imm2, imm3, reserved1, args, shape);
     contract!(out, PieLaunchOpSlice, ptr, len);

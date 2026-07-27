@@ -69,7 +69,7 @@
  * itself in `region_support.hpp`. Additive, and empty means "not supplied",
  * but the struct grew, so drivers and workers ship together.
  */
-#define PIE_DRIVER_ABI_VERSION 18
+#define PIE_DRIVER_ABI_VERSION 19
 
 #define PIE_MODEL_COMPONENT_FULL 0
 
@@ -244,20 +244,11 @@
 
 #define PIE_VALUE_INTRINSIC 1
 
-#define PIE_VALUE_HOST_INPUT 2
+#define PIE_VALUE_CHANNEL_TAKE 2
 
-#define PIE_VALUE_CHANNEL_TAKE 3
+#define PIE_VALUE_CHANNEL_READ 3
 
-#define PIE_VALUE_CHANNEL_READ 4
-
-#define PIE_VALUE_OP_RESULT 5
-
-/**
- * A host input is bound at submit time, not late.
- */
-#define PIE_HOST_SUBMIT_BOUND 0
-
-#define PIE_HOST_LATE_BOUND 1
+#define PIE_VALUE_OP_RESULT 4
 
 /**
  * The channel is pre-filled with a seed cell at instantiation.
@@ -603,13 +594,9 @@ typedef struct PieLaunchValue {
    */
   uint8_t intrinsic;
   /**
-   * `PIE_HOST_*` when `source` is `PIE_VALUE_HOST_INPUT`.
+   * Reserved; must be zero.
    */
-  uint8_t host_avail;
-  /**
-   * Request-table selector when `source` is `PIE_VALUE_HOST_INPUT`.
-   */
-  uint32_t host_key;
+  uint8_t reserved1;
   /**
    * Channel id when `source` is a channel take or read.
    */

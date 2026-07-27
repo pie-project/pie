@@ -53,9 +53,9 @@ const INTR_ATTN_SCORE: u16 = 7;
 /// Value sources, mirroring `PIE_VALUE_*`.
 const VALUE_CONST: u8 = 0;
 const VALUE_INTRINSIC: u8 = 1;
-const VALUE_CHANNEL_TAKE: u8 = 3;
-const VALUE_CHANNEL_READ: u8 = 4;
-const VALUE_OP_RESULT: u8 = 5;
+const VALUE_CHANNEL_TAKE: u8 = 2;
+const VALUE_CHANNEL_READ: u8 = 3;
+const VALUE_OP_RESULT: u8 = 4;
 
 /// Channel flags, mirroring `PIE_CHANNEL_*`.
 const CHANNEL_SEEDED: u8 = 1 << 0;

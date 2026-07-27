@@ -115,7 +115,6 @@ struct FireInputs {
     const void* layer = nullptr;
     std::uint32_t vocab = 0;
     const void* row_seeds = nullptr;  // gumbel per-row seed buffer (u32 [rows])
-    std::unordered_map<std::uint32_t, const void*> host_inputs;  // host_key → device ptr
     cudaStream_t stream = nullptr;
     // Stage-2 MTP: the row base (within the `logits` buffer) of this fire's K MTP
     // DRAFT rows — an Intrinsic(MtpLogits) `[K, vocab]` matrix reads
@@ -555,7 +554,7 @@ class Tier0Runner {
         return d;
     }
 
-    // Materialize a root value (Const/Intrinsic/HostInput/Channel take-read) to a
+    // Materialize a root value (Const/Intrinsic/Channel take-read) to a
     // device pointer, recorded in val_ptr_. Op results are recorded by build_launch.
     bool resolve_root(ValueId id, const FireInputs& in, std::vector<void*>& scratch, std::string& err) {
         if (val_ptr_.count(id)) return true;
@@ -623,12 +622,6 @@ class Tier0Runner {
                     return true;
                 }
                 err = "tier-0: intrinsic not yet bound"; return false;
-            }
-            case ValueSource::HostInput: {
-                auto it = in.host_inputs.find(v->host_key);
-                if (it == in.host_inputs.end()) { err = "host input missing (late-bind miss)"; return false; }
-                val_ptr_[id] = const_cast<void*>(it->second);
-                return true;
             }
             case ValueSource::ChannelTake:
             case ValueSource::ChannelRead:
