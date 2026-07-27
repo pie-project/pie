@@ -1335,3 +1335,47 @@ It also means this table is a **worst case for the ratio**. A 0.6B model has a
 small decode step, so a constant 2.5 ms is a large fraction of it. On a
 production-sized model the same 2.5 ms is a much smaller share and the
 crossover moves substantially earlier.
+
+### 14.4 Where the 2.5 ms actually goes: the hook takes the request off the fused decode path
+
+§14.3 attributed the constant overhead to "per-layer hook dispatch". An `nsys`
+profile of the two programs at ~6.8K context, 31 decode steps each, says
+precisely what that means:
+
+| | baseline | quest |
+|---|---|---|
+| GPU kernel launches, whole run | 561 | 18 014 |
+| launches per decode step | ~18 | ~580 |
+| GPU time per decode step | ~0.37 ms | ~5.5 ms |
+
+The baseline's entire 28-layer decode step is **one fused kernel**
+(`ptir_fused_…`, 205 us) plus plumbing — no separate attention, projection,
+norm or activation launches appear at all. With a stage hook bound, that
+fusion is off, and every layer's `gemv` (1768 launches), decode attention
+(868), `qk_rmsnorm_rope` (896), `split_qkv` (896), `swiglu` (896) and `rmsnorm`
+(1824) is launched individually.
+
+Quest's own kernels are a small part of this. Per layer:
+`k_generated_envelope_dot` 12.1 us and the threshold/mask program 8.9 us —
+21 us/layer, 0.59 ms/step. The other ~4.5 ms/step is the *unfusing*, which the
+policy pays simply for asking to be called once per layer.
+
+So the ranking of things worth optimising in Quest is:
+
+1. **Restore fusion between hook points** (~4.5 ms/step). The hook needs to run
+   between layers, so the whole step cannot be one kernel — but the runs
+   *between* hooks could still fuse. This is an engine-level change to PTIR
+   dispatch, not a Quest change, and it would benefit every Track A and Track B
+   policy identically, since they all bind the same per-layer hook.
+2. `envelope_dot` itself (0.34 ms/step).
+3. The threshold/mask program (0.25 ms/step).
+4. Envelope maintenance (0.08 ms/step after §13.2).
+
+Items 2-4 together are smaller than a quarter of item 1. Nothing further in
+this file's kernels is worth tuning until fusion is addressed.
+
+One engine-level observation, flagged rather than attributed because it affects
+both programs equally and so cancels out of every comparison here:
+`cudaGraphInstantiate` was called 51 times at ~2.2 ms in a 31-step run, in both
+programs. Re-instantiating an executable graph rather than updating one is
+expensive enough to dominate the host side of a decode step.
