@@ -24,9 +24,7 @@
 
 use std::path::PathBuf;
 
-use pie_loader::arch::default_contract;
 use pie_loader::checkpoint::{CheckpointFile, CheckpointMetadata, RawTensor};
-use pie_loader::config::ModelConfig;
 use pie_loader::contract::ModelContract;
 use pie_loader::ffi::contract::{read_contract, write_contract};
 use pie_loader::load_plan::{
@@ -35,8 +33,7 @@ use pie_loader::load_plan::{
 };
 use pie_loader::planner::compile_load_plan;
 use pie_loader::types::{
-    BackendKind, CheckpointFormat, DType, Encoding, FileId, Mxfp4MoePolicy, QuantScheme, QuantSpec,
-    TensorId,
+    BackendKind, CheckpointFormat, DType, Encoding, FileId, QuantScheme, QuantSpec, TensorId,
 };
 use pie_loader::verify::{ContractCoverage, ContractView, PlanView, verify};
 
@@ -310,17 +307,6 @@ fn awq_checkpoint() -> CheckpointMetadata {
 
 // ── the harness ─────────────────────────────────────────────────────
 
-fn model(model_type: &str, layers: u32, experts: u32) -> ModelConfig {
-    ModelConfig {
-        model_type: model_type.to_string(),
-        quant_method: String::new(),
-        num_hidden_layers: layers,
-        num_experts: experts,
-        num_experts_per_tok: if experts > 0 { 2 } else { 0 },
-        runtime_quant: String::new(),
-    }
-}
-
 fn target(backend: BackendKind, tp_rank: u32, tp_size: u32) -> StorageTarget {
     StorageTarget {
         backend,
@@ -332,7 +318,6 @@ fn target(backend: BackendKind, tp_rank: u32, tp_size: u32) -> StorageTarget {
             BackendKind::Cuda => CUDA_TILE_MAP_MASK,
             _ => HOST_TILE_MAP_MASK,
         },
-        mxfp4_moe: Mxfp4MoePolicy::RoutedDecode,
         native_mxfp4_moe: false,
         fusion_mask: if backend == BackendKind::Cuda {
             FUSION_FP8_TO_MXFP4
@@ -342,6 +327,37 @@ fn target(backend: BackendKind, tp_rank: u32, tp_size: u32) -> StorageTarget {
         encode_scratch_dtype: DType::BF16,
         block_scale_rows: 128,
     }
+}
+
+/// The contract this golden compiles, as a stored fixture.
+///
+/// A golden is a test of the *compiler*, and the compiler's input is a
+/// contract. Storing the contract instead of re-deriving it from a model type
+/// is what lets the loader stop knowing what a model is: after `arch/` is gone
+/// there is no function in this crate that could produce one, and there should
+/// not be — authorship is the driver's job. Freezing them here keeps every
+/// construct the real families use (the MXFP4 repacks, the fused QKV `Cat`, the
+/// `Out` aliases into a bank, the strided GPTQ slices) under test, expressed as
+/// what they actually are: programs over a checkpoint.
+fn contract_fixture(name: &str) -> ModelContract {
+    let path = contract_path(name);
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|err| {
+        panic!(
+            "{name}: cannot read {}: {err}\n\
+             A new golden needs a contract next to it. Author one the way a \
+             driver does — `driver/common/include/pie_driver/model_contracts.hpp` \
+             can dump the real thing under PIE_TEST_CONTRACT_DUMP — or write the \
+             expression out by hand.",
+            path.display()
+        )
+    });
+    serde_json::from_str(&text).unwrap_or_else(|err| panic!("{name}: parsing the contract: {err}"))
+}
+
+fn contract_path(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden/contracts")
+        .join(format!("{name}.json"))
 }
 
 fn golden_path(name: &str) -> PathBuf {
@@ -390,9 +406,8 @@ fn check_stats_render(name: &str, plan: &LoadPlan) {
 /// was regenerated from a broken compiler would otherwise lock the breakage in:
 /// the file would faithfully record whatever came out. Requiring the plan to
 /// verify before it is allowed to become golden is what stops that.
-fn check(name: &str, metadata: &CheckpointMetadata, cfg: &ModelConfig, target: StorageTarget) {
-    let contract = default_contract(metadata, cfg, &target)
-        .unwrap_or_else(|err| panic!("{name}: building the contract failed: {err}"));
+fn check(name: &str, metadata: &CheckpointMetadata, target: StorageTarget) {
+    let contract = contract_fixture(name);
     check_contract_survives_the_ffi(name, &contract);
     let plan = compile_load_plan(metadata, &contract, target)
         .unwrap_or_else(|err| panic!("{name}: compiling failed: {err}"));
@@ -533,7 +548,6 @@ fn llama_dense_cuda() {
     check(
         "llama_dense_cuda",
         &llama_checkpoint(),
-        &model("llama", 2, 0),
         target(BackendKind::Cuda, 0, 1),
     );
 }
@@ -546,7 +560,6 @@ fn llama_dense_cuda_tp1_of_2() {
     check(
         "llama_dense_cuda_tp1_of_2",
         &llama_checkpoint(),
-        &model("llama", 2, 0),
         target(BackendKind::Cuda, 1, 2),
     );
 }
@@ -558,7 +571,6 @@ fn llama_dense_host() {
     check(
         "llama_dense_host",
         &llama_checkpoint(),
-        &model("llama", 2, 0),
         target(BackendKind::Unknown, 0, 1),
     );
 }
@@ -570,7 +582,6 @@ fn llama_dense_host_tp1_of_2() {
     check(
         "llama_dense_host_tp1_of_2",
         &llama_checkpoint(),
-        &model("llama", 2, 0),
         target(BackendKind::Unknown, 1, 2),
     );
 }
@@ -580,7 +591,6 @@ fn qwen3_moe_host() {
     check(
         "qwen3_moe_host",
         &qwen3_moe_checkpoint(),
-        &model("qwen3_moe", 1, 4),
         target(BackendKind::Unknown, 0, 1),
     );
 }
@@ -590,19 +600,15 @@ fn qwen3_moe_host_tp1_of_2() {
     check(
         "qwen3_moe_host_tp1_of_2",
         &qwen3_moe_checkpoint(),
-        &model("qwen3_moe", 1, 4),
         target(BackendKind::Unknown, 1, 2),
     );
 }
 
 #[test]
 fn awq_dense_host_tp1_of_2() {
-    let mut cfg = model("llama", 1, 0);
-    cfg.quant_method = "awq".to_string();
     check(
         "awq_dense_host_tp1_of_2",
         &awq_checkpoint(),
-        &cfg,
         target(BackendKind::Unknown, 1, 2),
     );
 }
@@ -612,7 +618,6 @@ fn qwen3_moe_cuda() {
     check(
         "qwen3_moe_cuda",
         &qwen3_moe_checkpoint(),
-        &model("qwen3_moe", 1, 4),
         target(BackendKind::Cuda, 0, 1),
     );
 }
@@ -622,7 +627,6 @@ fn qwen3_moe_cuda_tp1_of_2() {
     check(
         "qwen3_moe_cuda_tp1_of_2",
         &qwen3_moe_checkpoint(),
-        &model("qwen3_moe", 1, 4),
         target(BackendKind::Cuda, 1, 2),
     );
 }
@@ -632,7 +636,6 @@ fn gpt_oss_mxfp4_cuda() {
     check(
         "gpt_oss_mxfp4_cuda",
         &gpt_oss_checkpoint(),
-        &model("gpt_oss", 1, 2),
         target(BackendKind::Cuda, 0, 1),
     );
 }
@@ -640,24 +643,19 @@ fn gpt_oss_mxfp4_cuda() {
 #[test]
 fn gpt_oss_mxfp4_cuda_native_gemm() {
     let mut target = target(BackendKind::Cuda, 0, 1);
-    target.mxfp4_moe = Mxfp4MoePolicy::NativeGemm;
     target.native_mxfp4_moe = true;
     check(
         "gpt_oss_mxfp4_cuda_native_gemm",
         &gpt_oss_checkpoint(),
-        &model("gpt_oss", 1, 2),
         target,
     );
 }
 
 #[test]
 fn awq_dense_cuda() {
-    let mut cfg = model("llama", 1, 0);
-    cfg.quant_method = "awq".to_string();
     check(
         "awq_dense_cuda",
         &awq_checkpoint(),
-        &cfg,
         target(BackendKind::Cuda, 0, 1),
     );
 }
@@ -666,12 +664,9 @@ fn awq_dense_cuda() {
 /// shard boundary has to land on a quantization group, not just on a row.
 #[test]
 fn awq_dense_cuda_tp1_of_2() {
-    let mut cfg = model("llama", 1, 0);
-    cfg.quant_method = "awq".to_string();
     check(
         "awq_dense_cuda_tp1_of_2",
         &awq_checkpoint(),
-        &cfg,
         target(BackendKind::Cuda, 1, 2),
     );
 }
@@ -680,12 +675,9 @@ fn awq_dense_cuda_tp1_of_2() {
 /// leaves the rest alone, so the plan has to carry both.
 #[test]
 fn llama_dense_cuda_runtime_fp8() {
-    let mut cfg = model("llama", 2, 0);
-    cfg.runtime_quant = "fp8".to_string();
     check(
         "llama_dense_cuda_runtime_fp8",
         &llama_checkpoint(),
-        &cfg,
         target(BackendKind::Cuda, 0, 1),
     );
 }

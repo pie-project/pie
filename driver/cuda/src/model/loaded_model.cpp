@@ -14,7 +14,6 @@
 #include "distributed.hpp"
 #include "ops/gemm.hpp"
 #include "loader/load_plan_bridge.hpp"
-#include "loader/model_contracts.hpp"
 #include "loader/load_plan_executor.hpp"
 #include "model/weight_artifact_cache.hpp"
 #include "tensor.hpp"
@@ -76,8 +75,8 @@ LoadedModel LoadedModel::load(
     const Config& boot_cfg,
     NcclComm* tp_comm,
     std::string_view runtime_quant,
-    pie_loader::PieLoaderMxfp4MoeRequest mxfp4_moe,
-    pie_loader::PieLoaderComponent component) {
+    pie_driver::Mxfp4MoeRequest mxfp4_moe,
+    pie_driver::Component component) {
     (void)tp_comm;
 
     if (boot_cfg.model.snapshot_dir.empty()) {
@@ -139,27 +138,50 @@ LoadedModel LoadedModel::load(
     // as the loader's decision, not checked against a second opinion
     // (`loader/architecture.md` §9).
     log_stage("compile LoadPlan begin");
-    LoadPlanResult planned_load = prepare_load_plan(
-        e.hf_,
-        boot_cfg.model.snapshot_dir,
-        [&] {
-            auto target = cuda_device_target();
-            target.tp_rank = static_cast<std::uint32_t>(boot_cfg.distributed.tp_rank);
-            target.tp_size = static_cast<std::uint32_t>(boot_cfg.distributed.tp_size);
-            target.fp8_native = fp8_native;
-            target.native_mxfp4_moe = mxfp4_native_gemm;
-            return target;
-        }(),
-        runtime_quant,
-        mxfp4_moe,
-        component,
-        // What this model promises to bind. Checked against the plan by
-        // `pie_loader_verify` inside `prepare_load_plan` (§12 row 7b-4b).
-        declare_model_contract(
-            e.hf_, static_cast<std::uint32_t>(boot_cfg.distributed.tp_size)));
-    log_stage("compile LoadPlan done");
+    const pie_loader::DeviceTarget device_target = [&] {
+        auto target = cuda_device_target();
+        target.tp_rank = static_cast<std::uint32_t>(boot_cfg.distributed.tp_rank);
+        target.tp_size = static_cast<std::uint32_t>(boot_cfg.distributed.tp_size);
+        target.fp8_native = fp8_native;
+        target.native_mxfp4_moe = mxfp4_native_gemm;
+        return target;
+    }();
 
-    e.mxfp4_moe_policy_ = planned_load.plan.mxfp4_moe();
+    // Read the tensor table once. The contract is written against it and the
+    // compile consumes the same handle, so the two cannot be about different
+    // parses of the same directory.
+    std::string open_error;
+    pie_loader::Checkpoint checkpoint =
+        pie_loader::Checkpoint::open(boot_cfg.model.snapshot_dir, &open_error);
+    if (!checkpoint) {
+        throw std::runtime_error("engine: failed to read checkpoint: " + open_error);
+    }
+
+    // What this driver will bind, stated before anything is loaded. The loader
+    // type-checks it against what the files actually contain and lowers it; it
+    // does not decide *what* to build, which is why a family it has never heard
+    // of loads exactly as well as one it has (§12 row 12).
+    pie_loader::ModelContract contract;
+    pie_driver::author_model_contract(
+        checkpoint,
+        pie_driver::ModelFacts{
+            .model_type = e.hf_.model_type,
+            .quant_method = e.hf_.quant_method,
+            .num_hidden_layers = static_cast<std::uint32_t>(std::max(0, e.hf_.num_hidden_layers)),
+            .num_experts = static_cast<std::uint32_t>(std::max(0, e.hf_.num_experts)),
+        },
+        device_target, runtime_quant, mxfp4_moe, component, contract);
+
+    // The policy is the *author's* answer, not the plan's. It used to be read
+    // back off `plan.target`, which meant the loader had to carry a field it
+    // never decided anything with: an expert weight is MXFP4 in the plan because
+    // a contract node says so, and this is the same resolution the contract was
+    // written from.
+    e.mxfp4_moe_policy_ =
+        pie_driver::resolve_mxfp4_moe(mxfp4_moe, device_target.native_mxfp4_moe);
+
+    LoadPlanResult planned_load = prepare_load_plan(checkpoint, contract, device_target);
+    log_stage("compile LoadPlan done");
 
     log_stage("open safetensors begin");
     pie_loader::CheckpointSource loader(planned_load.plan.view());

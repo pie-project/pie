@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::optimizer::OptimizerReport;
 use crate::types::{
-    BackendKind, BufferId, CheckpointFormat, DType, Encoding, FileId, InstrId, Mxfp4MoePolicy,
-    QuantScheme, RepackSpec, TensorDecl, TensorId,
+    BackendKind, BufferId, CheckpointFormat, DType, Encoding, FileId, InstrId, QuantScheme,
+    RepackSpec, TensorDecl, TensorId,
 };
 
 pub use crate::ffi::types::{
@@ -43,7 +43,6 @@ pub struct StorageTarget {
     pub max_tile_bytes: u64,
     pub preferred_alignment: u32,
     pub tile_map_mask: u32,
-    pub mxfp4_moe: Mxfp4MoePolicy,
     pub native_mxfp4_moe: bool,
     /// Which fused transform chains the backend has kernels for.
     ///
@@ -80,7 +79,6 @@ impl Default for StorageTarget {
             max_tile_bytes: 0,
             preferred_alignment: 1,
             tile_map_mask: HOST_TILE_MAP_MASK,
-            mxfp4_moe: Mxfp4MoePolicy::RoutedDecode,
             native_mxfp4_moe: false,
             fusion_mask: 0,
             encode_scratch_dtype: DType::BF16,

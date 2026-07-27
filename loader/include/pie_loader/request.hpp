@@ -57,19 +57,6 @@ struct DeviceTarget {
     std::uint32_t block_scale_rows = 0;
 };
 
-/// The model facts the storage compile keys off.
-///
-/// The driver has already parsed `config.json` to build its model; the loader
-/// does not read it a second time (`loader/architecture.md` §10.4). The string
-/// members are borrowed and must outlive the compile call.
-struct ModelFacts {
-    std::string_view model_type;
-    std::string_view quant_method;
-    std::uint32_t num_hidden_layers = 0;
-    std::uint32_t num_experts = 0;
-    std::uint32_t num_experts_per_tok = 0;
-};
-
 inline PieLoaderBytes borrow(std::string_view text) {
     return PieLoaderBytes{
         reinterpret_cast<const std::uint8_t*>(text.data()), text.size()};
@@ -79,10 +66,9 @@ inline PieLoaderBytes borrow(std::string_view text) {
 ///
 /// Marshal a `DeviceTarget` into the POD the loader reads.
 ///
-/// One function rather than one per entry point: the legacy `build_request` and
-/// the contract path both need it, and the two copies this replaced had already
-/// disagreed once — a field added for the contract path was a compile error on
-/// one side and a silently stale value on the other.
+/// One function, in one place. The two copies this replaced — one per driver —
+/// had already disagreed once: a field added for the contract path was a compile
+/// error on one side and a silently stale value on the other.
 ///
 /// The `static_cast`s are the ABI rule, not sloppiness. Every enum-valued field
 /// crosses as a `uint32_t` because these are *inputs*: the loader must be able
@@ -102,33 +88,6 @@ inline PieLoaderTargetSpec target_spec(const DeviceTarget& target) {
         .fusion_mask = target.fusion_mask,
         .encode_scratch_dtype = static_cast<std::uint32_t>(target.encode_scratch_dtype),
         .block_scale_rows = target.block_scale_rows,
-    };
-}
-
-/// Everything the request borrows — `snapshot_dir`, `runtime_quant`, and the
-/// strings in `model` — must outlive the `pie_loader_compile` call that
-/// consumes it.
-inline PieLoaderRequest build_request(
-    std::string_view snapshot_dir,
-    const DeviceTarget& target,
-    const ModelFacts& model,
-    std::string_view runtime_quant,
-    PieLoaderMxfp4MoeRequest mxfp4_moe,
-    PieLoaderComponent component) {
-    return PieLoaderRequest{
-        .snapshot_dir = borrow(snapshot_dir),
-        .target = target_spec(target),
-        .model =
-            {
-                .model_type = borrow(model.model_type),
-                .quant_method = borrow(model.quant_method),
-                .num_hidden_layers = model.num_hidden_layers,
-                .num_experts = model.num_experts,
-                .num_experts_per_tok = model.num_experts_per_tok,
-            },
-        .runtime_quant = borrow(runtime_quant),
-        .mxfp4_moe = static_cast<std::uint32_t>(mxfp4_moe),
-        .component = static_cast<std::uint32_t>(component),
     };
 }
 

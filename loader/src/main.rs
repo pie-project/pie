@@ -5,11 +5,16 @@
 //! it against a stored one, and execute it against the real checkpoint bytes.
 //!
 //! ```text
-//! pie-loader dump   SNAPSHOT [options]        the compiled plan, as JSON
-//! pie-loader verify SNAPSHOT [options]        compile, then check the result
-//! pie-loader diff   SNAPSHOT GOLDEN [options] compile and compare to a dump
-//! pie-loader replay SNAPSHOT [options]        execute the plan on the host
+//! pie-loader dump   SNAPSHOT CONTRACT [options]        the compiled plan, as JSON
+//! pie-loader verify SNAPSHOT CONTRACT [options]        compile, then check the result
+//! pie-loader diff   SNAPSHOT CONTRACT GOLDEN [options] compile and compare to a dump
+//! pie-loader replay SNAPSHOT CONTRACT [options]        execute the plan on the host
 //! ```
+//!
+//! `CONTRACT` is a JSON [`ModelContract`] — what the tool holds instead of a
+//! model's name, because the loader does not have families any more. A driver
+//! authors one in C++ (`driver/common/include/pie_driver/model_contracts.hpp`);
+//! `loader/tests/golden/contracts/` holds the ones the tests use.
 //!
 //! `replay` is the strongest statement the loader can make about itself
 //! offline: it reads the checkpoint through the plan and reports what each
@@ -25,7 +30,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use pie_loader::checkpoint::CheckpointMetadata;
-use pie_loader::checkpoint::read::{parse_checkpoint_metadata, parse_model_config};
+use pie_loader::checkpoint::read::parse_checkpoint_metadata;
 use pie_loader::contract::ModelContract;
 use pie_loader::dump::dump_load_plan_json;
 use pie_loader::error::CompileError;
@@ -34,22 +39,22 @@ use pie_loader::load_plan::{
     StorageTarget,
 };
 use pie_loader::planner::compile_load_plan;
-use pie_loader::types::{BackendKind, DType, Mxfp4MoePolicy};
+use pie_loader::types::{BackendKind, DType};
 use pie_loader::verify::{ContractView, PlanView, verify};
 
 const USAGE: &str = "\
-usage: pie-loader <command> SNAPSHOT [BACKEND] [RUNTIME_QUANT] [MXFP4] [FUSION] [TP]
+usage: pie-loader <command> SNAPSHOT CONTRACT [BACKEND] [FUSION] [TP]
 
 commands:
-  dump   SNAPSHOT          compile and print the plan as JSON
-  verify SNAPSHOT          compile, then check the plan against its contract
-  diff   SNAPSHOT GOLDEN   compile and compare against a stored `dump` output
-  replay SNAPSHOT          compile and execute the plan against the checkpoint
+  dump   SNAPSHOT CONTRACT          compile and print the plan as JSON
+  verify SNAPSHOT CONTRACT          compile, then check the plan against its contract
+  diff   SNAPSHOT CONTRACT GOLDEN   compile and compare against a stored `dump` output
+  replay SNAPSHOT CONTRACT          compile and execute the plan against the checkpoint
+
+CONTRACT is a JSON ModelContract; see loader/tests/golden/contracts/.
 
 options (positional, all optional):
   BACKEND        cuda | metal | host             (default cuda)
-  RUNTIME_QUANT  e.g. fp8, int8; '-' for none    (default none)
-  MXFP4          routed | native | bf16          (default routed)
   FUSION         fused | unfused                 (default: fused on cuda)
   TP             RANK/SIZE                       (default 0/1)
 ";
@@ -88,30 +93,46 @@ fn run(args: &[String]) -> Result<(), Fail> {
         return Err(Fail::Usage(format!("{command} needs a snapshot directory")));
     };
 
+    let Some(contract_path) = args.get(2).map(PathBuf::from) else {
+        return Err(Fail::Usage(format!("{command} needs a contract file")));
+    };
+
     // `diff` takes one extra positional before the options.
     let (golden, rest) = if command == "diff" {
-        let Some(golden) = args.get(2).map(PathBuf::from) else {
+        let Some(golden) = args.get(3).map(PathBuf::from) else {
             return Err(Fail::Usage("diff needs a golden dump".to_string()));
         };
-        (Some(golden), &args[3..])
+        (Some(golden), &args[4..])
     } else {
-        (None, &args[2..])
+        (None, &args[3..])
     };
 
     let options = Options::parse(rest)?;
+    let contract = read_contract_file(&contract_path)?;
     match command.as_str() {
-        "dump" => dump(&snapshot, &options),
-        "verify" => run_verify(&snapshot, &options),
-        "diff" => diff(&snapshot, golden.as_deref().unwrap(), &options),
-        "replay" => replay(&snapshot, &options),
+        "dump" => dump(&snapshot, &contract, &options),
+        "verify" => run_verify(&snapshot, &contract, &options),
+        "diff" => diff(&snapshot, &contract, golden.as_deref().unwrap(), &options),
+        "replay" => replay(&snapshot, &contract, &options),
         other => Err(Fail::Usage(format!("unknown command '{other}'"))),
     }
 }
 
+/// Read the contract to compile.
+///
+/// The loader cannot produce one: authoring is the driver's job, and this tool
+/// is standing in for a driver. Taking it as a file is what makes the tool able
+/// to reproduce *any* driver's plan rather than only the families someone
+/// remembered to teach it.
+fn read_contract_file(path: &Path) -> Result<ModelContract, Fail> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|err| Fail::Failed(format!("cannot read {}: {err}", path.display())))?;
+    serde_json::from_str(&text)
+        .map_err(|err| Fail::Failed(format!("cannot parse {}: {err}", path.display())))
+}
+
 struct Options {
     backend: BackendKind,
-    runtime_quant: String,
-    mxfp4_moe: Mxfp4MoePolicy,
     fused_transcode: bool,
     tp_rank: u32,
     tp_size: u32,
@@ -125,16 +146,6 @@ impl Options {
             "metal" => BackendKind::Metal,
             "host" | "dummy" => BackendKind::Unknown,
             other => return Err(Fail::Usage(format!("unknown backend '{other}'"))),
-        };
-        let runtime_quant = match args.next().unwrap_or("") {
-            "-" | "none" => String::new(),
-            quant => quant.to_string(),
-        };
-        let mxfp4_moe = match args.next().unwrap_or("routed") {
-            "routed" | "routed_decode" | "auto" => Mxfp4MoePolicy::RoutedDecode,
-            "native" | "native_gemm" => Mxfp4MoePolicy::NativeGemm,
-            "bf16" | "eager_bf16" => Mxfp4MoePolicy::EagerBf16,
-            other => return Err(Fail::Usage(format!("unknown MXFP4 policy '{other}'"))),
         };
         // Not inferred from the backend: a CUDA driver running with
         // PIE_CUDA_DISABLE_FUSED_TRANSCODE=1 compiles a *different* plan, and a
@@ -169,8 +180,6 @@ impl Options {
         }
         Ok(Self {
             backend,
-            runtime_quant,
-            mxfp4_moe,
             fused_transcode,
             tp_rank,
             tp_size,
@@ -189,8 +198,7 @@ impl Options {
                 BackendKind::Metal => METAL_TILE_MAP_MASK,
                 BackendKind::Unknown => HOST_TILE_MAP_MASK,
             },
-            mxfp4_moe: self.mxfp4_moe,
-            native_mxfp4_moe: self.mxfp4_moe == Mxfp4MoePolicy::NativeGemm,
+            native_mxfp4_moe: true,
             fusion_mask: if self.fused_transcode {
                 FUSION_FP8_TO_MXFP4
             } else {
@@ -209,16 +217,11 @@ impl Options {
 ///
 /// A driver states the model facts in its request; a tool holding only a
 /// directory reads them the way the driver's own config parser does.
-fn compile(snapshot: &Path, options: &Options) -> Result<(LoadPlan, ModelContract), Fail> {
-    let model = parse_model_config(snapshot, options.runtime_quant.clone())?;
+fn compile(snapshot: &Path, contract: &ModelContract, options: &Options) -> Result<LoadPlan, Fail> {
     let target = options.target();
     let metadata: CheckpointMetadata = parse_checkpoint_metadata(snapshot)?;
     let started = Instant::now();
-    // Kept separate from `compile_snapshot` so `verify` can be handed the
-    // contract as well as the plan: checking one against the other is only
-    // worth anything when they arrive from different places.
-    let contract = pie_loader::arch::default_contract(&metadata, &model, &target)?;
-    let plan = compile_load_plan(&metadata, &contract, target)?;
+    let plan = compile_load_plan(&metadata, contract, target)?;
     eprintln!(
         "compiled {} source tensors into {} runtime tensors and {} instructions in {:?}",
         plan.sources.len(),
@@ -226,18 +229,18 @@ fn compile(snapshot: &Path, options: &Options) -> Result<(LoadPlan, ModelContrac
         plan.instrs.len(),
         started.elapsed()
     );
-    Ok((plan, contract))
+    Ok(plan)
 }
 
-fn dump(snapshot: &Path, options: &Options) -> Result<(), Fail> {
-    let (plan, _) = compile(snapshot, options)?;
+fn dump(snapshot: &Path, contract: &ModelContract, options: &Options) -> Result<(), Fail> {
+    let plan = compile(snapshot, contract, options)?;
     println!("{}", dump_load_plan_json(&plan)?);
     Ok(())
 }
 
-fn run_verify(snapshot: &Path, options: &Options) -> Result<(), Fail> {
-    let (plan, contract) = compile(snapshot, options)?;
-    match verify(&PlanView::from(&plan), Some(&ContractView::of(&contract))) {
+fn run_verify(snapshot: &Path, contract: &ModelContract, options: &Options) -> Result<(), Fail> {
+    let plan = compile(snapshot, contract, options)?;
+    match verify(&PlanView::from(&plan), Some(&ContractView::of(contract))) {
         Ok(certificate) => {
             println!("{certificate}");
             Ok(())
@@ -259,8 +262,13 @@ fn run_verify(snapshot: &Path, options: &Options) -> Result<(), Fail> {
 /// The comparison is on the dump text, line by line, because that is the form
 /// a golden file is reviewed in: a reader who is shown the differing line can
 /// tell whether the change was intended.
-fn diff(snapshot: &Path, golden: &Path, options: &Options) -> Result<(), Fail> {
-    let (plan, _) = compile(snapshot, options)?;
+fn diff(
+    snapshot: &Path,
+    contract: &ModelContract,
+    golden: &Path,
+    options: &Options,
+) -> Result<(), Fail> {
+    let plan = compile(snapshot, contract, options)?;
     let fresh = dump_load_plan_json(&plan)?;
     let stored = std::fs::read_to_string(golden)
         .map_err(|err| Fail::Failed(format!("cannot read {}: {err}", golden.display())))?;
@@ -292,8 +300,8 @@ fn diff(snapshot: &Path, golden: &Path, options: &Options) -> Result<(), Fail> {
 ///
 /// This is the only offline check that can fail because the plan moved the
 /// *wrong* bytes rather than an ill-formed number of them.
-fn replay(snapshot: &Path, options: &Options) -> Result<(), Fail> {
-    let (plan, _) = compile(snapshot, options)?;
+fn replay(snapshot: &Path, contract: &ModelContract, options: &Options) -> Result<(), Fail> {
+    let plan = compile(snapshot, contract, options)?;
     let started = Instant::now();
     let storage = pie_loader::host::execute_plan(&plan, snapshot)?;
     let bytes: usize = storage.tensors.values().map(|t| t.bytes.len()).sum();

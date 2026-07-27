@@ -303,9 +303,19 @@ public:
         return v;
     }
 
+    /// Attach a block shape to `spec`, backed by this contract's storage.
+    ///
+    /// `PieLoaderQuantSpecView::block_shape` is a borrowed slice, so an author
+    /// cannot hand it a local: the contract has to own the numbers for as long
+    /// as the view is live. Everything else on the spec is a scalar the author
+    /// can just assign.
+    PieLoaderQuantSpecView with_block_shape(PieLoaderQuantSpecView spec,
+                                            std::vector<std::int64_t> block_shape) {
+        spec.block_shape = store_shape(std::move(block_shape));
+        return spec;
+    }
+
 private:
-    /// Bumped when the POD layout changes in a way an old driver would
-    /// misinterpret. The loader rejects anything it does not recognize.
     static constexpr std::uint32_t kAbiVersion = 1;
 
     static PieLoaderExprNode blank(PieLoaderExprKind kind) {

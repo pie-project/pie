@@ -1,0 +1,409 @@
+{
+  "abi_version": 1,
+  "alignment": 1,
+  "tensors": [
+    {
+      "name": "model.layers.0.mlp.experts.gate_proj.weight",
+      "expr": {
+        "Repack": {
+          "src": {
+            "Src": "model.layers.0.mlp.experts.gate_up_proj_blocks"
+          },
+          "spec": {
+            "layout": "MarlinMxfp4Weight",
+            "row_map": "Even",
+            "batch": 2,
+            "source_rows": 256,
+            "source_row_offset": 64,
+            "target_rows": 128,
+            "valid_rows": 64,
+            "source_stride_cols": 64,
+            "source_col_offset": 0,
+            "source_cols": 64,
+            "target_cols": 64
+          },
+          "out": {
+            "shape": [
+              2,
+              128,
+              64
+            ],
+            "encoding": {
+              "Quant": {
+                "scheme": "Mxfp4E2M1E8M0",
+                "logical_dtype": "BF16",
+                "bits_per_element": 4,
+                "group_size": 32,
+                "channel_axis": 1,
+                "scale_dtype": "U8",
+                "zero_point_dtype": null,
+                "block_shape": [
+                  32
+                ]
+              }
+            }
+          }
+        }
+      },
+      "shape": [
+        2,
+        128,
+        64
+      ],
+      "encoding": {
+        "Quant": {
+          "scheme": "Mxfp4E2M1E8M0",
+          "logical_dtype": "BF16",
+          "bits_per_element": 4,
+          "group_size": 32,
+          "channel_axis": 1,
+          "scale_dtype": "U8",
+          "zero_point_dtype": null,
+          "block_shape": [
+            32
+          ]
+        }
+      }
+    },
+    {
+      "name": "model.layers.0.mlp.experts.gate_proj.weight_scale",
+      "expr": {
+        "Repack": {
+          "src": {
+            "Src": "model.layers.0.mlp.experts.gate_up_proj_scales"
+          },
+          "spec": {
+            "layout": "MarlinMxfp4Scale",
+            "row_map": "Even",
+            "batch": 2,
+            "source_rows": 256,
+            "source_row_offset": 64,
+            "target_rows": 128,
+            "valid_rows": 64,
+            "source_stride_cols": 2,
+            "source_col_offset": 0,
+            "source_cols": 2,
+            "target_cols": 2
+          },
+          "out": {
+            "shape": [
+              2,
+              128,
+              2
+            ],
+            "encoding": {
+              "Raw": "U8"
+            }
+          }
+        }
+      },
+      "shape": [
+        2,
+        128,
+        2
+      ],
+      "encoding": {
+        "Raw": "U8"
+      }
+    },
+    {
+      "name": "model.layers.0.mlp.experts.gate_proj.bias",
+      "expr": {
+        "Repack": {
+          "src": {
+            "Src": "model.layers.0.mlp.experts.gate_up_proj_bias"
+          },
+          "spec": {
+            "layout": "DenseRowGather",
+            "row_map": "Even",
+            "batch": 2,
+            "source_rows": 256,
+            "source_row_offset": 64,
+            "target_rows": 64,
+            "valid_rows": 64,
+            "source_stride_cols": 1,
+            "source_col_offset": 0,
+            "source_cols": 1,
+            "target_cols": 1
+          },
+          "out": {
+            "shape": [
+              2,
+              64
+            ],
+            "encoding": {
+              "Raw": "BF16"
+            }
+          }
+        }
+      },
+      "shape": [
+        2,
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      }
+    },
+    {
+      "name": "model.layers.0.mlp.experts.up_proj.weight",
+      "expr": {
+        "Repack": {
+          "src": {
+            "Src": "model.layers.0.mlp.experts.gate_up_proj_blocks"
+          },
+          "spec": {
+            "layout": "MarlinMxfp4Weight",
+            "row_map": "Odd",
+            "batch": 2,
+            "source_rows": 256,
+            "source_row_offset": 64,
+            "target_rows": 128,
+            "valid_rows": 64,
+            "source_stride_cols": 64,
+            "source_col_offset": 0,
+            "source_cols": 64,
+            "target_cols": 64
+          },
+          "out": {
+            "shape": [
+              2,
+              128,
+              64
+            ],
+            "encoding": {
+              "Quant": {
+                "scheme": "Mxfp4E2M1E8M0",
+                "logical_dtype": "BF16",
+                "bits_per_element": 4,
+                "group_size": 32,
+                "channel_axis": 1,
+                "scale_dtype": "U8",
+                "zero_point_dtype": null,
+                "block_shape": [
+                  32
+                ]
+              }
+            }
+          }
+        }
+      },
+      "shape": [
+        2,
+        128,
+        64
+      ],
+      "encoding": {
+        "Quant": {
+          "scheme": "Mxfp4E2M1E8M0",
+          "logical_dtype": "BF16",
+          "bits_per_element": 4,
+          "group_size": 32,
+          "channel_axis": 1,
+          "scale_dtype": "U8",
+          "zero_point_dtype": null,
+          "block_shape": [
+            32
+          ]
+        }
+      }
+    },
+    {
+      "name": "model.layers.0.mlp.experts.up_proj.weight_scale",
+      "expr": {
+        "Repack": {
+          "src": {
+            "Src": "model.layers.0.mlp.experts.gate_up_proj_scales"
+          },
+          "spec": {
+            "layout": "MarlinMxfp4Scale",
+            "row_map": "Odd",
+            "batch": 2,
+            "source_rows": 256,
+            "source_row_offset": 64,
+            "target_rows": 128,
+            "valid_rows": 64,
+            "source_stride_cols": 2,
+            "source_col_offset": 0,
+            "source_cols": 2,
+            "target_cols": 2
+          },
+          "out": {
+            "shape": [
+              2,
+              128,
+              2
+            ],
+            "encoding": {
+              "Raw": "U8"
+            }
+          }
+        }
+      },
+      "shape": [
+        2,
+        128,
+        2
+      ],
+      "encoding": {
+        "Raw": "U8"
+      }
+    },
+    {
+      "name": "model.layers.0.mlp.experts.up_proj.bias",
+      "expr": {
+        "Repack": {
+          "src": {
+            "Src": "model.layers.0.mlp.experts.gate_up_proj_bias"
+          },
+          "spec": {
+            "layout": "DenseRowGather",
+            "row_map": "Odd",
+            "batch": 2,
+            "source_rows": 256,
+            "source_row_offset": 64,
+            "target_rows": 64,
+            "valid_rows": 64,
+            "source_stride_cols": 1,
+            "source_col_offset": 0,
+            "source_cols": 1,
+            "target_cols": 1
+          },
+          "out": {
+            "shape": [
+              2,
+              64
+            ],
+            "encoding": {
+              "Raw": "BF16"
+            }
+          }
+        }
+      },
+      "shape": [
+        2,
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      }
+    },
+    {
+      "name": "model.layers.0.mlp.experts.down_proj.weight",
+      "expr": {
+        "Repack": {
+          "src": {
+            "Src": "model.layers.0.mlp.experts.down_proj_blocks"
+          },
+          "spec": {
+            "layout": "MarlinMxfp4Weight",
+            "row_map": "Identity",
+            "batch": 2,
+            "source_rows": 64,
+            "source_row_offset": 0,
+            "target_rows": 64,
+            "valid_rows": 64,
+            "source_stride_cols": 128,
+            "source_col_offset": 64,
+            "source_cols": 64,
+            "target_cols": 128
+          },
+          "out": {
+            "shape": [
+              2,
+              64,
+              128
+            ],
+            "encoding": {
+              "Quant": {
+                "scheme": "Mxfp4E2M1E8M0",
+                "logical_dtype": "BF16",
+                "bits_per_element": 4,
+                "group_size": 32,
+                "channel_axis": 2,
+                "scale_dtype": "U8",
+                "zero_point_dtype": null,
+                "block_shape": [
+                  32
+                ]
+              }
+            }
+          }
+        }
+      },
+      "shape": [
+        2,
+        64,
+        128
+      ],
+      "encoding": {
+        "Quant": {
+          "scheme": "Mxfp4E2M1E8M0",
+          "logical_dtype": "BF16",
+          "bits_per_element": 4,
+          "group_size": 32,
+          "channel_axis": 2,
+          "scale_dtype": "U8",
+          "zero_point_dtype": null,
+          "block_shape": [
+            32
+          ]
+        }
+      }
+    },
+    {
+      "name": "model.layers.0.mlp.experts.down_proj.weight_scale",
+      "expr": {
+        "Repack": {
+          "src": {
+            "Src": "model.layers.0.mlp.experts.down_proj_scales"
+          },
+          "spec": {
+            "layout": "MarlinMxfp4Scale",
+            "row_map": "Identity",
+            "batch": 2,
+            "source_rows": 64,
+            "source_row_offset": 0,
+            "target_rows": 64,
+            "valid_rows": 64,
+            "source_stride_cols": 4,
+            "source_col_offset": 2,
+            "source_cols": 2,
+            "target_cols": 4
+          },
+          "out": {
+            "shape": [
+              2,
+              64,
+              4
+            ],
+            "encoding": {
+              "Raw": "U8"
+            }
+          }
+        }
+      },
+      "shape": [
+        2,
+        64,
+        4
+      ],
+      "encoding": {
+        "Raw": "U8"
+      }
+    },
+    {
+      "name": "model.layers.0.mlp.experts.down_proj.bias",
+      "expr": {
+        "Src": "model.layers.0.mlp.experts.down_proj_bias"
+      },
+      "shape": [
+        2,
+        64
+      ],
+      "encoding": {
+        "Raw": "BF16"
+      }
+    }
+  ]
+}

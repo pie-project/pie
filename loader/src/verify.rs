@@ -511,7 +511,7 @@ fn check_contract(plan: &PlanView<'_>, contract: &ContractView<'_>, found: &mut 
             ));
         }
         if let Some(encoding) = &demanded.encoding
-            && planned.encoding != *encoding
+            && !encoding_matches(&planned.encoding, encoding)
         {
             found.push(Violation::tensor(
                 demanded.name,
@@ -527,6 +527,32 @@ fn check_contract(plan: &PlanView<'_>, contract: &ContractView<'_>, found: &mut 
     // (`nemotron.rs` republishes packed experts under their original names) that
     // a given driver may never bind. Producing more than was demanded costs a
     // name, not correctness. Producing less is the failure.
+}
+
+/// Compare two encodings over the fields a plan can actually carry.
+///
+/// A [`PlanView`] can arrive two ways: from a plan the loader still holds in
+/// typed form, or rebuilt from the POD arena the driver received. The POD
+/// `TensorDecl` carries `scheme`, `dtype`, `bits_per_element` and `group_size`
+/// and nothing else, because the rest of [`QuantSpec`] had no reader on the far
+/// side — the scale tensor's axis, dtype and granularity are stated on the
+/// `QuantAttachment`, which is where the executor looks for them.
+///
+/// So verification compares what crossed the boundary. Holding a plan to a
+/// field that cannot be expressed in it would make the check fail for a
+/// contract that is in fact satisfied, and comparing the two representations
+/// asymmetrically would make the answer depend on which side of the FFI the
+/// caller stood on.
+fn encoding_matches(planned: &Encoding, demanded: &Encoding) -> bool {
+    match (planned, demanded) {
+        (Encoding::Quant(planned), Encoding::Quant(demanded)) => {
+            planned.scheme == demanded.scheme
+                && planned.logical_dtype == demanded.logical_dtype
+                && planned.bits_per_element == demanded.bits_per_element
+                && planned.group_size == demanded.group_size
+        }
+        _ => planned == demanded,
+    }
 }
 
 /// How much of a declared contract a plan delivers.

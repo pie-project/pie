@@ -4,11 +4,9 @@
 //! the C++ side. Rust receives metadata/config/ABI data and returns a flat
 //! executable LoadPlan.
 
-pub mod arch;
 pub mod artifact;
 pub mod backend;
 pub mod checkpoint;
-pub mod config;
 pub mod contract;
 pub mod dump;
 pub mod error;

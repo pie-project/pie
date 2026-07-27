@@ -8,7 +8,6 @@
     "max_tile_bytes": 67108864,
     "preferred_alignment": 256,
     "tile_map_mask": 17,
-    "mxfp4_moe": "RoutedDecode",
     "native_mxfp4_moe": false,
     "fusion_mask": 0,
     "encode_scratch_dtype": "BF16",

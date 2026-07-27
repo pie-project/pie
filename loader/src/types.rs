@@ -145,13 +145,6 @@ impl QuantScheme {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum Mxfp4MoePolicy {
-    RoutedDecode,
-    NativeGemm,
-    EagerBf16,
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RowMap {
     #[default]
