@@ -15,6 +15,7 @@
 #include "ops/gemm.hpp"
 #include "loader/load_plan_bridge.hpp"
 #include "loader/load_plan_executor.hpp"
+#include "model/registry.hpp"
 #include "model/weight_artifact_cache.hpp"
 #include "tensor.hpp"
 
@@ -75,8 +76,8 @@ LoadedModel LoadedModel::load(
     const Config& boot_cfg,
     NcclComm* tp_comm,
     std::string_view runtime_quant,
-    pie_driver::Mxfp4MoeRequest mxfp4_moe,
-    pie_driver::Component component) {
+    model::Mxfp4MoeRequest mxfp4_moe,
+    model::Component component) {
     (void)tp_comm;
 
     if (boot_cfg.model.snapshot_dir.empty()) {
@@ -157,20 +158,32 @@ LoadedModel LoadedModel::load(
         throw std::runtime_error("engine: failed to read checkpoint: " + open_error);
     }
 
-    // What this driver will bind, stated before anything is loaded. The loader
-    // type-checks it against what the files actually contain and lowers it; it
-    // does not decide *what* to build, which is why a family it has never heard
-    // of loads exactly as well as one it has (§12 row 12).
+    // What this driver will bind, stated before anything is loaded. The row is
+    // the same one `Context` will later call `bind` on, so the contract and the
+    // binder cannot be about different models; the loader type-checks the
+    // contract against what the files contain and lowers it, but does not
+    // decide *what* to build, which is why a family it has never heard of loads
+    // exactly as well as one it has (§12 row 12).
+    const model::ArchEntry* arch = model::find_arch_entry(e.hf_.model_type);
+    if (arch == nullptr || !arch->author_contract) {
+        throw std::runtime_error("engine: unsupported model_type '" + e.hf_.model_type +
+                                 "'; no row in the arch table declares what it binds");
+    }
+    const model::ModelFacts facts{
+        .model_type = e.hf_.model_type,
+        .quant_method = e.hf_.quant_method,
+        .num_hidden_layers = static_cast<std::uint32_t>(std::max(0, e.hf_.num_hidden_layers)),
+        .num_experts = static_cast<std::uint32_t>(std::max(0, e.hf_.num_experts)),
+    };
     pie_loader::ModelContract contract;
-    pie_driver::author_model_contract(
-        checkpoint,
-        pie_driver::ModelFacts{
-            .model_type = e.hf_.model_type,
-            .quant_method = e.hf_.quant_method,
-            .num_hidden_layers = static_cast<std::uint32_t>(std::max(0, e.hf_.num_hidden_layers)),
-            .num_experts = static_cast<std::uint32_t>(std::max(0, e.hf_.num_experts)),
-        },
-        device_target, runtime_quant, mxfp4_moe, component, contract);
+    {
+        model::ContractBuilder builder(
+            checkpoint, facts, device_target, runtime_quant,
+            model::resolve_mxfp4_moe(mxfp4_moe, device_target.native_mxfp4_moe), component,
+            contract);
+        arch->author_contract(builder);
+        builder.finish();
+    }
 
     // The policy is the *author's* answer, not the plan's. It used to be read
     // back off `plan.target`, which meant the loader had to carry a field it
@@ -178,7 +191,7 @@ LoadedModel LoadedModel::load(
     // a contract node says so, and this is the same resolution the contract was
     // written from.
     e.mxfp4_moe_policy_ =
-        pie_driver::resolve_mxfp4_moe(mxfp4_moe, device_target.native_mxfp4_moe);
+        model::resolve_mxfp4_moe(mxfp4_moe, device_target.native_mxfp4_moe);
 
     LoadPlanResult planned_load = prepare_load_plan(checkpoint, contract, device_target);
     log_stage("compile LoadPlan done");

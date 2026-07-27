@@ -8,7 +8,6 @@
 #include <unordered_map>
 #include <vector>
 
-#include "pie_driver/model_contracts.hpp"
 #include "pie_loader/source_checkpoint.hpp"
 
 #include "loader/rust_quant_attachment.hpp"

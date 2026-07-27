@@ -5,7 +5,7 @@
 #include <string>
 #include <string_view>
 
-#include "pie_driver/model_contracts.hpp"
+#include "model/qwen3_5/qwen3_5_contract.hpp"
 #include "pie_loader/plan.hpp"
 #include "pie_loader/request.hpp"
 #include "pie_loader/source_checkpoint.hpp"
@@ -41,14 +41,12 @@ inline pie_loader::DeviceTarget metal_device_target() {
 /// Three inputs and no fourth: what the files contain, what this driver will
 /// bind, and what the GPU can do. The loader is not told which model this is,
 /// so a family it has never heard of loads exactly as well as one it has
-/// (`loader/architecture.md` §12 row 12).
+/// (`loader/architecture.md` §12 row 12). `model_type` selects the schema on
+/// *this* side of the call and never crosses it.
 inline LoadPlan compile_load_plan(
     std::string_view snapshot_dir,
     const pie_loader::DeviceTarget& target,
-    const pie_driver::ModelFacts& model,
-    std::string_view runtime_quant,
-    pie_driver::Mxfp4MoeRequest mxfp4_moe,
-    pie_driver::Component component) {
+    std::string_view model_type) {
     std::string open_error;
     pie_loader::Checkpoint checkpoint =
         pie_loader::Checkpoint::open(snapshot_dir, &open_error);
@@ -57,8 +55,7 @@ inline LoadPlan compile_load_plan(
     }
 
     pie_loader::ModelContract contract;
-    pie_driver::author_model_contract(
-        checkpoint, model, target, runtime_quant, mxfp4_moe, component, contract);
+    model::author_model_contract(checkpoint, model_type, target, contract);
 
     const auto request =
         pie_loader::build_contract_request(checkpoint, target, contract.view());

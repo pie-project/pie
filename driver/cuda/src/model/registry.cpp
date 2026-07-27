@@ -19,31 +19,39 @@
 #include "model/csm/csm.hpp"
 #include "model/csm/csm_model.hpp"
 #include "model/deepseek_v4/deepseek_v4.hpp"
+#include "model/deepseek_v4/deepseek_v4_contract.hpp"
 #include "model/deepseek_v4/deepseek_v4_model.hpp"
 #include "model/gemma/gemma2.hpp"
 #include "model/gemma/gemma2_model.hpp"
 #include "model/gemma3n/gemma3n.hpp"
 #include "model/gemma3n/gemma3n_model.hpp"
 #include "model/gemma4/gemma4.hpp"
+#include "model/gemma4/gemma4_contract.hpp"
 #include "model/gemma4/gemma4_model.hpp"
 #include "model/glm5/glm5.hpp"
+#include "model/glm5/glm5_contract.hpp"
 #include "model/glm5/glm5_forward.hpp"
 #include "model/glm5/glm5_model.hpp"
 #include "model/kimi/kimi.hpp"
+#include "model/kimi/kimi_contract.hpp"
 #include "model/kimi/kimi_forward.hpp"
 #include "model/kimi/kimi_model.hpp"
 #include "model/llama_like/llama_like.hpp"
+#include "model/llama_like/llama_like_contract.hpp"
 #include "model/llama_like/llama_like_model.hpp"
 #include "model/llama_like/mistral3.hpp"
 #include "model/llama_like/qwen3.hpp"
 #include "model/mixtral/gpt_oss.hpp"
+#include "model/mixtral/mixtral_contract.hpp"
 #include "model/mixtral/mixtral.hpp"
 #include "model/mixtral/mixtral_model.hpp"
 #include "model/nemotron_h/nemotron_h.hpp"
+#include "model/nemotron_h/nemotron_h_contract.hpp"
 #include "model/nemotron_h/nemotron_h_forward.hpp"
 #include "model/nemotron_h/nemotron_h_model.hpp"
 #include "model/qwen3_5/qwen3_5.hpp"
 #include "model/qwen3_5/qwen3_5_config.hpp"
+#include "model/qwen3_5/qwen3_5_contract.hpp"
 #include "model/qwen3_5/qwen3_5_forward.hpp"
 #include "model/qwen3_5/qwen3_5_model.hpp"
 #include "model/qwen3_5/qwen3_5_moe.hpp"
@@ -630,7 +638,8 @@ std::vector<ArchEntry> build_arch_table() {
     auto push = [&t](const char* model_type, Family family, const char* binder_key,
                      std::function<std::optional<std::string>(const HfConfig&)> validate,
                      std::function<std::unique_ptr<ModelPlan>(LoadedModel&, bool)> bind,
-                     std::function<std::unique_ptr<IModel>(std::unique_ptr<ModelPlan>, ModelResources&)> create) {
+                     std::function<std::unique_ptr<IModel>(std::unique_ptr<ModelPlan>, ModelResources&)> create,
+                     std::function<void(ContractBuilder&)> author) {
         ArchEntry entry;
         entry.model_type = model_type;
         entry.family = family;
@@ -638,6 +647,7 @@ std::vector<ArchEntry> build_arch_table() {
         entry.validate_config = std::move(validate);
         entry.bind = std::move(bind);
         entry.create_model = std::move(create);
+        entry.author_contract = std::move(author);
         t.push_back(std::move(entry));
     };
 
@@ -646,89 +656,107 @@ std::vector<ArchEntry> build_arch_table() {
     //    "llama3"/"mistral" (bare) all use the same `bind_llama_like`.
     for (const char* mt : {"qwen3", "qwen2", "llama", "llama3", "mistral"}) {
         push(mt, Family::LlamaLike, "llama_like", default_validate_config,
-             bind_row_llama_like, create_llama_like_model);
+             bind_row_llama_like, create_llama_like_model,
+             author_llama_like_contract);
     }
     for (const char* mt : {"mistral3", "ministral3"}) {
         push(mt, Family::LlamaLike, "mistral3", default_validate_config,
-             bind_row_mistral3, create_llama_like_model);
+             bind_row_mistral3, create_llama_like_model,
+             author_dense_contract);
     }
     push("phi3", Family::LlamaLike, "phi3", default_validate_config,
-         bind_row_phi3, create_llama_like_model);
+         bind_row_phi3, create_llama_like_model,
+         author_phi3_contract);
     for (const char* mt : {"olmo2", "olmo3"}) {
         push(mt, Family::LlamaLike, "olmo3", default_validate_config,
-             bind_row_olmo3, create_llama_like_model);
+             bind_row_olmo3, create_llama_like_model,
+             author_dense_contract);
     }
 
     // ── Mixtral: sparse top-k MoE. gpt_oss shares the family/model class
     //    through its own binder (MXFP4 experts + attention sinks).
     push("mixtral", Family::Mixtral, "mixtral", default_validate_config,
-         bind_row_mixtral, create_mixtral_model);
+         bind_row_mixtral, create_mixtral_model,
+         author_dense_contract);
     push("gpt_oss", Family::Mixtral, "gpt_oss", default_validate_config,
-         bind_row_gpt_oss, create_mixtral_model);
+         bind_row_gpt_oss, create_mixtral_model,
+         author_gpt_oss_contract);
 
     // ── Gemma 2 / 3 (share Gemma2Weights + gemma2_forward_paged).
     push("gemma2", Family::Gemma, "gemma2", default_validate_config,
-         bind_row_gemma2, create_gemma_model);
+         bind_row_gemma2, create_gemma_model,
+         author_dense_contract);
     for (const char* mt : {"gemma3", "gemma3_text"}) {
         push(mt, Family::Gemma, "gemma3", default_validate_config,
-             bind_row_gemma3, create_gemma_model);
+             bind_row_gemma3, create_gemma_model,
+             author_dense_contract);
     }
 
     // ── Gemma 4 (dense/MoE, + optional vision/audio towers).
     for (const char* mt : {"gemma4", "gemma4_text"}) {
         push(mt, Family::Gemma4, "gemma4", default_validate_config,
-             bind_row_gemma4, create_gemma4_model);
+             bind_row_gemma4, create_gemma4_model,
+             author_gemma4_contract);
     }
 
     // ── Gemma 3n (AltUp/Laurel/PLE "Nano" family).
     for (const char* mt : {"gemma3n", "gemma3n_text"}) {
         push(mt, Family::Gemma3n, "gemma3n", default_validate_config,
-             bind_row_gemma3n, create_gemma3n_model);
+             bind_row_gemma3n, create_gemma3n_model,
+             author_dense_contract);
     }
 
     // ── Nemotron-H (Mamba2 / attention / MoE hybrid).
     push("nemotron_h", Family::NemotronH, "nemotron_h", default_validate_config,
-         bind_row_nemotron_h, create_nemotron_h_model);
+         bind_row_nemotron_h, create_nemotron_h_model,
+         author_nemotron_h_contract);
 
     // ── DeepSeek-V4 (hypercompressed streams, own family/plan).
     push("deepseek_v4", Family::DeepSeekV4, "deepseek_v4",
          default_validate_config, bind_row_deepseek_v4,
-         create_deepseek_v4_model);
+         create_deepseek_v4_model, author_deepseek_v4_contract);
 
     // ── Kimi: DeepSeek-V2/V3-style MLA + Kimi-K2, one binder/family for
     //    all three aliases.
     for (const char* mt : {"deepseek_v2", "deepseek_v3", "kimi_k2"}) {
         push(mt, Family::Kimi, "kimi", default_validate_config,
-             bind_row_kimi, create_kimi_model);
+             bind_row_kimi, create_kimi_model,
+             mt == std::string("kimi_k2") ? author_kimi_contract
+                                          : author_deepseek_mla_contract);
     }
 
     // ── GLM-5.1 (MLA + DSA indexer + routed/shared MoE).
     push("glm_moe_dsa", Family::Glm5, "glm5", default_validate_config,
-         bind_row_glm5, create_glm5_model);
+         bind_row_glm5, create_glm5_model,
+         author_glm5_contract);
 
     // ── Qwen3.5 hybrid dense (linear-attn + full-attn + optional MTP).
     for (const char* mt : {"qwen3_5", "qwen3_5_text"}) {
         push(mt, Family::Qwen3_5, "qwen3_5", default_validate_config,
-             bind_row_qwen3_5, create_qwen3_5_model);
+             bind_row_qwen3_5, create_qwen3_5_model,
+             author_qwen3_5_contract);
     }
 
     // ── Qwen3.5 hybrid MoE (same hybrid attention + sparse MoE MLP).
     for (const char* mt : {"qwen3_5_moe", "qwen3_5_moe_text", "qwen3_moe"}) {
         push(mt, Family::Qwen3_5Moe, "qwen3_5_moe", default_validate_config,
-             bind_row_qwen3_5_moe, create_qwen3_5_moe_model);
+             bind_row_qwen3_5_moe, create_qwen3_5_moe_model,
+             author_qwen3_5_moe_contract);
     }
 
     // ── Qwen3-VL: Qwen3 text tower (binds into the same `Qwen3Weights`
     //    shape as LlamaLike) + optional ViT vision tower with DeepStack.
     for (const char* mt : {"qwen3_vl", "qwen3_vl_text"}) {
         push(mt, Family::Qwen3VL, "qwen3_vl_text", default_validate_config,
-             bind_row_qwen3_vl, create_qwen3_vl_model);
+             bind_row_qwen3_vl, create_qwen3_vl_model,
+             author_dense_contract);
     }
 
     // ── CSM: native audio-output backbone + depth decoder + Mimi codec.
     //    The only family whose config validation hook is non-trivial.
     push("csm", Family::Csm, "csm", validate_csm_config, bind_row_csm,
-         create_csm_model);
+         create_csm_model,
+         author_dense_contract);
 
     return t;
 }

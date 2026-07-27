@@ -13,7 +13,7 @@
 //!
 //! `CONTRACT` is a JSON [`ModelContract`] — what the tool holds instead of a
 //! model's name, because the loader does not have families any more. A driver
-//! authors one in C++ (`driver/common/include/pie_driver/model_contracts.hpp`);
+//! authors one in C++ (`driver/*/src/model/<family>/<family>_contract.hpp`);
 //! `loader/tests/golden/contracts/` holds the ones the tests use.
 //!
 //! `replay` is the strongest statement the loader can make about itself

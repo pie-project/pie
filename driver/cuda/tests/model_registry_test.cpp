@@ -119,6 +119,17 @@ int main() {
         }
     }
 
+    // ── Every row says what it binds *and* how to bind it. A contract and a
+    //    binder are two halves of one sentence: a row with only the second
+    //    would compile and then fail at load time with a message about a
+    //    model_type nobody had declared, which is exactly the drift the old
+    //    `ArchProfile` table accumulated (six strings with a profile and no
+    //    binder, twelve with a binder and no profile).
+    for (const auto& row : table) {
+        expect(static_cast<bool>(row.author_contract),
+               row.model_type + ": no author_contract; the row binds a model it never declares");
+    }
+
     // ── Unknown arch must be rejected — never a silent fallback to any
     //    family (this is the whole point of killing the allowlist chain).
     expect(find_arch_entry("totally_unknown_arch") == nullptr,

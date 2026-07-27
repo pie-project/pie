@@ -345,7 +345,7 @@ fn contract_fixture(name: &str) -> ModelContract {
         panic!(
             "{name}: cannot read {}: {err}\n\
              A new golden needs a contract next to it. Author one the way a \
-             driver does — `driver/common/include/pie_driver/model_contracts.hpp` \
+             driver does — `driver/*/src/model/*/*_contract.hpp` \
              can dump the real thing under PIE_TEST_CONTRACT_DUMP — or write the \
              expression out by hand.",
             path.display()

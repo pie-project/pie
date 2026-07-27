@@ -2,9 +2,10 @@
 //
 // Since §12 row 12 the contract is not a *claim about* the load — it is the
 // load's input. `plan = compile(source_facts, program, target)`, and this file
-// covers the `program`: `pie_driver::author_model_contract` reads the
-// checkpoint's tensor table plus the config facts the driver already parsed and
-// writes down every tensor it will bind, as an expression over what is on disk.
+// covers the `program`: the `author_contract` hook on this family's arch-table
+// row reads the checkpoint's tensor table plus the config facts the driver
+// already parsed and writes down every tensor it will bind, as an expression
+// over what is on disk.
 //
 // Two things are checked here. First the builder — that a handle names one node
 // however many times it is used, that a shape may be declined, and that the
@@ -39,7 +40,8 @@
 #include "pie_loader/model_contract.hpp"
 #include "pie_loader/source_checkpoint.hpp"
 
-#include "pie_driver/model_contracts.hpp"
+#include "model/contract.hpp"
+#include "model/registry.hpp"
 
 #include "loader/load_plan.hpp"
 #include "model/config.hpp"
@@ -234,12 +236,18 @@ void author_real_contract(const std::string& snapshot, const char* dest) {
     check(static_cast<bool>(checkpoint), "the snapshot opens: " + open_error);
     if (!checkpoint) return;
 
-    const pie_driver::ModelFacts facts{
+    const pie_cuda_driver::model::ModelFacts facts{
         .model_type = hf.model_type,
         .quant_method = hf.quant_method,
         .num_hidden_layers = static_cast<std::uint32_t>(std::max(0, hf.num_hidden_layers)),
         .num_experts = static_cast<std::uint32_t>(std::max(0, hf.num_experts)),
     };
+
+    namespace model = pie_cuda_driver::model;
+    const model::ArchEntry* arch = model::find_arch_entry(hf.model_type);
+    check(arch != nullptr && static_cast<bool>(arch->author_contract),
+          "the arch table has a row for model_type '" + hf.model_type + "'");
+    if (arch == nullptr || !arch->author_contract) return;
 
     nlohmann::json by_tp = nlohmann::json::object();
     for (std::uint32_t tp : {1u, 2u, 4u}) {
@@ -249,9 +257,12 @@ void author_real_contract(const std::string& snapshot, const char* dest) {
 
         pie_loader::ModelContract contract;
         try {
-            pie_driver::author_model_contract(
-                checkpoint, facts, target, "", pie_driver::Mxfp4MoeRequest::Auto,
-                pie_driver::Component::Full, contract);
+            model::ContractBuilder builder(
+                checkpoint, facts, target, "",
+                model::resolve_mxfp4_moe(model::Mxfp4MoeRequest::Auto, target.native_mxfp4_moe),
+                model::Component::Full, contract);
+            arch->author_contract(builder);
+            builder.finish();
         } catch (const std::exception& error) {
             check(false, std::string("authoring at tp ") + std::to_string(tp) + ": " +
                              error.what());
