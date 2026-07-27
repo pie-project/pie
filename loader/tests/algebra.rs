@@ -2,19 +2,19 @@
 //!
 //! `contract/compile.rs` checks the lowering against a per-coordinate oracle in
 //! index space. This file checks the layer below it: that the byte offsets and
-//! strides the gather carries, replayed by the reference evaluator, reproduce
-//! the tensor the expression names — and that the type checker rejects a gather
-//! that does not.
+//! strides the lowering carries, replayed literally, reproduce the tensor the
+//! expression names — and that a lowering which does not is refused.
+//!
+//! The replay used to go through the middle IR, which meant the frontend that
+//! built that IR was inside the thing under test. It is gone, and so is the
+//! detour: `reference::replay` reads the lowering directly.
 
 use std::collections::HashMap;
 
-use pie_loader::contract::compile::compile;
+use pie_loader::contract::compile::{Leaf, Lowering, Run, RunSource, compile};
 use pie_loader::contract::{CheckpointTypes, Expr, TensorType, infer_type};
-use pie_loader::ir::{GatherDim, GatherPiece, LayoutExpr, LayoutPlan};
-use pie_loader::optimizer::optimize;
-use pie_loader::reference::{TensorValue, evaluate};
-use pie_loader::typecheck::typecheck;
-use pie_loader::types::{DType, Encoding, ExprId, TensorDecl, TensorId, encoding_nbytes};
+use pie_loader::reference::{TensorValue, replay};
+use pie_loader::types::{DType, Encoding, TensorDecl, TensorId};
 
 const MAX_RUNS: usize = 1 << 16;
 const DTYPE: DType = DType::I32;
@@ -53,14 +53,14 @@ impl Fixture {
         (0..count).map(|i| 1000 * at as i64 + i).collect()
     }
 
-    fn values(&self) -> HashMap<TensorId, TensorValue> {
+    fn values(&self) -> HashMap<String, TensorValue> {
         self.tensors
             .iter()
             .enumerate()
             .map(|(at, (name, shape))| {
                 let decl = decl(at as u32, name, shape);
                 (
-                    TensorId(at as u32),
+                    name.clone(),
                     TensorValue::new(decl, self.data(name)).unwrap(),
                 )
             })
@@ -87,73 +87,15 @@ fn decl(id: u32, name: &str, shape: &[i64]) -> TensorDecl {
     }
 }
 
-/// Build the one-gather plan the frontend builds for a single expression, and
-/// run the reference evaluator over it.
-fn realize(expr: &Expr, fixture: &Fixture) -> TensorValue {
+/// Compile one expression and replay the bytes its lowering claims.
+fn realize(expr: &Expr, fixture: &Fixture) -> Vec<i64> {
     let (ty, checked) = infer_type(expr, fixture).unwrap();
     let lowering = compile(expr, &checked, MAX_RUNS).unwrap();
     assert!(
         !lowering.needs_zero_fill(),
         "this helper does not model padding"
     );
-
-    let mut plan = LayoutPlan::new();
-    let inputs = lowering
-        .leaves
-        .iter()
-        .map(|leaf| {
-            let name = match leaf {
-                pie_loader::contract::compile::Leaf::Checkpoint(name) => name.clone(),
-                pie_loader::contract::compile::Leaf::Contract(name) => {
-                    panic!("this helper takes no contract references, got '{name}'")
-                }
-            };
-            let at = fixture.index(&name);
-            plan.push(LayoutExpr::Source {
-                tensor: TensorId(at as u32),
-                decl: decl(at as u32, &name, fixture.shape(&name)),
-            })
-        })
-        .collect::<Vec<_>>();
-
-    let out_decl = decl(900, "out", &ty.shape);
-    let gathered = plan.push(LayoutExpr::Gather {
-        inputs,
-        pieces: lowering
-            .byte_pieces(&ty.encoding)
-            .unwrap()
-            .into_iter()
-            .map(|piece| GatherPiece {
-                input: piece.leaf as u32,
-                src_offset: piece.src_offset,
-                dst_offset: piece.dst_offset,
-                dims: piece
-                    .dims
-                    .into_iter()
-                    .map(|dim| GatherDim {
-                        count: dim.count,
-                        src_stride: dim.src_stride,
-                        dst_stride: dim.dst_stride,
-                    })
-                    .collect(),
-            })
-            .collect(),
-        zero_fill: false,
-        decl: out_decl.clone(),
-    });
-    let final_node = plan.push(LayoutExpr::Realize {
-        input: gathered,
-        runtime_name: "out".to_string(),
-        decl: out_decl,
-    });
-    plan.outputs.push(final_node);
-
-    typecheck(&plan).unwrap();
-    let plan = optimize(plan).unwrap();
-    evaluate(&plan, &fixture.values())
-        .unwrap()
-        .remove("out")
-        .unwrap()
+    replay(&lowering, &ty, &fixture.values()).unwrap()
 }
 
 /// What the expression means, worked out by hand with no reference to the
@@ -233,7 +175,7 @@ fn resolve(expr: &Expr, index: &[i64], fixture: &Fixture) -> Option<i64> {
 
 fn check(expr: Expr, fixture: &Fixture) {
     let realized = realize(&expr, fixture);
-    assert_eq!(realized.data, oracle(&expr, fixture), "for {expr:?}");
+    assert_eq!(realized, oracle(&expr, fixture), "for {expr:?}");
 }
 
 #[test]
@@ -315,93 +257,102 @@ fn stacking_experts_is_a_reshaped_concatenation() {
     );
 }
 
-#[test]
-fn typecheck_rejects_a_gather_that_leaves_a_hole() {
-    let mut plan = LayoutPlan::new();
-    let source = plan.push(LayoutExpr::Source {
-        tensor: TensorId(0),
-        decl: decl(0, "w", &[4, 4]),
-    });
-    let out = decl(1, "out", &[4, 4]);
-    let final_node = plan.push(LayoutExpr::Gather {
-        inputs: vec![source],
-        pieces: vec![GatherPiece::span(0, 0, 0, 32)],
-        zero_fill: false,
-        decl: out,
-    });
-    plan.outputs.push(final_node);
+/// A lowering built by hand, so the replay can be shown what a *wrong* one
+/// looks like. `compile` cannot produce these; the point is that if it ever
+/// did, the replay would say so rather than quietly returning a tensor with
+/// garbage in it.
+fn hand_rolled(runs: Vec<Run>, elements: i64) -> Lowering {
+    Lowering {
+        leaves: vec![Leaf::Checkpoint("w".to_string())],
+        runs,
+        elements,
+    }
+}
 
-    let err = typecheck(&plan).unwrap_err().to_string();
-    assert!(err.contains("covers 32 of 64 bytes"), "{err}");
+fn out_type(shape: &[i64]) -> TensorType {
+    TensorType::raw(shape.to_vec(), DTYPE)
 }
 
 #[test]
-fn typecheck_rejects_a_gather_that_reads_past_its_input() {
-    let mut plan = LayoutPlan::new();
-    let source = plan.push(LayoutExpr::Source {
-        tensor: TensorId(0),
-        decl: decl(0, "w", &[4, 4]),
-    });
-    let out = decl(1, "out", &[4, 4]);
-    let final_node = plan.push(LayoutExpr::Gather {
-        inputs: vec![source],
-        pieces: vec![GatherPiece::span(0, 8, 0, 64)],
-        zero_fill: false,
-        decl: out,
-    });
-    plan.outputs.push(final_node);
+fn the_replay_rejects_a_lowering_that_leaves_a_hole() {
+    let fixture = Fixture::new(&[("w", &[4, 4])]);
+    let lowering = hand_rolled(
+        vec![Run {
+            source: RunSource::Leaf {
+                leaf: 0,
+                src_elem: 0,
+            },
+            dst_elem: 0,
+            len: 8,
+        }],
+        16,
+    );
+    let err = replay(&lowering, &out_type(&[4, 4]), &fixture.values())
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("uninitialized"), "{err}");
+}
 
-    let err = typecheck(&plan).unwrap_err().to_string();
+#[test]
+fn the_replay_rejects_a_lowering_that_reads_past_its_input() {
+    let fixture = Fixture::new(&[("w", &[4, 4])]);
+    let lowering = hand_rolled(
+        vec![Run {
+            source: RunSource::Leaf {
+                leaf: 0,
+                src_elem: 2,
+            },
+            dst_elem: 0,
+            len: 16,
+        }],
+        16,
+    );
+    let err = replay(&lowering, &out_type(&[4, 4]), &fixture.values())
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("reads past the end"), "{err}");
 }
 
 #[test]
-fn typecheck_rejects_a_gather_that_names_a_missing_input() {
-    let mut plan = LayoutPlan::new();
-    let source = plan.push(LayoutExpr::Source {
-        tensor: TensorId(0),
-        decl: decl(0, "w", &[4, 4]),
-    });
-    let out = decl(1, "out", &[4, 4]);
-    let final_node = plan.push(LayoutExpr::Gather {
-        inputs: vec![source],
-        pieces: vec![GatherPiece::span(1, 0, 0, 64)],
-        zero_fill: false,
-        decl: out,
-    });
-    plan.outputs.push(final_node);
-
-    let err = typecheck(&plan).unwrap_err().to_string();
-    assert!(err.contains("names input 1"), "{err}");
+fn the_replay_rejects_a_lowering_that_names_a_leaf_nobody_supplied() {
+    let fixture = Fixture::new(&[("w", &[4, 4])]);
+    let mut lowering = hand_rolled(
+        vec![Run {
+            source: RunSource::Leaf {
+                leaf: 0,
+                src_elem: 0,
+            },
+            dst_elem: 0,
+            len: 16,
+        }],
+        16,
+    );
+    lowering.leaves = vec![Leaf::Checkpoint("absent".to_string())];
+    let err = replay(&lowering, &out_type(&[4, 4]), &fixture.values())
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("no reference value for 'absent'"), "{err}");
 }
 
 #[test]
-fn the_optimizer_drops_what_no_output_reaches() {
-    let mut plan = LayoutPlan::new();
-    let kept = plan.push(LayoutExpr::Source {
-        tensor: TensorId(0),
-        decl: decl(0, "kept", &[2, 2]),
-    });
-    plan.push(LayoutExpr::Source {
-        tensor: TensorId(1),
-        decl: decl(1, "dropped", &[2, 2]),
-    });
-    let out = decl(2, "out", &[2, 2]);
-    let bytes = encoding_nbytes(&out.shape, &out.encoding).unwrap();
-    let gathered = plan.push(LayoutExpr::Gather {
-        inputs: vec![kept],
-        pieces: vec![GatherPiece::span(0, 0, 0, bytes)],
-        zero_fill: false,
-        decl: out.clone(),
-    });
-    let final_node = plan.push(LayoutExpr::Realize {
-        input: gathered,
-        runtime_name: "out".to_string(),
-        decl: out,
-    });
-    plan.outputs.push(final_node);
-
-    let optimized = optimize(plan).unwrap();
-    assert_eq!(optimized.exprs.len(), 3);
-    assert_eq!(optimized.outputs, vec![ExprId(2)]);
+fn the_replay_rejects_a_lowering_that_writes_one_element_twice() {
+    // Dead-code elimination used to be a pass, and the test here used to be
+    // that it dropped what no output reached. There is nothing to drop now:
+    // the builder walks outward from the declared tensors, so an unreachable
+    // node is one it never constructs. What is still worth pinning is the
+    // other half of "covers the destination exactly once".
+    let fixture = Fixture::new(&[("w", &[4, 4])]);
+    let run = |dst_elem| Run {
+        source: RunSource::Leaf {
+            leaf: 0,
+            src_elem: 0,
+        },
+        dst_elem,
+        len: 16,
+    };
+    let lowering = hand_rolled(vec![run(0), run(0)], 16);
+    let err = replay(&lowering, &out_type(&[4, 4]), &fixture.values())
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("twice"), "{err}");
 }

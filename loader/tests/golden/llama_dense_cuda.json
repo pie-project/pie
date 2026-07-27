@@ -12,16 +12,26 @@
     "encode_scratch_dtype": "BF16",
     "block_scale_rows": 128
   },
-  "optimizer": {
-    "passes": [
-      {
-        "name": "live-normalization",
-        "exprs_before": 51,
-        "exprs_after": 51,
-        "rewrites": 0
-      }
-    ]
-  },
+  "passes": [
+    {
+      "pass": "assign-persistent-offsets",
+      "instrs_before": 51,
+      "instrs_after": 51,
+      "rewrites": 15
+    },
+    {
+      "pass": "coalesce-persistent-arena-writes",
+      "instrs_before": 51,
+      "instrs_after": 45,
+      "rewrites": 6
+    },
+    {
+      "pass": "hoist-bulk-arena-writes",
+      "instrs_before": 45,
+      "instrs_after": 31,
+      "rewrites": 14
+    }
+  ],
   "files": [
     {
       "id": 0,

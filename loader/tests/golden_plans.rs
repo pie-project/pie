@@ -29,11 +29,11 @@ use pie_loader::contract::ModelContract;
 use pie_loader::contract_writer::write_contract;
 use pie_loader::ffi::contract::read_contract;
 use pie_loader::ffi::view::verify_marshalled;
-use pie_loader::load_plan::{
+use pie_loader::plan::compile as compile_load_plan;
+use pie_loader::plan::{
     CUDA_TILE_MAP_MASK, FUSION_FP8_TO_MXFP4, HOST_TILE_MAP_MASK, LoadPlan, StorageTarget,
     compiler_version,
 };
-use pie_loader::planner::compile_load_plan;
 use pie_loader::types::{
     BackendKind, CheckpointFormat, DType, Encoding, FileId, QuantScheme, QuantSpec, TensorId,
 };
@@ -506,8 +506,8 @@ fn replay(name: &str, plan: &LoadPlan, metadata: &CheckpointMetadata) {
             .tensors
             .get(&tensor.name)
             .unwrap_or_else(|| panic!("{name}: '{}' was never materialized", tensor.name));
-        let expected = pie_loader::frontend::runtime_bytes(&tensor.shape, &tensor.encoding)
-            .unwrap_or_else(|err| panic!("{name}: '{}' has no size: {err}", tensor.name));
+        let expected = pie_loader::types::encoding_nbytes(&tensor.shape, &tensor.encoding)
+            .unwrap_or_else(|| panic!("{name}: '{}' has no size", tensor.name));
         assert_eq!(
             materialized.bytes.len() as u64,
             expected,

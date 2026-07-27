@@ -31,6 +31,11 @@ pub const PIE_LOADER_NO_TENSOR: u32 = u32::MAX;
 // These live here, in the module that owns the C surface, because the header is
 // where they have to be correct. `crate::load_plan` re-exports them under short
 // names for use inside the compiler.
+// `crate::plan` states the same seven bits. Restated here rather than aliased
+// because cbindgen emits a literal and cannot follow a path — and because the
+// arrow used to run the other way, with `load_plan.rs` importing its own
+// serialization format's constants. Two independent statements, checked below,
+// is the same shape as the loader/driver cross-check in `ffi/mod.rs`.
 pub const PIE_LOADER_TILE_MAP_CAST: u32 = 1 << 0;
 pub const PIE_LOADER_TILE_MAP_DECODE: u32 = 1 << 1;
 pub const PIE_LOADER_TILE_MAP_ENCODE: u32 = 1 << 2;
@@ -384,9 +389,9 @@ pub enum PieLoaderTileMapKind {
     None = 7,
 }
 
-impl From<crate::load_plan::TileMapKind> for PieLoaderTileMapKind {
-    fn from(value: crate::load_plan::TileMapKind) -> Self {
-        use crate::load_plan::TileMapKind as K;
+impl From<crate::plan::TileMapKind> for PieLoaderTileMapKind {
+    fn from(value: crate::plan::TileMapKind) -> Self {
+        use crate::plan::TileMapKind as K;
         match value {
             K::Cast => Self::Cast,
             K::Decode => Self::Decode,
@@ -412,9 +417,9 @@ pub enum PieLoaderTransformFusion {
     Fp8ToMxfp4 = 1,
 }
 
-impl From<crate::load_plan::TransformFusion> for PieLoaderTransformFusion {
-    fn from(value: crate::load_plan::TransformFusion) -> Self {
-        use crate::load_plan::TransformFusion as F;
+impl From<crate::plan::TransformFusion> for PieLoaderTransformFusion {
+    fn from(value: crate::plan::TransformFusion) -> Self {
+        use crate::plan::TransformFusion as F;
         match value {
             F::None => Self::None,
             F::Fp8ToMxfp4 => Self::Fp8ToMxfp4,
@@ -759,8 +764,8 @@ pub struct PieLoaderTargetView {
     pub block_scale_rows: u32,
 }
 
-impl From<&crate::load_plan::StorageTarget> for PieLoaderTargetView {
-    fn from(value: &crate::load_plan::StorageTarget) -> Self {
+impl From<&crate::plan::StorageTarget> for PieLoaderTargetView {
+    fn from(value: &crate::plan::StorageTarget) -> Self {
         Self {
             backend: value.backend.into(),
             tp_rank: value.tp_rank,
@@ -813,3 +818,20 @@ pub struct PieLoaderPlan {
     pub stats_json: PieLoaderBytes,
     pub owner: *mut std::ffi::c_void,
 }
+
+/// The ABI's bits and the plan's are the same bits.
+///
+/// A build error here means someone added a transform on one side only, which
+/// is the drift `PieLoaderTileMapKind::capability_bit` would otherwise turn
+/// into a mis-dispatched kernel.
+const _: () = {
+    use crate::plan as p;
+    assert!(PIE_LOADER_TILE_MAP_CAST == p::TILE_MAP_CAST);
+    assert!(PIE_LOADER_TILE_MAP_DECODE == p::TILE_MAP_DECODE);
+    assert!(PIE_LOADER_TILE_MAP_ENCODE == p::TILE_MAP_ENCODE);
+    assert!(PIE_LOADER_TILE_MAP_TRANSCODE == p::TILE_MAP_TRANSCODE);
+    assert!(PIE_LOADER_TILE_MAP_REBLOCK == p::TILE_MAP_REBLOCK);
+    assert!(PIE_LOADER_TILE_MAP_REORDER == p::TILE_MAP_REORDER);
+    assert!(PIE_LOADER_TILE_MAP_REPACK == p::TILE_MAP_REPACK);
+    assert!(PIE_LOADER_FUSION_FP8_TO_MXFP4 == p::FUSION_FP8_TO_MXFP4);
+};

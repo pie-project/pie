@@ -14,7 +14,8 @@
 use std::collections::HashMap;
 
 use super::{Checked, Expr};
-use crate::error::CompileError;
+use crate::error::Error;
+use crate::extent::{Dim, Rect};
 use crate::types::Encoding;
 
 /// Maximum tensor rank the walker supports. GPT-OSS MXFP4 blocks are rank 4;
@@ -95,7 +96,7 @@ impl Lowering {
     /// per row — thousands of them — but every row is the same length and the
     /// source and destination both advance by a fixed stride, so the whole
     /// thing is a single rectangular copy. That is exactly what the low IR's
-    /// `StridedExtent` expresses, and emitting the unfolded run list instead
+    /// `Extent` expresses, and emitting the unfolded run list instead
     /// would inflate the plan by three orders of magnitude for every sharded
     /// tensor in the model.
     ///
@@ -144,7 +145,7 @@ impl Lowering {
     }
 
     /// Convert to byte offsets under `encoding`.
-    pub fn byte_runs(&self, encoding: &Encoding) -> Result<Vec<ByteRun>, CompileError> {
+    pub fn byte_runs(&self, encoding: &Encoding) -> Result<Vec<ByteRun>, Error> {
         let scale = ByteScale::of(encoding);
         self.runs
             .iter()
@@ -166,9 +167,9 @@ impl Lowering {
 
     /// The copy pieces with every offset, stride and extent converted to bytes.
     ///
-    /// This is the form the low IR wants: `load_plan::StridedExtent` addresses
+    /// This is the form the low IR wants: `load_plan::Extent` addresses
     /// bytes, and a sub-byte encoding has no element addresses to speak of.
-    pub fn byte_pieces(&self, encoding: &Encoding) -> Result<Vec<BytePiece>, CompileError> {
+    pub fn byte_pieces(&self, encoding: &Encoding) -> Result<Vec<Rect>, Error> {
         let scale = ByteScale::of(encoding);
         self.copy_pieces()
             .into_iter()
@@ -199,8 +200,8 @@ impl Lowering {
                             dst_stride: scale.stride(dim.dst_stride, "destination stride")?,
                         })
                     })
-                    .collect::<Result<Vec<_>, CompileError>>()?;
-                Ok(BytePiece {
+                    .collect::<Result<Vec<_>, Error>>()?;
+                Ok(Rect {
                     leaf,
                     src_offset: scale.offset(src_elem, "piece source")?,
                     dst_offset: scale.offset(piece.dst_elem, "piece destination")?,
@@ -209,15 +210,6 @@ impl Lowering {
             })
             .collect()
     }
-}
-
-/// One [`Piece`] with byte addresses. The innermost `dims` entry counts bytes.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BytePiece {
-    pub leaf: usize,
-    pub src_offset: u64,
-    pub dst_offset: u64,
-    pub dims: Vec<Dim>,
 }
 
 /// Element index to byte offset, for one encoding.
@@ -237,12 +229,12 @@ impl ByteScale {
         }
     }
 
-    fn scaled(&self, elems: i64, what: &str) -> Result<i64, CompileError> {
+    fn scaled(&self, elems: i64, what: &str) -> Result<i64, Error> {
         let total = elems
             .checked_mul(self.bits)
-            .ok_or_else(|| CompileError::InvalidInput("byte offset overflows".to_string()))?;
+            .ok_or_else(|| Error::Overflow("byte offset overflows".to_string()))?;
         if total % 8 != 0 {
-            return Err(CompileError::InvalidInput(format!(
+            return Err(Error::Contract(format!(
                 "{what} of {elems} elements is not byte-aligned under a {} -bit encoding",
                 self.bits
             )));
@@ -250,16 +242,16 @@ impl ByteScale {
         Ok(total / 8)
     }
 
-    fn offset(&self, elems: i64, what: &str) -> Result<u64, CompileError> {
+    fn offset(&self, elems: i64, what: &str) -> Result<u64, Error> {
         u64::try_from(self.scaled(elems, what)?)
-            .map_err(|_| CompileError::InvalidInput("negative byte offset".to_string()))
+            .map_err(|_| Error::Contract("negative byte offset".to_string()))
     }
 
-    fn extent(&self, elems: i64, what: &str) -> Result<u64, CompileError> {
+    fn extent(&self, elems: i64, what: &str) -> Result<u64, Error> {
         self.offset(elems, what)
     }
 
-    fn stride(&self, elems: i64, what: &str) -> Result<i64, CompileError> {
+    fn stride(&self, elems: i64, what: &str) -> Result<i64, Error> {
         self.scaled(elems, what)
     }
 }
@@ -284,7 +276,7 @@ pub enum ByteRunSource {
 /// `dst_elem + Σ iₖ·dst_strideₖ`. The innermost dimension always has unit
 /// strides, so every piece ends in a contiguous stretch.
 ///
-/// This is the shape `load_plan::StridedExtent` already carries, which is why
+/// This is the shape `load_plan::Extent` already carries, which is why
 /// the fold exists: it is the difference between one instruction and one
 /// instruction per row.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -292,13 +284,6 @@ pub struct Piece {
     pub source: RunSource,
     pub dst_elem: i64,
     pub dims: Vec<Dim>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Dim {
-    pub count: i64,
-    pub src_stride: i64,
-    pub dst_stride: i64,
 }
 
 impl Piece {
@@ -419,7 +404,7 @@ pub fn bits_per_element(encoding: &Encoding) -> u32 {
 /// cannot make the compiler allocate without limit. It is *not* the cost
 /// model — a row shard is thousands of runs and one copy. Ask
 /// [`Lowering::cost`] what the expression actually costs.
-pub fn compile(expr: &Expr, checked: &Checked, max_runs: usize) -> Result<Lowering, CompileError> {
+pub fn compile(expr: &Expr, checked: &Checked, max_runs: usize) -> Result<Lowering, Error> {
     let mut builder = Builder {
         checked,
         nodes: Vec::new(),
@@ -475,9 +460,9 @@ struct Builder<'a> {
 }
 
 impl Builder<'_> {
-    fn push(&mut self, kind: Kind, shape: Vec<i64>) -> Result<usize, CompileError> {
+    fn push(&mut self, kind: Kind, shape: Vec<i64>) -> Result<usize, Error> {
         if shape.len() > MAX_RANK {
-            return Err(CompileError::InvalidInput(format!(
+            return Err(Error::Contract(format!(
                 "rank {} exceeds the supported maximum of {MAX_RANK}",
                 shape.len()
             )));
@@ -486,12 +471,12 @@ impl Builder<'_> {
         for axis in (0..shape.len().saturating_sub(1)).rev() {
             strides[axis] = strides[axis + 1]
                 .checked_mul(shape[axis + 1])
-                .ok_or_else(|| CompileError::InvalidInput("shape overflows i64".to_string()))?;
+                .ok_or_else(|| Error::Overflow("shape overflows i64".to_string()))?;
         }
         let elements = match shape.first() {
-            Some(first) => first.checked_mul(strides[0]).ok_or_else(|| {
-                CompileError::InvalidInput("element count overflows i64".to_string())
-            })?,
+            Some(first) => first
+                .checked_mul(strides[0])
+                .ok_or_else(|| Error::Overflow("element count overflows i64".to_string()))?,
             None => 1,
         };
         self.nodes.push(Node {
@@ -514,14 +499,14 @@ impl Builder<'_> {
     }
 
     /// Flatten `expr` into `self.nodes`, returning the root index.
-    fn build(&mut self, expr: &Expr) -> Result<usize, CompileError> {
+    fn build(&mut self, expr: &Expr) -> Result<usize, Error> {
         match expr {
             Expr::Src(name) => {
                 let shape = self
                     .checked
                     .source(name)
                     .ok_or_else(|| {
-                        CompileError::InvalidInput(format!(
+                        Error::Contract(format!(
                             "checkpoint tensor '{name}' was not resolved by the type checker"
                         ))
                     })?
@@ -535,7 +520,7 @@ impl Builder<'_> {
                     .checked
                     .output(name)
                     .ok_or_else(|| {
-                        CompileError::InvalidInput(format!(
+                        Error::Contract(format!(
                             "contract '{name}' was not resolved by the type checker"
                         ))
                     })?
@@ -555,7 +540,7 @@ impl Builder<'_> {
                 let axis = usize::from(axis.0);
                 let mut shape = self.nodes[inner].shape.clone();
                 let operand_extent = *shape.get(axis).ok_or_else(|| {
-                    CompileError::Internal("Slice axis escaped the type checker".to_string())
+                    Error::Internal("Slice axis escaped the type checker".to_string())
                 })?;
                 shape[axis] = *len;
                 let whole = *step == 1 && *start == 0 && *len == operand_extent;
@@ -584,7 +569,7 @@ impl Builder<'_> {
                     offset += self.nodes[inner].shape[axis];
                 }
                 if placed.is_empty() {
-                    return Err(CompileError::Internal(
+                    return Err(Error::Internal(
                         "empty Cat escaped the type checker".to_string(),
                     ));
                 }
@@ -634,10 +619,10 @@ impl Builder<'_> {
                     shape,
                 )
             }
-            Expr::Repack { .. } => Err(CompileError::InvalidInput(
+            Expr::Repack { .. } => Err(Error::Contract(
                 "Repack needs a kernel and cannot be lowered to byte runs".to_string(),
             )),
-            Expr::Quantize { .. } => Err(CompileError::InvalidInput(
+            Expr::Quantize { .. } => Err(Error::Contract(
                 "Quantize needs a kernel and cannot be lowered to byte runs".to_string(),
             )),
             // Nothing moves: the leaf is simply read under its declared type.
@@ -649,14 +634,14 @@ impl Builder<'_> {
                     Expr::Src(name) => self.intern(Leaf::Checkpoint(name.clone())),
                     Expr::Out(name) => self.intern(Leaf::Contract(name.clone())),
                     _ => {
-                        return Err(CompileError::InvalidInput(
+                        return Err(Error::Contract(
                             "Bitcast may only reinterpret a whole tensor".to_string(),
                         ));
                     }
                 };
                 self.push(Kind::Leaf(leaf), out.shape.clone())
             }
-            Expr::Shard { .. } => Err(CompileError::Internal(
+            Expr::Shard { .. } => Err(Error::Internal(
                 "Shard must be specialized against a target before lowering".to_string(),
             )),
         }
@@ -664,7 +649,7 @@ impl Builder<'_> {
 
     /// Walk the output in flat order, emitting one run per maximal contiguous
     /// stretch.
-    fn walk(&mut self, root: usize, max_runs: usize) -> Result<Lowering, CompileError> {
+    fn walk(&mut self, root: usize, max_runs: usize) -> Result<Lowering, Error> {
         let total = self.nodes[root].elements;
         let mut runs: Vec<Run> = Vec::new();
         let mut flat = 0_i64;
@@ -684,7 +669,7 @@ impl Builder<'_> {
                 Some(last) if adjacent(last, source, flat) => last.len += span,
                 _ => {
                     if runs.len() >= max_runs {
-                        return Err(CompileError::InvalidInput(format!(
+                        return Err(Error::Contract(format!(
                             "expression breaks into more than {max_runs} contiguous \
                              stretches; it needs a gather lowering, not a copy list"
                         )));
@@ -712,7 +697,7 @@ impl Builder<'_> {
         index: usize,
         coord: &Coord,
         flat: i64,
-    ) -> Result<(Option<(usize, i64)>, i64), CompileError> {
+    ) -> Result<(Option<(usize, i64)>, i64), Error> {
         let node = &self.nodes[index];
         let remaining = node.elements - flat;
         match &node.kind {
@@ -753,7 +738,7 @@ impl Builder<'_> {
                     .find(|(offset, _)| *offset <= at)
                     .copied()
                     .ok_or_else(|| {
-                        CompileError::Internal(format!("Cat has no part covering index {at}"))
+                        Error::Internal(format!("Cat has no part covering index {at}"))
                     })?;
                 let mut inner = *coord;
                 inner.dims[*axis] = at - offset;
@@ -1497,7 +1482,7 @@ mod tests {
     #[test]
     fn a_row_shard_folds_to_a_single_strided_copy() {
         // 2048 runs of 3072 elements, each advancing 6144 in the source and
-        // 3072 in the destination. That is one `StridedExtent`, and emitting
+        // 3072 in the destination. That is one `Extent`, and emitting
         // 2048 of anything instead would be the whole point missed.
         let ck = Fake::new(&[("w", &[2048, 6144])]);
         let out = lower(Expr::src("w").slice(1, 0, 3072), &ck);

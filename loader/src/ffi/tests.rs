@@ -9,7 +9,7 @@
 use super::arena::{self, view};
 use super::entry::{PieLoaderDiagnostics, PieLoaderStatus, PieLoaderTargetSpec};
 use super::types::*;
-use crate::load_plan::*;
+use crate::plan::*;
 use crate::types::*;
 
 fn target() -> StorageTarget {
@@ -27,13 +27,13 @@ fn target() -> StorageTarget {
     }
 }
 
-fn stride(element_bytes: u32, dims: &[(i64, i64, i64)]) -> StridedExtent {
-    StridedExtent {
+fn stride(element_bytes: u32, dims: &[(i64, i64, i64)]) -> Extent {
+    Extent {
         base_offset: 0,
         element_bytes,
         dims: dims
             .iter()
-            .map(|(count, src_stride, dst_stride)| DimSpec {
+            .map(|(count, src_stride, dst_stride)| Dim {
                 count: *count,
                 src_stride: *src_stride,
                 dst_stride: *dst_stride,

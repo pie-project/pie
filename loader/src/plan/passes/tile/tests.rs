@@ -7,9 +7,9 @@
 //! plan-level tests in `tests/storage_compiler.rs`.
 
 use super::*;
-use crate::load_plan::{
-    BufferDecl, DimSpec, FUSION_FP8_TO_MXFP4, LoadPlan, SourceTensorDecl, StorageInstr, TileSpec,
-    TransformSpec,
+use crate::plan::{
+    BufferDecl, Dim, Extent, FUSION_FP8_TO_MXFP4, LoadPlan, SourceTensorDecl, StorageInstr,
+    TileSpec, TransformSpec,
 };
 use crate::types::{FileId, InstrId, QuantSpec, TensorId};
 
@@ -28,8 +28,8 @@ fn facts(source_dtype: DType, rows: u64, cols: u64, max_tile_bytes: u64) -> Tile
     }
 }
 
-/// A CUDA target with the two constants that used to be hardcoded in
-/// `backend/cuda.rs` now stated the way the driver states them.
+/// A CUDA target with the two constants that used to be hardcoded in the
+/// backend module, now stated the way the driver states them.
 fn cuda_target(fused: bool) -> StorageTarget {
     StorageTarget {
         backend: BackendKind::Cuda,
@@ -41,7 +41,7 @@ fn cuda_target(fused: bool) -> StorageTarget {
 }
 
 fn cuda_lower(facts: &TileMapFacts, fused: bool) -> TileLowering {
-    cuda::Cuda.lower_tile_map(facts, &cuda_target(fused))
+    lower_tile_map(facts, &cuda_target(fused))
 }
 
 fn rows_per_tile(facts: &TileMapFacts) -> u32 {
@@ -98,10 +98,7 @@ fn a_target_with_no_block_scale_layout_tiles_an_fp8_source() {
         ..cuda_target(false)
     };
     let facts = facts(DType::F8E4M3, 4096, 4096, 4 * MIB);
-    assert_eq!(
-        cuda::Cuda.lower_tile_map(&facts, &target).rows_per_tile,
-        341
-    );
+    assert_eq!(lower_tile_map(&facts, &target).rows_per_tile, 341);
 }
 
 #[test]
@@ -116,7 +113,7 @@ fn the_scratch_dtype_is_the_targets_to_state() {
             encode_scratch_dtype: dtype,
             ..cuda_target(false)
         };
-        cuda::Cuda.lower_tile_map(&facts, &target).rows_per_tile
+        lower_tile_map(&facts, &target).rows_per_tile
     };
     assert_eq!(through(DType::BF16), 256);
     assert_eq!(through(DType::F32), 170);
@@ -202,7 +199,7 @@ fn fusion_needs_every_conjunct() {
 fn backends_without_transform_kernels_decide_nothing() {
     // Metal binds tensors into a heap and runs no transforms, so its mask is
     // empty and every lowering is the default.
-    assert_eq!(metal::TILE_MAP_MASK, 0);
+    assert_eq!(METAL_TILE_MAP_MASK, 0);
     let target = StorageTarget {
         backend: BackendKind::Metal,
         fusion_mask: FUSION_FP8_TO_MXFP4,
@@ -211,10 +208,7 @@ fn backends_without_transform_kernels_decide_nothing() {
         ..StorageTarget::default()
     };
     let facts = facts(DType::F8E4M3, 4096, 4096, 4 * MIB);
-    assert_eq!(
-        metal::Metal.lower_tile_map(&facts, &target),
-        TileLowering::default()
-    );
+    assert_eq!(lower_tile_map(&facts, &target), TileLowering::default());
 }
 
 #[test]
@@ -229,39 +223,32 @@ fn the_reference_backend_declines_every_optimization() {
         ..StorageTarget::default()
     };
     let facts = facts(DType::F8E4M3, 4096, 4096, 4 * MIB);
-    assert_eq!(
-        host::Host.lower_tile_map(&facts, &target),
-        TileLowering::default()
-    );
+    assert_eq!(lower_tile_map(&facts, &target), TileLowering::default());
 }
 
 #[test]
 fn each_backend_resolves_to_its_own_rules() {
-    assert_eq!(for_backend(BackendKind::Cuda).name(), "cuda");
-    assert_eq!(for_backend(BackendKind::Metal).name(), "metal");
-    assert_eq!(for_backend(BackendKind::Unknown).name(), "host");
-    assert_eq!(
-        for_backend(BackendKind::Cuda).tile_map_mask(),
-        cuda::TILE_MAP_MASK
-    );
+    assert_eq!(tile_map_mask(BackendKind::Cuda), CUDA_TILE_MAP_MASK);
+    assert_eq!(tile_map_mask(BackendKind::Metal), METAL_TILE_MAP_MASK);
+    assert_eq!(tile_map_mask(BackendKind::Unknown), HOST_TILE_MAP_MASK);
 }
 
 // ---------------------------------------------------------------------------
 // Fact extraction: what the pass reads out of the plan before a backend sees it.
 // ---------------------------------------------------------------------------
 
-fn compact_extent(rows: i64, cols: i64, element_bytes: u32) -> StridedExtent {
+fn compact_extent(rows: i64, cols: i64, element_bytes: u32) -> Extent {
     let eb = i64::from(element_bytes);
-    StridedExtent {
+    Extent {
         base_offset: 0,
         element_bytes,
         dims: vec![
-            DimSpec {
+            Dim {
                 count: rows,
                 src_stride: cols * eb,
                 dst_stride: cols * eb,
             },
-            DimSpec {
+            Dim {
                 count: cols,
                 src_stride: eb,
                 dst_stride: eb,

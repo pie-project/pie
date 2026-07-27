@@ -7,7 +7,7 @@
 //!
 //! It is the one module below `lib.rs` that opens a file, which is why it is
 //! named for what it is rather than sharing a name with the backend whose
-//! plans it accepts: `crate::backend::host` decides how a plan is lowered, and
+//! plans it accepts: `crate::plan::passes::tile::host` decides how a plan is lowered, and
 //! this executes the result. The compiler is on the other side of that line —
 //! `tests/standalone.rs` pins it.
 
@@ -18,10 +18,9 @@ use std::path::{Path, PathBuf};
 
 use half::{bf16, f16};
 
-use crate::error::CompileError;
-use crate::load_plan::{
-    DestExtent, HOST_TILE_MAP_MASK, LoadPlan, SourceExtent, StorageInstr, StridedExtent,
-    TileMapKind,
+use crate::error::Error;
+use crate::plan::{
+    DestExtent, Extent, HOST_TILE_MAP_MASK, LoadPlan, SourceExtent, StorageInstr, TileMapKind,
 };
 use crate::types::{BufferId, DType, Encoding};
 
@@ -64,7 +63,7 @@ enum Root {
 /// an executor that rediscovered the checkpoint by scanning a directory could
 /// disagree with the plan about which file id means which file, and every
 /// offset in the plan is expressed against that table.
-pub fn execute_plan(plan: &LoadPlan, snapshot_dir: &Path) -> Result<HostStorage, CompileError> {
+pub fn execute_plan(plan: &LoadPlan, snapshot_dir: &Path) -> Result<HostStorage, Error> {
     if plan.target.tile_map_mask & !HOST_TILE_MAP_MASK != 0 {
         return Err(invalid(
             "host executor received a plan advertising unsupported TileMap transforms",
@@ -111,7 +110,7 @@ struct HostExecutor<'a> {
 }
 
 impl HostExecutor<'_> {
-    fn execute(&mut self) -> Result<(), CompileError> {
+    fn execute(&mut self) -> Result<(), Error> {
         for id in &self.plan.schedule {
             let instr = self
                 .plan
@@ -209,7 +208,7 @@ impl HostExecutor<'_> {
         Ok(())
     }
 
-    fn allocate(&mut self, id: BufferId) -> Result<(), CompileError> {
+    fn allocate(&mut self, id: BufferId) -> Result<(), Error> {
         let decl = self
             .plan
             .buffers
@@ -235,7 +234,7 @@ impl HostExecutor<'_> {
         Ok(())
     }
 
-    fn read_extent(&self, source: &SourceExtent) -> Result<Vec<u8>, CompileError> {
+    fn read_extent(&self, source: &SourceExtent) -> Result<Vec<u8>, Error> {
         let mut normalized = source.stride.clone();
         let base_offset = normalized.base_offset;
         normalized.base_offset = 0;
@@ -258,7 +257,7 @@ impl HostExecutor<'_> {
         offset: u64,
         len: u64,
         tile_bound: u64,
-    ) -> Result<Vec<u8>, CompileError> {
+    ) -> Result<Vec<u8>, Error> {
         let path = self
             .files
             .get(&file_id)
@@ -285,8 +284,8 @@ impl HostExecutor<'_> {
         &mut self,
         dest: &DestExtent,
         compact: &[u8],
-        source_stride: &StridedExtent,
-    ) -> Result<(), CompileError> {
+        source_stride: &Extent,
+    ) -> Result<(), Error> {
         require_same_byte_count(source_stride, &dest.stride)?;
         if !compact_extent(&dest.stride) {
             return Err(invalid(
@@ -299,7 +298,7 @@ impl HostExecutor<'_> {
         self.write_buffer(dest.buffer, base, compact)
     }
 
-    fn write_arena(&mut self, offset: u64, bytes: &[u8]) -> Result<(), CompileError> {
+    fn write_arena(&mut self, offset: u64, bytes: &[u8]) -> Result<(), Error> {
         let offset = checked_usize(offset)?;
         let end = offset
             .checked_add(bytes.len())
@@ -320,7 +319,7 @@ impl HostExecutor<'_> {
         inputs: &[BufferId],
         outputs: &[BufferId],
         max_tile_bytes: u64,
-    ) -> Result<(), CompileError> {
+    ) -> Result<(), Error> {
         let input = if let Some(source) = source {
             self.read_extent(source)?
         } else {
@@ -387,7 +386,7 @@ impl HostExecutor<'_> {
         input: Option<BufferId>,
         output: Option<BufferId>,
         bytes: &[u8],
-    ) -> Result<Vec<u8>, CompileError> {
+    ) -> Result<Vec<u8>, Error> {
         let output = output.ok_or_else(|| invalid("host Cast requires an output buffer"))?;
         let from = if let Some(input) = input {
             self.buffer_dtype(input)?
@@ -404,7 +403,7 @@ impl HostExecutor<'_> {
         encode_values(&values, to)
     }
 
-    fn buffer_dtype(&self, id: BufferId) -> Result<DType, CompileError> {
+    fn buffer_dtype(&self, id: BufferId) -> Result<DType, Error> {
         let buffer = self
             .plan
             .buffers
@@ -426,7 +425,7 @@ impl HostExecutor<'_> {
         }
     }
 
-    fn source_dtype(&self, id: crate::types::TensorId) -> Result<DType, CompileError> {
+    fn source_dtype(&self, id: crate::types::TensorId) -> Result<DType, Error> {
         let source = self
             .plan
             .sources
@@ -439,7 +438,7 @@ impl HostExecutor<'_> {
         }
     }
 
-    fn buffer_bytes(&self, id: BufferId) -> Result<&[u8], CompileError> {
+    fn buffer_bytes(&self, id: BufferId) -> Result<&[u8], Error> {
         let (root, offset, len) = self.resolve(id, 0, usize::MAX)?;
         match root {
             Root::Arena => self
@@ -455,12 +454,7 @@ impl HostExecutor<'_> {
         }
     }
 
-    fn write_buffer(
-        &mut self,
-        id: BufferId,
-        offset: usize,
-        bytes: &[u8],
-    ) -> Result<(), CompileError> {
+    fn write_buffer(&mut self, id: BufferId, offset: usize, bytes: &[u8]) -> Result<(), Error> {
         let (root, base, _) = self.resolve(id, offset, bytes.len())?;
         let end = base
             .checked_add(bytes.len())
@@ -487,7 +481,7 @@ impl HostExecutor<'_> {
         id: BufferId,
         extra_offset: usize,
         requested_len: usize,
-    ) -> Result<(Root, usize, usize), CompileError> {
+    ) -> Result<(Root, usize, usize), Error> {
         let loc = self
             .buffers
             .get(&id)
@@ -520,7 +514,7 @@ fn resolve_range(
     available: usize,
     extra_offset: usize,
     requested_len: usize,
-) -> Result<(Root, usize, usize), CompileError> {
+) -> Result<(Root, usize, usize), Error> {
     if extra_offset > available {
         return Err(invalid("buffer offset is out of bounds"));
     }
@@ -535,7 +529,7 @@ fn resolve_range(
     Ok((root, base + extra_offset, len))
 }
 
-fn gather_strided(raw: &[u8], extent: &StridedExtent) -> Result<Vec<u8>, CompileError> {
+fn gather_strided(raw: &[u8], extent: &Extent) -> Result<Vec<u8>, Error> {
     let shape = extent
         .dims
         .iter()
@@ -571,11 +565,8 @@ fn gather_strided(raw: &[u8], extent: &StridedExtent) -> Result<Vec<u8>, Compile
 /// plan, because `[2048] x 6144 bytes` and `[2048, 3072] x 2 bytes` are the same
 /// 12 MiB written the same way. Neither the CUDA nor the Metal executor makes
 /// that comparison; this one should not either.
-fn require_same_byte_count(
-    source: &StridedExtent,
-    dest: &StridedExtent,
-) -> Result<(), CompileError> {
-    let bytes = |extent: &StridedExtent| -> Option<i64> {
+fn require_same_byte_count(source: &Extent, dest: &Extent) -> Result<(), Error> {
+    let bytes = |extent: &Extent| -> Option<i64> {
         extent
             .dims
             .iter()
@@ -593,7 +584,7 @@ fn require_same_byte_count(
     Ok(())
 }
 
-fn compact_extent(extent: &StridedExtent) -> bool {
+fn compact_extent(extent: &Extent) -> bool {
     let mut stride = i64::from(extent.element_bytes);
     for dim in extent.dims.iter().rev() {
         if dim.count < 0 || dim.dst_stride != stride {
@@ -616,11 +607,7 @@ fn unravel(mut linear: usize, shape: &[usize]) -> Vec<usize> {
     index
 }
 
-fn extent_offset(
-    index: &[usize],
-    dims: &[crate::load_plan::DimSpec],
-    source: bool,
-) -> Result<usize, CompileError> {
+fn extent_offset(index: &[usize], dims: &[crate::plan::Dim], source: bool) -> Result<usize, Error> {
     index
         .iter()
         .zip(dims)
@@ -640,7 +627,7 @@ fn extent_offset(
         })
 }
 
-fn extent_bytes(extent: &StridedExtent) -> Result<usize, CompileError> {
+fn extent_bytes(extent: &Extent) -> Result<usize, Error> {
     let elements = extent.dims.iter().try_fold(1usize, |n, dim| {
         n.checked_mul(checked_usize_i64(dim.count)?)
             .ok_or_else(|| invalid("extent byte count overflow"))
@@ -650,11 +637,11 @@ fn extent_bytes(extent: &StridedExtent) -> Result<usize, CompileError> {
         .ok_or_else(|| invalid("extent byte count overflow"))
 }
 
-fn physical_source_bytes(extent: &StridedExtent) -> Result<u64, CompileError> {
+fn physical_source_bytes(extent: &Extent) -> Result<u64, Error> {
     physical_bytes(extent, true)
 }
 
-fn physical_bytes(extent: &StridedExtent, source: bool) -> Result<u64, CompileError> {
+fn physical_bytes(extent: &Extent, source: bool) -> Result<u64, Error> {
     let mut end = 0u64;
     for dim in &extent.dims {
         if dim.count == 0 {
@@ -680,7 +667,7 @@ fn physical_bytes(extent: &StridedExtent, source: bool) -> Result<u64, CompileEr
         .ok_or_else(|| invalid("extent range overflow"))
 }
 
-fn decode_values(bytes: &[u8], dtype: DType) -> Result<Vec<f64>, CompileError> {
+fn decode_values(bytes: &[u8], dtype: DType) -> Result<Vec<f64>, Error> {
     let width = dtype.bytes() as usize;
     if !bytes.len().is_multiple_of(width) {
         return Err(invalid("cast input byte count is not element-aligned"));
@@ -710,7 +697,7 @@ fn decode_values(bytes: &[u8], dtype: DType) -> Result<Vec<f64>, CompileError> {
         .collect()
 }
 
-fn encode_values(values: &[f64], dtype: DType) -> Result<Vec<u8>, CompileError> {
+fn encode_values(values: &[f64], dtype: DType) -> Result<Vec<u8>, Error> {
     let mut out = Vec::with_capacity(values.len() * dtype.bytes() as usize);
     for &value in values {
         match dtype {
@@ -749,34 +736,34 @@ fn instr_id(instr: &StorageInstr) -> crate::types::InstrId {
     }
 }
 
-fn checked_usize(value: u64) -> Result<usize, CompileError> {
+fn checked_usize(value: u64) -> Result<usize, Error> {
     usize::try_from(value).map_err(|_| invalid("value does not fit usize"))
 }
 
-fn checked_usize_i64(value: i64) -> Result<usize, CompileError> {
+fn checked_usize_i64(value: i64) -> Result<usize, Error> {
     usize::try_from(value).map_err(|_| invalid("negative or oversized extent value"))
 }
 
-fn invalid(message: impl Into<String>) -> CompileError {
-    CompileError::InvalidInput(message.into())
+fn invalid(message: impl Into<String>) -> Error {
+    Error::Contract(message.into())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::load_plan::{
-        BufferDecl, DestExtent, DimSpec, MemoryPlan, SourceTensorDecl, StorageTarget, TileSpec,
+    use crate::plan::{
+        BufferDecl, DestExtent, Dim, MemoryPlan, SourceTensorDecl, StorageTarget, TileSpec,
         TransformSpec,
     };
     use crate::types::{FileId, InstrId, TensorDecl, TensorId};
 
-    fn extent(base_offset: u64, element_bytes: u32, dims: &[(i64, i64, i64)]) -> StridedExtent {
-        StridedExtent {
+    fn extent(base_offset: u64, element_bytes: u32, dims: &[(i64, i64, i64)]) -> Extent {
+        Extent {
             base_offset,
             element_bytes,
             dims: dims
                 .iter()
-                .map(|&(count, src_stride, dst_stride)| DimSpec {
+                .map(|&(count, src_stride, dst_stride)| Dim {
                     count,
                     src_stride,
                     dst_stride,
@@ -807,7 +794,7 @@ mod tests {
         });
         // The plan names its own files; the executor does not go looking.
         // Relative, so `snapshot_dir` still has a job.
-        program.files.push(crate::load_plan::CheckpointFileDecl {
+        program.files.push(crate::plan::CheckpointFileDecl {
             id: FileId(0),
             path: "model.safetensors".to_string(),
             size_bytes,
@@ -1011,7 +998,7 @@ mod tests {
     #[test]
     fn rejects_unsupported_advertised_transforms() {
         let (dir, mut plan) = fixture();
-        plan.target.tile_map_mask |= crate::load_plan::TILE_MAP_REORDER;
+        plan.target.tile_map_mask |= crate::plan::TILE_MAP_REORDER;
         let error = execute_plan(&plan, &dir).unwrap_err().to_string();
         assert!(error.contains("unsupported TileMap transforms"));
         std::fs::remove_dir_all(dir).ok();

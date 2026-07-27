@@ -11,21 +11,16 @@
 //! `crate::host_executor` does, which is exactly why it is not the compiler.
 
 pub mod artifact;
-pub mod backend;
 pub mod checkpoint;
 pub mod contract;
 pub mod contract_writer;
 pub mod dump;
 pub mod error;
+pub mod extent;
 pub mod ffi;
-pub mod frontend;
 pub mod host_executor;
-pub mod ir;
-pub mod load_plan;
-pub mod optimizer;
-pub mod planner;
+pub mod plan;
 pub mod reference;
-pub mod typecheck;
 pub mod types;
 pub mod verify;
 

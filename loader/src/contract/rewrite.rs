@@ -8,8 +8,8 @@
 
 use crate::checkpoint::{CheckpointMetadata, RawTensor};
 use crate::contract::{Expr, ModelContract, TensorContract};
-use crate::error::CompileError;
-use crate::load_plan::StorageTarget;
+use crate::error::Error;
+use crate::plan::StorageTarget;
 use crate::types::{Axis, Encoding};
 
 /// Replace many equally-shaped row shards with one bank plus views of it.
@@ -22,7 +22,7 @@ pub fn coalesce_direct_row_shards(
     contract: &ModelContract,
     metadata: &CheckpointMetadata,
     target: &StorageTarget,
-) -> Result<ModelContract, CompileError> {
+) -> Result<ModelContract, Error> {
     if target.tp_size <= 1 {
         return Ok(contract.clone());
     }
@@ -173,7 +173,7 @@ fn emit_row_shard_bank(
     indices: &[usize],
     old_to_new: &mut [usize],
     new_tensors: &mut Vec<TensorContract>,
-) -> Result<(), CompileError> {
+) -> Result<(), Error> {
     let first = &contract.tensors[indices[0]];
     let first_raw = direct_raw(metadata, first)?;
     let rows = first_raw.shape[0];
@@ -214,15 +214,15 @@ fn emit_row_shard_bank(
 fn direct_raw<'a>(
     metadata: &'a CheckpointMetadata,
     contract: &TensorContract,
-) -> Result<&'a RawTensor, CompileError> {
+) -> Result<&'a RawTensor, Error> {
     let Some(name) = direct_src(&contract.expr) else {
-        return Err(CompileError::InvalidInput(format!(
+        return Err(Error::Contract(format!(
             "runtime tensor '{}' is not a direct tensor",
             contract.name
         )));
     };
     metadata.tensor_by_name(name).ok_or_else(|| {
-        CompileError::InvalidInput(format!(
+        Error::Contract(format!(
             "runtime tensor '{}' references missing source tensor '{name}'",
             contract.name
         ))
@@ -239,11 +239,11 @@ fn direct_src(expr: &Expr) -> Option<&str> {
     }
 }
 
-fn dense_element_bytes(raw: &RawTensor, context: &str) -> Result<u64, CompileError> {
+fn dense_element_bytes(raw: &RawTensor, context: &str) -> Result<u64, Error> {
     match &raw.encoding {
         Encoding::Raw(dtype) => Ok(dtype.bytes()),
         Encoding::Quant(spec) => spec.dense_element_bytes().ok_or_else(|| {
-            CompileError::InvalidInput(format!(
+            Error::Contract(format!(
                 "{context} '{}' has non-affine packed encoding",
                 raw.name
             ))
@@ -257,11 +257,11 @@ fn dense_element_bytes(raw: &RawTensor, context: &str) -> Result<u64, CompileErr
 /// for "tp_size does not divide this model". The driver used to pre-empt it with
 /// its own per-family table of divisibility rules read off `config.json` — the
 /// same fact checked twice, and only for the families someone had listed.
-fn local_range(full: i64, target: &StorageTarget, what: &str) -> Result<(i64, i64), CompileError> {
+fn local_range(full: i64, target: &StorageTarget, what: &str) -> Result<(i64, i64), Error> {
     let world = i64::from(target.tp_size.max(1));
     let rank = i64::from(target.tp_rank);
     if full % world != 0 {
-        return Err(CompileError::InvalidInput(format!(
+        return Err(Error::Contract(format!(
             "{what} is {full}, which tp_size {} does not divide; use a tp_size \
              that divides it or run single-GPU",
             target.tp_size
@@ -271,9 +271,9 @@ fn local_range(full: i64, target: &StorageTarget, what: &str) -> Result<(i64, i6
     Ok((rank * local, local))
 }
 
-fn checked_mul_i64(lhs: i64, rhs: u64, context: &str) -> Result<u64, CompileError> {
-    let lhs = u64::try_from(lhs)
-        .map_err(|_| CompileError::InvalidInput(format!("{context}: negative value")))?;
+fn checked_mul_i64(lhs: i64, rhs: u64, context: &str) -> Result<u64, Error> {
+    let lhs =
+        u64::try_from(lhs).map_err(|_| Error::Contract(format!("{context}: negative value")))?;
     lhs.checked_mul(rhs)
-        .ok_or_else(|| CompileError::InvalidInput(format!("{context}: byte overflow")))
+        .ok_or_else(|| Error::Overflow(format!("{context}: byte overflow")))
 }

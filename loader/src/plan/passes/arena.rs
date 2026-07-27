@@ -1,11 +1,12 @@
 //! Persistent device arena: assign operand offsets, order the persistent
 //! sources, and validate the resulting layout for overlap and alignment.
 
-use super::passes::compact_extent_for_copy;
+use super::rewrite::compact_extent_for_copy;
 use super::*;
 
-pub(super) fn assign_persistent_offsets(program: &mut LoadPlan) -> Result<(), CompileError> {
+pub(super) fn assign_persistent_offsets(program: &mut LoadPlan) -> Result<usize> {
     let mut next = 0u64;
+    let mut placed = 0usize;
     let source_order = persistent_source_order(program)?;
     let mut order = (0..program.buffers.len()).collect::<Vec<_>>();
     order.sort_by_key(|&idx| {
@@ -32,27 +33,22 @@ pub(super) fn assign_persistent_offsets(program: &mut LoadPlan) -> Result<(), Co
         let offset = align_up_u64(next, alignment)?;
         next = offset
             .checked_add(buffer.bytes)
-            .ok_or_else(|| CompileError::InvalidInput("persistent arena overflow".to_string()))?;
+            .ok_or_else(|| Error::Overflow("persistent arena overflow".to_string()))?;
         buffer.persistent_offset = Some(offset);
+        placed += 1;
     }
-    Ok(())
+    Ok(placed)
 }
 
 pub(super) fn persistent_source_order(
     program: &LoadPlan,
-) -> Result<HashMap<BufferId, (u32, u64, u32)>, CompileError> {
+) -> Result<HashMap<BufferId, (u32, u64, u32)>> {
     let mut order = HashMap::new();
     for instr in &program.instrs {
         let StorageInstr::ExtentWrite { source, dest, .. } = instr else {
             continue;
         };
-        let Some(buffer) = program
-            .buffers
-            .iter()
-            .find(|buffer| buffer.id == dest.buffer)
-        else {
-            continue;
-        };
+        let buffer = program.buffer(dest.buffer)?;
         if buffer.temporary || buffer.tensor.is_none() || buffer.bytes == 0 {
             continue;
         }
@@ -65,7 +61,7 @@ pub(super) fn persistent_source_order(
         let source_start = source
             .file_offset
             .checked_add(source.stride.base_offset)
-            .ok_or_else(|| CompileError::InvalidInput("source offset overflow".to_string()))?;
+            .ok_or_else(|| Error::Overflow("source offset overflow".to_string()))?;
         order
             .entry(dest.buffer)
             .or_insert((source.file_id.0, source_start, dest.buffer.0));
@@ -73,7 +69,7 @@ pub(super) fn persistent_source_order(
     Ok(order)
 }
 
-pub(super) fn align_up_u64(value: u64, alignment: u64) -> Result<u64, CompileError> {
+pub(super) fn align_up_u64(value: u64, alignment: u64) -> Result<u64> {
     if alignment <= 1 {
         return Ok(value);
     }
@@ -83,7 +79,7 @@ pub(super) fn align_up_u64(value: u64, alignment: u64) -> Result<u64, CompileErr
     }
     value
         .checked_add(alignment - rem)
-        .ok_or_else(|| CompileError::InvalidInput("alignment overflow".to_string()))
+        .ok_or_else(|| Error::Overflow("alignment overflow".to_string()))
 }
 
 /// Operand-unit invariants the optimizer/ABI must preserve and the C++ executor
@@ -96,7 +92,7 @@ pub(super) fn align_up_u64(value: u64, alignment: u64) -> Result<u64, CompileErr
 ///   3. every `CreateView` reads a single backing buffer that exists, and the
 ///      view window lies within it — i.e. packed members stay *internal* to one
 ///      backing buffer, which is what makes (1) safe for packed weights.
-pub(super) fn validate_persistent_layout(program: &LoadPlan) -> Result<(), CompileError> {
+pub(super) fn validate_persistent_layout(program: &mut LoadPlan) -> Result<usize> {
     let mut spans: Vec<(u64, u64, u32)> = Vec::new();
     for buffer in &program.buffers {
         let Some(offset) = buffer.persistent_offset else {
@@ -109,20 +105,20 @@ pub(super) fn validate_persistent_layout(program: &LoadPlan) -> Result<(), Compi
                 .max(1),
         );
         if offset % alignment != 0 {
-            return Err(CompileError::InvalidInput(format!(
+            return Err(Error::Contract(format!(
                 "persistent buffer {} base offset {} violates operand alignment {}",
                 buffer.id.0, offset, alignment
             )));
         }
-        let end = offset.checked_add(buffer.bytes).ok_or_else(|| {
-            CompileError::InvalidInput("persistent arena offset overflow".to_string())
-        })?;
+        let end = offset
+            .checked_add(buffer.bytes)
+            .ok_or_else(|| Error::Overflow("persistent arena offset overflow".to_string()))?;
         spans.push((offset, end, buffer.id.0));
     }
     spans.sort_by_key(|span| span.0);
     for pair in spans.windows(2) {
         if pair[0].1 > pair[1].0 {
-            return Err(CompileError::InvalidInput(format!(
+            return Err(Error::Contract(format!(
                 "persistent buffers {} and {} overlap in the arena: [{}, {}) vs [{}, {})",
                 pair[0].2, pair[1].2, pair[0].0, pair[0].1, pair[1].0, pair[1].1
             )));
@@ -133,7 +129,7 @@ pub(super) fn validate_persistent_layout(program: &LoadPlan) -> Result<(), Compi
             continue;
         };
         let Some(backing) = program.buffers.iter().find(|buffer| buffer.id == *input) else {
-            return Err(CompileError::InvalidInput(format!(
+            return Err(Error::Contract(format!(
                 "CreateView references missing backing buffer {}",
                 input.0
             )));
@@ -142,13 +138,13 @@ pub(super) fn validate_persistent_layout(program: &LoadPlan) -> Result<(), Compi
         let end = view
             .offset
             .checked_add(extent)
-            .ok_or_else(|| CompileError::InvalidInput("CreateView window overflow".to_string()))?;
+            .ok_or_else(|| Error::Overflow("CreateView window overflow".to_string()))?;
         if end > backing.bytes {
-            return Err(CompileError::InvalidInput(format!(
+            return Err(Error::Contract(format!(
                 "CreateView window [{}, {}) escapes backing buffer {} ({} bytes)",
                 view.offset, end, backing.id.0, backing.bytes
             )));
         }
     }
-    Ok(())
+    Ok(0)
 }

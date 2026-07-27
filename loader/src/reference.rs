@@ -1,9 +1,28 @@
+//! The differential oracle: replay a lowering's bytes and see what comes out.
+//!
+//! `contract/compile.rs` checks its own lowering against a per-coordinate
+//! oracle in *index* space. This checks the layer below that: that the byte
+//! offsets and strides the lowering actually carries, replayed literally,
+//! reproduce the tensor the expression names.
+//!
+//! It used to evaluate a middle IR (`LayoutPlan`), which meant the oracle could
+//! only see expressions the frontend had already translated — the frontend was
+//! inside the thing being checked. Replaying the lowering removes it: the only
+//! inputs are the algebra's output and the checkpoint's bytes.
+//!
+//! The replay works one byte at a time and tracks where each output byte came
+//! from. That is slower than any real executor and does not care: it models
+//! *addresses*, which is the only thing a lowering claims, and it makes the
+//! three ways a lowering can be wrong — a hole, a double write, a read past the
+//! end — the same check rather than three.
+
 use std::collections::HashMap;
 
-use crate::error::CompileError;
-use crate::ir::{GatherPiece, LayoutExpr, LayoutPlan};
-use crate::typecheck::typecheck;
-use crate::types::{Encoding, ExprId, TensorDecl, TensorId, encoding_dense_element_bytes};
+use crate::contract::TensorType;
+use crate::contract::compile::Lowering;
+use crate::error::{Error, Result};
+use crate::extent::Rect;
+use crate::types::{TensorDecl, encoding_dense_element_bytes};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TensorValue {
@@ -12,10 +31,10 @@ pub struct TensorValue {
 }
 
 impl TensorValue {
-    pub fn new(decl: TensorDecl, data: Vec<i64>) -> Result<Self, CompileError> {
+    pub fn new(decl: TensorDecl, data: Vec<i64>) -> Result<Self> {
         let expected = element_count(&decl.shape)?;
         if expected != data.len() {
-            return Err(CompileError::InvalidInput(format!(
+            return Err(Error::Contract(format!(
                 "reference tensor '{}' has {} values for shape {:?}",
                 decl.name,
                 data.len(),
@@ -26,179 +45,154 @@ impl TensorValue {
     }
 }
 
-pub fn evaluate(
-    plan: &LayoutPlan,
-    sources: &HashMap<TensorId, TensorValue>,
-) -> Result<HashMap<String, TensorValue>, CompileError> {
-    typecheck(plan)?;
-    let mut values: HashMap<ExprId, TensorValue> = HashMap::new();
-    let mut outputs = HashMap::new();
-    for (index, expr) in plan.exprs.iter().enumerate() {
-        let id = ExprId(index as u32);
-        let value = eval_expr(expr, &values, sources)?;
-        if let LayoutExpr::Realize { runtime_name, .. } = expr {
-            outputs.insert(runtime_name.clone(), value.clone());
-        }
-        values.insert(id, value);
-    }
-    Ok(outputs)
-}
+/// Where one output byte came from.
+type Provenance = (usize, u64);
 
-fn eval_expr(
-    expr: &LayoutExpr,
-    values: &HashMap<ExprId, TensorValue>,
-    sources: &HashMap<TensorId, TensorValue>,
-) -> Result<TensorValue, CompileError> {
-    match expr {
-        LayoutExpr::Source { tensor, decl } => {
-            let mut value = sources.get(tensor).cloned().ok_or_else(|| {
-                CompileError::InvalidInput(format!("missing reference source {}", tensor.0))
-            })?;
-            value.decl = decl.clone();
-            Ok(value)
-        }
-        LayoutExpr::Gather {
-            inputs,
-            pieces,
-            zero_fill,
-            decl,
-        } => {
-            let sources = inputs
-                .iter()
-                .map(|input| value(values, *input))
-                .collect::<Result<Vec<_>, _>>()?;
-            gather(&sources, pieces, *zero_fill, decl)
-        }
-        LayoutExpr::Cast { input, decl, .. } | LayoutExpr::Encode { input, decl, .. } => {
-            retag(value(values, *input)?, decl)
-        }
-        LayoutExpr::Decode { data, decl, .. } | LayoutExpr::Transcode { data, decl, .. } => {
-            retag(value(values, *data)?, decl)
-        }
-        LayoutExpr::Repack { input, decl, .. } => retag(value(values, *input)?, decl),
-        LayoutExpr::Realize { input, decl, .. } => retag(value(values, *input)?, decl),
-    }
-}
-
-fn value(values: &HashMap<ExprId, TensorValue>, id: ExprId) -> Result<&TensorValue, CompileError> {
-    values.get(&id).ok_or_else(|| {
-        CompileError::InvalidInput(format!("reference expr {} is not available", id.0))
-    })
-}
-
-fn retag(source: &TensorValue, decl: &TensorDecl) -> Result<TensorValue, CompileError> {
-    TensorValue::new(decl.clone(), source.data.clone())
-}
-
-/// Replay a compiled affine expression one rectangular copy at a time.
+/// Materialize what a lowering says the output is.
 ///
-/// This is the semantics the storage executors implement, spelled out with no
-/// regard for speed: the point is that it is obviously right, so a plan that
-/// disagrees with it is wrong. Offsets below the HIGH IR are in bytes, so the
-/// evaluator only handles encodings with a whole number of bytes per element —
-/// it has one `i64` per element and nowhere to put half of one.
-fn gather(
-    inputs: &[&TensorValue],
-    pieces: &[GatherPiece],
-    zero_fill: bool,
-    decl: &TensorDecl,
-) -> Result<TensorValue, CompileError> {
-    let width = element_bytes(&decl.encoding)?;
-    let mut out = vec![0i64; element_count(&decl.shape)?];
-    let mut written = 0usize;
-    for piece in pieces {
-        let source = inputs.get(piece.input as usize).ok_or_else(|| {
-            CompileError::InvalidInput(format!("reference gather names input {}", piece.input))
-        })?;
-        if element_bytes(&source.decl.encoding)? != width {
-            return Err(CompileError::InvalidInput(
-                "reference gather mixes element widths".to_string(),
-            ));
+/// Refuses the three things the retired IR type checker refused: a lowering
+/// that names a leaf the caller did not supply, one that reads past the end of
+/// a leaf, and one that does not cover its destination exactly once. The last
+/// is why this returns a `Result` and not a `Vec` — a lowering with a hole and
+/// no fill is not a slower plan, it is a plan that leaves uninitialized device
+/// memory behind.
+pub fn replay(
+    lowering: &Lowering,
+    ty: &TensorType,
+    leaves: &HashMap<String, TensorValue>,
+) -> Result<Vec<i64>> {
+    let width = encoding_dense_element_bytes(&ty.encoding).ok_or_else(|| {
+        Error::Unsupported(format!(
+            "the reference evaluator does not model the packed encoding {:?}",
+            ty.encoding
+        ))
+    })?;
+    let elements = usize::try_from(lowering.elements)
+        .map_err(|_| Error::Overflow("reference output element count".to_string()))?;
+    let bytes = elements
+        .checked_mul(width as usize)
+        .ok_or_else(|| Error::Overflow("reference output byte size".to_string()))?;
+
+    let mut from: Vec<Option<Provenance>> = vec![None; bytes];
+    for rect in lowering.byte_pieces(&ty.encoding)? {
+        scatter(&rect, &mut from)?;
+    }
+
+    let zero_fill = lowering.needs_zero_fill();
+    (0..elements)
+        .map(|at| element(at, width, &from, lowering, leaves, zero_fill))
+        .collect()
+}
+
+/// Walk one rect's loop nest and record where each destination byte came from.
+fn scatter(rect: &Rect, from: &mut [Option<Provenance>]) -> Result<()> {
+    let mut at = vec![0i64; rect.dims.len()];
+    loop {
+        let (mut src, mut dst) = (0i64, 0i64);
+        for (dim, step) in rect.dims.iter().zip(&at) {
+            src += dim.src_stride * step;
+            dst += dim.dst_stride * step;
         }
-        let (inner, outer) = piece.dims.split_last().ok_or_else(|| {
-            CompileError::InvalidInput("reference gather piece has no extent".to_string())
+        let src = offset(rect.src_offset, src, "source")?;
+        let dst = offset(rect.dst_offset, dst, "destination")?;
+        let size = from.len();
+        let slot = from.get_mut(dst as usize).ok_or_else(|| {
+            Error::Internal(format!(
+                "the lowering writes byte {dst}, past the end of its {size}-byte output"
+            ))
         })?;
-        if inner.src_stride != 1 || inner.dst_stride != 1 {
-            return Err(CompileError::InvalidInput(
-                "reference gather piece has no contiguous inner block".to_string(),
-            ));
+        if slot.is_some() {
+            return Err(Error::Internal(format!(
+                "the lowering writes output byte {dst} twice"
+            )));
         }
-        let run = elements(inner.count, width, "gather run")?;
-        let counts = outer.iter().map(|dim| dim.count).collect::<Vec<_>>();
-        for index in iterate_indices(&counts)? {
-            let mut src = piece.src_offset as i64;
-            let mut dst = piece.dst_offset as i64;
-            for (at, dim) in outer.iter().enumerate() {
-                src += index[at] * dim.src_stride;
-                dst += index[at] * dim.dst_stride;
-            }
-            let src = elements(src, width, "gather source offset")?;
-            let dst = elements(dst, width, "gather destination offset")?;
-            if src + run > source.data.len() || dst + run > out.len() {
-                return Err(CompileError::InvalidInput(
-                    "reference gather piece is out of range".to_string(),
-                ));
-            }
-            out[dst..dst + run].copy_from_slice(&source.data[src..src + run]);
-            written += run;
+        *slot = Some((rect.leaf, src));
+        if !advance(&mut at, &rect.dims) {
+            return Ok(());
         }
     }
-    if !zero_fill && written != out.len() {
-        return Err(CompileError::InvalidInput(format!(
-            "reference gather covers {written} of {} elements with no zero fill",
-            out.len()
+}
+
+/// Read back one output element, checking that its bytes came from one source
+/// element in order.
+fn element(
+    at: usize,
+    width: u64,
+    from: &[Option<Provenance>],
+    lowering: &Lowering,
+    leaves: &HashMap<String, TensorValue>,
+    zero_fill: bool,
+) -> Result<i64> {
+    let base = at * width as usize;
+    let Some((leaf, src)) = from[base] else {
+        if zero_fill {
+            return Ok(0);
+        }
+        return Err(Error::Internal(format!(
+            "the lowering leaves output element {at} uninitialized and does not fill"
+        )));
+    };
+    for step in 1..width {
+        let want = Some((leaf, src + step));
+        if from[base + step as usize] != want {
+            return Err(Error::Internal(format!(
+                "output element {at} is assembled from more than one source element"
+            )));
+        }
+    }
+    if src % width != 0 {
+        return Err(Error::Internal(format!(
+            "output element {at} reads from byte {src}, which is not a {width}-byte boundary"
         )));
     }
-    TensorValue::new(decl.clone(), out)
-}
-
-fn element_bytes(encoding: &Encoding) -> Result<usize, CompileError> {
-    encoding_dense_element_bytes(encoding)
-        .and_then(|bytes| usize::try_from(bytes).ok())
-        .filter(|bytes| *bytes > 0)
+    let name = lowering
+        .leaves
+        .get(leaf)
+        .ok_or_else(|| Error::Internal(format!("the lowering names leaf {leaf}, which it has no")))?
+        .name();
+    let value = leaves
+        .get(name)
+        .ok_or_else(|| Error::Contract(format!("no reference value for '{name}'")))?;
+    value
+        .data
+        .get((src / width) as usize)
+        .copied()
         .ok_or_else(|| {
-            CompileError::InvalidInput(format!(
-                "reference evaluator cannot address {encoding:?} by element"
+            Error::Internal(format!(
+                "the lowering reads past the end of '{name}': element {} of {}",
+                src / width,
+                value.data.len()
             ))
         })
 }
 
-fn elements(bytes: i64, width: usize, what: &str) -> Result<usize, CompileError> {
-    let bytes = usize::try_from(bytes)
-        .map_err(|_| CompileError::InvalidInput(format!("negative {what}")))?;
-    if bytes % width != 0 {
-        return Err(CompileError::InvalidInput(format!(
-            "{what} {bytes} does not land on an element boundary"
-        )));
-    }
-    Ok(bytes / width)
-}
-
-fn element_count(shape: &[i64]) -> Result<usize, CompileError> {
-    shape.iter().try_fold(1usize, |acc, dim| {
-        let dim = usize::try_from(*dim).map_err(|_| {
-            CompileError::InvalidInput(format!("negative reference dimension {}", dim))
-        })?;
-        acc.checked_mul(dim).ok_or_else(|| {
-            CompileError::InvalidInput("reference element count overflow".to_string())
-        })
-    })
-}
-
-fn iterate_indices(shape: &[i64]) -> Result<Vec<Vec<i64>>, CompileError> {
-    let total = element_count(shape)?;
-    let mut out = Vec::with_capacity(total);
-    for linear in 0..total {
-        let mut remaining = linear;
-        let mut index = vec![0; shape.len()];
-        for axis in (0..shape.len()).rev() {
-            let dim = usize::try_from(shape[axis]).map_err(|_| {
-                CompileError::InvalidInput(format!("negative reference dimension {}", shape[axis]))
-            })?;
-            index[axis] = (remaining % dim) as i64;
-            remaining /= dim;
+/// Odometer over a loop nest, innermost last. Returns false when it wraps.
+fn advance(at: &mut [i64], dims: &[crate::extent::Dim]) -> bool {
+    for level in (0..at.len()).rev() {
+        at[level] += 1;
+        if at[level] < dims[level].count {
+            return true;
         }
-        out.push(index);
+        at[level] = 0;
     }
-    Ok(out)
+    false
+}
+
+fn offset(base: u64, delta: i64, what: &str) -> Result<u64> {
+    let base = i64::try_from(base).map_err(|_| Error::Overflow(format!("{what} byte offset")))?;
+    u64::try_from(base + delta)
+        .map_err(|_| Error::Internal(format!("the {what} offset {} is negative", base + delta)))
+}
+
+fn element_count(shape: &[i64]) -> Result<usize> {
+    let mut count = 1i64;
+    for dim in shape {
+        if *dim < 0 {
+            return Err(Error::Contract(format!("negative dimension in {shape:?}")));
+        }
+        count = count
+            .checked_mul(*dim)
+            .ok_or_else(|| Error::Overflow(format!("element count of {shape:?}")))?;
+    }
+    usize::try_from(count).map_err(|_| Error::Overflow(format!("element count of {shape:?}")))
 }

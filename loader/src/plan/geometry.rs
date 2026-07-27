@@ -1,13 +1,20 @@
 //! Strided-extent geometry: build, narrow and measure the source/dest
 //! extents that back every copy instruction, plus plan-wide id lookups.
 
-use super::passes::instr_id_of;
-use super::*;
+use crate::error::{Error, Result};
+use crate::extent::{Dim, Extent};
+use crate::plan::build::SourceView;
+use crate::plan::passes::instr_id_of;
+use crate::plan::{DestExtent, LoadPlan, StorageInstr};
+use crate::types::{
+    Axis, BufferId, DType, Encoding, InstrId, QuantScheme, RepackLayout, RepackSpec, TensorDecl,
+    encoding_dense_element_bytes, encoding_nbytes, tensor_nbytes,
+};
 
 pub(super) fn narrow_repack_source(
     mut source: SourceView,
     spec: RepackSpec,
-) -> Result<(SourceView, RepackSpec), CompileError> {
+) -> Result<(SourceView, RepackSpec)> {
     let mut narrowed = spec;
     let valid_rows = if narrowed.valid_rows == 0 {
         narrowed.target_rows
@@ -17,14 +24,14 @@ pub(super) fn narrow_repack_source(
     narrowed.valid_rows = valid_rows;
 
     if source.shape.len() < 2 {
-        return Err(CompileError::InvalidInput(
+        return Err(Error::Contract(
             "Repack source must have batch and row axes".to_string(),
         ));
     }
     if source.shape[0] != i64::from(narrowed.batch)
         || source.shape[1] != i64::from(narrowed.source_rows)
     {
-        return Err(CompileError::InvalidInput(format!(
+        return Err(Error::Contract(format!(
             "Repack source shape {:?} does not match batch/source_rows {:?}/{}",
             source.shape, narrowed.batch, narrowed.source_rows
         )));
@@ -33,12 +40,13 @@ pub(super) fn narrow_repack_source(
     let (row_start, row_count) = match narrowed.row_map {
         crate::types::RowMap::Identity => (narrowed.source_row_offset, valid_rows),
         crate::types::RowMap::Even | crate::types::RowMap::Odd => {
-            let start = narrowed.source_row_offset.checked_mul(2).ok_or_else(|| {
-                CompileError::InvalidInput("Repack row offset overflow".to_string())
-            })?;
-            let rows = valid_rows.checked_mul(2).ok_or_else(|| {
-                CompileError::InvalidInput("Repack row count overflow".to_string())
-            })?;
+            let start = narrowed
+                .source_row_offset
+                .checked_mul(2)
+                .ok_or_else(|| Error::Overflow("Repack row offset overflow".to_string()))?;
+            let rows = valid_rows
+                .checked_mul(2)
+                .ok_or_else(|| Error::Overflow("Repack row count overflow".to_string()))?;
             (start, rows)
         }
     };
@@ -51,7 +59,7 @@ pub(super) fn narrow_repack_source(
     match narrowed.layout {
         RepackLayout::MarlinMxfp4Weight => {
             if source.shape.len() != 4 || source.shape[3] != 16 {
-                return Err(CompileError::InvalidInput(format!(
+                return Err(Error::Contract(format!(
                     "MarlinMxfp4Weight Repack source must be [B, R, K/32, 16], got {:?}",
                     source.shape
                 )));
@@ -60,7 +68,7 @@ pub(super) fn narrow_repack_source(
                 || !narrowed.source_cols.is_multiple_of(32)
                 || !narrowed.source_stride_cols.is_multiple_of(32)
             {
-                return Err(CompileError::InvalidInput(
+                return Err(Error::Contract(
                     "MarlinMxfp4Weight source narrowing requires 32-wide MXFP4 group alignment"
                         .to_string(),
                 ));
@@ -68,7 +76,7 @@ pub(super) fn narrow_repack_source(
             let group_start = narrowed.source_col_offset / 32;
             let group_count = narrowed.source_cols / 32;
             if source.shape[2] != i64::from(narrowed.source_stride_cols / 32) {
-                return Err(CompileError::InvalidInput(format!(
+                return Err(Error::Contract(format!(
                     "MarlinMxfp4Weight source group axis {:?} does not match stride cols {}",
                     source.shape, narrowed.source_stride_cols
                 )));
@@ -86,13 +94,13 @@ pub(super) fn narrow_repack_source(
         }
         RepackLayout::MarlinMxfp4Scale => {
             if source.shape.len() != 3 {
-                return Err(CompileError::InvalidInput(format!(
+                return Err(Error::Contract(format!(
                     "MarlinMxfp4Scale Repack source must be [B, R, groups], got {:?}",
                     source.shape
                 )));
             }
             if source.shape[2] != i64::from(narrowed.source_stride_cols) {
-                return Err(CompileError::InvalidInput(format!(
+                return Err(Error::Contract(format!(
                     "MarlinMxfp4Scale source group axis {:?} does not match stride cols {}",
                     source.shape, narrowed.source_stride_cols
                 )));
@@ -112,7 +120,7 @@ pub(super) fn narrow_repack_source(
         }
         RepackLayout::DenseRowGather => {
             if source.shape.len() != 2 {
-                return Err(CompileError::InvalidInput(format!(
+                return Err(Error::Contract(format!(
                     "DenseRowGather Repack source must be [B, R], got {:?}",
                     source.shape
                 )));
@@ -124,57 +132,54 @@ pub(super) fn narrow_repack_source(
     Ok((source, narrowed))
 }
 
-pub(super) fn buffer_bytes(program: &LoadPlan, id: BufferId) -> Result<u64, CompileError> {
-    program
-        .buffers
-        .get(id.0 as usize)
-        .filter(|buffer| buffer.id == id)
-        .or_else(|| program.buffers.iter().find(|buffer| buffer.id == id))
-        .map(|buffer| buffer.bytes)
-        .ok_or_else(|| CompileError::InvalidInput(format!("buffer {} is missing", id.0)))
+pub(super) fn buffer_bytes(program: &LoadPlan, id: BufferId) -> Result<u64> {
+    Ok(program.buffer(id)?.bytes)
 }
 
-/// Resolve a scheduled instruction by id: index directly when ids are dense (the
-/// common case), else fall back to a linear scan. Used by every pass that walks
-/// `program.schedule` against an instruction slice.
-pub(super) fn instr_by_id(
-    instrs: &[StorageInstr],
-    id: InstrId,
-) -> Result<&StorageInstr, CompileError> {
-    instrs
+/// Resolve a scheduled instruction by id, against a slice the caller owns.
+///
+/// The passes clone `instrs` before rewriting it, so they cannot go through
+/// [`LoadPlan::instr`]. Same invariant, same refusal: ids are dense, and a
+/// position that holds a different id means something built the plan wrong.
+pub(super) fn instr_by_id(instrs: &[StorageInstr], id: InstrId) -> Result<&StorageInstr> {
+    let found = instrs
         .get(id.0 as usize)
-        .filter(|instr| instr_id_of(instr) == id)
-        .or_else(|| instrs.iter().find(|instr| instr_id_of(instr) == id))
-        .ok_or_else(|| CompileError::InvalidInput(format!("scheduled instr {} is missing", id.0)))
+        .ok_or_else(|| Error::Internal(format!("scheduled instr {} is missing", id.0)))?;
+    if instr_id_of(found) != id {
+        return Err(Error::Internal(format!(
+            "instruction ids are not dense: position {} holds {}",
+            id.0,
+            instr_id_of(found).0
+        )));
+    }
+    Ok(found)
 }
 
-pub(super) fn repack_stage_bytes(spec: RepackSpec) -> Result<u64, CompileError> {
+pub(super) fn repack_stage_bytes(spec: RepackSpec) -> Result<u64> {
     match spec.layout {
         RepackLayout::MarlinMxfp4Weight => {
             let elems = u64::from(spec.target_rows)
                 .checked_mul(u64::from(spec.target_cols))
-                .ok_or_else(|| {
-                    CompileError::InvalidInput("MXFP4 repack stage size overflow".to_string())
-                })?;
+                .ok_or_else(|| Error::Overflow("MXFP4 repack stage size overflow".to_string()))?;
             Ok(elems.div_ceil(2))
         }
         RepackLayout::MarlinMxfp4Scale | RepackLayout::DenseRowGather | RepackLayout::None => Ok(0),
     }
 }
 
-pub(super) fn extent_storage_bytes(extent: &StridedExtent) -> Result<u64, CompileError> {
+pub(super) fn extent_storage_bytes(extent: &Extent) -> Result<u64> {
     tensor_nbytes(
         &extent.dims.iter().map(|dim| dim.count).collect::<Vec<_>>(),
         u64::from(extent.element_bytes),
     )
-    .ok_or_else(|| CompileError::InvalidInput("extent byte size overflow".to_string()))
+    .ok_or_else(|| Error::Overflow("extent byte size overflow".to_string()))
 }
 
-pub(super) fn strided_physical_source_bytes(extent: &StridedExtent) -> Result<u64, CompileError> {
+pub(super) fn strided_physical_source_bytes(extent: &Extent) -> Result<u64> {
     let mut max_offset = extent.base_offset;
     for dim in &extent.dims {
         if dim.count < 0 || dim.src_stride < 0 {
-            return Err(CompileError::InvalidInput(
+            return Err(Error::Contract(
                 "negative source extent dimension or stride".to_string(),
             ));
         }
@@ -182,25 +187,27 @@ pub(super) fn strided_physical_source_bytes(extent: &StridedExtent) -> Result<u6
             return Ok(0);
         }
         let count = u64::try_from(dim.count - 1)
-            .map_err(|_| CompileError::InvalidInput("source extent count overflow".to_string()))?;
+            .map_err(|_| Error::Overflow("source extent count overflow".to_string()))?;
         let stride = u64::try_from(dim.src_stride)
-            .map_err(|_| CompileError::InvalidInput("source extent stride overflow".to_string()))?;
+            .map_err(|_| Error::Overflow("source extent stride overflow".to_string()))?;
         max_offset = max_offset
-            .checked_add(count.checked_mul(stride).ok_or_else(|| {
-                CompileError::InvalidInput("source extent byte overflow".to_string())
-            })?)
-            .ok_or_else(|| CompileError::InvalidInput("source extent byte overflow".to_string()))?;
+            .checked_add(
+                count
+                    .checked_mul(stride)
+                    .ok_or_else(|| Error::Overflow("source extent byte overflow".to_string()))?,
+            )
+            .ok_or_else(|| Error::Overflow("source extent byte overflow".to_string()))?;
     }
     max_offset
         .checked_add(u64::from(extent.element_bytes))
-        .ok_or_else(|| CompileError::InvalidInput("source extent byte overflow".to_string()))
+        .ok_or_else(|| Error::Overflow("source extent byte overflow".to_string()))
 }
 
-pub(super) fn compact_extent(shape: &[i64], element_bytes: u64) -> StridedExtent {
+pub(super) fn compact_extent(shape: &[i64], element_bytes: u64) -> Extent {
     let mut stride = i64::try_from(element_bytes).unwrap_or(i64::MAX);
     let mut dims = Vec::with_capacity(shape.len());
     for dim in shape.iter().rev() {
-        dims.push(DimSpec {
+        dims.push(Dim {
             count: *dim,
             src_stride: stride,
             dst_stride: stride,
@@ -208,18 +215,18 @@ pub(super) fn compact_extent(shape: &[i64], element_bytes: u64) -> StridedExtent
         stride = stride.saturating_mul(*dim);
     }
     dims.reverse();
-    StridedExtent {
+    Extent {
         base_offset: 0,
         element_bytes: u32::try_from(element_bytes).unwrap_or(u32::MAX),
         dims,
     }
 }
 
-pub(super) fn byte_extent(bytes: u64) -> StridedExtent {
-    StridedExtent {
+pub(super) fn byte_extent(bytes: u64) -> Extent {
+    Extent {
         base_offset: 0,
         element_bytes: 1,
-        dims: vec![DimSpec {
+        dims: vec![Dim {
             count: i64::try_from(bytes).unwrap_or(i64::MAX),
             src_stride: 1,
             dst_stride: 1,
@@ -227,10 +234,7 @@ pub(super) fn byte_extent(bytes: u64) -> StridedExtent {
     }
 }
 
-pub(super) fn full_dest_extent(
-    buffer: BufferId,
-    decl: &TensorDecl,
-) -> Result<DestExtent, CompileError> {
+pub(super) fn full_dest_extent(buffer: BufferId, decl: &TensorDecl) -> Result<DestExtent> {
     Ok(DestExtent {
         buffer,
         offset: 0,
@@ -238,28 +242,21 @@ pub(super) fn full_dest_extent(
     })
 }
 
-pub(super) fn storage_extent_for_shape(
-    shape: &[i64],
-    encoding: &Encoding,
-) -> Result<StridedExtent, CompileError> {
+pub(super) fn storage_extent_for_shape(shape: &[i64], encoding: &Encoding) -> Result<Extent> {
     if let Some(element_bytes) = encoding_dense_element_bytes(encoding) {
         return Ok(compact_extent(shape, element_bytes));
     }
     Ok(byte_extent(encoding_nbytes(shape, encoding).ok_or_else(
-        || CompileError::InvalidInput("packed extent byte size overflow".to_string()),
+        || Error::Overflow("packed extent byte size overflow".to_string()),
     )?))
 }
 
-fn selected_source_extent(
-    source: &StridedExtent,
-    shape: &[i64],
-    encoding: &Encoding,
-) -> Result<StridedExtent, CompileError> {
+fn selected_source_extent(source: &Extent, shape: &[i64], encoding: &Encoding) -> Result<Extent> {
     let Some(element_bytes) = encoding_dense_element_bytes(encoding) else {
         return storage_extent_for_shape(shape, encoding);
     };
     if source.dims.len() != shape.len() {
-        return Err(CompileError::InvalidInput(format!(
+        return Err(Error::Contract(format!(
             "source stride rank {} does not match selected shape rank {}",
             source.dims.len(),
             shape.len()
@@ -271,13 +268,13 @@ fn selected_source_extent(
         .iter()
         .zip(shape.iter())
         .zip(dest.dims.iter())
-        .map(|((dim, count), dest_dim)| DimSpec {
+        .map(|((dim, count), dest_dim)| Dim {
             count: *count,
             src_stride: dim.src_stride,
             dst_stride: dest_dim.dst_stride,
         })
         .collect();
-    Ok(StridedExtent {
+    Ok(Extent {
         base_offset: source.base_offset,
         element_bytes: u32::try_from(element_bytes).unwrap_or(u32::MAX),
         dims,
@@ -289,16 +286,16 @@ fn narrow_source_axis(
     axis: Axis,
     start: i64,
     length: i64,
-) -> Result<SourceView, CompileError> {
+) -> Result<SourceView> {
     let axis_index = axis.0 as usize;
     if axis_index >= source.shape.len() {
-        return Err(CompileError::InvalidInput(format!(
+        return Err(Error::Contract(format!(
             "source slice axis {} out of range for shape {:?}",
             axis.0, source.shape
         )));
     }
     if start < 0 || length < 0 || start + length > source.shape[axis_index] {
-        return Err(CompileError::InvalidInput(format!(
+        return Err(Error::Contract(format!(
             "source slice [{start}, {}) on axis {} exceeds shape {:?}",
             start + length,
             axis.0,
@@ -309,9 +306,8 @@ fn narrow_source_axis(
     let can_preserve_strides = encoding_dense_element_bytes(&source.encoding).is_some()
         && old_stride.dims.len() == source.shape.len();
     let axis_stride_bytes = if can_preserve_strides {
-        u64::try_from(old_stride.dims[axis_index].src_stride).map_err(|_| {
-            CompileError::InvalidInput("negative source stride in slice lowering".to_string())
-        })?
+        u64::try_from(old_stride.dims[axis_index].src_stride)
+            .map_err(|_| Error::Contract("negative source stride in slice lowering".to_string()))?
     } else {
         dense_axis_stride_bytes(&source.shape, axis, &source.encoding)?
     };
@@ -321,11 +317,9 @@ fn narrow_source_axis(
             u64::try_from(start)
                 .ok()
                 .and_then(|start| start.checked_mul(axis_stride_bytes))
-                .ok_or_else(|| {
-                    CompileError::InvalidInput("source slice offset overflow".to_string())
-                })?,
+                .ok_or_else(|| Error::Overflow("source slice offset overflow".to_string()))?,
         )
-        .ok_or_else(|| CompileError::InvalidInput("source slice offset overflow".to_string()))?;
+        .ok_or_else(|| Error::Overflow("source slice offset overflow".to_string()))?;
     source.shape[axis_index] = length;
     source.stride = if can_preserve_strides {
         selected_source_extent(&old_stride, &source.shape, &source.encoding)?
@@ -335,14 +329,10 @@ fn narrow_source_axis(
     Ok(source)
 }
 
-fn dense_axis_stride_bytes(
-    shape: &[i64],
-    axis: Axis,
-    encoding: &Encoding,
-) -> Result<u64, CompileError> {
+fn dense_axis_stride_bytes(shape: &[i64], axis: Axis, encoding: &Encoding) -> Result<u64> {
     let axis = axis.0 as usize;
     if axis >= shape.len() {
-        return Err(CompileError::InvalidInput(format!(
+        return Err(Error::Contract(format!(
             "axis {} out of range for shape {:?}",
             axis, shape
         )));
@@ -354,16 +344,16 @@ fn dense_axis_stride_bytes(
     match encoding {
         Encoding::Raw(dtype) => suffix_elements
             .and_then(|elements| elements.checked_mul(dtype.bytes()))
-            .ok_or_else(|| CompileError::InvalidInput("dense stride overflow".to_string())),
+            .ok_or_else(|| Error::Overflow("dense stride overflow".to_string())),
         Encoding::Quant(spec) => {
             let spec = spec.clone().normalized();
             let suffix = suffix_elements
-                .ok_or_else(|| CompileError::InvalidInput("dense stride overflow".to_string()))?;
+                .ok_or_else(|| Error::Overflow("dense stride overflow".to_string()))?;
             let bits = suffix
                 .checked_mul(u64::from(spec.bits_per_element))
-                .ok_or_else(|| CompileError::InvalidInput("packed stride overflow".to_string()))?;
+                .ok_or_else(|| Error::Overflow("packed stride overflow".to_string()))?;
             if bits % 8 != 0 {
-                return Err(CompileError::InvalidInput(format!(
+                return Err(Error::Contract(format!(
                     "packed {:?} select on axis {} is not byte-aligned",
                     spec.scheme, axis
                 )));
@@ -388,72 +378,6 @@ pub(super) fn dtype_to_quant_marker(dtype: DType) -> QuantScheme {
 /// layout, so they can be rebased onto a view that is itself dense — a shard of
 /// a shard stays lazy — but not onto one that already skips. A strided view has
 /// to be materialized before it can be gathered from again.
-pub(super) fn source_is_dense(source: &SourceView) -> Result<bool, CompileError> {
+pub(super) fn source_is_dense(source: &SourceView) -> Result<bool> {
     Ok(source.stride == storage_extent_for_shape(&source.shape, &source.encoding)?)
-}
-
-/// Split one [`GatherPiece`] into the source and destination extents of an
-/// `ExtentWrite`.
-///
-/// The innermost dimension is always the contiguous block, so it becomes
-/// `element_bytes` and the outer dimensions become the loop nest. The
-/// destination of a piece is a single contiguous range by construction — the
-/// fold in `contract::compile` refuses to widen a loop that skips in the
-/// destination — which is exactly what the executors require of `dest.stride`.
-pub(super) fn gather_extents(
-    piece: &GatherPiece,
-) -> Result<(StridedExtent, StridedExtent), CompileError> {
-    let bytes = piece.bytes();
-    if piece.is_contiguous() {
-        return Ok((byte_extent(bytes), byte_extent(bytes)));
-    }
-    let (inner, outer) = piece
-        .dims
-        .split_last()
-        .ok_or_else(|| CompileError::InvalidInput("gather piece has no extent".to_string()))?;
-    if inner.src_stride != 1 || inner.dst_stride != 1 {
-        return Err(CompileError::InvalidInput(
-            "gather piece has no contiguous inner block".to_string(),
-        ));
-    }
-    let element_bytes = u32::try_from(inner.count).map_err(|_| {
-        CompileError::InvalidInput("gather piece inner block exceeds 4 GiB".to_string())
-    })?;
-    let mut dense = i64::from(element_bytes);
-    let mut source_dims = Vec::with_capacity(outer.len());
-    let mut dest_dims = Vec::with_capacity(outer.len());
-    for dim in outer.iter().rev() {
-        if dim.dst_stride != dense {
-            return Err(CompileError::InvalidInput(
-                "gather piece writes a non-contiguous destination".to_string(),
-            ));
-        }
-        source_dims.push(DimSpec {
-            count: dim.count,
-            src_stride: dim.src_stride,
-            dst_stride: dense,
-        });
-        dest_dims.push(DimSpec {
-            count: dim.count,
-            src_stride: dense,
-            dst_stride: dense,
-        });
-        dense = dense.checked_mul(dim.count).ok_or_else(|| {
-            CompileError::InvalidInput("gather piece extent overflow".to_string())
-        })?;
-    }
-    source_dims.reverse();
-    dest_dims.reverse();
-    Ok((
-        StridedExtent {
-            base_offset: 0,
-            element_bytes,
-            dims: source_dims,
-        },
-        StridedExtent {
-            base_offset: 0,
-            element_bytes,
-            dims: dest_dims,
-        },
-    ))
 }

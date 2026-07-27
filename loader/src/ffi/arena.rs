@@ -11,8 +11,8 @@
 //! reclaims it. Between those two points nothing mutates, so handing the plan to
 //! another thread is sound.
 
-use crate::load_plan::{
-    DestExtent, LoadPlan, QuantGranularity, ScaleForm, SourceExtent, StorageInstr, StridedExtent,
+use crate::plan::{
+    DestExtent, Extent, LoadPlan, QuantGranularity, ScaleForm, SourceExtent, StorageInstr,
 };
 use crate::types::{Encoding, QuantScheme};
 
@@ -98,7 +98,7 @@ impl PlanArena {
         view
     }
 
-    fn stride(&mut self, stride: &StridedExtent) -> PieLoaderStridedExtentView {
+    fn stride(&mut self, stride: &Extent) -> PieLoaderStridedExtentView {
         let dims = self.store_dims(stride.dims.iter().map(|dim| PieLoaderDimSpecView {
             count: dim.count,
             src_stride: dim.src_stride,

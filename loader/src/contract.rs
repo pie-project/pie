@@ -10,10 +10,11 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::CompileError;
+use crate::error::Error;
 use crate::types::{Axis, DType, Encoding, QuantSpec, RepackSpec};
 
 pub mod compile;
+pub mod rewrite;
 
 /// A tensor-valued expression.
 ///
@@ -116,18 +117,17 @@ impl TensorType {
     }
 
     /// Number of logical elements, or an error on overflow.
-    pub fn element_count(&self) -> Result<i64, CompileError> {
+    pub fn element_count(&self) -> Result<i64, Error> {
         self.shape.iter().try_fold(1_i64, |acc, dim| {
-            acc.checked_mul(*dim).ok_or_else(|| {
-                CompileError::InvalidInput(format!("shape {:?} overflows i64", self.shape))
-            })
+            acc.checked_mul(*dim)
+                .ok_or_else(|| Error::Overflow(format!("shape {:?} overflows i64", self.shape)))
         })
     }
 
     /// Size in bytes. Errors when a sub-byte encoding does not fill whole bytes.
-    pub fn byte_size(&self) -> Result<u64, CompileError> {
+    pub fn byte_size(&self) -> Result<u64, Error> {
         crate::types::encoding_nbytes(&self.shape, &self.encoding).ok_or_else(|| {
-            CompileError::InvalidInput(format!(
+            Error::Contract(format!(
                 "shape {:?} of {:?} has no whole-byte size",
                 self.shape, self.encoding
             ))
@@ -219,6 +219,14 @@ impl Checked {
     pub fn output(&self, name: &str) -> Option<&TensorType> {
         self.outputs.get(name)
     }
+
+    /// The type behind a lowering leaf, whichever namespace it names.
+    pub fn type_of(&self, leaf: &compile::Leaf) -> Option<&TensorType> {
+        match leaf {
+            compile::Leaf::Checkpoint(name) => self.source(name),
+            compile::Leaf::Contract(name) => self.output(name),
+        }
+    }
 }
 
 struct Scope<'a> {
@@ -233,7 +241,7 @@ struct Scope<'a> {
 pub fn infer_type(
     expr: &Expr,
     checkpoint: &dyn CheckpointTypes,
-) -> Result<(TensorType, Checked), CompileError> {
+) -> Result<(TensorType, Checked), Error> {
     let mut resolver = Resolver::new(checkpoint);
     let ty = resolver.infer(expr)?;
     Ok((ty, resolver.into_checked()))
@@ -261,7 +269,7 @@ impl<'a> Resolver<'a> {
 
     /// Infer `expr`'s type, resolving [`Expr::Out`] against what has been
     /// published so far.
-    pub fn infer(&mut self, expr: &Expr) -> Result<TensorType, CompileError> {
+    pub fn infer(&mut self, expr: &Expr) -> Result<TensorType, Error> {
         infer(expr, &mut self.scope)
     }
 
@@ -276,7 +284,7 @@ impl<'a> Resolver<'a> {
         rank: u32,
         world: u32,
         what: &str,
-    ) -> Result<Expr, CompileError> {
+    ) -> Result<Expr, Error> {
         specialize(expr, &mut self.scope, rank, world, what)
     }
 
@@ -295,17 +303,17 @@ impl<'a> Resolver<'a> {
 }
 
 /// Infer the type of `expr`, resolving names through `scope`.
-fn infer(expr: &Expr, scope: &mut Scope<'_>) -> Result<TensorType, CompileError> {
+fn infer(expr: &Expr, scope: &mut Scope<'_>) -> Result<TensorType, Error> {
     match expr {
         Expr::Src(name) => {
             let ty = scope.checkpoint.tensor_type(name).ok_or_else(|| {
-                CompileError::InvalidInput(format!("checkpoint has no tensor named '{name}'"))
+                Error::Checkpoint(format!("checkpoint has no tensor named '{name}'"))
             })?;
             scope.resolved.sources.insert(name.clone(), ty.clone());
             Ok(ty)
         }
         Expr::Out(name) => scope.resolved.outputs.get(name).cloned().ok_or_else(|| {
-            CompileError::InvalidInput(format!(
+            Error::Contract(format!(
                 "no contract named '{name}' is declared before this one"
             ))
         }),
@@ -355,18 +363,18 @@ fn infer(expr: &Expr, scope: &mut Scope<'_>) -> Result<TensorType, CompileError>
             let from = ty.byte_size()?;
             let to = out.byte_size()?;
             if from != to {
-                return Err(CompileError::InvalidInput(format!(
+                return Err(Error::Contract(format!(
                     "Bitcast changes the byte size, {from} -> {to}"
                 )));
             }
             if !matches!(src.as_ref(), Expr::Src(_) | Expr::Out(_)) {
-                return Err(CompileError::InvalidInput(
+                return Err(Error::Contract(
                     "Bitcast may only reinterpret a whole tensor".to_string(),
                 ));
             }
             Ok(out.clone())
         }
-        Expr::Shard { .. } => Err(CompileError::Internal(
+        Expr::Shard { .. } => Err(Error::Internal(
             "Shard has no type until it is specialized against a target; call \
              Resolver::specialize first"
                 .to_string(),
@@ -385,7 +393,7 @@ fn specialize(
     rank: u32,
     world: u32,
     what: &str,
-) -> Result<Expr, CompileError> {
+) -> Result<Expr, Error> {
     macro_rules! go {
         ($src:expr) => {
             Box::new(specialize(*$src, scope, rank, world, what)?)
@@ -455,7 +463,7 @@ fn specialize(
                 // with its own per-family divisibility table over `config.json`,
                 // which was the same fact checked twice and reachable only for
                 // the families someone had listed.
-                return Err(CompileError::InvalidInput(format!(
+                return Err(Error::Shard(format!(
                     "'{what}' has {extent} along axis {index}, which tp_size {world} does not \
                      divide; use a tp_size that divides it or run single-GPU"
                 )));
@@ -467,10 +475,10 @@ fn specialize(
 }
 
 /// Resolve an [`Axis`] against a rank, rejecting out-of-range axes.
-fn axis_index(axis: Axis, rank: usize, what: &str) -> Result<usize, CompileError> {
+fn axis_index(axis: Axis, rank: usize, what: &str) -> Result<usize, Error> {
     let index = usize::from(axis.0);
     if index >= rank {
-        return Err(CompileError::InvalidInput(format!(
+        return Err(Error::Contract(format!(
             "{what} names axis {index} of a rank-{rank} tensor"
         )));
     }
@@ -500,20 +508,20 @@ fn infer_slice(
     start: i64,
     len: i64,
     step: i64,
-) -> Result<TensorType, CompileError> {
+) -> Result<TensorType, Error> {
     let index = axis_index(axis, ty.rank(), "Slice")?;
     if step < 1 {
-        return Err(CompileError::InvalidInput(format!(
+        return Err(Error::Contract(format!(
             "Slice step must be >= 1, got {step}"
         )));
     }
     if len < 1 {
-        return Err(CompileError::InvalidInput(format!(
+        return Err(Error::Contract(format!(
             "Slice len must be >= 1, got {len}"
         )));
     }
     if start < 0 {
-        return Err(CompileError::InvalidInput(format!(
+        return Err(Error::Contract(format!(
             "Slice start must be >= 0, got {start}"
         )));
     }
@@ -522,24 +530,22 @@ fn infer_slice(
         .checked_add(
             len.checked_sub(1)
                 .and_then(|n| n.checked_mul(step))
-                .ok_or_else(|| {
-                    CompileError::InvalidInput("Slice extent overflows i64".to_string())
-                })?,
+                .ok_or_else(|| Error::Overflow("Slice extent overflows i64".to_string()))?,
         )
-        .ok_or_else(|| CompileError::InvalidInput("Slice extent overflows i64".to_string()))?;
+        .ok_or_else(|| Error::Overflow("Slice extent overflows i64".to_string()))?;
     if last >= extent {
-        return Err(CompileError::InvalidInput(format!(
+        return Err(Error::Contract(format!(
             "Slice reads index {last} of axis {index}, which has extent {extent}"
         )));
     }
     if let Some(group) = block_granularity(&ty.encoding, index) {
         if step != 1 {
-            return Err(CompileError::InvalidInput(format!(
+            return Err(Error::Contract(format!(
                 "Slice with step {step} on quantized axis {index} would split its {group}-element groups"
             )));
         }
         if start % group != 0 || len % group != 0 {
-            return Err(CompileError::InvalidInput(format!(
+            return Err(Error::Contract(format!(
                 "Slice [{start}, {len}) on quantized axis {index} is not aligned to its {group}-element groups"
             )));
         }
@@ -552,17 +558,15 @@ fn infer_slice(
     })
 }
 
-fn infer_cat(axis: Axis, parts: &[TensorType]) -> Result<TensorType, CompileError> {
+fn infer_cat(axis: Axis, parts: &[TensorType]) -> Result<TensorType, Error> {
     let Some((head, tail)) = parts.split_first() else {
-        return Err(CompileError::InvalidInput(
-            "Cat needs at least one part".to_string(),
-        ));
+        return Err(Error::Contract("Cat needs at least one part".to_string()));
     };
     let index = axis_index(axis, head.rank(), "Cat")?;
     let mut total = head.shape[index];
     for (offset, part) in tail.iter().enumerate() {
         if part.rank() != head.rank() {
-            return Err(CompileError::InvalidInput(format!(
+            return Err(Error::Contract(format!(
                 "Cat part {} has rank {} but part 0 has rank {}",
                 offset + 1,
                 part.rank(),
@@ -571,7 +575,7 @@ fn infer_cat(axis: Axis, parts: &[TensorType]) -> Result<TensorType, CompileErro
         }
         for (other, (lhs, rhs)) in head.shape.iter().zip(part.shape.iter()).enumerate() {
             if other != index && lhs != rhs {
-                return Err(CompileError::InvalidInput(format!(
+                return Err(Error::Contract(format!(
                     "Cat on axis {index}: part {} has shape {:?}, incompatible with part 0's {:?}",
                     offset + 1,
                     part.shape,
@@ -582,7 +586,7 @@ fn infer_cat(axis: Axis, parts: &[TensorType]) -> Result<TensorType, CompileErro
         if crate::types::normalize_encoding(&part.encoding)
             != crate::types::normalize_encoding(&head.encoding)
         {
-            return Err(CompileError::InvalidInput(format!(
+            return Err(Error::Contract(format!(
                 "Cat part {} is encoded as {:?}, incompatible with part 0's {:?}",
                 offset + 1,
                 part.encoding,
@@ -591,12 +595,12 @@ fn infer_cat(axis: Axis, parts: &[TensorType]) -> Result<TensorType, CompileErro
         }
         total = total
             .checked_add(part.shape[index])
-            .ok_or_else(|| CompileError::InvalidInput("Cat extent overflows i64".to_string()))?;
+            .ok_or_else(|| Error::Overflow("Cat extent overflows i64".to_string()))?;
     }
     if let Some(group) = block_granularity(&head.encoding, index) {
         for (offset, part) in parts.iter().enumerate() {
             if part.shape[index] % group != 0 {
-                return Err(CompileError::InvalidInput(format!(
+                return Err(Error::Contract(format!(
                     "Cat part {offset} contributes {} elements to quantized axis {index}, which is not a multiple of its {group}-element groups",
                     part.shape[index]
                 )));
@@ -611,9 +615,9 @@ fn infer_cat(axis: Axis, parts: &[TensorType]) -> Result<TensorType, CompileErro
     })
 }
 
-fn infer_reshape(ty: &TensorType, requested: &[i64]) -> Result<TensorType, CompileError> {
+fn infer_reshape(ty: &TensorType, requested: &[i64]) -> Result<TensorType, Error> {
     if requested.is_empty() {
-        return Err(CompileError::InvalidInput(
+        return Err(Error::Contract(
             "Reshape needs at least one extent".to_string(),
         ));
     }
@@ -621,7 +625,7 @@ fn infer_reshape(ty: &TensorType, requested: &[i64]) -> Result<TensorType, Compi
         // A block-quantized tensor's element order is tied to its block
         // structure, so a row-major reinterpretation is not generally a byte
         // identity. No production case needs it; see spec.md §8.
-        return Err(CompileError::InvalidInput(format!(
+        return Err(Error::Contract(format!(
             "Reshape of a quantized tensor ({:?}) is not supported",
             ty.encoding
         )));
@@ -632,20 +636,20 @@ fn infer_reshape(ty: &TensorType, requested: &[i64]) -> Result<TensorType, Compi
     for (index, extent) in requested.iter().enumerate() {
         match *extent {
             -1 if wildcard.is_some() => {
-                return Err(CompileError::InvalidInput(
+                return Err(Error::Contract(
                     "Reshape allows at most one -1 extent".to_string(),
                 ));
             }
             -1 => wildcard = Some(index),
             extent if extent < 1 => {
-                return Err(CompileError::InvalidInput(format!(
+                return Err(Error::Contract(format!(
                     "Reshape extent {extent} must be >= 1 or -1"
                 )));
             }
             extent => {
-                known = known.checked_mul(extent).ok_or_else(|| {
-                    CompileError::InvalidInput("Reshape extent overflows i64".to_string())
-                })?;
+                known = known
+                    .checked_mul(extent)
+                    .ok_or_else(|| Error::Overflow("Reshape extent overflows i64".to_string()))?;
             }
         }
     }
@@ -653,14 +657,14 @@ fn infer_reshape(ty: &TensorType, requested: &[i64]) -> Result<TensorType, Compi
     match wildcard {
         Some(index) if known > 0 && total % known == 0 => shape[index] = total / known,
         Some(_) => {
-            return Err(CompileError::InvalidInput(format!(
+            return Err(Error::Contract(format!(
                 "Reshape of {:?} ({total} elements) to {requested:?} does not divide evenly",
                 ty.shape
             )));
         }
         None if known == total => {}
         None => {
-            return Err(CompileError::InvalidInput(format!(
+            return Err(Error::Contract(format!(
                 "Reshape of {:?} ({total} elements) to {requested:?} ({known} elements) changes the element count",
                 ty.shape
             )));
@@ -672,34 +676,29 @@ fn infer_reshape(ty: &TensorType, requested: &[i64]) -> Result<TensorType, Compi
     })
 }
 
-fn infer_pad(
-    ty: &TensorType,
-    axis: Axis,
-    before: i64,
-    after: i64,
-) -> Result<TensorType, CompileError> {
+fn infer_pad(ty: &TensorType, axis: Axis, before: i64, after: i64) -> Result<TensorType, Error> {
     let index = axis_index(axis, ty.rank(), "Pad")?;
     if before < 0 || after < 0 {
-        return Err(CompileError::InvalidInput(format!(
+        return Err(Error::Contract(format!(
             "Pad amounts must be >= 0, got before={before} after={after}"
         )));
     }
     if before == 0 && after == 0 {
-        return Err(CompileError::InvalidInput(
+        return Err(Error::Contract(
             "Pad by zero on both sides has no effect; omit it".to_string(),
         ));
     }
     if let Some(group) = block_granularity(&ty.encoding, index)
         && (before % group != 0 || after % group != 0)
     {
-        return Err(CompileError::InvalidInput(format!(
+        return Err(Error::Contract(format!(
             "Pad by ({before}, {after}) on quantized axis {index} is not aligned to its {group}-element groups"
         )));
     }
     let extent = ty.shape[index]
         .checked_add(before)
         .and_then(|sum| sum.checked_add(after))
-        .ok_or_else(|| CompileError::InvalidInput("Pad extent overflows i64".to_string()))?;
+        .ok_or_else(|| Error::Overflow("Pad extent overflows i64".to_string()))?;
     let mut shape = ty.shape.clone();
     shape[index] = extent;
     Ok(TensorType {
@@ -708,9 +707,9 @@ fn infer_pad(
     })
 }
 
-fn infer_quantize(ty: &TensorType, spec: &QuantSpec) -> Result<TensorType, CompileError> {
+fn infer_quantize(ty: &TensorType, spec: &QuantSpec) -> Result<TensorType, Error> {
     if matches!(ty.encoding, Encoding::Quant(_)) {
-        return Err(CompileError::InvalidInput(format!(
+        return Err(Error::Contract(format!(
             "Quantize of an already-quantized tensor ({:?}) is not supported",
             ty.encoding
         )));
@@ -720,7 +719,7 @@ fn infer_quantize(ty: &TensorType, spec: &QuantSpec) -> Result<TensorType, Compi
         let index = axis_index(channel, ty.rank(), "Quantize channel_axis")?;
         let group = i64::from(spec.normalized_group_size());
         if group > 1 && ty.shape[index] % group != 0 {
-            return Err(CompileError::InvalidInput(format!(
+            return Err(Error::Contract(format!(
                 "Quantize groups axis {index} by {group}, but its extent is {}",
                 ty.shape[index]
             )));
@@ -914,7 +913,7 @@ mod tests {
         ])
     }
 
-    fn check_one(expr: Expr, checkpoint: &dyn CheckpointTypes) -> Result<TensorType, CompileError> {
+    fn check_one(expr: Expr, checkpoint: &dyn CheckpointTypes) -> Result<TensorType, Error> {
         infer_type(&expr, checkpoint).map(|(ty, _)| ty)
     }
 
@@ -931,7 +930,7 @@ mod tests {
         }
     }
 
-    fn specialize_one(expr: Expr, rank: u32, world: u32) -> Result<Expr, CompileError> {
+    fn specialize_one(expr: Expr, rank: u32, world: u32) -> Result<Expr, Error> {
         let checkpoint = qwen3();
         Resolver::new(&checkpoint).specialize(expr, rank, world, "q")
     }
@@ -1206,7 +1205,7 @@ mod tests {
     fn resolve(
         tensors: &[TensorContract],
         checkpoint: &dyn CheckpointTypes,
-    ) -> Result<Vec<TensorType>, CompileError> {
+    ) -> Result<Vec<TensorType>, Error> {
         let mut resolver = Resolver::new(checkpoint);
         tensors
             .iter()

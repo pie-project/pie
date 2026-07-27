@@ -12,16 +12,20 @@
     "encode_scratch_dtype": "BF16",
     "block_scale_rows": 128
   },
-  "optimizer": {
-    "passes": [
-      {
-        "name": "live-normalization",
-        "exprs_before": 77,
-        "exprs_after": 77,
-        "rewrites": 0
-      }
-    ]
-  },
+  "passes": [
+    {
+      "pass": "assign-persistent-offsets",
+      "instrs_before": 91,
+      "instrs_after": 91,
+      "rewrites": 35
+    },
+    {
+      "pass": "hoist-bulk-arena-writes",
+      "instrs_before": 91,
+      "instrs_after": 89,
+      "rewrites": 2
+    }
+  ],
   "files": [
     {
       "id": 0,

@@ -33,13 +33,13 @@ use pie_loader::checkpoint::CheckpointMetadata;
 use pie_loader::checkpoint::read::parse_checkpoint_metadata;
 use pie_loader::contract::ModelContract;
 use pie_loader::dump::dump_load_plan_json;
-use pie_loader::error::CompileError;
+use pie_loader::error::Error;
 use pie_loader::ffi::view::verify_marshalled;
-use pie_loader::load_plan::{
+use pie_loader::plan::compile as compile_load_plan;
+use pie_loader::plan::{
     CUDA_TILE_MAP_MASK, FUSION_FP8_TO_MXFP4, HOST_TILE_MAP_MASK, LoadPlan, METAL_TILE_MAP_MASK,
     StorageTarget,
 };
-use pie_loader::planner::compile_load_plan;
 use pie_loader::types::{BackendKind, DType};
 use pie_loader::verify::ContractView;
 
@@ -84,8 +84,8 @@ enum Fail {
     Failed(String),
 }
 
-impl From<CompileError> for Fail {
-    fn from(error: CompileError) -> Self {
+impl From<Error> for Fail {
+    fn from(error: Error) -> Self {
         Fail::Failed(error.to_string())
     }
 }
