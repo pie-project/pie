@@ -31,6 +31,7 @@
 #include "pie_native/fire/descriptor.hpp"
 #include "pie_native/fire/fire_geometry.hpp"
 #include "pie_native/launch/program.hpp"
+#include "pie_native/launch/trace_query.hpp"
 
 namespace pie_cuda_driver::pipeline {
 
@@ -94,60 +95,6 @@ inline std::vector<std::uint32_t> as_u32(const std::vector<std::uint8_t>& bytes)
     std::vector<std::uint32_t> out(bytes.size() / 4);
     std::memcpy(out.data(), bytes.data(), out.size() * 4);
     return out;
-}
-
-inline const Op* producer(const Trace& trace, ValueId value) {
-    for (const Stage& stage : trace.stages) {
-        for (const Op& op : stage.ops) {
-            if (value >= op.result_id &&
-                value < op.result_id + op.result_count) {
-                return &op;
-            }
-        }
-    }
-    return nullptr;
-}
-
-inline StructuredMaskDescriptor structured_mask_descriptor(
-    const Trace& trace, ChannelId mask_channel) {
-    const ChannelPut* selected = nullptr;
-    for (const Stage& stage : trace.stages) {
-        for (const ChannelPut& put : stage.puts) {
-            if (put.channel == mask_channel) selected = &put;
-        }
-    }
-    if (selected == nullptr) return {};
-    ValueId value = selected->value;
-    for (std::size_t depth = 0; depth <= trace.values.size(); ++depth) {
-        const Op* op = producer(trace, value);
-        if (op == nullptr) break;
-        if (op->code == OpCode::Reshape && !op->args.empty()) {
-            value = op->args[0];
-            continue;
-        }
-        StructuredMaskDescriptor descriptor;
-        switch (op->code) {
-            case OpCode::CausalMask:
-                descriptor.kind = StructuredMaskKind::Causal;
-                descriptor.key_len = op->imm;
-                return descriptor;
-            case OpCode::SlidingWindowMask:
-                descriptor.kind = StructuredMaskKind::SlidingWindow;
-                descriptor.key_len = op->imm;
-                descriptor.window = op->imm2;
-                return descriptor;
-            case OpCode::SinkWindowMask:
-                descriptor.kind = StructuredMaskKind::SinkWindow;
-                descriptor.key_len = op->imm;
-                descriptor.sink = op->imm2;
-                descriptor.window = op->imm3;
-                return descriptor;
-            default:
-                break;
-        }
-        break;
-    }
-    return {};
 }
 
 }  // namespace detail
@@ -334,7 +281,7 @@ inline bool resolve_fire_geometry(const Trace& trace, ChannelView& view,
     // -- dense attention mask (→ pack_dense_mask) --
     if (has[kPortAttnMask]) {
         out.structured_mask =
-            detail::structured_mask_descriptor(trace, ch[kPortAttnMask]);
+            structured_mask_descriptor(trace, ch[kPortAttnMask]);
         // Runtime-window APIs cannot encode an empty window. Keep window=0
         // valid by consuming the program's exact dense Bool result instead.
         const bool direct =
@@ -386,7 +333,7 @@ inline bool resolve_attention_mask(
     }
 
     out.structured_mask =
-        detail::structured_mask_descriptor(trace, binding->channel);
+        structured_mask_descriptor(trace, binding->channel);
     const bool direct =
         allow_structured_masks &&
         (out.structured_mask.kind == StructuredMaskKind::Causal ||

@@ -44,6 +44,7 @@
 
 #include "pie_native/fire/descriptor.hpp"
 #include "pie_native/fire/fire_geometry.hpp"
+#include "pie_native/launch/trace_query.hpp"
 #include "pipeline/interp.hpp"
 
 namespace pie::metal::pipeline {
@@ -58,64 +59,6 @@ struct GeometryResolveResult {
 };
 
 namespace detail {
-
-inline const launch::Op* producer(
-    const Trace& trace, launch::ValueId value) {
-    for (const launch::Stage& stage : trace.stages) {
-        for (const launch::Op& op : stage.ops) {
-            if (value >= op.result_id &&
-                value < op.result_id + op.result_count) {
-                return &op;
-            }
-        }
-    }
-    return nullptr;
-}
-
-inline launch::StructuredMaskDescriptor structured_mask_descriptor(
-    const Trace& trace,
-    launch::ChannelId mask_channel) {
-    const launch::ChannelPut* selected = nullptr;
-    for (const launch::Stage& stage : trace.stages) {
-        for (const launch::ChannelPut& put : stage.puts) {
-            if (put.channel == mask_channel) selected = &put;
-        }
-    }
-    if (selected == nullptr) return {};
-    launch::ValueId value = selected->value;
-    for (std::size_t depth = 0; depth <= trace.values.size(); ++depth) {
-        const launch::Op* op = producer(trace, value);
-        if (op == nullptr) break;
-        if (op->code == OpCode::Reshape && !op->args.empty()) {
-            value = op->args[0];
-            continue;
-        }
-        launch::StructuredMaskDescriptor descriptor;
-        switch (op->code) {
-            case OpCode::CausalMask:
-                descriptor.kind =
-                    launch::StructuredMaskKind::Causal;
-                descriptor.key_len = op->imm;
-                return descriptor;
-            case OpCode::SlidingWindowMask:
-                descriptor.kind =
-                    launch::StructuredMaskKind::SlidingWindow;
-                descriptor.key_len = op->imm;
-                descriptor.window = op->imm2;
-                return descriptor;
-            case OpCode::SinkWindowMask:
-                descriptor.kind =
-                    launch::StructuredMaskKind::SinkWindow;
-                descriptor.key_len = op->imm;
-                descriptor.sink = op->imm2;
-                descriptor.window = op->imm3;
-                return descriptor;
-            default:
-                return {};
-        }
-    }
-    return {};
-}
 
 // Bit-reinterpret a Value's lanes as u32, mirroring CUDA's raw-byte
 // `as_u32` (a straight little-endian reinterpretation of the wire bytes,
@@ -379,7 +322,7 @@ inline GeometryResolveResult resolve_fire_geometry_typed(
     if (has[kPortAttnMask]) {
         if (channel_bound[kPortAttnMask]) {
             out.structured_mask =
-                detail::structured_mask_descriptor(
+                launch::structured_mask_descriptor(
                     trace, ch[kPortAttnMask]);
         }
         const auto result =
