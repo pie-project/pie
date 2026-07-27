@@ -177,6 +177,7 @@ LoadedModel LoadedModel::load(
     // never decided anything with: an expert weight is MXFP4 in the plan because
     // a contract node says so, and this is the same resolution the contract was
     // written from.
+    e.mxfp4_moe_request_ = mxfp4_moe;
     e.mxfp4_moe_policy_ =
         pie_driver::resolve_mxfp4_moe(mxfp4_moe, device_target.native_mxfp4_moe);
 

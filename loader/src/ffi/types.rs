@@ -96,6 +96,10 @@ pub enum PieLoaderDType {
     U16 = 9,
     U8 = 10,
     Bool = 11,
+    // Appended after `Bool` so existing discriminants keep their values: the
+    // enum is an ABI, not a declaration order.
+    I64 = 12,
+    U64 = 13,
 }
 
 impl From<DType> for PieLoaderDType {
@@ -113,6 +117,8 @@ impl From<DType> for PieLoaderDType {
             DType::U16 => Self::U16,
             DType::U8 => Self::U8,
             DType::Bool => Self::Bool,
+            DType::I64 => Self::I64,
+            DType::U64 => Self::U64,
         }
     }
 }
@@ -134,6 +140,8 @@ impl From<PieLoaderDType> for DType {
             PieLoaderDType::U16 => Self::U16,
             PieLoaderDType::U8 => Self::U8,
             PieLoaderDType::Bool => Self::Bool,
+            PieLoaderDType::I64 => Self::I64,
+            PieLoaderDType::U64 => Self::U64,
         }
     }
 }
@@ -292,6 +300,8 @@ impl TryFrom<u32> for PieLoaderDType {
             9 => Self::U16,
             10 => Self::U8,
             11 => Self::Bool,
+            12 => Self::I64,
+            13 => Self::U64,
             other => return Err(other),
         })
     }

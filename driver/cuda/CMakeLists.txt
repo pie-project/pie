@@ -415,6 +415,7 @@ set(PIE_CUDA_MODEL_SOURCES
   src/ops/attention_mla.cu
   src/ops/flashinfer_mamba.cu
   src/store/dsa_cache.cpp
+  src/store/dsv4_compress_cache.cpp
   src/store/mla_cache.cpp)
 
 # ---- pie_driver_cuda_lib ---------------------------------------------------

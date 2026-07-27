@@ -2211,6 +2211,23 @@ impl BatchScheduler {
             );
             progress |= dispatched;
             if probe {
+                let dispatch_ns = retire_done.elapsed().as_nanos() as u64;
+                let acc = &super::LOOP_PHASES;
+                acc.mailbox_ns.fetch_add(
+                    mailbox_done.duration_since(pass_started).as_nanos() as u64,
+                    Ordering::Relaxed,
+                );
+                acc.retire_ns.fetch_add(
+                    retire_done.duration_since(mailbox_done).as_nanos() as u64,
+                    Ordering::Relaxed,
+                );
+                acc.dispatch_ns
+                    .fetch_add(dispatch_ns, Ordering::Relaxed);
+                acc.passes.fetch_add(1, Ordering::Relaxed);
+                acc.mailbox_items
+                    .fetch_add(mailbox_items as u64, Ordering::Relaxed);
+            }
+            if probe {
                 let dispatch_us = retire_done.elapsed().as_micros() as u64;
                 let mailbox_us = mailbox_done.duration_since(pass_started).as_micros() as u64;
                 let retire_us = retire_done.duration_since(mailbox_done).as_micros() as u64;
@@ -2302,7 +2319,15 @@ impl BatchScheduler {
                 // completion nudge in between.
                 let backstop = Duration::from_millis(250);
                 let recv_wait = wait_hint.map(|hold| hold.min(backstop)).unwrap_or(backstop);
-                match rx.recv_timeout(recv_wait) {
+                let park_started = probe.then(Instant::now);
+                let parked = rx.recv_timeout(recv_wait);
+                if let Some(park_started) = park_started {
+                    super::LOOP_PHASES.park_ns.fetch_add(
+                        park_started.elapsed().as_nanos() as u64,
+                        Ordering::Relaxed,
+                    );
+                }
+                match parked {
                     Ok(item) => Some(item),
                     Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
                         // A settled completion discovered by the backstop
@@ -3876,6 +3901,15 @@ impl BatchScheduler {
             .filter(|&&outcome| outcome == "retry")
             .count();
         let failed = outcomes.len().saturating_sub(committed + retried);
+        let acc = &super::LOOP_PHASES;
+        let take = |cell: &std::sync::atomic::AtomicU64| cell.swap(0, Ordering::Relaxed);
+        let (loop_mailbox, loop_retire, loop_dispatch, loop_park) = (
+            take(&acc.mailbox_ns) / 1_000,
+            take(&acc.retire_ns) / 1_000,
+            take(&acc.dispatch_ns) / 1_000,
+            take(&acc.park_ns) / 1_000,
+        );
+        let (loop_passes, loop_items) = (take(&acc.passes), take(&acc.mailbox_items));
         let mut record = serde_json::json!({
             "schema": 1,
             "source": "scheduler",
@@ -3890,6 +3924,12 @@ impl BatchScheduler {
             "retried": retried,
             "failed": failed,
             "dispatch_started_us": timing.dispatch_started_us,
+            "loop_mailbox_us": loop_mailbox,
+            "loop_retire_us": loop_retire,
+            "loop_dispatch_us": loop_dispatch,
+            "loop_park_us": loop_park,
+            "loop_passes": loop_passes,
+            "loop_items": loop_items,
             "batch_built_us": timing.batch_built_us,
             "driver_started_us": timing.driver_started_us,
             "launch_returned_us": timing.launch_returned_us,
@@ -3918,6 +3958,9 @@ impl BatchScheduler {
             record["token_instance_ids"] = serde_json::json!(token_instance_ids);
         }
         super::fire_timing_write(&record);
+        if !super::fire_timing_per_fire() {
+            return;
+        }
         for request in requests {
             let outcome = outcomes
                 .get(request.outcome_index)

@@ -27,8 +27,10 @@ void launch_rope_standard_table(
     cudaStream_t stream);
 
 // `interleaved=false` uses the half/half (NeoX) pairing (dim i with i+d/2),
-// used by Llama/Qwen/DeepSeek/Kimi. `interleaved=true` uses the GPT-J pairing
-// (adjacent dims 2i, 2i+1), required by GLM (config `rope_interleave=true`).
+// used by Llama/Qwen. `interleaved=true` uses the GPT-J pairing (adjacent dims
+// 2i, 2i+1), required by GLM (config `rope_interleave=true`) and by the
+// DeepSeek-V2/V3/Kimi-K2 MLA rope dims (HF spells it as an interleave-transpose
+// plus a NeoX rotate_half; vLLM as `is_neox_style=False`).
 void launch_rope_bf16(
     void* q, void* k,
     const std::int32_t* positions,  // [num_tokens]
@@ -153,7 +155,13 @@ void launch_rope_yarn_original_bf16(
     float beta_slow,
     float attention_factor,
     int   original_max_position,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    // DeepSeek-V2/V3-style MLA (and therefore Kimi-K2) pairs *adjacent*
+    // dims (GPT-J). HF's `modeling_deepseek.py` gets there by
+    // interleave-transposing q_pe/k_pe before a NeoX `rotate_half`, which is
+    // the same rotation; vLLM builds the rope with `is_neox_style=False`.
+    // OLMo-3 / gpt-oss keep the NeoX half/half pairing.
+    bool interleaved = false);
 
 // Partial rotary embedding (Gemma-4 full-attention layers). Rotates
 // only the first `rotary_dim` of each head's `head_dim` channels;
@@ -184,8 +192,11 @@ void launch_rope_partial_bf16_position_delta(
 
 // Partial rotary embedding on the LAST `rotary_dim` dimensions of each head.
 // Used by DeepSeek V4 where RoPE is applied to the trailing 64 dims of
-// head_dim=512. Pair convention: (offset+i, offset+i+rotary_dim/2)
-// where offset = head_dim - rotary_dim.
+// head_dim=512. Pair convention: NeoX (offset+i, offset+i+rotary_dim/2) by
+// default, GPT-J (offset+2i, offset+2i+1) when `interleaved` — DeepSeek-V4
+// needs the latter (vLLM `build_deepseek_v4_rope` uses `is_neox_style=False`).
+// `yarn_factor > 1` additionally applies the original-YaRN inv_freq ramp, with
+// the correction range computed over `rotary_dim`.
 void launch_rope_partial_last_bf16(
     void* q, void* k,
     const std::int32_t* positions,
@@ -196,6 +207,11 @@ void launch_rope_partial_last_bf16(
     int rotary_dim,
     float theta,
     cudaStream_t stream,
-    bool inverse = false);
+    bool inverse = false,
+    bool interleaved = false,
+    float yarn_factor = 1.f,
+    float yarn_beta_fast = 32.f,
+    float yarn_beta_slow = 1.f,
+    int   yarn_original_max_position = 0);
 
 }  // namespace pie_cuda_driver::kernels

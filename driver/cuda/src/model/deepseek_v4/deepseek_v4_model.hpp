@@ -18,10 +18,12 @@ public:
         DsV4Weights weights,
         const HfConfig& hf_config,
         DsV4Workspace& ws,
+        DsV4CompressCache& comp_cache,
         int tp_size,
         int tp_rank,
         NcclComm* tp_comm,
-        bool emit_logits);
+        bool emit_logits,
+        bool eager_bf16_experts = true);
 
     void prepare(AttentionWorkspace& attn_ws,
                  const ForwardFn::PrepareInputs& in) override;
@@ -37,6 +39,7 @@ private:
     DsV4Weights weights_;
     const HfConfig& hf_config_;
     DsV4Workspace& ws_;
+    DsV4CompressCache& comp_cache_;
     DsV4ForwardCfg fwd_cfg_;
     DsV4PlanState plan_state_;
     ModelCapabilities caps_;

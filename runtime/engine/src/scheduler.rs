@@ -33,6 +33,7 @@ pub mod worker;
 pub use frame::FrameStamp;
 
 use std::collections::HashMap;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use anyhow::{Result, anyhow};
@@ -238,6 +239,41 @@ pub(crate) fn fire_timing_full() -> bool {
         std::env::var("PIE_FIRE_TIMING").is_ok_and(|value| !value.is_empty() && value != "0")
     })
 }
+
+/// `PIE_FIRE_TIMING=waves` keeps the per-wave and per-pass records but drops
+/// the per-fire ones. The per-fire stream emits one JSON line per request from
+/// inside `retire_ready_launches`, which at 128-request waves costs a
+/// millisecond or two of the very pass it is measuring — enough to make the
+/// scheduler look like the bottleneck it is being used to find.
+pub(crate) fn fire_timing_per_fire() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !std::env::var("PIE_FIRE_TIMING").is_ok_and(|value| value == "waves")
+    })
+}
+
+/// Worker-loop phase accumulators, in nanoseconds, summed across every pass
+/// since the last wave dispatch and drained into that wave's record. The
+/// per-wave `settled -> next dispatch` gap is the throughput lever at high
+/// concurrency, and these say whether it is the scheduler thread burning CPU
+/// (mailbox/retire/dispatch) or parked waiting on the guest lanes.
+pub(crate) struct LoopPhaseAcc {
+    pub mailbox_ns: AtomicU64,
+    pub retire_ns: AtomicU64,
+    pub dispatch_ns: AtomicU64,
+    pub park_ns: AtomicU64,
+    pub passes: AtomicU64,
+    pub mailbox_items: AtomicU64,
+}
+
+pub(crate) static LOOP_PHASES: LoopPhaseAcc = LoopPhaseAcc {
+    mailbox_ns: AtomicU64::new(0),
+    retire_ns: AtomicU64::new(0),
+    dispatch_ns: AtomicU64::new(0),
+    park_ns: AtomicU64::new(0),
+    passes: AtomicU64::new(0),
+    mailbox_items: AtomicU64::new(0),
+};
 
 pub(crate) fn ledger_timing_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();

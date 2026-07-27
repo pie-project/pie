@@ -49,6 +49,21 @@ struct KimiWorkspace {
     DeviceTensor expert_up;         // [N*top_k, routed_I]
     DeviceTensor expert_out;        // [N*top_k, H]
     DeviceTensor moe_out;           // [N, H]
+    // Device-side aligned MoE scratch (batched-GEMM path).
+    DeviceTensor aligned_route_ids;
+    DeviceTensor aligned_expert_ids;
+    DeviceTensor aligned_expert_in;
+    DeviceTensor aligned_gate_up;
+    DeviceTensor aligned_act;
+    DeviceTensor aligned_out;
+    DeviceTensor a_gu_ptrs;
+    DeviceTensor b_gu_ptrs;
+    DeviceTensor c_gu_ptrs;
+    DeviceTensor a_dn_ptrs;
+    DeviceTensor b_dn_ptrs;
+    DeviceTensor c_dn_ptrs;
+    int aligned_block_size = 0;
+    int aligned_max_blocks = 0;
     DeviceTensor shared_gate;       // [N, shared_I]
     DeviceTensor shared_up;         // [N, shared_I]
     DeviceTensor shared_act;        // [N, shared_I]
@@ -62,6 +77,15 @@ struct KimiWorkspace {
         int max_logit_rows,
         int tp_size);
 };
+
+// Dequantises the routed experts into per-layer BF16 stacks (`[E, 2I, H]` and
+// `[E, H, I]`) so the batched-GEMM MoE path can read each expert once. Skipped
+// when the stacks would exceed `kKimiMoeBf16StackBudget`. Must be called before
+// any CUDA graph capture: allocating during capture yields graph-ordered memory.
+void kimi_materialize_bf16_expert_stacks(
+    KimiWeights& weights,
+    const HfConfig& cfg,
+    int tp_size);
 
 std::size_t kimi_workspace_bytes(
     const HfConfig& cfg,

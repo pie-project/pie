@@ -25,9 +25,11 @@ pub enum DType {
     BF16,
     F8E4M3,
     F8E5M2,
+    I64,
     I32,
     I16,
     I8,
+    U64,
     U32,
     U16,
     U8,
@@ -37,6 +39,7 @@ pub enum DType {
 impl DType {
     pub fn bytes(self) -> u64 {
         match self {
+            Self::I64 | Self::U64 => 8,
             Self::F32 | Self::I32 | Self::U32 => 4,
             Self::F16 | Self::BF16 | Self::I16 | Self::U16 => 2,
             Self::F8E4M3 | Self::F8E5M2 | Self::I8 | Self::U8 | Self::Bool => 1,

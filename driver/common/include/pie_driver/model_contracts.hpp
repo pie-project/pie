@@ -313,6 +313,11 @@ struct ArchProfile {
     /// forward expects. Plain Qwen3-MoE ships per-expert weights; qwen3_5_moe
     /// checkpoints ship them pre-fused, which makes this a no-op.
     bool stack_per_expert_moe = false;
+    /// Only stack when the per-expert weights are raw BF16/F16. Quantised
+    /// experts carry companion scale tensors that the stack would orphan, so
+    /// archs that can ship either layout set this and fall back to the
+    /// per-expert path for quantised checkpoints.
+    bool stack_per_expert_moe_float_only = false;
     /// The canonical Metal Qwen3.5/GDN storage schema is defined for this arch.
     bool metal_qwen35 = false;
     /// Tensor-parallel shard-axis strategy, keyed by tensor name. Defaults to
@@ -366,7 +371,9 @@ inline ArchProfile arch_profile(std::string_view model_type) {
         {{"glm_moe_dsa"},
          ArchProfile{.shard_embed_tokens = true,
                      .mxfp4_runtime_quant = true,
-                     .bf16_runtime_quant = true}},
+                     .bf16_runtime_quant = true,
+                     .stack_per_expert_moe = true,
+                     .stack_per_expert_moe_float_only = true}},
         {{"qwen3_moe", "qwen3_5_moe", "qwen3_5_moe_text"},
          ArchProfile{.bf16_runtime_quant = true,
                      .skip_dense_qkv_fusion = true,
@@ -1055,6 +1062,10 @@ private:
             const std::int64_t inter = gate0->shape[0];
             const std::int64_t hidden = gate0->shape[1];
             const PieLoaderDType dtype = logical_dtype(gate0->encoding);
+            if (profile_.stack_per_expert_moe_float_only &&
+                dtype != PieLoaderDType::BF16 && dtype != PieLoaderDType::F16) {
+                continue;  // quantised experts keep the per-expert layout.
+            }
             if (!is_dense_addressable(gate0->encoding)) {
                 fail("qwen moe expert stack: '" + std::string(gate0->name) +
                      "' has a non-affine packed encoding");

@@ -1,5 +1,7 @@
 #include "ops/attention_workspace.hpp"
 
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <utility>
 
@@ -9,6 +11,16 @@
 #include "kernels_manifest.hpp"
 
 namespace pie_cuda_driver {
+
+namespace {
+bool plan_profile_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("PIE_STEP_PROFILE");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return on;
+}
+}  // namespace
 
 void AttentionWorkspace::ensure_plan_slot(PlanStaging& slot) {
     if (slot.host == nullptr && staging_bytes_ > 0) {
@@ -111,10 +123,28 @@ void AttentionWorkspace::begin_plan_update() {
     next_plan_slot_ =
         (next_plan_slot_ + 1) % kPlanStagingSlots;
     auto& staging = plan_staging_[active_plan_slot_];
+    const bool profile = plan_profile_enabled();
+    const auto t0 = profile ? std::chrono::steady_clock::now()
+                            : std::chrono::steady_clock::time_point{};
+    const bool cold = staging.host == nullptr;
     ensure_plan_slot(staging);
-    if (!staging.upload_pending) return;
-    CUDA_CHECK(cudaEventSynchronize(staging.upload_done));
-    staging.upload_pending = false;
+    const auto t1 = profile ? std::chrono::steady_clock::now() : t0;
+    if (staging.upload_pending) {
+        CUDA_CHECK(cudaEventSynchronize(staging.upload_done));
+        staging.upload_pending = false;
+    }
+    if (profile) {
+        const auto t2 = std::chrono::steady_clock::now();
+        auto us = [](auto a, auto b) {
+            return std::chrono::duration_cast<std::chrono::microseconds>(b - a)
+                .count();
+        };
+        std::fprintf(stderr,
+                     "[plan-staging] slot=%zu cold=%d alloc_us=%lld sync_us=%lld\n",
+                     active_plan_slot_, cold ? 1 : 0,
+                     static_cast<long long>(us(t0, t1)),
+                     static_cast<long long>(us(t1, t2)));
+    }
 }
 
 void AttentionWorkspace::end_plan_update(cudaStream_t stream) {

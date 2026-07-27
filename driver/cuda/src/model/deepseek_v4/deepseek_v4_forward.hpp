@@ -5,6 +5,7 @@
 #include "ops/attention_workspace.hpp"
 #include "distributed.hpp"
 #include "store/kv_cache.hpp"
+#include "store/dsv4_compress_cache.hpp"
 #include "model/deepseek_v4/deepseek_v4.hpp"
 #include "ops/gemm.hpp"
 #include "tensor.hpp"
@@ -16,6 +17,10 @@ struct DsV4ForwardCfg {
     int tp_rank = 0;
     NcclComm* tp_comm = nullptr;
     bool emit_logits = true;
+    // When true, the MXFP4 routed experts are dequantised to BF16 once and
+    // cached. Costs 2x the packed footprint per layer but removes a full
+    // expert-bank dequant from every forward.
+    bool eager_bf16_experts = true;
 };
 
 struct DsV4Workspace {
@@ -68,6 +73,9 @@ struct DsV4Workspace {
     // Compressed attention output and LSE (per layer, reused)
     DeviceTensor comp_attn_out;   // [N, num_heads * head_dim] BF16
     DeviceTensor comp_attn_lse;   // [N, num_heads] F32
+    // Per-entry compressor metadata, four packed [max_comp_tokens] I32 slices:
+    // boundary_tok | boundary_pos | window_lo | rope_pos
+    DeviceTensor comp_meta;       // [4 * max_comp_tokens] I32
 
     // Routed expert scratch
     DeviceTensor expert_in;      // [N, H] bf16 — gathered input rows
@@ -80,6 +88,18 @@ struct DsV4Workspace {
     DeviceTensor route_idx;      // [N*K] int32 — token indices for one expert
     DeviceTensor route_w;        // [N*K] fp32 — routing weights
 
+    // Device-side aligned MoE scratch (vLLM/SGL-style expert blocking).
+    DeviceTensor aligned_route_ids;   // [aligned_rows] int32
+    DeviceTensor aligned_expert_ids;  // [max_blocks]   int32
+    DeviceTensor aligned_expert_in;   // [aligned_rows, H]
+    DeviceTensor aligned_gate_up;     // [aligned_rows, 2*moe_I]
+    DeviceTensor aligned_act;         // [aligned_rows, moe_I]
+    DeviceTensor aligned_out;         // [aligned_rows, H]
+    DeviceTensor a_gu_ptrs, b_gu_ptrs, c_gu_ptrs;
+    DeviceTensor a_dn_ptrs, b_dn_ptrs, c_dn_ptrs;
+    int aligned_block_size = 0;
+    int aligned_max_blocks = 0;
+
     // Logits
     DeviceTensor logits;         // [O, vocab]
 
@@ -89,6 +109,16 @@ struct DsV4Workspace {
         int max_logit_rows,
         int tp_size);
 };
+
+// Dequantises the MXFP4 routed experts into per-layer BF16 stacks
+// (`[E, 2I, H]` and `[E, H, I]`) so the GEMV/batched-GEMM MoE paths can read
+// them directly. Must run at model construction: allocating inside the forward
+// picks up whatever allocator binding is active there (the elastic KV arena)
+// and yields memory that is not safely writable.
+void dsv4_materialize_bf16_expert_stacks(
+    DsV4Weights& weights,
+    const HfConfig& cfg,
+    int tp_size);
 
 std::size_t dsv4_workspace_bytes(
     const HfConfig& cfg,
@@ -107,6 +137,7 @@ void dsv4_forward_paged(
     const DsV4ForwardCfg& fwd_cfg,
     DsV4Workspace& ws,
     KvCache& kv_cache,
+    DsV4CompressCache& comp_cache,
     AttentionWorkspace& attn_ws,
     ops::CublasHandle& cublas,
     void* logits_out,

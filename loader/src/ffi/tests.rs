@@ -1126,6 +1126,8 @@ fn dtype_survives_the_c_boundary() {
         DType::U16,
         DType::U8,
         DType::Bool,
+        DType::I64,
+        DType::U64,
     ] {
         let round_tripped: DType = PieLoaderDType::from(dtype).into();
         assert_eq!(round_tripped, dtype);

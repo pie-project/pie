@@ -490,6 +490,38 @@ def request_max_tokens(args: argparse.Namespace, i: int) -> int:
     return args.max_tokens
 
 
+def hash_output_tokens(token_ids: list[int]) -> str:
+    """SHA-256 over emitted u32 token ids, little-endian.
+
+    Shared by every engine harness so a cross-engine parity check is a
+    string comparison and not a re-derivation of the same digest twice.
+    """
+    import hashlib
+
+    digest = hashlib.sha256()
+    for token in token_ids:
+        digest.update(int(token).to_bytes(4, "little", signed=False))
+    return digest.hexdigest()
+
+
+def add_output_dump_args(p: argparse.ArgumentParser) -> None:
+    """Cross-engine output-inspection flags (parity checking)."""
+    p.add_argument("--dump-first-text", action="store_true")
+    p.add_argument("--dump-all-token-ids", action="store_true")
+    p.add_argument("--dump-all-texts", action="store_true")
+
+
+def print_first_output(args: argparse.Namespace, text: str | None) -> None:
+    if not getattr(args, "dump_first_text", False) or text is None:
+        return
+    import hashlib
+
+    sha = hashlib.sha256(text.encode()).hexdigest()[:16]
+    print(f"\nFIRST REQUEST OUTPUT (sha256[:16]={sha}):")
+    print(text)
+    print(f"END OUTPUT (chars={len(text)})")
+
+
 def make_prompts(args: argparse.Namespace, n: int) -> list[str]:
     if getattr(args, "mixed_phase", False):
         long_body = _filler_words(getattr(args, "mixed_long_prompt_words", 400))

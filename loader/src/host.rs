@@ -701,6 +701,12 @@ fn decode_values(bytes: &[u8], dtype: DType) -> Result<Vec<f64>, CompileError> {
                 DType::F8E4M3 | DType::F8E5M2 => {
                     return Err(invalid("host Cast does not implement FP8"));
                 }
+                // A 64-bit integer does not survive the f64 pivot this cast
+                // is written around, and nothing asks it to: `I64`/`U64`
+                // tensors are index tables that move byte-for-byte.
+                DType::I64 | DType::U64 => {
+                    return Err(invalid("host Cast does not implement 64-bit integers"));
+                }
             })
         })
         .collect()
@@ -726,6 +732,9 @@ fn encode_values(values: &[f64], dtype: DType) -> Result<Vec<u8>, CompileError> 
             DType::Bool => out.push(u8::from(value != 0.0)),
             DType::F8E4M3 | DType::F8E5M2 => {
                 return Err(invalid("host Cast does not implement FP8"));
+            }
+            DType::I64 | DType::U64 => {
+                return Err(invalid("host Cast does not implement 64-bit integers"));
             }
         }
     }

@@ -60,6 +60,11 @@ struct KimiLayerWeights {
     DeviceBuffer<const void*>         expert_up_scale_ptrs;
     DeviceBuffer<const std::int32_t*> expert_down_packed_ptrs;
     DeviceBuffer<const void*>         expert_down_scale_ptrs;
+    // Lazily materialised BF16 expert stack: `[E, 2*I, H]` and `[E, H, I]`.
+    // Only built when the batched MoE path is viable (see
+    // `kKimiMoeBf16StackBudget`); the W4A16 GEMVs are used otherwise.
+    mutable std::unique_ptr<DeviceTensor> moe_gate_up_bf16;
+    mutable std::unique_ptr<DeviceTensor> moe_down_bf16;
     const DeviceTensor* shared_gate_proj = nullptr;     // [I_shared, H]
     const DeviceTensor* shared_up_proj   = nullptr;     // [I_shared, H]
     const DeviceTensor* shared_down_proj = nullptr;     // [H, I_shared]

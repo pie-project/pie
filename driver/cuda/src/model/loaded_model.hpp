@@ -63,6 +63,13 @@ public:
     pie_driver::Mxfp4MoePolicy mxfp4_moe_policy() const noexcept {
         return mxfp4_moe_policy_;
     }
+    /// What the caller asked for, before device capability narrowed it.
+    /// Families that can honour a request the loader's `Auto` rule does not
+    /// cover (DeepSeek-V4 caches a BF16 dequant of its experts) need to see
+    /// `Auto` as distinct from an explicit `RoutedDecode`.
+    pie_driver::Mxfp4MoeRequest mxfp4_moe_request() const noexcept {
+        return mxfp4_moe_request_;
+    }
     LoadedModelCapabilities capabilities() const;
 
     /// Number of weights resident on device.
@@ -86,6 +93,8 @@ private:
     Config boot_;
     HfConfig hf_;
     WeightStore weights_;
+    pie_driver::Mxfp4MoeRequest mxfp4_moe_request_ =
+        pie_driver::Mxfp4MoeRequest::Auto;
     pie_driver::Mxfp4MoePolicy mxfp4_moe_policy_ =
         pie_driver::Mxfp4MoePolicy::EagerBf16;
 };

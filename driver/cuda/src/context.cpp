@@ -49,6 +49,7 @@
 #include "store/mla_cache.hpp"
 #include "store/dsa_cache.hpp"
 #include "model/deepseek_v4/deepseek_v4_forward.hpp"
+#include "store/dsv4_compress_cache.hpp"
 #include "model/gemma/gemma2.hpp"
 #include "model/gemma4/gemma4.hpp"
 #include "model/gemma4/gemma4_audio_adapter.hpp"
@@ -1018,9 +1019,10 @@ int Context::Impl::load_model(
          family == model::Family::Qwen3_5 ||
          family == model::Family::Qwen3_5Moe ||
          family == model::Family::Gemma4 ||
-         family == model::Family::NemotronH) ||
-        family == model::Family::Kimi ||
-        family == model::Family::Glm5;
+         family == model::Family::NemotronH ||
+         family == model::Family::Kimi ||
+         family == model::Family::Glm5 ||
+         family == model::Family::DeepSeekV4);
     const int physical_kv_pages =
         runtime_kv_pages +
         (runtime_kv_pages > 0 && !page_zero_dummy_safe ? 1 : 0);
@@ -1113,6 +1115,18 @@ int Context::Impl::load_model(
     }
     auto& kv_cache = *kv_cache_p;
     kv_cache.set_elastic_allocator(kv_allocator_);
+
+    DsV4CompressCache* dsv4_comp_cache_p = nullptr;
+    {
+        ScopedCudaArenaAllocator arena(*kv_allocator_);
+        dsv4_comp_cache_p = own_value(
+            family == model::Family::DeepSeekV4
+                ? DsV4CompressCache::allocate(
+                      engine.hf_config(), physical_kv_pages,
+                      mem_plan.kv_page_size)
+                : DsV4CompressCache{});
+    }
+    auto& dsv4_comp_cache = *dsv4_comp_cache_p;
 
     MlaCache* mla_cache_p = nullptr;
     {
@@ -1465,6 +1479,7 @@ int Context::Impl::load_model(
     resources.nemotron_h_ws = &nemotron_h_ws;
     resources.nemotron_h_state_cache = &nemotron_h_state_cache;
     resources.dsv4_ws = &dsv4_ws;
+    resources.dsv4_comp_cache = &dsv4_comp_cache;
     resources.kimi_ws = &kimi_ws;
     resources.glm5_ws = &glm5_ws;
 
