@@ -60,7 +60,27 @@ void launch_envelope_recompute_bf16(
     int head_dim,
     cudaStream_t stream);
 
-// Score: `score[kv_head, page]` (f32 `[num_kv_heads, P_MAX]`) per the Quest
+// Maintenance for the EXPLICIT-descriptor KV write, where the program supplies
+// one (physical page, offset) per token instead of a page CSR. `k_curr` is this
+// fire's keys `[num_tokens, num_kv_heads, head_dim]` bf16; `w_page[t]`/`w_off[t]`
+// are the physical page and in-page offset token `t` was written to;
+// `row_valid` (optional) masks padded lanes. A page entered at offset 0 is
+// reset first (it was recycled), then each written key is MERGED into its
+// page's envelope -- which equals a full recompute for append-only pages and
+// only ever widens the bound for the mid-page rewrites the explicit path
+// exists to serve. See the kernel comments.
+void launch_envelope_merge_written_bf16(
+    const std::uint16_t* k_curr,
+    const std::uint32_t* w_page,
+    const std::uint32_t* w_off,
+    const std::uint8_t* row_valid,
+    float* env_min,
+    float* env_max,
+    int num_tokens,
+    int num_kv_heads,
+    int head_dim,
+    cudaStream_t stream);
+
 // formula above. `q` is `[num_q_heads, head_dim]` f32 (this layer's projected
 // query, M=1 decode); `env_min`/`env_max` are `[P_MAX, num_kv_heads, head_dim]`
 // f32. Pages `page >= live_pages` → `-inf`. Requires

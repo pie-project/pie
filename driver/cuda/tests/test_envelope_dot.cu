@@ -20,6 +20,7 @@
 #include "kernels/envelope.hpp"
 
 using pie_cuda_driver::kernels::launch_envelope_dot_f32;
+using pie_cuda_driver::kernels::launch_envelope_merge_written_bf16;
 using pie_cuda_driver::kernels::launch_envelope_recompute_bf16;
 using pie_cuda_driver::kernels::launch_envelope_update_appended_bf16;
 
@@ -266,6 +267,153 @@ void check_update_appended(const char* name, int num_pages, int page_size,
     cudaFree(d_qo); cudaFree(d_idx); cudaFree(d_indptr); cudaFree(d_lastlen);
 }
 
+// The explicit-descriptor maintenance path: `launch_envelope_merge_written_bf16`.
+//
+// The claim it has to earn is that merging fire by fire ends up where a full
+// recompute of the finished pages would. So this simulates a whole sequence --
+// a prefill fire followed by `decode_fires` one-token fires -- feeding each one
+// through the merge exactly as `launch_write_kv_explicit_bf16` does, and then
+// compares against `envelope_recompute` over the final live lengths.
+//
+// It also plants garbage in the envelopes of every page the sequence will use,
+// standing in for a page recycled out of the pool. Merging alone would keep
+// that garbage forever (min/max only widen); the reset pass is what removes it,
+// and the comparison below is exact, so a missing reset fails here.
+void check_merge_written(const char* name, int num_pages, int page_size,
+                         int nkvh, int hd,
+                         const std::vector<int>& pages,
+                         int prefill_len, int decode_fires,
+                         bool poison_invalid_row) {
+    const long tok = static_cast<long>(nkvh) * hd;
+    const long n = static_cast<long>(num_pages) * page_size * tok;
+    const long envn = static_cast<long>(num_pages) * nkvh * hd;
+    const int total = prefill_len + decode_fires;
+
+    // The pool, and the sequence's keys laid into it at the cells the
+    // descriptors will name. Everything else stays zero and is never live.
+    std::vector<std::uint16_t> k(n, f2b(0.f));
+    std::vector<std::uint16_t> k_curr(static_cast<long>(total) * tok);
+    std::vector<std::uint32_t> w_page(total), w_off(total);
+    for (int t = 0; t < total; ++t) {
+        w_page[t] = static_cast<std::uint32_t>(pages[t / page_size]);
+        w_off[t] = static_cast<std::uint32_t>(t % page_size);
+        const long cell = (static_cast<long>(w_page[t]) * page_size +
+                           static_cast<long>(w_off[t])) * tok;
+        for (long e = 0; e < tok; ++e) {
+            const std::uint16_t v = f2b(
+                std::sin(0.013f * static_cast<float>(t * tok + e)) * 2.5f);
+            k[cell + e] = v;
+            k_curr[static_cast<long>(t) * tok + e] = v;
+        }
+    }
+
+    std::vector<int> live(num_pages, 0);
+    for (int t = 0; t < total; ++t) live[pages[t / page_size]] = (t % page_size) + 1;
+
+    std::uint16_t *dk, *dcurr;
+    std::int32_t* dlive;
+    float *dmin_ref, *dmax_ref, *dmin_inc, *dmax_inc;
+    std::uint32_t *d_page, *d_off;
+    RT(cudaMalloc(&dk, n * 2));
+    RT(cudaMalloc(&dcurr, static_cast<long>(total) * tok * 2));
+    RT(cudaMalloc(&dlive, num_pages * sizeof(std::int32_t)));
+    RT(cudaMalloc(&dmin_ref, envn * sizeof(float)));
+    RT(cudaMalloc(&dmax_ref, envn * sizeof(float)));
+    RT(cudaMalloc(&dmin_inc, envn * sizeof(float)));
+    RT(cudaMalloc(&dmax_inc, envn * sizeof(float)));
+    RT(cudaMalloc(&d_page, total * sizeof(std::uint32_t)));
+    RT(cudaMalloc(&d_off, total * sizeof(std::uint32_t)));
+    RT(cudaMemcpy(dk, k.data(), n * 2, cudaMemcpyHostToDevice));
+    RT(cudaMemcpy(dcurr, k_curr.data(), static_cast<long>(total) * tok * 2,
+                  cudaMemcpyHostToDevice));
+    RT(cudaMemcpy(dlive, live.data(), num_pages * sizeof(std::int32_t),
+                  cudaMemcpyHostToDevice));
+    RT(cudaMemcpy(d_page, w_page.data(), total * sizeof(std::uint32_t),
+                  cudaMemcpyHostToDevice));
+    RT(cudaMemcpy(d_off, w_off.data(), total * sizeof(std::uint32_t),
+                  cudaMemcpyHostToDevice));
+
+    launch_envelope_recompute_bf16(dk, dlive, dmin_ref, dmax_ref, num_pages,
+                                   page_size, nkvh, hd, nullptr);
+
+    // The recycled-page stand-in: a previous tenant's envelope, wide enough
+    // that a merge could never narrow it back.
+    std::vector<float> dirty_min(envn, -1e30f), dirty_max(envn, 1e30f);
+    RT(cudaMemcpy(dmin_inc, dirty_min.data(), envn * sizeof(float),
+                  cudaMemcpyHostToDevice));
+    RT(cudaMemcpy(dmax_inc, dirty_max.data(), envn * sizeof(float),
+                  cudaMemcpyHostToDevice));
+
+    launch_envelope_merge_written_bf16(dcurr, d_page, d_off, nullptr,
+                                       dmin_inc, dmax_inc, prefill_len,
+                                       nkvh, hd, nullptr);
+    for (int f = 0; f < decode_fires; ++f) {
+        const int t = prefill_len + f;
+        launch_envelope_merge_written_bf16(
+            dcurr + static_cast<long>(t) * tok, d_page + t, d_off + t, nullptr,
+            dmin_inc, dmax_inc, 1, nkvh, hd, nullptr);
+    }
+
+    // A masked-off row: the descriptor still names a cell (page 0 of the
+    // sequence, offset 0 -- the most destructive target available, since an
+    // unhonoured `row_valid` would BOTH reset that page and pollute it with a
+    // key the pool never received). The comparison below is exact, so honouring
+    // `row_valid` in only one of the two passes fails too.
+    if (poison_invalid_row) {
+        std::vector<std::uint16_t> junk(tok, f2b(9.0f));
+        const std::uint32_t jp = static_cast<std::uint32_t>(pages[0]), jo = 0u;
+        const std::uint8_t invalid = 0;
+        std::uint16_t* d_junk;
+        std::uint32_t *d_jp, *d_jo;
+        std::uint8_t* d_valid;
+        RT(cudaMalloc(&d_junk, tok * 2));
+        RT(cudaMalloc(&d_jp, sizeof(std::uint32_t)));
+        RT(cudaMalloc(&d_jo, sizeof(std::uint32_t)));
+        RT(cudaMalloc(&d_valid, 1));
+        RT(cudaMemcpy(d_junk, junk.data(), tok * 2, cudaMemcpyHostToDevice));
+        RT(cudaMemcpy(d_jp, &jp, sizeof(jp), cudaMemcpyHostToDevice));
+        RT(cudaMemcpy(d_jo, &jo, sizeof(jo), cudaMemcpyHostToDevice));
+        RT(cudaMemcpy(d_valid, &invalid, 1, cudaMemcpyHostToDevice));
+        launch_envelope_merge_written_bf16(d_junk, d_jp, d_jo, d_valid,
+                                           dmin_inc, dmax_inc, 1, nkvh, hd,
+                                           nullptr);
+        RT(cudaDeviceSynchronize());
+        cudaFree(d_junk); cudaFree(d_jp); cudaFree(d_jo); cudaFree(d_valid);
+    }
+    RT(cudaDeviceSynchronize());
+
+    std::vector<float> rmin(envn), rmax(envn), imin(envn), imax(envn);
+    RT(cudaMemcpy(rmin.data(), dmin_ref, envn * sizeof(float),
+                  cudaMemcpyDeviceToHost));
+    RT(cudaMemcpy(rmax.data(), dmax_ref, envn * sizeof(float),
+                  cudaMemcpyDeviceToHost));
+    RT(cudaMemcpy(imin.data(), dmin_inc, envn * sizeof(float),
+                  cudaMemcpyDeviceToHost));
+    RT(cudaMemcpy(imax.data(), dmax_inc, envn * sizeof(float),
+                  cudaMemcpyDeviceToHost));
+
+    bool ok = true;
+    for (int i = 0; i < total && ok; ++i) {
+        const int p = pages[i / page_size];
+        for (int kh = 0; kh < nkvh && ok; ++kh)
+            for (int d = 0; d < hd && ok; ++d) {
+                const long e = (static_cast<long>(p) * nkvh + kh) * hd + d;
+                ok = imin[e] == rmin[e] && imax[e] == rmax[e];
+                if (!ok)
+                    std::printf(
+                        "       (page %d kh %d d %d: merged [%g,%g] vs "
+                        "recompute [%g,%g])\n",
+                        p, kh, d, imin[e], imax[e], rmin[e], rmax[e]);
+            }
+    }
+    std::printf("[%s] %s\n", ok ? " ok " : "FAIL", name);
+    if (!ok) ++g_fail;
+    cudaFree(dk); cudaFree(dcurr); cudaFree(dlive);
+    cudaFree(dmin_ref); cudaFree(dmax_ref);
+    cudaFree(dmin_inc); cudaFree(dmax_inc);
+    cudaFree(d_page); cudaFree(d_off);
+}
+
 void check_dot(const char* name, int nqh, int nkvh, int hd, int p_max,
                int live) {
     const long envn = static_cast<long>(p_max) * nkvh * hd;
@@ -345,6 +493,83 @@ void check_dot_golden_vector() {
     cudaFree(dq); cudaFree(dmin); cudaFree(dmax); cudaFree(ds);
 }
 
+// What the explicit-path maintenance costs. Envelopes are a process-wide
+// switch, so this runs on every KV append once Quest is enabled, per layer per
+// fire -- and Quest's decode fires carry only R tokens, where the two kernels
+// are pure launch overhead rather than work. That is the regime that decides
+// whether the feature is affordable, so it is the one reported first.
+void bench_merge_written(int num_tokens, int nkvh, int hd, int layers) {
+    const long tok = static_cast<long>(nkvh) * hd;
+    const int num_pages = num_tokens + 8;
+    const long envn = static_cast<long>(num_pages) * tok;
+
+    std::vector<std::uint16_t> k(static_cast<long>(num_tokens) * tok, f2b(0.5f));
+    std::vector<std::uint32_t> wp(num_tokens), wo(num_tokens);
+    for (int t = 0; t < num_tokens; ++t) {
+        wp[t] = static_cast<std::uint32_t>(t % num_pages);
+        wo[t] = static_cast<std::uint32_t>(t % 16);
+    }
+
+    std::uint16_t* dk;
+    std::uint32_t *d_page, *d_off;
+    float *dmin, *dmax;
+    RT(cudaMalloc(&dk, static_cast<long>(num_tokens) * tok * 2));
+    RT(cudaMalloc(&d_page, num_tokens * sizeof(std::uint32_t)));
+    RT(cudaMalloc(&d_off, num_tokens * sizeof(std::uint32_t)));
+    RT(cudaMalloc(&dmin, envn * sizeof(float)));
+    RT(cudaMalloc(&dmax, envn * sizeof(float)));
+    RT(cudaMemcpy(dk, k.data(), static_cast<long>(num_tokens) * tok * 2,
+                  cudaMemcpyHostToDevice));
+    RT(cudaMemcpy(d_page, wp.data(), num_tokens * sizeof(std::uint32_t),
+                  cudaMemcpyHostToDevice));
+    RT(cudaMemcpy(d_off, wo.data(), num_tokens * sizeof(std::uint32_t),
+                  cudaMemcpyHostToDevice));
+
+    cudaEvent_t beg, end;
+    RT(cudaEventCreate(&beg));
+    RT(cudaEventCreate(&end));
+
+    // One iteration = one whole forward pass worth of maintenance, because the
+    // per-launch overhead is the dominant term at decode widths and only shows
+    // up honestly when all `layers` launches are in flight together.
+    //
+    // This host is shared and heavily loaded, so a mean is worthless (repeated
+    // runs disagree by >2x). Take the MIN over repetitions: the fastest pass is
+    // the one that got the least interference, and the quantity of interest is
+    // the cost of the work, not the cost of the contention.
+    const int warmup = 20, iters = 100, reps = 7;
+    for (int i = 0; i < warmup; ++i)
+        for (int l = 0; l < layers; ++l)
+            launch_envelope_merge_written_bf16(dk, d_page, d_off, nullptr, dmin,
+                                               dmax, num_tokens, nkvh, hd, nullptr);
+    RT(cudaDeviceSynchronize());
+
+    double best_us = 1e30;
+    for (int r = 0; r < reps; ++r) {
+        RT(cudaEventRecord(beg));
+        for (int i = 0; i < iters; ++i)
+            for (int l = 0; l < layers; ++l)
+                launch_envelope_merge_written_bf16(dk, d_page, d_off, nullptr,
+                                                   dmin, dmax, num_tokens, nkvh,
+                                                   hd, nullptr);
+        RT(cudaEventRecord(end));
+        RT(cudaEventSynchronize(end));
+        float ms = 0.f;
+        RT(cudaEventElapsedTime(&ms, beg, end));
+        const double us = 1000.0 * static_cast<double>(ms) / iters;
+        if (us < best_us) best_us = us;
+    }
+
+    const double per_pass_us = best_us;
+    std::printf("  N=%-5d  %7.1f us / %d-layer pass   (%5.2f us / layer)\n",
+                num_tokens, per_pass_us, layers, per_pass_us / layers);
+
+    RT(cudaEventDestroy(beg));
+    RT(cudaEventDestroy(end));
+    cudaFree(dk); cudaFree(d_page); cudaFree(d_off);
+    cudaFree(dmin); cudaFree(dmax);
+}
+
 }  // namespace
 
 int main() {
@@ -369,6 +594,23 @@ int main() {
     check_update_appended("update: append lands on a page boundary",
                           8, 16, 4, 64, {{16, 16, {5, 2, 7}}, {1, 9, {1, 4}}});
 
+    // The explicit-descriptor write path (Quest's decode fires go through it).
+    // Fire-by-fire merge must land where a full recompute of the finished pages
+    // would, starting from envelopes left dirty by a previous tenant.
+    check_merge_written("merge/explicit: prefill 20 + 20 decodes",
+                        10, 16, 4, 64, {6, 1, 9}, 20, 20, false);
+    check_merge_written("merge/explicit: page-aligned prefill + decodes",
+                        8, 16, 8, 128, {3, 0, 5}, 32, 9, false);
+    check_merge_written("merge/explicit: masked row must not touch its page",
+                        10, 16, 4, 64, {2, 7, 4}, 17, 20, true);
+    // Wider than `kEnvelopeFuseMaxTokens`, so the prefill fire takes the
+    // two-launch reset/merge path while its decode fires take the fused one.
+    // Both must land on the same envelopes.
+    check_merge_written("merge/explicit: wide fire (two-launch path)",
+                        20, 16, 4, 64,
+                        {13, 2, 17, 5, 0, 11, 8, 1, 15, 6, 3, 19, 9, 4},
+                        200, 10, false);
+
     check_dot_golden_vector();
     check_dot("dot: GQA 16q/8kv, P_MAX 32", 16, 8, 128, 32, 20);
     check_dot("dot: MHA 8/8", 8, 8, 128, 16, 16);
@@ -376,5 +618,13 @@ int main() {
 
     std::printf(g_fail ? "\nENVELOPE FAILED (%d)\n" : "\nALL PASS (0 failures)\n",
                 g_fail);
+
+    if (std::getenv("PIE_ENVELOPE_MERGE_BENCH") != nullptr) {
+        std::printf("\nenvelope maintenance on the explicit write path"
+                    " (nkvh=8 hd=128, 28 layers):\n");
+        for (int n : {1, 2, 4, 8, 16, 32, 64, 128, 272, 2048})
+            bench_merge_written(n, 8, 128, 28);
+    }
+
     return g_fail ? 1 : 0;
 }

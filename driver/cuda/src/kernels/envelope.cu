@@ -182,7 +182,235 @@ __global__ void envelope_seed_empty_kernel(
     env_max[i] = -INFINITY;
 }
 
+// Single-launch form of the reset+merge pair below, for fires narrow enough
+// that the launch overhead of the two-kernel version dominates -- which is
+// every decode fire, and therefore the overwhelming majority of calls. Two
+// launches cost ~4.6 us per layer on an L40S regardless of how few tokens they
+// carry, so at 28 layers the pair is ~129 us of pure dispatch on the critical
+// path of every step; this halves that.
+//
+// It removes the atomics too. Blocks elect ONE writer per (page, kv_head) --
+// the first valid token naming that page -- so that block owns the page's
+// envelope outright and can gather its own fire's keys into registers and
+// store once. Sole ownership is also what makes the reset safe to fold in:
+// the race the two-kernel split exists to avoid (a reset erasing a key merged
+// by another token of the same fire) cannot arise when the same block does
+// both, in order, for every token on the page.
+//
+// Thread 0 would serialise the O(num_tokens) scans, which shows up as soon as
+// a fire carries more than a handful of tokens, so the scan is strided across
+// the block and the gathered list is built with shared-memory atomics. Order
+// within the list is irrelevant -- it feeds a min/max.
+constexpr int kEnvelopeFuseMaxTokens = 128;
+
+__global__ void envelope_merge_written_fused_kernel(
+    const __nv_bfloat16* __restrict__ k_curr,
+    const std::uint32_t* __restrict__ w_page,
+    const std::uint32_t* __restrict__ w_off,
+    const std::uint8_t* __restrict__ row_valid,
+    float* __restrict__ env_min,
+    float* __restrict__ env_max,
+    int num_tokens,
+    int num_kv_heads,
+    int head_dim)
+{
+    __shared__ int s_mine[kEnvelopeFuseMaxTokens];
+    __shared__ int s_count;
+    __shared__ int s_started;
+    __shared__ int s_taken;
+
+    const int token = blockIdx.x;
+    const int kh = blockIdx.y;
+    if (token >= num_tokens) return;
+
+    if (threadIdx.x == 0) {
+        s_count = 0;
+        s_started = 0;
+        s_taken = 0;
+    }
+    __syncthreads();
+
+    // Uniform across the block: it depends only on blockIdx.
+    if (row_valid != nullptr && row_valid[token] == 0) return;
+    const std::uint32_t page = w_page[token];
+
+    for (int t = threadIdx.x; t < num_tokens; t += blockDim.x) {
+        if (row_valid != nullptr && row_valid[t] == 0) continue;
+        if (w_page[t] != page) continue;
+        if (t < token) {
+            atomicOr(&s_taken, 1);  // an earlier token owns this page
+            continue;
+        }
+        s_mine[atomicAdd(&s_count, 1)] = t;
+        if (w_off[t] == 0u) atomicOr(&s_started, 1);
+    }
+    __syncthreads();
+    if (s_taken != 0) return;
+
+    const long env_base =
+        (static_cast<long>(page) * num_kv_heads + kh) * head_dim;
+    const int count = s_count;
+    const bool started = s_started != 0;
+
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float lo = CUDART_INF_F;
+        float hi = -CUDART_INF_F;
+        for (int i = 0; i < count; ++i) {
+            const long src =
+                (static_cast<long>(s_mine[i]) * num_kv_heads + kh) * head_dim;
+            const float v = __bfloat162float(k_curr[src + d]);
+            lo = fminf(lo, v);
+            hi = fmaxf(hi, v);
+        }
+        // Started in this fire => the page was recycled, so the previous
+        // tenant's bound is dead and must be replaced, not widened.
+        if (!started) {
+            lo = fminf(lo, env_min[env_base + d]);
+            hi = fmaxf(hi, env_max[env_base + d]);
+        }
+        env_min[env_base + d] = lo;
+        env_max[env_base + d] = hi;
+    }
+}
+
+// Float min/max via CAS on the bit pattern. IEEE-754 floats compare in the same
+// order as their sign-magnitude bits, and the only values in play here are real
+// keys plus the `+inf`/`-inf` seed, so the ordinary `fminf`/`fmaxf` comparison
+// inside the loop is what decides; the CAS only serialises the update.
+__device__ inline void envelope_atomic_min(float* addr, float value) {
+    int* as_int = reinterpret_cast<int*>(addr);
+    int old = *as_int;
+    int assumed;
+    do {
+        if (__int_as_float(old) <= value) return;
+        assumed = old;
+        old = atomicCAS(as_int, assumed, __float_as_int(value));
+    } while (assumed != old);
+}
+
+__device__ inline void envelope_atomic_max(float* addr, float value) {
+    int* as_int = reinterpret_cast<int*>(addr);
+    int old = *as_int;
+    int assumed;
+    do {
+        if (__int_as_float(old) >= value) return;
+        assumed = old;
+        old = atomicCAS(as_int, assumed, __float_as_int(value));
+    } while (assumed != old);
+}
+
+// Companion to the merge below: a page whose FIRST cell is being written in
+// this fire is being started from scratch, so whatever its envelope holds
+// belongs to content that is now dead (the page was recycled through the
+// pool). Reset it to empty before the merge widens it, or the bound would
+// accumulate every request that ever used the page and converge on "keep
+// everything". Pages entered at a non-zero offset are being continued and must
+// keep what they have.
+//
+// A separate launch, not a branch inside the merge: two tokens of the same
+// fire can land on one page, and a reset racing a merge would erase a key.
+__global__ void envelope_reset_started_pages_kernel(
+    const std::uint32_t* __restrict__ w_page,
+    const std::uint32_t* __restrict__ w_off,
+    const std::uint8_t* __restrict__ row_valid,
+    float* __restrict__ env_min,
+    float* __restrict__ env_max,
+    int num_tokens,
+    int num_kv_heads,
+    int head_dim)
+{
+    const int token = blockIdx.x;
+    const int kh = blockIdx.y;
+    if (token >= num_tokens) return;
+    if (row_valid != nullptr && row_valid[token] == 0) return;
+    if (w_off[token] != 0u) return;
+
+    const long env_base =
+        (static_cast<long>(w_page[token]) * num_kv_heads + kh) * head_dim;
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        env_min[env_base + d] = CUDART_INF_F;
+        env_max[env_base + d] = -CUDART_INF_F;
+    }
+}
+
+// Envelope maintenance for the EXPLICIT-descriptor KV write, where the program
+// names the (physical page, offset) for every token instead of letting the
+// kernel derive it from the CSR. There is no page list to walk and no live
+// length to recompute from, so this MERGES each written key into the page's
+// existing envelope rather than recomputing the page.
+//
+// Merging is the right operation here, not a shortcut:
+//   * for the append-only case it is exactly equal to a full recompute,
+//     because the seed is the empty envelope (+inf, -inf), the reset pass
+//     above restores that seed whenever a page is started, and every key that
+//     has ever been written to the page since then has passed through here;
+//   * for the beam fork/freeze case -- the reason the explicit path exists at
+//     all -- a cell can be REWRITTEN mid-page, and a recompute keyed on the
+//     descriptor's offset would shrink the envelope to a prefix and could drop
+//     a page that still holds a live key. Merging only ever widens, so the
+//     bound stays an upper bound, which is the direction Quest must fail in.
+//
+// One block per (token, kv_head); threads stride over head_dim.
+__global__ void envelope_merge_written_kernel(
+    const __nv_bfloat16* __restrict__ k_curr,
+    const std::uint32_t* __restrict__ w_page,
+    const std::uint8_t* __restrict__ row_valid,
+    float* __restrict__ env_min,
+    float* __restrict__ env_max,
+    int num_tokens,
+    int num_kv_heads,
+    int head_dim)
+{
+    const int token = blockIdx.x;
+    const int kh = blockIdx.y;
+    if (token >= num_tokens) return;
+    if (row_valid != nullptr && row_valid[token] == 0) return;
+
+    const long src_base =
+        (static_cast<long>(token) * num_kv_heads + kh) * head_dim;
+    const long env_base =
+        (static_cast<long>(w_page[token]) * num_kv_heads + kh) * head_dim;
+
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        const float v = __bfloat162float(k_curr[src_base + d]);
+        envelope_atomic_min(&env_min[env_base + d], v);
+        envelope_atomic_max(&env_max[env_base + d], v);
+    }
+}
+
 }  // namespace
+
+void launch_envelope_merge_written_bf16(
+    const std::uint16_t* k_curr,
+    const std::uint32_t* w_page,
+    const std::uint32_t* w_off,
+    const std::uint8_t* row_valid,
+    float* env_min,
+    float* env_max,
+    int num_tokens,
+    int num_kv_heads,
+    int head_dim,
+    cudaStream_t stream)
+{
+    if (num_tokens <= 0 || num_kv_heads <= 0 || head_dim <= 0) return;
+    const dim3 grid(static_cast<unsigned>(num_tokens),
+                    static_cast<unsigned>(num_kv_heads));
+    const int threads = head_dim < 256 ? head_dim : 256;
+    if (num_tokens <= kEnvelopeFuseMaxTokens) {
+        envelope_merge_written_fused_kernel<<<grid, threads, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(k_curr),
+            w_page, w_off, row_valid, env_min, env_max,
+            num_tokens, num_kv_heads, head_dim);
+        return;
+    }
+    envelope_reset_started_pages_kernel<<<grid, threads, 0, stream>>>(
+        w_page, w_off, row_valid, env_min, env_max,
+        num_tokens, num_kv_heads, head_dim);
+    envelope_merge_written_kernel<<<grid, threads, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(k_curr),
+        w_page, row_valid, env_min, env_max,
+        num_tokens, num_kv_heads, head_dim);
+}
 
 void launch_envelope_seed_empty_f32(
     float* env_min,
