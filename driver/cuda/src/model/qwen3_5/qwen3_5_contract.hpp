@@ -8,6 +8,8 @@
 
 #include "model/contract.hpp"
 
+#include "model/qwen3_5/qwen3_5_moe.hpp"
+
 namespace pie_cuda_driver::model {
 namespace contract_detail {
 
@@ -15,11 +17,12 @@ namespace contract_detail {
 /// forward consumes. The HF Qwen3-MoE source layout is, per expert `e`,
 /// `mlp.experts.{e}.gate_proj.weight` / `.up_proj.weight` as `[I, H]` and
 /// `.down_proj.weight` as `[H, I]`. Output:
-///   `mlp.experts.gate_up_proj` -> `[E, 2I, H]`, rows `[0,I)` gate, `[I,2I)` up
+///   `mlp.experts.gate_up_proj` -> `[E, 2I, H]`; `gate_second` selects which
+///   half leads, matching what the bound driver's activation reads.
 ///   `mlp.experts.down_proj`    -> `[E, H, I]`
 /// Built as an expression over the sources, so no GPU-side duplicate exists.
 /// A no-op when the checkpoint already ships the fused tensors.
-inline void qwen_moe_expert_stacks(ContractBuilder& b) {
+inline void qwen_moe_expert_stacks(ContractBuilder& b, bool gate_second) {
     if (b.target().tp_size != 1) {
         // TP>1 per-expert sharding is not wired; the bind then fails loudly
         // on the missing fused tensor rather than loading silently wrong.
@@ -84,10 +87,13 @@ inline void qwen_moe_expert_stacks(ContractBuilder& b) {
             }
             // One expert slab is gate over up; the leading 1 makes the
             // per-expert concatenation a stack.
+            const Node gate_src = b.contract().src(std::string(g->name));
+            const Node up_src = b.contract().src(std::string(u->name));
             gate_up_parts.push_back(b.contract().reshape(
-                b.contract().cat({b.contract().src(std::string(g->name)),
-                                b.contract().src(std::string(u->name))},
-                               0),
+                b.contract().cat(gate_second
+                                     ? std::vector<Node>{up_src, gate_src}
+                                     : std::vector<Node>{gate_src, up_src},
+                                 0),
                 {1, 2 * inter, hidden}));
             down_parts.push_back(b.contract().reshape(
                 b.contract().src(std::string(d->name)), {1, hidden, inter}));
@@ -119,8 +125,13 @@ inline void author_qwen3_5_contract(ContractBuilder& b) {
 /// reads q/k/v separately.
 inline void author_qwen3_5_moe_contract(ContractBuilder& b) {
     b.allow_bf16_runtime_quant();
-    b.fused_moe_gate_up_tp_slices();
-    contract_detail::qwen_moe_expert_stacks(b);
+    // The MoE decode runs through flashinfer's CUTLASS grouped GEMM, which
+    // reads fc1's output as [linear|gate]; the checkpoint stores [gate|up].
+    // Both the pre-fused and the per-expert stacking paths publish in the
+    // order the bound driver expects.
+    const bool gate_second = qwen35_moe_gate_up_swapped();
+    b.fused_moe_gate_up_tp_slices(gate_second);
+    contract_detail::qwen_moe_expert_stacks(b, gate_second);
     b.publish_remaining();
 }
 }  // namespace pie_cuda_driver::model

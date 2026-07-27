@@ -656,8 +656,15 @@ public:
     // -- shared passes -------------------------------------------------------
 
     /// Re-join each rank's gate and up bands of a pre-fused expert tensor.
-    void fused_moe_gate_up_tp_slices() {
-        if (target_.tp_size <= 1) {
+    /// `gate_second` publishes each expert's halves as `[up|gate]` instead of
+    /// the checkpoint's `[gate|up]`. That is the order flashinfer's CUTLASS
+    /// MoE reads fc1's output in, and declaring it here makes the reorder a
+    /// load-time view of the source rather than a runtime pass that mutates a
+    /// resident weight. It applies with or without sharding, so unlike the
+    /// slicing this runs at tp_size == 1 too.
+    void fused_moe_gate_up_tp_slices(bool gate_second = false) {
+        const bool sharding = target_.tp_size > 1;
+        if (!sharding && !gate_second) {
             return;
         }
         for (const SourceTensor& raw : tensors_) {
@@ -681,11 +688,25 @@ public:
             // Gate rows [0, I) and up rows [I, 2I) are sharded independently
             // and re-joined, so the local halves stay adjacent per expert.
             const Node src = contract_.src(std::string(raw.name));
-            auto [gate, local_i] = band(src, 1, 0, full_i);
-            auto [up, up_extent] = band(src, 1, full_i, full_i);
-            (void)up_extent;
+            // Gate rows [0, I) and up rows [I, 2I) are taken separately so
+            // that a shard splits each half independently and the local
+            // halves stay adjacent per expert. Build only the nodes that are
+            // used: an unreferenced slice still enters the DAG.
+            const std::pair<Node, std::int64_t> gate_part =
+                sharding ? band(src, 1, 0, full_i)
+                         : std::pair<Node, std::int64_t>{
+                               contract_.slice(src, 1, 0, full_i), full_i};
+            const std::pair<Node, std::int64_t> up_part =
+                sharding ? band(src, 1, full_i, full_i)
+                         : std::pair<Node, std::int64_t>{
+                               contract_.slice(src, 1, full_i, full_i), full_i};
+            const Node gate = gate_part.first;
+            const Node up = up_part.first;
+            const std::int64_t local_i = gate_part.second;
             push_expr(output_name(raw.name), raw, {experts, 2 * local_i, hidden},
-                      contract_.cat(std::vector<Node>{gate, up}, 1));
+                      contract_.cat(gate_second ? std::vector<Node>{up, gate}
+                                                : std::vector<Node>{gate, up},
+                                    1));
         }
     }
 

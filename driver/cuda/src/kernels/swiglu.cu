@@ -239,37 +239,6 @@ __global__ void chunked_swiglu_bf16_strided_kernel(
 
 }  // namespace
 
-namespace {
-
-__global__ void swap_gate_up_halves_bf16_kernel(
-    __nv_bfloat16* __restrict__ w, int inter_size, int hidden)
-{
-    // One block per (expert, row-in-first-half); swap it with its partner.
-    const long long expert = blockIdx.y;
-    const int r = blockIdx.x;
-    if (r >= inter_size) return;
-    __nv_bfloat16* base =
-        w + expert * (2LL * inter_size * hidden) + (long long)r * hidden;
-    __nv_bfloat16* partner = base + (long long)inter_size * hidden;
-    for (int h = threadIdx.x; h < hidden; h += blockDim.x) {
-        const __nv_bfloat16 t = base[h];
-        base[h] = partner[h];
-        partner[h] = t;
-    }
-}
-
-}  // namespace
-
-void launch_swap_gate_up_halves_bf16(
-    void* weights, int num_experts, int inter_size, int hidden,
-    cudaStream_t stream)
-{
-    if (num_experts <= 0 || inter_size <= 0 || hidden <= 0) return;
-    dim3 grid(inter_size, num_experts);
-    swap_gate_up_halves_bf16_kernel<<<grid, 256, 0, stream>>>(
-        static_cast<__nv_bfloat16*>(weights), inter_size, hidden);
-}
-
 void launch_chunked_swiglu_bf16(
     const void* packed, void* y, int N, int I, cudaStream_t stream,
     bool gate_second)

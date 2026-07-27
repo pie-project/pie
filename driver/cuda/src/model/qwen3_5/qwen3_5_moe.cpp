@@ -379,18 +379,6 @@ Qwen3_5MoeWeights bind_qwen3_5_moe(const LoadedModel& engine) {
         // combined routed+shared partial sum.
         Lw.moe_router       = &must(engine, lp + "mlp.gate.weight");
         Lw.moe_gate_up_proj = &must(engine, lp + "mlp.experts.gate_up_proj");
-        // flashinfer's CUTLASS MoE reads fc1's output as [linear|gate];
-        // HuggingFace stores [gate|up]. Reorder the resident weight once
-        // here rather than duplicating a tensor this large, and tell the
-        // swiglu kernels which order they are reading.
-        if (qwen35_moe_gate_up_swapped()) {
-            const auto& t = *Lw.moe_gate_up_proj;
-            const int inter = static_cast<int>(t.shape()[1]) / 2;
-            const int hid = static_cast<int>(t.shape()[2]);
-            kernels::launch_swap_gate_up_halves_bf16(
-                const_cast<void*>(t.data()),
-                static_cast<int>(t.shape()[0]), inter, hid, /*stream=*/nullptr);
-        }
         Lw.moe_down_proj    = &must(engine, lp + "mlp.experts.down_proj");
         if (has_shared_expert) {
             Lw.shared_gate_proj = &must(engine, lp + "mlp.shared_expert.gate_proj.weight");

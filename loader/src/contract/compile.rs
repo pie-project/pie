@@ -351,6 +351,14 @@ fn fold_once(items: &[Piece]) -> Option<Vec<Piece>> {
             // a scatter, and nothing below this layer can execute one. See
             // `spec.md` §3.3.
             && strides.1 == head.elements()
+            // The source must advance forward. A plan addresses its source as
+            // a span starting at `file_offset`, so a descending progression
+            // would read below that anchor. Such a run is a perfectly good
+            // rectangle — it just is not one this ABI can name, and the pieces
+            // are individually copyable, so leave them unfolded. `Cat` in
+            // descending source order (e.g. re-joining a fused gate/up weight
+            // as `[up | gate]`) is the case that reaches this.
+            && strides.0 >= 0
         {
             (src_stride, dst_stride) = strides;
             end = at + 2;
