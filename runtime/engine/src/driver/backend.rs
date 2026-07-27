@@ -141,7 +141,54 @@ impl DriverBackend {
         }
     }
 
+    /// The backend whose kernels this driver wants the host to generate, or
+    /// `None` when it generates its own (or needs none). The variant already
+    /// says which native backend it is, so this needs no capability round-trip.
+    fn codegen_backend(&self) -> Option<&'static str> {
+        match self {
+            #[cfg(feature = "driver-cuda")]
+            Self::Cuda(_) => Some("cuda"),
+            #[cfg(feature = "driver-metal")]
+            Self::Metal(_) => Some("metal"),
+            // The dummy driver interprets PTIR, and a remote driver's own
+            // backend does its generation on the far side.
+            _ => None,
+        }
+    }
+
     pub fn register_program(&mut self, desc: &ProgramRegistration) -> Result<u64> {
+        // Attach host-generated kernels, if this driver reads them and the
+        // program is still in the cache. Generation is memoised per program per
+        // backend, so a re-registration costs a lookup.
+        let owned;
+        let desc = match self
+            .codegen_backend()
+            .filter(|_| desc.emitted_kernels.is_empty())
+            .and_then(|backend| {
+                crate::pipeline::program::lookup(desc.program_hash)
+                    .and_then(|program| program.emitted(backend))
+            }) {
+            Some(emitted) => {
+                owned = ProgramRegistration {
+                    emitter_version: emitted.emitter_version,
+                    emitted_kernels: emitted
+                        .kernels
+                        .iter()
+                        .map(|kernel| pie_driver_abi::EmittedKernel {
+                            kind: kernel.kind,
+                            stage_index: kernel.stage_index,
+                            region_index: kernel.region_index,
+                            entry_name: kernel.entry_name.clone(),
+                            source: kernel.source.clone(),
+                            error: kernel.error.clone(),
+                        })
+                        .collect(),
+                    ..desc.clone()
+                };
+                &owned
+            }
+            None => desc,
+        };
         match self {
             Self::Dummy(driver) => driver.register_program(desc),
             #[cfg(feature = "driver-cuda")]

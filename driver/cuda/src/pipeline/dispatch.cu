@@ -52,6 +52,57 @@
 
 namespace pie_cuda_driver::pipeline {
 
+namespace {
+
+// A (stage, region) index over the host's emitted kernel table.
+//
+// The host runs the same emitter this driver carries
+// (`compiler/codegen/src/cuda/`), so where it supplied source we compile that
+// instead of regenerating it. An entry whose `source` is empty is a *recorded*
+// failure, not an omission -- the host is saying it could not emit that region
+// -- so it is left absent here and the driver's own path decides what to do.
+class HostEmittedKernels {
+public:
+    explicit HostEmittedKernels(PieEmittedKernelSlice slice) {
+        if (slice.ptr == nullptr) return;
+        for (std::size_t i = 0; i < slice.len; ++i) {
+            const PieEmittedKernel& kernel = slice.ptr[i];
+            if (kernel.kind != PIE_KERNEL_FUSED || kernel.source.len == 0) {
+                continue;
+            }
+            sources_.emplace(
+                Key{kernel.stage_index, kernel.region_index},
+                std::string(
+                    reinterpret_cast<const char*>(kernel.source.ptr),
+                    kernel.source.len));
+        }
+    }
+
+    static const std::string* lookup(
+        void* context, std::size_t stage_index, std::size_t region_index) {
+        auto* self = static_cast<HostEmittedKernels*>(context);
+        const auto found = self->sources_.find(Key{
+            static_cast<std::uint32_t>(stage_index),
+            static_cast<std::uint32_t>(region_index)});
+        return found == self->sources_.end() ? nullptr : &found->second;
+    }
+
+private:
+    struct Key {
+        std::uint32_t stage;
+        std::uint32_t region;
+        bool operator==(const Key&) const = default;
+    };
+    struct KeyHash {
+        std::size_t operator()(const Key& key) const {
+            return (static_cast<std::size_t>(key.stage) << 32) ^ key.region;
+        }
+    };
+    std::unordered_map<Key, std::string, KeyHash> sources_;
+};
+
+}  // namespace
+
 // Shared pure-host PTIR decode model (trace/op-table/container/bound/
 // fire-geometry) now lives in pie_native::ptir (driver/common); bring it into
 // scope so the CUDA-side tier-0/1 code below can use it unqualified.
@@ -2810,6 +2861,7 @@ void Dispatch::reserve_channel_slots(std::uint32_t min_slots) {
 int Dispatch::register_program(std::uint64_t program_hash,
                                    pie_native::ByteSlice canonical,
                                    pie_native::ByteSlice sidecar,
+                                   PieEmittedKernelSlice emitted,
                                    std::string* err) {
     if (err) err->clear();
     std::string derr;
@@ -2971,11 +3023,17 @@ int Dispatch::register_program(std::uint64_t program_hash,
     generated::CompileFailureKind compile_failure =
         generated::CompileFailureKind::None;
     std::string compile_error;
+    // Index the host's kernels by (stage, region) so the compiler can look one
+    // up without rescanning; an empty table leaves every lookup null and the
+    // in-driver emitter runs exactly as before.
+    HostEmittedKernels host_kernels(emitted);
     const auto compiled_program = impl_->fused_modules.compile_program(
             program_hash,
             *plans,
             compile_failure,
-            compile_error);
+            compile_error,
+            HostEmittedKernels::lookup,
+            &host_kernels);
     if (compiled_program == nullptr) {
         if (err) *err = std::move(compile_error);
         return compile_failure == generated::CompileFailureKind::Deterministic

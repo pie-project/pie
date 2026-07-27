@@ -152,9 +152,15 @@ class Dispatch {
     // any registration traffic) so grow() never fires mid-ramp.
     void reserve_channel_slots(std::uint32_t min_slots);
 
+    // `emitted` is the host's generated kernels for this program, or an empty
+    // slice when the host did not generate any (it only does so for a driver
+    // that advertised `codegen_backend`). Where present it is preferred over
+    // the in-driver emitter; the two are pinned byte-for-byte by
+    // `compiler/tests/golden-cuda/` until the in-driver copy is deleted.
     int register_program(std::uint64_t program_hash,
                          pie_native::ByteSlice canonical,
                          pie_native::ByteSlice sidecar,
+                         PieEmittedKernelSlice emitted,
                          std::string* err);
 
     int register_channel(const PieChannelDesc& channel,

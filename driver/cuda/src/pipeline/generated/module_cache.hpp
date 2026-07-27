@@ -88,11 +88,20 @@ class ModuleCache {
     explicit ModuleCache(std::filesystem::path disk_cache_directory)
         : disk_cache_directory_(std::move(disk_cache_directory)) {}
 
+    // Source the host generated for one region, or nullptr when the host did
+    // not supply this program's kernels. Indexed by (stage, region) because
+    // that is the identity the host emits under; see
+    // `compiler/codegen/src/program.rs`.
+    using HostSource = const std::string* (*)(
+        void* context, std::size_t stage_index, std::size_t region_index);
+
     std::shared_ptr<const FusedProgramExecutable> compile_program(
         std::uint64_t program_hash,
         const std::vector<pie_native::ptir::plan::StagePlan>& plans,
         CompileFailureKind& failure_kind,
-        std::string& error) {
+        std::string& error,
+        HostSource host_source = nullptr,
+        void* host_context = nullptr) {
         std::lock_guard<std::mutex> lock(mutex_);
         failure_kind = CompileFailureKind::None;
         error.clear();
@@ -147,7 +156,9 @@ class ModuleCache {
         std::vector<std::pair<std::string, std::shared_ptr<FusedStageExecutable>>>
             staged_entries;
         staged_entries.reserve(plans.size());
+        std::size_t stage_index = 0;
         for (const auto& plan : plans) {
+            const std::size_t this_stage = stage_index++;
             const std::string key = stage_key(
                 plan,
                 properties.major,
@@ -209,8 +220,22 @@ class ModuleCache {
                     }
                 }
                 if (executable == nullptr) {
-                    GeneratedKernelSource source =
-                        emit_fused_region_cuda(entry, plan, region);
+                    // The host runs the same emitter (`compiler/codegen`), so
+                    // prefer what it shipped and only fall back to the
+                    // in-driver copy while both exist. The two are pinned
+                    // byte-for-byte by `compiler/tests/golden-cuda/`.
+                    GeneratedKernelSource source;
+                    const std::string* supplied =
+                        host_source != nullptr
+                            ? host_source(host_context, this_stage, region_index)
+                            : nullptr;
+                    if (supplied != nullptr) {
+                        source.ok = true;
+                        source.entry_name = entry;
+                        source.source = *supplied;
+                    } else {
+                        source = emit_fused_region_cuda(entry, plan, region);
+                    }
                     if (!source.ok) {
                         failure_kind = CompileFailureKind::Deterministic;
                         error = source.error;

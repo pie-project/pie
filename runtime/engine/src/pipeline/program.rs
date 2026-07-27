@@ -240,7 +240,6 @@ impl Registry {
     }
 
     /// Probe by identity hash (a hit bumps LRU recency).
-    #[cfg(test)]
     pub fn lookup(&mut self, hash: u64) -> Option<Arc<RegisteredProgram>> {
         self.inner.get(&hash).cloned()
     }
@@ -311,7 +310,6 @@ pub fn register(
 /// Probe the process-wide registry by identity hash. Only the `#[cfg(test)]`
 /// `instance::instantiate` path probes by hash; production carries the
 /// `Arc<RegisteredProgram>` from `register`.
-#[cfg(test)]
 pub fn lookup(hash: u64) -> Option<Arc<RegisteredProgram>> {
     global().lookup(hash)
 }
