@@ -1,5 +1,6 @@
 #include "kernels/moe_dispatch.hpp"
 
+#include <cstdint>
 #include <cuda_bf16.h>
 #include <mma.h>
 
@@ -664,8 +665,11 @@ __global__ void moe_align_decode_kernel(
     std::int32_t* counts = align_smem;
     std::int32_t* offsets = counts + num_experts;
     std::int32_t* fill = offsets + num_experts + 1;
+    std::int32_t* warp_totals = fill + num_experts;
+    std::int32_t* block_base = warp_totals + 32;
 
     const int aligned_rows = max_blocks * block_size;
+    if (threadIdx.x == 0) *block_base = 0;
     for (int i = threadIdx.x; i < num_experts; i += blockDim.x) {
         counts[i] = 0;
         fill[i] = 0;
@@ -686,17 +690,50 @@ __global__ void moe_align_decode_kernel(
     }
     __syncthreads();
 
-    if (threadIdx.x == 0) {
-        int running = 0;
-        for (int e = 0; e < num_experts; ++e) {
-            offsets[e] = running;
-            const int c = counts[e];
-            running += ((c + block_size - 1) / block_size) * block_size;
+    // Block-wide exclusive scan of the per-expert padded block counts.
+    // Running this serially on thread 0 cost ~15 us per layer -- 256
+    // dependent shared-memory reads and integer divides, x40 layers.
+    {
+        const int lane = threadIdx.x & 31;
+        const int warp = static_cast<int>(threadIdx.x) >> 5;
+        const int num_warps = static_cast<int>(blockDim.x) >> 5;
+        for (int base = 0; base < num_experts; base += static_cast<int>(blockDim.x)) {
+            const int e = base + static_cast<int>(threadIdx.x);
+            int padded = 0;
+            if (e < num_experts) {
+                const int c = counts[e];
+                padded = ((c + block_size - 1) / block_size) * block_size;
+            }
+            int value = padded;
+            for (int off = 1; off < 32; off <<= 1) {
+                const int n = __shfl_up_sync(0xffffffffu, value, off);
+                if (lane >= off) value += n;
+            }
+            if (lane == 31) warp_totals[warp] = value;
+            __syncthreads();
+            if (warp == 0) {
+                int t = (lane < num_warps) ? warp_totals[lane] : 0;
+                for (int off = 1; off < 32; off <<= 1) {
+                    const int n = __shfl_up_sync(0xffffffffu, t, off);
+                    if (lane >= off) t += n;
+                }
+                if (lane < num_warps) warp_totals[lane] = t;
+            }
+            __syncthreads();
+            const int warp_prefix = (warp == 0) ? 0 : warp_totals[warp - 1];
+            if (e < num_experts) {
+                // Exclusive within this chunk, plus everything before it.
+                offsets[e] = *block_base + warp_prefix + value - padded;
+            }
+            __syncthreads();
+            if (threadIdx.x == 0) {
+                *block_base += warp_totals[num_warps - 1];
+            }
+            __syncthreads();
         }
-        offsets[num_experts] = running;
+        if (threadIdx.x == 0) offsets[num_experts] = *block_base;
     }
     __syncthreads();
-
     for (int e = threadIdx.x; e < num_experts; e += blockDim.x) {
         const int begin = offsets[e];
         const int end = offsets[e + 1];
@@ -772,6 +809,34 @@ __global__ void moe_bucket_exact_kernel(
     }
 }
 
+// One bf16 per thread makes every warp issue a 64-byte store, half of a
+// cache line. Moving 8 (a uint4) per thread turns that into a full 512-byte
+// contiguous store per warp.
+constexpr int kMoeVecWidth = 8;
+
+__global__ void gather_moe_aligned_inputs_bf16_vec_kernel(
+    const __nv_bfloat16* __restrict__ norm_x,
+    const std::int32_t* __restrict__ sorted_route_ids,
+    __nv_bfloat16* __restrict__ aligned_in,
+    int num_routes,
+    int aligned_rows,
+    int top_k,
+    int hidden_vec)
+{
+    const int hv = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row = blockIdx.y;
+    if (hv >= hidden_vec || row >= aligned_rows) return;
+    const int route = sorted_route_ids[row];
+    uint4 v = make_uint4(0u, 0u, 0u, 0u);
+    if (route < num_routes) {
+        const int token = route / top_k;
+        v = reinterpret_cast<const uint4*>(norm_x)[
+            static_cast<long long>(token) * hidden_vec + hv];
+    }
+    reinterpret_cast<uint4*>(aligned_in)[
+        static_cast<long long>(row) * hidden_vec + hv] = v;
+}
+
 __global__ void gather_moe_aligned_inputs_bf16_kernel(
     const __nv_bfloat16* __restrict__ norm_x,
     const std::int32_t* __restrict__ sorted_route_ids,
@@ -829,6 +894,25 @@ __global__ void build_moe_ptrs_aligned_bf16_kernel(
     c_dn_ptrs[b] = aligned_out + row * H;
 }
 
+__global__ void reorder_moe_aligned_output_bf16_vec_kernel(
+    const __nv_bfloat16* __restrict__ aligned_out,
+    const std::int32_t* __restrict__ sorted_route_ids,
+    __nv_bfloat16* __restrict__ route_out,
+    int num_routes,
+    int aligned_rows,
+    int hidden_vec)
+{
+    const int hv = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row = blockIdx.y;
+    if (hv >= hidden_vec || row >= aligned_rows) return;
+    const int route = sorted_route_ids[row];
+    if (route >= num_routes) return;
+    reinterpret_cast<uint4*>(route_out)[
+        static_cast<long long>(route) * hidden_vec + hv] =
+        reinterpret_cast<const uint4*>(aligned_out)[
+            static_cast<long long>(row) * hidden_vec + hv];
+}
+
 __global__ void reorder_moe_aligned_output_bf16_kernel(
     const __nv_bfloat16* __restrict__ aligned_out,
     const std::int32_t* __restrict__ sorted_route_ids,
@@ -864,8 +948,10 @@ void launch_moe_align_decode(
         return;
     }
     constexpr int BS = 1024;
+    // counts + offsets(+1) + fill, then 32 warp partials and one running base
+    // for the block-wide scan.
     const std::size_t smem =
-        static_cast<std::size_t>(3 * num_experts + 1) * sizeof(std::int32_t);
+        static_cast<std::size_t>(3 * num_experts + 1 + 33) * sizeof(std::int32_t);
     moe_align_decode_kernel<<<1, BS, smem, stream>>>(
         topk_idx, sorted_route_ids, expert_ids, route_to_aligned_row,
         num_routes, num_experts, block_size, max_blocks);
@@ -901,11 +987,23 @@ void launch_gather_moe_aligned_inputs_bf16(
 {
     if (aligned_rows <= 0 || hidden <= 0) return;
     constexpr int BS = 256;
+    const auto* src = static_cast<const __nv_bfloat16*>(norm_x);
+    auto* dst = static_cast<__nv_bfloat16*>(aligned_in);
+    const bool vectorizable =
+        (hidden % kMoeVecWidth) == 0 &&
+        (reinterpret_cast<std::uintptr_t>(src) % 16) == 0 &&
+        (reinterpret_cast<std::uintptr_t>(dst) % 16) == 0;
+    if (vectorizable) {
+        const int hidden_vec = hidden / kMoeVecWidth;
+        const dim3 grid((hidden_vec + BS - 1) / BS, aligned_rows);
+        gather_moe_aligned_inputs_bf16_vec_kernel<<<grid, BS, 0, stream>>>(
+            src, sorted_route_ids, dst,
+            num_routes, aligned_rows, top_k, hidden_vec);
+        return;
+    }
     const dim3 grid((hidden + BS - 1) / BS, aligned_rows);
     gather_moe_aligned_inputs_bf16_kernel<<<grid, BS, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(norm_x),
-        sorted_route_ids,
-        static_cast<__nv_bfloat16*>(aligned_in),
+        src, sorted_route_ids, dst,
         num_routes, aligned_rows, top_k, hidden);
 }
 
@@ -960,12 +1058,22 @@ void launch_reorder_moe_aligned_output_bf16(
 {
     if (aligned_rows <= 0 || hidden <= 0) return;
     constexpr int BS = 256;
+    const auto* src = static_cast<const __nv_bfloat16*>(aligned_out);
+    auto* dst = static_cast<__nv_bfloat16*>(route_out);
+    const bool vectorizable =
+        (hidden % kMoeVecWidth) == 0 &&
+        (reinterpret_cast<std::uintptr_t>(src) % 16) == 0 &&
+        (reinterpret_cast<std::uintptr_t>(dst) % 16) == 0;
+    if (vectorizable) {
+        const int hidden_vec = hidden / kMoeVecWidth;
+        const dim3 grid((hidden_vec + BS - 1) / BS, aligned_rows);
+        reorder_moe_aligned_output_bf16_vec_kernel<<<grid, BS, 0, stream>>>(
+            src, sorted_route_ids, dst, num_routes, aligned_rows, hidden_vec);
+        return;
+    }
     const dim3 grid((hidden + BS - 1) / BS, aligned_rows);
     reorder_moe_aligned_output_bf16_kernel<<<grid, BS, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(aligned_out),
-        sorted_route_ids,
-        static_cast<__nv_bfloat16*>(route_out),
-        num_routes, aligned_rows, hidden);
+        src, sorted_route_ids, dst, num_routes, aligned_rows, hidden);
 }
 
 }  // namespace pie_cuda_driver::kernels
