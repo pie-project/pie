@@ -2153,6 +2153,45 @@ class DeviceBatch:
         self.config_count.fill_(1)
         self.lexer_state.zero_()
 
+    def set_matchers(self, matchers: list) -> None:
+        """Load the parse state of many reference matchers, in one transfer.
+
+        The same thing `set_batch_configurations` does, with the conversion in
+        Rust: building the arrays a row at a time in Python costs 2.3 ms at
+        batch 512, against 84 us for the fill it prepares, and most of that is
+        not the copy but turning each matcher's state into Python objects only
+        to write them straight back out.
+        """
+        import gpugrammar
+
+        rows = len(matchers)
+        if rows == 0:
+            return
+        lexer, depths, stacks, counts, width, deep = gpugrammar.pack_configurations(
+            matchers, self.configs
+        )
+        if deep > self.grammar.max_stack:
+            raise ValueError(
+                f"a stack of {deep} exceeds the batch's limit of "
+                f"{self.grammar.max_stack}"
+            )
+
+        def view(blob, shape):
+            return torch.frombuffer(bytearray(blob), dtype=torch.int32).view(*shape)
+
+        self.lexer_state.view(self.batch, self.configs)[:rows, :width].copy_(
+            view(lexer, (rows, width))
+        )
+        self.depth.view(self.batch, self.configs)[:rows, :width].copy_(
+            view(depths, (rows, width))
+        )
+        self.stack.view(self.batch, self.configs, -1)[:rows, :width, :deep].copy_(
+            view(stacks, (rows, width, deep))
+        )
+        counted = view(counts, (rows,))
+        self.config_count[:rows].copy_(counted)
+        self.widest.fill_(int(counted.max()))
+
     def set_configurations(
         self, sequence: int, configurations: list[tuple[int, list[int]]]
     ) -> None:
@@ -2171,27 +2210,74 @@ class DeviceBatch:
         rows = max(per_sequence) + 1 if per_sequence else 0
         if rows == 0:
             return
-        lexer = np.zeros(rows * self.configs, dtype=np.int32)
-        stacks = np.zeros((rows * self.configs, self.grammar.max_stack), dtype=np.int32)
-        depths = np.ones(rows * self.configs, dtype=np.int32)
+        # Sized by what the sequences hold rather than by the ceilings. Sending
+        # `rows x max_configs x max_stack` was 4 MB a step at a serving batch to
+        # carry a couple of dozen words: real parses hold one or two
+        # configurations and reach a depth of tens, against a ceiling of sixteen
+        # and 256.
+        width = 1
+        deep = 1
+        for configurations in per_sequence.values():
+            width = max(width, len(configurations))
+            for _, stack in configurations:
+                deep = max(deep, len(stack))
+        if width > self.configs:
+            raise ValueError(
+                f"{width} configurations exceeds the batch's limit of {self.configs}"
+            )
+        if deep > self.grammar.max_stack:
+            raise ValueError(
+                f"a stack of {deep} exceeds the batch's limit of "
+                f"{self.grammar.max_stack}"
+            )
+
+        # Built as one flat list and converted once. Writing each stack into a
+        # numpy slice instead is a numpy call per configuration, and at a
+        # serving batch that is thousands of them. Keying rows by their state to
+        # skip the duplicates was tried and is worse - building a hashable key
+        # out of a configuration set costs more than writing it out.
+        #
+        # `set_matchers` avoids this path entirely and should be preferred where
+        # the caller has the matchers.
+        flat: list[int] = []
+        lexer_flat: list[int] = []
+        depth_flat: list[int] = []
         counts = np.ones(rows, dtype=np.int32)
-        for sequence, configurations in per_sequence.items():
-            if len(configurations) > self.configs:
-                raise ValueError(
-                    f"{len(configurations)} configurations exceeds the batch's "
-                    f"limit of {self.configs}"
-                )
-            counts[sequence] = len(configurations)
-            for index, (lexer_state, stack) in enumerate(configurations):
-                row = sequence * self.configs + index
-                lexer[row] = lexer_state
-                stacks[row, : len(stack)] = stack
-                depths[row] = len(stack)
+        blank = [0] * deep
+        for sequence in range(rows):
+            configurations = per_sequence.get(sequence) or ()
+            counts[sequence] = max(1, len(configurations))
+            for index in range(width):
+                if index < len(configurations):
+                    lexer_state, stack = configurations[index]
+                    lexer_flat.append(lexer_state)
+                    depth_flat.append(len(stack))
+                    flat.extend(stack)
+                    flat.extend(blank[len(stack) :])
+                else:
+                    lexer_flat.append(0)
+                    depth_flat.append(1)
+                    flat.extend(blank)
+        lexer = np.array(lexer_flat, dtype=np.int32).reshape(rows, width)
+        depths = np.array(depth_flat, dtype=np.int32).reshape(rows, width)
+        stacks = np.array(flat, dtype=np.int32).reshape(rows, width, deep)
+
+        # Rows past `width` are never read, because `config_count` bounds every
+        # sweep, so only the prefix has to be written.
+        self.lexer_state.view(self.batch, self.configs)[:rows, :width].copy_(
+            torch.from_numpy(lexer)
+        )
+        self.depth.view(self.batch, self.configs)[:rows, :width].copy_(
+            torch.from_numpy(depths)
+        )
+        self.stack.view(self.batch, self.configs, -1)[:rows, :width, :deep].copy_(
+            torch.from_numpy(stacks)
+        )
+        self.config_count[:rows].copy_(torch.from_numpy(counts))
         # The widest configuration set in the batch, recorded while it is still
         # on the host. Asking the device for it costs a synchronisation every
-        # step - the one thing this design exists to avoid - and launching for
-        # the ceiling instead wastes a grid dimension on programs that return
-        # immediately. The host put the counts there; it can remember them.
+        # step - the one thing this design exists to avoid.
+        #
         # The kernels gate on `widest`, which lives on the device because the
         # advance is the thing that normally sets it. Loading state from the
         # host has to set it too, or every configuration past the first is
@@ -2201,10 +2287,6 @@ class DeviceBatch:
         # `widest` on its way past, and checking both together let one claim
         # cover for the other.
         self.widest.fill_(int(counts.max()))
-        self.lexer_state[: rows * self.configs].copy_(torch.from_numpy(lexer))
-        self.stack[: rows * self.configs].copy_(torch.from_numpy(stacks))
-        self.depth[: rows * self.configs].copy_(torch.from_numpy(depths))
-        self.config_count[:rows].copy_(torch.from_numpy(counts))
 
     def advance(self, tokens: torch.Tensor) -> None:
         """Take one sampled token per sequence, entirely on device.

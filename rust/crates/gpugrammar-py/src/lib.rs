@@ -428,10 +428,87 @@ impl Matcher {
     }
 }
 
+/// Pack many matchers' parse states into flat buffers, ready for one upload.
+///
+/// The device path needs every sequence's configuration set on the accelerator
+/// each step, and building that a row at a time in Python costs more than every
+/// kernel it feeds: 2.3 ms at batch 512 against 84 us for the fill. Most of that
+/// is not the copy but the conversion - `configurations()` builds a list of
+/// tuples of lists per sequence, and then Python writes each one into an array.
+///
+/// Returns `(lexer, depths, stacks, counts, width, deep)`, where `width` is the
+/// widest configuration set and `deep` the deepest stack, so the caller uploads
+/// what is in use rather than what the ceilings allow.
+#[pyfunction]
+fn pack_configurations<'py>(
+    python: Python<'py>,
+    matchers: Vec<PyRef<'py, Matcher>>,
+    limit: usize,
+) -> PyResult<(
+    Bound<'py, PyBytes>,
+    Bound<'py, PyBytes>,
+    Bound<'py, PyBytes>,
+    Bound<'py, PyBytes>,
+    usize,
+    usize,
+)> {
+    let states: Vec<Vec<(u32, Vec<u32>)>> = matchers
+        .iter()
+        .map(|matcher| matcher.inner.configurations())
+        .collect();
+    let mut width = 1usize;
+    let mut deep = 1usize;
+    for set in &states {
+        width = width.max(set.len());
+        for (_, stack) in set {
+            deep = deep.max(stack.len());
+        }
+    }
+    if width > limit {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "{width} configurations exceeds the batch's limit of {limit}"
+        )));
+    }
+
+    let rows = states.len();
+    let mut lexer = vec![0i32; rows * width];
+    let mut depths = vec![1i32; rows * width];
+    let mut stacks = vec![0i32; rows * width * deep];
+    let mut counts = vec![1i32; rows];
+    for (row, set) in states.iter().enumerate() {
+        counts[row] = set.len().max(1) as i32;
+        for (index, (state, stack)) in set.iter().enumerate() {
+            lexer[row * width + index] = *state as i32;
+            depths[row * width + index] = stack.len() as i32;
+            let at = (row * width + index) * deep;
+            for (offset, entry) in stack.iter().enumerate() {
+                stacks[at + offset] = *entry as i32;
+            }
+        }
+    }
+
+    fn bytes<'py>(python: Python<'py>, values: &[i32]) -> Bound<'py, PyBytes> {
+        let mut out = Vec::with_capacity(values.len() * 4);
+        for value in values {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        PyBytes::new(python, &out)
+    }
+    Ok((
+        bytes(python, &lexer),
+        bytes(python, &depths),
+        bytes(python, &stacks),
+        bytes(python, &counts),
+        width,
+        deep,
+    ))
+}
+
 #[pymodule]
 fn gpugrammar(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Compiler>()?;
     module.add_class::<CompiledGrammar>()?;
     module.add_class::<Matcher>()?;
+    module.add_function(wrap_pyfunction!(pack_configurations, module)?)?;
     Ok(())
 }
