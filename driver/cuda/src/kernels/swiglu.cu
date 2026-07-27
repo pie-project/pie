@@ -1,5 +1,6 @@
 #include "kernels/swiglu.hpp"
 
+#include <cstdint>
 #include <cuda_bf16.h>
 
 namespace pie_cuda_driver::kernels {
@@ -423,6 +424,10 @@ __global__ void sigmoid_dot_scalar_gate_inplace_bf16_kernel(
     }
 }
 
+// One bf16 per thread makes every warp issue a 64-byte access, half a cache
+// line, and this kernel is pure bandwidth: it streams x, y and out. Moving a
+// uint4 per thread, and reducing the dot product through warp shuffles
+// instead of a __syncthreads tree, is the whole optimisation.
 __global__ void sigmoid_dot_scalar_gate_add_bf16_kernel(
     const __nv_bfloat16* __restrict__ x,
     const __nv_bfloat16* __restrict__ gate_w,
@@ -432,28 +437,76 @@ __global__ void sigmoid_dot_scalar_gate_add_bf16_kernel(
 {
     const int n = blockIdx.x;
     const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int num_warps = static_cast<int>(blockDim.x) >> 5;
     extern __shared__ float smem[];
 
-    float acc = 0.f;
     const __nv_bfloat16* x_row = x + static_cast<long long>(n) * H;
-    for (int h = tid; h < H; h += blockDim.x) {
-        acc += __bfloat162float(x_row[h]) * __bfloat162float(gate_w[h]);
-    }
-    smem[tid] = acc;
-    __syncthreads();
-
-    for (int offset = blockDim.x >> 1; offset > 0; offset >>= 1) {
-        if (tid < offset) smem[tid] += smem[tid + offset];
-        __syncthreads();
-    }
-    const float s = 1.f / (1.f + __expf(-smem[0]));
-
     __nv_bfloat16* out_row = out + static_cast<long long>(n) * H;
     const __nv_bfloat16* y_row = y + static_cast<long long>(n) * H;
-    for (int h = tid; h < H; h += blockDim.x) {
-        const float ov = __bfloat162float(out_row[h]);
-        const float yv = __bfloat162float(y_row[h]);
-        out_row[h] = __float2bfloat16(ov + yv * s);
+
+    const bool vec = (H & 7) == 0 &&
+        ((reinterpret_cast<std::uintptr_t>(x_row) | 
+          reinterpret_cast<std::uintptr_t>(gate_w) |
+          reinterpret_cast<std::uintptr_t>(out_row) |
+          reinterpret_cast<std::uintptr_t>(y_row)) & 15) == 0;
+
+    float acc = 0.f;
+    const int Hv = H >> 3;
+    if (vec) {
+        const uint4* xv = reinterpret_cast<const uint4*>(x_row);
+        const uint4* gv = reinterpret_cast<const uint4*>(gate_w);
+        for (int i = tid; i < Hv; i += blockDim.x) {
+            const uint4 a = xv[i];
+            const uint4 b = gv[i];
+            const auto* ah = reinterpret_cast<const __nv_bfloat16*>(&a);
+            const auto* bh = reinterpret_cast<const __nv_bfloat16*>(&b);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                acc += __bfloat162float(ah[j]) * __bfloat162float(bh[j]);
+            }
+        }
+    } else {
+        for (int h = tid; h < H; h += blockDim.x) {
+            acc += __bfloat162float(x_row[h]) * __bfloat162float(gate_w[h]);
+        }
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_down_sync(0xffffffffu, acc, off);
+    }
+    if (lane == 0) smem[warp] = acc;
+    __syncthreads();
+    if (tid == 0) {
+        float total = 0.f;
+        for (int w = 0; w < num_warps; ++w) total += smem[w];
+        smem[0] = 1.f / (1.f + __expf(-total));
+    }
+    __syncthreads();
+    const float s = smem[0];
+
+    if (vec) {
+        uint4* ov = reinterpret_cast<uint4*>(out_row);
+        const uint4* yv = reinterpret_cast<const uint4*>(y_row);
+        for (int i = tid; i < Hv; i += blockDim.x) {
+            uint4 o = ov[i];
+            const uint4 yy = yv[i];
+            auto* oh = reinterpret_cast<__nv_bfloat16*>(&o);
+            const auto* yh = reinterpret_cast<const __nv_bfloat16*>(&yy);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                oh[j] = __float2bfloat16(
+                    __bfloat162float(oh[j]) + __bfloat162float(yh[j]) * s);
+            }
+            ov[i] = o;
+        }
+    } else {
+        for (int h = tid; h < H; h += blockDim.x) {
+            const float ov = __bfloat162float(out_row[h]);
+            const float yv = __bfloat162float(y_row[h]);
+            out_row[h] = __float2bfloat16(ov + yv * s);
+        }
     }
 }
 
@@ -530,7 +583,7 @@ void launch_sigmoid_dot_scalar_gate_add_bf16(
     if (N <= 0 || H <= 0) return;
     constexpr int BLOCK = 256;
     sigmoid_dot_scalar_gate_add_bf16_kernel<<<
-        N, BLOCK, BLOCK * sizeof(float), stream>>>(
+        N, BLOCK, (BLOCK / 32) * sizeof(float), stream>>>(
         static_cast<const __nv_bfloat16*>(x),
         static_cast<const __nv_bfloat16*>(gate_w),
         static_cast<__nv_bfloat16*>(out),

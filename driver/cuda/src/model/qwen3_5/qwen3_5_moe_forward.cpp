@@ -1247,11 +1247,8 @@ void linear_attn_body(
     profile_cuda_detail_stage(
         profile, profile ? &profile->linear_post_ms : nullptr,
         stream, [&] {
-    kernels::launch_fp32_to_bf16(
-        la.core_out.data(), la.core_out_bf16.data(),
-        (std::size_t)N * V_dim, stream);
-    kernels::launch_rmsnorm_gated_bf16(
-        la.core_out_bf16.data(), z_data, Lw.la_norm_w_fp32,
+    kernels::launch_rmsnorm_gated_fp32_in_bf16(
+        la.core_out.data(), z_data, Lw.la_norm_w_fp32,
         la.core_out_bf16.data(),
         N * V_h, V_d, /*eps=*/cfg.rms_norm_eps, stream);
     // out_proj: TP=1 fuses residual via beta=1; TP>1 row-parallel +
