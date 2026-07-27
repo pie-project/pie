@@ -1386,13 +1386,28 @@ So the ~2.5 ms/step splits in two:
 
 **This reorders the optimisation targets.** The largest single lever is not any
 kernel in this document -- it is making a hook-bearing request graph-capturable
-again. Everything Quest does per layer is already device-side (`envelope_dot`,
-a PTIR threshold program, a mask write), so there is no host round-trip in the
-policy itself that would inherently prevent capture; the request is excluded
-because binding a stage hook conservatively disables capture, not because the
-hook does anything uncapturable. That is engine-level work in PTIR dispatch
-rather than a Quest change, and it would benefit every Track A and Track B
-policy identically, since they all bind the same per-layer hook.
+again. The exclusion is one clause, `!has_stage_hooks`, at the end of
+`forward_graph_replay_eligible` (`driver/cuda/src/batch/forward.cpp`), and it is
+worth being clear that it is **structurally necessary rather than merely
+conservative**:
+
+* `execute_declared_phase` is host work that runs once per layer per fire. It
+  rebuilds the task/binding/group vectors, sizes and uploads the lane table,
+  and acquires workspaces. A replayed graph runs no host code, so the recorded
+  kernels would address the workspace and lane-table contents of whichever step
+  was captured.
+* `Dispatch::finish` asserts `phase_invocations[phase] == model_layers` -- the
+  hook must be observed to have run at every layer. Under replay it would be
+  observed zero times and every hook-bearing fire would fail that check.
+
+Neither is a property of the *policy*: everything Quest does per layer is
+already device-side (`envelope_dot`, a PTIR threshold program, a mask write).
+They are properties of how the PTIR stage phase is currently driven. Lifting
+them means giving the phase stable device-resident state that device kernels
+update, instead of host-rebuilt state, and moving the invocation accounting to
+the device. That is an engine project in PTIR dispatch rather than a Quest
+change, and it would benefit every Track A and Track B policy identically,
+since they all bind the same per-layer hook.
 
 Ranked, per decode step at ~6K context:
 
