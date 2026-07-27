@@ -1585,6 +1585,11 @@ class DeviceBatch:
         self.mask = torch.zeros(
             (batch, grammar.mask_words), dtype=torch.int32, device="cuda"
         )
+        # How many blocks drain the sweep. Deriving this from the batch was
+        # tried and is worse: a batch of eight went from 74 us to 154 us on 64
+        # blocks, because fewer blocks means more items each, while a batch of
+        # one was unchanged - its cost is the eight launches, not the grid.
+        self.sweep_blocks = _SWEEP_BLOCKS
         self.max_groups = grammar.max_groups_per_state
         self.advance_blocks = (self.max_groups + _GROUP_BLOCK - 1) // _GROUP_BLOCK
         # One entry per work item, so nothing has to be cleared between steps:
@@ -1602,14 +1607,14 @@ class DeviceBatch:
         # program - which is the point of the sweep. This used to be one per
         # (sequence, configuration, group) and reach 1.7 GB at batch 512.
         self.scratch = torch.zeros(
-            (_SWEEP_BLOCKS, 2 * grammar.window), dtype=torch.int32, device="cuda"
+            (self.sweep_blocks, 2 * grammar.window), dtype=torch.int32, device="cuda"
         )
         # The advance indexes its scratch by block, like the sweep, so it too
         # stops depending on the batch. It cannot share the sweep's buffer:
         # both may be in flight on the same stream and they would write over
         # each other's replays.
         self.advance_scratch = torch.zeros(
-            (_SWEEP_BLOCKS, 2 * grammar.window),
+            (self.sweep_blocks, 2 * grammar.window),
             dtype=torch.int32,
             device="cuda",
         )
@@ -1617,13 +1622,6 @@ class DeviceBatch:
             (rows,), _NO_GROUP, dtype=torch.int32, device="cuda"
         )
         self.advance_live = 1
-
-    def _scratch_for(self, live: int) -> torch.Tensor:
-        return torch.zeros(
-            (_SWEEP_BLOCKS, 2 * self.grammar.window),
-            dtype=torch.int32,
-            device="cuda",
-        )
 
     def set_grammars(self, ids) -> None:
         """Say which grammar each sequence is under, and reset it to that start.
@@ -1759,7 +1757,7 @@ class DeviceBatch:
             GROUP_BLOCK=_GROUP_BLOCK,
             SEARCH_STEPS=grammar.search_steps,
         )
-        _candidate_kernel[(_SWEEP_BLOCKS,)](
+        _candidate_kernel[(self.sweep_blocks,)](
             grammar.group_offsets,
             grammar.reading_offsets,
             grammar.reading_index,
@@ -1949,7 +1947,7 @@ class DeviceBatch:
         # It is a device op on a device value, so the total never comes to the
         # host and the launches below do not depend on it.
         torch.cumsum(self.counts, 0, out=self.work_offsets[1:])
-        _mask_kernel[(_SWEEP_BLOCKS,)](
+        _mask_kernel[(self.sweep_blocks,)](
             grammar.group_offsets,
             grammar.group_set_kind,
             grammar.group_set_offset,
@@ -1988,7 +1986,7 @@ class DeviceBatch:
             num_warps=1,
         )
         for complements_only in (1, 0):
-            _scatter_kernel[(_SWEEP_BLOCKS,)](
+            _scatter_kernel[(self.sweep_blocks,)](
                 grammar.group_offsets,
                 grammar.group_set_kind,
                 grammar.group_set_offset,

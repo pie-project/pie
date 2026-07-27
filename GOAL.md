@@ -663,12 +663,11 @@ matters because our fill deduplicates. Median over four schemas, in isolation:
 |---|---|---|---|---|---|
 | whole step, isolated | 0.20x | 0.60x | 1.89x | 3.82x | **7.83x** |
 
-**Overlap inverts it (q10).** Earlier versions of this document said the
-advance "cannot overlap, because it follows the sampled token". That is wrong,
-and the error was ours in XGrammar's favour and then in our own. The forward
-pass follows the same token: a decode step embeds what was sampled at `t-1`,
-and so does the parser. Neither needs the other, and the mask is not wanted
-until the logits exist. So a step is
+**Overlap, twice corrected (q10).** Earlier versions of this document said the
+advance "cannot overlap, because it follows the sampled token". That is wrong.
+The forward pass follows the same token: a decode step embeds what was sampled
+at `t-1`, and so does the parser. Neither needs the other, and the mask is not
+wanted until the logits exist. So a step is
 
     sample(t-1)  ->  forward pass       ->  apply mask  ->  sample(t)
                  ->  advance + fill     ->
@@ -679,26 +678,34 @@ streams, schema 2:
 
 | batch | forward pass | ours alone | ours overlapped | XGrammar alone | XGrammar overlapped |
 |---:|---:|---:|---:|---:|---:|
-| 32 | 6,556 us | 326 | **+158** | 849 | **+54** |
-| 128 | 9,401 us | 911 | **+856** | 3,276 | **+112** |
-| 512 | 22,109 us | 3,381 | **+3,334** | 12,487 | **+510** |
+| 32 | 6,555 us | 336 | **+93** | 856 | **+51** |
+| 128 | 9,430 us | 372 | **+145** | 3,308 | **+116** |
+| 512 | 22,108 us | 451 | **+202** | 11,746 | **+419** |
 
-At batch 512 XGrammar's 12,487 us of host work costs 510 us of wall clock -
-96% of it disappears - while our 3,381 us of device work costs 3,334 us. Almost
-none of ours hides.
+Correcting it the first time went against us and was recorded that way: at
+batch 512 ours then cost 3,381 us alone and 3,334 us overlapped, against
+XGrammar's 12,487 us alone and 510 us overlapped. The reading was that host
+work overlaps with a forward pass by using a resource it is not using, while
+device work overlaps by sharing the very multiprocessors the forward pass is
+saturating - so a device-resident parser is cheaper in isolation and harder to
+hide, and the second effect was the larger one.
 
-The reason is structural and it is the thesis's own weak point. Host work
-overlaps with a forward pass because it uses a resource the forward pass is not
-using. Device work overlaps by sharing the very multiprocessors the forward
-pass is saturating, so there is nothing to hide inside. A device-resident
-parser is *cheaper in isolation* and *harder to hide*, and at batch 512 on this
-schema the second effect is larger than the first.
+The structural half of that is still true. What was wrong was treating 3,381 us
+as the cost of a device-resident parser rather than as the cost of *this*
+implementation. The grid was one program per (sequence, configuration, group),
+sized by the configuration ceiling and by the largest number of groups any
+lexer state has - 841,000 programs at batch 512, of which 93% to 95% exited
+immediately. Enumerating the work instead of the ceilings took the whole
+grammar step to 451 us, and at batch 512 it now costs 202 us of wall clock
+against XGrammar's 419.
 
-This does not sink the argument, but it moves it. Being four times cheaper in
-absolute terms still matters where the host is contended, where the step is not
-GPU-bound, or where the parser must be inside a captured graph at all (q22).
-What it does sink is any claim that the per-step ratio translates to
-end-to-end: on this measurement it does the opposite.
+So the honest statement is narrower than either previous version. Device work
+does compete with the forward pass for the same multiprocessors, and 45% of
+ours fails to hide where 96% of XGrammar's host work does. That penalty is
+real. It is simply smaller than the twenty-five-fold difference in what there
+is to hide, once the work is the work rather than the ceilings. At batch 32 and
+128 XGrammar still adds less - 51 against 93, and 116 against 145 - and those
+are 0.6% and 0.3% of a step.
 
 **The fill cannot be captured (q22).** This is the structural finding and it is
 binary rather than a matter of microseconds. A CUDA graph records device work;
