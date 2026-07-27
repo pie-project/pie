@@ -67,6 +67,27 @@ struct Input {
     /// Pages Quest would keep per layer.
     #[serde(default = "default_page_budget")]
     page_budget: u32,
+    /// Drain the per-page scores, layer count and kv_len back to the host each
+    /// step. Every test here needs them; nothing about the POLICY does, since
+    /// the ranking, the threshold and the mask are all computed and consumed
+    /// on device. They are separable because they cost real time -- a
+    /// per-layer fold over `p_max`, plus three device-to-host channel drains
+    /// per step that a runahead pipeline has to wait on -- so leaving them on
+    /// while benchmarking measures the instrumentation, not Quest.
+    #[serde(default = "default_report")]
+    report: bool,
+    /// Size the page channel for this many generated tokens instead of
+    /// `max_tokens`. `p_max` is what `envelope_dot` scores per layer, so a
+    /// benchmark that differences two `max_tokens` would otherwise be
+    /// comparing two different per-step workloads and would charge Quest for
+    /// the difference. Setting this to the larger of the two endpoints makes
+    /// the per-step cost identical. Defaults to `max_tokens`.
+    #[serde(default)]
+    reserve_tokens: Option<usize>,
+}
+
+fn default_report() -> bool {
+    true
 }
 
 fn default_prompt() -> String {
@@ -144,6 +165,7 @@ async fn main(input: Input) -> Result<Output> {
     }
     let max_tokens = input.max_tokens;
     let temperature = input.temperature;
+    let report = input.report;
     let ws = WorkingSet::new();
     let page_size = ws.page_size();
 
@@ -156,7 +178,8 @@ async fn main(input: Input) -> Result<Output> {
         prompt.push(0);
     }
     let n = prompt.len() as u32;
-    let max_pages = (n + max_tokens as u32 + 1).div_ceil(page_size).max(1);
+    let reserve = input.reserve_tokens.unwrap_or(max_tokens).max(max_tokens);
+    let max_pages = (n + reserve as u32 + 1).div_ceil(page_size).max(1);
     let p_max = max_pages;
     let budget = input.page_budget.min(p_max);
     ws.reserve(max_pages)
@@ -240,19 +263,31 @@ async fn main(input: Input) -> Result<Output> {
         // the layer loop folds into a device-carried channel and the epilogue
         // — which fires exactly once per fire — publishes the fold. The seed
         // is `-inf` (the identity of `max`) and a zero layer counter.
-        let acc = Channel::from(vec![f32::NEG_INFINITY; p_max as usize]).named("quest_acc");
-        let layer_ct = Channel::from(vec![0u32]).named("quest_layers");
+        //
+        // Report-only: nothing in the policy reads it, so it is absent when the
+        // caller did not ask for a report.
+        let acc = report.then(|| {
+            Channel::from(vec![f32::NEG_INFINITY; p_max as usize]).named("quest_acc")
+        });
+        let layer_ct = report.then(|| Channel::from(vec![0u32]).named("quest_layers"));
 
-        // Host drains.
-        let scores_out = Channel::new([p_max], dtype::f32)
-            .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
-            .named("quest_scores");
-        let layers_out = Channel::new([1], dtype::u32)
-            .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
-            .named("quest_layer_count");
-        let kvlen_out = Channel::new([1], dtype::u32)
-            .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
-            .named("quest_kv_len");
+        // Host drains. Present only when the caller asked to be told what
+        // happened; see `Input::report`.
+        let scores_out = report.then(|| {
+            Channel::new([p_max], dtype::f32)
+                .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+                .named("quest_scores")
+        });
+        let layers_out = report.then(|| {
+            Channel::new([1], dtype::u32)
+                .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+                .named("quest_layer_count")
+        });
+        let kvlen_out = report.then(|| {
+            Channel::new([1], dtype::u32)
+                .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+                .named("quest_kv_len")
+        });
 
         let fwd = ForwardPass::new();
         fwd.embed(&tok_in, &lane1)?;
@@ -272,8 +307,6 @@ async fn main(input: Input) -> Result<Output> {
         // ── THE TAP. Fires once per layer, inside the fire, after the layer's
         //    Q/K/V projection and rope but before its KV append. ──
         fwd.on_attn_proj(move || {
-            let prev = acc.take().tensor();
-            let ct = layer_ct.take().tensor();
             let scores = intrinsics::kernel::envelope_dot(p_max);
 
             // ── THE ENFORCEMENT. `pivot_threshold(.., rank_le(budget))` is the
@@ -293,13 +326,21 @@ async fn main(input: Input) -> Result<Output> {
                 rank_le(budget),
             ));
 
-            acc.put(&max_elem(&prev, &scores));
-            layer_ct.put(&add(&ct, 1u32));
+            // Everything below is the report, not the policy: the mask above
+            // has already been applied to this layer.
+            if let (Some(acc), Some(layer_ct)) = (acc.as_ref(), layer_ct.as_ref()) {
+                let prev = acc.take().tensor();
+                let ct = layer_ct.take().tensor();
+                acc.put(&max_elem(&prev, &scores));
+                layer_ct.put(&add(&ct, 1u32));
+            }
         });
 
         fwd.epilogue(move || {
             let length = kv_len.take().tensor();
-            kvlen_out.put(&length);
+            if let Some(kvlen_out) = kvlen_out.as_ref() {
+                kvlen_out.put(&length);
+            }
             let r = rng.take();
             let logits = intrinsics::logits();
             let token = step(logits, temperature, &r);
@@ -318,12 +359,16 @@ async fn main(input: Input) -> Result<Output> {
             rng.put(&add(&r, iota(2)));
 
             // Publish the layer fold, then re-seed it for the next fire.
-            let folded = acc.take().tensor();
-            let layers = layer_ct.take().tensor();
-            scores_out.put(&folded);
-            layers_out.put(&layers);
-            acc.put(&broadcast(f32::NEG_INFINITY, [p_max]));
-            layer_ct.put(&reshape(&mul(&layers, 0u32), [1]));
+            if let (Some(acc), Some(layer_ct), Some(scores_out), Some(layers_out)) =
+                (acc.as_ref(), layer_ct.as_ref(), scores_out.as_ref(), layers_out.as_ref())
+            {
+                let folded = acc.take().tensor();
+                let layers = layer_ct.take().tensor();
+                scores_out.put(&folded);
+                layers_out.put(&layers);
+                acc.put(&broadcast(f32::NEG_INFINITY, [p_max]));
+                layer_ct.put(&reshape(&mul(&layers, 0u32), [1]));
+            }
         });
 
         let budget_n = max_tokens - 1;
@@ -341,21 +386,30 @@ async fn main(input: Input) -> Result<Output> {
                 .get::<i32>()
                 .await
                 .map_err(|e| format!("tok_out.take @{}: {e}", generated.len()))?[0];
-            last_scores = scores_out
-                .take()
-                .get::<f32>()
-                .await
-                .map_err(|e| format!("quest_scores.take @{}: {e}", generated.len()))?;
-            layers_observed = layers_out
-                .take()
-                .get::<u32>()
-                .await
-                .map_err(|e| format!("quest_layer_count.take @{}: {e}", generated.len()))?[0];
-            kv_len_last = kvlen_out
-                .take()
-                .get::<u32>()
-                .await
-                .map_err(|e| format!("quest_kv_len.take @{}: {e}", generated.len()))?[0];
+            last_scores = match scores_out.as_ref() {
+                Some(ch) => ch
+                    .take()
+                    .get::<f32>()
+                    .await
+                    .map_err(|e| format!("quest_scores.take @{}: {e}", generated.len()))?,
+                None => last_scores,
+            };
+            layers_observed = match layers_out.as_ref() {
+                Some(ch) => ch
+                    .take()
+                    .get::<u32>()
+                    .await
+                    .map_err(|e| format!("quest_layer_count.take @{}: {e}", generated.len()))?[0],
+                None => layers_observed,
+            };
+            kv_len_last = match kvlen_out.as_ref() {
+                Some(ch) => ch
+                    .take()
+                    .get::<u32>()
+                    .await
+                    .map_err(|e| format!("quest_kv_len.take @{}: {e}", generated.len()))?[0],
+                None => kv_len_last,
+            };
             in_flight -= 1;
             generated.push(t as u32);
             if submitted < budget_n {

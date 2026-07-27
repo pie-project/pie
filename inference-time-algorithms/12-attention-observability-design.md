@@ -1265,3 +1265,73 @@ arise when one block does both, in order, for every token on the page. Measured
 on an L40S: **129 us → ~82 us per 28-layer pass, flat from N=1 to N=128.** Above
 128 tokens the two-launch form is kept, since there the kernels are doing real
 work and the shared-memory gather list would not fit.
+
+## 14. From what context does Quest pay for itself?
+
+Quest trades work for work: an `envelope_dot` per layer, a top-k, and a page
+table compaction, in exchange for an attention that reads fewer pages. Below
+some context the overhead exceeds the saving. That crossover is the only number
+that decides whether to enable it, and no kernel microbenchmark yields it,
+because the overhead is per-layer-per-step while the saving is proportional to
+the pages the budget removes. `tests/inferlets/bench_quest.py` measures it.
+
+### 14.1 Two things had to be fixed before the number meant anything
+
+**The instrumentation was being timed.** The inferlet drained per-page scores,
+a layer count and `kv_len` to the host on every step so tests could assert the
+census. None of that is the policy — the ranking, the threshold and the mask
+are computed and consumed on device — but it costs a per-layer fold over
+`p_max` plus three device-to-host drains per step that a runahead pipeline has
+to wait on. It is now behind `report` (default on, so every test is unchanged),
+and the benchmark turns it off. At 6144 tokens with a quarter budget this alone
+moved the result from 1.01x to 0.76x.
+
+**The difference method was charging Quest for its own endpoint.** Decode cost
+is measured by differencing two runs that differ only in `max_tokens`, which
+cancels prefill and all fixed overhead. But `p_max` — the number of slots
+`envelope_dot` scores per layer — is derived from `max_tokens`, so the long
+endpoint was doing more per-step work than the short one and the difference
+absorbed it. `reserve_tokens` now pins `p_max` to the long endpoint for both.
+
+Two further method notes, both learned by getting them wrong: minimise the two
+endpoints **independently** before differencing (minimising the differences
+pairs the luckiest long run with the unluckiest short one, which produced
+negative times), and **interleave** the configurations rather than running each
+to completion, so a drifting shared host does not land entirely on one of them.
+
+### 14.2 The measurement
+
+Qwen3-0.6B, 28 layers, page size 16, L40S. ms/token, min of 7 interleaved
+rounds, `report=false`:
+
+| ctx | pages | baseline | budget=100% | budget=50% | budget=25% |
+|---|---|---|---|---|---|
+| 1024 | 80 | 3.76 ms | 1.65x | 1.45x | 1.35x |
+| 2048 | 158 | 4.83 ms | 1.50x | 1.24x | 1.16x |
+| 4096 | 314 | 6.84 ms | 1.33x | 1.04x | **0.87x** |
+| 6144 | 471 | 8.70 ms | 1.32x | 0.98x | **0.77x** |
+
+Monotone in every direction: the baseline grows with context, every row
+improves as the budget tightens, and every column improves as context grows.
+
+**Quest becomes a net win at ~4K context with a quarter budget, and is 23%
+faster at 6K.**
+
+### 14.3 The overhead is constant, so the crossover is set by the baseline
+
+The `budget=100%` column is Quest with nothing evicted — pure overhead. In
+absolute terms it is 2.46, 2.41, 2.29, 2.76 ms across the four contexts: **flat
+at ~2.5 ms/step regardless of context.** The ratio falls from 1.65x to 1.32x
+only because the baseline grows underneath it.
+
+That is ~89 us per layer, and it is *not* the kernels: envelope maintenance is
+~3 us/layer (§13.2) and compaction 5-10 us/layer at these contexts (§10.3b).
+The remainder is the per-layer hook dispatch itself — `envelope_dot`,
+`pivot_threshold`, `rank_le` and `attn_page_mask` are four separate launches
+plus the grouped-dispatch machinery around them, 28 times per step. That, not
+any individual kernel, is where a further Quest speedup would come from.
+
+It also means this table is a **worst case for the ratio**. A 0.6B model has a
+small decode step, so a constant 2.5 ms is a large fraction of it. On a
+production-sized model the same 2.5 ms is a much smaller share and the
+crossover moves substantially earlier.
