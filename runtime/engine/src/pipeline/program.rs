@@ -114,7 +114,7 @@ impl RegisteredProgram {
         Some(Arc::clone(cache.entry(backend).or_insert_with(|| {
             Arc::new(EmittedProgram {
                 emitter_version: backend.emitter_version(),
-                kernels: emit_program(backend, &self.compiled_stages),
+                kernels: emit_program(backend, &self.compiled_stages, &self.bound),
             })
         })))
     }

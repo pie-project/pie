@@ -40,7 +40,9 @@ pub mod topk;
 pub mod validate;
 
 pub use crate::op_view::OpView;
-pub use effects::{emit_commit, emit_grouped_commit, emit_grouped_readiness, emit_readiness};
+pub use effects::{
+    channel_effects, emit_commit, emit_grouped_commit, emit_grouped_readiness, emit_readiness,
+};
 pub use fused::{emit_fused_region, emit_grouped_fused_region};
 pub use nucleus::emit_grouped_nucleus;
 pub use preamble::RUNTIME_TEMPLATE;

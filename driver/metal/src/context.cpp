@@ -368,6 +368,11 @@ std::string build_caps_json(const Config& cfg,
         {"max_model_len", max_model_len},
         {"activation_dtype", "bf16"},
         {"snapshot_dir", cfg.model.hf_path},
+        // Advertising the emitter identity opts this driver into the host
+        // codegen path (see `compiler/codegen/src/program.rs::Backend::parse`);
+        // the runtime uses it to pick which per-kernel table to build and
+        // to key the MSL cache.
+        {"codegen_backend", "metal"},
     };
     return caps.dump();
 }
@@ -503,6 +508,15 @@ class Context::Impl {
         std::string compile_error;
         pipeline::M1CompileFailureKind compile_failure =
             pipeline::M1CompileFailureKind::Retryable;
+        // Snapshot the host-emitted kernels alongside the plan so the
+        // worker thread sees a stable view; the registry owns the byte
+        // strings for the life of the program record.
+        std::vector<pipeline::HostEmittedKernel> compile_emitted;
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            ProgramRecord& record = *registry_.find_program(id);
+            compile_emitted = record.emitted_kernels;
+        }
         worker_.run([&] {
             if (m1_runtime_ == nullptr) {
                 m1_runtime_ = pipeline::M1Runtime::create(
@@ -514,6 +528,7 @@ class Context::Impl {
                 executable = m1_runtime_->compile_program(
                     program.program_hash,
                     compile_plan,
+                    compile_emitted,
                     compile_error,
                     compile_canonical,
                     &compile_failure);

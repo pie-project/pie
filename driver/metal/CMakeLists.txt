@@ -87,7 +87,6 @@ if(APPLE)
   set(PIE_METAL_LIVE_SOURCES
     src/mtl4_context.mm
     src/pipeline/shared_storage.mm
-    src/pipeline/m1_codegen.cpp
     src/pipeline/m1_runtime.cpp
     src/batch/decode_timing.cpp
     src/batch/scratch.cpp
@@ -122,7 +121,7 @@ target_include_directories(pie_driver_metal_lib
     # CUDA-free, namespace pie_native::ptir). The host interpreter
     # (src/pipeline/interp.hpp) consumes them; Metal no longer reaches into
     # driver/cuda/src for anything.
-    ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../common/include ${CMAKE_CURRENT_SOURCE_DIR}/../abi/include ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include
     ${PIE_DRIVER_ABI_INCLUDE_DIR} ${PIE_LOADER_INCLUDE_DIR})
 
 target_compile_options(pie_driver_metal_lib PRIVATE
@@ -135,6 +134,19 @@ target_compile_options(pie_driver_metal_lib PRIVATE
 # which drives an independent MetalExecutor::setup outside Context) sees
 # the same default when PIE_METAL_KERNELS_DIR is unset. Installed packaging
 # of the kernels dir is a follow-up.
+#
+# ptir_rng.generated.metal is owned by pie-codegen and staged here at configure
+# time rather than checked in twice. The host emitter now embeds the M1 runtime
+# template into every emitted MSL source itself, but the RNG preamble still
+# needs to sit beside the checked-in .metal kernels so a build-time
+# `configure_file` (below) keeps them in lockstep -- the driver splices it in
+# at compile time because Metal's runtime shader compiler does no filesystem
+# include lookup.
+configure_file(
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include/ptir_rng.generated.metal
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/ptir_rng.generated.metal
+  COPYONLY)
+
 if(APPLE)
   target_compile_definitions(pie_driver_metal_lib PUBLIC
     PIE_METAL_KERNELS_DIR_DEFAULT="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
@@ -257,7 +269,7 @@ function(add_metal_host_test target source)
   add_executable(${target} ${source})
   target_include_directories(${target} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${CMAKE_CURRENT_SOURCE_DIR}/../common/include)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../common/include ${CMAKE_CURRENT_SOURCE_DIR}/../abi/include ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include)
   add_test(NAME ${target} COMMAND ${target})
 endfunction()
 
@@ -273,7 +285,7 @@ add_executable(
   ptir_decoder_limits_test
   ${CMAKE_CURRENT_SOURCE_DIR}/../common/tests/ptir_decoder_limits_test.cpp)
 target_include_directories(ptir_decoder_limits_test PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/../common/include)
+  ${CMAKE_CURRENT_SOURCE_DIR}/../common/include ${CMAKE_CURRENT_SOURCE_DIR}/../abi/include ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include)
 target_compile_features(ptir_decoder_limits_test PRIVATE cxx_std_20)
 add_test(
   NAME ptir_decoder_limits_test
@@ -317,9 +329,6 @@ target_link_libraries(executor_worker_test PRIVATE Threads::Threads)
 add_test(NAME executor_worker_test COMMAND executor_worker_test)
 
 if(APPLE)
-  add_metal_linked_test(m1_generated_test tests/m1_generated_test.cpp)
-  target_compile_definitions(m1_generated_test PRIVATE
-    PIE_PTIR_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/tests/golden")
   add_metal_linked_test(ptir_m0_device_test tests/ptir_m0_device_test.cpp)
   add_metal_linked_test(ptir_checkpoint_e2e_test tests/ptir_checkpoint_e2e_test.cpp)
   add_metal_linked_test(kv_append_paged_pso_test tests/kv_append_paged_pso_test.cpp)

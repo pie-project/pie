@@ -444,7 +444,7 @@ Total **−20,259**, of which 3,142 is `ptir_generated_singleton_test.cu` — th
 test of the emitter being deleted, which had already failed on `dev` since
 before this work started. The Δ column is measured after implementation, not
 projected; it does not count the driver-side test surface that needs
-*retargeting* rather than deletion (§4.1).
+*retargeting* rather than deletion (§4.3).
 
 Old→new: 8→0, 4→1′, 5+6→2′, 7→3′.
 
@@ -619,7 +619,34 @@ from §2.3:
 canonical_bytes.len == 0 && sidecar_bytes.len == 0
 ```
 
-### 4.1 The driver-side test surface (retarget, not delete)
+### 4.2 What phase 3′ must absorb
+
+Implementing phases 0–2′ turned up the full list of things the driver still
+derives for itself. Each is a field the launch package has to carry, and the
+list is longer than the earlier draft's three bullets:
+
+| what the driver derives today | from | where it lives |
+|---|---|---|
+| buffer / scratch layout | the plan | `program_runtime.hpp` |
+| region → launch mapping | the plan | `program_runtime.hpp`, `grouped_runtime.cuh` |
+| fire geometry | the plan | `fire_geometry.hpp` consumers |
+| **port → field table** | hand-synced with `map_geometry` | `descriptor_resolve.hpp` ×2 |
+| **bind-time region gates** | the plan | `region_support.hpp` |
+| **intrinsic side-table analysis** | the plan | `region_support.hpp::analyze_direct_argmax` |
+| **per-op launch class / result kind** | `op_table.hpp` | `tier0_launch.hpp` |
+
+The bottom four are the ones the plan did not name. They are the reason
+`region_support.hpp` and `op_table.hpp` exist at all: each is a *decision about
+the program* that the host has already made and the driver re-derives. Shipping
+them as data is what finishes the job — and it is also what lets
+`region_support.hpp` (488) and `op_table.hpp` (179) go, which the §5 ledger
+currently books as permanent survivors.
+
+Sequence it the way §4's phase 3′ says: ship each field alongside the driver's
+existing derivation first, count divergence, and delete the derivation at zero.
+The `ModuleCacheStats` pattern already in the tree is the model.
+
+### 4.3 The driver-side test surface (retarget, not delete)
 
 The Δ columns above count deletions. They do not count the driver's PTIR test
 suite, which is 9,385 lines and mostly needs *retargeting* — the tests exercise
@@ -628,7 +655,7 @@ feed it.
 
 | file | lines | fate |
 |---|---|---|
-| `cuda/ptir_generated_singleton_test.cu` | 3,142 | phase 2′ — repair or delete |
+| `cuda/ptir_generated_singleton_test.cu` | 3,142 | **deleted in 2′** with its subject |
 | `cuda/ptir_grouped_dispatch_test.cpp` | 2,147 | includes `plan.hpp`; retarget in 3′ (also fails to compile on `dev`, §7.2) |
 | `cuda/ptir_tier0_test.cu` | 1,082 | retarget |
 | `cuda/ptir_golden_exec_test.cu` | 871 | retarget |
@@ -701,7 +728,7 @@ vocabulary). **None of them decode PTIR** — which is the property that matters
 and the one the §2.3 assertion enforces.
 
 Not in the table because they are retargeted rather than deleted: the 9,385
-lines of driver PTIR tests (§4.1).
+lines of driver PTIR tests (§4.3).
 
 **The one-line version:** three interpreters become one, four emitters become
 two, and the driver stops receiving the plan at all.

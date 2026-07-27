@@ -17,6 +17,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
+use pie_ir::validate::BoundTrace;
 use pie_plan::{CompiledStage, LibraryOp, Region, RegionKind};
 
 /// Kind discriminants, matching `PIE_KERNEL_*` in the driver ABI.
@@ -93,13 +94,20 @@ impl Backend {
 }
 
 /// Emit every kernel a driver needs for `stages`, in stage then region order.
-pub fn emit_program(backend: Backend, stages: &[CompiledStage]) -> Vec<EmittedKernel> {
+pub fn emit_program(
+    backend: Backend,
+    stages: &[CompiledStage],
+    bound: &BoundTrace,
+) -> Vec<EmittedKernel> {
     let mut kernels = Vec::new();
     for (stage_index, stage) in stages.iter().enumerate() {
         match backend {
             Backend::Cuda => emit_cuda_stage(stage, stage_index, &mut kernels),
             Backend::Metal => emit_metal_stage(stage, stage_index, &mut kernels),
         }
+    }
+    if backend == Backend::Metal {
+        emit_metal_program_effects(bound, &mut kernels);
     }
     kernels
 }
@@ -210,8 +218,11 @@ fn emit_metal_stage(stage: &CompiledStage, stage_index: usize, out: &mut Vec<Emi
         ));
     }
 
-    // The readiness and commit kernels are shared across a group, so they are
-    // named by emitter version rather than by program.
+    // The grouped readiness and commit kernels are shared across a group, so
+    // they are named by emitter version rather than by program. They sit at
+    // region 0; the per-program single-lane forms the M1 and M2 launch paths
+    // bind are emitted once per program at region 1 by `emit_program`, because
+    // their channel effects are program-wide and a stage cannot see them.
     let version = crate::metal::METAL_M1_EMITTER_VERSION;
     let ready = format!("ptir_m3_generic_ready_v{version}");
     let source = crate::metal::emit_grouped_readiness(&ready);
@@ -231,6 +242,23 @@ fn emit_metal_stage(stage: &CompiledStage, stage_index: usize, out: &mut Vec<Emi
         commit,
         Ok(source),
     ));
+}
+
+/// The single-lane readiness and commit kernels, specialised to this program's
+/// channel effects.
+///
+/// These are what `m1_runtime.cpp` binds on the M1 and M2 paths — a different
+/// buffer shape from the grouped M3 forms above, so they cannot share a slot.
+/// They are program-wide rather than per-stage, hence `(stage 0, region 1)`.
+fn emit_metal_program_effects(bound: &BoundTrace, out: &mut Vec<EmittedKernel>) {
+    let effects = crate::metal::channel_effects(bound);
+    let signature = format!("{:016x}", bound.hash);
+    let ready = format!("ptir_m1_{signature}_ready");
+    let source = crate::metal::emit_readiness(&ready, &effects);
+    out.push(EmittedKernel::new(KERNEL_READINESS, 0, 1, ready, Ok(source)));
+    let commit = format!("ptir_m1_{signature}_commit");
+    let source = crate::metal::emit_commit(&commit, &effects);
+    out.push(EmittedKernel::new(KERNEL_COMMIT, 0, 1, commit, Ok(source)));
 }
 
 /// Which library kernel a grouped region should use, reproducing the driver's

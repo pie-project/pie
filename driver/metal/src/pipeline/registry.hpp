@@ -16,12 +16,26 @@ namespace pie::metal::pipeline {
 
 struct M1ProgramExecutable;
 
+// One host-emitted MSL kernel, or the reason the host chose not to emit
+// this one. Owns its byte strings so it outlives the caller's
+// `PieEmittedKernel` buffer, which is only guaranteed valid for the
+// register-program call.
+struct HostEmittedKernel {
+    std::uint32_t kind = 0;
+    std::uint32_t stage_index = 0;
+    std::uint32_t region_index = 0;
+    std::string entry_name;
+    std::string source;
+    std::string error;
+};
+
 struct ProgramRecord {
     std::uint64_t program_id = 0;
     std::uint64_t program_hash = 0;
     std::vector<std::uint8_t> canonical_bytes;
     std::vector<pie_native::PtirChannelDecl> channels;
     ExecPlan plan;
+    std::vector<HostEmittedKernel> emitted_kernels;
     std::shared_ptr<M1ProgramExecutable> m1_executable;
     std::string m1_error;
 };

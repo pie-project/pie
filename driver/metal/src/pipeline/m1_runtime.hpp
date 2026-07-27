@@ -10,6 +10,7 @@
 #include "batch/compose.hpp"
 #include "mtl4_context.hpp"
 #include "pipeline/interp.hpp"
+#include "pipeline/registry.hpp"
 
 namespace pie::metal::pipeline {
 
@@ -117,6 +118,7 @@ class M1Runtime {
     std::shared_ptr<M1ProgramExecutable> compile_program(
         std::uint64_t program_hash,
         const ExecPlan& plan,
+        std::span<const HostEmittedKernel> emitted_kernels,
         std::string& error,
         std::span<const std::uint8_t> canonical_bytes = {},
         M1CompileFailureKind* failure_kind = nullptr);

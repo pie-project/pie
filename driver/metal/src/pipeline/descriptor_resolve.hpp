@@ -42,8 +42,8 @@
 #include <string>
 #include <vector>
 
-#include "pie_native/ptir/descriptor.hpp"
-#include "pie_native/ptir/fire_geometry.hpp"
+#include "pie_native/fire/descriptor.hpp"
+#include "pie_native/fire/fire_geometry.hpp"
 #include "pipeline/interp.hpp"
 
 namespace pie::metal::pipeline {

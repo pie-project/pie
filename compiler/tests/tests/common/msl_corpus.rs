@@ -328,3 +328,15 @@ pub fn region_shape(region: &pie_plan::Region) -> String {
         region.sinks.len()
     )
 }
+
+/// A bound trace to hand `emit_program`, which needs one for the program-wide
+/// Metal effect kernels.
+///
+/// `corpus_stages` deliberately flattens stages across every golden, so there
+/// is no single program the flattened list belongs to. The coverage tests only
+/// care that each kernel *family* is emitted, so any bound trace serves; this
+/// returns the first golden's.
+pub fn corpus_bound() -> pie_ir::validate::BoundTrace {
+    let name = GOLDEN_NAMES[0];
+    bind(golden_container(name), golden_profile(name)).expect("first golden binds")
+}

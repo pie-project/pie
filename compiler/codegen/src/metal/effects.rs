@@ -8,6 +8,11 @@
 use alloc::string::String;
 use core::fmt::Write as _;
 
+use alloc::vec::Vec;
+
+use pie_ir::op::Op;
+use pie_ir::validate::{BoundTrace, Direction};
+
 use super::M1ChannelEffect;
 use super::preamble::{common_effect_preamble, emit_word_arguments, grouped_preamble};
 
@@ -238,4 +243,44 @@ pub fn emit_grouped_commit(function_name: &str) -> String {
     source.push_str("  }\n");
     source.push_str("  status->state = 4;\n}\n");
     source
+}
+
+/// The per-program channel effect table the M1/M2 readiness and commit kernels
+/// are baked against.
+///
+/// This is the host's copy of what `m1_runtime.cpp` used to derive for itself
+/// from the decoded plan: capacity and the take/put flags come from the
+/// container, the two readiness bits from the bound trace's first-op direction
+/// table. It is emitted rather than derived so the driver stops needing the
+/// plan (see `ptir-refactor.md` §2.3) — and, more immediately, so the effect
+/// kernels the M1 and M2 launch paths bind are host-emitted like every other
+/// kernel rather than being the one family the driver still built itself.
+pub fn channel_effects(bound: &BoundTrace) -> Vec<M1ChannelEffect> {
+    let channels = &bound.container.channels;
+    let mut effects = Vec::with_capacity(channels.len());
+    for (index, channel) in channels.iter().enumerate() {
+        let chan = index as u32;
+        let mut effect = M1ChannelEffect {
+            requires_full: false,
+            requires_empty: false,
+            take: false,
+            put: false,
+            capacity: channel.capacity,
+        };
+        for program in &bound.container.stages {
+            for op in &program.ops {
+                match op {
+                    Op::ChanTake(taken) if *taken == chan => effect.take = true,
+                    Op::ChanPut { chan: put, .. } if *put == chan => effect.put = true,
+                    _ => {}
+                }
+            }
+        }
+        if let Some(entry) = bound.readiness.iter().find(|entry| entry.chan == chan) {
+            effect.requires_full = entry.dir == Direction::NeedsFull;
+            effect.requires_empty = entry.dir == Direction::NeedsEmpty;
+        }
+        effects.push(effect);
+    }
+    effects
 }

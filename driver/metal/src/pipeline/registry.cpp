@@ -73,6 +73,37 @@ int Registry::register_program(
                   << decode_error << "\n";
         return PIE_STATUS_INVALID_ARGUMENT;
     }
+    // Snapshot the host-emitted kernel table into `record` so it survives
+    // the caller's PieProgramDesc lifetime and the worker-thread hop
+    // `Context::Impl::register_program` performs before it hands the record
+    // to `M1Runtime::compile_program`. The empty-source-plus-error entry
+    // form is preserved verbatim: `m1_runtime.cpp` reads that as "the host
+    // deliberately could not emit this one" and takes the same fallback
+    // the old in-driver emitter did on `false`.
+    record.emitted_kernels.reserve(program.emitted_kernels.len);
+    for (std::size_t i = 0; i < program.emitted_kernels.len; ++i) {
+        const PieEmittedKernel& kernel = program.emitted_kernels.ptr[i];
+        HostEmittedKernel copy;
+        copy.kind = kernel.kind;
+        copy.stage_index = kernel.stage_index;
+        copy.region_index = kernel.region_index;
+        if (kernel.entry_name.len != 0) {
+            copy.entry_name.assign(
+                reinterpret_cast<const char*>(kernel.entry_name.ptr),
+                kernel.entry_name.len);
+        }
+        if (kernel.source.len != 0) {
+            copy.source.assign(
+                reinterpret_cast<const char*>(kernel.source.ptr),
+                kernel.source.len);
+        }
+        if (kernel.error.len != 0) {
+            copy.error.assign(
+                reinterpret_cast<const char*>(kernel.error.ptr),
+                kernel.error.len);
+        }
+        record.emitted_kernels.push_back(std::move(copy));
+    }
     program_ids_by_hash_[record.program_hash] = record.program_id;
     if (program_id != nullptr) *program_id = record.program_id;
     programs_.emplace(record.program_id, std::move(record));

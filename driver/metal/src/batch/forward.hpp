@@ -33,7 +33,7 @@
 #include <vector>
 
 #include "loader/load_plan.hpp"
-#include "pie_native/ptir/fire_geometry.hpp"
+#include "pie_native/fire/fire_geometry.hpp"
 
 namespace pie::metal {
 

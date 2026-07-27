@@ -23,7 +23,7 @@ use pie_codegen::cuda::{
     second_party_region_supported, singleton_runtime_source, validate_generated_region,
 };
 
-use msl_corpus::{corpus_stages, region_shape};
+use msl_corpus::{corpus_bound, corpus_stages, region_shape};
 
 fn golden_cuda_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("golden-cuda")
@@ -299,7 +299,7 @@ fn emit_program_covers_every_region() {
         .into_iter()
         .map(|stage| stage.plan)
         .collect();
-    let kernels = emit_program(Backend::Cuda, &stages);
+    let kernels = emit_program(Backend::Cuda, &stages, &corpus_bound());
 
     let expected: usize = stages.iter().map(|stage| stage.fused.regions.len()).sum();
     assert_eq!(
@@ -346,7 +346,7 @@ fn emit_program_metal_covers_every_family() {
         .into_iter()
         .map(|stage| stage.plan)
         .collect();
-    let kernels = emit_program(Backend::Metal, &stages);
+    let kernels = emit_program(Backend::Metal, &stages, &corpus_bound());
     for kind in [
         KERNEL_SINGLETON,
         KERNEL_FUSED,
