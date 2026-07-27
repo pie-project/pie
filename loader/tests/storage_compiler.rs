@@ -15,13 +15,12 @@ fn stored_contract(name: &str) -> ModelContract {
     serde_json::from_str(&text).unwrap_or_else(|err| panic!("{name}: parsing: {err}"))
 }
 use pie_loader::checkpoint::{CheckpointFile, CheckpointMetadata, RawTensor};
-use pie_loader::contract::{Expr, ModelContract, TensorContract};
-use pie_loader::ir::{GatherPiece, LayoutExpr, LayoutPlan};
-use pie_loader::load_plan::{StorageInstr, StorageTarget, TileMapKind};
-use pie_loader::planner::{compile_load_plan, lower_layout_plan};
+use pie_loader::contract::{Expr, ModelContract, TensorContract, TensorType};
+use pie_loader::plan::compile as compile_load_plan;
+use pie_loader::plan::{StorageInstr, StorageTarget, TileMapKind};
 use pie_loader::types::{
     Axis, BackendKind, CheckpointFormat, DType, Encoding, FileId, QuantScheme, QuantSpec,
-    RepackLayout, RowMap, TensorDecl, TensorId,
+    RepackLayout, RowMap, TensorId,
 };
 
 #[test]
@@ -84,7 +83,7 @@ fn metal_qwen35_schema_emits_canonical_affine_u4_arena() {
     };
     let target = StorageTarget {
         backend: BackendKind::Metal,
-        tile_map_mask: pie_loader::load_plan::METAL_TILE_MAP_MASK,
+        tile_map_mask: pie_loader::plan::METAL_TILE_MAP_MASK,
         max_tile_bytes: 64 << 20,
         preferred_alignment: 256,
         ..StorageTarget::default()
@@ -102,9 +101,6 @@ fn metal_qwen35_schema_emits_canonical_affine_u4_arena() {
                 bits_per_element: 4,
                 group_size,
                 channel_axis: Some(Axis(1)),
-                scale_dtype: Some(DType::BF16),
-                zero_point_dtype: Some(DType::BF16),
-                block_shape: vec![i64::from(group_size)],
             }
             .normalized(),
         )
@@ -163,44 +159,32 @@ fn metal_qwen35_schema_emits_canonical_affine_u4_arena() {
 
 #[test]
 fn buffer_join_tile_maps_carry_destination_offsets() {
-    let mut plan = LayoutPlan::new();
-    let a_decl = decl(0, "a", &[2], Encoding::Raw(DType::F32));
-    let b_decl = decl(1, "b", &[2], Encoding::Raw(DType::F32));
-    let a = plan.push(LayoutExpr::Source {
-        tensor: TensorId(0),
-        decl: a_decl.clone(),
-    });
-    let b = plan.push(LayoutExpr::Source {
-        tensor: TensorId(1),
-        decl: b_decl.clone(),
-    });
-    let a_cast_decl = decl(2, "a.cast", &[2], Encoding::Raw(DType::BF16));
-    let b_cast_decl = decl(3, "b.cast", &[2], Encoding::Raw(DType::BF16));
-    let a_cast = plan.push(LayoutExpr::Cast {
-        dtype: DType::BF16,
-        input: a,
-        decl: a_cast_decl,
-    });
-    let b_cast = plan.push(LayoutExpr::Cast {
-        dtype: DType::BF16,
-        input: b,
-        decl: b_cast_decl,
-    });
-    let joined_decl = decl(4, "joined", &[4], Encoding::Raw(DType::BF16));
-    let joined = plan.push(LayoutExpr::Gather {
-        inputs: vec![a_cast, b_cast],
-        pieces: vec![GatherPiece::span(0, 0, 0, 4), GatherPiece::span(1, 0, 4, 4)],
-        zero_fill: false,
-        decl: joined_decl.clone(),
-    });
-    let realized = plan.push(LayoutExpr::Realize {
-        input: joined,
-        runtime_name: "joined".to_string(),
-        decl: joined_decl,
-    });
-    plan.outputs.push(realized);
+    let contract = ModelContract {
+        abi_version: 1,
+        alignment: 1,
+        tensors: vec![
+            TensorContract::new(
+                "a.cast",
+                Expr::src("a"),
+                vec![2],
+                Encoding::Raw(DType::BF16),
+            ),
+            TensorContract::new(
+                "b.cast",
+                Expr::src("b"),
+                vec![2],
+                Encoding::Raw(DType::BF16),
+            ),
+            TensorContract::new(
+                "joined",
+                Expr::cat(0, vec![Expr::out("a.cast"), Expr::out("b.cast")]),
+                vec![4],
+                Encoding::Raw(DType::BF16),
+            ),
+        ],
+    };
 
-    let program = lower_layout_plan(&metadata(), &plan, StorageTarget::default()).unwrap();
+    let program = compile_load_plan(&metadata(), &contract, StorageTarget::default()).unwrap();
     let reblocks: Vec<_> = program
         .instrs
         .iter()
@@ -220,26 +204,15 @@ fn buffer_join_tile_maps_carry_destination_offsets() {
     assert_eq!(reblocks[0].stride.element_bytes, 2);
     assert_eq!(reblocks[1].stride.element_bytes, 2);
     assert_eq!(program.memory.device_write_bytes, 16);
-    assert_eq!(program.memory.persistent_bytes, 8);
-    assert_eq!(program.memory.temporary_peak_bytes, 8);
+    // The public contract has no ephemeral declarations, so the two cast inputs
+    // to the join are now named tensors and count toward persistent memory
+    // instead of temporary peak.
+    assert_eq!(program.memory.persistent_bytes, 16);
+    assert_eq!(program.memory.temporary_peak_bytes, 0);
 }
 
 #[test]
 fn direct_copy_lowers_to_identity_extent_write() {
-    let mut plan = LayoutPlan::new();
-    let runtime_decl = decl(7, "runtime.weight", &[2, 2], Encoding::Raw(DType::BF16));
-    let source_decl = decl(0, "checkpoint.weight", &[2, 2], Encoding::Raw(DType::BF16));
-    let source = plan.push(LayoutExpr::Source {
-        tensor: TensorId(6),
-        decl: source_decl,
-    });
-    let realized = plan.push(LayoutExpr::Realize {
-        input: source,
-        runtime_name: "runtime.weight".to_string(),
-        decl: runtime_decl,
-    });
-    plan.outputs.push(realized);
-
     let metadata = CheckpointMetadata {
         files: vec![CheckpointFile {
             id: FileId(0),
@@ -258,7 +231,18 @@ fn direct_copy_lowers_to_identity_extent_write() {
         }],
     };
 
-    let program = lower_layout_plan(&metadata, &plan, StorageTarget::default()).unwrap();
+    let contract = ModelContract {
+        abi_version: 1,
+        alignment: 1,
+        tensors: vec![TensorContract::new(
+            "runtime.weight",
+            Expr::src("checkpoint.weight"),
+            vec![2, 2],
+            Encoding::Raw(DType::BF16),
+        )],
+    };
+
+    let program = compile_load_plan(&metadata, &contract, StorageTarget::default()).unwrap();
     let writes: Vec<_> = program
         .instrs
         .iter()
@@ -290,38 +274,20 @@ fn direct_copy_lowers_to_identity_extent_write() {
 
 #[test]
 fn packed_quant_row_select_uses_byte_exact_offsets() {
-    let mut plan = LayoutPlan::new();
-    let q_decl = decl(
-        0,
-        "q",
-        &[4, 8],
-        Encoding::Quant(quant(QuantScheme::AwqInt4, DType::BF16)),
-    );
-    let q = plan.push(LayoutExpr::Source {
-        tensor: TensorId(2),
-        decl: q_decl,
-    });
-    let selected_decl = decl(
-        1,
-        "q.row",
-        &[1, 8],
-        Encoding::Quant(quant(QuantScheme::AwqInt4, DType::BF16)),
-    );
     // Row 2 of a [4, 8] int4 tensor: 8 elements at 4 bits is 4 bytes a row.
-    let selected = plan.push(LayoutExpr::Gather {
-        inputs: vec![q],
-        pieces: vec![GatherPiece::span(0, 8, 0, 4)],
-        zero_fill: false,
-        decl: selected_decl.clone(),
-    });
-    let realized = plan.push(LayoutExpr::Realize {
-        input: selected,
-        runtime_name: "q.row".to_string(),
-        decl: selected_decl,
-    });
-    plan.outputs.push(realized);
+    let contract = ModelContract {
+        abi_version: 1,
+        alignment: 1,
+        tensors: vec![TensorContract::new(
+            "q.row",
+            Expr::src("q").slice(0, 2, 1),
+            vec![1, 8],
+            Encoding::Quant(quant(QuantScheme::AwqInt4, DType::BF16)),
+        )],
+    };
 
-    let program = lower_layout_plan(&quant_metadata(), &plan, StorageTarget::default()).unwrap();
+    let program =
+        compile_load_plan(&quant_metadata(), &contract, StorageTarget::default()).unwrap();
     let write = program
         .instrs
         .iter()
@@ -337,107 +303,64 @@ fn packed_quant_row_select_uses_byte_exact_offsets() {
     assert_eq!(program.memory.device_write_bytes, 4);
 }
 
+/// An expression bigger than the tensor it is declared for is refused.
+///
+/// This used to inject a gather whose byte offsets ran past its output, which a
+/// contract cannot author: every destination offset the builder emits is
+/// derived from a declared shape. The byte-level property did not go away, it
+/// moved down to where the offsets are actually produced —
+/// `reference::replay` refuses a lowering that writes outside its output, and
+/// `tests/algebra.rs` pins that. What is checkable *here* is the declaration
+/// that would have led to one.
 #[test]
-fn a_gather_may_not_write_past_its_output() {
-    // Sub-byte slicing alignment is settled in `contract.rs`, where elements
-    // still exist. All the storage compiler can still check is bytes.
-    let mut plan = LayoutPlan::new();
-    let q_decl = decl(
-        0,
-        "q",
-        &[4, 8],
-        Encoding::Quant(quant(QuantScheme::AwqInt4, DType::BF16)),
-    );
-    let q = plan.push(LayoutExpr::Source {
-        tensor: TensorId(2),
-        decl: q_decl,
-    });
-    let out_decl = decl(
-        1,
-        "q.bad",
-        &[1, 8],
-        Encoding::Quant(quant(QuantScheme::AwqInt4, DType::BF16)),
-    );
-    let gathered = plan.push(LayoutExpr::Gather {
-        inputs: vec![q],
-        pieces: vec![GatherPiece::span(0, 0, 2, 4)],
-        zero_fill: false,
-        decl: out_decl.clone(),
-    });
-    let realized = plan.push(LayoutExpr::Realize {
-        input: gathered,
-        runtime_name: "q.bad".to_string(),
-        decl: out_decl,
-    });
-    plan.outputs.push(realized);
+fn an_expression_may_not_outgrow_the_tensor_it_is_declared_for() {
+    let contract = ModelContract {
+        abi_version: 1,
+        alignment: 1,
+        tensors: vec![TensorContract::new(
+            "q.bad",
+            Expr::src("q").slice(0, 0, 1),
+            vec![1, 4],
+            Encoding::Quant(quant(QuantScheme::AwqInt4, DType::BF16)),
+        )],
+    };
 
-    let err = lower_layout_plan(&quant_metadata(), &plan, StorageTarget::default())
+    let err = compile_load_plan(&quant_metadata(), &contract, StorageTarget::default())
         .unwrap_err()
         .to_string();
-    assert!(err.contains("writes past the end"), "{err}");
+    assert!(err.contains("declares shape [1, 4]"), "{err}");
+    assert!(err.contains("yields [1, 8]"), "{err}");
 }
 
 #[test]
 fn target_support_rejects_cuda_decode_at_compile_time() {
-    let mut plan = LayoutPlan::new();
-    let q_decl = decl(
-        0,
-        "q",
-        &[4],
-        Encoding::Quant(quant(QuantScheme::Fp8E4M3, DType::BF16)),
-    );
-    let q = plan.push(LayoutExpr::Source {
-        tensor: TensorId(3),
-        decl: q_decl,
-    });
-    let decoded_decl = decl(1, "decoded", &[4], Encoding::Raw(DType::BF16));
-    let decoded = plan.push(LayoutExpr::Decode {
-        metadata: Vec::new(),
-        scheme: QuantScheme::Fp8E4M3,
-        data: q,
-        decl: decoded_decl.clone(),
-    });
-    let realized = plan.push(LayoutExpr::Realize {
-        input: decoded,
-        runtime_name: "decoded".to_string(),
-        decl: decoded_decl,
-    });
-    plan.outputs.push(realized);
+    let contract = ModelContract {
+        abi_version: 1,
+        alignment: 1,
+        tensors: vec![TensorContract::new(
+            "decoded",
+            Expr::src("fp8"),
+            vec![4],
+            Encoding::Raw(DType::BF16),
+        )],
+    };
 
-    let err = lower_layout_plan(
+    let err = compile_load_plan(
         &quant_metadata(),
-        &plan,
+        &contract,
         StorageTarget {
             backend: BackendKind::Cuda,
-            tile_map_mask: pie_loader::load_plan::CUDA_TILE_MAP_MASK,
+            tile_map_mask: pie_loader::plan::CUDA_TILE_MAP_MASK,
             ..StorageTarget::default()
         },
     )
     .unwrap_err()
     .to_string();
-    assert!(err.contains("does not support Decode"));
+    assert!(err.contains("does not support Decode"), "{err}");
 }
 
 #[test]
 fn packed_quant_source_requires_exact_affine_size() {
-    let mut plan = LayoutPlan::new();
-    let q_decl = decl(
-        0,
-        "blocked",
-        &[4, 8],
-        Encoding::Quant(quant(QuantScheme::GgufQ4_0, DType::BF16)),
-    );
-    let q = plan.push(LayoutExpr::Source {
-        tensor: TensorId(5),
-        decl: q_decl.clone(),
-    });
-    let realized = plan.push(LayoutExpr::Realize {
-        input: q,
-        runtime_name: "blocked".to_string(),
-        decl: q_decl,
-    });
-    plan.outputs.push(realized);
-
     let mut metadata = quant_metadata();
     metadata.tensors.push(RawTensor {
         id: TensorId(5),
@@ -449,7 +372,18 @@ fn packed_quant_source_requires_exact_affine_size() {
         encoding: Encoding::Quant(quant(QuantScheme::GgufQ4_0, DType::BF16)),
     });
 
-    let err = lower_layout_plan(&metadata, &plan, StorageTarget::default())
+    let contract = ModelContract {
+        abi_version: 1,
+        alignment: 1,
+        tensors: vec![TensorContract::new(
+            "blocked",
+            Expr::src("blocked"),
+            vec![4, 8],
+            Encoding::Quant(quant(QuantScheme::GgufQ4_0, DType::BF16)),
+        )],
+    };
+
+    let err = compile_load_plan(&metadata, &contract, StorageTarget::default())
         .unwrap_err()
         .to_string();
     assert!(err.contains("non-affine physical size"));
@@ -459,7 +393,7 @@ fn packed_quant_source_requires_exact_affine_size() {
 fn gpt_oss_native_mxfp4_default_abi_lowers_to_repack_tile_maps() {
     let target = StorageTarget {
         backend: BackendKind::Cuda,
-        tile_map_mask: pie_loader::load_plan::CUDA_TILE_MAP_MASK,
+        tile_map_mask: pie_loader::plan::CUDA_TILE_MAP_MASK,
         native_mxfp4_moe: true,
         ..StorageTarget::default()
     };
@@ -511,7 +445,7 @@ fn gpt_oss_native_mxfp4_default_abi_lowers_to_repack_tile_maps() {
 fn gpt_oss_native_mxfp4_tp_uses_row_and_column_offset_repack_contracts() {
     let target = StorageTarget {
         backend: BackendKind::Cuda,
-        tile_map_mask: pie_loader::load_plan::CUDA_TILE_MAP_MASK,
+        tile_map_mask: pie_loader::plan::CUDA_TILE_MAP_MASK,
         tp_rank: 1,
         tp_size: 2,
         native_mxfp4_moe: true,
@@ -635,7 +569,7 @@ fn gpt_oss_native_mxfp4_tp_uses_row_and_column_offset_repack_contracts() {
 fn nemotron_h_default_abi_packs_experts_and_exposes_views() {
     let target = StorageTarget {
         backend: BackendKind::Cuda,
-        tile_map_mask: pie_loader::load_plan::CUDA_TILE_MAP_MASK,
+        tile_map_mask: pie_loader::plan::CUDA_TILE_MAP_MASK,
         tp_rank: 1,
         tp_size: 2,
         preferred_alignment: 256,
@@ -966,16 +900,6 @@ fn sized_raw(
     }
 }
 
-fn decl(id: u32, name: &str, shape: &[i64], encoding: Encoding) -> TensorDecl {
-    TensorDecl {
-        id: TensorId(id),
-        name: name.to_string(),
-        shape: shape.to_vec(),
-        encoding,
-        alignment: 1,
-    }
-}
-
 fn quant(scheme: QuantScheme, dtype: DType) -> QuantSpec {
     QuantSpec {
         scheme,
@@ -983,9 +907,6 @@ fn quant(scheme: QuantScheme, dtype: DType) -> QuantSpec {
         bits_per_element: scheme.default_bits(),
         group_size: scheme.default_group_size(),
         channel_axis: None,
-        scale_dtype: Some(DType::F32),
-        zero_point_dtype: None,
-        block_shape: Vec::new(),
     }
 }
 
@@ -1019,29 +940,28 @@ fn slab_scatter_merges_nearby_bulk_extent_writes() {
             raw_big(2, "t2", 2 * (chunk + gap), chunk, DType::BF16),
         ],
     };
-    let mut plan = LayoutPlan::new();
-    let mut ids = Vec::new();
-    for i in 0..3u32 {
-        let cols = (chunk / 2) as i64; // BF16 = 2 bytes
-        let src = plan.push(LayoutExpr::Source {
-            tensor: TensorId(i),
-            decl: decl(i, &format!("t{i}"), &[cols], Encoding::Raw(DType::BF16)),
-        });
-        let r = plan.push(LayoutExpr::Realize {
-            input: src,
-            runtime_name: format!("t{i}"),
-            decl: decl(i, &format!("t{i}"), &[cols], Encoding::Raw(DType::BF16)),
-        });
-        ids.push(r);
-    }
-    plan.outputs = ids;
+    let contract = ModelContract {
+        abi_version: 1,
+        alignment: 1,
+        tensors: (0..3u32)
+            .map(|i| {
+                let cols = (chunk / 2) as i64; // BF16 = 2 bytes
+                TensorContract::new(
+                    format!("t{i}"),
+                    Expr::src(format!("t{i}")),
+                    vec![cols],
+                    Encoding::Raw(DType::BF16),
+                )
+            })
+            .collect(),
+    };
 
     let target = StorageTarget {
         backend: BackendKind::Cuda,
-        tile_map_mask: pie_loader::load_plan::CUDA_TILE_MAP_MASK,
+        tile_map_mask: pie_loader::plan::CUDA_TILE_MAP_MASK,
         ..StorageTarget::default()
     };
-    let program = lower_layout_plan(&meta, &plan, target).unwrap();
+    let program = compile_load_plan(&meta, &contract, target).unwrap();
 
     let slabs: Vec<_> = program
         .instrs
@@ -1093,26 +1013,29 @@ fn slab_scatter_rejects_excessive_overread() {
             raw_big(1, "far", small + gap, small, DType::BF16),
         ],
     };
-    let mut plan = LayoutPlan::new();
-    for i in 0..2u32 {
-        let cols = (small / 2) as i64;
-        let src = plan.push(LayoutExpr::Source {
-            tensor: TensorId(i),
-            decl: decl(i, &format!("t{i}"), &[cols], Encoding::Raw(DType::BF16)),
-        });
-        let r = plan.push(LayoutExpr::Realize {
-            input: src,
-            runtime_name: format!("t{i}"),
-            decl: decl(i, &format!("t{i}"), &[cols], Encoding::Raw(DType::BF16)),
-        });
-        plan.outputs.push(r);
-    }
+    let contract = ModelContract {
+        abi_version: 1,
+        alignment: 1,
+        tensors: ["near", "far"]
+            .into_iter()
+            .enumerate()
+            .map(|(i, source)| {
+                let cols = (small / 2) as i64;
+                TensorContract::new(
+                    format!("t{i}"),
+                    Expr::src(source),
+                    vec![cols],
+                    Encoding::Raw(DType::BF16),
+                )
+            })
+            .collect(),
+    };
     let target = StorageTarget {
         backend: BackendKind::Cuda,
-        tile_map_mask: pie_loader::load_plan::CUDA_TILE_MAP_MASK,
+        tile_map_mask: pie_loader::plan::CUDA_TILE_MAP_MASK,
         ..StorageTarget::default()
     };
-    let program = lower_layout_plan(&meta, &plan, target).unwrap();
+    let program = compile_load_plan(&meta, &contract, target).unwrap();
     let slabs: Vec<_> = program
         .instrs
         .iter()
@@ -1143,26 +1066,29 @@ fn slab_scatter_placement_offsets_are_within_span() {
             raw_big(2, "c", 2 * (chunk + gap), chunk, DType::BF16),
         ],
     };
-    let mut plan = LayoutPlan::new();
-    for i in 0..3u32 {
-        let cols = (chunk / 2) as i64;
-        let src = plan.push(LayoutExpr::Source {
-            tensor: TensorId(i),
-            decl: decl(i, &format!("p{i}"), &[cols], Encoding::Raw(DType::BF16)),
-        });
-        let r = plan.push(LayoutExpr::Realize {
-            input: src,
-            runtime_name: format!("p{i}"),
-            decl: decl(i, &format!("p{i}"), &[cols], Encoding::Raw(DType::BF16)),
-        });
-        plan.outputs.push(r);
-    }
+    let contract = ModelContract {
+        abi_version: 1,
+        alignment: 1,
+        tensors: ["a", "b", "c"]
+            .into_iter()
+            .enumerate()
+            .map(|(i, source)| {
+                let cols = (chunk / 2) as i64;
+                TensorContract::new(
+                    format!("p{i}"),
+                    Expr::src(source),
+                    vec![cols],
+                    Encoding::Raw(DType::BF16),
+                )
+            })
+            .collect(),
+    };
     let target = StorageTarget {
         backend: BackendKind::Cuda,
-        tile_map_mask: pie_loader::load_plan::CUDA_TILE_MAP_MASK,
+        tile_map_mask: pie_loader::plan::CUDA_TILE_MAP_MASK,
         ..StorageTarget::default()
     };
-    let program = lower_layout_plan(&meta, &plan, target).unwrap();
+    let program = compile_load_plan(&meta, &contract, target).unwrap();
     for instr in &program.instrs {
         if let StorageInstr::SlabScatter {
             span_bytes,
@@ -1201,8 +1127,6 @@ fn raw_big(id: u32, name: &str, offset: u64, span_bytes: u64, dtype: DType) -> R
 
 #[test]
 fn mla_q_kv_a_fusion_produces_joined_tensor() {
-    use pie_loader::planner::compile_load_plan;
-
     let h = 128i64;
     let q_lora = 32i64;
     let kv_lora_rope = 16i64;
@@ -1266,7 +1190,7 @@ fn mla_q_kv_a_fusion_produces_joined_tensor() {
     };
     let target = StorageTarget {
         backend: BackendKind::Cuda,
-        tile_map_mask: pie_loader::load_plan::CUDA_TILE_MAP_MASK,
+        tile_map_mask: pie_loader::plan::CUDA_TILE_MAP_MASK,
         ..StorageTarget::default()
     };
     let contract = stored_contract("kimi_k2_mla_fusion");
@@ -1307,12 +1231,12 @@ fn mla_q_kv_a_fusion_produces_joined_tensor() {
 fn instr_id(instr: &StorageInstr) -> pie_loader::types::InstrId {
     match instr {
         StorageInstr::Allocate { id, .. }
+        | StorageInstr::Fill { id, .. }
         | StorageInstr::ExtentWrite { id, .. }
         | StorageInstr::BulkExtentWrite { id, .. }
         | StorageInstr::SlabScatter { id, .. }
         | StorageInstr::TileMap { id, .. }
         | StorageInstr::CreateView { id, .. }
-        | StorageInstr::Release { id, .. }
         | StorageInstr::Finalize { id, .. } => *id,
     }
 }
@@ -1326,34 +1250,6 @@ fn instr_id(instr: &StorageInstr) -> pie_loader::types::InstrId {
 /// answer travels.
 #[test]
 fn a_block_scaled_fp8_source_carries_its_scale_tensor() {
-    let mut plan = LayoutPlan::new();
-    let source = plan.push(LayoutExpr::Source {
-        tensor: TensorId(0),
-        decl: decl(0, "w.weight", &[64, 64], Encoding::Raw(DType::F8E4M3)),
-    });
-    let encoded = plan.push(LayoutExpr::Encode {
-        scheme: QuantScheme::Mxfp4E2M1E8M0,
-        input: source,
-        metadata_outputs: Vec::new(),
-        decl: decl(
-            1,
-            "runtime.w",
-            &[64, 64],
-            Encoding::Quant(quant(QuantScheme::Mxfp4E2M1E8M0, DType::BF16)),
-        ),
-    });
-    let realized = plan.push(LayoutExpr::Realize {
-        input: encoded,
-        runtime_name: "runtime.w".to_string(),
-        decl: decl(
-            1,
-            "runtime.w",
-            &[64, 64],
-            Encoding::Quant(quant(QuantScheme::Mxfp4E2M1E8M0, DType::BF16)),
-        ),
-    });
-    plan.outputs.push(realized);
-
     let metadata = CheckpointMetadata {
         files: vec![CheckpointFile {
             id: FileId(0),
@@ -1372,7 +1268,17 @@ fn a_block_scaled_fp8_source_carries_its_scale_tensor() {
         tile_map_mask: u32::MAX,
         ..StorageTarget::default()
     };
-    let program = lower_layout_plan(&metadata, &plan, target).unwrap();
+    let contract = ModelContract {
+        abi_version: 1,
+        alignment: 1,
+        tensors: vec![TensorContract::new(
+            "runtime.w",
+            Expr::src("w.weight"),
+            vec![64, 64],
+            Encoding::Quant(quant(QuantScheme::Mxfp4E2M1E8M0, DType::BF16)),
+        )],
+    };
+    let program = compile_load_plan(&metadata, &contract, target).unwrap();
     let encodes: Vec<_> = program
         .instrs
         .iter()
@@ -1391,34 +1297,6 @@ fn a_block_scaled_fp8_source_carries_its_scale_tensor() {
 /// ...and a source with no such sibling says so, rather than naming tensor 0.
 #[test]
 fn a_source_without_a_scale_sibling_names_none() {
-    let mut plan = LayoutPlan::new();
-    let source = plan.push(LayoutExpr::Source {
-        tensor: TensorId(0),
-        decl: decl(0, "w.weight", &[64, 64], Encoding::Raw(DType::BF16)),
-    });
-    let encoded = plan.push(LayoutExpr::Encode {
-        scheme: QuantScheme::Mxfp4E2M1E8M0,
-        input: source,
-        metadata_outputs: Vec::new(),
-        decl: decl(
-            1,
-            "runtime.w",
-            &[64, 64],
-            Encoding::Quant(quant(QuantScheme::Mxfp4E2M1E8M0, DType::BF16)),
-        ),
-    });
-    let realized = plan.push(LayoutExpr::Realize {
-        input: encoded,
-        runtime_name: "runtime.w".to_string(),
-        decl: decl(
-            1,
-            "runtime.w",
-            &[64, 64],
-            Encoding::Quant(quant(QuantScheme::Mxfp4E2M1E8M0, DType::BF16)),
-        ),
-    });
-    plan.outputs.push(realized);
-
     let metadata = CheckpointMetadata {
         files: vec![CheckpointFile {
             id: FileId(0),
@@ -1433,10 +1311,156 @@ fn a_source_without_a_scale_sibling_names_none() {
         tile_map_mask: u32::MAX,
         ..StorageTarget::default()
     };
-    let program = lower_layout_plan(&metadata, &plan, target).unwrap();
+    let contract = ModelContract {
+        abi_version: 1,
+        alignment: 1,
+        tensors: vec![TensorContract::new(
+            "runtime.w",
+            Expr::src("w.weight"),
+            vec![64, 64],
+            Encoding::Quant(quant(QuantScheme::Mxfp4E2M1E8M0, DType::BF16)),
+        )],
+    };
+    let program = compile_load_plan(&metadata, &contract, target).unwrap();
     for instr in &program.instrs {
         if let StorageInstr::TileMap { transform, .. } = instr {
             assert_eq!(transform.metadata_source, None);
         }
     }
+}
+
+#[test]
+fn a_padded_head_dim_zeroes_the_buffer_before_it_writes_the_rows() {
+    // `driver/cuda/src/model/llama_like/llama_like.cpp:640` wants this: pad Q/K/V
+    // up to a head_dim the attention kernel takes. Until `Fill` existed the
+    // compiler priced the pad (spec.md §3.3) and then refused to build it.
+    let metadata = CheckpointMetadata {
+        files: vec![CheckpointFile {
+            id: FileId(0),
+            path: "model.safetensors".to_string(),
+            size_bytes: 1024,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors: vec![RawTensor {
+            id: TensorId(0),
+            name: "q_proj.weight".to_string(),
+            file_id: FileId(0),
+            file_offset: 0,
+            span_bytes: 32,
+            shape: vec![4, 4],
+            encoding: Encoding::Raw(DType::BF16),
+        }],
+    };
+
+    let contract = ModelContract {
+        abi_version: 1,
+        alignment: 1,
+        tensors: vec![TensorContract::new(
+            "q_proj.weight",
+            Expr::src("q_proj.weight").pad(1, 0, 1),
+            vec![4, 5],
+            Encoding::Raw(DType::BF16),
+        )],
+    };
+
+    let program = compile_load_plan(&metadata, &contract, StorageTarget::default()).unwrap();
+
+    let fills: Vec<_> = program
+        .instrs
+        .iter()
+        .filter_map(|instr| match instr {
+            StorageInstr::Fill { id, buffer } => Some((*id, *buffer)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(fills.len(), 1, "one fill, not one per band");
+    let (fill_id, filled) = fills[0];
+
+    // Four rows, because the destination stride is wider than the row and
+    // `fold` will not skip in the destination. spec.md §3.3 prices this at 5.
+    let writes: Vec<_> = program
+        .instrs
+        .iter()
+        .filter(|instr| {
+            matches!(
+                instr,
+                StorageInstr::ExtentWrite { .. } | StorageInstr::BulkExtentWrite { .. }
+            )
+        })
+        .collect();
+    assert_eq!(writes.len(), 4);
+
+    // The fill has to run before every one of them, or it erases what they wrote.
+    let at = |want| program.schedule.iter().position(|id| *id == want).unwrap();
+    let fill_at = at(fill_id);
+    for write in &writes {
+        assert!(fill_at < at(instr_id(write)), "the fill must come first");
+    }
+
+    // The padded column is real memory that no source covers.
+    assert_eq!(program.memory.checkpoint_read_bytes, 32);
+    assert_eq!(program.memory.device_write_bytes, 32);
+    assert_eq!(program.memory.persistent_bytes, 40);
+    assert_eq!(program.buffer(filled).unwrap().bytes, 40);
+}
+
+/// A block scale is bytes in the file and an exponent to the GEMM.
+///
+/// DeepSeek-V4 pairs FP8-E4M3 weights with OCP Microscaling E8M0 scales --
+/// a combination `QuantScheme::Mxfp4E2M1E8M0` cannot name, because that symbol
+/// bundles the element format together with the scale format. The driver used
+/// to bridge the gap by copying the scales to the host and running `ldexpf`
+/// over them at bind time.
+///
+/// No new expression is needed for this. `Bitcast` names the reading of the
+/// bytes and the declaration names the type wanted, so the existing
+/// dtype-mismatch rule inserts the cast -- which is the whole argument for
+/// `E8M0` being a dtype rather than an arithmetic escape hatch.
+#[test]
+fn an_e8m0_block_scale_read_as_fp32_lowers_to_a_cast() {
+    let metadata = CheckpointMetadata {
+        files: vec![CheckpointFile {
+            id: FileId(0),
+            path: "model.safetensors".to_string(),
+            size_bytes: 1 << 20,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors: vec![sized_raw(0, "w.scale", 0, 64, &[8, 8], DType::U8)],
+    };
+    let target = StorageTarget {
+        backend: BackendKind::Cuda,
+        tile_map_mask: u32::MAX,
+        ..StorageTarget::default()
+    };
+    let contract = ModelContract {
+        abi_version: 1,
+        alignment: 1,
+        tensors: vec![TensorContract::new(
+            "runtime.w.scale",
+            Expr::Bitcast {
+                src: Box::new(Expr::src("w.scale")),
+                out: TensorType {
+                    shape: vec![8, 8],
+                    encoding: Encoding::Raw(DType::E8M0),
+                },
+            },
+            vec![8, 8],
+            Encoding::Raw(DType::F32),
+        )],
+    };
+    let program = compile_load_plan(&metadata, &contract, target).unwrap();
+    let casts = program
+        .instrs
+        .iter()
+        .filter(|instr| {
+            matches!(
+                instr,
+                StorageInstr::TileMap {
+                    kind: TileMapKind::Cast,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(casts, 1, "expected exactly one Cast, got plan {program:#?}");
 }

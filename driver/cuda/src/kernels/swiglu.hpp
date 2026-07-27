@@ -65,11 +65,14 @@ void launch_sigmoid_gate_inplace_bf16(
 // deinterleave that an unfused path would need.
 //
 //     y[n, i] = silu(packed[n, i]) * packed[n, I + i]
+// `gate_second` selects the [linear|gate] order flashinfer's CUTLASS MoE
+// requires; the default is HuggingFace's [gate|up].
 void launch_chunked_swiglu_bf16(
-    const void* packed,  // [N, 2*I] bf16 (gate first, up second)
+    const void* packed,  // [N, 2*I] bf16
     void*       y,       // [N, I]   bf16
     int N, int I,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    bool gate_second = false);
 
 void launch_chunked_swiglu_strided_bf16(
     const void* packed,  // [N, row_stride] bf16 (gate first, up second)

@@ -23,6 +23,8 @@
 #include "kernels/kv_paged.hpp"
 #include "kernels/moe_dispatch.hpp"
 #include "kernels/moe_grouped_gemm.hpp"
+#include "ops/flashinfer_moe.hpp"
+#include "model/qwen3_5/qwen3_5_moe.hpp"
 #include "kernels/residual_add.hpp"
 #include <mutex>
 #include <set>
@@ -165,6 +167,32 @@ bool moe_grouped_gemm_enabled() {
         return v[0] != '0';
     }();
     return enabled;
+}
+
+// flashinfer's CUTLASS grouped MoE. It takes unpermuted rows plus the topk
+// indices/scales and does permute -> GEMM1 -> swiglu -> GEMM2 -> scaled
+// unpermute internally, so it needs neither the aligned-block padding nor
+// the static worst-case batch count that the cuBLAS path is forced into
+// under graph capture, and its grouped GEMM tiles M properly. Those are
+// exactly the two costs that keep PIE's MoE at ~700 GB/s against vLLM's
+// 1220 on the same bytes.
+// Decode batches are bounded by the scheduler's concurrency, so the fused
+// MoE workspace is sized for this rather than for a prefill's token count.
+constexpr int kFusedMoeMaxRows = 512;
+
+bool moe_flashinfer_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_QWEN35_MOE_FLASHINFER");
+        if (v == nullptr || v[0] == '\0') return true;
+        return v[0] != '0';
+    }();
+    return enabled;
+}
+
+// True when the routed gate/up weights were stored in flashinfer's
+// [linear|gate] order at bind time. Both MoE paths must agree.
+bool moe_gate_up_swapped() {
+    return model::qwen35_moe_gate_up_swapped();
 }
 
 bool shared_fold_enabled() {
@@ -688,6 +716,22 @@ Qwen3_5MoeMlpWorkspace Qwen3_5MoeMlpWorkspace::allocate(
             DeviceBuffer<std::uint16_t>::alloc(ws.aligned_rows_capacity * I);
         ws.aligned_out =
             DeviceBuffer<std::uint16_t>::alloc(ws.aligned_rows_capacity * H);
+    }
+    if (moe_flashinfer_enabled() && ops::flashinfer_cutlass_moe_enabled()) {
+        // Sized for decode, not for the prefill high-water mark: the fused
+        // path only runs on the decode fast path, and its workspace scales
+        // with rows * top_k. At tp=1 the whole 68 GB model sits on one
+        // device and a prefill-sized workspace does not fit the budget.
+        ws.cutlass_max_rows = std::min(max_tokens, kFusedMoeMaxRows);
+        const std::size_t bytes = ops::flashinfer_cutlass_moe_workspace_bytes(
+            ops::MoeActivation::Swiglu, ws.cutlass_max_rows, hidden,
+            moe_intermediate, num_experts, top_k,
+            /*tp_size=*/1, /*tp_rank=*/0);
+        if (bytes > 0) {
+            ws.cutlass_ws = DeviceBuffer<std::uint8_t>::alloc(bytes);
+            ws.cutlass_row_map = DeviceBuffer<std::int32_t>::alloc(
+                static_cast<std::size_t>(ws.cutlass_max_rows) * top_k);
+        }
     }
     return ws;
 }
@@ -1551,6 +1595,38 @@ bool moe_block(
         profile_cuda_stage(profile, profile ? &profile->moe_routed_ms : nullptr,
             stream, [&] {
                 const int routes = N * K;
+                // Weights are already sharded per rank, so the runner is told
+                // tp_size=1 and given this rank's own slice.
+                // The runner overwrites its output, so when the caller
+                // wanted the residual folded in it writes to scratch and a
+                // separate add follows -- still far cheaper than the path
+                // this replaces, and it is what makes tp=1 (where
+                // `add_to_residual` is always set) reach this kernel.
+                void* fused_out = add_to_residual ? ws.norm_y.data() : moe_out;
+                if (!moe_ws.cutlass_ws.empty() &&
+                    N <= moe_ws.cutlass_max_rows &&
+                    ops::flashinfer_cutlass_moe_bf16(
+                        ops::MoeActivation::Swiglu,
+                        static_cast<const std::uint16_t*>(ws.norm_x.data()),
+                        moe_ws.topk_idx.data(),
+                        moe_ws.topk_weights.data(),
+                        static_cast<const std::uint16_t*>(
+                            Lw.moe_gate_up_proj->data()),
+                        static_cast<const std::uint16_t*>(
+                            Lw.moe_down_proj->data()),
+                        static_cast<std::uint16_t*>(fused_out),
+                        moe_ws.cutlass_ws.data(),
+                        moe_ws.cutlass_ws.size(),
+                        moe_ws.cutlass_row_map.data(),
+                        N, H, Im, E, K,
+                        /*tp_size=*/1, /*tp_rank=*/0, stream)) {
+                    if (add_to_residual) {
+                        kernels::launch_residual_add_bf16(
+                            moe_out, ws.norm_y.data(),
+                            static_cast<std::size_t>(N) * H, stream);
+                    }
+                    return;
+                }
                 const int block = moe_ws.aligned_block_size;
                 const bool use_aligned_decode =
                     block > 1 &&
@@ -1679,7 +1755,8 @@ bool moe_block(
                             kernels::launch_chunked_swiglu_bf16(
                                 moe_ws.aligned_gate_up.data(),
                                 moe_ws.aligned_act.data(),
-                                aligned_rows, Im, stream);
+                                aligned_rows, Im, stream,
+                                /*gate_second=*/moe_gate_up_swapped());
                         });
 
                     // Aligned down_proj: M=block_size, N=H, K=Im.
@@ -1747,7 +1824,8 @@ bool moe_block(
                             kernels::launch_chunked_swiglu_bf16(
                                 moe_ws.expert_gate_up.data(),
                                 moe_ws.expert_act.data(),
-                                routes, Im, stream);
+                                routes, Im, stream,
+                                /*gate_second=*/moe_gate_up_swapped());
                         });
 
                     profile_cuda_detail_stage(
@@ -1795,7 +1873,8 @@ bool moe_block(
                             kernels::launch_chunked_swiglu_bf16(
                                 moe_ws.expert_gate_up.data(),
                                 moe_ws.expert_act.data(),
-                                routes, Im, stream);
+                                routes, Im, stream,
+                                /*gate_second=*/moe_gate_up_swapped());
                         });
 
                     profile_cuda_detail_stage(
@@ -1868,7 +1947,8 @@ bool moe_block(
                             kernels::launch_chunked_swiglu_bf16(
                                 moe_ws.expert_gate_up.data(),
                                 moe_ws.expert_act.data(),
-                                routes, Im, stream);
+                                routes, Im, stream,
+                                /*gate_second=*/moe_gate_up_swapped());
                         });
 
                     // down_proj batched GEMM: M=1, N=H, K=Im, batch=N*top_k.
@@ -1941,7 +2021,8 @@ bool moe_block(
                     kernels::launch_chunked_swiglu_bf16(
                         moe_ws.expert_gate_up.data(),
                         moe_ws.expert_act.data(),
-                        Ne, Im, stream);
+                        Ne, Im, stream,
+                        /*gate_second=*/moe_gate_up_swapped());
 
                     const auto* down_w = static_cast<const std::uint16_t*>(
                                              Lw.moe_down_proj->data())

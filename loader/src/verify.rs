@@ -231,7 +231,7 @@ pub fn verify(
 /// beside it was removed: a monotonic layout number cannot say anything a
 /// source hash does not, and it said it about a struct C++ reads by layout.
 fn check_compiler_version(plan: &PlanView<'_>, found: &mut Vec<Violation>) {
-    let expected = crate::load_plan::compiler_version();
+    let expected = crate::plan::compiler_version();
     if plan.compiler_version != expected {
         found.push(Violation::plan(format!(
             "plan compiler version {:#x} does not match loader version {expected:#x}",
@@ -471,7 +471,7 @@ fn encoding_matches(planned: &Encoding, demanded: &Encoding) -> bool {
 mod tests {
     use super::*;
     use crate::ffi::view::verify_marshalled;
-    use crate::load_plan::{LoadPlan, StorageInstr, StorageTarget, compiler_version};
+    use crate::plan::{LoadPlan, StorageInstr, StorageTarget, compiler_version};
     use crate::types::{BufferId, Encoding, InstrId, TensorDecl, TensorId};
 
     fn decl(name: &str) -> TensorDecl {

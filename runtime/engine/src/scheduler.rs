@@ -157,16 +157,24 @@ pub async fn debug_dump(driver_id: usize) -> Result<String> {
 /// Waves per frame (k): a static deployment constant, fixed at engine start
 /// exactly like the KV page size — never renegotiated per frame and never
 /// adapted from runtime timing. Guests query it via `model.frame-size()` and
-/// size their frames/channels to it. 1 (the default) keeps the per-wave
-/// wait-all scheduling path byte-identical to today; k > 1 enables sealed
-/// frame scheduling ([`worker`]'s frame policy).
+/// size their frames/channels to it.
+///
+/// The default is 2. At k = 1 the wait-all quorum runs once per token, and
+/// above ~64 concurrent processes the fleet stops overlapping batches
+/// entirely — measured duty (forward batches in flight) collapses from 1.7
+/// to 1.0 and becomes bimodal, costing 29% throughput and 28% latency at
+/// concurrency 256. k = 2 halves the number of quorum boundaries and holds
+/// duty at 1.6 with no regression at any lower concurrency. k = 3 and k = 4
+/// measure the same as k = 2 while costing more driver staging depth, so 2
+/// is the setting (CONTENTION_FOLLOWUP §20.8). Set `PIE_FRAME_SIZE=1` to
+/// restore the per-wave path.
 pub fn configured_frame_size() -> usize {
     static CONFIGURED: OnceLock<usize> = OnceLock::new();
     *CONFIGURED.get_or_init(|| {
         std::env::var("PIE_FRAME_SIZE")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(1)
+            .unwrap_or(2)
             .clamp(1, 64)
     })
 }

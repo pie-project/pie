@@ -20,9 +20,9 @@ use std::path::PathBuf;
 
 use crate::artifact::{ArtifactInputs, artifact_cache_key};
 use crate::checkpoint::read::parse_checkpoint_metadata;
-use crate::error::CompileError;
-use crate::load_plan::LoadPlan;
-use crate::planner::compile_load_plan;
+use crate::error::Error;
+use crate::plan::LoadPlan;
+use crate::plan::compile as compile_load_plan;
 
 use super::arena;
 use super::checkpoint::PieLoaderCheckpoint;
@@ -225,10 +225,24 @@ pub(super) unsafe fn as_str<'a>(value: &'a PieLoaderBytes, field: &str) -> Resul
     std::str::from_utf8(bytes).map_err(|err| format!("{field}: not valid UTF-8: {err}"))
 }
 
-fn compile_error_status(err: &CompileError) -> PieLoaderStatus {
+/// How a compile failure crosses the ABI.
+///
+/// Every variant that used to be `InvalidInput` still answers
+/// `InvalidCheckpoint`, so this is behaviour-preserving: the status enum is
+/// coarser than [`Error`] on purpose, because a C caller acts on "retry with a
+/// different checkpoint" versus "file a bug" and nothing finer. The full
+/// distinction travels in the diagnostic message and in [`Error::code`].
+///
+/// Written exhaustively rather than with a wildcard so that adding a variant to
+/// [`Error`] forces this decision to be made again.
+fn compile_error_status(err: &Error) -> PieLoaderStatus {
     match err {
-        CompileError::InvalidInput(_) => PieLoaderStatus::InvalidCheckpoint,
-        CompileError::Internal(_) => PieLoaderStatus::Internal,
+        Error::Contract(_)
+        | Error::Shard(_)
+        | Error::Checkpoint(_)
+        | Error::Unsupported(_)
+        | Error::Overflow(_) => PieLoaderStatus::InvalidCheckpoint,
+        Error::Internal(_) => PieLoaderStatus::Internal,
     }
 }
 
@@ -290,7 +304,7 @@ unsafe fn compile_contract_request(
 /// A contract request with its target resolved and its contract materialized.
 struct CheckedContractRequest {
     model: crate::contract::ModelContract,
-    target: crate::load_plan::StorageTarget,
+    target: crate::plan::StorageTarget,
 }
 
 /// Validate a contract request without touching the filesystem.

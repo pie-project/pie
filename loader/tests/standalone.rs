@@ -131,8 +131,8 @@ fn nothing_below_the_reader_opens_a_file() {
 fn a_plan_compiles_from_a_value_with_no_checkpoint_anywhere() {
     use pie_loader::checkpoint::{CheckpointFile, CheckpointMetadata, RawTensor};
     use pie_loader::contract::{Expr, ModelContract, TensorContract};
-    use pie_loader::load_plan::StorageTarget;
-    use pie_loader::planner::compile_load_plan;
+    use pie_loader::plan::StorageTarget;
+    use pie_loader::plan::compile as compile_load_plan;
     use pie_loader::types::{CheckpointFormat, DType, Encoding, FileId, TensorId};
 
     let nowhere = "/nonexistent/there-is-no-checkpoint-here/model.safetensors";
@@ -223,31 +223,32 @@ fn nothing_in_the_compiler_knows_what_a_model_is() {
 
 /// The backend lowering states no device constant of its own.
 ///
-/// `backend/` decides how a transform is *expressed* for a device; what the
-/// device can *do* arrives in `StorageTarget`. The distinction is easy to lose
-/// one number at a time — a fallback tile size, a block-scale granularity, a
-/// scratch dtype — and each one makes the plan depend on something no caller
-/// stated and no artifact key covers.
+/// `plan/passes/tile.rs` decides how a transform is *expressed* for a device;
+/// what the device can *do* arrives in `StorageTarget`. The distinction is easy
+/// to lose one number at a time — a fallback tile size, a block-scale
+/// granularity, a scratch dtype — and each one makes the plan depend on
+/// something no caller stated and no artifact key covers.
 #[test]
 fn the_backend_lowering_reads_its_numbers_off_the_target() {
+    const TILE: &str = "plan/passes/tile.rs";
     let sources = sources();
-    let (_, cuda) = sources
+    let (_, tile) = sources
         .iter()
-        .find(|(rel, _)| rel == "backend/cuda.rs")
-        .expect("the CUDA lowering must exist for this test to mean anything");
+        .find(|(rel, _)| rel == TILE)
+        .expect("the backend lowering must exist for this test to mean anything");
 
     let mut offences = Vec::new();
-    for (line_no, line) in production_lines(cuda) {
+    for (line_no, line) in production_lines(tile) {
         let trimmed = line.trim();
-        // A `const` here is a number the driver never stated. The tile-map mask
-        // is the one exception and is not a capability claim: it is the set of
-        // transforms the *loader* knows how to emit, which the driver intersects
-        // with its own.
+        // A `const` here is a number the driver never stated. The tile-map masks
+        // are the one exception and are not capability claims: they are the set
+        // of transforms the *loader* knows how to emit, which the driver
+        // intersects with its own.
         if trimmed.starts_with("const ") || trimmed.starts_with("pub const ") {
             if trimmed.contains("TILE_MAP_MASK") {
                 continue;
             }
-            offences.push(format!("backend/cuda.rs:{line_no}: {trimmed}"));
+            offences.push(format!("{TILE}:{line_no}: {trimmed}"));
         }
     }
     assert!(

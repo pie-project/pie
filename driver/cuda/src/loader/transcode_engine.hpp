@@ -1,7 +1,7 @@
 #pragma once
 
 // TranscodeEngine: the quant/transcode TileMap path — Cast, Encode
-// (FP8->bf16->FP8/MXFP4, fused or staged), Repack (Marlin) and Reblock/Reorder.
+// (FP8->bf16->FP8/MXFP4, fused or staged), Repack (Marlin) and Reblock.
 // Factored out of the storage executor; it consumes source bytes (loader + copy
 // engine), resolves input/output buffers (resolver), reads the LoadPlan
 // (program index), and owns the FP8 encode scratch buffers.
@@ -72,7 +72,6 @@ public:
             cast_tile_map(instr);
             return;
         case lp::PieLoaderTileMapKind::Reblock:
-        case lp::PieLoaderTileMapKind::Reorder:
             reblock_tile_map(instr);
             return;
         case lp::PieLoaderTileMapKind::Encode:
@@ -125,6 +124,9 @@ private:
                 src.data(), dst, src.numel(), /*stream=*/0);
         } else if (src.dtype() == DType::BF16 && dst_dtype == DType::FP32) {
             kernels::launch_cast_bf16_to_fp32(
+                src.data(), dst, src.numel(), /*stream=*/0);
+        } else if (src.dtype() == DType::E8M0 && dst_dtype == DType::FP32) {
+            kernels::launch_cast_e8m0_to_fp32(
                 src.data(), dst, src.numel(), /*stream=*/0);
         } else {
             throw std::runtime_error(

@@ -1,7 +1,7 @@
 //! The loader's FFI boundary.
 //!
 //! `types` is the published `#[repr(C)]` vocabulary, `arena` turns a compiled
-//! [`LoadPlan`](crate::load_plan::LoadPlan) into it, and `entry` holds the
+//! [`LoadPlan`](crate::plan::LoadPlan) into it, and `entry` holds the
 //! `extern "C"` functions the driver calls. The generated header
 //! (`loader/include/pie_loader.h`) is the C view of exactly these three files.
 //!
@@ -22,7 +22,7 @@ pub use entry::{
 };
 pub use types::*;
 
-use crate::load_plan::StorageTarget;
+use crate::plan::StorageTarget;
 use crate::types::{BackendKind, DType};
 
 /// Build the compiler's [`StorageTarget`] from the driver's measured spec.
@@ -52,7 +52,7 @@ fn storage_target(
         PieLoaderBackendKind::Unknown => BackendKind::Unknown,
     };
 
-    // The driver's `tile_map_mask` and the loader's `backend::*::TILE_MAP_MASK`
+    // The driver's `tile_map_mask` and the loader's `plan::passes::tile` masks
     // are two independent statements of the same fact — the C++ constant is
     // written by hand next to the kernels, the Rust one next to the lowering
     // rules that decide when to emit them. §9 makes the driver the authority, so
@@ -60,13 +60,13 @@ fn storage_target(
     // lower. What it may not do is claim one the loader has never heard of:
     // that bit would silently pass `validate_target_support` and then fail as an
     // unrecognized kernel dispatch at load time, far from its cause (§8).
-    let known = crate::backend::for_backend(kind).tile_map_mask();
+    let known = crate::plan::passes::tile::tile_map_mask(kind);
     if spec.tile_map_mask & !known != 0 {
         return Err(format!(
             "target claims tile map transforms {:#x} that the {} backend model \
              does not define (loader knows {:#x})",
             spec.tile_map_mask & !known,
-            crate::backend::for_backend(kind).name(),
+            backend_name(kind),
             known
         ));
     }
@@ -87,5 +87,14 @@ fn storage_target(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "testkit"))]
 mod tests;
+
+/// The lowercase name a driver would recognize, for messages only.
+fn backend_name(kind: BackendKind) -> &'static str {
+    match kind {
+        BackendKind::Cuda => "cuda",
+        BackendKind::Metal => "metal",
+        BackendKind::Unknown => "host",
+    }
+}

@@ -9,7 +9,7 @@
 use super::arena::{self, view};
 use super::entry::{PieLoaderDiagnostics, PieLoaderStatus, PieLoaderTargetSpec};
 use super::types::*;
-use crate::load_plan::*;
+use crate::plan::*;
 use crate::types::*;
 
 fn target() -> StorageTarget {
@@ -27,13 +27,13 @@ fn target() -> StorageTarget {
     }
 }
 
-fn stride(element_bytes: u32, dims: &[(i64, i64, i64)]) -> StridedExtent {
-    StridedExtent {
+fn stride(element_bytes: u32, dims: &[(i64, i64, i64)]) -> Extent {
+    Extent {
         base_offset: 0,
         element_bytes,
         dims: dims
             .iter()
-            .map(|(count, src_stride, dst_stride)| DimSpec {
+            .map(|(count, src_stride, dst_stride)| Dim {
                 count: *count,
                 src_stride: *src_stride,
                 dst_stride: *dst_stride,
@@ -101,9 +101,6 @@ fn plan_with_every_instr() -> LoadPlan {
             bits_per_element: 4,
             group_size: 32,
             channel_axis: Some(Axis(0)),
-            scale_dtype: Some(DType::U8),
-            zero_point_dtype: None,
-            block_shape: vec![32],
         }),
         alignment: 256,
     });
@@ -127,9 +124,6 @@ fn plan_with_every_instr() -> LoadPlan {
             bits_per_element: 4,
             group_size: 64,
             channel_axis: None,
-            scale_dtype: None,
-            zero_point_dtype: None,
-            block_shape: vec![],
         }),
     });
     plan.sources.push(SourceTensorDecl {
@@ -228,10 +222,6 @@ fn plan_with_every_instr() -> LoadPlan {
             input: BufferId(0),
             output: BufferId(13),
             view: dest_extent(13),
-        },
-        StorageInstr::Release {
-            id: InstrId(7),
-            buffer: BufferId(1),
         },
         StorageInstr::Finalize {
             id: InstrId(8),
@@ -470,12 +460,6 @@ fn allocate_and_release_carry_only_a_buffer() {
         assert!(!alloc.has_source);
         assert!(!alloc.has_dest);
         assert_eq!(alloc.tile_kind, PieLoaderTileMapKind::None);
-
-        let release = &instrs[6];
-        assert_eq!(release.kind, PieLoaderStorageInstrKind::Release);
-        assert_eq!(release.buffer_id, 1);
-        assert!(!release.has_source);
-        assert!(!release.has_dest);
     });
 }
 
@@ -640,7 +624,7 @@ fn scalar_operands_are_published_as_one_element_runs() {
         assert!(view_instr.has_dest);
         assert_eq!(view_instr.dest.buffer_id, 13);
 
-        let finalize = &instrs[7];
+        let finalize = &instrs[6];
         assert_eq!(finalize.kind, PieLoaderStorageInstrKind::Finalize);
         assert_eq!(finalize.buffer_id, 0);
         assert_eq!(unsafe { view::u32s(&finalize.output_buffers) }, &[0]);
@@ -657,7 +641,7 @@ fn the_schedule_survives() {
     with_plan(&plan, |pod| {
         assert_eq!(
             unsafe { view::schedule(pod) },
-            &[0, 1, 2, 3, 4, 5, 6, 7, 8][..]
+            &[0, 1, 2, 3, 4, 5, 6, 7][..]
         );
     });
 }
@@ -732,7 +716,7 @@ fn plans_can_be_built_and_released_from_other_threads() {
         .collect();
     for handle in handles {
         let (pod, count) = handle.join().unwrap();
-        assert_eq!(count, 9);
+        assert_eq!(count, 8);
         unsafe { arena::release(pod as *mut PieLoaderPlan) };
     }
 }

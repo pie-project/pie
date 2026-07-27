@@ -245,6 +245,14 @@ Runner& get_runner() {
     return *s.runner;
 }
 
+ck::ActivationType to_cutlass_activation(MoeActivation a) {
+    switch (a) {
+        case MoeActivation::Swiglu: return ck::ActivationType::Swiglu;
+        case MoeActivation::Relu2:
+        default:                    return ck::ActivationType::Relu2;
+    }
+}
+
 ck::MOEParallelismConfig parallelism_config(int tp_size, int tp_rank) {
     return ck::MOEParallelismConfig(std::max(1, tp_size), tp_rank, 1, 0);
 }
@@ -252,12 +260,18 @@ ck::MOEParallelismConfig parallelism_config(int tp_size, int tp_rank) {
 }  // namespace
 
 bool flashinfer_cutlass_moe_enabled() {
-    static const bool enabled =
-        env_truthy(std::getenv("PIE_NEMOTRON_FLASHINFER_MOE"));
+    // Two consumers, each with its own switch: nemotron_h (Relu2) and the
+    // qwen3_5 MoE decode (Swiglu). Either one turns the runner on.
+    static const bool enabled = [] {
+        if (env_truthy(std::getenv("PIE_NEMOTRON_FLASHINFER_MOE"))) return true;
+        const char* q = std::getenv("PIE_QWEN35_MOE_FLASHINFER");
+        return q == nullptr || q[0] == '\0' || q[0] != '0';
+    }();
     return enabled;
 }
 
 std::size_t flashinfer_cutlass_moe_workspace_bytes(
+    MoeActivation activation,
     int num_rows,
     int hidden_size,
     int inter_size,
@@ -276,7 +290,7 @@ std::size_t flashinfer_cutlass_moe_workspace_bytes(
         inter_size,
         num_experts,
         experts_per_token,
-        ck::ActivationType::Relu2,
+        to_cutlass_activation(activation),
         parallelism_config(tp_size, tp_rank),
         false,
         false,
@@ -285,7 +299,8 @@ std::size_t flashinfer_cutlass_moe_workspace_bytes(
         false);
 }
 
-bool flashinfer_cutlass_moe_bf16_relu2(
+bool flashinfer_cutlass_moe_bf16(
+    MoeActivation activation,
     const std::uint16_t* input,
     const std::int32_t* token_selected_experts,
     const float* token_final_scales,
@@ -311,8 +326,8 @@ bool flashinfer_cutlass_moe_bf16_relu2(
         return false;
     }
     const std::size_t needed = flashinfer_cutlass_moe_workspace_bytes(
-        num_rows, hidden_size, inter_size, num_experts, experts_per_token,
-        tp_size, tp_rank);
+        activation, num_rows, hidden_size, inter_size, num_experts,
+        experts_per_token, tp_size, tp_rank);
     if (needed == 0 || workspace_bytes < needed) return false;
 
     Runner& runner = get_runner();
@@ -327,7 +342,7 @@ bool flashinfer_cutlass_moe_bf16_relu2(
         token_final_scales,
         fc1_expert_weights,
         nullptr,
-        ck::ActivationParams(ck::ActivationType::Relu2),
+        ck::ActivationParams(to_cutlass_activation(activation)),
         fc2_expert_weights,
         nullptr,
         quant_params,

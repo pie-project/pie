@@ -12,16 +12,20 @@
     "encode_scratch_dtype": "BF16",
     "block_scale_rows": 128
   },
-  "optimizer": {
-    "passes": [
-      {
-        "name": "live-normalization",
-        "exprs_before": 33,
-        "exprs_after": 33,
-        "rewrites": 0
-      }
-    ]
-  },
+  "passes": [
+    {
+      "pass": "assign-persistent-offsets",
+      "instrs_before": 33,
+      "instrs_after": 33,
+      "rewrites": 11
+    },
+    {
+      "pass": "hoist-bulk-arena-writes",
+      "instrs_before": 33,
+      "instrs_after": 31,
+      "rewrites": 2
+    }
+  ],
   "files": [
     {
       "id": 0,
@@ -74,10 +78,7 @@
           "logical_dtype": "BF16",
           "bits_per_element": 4,
           "group_size": 32,
-          "channel_axis": null,
-          "scale_dtype": "BF16",
-          "zero_point_dtype": null,
-          "block_shape": []
+          "channel_axis": null
         }
       }
     },
@@ -97,10 +98,7 @@
           "logical_dtype": "BF16",
           "bits_per_element": 4,
           "group_size": 32,
-          "channel_axis": null,
-          "scale_dtype": "BF16",
-          "zero_point_dtype": null,
-          "block_shape": []
+          "channel_axis": null
         }
       }
     },
@@ -120,10 +118,7 @@
           "logical_dtype": "BF16",
           "bits_per_element": 4,
           "group_size": 32,
-          "channel_axis": null,
-          "scale_dtype": "BF16",
-          "zero_point_dtype": null,
-          "block_shape": []
+          "channel_axis": null
         }
       }
     },
@@ -143,10 +138,7 @@
           "logical_dtype": "BF16",
           "bits_per_element": 4,
           "group_size": 32,
-          "channel_axis": null,
-          "scale_dtype": "BF16",
-          "zero_point_dtype": null,
-          "block_shape": []
+          "channel_axis": null
         }
       }
     },
@@ -166,10 +158,7 @@
           "logical_dtype": "BF16",
           "bits_per_element": 4,
           "group_size": 32,
-          "channel_axis": null,
-          "scale_dtype": "BF16",
-          "zero_point_dtype": null,
-          "block_shape": []
+          "channel_axis": null
         }
       }
     },
@@ -189,10 +178,7 @@
           "logical_dtype": "BF16",
           "bits_per_element": 4,
           "group_size": 32,
-          "channel_axis": null,
-          "scale_dtype": "BF16",
-          "zero_point_dtype": null,
-          "block_shape": []
+          "channel_axis": null
         }
       }
     },
@@ -212,10 +198,7 @@
           "logical_dtype": "BF16",
           "bits_per_element": 4,
           "group_size": 32,
-          "channel_axis": null,
-          "scale_dtype": "BF16",
-          "zero_point_dtype": null,
-          "block_shape": []
+          "channel_axis": null
         }
       }
     },
@@ -283,10 +266,7 @@
           "logical_dtype": "BF16",
           "bits_per_element": 4,
           "group_size": 32,
-          "channel_axis": null,
-          "scale_dtype": "BF16",
-          "zero_point_dtype": null,
-          "block_shape": []
+          "channel_axis": null
         }
       },
       "alignment": 256
@@ -304,10 +284,7 @@
           "logical_dtype": "BF16",
           "bits_per_element": 4,
           "group_size": 32,
-          "channel_axis": null,
-          "scale_dtype": "BF16",
-          "zero_point_dtype": null,
-          "block_shape": []
+          "channel_axis": null
         }
       },
       "alignment": 256
@@ -325,10 +302,7 @@
           "logical_dtype": "BF16",
           "bits_per_element": 4,
           "group_size": 32,
-          "channel_axis": null,
-          "scale_dtype": "BF16",
-          "zero_point_dtype": null,
-          "block_shape": []
+          "channel_axis": null
         }
       },
       "alignment": 256
@@ -346,10 +320,7 @@
           "logical_dtype": "BF16",
           "bits_per_element": 4,
           "group_size": 32,
-          "channel_axis": null,
-          "scale_dtype": "BF16",
-          "zero_point_dtype": null,
-          "block_shape": []
+          "channel_axis": null
         }
       },
       "alignment": 256
@@ -367,10 +338,7 @@
           "logical_dtype": "BF16",
           "bits_per_element": 4,
           "group_size": 32,
-          "channel_axis": null,
-          "scale_dtype": "BF16",
-          "zero_point_dtype": null,
-          "block_shape": []
+          "channel_axis": null
         }
       },
       "alignment": 256
@@ -388,10 +356,7 @@
           "logical_dtype": "BF16",
           "bits_per_element": 4,
           "group_size": 32,
-          "channel_axis": null,
-          "scale_dtype": "BF16",
-          "zero_point_dtype": null,
-          "block_shape": []
+          "channel_axis": null
         }
       },
       "alignment": 256
@@ -409,10 +374,7 @@
           "logical_dtype": "BF16",
           "bits_per_element": 4,
           "group_size": 32,
-          "channel_axis": null,
-          "scale_dtype": "BF16",
-          "zero_point_dtype": null,
-          "block_shape": []
+          "channel_axis": null
         }
       },
       "alignment": 256

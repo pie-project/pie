@@ -11,7 +11,10 @@ namespace pie_loader {
 /// `PieLoaderExprNode::src` when the node has no single operand.
 constexpr static const uint32_t PIE_LOADER_NO_NODE = UINT32_MAX;
 
-/// The same convention for `QuantSpec::channel_axis`.
+/// `QuantSpec::channel_axis`, as a signed integer so that `-1` is "unset".
+///
+/// A sentinel rather than a second `bool` field keeps the struct a plain list
+/// of numbers, which is what a designated initializer is good at.
 constexpr static const int32_t PIE_LOADER_NO_AXIS = -1;
 
 /// Sentinel for "no buffer", mirroring the C++ `numeric_limits<uint32_t>::max()`
@@ -30,8 +33,6 @@ constexpr static const uint32_t PIE_LOADER_TILE_MAP_ENCODE = (1 << 2);
 constexpr static const uint32_t PIE_LOADER_TILE_MAP_TRANSCODE = (1 << 3);
 
 constexpr static const uint32_t PIE_LOADER_TILE_MAP_REBLOCK = (1 << 4);
-
-constexpr static const uint32_t PIE_LOADER_TILE_MAP_REORDER = (1 << 5);
 
 constexpr static const uint32_t PIE_LOADER_TILE_MAP_REPACK = (1 << 6);
 
@@ -82,6 +83,7 @@ enum class PieLoaderDType : uint32_t {
   U16 = 9,
   U8 = 10,
   Bool = 11,
+  E8M0 = 12,
 };
 
 enum class PieLoaderEncodingKind : uint32_t {
@@ -117,10 +119,10 @@ enum class PieLoaderStorageInstrKind : uint32_t {
   ExtentWrite = 1,
   TileMap = 2,
   CreateView = 3,
-  Release = 4,
   Finalize = 5,
   BulkExtentWrite = 6,
   SlabScatter = 7,
+  Fill = 8,
 };
 
 /// `None` is the resting value for instructions that carry no tile map, so it
@@ -132,7 +134,6 @@ enum class PieLoaderTileMapKind : uint32_t {
   Encode = 2,
   Transcode = 3,
   Reblock = 4,
-  Reorder = 5,
   Repack = 6,
   None = 7,
 };
@@ -229,13 +230,6 @@ using PieLoaderCheckpointFileSlice = PieLoaderSlice<PieLoaderCheckpointFileView>
 
 using PieLoaderI64Slice = PieLoaderSlice<int64_t>;
 
-/// An optional [`PieLoaderDType`], as a signed integer so that `-1` is "unset".
-///
-/// `QuantSpec` has three of these. Encoding them as a sentinel rather than a
-/// second `bool` field per member keeps the struct a plain list of numbers,
-/// which is what a designated initializer is good at.
-using PieLoaderOptDType = int32_t;
-
 /// [`crate::types::QuantSpec`], flattened.
 struct PieLoaderQuantSpecView {
   /// A `PieLoaderQuantScheme` value, as `uint32_t`.
@@ -247,9 +241,6 @@ struct PieLoaderQuantSpecView {
   /// `0` asks for the scheme's default.
   uint32_t group_size;
   int32_t channel_axis;
-  PieLoaderOptDType scale_dtype;
-  PieLoaderOptDType zero_point_dtype;
-  PieLoaderI64Slice block_shape;
 };
 
 /// [`crate::types::Encoding`], flattened. `kind` selects which half is read.
@@ -696,8 +687,6 @@ struct PieLoaderPlan {
   PieLoaderBytes stats_json;
   void *owner;
 };
-
-constexpr static const PieLoaderOptDType PIE_LOADER_NO_DTYPE = -1;
 
 extern "C" {
 

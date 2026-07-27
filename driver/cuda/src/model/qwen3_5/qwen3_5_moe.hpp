@@ -31,6 +31,12 @@
 
 namespace pie_cuda_driver::model {
 
+// True when the routed gate/up weights are stored in flashinfer's
+// [linear|gate] order instead of HuggingFace's [gate|up]. Decided once from
+// the environment; the bind reorders the weight and the swiglu kernels are
+// told which order they read.
+bool qwen35_moe_gate_up_swapped();
+
 struct Qwen3_5MoeLayerWeights {
     enum class Kind { LinearAttn, FullAttn };
     Kind kind;

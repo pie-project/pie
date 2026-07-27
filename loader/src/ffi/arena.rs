@@ -11,8 +11,8 @@
 //! reclaims it. Between those two points nothing mutates, so handing the plan to
 //! another thread is sound.
 
-use crate::load_plan::{
-    DestExtent, LoadPlan, QuantGranularity, ScaleForm, SourceExtent, StorageInstr, StridedExtent,
+use crate::plan::{
+    DestExtent, Extent, LoadPlan, QuantGranularity, ScaleForm, SourceExtent, StorageInstr,
 };
 use crate::types::{Encoding, QuantScheme};
 
@@ -98,7 +98,7 @@ impl PlanArena {
         view
     }
 
-    fn stride(&mut self, stride: &StridedExtent) -> PieLoaderStridedExtentView {
+    fn stride(&mut self, stride: &Extent) -> PieLoaderStridedExtentView {
         let dims = self.store_dims(stride.dims.iter().map(|dim| PieLoaderDimSpecView {
             count: dim.count,
             src_stride: dim.src_stride,
@@ -258,6 +258,12 @@ fn flatten_instr(arena: &mut PlanArena, instr: &StorageInstr) -> PieLoaderStorag
             out.kind = PieLoaderStorageInstrKind::Allocate;
             out.buffer_id = buffer.0;
         }
+        StorageInstr::Fill { id, buffer } => {
+            out.id = id.0;
+            out.kind = PieLoaderStorageInstrKind::Fill;
+            out.buffer_id = buffer.0;
+            out.output_buffers = arena.store_u32([buffer.0]);
+        }
         StorageInstr::ExtentWrite { id, source, dest } => {
             out.id = id.0;
             out.kind = PieLoaderStorageInstrKind::ExtentWrite;
@@ -371,11 +377,6 @@ fn flatten_instr(arena: &mut PlanArena, instr: &StorageInstr) -> PieLoaderStorag
             out.buffer_id = output.0;
             out.dest = arena.dest_extent(view);
             out.has_dest = true;
-        }
-        StorageInstr::Release { id, buffer } => {
-            out.id = id.0;
-            out.kind = PieLoaderStorageInstrKind::Release;
-            out.buffer_id = buffer.0;
         }
         StorageInstr::Finalize { id, tensor, name } => {
             out.id = id.0;

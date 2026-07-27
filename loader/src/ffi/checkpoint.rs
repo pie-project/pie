@@ -24,7 +24,7 @@
 use std::path::PathBuf;
 
 use crate::checkpoint::CheckpointMetadata;
-use crate::ffi::contract::{PieLoaderEncodingSpec, ShapeStore, write_encoding};
+use crate::ffi::contract::{PieLoaderEncodingSpec, write_encoding};
 use crate::ffi::types::{
     PieLoaderBytes, PieLoaderCheckpointFileSlice, PieLoaderCheckpointFileView,
     PieLoaderCheckpointFormat, PieLoaderI64Slice,
@@ -146,7 +146,7 @@ pub(super) fn build(
     for tensor in &tensors {
         let name = arena.store_str(&tensor.name);
         let shape = arena.store_i64(&tensor.shape);
-        let encoding = write_encoding(&mut arena, &tensor.encoding);
+        let encoding = write_encoding(&tensor.encoding);
         arena.tensors.push(PieLoaderRawTensorView {
             id: tensor.id.0,
             name,
@@ -195,11 +195,5 @@ pub(super) unsafe fn release(handle: *mut PieLoaderCheckpoint) {
     let boxed = unsafe { Box::from_raw(handle) };
     if !boxed.owner.is_null() {
         drop(unsafe { Box::from_raw(boxed.owner.cast::<CheckpointArena>()) });
-    }
-}
-
-impl ShapeStore for CheckpointArena {
-    fn store_shape(&mut self, values: &[i64]) -> PieLoaderI64Slice {
-        self.store_i64(values)
     }
 }

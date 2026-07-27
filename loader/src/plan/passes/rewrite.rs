@@ -2,11 +2,18 @@
 //! arena-relative bulk copies, batch them into slab scatters, merge adjacent
 //! extent writes, and check the target supports every emitted tile map.
 
-use super::*;
+use std::collections::HashSet;
 
-pub(super) fn coalesce_persistent_arena_writes(program: &mut LoadPlan) -> Result<(), CompileError> {
+use crate::error::{Error, Result};
+use crate::extent::Extent;
+use crate::plan::geometry::extent_storage_bytes;
+use crate::plan::index::{instr_by_id, set_instr_id};
+use crate::plan::{LoadPlan, SlabPlacement, SourceExtent, StorageInstr};
+use crate::types::{BufferId, InstrId};
+
+pub(super) fn coalesce_persistent_arena_writes(program: &mut LoadPlan) -> Result<usize> {
     if program.schedule.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
     let old_instrs = program.instrs.clone();
     let blocked_buffers = non_bulk_compatible_persistent_write_buffers(program)?;
@@ -30,37 +37,23 @@ pub(super) fn coalesce_persistent_arena_writes(program: &mut LoadPlan) -> Result
     }
 
     rewrite_program_instrs(program, merged)?;
-    if rewrites > 0 {
-        program.optimizer.passes.push(OptimizerPassStats {
-            name: "coalesce-persistent-arena-writes".to_string(),
-            exprs_before: old_instrs.len(),
-            exprs_after: program.instrs.len(),
-            rewrites: usize::try_from(rewrites).unwrap_or(usize::MAX),
-        });
-    }
-    Ok(())
+    Ok(usize::try_from(rewrites).unwrap_or(usize::MAX))
 }
 
 pub(super) fn non_bulk_compatible_persistent_write_buffers(
     program: &LoadPlan,
-) -> Result<HashSet<BufferId>, CompileError> {
+) -> Result<HashSet<BufferId>> {
     let mut blocked = HashSet::new();
     for instr in &program.instrs {
         let StorageInstr::ExtentWrite { source, dest, .. } = instr else {
             continue;
         };
-        let Some(buffer) = program
-            .buffers
-            .iter()
-            .find(|buffer| buffer.id == dest.buffer)
-        else {
-            continue;
-        };
+        let buffer = program.buffer(dest.buffer)?;
         if buffer.persistent_offset.is_none() {
             continue;
         }
-        if !compact_extent_for_copy(&source.stride)
-            || !compact_extent_for_copy(&dest.stride)
+        if !source.stride.is_dense()
+            || !dest.stride.is_dense()
             || source.span_bytes != extent_storage_bytes(&dest.stride)?
         {
             blocked.insert(dest.buffer);
@@ -69,13 +62,16 @@ pub(super) fn non_bulk_compatible_persistent_write_buffers(
     Ok(blocked)
 }
 
-pub(super) fn hoist_bulk_extent_writes(program: &mut LoadPlan) -> Result<(), CompileError> {
+pub(super) fn hoist_bulk_extent_writes(program: &mut LoadPlan) -> Result<usize> {
     if program.schedule.len() < 2 {
-        return Ok(());
+        return Ok(0);
     }
     let old_instrs = program.instrs.clone();
     let mut pending_bulk: Vec<StorageInstr> = Vec::new();
-    let mut allocations: Vec<StorageInstr> = Vec::new();
+    // Everything that has to happen before a byte is written: the allocations,
+    // and the fills. A fill after the write it was meant to precede erases it,
+    // so `Fill` cannot be left in `rest` — `validate-fill-order` is the check.
+    let mut prologue: Vec<StorageInstr> = Vec::new();
     let mut rest: Vec<StorageInstr> = Vec::with_capacity(old_instrs.len());
     let mut result: Vec<StorageInstr> = Vec::with_capacity(old_instrs.len());
     let mut rewrites = 0_u64;
@@ -84,13 +80,16 @@ pub(super) fn hoist_bulk_extent_writes(program: &mut LoadPlan) -> Result<(), Com
         let instr = instr_by_id(&old_instrs, *instr_id)?;
         if matches!(instr, StorageInstr::BulkExtentWrite { .. }) {
             pending_bulk.push(instr.clone());
-        } else if matches!(instr, StorageInstr::Allocate { .. }) {
-            allocations.push(instr.clone());
+        } else if matches!(
+            instr,
+            StorageInstr::Allocate { .. } | StorageInstr::Fill { .. }
+        ) {
+            prologue.push(instr.clone());
         } else {
             rest.push(instr.clone());
         }
     }
-    result.append(&mut allocations);
+    result.append(&mut prologue);
     flush_pending_bulk(
         &mut result,
         &mut pending_bulk,
@@ -100,15 +99,7 @@ pub(super) fn hoist_bulk_extent_writes(program: &mut LoadPlan) -> Result<(), Com
     result.append(&mut rest);
 
     rewrite_program_instrs(program, result)?;
-    if rewrites > 0 {
-        program.optimizer.passes.push(OptimizerPassStats {
-            name: "hoist-bulk-arena-writes".to_string(),
-            exprs_before: old_instrs.len(),
-            exprs_after: program.instrs.len(),
-            rewrites: usize::try_from(rewrites).unwrap_or(usize::MAX),
-        });
-    }
-    Ok(())
+    Ok(usize::try_from(rewrites).unwrap_or(usize::MAX))
 }
 
 pub(super) fn flush_pending_bulk(
@@ -116,7 +107,7 @@ pub(super) fn flush_pending_bulk(
     pending_bulk: &mut Vec<StorageInstr>,
     rewrites: &mut u64,
     max_merged_bytes: u64,
-) -> Result<(), CompileError> {
+) -> Result<()> {
     if pending_bulk.is_empty() {
         return Ok(());
     }
@@ -152,6 +143,14 @@ pub(super) fn flush_pending_bulk(
 /// Coalescing thresholds for the slab-scatter pass, bundled so the knobs are
 /// passed by name — a transposed pair of same-typed positional args would
 /// silently change coalescing behavior.
+///
+/// These are `spec.md` §3.3's "loader policy informed by measured bandwidth",
+/// and they are not on `StorageTarget` because they are not facts about a
+/// device: every backend reads files the same way. They are also not a function
+/// of `Lowering::cost` — a slab groups writes from *different tensors* by file
+/// offset, so the quantities that decide it (the gap between two sources, the
+/// ratio of span to payload) do not exist until offsets are assigned and no
+/// single expression has them.
 #[derive(Clone, Copy)]
 pub(super) struct SlabConfig {
     max_slab_bytes: u64,
@@ -163,9 +162,9 @@ pub(super) struct SlabConfig {
     max_overread_den: u64,
 }
 
-pub(super) fn build_slab_scatter_writes(program: &mut LoadPlan) -> Result<(), CompileError> {
+pub(super) fn build_slab_scatter_writes(program: &mut LoadPlan) -> Result<usize> {
     if program.schedule.len() < 2 {
-        return Ok(());
+        return Ok(0);
     }
     const DEFAULT_MAX_SLAB_BYTES: u64 = 256 * 1024 * 1024;
     let cfg = SlabConfig {
@@ -257,15 +256,7 @@ pub(super) fn build_slab_scatter_writes(program: &mut LoadPlan) -> Result<(), Co
         }
     }
 
-    if rewrites > 0 {
-        program.optimizer.passes.push(OptimizerPassStats {
-            name: "slab-scatter-arena-writes".to_string(),
-            exprs_before: old_instrs.len(),
-            exprs_after: program.instrs.len(),
-            rewrites: usize::try_from(rewrites).unwrap_or(usize::MAX),
-        });
-    }
-    Ok(())
+    Ok(usize::try_from(rewrites).unwrap_or(usize::MAX))
 }
 
 pub(super) fn flush_pending_slab_scatter(
@@ -273,7 +264,7 @@ pub(super) fn flush_pending_slab_scatter(
     pending: &mut Vec<StorageInstr>,
     rewrites: &mut u64,
     cfg: SlabConfig,
-) -> Result<(), CompileError> {
+) -> Result<()> {
     if pending.is_empty() {
         return Ok(());
     }
@@ -306,7 +297,7 @@ pub(super) fn slab_can_accept(
     current: &[StorageInstr],
     next: &StorageInstr,
     cfg: SlabConfig,
-) -> Result<bool, CompileError> {
+) -> Result<bool> {
     if current.len() >= cfg.max_placements {
         return Ok(false);
     }
@@ -316,16 +307,16 @@ pub(super) fn slab_can_accept(
     let StorageInstr::BulkExtentWrite { source, .. } = next else {
         return Ok(false);
     };
-    if source.file_id != file_id || !is_byte_extent(&source.stride) {
+    if source.file_id != file_id || !source.stride.is_byte_run() {
         return Ok(false);
     }
     let start = source
         .file_offset
         .checked_add(source.stride.base_offset)
-        .ok_or_else(|| CompileError::InvalidInput("source offset overflow".to_string()))?;
+        .ok_or_else(|| Error::Overflow("source offset overflow".to_string()))?;
     let end = start
         .checked_add(source.span_bytes)
-        .ok_or_else(|| CompileError::InvalidInput("source span overflow".to_string()))?;
+        .ok_or_else(|| Error::Overflow("source span overflow".to_string()))?;
     if start < last_end || start - last_end > cfg.max_gap_bytes {
         return Ok(false);
     }
@@ -334,7 +325,7 @@ pub(super) fn slab_can_accept(
 
 pub(super) fn slab_bounds(
     instrs: &[StorageInstr],
-) -> Result<Option<(crate::types::FileId, u64, u64, u64)>, CompileError> {
+) -> Result<Option<(crate::types::FileId, u64, u64, u64)>> {
     let Some(first) = instrs.first() else {
         return Ok(None);
     };
@@ -345,7 +336,7 @@ pub(super) fn slab_bounds(
     let first_start = source
         .file_offset
         .checked_add(source.stride.base_offset)
-        .ok_or_else(|| CompileError::InvalidInput("source offset overflow".to_string()))?;
+        .ok_or_else(|| Error::Overflow("source offset overflow".to_string()))?;
     let mut payload = 0u64;
     let mut last_end = first_start;
     for instr in instrs {
@@ -355,13 +346,13 @@ pub(super) fn slab_bounds(
         let start = source
             .file_offset
             .checked_add(source.stride.base_offset)
-            .ok_or_else(|| CompileError::InvalidInput("source offset overflow".to_string()))?;
+            .ok_or_else(|| Error::Overflow("source offset overflow".to_string()))?;
         let end = start
             .checked_add(source.span_bytes)
-            .ok_or_else(|| CompileError::InvalidInput("source span overflow".to_string()))?;
+            .ok_or_else(|| Error::Overflow("source span overflow".to_string()))?;
         payload = payload
             .checked_add(source.span_bytes)
-            .ok_or_else(|| CompileError::InvalidInput("slab payload overflow".to_string()))?;
+            .ok_or_else(|| Error::Overflow("slab payload overflow".to_string()))?;
         last_end = last_end.max(end);
     }
     Ok(Some((file_id, first_start, payload, last_end)))
@@ -372,7 +363,7 @@ pub(super) fn emit_slab_or_bulk(
     current: &mut Vec<StorageInstr>,
     rewrites: &mut u64,
     cfg: SlabConfig,
-) -> Result<(), CompileError> {
+) -> Result<()> {
     if current.is_empty() {
         return Ok(());
     }
@@ -391,10 +382,10 @@ pub(super) fn emit_slab_or_bulk(
     }
     if span_bytes
         .checked_mul(cfg.max_overread_den)
-        .ok_or_else(|| CompileError::InvalidInput("slab overread overflow".to_string()))?
+        .ok_or_else(|| Error::Overflow("slab overread overflow".to_string()))?
         > payload
             .checked_mul(cfg.max_overread_num)
-            .ok_or_else(|| CompileError::InvalidInput("slab overread overflow".to_string()))?
+            .ok_or_else(|| Error::Overflow("slab overread overflow".to_string()))?
     {
         result.append(current);
         return Ok(());
@@ -412,7 +403,7 @@ pub(super) fn emit_slab_or_bulk(
         let source_start = source
             .file_offset
             .checked_add(source.stride.base_offset)
-            .ok_or_else(|| CompileError::InvalidInput("source offset overflow".to_string()))?;
+            .ok_or_else(|| Error::Overflow("source offset overflow".to_string()))?;
         placements.push(SlabPlacement {
             src_offset: source_start - file_offset,
             dest_offset,
@@ -421,7 +412,7 @@ pub(super) fn emit_slab_or_bulk(
     }
     *rewrites = rewrites
         .checked_add(placements.len().saturating_sub(1) as u64)
-        .ok_or_else(|| CompileError::InvalidInput("slab rewrite overflow".to_string()))?;
+        .ok_or_else(|| Error::Overflow("slab rewrite overflow".to_string()))?;
     result.push(StorageInstr::SlabScatter {
         id: InstrId(0),
         file_id,
@@ -436,27 +427,17 @@ pub(super) fn extent_write_as_bulk(
     program: &LoadPlan,
     instr: &StorageInstr,
     blocked_buffers: &HashSet<BufferId>,
-) -> Result<Option<StorageInstr>, CompileError> {
+) -> Result<Option<StorageInstr>> {
     let StorageInstr::ExtentWrite { id, source, dest } = instr else {
         return Ok(None);
     };
-    if !compact_extent_for_copy(&source.stride)
-        || !compact_extent_for_copy(&dest.stride)
+    if !source.stride.is_dense()
+        || !dest.stride.is_dense()
         || source.span_bytes != extent_storage_bytes(&dest.stride)?
     {
         return Ok(None);
     }
-    let Some(buffer) = program
-        .buffers
-        .iter()
-        .find(|buffer| buffer.id == dest.buffer)
-    else {
-        return Err(CompileError::InvalidInput(format!(
-            "destination buffer {} is missing",
-            dest.buffer.0
-        )));
-    };
-    let Some(base) = buffer.persistent_offset else {
+    let Some(base) = program.buffer(dest.buffer)?.persistent_offset else {
         return Ok(None);
     };
     if blocked_buffers.contains(&dest.buffer) {
@@ -465,9 +446,7 @@ pub(super) fn extent_write_as_bulk(
     let dest_offset = base
         .checked_add(dest.offset)
         .and_then(|v| v.checked_add(dest.stride.base_offset))
-        .ok_or_else(|| {
-            CompileError::InvalidInput("bulk destination offset overflow".to_string())
-        })?;
+        .ok_or_else(|| Error::Overflow("bulk destination offset overflow".to_string()))?;
     Ok(Some(StorageInstr::BulkExtentWrite {
         id: *id,
         source: SourceExtent {
@@ -476,9 +455,9 @@ pub(super) fn extent_write_as_bulk(
             file_offset: source
                 .file_offset
                 .checked_add(source.stride.base_offset)
-                .ok_or_else(|| CompileError::InvalidInput("source offset overflow".to_string()))?,
+                .ok_or_else(|| Error::Overflow("source offset overflow".to_string()))?,
             span_bytes: source.span_bytes,
-            stride: byte_extent(source.span_bytes),
+            stride: Extent::byte_run(source.span_bytes),
         },
         dest_offset,
     }))
@@ -488,7 +467,7 @@ pub(super) fn try_merge_bulk_extent_write(
     previous: &mut StorageInstr,
     current: &StorageInstr,
     max_merged_bytes: u64,
-) -> Result<bool, CompileError> {
+) -> Result<bool> {
     let (
         StorageInstr::BulkExtentWrite {
             source: prev_source,
@@ -506,8 +485,8 @@ pub(super) fn try_merge_bulk_extent_write(
     };
 
     if prev_source.file_id != cur_source.file_id
-        || !is_byte_extent(&prev_source.stride)
-        || !is_byte_extent(&cur_source.stride)
+        || !prev_source.stride.is_byte_run()
+        || !cur_source.stride.is_byte_run()
     {
         return Ok(false);
     }
@@ -515,11 +494,11 @@ pub(super) fn try_merge_bulk_extent_write(
     let cur_source_start = cur_source.file_offset + cur_source.stride.base_offset;
     if prev_source_start
         .checked_add(prev_source.span_bytes)
-        .ok_or_else(|| CompileError::InvalidInput("source span overflow".to_string()))?
+        .ok_or_else(|| Error::Overflow("source span overflow".to_string()))?
         != cur_source_start
         || prev_dest_offset
             .checked_add(prev_source.span_bytes)
-            .ok_or_else(|| CompileError::InvalidInput("destination span overflow".to_string()))?
+            .ok_or_else(|| Error::Overflow("destination span overflow".to_string()))?
             != *cur_dest_offset
     {
         return Ok(false);
@@ -527,75 +506,19 @@ pub(super) fn try_merge_bulk_extent_write(
     let span_bytes = prev_source
         .span_bytes
         .checked_add(cur_source.span_bytes)
-        .ok_or_else(|| CompileError::InvalidInput("merged bulk extent overflow".to_string()))?;
+        .ok_or_else(|| Error::Overflow("merged bulk extent overflow".to_string()))?;
     if max_merged_bytes != 0 && span_bytes > max_merged_bytes {
         return Ok(false);
     }
     prev_source.file_offset = prev_source_start;
     prev_source.span_bytes = span_bytes;
-    prev_source.stride = byte_extent(span_bytes);
+    prev_source.stride = Extent::byte_run(span_bytes);
     Ok(true)
 }
 
-pub(super) fn compact_extent_for_copy(extent: &StridedExtent) -> bool {
-    if extent.dims.iter().any(|dim| dim.count < 0) {
-        return false;
-    }
-    let mut stride = i64::from(extent.element_bytes);
-    for dim in extent.dims.iter().rev() {
-        if dim.src_stride != stride || dim.dst_stride != stride {
-            return false;
-        }
-        stride = match stride.checked_mul(dim.count) {
-            Some(value) => value,
-            None => return false,
-        };
-    }
-    true
-}
-
-pub(super) fn validate_target_support(program: &LoadPlan) -> Result<(), CompileError> {
-    for instr in &program.instrs {
-        let StorageInstr::TileMap {
-            kind, transform, ..
-        } = instr
-        else {
-            continue;
-        };
-        let advertised = program.target.tile_map_mask & kind.capability_bit() != 0;
-        let supported = advertised
-            && (matches!(
-                kind,
-                TileMapKind::Cast | TileMapKind::Reblock | TileMapKind::Reorder
-            ) || (*kind == TileMapKind::Encode
-                && matches!(
-                    transform.to,
-                    Some(
-                        QuantScheme::Fp8E4M3
-                            | QuantScheme::Int8Symmetric
-                            | QuantScheme::Mxfp4E2M1E8M0
-                    )
-                ))
-                || (*kind == TileMapKind::Repack
-                    && (matches!(transform.repack.layout, RepackLayout::DenseRowGather)
-                        || (program.target.native_mxfp4_moe
-                            && matches!(
-                                transform.repack.layout,
-                                RepackLayout::MarlinMxfp4Weight | RepackLayout::MarlinMxfp4Scale
-                            )))));
-        if !supported {
-            return Err(CompileError::InvalidInput(format!(
-                "{:?} target does not support {:?} TileMap ({:?}->{:?})",
-                program.target.backend, kind, transform.from, transform.to
-            )));
-        }
-    }
-    Ok(())
-}
-
-pub(super) fn merge_adjacent_extent_writes(program: &mut LoadPlan) -> Result<(), CompileError> {
+pub(super) fn merge_adjacent_extent_writes(program: &mut LoadPlan) -> Result<usize> {
     if program.schedule.len() < 2 {
-        return Ok(());
+        return Ok(0);
     }
 
     let old_instrs = program.instrs.clone();
@@ -615,21 +538,13 @@ pub(super) fn merge_adjacent_extent_writes(program: &mut LoadPlan) -> Result<(),
     }
 
     rewrite_program_instrs(program, merged)?;
-    if rewrites > 0 {
-        program.optimizer.passes.push(OptimizerPassStats {
-            name: "merge-adjacent-extent-writes".to_string(),
-            exprs_before: old_instrs.len(),
-            exprs_after: program.instrs.len(),
-            rewrites: usize::try_from(rewrites).unwrap_or(usize::MAX),
-        });
-    }
-    Ok(())
+    Ok(usize::try_from(rewrites).unwrap_or(usize::MAX))
 }
 
 pub(super) fn rewrite_program_instrs(
     program: &mut LoadPlan,
     merged: Vec<StorageInstr>,
-) -> Result<(), CompileError> {
+) -> Result<()> {
     program.instrs.clear();
     program.schedule.clear();
     program.instrs.reserve(merged.len());
@@ -637,7 +552,7 @@ pub(super) fn rewrite_program_instrs(
     for mut instr in merged {
         let id = InstrId(
             u32::try_from(program.instrs.len())
-                .map_err(|_| CompileError::InvalidInput("too many instructions".to_string()))?,
+                .map_err(|_| Error::Contract("too many instructions".to_string()))?,
         );
         set_instr_id(&mut instr, id);
         program.schedule.push(id);
@@ -649,7 +564,7 @@ pub(super) fn rewrite_program_instrs(
 pub(super) fn try_merge_extent_write(
     previous: &mut StorageInstr,
     current: &StorageInstr,
-) -> Result<bool, CompileError> {
+) -> Result<bool> {
     let (
         StorageInstr::ExtentWrite {
             source: prev_source,
@@ -668,10 +583,10 @@ pub(super) fn try_merge_extent_write(
 
     if prev_source.file_id != cur_source.file_id
         || prev_dest.buffer != cur_dest.buffer
-        || !is_byte_extent(&prev_source.stride)
-        || !is_byte_extent(&cur_source.stride)
-        || !is_byte_extent(&prev_dest.stride)
-        || !is_byte_extent(&cur_dest.stride)
+        || !prev_source.stride.is_byte_run()
+        || !cur_source.stride.is_byte_run()
+        || !prev_dest.stride.is_byte_run()
+        || !cur_dest.stride.is_byte_run()
     {
         return Ok(false);
     }
@@ -679,27 +594,27 @@ pub(super) fn try_merge_extent_write(
     let prev_source_start = prev_source
         .file_offset
         .checked_add(prev_source.stride.base_offset)
-        .ok_or_else(|| CompileError::InvalidInput("source offset overflow".to_string()))?;
+        .ok_or_else(|| Error::Overflow("source offset overflow".to_string()))?;
     let cur_source_start = cur_source
         .file_offset
         .checked_add(cur_source.stride.base_offset)
-        .ok_or_else(|| CompileError::InvalidInput("source offset overflow".to_string()))?;
+        .ok_or_else(|| Error::Overflow("source offset overflow".to_string()))?;
     let prev_dest_start = prev_dest
         .offset
         .checked_add(prev_dest.stride.base_offset)
-        .ok_or_else(|| CompileError::InvalidInput("destination offset overflow".to_string()))?;
+        .ok_or_else(|| Error::Overflow("destination offset overflow".to_string()))?;
     let cur_dest_start = cur_dest
         .offset
         .checked_add(cur_dest.stride.base_offset)
-        .ok_or_else(|| CompileError::InvalidInput("destination offset overflow".to_string()))?;
+        .ok_or_else(|| Error::Overflow("destination offset overflow".to_string()))?;
 
     if prev_source_start
         .checked_add(prev_source.span_bytes)
-        .ok_or_else(|| CompileError::InvalidInput("source span overflow".to_string()))?
+        .ok_or_else(|| Error::Overflow("source span overflow".to_string()))?
         != cur_source_start
         || prev_dest_start
             .checked_add(prev_source.span_bytes)
-            .ok_or_else(|| CompileError::InvalidInput("destination span overflow".to_string()))?
+            .ok_or_else(|| Error::Overflow("destination span overflow".to_string()))?
             != cur_dest_start
     {
         return Ok(false);
@@ -708,46 +623,11 @@ pub(super) fn try_merge_extent_write(
     let span_bytes = prev_source
         .span_bytes
         .checked_add(cur_source.span_bytes)
-        .ok_or_else(|| CompileError::InvalidInput("merged extent overflow".to_string()))?;
+        .ok_or_else(|| Error::Overflow("merged extent overflow".to_string()))?;
     prev_source.file_offset = prev_source_start;
     prev_source.span_bytes = span_bytes;
-    prev_source.stride = byte_extent(span_bytes);
+    prev_source.stride = Extent::byte_run(span_bytes);
     prev_dest.offset = prev_dest_start;
-    prev_dest.stride = byte_extent(span_bytes);
+    prev_dest.stride = Extent::byte_run(span_bytes);
     Ok(true)
-}
-
-pub(super) fn is_byte_extent(extent: &StridedExtent) -> bool {
-    extent.base_offset == 0
-        && extent.element_bytes == 1
-        && extent.dims.len() == 1
-        && extent.dims[0].src_stride == 1
-        && extent.dims[0].dst_stride == 1
-        && extent.dims[0].count >= 0
-}
-
-pub(super) fn instr_id_of(instr: &StorageInstr) -> InstrId {
-    match instr {
-        StorageInstr::Allocate { id, .. }
-        | StorageInstr::ExtentWrite { id, .. }
-        | StorageInstr::BulkExtentWrite { id, .. }
-        | StorageInstr::SlabScatter { id, .. }
-        | StorageInstr::TileMap { id, .. }
-        | StorageInstr::CreateView { id, .. }
-        | StorageInstr::Release { id, .. }
-        | StorageInstr::Finalize { id, .. } => *id,
-    }
-}
-
-pub(super) fn set_instr_id(instr: &mut StorageInstr, new_id: InstrId) {
-    match instr {
-        StorageInstr::Allocate { id, .. }
-        | StorageInstr::ExtentWrite { id, .. }
-        | StorageInstr::BulkExtentWrite { id, .. }
-        | StorageInstr::SlabScatter { id, .. }
-        | StorageInstr::TileMap { id, .. }
-        | StorageInstr::CreateView { id, .. }
-        | StorageInstr::Release { id, .. }
-        | StorageInstr::Finalize { id, .. } => *id = new_id,
-    }
 }

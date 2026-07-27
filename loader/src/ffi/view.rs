@@ -1,6 +1,6 @@
 //! Reading a marshalled plan back as a safe view.
 //!
-//! The mirror of [`super::arena`]: that module writes a [`crate::load_plan::LoadPlan`]
+//! The mirror of [`super::arena`]: that module writes a [`crate::plan::LoadPlan`]
 //! into the POD form the driver holds, and this one reads that POD form back.
 //!
 //! Verification runs *here*, on the marshalled bytes, and nowhere else. There is
@@ -14,7 +14,7 @@
 use super::arena;
 use super::entry::as_str;
 use super::types::*;
-use crate::load_plan::LoadPlan;
+use crate::plan::LoadPlan;
 use crate::verify::{Certificate, ContractView, Violation, verify};
 
 /// Compile-free verification of a plan, as the driver will see it.
@@ -145,9 +145,6 @@ fn join_encoding(tensor: &PieLoaderTensorDeclView) -> crate::types::Encoding {
             bits_per_element: tensor.quant_bits_per_element,
             group_size: tensor.quant_group_size,
             channel_axis: None,
-            scale_dtype: None,
-            zero_point_dtype: None,
-            block_shape: Vec::new(),
         }),
         _ => crate::types::Encoding::Raw(tensor.dtype.into()),
     }

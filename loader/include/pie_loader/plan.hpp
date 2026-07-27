@@ -43,7 +43,6 @@ inline constexpr std::uint32_t kTileMapDecode = PIE_LOADER_TILE_MAP_DECODE;
 inline constexpr std::uint32_t kTileMapEncode = PIE_LOADER_TILE_MAP_ENCODE;
 inline constexpr std::uint32_t kTileMapTranscode = PIE_LOADER_TILE_MAP_TRANSCODE;
 inline constexpr std::uint32_t kTileMapReblock = PIE_LOADER_TILE_MAP_REBLOCK;
-inline constexpr std::uint32_t kTileMapReorder = PIE_LOADER_TILE_MAP_REORDER;
 inline constexpr std::uint32_t kTileMapRepack = PIE_LOADER_TILE_MAP_REPACK;
 
 /// Everything the loader reported about one call, owned and freed by C++.

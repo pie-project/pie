@@ -18,8 +18,7 @@ using LoadPlan = pie_loader::LoadPlan;
 /// the cross-check stays one-sided.
 inline constexpr std::uint32_t kCudaTileMapMask =
     pie_loader::kTileMapCast | pie_loader::kTileMapEncode |
-    pie_loader::kTileMapReblock | pie_loader::kTileMapReorder |
-    pie_loader::kTileMapRepack;
+    pie_loader::kTileMapReblock | pie_loader::kTileMapRepack;
 
 /// This driver's storage capability. One definition, two readers: the device
 /// facts JSON published at create time, and the target spec supplied with every

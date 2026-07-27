@@ -332,12 +332,12 @@ async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
             return;
         }
         Err(error @ crate::store::kv::KvStoreError::HostSwapFull { .. }) => {
-            // No kill rung: without swap room this victim cannot move, and
-            // the head waits for completions instead.
-            planner.record_host_swap_exhaustion();
+            // No kill rung here: without swap room this victim cannot move,
+            // and the head waits for completions instead. Park the victim so
+            // the deterministic re-pick cannot spin on it (§20.6).
             step!(pid, "evict rollback: host swap full");
             tracing::warn!(pid = %pid, %error, "planner: eviction blocked on host swap");
-            planner.eviction_failed(pid);
+            planner.eviction_failed_host_swap_full(pid);
             return;
         }
         Err(error) => {

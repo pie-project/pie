@@ -139,6 +139,7 @@ void launch_sigmoid_gate_inplace_bf16(
 
 namespace {
 
+template <bool GateSecond>
 __global__ void chunked_swiglu_bf16_kernel(
     const __nv_bfloat16* __restrict__ packed,
     __nv_bfloat16*       __restrict__ y,
@@ -156,6 +157,7 @@ __global__ void chunked_swiglu_bf16_kernel(
     y[row + i] = __float2bfloat16(silu * u);
 }
 
+template <bool GateSecond>
 __global__ void chunked_swiglu_bf16_vec2_kernel(
     const __nv_bfloat16* __restrict__ packed,
     __nv_bfloat16*       __restrict__ y,
@@ -169,9 +171,9 @@ __global__ void chunked_swiglu_bf16_vec2_kernel(
     const long long packed_row = row * 2;
     if (((I & 1) == 0) && i + 1 < I) {
         const auto gate2 = *reinterpret_cast<const __nv_bfloat162*>(
-            packed + packed_row + i);
+            packed + packed_row + (GateSecond ? I + i : i));
         const auto up2 = *reinterpret_cast<const __nv_bfloat162*>(
-            packed + packed_row + I + i);
+            packed + packed_row + (GateSecond ? i : I + i));
         const float2 g = __bfloat1622float2(gate2);
         const float2 u = __bfloat1622float2(up2);
         const float y0 = (g.x / (1.f + __expf(-g.x))) * u.x;
@@ -238,23 +240,28 @@ __global__ void chunked_swiglu_bf16_strided_kernel(
 }  // namespace
 
 void launch_chunked_swiglu_bf16(
-    const void* packed, void* y, int N, int I, cudaStream_t stream)
+    const void* packed, void* y, int N, int I, cudaStream_t stream,
+    bool gate_second)
 {
     if (N <= 0 || I <= 0) return;
     constexpr int BLOCK = 128;
+    const auto* p = static_cast<const __nv_bfloat16*>(packed);
+    auto* yp = static_cast<__nv_bfloat16*>(y);
     if (I > 10000) {
         dim3 grid(N, (I + BLOCK - 1) / BLOCK);
-        chunked_swiglu_bf16_kernel<<<grid, BLOCK, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(packed),
-            static_cast<__nv_bfloat16*>(y),
-            N, I);
+        if (gate_second) {
+            chunked_swiglu_bf16_kernel<true><<<grid, BLOCK, 0, stream>>>(p, yp, N, I);
+        } else {
+            chunked_swiglu_bf16_kernel<false><<<grid, BLOCK, 0, stream>>>(p, yp, N, I);
+        }
         return;
     }
     dim3 grid(N, ((I + 1) / 2 + BLOCK - 1) / BLOCK);
-    chunked_swiglu_bf16_vec2_kernel<<<grid, BLOCK, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(packed),
-        static_cast<__nv_bfloat16*>(y),
-        N, I);
+    if (gate_second) {
+        chunked_swiglu_bf16_vec2_kernel<true><<<grid, BLOCK, 0, stream>>>(p, yp, N, I);
+    } else {
+        chunked_swiglu_bf16_vec2_kernel<false><<<grid, BLOCK, 0, stream>>>(p, yp, N, I);
+    }
 }
 
 void launch_chunked_swiglu_strided_bf16(

@@ -1,25 +1,66 @@
+//! The plan: what the loader emits, and the passes that shape it.
+//!
+//! `build` turns a checked contract into instructions; `passes` rewrites them
+//! into the form the executor wants; `mod.rs` is only the vocabulary the two
+//! share.
+
 use serde::{Deserialize, Serialize};
 
-use crate::optimizer::OptimizerReport;
+use crate::error::Result;
 use crate::types::{
     BackendKind, BufferId, CheckpointFormat, DType, Encoding, FileId, InstrId, QuantScheme,
     RepackSpec, TensorDecl, TensorId,
 };
 
-pub use crate::ffi::types::{
-    PIE_LOADER_FUSION_FP8_TO_MXFP4 as FUSION_FP8_TO_MXFP4,
-    PIE_LOADER_TILE_MAP_CAST as TILE_MAP_CAST, PIE_LOADER_TILE_MAP_DECODE as TILE_MAP_DECODE,
-    PIE_LOADER_TILE_MAP_ENCODE as TILE_MAP_ENCODE, PIE_LOADER_TILE_MAP_REBLOCK as TILE_MAP_REBLOCK,
-    PIE_LOADER_TILE_MAP_REORDER as TILE_MAP_REORDER, PIE_LOADER_TILE_MAP_REPACK as TILE_MAP_REPACK,
-    PIE_LOADER_TILE_MAP_TRANSCODE as TILE_MAP_TRANSCODE,
-};
+pub mod build;
+pub(crate) mod geometry;
+pub mod index;
+pub mod pass;
+pub mod passes;
 
-// Each backend's statement of which transforms its kernels implement now lives
-// with that backend's lowering rules, because the two always change together
-// (§9). Re-exported here under the names the rest of the tree already uses.
-pub use crate::backend::cuda::TILE_MAP_MASK as CUDA_TILE_MAP_MASK;
-pub use crate::backend::host::TILE_MAP_MASK as HOST_TILE_MAP_MASK;
-pub use crate::backend::metal::TILE_MAP_MASK as METAL_TILE_MAP_MASK;
+pub use crate::extent::{Dim, Extent};
+pub use passes::tile::{CUDA_TILE_MAP_MASK, HOST_TILE_MAP_MASK, METAL_TILE_MAP_MASK};
+
+/// Which tile-map transforms a target's kernels implement.
+///
+/// Defined here, not in `ffi/`: the plan is the thing that has transforms, and
+/// the ABI is a view of the plan. The arrow used to point the other way —
+/// `load_plan.rs` imported `crate::ffi::types::PIE_LOADER_TILE_MAP_*` — which
+/// made the core depend on its own serialization format. `ffi/types.rs` now
+/// restates these under the C names and a `const` assertion pins the two
+/// together, because cbindgen emits literals and cannot follow a path.
+pub const TILE_MAP_CAST: u32 = 1 << 0;
+pub const TILE_MAP_DECODE: u32 = 1 << 1;
+pub const TILE_MAP_ENCODE: u32 = 1 << 2;
+pub const TILE_MAP_TRANSCODE: u32 = 1 << 3;
+pub const TILE_MAP_REBLOCK: u32 = 1 << 4;
+// 1 << 5 was `Reorder`, which no contract could reach and which the CUDA
+// transcode engine dispatched to `reblock_tile_map` anyway — one transform
+// under two names. The bit stays reserved so the numbering below it is stable.
+pub const TILE_MAP_REPACK: u32 = 1 << 6;
+
+/// Transform chains a backend can collapse into one kernel.
+pub const FUSION_FP8_TO_MXFP4: u32 = 1 << 0;
+
+/// Compile a contract into the plan that satisfies it.
+///
+/// The whole pipeline, and short enough to read: rewrite the contract, build
+/// the instructions, run the passes, decide the backend's tiling.
+pub fn compile(
+    metadata: &crate::checkpoint::CheckpointMetadata,
+    contract: &crate::contract::ModelContract,
+    target: StorageTarget,
+) -> Result<LoadPlan> {
+    let contract =
+        crate::contract::rewrite::coalesce_direct_row_shards(contract, metadata, &target)?;
+    let mut plan = build::build(metadata, &contract, target)?;
+    plan.passes = pass::run_all(&mut plan)?;
+    // Runs last, so a plan is never observable in a state where its tiling and
+    // fusion fields are still placeholders.
+    passes::tile::lower(&mut plan);
+    plan.attachments = derive_quant_attachments(&plan.tensors);
+    Ok(plan)
+}
 
 pub fn compiler_version() -> u64 {
     env!("PIE_LOADER_COMPILER_HASH").parse::<u64>().unwrap_or(0)
@@ -272,33 +313,19 @@ pub fn derive_quant_attachments(tensors: &[TensorDecl]) -> Vec<QuantAttachment> 
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StridedExtent {
-    pub base_offset: u64,
-    pub element_bytes: u32,
-    pub dims: Vec<DimSpec>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DimSpec {
-    pub count: i64,
-    pub src_stride: i64,
-    pub dst_stride: i64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceExtent {
     pub file_id: FileId,
     pub tensor_id: TensorId,
     pub file_offset: u64,
     pub span_bytes: u64,
-    pub stride: StridedExtent,
+    pub stride: Extent,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DestExtent {
     pub buffer: BufferId,
     pub offset: u64,
-    pub stride: StridedExtent,
+    pub stride: Extent,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -315,7 +342,6 @@ pub enum TileMapKind {
     Encode,
     Transcode,
     Reblock,
-    Reorder,
     Repack,
 }
 
@@ -327,7 +353,6 @@ impl TileMapKind {
             Self::Encode => TILE_MAP_ENCODE,
             Self::Transcode => TILE_MAP_TRANSCODE,
             Self::Reblock => TILE_MAP_REBLOCK,
-            Self::Reorder => TILE_MAP_REORDER,
             Self::Repack => TILE_MAP_REPACK,
         }
     }
@@ -343,7 +368,7 @@ pub struct TileSpec {
     /// used to turn the budget into a row count while executing
     /// (`transcode_engine.hpp::encode_rows_per_tile`), which left the plan
     /// silent about how it would actually run. Filled in by
-    /// [`crate::backend::lower`].
+    /// [`crate::plan::passes::tile::lower`].
     pub rows_per_tile: u32,
 }
 
@@ -385,6 +410,18 @@ pub enum StorageInstr {
         id: InstrId,
         buffer: BufferId,
     },
+    /// Zero `buffer` before anything writes into it.
+    ///
+    /// A padded destination has holes, and a hole is not copied zeros — it is
+    /// a destination that was zeroed once and then not written to. That is why
+    /// `Lowering::cost` prices padding as one fill rather than one copy per
+    /// band: dropping the holes lets the data on either side fold together,
+    /// which for a head-dim pad is the difference between `2·n_heads` copies
+    /// and one.
+    Fill {
+        id: InstrId,
+        buffer: BufferId,
+    },
     ExtentWrite {
         id: InstrId,
         source: SourceExtent,
@@ -418,10 +455,6 @@ pub enum StorageInstr {
         output: BufferId,
         view: DestExtent,
     },
-    Release {
-        id: InstrId,
-        buffer: BufferId,
-    },
     Finalize {
         id: InstrId,
         tensor: BufferId,
@@ -433,7 +466,9 @@ pub enum StorageInstr {
 pub struct LoadPlan {
     pub compiler_version: u64,
     pub target: StorageTarget,
-    pub optimizer: OptimizerReport,
+    /// What each plan pass did. Replaces the old `optimizer` report, which
+    /// described a no-op pass over an IR that no longer exists.
+    pub passes: Vec<pass::PassStats>,
     pub files: Vec<CheckpointFileDecl>,
     pub sources: Vec<SourceTensorDecl>,
     pub tensors: Vec<TensorDecl>,
@@ -450,7 +485,7 @@ impl LoadPlan {
         Self {
             compiler_version: compiler_version(),
             target,
-            optimizer: OptimizerReport::default(),
+            passes: Vec::new(),
             files: Vec::new(),
             sources: Vec::new(),
             tensors: Vec::new(),
@@ -485,9 +520,6 @@ mod tests {
             bits_per_element: 0,
             group_size,
             channel_axis: Some(Axis(0)),
-            scale_dtype: Some(DType::U8),
-            zero_point_dtype: None,
-            block_shape: Vec::new(),
         })
     }
 

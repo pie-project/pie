@@ -24,16 +24,30 @@ constexpr int kShortK = 512;
 // 2*K, so a quarter of each cache line is used. It is affordable only while
 // K is short, which is why `moe_grouped_gemm_bf16_supported` bounds K.
 //
-// The long-K case was pursued and abandoned. Staging both operands through
-// shared memory, then adding a `cp.async` double buffer, then deepening it
-// to four stages, walked Qwen3.6's gate_up (K=2048) from 14.60 -> 13.71 ->
-// 12.75 -> 11.98 ms and never reached cuBLAS's 10.57. What remains is the
-// MMA-to-load ratio: each warp owns one 16-wide n-fragment, so it issues
-// one `mma` per two fragment loads. Fixing that means each warp computing
-// several n-fragments, which needs a wider tile -- and with only ~70 active
-// blocks a wider tile drops the CTA count below what fills the device. The
-// early exit alone does not pay for a GEMM this much less tuned than
-// cuBLAS's.
+// The long-K case was pursued across seven kernels and cuBLAS keeps it.
+// On Qwen3.6's gate_up (M=16, N=512, K=2048), against cuBLAS's 10.57 ms:
+//   direct (this kernel)                              14.60
+//   + both operands staged through shared memory      13.71
+//   + cp.async double buffering                       12.75
+//   + 4 stages at kChunk=32                           11.98
+//   + 4 n-fragments per warp sharing one a-fragment   11.22
+//   + narrower tile for 4x the CTAs                   11.17
+//   + kChunk=64 so each row read is a full cache line 11.13
+//
+// The plateau is the point. Skipping the padding blocks removes about 65%
+// of the *batch entries* but almost none of the DRAM traffic: roughly 106
+// of 256 experts are live at 128 rows, so the unique weight bytes are
+// ~212 MB per layer either way, and the padding entries were already being
+// served from L2 (they repeat live experts, and inactive ones collapse onto
+// expert 0). Both kernels end up streaming the same bytes at ~780 GB/s.
+//
+// That also corrects the clamp probe that motivated this: clamping the
+// batch count to 128 measured 6.78 ms, but it cut the unique bytes too, so
+// it was never an achievable target for a correct kernel.
+//
+// Where the early exit does pay is a short K, because there the per-entry
+// fixed cost is large relative to the mainloop -- which is exactly where
+// this kernel is used.
 __global__ __launch_bounds__(kWarps * 32) void moe_grouped_gemm_bf16_kernel(
     const __nv_bfloat16* __restrict__ a,
     const __nv_bfloat16* __restrict__ weight_base,

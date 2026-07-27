@@ -145,9 +145,7 @@ inline bool same_encoding(const PieLoaderEncodingSpec& a, const PieLoaderEncodin
     return a.quant.scheme == b.quant.scheme && a.quant.logical_dtype == b.quant.logical_dtype &&
            a.quant.bits_per_element == b.quant.bits_per_element &&
            a.quant.group_size == b.quant.group_size &&
-           a.quant.channel_axis == b.quant.channel_axis &&
-           a.quant.scale_dtype == b.quant.scale_dtype &&
-           a.quant.zero_point_dtype == b.quant.zero_point_dtype;
+           a.quant.channel_axis == b.quant.channel_axis;
 }
 
 inline std::uint8_t default_bits(PieLoaderQuantScheme scheme) {
@@ -324,10 +322,9 @@ inline PieLoaderEncodingSpec mxfp4_encoding(ModelContract& contract, std::uint8_
     quant.bits_per_element = 4;
     quant.group_size = 32;
     quant.channel_axis = channel_axis;
-    quant.scale_dtype = static_cast<std::uint32_t>(PieLoaderDType::U8);
-    // One MXFP4 block scale covers 32 contiguous elements along K. The block
-    // shape says so; the contract owns the number because the POD only borrows.
-    return pie_loader::quantized(contract.with_block_shape(quant, {32}));
+    // One MXFP4 block scale covers 32 contiguous elements along K, which
+    // `group_size` above already says.
+    return pie_loader::quantized(quant);
 }
 
 inline PieLoaderRepackSpecView repack_spec(PieLoaderRepackLayout layout, PieLoaderRowMap row_map) {
@@ -420,6 +417,17 @@ public:
         }
     }
 
+    /// The name a source tensor is published under, given the prefix.
+    ///
+    /// The counterpart to `source_name`: a pass that walks `tensors()` already
+    /// holds the raw name and publishes it through this.
+    std::string output_name(std::string_view raw_name) const {
+        if (!source_prefix_.empty() && raw_name.rfind(source_prefix_, 0) == 0) {
+            return std::string(raw_name.substr(source_prefix_.size()));
+        }
+        return std::string(raw_name);
+    }
+
     /// The name a source tensor has in the checkpoint, given the prefix.
     ///
     /// A pass that goes looking for one specific tensor names it the way the
@@ -430,6 +438,15 @@ public:
     std::string source_name(std::string_view bound_name) const {
         return std::string(source_prefix_) + std::string(bound_name);
     }
+
+    /// Where the decoder's layers are named, up to the layer index.
+    ///
+    /// Only the fused-projection pass needs it, and only because it goes
+    /// looking for specific names instead of walking `tensors()`. Matching on
+    /// the `.self_attn.q_proj.weight` suffix alone would be prefix-free but
+    /// wrong: Gemma-4's vision and audio towers have projections of that name
+    /// too, and fusing one would consume weights its bind path still reads.
+    void decoder_layer_prefix(std::string_view prefix) { decoder_layer_prefix_ = prefix; }
 
     /// Tensor-parallel shard-axis strategy, keyed by tensor name. Defaults to
     /// the HF convention; a family whose checkpoint names the same operator
@@ -659,8 +676,15 @@ public:
     // -- shared passes -------------------------------------------------------
 
     /// Re-join each rank's gate and up bands of a pre-fused expert tensor.
-    void fused_moe_gate_up_tp_slices() {
-        if (target_.tp_size <= 1) {
+    /// `gate_second` publishes each expert's halves as `[up|gate]` instead of
+    /// the checkpoint's `[gate|up]`. That is the order flashinfer's CUTLASS
+    /// MoE reads fc1's output in, and declaring it here makes the reorder a
+    /// load-time view of the source rather than a runtime pass that mutates a
+    /// resident weight. It applies with or without sharding, so unlike the
+    /// slicing this runs at tp_size == 1 too.
+    void fused_moe_gate_up_tp_slices(bool gate_second = false) {
+        const bool sharding = target_.tp_size > 1;
+        if (!sharding && !gate_second) {
             return;
         }
         for (const SourceTensor& raw : tensors_) {
@@ -684,11 +708,25 @@ public:
             // Gate rows [0, I) and up rows [I, 2I) are sharded independently
             // and re-joined, so the local halves stay adjacent per expert.
             const Node src = contract_.src(std::string(raw.name));
-            auto [gate, local_i] = band(src, 1, 0, full_i);
-            auto [up, up_extent] = band(src, 1, full_i, full_i);
-            (void)up_extent;
+            // Gate rows [0, I) and up rows [I, 2I) are taken separately so
+            // that a shard splits each half independently and the local
+            // halves stay adjacent per expert. Build only the nodes that are
+            // used: an unreferenced slice still enters the DAG.
+            const std::pair<Node, std::int64_t> gate_part =
+                sharding ? band(src, 1, 0, full_i)
+                         : std::pair<Node, std::int64_t>{
+                               contract_.slice(src, 1, 0, full_i), full_i};
+            const std::pair<Node, std::int64_t> up_part =
+                sharding ? band(src, 1, full_i, full_i)
+                         : std::pair<Node, std::int64_t>{
+                               contract_.slice(src, 1, full_i, full_i), full_i};
+            const Node gate = gate_part.first;
+            const Node up = up_part.first;
+            const std::int64_t local_i = gate_part.second;
             push_expr(output_name(raw.name), raw, {experts, 2 * local_i, hidden},
-                      contract_.cat(std::vector<Node>{gate, up}, 1));
+                      contract_.cat(gate_second ? std::vector<Node>{up, gate}
+                                                : std::vector<Node>{gate, up},
+                                    1));
         }
     }
 
@@ -731,14 +769,41 @@ public:
     void publish_fused(const std::vector<FusedCandidate>& candidates) {
         for (const FusedCandidate& candidate : candidates) {
             std::vector<Node> parts;
+            std::vector<std::int64_t> local_rows;
             parts.reserve(candidate.parts.size());
+            local_rows.reserve(candidate.parts.size());
+            std::int64_t rows = 0;
             for (const SourceTensor* raw : candidate.parts) {
-                consumed_.insert(raw->id);
-                parts.push_back(contract_.src(std::string(raw->name)));
+                // Shard each part, then join: q/k/v have different row counts,
+                // so a row-shard of the *concatenation* would cut across the
+                // q/k boundary and hand a rank a mix of two projections.
+                // Sharding first gives every rank its own band of each, and
+                // their join is exactly this rank's fused weight.
+                check_head_granularity(raw->name, shape_of(*raw), ShardAxis{0});
+                parts.push_back(split(contract_.src(std::string(raw->name)), 0));
+                local_rows.push_back(local_extent(raw->shape[0]));
+                rows += local_rows.back();
             }
             define(candidate.output_name, contract_.cat(parts, 0),
                    pie_loader::raw(PieLoaderDType::BF16),
-                   std::vector<std::int64_t>{candidate.rows, candidate.cols});
+                   std::vector<std::int64_t>{rows, candidate.cols});
+
+            // Re-publish each projection as a view into the bank. A bind path
+            // that reads q/k/v individually -- a shared Gemma-4 layer, an
+            // unfused GEMM -- then finds them under their own names at every
+            // `tp_size`, and the offset of a rank's band is stated once, here,
+            // instead of being recomputed in pointer arithmetic per family.
+            std::int64_t at = 0;
+            for (std::size_t part = 0; part < candidate.parts.size(); ++part) {
+                const SourceTensor* raw = candidate.parts[part];
+                define(output_name(raw->name),
+                       contract_.slice(contract_.out(candidate.output_name), 0, at,
+                                       local_rows[part]),
+                       pie_loader::raw(PieLoaderDType::BF16),
+                       std::vector<std::int64_t>{local_rows[part], candidate.cols});
+                consumed_.insert(raw->id);
+                at += local_rows[part];
+            }
         }
     }
 
@@ -749,7 +814,7 @@ public:
     /// projections separately. A family whose bind path reads q/k/v
     /// individually (Qwen3-MoE, GPT-OSS) simply does not call this.
     void dense_fused_projection_joins() {
-        if (target_.tp_size != 1 || runtime_quant_scheme().has_value()) {
+        if (runtime_quant_scheme().has_value()) {
             return;
         }
         std::vector<FusedCandidate> qkv;
@@ -757,7 +822,8 @@ public:
         std::uint64_t qkv_bytes = 0;
         std::uint64_t gate_up_bytes = 0;
         for (std::uint32_t layer = 0; layer < facts_.num_hidden_layers; ++layer) {
-            const std::string p = "model.layers." + std::to_string(layer) + ".";
+            const std::string p =
+                std::string(decoder_layer_prefix_) + std::to_string(layer) + ".";
             const std::string s = source_name(p);
             if (auto candidate = fused_join_candidate(
                     p + "self_attn.qkv_proj.fused.weight",
@@ -777,11 +843,13 @@ public:
             return;
         }
 
-        // Fused dense projections replace the original TP1 BF16 tensors, and
-        // the unfused fallback binds non-owning views into the fused buffer, so
+        // Fused dense projections replace the original BF16 tensors, and the
+        // unfused fallback binds non-owning views into the fused buffer, so
         // this is not a persistent duplicate-memory budget. It selects which
         // groups get a fused GEMM: all groups through 8B-class Qwen models, and
-        // QKV-only above that, where gate/up fusion has regressed.
+        // QKV-only above that, where gate/up fusion has regressed. Measured on
+        // whole-checkpoint bytes so a model lands in the same class at every
+        // `tp_size` — it is a proxy for model class, not for device memory.
         constexpr std::uint64_t kBudgetBytes = 10ull * 1024 * 1024 * 1024;
         std::vector<FusedCandidate> chosen;
         if (qkv_bytes + gate_up_bytes <= kBudgetBytes) {
@@ -850,13 +918,6 @@ private:
                raw_name.rfind(source_prefix_, 0) == 0;
     }
 
-    std::string output_name(std::string_view raw_name) const {
-        if (!source_prefix_.empty() && raw_name.rfind(source_prefix_, 0) == 0) {
-            return std::string(raw_name.substr(source_prefix_.size()));
-        }
-        return std::string(raw_name);
-    }
-
     // -- runtime quantization ------------------------------------------------
 
     /// The scheme this author's runtime-quant request resolves to, or none.
@@ -920,14 +981,12 @@ private:
                 quant.bits_per_element = 8;
                 quant.group_size = 1;
                 quant.channel_axis = 0;
-                quant.scale_dtype = static_cast<std::uint32_t>(PieLoaderDType::F32);
                 break;
             case PieLoaderQuantScheme::Int8Symmetric:
                 quant = pie_loader::quant_spec(scheme, PieLoaderDType::I8);
                 quant.bits_per_element = 8;
                 quant.group_size = 1;
                 quant.channel_axis = 0;
-                quant.scale_dtype = static_cast<std::uint32_t>(PieLoaderDType::F32);
                 break;
             case PieLoaderQuantScheme::Mxfp4E2M1E8M0:
                 // The K dimension (columns, for a 2-D weight) must be a
@@ -941,8 +1000,6 @@ private:
                 quant.bits_per_element = 4;
                 quant.group_size = 32;
                 quant.channel_axis = 1;
-                quant.scale_dtype = static_cast<std::uint32_t>(PieLoaderDType::U8);
-                quant = contract_.with_block_shape(quant, {32});
                 break;
             default:
                 fail("unsupported runtime_quant scheme");
@@ -969,6 +1026,7 @@ private:
 
     std::string_view source_prefix_;
     ShardAxis (*shard_axis_fn_)(std::string_view) = hf_shard_axis;
+    std::string_view decoder_layer_prefix_ = "model.layers.";
     bool shard_embed_tokens_ = false;
     bool replicate_lm_head_ = false;
     bool allow_bf16_rq_ = false;

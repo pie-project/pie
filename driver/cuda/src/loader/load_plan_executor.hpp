@@ -104,6 +104,9 @@ public:
                               << instr.buffer_id << "\n";
                 }
                 break;
+            case pie_loader::PieLoaderStorageInstrKind::Fill:
+                fill(instr);
+                break;
             case pie_loader::PieLoaderStorageInstrKind::ExtentWrite:
                 extent_write(instr, stats);
                 break;
@@ -134,10 +137,6 @@ public:
                 copy_engine_.flush();
                 create_view(plan, instr);
                 break;
-            case pie_loader::PieLoaderStorageInstrKind::Release:
-                copy_engine_.flush();
-                buffers_.erase(instr.buffer_id);
-                break;
             }
         }
         copy_engine_.flush();
@@ -148,6 +147,25 @@ public:
     }
 
 private:
+    /// Zero a buffer the plan is about to write only part of.
+    ///
+    /// The loader emits this when an expression pads: the padded region is
+    /// device memory no source covers, and the compiler prices it as one fill
+    /// rather than one copy per band. It must precede every write to the same
+    /// buffer, which `validate-fill-order` guarantees on the Rust side; the
+    /// stream ordering is what guarantees it here, so the pending copies have
+    /// to be flushed first.
+    void fill(const pie_loader::PieLoaderStorageInstrView& instr)
+    {
+        copy_engine_.flush();
+        auto it = buffers_.find(instr.buffer_id);
+        if (it == buffers_.end()) {
+            throw std::runtime_error("rust storage executor: Fill buffer missing");
+        }
+        CUDA_CHECK(cudaMemsetAsync(
+            it->second.data(), 0, it->second.nbytes(), copy_engine_.acquire_stream()));
+    }
+
     void allocate(
         const pie_loader::LoadPlanView& plan,
         const pie_loader::PieLoaderStorageInstrView& instr)
