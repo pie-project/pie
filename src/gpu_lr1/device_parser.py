@@ -545,6 +545,51 @@ def _count_kernel(
 
 
 @triton.jit
+def _snapshot_kernel(
+    lexer_state_ptr,
+    stack_ptr,
+    config_count_ptr,
+    live_offsets_ptr,
+    old_lexer_ptr,
+    old_count_ptr,
+    old_stack_ptr,
+    ROWS: tl.constexpr,
+    CONFIGS: tl.constexpr,
+    STACK_STRIDE: tl.constexpr,
+):
+    """Keep what the commit will overwrite, for the configurations in play.
+
+    A candidate names the stack it came from rather than carrying a copy, and
+    the commit builds the next set in place, so the sources have to survive.
+    Copying the whole buffer was 8.4 MB and 13 us a step to preserve the one or
+    two configurations a sequence actually holds.
+    """
+    program = tl.program_id(0)
+    programs = tl.num_programs(0)
+    total = tl.load(live_offsets_ptr + ROWS)
+    slot = program
+    while slot < total:
+        low = 0
+        high = ROWS - 1
+        while low < high:
+            middle = (low + high + 1) // 2
+            if tl.load(live_offsets_ptr + middle) <= slot:
+                low = middle
+            else:
+                high = middle - 1
+        row_index = low
+        tl.store(old_lexer_ptr + row_index, tl.load(lexer_state_ptr + row_index))
+        sequence = row_index // CONFIGS
+        tl.store(old_count_ptr + sequence, tl.load(config_count_ptr + sequence))
+        lane = tl.arange(0, STACK_STRIDE)
+        tl.store(
+            old_stack_ptr + row_index * STACK_STRIDE + lane,
+            tl.load(stack_ptr + row_index * STACK_STRIDE + lane),
+        )
+        slot = slot + programs
+
+
+@triton.jit
 def _scatter_kernel(
     group_offsets_ptr,
     group_set_kind_ptr,
@@ -1958,9 +2003,6 @@ class DeviceBatch:
         grammar = self.grammar
         self.cand_valid.zero_()
         self.found.fill_(_NO_GROUP)
-        self.old_lexer.copy_(self.lexer_state)
-        self.old_count.copy_(self.config_count)
-        self.old_stack.copy_(self.stack.reshape(-1))
         rows = self.batch * self.configs
         # One entry per live configuration, enumerated the way the fill
         # enumerates its groups. Sizing the grid by the width instead meant a
@@ -1983,7 +2025,22 @@ class DeviceBatch:
             UNIT=1,
             BLOCK=256,
         )
+        # Torch's scan rather than one of our own: a single program carrying a
+        # running total across eight thousand words is one multiprocessor doing
+        # what thirty could, and measured 16 us against 9.
         torch.cumsum(self.live_counts, 0, out=self.live_offsets[1:])
+        _snapshot_kernel[(self.sweep_blocks,)](
+            self.lexer_state,
+            self.stack,
+            self.config_count,
+            self.live_offsets,
+            self.old_lexer,
+            self.old_count,
+            self.old_stack,
+            ROWS=rows,
+            CONFIGS=self.configs,
+            STACK_STRIDE=grammar.max_stack,
+        )
         _locate_kernel[(self.sweep_blocks,)](
             grammar.group_offsets,
             grammar.group_set_kind,
