@@ -1428,3 +1428,73 @@ affects both programs equally and so cancels out of every comparison here:
 `cudaGraphInstantiate` was called 51 times at ~2.2 ms each in a 31-step run, in
 *both* programs. Re-instantiating an executable graph rather than updating one
 is expensive enough to dominate the host side of a decode step.
+
+## 15. Track B: where each eviction policy pays for itself
+
+§14 measured Quest. `tests/inferlets/bench_trackb.py` applies the identical
+method -- differenced endpoints, independently minimised, interleaved across
+rounds, `reserve_tokens` pinned, `report` off -- to the two Track B policies
+that enforce. Qwen3-0.6B, 28 layers, page size 16, L40S, min of 7 rounds.
+Ratios are baseline ms/token over policy ms/token, so >1.00x is a net win.
+
+| ctx | pages | baseline | h2o@1 | h2o@0.5 | h2o@0.25 | snapkv@1 | snapkv@0.5 | snapkv@0.25 |
+|---|---|---|---|---|---|---|---|---|
+| 1024 | 70 | 3.54 ms | 0.52x | 0.58x | 0.61x | 0.65x | 0.73x | 0.74x |
+| 2048 | 134 | 4.66 ms | 0.58x | 0.70x | 0.76x | 0.73x | 0.88x | 0.95x |
+| 4096 | 262 | 6.92 ms | 0.62x | 0.85x | 0.99x | 0.80x | 1.10x | 1.16x |
+| 6144 | 390 | 10.68 ms | 0.72x | 1.13x | 1.22x | 0.89x | 1.44x | **1.79x** |
+
+Monotone in every direction: in the context, in the aggressiveness of the
+budget, and between the two policies at every cell.
+
+### 15.1 SnapKV is at the floor, and that is the point
+
+The `@1` columns keep every page, so they price the policy with its benefit
+removed. At 6144 that is **+4.15 ms/step for H2O and +1.32 ms/step for
+SnapKV**, and the gap between those two numbers is the whole argument of §14.4
+restated from the other end.
+
+SnapKV does almost nothing per layer. Its keep-set was decided once, during
+prefill; every decode step afterwards re-applies a mask that is already
+resident on the device. There is no score to compute, no row to fold, no
+ranking. Its 1.32 ms/step is therefore very close to a direct measurement of
+what binding a per-layer hook costs by itself -- and §14.4 put that at ~1.5
+ms/step from an entirely different instrument (kernel launch counts under
+`nsys`). Two independent measurements landing on the same constant is the
+reason to believe either of them.
+
+The consequence is that **SnapKV's per-step cost cannot be optimised from
+within this document**. It is already doing the minimum. Only the engine-level
+graph-capture change described in §14.4 would move it.
+
+H2O's extra ~2.8 ms/step over SnapKV is its own work, and it is per-layer work
+proportional to the context: `on_attn` folds a `[kv_max]` score row into a
+cumulative accumulator at every layer, and the epilogue reduces that row into
+page masses once per step. That is a real cost with a real justification --
+H2O's statistic is the accumulated history, which is exactly what SnapKV's
+fixed keep-set gives up -- but it is the part worth attacking if H2O's
+crossover needs to move earlier.
+
+### 15.2 How the three policies compare
+
+Ranked by where each becomes a net win on this model:
+
+| policy | decides | per-layer decode work | crossover (quarter budget) |
+|---|---|---|---|
+| SnapKV | once, at prefill | apply a fixed mask | **~2.3K** |
+| H2O | every step | fold + rank a `[kv_max]` row | ~4.1K |
+| Quest | every step | `envelope_dot` over all pages, then rank | ~4.4K (§14) |
+
+The ordering is the ordering of how much each recomputes. SnapKV commits to a
+decision and never revisits it, so it pays once; H2O revisits it with a
+statistic it already has; Quest recomputes the statistic itself from the key
+envelopes every layer. Each step up that ladder buys adaptivity -- Quest can
+change its mind about a page whose relevance depends on the current query,
+which SnapKV structurally cannot -- and each costs a later crossover.
+
+None of this is an argument that SnapKV is the best policy. It is an argument
+that on a 0.6B model the crossovers are close together and all of them are
+dominated by a constant that belongs to the engine. On a production-sized model
+the baseline per-step cost grows while that constant does not, so every one of
+these crossovers moves earlier, and the ordering between them -- which is set
+by real per-layer work rather than by the constant -- is what survives.

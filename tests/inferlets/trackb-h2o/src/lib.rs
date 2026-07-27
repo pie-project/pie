@@ -93,6 +93,21 @@ struct Input {
     /// top of this, so the effective local window is never zero.
     #[serde(default = "default_page_budget")]
     page_budget: u32,
+    /// Drain the per-step score row and layer counter to the host. The tests
+    /// assert on them, so it defaults on; a benchmark must turn it off, because
+    /// a `[kv_max]` f32 readback per decode step is tens of kilobytes and a
+    /// round-trip that the POLICY never performs. Timing it measures the
+    /// harness. See §14.2 of the design document.
+    #[serde(default = "default_report")]
+    report: bool,
+    /// Pins the reserved page count so it does not move with `max_tokens`.
+    /// `p_max` sets the width of the score row folded and ranked every layer,
+    /// so a benchmark that differences two `max_tokens` would otherwise be
+    /// comparing two different per-step workloads and would charge the policy
+    /// for the difference. Setting this to the larger of the two endpoints
+    /// makes the per-step cost identical. Defaults to `max_tokens`.
+    #[serde(default)]
+    reserve_tokens: Option<usize>,
 }
 
 fn default_prompt() -> String {
@@ -109,6 +124,9 @@ fn default_seed() -> u32 {
 }
 fn default_page_budget() -> u32 {
     4
+}
+fn default_report() -> bool {
+    true
 }
 
 /// Largest entry of the cold-start ramp (see the module docs). Four orders of
@@ -209,7 +227,8 @@ async fn main(input: Input) -> Result<Output> {
         prompt.push(0);
     }
     let n = prompt.len() as u32;
-    let max_pages = (n + max_tokens as u32 + 1).div_ceil(page_size).max(1);
+    let reserve = input.reserve_tokens.unwrap_or(max_tokens).max(max_tokens);
+    let max_pages = (n + reserve as u32 + 1).div_ceil(page_size).max(1);
     // The program cannot know the runtime KV length, so — exactly like Quest's
     // `p_max` — it declares a static ceiling and the backend refuses (rather
     // than truncates) a request that outgrows it. Sizing it off `max_pages`
@@ -218,6 +237,7 @@ async fn main(input: Input) -> Result<Output> {
     let kv_max = max_pages * page_size;
     let p_max = max_pages;
     let page_budget = input.page_budget.min(p_max);
+    let report = input.report;
     ws.reserve(max_pages)
         .map_err(|e| format!("reserve KV: {e}"))?;
 
@@ -324,13 +344,20 @@ async fn main(input: Input) -> Result<Output> {
         let acc = Channel::from(seed).named("h2o_acc");
         let layer_ct = Channel::from(vec![0u32]).named("h2o_layers");
 
-        // Host drains.
-        let scores_out = Channel::new([kv_max], dtype::f32)
-            .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
-            .named("h2o_scores");
-        let layers_out = Channel::new([1], dtype::u32)
-            .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
-            .named("h2o_layer_count");
+        // Host drains. Absent entirely when `report` is off -- not merely
+        // undrained -- so the epilogue never writes them and the geometry pass
+        // never sees a port. `acc` and `layer_ct` stay unconditional: their
+        // fold feeds `page_mass_epi`, which IS the policy.
+        let scores_out = report.then(|| {
+            Channel::new([kv_max], dtype::f32)
+                .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+                .named("h2o_scores")
+        });
+        let layers_out = report.then(|| {
+            Channel::new([1], dtype::u32)
+                .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+                .named("h2o_layer_count")
+        });
 
         // The page-mass row the NEXT fire's `on_attn_proj` ranks. Published by
         // the epilogue because that is the only stage that sees the completed
@@ -419,8 +446,12 @@ async fn main(input: Input) -> Result<Output> {
             // what makes `score_mass == layers_observed` stay true as both grow.
             let folded = acc.take().tensor();
             let layers = layer_ct.take().tensor();
-            scores_out.put(&folded);
-            layers_out.put(&layers);
+            if let Some(c) = scores_out.as_ref() {
+                c.put(&folded);
+            }
+            if let Some(c) = layers_out.as_ref() {
+                c.put(&layers);
+            }
             acc.put(&folded);
             layer_ct.put(&layers);
 
@@ -449,26 +480,30 @@ async fn main(input: Input) -> Result<Output> {
                 .get::<i32>()
                 .await
                 .map_err(|e| format!("tok_out.take @{}: {e}", generated.len()))?[0];
-            last_scores = scores_out
-                .take()
-                .get::<f32>()
-                .await
-                .map_err(|e| format!("h2o_scores.take @{}: {e}", generated.len()))?;
-            let layers_before = layers_observed;
-            layers_observed = layers_out
-                .take()
-                .get::<u32>()
-                .await
-                .map_err(|e| format!("h2o_layer_count.take @{}: {e}", generated.len()))?[0];
-            // The fire that produced this row had `n + generated.len()` KV
-            // positions live: the prompt plus every token committed before it.
-            last_kv_len = n + generated.len() as u32;
-            layers_per_fire = layers_observed - layers_before;
-            mass_trace.push(last_scores.iter().filter(|s| s.is_finite()).sum());
-            trace.push((
-                last_kv_len,
-                last_scores.iter().rposition(|s| *s != 0.0).map_or(0, |i| i + 1),
-            ));
+            if let (Some(sc), Some(lc)) = (scores_out.as_ref(), layers_out.as_ref()) {
+                last_scores = sc
+                    .take()
+                    .get::<f32>()
+                    .await
+                    .map_err(|e| format!("h2o_scores.take @{}: {e}", generated.len()))?;
+                let layers_before = layers_observed;
+                layers_observed = lc
+                    .take()
+                    .get::<u32>()
+                    .await
+                    .map_err(|e| {
+                        format!("h2o_layer_count.take @{}: {e}", generated.len())
+                    })?[0];
+                // The fire that produced this row had `n + generated.len()` KV
+                // positions live: the prompt plus every token committed before it.
+                last_kv_len = n + generated.len() as u32;
+                layers_per_fire = layers_observed - layers_before;
+                mass_trace.push(last_scores.iter().filter(|s| s.is_finite()).sum());
+                trace.push((
+                    last_kv_len,
+                    last_scores.iter().rposition(|s| *s != 0.0).map_or(0, |i| i + 1),
+                ));
+            }
             in_flight -= 1;
             generated.push(t as u32);
             if submitted < budget_n {
@@ -488,9 +523,15 @@ async fn main(input: Input) -> Result<Output> {
     // drained position scores into page masses and rank them. Recomputing it
     // here rather than draining the device's mask is deliberate -- it is an
     // independent second opinion, so a disagreement is visible.
+    //
+    // `live_pages` is derived from `kv_len`, which is known whether or not the
+    // scores were drained, so it can outrun `last_scores` when `report` is off
+    // and the row was never fetched. Clamp BOTH ends against the row actually
+    // in hand rather than only `hi`: a page whose whole span sits past the end
+    // must yield an empty slice, not a backwards one.
     let masses: Vec<f32> = (0..live_pages as usize)
         .map(|p| {
-            let lo = p * page_size as usize;
+            let lo = (p * page_size as usize).min(last_scores.len());
             let hi = ((p + 1) * page_size as usize).min(last_scores.len());
             last_scores[lo..hi].iter().sum()
         })
