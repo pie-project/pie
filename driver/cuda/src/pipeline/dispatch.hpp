@@ -105,6 +105,12 @@ struct DispatchStats {
     std::uint64_t identity_host_supplied = 0;
     std::uint64_t identity_derived = 0;
     std::uint64_t identity_divergent = 0;
+    /// The same pair for the per-region analysis (`region_support.hpp`'s bind
+    /// gates and `analyze_direct_argmax`). Deleting that file's copies is
+    /// gated on `region_divergent == 0 && region_host_supplied > 0`.
+    std::uint64_t region_host_supplied = 0;
+    std::uint64_t region_derived = 0;
+    std::uint64_t region_divergent = 0;
     std::uint64_t descriptor_readback_batches = 0;
     std::uint64_t descriptor_readback_cells = 0;
     std::uint64_t descriptor_readback_bytes = 0;
@@ -174,6 +180,7 @@ class Dispatch {
                          pie_native::ByteSlice sidecar,
                          PieEmittedKernelSlice emitted,
                          PieU64Slice stage_identities,
+                         PieRegionAnalysisSlice region_analysis,
                          std::string* err);
 
     int register_channel(const PieChannelDesc& channel,

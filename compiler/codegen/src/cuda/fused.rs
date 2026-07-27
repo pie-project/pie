@@ -137,12 +137,24 @@ fn row_shape(dims: &[Dimension]) -> Option<RowShape> {
 
 /// Which `argmax` nodes may read a logits intrinsic's buffer directly, and
 /// which nodes that makes redundant.
-struct DirectArgmax {
-    intrinsic: Vec<u16>,
-    skipped: Vec<u8>,
+///
+/// `source_value` and `requires_single_row` are not used by emission — the
+/// emitted kernel only needs to know *that* the rewrite applies. They exist
+/// because the driver's launch packer needs them, and shipping them from here
+/// is what keeps this the only implementation of the analysis
+/// (`ptir-refactor.md` §4.2).
+pub(crate) struct DirectArgmax {
+    pub(crate) intrinsic: Vec<u16>,
+    pub(crate) skipped: Vec<u8>,
+    pub(crate) source_value: Vec<u32>,
+    pub(crate) requires_single_row: Vec<u8>,
 }
 
-fn analyze_direct_argmax(stage: &CompiledStage, region: &Region, bases: &[u32]) -> DirectArgmax {
+pub(crate) fn analyze_direct_argmax(
+    stage: &CompiledStage,
+    region: &Region,
+    bases: &[u32],
+) -> DirectArgmax {
     let ops: Vec<OpView> = OpView::of_all(&stage.normalized.ops);
     let value_count = stage.normalized.value_types.len();
     let mut producers = vec![u32::MAX; value_count];
@@ -158,6 +170,8 @@ fn analyze_direct_argmax(stage: &CompiledStage, region: &Region, bases: &[u32]) 
     let mut analysis = DirectArgmax {
         intrinsic: vec![u16::MAX; ops.len()],
         skipped: vec![0; ops.len()],
+        source_value: vec![u32::MAX; ops.len()],
+        requires_single_row: vec![0; ops.len()],
     };
 
     for &node in &region.nodes {
@@ -203,6 +217,8 @@ fn analyze_direct_argmax(stage: &CompiledStage, region: &Region, bases: &[u32]) 
             };
             if exact_shape || runtime_single_row {
                 analysis.intrinsic[node] = op.intr;
+                analysis.source_value[node] = bases[producer as usize];
+                analysis.requires_single_row[node] = u8::from(runtime_single_row);
                 for &skipped in &chain {
                     analysis.skipped[skipped as usize] = 1;
                 }

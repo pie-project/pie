@@ -152,8 +152,31 @@ fn rust_layout_matches_committed_header_contract() {
     );
     assert_layout!(PieEmittedKernelSlice, 16, 8, ptr => 0, len => 8);
     assert_layout!(
+        PieDirectArgmax,
+        12,
+        4,
+        node => 0,
+        source_value => 4,
+        intrinsic => 8,
+        requires_single_row => 10,
+        reserved0 => 11
+    );
+    assert_layout!(PieDirectArgmaxSlice, 16, 8, ptr => 0, len => 8);
+    assert_layout!(
+        PieRegionAnalysis,
+        48,
+        8,
+        stage_index => 0,
+        region_index => 4,
+        flags => 8,
+        reserved0 => 12,
+        direct_argmax => 16,
+        skipped => 32
+    );
+    assert_layout!(PieRegionAnalysisSlice, 16, 8, ptr => 0, len => 8);
+    assert_layout!(
         PieProgramDesc,
-        88,
+        104,
         8,
         abi_version => 0,
         reserved0 => 4,
@@ -163,7 +186,8 @@ fn rust_layout_matches_committed_header_contract() {
         emitter_version => 48,
         reserved1 => 52,
         emitted_kernels => 56,
-        stage_identities => 72
+        stage_identities => 72,
+        region_analysis => 88
     );
     assert_layout!(
         PieInstanceDesc,

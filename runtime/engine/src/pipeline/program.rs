@@ -34,6 +34,7 @@ use std::sync::{Arc, Mutex};
 
 use lru::LruCache;
 use pie_codegen::program::{Backend, EmittedKernel, emit_program};
+use pie_driver_abi::plan::{DirectArgmax, RegionAnalysis};
 use pie_ir::container::{self, ContainerDecodeError, PortSource, TraceContainer};
 use pie_ir::container_hash;
 use pie_ir::op::Op;
@@ -112,6 +113,36 @@ impl RegisteredProgram {
         self.compiled_stages
             .iter()
             .map(pie_plan::stage_identity)
+            .collect()
+    }
+
+    /// Every per-region decision the CUDA driver derives for itself in
+    /// `region_support.hpp` — the bind-time gates and the intrinsic side-table
+    /// analysis (`ptir-refactor.md` §4.2).
+    ///
+    /// The analysis is CUDA's, but it is not code generation: it is the same
+    /// question the emitter had to answer to build the kernel, which is exactly
+    /// why it must not be answered twice. Shipped on the same terms as
+    /// `stage_identities` — the driver compares while both exist.
+    pub fn region_analysis(&self) -> Vec<RegionAnalysis> {
+        pie_codegen::region_analysis::analyze_program(&self.compiled_stages)
+            .into_iter()
+            .map(|region| RegionAnalysis {
+                stage_index: region.stage_index,
+                region_index: region.region_index,
+                flags: region.flags,
+                direct_argmax: region
+                    .direct_argmax
+                    .into_iter()
+                    .map(|record| DirectArgmax {
+                        node: record.node,
+                        source_value: record.source_value,
+                        intrinsic: record.intrinsic,
+                        requires_single_row: record.requires_single_row,
+                    })
+                    .collect(),
+                skipped: region.skipped,
+            })
             .collect()
     }
 

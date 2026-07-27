@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <sstream>
 #include <iterator>
 #include <limits>
 #include <numeric>
@@ -85,6 +86,85 @@ PieU64Slice host_stage_identities(
     const std::vector<std::uint64_t>& identities =
         load_host_stage_identities(golden_directory, name);
     return PieU64Slice{identities.data(), identities.size()};
+}
+
+// The per-region analysis, same fixture path and same reason. The nested
+// `direct_argmax` and `skipped` slices point into the cached vectors, so the
+// whole record has to be cached together rather than rebuilt per call.
+struct HostRegionFixture {
+    std::vector<PieRegionAnalysis> regions;
+    std::vector<std::vector<PieDirectArgmax>> argmax;
+    std::vector<std::vector<std::uint32_t>> skipped;
+};
+
+const HostRegionFixture& load_host_region_analysis(
+    const std::string& golden_directory, const std::string& name) {
+    static std::map<std::string, HostRegionFixture> cache;
+    auto found = cache.find(name);
+    if (found != cache.end()) return found->second;
+    const std::string path = golden_directory + "-kernels/" + name + ".regions";
+    std::ifstream input(path);
+    if (!input) {
+        std::fprintf(
+            stderr, "host region analysis fixture: cannot open %s\n",
+            path.c_str());
+        std::abort();
+    }
+    HostRegionFixture fixture;
+    std::string line;
+    while (std::getline(input, line)) {
+        std::istringstream fields(line);
+        std::string kind;
+        if (!(fields >> kind)) continue;
+        if (kind == "region") {
+            PieRegionAnalysis region{};
+            std::uint32_t argmax_count = 0;
+            fields >> region.stage_index >> region.region_index >>
+                region.flags >> argmax_count;
+            std::vector<std::uint32_t> skipped;
+            std::uint32_t node = 0;
+            while (fields >> node) skipped.push_back(node);
+            fixture.skipped.push_back(std::move(skipped));
+            fixture.argmax.emplace_back();
+            fixture.argmax.back().reserve(argmax_count);
+            fixture.regions.push_back(region);
+        } else if (kind == "argmax") {
+            if (fixture.argmax.empty()) {
+                std::fprintf(
+                    stderr, "host region analysis fixture: %s has an argmax "
+                    "record before any region\n", path.c_str());
+                std::abort();
+            }
+            PieDirectArgmax record{};
+            std::uint32_t intrinsic = 0;
+            std::uint32_t single_row = 0;
+            fields >> record.node >> record.source_value >> intrinsic >>
+                single_row;
+            record.intrinsic = static_cast<std::uint16_t>(intrinsic);
+            record.requires_single_row =
+                static_cast<std::uint8_t>(single_row);
+            fixture.argmax.back().push_back(record);
+        }
+    }
+    // The nested pointers are taken only after every vector has stopped
+    // growing; taken during the parse they would dangle on the next
+    // reallocation.
+    for (std::size_t i = 0; i < fixture.regions.size(); ++i) {
+        fixture.regions[i].direct_argmax =
+            PieDirectArgmaxSlice{fixture.argmax[i].data(),
+                                 fixture.argmax[i].size()};
+        fixture.regions[i].skipped =
+            PieU32Slice{fixture.skipped[i].data(), fixture.skipped[i].size()};
+    }
+    return cache.emplace(name, std::move(fixture)).first->second;
+}
+
+PieRegionAnalysisSlice host_region_analysis(
+    const std::string& golden_directory, const std::string& name) {
+    const HostRegionFixture& fixture =
+        load_host_region_analysis(golden_directory, name);
+    return PieRegionAnalysisSlice{fixture.regions.data(),
+                                  fixture.regions.size()};
 }
 
 int failures = 0;
@@ -217,6 +297,7 @@ std::uint64_t run_case(
                 sidecar_bytes.data(), sidecar_bytes.size()},
             load_host_kernels(golden_directory, "section3_masked_gumbel").slice(),
             host_stage_identities(golden_directory, "section3_masked_gumbel"),
+            host_region_analysis(golden_directory, "section3_masked_gumbel"),
             &error) == PIE_STATUS_OK,
         "register grouped program: " + error);
     const DispatchStats registration_stats = dispatch.stats();
@@ -238,6 +319,15 @@ std::uint64_t run_case(
             std::to_string(registration_stats.identity_host_supplied) +
             " divergent=" +
             std::to_string(registration_stats.identity_divergent));
+    // Same gate for `region_support.hpp`. Read as a pair for the same reason.
+    expect(
+        registration_stats.region_host_supplied != 0 &&
+            registration_stats.region_divergent == 0,
+        "the driver derives the host's region analysis, and says so: "
+        "host_supplied=" +
+            std::to_string(registration_stats.region_host_supplied) +
+            " divergent=" +
+            std::to_string(registration_stats.region_divergent));
 
     std::vector<std::uint64_t> hashes(lane_count, hash);
     std::vector<std::uint64_t> instances(lane_count);
@@ -566,6 +656,7 @@ std::vector<std::int32_t> run_nucleus_case(
             {sidecar_bytes.data(), sidecar_bytes.size()},
             load_host_kernels(golden_directory, "nucleus_sample").slice(),
             host_stage_identities(golden_directory, "nucleus_sample"),
+            host_region_analysis(golden_directory, "nucleus_sample"),
             &error) == PIE_STATUS_OK,
         "register nucleus program: " + error);
 
@@ -808,6 +899,7 @@ void run_structured_mask_golden(const std::string& golden_directory) {
             {sidecar_bytes.data(), sidecar_bytes.size()},
             load_host_kernels(golden_directory, "structured_masks").slice(),
             host_stage_identities(golden_directory, "structured_masks"),
+            host_region_analysis(golden_directory, "structured_masks"),
             &error) == PIE_STATUS_OK,
         "register structured-mask golden: " + error);
     std::vector<std::uint64_t> hashes(lane_count, hash);
@@ -1001,6 +1093,7 @@ void run_declared_phase_case(
                 {sidecar_bytes.data(), sidecar_bytes.size()},
                 load_host_kernels(golden_directory, "staged_dispatch").slice(),
             host_stage_identities(golden_directory, "staged_dispatch"),
+            host_region_analysis(golden_directory, "staged_dispatch"),
                 &error) == PIE_STATUS_UNSUPPORTED,
             "model without attention hook coverage rejects registration");
     }
@@ -1014,6 +1107,7 @@ void run_declared_phase_case(
             {sidecar_bytes.data(), sidecar_bytes.size()},
             load_host_kernels(golden_directory, "staged_dispatch").slice(),
             host_stage_identities(golden_directory, "staged_dispatch"),
+            host_region_analysis(golden_directory, "staged_dispatch"),
             &error) == PIE_STATUS_OK,
         "register staged program: " + error);
 
@@ -1533,6 +1627,7 @@ std::vector<std::uint8_t> run_beam_case(
             {sidecar_bytes.data(), sidecar_bytes.size()},
             load_host_kernels(golden_directory, "beam_epilogue").slice(),
             host_stage_identities(golden_directory, "beam_epilogue"),
+            host_region_analysis(golden_directory, "beam_epilogue"),
             &error) == PIE_STATUS_OK,
         "register beam program: " + error);
     std::vector<std::uint64_t> hashes(lane_count, hash);
@@ -1797,6 +1892,7 @@ void run_mtp_direct_case(const std::string& golden_directory) {
             {sidecar_bytes.data(), sidecar_bytes.size()},
             load_host_kernels(golden_directory, "mtp_verify_tail").slice(),
             host_stage_identities(golden_directory, "mtp_verify_tail"),
+            host_region_analysis(golden_directory, "mtp_verify_tail"),
             &error) == PIE_STATUS_OK,
         "register MtpLogits fixture: " + error);
 
@@ -2018,6 +2114,7 @@ void run_parallel_signature_case(const std::string& golden_directory) {
                 // kernel table publishes a kernel built for a different plan.
                 load_host_kernels(golden_directory, name).slice(),
                 host_stage_identities(golden_directory, name),
+                host_region_analysis(golden_directory, name),
                 &error) == PIE_STATUS_OK,
             "parallel-signature program registration: " + error);
         result.instance = instance;

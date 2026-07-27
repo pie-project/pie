@@ -157,12 +157,24 @@ impl DriverBackend {
     }
 
     pub fn register_program(&mut self, desc: &ProgramRegistration) -> Result<u64> {
-        // Attach host-generated kernels, if this driver reads them and the
-        // program is still in the cache. Generation is memoised per program per
-        // backend, so a re-registration costs a lookup.
+        // Attach whatever this driver reads and the caller did not already
+        // supply. Generation is memoised per program per backend, so a
+        // re-registration costs a lookup.
+        let registered = crate::pipeline::program::lookup(desc.program_hash);
+        let codegen_backend = self.codegen_backend();
+
+        // The driver no longer carries an emitter, so a fused region with no
+        // host source is a registration failure rather than a slower path.
+        let emitted = codegen_backend
+            .filter(|_| desc.emitted_kernels.is_empty())
+            .and_then(|backend| {
+                registered
+                    .as_ref()
+                    .and_then(|program| program.emitted(backend))
+            });
+
         // The stage identities go to every driver, not just the ones that read
         // host-emitted kernels: they are plan analysis, not code generation.
-        let registered = crate::pipeline::program::lookup(desc.program_hash);
         let stage_identities = if desc.stage_identities.is_empty() {
             registered
                 .as_ref()
@@ -171,43 +183,53 @@ impl DriverBackend {
         } else {
             Vec::new()
         };
+
+        // The region analysis is the other half of the CUDA emitter's own
+        // contract -- which regions bind, and how the kernel's intrinsic side
+        // tables are laid out -- so it only means anything to a driver running
+        // those kernels.
+        let region_analysis = if desc.region_analysis.is_empty()
+            && codegen_backend == Some("cuda")
+        {
+            registered
+                .as_ref()
+                .map(|program| program.region_analysis())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
         let owned;
-        let desc = match self
-            .codegen_backend()
-            .filter(|_| desc.emitted_kernels.is_empty())
-            .and_then(|backend| {
-                registered
-                    .as_ref()
-                    .and_then(|program| program.emitted(backend))
-            }) {
-            Some(emitted) => {
-                owned = ProgramRegistration {
-                    emitter_version: emitted.emitter_version,
-                    emitted_kernels: emitted
-                        .kernels
-                        .iter()
-                        .map(|kernel| pie_driver_abi::EmittedKernel {
-                            kind: kernel.kind,
-                            stage_index: kernel.stage_index,
-                            region_index: kernel.region_index,
-                            entry_name: kernel.entry_name.clone(),
-                            source: kernel.source.clone(),
-                            error: kernel.error.clone(),
-                        })
-                        .collect(),
-                    stage_identities,
-                    ..desc.clone()
-                };
-                &owned
+        let desc = if emitted.is_some()
+            || !stage_identities.is_empty()
+            || !region_analysis.is_empty()
+        {
+            let mut next = desc.clone();
+            if let Some(emitted) = emitted {
+                next.emitter_version = emitted.emitter_version;
+                next.emitted_kernels = emitted
+                    .kernels
+                    .iter()
+                    .map(|kernel| pie_driver_abi::EmittedKernel {
+                        kind: kernel.kind,
+                        stage_index: kernel.stage_index,
+                        region_index: kernel.region_index,
+                        entry_name: kernel.entry_name.clone(),
+                        source: kernel.source.clone(),
+                        error: kernel.error.clone(),
+                    })
+                    .collect();
             }
-            None if !stage_identities.is_empty() => {
-                owned = ProgramRegistration {
-                    stage_identities,
-                    ..desc.clone()
-                };
-                &owned
+            if !stage_identities.is_empty() {
+                next.stage_identities = stage_identities;
             }
-            None => desc,
+            if !region_analysis.is_empty() {
+                next.region_analysis = region_analysis;
+            }
+            owned = next;
+            &owned
+        } else {
+            desc
         };
         match self {
             Self::Dummy(driver) => driver.register_program(desc),

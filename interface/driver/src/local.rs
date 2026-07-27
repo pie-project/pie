@@ -25,7 +25,12 @@ use crate::geometry::GeometryClass;
 /// hoisted out of the per-step sections. Admission is folded into the launch
 /// call itself ([`PIE_STATUS_EXHAUSTED`] / [`PIE_STATUS_IMPOSSIBLE`]); the
 /// v12 prepare/lease surface and the v13 `settle_defer` lever are deleted.
-pub const PIE_DRIVER_ABI_VERSION: u32 = 16;
+///
+/// v17 (phase 3′): `PieProgramDesc::region_analysis` — the per-region bind
+/// verdicts and intrinsic side-table analysis the CUDA driver derives for
+/// itself in `region_support.hpp`. Additive, and empty means "not supplied",
+/// but the struct grew, so drivers and workers ship together.
+pub const PIE_DRIVER_ABI_VERSION: u32 = 17;
 pub const PIE_MODEL_COMPONENT_FULL: u32 = 0;
 pub const PIE_MODEL_COMPONENT_TEXT: u32 = 1;
 pub const PIE_MODEL_COMPONENT_ENCODE: u32 = 2;
@@ -526,6 +531,68 @@ pub struct PieEmittedKernelSlice {
     pub len: usize,
 }
 
+/// One `argmax` in a generated region that reads a logits intrinsic's device
+/// buffer directly, skipping the intrinsic materialisation and the reshapes
+/// between them.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PieDirectArgmax {
+    /// The `argmax` node, in stage op order.
+    pub node: u32,
+    /// The value id of the intrinsic buffer it reads instead.
+    pub source_value: u32,
+    /// `PTIR_INTR_*` of that buffer.
+    pub intrinsic: u16,
+    /// Nonzero when the rewrite is only valid for a single runtime row, which
+    /// the driver checks per fire against the lane's descriptors.
+    pub requires_single_row: u8,
+    /// Reserved; must be zero.
+    pub reserved0: u8,
+}
+
+/// Borrowed view of a direct-argmax table.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PieDirectArgmaxSlice {
+    pub ptr: *const PieDirectArgmax,
+    pub len: usize,
+}
+
+/// The region can be bound as a second-party region.
+pub const PIE_REGION_SECOND_PARTY_SUPPORTED: u32 = 1 << 0;
+/// The region is a well-formed generated region.
+pub const PIE_REGION_GENERATED_VALID: u32 = 1 << 1;
+
+/// Every per-region decision the host made about one fused region.
+///
+/// Joins to `PieEmittedKernel` on `(stage_index, region_index)`. A driver that
+/// reads this table does not have to look at the plan to know whether a region
+/// binds, whether it can be emitted, or how its intrinsic side tables are laid
+/// out (`ptir-refactor.md` §4.2).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PieRegionAnalysis {
+    /// Stage index in container order.
+    pub stage_index: u32,
+    /// Region index within the stage's fused partition.
+    pub region_index: u32,
+    /// `PIE_REGION_*` bits.
+    pub flags: u32,
+    /// Reserved; must be zero.
+    pub reserved0: u32,
+    pub direct_argmax: PieDirectArgmaxSlice,
+    /// Nodes the rewrites above make redundant, ascending.
+    pub skipped: PieU32Slice,
+}
+
+/// Borrowed view of a per-region analysis table.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PieRegionAnalysisSlice {
+    pub ptr: *const PieRegionAnalysis,
+    pub len: usize,
+}
+
 /// Static program registration descriptor.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -558,6 +625,12 @@ pub struct PieProgramDesc {
     ///
     /// Empty means "not supplied" — a driver must keep deriving.
     pub stage_identities: PieU64Slice,
+    /// Per-region bind verdicts and intrinsic side-table analysis, joined to
+    /// `emitted_kernels` on `(stage_index, region_index)`.
+    ///
+    /// Same contract as `stage_identities`: the driver derives its own while
+    /// both exist, compares, and counts. Empty means "not supplied".
+    pub region_analysis: PieRegionAnalysisSlice,
 }
 
 impl Default for PieProgramDesc {
@@ -572,6 +645,7 @@ impl Default for PieProgramDesc {
             reserved1: 0,
             emitted_kernels: PieEmittedKernelSlice::default(),
             stage_identities: PieU64Slice::default(),
+            region_analysis: PieRegionAnalysisSlice::default(),
         }
     }
 }

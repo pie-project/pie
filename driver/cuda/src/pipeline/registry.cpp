@@ -19,6 +19,7 @@ int Registry::register_program(
         pie_native::ByteSlice{program.sidecar_bytes.ptr, program.sidecar_bytes.len},
         program.emitted_kernels,
         program.stage_identities,
+        program.region_analysis,
         err);
     if (rc != PIE_STATUS_OK) return rc;
 

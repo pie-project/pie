@@ -29,4 +29,5 @@ pub mod header;
 pub mod metal;
 pub mod op_view;
 pub mod program;
+pub mod region_analysis;
 pub mod rng;

@@ -113,6 +113,35 @@ pub struct ProgramRegistration {
     /// driver that receives nothing keeps deriving.
     #[serde(default)]
     pub stage_identities: Vec<u64>,
+    /// Per-region bind verdicts and intrinsic side-table analysis, joined to
+    /// `emitted_kernels` on `(stage_index, region_index)`.
+    ///
+    /// Same contract as `stage_identities`: empty means "not supplied".
+    #[serde(default)]
+    pub region_analysis: Vec<RegionAnalysis>,
+}
+
+/// Every per-region decision the host made. The owned counterpart of
+/// [`PieRegionAnalysis`](crate::local::PieRegionAnalysis).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegionAnalysis {
+    pub stage_index: u32,
+    pub region_index: u32,
+    /// `PIE_REGION_*` bits.
+    pub flags: u32,
+    pub direct_argmax: Vec<DirectArgmax>,
+    /// Nodes the rewrites make redundant, ascending.
+    pub skipped: Vec<u32>,
+}
+
+/// One `argmax` that reads a logits intrinsic's buffer directly. The owned
+/// counterpart of [`PieDirectArgmax`](crate::local::PieDirectArgmax).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectArgmax {
+    pub node: u32,
+    pub source_value: u32,
+    pub intrinsic: u16,
+    pub requires_single_row: u8,
 }
 
 /// One host-emitted kernel. The owned counterpart of

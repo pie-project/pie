@@ -193,7 +193,30 @@ inline int validate_program_desc(const PieProgramDesc* desc,
     }
     status = validate_bytes(desc->canonical_bytes);
     if (status != PIE_STATUS_OK) return status;
-    return validate_bytes(desc->sidecar_bytes);
+    status = validate_bytes(desc->sidecar_bytes);
+    if (status != PIE_STATUS_OK) return status;
+    // The launch package's tables. A driver walks these before it has decoded
+    // anything, so a malformed slice here is a segfault rather than a rejected
+    // program -- and the nested slices are two levels down, where a top-level
+    // check does not reach.
+    status = validate_slice(desc->emitted_kernels.ptr, desc->emitted_kernels.len);
+    if (status != PIE_STATUS_OK) return status;
+    status =
+        validate_slice(desc->stage_identities.ptr, desc->stage_identities.len);
+    if (status != PIE_STATUS_OK) return status;
+    status =
+        validate_slice(desc->region_analysis.ptr, desc->region_analysis.len);
+    if (status != PIE_STATUS_OK) return status;
+    for (std::size_t i = 0; i < desc->region_analysis.len; ++i) {
+        const PieRegionAnalysis& region = desc->region_analysis.ptr[i];
+        if (region.reserved0 != 0) return PIE_STATUS_INVALID_ARGUMENT;
+        status =
+            validate_slice(region.direct_argmax.ptr, region.direct_argmax.len);
+        if (status != PIE_STATUS_OK) return status;
+        status = validate_slice(region.skipped.ptr, region.skipped.len);
+        if (status != PIE_STATUS_OK) return status;
+    }
+    return PIE_STATUS_OK;
 }
 
 inline int validate_channel_desc(

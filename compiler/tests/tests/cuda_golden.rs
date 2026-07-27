@@ -515,6 +515,34 @@ fn emit_driver_test_kernel_fixtures() {
             let _ = writeln!(identities, "{:016x}", pie_plan::stage_identity(stage));
         }
         std::fs::write(out_dir.join(format!("{name}.identities")), identities).unwrap();
+
+        // Same reasoning for the region analysis. Its record is nested, so it
+        // is written as one line per region followed by one line per direct
+        // argmax:
+        //   `region <stage> <region> <flags> <argmax-count> <skipped...>`
+        //   `argmax <node> <source_value> <intrinsic> <requires_single_row>`
+        let mut regions = String::new();
+        for region in pie_codegen::region_analysis::analyze_program(&stages) {
+            let mut header = format!(
+                "region {} {} {} {}",
+                region.stage_index,
+                region.region_index,
+                region.flags,
+                region.direct_argmax.len()
+            );
+            for node in &region.skipped {
+                let _ = write!(header, " {node}");
+            }
+            let _ = writeln!(regions, "{header}");
+            for record in &region.direct_argmax {
+                let _ = writeln!(
+                    regions,
+                    "argmax {} {} {} {}",
+                    record.node, record.source_value, record.intrinsic, record.requires_single_row
+                );
+            }
+        }
+        std::fs::write(out_dir.join(format!("{name}.regions")), regions).unwrap();
         written += 1;
     }
     assert!(written > 0, "no driver-test kernel fixtures were written");

@@ -2451,6 +2451,10 @@ DispatchStats Dispatch::stats() const {
     result.identity_host_supplied = identities.host_supplied;
     result.identity_derived = identities.derived;
     result.identity_divergent = identities.divergent;
+    const auto regions = impl_->cache.region_stats();
+    result.region_host_supplied = regions.host_supplied;
+    result.region_derived = regions.derived;
+    result.region_divergent = regions.divergent;
     result.channel_slot_capacity = impl_->channels.capacity_slots();
     return result;
 }
@@ -2881,6 +2885,7 @@ int Dispatch::register_program(std::uint64_t program_hash,
                                    pie_native::ByteSlice sidecar,
                                    PieEmittedKernelSlice emitted,
                                    PieU64Slice stage_identities,
+                                   PieRegionAnalysisSlice region_analysis,
                                    std::string* err) {
     if (err) err->clear();
     std::string derr;
@@ -2914,6 +2919,15 @@ int Dispatch::register_program(std::uint64_t program_hash,
             stage_identities.len,
             &identity_error)) {
         if (err) *err = identity_error;
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    std::string region_error;
+    if (!impl_->cache.adopt_host_region_analysis(
+            program_hash,
+            region_analysis.ptr,
+            region_analysis.len,
+            &region_error)) {
+        if (err) *err = region_error;
         return PIE_STATUS_INVALID_ARGUMENT;
     }
     bool needs_kv_envelopes = false;

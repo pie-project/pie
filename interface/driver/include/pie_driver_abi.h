@@ -58,8 +58,13 @@
  * hoisted out of the per-step sections. Admission is folded into the launch
  * call itself ([`PIE_STATUS_EXHAUSTED`] / [`PIE_STATUS_IMPOSSIBLE`]); the
  * v12 prepare/lease surface and the v13 `settle_defer` lever are deleted.
+ *
+ * v17 (phase 3′): `PieProgramDesc::region_analysis` — the per-region bind
+ * verdicts and intrinsic side-table analysis the CUDA driver derives for
+ * itself in `region_support.hpp`. Additive, and empty means "not supplied",
+ * but the struct grew, so drivers and workers ship together.
  */
-#define PIE_DRIVER_ABI_VERSION 16
+#define PIE_DRIVER_ABI_VERSION 17
 
 #define PIE_MODEL_COMPONENT_FULL 0
 
@@ -211,6 +216,16 @@
 #define PIE_KERNEL_READINESS 3
 
 #define PIE_KERNEL_COMMIT 4
+
+/**
+ * The region can be bound as a second-party region.
+ */
+#define PIE_REGION_SECOND_PARTY_SUPPORTED (1 << 0)
+
+/**
+ * The region is a well-formed generated region.
+ */
+#define PIE_REGION_GENERATED_VALID (1 << 1)
 
 #define CHANNEL_TICKET_NONE UINT64_MAX
 
@@ -374,6 +389,93 @@ typedef struct PieU64Slice {
 } PieU64Slice;
 
 /**
+ * One `argmax` in a generated region that reads a logits intrinsic's device
+ * buffer directly, skipping the intrinsic materialisation and the reshapes
+ * between them.
+ */
+typedef struct PieDirectArgmax {
+  /**
+   * The `argmax` node, in stage op order.
+   */
+  uint32_t node;
+  /**
+   * The value id of the intrinsic buffer it reads instead.
+   */
+  uint32_t source_value;
+  /**
+   * `PTIR_INTR_*` of that buffer.
+   */
+  uint16_t intrinsic;
+  /**
+   * Nonzero when the rewrite is only valid for a single runtime row, which
+   * the driver checks per fire against the lane's descriptors.
+   */
+  uint8_t requires_single_row;
+  /**
+   * Reserved; must be zero.
+   */
+  uint8_t reserved0;
+} PieDirectArgmax;
+
+/**
+ * Borrowed view of a direct-argmax table.
+ */
+typedef struct PieDirectArgmaxSlice {
+  const struct PieDirectArgmax *ptr;
+  size_t len;
+} PieDirectArgmaxSlice;
+
+/**
+ * Borrowed immutable `u32` slice.
+ *
+ * `ptr` may be null only when `len == 0`.
+ */
+typedef struct PieU32Slice {
+  const uint32_t *ptr;
+  size_t len;
+} PieU32Slice;
+
+/**
+ * Every per-region decision the host made about one fused region.
+ *
+ * Joins to `PieEmittedKernel` on `(stage_index, region_index)`. A driver that
+ * reads this table does not have to look at the plan to know whether a region
+ * binds, whether it can be emitted, or how its intrinsic side tables are laid
+ * out (`ptir-refactor.md` §4.2).
+ */
+typedef struct PieRegionAnalysis {
+  /**
+   * Stage index in container order.
+   */
+  uint32_t stage_index;
+  /**
+   * Region index within the stage's fused partition.
+   */
+  uint32_t region_index;
+  /**
+   * `PIE_REGION_*` bits.
+   */
+  uint32_t flags;
+  /**
+   * Reserved; must be zero.
+   */
+  uint32_t reserved0;
+  struct PieDirectArgmaxSlice direct_argmax;
+  /**
+   * Nodes the rewrites above make redundant, ascending.
+   */
+  struct PieU32Slice skipped;
+} PieRegionAnalysis;
+
+/**
+ * Borrowed view of a per-region analysis table.
+ */
+typedef struct PieRegionAnalysisSlice {
+  const struct PieRegionAnalysis *ptr;
+  size_t len;
+} PieRegionAnalysisSlice;
+
+/**
  * Static program registration descriptor.
  */
 typedef struct PieProgramDesc {
@@ -415,17 +517,15 @@ typedef struct PieProgramDesc {
    * Empty means "not supplied" — a driver must keep deriving.
    */
   struct PieU64Slice stage_identities;
+  /**
+   * Per-region bind verdicts and intrinsic side-table analysis, joined to
+   * `emitted_kernels` on `(stage_index, region_index)`.
+   *
+   * Same contract as `stage_identities`: the driver derives its own while
+   * both exist, compares, and counts. Empty means "not supplied".
+   */
+  struct PieRegionAnalysisSlice region_analysis;
 } PieProgramDesc;
-
-/**
- * Borrowed immutable `u32` slice.
- *
- * `ptr` may be null only when `len == 0`.
- */
-typedef struct PieU32Slice {
-  const uint32_t *ptr;
-  size_t len;
-} PieU32Slice;
 
 /**
  * Persistent channel endpoint registration descriptor.
