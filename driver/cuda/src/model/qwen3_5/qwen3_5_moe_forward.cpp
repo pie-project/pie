@@ -26,6 +26,7 @@
 #include <mutex>
 #include <set>
 #include <tuple>
+#include <utility>
 
 #include "kernels/rmsnorm.hpp"
 #include "kernels/rope.hpp"
@@ -255,6 +256,9 @@ struct Qwen35MoeForwardProfile {
     double moe_router_ms = 0.0;
     double moe_routed_ms = 0.0;
     double moe_route_setup_ms = 0.0;
+    double moe_align_ms = 0.0;
+    double moe_gather_ms = 0.0;
+    double moe_ptrs_ms = 0.0;
     double moe_gate_up_ms = 0.0;
     double moe_act_ms = 0.0;
     double moe_down_ms = 0.0;
@@ -271,28 +275,38 @@ struct Qwen35MoeForwardProfile {
 
     cudaEvent_t forward_start = nullptr;
     cudaEvent_t forward_stop = nullptr;
-    cudaEvent_t stage_start = nullptr;
-    cudaEvent_t stage_stop = nullptr;
-    cudaEvent_t detail_start = nullptr;
-    cudaEvent_t detail_stop = nullptr;
+
+    // Each timed stage takes its own event pair out of `pool` and defers the
+    // readback to `end()`. Synchronizing per stage instead -- which this
+    // profiler used to do -- drains the pipeline several hundred times per
+    // step, so every stage paid a launch latency it does not pay in
+    // production and small stages read 5-10x their true cost.
+    std::vector<cudaEvent_t> pool;
+    std::size_t pool_used = 0;
+    std::vector<std::pair<double*, std::size_t>> pending;
 
     ~Qwen35MoeForwardProfile() {
         if (forward_start != nullptr) cudaEventDestroy(forward_start);
         if (forward_stop != nullptr) cudaEventDestroy(forward_stop);
-        if (stage_start != nullptr) cudaEventDestroy(stage_start);
-        if (stage_stop != nullptr) cudaEventDestroy(stage_stop);
-        if (detail_start != nullptr) cudaEventDestroy(detail_start);
-        if (detail_stop != nullptr) cudaEventDestroy(detail_stop);
+        for (cudaEvent_t e : pool) cudaEventDestroy(e);
     }
 
     void ensure_events() {
         if (forward_start != nullptr) return;
         CUDA_CHECK(cudaEventCreate(&forward_start));
         CUDA_CHECK(cudaEventCreate(&forward_stop));
-        CUDA_CHECK(cudaEventCreate(&stage_start));
-        CUDA_CHECK(cudaEventCreate(&stage_stop));
-        CUDA_CHECK(cudaEventCreate(&detail_start));
-        CUDA_CHECK(cudaEventCreate(&detail_stop));
+    }
+
+    // Index of a fresh start event; its stop event is the next slot.
+    std::size_t acquire_pair() {
+        const std::size_t idx = pool_used;
+        while (pool.size() < idx + 2) {
+            cudaEvent_t e = nullptr;
+            CUDA_CHECK(cudaEventCreate(&e));
+            pool.push_back(e);
+        }
+        pool_used = idx + 2;
+        return idx;
     }
 
     void begin(int n, int r, bool decode, int rank, cudaStream_t stream) {
@@ -311,9 +325,12 @@ struct Qwen35MoeForwardProfile {
         linear_recur_ms = linear_post_ms = 0.0;
         moe_router_ms = moe_routed_ms = moe_shared_ms = moe_allreduce_ms = 0.0;
         moe_route_setup_ms = moe_gate_up_ms = moe_act_ms = moe_down_ms = 0.0;
+        moe_align_ms = moe_gather_ms = moe_ptrs_ms = 0.0;
         moe_reduce_ms = moe_shared_gate_up_ms = moe_shared_down_ms = 0.0;
         moe_shared_gate_ms = 0.0;
         residual_ms = lm_head_ms = forward_ms = 0.0;
+        pool_used = 0;
+        pending.clear();
         timing_suspended = profile_stream_is_capturing(stream);
         if (timing_suspended) return;
         CUDA_CHECK(cudaEventRecord(forward_start, stream));
@@ -326,6 +343,16 @@ struct Qwen35MoeForwardProfile {
         float ms = 0.0f;
         CUDA_CHECK(cudaEventElapsedTime(&ms, forward_start, forward_stop));
         forward_ms = ms;
+        // Every stage event is already complete now that `forward_stop` has,
+        // so the whole step's timings read back without another sync.
+        for (const auto& entry : pending) {
+            float stage_ms = 0.0f;
+            CUDA_CHECK(cudaEventElapsedTime(
+                &stage_ms, pool[entry.second], pool[entry.second + 1]));
+            add(*entry.first, stage_ms);
+        }
+        pending.clear();
+        pool_used = 0;
     }
 
     void add(double& dst, float ms) {
@@ -333,11 +360,8 @@ struct Qwen35MoeForwardProfile {
     }
 };
 
-// Stages MUST NOT nest. There is a single shared `stage_start`/`stage_stop`
-// event pair, so an inner stage overwrites the outer one's start and the
-// outer reading comes back as just its own tail — wrapping `moe_block`
-// around its four inner stages reported 1.35 ms for a block whose child
-// alone measured 22.85 ms.
+// Stages may nest: each one takes its own event pair, and nothing is read
+// back until the step ends.
 template <class F>
 void profile_cuda_stage(
     Qwen35MoeForwardProfile* profile,
@@ -346,17 +370,15 @@ void profile_cuda_stage(
     F&& fn)
 {
     if (profile == nullptr || !profile->enabled || dst == nullptr ||
-        profile_stream_is_capturing(stream)) {
+        profile->timing_suspended || profile_stream_is_capturing(stream)) {
         fn();
         return;
     }
-    CUDA_CHECK(cudaEventRecord(profile->stage_start, stream));
+    const std::size_t idx = profile->acquire_pair();
+    CUDA_CHECK(cudaEventRecord(profile->pool[idx], stream));
     fn();
-    CUDA_CHECK(cudaEventRecord(profile->stage_stop, stream));
-    CUDA_CHECK(cudaEventSynchronize(profile->stage_stop));
-    float ms = 0.0f;
-    CUDA_CHECK(cudaEventElapsedTime(&ms, profile->stage_start, profile->stage_stop));
-    profile->add(*dst, ms);
+    CUDA_CHECK(cudaEventRecord(profile->pool[idx + 1], stream));
+    profile->pending.emplace_back(dst, idx);
 }
 
 template <class F>
@@ -366,18 +388,7 @@ void profile_cuda_detail_stage(
     cudaStream_t stream,
     F&& fn)
 {
-    if (profile == nullptr || !profile->enabled || dst == nullptr ||
-        profile_stream_is_capturing(stream)) {
-        fn();
-        return;
-    }
-    CUDA_CHECK(cudaEventRecord(profile->detail_start, stream));
-    fn();
-    CUDA_CHECK(cudaEventRecord(profile->detail_stop, stream));
-    CUDA_CHECK(cudaEventSynchronize(profile->detail_stop));
-    float ms = 0.0f;
-    CUDA_CHECK(cudaEventElapsedTime(&ms, profile->detail_start, profile->detail_stop));
-    profile->add(*dst, ms);
+    profile_cuda_stage(profile, dst, stream, std::forward<F>(fn));
 }
 
 void maybe_print_profile(const Qwen35MoeForwardProfile& p) {
@@ -419,6 +430,9 @@ void maybe_print_profile(const Qwen35MoeForwardProfile& p) {
         << " moe_router_ms=" << p.moe_router_ms
         << " moe_routed_ms=" << p.moe_routed_ms
         << " moe_route_setup_ms=" << p.moe_route_setup_ms
+        << " moe_align_ms=" << p.moe_align_ms
+        << " moe_gather_ms=" << p.moe_gather_ms
+        << " moe_ptrs_ms=" << p.moe_ptrs_ms
         << " moe_gate_up_ms=" << p.moe_gate_up_ms
         << " moe_act_ms=" << p.moe_act_ms
         << " moe_down_ms=" << p.moe_down_ms
@@ -1479,16 +1493,27 @@ bool moe_block(
                     profile_cuda_detail_stage(
                         profile, profile ? &profile->moe_route_setup_ms : nullptr,
                         stream, [&] {
+                            profile_cuda_detail_stage(
+                                profile, profile ? &profile->moe_align_ms : nullptr,
+                                stream, [&] {
                             kernels::launch_moe_align_decode(
                                 moe_ws.topk_idx.data(),
                                 moe_ws.aligned_route_ids.data(),
                                 moe_ws.aligned_expert_ids.data(),
                                 /*route_to_aligned_row=*/nullptr,
                                 routes, E, block, max_blocks, stream);
+                                });
+                            profile_cuda_detail_stage(
+                                profile, profile ? &profile->moe_gather_ms : nullptr,
+                                stream, [&] {
                             kernels::launch_gather_moe_aligned_inputs_bf16(
                                 ws.norm_x.data(), moe_ws.aligned_route_ids.data(),
                                 moe_ws.aligned_expert_in.data(),
                                 routes, aligned_rows, K, H, stream);
+                                });
+                            profile_cuda_detail_stage(
+                                profile, profile ? &profile->moe_ptrs_ms : nullptr,
+                                stream, [&] {
                             kernels::launch_build_moe_ptrs_aligned_bf16(
                                 moe_ws.aligned_expert_ids.data(),
                                 Lw.moe_gate_up_proj->data(),
@@ -1504,6 +1529,7 @@ bool moe_block(
                                 reinterpret_cast<const void**>(moe_ws.b_dn_ptrs.data()),
                                 reinterpret_cast<void**>(moe_ws.c_dn_ptrs.data()),
                                 max_blocks, block, H, Im, stream);
+                                });
                         });
 
                     // Aligned gate_up: M=block_size, N=2*Im, K=H.
