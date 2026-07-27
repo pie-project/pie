@@ -3561,36 +3561,36 @@ GroupedLaneEnvelope resolve_lane_envelope(
     if (page_end < page_begin) {
         throw std::runtime_error("envelope_dot saw a malformed kv page CSR");
     }
-    const std::uint32_t page_count = page_end - page_begin;
+    // A BOUND, not the count. It sizes the result row; the kernel takes the
+    // real count from the device CSR. See `GroupedLaneEnvelope`.
+    const std::uint32_t page_bound = page_end - page_begin;
     const std::uint32_t page_size =
         static_cast<std::uint32_t>(view.page_size);
+    const std::uint32_t qo_len =
+        obs->qo_indptr_h[request + 1] - obs->qo_indptr_h[request];
 
-    // `kv_last_page_lens` is POST-append (see `write_kv_kernel`), so the KV
-    // length this fire will END at is derivable, and subtracting the fire's own
-    // tokens gives the length the envelopes currently describe. Only pages
-    // entirely below that are final.
-    std::uint32_t scored_pages = 0;
-    if (page_count > 0) {
-        const std::uint32_t kv_after =
-            (page_count - 1) * page_size + obs->kv_last_page_lens_h[request];
-        const std::uint32_t qo_len =
-            obs->qo_indptr_h[request + 1] - obs->qo_indptr_h[request];
-        const std::uint32_t kv_before =
-            kv_after >= qo_len ? kv_after - qo_len : 0u;
-        scored_pages = std::min(kv_before / page_size, page_count);
-    }
     if (const char* dbg = std::getenv("PIE_QUEST_DEBUG"); dbg && *dbg == '1') {
+        // The fire's request count, reported once per new maximum. A test that
+        // wants to prove the R>1 path was exercised has no other way to see it:
+        // co-batching is a scheduling outcome, not something a program asks for.
+        static std::atomic<int> seen_requests{0};
+        int prev = seen_requests.load(std::memory_order_relaxed);
+        while (obs->num_requests > prev &&
+               !seen_requests.compare_exchange_weak(prev, obs->num_requests)) {
+        }
+        if (obs->num_requests > prev) {
+            std::fprintf(stderr, "[quest] R_max=%d\n", obs->num_requests);
+        }
         static std::atomic<int> shots{0};
         if (shots.fetch_add(1) < 4) {
             std::fprintf(stderr,
-                "[quest] req=%d layer=%u tok_start=%u tok_count=%u "
-                "page_begin=%u page_count=%u page_size=%u last_len=%u "
-                "qo=[%u,%u] scored=%u kv_heads=%d head_dim=%d qcols=%u\n",
-                request, layer, lane.token_start, lane.token_count,
-                page_begin, page_count, page_size,
-                obs->kv_last_page_lens_h[request],
+                "[quest] req=%d/%d layer=%u tok_start=%u tok_count=%u "
+                "page_begin(bound)=%u page_bound=%u page_size=%u "
+                "qo=[%u,%u] kv_heads=%d head_dim=%d qcols=%u\n",
+                request, obs->num_requests, layer, lane.token_start,
+                lane.token_count, page_begin, page_bound, page_size,
                 obs->qo_indptr_h[request], obs->qo_indptr_h[request + 1],
-                scored_pages, view.num_kv_heads, view.head_dim, query_columns);
+                view.num_kv_heads, view.head_dim, query_columns);
         }
     }
 
@@ -3600,9 +3600,13 @@ GroupedLaneEnvelope resolve_lane_envelope(
         .query = query_base +
             static_cast<std::size_t>(lane.token_start + lane.token_count - 1) *
                 query_columns,
-        .page_ids = obs->kv_page_indices_d + page_begin,
-        .page_count = page_count,
-        .scored_pages = scored_pages,
+        .page_ids = obs->kv_page_indices_d,
+        .page_indptr = obs->kv_page_indptr_d,
+        .last_page_lens = obs->kv_last_page_lens_d,
+        .request = static_cast<std::uint32_t>(request),
+        .qo_len = qo_len,
+        .page_size = page_size,
+        .page_bound = page_bound,
         .num_q_heads =
             query_columns / static_cast<std::uint32_t>(view.head_dim),
         .num_kv_heads = static_cast<std::uint32_t>(view.num_kv_heads),

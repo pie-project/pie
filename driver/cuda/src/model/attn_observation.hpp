@@ -32,8 +32,18 @@ struct AttentionObservation {
     // Fire CSR, device side. Page ids are indexed by `kv_page_indptr`.
     const std::uint32_t* kv_page_indices_d = nullptr;
 
-    // Fire CSR, host side. Needed to slice the device page list per request
-    // without a device round trip.
+    // Fire CSR, device side, EXACT. Under decode envelopes the device composes
+    // the real page table itself while the host copies below are only an upper
+    // bound (`frame.cpp` substitutes `plan_kv_page_indptr`, whose per-request
+    // counts come from the program's declared page channel). Anything that
+    // slices `kv_page_indices_d` must do it with THESE, on device: using the
+    // host offset lands on another request's pages, and using the host count
+    // scores slots that are not pages of this request at all.
+    const std::uint32_t* kv_page_indptr_d = nullptr;
+    const std::uint32_t* kv_last_page_lens_d = nullptr;
+
+    // Fire CSR, host side. A BOUND, not the truth -- see above. Safe to size
+    // allocations and grids with; never safe to address device memory with.
     const std::uint32_t* qo_indptr_h = nullptr;
     const std::uint32_t* kv_page_indptr_h = nullptr;
     const std::uint32_t* kv_last_page_lens_h = nullptr;
@@ -43,6 +53,8 @@ struct AttentionObservation {
 
     bool usable() const noexcept {
         return kv != nullptr && kv_page_indices_d != nullptr &&
+               kv_page_indptr_d != nullptr &&
+               kv_last_page_lens_d != nullptr &&
                qo_indptr_h != nullptr && kv_page_indptr_h != nullptr &&
                kv_last_page_lens_h != nullptr && num_requests > 0;
     }
