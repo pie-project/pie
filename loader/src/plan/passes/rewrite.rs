@@ -4,7 +4,7 @@
 
 use std::collections::HashSet;
 
-use crate::error::{Error, Result};
+use crate::error::{Error, OrOverflow, Result};
 use crate::extent::Extent;
 use crate::plan::geometry::extent_storage_bytes;
 use crate::plan::index::{instr_by_id, set_instr_id};
@@ -126,7 +126,18 @@ pub(super) fn flush_pending_bulk(
             file_offset,
             ..
         } => (file_id.0, *file_offset, 0),
-        _ => (u32::MAX, u64::MAX, u64::MAX),
+        // Nothing else is put in this list — the loop above routes every other
+        // instruction to `prologue` or `rest`. Named rather than left to a
+        // wildcard: an instruction added later that *does* belong here would
+        // otherwise sort silently to the end and defeat the merge it was added
+        // to take part in, where this way it fails to compile until someone
+        // decides what its sort key is.
+        StorageInstr::Allocate { .. }
+        | StorageInstr::Fill { .. }
+        | StorageInstr::ExtentWrite { .. }
+        | StorageInstr::TileMap { .. }
+        | StorageInstr::CreateView { .. }
+        | StorageInstr::Finalize { .. } => (u32::MAX, u64::MAX, u64::MAX),
     });
     for instr in pending_bulk.drain(..) {
         if let Some(previous) = result.last_mut()
@@ -273,7 +284,16 @@ pub(super) fn flush_pending_slab_scatter(
             source.file_id.0,
             source.file_offset + source.stride.base_offset,
         ),
-        _ => (u32::MAX, u64::MAX),
+        // As in `flush_pending_bulk`: only bulk writes reach this list, and the
+        // rest are named so that adding an instruction is a compile error here
+        // rather than a sort key of `MAX` nobody notices.
+        StorageInstr::Allocate { .. }
+        | StorageInstr::Fill { .. }
+        | StorageInstr::ExtentWrite { .. }
+        | StorageInstr::SlabScatter { .. }
+        | StorageInstr::TileMap { .. }
+        | StorageInstr::CreateView { .. }
+        | StorageInstr::Finalize { .. } => (u32::MAX, u64::MAX),
     });
 
     let mut current = Vec::new();
@@ -313,10 +333,10 @@ pub(super) fn slab_can_accept(
     let start = source
         .file_offset
         .checked_add(source.stride.base_offset)
-        .ok_or_else(|| Error::Overflow("source offset overflow".to_string()))?;
+        .or_overflow("source offset overflow")?;
     let end = start
         .checked_add(source.span_bytes)
-        .ok_or_else(|| Error::Overflow("source span overflow".to_string()))?;
+        .or_overflow("source span overflow")?;
     if start < last_end || start - last_end > cfg.max_gap_bytes {
         return Ok(false);
     }
@@ -336,7 +356,7 @@ pub(super) fn slab_bounds(
     let first_start = source
         .file_offset
         .checked_add(source.stride.base_offset)
-        .ok_or_else(|| Error::Overflow("source offset overflow".to_string()))?;
+        .or_overflow("source offset overflow")?;
     let mut payload = 0u64;
     let mut last_end = first_start;
     for instr in instrs {
@@ -346,13 +366,13 @@ pub(super) fn slab_bounds(
         let start = source
             .file_offset
             .checked_add(source.stride.base_offset)
-            .ok_or_else(|| Error::Overflow("source offset overflow".to_string()))?;
+            .or_overflow("source offset overflow")?;
         let end = start
             .checked_add(source.span_bytes)
-            .ok_or_else(|| Error::Overflow("source span overflow".to_string()))?;
+            .or_overflow("source span overflow")?;
         payload = payload
             .checked_add(source.span_bytes)
-            .ok_or_else(|| Error::Overflow("slab payload overflow".to_string()))?;
+            .or_overflow("slab payload overflow")?;
         last_end = last_end.max(end);
     }
     Ok(Some((file_id, first_start, payload, last_end)))
@@ -382,10 +402,10 @@ pub(super) fn emit_slab_or_bulk(
     }
     if span_bytes
         .checked_mul(cfg.max_overread_den)
-        .ok_or_else(|| Error::Overflow("slab overread overflow".to_string()))?
+        .or_overflow("slab overread overflow")?
         > payload
             .checked_mul(cfg.max_overread_num)
-            .ok_or_else(|| Error::Overflow("slab overread overflow".to_string()))?
+            .or_overflow("slab overread overflow")?
     {
         result.append(current);
         return Ok(());
@@ -403,7 +423,7 @@ pub(super) fn emit_slab_or_bulk(
         let source_start = source
             .file_offset
             .checked_add(source.stride.base_offset)
-            .ok_or_else(|| Error::Overflow("source offset overflow".to_string()))?;
+            .or_overflow("source offset overflow")?;
         placements.push(SlabPlacement {
             src_offset: source_start - file_offset,
             dest_offset,
@@ -412,7 +432,7 @@ pub(super) fn emit_slab_or_bulk(
     }
     *rewrites = rewrites
         .checked_add(placements.len().saturating_sub(1) as u64)
-        .ok_or_else(|| Error::Overflow("slab rewrite overflow".to_string()))?;
+        .or_overflow("slab rewrite overflow")?;
     result.push(StorageInstr::SlabScatter {
         id: InstrId(0),
         file_id,
@@ -446,7 +466,7 @@ pub(super) fn extent_write_as_bulk(
     let dest_offset = base
         .checked_add(dest.offset)
         .and_then(|v| v.checked_add(dest.stride.base_offset))
-        .ok_or_else(|| Error::Overflow("bulk destination offset overflow".to_string()))?;
+        .or_overflow("bulk destination offset overflow")?;
     Ok(Some(StorageInstr::BulkExtentWrite {
         id: *id,
         source: SourceExtent {
@@ -455,7 +475,7 @@ pub(super) fn extent_write_as_bulk(
             file_offset: source
                 .file_offset
                 .checked_add(source.stride.base_offset)
-                .ok_or_else(|| Error::Overflow("source offset overflow".to_string()))?,
+                .or_overflow("source offset overflow")?,
             span_bytes: source.span_bytes,
             stride: Extent::byte_run(source.span_bytes),
         },
@@ -494,11 +514,11 @@ pub(super) fn try_merge_bulk_extent_write(
     let cur_source_start = cur_source.file_offset + cur_source.stride.base_offset;
     if prev_source_start
         .checked_add(prev_source.span_bytes)
-        .ok_or_else(|| Error::Overflow("source span overflow".to_string()))?
+        .or_overflow("source span overflow")?
         != cur_source_start
         || prev_dest_offset
             .checked_add(prev_source.span_bytes)
-            .ok_or_else(|| Error::Overflow("destination span overflow".to_string()))?
+            .or_overflow("destination span overflow")?
             != *cur_dest_offset
     {
         return Ok(false);
@@ -506,7 +526,7 @@ pub(super) fn try_merge_bulk_extent_write(
     let span_bytes = prev_source
         .span_bytes
         .checked_add(cur_source.span_bytes)
-        .ok_or_else(|| Error::Overflow("merged bulk extent overflow".to_string()))?;
+        .or_overflow("merged bulk extent overflow")?;
     if max_merged_bytes != 0 && span_bytes > max_merged_bytes {
         return Ok(false);
     }
@@ -594,27 +614,27 @@ pub(super) fn try_merge_extent_write(
     let prev_source_start = prev_source
         .file_offset
         .checked_add(prev_source.stride.base_offset)
-        .ok_or_else(|| Error::Overflow("source offset overflow".to_string()))?;
+        .or_overflow("source offset overflow")?;
     let cur_source_start = cur_source
         .file_offset
         .checked_add(cur_source.stride.base_offset)
-        .ok_or_else(|| Error::Overflow("source offset overflow".to_string()))?;
+        .or_overflow("source offset overflow")?;
     let prev_dest_start = prev_dest
         .offset
         .checked_add(prev_dest.stride.base_offset)
-        .ok_or_else(|| Error::Overflow("destination offset overflow".to_string()))?;
+        .or_overflow("destination offset overflow")?;
     let cur_dest_start = cur_dest
         .offset
         .checked_add(cur_dest.stride.base_offset)
-        .ok_or_else(|| Error::Overflow("destination offset overflow".to_string()))?;
+        .or_overflow("destination offset overflow")?;
 
     if prev_source_start
         .checked_add(prev_source.span_bytes)
-        .ok_or_else(|| Error::Overflow("source span overflow".to_string()))?
+        .or_overflow("source span overflow")?
         != cur_source_start
         || prev_dest_start
             .checked_add(prev_source.span_bytes)
-            .ok_or_else(|| Error::Overflow("destination span overflow".to_string()))?
+            .or_overflow("destination span overflow")?
             != cur_dest_start
     {
         return Ok(false);
@@ -623,7 +643,7 @@ pub(super) fn try_merge_extent_write(
     let span_bytes = prev_source
         .span_bytes
         .checked_add(cur_source.span_bytes)
-        .ok_or_else(|| Error::Overflow("merged extent overflow".to_string()))?;
+        .or_overflow("merged extent overflow")?;
     prev_source.file_offset = prev_source_start;
     prev_source.span_bytes = span_bytes;
     prev_source.stride = Extent::byte_run(span_bytes);

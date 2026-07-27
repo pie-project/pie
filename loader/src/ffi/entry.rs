@@ -278,7 +278,7 @@ pub struct PieLoaderContractRequest {
 /// `req` and everything its pointers reach must be live for the call.
 unsafe fn compile_contract_request(
     req: &PieLoaderContractRequest,
-) -> Result<(LoadPlan, arena::PlanExtras), (PieLoaderStatus, String)> {
+) -> Result<(LoadPlan, String), (PieLoaderStatus, String)> {
     let checked = unsafe { read_contract_request(req) }?;
     let source = unsafe { super::checkpoint::arena_of(req.checkpoint) };
 
@@ -297,7 +297,7 @@ unsafe fn compile_contract_request(
                     component: 0,
                 },
             );
-            (plan, arena::PlanExtras { cache_key })
+            (plan, cache_key)
         })
 }
 
@@ -453,8 +453,8 @@ pub unsafe extern "C" fn pie_loader_compile_contract(
         let status = match catch_unwind(AssertUnwindSafe(|| unsafe {
             compile_contract_request(&*req)
         })) {
-            Ok(Ok((plan, extras))) => {
-                unsafe { *out_plan = arena::build(&plan, &extras) };
+            Ok(Ok((plan, cache_key))) => {
+                unsafe { *out_plan = arena::build(&plan, &cache_key) };
                 PieLoaderStatus::Ok
             }
             Ok(Err((status, message))) => {

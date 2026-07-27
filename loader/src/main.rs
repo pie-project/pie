@@ -336,7 +336,7 @@ fn replay(snapshot: &Path, contract: &ModelContract, options: &Options) -> Resul
     let plan = compile(snapshot, contract, options)?;
     let started = Instant::now();
     let storage = pie_loader::host_executor::execute_plan(&plan, snapshot)?;
-    let bytes: usize = storage.tensors.values().map(|t| t.bytes.len()).sum();
+    let bytes: usize = storage.tensors.values().map(Vec::len).sum();
     eprintln!(
         "replayed {} tensors ({bytes} bytes materialized, {} arena bytes) in {:?}",
         storage.tensors.len(),
@@ -348,11 +348,7 @@ fn replay(snapshot: &Path, contract: &ModelContract, options: &Options) -> Resul
     names.sort();
     for name in names {
         let tensor = &storage.tensors[name];
-        println!(
-            "{name}\t{}\t{:016x}",
-            tensor.bytes.len(),
-            checksum(&tensor.bytes)
-        );
+        println!("{name}\t{}\t{:016x}", tensor.len(), checksum(tensor));
     }
     Ok(())
 }

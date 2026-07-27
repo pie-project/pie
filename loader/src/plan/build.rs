@@ -33,7 +33,7 @@ use crate::checkpoint::{CheckpointMetadata, RawTensor, Sources};
 use crate::contract::compile::{Leaf, Lowering, compile};
 use crate::contract::infer::Resolver;
 use crate::contract::{Expr, ModelContract, TensorContract, TensorType};
-use crate::error::{Error, Result};
+use crate::error::{Error, OrOverflow, Result};
 use crate::extent::Extent;
 use crate::plan::geometry::{
     full_dest_extent, narrow_repack_source, repack_stage_bytes, storage_extent_for_shape,
@@ -244,7 +244,7 @@ impl Builder<'_> {
     /// Emit the rectangular copies of a solved expression.
     fn copies(&mut self, lowering: &Lowering, decl: &TensorDecl) -> Result<Value> {
         let output_bytes = encoding_nbytes(&decl.shape, &decl.encoding)
-            .ok_or_else(|| Error::Overflow(format!("'{}' size overflow", decl.name)))?;
+            .or_overflow(format!("'{}' size overflow", decl.name))?;
         let rects = lowering.byte_pieces(&decl.encoding)?;
 
         // `spec.md` §3.3's cost model, deciding the lowering. A cost of 1 is a
@@ -556,7 +556,7 @@ impl Builder<'_> {
                 repack,
                 scratch_bytes: input_bytes
                     .checked_add(stage_bytes)
-                    .ok_or_else(|| Error::Overflow("Repack scratch bytes".to_string()))?,
+                    .or_overflow("Repack scratch bytes")?,
                 ..TransformSpec::default()
             },
         );
@@ -728,8 +728,8 @@ impl Builder<'_> {
 
     fn extent_write(&mut self, source: SourceView, dest: BufferId, shape: &[i64]) -> Result<()> {
         let source_extent = self.source_extent(&source)?;
-        let bytes = encoding_nbytes(shape, &source.encoding)
-            .ok_or_else(|| Error::Overflow("extent write byte size".to_string()))?;
+        let bytes =
+            encoding_nbytes(shape, &source.encoding).or_overflow("extent write byte size")?;
         let instr = self.next_instr();
         self.program.instrs.push(StorageInstr::ExtentWrite {
             id: instr,
@@ -773,7 +773,7 @@ impl Builder<'_> {
     fn source_extent(&self, source: &SourceView) -> Result<SourceExtent> {
         let raw = self.raw(source.tensor_id)?;
         let span_bytes = encoding_nbytes(&source.shape, &source.encoding)
-            .ok_or_else(|| Error::Overflow("source extent byte size".to_string()))?;
+            .or_overflow("source extent byte size")?;
         let physical_bytes = strided_physical_source_bytes(&source.stride)?;
         if source.offset_bytes + physical_bytes > raw.span_bytes {
             return Err(Error::Contract(format!(
@@ -794,7 +794,7 @@ impl Builder<'_> {
         let buffer = BufferId(self.next_buffer);
         self.next_buffer += 1;
         let bytes = encoding_nbytes(&decl.shape, &decl.encoding)
-            .ok_or_else(|| Error::Overflow(format!("'{}' byte size", decl.name)))?;
+            .or_overflow(format!("'{}' byte size", decl.name))?;
         self.program.buffers.push(BufferDecl {
             id: buffer,
             tensor: if temporary { None } else { Some(decl.id) },

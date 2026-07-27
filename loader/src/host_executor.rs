@@ -25,14 +25,9 @@ use crate::plan::{
 use crate::types::{BufferId, DType, Encoding};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HostTensor {
-    pub bytes: Vec<u8>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostStorage {
     pub arena: Vec<u8>,
-    pub tensors: HashMap<String, HostTensor>,
+    pub tensors: HashMap<String, Vec<u8>>,
     pub max_tile_write_bytes: usize,
 }
 
@@ -105,7 +100,7 @@ struct HostExecutor<'a> {
     files: HashMap<u32, PathBuf>,
     arena: Vec<u8>,
     buffers: HashMap<BufferId, BufferLoc>,
-    tensors: HashMap<String, HostTensor>,
+    tensors: HashMap<String, Vec<u8>>,
     max_tile_write_bytes: usize,
 }
 
@@ -193,11 +188,7 @@ impl HostExecutor<'_> {
                 }
                 StorageInstr::Finalize { tensor, name, .. } => {
                     let bytes = self.buffer_bytes(tensor)?.to_vec();
-                    if self
-                        .tensors
-                        .insert(name.clone(), HostTensor { bytes })
-                        .is_some()
-                    {
+                    if self.tensors.insert(name.clone(), bytes).is_some() {
                         return Err(invalid(format!("tensor '{name}' was finalized twice")));
                     }
                 }
@@ -826,7 +817,7 @@ mod tests {
         let plan = crate::plan::compile(&metadata, &contract, StorageTarget::default()).unwrap();
         let storage = execute_plan(&plan, &dir).unwrap();
         assert_eq!(
-            storage.tensors["padded"].bytes,
+            storage.tensors["padded"],
             vec![0, 1, 2, 3, 0, 0, 4, 5, 6, 0]
         );
         std::fs::remove_dir_all(dir).ok();
@@ -961,7 +952,6 @@ mod tests {
         let (dir, program) = fixture();
         let storage = execute_plan(&program, &dir).unwrap();
         let values = storage.tensors["cast"]
-            .bytes
             .chunks_exact(2)
             .map(|chunk| u16::from_le_bytes(chunk.try_into().unwrap()))
             .collect::<Vec<_>>();
@@ -1035,7 +1025,6 @@ mod tests {
         inputs.clear();
         let storage = execute_plan(&plan, &dir).unwrap();
         let values = storage.tensors["cast"]
-            .bytes
             .chunks_exact(2)
             .map(|chunk| u16::from_le_bytes(chunk.try_into().unwrap()))
             .collect::<Vec<_>>();

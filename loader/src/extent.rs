@@ -30,7 +30,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::{Error, Result};
+use crate::error::{Error, OrOverflow, Result};
 
 /// One level of a rectangular copy's loop nest.
 ///
@@ -202,8 +202,8 @@ impl Rect {
                 "copy has no contiguous inner block".to_string(),
             ));
         }
-        let element_bytes = u32::try_from(inner.count)
-            .map_err(|_| Error::Overflow("copy inner block exceeds 4 GiB".to_string()))?;
+        let element_bytes =
+            u32::try_from(inner.count).or_overflow("copy inner block exceeds 4 GiB")?;
 
         let mut dense = i64::from(element_bytes);
         let mut source_dims = Vec::with_capacity(outer.len());
@@ -226,7 +226,7 @@ impl Rect {
             });
             dense = dense
                 .checked_mul(dim.count)
-                .ok_or_else(|| Error::Overflow("copy extent overflow".to_string()))?;
+                .or_overflow("copy extent overflow")?;
         }
         source_dims.reverse();
         dest_dims.reverse();

@@ -24,7 +24,7 @@ use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use crate::checkpoint::{CheckpointFile, CheckpointMetadata, RawTensor};
-use crate::error::Error;
+use crate::error::{Error, OrOverflow};
 use crate::types::{
     Axis, CheckpointFormat, DType, Encoding, FileId, QuantScheme, QuantSpec, TensorId,
 };
@@ -220,9 +220,8 @@ impl GgufReader {
 
     fn read_string(&mut self, context: &str) -> Result<String, Error> {
         let len = self.read_u64(context)?;
-        let len = usize::try_from(len).map_err(|_| {
-            Error::Overflow(format!("gguf: string too large while reading {context}"))
-        })?;
+        let len = usize::try_from(len)
+            .or_overflow(format!("gguf: string too large while reading {context}"))?;
         self.require(len as u64, context)?;
         let mut buf = vec![0u8; len];
         self.inner
@@ -294,11 +293,9 @@ fn align_up(value: u64, alignment: u64) -> Result<u64, Error> {
 }
 
 fn checked_mul(a: u64, b: u64, tensor_name: &str) -> Result<u64, Error> {
-    a.checked_mul(b).ok_or_else(|| {
-        Error::Overflow(format!(
-            "gguf: tensor byte size overflows for '{tensor_name}'"
-        ))
-    })
+    a.checked_mul(b).or_overflow(format!(
+        "gguf: tensor byte size overflows for '{tensor_name}'"
+    ))
 }
 
 fn numel_for_shape(shape: &[i64], tensor_name: &str) -> Result<u64, Error> {
@@ -361,8 +358,7 @@ pub fn parse_gguf_checkpoint(path: &Path) -> Result<CheckpointMetadata, Error> {
     }
 
     let mut pending: Vec<PendingTensor> = Vec::with_capacity(
-        usize::try_from(tensor_count)
-            .map_err(|_| Error::Overflow("gguf: tensor count too large".to_string()))?,
+        usize::try_from(tensor_count).or_overflow("gguf: tensor count too large")?,
     );
     for _ in 0..tensor_count {
         let name = r.read_string("tensor name")?;
@@ -421,9 +417,9 @@ pub fn parse_gguf_checkpoint(path: &Path) -> Result<CheckpointMetadata, Error> {
 
     let mut tensors = Vec::with_capacity(pending.len());
     for (index, t) in pending.into_iter().enumerate() {
-        let absolute_offset = data_base.checked_add(t.relative_offset).ok_or_else(|| {
-            Error::Overflow(format!("gguf: tensor '{}' offset overflows", t.name))
-        })?;
+        let absolute_offset = data_base
+            .checked_add(t.relative_offset)
+            .or_overflow(format!("gguf: tensor '{}' offset overflows", t.name))?;
         if absolute_offset > r.len || t.nbytes > r.len - absolute_offset {
             return Err(Error::Checkpoint(format!(
                 "gguf: tensor '{}' points outside the file",

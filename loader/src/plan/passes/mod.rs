@@ -13,9 +13,7 @@
 //! only refuses. Nothing here is re-exported as a prelude — a pass names what
 //! it uses, so moving one is a matter of moving its imports with it.
 
-use crate::error::Result;
-use crate::plan::LoadPlan;
-use crate::plan::pass::{FnPass, Pass};
+use crate::plan::pass::Pass;
 
 mod arena;
 mod memory;
@@ -32,35 +30,43 @@ mod tests;
 /// change meant editing the middle of `StorageCompiler::lower`, where the pass
 /// list was indistinguishable from the code that built the plan in the first
 /// place.
-pub fn all() -> Vec<Box<dyn Pass>> {
-    vec![
-        boxed(
-            "assign-persistent-offsets",
-            arena::assign_persistent_offsets,
-        ),
-        boxed(
-            "coalesce-persistent-arena-writes",
-            rewrite::coalesce_persistent_arena_writes,
-        ),
-        boxed("hoist-bulk-arena-writes", rewrite::hoist_bulk_extent_writes),
-        boxed(
-            "slab-scatter-arena-writes",
-            rewrite::build_slab_scatter_writes,
-        ),
-        boxed(
-            "merge-adjacent-extent-writes",
-            rewrite::merge_adjacent_extent_writes,
-        ),
-        boxed("recompute-memory-plan", memory::recompute_memory_plan),
-        boxed("validate-fill-order", validate::validate_fill_order),
-        boxed("validate-target-support", validate::validate_target_support),
-        boxed(
-            "validate-persistent-layout",
-            validate::validate_persistent_layout,
-        ),
+pub fn all() -> &'static [Pass] {
+    &[
+        Pass {
+            name: "assign-persistent-offsets",
+            run: arena::assign_persistent_offsets,
+        },
+        Pass {
+            name: "coalesce-persistent-arena-writes",
+            run: rewrite::coalesce_persistent_arena_writes,
+        },
+        Pass {
+            name: "hoist-bulk-arena-writes",
+            run: rewrite::hoist_bulk_extent_writes,
+        },
+        Pass {
+            name: "slab-scatter-arena-writes",
+            run: rewrite::build_slab_scatter_writes,
+        },
+        Pass {
+            name: "merge-adjacent-extent-writes",
+            run: rewrite::merge_adjacent_extent_writes,
+        },
+        Pass {
+            name: "recompute-memory-plan",
+            run: memory::recompute_memory_plan,
+        },
+        Pass {
+            name: "validate-fill-order",
+            run: validate::validate_fill_order,
+        },
+        Pass {
+            name: "validate-target-support",
+            run: validate::validate_target_support,
+        },
+        Pass {
+            name: "validate-persistent-layout",
+            run: validate::validate_persistent_layout,
+        },
     ]
-}
-
-fn boxed(name: &'static str, run: fn(&mut LoadPlan) -> Result<usize>) -> Box<dyn Pass> {
-    Box::new(FnPass { name, run })
 }

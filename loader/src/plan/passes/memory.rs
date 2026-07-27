@@ -3,7 +3,7 @@
 
 use std::collections::HashSet;
 
-use crate::error::{Error, Result};
+use crate::error::{OrOverflow, Result};
 use crate::plan::geometry::extent_storage_bytes;
 use crate::plan::index::instr_by_id;
 use crate::plan::{LoadPlan, StorageInstr};
@@ -22,12 +22,12 @@ pub(super) fn recompute_memory_plan(program: &mut LoadPlan) -> Result<usize> {
             persistent_bytes = persistent_bytes.max(
                 offset
                     .checked_add(buffer.bytes)
-                    .ok_or_else(|| Error::Overflow("persistent byte overflow".to_string()))?,
+                    .or_overflow("persistent byte overflow")?,
             );
         } else if !buffer.temporary && buffer.tensor.is_some() {
             persistent_bytes = persistent_bytes
                 .checked_add(buffer.bytes)
-                .ok_or_else(|| Error::Overflow("persistent byte overflow".to_string()))?;
+                .or_overflow("persistent byte overflow")?;
         }
     }
 
@@ -39,7 +39,7 @@ pub(super) fn recompute_memory_plan(program: &mut LoadPlan) -> Result<usize> {
                 if live.insert(*buffer) {
                     live_bytes = live_bytes
                         .checked_add(bytes)
-                        .ok_or_else(|| Error::Overflow("live byte overflow".to_string()))?;
+                        .or_overflow("live byte overflow")?;
                     live_peak = live_peak.max(live_bytes);
                 }
             }
@@ -48,18 +48,18 @@ pub(super) fn recompute_memory_plan(program: &mut LoadPlan) -> Result<usize> {
             StorageInstr::ExtentWrite { source, .. } => {
                 checkpoint_read_bytes = checkpoint_read_bytes
                     .checked_add(source.span_bytes)
-                    .ok_or_else(|| Error::Overflow("read byte overflow".to_string()))?;
+                    .or_overflow("read byte overflow")?;
                 device_write_bytes = device_write_bytes
                     .checked_add(source.span_bytes)
-                    .ok_or_else(|| Error::Overflow("write byte overflow".to_string()))?;
+                    .or_overflow("write byte overflow")?;
             }
             StorageInstr::BulkExtentWrite { source, .. } => {
                 checkpoint_read_bytes = checkpoint_read_bytes
                     .checked_add(source.span_bytes)
-                    .ok_or_else(|| Error::Overflow("read byte overflow".to_string()))?;
+                    .or_overflow("read byte overflow")?;
                 device_write_bytes = device_write_bytes
                     .checked_add(source.span_bytes)
-                    .ok_or_else(|| Error::Overflow("write byte overflow".to_string()))?;
+                    .or_overflow("write byte overflow")?;
             }
             StorageInstr::SlabScatter {
                 span_bytes,
@@ -68,16 +68,16 @@ pub(super) fn recompute_memory_plan(program: &mut LoadPlan) -> Result<usize> {
             } => {
                 checkpoint_read_bytes = checkpoint_read_bytes
                     .checked_add(*span_bytes)
-                    .ok_or_else(|| Error::Overflow("read byte overflow".to_string()))?;
+                    .or_overflow("read byte overflow")?;
                 let mut payload_bytes = 0u64;
                 for placement in placements {
                     payload_bytes = payload_bytes
                         .checked_add(placement.bytes)
-                        .ok_or_else(|| Error::Overflow("write byte overflow".to_string()))?;
+                        .or_overflow("write byte overflow")?;
                 }
                 device_write_bytes = device_write_bytes
                     .checked_add(payload_bytes)
-                    .ok_or_else(|| Error::Overflow("write byte overflow".to_string()))?;
+                    .or_overflow("write byte overflow")?;
                 transform_scratch_peak_bytes = transform_scratch_peak_bytes.max(*span_bytes);
             }
             StorageInstr::TileMap {
@@ -90,7 +90,7 @@ pub(super) fn recompute_memory_plan(program: &mut LoadPlan) -> Result<usize> {
                 if let Some(source) = source {
                     checkpoint_read_bytes = checkpoint_read_bytes
                         .checked_add(source.span_bytes)
-                        .ok_or_else(|| Error::Overflow("read byte overflow".to_string()))?;
+                        .or_overflow("read byte overflow")?;
                 }
                 let write_bytes = if let Some(dest) = dest {
                     extent_storage_bytes(&dest.stride)?
@@ -99,13 +99,13 @@ pub(super) fn recompute_memory_plan(program: &mut LoadPlan) -> Result<usize> {
                     for output in outputs {
                         total = total
                             .checked_add(program.buffer(*output)?.bytes)
-                            .ok_or_else(|| Error::Overflow("write byte overflow".to_string()))?;
+                            .or_overflow("write byte overflow")?;
                     }
                     total
                 };
                 device_write_bytes = device_write_bytes
                     .checked_add(write_bytes)
-                    .ok_or_else(|| Error::Overflow("write byte overflow".to_string()))?;
+                    .or_overflow("write byte overflow")?;
                 transform_scratch_peak_bytes =
                     transform_scratch_peak_bytes.max(write_bytes.max(transform.scratch_bytes));
             }

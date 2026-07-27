@@ -26,15 +26,6 @@ impl LoadPlan {
         Ok(decl)
     }
 
-    pub fn buffer_mut(&mut self, id: BufferId) -> Result<&mut BufferDecl> {
-        let decl = self
-            .buffers
-            .get_mut(id.0 as usize)
-            .ok_or_else(|| Error::Internal(format!("buffer {} is not declared", id.0)))?;
-        dense(decl.id.0, id.0, "buffer")?;
-        Ok(decl)
-    }
-
     pub fn instr(&self, id: InstrId) -> Result<&StorageInstr> {
         let instr = self
             .instrs

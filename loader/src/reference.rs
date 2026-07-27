@@ -20,7 +20,7 @@ use std::collections::HashMap;
 
 use crate::contract::TensorType;
 use crate::contract::compile::Lowering;
-use crate::error::{Error, Result};
+use crate::error::{Error, OrOverflow, Result};
 use crate::extent::Rect;
 use crate::types::{TensorDecl, encoding_dense_element_bytes};
 
@@ -67,11 +67,11 @@ pub fn replay(
             ty.encoding
         ))
     })?;
-    let elements = usize::try_from(lowering.elements)
-        .map_err(|_| Error::Overflow("reference output element count".to_string()))?;
+    let elements =
+        usize::try_from(lowering.elements).or_overflow("reference output element count")?;
     let bytes = elements
         .checked_mul(width as usize)
-        .ok_or_else(|| Error::Overflow("reference output byte size".to_string()))?;
+        .or_overflow("reference output byte size")?;
 
     let mut from: Vec<Option<Provenance>> = vec![None; bytes];
     for rect in lowering.byte_pieces(&ty.encoding)? {
@@ -179,7 +179,7 @@ fn advance(at: &mut [i64], dims: &[crate::extent::Dim]) -> bool {
 }
 
 fn offset(base: u64, delta: i64, what: &str) -> Result<u64> {
-    let base = i64::try_from(base).map_err(|_| Error::Overflow(format!("{what} byte offset")))?;
+    let base = i64::try_from(base).or_overflow(format!("{what} byte offset"))?;
     u64::try_from(base + delta)
         .map_err(|_| Error::Internal(format!("the {what} offset {} is negative", base + delta)))
 }
@@ -192,7 +192,7 @@ fn element_count(shape: &[i64]) -> Result<usize> {
         }
         count = count
             .checked_mul(*dim)
-            .ok_or_else(|| Error::Overflow(format!("element count of {shape:?}")))?;
+            .or_overflow(format!("element count of {shape:?}"))?;
     }
-    usize::try_from(count).map_err(|_| Error::Overflow(format!("element count of {shape:?}")))
+    usize::try_from(count).or_overflow(format!("element count of {shape:?}"))
 }

@@ -8,7 +8,7 @@
 
 use crate::checkpoint::{CheckpointMetadata, RawTensor};
 use crate::contract::{Expr, ModelContract, TensorContract};
-use crate::error::Error;
+use crate::error::{Error, OrOverflow};
 use crate::plan::StorageTarget;
 use crate::types::{Axis, Encoding};
 
@@ -270,5 +270,5 @@ fn checked_mul_i64(lhs: i64, rhs: u64, context: &str) -> Result<u64, Error> {
     let lhs =
         u64::try_from(lhs).map_err(|_| Error::Contract(format!("{context}: negative value")))?;
     lhs.checked_mul(rhs)
-        .ok_or_else(|| Error::Overflow(format!("{context}: byte overflow")))
+        .or_overflow(format!("{context}: byte overflow"))
 }

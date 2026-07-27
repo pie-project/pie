@@ -13,7 +13,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::Error;
+use crate::error::{Error, OrOverflow};
 use crate::types::{Axis, DType, Encoding, QuantSpec, RepackSpec};
 
 pub mod compile;
@@ -124,7 +124,7 @@ impl TensorType {
     pub fn element_count(&self) -> Result<i64, Error> {
         self.shape.iter().try_fold(1_i64, |acc, dim| {
             acc.checked_mul(*dim)
-                .ok_or_else(|| Error::Overflow(format!("shape {:?} overflows i64", self.shape)))
+                .or_overflow(format!("shape {:?} overflows i64", self.shape))
         })
     }
 
@@ -285,14 +285,6 @@ impl Expr {
             Expr::Shard { src, .. } => src.is_affine(),
             Expr::Repack { .. } | Expr::Quantize { .. } => false,
         }
-    }
-
-    /// Whether any part of this expression is partitioned across ranks, and so
-    /// means something different on each of them.
-    pub fn is_sharded(&self) -> bool {
-        let mut found = false;
-        self.visit(&mut |expr| found |= matches!(expr, Expr::Shard { .. }));
-        found
     }
 
     /// Names of the checkpoint tensors this expression reads, in traversal

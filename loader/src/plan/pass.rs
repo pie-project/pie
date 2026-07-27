@@ -18,14 +18,19 @@ use crate::error::Result;
 use crate::plan::LoadPlan;
 
 /// One rewrite or check over a finished plan.
-pub trait Pass {
-    fn name(&self) -> &'static str;
+///
+/// A pass is a name and a function, so this is a struct rather than a trait: no
+/// pass has ever had state of its own, and a trait with one implementor buys
+/// dispatch nobody calls for. Keeping it concrete makes [`super::passes::all`] a
+/// `static` the compiler lays out once, instead of nine boxes built per compile.
+pub struct Pass {
+    pub name: &'static str,
 
     /// Rewrite the plan, returning how many rewrites were made.
     ///
     /// A validator returns `0`: it is the honest answer, and it is why the
     /// count is "rewrites" rather than "did something".
-    fn run(&self, plan: &mut LoadPlan) -> Result<usize>;
+    pub run: fn(&mut LoadPlan) -> Result<usize>,
 }
 
 /// What one pass did, kept on the plan.
@@ -35,22 +40,6 @@ pub struct PassStats {
     pub instrs_before: usize,
     pub instrs_after: usize,
     pub rewrites: usize,
-}
-
-/// A pass with no state of its own.
-pub struct FnPass {
-    pub name: &'static str,
-    pub run: fn(&mut LoadPlan) -> Result<usize>,
-}
-
-impl Pass for FnPass {
-    fn name(&self) -> &'static str {
-        self.name
-    }
-
-    fn run(&self, plan: &mut LoadPlan) -> Result<usize> {
-        (self.run)(plan)
-    }
 }
 
 /// Run the standard pipeline, in order, recording what each pass did.
@@ -63,11 +52,11 @@ pub fn run_all(plan: &mut LoadPlan) -> Result<Vec<PassStats>> {
     for pass in super::passes::all() {
         let before = plan.instrs.len();
         let started = std::time::Instant::now();
-        let rewrites = pass.run(plan)?;
+        let rewrites = (pass.run)(plan)?;
         if crate::planner_debug_enabled() {
             eprintln!(
                 "[pie-loader] pass {:<34} {:>6} ms  {before} -> {} instrs, {rewrites} rewrites",
-                pass.name(),
+                pass.name,
                 started.elapsed().as_millis(),
                 plan.instrs.len()
             );
@@ -76,7 +65,7 @@ pub fn run_all(plan: &mut LoadPlan) -> Result<Vec<PassStats>> {
             continue;
         }
         stats.push(PassStats {
-            pass: pass.name().to_string(),
+            pass: pass.name.to_string(),
             instrs_before: before,
             instrs_after: plan.instrs.len(),
             rewrites,

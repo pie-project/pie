@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 
-use crate::error::{Error, Result};
+use crate::error::{Error, OrOverflow, Result};
 use crate::plan::geometry::extent_storage_bytes;
 use crate::plan::index::instr_by_id;
 use crate::plan::{LoadPlan, StorageInstr, TileMapKind};
@@ -137,7 +137,7 @@ pub(super) fn validate_persistent_layout(program: &mut LoadPlan) -> Result<usize
         }
         let end = offset
             .checked_add(buffer.bytes)
-            .ok_or_else(|| Error::Overflow("persistent arena offset overflow".to_string()))?;
+            .or_overflow("persistent arena offset overflow")?;
         spans.push((offset, end, buffer.id.0));
     }
     spans.sort_by_key(|span| span.0);
@@ -163,7 +163,7 @@ pub(super) fn validate_persistent_layout(program: &mut LoadPlan) -> Result<usize
         let end = view
             .offset
             .checked_add(extent)
-            .ok_or_else(|| Error::Overflow("CreateView window overflow".to_string()))?;
+            .or_overflow("CreateView window overflow")?;
         if end > backing.bytes {
             return Err(Error::Contract(format!(
                 "CreateView window [{}, {}) escapes backing buffer {} ({} bytes)",
