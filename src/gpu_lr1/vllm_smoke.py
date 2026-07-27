@@ -28,6 +28,34 @@ SCHEMA = {
     "additionalProperties": False,
 }
 
+# A second and third schema, so `--mixed` puts the batch under several at once.
+# That is what a serving batch looks like - requests bring their own - and it is
+# the case the device tables are laid out as one arena for.
+SCHEMAS = [
+    SCHEMA,
+    {
+        "type": "object",
+        "properties": {"title": {"type": "string"}, "pages": {"type": "integer"}},
+        "required": ["title", "pages"],
+        "additionalProperties": False,
+    },
+    {
+        "type": "object",
+        "properties": {"city": {"type": "string"}, "population": {"type": "integer"}},
+        "required": ["city", "population"],
+        "additionalProperties": False,
+    },
+]
+
+
+def _check(text: str, schema: dict) -> None:
+    value = json.loads(text)
+    required = set(schema["required"])
+    assert set(value) == required, f"{set(value)} != {required}"
+    for key, kind in schema["properties"].items():
+        expected = {"string": str, "integer": int, "boolean": bool}[kind["type"]]
+        assert isinstance(value[key], expected), f"{key} is not {kind['type']}"
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -35,6 +63,12 @@ def main() -> int:
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
     parser.add_argument("--prompts", type=int, default=16)
     parser.add_argument("--max-tokens", type=int, default=96)
+    parser.add_argument(
+        "--mixed",
+        action="store_true",
+        help="put the batch under several schemas at once, which is what a "
+        "serving batch looks like and what one arena of tables is for",
+    )
     parser.add_argument(
         "--repeats",
         type=int,
@@ -54,15 +88,21 @@ def main() -> int:
         gpu_memory_utilization=0.35,
         structured_outputs_config={"backend": arguments.backend},
     )
-    params = SamplingParams(
-        temperature=0.8,
-        top_p=0.95,
-        max_tokens=arguments.max_tokens,
-        structured_outputs=StructuredOutputsParams(json=SCHEMA),
-    )
+    schemas = SCHEMAS if arguments.mixed else [SCHEMA]
+    assigned = [schemas[index % len(schemas)] for index in range(arguments.prompts)]
+    subjects = ["person", "book", "city"]
     prompts = [
-        f"Give a JSON profile for person {index}. JSON only."
+        f"Give a JSON {subjects[index % len(schemas)]} record {index}. JSON only."
         for index in range(arguments.prompts)
+    ]
+    params = [
+        SamplingParams(
+            temperature=0.8,
+            top_p=0.95,
+            max_tokens=arguments.max_tokens,
+            structured_outputs=StructuredOutputsParams(json=schema),
+        )
+        for schema in assigned
     ]
 
     rates = []
@@ -77,19 +117,25 @@ def main() -> int:
     median = rates[len(rates) // 2]
 
     valid = 0
-    for output in outputs:
+    truncated = 0
+    for index, output in enumerate(outputs):
         text = output.outputs[0].text.strip()
         try:
-            value = json.loads(text)
-            assert set(value) == {"name", "age", "active"}
-            assert isinstance(value["age"], int)
-            assert isinstance(value["active"], bool)
+            _check(text, assigned[index])
             valid += 1
         except Exception as error:  # noqa: BLE001
-            print("INVALID:", repr(text[:120]), error)
+            # A document that ran out of tokens is not an invalid document. The
+            # model will happily emit eighty digits of an integer, which the
+            # schema allows, so the two have to be counted apart or the test
+            # reports a grammar failure for a sampling one.
+            if output.outputs[0].finish_reason == "length":
+                truncated += 1
+            else:
+                print("INVALID:", repr(text[:120]), error)
 
     print(
-        f"{valid}/{len(outputs)} valid | median {median:.0f} tok/s "
+        f"{valid}/{len(outputs) - truncated} valid "
+        f"({truncated} ran out of tokens) | median {median:.0f} tok/s "
         f"over {len(rates)} runs (min {rates[0]:.0f}, max {rates[-1]:.0f})"
     )
     if os.environ.get("VLLM_GRAMMAR_TIMING"):

@@ -2025,6 +2025,12 @@ class DeviceBatch:
         # recorded. Replaying then reads freed memory, which is a wrong mask if
         # it is anything at all.
         self.recorded = -1
+        # The pool as it was when this batch's buffers were sized. Admitting a
+        # grammar can raise a ceiling - the window, the widest state's group
+        # count, the readings a group can have - and buffers sized against the
+        # old ones are too small for the new. Silently, since a kernel indexes
+        # what it is given.
+        self.pool_revision = grammar.revision
 
         readings = grammar.max_readings
         self.max_readings = readings
