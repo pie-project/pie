@@ -90,7 +90,6 @@ ExpertRouting build_routing(
 // Expert-block size for the device-side aligned MoE path.
 // TEMP ablation switch for perf bring-up: PIE_GLM_ABLATE=lmhead,dsa,moe
 
-static constexpr int kGlm5MoeAlignedBlock = 16;
 // Above this token count the aligned batched GEMM beats the decode GEMVs.
 static constexpr int kGlm5MoeGemvMaxTokens = 8;
 
@@ -177,11 +176,18 @@ Glm5Workspace Glm5Workspace::allocate(
     // Aligned MoE scratch. `routed_blocks` is the worst case: every one of the
     // `routes` rows lands in a distinct expert block, each padded to `block`.
     if (routed_I > 0 && cfg.num_experts > 0) {
-        const int block = kGlm5MoeAlignedBlock;
+        // Sized for both extremes because the block is chosen per forward:
+        // the minimum block yields the most blocks, this one the most rows.
+        const int block = kernels::moe_aligned_block(routes, cfg.num_experts);
         const int active_expert_cap = std::min(cfg.num_experts, routes);
         const int max_blocks =
-            (routes + active_expert_cap * (block - 1) + block - 1) / block;
-        const int aligned_rows = max_blocks * block;
+            (routes + active_expert_cap * (kernels::kMoeAlignedBlockMin - 1) +
+             kernels::kMoeAlignedBlockMin - 1) /
+            kernels::kMoeAlignedBlockMin;
+        const int aligned_rows =
+            std::max(max_blocks * kernels::kMoeAlignedBlockMin,
+                     ((routes + active_expert_cap * (block - 1) + block - 1) /
+                      block) * block);
         ws.aligned_block_size  = block;
         ws.aligned_max_blocks  = max_blocks;
         ws.aligned_route_ids   = DeviceTensor::allocate(DType::INT32, {aligned_rows});
@@ -309,7 +315,7 @@ void glm5_forward_paged(
     const std::uint8_t* idx_mask_ptr = nullptr;
     int idx_mask_stride = 0;
 
-    act_dump_step_begin();
+    act_dump_step_begin(stream);
     act_dump_bf16("embed", ws.y.data(), total_tokens, H, stream);
 
     for (int li = 0; li < cfg.num_hidden_layers; ++li) {
@@ -532,12 +538,14 @@ void glm5_forward_paged(
                 total_tokens, K, H, stream);
         } else if (Lw.moe_gate_up_proj != nullptr && ws.aligned_block_size > 0) {
             const int routes = total_tokens * K;
-            const int block = ws.aligned_block_size;
+            const int block = std::min(ws.aligned_block_size,
+                                       kernels::moe_aligned_block(routes, E));
             const int active_expert_cap = std::min(E, routes);
             const int max_blocks =
                 (routes + active_expert_cap * (block - 1) + block - 1) / block;
             const int aligned_rows = max_blocks * block;
-            if (max_blocks > ws.aligned_max_blocks) {
+            if (max_blocks > ws.aligned_max_blocks ||
+                aligned_rows > static_cast<int>(ws.aligned_expert_in.shape()[0])) {
                 throw std::runtime_error("glm5: aligned MoE scratch too small");
             }
 

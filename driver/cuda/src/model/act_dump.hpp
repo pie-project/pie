@@ -43,8 +43,25 @@ inline int& act_dump_step() {
 
 /// Starts a new forward pass. Tags written after this call are prefixed with
 /// the new step index; the first pass of a request is step 0 (the prefill).
-inline void act_dump_step_begin() {
-    if (act_dump_enabled()) ++act_dump_step();
+inline bool act_dump_capturing(cudaStream_t stream);
+
+/// Graph-capture passes must not consume a step index: the upfront capture
+/// lattice runs the body several times before the first real prefill, which
+/// would otherwise push the step counter past PIE_ACT_DUMP_STEPS.
+inline void act_dump_step_begin(cudaStream_t stream = nullptr) {
+    if (act_dump_enabled() && !act_dump_capturing(stream)) ++act_dump_step();
+}
+
+/// True while the calling thread is recording into a CUDA graph. Dumping
+/// there is illegal (it synchronises and round-trips through host memory)
+/// and poisons the capture, so every entry point bails out.
+inline bool act_dump_capturing(cudaStream_t stream) {
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &status) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    return status != cudaStreamCaptureStatusNone;
 }
 
 /// Only dump the first `PIE_ACT_DUMP_STEPS` passes (default 1: prefill only).
@@ -93,7 +110,8 @@ inline void act_dump_write_npy(
 inline void act_dump_bf16(
     const char* tag, const void* device_ptr, long rows, long cols,
     cudaStream_t stream) {
-    if (!act_dump_active() || device_ptr == nullptr || rows <= 0 || cols <= 0) {
+    if (!act_dump_active() || act_dump_capturing(stream) ||
+        device_ptr == nullptr || rows <= 0 || cols <= 0) {
         return;
     }
     const std::size_t n = static_cast<std::size_t>(rows) * cols;
@@ -114,7 +132,8 @@ inline void act_dump_bf16(
 inline void act_dump_f32(
     const char* tag, const void* device_ptr, long rows, long cols,
     cudaStream_t stream) {
-    if (!act_dump_active() || device_ptr == nullptr || rows <= 0 || cols <= 0) {
+    if (!act_dump_active() || act_dump_capturing(stream) ||
+        device_ptr == nullptr || rows <= 0 || cols <= 0) {
         return;
     }
     const std::size_t n = static_cast<std::size_t>(rows) * cols;
@@ -130,7 +149,8 @@ inline void act_dump_f32(
 inline void act_dump_i32(
     const char* tag, const void* device_ptr, long rows, long cols,
     cudaStream_t stream) {
-    if (!act_dump_active() || device_ptr == nullptr || rows <= 0 || cols <= 0) {
+    if (!act_dump_active() || act_dump_capturing(stream) ||
+        device_ptr == nullptr || rows <= 0 || cols <= 0) {
         return;
     }
     const std::size_t n = static_cast<std::size_t>(rows) * cols;

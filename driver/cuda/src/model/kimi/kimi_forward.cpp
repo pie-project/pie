@@ -28,8 +28,7 @@
 
 namespace pie_cuda_driver::model {
 
-// Route block size for the device-side aligned MoE pipeline.
-constexpr int kKimiMoeAlignedBlock = 16;
+
 // Below this token count the W4A16 GEMVs win: they stream int4 weights
 // (a quarter of the BF16 traffic) and there is no reuse to exploit yet.
 constexpr int kKimiMoeGemvMaxTokens = 8;
@@ -437,11 +436,19 @@ KimiWorkspace KimiWorkspace::allocate(
     // landing in its own expert block, each padded up to `block` rows.
     if (routed_I > 0 && cfg.num_experts > 0) {
         const int E = cfg.num_experts;
-        const int block = kKimiMoeAlignedBlock;
+        // `block` is picked per forward from that batch's route count, so the
+        // scratch has to cover both extremes: the smallest block produces the
+        // most blocks, the largest produces the most padded rows.
+        const int block = kernels::moe_aligned_block(routes, E);
         const int active_expert_cap = std::min(E, routes);
         const int max_blocks =
-            (routes + active_expert_cap * (block - 1) + block - 1) / block;
-        const int aligned_rows = max_blocks * block;
+            (routes + active_expert_cap * (kernels::kMoeAlignedBlockMin - 1) +
+             kernels::kMoeAlignedBlockMin - 1) /
+            kernels::kMoeAlignedBlockMin;
+        const int aligned_rows =
+            std::max(max_blocks * kernels::kMoeAlignedBlockMin,
+                     ((routes + active_expert_cap * (block - 1) + block - 1) /
+                      block) * block);
         ws.aligned_block_size = block;
         ws.aligned_max_blocks = max_blocks;
         ws.aligned_route_ids  = DeviceTensor::allocate(DType::INT32, {aligned_rows});
@@ -573,7 +580,7 @@ void kimi_forward_paged(
     KimiForwardProfile profile;
     profile.begin(total_tokens, num_requests, is_pure_decode,
         tp != nullptr ? tp->rank() : 0, stream);
-    act_dump_step_begin();
+    act_dump_step_begin(stream);
 
     profile_cuda_stage(&profile, &profile.embed_ms, stream, [&] {
         if (w.embed_tp_sharded) {
@@ -860,12 +867,15 @@ void kimi_forward_paged(
 
         if (want_batched) {
             profile_cuda_stage(&profile, &profile.moe_prefill_ms, stream, [&] {
-                const int block = kimi_ws.aligned_block_size;
+                const int block = std::min(kimi_ws.aligned_block_size,
+                                           kernels::moe_aligned_block(routes, E));
                 const int active_expert_cap = std::min(E, routes);
                 const int max_blocks =
                     (routes + active_expert_cap * (block - 1) + block - 1) / block;
                 const int aligned_rows = max_blocks * block;
-                if (max_blocks > kimi_ws.aligned_max_blocks) {
+                if (max_blocks > kimi_ws.aligned_max_blocks ||
+                    aligned_rows >
+                        static_cast<int>(kimi_ws.aligned_expert_in.shape()[0])) {
                     throw std::runtime_error("kimi: aligned MoE scratch too small");
                 }
                 kernels::launch_moe_align_decode(

@@ -10,6 +10,7 @@
 // since they are cheap O(N*K) bookkeeping. The corresponding "gather
 // expert input rows" step reuses the existing `launch_gather_bf16_rows`.
 
+#include <cstdlib>
 #include <cstdint>
 #include <cuda_runtime.h>
 
@@ -228,6 +229,41 @@ void launch_build_dual_bf16_gemm_ptrs(
 // vLLM/SGL-style decode alignment. Sorts route ids [0, num_routes) by expert
 // into fixed-size blocks; padded entries are filled with sentinel num_routes.
 // `expert_ids[b]` is the expert for block b or -1 for inactive padding blocks.
+
+// Block size for the aligned MoE path above. Every expert's routes are padded
+// up to a multiple of this, so the useful value tracks how many rows an expert
+// actually receives (routes / experts). A full 384-expert checkpoint gets ~3
+// rows per expert at batch 128 and needs a small block or it pads 3 rows up to
+// 64; a reduced expert bank gets ~128 and wants fat blocks so the batched GEMM
+// has a usable M dimension. Measured on kimi26-mini at batch 128, moe_prefill:
+// 16 -> 1.184 ms, 32 -> 0.811, 64 -> 0.746, 128 -> 0.796 -- it turns back up at
+// 128 because eight blocks no longer fill the GPU, hence the cap.
+//
+// Callers pick this per forward from that batch's route count, so scratch must
+// be sized for both extremes: kMoeAlignedBlockMin yields the most blocks, the
+// value returned here for the largest batch yields the most padded rows.
+inline constexpr int kMoeAlignedBlockMin = 16;
+inline constexpr int kMoeAlignedBlockMax = 64;
+
+inline int moe_aligned_block(int routes, int num_experts) {
+    static const int forced = [] {
+        const char* e = std::getenv("PIE_MOE_ALIGNED_BLOCK");
+        if (e == nullptr || e[0] == '\0') return 0;
+        const int parsed = std::atoi(e);
+        return (parsed >= 8 && parsed <= 256 && (parsed & (parsed - 1)) == 0)
+                   ? parsed
+                   : 0;
+    }();
+    if (forced != 0) return forced;
+    if (num_experts <= 0) return kMoeAlignedBlockMin;
+    const int per_expert = routes / num_experts;
+    int block = kMoeAlignedBlockMin;
+    while (block * 2 <= kMoeAlignedBlockMax && block * 2 <= per_expert) {
+        block *= 2;
+    }
+    return block;
+}
+
 void launch_moe_align_decode(
     const std::int32_t* topk_idx,
     std::int32_t* sorted_route_ids,
