@@ -443,7 +443,9 @@ void author_real_contract(const std::string& snapshot, const char* dest) {
               << by_tp["1"]["0"]["contract"]["tensors"].size() << " tensor(s) for "
               << hf.model_type << "\n";
 
-    if (dest != nullptr) {
+    // Set-but-empty is how a caller sweeping many snapshots turns the dump off
+    // for the big ones, and `std::ofstream("")` fails, so it has to mean "no".
+    if (dest != nullptr && *dest != '\0') {
         nlohmann::json doc = {{"model_type", hf.model_type}, {"by_tp_size", std::move(by_tp)}};
         std::ofstream out(dest);
         check(out.good(), "contract dump destination is writable");
