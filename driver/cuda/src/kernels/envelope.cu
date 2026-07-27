@@ -21,8 +21,8 @@ __device__ inline void envelope_reduce_page(
     int page_size,
     int num_kv_heads,
     int head_dim,
-    float* __restrict__ env_min,
-    float* __restrict__ env_max)
+    __nv_bfloat16* __restrict__ env_min,
+    __nv_bfloat16* __restrict__ env_max)
 {
     const long token_stride = static_cast<long>(num_kv_heads) * head_dim;
     const long page_base = static_cast<long>(page) * page_size * token_stride +
@@ -39,8 +39,8 @@ __device__ inline void envelope_reduce_page(
             mn = fminf(mn, v);
             mx = fmaxf(mx, v);
         }
-        env_min[env_base + d] = mn;
-        env_max[env_base + d] = mx;
+        env_min[env_base + d] = __float2bfloat16_rd(mn);
+        env_max[env_base + d] = __float2bfloat16_ru(mx);
     }
 }
 
@@ -49,8 +49,8 @@ __device__ inline void envelope_reduce_page(
 __global__ void envelope_recompute_kernel(
     const __nv_bfloat16* __restrict__ k_pages,
     const std::int32_t* __restrict__ page_live_lens,
-    float* __restrict__ env_min,
-    float* __restrict__ env_max,
+    __nv_bfloat16* __restrict__ env_min,
+    __nv_bfloat16* __restrict__ env_max,
     int page_size,
     int num_kv_heads,
     int head_dim)
@@ -78,8 +78,8 @@ __global__ void envelope_update_appended_kernel(
     const std::uint32_t* __restrict__ kv_page_indices,
     const std::uint32_t* __restrict__ kv_page_indptr,
     const std::uint32_t* __restrict__ kv_last_page_lens,
-    float* __restrict__ env_min,
-    float* __restrict__ env_max,
+    __nv_bfloat16* __restrict__ env_min,
+    __nv_bfloat16* __restrict__ env_max,
     int num_requests,
     int page_size,
     int num_kv_heads,
@@ -133,8 +133,8 @@ __global__ void envelope_update_appended_kernel(
 template <int BLOCK>
 __global__ void envelope_dot_kernel(
     const float* __restrict__ q,
-    const float* __restrict__ env_min,
-    const float* __restrict__ env_max,
+    const __nv_bfloat16* __restrict__ env_min,
+    const __nv_bfloat16* __restrict__ env_max,
     float* __restrict__ score,
     int num_q_heads,
     int num_kv_heads,
@@ -171,15 +171,15 @@ __global__ void envelope_dot_kernel(
 
 // One thread per (page, kv_head, dim) triple of the empty envelope.
 __global__ void envelope_seed_empty_kernel(
-    float* __restrict__ env_min,
-    float* __restrict__ env_max,
+    __nv_bfloat16* __restrict__ env_min,
+    __nv_bfloat16* __restrict__ env_max,
     std::size_t n)
 {
     const std::size_t i =
         static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    env_min[i] = INFINITY;
-    env_max[i] = -INFINITY;
+    env_min[i] = __float2bfloat16(INFINITY);
+    env_max[i] = __float2bfloat16(-INFINITY);
 }
 
 // Single-launch form of the reset+merge pair below, for fires narrow enough
@@ -208,8 +208,8 @@ __global__ void envelope_merge_written_fused_kernel(
     const std::uint32_t* __restrict__ w_page,
     const std::uint32_t* __restrict__ w_off,
     const std::uint8_t* __restrict__ row_valid,
-    float* __restrict__ env_min,
-    float* __restrict__ env_max,
+    __nv_bfloat16* __restrict__ env_min,
+    __nv_bfloat16* __restrict__ env_max,
     int num_tokens,
     int num_kv_heads,
     int head_dim)
@@ -265,37 +265,45 @@ __global__ void envelope_merge_written_fused_kernel(
         // Started in this fire => the page was recycled, so the previous
         // tenant's bound is dead and must be replaced, not widened.
         if (!started) {
-            lo = fminf(lo, env_min[env_base + d]);
-            hi = fmaxf(hi, env_max[env_base + d]);
+            lo = fminf(lo, __bfloat162float(env_min[env_base + d]));
+            hi = fmaxf(hi, __bfloat162float(env_max[env_base + d]));
         }
-        env_min[env_base + d] = lo;
-        env_max[env_base + d] = hi;
+        env_min[env_base + d] = __float2bfloat16_rd(lo);
+        env_max[env_base + d] = __float2bfloat16_ru(hi);
     }
 }
 
-// Float min/max via CAS on the bit pattern. IEEE-754 floats compare in the same
-// order as their sign-magnitude bits, and the only values in play here are real
-// keys plus the `+inf`/`-inf` seed, so the ordinary `fminf`/`fmaxf` comparison
-// inside the loop is what decides; the CAS only serialises the update.
-__device__ inline void envelope_atomic_min(float* addr, float value) {
-    int* as_int = reinterpret_cast<int*>(addr);
-    int old = *as_int;
-    int assumed;
+// bf16 min/max via CAS on the bit pattern. bf16 IS the top 16 bits of an
+// IEEE-754 float, so the ordering argument is the float one: the values in play
+// are real keys plus the `+inf`/`-inf` seed, the ordinary comparison inside the
+// loop is what decides, and the CAS only serialises the update.
+//
+// The stored value is rounded AWAY from the incoming key -- down for the
+// minimum, up for the maximum -- so a widening can never round back inside the
+// true range. The keys are themselves bf16, so in practice both roundings are
+// exact and this costs nothing; it is here so that the envelope stays a valid
+// bound if a caller ever merges a value that is not already a bf16.
+__device__ inline void envelope_atomic_min(__nv_bfloat16* addr, float value) {
+    unsigned short* as_u16 = reinterpret_cast<unsigned short*>(addr);
+    const unsigned short want = __bfloat16_as_ushort(__float2bfloat16_rd(value));
+    unsigned short old = *as_u16;
+    unsigned short assumed;
     do {
-        if (__int_as_float(old) <= value) return;
+        if (__bfloat162float(__ushort_as_bfloat16(old)) <= value) return;
         assumed = old;
-        old = atomicCAS(as_int, assumed, __float_as_int(value));
+        old = atomicCAS(as_u16, assumed, want);
     } while (assumed != old);
 }
 
-__device__ inline void envelope_atomic_max(float* addr, float value) {
-    int* as_int = reinterpret_cast<int*>(addr);
-    int old = *as_int;
-    int assumed;
+__device__ inline void envelope_atomic_max(__nv_bfloat16* addr, float value) {
+    unsigned short* as_u16 = reinterpret_cast<unsigned short*>(addr);
+    const unsigned short want = __bfloat16_as_ushort(__float2bfloat16_ru(value));
+    unsigned short old = *as_u16;
+    unsigned short assumed;
     do {
-        if (__int_as_float(old) >= value) return;
+        if (__bfloat162float(__ushort_as_bfloat16(old)) >= value) return;
         assumed = old;
-        old = atomicCAS(as_int, assumed, __float_as_int(value));
+        old = atomicCAS(as_u16, assumed, want);
     } while (assumed != old);
 }
 
@@ -313,8 +321,8 @@ __global__ void envelope_reset_started_pages_kernel(
     const std::uint32_t* __restrict__ w_page,
     const std::uint32_t* __restrict__ w_off,
     const std::uint8_t* __restrict__ row_valid,
-    float* __restrict__ env_min,
-    float* __restrict__ env_max,
+    __nv_bfloat16* __restrict__ env_min,
+    __nv_bfloat16* __restrict__ env_max,
     int num_tokens,
     int num_kv_heads,
     int head_dim)
@@ -328,8 +336,8 @@ __global__ void envelope_reset_started_pages_kernel(
     const long env_base =
         (static_cast<long>(w_page[token]) * num_kv_heads + kh) * head_dim;
     for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
-        env_min[env_base + d] = CUDART_INF_F;
-        env_max[env_base + d] = -CUDART_INF_F;
+        env_min[env_base + d] = __float2bfloat16(CUDART_INF_F);
+        env_max[env_base + d] = __float2bfloat16(-CUDART_INF_F);
     }
 }
 
@@ -355,8 +363,8 @@ __global__ void envelope_merge_written_kernel(
     const __nv_bfloat16* __restrict__ k_curr,
     const std::uint32_t* __restrict__ w_page,
     const std::uint8_t* __restrict__ row_valid,
-    float* __restrict__ env_min,
-    float* __restrict__ env_max,
+    __nv_bfloat16* __restrict__ env_min,
+    __nv_bfloat16* __restrict__ env_max,
     int num_tokens,
     int num_kv_heads,
     int head_dim)
@@ -385,8 +393,8 @@ void launch_envelope_merge_written_bf16(
     const std::uint32_t* w_page,
     const std::uint32_t* w_off,
     const std::uint8_t* row_valid,
-    float* env_min,
-    float* env_max,
+    std::uint16_t* env_min,
+    std::uint16_t* env_max,
     int num_tokens,
     int num_kv_heads,
     int head_dim,
@@ -399,22 +407,28 @@ void launch_envelope_merge_written_bf16(
     if (num_tokens <= kEnvelopeFuseMaxTokens) {
         envelope_merge_written_fused_kernel<<<grid, threads, 0, stream>>>(
             reinterpret_cast<const __nv_bfloat16*>(k_curr),
-            w_page, w_off, row_valid, env_min, env_max,
+            w_page, w_off, row_valid,
+            reinterpret_cast<__nv_bfloat16*>(env_min),
+        reinterpret_cast<__nv_bfloat16*>(env_max),
             num_tokens, num_kv_heads, head_dim);
         return;
     }
     envelope_reset_started_pages_kernel<<<grid, threads, 0, stream>>>(
-        w_page, w_off, row_valid, env_min, env_max,
+        w_page, w_off, row_valid,
+        reinterpret_cast<__nv_bfloat16*>(env_min),
+        reinterpret_cast<__nv_bfloat16*>(env_max),
         num_tokens, num_kv_heads, head_dim);
     envelope_merge_written_kernel<<<grid, threads, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(k_curr),
-        w_page, row_valid, env_min, env_max,
+        w_page, row_valid,
+        reinterpret_cast<__nv_bfloat16*>(env_min),
+        reinterpret_cast<__nv_bfloat16*>(env_max),
         num_tokens, num_kv_heads, head_dim);
 }
 
-void launch_envelope_seed_empty_f32(
-    float* env_min,
-    float* env_max,
+void launch_envelope_seed_empty_bf16(
+    std::uint16_t* env_min,
+    std::uint16_t* env_max,
     int num_pages,
     int num_kv_heads,
     int head_dim,
@@ -427,14 +441,16 @@ void launch_envelope_seed_empty_f32(
     const int threads = 256;
     const std::size_t blocks = (n + threads - 1) / threads;
     envelope_seed_empty_kernel<<<static_cast<unsigned>(blocks), threads, 0,
-                                 stream>>>(env_min, env_max, n);
+                                 stream>>>(
+        reinterpret_cast<__nv_bfloat16*>(env_min),
+        reinterpret_cast<__nv_bfloat16*>(env_max), n);
 }
 
 void launch_envelope_recompute_bf16(
     const std::uint16_t* k_pages,
     const std::int32_t* page_live_lens,
-    float* env_min,
-    float* env_max,
+    std::uint16_t* env_min,
+    std::uint16_t* env_max,
     int num_pages,
     int page_size,
     int num_kv_heads,
@@ -447,14 +463,16 @@ void launch_envelope_recompute_bf16(
     const int threads = head_dim < 256 ? head_dim : 256;
     envelope_recompute_kernel<<<grid, threads, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(k_pages),
-        page_live_lens, env_min, env_max,
+        page_live_lens,
+        reinterpret_cast<__nv_bfloat16*>(env_min),
+        reinterpret_cast<__nv_bfloat16*>(env_max),
         page_size, num_kv_heads, head_dim);
 }
 
 void launch_envelope_dot_f32(
     const float* q,
-    const float* env_min,
-    const float* env_max,
+    const std::uint16_t* env_min,
+    const std::uint16_t* env_max,
     float* score,
     int num_q_heads,
     int num_kv_heads,
@@ -468,7 +486,10 @@ void launch_envelope_dot_f32(
     const dim3 grid(static_cast<unsigned>(p_max),
                     static_cast<unsigned>(num_kv_heads));
     envelope_dot_kernel<BLOCK><<<grid, BLOCK, 0, stream>>>(
-        q, env_min, env_max, score,
+        q,
+        reinterpret_cast<const __nv_bfloat16*>(env_min),
+        reinterpret_cast<const __nv_bfloat16*>(env_max),
+        score,
         num_q_heads, num_kv_heads, head_dim, p_max, live_pages);
 }
 
@@ -478,8 +499,8 @@ void launch_envelope_update_appended_bf16(
     const std::uint32_t* kv_page_indices,
     const std::uint32_t* kv_page_indptr,
     const std::uint32_t* kv_last_page_lens,
-    float* env_min,
-    float* env_max,
+    std::uint16_t* env_min,
+    std::uint16_t* env_max,
     int num_requests,
     int max_touched,
     int page_size,
@@ -497,7 +518,8 @@ void launch_envelope_update_appended_bf16(
     envelope_update_appended_kernel<<<grid, threads, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(k_pages),
         qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-        env_min, env_max,
+        reinterpret_cast<__nv_bfloat16*>(env_min),
+        reinterpret_cast<__nv_bfloat16*>(env_max),
         num_requests, page_size, num_kv_heads, head_dim);
 }
 

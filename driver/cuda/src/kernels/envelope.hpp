@@ -32,13 +32,20 @@
 
 namespace pie_cuda_driver::kernels {
 
+// The envelopes are stored bf16, half of what f32 cost, and the narrowing is
+// EXACT rather than a tolerated approximation: every envelope entry is the min
+// or max of a set of bf16 keys, so it is already representable. The maintenance
+// kernels still round in a DIRECTED way (min down, max up) so that a caller who
+// one day merges a non-bf16 value cannot round the bound inwards and turn an
+// upper bound into an estimate.
+//
 // Seed every page to the EMPTY envelope (`+inf`, `-inf`). Used once, when the
 // envelopes are allocated alongside a fresh KV pool: no page holds a key yet,
 // so the empty envelope is the exact answer, and every subsequent append
 // refreshes the pages it touched.
-void launch_envelope_seed_empty_f32(
-    float* env_min,
-    float* env_max,
+void launch_envelope_seed_empty_bf16(
+    std::uint16_t* env_min,
+    std::uint16_t* env_max,
     int num_pages,
     int num_kv_heads,
     int head_dim,
@@ -48,12 +55,13 @@ void launch_envelope_seed_empty_f32(
 // `k_pages` is `[num_pages, page_size, num_kv_heads, head_dim]` bf16 (NHD, as
 // `std::uint16_t`); `page_live_lens[p]` is the number of live tokens in page p
 // (`<= page_size`). `env_min`/`env_max` are `[num_pages, num_kv_heads, head_dim]`
-// f32. A page with 0 live tokens leaves `env_min=+inf`, `env_max=-inf`.
+// bf16 (as `std::uint16_t`). A page with 0 live tokens leaves `env_min=+inf`,
+// `env_max=-inf`.
 void launch_envelope_recompute_bf16(
     const std::uint16_t* k_pages,
     const std::int32_t* page_live_lens,
-    float* env_min,
-    float* env_max,
+    std::uint16_t* env_min,
+    std::uint16_t* env_max,
     int num_pages,
     int page_size,
     int num_kv_heads,
@@ -74,8 +82,8 @@ void launch_envelope_merge_written_bf16(
     const std::uint32_t* w_page,
     const std::uint32_t* w_off,
     const std::uint8_t* row_valid,
-    float* env_min,
-    float* env_max,
+    std::uint16_t* env_min,
+    std::uint16_t* env_max,
     int num_tokens,
     int num_kv_heads,
     int head_dim,
@@ -83,12 +91,14 @@ void launch_envelope_merge_written_bf16(
 
 // formula above. `q` is `[num_q_heads, head_dim]` f32 (this layer's projected
 // query, M=1 decode); `env_min`/`env_max` are `[P_MAX, num_kv_heads, head_dim]`
-// f32. Pages `page >= live_pages` → `-inf`. Requires
+// bf16. The dot itself is f32: the envelopes widen exactly (see
+// `envelope_device.cuh`), so only their storage is narrow.
+// Pages `page >= live_pages` → `-inf`. Requires
 // `num_q_heads % num_kv_heads == 0` (GQA group).
 void launch_envelope_dot_f32(
     const float* q,
-    const float* env_min,
-    const float* env_max,
+    const std::uint16_t* env_min,
+    const std::uint16_t* env_max,
     float* score,
     int num_q_heads,
     int num_kv_heads,
@@ -118,8 +128,8 @@ void launch_envelope_update_appended_bf16(
     const std::uint32_t* kv_page_indices,    // [kv_page_indptr[num_requests]]
     const std::uint32_t* kv_page_indptr,     // [num_requests + 1]
     const std::uint32_t* kv_last_page_lens,  // [num_requests]
-    float* env_min,
-    float* env_max,
+    std::uint16_t* env_min,
+    std::uint16_t* env_max,
     int num_requests,
     int max_touched,
     int page_size,

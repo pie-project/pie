@@ -1498,3 +1498,69 @@ dominated by a constant that belongs to the engine. On a production-sized model
 the baseline per-step cost grows while that constant does not, so every one of
 these crossovers moves earlier, and the ordering between them -- which is set
 by real per-layer work rather than by the constant -- is what survives.
+
+## 16. Envelopes cost half of what they did, for free
+
+Quest's key envelopes were stored as fp32 `[num_pages, kv_heads, head_dim]`
+pairs, which is **12.5% of the key tier and 25% of the KV pool's key half** --
+the largest single memory cost this document adds, and the one that decides
+whether Quest is affordable on a device where KV capacity is the binding
+constraint.
+
+### 16.1 The narrowing is exact, not a tradeoff
+
+The usual framing for a precision reduction is a memory-vs-accuracy trade. Here
+there is nothing to trade, because of what an envelope *is*:
+
+> An envelope entry is the min or the max of a set of **bf16 keys**. It is
+> therefore already, exactly, some bf16 value. Storing it in fp32 stores the
+> same number in twice the space.
+
+The seeds are exact too: `+inf` and `-inf` are representable in bf16 (bf16 is
+the top 16 bits of fp32, so it inherits the exponent range verbatim -- which is
+also why the sign-magnitude ordering argument behind the `atomicCAS` min/max
+carries over unchanged). And `envelope_dot` widens `bf16 -> fp32` exactly before
+multiplying, keeping the accumulate in f32, so **every arithmetic result is
+bit-identical to the fp32-storage version.**
+
+This is checkable rather than merely arguable, and `test_envelope_dot`'s 13
+checks -- including the exact merge/recompute equality of §13.2 and the golden
+vector -- all pass **unchanged**, with no tolerance loosened. If the narrowing
+were lossy, the merge-equals-recompute check would be the first to break, since
+it compares two different orders of arriving at the same bound.
+
+Directed rounding (`__float2bfloat16_rd` for min, `_ru` for max) is applied
+anyway. It is a no-op on every value the current code stores, and it is there so
+that a future caller merging a value that did *not* originate as a bf16 key --
+a quantized tier, a fused dequantize, a synthetic bound -- cannot round a bound
+*inwards*. An envelope that is too tight drops a live key from the score and
+Quest evicts a page it should have kept; an envelope that is too loose only
+costs a page it did not need. Only one of those directions is safe to be wrong
+in, and the rounding mode is what pins it.
+
+### 16.2 The saving, measured
+
+The planner (`memory_planner.cpp`) and the cache (`kv_cache.cpp`) both charge
+`2 * sizeof(uint16_t) * layers * kv_heads * head_dim` per page and **must
+agree**, or the cache overruns the budget the planner sized. Running the planner
+on this L40S with the switch off and on:
+
+| `PIE_CUDA_KV_ENVELOPES` | logical KV pages | KV tokens |
+|---|---|---|
+| 0 | 22 084 | 353 344 |
+| 1 | 20 785 | 332 560 |
+
+22084/20785 = **1.0625 exactly** -- envelopes are 6.25% of a KV page, as the
+accounting says. Under fp32 the same ratio was 1.125, which would have left
+19 630 pages. **The narrowing hands back 1 155 pages -- 18 480 tokens of KV
+capacity -- for zero numeric change.**
+
+Kernel cost is unchanged at decode widths: the merge bench reports 82.3 us per
+28-layer pass at N=1 and 78.5 us at N=16, matching §13.2's fp32 numbers, because
+at those widths the kernels are pure launch overhead and touch too little memory
+for the halving to show. It shows only in the memory table, which is the point.
+
+End to end, `bench_quest.py` re-run after the change reproduces §14.2's crossover
+unchanged -- net win from 4K, quarter-budget 0.85x at 4096 and 0.60x at 6144
+against a 11.90 ms baseline -- with an identical reserved page count at every
+context. The narrowing is invisible to every measurement except the memory one.

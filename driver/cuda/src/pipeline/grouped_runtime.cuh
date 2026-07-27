@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cuda_bf16.h>
+
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -62,8 +64,8 @@ struct GroupedLanePageMask {
 };
 
 struct GroupedLaneEnvelopeDevice {
-    const float* env_min;
-    const float* env_max;
+    const __nv_bfloat16* env_min;
+    const __nv_bfloat16* env_max;
     const float* query;
     // UNSLICED fire page list, plus the device CSR that slices it. See the
     // comment on `GroupedLaneEnvelope` for why the host must not pre-slice.
@@ -94,8 +96,8 @@ struct GroupedLaneEnvelopeDevice {
 // `page_indptr` instead, and the host contributes only the *declared slot
 // bound*, which is safe to over-estimate.
 struct GroupedLaneEnvelope {
-    const float* env_min = nullptr;   // [num_pages, num_kv_heads, head_dim]
-    const float* env_max = nullptr;
+    const __nv_bfloat16* env_min = nullptr;   // [num_pages, num_kv_heads, head_dim]
+    const __nv_bfloat16* env_max = nullptr;
     // This lane's query row to score with: the LAST token of the lane, which is
     // the token whose attention the mask will govern.
     const float* query = nullptr;

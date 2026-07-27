@@ -86,12 +86,12 @@ void check_recompute(const char* name, int num_pages, int page_size, int nkvh,
 
     std::uint16_t* dk;
     std::int32_t* dlive;
-    float *dmin, *dmax;
+    std::uint16_t *dmin, *dmax;
     const long envn = static_cast<long>(num_pages) * nkvh * hd;
     RT(cudaMalloc(&dk, n * 2));
     RT(cudaMalloc(&dlive, num_pages * sizeof(std::int32_t)));
-    RT(cudaMalloc(&dmin, envn * sizeof(float)));
-    RT(cudaMalloc(&dmax, envn * sizeof(float)));
+    RT(cudaMalloc(&dmin, envn * sizeof(std::uint16_t)));
+    RT(cudaMalloc(&dmax, envn * sizeof(std::uint16_t)));
     RT(cudaMemcpy(dk, k.data(), n * 2, cudaMemcpyHostToDevice));
     RT(cudaMemcpy(dlive, live.data(), num_pages * sizeof(std::int32_t),
                   cudaMemcpyHostToDevice));
@@ -100,10 +100,10 @@ void check_recompute(const char* name, int num_pages, int page_size, int nkvh,
                                    nkvh, hd, nullptr);
     RT(cudaDeviceSynchronize());
 
-    std::vector<float> gmin(envn), gmax(envn);
-    RT(cudaMemcpy(gmin.data(), dmin, envn * sizeof(float),
+    std::vector<std::uint16_t> gmin(envn), gmax(envn);
+    RT(cudaMemcpy(gmin.data(), dmin, envn * sizeof(std::uint16_t),
                   cudaMemcpyDeviceToHost));
-    RT(cudaMemcpy(gmax.data(), dmax, envn * sizeof(float),
+    RT(cudaMemcpy(gmax.data(), dmax, envn * sizeof(std::uint16_t),
                   cudaMemcpyDeviceToHost));
 
     bool ok = true;
@@ -120,7 +120,7 @@ void check_recompute(const char* name, int num_pages, int page_size, int nkvh,
                     mx = std::fmax(mx, v);
                 }
                 const long e = (static_cast<long>(p) * nkvh + kh) * hd + d;
-                ok = (gmin[e] == mn) && (gmax[e] == mx);
+                ok = (b2f(gmin[e]) == mn) && (b2f(gmax[e]) == mx);
             }
     std::printf("[%s] %s\n", ok ? " ok " : "FAIL", name);
     if (!ok) ++g_fail;
@@ -183,14 +183,14 @@ void check_update_appended(const char* name, int num_pages, int page_size,
 
     std::uint16_t* dk;
     std::int32_t* dlive;
-    float *dmin_ref, *dmax_ref, *dmin_inc, *dmax_inc;
+    std::uint16_t *dmin_ref, *dmax_ref, *dmin_inc, *dmax_inc;
     std::uint32_t *d_qo, *d_idx, *d_indptr, *d_lastlen;
     RT(cudaMalloc(&dk, n * 2));
     RT(cudaMalloc(&dlive, num_pages * sizeof(std::int32_t)));
-    RT(cudaMalloc(&dmin_ref, envn * sizeof(float)));
-    RT(cudaMalloc(&dmax_ref, envn * sizeof(float)));
-    RT(cudaMalloc(&dmin_inc, envn * sizeof(float)));
-    RT(cudaMalloc(&dmax_inc, envn * sizeof(float)));
+    RT(cudaMalloc(&dmin_ref, envn * sizeof(std::uint16_t)));
+    RT(cudaMalloc(&dmax_ref, envn * sizeof(std::uint16_t)));
+    RT(cudaMalloc(&dmin_inc, envn * sizeof(std::uint16_t)));
+    RT(cudaMalloc(&dmax_inc, envn * sizeof(std::uint16_t)));
     RT(cudaMalloc(&d_qo, qo_indptr.size() * sizeof(std::uint32_t)));
     RT(cudaMalloc(&d_idx, kv_page_indices.size() * sizeof(std::uint32_t)));
     RT(cudaMalloc(&d_indptr, kv_page_indptr.size() * sizeof(std::uint32_t)));
@@ -213,8 +213,8 @@ void check_update_appended(const char* name, int num_pages, int page_size,
 
     // Poison the incremental buffers so any page the fire does NOT touch stays
     // poisoned -- only the touched ones may be compared against the golden.
-    RT(cudaMemset(dmin_inc, 0x7f, envn * sizeof(float)));
-    RT(cudaMemset(dmax_inc, 0x7f, envn * sizeof(float)));
+    RT(cudaMemset(dmin_inc, 0x7f, envn * sizeof(std::uint16_t)));
+    RT(cudaMemset(dmax_inc, 0x7f, envn * sizeof(std::uint16_t)));
 
     // The host's worst-case bound, exactly as the KV write path will compute it.
     const int total_tokens = static_cast<int>(qo_indptr[R]);
@@ -227,19 +227,18 @@ void check_update_appended(const char* name, int num_pages, int page_size,
                                          page_size, nkvh, hd, nullptr);
     RT(cudaDeviceSynchronize());
 
-    std::vector<float> rmin(envn), rmax(envn), imin(envn), imax(envn);
-    RT(cudaMemcpy(rmin.data(), dmin_ref, envn * sizeof(float),
+    std::vector<std::uint16_t> rmin(envn), rmax(envn), imin(envn), imax(envn);
+    RT(cudaMemcpy(rmin.data(), dmin_ref, envn * sizeof(std::uint16_t),
                   cudaMemcpyDeviceToHost));
-    RT(cudaMemcpy(rmax.data(), dmax_ref, envn * sizeof(float),
+    RT(cudaMemcpy(rmax.data(), dmax_ref, envn * sizeof(std::uint16_t),
                   cudaMemcpyDeviceToHost));
-    RT(cudaMemcpy(imin.data(), dmin_inc, envn * sizeof(float),
+    RT(cudaMemcpy(imin.data(), dmin_inc, envn * sizeof(std::uint16_t),
                   cudaMemcpyDeviceToHost));
-    RT(cudaMemcpy(imax.data(), dmax_inc, envn * sizeof(float),
+    RT(cudaMemcpy(imax.data(), dmax_inc, envn * sizeof(std::uint16_t),
                   cudaMemcpyDeviceToHost));
 
-    float poison;
-    const std::uint32_t poison_bits = 0x7f7f7f7fu;
-    __builtin_memcpy(&poison, &poison_bits, sizeof(poison));
+    // `cudaMemset` writes 0x7f per BYTE, so a bf16 lane reads back 0x7f7f.
+    const std::uint16_t poison = 0x7f7fu;
 
     // The test is only meaningful if some page is deliberately left untouched.
     int untouched_used = 0;
@@ -312,15 +311,15 @@ void check_merge_written(const char* name, int num_pages, int page_size,
 
     std::uint16_t *dk, *dcurr;
     std::int32_t* dlive;
-    float *dmin_ref, *dmax_ref, *dmin_inc, *dmax_inc;
+    std::uint16_t *dmin_ref, *dmax_ref, *dmin_inc, *dmax_inc;
     std::uint32_t *d_page, *d_off;
     RT(cudaMalloc(&dk, n * 2));
     RT(cudaMalloc(&dcurr, static_cast<long>(total) * tok * 2));
     RT(cudaMalloc(&dlive, num_pages * sizeof(std::int32_t)));
-    RT(cudaMalloc(&dmin_ref, envn * sizeof(float)));
-    RT(cudaMalloc(&dmax_ref, envn * sizeof(float)));
-    RT(cudaMalloc(&dmin_inc, envn * sizeof(float)));
-    RT(cudaMalloc(&dmax_inc, envn * sizeof(float)));
+    RT(cudaMalloc(&dmin_ref, envn * sizeof(std::uint16_t)));
+    RT(cudaMalloc(&dmax_ref, envn * sizeof(std::uint16_t)));
+    RT(cudaMalloc(&dmin_inc, envn * sizeof(std::uint16_t)));
+    RT(cudaMalloc(&dmax_inc, envn * sizeof(std::uint16_t)));
     RT(cudaMalloc(&d_page, total * sizeof(std::uint32_t)));
     RT(cudaMalloc(&d_off, total * sizeof(std::uint32_t)));
     RT(cudaMemcpy(dk, k.data(), n * 2, cudaMemcpyHostToDevice));
@@ -338,10 +337,11 @@ void check_merge_written(const char* name, int num_pages, int page_size,
 
     // The recycled-page stand-in: a previous tenant's envelope, wide enough
     // that a merge could never narrow it back.
-    std::vector<float> dirty_min(envn, -1e30f), dirty_max(envn, 1e30f);
-    RT(cudaMemcpy(dmin_inc, dirty_min.data(), envn * sizeof(float),
+    std::vector<std::uint16_t> dirty_min(envn, f2b(-1e30f)),
+        dirty_max(envn, f2b(1e30f));
+    RT(cudaMemcpy(dmin_inc, dirty_min.data(), envn * sizeof(std::uint16_t),
                   cudaMemcpyHostToDevice));
-    RT(cudaMemcpy(dmax_inc, dirty_max.data(), envn * sizeof(float),
+    RT(cudaMemcpy(dmax_inc, dirty_max.data(), envn * sizeof(std::uint16_t),
                   cudaMemcpyHostToDevice));
 
     launch_envelope_merge_written_bf16(dcurr, d_page, d_off, nullptr,
@@ -382,14 +382,14 @@ void check_merge_written(const char* name, int num_pages, int page_size,
     }
     RT(cudaDeviceSynchronize());
 
-    std::vector<float> rmin(envn), rmax(envn), imin(envn), imax(envn);
-    RT(cudaMemcpy(rmin.data(), dmin_ref, envn * sizeof(float),
+    std::vector<std::uint16_t> rmin(envn), rmax(envn), imin(envn), imax(envn);
+    RT(cudaMemcpy(rmin.data(), dmin_ref, envn * sizeof(std::uint16_t),
                   cudaMemcpyDeviceToHost));
-    RT(cudaMemcpy(rmax.data(), dmax_ref, envn * sizeof(float),
+    RT(cudaMemcpy(rmax.data(), dmax_ref, envn * sizeof(std::uint16_t),
                   cudaMemcpyDeviceToHost));
-    RT(cudaMemcpy(imin.data(), dmin_inc, envn * sizeof(float),
+    RT(cudaMemcpy(imin.data(), dmin_inc, envn * sizeof(std::uint16_t),
                   cudaMemcpyDeviceToHost));
-    RT(cudaMemcpy(imax.data(), dmax_inc, envn * sizeof(float),
+    RT(cudaMemcpy(imax.data(), dmax_inc, envn * sizeof(std::uint16_t),
                   cudaMemcpyDeviceToHost));
 
     bool ok = true;
@@ -403,7 +403,8 @@ void check_merge_written(const char* name, int num_pages, int page_size,
                     std::printf(
                         "       (page %d kh %d d %d: merged [%g,%g] vs "
                         "recompute [%g,%g])\n",
-                        p, kh, d, imin[e], imax[e], rmin[e], rmax[e]);
+                        p, kh, d, b2f(imin[e]), b2f(imax[e]),
+                        b2f(rmin[e]), b2f(rmax[e]));
             }
     }
     std::printf("[%s] %s\n", ok ? " ok " : "FAIL", name);
@@ -421,23 +422,31 @@ void check_dot(const char* name, int nqh, int nkvh, int hd, int p_max,
     std::vector<float> emin(envn), emax(envn);
     for (std::size_t i = 0; i < q.size(); ++i)
         q[i] = std::cos(0.017f * static_cast<float>(i)) * 2.0f;
+    // The envelopes are stored bf16, so ROUND FIRST and let the CPU reference
+    // see the same numbers the kernel will read. Rounding only one side would
+    // turn a storage-format question into an apparent kernel error, and the
+    // tolerance below exists for reduction ORDER, not for storage width.
+    std::vector<std::uint16_t> bmin(envn), bmax(envn);
     for (long i = 0; i < envn; ++i) {
         const float a = std::sin(0.013f * static_cast<float>(i));
-        emin[i] = a - 1.5f;
-        emax[i] = a + 2.0f;
+        bmin[i] = f2b(a - 1.5f);
+        bmax[i] = f2b(a + 2.0f);
+        emin[i] = b2f(bmin[i]);
+        emax[i] = b2f(bmax[i]);
     }
 
-    float *dq, *dmin, *dmax, *dscore;
+    float *dq, *dscore;
+    std::uint16_t *dmin, *dmax;
     const long sn = static_cast<long>(nkvh) * p_max;
     RT(cudaMalloc(&dq, q.size() * sizeof(float)));
-    RT(cudaMalloc(&dmin, envn * sizeof(float)));
-    RT(cudaMalloc(&dmax, envn * sizeof(float)));
+    RT(cudaMalloc(&dmin, envn * sizeof(std::uint16_t)));
+    RT(cudaMalloc(&dmax, envn * sizeof(std::uint16_t)));
     RT(cudaMalloc(&dscore, sn * sizeof(float)));
     RT(cudaMemcpy(dq, q.data(), q.size() * sizeof(float),
                   cudaMemcpyHostToDevice));
-    RT(cudaMemcpy(dmin, emin.data(), envn * sizeof(float),
+    RT(cudaMemcpy(dmin, bmin.data(), envn * sizeof(std::uint16_t),
                   cudaMemcpyHostToDevice));
-    RT(cudaMemcpy(dmax, emax.data(), envn * sizeof(float),
+    RT(cudaMemcpy(dmax, bmax.data(), envn * sizeof(std::uint16_t),
                   cudaMemcpyHostToDevice));
 
     launch_envelope_dot_f32(dq, dmin, dmax, dscore, nqh, nkvh, hd, p_max, live,
@@ -471,16 +480,25 @@ void check_dot(const char* name, int nqh, int nkvh, int hd, int p_max,
 // (envelope_dot_reference_quest_math): score[0,0]=11, [0,1]=3, [0,2]=−inf.
 void check_dot_golden_vector() {
     const std::vector<float> q{1.0f, -1.0f, 2.0f, 0.5f};
-    const std::vector<float> emin{0.0f, 0.0f, -2.0f, 1.0f, 9.9f, 9.9f};
-    const std::vector<float> emax{3.0f, 4.0f, 1.0f, 2.0f, 9.9f, 9.9f};
-    float *dq, *dmin, *dmax, *ds;
+    // Every value that reaches the result is a small dyadic rational and so is
+    // bf16-exact; the 9.9s belong to the page past `live_pages`, which is
+    // -inf'd before any arithmetic. The golden is therefore unchanged by the
+    // envelopes being stored bf16.
+    const std::vector<std::uint16_t> emin{f2b(0.0f),  f2b(0.0f), f2b(-2.0f),
+                                          f2b(1.0f),  f2b(9.9f), f2b(9.9f)};
+    const std::vector<std::uint16_t> emax{f2b(3.0f),  f2b(4.0f), f2b(1.0f),
+                                          f2b(2.0f),  f2b(9.9f), f2b(9.9f)};
+    float *dq, *ds;
+    std::uint16_t *dmin, *dmax;
     RT(cudaMalloc(&dq, 4 * sizeof(float)));
-    RT(cudaMalloc(&dmin, 6 * sizeof(float)));
-    RT(cudaMalloc(&dmax, 6 * sizeof(float)));
+    RT(cudaMalloc(&dmin, 6 * sizeof(std::uint16_t)));
+    RT(cudaMalloc(&dmax, 6 * sizeof(std::uint16_t)));
     RT(cudaMalloc(&ds, 3 * sizeof(float)));
     RT(cudaMemcpy(dq, q.data(), 4 * sizeof(float), cudaMemcpyHostToDevice));
-    RT(cudaMemcpy(dmin, emin.data(), 6 * sizeof(float), cudaMemcpyHostToDevice));
-    RT(cudaMemcpy(dmax, emax.data(), 6 * sizeof(float), cudaMemcpyHostToDevice));
+    RT(cudaMemcpy(dmin, emin.data(), 6 * sizeof(std::uint16_t),
+                  cudaMemcpyHostToDevice));
+    RT(cudaMemcpy(dmax, emax.data(), 6 * sizeof(std::uint16_t),
+                  cudaMemcpyHostToDevice));
     launch_envelope_dot_f32(dq, dmin, dmax, ds, 2, 1, 2, 3, 2, nullptr);
     RT(cudaDeviceSynchronize());
     float s[3];
@@ -512,12 +530,12 @@ void bench_merge_written(int num_tokens, int nkvh, int hd, int layers) {
 
     std::uint16_t* dk;
     std::uint32_t *d_page, *d_off;
-    float *dmin, *dmax;
+    std::uint16_t *dmin, *dmax;
     RT(cudaMalloc(&dk, static_cast<long>(num_tokens) * tok * 2));
     RT(cudaMalloc(&d_page, num_tokens * sizeof(std::uint32_t)));
     RT(cudaMalloc(&d_off, num_tokens * sizeof(std::uint32_t)));
-    RT(cudaMalloc(&dmin, envn * sizeof(float)));
-    RT(cudaMalloc(&dmax, envn * sizeof(float)));
+    RT(cudaMalloc(&dmin, envn * sizeof(std::uint16_t)));
+    RT(cudaMalloc(&dmax, envn * sizeof(std::uint16_t)));
     RT(cudaMemcpy(dk, k.data(), static_cast<long>(num_tokens) * tok * 2,
                   cudaMemcpyHostToDevice));
     RT(cudaMemcpy(d_page, wp.data(), num_tokens * sizeof(std::uint32_t),

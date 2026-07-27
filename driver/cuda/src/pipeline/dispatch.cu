@@ -3595,8 +3595,8 @@ GroupedLaneEnvelope resolve_lane_envelope(
     }
 
     return GroupedLaneEnvelope{
-        .env_min = view.k_env_min,
-        .env_max = view.k_env_max,
+        .env_min = reinterpret_cast<const __nv_bfloat16*>(view.k_env_min),
+        .env_max = reinterpret_cast<const __nv_bfloat16*>(view.k_env_max),
         .query = query_base +
             static_cast<std::size_t>(lane.token_start + lane.token_count - 1) *
                 query_columns,
