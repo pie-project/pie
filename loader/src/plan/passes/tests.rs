@@ -110,7 +110,7 @@ fn target_transform_matrix_matches_host_and_metal_executors() {
     let mut host = LoadPlan::empty(StorageTarget::default());
     host.instrs.push(tile(TileMapKind::Cast));
     assert!(validate_target_support(&mut host).is_ok());
-    host.instrs[0] = tile(TileMapKind::Reorder);
+    host.instrs[0] = tile(TileMapKind::Transcode);
     assert!(validate_target_support(&mut host).is_err());
 
     let mut metal = LoadPlan::empty(StorageTarget {

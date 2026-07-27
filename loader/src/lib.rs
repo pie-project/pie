@@ -13,13 +13,16 @@
 pub mod artifact;
 pub mod checkpoint;
 pub mod contract;
+#[cfg(feature = "testkit")]
 pub mod contract_writer;
 pub mod dump;
 pub mod error;
 pub mod extent;
 pub mod ffi;
+#[cfg(feature = "testkit")]
 pub mod host_executor;
 pub mod plan;
+#[cfg(feature = "testkit")]
 pub mod reference;
 pub mod types;
 pub mod verify;

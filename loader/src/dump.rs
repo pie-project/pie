@@ -25,7 +25,6 @@ fn instr_name(instr: &StorageInstr) -> &'static str {
         StorageInstr::SlabScatter { .. } => "SlabScatter",
         StorageInstr::TileMap { .. } => "TileMap",
         StorageInstr::CreateView { .. } => "CreateView",
-        StorageInstr::Release { .. } => "Release",
         StorageInstr::Finalize { .. } => "Finalize",
     }
 }
@@ -38,7 +37,6 @@ fn tile_map_name(kind: TileMapKind) -> &'static str {
         TileMapKind::Encode => "Encode",
         TileMapKind::Transcode => "Transcode",
         TileMapKind::Reblock => "Reblock",
-        TileMapKind::Reorder => "Reorder",
         TileMapKind::Repack => "Repack",
     }
 }

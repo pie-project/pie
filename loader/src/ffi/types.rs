@@ -41,7 +41,6 @@ pub const PIE_LOADER_TILE_MAP_DECODE: u32 = 1 << 1;
 pub const PIE_LOADER_TILE_MAP_ENCODE: u32 = 1 << 2;
 pub const PIE_LOADER_TILE_MAP_TRANSCODE: u32 = 1 << 3;
 pub const PIE_LOADER_TILE_MAP_REBLOCK: u32 = 1 << 4;
-pub const PIE_LOADER_TILE_MAP_REORDER: u32 = 1 << 5;
 pub const PIE_LOADER_TILE_MAP_REPACK: u32 = 1 << 6;
 
 // Fused-chain capability bits, on the same principle: the *loader* knows what a
@@ -367,7 +366,6 @@ pub enum PieLoaderStorageInstrKind {
     ExtentWrite = 1,
     TileMap = 2,
     CreateView = 3,
-    Release = 4,
     Finalize = 5,
     BulkExtentWrite = 6,
     SlabScatter = 7,
@@ -384,7 +382,6 @@ pub enum PieLoaderTileMapKind {
     Encode = 2,
     Transcode = 3,
     Reblock = 4,
-    Reorder = 5,
     Repack = 6,
     None = 7,
 }
@@ -398,7 +395,6 @@ impl From<crate::plan::TileMapKind> for PieLoaderTileMapKind {
             K::Encode => Self::Encode,
             K::Transcode => Self::Transcode,
             K::Reblock => Self::Reblock,
-            K::Reorder => Self::Reorder,
             K::Repack => Self::Repack,
         }
     }
@@ -831,7 +827,6 @@ const _: () = {
     assert!(PIE_LOADER_TILE_MAP_ENCODE == p::TILE_MAP_ENCODE);
     assert!(PIE_LOADER_TILE_MAP_TRANSCODE == p::TILE_MAP_TRANSCODE);
     assert!(PIE_LOADER_TILE_MAP_REBLOCK == p::TILE_MAP_REBLOCK);
-    assert!(PIE_LOADER_TILE_MAP_REORDER == p::TILE_MAP_REORDER);
     assert!(PIE_LOADER_TILE_MAP_REPACK == p::TILE_MAP_REPACK);
     assert!(PIE_LOADER_FUSION_FP8_TO_MXFP4 == p::FUSION_FP8_TO_MXFP4);
 };

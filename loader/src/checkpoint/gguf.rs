@@ -142,9 +142,6 @@ fn map_tensor_type(ty: GgmlType, tensor_name: &str) -> Result<GgufTensorType, Er
                     bits_per_element: 4,
                     group_size: 32,
                     channel_axis: Some(Axis(0)),
-                    scale_dtype: Some(DType::F16),
-                    zero_point_dtype: None,
-                    block_shape: vec![32],
                 }
                 .normalized(),
             ),

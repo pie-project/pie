@@ -372,11 +372,6 @@ fn flatten_instr(arena: &mut PlanArena, instr: &StorageInstr) -> PieLoaderStorag
             out.dest = arena.dest_extent(view);
             out.has_dest = true;
         }
-        StorageInstr::Release { id, buffer } => {
-            out.id = id.0;
-            out.kind = PieLoaderStorageInstrKind::Release;
-            out.buffer_id = buffer.0;
-        }
         StorageInstr::Finalize { id, tensor, name } => {
             out.id = id.0;
             out.kind = PieLoaderStorageInstrKind::Finalize;

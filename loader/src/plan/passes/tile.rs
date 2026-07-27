@@ -21,8 +21,7 @@
 use crate::plan::index::PlanIndex;
 use crate::plan::{
     FUSION_FP8_TO_MXFP4, LoadPlan, SourceExtent, StorageInstr, StorageTarget, TILE_MAP_CAST,
-    TILE_MAP_ENCODE, TILE_MAP_REBLOCK, TILE_MAP_REORDER, TILE_MAP_REPACK, TileMapKind,
-    TransformFusion,
+    TILE_MAP_ENCODE, TILE_MAP_REBLOCK, TILE_MAP_REPACK, TileMapKind, TransformFusion,
 };
 use crate::types::{BackendKind, BufferId, DType, Encoding, QuantScheme, TensorDecl};
 
@@ -30,7 +29,7 @@ use crate::types::{BackendKind, BufferId, DType, Encoding, QuantScheme, TensorDe
 /// `kCudaTileMapMask`, which is defined in terms of the generated bits rather
 /// than restated, so the two cannot drift.
 pub const CUDA_TILE_MAP_MASK: u32 =
-    TILE_MAP_CAST | TILE_MAP_ENCODE | TILE_MAP_REBLOCK | TILE_MAP_REORDER | TILE_MAP_REPACK;
+    TILE_MAP_CAST | TILE_MAP_ENCODE | TILE_MAP_REBLOCK | TILE_MAP_REPACK;
 
 /// Metal's load executor binds tensors into a heap and runs no tile-map
 /// transforms at all. The loader will therefore not emit a transform this

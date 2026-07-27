@@ -138,10 +138,7 @@ nlohmann::json quant_to_json(const pie_loader::PieLoaderQuantSpecView& q) {
             {"logical_dtype", q.logical_dtype},
             {"bits_per_element", q.bits_per_element},
             {"group_size", q.group_size},
-            {"channel_axis", q.channel_axis},
-            {"scale_dtype", q.scale_dtype},
-            {"zero_point_dtype", q.zero_point_dtype},
-            {"block_shape", shape_to_json(q.block_shape)}};
+            {"channel_axis", q.channel_axis}};
 }
 
 nlohmann::json contract_to_json(const pie_loader::PieLoaderModelContractView& v) {

@@ -170,9 +170,6 @@ pub struct QuantSpec {
     pub bits_per_element: u8,
     pub group_size: u32,
     pub channel_axis: Option<Axis>,
-    pub scale_dtype: Option<DType>,
-    pub zero_point_dtype: Option<DType>,
-    pub block_shape: Vec<i64>,
 }
 
 impl QuantSpec {

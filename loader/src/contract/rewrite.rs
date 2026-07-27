@@ -134,11 +134,10 @@ pub fn coalesce_direct_row_shards(
     }
 
     let mut emitted_groups = vec![false; groups.len()];
-    let mut old_to_new = vec![usize::MAX; contract.tensors.len()];
     let mut new_tensors = Vec::with_capacity(contract.tensors.len() + groups.len());
 
-    for old_index in 0..contract.tensors.len() {
-        if let Some(group_id) = group_for[old_index] {
+    for (tensor, group) in contract.tensors.iter().zip(&group_for) {
+        if let Some(group_id) = *group {
             if emitted_groups[group_id] {
                 continue;
             }
@@ -149,14 +148,12 @@ pub fn coalesce_direct_row_shards(
                 target,
                 group_id,
                 &groups[group_id],
-                &mut old_to_new,
                 &mut new_tensors,
             )?;
             continue;
         }
 
-        old_to_new[old_index] = new_tensors.len();
-        new_tensors.push(contract.tensors[old_index].clone());
+        new_tensors.push(tensor.clone());
     }
 
     Ok(ModelContract {
@@ -171,7 +168,6 @@ fn emit_row_shard_bank(
     target: &StorageTarget,
     group_id: usize,
     indices: &[usize],
-    old_to_new: &mut [usize],
     new_tensors: &mut Vec<TensorContract>,
 ) -> Result<(), Error> {
     let first = &contract.tensors[indices[0]];
@@ -200,7 +196,6 @@ fn emit_row_shard_bank(
 
     for (slot, &old_index) in indices.iter().enumerate() {
         let original = &contract.tensors[old_index];
-        old_to_new[old_index] = new_tensors.len();
         new_tensors.push(TensorContract::new(
             original.name.clone(),
             Expr::out(bank_name.clone()).slice(0, slot as i64 * local_rows, local_rows),

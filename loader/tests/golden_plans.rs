@@ -124,9 +124,6 @@ fn quant(scheme: QuantScheme) -> Encoding {
         bits_per_element: scheme.default_bits(),
         group_size: scheme.default_group_size(),
         channel_axis: None,
-        scale_dtype: Some(DType::BF16),
-        zero_point_dtype: None,
-        block_shape: Vec::new(),
     })
 }
 

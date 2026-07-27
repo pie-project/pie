@@ -159,11 +159,7 @@ fn an_unresolvable_shape_or_dtype_declines_to_tile() {
 #[test]
 fn only_encode_is_lowered() {
     // Cast and Reblock have no scratch to budget; the executor streams them.
-    for kind in [
-        TileMapKind::Cast,
-        TileMapKind::Reblock,
-        TileMapKind::Reorder,
-    ] {
+    for kind in [TileMapKind::Cast, TileMapKind::Reblock] {
         let mut f = facts(DType::F8E4M3, 4096, 4096, 4 * MIB);
         f.kind = kind;
         assert_eq!(cuda_lower(&f, true), TileLowering::default(), "{kind:?}");
@@ -349,9 +345,6 @@ fn a_quantized_source_resolves_to_its_logical_dtype() {
             bits_per_element: 8,
             group_size: 0,
             channel_axis: None,
-            scale_dtype: None,
-            zero_point_dtype: None,
-            block_shape: Vec::new(),
         }),
         4096,
         4096,

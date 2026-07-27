@@ -909,9 +909,6 @@ mod tests {
             bits_per_element: 4,
             group_size: 32,
             channel_axis: Some(Axis(1)),
-            scale_dtype: Some(DType::U8),
-            zero_point_dtype: None,
-            block_shape: vec![32],
         }
     }
 

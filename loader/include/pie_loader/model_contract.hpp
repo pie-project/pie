@@ -103,8 +103,6 @@ inline PieLoaderEncodingSpec raw(PieLoaderDType dtype) {
     spec.quant.scheme = static_cast<std::uint32_t>(PieLoaderQuantScheme::None);
     spec.quant.logical_dtype = static_cast<std::uint32_t>(PieLoaderDType::BF16);
     spec.quant.channel_axis = PIE_LOADER_NO_AXIS;
-    spec.quant.scale_dtype = PIE_LOADER_NO_DTYPE;
-    spec.quant.zero_point_dtype = PIE_LOADER_NO_DTYPE;
     return spec;
 }
 
@@ -120,8 +118,6 @@ inline PieLoaderQuantSpecView quant_spec(PieLoaderQuantScheme scheme, PieLoaderD
     spec.bits_per_element = 0;
     spec.group_size = 0;
     spec.channel_axis = PIE_LOADER_NO_AXIS;
-    spec.scale_dtype = PIE_LOADER_NO_DTYPE;
-    spec.zero_point_dtype = PIE_LOADER_NO_DTYPE;
     return spec;
 }
 
@@ -301,18 +297,6 @@ public:
         v.nodes = {nodes_.empty() ? nullptr : nodes_.data(), nodes_.size()};
         v.tensors = {tensors_.empty() ? nullptr : tensors_.data(), tensors_.size()};
         return v;
-    }
-
-    /// Attach a block shape to `spec`, backed by this contract's storage.
-    ///
-    /// `PieLoaderQuantSpecView::block_shape` is a borrowed slice, so an author
-    /// cannot hand it a local: the contract has to own the numbers for as long
-    /// as the view is live. Everything else on the spec is a scalar the author
-    /// can just assign.
-    PieLoaderQuantSpecView with_block_shape(PieLoaderQuantSpecView spec,
-                                            std::vector<std::int64_t> block_shape) {
-        spec.block_shape = store_shape(std::move(block_shape));
-        return spec;
     }
 
 private:

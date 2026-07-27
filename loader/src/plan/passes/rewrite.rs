@@ -522,18 +522,16 @@ pub(super) fn validate_target_support(program: &mut LoadPlan) -> Result<usize> {
         };
         let advertised = program.target.tile_map_mask & kind.capability_bit() != 0;
         let supported = advertised
-            && (matches!(
-                kind,
-                TileMapKind::Cast | TileMapKind::Reblock | TileMapKind::Reorder
-            ) || (*kind == TileMapKind::Encode
-                && matches!(
-                    transform.to,
-                    Some(
-                        QuantScheme::Fp8E4M3
-                            | QuantScheme::Int8Symmetric
-                            | QuantScheme::Mxfp4E2M1E8M0
-                    )
-                ))
+            && (matches!(kind, TileMapKind::Cast | TileMapKind::Reblock)
+                || (*kind == TileMapKind::Encode
+                    && matches!(
+                        transform.to,
+                        Some(
+                            QuantScheme::Fp8E4M3
+                                | QuantScheme::Int8Symmetric
+                                | QuantScheme::Mxfp4E2M1E8M0
+                        )
+                    ))
                 || (*kind == TileMapKind::Repack
                     && (matches!(transform.repack.layout, RepackLayout::DenseRowGather)
                         || (program.target.native_mxfp4_moe
@@ -684,7 +682,6 @@ pub(crate) fn instr_id_of(instr: &StorageInstr) -> InstrId {
         | StorageInstr::SlabScatter { id, .. }
         | StorageInstr::TileMap { id, .. }
         | StorageInstr::CreateView { id, .. }
-        | StorageInstr::Release { id, .. }
         | StorageInstr::Finalize { id, .. } => *id,
     }
 }
@@ -697,7 +694,6 @@ pub(super) fn set_instr_id(instr: &mut StorageInstr, new_id: InstrId) {
         | StorageInstr::SlabScatter { id, .. }
         | StorageInstr::TileMap { id, .. }
         | StorageInstr::CreateView { id, .. }
-        | StorageInstr::Release { id, .. }
         | StorageInstr::Finalize { id, .. } => *id = new_id,
     }
 }

@@ -78,14 +78,10 @@ impl TryFrom<u32> for PieLoaderExprKind {
     }
 }
 
-/// An optional [`PieLoaderDType`], as a signed integer so that `-1` is "unset".
+/// `QuantSpec::channel_axis`, as a signed integer so that `-1` is "unset".
 ///
-/// `QuantSpec` has three of these. Encoding them as a sentinel rather than a
-/// second `bool` field per member keeps the struct a plain list of numbers,
-/// which is what a designated initializer is good at.
-pub type PieLoaderOptDType = i32;
-pub const PIE_LOADER_NO_DTYPE: PieLoaderOptDType = -1;
-/// The same convention for `QuantSpec::channel_axis`.
+/// A sentinel rather than a second `bool` field keeps the struct a plain list
+/// of numbers, which is what a designated initializer is good at.
 pub const PIE_LOADER_NO_AXIS: i32 = -1;
 
 /// [`crate::types::QuantSpec`], flattened.
@@ -101,9 +97,6 @@ pub struct PieLoaderQuantSpecView {
     /// `0` asks for the scheme's default.
     pub group_size: u32,
     pub channel_axis: i32,
-    pub scale_dtype: PieLoaderOptDType,
-    pub zero_point_dtype: PieLoaderOptDType,
-    pub block_shape: PieLoaderI64Slice,
 }
 
 impl Default for PieLoaderQuantSpecView {
@@ -114,9 +107,6 @@ impl Default for PieLoaderQuantSpecView {
             bits_per_element: 0,
             group_size: 0,
             channel_axis: PIE_LOADER_NO_AXIS,
-            scale_dtype: PIE_LOADER_NO_DTYPE,
-            zero_point_dtype: PIE_LOADER_NO_DTYPE,
-            block_shape: PieLoaderI64Slice::default(),
         }
     }
 }
@@ -312,14 +302,6 @@ fn dtype(value: u32, what: &str) -> Result<DType, String> {
         .map_err(|v| format!("{what}: {v} is not a PieLoaderDType"))
 }
 
-fn opt_dtype(value: PieLoaderOptDType, what: &str) -> Result<Option<DType>, String> {
-    if value == PIE_LOADER_NO_DTYPE {
-        return Ok(None);
-    }
-    let raw = u32::try_from(value).map_err(|_| format!("{what}: {value} is not a dtype"))?;
-    dtype(raw, what).map(Some)
-}
-
 fn read_quant(spec: &PieLoaderQuantSpecView, what: &str) -> Result<QuantSpec, String> {
     let channel_axis = if spec.channel_axis == PIE_LOADER_NO_AXIS {
         None
@@ -336,9 +318,6 @@ fn read_quant(spec: &PieLoaderQuantSpecView, what: &str) -> Result<QuantSpec, St
         bits_per_element: spec.bits_per_element,
         group_size: spec.group_size,
         channel_axis,
-        scale_dtype: opt_dtype(spec.scale_dtype, &format!("{what}.scale_dtype"))?,
-        zero_point_dtype: opt_dtype(spec.zero_point_dtype, &format!("{what}.zero_point_dtype"))?,
-        block_shape: unsafe { slice_of(spec.block_shape.ptr, spec.block_shape.len) }.to_vec(),
     })
 }
 
@@ -519,21 +498,7 @@ pub unsafe fn read_contract(view: &PieLoaderModelContractView) -> Result<ModelCo
 // (`crate::contract_writer`). Flattening a *contract* is not on the load path
 // and lives in the latter.
 
-/// Somewhere to keep the `i64` runs a POD encoding points into.
-///
-/// A quantization spec can carry a `block_shape`, so writing one needs
-/// somewhere stable to put it. Two things marshal encodings — a contract being
-/// flattened and a checkpoint being opened — and they own their storage
-/// differently, so the writer takes the store rather than being a method on
-/// either.
-pub(crate) trait ShapeStore {
-    fn store_shape(&mut self, values: &[i64]) -> PieLoaderI64Slice;
-}
-
-pub(crate) fn write_quant<S: ShapeStore + ?Sized>(
-    store: &mut S,
-    spec: &QuantSpec,
-) -> PieLoaderQuantSpecView {
+pub(crate) fn write_quant(spec: &QuantSpec) -> PieLoaderQuantSpecView {
     PieLoaderQuantSpecView {
         scheme: PieLoaderQuantScheme::from(spec.scheme) as u32,
         logical_dtype: PieLoaderDType::from(spec.logical_dtype) as u32,
@@ -542,16 +507,10 @@ pub(crate) fn write_quant<S: ShapeStore + ?Sized>(
         channel_axis: spec
             .channel_axis
             .map_or(PIE_LOADER_NO_AXIS, |axis| i32::from(axis.0)),
-        scale_dtype: write_opt_dtype(spec.scale_dtype),
-        zero_point_dtype: write_opt_dtype(spec.zero_point_dtype),
-        block_shape: store.store_shape(&spec.block_shape),
     }
 }
 
-pub(crate) fn write_encoding<S: ShapeStore + ?Sized>(
-    store: &mut S,
-    encoding: &Encoding,
-) -> PieLoaderEncodingSpec {
+pub(crate) fn write_encoding(encoding: &Encoding) -> PieLoaderEncodingSpec {
     let mut spec = PieLoaderEncodingSpec::default();
     match encoding {
         Encoding::Raw(dtype) => {
@@ -560,14 +519,8 @@ pub(crate) fn write_encoding<S: ShapeStore + ?Sized>(
         }
         Encoding::Quant(quant) => {
             spec.kind = PieLoaderEncodingKind::Quant as u32;
-            spec.quant = write_quant(store, quant);
+            spec.quant = write_quant(quant);
         }
     }
     spec
-}
-
-fn write_opt_dtype(dtype: Option<DType>) -> PieLoaderOptDType {
-    dtype.map_or(PIE_LOADER_NO_DTYPE, |dtype| {
-        PieLoaderDType::from(dtype) as PieLoaderOptDType
-    })
 }

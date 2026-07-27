@@ -34,7 +34,9 @@ pub const TILE_MAP_DECODE: u32 = 1 << 1;
 pub const TILE_MAP_ENCODE: u32 = 1 << 2;
 pub const TILE_MAP_TRANSCODE: u32 = 1 << 3;
 pub const TILE_MAP_REBLOCK: u32 = 1 << 4;
-pub const TILE_MAP_REORDER: u32 = 1 << 5;
+// 1 << 5 was `Reorder`, which no contract could reach and which the CUDA
+// transcode engine dispatched to `reblock_tile_map` anyway — one transform
+// under two names. The bit stays reserved so the numbering below it is stable.
 pub const TILE_MAP_REPACK: u32 = 1 << 6;
 
 /// Transform chains a backend can collapse into one kernel.
@@ -340,7 +342,6 @@ pub enum TileMapKind {
     Encode,
     Transcode,
     Reblock,
-    Reorder,
     Repack,
 }
 
@@ -352,7 +353,6 @@ impl TileMapKind {
             Self::Encode => TILE_MAP_ENCODE,
             Self::Transcode => TILE_MAP_TRANSCODE,
             Self::Reblock => TILE_MAP_REBLOCK,
-            Self::Reorder => TILE_MAP_REORDER,
             Self::Repack => TILE_MAP_REPACK,
         }
     }
@@ -443,10 +443,6 @@ pub enum StorageInstr {
         output: BufferId,
         view: DestExtent,
     },
-    Release {
-        id: InstrId,
-        buffer: BufferId,
-    },
     Finalize {
         id: InstrId,
         tensor: BufferId,
@@ -512,9 +508,6 @@ mod tests {
             bits_per_element: 0,
             group_size,
             channel_axis: Some(Axis(0)),
-            scale_dtype: Some(DType::U8),
-            zero_point_dtype: None,
-            block_shape: Vec::new(),
         })
     }
 

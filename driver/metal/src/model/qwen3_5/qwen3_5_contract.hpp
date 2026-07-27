@@ -65,13 +65,6 @@ inline bool is_raw(const PieLoaderEncodingSpec& e, PieLoaderDType dtype) {
            static_cast<PieLoaderDType>(e.dtype) == dtype;
 }
 
-/// The dtype a consumer sees, whatever the storage format is.
-inline PieLoaderDType logical_dtype(const PieLoaderEncodingSpec& e) {
-    return kind_of(e) == PieLoaderEncodingKind::Raw
-               ? static_cast<PieLoaderDType>(e.dtype)
-               : static_cast<PieLoaderDType>(e.quant.logical_dtype);
-}
-
 inline std::vector<std::int64_t> shape_of(const SourceTensor& raw) {
     return std::vector<std::int64_t>(raw.shape.begin(), raw.shape.end());
 }
@@ -150,10 +143,7 @@ inline void push_mlx_affine_u4(ModelContract& out, const SourceTensor& raw,
     quant.bits_per_element = 4;
     quant.group_size = group_size;
     quant.channel_axis = 1;
-    quant.scale_dtype = static_cast<std::uint32_t>(logical_dtype(scales.encoding));
-    quant.zero_point_dtype = static_cast<std::uint32_t>(logical_dtype(biases.encoding));
-    const PieLoaderEncodingSpec encoding =
-        pie_loader::quantized(out.with_block_shape(quant, {static_cast<std::int64_t>(group_size)}));
+    const PieLoaderEncodingSpec encoding = pie_loader::quantized(quant);
 
     out.define(std::move(output),
                out.bitcast(out.src(std::string(raw.name)), {rows, logical_cols}, encoding),

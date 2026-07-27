@@ -145,9 +145,6 @@ fn join_encoding(tensor: &PieLoaderTensorDeclView) -> crate::types::Encoding {
             bits_per_element: tensor.quant_bits_per_element,
             group_size: tensor.quant_group_size,
             channel_axis: None,
-            scale_dtype: None,
-            zero_point_dtype: None,
-            block_shape: Vec::new(),
         }),
         _ => crate::types::Encoding::Raw(tensor.dtype.into()),
     }

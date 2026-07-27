@@ -6,7 +6,7 @@
     "tp_size": 1,
     "max_tile_bytes": 67108864,
     "preferred_alignment": 256,
-    "tile_map_mask": 117,
+    "tile_map_mask": 85,
     "native_mxfp4_moe": false,
     "fusion_mask": 1,
     "encode_scratch_dtype": "BF16",

@@ -924,9 +924,6 @@ mod tests {
             bits_per_element: 8,
             group_size: 1,
             channel_axis: Some(Axis(0)),
-            scale_dtype: Some(DType::F32),
-            zero_point_dtype: None,
-            block_shape: Vec::new(),
         }
     }
 
@@ -1126,9 +1123,6 @@ mod tests {
             bits_per_element: 4,
             group_size: 32,
             channel_axis: Some(Axis(1)),
-            scale_dtype: Some(DType::U8),
-            zero_point_dtype: None,
-            block_shape: vec![32],
         };
         let err = check_one(Expr::src("w").quantize(mxfp4), &checkpoint).unwrap_err();
         assert!(err.to_string().contains("groups axis 1 by 32"));
@@ -1143,9 +1137,6 @@ mod tests {
             bits_per_element: 4,
             group_size: 32,
             channel_axis: Some(Axis(1)),
-            scale_dtype: Some(DType::U8),
-            zero_point_dtype: None,
-            block_shape: vec![32],
         };
         let quantized = Expr::src("w").quantize(mxfp4);
         // Aligned to the 32-element groups: fine.

@@ -87,7 +87,7 @@ fn storage_target(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "testkit"))]
 mod tests;
 
 /// The lowercase name a driver would recognize, for messages only.

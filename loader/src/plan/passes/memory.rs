@@ -38,13 +38,6 @@ pub(super) fn recompute_memory_plan(program: &mut LoadPlan) -> Result<usize> {
                     live_peak = live_peak.max(live_bytes);
                 }
             }
-            StorageInstr::Release { buffer, .. } => {
-                if live.remove(buffer) {
-                    live_bytes = live_bytes
-                        .checked_sub(buffer_bytes(program, *buffer)?)
-                        .ok_or_else(|| Error::Contract("live byte underflow".to_string()))?;
-                }
-            }
             StorageInstr::ExtentWrite { source, .. } => {
                 checkpoint_read_bytes = checkpoint_read_bytes
                     .checked_add(source.span_bytes)

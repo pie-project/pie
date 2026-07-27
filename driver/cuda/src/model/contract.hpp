@@ -145,9 +145,7 @@ inline bool same_encoding(const PieLoaderEncodingSpec& a, const PieLoaderEncodin
     return a.quant.scheme == b.quant.scheme && a.quant.logical_dtype == b.quant.logical_dtype &&
            a.quant.bits_per_element == b.quant.bits_per_element &&
            a.quant.group_size == b.quant.group_size &&
-           a.quant.channel_axis == b.quant.channel_axis &&
-           a.quant.scale_dtype == b.quant.scale_dtype &&
-           a.quant.zero_point_dtype == b.quant.zero_point_dtype;
+           a.quant.channel_axis == b.quant.channel_axis;
 }
 
 inline std::uint8_t default_bits(PieLoaderQuantScheme scheme) {
@@ -324,10 +322,9 @@ inline PieLoaderEncodingSpec mxfp4_encoding(ModelContract& contract, std::uint8_
     quant.bits_per_element = 4;
     quant.group_size = 32;
     quant.channel_axis = channel_axis;
-    quant.scale_dtype = static_cast<std::uint32_t>(PieLoaderDType::U8);
-    // One MXFP4 block scale covers 32 contiguous elements along K. The block
-    // shape says so; the contract owns the number because the POD only borrows.
-    return pie_loader::quantized(contract.with_block_shape(quant, {32}));
+    // One MXFP4 block scale covers 32 contiguous elements along K, which
+    // `group_size` above already says.
+    return pie_loader::quantized(quant);
 }
 
 inline PieLoaderRepackSpecView repack_spec(PieLoaderRepackLayout layout, PieLoaderRowMap row_map) {
@@ -920,14 +917,12 @@ private:
                 quant.bits_per_element = 8;
                 quant.group_size = 1;
                 quant.channel_axis = 0;
-                quant.scale_dtype = static_cast<std::uint32_t>(PieLoaderDType::F32);
                 break;
             case PieLoaderQuantScheme::Int8Symmetric:
                 quant = pie_loader::quant_spec(scheme, PieLoaderDType::I8);
                 quant.bits_per_element = 8;
                 quant.group_size = 1;
                 quant.channel_axis = 0;
-                quant.scale_dtype = static_cast<std::uint32_t>(PieLoaderDType::F32);
                 break;
             case PieLoaderQuantScheme::Mxfp4E2M1E8M0:
                 // The K dimension (columns, for a 2-D weight) must be a
@@ -941,8 +936,6 @@ private:
                 quant.bits_per_element = 4;
                 quant.group_size = 32;
                 quant.channel_axis = 1;
-                quant.scale_dtype = static_cast<std::uint32_t>(PieLoaderDType::U8);
-                quant = contract_.with_block_shape(quant, {32});
                 break;
             default:
                 fail("unsupported runtime_quant scheme");

@@ -190,9 +190,6 @@ impl HostExecutor<'_> {
                     self.buffers
                         .insert(output, BufferLoc::View { input, offset, len });
                 }
-                StorageInstr::Release { buffer, .. } => {
-                    self.buffers.remove(&buffer);
-                }
                 StorageInstr::Finalize { tensor, name, .. } => {
                     let bytes = self.buffer_bytes(tensor)?.to_vec();
                     if self
@@ -731,7 +728,6 @@ fn instr_id(instr: &StorageInstr) -> crate::types::InstrId {
         | StorageInstr::SlabScatter { id, .. }
         | StorageInstr::TileMap { id, .. }
         | StorageInstr::CreateView { id, .. }
-        | StorageInstr::Release { id, .. }
         | StorageInstr::Finalize { id, .. } => *id,
     }
 }
@@ -998,7 +994,7 @@ mod tests {
     #[test]
     fn rejects_unsupported_advertised_transforms() {
         let (dir, mut plan) = fixture();
-        plan.target.tile_map_mask |= crate::plan::TILE_MAP_REORDER;
+        plan.target.tile_map_mask |= crate::plan::TILE_MAP_TRANSCODE;
         let error = execute_plan(&plan, &dir).unwrap_err().to_string();
         assert!(error.contains("unsupported TileMap transforms"));
         std::fs::remove_dir_all(dir).ok();

@@ -101,9 +101,6 @@ fn metal_qwen35_schema_emits_canonical_affine_u4_arena() {
                 bits_per_element: 4,
                 group_size,
                 channel_axis: Some(Axis(1)),
-                scale_dtype: Some(DType::BF16),
-                zero_point_dtype: Some(DType::BF16),
-                block_shape: vec![i64::from(group_size)],
             }
             .normalized(),
         )
@@ -910,9 +907,6 @@ fn quant(scheme: QuantScheme, dtype: DType) -> QuantSpec {
         bits_per_element: scheme.default_bits(),
         group_size: scheme.default_group_size(),
         channel_axis: None,
-        scale_dtype: Some(DType::F32),
-        zero_point_dtype: None,
-        block_shape: Vec::new(),
     }
 }
 
@@ -1242,7 +1236,6 @@ fn instr_id(instr: &StorageInstr) -> pie_loader::types::InstrId {
         | StorageInstr::SlabScatter { id, .. }
         | StorageInstr::TileMap { id, .. }
         | StorageInstr::CreateView { id, .. }
-        | StorageInstr::Release { id, .. }
         | StorageInstr::Finalize { id, .. } => *id,
     }
 }

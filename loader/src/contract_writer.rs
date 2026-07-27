@@ -16,13 +16,12 @@
 
 use crate::contract::{Expr, ModelContract};
 use crate::ffi::contract::{
-    PieLoaderEncodingSpec, PieLoaderExprKind, PieLoaderExprNode, PieLoaderExprNodeSlice,
-    PieLoaderModelContractView, PieLoaderQuantSpecView, PieLoaderRepackSpecView,
-    PieLoaderTensorContractSlice, PieLoaderTensorContractView, ShapeStore, write_encoding,
-    write_quant,
+    PieLoaderExprKind, PieLoaderExprNode, PieLoaderExprNodeSlice, PieLoaderModelContractView,
+    PieLoaderRepackSpecView, PieLoaderTensorContractSlice, PieLoaderTensorContractView,
+    write_encoding, write_quant,
 };
 use crate::ffi::types::*;
-use crate::types::{Encoding, QuantSpec, RepackSpec};
+use crate::types::RepackSpec;
 
 /// A contract flattened into the POD form, with its backing storage.
 ///
@@ -162,37 +161,23 @@ impl OwnedContract {
                 node.src = src;
                 node.repack = write_repack(spec);
                 node.out_shape = self.shape(&out.shape);
-                node.out_encoding = self.write_encoding(&out.encoding);
+                node.out_encoding = write_encoding(&out.encoding);
             }
             Expr::Quantize { src, spec } => {
                 let src = self.write_expr(src);
                 node.kind = PieLoaderExprKind::Quantize as u32;
                 node.src = src;
-                node.quant = self.write_quant(spec);
+                node.quant = write_quant(spec);
             }
             Expr::Bitcast { src, out } => {
                 let src = self.write_expr(src);
                 node.kind = PieLoaderExprKind::Bitcast as u32;
                 node.src = src;
                 node.out_shape = self.shape(&out.shape);
-                node.out_encoding = self.write_encoding(&out.encoding);
+                node.out_encoding = write_encoding(&out.encoding);
             }
         }
         self.push(node)
-    }
-
-    fn write_quant(&mut self, spec: &QuantSpec) -> PieLoaderQuantSpecView {
-        write_quant(self, spec)
-    }
-
-    fn write_encoding(&mut self, encoding: &Encoding) -> PieLoaderEncodingSpec {
-        write_encoding(self, encoding)
-    }
-}
-
-impl ShapeStore for OwnedContract {
-    fn store_shape(&mut self, values: &[i64]) -> PieLoaderI64Slice {
-        self.shape(values)
     }
 }
 
@@ -234,7 +219,7 @@ pub fn write_contract(contract: &ModelContract) -> OwnedContract {
             Some(shape) => owned.shape(shape),
             None => PieLoaderI64Slice::default(),
         };
-        let encoding = owned.write_encoding(&tensor.encoding);
+        let encoding = write_encoding(&tensor.encoding);
         owned.tensors.push(PieLoaderTensorContractView {
             name,
             root,

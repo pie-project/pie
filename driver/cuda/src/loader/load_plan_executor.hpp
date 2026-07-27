@@ -134,10 +134,6 @@ public:
                 copy_engine_.flush();
                 create_view(plan, instr);
                 break;
-            case pie_loader::PieLoaderStorageInstrKind::Release:
-                copy_engine_.flush();
-                buffers_.erase(instr.buffer_id);
-                break;
             }
         }
         copy_engine_.flush();
