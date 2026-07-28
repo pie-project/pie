@@ -684,46 +684,52 @@ impl<'a> Converter<'a> {
         // any order while `required` is still enforced. The cost is one rule
         // per subset, so it is affordable exactly while the required set is
         // small - which, in practice, is nearly always.
-        if min <= required.len() as u32
+        if self.options.precision.exact()
+            && min <= required.len() as u32
             && max.is_none()
-            && self.options.precision.unordered()
             && let Some(object) = self.build_unordered(hint, &known, &additional_pair)?
         {
             return Ok(object);
         }
+        // This object alone widens; the rest of the schema stays exact. The
+        // fallback is deliberately local, because the alternative - refusing
+        // the schema so the search retries it at a coarser level - relaxes
+        // every other object too, and those did fit.
+        Ok(self.relaxed_object(&known, additional_pair))
+    }
 
-        let content = if known.iter().all(|property| property.required) {
-            let mut sequence = intersperse_properties(
-                known.iter().map(|property| property.pair.clone()).collect(),
-                self.ws(),
-            );
-            let tail = additional_tail(known.len() as u32, min, max, additional_pair, self.ws())?
-                .ok_or_else(|| anyhow!("object property constraints are unsatisfiable"))?;
-            if tail != Expr::Empty {
-                sequence.push(tail);
-            }
-            seq(sequence)
+    /// The shape of an object without any of its counting constraints.
+    ///
+    /// Any declared pair, or an additional one where the schema allows it, in
+    /// any order and any number of times. `required`, `minProperties` and
+    /// `maxProperties` are not enforced - they are exactly the keywords that
+    /// need a tally in the parser state, and a tally is what the exact
+    /// lowering could not afford here.
+    ///
+    /// This is a superset of the schema, so a caller that needs those three
+    /// keywords must check the finished document. It is never a subset, which
+    /// is the property that matters: the model can still produce every
+    /// document the schema allows.
+    fn relaxed_object(&mut self, known: &[Property], additional: Option<Expr>) -> Expr {
+        let mut alternatives: Vec<Expr> =
+            known.iter().map(|property| property.pair.clone()).collect();
+        if let Some(additional) = additional {
+            alternatives.push(additional);
+        }
+        let body = if alternatives.is_empty() {
+            Expr::Empty
         } else {
-            // Never enumerate subsets of the optional properties. That is
-            // exponential in their number and, worse, copies every property's
-            // value grammar into every subset, so a schema with eight optional
-            // properties duplicates each value 256 times. The state
-            // construction shares them behind one rule per (index, count).
-            self.build_property_state(
-                hint,
-                &known,
-                0,
-                0,
-                min,
-                max,
-                additional_pair,
-                self.ws(),
-                &mut HashMap::new(),
-            )?
-            .ok_or_else(|| anyhow!("object property constraints are unsatisfiable"))?
+            let pair = if alternatives.len() == 1 {
+                alternatives.pop().expect("one alternative")
+            } else {
+                Expr::Choice(alternatives)
+            };
+            optional(seq(vec![
+                pair.clone(),
+                seq(vec![lit(","), self.ws(), pair]).repeat(0, None),
+            ]))
         };
-
-        Ok(seq(vec![lit("{"), self.ws(), content, lit("}")]))
+        seq(vec![lit("{"), self.ws(), body, lit("}")])
     }
 
     /// Objects whose properties may arrive in any order.
@@ -833,84 +839,6 @@ impl<'a> Converter<'a> {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn build_property_state(
-        &mut self,
-        hint: &str,
-        properties: &[Property],
-        index: usize,
-        emitted: u32,
-        min: u32,
-        max: Option<u32>,
-        additional: Option<Expr>,
-        ws: Expr,
-        memo: &mut HashMap<(usize, u32), Option<Expr>>,
-    ) -> Result<Option<Expr>> {
-        if max.is_some_and(|max| emitted > max) {
-            return Ok(None);
-        }
-        if let Some(cached) = memo.get(&(index, emitted)) {
-            return Ok(cached.clone());
-        }
-        if index == properties.len() {
-            let tail = additional_tail(emitted, min, max, additional, ws)?;
-            memo.insert((index, emitted), tail.clone());
-            return Ok(tail);
-        }
-
-        let mut alternatives = Vec::new();
-        if !properties[index].required {
-            if let Some(rest) = self.build_property_state(
-                hint,
-                properties,
-                index + 1,
-                emitted,
-                min,
-                max,
-                additional.clone(),
-                ws.clone(),
-                memo,
-            )? {
-                alternatives.push(rest);
-            }
-        }
-        if max.is_none_or(|max| emitted < max) {
-            let next_emitted = if min == 0 && max.is_none() {
-                1
-            } else {
-                emitted + 1
-            };
-            if let Some(rest) = self.build_property_state(
-                hint,
-                properties,
-                index + 1,
-                next_emitted,
-                min,
-                max,
-                additional,
-                ws.clone(),
-                memo,
-            )? {
-                let property = if emitted == 0 {
-                    properties[index].pair.clone()
-                } else {
-                    seq(vec![lit(","), ws, properties[index].pair.clone()])
-                };
-                alternatives.push(seq(vec![property, rest]));
-            }
-        }
-
-        let result = if alternatives.is_empty() {
-            None
-        } else {
-            let name = self.fresh_name(&format!("{}_properties_{}_{}", hint, index, emitted));
-            self.define_named(name.clone(), Expr::choice(alternatives))?;
-            Some(Expr::RuleRef(name))
-        };
-        memo.insert((index, emitted), result.clone());
-        Ok(result)
-    }
-
     fn define_named(&mut self, name: String, body: Expr) -> Result<()> {
         if !self.names.insert(name.clone()) {
             bail!("duplicate generated rule '{}'", name);
@@ -1003,17 +931,6 @@ fn separated_items(item: Expr, min: u32, max: Option<u32>, ws: Expr) -> Expr {
     } else {
         sequence
     }
-}
-
-fn intersperse_properties(properties: Vec<Expr>, ws: Expr) -> Vec<Expr> {
-    let mut result = Vec::new();
-    for (index, property) in properties.into_iter().enumerate() {
-        if index > 0 {
-            result.extend([lit(","), ws.clone()]);
-        }
-        result.push(property);
-    }
-    result
 }
 
 /// The shortest and longest strings an expression matches, in bytes.

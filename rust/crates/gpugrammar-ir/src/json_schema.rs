@@ -38,23 +38,25 @@ pub struct JsonSchemaOptions {
     pub precision: Precision,
 }
 
-/// Which lowering strategy to use, most faithful first.
+/// How much the lowering may widen, least first.
 ///
-/// The levels are ordered by the language they describe, largest first. A
-/// schema may fail to compile at one level and succeed at the next, so the
-/// pipeline walks them in order and keeps the first that builds tables. No
-/// level ever describes *less* than the schema allows, which is what a mask
-/// needs: a token the schema permits is never masked away.
+/// One axis, and every step along it describes a *larger* language than the
+/// last. That direction is the contract rather than a preference: a mask that
+/// admits too much leaves a document for a checker to reject, while a mask
+/// that admits too little makes a valid document ungeneratable and nothing
+/// downstream can repair it.
+///
+/// This used to be a chain that mixed two axes - whether objects accept their
+/// properties in any order, and how far branches may be merged - and the first
+/// of those runs the wrong way. `Ordered` bought a smaller lexer by refusing
+/// permutations of valid documents, which is exactly the failure the contract
+/// forbids, so it is gone. Objects are unordered at every level now.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 pub enum Precision {
-    /// Objects whose properties are all optional accept them in any order,
-    /// which is what JSON Schema means. Costs lexer states, because every
-    /// property name is live at once.
-    Unordered,
-    /// Properties must appear in the order the schema declares them. Smaller
-    /// lexer, but rejects permutations of valid documents. This is also what
-    /// XGrammar does.
-    Ordered,
+    /// The schema as written: objects accept their properties in any order,
+    /// which is what JSON Schema means, and branches stay separate. Costs
+    /// lexer states, because every property name is live at once.
+    Exact,
     /// `oneOf` branches that all describe objects collapse into one object:
     /// every property any branch names, required only where every branch
     /// requires it. Accepts documents that satisfy no branch exactly, which is
@@ -70,19 +72,22 @@ pub enum Precision {
 
 impl Precision {
     /// Most faithful first.
-    pub const LEVELS: [Precision; 4] = [
-        Precision::Unordered,
-        Precision::Ordered,
+    pub const LEVELS: [Precision; 3] = [
+        Precision::Exact,
         Precision::Merged,
         Precision::Branches,
     ];
 
     /// May objects put their properties in any order?
-    pub fn unordered(self) -> bool {
-        self == Precision::Unordered
+    /// Do `anyOf` branches inherit their sibling keywords?
+    /// Whether objects must enforce `required`, `minProperties` and
+    /// `maxProperties`. Only the first level does; the rest drop them and say
+    /// so, because those are the keywords that need a tally in the parser
+    /// state and a tally is what does not fit.
+    pub fn exact(self) -> bool {
+        self == Precision::Exact
     }
 
-    /// Do `anyOf` branches inherit their sibling keywords?
     pub fn merges_branches(self) -> bool {
         self != Precision::Branches
     }
@@ -98,7 +103,7 @@ impl Default for JsonSchemaOptions {
         Self {
             any_whitespace: true,
             strict_mode: false,
-            precision: Precision::Unordered,
+            precision: Precision::Exact,
         }
     }
 }
