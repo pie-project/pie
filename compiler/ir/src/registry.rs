@@ -9,48 +9,22 @@ use alloc::vec::Vec;
 use super::op::IntrinsicId;
 use crate::types::DType;
 
-/// Attachment stage of a traced program (overview §5.3). Wire tags stable.
-/// Boundary stages run once per pass; the anatomical taps run once per layer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[repr(u8)]
-pub enum Stage {
-    /// Before any KV read — weight swap, pass-wide config sinks.
-    Prologue = 0,
-    /// Per layer, before attention (query in scope).
-    OnAttnProj = 1,
-    /// Per layer, after attention.
-    OnAttn = 2,
-    /// After the forward — sampling programs.
-    Epilogue = 3,
+crate::declare_tagged_enum! {
+    /// Attachment stage of a traced program (overview §5.3). Wire tags stable.
+    /// Boundary stages run once per pass; the anatomical taps run once per layer.
+    pub enum Stage {
+        /// Before any KV read — weight swap, pass-wide config sinks.
+        Prologue = 0, "prologue";
+        /// Per layer, before attention (query in scope).
+        OnAttnProj = 1, "on_attn_proj";
+        /// Per layer, after attention.
+        OnAttn = 2, "on_attn";
+        /// After the forward — sampling programs.
+        Epilogue = 3, "epilogue";
+    }
 }
 
 impl Stage {
-    /// Every stage, in wire-tag order. The generated C header and any other
-    /// enumeration of stages derives from this rather than re-listing them.
-    pub const ALL: &'static [Stage] = &[
-        Stage::Prologue,
-        Stage::OnAttnProj,
-        Stage::OnAttn,
-        Stage::Epilogue,
-    ];
-
-    pub fn from_u8(v: u8) -> Option<Self> {
-        Some(match v {
-            0 => Stage::Prologue,
-            1 => Stage::OnAttnProj,
-            2 => Stage::OnAttn,
-            3 => Stage::Epilogue,
-            _ => return None,
-        })
-    }
-    pub fn name(self) -> &'static str {
-        match self {
-            Stage::Prologue => "prologue",
-            Stage::OnAttnProj => "on_attn_proj",
-            Stage::OnAttn => "on_attn",
-            Stage::Epilogue => "epilogue",
-        }
-    }
     /// True for the per-layer anatomical taps.
     pub fn per_layer(self) -> bool {
         matches!(self, Stage::OnAttnProj | Stage::OnAttn)
@@ -102,69 +76,26 @@ impl Phase {
     ];
 }
 
-/// Descriptor ports (overview §5.1): the forward's ragged-tensor families.
-/// Consumption discipline is fixed per port: the token family **takes**
-/// (a token is spent by the pass that embeds it), geometry and masks **read**
-/// (state, not a message).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[repr(u8)]
-pub enum Port {
-    EmbedTokens = 0,
-    EmbedIndptr = 1,
-    Positions = 2,
-    Pages = 3,
-    PageIndptr = 4,
-    KvLen = 5,
-    WSlot = 6,
-    WOff = 7,
-    Readout = 8,
-    AttnMask = 9,
+crate::declare_tagged_enum! {
+    /// Descriptor ports (overview §5.1): the forward's ragged-tensor families.
+    /// Consumption discipline is fixed per port: the token family **takes**
+    /// (a token is spent by the pass that embeds it), geometry and masks **read**
+    /// (state, not a message).
+    pub enum Port {
+        EmbedTokens = 0, "embed_tokens";
+        EmbedIndptr = 1, "embed_indptr";
+        Positions = 2, "positions";
+        Pages = 3, "pages";
+        PageIndptr = 4, "page_indptr";
+        KvLen = 5, "kv_len";
+        WSlot = 6, "w_slot";
+        WOff = 7, "w_off";
+        Readout = 8, "readout";
+        AttnMask = 9, "attn_mask";
+    }
 }
 
 impl Port {
-    /// Every descriptor port, in wire-tag order. See [`Stage::ALL`].
-    pub const ALL: &'static [Port] = &[
-        Port::EmbedTokens,
-        Port::EmbedIndptr,
-        Port::Positions,
-        Port::Pages,
-        Port::PageIndptr,
-        Port::KvLen,
-        Port::WSlot,
-        Port::WOff,
-        Port::Readout,
-        Port::AttnMask,
-    ];
-
-    pub fn from_u8(v: u8) -> Option<Self> {
-        Some(match v {
-            0 => Port::EmbedTokens,
-            1 => Port::EmbedIndptr,
-            2 => Port::Positions,
-            3 => Port::Pages,
-            4 => Port::PageIndptr,
-            5 => Port::KvLen,
-            6 => Port::WSlot,
-            7 => Port::WOff,
-            8 => Port::Readout,
-            9 => Port::AttnMask,
-            _ => return None,
-        })
-    }
-    pub fn name(self) -> &'static str {
-        match self {
-            Port::EmbedTokens => "embed_tokens",
-            Port::EmbedIndptr => "embed_indptr",
-            Port::Positions => "positions",
-            Port::Pages => "pages",
-            Port::PageIndptr => "page_indptr",
-            Port::KvLen => "kv_len",
-            Port::WSlot => "w_slot",
-            Port::WOff => "w_off",
-            Port::Readout => "readout",
-            Port::AttnMask => "attn_mask",
-        }
-    }
     /// True iff a channel bound to this port is **consumed** (take) by the
     /// pass; false = peeked (read). §5.1: the token-indexed family (embed,
     /// positions, `w_slot`/`w_off`) consumes — a token is spent by the pass

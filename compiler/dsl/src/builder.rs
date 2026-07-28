@@ -290,12 +290,7 @@ impl<'a> Builder<'a> {
 
         // Trace stages in canonical stage order (byte-stable container.stages).
         let mut results = Vec::new();
-        for stage in [
-            Stage::Prologue,
-            Stage::OnAttnProj,
-            Stage::OnAttn,
-            Stage::Epilogue,
-        ] {
+        for &stage in Stage::ALL {
             let Some((_, body)) = self.stages.iter().find(|(s, _)| *s == stage) else {
                 continue;
             };

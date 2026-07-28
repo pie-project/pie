@@ -13,6 +13,7 @@ use pie_ir::container::DT_ACT;
 use pie_ir::op::{IntrinsicId, OP_TABLE, VARIADIC};
 use pie_ir::registry::{KNOWN_SINKS, PHASE_DESCRIPTOR_TAG, Port, Stage};
 use pie_ir::types::DType;
+use pie_plan::{LibraryOp, ScheduleTemplate, SymbolicExtent};
 
 /// Render `include/ptir_abi.h`. Pure function of the tables — byte-stable.
 pub fn generate_c_header() -> String {
@@ -37,31 +38,33 @@ pub fn generate_c_header() -> String {
         pie_plan::REGION_PLAN_VERSION,
         pie_plan::LANE_TABLE_ABI_VERSION
     ));
-    s.push_str(
-        "enum PtirSymbolicExtent : uint8_t {\n\
-  PTIR_EXTENT_KV_LEN = 0,\n\
-  PTIR_EXTENT_PAGE_COUNT = 1,\n\
-  PTIR_EXTENT_ROW_COUNT = 2,\n\
-  PTIR_EXTENT_TOKEN_COUNT = 3,\n\
-  PTIR_EXTENT_SAMPLED_ROWS = 4,\n\
-  PTIR_EXTENT_QUERY_LEN = 5,\n\
-  PTIR_EXTENT_KEY_LEN = 6,\n\
-};\n\n\
-enum PtirScheduleTemplate : uint8_t {\n\
-  PTIR_SCHEDULE_EFFECTS = 0,\n\
-  PTIR_SCHEDULE_ONE_CTA_PER_ROW = 1,\n\
-  PTIR_SCHEDULE_HIERARCHICAL_ROW = 2,\n\
-  PTIR_SCHEDULE_LIBRARY = 3,\n\
-};\n\n\
-enum PtirLibraryOp : uint8_t {\n\
-  PTIR_LIBRARY_NUCLEUS_SAMPLE = 0,\n\
-  PTIR_LIBRARY_TOP_K = 1,\n\
-  PTIR_LIBRARY_SORT = 2,\n\
-  PTIR_LIBRARY_SCAN = 3,\n\
-  PTIR_LIBRARY_MATMUL = 4,\n\
-  PTIR_LIBRARY_SECOND_PARTY = 5,\n\
-};\n\n",
-    );
+    s.push_str("enum PtirSymbolicExtent : uint8_t {\n");
+    for extent in SymbolicExtent::ALL {
+        s.push_str(&format!(
+            "  PTIR_EXTENT_{} = {},\n",
+            extent.name().to_uppercase(),
+            *extent as u8
+        ));
+    }
+    s.push_str("};\n\n");
+    s.push_str("enum PtirScheduleTemplate : uint8_t {\n");
+    for schedule in ScheduleTemplate::ALL {
+        s.push_str(&format!(
+            "  PTIR_SCHEDULE_{} = {},\n",
+            schedule.name().to_uppercase(),
+            *schedule as u8
+        ));
+    }
+    s.push_str("};\n\n");
+    s.push_str("enum PtirLibraryOp : uint8_t {\n");
+    for library in LibraryOp::ALL {
+        s.push_str(&format!(
+            "  PTIR_LIBRARY_{} = {},\n",
+            library.name().to_uppercase(),
+            *library as u8
+        ));
+    }
+    s.push_str("};\n\n");
 
     // The lane table is the host/kernel ABI; its field list lives in
     // `crate::layout` so this header, the MSL preambles and the `pie-plan`

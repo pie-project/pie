@@ -51,6 +51,7 @@ pub mod op;
 pub mod read;
 pub mod registry;
 pub mod rng;
+pub mod tagged;
 pub mod types;
 pub mod validate;
 

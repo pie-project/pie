@@ -13,37 +13,20 @@ use pie_ir::registry::Port;
 use pie_ir::types::{DType, Shape, ValueType};
 use pie_ir::validate::BoundTrace;
 
-/// Runtime-varying dimensions represented symbolically in compiler types.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[repr(u8)]
-pub enum SymbolicExtent {
-    KvLen = 0,
-    PageCount = 1,
-    RowCount = 2,
-    TokenCount = 3,
-    SampledRows = 4,
-    QueryLen = 5,
-    KeyLen = 6,
-}
-
-impl SymbolicExtent {
-    /// Every extent, indexed by its own wire byte. The discriminants are the
-    /// wire encoding, so this is the whole of that encoding in one place —
-    /// `pie_codegen::launch` bounds the grouped path by its length and
-    /// [`from_wire`](Self::from_wire) is how the container reads one back.
-    pub const ALL: &'static [Self] = &[
-        Self::KvLen,
-        Self::PageCount,
-        Self::RowCount,
-        Self::TokenCount,
-        Self::SampledRows,
-        Self::QueryLen,
-        Self::KeyLen,
-    ];
-
-    /// The extent a wire byte names, or `None` if the byte names none.
-    pub fn from_wire(byte: u8) -> Option<Self> {
-        Self::ALL.get(usize::from(byte)).copied()
+pie_ir::declare_tagged_enum! {
+    /// Runtime-varying dimensions represented symbolically in compiler types.
+    ///
+    /// The discriminants are the wire encoding, and `ALL` is the whole of it in
+    /// one place: `pie_codegen::launch` bounds the grouped path by its length,
+    /// and the C header enumerates it as `PtirSymbolicExtent`.
+    pub enum SymbolicExtent {
+        KvLen = 0, "kv_len";
+        PageCount = 1, "page_count";
+        RowCount = 2, "row_count";
+        TokenCount = 3, "token_count";
+        SampledRows = 4, "sampled_rows";
+        QueryLen = 5, "query_len";
+        KeyLen = 6, "key_len";
     }
 }
 

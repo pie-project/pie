@@ -24,7 +24,24 @@ const REASON_PREFIX: &str = "#   reason: ";
 /// lists two cases where it emitted a kernel that read the wrong buffer. So a
 /// mismatch during a rewrite is a question, not an answer, and blessing it is a
 /// claim that has to be written down.
+///
+/// A regeneration that produces the bytes already on disk is not a rewrite and
+/// is left alone. The thing worth guarding is evidence being *discarded*, not
+/// the command being run: stamping a file whose body still matches the oracle
+/// would retract a true provenance claim for nothing. That is not hypothetical
+/// either — `golden-stage-identity.txt` was stamped by a regeneration that
+/// changed none of its 21 values.
 pub fn regenerate_foreign(path: &Path, header: &str, body: &str) {
+    if let Ok(existing) = std::fs::read_to_string(path) {
+        let recorded: String = existing
+            .lines()
+            .skip_while(|line| line.starts_with('#'))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        if recorded == body {
+            return;
+        }
+    }
     let reason = std::env::var("PTIR_REGEN_REASON").unwrap_or_default();
     let reason = reason.trim();
     assert!(

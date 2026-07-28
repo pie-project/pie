@@ -15,24 +15,31 @@ use pie_ir::types::{DType, Literal, Predicate, RngKind, ValueId};
 use super::normalize::{NodeIndex, NormalizedStage, result_layout};
 use super::symbolic::{Dimension, symbolic_dims_match_expected, symbolic_shape_matches_static};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum ScheduleTemplate {
-    Effects = 0,
-    OneCtaPerRow = 1,
-    HierarchicalRow = 2,
-    Library = 3,
+pie_ir::declare_tagged_enum! {
+    /// How a region is scheduled on a device.
+    ///
+    /// Enumerated into the C header as `PtirScheduleTemplate`.
+    pub enum ScheduleTemplate {
+        Effects = 0, "effects";
+        OneCtaPerRow = 1, "one_cta_per_row";
+        HierarchicalRow = 2, "hierarchical_row";
+        Library = 3, "library";
+    }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum LibraryOp {
-    NucleusSample = 0,
-    TopK = 1,
-    Sort = 2,
-    Scan = 3,
-    MatMul = 4,
-    SecondParty = 5,
+pie_ir::declare_tagged_enum! {
+    /// A region a backend implements with a library kernel rather than
+    /// generated code.
+    ///
+    /// Enumerated into the C header as `PtirLibraryOp`.
+    pub enum LibraryOp {
+        NucleusSample = 0, "nucleus_sample";
+        TopK = 1, "top_k";
+        Sort = 2, "sort";
+        Scan = 3, "scan";
+        MatMul = 4, "matmul";
+        SecondParty = 5, "second_party";
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -315,7 +315,10 @@ fn grouped_library(stage: &CompiledStage, region: &Region) -> Option<LibraryOp> 
             let op = stage.normalized.ops.get(node)?;
             (crate::op_view::OpView::of(op).tag == tags::TOP_K).then_some(LibraryOp::TopK)
         }
-        _ => None,
+        // Listed rather than caught by `_`: a new library op has no grouped
+        // kernel until someone writes one, and it should be this match that
+        // says so.
+        LibraryOp::Sort | LibraryOp::Scan | LibraryOp::MatMul | LibraryOp::SecondParty => None,
     }
 }
 

@@ -1,7 +1,5 @@
 # GENERATED from driver/cuda/src/pipeline/program_identity.hpp
 # <golden>#<stage_index> <compiled_stage_identity as hex>
-# REGENERATED: the body below is this compiler's output, not the recorded output of the source of truth above
-#   reason: reshape elision now recognises a prefix view, so the sampler's vocabulary-wide reshape and its logits gather both fuse away
 beam_epilogue#0 6fa999699fa1e06c
 counter_pingpong#0 78e8dae4d9926e8a
 dfa_ingraph#0 8414a1281165a6c6
