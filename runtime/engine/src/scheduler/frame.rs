@@ -131,6 +131,24 @@ fn cold_hold() -> Duration {
 /// epoch — an unresponsive lane leaves only through close/terminate.
 const STRICT_WATCHDOG_US: u64 = 1_000_000;
 
+/// How long a blocked gather waits before looking again. This is NOT the
+/// watchdog above: that one is a *reporting* cadence, and using it as the hold
+/// as well meant a boundary that was one lane short went back to sleep for as
+/// long as the worker's 250ms backstop allowed, with the GPU idle the whole
+/// time, even though the missing lane submitted microseconds later. Separating
+/// the two is worth 2x on a sixteen-request fleet (206 -> 422 tok/s).
+const GATHER_POLL_US: u64 = 500;
+
+fn gather_poll_us() -> u64 {
+    static US: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *US.get_or_init(|| {
+        std::env::var("PIE_GATHER_POLL_US")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(GATHER_POLL_US)
+    })
+}
+
 /// Grace period before a gather blocked EXCLUSIVELY on empty lanes whose
 /// owners hold an in-flight bind releases them (see the `missing` predicate
 /// in [`FramePolicy::plan_dispatch`]). Only consulted in escape mode 2.
@@ -1098,7 +1116,11 @@ impl FramePolicy {
                     }));
                     stalled = true;
                 }
-                let plan = FramePlan::Hold(deadline.saturating_duration_since(now));
+                let plan = FramePlan::Hold(
+                    deadline
+                        .saturating_duration_since(now)
+                        .min(Duration::from_micros(gather_poll_us())),
+                );
                 if stalled && crate::planner::trace_enabled() {
                     println!("[frame-stall] {}", self.debug_summary());
                 }
