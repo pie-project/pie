@@ -1037,6 +1037,28 @@ Their advance stays on the host either way, and at batch 512 it alone is 330 us
 against our whole step at 244: **1.35x, where before this it was 0.94x.** A
 perfect port of the half they could port would no longer be enough.
 
+**Where the step still is, and three ways of shrinking it that did not work
+(2026-07-28).** At batch 32 the fill enumerates 9,977 work items and admits
+**344 of them - 3.4%**. So 96.6% of the replay is spent discovering a refusal,
+which is the same shape as XGrammar's own finding that under 1% of the
+vocabulary is context-dependent. Three ways of exploiting that were measured
+before being built, and all three are too weak to pay for themselves:
+
+| idea | what it would remove | measured |
+|---|---|---|
+| precompute admission per (parser state, group) | all of it | **2.95 GB** of bitset on one schema |
+| refuse a group whose readings' first terminals have no action | the enumeration | 1.4-1.8x fewer items |
+| replay each *distinct* reading of a state once, not once per group | duplicated replays | 1.3-1.6x fewer replays |
+
+The second and third look much better in the aggregate than they are in place:
+readings are shared 2x to 22x across a whole grammar but barely at all within
+one lexer state, and most groups' first terminal is one the parser state does
+allow. Refusals happen deeper than either filter can see.
+
+So the replay is the work, and making it cheaper needs a table that does not
+fit rather than a better filter. That is the honest state of the remaining gap
+at small batch, and it is recorded rather than left as an intention.
+
 **Host contention (q21).** Weaker than expected and worth saying so. With
 twenty-four cores deliberately saturated, XGrammar's fill slows by 1.06x and
 ours by 1.01x; both engines' p99 degrades to about 3 ms, which is the operating
