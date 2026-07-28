@@ -528,6 +528,12 @@ struct PieLoaderSourceExtentView {
   uint64_t file_offset;
   uint64_t span_bytes;
   PieLoaderStridedExtentView stride;
+  /// The type these bytes are read as. Not necessarily
+  /// `PieLoaderPlan::sources[tensor_id].dtype`: a contract that reinterprets a
+  /// tensor with `Bitcast` — DeepSeek-V4's E8M0 block scales are stored as
+  /// `U8` — says so here, and an executor that consulted the source table
+  /// instead would undo the reinterpretation.
+  PieLoaderDType dtype;
 };
 
 struct PieLoaderDestExtentView {

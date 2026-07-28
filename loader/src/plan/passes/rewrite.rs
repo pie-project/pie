@@ -478,6 +478,7 @@ pub(super) fn extent_write_as_bulk(
                 .or_overflow("source offset overflow")?,
             span_bytes: source.span_bytes,
             stride: Extent::byte_run(source.span_bytes),
+            dtype: source.dtype,
         },
         dest_offset,
     }))

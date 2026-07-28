@@ -58,14 +58,21 @@ inline void dsv4_block_scales_to_fp32(ContractBuilder& b) {
             !contract_detail::is_raw(raw.encoding, PieLoaderDType::U8)) {
             continue;
         }
-        // Only a companion to an FP8 weight is an E8M0 exponent. A `.scale`
-        // beside anything else is some other convention, and guessing is how
-        // a scale tensor gets silently reinterpreted.
+        // Only a companion to a block-quantized weight is an E8M0 exponent. A
+        // `.scale` beside anything else is some other convention, and guessing
+        // is how a scale tensor gets silently reinterpreted.
+        //
+        // Both quantizations DeepSeek-V4 ships qualify: the dense and shared
+        // paths store F8E4M3 weights, and the routed experts store INT8. On
+        // `dsv4flash-mini` that is 50 scales and 144 respectively -- reading
+        // the guard as "FP8 only" leaves the experts' scales as raw bytes, and
+        // `make_block_fp8_quant` then throws on a scale that never became F32.
         const std::string weight =
             std::string(raw.name.substr(0, raw.name.size() - kSuffix.size())) + ".weight";
         const SourceTensor* companion = b.find(weight);
         if (companion == nullptr ||
-            !contract_detail::is_raw(companion->encoding, PieLoaderDType::F8E4M3)) {
+            !(contract_detail::is_raw(companion->encoding, PieLoaderDType::F8E4M3) ||
+              contract_detail::is_raw(companion->encoding, PieLoaderDType::I8))) {
             continue;
         }
         std::vector<std::int64_t> shape = contract_detail::shape_of(raw);

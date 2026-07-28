@@ -318,6 +318,7 @@ impl Builder<'_> {
                             file_offset: base + source.offset_bytes + rect.src_offset,
                             span_bytes: rect.bytes(),
                             stride: src_stride,
+                            dtype: source.encoding.dtype(),
                         },
                         dest: DestExtent {
                             buffer: out,
@@ -787,6 +788,7 @@ impl Builder<'_> {
             file_offset: raw.file_offset + source.offset_bytes,
             span_bytes,
             stride: source.stride.clone(),
+            dtype: source.encoding.dtype(),
         })
     }
 

@@ -215,6 +215,17 @@ pub enum Encoding {
     Quant(QuantSpec),
 }
 
+impl Encoding {
+    /// The type one element reads as. For a quantized encoding this is the
+    /// logical type the elements decode to, not their storage width.
+    pub fn dtype(&self) -> DType {
+        match self {
+            Encoding::Raw(dtype) => *dtype,
+            Encoding::Quant(spec) => spec.logical_dtype,
+        }
+    }
+}
+
 pub fn normalize_encoding(encoding: &Encoding) -> Encoding {
     match encoding {
         Encoding::Raw(dtype) => Encoding::Raw(*dtype),
@@ -233,10 +244,7 @@ pub struct TensorDecl {
 
 impl TensorDecl {
     pub fn dtype(&self) -> DType {
-        match &self.encoding {
-            Encoding::Raw(dtype) => *dtype,
-            Encoding::Quant(spec) => spec.logical_dtype,
-        }
+        self.encoding.dtype()
     }
 }
 

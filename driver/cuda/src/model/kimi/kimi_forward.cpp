@@ -401,6 +401,7 @@ KimiWorkspace KimiWorkspace::allocate(
     ws.y             = DeviceTensor::allocate(DType::BF16, {N, H});
     ws.norm_x        = DeviceTensor::allocate(DType::BF16, {N, H});
     ws.q_a           = DeviceTensor::allocate(DType::BF16, {N, q_lora});
+    ws.qkv_a         = DeviceTensor::allocate(DType::BF16, {N, q_lora + kv_lora + q_rope});
     ws.q_b           = DeviceTensor::allocate(DType::BF16, {N, local_heads * (q_nope + q_rope)});
     ws.q_nope        = DeviceTensor::allocate(DType::BF16, {N, local_heads * q_nope});
     ws.kv_a_mqa      = DeviceTensor::allocate(DType::BF16, {N, kv_lora + q_rope});
@@ -649,19 +650,27 @@ void kimi_forward_paged(
             act_dump_bf16(act_dump_layer_tag("norm_x", li).c_str(),
                 kimi_ws.norm_x.data(), total_tokens, H, stream);
 
+            // Where the kv half ends up, and its row pitch. The fused path
+            // leaves both halves interleaved per token in `qkv_a`; the split
+            // path writes a compact `kv_a_mqa`.
+            const void* kv_a_src = kimi_ws.kv_a_mqa.data();
+            int kv_a_row_stride = 0;
             if (Lw.q_kv_a_fused != nullptr) {
-                // Fused q_a + kv_a projection: one GEMM instead of two
+                // Fused q_a + kv_a projection: one GEMM instead of two. The
+                // result is row-major `[T, q_lora + kv_lora + q_rope]`, so the
+                // halves interleave per token and neither is a contiguous
+                // block of the buffer -- both consumers below take a pitch.
                 ops::gemm_act_x_w(cublas.handle(),
                     kimi_ws.norm_x.data(), *Lw.q_kv_a_fused,
-                    kimi_ws.q_a.data(), total_tokens, q_lora + kv_lora + q_rope, H);
-                // Split the fused output: q_a is first q_lora rows, kv_a is the rest
-                // q_a is already in place; copy kv_a part to kv_a_mqa buffer
-                CUDA_CHECK(cudaMemcpyAsync(
-                    kimi_ws.kv_a_mqa.data(),
-                    static_cast<const char*>(kimi_ws.q_a.data()) +
-                        static_cast<std::size_t>(total_tokens) * q_lora * sizeof(std::uint16_t),
-                    static_cast<std::size_t>(total_tokens) * (kv_lora + q_rope) * sizeof(std::uint16_t),
-                    cudaMemcpyDeviceToDevice, stream));
+                    kimi_ws.qkv_a.data(), total_tokens, q_lora + kv_lora + q_rope, H);
+                kv_a_src = static_cast<const char*>(kimi_ws.qkv_a.data()) +
+                    static_cast<std::size_t>(q_lora) * sizeof(std::uint16_t);
+                kv_a_row_stride = q_lora + kv_lora + q_rope;
+                kernels::launch_rmsnorm_strided_bf16(
+                    kimi_ws.qkv_a.data(), Lw.q_a_norm->data(), kimi_ws.q_a.data(),
+                    total_tokens, q_lora,
+                    /*x_row_stride=*/q_lora + kv_lora + q_rope,
+                    /*y_row_stride=*/q_lora, eps, stream);
             } else {
                 ops::gemm_act_x_w(cublas.handle(),
                     kimi_ws.norm_x.data(), *Lw.q_a_proj,
@@ -669,10 +678,10 @@ void kimi_forward_paged(
                 ops::gemm_act_x_w(cublas.handle(),
                     kimi_ws.norm_x.data(), *Lw.kv_a_proj_with_mqa,
                     kimi_ws.kv_a_mqa.data(), total_tokens, kv_lora + q_rope, H);
+                kernels::launch_rmsnorm_bf16(
+                    kimi_ws.q_a.data(), Lw.q_a_norm->data(), kimi_ws.q_a.data(),
+                    total_tokens, q_lora, eps, stream);
             }
-            kernels::launch_rmsnorm_bf16(
-                kimi_ws.q_a.data(), Lw.q_a_norm->data(), kimi_ws.q_a.data(),
-                total_tokens, q_lora, eps, stream);
             act_dump_bf16(act_dump_layer_tag("q_a", li).c_str(),
                 kimi_ws.q_a.data(), total_tokens, q_lora, stream);
             ops::gemm_act_x_w(cublas.handle(),
@@ -686,9 +695,9 @@ void kimi_forward_paged(
                 static_cast<std::uint32_t>(heads * (q_nope + q_rope)),
                 static_cast<std::uint32_t>(li), stream);
             kernels::launch_kimi_split_kv_a_norm_bf16(
-                kimi_ws.kv_a_mqa.data(), Lw.kv_a_norm->data(),
+                kv_a_src, Lw.kv_a_norm->data(),
                 kimi_ws.kv_c.data(), kimi_ws.k_pe.data(),
-                total_tokens, kv_lora, q_rope, eps, stream);
+                total_tokens, kv_lora, q_rope, eps, stream, kv_a_row_stride);
             act_dump_bf16(act_dump_layer_tag("kv_c", li).c_str(),
                 kimi_ws.kv_c.data(), total_tokens, kv_lora, stream);
 

@@ -889,7 +889,8 @@
                 "dst_stride": 1
               }
             ]
-          }
+          },
+          "dtype": "BF16"
         },
         "dest_offset": 0
       }

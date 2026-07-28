@@ -7,6 +7,7 @@
 use super::rewrite::try_merge_bulk_extent_write;
 use super::validate::{validate_persistent_layout, validate_target_support};
 use crate::extent::Extent;
+use crate::types::DType;
 use crate::plan::{
     BufferDecl, DestExtent, LoadPlan, SourceExtent, StorageInstr, StorageTarget, TileMapKind,
     TileSpec, TransformSpec,
@@ -86,6 +87,7 @@ fn bulk_merge_respects_target_tile_bound() {
             file_offset,
             span_bytes: 8,
             stride: Extent::byte_run(8),
+            dtype: DType::U8,
         },
         dest_offset,
     };

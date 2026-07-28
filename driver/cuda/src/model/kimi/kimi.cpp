@@ -131,9 +131,13 @@ KimiWeights bind_kimi(const LoadedModel& engine) {
         L.kv_b_proj = &must(engine, ap + "kv_b_proj.weight");
         L.o_proj    = &must(engine, ap + "o_proj.weight");
 
-        require_rank2(*L.q_a_proj, ap + "q_a_proj.weight");
+        if (L.q_kv_a_fused != nullptr) {
+            require_rank2(*L.q_kv_a_fused, ap + "q_kv_a_proj.fused.weight");
+        } else {
+            require_rank2(*L.q_a_proj, ap + "q_a_proj.weight");
+            require_rank2(*L.kv_a_proj_with_mqa, ap + "kv_a_proj_with_mqa.weight");
+        }
         require_rank2(*L.q_b_proj, ap + "q_b_proj.weight");
-        require_rank2(*L.kv_a_proj_with_mqa, ap + "kv_a_proj_with_mqa.weight");
         require_rank2(*L.kv_b_proj, ap + "kv_b_proj.weight");
         require_rank2(*L.o_proj, ap + "o_proj.weight");
 

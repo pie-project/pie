@@ -319,6 +319,16 @@ pub struct SourceExtent {
     pub file_offset: u64,
     pub span_bytes: u64,
     pub stride: Extent,
+    /// The type these bytes are read as, which is not always the type the
+    /// checkpoint declares: `Expr::Bitcast` exists precisely to say that a
+    /// tensor stored as `U8` is to be read as `E8M0`. Looking the dtype up
+    /// from `tensor_id` instead would discard that, and the executor would be
+    /// asked for a cast from the storage type it was told to stop believing.
+    ///
+    /// Only the dtype can differ. `Bitcast` is checked raw-to-raw and
+    /// byte-size preserving (`contract::infer`), so an extent's quantization
+    /// scheme is still whatever `PieLoaderPlan::sources[tensor_id]` says.
+    pub dtype: DType,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

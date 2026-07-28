@@ -119,6 +119,7 @@ impl PlanArena {
             file_offset: source.file_offset,
             span_bytes: source.span_bytes,
             stride,
+            dtype: source.dtype.into(),
         }
     }
 

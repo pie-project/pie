@@ -920,6 +920,7 @@ mod tests {
                     file_offset: data_offset,
                     span_bytes: 4,
                     stride: extent(1, 1, &[(2, 3, 2), (2, 1, 1)]),
+                    dtype: DType::U16,
                 },
                 dest: DestExtent {
                     buffer: BufferId(0),
@@ -1030,6 +1031,7 @@ mod tests {
             file_offset,
             span_bytes: 4,
             stride: extent(1, 1, &[(2, 3, 2), (2, 1, 1)]),
+            dtype: DType::U16,
         });
         inputs.clear();
         let storage = execute_plan(&plan, &dir).unwrap();

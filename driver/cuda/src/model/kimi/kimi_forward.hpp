@@ -23,6 +23,11 @@ struct KimiWorkspace {
     DeviceTensor y;                 // [N, H]
     DeviceTensor norm_x;            // [N, H]
     DeviceTensor q_a;               // [N, q_lora_rank]
+    // [N, q_lora_rank + kv_lora_rank + qk_rope], the landing buffer for the
+    // fused q_a + kv_a projection. The GEMM is row-major, so each token's row
+    // holds its q half followed by its kv half; the two consumers read their
+    // half in place with a row pitch rather than the halves being split out.
+    DeviceTensor qkv_a;
     DeviceTensor q_b;               // [N, local_heads*(qk_nope+qk_rope)]
     DeviceTensor q_nope;            // [N, local_heads*qk_nope]
     DeviceTensor kv_a_mqa;          // [N, kv_lora_rank+qk_rope]

@@ -66,6 +66,7 @@ fn source_extent(span_bytes: u64) -> SourceExtent {
         file_offset: 512,
         span_bytes,
         stride: stride(2, &[(4, 8, 16)]),
+        dtype: DType::BF16,
     }
 }
 

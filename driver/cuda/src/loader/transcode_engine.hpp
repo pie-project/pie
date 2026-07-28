@@ -163,10 +163,9 @@ private:
                     "rust storage executor: non-compact Cast source is not "
                     "implemented");
             }
-            const auto& info = plan_index_.source(instr.source.tensor_id);
             DeviceTensor scratch =
                 DeviceTensor::allocate(
-                    dtype_from_rust(info.dtype),
+                    dtype_from_rust(instr.source.dtype),
                     pie_loader::extent_shape(instr.source.stride));
             if (scratch.nbytes() != instr.source.span_bytes) {
                 throw std::runtime_error(
@@ -204,8 +203,7 @@ private:
         };
         DeviceTensor source;
         if (instr.has_source) {
-            const auto& info = plan_index_.source(instr.source.tensor_id);
-            const DType source_dtype = dtype_from_rust(info.dtype);
+            const DType source_dtype = dtype_from_rust(instr.source.dtype);
             const bool compact = pie_loader::compact_extent(instr.source.stride);
 #if PIE_CUDA_TRANSCODE_ENGINE_HAS_CUDA
             // Reuse a persistent device tile buffer for compact sources — the

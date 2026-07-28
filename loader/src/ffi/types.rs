@@ -85,8 +85,9 @@ impl TryFrom<u32> for PieLoaderBackendKind {
 }
 
 #[repr(u32)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PieLoaderDType {
+    #[default]
     F32 = 0,
     F16 = 1,
     BF16 = 2,
@@ -490,6 +491,12 @@ pub struct PieLoaderSourceExtentView {
     pub file_offset: u64,
     pub span_bytes: u64,
     pub stride: PieLoaderStridedExtentView,
+    /// The type these bytes are read as. Not necessarily
+    /// `PieLoaderPlan::sources[tensor_id].dtype`: a contract that reinterprets
+    /// a tensor with `Bitcast` -- DeepSeek-V4's E8M0 block scales are stored
+    /// as `U8` -- says so here, and an executor that consulted the source
+    /// table instead would undo the reinterpretation.
+    pub dtype: PieLoaderDType,
 }
 
 #[repr(C)]
