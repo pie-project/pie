@@ -285,18 +285,21 @@ void mixtral_forward_paged(
         kernels::launch_rmsnorm_bf16(
             ws.y.data(), layer.attn_norm->data(), ws.norm_x.data(),
             N, H, eps, stream);
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
-            ws.norm_x.data(), layer.q_proj->data(), ws.q.data(), N, Hq, H);
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
-            ws.norm_x.data(), layer.k_proj->data(), ws.k.data(), N, Hk, H);
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
-            ws.norm_x.data(), layer.v_proj->data(), ws.v.data(), N, Hk, H);
-        if (layer.q_bias) kernels::launch_add_bias_bf16(
-            ws.q.data(), layer.q_bias->data(), N, Hq, stream);
-        if (layer.k_bias) kernels::launch_add_bias_bf16(
-            ws.k.data(), layer.k_bias->data(), N, Hk, stream);
-        if (layer.v_bias) kernels::launch_add_bias_bf16(
-            ws.v.data(), layer.v_bias->data(), N, Hk, stream);
+        // Bias folded into the projection: at decode these route to the
+        // warp-per-row GEMV, whose epilogue absorbs it for free. gpt-oss
+        // biases all three, so this is 3 launches per layer removed.
+        ops::gemm_act_x_wt_bias_bf16(cublas.handle(),
+            ws.norm_x.data(), layer.q_proj->data(),
+            layer.q_bias ? layer.q_bias->data() : nullptr,
+            ws.q.data(), N, Hq, H, stream);
+        ops::gemm_act_x_wt_bias_bf16(cublas.handle(),
+            ws.norm_x.data(), layer.k_proj->data(),
+            layer.k_bias ? layer.k_bias->data() : nullptr,
+            ws.k.data(), N, Hk, H, stream);
+        ops::gemm_act_x_wt_bias_bf16(cublas.handle(),
+            ws.norm_x.data(), layer.v_proj->data(),
+            layer.v_bias ? layer.v_bias->data() : nullptr,
+            ws.v.data(), N, Hk, H, stream);
 
         kernels::launch_rope_bf16(
             ws.q.data(), ws.k.data(), positions,
@@ -379,13 +382,10 @@ void mixtral_forward_paged(
             if (layer.o_bias) kernels::launch_add_bias_bf16(
                 ws.y.data(), layer.o_bias->data(), N, H, stream);
         } else {
-            ops::gemm_act_x_wt_bf16(cublas.handle(),
-                ws.attn_out.data(), layer.o_proj->data(), ws.norm_x.data(),
-                N, H, Hq, /*beta=*/0.f);
-            if (layer.o_bias && tp_is_leader) {
-                kernels::launch_add_bias_bf16(
-                    ws.norm_x.data(), layer.o_bias->data(), N, H, stream);
-            }
+            ops::gemm_act_x_wt_bias_bf16(cublas.handle(),
+                ws.attn_out.data(), layer.o_proj->data(),
+                (layer.o_bias && tp_is_leader) ? layer.o_bias->data() : nullptr,
+                ws.norm_x.data(), N, H, Hq, stream);
             tp->all_reduce_bf16(ws.norm_x.data(),
                 static_cast<std::size_t>(N) * H, ncclSum, stream);
             kernels::launch_residual_add_bf16(
@@ -402,11 +402,10 @@ void mixtral_forward_paged(
         // — its allocation is `[max_tokens, intermediate]` which is
         // always ≥ [N, num_experts] for any production config (E ≤ 64,
         // I ≥ 4096).
-        ops::gemm_act_x_wt_bf16(cublas.handle(),
-            ws.norm_y.data(), layer.router->data(), ws.gate.data(),
-            N, num_experts, H);
-        if (layer.router_bias) kernels::launch_add_bias_bf16(
-            ws.gate.data(), layer.router_bias->data(), N, num_experts, stream);
+        ops::gemm_act_x_wt_bias_bf16(cublas.handle(),
+            ws.norm_y.data(), layer.router->data(),
+            layer.router_bias ? layer.router_bias->data() : nullptr,
+            ws.gate.data(), N, num_experts, H, stream);
         kernels::launch_topk_softmax_bf16(
             ws.gate.data(), d_topk_idx.data(), d_topk_w.data(),
             N, num_experts, top_k, stream);
