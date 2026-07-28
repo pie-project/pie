@@ -296,7 +296,10 @@ pub fn emit_grouped_fused_region(
     };
     // `result` is never longer than `source`, whatever the symbolic dims are.
     let covers = |source: u32, result: u32| match (footprint(source), footprint(result)) {
-        (Some((src_dtype, src_static, src_symbolic)), Some((dst_dtype, dst_static, mut dst_symbolic))) => {
+        (
+            Some((src_dtype, src_static, src_symbolic)),
+            Some((dst_dtype, dst_static, mut dst_symbolic)),
+        ) => {
             if src_dtype != dst_dtype || dst_static > src_static {
                 return false;
             }
@@ -316,7 +319,9 @@ pub fn emit_grouped_fused_region(
     // Decided before anything is emitted, because the gather/argmax fusion below
     // has to see through these aliases to recognise its pattern.
     let is_view_reshape = |node: usize| -> bool {
-        let Some(op) = ops.get(node) else { return false };
+        let Some(op) = ops.get(node) else {
+            return false;
+        };
         op.tag == tags::RESHAPE
             && op.results == 1
             && op.args.len() == 1
