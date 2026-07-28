@@ -8,7 +8,7 @@
 //! generation and library implementations.
 //!
 //! "Plan" here is the cuDNN/FFTW sense — a reusable, shape-parameterized
-//! execution strategy keyed by [`ExecutableCacheKey`] — **not** an LLVM-style
+//! execution strategy keyed by a [`StageSignature`] — **not** an LLVM-style
 //! optimization pass pipeline. Runtime-varying extents stay symbolic
 //! ([`SymbolicExtent`]) so one plan serves many batch shapes.
 //!
@@ -26,4 +26,14 @@ extern crate alloc;
 mod compile;
 pub mod sidecar;
 
-pub use compile::*;
+// Spelled out rather than `pub use compile::*`. The glob made every `pub` item
+// anywhere under `compile` part of this crate's API whether or not anything
+// called it, so the surface grew silently and nothing ever shrank it.
+pub use compile::{
+    COMPILER_VERSION, ChannelSink, CompiledStage, Dimension, EncodedPlanHeader,
+    LANE_TABLE_ABI_VERSION, LaneChannelSlot, LaneRecord, LaneTableHeader, LibraryOp,
+    NormalizedStage, PartitionKind, PlanDecodeError, PlanMetrics, REGION_PLAN_VERSION, Region,
+    RegionKind, RegionPartition, RuntimeExtents, ScheduleTemplate, StageSignature, SymbolicExtent,
+    SymbolicType, ValueDomain, compile_bound, compile_stage, compile_stage_at, debug_stage_plan,
+    decode_plan_header, encode_stage_plan, library_op_for_tag, stage_identity,
+};
