@@ -8,13 +8,14 @@
 //! two inline expansions the single-lane form does not have — the MTP-draft
 //! argmax and the logits gather.
 
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt::Write as _;
 use pie_ir::op::{intrinsic_tags, tags};
 
-use pie_plan::{CompiledStage, Region};
+use pie_plan::{CompiledStage, Dimension, Region};
 
 use super::METAL_M2_MAX_FUSED_CHANNELS;
 use super::preamble::{RUNTIME_TEMPLATE, grouped_preamble};
@@ -26,16 +27,24 @@ fn value_ptr(value: u32) -> String {
     format!("scratch + offsets[{value}]")
 }
 
-/// The widest threadgroup a grouped region's kernel can serve. The emitted
-/// kernel sizes its threadgroup reduction buffer to this and rejects a launch
-/// wider than it; `m1_runtime.cpp` picks the actual width from the pipeline's
-/// own `maxTotalThreadsPerThreadgroup`, which is why the kernel checks a bound
-/// rather than equality.
-///
-/// It must not be lowered below what a driver may ask for: the check faults
-/// with `0xB3` instead of reading past `m3_tgbuf`, so a value under the
-/// pipeline limit turns every grouped dispatch on that device into a fault.
-pub const METAL_M3_REGION_THREADS: u32 = 1024;
+/// Follow a chain of elided reshapes to the value that actually holds the bytes.
+fn resolve_alias(alias: &BTreeMap<u32, u32>, mut value: u32) -> u32 {
+    // The chain is acyclic (SSA), but bound the walk anyway.
+    for _ in 0..64 {
+        match alias.get(&value) {
+            Some(&source) => value = source,
+            None => break,
+        }
+    }
+    value
+}
+
+/// Threads a grouped region's threadgroup gets per lane. The emitted kernel
+/// sizes its threadgroup reduction buffer to this and faults `0xB3` on a wider
+/// launch rather than reading past it; `m1_runtime.cpp` launches exactly this
+/// many, from its own `kM3RegionThreads`, which is a hand-kept copy of this
+/// number that nothing compares.
+pub const METAL_M3_REGION_THREADS: u32 = 256;
 
 /// Device+threadgroup barrier between two ops of a region.
 const BARRIER: &str =
@@ -233,13 +242,59 @@ pub fn emit_grouped_fused_region(
              channel_{channel}.pending_cell);"
         );
     }
+    // A reshape that does not change the element count or dtype is a view, but
+    // the runtime still executes it as a byte-for-byte copy of the whole value.
+    // In the sampler's graph that is a vocabulary-wide round trip through device
+    // memory for nothing. Elide it and point its consumers at the source
+    // instead, as long as the result stays inside this region -- a region output
+    // or sink is read through its own offset by someone else, so those keep the
+    // copy.
+    let escapes: BTreeSet<u32> = region
+        .outputs
+        .iter()
+        .copied()
+        .chain(region.sinks.iter().map(|sink| sink.value))
+        .collect();
+    let mut alias: BTreeMap<u32, u32> = BTreeMap::new();
+    let value_types = &stage.normalized.value_types;
+    // Element count, and only when every extent is static: a symbolic dim could
+    // resolve differently for the two values and the copy would not be a view.
+    let static_elements = |value: u32| -> Option<u64> {
+        let ty = value_types.get(value as usize)?;
+        let mut total: u64 = 1;
+        for dim in &ty.dims {
+            match dim {
+                Dimension::Static(extent) => total *= u64::from(*extent),
+                Dimension::Symbolic(_) => return None,
+            }
+        }
+        Some(total)
+    };
+    let same_footprint =
+        |a: u32, b: u32| match (value_types.get(a as usize), value_types.get(b as usize)) {
+            (Some(x), Some(y)) if x.dtype == y.dtype => {
+                matches!((static_elements(a), static_elements(b)),
+                         (Some(m), Some(n)) if m == n)
+            }
+            _ => false,
+        };
+
     for &node in &region.nodes {
         let node = node.index();
         let Some(op) = ops.get(node) else {
             return Err("grouped fused region node out of range".to_string());
         };
         let base = bases[node];
-        let mut slots = Slots::of(op, base, value_ptr);
+        if op.tag == tags::RESHAPE
+            && op.results == 1
+            && op.args.len() == 1
+            && !escapes.contains(&base)
+            && same_footprint(op.args[0], base)
+        {
+            alias.insert(base, resolve_alias(&alias, op.args[0]));
+            continue;
+        }
+        let mut slots = Slots::of(op, base, |value| value_ptr(resolve_alias(&alias, value)));
         if op.tag == tags::INTRINSIC_VAL && op.intr == intrinsic_tags::MTP_DRAFTS {
             emit_mtp_drafts(&mut source, base, &slots.o0);
             source.push_str(BARRIER);

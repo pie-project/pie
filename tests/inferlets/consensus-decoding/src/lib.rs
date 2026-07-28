@@ -239,7 +239,7 @@ async fn main(input: Input) -> Result<String> {
         let page_indptr = Channel::from_shaped([b + 1], pidx_v).named("page_indptr");
         let pool_ids_ch = Channel::from(pool_ids.clone()).named("pool_ids");
         let out = Channel::new([b], dtype::i32)
-            .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+            .capacity(channel_capacity() as u32)
             .named("out");
         let rng = Channel::from(vec![0x9e37_u32, 0]).named("rng");
         let lanes = Channel::from((0..=b).collect::<Vec<u32>>()).named("embed_indptr");

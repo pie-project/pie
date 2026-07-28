@@ -149,13 +149,13 @@ async fn main(input: Input) -> Result<String> {
 
     let pool_ids_ch = Channel::from(pool_ids.clone()).named("pool_ids");
     let out = Channel::new([B], dtype::i32)
-        .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+        .capacity(channel_capacity() as u32)
         .named("out");
     let out_par = Channel::new([B], dtype::u32)
-        .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+        .capacity(channel_capacity() as u32)
         .named("out_par");
     let out_scr = Channel::new([B], dtype::f32)
-        .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+        .capacity(channel_capacity() as u32)
         .named("out_scr");
     // Independent per-lane greedy argmax over the RAW logits, published beside
     // the beam pick. At `beams == 1` the beam identity says the two must agree
@@ -166,7 +166,7 @@ async fn main(input: Input) -> Result<String> {
     // [B*V] flatten, `top_k`, and the `idx / v` / `idx % v` decomposition
     // against an operator that shares none of that machinery.
     let out_greedy = Channel::new([B], dtype::i32)
-        .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+        .capacity(channel_capacity() as u32)
         .named("out_greedy");
 
     let pipeline = Pipeline::new();

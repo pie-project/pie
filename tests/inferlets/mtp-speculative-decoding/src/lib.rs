@@ -153,7 +153,7 @@ async fn main(input: Input) -> Result<String> {
     let readout = Channel::from((0..w).collect::<Vec<_>>()).named("readout");
     let stopped = Channel::from_shaped([1u32], vec![false]).named("stopped");
     let committed_out = Channel::new([w], dtype::i32)
-        .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+        .capacity(channel_capacity() as u32)
         .named("committed");
 
     let fwd = ForwardPass::new();

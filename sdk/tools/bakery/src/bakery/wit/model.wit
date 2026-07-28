@@ -42,10 +42,24 @@ interface model {
     // engine start, exactly like kv-page-size. `forward.submit` takes exactly
     // this many ordered slots; slot i executes in wave i. Guests must be
     // output-correct for any k: it decides submission granularity and
-    // resource sizing (host-reader channel capacity >= 2k - 1), never
-    // token-level behavior. Never renegotiated per frame and never adapted
-    // from runtime timing.
+    // resource sizing, never token-level behavior. Never renegotiated per
+    // frame and never adapted from runtime timing.
     frame-size: func() -> u32;
+
+    // Host-reader channel capacity, in cells, that lets one lane sustain the
+    // engine's run-ahead without the ring becoming the bottleneck. Size every
+    // host-reader channel to at least this; the staging margin is already
+    // included, so guests need no arithmetic.
+    //
+    // Under-sizing does not fail loudly. At k = 1 there is no frame to
+    // validate, so an undersized ring simply serialises the lane with no
+    // diagnostic — and because the scheduler waits for ALL lanes, a serialised
+    // lane holds up every co-resident tenant, not just itself.
+    //
+    // UNLIKE frame-size this is not promised to be static: it derives from the
+    // host resubmit turnaround, which the runtime may later adapt. Read it,
+    // don't cache it across a run.
+    channel-capacity: func() -> u32;
 
     // Max embed tokens in a single pass (C) — the prefill chunk budget.
     // Guests split a prompt of L tokens into ceil(L / C) chunk passes;

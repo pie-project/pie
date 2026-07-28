@@ -194,13 +194,13 @@ async fn main(input: Input) -> Result<Output> {
         let tok_in = Channel::from(vec![g0; 1]).named("tok_in");
         let rng = Channel::from(vec![input.seed ^ 0x5bd1, 0]).named("rng");
         let tok_out = Channel::new([1], dtype::i32)
-            .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+            .capacity(channel_capacity() as u32)
             .named("tok_out");
         let s1_out = Channel::new([1], dtype::f32)
-            .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+            .capacity(channel_capacity() as u32)
             .named("s1_out");
         let s2_out = Channel::new([1], dtype::f32)
-            .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+            .capacity(channel_capacity() as u32)
             .named("s2_out");
         let lane1 = Channel::from(vec![0u32, 1u32]).named("embed_indptr");
         let positions = Channel::from(vec![n]).named("positions");
