@@ -378,16 +378,54 @@ fn bound_rs_working_set_ids<C: FireContext>(
     Ok(Ok(ids))
 }
 
+/// Resolve the pass's declared RS mode into the per-row plan the lowering
+/// needs: a buffered write covers each row's own token span, and a fold
+/// replays the lengths the guest supplied.
+fn rs_plan_for(
+    mode: &crate::pipeline::instance::RsMode,
+    rows: usize,
+    qo_indptr: &[u32],
+) -> Result<rs::RsPlan, String> {
+    use crate::pipeline::instance::RsMode;
+    Ok(match mode {
+        RsMode::Fold => rs::RsPlan::Fold,
+        RsMode::Buffer { start_token } => rs::RsPlan::Buffer {
+            start_token: *start_token,
+            row_tokens: (0..rows)
+                .map(|row| {
+                    qo_indptr
+                        .get(row + 1)
+                        .zip(qo_indptr.get(row))
+                        .map(|(end, start)| end.saturating_sub(*start))
+                        .unwrap_or(0)
+                })
+                .collect(),
+        },
+        RsMode::FoldBuffered { tokens } => {
+            if tokens.len() != rows {
+                return Err(format!(
+                    "fold-buffered supplied {} length(s) for {rows} request row(s)",
+                    tokens.len()
+                ));
+            }
+            rs::RsPlan::FoldBuffered {
+                tokens: tokens.clone(),
+            }
+        }
+    })
+}
+
 /// Phase-A RS demand for the acquisition grant.
 fn rs_slot_demand(
     stores: &crate::store::registry::Stores,
     ids: &[crate::store::rs::RsWorkingSetId],
+    plan: &rs::RsPlan,
 ) -> Result<u32, String> {
     if ids.is_empty() {
         return Ok(0);
     }
     let store = stores.rs.lock().unwrap();
-    let demand = rs::demand(&store, ids)?;
+    let demand = rs::demand(&store, ids, plan)?;
     u32::try_from(demand).map_err(|_| "pipeline: RS demand exceeds the contention ABI".to_string())
 }
 
@@ -580,8 +618,6 @@ pub struct PendingFire {
     failure: PipelineFailure,
 }
 
-type PreparedRs = (Vec<u32>, Vec<u8>, Vec<u32>, Vec<u32>, Option<rs::RsTxn>);
-
 fn prepare_bound_rs<C: FireContext>(
     ctx: &mut C,
     stores: &crate::store::registry::Stores,
@@ -590,8 +626,9 @@ fn prepare_bound_rs<C: FireContext>(
     rs_reps: &[u32],
     qo_indptr: &[u32],
     pipeline_scope: &crate::store::PipelineScope,
+    plan: &rs::RsPlan,
     grant: &mut crate::planner::AllocationGrant,
-) -> Anyhow<Result<PreparedRs, ReservedError>> {
+) -> Anyhow<Result<rs::PreparedRs, ReservedError>> {
     let has_recurrent_state = pie_model::model().rs_caps().state_size > 0;
     if let Err(error) = rs::validate_count(rs_reps.len(), qo_indptr, has_recurrent_state) {
         return Ok(Err(ReservedError::Fatal(format!(
@@ -599,7 +636,7 @@ fn prepare_bound_rs<C: FireContext>(
         ))));
     }
     if rs_reps.is_empty() {
-        return Ok(Ok((Vec::new(), Vec::new(), Vec::new(), Vec::new(), None)));
+        return Ok(Ok(rs::PreparedRs::empty()));
     }
 
     // Resolution + model/driver validation live in the phase-A resolver;
@@ -624,7 +661,7 @@ fn prepare_bound_rs<C: FireContext>(
         // Staleness gate under the same lock as the prepare: if the demand
         // grew while the requester awaited its grant, nothing is consumed
         // and the caller re-acquires.
-        let required = match rs::demand(&store, &working_sets) {
+        let required = match rs::demand(&store, &working_sets, plan) {
             Ok(required) => required,
             Err(error) => {
                 return Ok(Err(ReservedError::Fatal(format!(
@@ -635,11 +672,9 @@ fn prepare_bound_rs<C: FireContext>(
         if required > grant.remaining_rs() {
             return Ok(Err(ReservedError::Stale));
         }
-        rs::prepare_many_reserved(&mut store, &working_sets, grant.lend_rs())
+        rs::prepare_many_reserved(&mut store, &working_sets, plan, grant.lend_rs())
     };
-    Ok(prepared
-        .map(|(ids, flags, (copy_src, copy_dst), txns)| (ids, flags, copy_src, copy_dst, txns))
-        .map_err(|error| ReservedError::Fatal(format!("pipeline: rs prepare: {error}"))))
+    Ok(prepared.map_err(|error| ReservedError::Fatal(format!("pipeline: rs prepare: {error}"))))
 }
 
 /// Drain EVERY in-flight fire on this pipeline to settlement.
@@ -836,6 +871,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             cells,
             ws_rep,
             rs_reps,
+            rs_mode,
             kv_declaration,
             kv_declaration_realized,
             fwd_rep,
@@ -915,6 +951,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 p.cells.clone(),
                 p.kv_ws,
                 p.rs_ws.clone(),
+                p.rs_mode.clone(),
                 p.kv_declaration,
                 p.kv_declaration_realized,
                 fwd.rep(),
@@ -1003,6 +1040,12 @@ pub async fn submit_pass_stamped<C: FireContext>(
             Ok(ids) => ids,
             Err(error) => return Ok(Err(error)),
         };
+        let rs_plan = match rs_plan_for(&rs_mode, rs_reps.len(), &req.qo_indptr) {
+            Ok(plan) => plan,
+            Err(error) => {
+                return Ok(Err(format!("pipeline: recurrent-state mode: {error}")));
+            }
+        };
         crate::planner::trace_mark!("build", pid, "hp-acquire");
         let mut attempts = 0;
         let (ws_guard, (copy_src, copy_dst), kvtxn, rs_prepared) = loop {
@@ -1020,7 +1063,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     "pipeline: KV demand exceeds the planner ABI".to_string()
                 ));
             };
-            let rs_demand = match rs_slot_demand(&stores, &rs_ws_ids) {
+            let rs_demand = match rs_slot_demand(&stores, &rs_ws_ids, &rs_plan) {
                 Ok(demand) => demand,
                 Err(error) => return Ok(Err(error)),
             };
@@ -1076,6 +1119,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 &rs_reps,
                 &req.qo_indptr,
                 &pipeline_scope,
+                &rs_plan,
                 &mut grant,
             )? {
                 Ok(prepared) => break (ws_guard, copies, kvtxn, prepared),
@@ -1088,10 +1132,9 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 Err(ReservedError::Fatal(error)) => return Ok(Err(error)),
             }
         };
-        let (rs_slot_ids, rs_slot_flags, rs_copy_src, rs_copy_dst, rstxns) = rs_prepared;
-        let rstxns = RsTxnsGuard::new(model, driver, rstxns);
-        req.rs_slot_ids = rs_slot_ids;
-        req.rs_slot_flags = rs_slot_flags;
+        rs_prepared.apply_to(&mut req);
+        let (rs_copy_src, rs_copy_dst) = rs_prepared.copies.clone();
+        let rstxns = RsTxnsGuard::new(model, driver, rs_prepared.txn);
         let (translation_version, translation) = match ws.translation() {
             Ok(translation) => translation,
             Err(error) => {
@@ -1937,9 +1980,9 @@ async fn fire_device_geometry<C: FireContext>(
     // order), so a recurrent-state device-geometry pass runs ahead too.
     let timing_enabled = ctx.fire_timing_requested();
 
-    let (ws_rep, rs_reps) = {
+    let (ws_rep, rs_reps, rs_mode) = {
         let pass = ctx.resources().get(&fwd)?;
-        (pass.kv_ws, pass.rs_ws.clone())
+        (pass.kv_ws, pass.rs_ws.clone(), pass.rs_mode.clone())
     };
     let ws_res: Resource<KvWorkingSet> = Resource::new_borrow(ws_rep);
     let ws = ctx.resources().get(&ws_res)?.clone();
@@ -2070,7 +2113,14 @@ async fn fire_device_geometry<C: FireContext>(
                 "pipeline: KV demand exceeds the planner ABI".to_string()
             ));
         };
-        let rs_demand = match rs_slot_demand(&stores, &rs_ws_ids) {
+        let rs_plan = match rs_plan_for(&rs_mode, rs_reps.len(), &resolved_qo_indptr) {
+            Ok(plan) => plan,
+            Err(error) => {
+                reclaim_pending_device_grant(ctx, &fwd);
+                return Ok(Err(format!("pipeline: recurrent-state mode: {error}")));
+            }
+        };
+        let rs_demand = match rs_slot_demand(&stores, &rs_ws_ids, &rs_plan) {
             Ok(demand) => demand,
             Err(error) => {
                 reclaim_pending_device_grant(ctx, &fwd);
@@ -2130,6 +2180,7 @@ async fn fire_device_geometry<C: FireContext>(
             &rs_reps,
             &resolved_qo_indptr,
             &pipeline_scope,
+            &rs_plan,
             &mut grant,
         ) {
             Ok(Ok(prepared)) => break (ws_guard, pages, copies, kv_translation, kvtxn, prepared),
@@ -2155,8 +2206,9 @@ async fn fire_device_geometry<C: FireContext>(
             }
         }
     };
-    let (rs_slot_ids, rs_slot_flags, rs_copy_src, rs_copy_dst, rstxns) = rs_prepared;
-    let rstxns = RsTxnsGuard::new(ws.model, ws.driver, rstxns);
+    let (rs_copy_src, rs_copy_dst) = rs_prepared.copies.clone();
+    let mut rs_prepared = rs_prepared;
+    let rstxns = RsTxnsGuard::new(ws.model, ws.driver, rs_prepared.txn.take());
 
     // Deliver the fresh grant to the program as a direct put on its `fresh`
     // channel — a shared-ring write the driver pulls before the pass (plan
@@ -2227,8 +2279,7 @@ async fn fire_device_geometry<C: FireContext>(
     req.qo_indptr = resolved_qo_indptr;
     req.kv_translation = kv_translation;
     req.kv_translation_version = kv_translation_version;
-    req.rs_slot_ids = rs_slot_ids;
-    req.rs_slot_flags = rs_slot_flags;
+    rs_prepared.apply_to(&mut req);
     attn_mask.apply_to(&mut req);
     let ticket_reservation = TicketReservation::new(&cells, &accesses);
     ticket_reservation.apply_to(&mut req);
@@ -2439,8 +2490,10 @@ mod lifecycle_tests {
             });
             let before = store.available_slots();
             let mut granted = store.reserve_slots(2).expect("slots available");
-            let (_, _, _, txn) =
-                rs::prepare_many_reserved(&mut store, &[ws], &mut granted).expect("prepare");
+            let prepared =
+                rs::prepare_many_reserved(&mut store, &[ws], &rs::RsPlan::Fold, &mut granted)
+                    .expect("prepare");
+            let txn = prepared.txn;
             store.release_slot_reservation(granted);
             assert!(
                 store.folded_slot(ws).expect("live working set").is_some(),

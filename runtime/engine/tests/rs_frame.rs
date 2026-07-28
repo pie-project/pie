@@ -52,7 +52,7 @@ static STATE: OnceLock<TestState> = OnceLock::new();
 /// `OnceLock`: `add_and_install` shells out to `cargo build` and mutates the
 /// shared program registry, so two tests installing the same program in
 /// parallel race ("Component not found").
-const PROGRAMS: [&str; 2] = ["generate-gdn", "generate-gdn-frame"];
+const PROGRAMS: [&str; 3] = ["generate-gdn", "generate-gdn-frame", "gdn-foldcommit"];
 
 fn state() -> &'static TestState {
     STATE.get_or_init(|| {
@@ -162,5 +162,31 @@ fn full_width_recurrent_frames_do_not_leak_slots() {
         generated_count(&out),
         budget,
         "a {budget}-token run must fit a {RS_SLOTS}-slot RS pool: {out}"
+    );
+}
+
+/// FOLD-COMMIT end to end: a prefill folds, a chunk is buffered with the
+/// fold suppressed, and only the accepted prefix is folded back from the
+/// buffer. This is the shape `model.is-linear()` exists to select, and it
+/// exercises the three launch fields the engine never used to populate
+/// (`rs_fold_lens`, `rs_buffer_slot_ids`, `rs_buffer_slot_indptr`) —
+/// the dummy driver validates their CSR well-formedness on every launch.
+#[test]
+fn fold_commit_buffers_then_folds_the_accepted_prefix() {
+    let out = run("gdn-foldcommit", "2").unwrap_or_else(|e| panic!("fold-commit failed: {e}"));
+    assert!(
+        out.contains("buffered=4") && out.contains("committed=2") && out.contains("abandoned=2"),
+        "{out}"
+    );
+}
+
+/// Accepting nothing must still be legal: the buffered chunk is abandoned
+/// whole and the folded state never moved.
+#[test]
+fn fold_commit_can_reject_the_whole_speculative_chunk() {
+    let out = run("gdn-foldcommit", "0").unwrap_or_else(|e| panic!("full reject failed: {e}"));
+    assert!(
+        out.contains("committed=0") && out.contains("abandoned=4"),
+        "{out}"
     );
 }

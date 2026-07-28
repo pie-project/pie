@@ -25,7 +25,7 @@ use crate::pipeline::channel::{BoundCells, ChannelCell, ChannelError};
 use crate::pipeline::fire::lease::DevGeo;
 pub use crate::pipeline::instance::ForwardPass;
 use crate::pipeline::instance::Instance;
-use crate::pipeline::instance::{AttentionBinding, BoundForwardPass, EmbedBinding};
+use crate::pipeline::instance::{AttentionBinding, BoundForwardPass, EmbedBinding, RsMode};
 use crate::store::kv::working_set::KvWorkingSet;
 use crate::store::rs::working_set::RsWorkingSet;
 
@@ -456,7 +456,7 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
         container_bytes: Vec<u8>,
         channels: Vec<Resource<Channel>>,
     ) -> Anyhow<Result<(), String>> {
-        let (embed, attention, readout, rs_working_sets) = {
+        let (embed, attention, readout, rs_working_sets, rs_mode) = {
             let pass = self.ctx().table.get(&this)?;
             if pass.is_bound() {
                 return Ok(Err("forward pass program is already attached".to_string()));
@@ -481,6 +481,7 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
                     .copied()
                     .map(Resource::new_borrow)
                     .collect::<Vec<Resource<RsWorkingSet>>>(),
+                pass.bindings.rs_mode.clone(),
             )
         };
         let kv_working_set: Resource<KvWorkingSet> = Resource::new_borrow(attention.kv_ws);
@@ -946,6 +947,7 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
                 kv_ws: ws_rep,
                 kv_declaration: crate::pipeline::instance::KvDeclaration { readable, writable },
                 rs_ws: rs_reps,
+                rs_mode,
                 kv_declaration_realized: false,
                 failed: None,
                 devgeo,
@@ -979,6 +981,86 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
             }
             Ok(Ok(()))
         }
+    }
+
+    async fn set_rs_mode(
+        &mut self,
+        this: Resource<ForwardPass>,
+        mode: pie::inferlet::forward::RsMode,
+    ) -> Anyhow<Result<(), String>> {
+        let caps = pie_model::model().rs_caps();
+        let mode = match mode {
+            pie::inferlet::forward::RsMode::Fold => RsMode::Fold,
+            pie::inferlet::forward::RsMode::Buffer(start_token) => {
+                if caps.state_size == 0 {
+                    return Ok(Err(
+                        "pipeline: rs-mode: a pure-attention model has no recurrent state to \
+                         buffer"
+                            .to_string(),
+                    ));
+                }
+                let page = caps.buffer_page_size;
+                if page == 0 {
+                    return Ok(Err(
+                        "pipeline: rs-mode: this model reports no RS buffer page size".to_string(),
+                    ));
+                }
+                // The driver fills a request's slabs page-major FROM SLAB
+                // ZERO of the listed CSR span, so an unaligned start would
+                // silently shift every token within its slab.
+                if start_token % page != 0 {
+                    return Ok(Err(format!(
+                        "pipeline: rs-mode: buffered write starts at token {start_token}, which \
+                         is not a multiple of the RS buffer page size {page}"
+                    )));
+                }
+                RsMode::Buffer { start_token }
+            }
+            pie::inferlet::forward::RsMode::FoldBuffered(tokens) => {
+                if caps.state_size == 0 {
+                    return Ok(Err(
+                        "pipeline: rs-mode: a pure-attention model has no recurrent state to fold"
+                            .to_string(),
+                    ));
+                }
+                if tokens.is_empty() {
+                    return Ok(Err(
+                        "pipeline: rs-mode: fold-buffered needs one length per bound \
+                         recurrent-state working set"
+                            .to_string(),
+                    ));
+                }
+                RsMode::FoldBuffered { tokens }
+            }
+        };
+        let bound_rows = {
+            let pass = self.ctx().table.get(&this)?;
+            if pass.is_bound() {
+                pass.bound().map(|bound| bound.rs_ws.len()).unwrap_or(0)
+            } else {
+                pass.bindings.rs_ws.len()
+            }
+        };
+        if let RsMode::FoldBuffered { tokens } = &mode
+            && bound_rows != 0
+            && tokens.len() != bound_rows
+        {
+            return Ok(Err(format!(
+                "pipeline: rs-mode: fold-buffered supplied {} length(s) for {bound_rows} bound \
+                 recurrent-state working set(s)",
+                tokens.len()
+            )));
+        }
+        let pass = self.ctx().table.get_mut(&this)?;
+        if pass.is_bound() {
+            match pass.bound_mut() {
+                Ok(bound) => bound.rs_mode = mode,
+                Err(error) => return Ok(Err(error)),
+            }
+        } else {
+            pass.bindings.rs_mode = mode;
+        }
+        Ok(Ok(()))
     }
 
     async fn set_rs_working_sets(

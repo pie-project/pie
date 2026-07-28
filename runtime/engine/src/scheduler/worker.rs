@@ -297,6 +297,22 @@ impl PendingRequest {
     fn requires_solo_submission(&self) -> bool {
         (self.prebuilt && self.pipeline_id.is_none())
             || (self.preserves_inner_rows() && self.request.qo_indptr.last().copied() == Some(0))
+            || self.touches_rs_buffer()
+    }
+
+    /// A fire that buffers recurrent activations, or folds them back, picks
+    /// the driver's RS execution mode for the WHOLE composed batch: the mode
+    /// is read off `rs_slot_flags` and the buffered CSR, and the driver
+    /// rejects a batch that mixes folded and forward rows or that gives a
+    /// plain row no slabs. Coalescing such a fire with an ordinary one would
+    /// therefore fail the whole wave, so it goes out alone.
+    fn touches_rs_buffer(&self) -> bool {
+        !self.request.rs_buffer_slot_ids.is_empty()
+            || self
+                .request
+                .rs_slot_flags
+                .iter()
+                .any(|flags| flags & pie_driver_abi::RS_FLAG_FOLD != 0)
     }
 
     pub(crate) fn preserves_inner_rows(&self) -> bool {
@@ -2310,8 +2326,7 @@ impl BatchScheduler {
                     retire_done.duration_since(mailbox_done).as_nanos() as u64,
                     Ordering::Relaxed,
                 );
-                acc.dispatch_ns
-                    .fetch_add(dispatch_ns, Ordering::Relaxed);
+                acc.dispatch_ns.fetch_add(dispatch_ns, Ordering::Relaxed);
                 acc.passes.fetch_add(1, Ordering::Relaxed);
                 acc.pass_max_ns
                     .fetch_max(pass_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -2413,10 +2428,9 @@ impl BatchScheduler {
                 let park_started = probe.then(Instant::now);
                 let parked = rx.recv_timeout(recv_wait);
                 if let Some(park_started) = park_started {
-                    super::LOOP_PHASES.park_ns.fetch_add(
-                        park_started.elapsed().as_nanos() as u64,
-                        Ordering::Relaxed,
-                    );
+                    super::LOOP_PHASES
+                        .park_ns
+                        .fetch_add(park_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 }
                 match parked {
                     Ok(item) => Some(item),
@@ -3089,10 +3103,7 @@ impl BatchScheduler {
     }
 
     /// launch that reached the queue front has no queued copy left).
-    fn rotate_launch_for_wave_work(
-        pending: &mut PendingQueue,
-        allow_controls: bool,
-    ) -> bool {
+    fn rotate_launch_for_wave_work(pending: &mut PendingQueue, allow_controls: bool) -> bool {
         if !matches!(pending.front(), Some(QueuedItem::Launch(_))) {
             return false;
         }
@@ -4149,17 +4160,37 @@ impl BatchScheduler {
                 ("loop_plan_us", loop_plan),
                 ("loop_post_us", loop_post),
                 ("loop_scans", loop_scans),
-                ("loop_lag_us", if loop_lag_n > 0 { loop_lag / loop_lag_n } else { 0 }),
+                (
+                    "loop_lag_us",
+                    if loop_lag_n > 0 {
+                        loop_lag / loop_lag_n
+                    } else {
+                        0
+                    },
+                ),
                 ("loop_lag_max_us", loop_lag_max),
                 ("loop_lag_n", loop_lag_n),
                 ("loop_pass_max_us", loop_pass_max),
                 ("sub_min_us", sub_min),
                 ("sub_max_us", sub_max),
-                ("guest_wake_us", if guest_n > 0 { guest_wake / guest_n } else { 0 }),
-                ("guest_work_us", if guest_n > 0 { guest_work / guest_n } else { 0 }),
+                (
+                    "guest_wake_us",
+                    if guest_n > 0 { guest_wake / guest_n } else { 0 },
+                ),
+                (
+                    "guest_work_us",
+                    if guest_n > 0 { guest_work / guest_n } else { 0 },
+                ),
                 ("guest_work_max_us", guest_work_max),
                 ("guest_n", guest_n),
-                ("guest_resume_us", if guest_resume_n > 0 { guest_resume / guest_resume_n } else { 0 }),
+                (
+                    "guest_resume_us",
+                    if guest_resume_n > 0 {
+                        guest_resume / guest_resume_n
+                    } else {
+                        0
+                    },
+                ),
                 ("guest_resume_max_us", guest_resume_max),
                 ("wake_woken", wake_woken),
                 ("wake_empty", wake_empty),
@@ -5788,7 +5819,8 @@ mod tests {
                 plan: dummy_program(),
                 response: tx_b,
             },
-        ]).into();
+        ])
+        .into();
         let (lane, _lane_rx) = test_lane(None);
         let mut lane_inflight = 0u64;
         let mut lane_token = 0u64;
@@ -6619,8 +6651,7 @@ mod tests {
         // Every settled output stayed visible across the close: none was
         // poisoned or discarded, so the ring published all three.
         let tail = unsafe {
-            (&*(words as *const std::sync::atomic::AtomicU64)
-                .add(binding.tail_word_index as usize))
+            (&*(words as *const std::sync::atomic::AtomicU64).add(binding.tail_word_index as usize))
                 .load(Ordering::Acquire)
         };
         assert_eq!(tail, 3, "settled outputs remain visible after close");
@@ -6919,7 +6950,12 @@ mod tests {
         assert!(pending.is_empty());
         assert!(completion.is_settled(), "the cancelled fire must reject");
         assert_eq!(
-            frame_policy.plan_dispatch(&frame::QueuedFireIds::default(), &HashSet::new(), false, Instant::now()),
+            frame_policy.plan_dispatch(
+                &frame::QueuedFireIds::default(),
+                &HashSet::new(),
+                false,
+                Instant::now()
+            ),
             FramePlan::Park,
             "the frame resolved without the fire; the lane stays awaited"
         );
@@ -6970,7 +7006,8 @@ mod tests {
                 plan: crate::driver::KvCopyPlan::default(),
                 completion: ControlCompletion::new(),
             },
-        ]).into();
+        ])
+        .into();
         let (lane, _lane_rx) = test_lane(None);
         let mut lane_inflight = 0u64;
         let mut lane_token = 0u64;
@@ -7068,13 +7105,16 @@ mod tests {
                 process_id: Some(coupled),
                 pipeline_id: Some(coupled),
             },
-        ]).into();
+        ])
+        .into();
 
         let mut scan_cache = ScanCache::default();
         let scan = BatchScheduler::scan_queue(&mut scan_cache, &pending, false);
         assert_eq!(
             scan.queued_ids,
-            [fire_a, fire_b].into_iter().collect::<frame::QueuedFireIds>()
+            [fire_a, fire_b]
+                .into_iter()
+                .collect::<frame::QueuedFireIds>()
         );
         assert_eq!(
             scan.blocked_lanes,
@@ -7124,11 +7164,8 @@ mod tests {
         }));
         let rider = make(None);
         let (stamped_id, rider_id) = (stamped.logical_fire_id, rider.logical_fire_id);
-        let mut pending: PendingQueue = VecDeque::from([
-            QueuedItem::Launch(stamped),
-            QueuedItem::Launch(rider),
-        ])
-        .into();
+        let mut pending: PendingQueue =
+            VecDeque::from([QueuedItem::Launch(stamped), QueuedItem::Launch(rider)]).into();
 
         let mut cache = ScanCache::default();
         let scan = BatchScheduler::scan_queue(&mut cache, &pending, false);

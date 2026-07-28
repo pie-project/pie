@@ -168,6 +168,22 @@ pub struct ForwardBindings {
     pub attention: Option<AttentionBinding>,
     pub readout: Option<u32>,
     pub rs_ws: Vec<u32>,
+    pub rs_mode: RsMode,
+}
+
+/// How a pass treats the recurrent state of its bound working sets — the
+/// host mirror of WIT `rs-mode`. See `interface/inferlet/forward.wit`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum RsMode {
+    /// Fold every token in-forward, irreversibly. The default.
+    #[default]
+    Fold,
+    /// Buffer this fire's pre-recurrence activations starting at the given
+    /// buffer-relative token offset; the folded state is untouched.
+    Buffer { start_token: u32 },
+    /// Replay this many buffered tokens per bound working set (request
+    /// order) into the folded state.
+    FoldBuffered { tokens: Vec<u32> },
 }
 
 #[derive(Clone, Copy)]
@@ -288,6 +304,9 @@ pub struct BoundForwardPass {
     /// models — GDN, Mamba2), in resolved forward-request order. Empty for
     /// pure-attention models.
     pub rs_ws: Vec<u32>,
+    /// How this pass treats that recurrent state: fold in-forward (default),
+    /// buffer without folding, or replay buffered tokens into the fold.
+    pub rs_mode: RsMode,
     /// Whether the currently bound writable declaration has performed its
     /// one-shot COW against the sharing shape visible at first submit.
     pub kv_declaration_realized: bool,
@@ -1087,6 +1106,7 @@ mod tests {
                 kv_ws: 0,
                 kv_declaration: KvDeclaration::all(),
                 rs_ws: Vec::new(),
+                rs_mode: RsMode::default(),
                 kv_declaration_realized: false,
                 failed: None,
                 devgeo: None,

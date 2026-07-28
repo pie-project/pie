@@ -587,6 +587,26 @@ impl RsWorkingSet {
         self.rs.buffer_page_size()
     }
 
+    /// Append `n` reserved buffered page slots; returns the contiguous
+    /// range. Purely logical — a slot is materialized by the first
+    /// [`ForwardPass::buffer_recurrent`] fire that writes it.
+    pub fn alloc_buffer(&self, n: u32) -> Result<crate::working_set::PageRange, String> {
+        self.rs.alloc_buffer(n)
+    }
+
+    /// Drop the buffered slots at `indices` and densely compact. This is the
+    /// REJECT half of fold-commit: a speculative tail that was buffered but
+    /// never folded is abandoned by dropping its slots, and no folded state
+    /// was ever perturbed by it.
+    pub fn free_buffer(&self, indices: &[u32]) -> Result<(), String> {
+        self.rs.free_buffer(indices)
+    }
+
+    /// Reorder the buffered slots by the full bijection `perm`.
+    pub fn reorder_buffer(&self, perm: &[u32]) -> Result<(), String> {
+        self.rs.reorder_buffer(perm)
+    }
+
     /// Copy-on-write child sharing the current folded state and buffered
     /// suffix, ordered on `on`.
     pub fn fork(&self, on: &Pipeline) -> Result<RsWorkingSet, String> {
@@ -835,6 +855,35 @@ impl ForwardPass {
     }
 
     /// Bind readout indexes through a channel, separately from embedding.
+    /// Fold every token of this pass into the recurrent state, in-forward
+    /// and irreversibly. The default; call this only to undo an earlier
+    /// [`ForwardPass::buffer_recurrent`] or [`ForwardPass::fold_buffered`]
+    /// on a reused pass.
+    pub fn fold_recurrent(&self) -> Result<(), String> {
+        self.wit.set_rs_mode(&wit::RsMode::Fold)
+    }
+
+    /// Write this pass's pre-recurrence activations into the bound
+    /// recurrent-state working sets' buffered slots, starting at buffer
+    /// token `start_token`, and leave the folded state UNTOUCHED.
+    ///
+    /// This is what makes a linear model speculatable: tokens that are
+    /// buffered but never folded cost nothing to abandon. `start_token` must
+    /// be a multiple of `rs-buffer-page-size`, and the working set must
+    /// already carry a folded state (run the folding prefill first).
+    pub fn buffer_recurrent(&self, start_token: u32) -> Result<(), String> {
+        self.wit.set_rs_mode(&wit::RsMode::Buffer(start_token))
+    }
+
+    /// Replay `tokens[r]` buffered tokens of request row `r` into that row's
+    /// folded state, dropping the fully covered head slots. Runs only the
+    /// recurrent layers — no logits — so this is the COMMIT half of
+    /// fold-commit speculation.
+    pub fn fold_buffered(&self, tokens: &[u32]) -> Result<(), String> {
+        self.wit
+            .set_rs_mode(&wit::RsMode::FoldBuffered(tokens.to_vec()))
+    }
+
     pub fn readout(&self, indices: &Channel) -> Result<(), String> {
         self.ensure_ports_available(&[Port::Readout])?;
         let indices_wit = indices.wit();
@@ -1039,10 +1088,8 @@ pub fn submit_frame(on: &Pipeline, slots: &[Option<&ForwardPass>]) -> Result<(),
         .iter()
         .map(|slot| slot.map(|pass| pass.wit.clone()))
         .collect();
-    let mut borrows: Vec<Option<&wit::ForwardPass>> = wits
-        .iter()
-        .map(|slot| slot.as_deref())
-        .collect();
+    let mut borrows: Vec<Option<&wit::ForwardPass>> =
+        wits.iter().map(|slot| slot.as_deref()).collect();
     borrows.resize(k, None);
     wit::submit(&on.wit, &borrows)
 }
@@ -1169,7 +1216,11 @@ mod prefill_chunk_tests {
                 let l = lens(n, cap);
                 let (lo, hi) = (*l.iter().min().unwrap(), *l.iter().max().unwrap());
                 assert!(hi - lo <= 1, "n={n} cap={cap}: lengths span {lo}..={hi}");
-                assert_eq!(*l.last().unwrap(), lo, "n={n} cap={cap}: tail is not the min");
+                assert_eq!(
+                    *l.last().unwrap(),
+                    lo,
+                    "n={n} cap={cap}: tail is not the min"
+                );
             }
         }
     }

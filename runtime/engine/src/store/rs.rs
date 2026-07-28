@@ -368,15 +368,46 @@ impl RsStore {
 
     /// Prepare a folded-state write from caller-owned reserved slots,
     /// consuming exactly the required prefix of `granted` (lend semantics:
-    /// failure consumes nothing, surplus stays caller-owned). Always a
-    /// `write_state` prepare — the reserved path exists only for the fire's
-    /// folded-slot write.
+    /// failure consumes nothing, surplus stays caller-owned).
     pub fn prepare_write_reserved(
         &mut self,
         ws: RsWorkingSetId,
         granted: &mut Vec<RsSlotId>,
     ) -> Result<RsPreparedWrite, RsError> {
         self.prepare(ws, true, None, None, Some(granted))
+    }
+
+    /// The general prepare: any combination of a folded-state write, an
+    /// explicit fold, and a buffered-page write, allocating from the pool.
+    /// A fold is validated against the granularity and buffered capacity
+    /// before anything is allocated.
+    pub fn prepare_general(
+        &mut self,
+        ws: RsWorkingSetId,
+        write_state: bool,
+        fold_tokens: Option<u32>,
+        buffer_tokens: Option<(u32, u32)>,
+    ) -> Result<RsPreparedWrite, RsError> {
+        if let Some(tokens) = fold_tokens {
+            self.validate_fold(ws, tokens)?;
+        }
+        self.prepare(ws, write_state, fold_tokens, buffer_tokens, None)
+    }
+
+    /// [`prepare_general`] from caller-owned reserved slots (the acquisition
+    /// grant), consuming exactly the required prefix of `granted`.
+    pub fn prepare_reserved(
+        &mut self,
+        ws: RsWorkingSetId,
+        write_state: bool,
+        fold_tokens: Option<u32>,
+        buffer_tokens: Option<(u32, u32)>,
+        granted: &mut Vec<RsSlotId>,
+    ) -> Result<RsPreparedWrite, RsError> {
+        if let Some(tokens) = fold_tokens {
+            self.validate_fold(ws, tokens)?;
+        }
+        self.prepare(ws, write_state, fold_tokens, buffer_tokens, Some(granted))
     }
 
     /// Phase-A demand: slots a folded-state write for `ws` would allocate
@@ -388,6 +419,35 @@ impl RsStore {
             Some(id) if self.ref_count(id) > 1 => 1,
             Some(_) => 0,
         })
+    }
+
+    /// Phase-A demand for a whole prepared write, folded target plus buffered
+    /// pages: exactly what [`RsStore::prepare`] would allocate. A buffered
+    /// page costs a slot when it is still reserved (first write materializes
+    /// it) or shared after a fork (copy-on-write). Pure.
+    pub fn write_demand(
+        &self,
+        ws: RsWorkingSetId,
+        write_state: bool,
+        buffer_tokens: Option<(u32, u32)>,
+    ) -> Result<usize, RsError> {
+        let state = if write_state {
+            self.write_state_demand(ws)?
+        } else {
+            0
+        };
+        let Some((start, len)) = buffer_tokens.filter(|(_, len)| *len > 0) else {
+            return Ok(state);
+        };
+        let entry = self.entry(ws)?;
+        let (first, last) = page_span(entry, start, len)?;
+        let buffers = (first..=last)
+            .filter(|&index| match entry.buffer[index] {
+                None => true,
+                Some(id) => self.ref_count(id) > 1,
+            })
+            .count();
+        Ok(state + buffers)
     }
 
     /// Prepare an explicit `fold(tokens)`: validated against the fold

@@ -25,6 +25,7 @@ use crate::store::rs::{RsStore, RsWorkingSetId};
 
 /// The published RS write for one in-flight PTIR fire, held across
 /// `submit_async` until [`settle`].
+#[derive(Debug)]
 pub struct RsTxn {
     published: RsPublished,
 }
@@ -63,30 +64,111 @@ pub fn validate_count(
     Ok(request_count)
 }
 
+/// What a pass does with the recurrent state of its bound working sets, with
+/// the per-row token counts the lowering needs resolved from the fire's
+/// geometry. The host-side mirror of WIT `rs-mode` at prepare time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RsPlan {
+    /// Advance the folded state in-forward over every row.
+    Fold,
+    /// Scatter each row's pre-recurrence activations into buffered slots
+    /// covering `[start_token, start_token + row_tokens[r])`, leaving the
+    /// folded state untouched.
+    Buffer {
+        start_token: u32,
+        row_tokens: Vec<u32>,
+    },
+    /// Replay `tokens[r]` buffered tokens of row `r` into its folded state.
+    FoldBuffered { tokens: Vec<u32> },
+}
+
+impl RsPlan {
+    /// `(write_state, fold_tokens, buffer_tokens)` for row `index` — exactly
+    /// the arguments `RsStore::prepare` classifies against.
+    fn row(&self, index: usize) -> (bool, Option<u32>, Option<(u32, u32)>) {
+        match self {
+            RsPlan::Fold => (true, None, None),
+            RsPlan::Buffer {
+                start_token,
+                row_tokens,
+            } => (
+                false,
+                None,
+                Some((*start_token, row_tokens.get(index).copied().unwrap_or(0))),
+            ),
+            // A fold gathers the buffered PREFIX: the driver walks the CSR
+            // from slab zero, so the span always starts at buffer token 0.
+            RsPlan::FoldBuffered { tokens } => {
+                let n = tokens.get(index).copied().unwrap_or(0);
+                (true, Some(n), Some((0, n)))
+            }
+        }
+    }
+}
+
 /// Phase-A demand for [`prepare_many`] over these working sets: how many
-/// folded slots the prepare would allocate, with no allocation or open
+/// slots the prepare would allocate — the folded target plus any buffered
+/// page it must materialize or copy-on-write — with no allocation or open
 /// transaction. The acquisition seam sizes its RS ask from this.
-pub fn demand(store: &RsStore, working_sets: &[RsWorkingSetId]) -> Result<usize, String> {
+pub fn demand(
+    store: &RsStore,
+    working_sets: &[RsWorkingSetId],
+    plan: &RsPlan,
+) -> Result<usize, String> {
     let mut total = 0;
-    for &ws in working_sets {
-        total += store.write_state_demand(ws).map_err(|e| e.to_string())?;
+    for (index, &ws) in working_sets.iter().enumerate() {
+        let (write_state, _, buffer_tokens) = plan.row(index);
+        total += store
+            .write_demand(ws, write_state, buffer_tokens)
+            .map_err(|e| e.to_string())?;
     }
     Ok(total)
 }
 
-/// Driver lowering for published folded-state writes:
-/// `(rs_slot_ids, rs_slot_flags, (copy_src, copy_dst), txn)`.
-pub type PreparedRs = (Vec<u32>, Vec<u8>, (Vec<u32>, Vec<u32>), Option<RsTxn>);
+/// Driver lowering for one fire's published recurrent-state work.
+#[derive(Debug)]
+pub struct PreparedRs {
+    /// Folded slot per request row. Always present: buffered execution needs
+    /// it too, to validate the row and to read the state it does not write.
+    pub slot_ids: Vec<u32>,
+    pub slot_flags: Vec<u8>,
+    /// Pre-launch device copies `(src, dst)` for copy-on-write targets.
+    pub copies: (Vec<u32>, Vec<u32>),
+    /// Tokens to replay per row; empty unless this is a fold.
+    pub fold_lens: Vec<u32>,
+    /// Buffered slab ids, flattened, with the per-row CSR boundaries the
+    /// driver walks page-major. Empty unless the pass touches the buffer.
+    pub buffer_slot_ids: Vec<u32>,
+    pub buffer_slot_indptr: Vec<u32>,
+    pub txn: Option<RsTxn>,
+}
 
-/// Prepare and publish the in-forward folded-state write. Returns
-/// [`PreparedRs`]: thread the ids and flags into the launch in request order,
-/// issue one aggregated state-copy command before the launch when non-empty,
-/// hold `txn` across the fire, then [`settle`].
+impl PreparedRs {
+    /// The no-recurrent-state lowering: every field empty.
+    pub fn empty() -> Self {
+        empty_prepared()
+    }
+
+    /// Thread this lowering into a launch plan.
+    pub fn apply_to(&self, request: &mut crate::driver::LaunchPlan) {
+        request.rs_slot_ids = self.slot_ids.clone();
+        request.rs_slot_flags = self.slot_flags.clone();
+        request.rs_fold_lens = self.fold_lens.clone();
+        request.rs_buffer_slot_ids = self.buffer_slot_ids.clone();
+        request.rs_buffer_slot_indptr = self.buffer_slot_indptr.clone();
+    }
+}
+
+/// Prepare and publish this fire's recurrent-state work. Returns the driver
+/// lowering: thread the ids and flags into the launch in request order, issue
+/// one aggregated state-copy command before the launch when non-empty, hold
+/// `txn` across the fire, then [`settle`].
 pub fn prepare_many(
     store: &mut RsStore,
     working_sets: &[RsWorkingSetId],
+    plan: &RsPlan,
 ) -> Result<PreparedRs, String> {
-    prepare_many_impl(store, working_sets, None)
+    prepare_many_impl(store, working_sets, plan, None)
 }
 
 /// [`prepare_many`] from caller-owned reserved slots (the acquisition
@@ -94,14 +176,28 @@ pub fn prepare_many(
 pub fn prepare_many_reserved(
     store: &mut RsStore,
     working_sets: &[RsWorkingSetId],
+    plan: &RsPlan,
     granted: &mut Vec<crate::store::rs::RsSlotId>,
 ) -> Result<PreparedRs, String> {
-    prepare_many_impl(store, working_sets, Some(granted))
+    prepare_many_impl(store, working_sets, plan, Some(granted))
+}
+
+fn empty_prepared() -> PreparedRs {
+    PreparedRs {
+        slot_ids: Vec::new(),
+        slot_flags: Vec::new(),
+        copies: (Vec::new(), Vec::new()),
+        fold_lens: Vec::new(),
+        buffer_slot_ids: Vec::new(),
+        buffer_slot_indptr: Vec::new(),
+        txn: None,
+    }
 }
 
 fn prepare_many_impl(
     store: &mut RsStore,
     working_sets: &[RsWorkingSetId],
+    plan: &RsPlan,
     mut granted: Option<&mut Vec<crate::store::rs::RsSlotId>>,
 ) -> Result<PreparedRs, String> {
     for (index, ws) in working_sets.iter().enumerate() {
@@ -112,18 +208,42 @@ fn prepare_many_impl(
         }
     }
     if working_sets.is_empty() {
-        return Ok((Vec::new(), Vec::new(), (Vec::new(), Vec::new()), None));
+        return Ok(empty_prepared());
     }
 
-    let mut slot_ids = Vec::with_capacity(working_sets.len());
-    let mut slot_flags = Vec::with_capacity(working_sets.len());
-    let mut copy_src = Vec::new();
-    let mut copy_dst = Vec::new();
+    let buffered = !matches!(plan, RsPlan::Fold);
+    let mut out = empty_prepared();
+    if buffered {
+        out.buffer_slot_indptr.push(0);
+    }
     let mut prepared_rows: Vec<RsPreparedWrite> = Vec::with_capacity(working_sets.len());
-    for &ws in working_sets {
+
+    for (index, &ws) in working_sets.iter().enumerate() {
+        let (write_state, fold_tokens, buffer_tokens) = plan.row(index);
+
+        // Buffered execution reads the folded state it does not write, and
+        // a fold advances it — both need one already to exist. The driver
+        // skips its per-slot reset in either mode, so a cold working set
+        // would consume undefined state. Reject it here, where the guest
+        // still gets a message it can act on.
+        if buffered
+            && store
+                .folded_slot(ws)
+                .map_err(|error| error.to_string())?
+                .is_none()
+        {
+            store.cancel_batch(prepared_rows);
+            return Err(format!(
+                "rs-working-set at request row {index} has no folded state yet: run a folding \
+                 pass (the prefill) before buffering or folding buffered tokens"
+            ));
+        }
+
         let prepared = match granted.as_deref_mut() {
-            Some(granted) => store.prepare_write_reserved(ws, granted),
-            None => store.prepare_write(ws, true, None),
+            Some(granted) => {
+                store.prepare_reserved(ws, write_state, fold_tokens, buffer_tokens, granted)
+            }
+            None => store.prepare_general(ws, write_state, fold_tokens, buffer_tokens),
         };
         let prepared = match prepared {
             Ok(prepared) => prepared,
@@ -132,43 +252,71 @@ fn prepare_many_impl(
                 return Err(error.to_string());
             }
         };
-        let state = prepared.state().expect("write_state requested");
-        slot_ids.push(state.slot.0);
-        slot_flags.push(if state.reset {
-            crate::driver::RS_FLAG_RESET
-        } else {
-            0
-        });
-        if let Some(src) = state.copy_from {
-            copy_src.push(src.0);
-            copy_dst.push(state.slot.0);
+
+        // Folded slot: the write target when this pass folds, otherwise the
+        // committed slot the buffered forward reads. `RS_FLAG_FOLD` is what
+        // selects the driver's replay mode, and it must be uniform across
+        // the batch — `requires_solo_submission` keeps such a fire alone.
+        match prepared.state() {
+            Some(state) => {
+                out.slot_ids.push(state.slot.0);
+                let mut flags = if state.reset {
+                    crate::driver::RS_FLAG_RESET
+                } else {
+                    0
+                };
+                if state.fold_tokens.is_some() {
+                    flags |= crate::driver::RS_FLAG_FOLD;
+                }
+                out.slot_flags.push(flags);
+                if let Some(src) = state.copy_from {
+                    out.copies.0.push(src.0);
+                    out.copies.1.push(state.slot.0);
+                }
+                // ONE length per row, always: `wire.rs` concatenates these
+                // across a composed batch, so a row that contributes a slot
+                // id but no length would shift every later row's.
+                out.fold_lens.push(state.fold_tokens.unwrap_or(0));
+            }
+            None => {
+                let slot = store
+                    .folded_slot(ws)
+                    .map_err(|error| error.to_string())?
+                    .expect("buffered rows are rejected without a folded state");
+                out.slot_ids.push(slot.0);
+                out.slot_flags.push(0);
+                out.fold_lens.push(0);
+            }
         }
+
+        // Buffer CSR. The driver walks a row's slabs page-major from the
+        // first listed one, so the order here IS the token order.
+        for target in prepared.buffer_targets() {
+            out.buffer_slot_ids.push(target.dst().0);
+            if let crate::store::rs::write::RsBufferTarget::Cow { src, dst, .. } = *target {
+                out.copies.0.push(src.0);
+                out.copies.1.push(dst.0);
+            }
+        }
+        if buffered {
+            out.buffer_slot_indptr
+                .push(out.buffer_slot_ids.len() as u32);
+        }
+
         prepared_rows.push(prepared);
     }
+
     // Publish before returning: the successor fire's classification must see
     // this fire's decision without waiting for the device.
     let published = store
         .publish_batch(prepared_rows)
         .map_err(|error| error.to_string())?;
-    Ok((
-        slot_ids,
-        slot_flags,
-        (copy_src, copy_dst),
-        Some(RsTxn { published }),
-    ))
+    out.txn = Some(RsTxn { published });
+    Ok(out)
 }
 
-pub fn prepare(
-    store: &mut RsStore,
-    ws: RsWorkingSetId,
-) -> Result<(Vec<u32>, Vec<u8>, (Vec<u32>, Vec<u32>), RsTxn), String> {
-    let (ids, flags, copies, txn) = prepare_many(store, &[ws])?;
-    Ok((
-        ids,
-        flags,
-        copies,
-        txn.expect("one working set produces one transaction"),
-    ))
+pub fn prepare(store: &mut RsStore, ws: RsWorkingSetId) -> Result<PreparedRs, String> {
+    prepare_many(store, &[ws], &RsPlan::Fold)
 }
 
 /// Settle a fire's published RS write once it resolves, successfully or not.
@@ -199,39 +347,47 @@ mod tests {
         }
     }
 
+    /// A working set with a materialized folded state, which every buffered
+    /// or folding pass requires.
+    fn warm(store: &mut RsStore) -> RsWorkingSetId {
+        let ws = store.create_working_set(geom());
+        let prepared = prepare(store, ws).unwrap();
+        settle(store, prepared.txn);
+        ws
+    }
+
     #[test]
     fn first_fire_resets_then_continues_in_place() {
         let mut store = RsStore::new(4);
         let ws = store.create_working_set(geom());
 
-        let (ids, flags, (src, _), txn) = prepare(&mut store, ws).unwrap();
-        assert_eq!(ids.len(), 1);
-        assert_eq!(flags, vec![crate::driver::RS_FLAG_RESET]);
-        assert!(src.is_empty());
-        settle(&mut store, Some(txn));
+        let out = prepare(&mut store, ws).unwrap();
+        assert_eq!(out.slot_ids.len(), 1);
+        assert_eq!(out.slot_flags, vec![crate::driver::RS_FLAG_RESET]);
+        assert!(out.copies.0.is_empty());
+        assert_eq!(out.fold_lens, vec![0], "one length per row, zero = no fold");
+        assert!(out.buffer_slot_ids.is_empty() && out.buffer_slot_indptr.is_empty());
+        settle(&mut store, out.txn);
         let slot = store.folded_slot(ws).unwrap().unwrap();
 
-        let (ids, flags, (src, _), txn) = prepare(&mut store, ws).unwrap();
-        assert_eq!(ids, vec![slot.0]);
-        assert_eq!(flags, vec![0]);
-        assert!(src.is_empty());
-        settle(&mut store, Some(txn));
+        let out = prepare(&mut store, ws).unwrap();
+        assert_eq!(out.slot_ids, vec![slot.0]);
+        assert_eq!(out.slot_flags, vec![0]);
+        settle(&mut store, out.txn);
     }
 
     #[test]
     fn forked_fire_copies_the_folded_state() {
         let mut store = RsStore::new(4);
-        let ws = store.create_working_set(geom());
-        let (_, _, _, txn) = prepare(&mut store, ws).unwrap();
-        settle(&mut store, Some(txn));
+        let ws = warm(&mut store);
         let shared = store.folded_slot(ws).unwrap().unwrap();
 
         let forked = store.fork(ws).unwrap();
-        let (ids, flags, (src, dst), txn) = prepare(&mut store, forked).unwrap();
-        assert_eq!(src, vec![shared.0]);
-        assert_eq!(dst, ids);
-        assert_eq!(flags, vec![0]); // copied, not reset
-        settle(&mut store, Some(txn));
+        let out = prepare(&mut store, forked).unwrap();
+        assert_eq!(out.copies.0, vec![shared.0]);
+        assert_eq!(out.copies.1, out.slot_ids);
+        assert_eq!(out.slot_flags, vec![0]); // copied, not reset
+        settle(&mut store, out.txn);
         assert_eq!(store.folded_slot(ws).unwrap(), Some(shared));
         assert_ne!(store.folded_slot(forked).unwrap(), Some(shared));
     }
@@ -246,152 +402,251 @@ mod tests {
         let mut store = RsStore::new(3);
         let ws = store.create_working_set(geom());
 
-        let (first_ids, first_flags, _, first) = prepare(&mut store, ws).unwrap();
-        assert_eq!(first_flags, vec![crate::driver::RS_FLAG_RESET]);
+        let first = prepare(&mut store, ws).unwrap();
+        assert_eq!(first.slot_flags, vec![crate::driver::RS_FLAG_RESET]);
 
         // No settle: the first fire is still on the device.
-        let (second_ids, second_flags, (copy_src, _), second) = prepare(&mut store, ws).unwrap();
+        let second = prepare(&mut store, ws).unwrap();
         assert_eq!(
-            second_ids, first_ids,
+            second.slot_ids, first.slot_ids,
             "second fire continues the published slot"
         );
-        assert_eq!(second_flags, vec![0], "second fire must not RESET again");
-        assert!(copy_src.is_empty());
+        assert_eq!(second.slot_flags, vec![0], "must not RESET again");
+        assert!(second.copies.0.is_empty());
         assert_eq!(store.available_slots(), 2, "one slot serves both fires");
 
-        settle(&mut store, Some(first));
-        settle(&mut store, Some(second));
+        settle(&mut store, first.txn);
+        settle(&mut store, second.txn);
     }
 
     #[test]
     fn unsettled_forked_runahead_cows_once_then_continues_the_child() {
         let mut store = RsStore::new(4);
-        let parent = store.create_working_set(geom());
-        let (_, _, _, parent_write) = prepare(&mut store, parent).unwrap();
-        settle(&mut store, Some(parent_write));
+        let parent = warm(&mut store);
         let shared = store.folded_slot(parent).unwrap().unwrap().0;
         let child = store.fork(parent).unwrap();
 
-        let (first_ids, _, (first_src, _), first) = prepare(&mut store, child).unwrap();
-        assert_eq!(first_src, vec![shared]);
+        let first = prepare(&mut store, child).unwrap();
+        assert_eq!(first.copies.0, vec![shared]);
 
-        // No settle in between.
-        let (second_ids, second_flags, (second_src, _), second) =
-            prepare(&mut store, child).unwrap();
+        let second = prepare(&mut store, child).unwrap();
         assert_eq!(
-            second_ids, first_ids,
+            second.slot_ids, first.slot_ids,
             "child continues its published CoW slot"
         );
-        assert_eq!(second_flags, vec![0]);
         assert!(
-            second_src.is_empty(),
+            second.copies.0.is_empty(),
             "a run-ahead successor must not CoW from the stale parent again"
         );
-        settle(&mut store, Some(first));
-        settle(&mut store, Some(second));
+        settle(&mut store, first.txn);
+        settle(&mut store, second.txn);
     }
 
     #[test]
     fn a_three_slot_frame_lowers_one_slot_and_one_reset() {
-        // The k=3 decode frame: three fires submitted back to back, none
-        // settled, all writing one working set's folded state.
         let mut store = RsStore::new(2);
         let ws = store.create_working_set(geom());
 
         let mut txns = Vec::new();
         let mut lowered = Vec::new();
         for slot in 0..3 {
-            let (ids, flags, (src, dst), txn) = prepare(&mut store, ws).unwrap();
+            let out = prepare(&mut store, ws).unwrap();
             assert!(
-                src.is_empty() && dst.is_empty(),
+                out.copies.0.is_empty() && out.copies.1.is_empty(),
                 "slot {slot} must not need a pre-launch copy"
             );
-            lowered.push((ids, flags));
-            txns.push(txn);
+            lowered.push((out.slot_ids.clone(), out.slot_flags.clone()));
+            txns.push(out.txn);
         }
-        assert_eq!(
-            lowered[0].1,
-            vec![crate::driver::RS_FLAG_RESET],
-            "wave 0 resets the cold slot"
-        );
-        assert_eq!(lowered[1].1, vec![0], "wave 1 continues in place");
-        assert_eq!(lowered[2].1, vec![0], "wave 2 continues in place");
+        assert_eq!(lowered[0].1, vec![crate::driver::RS_FLAG_RESET]);
+        assert_eq!(lowered[1].1, vec![0]);
+        assert_eq!(lowered[2].1, vec![0]);
         assert_eq!(lowered[0].0, lowered[1].0);
         assert_eq!(lowered[1].0, lowered[2].0);
-        assert_eq!(
-            store.available_slots(),
-            1,
-            "a three-wave frame allocates exactly one folded slot"
-        );
+        assert_eq!(store.available_slots(), 1);
         for txn in txns {
-            settle(&mut store, Some(txn));
+            settle(&mut store, txn);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Buffered write and fold — the FOLD-COMMIT path.
+    // ------------------------------------------------------------------
+
+    fn buffer_plan(start_token: u32, row_tokens: Vec<u32>) -> RsPlan {
+        RsPlan::Buffer {
+            start_token,
+            row_tokens,
         }
     }
 
     #[test]
-    fn failed_fire_keeps_the_published_state() {
-        let mut store = RsStore::new(2);
-        let ws = store.create_working_set(geom());
-        let (ids, _, _, txn) = prepare(&mut store, ws).unwrap();
-        settle(&mut store, Some(txn)); // the fire failed on the device
+    fn buffered_write_materializes_slabs_and_leaves_the_fold_alone() {
+        let mut store = RsStore::new(8);
+        let ws = warm(&mut store);
+        let folded = store.folded_slot(ws).unwrap().unwrap();
+        store.alloc_buffer(ws, 3).unwrap();
+
+        // 6 tokens at page 4 spans slabs 0 and 1.
+        let out = prepare_many(&mut store, &[ws], &buffer_plan(0, vec![6])).unwrap();
         assert_eq!(
-            store.folded_slot(ws).unwrap().map(|s| s.0),
-            Some(ids[0]),
-            "fail-stop: the published mapping stays authoritative"
+            out.slot_ids,
+            vec![folded.0],
+            "a buffered fire still names the folded slot it reads"
         );
+        assert_eq!(out.slot_flags, vec![0], "a buffered fire never resets");
+        assert_eq!(out.fold_lens, vec![0], "nothing is folded here");
+        assert_eq!(out.buffer_slot_ids.len(), 2);
+        assert_eq!(out.buffer_slot_indptr, vec![0, 2], "CSR: one row, 2 slabs");
+        settle(&mut store, out.txn);
+
+        assert_eq!(
+            store.folded_slot(ws).unwrap(),
+            Some(folded),
+            "the folded state is untouched, so the tokens stay abandonable"
+        );
+        assert_eq!(store.resolve_buffer(ws, 0, 6).unwrap().len(), 2);
     }
 
     #[test]
-    fn two_rows_lower_distinct_slots_in_request_order() {
-        let mut store = RsStore::new(4);
-        let first = store.create_working_set(geom());
-        let second = store.create_working_set(geom());
-        let (_, _, _, txn) = prepare(&mut store, first).unwrap();
-        settle(&mut store, Some(txn));
-        let (_, _, _, txn) = prepare(&mut store, second).unwrap();
-        settle(&mut store, Some(txn));
-        let first_slot = store.folded_slot(first).unwrap().unwrap().0;
-        let second_slot = store.folded_slot(second).unwrap().unwrap().0;
+    fn a_second_buffered_chunk_appends_to_later_slabs() {
+        let mut store = RsStore::new(8);
+        let ws = warm(&mut store);
+        store.alloc_buffer(ws, 3).unwrap();
 
-        let (ids, flags, copies, txn) = prepare_many(&mut store, &[second, first]).unwrap();
-        assert_eq!(ids, vec![second_slot, first_slot]);
-        assert_ne!(ids[0], ids[1]);
-        assert_eq!(flags, vec![0, 0]);
-        assert_eq!(copies, (Vec::new(), Vec::new()));
-        settle(&mut store, txn);
-    }
+        let first = prepare_many(&mut store, &[ws], &buffer_plan(0, vec![4])).unwrap();
+        let first_slab = first.buffer_slot_ids.clone();
+        settle(&mut store, first.txn);
 
-    #[test]
-    fn duplicate_parent_forks_get_independent_cow_children() {
-        let mut store = RsStore::new(6);
-        let parent = store.create_working_set(geom());
-        let (_, _, _, txn) = prepare(&mut store, parent).unwrap();
-        settle(&mut store, Some(txn));
-        let parent_slot = store.folded_slot(parent).unwrap().unwrap().0;
-        let left = store.fork(parent).unwrap();
-        let right = store.fork(parent).unwrap();
-
-        let (ids, flags, (src, dst), txn) = prepare_many(&mut store, &[left, right]).unwrap();
-        assert_eq!(src, vec![parent_slot, parent_slot]);
-        assert_eq!(dst, ids);
-        assert_ne!(ids[0], ids[1]);
-        assert_eq!(flags, vec![0, 0]);
-        settle(&mut store, txn);
-
-        assert_eq!(store.folded_slot(parent).unwrap().unwrap().0, parent_slot);
+        let second = prepare_many(&mut store, &[ws], &buffer_plan(4, vec![4])).unwrap();
+        assert_eq!(second.buffer_slot_indptr, vec![0, 1]);
         assert_ne!(
-            store.folded_slot(left).unwrap(),
-            store.folded_slot(right).unwrap()
+            second.buffer_slot_ids, first_slab,
+            "a page-aligned successor chunk takes the NEXT slab"
         );
+        settle(&mut store, second.txn);
+    }
+
+    #[test]
+    fn fold_buffered_lowers_the_prefix_csr_and_advances_the_boundary() {
+        let mut store = RsStore::new(8);
+        let ws = warm(&mut store);
+        let folded = store.folded_slot(ws).unwrap().unwrap();
+        store.alloc_buffer(ws, 3).unwrap();
+        let write = prepare_many(&mut store, &[ws], &buffer_plan(0, vec![12])).unwrap();
+        let slabs = write.buffer_slot_ids.clone();
+        settle(&mut store, write.txn);
+        assert_eq!(slabs.len(), 3);
+
+        // Fold the first 8 buffered tokens = slabs 0 and 1.
+        let out =
+            prepare_many(&mut store, &[ws], &RsPlan::FoldBuffered { tokens: vec![8] }).unwrap();
+        assert_eq!(out.fold_lens, vec![8]);
+        assert_eq!(out.buffer_slot_indptr, vec![0, 2]);
+        assert_eq!(
+            out.buffer_slot_ids,
+            slabs[..2].to_vec(),
+            "the fold gathers the buffered PREFIX, from slab zero"
+        );
+        assert_eq!(
+            out.slot_ids,
+            vec![folded.0],
+            "the fold writes the working set's own folded slot in place"
+        );
+        settle(&mut store, out.txn);
+
+        assert_eq!(
+            store.buffer_size(ws).unwrap(),
+            1,
+            "the two fully covered head slabs are dropped"
+        );
+    }
+
+    #[test]
+    fn a_cold_working_set_cannot_buffer_or_fold() {
+        let mut store = RsStore::new(4);
+        let ws = store.create_working_set(geom());
+        store.alloc_buffer(ws, 2).unwrap();
+
+        let error = prepare_many(&mut store, &[ws], &buffer_plan(0, vec![4])).unwrap_err();
+        assert!(error.contains("no folded state"), "{error}");
+        let error =
+            prepare_many(&mut store, &[ws], &RsPlan::FoldBuffered { tokens: vec![4] }).unwrap_err();
+        assert!(error.contains("no folded state"), "{error}");
+        assert_eq!(store.available_slots(), 4, "nothing leaked");
+    }
+
+    #[test]
+    fn fold_beyond_the_buffer_is_rejected_before_any_allocation() {
+        let mut store = RsStore::new(8);
+        let ws = warm(&mut store);
+        store.alloc_buffer(ws, 1).unwrap(); // capacity 4 tokens
+        let free = store.available_slots();
+        assert!(
+            prepare_many(&mut store, &[ws], &RsPlan::FoldBuffered { tokens: vec![8] }).is_err()
+        );
+        assert_eq!(store.available_slots(), free, "nothing leaked");
+    }
+
+    #[test]
+    fn demand_counts_buffered_materialization() {
+        let mut store = RsStore::new(8);
+        let ws = warm(&mut store);
+        store.alloc_buffer(ws, 3).unwrap();
+
+        assert_eq!(
+            demand(&store, &[ws], &RsPlan::Fold).unwrap(),
+            0,
+            "an in-place fold allocates nothing"
+        );
+        assert_eq!(
+            demand(&store, &[ws], &buffer_plan(0, vec![12])).unwrap(),
+            3,
+            "three reserved slabs must be materialized"
+        );
+
+        let write = prepare_many(&mut store, &[ws], &buffer_plan(0, vec![12])).unwrap();
+        settle(&mut store, write.txn);
+        assert_eq!(
+            demand(&store, &[ws], &buffer_plan(0, vec![12])).unwrap(),
+            0,
+            "rewriting materialized, uniquely owned slabs is in place"
+        );
+
+        let forked = store.fork(ws).unwrap();
+        assert_eq!(
+            demand(&store, &[forked], &buffer_plan(0, vec![12])).unwrap(),
+            3,
+            "after a fork every touched slab copies on write"
+        );
+    }
+
+    #[test]
+    fn buffered_rows_lower_one_csr_span_each() {
+        let mut store = RsStore::new(12);
+        let first = warm(&mut store);
+        let second = warm(&mut store);
+        store.alloc_buffer(first, 2).unwrap();
+        store.alloc_buffer(second, 2).unwrap();
+
+        let out = prepare_many(&mut store, &[first, second], &buffer_plan(0, vec![8, 4])).unwrap();
+        assert_eq!(out.slot_ids.len(), 2);
+        assert_eq!(
+            out.buffer_slot_indptr,
+            vec![0, 2, 3],
+            "R+1 boundaries, leading zero, monotonic"
+        );
+        assert_eq!(out.buffer_slot_ids.len(), 3);
+        settle(&mut store, out.txn);
     }
 
     #[test]
     fn no_working_sets_prepares_nothing() {
         let mut store = RsStore::new(2);
-        let (ids, flags, copies, txn) = prepare_many(&mut store, &[]).unwrap();
-        assert!(ids.is_empty() && flags.is_empty());
-        assert_eq!(copies, (Vec::new(), Vec::new()));
-        assert!(txn.is_none());
+        let out = prepare_many(&mut store, &[], &RsPlan::Fold).unwrap();
+        assert!(out.slot_ids.is_empty() && out.slot_flags.is_empty());
+        assert!(out.buffer_slot_indptr.is_empty(), "no CSR without rows");
+        assert!(out.txn.is_none());
         assert_eq!(store.available_slots(), 2);
     }
 
@@ -399,7 +654,7 @@ mod tests {
     fn aliased_rows_are_rejected_before_any_allocation() {
         let mut store = RsStore::new(4);
         let ws = store.create_working_set(geom());
-        assert!(prepare_many(&mut store, &[ws, ws]).is_err());
+        assert!(prepare_many(&mut store, &[ws, ws], &RsPlan::Fold).is_err());
         assert_eq!(store.available_slots(), 4);
         assert_eq!(store.folded_slot(ws).unwrap(), None);
     }
@@ -409,25 +664,24 @@ mod tests {
         let mut store = RsStore::new(1);
         let first = store.create_working_set(geom());
         let second = store.create_working_set(geom());
-        assert!(prepare_many(&mut store, &[first, second]).is_err());
+        assert!(prepare_many(&mut store, &[first, second], &RsPlan::Fold).is_err());
         assert_eq!(store.folded_slot(first).unwrap(), None);
         assert_eq!(store.folded_slot(second).unwrap(), None);
         assert_eq!(store.available_slots(), 1);
     }
 
     #[test]
-    fn folded_lowering_never_uses_a_buffered_slot() {
-        let mut store = RsStore::new(3);
+    fn failed_fire_keeps_the_published_state() {
+        let mut store = RsStore::new(2);
         let ws = store.create_working_set(geom());
-        store.alloc_buffer(ws, 1).unwrap();
-        let buffered = store.prepare_write(ws, false, Some((0, 1))).unwrap();
-        let buffer_slot = buffered.buffer_targets()[0].dst().0;
-        let published = store.publish_prepared(buffered).unwrap();
-        store.settle(published);
-
-        let (ids, _, _, txn) = prepare(&mut store, ws).unwrap();
-        assert_ne!(ids, vec![buffer_slot]);
-        settle(&mut store, Some(txn));
+        let out = prepare(&mut store, ws).unwrap();
+        let ids = out.slot_ids.clone();
+        settle(&mut store, out.txn); // the fire failed on the device
+        assert_eq!(
+            store.folded_slot(ws).unwrap().map(|s| s.0),
+            Some(ids[0]),
+            "fail-stop: the published mapping stays authoritative"
+        );
     }
 
     #[test]

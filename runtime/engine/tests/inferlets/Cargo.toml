@@ -10,6 +10,7 @@ members = [
     "generate-gdn",
     "generate-gdn-n1",
     "generate-gdn-frame",
+    "gdn-foldcommit",
     "grammar",
     "grammar-late",
     "grammar-wit-bench",
