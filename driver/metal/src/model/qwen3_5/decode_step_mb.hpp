@@ -46,6 +46,16 @@ void bind_decode_dag_mb(RawMetalContext& ctx, const BoundDecode& b,
                         bool gdn_prep = true,
                         const MbBindOffsets& offsets = {});
 
+// Encodes every prompt token's DAG dispatch-major rather than token-major, so
+// each weight tensor is read once for the whole prompt. Falls back to
+// token-major if the per-token DAGs are not the same shape.
+void encode_prefill_dags_mb(StepEncoder& se,
+                            const std::vector<std::vector<Dispatch>>& dags,
+                            int n_tokens,
+                            const DecodeStepPsos& base_psos,
+                            const MultiBatchPsos& mb_psos,
+                            bool force_barriers);
+
 void encode_decode_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
                            const DecodeStepPsos& base_psos, const MultiBatchPsos& mb_psos,
                            bool force_barriers = false);

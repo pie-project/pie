@@ -265,38 +265,84 @@ pub fn emit_grouped_fused_region(
         .copied()
         .chain(region.sinks.iter().map(|sink| sink.value))
         .collect();
-    let mut alias: BTreeMap<u32, u32> = BTreeMap::new();
     let value_types = &stage.normalized.value_types;
-    // Element count, and only when every extent is static: a symbolic dim could
-    // resolve differently for the two values and the copy would not be a view.
-    let static_elements = |value: u32| -> Option<u64> {
+    // What the runtime actually does for a reshape is
+    // `m1_copy_typed(src, dst, dst_desc.len, dtype)` -- it takes the *result's*
+    // element count from offset 0 of the source. So the result is a prefix view
+    // of the source whenever the source is at least as long, and pointing
+    // consumers at the source reproduces it byte for byte: they read through
+    // the result's own descriptor, so they still read exactly `dst.len`.
+    //
+    // Comparing lengths must survive symbolic extents, because the one graph
+    // that needs this is the sampler, whose reshape is
+    // `[SampledRows, vocab] -> [vocab]`. Splitting a shape into its static
+    // product and the multiset of its symbolic ids is enough: if the result's
+    // symbolic ids are a sub-multiset of the source's and its static product is
+    // no larger, the result is no longer than the source under every binding.
+    // (An earlier version demanded fully static extents on both sides and so
+    // never fired at all.)
+    let footprint = |value: u32| -> Option<(u8, u64, Vec<u8>)> {
         let ty = value_types.get(value as usize)?;
-        let mut total: u64 = 1;
+        let mut statics: u64 = 1;
+        let mut symbolic: Vec<u8> = Vec::new();
         for dim in &ty.dims {
             match dim {
-                Dimension::Static(extent) => total *= u64::from(*extent),
-                Dimension::Symbolic(_) => return None,
+                Dimension::Static(extent) => statics *= u64::from(*extent),
+                Dimension::Symbolic(id) => symbolic.push(*id as u8),
             }
         }
-        Some(total)
+        symbolic.sort_unstable();
+        Some((ty.dtype as u8, statics, symbolic))
     };
-    let same_footprint =
-        |a: u32, b: u32| match (value_types.get(a as usize), value_types.get(b as usize)) {
-            (Some(x), Some(y)) if x.dtype == y.dtype => {
-                matches!((static_elements(a), static_elements(b)),
-                         (Some(m), Some(n)) if m == n)
+    // `result` is never longer than `source`, whatever the symbolic dims are.
+    let covers = |source: u32, result: u32| match (footprint(source), footprint(result)) {
+        (Some((src_dtype, src_static, src_symbolic)), Some((dst_dtype, dst_static, mut dst_symbolic))) => {
+            if src_dtype != dst_dtype || dst_static > src_static {
+                return false;
             }
-            _ => false,
-        };
+            let mut remaining = src_symbolic;
+            dst_symbolic.retain(|id| match remaining.iter().position(|kept| kept == id) {
+                Some(at) => {
+                    remaining.remove(at);
+                    false
+                }
+                None => true,
+            });
+            dst_symbolic.is_empty()
+        }
+        _ => false,
+    };
+
+    // Decided before anything is emitted, because the gather/argmax fusion below
+    // has to see through these aliases to recognise its pattern.
+    let is_view_reshape = |node: usize| -> bool {
+        let Some(op) = ops.get(node) else { return false };
+        op.tag == tags::RESHAPE
+            && op.results == 1
+            && op.args.len() == 1
+            && !escapes.contains(&bases[node])
+            && covers(op.args[0], bases[node])
+    };
+    let mut alias: BTreeMap<u32, u32> = BTreeMap::new();
+    for &node in &region.nodes {
+        let node = node.index();
+        if is_view_reshape(node) {
+            let arg = ops[node].args[0];
+            alias.insert(bases[node], resolve_alias(&alias, arg));
+        }
+    }
 
     // A logits gather whose only consumer is an argmax does not need to exist:
     // the pair fuses into one pass over the bf16 row. Decided up front because
     // the gather is emitted before the argmax is reached.
     let mut consumers: BTreeMap<u32, usize> = BTreeMap::new();
     for &node in &region.nodes {
+        if is_view_reshape(node.index()) {
+            continue;
+        }
         if let Some(op) = ops.get(node.index()) {
             for &arg in &op.args {
-                *consumers.entry(arg).or_insert(0) += 1;
+                *consumers.entry(resolve_alias(&alias, arg)).or_insert(0) += 1;
             }
         }
     }
@@ -308,7 +354,7 @@ pub fn emit_grouped_fused_region(
         if op.tag != tags::REDUCE_ARGMAX || op.args.len() != 1 {
             continue;
         }
-        let source_value = op.args[0];
+        let source_value = resolve_alias(&alias, op.args[0]);
         if consumers.get(&source_value).copied().unwrap_or(0) != 1
             || escapes.contains(&source_value)
         {
@@ -349,13 +395,7 @@ pub fn emit_grouped_fused_region(
             source.push_str("  if (status->state != 1) return;\n");
             continue;
         }
-        if op.tag == tags::RESHAPE
-            && op.results == 1
-            && op.args.len() == 1
-            && !escapes.contains(&base)
-            && same_footprint(op.args[0], base)
-        {
-            alias.insert(base, resolve_alias(&alias, op.args[0]));
+        if is_view_reshape(node) {
             continue;
         }
         let mut slots = Slots::of(op, base, |value| value_ptr(resolve_alias(&alias, value)));

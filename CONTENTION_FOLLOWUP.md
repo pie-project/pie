@@ -3150,3 +3150,145 @@ instantiation and amortizes away on a long-lived server; the per-turnover gap
 does not. Tracked as an open finding — the change touches the same permit
 accounting that §20.4's forfeit path depends on and needs its own contention
 evidence.
+
+## 20.14 The turnover barrier: one fix landed, eight levers closed
+
+§20.13 named the cost. This section is the attempt to remove it. One change
+landed; every other lever that could plausibly have removed the remaining gap
+was implemented or configured and then **measured worse or neutral**, so they
+are recorded here as closed rather than as future work.
+
+### The change that landed: free the execution seat at `ProcessCtx::drop`
+
+`TeardownFireContext` declared `_execution_permit` after `resources` so it
+dropped last, deliberately: "strict admission advances only after pooled
+resources are released". The consequence was that a seat was freed when the
+predecessor finished *tearing down*, not when it stopped producing tokens.
+
+Measured cost of that ordering (conc 512, 4096 requests, p50):
+
+| interval | before | after |
+| --- | ---: | ---: |
+| guest return -> `Drop` entered | 0.04 ms | 0.04 ms |
+| `Drop` -> permit released | — | **0.011 ms** |
+| `Drop` -> teardown task starts | 16.29 ms | 27.37 ms *(now off the critical path)* |
+| teardown task -> finalize | 11.51 ms | 0.00 ms |
+| **guest return -> permit released** | **27.84 ms** | **~0.05 ms** |
+
+The permit is already in hand inside `Drop`, so no new liveness signal was
+needed. `ProcessCtx::drop` now posts the Terminate leave with a per-driver
+oneshot, broadcasts the release, drops the permit, and hands the *fences* to
+`defer_resource_teardown`; the fence wait, `finalize_all` and the page recycle
+run behind the successor instead of in front of it. Leave-before-release
+ordering is preserved (same producer, FIFO), which is what `departing` relies
+on.
+
+This also **deletes a failure mode**. The old no-runtime error path
+`mem::forget`-ed the context and therefore destroyed the seat, which is why
+`ExecutionSlotForfeited` existed at all. With the permit out of the context the
+permit can no longer leak, so the forfeit item, its handler
+(`on_execution_slot_forfeited`), its dispatch arm and its test are gone.
+
+Effect on the boundary is exactly as intended and is visible per herd
+(conc 512, 8 cohorts, retirement herds detected by a 200 ms gap):
+
+| herd | retirements | ret span | admits | admit span | first admit − first retire | last admit − last retire |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 512 | 43.9 ms | 512 | 74.5 ms | **0.7 ms** | 31.3 ms |
+| 3 | 512 | 41.4 ms | 512 | 83.1 ms | **0.4 ms** | 42.1 ms |
+| 6 | 512 | 49.7 ms | 512 | 92.3 ms | **0.4 ms** | 43.0 ms |
+
+The handoff is now immediate. **It does not convert to throughput** — the
+4-point cohort sweep moved +0.30 / +1.01 / −0.34 / +1.86 %, i.e. noise, and the
+turnover gap itself did not shrink (106.7 -> 112.7 ms). The bottleneck moved,
+it did not disappear: 512 admissions still take ~80 ms to drain at ~156 us
+each. Retirement and bring-up are **host-CPU bound** and contend for the same
+tokio runtime while the GPU idles.
+
+The change is kept anyway: it is a strict improvement in ordering, it removes
+the leak-destroys-a-seat path, and any future overlap of the swap depends on
+seats genuinely freeing early.
+
+### Closed by measurement (conc 512, 4096 requests, `--max-tokens 128`)
+
+| # | lever | result |
+| --- | --- | ---: |
+| 1 | execution admission cap x2 / x4 (pre-§20.14) | +0.85 % / −1.2 % |
+| 2 | execution admission cap x1.25 / x1.5 (**re-tested after the seat fix**) | **26543 / 29674** vs 30402 |
+| 3 | `PIE_SCHED_MAX_IN_FLIGHT` 1 / 3 | 22169 / 30582 vs 30578 |
+| 4 | `--worker-threads` 16 / 32 / 64 | all <= default |
+| 5 | bind staging depth `STAGED_COHORTS` 2 / 3 | 30054 / 30109 vs 30443 |
+| 6 | bounded swap hold, 2 ms (early seal during a swap) | **18852** vs 30008 (−38 %) |
+| 7 | bounded swap hold, 32 ms | 30627 vs 30443 (noise) |
+| 8 | prioritise launches over controls on the driver lane | already implemented |
+
+Four of these are worth their own paragraph, because each kills a *theory*, not
+just a setting.
+
+**Cohort overlap is not available through the cap (#1, #2).** The obvious fix
+for a swap is to let the successor cohort start decoding before the predecessor
+finishes retiring, which needs more execution seats than the offered
+concurrency. It was re-tested after the seat fix, because the original test ran
+while releases were still 27.8 ms late and could have been confounded. It is
+not: x1.25 costs 13 %. Admitting more than the driver's `max_forward_requests`
+worth of processes cannot widen a batch — one fire per process per forward — it
+only makes batches ragged, and `init_admission` already predicted the outcome
+("without an earmarked taker the stall just moves into mid-generation seals").
+
+**The seal is not the lever (#6, #7) — third independent confirmation.** The
+wait-all gate holds when `joining` is true even with the GPU idle, so bounding
+that hold and dispatching whoever is ready looks like free throughput. It is
+the opposite: at conc 512 the *entire cohort* swaps at once, so the ready set
+during the gap is the handful of successors that happen to have arrived. The
+seal fires a ~20-row wave instead of a 1024-row one, and those 20 lanes are then
+a token ahead of the other 492, so every subsequent boundary pays to re-merge
+them (run-ahead lead is hysteretic). Wave count and p50 rows were unchanged
+(592 -> 614 waves, p50 1024 both) while wall doubled — the damage is idle, not
+fragmentation. A 32 ms bound is harmless only because it almost never fires.
+`joining` exists precisely to keep a turnover in one dense epoch, and the
+measurement says it earns its keep.
+
+**Bind staging is already deep enough (#5).** The bind pool is
+`concurrency * (1 + STAGED_COHORTS)`, and at saturation it is exactly full, so
+a staged process can only take its permit once a retiring one closes its
+instance — the staging burst is synchronised to the turnover by construction.
+Raising the depth to 2 or 3 removes that synchronisation and changes nothing,
+because the binds were never late: per-process, **both** driver binds finish
+~2.0 s before that process is admitted (p50 −2043 ms and −1984 ms). Only the
+first cohort binds at its own admission, which is the startup gap.
+
+**The driver control storm is a symptom, not a cause (#8).** During a turnover
+window the driver lane is 38–57 % occupied by control ops, dominated by 400–600
+`register_channels_bind` at ~120 us each (`set_us` 53 us in the engine's
+`register_channel_set`, `bind_us` 29 us in `bind_instance`, of which the actual
+per-channel work is ~1 %: 73746 channel registrations sum to 12 ms of
+alloc+init+mirror). That looks like the launch thread being stolen at the worst
+moment, and it is not: `DriverLane::next_request` already polls the launch queue
+first and only falls through to controls, so a pending launch preempts within
+one op. The lane is draining staged binds *because* the seal has nothing to
+launch, not the other way round.
+
+### Where the cost actually is
+
+Everything above is elimination. What survives is the §20.13 decomposition,
+now with the seat-handoff term removed:
+
+```
+last decode settle -> first guest return    5.9 ms
+guest exit spread (512 WASM guests)        45.5 ms   <- dominant
+seat handoff                               ~0.05 ms  <- was 27.8 ms
+successor admission drain                  ~80 ms, overlapping the above
+```
+
+512 guests returning from `main` and 512 successors running to their first
+submit are real host work on the same runtime, and the wait-all seal cannot
+start until the last of them lands. No configuration removes it; the only
+shapes that could are (a) making per-process bring-up and teardown
+substantially cheaper, or (b) a seal quorum that tolerates a partial fleet
+*without* letting the admitted subset run ahead — which is a different and much
+larger design than the bounded hold tried in #6.
+
+The tax is ~4.8 % of wall at every concurrency (§20.13). It is only *visible* at
+256 and above because pie's per-step advantage over vLLM decays with batch width
+(+7.1 % at 128, +1.7 % at 256, +1.1 % at 512), so a flat tax flips the sign
+exactly where the measured ratio flips.

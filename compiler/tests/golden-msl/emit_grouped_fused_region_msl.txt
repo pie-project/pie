@@ -34,7 +34,7 @@
 #   value, which in the sampler's graph was a vocabulary-wide round trip through
 #   device memory for nothing.
 # REGENERATED: the body below is this compiler's output, not the recorded output of the source of truth above
-#   reason: the fused argmax strides by the emit-time region width so the compiler sees a constant
+#   reason: reshape elision now recognises a prefix view, so the sampler's vocabulary-wide reshape and its logits gather both fuse away
 === beam_epilogue#0 singleton#0
 function_name: ptir_m3s_b4fadd8446eb58dd_r0
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
@@ -5108,7 +5108,7 @@ kernel void ptir_m3s_f2566cc0c1e0529a_r4(
 function_name: ptir_m3_f2566cc0c1e0529a_r0
 region: library=0 library_op=0 schedule=1 nodes=6 inputs=0 outputs=0 sinks=2
 ok: true
-source: bytes=46453 prefix=@runtime+@grouped tail_bytes=5872
+source: bytes=47042 prefix=@runtime+@grouped tail_bytes=6461
 kernel void ptir_m3_f2566cc0c1e0529a_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -5151,29 +5151,43 @@ kernel void ptir_m3_f2566cc0c1e0529a_r0(
   const device uchar* current_1 = reinterpret_cast<const device uchar*>(pending_flags[pending_index_1] != 0 ? channel_1.pending_cell : channel_1.committed_cell);
   device uchar* pending_1 = reinterpret_cast<device uchar*>(channel_1.pending_cell);
   {
-    const uint gather_begin = m3_tid;
-    const uint gather_step = m3_threads;
-    const M1ValueDesc intrinsic_desc = descriptors[0];
-    const uint intrinsic_row_base = 0u;
-    if (layout->vocab == 0u || intrinsic_desc.len % layout->vocab != 0u || intrinsic_row_base > row_meta.count || intrinsic_desc.len / layout->vocab > row_meta.count - intrinsic_row_base) { m1_fault(status, 0xA0u); return; }
-    device float* intrinsic_out = reinterpret_cast<device float*>(scratch + offsets[0]);
-    const uint gather_vocab = layout->vocab;
-    const uint gather_rows = intrinsic_desc.len / gather_vocab;
-    const uint gather_row_base = row_meta.offset + intrinsic_row_base;
-    for (uint gr = 0u; gr < gather_rows; ++gr) {
-      const uint source_row = row_indices[gather_row_base + gr];
-      const device bfloat* gather_src = logits + ulong(source_row) * gather_vocab;
-      device float* gather_dst = intrinsic_out + ulong(gr) * gather_vocab;
-      for (uint column = gather_begin; column < gather_vocab; column += gather_step) {
-        gather_dst[column] = float(gather_src[column]);
+    const M1ValueDesc am_in = descriptors[0];
+    const uint am_row_base = row_meta.offset + 0u;
+    const uint am_vocab = layout->vocab;
+    if (am_vocab == 0u || am_in.last != am_vocab || am_in.rows > row_meta.count) { m1_fault(status, 0xA0u); return; }
+    device int* am_out = reinterpret_cast<device int*>(scratch + offsets[2]);
+    for (uint am_r = 0u; am_r < am_in.rows; ++am_r) {
+      const uint am_src_row = row_indices[am_row_base + am_r];
+      const device bfloat* am_src = logits + ulong(am_src_row) * am_vocab;
+      M1ArgmaxCandidate am_best = {-INFINITY, 0u, 0u, 0u};
+      M1ArgmaxCandidate am_b1 = am_best, am_b2 = am_best, am_b3 = am_best;
+      constexpr uint am_w = 512u;
+      uint am_c = m3_tid;
+      for (; am_c + 3u * am_w < am_vocab; am_c += 4u * am_w) {
+        const float v0 = float(am_src[am_c]);
+        const float v1 = float(am_src[am_c + am_w]);
+        const float v2 = float(am_src[am_c + 2u * am_w]);
+        const float v3 = float(am_src[am_c + 3u * am_w]);
+        am_best = m1_argmax_combine(am_best, M1ArgmaxCandidate{v0, am_c, isnan(v0) ? 0u : 1u, 0u});
+        am_b1 = m1_argmax_combine(am_b1, M1ArgmaxCandidate{v1, am_c + am_w, isnan(v1) ? 0u : 1u, 0u});
+        am_b2 = m1_argmax_combine(am_b2, M1ArgmaxCandidate{v2, am_c + 2u * am_w, isnan(v2) ? 0u : 1u, 0u});
+        am_b3 = m1_argmax_combine(am_b3, M1ArgmaxCandidate{v3, am_c + 3u * am_w, isnan(v3) ? 0u : 1u, 0u});
       }
+      for (; am_c < am_vocab; am_c += am_w) {
+        const float am_v = float(am_src[am_c]);
+        am_best = m1_argmax_combine(am_best, M1ArgmaxCandidate{am_v, am_c, isnan(am_v) ? 0u : 1u, 0u});
+      }
+      am_best = m1_argmax_combine(m1_argmax_combine(am_best, am_b1), m1_argmax_combine(am_b2, am_b3));
+      m3_tgbuf[m3_tid] = am_best;
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (uint am_s = 1u; am_s < m3_threads; am_s <<= 1) {
+        if ((m3_tid % (2u * am_s)) == 0u && m3_tid + am_s < m3_threads) m3_tgbuf[m3_tid] = m1_argmax_combine(m3_tgbuf[m3_tid], m3_tgbuf[m3_tid + am_s]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      }
+      if (m3_tid == 0) am_out[am_r] = int(m3_tgbuf[0].index);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
     }
   }
-  threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
-  ptir_m1_execute_mt(57u, status, descriptors, lane_params + 1, scratch + offsets[0], scratch, scratch, scratch + offsets[1], scratch, temporary, m3_tid, m3_threads, m3_tgbuf);
-  threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
-  if (status->state != 1) return;
-  ptir_m1_execute_mt(51u, status, descriptors, lane_params + 2, scratch + offsets[1], scratch, scratch, scratch + offsets[2], scratch, temporary, m3_tid, m3_threads, m3_tgbuf);
   threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
   if (status->state != 1) return;
   ptir_m1_execute_mt(57u, status, descriptors, lane_params + 3, scratch + offsets[2], scratch, scratch, scratch + offsets[3], scratch, temporary, m3_tid, m3_threads, m3_tgbuf);
@@ -11429,7 +11443,7 @@ kernel void ptir_m3s_4cf3882bf2fff913_r11(
 function_name: ptir_m3_4cf3882bf2fff913_r0
 region: library=0 library_op=0 schedule=1 nodes=19 inputs=0 outputs=0 sinks=4
 ok: true
-source: bytes=51906 prefix=@runtime+@grouped tail_bytes=11325
+source: bytes=51620 prefix=@runtime+@grouped tail_bytes=11039
 kernel void ptir_m3_4cf3882bf2fff913_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -11506,9 +11520,6 @@ kernel void ptir_m3_4cf3882bf2fff913_r0(
     }
   }
   threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
-  ptir_m1_execute_mt(57u, status, descriptors, lane_params + 1, scratch + offsets[0], scratch, scratch, scratch + offsets[1], scratch, temporary, m3_tid, m3_threads, m3_tgbuf);
-  threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
-  if (status->state != 1) return;
   ptir_m1_execute_mt(144u, status, descriptors, lane_params + 2, current_0, scratch, scratch, scratch + offsets[2], scratch, temporary, m3_tid, m3_threads, m3_tgbuf);
   threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
   if (status->state != 1) return;
@@ -11521,7 +11532,7 @@ kernel void ptir_m3_4cf3882bf2fff913_r0(
   ptir_m1_execute_mt(129u, status, descriptors, lane_params + 5, scratch, scratch, scratch, scratch + offsets[5], scratch, temporary, m3_tid, m3_threads, m3_tgbuf);
   threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
   if (status->state != 1) return;
-  ptir_m1_execute_mt(32u, status, descriptors, lane_params + 6, scratch + offsets[3], scratch + offsets[1], scratch + offsets[5], scratch + offsets[6], scratch, temporary, m3_tid, m3_threads, m3_tgbuf);
+  ptir_m1_execute_mt(32u, status, descriptors, lane_params + 6, scratch + offsets[3], scratch + offsets[0], scratch + offsets[5], scratch + offsets[6], scratch, temporary, m3_tid, m3_threads, m3_tgbuf);
   threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
   if (status->state != 1) return;
   ptir_m1_execute_mt(16u, status, descriptors, lane_params + 7, scratch + offsets[6], scratch + offsets[4], scratch, scratch + offsets[7], scratch, temporary, m3_tid, m3_threads, m3_tgbuf);

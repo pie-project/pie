@@ -306,20 +306,18 @@ pub(super) struct FramePolicy {
     joins_in_flight: BTreeSet<ProcessId>,
     /// Processes that consumed an execution slot and still hold it. A
     /// Terminate leave of a member moves it to `departing`: its slot is
-    /// now certain to resolve (the permit's only exit is the capped
-    /// teardown, which broadcasts the release — or, on the no-runtime
-    /// error path, an explicit forfeit — after its terminate leave).
+    /// now certain to resolve (the permit's only exit is `ProcessCtx::drop`,
+    /// which broadcasts the release immediately after posting the leave).
     slotted: BTreeSet<ProcessId>,
-    /// Slot holders between their Terminate leave and their teardown's
-    /// release (or forfeit) broadcast, identity-paired. The leave is
-    /// delivered pass-granular while the release waits on the teardown
-    /// task, so a seal check in that window sees a zero `pending_slots`
-    /// balance with departures already recorded — without this set the
+    /// Slot holders between their Terminate leave and their release
+    /// broadcast, identity-paired. Both are posted back-to-back by
+    /// `ProcessCtx::drop`, but the worker processes them pass-granular, so a
+    /// seal check landing between the two sees a zero `pending_slots`
+    /// balance with the departure already recorded — without this set the
     /// seal would close on the partial cohort and split the fleet, and
     /// the split persists for the rest of the run (run-ahead lead is
-    /// hysteretic). Every entry resolves: the same teardown that owns the
-    /// permit sends the disarm after its leave (same-producer FIFO), and
-    /// the leaked-permit error path disarms via forfeit.
+    /// hysteretic). Every entry resolves: the retiring process posts the
+    /// disarm right after its leave, on the same producer (FIFO).
     departing: BTreeSet<ProcessId>,
     /// Processes the planner has suspended (evicted) and not yet observed
     /// running again. While a process is marked here its lanes never
@@ -545,15 +543,6 @@ impl FramePolicy {
         self.pending_slots += 1;
     }
 
-    /// The no-runtime teardown error path leaked the holder's permit
-    /// (`std::mem::forget`): the slot is destroyed, not freed. Resolves the
-    /// departure WITHOUT crediting `pending_slots` — the semaphore capacity
-    /// shrank by one and the balance must agree, and a departure entry that
-    /// never resolves would hold every seal with a staged successor.
-    pub fn on_execution_slot_forfeited(&mut self, pid: ProcessId) {
-        self.departing.remove(&pid);
-    }
-
     /// A process acquired its execution permit (every capped admission
     /// notifies, uncontended ones included). Its first fire is imminent:
     /// the seal now waits for `pid` ITSELF, identity-paired, so no event
@@ -569,9 +558,9 @@ impl FramePolicy {
         }
     }
 
-    /// A slot holder's Terminate leave arrived: its release (or forfeit)
-    /// broadcast is now in flight (the permit's only exit is the capped
-    /// teardown, which leaves first and resolves second). The seal treats
+    /// A slot holder's Terminate leave arrived: its release broadcast is
+    /// now in flight (the permit's only exit is `ProcessCtx::drop`, which
+    /// leaves first and resolves second). The seal treats
     /// the imminent slot like a freed one — without this, a seal check
     /// between the leave and the resolution sees `pending_slots == 0` and
     /// closes on a partial cohort. Guarded on `slotted` so only an actual
@@ -1848,36 +1837,6 @@ mod tests {
                 FramePlan::Dispatch(_)
             ),
             "a retired departure must leave no phantom hold"
-        );
-    }
-
-    /// A forfeited slot (the leaked-permit teardown error path) resolves
-    /// its holder's departure WITHOUT crediting the balance: the seal
-    /// stops waiting, and no phantom free slot earmarks a staged
-    /// successor that can never admit.
-    #[test]
-    fn forfeit_resolves_departure_without_freeing_a_slot() {
-        let mut policy = FramePolicy::new(2, 64, 4096, None);
-        let lane = pid();
-        let holder = pid();
-        let successor = pid();
-        policy.on_execution_slot_consumed(holder);
-        policy.on_fire_enqueued(stamp(lane, 0, 0, 1), Some(lane), 95, 1, 1);
-        policy.on_bind_enqueued(Some(successor));
-        policy.on_bind_completed(Some(successor));
-        policy.on_slotted_terminate(holder);
-        let queued: QueuedFireIds = [95].into_iter().collect();
-        match drive_past_cold_hold(&mut policy, &queued) {
-            FramePlan::Hold(_) => {}
-            plan => panic!("an unresolved departure must hold, got {plan:?}"),
-        }
-        policy.on_execution_slot_forfeited(holder);
-        assert!(
-            matches!(
-                drive_past_cold_hold(&mut policy, &queued),
-                FramePlan::Dispatch(_)
-            ),
-            "a forfeited slot must neither hold nor earmark"
         );
     }
 

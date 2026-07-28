@@ -21,7 +21,7 @@
 #   value, which in the sampler's graph was a vocabulary-wide round trip through
 #   device memory for nothing.
 # REGENERATED: the body below is this compiler's output, not the recorded output of the source of truth above
-#   reason: the fused argmax strides by the emit-time region width so the compiler sees a constant
+#   reason: reshape elision now recognises a prefix view, so the sampler's vocabulary-wide reshape and its logits gather both fuse away
 === tag_0x00
 function_name: ptir_m1_feedfacecafebeef_r0
 ok: true
