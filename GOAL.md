@@ -1135,11 +1135,15 @@ caught by the corpus.
 | at batch 128 | 2.71x | **3.04x** |
 | at batch 512 | 9.19x | **9.53x** |
 
-The table costs 1.27 MB for the median schema, which is 40-70% of what the rest
-of the tables cost, and it is abandoned above four million words so a
-pathological grammar falls back to replaying everything. That trade - memory
-for per-step work - is the same one this whole design makes, applied one level
-down.
+**It is bought with memory, and the memory is reported.** Over 25 corpus
+schemas the resident tables are 3.27 MB at the median, 6.43 at p90, and the
+verdict table is 25% of that - so it raised the median schema's residency by
+about a third. It is abandoned above four million words, so a pathological
+grammar falls back to replaying everything and pays nothing.
+
+That trade is the same one this whole design makes, applied one level down: the
+thing we are worst at against XGrammar is memory, and this makes it worse to
+make the step faster. Reporting both is the only honest way to present it.
 
 The same table makes the advance's token search cheaper too - a group already
 refused cannot be the one that advances - and that is another 19 us at batch

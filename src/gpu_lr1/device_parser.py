@@ -2570,8 +2570,13 @@ class DeviceGrammar:
         # meets several, so the product is what enumerating them all would
         # cost. Bounded at the reference matcher's own bound: past it both
         # refuse the same derivations, which is what keeps them in step.
+        # One grammar too large for a verdict table turns the shortcut off for
+        # the whole pool: the kernel is compiled once for a pool and a mixture
+        # would otherwise index a table that is not there. It went in with the
+        # assignment inverted, which held until a corpus schema exceeded the
+        # budget and the kernel read an empty array.
         if tables.has_verdicts == 0 and self.has_verdicts == 1:
-            self.has_verdicts = 1
+            self.has_verdicts = 0
             self.revision += 1
         wanted_paths = tables.paths
         if wanted_paths > self.paths:

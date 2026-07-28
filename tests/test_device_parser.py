@@ -717,6 +717,69 @@ class DraftWalk(unittest.TestCase):
         self.assertTrue(torch.equal(device.fill_mask()[0].cpu(), reference))
 
 
+class PrecomputedVerdicts(unittest.TestCase):
+    """The refusals settled when the tables are built.
+
+    91% of group replays are decided by the parser state alone, so they are
+    settled at compile time and read at runtime. A grammar too large for the
+    table has to fall back to replaying everything, and because the kernel is
+    compiled once for a whole pool, one such grammar has to turn the shortcut
+    off for all of them - which is where this first went wrong.
+    """
+
+    def setUp(self):
+        _requirements()
+        from gpu_lr1.device_parser import DeviceGrammar
+
+        self.DeviceGrammar = DeviceGrammar
+        self.compiler = gpugrammar.Compiler(VOCABULARY)
+
+    def _compiled(self, schema):
+        return self.compiler.compile_json_schema(json.dumps(schema))
+
+    def test_a_pool_without_a_table_everywhere_turns_the_shortcut_off(self):
+        pool = self.DeviceGrammar()
+        item = self._compiled(
+            {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]}
+        )
+        pool.admit(item)
+        # A grammar whose table was abandoned, faked by admitting one that has
+        # none. The flag must go to zero and stay there.
+        tables = self.DeviceGrammar.prepare(item)
+        tables.has_verdicts = 0
+        pool.admit(tables)
+        self.assertEqual(
+            pool.has_verdicts, 0, "one grammar without a table must disable the shortcut"
+        )
+        pool.admit(self._compiled({"type": "array", "items": {"type": "integer"}}))
+        self.assertEqual(pool.has_verdicts, 0, "and it must not come back")
+
+    def test_the_mask_is_the_matcher_s_with_the_shortcut_on(self):
+        schema = {
+            "type": "object",
+            "properties": {"name": {"type": "string"}, "id": {"type": "integer"}},
+            "required": ["name", "id"],
+        }
+        compiled = self._compiled(schema)
+        pool = self.DeviceGrammar(compiled)
+        self.assertEqual(pool.has_verdicts, 1)
+        batch = pool.new_batch(1)
+        matcher = compiled.matcher(0)
+        reference = torch.zeros(pool.mask_words, dtype=torch.int32)
+        for piece in (b'{"', b"name", b'":"', b"ab", b'","', b"id", b'":', b"12", b"}"):
+            token = VOCABULARY.index(piece)
+            reference.zero_()
+            matcher.fill_bitmask(reference)
+            batch.set_configurations(0, matcher.configurations())
+            self.assertTrue(torch.equal(batch.fill_mask()[0].cpu(), reference))
+            batch.advance(torch.tensor([token], dtype=torch.int32, device="cuda"))
+            self.assertTrue(matcher.accept_token(token))
+            self.assertEqual(
+                sorted((s, tuple(k)) for s, k in batch.configurations(0)),
+                sorted((s, tuple(k)) for s, k in matcher.configurations()),
+            )
+
+
 class ArenaPaging(unittest.TestCase):
     """Grammars come and go faster than a graph can be re-recorded.
 
