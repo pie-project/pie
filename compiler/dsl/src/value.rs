@@ -7,6 +7,7 @@
 use alloc::vec::Vec;
 
 use pie_ir::container::const_elem_size;
+use pie_ir::expand;
 use pie_ir::op::{IntrinsicId, Op};
 use pie_ir::types::{DType, Literal, Predicate, RngKind, Shape, ValueId, ValueType};
 
@@ -626,68 +627,57 @@ pub fn cumprod(x: impl AsTensor) -> Tensor {
     emit_unary(&x, Op::CumProd, |t| t)
 }
 
-// -- normalize (echo's expand.rs expansions, type-tracked) --
-pub fn softmax(x: impl AsTensor) -> Tensor {
+// -- normalize (pie_ir::expand sequences, type-tracked) --
+
+/// Records [`pie_ir::expand`] steps into the trace, attaching the result type
+/// each step lands in.
+///
+/// The op order lives in `pie_ir::expand`; this only knows how to name the
+/// three shapes an expansion step can have. Adding a step there needs no edit
+/// here, which is the point — the two used to be transcriptions of each other.
+struct Traced {
+    row: ValueType,
+    reduced: ValueType,
+}
+
+impl Traced {
+    fn over(row: ValueType) -> Self {
+        Self {
+            row,
+            reduced: ValueType::new(reduce_shape(row.shape), row.dtype),
+        }
+    }
+}
+
+impl expand::Sink for Traced {
+    fn push(&mut self, op: Op, shape: expand::StepShape) -> ValueId {
+        let ty = match shape {
+            expand::StepShape::Row => self.row,
+            expand::StepShape::Reduced => self.reduced,
+            // The expansions' only scalars are `Literal::F32` constants, so
+            // the declared type follows the literal, not the row.
+            expand::StepShape::Scalar => ValueType::scalar(DType::F32),
+        };
+        emit(op, &[ty])
+    }
+}
+
+/// Runs one `pie_ir::expand` sequence over `x` and returns its typed result.
+fn expanded(x: impl AsTensor, seq: impl FnOnce(&mut Traced, ValueId, Shape) -> ValueId) -> Tensor {
     let (xid, ty) = x.to_arg().materialize();
-    let (s, red) = (ty.shape, reduce_shape(ty.shape));
-    let m = push(Op::ReduceMax(xid), &[ValueType::new(red, DType::F32)]);
-    let mb = push(
-        Op::Broadcast { value: m, shape: s },
-        &[ValueType::new(s, DType::F32)],
-    );
-    let c = push(Op::Sub(xid, mb), &[ValueType::new(s, DType::F32)]);
-    let e = push(Op::Exp(c), &[ValueType::new(s, DType::F32)]);
-    let sum = push(Op::ReduceSum(e), &[ValueType::new(red, DType::F32)]);
-    let sb = push(
-        Op::Broadcast {
-            value: sum,
-            shape: s,
-        },
-        &[ValueType::new(s, DType::F32)],
-    );
-    let out = push(Op::Div(e, sb), &[ValueType::new(s, DType::F32)]);
-    Tensor::node(out, ValueType::new(s, DType::F32))
+    let row = ValueType::new(ty.shape, DType::F32);
+    let mut sink = Traced::over(row);
+    Tensor::node(seq(&mut sink, xid, ty.shape), row)
+}
+
+pub fn softmax(x: impl AsTensor) -> Tensor {
+    expanded(x, expand::softmax)
 }
 pub fn log_softmax(x: impl AsTensor) -> Tensor {
-    let (xid, ty) = x.to_arg().materialize();
-    let (s, red) = (ty.shape, reduce_shape(ty.shape));
-    let m = push(Op::ReduceMax(xid), &[ValueType::new(red, DType::F32)]);
-    let mb = push(
-        Op::Broadcast { value: m, shape: s },
-        &[ValueType::new(s, DType::F32)],
-    );
-    let c = push(Op::Sub(xid, mb), &[ValueType::new(s, DType::F32)]);
-    let e = push(Op::Exp(c), &[ValueType::new(s, DType::F32)]);
-    let sum = push(Op::ReduceSum(e), &[ValueType::new(red, DType::F32)]);
-    let l = push(Op::Log(sum), &[ValueType::new(red, DType::F32)]);
-    let lb = push(
-        Op::Broadcast { value: l, shape: s },
-        &[ValueType::new(s, DType::F32)],
-    );
-    let out = push(Op::Sub(c, lb), &[ValueType::new(s, DType::F32)]);
-    Tensor::node(out, ValueType::new(s, DType::F32))
+    expanded(x, expand::log_softmax)
 }
 pub fn l2norm(x: impl AsTensor) -> Tensor {
-    let (xid, ty) = x.to_arg().materialize();
-    let (s, red) = (ty.shape, reduce_shape(ty.shape));
-    let sq = push(Op::Mul(xid, xid), &[ValueType::new(s, DType::F32)]);
-    let sum = push(Op::ReduceSum(sq), &[ValueType::new(red, DType::F32)]);
-    let lg = push(Op::Log(sum), &[ValueType::new(red, DType::F32)]);
-    let half = push(
-        Op::Const(Literal::F32(0.5)),
-        &[ValueType::scalar(DType::F32)],
-    );
-    let h = push(Op::Mul(lg, half), &[ValueType::new(red, DType::F32)]);
-    let rt = push(Op::Exp(h), &[ValueType::new(red, DType::F32)]);
-    let rb = push(
-        Op::Broadcast {
-            value: rt,
-            shape: s,
-        },
-        &[ValueType::new(s, DType::F32)],
-    );
-    let out = push(Op::Div(xid, rb), &[ValueType::new(s, DType::F32)]);
-    Tensor::node(out, ValueType::new(s, DType::F32))
+    expanded(x, expand::l2norm)
 }
 
 // -- order --
@@ -794,21 +784,8 @@ fn rng_noise(state: impl AsTensor, shape: impl IntoShape, kind: RngKind) -> Tens
 pub fn mask_apply(logits: impl AsTensor, mask: impl AsTensor) -> Tensor {
     let (il, tyl) = logits.to_arg().materialize();
     let (im, _) = mask.to_arg().materialize();
-    let ninf = push(
-        Op::Const(Literal::F32(f32::NEG_INFINITY)),
-        &[ValueType::scalar(DType::F32)],
-    );
-    Tensor::node(
-        emit(
-            Op::Select {
-                cond: im,
-                a: il,
-                b: ninf,
-            },
-            &[tyl],
-        ),
-        tyl,
-    )
+    let mut sink = Traced::over(tyl);
+    Tensor::node(expand::mask_apply(&mut sink, il, im), tyl)
 }
 
 fn append_mask_axis(shape: Shape, len: u32) -> Shape {
