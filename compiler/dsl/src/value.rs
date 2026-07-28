@@ -657,6 +657,8 @@ impl expand::Sink for Traced {
             // The expansions' only scalars are `Literal::F32` constants, so
             // the declared type follows the literal, not the row.
             expand::StepShape::Scalar => ValueType::scalar(DType::F32),
+            expand::StepShape::RowMask => ValueType::new(self.row.shape, DType::Bool),
+            expand::StepShape::ReducedIndex => ValueType::new(self.reduced.shape, DType::I32),
         };
         emit(op, &[ty])
     }
@@ -975,61 +977,16 @@ pub fn scalar_gather(src: impl AsTensor, index: impl AsTensor) -> Tensor {
 
 /// Exact nucleus sampler expressed entirely as ordinary composable SSA.
 /// Temperature scaling remains an ordinary preceding operation.
+///
+/// The op sequence is [`expand::nucleus_sample`], shared with the region
+/// matcher that has to recognize it again on the way to a fused kernel.
 pub fn nucleus_sample(logits: impl AsTensor, top_p: impl AsTensor, state: impl AsTensor) -> Tensor {
     let (logits, logits_type) = logits.to_arg().materialize();
     let (top_p, _) = top_p.to_arg().materialize();
     let (state, _) = state.to_arg().materialize();
-    let row_type = ValueType::new(reduce_shape(logits_type.shape), DType::F32);
+    let mut sink = Traced::over(logits_type);
     let token_type = ValueType::new(reduce_shape(logits_type.shape), DType::I32);
-
-    let maximum = push(Op::ReduceMax(logits), &[row_type]);
-    let maximum = push(
-        Op::Broadcast {
-            value: maximum,
-            shape: logits_type.shape,
-        },
-        &[logits_type],
-    );
-    let centered = push(Op::Sub(logits, maximum), &[logits_type]);
-    let exponentials = push(Op::Exp(centered), &[logits_type]);
-    let sum = push(Op::ReduceSum(exponentials), &[row_type]);
-    let sum = push(
-        Op::Broadcast {
-            value: sum,
-            shape: logits_type.shape,
-        },
-        &[logits_type],
-    );
-    let probabilities = push(Op::Div(exponentials, sum), &[logits_type]);
-    let keep = push(
-        Op::PivotThreshold {
-            input: probabilities,
-            predicate: Predicate::CummassLe(top_p),
-        },
-        &[ValueType::new(logits_type.shape, DType::Bool)],
-    );
-    let negative_infinity = push(
-        Op::Const(Literal::F32(f32::NEG_INFINITY)),
-        &[ValueType::scalar(DType::F32)],
-    );
-    let masked = push(
-        Op::Select {
-            cond: keep,
-            a: logits,
-            b: negative_infinity,
-        },
-        &[logits_type],
-    );
-    let noise = push(
-        Op::RngKeyed {
-            state,
-            shape: logits_type.shape,
-            kind: RngKind::Gumbel,
-        },
-        &[logits_type],
-    );
-    let perturbed = push(Op::Add(masked, noise), &[logits_type]);
-    let result = push(Op::ReduceArgmax(perturbed), &[token_type]);
+    let result = expand::nucleus_sample(&mut sink, logits, top_p, state, logits_type.shape);
     Tensor::node(result, token_type)
 }
 

@@ -19,9 +19,10 @@ use alloc::vec;
 use pie_ir::container::{
     ChanDType, ChannelDecl, HostRole, PortBinding, PortSource, StageProgram, TraceContainer,
 };
+use pie_ir::expand;
 use pie_ir::op::{IntrinsicId, Op};
 use pie_ir::registry::{KernelInfo, ModelProfile, Port};
-use pie_ir::types::{DType, Literal, Predicate, RngKind, Shape, ValueType};
+use pie_ir::types::{DType, Literal, Predicate, RngKind, Shape, ValueId, ValueType};
 use pie_ir::validate::bind;
 
 fn channel(shape: Shape, dtype: DType, role: HostRole, seeded: bool) -> ChannelDecl {
@@ -420,88 +421,27 @@ enum NucleusMutation {
     EscapedIntermediate,
 }
 
-fn nucleus_program(mutation: NucleusMutation) -> BoundTrace {
-    let shape = Shape::matrix(2, 8);
-    let predicate = if matches!(mutation, NucleusMutation::WrongPredicate) {
-        Predicate::ProbGe(1)
-    } else {
-        Predicate::CummassLe(1)
-    };
-    let select_source = if matches!(mutation, NucleusMutation::WrongSelectSource) {
-        9
-    } else {
-        2
-    };
-    let centered_source = if matches!(mutation, NucleusMutation::WrongCenteredSource) {
-        4
-    } else {
-        2
-    };
-    let mask_fill = if matches!(mutation, NucleusMutation::FiniteMaskFill) {
-        Literal::F32(f32::MIN)
-    } else {
-        Literal::F32(f32::NEG_INFINITY)
-    };
-    let rng_kind = if matches!(mutation, NucleusMutation::UniformRng) {
-        RngKind::Uniform
-    } else {
-        RngKind::Gumbel
-    };
-    let sum_input = if matches!(mutation, NucleusMutation::WrongSumOperand) {
-        5
-    } else {
-        6
-    };
-    let add = if matches!(mutation, NucleusMutation::CommutedAdd) {
-        Op::Add(13, 12)
-    } else {
-        Op::Add(12, 13)
-    };
-    let argmax_input = if matches!(mutation, NucleusMutation::PartialArgmax) {
-        12
-    } else {
-        14
-    };
-    let mut channels = vec![
+/// The id defined by the one canonical step matching `want`.
+fn defines(ops: &[Op], want: impl FnMut(&Op) -> bool) -> ValueId {
+    let at = ops
+        .iter()
+        .position(want)
+        .expect("step is part of the canonical nucleus chain");
+    expand::next_id(&ops[..at])
+}
+
+/// Channels every nucleus fixture reads: rng state, top-p, logits, and the
+/// token the sampler writes back.
+fn nucleus_channels(shape: Shape) -> Vec<ChannelDecl> {
+    vec![
         channel(Shape::vector(2), DType::U32, HostRole::None, true),
         channel(Shape::vector(2), DType::F32, HostRole::None, true),
         channel(shape, DType::F32, HostRole::None, true),
         channel(Shape::vector(2), DType::I32, HostRole::Reader, false),
-    ];
-    let mut ops = vec![
-        Op::ChanRead(0), // rng state: v0
-        Op::ChanRead(1), // top-p: v1
-        Op::ChanTake(2), // logits: v2
-        Op::ReduceMax(2),
-        Op::Broadcast { value: 3, shape },
-        Op::Sub(centered_source, 4),
-        Op::Exp(5),
-        Op::ReduceSum(sum_input),
-        Op::Broadcast { value: 7, shape },
-        Op::Div(6, 8),
-        Op::PivotThreshold {
-            input: 9,
-            predicate,
-        },
-        Op::Const(mask_fill),
-        Op::Select {
-            cond: 10,
-            a: select_source,
-            b: 11,
-        },
-        Op::RngKeyed {
-            state: 0,
-            shape,
-            kind: rng_kind,
-        },
-        add,
-        Op::ReduceArgmax(argmax_input),
-        Op::ChanPut { chan: 3, value: 15 },
-    ];
-    if matches!(mutation, NucleusMutation::EscapedIntermediate) {
-        channels.push(channel(shape, DType::F32, HostRole::Reader, false));
-        ops.push(Op::ChanPut { chan: 4, value: 6 });
-    }
+    ]
+}
+
+fn epilogue(channels: Vec<ChannelDecl>, ops: Vec<Op>) -> BoundTrace {
     let container = TraceContainer {
         channels,
         stages: vec![StageProgram {
@@ -513,105 +453,132 @@ fn nucleus_program(mutation: NucleusMutation) -> BoundTrace {
     bind(container, ModelProfile::dummy()).unwrap()
 }
 
-fn scaled_nucleus_program() -> BoundTrace {
+/// A nucleus sampler, then one thing wrong with it.
+///
+/// The chain itself comes from [`expand::nucleus_sample`] — the same sequence
+/// `pie-dsl` traces — so it cannot drift away from what the matcher will meet
+/// in the field. Each mutation names the step it breaks rather than an SSA
+/// number, which is also what the mutation *means*; the hand-numbered copy
+/// this replaced had to be renumbered by eye whenever the chain moved.
+fn nucleus_program(mutation: NucleusMutation) -> BoundTrace {
+    use NucleusMutation as M;
     let shape = Shape::matrix(2, 8);
-    let container = TraceContainer {
-        channels: vec![
-            channel(Shape::vector(2), DType::U32, HostRole::None, true),
-            channel(Shape::vector(2), DType::F32, HostRole::None, true),
-            channel(shape, DType::F32, HostRole::None, true),
-            channel(Shape::vector(2), DType::I32, HostRole::Reader, false),
-        ],
-        stages: vec![StageProgram {
-            stage: Stage::Epilogue,
-            ops: vec![
-                Op::ChanRead(0),
-                Op::ChanRead(1),
-                Op::ChanTake(2),
-                Op::Reshape { value: 2, shape },
-                Op::Const(Literal::F32(0.8)),
-                Op::Div(3, 4),
-                Op::ReduceMax(5),
-                Op::Broadcast { value: 6, shape },
-                Op::Sub(5, 7),
-                Op::Exp(8),
-                Op::ReduceSum(9),
-                Op::Broadcast { value: 10, shape },
-                Op::Div(9, 11),
-                Op::PivotThreshold {
-                    input: 12,
-                    predicate: Predicate::CummassLe(1),
-                },
-                Op::Const(Literal::F32(f32::NEG_INFINITY)),
-                Op::Select {
-                    cond: 13,
-                    a: 5,
-                    b: 14,
-                },
-                Op::RngKeyed {
-                    state: 0,
-                    shape,
-                    kind: RngKind::Gumbel,
-                },
-                Op::Add(15, 16),
-                Op::ReduceArgmax(17),
-                Op::ChanPut { chan: 3, value: 18 },
-            ],
-        }],
-        ..TraceContainer::default()
-    };
-    bind(container, ModelProfile::dummy()).unwrap()
+    let mut channels = nucleus_channels(shape);
+    let mut ops = vec![
+        Op::ChanRead(0), // rng state
+        Op::ChanRead(1), // top-p
+        Op::ChanTake(2), // logits
+    ];
+    let token = expand::nucleus_sample(&mut ops, 2, 1, 0, shape);
+
+    // Each targeted op kind occurs exactly once in the chain, so naming the
+    // kind names the step. `Broadcast` occurs twice and the first is the one
+    // that lifts the row maximum.
+    let maximum = defines(&ops, |op| matches!(op, Op::Broadcast { .. }));
+    let centered = defines(&ops, |op| matches!(op, Op::Sub(..)));
+    let exponentials = defines(&ops, |op| matches!(op, Op::Exp(..)));
+    let probabilities = defines(&ops, |op| matches!(op, Op::Div(..)));
+    let masked = defines(&ops, |op| matches!(op, Op::Select { .. }));
+    for op in &mut ops {
+        match (mutation, op) {
+            // Gumbel's argmax is only exact if the noise is added to the
+            // masked logits; `a + b` and `b + a` differ once one is -inf.
+            (M::CommutedAdd, Op::Add(a, b)) => core::mem::swap(a, b),
+            (M::WrongPredicate, Op::PivotThreshold { predicate, .. }) => {
+                *predicate = Predicate::ProbGe(1)
+            }
+            // Keep the probabilities rather than the logits.
+            (M::WrongSelectSource, Op::Select { a, .. }) => *a = probabilities,
+            // Centre the maximum against itself instead of the logits.
+            (M::WrongCenteredSource, Op::Sub(a, _)) => *a = maximum,
+            (M::FiniteMaskFill, Op::Const(fill)) => *fill = Literal::F32(f32::MIN),
+            (M::UniformRng, Op::RngKeyed { kind, .. }) => *kind = RngKind::Uniform,
+            // Argmax over the masked logits, before the noise is added.
+            (M::PartialArgmax, Op::ReduceArgmax(input)) => *input = masked,
+            // Normalize by the sum of the centered logits, not their exp.
+            (M::WrongSumOperand, Op::ReduceSum(input)) => *input = centered,
+            // `Exact` breaks nothing; `EscapedIntermediate` adds a reader
+            // below rather than editing a step.
+            _ => {}
+        }
+    }
+    ops.push(Op::ChanPut {
+        chan: 3,
+        value: token,
+    });
+    if matches!(mutation, M::EscapedIntermediate) {
+        channels.push(channel(shape, DType::F32, HostRole::Reader, false));
+        ops.push(Op::ChanPut {
+            chan: 4,
+            value: exponentials,
+        });
+    }
+    epilogue(channels, ops)
 }
 
-fn scaled_nucleus_program_with_broadcast_ninf() -> BoundTrace {
+/// How the sampler's `-inf` mask fill is spelled.
+#[derive(Clone, Copy)]
+enum MaskFill {
+    /// A bare scalar, which is what [`expand::mask_apply`] emits.
+    Scalar,
+    /// Already broadcast to the row shape.
+    Broadcast,
+}
+
+/// Temperature scaling ahead of the sampler, which the region has to absorb.
+fn scaled_nucleus_program(fill: MaskFill) -> BoundTrace {
     let shape = Shape::matrix(2, 8);
-    let container = TraceContainer {
-        channels: vec![
-            channel(Shape::vector(2), DType::U32, HostRole::None, true),
-            channel(Shape::vector(2), DType::F32, HostRole::None, true),
-            channel(shape, DType::F32, HostRole::None, true),
-            channel(Shape::vector(2), DType::I32, HostRole::Reader, false),
-        ],
-        stages: vec![StageProgram {
-            stage: Stage::Epilogue,
-            ops: vec![
-                Op::ChanRead(0),
-                Op::ChanRead(1),
-                Op::ChanTake(2),
-                Op::Reshape { value: 2, shape },
-                Op::Const(Literal::F32(0.8)),
-                Op::Div(3, 4),
-                Op::ReduceMax(5),
-                Op::Broadcast { value: 6, shape },
-                Op::Sub(5, 7),
-                Op::Exp(8),
-                Op::ReduceSum(9),
-                Op::Broadcast { value: 10, shape },
-                Op::Div(9, 11),
-                Op::PivotThreshold {
-                    input: 12,
-                    predicate: Predicate::CummassLe(1),
-                },
-                Op::Const(Literal::F32(f32::NEG_INFINITY)),
-                Op::Broadcast { value: 14, shape },
-                Op::Select {
-                    cond: 13,
-                    a: 5,
-                    b: 15,
-                },
-                Op::RngKeyed {
-                    state: 0,
-                    shape,
-                    kind: RngKind::Gumbel,
-                },
-                Op::Add(16, 17),
-                Op::ReduceArgmax(18),
-                Op::ChanPut { chan: 3, value: 19 },
-            ],
-        }],
-        ..TraceContainer::default()
+    let mut ops = vec![
+        Op::ChanRead(0),
+        Op::ChanRead(1),
+        Op::ChanTake(2),
+        Op::Reshape { value: 2, shape },
+        Op::Const(Literal::F32(0.8)),
+        Op::Div(3, 4),
+    ];
+    // the id the temperature divide defines
+    let scaled = expand::next_id(&ops[..ops.len() - 1]);
+    let mut token = expand::nucleus_sample(&mut ops, scaled, 1, 0, shape);
+    if matches!(fill, MaskFill::Broadcast) {
+        token = broadcast_the_mask_fill(&mut ops, shape, token);
+    }
+    ops.push(Op::ChanPut {
+        chan: 3,
+        value: token,
+    });
+    epilogue(nucleus_channels(shape), ops)
+}
+
+/// Respell the sampler's `-inf` as an explicit row broadcast, renumbering
+/// everything it displaces, and return the token id's new value.
+///
+/// Writing this as a rewrite rather than as a second copy of the chain is the
+/// point: the claim under test is that normalization erases the difference,
+/// and a rewrite can only introduce the difference it names.
+fn broadcast_the_mask_fill(ops: &mut Vec<Op>, shape: Shape, token: ValueId) -> ValueId {
+    let at = ops
+        .iter()
+        .position(|op| matches!(op, Op::Select { .. }))
+        .expect("the sampler masks with a select");
+    let Op::Select { b: fill, .. } = ops[at] else {
+        unreachable!()
     };
-    bind(container, ModelProfile::dummy()).unwrap()
+    // `mask_apply` emits the fill immediately before the select, so this is
+    // where the broadcast goes and `fill + 1` is the id it takes.
+    assert_eq!(
+        expand::next_id(&ops[..at]),
+        fill + 1,
+        "fill precedes select"
+    );
+    ops.insert(at, Op::Broadcast { value: fill, shape });
+    for op in &mut ops[at + 1..] {
+        op.map_operands(|id| if id > fill { id + 1 } else { id });
+    }
+    let Op::Select { b, .. } = &mut ops[at + 1] else {
+        unreachable!()
+    };
+    *b = fill + 1;
+    token + 1
 }
 
 /// `Op::Select` broadcasts its operands, so passing `-inf` as a bare scalar
@@ -623,11 +590,11 @@ fn scaled_nucleus_program_with_broadcast_ninf() -> BoundTrace {
 #[test]
 fn broadcast_neg_inf_normalizes_to_the_same_nucleus_plan() {
     let broadcast = compile_stage(
-        &scaled_nucleus_program_with_broadcast_ninf(),
+        &scaled_nucleus_program(MaskFill::Broadcast),
         Stage::Epilogue,
     )
     .unwrap();
-    let bare = compile_stage(&scaled_nucleus_program(), Stage::Epilogue).unwrap();
+    let bare = compile_stage(&scaled_nucleus_program(MaskFill::Scalar), Stage::Epilogue).unwrap();
     for compiled in [&broadcast, &bare] {
         let nucleus = compiled
             .fused
@@ -790,7 +757,8 @@ fn normalized_nucleus_dataflow_has_role_ordered_library_abi() {
 
 #[test]
 fn scaled_nucleus_absorbs_temperature_and_peels_reshape() {
-    let compiled = compile_stage(&scaled_nucleus_program(), Stage::Epilogue).unwrap();
+    let compiled =
+        compile_stage(&scaled_nucleus_program(MaskFill::Scalar), Stage::Epilogue).unwrap();
     let nucleus = compiled
         .fused
         .regions
@@ -808,7 +776,8 @@ fn scaled_nucleus_absorbs_temperature_and_peels_reshape() {
 /// crate had just produced.
 #[test]
 fn a_scaled_nucleus_matches_as_one_region_at_five_inputs() {
-    let compiled = compile_stage(&scaled_nucleus_program(), Stage::Epilogue).unwrap();
+    let compiled =
+        compile_stage(&scaled_nucleus_program(MaskFill::Scalar), Stage::Epilogue).unwrap();
     let nucleus = compiled
         .fused
         .regions

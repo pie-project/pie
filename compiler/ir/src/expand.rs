@@ -11,7 +11,7 @@
 use alloc::vec::Vec;
 
 use super::op::Op;
-use crate::types::{Literal, RngKind, Shape, ValueId};
+use crate::types::{Literal, Predicate, RngKind, Shape, ValueId};
 
 /// The SSA id the next appended op's first result would take.
 pub fn next_id(ops: &[Op]) -> ValueId {
@@ -34,6 +34,11 @@ pub enum StepShape {
     Reduced,
     /// A scalar constant.
     Scalar,
+    /// The input's shape, but a boolean element — a per-element keep mask.
+    RowMask,
+    /// The input with its last axis reduced away, holding an index rather
+    /// than a value.
+    ReducedIndex,
 }
 
 /// Where an expansion appends its ops.
@@ -130,6 +135,41 @@ pub fn l2norm(sink: &mut impl Sink, x: ValueId, shape: Shape) -> ValueId {
     push(sink, Op::Div(x, rb), StepShape::Row)
 }
 
+/// Exact nucleus (top-p) sampling:
+/// `argmax(mask_apply(logits, cummass_le(softmax(logits), top_p)) + gumbel(state))`.
+///
+/// This is the one expansion `pie-plan` also has to *recognize* — the whole
+/// nucleus region template exists to fuse it back into a single kernel. That
+/// recognizer, `compile::region::match_nucleus`, cannot see `pie-dsl`, so
+/// until this lived here the SDK spelled the chain out flat in `value.rs` and
+/// the matcher was written against a copy of it. Both are now checked against
+/// this one sequence: the SDK builds it, and the matcher's fixtures are
+/// generated from it and then mutated one op at a time.
+///
+/// Temperature scaling is deliberately not part of it — it stays an ordinary
+/// preceding `Mul`, which is what lets the region absorb it or not.
+pub fn nucleus_sample(
+    sink: &mut impl Sink,
+    logits: ValueId,
+    top_p: ValueId,
+    state: ValueId,
+    shape: Shape,
+) -> ValueId {
+    let probabilities = softmax(sink, logits, shape);
+    let keep = push(
+        sink,
+        Op::PivotThreshold {
+            input: probabilities,
+            predicate: Predicate::CummassLe(top_p),
+        },
+        StepShape::RowMask,
+    );
+    let masked = mask_apply(sink, logits, keep);
+    let noise = gumbel(sink, state, shape);
+    let perturbed = push(sink, Op::Add(masked, noise), StepShape::Row);
+    push(sink, Op::ReduceArgmax(perturbed), StepShape::ReducedIndex)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,20 +198,28 @@ mod tests {
             ValueType::new(Shape::matrix(2, 8), DType::F32),
             ValueType::vector(2, DType::U32),
             ValueType::new(Shape::matrix(2, 8), DType::Bool),
+            ValueType::vector(2, DType::F32),
         ];
         let mut sink = Recording {
-            ops: vec![Op::ChanRead(0), Op::ChanTake(1), Op::ChanRead(2)],
+            ops: vec![
+                Op::ChanRead(0),
+                Op::ChanTake(1),
+                Op::ChanRead(2),
+                Op::ChanRead(3),
+            ],
             claims: Vec::new(),
         };
         let x = 0;
         let state = 1;
         let mask = 2;
+        let top_p = 3;
         let shape = Shape::matrix(2, 8);
         let g = gumbel(&mut sink, state, shape);
         let ma = mask_apply(&mut sink, x, mask);
         let sm = softmax(&mut sink, x, shape);
         let lsm = log_softmax(&mut sink, x, shape);
         let l2 = l2norm(&mut sink, x, shape);
+        let ns = nucleus_sample(&mut sink, x, top_p, state, shape);
         let t = body_types(
             &sink.ops,
             &BodyCtx {
@@ -183,6 +231,11 @@ mod tests {
         for id in [g, ma, sm, lsm, l2] {
             assert_eq!(t[id as usize], ValueType::new(shape, DType::F32), "id {id}");
         }
+        assert_eq!(
+            t[ns as usize],
+            ValueType::new(shape.drop_last().unwrap(), DType::I32),
+            "nucleus_sample yields one token id per row"
+        );
 
         // Every step's `StepShape` must be the type inference actually gives
         // it. `pie-dsl` builds its recorded `ValueType`s out of nothing but
@@ -196,6 +249,8 @@ mod tests {
                 StepShape::Row => row,
                 StepShape::Reduced => reduced,
                 StepShape::Scalar => ValueType::scalar(DType::F32),
+                StepShape::RowMask => ValueType::new(shape, DType::Bool),
+                StepShape::ReducedIndex => ValueType::new(shape.drop_last().unwrap(), DType::I32),
             };
             assert_eq!(t[id as usize], want, "id {id} claimed {claim:?}");
         }
