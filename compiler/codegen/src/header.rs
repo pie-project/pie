@@ -177,6 +177,13 @@ enum PtirLibraryOp : uint8_t {\n\
         crate::metal::METAL_M1_MAX_CHANNELS,
         crate::metal::METAL_M2_MAX_FUSED_CHANNELS
     ));
+    s.push_str(
+        "// Threads a grouped generated region is launched with. The emitted MSL sizes\n// its threadgroup argmax buffer for exactly this many, so a driver that\n// dispatches more overruns it. Same argument as the emitter versions above: the\n// driver cannot compare its copy against the emitter's at runtime.\n",
+    );
+    s.push_str(&format!(
+        "#define PTIR_METAL_M3_REGION_THREADS {}\n",
+        crate::metal::fused::METAL_M3_REGION_THREADS
+    ));
 
     s.push_str("\n// ── numeric contract (T8 replay determinism; golden interp is normative) ──\n");
     s.push_str("// argmax: lower index wins ties; NaN never selected (all-NaN row -> index 0).\n");

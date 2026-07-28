@@ -1,18 +1,32 @@
 //! The device-side struct layouts, declared once.
 //!
 //! The lane table is the ABI between the host planner and the kernels it
-//! emits, and it used to be written out five times: as `#[repr(C)]` structs in
-//! `pie-plan`, as C text in [`crate::header`], and as MSL text three times over
-//! in `metal::preamble` (`M1*`, `M3*`, and `M1Status` again in two effect
-//! emitters). Nothing tied the copies together. Adding a field meant editing
-//! five places, and getting it wrong did not fail to compile — it shifted every
-//! field after it, so the kernel read a different offset than the host wrote.
-//! Wrong numbers, no error.
+//! emits, and it was written out seven times. Nothing tied the copies
+//! together. Adding a field meant editing all seven, and getting it wrong did
+//! not fail to compile — it shifted every field after it, so the kernel read a
+//! different offset than the host wrote. Wrong numbers, no error.
 //!
-//! Here the field list is data. The C and MSL texts are printed from it, and
-//! [`static_assertions`] ties it back to the `pie-plan` structs with
-//! `offset_of!`, so a field added on one side and not the other is a
-//! compile error rather than a silent reinterpretation.
+//! Here the field list is data, and each copy is either printed from it or
+//! read back and compared against it:
+//!
+//! | copy | how it is tied here |
+//! |---|---|
+//! | `#[repr(C)]` structs in `pie-plan` | `offset_of!` in [`static_assertions`] |
+//! | C text in [`crate::header`] → `ptir_abi.h` | printed by [`DeviceStruct::emit_c`] |
+//! | MSL `M1*` in `metal::preamble` | printed by [`DeviceStruct::emit_msl`] |
+//! | MSL `M3*` in `metal::preamble` | printed by [`DeviceStruct::emit_msl`] |
+//! | MSL `M1Status` in the effect emitters | printed by [`DeviceStruct::emit_msl`] |
+//! | `runtime/cuda/fused_block0.cuh` | [`DeviceStruct::emit_cuda`], compared in `cuda::fused` |
+//! | `runtime/metal/ptir_m1_grouped.metal` | `metal::preamble::tests::file_matches_emitted_text` |
+//!
+//! The two runtime files are hand-written C++/MSL that cannot be generated
+//! wholesale — they are compiled by NVRTC and the Metal compiler as text and
+//! carry far more than the struct declarations — so they are checked rather
+//! than produced. The drivers do not appear above because they `#include` the
+//! generated `ptir_abi.h` rather than retyping it.
+//!
+//! A field added on one side and not the other is now a compile error or a
+//! test failure rather than a silent reinterpretation.
 //!
 //! The emitted text is byte-identical to what was hand-written, which the MSL
 //! goldens (and the `# @grouped:` length+hash pin in `emit_grouped_*.txt`)
@@ -45,6 +59,15 @@ impl FieldType {
         match self {
             FieldType::U32 => "uint",
             FieldType::U64 => "ulong",
+        }
+    }
+
+    /// Spelling in the CUDA runtime headers, which typedef their own widths
+    /// rather than including `<cstdint>` — NVRTC compiles these as a string.
+    const fn cuda(self) -> &'static str {
+        match self {
+            FieldType::U32 => "m1_u32",
+            FieldType::U64 => "m1_u64",
         }
     }
 
@@ -156,6 +179,41 @@ impl DeviceStruct {
                 out
             }
         }
+    }
+
+    /// `struct Name { ... };` in the CUDA runtime's dialect: the C names and
+    /// declaration order, the CUDA width spellings, two-space indent.
+    pub fn emit_cuda(&self) -> String {
+        let mut out = format!("struct {} {{\n", self.c_name);
+        for field in self.fields {
+            out.push_str(&format!("  {} {};\n", field.ty.cuda(), field.name));
+        }
+        out.push_str("};\n");
+        out
+    }
+
+    /// `static_assert(sizeof(Name) == N, "...");` — the size check the CUDA
+    /// runtime carries. It is not enough on its own (reordering two fields of
+    /// equal width keeps the size), which is why `emit_cuda` exists.
+    pub fn emit_cuda_size_assert(&self, note: &str) -> String {
+        format!(
+            "static_assert(sizeof({}) == {}, \"{note}\");\n",
+            self.c_name,
+            self.size_bytes()
+        )
+    }
+
+    /// Total size with the natural alignment, from the same walk `offsets`
+    /// does.
+    pub fn size_bytes(&self) -> usize {
+        let mut end = 0usize;
+        let mut alignment = 1usize;
+        for field in self.fields {
+            let size = field.ty.size();
+            alignment = alignment.max(size);
+            end = end.next_multiple_of(size) + size;
+        }
+        end.next_multiple_of(alignment)
     }
 
     /// Byte offset of each field, assuming the natural C alignment both

@@ -20,6 +20,7 @@ use pie_plan::{CompiledStage, Dimension, Region};
 use super::METAL_M2_MAX_FUSED_CHANNELS;
 use super::preamble::{RUNTIME_TEMPLATE, grouped_preamble};
 use super::validate::{intrinsics_bindable, library_region_valid, used_channel_slots};
+use crate::fault::{FUSED_GEOMETRY_MISMATCH, M3_THREADS_EXCEEDED};
 use crate::op_view::{OpView, result_bases};
 use crate::slots::Slots;
 
@@ -43,8 +44,12 @@ fn resolve_alias(alias: &BTreeMap<u32, u32>, mut value: u32) -> u32 {
 /// sizes its threadgroup reduction buffer to this; the driver launches the
 /// narrower of it and the pipeline's own maxTotalThreadsPerThreadgroup, and
 /// the kernel faults `0xB3` on a wider launch rather than reading past the
-/// buffer. `m1_runtime.cpp` keeps its own `kM3RegionThreads` copy of this
-/// number by hand, with nothing comparing them.
+/// buffer.
+///
+/// Emitted into `ptir_abi.h` as `PTIR_METAL_M3_REGION_THREADS`, which is what
+/// `m1_runtime.cpp`'s `kM3RegionThreads` now reads. It used to be a hand-kept
+/// copy with a "must equal" comment and nothing comparing them, and it did
+/// drift: 256 in the driver against a 1024-element buffer in the goldens.
 ///
 /// 512 measured against 256 with the model DAG truncated away, interleaved to
 /// cancel thermal drift: 0.951ms vs 1.557ms for the sampler region, reproduced
@@ -204,7 +209,7 @@ pub fn emit_grouped_fused_region(
     let _ = writeln!(
         source,
         "  if (m3_threads > {METAL_M3_REGION_THREADS}u) {{ \
-         if (m3_tid == 0) m1_fault(status, 0xB3u); return; }}"
+         if (m3_tid == 0) m1_fault(status, {M3_THREADS_EXCEEDED:#X}u); return; }}"
     );
     source.push_str(
         "  const device M1ValueDesc* descriptors = all_descriptors + \
@@ -420,10 +425,11 @@ fn emit_mtp_drafts(source: &mut String, base: u32, o0: &str) {
         source,
         "    const M1ValueDesc draft_desc = descriptors[{base}];"
     );
-    source.push_str(
+    let _ = writeln!(
+        source,
         "    if (layout->vocab == 0u || row_meta.mtp_offset > row_meta.count || \
          draft_desc.len > row_meta.count - row_meta.mtp_offset) \
-         { m1_fault(status, 0xA0u); return; }\n",
+         {{ m1_fault(status, {FUSED_GEOMETRY_MISMATCH:#X}u); return; }}"
     );
     let _ = writeln!(
         source,
@@ -474,8 +480,10 @@ fn emit_logits_argmax(source: &mut String, in_base: u32, mtp: bool, o0: &str) {
         if mtp { "row_meta.mtp_offset" } else { "0u" }
     );
     source.push_str("    const uint am_vocab = layout->vocab;\n");
-    source.push_str(
-        "    if (am_vocab == 0u || am_in.last != am_vocab || am_in.rows > row_meta.count) { m1_fault(status, 0xA0u); return; }\n",
+    let _ = writeln!(
+        source,
+        "    if (am_vocab == 0u || am_in.last != am_vocab || am_in.rows > row_meta.count) \
+         {{ m1_fault(status, {FUSED_GEOMETRY_MISMATCH:#X}u); return; }}"
     );
     let _ = writeln!(
         source,
@@ -522,11 +530,12 @@ fn emit_logits_gather(source: &mut String, base: u32, mtp: bool, o0: &str) {
         "    const uint intrinsic_row_base = {};",
         if mtp { "row_meta.mtp_offset" } else { "0u" }
     );
-    source.push_str(
+    let _ = writeln!(
+        source,
         "    if (layout->vocab == 0u || intrinsic_desc.len % layout->vocab != 0u || \
          intrinsic_row_base > row_meta.count || \
          intrinsic_desc.len / layout->vocab > row_meta.count - intrinsic_row_base) \
-         { m1_fault(status, 0xA0u); return; }\n",
+         {{ m1_fault(status, {FUSED_GEOMETRY_MISMATCH:#X}u); return; }}"
     );
     let _ = writeln!(
         source,

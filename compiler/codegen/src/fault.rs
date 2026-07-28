@@ -14,14 +14,28 @@
 //! only `0x80` — [`the_classes_do_not_overlap`](self) is what keeps a future
 //! channel-count raise from silently aliasing "ring empty" onto "ring full".
 //!
-//! ## The CUDA divergence, recorded not fixed
+//! ## The op-tag half of the space
 //!
-//! `m1_fault(&status, tag)` in the CUDA fused emitter passes the **op tag**,
-//! which is an unrelated `0x00..=0xFF` space, and the Metal fused emitter
-//! passes the fixed [`FUSED_UNSUPPORTED_OP`]. So a `fault` value below `0x100`
-//! means "which op" on one backend and "unsupported op" on the other. Both are
-//! diagnostics with no consumer, so unifying them is an ABI decision rather
-//! than a cleanup, and it is not made here.
+//! Both runtimes' interpreters report an unhandled op as `m1_fault(status,
+//! p.tag)` — the raw op tag, a `0x00..=0xFF` value from an unrelated space.
+//! (An earlier version of this comment called that a CUDA-only divergence with
+//! Metal passing a fixed code; `ptir_m1_runtime.metal:583,741,816` says
+//! otherwise.) So every class below `0x100` shares numbers with the op table,
+//! and [`FUSED_GEOMETRY_MISMATCH`] is in fact `intrinsic_val`'s tag exactly.
+//!
+//! And they meet: an emitted Metal region carries the runtime preamble, so one
+//! kernel both writes [`FUSED_GEOMETRY_MISMATCH`] and reports unhandled ops as
+//! `m1_fault(status, p.tag)`. A `fault` of `0xA0` from that kernel is either
+//! "the region's geometry did not match" or "`intrinsic_val` had no arm", and
+//! nothing in `M1Status` separates them — plain `m1_fault` does not touch the
+//! `reserved` words that `m1_fault_op`'s three-way site code lives in.
+//!
+//! That is a live ambiguity, not a hypothetical, and it is recorded rather than
+//! fixed: respacing the codes above the tag space rewrites emitted bytes in
+//! every fused golden, which is an ABI change needing device re-verification,
+//! not a cleanup. [`TAG_ALIASES`] is the record, and it is recomputed from the
+//! op table on every run — so assigning a new op the tag `0xB3`, or adding a
+//! sub-`0x100` class, fails a test instead of quietly widening the damage.
 
 /// One named region of the fault space.
 pub struct FaultClass {
@@ -60,16 +74,46 @@ pub const M3_RING_CORRUPT: u32 = 0x700;
 /// retry (2) from fault (3).
 pub const M3_NOT_READY: u32 = 0x780;
 
-/// The Metal fused emitter's "this op has no lowering" code. Below `0x100`, and
-/// so in the same numeric range the CUDA emitter fills with op tags — see the
-/// module docs.
-pub const FUSED_UNSUPPORTED_OP: u32 = 0xA0;
+/// A generated fused region's inputs do not have the geometry the kernel was
+/// emitted against: a zero vocabulary, or a row window that runs past the row
+/// metadata. Three guards in the Metal fused emitter write it — the draft
+/// window, the argmax input, and the intrinsic row block.
+///
+/// Below `0x100`, and equal to `intrinsic_val`'s op tag. See the module docs
+/// for why that is safe and what checks it stays safe.
+pub const FUSED_GEOMETRY_MISMATCH: u32 = 0xA0;
+
+/// A grouped region was launched with more threads than
+/// [`METAL_M3_REGION_THREADS`](crate::metal::fused::METAL_M3_REGION_THREADS),
+/// which is what its threadgroup reduction buffer is sized for. The kernel
+/// reports this instead of reading past the buffer.
+///
+/// Below `0x100`, like [`FUSED_GEOMETRY_MISMATCH`], but `0xB3` is unassigned in
+/// the op table today; the module docs say what keeps that from mattering.
+pub const M3_THREADS_EXCEEDED: u32 = 0xB3;
+
+/// Every sub-`0x100` class and the op whose tag it collides with, since those
+/// classes share numbers with the op table and the two meet inside one emitted
+/// kernel. `None` means the tag is unassigned today.
+///
+/// Kept by hand so that changing it is a decision; checked against the op table
+/// by [`the_tag_aliases_are_still_what_they_say`](self) so that *not* changing
+/// it cannot be an accident.
+pub const TAG_ALIASES: &[(u32, Option<&str>)] = &[
+    (FUSED_GEOMETRY_MISMATCH, Some("intrinsic_val")),
+    (M3_THREADS_EXCEEDED, None),
+];
 
 /// Every class, in ascending order.
 pub const CLASSES: &[FaultClass] = &[
     FaultClass {
-        base: FUSED_UNSUPPORTED_OP,
-        name: "FUSED_UNSUPPORTED_OP",
+        base: FUSED_GEOMETRY_MISMATCH,
+        name: "FUSED_GEOMETRY_MISMATCH",
+        per_channel: false,
+    },
+    FaultClass {
+        base: M3_THREADS_EXCEEDED,
+        name: "M3_THREADS_EXCEEDED",
         per_channel: false,
     },
     FaultClass {
@@ -165,5 +209,41 @@ mod tests {
             "METAL_M1_MAX_CHANNELS ({METAL_M1_MAX_CHANNELS}) exceeds the tightest \
              fault-class gap ({tightest:#x}); respace the bases in this module first"
         );
+    }
+
+    /// The sub-`0x100` classes are the ones that share numbers with the op
+    /// table, so the set of them and the ops they hit is a fact about two
+    /// tables that move independently. Recomputing it here is what turns
+    /// "someone wrote 0xB3 down once" into "0xB3 is still unassigned".
+    #[test]
+    fn the_tag_aliases_are_still_what_they_say() {
+        let below: Vec<&FaultClass> = CLASSES.iter().filter(|c| c.base < 0x100).collect();
+        assert_eq!(
+            below.len(),
+            TAG_ALIASES.len(),
+            "{} fault classes sit in the op-tag space but TAG_ALIASES lists {} — \
+             a class below 0x100 needs an entry saying which op it collides with",
+            below.len(),
+            TAG_ALIASES.len()
+        );
+        for (class, (code, alias)) in below.iter().zip(TAG_ALIASES) {
+            assert_eq!(
+                class.base, *code,
+                "TAG_ALIASES is out of step with CLASSES at {}",
+                class.name
+            );
+            let actual = u8::try_from(*code)
+                .ok()
+                .and_then(pie_ir::op::spec)
+                .map(|spec| spec.name);
+            assert_eq!(
+                actual, *alias,
+                "{} ({code:#x}) now collides with {actual:?}, not {alias:?}. A crash \
+                 report showing {code:#x} from a generated region cannot be told \
+                 apart from one showing the op tag; decide whether to respace the \
+                 class or accept the alias, then update TAG_ALIASES",
+                class.name
+            );
+        }
     }
 }

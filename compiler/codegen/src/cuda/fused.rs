@@ -637,8 +637,42 @@ fn emit_chan_put(source: &mut String, op: &OpView, a0: &str, o0: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::{HOST_SHARED, LANE_CHANNEL_SLOT, LANE_RECORD, LANE_TABLE_HEADER};
     use crate::runtime_scan::{function_body, tags_compared_in};
     use alloc::collections::BTreeSet;
+
+    /// `fused_block0.cuh` declares the lane table a sixth time, in CUDA's own
+    /// width spellings. `layout.rs` knew about five copies and not this one.
+    ///
+    /// The file's own `static_assert(sizeof(...))` lines do not cover it:
+    /// swapping two `m1_u32` fields, or `rng_state` with `commit_slot`, keeps
+    /// every size and moves what the kernel reads. The host would write
+    /// `page_count` where the kernel looks for `kv_len` and nothing would say
+    /// so — not at compile time, not at launch, not in a golden, because the
+    /// golden records the emitted kernel and this file is the runtime the
+    /// kernel is prefixed with.
+    #[test]
+    fn cuda_runtime_lane_table_matches_layout() {
+        for declared in HOST_SHARED {
+            let expected = declared.emit_cuda();
+            assert!(
+                PROLOGUE.contains(&expected),
+                "fused_block0.cuh has drifted from layout.rs for {}; expected:\n{expected}",
+                declared.c_name
+            );
+        }
+        for (declared, note) in [
+            (LANE_TABLE_HEADER, "lane header ABI"),
+            (LANE_RECORD, "lane record ABI"),
+            (LANE_CHANNEL_SLOT, "lane channel ABI"),
+        ] {
+            let expected = declared.emit_cuda_size_assert(note);
+            assert!(
+                PROLOGUE.contains(&expected),
+                "fused_block0.cuh size assert has drifted; expected:\n{expected}"
+            );
+        }
+    }
 
     /// `parallel_elementwise` is a claim about C++ that the C++ cannot check:
     /// the helper's dispatch runs off the end for a tag it does not know,

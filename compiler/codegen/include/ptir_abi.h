@@ -258,6 +258,11 @@ enum PtirChannelClass : uint8_t { PTIR_CHAN_FULL_RING = 0, PTIR_CHAN_IN_PLACE = 
 #define PTIR_METAL_M1_EMITTER_VERSION 33
 #define PTIR_METAL_M1_MAX_CHANNELS 29
 #define PTIR_METAL_M2_MAX_FUSED_CHANNELS 12
+// Threads a grouped generated region is launched with. The emitted MSL sizes
+// its threadgroup argmax buffer for exactly this many, so a driver that
+// dispatches more overruns it. Same argument as the emitter versions above: the
+// driver cannot compare its copy against the emitter's at runtime.
+#define PTIR_METAL_M3_REGION_THREADS 512
 
 // ── numeric contract (T8 replay determinism; golden interp is normative) ──
 // argmax: lower index wins ties; NaN never selected (all-NaN row -> index 0).
