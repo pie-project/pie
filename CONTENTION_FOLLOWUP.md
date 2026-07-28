@@ -2888,3 +2888,124 @@ loss: a larger window reserves more KV ahead per lane (`reserve_to_tokens`
 covers every submitted fire) and lengthens the queue the scheduler scans each
 seal. Cover 3 is simultaneously the maximum the sweep requires and the optimum
 at the point that requires it.
+
+## §20.12 The run-ahead window belongs to the engine: `channel-capacity()` (2026-07-28)
+
+§20.11 fixed one guest's window. This makes the fix structural: the engine
+computes the window and hands it to every guest over WIT, and the SDK provides
+the loop that consumes it.
+
+### The quantity
+
+```
+R = HOST_TURNAROUND_WAVES = 3       host resubmit turnaround, k-INDEPENDENT
+F = 1 + ceil(R / k)                 frames a lane keeps outstanding
+W = F * k + 1                       model.channel-capacity(), in CELLS
+```
+
+| k | F | W | window (fires) | cover (waves) |
+| --- | --- | --- | --- | --- |
+| 1 | 4 | 5 | 4 | 3 |
+| 2 | 3 | 7 | 6 | 4 |
+| 3 | 2 | 7 | 6 | 3 |
+| 4 | 2 | 9 | 8 | 4 |
+
+`R` is in waves because that is what §20.10 showed the seal actually consumes:
+the wait-for-ALL quorum's binding term is the slowest lane's resubmit, and a
+frame does not make that turnaround any shorter. Sizing in frames is what gave
+k=1 a single wave of runway from the same line of code that gave k=2 two.
+
+The `+1` is structural, not empirical. At zero margin the producer needs the
+consumer's ack to be visible at publish time, and that visibility delay *is*
+the host round trip run-ahead exists to hide.
+
+`PIE_TURNAROUND_WAVES` overrides `R`. Swept at conc 256 (Qwen3-0.6B / L40S,
+medians of 3-4):
+
+| k | R=3 | R=5 | R=6 | R=8 | R=10 |
+| --- | --- | --- | --- | --- | --- |
+| 1 | **29031** | 28874 | - | 28472 | - |
+| 2 | **28847** | - | 28635 | - | 28369 |
+
+Monotonically decreasing above 3 at both frame sizes, for the reason §20.11
+already gave: a deeper window reserves more KV per lane and lengthens the queue
+the scheduler scans each seal. R=3 is measured, not assumed.
+
+Larger models may want more — upstream's bench default was 6 FRAMES, tuned at
+c=128 on Kimi K2.6 — which is what the env override is for.
+
+### Why the guest cannot be trusted with it
+
+At k=1 there is no diagnostic of any kind. `fire.rs:1217` short-circuits to
+`submit_pass_stamped` before `validate_frame`, and every capacity check
+(`fire.rs:1327-1406`) lives inside `validate_frame`. An undersized k=1 ring
+serialises the lane silently, forever. That is exactly the §20.10 collapse, and
+it took three investigations to find because nothing reported it.
+
+### Top-up discipline (a real defect this surfaced)
+
+Refill only while a WHOLE frame still fits:
+
+```rust
+let s = (budget - submitted).min(live_slots);
+if submitted - drained + s > window_fires { break; }
+```
+
+Testing `submitted - drained < window_fires` instead lets a frame START one
+below the window and finish `live_slots - 1` above it, so the true peak is
+`window_fires + live_slots - 1`. The bench's old ring was oversized enough to
+hide this; against a right-sized ring it is a hard submit rejection at k >= 3:
+`frame would need 8 reader cell(s) (capacity 7)`. `ptir::run_ahead` uses the
+same rule, which is what makes the single spare cell the correct margin.
+
+### Migration
+
+- 69 `.capacity(DEFAULT_RUNAHEAD_DEPTH)` sites -> `.capacity(channel_capacity())`
+- 24 pipelined inferlets -> `ptir::run_ahead`, ~430 lines of duplicated
+  prime-then-refill boilerplate deleted
+- `DEFAULT_RUNAHEAD_DEPTH` deleted. It had silently served as three different
+  quantities — window depth in frames, ring capacity in cells, and mtp's KV
+  extent in tokens — which only ever agreed because `submit()` pads every frame
+  to one live slot.
+- The 5 host-in-the-loop inferlets (`json-schema-constrained-decoding`,
+  `greenlist-watermarking`, `classifier-free-guidance`, `context-aware-decoding`,
+  `contrastive-decoding`) are depth-1 BY DESIGN — running ahead would reuse a
+  stale mask or a stale host pick — and keep their lockstep loops. For them
+  F=1, r=1, so `channel-capacity()` returns the 2 they already had.
+
+### Results (Qwen3-0.6B / L40S, medians; vLLM 0.26.0 at matched KV pages)
+
+| conc | PIE k=1 | PIE k=2 | vLLM | k=1 ratio | k=2 ratio |
+| --- | --- | --- | --- | --- | --- |
+| 64 | **16326** | 16150 | 15475 | **1.055** | 1.044 |
+| 128 | **23241** | 22712 | 22133 | **1.050** | 1.026 |
+| 256 | 29031 | 28840 | 29439 | 0.986 | 0.980 |
+
+conc 256 at every frame size: k=1 29031, k=2 28840, k=3 28677, k=4 28392.
+
+conc 64 k=2 is 16150 against the 16145-16153 baseline — the migration is
+neutral where it should be, and the gain at 128/256 is the window.
+
+**k=1 now measures at or above k=2 at every concurrency**, which reverses
+§20.8's premise: that default was raised to 2 only because k=1 collapsed above
+conc 64, and the collapse was the guest window all along (§20.11). k=1 also
+costs less — 5 ring cells against 7, and a smaller KV run-ahead reservation.
+`PIE_FRAME_SIZE` is LEFT AT 2 here because reversing §20.8 deserves its own
+decision and its own contention evidence; the numbers above are that evidence
+when someone wants to take it.
+
+### Verification
+
+- contention suite 16/16 at k=1, k=2 (default) and k=3
+- `cargo test -p pie-engine --test inferlet_canary`: 2 passed, 3 ignored
+- all 29 inferlets build for `wasm32-wasip2`
+
+### Also fixed: embedded engine boot was broken on dev
+
+`pie.Config.to_toml()` emits the role-sectioned standalone document
+(`[controller]` / `[gateway]` / `[worker.*]`) that `pie serve --config` reads,
+and `server.py` fed that same string to `_engine.bootstrap`. The embedded wheel
+IS the worker and deserializes a flat `ServeConfig`, so it rejected
+`[controller]` outright — every embedded-engine bench failed at startup with
+`unknown field 'controller'`. Split out `to_engine_toml()`; both shapes are now
+emitted from one place so they cannot drift apart again.
