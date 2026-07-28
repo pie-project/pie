@@ -125,7 +125,7 @@ async fn generate(
     let w_slot = Channel::from(vec![seq_len / page_size]).named("w_slot");
     let w_off = Channel::from(vec![seq_len % page_size]).named("w_off");
     let token_out = Channel::new([1], dtype::i32)
-        .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+        .capacity(channel_capacity() as u32)
         .named("token_out");
 
     let fwd = ForwardPass::new();

@@ -476,13 +476,13 @@ async fn main(input: Input) -> Result<Output> {
             host_counter(&history, n as usize, cfg.context_width);
         let chist_c = Channel::from(ring_seed).named("context_history");
         let tok_out = Channel::new([1], dtype::i32)
-            .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+            .capacity(channel_capacity() as u32)
             .named("tok_out");
         let score_out = Channel::new([1], dtype::f32)
-            .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+            .capacity(channel_capacity() as u32)
             .named("score_out");
         let null_out = Channel::new([1], dtype::f32)
-            .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+            .capacity(channel_capacity() as u32)
             .named("null_out");
         let lane1 = Channel::from(vec![0u32, 1u32]).named("embed_indptr");
         let positions = Channel::from(vec![n]).named("positions");

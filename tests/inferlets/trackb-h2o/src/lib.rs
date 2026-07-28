@@ -340,7 +340,7 @@ async fn main(input: Input) -> Result<Output> {
         // reasons that have nothing to do with attention.
         let rng = Channel::from(vec![input.seed ^ 0x5bd1, 0]).named("rng");
         let tok_out = Channel::new([1], dtype::i32)
-            .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+            .capacity(channel_capacity() as u32)
             .named("tok_out");
         let lane1 = Channel::from(vec![0u32, 1u32]).named("embed_indptr");
         let positions = Channel::from(vec![n]).named("positions");
@@ -378,12 +378,12 @@ async fn main(input: Input) -> Result<Output> {
         // fold feeds `page_mass_epi`, which IS the policy.
         let scores_out = report.then(|| {
             Channel::new([kv_max], dtype::f32)
-                .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+                .capacity(channel_capacity() as u32)
                 .named("h2o_scores")
         });
         let layers_out = report.then(|| {
             Channel::new([1], dtype::u32)
-                .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+                .capacity(channel_capacity() as u32)
                 .named("h2o_layer_count")
         });
 

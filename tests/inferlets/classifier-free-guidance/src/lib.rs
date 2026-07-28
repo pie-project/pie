@@ -233,7 +233,7 @@ async fn main(input: Input) -> Result<String> {
     let u_slot = Channel::from(vec![nu / PAGE_T]).named("uncond_write_slot");
     let u_off = Channel::from(vec![nu % PAGE_T]).named("uncond_write_offset");
     let u_logits_out = Channel::new([vocab], dtype::f32)
-        .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+        .capacity(channel_capacity() as u32)
         .named("uncond_logits");
 
     let uncond_decode = ForwardPass::new();
@@ -275,13 +275,13 @@ async fn main(input: Input) -> Result<String> {
     let c_off = Channel::from(vec![nc % PAGE_T]).named("cond_write_offset");
     let c_uncond = Channel::writer([vocab], dtype::f32).named("cond_uncond_logits");
     let c_token_out = Channel::new([1], dtype::i32)
-        .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+        .capacity(channel_capacity() as u32)
         .named("cond_token_out");
     let c_shift_out = Channel::new([1], dtype::i32)
-        .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+        .capacity(channel_capacity() as u32)
         .named("cond_shift_out");
     let c_kl_out = Channel::new([1], dtype::f32)
-        .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+        .capacity(channel_capacity() as u32)
         .named("cond_kl_out");
 
     let cond_decode = ForwardPass::new();

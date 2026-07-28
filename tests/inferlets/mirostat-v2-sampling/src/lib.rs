@@ -237,10 +237,10 @@ async fn main(input: Input) -> Result<Output> {
         let mu_state = Channel::from(vec![mu]).named("mu_state");
         let rng = Channel::from(vec![0x51ed_u32, 0]).named("rng");
         let tok_out = Channel::new([1], dtype::i32)
-            .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+            .capacity(channel_capacity() as u32)
             .named("tok_out");
         let s_out = Channel::new([1], dtype::f32)
-            .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+            .capacity(channel_capacity() as u32)
             .named("s_out");
         let lane1 = Channel::from(vec![0u32, 1u32]).named("embed_indptr");
         let positions = Channel::from(vec![n]).named("positions");

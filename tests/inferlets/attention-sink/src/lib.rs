@@ -150,7 +150,7 @@ async fn main(input: Input) -> Result<String> {
     let page_indptr = Channel::from_shaped([2], vec![0u32, (n + 1).div_ceil(PAGE_T)]);
     let pool_ids_input = Channel::from(pool_ids.clone()).named("pool_ids");
     let token_out = Channel::new([1], dtype::i32)
-        .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+        .capacity(channel_capacity() as u32)
         .named("token_out");
 
     let decode = ForwardPass::new();

@@ -433,13 +433,13 @@ async fn main(input: Input) -> Result<Output> {
         let hist_c = Channel::from(history.clone()).named("hist");
         let hlen_c = Channel::from(vec![n + 1]).named("hlen");
         let tok_out = Channel::new([1], dtype::i32)
-            .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+            .capacity(channel_capacity() as u32)
             .named("tok_out");
         let cnt_out = Channel::new([1], dtype::f32)
-            .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+            .capacity(channel_capacity() as u32)
             .named("cnt_out");
         let peak_out = Channel::new([1], dtype::f32)
-            .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+            .capacity(channel_capacity() as u32)
             .named("peak_out");
         let lane1 = Channel::from(vec![0u32, 1u32]).named("embed_indptr");
         let positions = Channel::from(vec![n]).named("positions");

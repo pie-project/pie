@@ -141,7 +141,7 @@ async fn main(input: Input) -> Result<String> {
     let decode_embed_indptr = Channel::from(vec![0u32, 1]);
     let pool_ids_input = Channel::from(pool_ids.clone()).named("pool_ids");
     let token_out = Channel::new([1], dtype::i32)
-        .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+        .capacity(channel_capacity() as u32)
         .named("token_out");
 
     let decode = ForwardPass::new();

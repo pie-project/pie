@@ -257,7 +257,7 @@ async fn main(input: Input) -> Result<Output> {
         let tok_in = Channel::from(vec![g0; 1]).named("tok_in");
         let rng = Channel::from(vec![input.seed ^ 0x70a, 0]).named("rng");
         let tok_out = Channel::new([1], dtype::i32)
-            .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+            .capacity(channel_capacity() as u32)
             .named("tok_out");
         let lane1 = Channel::from(vec![0u32, 1u32]).named("embed_indptr");
         let positions = Channel::from(vec![n]).named("positions");
@@ -282,10 +282,10 @@ async fn main(input: Input) -> Result<Output> {
 
         // Host drains.
         let scores_out = Channel::new([kv_max], dtype::f32)
-            .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+            .capacity(channel_capacity() as u32)
             .named("tova_scores");
         let layers_out = Channel::new([1], dtype::u32)
-            .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+            .capacity(channel_capacity() as u32)
             .named("tova_layer_count");
 
         let fwd = ForwardPass::new();
