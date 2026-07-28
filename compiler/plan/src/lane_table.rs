@@ -1,5 +1,10 @@
 //! The lane-table ABI: the structs the host fills and the kernels read.
 //!
+//! Declarations, not a compilation pass, which is why they sit at the crate
+//! root rather than under `compile/`. Nothing here reads a stage or produces a
+//! plan; every consumer is downstream — `pie_codegen::layout`, `header`, and
+//! the two backends' emitters.
+//!
 //! The field layout is mirrored into the generated C header and both MSL
 //! preambles by `pie_codegen::layout`, which pins these structs with
 //! `offset_of!` so the copies cannot drift.

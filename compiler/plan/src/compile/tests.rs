@@ -15,6 +15,7 @@
 //! `normalize::value_domain_tests` reaches for `program` too.
 
 use super::*;
+use crate::lane_table::{LaneChannelSlot, LaneRecord, LaneTableHeader};
 use alloc::vec;
 use pie_ir::container::{
     ChanDType, ChannelDecl, HostRole, PortBinding, PortSource, StageProgram, TraceContainer,
