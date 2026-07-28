@@ -2999,12 +2999,7 @@ see whether run-ahead sizing explains the trailing half. None of it does:
 
 The long run is the informative one: with four times the cohorts the ratio does
 not move (0.942 -> 0.928), so the gap is steady-state throughput, not prefill
-ramp or cohort-boundary accounting. §20.10 already named the mechanism — the
-seal is wait-for-ALL, so its binding term is the SLOWEST of `concurrency` lanes'
-resubmit, and the maximum of N samples grows with N. Run-ahead buys the
-straggler time but cannot remove it from the critical path; only changing the
-quorum can. That is an architectural item, tracked as an open finding, not a
-regression from this work.
+ramp. §20.13 profiles it and finds the mechanism is NOT the seal quorum.
 
 What this work did move: conc 256 went 0.962 (§20.9) -> 0.979 (§20.11) ->
 0.986, and conc 128 went from behind to 1.050.
@@ -3035,3 +3030,123 @@ IS the worker and deserializes a flat `ServeConfig`, so it rejected
 `[controller]` outright — every embedded-engine bench failed at startup with
 `unknown field 'controller'`. Split out `to_engine_toml()`; both shapes are now
 emitted from one place so they cannot drift apart again.
+
+### §20.13 The conc-512 gap is the request-turnover barrier, not the seal quorum (2026-08-04)
+
+§20.12 blamed §20.10's wait-for-ALL seal for the 256/512 deficit. **That was
+wrong.** Direct profiling refutes it and names two independent, measured terms.
+
+#### Refuting the seal hypothesis: pie is GPU-bound
+
+`PIE_FIRE_TIMING=waves` at conc 512, k=2. GPU busy is reconstructed from
+consecutive waves — `start = max(prev.native_complete_us, w.launch_returned_us)`
+— because waves overlap two deep and `native_inflight_us` alone sums to 127% of
+the span.
+
+| conc | span | GPU busy | prefill share |
+| --- | --- | --- | --- |
+| 128 | 6140 ms | 93.3% | — |
+| 256 | 4950 ms | 91.6% | — |
+| 512 | 17770 ms | 92.7% | 3.4% |
+
+A seal that waits on the slowest of N lanes' resubmit would show up as GPU idle
+scattered through the run. It does not: idle is 7.3% and, as shown below, it is
+concentrated in a handful of gaps whose position and size are fully explained by
+something else. Raising `PIE_SCHED_MAX_IN_FLIGHT` 2 -> 3 also does nothing
+(30582 vs 30578); depth 1 costs 27% (22169). The pipeline is not depth-starved.
+
+#### Term 1: request turnover is a global barrier (~4.8% of wall)
+
+The idle is not scattered. At conc 512 / 4096 requests there is exactly one
+startup gap plus **`cohorts - 1` turnover gaps**, and each one lands precisely on
+a fleet-wide process retirement:
+
+| gap | size | lifecycle events within +/-40 ms |
+| --- | --- | --- |
+| startup | 418 ms | `guest_main_entered` = 1024 (whole fleet instantiating) |
+| turnover | 77-141 ms | `process_teardown` start = 512, `released` = 512 |
+
+Inside a turnover gap the successor's admission tracks its predecessor's release
+at every quantile, within 0.3 ms:
+
+| quantile | teardown start | permit released | successor admitted |
+| --- | --- | --- | --- |
+| p10 | 162086.9 | 162105.3 | 162105.6 |
+| p50 | 162108.0 | 162120.1 | **162120.2** |
+| p90 | 162132.6 | 162135.1 | 162135.4 |
+
+The code says why. In `process/teardown.rs` the execution permit lives inside
+`context` and is only released by `drop(context)` — which runs *after* the
+awaited `notify_process_terminate` reference fence (`terminate_ack_us` p50
+**8.5 ms**) and after `finalize_all`. The fence's own comment concedes the
+pacing: *"serializes each retirement behind a scheduler pass"*. So a lane's seat
+is not freed when it stops producing tokens; it is freed when its predecessor has
+fully torn down. Because every lane runs the same prompt for the same
+`max_tokens`, all `concurrency` lanes retire in the same wave, and the retirement
+herd is serialized with the GPU idle.
+
+That predicts the gap should scale with herd size, and it does — linearly:
+
+| conc | turnover gap (mean) | startup gap | gap / (gap + cohort GPU time) |
+| --- | --- | --- | --- |
+| 128 | 35.4 ms | 136 ms | 4.7% |
+| 256 | 57.4 ms | 202 ms | 4.8% |
+| 512 | **106.7 ms** | 418 ms | **4.9%** |
+
+Both the gap and the work per cohort scale with concurrency, so **the turnover
+tax is a near-constant ~4.8% at every concurrency** — it is not a defect that
+appears at 512. vLLM pays none of it: its marginal wall per cohort is flat to
+three digits (2.00 / 2.01 / 2.00 s) while pie's grows (2.09 / 2.145 / 2.24 s).
+
+A finished vLLM sequence is dropped from the batch and replaced on the very next
+scheduler step. A finished pie request must tear down a WASM process first.
+
+#### Term 2: pie's per-step advantage decays with batch width
+
+Dividing tokens by GPU-busy time isolates pie's decode rate from the turnover
+tax (corrected for instrumentation's 3.6%):
+
+| conc | pie decode rate | vLLM end-to-end | raw advantage | measured e2e ratio |
+| --- | --- | --- | --- | --- |
+| 128 | 23702 | 22133 | **+7.1%** | 1.050 |
+| 256 | 29949 | 29439 | +1.7% | 0.986 |
+| 512 | 32973 | 32613 | **+1.1%** | 0.916 |
+
+pie's kernels are at or ahead of vLLM's at every width — at conc 512 its decode
+rate (32973) matches vLLM's own steady-state generation throughput
+(33013-33043). But the margin collapses from +7.1% to +1.1% as the batch widens.
+
+**The two terms together are the whole story.** A flat ~4.8% turnover tax against
+an advantage that decays from +7% to +1%: the sign flips between conc 128 and
+conc 256, exactly where the measured ratio does.
+
+#### Corroboration: the deficit is per-request, not per-token
+
+Holding conc at 512 and varying output length moves the ratio monotonically,
+which is the signature of a fixed per-request cost:
+
+| max_tokens | pie | vLLM | ratio |
+| --- | --- | --- | --- |
+| 32 | 28128 | 31925 | 0.881 |
+| 64 | 31934 | 34948 | 0.914 |
+| 128 | 30594 | 32453 | 0.942 |
+| 256 | 24291 | 24958 | 0.973 |
+| 512 | 12334 | 15771 | 0.782 (KV-confounded, discard) |
+
+The 512 row is not comparable: Qwen3-0.6B is 112 KiB/token, so 512 lanes x 548
+tokens does not fit in 12288 pages and both engines thrash.
+
+Ruled out by measurement: in-flight depth, `--worker-threads` (16/32/64 all at or
+below default), prefill share (3.4%), kernel efficiency, and run length.
+
+#### Prize
+
+Removing the process-lifecycle idle — 1165 ms of a 17770 ms run at conc 512 —
+would take the ratio from 0.916 to **~0.979**. The fix is to stop holding the
+execution permit across teardown: release the seat when the guest stops
+producing, and let the terminate fence, finalize and resource drop run behind the
+successor rather than in front of it. The startup gap is a one-time fleet
+instantiation and amortizes away on a long-lived server; the per-turnover gap
+does not. Tracked as an open finding — the change touches the same permit
+accounting that §20.4's forfeit path depends on and needs its own contention
+evidence.
