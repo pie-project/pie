@@ -10,7 +10,10 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
+
+#include <sys/stat.h>
 
 #include <cuda_bf16.h>
 
@@ -32,11 +35,26 @@ bool env_truthy(const char* value) {
            value[0] == 'O';
 }
 
+// Tactics are held as indices into the runner's candidate lists, not as
+// configs, so that a tuning result is a pair of small integers and can be
+// written to (and matched against) an on-disk cache.
+struct TacticPair {
+    int gemm1 = -1;
+    int gemm2 = -1;
+};
+
 struct RunnerState {
     std::once_flag init_once;
     std::unique_ptr<Runner> runner;
     bool ready = false;
     std::exception_ptr init_error;
+    // Populated by get_runner(); the full candidate lists plus the shape-blind
+    // default pair, so the autotuner does not have to re-query them.
+    std::vector<ce::CutlassGemmConfig> gemm1_tactics;
+    std::vector<ce::CutlassGemmConfig> gemm2_tactics;
+    TacticPair default_tactics{};
+    std::mutex tune_mutex;
+    std::unordered_map<std::uint64_t, TacticPair> tuned;
 };
 
 RunnerState& state() {
@@ -72,8 +90,10 @@ bool use_raw_tactic_selection() {
 
 std::optional<ce::CutlassGemmConfig> select_first_profile(
     const std::vector<ce::CutlassGemmConfig>& configs,
-    const char* name) {
+    const char* name,
+    int* out_index) {
     if (configs.empty()) return std::nullopt;
+    *out_index = 0;
     if (log_enabled()) {
         std::fprintf(
             stderr,
@@ -89,7 +109,8 @@ std::optional<ce::CutlassGemmConfig> first_supported(
     const std::vector<ce::CutlassGemmConfig>& configs,
     std::optional<ce::CutlassGemmConfig::EpilogueFusionType> fusion,
     int supported_index,
-    const char* name) {
+    const char* name,
+    int* out_index) {
     int seen = 0;
     int supported = 0;
     int index = -1;
@@ -103,6 +124,7 @@ std::optional<ce::CutlassGemmConfig> first_supported(
             if (supported == supported_index) {
                 selected = cfg;
                 selected_index = index;
+                *out_index = index;
             }
             ++supported;
         }
@@ -128,11 +150,13 @@ std::optional<ce::CutlassGemmConfig> first_supported(
 std::optional<ce::CutlassGemmConfig> select_raw_profile(
     const std::vector<ce::CutlassGemmConfig>& configs,
     int raw_index,
-    const char* name) {
+    const char* name,
+    int* out_index) {
     if (configs.empty()) return std::nullopt;
     const int index = std::min(
         std::max(0, raw_index),
         static_cast<int>(configs.size()) - 1);
+    *out_index = index;
     if (log_enabled()) {
         std::fprintf(
             stderr,
@@ -172,26 +196,55 @@ std::optional<ce::CutlassGemmConfig::EpilogueFusionType> requested_gemm2_fusion(
         "PIE_NEMOTRON_FLASHINFER_MOE_GEMM2 must be auto, none, or finalize");
 }
 
-void log_config(const char* name, const ce::CutlassGemmConfig& cfg) {
-    if (!log_enabled()) return;
-    std::fprintf(
-        stderr,
-        "[pie-driver-cuda] FlashInfer MoE %s tactic: fusion=%s "
-        "tma=%d swap_ab=%d sm=%d tile80=%d tile90=%d mainloop=%d "
-        "epilogue=%d cluster=%d split_k=%d stages=%d\n",
-        name,
+// The tile/cluster enums encode their shape as base-1000 digits, so they are
+// unreadable as raw integers. `Undefined`(0) and `ChooseWithHeuristic`(1) are
+// not shapes and are reported as-is.
+std::string shape_str(int id) {
+    if (id == 0) return "undef";
+    if (id == 1) return "heuristic";
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%dx%dx%d",
+                  id / 1000000, (id % 1000000) / 1000, id % 1000);
+    return std::string(buf);
+}
+
+// `sm_version` decides which of the three tile fields is live; printing the
+// wrong one shows a constant `heuristic` for every tactic.
+std::string tile_str(const ce::CutlassGemmConfig& cfg) {
+    if (cfg.sm_version >= 120) return shape_str(static_cast<int>(cfg.tile_config_sm120));
+    if (cfg.sm_version >= 100) return shape_str(static_cast<int>(cfg.tile_config_sm100));
+    if (cfg.sm_version >= 90) return shape_str(static_cast<int>(cfg.tile_config_sm90));
+    return shape_str(static_cast<int>(cfg.tile_config_sm80));
+}
+
+std::string config_str(const ce::CutlassGemmConfig& cfg) {
+    char buf[320];
+    std::snprintf(
+        buf, sizeof(buf),
+        "fusion=%s tma=%d swap_ab=%d sm=%d tile=%s mainloop=%d epilogue=%d "
+        "cluster=%s dyn_cluster=%s fallback_cluster=%s split_k=%d stages=%d",
         fusion_name(cfg.epilogue_fusion_type),
         cfg.is_tma_warp_specialized ? 1 : 0,
         cfg.swap_ab ? 1 : 0,
         cfg.sm_version,
-        static_cast<int>(cfg.tile_config_sm80),
-        static_cast<int>(cfg.tile_config_sm90),
+        tile_str(cfg).c_str(),
         static_cast<int>(cfg.mainloop_schedule),
         static_cast<int>(cfg.epilogue_schedule),
-        static_cast<int>(cfg.cluster_shape),
+        shape_str(static_cast<int>(cfg.cluster_shape)).c_str(),
+        shape_str(static_cast<int>(cfg.dynamic_cluster_shape)).c_str(),
+        shape_str(static_cast<int>(cfg.fallback_cluster_shape)).c_str(),
         cfg.split_k_factor,
         cfg.stages);
+    return std::string(buf);
 }
+
+void log_config(const char* name, const ce::CutlassGemmConfig& cfg) {
+    if (!log_enabled()) return;
+    std::fprintf(stderr, "[pie-driver-cuda] FlashInfer MoE %s tactic: %s\n",
+                 name, config_str(cfg).c_str());
+}
+
+void tactic_cache_load(RunnerState& s);
 
 Runner& get_runner() {
     RunnerState& s = state();
@@ -200,20 +253,21 @@ Runner& get_runner() {
             auto runner = std::make_unique<Runner>();
             auto gemm1 = runner->getTactics(ck::MoeGemmId::GEMM_1);
             auto gemm2 = runner->getTactics(ck::MoeGemmId::GEMM_2);
+            TacticPair defaults{};
             std::optional<ce::CutlassGemmConfig> best_gemm1;
             std::optional<ce::CutlassGemmConfig> best_gemm2;
             if (use_raw_tactic_selection()) {
                 best_gemm1 = select_raw_profile(
                     gemm1,
                     env_index("PIE_NEMOTRON_FLASHINFER_MOE_GEMM1_INDEX"),
-                    "GEMM1");
+                    "GEMM1", &defaults.gemm1);
                 best_gemm2 = select_raw_profile(
                     gemm2,
                     env_index("PIE_NEMOTRON_FLASHINFER_MOE_GEMM2_INDEX"),
-                    "GEMM2");
+                    "GEMM2", &defaults.gemm2);
             } else if (use_first_tactic_selection()) {
-                best_gemm1 = select_first_profile(gemm1, "GEMM1");
-                best_gemm2 = select_first_profile(gemm2, "GEMM2");
+                best_gemm1 = select_first_profile(gemm1, "GEMM1", &defaults.gemm1);
+                best_gemm2 = select_first_profile(gemm2, "GEMM2", &defaults.gemm2);
             } else {
                 // Default: first tactic the runner reports as occupancy-viable.
                 //
@@ -227,7 +281,7 @@ Runner& get_runner() {
                 best_gemm1 = first_supported(
                     *runner, gemm1, std::nullopt,
                     env_index("PIE_NEMOTRON_FLASHINFER_MOE_GEMM1_INDEX"),
-                    "GEMM1");
+                    "GEMM1", &defaults.gemm1);
                 const auto gemm2_fusion = requested_gemm2_fusion();
                 const int gemm2_index =
                     env_index("PIE_NEMOTRON_FLASHINFER_MOE_GEMM2_INDEX");
@@ -235,10 +289,11 @@ Runner& get_runner() {
                     *runner, gemm2,
                     gemm2_fusion.value_or(
                         ce::CutlassGemmConfig::EpilogueFusionType::FINALIZE),
-                    gemm2_index, "GEMM2");
+                    gemm2_index, "GEMM2", &defaults.gemm2);
                 if (!best_gemm2 && !gemm2_fusion) {
                     best_gemm2 = first_supported(
-                        *runner, gemm2, std::nullopt, gemm2_index, "GEMM2");
+                        *runner, gemm2, std::nullopt, gemm2_index, "GEMM2",
+                        &defaults.gemm2);
                 }
             }
             if (!best_gemm1 || !best_gemm2) {
@@ -248,6 +303,14 @@ Runner& get_runner() {
             log_config("GEMM1", *best_gemm1);
             log_config("GEMM2", *best_gemm2);
             runner->setTactic(best_gemm1, best_gemm2);
+            s.gemm1_tactics = std::move(gemm1);
+            s.gemm2_tactics = std::move(gemm2);
+            if (defaults.gemm1 < 0 || defaults.gemm2 < 0) {
+                throw std::runtime_error(
+                    "flashinfer CUTLASS MoE: default tactic has no index");
+            }
+            s.default_tactics = defaults;
+            tactic_cache_load(s);
             s.runner = std::move(runner);
             s.ready = true;
         } catch (...) {
@@ -272,6 +335,427 @@ ck::ActivationType to_cutlass_activation(MoeActivation a) {
 
 ck::MOEParallelismConfig parallelism_config(int tp_size, int tp_rank) {
     return ck::MOEParallelismConfig(std::max(1, tp_size), tp_rank, 1, 0);
+}
+
+// ---- Shape-aware tactic selection ----------------------------------------
+//
+// `getTactics` returns 109 GEMM1 and 209 GEMM2 candidates, and on SM100 every
+// one of them reports positive occupancy -- so "first occupancy-viable" is
+// really just "candidate 0", regardless of the problem. That is the wrong tile
+// for almost every shape we run: a decode step is M=8 against N=4096, where a
+// 256-row CTA tile wastes 97% of its rows, while a prefill at M=1024 wants the
+// widest tile available. CUTLASS ships no shape heuristic for grouped GEMM
+// here (`ChooseWithHeuristic` is not among the returned configs), so measure.
+//
+// `setTactic` is two pointer stores, so the tactic can be chosen per call. We
+// key on the problem shape, bucket M by power of two, and tune once per key by
+// coordinate descent (sweep GEMM1 with GEMM2 fixed, then the reverse).
+//
+// Tuning runs entirely on private buffers and a private stream, sharing only
+// the (read-only, long-since-written) expert weights with the caller. That
+// matters because the shape we most want to tune -- decode -- is only ever
+// seen from inside `cudaStreamBeginCapture`: capture takes the very first
+// step of each bucket, with no eager pass in front of it. Borrowing the
+// caller's stream or workspace would need cross-stream events, and those get
+// swallowed into the graph. Being self-contained means tuning is just
+// ordinary work on an unrelated stream, which capture does not observe.
+// Timing calls (`cudaStreamSynchronize`, `cudaMalloc`) are unsafe API in the
+// capture sense, but pie captures with `cudaStreamCaptureModeRelaxed`
+// (cuda_check.hpp), which permits exactly that.
+
+struct MoeProblem {
+    int num_rows;
+    int hidden_size;
+    int inter_size;
+    int num_experts;
+    int experts_per_token;
+    int tp_size;
+    int tp_rank;
+    MoeActivation activation;
+};
+
+struct MoeBuffers {
+    const std::uint16_t* input;
+    const std::int32_t* token_selected_experts;
+    const float* token_final_scales;
+    const std::uint16_t* fc1_expert_weights;
+    const std::uint16_t* fc2_expert_weights;
+    std::uint16_t* output;
+    std::uint8_t* workspace;
+    std::int32_t* unpermuted_row_to_permuted_row;
+};
+
+void run_moe(Runner& runner, const MoeProblem& p, const MoeBuffers& b,
+             cudaStream_t stream) {
+    ck::QuantParams quant_params{};
+    tk::LoraParams lora_params{};
+    ck::MoeMinLatencyParams min_latency_params{};
+    runner.runMoe(
+        b.input, nullptr, false, b.token_selected_experts, b.token_final_scales,
+        b.fc1_expert_weights, nullptr,
+        ck::ActivationParams(to_cutlass_activation(p.activation)),
+        b.fc2_expert_weights, nullptr, quant_params, p.num_rows, p.hidden_size,
+        p.hidden_size, p.inter_size, p.num_experts, p.experts_per_token,
+        reinterpret_cast<char*>(b.workspace), b.output,
+        b.unpermuted_row_to_permuted_row,
+        parallelism_config(p.tp_size, p.tp_rank), false, false, lora_params,
+        false, false, false, min_latency_params, false, stream);
+}
+
+bool autotune_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("PIE_MOE_AUTOTUNE");
+        if (v == nullptr || v[0] == '\0') return true;
+        return !(v[0] == '0' || v[0] == 'n' || v[0] == 'N');
+    }();
+    return on;
+}
+
+// A candidate must be at least this much faster than the incumbent to
+// displace it.
+constexpr float kTacticMargin = 0.98f;
+
+int autotune_m_bucket(int m) {
+    // Exact below 16 (decode concurrency lives here and the best tile changes
+    // fast), power-of-two above.
+    if (m <= 16) return m;
+    int b = 16;
+    while (b < m && b < (1 << 20)) b <<= 1;
+    return b;
+}
+
+std::uint64_t tactic_key(const MoeProblem& p) {
+    auto mix = [](std::uint64_t h, std::uint64_t v) {
+        h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        return h;
+    };
+    std::uint64_t h = 0;
+    h = mix(h, static_cast<std::uint64_t>(autotune_m_bucket(p.num_rows)));
+    h = mix(h, static_cast<std::uint64_t>(p.hidden_size));
+    h = mix(h, static_cast<std::uint64_t>(p.inter_size));
+    h = mix(h, static_cast<std::uint64_t>(p.num_experts));
+    h = mix(h, static_cast<std::uint64_t>(p.experts_per_token));
+    h = mix(h, static_cast<std::uint64_t>(p.tp_size));
+    h = mix(h, static_cast<std::uint64_t>(p.activation));
+    return h;
+}
+
+// Returns the elapsed time of the fastest of `iters` runs, or -1 if the tactic
+// fails. Errors here are expected (a tile can be rejected for this problem
+// even when occupancy says otherwise), so they are swallowed and the tactic is
+// dropped from consideration.
+float time_tactic(RunnerState& s, Runner& runner, const MoeProblem& p,
+                  const MoeBuffers& b, const TacticPair& t, cudaEvent_t start,
+                  cudaEvent_t stop, cudaStream_t stream) {
+    constexpr int kWarmup = 3;
+    constexpr int kIters = 7;
+    runner.setTactic(s.gemm1_tactics[t.gemm1], s.gemm2_tactics[t.gemm2]);
+    try {
+        for (int i = 0; i < kWarmup; ++i) run_moe(runner, p, b, stream);
+    } catch (...) {
+        cudaStreamSynchronize(stream);
+        cudaGetLastError();
+        return -1.0f;
+    }
+    if (cudaStreamSynchronize(stream) != cudaSuccess) {
+        cudaGetLastError();
+        return -1.0f;
+    }
+    float best = 1e30f;
+    for (int i = 0; i < kIters; ++i) {
+        cudaEventRecord(start, stream);
+        try {
+            run_moe(runner, p, b, stream);
+        } catch (...) {
+            cudaStreamSynchronize(stream);
+            cudaGetLastError();
+            return -1.0f;
+        }
+        cudaEventRecord(stop, stream);
+        if (cudaEventSynchronize(stop) != cudaSuccess) {
+            cudaGetLastError();
+            return -1.0f;
+        }
+        float ms = 0.0f;
+        if (cudaEventElapsedTime(&ms, start, stop) != cudaSuccess) {
+            cudaGetLastError();
+            return -1.0f;
+        }
+        best = std::min(best, ms);
+    }
+    return best;
+}
+
+// Owns every allocation the tuner needs, so tuning never touches a buffer the
+// caller's stream might still be using.
+struct TuneArena {
+    void* input = nullptr;
+    void* experts = nullptr;
+    void* scales = nullptr;
+    void* output = nullptr;
+    void* row_map = nullptr;
+    void* workspace = nullptr;
+    cudaStream_t stream = nullptr;
+    cudaEvent_t start = nullptr;
+    cudaEvent_t stop = nullptr;
+
+    ~TuneArena() {
+        if (start) cudaEventDestroy(start);
+        if (stop) cudaEventDestroy(stop);
+        if (stream) cudaStreamDestroy(stream);
+        for (void* p : {input, experts, scales, output, row_map, workspace}) {
+            if (p) cudaFree(p);
+        }
+        cudaGetLastError();
+    }
+
+    bool alloc(std::size_t bytes, void** dst) {
+        if (cudaMalloc(dst, bytes) != cudaSuccess) {
+            cudaGetLastError();
+            *dst = nullptr;
+            return false;
+        }
+        return true;
+    }
+
+    bool init(const MoeProblem& p, std::size_t workspace_bytes) {
+        const std::size_t rows = static_cast<std::size_t>(p.num_rows);
+        const std::size_t routes = rows * p.experts_per_token;
+        if (!alloc(rows * p.hidden_size * sizeof(std::uint16_t), &input) ||
+            !alloc(rows * p.hidden_size * sizeof(std::uint16_t), &output) ||
+            !alloc(routes * sizeof(std::int32_t), &experts) ||
+            !alloc(routes * sizeof(std::int32_t), &row_map) ||
+            !alloc(routes * sizeof(float), &scales) ||
+            !alloc(workspace_bytes, &workspace)) {
+            return false;
+        }
+        if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) !=
+                cudaSuccess ||
+            cudaEventCreate(&start) != cudaSuccess ||
+            cudaEventCreate(&stop) != cudaSuccess) {
+            const cudaError_t err = cudaGetLastError();
+            std::fprintf(stderr,
+                         "[pie-driver-cuda] FlashInfer MoE autotune stream/event "
+                         "setup failed (%s)\n",
+                         cudaGetErrorString(err));
+            return false;
+        }
+
+        // Activations only have to be finite -- a tensor-core GEMM's cost does
+        // not depend on its values. Routing does matter, because it decides
+        // how many rows land in each expert's group; round-robin is the
+        // balanced case.
+        std::vector<std::int32_t> host_experts(routes);
+        std::vector<float> host_scales(
+            routes, 1.0f / static_cast<float>(p.experts_per_token));
+        for (std::size_t i = 0; i < routes; ++i) {
+            host_experts[i] = static_cast<std::int32_t>(i % p.num_experts);
+        }
+        const bool ok =
+            cudaMemsetAsync(input, 0x3C,
+                            rows * p.hidden_size * sizeof(std::uint16_t),
+                            stream) == cudaSuccess &&
+            cudaMemcpyAsync(experts, host_experts.data(),
+                            routes * sizeof(std::int32_t),
+                            cudaMemcpyHostToDevice, stream) == cudaSuccess &&
+            cudaMemcpyAsync(scales, host_scales.data(), routes * sizeof(float),
+                            cudaMemcpyHostToDevice, stream) == cudaSuccess &&
+            cudaStreamSynchronize(stream) == cudaSuccess;
+        if (!ok) {
+            const cudaError_t err = cudaGetLastError();
+            std::fprintf(stderr,
+                         "[pie-driver-cuda] FlashInfer MoE autotune arena fill "
+                         "failed (%s); using default tactic\n",
+                         cudaGetErrorString(err));
+        }
+        return ok;
+    }
+};
+
+TacticPair autotune(RunnerState& s, Runner& runner, const MoeProblem& p,
+                    const MoeBuffers& live, std::size_t workspace_bytes) {
+    TacticPair best = s.default_tactics;
+
+    TuneArena arena;
+    if (!arena.init(p, workspace_bytes)) {
+        std::fprintf(stderr,
+                     "[pie-driver-cuda] FlashInfer MoE autotune skipped for "
+                     "m=%d h=%d i=%d e=%d k=%d (arena setup failed)\n",
+                     p.num_rows, p.hidden_size, p.inter_size, p.num_experts,
+                     p.experts_per_token);
+        return best;
+    }
+
+    MoeBuffers b{};
+    b.input = static_cast<const std::uint16_t*>(arena.input);
+    b.token_selected_experts = static_cast<const std::int32_t*>(arena.experts);
+    b.token_final_scales = static_cast<const float*>(arena.scales);
+    b.fc1_expert_weights = live.fc1_expert_weights;
+    b.fc2_expert_weights = live.fc2_expert_weights;
+    b.output = static_cast<std::uint16_t*>(arena.output);
+    b.workspace = static_cast<std::uint8_t*>(arena.workspace);
+    b.unpermuted_row_to_permuted_row = static_cast<std::int32_t*>(arena.row_map);
+
+    float best_ms = time_tactic(s, runner, p, b, best, arena.start, arena.stop,
+                                arena.stream);
+    const float baseline_ms = best_ms;
+    int tried = 0;
+    auto sweep = [&](const std::vector<ce::CutlassGemmConfig>& configs,
+                     bool is_gemm1) {
+        for (int i = 0; i < static_cast<int>(configs.size()); ++i) {
+            if (runner.queryOccupancyForConfig(configs[i]) <= 0) continue;
+            TacticPair cand = best;
+            (is_gemm1 ? cand.gemm1 : cand.gemm2) = i;
+            ++tried;
+            const float ms = time_tactic(s, runner, p, b, cand, arena.start,
+                                         arena.stop, arena.stream);
+            // Only switch on a margin clearly outside run-to-run timing noise.
+            // Dozens of these tactics land within a percent of each other, and
+            // letting noise pick between them makes the choice -- and with it
+            // the GEMM's accumulation order, and so the sampled token on a
+            // near-tie -- differ from run to run.
+            if (ms > 0.0f && (best_ms < 0.0f || ms < best_ms * kTacticMargin)) {
+                best_ms = ms;
+                best = cand;
+            }
+        }
+    };
+    sweep(s.gemm1_tactics, true);
+    sweep(s.gemm2_tactics, false);
+
+    if (log_enabled()) {
+        std::fprintf(
+            stderr,
+            "[pie-driver-cuda] FlashInfer MoE autotune m=%d h=%d i=%d e=%d "
+            "k=%d: %.1f us -> %.1f us over %d tactics\n"
+            "    GEMM1 %s\n    GEMM2 %s\n",
+            p.num_rows, p.hidden_size, p.inter_size, p.num_experts,
+            p.experts_per_token, baseline_ms * 1e3f, best_ms * 1e3f, tried,
+            config_str(s.gemm1_tactics[best.gemm1]).c_str(),
+            config_str(s.gemm2_tactics[best.gemm2]).c_str());
+    }
+    return best;
+}
+
+
+// ---- Tuning cache ---------------------------------------------------------
+//
+// Sweeping 318 tactics takes ~0.3s per shape, and a server sees roughly a
+// dozen shapes (one per CUDA-graph bucket), so an untuned start costs several
+// seconds and perturbs the first requests. Results are keyed by shape and
+// stored as indices into the runner's candidate lists, which is only
+// meaningful for the exact GPU and tactic list that produced them -- so the
+// header pins both, and a mismatch discards the file rather than replaying
+// indices that now name different kernels.
+
+std::string tactic_cache_path() {
+    const char* explicit_path = std::getenv("PIE_MOE_TACTIC_CACHE");
+    if (explicit_path != nullptr && explicit_path[0] != '\0') {
+        return explicit_path;
+    }
+    const char* xdg = std::getenv("XDG_CACHE_HOME");
+    if (xdg != nullptr && xdg[0] != '\0') return std::string(xdg) + "/pie/moe_tactics.txt";
+    const char* home = std::getenv("HOME");
+    if (home == nullptr || home[0] == '\0') return {};
+    return std::string(home) + "/.cache/pie/moe_tactics.txt";
+}
+
+std::string tactic_cache_header(const RunnerState& s) {
+    int device = 0;
+    cudaDeviceProp prop{};
+    if (cudaGetDevice(&device) != cudaSuccess ||
+        cudaGetDeviceProperties(&prop, device) != cudaSuccess) {
+        cudaGetLastError();
+        return {};
+    }
+    char buf[384];
+    std::snprintf(buf, sizeof(buf),
+                  "# pie-moe-tactics v1 sm%d%d gemm1=%zu gemm2=%zu dev=%s",
+                  prop.major, prop.minor, s.gemm1_tactics.size(),
+                  s.gemm2_tactics.size(), prop.name);
+    return buf;
+}
+
+void tactic_cache_load(RunnerState& s) {
+    if (!autotune_enabled()) return;
+    const std::string path = tactic_cache_path();
+    const std::string want = tactic_cache_header(s);
+    if (path.empty() || want.empty()) return;
+    FILE* f = std::fopen(path.c_str(), "r");
+    if (f == nullptr) return;
+
+    char line[512];
+    bool header_ok = false;
+    if (std::fgets(line, sizeof(line), f) != nullptr) {
+        std::string got(line);
+        while (!got.empty() && (got.back() == '\n' || got.back() == '\r')) {
+            got.pop_back();
+        }
+        header_ok = (got == want);
+    }
+    if (header_ok) {
+        unsigned long long key = 0;
+        int g1 = 0;
+        int g2 = 0;
+        while (std::fscanf(f, "%llx %d %d", &key, &g1, &g2) == 3) {
+            if (g1 < 0 || g2 < 0 ||
+                g1 >= static_cast<int>(s.gemm1_tactics.size()) ||
+                g2 >= static_cast<int>(s.gemm2_tactics.size())) {
+                continue;
+            }
+            s.tuned[static_cast<std::uint64_t>(key)] = TacticPair{g1, g2};
+        }
+    }
+    std::fclose(f);
+    if (!header_ok) {
+        std::remove(path.c_str());
+    } else if (log_enabled()) {
+        std::fprintf(stderr,
+                     "[pie-driver-cuda] FlashInfer MoE loaded %zu tuned shapes "
+                     "from %s\n",
+                     s.tuned.size(), path.c_str());
+    }
+}
+
+void mkdir_parents(const std::string& path) {
+    for (std::size_t i = 1; i < path.size(); ++i) {
+        if (path[i] != '/') continue;
+        ::mkdir(path.substr(0, i).c_str(), 0755);
+    }
+}
+
+void tactic_cache_store(RunnerState& s, std::uint64_t key, const TacticPair& t) {
+    if (t.gemm1 < 0 || t.gemm2 < 0) return;
+    const std::string path = tactic_cache_path();
+    const std::string header = tactic_cache_header(s);
+    if (path.empty() || header.empty()) return;
+    mkdir_parents(path);
+    // Appending (rather than rewriting) keeps concurrent TP ranks from
+    // truncating each other's entries; a duplicate key just loses to whichever
+    // line is read last.
+    FILE* f = std::fopen(path.c_str(), "a");
+    if (f == nullptr) return;
+    if (std::ftell(f) == 0) std::fprintf(f, "%s\n", header.c_str());
+    std::fprintf(f, "%016llx %d %d\n", static_cast<unsigned long long>(key),
+                 t.gemm1, t.gemm2);
+    std::fclose(f);
+}
+
+// Chooses (and on first sight of a shape, measures) the tactic pair for this
+// problem, then installs it on the runner.
+void install_tactics(RunnerState& s, Runner& runner, const MoeProblem& p,
+                     const MoeBuffers& b, std::size_t workspace_bytes) {
+    if (!autotune_enabled()) return;
+    const std::uint64_t key = tactic_key(p);
+    std::lock_guard<std::mutex> lock(s.tune_mutex);
+    auto it = s.tuned.find(key);
+    if (it == s.tuned.end()) {
+        const TacticPair chosen = autotune(s, runner, p, b, workspace_bytes);
+        it = s.tuned.emplace(key, chosen).first;
+        tactic_cache_store(s, key, chosen);
+    }
+    runner.setTactic(s.gemm1_tactics[it->second.gemm1],
+                     s.gemm2_tactics[it->second.gemm2]);
 }
 
 }  // namespace
@@ -388,40 +872,19 @@ bool flashinfer_cutlass_moe_bf16(
     if (needed == 0 || workspace_bytes < needed) return false;
 
     Runner& runner = get_runner();
-    ck::QuantParams quant_params{};
-    tk::LoraParams lora_params{};
-    ck::MoeMinLatencyParams min_latency_params{};
-    runner.runMoe(
-        input,
-        nullptr,
-        false,
-        token_selected_experts,
-        token_final_scales,
-        fc1_expert_weights,
-        nullptr,
-        ck::ActivationParams(to_cutlass_activation(activation)),
-        fc2_expert_weights,
-        nullptr,
-        quant_params,
-        num_rows,
-        hidden_size,
-        hidden_size,
-        inter_size,
-        num_experts,
-        experts_per_token,
-        reinterpret_cast<char*>(workspace),
-        output,
-        unpermuted_row_to_permuted_row,
-        parallelism_config(tp_size, tp_rank),
-        false,
-        false,
-        lora_params,
-        false,
-        false,
-        false,
-        min_latency_params,
-        false,
-        stream);
+    const MoeProblem problem{num_rows,   hidden_size,       inter_size,
+                             num_experts, experts_per_token, tp_size,
+                             tp_rank,     activation};
+    const MoeBuffers buffers{input,
+                             token_selected_experts,
+                             token_final_scales,
+                             fc1_expert_weights,
+                             fc2_expert_weights,
+                             output,
+                             workspace,
+                             unpermuted_row_to_permuted_row};
+    install_tactics(state(), runner, problem, buffers, needed);
+    run_moe(runner, problem, buffers, stream);
     return true;
 }
 
