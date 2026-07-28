@@ -538,7 +538,14 @@ struct MetalExecutor::Impl {
     LinearStateSlots linear_state_slots_{};
 
     static constexpr bool gdn_prep_ = true;
-    static constexpr bool fuse_residual_ = false;
+    // Folds the block/MLP residual add into the projection that feeds it,
+    // dropping 48 of the DAG's 411 dispatches. The decode DAG is launch-bound
+    // -- ~10us a dispatch against qmv kernels that are themselves only ~10us of
+    // weight streaming -- so removing dispatches is the lever, and this one is
+    // free: the fused epilogue is already implemented (affine_qmv_fast_residual)
+    // and the scratch schedule already models it. Measured 45.7 -> 52.5 tok/s
+    // with byte-identical output.
+    static constexpr bool fuse_residual_ = true;
     static constexpr bool force_barriers_ = false;
     static constexpr int max_ctx_ = 4096;
 
