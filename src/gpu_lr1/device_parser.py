@@ -84,7 +84,10 @@ _B_PENDING_OFFSETS = tl.constexpr(13)
 _B_PENDING_TERMINALS = tl.constexpr(14)
 _B_ACTION_EXTRA_OFFSETS = tl.constexpr(15)
 _B_ACTION_EXTRA = tl.constexpr(16)
-_NBASES = tl.constexpr(17)
+_B_VERDICT_OFFSETS = tl.constexpr(17)
+_B_VERDICTS = tl.constexpr(18)
+_B_VERDICT_STRIDE = tl.constexpr(19)
+_NBASES = tl.constexpr(20)
 
 # Matches `MAX_PATHS` in the reference matcher. Both refuse the derivations
 # past it, and refusing the same ones is what keeps device and reference in
@@ -462,6 +465,9 @@ def _mask_kernel(
     production_arity_ptr,
     pending_offsets_ptr,
     pending_terminals_ptr,
+    verdict_offsets_ptr,
+    verdicts_ptr,
+    verdict_stride_ptr,
     # per sequence
     lexer_state_ptr,
     stack_ptr,
@@ -479,6 +485,7 @@ def _mask_kernel(
     MAX_REDUCTIONS: tl.constexpr,
     WINDOW: tl.constexpr,
     PATHS: tl.constexpr,
+    HAS_VERDICTS: tl.constexpr,
 ):
     """A fixed number of blocks draining a list of (configuration, group).
 
@@ -536,39 +543,61 @@ def _mask_kernel(
         my_group_offsets = group_offsets_ptr + tl.load(at + _B_GROUP_OFFSETS)
         group = tl.load(my_group_offsets + state) + slot
 
-        admitted, reach = _replay_group(
-            my_group_offsets,
-            reading_offsets_ptr + tl.load(at + _B_READING_OFFSETS),
-            reading_index_ptr + tl.load(at + _B_READING_INDEX),
-            reading_next_state_ptr + tl.load(at + _B_READINGS),
-            reading_term_offsets_ptr + tl.load(at + _B_READING_TERM_OFFSETS),
-            reading_terminals_ptr + tl.load(at + _B_READING_TERMINALS),
-            action_offsets_ptr + tl.load(at + _B_ACTION_OFFSETS),
-            action_terminals_ptr + tl.load(at + _B_ACTIONS),
-            action_values_ptr + tl.load(at + _B_ACTIONS),
-            action_extra_offsets_ptr + tl.load(at + _B_ACTION_EXTRA_OFFSETS),
-            action_extra_ptr + tl.load(at + _B_ACTION_EXTRA),
-            goto_offsets_ptr + tl.load(at + _B_GOTO_OFFSETS),
-            goto_nonterminals_ptr + tl.load(at + _B_GOTOS),
-            goto_targets_ptr + tl.load(at + _B_GOTOS),
-            production_lhs_ptr + tl.load(at + _B_PRODUCTIONS),
-            production_arity_ptr + tl.load(at + _B_PRODUCTIONS),
-            pending_offsets_ptr + tl.load(at + _B_PENDING_OFFSETS),
-            pending_terminals_ptr + tl.load(at + _B_PENDING_TERMINALS),
-            stack_ptr,
-            scratch_ptr,
-            overflow_ptr,
-            sequence,
-            row_index * STACK_STRIDE,
-            depth,
-            group,
-            scratch,
-            probe,
-            STACK_STRIDE=STACK_STRIDE,
-            MAX_REDUCTIONS=MAX_REDUCTIONS,
-            WINDOW=WINDOW,
-            PATHS=PATHS,
-        )
+        # Most of this answer does not depend on the stack. A group whose every
+        # reading dies on a missing action dies for any stack, and that is 91%
+        # of all replays on real grammars, so it is settled when the tables are
+        # built and read here instead of run. Two bits a group; 1 means refused
+        # and there is nothing to replay.
+        settled = 0
+        if HAS_VERDICTS == 1:
+            stride = tl.load(verdict_stride_ptr + tl.load(at + _B_VERDICT_STRIDE) + state)
+            if stride > 0:
+                top = tl.load(stack_ptr + row_index * STACK_STRIDE + depth - 1)
+                word = (
+                    verdicts_ptr
+                    + tl.load(at + _B_VERDICTS)
+                    + tl.load(verdict_offsets_ptr + tl.load(at + _B_VERDICT_OFFSETS) + state)
+                    + top * stride
+                    + slot // 16
+                )
+                settled = (tl.load(word) >> (2 * (slot % 16))) & 3
+
+        admitted = 0
+        reach = 0
+        if settled == 0:
+            admitted, reach = _replay_group(
+                my_group_offsets,
+                reading_offsets_ptr + tl.load(at + _B_READING_OFFSETS),
+                reading_index_ptr + tl.load(at + _B_READING_INDEX),
+                reading_next_state_ptr + tl.load(at + _B_READINGS),
+                reading_term_offsets_ptr + tl.load(at + _B_READING_TERM_OFFSETS),
+                reading_terminals_ptr + tl.load(at + _B_READING_TERMINALS),
+                action_offsets_ptr + tl.load(at + _B_ACTION_OFFSETS),
+                action_terminals_ptr + tl.load(at + _B_ACTIONS),
+                action_values_ptr + tl.load(at + _B_ACTIONS),
+                action_extra_offsets_ptr + tl.load(at + _B_ACTION_EXTRA_OFFSETS),
+                action_extra_ptr + tl.load(at + _B_ACTION_EXTRA),
+                goto_offsets_ptr + tl.load(at + _B_GOTO_OFFSETS),
+                goto_nonterminals_ptr + tl.load(at + _B_GOTOS),
+                goto_targets_ptr + tl.load(at + _B_GOTOS),
+                production_lhs_ptr + tl.load(at + _B_PRODUCTIONS),
+                production_arity_ptr + tl.load(at + _B_PRODUCTIONS),
+                pending_offsets_ptr + tl.load(at + _B_PENDING_OFFSETS),
+                pending_terminals_ptr + tl.load(at + _B_PENDING_TERMINALS),
+                stack_ptr,
+                scratch_ptr,
+                overflow_ptr,
+                sequence,
+                row_index * STACK_STRIDE,
+                depth,
+                group,
+                scratch,
+                probe,
+                STACK_STRIDE=STACK_STRIDE,
+                MAX_REDUCTIONS=MAX_REDUCTIONS,
+                WINDOW=WINDOW,
+                PATHS=PATHS,
+            )
         # Written whether or not the group is admitted, so the buffer never has
         # to be cleared - at batch 512 that clear was 13 MB a step.
         tl.store(admitted_ptr + item, admitted.to(tl.int8))
@@ -2088,6 +2117,9 @@ _ARENA = {
     "pending_terminals": _B_PENDING_TERMINALS,
     "action_extra_offsets": _B_ACTION_EXTRA_OFFSETS,
     "action_extra": _B_ACTION_EXTRA,
+    "verdict_offsets": _B_VERDICT_OFFSETS,
+    "verdicts": _B_VERDICTS,
+    "verdict_stride": _B_VERDICT_STRIDE,
 }
 
 @dataclass
@@ -2112,6 +2144,7 @@ class ResidentTables:
     window_bound: int
     paths: int
     longest_set: int
+    has_verdicts: int
 
     @property
     def words(self) -> int:
@@ -2186,6 +2219,11 @@ class DeviceGrammar:
         # every grammar that compiled before the tables kept conflicts, and the
         # path loop is then a single iteration around unchanged code.
         self.paths = 1
+        # Whether every grammar in the pool carries the precomputed verdicts. A
+        # pool is a mixture, and a kernel is compiled once for it, so one
+        # grammar too large for the table turns the shortcut off for all - the
+        # alternative is a branch per item on a value the compiler cannot see.
+        self.has_verdicts = 1
         self.search_steps = 2
         self.max_groups_per_state = 1
         self.max_readings = 1
@@ -2401,6 +2439,7 @@ class DeviceGrammar:
             window_bound=_window_bound(arrays, nullable),
             paths=min(_MAX_PATHS, max(1, int(arrays.get("max_actions", 1)))),
             longest_set=int(lengths.max()) if lengths.size else 1,
+            has_verdicts=1 if len(arrays["verdicts"]) else 0,
         )
 
     def admit(self, compiled) -> int:
@@ -2473,6 +2512,9 @@ class DeviceGrammar:
         # meets several, so the product is what enumerating them all would
         # cost. Bounded at the reference matcher's own bound: past it both
         # refuse the same derivations, which is what keeps them in step.
+        if tables.has_verdicts == 0 and self.has_verdicts == 1:
+            self.has_verdicts = 1
+            self.revision += 1
         wanted_paths = tables.paths
         if wanted_paths > self.paths:
             self.paths = wanted_paths
@@ -3444,6 +3486,9 @@ class DeviceBatch:
             grammar.production_arity,
             grammar.pending_offsets,
             grammar.pending_terminals,
+            grammar.verdict_offsets,
+            grammar.verdicts,
+            grammar.verdict_stride,
             self.lexer_state,
             self.stack,
             self.depth,
@@ -3460,6 +3505,7 @@ class DeviceBatch:
             MAX_REDUCTIONS=grammar.max_reductions,
             WINDOW=grammar.window,
             PATHS=grammar.paths,
+            HAS_VERDICTS=grammar.has_verdicts,
             num_warps=1,
         )
         _scatter_kernel[(self.sweep_blocks,)](

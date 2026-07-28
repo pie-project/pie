@@ -1094,6 +1094,44 @@ the table is sized by the ceiling - rows times the widest state's group count -
 so writing it moves megabytes to save loads that were already in cache. The
 searches stay.
 
+**Most of the replay does not depend on the stack (2026-07-28).** XGrammar's
+central idea is that a token's fate is usually decided by the automaton state
+alone, so the context-dependent set is under 1% and everything else is cached.
+The LR analogue is exact: a group's readings run against the parser state on
+top of the stack, and a reading that only ever *shifts* never looks below the
+top. Only a reduce pops, and only a pop exposes the stack.
+
+Measured over 6.9 million group replays on eight real grammars:
+
+| | share |
+|---|---:|
+| refused without the stack | **91.0%** |
+| admitted without the stack | 1.5% |
+| needs the stack, because a reading reduces | **7.5%** |
+
+Median schema 88.1%, worst 82.3%. So the refusals are precomputed when the
+tables are built - two bits per (lexer state, parser state, group) - and the
+runtime replays only what is left. Refusals only: a reading that survives by
+shifting still has to run the pending-lexeme probe, which reduces, so
+admissions stay undecided. That is also the safe direction, since a wrongly
+precomputed admission would widen a mask and a wrongly precomputed refusal is
+caught by the corpus.
+
+| | was | now |
+|---|---:|---:|
+| `_mask_kernel` at batch 32 | 36.6 us | **22.5** |
+| whole step, batch 32 | 103.0 | **88.0** |
+| whole step, batch 512 | 149.5 | **135.0** |
+| against XGrammar at batch 32 | 0.82x | **0.92x** |
+| at batch 128 | 2.71x | **2.95x** |
+| at batch 512 | 9.19x | **9.96x** |
+
+The table costs 1.27 MB for the median schema, which is 40-70% of what the rest
+of the tables cost, and it is abandoned above four million words so a
+pathological grammar falls back to replaying everything. That trade - memory
+for per-step work - is the same one this whole design makes, applied one level
+down.
+
 **Host contention (q21).** Weaker than expected and worth saying so. With
 twenty-four cores deliberately saturated, XGrammar's fill slows by 1.06x and
 ours by 1.01x; both engines' p99 degrades to about 3 ms, which is the operating

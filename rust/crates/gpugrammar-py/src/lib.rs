@@ -273,6 +273,9 @@ impl CompiledGrammar {
             "production_arity",
             words(python, &artifact.production_arity),
         )?;
+        out.set_item("verdict_offsets", words(python, &artifact.verdict_offsets))?;
+        out.set_item("verdicts", words(python, &artifact.verdicts))?;
+        out.set_item("verdict_stride", words(python, &artifact.verdict_stride))?;
         out.set_item("pending_offsets", words(python, &artifact.pending_offsets))?;
         out.set_item(
             "pending_terminals",
