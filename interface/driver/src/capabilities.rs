@@ -156,6 +156,16 @@ pub struct DriverCapabilities {
     pub snapshot_dir: String,
     #[serde(default)]
     pub kv_handle: Option<crate::transfer::KvHandle>,
+    /// Which backend's source this driver wants in
+    /// [`ProgramRegistration::emitted_kernels`](crate::plan::ProgramRegistration),
+    /// or empty when it generates its own (or needs none).
+    ///
+    /// Emitted kernels are tens of kilobytes each and a program can have dozens,
+    /// so the host only runs code generation for a driver that says it will read
+    /// the result. This is what lets the two backends move off their in-driver
+    /// emitters one at a time.
+    #[serde(default)]
+    pub codegen_backend: String,
 }
 
 #[cfg(test)]

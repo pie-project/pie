@@ -66,6 +66,17 @@ pub(crate) fn notify_process_suspend(pid: ProcessId) {
     post_pipeline_leave(pid, Some(pid), LeaveKind::Suspend);
 }
 
+/// `pid` is runnable again after a suspend (restore committed, or the
+/// eviction rolled back). Undoes the wait-set consequences of
+/// [`notify_process_suspend`]. Process-keyed, fire-and-forget: a missed
+/// resume is fail-safe (the fleet just stops waiting for the process).
+pub(crate) fn notify_process_resume(pid: ProcessId) {
+    let handles = super::handle_registry().read().unwrap();
+    for handle in handles.iter().flatten() {
+        let _ = handle.send(SchedulerItem::ProcessResume(pid));
+    }
+}
+
 /// Terminate `pid`'s lanes, fire-and-forget (queued fires are rejected).
 /// Process-keyed. The waited sibling is [`notify_process_terminate`].
 pub(crate) fn post_process_terminate(pid: ProcessId) {
@@ -560,6 +571,10 @@ enum SchedulerItem {
     /// waits for this exact process's first fire (identity-paired with the
     /// release above — the two race through the mailbox in either order).
     ExecutionSlotConsumed(ProcessId),
+    /// The planner concluded a suspended process is runnable again (restore
+    /// committed, or the eviction rolled back): its lanes may rejoin the
+    /// wait-set and batch full frames again. Process-keyed.
+    ProcessResume(ProcessId),
     /// A frame submit failed mid-way host-side: only `submitted` of the
     /// declared fires exist. The frame policy adjusts the lane frame's
     /// expected count so it can still seal (frame mode only; a no-op
@@ -1743,7 +1758,7 @@ struct SchedulerControl {
     active_senders: AtomicUsize,
     shutdown_wait: Condvar,
     shutdown_gate: Mutex<()>,
-    program_ids: Mutex<HashMap<u64, (u64, Vec<u8>, Vec<u8>)>>,
+    program_ids: Mutex<HashMap<u64, (u64, pie_driver_abi::plan::LaunchPackage)>>,
     accepting: AtomicBool,
     stats: Arc<SchedulerStats>,
 }
@@ -1912,15 +1927,14 @@ impl SchedulerHandle {
         let program_hash = plan.program_hash;
         {
             let program_ids = self.inner.program_ids.lock().unwrap();
-            if let Some((program_id, canonical, sidecar)) = program_ids.get(&program_hash) {
-                if canonical != &plan.canonical_bytes || sidecar != &plan.sidecar_bytes {
+            if let Some((program_id, launch)) = program_ids.get(&program_hash) {
+                if launch != &plan.launch {
                     return Err(anyhow!("program hash collision for 0x{program_hash:016x}"));
                 }
                 return Ok(*program_id);
             }
         }
-        let canonical = plan.canonical_bytes.clone();
-        let sidecar = plan.sidecar_bytes.clone();
+        let launch = plan.launch.clone();
         let program_id = self
             .request(|response| SchedulerItem::RegisterProgram { plan, response })
             .await??;
@@ -1928,7 +1942,7 @@ impl SchedulerHandle {
             .program_ids
             .lock()
             .unwrap()
-            .insert(program_hash, (program_id, canonical, sidecar));
+            .insert(program_hash, (program_id, launch));
         Ok(program_id)
     }
 
@@ -1972,8 +1986,8 @@ impl SchedulerHandle {
         let cached = {
             let program_ids = self.inner.program_ids.lock().unwrap();
             match program_ids.get(&program_hash) {
-                Some((program_id, canonical, sidecar)) => {
-                    if canonical != &program.canonical_bytes || sidecar != &program.sidecar_bytes {
+                Some((program_id, launch)) => {
+                    if launch != &program.launch {
                         return Err(anyhow!("program hash collision for 0x{program_hash:016x}"));
                     }
                     Some(*program_id)
@@ -1986,10 +2000,7 @@ impl SchedulerHandle {
                 bind.program_id = program_id;
                 (None, None)
             }
-            None => (
-                Some(program.clone()),
-                Some((program.canonical_bytes, program.sidecar_bytes)),
-            ),
+            None => (Some(program.clone()), Some(program.launch)),
         };
         let (registered, program_id, bound) = self
             .request(|response| SchedulerItem::RegisterChannelsBind {
@@ -2000,12 +2011,12 @@ impl SchedulerHandle {
                 response,
             })
             .await??;
-        if let Some((canonical, sidecar)) = cache_fill {
+        if let Some(launch) = cache_fill {
             self.inner
                 .program_ids
                 .lock()
                 .unwrap()
-                .insert(program_hash, (program_id, canonical, sidecar));
+                .insert(program_hash, (program_id, launch));
         }
         Ok((registered, bound))
     }
@@ -2758,6 +2769,9 @@ impl BatchScheduler {
                 }
             }
 
+            SchedulerItem::ProcessResume(pid) => {
+                frame_policy.on_process_resume(pid);
+            }
             SchedulerItem::FrameTruncate {
                 lane,
                 seq,
@@ -3282,9 +3296,7 @@ impl BatchScheduler {
         // them positional starved the very traffic that unsticks a held
         // frame (CONTENTION_FOLLOWUP.md §12).
         if in_flight_control.is_none()
-            && let Some(index) = pending
-                .iter()
-                .position(|item| Self::standalone_copy(item))
+            && let Some(index) = pending.iter().position(|item| Self::standalone_copy(item))
             && let Some(item) = pending.remove(index)
         {
             Self::post_control(
@@ -4521,10 +4533,10 @@ mod tests {
     };
     use pie_driver_abi::{PieInstanceBinding, PieKvMoveCell, PiePoolRange};
     use pie_driver_dummy_lib::DummyDriverOptions;
-    use pie_ptir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
-    use pie_ptir::op::Op;
-    use pie_ptir::registry::Stage;
-    use pie_ptir::types::{DType, Literal, Shape};
+    use pie_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
+    use pie_ir::op::Op;
+    use pie_ir::registry::Stage;
+    use pie_ir::types::{DType, Literal, Shape};
     use tokio::time::{Duration, timeout};
 
     async fn setup_scheduler(
@@ -4638,9 +4650,9 @@ mod tests {
         }
         .encode();
         ProgramRegistration {
-            program_hash: pie_ptir::container_hash(&bytes),
-            canonical_bytes: bytes,
-            sidecar_bytes: Vec::new(),
+            program_hash: pie_ir::container_hash(&bytes),
+            reference_ptir: bytes,
+            ..Default::default()
         }
     }
 
@@ -6033,7 +6045,7 @@ mod tests {
         // Plan §14 gate 3: instance A's fire fills a shared extern channel;
         // instance B's fire consumes it and publishes to its host reader —
         // cross-instance dataflow over one global channel registration.
-        use pie_ptir::container::{ExternDecl, ExternDir};
+        use pie_ir::container::{ExternDecl, ExternDir};
         let driver_id = driver::register_driver_backend(
             DriverSpec {
                 num_kv_pages: 16,
@@ -6103,18 +6115,18 @@ mod tests {
         let exporter_program = crate::scheduler::register_program(
             driver_id,
             ProgramRegistration {
-                program_hash: pie_ptir::container_hash(&exporter_bytes),
-                canonical_bytes: exporter_bytes,
-                sidecar_bytes: Vec::new(),
+                program_hash: pie_ir::container_hash(&exporter_bytes),
+                reference_ptir: exporter_bytes,
+                ..Default::default()
             },
         )
         .await?;
         let importer_program = crate::scheduler::register_program(
             driver_id,
             ProgramRegistration {
-                program_hash: pie_ptir::container_hash(&importer_bytes),
-                canonical_bytes: importer_bytes,
-                sidecar_bytes: Vec::new(),
+                program_hash: pie_ir::container_hash(&importer_bytes),
+                reference_ptir: importer_bytes,
+                ..Default::default()
             },
         )
         .await?;

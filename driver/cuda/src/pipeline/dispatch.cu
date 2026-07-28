@@ -52,17 +52,118 @@
 
 namespace pie_cuda_driver::pipeline {
 
+namespace {
+
+// A (stage, region) index over the host's emitted kernel table.
+//
+// The host (`compiler/codegen/src/cuda/`) is the only emitter, so both the
+// source *and* the entry symbol it named are carried through unchanged. An
+// entry whose `source` is empty is a *recorded* failure, not an omission --
+// the host is saying it could not emit that region -- so it is left absent
+// here and registration refuses the program.
+class HostEmittedKernels {
+public:
+    explicit HostEmittedKernels(PieEmittedKernelSlice slice) {
+        if (slice.ptr == nullptr) return;
+        for (std::size_t i = 0; i < slice.len; ++i) {
+            const PieEmittedKernel& kernel = slice.ptr[i];
+            if (kernel.kind != PIE_KERNEL_FUSED || kernel.source.len == 0) {
+                continue;
+            }
+            sources_.emplace(
+                Key{kernel.stage_index, kernel.region_index},
+                Region{
+                    to_string(kernel.entry_name),
+                    to_string(kernel.source)});
+        }
+    }
+
+    // The host's region analysis rides the same table, keyed the same way.
+    // It is the other half of one contract: the kernel above was emitted from
+    // these answers, and the packer fills its side tables from them.
+    void adopt(PieRegionAnalysisSlice slice) {
+        if (slice.ptr == nullptr) return;
+        for (std::size_t i = 0; i < slice.len; ++i) {
+            const PieRegionAnalysis& region = slice.ptr[i];
+            generated::StageRegionAnalysis analysis;
+            analysis.flags = region.flags;
+            analysis.direct_argmax.reserve(region.direct_argmax.len);
+            for (std::size_t j = 0; j < region.direct_argmax.len; ++j) {
+                const PieDirectArgmax& record = region.direct_argmax.ptr[j];
+                analysis.direct_argmax.push_back(
+                    generated::StageRegionArgmax{
+                        record.node,
+                        record.source_value,
+                        record.intrinsic,
+                        record.requires_single_row});
+            }
+            analysis.skipped.assign(
+                region.skipped.ptr, region.skipped.ptr + region.skipped.len);
+            regions_.emplace(
+                Key{region.stage_index, region.region_index},
+                std::move(analysis));
+        }
+    }
+
+    static generated::ModuleCache::HostRegion lookup(
+        void* context, std::size_t stage_index, std::size_t region_index) {
+        auto* self = static_cast<HostEmittedKernels*>(context);
+        const auto found = self->sources_.find(Key{
+            static_cast<std::uint32_t>(stage_index),
+            static_cast<std::uint32_t>(region_index)});
+        if (found == self->sources_.end()) return {};
+        return {&found->second.entry, &found->second.source};
+    }
+
+    static const generated::StageRegionAnalysis* lookup_region(
+        void* context, std::size_t stage_index, std::size_t region_index) {
+        auto* self = static_cast<HostEmittedKernels*>(context);
+        const auto found = self->regions_.find(Key{
+            static_cast<std::uint32_t>(stage_index),
+            static_cast<std::uint32_t>(region_index)});
+        if (found == self->regions_.end()) return nullptr;
+        return &found->second;
+    }
+
+private:
+    template <typename Slice>
+    static std::string to_string(const Slice& slice) {
+        if (slice.ptr == nullptr || slice.len == 0) return {};
+        return std::string(
+            reinterpret_cast<const char*>(slice.ptr), slice.len);
+    }
+
+    struct Region {
+        std::string entry;
+        std::string source;
+    };
+    struct Key {
+        std::uint32_t stage;
+        std::uint32_t region;
+        bool operator==(const Key&) const = default;
+    };
+    struct KeyHash {
+        std::size_t operator()(const Key& key) const {
+            return (static_cast<std::size_t>(key.stage) << 32) ^ key.region;
+        }
+    };
+    std::unordered_map<Key, Region, KeyHash> sources_;
+    std::unordered_map<Key, generated::StageRegionAnalysis, KeyHash> regions_;
+};
+
+}  // namespace
+
 // Shared pure-host PTIR decode model (trace/op-table/container/bound/
-// fire-geometry) now lives in pie_native::ptir (driver/common); bring it into
+// fire-geometry) now lives in pie_native::launch (driver/common); bring it into
 // scope so the CUDA-side tier-0/1 code below can use it unqualified.
-using namespace pie_native::ptir;
+using namespace pie_native::launch;
 
 // `store/kv_cache.hpp` (pulled in for the `envelope_dot` KV geometry) declares
 // its own `pie_cuda_driver::DType`, which sits closer in the lookup chain than
 // the using-directive above and would silently retarget every unqualified
 // `DType` in this file. Pin the PTIR one explicitly; the cache's own dtype is
 // spelled `pie_cuda_driver::DType` where it is needed.
-using DType = pie_native::ptir::DType;
+using DType = pie_native::launch::DType;
 
 struct CallbackFence {
     std::atomic<std::uint32_t> pending{0};
@@ -1233,6 +1334,22 @@ struct Dispatch::Impl {
     // different stream), consumed at the instance's first completed wave.
     cudaEvent_t publications_done = nullptr;
     bool publications_recorded = false;
+    // Settlement notification runs on its OWN stream. `cudaLaunchHostFunc`
+    // blocks the stream it is enqueued on until the driver's callback thread
+    // wakes and returns, so hosting it on the compute stream stalled the GPU
+    // between one wave's `k_settle_host_channels_batch` and the next wave's
+    // `k_pull_validate_host_channels_batch` — measured 111 us fixed (callback
+    // thread wakeup) + 0.44 us per lane, i.e. 224 us at 256 lanes. The next
+    // wave was already submitted, so no amount of frame lookahead (k) could
+    // hide it: a blocking node cannot be jumped by pre-queueing.
+    //
+    // `settlement_ready` orders the callback after the wave's settlement;
+    // `settlement_callbacks_done` re-establishes the ordering the compute
+    // stream used to get for free (see the wait before this wave's host
+    // publications in `Dispatch::finish`).
+    cudaEvent_t settlement_ready = nullptr;
+    cudaEvent_t settlement_callbacks_done = nullptr;
+    bool settlement_callbacks_recorded = false;
     std::vector<BoundInstance::CommitSnapshot> available_commit_snapshots;
     // Backing storage for `available_commit_snapshots`. Snapshots are two
     // words each, but they were allocated ONE PER INSTANCE, and each
@@ -1304,6 +1421,7 @@ struct Dispatch::Impl {
     std::uint32_t* h_envelope_kills = nullptr;
     std::uint32_t envelope_kills_reported = 0;
     cudaStream_t output_copy_stream = nullptr;
+    cudaStream_t notify_stream = nullptr;
     cudaStream_t group_streams[2] = {nullptr, nullptr};
     cudaStream_t signature_streams[kSignatureStreamCount] = {};
     bool attention_hook_coverage = false;
@@ -1997,10 +2115,12 @@ class NotifyContextLease {
         NotifyContext* context,
         cudaStream_t stream,
         cudaStream_t auxiliary_stream,
+        cudaStream_t notify_stream,
         std::unique_lock<std::mutex> lock)
         : context_(context),
           stream_(stream),
           auxiliary_stream_(auxiliary_stream),
+          notify_stream_(notify_stream),
           lock_(std::move(lock)) {}
     ~NotifyContextLease() {
         if (context_ != nullptr) {
@@ -2008,17 +2128,26 @@ class NotifyContextLease {
                 auxiliary_stream_ == stream_
                 ? cudaSuccess
                 : cudaStreamSynchronize(auxiliary_stream_);
+            // The settlement callback rides its own stream now, so an
+            // exception thrown after it was enqueued must drain that stream
+            // too before the fences it releases are touched here.
+            const cudaError_t notify_status =
+                (notify_stream_ == nullptr || notify_stream_ == stream_)
+                ? cudaSuccess
+                : cudaStreamSynchronize(notify_stream_);
             const cudaError_t status =
                 cudaStreamSynchronize(stream_);
             if (auxiliary_status == cudaSuccess &&
+                notify_status == cudaSuccess &&
                 status == cudaSuccess) {
                 release_callback_fences(*context_);
                 context_->in_use.store(false, std::memory_order_release);
             } else {
                 std::fprintf(
                     stderr,
-                    "[pie-driver-cuda] settlement cleanup stream sync failed: %s / %s\n",
+                    "[pie-driver-cuda] settlement cleanup stream sync failed: %s / %s / %s\n",
                     cudaGetErrorString(auxiliary_status),
+                    cudaGetErrorString(notify_status),
                     cudaGetErrorString(status));
             }
         }
@@ -2034,6 +2163,7 @@ class NotifyContextLease {
     NotifyContext* context_;
     cudaStream_t stream_;
     cudaStream_t auxiliary_stream_;
+    cudaStream_t notify_stream_;
     std::unique_lock<std::mutex> lock_;
 };
 
@@ -2359,6 +2489,8 @@ __global__ void cast_query_bf16_to_f32(
 Dispatch::Dispatch() : impl_(std::make_unique<Impl>()) {
     CUDA_CHECK(cudaStreamCreateWithFlags(
         &impl_->output_copy_stream, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaStreamCreateWithFlags(
+        &impl_->notify_stream, cudaStreamNonBlocking));
     for (std::size_t index = 0; index < 2; ++index) {
         CUDA_CHECK(cudaStreamCreateWithFlags(
             &impl_->group_streams[index], cudaStreamNonBlocking));
@@ -2396,9 +2528,12 @@ DispatchStats Dispatch::stats() const {
     result.generated_disk_writes = generated.disk_writes;
     result.generated_disk_errors = generated.disk_errors;
     result.generated_negative_hits = generated.negative_hits;
+    result.generated_host_sources = generated.host_sources;
+    result.generated_driver_sources = generated.driver_sources;
     result.generated_stage_cache_entries = generated.stage_entries;
     result.generated_program_cache_entries = generated.program_entries;
     result.generated_negative_cache_entries = generated.negative_entries;
+    result.region_host_supplied = impl_->cache.region_stats().host_supplied;
     result.channel_slot_capacity = impl_->channels.capacity_slots();
     return result;
 }
@@ -2474,6 +2609,9 @@ Dispatch::~Dispatch() {
         CUDA_CHECK(cudaStreamSynchronize(
             impl_->output_copy_stream));
     }
+    if (impl_->notify_stream != nullptr) {
+        CUDA_CHECK(cudaStreamSynchronize(impl_->notify_stream));
+    }
     impl_->generated_runtime.clear();
     CUDA_CHECK(cudaStreamSynchronize(
         sampling_ir::FrameCarrierEngine::instance().copy_stream()));
@@ -2517,9 +2655,21 @@ Dispatch::~Dispatch() {
         CUDA_CHECK(cudaStreamDestroy(impl_->output_copy_stream));
         impl_->output_copy_stream = nullptr;
     }
+    if (impl_->notify_stream != nullptr) {
+        CUDA_CHECK(cudaStreamDestroy(impl_->notify_stream));
+        impl_->notify_stream = nullptr;
+    }
     if (impl_->publications_done != nullptr) {
         CUDA_CHECK(cudaEventDestroy(impl_->publications_done));
         impl_->publications_done = nullptr;
+    }
+    if (impl_->settlement_ready != nullptr) {
+        CUDA_CHECK(cudaEventDestroy(impl_->settlement_ready));
+        impl_->settlement_ready = nullptr;
+    }
+    if (impl_->settlement_callbacks_done != nullptr) {
+        CUDA_CHECK(cudaEventDestroy(impl_->settlement_callbacks_done));
+        impl_->settlement_callbacks_done = nullptr;
     }
 }
 
@@ -2853,15 +3003,13 @@ void Dispatch::reserve_channel_slots(std::uint32_t min_slots) {
 }
 
 int Dispatch::register_program(std::uint64_t program_hash,
-                                   pie_native::ByteSlice canonical,
-                                   pie_native::ByteSlice sidecar,
+                                   const PieLaunchPackage& package,
+                                   PieEmittedKernelSlice emitted,
+                                   PieRegionAnalysisSlice region_analysis,
                                    std::string* err) {
     if (err) err->clear();
     std::string derr;
-    const Trace* trace = impl_->cache.get_or_decode(
-        program_hash,
-        reinterpret_cast<const std::uint8_t*>(canonical.ptr), canonical.size(),
-        reinterpret_cast<const std::uint8_t*>(sidecar.ptr), sidecar.size(), &derr);
+    const Trace* trace = impl_->cache.adopt(program_hash, package, &derr);
     if (trace == nullptr) {
         if (err) *err = derr;
         return PIE_STATUS_DRIVER_ERROR;
@@ -2881,8 +3029,29 @@ int Dispatch::register_program(std::uint64_t program_hash,
         if (err) *err = "ptir program has no compiler region plans";
         return PIE_STATUS_INVALID_ARGUMENT;
     }
+    std::string region_error;
+    if (!impl_->cache.adopt_host_region_analysis(
+            program_hash,
+            region_analysis.ptr,
+            region_analysis.len,
+            &region_error)) {
+        if (err) *err = region_error;
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
     bool needs_kv_envelopes = false;
     for (const plan::StagePlan& stage : *plans) {
+        // The host already decided whether the grouped interpreter can run
+        // this stage, and said so in the envelope. Re-deriving it here is how
+        // the two verdicts drift.
+        if (!stage.grouped.valid) {
+            if (err) {
+                *err = stage.grouped.error.empty()
+                    ? std::string("ptir stage is not executable by the CUDA "
+                                  "grouped runtime")
+                    : stage.grouped.error;
+            }
+            return PIE_STATUS_UNSUPPORTED;
+        }
         if ((stage.stage == PTIR_STAGE_ON_ATTN_PROJ ||
              stage.stage == PTIR_STAGE_ON_ATTN) &&
             !impl_->attention_hook_coverage) {
@@ -2937,8 +3106,6 @@ int Dispatch::register_program(std::uint64_t program_hash,
                 // Second-party kernels are named, not generic: the fused
                 // runtime dispatches them by name, so a name it cannot launch
                 // has to be refused at bind rather than silently skipped.
-                // `grouped_supported_tag` deliberately still excludes the tag —
-                // the grouped interpreter has no arm for it.
                 const std::string& name =
                     op.name_idx < stage.names.size()
                         ? stage.names[op.name_idx]
@@ -2970,13 +3137,6 @@ int Dispatch::register_program(std::uint64_t program_hash,
                     return PIE_STATUS_UNSUPPORTED;
                 }
                 continue;
-            }
-            if (!grouped_supported_tag(op.tag)) {
-                if (err) {
-                    *err =
-                        "ptir region plan contains an unsupported generic CUDA op";
-                }
-                return PIE_STATUS_UNSUPPORTED;
             }
             if (op.tag != PTIR_OP_INTRINSIC_VAL) continue;
             const bool valid =
@@ -3016,11 +3176,19 @@ int Dispatch::register_program(std::uint64_t program_hash,
     generated::CompileFailureKind compile_failure =
         generated::CompileFailureKind::None;
     std::string compile_error;
+    // Index the host's kernels by (stage, region) so the compiler can look one
+    // up without rescanning; an empty table leaves every lookup null and the
+    // in-driver emitter runs exactly as before.
+    HostEmittedKernels host_kernels(emitted);
+    host_kernels.adopt(region_analysis);
     const auto compiled_program = impl_->fused_modules.compile_program(
             program_hash,
             *plans,
             compile_failure,
-            compile_error);
+            compile_error,
+            HostEmittedKernels::lookup,
+            &host_kernels,
+            HostEmittedKernels::lookup_region);
     if (compiled_program == nullptr) {
         if (err) *err = std::move(compile_error);
         return compile_failure == generated::CompileFailureKind::Deterministic
@@ -3112,8 +3280,7 @@ int Dispatch::bind_instance(std::uint64_t instance_id,
     std::uint64_t bind_instance_us = 0;
     std::uint64_t bind_topology_us = 0;
     std::string derr;
-    const Trace* trace = impl_->cache.get_or_decode(
-        program_hash, nullptr, 0, nullptr, 0, &derr);
+    const Trace* trace = impl_->cache.find(program_hash, &derr);
     if (bind_timing) {
         const auto now = fire_timing::Clock::now();
         bind_decode_us = fire_timing::duration_us(bind_mark, now);
@@ -4071,7 +4238,6 @@ void execute_declared_phase(
                 if (next.complete ||
                     next.plan->signature_hash !=
                         first.plan->signature_hash ||
-                    next.plan->signature != first.plan->signature ||
                     *next.topology != *first.topology) {
                     continue;
                 }
@@ -4864,6 +5030,7 @@ bool Dispatch::finish(
         notify,
         callback_stream,
         impl_->output_copy_stream,
+        impl_->notify_stream,
         std::move(settlement_lock));
     if (runtime != nullptr) notify->runtime = *runtime;
     notify->completion = completion;
@@ -5003,6 +5170,19 @@ bool Dispatch::finish(
             0));
         settlement_stream = impl_->output_copy_stream;
     }
+    // Commit snapshots are pooled per (instance, wave-occurrence) and reused
+    // every wave, so this wave's D2H publications write the very buffers the
+    // PREVIOUS wave's settlement callback reads. That callback used to sit on
+    // the compute stream, which enforced the ordering implicitly; it now runs
+    // on `notify_stream`, so state the dependency explicitly. Placed here
+    // rather than at the wave's head it costs nothing: a full forward pass
+    // separates the two, and the callback has long since retired.
+    if (impl_->settlement_callbacks_recorded) {
+        CUDA_CHECK(cudaStreamWaitEvent(
+            settlement_stream,
+            impl_->settlement_callbacks_done,
+            0));
+    }
     enqueue_host_publish_copies(
         *notify, settlement_stream, publish_transport);
     launch_settle_host_channels_batch(
@@ -5066,22 +5246,35 @@ bool Dispatch::finish(
     ensure_event(&impl_->publications_done);
     CUDA_CHECK(cudaEventRecord(impl_->publications_done, callback_stream));
     impl_->publications_recorded = true;
+    // Hand the settlement callback to a stream of its own: `cudaLaunchHostFunc`
+    // holds its stream until the driver's callback thread runs the function, so
+    // leaving it here would stall the compute stream for the wakeup latency
+    // even though the next wave is already queued behind it.
+    ensure_event(&impl_->settlement_ready);
+    CUDA_CHECK(cudaEventRecord(
+        impl_->settlement_ready, settlement_stream));
+    CUDA_CHECK(cudaStreamWaitEvent(
+        impl_->notify_stream, impl_->settlement_ready, 0));
     const cudaError_t callback_status = cudaLaunchHostFunc(
-        settlement_stream, notify_runtime_callback, notify);
+        impl_->notify_stream, notify_runtime_callback, notify);
     if (callback_status != cudaSuccess) {
         CUDA_CHECK(callback_status);
     }
     const cudaError_t event_status = cudaEventRecord(
-        notify->callback_done, settlement_stream);
+        notify->callback_done, impl_->notify_stream);
     if (event_status == cudaSuccess) {
         notify->callback_pending = true;
+        ensure_event(&impl_->settlement_callbacks_done);
+        CUDA_CHECK(cudaEventRecord(
+            impl_->settlement_callbacks_done, impl_->notify_stream));
+        impl_->settlement_callbacks_recorded = true;
     } else {
         std::fprintf(
             stderr,
             "[pie-driver-cuda] settlement callback event record failed: %s\n",
             cudaGetErrorString(event_status));
         const cudaError_t sync_status =
-            cudaStreamSynchronize(settlement_stream);
+            cudaStreamSynchronize(impl_->notify_stream);
         if (sync_status != cudaSuccess) {
             std::fprintf(
                 stderr,

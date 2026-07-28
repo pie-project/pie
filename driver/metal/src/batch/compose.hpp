@@ -10,7 +10,7 @@
 
 #include "batch/forward.hpp"
 #include "pie_native/launch_view.hpp"
-#include "pie_native/ptir/fire_geometry.hpp"
+#include "pie_native/fire/fire_geometry.hpp"
 
 namespace pie::metal::batch {
 
@@ -78,7 +78,7 @@ bool build_member_forward_desc(
     std::size_t member_count,
     bool has_linear_attn,
     std::uint32_t page_size,
-    const pie_native::ptir::FireGeometry* resolved,
+    const pie_native::launch::FireGeometry* resolved,
     MemberForwardDesc& desc,
     std::string& error);
 

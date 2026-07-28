@@ -30,7 +30,6 @@
 
 #include "pie_native/launch_view.hpp"
 #include "loader/load_plan.hpp"
-#include "pie_native/ptir_channels.hpp"
 #include "pipeline/interp.hpp"
 #include "pipeline/descriptor_resolve.hpp"
 #include "pipeline/registry.hpp"
@@ -183,14 +182,10 @@ struct ModelFacts {
     std::uint32_t max_model_len = 8192;
     std::string arch_name = "llama";
     bool has_linear_attn = false;
-    // What the loader's storage compile keys off. Parsed here because this is
-    // already the driver's one read of `config.json`; the loader no longer
-    // opens it (`loader/architecture.md` §10.4).
+    // Which storage schema this driver authors against. Parsed here because
+    // this is already the driver's one read of `config.json`; the loader no
+    // longer opens it (`loader/architecture.md` §10.4).
     std::string model_type;
-    std::string quant_method;
-    std::uint32_t num_hidden_layers = 0;
-    std::uint32_t num_experts = 0;
-    std::uint32_t num_experts_per_tok = 0;
 };
 
 // Phase 1a (metal_ptir_plan.md §5.4, §12 "Caps honesty"): the Metal forward
@@ -260,29 +255,8 @@ ModelFacts read_model_facts(const std::string& hf_path) {
                        ? obj[key].get<std::string>()
                        : std::string{};
         };
-        const auto uint_of = [](const nlohmann::json& obj,
-                                std::initializer_list<const char*> keys) {
-            for (const char* key : keys) {
-                if (obj.contains(key) && obj[key].is_number_integer()) {
-                    const auto v = obj[key].get<std::int64_t>();
-                    if (v > 0) return static_cast<std::uint32_t>(v);
-                }
-            }
-            return 0u;
-        };
         facts.model_type = str_of(tc, "model_type");
         if (facts.model_type.empty()) facts.model_type = str_of(j, "model_type");
-        facts.num_hidden_layers = uint_of(tc, {"num_hidden_layers"});
-        facts.num_experts =
-            uint_of(tc, {"num_local_experts", "num_experts", "n_routed_experts"});
-        facts.num_experts_per_tok = uint_of(tc, {"num_experts_per_tok"});
-        const nlohmann::json* quant = nullptr;
-        if (tc.contains("quantization_config") && tc["quantization_config"].is_object()) {
-            quant = &tc["quantization_config"];
-        } else if (j.contains("quantization_config") && j["quantization_config"].is_object()) {
-            quant = &j["quantization_config"];
-        }
-        if (quant != nullptr) facts.quant_method = str_of(*quant, "quant_method");
     } catch (const std::exception& e) {
         std::cerr << "[pie-driver-metal] warning: failed to parse "
                   << cfg.string() << ": " << e.what() << "\n";
@@ -368,6 +342,11 @@ std::string build_caps_json(const Config& cfg,
         {"max_model_len", max_model_len},
         {"activation_dtype", "bf16"},
         {"snapshot_dir", cfg.model.hf_path},
+        // Advertising the emitter identity opts this driver into the host
+        // codegen path (see `compiler/codegen/src/program.rs::Backend::parse`);
+        // the runtime uses it to pick which per-kernel table to build and
+        // to key the MSL cache.
+        {"codegen_backend", "metal"},
     };
     return caps.dump();
 }
@@ -444,11 +423,9 @@ class Context::Impl {
         cfg_.model.hf_path.assign(
             reinterpret_cast<const char*>(load.snapshot_dir.ptr),
             load.snapshot_dir.len);
-        runtime_quant_.assign(
-            reinterpret_cast<const char*>(load.runtime_quant.ptr),
-            load.runtime_quant.len);
-        mxfp4_moe_ = static_cast<pie_driver::Mxfp4MoeRequest>(
-            load.mxfp4_moe);
+        // `load.runtime_quant` and `load.mxfp4_moe` are deliberately not read:
+        // this driver binds what the checkpoint holds. They were plumbed through
+        // three layers to an author that never looked at them.
         facts_ = read_model_facts(cfg_.model.hf_path);
         std::string error;
         if (!ensure_executor(error)) {
@@ -473,7 +450,6 @@ class Context::Impl {
     int register_program(const PieProgramDesc& program, std::uint64_t* program_id) {
         std::uint64_t id = 0;
         pipeline::ExecPlan compile_plan;
-        std::vector<std::uint8_t> compile_canonical;
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
             const int status = registry_.register_program(program, &id);
@@ -495,7 +471,6 @@ class Context::Impl {
                 return PIE_STATUS_UNSUPPORTED;
             }
             compile_plan = record.plan;
-            compile_canonical = record.canonical_bytes;
         }
 
 #if defined(__APPLE__)
@@ -503,6 +478,15 @@ class Context::Impl {
         std::string compile_error;
         pipeline::M1CompileFailureKind compile_failure =
             pipeline::M1CompileFailureKind::Retryable;
+        // Snapshot the host-emitted kernels alongside the plan so the
+        // worker thread sees a stable view; the registry owns the byte
+        // strings for the life of the program record.
+        std::vector<pipeline::HostEmittedKernel> compile_emitted;
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            ProgramRecord& record = *registry_.find_program(id);
+            compile_emitted = record.emitted_kernels;
+        }
         worker_.run([&] {
             if (m1_runtime_ == nullptr) {
                 m1_runtime_ = pipeline::M1Runtime::create(
@@ -514,8 +498,8 @@ class Context::Impl {
                 executable = m1_runtime_->compile_program(
                     program.program_hash,
                     compile_plan,
+                    compile_emitted,
                     compile_error,
-                    compile_canonical,
                     &compile_failure);
             }
         });
@@ -1882,13 +1866,7 @@ class Context::Impl {
         setup_cfg.max_forward_tokens = cfg_.batching.max_forward_tokens;
         setup_cfg.max_forward_requests = cfg_.batching.max_forward_requests;
         setup_cfg.snapshot_dir = cfg_.model.hf_path;
-        setup_cfg.runtime_quant = runtime_quant_;
         setup_cfg.model_type = facts_.model_type;
-        setup_cfg.quant_method = facts_.quant_method;
-        setup_cfg.num_hidden_layers = facts_.num_hidden_layers;
-        setup_cfg.num_experts = facts_.num_experts;
-        setup_cfg.num_experts_per_tok = facts_.num_experts_per_tok;
-        setup_cfg.mxfp4_moe = mxfp4_moe_;
         setup_cfg.storage_page_size = storage_page_size_;
         // Create + `setup()` the executor ON THE WORKER THREAD (Phase 3, §7):
         // MetalExecutor::setup builds the Metal device/heap/PSOs, which must
@@ -1927,7 +1905,7 @@ class Context::Impl {
         std::string& failure) {
         desc.sequence_id = member.instance_id;
 
-        pie_native::ptir::FireGeometry resolved;
+        pie_native::launch::FireGeometry resolved;
         const bool device_geometry =
             interp::requires_descriptor_resolution(program.plan.trace);
         if (device_geometry) {
@@ -1977,7 +1955,7 @@ class Context::Impl {
             }
             const std::uint32_t device_pages =
                 effective_total_pages(cfg_, facts_.has_linear_attn);
-            if (!pie_native::ptir::validate_fire_geometry(
+            if (!pie_native::launch::validate_fire_geometry(
                     resolved, device_pages, cfg_.batching.kv_page_size, &failure)) {
                 return ForwardBuildResult::Failed;
             }
@@ -2088,9 +2066,6 @@ class Context::Impl {
     ModelFacts facts_{};
     std::string caps_json_;
     std::string device_facts_json_;
-    std::string runtime_quant_;
-    pie_driver::Mxfp4MoeRequest mxfp4_moe_ =
-        pie_driver::Mxfp4MoeRequest::Auto;
     bool load_attempted_ = false;
     std::uint32_t storage_page_size_ = 1;
     PieRuntimeCallbacks runtime_{};

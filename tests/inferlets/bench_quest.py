@@ -44,7 +44,12 @@ _HEAD = "The capital of France is Paris. "
 
 SHORT_TOKENS = 8
 LONG_TOKENS = 104
-REPS = 7
+# min-of-REPS converges to the machine's floor from above, so on a shared host
+# the rep count is the knob that buys signal. Overridable because the load here
+# swings between 5 and 40 and a run taken at the top of that range needs more
+# rounds to reach the same floor -- see `assert_monotone_baseline`, which is
+# what tells you a run did not get there.
+REPS = int(os.environ.get("PIE_BENCH_REPS", "7"))
 
 # Contexts to sweep. This used to stop at 6144, because both this benchmark's
 # endpoints prefilled in a single fire and a single fire cannot exceed the
@@ -66,6 +71,74 @@ async def _timed(client, args, name, params):
     out = await run_inferlet(client, name, params, timeout=args.timeout)
     dt = (time.perf_counter() - t0) * 1000.0
     return dt, out
+
+
+def assert_full_budget_is_overhead(labels_ms, baseline_ms, tol=0.02):
+    """A budget that evicts nothing cannot be faster than evicting nothing.
+
+    The `budget=1.0` column exists to isolate what a policy COSTS, with its
+    benefit set to zero. That only holds if the budget really covers the whole
+    request: a policy at a full budget does everything the baseline does plus
+    its own bookkeeping, so its per-token time is >= the baseline's, always.
+
+    If it comes out faster, the budget is not full and the column is measuring
+    cost minus an unintended benefit. That is not a hypothetical -- this is
+    exactly how the Track B table came to report `snapkv@1` at 1.05x: the page
+    count was extrapolated from the target context length rather than probed,
+    the real prompt runs ~25% long, and "100%" was really ~80%.
+
+    `labels_ms` maps a label to its per-token ms; only full-budget labels
+    should be passed in.
+    """
+    faster = {
+        label: ms for label, ms in labels_ms.items()
+        if ms < baseline_ms * (1.0 - tol)
+    }
+    assert not faster, (
+        "a full budget beat the baseline: "
+        + ", ".join(
+            f"{label} {ms:.2f} ms vs baseline {baseline_ms:.2f} ms "
+            f"({baseline_ms / ms:.2f}x)" for label, ms in faster.items()
+        )
+        + ". A policy that evicts nothing cannot be faster than not evicting,"
+        " so the budget is not actually full and this column is not measuring"
+        " overhead. Check how the page count is derived."
+    )
+
+
+def assert_monotone_baseline(contexts, baseline_ms, tol=0.02):
+    """Reject a contaminated run instead of publishing it.
+
+    The baseline recomputes attention over the whole prefix, so its per-token
+    cost is *necessarily* increasing in the context length -- that is arithmetic
+    about the machine, not a property of any policy. If the measured baseline
+    is not increasing, the run's noise floor is above its signal and every ratio
+    derived from it is meaningless.
+
+    This is the cheapest available validity check, and it is worth having
+    because a contaminated run is not obviously wrong: the ratios stay in a
+    plausible range and only the baseline column gives it away. On this shared
+    host (load 5-40) a 7-rep run at 16K can fail it; the fix is more rounds
+    (`PIE_BENCH_REPS`), not a wider tolerance.
+
+    `tol` allows a little slack between adjacent contexts, since min-of-N still
+    has a little jitter left in it.
+    """
+    bad = [
+        (contexts[i - 1], baseline_ms[i - 1], contexts[i], baseline_ms[i])
+        for i in range(1, len(baseline_ms))
+        if baseline_ms[i] < baseline_ms[i - 1] * (1.0 - tol)
+    ]
+    assert not bad, (
+        "baseline per-token cost is not increasing in the context length:\n"
+        + "\n".join(
+            f"  ctx {a} -> {c}: {b:.2f} ms -> {d:.2f} ms" for a, b, c, d in bad
+        )
+        + "\nThe baseline attends over the whole prefix, so this cannot be real."
+        " The run is contaminated by host load; re-run with a higher"
+        " PIE_BENCH_REPS. Do not widen the tolerance -- it is not a tolerance"
+        " problem, the ratios in this run are meaningless."
+    )
 
 
 async def _endpoints(client, args, name, base_params):
@@ -144,12 +217,20 @@ async def test_quest_crossover(client, args):
 
         # One instrumented probe to learn the request's real page count, so the
         # budgets below are fractions of something real rather than of a guess.
+        # The probe stops after SHORT_TOKENS, so the LONG_TOKENS the measured
+        # endpoint decodes have to be added back: without that, `budget=1.0`
+        # quietly evicts the decoded tail and stops being the zero-benefit
+        # column it is there to be.
         probe_out = await run_inferlet(
             client, "quest-attention",
             {**common, "max_tokens": SHORT_TOKENS, "page_budget": 1 << 20},
             timeout=args.timeout)
         probe = _parse(probe_out)
-        pages = -(-probe["kv_len_last"] // probe["page_size"]) if probe else 0
+        pages = (
+            -(-(probe["kv_len_last"] - SHORT_TOKENS + LONG_TOKENS)
+              // probe["page_size"])
+            if probe else 0
+        )
 
         configs = [("baseline", ("naive-baseline", dict(common)))]
         for frac in BUDGET_FRACTIONS:
@@ -169,8 +250,12 @@ async def test_quest_crossover(client, args):
             line += f" {q_ms:>7.3f} {ratio:>4.2f}x"
         print(line)
         rows.append((ctx, pages, base_ms, cells))
+        assert_full_budget_is_overhead({"quest@1.00": ms["q1.00"]}, base_ms)
 
     print()
+    # Before reading anything off the table, check the table is readable at all.
+    assert_monotone_baseline([r[0] for r in rows], [r[2] for r in rows])
+
     # The claim under test: the ratio must IMPROVE with context. Quest's
     # overhead is per layer per step and roughly context-independent, while its
     # saving grows with the pages the budget removes. If the ratio does not

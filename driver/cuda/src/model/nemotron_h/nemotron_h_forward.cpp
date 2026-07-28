@@ -1304,7 +1304,7 @@ NemotronHWorkspace NemotronHWorkspace::allocate(
     if (ops::flashinfer_cutlass_moe_enabled()) {
         ws.flashinfer_moe_workspace_bytes =
             ops::flashinfer_cutlass_moe_workspace_bytes(
-                ops::MoeActivation::Relu2,
+            ops::MoeActivation::Relu2,
                 static_cast<int>(N), static_cast<int>(H),
                 static_cast<int>(I), static_cast<int>(E),
                 static_cast<int>(K), T, 0);

@@ -1,0 +1,1605 @@
+# oracle dump: pie_cuda_driver::pipeline::generated::validate_generated_region
+# source of truth: driver/cuda/src/pipeline/generated/ (transitional; the Rust port is compiler/codegen/src/cuda/)
+# emitter_version: 19
+# @runtime: bytes=45277 fnv1a64=0x41b1d45aaef71184
+# cases: 320
+=== beam_epilogue#0 singleton#0
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#1
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#2
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#3
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#4
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#5
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#6
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#7
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#8
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#9
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#10
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#11
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#12
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#13
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#14
+region: library=1 library_op=1 schedule=3 nodes=1 inputs=1 outputs=2 sinks=0
+ok: false
+error: fused CUDA emitter requires a non-library generated region
+=== end
+=== beam_epilogue#0 singleton#15
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#16
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#17
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#18
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#19
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#20
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#21
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#22
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#23
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#24
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#25
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#26
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#27
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#28
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#29
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#30
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#31
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#32
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#33
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#34
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#35
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#36
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#37
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#38
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#39
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#40
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#41
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#42
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#43
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#44
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#45
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#46
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#47
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#48
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#49
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#50
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#51
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#52
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#53
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#54
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#55
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#56
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=0 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#57
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#58
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#59
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#60
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#61
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#62
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#63
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#64
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#65
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=0 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#66
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#67
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#68
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#69
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#70
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#71
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#72
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#73
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#74
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#75
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#76
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#77
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#78
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#79
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#80
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 singleton#81
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 fused#0
+region: library=0 library_op=0 schedule=1 nodes=14 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== beam_epilogue#0 fused#1
+region: library=1 library_op=1 schedule=3 nodes=1 inputs=1 outputs=2 sinks=0
+ok: false
+error: fused CUDA emitter requires a non-library generated region
+=== end
+=== beam_epilogue#0 fused#2
+region: library=0 library_op=0 schedule=1 nodes=67 inputs=2 outputs=0 sinks=15
+ok: true
+error: 
+=== end
+=== counter_pingpong#0 singleton#0
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== counter_pingpong#0 singleton#1
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== counter_pingpong#0 singleton#2
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== counter_pingpong#0 singleton#3
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+=== end
+=== counter_pingpong#0 singleton#4
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+=== end
+=== counter_pingpong#0 fused#0
+region: library=0 library_op=0 schedule=1 nodes=5 inputs=0 outputs=0 sinks=2
+ok: true
+error: 
+=== end
+=== dfa_ingraph#0 singleton#0
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== dfa_ingraph#0 singleton#1
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== dfa_ingraph#0 singleton#2
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== dfa_ingraph#0 singleton#3
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== dfa_ingraph#0 singleton#4
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== dfa_ingraph#0 singleton#5
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== dfa_ingraph#0 singleton#6
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== dfa_ingraph#0 singleton#7
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== dfa_ingraph#0 singleton#8
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+=== end
+=== dfa_ingraph#0 singleton#9
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== dfa_ingraph#0 singleton#10
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== dfa_ingraph#0 singleton#11
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== dfa_ingraph#0 singleton#12
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== dfa_ingraph#0 singleton#13
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== dfa_ingraph#0 singleton#14
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+=== end
+=== dfa_ingraph#0 fused#0
+region: library=0 library_op=0 schedule=1 nodes=15 inputs=0 outputs=0 sinks=2
+ok: true
+error: 
+=== end
+=== extern_contrastive#0 singleton#0
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== extern_contrastive#0 singleton#1
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+=== end
+=== extern_contrastive#0 fused#0
+region: library=0 library_op=0 schedule=1 nodes=2 inputs=0 outputs=0 sinks=1
+ok: true
+error: 
+=== end
+=== greedy_argmax#0 singleton#0
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== greedy_argmax#0 singleton#1
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== greedy_argmax#0 singleton#2
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== greedy_argmax#0 singleton#3
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== greedy_argmax#0 singleton#4
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+=== end
+=== greedy_argmax#0 singleton#5
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+=== end
+=== greedy_argmax#0 fused#0
+region: library=0 library_op=0 schedule=1 nodes=6 inputs=0 outputs=0 sinks=2
+ok: true
+error: 
+=== end
+=== matrix_mask_apply_packed#0 singleton#0
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== matrix_mask_apply_packed#0 singleton#1
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== matrix_mask_apply_packed#0 singleton#2
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== matrix_mask_apply_packed#0 singleton#3
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== matrix_mask_apply_packed#0 singleton#4
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== matrix_mask_apply_packed#0 singleton#5
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+=== end
+=== matrix_mask_apply_packed#0 fused#0
+region: library=0 library_op=0 schedule=1 nodes=6 inputs=0 outputs=0 sinks=1
+ok: true
+error: 
+=== end
+=== matrix_select_mask#0 singleton#0
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== matrix_select_mask#0 singleton#1
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== matrix_select_mask#0 singleton#2
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== matrix_select_mask#0 singleton#3
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== matrix_select_mask#0 singleton#4
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== matrix_select_mask#0 singleton#5
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+=== end
+=== matrix_select_mask#0 fused#0
+region: library=0 library_op=0 schedule=1 nodes=6 inputs=0 outputs=0 sinks=1
+ok: true
+error: 
+=== end
+=== mtp_verify_tail#0 singleton#0
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== mtp_verify_tail#0 singleton#1
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== mtp_verify_tail#0 singleton#2
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== mtp_verify_tail#0 singleton#3
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== mtp_verify_tail#0 singleton#4
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== mtp_verify_tail#0 singleton#5
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== mtp_verify_tail#0 singleton#6
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== mtp_verify_tail#0 singleton#7
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== mtp_verify_tail#0 singleton#8
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== mtp_verify_tail#0 singleton#9
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== mtp_verify_tail#0 singleton#10
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== mtp_verify_tail#0 singleton#11
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== mtp_verify_tail#0 singleton#12
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== mtp_verify_tail#0 singleton#13
+region: library=1 library_op=3 schedule=3 nodes=1 inputs=1 outputs=1 sinks=0
+ok: false
+error: fused CUDA emitter requires a non-library generated region
+=== end
+=== mtp_verify_tail#0 singleton#14
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== mtp_verify_tail#0 singleton#15
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== mtp_verify_tail#0 singleton#16
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== mtp_verify_tail#0 singleton#17
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== mtp_verify_tail#0 singleton#18
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== mtp_verify_tail#0 singleton#19
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== mtp_verify_tail#0 singleton#20
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== mtp_verify_tail#0 singleton#21
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+=== end
+=== mtp_verify_tail#0 singleton#22
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== mtp_verify_tail#0 singleton#23
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+=== end
+=== mtp_verify_tail#0 singleton#24
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+=== end
+=== mtp_verify_tail#0 fused#0
+region: library=0 library_op=0 schedule=1 nodes=13 inputs=0 outputs=3 sinks=0
+ok: true
+error: 
+=== end
+=== mtp_verify_tail#0 fused#1
+region: library=1 library_op=3 schedule=3 nodes=1 inputs=1 outputs=1 sinks=0
+ok: false
+error: fused CUDA emitter requires a non-library generated region
+=== end
+=== mtp_verify_tail#0 fused#2
+region: library=0 library_op=0 schedule=1 nodes=11 inputs=3 outputs=0 sinks=3
+ok: true
+error: 
+=== end
+=== nucleus_sample#0 singleton#0
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== nucleus_sample#0 singleton#1
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== nucleus_sample#0 singleton#2
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== nucleus_sample#0 singleton#3
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== nucleus_sample#0 singleton#4
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== nucleus_sample#0 singleton#5
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== nucleus_sample#0 singleton#6
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== nucleus_sample#0 singleton#7
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== nucleus_sample#0 singleton#8
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== nucleus_sample#0 singleton#9
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== nucleus_sample#0 singleton#10
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== nucleus_sample#0 singleton#11
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== nucleus_sample#0 singleton#12
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== nucleus_sample#0 singleton#13
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== nucleus_sample#0 singleton#14
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== nucleus_sample#0 singleton#15
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== nucleus_sample#0 singleton#16
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+=== end
+=== nucleus_sample#0 fused#0
+region: library=0 library_op=0 schedule=1 nodes=3 inputs=0 outputs=3 sinks=0
+ok: true
+error: 
+=== end
+=== nucleus_sample#0 fused#1
+region: library=1 library_op=0 schedule=3 nodes=13 inputs=3 outputs=1 sinks=0
+ok: false
+error: fused CUDA emitter requires a non-library generated region
+=== end
+=== nucleus_sample#0 fused#2
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+=== end
+=== pentathlon_iter#0 singleton#0
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== pentathlon_iter#0 singleton#1
+region: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=1 sinks=0
+ok: false
+error: fused CUDA emitter requires a non-library generated region
+=== end
+=== pentathlon_iter#0 singleton#2
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== pentathlon_iter#0 singleton#3
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== pentathlon_iter#0 singleton#4
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== pentathlon_iter#0 singleton#5
+region: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=0 sinks=0
+ok: false
+error: fused CUDA emitter requires a non-library generated region
+=== end
+=== pentathlon_iter#0 fused#0
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== pentathlon_iter#0 fused#1
+region: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=1 sinks=0
+ok: false
+error: fused CUDA emitter requires a non-library generated region
+=== end
+=== pentathlon_iter#0 fused#2
+region: library=0 library_op=0 schedule=1 nodes=3 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== pentathlon_iter#0 fused#3
+region: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=0 sinks=0
+ok: false
+error: fused CUDA emitter requires a non-library generated region
+=== end
+=== pentathlon_iter#1 singleton#0
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== pentathlon_iter#1 singleton#1
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== pentathlon_iter#1 singleton#2
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== pentathlon_iter#1 singleton#3
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== pentathlon_iter#1 singleton#4
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== pentathlon_iter#1 singleton#5
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== pentathlon_iter#1 singleton#6
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== pentathlon_iter#1 singleton#7
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== pentathlon_iter#1 singleton#8
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== pentathlon_iter#1 singleton#9
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== pentathlon_iter#1 singleton#10
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== pentathlon_iter#1 singleton#11
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== pentathlon_iter#1 singleton#12
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== pentathlon_iter#1 singleton#13
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== pentathlon_iter#1 singleton#14
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== pentathlon_iter#1 singleton#15
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== pentathlon_iter#1 singleton#16
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== pentathlon_iter#1 singleton#17
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== pentathlon_iter#1 singleton#18
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== pentathlon_iter#1 singleton#19
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== pentathlon_iter#1 singleton#20
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== pentathlon_iter#1 singleton#21
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== pentathlon_iter#1 singleton#22
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== pentathlon_iter#1 singleton#23
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== pentathlon_iter#1 singleton#24
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== pentathlon_iter#1 singleton#25
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== pentathlon_iter#1 singleton#26
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== pentathlon_iter#1 singleton#27
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== pentathlon_iter#1 singleton#28
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== pentathlon_iter#1 singleton#29
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== pentathlon_iter#1 singleton#30
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== pentathlon_iter#1 singleton#31
+region: library=1 library_op=1 schedule=3 nodes=1 inputs=1 outputs=2 sinks=0
+ok: false
+error: fused CUDA emitter requires a non-library generated region
+=== end
+=== pentathlon_iter#1 singleton#32
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== pentathlon_iter#1 singleton#33
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== pentathlon_iter#1 singleton#34
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+=== end
+=== pentathlon_iter#1 singleton#35
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+=== end
+=== pentathlon_iter#1 singleton#36
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== pentathlon_iter#1 singleton#37
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+=== end
+=== pentathlon_iter#1 fused#0
+region: library=0 library_op=0 schedule=1 nodes=31 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== pentathlon_iter#1 fused#1
+region: library=1 library_op=1 schedule=3 nodes=1 inputs=1 outputs=2 sinks=0
+ok: false
+error: fused CUDA emitter requires a non-library generated region
+=== end
+=== pentathlon_iter#1 fused#2
+region: library=0 library_op=0 schedule=1 nodes=6 inputs=2 outputs=0 sinks=3
+ok: true
+error: 
+=== end
+=== pivot_predicates_multistage#1 singleton#0
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== pivot_predicates_multistage#1 singleton#1
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== pivot_predicates_multistage#1 singleton#2
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== pivot_predicates_multistage#1 singleton#3
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== pivot_predicates_multistage#1 singleton#4
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== pivot_predicates_multistage#1 singleton#5
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== pivot_predicates_multistage#1 singleton#6
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== pivot_predicates_multistage#1 singleton#7
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== pivot_predicates_multistage#1 singleton#8
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== pivot_predicates_multistage#1 singleton#9
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== pivot_predicates_multistage#1 singleton#10
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== pivot_predicates_multistage#1 singleton#11
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== pivot_predicates_multistage#1 singleton#12
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+=== end
+=== pivot_predicates_multistage#1 singleton#13
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+=== end
+=== pivot_predicates_multistage#1 fused#0
+region: library=0 library_op=0 schedule=1 nodes=14 inputs=0 outputs=0 sinks=2
+ok: true
+error: 
+=== end
+=== section3_masked_gumbel#0 singleton#0
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== section3_masked_gumbel#0 singleton#1
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== section3_masked_gumbel#0 singleton#2
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== section3_masked_gumbel#0 singleton#3
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== section3_masked_gumbel#0 singleton#4
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== section3_masked_gumbel#0 singleton#5
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== section3_masked_gumbel#0 singleton#6
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== section3_masked_gumbel#0 singleton#7
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== section3_masked_gumbel#0 singleton#8
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== section3_masked_gumbel#0 singleton#9
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== section3_masked_gumbel#0 singleton#10
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== section3_masked_gumbel#0 singleton#11
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+=== end
+=== section3_masked_gumbel#0 singleton#12
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== section3_masked_gumbel#0 singleton#13
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+=== end
+=== section3_masked_gumbel#0 singleton#14
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== section3_masked_gumbel#0 singleton#15
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== section3_masked_gumbel#0 singleton#16
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== section3_masked_gumbel#0 singleton#17
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+=== end
+=== section3_masked_gumbel#0 singleton#18
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+=== end
+=== section3_masked_gumbel#0 fused#0
+region: library=0 library_op=0 schedule=1 nodes=19 inputs=0 outputs=0 sinks=4
+ok: true
+error: 
+=== end
+=== structured_masks#0 singleton#0
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== structured_masks#0 singleton#1
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== structured_masks#0 singleton#2
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== structured_masks#0 singleton#3
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== structured_masks#0 singleton#4
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+=== end
+=== structured_masks#0 singleton#5
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== structured_masks#0 singleton#6
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+=== end
+=== structured_masks#0 singleton#7
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== structured_masks#0 singleton#8
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+=== end
+=== structured_masks#0 singleton#9
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== structured_masks#0 singleton#10
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== structured_masks#0 singleton#11
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== structured_masks#0 singleton#12
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== structured_masks#0 singleton#13
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== structured_masks#0 singleton#14
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== structured_masks#0 singleton#15
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== structured_masks#0 singleton#16
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== structured_masks#0 singleton#17
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== structured_masks#0 singleton#18
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== structured_masks#0 singleton#19
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== structured_masks#0 singleton#20
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== structured_masks#0 singleton#21
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== structured_masks#0 singleton#22
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== structured_masks#0 singleton#23
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== structured_masks#0 singleton#24
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== structured_masks#0 singleton#25
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== structured_masks#0 singleton#26
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== structured_masks#0 singleton#27
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== structured_masks#0 singleton#28
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+=== end
+=== structured_masks#0 fused#0
+region: library=0 library_op=0 schedule=1 nodes=29 inputs=0 outputs=0 sinks=4
+ok: true
+error: 
+=== end
+=== synthetic_sort_desc#0 singleton#0
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== synthetic_sort_desc#0 singleton#1
+region: library=1 library_op=2 schedule=3 nodes=1 inputs=1 outputs=2 sinks=0
+ok: false
+error: fused CUDA emitter requires a non-library generated region
+=== end
+=== synthetic_sort_desc#0 singleton#2
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+=== end
+=== synthetic_sort_desc#0 singleton#3
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+=== end
+=== synthetic_sort_desc#0 fused#0
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== synthetic_sort_desc#0 fused#1
+region: library=1 library_op=2 schedule=3 nodes=1 inputs=1 outputs=2 sinks=0
+ok: false
+error: fused CUDA emitter requires a non-library generated region
+=== end
+=== synthetic_sort_desc#0 fused#2
+region: library=0 library_op=0 schedule=0 nodes=2 inputs=2 outputs=0 sinks=2
+ok: true
+error: 
+=== end
+=== synthetic_matmul#0 singleton#0
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== synthetic_matmul#0 singleton#1
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== synthetic_matmul#0 singleton#2
+region: library=1 library_op=4 schedule=3 nodes=1 inputs=2 outputs=1 sinks=0
+ok: false
+error: fused CUDA emitter requires a non-library generated region
+=== end
+=== synthetic_matmul#0 singleton#3
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+=== end
+=== synthetic_matmul#0 fused#0
+region: library=0 library_op=0 schedule=0 nodes=2 inputs=0 outputs=2 sinks=0
+ok: true
+error: 
+=== end
+=== synthetic_matmul#0 fused#1
+region: library=1 library_op=4 schedule=3 nodes=1 inputs=2 outputs=1 sinks=0
+ok: false
+error: fused CUDA emitter requires a non-library generated region
+=== end
+=== synthetic_matmul#0 fused#2
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+=== end
+=== synthetic_mtp_drafts#0 singleton#0
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== synthetic_mtp_drafts#0 singleton#1
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== synthetic_mtp_drafts#0 singleton#2
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== synthetic_mtp_drafts#0 singleton#3
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== synthetic_mtp_drafts#0 singleton#4
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== synthetic_mtp_drafts#0 singleton#5
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+=== end
+=== synthetic_mtp_drafts#0 fused#0
+region: library=0 library_op=0 schedule=1 nodes=6 inputs=0 outputs=0 sinks=1
+ok: true
+error: 
+=== end
+=== synthetic_sink_call#0 singleton#0
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== synthetic_sink_call#0 singleton#1
+region: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=0 sinks=0
+ok: false
+error: fused CUDA emitter requires a non-library generated region
+=== end
+=== synthetic_sink_call#0 fused#0
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+=== end
+=== synthetic_sink_call#0 fused#1
+region: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=0 sinks=0
+ok: false
+error: fused CUDA emitter requires a non-library generated region
+=== end

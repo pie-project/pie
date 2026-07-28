@@ -33,7 +33,7 @@
 #include <vector>
 
 #include "loader/load_plan.hpp"
-#include "pie_native/ptir/fire_geometry.hpp"
+#include "pie_native/fire/fire_geometry.hpp"
 
 namespace pie::metal {
 
@@ -100,7 +100,7 @@ struct MemberForwardDesc {
     bool has_attention_mask = false;
     std::uint32_t attention_mask_stride = 0;
     std::vector<std::uint8_t> attention_mask;
-    pie_native::ptir::StructuredMaskDescriptor structured_mask;
+    pie_native::launch::StructuredMaskDescriptor structured_mask;
 
     // Local indices into `token_ids` (NOT global) whose logits must be
     // materialized — the fire's `sampling_indices` slice, member-relative
@@ -190,16 +190,9 @@ struct SetupConfig {
     // itself, because only the driver knows the device
     // (`loader/architecture.md` §3).
     std::string snapshot_dir;
-    std::string runtime_quant;
-    // The model facts the loader's storage compile keys off; the driver states
-    // them so the loader never opens `config.json` (§10.4).
+    // Which storage schema to author against. It selects a contract on this
+    // side of the loader call and never crosses it (§10.4).
     std::string model_type;
-    std::string quant_method;
-    std::uint32_t num_hidden_layers = 0;
-    std::uint32_t num_experts = 0;
-    std::uint32_t num_experts_per_tok = 0;
-    pie_driver::Mxfp4MoeRequest mxfp4_moe =
-        pie_driver::Mxfp4MoeRequest::Auto;
     std::uint32_t storage_page_size = 1;
 };
 

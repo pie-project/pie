@@ -284,8 +284,7 @@ async fn drain_detachable(pid: ProcessId) {
 
 async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
     let (model, driver) = planner.locus();
-    let handles =
-        crate::inferlet::process::residency::kv_suspend_handles(pid, model, driver);
+    let handles = crate::inferlet::process::residency::kv_suspend_handles(pid, model, driver);
     let working_sets: HashSet<WorkingSetId> =
         crate::inferlet::process::residency::kv_working_set_ids(pid, model, driver);
     if working_sets.is_empty() {
@@ -311,7 +310,11 @@ async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
     // Step 5: lease quiescence — the seal against mid-build stragglers.
     for (index, handle) in fence.handles.iter().enumerate() {
         if handle.active_leases() > 0 {
-            step!(pid, "quiesce: waiting on set {index} ({} lease(s))", handle.active_leases());
+            step!(
+                pid,
+                "quiesce: waiting on set {index} ({} lease(s))",
+                handle.active_leases()
+            );
         }
         handle.quiesce().await;
     }
@@ -329,12 +332,12 @@ async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
             return;
         }
         Err(error @ crate::store::kv::KvStoreError::HostSwapFull { .. }) => {
-            // No kill rung: without swap room this victim cannot move, and
-            // the head waits for completions instead.
-            planner.record_host_swap_exhaustion();
+            // No kill rung here: without swap room this victim cannot move,
+            // and the head waits for completions instead. Park the victim so
+            // the deterministic re-pick cannot spin on it (§20.6).
             step!(pid, "evict rollback: host swap full");
             tracing::warn!(pid = %pid, %error, "planner: eviction blocked on host swap");
-            planner.eviction_failed(pid);
+            planner.eviction_failed_host_swap_full(pid);
             return;
         }
         Err(error) => {

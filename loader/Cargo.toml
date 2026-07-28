@@ -23,6 +23,20 @@ path = "src/lib.rs"
 [[bin]]
 name = "pie-loader"
 path = "src/main.rs"
+required-features = ["testkit"]
+
+[features]
+default = ["testkit"]
+
+# The parts of this crate that exist to *check* the loader rather than to be
+# the loader: the differential oracle, the contract fixture builder, and the
+# CPU plan executor the `pie-loader` tool replays with. None is reachable from
+# `ffi/`, so a driver linking this crate has no use for ~1.4k lines of them.
+#
+# On by default so `cargo build`, `cargo test` and the tool all work unasked.
+# `worker/Cargo.toml` turns it off, which is also the check: if `ffi/` ever
+# grows a path into the oracle, the worker stops compiling.
+testkit = []
 
 [dependencies]
 half = "2"

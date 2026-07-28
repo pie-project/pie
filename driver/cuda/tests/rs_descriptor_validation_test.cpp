@@ -129,7 +129,7 @@ int main() {
     view.rs_buffer_slot_indptr =
         pie_native::slice_from_u32(buffer_indptr, 3);
 
-    pie_native::ptir::ResolvedPrograms resolved;
+    pie_native::launch::ResolvedPrograms resolved;
     resolved.per_program.resize(1);
     resolved.is_device_geometry = {1};
     resolved.device_count = 1;
@@ -203,7 +203,7 @@ int main() {
     mixed_view.rs_buffer_slot_indptr =
         pie_native::slice_from_u32(mixed_buffer_ptr, 4);
 
-    pie_native::ptir::ResolvedPrograms mixed_resolved;
+    pie_native::launch::ResolvedPrograms mixed_resolved;
     mixed_resolved.per_program.resize(2);
     mixed_resolved.is_device_geometry = {1, 0};
     mixed_resolved.device_count = 1;
@@ -309,14 +309,14 @@ int main() {
             &error),
         "buffered RS is rejected before mutation on unsupported models");
 
-    const pie_native::ptir::StructuredMaskDescriptor unset_masks[2]{};
-    const pie_native::ptir::StructuredMaskDescriptor explicit_masks[2] = {
-        {pie_native::ptir::StructuredMaskKind::SlidingWindow, 8, 0, 4},
-        {pie_native::ptir::StructuredMaskKind::SlidingWindow, 8, 0, 4},
+    const pie_native::launch::StructuredMaskDescriptor unset_masks[2]{};
+    const pie_native::launch::StructuredMaskDescriptor explicit_masks[2] = {
+        {pie_native::launch::StructuredMaskKind::SlidingWindow, 8, 0, 4},
+        {pie_native::launch::StructuredMaskKind::SlidingWindow, 8, 0, 4},
     };
-    const pie_native::ptir::StructuredMaskDescriptor mixed_masks[2] = {
+    const pie_native::launch::StructuredMaskDescriptor mixed_masks[2] = {
         {},
-        {pie_native::ptir::StructuredMaskKind::SlidingWindow, 8, 0, 4},
+        {pie_native::launch::StructuredMaskKind::SlidingWindow, 8, 0, 4},
     };
     expect(
         pie_cuda_driver::pipeline::structured_mask_coverage(unset_masks) ==

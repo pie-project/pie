@@ -1,4 +1,5 @@
 #include "model/qwen3_5/qwen3_5_moe.hpp"
+#include "kernels/swiglu.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -210,6 +211,15 @@ DeviceTensor concat_axis0_bf16(
 }
 
 }  // namespace
+
+bool qwen35_moe_gate_up_swapped() {
+    static const bool swapped = [] {
+        const char* v = std::getenv("PIE_QWEN35_MOE_FLASHINFER");
+        if (v == nullptr || v[0] == '\0') return true;
+        return v[0] != '0';
+    }();
+    return swapped;
+}
 
 Qwen3_5MoeWeights bind_qwen3_5_moe(const LoadedModel& engine) {
     const auto& cfg = engine.hf_config();

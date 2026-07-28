@@ -1,0 +1,22 @@
+[package]
+name = "pie-codegen"
+version = "0.1.0"
+edition = "2024"
+authors = ["In Gim <in.gim@yale.edu>"]
+description = "Backend source emission for PTIR: the deterministic C ABI header and the CUDA/C++ and MSL projections of the RNG contract, generated from the IR tables so host and device cannot drift."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+keywords = ["pie", "tensor", "ir", "ptir", "codegen"]
+
+[lib]
+name = "pie_codegen"
+crate-type = ["rlib"]
+path = "src/lib.rs"
+
+# Host-side only: this crate exists to write files into `include/` (and, once the
+# region emitters land, backend kernel source). It depends on `pie-plan` because
+# the C ABI header pins the plan/sidecar wire versions the drivers check.
+[dependencies]
+pie-ir = { path = "../ir" }
+pie-plan = { path = "../plan" }
+pie-driver-abi = { path = "../../interface/driver" }

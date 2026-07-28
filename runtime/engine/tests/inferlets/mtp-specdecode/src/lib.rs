@@ -4,7 +4,7 @@
 //! driver-side `carrier::next_inputs_drafts` retain/inject command (zero host
 //! round-trip on the `[k]` drafts). Both that intrinsic's author-facing eDSL
 //! wrapper and the retain/inject WIT command have been REMOVED in the ptir
-//! refactor (there is no `intrinsics::mtp_drafts()` in `ptir-dsl`, and no
+//! refactor (there is no `intrinsics::mtp_drafts()` in `pie-dsl`, and no
 //! `pipeline_source_kind`/retain surface anywhere in the current `forward`/
 //! `pipeline` WIT interfaces) — this is a genuine capability gap, not a stale
 //! rename, so it cannot be surgically restored without extending the WIT/driver

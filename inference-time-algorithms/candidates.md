@@ -27,7 +27,7 @@ upstream. See "Excluded" at the bottom for the full covered list.
 
 So `query()`/`layer()` are already wired on CUDA and completely unexplored
 (→ Tier B, no engine work). `hidden()`/`value_head()` are in the ABI
-(`interface/ptir/src/{op,header,interp}.rs`), implemented in `driver/dummy`, and
+(`compiler/{ir/src/op,codegen/src/header,eval/src/interp}.rs`), implemented in `driver/dummy`, and
 exercised by Metal's interpreter test — but `FireInputs` in
 `driver/cuda/src/pipeline/tier0/tier0_runner.hpp` has no field for them
 (→ Tier C needs that binding first).
@@ -176,7 +176,7 @@ to be missing; C0 and its dependants were out of scope.
 > wrong, and none of B1–B5 can be written today. The distinction that matters:
 >
 > - **The actuator already exists.** `Port::Pages`, `Port::PageIndptr` and
->   `Port::AttnMask` (`interface/ptir/src/registry.rs:102-113`) are all
+>   `Port::AttnMask` (`compiler/ir/src/registry.rs:102-113`) are all
 >   guest-bound, so an inferlet can freely choose *which* pages a step attends
 >   to and mask *which* positions survive. Eviction and page selection are
 >   expressible.
@@ -184,7 +184,7 @@ to be missing; C0 and its dependants were out of scope.
 >   `softmax(QK^T)` — accumulated attention mass (H2O), a recent-window score
 >   (SnapKV), the current step's score (TOVA), a per-page bound on `q·k`
 >   (Quest), or a nearest-neighbour lookup over `K` (RetrievalAttention).
->   `IntrinsicId` (`interface/ptir/src/op.rs:49-68`) is exhaustively
+>   `IntrinsicId` (`compiler/ir/src/op.rs:49-68`) is exhaustively
 >   `Logits, MtpLogits, Hidden, Query, ValueHead, Layer, MtpDrafts`. There is
 >   **no key, no attention score and no attention probability tap**, and
 >   `Port` has no KV-data port either — `Pages`/`PageIndptr`/`KvLen` carry page

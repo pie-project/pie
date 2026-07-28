@@ -83,60 +83,59 @@ public:
         for (std::size_t i = 0; i < plan.schedule.len; ++i) {
             const std::uint32_t instr_id = plan.schedule.ptr[i];
             const auto& instr = plan_index_.instruction(instr_id);
+            using Tag = pie_loader::PieLoaderStorageOp::Tag;
             if (trace_executor && (i < 128 || i % 1000 == 0 ||
-                    instr.kind != pie_loader::PieLoaderStorageInstrKind::Allocate)) {
+                    instr.op.tag != Tag::Allocate)) {
                 std::cerr << "[pie-driver-cuda] storage executor instr[" << i
                           << "] id=" << instr.id
-                          << " kind=" << static_cast<int>(instr.kind)
-                          << " buffer=" << instr.buffer_id << "\n";
+                          << " tag=" << static_cast<int>(instr.op.tag) << "\n";
             }
-            switch (instr.kind) {
-            case pie_loader::PieLoaderStorageInstrKind::Allocate:
-                if (allocate_requires_copy_flush(instr)) {
+            switch (instr.op.tag) {
+            case Tag::Allocate:
+                if (allocate_requires_copy_flush(instr.op.allocate)) {
                     copy_engine_.flush();
                 }
                 {
                     PhaseTimer _pt(&stats.phase_alloc_ms);
-                    allocate(plan, instr);
+                    allocate(plan, instr.op.allocate);
                 }
                 if (trace_executor && (i < 128 || i % 1000 == 0)) {
                     std::cerr << "[pie-driver-cuda] storage executor allocated buffer="
-                              << instr.buffer_id << "\n";
+                              << instr.op.allocate.buffer_id << "\n";
                 }
                 break;
-            case pie_loader::PieLoaderStorageInstrKind::ExtentWrite:
-                extent_write(instr, stats);
+            case Tag::Fill:
+                fill(instr.op.fill);
                 break;
-            case pie_loader::PieLoaderStorageInstrKind::BulkExtentWrite:
-                bulk_extent_write(instr, stats);
+            case Tag::ExtentWrite:
+                extent_write(instr.op.extent_write, stats);
                 break;
-            case pie_loader::PieLoaderStorageInstrKind::SlabScatter:
+            case Tag::BulkExtentWrite:
+                bulk_extent_write(instr.op.bulk_extent_write, stats);
+                break;
+            case Tag::SlabScatter:
                 copy_engine_.flush();
                 {
                     PhaseTimer _pt(&stats.phase_transform_ms);
-                    slab_scatter(instr, stats);
+                    slab_scatter(instr.op.slab_scatter, stats);
                 }
                 break;
-            case pie_loader::PieLoaderStorageInstrKind::Finalize:
+            case Tag::Finalize:
                 {
                     PhaseTimer _pt(&stats.phase_transform_ms);
-                    finalize(plan, instr, stats);
+                    finalize(plan, instr.op.finalize, stats);
                 }
                 break;
-            case pie_loader::PieLoaderStorageInstrKind::TileMap:
+            case Tag::TileMap:
                 copy_engine_.flush();
                 {
                     PhaseTimer _pt(&stats.phase_transform_ms);
-                    transcode_.tile_map(instr, stats);
+                    transcode_.tile_map(instr.op.tile_map, stats);
                 }
                 break;
-            case pie_loader::PieLoaderStorageInstrKind::CreateView:
+            case Tag::CreateView:
                 copy_engine_.flush();
-                create_view(plan, instr);
-                break;
-            case pie_loader::PieLoaderStorageInstrKind::Release:
-                copy_engine_.flush();
-                buffers_.erase(instr.buffer_id);
+                create_view(plan, instr.op.create_view);
                 break;
             }
         }
@@ -148,9 +147,28 @@ public:
     }
 
 private:
+    /// Zero a buffer the plan is about to write only part of.
+    ///
+    /// The loader emits this when an expression pads: the padded region is
+    /// device memory no source covers, and the compiler prices it as one fill
+    /// rather than one copy per band. It must precede every write to the same
+    /// buffer, which `validate-fill-order` guarantees on the Rust side; the
+    /// stream ordering is what guarantees it here, so the pending copies have
+    /// to be flushed first.
+    void fill(const pie_loader::PieLoaderStorageOp::Fill_Body& instr)
+    {
+        copy_engine_.flush();
+        auto it = buffers_.find(instr.buffer_id);
+        if (it == buffers_.end()) {
+            throw std::runtime_error("rust storage executor: Fill buffer missing");
+        }
+        CUDA_CHECK(cudaMemsetAsync(
+            it->second.data(), 0, it->second.nbytes(), copy_engine_.acquire_stream()));
+    }
+
     void allocate(
         const pie_loader::LoadPlanView& plan,
-        const pie_loader::PieLoaderStorageInstrView& instr)
+        const pie_loader::PieLoaderStorageOp::Allocate_Body& instr)
     {
         const auto& buffer = plan_index_.buffer(instr.buffer_id);
         if (try_allocate_persistent_arena_view(buffer)) {
@@ -191,7 +209,7 @@ private:
     }
 
     bool allocate_requires_copy_flush(
-        const pie_loader::PieLoaderStorageInstrView& instr) const
+        const pie_loader::PieLoaderStorageOp::Allocate_Body& instr) const
     {
         const auto& buffer = plan_index_.buffer(instr.buffer_id);
         return !can_allocate_persistent_arena_view(buffer);
@@ -269,13 +287,9 @@ private:
     }
 
     void extent_write(
-        const pie_loader::PieLoaderStorageInstrView& instr,
+        const pie_loader::PieLoaderStorageOp::ExtentWrite_Body& instr,
         LoadExecutionStats& stats)
     {
-        if (!instr.has_source || !instr.has_dest) {
-            throw std::runtime_error(
-                "rust storage executor: ExtentWrite missing source/dest");
-        }
         auto dst_it = buffers_.find(instr.dest.buffer_id);
         if (dst_it == buffers_.end()) {
             throw std::runtime_error(
@@ -293,7 +307,7 @@ private:
                 instr.dest.offset + instr.dest.stride.base_offset;
             const std::uint64_t dst_total = dst_it->second.nbytes();
             copy_strided_extent_to_device(
-                loader_, instr,
+                loader_, instr.source,
                 dst,
                 dst_offset > dst_total ? 0 : dst_total - dst_offset);
             return;
@@ -308,19 +322,14 @@ private:
     }
 
     void bulk_extent_write(
-        const pie_loader::PieLoaderStorageInstrView& instr,
+        const pie_loader::PieLoaderStorageOp::BulkExtentWrite_Body& instr,
         LoadExecutionStats& stats)
     {
         if (persistent_arena_base_ == nullptr) {
             throw std::runtime_error(
                 "rust storage executor: BulkExtentWrite requires persistent arena");
         }
-        if (!instr.has_source || !instr.has_dest) {
-            throw std::runtime_error(
-                "rust storage executor: BulkExtentWrite missing source/dest");
-        }
-        const std::uint64_t dst_offset =
-            instr.dest.offset + instr.dest.stride.base_offset;
+        const std::uint64_t dst_offset = instr.dest_offset;
         if (dst_offset > persistent_arena_bytes_ ||
             instr.source.span_bytes > persistent_arena_bytes_ - dst_offset) {
             throw std::runtime_error(
@@ -338,7 +347,7 @@ private:
     }
 
     void slab_scatter(
-        const pie_loader::PieLoaderStorageInstrView& instr,
+        const pie_loader::PieLoaderStorageOp::SlabScatter_Body& instr,
         LoadExecutionStats& stats)
     {
 #if PIE_CUDA_RUST_STORAGE_EXECUTOR_HAS_CUDA
@@ -346,18 +355,18 @@ private:
             throw std::runtime_error(
                 "rust storage executor: SlabScatter requires persistent arena");
         }
-        if (instr.slab_placements.len == 0 || instr.slab_span_bytes == 0) {
+        if (instr.placements.len == 0 || instr.span_bytes == 0) {
             return;
         }
-        ensure_slab_staging_capacity(instr.slab_span_bytes);
-        ensure_slab_placement_capacity(instr.slab_placements.len);
+        ensure_slab_staging_capacity(instr.span_bytes);
+        ensure_slab_placement_capacity(instr.placements.len);
 
-        slab_placement_host_.resize(instr.slab_placements.len);
+        slab_placement_host_.resize(instr.placements.len);
         std::uint64_t payload_bytes = 0;
-        for (std::size_t i = 0; i < instr.slab_placements.len; ++i) {
-            const auto& placement = instr.slab_placements.ptr[i];
-            if (placement.src_offset > instr.slab_span_bytes ||
-                placement.bytes > instr.slab_span_bytes - placement.src_offset) {
+        for (std::size_t i = 0; i < instr.placements.len; ++i) {
+            const auto& placement = instr.placements.ptr[i];
+            if (placement.src_offset > instr.span_bytes ||
+                placement.bytes > instr.span_bytes - placement.src_offset) {
                 throw std::runtime_error(
                     "rust storage executor: SlabScatter source placement out of bounds");
             }
@@ -376,30 +385,30 @@ private:
 
         cudaStream_t stream = copy_engine_.acquire_stream();
         copy_engine_.copy_span_to_device(
-            instr.slab_file_id,
-            instr.slab_file_offset,
-            instr.slab_span_bytes,
+            instr.file_id,
+            instr.file_offset,
+            instr.span_bytes,
             slab_staging_,
             stream);
         CUDA_CHECK(cudaMemcpyAsync(
             slab_placements_device_,
             slab_placement_host_.data(),
-            instr.slab_placements.len * sizeof(SlabScatterPlacement),
+            instr.placements.len * sizeof(SlabScatterPlacement),
             cudaMemcpyHostToDevice,
             stream));
         launch_slab_scatter(
             static_cast<const std::uint8_t*>(slab_staging_),
             persistent_arena_base_,
             slab_placements_device_,
-            instr.slab_placements.len,
+            instr.placements.len,
             stream);
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
         ++stats.h2d_copy_count;
-        stats.h2d_copy_bytes += instr.slab_span_bytes;
+        stats.h2d_copy_bytes += instr.span_bytes;
         ++stats.slab_scatter_count;
-        stats.slab_scatter_placements += instr.slab_placements.len;
-        stats.slab_scatter_source_bytes += instr.slab_span_bytes;
+        stats.slab_scatter_placements += instr.placements.len;
+        stats.slab_scatter_source_bytes += instr.span_bytes;
         stats.slab_scatter_payload_bytes += payload_bytes;
 #else
         (void)instr;
@@ -457,19 +466,10 @@ private:
 
     void create_view(
         const pie_loader::LoadPlanView& plan,
-        const pie_loader::PieLoaderStorageInstrView& instr)
+        const pie_loader::PieLoaderStorageOp::CreateView_Body& instr)
     {
-        const auto inputs =
-            pie_loader::buffer_id_slice_to_vector(instr.input_buffers);
-        const auto outputs =
-            pie_loader::buffer_id_slice_to_vector(instr.output_buffers);
-        if (inputs.size() != 1 || outputs.size() != 1 || !instr.has_dest) {
-            throw std::runtime_error(
-                "rust storage executor: CreateView expects one input, one "
-                "output, and a destination view extent");
-        }
-        const auto input_id = inputs.front();
-        const auto output_id = outputs.front();
+        const auto input_id = instr.input_buffer;
+        const auto output_id = instr.output_buffer;
         const DeviceTensor& input = resolver_.or_finalized(input_id);
         const auto& output_buffer = plan_index_.buffer(output_id);
         if (!output_buffer.has_tensor) {
@@ -480,8 +480,8 @@ private:
         const auto& tensor = plan_index_.tensor(output_buffer.tensor_id);
         const auto shape = pie_loader::i64_slice_to_vector(tensor.shape);
         const auto* input_base =
-            static_cast<const std::uint8_t*>(input.data()) + instr.dest.offset +
-            instr.dest.stride.base_offset;
+            static_cast<const std::uint8_t*>(input.data()) + instr.view.offset +
+            instr.view.stride.base_offset;
         buffers_.emplace(
             output_id,
             DeviceTensor::view(
@@ -508,7 +508,7 @@ private:
 
     void finalize(
         const pie_loader::LoadPlanView& plan,
-        const pie_loader::PieLoaderStorageInstrView& instr,
+        const pie_loader::PieLoaderStorageOp::Finalize_Body& instr,
         LoadExecutionStats& stats)
     {
         auto buffer = buffers_.extract(instr.buffer_id);

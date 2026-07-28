@@ -1,5 +1,4 @@
 {
-  "version": 5,
   "compiler_version": 0,
   "target": {
     "backend": "Cuda",
@@ -7,22 +6,26 @@
     "tp_size": 2,
     "max_tile_bytes": 67108864,
     "preferred_alignment": 256,
-    "tile_map_mask": 117,
+    "tile_map_mask": 85,
     "native_mxfp4_moe": false,
     "fusion_mask": 1,
     "encode_scratch_dtype": "BF16",
     "block_scale_rows": 128
   },
-  "optimizer": {
-    "passes": [
-      {
-        "name": "live-normalization",
-        "exprs_before": 63,
-        "exprs_after": 63,
-        "rewrites": 0
-      }
-    ]
-  },
+  "passes": [
+    {
+      "pass": "assign-persistent-offsets",
+      "instrs_before": 63,
+      "instrs_after": 63,
+      "rewrites": 21
+    },
+    {
+      "pass": "hoist-bulk-arena-writes",
+      "instrs_before": 63,
+      "instrs_after": 61,
+      "rewrites": 2
+    }
+  ],
   "files": [
     {
       "id": 0,

@@ -1,7 +1,7 @@
 #pragma once
 
 // TranscodeEngine: the quant/transcode TileMap path — Cast, Encode
-// (FP8->bf16->FP8/MXFP4, fused or staged), Repack (Marlin) and Reblock/Reorder.
+// (FP8->bf16->FP8/MXFP4, fused or staged), Repack (Marlin) and Reblock.
 // Factored out of the storage executor; it consumes source bytes (loader + copy
 // engine), resolves input/output buffers (resolver), reads the LoadPlan
 // (program index), and owns the FP8 encode scratch buffers.
@@ -64,7 +64,7 @@ public:
     TranscodeEngine& operator=(const TranscodeEngine&) = delete;
 
     void tile_map(
-        const lp::PieLoaderStorageInstrView& instr,
+        const lp::PieLoaderStorageOp::TileMap_Body& instr,
         LoadExecutionStats& stats)
     {
         switch (instr.tile_kind) {
@@ -72,7 +72,6 @@ public:
             cast_tile_map(instr);
             return;
         case lp::PieLoaderTileMapKind::Reblock:
-        case lp::PieLoaderTileMapKind::Reorder:
             reblock_tile_map(instr);
             return;
         case lp::PieLoaderTileMapKind::Encode:
@@ -126,6 +125,9 @@ private:
         } else if (src.dtype() == DType::BF16 && dst_dtype == DType::FP32) {
             kernels::launch_cast_bf16_to_fp32(
                 src.data(), dst, src.numel(), /*stream=*/0);
+        } else if (src.dtype() == DType::E8M0 && dst_dtype == DType::FP32) {
+            kernels::launch_cast_e8m0_to_fp32(
+                src.data(), dst, src.numel(), /*stream=*/0);
         } else {
             throw std::runtime_error(
                 "rust storage executor: unsupported TileMap Cast " +
@@ -143,7 +145,7 @@ private:
     }
 
     void cast_tile_map(
-        const lp::PieLoaderStorageInstrView& instr)
+        const lp::PieLoaderStorageOp::TileMap_Body& instr)
     {
         if (instr.output_buffers.len != 1) {
             throw std::runtime_error(
@@ -190,7 +192,7 @@ private:
     // slice of an input buffer) WITHOUT dequantizing. Shared by the BF16
     // materialize path and the fused FP8->MXFP4 transcode path.
     DeviceTensor acquire_encode_source_tile(
-        const lp::PieLoaderStorageInstrView& instr,
+        const lp::PieLoaderStorageOp::TileMap_Body& instr,
         const std::vector<std::int64_t>& full_shape,
         int row_start,
         int rows)
@@ -240,7 +242,7 @@ private:
                         "sources is not implemented");
                 }
                 copy_strided_extent_to_device(
-                    loader_, instr, source.data(), source.nbytes());
+                    loader_, instr.source, source.data(), source.nbytes());
             } else {
                 const std::uint64_t elem = dtype_bytes(source_dtype);
                 const std::uint64_t row_bytes =
@@ -290,7 +292,7 @@ private:
     }
 
     DeviceTensor materialize_encode_input_bf16_rows(
-        const lp::PieLoaderStorageInstrView& instr,
+        const lp::PieLoaderStorageOp::TileMap_Body& instr,
         const std::vector<std::int64_t>& full_shape,
         int row_start,
         int rows)
@@ -379,11 +381,12 @@ private:
     };
 
     // Resolve the per-group FP8 block scale for an Encode-source tile: loads/
-    // caches `<weight>_scale_inv`, slices the rank-local block for TP shards,
+    // caches the scale tensor the instruction names, slices the rank-local
+    // block for TP shards,
     // and offsets to the tile's first scale row. Shared by the BF16 dequant and
     // the fused FP8->MXFP4 paths so both see identical scale data.
     Fp8TileScale fp8_tile_scale(
-        const lp::PieLoaderStorageInstrView& instr,
+        const lp::PieLoaderStorageOp::TileMap_Body& instr,
         const std::vector<std::int64_t>& full_shape,
         int row_start,
         int rows)
@@ -399,18 +402,22 @@ private:
         const auto& weight_info = plan_index_.source(instr.source.tensor_id);
         const std::string weight_name =
             pie_loader::bytes_to_string(weight_info.name);
-        const std::string scale_name = weight_name + "_scale_inv";
-        const auto* scale_info = plan_index_.find_source(scale_name);
-        if (scale_info == nullptr) {
+        // Which tensor holds the block scales is the checkpoint's naming
+        // convention, and the loader read the tensor table. It says so on the
+        // instruction rather than leaving this to rebuild the name and hope.
+        if (instr.transform_metadata_source == pie_loader::PIE_LOADER_NO_TENSOR) {
             throw std::runtime_error(
                 "rust storage executor: FP8 Encode source '" + weight_name +
-                "' has no '_scale_inv' sibling tensor");
+                "' has no block-scale tensor on its instruction");
         }
+        const auto& scale_info =
+            plan_index_.source(instr.transform_metadata_source);
         const auto scale_shape =
-            pie_loader::i64_slice_to_vector(scale_info->shape);
+            pie_loader::i64_slice_to_vector(scale_info.shape);
         if (scale_shape.size() != 2) {
             throw std::runtime_error(
-                "rust storage executor: FP8 Encode scale '" + scale_name +
+                "rust storage executor: FP8 Encode scale '" +
+                pie_loader::bytes_to_string(scale_info.name) +
                 "' must be 2-D (block-scaled FP8)");
         }
         // Get the FULL (un-sharded) weight shape from the checkpoint so we
@@ -451,7 +458,8 @@ private:
         const std::uint64_t rank_row_off_full = base_byte / true_cols;
         const std::uint64_t rank_col_off_full = base_byte % true_cols;
 
-        if (dtype_from_rust(scale_info->dtype) != DType::FP32) {
+        const std::string scale_name = pie_loader::bytes_to_string(scale_info.name);
+        if (dtype_from_rust(scale_info.dtype) != DType::FP32) {
             throw std::runtime_error(
                 "rust storage executor: FP8 Encode scale '" + scale_name +
                 "' must be FP32");
@@ -461,7 +469,7 @@ private:
         const std::size_t scale_nbytes =
             static_cast<std::size_t>(scale_rows) * scale_cols * sizeof(float);
         ensure_fp8_scale_loaded(
-            scale_name, *scale_info, scale_nbytes, *scale_info);
+            scale_name, scale_info, scale_nbytes, scale_info);
         const auto& cached_scale = fp8_scale_cache_[scale_name];
         const float* scale_full_ptr =
             static_cast<const float*>(cached_scale.data);
@@ -512,7 +520,7 @@ private:
     }
 
     DeviceTensor dequant_fp8_tile_to_bf16(
-        const lp::PieLoaderStorageInstrView& instr,
+        const lp::PieLoaderStorageOp::TileMap_Body& instr,
         const DeviceTensor& fp8_tile,
         const std::vector<std::int64_t>& full_shape,
         int row_start,
@@ -547,7 +555,7 @@ private:
     // dequant_fp8_tile_to_bf16 + quantize_bf16_to_mxfp4 — the fused kernel
     // rounds through BF16; see tests/test_transcode_fused.cu.
     void transcode_fp8_tile_to_mxfp4(
-        const lp::PieLoaderStorageInstrView& instr,
+        const lp::PieLoaderStorageOp::TileMap_Body& instr,
         const DeviceTensor& fp8_tile,
         const std::vector<std::int64_t>& full_shape,
         int row_start,
@@ -578,7 +586,7 @@ private:
     // tile already covers everything. Clamped against `rows` so a malformed plan
     // cannot turn the loop below into a spin.
     static int encode_rows_per_tile(
-        const lp::PieLoaderStorageInstrView& instr,
+        const lp::PieLoaderStorageOp::TileMap_Body& instr,
         int rows)
     {
         if (instr.rows_per_tile == 0) {
@@ -589,7 +597,7 @@ private:
     }
 
     void launch_encode_tile(
-        const lp::PieLoaderStorageInstrView& instr,
+        const lp::PieLoaderStorageOp::TileMap_Body& instr,
         const DeviceTensor& bf16,
         DeviceTensor& out,
         DeviceTensor& scale,
@@ -688,7 +696,7 @@ private:
     // transcode it straight into the MXFP4 packed/scale outputs at this tile's
     // row offset (same offsets as launch_encode_tile's MXFP4 case).
     void launch_fused_mxfp4_tile(
-        const lp::PieLoaderStorageInstrView& instr,
+        const lp::PieLoaderStorageOp::TileMap_Body& instr,
         DeviceTensor& out,
         DeviceTensor& scale,
         const std::vector<std::int64_t>& shape,
@@ -720,7 +728,7 @@ private:
     }
 
     void encode_tile_map(
-        const lp::PieLoaderStorageInstrView& instr,
+        const lp::PieLoaderStorageOp::TileMap_Body& instr,
         LoadExecutionStats& stats)
     {
         if (instr.output_buffers.len != 2) {
@@ -823,7 +831,7 @@ private:
 #endif
 
     DeviceTensor materialize_repack_source(
-        const lp::PieLoaderStorageInstrView& instr)
+        const lp::PieLoaderStorageOp::TileMap_Body& instr)
     {
         if (instr.has_source) {
             DeviceTensor scratch = DeviceTensor::allocate(
@@ -831,7 +839,7 @@ private:
                 {static_cast<std::int64_t>(instr.source.span_bytes)});
             if (!pie_loader::compact_extent(instr.source.stride)) {
                 copy_strided_extent_to_device(
-                    loader_, instr,
+                    loader_, instr.source,
                     scratch.data(),
                     scratch.nbytes());
             } else {
@@ -867,7 +875,7 @@ private:
     }
 
     void repack_tile_map(
-        const lp::PieLoaderStorageInstrView& instr)
+        const lp::PieLoaderStorageOp::TileMap_Body& instr)
     {
 #if PIE_CUDA_TRANSCODE_ENGINE_HAS_CUDA
         if (instr.output_buffers.len != 1 || !instr.has_dest) {
@@ -1045,7 +1053,7 @@ private:
 #endif
 
     void reblock_tile_map(
-        const lp::PieLoaderStorageInstrView& instr)
+        const lp::PieLoaderStorageOp::TileMap_Body& instr)
     {
         if (instr.input_buffers.len != 1 || instr.output_buffers.len != 1) {
             throw std::runtime_error(

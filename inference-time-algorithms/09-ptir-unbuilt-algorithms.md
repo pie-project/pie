@@ -47,7 +47,7 @@ Two consequences:
 
 - `query()` and `layer()` are **already wired on CUDA and completely
   unexplored**. Everything in Tier B below is buildable today.
-- `hidden()` and `value_head()` are declared in the ABI (`interface/ptir/src/op.rs`,
+- `hidden()` and `value_head()` are declared in the ABI (`compiler/ir/src/op.rs`,
   `header.rs`, `interp.rs`), implemented in the dummy driver and exercised by
   Metal's interpreter test, but the CUDA tier-0 runner has no `hidden` /
   `value_head` field in `FireInputs`. Tier C needs that binding first — a
@@ -101,13 +101,13 @@ Tiers A/D/E, and none of B1–B5 is writable today.
 
 | | Capability | Status |
 |---|---|---|
-| **Actuator** | choose which pages a step attends to | ✅ `Port::Pages`, `Port::PageIndptr` — `interface/ptir/src/registry.rs:102-113` |
+| **Actuator** | choose which pages a step attends to | ✅ `Port::Pages`, `Port::PageIndptr` — `compiler/ir/src/registry.rs:102-113` |
 | **Actuator** | mask which positions survive | ✅ `Port::AttnMask` — same enum |
 | **Sensor** | read `softmax(QK^T)` | ❌ no such intrinsic |
 | **Sensor** | read the layer's projected keys `K` | ❌ no such intrinsic |
 | **Sensor** | read the layer's projected query `Q` | ✅ `IntrinsicId::Query` |
 
-`IntrinsicId` (`interface/ptir/src/op.rs:49-68`) is exhaustively `Logits,
+`IntrinsicId` (`compiler/ir/src/op.rs:49-68`) is exhaustively `Logits,
 MtpLogits, Hidden, Query, ValueHead, Layer, MtpDrafts`. `Port`
 (`registry.rs:102-113`) is exhaustively `EmbedTokens, EmbedIndptr, Positions,
 Pages, PageIndptr, KvLen, WSlot, WOff, Readout, AttnMask` — `Pages`,

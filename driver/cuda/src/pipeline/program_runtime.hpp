@@ -1,20 +1,16 @@
 #pragma once
 
-// PTIR program runtime — the driver-side stage-runner entry that consumes
-// the `PtirProgramSubmission` wire contract (`8a4b20bf`):
-//   { hash, bytes?(first-fire container), sidecar?(first-fire PTIB),
-//     seeds[](per-instance init D2) }.
+// Program runtime — the driver-side stage-runner entry.
 // Host puts do not ride the wire (ABI v2): the runtime writes them into the
 // registered channel endpoint's pinned ring and the instance pulls them
 // stream-ordered before the consuming pass (`pull_writer_inputs`).
 //
 // Two pieces:
-//   * `PtirProgramCache` — the C3 hash-keyed DECODE cache (mirrors
-//     `SamplingIrBackend::get_or_compile`): the first fire of a hash ships the
-//     container + PTIB sidecar bytes → decode → fold into an executable `Trace`
-//     → cache by `hash`; every steady-state fire ships empty bytes and MUST hit
-//     the cache. The cached `Trace` is the seed-independent program identity
-//     (the hash's payload D1); per-instance state lives in `PtirInstance`.
+//   * `PtirProgramCache` — the hash-keyed program cache. Registration ships a
+//     `PieLaunchPackage`, which is adopted into an executable `Trace` + per-
+//     stage plans and cached by `hash`; every steady-state fire ships nothing
+//     and MUST hit the cache. The cached `Trace` is the seed-independent
+//     program identity; per-instance state lives in `PtirInstance`.
 //   * `PtirInstance` — a per-instance execution context (§5 degenerate
 //     depth-0 synchronous loop): the shared `Trace` + its own channel arena,
 //     seeded at construction with the instance's D2 seed values. Each fire
@@ -36,20 +32,17 @@
 #include <utility>
 #include <vector>
 
-#include "pie_native/ptir/bound.hpp"
+#include "pie_native/launch/plan.hpp"
+#include "pie_native/launch/program.hpp"
 #include "pipeline/channel_registry.hpp"
-#include "pie_native/ptir/container.hpp"
-#include "pie_native/ptir/plan.hpp"
-#include "pipeline/program_identity.hpp"
 #include "pipeline/tier0/tier0_runner.hpp"
-#include "pie_native/ptir/trace.hpp"
 
 namespace pie_cuda_driver::pipeline {
 
-// Shared pure-host PTIR decode model (trace/op-table/container/bound/
-// fire-geometry) now lives in pie_native::ptir (driver/common); bring it into
-// scope so the CUDA-side tier-0/1 code below can use it unqualified.
-using namespace pie_native::ptir;
+// The driver's execution model (trace/op-table/plan) lives in
+// pie_native::launch (driver/abi); bring it into scope so the CUDA-side
+// tier-0/1 code below can use it unqualified.
+using namespace pie_native::launch;
 
 // A per-channel host-supplied byte value — mirrors the wire `PtirChannelValue`.
 // Seeds are per-instance init (D2, not in the hash).
@@ -59,281 +52,53 @@ struct ChannelValue {
     std::vector<std::uint8_t> bytes;
 };
 
-inline bool validate_plan_structure(
-    const plan::StagePlan& stage,
-    std::string* error) {
-    auto fail = [&](const char* message) {
-        if (error != nullptr) *error = message;
-        return false;
-    };
-    std::uint32_t next = 0;
-    for (std::size_t node = 0; node < stage.ops.size(); ++node) {
-        const auto& op = stage.ops[node].op;
-        const std::uint32_t result_base = next;
-        for (const auto argument : op.args) {
-            if (argument >= result_base) {
-                return fail(
-                    "region plan operand is not a prior SSA value");
-            }
-        }
-        if (op.tag == PTIR_OP_PIVOT_THRESHOLD &&
-            op.pred_payload >= result_base) {
-            return fail(
-                "region plan predicate is not a prior SSA value");
-        }
-        if ((op.tag == PTIR_OP_CHAN_TAKE ||
-             op.tag == PTIR_OP_CHAN_READ ||
-             op.tag == PTIR_OP_CHAN_PUT) &&
-            (op.chan < 0 ||
-             static_cast<std::size_t>(op.chan) >=
-                 stage.channel_bindings.size())) {
-            return fail("region plan channel binding is out of range");
-        }
-        if (next >
-            std::numeric_limits<std::uint32_t>::max() - op.results) {
-            return fail("region plan value layout overflows u32");
-        }
-        next += op.results;
-    }
-    if (next != stage.value_types.size()) {
-        return fail("region plan value layout mismatch");
-    }
-    auto validate_partition = [&](const plan::Partition& partition) {
-        std::vector<std::uint8_t> covered(stage.ops.size(), 0);
-        std::uint32_t previous_node = 0;
-        bool have_previous = false;
-        for (const auto& region : partition.regions) {
-            if (region.nodes.empty() ||
-                !std::is_sorted(
-                    region.nodes.begin(), region.nodes.end())) {
-                return false;
-            }
-            if (have_previous &&
-                region.nodes.back() <= previous_node) {
-                return false;
-            }
-            for (const auto node : region.nodes) {
-                if (node >= stage.ops.size() || covered[node] != 0) {
-                   return false;
-                }
-                covered[node] = 1;
-            }
-            previous_node = region.nodes.back();
-            have_previous = true;
-            if (!region.library) {
-                if (region.schedule == PTIR_SCHEDULE_LIBRARY) return false;
-                continue;
-            }
-            if (region.schedule != PTIR_SCHEDULE_LIBRARY) {
-                return false;
-            }
-            if (region.library_op == PTIR_LIBRARY_NUCLEUS_SAMPLE) {
-                const bool scaled = region.inputs.size() == 5;
-                if (region.nodes.size() != 13 ||
-                    (!scaled && region.inputs.size() != 3) ||
-                    region.outputs.size() != 1 ||
-                    !region.sinks.empty()) {
-                    return false;
-                }
-                const auto logits = region.inputs[0];
-                const auto top_p = region.inputs[scaled ? 3 : 1];
-                const auto rng_state = region.inputs[scaled ? 4 : 2];
-                const auto token = region.outputs[0];
-                if (logits >= stage.value_types.size() ||
-                    top_p >= stage.value_types.size() ||
-                    rng_state >= stage.value_types.size() ||
-                    token >= stage.value_types.size() ||
-                    stage.value_types[logits].dtype != PTIR_DT_F32 ||
-                    stage.value_types[logits].dims.empty() ||
-                    (scaled &&
-                     stage.value_types[region.inputs[1]].dtype !=
-                         PTIR_DT_F32) ||
-                    (scaled &&
-                     stage.value_types[region.inputs[2]].dtype !=
-                         PTIR_DT_F32) ||
-                    stage.value_types[top_p].dtype != PTIR_DT_F32 ||
-                    stage.value_types[rng_state].dtype != PTIR_DT_U32 ||
-                    (stage.value_types[token].dtype != PTIR_DT_I32 &&
-                     stage.value_types[token].dtype != PTIR_DT_U32)) {
-                    return false;
-                }
-                continue;
-            }
-            if (region.nodes.size() != 1) return false;
-            const auto& op = stage.ops[region.nodes.front()].op;
-            const bool matches =
-                (region.library_op == PTIR_LIBRARY_TOP_K &&
-                 op.tag == PTIR_OP_TOP_K) ||
-                (region.library_op == PTIR_LIBRARY_SORT &&
-                 op.tag == PTIR_OP_SORT_DESC) ||
-                (region.library_op == PTIR_LIBRARY_SCAN &&
-                 (op.tag == PTIR_OP_CUMSUM ||
-                 op.tag == PTIR_OP_CUMPROD)) ||
-                (region.library_op == PTIR_LIBRARY_MATMUL &&
-                 op.tag == PTIR_OP_MATMUL) ||
-                (region.library_op == PTIR_LIBRARY_SECOND_PARTY &&
-                 (op.tag == PTIR_OP_KERNEL_CALL ||
-                  op.tag == PTIR_OP_SINK_CALL));
-            if (!matches) return false;
-        }
-        return std::all_of(
-            covered.begin(), covered.end(),
-            [](std::uint8_t value) { return value != 0; });
-    };
-    if (!validate_partition(stage.singleton)) {
-        return fail("singleton region plan partition/opcode mismatch");
-    }
-    if (!validate_partition(stage.fused)) {
-        return fail("fused region plan partition/opcode mismatch");
-    }
-    return true;
-}
-
-inline bool validate_plan_bindings(
-    const plan::StagePlan& stage,
-    const container::CStage& source_stage,
-    std::string* error) {
-    auto fail = [&](const char* message) {
-        if (error != nullptr) *error = message;
-        return false;
-    };
-    for (const auto& normalized : stage.ops) {
-        const auto& op = normalized.op;
-        const bool channel_op =
-            op.tag == PTIR_OP_CHAN_TAKE ||
-            op.tag == PTIR_OP_CHAN_READ ||
-            op.tag == PTIR_OP_CHAN_PUT;
-        if (!channel_op) continue;
-        if (op.chan < 0 ||
-            static_cast<std::size_t>(op.chan) >=
-                stage.channel_bindings.size()) {
-            return fail("localized channel is out of range");
-        }
-        bool matched = false;
-        for (const auto source : normalized.source_ops) {
-            if (source >= source_stage.ops.size()) {
-                return fail("normalized source op is out of range");
-            }
-            const auto& source_op = source_stage.ops[source];
-            if (source_op.tag == op.tag && source_op.chan >= 0) {
-                matched = true;
-                if (stage.channel_bindings[
-                        static_cast<std::size_t>(op.chan)] !=
-                    static_cast<std::uint32_t>(source_op.chan)) {
-                    return fail("localized channel binding mismatch");
-                }
-            }
-        }
-        if (!matched) return fail("channel op has no matching source binding");
-    }
-    return true;
-}
-
-// C3 hash-keyed decoded-program cache. The `Trace` is folded once per identity
-// hash from the first fire's container + sidecar; steady-state fires reuse it.
+// Hash-keyed program cache. `register_program` ships the launch package once;
+// every later call is a lookup.
 class PtirProgramCache {
   public:
-    // Return the cached `Trace` for `hash`, decoding + caching it on a first
-    // fire (non-empty container AND sidecar). A steady-state fire (empty bytes)
-    // MUST hit the cache. Returns nullptr and sets `*err` on any failure — a
-    // decode/version/hash mismatch is a host/bridge bug, surfaced loudly.
-    const Trace* get_or_decode(std::uint64_t hash,
-                               const std::uint8_t* container_bytes, std::size_t container_len,
-                               const std::uint8_t* sidecar_bytes, std::size_t sidecar_len,
-                               std::string* err = nullptr) {
+    // Return the cached `Trace` for `hash`, adopting + caching it on a first
+    // registration. A steady-state fire ships no package and MUST hit the
+    // cache. Returns nullptr and sets `*err` on a miss.
+    //
+    // There is nothing to validate here: the package is typed records the host
+    // built from its own compile, and `validate_program_desc` already checked
+    // every slice. The decoder, the structural validator, and the binding
+    // validator this method replaced were all re-deriving what the host knew
+    // (`ptir-refactor.md` §2.3).
+    const Trace* adopt(std::uint64_t hash,
+                       const PieLaunchPackage& package,
+                       std::string* err = nullptr) {
         auto it = programs_.find(hash);
-        if (it != programs_.end()) {
-            if (container_len != 0 || sidecar_len != 0) {
-                if (container_len == 0 || sidecar_len == 0 ||
-                    container_len != it->second.container_bytes.size() ||
-                    sidecar_len != it->second.sidecar_bytes.size() ||
-                    std::memcmp(
-                        container_bytes,
-                        it->second.container_bytes.data(),
-                        container_len) != 0 ||
-                    std::memcmp(
-                        sidecar_bytes,
-                        it->second.sidecar_bytes.data(),
-                        sidecar_len) != 0) {
-                    return fail(
-                        err,
-                        "ptir program hash collision or payload mismatch");
-                }
-            }
-            return &it->second.trace;
-        }
+        if (it != programs_.end()) return &it->second.trace;
 
-        if (container_len == 0 || sidecar_len == 0)
+        if (package.stages.len == 0)
             return fail(err, "ptir program hash " + std::to_string(hash) +
-                                 " not cached and this fire shipped no first-fire "
-                                 "container/sidecar bytes");
+                                 " not cached and this fire shipped no launch "
+                                 "package");
 
-        // Structural container (channels/ports/stage op tags) …
-        container::Container c;
-        container::DecodeError de;
-        if (!container::decode(container_bytes, container_len, c, &de))
-            return fail(err, "ptir container decode: " + de.detail);
-
-        // … + the PTIB typed sidecar (per-SSA (dtype, shape), channel classes,
-        // readiness table — Option-B: the driver does NOT re-infer shapes).
-        bound::Bound b;
-        std::string se;
-        if (!bound::parse_sidecar(sidecar_bytes, sidecar_len, b, &se))
-            return fail(err, "ptir sidecar parse: " + se);
-
-        // The identity chain must agree: wire hash == container hash ==
-        // sidecar's inner container_hash (else the bytes were mispaired).
-        if (c.hash != hash || b.container_hash != hash)
-            return fail(err, "ptir hash mismatch: wire=" + std::to_string(hash) +
-                                 " container=" + std::to_string(c.hash) +
-                                 " sidecar=" + std::to_string(b.container_hash));
-
-        bound::TranslateResult tr = bound::container_to_trace(c, b);
-        if (!tr.ok) return fail(err, "ptir container->trace: " + tr.error);
-
-        DecodedProgram decoded;
-        decoded.container_bytes.assign(
-            container_bytes, container_bytes + container_len);
-        decoded.sidecar_bytes.assign(
-            sidecar_bytes, sidecar_bytes + sidecar_len);
-        decoded.trace = std::move(tr.trace);
-        if (b.version != PTIB_VERSION ||
-            b.plans.size() != c.stages.size()) {
-            return fail(err, "ptir sidecar requires compiler v3 PTRP v4 plans");
+        AdoptedProgram adopted;
+        adopted.trace = pie_native::launch::adopt(package);
+        adopted.plans.reserve(package.plans.len);
+        adopted.graph_stage_identities.reserve(package.plans.len);
+        for (std::size_t i = 0; i < package.plans.len; ++i) {
+            plan::StagePlan stage_plan =
+                plan::adopt(package.stages.ptr[i].kind, package.plans.ptr[i]);
+            adopted.graph_stage_identities.push_back(stage_plan.identity);
+            adopted.plans.push_back(std::move(stage_plan));
         }
-        decoded.plans.reserve(b.plans.size());
-        decoded.graph_stage_identities.reserve(b.plans.size());
-        for (std::size_t plan_index = 0;
-             plan_index < b.plans.size();
-             ++plan_index) {
-            const bound::StagePlan& encoded = b.plans[plan_index];
-            plan::StagePlan stage_plan;
-            std::string plan_error;
-            if (!plan::decode(
-                    encoded.bytes.data(), encoded.bytes.size(), stage_plan, &plan_error)) {
-                return fail(err, "ptir region plan: " + plan_error);
-            }
-            if (stage_plan.stage != encoded.stage ||
-                stage_plan.signature_hash == 0) {
-                return fail(err, "ptir region plan identity mismatch");
-            }
-            if (!validate_plan_structure(stage_plan, &plan_error)) {
-                return fail(err, "ptir region plan: " + plan_error);
-            }
-            if (!validate_plan_bindings(
-                    stage_plan,
-                    c.stages[plan_index],
-                    &plan_error)) {
-                return fail(
-                    err,
-                    "ptir region plan binding: " + plan_error);
-            }
-            decoded.graph_stage_identities.push_back(
-                compiled_stage_identity(stage_plan));
-            decoded.plans.push_back(std::move(stage_plan));
-        }
-        auto ins = programs_.emplace(hash, std::move(decoded));
+        auto ins = programs_.emplace(hash, std::move(adopted));
         return &ins.first->second.trace;
+    }
+
+
+    // Look up an already-registered program. Bind and every steady-state fire
+    // go through here: only `register_program` ships a package.
+    const Trace* find(std::uint64_t hash, std::string* err = nullptr) const {
+        auto it = programs_.find(hash);
+        if (it == programs_.end())
+            return fail(err, "ptir program hash " + std::to_string(hash) +
+                                 " is not registered");
+        return &it->second.trace;
     }
 
     bool contains(std::uint64_t hash) const { return programs_.find(hash) != programs_.end(); }
@@ -350,11 +115,79 @@ class PtirProgramCache {
             : &it->second.graph_stage_identities;
     }
 
+    // The host's per-region analysis (`region_support.hpp`'s former bind gates
+    // and `analyze_direct_argmax`) is now the only copy: the driver's was
+    // deleted once this counter read `divergent == 0` with `host_supplied != 0`
+    // over the vendored corpus and the curated matrix. `derived` and
+    // `divergent` are gone with it -- there is nothing left to derive or
+    // disagree with -- and what remains is the shape check, which stopped
+    // being a diagnostic and became load-bearing the moment the driver started
+    // indexing this table instead of rebuilding it.
+    struct RegionStats {
+        std::uint64_t host_supplied = 0;
+    };
+    const RegionStats& region_stats() const { return region_stats_; }
+
+    // Validate the host's region table against the program's actual shape.
+    // Returns false when it names regions this program does not have, which is
+    // an ABI bug: the module cache indexes this table by `(stage, region)` and
+    // a short or misaddressed one silently binds the wrong kernel contract.
+    bool adopt_host_region_analysis(
+        std::uint64_t hash,
+        const PieRegionAnalysis* host,
+        std::size_t host_len,
+        std::string* err) {
+        auto it = programs_.find(hash);
+        if (it == programs_.end()) return true;
+        const auto& plans = it->second.plans;
+        std::size_t derived_regions = 0;
+        for (const plan::StagePlan& stage : plans) {
+            derived_regions += stage.fused.regions.size();
+        }
+        if (host == nullptr || host_len == 0) {
+            // Not an error here: a program with no fused regions needs no
+            // table, and the module cache is the one that refuses a fused
+            // region with nothing behind it.
+            return true;
+        }
+        if (host_len != derived_regions) {
+            if (err) {
+                *err = "host supplied " + std::to_string(host_len) +
+                    " region analyses for a program with " +
+                    std::to_string(derived_regions) + " fused regions";
+            }
+            return false;
+        }
+        for (std::size_t entry = 0; entry < host_len; ++entry) {
+            const PieRegionAnalysis& supplied = host[entry];
+            if (supplied.stage_index >= plans.size()) {
+                if (err) {
+                    *err = "host region analysis names stage " +
+                        std::to_string(supplied.stage_index) +
+                        " in a program with " + std::to_string(plans.size()) +
+                        " stages";
+                }
+                return false;
+            }
+            const plan::StagePlan& stage = plans[supplied.stage_index];
+            if (supplied.region_index >= stage.fused.regions.size()) {
+                if (err) {
+                    *err = "host region analysis names region " +
+                        std::to_string(supplied.region_index) +
+                        " in a stage with " +
+                        std::to_string(stage.fused.regions.size()) +
+                        " fused regions";
+                }
+                return false;
+            }
+        }
+        region_stats_.host_supplied += host_len;
+        return true;
+    }
+
   private:
-    struct DecodedProgram {
+    struct AdoptedProgram {
         Trace trace;
-        std::vector<std::uint8_t> container_bytes;
-        std::vector<std::uint8_t> sidecar_bytes;
         std::vector<plan::StagePlan> plans;
         // Registration-time compact identities for the forward graph key.
         // Steady-state fires fold these integers without touching plan bytes.
@@ -364,7 +197,8 @@ class PtirProgramCache {
         if (e) *e = m;
         return nullptr;
     }
-    std::unordered_map<std::uint64_t, DecodedProgram> programs_;
+    std::unordered_map<std::uint64_t, AdoptedProgram> programs_;
+    RegionStats region_stats_;
 };
 
 // Per-instance execution context: the shared cached `Trace` + a channel VIEW
@@ -580,7 +414,12 @@ class PtirInstance {
             channel.extern_dir == 0) {
             return true;
         }
-        return fire_takes_channel(dense) && !puts_channel(dense);
+        // First-touch, as shipped. `fire_takes_channel && !puts_channel` was
+        // the same question asked of the effect sets, and it gets an in-place
+        // channel (taken, then put back) wrong in the one direction that
+        // matters: it reads as "no input needed" for a ring whose first op
+        // needs one.
+        return channel.readiness == Readiness::NeedsFull;
     }
     ChannelView& view() { return view_; }
 

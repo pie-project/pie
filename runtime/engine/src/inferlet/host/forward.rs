@@ -29,8 +29,8 @@ use crate::pipeline::instance::{AttentionBinding, BoundForwardPass, EmbedBinding
 use crate::store::kv::working_set::KvWorkingSet;
 use crate::store::rs::working_set::RsWorkingSet;
 
-use pie_ptir::container::{HostRole, PortSource, TraceContainer};
-use pie_ptir::registry::Port;
+use pie_ir::container::{HostRole, PortSource, TraceContainer};
+use pie_ir::registry::Port;
 
 use super::pie;
 
@@ -275,10 +275,10 @@ impl pie::inferlet::forward::HostChannel for ProcessCtx {
         // errors at forward-pass.new / submit).
         use pie::inferlet::types::Dtype;
         let dtype = match dtype {
-            Dtype::F32 => pie_ptir::types::DType::F32,
-            Dtype::I32 => pie_ptir::types::DType::I32,
-            Dtype::U32 => pie_ptir::types::DType::U32,
-            Dtype::Bool => pie_ptir::types::DType::Bool,
+            Dtype::F32 => pie_ir::types::DType::F32,
+            Dtype::I32 => pie_ir::types::DType::I32,
+            Dtype::U32 => pie_ir::types::DType::U32,
+            Dtype::Bool => pie_ir::types::DType::Bool,
         };
         let cell = Arc::new(Mutex::new(ChannelCell::new(shape, dtype, capacity)));
         Ok(self.ctx().table.push(Channel { cell, fires: None })?)
@@ -676,8 +676,8 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
                     let mut lease = crate::pipeline::fire::lease::PageLease::new(b);
                     lease.seed(seed_pages);
                     let has_mask = prog.bound.container.ports.iter().any(|p| {
-                        matches!(p.port, pie_ptir::registry::Port::AttnMask)
-                            && matches!(p.source, pie_ptir::container::PortSource::Channel(_))
+                        matches!(p.port, pie_ir::registry::Port::AttnMask)
+                            && matches!(p.source, pie_ir::container::PortSource::Channel(_))
                     });
                     Some(DevGeo {
                         lease,
@@ -691,7 +691,7 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
                 None => None,
             };
 
-            let taint = pie_ptir::pareval::geometry_taint(&prog.bound);
+            let taint = pie_eval::pareval::geometry_taint(&prog.bound);
             let decode_envelope = if devgeo.is_some() || taint.host_derivable() {
                 None
             } else {
@@ -804,10 +804,10 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
                     seeded: decls[dense].seeded,
                     extern_dir: extern_binding
                         .map(|(_, dir)| match dir {
-                            pie_ptir::container::ExternDir::Import => {
+                            pie_ir::container::ExternDir::Import => {
                                 pie_driver_abi::PIE_CHANNEL_EXTERN_IMPORT
                             }
-                            pie_ptir::container::ExternDir::Export => {
+                            pie_ir::container::ExternDir::Export => {
                                 pie_driver_abi::PIE_CHANNEL_EXTERN_EXPORT
                             }
                         })
@@ -830,8 +830,9 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
             let channel_reps: Vec<u32> = channels.iter().map(|c| c.rep()).collect();
             let program_registration = crate::driver::ProgramRegistration {
                 program_hash: prog.hash,
-                canonical_bytes: prog.bytes.clone(),
-                sidecar_bytes: prog.sidecar.clone(),
+                launch: prog.launch().clone(),
+                reference_ptir: prog.bytes.clone(),
+                ..Default::default()
             };
             if bind_timing.is_some() {
                 bind_stages[2] = crate::scheduler::fire_timing_now_us();
@@ -928,8 +929,8 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
                 }
             }
             let dense_mask = instance.program.bound.container.ports.iter().any(|p| {
-                matches!(p.port, pie_ptir::registry::Port::AttnMask)
-                    && matches!(p.source, pie_ptir::container::PortSource::Channel(_))
+                matches!(p.port, pie_ir::registry::Port::AttnMask)
+                    && matches!(p.source, pie_ir::container::PortSource::Channel(_))
             });
             let host_shadow = crate::pipeline::fire::shadow::HostShadow::new(
                 &instance.program.bound,
@@ -1103,8 +1104,8 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
 #[cfg(test)]
 mod descriptor_binding_tests {
     use super::*;
-    use pie_ptir::container::PortBinding;
-    use pie_ptir::types::{DType, Shape};
+    use pie_ir::container::PortBinding;
+    use pie_ir::types::{DType, Shape};
 
     fn container(ports: Vec<PortBinding>) -> TraceContainer {
         TraceContainer {

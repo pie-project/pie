@@ -1,0 +1,295 @@
+//! `validate_singleton_plan` and the region ABI predicates it shares with the
+//! fused emitters.
+//!
+//! Three C++ rejections have no counterpart here because the Rust plan types
+//! cannot express the damage: `"invalid symbolic extent role"`
+//! ([`SymbolicExtent`](pie_plan::SymbolicExtent) is a closed enum of exactly
+//! the legal roles), the dtype half of `"invalid normalized value type"`
+//! ([`DType`] likewise), and `"unsupported singleton op <name>"`
+//! ([`Op`](pie_ir::op::Op) only names known tags).
+
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+
+use pie_ir::op::{OP_TABLE, VARIADIC};
+use pie_ir::types::{DType, MAX_RANK};
+use pie_plan::{
+    CompiledStage, Dimension, LibraryOp, PartitionKind, Region, RegionKind, RegionPartition,
+    ScheduleTemplate, SymbolicType,
+};
+
+use super::M1OpMeta;
+use crate::op_view::OpView;
+
+const OP_PIVOT_THRESHOLD: u8 = 0x58;
+const OP_KERNEL_CALL: u8 = 0xA1;
+const OP_SINK_CALL: u8 = 0xA2;
+const OP_CHAN_TAKE: u8 = 0x90;
+const OP_CHAN_READ: u8 = 0x91;
+const OP_CHAN_PUT: u8 = 0x92;
+pub(crate) const OP_TOP_K: u8 = 0x51;
+const OP_SORT_DESC: u8 = 0x50;
+const OP_CUMSUM: u8 = 0x40;
+const OP_CUMPROD: u8 = 0x41;
+const OP_MATMUL: u8 = 0x55;
+
+/// The library kind of a region as the wire encodes it: a `Generated` region
+/// still carries a `library_op` byte, and it is zero. Two C++ guards read that
+/// byte without first testing `region.library`, so the port has to model it.
+pub(crate) fn library_op_byte(region: &Region) -> u8 {
+    match region.kind {
+        RegionKind::Library(op) => op as u8,
+        RegionKind::Generated => 0,
+    }
+}
+
+pub(crate) fn is_library(region: &Region) -> bool {
+    matches!(region.kind, RegionKind::Library(_))
+}
+
+/// `nucleus_library_region_valid` — the 3-input/1-output nucleus ABI.
+pub fn nucleus_library_region_valid(stage: &CompiledStage, region: &Region) -> bool {
+    let value_types = &stage.normalized.value_types;
+    if !is_library(region)
+        || library_op_byte(region) != LibraryOp::NucleusSample as u8
+        || region.schedule != ScheduleTemplate::Library
+        || region.nodes.len() != 13
+        || region.inputs.len() != 3
+        || region.outputs.len() != 1
+        || !region.sinks.is_empty()
+        || region
+            .inputs
+            .iter()
+            .any(|value| *value as usize >= value_types.len())
+        || region.outputs[0] as usize >= value_types.len()
+    {
+        return false;
+    }
+    let logits_type = &value_types[region.inputs[0] as usize];
+    let top_p_type = &value_types[region.inputs[1] as usize];
+    let state_type = &value_types[region.inputs[2] as usize];
+    let output_type = &value_types[region.outputs[0] as usize];
+    if logits_type.dtype != DType::F32 || logits_type.dims.is_empty() || logits_type.dims.len() > 2
+    {
+        return false;
+    }
+    let row_dims = &logits_type.dims[..logits_type.dims.len() - 1];
+    top_p_type.dtype == DType::F32
+        && (top_p_type.dims.is_empty() || top_p_type.dims.len() == row_dims.len())
+        && state_type.dtype == DType::U32
+        && state_type.dims.len() == 1
+        && state_type.dims[0] == Dimension::Static(2)
+        && output_type.dtype == DType::I32
+        && output_type.dims == row_dims
+}
+
+/// `library_region_valid` — a generated region is always fine; a library
+/// region must claim the op it actually wraps.
+pub fn library_region_valid(stage: &CompiledStage, region: &Region) -> bool {
+    if !is_library(region) {
+        return true;
+    }
+    if library_op_byte(region) == LibraryOp::NucleusSample as u8 {
+        return nucleus_library_region_valid(stage, region);
+    }
+    let ops = &stage.normalized.ops;
+    if region.nodes.len() != 1 || region.nodes[0] as usize >= ops.len() {
+        return false;
+    }
+    let tag = ops[region.nodes[0] as usize].tag();
+    match region.kind {
+        RegionKind::Library(LibraryOp::TopK) => tag == OP_TOP_K,
+        RegionKind::Library(LibraryOp::Sort) => tag == OP_SORT_DESC,
+        RegionKind::Library(LibraryOp::Scan) => tag == OP_CUMSUM || tag == OP_CUMPROD,
+        RegionKind::Library(LibraryOp::MatMul) => tag == OP_MATMUL,
+        RegionKind::Library(LibraryOp::SecondParty) => tag == OP_KERNEL_CALL || tag == OP_SINK_CALL,
+        _ => false,
+    }
+}
+
+/// `used_channel_slots` — one past the highest channel slot any op touches.
+pub fn used_channel_slots(ops: &[OpView]) -> usize {
+    let mut count = 0usize;
+    for op in ops {
+        if op.chan >= 0 {
+            count = count.max(op.chan as usize + 1);
+        }
+    }
+    count
+}
+
+fn value_type_valid(value_type: &SymbolicType) -> Result<(), String> {
+    if value_type.dims.len() > MAX_RANK {
+        return Err("invalid normalized value type".to_string());
+    }
+    let mut product: u64 = 1;
+    for dimension in &value_type.dims {
+        let Dimension::Static(extent) = *dimension else {
+            continue;
+        };
+        if extent == 0 || product > u64::from(u32::MAX) / u64::from(extent) {
+            return Err("normalized value shape product exceeds u32".to_string());
+        }
+        product *= u64::from(extent);
+    }
+    Ok(())
+}
+
+fn partition_valid(stage: &CompiledStage, partition: &RegionPartition) -> Result<(), String> {
+    let ops = &stage.normalized.ops;
+    let value_types = &stage.normalized.value_types;
+    let channel_bindings = &stage.normalized.channel_bindings;
+    for region in &partition.regions {
+        if region.nodes.iter().any(|node| *node as usize >= ops.len()) {
+            return Err("region node out of range".to_string());
+        }
+        if region.nodes.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err("region node indices are not strictly ordered".to_string());
+        }
+        if region
+            .inputs
+            .iter()
+            .any(|value| *value as usize >= value_types.len())
+        {
+            return Err("region input out of range".to_string());
+        }
+        if region
+            .outputs
+            .iter()
+            .any(|value| *value as usize >= value_types.len())
+        {
+            return Err("region output out of range".to_string());
+        }
+        for sink in &region.sinks {
+            if sink.channel_slot as usize >= channel_bindings.len()
+                || sink.value as usize >= value_types.len()
+            {
+                return Err("region sink out of range".to_string());
+            }
+        }
+        if !library_region_valid(stage, region) {
+            return Err("library region ABI is invalid".to_string());
+        }
+    }
+    Ok(())
+}
+
+/// `validate_singleton_plan` — accept a stage for the one-op-per-dispatch
+/// tier, returning the per-op metadata the driver dispatches from.
+pub fn validate_singleton_plan(stage: &CompiledStage) -> Result<Vec<M1OpMeta>, String> {
+    let (operations, result) = validate_singleton_plan_partial(stage);
+    result.map(|()| operations)
+}
+
+/// [`validate_singleton_plan`], but also handing back the ops accepted before
+/// the rejection point.
+///
+/// The C++ fills its `std::vector<M1OpMeta>&` out-parameter as it walks the
+/// stage and leaves the partial contents behind when it returns `false`. No
+/// caller looks at them, but the conformance dump records them because they
+/// pin *where* validation gave up, not just that it did.
+pub fn validate_singleton_plan_partial(
+    stage: &CompiledStage,
+) -> (Vec<M1OpMeta>, Result<(), String>) {
+    let mut operations = Vec::new();
+    let result = validate_into(stage, &mut operations);
+    (operations, result)
+}
+
+fn validate_into(stage: &CompiledStage, operations: &mut Vec<M1OpMeta>) -> Result<(), String> {
+    let normalized = &stage.normalized;
+    let value_types = &normalized.value_types;
+    let names = &normalized.names;
+    let channel_bindings = &normalized.channel_bindings;
+
+    if stage.signature.hash == 0
+        || pie_ir::program_hash(&stage.signature.canonical_bytes) != stage.signature.hash
+        || stage.singleton.kind != PartitionKind::Singleton
+    {
+        return Err("invalid singleton plan identity".to_string());
+    }
+    for value_type in value_types {
+        value_type_valid(value_type)?;
+    }
+    partition_valid(stage, &stage.singleton)?;
+    partition_valid(stage, &stage.fused)?;
+
+    let ops = OpView::of_all(&normalized.ops);
+    if stage.singleton.regions.len() != ops.len() {
+        return Err("singleton partition must contain one region per normalized op".to_string());
+    }
+    operations.reserve(ops.len());
+    let mut result_base: u32 = 0;
+    for (node, op) in ops.iter().enumerate() {
+        let region = &stage.singleton.regions[node];
+        if region.nodes.len() != 1 || region.nodes[0] as usize != node {
+            return Err("singleton region/node ordering mismatch".to_string());
+        }
+        // The C++ rejects an unknown tag here; `Op` has none.
+        let spec = OP_TABLE
+            .iter()
+            .find(|spec| spec.tag == op.tag)
+            .expect("every Op tag is in OP_TABLE");
+        if op.tag == OP_KERNEL_CALL {
+            // The C++ indexes `value_types[args[0]]` before it has checked
+            // `args[0] < result_base`; the `get` below is that read made safe.
+            let identity = names
+                .get(op.name_idx as usize)
+                .is_some_and(|name| name == "metal.identity")
+                && op.args.len() == 1
+                && (result_base as usize) < value_types.len()
+                && value_types
+                    .get(op.args[0] as usize)
+                    .is_some_and(|argument| *argument == value_types[result_base as usize]);
+            if !identity {
+                return Err("unsupported Metal semantic kernel boundary".to_string());
+            }
+        } else if op.tag == OP_SINK_CALL
+            && names.get(op.name_idx as usize).map(String::as_str) != Some("metal.discard")
+        {
+            return Err("unsupported Metal semantic sink boundary".to_string());
+        }
+        let expected_arity = if op.tag == OP_PIVOT_THRESHOLD {
+            1
+        } else {
+            spec.val_operands
+        };
+        if expected_arity != VARIADIC && op.args.len() != expected_arity as usize {
+            return Err("normalized op arity mismatch".to_string());
+        }
+        if op.results != u32::from(spec.results)
+            || result_base > u32::MAX - op.results
+            || (result_base + op.results) as usize > value_types.len()
+        {
+            return Err("normalized op result range is invalid".to_string());
+        }
+        if op.args.iter().any(|argument| *argument >= result_base) {
+            return Err("normalized SSA operand is not a prior value".to_string());
+        }
+        if op.tag == OP_PIVOT_THRESHOLD && (op.pred_tag > 2 || op.pred_payload >= result_base) {
+            return Err("pivot predicate payload is out of range".to_string());
+        }
+        let channel_op = op.tag == OP_CHAN_TAKE || op.tag == OP_CHAN_READ || op.tag == OP_CHAN_PUT;
+        if (channel_op && (op.chan < 0 || op.chan as usize >= channel_bindings.len()))
+            || (!channel_op && op.chan >= 0)
+        {
+            return Err("normalized channel slot is invalid".to_string());
+        }
+        operations.push(M1OpMeta {
+            node: node as u32,
+            result_base,
+            op: op.clone(),
+        });
+        result_base += op.results;
+    }
+    if stage.singleton.whole_stage_fallback {
+        return Err(
+            "singleton plan requests whole-stage fallback without an identifiable unsupported op"
+                .to_string(),
+        );
+    }
+    if result_base as usize != value_types.len() {
+        return Err("normalized value layout does not match op results".to_string());
+    }
+    Ok(())
+}

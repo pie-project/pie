@@ -262,12 +262,12 @@ Runner& get_runner() {
     return *s.runner;
 }
 
-ck::ActivationType to_cutlass_activation(MoeActivation activation) {
-    switch (activation) {
+ck::ActivationType to_cutlass_activation(MoeActivation a) {
+    switch (a) {
         case MoeActivation::Swiglu: return ck::ActivationType::Swiglu;
-        case MoeActivation::Relu2: break;
+        case MoeActivation::Relu2:
+        default:                    return ck::ActivationType::Relu2;
     }
-    return ck::ActivationType::Relu2;
 }
 
 ck::MOEParallelismConfig parallelism_config(int tp_size, int tp_rank) {
@@ -277,8 +277,13 @@ ck::MOEParallelismConfig parallelism_config(int tp_size, int tp_rank) {
 }  // namespace
 
 bool flashinfer_cutlass_moe_enabled() {
-    static const bool enabled =
-        env_truthy(std::getenv("PIE_NEMOTRON_FLASHINFER_MOE"));
+    // Two consumers, each with its own switch: nemotron_h (Relu2) and the
+    // qwen3_5 MoE decode (Swiglu). Either one turns the runner on.
+    static const bool enabled = [] {
+        if (env_truthy(std::getenv("PIE_NEMOTRON_FLASHINFER_MOE"))) return true;
+        const char* q = std::getenv("PIE_QWEN35_MOE_FLASHINFER");
+        return q == nullptr || q[0] == '\0' || q[0] != '0';
+    }();
     return enabled;
 }
 

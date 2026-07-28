@@ -182,22 +182,25 @@ impl DevGeo {
 ///
 /// Returns the lane count (`EmbedTokens` extent).
 pub fn detect_pooled_device_geometry(
-    container: &pie_ptir::container::TraceContainer,
+    container: &pie_ir::container::TraceContainer,
 ) -> Option<usize> {
-    use pie_ptir::container::{ChanDType, PortSource};
-    use pie_ptir::registry::Port;
-    use pie_ptir::types::DType;
+    use pie_ir::container::{ChanDType, PortSource};
+    use pie_ir::registry::Port;
+    use pie_ir::types::DType;
 
     let channel_of = |port: Port| {
-        container.ports.iter().find_map(|binding| match &binding.source {
-            PortSource::Channel(channel) if binding.port == port => Some(*channel as usize),
-            _ => None,
-        })
+        container
+            .ports
+            .iter()
+            .find_map(|binding| match &binding.source {
+                PortSource::Channel(channel) if binding.port == port => Some(*channel as usize),
+                _ => None,
+            })
     };
     let republished = |channel: usize| {
         container.stages.iter().any(|stage| {
             stage.ops.iter().any(|op| {
-                matches!(op, pie_ptir::op::Op::ChanPut { chan, .. } if *chan as usize == channel)
+                matches!(op, pie_ir::op::Op::ChanPut { chan, .. } if *chan as usize == channel)
             })
         })
     };
@@ -250,12 +253,12 @@ pub fn detect_pooled_device_geometry(
 /// host-writer channel is `fresh`; the host-reader `[B]` bool channel is
 /// `w_cont` (the reclaim signal). `None` for an ordinary decode.
 pub fn detect_device_geometry(
-    container: &pie_ptir::container::TraceContainer,
+    container: &pie_ir::container::TraceContainer,
 ) -> Option<(usize, usize, usize)> {
-    use pie_ptir::container::HostRole;
-    use pie_ptir::container::{ChanDType, PortSource};
-    use pie_ptir::registry::Port;
-    use pie_ptir::types::DType;
+    use pie_ir::container::HostRole;
+    use pie_ir::container::{ChanDType, PortSource};
+    use pie_ir::registry::Port;
+    use pie_ir::types::DType;
 
     let has_write_desc = container
         .ports
@@ -363,10 +366,10 @@ mod tests {
         assert_eq!(lease.in_flight(), 0);
     }
 
-    use pie_ptir::container::{ChanDType, ChannelDecl, HostRole, PortBinding, PortSource};
-    use pie_ptir::container::{StageProgram, TraceContainer};
-    use pie_ptir::registry::{Port, Stage};
-    use pie_ptir::types::{DType, Shape};
+    use pie_ir::container::{ChanDType, ChannelDecl, HostRole, PortBinding, PortSource};
+    use pie_ir::container::{StageProgram, TraceContainer};
+    use pie_ir::registry::{Port, Stage};
+    use pie_ir::types::{DType, Shape};
 
     fn ch(shape: Shape, dtype: DType, role: HostRole) -> ChannelDecl {
         ChannelDecl {
@@ -461,12 +464,12 @@ mod tests {
 #[cfg(test)]
 mod pooled_tests {
     use super::detect_pooled_device_geometry;
-    use pie_ptir::container::{
+    use pie_ir::container::{
         ChanDType, ChannelDecl, HostRole, PortBinding, PortSource, StageProgram, TraceContainer,
     };
-    use pie_ptir::op::Op;
-    use pie_ptir::registry::{Port, Stage};
-    use pie_ptir::types::{DType, Shape};
+    use pie_ir::op::Op;
+    use pie_ir::registry::{Port, Stage};
+    use pie_ir::types::{DType, Shape};
 
     fn chan(shape: Shape, dtype: DType) -> ChannelDecl {
         ChannelDecl {
@@ -519,8 +522,14 @@ mod pooled_tests {
 
     #[test]
     fn masked_loop_carried_decode_is_pooled_device_geometry() {
-        assert_eq!(detect_pooled_device_geometry(&masked_decode(1, 128)), Some(1));
-        assert_eq!(detect_pooled_device_geometry(&masked_decode(2, 128)), Some(2));
+        assert_eq!(
+            detect_pooled_device_geometry(&masked_decode(1, 128)),
+            Some(1)
+        );
+        assert_eq!(
+            detect_pooled_device_geometry(&masked_decode(2, 128)),
+            Some(2)
+        );
     }
 
     #[test]

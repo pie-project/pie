@@ -37,10 +37,17 @@ members = [
     "interface/controller",
     "interface/worker",
     "interface/client",
-    # PTIR — the Pie Tensor IR: the cross-language seam for programmable dataflow
-    # (stage-tagged trace container + validation + versioned wire format).
-    # `no_std` core; the wasm SDK depends on it with `default-features = false`.
-    "interface/ptir",
+    # The tensor-program toolchain: authoring eDSL -> PTIR -> planning ->
+    # CUDA/Metal codegen, plus the reference interpreter every backend diffs
+    # against. See `compiler/README.md`. `compiler/dsl` targets wasm inside an
+    # inferlet but has no wasm-only dependencies, so unlike `sdk/rust/*` it can
+    # be a member — which is what puts its tests in the CI battery.
+    "compiler/ir",
+    "compiler/plan",
+    "compiler/eval",
+    "compiler/codegen",
+    "compiler/dsl",
+    "compiler/tests",
     "driver/dummy",
     # Weight loader: checkpoints -> verified device-memory layouts. Consumed by
     # drivers at cold start, not by the serving runtime (see loader/architecture.md).

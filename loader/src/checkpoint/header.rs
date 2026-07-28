@@ -30,7 +30,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::checkpoint::{CheckpointFile, CheckpointMetadata, RawTensor};
-use crate::error::CompileError;
+use crate::error::{Error, OrOverflow};
 use crate::types::{CheckpointFormat, DType, Encoding, FileId, TensorId, tensor_nbytes};
 
 /// Width of the safetensors little-endian header-length prefix.
@@ -55,7 +55,7 @@ pub struct SafetensorsEntry {
 /// MXFP4 storage tags (`F4_E2M1` blocks, `F8_E8M0` scales) map onto `U8` — the
 /// scheme is recognised later by *name* in the storage compiler. `F64` has no
 /// device representation here and is rejected; `I64`/`U64` pass through.
-pub fn dtype_from_safetensors(s: &str) -> Result<DType, CompileError> {
+pub fn dtype_from_safetensors(s: &str) -> Result<DType, Error> {
     Ok(match s {
         "F32" => DType::F32,
         "F16" => DType::F16,
@@ -73,6 +73,13 @@ pub fn dtype_from_safetensors(s: &str) -> Result<DType, CompileError> {
         // + `*_scales` (`F8_E8M0`) tensor pairs recognised by schema/name in
         // the storage compiler. Real gpt-oss checkpoints already declare these
         // as `U8`; the packed tags are accepted for C++ parity.
+        //
+        // `F8_E8M0` deliberately does NOT map to `DType::E8M0`, even though
+        // that dtype now exists: the same tag names MXFP4's scales, which the
+        // repack path reads as bytes. A contract that wants the exponent
+        // decoded says so with `Bitcast(.., E8M0)` -- naming the reading is
+        // that node's whole job, and it leaves the file's tag meaning what
+        // gpt-oss means by it.
         "F4_E2M1" | "F8_E8M0" => DType::U8,
         // Integer index tables ride through untouched: DeepSeek-V4's hash
         // router ships `ffn.gate.tid2eid` as `[vocab, K]` I64 and the kernel
@@ -83,12 +90,12 @@ pub fn dtype_from_safetensors(s: &str) -> Result<DType, CompileError> {
         // No 64-bit float runtime dtype or executor contract. Reject
         // explicitly rather than narrowing checkpoint metadata.
         "F64" => {
-            return Err(CompileError::InvalidInput(format!(
+            return Err(Error::Checkpoint(format!(
                 "safetensors 64-bit dtype {s} is unsupported by the header parser"
             )));
         }
         other => {
-            return Err(CompileError::InvalidInput(format!(
+            return Err(Error::Checkpoint(format!(
                 "unsupported safetensors dtype {other}"
             )));
         }
@@ -108,11 +115,9 @@ fn is_subbyte_packed(s: &str) -> bool {
 /// header size and the parsed tensor entries. `prefix` must contain at least
 /// the leading 8-byte length plus the whole JSON header; any trailing bulk
 /// bytes are ignored.
-pub fn parse_safetensors_index(
-    prefix: &[u8],
-) -> Result<(u64, Vec<SafetensorsEntry>), CompileError> {
+pub fn parse_safetensors_index(prefix: &[u8]) -> Result<(u64, Vec<SafetensorsEntry>), Error> {
     if prefix.len() < SAFETENSORS_LEN_PREFIX {
-        return Err(CompileError::InvalidInput(format!(
+        return Err(Error::Checkpoint(format!(
             "safetensors prefix is {} bytes, need at least {} for the length header",
             prefix.len(),
             SAFETENSORS_LEN_PREFIX
@@ -120,25 +125,23 @@ pub fn parse_safetensors_index(
     }
     let header_size = u64::from_le_bytes(prefix[..SAFETENSORS_LEN_PREFIX].try_into().unwrap());
     let json_end = SAFETENSORS_LEN_PREFIX
-        .checked_add(usize::try_from(header_size).map_err(|_| {
-            CompileError::InvalidInput(format!("safetensors header size {header_size} too large"))
-        })?)
-        .ok_or_else(|| {
-            CompileError::InvalidInput("safetensors header size overflows usize".to_string())
-        })?;
+        .checked_add(
+            usize::try_from(header_size)
+                .or_overflow(format!("safetensors header size {header_size} too large"))?,
+        )
+        .or_overflow("safetensors header size overflows usize")?;
     if prefix.len() < json_end {
-        return Err(CompileError::InvalidInput(format!(
+        return Err(Error::Checkpoint(format!(
             "safetensors header truncated: need {json_end} bytes, have {}",
             prefix.len()
         )));
     }
     let json_bytes = &prefix[SAFETENSORS_LEN_PREFIX..json_end];
-    let value: serde_json::Value = serde_json::from_slice(json_bytes).map_err(|err| {
-        CompileError::InvalidInput(format!("safetensors header is not valid JSON: {err}"))
-    })?;
-    let object = value.as_object().ok_or_else(|| {
-        CompileError::InvalidInput("safetensors header JSON is not an object".to_string())
-    })?;
+    let value: serde_json::Value = serde_json::from_slice(json_bytes)
+        .map_err(|err| Error::Checkpoint(format!("safetensors header is not valid JSON: {err}")))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| Error::Checkpoint("safetensors header JSON is not an object".to_string()))?;
 
     let mut entries = Vec::with_capacity(object.len());
     for (name, spec) in object {
@@ -148,25 +151,25 @@ pub fn parse_safetensors_index(
             continue;
         }
         let spec = spec.as_object().ok_or_else(|| {
-            CompileError::InvalidInput(format!("safetensors entry {name} is not an object"))
+            Error::Checkpoint(format!("safetensors entry {name} is not an object"))
         })?;
         let dtype = spec
             .get("dtype")
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| {
-                CompileError::InvalidInput(format!("safetensors entry {name} lacks a string dtype"))
+                Error::Checkpoint(format!("safetensors entry {name} lacks a string dtype"))
             })?
             .to_string();
         let shape = spec
             .get("shape")
             .and_then(serde_json::Value::as_array)
             .ok_or_else(|| {
-                CompileError::InvalidInput(format!("safetensors entry {name} lacks a shape array"))
+                Error::Checkpoint(format!("safetensors entry {name} lacks a shape array"))
             })?
             .iter()
             .map(|dim| {
                 dim.as_i64().filter(|d| *d >= 0).ok_or_else(|| {
-                    CompileError::InvalidInput(format!(
+                    Error::Checkpoint(format!(
                         "safetensors entry {name} has a non-negative-integer shape dim"
                     ))
                 })
@@ -176,23 +179,23 @@ pub fn parse_safetensors_index(
             .get("data_offsets")
             .and_then(serde_json::Value::as_array)
             .ok_or_else(|| {
-                CompileError::InvalidInput(format!(
+                Error::Checkpoint(format!(
                     "safetensors entry {name} lacks a data_offsets array"
                 ))
             })?;
         if offsets.len() != 2 {
-            return Err(CompileError::InvalidInput(format!(
+            return Err(Error::Checkpoint(format!(
                 "safetensors entry {name} data_offsets must have exactly 2 elements"
             )));
         }
         let begin = offsets[0].as_u64().ok_or_else(|| {
-            CompileError::InvalidInput(format!("safetensors entry {name} has a bad begin offset"))
+            Error::Checkpoint(format!("safetensors entry {name} has a bad begin offset"))
         })?;
         let end = offsets[1].as_u64().ok_or_else(|| {
-            CompileError::InvalidInput(format!("safetensors entry {name} has a bad end offset"))
+            Error::Checkpoint(format!("safetensors entry {name} has a bad end offset"))
         })?;
         if end < begin {
-            return Err(CompileError::InvalidInput(format!(
+            return Err(Error::Checkpoint(format!(
                 "safetensors entry {name} has end offset {end} < begin offset {begin}"
             )));
         }
@@ -219,7 +222,7 @@ pub fn tensors_from_safetensors_entries(
     file_id: FileId,
     data_section_offset: u64,
     id_base: u32,
-) -> Result<Vec<RawTensor>, CompileError> {
+) -> Result<Vec<RawTensor>, Error> {
     let mut out = Vec::with_capacity(entries.len());
     for (index, entry) in entries.iter().enumerate() {
         let dtype = dtype_from_safetensors(&entry.dtype)?;
@@ -228,14 +231,12 @@ pub fn tensors_from_safetensors_entries(
         // `shape`, so `shape × dtype.bytes()` overstates the storage span; trust
         // the safetensors `data_offsets` span, matching the C++ loader.
         if !is_subbyte_packed(&entry.dtype) {
-            let expected = tensor_nbytes(&entry.shape, dtype.bytes()).ok_or_else(|| {
-                CompileError::InvalidInput(format!(
-                    "safetensors tensor {} has a shape whose byte size overflows",
-                    entry.name
-                ))
-            })?;
+            let expected = tensor_nbytes(&entry.shape, dtype.bytes()).or_overflow(format!(
+                "safetensors tensor {} has a shape whose byte size overflows",
+                entry.name
+            ))?;
             if expected != span_bytes {
-                return Err(CompileError::InvalidInput(format!(
+                return Err(Error::Checkpoint(format!(
                     "safetensors tensor {} byte-size mismatch: data_offsets span {span_bytes}, expected {expected} for shape {:?} × {:?}",
                     entry.name, entry.shape, dtype
                 )));
@@ -243,15 +244,13 @@ pub fn tensors_from_safetensors_entries(
         }
         let file_offset = data_section_offset
             .checked_add(entry.begin)
-            .ok_or_else(|| {
-                CompileError::InvalidInput(format!(
-                    "safetensors tensor {} file offset overflows",
-                    entry.name
-                ))
-            })?;
-        let id = id_base.checked_add(index as u32).ok_or_else(|| {
-            CompileError::InvalidInput("safetensors tensor id space overflows u32".to_string())
-        })?;
+            .or_overflow(format!(
+                "safetensors tensor {} file offset overflows",
+                entry.name
+            ))?;
+        let id = id_base
+            .checked_add(index as u32)
+            .or_overflow("safetensors tensor id space overflows u32")?;
         out.push(RawTensor {
             id: TensorId(id),
             name: entry.name.clone(),
@@ -267,29 +266,26 @@ pub fn tensors_from_safetensors_entries(
 
 /// Read only the safetensors framing (8-byte length + JSON header) from a file
 /// on disk. The bulk tensor bytes are never read.
-pub fn read_safetensors_header_prefix(path: &Path) -> Result<Vec<u8>, CompileError> {
-    let mut file = File::open(path).map_err(|err| {
-        CompileError::InvalidInput(format!("cannot open {}: {err}", path.display()))
-    })?;
+pub fn read_safetensors_header_prefix(path: &Path) -> Result<Vec<u8>, Error> {
+    let mut file = File::open(path)
+        .map_err(|err| Error::Checkpoint(format!("cannot open {}: {err}", path.display())))?;
     let mut len_buf = [0u8; SAFETENSORS_LEN_PREFIX];
     file.read_exact(&mut len_buf).map_err(|err| {
-        CompileError::InvalidInput(format!(
+        Error::Checkpoint(format!(
             "cannot read safetensors length header from {}: {err}",
             path.display()
         ))
     })?;
     let header_size = u64::from_le_bytes(len_buf);
-    let header_size_usize = usize::try_from(header_size).map_err(|_| {
-        CompileError::InvalidInput(format!(
-            "safetensors header size {header_size} too large in {}",
-            path.display()
-        ))
-    })?;
+    let header_size_usize = usize::try_from(header_size).or_overflow(format!(
+        "safetensors header size {header_size} too large in {}",
+        path.display()
+    ))?;
     let mut prefix = len_buf.to_vec();
     prefix.resize(SAFETENSORS_LEN_PREFIX + header_size_usize, 0);
     file.read_exact(&mut prefix[SAFETENSORS_LEN_PREFIX..])
         .map_err(|err| {
-            CompileError::InvalidInput(format!(
+            Error::Checkpoint(format!(
                 "cannot read safetensors JSON header from {}: {err}",
                 path.display()
             ))
@@ -308,7 +304,7 @@ pub fn read_safetensors_header_prefix(path: &Path) -> Result<Vec<u8>, CompileErr
 /// load-bearing: the driver's executor indexes its `source_tensor_names` list
 /// by the plan's `tensor_id`, so a per-shard ordering would mis-resolve
 /// strided source reads on multi-shard checkpoints.
-pub fn parse_safetensors_checkpoint(files: &[PathBuf]) -> Result<CheckpointMetadata, CompileError> {
+pub fn parse_safetensors_checkpoint(files: &[PathBuf]) -> Result<CheckpointMetadata, Error> {
     let mut checkpoint_files = Vec::with_capacity(files.len());
     let mut tensors = Vec::new();
     for (index, path) in files.iter().enumerate() {
@@ -334,9 +330,8 @@ pub fn parse_safetensors_checkpoint(files: &[PathBuf]) -> Result<CheckpointMetad
     // driver's C++ `source_tensor_names` ordering across all shards.
     tensors.sort_by(|a, b| a.name.cmp(&b.name));
     for (index, tensor) in tensors.iter_mut().enumerate() {
-        tensor.id = TensorId(u32::try_from(index).map_err(|_| {
-            CompileError::InvalidInput("checkpoint tensor id space overflows u32".to_string())
-        })?);
+        tensor.id =
+            TensorId(u32::try_from(index).or_overflow("checkpoint tensor id space overflows u32")?);
     }
     Ok(CheckpointMetadata {
         files: checkpoint_files,

@@ -13,6 +13,7 @@
 pub mod abi;
 pub mod backend;
 pub mod channel;
+pub mod launch_abi;
 pub mod command;
 pub mod completion;
 pub mod instance;

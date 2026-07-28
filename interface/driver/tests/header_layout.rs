@@ -1,22 +1,51 @@
+//! The **layout contract** — one hand-maintained list, two derived artifacts.
+//!
+//! `interface/driver/include/pie_driver_abi.h` is generated from `local.rs` by
+//! cbindgen, so it cannot drift. The contract that pins the *layout* used to be
+//! hand-written twice — here and in `tests/support/layout_contract.inc` — and
+//! the two halves once went stale together: they agreed with each other and
+//! disagreed with reality.
+//!
+//! Now the `.inc` is generated from this file. The field list below is the
+//! single hand-maintained copy; [`rust_layout_matches_committed_header_contract`]
+//! regenerates the `.inc` from Rust's own `size_of`/`align_of`/`offset_of!` and
+//! fails if the committed copy differs, and
+//! [`c11_and_cpp20_layout_sources_compile`] then makes a C and a C++ compiler
+//! check the header against it. Adding a struct or a field to `local.rs`
+//! without listing it here is the one remaining gap, and it is a gap in
+//! coverage rather than a silent disagreement.
+//!
+//! Run with `PIE_REGEN=1` to bless a deliberate layout change.
+
+use std::fmt::Write as _;
 use std::mem::{align_of, offset_of, size_of};
 use std::path::PathBuf;
 use std::process::Command;
 
 use pie_driver_abi::local::*;
 
-macro_rules! assert_layout {
-    ($ty:ty, $size:expr, $align:expr $(, $field:ident => $offset:expr )* $(,)?) => {{
-        assert_eq!(size_of::<$ty>(), $size, "sizeof({})", stringify!($ty));
-        assert_eq!(align_of::<$ty>(), $align, "alignof({})", stringify!($ty));
+/// Emits one type's `PIE_LAYOUT` / `PIE_FIELD` lines from Rust's own layout.
+macro_rules! contract {
+    ($out:expr, $ty:ty $(, $field:ident )* $(,)?) => {{
+        writeln!(
+            $out,
+            "PIE_LAYOUT({}, {}, {})",
+            stringify!($ty),
+            size_of::<$ty>(),
+            align_of::<$ty>()
+        )
+        .unwrap();
         $(
-            assert_eq!(
-                offset_of!($ty, $field),
-                $offset,
-                "offsetof({}, {})",
+            writeln!(
+                $out,
+                "PIE_FIELD({}, {}, {})",
                 stringify!($ty),
-                stringify!($field)
-            );
+                stringify!($field),
+                offset_of!($ty, $field)
+            )
+            .unwrap();
         )*
+        writeln!($out).unwrap();
     }};
 }
 
@@ -24,277 +53,93 @@ fn manifest_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
+fn contract_source() -> String {
+    let mut out = String::new();
+    contract!(out, PieBytes, ptr, len);
+    contract!(out, PieMutBytes, ptr, len);
+    contract!(out, PieU8Slice, ptr, len);
+    contract!(out, PieU32Slice, ptr, len);
+    contract!(out, PieU32MutSlice, ptr, len);
+    contract!(out, PieU64Slice, ptr, len);
+    contract!(out, PieTerminalCell, outcome, reserved0);
+    contract!(out, PieTerminalCellPtrSlice, ptr, len);
+    contract!(out, PieChannelDesc, abi_version, reserved0, channel_id, shape, dtype, host_role, seeded, extern_dir, capacity, reserved1, reader_wait_id, writer_wait_id, extern_name);
+    contract!(out, PieChannelEndpointBinding, channel_id, mirror_base, word_base, mirror_bytes, word_bytes, cell_bytes, capacity, head_word_index, tail_word_index, poison_word_index, closed_word_index);
+    contract!(out, PieChannelValueDesc, channel_id, bytes);
+    contract!(out, PieChannelValueDescSlice, ptr, len);
+    contract!(out, PieMaskWordsDesc, request_indptr, word_indptr, words);
+    contract!(out, PieKvMoveCell, dst_page_id, dst_token_offset, src_page_id, src_token_offset);
+    contract!(out, PieKvMoveCellSlice, ptr, len);
+    contract!(out, PieStateCopyRange, src_slot_id, dst_slot_id, src_token_offset, dst_token_offset, token_count);
+    contract!(out, PieStateCopyRangeSlice, ptr, len);
+    contract!(out, PiePoolRange, page_index, page_count);
+    contract!(out, PiePoolRangeSlice, ptr, len);
+    contract!(out, PieRuntimeCallbacks, abi_version, reserved0, ctx, notify);
+    contract!(out, PieCompletion, wait_id, target_epoch, terminal_cell);
+    contract!(out, PieDriverCreateDesc, abi_version, reserved0, config_bytes, runtime);
+    contract!(out, PieDriverCaps, json_bytes, json_len);
+    contract!(out, PieModelLoadDesc, abi_version, component, mxfp4_moe, runtime_quant, snapshot_dir);
+    contract!(out, PieEmittedKernel, kind, stage_index, region_index, reserved0, entry_name, source, error);
+    contract!(out, PieEmittedKernelSlice, ptr, len);
+    contract!(out, PieDirectArgmax, node, source_value, intrinsic, requires_single_row, reserved0);
+    contract!(out, PieDirectArgmaxSlice, ptr, len);
+    contract!(out, PieRegionAnalysis, stage_index, region_index, flags, reserved0, direct_argmax, skipped);
+    contract!(out, PieRegionAnalysisSlice, ptr, len);
+    contract!(out, PieProgramDesc, abi_version, reserved0, program_hash, emitter_version, reserved1, emitted_kernels, region_analysis, launch);
+    contract!(out, PieInstanceDesc, abi_version, reserved0, geometry_class, reserved1, program_id, requested_instance_id, pacing_wait_id, channel_ids, seed_values);
+    contract!(out, PieInstanceBinding, instance_id, geometry_class, reserved0);
+    contract!(out, PieStepDesc, roster_rows, sub_batch_indptr, sub_batch_class, terminal_cells, token_ids, position_ids, kv_page_indices, kv_page_indptr, kv_last_page_lens, qo_indptr, rs_slot_ids, rs_slot_flags, rs_fold_lens, rs_buffer_slot_ids, rs_buffer_slot_indptr, masks, sampling_indices, sampling_indptr, context_ids, single_token_mode, has_user_mask, reserved_flags, reserved0, image_indptr, image_grids, image_anchor_positions, image_pixels, image_pixel_indptr, image_mrope_positions, image_mrope_indptr, image_patch_positions, image_anchor_rows, audio_features, audio_feature_indptr, audio_anchor_rows, audio_indptr, embed_rows, embed_indptr, embed_shapes, embed_dtypes, embed_anchor_rows, embed_block_indptr, kv_len, kv_len_device, ptir_program_row_indptr, ptir_kv_write_lower_bounds, ptir_kv_write_upper_bounds, logical_fire_ids, channel_expected_head, channel_expected_tail, channel_ticket_indptr);
+    contract!(out, PieStepDescSlice, ptr, len);
+    contract!(out, PieFrameDesc, abi_version, reserved0, instance_ids, kv_translation, kv_translation_indptr, required_kv_pages, reserved1, steps);
+    contract!(out, PieEncodeDesc, abi_version, reserved0, image_grids, image_pixels, image_pixel_indptr, image_patch_positions, image_anchor_rows, audio_features, audio_feature_indptr, audio_anchor_rows, output_rows, output_row_indptr);
+    contract!(out, PieKvCopyDesc, abi_version, src_domain, src_device_ordinal, dst_domain, dst_device_ordinal, reserved0, src_page_ids, dst_page_ids, cells);
+    contract!(out, PieStateCopyDesc, abi_version, reserved0, slot_ranges);
+    contract!(out, PiePoolResizeDesc, abi_version, reserved0, pool_id, target_pages, map_ranges, unmap_ranges);
+    contract!(out, PieLaunchValue, id, source, dtype, intrinsic, reserved1, channel, literal_bits, reserved0, shape);
+    contract!(out, PieLaunchValueSlice, ptr, len);
+    contract!(out, PieLaunchOp, code, result_count, result_id, intrinsic, lit_dtype, dtype, pred_tag, rng_kind, reserved0, lit_bits, pred_payload, channel, name_index, imm, imm2, imm3, reserved1, args, shape);
+    contract!(out, PieLaunchOpSlice, ptr, len);
+    contract!(out, PieLaunchChannel, id, capacity, dtype, flags, extern_dir, readiness, reserved1, shape, extern_name);
+    contract!(out, PieLaunchChannelSlice, ptr, len);
+    contract!(out, PieLaunchPort, port, is_const, const_dtype, reserved0, channel, const_shape, const_data);
+    contract!(out, PieLaunchPortSlice, ptr, len);
+    contract!(out, PieLaunchPut, channel, value);
+    contract!(out, PieLaunchPutSlice, ptr, len);
+    contract!(out, PieLaunchRegion, kind, library, schedule, reserved0, reserved1, nodes, inputs, outputs, sinks);
+    contract!(out, PieLaunchRegionSlice, ptr, len);
+    contract!(out, PieLaunchPlanValue, dtype, reserved0, reserved1, extents, dims);
+    contract!(out, PieLaunchPlanValueSlice, ptr, len);
+    contract!(out, PieLaunchChannelRule, value, local);
+    contract!(out, PieLaunchChannelRuleSlice, ptr, len);
+    contract!(out, PieLaunchStagePlan, signature_hash, identity, flags, mtp_rows, ops, source_ops, source_op_counts, value_types, channel_bindings, names, singleton, fused, used_extents, channel_rules, error);
+    contract!(out, PieLaunchStagePlanSlice, ptr, len);
+    contract!(out, PieLaunchStage, kind, reserved0, reserved1, reserved2, ops, puts, takes, reads);
+    contract!(out, PieLaunchStageSlice, ptr, len);
+    contract!(out, PieBytesSlice, ptr, len);
+    contract!(out, PieLaunchPackage, values, channels, ports, names, stages, plans);
+    out
+}
+
+fn contract_path() -> PathBuf {
+    manifest_dir()
+        .join("tests")
+        .join("support")
+        .join("layout_contract.inc")
+}
+
 #[test]
 fn rust_layout_matches_committed_header_contract() {
-    assert_layout!(PieBytes, 16, 8, ptr => 0, len => 8);
-    assert_layout!(PieMutBytes, 16, 8, ptr => 0, len => 8);
-    assert_layout!(PieU8Slice, 16, 8, ptr => 0, len => 8);
-    assert_layout!(PieU32Slice, 16, 8, ptr => 0, len => 8);
-    assert_layout!(PieU32MutSlice, 16, 8, ptr => 0, len => 8);
-    assert_layout!(PieU64Slice, 16, 8, ptr => 0, len => 8);
-    assert_layout!(PieTerminalCell, 8, 4, outcome => 0, reserved0 => 4);
-    assert_layout!(PieTerminalCellPtrSlice, 16, 8, ptr => 0, len => 8);
-    assert_layout!(
-        PieChannelDesc,
-        80,
-        8,
-        abi_version => 0,
-        reserved0 => 4,
-        channel_id => 8,
-        shape => 16,
-        dtype => 32,
-        host_role => 33,
-        seeded => 34,
-        extern_dir => 35,
-        capacity => 36,
-        reserved1 => 40,
-        reader_wait_id => 48,
-        writer_wait_id => 56,
-        extern_name => 64
-    );
-    assert_layout!(
-        PieChannelEndpointBinding,
-        64,
-        8,
-        channel_id => 0,
-        mirror_base => 8,
-        word_base => 16,
-        mirror_bytes => 24,
-        word_bytes => 32,
-        cell_bytes => 40,
-        capacity => 44,
-        head_word_index => 48,
-        tail_word_index => 52,
-        poison_word_index => 56,
-        closed_word_index => 60
-    );
-    assert_layout!(PieChannelValueDesc, 24, 8, channel_id => 0, bytes => 8);
-    assert_layout!(PieChannelValueDescSlice, 16, 8, ptr => 0, len => 8);
-    assert_layout!(
-        PieMaskWordsDesc,
-        48,
-        8,
-        request_indptr => 0,
-        word_indptr => 16,
-        words => 32
-    );
-    assert_layout!(
-        PieKvMoveCell,
-        16,
-        4,
-        dst_page_id => 0,
-        dst_token_offset => 4,
-        src_page_id => 8,
-        src_token_offset => 12
-    );
-    assert_layout!(PieKvMoveCellSlice, 16, 8, ptr => 0, len => 8);
-    assert_layout!(
-        PieStateCopyRange,
-        20,
-        4,
-        src_slot_id => 0,
-        dst_slot_id => 4,
-        src_token_offset => 8,
-        dst_token_offset => 12,
-        token_count => 16
-    );
-    assert_layout!(PieStateCopyRangeSlice, 16, 8, ptr => 0, len => 8);
-    assert_layout!(PiePoolRange, 16, 8, page_index => 0, page_count => 8);
-    assert_layout!(PiePoolRangeSlice, 16, 8, ptr => 0, len => 8);
-    assert_layout!(
-        PieRuntimeCallbacks,
-        24,
-        8,
-        abi_version => 0,
-        reserved0 => 4,
-        ctx => 8,
-        notify => 16
-    );
-    assert_layout!(
-        PieCompletion,
-        24,
-        8,
-        wait_id => 0,
-        target_epoch => 8,
-        terminal_cell => 16
-    );
-    assert_layout!(
-        PieDriverCreateDesc,
-        48,
-        8,
-        abi_version => 0,
-        reserved0 => 4,
-        config_bytes => 8,
-        runtime => 24
-    );
-    assert_layout!(PieDriverCaps, 16, 8, json_bytes => 0, json_len => 8);
-    assert_layout!(
-        PieModelLoadDesc,
-        48,
-        8,
-        abi_version => 0,
-        component => 4,
-        mxfp4_moe => 8,
-        runtime_quant => 16,
-        snapshot_dir => 32
-    );
-    assert_layout!(
-        PieProgramDesc,
-        48,
-        8,
-        abi_version => 0,
-        reserved0 => 4,
-        program_hash => 8,
-        canonical_bytes => 16,
-        sidecar_bytes => 32
-    );
-    assert_layout!(
-        PieInstanceDesc,
-        72,
-        8,
-        abi_version => 0,
-        reserved0 => 4,
-        geometry_class => 8,
-        reserved1 => 12,
-        program_id => 16,
-        requested_instance_id => 24,
-        pacing_wait_id => 32,
-        channel_ids => 40,
-        seed_values => 56
-    );
-    assert_layout!(
-        PieInstanceBinding,
-        16,
-        8,
-        instance_id => 0,
-        geometry_class => 8,
-        reserved0 => 12
-    );
-    assert_layout!(
-        PieStepDesc,
-        792,
-        8,
-        roster_rows => 0,
-        sub_batch_indptr => 16,
-        sub_batch_class => 32,
-        terminal_cells => 48,
-        token_ids => 64,
-        position_ids => 80,
-        kv_page_indices => 96,
-        kv_page_indptr => 112,
-        kv_last_page_lens => 128,
-        qo_indptr => 144,
-        rs_slot_ids => 160,
-        rs_slot_flags => 176,
-        rs_fold_lens => 192,
-        rs_buffer_slot_ids => 208,
-        rs_buffer_slot_indptr => 224,
-        masks => 240,
-        sampling_indices => 288,
-        sampling_indptr => 304,
-        context_ids => 320,
-        single_token_mode => 336,
-        has_user_mask => 337,
-        reserved_flags => 338,
-        reserved0 => 340,
-        image_indptr => 344,
-        image_grids => 360,
-        image_anchor_positions => 376,
-        image_pixels => 392,
-        image_pixel_indptr => 408,
-        image_mrope_positions => 424,
-        image_mrope_indptr => 440,
-        image_patch_positions => 456,
-        image_anchor_rows => 472,
-        audio_features => 488,
-        audio_feature_indptr => 504,
-        audio_anchor_rows => 520,
-        audio_indptr => 536,
-        embed_rows => 552,
-        embed_indptr => 568,
-        embed_shapes => 584,
-        embed_dtypes => 600,
-        embed_anchor_rows => 616,
-        embed_block_indptr => 632,
-        kv_len => 648,
-        kv_len_device => 664,
-        ptir_program_row_indptr => 680,
-        ptir_kv_write_lower_bounds => 696,
-        ptir_kv_write_upper_bounds => 712,
-        logical_fire_ids => 728,
-        channel_expected_head => 744,
-        channel_expected_tail => 760,
-        channel_ticket_indptr => 776
-    );
-    assert_layout!(
-        PieStepDescSlice,
-        16,
-        8,
-        ptr => 0,
-        len => 8
-    );
-    assert_layout!(
-        PieFrameDesc,
-        80,
-        8,
-        abi_version => 0,
-        reserved0 => 4,
-        instance_ids => 8,
-        kv_translation => 24,
-        kv_translation_indptr => 40,
-        required_kv_pages => 56,
-        reserved1 => 60,
-        steps => 64
-    );
-    assert_layout!(
-        PieEncodeDesc,
-        168,
-        8,
-        abi_version => 0,
-        reserved0 => 4,
-        image_grids => 8,
-        image_pixels => 24,
-        image_pixel_indptr => 40,
-        image_patch_positions => 56,
-        image_anchor_rows => 72,
-        audio_features => 88,
-        audio_feature_indptr => 104,
-        audio_anchor_rows => 120,
-        output_rows => 136,
-        output_row_indptr => 152
-    );
-    assert_layout!(
-        PieKvCopyDesc,
-        72,
-        8,
-        abi_version => 0,
-        src_domain => 4,
-        src_device_ordinal => 8,
-        dst_domain => 12,
-        dst_device_ordinal => 16,
-        reserved0 => 20,
-        src_page_ids => 24,
-        dst_page_ids => 40,
-        cells => 56
-    );
-    assert_layout!(
-        PieStateCopyDesc,
-        24,
-        8,
-        abi_version => 0,
-        reserved0 => 4,
-        slot_ranges => 8
-    );
-    assert_layout!(
-        PiePoolResizeDesc,
-        56,
-        8,
-        abi_version => 0,
-        reserved0 => 4,
-        pool_id => 8,
-        target_pages => 16,
-        map_ranges => 24,
-        unmap_ranges => 40
+    let generated = contract_source();
+    let path = contract_path();
+    if std::env::var_os("PIE_REGEN").is_some() {
+        std::fs::write(&path, &generated).expect("write layout contract");
+        return;
+    }
+    let committed = std::fs::read_to_string(&path).expect("read layout contract");
+    assert_eq!(
+        committed, generated,
+        "{} is stale; re-run with PIE_REGEN=1",
+        path.display()
     );
 }
 

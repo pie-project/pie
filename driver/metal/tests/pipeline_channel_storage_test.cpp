@@ -12,6 +12,7 @@
 using namespace pie::metal;
 using namespace pie::metal::batch;
 using namespace pie::metal::pipeline;
+namespace launch = pie_native::launch;
 
 namespace {
 
@@ -112,7 +113,7 @@ int main() {
                  std::numeric_limits<float>::infinity(),
                  detail::canonical_min)) == bits(-0.0f),
         "canonical max/min preserve Rust signed-zero semantics in both orders");
-    cptir::Shape rank3;
+    launch::Shape rank3;
     rank3.dims = {2, 3, 4};
     const std::int64_t negative_values[] = {-2, -1};
     expect(

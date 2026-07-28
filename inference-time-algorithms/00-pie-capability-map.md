@@ -29,13 +29,13 @@ guest-visible hook is a sampling-parameter struct.
 | `layer()` | layer index, U32 scalar (attention tap) | per-layer logic, layer-contrastive decoding (DoLa-style) |
 | `vocab()`, `page_size()` | trace-known constants | shape-correct programs |
 
-Where: `sdk/rust/ptir-dsl/src/intrinsics.rs`
+Where: `compiler/dsl/src/intrinsics.rs`
 
 ### Operator set
 
 Elementwise/reduction/comparison/logical: `neg exp log cast add sub mul div rem
 max_elem min_elem eq ne lt le gt ge and or not` (and more).
-Where: `sdk/rust/ptir-dsl/src/value.rs`
+Where: `compiler/dsl/src/value.rs`
 
 > **Why it matters.** On a black-box server, "a new sampler" means a C++/CUDA
 > patch and a redeploy. On Pie it is a traced guest program shipped as Wasm.

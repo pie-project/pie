@@ -170,11 +170,9 @@ impl KvSuspendHandle {
     /// fires holds none for an instant but is very much alive — see
     /// `check_starvation`.
     pub fn active_leases(&self) -> usize {
-        self.lifecycle
-            .upgrade()
-            .map_or(0, |lifecycle| {
-                lifecycle.active_fire_leases.load(Ordering::SeqCst)
-            })
+        self.lifecycle.upgrade().map_or(0, |lifecycle| {
+            lifecycle.active_fire_leases.load(Ordering::SeqCst)
+        })
     }
 
     /// Await zero fire leases. Meaningful only under a raised fence, where

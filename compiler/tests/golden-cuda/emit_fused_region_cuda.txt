@@ -1,0 +1,2548 @@
+# oracle dump: pie_cuda_driver::pipeline::generated::emit_fused_region_cuda
+# source of truth: driver/cuda/src/pipeline/generated/ (transitional; the Rust port is compiler/codegen/src/cuda/)
+# emitter_version: 19
+# @runtime: bytes=45277 fnv1a64=0x41b1d45aaef71184
+# cases: 320
+=== beam_epilogue#0 singleton#0
+entry_name: ptir_fused_b4fadd8446eb58dd_r0
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r0
+source: bytes=87547 prefix=@runtime tail_bytes=42270 fnv1a64=0x4b3e797288729c97
+=== end
+=== beam_epilogue#0 singleton#1
+entry_name: ptir_fused_b4fadd8446eb58dd_r1
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r1
+source: bytes=87627 prefix=@runtime tail_bytes=42350 fnv1a64=0xc3ba70466cd11002
+=== end
+=== beam_epilogue#0 singleton#2
+entry_name: ptir_fused_b4fadd8446eb58dd_r2
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r2
+source: bytes=87298 prefix=@runtime tail_bytes=42021 fnv1a64=0x703cf0530f44c939
+=== end
+=== beam_epilogue#0 singleton#3
+entry_name: ptir_fused_b4fadd8446eb58dd_r3
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r3
+source: bytes=87300 prefix=@runtime tail_bytes=42023 fnv1a64=0xee469a6b8770657a
+=== end
+=== beam_epilogue#0 singleton#4
+entry_name: ptir_fused_b4fadd8446eb58dd_r4
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r4
+source: bytes=87325 prefix=@runtime tail_bytes=42048 fnv1a64=0xd386fec11a83db88
+=== end
+=== beam_epilogue#0 singleton#5
+entry_name: ptir_fused_b4fadd8446eb58dd_r5
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r5
+source: bytes=87311 prefix=@runtime tail_bytes=42034 fnv1a64=0x3889f1d8fe35ddb1
+=== end
+=== beam_epilogue#0 singleton#6
+entry_name: ptir_fused_b4fadd8446eb58dd_r6
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r6
+source: bytes=87298 prefix=@runtime tail_bytes=42021 fnv1a64=0x8be8902241f5596a
+=== end
+=== beam_epilogue#0 singleton#7
+entry_name: ptir_fused_b4fadd8446eb58dd_r7
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r7
+source: bytes=87311 prefix=@runtime tail_bytes=42034 fnv1a64=0xe991869f8a8c156a
+=== end
+=== beam_epilogue#0 singleton#8
+entry_name: ptir_fused_b4fadd8446eb58dd_r8
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r8
+source: bytes=87300 prefix=@runtime tail_bytes=42023 fnv1a64=0x5a23cc8cb7f38f48
+=== end
+=== beam_epilogue#0 singleton#9
+entry_name: ptir_fused_b4fadd8446eb58dd_r9
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r9
+source: bytes=87325 prefix=@runtime tail_bytes=42048 fnv1a64=0xe60c867614c7f0b5
+=== end
+=== beam_epilogue#0 singleton#10
+entry_name: ptir_fused_b4fadd8446eb58dd_r10
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r10
+source: bytes=87327 prefix=@runtime tail_bytes=42050 fnv1a64=0x5a32c0c4e6d39caf
+=== end
+=== beam_epilogue#0 singleton#11
+entry_name: ptir_fused_b4fadd8446eb58dd_r11
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r11
+source: bytes=87304 prefix=@runtime tail_bytes=42027 fnv1a64=0xa7ee5ac1c9c67ee4
+=== end
+=== beam_epilogue#0 singleton#12
+entry_name: ptir_fused_b4fadd8446eb58dd_r12
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r12
+source: bytes=87329 prefix=@runtime tail_bytes=42052 fnv1a64=0x183136a46d559477
+=== end
+=== beam_epilogue#0 singleton#13
+entry_name: ptir_fused_b4fadd8446eb58dd_r13
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r13
+source: bytes=87328 prefix=@runtime tail_bytes=42051 fnv1a64=0xd5c1b42ae1de60fb
+=== end
+=== beam_epilogue#0 singleton#14
+entry_name: ptir_fused_b4fadd8446eb58dd_r14
+region: library=1 library_op=1 schedule=3 nodes=1 inputs=1 outputs=2 sinks=0
+ok: false
+error: fused CUDA emitter requires a non-library generated region
+entry_name: ptir_fused_b4fadd8446eb58dd_r14
+=== end
+=== beam_epilogue#0 singleton#15
+entry_name: ptir_fused_b4fadd8446eb58dd_r15
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r15
+source: bytes=87649 prefix=@runtime tail_bytes=42372 fnv1a64=0x233f8b32e90511d9
+=== end
+=== beam_epilogue#0 singleton#16
+entry_name: ptir_fused_b4fadd8446eb58dd_r16
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r16
+source: bytes=87330 prefix=@runtime tail_bytes=42053 fnv1a64=0x6fea44b264bd3e2d
+=== end
+=== beam_epilogue#0 singleton#17
+entry_name: ptir_fused_b4fadd8446eb58dd_r17
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r17
+source: bytes=87550 prefix=@runtime tail_bytes=42273 fnv1a64=0xc2ecb0d3e75fd285
+=== end
+=== beam_epilogue#0 singleton#18
+entry_name: ptir_fused_b4fadd8446eb58dd_r18
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r18
+source: bytes=87348 prefix=@runtime tail_bytes=42071 fnv1a64=0x389a53e222d6f0e5
+=== end
+=== beam_epilogue#0 singleton#19
+entry_name: ptir_fused_b4fadd8446eb58dd_r19
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r19
+source: bytes=87550 prefix=@runtime tail_bytes=42273 fnv1a64=0x200dcc3723ecdd6b
+=== end
+=== beam_epilogue#0 singleton#20
+entry_name: ptir_fused_b4fadd8446eb58dd_r20
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r20
+source: bytes=87348 prefix=@runtime tail_bytes=42071 fnv1a64=0x6b3aabd7eafa4be7
+=== end
+=== beam_epilogue#0 singleton#21
+entry_name: ptir_fused_b4fadd8446eb58dd_r21
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r21
+source: bytes=87550 prefix=@runtime tail_bytes=42273 fnv1a64=0xdf0234acc4d312d4
+=== end
+=== beam_epilogue#0 singleton#22
+entry_name: ptir_fused_b4fadd8446eb58dd_r22
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r22
+source: bytes=87348 prefix=@runtime tail_bytes=42071 fnv1a64=0x4e37decda641a337
+=== end
+=== beam_epilogue#0 singleton#23
+entry_name: ptir_fused_b4fadd8446eb58dd_r23
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r23
+source: bytes=87550 prefix=@runtime tail_bytes=42273 fnv1a64=0x589ead827d24ddc3
+=== end
+=== beam_epilogue#0 singleton#24
+entry_name: ptir_fused_b4fadd8446eb58dd_r24
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r24
+source: bytes=87348 prefix=@runtime tail_bytes=42071 fnv1a64=0x5c05cd0df47ec357
+=== end
+=== beam_epilogue#0 singleton#25
+entry_name: ptir_fused_b4fadd8446eb58dd_r25
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r25
+source: bytes=87303 prefix=@runtime tail_bytes=42026 fnv1a64=0xed97877dff2a9f19
+=== end
+=== beam_epilogue#0 singleton#26
+entry_name: ptir_fused_b4fadd8446eb58dd_r26
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r26
+source: bytes=87510 prefix=@runtime tail_bytes=42233 fnv1a64=0x0cec04da22c8b10f
+=== end
+=== beam_epilogue#0 singleton#27
+entry_name: ptir_fused_b4fadd8446eb58dd_r27
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r27
+source: bytes=87348 prefix=@runtime tail_bytes=42071 fnv1a64=0x939eed33bc7c984b
+=== end
+=== beam_epilogue#0 singleton#28
+entry_name: ptir_fused_b4fadd8446eb58dd_r28
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r28
+source: bytes=87330 prefix=@runtime tail_bytes=42053 fnv1a64=0x75eaf8dc9813b649
+=== end
+=== beam_epilogue#0 singleton#29
+entry_name: ptir_fused_b4fadd8446eb58dd_r29
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r29
+source: bytes=87649 prefix=@runtime tail_bytes=42372 fnv1a64=0x40b7eafea84e25b3
+=== end
+=== beam_epilogue#0 singleton#30
+entry_name: ptir_fused_b4fadd8446eb58dd_r30
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r30
+source: bytes=87330 prefix=@runtime tail_bytes=42053 fnv1a64=0x79662432a7ca1ed2
+=== end
+=== beam_epilogue#0 singleton#31
+entry_name: ptir_fused_b4fadd8446eb58dd_r31
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r31
+source: bytes=87330 prefix=@runtime tail_bytes=42053 fnv1a64=0x267a0eab455ad98c
+=== end
+=== beam_epilogue#0 singleton#32
+entry_name: ptir_fused_b4fadd8446eb58dd_r32
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r32
+source: bytes=87550 prefix=@runtime tail_bytes=42273 fnv1a64=0x1912448d000cb874
+=== end
+=== beam_epilogue#0 singleton#33
+entry_name: ptir_fused_b4fadd8446eb58dd_r33
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r33
+source: bytes=87348 prefix=@runtime tail_bytes=42071 fnv1a64=0x751de77963201275
+=== end
+=== beam_epilogue#0 singleton#34
+entry_name: ptir_fused_b4fadd8446eb58dd_r34
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r34
+source: bytes=87550 prefix=@runtime tail_bytes=42273 fnv1a64=0xeed3a3363f33d29b
+=== end
+=== beam_epilogue#0 singleton#35
+entry_name: ptir_fused_b4fadd8446eb58dd_r35
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r35
+source: bytes=87344 prefix=@runtime tail_bytes=42067 fnv1a64=0xcbebbb22d6ed42ab
+=== end
+=== beam_epilogue#0 singleton#36
+entry_name: ptir_fused_b4fadd8446eb58dd_r36
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r36
+source: bytes=87649 prefix=@runtime tail_bytes=42372 fnv1a64=0xe1186fc90d2cfdeb
+=== end
+=== beam_epilogue#0 singleton#37
+entry_name: ptir_fused_b4fadd8446eb58dd_r37
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r37
+source: bytes=87344 prefix=@runtime tail_bytes=42067 fnv1a64=0xb00ee2fb5350668d
+=== end
+=== beam_epilogue#0 singleton#38
+entry_name: ptir_fused_b4fadd8446eb58dd_r38
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r38
+source: bytes=87649 prefix=@runtime tail_bytes=42372 fnv1a64=0x0d04048cd7c5574b
+=== end
+=== beam_epilogue#0 singleton#39
+entry_name: ptir_fused_b4fadd8446eb58dd_r39
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r39
+source: bytes=87330 prefix=@runtime tail_bytes=42053 fnv1a64=0x3ee59203793ef478
+=== end
+=== beam_epilogue#0 singleton#40
+entry_name: ptir_fused_b4fadd8446eb58dd_r40
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r40
+source: bytes=87344 prefix=@runtime tail_bytes=42067 fnv1a64=0x52c975aa0ccb7c81
+=== end
+=== beam_epilogue#0 singleton#41
+entry_name: ptir_fused_b4fadd8446eb58dd_r41
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r41
+source: bytes=87649 prefix=@runtime tail_bytes=42372 fnv1a64=0xe010a8db8a305293
+=== end
+=== beam_epilogue#0 singleton#42
+entry_name: ptir_fused_b4fadd8446eb58dd_r42
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r42
+source: bytes=87330 prefix=@runtime tail_bytes=42053 fnv1a64=0xc973b5c6fc1091ec
+=== end
+=== beam_epilogue#0 singleton#43
+entry_name: ptir_fused_b4fadd8446eb58dd_r43
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r43
+source: bytes=87330 prefix=@runtime tail_bytes=42053 fnv1a64=0x36c90701b9c05367
+=== end
+=== beam_epilogue#0 singleton#44
+entry_name: ptir_fused_b4fadd8446eb58dd_r44
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r44
+source: bytes=87330 prefix=@runtime tail_bytes=42053 fnv1a64=0xe00974fb87849ef9
+=== end
+=== beam_epilogue#0 singleton#45
+entry_name: ptir_fused_b4fadd8446eb58dd_r45
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r45
+source: bytes=87328 prefix=@runtime tail_bytes=42051 fnv1a64=0xefc420b8e2f07974
+=== end
+=== beam_epilogue#0 singleton#46
+entry_name: ptir_fused_b4fadd8446eb58dd_r46
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r46
+source: bytes=87510 prefix=@runtime tail_bytes=42233 fnv1a64=0xf7d6329e7417156d
+=== end
+=== beam_epilogue#0 singleton#47
+entry_name: ptir_fused_b4fadd8446eb58dd_r47
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r47
+source: bytes=87328 prefix=@runtime tail_bytes=42051 fnv1a64=0x1e338ba371d299a7
+=== end
+=== beam_epilogue#0 singleton#48
+entry_name: ptir_fused_b4fadd8446eb58dd_r48
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r48
+source: bytes=89090 prefix=@runtime tail_bytes=43813 fnv1a64=0x34b5cb7246cf1a01
+=== end
+=== beam_epilogue#0 singleton#49
+entry_name: ptir_fused_b4fadd8446eb58dd_r49
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r49
+source: bytes=87330 prefix=@runtime tail_bytes=42053 fnv1a64=0xb475dd97808b3889
+=== end
+=== beam_epilogue#0 singleton#50
+entry_name: ptir_fused_b4fadd8446eb58dd_r50
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r50
+source: bytes=87328 prefix=@runtime tail_bytes=42051 fnv1a64=0xd1d407341af2dc92
+=== end
+=== beam_epilogue#0 singleton#51
+entry_name: ptir_fused_b4fadd8446eb58dd_r51
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r51
+source: bytes=87510 prefix=@runtime tail_bytes=42233 fnv1a64=0x508eefd1dd24e33c
+=== end
+=== beam_epilogue#0 singleton#52
+entry_name: ptir_fused_b4fadd8446eb58dd_r52
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r52
+source: bytes=87328 prefix=@runtime tail_bytes=42051 fnv1a64=0x895beb45d2f90b79
+=== end
+=== beam_epilogue#0 singleton#53
+entry_name: ptir_fused_b4fadd8446eb58dd_r53
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r53
+source: bytes=89090 prefix=@runtime tail_bytes=43813 fnv1a64=0xae468424e9500182
+=== end
+=== beam_epilogue#0 singleton#54
+entry_name: ptir_fused_b4fadd8446eb58dd_r54
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r54
+source: bytes=87330 prefix=@runtime tail_bytes=42053 fnv1a64=0xf9acacbeb67ba481
+=== end
+=== beam_epilogue#0 singleton#55
+entry_name: ptir_fused_b4fadd8446eb58dd_r55
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r55
+source: bytes=87330 prefix=@runtime tail_bytes=42053 fnv1a64=0x37e36dd528490df1
+=== end
+=== beam_epilogue#0 singleton#56
+entry_name: ptir_fused_b4fadd8446eb58dd_r56
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=0 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r56
+source: bytes=87550 prefix=@runtime tail_bytes=42273 fnv1a64=0xbd32d98da575a8a6
+=== end
+=== beam_epilogue#0 singleton#57
+entry_name: ptir_fused_b4fadd8446eb58dd_r57
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r57
+source: bytes=89090 prefix=@runtime tail_bytes=43813 fnv1a64=0x9897aebdc102c182
+=== end
+=== beam_epilogue#0 singleton#58
+entry_name: ptir_fused_b4fadd8446eb58dd_r58
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r58
+source: bytes=87303 prefix=@runtime tail_bytes=42026 fnv1a64=0x4ae85f8d7bc0915e
+=== end
+=== beam_epilogue#0 singleton#59
+entry_name: ptir_fused_b4fadd8446eb58dd_r59
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r59
+source: bytes=87328 prefix=@runtime tail_bytes=42051 fnv1a64=0x7346aaed60f985cf
+=== end
+=== beam_epilogue#0 singleton#60
+entry_name: ptir_fused_b4fadd8446eb58dd_r60
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r60
+source: bytes=87304 prefix=@runtime tail_bytes=42027 fnv1a64=0xd77724b641ea82f8
+=== end
+=== beam_epilogue#0 singleton#61
+entry_name: ptir_fused_b4fadd8446eb58dd_r61
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r61
+source: bytes=87328 prefix=@runtime tail_bytes=42051 fnv1a64=0xa78743669885e01b
+=== end
+=== beam_epilogue#0 singleton#62
+entry_name: ptir_fused_b4fadd8446eb58dd_r62
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r62
+source: bytes=87304 prefix=@runtime tail_bytes=42027 fnv1a64=0x88aa1af7606dbf31
+=== end
+=== beam_epilogue#0 singleton#63
+entry_name: ptir_fused_b4fadd8446eb58dd_r63
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r63
+source: bytes=87330 prefix=@runtime tail_bytes=42053 fnv1a64=0xe0bbd1dfec99ccc6
+=== end
+=== beam_epilogue#0 singleton#64
+entry_name: ptir_fused_b4fadd8446eb58dd_r64
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r64
+source: bytes=87328 prefix=@runtime tail_bytes=42051 fnv1a64=0x4932901c90129905
+=== end
+=== beam_epilogue#0 singleton#65
+entry_name: ptir_fused_b4fadd8446eb58dd_r65
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=0 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r65
+source: bytes=87550 prefix=@runtime tail_bytes=42273 fnv1a64=0xbcfe11a792230ab2
+=== end
+=== beam_epilogue#0 singleton#66
+entry_name: ptir_fused_b4fadd8446eb58dd_r66
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r66
+source: bytes=89090 prefix=@runtime tail_bytes=43813 fnv1a64=0x7e9b98c45a005bb3
+=== end
+=== beam_epilogue#0 singleton#67
+entry_name: ptir_fused_b4fadd8446eb58dd_r67
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r67
+source: bytes=87550 prefix=@runtime tail_bytes=42273 fnv1a64=0xc50d435b70760d54
+=== end
+=== beam_epilogue#0 singleton#68
+entry_name: ptir_fused_b4fadd8446eb58dd_r68
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r68
+source: bytes=87330 prefix=@runtime tail_bytes=42053 fnv1a64=0x85945f32f9e53dd2
+=== end
+=== beam_epilogue#0 singleton#69
+entry_name: ptir_fused_b4fadd8446eb58dd_r69
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r69
+source: bytes=89090 prefix=@runtime tail_bytes=43813 fnv1a64=0xd3a0417accc6eddc
+=== end
+=== beam_epilogue#0 singleton#70
+entry_name: ptir_fused_b4fadd8446eb58dd_r70
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r70
+source: bytes=89090 prefix=@runtime tail_bytes=43813 fnv1a64=0x2528efd5003ff856
+=== end
+=== beam_epilogue#0 singleton#71
+entry_name: ptir_fused_b4fadd8446eb58dd_r71
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r71
+source: bytes=89090 prefix=@runtime tail_bytes=43813 fnv1a64=0x23e5a5472c6a0632
+=== end
+=== beam_epilogue#0 singleton#72
+entry_name: ptir_fused_b4fadd8446eb58dd_r72
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r72
+source: bytes=89090 prefix=@runtime tail_bytes=43813 fnv1a64=0xad4a4c48c9859ca8
+=== end
+=== beam_epilogue#0 singleton#73
+entry_name: ptir_fused_b4fadd8446eb58dd_r73
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r73
+source: bytes=89092 prefix=@runtime tail_bytes=43815 fnv1a64=0x37e502c128c65dd2
+=== end
+=== beam_epilogue#0 singleton#74
+entry_name: ptir_fused_b4fadd8446eb58dd_r74
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r74
+source: bytes=89092 prefix=@runtime tail_bytes=43815 fnv1a64=0xc0664f0ec4aaeea6
+=== end
+=== beam_epilogue#0 singleton#75
+entry_name: ptir_fused_b4fadd8446eb58dd_r75
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r75
+source: bytes=87330 prefix=@runtime tail_bytes=42053 fnv1a64=0x06cef7d82542a639
+=== end
+=== beam_epilogue#0 singleton#76
+entry_name: ptir_fused_b4fadd8446eb58dd_r76
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r76
+source: bytes=87315 prefix=@runtime tail_bytes=42038 fnv1a64=0x87802b0353d20ff9
+=== end
+=== beam_epilogue#0 singleton#77
+entry_name: ptir_fused_b4fadd8446eb58dd_r77
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r77
+source: bytes=89092 prefix=@runtime tail_bytes=43815 fnv1a64=0xa652c34c0dc7e7e0
+=== end
+=== beam_epilogue#0 singleton#78
+entry_name: ptir_fused_b4fadd8446eb58dd_r78
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r78
+source: bytes=89090 prefix=@runtime tail_bytes=43813 fnv1a64=0x77a57783d381377e
+=== end
+=== beam_epilogue#0 singleton#79
+entry_name: ptir_fused_b4fadd8446eb58dd_r79
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r79
+source: bytes=89092 prefix=@runtime tail_bytes=43815 fnv1a64=0xfc6cf431e452de64
+=== end
+=== beam_epilogue#0 singleton#80
+entry_name: ptir_fused_b4fadd8446eb58dd_r80
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r80
+source: bytes=89092 prefix=@runtime tail_bytes=43815 fnv1a64=0xe23f52fed065bf59
+=== end
+=== beam_epilogue#0 singleton#81
+entry_name: ptir_fused_b4fadd8446eb58dd_r81
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r81
+source: bytes=89092 prefix=@runtime tail_bytes=43815 fnv1a64=0x8b00c02a28ce9000
+=== end
+=== beam_epilogue#0 fused#0
+entry_name: ptir_fused_b4fadd8446eb58dd_r0
+region: library=0 library_op=0 schedule=1 nodes=14 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r0
+source: bytes=91419 prefix=@runtime tail_bytes=46142 fnv1a64=0xa061a8338b6698eb
+=== end
+=== beam_epilogue#0 fused#1
+entry_name: ptir_fused_b4fadd8446eb58dd_r1
+region: library=1 library_op=1 schedule=3 nodes=1 inputs=1 outputs=2 sinks=0
+ok: false
+error: fused CUDA emitter requires a non-library generated region
+entry_name: ptir_fused_b4fadd8446eb58dd_r1
+=== end
+=== beam_epilogue#0 fused#2
+entry_name: ptir_fused_b4fadd8446eb58dd_r2
+region: library=0 library_op=0 schedule=1 nodes=67 inputs=2 outputs=0 sinks=15
+ok: true
+error: 
+entry_name: ptir_fused_b4fadd8446eb58dd_r2
+source: bytes=136411 prefix=@runtime tail_bytes=91134 fnv1a64=0x4a43cbcc7e596f98
+=== end
+=== counter_pingpong#0 singleton#0
+entry_name: ptir_fused_f4e949004f50e90e_r0
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_f4e949004f50e90e_r0
+source: bytes=87547 prefix=@runtime tail_bytes=42270 fnv1a64=0xc2a8258928e4c0b1
+=== end
+=== counter_pingpong#0 singleton#1
+entry_name: ptir_fused_f4e949004f50e90e_r1
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_f4e949004f50e90e_r1
+source: bytes=87643 prefix=@runtime tail_bytes=42366 fnv1a64=0x3305f2d9e2c7b703
+=== end
+=== counter_pingpong#0 singleton#2
+entry_name: ptir_fused_f4e949004f50e90e_r2
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_f4e949004f50e90e_r2
+source: bytes=87325 prefix=@runtime tail_bytes=42048 fnv1a64=0x23e088107c121c50
+=== end
+=== counter_pingpong#0 singleton#3
+entry_name: ptir_fused_f4e949004f50e90e_r3
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+entry_name: ptir_fused_f4e949004f50e90e_r3
+source: bytes=89087 prefix=@runtime tail_bytes=43810 fnv1a64=0xddf761dba59304eb
+=== end
+=== counter_pingpong#0 singleton#4
+entry_name: ptir_fused_f4e949004f50e90e_r4
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+entry_name: ptir_fused_f4e949004f50e90e_r4
+source: bytes=89087 prefix=@runtime tail_bytes=43810 fnv1a64=0x6c05c668b277b99d
+=== end
+=== counter_pingpong#0 fused#0
+entry_name: ptir_fused_f4e949004f50e90e_r0
+region: library=0 library_op=0 schedule=1 nodes=5 inputs=0 outputs=0 sinks=2
+ok: true
+error: 
+entry_name: ptir_fused_f4e949004f50e90e_r0
+source: bytes=92629 prefix=@runtime tail_bytes=47352 fnv1a64=0x2eae737a00544fc0
+=== end
+=== dfa_ingraph#0 singleton#0
+entry_name: ptir_fused_4f4b856e5ef3e8b4_r0
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_4f4b856e5ef3e8b4_r0
+source: bytes=87627 prefix=@runtime tail_bytes=42350 fnv1a64=0x6cbfafb502c83aae
+=== end
+=== dfa_ingraph#0 singleton#1
+entry_name: ptir_fused_4f4b856e5ef3e8b4_r1
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_4f4b856e5ef3e8b4_r1
+source: bytes=87547 prefix=@runtime tail_bytes=42270 fnv1a64=0x8bbf29ec0bb42a63
+=== end
+=== dfa_ingraph#0 singleton#2
+entry_name: ptir_fused_4f4b856e5ef3e8b4_r2
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_4f4b856e5ef3e8b4_r2
+source: bytes=87547 prefix=@runtime tail_bytes=42270 fnv1a64=0xcf1461b781fee67b
+=== end
+=== dfa_ingraph#0 singleton#3
+entry_name: ptir_fused_4f4b856e5ef3e8b4_r3
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_4f4b856e5ef3e8b4_r3
+source: bytes=87547 prefix=@runtime tail_bytes=42270 fnv1a64=0x9c60e2a4d4a0978b
+=== end
+=== dfa_ingraph#0 singleton#4
+entry_name: ptir_fused_4f4b856e5ef3e8b4_r4
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_4f4b856e5ef3e8b4_r4
+source: bytes=87343 prefix=@runtime tail_bytes=42066 fnv1a64=0x2d4a5cb3ce4853fd
+=== end
+=== dfa_ingraph#0 singleton#5
+entry_name: ptir_fused_4f4b856e5ef3e8b4_r5
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_4f4b856e5ef3e8b4_r5
+source: bytes=87643 prefix=@runtime tail_bytes=42366 fnv1a64=0x6804468b22ea7912
+=== end
+=== dfa_ingraph#0 singleton#6
+entry_name: ptir_fused_4f4b856e5ef3e8b4_r6
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_4f4b856e5ef3e8b4_r6
+source: bytes=87338 prefix=@runtime tail_bytes=42061 fnv1a64=0x0a5b23453579412c
+=== end
+=== dfa_ingraph#0 singleton#7
+entry_name: ptir_fused_4f4b856e5ef3e8b4_r7
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_4f4b856e5ef3e8b4_r7
+source: bytes=87274 prefix=@runtime tail_bytes=41997 fnv1a64=0xb187f95ccbbcdc80
+=== end
+=== dfa_ingraph#0 singleton#8
+entry_name: ptir_fused_4f4b856e5ef3e8b4_r8
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+entry_name: ptir_fused_4f4b856e5ef3e8b4_r8
+source: bytes=89087 prefix=@runtime tail_bytes=43810 fnv1a64=0xc2eb70032d17ca65
+=== end
+=== dfa_ingraph#0 singleton#9
+entry_name: ptir_fused_4f4b856e5ef3e8b4_r9
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_4f4b856e5ef3e8b4_r9
+source: bytes=87643 prefix=@runtime tail_bytes=42366 fnv1a64=0xabdca10036a525be
+=== end
+=== dfa_ingraph#0 singleton#10
+entry_name: ptir_fused_4f4b856e5ef3e8b4_r10
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_4f4b856e5ef3e8b4_r10
+source: bytes=87327 prefix=@runtime tail_bytes=42050 fnv1a64=0xd63e22a85d5707d4
+=== end
+=== dfa_ingraph#0 singleton#11
+entry_name: ptir_fused_4f4b856e5ef3e8b4_r11
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_4f4b856e5ef3e8b4_r11
+source: bytes=87314 prefix=@runtime tail_bytes=42037 fnv1a64=0xe6d645db3b6e6de7
+=== end
+=== dfa_ingraph#0 singleton#12
+entry_name: ptir_fused_4f4b856e5ef3e8b4_r12
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_4f4b856e5ef3e8b4_r12
+source: bytes=87329 prefix=@runtime tail_bytes=42052 fnv1a64=0xa5db45aa42842f1a
+=== end
+=== dfa_ingraph#0 singleton#13
+entry_name: ptir_fused_4f4b856e5ef3e8b4_r13
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_4f4b856e5ef3e8b4_r13
+source: bytes=87347 prefix=@runtime tail_bytes=42070 fnv1a64=0x7d2f5b716d8cf8d2
+=== end
+=== dfa_ingraph#0 singleton#14
+entry_name: ptir_fused_4f4b856e5ef3e8b4_r14
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+entry_name: ptir_fused_4f4b856e5ef3e8b4_r14
+source: bytes=89090 prefix=@runtime tail_bytes=43813 fnv1a64=0x856df790a45e3531
+=== end
+=== dfa_ingraph#0 fused#0
+entry_name: ptir_fused_4f4b856e5ef3e8b4_r0
+region: library=0 library_op=0 schedule=1 nodes=15 inputs=0 outputs=0 sinks=2
+ok: true
+error: 
+entry_name: ptir_fused_4f4b856e5ef3e8b4_r0
+source: bytes=96788 prefix=@runtime tail_bytes=51511 fnv1a64=0x5d97b8b4af067257
+=== end
+=== extern_contrastive#0 singleton#0
+entry_name: ptir_fused_d01f407b22863878_r0
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_d01f407b22863878_r0
+source: bytes=87627 prefix=@runtime tail_bytes=42350 fnv1a64=0xaa94626c87c62bee
+=== end
+=== extern_contrastive#0 singleton#1
+entry_name: ptir_fused_d01f407b22863878_r1
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+entry_name: ptir_fused_d01f407b22863878_r1
+source: bytes=89087 prefix=@runtime tail_bytes=43810 fnv1a64=0xe5909abac0b0c3c8
+=== end
+=== extern_contrastive#0 fused#0
+entry_name: ptir_fused_d01f407b22863878_r0
+region: library=0 library_op=0 schedule=1 nodes=2 inputs=0 outputs=0 sinks=1
+ok: true
+error: 
+entry_name: ptir_fused_d01f407b22863878_r0
+source: bytes=89699 prefix=@runtime tail_bytes=44422 fnv1a64=0x6a6bf3656cd16548
+=== end
+=== greedy_argmax#0 singleton#0
+entry_name: ptir_fused_f2566cc0c1e0529a_r0
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_f2566cc0c1e0529a_r0
+source: bytes=87627 prefix=@runtime tail_bytes=42350 fnv1a64=0x618919425207c6ed
+=== end
+=== greedy_argmax#0 singleton#1
+entry_name: ptir_fused_f2566cc0c1e0529a_r1
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_f2566cc0c1e0529a_r1
+source: bytes=87324 prefix=@runtime tail_bytes=42047 fnv1a64=0x293b4bc598cc16c5
+=== end
+=== greedy_argmax#0 singleton#2
+entry_name: ptir_fused_f2566cc0c1e0529a_r2
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_f2566cc0c1e0529a_r2
+source: bytes=87578 prefix=@runtime tail_bytes=42301 fnv1a64=0xa41d901d6c3e3ee7
+=== end
+=== greedy_argmax#0 singleton#3
+entry_name: ptir_fused_f2566cc0c1e0529a_r3
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_f2566cc0c1e0529a_r3
+source: bytes=87324 prefix=@runtime tail_bytes=42047 fnv1a64=0xbed5f068cd9458a5
+=== end
+=== greedy_argmax#0 singleton#4
+entry_name: ptir_fused_f2566cc0c1e0529a_r4
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+entry_name: ptir_fused_f2566cc0c1e0529a_r4
+source: bytes=89087 prefix=@runtime tail_bytes=43810 fnv1a64=0x38d754b77365e508
+=== end
+=== greedy_argmax#0 singleton#5
+entry_name: ptir_fused_f2566cc0c1e0529a_r5
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+entry_name: ptir_fused_f2566cc0c1e0529a_r5
+source: bytes=89087 prefix=@runtime tail_bytes=43810 fnv1a64=0xbfed3b60a0fddf7a
+=== end
+=== greedy_argmax#0 fused#0
+entry_name: ptir_fused_f2566cc0c1e0529a_r0
+region: library=0 library_op=0 schedule=1 nodes=6 inputs=0 outputs=0 sinks=2
+ok: true
+error: 
+entry_name: ptir_fused_f2566cc0c1e0529a_r0
+source: bytes=91722 prefix=@runtime tail_bytes=46445 fnv1a64=0xaa7a734d7a60c3e6
+=== end
+=== matrix_mask_apply_packed#0 singleton#0
+entry_name: ptir_fused_6612fe00a51d7edc_r0
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_6612fe00a51d7edc_r0
+source: bytes=87627 prefix=@runtime tail_bytes=42350 fnv1a64=0x2deb710a4e3428fa
+=== end
+=== matrix_mask_apply_packed#0 singleton#1
+entry_name: ptir_fused_6612fe00a51d7edc_r1
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_6612fe00a51d7edc_r1
+source: bytes=87643 prefix=@runtime tail_bytes=42366 fnv1a64=0x98c51d82af1d3f9e
+=== end
+=== matrix_mask_apply_packed#0 singleton#2
+entry_name: ptir_fused_6612fe00a51d7edc_r2
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_6612fe00a51d7edc_r2
+source: bytes=87324 prefix=@runtime tail_bytes=42047 fnv1a64=0xc68ef1cc074b7e9a
+=== end
+=== matrix_mask_apply_packed#0 singleton#3
+entry_name: ptir_fused_6612fe00a51d7edc_r3
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_6612fe00a51d7edc_r3
+source: bytes=87326 prefix=@runtime tail_bytes=42049 fnv1a64=0x151d94e602da3868
+=== end
+=== matrix_mask_apply_packed#0 singleton#4
+entry_name: ptir_fused_6612fe00a51d7edc_r4
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_6612fe00a51d7edc_r4
+source: bytes=87274 prefix=@runtime tail_bytes=41997 fnv1a64=0x9b99d00a9d11bb8e
+=== end
+=== matrix_mask_apply_packed#0 singleton#5
+entry_name: ptir_fused_6612fe00a51d7edc_r5
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+entry_name: ptir_fused_6612fe00a51d7edc_r5
+source: bytes=89087 prefix=@runtime tail_bytes=43810 fnv1a64=0x2656ba33e5da0c50
+=== end
+=== matrix_mask_apply_packed#0 fused#0
+entry_name: ptir_fused_6612fe00a51d7edc_r0
+region: library=0 library_op=0 schedule=1 nodes=6 inputs=0 outputs=0 sinks=1
+ok: true
+error: 
+entry_name: ptir_fused_6612fe00a51d7edc_r0
+source: bytes=90897 prefix=@runtime tail_bytes=45620 fnv1a64=0xee3d7d8a712306aa
+=== end
+=== matrix_select_mask#0 singleton#0
+entry_name: ptir_fused_101abcfb79b08b89_r0
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_101abcfb79b08b89_r0
+source: bytes=87627 prefix=@runtime tail_bytes=42350 fnv1a64=0xb72c6debcce6d979
+=== end
+=== matrix_select_mask#0 singleton#1
+entry_name: ptir_fused_101abcfb79b08b89_r1
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_101abcfb79b08b89_r1
+source: bytes=87547 prefix=@runtime tail_bytes=42270 fnv1a64=0x32745e3a6debc9c4
+=== end
+=== matrix_select_mask#0 singleton#2
+entry_name: ptir_fused_101abcfb79b08b89_r2
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_101abcfb79b08b89_r2
+source: bytes=87643 prefix=@runtime tail_bytes=42366 fnv1a64=0x406910846f867059
+=== end
+=== matrix_select_mask#0 singleton#3
+entry_name: ptir_fused_101abcfb79b08b89_r3
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_101abcfb79b08b89_r3
+source: bytes=87338 prefix=@runtime tail_bytes=42061 fnv1a64=0xb0abcbdaf5ba5df0
+=== end
+=== matrix_select_mask#0 singleton#4
+entry_name: ptir_fused_101abcfb79b08b89_r4
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_101abcfb79b08b89_r4
+source: bytes=87274 prefix=@runtime tail_bytes=41997 fnv1a64=0x4cef3ea4f70669cf
+=== end
+=== matrix_select_mask#0 singleton#5
+entry_name: ptir_fused_101abcfb79b08b89_r5
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+entry_name: ptir_fused_101abcfb79b08b89_r5
+source: bytes=89087 prefix=@runtime tail_bytes=43810 fnv1a64=0x667a314d56f67e09
+=== end
+=== matrix_select_mask#0 fused#0
+entry_name: ptir_fused_101abcfb79b08b89_r0
+region: library=0 library_op=0 schedule=1 nodes=6 inputs=0 outputs=0 sinks=1
+ok: true
+error: 
+entry_name: ptir_fused_101abcfb79b08b89_r0
+source: bytes=91441 prefix=@runtime tail_bytes=46164 fnv1a64=0x888f28ba2dc48a63
+=== end
+=== mtp_verify_tail#0 singleton#0
+entry_name: ptir_fused_963137d4ffed0445_r0
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_963137d4ffed0445_r0
+source: bytes=87627 prefix=@runtime tail_bytes=42350 fnv1a64=0x0b232564328a204d
+=== end
+=== mtp_verify_tail#0 singleton#1
+entry_name: ptir_fused_963137d4ffed0445_r1
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_963137d4ffed0445_r1
+source: bytes=87627 prefix=@runtime tail_bytes=42350 fnv1a64=0x87d4924bd008eeae
+=== end
+=== mtp_verify_tail#0 singleton#2
+entry_name: ptir_fused_963137d4ffed0445_r2
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_963137d4ffed0445_r2
+source: bytes=87547 prefix=@runtime tail_bytes=42270 fnv1a64=0xc1477b5cad230e85
+=== end
+=== mtp_verify_tail#0 singleton#3
+entry_name: ptir_fused_963137d4ffed0445_r3
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_963137d4ffed0445_r3
+source: bytes=87643 prefix=@runtime tail_bytes=42366 fnv1a64=0xb5b3722fb7f4a841
+=== end
+=== mtp_verify_tail#0 singleton#4
+entry_name: ptir_fused_963137d4ffed0445_r4
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_963137d4ffed0445_r4
+source: bytes=87338 prefix=@runtime tail_bytes=42061 fnv1a64=0xd27a667cdb3598c7
+=== end
+=== mtp_verify_tail#0 singleton#5
+entry_name: ptir_fused_963137d4ffed0445_r5
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_963137d4ffed0445_r5
+source: bytes=87274 prefix=@runtime tail_bytes=41997 fnv1a64=0x1ba073fa3e90d931
+=== end
+=== mtp_verify_tail#0 singleton#6
+entry_name: ptir_fused_963137d4ffed0445_r6
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_963137d4ffed0445_r6
+source: bytes=87547 prefix=@runtime tail_bytes=42270 fnv1a64=0x0a5953f8a334a398
+=== end
+=== mtp_verify_tail#0 singleton#7
+entry_name: ptir_fused_963137d4ffed0445_r7
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_963137d4ffed0445_r7
+source: bytes=87300 prefix=@runtime tail_bytes=42023 fnv1a64=0xd22225703d829d40
+=== end
+=== mtp_verify_tail#0 singleton#8
+entry_name: ptir_fused_963137d4ffed0445_r8
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_963137d4ffed0445_r8
+source: bytes=87343 prefix=@runtime tail_bytes=42066 fnv1a64=0x34f4f3ec7594faca
+=== end
+=== mtp_verify_tail#0 singleton#9
+entry_name: ptir_fused_963137d4ffed0445_r9
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_963137d4ffed0445_r9
+source: bytes=87325 prefix=@runtime tail_bytes=42048 fnv1a64=0xaeebc3e306a6a8a5
+=== end
+=== mtp_verify_tail#0 singleton#10
+entry_name: ptir_fused_963137d4ffed0445_r10
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_963137d4ffed0445_r10
+source: bytes=87649 prefix=@runtime tail_bytes=42372 fnv1a64=0x1c80f0b2d387a523
+=== end
+=== mtp_verify_tail#0 singleton#11
+entry_name: ptir_fused_963137d4ffed0445_r11
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_963137d4ffed0445_r11
+source: bytes=87649 prefix=@runtime tail_bytes=42372 fnv1a64=0x212d794b52f8760d
+=== end
+=== mtp_verify_tail#0 singleton#12
+entry_name: ptir_fused_963137d4ffed0445_r12
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_963137d4ffed0445_r12
+source: bytes=87343 prefix=@runtime tail_bytes=42066 fnv1a64=0x5e17c7e4741d3f49
+=== end
+=== mtp_verify_tail#0 singleton#13
+entry_name: ptir_fused_963137d4ffed0445_r13
+region: library=1 library_op=3 schedule=3 nodes=1 inputs=1 outputs=1 sinks=0
+ok: false
+error: fused CUDA emitter requires a non-library generated region
+entry_name: ptir_fused_963137d4ffed0445_r13
+=== end
+=== mtp_verify_tail#0 singleton#14
+entry_name: ptir_fused_963137d4ffed0445_r14
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_963137d4ffed0445_r14
+source: bytes=87302 prefix=@runtime tail_bytes=42025 fnv1a64=0xf2f803cf6ee28900
+=== end
+=== mtp_verify_tail#0 singleton#15
+entry_name: ptir_fused_963137d4ffed0445_r15
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_963137d4ffed0445_r15
+source: bytes=87315 prefix=@runtime tail_bytes=42038 fnv1a64=0x755ed14854d358bd
+=== end
+=== mtp_verify_tail#0 singleton#16
+entry_name: ptir_fused_963137d4ffed0445_r16
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_963137d4ffed0445_r16
+source: bytes=87304 prefix=@runtime tail_bytes=42027 fnv1a64=0xc33c588285707486
+=== end
+=== mtp_verify_tail#0 singleton#17
+entry_name: ptir_fused_963137d4ffed0445_r17
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_963137d4ffed0445_r17
+source: bytes=87303 prefix=@runtime tail_bytes=42026 fnv1a64=0xdf454f384c5c43ef
+=== end
+=== mtp_verify_tail#0 singleton#18
+entry_name: ptir_fused_963137d4ffed0445_r18
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_963137d4ffed0445_r18
+source: bytes=87330 prefix=@runtime tail_bytes=42053 fnv1a64=0x39effba7fb5e5417
+=== end
+=== mtp_verify_tail#0 singleton#19
+entry_name: ptir_fused_963137d4ffed0445_r19
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_963137d4ffed0445_r19
+source: bytes=87649 prefix=@runtime tail_bytes=42372 fnv1a64=0xbb83f9944b4c788d
+=== end
+=== mtp_verify_tail#0 singleton#20
+entry_name: ptir_fused_963137d4ffed0445_r20
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_963137d4ffed0445_r20
+source: bytes=87343 prefix=@runtime tail_bytes=42066 fnv1a64=0x7bf80fa33652460e
+=== end
+=== mtp_verify_tail#0 singleton#21
+entry_name: ptir_fused_963137d4ffed0445_r21
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+entry_name: ptir_fused_963137d4ffed0445_r21
+source: bytes=89090 prefix=@runtime tail_bytes=43813 fnv1a64=0xa7b710efc1f47343
+=== end
+=== mtp_verify_tail#0 singleton#22
+entry_name: ptir_fused_963137d4ffed0445_r22
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_963137d4ffed0445_r22
+source: bytes=87581 prefix=@runtime tail_bytes=42304 fnv1a64=0x45e6b47a1c8dc1df
+=== end
+=== mtp_verify_tail#0 singleton#23
+entry_name: ptir_fused_963137d4ffed0445_r23
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+entry_name: ptir_fused_963137d4ffed0445_r23
+source: bytes=89090 prefix=@runtime tail_bytes=43813 fnv1a64=0x13cca153d0855bac
+=== end
+=== mtp_verify_tail#0 singleton#24
+entry_name: ptir_fused_963137d4ffed0445_r24
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+entry_name: ptir_fused_963137d4ffed0445_r24
+source: bytes=89090 prefix=@runtime tail_bytes=43813 fnv1a64=0x10092946de69e11a
+=== end
+=== mtp_verify_tail#0 fused#0
+entry_name: ptir_fused_963137d4ffed0445_r0
+region: library=0 library_op=0 schedule=1 nodes=13 inputs=0 outputs=3 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_963137d4ffed0445_r0
+source: bytes=93029 prefix=@runtime tail_bytes=47752 fnv1a64=0xec6feaac4e0a51de
+=== end
+=== mtp_verify_tail#0 fused#1
+entry_name: ptir_fused_963137d4ffed0445_r1
+region: library=1 library_op=3 schedule=3 nodes=1 inputs=1 outputs=1 sinks=0
+ok: false
+error: fused CUDA emitter requires a non-library generated region
+entry_name: ptir_fused_963137d4ffed0445_r1
+=== end
+=== mtp_verify_tail#0 fused#2
+entry_name: ptir_fused_963137d4ffed0445_r2
+region: library=0 library_op=0 schedule=1 nodes=11 inputs=3 outputs=0 sinks=3
+ok: true
+error: 
+entry_name: ptir_fused_963137d4ffed0445_r2
+source: bytes=96236 prefix=@runtime tail_bytes=50959 fnv1a64=0xbf364baa1d2387fb
+=== end
+=== nucleus_sample#0 singleton#0
+entry_name: ptir_fused_82921040f7bc2612_r0
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_82921040f7bc2612_r0
+source: bytes=87627 prefix=@runtime tail_bytes=42350 fnv1a64=0x4625257ad85593f5
+=== end
+=== nucleus_sample#0 singleton#1
+entry_name: ptir_fused_82921040f7bc2612_r1
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_82921040f7bc2612_r1
+source: bytes=87547 prefix=@runtime tail_bytes=42270 fnv1a64=0xb0a8871584960a30
+=== end
+=== nucleus_sample#0 singleton#2
+entry_name: ptir_fused_82921040f7bc2612_r2
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_82921040f7bc2612_r2
+source: bytes=87547 prefix=@runtime tail_bytes=42270 fnv1a64=0x2718e193e1b29ffc
+=== end
+=== nucleus_sample#0 singleton#3
+entry_name: ptir_fused_82921040f7bc2612_r3
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_82921040f7bc2612_r3
+source: bytes=87298 prefix=@runtime tail_bytes=42021 fnv1a64=0x1048653901f29f39
+=== end
+=== nucleus_sample#0 singleton#4
+entry_name: ptir_fused_82921040f7bc2612_r4
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_82921040f7bc2612_r4
+source: bytes=87300 prefix=@runtime tail_bytes=42023 fnv1a64=0x005abacfb4fe6b7c
+=== end
+=== nucleus_sample#0 singleton#5
+entry_name: ptir_fused_82921040f7bc2612_r5
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_82921040f7bc2612_r5
+source: bytes=87325 prefix=@runtime tail_bytes=42048 fnv1a64=0x3611a308539764bd
+=== end
+=== nucleus_sample#0 singleton#6
+entry_name: ptir_fused_82921040f7bc2612_r6
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_82921040f7bc2612_r6
+source: bytes=87311 prefix=@runtime tail_bytes=42034 fnv1a64=0xe2217ac07242fccb
+=== end
+=== nucleus_sample#0 singleton#7
+entry_name: ptir_fused_82921040f7bc2612_r7
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_82921040f7bc2612_r7
+source: bytes=87298 prefix=@runtime tail_bytes=42021 fnv1a64=0xb8709be013f137a4
+=== end
+=== nucleus_sample#0 singleton#8
+entry_name: ptir_fused_82921040f7bc2612_r8
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_82921040f7bc2612_r8
+source: bytes=87300 prefix=@runtime tail_bytes=42023 fnv1a64=0x239502ec6152643c
+=== end
+=== nucleus_sample#0 singleton#9
+entry_name: ptir_fused_82921040f7bc2612_r9
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_82921040f7bc2612_r9
+source: bytes=87325 prefix=@runtime tail_bytes=42048 fnv1a64=0x9444144bfd194f75
+=== end
+=== nucleus_sample#0 singleton#10
+entry_name: ptir_fused_82921040f7bc2612_r10
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_82921040f7bc2612_r10
+source: bytes=87329 prefix=@runtime tail_bytes=42052 fnv1a64=0x67130cc71e00836c
+=== end
+=== nucleus_sample#0 singleton#11
+entry_name: ptir_fused_82921040f7bc2612_r11
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_82921040f7bc2612_r11
+source: bytes=87649 prefix=@runtime tail_bytes=42372 fnv1a64=0xacdc4be367aa4395
+=== end
+=== nucleus_sample#0 singleton#12
+entry_name: ptir_fused_82921040f7bc2612_r12
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_82921040f7bc2612_r12
+source: bytes=87343 prefix=@runtime tail_bytes=42066 fnv1a64=0x488e3f0d80bd7f02
+=== end
+=== nucleus_sample#0 singleton#13
+entry_name: ptir_fused_82921040f7bc2612_r13
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_82921040f7bc2612_r13
+source: bytes=87316 prefix=@runtime tail_bytes=42039 fnv1a64=0x9e179a72f7a3656b
+=== end
+=== nucleus_sample#0 singleton#14
+entry_name: ptir_fused_82921040f7bc2612_r14
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_82921040f7bc2612_r14
+source: bytes=87330 prefix=@runtime tail_bytes=42053 fnv1a64=0xc2a1b557c22bb3c3
+=== end
+=== nucleus_sample#0 singleton#15
+entry_name: ptir_fused_82921040f7bc2612_r15
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_82921040f7bc2612_r15
+source: bytes=87278 prefix=@runtime tail_bytes=42001 fnv1a64=0xa1d77185927da8ef
+=== end
+=== nucleus_sample#0 singleton#16
+entry_name: ptir_fused_82921040f7bc2612_r16
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+entry_name: ptir_fused_82921040f7bc2612_r16
+source: bytes=89090 prefix=@runtime tail_bytes=43813 fnv1a64=0x7dceef0c264fc663
+=== end
+=== nucleus_sample#0 fused#0
+entry_name: ptir_fused_82921040f7bc2612_r0
+region: library=0 library_op=0 schedule=1 nodes=3 inputs=0 outputs=3 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_82921040f7bc2612_r0
+source: bytes=88691 prefix=@runtime tail_bytes=43414 fnv1a64=0x6ba0f2722e6e08e2
+=== end
+=== nucleus_sample#0 fused#1
+entry_name: ptir_fused_82921040f7bc2612_r1
+region: library=1 library_op=0 schedule=3 nodes=13 inputs=3 outputs=1 sinks=0
+ok: false
+error: fused CUDA emitter requires a non-library generated region
+entry_name: ptir_fused_82921040f7bc2612_r1
+=== end
+=== nucleus_sample#0 fused#2
+entry_name: ptir_fused_82921040f7bc2612_r2
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+entry_name: ptir_fused_82921040f7bc2612_r2
+source: bytes=89089 prefix=@runtime tail_bytes=43812 fnv1a64=0xfdd3d1d5a4f4220c
+=== end
+=== pentathlon_iter#0 singleton#0
+entry_name: ptir_fused_14f667a41eb30669_r0
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_14f667a41eb30669_r0
+source: bytes=87627 prefix=@runtime tail_bytes=42350 fnv1a64=0x2dd0ac012644fc8f
+=== end
+=== pentathlon_iter#0 singleton#1
+entry_name: ptir_fused_14f667a41eb30669_r1
+region: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=1 sinks=0
+ok: false
+error: fused CUDA emitter requires a non-library generated region
+entry_name: ptir_fused_14f667a41eb30669_r1
+=== end
+=== pentathlon_iter#0 singleton#2
+entry_name: ptir_fused_14f667a41eb30669_r2
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_14f667a41eb30669_r2
+source: bytes=87547 prefix=@runtime tail_bytes=42270 fnv1a64=0x3ff7813c3c9cac23
+=== end
+=== pentathlon_iter#0 singleton#3
+entry_name: ptir_fused_14f667a41eb30669_r3
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_14f667a41eb30669_r3
+source: bytes=87324 prefix=@runtime tail_bytes=42047 fnv1a64=0xce07b8b50e26d26f
+=== end
+=== pentathlon_iter#0 singleton#4
+entry_name: ptir_fused_14f667a41eb30669_r4
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_14f667a41eb30669_r4
+source: bytes=87321 prefix=@runtime tail_bytes=42044 fnv1a64=0x02001f35b8cfe166
+=== end
+=== pentathlon_iter#0 singleton#5
+entry_name: ptir_fused_14f667a41eb30669_r5
+region: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=0 sinks=0
+ok: false
+error: fused CUDA emitter requires a non-library generated region
+entry_name: ptir_fused_14f667a41eb30669_r5
+=== end
+=== pentathlon_iter#0 fused#0
+entry_name: ptir_fused_14f667a41eb30669_r0
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_14f667a41eb30669_r0
+source: bytes=87627 prefix=@runtime tail_bytes=42350 fnv1a64=0x2dd0ac012644fc8f
+=== end
+=== pentathlon_iter#0 fused#1
+entry_name: ptir_fused_14f667a41eb30669_r1
+region: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=1 sinks=0
+ok: false
+error: fused CUDA emitter requires a non-library generated region
+entry_name: ptir_fused_14f667a41eb30669_r1
+=== end
+=== pentathlon_iter#0 fused#2
+entry_name: ptir_fused_14f667a41eb30669_r2
+region: library=0 library_op=0 schedule=1 nodes=3 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_14f667a41eb30669_r2
+source: bytes=87853 prefix=@runtime tail_bytes=42576 fnv1a64=0xb165483ceff9528e
+=== end
+=== pentathlon_iter#0 fused#3
+entry_name: ptir_fused_14f667a41eb30669_r3
+region: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=0 sinks=0
+ok: false
+error: fused CUDA emitter requires a non-library generated region
+entry_name: ptir_fused_14f667a41eb30669_r3
+=== end
+=== pentathlon_iter#1 singleton#0
+entry_name: ptir_fused_dff3bc6795a9dcdf_r0
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_dff3bc6795a9dcdf_r0
+source: bytes=87627 prefix=@runtime tail_bytes=42350 fnv1a64=0x2ae01d7ed2e4a958
+=== end
+=== pentathlon_iter#1 singleton#1
+entry_name: ptir_fused_dff3bc6795a9dcdf_r1
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_dff3bc6795a9dcdf_r1
+source: bytes=87547 prefix=@runtime tail_bytes=42270 fnv1a64=0xf239842d84171405
+=== end
+=== pentathlon_iter#1 singleton#2
+entry_name: ptir_fused_dff3bc6795a9dcdf_r2
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_dff3bc6795a9dcdf_r2
+source: bytes=87547 prefix=@runtime tail_bytes=42270 fnv1a64=0xba81152e89cac289
+=== end
+=== pentathlon_iter#1 singleton#3
+entry_name: ptir_fused_dff3bc6795a9dcdf_r3
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_dff3bc6795a9dcdf_r3
+source: bytes=87298 prefix=@runtime tail_bytes=42021 fnv1a64=0x93f832b77f59c85a
+=== end
+=== pentathlon_iter#1 singleton#4
+entry_name: ptir_fused_dff3bc6795a9dcdf_r4
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_dff3bc6795a9dcdf_r4
+source: bytes=87300 prefix=@runtime tail_bytes=42023 fnv1a64=0x28479a7934c7ea1b
+=== end
+=== pentathlon_iter#1 singleton#5
+entry_name: ptir_fused_dff3bc6795a9dcdf_r5
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_dff3bc6795a9dcdf_r5
+source: bytes=87325 prefix=@runtime tail_bytes=42048 fnv1a64=0x4f7a264f849f3e1c
+=== end
+=== pentathlon_iter#1 singleton#6
+entry_name: ptir_fused_dff3bc6795a9dcdf_r6
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_dff3bc6795a9dcdf_r6
+source: bytes=87311 prefix=@runtime tail_bytes=42034 fnv1a64=0x4b472fec9983e0ee
+=== end
+=== pentathlon_iter#1 singleton#7
+entry_name: ptir_fused_dff3bc6795a9dcdf_r7
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_dff3bc6795a9dcdf_r7
+source: bytes=87298 prefix=@runtime tail_bytes=42021 fnv1a64=0xd92f33b7053e1083
+=== end
+=== pentathlon_iter#1 singleton#8
+entry_name: ptir_fused_dff3bc6795a9dcdf_r8
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_dff3bc6795a9dcdf_r8
+source: bytes=87311 prefix=@runtime tail_bytes=42034 fnv1a64=0xf4d3ecaf93efbd0d
+=== end
+=== pentathlon_iter#1 singleton#9
+entry_name: ptir_fused_dff3bc6795a9dcdf_r9
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_dff3bc6795a9dcdf_r9
+source: bytes=87300 prefix=@runtime tail_bytes=42023 fnv1a64=0xe99a03620ca30245
+=== end
+=== pentathlon_iter#1 singleton#10
+entry_name: ptir_fused_dff3bc6795a9dcdf_r10
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_dff3bc6795a9dcdf_r10
+source: bytes=87328 prefix=@runtime tail_bytes=42051 fnv1a64=0x16c26dcb125ef27e
+=== end
+=== pentathlon_iter#1 singleton#11
+entry_name: ptir_fused_dff3bc6795a9dcdf_r11
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_dff3bc6795a9dcdf_r11
+source: bytes=87301 prefix=@runtime tail_bytes=42024 fnv1a64=0x018f2ca88468b4ce
+=== end
+=== pentathlon_iter#1 singleton#12
+entry_name: ptir_fused_dff3bc6795a9dcdf_r12
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_dff3bc6795a9dcdf_r12
+source: bytes=87304 prefix=@runtime tail_bytes=42027 fnv1a64=0xecf8798d2bc0693d
+=== end
+=== pentathlon_iter#1 singleton#13
+entry_name: ptir_fused_dff3bc6795a9dcdf_r13
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_dff3bc6795a9dcdf_r13
+source: bytes=87329 prefix=@runtime tail_bytes=42052 fnv1a64=0x9ce740df7c57ed85
+=== end
+=== pentathlon_iter#1 singleton#14
+entry_name: ptir_fused_dff3bc6795a9dcdf_r14
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_dff3bc6795a9dcdf_r14
+source: bytes=87315 prefix=@runtime tail_bytes=42038 fnv1a64=0xd7cb5273ec4713e0
+=== end
+=== pentathlon_iter#1 singleton#15
+entry_name: ptir_fused_dff3bc6795a9dcdf_r15
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_dff3bc6795a9dcdf_r15
+source: bytes=87302 prefix=@runtime tail_bytes=42025 fnv1a64=0x5de649e6d9e44e55
+=== end
+=== pentathlon_iter#1 singleton#16
+entry_name: ptir_fused_dff3bc6795a9dcdf_r16
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_dff3bc6795a9dcdf_r16
+source: bytes=87315 prefix=@runtime tail_bytes=42038 fnv1a64=0xae937cd2374446f3
+=== end
+=== pentathlon_iter#1 singleton#17
+entry_name: ptir_fused_dff3bc6795a9dcdf_r17
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_dff3bc6795a9dcdf_r17
+source: bytes=87304 prefix=@runtime tail_bytes=42027 fnv1a64=0xa4f4e756d63ed60b
+=== end
+=== pentathlon_iter#1 singleton#18
+entry_name: ptir_fused_dff3bc6795a9dcdf_r18
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_dff3bc6795a9dcdf_r18
+source: bytes=87330 prefix=@runtime tail_bytes=42053 fnv1a64=0x2c2ac7030ec7e99c
+=== end
+=== pentathlon_iter#1 singleton#19
+entry_name: ptir_fused_dff3bc6795a9dcdf_r19
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_dff3bc6795a9dcdf_r19
+source: bytes=87649 prefix=@runtime tail_bytes=42372 fnv1a64=0xfe8341cfcbdb0554
+=== end
+=== pentathlon_iter#1 singleton#20
+entry_name: ptir_fused_dff3bc6795a9dcdf_r20
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_dff3bc6795a9dcdf_r20
+source: bytes=87330 prefix=@runtime tail_bytes=42053 fnv1a64=0x43eccdee90c40187
+=== end
+=== pentathlon_iter#1 singleton#21
+entry_name: ptir_fused_dff3bc6795a9dcdf_r21
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_dff3bc6795a9dcdf_r21
+source: bytes=87330 prefix=@runtime tail_bytes=42053 fnv1a64=0x21fa43cfdfbc2e59
+=== end
+=== pentathlon_iter#1 singleton#22
+entry_name: ptir_fused_dff3bc6795a9dcdf_r22
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_dff3bc6795a9dcdf_r22
+source: bytes=87649 prefix=@runtime tail_bytes=42372 fnv1a64=0x7e36eea2bfbbad14
+=== end
+=== pentathlon_iter#1 singleton#23
+entry_name: ptir_fused_dff3bc6795a9dcdf_r23
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_dff3bc6795a9dcdf_r23
+source: bytes=87343 prefix=@runtime tail_bytes=42066 fnv1a64=0x9ceaa7b7c68218e1
+=== end
+=== pentathlon_iter#1 singleton#24
+entry_name: ptir_fused_dff3bc6795a9dcdf_r24
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_dff3bc6795a9dcdf_r24
+source: bytes=87302 prefix=@runtime tail_bytes=42025 fnv1a64=0x12d38264d46d46d4
+=== end
+=== pentathlon_iter#1 singleton#25
+entry_name: ptir_fused_dff3bc6795a9dcdf_r25
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_dff3bc6795a9dcdf_r25
+source: bytes=87328 prefix=@runtime tail_bytes=42051 fnv1a64=0x3215f275a8f51e34
+=== end
+=== pentathlon_iter#1 singleton#26
+entry_name: ptir_fused_dff3bc6795a9dcdf_r26
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_dff3bc6795a9dcdf_r26
+source: bytes=87304 prefix=@runtime tail_bytes=42027 fnv1a64=0xfe3fdedbc305e971
+=== end
+=== pentathlon_iter#1 singleton#27
+entry_name: ptir_fused_dff3bc6795a9dcdf_r27
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_dff3bc6795a9dcdf_r27
+source: bytes=87649 prefix=@runtime tail_bytes=42372 fnv1a64=0x2594c71725fff506
+=== end
+=== pentathlon_iter#1 singleton#28
+entry_name: ptir_fused_dff3bc6795a9dcdf_r28
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_dff3bc6795a9dcdf_r28
+source: bytes=87330 prefix=@runtime tail_bytes=42053 fnv1a64=0x780c708504daceeb
+=== end
+=== pentathlon_iter#1 singleton#29
+entry_name: ptir_fused_dff3bc6795a9dcdf_r29
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_dff3bc6795a9dcdf_r29
+source: bytes=87330 prefix=@runtime tail_bytes=42053 fnv1a64=0x263e98858a86ba32
+=== end
+=== pentathlon_iter#1 singleton#30
+entry_name: ptir_fused_dff3bc6795a9dcdf_r30
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_dff3bc6795a9dcdf_r30
+source: bytes=87344 prefix=@runtime tail_bytes=42067 fnv1a64=0x301974b8fb22864e
+=== end
+=== pentathlon_iter#1 singleton#31
+entry_name: ptir_fused_dff3bc6795a9dcdf_r31
+region: library=1 library_op=1 schedule=3 nodes=1 inputs=1 outputs=2 sinks=0
+ok: false
+error: fused CUDA emitter requires a non-library generated region
+entry_name: ptir_fused_dff3bc6795a9dcdf_r31
+=== end
+=== pentathlon_iter#1 singleton#32
+entry_name: ptir_fused_dff3bc6795a9dcdf_r32
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_dff3bc6795a9dcdf_r32
+source: bytes=87328 prefix=@runtime tail_bytes=42051 fnv1a64=0x506a1571c58bcf01
+=== end
+=== pentathlon_iter#1 singleton#33
+entry_name: ptir_fused_dff3bc6795a9dcdf_r33
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_dff3bc6795a9dcdf_r33
+source: bytes=87328 prefix=@runtime tail_bytes=42051 fnv1a64=0xd1befacd6fccceed
+=== end
+=== pentathlon_iter#1 singleton#34
+entry_name: ptir_fused_dff3bc6795a9dcdf_r34
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+entry_name: ptir_fused_dff3bc6795a9dcdf_r34
+source: bytes=89090 prefix=@runtime tail_bytes=43813 fnv1a64=0x8d22e2d137574d34
+=== end
+=== pentathlon_iter#1 singleton#35
+entry_name: ptir_fused_dff3bc6795a9dcdf_r35
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+entry_name: ptir_fused_dff3bc6795a9dcdf_r35
+source: bytes=89090 prefix=@runtime tail_bytes=43813 fnv1a64=0x44002f8c04bf709f
+=== end
+=== pentathlon_iter#1 singleton#36
+entry_name: ptir_fused_dff3bc6795a9dcdf_r36
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_dff3bc6795a9dcdf_r36
+source: bytes=87630 prefix=@runtime tail_bytes=42353 fnv1a64=0xe1e270e4fc3e80d0
+=== end
+=== pentathlon_iter#1 singleton#37
+entry_name: ptir_fused_dff3bc6795a9dcdf_r37
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+entry_name: ptir_fused_dff3bc6795a9dcdf_r37
+source: bytes=89090 prefix=@runtime tail_bytes=43813 fnv1a64=0xdc54c4b2c05a574c
+=== end
+=== pentathlon_iter#1 fused#0
+entry_name: ptir_fused_dff3bc6795a9dcdf_r0
+region: library=0 library_op=0 schedule=1 nodes=31 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_dff3bc6795a9dcdf_r0
+source: bytes=97797 prefix=@runtime tail_bytes=52520 fnv1a64=0x43c080894f5a3bdf
+=== end
+=== pentathlon_iter#1 fused#1
+entry_name: ptir_fused_dff3bc6795a9dcdf_r1
+region: library=1 library_op=1 schedule=3 nodes=1 inputs=1 outputs=2 sinks=0
+ok: false
+error: fused CUDA emitter requires a non-library generated region
+entry_name: ptir_fused_dff3bc6795a9dcdf_r1
+=== end
+=== pentathlon_iter#1 fused#2
+entry_name: ptir_fused_dff3bc6795a9dcdf_r2
+region: library=0 library_op=0 schedule=1 nodes=6 inputs=2 outputs=0 sinks=3
+ok: true
+error: 
+entry_name: ptir_fused_dff3bc6795a9dcdf_r2
+source: bytes=93851 prefix=@runtime tail_bytes=48574 fnv1a64=0x235a390276833ee0
+=== end
+=== pivot_predicates_multistage#1 singleton#0
+entry_name: ptir_fused_09a2719886970a85_r0
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_09a2719886970a85_r0
+source: bytes=87627 prefix=@runtime tail_bytes=42350 fnv1a64=0x14d54da5431e8b61
+=== end
+=== pivot_predicates_multistage#1 singleton#1
+entry_name: ptir_fused_09a2719886970a85_r1
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_09a2719886970a85_r1
+source: bytes=87298 prefix=@runtime tail_bytes=42021 fnv1a64=0x8f1324e6e2ecc057
+=== end
+=== pivot_predicates_multistage#1 singleton#2
+entry_name: ptir_fused_09a2719886970a85_r2
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_09a2719886970a85_r2
+source: bytes=87300 prefix=@runtime tail_bytes=42023 fnv1a64=0x5deb023c15d86bfc
+=== end
+=== pivot_predicates_multistage#1 singleton#3
+entry_name: ptir_fused_09a2719886970a85_r3
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_09a2719886970a85_r3
+source: bytes=87325 prefix=@runtime tail_bytes=42048 fnv1a64=0x12c289ac68a63755
+=== end
+=== pivot_predicates_multistage#1 singleton#4
+entry_name: ptir_fused_09a2719886970a85_r4
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_09a2719886970a85_r4
+source: bytes=87311 prefix=@runtime tail_bytes=42034 fnv1a64=0xd4fc3ed9692703c3
+=== end
+=== pivot_predicates_multistage#1 singleton#5
+entry_name: ptir_fused_09a2719886970a85_r5
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_09a2719886970a85_r5
+source: bytes=87298 prefix=@runtime tail_bytes=42021 fnv1a64=0x86eab09d91260810
+=== end
+=== pivot_predicates_multistage#1 singleton#6
+entry_name: ptir_fused_09a2719886970a85_r6
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_09a2719886970a85_r6
+source: bytes=87300 prefix=@runtime tail_bytes=42023 fnv1a64=0x3854c981279ef614
+=== end
+=== pivot_predicates_multistage#1 singleton#7
+entry_name: ptir_fused_09a2719886970a85_r7
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_09a2719886970a85_r7
+source: bytes=87325 prefix=@runtime tail_bytes=42048 fnv1a64=0x233176bece88611b
+=== end
+=== pivot_predicates_multistage#1 singleton#8
+entry_name: ptir_fused_09a2719886970a85_r8
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_09a2719886970a85_r8
+source: bytes=87547 prefix=@runtime tail_bytes=42270 fnv1a64=0x45856a67aad2a5df
+=== end
+=== pivot_predicates_multistage#1 singleton#9
+entry_name: ptir_fused_09a2719886970a85_r9
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_09a2719886970a85_r9
+source: bytes=87547 prefix=@runtime tail_bytes=42270 fnv1a64=0x7f78aabb1ff2e1fd
+=== end
+=== pivot_predicates_multistage#1 singleton#10
+entry_name: ptir_fused_09a2719886970a85_r10
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_09a2719886970a85_r10
+source: bytes=87329 prefix=@runtime tail_bytes=42052 fnv1a64=0x7238c5ecdde91784
+=== end
+=== pivot_predicates_multistage#1 singleton#11
+entry_name: ptir_fused_09a2719886970a85_r11
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_09a2719886970a85_r11
+source: bytes=87324 prefix=@runtime tail_bytes=42047 fnv1a64=0x57ee93b380214914
+=== end
+=== pivot_predicates_multistage#1 singleton#12
+entry_name: ptir_fused_09a2719886970a85_r12
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+entry_name: ptir_fused_09a2719886970a85_r12
+source: bytes=89090 prefix=@runtime tail_bytes=43813 fnv1a64=0x242291503c408d0a
+=== end
+=== pivot_predicates_multistage#1 singleton#13
+entry_name: ptir_fused_09a2719886970a85_r13
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+entry_name: ptir_fused_09a2719886970a85_r13
+source: bytes=89090 prefix=@runtime tail_bytes=43813 fnv1a64=0xf5d47e9b632c860b
+=== end
+=== pivot_predicates_multistage#1 fused#0
+entry_name: ptir_fused_09a2719886970a85_r0
+region: library=0 library_op=0 schedule=1 nodes=14 inputs=0 outputs=0 sinks=2
+ok: true
+error: 
+entry_name: ptir_fused_09a2719886970a85_r0
+source: bytes=95512 prefix=@runtime tail_bytes=50235 fnv1a64=0x79946b2d4d557cd1
+=== end
+=== section3_masked_gumbel#0 singleton#0
+entry_name: ptir_fused_4cf3882bf2fff913_r0
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_4cf3882bf2fff913_r0
+source: bytes=87627 prefix=@runtime tail_bytes=42350 fnv1a64=0x00a04422aa54c8bd
+=== end
+=== section3_masked_gumbel#0 singleton#1
+entry_name: ptir_fused_4cf3882bf2fff913_r1
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_4cf3882bf2fff913_r1
+source: bytes=87324 prefix=@runtime tail_bytes=42047 fnv1a64=0x8714ca367c84f3f5
+=== end
+=== section3_masked_gumbel#0 singleton#2
+entry_name: ptir_fused_4cf3882bf2fff913_r2
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_4cf3882bf2fff913_r2
+source: bytes=87547 prefix=@runtime tail_bytes=42270 fnv1a64=0xa79c5c833be8b6b5
+=== end
+=== section3_masked_gumbel#0 singleton#3
+entry_name: ptir_fused_4cf3882bf2fff913_r3
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_4cf3882bf2fff913_r3
+source: bytes=87547 prefix=@runtime tail_bytes=42270 fnv1a64=0x8f45feac27522fff
+=== end
+=== section3_masked_gumbel#0 singleton#4
+entry_name: ptir_fused_4cf3882bf2fff913_r4
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_4cf3882bf2fff913_r4
+source: bytes=87313 prefix=@runtime tail_bytes=42036 fnv1a64=0xc19146f90fe10280
+=== end
+=== section3_masked_gumbel#0 singleton#5
+entry_name: ptir_fused_4cf3882bf2fff913_r5
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_4cf3882bf2fff913_r5
+source: bytes=87643 prefix=@runtime tail_bytes=42366 fnv1a64=0xe8a47ecc6cd41ffd
+=== end
+=== section3_masked_gumbel#0 singleton#6
+entry_name: ptir_fused_4cf3882bf2fff913_r6
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_4cf3882bf2fff913_r6
+source: bytes=87338 prefix=@runtime tail_bytes=42061 fnv1a64=0x55510d52d19755cf
+=== end
+=== section3_masked_gumbel#0 singleton#7
+entry_name: ptir_fused_4cf3882bf2fff913_r7
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_4cf3882bf2fff913_r7
+source: bytes=87325 prefix=@runtime tail_bytes=42048 fnv1a64=0x043a3a043856d17e
+=== end
+=== section3_masked_gumbel#0 singleton#8
+entry_name: ptir_fused_4cf3882bf2fff913_r8
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_4cf3882bf2fff913_r8
+source: bytes=87274 prefix=@runtime tail_bytes=41997 fnv1a64=0xc7be96062b54215b
+=== end
+=== section3_masked_gumbel#0 singleton#9
+entry_name: ptir_fused_4cf3882bf2fff913_r9
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_4cf3882bf2fff913_r9
+source: bytes=87300 prefix=@runtime tail_bytes=42023 fnv1a64=0x7e6da5cd6961136a
+=== end
+=== section3_masked_gumbel#0 singleton#10
+entry_name: ptir_fused_4cf3882bf2fff913_r10
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_4cf3882bf2fff913_r10
+source: bytes=87328 prefix=@runtime tail_bytes=42051 fnv1a64=0xb7740662f3201b61
+=== end
+=== section3_masked_gumbel#0 singleton#11
+entry_name: ptir_fused_4cf3882bf2fff913_r11
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+entry_name: ptir_fused_4cf3882bf2fff913_r11
+source: bytes=89090 prefix=@runtime tail_bytes=43813 fnv1a64=0x536cf2961da3efcc
+=== end
+=== section3_masked_gumbel#0 singleton#12
+entry_name: ptir_fused_4cf3882bf2fff913_r12
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_4cf3882bf2fff913_r12
+source: bytes=87327 prefix=@runtime tail_bytes=42050 fnv1a64=0x5ba7af72cba2d260
+=== end
+=== section3_masked_gumbel#0 singleton#13
+entry_name: ptir_fused_4cf3882bf2fff913_r13
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+entry_name: ptir_fused_4cf3882bf2fff913_r13
+source: bytes=89090 prefix=@runtime tail_bytes=43813 fnv1a64=0x2856d374966003b1
+=== end
+=== section3_masked_gumbel#0 singleton#14
+entry_name: ptir_fused_4cf3882bf2fff913_r14
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_4cf3882bf2fff913_r14
+source: bytes=87550 prefix=@runtime tail_bytes=42273 fnv1a64=0xfda4a6c2499e29cf
+=== end
+=== section3_masked_gumbel#0 singleton#15
+entry_name: ptir_fused_4cf3882bf2fff913_r15
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_4cf3882bf2fff913_r15
+source: bytes=87649 prefix=@runtime tail_bytes=42372 fnv1a64=0xde92e5a97832ab9d
+=== end
+=== section3_masked_gumbel#0 singleton#16
+entry_name: ptir_fused_4cf3882bf2fff913_r16
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_4cf3882bf2fff913_r16
+source: bytes=87330 prefix=@runtime tail_bytes=42053 fnv1a64=0xa82e331c6110806b
+=== end
+=== section3_masked_gumbel#0 singleton#17
+entry_name: ptir_fused_4cf3882bf2fff913_r17
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+entry_name: ptir_fused_4cf3882bf2fff913_r17
+source: bytes=89090 prefix=@runtime tail_bytes=43813 fnv1a64=0x69e6ba5cbef5d0ea
+=== end
+=== section3_masked_gumbel#0 singleton#18
+entry_name: ptir_fused_4cf3882bf2fff913_r18
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+entry_name: ptir_fused_4cf3882bf2fff913_r18
+source: bytes=89090 prefix=@runtime tail_bytes=43813 fnv1a64=0xbc0994fb6137577f
+=== end
+=== section3_masked_gumbel#0 fused#0
+entry_name: ptir_fused_4cf3882bf2fff913_r0
+region: library=0 library_op=0 schedule=1 nodes=19 inputs=0 outputs=0 sinks=4
+ok: true
+error: 
+entry_name: ptir_fused_4cf3882bf2fff913_r0
+source: bytes=100881 prefix=@runtime tail_bytes=55604 fnv1a64=0x17418fd6d282b6d9
+=== end
+=== structured_masks#0 singleton#0
+entry_name: ptir_fused_1752e0dfb0bf5827_r0
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_1752e0dfb0bf5827_r0
+source: bytes=87547 prefix=@runtime tail_bytes=42270 fnv1a64=0x8ebb796afe025144
+=== end
+=== structured_masks#0 singleton#1
+entry_name: ptir_fused_1752e0dfb0bf5827_r1
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_1752e0dfb0bf5827_r1
+source: bytes=87547 prefix=@runtime tail_bytes=42270 fnv1a64=0xa94b9d358ecbaa4e
+=== end
+=== structured_masks#0 singleton#2
+entry_name: ptir_fused_1752e0dfb0bf5827_r2
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_1752e0dfb0bf5827_r2
+source: bytes=87547 prefix=@runtime tail_bytes=42270 fnv1a64=0x0d7b5b1a21058e0c
+=== end
+=== structured_masks#0 singleton#3
+entry_name: ptir_fused_1752e0dfb0bf5827_r3
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_1752e0dfb0bf5827_r3
+source: bytes=87313 prefix=@runtime tail_bytes=42036 fnv1a64=0xf0bd2288c746492a
+=== end
+=== structured_masks#0 singleton#4
+entry_name: ptir_fused_1752e0dfb0bf5827_r4
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+entry_name: ptir_fused_1752e0dfb0bf5827_r4
+source: bytes=89087 prefix=@runtime tail_bytes=43810 fnv1a64=0xdd4d966a2cbe8b1d
+=== end
+=== structured_masks#0 singleton#5
+entry_name: ptir_fused_1752e0dfb0bf5827_r5
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_1752e0dfb0bf5827_r5
+source: bytes=87313 prefix=@runtime tail_bytes=42036 fnv1a64=0xc9b83ce008c65f86
+=== end
+=== structured_masks#0 singleton#6
+entry_name: ptir_fused_1752e0dfb0bf5827_r6
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+entry_name: ptir_fused_1752e0dfb0bf5827_r6
+source: bytes=89087 prefix=@runtime tail_bytes=43810 fnv1a64=0x156d55b831bf76f8
+=== end
+=== structured_masks#0 singleton#7
+entry_name: ptir_fused_1752e0dfb0bf5827_r7
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_1752e0dfb0bf5827_r7
+source: bytes=87313 prefix=@runtime tail_bytes=42036 fnv1a64=0x697c9f8b90a86472
+=== end
+=== structured_masks#0 singleton#8
+entry_name: ptir_fused_1752e0dfb0bf5827_r8
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+entry_name: ptir_fused_1752e0dfb0bf5827_r8
+source: bytes=89087 prefix=@runtime tail_bytes=43810 fnv1a64=0x9ead18ba694f4f33
+=== end
+=== structured_masks#0 singleton#9
+entry_name: ptir_fused_1752e0dfb0bf5827_r9
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_1752e0dfb0bf5827_r9
+source: bytes=87324 prefix=@runtime tail_bytes=42047 fnv1a64=0xe6e6e904721193d6
+=== end
+=== structured_masks#0 singleton#10
+entry_name: ptir_fused_1752e0dfb0bf5827_r10
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_1752e0dfb0bf5827_r10
+source: bytes=87302 prefix=@runtime tail_bytes=42025 fnv1a64=0xe7eaea549d568d45
+=== end
+=== structured_masks#0 singleton#11
+entry_name: ptir_fused_1752e0dfb0bf5827_r11
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_1752e0dfb0bf5827_r11
+source: bytes=87645 prefix=@runtime tail_bytes=42368 fnv1a64=0x0e7271330ba8e6a4
+=== end
+=== structured_masks#0 singleton#12
+entry_name: ptir_fused_1752e0dfb0bf5827_r12
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_1752e0dfb0bf5827_r12
+source: bytes=87327 prefix=@runtime tail_bytes=42050 fnv1a64=0x1d0da07b65171393
+=== end
+=== structured_masks#0 singleton#13
+entry_name: ptir_fused_1752e0dfb0bf5827_r13
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_1752e0dfb0bf5827_r13
+source: bytes=87649 prefix=@runtime tail_bytes=42372 fnv1a64=0x934a82bcf4a18b5e
+=== end
+=== structured_masks#0 singleton#14
+entry_name: ptir_fused_1752e0dfb0bf5827_r14
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_1752e0dfb0bf5827_r14
+source: bytes=87329 prefix=@runtime tail_bytes=42052 fnv1a64=0x350dc9185cfd11df
+=== end
+=== structured_masks#0 singleton#15
+entry_name: ptir_fused_1752e0dfb0bf5827_r15
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_1752e0dfb0bf5827_r15
+source: bytes=87329 prefix=@runtime tail_bytes=42052 fnv1a64=0x058c26a8bd39b29b
+=== end
+=== structured_masks#0 singleton#16
+entry_name: ptir_fused_1752e0dfb0bf5827_r16
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_1752e0dfb0bf5827_r16
+source: bytes=87330 prefix=@runtime tail_bytes=42053 fnv1a64=0x669643d781b84e4f
+=== end
+=== structured_masks#0 singleton#17
+entry_name: ptir_fused_1752e0dfb0bf5827_r17
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_1752e0dfb0bf5827_r17
+source: bytes=87347 prefix=@runtime tail_bytes=42070 fnv1a64=0x48fd4e942dee23be
+=== end
+=== structured_masks#0 singleton#18
+entry_name: ptir_fused_1752e0dfb0bf5827_r18
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_1752e0dfb0bf5827_r18
+source: bytes=87329 prefix=@runtime tail_bytes=42052 fnv1a64=0xffc9b93c8459b2f1
+=== end
+=== structured_masks#0 singleton#19
+entry_name: ptir_fused_1752e0dfb0bf5827_r19
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_1752e0dfb0bf5827_r19
+source: bytes=87649 prefix=@runtime tail_bytes=42372 fnv1a64=0x1d8f1a35e722df76
+=== end
+=== structured_masks#0 singleton#20
+entry_name: ptir_fused_1752e0dfb0bf5827_r20
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_1752e0dfb0bf5827_r20
+source: bytes=87330 prefix=@runtime tail_bytes=42053 fnv1a64=0x4ae845120af4f8f0
+=== end
+=== structured_masks#0 singleton#21
+entry_name: ptir_fused_1752e0dfb0bf5827_r21
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_1752e0dfb0bf5827_r21
+source: bytes=87347 prefix=@runtime tail_bytes=42070 fnv1a64=0x8e703890ab12da98
+=== end
+=== structured_masks#0 singleton#22
+entry_name: ptir_fused_1752e0dfb0bf5827_r22
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_1752e0dfb0bf5827_r22
+source: bytes=87328 prefix=@runtime tail_bytes=42051 fnv1a64=0xa74afbff06f30322
+=== end
+=== structured_masks#0 singleton#23
+entry_name: ptir_fused_1752e0dfb0bf5827_r23
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_1752e0dfb0bf5827_r23
+source: bytes=87328 prefix=@runtime tail_bytes=42051 fnv1a64=0x027cfe6163e93c98
+=== end
+=== structured_masks#0 singleton#24
+entry_name: ptir_fused_1752e0dfb0bf5827_r24
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_1752e0dfb0bf5827_r24
+source: bytes=87330 prefix=@runtime tail_bytes=42053 fnv1a64=0x464d97dfc2db8c96
+=== end
+=== structured_masks#0 singleton#25
+entry_name: ptir_fused_1752e0dfb0bf5827_r25
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_1752e0dfb0bf5827_r25
+source: bytes=87315 prefix=@runtime tail_bytes=42038 fnv1a64=0x3612fd733437d6ca
+=== end
+=== structured_masks#0 singleton#26
+entry_name: ptir_fused_1752e0dfb0bf5827_r26
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_1752e0dfb0bf5827_r26
+source: bytes=87350 prefix=@runtime tail_bytes=42073 fnv1a64=0xf84d36a79cd508e7
+=== end
+=== structured_masks#0 singleton#27
+entry_name: ptir_fused_1752e0dfb0bf5827_r27
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_1752e0dfb0bf5827_r27
+source: bytes=87315 prefix=@runtime tail_bytes=42038 fnv1a64=0x99b0dfb3d6aaba4e
+=== end
+=== structured_masks#0 singleton#28
+entry_name: ptir_fused_1752e0dfb0bf5827_r28
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+entry_name: ptir_fused_1752e0dfb0bf5827_r28
+source: bytes=89090 prefix=@runtime tail_bytes=43813 fnv1a64=0xa3a2a5b836f1f3b4
+=== end
+=== structured_masks#0 fused#0
+entry_name: ptir_fused_1752e0dfb0bf5827_r0
+region: library=0 library_op=0 schedule=1 nodes=29 inputs=0 outputs=0 sinks=4
+ok: true
+error: 
+entry_name: ptir_fused_1752e0dfb0bf5827_r0
+source: bytes=103762 prefix=@runtime tail_bytes=58485 fnv1a64=0xd0a2431375001e63
+=== end
+=== synthetic_sort_desc#0 singleton#0
+entry_name: ptir_fused_dc132d209d85d958_r0
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_dc132d209d85d958_r0
+source: bytes=87547 prefix=@runtime tail_bytes=42270 fnv1a64=0x583de0191846b3a5
+=== end
+=== synthetic_sort_desc#0 singleton#1
+entry_name: ptir_fused_dc132d209d85d958_r1
+region: library=1 library_op=2 schedule=3 nodes=1 inputs=1 outputs=2 sinks=0
+ok: false
+error: fused CUDA emitter requires a non-library generated region
+entry_name: ptir_fused_dc132d209d85d958_r1
+=== end
+=== synthetic_sort_desc#0 singleton#2
+entry_name: ptir_fused_dc132d209d85d958_r2
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+entry_name: ptir_fused_dc132d209d85d958_r2
+source: bytes=89087 prefix=@runtime tail_bytes=43810 fnv1a64=0xfbe75d895a5cf442
+=== end
+=== synthetic_sort_desc#0 singleton#3
+entry_name: ptir_fused_dc132d209d85d958_r3
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+entry_name: ptir_fused_dc132d209d85d958_r3
+source: bytes=89087 prefix=@runtime tail_bytes=43810 fnv1a64=0xdfff83e9f92bebd7
+=== end
+=== synthetic_sort_desc#0 fused#0
+entry_name: ptir_fused_dc132d209d85d958_r0
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_dc132d209d85d958_r0
+source: bytes=87547 prefix=@runtime tail_bytes=42270 fnv1a64=0x583de0191846b3a5
+=== end
+=== synthetic_sort_desc#0 fused#1
+entry_name: ptir_fused_dc132d209d85d958_r1
+region: library=1 library_op=2 schedule=3 nodes=1 inputs=1 outputs=2 sinks=0
+ok: false
+error: fused CUDA emitter requires a non-library generated region
+entry_name: ptir_fused_dc132d209d85d958_r1
+=== end
+=== synthetic_sort_desc#0 fused#2
+entry_name: ptir_fused_dc132d209d85d958_r2
+region: library=0 library_op=0 schedule=0 nodes=2 inputs=2 outputs=0 sinks=2
+ok: true
+error: 
+entry_name: ptir_fused_dc132d209d85d958_r2
+source: bytes=91159 prefix=@runtime tail_bytes=45882 fnv1a64=0xd7166978e7e2dba0
+=== end
+=== synthetic_matmul#0 singleton#0
+entry_name: ptir_fused_92d86f95b487e729_r0
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_92d86f95b487e729_r0
+source: bytes=87547 prefix=@runtime tail_bytes=42270 fnv1a64=0x3af27c493cddcbeb
+=== end
+=== synthetic_matmul#0 singleton#1
+entry_name: ptir_fused_92d86f95b487e729_r1
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_92d86f95b487e729_r1
+source: bytes=87547 prefix=@runtime tail_bytes=42270 fnv1a64=0x0131999bacc13b49
+=== end
+=== synthetic_matmul#0 singleton#2
+entry_name: ptir_fused_92d86f95b487e729_r2
+region: library=1 library_op=4 schedule=3 nodes=1 inputs=2 outputs=1 sinks=0
+ok: false
+error: fused CUDA emitter requires a non-library generated region
+entry_name: ptir_fused_92d86f95b487e729_r2
+=== end
+=== synthetic_matmul#0 singleton#3
+entry_name: ptir_fused_92d86f95b487e729_r3
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+entry_name: ptir_fused_92d86f95b487e729_r3
+source: bytes=89087 prefix=@runtime tail_bytes=43810 fnv1a64=0xc901584c5a916f41
+=== end
+=== synthetic_matmul#0 fused#0
+entry_name: ptir_fused_92d86f95b487e729_r0
+region: library=0 library_op=0 schedule=0 nodes=2 inputs=0 outputs=2 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_92d86f95b487e729_r0
+source: bytes=88079 prefix=@runtime tail_bytes=42802 fnv1a64=0x54b9af5152c217a7
+=== end
+=== synthetic_matmul#0 fused#1
+entry_name: ptir_fused_92d86f95b487e729_r1
+region: library=1 library_op=4 schedule=3 nodes=1 inputs=2 outputs=1 sinks=0
+ok: false
+error: fused CUDA emitter requires a non-library generated region
+entry_name: ptir_fused_92d86f95b487e729_r1
+=== end
+=== synthetic_matmul#0 fused#2
+entry_name: ptir_fused_92d86f95b487e729_r2
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+entry_name: ptir_fused_92d86f95b487e729_r2
+source: bytes=89087 prefix=@runtime tail_bytes=43810 fnv1a64=0x193c570dc38eb500
+=== end
+=== synthetic_mtp_drafts#0 singleton#0
+entry_name: ptir_fused_9eda8aa42400c4c2_r0
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_9eda8aa42400c4c2_r0
+source: bytes=87690 prefix=@runtime tail_bytes=42413 fnv1a64=0x8b709038736026ea
+=== end
+=== synthetic_mtp_drafts#0 singleton#1
+entry_name: ptir_fused_9eda8aa42400c4c2_r1
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_9eda8aa42400c4c2_r1
+source: bytes=87627 prefix=@runtime tail_bytes=42350 fnv1a64=0x26b6980464945572
+=== end
+=== synthetic_mtp_drafts#0 singleton#2
+entry_name: ptir_fused_9eda8aa42400c4c2_r2
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_9eda8aa42400c4c2_r2
+source: bytes=87578 prefix=@runtime tail_bytes=42301 fnv1a64=0x000b5d26ca6bdc52
+=== end
+=== synthetic_mtp_drafts#0 singleton#3
+entry_name: ptir_fused_9eda8aa42400c4c2_r3
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_9eda8aa42400c4c2_r3
+source: bytes=87311 prefix=@runtime tail_bytes=42034 fnv1a64=0x256e664c53a0a6bb
+=== end
+=== synthetic_mtp_drafts#0 singleton#4
+entry_name: ptir_fused_9eda8aa42400c4c2_r4
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_9eda8aa42400c4c2_r4
+source: bytes=87325 prefix=@runtime tail_bytes=42048 fnv1a64=0x50dfddffadf069ae
+=== end
+=== synthetic_mtp_drafts#0 singleton#5
+entry_name: ptir_fused_9eda8aa42400c4c2_r5
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+ok: true
+error: 
+entry_name: ptir_fused_9eda8aa42400c4c2_r5
+source: bytes=89087 prefix=@runtime tail_bytes=43810 fnv1a64=0xaf26a0f2a90a954b
+=== end
+=== synthetic_mtp_drafts#0 fused#0
+entry_name: ptir_fused_9eda8aa42400c4c2_r0
+region: library=0 library_op=0 schedule=1 nodes=6 inputs=0 outputs=0 sinks=1
+ok: true
+error: 
+entry_name: ptir_fused_9eda8aa42400c4c2_r0
+source: bytes=90931 prefix=@runtime tail_bytes=45654 fnv1a64=0xc5f523fc2f6cb3c2
+=== end
+=== synthetic_sink_call#0 singleton#0
+entry_name: ptir_fused_a297c60f7a5de47e_r0
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_a297c60f7a5de47e_r0
+source: bytes=87547 prefix=@runtime tail_bytes=42270 fnv1a64=0x5b4c345f788d4298
+=== end
+=== synthetic_sink_call#0 singleton#1
+entry_name: ptir_fused_a297c60f7a5de47e_r1
+region: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=0 sinks=0
+ok: false
+error: fused CUDA emitter requires a non-library generated region
+entry_name: ptir_fused_a297c60f7a5de47e_r1
+=== end
+=== synthetic_sink_call#0 fused#0
+entry_name: ptir_fused_a297c60f7a5de47e_r0
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+ok: true
+error: 
+entry_name: ptir_fused_a297c60f7a5de47e_r0
+source: bytes=87547 prefix=@runtime tail_bytes=42270 fnv1a64=0x5b4c345f788d4298
+=== end
+=== synthetic_sink_call#0 fused#1
+entry_name: ptir_fused_a297c60f7a5de47e_r1
+region: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=0 sinks=0
+ok: false
+error: fused CUDA emitter requires a non-library generated region
+entry_name: ptir_fused_a297c60f7a5de47e_r1
+=== end

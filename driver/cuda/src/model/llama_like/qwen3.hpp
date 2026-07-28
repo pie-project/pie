@@ -68,16 +68,6 @@ struct Qwen3LayerWeights {
     const DeviceTensor* qkv_proj_fused      = nullptr;
     const DeviceTensor* gate_up_proj_fused  = nullptr;
 
-    // When the loader materializes fused QKV / gate-up tensors as the owning
-    // storage, the canonical per-projection pointers above are non-owning
-    // row-slice views into those fused buffers. Keeping the views here lets the
-    // unfused fallback stay simple without paying for duplicate weights.
-    std::unique_ptr<DeviceTensor> q_proj_view;
-    std::unique_ptr<DeviceTensor> k_proj_view;
-    std::unique_ptr<DeviceTensor> v_proj_view;
-    std::unique_ptr<DeviceTensor> gate_proj_view;
-    std::unique_ptr<DeviceTensor> up_proj_view;
-
     // Optional QuantMeta companions for each weight. Null when the
     // weight is plain bf16 (the common case). When set, the forward
     // pass routes the corresponding GEMM through ops::gemm_act_x_w with
@@ -112,8 +102,6 @@ struct Qwen3Weights {
     const DeviceTensor* final_norm  = nullptr;  // [hidden]
     const DeviceTensor* lm_head     = nullptr;  // [vocab, hidden] (may alias embed)
     std::vector<Qwen3LayerWeights> layers;
-    std::vector<DeviceTensor> owned_qkv_fused;
-    std::vector<DeviceTensor> owned_gate_up_fused;
 };
 
 /// Build the schema by name-binding tensors out of the engine. Throws if a

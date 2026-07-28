@@ -34,7 +34,7 @@
 #include "pipeline/channels.hpp"
 #include "pipeline/channel_registry.hpp"
 #include "pipeline/tier0/tier0_launch.hpp"
-#include "pie_native/ptir/trace.hpp"
+#include "pie_native/launch/program.hpp"
 
 namespace pie_cuda_driver::pipeline {
 
@@ -103,9 +103,9 @@ class BakedBufferPool {
 };
 
 // Shared pure-host PTIR decode model (trace/op-table/container/bound/
-// fire-geometry) now lives in pie_native::ptir (driver/common); bring it into
+// fire-geometry) now lives in pie_native::launch (driver/common); bring it into
 // scope so the CUDA-side tier-0/1 code below can use it unqualified.
-using namespace pie_native::ptir;
+using namespace pie_native::launch;
 
 // Per-fire inputs the runner binds into the trace (intrinsics + host tensors).
 struct FireInputs {
@@ -115,7 +115,6 @@ struct FireInputs {
     const void* layer = nullptr;
     std::uint32_t vocab = 0;
     const void* row_seeds = nullptr;  // gumbel per-row seed buffer (u32 [rows])
-    std::unordered_map<std::uint32_t, const void*> host_inputs;  // host_key → device ptr
     cudaStream_t stream = nullptr;
     // Stage-2 MTP: the row base (within the `logits` buffer) of this fire's K MTP
     // DRAFT rows — an Intrinsic(MtpLogits) `[K, vocab]` matrix reads
@@ -498,8 +497,9 @@ class Tier0Runner {
             for (ValueId a : op.args)
                 if (!resolve_root(a, in, scratch, err)) return false;
             // pivot_threshold's predicate payload is a trace value (scalar or
-            // per-row), not an op arg — resolve it the same way (interface/ptir
-            // interp.rs: RankLe/CummassLe/ProbGe all carry a ValueId).
+            // per-row), not an op arg — resolve it the same way
+            // (compiler/eval/src/interp.rs: RankLe/CummassLe/ProbGe all carry a
+            // ValueId).
             if (op.code == OpCode::PivotThreshold)
                 if (!resolve_root(op.predicate.payload, in, scratch, err)) return false;
 
@@ -513,8 +513,6 @@ class Tier0Runner {
         // channel value put straight through).
         for (const ChannelPut& p : st.puts)
             if (!resolve_root(p.value, in, scratch, err)) return false;
-        for (const Output& o : st.outputs)
-            if (!resolve_root(o.value, in, scratch, err)) return false;
         return true;
     }
 
@@ -556,7 +554,7 @@ class Tier0Runner {
         return d;
     }
 
-    // Materialize a root value (Const/Intrinsic/HostInput/Channel take-read) to a
+    // Materialize a root value (Const/Intrinsic/Channel take-read) to a
     // device pointer, recorded in val_ptr_. Op results are recorded by build_launch.
     bool resolve_root(ValueId id, const FireInputs& in, std::vector<void*>& scratch, std::string& err) {
         if (val_ptr_.count(id)) return true;
@@ -624,12 +622,6 @@ class Tier0Runner {
                     return true;
                 }
                 err = "tier-0: intrinsic not yet bound"; return false;
-            }
-            case ValueSource::HostInput: {
-                auto it = in.host_inputs.find(v->host_key);
-                if (it == in.host_inputs.end()) { err = "host input missing (late-bind miss)"; return false; }
-                val_ptr_[id] = const_cast<void*>(it->second);
-                return true;
             }
             case ValueSource::ChannelTake:
             case ValueSource::ChannelRead:
@@ -828,7 +820,7 @@ class Tier0Runner {
         }
         if (op.code == OpCode::PivotThreshold) {
             // The predicate payload is a resolved trace value (scalar or
-            // per-row [rows]) — never an immediate (interface/ptir interp.rs
+            // per-row [rows]) — never an immediate (compiler/eval/src/interp.rs
             // Op::PivotThreshold; all three PredTag variants carry a ValueId).
             // Resolved above in run_stage via resolve_root before build_launch
             // is called, so it must already be in val_ptr_ here.

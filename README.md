@@ -57,6 +57,7 @@ pie run text-completion -- --prompt "The capital of France is"
 |---|---|
 | `worker/` | The `pie` CLI and standalone engine — the invariant entry point |
 | `runtime/` | Inferlet runtime |
+| `compiler/` | Tensor-program toolchain: authoring eDSL → PTIR → planning → CUDA/Metal codegen (+ the reference interpreter) |
 | `controller/` | Cluster-coordination control plane (pairing · roles · health) |
 | `driver/transport/` | Worker↔worker P2P KV-tensor data plane |
 | `driver/` | Backend drivers (CUDA · Metal) + runtime↔driver IPC |

@@ -1783,9 +1783,7 @@ impl ExecutorActor {
         let completion = match self.backend.launch(&submission) {
             Ok(FrameLaunchOutcome::Launched(completion)) => completion,
             Ok(FrameLaunchOutcome::Exhausted) => {
-                let error = driver_error(anyhow::anyhow!(
-                    "frame admission exhausted"
-                ));
+                let error = driver_error(anyhow::anyhow!("frame admission exhausted"));
                 for (_, _, reply) in metadata {
                     let _ = reply.send(Err(error.clone()));
                 }
@@ -3358,8 +3356,8 @@ mod tests {
     };
     use pie_driver_dummy_lib::DummyDriverOptions;
     use pie_engine::driver::{DriverBackend, DummyDriver};
-    use pie_ptir::container::{StageProgram, TraceContainer};
-    use pie_ptir::registry::Stage;
+    use pie_ir::container::{StageProgram, TraceContainer};
+    use pie_ir::registry::Stage;
 
     fn fixture(
         max_clients: usize,
@@ -3468,9 +3466,9 @@ mod tests {
         }
         .encode();
         ProgramRegistration {
-            program_hash: pie_ptir::container_hash(&bytes),
-            canonical_bytes: bytes,
-            sidecar_bytes: Vec::new(),
+            program_hash: pie_ir::container_hash(&bytes),
+            reference_ptir: bytes,
+            ..Default::default()
         }
     }
 

@@ -44,16 +44,21 @@ os.environ.setdefault("PIE_CUDA_KV_ENVELOPES", "1")
 
 from bench_quest import (  # noqa: E402
     LONG_TOKENS,
-    PAGE_SIZE,
     REPS,
     SHORT_TOKENS,
     _parse,
     _prompt_for,
     _timed,
+    assert_full_budget_is_overhead,
+    assert_monotone_baseline,
 )
-from conftest import run_tests  # noqa: E402
+from conftest import run_inferlet, run_tests  # noqa: E402
 
-CONTEXTS = [1024, 2048, 4096, 6144]
+# Extends past 8192 because the one-shot prefill ceiling that used to cap this
+# at 6144 is gone (section 17). That matters here more than for Quest: section
+# 15 puts SnapKV's crossover at ~2.3K and H2O's at ~4.1K, so the range where
+# these policies actually pay was almost entirely above where they could run.
+CONTEXTS = [1024, 2048, 4096, 6144, 8192, 12288, 16384]
 BUDGET_FRACTIONS = [1.0, 0.5, 0.25]
 
 # H2O and SnapKV both keep `page_budget` pages; the backend force-keeps the
@@ -121,12 +126,32 @@ async def test_trackb_crossover(client, args):
     print("  " + "  ".join(f"{h:>14s}" for h in header))
 
     ratios = {}
+    baseline_ms = []
     for ctx in CONTEXTS:
         prompt = _prompt_for(ctx)
-        pages = (ctx + LONG_TOKENS) // PAGE_SIZE
+        # The real page count, probed -- NOT `(ctx + LONG_TOKENS) // PAGE_SIZE`,
+        # which is what this used to do and which was quietly wrong. `ctx` is a
+        # TARGET; `_prompt_for` lays down `round(ctx / 9)` repetitions of a unit
+        # that tokenizes to a bit more than 9, so the real prompt runs ~25%
+        # long (ctx=12288 measures 15032 tokens). The estimate therefore
+        # UNDER-counts pages, and `budget=1.0` -- the column whose entire job is
+        # to isolate the policy's cost with the benefit set to zero -- was
+        # actually a ~80% budget that evicted. That is how a "pure overhead"
+        # column came to report the policy running FASTER than the baseline.
+        probe_out = await run_inferlet(
+            client, "trackb-snapkv",
+            {"prompt": prompt, "max_tokens": SHORT_TOKENS, "page_budget": 1 << 20},
+            timeout=args.timeout)
+        probe = _parse(probe_out)
+        assert probe, "page-count probe returned no report"
+        # Plus the pages the long endpoint will DECODE into. The budget has to
+        # cover the request at its largest or `budget=1.0` still evicts -- and
+        # the decoded tail is 104 tokens, which is 8% of the pages at ctx=1024.
+        pages = probe["prompt_pages"] + -(-LONG_TOKENS // probe["page_size"])
         per_token, reports = await _sweep(
             client, args, ctx, _configs(prompt, pages))
         base = per_token["baseline"]
+        baseline_ms.append(base)
         row = [f"{ctx}", f"{pages}", f"{base:.2f} ms"]
         for label, ms in per_token.items():
             if label == "baseline":
@@ -135,8 +160,13 @@ async def test_trackb_crossover(client, args):
             ratios.setdefault(label, []).append(base / ms)
         print("  " + "  ".join(f"{c:>14s}" for c in row))
         sys.stdout.flush()
+        assert_full_budget_is_overhead(
+            {k: v for k, v in per_token.items() if k.endswith("@1")}, base)
 
     print()
+    # Before reading anything off the table, check the table is readable at all.
+    assert_monotone_baseline(CONTEXTS, baseline_ms)
+
     for label, series in ratios.items():
         print(f"  {label:>16s}: " + "  ".join(f"{r:.2f}x" for r in series))
 

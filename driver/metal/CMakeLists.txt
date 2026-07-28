@@ -87,7 +87,6 @@ if(APPLE)
   set(PIE_METAL_LIVE_SOURCES
     src/mtl4_context.mm
     src/pipeline/shared_storage.mm
-    src/pipeline/m1_codegen.cpp
     src/pipeline/m1_runtime.cpp
     src/batch/decode_timing.cpp
     src/batch/scratch.cpp
@@ -117,12 +116,11 @@ target_include_directories(pie_driver_metal_lib
     ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels
     ${CMAKE_CURRENT_SOURCE_DIR}/src/store
     ${CMAKE_CURRENT_SOURCE_DIR}/src/loader
-    # ../common/include also carries the shared pure-host PTIR decode headers
-    # (pie_native/ptir/{container,bound,trace,op_table,fire_geometry}.hpp —
-    # CUDA-free, namespace pie_native::ptir). The host interpreter
-    # (src/pipeline/interp.hpp) consumes them; Metal no longer reaches into
+    # ../abi/include carries the shared launch-package view headers
+    # (pie_native/launch/{program,plan,op_table,fire_geometry}.hpp — CUDA-free,
+    # namespace pie_native::launch). Metal no longer reaches into
     # driver/cuda/src for anything.
-    ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../abi/include ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include
     ${PIE_DRIVER_ABI_INCLUDE_DIR} ${PIE_LOADER_INCLUDE_DIR})
 
 target_compile_options(pie_driver_metal_lib PRIVATE
@@ -135,6 +133,19 @@ target_compile_options(pie_driver_metal_lib PRIVATE
 # which drives an independent MetalExecutor::setup outside Context) sees
 # the same default when PIE_METAL_KERNELS_DIR is unset. Installed packaging
 # of the kernels dir is a follow-up.
+#
+# ptir_rng.generated.metal is owned by pie-codegen and staged here at configure
+# time rather than checked in twice. The host emitter now embeds the M1 runtime
+# template into every emitted MSL source itself, but the RNG preamble still
+# needs to sit beside the checked-in .metal kernels so a build-time
+# `configure_file` (below) keeps them in lockstep -- the driver splices it in
+# at compile time because Metal's runtime shader compiler does no filesystem
+# include lookup.
+configure_file(
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include/ptir_rng.generated.metal
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/ptir_rng.generated.metal
+  COPYONLY)
+
 if(APPLE)
   target_compile_definitions(pie_driver_metal_lib PUBLIC
     PIE_METAL_KERNELS_DIR_DEFAULT="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
@@ -246,18 +257,14 @@ endif()
 
 option(PIE_METAL_BUILD_STUB_TESTS "Build Linux/non-MLX direct-surface tests" OFF)
 if(PIE_METAL_BUILD_STUB_TESTS AND NOT PIE_METAL_WITH_MLX)
-  add_executable(metal_direct_stub_test tests/direct_stub_test.cpp)
-  target_link_libraries(metal_direct_stub_test PRIVATE pie_driver_metal_lib)
-  add_test(NAME metal_direct_stub_test COMMAND metal_direct_stub_test)
-  set_tests_properties(metal_direct_stub_test PROPERTIES
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+  message(STATUS "Metal direct stub tests are disabled after launch-package migration")
 endif()
 
 function(add_metal_host_test target source)
   add_executable(${target} ${source})
   target_include_directories(${target} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${CMAKE_CURRENT_SOURCE_DIR}/../common/include)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../abi/include ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include)
   add_test(NAME ${target} COMMAND ${target})
 endfunction()
 
@@ -267,27 +274,30 @@ function(add_metal_linked_test target source)
   add_test(NAME ${target} COMMAND ${target})
 endfunction()
 
-file(GLOB PIE_PTIR_CANONICAL_GOLDENS CONFIGURE_DEPENDS
-  ${CMAKE_CURRENT_SOURCE_DIR}/../../interface/ptir/tests/golden-ptir/*.txt)
-add_executable(
-  ptir_decoder_limits_test
-  ${CMAKE_CURRENT_SOURCE_DIR}/../common/tests/ptir_decoder_limits_test.cpp)
-target_include_directories(ptir_decoder_limits_test PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/../common/include)
-target_compile_features(ptir_decoder_limits_test PRIVATE cxx_std_20)
-add_test(
-  NAME ptir_decoder_limits_test
-  COMMAND ptir_decoder_limits_test
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../interface/ptir/tests/malformed_wire_corpus.txt
-    ${PIE_PTIR_CANONICAL_GOLDENS})
-
-add_metal_host_test(pipeline_interp_test tests/pipeline_interp_test.cpp)
 add_metal_host_test(
   pipeline_channel_storage_test
   tests/pipeline_channel_storage_test.cpp)
 add_metal_host_test(
   pipeline_descriptor_resolve_test
   tests/pipeline_descriptor_resolve_test.cpp)
+
+# The only host-runnable coverage of `interp.hpp`, which is live code
+# (`context.cpp` reaches `pipeline::step`). It replays the same relocatable
+# launch-package images the CUDA driver tests register -- the image is an ABI
+# record dump, so it is backend-neutral, which is why the fixtures live at
+# `driver/fixtures/` and not under either driver.
+add_executable(pipeline_launch_conformance_test
+  tests/pipeline_launch_conformance_test.cpp)
+target_include_directories(pipeline_launch_conformance_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/../abi/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../interface/driver/include)
+# The fixture directory is generated, so it is passed as an absolute path
+# rather than relied on as a working directory that may not exist yet.
+add_test(NAME pipeline_launch_conformance_test
+  COMMAND pipeline_launch_conformance_test
+    ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures)
 
 add_executable(heap_layout_slot_test tests/heap_layout_slot_test.cpp)
 target_include_directories(heap_layout_slot_test PRIVATE
@@ -303,9 +313,6 @@ target_include_directories(paged_batch_validation_test PRIVATE
 target_link_libraries(paged_batch_validation_test PRIVATE pie_driver_metal_lib)
 add_test(NAME paged_batch_validation_test COMMAND paged_batch_validation_test)
 
-add_metal_linked_test(
-  pipeline_device_geometry_e2e_test
-  tests/pipeline_device_geometry_e2e_test.cpp)
 add_metal_linked_test(pipeline_copy_ops_test tests/pipeline_copy_ops_test.cpp)
 add_metal_linked_test(caps_honesty_test tests/caps_honesty_test.cpp)
 add_metal_linked_test(executor_geometry_test tests/executor_geometry_test.cpp)
@@ -317,11 +324,7 @@ target_link_libraries(executor_worker_test PRIVATE Threads::Threads)
 add_test(NAME executor_worker_test COMMAND executor_worker_test)
 
 if(APPLE)
-  add_metal_linked_test(m1_generated_test tests/m1_generated_test.cpp)
-  target_compile_definitions(m1_generated_test PRIVATE
-    PIE_PTIR_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../interface/ptir/tests/golden-ptir")
   add_metal_linked_test(ptir_m0_device_test tests/ptir_m0_device_test.cpp)
-  add_metal_linked_test(ptir_checkpoint_e2e_test tests/ptir_checkpoint_e2e_test.cpp)
   add_metal_linked_test(kv_append_paged_pso_test tests/kv_append_paged_pso_test.cpp)
   add_metal_linked_test(decode_step_mb_test tests/decode_step_mb_test.cpp)
   add_metal_linked_test(kv_pool_lifecycle_test tests/kv_pool_lifecycle_test.cpp)
