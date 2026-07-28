@@ -26,6 +26,27 @@ pub enum SymbolicExtent {
     KeyLen = 6,
 }
 
+impl SymbolicExtent {
+    /// Every extent, indexed by its own wire byte. The discriminants are the
+    /// wire encoding, so this is the whole of that encoding in one place —
+    /// `pie_codegen::launch` bounds the grouped path by its length and
+    /// [`from_wire`](Self::from_wire) is how the container reads one back.
+    pub const ALL: &'static [Self] = &[
+        Self::KvLen,
+        Self::PageCount,
+        Self::RowCount,
+        Self::TokenCount,
+        Self::SampledRows,
+        Self::QueryLen,
+        Self::KeyLen,
+    ];
+
+    /// The extent a wire byte names, or `None` if the byte names none.
+    pub fn from_wire(byte: u8) -> Option<Self> {
+        Self::ALL.get(usize::from(byte)).copied()
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Dimension {
     Static(u32),

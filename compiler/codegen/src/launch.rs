@@ -18,6 +18,15 @@
 //! The op projection is [`crate::op_view::OpView`], the same one the emitters
 //! read, so the kernel and the description of the kernel cannot drift.
 
+use pie_driver_abi::local::{
+    PIE_CHANNEL_HOST_READER, PIE_CHANNEL_HOST_VISIBLE, PIE_CHANNEL_SEEDED, PIE_EXTENT_STATIC,
+    PIE_NO_CHANNEL, PIE_READINESS_NEEDS_EMPTY, PIE_READINESS_NEEDS_FULL, PIE_READINESS_UNTOUCHED,
+    PIE_REGION_GENERATED, PIE_REGION_LIBRARY, PIE_STAGE_GROUPED_VALID,
+    PIE_STAGE_REQUIRES_ATTN_SCORE, PIE_STAGE_REQUIRES_KERNEL_CALL, PIE_STAGE_REQUIRES_LAYER,
+    PIE_STAGE_REQUIRES_MTP_ROWS, PIE_STAGE_REQUIRES_PAGE_MASK, PIE_STAGE_REQUIRES_QUERY,
+    PIE_VALUE_CHANNEL_READ, PIE_VALUE_CHANNEL_TAKE, PIE_VALUE_CONST, PIE_VALUE_INTRINSIC,
+    PIE_VALUE_OP_RESULT,
+};
 use pie_driver_abi::plan::{
     LaunchChannel, LaunchChannelRule, LaunchOp, LaunchPackage, LaunchPlanValue, LaunchPort,
     LaunchPut, LaunchRegion, LaunchStage, LaunchStagePlan, LaunchValue,
@@ -29,52 +38,10 @@ use pie_ir::types::ValueType;
 use pie_ir::validate::{BoundTrace, Direction};
 use pie_plan::{
     CompiledStage, Dimension, LibraryOp, NodeIndex, Region, RegionKind, RegionPartition,
-    SymbolicType, stage_identity,
+    SymbolicExtent, SymbolicType, stage_identity,
 };
 
 use crate::op_view::OpView;
-
-// Op tags and enum values shared with the generated ABI header
-// (`compiler/codegen/include/ptir_abi.h`). Named rather than inlined so the
-// mapping below reads like the container's own op table.
-
-/// Value sources, mirroring `PIE_VALUE_*`.
-const VALUE_CONST: u8 = 0;
-const VALUE_INTRINSIC: u8 = 1;
-const VALUE_CHANNEL_TAKE: u8 = 2;
-const VALUE_CHANNEL_READ: u8 = 3;
-const VALUE_OP_RESULT: u8 = 4;
-
-/// Channel flags, mirroring `PIE_CHANNEL_*`.
-const CHANNEL_SEEDED: u8 = 1 << 0;
-const CHANNEL_HOST_VISIBLE: u8 = 1 << 1;
-const CHANNEL_HOST_READER: u8 = 1 << 2;
-
-/// Readiness directions, mirroring `PIE_READINESS_*`.
-const READINESS_UNTOUCHED: u8 = 0;
-const READINESS_NEEDS_FULL: u8 = 1;
-const READINESS_NEEDS_EMPTY: u8 = 2;
-
-/// Region kinds, mirroring `PIE_REGION_GENERATED` / `PIE_REGION_LIBRARY`.
-const REGION_GENERATED: u8 = 0;
-const REGION_LIBRARY: u8 = 1;
-
-/// A dimension is a literal extent, mirroring `PIE_EXTENT_STATIC`.
-const EXTENT_STATIC: u8 = 0xff;
-/// Highest runtime extent key the grouped path understands.
-const EXTENT_KEY_MAX: u8 = 6;
-
-/// Stage flags, mirroring `PIE_STAGE_REQUIRES_*` / `PIE_STAGE_GROUPED_VALID`.
-const REQUIRES_QUERY: u32 = 1 << 0;
-const REQUIRES_LAYER: u32 = 1 << 1;
-const REQUIRES_ATTN_SCORE: u32 = 1 << 2;
-const REQUIRES_KERNEL_CALL: u32 = 1 << 3;
-const REQUIRES_PAGE_MASK: u32 = 1 << 4;
-const REQUIRES_MTP_ROWS: u32 = 1 << 5;
-const GROUPED_VALID: u32 = 1 << 6;
-
-/// No channel. Mirrors the `-1` a wire op carries for a non-channel op.
-const NO_CHANNEL: u32 = u32::MAX;
 
 /// Build the launch package for a bound trace and its compiled stages.
 ///
@@ -119,9 +86,9 @@ fn lower_values(bound: &BoundTrace) -> Vec<LaunchValue> {
                         local,
                         LaunchValue {
                             source: if view.tag == tags::CHAN_TAKE {
-                                VALUE_CHANNEL_TAKE
+                                PIE_VALUE_CHANNEL_TAKE
                             } else {
-                                VALUE_CHANNEL_READ
+                                PIE_VALUE_CHANNEL_READ
                             },
                             channel: view.chan as u32,
                             ..LaunchValue::default()
@@ -133,7 +100,7 @@ fn lower_values(bound: &BoundTrace) -> Vec<LaunchValue> {
                     push(
                         local,
                         LaunchValue {
-                            source: VALUE_CONST,
+                            source: PIE_VALUE_CONST,
                             literal_bits: view.lit_bits,
                             ..LaunchValue::default()
                         },
@@ -144,7 +111,7 @@ fn lower_values(bound: &BoundTrace) -> Vec<LaunchValue> {
                     push(
                         local,
                         LaunchValue {
-                            source: VALUE_INTRINSIC,
+                            source: PIE_VALUE_INTRINSIC,
                             intrinsic: view.intr as u8,
                             ..LaunchValue::default()
                         },
@@ -157,7 +124,7 @@ fn lower_values(bound: &BoundTrace) -> Vec<LaunchValue> {
                         push(
                             local + result,
                             LaunchValue {
-                                source: VALUE_OP_RESULT,
+                                source: PIE_VALUE_OP_RESULT,
                                 ..LaunchValue::default()
                             },
                         );
@@ -180,13 +147,13 @@ fn lower_channels(bound: &BoundTrace) -> Vec<LaunchChannel> {
         .map(|(index, decl)| {
             let mut flags = 0u8;
             if decl.seeded {
-                flags |= CHANNEL_SEEDED;
+                flags |= PIE_CHANNEL_SEEDED;
             }
             if decl.host_role != HostRole::None {
-                flags |= CHANNEL_HOST_VISIBLE;
+                flags |= PIE_CHANNEL_HOST_VISIBLE;
             }
             if decl.host_role == HostRole::Reader {
-                flags |= CHANNEL_HOST_READER;
+                flags |= PIE_CHANNEL_HOST_READER;
             }
             let extern_decl = bound
                 .container
@@ -200,9 +167,9 @@ fn lower_channels(bound: &BoundTrace) -> Vec<LaunchChannel> {
                 .readiness
                 .iter()
                 .find(|entry| entry.chan as usize == index)
-                .map_or(READINESS_UNTOUCHED, |entry| match entry.dir {
-                    Direction::NeedsFull => READINESS_NEEDS_FULL,
-                    Direction::NeedsEmpty => READINESS_NEEDS_EMPTY,
+                .map_or(PIE_READINESS_UNTOUCHED, |entry| match entry.dir {
+                    Direction::NeedsFull => PIE_READINESS_NEEDS_FULL,
+                    Direction::NeedsEmpty => PIE_READINESS_NEEDS_EMPTY,
                 });
             LaunchChannel {
                 id: index as u32,
@@ -309,7 +276,7 @@ fn lower_stages(bound: &BoundTrace) -> Vec<LaunchStage> {
                         // remapped like any other operand rather than left as
                         // an immediate.
                         pred_payload: global(view.pred_payload),
-                        channel: NO_CHANNEL,
+                        channel: PIE_NO_CHANNEL,
                         name_index: u32::from(view.name_idx),
                         imm: view.imm,
                         imm2: view.imm2,
@@ -375,7 +342,7 @@ fn lower_plan_op(view: &OpView) -> LaunchOp {
         lit_bits: view.lit_bits,
         pred_payload: view.pred_payload,
         channel: if view.chan < 0 {
-            NO_CHANNEL
+            PIE_NO_CHANNEL
         } else {
             view.chan as u32
         },
@@ -394,7 +361,7 @@ fn lower_plan_value(value_type: &SymbolicType) -> LaunchPlanValue {
     for dimension in &value_type.dims {
         match *dimension {
             Dimension::Static(extent) => {
-                extents.push(EXTENT_STATIC);
+                extents.push(PIE_EXTENT_STATIC);
                 dims.push(extent);
             }
             Dimension::Symbolic(extent) => {
@@ -416,8 +383,8 @@ fn lower_partition(partition: &RegionPartition) -> Vec<LaunchRegion> {
 
 fn lower_region(region: &Region) -> LaunchRegion {
     let (kind, library) = match region.kind {
-        RegionKind::Generated => (REGION_GENERATED, 0),
-        RegionKind::Library(op) => (REGION_LIBRARY, library_tag(op)),
+        RegionKind::Generated => (PIE_REGION_GENERATED, 0),
+        RegionKind::Library(op) => (PIE_REGION_LIBRARY, library_tag(op)),
     };
     LaunchRegion {
         kind,
@@ -461,17 +428,17 @@ struct GroupedPlan {
 impl GroupedPlan {
     fn derive(ops: &[OpView], value_types: &[SymbolicType], channel_count: usize) -> Self {
         let mut plan = GroupedPlan {
-            flags: GROUPED_VALID,
+            flags: PIE_STAGE_GROUPED_VALID,
             ..GroupedPlan::default()
         };
-        let mut seen = [false; (EXTENT_KEY_MAX as usize) + 1];
+        let mut seen = vec![false; SymbolicExtent::ALL.len()];
         for value_type in value_types {
             for dimension in &value_type.dims {
                 let Dimension::Symbolic(extent) = *dimension else {
                     continue;
                 };
                 let extent = extent as u8;
-                if extent > EXTENT_KEY_MAX {
+                if usize::from(extent) >= seen.len() {
                     return plan.invalid("stage uses unsupported runtime extents");
                 }
                 if !seen[extent as usize] {
@@ -495,34 +462,34 @@ impl GroupedPlan {
             // describes the op rather than rejecting it. `requires_query` is
             // set because the kernel consumes the lane's post-rope query row.
             if op.tag == tags::KERNEL_CALL {
-                plan.flags |= REQUIRES_QUERY | REQUIRES_KERNEL_CALL;
+                plan.flags |= PIE_STAGE_REQUIRES_QUERY | PIE_STAGE_REQUIRES_KERNEL_CALL;
                 continue;
             }
             // `attn_page_mask` is grouped-walkable but only fused-executable.
             // Described here for the same reason.
             if op.tag == tags::SINK_CALL {
-                plan.flags |= REQUIRES_PAGE_MASK;
+                plan.flags |= PIE_STAGE_REQUIRES_PAGE_MASK;
             }
             if !grouped_supported_tag(op.tag) {
                 return plan.invalid("stage contains an unsupported grouped op");
             }
             if op.tag == tags::INTRINSIC_VAL {
                 match op.intr {
-                    intrinsic_tags::QUERY => plan.flags |= REQUIRES_QUERY,
-                    intrinsic_tags::LAYER => plan.flags |= REQUIRES_LAYER,
-                    intrinsic_tags::ATTN_SCORE => plan.flags |= REQUIRES_ATTN_SCORE,
+                    intrinsic_tags::QUERY => plan.flags |= PIE_STAGE_REQUIRES_QUERY,
+                    intrinsic_tags::LAYER => plan.flags |= PIE_STAGE_REQUIRES_LAYER,
+                    intrinsic_tags::ATTN_SCORE => plan.flags |= PIE_STAGE_REQUIRES_ATTN_SCORE,
                     intrinsic_tags::MTP_LOGITS => {
                         let value = value_bases[node] as usize;
                         let rows = match value_types.get(value).map(|ty| ty.dims.as_slice()) {
                             Some([Dimension::Static(rows), _]) => *rows,
                             _ => return plan.invalid("MtpLogits has no static draft-row layout"),
                         };
-                        if plan.flags & REQUIRES_MTP_ROWS != 0 && plan.mtp_rows != rows {
+                        if plan.flags & PIE_STAGE_REQUIRES_MTP_ROWS != 0 && plan.mtp_rows != rows {
                             return plan.invalid(
                                 "MtpLogits stages declare incompatible draft-row layouts",
                             );
                         }
-                        plan.flags |= REQUIRES_MTP_ROWS;
+                        plan.flags |= PIE_STAGE_REQUIRES_MTP_ROWS;
                         plan.mtp_rows = rows;
                     }
                     intrinsic_tags::LOGITS => {}
@@ -553,7 +520,7 @@ impl GroupedPlan {
     /// describe it — the fused path reads them — so only the validity bit and
     /// the reason change.
     fn invalid(mut self, reason: &str) -> Self {
-        self.flags &= !GROUPED_VALID;
+        self.flags &= !PIE_STAGE_GROUPED_VALID;
         self.error = reason.to_string();
         self
     }

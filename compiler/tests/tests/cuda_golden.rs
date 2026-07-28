@@ -295,7 +295,7 @@ fn emitter_version_matches_oracle() {
 /// recorded rather than dropped.
 #[test]
 fn emit_program_covers_every_region() {
-    use pie_codegen::program::{Backend, KERNEL_FUSED, emit_program};
+    use pie_codegen::program::{Backend, PIE_KERNEL_FUSED, emit_program};
 
     let stages: Vec<_> = corpus_stages()
         .into_iter()
@@ -310,7 +310,7 @@ fn emit_program_covers_every_region() {
         "CUDA emission must produce one kernel per fused region"
     );
     for kernel in &kernels {
-        assert_eq!(kernel.kind, KERNEL_FUSED);
+        assert_eq!(kernel.kind, PIE_KERNEL_FUSED);
         // Exactly one of source/error is set: a kernel is either emitted or
         // explained, never silently absent.
         assert_ne!(
@@ -340,8 +340,8 @@ fn emit_program_covers_every_region() {
 #[test]
 fn emit_program_metal_covers_every_family() {
     use pie_codegen::program::{
-        Backend, KERNEL_COMMIT, KERNEL_FUSED, KERNEL_GROUPED, KERNEL_READINESS, KERNEL_SINGLETON,
-        emit_program,
+        Backend, PIE_KERNEL_COMMIT, PIE_KERNEL_FUSED, PIE_KERNEL_GROUPED, PIE_KERNEL_READINESS,
+        PIE_KERNEL_SINGLETON, emit_program,
     };
 
     let stages: Vec<_> = corpus_stages()
@@ -350,11 +350,11 @@ fn emit_program_metal_covers_every_family() {
         .collect();
     let kernels = emit_program(Backend::Metal, &stages, &corpus_bound());
     for kind in [
-        KERNEL_SINGLETON,
-        KERNEL_FUSED,
-        KERNEL_GROUPED,
-        KERNEL_READINESS,
-        KERNEL_COMMIT,
+        PIE_KERNEL_SINGLETON,
+        PIE_KERNEL_FUSED,
+        PIE_KERNEL_GROUPED,
+        PIE_KERNEL_READINESS,
+        PIE_KERNEL_COMMIT,
     ] {
         assert!(
             kernels.iter().any(|kernel| kernel.kind == kind),

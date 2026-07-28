@@ -115,7 +115,7 @@ pub(crate) fn scan_planned_op(bytes: &[u8]) -> Result<u32, PlanDecodeError> {
         }
         tags::CAST => {
             reader.take(4)?;
-            if reader.u8()? > DType::Bool as u8 {
+            if DType::from_wire(reader.u8()?).is_none() {
                 return Err(PlanDecodeError::InvalidRecord);
             }
         }
@@ -167,7 +167,7 @@ pub(crate) fn scan_planned_op(bytes: &[u8]) -> Result<u32, PlanDecodeError> {
             }
         }
         tags::CONST => {
-            if reader.u8()? > DType::Bool as u8 {
+            if DType::from_wire(reader.u8()?).is_none() {
                 return Err(PlanDecodeError::InvalidRecord);
             }
             reader.take(4)?;
@@ -176,14 +176,16 @@ pub(crate) fn scan_planned_op(bytes: &[u8]) -> Result<u32, PlanDecodeError> {
             reader.take(8)?;
         }
         tags::INTRINSIC_VAL => {
-            if reader.u16()? > IntrinsicId::AttnScore as u16 || reader.u8()? > DType::Bool as u8 {
+            if reader.u16()? > IntrinsicId::AttnScore as u16
+                || DType::from_wire(reader.u8()?).is_none()
+            {
                 return Err(PlanDecodeError::InvalidRecord);
             }
             scan_plan_shape(&mut reader)?;
         }
         tags::KERNEL_CALL => {
             reader.u16()?;
-            if reader.u8()? > DType::Bool as u8 {
+            if DType::from_wire(reader.u8()?).is_none() {
                 return Err(PlanDecodeError::InvalidRecord);
             }
             scan_plan_shape(&mut reader)?;
@@ -384,7 +386,7 @@ pub fn decode_plan_header(bytes: &[u8]) -> Result<EncodedPlanHeader, PlanDecodeE
         return Err(PlanDecodeError::InvalidRecord);
     }
     for _ in 0..value_count {
-        if reader.u8()? > DType::Bool as u8 {
+        if DType::from_wire(reader.u8()?).is_none() {
             return Err(PlanDecodeError::InvalidRecord);
         }
         let rank = reader.u8()?;
@@ -395,7 +397,7 @@ pub fn decode_plan_header(bytes: &[u8]) -> Result<EncodedPlanHeader, PlanDecodeE
                     reader.u32()?;
                 }
                 1 => {
-                    if reader.u8()? > SymbolicExtent::KeyLen as u8 {
+                    if SymbolicExtent::from_wire(reader.u8()?).is_none() {
                         return Err(PlanDecodeError::InvalidRecord);
                     }
                 }

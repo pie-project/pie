@@ -21,12 +21,13 @@ use pie_ir::op::tags;
 use pie_ir::validate::BoundTrace;
 use pie_plan::{CompiledStage, LibraryOp, Region, RegionKind};
 
-/// Kind discriminants, matching `PIE_KERNEL_*` in the driver ABI.
-pub const KERNEL_SINGLETON: u32 = 0;
-pub const KERNEL_FUSED: u32 = 1;
-pub const KERNEL_GROUPED: u32 = 2;
-pub const KERNEL_READINESS: u32 = 3;
-pub const KERNEL_COMMIT: u32 = 4;
+/// Kind discriminants. Re-exported from the driver ABI rather than restated:
+/// [`EmittedKernel::kind`] is handed straight to the driver, so a second
+/// spelling of these numbers here would be a second thing to keep right.
+pub use pie_driver_abi::local::{
+    PIE_KERNEL_COMMIT, PIE_KERNEL_FUSED, PIE_KERNEL_GROUPED, PIE_KERNEL_READINESS,
+    PIE_KERNEL_SINGLETON,
+};
 
 /// One emitted kernel, or the reason it could not be emitted.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -126,7 +127,7 @@ fn emit_cuda_stage(stage: &CompiledStage, stage_index: usize, out: &mut Vec<Emit
         let entry = format!("ptir_fused_{signature}_r{region_index}");
         let emitted = crate::cuda::emit_fused_region(&entry, stage, region);
         out.push(EmittedKernel::new(
-            KERNEL_FUSED,
+            PIE_KERNEL_FUSED,
             stage_index,
             region_index,
             entry,
@@ -145,7 +146,7 @@ fn emit_metal_stage(stage: &CompiledStage, stage_index: usize, out: &mut Vec<Emi
                 let entry = format!("ptir_m1_{signature}_r{region_index}");
                 let source = crate::metal::emit_singleton_region(&entry, meta.op.tag);
                 out.push(EmittedKernel::new(
-                    KERNEL_SINGLETON,
+                    PIE_KERNEL_SINGLETON,
                     stage_index,
                     region_index,
                     entry,
@@ -157,7 +158,7 @@ fn emit_metal_stage(stage: &CompiledStage, stage_index: usize, out: &mut Vec<Emi
             // The whole stage is unrepresentable on the singleton path; say so
             // once rather than per region.
             out.push(EmittedKernel::new(
-                KERNEL_SINGLETON,
+                PIE_KERNEL_SINGLETON,
                 stage_index,
                 0,
                 String::new(),
@@ -179,7 +180,7 @@ fn emit_metal_stage(stage: &CompiledStage, stage_index: usize, out: &mut Vec<Emi
             Err("fused region exceeds the 12-channel direct-binding limit".to_string())
         };
         out.push(EmittedKernel::new(
-            KERNEL_FUSED,
+            PIE_KERNEL_FUSED,
             stage_index,
             region_index,
             entry,
@@ -194,7 +195,7 @@ fn emit_metal_stage(stage: &CompiledStage, stage_index: usize, out: &mut Vec<Emi
         let entry = format!("ptir_m3s_{signature}_r{region_index}");
         let emitted = crate::metal::emit_grouped_fused_region(&entry, stage, region);
         out.push(EmittedKernel::new(
-            KERNEL_GROUPED,
+            PIE_KERNEL_GROUPED,
             stage_index,
             region_index,
             entry,
@@ -211,7 +212,7 @@ fn emit_metal_stage(stage: &CompiledStage, stage_index: usize, out: &mut Vec<Emi
             _ => crate::metal::emit_grouped_fused_region(&entry, stage, region),
         };
         out.push(EmittedKernel::new(
-            KERNEL_GROUPED,
+            PIE_KERNEL_GROUPED,
             stage_index,
             stage.singleton.regions.len() + region_index,
             entry,
@@ -228,7 +229,7 @@ fn emit_metal_stage(stage: &CompiledStage, stage_index: usize, out: &mut Vec<Emi
     let ready = format!("ptir_m3_generic_ready_v{version}");
     let source = crate::metal::emit_grouped_readiness(&ready);
     out.push(EmittedKernel::new(
-        KERNEL_READINESS,
+        PIE_KERNEL_READINESS,
         stage_index,
         0,
         ready,
@@ -237,7 +238,7 @@ fn emit_metal_stage(stage: &CompiledStage, stage_index: usize, out: &mut Vec<Emi
     let commit = format!("ptir_m3_generic_commit_v{version}");
     let source = crate::metal::emit_grouped_commit(&commit);
     out.push(EmittedKernel::new(
-        KERNEL_COMMIT,
+        PIE_KERNEL_COMMIT,
         stage_index,
         0,
         commit,
@@ -256,10 +257,16 @@ fn emit_metal_program_effects(bound: &BoundTrace, out: &mut Vec<EmittedKernel>) 
     let signature = format!("{:016x}", bound.hash);
     let ready = format!("ptir_m1_{signature}_ready");
     let source = crate::metal::emit_readiness(&ready, &effects);
-    out.push(EmittedKernel::new(KERNEL_READINESS, 0, 1, ready, source));
+    out.push(EmittedKernel::new(
+        PIE_KERNEL_READINESS,
+        0,
+        1,
+        ready,
+        source,
+    ));
     let commit = format!("ptir_m1_{signature}_commit");
     let source = crate::metal::emit_commit(&commit, &effects);
-    out.push(EmittedKernel::new(KERNEL_COMMIT, 0, 1, commit, source));
+    out.push(EmittedKernel::new(PIE_KERNEL_COMMIT, 0, 1, commit, source));
 }
 
 /// Which library kernel a grouped region should use, reproducing the driver's
