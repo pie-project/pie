@@ -109,11 +109,32 @@ impl Drop for ProcessCtx {
         let bind_permit = self.bind_permit.take();
         self.execution_admitted = false;
         self.bind_admitted = false;
+        // Free the execution seat HERE, on the guest's own thread, rather
+        // than carrying the permit into the spawned teardown below. The
+        // guest has stopped producing (this Drop runs 0.05 ms p50 after
+        // `guest_main_returned`), so the seat is genuinely free; deferring
+        // its release to the teardown task made every successor wait out
+        // that task's spawn latency too — 27.8 ms p50 per retiree at conc
+        // 512, and a whole cohort retires at once. Order is the contract:
+        // the Terminate leave is posted first on this same producer, so
+        // every driver observes leave-then-release and the policy never
+        // credits a slot whose departure it has not yet seen.
+        let terminate_fences = execution_permit.as_ref().map(|_| {
+            let fences = crate::scheduler::worker::post_process_terminate_fenced(self.id);
+            crate::scheduler::worker::notify_execution_slot_released(self.id);
+            fences
+        });
+        drop(execution_permit);
+        let permit_released_us = if timing {
+            crate::scheduler::fire_timing_now_us()
+        } else {
+            0
+        };
         super::teardown::defer_resource_teardown(
             self.id,
             resources,
             self.residency.clone(),
-            execution_permit,
+            terminate_fences,
             bind_permit,
         );
         if timing {
@@ -124,6 +145,7 @@ impl Drop for ProcessCtx {
                 "process_id": self.id,
                 "drop_entered_us": drop_entered_us,
                 "scratch_rm_us": scratch_removed_us - drop_entered_us,
+                "permit_released_us": permit_released_us.saturating_sub(drop_entered_us),
             }));
         }
     }

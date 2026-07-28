@@ -237,6 +237,9 @@ pub fn init_admission(max_concurrent: Option<usize>) {
     // (see FramePolicy::on_execution_slot_released) — extra permits
     // beyond that are neutral because without an earmarked taker the
     // stall just moves into mid-generation seals.
+    //
+    // Depth 2 and 3 were measured at conc 512 (30054 / 30109 tok/s vs
+    // 30443 at depth 1): no gain, so the structural depth stands.
     const STAGED_COHORTS: usize = 1;
     let bind_ahead = limit.map(|n| Arc::new(Semaphore::new(n.saturating_mul(1 + STAGED_COHORTS))));
     EXECUTION_SLOT_CAPACITY
