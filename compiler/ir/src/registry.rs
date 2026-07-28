@@ -214,16 +214,22 @@ pub fn intrinsic_stages(intr: IntrinsicId) -> &'static [Stage] {
     }
 }
 
-/// True iff the intrinsic's availability is a **model property** checked at
-/// bind (overview §4).
-pub fn intrinsic_model_gated(intr: IntrinsicId) -> bool {
-    matches!(
-        intr,
-        IntrinsicId::MtpLogits
-            | IntrinsicId::MtpDrafts
-            | IntrinsicId::ValueHead
-            | IntrinsicId::AttnScore
-    )
+/// Whether `profile` provides `intr`.
+///
+/// Exhaustive on purpose, and deliberately one function. This used to be two:
+/// a `matches!` here listing which intrinsics are model-gated, and a `match` in
+/// [`crate::validate::bind`] mapping each gated one to its profile flag with a
+/// `_ => true` arm. Adding a gated intrinsic to the first without the second
+/// made it available on every model — a capability check that passes by being
+/// forgotten. With one exhaustive match the compiler asks the question.
+pub fn intrinsic_available(intr: IntrinsicId, profile: &ModelProfile) -> bool {
+    match intr {
+        IntrinsicId::MtpLogits => profile.has_mtp_logits,
+        IntrinsicId::MtpDrafts => profile.has_mtp_drafts,
+        IntrinsicId::ValueHead => profile.has_value_head,
+        IntrinsicId::AttnScore => profile.has_attn_score,
+        IntrinsicId::Logits | IntrinsicId::Hidden | IntrinsicId::Query | IntrinsicId::Layer => true,
+    }
 }
 
 /// A second-party kernel/sink the backend provides (bind-time availability,

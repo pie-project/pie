@@ -204,10 +204,7 @@ impl CompiledStage {
                 };
                 elements = elements.saturating_mul(*dimension as u64);
             }
-            elements.saturating_mul(match value_type.dtype {
-                DType::Bool => 1,
-                _ => 4,
-            })
+            elements.saturating_mul(pie_ir::container::const_elem_size(value_type.dtype) as u64)
         };
         let direct_values: BTreeSet<u32> = self
             .fused
@@ -1764,14 +1761,35 @@ fn build_library_match_region(
     region
 }
 
+/// The library kernel a wire tag is routed to, or `None` when the fused
+/// generated kernel emits it inline.
+///
+/// Keyed on the tag rather than the `Op` variant so the classification can be
+/// enumerated against [`pie_ir::op::OP_TABLE`]: `every_op_is_classified` in
+/// `compiler/tests` partitions the whole table into this set and the generated
+/// set, which is what makes a new op fail the build until someone says which
+/// side it is on. The `_ => None` arm alone would answer "emit it inline" for
+/// a new library op, and inline is not a kernel that exists.
+///
+/// `Family` cannot drive this: `Order` holds `sort_desc` and `top_k` (library)
+/// alongside `pivot_threshold` (generated), and `ReduceScan` holds `cumsum`
+/// and `cumprod` (library) alongside the four reductions (generated).
+pub fn library_op_for_tag(tag: u8) -> Option<LibraryOp> {
+    use pie_ir::op::tags;
+    match tag {
+        tags::TOP_K => Some(LibraryOp::TopK),
+        tags::SORT_DESC => Some(LibraryOp::Sort),
+        tags::CUMSUM | tags::CUMPROD => Some(LibraryOp::Scan),
+        tags::MATMUL => Some(LibraryOp::MatMul),
+        tags::KERNEL_CALL | tags::SINK_CALL => Some(LibraryOp::SecondParty),
+        _ => None,
+    }
+}
+
 fn region_kind_for_node(stage: &NormalizedStage, node: usize) -> RegionKind {
-    match stage.ops[node] {
-        Op::TopK { .. } => RegionKind::Library(LibraryOp::TopK),
-        Op::SortDesc(_) => RegionKind::Library(LibraryOp::Sort),
-        Op::CumSum(_) | Op::CumProd(_) => RegionKind::Library(LibraryOp::Scan),
-        Op::MatMul(_, _) => RegionKind::Library(LibraryOp::MatMul),
-        Op::KernelCall { .. } | Op::SinkCall { .. } => RegionKind::Library(LibraryOp::SecondParty),
-        _ => RegionKind::Generated,
+    match library_op_for_tag(stage.ops[node].tag()) {
+        Some(library) => RegionKind::Library(library),
+        None => RegionKind::Generated,
     }
 }
 

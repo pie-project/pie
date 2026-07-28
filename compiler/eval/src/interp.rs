@@ -1011,6 +1011,46 @@ fn rows_of(shape: Shape) -> usize {
     shape.rows() as usize
 }
 
+/// Which of the three row reductions [`eval_op`] is evaluating.
+///
+/// This exists because the dispatch it replaces re-matched `op` *inside* a
+/// combined `ReduceSum | ReduceMax | ReduceMin` arm and used `_` for the third
+/// case. That arm answered "minimum" for anything it did not recognise, so a
+/// fourth reduce op routed through it would have made the tier-0 oracle every
+/// backend diffs against return a silently wrong number -- not an error, a
+/// plausible one. Naming the three makes the compiler ask the question.
+#[derive(Clone, Copy)]
+enum ReduceKind {
+    Sum,
+    Max,
+    Min,
+}
+
+fn reduce_rows(kind: ReduceKind, ty: ValueType, data: &Value) -> Value {
+    let rows = rows_of(ty.shape);
+    let len = data.len().checked_div(rows).unwrap_or(0);
+    if ty.dtype == DType::F32 {
+        let x = lanes_f32(data);
+        let f: fn(&[f32]) -> f32 = match kind {
+            ReduceKind::Sum => |row| canonical_reduce(row, 0.0, |a, b| a + b),
+            ReduceKind::Max => |row| canonical_reduce(row, f32::NEG_INFINITY, canonical_max),
+            ReduceKind::Min => |row| canonical_reduce(row, f32::INFINITY, canonical_min),
+        };
+        Value::F32((0..rows).map(|r| f(&x[r * len..(r + 1) * len])).collect())
+    } else {
+        let x = lanes_i64(data);
+        let f: fn(&[i64]) -> i64 = match kind {
+            ReduceKind::Sum => |row| canonical_reduce(row, 0, i64::wrapping_add),
+            ReduceKind::Max => |row| canonical_reduce(row, i64::MIN, i64::max),
+            ReduceKind::Min => |row| canonical_reduce(row, i64::MAX, i64::min),
+        };
+        from_i64(
+            ty.dtype,
+            (0..rows).map(|r| f(&x[r * len..(r + 1) * len])).collect(),
+        )
+    }
+}
+
 pub(crate) fn eval_op(
     op: &Op,
     vals: &[Value],
@@ -1042,7 +1082,11 @@ pub(crate) fn eval_op(
         Op::Abs(a) => One(match v(a) {
             Value::F32(x) => Value::F32(x.iter().map(|&a| a.abs()).collect()),
             Value::I32(x) => Value::I32(x.iter().map(|&a| a.wrapping_abs()).collect()),
-            other => other.clone(),
+            // Already non-negative. Spelled out because the `_ => clone()`
+            // this replaces would answer "abs is the identity" for a signed
+            // dtype added later.
+            Value::U32(x) => Value::U32(x.clone()),
+            Value::Bool(x) => Value::Bool(x.clone()),
         }),
         Op::Sign(a) => One(match v(a) {
             Value::F32(x) => Value::F32(
@@ -1251,36 +1295,9 @@ pub(crate) fn eval_op(
             })
         }
 
-        Op::ReduceSum(a) | Op::ReduceMax(a) | Op::ReduceMin(a) => {
-            let t = ty_of(a);
-            let rows = rows_of(t.shape);
-            let data = v(a);
-            let len = data.len().checked_div(rows).unwrap_or(0);
-            if t.dtype == DType::F32 {
-                let x = lanes_f32(data);
-                let f: fn(&[f32]) -> f32 = match op {
-                    Op::ReduceSum(_) => |row| canonical_reduce(row, 0.0, |a, b| a + b),
-                    Op::ReduceMax(_) => {
-                        |row| canonical_reduce(row, f32::NEG_INFINITY, canonical_max)
-                    }
-                    _ => |row| canonical_reduce(row, f32::INFINITY, canonical_min),
-                };
-                One(Value::F32(
-                    (0..rows).map(|r| f(&x[r * len..(r + 1) * len])).collect(),
-                ))
-            } else {
-                let x = lanes_i64(data);
-                let f: fn(&[i64]) -> i64 = match op {
-                    Op::ReduceSum(_) => |row| canonical_reduce(row, 0, i64::wrapping_add),
-                    Op::ReduceMax(_) => |row| canonical_reduce(row, i64::MIN, i64::max),
-                    _ => |row| canonical_reduce(row, i64::MAX, i64::min),
-                };
-                One(from_i64(
-                    t.dtype,
-                    (0..rows).map(|r| f(&x[r * len..(r + 1) * len])).collect(),
-                ))
-            }
-        }
+        Op::ReduceSum(a) => One(reduce_rows(ReduceKind::Sum, ty_of(a), v(a))),
+        Op::ReduceMax(a) => One(reduce_rows(ReduceKind::Max, ty_of(a), v(a))),
+        Op::ReduceMin(a) => One(reduce_rows(ReduceKind::Min, ty_of(a), v(a))),
         Op::ReduceArgmax(a) => {
             let t = ty_of(a);
             let rows = rows_of(t.shape);

@@ -318,11 +318,20 @@ pub enum Op {
 
 impl Op {
     /// Number of SSA ids this op defines.
+    ///
+    /// Read from [`OP_TABLE`] rather than re-derived here. The catch-all this
+    /// replaces answered `1` for anything it did not recognise, so an op
+    /// declared with two results but omitted from the match would define one
+    /// id and **shift every later value id in the trace** — silently, because
+    /// `Recorder::push` and the encoders all trust this number.
     pub fn result_count(&self) -> u32 {
-        match self {
-            Op::SortDesc(_) | Op::TopK { .. } => 2,
-            Op::ChanPut { .. } | Op::SinkCall { .. } => 0,
-            _ => 1,
+        match spec(self.tag()) {
+            Some(row) => u32::from(row.results),
+            // `tag()` is exhaustive over `Op` and `declare_ops!` is the only
+            // place a tag exists, so a variant whose tag has no row cannot be
+            // built without also failing `table_matches_op_metadata`, which
+            // pins one representative per row.
+            None => unreachable!("op tag has no OP_TABLE row"),
         }
     }
 

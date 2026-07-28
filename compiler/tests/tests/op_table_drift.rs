@@ -24,7 +24,7 @@
 
 use std::path::PathBuf;
 
-use pie_ir::op::{OP_TABLE, VARIADIC};
+use pie_ir::op::{OP_TABLE, VARIADIC, tags};
 
 /// The driver's marker for "variadic operand count".
 ///
@@ -237,5 +237,111 @@ fn driver_launch_and_result_classes_are_pinned() {
         results,
         ["Bool", "Custom", "Index", "None", "SameAsInput"],
         "the driver's ResultKind distribution changed"
+    );
+}
+
+// ===========================================================================
+// The planner's library/generated partition
+// ===========================================================================
+
+/// Every op the fused *generated* kernel emits inline.
+///
+/// This list exists to be complete, not to be read. `pie_plan` answers "is
+/// this a library op?" with `library_op_for_tag`, whose `_ => None` arm means
+/// "emit it inline" -- a fine default for an elementwise op and a wrong one
+/// for a library op, because inline is not a kernel that exists for `matmul`.
+/// A default cannot tell the two apart, so the partition is pinned instead:
+/// add an op to `declare_ops!` and `every_op_is_classified` fails until it
+/// appears here or in `library_op_for_tag`.
+const GENERATED_TAGS: &[u8] = &[
+    tags::EXP,
+    tags::LOG,
+    tags::NEG,
+    tags::RECIP,
+    tags::ABS,
+    tags::SIGN,
+    tags::CAST,
+    tags::ADD,
+    tags::SUB,
+    tags::MUL,
+    tags::DIV,
+    tags::MAX_ELEM,
+    tags::MIN_ELEM,
+    tags::GT,
+    tags::GE,
+    tags::EQ,
+    tags::NE,
+    tags::LT,
+    tags::LE,
+    tags::AND,
+    tags::OR,
+    tags::NOT,
+    tags::REM,
+    tags::SELECT,
+    tags::REDUCE_SUM,
+    tags::REDUCE_MAX,
+    tags::REDUCE_MIN,
+    tags::REDUCE_ARGMAX,
+    tags::BROADCAST,
+    tags::RESHAPE,
+    tags::TRANSPOSE,
+    tags::PIVOT_THRESHOLD,
+    tags::GATHER,
+    tags::GATHER_ROW,
+    tags::SCATTER_ADD,
+    tags::SCATTER_SET,
+    tags::IOTA,
+    tags::MASK_APPLY_PACKED,
+    tags::CAUSAL_MASK,
+    tags::SLIDING_WINDOW_MASK,
+    tags::SINK_WINDOW_MASK,
+    tags::RNG,
+    tags::RNG_KEYED,
+    tags::CONST,
+    tags::CHAN_TAKE,
+    tags::CHAN_READ,
+    tags::CHAN_PUT,
+    tags::INTRINSIC_VAL,
+];
+
+#[test]
+fn every_op_is_classified() {
+    let mut unclassified: Vec<&str> = Vec::new();
+    let mut both: Vec<&str> = Vec::new();
+    for row in OP_TABLE {
+        let library = pie_plan::library_op_for_tag(row.tag).is_some();
+        let generated = GENERATED_TAGS.contains(&row.tag);
+        if library && generated {
+            both.push(row.name);
+        } else if !library && !generated {
+            unclassified.push(row.name);
+        }
+    }
+    assert!(
+        unclassified.is_empty(),
+        "these ops are in neither partition, so the planner will emit them \
+         inline by default: {unclassified:?} -- add each to \
+         `library_op_for_tag` or to GENERATED_TAGS above"
+    );
+    assert!(both.is_empty(), "ops claimed by both partitions: {both:?}");
+}
+
+#[test]
+fn generated_tags_are_real_ops() {
+    // A stale entry here would mask a missing classification: an op deleted
+    // from `declare_ops!` but left in the list keeps the count looking right.
+    for tag in GENERATED_TAGS {
+        assert!(
+            pie_ir::op::spec(*tag).is_some(),
+            "GENERATED_TAGS lists {tag:#04x}, which is not an OP_TABLE row"
+        );
+    }
+    let mut sorted = GENERATED_TAGS.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(
+        sorted.len(),
+        GENERATED_TAGS.len(),
+        "duplicate tag in GENERATED_TAGS"
     );
 }

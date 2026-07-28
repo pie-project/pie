@@ -18,8 +18,7 @@ use super::container::{ChannelDecl, ExternDir, HostRole, PortSource, TraceContai
 use super::infer::{BodyCtx, BodyError, body_types};
 use super::op::{IntrinsicId, Op};
 use super::registry::{
-    KNOWN_SINKS, ModelProfile, Phase, Port, SinkScope, Stage, intrinsic_model_gated,
-    intrinsic_stages,
+    KNOWN_SINKS, ModelProfile, Phase, Port, SinkScope, Stage, intrinsic_available, intrinsic_stages,
 };
 use crate::types::{DType, Shape, ValueType};
 
@@ -407,17 +406,8 @@ pub fn bind(container: TraceContainer, profile: ModelProfile) -> Result<BoundTra
                         stage: sp.stage,
                     });
                 }
-                if intrinsic_model_gated(intr) {
-                    let ok = match intr {
-                        IntrinsicId::MtpLogits => profile.has_mtp_logits,
-                        IntrinsicId::MtpDrafts => profile.has_mtp_drafts,
-                        IntrinsicId::AttnScore => profile.has_attn_score,
-                        IntrinsicId::ValueHead => profile.has_value_head,
-                        _ => true,
-                    };
-                    if !ok {
-                        return Err(ValidateError::IntrinsicUnavailable { intr });
-                    }
+                if !intrinsic_available(intr, &profile) {
+                    return Err(ValidateError::IntrinsicUnavailable { intr });
                 }
                 if !intrinsic_type_ok(intr, shape, dtype, &profile) {
                     return Err(ValidateError::IntrinsicTypeRule {

@@ -6,6 +6,7 @@
 
 use alloc::vec::Vec;
 
+use pie_ir::container::const_elem_size;
 use pie_ir::op::{IntrinsicId, Op};
 use pie_ir::types::{DType, Literal, Predicate, RngKind, Shape, ValueId, ValueType};
 
@@ -142,25 +143,12 @@ fn scalar_literal(dtype: DType, bytes: &[u8]) -> Literal {
 }
 
 fn elem_at(dtype: DType, bytes: &[u8], i: usize) -> f64 {
+    let word = |o: usize| [bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]];
     match dtype {
         DType::Bool => (bytes.get(i).copied().unwrap_or(0) != 0) as u8 as f64,
-        _ => {
-            let o = i * 4;
-            let word = [bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]];
-            match dtype {
-                DType::F32 => f32::from_le_bytes(word) as f64,
-                DType::I32 => i32::from_le_bytes(word) as f64,
-                DType::U32 => u32::from_le_bytes(word) as f64,
-                DType::Bool => unreachable!(),
-            }
-        }
-    }
-}
-
-fn elem_size(d: DType) -> usize {
-    match d {
-        DType::Bool => 1,
-        _ => 4,
+        DType::F32 => f32::from_le_bytes(word(i * 4)) as f64,
+        DType::I32 => i32::from_le_bytes(word(i * 4)) as f64,
+        DType::U32 => u32::from_le_bytes(word(i * 4)) as f64,
     }
 }
 
@@ -180,7 +168,10 @@ fn materialize_const(c: ConstData) -> (ValueId, ValueType) {
     // uniform ⇒ broadcast(scalar).
     if !vals.is_empty() && vals.iter().all(|&v| v == vals[0]) {
         let s = emit(
-            Op::Const(scalar_literal(c.dtype, &c.bytes[..elem_size(c.dtype)])),
+            Op::Const(scalar_literal(
+                c.dtype,
+                &c.bytes[..const_elem_size(c.dtype)],
+            )),
             &[ValueType::scalar(c.dtype)],
         );
         let id = emit(

@@ -466,10 +466,14 @@ pub fn put_u32(w: &mut Vec<u8>, v: u32) {
 }
 
 /// Bytes per element of a const-port payload.
+///
+/// Exhaustive on purpose: a `_ => 4` arm answers "4 bytes" for an F16 or E8M0
+/// dtype the day one is added, and the result is a mis-sized payload rather
+/// than a compile error.
 pub fn const_elem_size(dtype: DType) -> usize {
     match dtype {
         DType::Bool => 1,
-        _ => 4,
+        DType::F32 | DType::I32 | DType::U32 => 4,
     }
 }
 
