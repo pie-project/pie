@@ -1191,16 +1191,52 @@ call adversarial - and it is the same asymmetry as the batch scaling, in a
 second dimension: their cost tracks the work the constraint implies, ours
 tracks the constraint's shape.
 
+**llguidance as a second baseline (q19, 2026-07-28).** Only XGrammar had been
+compared, and llguidance claims fast mask computation and criticises
+XGrammar's tail specifically - so a reviewer would rightly ask why the fastest
+baseline was not chosen. All three are charged the same way: a mask for every
+sequence and an advance for every sequence, which is what a decode step costs.
+
+| batch | median vs XGrammar | median vs llguidance |
+|---:|---:|---:|
+| 32 | 2.26x | 4.00x |
+| 128 | 6.42x | 10.31x |
+| 512 | 21.33x | 37.56x |
+
+On JSON Schema at batch 128 it is 4.19x and 17.62x. **llguidance is slower than
+XGrammar throughout on this workload** - 0.24x their speed on schemas, 0.63x on
+regex - so adding it does not change the ranking, and saying so is the point of
+having measured it.
+
+Its tail claim holds, though, and it is the one place either baseline behaves
+better than the other by a wide margin: on `[a-z]+(,[a-z]+)*`, where XGrammar
+needs 45,354 us at batch 128, llguidance needs 963. That is the pattern where
+XGrammar's uncertain set is large, and llguidance's design does not have that
+failure mode. Ours needs 208 us.
+
+One schema of the six was refused outright: llguidance does not support `oneOf`
+without a coercion flag. Left as it is rather than tuned, since the default
+configuration is what a deployment gets.
+
+Two things follow for the paper. The speed argument does not rest on choosing a
+weak baseline - the stronger claim, llguidance's, is about the tail rather than
+the median, and it is right about the tail. And **at batch 32 on regex we are
+ahead of both**, 2.26x and 4.00x, where on JSON Schema at batch 32 we are behind
+XGrammar at 0.94x. The small-batch loss is a property of the schema workload's
+per-step cost, not of the design.
+
 **Host contention (q21).** Weaker than expected and worth saying so. With
 twenty-four cores deliberately saturated, XGrammar's fill slows by 1.06x and
 ours by 1.01x; both engines' p99 degrades to about 3 ms, which is the operating
 system rather than either design. Contention is not the argument. Capturability
 is.
 
-**Still unanswered.** End-to-end serving with error bars (q08), whether XGrammar can be made to accept
-any property order (q06), non-JSON grammars (q07), speculative decoding in a
-serving path (q13), depth scaling (q14), llguidance and outlines as baselines
-(q19), and the per-mechanism ablation (q20).
+**Still unanswered.** End-to-end serving with error bars (q08), whether
+XGrammar can be made to accept any property order (q06), grammars beyond JSON
+Schema and regex - a programming language or a query language, where LR(1) is
+doing work a DFA could not (q07) - speculative decoding in a serving path
+(q13), depth scaling (q14), Outlines as a third baseline (q19), and the
+per-mechanism ablation (q20).
 
 **Threats that remain.** Table construction is still excluded — rows are
 replayed, while XGrammar computes masks online from a compact automaton, so
