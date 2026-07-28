@@ -34,7 +34,7 @@
 #   value, which in the sampler's graph was a vocabulary-wide round trip through
 #   device memory for nothing.
 # REGENERATED: the body below is this compiler's output, not the recorded output of the source of truth above
-#   reason: argmax over the logits intrinsic is fused, so the gather that only widened bf16 to f32 is gone; bf16->f32 is exact so the argmax picks the same value and index
+#   reason: the fused argmax strides by the emit-time region width so the compiler sees a constant
 === empty
 function_name: ptir_m1_empty_commit
 channels: 0

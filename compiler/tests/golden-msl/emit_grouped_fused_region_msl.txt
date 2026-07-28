@@ -34,7 +34,7 @@
 #   value, which in the sampler's graph was a vocabulary-wide round trip through
 #   device memory for nothing.
 # REGENERATED: the body below is this compiler's output, not the recorded output of the source of truth above
-#   reason: argmax over the logits intrinsic is fused, so the gather that only widened bf16 to f32 is gone; bf16->f32 is exact so the argmax picks the same value and index
+#   reason: the fused argmax strides by the emit-time region width so the compiler sees a constant
 === beam_epilogue#0 singleton#0
 function_name: ptir_m3s_b4fadd8446eb58dd_r0
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
@@ -13902,7 +13902,7 @@ kernel void ptir_m3s_9eda8aa42400c4c2_r5(
 function_name: ptir_m3_9eda8aa42400c4c2_r0
 region: library=0 library_op=0 schedule=1 nodes=6 inputs=0 outputs=0 sinks=1
 ok: true
-source: bytes=46633 prefix=@runtime+@grouped tail_bytes=6052
+source: bytes=47552 prefix=@runtime+@grouped tail_bytes=6971
 kernel void ptir_m3_9eda8aa42400c4c2_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -13968,10 +13968,24 @@ kernel void ptir_m3_9eda8aa42400c4c2_r0(
       const uint am_src_row = row_indices[am_row_base + am_r];
       const device bfloat* am_src = logits + ulong(am_src_row) * am_vocab;
       M1ArgmaxCandidate am_best = {-INFINITY, 0u, 0u, 0u};
-      for (uint am_c = m3_tid; am_c < am_vocab; am_c += m3_threads) {
+      M1ArgmaxCandidate am_b1 = am_best, am_b2 = am_best, am_b3 = am_best;
+      constexpr uint am_w = 512u;
+      uint am_c = m3_tid;
+      for (; am_c + 3u * am_w < am_vocab; am_c += 4u * am_w) {
+        const float v0 = float(am_src[am_c]);
+        const float v1 = float(am_src[am_c + am_w]);
+        const float v2 = float(am_src[am_c + 2u * am_w]);
+        const float v3 = float(am_src[am_c + 3u * am_w]);
+        am_best = m1_argmax_combine(am_best, M1ArgmaxCandidate{v0, am_c, isnan(v0) ? 0u : 1u, 0u});
+        am_b1 = m1_argmax_combine(am_b1, M1ArgmaxCandidate{v1, am_c + am_w, isnan(v1) ? 0u : 1u, 0u});
+        am_b2 = m1_argmax_combine(am_b2, M1ArgmaxCandidate{v2, am_c + 2u * am_w, isnan(v2) ? 0u : 1u, 0u});
+        am_b3 = m1_argmax_combine(am_b3, M1ArgmaxCandidate{v3, am_c + 3u * am_w, isnan(v3) ? 0u : 1u, 0u});
+      }
+      for (; am_c < am_vocab; am_c += am_w) {
         const float am_v = float(am_src[am_c]);
         am_best = m1_argmax_combine(am_best, M1ArgmaxCandidate{am_v, am_c, isnan(am_v) ? 0u : 1u, 0u});
       }
+      am_best = m1_argmax_combine(m1_argmax_combine(am_best, am_b1), m1_argmax_combine(am_b2, am_b3));
       m3_tgbuf[m3_tid] = am_best;
       threadgroup_barrier(mem_flags::mem_threadgroup);
       for (uint am_s = 1u; am_s < m3_threads; am_s <<= 1) {
