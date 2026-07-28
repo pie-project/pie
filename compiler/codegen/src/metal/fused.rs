@@ -40,11 +40,16 @@ fn resolve_alias(alias: &BTreeMap<u32, u32>, mut value: u32) -> u32 {
 }
 
 /// Threads a grouped region's threadgroup gets per lane. The emitted kernel
-/// sizes its threadgroup reduction buffer to this and faults `0xB3` on a wider
-/// launch rather than reading past it; `m1_runtime.cpp` launches exactly this
-/// many, from its own `kM3RegionThreads`, which is a hand-kept copy of this
-/// number that nothing compares.
-pub const METAL_M3_REGION_THREADS: u32 = 256;
+/// sizes its threadgroup reduction buffer to this; the driver launches the
+/// narrower of it and the pipeline's own maxTotalThreadsPerThreadgroup, and
+/// the kernel faults `0xB3` on a wider launch rather than reading past the
+/// buffer. `m1_runtime.cpp` keeps its own `kM3RegionThreads` copy of this
+/// number by hand, with nothing comparing them.
+///
+/// 512 measured against 256 with the model DAG truncated away, interleaved to
+/// cancel thermal drift: 0.951ms vs 1.557ms for the sampler region, reproduced
+/// twice. 1024 is not better (0.963ms) and costs twice the threadgroup memory.
+pub const METAL_M3_REGION_THREADS: u32 = 512;
 
 /// Device+threadgroup barrier between two ops of a region.
 const BARRIER: &str =

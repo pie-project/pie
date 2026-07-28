@@ -24,7 +24,7 @@ namespace pie::metal::pipeline {
 
 // Threads a grouped generated region gets per lane. Must equal
 // `METAL_M3_REGION_THREADS` in compiler/codegen/src/metal/fused.rs.
-inline constexpr std::uint32_t kM3RegionThreads = 256;
+inline constexpr std::uint32_t kM3RegionThreads = 512;
 
 std::string encode_m1_cache_identity(
     std::uint64_t device,
