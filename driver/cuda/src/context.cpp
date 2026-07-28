@@ -714,7 +714,15 @@ int Context::Impl::initialize(
                             (dev_prop.major == 8 && dev_prop.minor >= 9);
     const bool native_mxfp4_moe =
 #ifdef PIE_CUDA_HAS_MARLIN
-        dev_prop.major >= 10;
+        // Ampere and newer. The vendored Marlin ships sm80 kernels for
+        // exactly this combination — BF16 activations, kFE2M1f (MXFP4)
+        // weights, kFE8M0fnu block scales (see
+        // third_party/marlin/sm80_kernel_bfloat16_fe2m1f_bfloat16.cu) —
+        // which is the same path vLLM selects on A100 ("Using 'MARLIN'
+        // Mxfp4 MoE backend"). The previous `>= 10` gate left every
+        // pre-Blackwell GPU on the routed-dequant fallback, which
+        // dequantizes each routed expert per fire.
+        dev_prop.major >= 8;
 #else
         false;
 #endif
@@ -1707,9 +1715,21 @@ int Context::Impl::load_model(
             std::uint8_t wanted;
             std::uint32_t arenas;
         };
+        // Mixtral/GPT-OSS opt out: their MoE block routes on the HOST inside
+        // the layer loop (D2H of the top-k selection plus a stream
+        // synchronize per layer). The custom all-reduce is a spin barrier —
+        // its kernel occupies the GPU until every peer arrives — so a rank
+        // that must drain its stream mid-layer waits for a peer kernel that
+        // is itself waiting for that rank. Measured: both ranks parked in
+        // forward with the follower exactly one all-reduce ahead. NCCL's
+        // collective does not hold the device the same way and runs this
+        // family fine, so the family takes NCCL. Every rank evaluates this
+        // predicate identically, which is what keeps the choice collective.
+        const bool family_wants_custom_ar = family != model::Family::Mixtral;
         const CustomArVote local{
             static_cast<std::uint8_t>(
                 (disabled == nullptr || std::strcmp(disabled, "1") != 0) &&
+                        family_wants_custom_ar &&
                         !tp_group_devices_.empty() && !workspace_bases.empty()
                     ? 1
                     : 0),

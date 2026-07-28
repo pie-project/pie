@@ -1,5 +1,7 @@
 #include "custom_all_reduce.hpp"
 
+#include <atomic>
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <iostream>
@@ -537,7 +539,21 @@ bool CustomAllReduce::can_handle(const void* input, std::size_t bytes,
     } catch (...) {
         return false;
     }
-    if (registered_bases_.find(base) == registered_bases_.end()) return false;
+    if (registered_bases_.find(base) == registered_bases_.end()) {
+        // A per-rank answer to a collective question: if the peer DID find
+        // its base registered, it runs the custom kernel while this rank
+        // posts NCCL, and the group hangs. Report it (bounded) — the
+        // asymmetry is the bug, not the fallback.
+        static std::atomic<int> reports{0};
+        if (reports.fetch_add(1, std::memory_order_relaxed) < 8) {
+            std::fprintf(stderr,
+                         "[pie-driver-cuda] custom AR: base %p of buffer %p "
+                         "is NOT registered on rank %d (falling back to "
+                         "NCCL; a peer that registered it will diverge)\n",
+                         base, input, rank_);
+        }
+        return false;
+    }
     // The vllm one-shot kernel handles arbitrary sizes correctly; the
     // question is just where NCCL takes over on raw bandwidth. On
     // fast interconnects the crossover is around a few MB for 2 ranks,

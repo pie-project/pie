@@ -166,6 +166,7 @@ void mixtral_forward_paged(
     const bool tp_is_leader = (T == 1) || (tp != nullptr && tp->rank() == 0);
 
     const bool use_decode_path = is_pure_decode && !fwd_cfg.force_prefill_path;
+    int ar_count = 0;  // per-fire all-reduce census (PIE_MIXTRAL_AR_TRACE)
     const bool any_sinks = [&]{
         for (const auto& L : w.layers) {
             if (L.attn_sinks != nullptr) return true;
@@ -335,6 +336,7 @@ void mixtral_forward_paged(
                 kernels::launch_add_bias_bf16(
                     ws.norm_x.data(), layer.o_bias->data(), N, H, stream);
             }
+            ++ar_count;
             tp->all_reduce_bf16(ws.norm_x.data(),
                 static_cast<std::size_t>(N) * H, ncclSum, stream);
             kernels::launch_residual_add_bf16(
@@ -538,6 +540,7 @@ void mixtral_forward_paged(
         }
 
         if (T > 1) {
+            ++ar_count;
             tp->all_reduce_bf16(ws.norm_x.data(),
                 static_cast<std::size_t>(N) * H, ncclSum, stream);
             kernels::launch_residual_add_bf16(
@@ -545,6 +548,21 @@ void mixtral_forward_paged(
         }
     }
 
+    // Per-fire collective census (PIE_MIXTRAL_AR_TRACE=1). Ranks must issue
+    // the SAME number of all-reduces in the same order; a divergence hangs
+    // the group with one rank spinning in NCCL. Printing the count with the
+    // fire's shape is what makes an asymmetry visible instead of inferred.
+    if (T > 1) {
+        static const bool trace =
+            std::getenv("PIE_MIXTRAL_AR_TRACE") != nullptr;
+        if (trace) {
+            std::fprintf(stderr,
+                         "[mixtral-ar] rank=%d N=%d R=%d pure_decode=%d "
+                         "layers=%d ar_this_fire=%d\n",
+                         tp != nullptr ? tp->rank() : 0, N, R,
+                         is_pure_decode ? 1 : 0,
+                         static_cast<int>(w.layers.size()), ar_count);
+        }
     if (!fwd_cfg.emit_logits) {
         return;
     }
