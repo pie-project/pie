@@ -198,13 +198,21 @@ pub fn fold_stage(
     Ok(fold)
 }
 
+/// A dtype-correct stand-in for a blocked value.
+///
+/// Blocked operands short-circuit before `eval_op` (the `if let Some(blocker)
+/// = blocked` arm returns early), so nothing ever reads a placeholder —
+/// `dense` only needs an entry to stay index-aligned with `slots`. It is
+/// therefore empty on purpose: materialising the declared `numel()` zeroed a
+/// whole tensor per blocked op, and in a decode epilogue (where every kernel
+/// and intrinsic is blocked) that dominated the host cost of a forward
+/// submit.
 fn placeholder(ty: pie_ir::types::ValueType) -> Value {
-    let n = ty.shape.numel().max(1) as usize;
     match ty.dtype {
-        pie_ir::types::DType::F32 => Value::F32(alloc::vec![0.0; n]),
-        pie_ir::types::DType::I32 => Value::I32(alloc::vec![0; n]),
-        pie_ir::types::DType::U32 => Value::U32(alloc::vec![0; n]),
-        pie_ir::types::DType::Bool => Value::Bool(alloc::vec![false; n]),
+        pie_ir::types::DType::F32 => Value::F32(alloc::vec::Vec::new()),
+        pie_ir::types::DType::I32 => Value::I32(alloc::vec::Vec::new()),
+        pie_ir::types::DType::U32 => Value::U32(alloc::vec::Vec::new()),
+        pie_ir::types::DType::Bool => Value::Bool(alloc::vec::Vec::new()),
     }
 }
 
