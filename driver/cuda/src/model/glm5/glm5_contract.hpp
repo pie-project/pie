@@ -8,6 +8,7 @@
 /// the one that ships FP8 experts a runtime FP4 request is allowed to consume.
 
 #include "model/contract.hpp"
+#include "model/glm5/glm5.hpp"
 
 namespace pie_cuda_driver::model {
 
@@ -21,7 +22,12 @@ inline void author_glm5_contract(ContractBuilder& b) {
     // GLM-5.2 ships routed experts one tensor per expert; glm5_forward reads
     // the fused 3-D slabs. Float only: this family's quantised checkpoints
     // keep the per-expert layout and take the per-expert forward path.
-    contract_detail::hf_moe_expert_stacks(b, /*gate_second=*/false,
+    //
+    // `gate_second` publishes each expert's halves as `[up | gate]`, which is
+    // what flashinfer's CUTLASS grouped GEMM reads fc1 as. Stating it here is
+    // the whole point: the alternative is a driver-side block swap over the
+    // largest tensor in the model, done after the loader has already placed it.
+    contract_detail::hf_moe_expert_stacks(b, glm5_moe_gate_up_swapped(),
                                           /*float_only=*/true);
     author_dense_contract(b);
 }

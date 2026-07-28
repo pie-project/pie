@@ -22,6 +22,7 @@
 #include "kernels/rmsnorm.hpp"
 #include "kernels/rope.hpp"
 #include "kernels/swiglu.hpp"
+#include "ops/flashinfer_moe.hpp"
 #include "model/llama_like/qwen3.hpp"  // for make_weight_view
 
 namespace pie_cuda_driver::model {
@@ -204,6 +205,23 @@ Glm5Workspace Glm5Workspace::allocate(
         ws.a_dn_ptrs = DeviceTensor::allocate(DType::INT64, {std::max<std::int64_t>(pw, 1)});
         ws.b_dn_ptrs = DeviceTensor::allocate(DType::INT64, {std::max<std::int64_t>(pw, 1)});
         ws.c_dn_ptrs = DeviceTensor::allocate(DType::INT64, {std::max<std::int64_t>(pw, 1)});
+    }
+    // flashinfer's fused MoE. Sized for the full token budget: unlike qwen3.5
+    // this branch also serves prefill, which is where the padded-block batched
+    // GEMM wastes the most work (`max_blocks` provisions for worst-case routing
+    // skew and every block runs unconditionally).
+    if (routed_I > 0 && cfg.num_experts > 0 && Ktop > 0 &&
+        ops::flashinfer_cutlass_moe_enabled() && glm5_moe_gate_up_swapped()) {
+        ws.cutlass_max_rows = N;
+        const std::size_t bytes = ops::flashinfer_cutlass_moe_workspace_bytes(
+            ops::MoeActivation::Swiglu, ws.cutlass_max_rows, H, routed_I,
+            cfg.num_experts, Ktop, /*tp_size=*/1, /*tp_rank=*/0);
+        if (bytes > 0) {
+            ws.cutlass_ws = DeviceTensor::allocate(
+                DType::UINT8, {static_cast<std::int64_t>(bytes)});
+            ws.cutlass_row_map = DeviceTensor::allocate(
+                DType::INT32, {static_cast<std::int64_t>(ws.cutlass_max_rows) * Ktop});
+        }
     }
     ws.logits        = DeviceTensor::allocate(DType::BF16, {O, cfg.vocab_size});
     return ws;
@@ -512,9 +530,44 @@ void glm5_forward_paged(
         // vLLM/SGL-style: bucket routes into fixed-size expert blocks on
         // device, run two batched GEMMs, scatter back. No host round-trip and
         // no stream sync, so the forward stays graph-capturable.
-        if (Lw.moe_gate_up_proj != nullptr && ws.aligned_block_size > 0 &&
+        //
+        // flashinfer's CUTLASS grouped GEMM does the same job in one call and
+        // without the padding: it permutes rows by expert, runs both GEMMs over
+        // the *actual* row counts, and its FINALIZE epilogue folds SwiGLU and
+        // the top-k weighted sum into GEMM2. The batched path below has to
+        // provision `max_blocks` for worst-case routing skew and run every
+        // block unconditionally -- 1536 padded rows for 1024 real at E=8, and
+        // 17,215 for the same 1024 at the real E=256.
+        // At M=1 the routed GEMMs are pure streaming reads with no weight
+        // reuse, so the dedicated one-warp-per-row GEMV still beats a grouped
+        // GEMM whose tiling assumes an M worth filling -- measured 466 vs 429
+        // tok/s on glm5.2-mini at concurrency 1. Reach for the fused runner
+        // only above that, where it is unambiguously better.
+        const bool gemv_ok =
+            Lw.moe_gate_up_proj != nullptr && ws.aligned_block_size > 0 &&
             total_tokens <= kGlm5MoeGemvMaxTokens && (H % 8) == 0 &&
-            (routed_I % 8) == 0) {
+            (routed_I % 8) == 0;
+        const bool fused_moe_fits =
+            !gemv_ok &&
+            Lw.moe_gate_up_proj != nullptr && !ws.cutlass_ws.empty() &&
+            total_tokens <= ws.cutlass_max_rows;
+        if (fused_moe_fits &&
+            ops::flashinfer_cutlass_moe_bf16(
+                ops::MoeActivation::Swiglu,
+                static_cast<const std::uint16_t*>(ws.norm_y.data()),
+                static_cast<const std::int32_t*>(ws.topk_idx.data()),
+                static_cast<const float*>(ws.topk_weights.data()),
+                static_cast<const std::uint16_t*>(Lw.moe_gate_up_proj->data()),
+                static_cast<const std::uint16_t*>(Lw.moe_down_proj->data()),
+                static_cast<std::uint16_t*>(ws.moe_out.data()),
+                static_cast<std::uint8_t*>(ws.cutlass_ws.data()),
+                static_cast<std::size_t>(ws.cutlass_ws.nbytes()),
+                static_cast<std::int32_t*>(ws.cutlass_row_map.data()),
+                total_tokens, H, routed_I, E, K,
+                /*tp_size=*/1, /*tp_rank=*/0, stream)) {
+            // FINALIZE already applied `topk_weights` and summed the K
+            // experts, so `ws.moe_out` is complete -- no weighted sum here.
+        } else if (gemv_ok) {
             // Decode: at M=1 the routed GEMMs are pure streaming reads with no
             // weight reuse, so one warp per output row beats a batched GEMM
             // whose tiling assumes an M worth filling.
@@ -526,7 +579,8 @@ void glm5_forward_paged(
                 total_tokens, K, H, routed_I, stream);
             kernels::launch_chunked_swiglu_bf16(
                 ws.aligned_gate_up.data(), ws.aligned_act.data(),
-                routes, routed_I, stream);
+                routes, routed_I, stream,
+                /*gate_second=*/glm5_moe_gate_up_swapped());
             kernels::launch_moe_down_decode_gemv_bf16(
                 static_cast<const std::int32_t*>(ws.topk_idx.data()),
                 ws.aligned_act.data(), Lw.moe_down_proj->data(),
@@ -582,7 +636,8 @@ void glm5_forward_paged(
                 block, 2 * routed_I, H, max_blocks);
             kernels::launch_chunked_swiglu_bf16(
                 ws.aligned_gate_up.data(), ws.aligned_act.data(),
-                aligned_rows, routed_I, stream);
+                aligned_rows, routed_I, stream,
+                /*gate_second=*/glm5_moe_gate_up_swapped());
             ops::gemm_batched_act_x_wt_bf16(cublas.handle(),
                 reinterpret_cast<const void* const*>(ws.b_dn_ptrs.data()),
                 reinterpret_cast<const void* const*>(ws.a_dn_ptrs.data()),

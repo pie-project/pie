@@ -72,6 +72,13 @@ struct Glm5Workspace {
     DeviceTensor a_dn_ptrs, b_dn_ptrs, c_dn_ptrs;
     int aligned_block_size = 0;
     int aligned_max_blocks = 0;
+    // flashinfer CUTLASS fused-MoE scratch. The runner permutes, runs both
+    // grouped GEMMs, applies SwiGLU and finalises the top-k weighted sum in
+    // one call, so it replaces the whole gather/batched-GEMM/scatter chain
+    // above whenever `cutlass_ws` is non-empty and the token count fits.
+    DeviceTensor cutlass_ws;          // opaque runner workspace (uint8)
+    DeviceTensor cutlass_row_map;     // [cutlass_max_rows * top_k] int32
+    int cutlass_max_rows = 0;
     DeviceTensor logits;            // [O, vocab]
 
     static Glm5Workspace allocate(
