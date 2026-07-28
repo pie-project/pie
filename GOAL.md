@@ -180,18 +180,26 @@ schemas, plus three tests.
 
 | batch | k=1 | k=4 | k=8 |
 |---:|---:|---:|---:|
-| 128 | 1.41x | 0.75x | 0.46x |
-| 512 | 3.15x | **2.34x** | **1.26x** |
+| 128 | 1.29x | 0.83x | 0.45x |
+| 512 | 2.95x | **2.68x** | **1.59x** |
 
-At batch 512 we now win at every draft length, where k=8 was 0.74x. At 128 we
-still lose past k=1, and the reason has changed: the launches are gone and what
-is left is the work, `k` times a fill and an advance. Being flat in `k`
-would need the draft tree walked on the device in one launch; that is a real
-possibility and not what this does.
+Both engines produce a mask per draft position - `traverse_draft_tree` fills one
+per node - so this is like for like.
 
-So speculative decoding is not a killer example. It is a capability that was
-missing and now exists, with an honest cost curve that favours the other engine
-past a draft of four.
+At batch 512 we win at every draft length, where k=8 was 0.74x before the
+per-step work came down. At 128 we still lose past k=1, and the reason is not
+speculative-specific: our cost is `k` times a step, and a step at batch 128 is
+where our fixed cost still shows. XGrammar is flat past k=4 because a child
+node continues from its parent's state and its mask comes from their cache;
+being flat in `k` for us would mean advancing position by position and then
+filling every position at once, as one wide batch. Our fill is nearly flat in
+the batch - 103 us at 32 against 116 at 512 - so that is the shape that would
+do it. Not attempted.
+
+So speculative decoding is no longer a loss, but it is not a killer example
+either: it is a capability that was missing, now with a cost curve that favours
+us at serving batch sizes and them at small ones - which is the same boundary
+everything else in this document falls on.
 
 ## Grammar class decision
 
