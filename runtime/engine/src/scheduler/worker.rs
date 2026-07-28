@@ -6572,22 +6572,58 @@ mod tests {
         // remains queued behind the scheduler's run-ahead depth while close
         // releases the wait-set; none may be cancelled.
         notify_pipeline_close(pid).await;
-        timeout(Duration::from_secs(5), completions.remove(0)).await??;
-        timeout(Duration::from_secs(5), completions.remove(0)).await??;
 
-        // The first two outputs remain committed after close. Consume them as
-        // a post-close `take` would, releasing capacity for the queued third
-        // fire; close did not poison or discard either value.
+        // Drain the reader ring CONCURRENTLY, as a real host reader
+        // (`channel.take`) does. The third fire is dispatched the instant
+        // run-ahead frees a slot, which is the same moment the first fire's
+        // completion resolves — so a test that only advances `head` after
+        // awaiting completions races the scheduler, and a fire that lands on
+        // a full 2-cell ring latches RETRY (a v14 contract violation). Nothing
+        // else bounds it here: `submit_async` is the raw scheduler entry and
+        // bypasses the pipeline's submit-time ring-occupancy admission
+        // (`validate_frame`), which is what keeps this in range in production.
+        // On a `current_thread` runtime this task interleaves at exactly the
+        // awaits below, i.e. whenever the test is blocked on a completion.
         let binding = endpoints[1].registered().binding;
-        let words = binding.word_base as *const std::sync::atomic::AtomicU64;
-        let tail =
-            unsafe { (&*words.add(binding.tail_word_index as usize)).load(Ordering::Acquire) };
-        assert_eq!(tail, 2, "settled outputs remain visible after close");
-        unsafe {
-            (&*words.add(binding.head_word_index as usize)).store(2, Ordering::Release);
+        let words = binding.word_base as usize;
+        let drainer = tokio::task::spawn(async move {
+            let mut drained = 0u64;
+            loop {
+                {
+                    // Derived inside the loop body: a raw pointer held across
+                    // the await below would make this future !Send.
+                    let words = words as *const std::sync::atomic::AtomicU64;
+                    let tail = unsafe {
+                        (&*words.add(binding.tail_word_index as usize)).load(Ordering::Acquire)
+                    };
+                    if tail > drained {
+                        drained = tail;
+                        unsafe {
+                            (&*words.add(binding.head_word_index as usize))
+                                .store(tail, Ordering::Release);
+                        }
+                        crate::scheduler::nudge(driver_id);
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        });
+
+        for index in 0..3 {
+            timeout(Duration::from_secs(5), completions.remove(0))
+                .await
+                .unwrap_or_else(|_| panic!("fire {index} did not complete after close"))?;
         }
-        crate::scheduler::nudge(driver_id);
-        timeout(Duration::from_secs(5), completions.remove(0)).await??;
+        drainer.abort();
+
+        // Every settled output stayed visible across the close: none was
+        // poisoned or discarded, so the ring published all three.
+        let tail = unsafe {
+            (&*(words as *const std::sync::atomic::AtomicU64)
+                .add(binding.tail_word_index as usize))
+                .load(Ordering::Acquire)
+        };
+        assert_eq!(tail, 3, "settled outputs remain visible after close");
 
         assert!(
             operation_log

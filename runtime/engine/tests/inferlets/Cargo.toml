@@ -9,6 +9,7 @@ members = [
     "generate",
     "generate-gdn",
     "generate-gdn-n1",
+    "generate-gdn-frame",
     "grammar",
     "grammar-late",
     "grammar-wit-bench",

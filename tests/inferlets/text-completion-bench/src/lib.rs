@@ -395,14 +395,11 @@ async fn run_one(
 
     let pipe = Pipeline::new();
 
-    // A recurrent-state pass serializes behind every earlier fire's
-    // settlement, so it cannot share a frame: the frame would sit one fire
-    // short of sealing while the fire that would complete it waits for the
-    // frame to run. Such a model gets one live slot per frame whatever k
-    // is (the rest pad to no-ops), which costs the k-wide batching but is
-    // the only shape the contract allows. The runtime rejects the other
-    // shape rather than hanging on it.
-    let live_slots = if rs_ws.is_empty() { k } else { 1 };
+    // A recurrent-state pass used to need a frame of its own: it serialized
+    // behind every earlier fire's SETTLEMENT, which a frame can never reach.
+    // RS mappings now publish at prepare, in slot order, so a linear model
+    // fills all k slots exactly like a dense one.
+    let live_slots = k;
 
     // First frame: the prefill chunk in slot 0, then up to live_slots-1
     // decode slots. At live_slots = 1 this is a bare prefill submit

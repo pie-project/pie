@@ -229,39 +229,36 @@ impl Drop for KvTxnGuard {
     }
 }
 
-/// Abort-on-drop guard for a fire's prepared RS transactions (which have no
-/// store-side Drop rollback of their own). Same protocol as [`KvTxnGuard`].
+/// Settle-on-drop guard for a fire's published RS transaction (which has no
+/// store-side Drop of its own). Same protocol as [`KvTxnGuard`]: the mapping
+/// is already authoritative, so dropping only releases the in-flight hold.
 struct RsTxnsGuard {
     model: usize,
     driver: usize,
-    txns: Vec<rs::RsTxn>,
+    txn: Option<rs::RsTxn>,
 }
 
 impl RsTxnsGuard {
-    fn new(model: usize, driver: usize, txns: Vec<rs::RsTxn>) -> Self {
-        Self {
-            model,
-            driver,
-            txns,
-        }
+    fn new(model: usize, driver: usize, txn: Option<rs::RsTxn>) -> Self {
+        Self { model, driver, txn }
     }
 
-    fn into_inner(mut self) -> Vec<rs::RsTxn> {
-        std::mem::take(&mut self.txns)
+    fn into_inner(mut self) -> Option<rs::RsTxn> {
+        self.txn.take()
     }
 }
 
 impl Drop for RsTxnsGuard {
     fn drop(&mut self) {
-        if self.txns.is_empty() {
+        let Some(txn) = self.txn.take() else {
             return;
-        }
+        };
         let stores = crate::store::registry::get(self.model, self.driver);
         {
             let mut store = stores.rs.lock().unwrap();
-            rs::abandon_many(&mut store, std::mem::take(&mut self.txns));
+            rs::settle(&mut store, Some(txn));
         }
-        // The abort recycled slots; parked asks may fit now.
+        // Settlement retired recycled slots; parked asks may fit now.
         if let Some(planner) = crate::planner::planner_for(self.model, self.driver) {
             planner.pages_freed();
         }
@@ -566,12 +563,12 @@ enum FireKv {
 }
 
 /// One in-flight fire: the work item completion plus everything needed to
-/// finalize when it resolves — the open KV/RS txns (pins/CoW held until
-/// commit/abort) and the bound cells whose mirror epochs become visible.
+/// finalize when it resolves — the open KV/RS txns (pins held until
+/// settlement) and the bound cells whose mirror epochs become visible.
 pub struct PendingFire {
     completion: crate::driver::WorkItemCompletion,
     kv: FireKv,
-    rstxns: Vec<rs::RsTxn>,
+    rstxn: Option<rs::RsTxn>,
     ws_guard: KvFireLease,
     model: usize,
     driver: usize,
@@ -583,7 +580,7 @@ pub struct PendingFire {
     failure: PipelineFailure,
 }
 
-type PreparedRs = (Vec<u32>, Vec<u8>, Vec<u32>, Vec<u32>, Vec<rs::RsTxn>);
+type PreparedRs = (Vec<u32>, Vec<u8>, Vec<u32>, Vec<u32>, Option<rs::RsTxn>);
 
 fn prepare_bound_rs<C: FireContext>(
     ctx: &mut C,
@@ -602,13 +599,7 @@ fn prepare_bound_rs<C: FireContext>(
         ))));
     }
     if rs_reps.is_empty() {
-        return Ok(Ok((
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        )));
+        return Ok(Ok((Vec::new(), Vec::new(), Vec::new(), Vec::new(), None)));
     }
 
     // Resolution + model/driver validation live in the phase-A resolver;
@@ -651,7 +642,14 @@ fn prepare_bound_rs<C: FireContext>(
         .map_err(|error| ReservedError::Fatal(format!("pipeline: rs prepare: {error}"))))
 }
 
-pub(crate) async fn drain_rs_predecessors<C: FireContext>(
+/// Drain EVERY in-flight fire on this pipeline to settlement.
+///
+/// This is not an RS ordering rule (RS mappings publish at prepare, in
+/// submission order, so a recurrent-state fire never needs to wait for its
+/// predecessors). It is the host-side ordering seam for out-of-band ops that
+/// read committed physical ids and then act on them off the fire path —
+/// `copy_into`, whose page translation must not race a same-WS CoW rebase.
+pub(crate) async fn drain_pipeline_fires<C: FireContext>(
     ctx: &mut C,
     fires: &PendingFires,
 ) -> Anyhow<()> {
@@ -829,15 +827,9 @@ pub async fn submit_pass_stamped<C: FireContext>(
         if let Err(error) = wire_channels_to_pipeline(ctx, &fwd, &pipe_fires)? {
             return Ok(Err(error));
         }
-        if !ctx.resources().get(&fwd)?.rs_ws.is_empty() {
-            // RS mappings publish only at finalize. Correctness-first
-            // serialization prevents a later run-ahead fire from preparing
-            // against stale committed state (double RESET / repeated CoW).
-            drain_rs_predecessors(ctx, &pipe_fires).await?;
-            if let Some(error) = pipeline_failed(&pipeline_failure) {
-                return Ok(Err(error));
-            }
-        }
+        // An RS-binding pass needs no extra serialization here: its mapping
+        // publishes at prepare, in submission order, so it runs ahead like
+        // any other pass.
         let timing_enabled = ctx.fire_timing_requested();
         let (
             geometry,
@@ -1162,7 +1154,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             .push_back(PendingOp::Fire(PendingFire {
                 completion,
                 kv: FireKv::Host(kvtxn.into_inner()),
-                rstxns: rstxns.into_inner(),
+                rstxn: rstxns.into_inner(),
                 ws_guard,
                 model,
                 driver,
@@ -1286,24 +1278,14 @@ fn validate_frame<C: FireContext>(
     let mut uses: std::collections::HashMap<usize, ChannelUse> = std::collections::HashMap::new();
     let mut device_rings: std::collections::HashMap<usize, DeviceRingUse> =
         std::collections::HashMap::new();
-    // A pass that binds recurrent state cannot share a frame with any
-    // other fire. `fire` serializes such a pass behind EVERY predecessor
-    // fire's settlement (`drain_rs_predecessors`) because RS mappings only
-    // publish at finalize — but a frame's fires cannot settle until all of
-    // them are submitted, and submitting the next one is what blocks. The
-    // two rules are structurally incompatible, and the result is a silent
-    // hang: the frame sits one fire short of sealing forever. Reject it
-    // here, where the frame's shape is known.
-    if fired.len() > 1 {
-        for &(slot, rep) in fired {
-            let fwd: Resource<ForwardPass> = Resource::new_borrow(rep);
-            if !ctx.resources().get(&fwd)?.rs_ws.is_empty() {
-                return Ok(Err(format!(
-                    "pipeline: frame slot {slot} binds recurrent state, so it                      serializes behind every earlier fire's settlement and                      cannot share a frame — give a recurrent-state pass a                      frame of its own (one live slot, the rest none)"
-                )));
-            }
-        }
-    }
+    // A pass that binds recurrent state needs NO frame restriction. RS
+    // mappings publish at prepare, in slot order, under the store lock — so
+    // slot i+1 classifies against slot i's decision without waiting for it to
+    // settle, and the advanced state's contents are ordered by the stream
+    // like any intra-frame dependency. The former rule (an RS pass had to own
+    // its frame) existed only because `fire` serialized such a pass behind
+    // every predecessor's settlement, which a frame can never reach: the
+    // frame seals one fire short forever. Both halves are gone.
     for &(_, rep) in fired {
         let fwd: Resource<ForwardPass> = Resource::new_borrow(rep);
         let pass = ctx.resources().get(&fwd)?;
@@ -1457,7 +1439,7 @@ pub async fn copy_into_inner<C: FireContext>(
             pipeline.failure.clone(),
         )
     };
-    drain_rs_predecessors(ctx, &pipe_fires).await?;
+    drain_pipeline_fires(ctx, &pipe_fires).await?;
     if let Some(error) = pipeline_failed(&pipeline_failure) {
         return Ok(Err(error));
     }
@@ -1780,7 +1762,7 @@ async fn finalize_fire_await(fire: PendingFire) -> Anyhow<FinalizeOutcome> {
     let PendingFire {
         completion,
         kv,
-        rstxns,
+        rstxn,
         ws_guard,
         model,
         driver,
@@ -1807,15 +1789,16 @@ async fn finalize_fire_await(fire: PendingFire) -> Anyhow<FinalizeOutcome> {
 
     let (kv_failure, rs_failure) = {
         let stores = crate::store::registry::get(model, driver);
-        // RS transactions have no Drop rollback. Retire them before the only
-        // await below so process cancellation cannot leak their slots.
-        let rs_failure = if rstxns.is_empty() {
+        // RS transactions have no Drop rollback. Settle them before the only
+        // await below so process cancellation cannot leak their slots. The
+        // mapping is already published (fail-stop either way), so settlement
+        // cannot fail and does not depend on `success`.
+        let rs_failure: Option<String> = if rstxn.is_some() {
+            let mut rs_store = stores.rs.lock().unwrap();
+            rs::settle(&mut rs_store, rstxn);
             None
         } else {
-            let mut rs_store = stores.rs.lock().unwrap();
-            rs::finalize_many(&mut rs_store, rstxns, success)
-                .err()
-                .map(|error| format!("pipeline: recurrent-state finalize failed: {error}"))
+            None
         };
         let kvtxn = match kv {
             FireKv::DeviceGeom { kvtxn } => Some(kvtxn),
@@ -1950,12 +1933,8 @@ async fn fire_device_geometry<C: FireContext>(
     if let Err(e) = wire_channels_to_pipeline(ctx, &fwd, &pipe_fires)? {
         return Ok(Err(e));
     }
-    if !ctx.resources().get(&fwd)?.rs_ws.is_empty() {
-        drain_rs_predecessors(ctx, &pipe_fires).await?;
-        if let Some(error) = pipeline_failed(&pipeline_failure) {
-            return Ok(Err(error));
-        }
-    }
+    // No RS serialization: the mapping publishes at prepare (submission
+    // order), so a recurrent-state device-geometry pass runs ahead too.
     let timing_enabled = ctx.fire_timing_requested();
 
     let (ws_rep, rs_reps) = {
@@ -2302,7 +2281,7 @@ async fn fire_device_geometry<C: FireContext>(
                     .into_inner()
                     .expect("device-geometry fire always holds a KV transaction"),
             },
-            rstxns: rstxns.into_inner(),
+            rstxn: rstxns.into_inner(),
             ws_guard,
             model: ws.model,
             driver: ws.driver,
@@ -2442,13 +2421,16 @@ mod lifecycle_tests {
         Ok(())
     }
 
-    /// Same contract for RS: abandoned folded-slot prepares release their
-    /// slots through the guard, not a hand-written error path.
+    /// The RS contract under publish-at-prepare: the guard SETTLES rather
+    /// than rolls back. The folded slot the prepare adopted stays owned by
+    /// the working set (fail-stop, as for KV), the unconsumed reservation
+    /// returns immediately, and settling releases the in-flight hold so a
+    /// later release retires everything.
     #[tokio::test(flavor = "current_thread")]
-    async fn rs_txns_guard_drop_releases_prepared_slots() -> anyhow::Result<()> {
+    async fn rs_txns_guard_drop_settles_without_rolling_back_the_mapping() -> anyhow::Result<()> {
         let model = crate::store::registry::register_model(16, &[4], &[4]);
         let stores = crate::store::registry::get(model, 0);
-        let (txns, before) = {
+        let (txn, ws, before) = {
             let mut store = stores.rs.lock().unwrap();
             let ws = store.create_working_set(crate::store::rs::RsGeometry {
                 state_size: 64,
@@ -2457,18 +2439,32 @@ mod lifecycle_tests {
             });
             let before = store.available_slots();
             let mut granted = store.reserve_slots(2).expect("slots available");
-            let (_, _, _, txns) =
+            let (_, _, _, txn) =
                 rs::prepare_many_reserved(&mut store, &[ws], &mut granted).expect("prepare");
             store.release_slot_reservation(granted);
-            (txns, before)
+            assert!(
+                store.folded_slot(ws).expect("live working set").is_some(),
+                "prepare publishes the folded slot before the fire is submitted"
+            );
+            (txn, ws, before)
         };
-        drop(RsTxnsGuard::new(model, 0, txns));
-        let store = stores.rs.lock().unwrap();
-        assert_eq!(
-            store.available_slots(),
-            before,
-            "every reserved slot released exactly once"
-        );
+        drop(RsTxnsGuard::new(model, 0, txn));
+        {
+            let mut store = stores.rs.lock().unwrap();
+            assert_eq!(
+                store.available_slots(),
+                before - 1,
+                "the published folded slot stays owned by the working set"
+            );
+            let epoch = store.current_epoch();
+            store.release_working_set(ws, epoch);
+            store.retire_idle();
+            assert_eq!(
+                store.available_slots(),
+                before,
+                "settling released the in-flight hold, so release retires everything"
+            );
+        }
         Ok(())
     }
 

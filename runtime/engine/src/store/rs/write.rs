@@ -1,7 +1,8 @@
 //! `RsPreparedWrite`: the per-fire prepared RS operation (kv_refact.md,
 //! `store/rs/write.rs`). Same lifecycle discipline as `KvPreparedWrite`:
-//! prepare classifies and allocates, `RsStore` commits on driver success or
-//! aborts on failure.
+//! prepare classifies and allocates, `RsStore::publish_batch` folds the
+//! result into the committed mapping in submission order, and
+//! [`RsPublished`] is the receipt the fire holds until it settles.
 //!
 //! Complete typed-store API (kv_refact.md): some methods here are not yet
 //! called by the live single-model fire path (only a subset of the typed
@@ -53,7 +54,7 @@ impl RsBufferTarget {
     }
 }
 
-/// A prepared, not-yet-committed RS write for one fire.
+/// A prepared, not-yet-published RS write for one fire.
 #[derive(Debug)]
 pub struct RsPreparedWrite {
     pub(crate) ws: RsWorkingSetId,
@@ -88,5 +89,31 @@ impl RsPreparedWrite {
             RsBufferTarget::Cow { src, dst, .. } => Some((src, dst)),
             _ => None,
         })
+    }
+}
+
+/// The receipt for one fire's published RS rows. The mapping is already
+/// authoritative when this exists; it only carries what settlement needs —
+/// the submission sequence and how many prepared rows to release from the
+/// store's in-flight hold on pool retirement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RsPublished {
+    seq: u64,
+    rows: usize,
+}
+
+impl RsPublished {
+    pub(super) fn new(seq: u64, rows: usize) -> Self {
+        Self { seq, rows }
+    }
+
+    /// Submission sequence of the newest row in the batch.
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    /// Prepared rows this receipt covers.
+    pub fn rows(&self) -> usize {
+        self.rows
     }
 }

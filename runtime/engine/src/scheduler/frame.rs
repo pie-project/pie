@@ -511,11 +511,10 @@ impl FramePolicy {
             // wait-set through its lane, and staging it again makes the
             // seal wait for a fire it cannot issue: its next fire may be
             // ordered behind the settlement of the frame the seal is
-            // holding. A recurrent-state pass is exactly that — it
-            // serializes behind every earlier fire — so a guest that
-            // binds a second program after its first fire (prefill then
-            // decode, the ordinary shape) deadlocked the whole gather
-            // whenever the execution pool was capped.
+            // holding — a guest that binds a second program after its
+            // first fire (prefill then decode, the ordinary shape)
+            // deadlocked the whole gather whenever the execution pool was
+            // capped.
             if !self.lanes.values().any(|lane| lane.owner == Some(pid)) {
                 self.staged.insert(pid);
             }
@@ -1445,7 +1444,7 @@ mod tests {
         policy.on_fire_enqueued(stamp(victim, 0, 1, 2), Some(victim), 101, 1, 1);
         policy.on_fire_enqueued(stamp(healthy, 0, 0, 2), Some(healthy), 102, 1, 1);
         policy.on_fire_enqueued(stamp(healthy, 0, 1, 2), Some(healthy), 103, 1, 1);
-        let queued: HashSet<u64> = [100, 101, 102, 103].into_iter().collect();
+        let queued: QueuedFireIds = [100, 101, 102, 103].into_iter().collect();
         assert!(matches!(
             drive_past_cold_hold(&mut policy, &queued),
             FramePlan::Dispatch(_)
@@ -1464,7 +1463,7 @@ mod tests {
             "a suspended owner's arrival must not rejoin the wait-set"
         );
 
-        let queued: HashSet<u64> = [200, 300, 301].into_iter().collect();
+        let queued: QueuedFireIds = [200, 300, 301].into_iter().collect();
         let FramePlan::Dispatch(waves) = plan(&mut policy, &queued, Instant::now()) else {
             panic!("the boundary must seal without waiting for the victim");
         };
@@ -1482,7 +1481,7 @@ mod tests {
         policy.on_fire_enqueued(stamp(victim, 1, 1, 2), Some(victim), 201, 1, 1);
         policy.on_fire_enqueued(stamp(healthy, 2, 0, 2), Some(healthy), 302, 1, 1);
         policy.on_fire_enqueued(stamp(healthy, 2, 1, 2), Some(healthy), 303, 1, 1);
-        let queued: HashSet<u64> = [201, 302, 303].into_iter().collect();
+        let queued: QueuedFireIds = [201, 302, 303].into_iter().collect();
         let FramePlan::Dispatch(waves) = plan(&mut policy, &queued, Instant::now()) else {
             panic!("the late slot must seal");
         };
@@ -1508,7 +1507,7 @@ mod tests {
         policy.on_fire_enqueued(stamp(lane, 0, 0, 2), Some(lane), 10, 1, 1);
         // Parked before slot 1: the allocation wait posts a lane close.
         policy.on_lane_leave(lane, Some(lane), false);
-        let queued: HashSet<u64> = [10].into_iter().collect();
+        let queued: QueuedFireIds = [10].into_iter().collect();
         let FramePlan::Dispatch(waves) = drive_past_cold_hold(&mut policy, &queued) else {
             panic!("a parked lane's submitted slot must still seal");
         };
@@ -1657,7 +1656,7 @@ mod tests {
         // Both lanes fire once and the epoch dispatches.
         policy.on_fire_enqueued(stamp(runner, 0, 0, 1), Some(runner), 10, 1, 1);
         policy.on_fire_enqueued(stamp(rebinder, 0, 0, 1), Some(rebinder), 11, 1, 1);
-        let queued: HashSet<u64> = [10, 11].into_iter().collect();
+        let queued: QueuedFireIds = [10, 11].into_iter().collect();
         let mut wave0 = fires(&drive_past_cold_hold(&mut policy, &queued));
         wave0.sort_unstable();
         assert_eq!(wave0, vec![10, 11]);
@@ -1668,7 +1667,7 @@ mod tests {
         policy.on_fire_enqueued(stamp(runner, 1, 0, 1), Some(runner), 12, 1, 1);
         policy.on_bind_enqueued(Some(rebinder));
 
-        let queued: HashSet<u64> = [12].into_iter().collect();
+        let queued: QueuedFireIds = [12].into_iter().collect();
         let sealed = drive_past_cold_hold(&mut policy, &queued);
         assert_eq!(
             fires(&sealed),
@@ -1682,13 +1681,13 @@ mod tests {
         // for it exactly as before.
         policy.on_bind_completed(Some(rebinder));
         policy.on_fire_enqueued(stamp(runner, 2, 0, 1), Some(runner), 14, 1, 1);
-        let queued: HashSet<u64> = [14].into_iter().collect();
+        let queued: QueuedFireIds = [14].into_iter().collect();
         match drive_past_cold_hold(&mut policy, &queued) {
             FramePlan::Hold(_) => {}
             plan => panic!("the committed rebinder must hold the seal, got {plan:?}"),
         }
         policy.on_fire_enqueued(stamp(rebinder, 1, 0, 1), Some(rebinder), 13, 1, 1);
-        let queued: HashSet<u64> = [13, 14].into_iter().collect();
+        let queued: QueuedFireIds = [13, 14].into_iter().collect();
         let mut wave = fires(&drive_past_cold_hold(&mut policy, &queued));
         wave.sort_unstable();
         assert_eq!(wave, vec![13, 14], "the rebinder gathered back in");

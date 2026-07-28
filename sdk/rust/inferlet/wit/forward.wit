@@ -138,8 +138,10 @@ interface forward {
     ///   unsettled frames plus the cells this frame will write must fit the
     ///   capacity — overflow is prevented here, never by back-pressure.
     ///
-    /// Each non-no-op slot prepares and enqueues RUN-AHEAD in slot order
-    /// (RS-bound passes first finalize prior FIFO operations). The first
+    /// Each non-no-op slot prepares and enqueues RUN-AHEAD in slot order,
+    /// including passes that bind recurrent state: an RS mapping publishes at
+    /// prepare, so slot i+1 sees slot i's decision without waiting for it to
+    /// execute, and the state's contents are ordered by the stream. The first
     /// submit of a pass binds seeds; steady-state resubmits carry the
     /// identity hash + instance only. Staged host-writer puts coalesce into
     /// the slot fires in order.

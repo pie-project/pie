@@ -247,7 +247,7 @@ impl Drop for ResidencyTxnGuard {
 /// Best-effort detachable drain of `pid`'s pipeline FIFOs — SETTLED host-KV
 /// ops only. The planner must NEVER await an unsettled fire completion: the
 /// waker table parks ONE waker per slot, and the owning guest may be (or
-/// later start) awaiting the same completion from `drain_rs_predecessors`
+/// later start) awaiting the same completion from `drain_pipeline_fires`
 /// or a channel materialize — the second registration would overwrite the
 /// first and strand whichever task lost (the lost-wakeup wedge behind the
 /// 2026-07-25 bench freezes). Finalizing a SETTLED op never registers a
