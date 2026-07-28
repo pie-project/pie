@@ -6,6 +6,14 @@
 
 use alloc::string::String;
 use core::fmt::Write as _;
+use std::sync::LazyLock;
+
+use crate::layout;
+
+/// MSL prefixes for the two dispatch shapes. Same layouts, different names —
+/// the single-lane effect kernels call them `M1*`, the grouped kernels `M3*`.
+const M1: &str = "M1";
+const M3: &str = "M3";
 
 /// `driver/metal/src/kernels/ptir_m1_runtime.metal`, embedded so the emitter
 /// is self-contained (the C++ takes it as a `runtime_template` argument the
@@ -18,38 +26,15 @@ pub const RUNTIME_TEMPLATE: &str = include_str!("../../runtime/metal/ptir_m1_run
 /// `common_effect_preamble()` — the structs the single-lane readiness and
 /// commit kernels read out of the lane table.
 pub fn common_effect_preamble() -> &'static str {
-    r#"
-#include <metal_stdlib>
-using namespace metal;
-struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };
-struct M1LaneHeader { uint abi_version; uint lane_count; uint channel_count; uint flags; };
-struct M1LaneRecord {
-  ulong logits_base;
-  uint logits_row_offset;
-  uint logits_row_count;
-  uint kv_len;
-  uint page_count;
-  uint row_count;
-  uint token_count;
-  uint sampled_rows;
-  uint query_len;
-  uint key_len;
-  uint channel_slot_offset;
-  ulong rng_state;
-  ulong commit_slot;
-  ulong active_row_mask;
-  ulong sample_output_channel_mask;
-  ulong row_valid;
-  uint row_valid_offset;
-  uint reserved0;
-};
-struct M1LaneChannelSlot {
-  ulong committed_cell;
-  ulong pending_cell;
-  ulong expected_head;
-  ulong expected_tail;
-};
-"#
+    static TEXT: LazyLock<String> = LazyLock::new(|| {
+        let mut out = String::from("\n#include <metal_stdlib>\nusing namespace metal;\n");
+        out.push_str(&layout::STATUS.emit_msl(M1));
+        for shared in layout::HOST_SHARED {
+            out.push_str(&shared.emit_msl(M1));
+        }
+        out
+    });
+    &TEXT
 }
 
 /// `emit_word_arguments()` — one `words_N` ring buffer per channel, from
@@ -66,35 +51,17 @@ pub fn emit_word_arguments(source: &mut String, count: usize) {
 
 /// `grouped_preamble()` — the M3 (grouped, multi-lane) lane-table structs.
 pub fn grouped_preamble() -> &'static str {
-    r#"
-struct M3LaneHeader { uint abi_version; uint lane_count; uint channel_count; uint flags; };
-struct M3LaneRecord {
-  ulong logits_base;
-  uint logits_row_offset;
-  uint logits_row_count;
-  uint kv_len;
-  uint page_count;
-  uint row_count;
-  uint token_count;
-  uint sampled_rows;
-  uint query_len;
-  uint key_len;
-  uint channel_slot_offset;
-  ulong rng_state;
-  ulong commit_slot;
-  ulong active_row_mask;
-  ulong sample_output_channel_mask;
-  ulong row_valid;
-  uint row_valid_offset;
-  uint reserved0;
-};
-struct M3LaneChannelSlot {
-  ulong committed_cell;
-  ulong pending_cell;
-  ulong expected_head;
-  ulong expected_tail;
-};
-struct M3ChannelMeta {
+    static TEXT: LazyLock<String> = LazyLock::new(|| {
+        let mut out = String::from("\n");
+        for shared in layout::HOST_SHARED {
+            out.push_str(&shared.emit_msl(M3));
+        }
+        // `M3ChannelMeta`, `M3GroupLayout` and `M3RowMeta` are grouped-dispatch
+        // arguments rather than lane-table members: the host does not build
+        // them as `#[repr(C)]` structs, so there is nothing to pin them to and
+        // they stay as text.
+        out.push_str(
+            r#"struct M3ChannelMeta {
   ulong words;
   uint capacity;
   uint flags;
@@ -115,5 +82,9 @@ struct M3RowMeta {
   uint mtp_offset;
   uint reserved;
 };
-"#
+"#,
+        );
+        out
+    });
+    &TEXT
 }

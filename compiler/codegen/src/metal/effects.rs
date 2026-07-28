@@ -10,6 +10,7 @@ use core::fmt::Write as _;
 
 use alloc::vec::Vec;
 
+use crate::layout;
 use pie_ir::op::ChannelUse;
 use pie_ir::validate::{BoundTrace, Direction};
 
@@ -147,8 +148,7 @@ pub fn emit_commit(function_name: &str, channels: &[M1ChannelEffect]) -> String 
 pub fn emit_grouped_readiness(function_name: &str) -> String {
     let mut source = String::new();
     source.push_str("#include <metal_stdlib>\nusing namespace metal;\n");
-    source
-        .push_str("struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };\n");
+    source.push_str(&layout::STATUS.emit_msl("M1"));
     source.push_str(grouped_preamble());
     let _ = writeln!(
         source,
@@ -210,8 +210,7 @@ pub fn emit_grouped_readiness(function_name: &str) -> String {
 pub fn emit_grouped_commit(function_name: &str) -> String {
     let mut source = String::new();
     source.push_str("#include <metal_stdlib>\nusing namespace metal;\n");
-    source
-        .push_str("struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };\n");
+    source.push_str(&layout::STATUS.emit_msl("M1"));
     source.push_str(grouped_preamble());
     let _ = writeln!(
         source,

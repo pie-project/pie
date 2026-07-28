@@ -7,6 +7,7 @@
 use alloc::format;
 use alloc::string::String;
 
+use crate::layout;
 use pie_ir::PTIR_VERSION;
 use pie_ir::container::DT_ACT;
 use pie_ir::op::{IntrinsicId, OP_TABLE, VARIADIC};
@@ -63,40 +64,15 @@ enum PtirLibraryOp : uint8_t {\n\
   PTIR_LIBRARY_SCAN = 3,\n\
   PTIR_LIBRARY_MATMUL = 4,\n\
   PTIR_LIBRARY_SECOND_PARTY = 5,\n\
-};\n\n\
-typedef struct PtirLaneTableHeader {\n\
-  uint32_t abi_version;\n\
-  uint32_t lane_count;\n\
-  uint32_t channel_slots_per_lane;\n\
-  uint32_t flags;\n\
-} PtirLaneTableHeader;\n\n\
-typedef struct PtirLaneRecord {\n\
-  uint64_t logits_base;\n\
-  uint32_t logits_row_offset;\n\
-  uint32_t logits_row_count;\n\
-  uint32_t kv_len;\n\
-  uint32_t page_count;\n\
-  uint32_t row_count;\n\
-  uint32_t token_count;\n\
-  uint32_t sampled_rows;\n\
-  uint32_t query_len;\n\
-  uint32_t key_len;\n\
-  uint32_t channel_slot_offset;\n\
-  uint64_t rng_state;\n\
-  uint64_t commit_slot;\n\
-  uint64_t active_row_mask;\n\
-  uint64_t sample_output_channel_mask;\n\
-  uint64_t row_valid;\n\
-  uint32_t row_valid_offset;\n\
-  uint32_t reserved0;\n\
-} PtirLaneRecord;\n\n\
-typedef struct PtirLaneChannelSlot {\n\
-  uint64_t committed_cell;\n\
-  uint64_t pending_cell;\n\
-  uint64_t expected_head;\n\
-  uint64_t expected_tail;\n\
-} PtirLaneChannelSlot;\n\n",
+};\n\n",
     );
+
+    // The lane table is the host/kernel ABI; its field list lives in
+    // `crate::layout` so this header, the MSL preambles and the `pie-plan`
+    // structs cannot drift apart.
+    for shared in layout::HOST_SHARED {
+        s.push_str(&shared.emit_c());
+    }
 
     s.push_str("// ── op tags (X-macro: name, tag, value-operands, results; 0xFF = variadic) ──\n");
     s.push_str("#define PTIR_OP_LIST(X) \\\n");

@@ -27,6 +27,7 @@ extern crate alloc;
 pub mod cuda;
 pub mod header;
 pub mod launch;
+pub mod layout;
 pub mod metal;
 pub mod op_view;
 pub mod program;
