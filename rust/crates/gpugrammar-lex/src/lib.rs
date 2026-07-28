@@ -329,11 +329,35 @@ impl Lexer {
     /// with its viable prefixes. Longest match is offered first, so it wins
     /// whenever the parser can follow it.
     pub fn scan(&self, token: &[u8], state: LexState) -> Option<Scan> {
-        let mut options = Vec::new();
-        let mut emitted = Vec::new();
+        let mut scratch = ScanScratch::default();
+        self.scan_into(token, state, &mut scratch)
+            .then(|| scratch.take())
+    }
+
+    /// Scan into buffers the caller owns, and say whether anything survived.
+    ///
+    /// Grouping runs this once per (lexer state, token) - tens of millions of
+    /// times for one schema, and 62% of all the time compilation takes. A
+    /// `Scan` is a vector of readings each holding a vector of terminals, so
+    /// producing one allocated three or four times and hashing it walked all
+    /// of them. Here the readings go into two flat buffers the caller keeps,
+    /// and the only allocation left is for a reading nobody has seen before.
+    pub fn scan_into(&self, token: &[u8], state: LexState, scratch: &mut ScanScratch) -> bool {
+        scratch.clear();
+        // Nothing to do if the first byte cannot be taken and nothing can be
+        // settled here, which is most of the vocabulary at a structural
+        // position. One transition lookup rather than a call and a recursion.
+        if let Some(&first) = token.first()
+            && self.step(state, first).is_none()
+            && self.accepting(state).is_empty()
+        {
+            return false;
+        }
         let mut budget = MAX_STEPS;
-        self.readings(token, 0, state, &mut emitted, &mut options, &mut budget);
-        (!options.is_empty()).then_some(Scan { options })
+        let mut emitted = std::mem::take(&mut scratch.emitted);
+        self.readings(token, 0, state, &mut emitted, scratch, &mut budget);
+        scratch.emitted = emitted;
+        !scratch.ends.is_empty()
     }
 
     fn readings(
@@ -342,7 +366,7 @@ impl Lexer {
         index: usize,
         state: LexState,
         emitted: &mut Vec<TerminalId>,
-        out: &mut Vec<ScanOption>,
+        out: &mut ScanScratch,
         budget: &mut usize,
     ) {
         // A branch that settles a lexeme and finds nothing after it produces no
@@ -355,21 +379,15 @@ impl Lexer {
             return;
         }
         *budget -= 1;
-        if out.len() >= MAX_OPTIONS {
+        if out.ends.len() >= MAX_OPTIONS {
             return;
         }
         if index == token.len() {
             // Carry the lexeme into the next token, or settle it here.
-            out.push(ScanOption {
-                terminals: emitted.clone(),
-                next_state: state,
-            });
+            out.push(emitted, state);
             for terminal in self.accepting(state) {
                 emitted.push(*terminal);
-                out.push(ScanOption {
-                    terminals: emitted.clone(),
-                    next_state: START,
-                });
+                out.push(emitted, START);
                 emitted.pop();
             }
             return;
@@ -394,6 +412,69 @@ impl Lexer {
 pub struct ScanOption {
     pub terminals: Vec<TerminalId>,
     pub next_state: LexState,
+}
+
+/// The readings of one token, flat, in buffers a caller reuses.
+///
+/// A `Scan` is a vector of vectors: building one per token allocated three or
+/// four times and hashing it walked all of them, which for tens of millions of
+/// scans is where compilation went. Here a reading is a run of `flat` and an
+/// entry in `ends`, both reused, and the bytes of the two are the key a bucket
+/// is found by - so a token that reads like one already seen allocates nothing
+/// at all.
+#[derive(Debug, Default)]
+pub struct ScanScratch {
+    /// Every reading's terminals, one run after another.
+    pub flat: Vec<TerminalId>,
+    /// Where each reading's run ends, and the state it leaves the lexer in.
+    pub ends: Vec<(u32, LexState)>,
+    /// The terminals of the reading being built, during the walk.
+    pub emitted: Vec<TerminalId>,
+    /// The two above as bytes, for looking a bucket up without allocating.
+    pub key: Vec<u8>,
+}
+
+impl ScanScratch {
+    fn clear(&mut self) {
+        self.flat.clear();
+        self.ends.clear();
+        self.emitted.clear();
+        self.key.clear();
+    }
+
+    fn push(&mut self, emitted: &[TerminalId], next_state: LexState) {
+        self.flat.extend_from_slice(emitted);
+        self.ends.push((self.flat.len() as u32, next_state));
+    }
+
+    /// The readings as bytes. Two tokens read the same way exactly when these
+    /// agree, so it is both the hash key and the equality test.
+    pub fn key(&mut self) -> &[u8] {
+        self.key.clear();
+        for (end, state) in &self.ends {
+            self.key.extend_from_slice(&end.to_le_bytes());
+            self.key.extend_from_slice(&state.0.to_le_bytes());
+        }
+        for terminal in &self.flat {
+            self.key.extend_from_slice(&terminal.0.to_le_bytes());
+        }
+        &self.key
+    }
+
+    /// The readings as the public type, built only for a bucket that is new.
+    pub fn take(&self) -> Scan {
+        let mut options = Vec::with_capacity(self.ends.len());
+        let mut from = 0usize;
+        for (end, next_state) in &self.ends {
+            let to = *end as usize;
+            options.push(ScanOption {
+                terminals: self.flat[from..to].to_vec(),
+                next_state: *next_state,
+            });
+            from = to;
+        }
+        Scan { options }
+    }
 }
 
 /// The result of scanning one token.
@@ -586,21 +667,26 @@ impl VocabularyGroups {
 /// use.
 pub fn group_state(lexer: &Lexer, vocabulary: &[Vec<u8>], state: LexState) -> (Vec<Group>, u32) {
     let mut rejected = 0u32;
-    let mut buckets: FxHashMap<Scan, Vec<u32>> = FxHashMap::default();
+    let mut buckets: FxHashMap<Box<[u8]>, usize> = FxHashMap::default();
+    let mut groups: Vec<Group> = Vec::new();
+    let mut scratch = ScanScratch::default();
     for (token_id, bytes) in vocabulary.iter().enumerate() {
         if bytes.is_empty() {
             rejected += 1;
             continue;
         }
-        match lexer.scan(bytes, state) {
-            Some(scan) => buckets.entry(scan).or_default().push(token_id as u32),
-            None => rejected += 1,
+        if !lexer.scan_into(bytes, state, &mut scratch) {
+            rejected += 1;
+            continue;
+        }
+        match buckets.get(scratch.key()) {
+            Some(&at) => groups[at].tokens.push(token_id as u32),
+            None => {
+                buckets.insert(scratch.key.clone().into_boxed_slice(), groups.len());
+                groups.push(Group { scan: scratch.take(), tokens: vec![token_id as u32] });
+            }
         }
     }
-    let mut groups: Vec<Group> = buckets
-        .into_iter()
-        .map(|(scan, tokens)| Group { scan, tokens })
-        .collect();
     groups.sort_by(|a, b| b.tokens.len().cmp(&a.tokens.len()));
     (groups, rejected)
 }
@@ -617,21 +703,33 @@ pub fn group_vocabulary(lexer: &Lexer, vocabulary: &[Vec<u8>]) -> VocabularyGrou
         .map(|state| {
             let from = LexState(state as u32);
             let mut refused = 0u32;
-            let mut buckets: FxHashMap<Scan, Vec<u32>> = FxHashMap::default();
+            // Keyed by the readings as bytes rather than by a `Scan`, so a
+            // token that reads like one already seen costs a lookup and a
+            // push. Building and hashing a `Scan` per token was the cost.
+            let mut buckets: FxHashMap<Box<[u8]>, usize> = FxHashMap::default();
+            let mut groups: Vec<Group> = Vec::new();
+            let mut scratch = ScanScratch::default();
             for (token_id, bytes) in vocabulary.iter().enumerate() {
                 if bytes.is_empty() {
                     refused += 1;
                     continue;
                 }
-                match lexer.scan(bytes, from) {
-                    Some(scan) => buckets.entry(scan).or_default().push(token_id as u32),
-                    None => refused += 1,
+                if !lexer.scan_into(bytes, from, &mut scratch) {
+                    refused += 1;
+                    continue;
+                }
+                match buckets.get(scratch.key()) {
+                    Some(&at) => groups[at].tokens.push(token_id as u32),
+                    None => {
+                        buckets
+                            .insert(scratch.key.clone().into_boxed_slice(), groups.len());
+                        groups.push(Group {
+                            scan: scratch.take(),
+                            tokens: vec![token_id as u32],
+                        });
+                    }
                 }
             }
-            let mut groups: Vec<Group> = buckets
-                .into_iter()
-                .map(|(scan, tokens)| Group { scan, tokens })
-                .collect();
             groups.sort_by(|a, b| b.tokens.len().cmp(&a.tokens.len()));
             (groups, refused)
         })
