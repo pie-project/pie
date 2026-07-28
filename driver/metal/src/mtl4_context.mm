@@ -930,8 +930,18 @@ void RawMetalContext::recycle_transient_buffer(const SlotHandle& h) {
     ++I.transient_stats.recycles;
 
     auto& bucket = I.transient_free[allocation->second.size_class];
-    constexpr size_t kMaxCachedPerSizeClass = 8;
-    if (bucket.size() < kMaxCachedPerSizeClass &&
+    // Cache depth by size class rather than a flat 8. One M3 fire acquires ~13
+    // buffers and most of them land in the smallest classes, so a flat 8
+    // overflowed every fire -- and the overflow path is not cheap: releasing a
+    // buffer commits the residency set and linear-scans the retained array, and
+    // the next fire then re-allocates. It cost 0.375ms of a ~1.2ms gap between
+    // two forwards, for buffers a few hundred bytes wide. The byte budget below
+    // is what actually bounds this; the depth only stops one class hoarding it.
+    const size_t size_class = allocation->second.size_class;
+    const size_t cache_depth =
+        std::clamp<size_t>((size_t{1} << 20) / std::max<size_t>(size_class, 1),
+                           8, 64);
+    if (bucket.size() < cache_depth &&
         I.transient_stats.resident_bytes <=
             I.transient_stats.capacity_bytes) {
         bucket.push_back(h);
