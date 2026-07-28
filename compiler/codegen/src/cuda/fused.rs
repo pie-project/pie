@@ -23,7 +23,7 @@ use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
-use pie_ir::op::{intrinsic_tags, tags};
+use pie_ir::op::{IntrinsicId, intrinsic_tags, tags};
 
 use pie_plan::{
     CompiledStage, Dimension, LANE_TABLE_ABI_VERSION, LibraryOp, NodeIndex, Region, RegionKind,
@@ -41,7 +41,12 @@ const SIGNATURE: &str = include_str!("../../runtime/cuda/fused_block1.cuh");
 const PREAMBLE: &str = include_str!("../../runtime/cuda/fused_block2.cuh");
 
 /// `kPtirIntrinsicSlots` — per-lane intrinsic descriptor slots.
-pub const PTIR_INTRINSIC_SLOTS: u32 = 8;
+///
+/// Projected, not counted. This was `= 8`, correct only for as long as
+/// `IntrinsicId` had eight rows, and the number appears in emitted device
+/// source (`dispatch_lane * N + p.intr`) where being one short means a kernel
+/// reading the next lane's slot zero.
+pub const PTIR_INTRINSIC_SLOTS: u32 = IntrinsicId::SLOTS;
 
 const DT_F32: u8 = 0;
 

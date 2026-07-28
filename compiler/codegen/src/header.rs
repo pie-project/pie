@@ -149,6 +149,14 @@ pub fn generate_c_header() -> String {
     }
     s.push_str("};\n\n");
 
+    s.push_str(&format!(
+        "// Per-lane stride of any table indexed by PtirIntrinsic. One past the largest id\n\
+         // above, not the number of ids: an id that overflows this stride does not fault,\n\
+         // it silently reads the next lane's slot 0.\n\
+         #define PTIR_INTRINSIC_SLOTS {}u\n\n",
+        IntrinsicId::SLOTS
+    ));
+
     s.push_str("// ── channel host roles / readiness direction / lowering classes ──\n");
     s.push_str("enum PtirHostRole : uint8_t { PTIR_HOST_NONE = 0, PTIR_HOST_WRITER = 1, PTIR_HOST_READER = 2 };\n");
     s.push_str("enum PtirDirection : uint8_t { PTIR_NEEDS_FULL = 0, PTIR_NEEDS_EMPTY = 1 };\n");

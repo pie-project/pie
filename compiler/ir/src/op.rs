@@ -72,6 +72,20 @@ macro_rules! declare_intrinsics {
             /// iterates this instead of repeating the list.
             pub const ALL: &'static [IntrinsicId] = &[$(IntrinsicId::$variant,)*];
 
+            /// One past the largest wire id — the per-lane stride of a table
+            /// indexed by [`IntrinsicId`].
+            ///
+            /// One past the largest id, not `ALL.len()`: the two agree only
+            /// while the ids are contiguous, and an id that overflows the
+            /// stride does not fault, it silently reads the next lane's slot
+            /// zero. Backends and the generated C header project this rather
+            /// than counting the rows themselves.
+            pub const SLOTS: u32 = {
+                let mut max = 0u32;
+                $(if $id as u32 > max { max = $id as u32; })*
+                max + 1
+            };
+
             pub fn from_u16(v: u16) -> Option<Self> {
                 Some(match v {
                     $($id => IntrinsicId::$variant,)*

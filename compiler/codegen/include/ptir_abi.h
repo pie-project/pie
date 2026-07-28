@@ -238,6 +238,11 @@ enum PtirIntrinsic : uint16_t {
   PTIR_INTR_ATTN_SCORE = 7,
 };
 
+// Per-lane stride of any table indexed by PtirIntrinsic. One past the largest id
+// above, not the number of ids: an id that overflows this stride does not fault,
+// it silently reads the next lane's slot 0.
+#define PTIR_INTRINSIC_SLOTS 8u
+
 // ── channel host roles / readiness direction / lowering classes ──
 enum PtirHostRole : uint8_t { PTIR_HOST_NONE = 0, PTIR_HOST_WRITER = 1, PTIR_HOST_READER = 2 };
 enum PtirDirection : uint8_t { PTIR_NEEDS_FULL = 0, PTIR_NEEDS_EMPTY = 1 };
