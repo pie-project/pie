@@ -62,7 +62,7 @@ pub fn metal_intrinsic_supported(intr: u16) -> bool {
 /// refuse plans the backend can emit.
 pub fn intrinsics_bindable(ops: &[OpView], region: &Region) -> Result<(), String> {
     for &node in &region.nodes {
-        let Some(op) = ops.get(node as usize) else {
+        let Some(op) = ops.get(node.index()) else {
             continue;
         };
         if op.tag == tags::INTRINSIC_VAL && !metal_intrinsic_supported(op.intr) {
@@ -123,10 +123,10 @@ pub fn library_region_valid(stage: &CompiledStage, region: &Region) -> bool {
         return nucleus_library_region_valid(stage, region);
     }
     let ops = &stage.normalized.ops;
-    if region.nodes.len() != 1 || region.nodes[0] as usize >= ops.len() {
+    if region.nodes.len() != 1 || region.nodes[0].index() >= ops.len() {
         return false;
     }
-    let tag = ops[region.nodes[0] as usize].tag();
+    let tag = ops[region.nodes[0].index()].tag();
     match region.kind {
         RegionKind::Library(LibraryOp::TopK) => tag == tags::TOP_K,
         RegionKind::Library(LibraryOp::Sort) => tag == tags::SORT_DESC,
@@ -172,7 +172,7 @@ fn partition_valid(stage: &CompiledStage, partition: &RegionPartition) -> Result
     let value_types = &stage.normalized.value_types;
     let channel_bindings = &stage.normalized.channel_bindings;
     for region in &partition.regions {
-        if region.nodes.iter().any(|node| *node as usize >= ops.len()) {
+        if region.nodes.iter().any(|node| node.index() >= ops.len()) {
             return Err("region node out of range".to_string());
         }
         if region.nodes.windows(2).any(|pair| pair[0] >= pair[1]) {
@@ -254,7 +254,7 @@ fn validate_into(stage: &CompiledStage, operations: &mut Vec<M1OpMeta>) -> Resul
     let mut result_base: u32 = 0;
     for (node, op) in ops.iter().enumerate() {
         let region = &stage.singleton.regions[node];
-        if region.nodes.len() != 1 || region.nodes[0] as usize != node {
+        if region.nodes.len() != 1 || region.nodes[0].index() != node {
             return Err("singleton region/node ordering mismatch".to_string());
         }
         // The C++ rejects an unknown tag here; `Op` has none.

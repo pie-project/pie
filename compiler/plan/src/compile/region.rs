@@ -9,10 +9,10 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec;
 use alloc::vec::Vec;
 
-use pie_ir::op::Op;
-use pie_ir::types::{DType, Literal, Predicate, RngKind};
+use pie_ir::op::{ChannelIndex, Op};
+use pie_ir::types::{DType, Literal, Predicate, RngKind, ValueId};
 
-use super::normalize::{NormalizedStage, result_layout};
+use super::normalize::{NodeIndex, NormalizedStage, result_layout};
 use super::symbolic::{Dimension, symbolic_dims_match_expected, symbolic_shape_matches_static};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,26 +43,29 @@ pub enum RegionKind {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChannelSink {
-    pub channel_slot: u32,
-    pub value: u32,
+    pub channel_slot: ChannelIndex,
+    pub value: ValueId,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Region {
     pub kind: RegionKind,
     pub schedule: ScheduleTemplate,
-    pub nodes: Vec<u32>,
-    pub inputs: Vec<u32>,
-    pub outputs: Vec<u32>,
+    /// Positions in the stage's op list.
+    pub nodes: Vec<NodeIndex>,
+    /// Values the region reads from outside itself.
+    pub inputs: Vec<ValueId>,
+    /// Values the region defines that something outside it reads.
+    pub outputs: Vec<ValueId>,
     pub sinks: Vec<ChannelSink>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LibraryMatch {
     library: LibraryOp,
-    nodes: Vec<u32>,
-    inputs: Vec<u32>,
-    outputs: Vec<u32>,
+    nodes: Vec<NodeIndex>,
+    inputs: Vec<ValueId>,
+    outputs: Vec<ValueId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,17 +84,10 @@ pub struct RegionPartition {
     pub whole_stage_fallback: bool,
 }
 
-pub(crate) fn singleton_partition(stage: &NormalizedStage) -> RegionPartition {
-    let index = StageIndex::of(stage);
-    let regions = (0..stage.ops.len())
-        .map(|node| {
-            build_region(
-                stage,
-                &index,
-                vec![node as u32],
-                region_kind_for_node(stage, node),
-            )
-        })
+pub(crate) fn singleton_partition(stage: &NormalizedStage, index: &StageIndex) -> RegionPartition {
+    let regions = (0..stage.ops.len() as u32)
+        .map(NodeIndex)
+        .map(|node| build_region(stage, index, vec![node], region_kind_for_node(stage, node)))
         .collect();
     RegionPartition {
         kind: PartitionKind::Singleton,
@@ -100,21 +96,14 @@ pub(crate) fn singleton_partition(stage: &NormalizedStage) -> RegionPartition {
     }
 }
 
-pub(crate) fn recognize_library_dataflows(stage: &NormalizedStage) -> Vec<LibraryMatch> {
-    let (bases, producer) = result_layout(&stage.ops);
-    let mut consumers = vec![Vec::new(); stage.value_types.len()];
-    for (node, op) in stage.ops.iter().enumerate() {
-        for operand in op.operands() {
-            consumers[operand as usize].push(node as u32);
-        }
-    }
-
+pub(crate) fn recognize_library_dataflows(
+    stage: &NormalizedStage,
+    index: &StageIndex,
+) -> Vec<LibraryMatch> {
     let mut claimed = BTreeSet::new();
     let mut matches = Vec::new();
-    for final_node in 0..stage.ops.len() {
-        let Some(candidate) =
-            match_nucleus_dataflow(stage, final_node, &bases, &producer, &consumers)
-        else {
+    for final_node in (0..stage.ops.len() as u32).map(NodeIndex) {
+        let Some(candidate) = match_nucleus_dataflow(stage, final_node, index) else {
             continue;
         };
         if candidate.nodes.iter().any(|node| claimed.contains(node)) {
@@ -128,95 +117,84 @@ pub(crate) fn recognize_library_dataflows(stage: &NormalizedStage) -> Vec<Librar
 
 pub(crate) fn match_nucleus_dataflow(
     stage: &NormalizedStage,
-    final_node: usize,
-    bases: &[u32],
-    producer: &[usize],
-    consumers: &[Vec<u32>],
+    final_node: NodeIndex,
+    index: &StageIndex,
 ) -> Option<LibraryMatch> {
-    let Op::ReduceArgmax(perturbed) = stage.ops.get(final_node)? else {
+    let Op::ReduceArgmax(perturbed) = stage.ops.get(final_node.index())? else {
         return None;
     };
-    let add_node = *producer.get(*perturbed as usize)?;
-    let Op::Add(left, right) = stage.ops.get(add_node)? else {
+    let add_node = index.producer(*perturbed)?;
+    let Op::Add(left, right) = stage.ops.get(add_node.index())? else {
         return None;
     };
 
-    match_nucleus_add_order(
-        stage, final_node, add_node, *left, *right, bases, producer, consumers,
-    )
-    .or_else(|| {
-        match_nucleus_add_order(
-            stage, final_node, add_node, *right, *left, bases, producer, consumers,
-        )
-    })
+    match_nucleus_add_order(stage, final_node, add_node, *left, *right, index)
+        .or_else(|| match_nucleus_add_order(stage, final_node, add_node, *right, *left, index))
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn match_nucleus_add_order(
     stage: &NormalizedStage,
-    final_node: usize,
-    add_node: usize,
-    masked: u32,
-    noise: u32,
-    bases: &[u32],
-    producer: &[usize],
-    consumers: &[Vec<u32>],
+    final_node: NodeIndex,
+    add_node: NodeIndex,
+    masked: ValueId,
+    noise: ValueId,
+    index: &StageIndex,
 ) -> Option<LibraryMatch> {
-    let select_node = *producer.get(masked as usize)?;
+    let select_node = index.producer(masked)?;
     let Op::Select {
         cond: keep,
         a: logits,
         b: negative_infinity,
-    } = stage.ops.get(select_node)?
+    } = stage.ops.get(select_node.index())?
     else {
         return None;
     };
     let (keep, logits, negative_infinity) = (*keep, *logits, *negative_infinity);
 
-    let rng_node = *producer.get(noise as usize)?;
+    let rng_node = index.producer(noise)?;
     let Op::RngKeyed {
         state: rng_state,
         shape: rng_shape,
         kind: RngKind::Gumbel,
-    } = stage.ops.get(rng_node)?
+    } = stage.ops.get(rng_node.index())?
     else {
         return None;
     };
     let rng_state = *rng_state;
     let rng_shape = *rng_shape;
 
-    let negative_infinity_node = *producer.get(negative_infinity as usize)?;
-    let Op::Const(Literal::F32(value)) = stage.ops.get(negative_infinity_node)? else {
+    let negative_infinity_node = index.producer(negative_infinity)?;
+    let Op::Const(Literal::F32(value)) = stage.ops.get(negative_infinity_node.index())? else {
         return None;
     };
     if value.to_bits() != f32::NEG_INFINITY.to_bits() {
         return None;
     }
 
-    let pivot_node = *producer.get(keep as usize)?;
+    let pivot_node = index.producer(keep)?;
     let Op::PivotThreshold {
         input: probabilities,
         predicate: Predicate::CummassLe(top_p),
-    } = stage.ops.get(pivot_node)?
+    } = stage.ops.get(pivot_node.index())?
     else {
         return None;
     };
     let (probabilities, top_p) = (*probabilities, *top_p);
 
-    let div_node = *producer.get(probabilities as usize)?;
-    let Op::Div(exponentials, sum_broadcast) = stage.ops.get(div_node)? else {
+    let div_node = index.producer(probabilities)?;
+    let Op::Div(exponentials, sum_broadcast) = stage.ops.get(div_node.index())? else {
         return None;
     };
     let (exponentials, sum_broadcast) = (*exponentials, *sum_broadcast);
 
-    let exponential_node = *producer.get(exponentials as usize)?;
-    let Op::Exp(centered) = stage.ops.get(exponential_node)? else {
+    let exponential_node = index.producer(exponentials)?;
+    let Op::Exp(centered) = stage.ops.get(exponential_node.index())? else {
         return None;
     };
     let centered = *centered;
 
-    let centered_node = *producer.get(centered as usize)?;
-    let Op::Sub(centered_logits, maximum_broadcast) = stage.ops.get(centered_node)? else {
+    let centered_node = index.producer(centered)?;
+    let Op::Sub(centered_logits, maximum_broadcast) = stage.ops.get(centered_node.index())? else {
         return None;
     };
     if *centered_logits != logits {
@@ -224,36 +202,36 @@ pub(crate) fn match_nucleus_add_order(
     }
     let maximum_broadcast = *maximum_broadcast;
 
-    let maximum_broadcast_node = *producer.get(maximum_broadcast as usize)?;
+    let maximum_broadcast_node = index.producer(maximum_broadcast)?;
     let Op::Broadcast {
         value: maximum,
         shape: maximum_shape,
-    } = stage.ops.get(maximum_broadcast_node)?
+    } = stage.ops.get(maximum_broadcast_node.index())?
     else {
         return None;
     };
     let (maximum, maximum_shape) = (*maximum, *maximum_shape);
 
-    let maximum_node = *producer.get(maximum as usize)?;
-    let Op::ReduceMax(maximum_logits) = stage.ops.get(maximum_node)? else {
+    let maximum_node = index.producer(maximum)?;
+    let Op::ReduceMax(maximum_logits) = stage.ops.get(maximum_node.index())? else {
         return None;
     };
     if *maximum_logits != logits {
         return None;
     }
 
-    let sum_broadcast_node = *producer.get(sum_broadcast as usize)?;
+    let sum_broadcast_node = index.producer(sum_broadcast)?;
     let Op::Broadcast {
         value: sum,
         shape: sum_shape,
-    } = stage.ops.get(sum_broadcast_node)?
+    } = stage.ops.get(sum_broadcast_node.index())?
     else {
         return None;
     };
     let (sum, sum_shape) = (*sum, *sum_shape);
 
-    let sum_node = *producer.get(sum as usize)?;
-    let Op::ReduceSum(sum_exponentials) = stage.ops.get(sum_node)? else {
+    let sum_node = index.producer(sum)?;
+    let Op::ReduceSum(sum_exponentials) = stage.ops.get(sum_node.index())? else {
         return None;
     };
     if *sum_exponentials != exponentials || maximum_shape != sum_shape || maximum_shape != rng_shape
@@ -261,7 +239,7 @@ pub(crate) fn match_nucleus_add_order(
         return None;
     }
 
-    let token = *bases.get(final_node)?;
+    let token = index.base(final_node)?;
     let nodes = [
         maximum_node,
         maximum_broadcast_node,
@@ -277,24 +255,20 @@ pub(crate) fn match_nucleus_add_order(
         add_node,
         final_node,
     ];
-    let mut ordered_nodes = nodes.map(|node| node as u32).to_vec();
+    let mut ordered_nodes = nodes.to_vec();
     let mut library_inputs = vec![logits, top_p, rng_state];
     let mut scaled_input = None;
-    if let Some(&scale_node) = producer.get(logits as usize)
-        && let Some(Op::Div(raw_logits, divisor)) = stage.ops.get(scale_node)
+    if let Some(scale_node) = index.producer(logits)
+        && let Some(Op::Div(raw_logits, divisor)) = stage.ops.get(scale_node.index())
     {
-        let mut actual = consumers.get(logits as usize)?.clone();
+        let mut actual = index.consumers(logits)?.to_vec();
         actual.sort_unstable();
-        let mut expected = vec![
-            maximum_node as u32,
-            centered_node as u32,
-            select_node as u32,
-        ];
+        let mut expected = vec![maximum_node, centered_node, select_node];
         expected.sort_unstable();
         if actual == expected {
             let mut library_logits = *raw_logits;
-            if let Some(&reshape_node) = producer.get(*raw_logits as usize)
-                && let Some(Op::Reshape { value, .. }) = stage.ops.get(reshape_node)
+            if let Some(reshape_node) = index.producer(*raw_logits)
+                && let Some(Op::Reshape { value, .. }) = stage.ops.get(reshape_node.index())
             {
                 library_logits = *value;
             }
@@ -307,49 +281,49 @@ pub(crate) fn match_nucleus_add_order(
     if ordered_nodes.len() != nodes.len() {
         return None;
     }
-    let node_set: BTreeSet<u32> = ordered_nodes.iter().copied().collect();
+    let node_set: BTreeSet<NodeIndex> = ordered_nodes.iter().copied().collect();
     if library_inputs.iter().copied().any(|input| {
-        producer
-            .get(input as usize)
-            .is_some_and(|node| node_set.contains(&(*node as u32)))
+        index
+            .producer(input)
+            .is_some_and(|node| node_set.contains(&node))
     }) {
         return None;
     }
 
     let exact_consumers = [
-        (maximum, vec![maximum_broadcast_node as u32]),
-        (maximum_broadcast, vec![centered_node as u32]),
-        (centered, vec![exponential_node as u32]),
-        (exponentials, vec![sum_node as u32, div_node as u32]),
-        (sum, vec![sum_broadcast_node as u32]),
-        (sum_broadcast, vec![div_node as u32]),
-        (probabilities, vec![pivot_node as u32]),
-        (keep, vec![select_node as u32]),
-        (negative_infinity, vec![select_node as u32]),
-        (masked, vec![add_node as u32]),
-        (noise, vec![add_node as u32]),
+        (maximum, vec![maximum_broadcast_node]),
+        (maximum_broadcast, vec![centered_node]),
+        (centered, vec![exponential_node]),
+        (exponentials, vec![sum_node, div_node]),
+        (sum, vec![sum_broadcast_node]),
+        (sum_broadcast, vec![div_node]),
+        (probabilities, vec![pivot_node]),
+        (keep, vec![select_node]),
+        (negative_infinity, vec![select_node]),
+        (masked, vec![add_node]),
+        (noise, vec![add_node]),
         (
-            *stage.ops[final_node].operands().first()?,
-            vec![final_node as u32],
+            *stage.ops[final_node.index()].operands().first()?,
+            vec![final_node],
         ),
     ];
     for (value, mut expected) in exact_consumers {
-        let mut actual = consumers.get(value as usize)?.clone();
+        let mut actual = index.consumers(value)?.to_vec();
         actual.sort_unstable();
         expected.sort_unstable();
         if actual != expected {
             return None;
         }
     }
-    if consumers
-        .get(token as usize)?
+    if index
+        .consumers(token)?
         .iter()
         .all(|consumer| node_set.contains(consumer))
     {
         return None;
     }
 
-    let value_type = |value: u32| stage.value_types.get(value as usize);
+    let value_type = |value: ValueId| stage.value_types.get(value as usize);
     let logits_type = value_type(logits)?;
     if logits_type.dtype != DType::F32
         || !(1..=2).contains(&logits_type.rank())
@@ -402,7 +376,7 @@ pub(crate) fn match_nucleus_add_order(
         sum_broadcast,
         probabilities,
         masked,
-        *stage.ops[final_node].operands().first()?,
+        *stage.ops[final_node.index()].operands().first()?,
     ] {
         if value_type(value)? != logits_type {
             return None;
@@ -437,14 +411,14 @@ pub(crate) fn match_nucleus_add_order(
 
 pub(crate) fn fused_partition(
     stage: &NormalizedStage,
+    index: &StageIndex,
     library_matches: &[LibraryMatch],
 ) -> RegionPartition {
-    let index = StageIndex::of(stage);
-    let matched_nodes: BTreeSet<u32> = library_matches
+    let matched_nodes: BTreeSet<NodeIndex> = library_matches
         .iter()
         .flat_map(|candidate| candidate.nodes.iter().copied())
         .collect();
-    let matches_by_end: BTreeMap<u32, &LibraryMatch> = library_matches
+    let matches_by_end: BTreeMap<NodeIndex, &LibraryMatch> = library_matches
         .iter()
         .map(|candidate| {
             (
@@ -455,30 +429,30 @@ pub(crate) fn fused_partition(
         .collect();
     let mut regions = Vec::new();
     let mut generated = Vec::new();
-    for node in 0..stage.ops.len() as u32 {
+    for node in (0..stage.ops.len() as u32).map(NodeIndex) {
         if matched_nodes.contains(&node) {
-            flush_generated_region(stage, &index, &mut regions, &mut generated);
+            flush_generated_region(stage, index, &mut regions, &mut generated);
             if let Some(candidate) = matches_by_end.get(&node) {
-                regions.push(build_library_match_region(stage, &index, candidate));
+                regions.push(build_library_match_region(stage, index, candidate));
             }
             continue;
         }
 
-        let kind = region_kind_for_node(stage, node as usize);
+        let kind = region_kind_for_node(stage, node);
         if matches!(kind, RegionKind::Library(_)) {
-            flush_generated_region(stage, &index, &mut regions, &mut generated);
-            regions.push(build_region(stage, &index, vec![node], kind));
+            flush_generated_region(stage, index, &mut regions, &mut generated);
+            regions.push(build_region(stage, index, vec![node], kind));
             continue;
         }
 
         if generated.first().is_some_and(|first| {
-            !compatible_schedule(&stage.ops[*first as usize], &stage.ops[node as usize])
+            !compatible_schedule(&stage.ops[first.index()], &stage.ops[node.index()])
         }) {
-            flush_generated_region(stage, &index, &mut regions, &mut generated);
+            flush_generated_region(stage, index, &mut regions, &mut generated);
         }
         generated.push(node);
     }
-    flush_generated_region(stage, &index, &mut regions, &mut generated);
+    flush_generated_region(stage, index, &mut regions, &mut generated);
     RegionPartition {
         kind: PartitionKind::Fused,
         regions,
@@ -490,7 +464,7 @@ pub(crate) fn flush_generated_region(
     stage: &NormalizedStage,
     index: &StageIndex,
     regions: &mut Vec<Region>,
-    nodes: &mut Vec<u32>,
+    nodes: &mut Vec<NodeIndex>,
 ) {
     if !nodes.is_empty() {
         regions.push(build_region(
@@ -543,8 +517,8 @@ pub fn library_op_for_tag(tag: u8) -> Option<LibraryOp> {
     }
 }
 
-pub(crate) fn region_kind_for_node(stage: &NormalizedStage, node: usize) -> RegionKind {
-    match library_op_for_tag(stage.ops[node].tag()) {
+pub(crate) fn region_kind_for_node(stage: &NormalizedStage, node: NodeIndex) -> RegionKind {
+    match library_op_for_tag(stage.ops[node.index()].tag()) {
         Some(library) => RegionKind::Library(library),
         None => RegionKind::Generated,
     }
@@ -573,22 +547,29 @@ pub(crate) fn compatible_schedule(first: &Op, next: &Op) -> bool {
 /// bounded only by the container length, and the container is guest-supplied,
 /// the curve was reachable from untrusted input. Hoisting the two tables out
 /// of the loop makes partitioning linear.
+///
+/// It is also the only place the node space and the value space meet: every
+/// table here is keyed by one and yields the other, and the accessors are
+/// what make that direction checkable. `recognize_library_dataflows` used to
+/// rebuild all three by hand and pass them down as three bare slices, so the
+/// nucleus matcher took `bases`, `producer` and `consumers` next to each
+/// other and had to cast on every use.
 pub(crate) struct StageIndex {
     /// First SSA id each op defines.
-    bases: Vec<u32>,
-    /// Op index that defines each SSA id.
-    producer: Vec<usize>,
-    /// Op indices reading each SSA id.
-    consumers: Vec<Vec<u32>>,
+    bases: Vec<ValueId>,
+    /// Node that defines each SSA id.
+    producer: Vec<NodeIndex>,
+    /// Nodes reading each SSA id.
+    consumers: Vec<Vec<NodeIndex>>,
 }
 
 impl StageIndex {
-    fn of(stage: &NormalizedStage) -> Self {
+    pub(crate) fn of(stage: &NormalizedStage) -> Self {
         let (bases, producer) = result_layout(&stage.ops);
-        let mut consumers: Vec<Vec<u32>> = vec![Vec::new(); stage.value_types.len()];
+        let mut consumers: Vec<Vec<NodeIndex>> = vec![Vec::new(); stage.value_types.len()];
         for (node, op) in stage.ops.iter().enumerate() {
             for operand in op.operands() {
-                consumers[operand as usize].push(node as u32);
+                consumers[operand as usize].push(NodeIndex(node as u32));
             }
         }
         Self {
@@ -597,28 +578,41 @@ impl StageIndex {
             consumers,
         }
     }
+
+    /// The node that defines `value`.
+    fn producer(&self, value: ValueId) -> Option<NodeIndex> {
+        self.producer.get(value as usize).copied()
+    }
+
+    /// The first SSA id `node` defines.
+    fn base(&self, node: NodeIndex) -> Option<ValueId> {
+        self.bases.get(node.index()).copied()
+    }
+
+    /// The nodes that read `value`.
+    fn consumers(&self, value: ValueId) -> Option<&[NodeIndex]> {
+        self.consumers.get(value as usize).map(Vec::as_slice)
+    }
 }
 
 pub(crate) fn build_region(
     stage: &NormalizedStage,
     index: &StageIndex,
-    nodes: Vec<u32>,
+    nodes: Vec<NodeIndex>,
     kind: RegionKind,
 ) -> Region {
-    let node_set: BTreeSet<u32> = nodes.iter().copied().collect();
-    let StageIndex {
-        bases,
-        producer,
-        consumers,
-    } = index;
+    let node_set: BTreeSet<NodeIndex> = nodes.iter().copied().collect();
 
     let mut inputs = BTreeSet::new();
     let mut outputs = BTreeSet::new();
     let mut sinks = Vec::new();
     for &node in &nodes {
-        let op = &stage.ops[node as usize];
+        let op = &stage.ops[node.index()];
         for operand in op.operands() {
-            if !node_set.contains(&(producer[operand as usize] as u32)) {
+            if !index
+                .producer(operand)
+                .is_some_and(|producer| node_set.contains(&producer))
+            {
                 inputs.insert(operand);
             }
         }
@@ -628,12 +622,12 @@ pub(crate) fn build_region(
                 value,
             });
         }
-        let base = bases[node as usize];
+        let base = index.base(node).unwrap_or_default();
         for result in 0..op.result_count() {
             let value = base + result;
-            if consumers[value as usize]
-                .iter()
-                .any(|consumer| !node_set.contains(consumer))
+            if index
+                .consumers(value)
+                .is_some_and(|consumers| consumers.iter().any(|c| !node_set.contains(c)))
             {
                 outputs.insert(value);
             }
@@ -645,12 +639,12 @@ pub(crate) fn build_region(
         RegionKind::Generated => {
             let has_compute = nodes.iter().any(|node| {
                 !matches!(
-                    stage.ops[*node as usize],
+                    stage.ops[node.index()],
                     Op::ChanTake(_) | Op::ChanRead(_) | Op::ChanPut { .. } | Op::SinkCall { .. }
                 )
             });
             let hierarchical = nodes.iter().any(|node| {
-                let op = &stage.ops[*node as usize];
+                let op = &stage.ops[node.index()];
                 if !matches!(
                     op,
                     Op::ReduceSum(_) | Op::ReduceMax(_) | Op::ReduceMin(_) | Op::ReduceArgmax(_)

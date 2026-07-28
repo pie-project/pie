@@ -9,7 +9,7 @@ use alloc::string::{String, ToString};
 use pie_ir::op::Op;
 use pie_ir::registry::Stage;
 use pie_ir::types::DType;
-use pie_plan::{CompiledStage, Region, RegionKind, ScheduleTemplate};
+use pie_plan::{CompiledStage, NodeIndex, Region, RegionKind, ScheduleTemplate};
 
 /// `second_party_region_supported` — `envelope_dot` is the only second-party
 /// kernel this backend launches, so anything else fails at bind rather than
@@ -22,7 +22,7 @@ pub fn second_party_region_supported(stage: &CompiledStage, region: &Region) -> 
     if region.nodes.len() != 1 {
         return false;
     }
-    let node = region.nodes[0] as usize;
+    let node = region.nodes[0].index();
     let Some(op) = stage.normalized.ops.get(node) else {
         return false;
     };
@@ -76,13 +76,13 @@ pub fn validate_generated_region(stage: &CompiledStage, region: &Region) -> Resu
     {
         return Err("fused CUDA emitter requires a non-library generated region".to_string());
     }
-    let mut previous = 0u32;
+    let mut previous = NodeIndex(0);
     let mut have_previous = false;
     for &node in &region.nodes {
-        if node as usize >= stage.normalized.ops.len() || (have_previous && node <= previous) {
+        if node.index() >= stage.normalized.ops.len() || (have_previous && node <= previous) {
             return Err("generated region nodes are invalid or unordered".to_string());
         }
-        let op = &stage.normalized.ops[node as usize];
+        let op = &stage.normalized.ops[node.index()];
         if matches!(op, Op::KernelCall { .. } | Op::SinkCall { .. }) {
             return Err("generated region contains a non-generated boundary".to_string());
         }

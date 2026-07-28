@@ -280,7 +280,7 @@ fn grouped_library(stage: &CompiledStage, region: &Region) -> Option<LibraryOp> 
             // The driver additionally checks the node really is a `top_k`, so a
             // mislabelled region falls to the generic emitter instead of a
             // kernel that would read the wrong operands.
-            let node = *region.nodes.first()? as usize;
+            let node = region.nodes.first()?.index();
             let op = stage.normalized.ops.get(node)?;
             (crate::op_view::OpView::of(op).tag == tags::TOP_K).then_some(LibraryOp::TopK)
         }

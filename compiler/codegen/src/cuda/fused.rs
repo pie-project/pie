@@ -25,7 +25,9 @@ use alloc::vec::Vec;
 use core::fmt::Write as _;
 use pie_ir::op::{intrinsic_tags, tags};
 
-use pie_plan::{CompiledStage, Dimension, LANE_TABLE_ABI_VERSION, LibraryOp, Region, RegionKind};
+use pie_plan::{
+    CompiledStage, Dimension, LANE_TABLE_ABI_VERSION, LibraryOp, NodeIndex, Region, RegionKind,
+};
 
 use crate::op_view::{OpView, result_bases};
 
@@ -142,7 +144,7 @@ pub(crate) fn analyze_direct_argmax(
     };
 
     for &node in &region.nodes {
-        let node = node as usize;
+        let node = node.index();
         let reduction = &ops[node];
         if reduction.tag != tags::REDUCE_ARGMAX || reduction.args.is_empty() {
             continue;
@@ -240,7 +242,7 @@ pub fn emit_fused_region(
         region
             .nodes
             .iter()
-            .map(|node| *node as usize)
+            .map(|node| node.index())
             .chain(0..ops.len())
             .find(|&node| value >= bases[node] && value < bases[node] + ops[node].results)
     };
@@ -266,10 +268,10 @@ pub fn emit_fused_region(
     let mut lone_generated_node = vec![false; ops.len()];
     for candidate in &stage.fused.regions {
         if !matches!(candidate.kind, RegionKind::Library(_)) && candidate.nodes.len() == 1 {
-            lone_generated_node[candidate.nodes[0] as usize] = true;
+            lone_generated_node[candidate.nodes[0].index()] = true;
         }
     }
-    let in_region = |node: usize| region.nodes.contains(&(node as u32));
+    let in_region = |node: usize| region.nodes.contains(&NodeIndex(node as u32));
 
     for candidate in &stage.fused.regions {
         if !matches!(
@@ -314,7 +316,7 @@ pub fn emit_fused_region(
     source.push_str(PREAMBLE);
 
     for &node in &region.nodes {
-        let node = node as usize;
+        let node = node.index();
         let op = &ops[node];
         let base = bases[node];
         if skipped[node] != 0 && op.tag != tags::RESHAPE {

@@ -162,7 +162,7 @@ pub fn emit_grouped_topk(
     }
     let ops: alloc::vec::Vec<OpView> = OpView::of_all(&stage.normalized.ops);
     let bases = result_bases(&ops);
-    let topk_node = region.nodes[0] as usize;
+    let topk_node = region.nodes[0].index();
     if topk_node >= ops.len() {
         return Err("TopK library node is out of range".to_string());
     }

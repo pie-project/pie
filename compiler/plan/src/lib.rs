@@ -31,7 +31,7 @@ pub mod sidecar;
 // called it, so the surface grew silently and nothing ever shrank it.
 pub use compile::{
     COMPILER_VERSION, ChannelSink, CompiledStage, Dimension, EncodedPlanHeader,
-    LANE_TABLE_ABI_VERSION, LaneChannelSlot, LaneRecord, LaneTableHeader, LibraryOp,
+    LANE_TABLE_ABI_VERSION, LaneChannelSlot, LaneRecord, LaneTableHeader, LibraryOp, NodeIndex,
     NormalizedStage, PartitionKind, PlanDecodeError, PlanMetrics, REGION_PLAN_VERSION, Region,
     RegionKind, RegionPartition, RuntimeExtents, ScheduleTemplate, StageSignature, SymbolicExtent,
     SymbolicType, ValueDomain, compile_bound, compile_stage, compile_stage_at, debug_stage_plan,

@@ -469,11 +469,11 @@ fn plan_emitters_match_oracle() {
                     // covers the partition without dozens of near-identical
                     // 10 KB kernels.
                     if region.nodes.len() != 1
-                        || region.nodes[0] as usize >= stage.plan.normalized.ops.len()
+                        || region.nodes[0].index() >= stage.plan.normalized.ops.len()
                     {
                         continue;
                     }
-                    let tag = op_tag(&stage.plan, region.nodes[0]);
+                    let tag = op_tag(&stage.plan, region.nodes[0].get());
                     if seen[tag as usize] {
                         continue;
                     }

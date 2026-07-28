@@ -28,8 +28,8 @@ use pie_ir::op::{intrinsic_tags, tags};
 use pie_ir::types::ValueType;
 use pie_ir::validate::{BoundTrace, Direction};
 use pie_plan::{
-    CompiledStage, Dimension, LibraryOp, Region, RegionKind, RegionPartition, SymbolicType,
-    stage_identity,
+    CompiledStage, Dimension, LibraryOp, NodeIndex, Region, RegionKind, RegionPartition,
+    SymbolicType, stage_identity,
 };
 
 use crate::op_view::OpView;
@@ -423,7 +423,9 @@ fn lower_region(region: &Region) -> LaunchRegion {
         kind,
         library,
         schedule: region.schedule as u8,
-        nodes: region.nodes.clone(),
+        // `LaunchRegion` is the driver ABI, which has one integer space;
+        // the node tags stop here.
+        nodes: region.nodes.iter().copied().map(NodeIndex::get).collect(),
         inputs: region.inputs.clone(),
         outputs: region.outputs.clone(),
         sinks: region

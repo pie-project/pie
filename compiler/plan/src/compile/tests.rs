@@ -769,7 +769,7 @@ fn normalized_nucleus_dataflow_has_role_ordered_library_abi() {
         .iter()
         .find(|region| region.kind == RegionKind::Library(LibraryOp::NucleusSample))
         .expect("nucleus library region");
-    assert_eq!(nucleus.nodes, (3..=15).collect::<Vec<_>>());
+    assert_eq!(nucleus.nodes, (3..=15).map(NodeIndex).collect::<Vec<_>>());
     assert_eq!(nucleus.inputs, vec![2, 1, 0]);
     assert_eq!(nucleus.outputs, vec![15]);
     assert!(nucleus.nodes.windows(2).all(|nodes| nodes[0] < nodes[1]));
@@ -791,7 +791,7 @@ fn scaled_nucleus_absorbs_temperature_and_peels_reshape() {
         .iter()
         .find(|region| region.kind == RegionKind::Library(LibraryOp::NucleusSample))
         .expect("scaled nucleus library region");
-    assert_eq!(nucleus.nodes, (6..=18).collect::<Vec<_>>());
+    assert_eq!(nucleus.nodes, (6..=18).map(NodeIndex).collect::<Vec<_>>());
     assert_eq!(nucleus.inputs, vec![2, 4, 5, 1, 0]);
     assert_eq!(nucleus.outputs, vec![18]);
 }
@@ -840,7 +840,10 @@ fn nucleus_matching_uses_connectivity_not_contiguous_source_ranges() {
         .expect("interleaved nucleus region");
     assert_eq!(
         region.nodes,
-        core::iter::once(3).chain(5..=16).collect::<Vec<_>>()
+        core::iter::once(3)
+            .chain(5..=16)
+            .map(NodeIndex)
+            .collect::<Vec<_>>()
     );
     assert_eq!(region.inputs, vec![2, 1, 0]);
     assert_eq!(region.outputs, vec![16]);

@@ -117,8 +117,10 @@ pub fn compile_stage_at(bound: &BoundTrace, stage_index: usize) -> CompiledStage
     let mut normalized = normalize_stage(bound, stage_index);
     localize_stage(bound, &mut normalized);
     let signature = stage_signature(bound, &normalized);
-    let singleton = singleton_partition(&normalized);
-    let fused = fused_partition(&normalized, &recognize_library_dataflows(&normalized));
+    let index = StageIndex::of(&normalized);
+    let singleton = singleton_partition(&normalized, &index);
+    let matches = recognize_library_dataflows(&normalized, &index);
+    let fused = fused_partition(&normalized, &index, &matches);
     CompiledStage {
         normalized,
         signature,
@@ -221,7 +223,7 @@ pub fn stage_identity(stage: &CompiledStage) -> u64 {
         add_byte(&mut hash, library_op);
         add_u32(&mut hash, region.nodes.len() as u32);
         for &node in &region.nodes {
-            add_u32(&mut hash, node);
+            add_u32(&mut hash, node.get());
         }
         add_u32(&mut hash, region.inputs.len() as u32);
         for &input in &region.inputs {

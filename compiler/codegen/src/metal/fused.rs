@@ -110,10 +110,11 @@ pub fn emit_fused_region(
         );
     }
     for &node in &region.nodes {
-        let Some(op) = ops.get(node as usize) else {
+        let node = node.index();
+        let Some(op) = ops.get(node) else {
             return Err("fused region node out of range".to_string());
         };
-        let mut slots = slots_for(op, bases[node as usize]);
+        let mut slots = slots_for(op, bases[node]);
         if op.tag == tags::CHAN_TAKE || op.tag == tags::CHAN_READ {
             if op.chan < 0 || op.chan as usize >= channel_bindings.len() {
                 return Err("fused channel root binding out of range".to_string());
@@ -236,10 +237,11 @@ pub fn emit_grouped_fused_region(
         );
     }
     for &node in &region.nodes {
-        let Some(op) = ops.get(node as usize) else {
+        let node = node.index();
+        let Some(op) = ops.get(node) else {
             return Err("grouped fused region node out of range".to_string());
         };
-        let base = bases[node as usize];
+        let base = bases[node];
         let mut slots = slots_for(op, base);
         if op.tag == tags::INTRINSIC_VAL && op.intr == intrinsic_tags::MTP_DRAFTS {
             emit_mtp_drafts(&mut source, base, &slots.o0);

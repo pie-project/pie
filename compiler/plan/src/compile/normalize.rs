@@ -14,7 +14,7 @@ use alloc::vec::Vec;
 use pie_ir::container::PortSource;
 use pie_ir::op::Op;
 use pie_ir::registry::Stage;
-use pie_ir::types::{DType, Literal, ValueType};
+use pie_ir::types::{DType, Literal, ValueId, ValueType};
 use pie_ir::validate::BoundTrace;
 
 use super::fold::{canonicalize_commutative, cse_candidate, cse_key, fold_scalar, simplify_alias};
@@ -32,6 +32,30 @@ pub enum ValueDomain {
     PageDescriptor = 5,
     LibraryResult = 6,
     EffectToken = 7,
+}
+
+/// A position in a stage's op list.
+///
+/// Deliberately not a [`ValueId`]: both are dense `u32` over the same stage
+/// and both start at zero, so swapping them type-checks. The plan that comes
+/// out then looks structurally valid while naming the wrong ops — regions
+/// fuse the wrong nodes, or a region's inputs point at op positions instead
+/// of values. Only [`StageIndex`](super::region::StageIndex) converts between
+/// the two spaces.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct NodeIndex(pub u32);
+
+impl NodeIndex {
+    /// The wire form. Explicit because the wire cannot tell the two spaces
+    /// apart either.
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+
+    /// As a slice index into the stage's op list.
+    pub const fn index(self) -> usize {
+        self.0 as usize
+    }
 }
 
 /// A normalized stage with local channel/name numbering.
@@ -162,14 +186,14 @@ pub(crate) fn normalize_stage(bound: &BoundTrace, stage_index: usize) -> Normali
     }
 }
 
-pub(crate) fn result_layout(ops: &[Op]) -> (Vec<u32>, Vec<usize>) {
+pub(crate) fn result_layout(ops: &[Op]) -> (Vec<ValueId>, Vec<NodeIndex>) {
     let mut bases = Vec::with_capacity(ops.len());
     let mut producer = Vec::new();
     let mut next = 0u32;
     for (op_index, op) in ops.iter().enumerate() {
         bases.push(next);
         for _ in 0..op.result_count() {
-            producer.push(op_index);
+            producer.push(NodeIndex(op_index as u32));
             next += 1;
         }
     }
@@ -185,7 +209,7 @@ pub(crate) fn result_layout(ops: &[Op]) -> (Vec<u32>, Vec<usize>) {
 pub(crate) fn redundant_select_broadcasts(
     stage_program: &pie_ir::container::StageProgram,
     original_types: &[ValueType],
-    result_bases: &[u32],
+    result_bases: &[ValueId],
 ) -> Vec<bool> {
     let mut redundant = vec![false; stage_program.ops.len()];
     let mut consumers: Vec<Vec<(usize, usize)>> = vec![Vec::new(); original_types.len()];
@@ -225,8 +249,8 @@ pub(crate) fn redundant_select_broadcasts(
 
 pub(crate) fn live_ops(
     stage_program: &pie_ir::container::StageProgram,
-    result_bases: &[u32],
-    producer: &[usize],
+    result_bases: &[ValueId],
+    producer: &[NodeIndex],
 ) -> Vec<bool> {
     let mut keep = vec![false; stage_program.ops.len()];
     let mut values = Vec::new();
@@ -244,7 +268,7 @@ pub(crate) fn live_ops(
         }
     }
     while let Some(value) = values.pop() {
-        let op_index = producer[value as usize];
+        let op_index = producer[value as usize].index();
         if !keep[op_index] {
             keep[op_index] = true;
             values.extend(stage_program.ops[op_index].operands());

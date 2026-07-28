@@ -10,7 +10,7 @@ use pie_ir::container::{encode_op, put_u16, put_u32};
 use pie_ir::op::Op;
 use pie_ir::types::Shape;
 
-use super::normalize::result_layout;
+use super::normalize::{NodeIndex, result_layout};
 use super::region::{RegionKind, RegionPartition};
 use super::symbolic::{Dimension, SymbolicType};
 use super::{COMPILER_VERSION, CompiledStage, REGION_PLAN_VERSION};
@@ -175,7 +175,7 @@ pub(crate) fn encode_partition(bytes: &mut Vec<u8>, partition: &RegionPartition)
             }
         }
         bytes.push(region.schedule as u8);
-        encode_u32_slice(bytes, &region.nodes);
+        encode_node_slice(bytes, &region.nodes);
         encode_u32_slice(bytes, &region.inputs);
         encode_u32_slice(bytes, &region.outputs);
         put_u32(bytes, region.sinks.len() as u32);
@@ -183,6 +183,16 @@ pub(crate) fn encode_partition(bytes: &mut Vec<u8>, partition: &RegionPartition)
             put_u32(bytes, sink.channel_slot);
             put_u32(bytes, sink.value);
         }
+    }
+}
+
+/// The one place node indices become wire `u32`s. The wire cannot tell the
+/// node space from the value space, so the cast is spelled out here rather
+/// than wherever a region is built.
+fn encode_node_slice(bytes: &mut Vec<u8>, nodes: &[NodeIndex]) {
+    put_u32(bytes, nodes.len() as u32);
+    for node in nodes {
+        put_u32(bytes, node.get());
     }
 }
 
