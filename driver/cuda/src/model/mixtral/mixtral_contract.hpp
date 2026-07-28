@@ -208,7 +208,13 @@ inline void gpt_oss_mxfp4_groups(ContractBuilder& b) {
             gpt_oss_native_group(b, block, *scale, *bias, base);
         } else {
             b.push_direct(block, base + ".weight", std::nullopt);
-            b.push_direct(*scale, base + ".weight_scale", std::nullopt);
+            auto scales = b.push_direct(*scale, base + ".weight_scale", std::nullopt);
+            // The routed-dequant path reads these bytes through
+            // `engine.quant_meta(...)->scale`, exactly as the native path does,
+            // so it needs the same pairing stated. Publishing the scale as a
+            // plain tensor leaves `quant_meta` empty and the bind fails with
+            // "packed MXFP4 expert tensors are missing quant metadata".
+            state_mxfp4_block_scales(scales, base + ".weight");
             b.push_direct(*bias, base + ".bias", std::nullopt);
         }
         b.consume(block.id);
