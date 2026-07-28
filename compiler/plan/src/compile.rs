@@ -9,8 +9,9 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use pie_ir::container::{PortSource, encode_op, put_u16, put_u32};
+use pie_ir::container::{MAX_CHANNELS, MAX_OPS, PortSource, encode_op, put_u16, put_u32};
 use pie_ir::op::{IntrinsicId, Op};
+use pie_ir::read::{ReadError, Reader};
 use pie_ir::registry::{Port, Stage};
 use pie_ir::types::{DType, Literal, MAX_RANK, Predicate, RngKind, Shape, ValueType};
 use pie_ir::validate::BoundTrace;
@@ -2038,86 +2039,37 @@ pub enum PlanDecodeError {
     CountTooLarge(&'static str),
 }
 
-#[derive(Clone, Copy)]
-struct PlanReader<'a> {
-    bytes: &'a [u8],
-    offset: usize,
-}
-
-impl<'a> PlanReader<'a> {
-    fn remaining(&self) -> usize {
-        self.bytes.len() - self.offset
-    }
-
-    fn take(&mut self, count: usize) -> Result<&'a [u8], PlanDecodeError> {
-        let end = self
-            .offset
-            .checked_add(count)
-            .ok_or(PlanDecodeError::Truncated)?;
-        let value = self
-            .bytes
-            .get(self.offset..end)
-            .ok_or(PlanDecodeError::Truncated)?;
-        self.offset = end;
-        Ok(value)
-    }
-
-    fn u8(&mut self) -> Result<u8, PlanDecodeError> {
-        Ok(self.take(1)?[0])
-    }
-
-    fn u16(&mut self) -> Result<u16, PlanDecodeError> {
-        Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
-    }
-
-    fn u32(&mut self) -> Result<u32, PlanDecodeError> {
-        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
-    }
-
-    fn u64(&mut self) -> Result<u64, PlanDecodeError> {
-        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
-    }
-
-    fn bounded_count(
-        &self,
-        raw_count: u32,
-        minimum_record_bytes: usize,
-        structural_maximum: usize,
-        table: &'static str,
-    ) -> Result<usize, PlanDecodeError> {
-        let count =
-            usize::try_from(raw_count).map_err(|_| PlanDecodeError::CountTooLarge(table))?;
-        let minimum_bytes = count
-            .checked_mul(minimum_record_bytes)
-            .ok_or(PlanDecodeError::CountTooLarge(table))?;
-        if minimum_record_bytes == 0
-            || count > structural_maximum
-            || minimum_bytes > self.remaining()
-        {
-            return Err(PlanDecodeError::CountTooLarge(table));
+impl From<ReadError> for PlanDecodeError {
+    fn from(error: ReadError) -> Self {
+        match error {
+            ReadError::UnexpectedEof => PlanDecodeError::Truncated,
+            ReadError::CountTooLarge(table) => PlanDecodeError::CountTooLarge(table),
         }
-        Ok(count)
-    }
-
-    fn length_with_tail(
-        &self,
-        raw_length: u32,
-        required_tail: usize,
-        record: &'static str,
-    ) -> Result<usize, PlanDecodeError> {
-        let length =
-            usize::try_from(raw_length).map_err(|_| PlanDecodeError::CountTooLarge(record))?;
-        let required = length
-            .checked_add(required_tail)
-            .ok_or(PlanDecodeError::CountTooLarge(record))?;
-        if required > self.remaining() {
-            return Err(PlanDecodeError::CountTooLarge(record));
-        }
-        Ok(length)
     }
 }
 
-fn scan_plan_shape(reader: &mut PlanReader<'_>) -> Result<(), PlanDecodeError> {
+/// A length that must leave `required_tail` bytes behind it.
+///
+/// The plan format is the only one with this shape -- a variable-length op
+/// payload followed by a fixed-size source count -- so it stays here rather
+/// than in the shared cursor.
+fn length_with_tail(
+    reader: &Reader<'_>,
+    raw_length: u32,
+    required_tail: usize,
+    record: &'static str,
+) -> Result<usize, PlanDecodeError> {
+    let length = raw_length as usize;
+    let required = length
+        .checked_add(required_tail)
+        .ok_or(PlanDecodeError::CountTooLarge(record))?;
+    if required > reader.remaining() {
+        return Err(PlanDecodeError::CountTooLarge(record));
+    }
+    Ok(length)
+}
+
+fn scan_plan_shape(reader: &mut Reader<'_>) -> Result<(), PlanDecodeError> {
     let rank = reader.u8()?;
     let rank = reader.bounded_count(
         rank as u32,
@@ -2133,7 +2085,7 @@ fn scan_plan_shape(reader: &mut PlanReader<'_>) -> Result<(), PlanDecodeError> {
 }
 
 fn scan_planned_op(bytes: &[u8]) -> Result<u32, PlanDecodeError> {
-    let mut reader = PlanReader { bytes, offset: 0 };
+    let mut reader = Reader::new(bytes);
     let tag = reader.u8()?;
     let results = match tag {
         0x01..=0x06 | 0x1E | 0x30..=0x33 | 0x3A | 0x40 | 0x41 | 0x50 | 0x64 | 0x90 | 0x91 => {
@@ -2228,14 +2180,14 @@ fn scan_planned_op(bytes: &[u8]) -> Result<u32, PlanDecodeError> {
         }
         _ => return Err(PlanDecodeError::InvalidRecord),
     };
-    if reader.offset != bytes.len() {
+    if reader.offset() != bytes.len() {
         return Err(PlanDecodeError::InvalidRecord);
     }
     Ok(results)
 }
 
 fn scan_index_vector(
-    reader: &mut PlanReader<'_>,
+    reader: &mut Reader<'_>,
     structural_maximum: usize,
     upper_bound: usize,
     ordered: bool,
@@ -2260,7 +2212,7 @@ fn scan_index_vector(
 }
 
 fn scan_partition(
-    reader: &mut PlanReader<'_>,
+    reader: &mut Reader<'_>,
     expected_kind: PartitionKind,
     operation_count: usize,
     value_count: usize,
@@ -2342,7 +2294,7 @@ fn scan_partition(
 /// preflight. Backend codegen applies the same limits before materializing a
 /// plan.
 pub fn decode_plan_header(bytes: &[u8]) -> Result<EncodedPlanHeader, PlanDecodeError> {
-    let mut reader = PlanReader { bytes, offset: 0 };
+    let mut reader = Reader::new(bytes);
     if reader.take(4)? != PLAN_MAGIC {
         return Err(PlanDecodeError::BadMagic);
     }
@@ -2352,14 +2304,14 @@ pub fn decode_plan_header(bytes: &[u8]) -> Result<EncodedPlanHeader, PlanDecodeE
     let stage = Stage::from_u8(reader.u8()?).ok_or(PlanDecodeError::InvalidStage)?;
     let signature_hash = reader.u64()?;
     let signature_len = reader.u32()?;
-    let signature_len = reader.length_with_tail(signature_len, 0, "stage signature")?;
+    let signature_len = length_with_tail(&reader, signature_len, 0, "stage signature")?;
     let signature = reader.take(signature_len)?;
     if pie_ir::container_hash(signature) != signature_hash {
         return Err(PlanDecodeError::InvalidRecord);
     }
 
     let channels = reader.u32()?;
-    let channel_count = reader.bounded_count(channels, 4, usize::MAX, "plan channel table")?;
+    let channel_count = reader.bounded_count(channels, 4, MAX_CHANNELS, "plan channel table")?;
     reader.take(
         channel_count
             .checked_mul(4)
@@ -2375,16 +2327,16 @@ pub fn decode_plan_header(bytes: &[u8]) -> Result<EncodedPlanHeader, PlanDecodeE
 
     let operations = reader.u32()?;
     let operation_count =
-        reader.bounded_count(operations, 12, usize::MAX, "normalized operation table")?;
+        reader.bounded_count(operations, 12, MAX_OPS, "normalized operation table")?;
     let mut result_count = 0u32;
     for _ in 0..operation_count {
         let raw_op_len = reader.u32()?;
-        let op_len = reader.length_with_tail(raw_op_len, 4, "normalized operation payload")?;
+        let op_len = length_with_tail(&reader, raw_op_len, 4, "normalized operation payload")?;
         result_count = result_count
             .checked_add(scan_planned_op(reader.take(op_len)?)?)
             .ok_or(PlanDecodeError::CountTooLarge("plan value table"))?;
         let sources = reader.u32()?;
-        let source_count = reader.bounded_count(sources, 4, usize::MAX, "operation source map")?;
+        let source_count = reader.bounded_count(sources, 4, MAX_OPS, "operation source map")?;
         reader.take(
             source_count
                 .checked_mul(4)
@@ -2437,7 +2389,7 @@ pub fn decode_plan_header(bytes: &[u8]) -> Result<EncodedPlanHeader, PlanDecodeE
         value_count,
         channel_count,
     )?;
-    if reader.offset != bytes.len() {
+    if reader.offset() != bytes.len() {
         return Err(PlanDecodeError::InvalidRecord);
     }
     Ok(EncodedPlanHeader {
@@ -3594,6 +3546,41 @@ mod tests {
         assert_eq!(
             decode_plan_header(&corrupted),
             Err(PlanDecodeError::InvalidRecord)
+        );
+    }
+
+    /// The byte bound alone is only as strong as the record size, so each
+    /// plan table also carries an absolute ceiling. These three were the last
+    /// `usize::MAX` in the decoders: with no ceiling, padding the input was
+    /// enough to make any of them accept an arbitrary count.
+    #[test]
+    fn plan_tables_have_a_structural_ceiling() {
+        let bound = program(1, 1);
+        let stage = compile_stage(&bound, Stage::Epilogue).unwrap();
+        let plan = encode_stage_plan(&stage);
+        // magic(4) + region version(2) + compiler version(2) + stage(1)
+        // + signature hash(8) + signature length(4), then the signature.
+        let signature_len = u32::from_le_bytes(plan[17..21].try_into().unwrap()) as usize;
+        let channel_count_at = 21 + signature_len;
+
+        let patch = |claim: u32, pad: usize| {
+            let mut bytes = plan.clone();
+            bytes[channel_count_at..channel_count_at + 4].copy_from_slice(&claim.to_le_bytes());
+            bytes.extend(core::iter::repeat_n(0u8, pad));
+            decode_plan_header(&bytes)
+        };
+
+        // Unbacked by the bytes present: refused by the byte bound.
+        assert_eq!(
+            patch(u32::MAX, 0),
+            Err(PlanDecodeError::CountTooLarge("plan channel table"))
+        );
+        // Backed by the bytes present, over the ceiling. This is the case the
+        // byte bound cannot see and `usize::MAX` used to wave through.
+        let over = MAX_CHANNELS as u32 + 1;
+        assert_eq!(
+            patch(over, over as usize * 4),
+            Err(PlanDecodeError::CountTooLarge("plan channel table"))
         );
     }
 

@@ -33,6 +33,7 @@
 use alloc::vec::Vec;
 use core::fmt;
 
+use pie_ir::read::{ReadError, Reader};
 use pie_ir::registry::{Phase, Stage};
 use pie_ir::types::{DType, MAX_RANK, Shape, ValueType};
 use pie_ir::validate::{BoundTrace, ChannelClass, Direction};
@@ -140,74 +141,12 @@ impl fmt::Display for SidecarDecodeError {
 #[cfg(feature = "std")]
 impl std::error::Error for SidecarDecodeError {}
 
-#[derive(Clone, Copy)]
-struct Reader<'a> {
-    bytes: &'a [u8],
-    offset: usize,
-}
-
-impl<'a> Reader<'a> {
-    fn remaining(&self) -> usize {
-        self.bytes.len() - self.offset
-    }
-
-    fn take(&mut self, count: usize) -> Result<&'a [u8], SidecarDecodeError> {
-        let end = self
-            .offset
-            .checked_add(count)
-            .ok_or(SidecarDecodeError::UnexpectedEof)?;
-        let value = self
-            .bytes
-            .get(self.offset..end)
-            .ok_or(SidecarDecodeError::UnexpectedEof)?;
-        self.offset = end;
-        Ok(value)
-    }
-
-    fn u8(&mut self) -> Result<u8, SidecarDecodeError> {
-        Ok(self.take(1)?[0])
-    }
-
-    fn u16(&mut self) -> Result<u16, SidecarDecodeError> {
-        Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
-    }
-
-    fn u32(&mut self) -> Result<u32, SidecarDecodeError> {
-        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
-    }
-
-    fn u64(&mut self) -> Result<u64, SidecarDecodeError> {
-        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
-    }
-
-    fn bounded_count(
-        &self,
-        raw_count: u32,
-        minimum_record_bytes: usize,
-        structural_maximum: usize,
-        table: &'static str,
-    ) -> Result<usize, SidecarDecodeError> {
-        let count =
-            usize::try_from(raw_count).map_err(|_| SidecarDecodeError::CountTooLarge(table))?;
-        let minimum_bytes = count
-            .checked_mul(minimum_record_bytes)
-            .ok_or(SidecarDecodeError::CountTooLarge(table))?;
-        if minimum_record_bytes == 0
-            || count > structural_maximum
-            || minimum_bytes > self.remaining()
-        {
-            return Err(SidecarDecodeError::CountTooLarge(table));
+impl From<ReadError> for SidecarDecodeError {
+    fn from(error: ReadError) -> Self {
+        match error {
+            ReadError::UnexpectedEof => SidecarDecodeError::UnexpectedEof,
+            ReadError::CountTooLarge(table) => SidecarDecodeError::CountTooLarge(table),
         }
-        Ok(count)
-    }
-
-    fn length(&self, raw_length: u32, table: &'static str) -> Result<usize, SidecarDecodeError> {
-        let length =
-            usize::try_from(raw_length).map_err(|_| SidecarDecodeError::CountTooLarge(table))?;
-        if length > self.remaining() {
-            return Err(SidecarDecodeError::CountTooLarge(table));
-        }
-        Ok(length)
     }
 }
 
@@ -234,7 +173,7 @@ const MAX_SIDECAR_STAGES: usize = 4;
 pub fn decode_bound(bytes: &[u8]) -> Result<BoundSidecar, SidecarDecodeError> {
     use SidecarDecodeError::*;
 
-    let mut r = Reader { bytes, offset: 0 };
+    let mut r = Reader::new(bytes);
     if r.take(4)? != PTIB_MAGIC {
         return Err(BadMagic);
     }
@@ -343,7 +282,7 @@ pub fn decode_bound(bytes: &[u8]) -> Result<BoundSidecar, SidecarDecodeError> {
             stage_plans.push((stage, r.take(length)?.to_vec()));
         }
     }
-    if r.offset != bytes.len() {
+    if r.offset() != bytes.len() {
         return Err(TrailingBytes);
     }
     Ok(BoundSidecar {

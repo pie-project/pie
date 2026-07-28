@@ -24,6 +24,8 @@
 //! * [`container`] — the trace container data model + canonical LE
 //!   encode/decode. Program identity = [`container_hash`] (FNV-1a 64) over the
 //!   canonical container bytes (contract C3).
+//! * [`read`] — the bounds-checked little-endian cursor every PTIR decoder
+//!   reads through, container and plan sidecar alike.
 //! * [`registry`] — stages, descriptor ports, first-party value intrinsics,
 //!   well-known sink names, and the bind-time model profile.
 //! * [`infer`] — per-op shape/dtype inference over a stage body.
@@ -46,6 +48,7 @@ pub mod container;
 pub mod expand;
 pub mod infer;
 pub mod op;
+pub mod read;
 pub mod registry;
 pub mod rng;
 pub mod types;

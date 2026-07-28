@@ -17,6 +17,7 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use super::op::{ChannelIndex, IntrinsicId, Op};
+use super::read::{ReadError, Reader};
 use super::registry::{Port, Stage};
 use crate::types::{DType, Literal, MAX_RANK, Predicate, RngKind, Shape};
 use crate::{PTIR_MAGIC, PTIR_VERSION, PTIR_VERSION_EXTERN};
@@ -519,74 +520,12 @@ impl fmt::Display for ContainerDecodeError {
 #[cfg(feature = "std")]
 impl std::error::Error for ContainerDecodeError {}
 
-struct Reader<'a> {
-    buf: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Reader<'a> {
-    fn u8(&mut self) -> Result<u8, ContainerDecodeError> {
-        let b = *self
-            .buf
-            .get(self.pos)
-            .ok_or(ContainerDecodeError::UnexpectedEof)?;
-        self.pos += 1;
-        Ok(b)
-    }
-    fn u16(&mut self) -> Result<u16, ContainerDecodeError> {
-        let s = self.take(2)?;
-        Ok(u16::from_le_bytes([s[0], s[1]]))
-    }
-    fn u32(&mut self) -> Result<u32, ContainerDecodeError> {
-        let s = self.take(4)?;
-        Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
-    }
-    fn take(&mut self, n: usize) -> Result<&'a [u8], ContainerDecodeError> {
-        let end = self
-            .pos
-            .checked_add(n)
-            .ok_or(ContainerDecodeError::UnexpectedEof)?;
-        let s = self
-            .buf
-            .get(self.pos..end)
-            .ok_or(ContainerDecodeError::UnexpectedEof)?;
-        self.pos = end;
-        Ok(s)
-    }
-    /// Reads a table count that the following bytes must be able to back.
-    ///
-    /// Two independent bounds, because either alone is insufficient:
-    ///
-    /// * `minimum_record_bytes` ties the count to the bytes actually present,
-    ///   so a header claiming four billion records cannot make us allocate for
-    ///   four billion.
-    /// * `structural_maximum` is an absolute ceiling, because the first bound
-    ///   is only as strong as the record size. The op table has a one-byte
-    ///   minimum record, so without a ceiling a caller who controls the input
-    ///   gets one op per byte -- and the ops are then decoded, bound and
-    ///   compiled while a global lock is held. That is a denial of service
-    ///   with a text file.
-    ///
-    /// This is the same shape as the two `Reader`s in `pie-plan`; it used to be
-    /// the odd one out, taking neither a ceiling nor a checked multiply.
-    fn bounded_count(
-        &self,
-        count: u32,
-        minimum_record_bytes: usize,
-        structural_maximum: usize,
-        table: &'static str,
-    ) -> Result<usize, ContainerDecodeError> {
-        let count = count as usize;
-        let minimum_bytes = count
-            .checked_mul(minimum_record_bytes)
-            .ok_or(ContainerDecodeError::CountTooLarge(table))?;
-        if minimum_record_bytes == 0
-            || count > structural_maximum
-            || minimum_bytes > self.buf.len().saturating_sub(self.pos)
-        {
-            return Err(ContainerDecodeError::CountTooLarge(table));
+impl From<ReadError> for ContainerDecodeError {
+    fn from(error: ReadError) -> Self {
+        match error {
+            ReadError::UnexpectedEof => ContainerDecodeError::UnexpectedEof,
+            ReadError::CountTooLarge(table) => ContainerDecodeError::CountTooLarge(table),
         }
-        Ok(count)
     }
 }
 
@@ -611,7 +550,7 @@ pub const MAX_EXTERNS: usize = MAX_CHANNELS;
 
 /// Parse container bytes back into the model. Does not validate (bind does).
 pub fn decode(bytes: &[u8]) -> Result<TraceContainer, ContainerDecodeError> {
-    let mut r = Reader { buf: bytes, pos: 0 };
+    let mut r = Reader::new(bytes);
     if r.take(4)? != PTIR_MAGIC {
         return Err(ContainerDecodeError::BadMagic);
     }
@@ -722,7 +661,7 @@ pub fn decode(bytes: &[u8]) -> Result<TraceContainer, ContainerDecodeError> {
         let chan = r.u32()?;
         externs.push(ExternDecl { name, dir, chan });
     }
-    if r.pos != bytes.len() {
+    if r.offset() != bytes.len() {
         return Err(ContainerDecodeError::TrailingBytes);
     }
     let container = TraceContainer {
@@ -1217,10 +1156,7 @@ mod tests {
 
     #[test]
     fn retired_nucleus_opcode_is_unknown() {
-        let mut reader = Reader {
-            buf: &[0x59],
-            pos: 0,
-        };
+        let mut reader = Reader::new(&[0x59]);
         assert_eq!(
             decode_op(&mut reader),
             Err(ContainerDecodeError::UnknownOpcode(0x59))
