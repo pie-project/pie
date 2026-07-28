@@ -194,16 +194,39 @@ inline void m1_fault_op(device M1Status* status, uint site, M1OpParams p) {
   status->state = 3;
 }
 
+// A strided, word-wide typed copy. `begin`/`step` partition it across a
+// threadgroup; 0/1 is the serial walk. The byte-at-a-time version this replaces
+// issued one device access per byte, so copying a vocabulary-wide f32 row -- a
+// plain reshape in the sampler's PTIR graph -- was ~1M dependent accesses on a
+// single thread, about 85ms of an ~89ms decode step.
+inline void m1_copy_typed_range(
+    const device uchar* input,
+    device uchar* output,
+    uint len,
+    uint dtype,
+    uint begin,
+    uint step) {
+  if (dtype == 3) {
+    for (uint i = begin; i < len; i += step) output[i] = input[i];
+    return;
+  }
+  const bool aligned =
+      ((ulong(input) | ulong(output)) & 3ul) == 0ul;
+  if (aligned) {
+    const device uint* src = reinterpret_cast<const device uint*>(input);
+    device uint* dst = reinterpret_cast<device uint*>(output);
+    for (uint i = begin; i < len; i += step) dst[i] = src[i];
+  } else {
+    for (uint i = begin; i < len * 4u; i += step) output[i] = input[i];
+  }
+}
+
 inline void m1_copy_typed(
     const device uchar* input,
     device uchar* output,
     uint len,
     uint dtype) {
-  if (dtype == 3) {
-    for (uint i = 0; i < len; ++i) output[i] = input[i];
-  } else {
-    for (uint i = 0; i < len * 4; ++i) output[i] = input[i];
-  }
+  m1_copy_typed_range(input, output, len, dtype, 0u, 1u);
 }
 
 inline void m1_reduce_float(
@@ -373,6 +396,48 @@ inline void m1_reduce_argmax(
         m1_argmax_combine(best[0], best[1]),
         m1_argmax_combine(best[2], best[3]));
     result[row] = int(folded.index);
+  }
+}
+
+// Threadgroup-cooperative argmax, for the grouped region launch that gives a
+// lane a whole threadgroup instead of one thread. Same strict total order as
+// m1_argmax_combine, so the answer is identical to the serial fold above; only
+// the partition changes. The tree guards `tid + stride` so a non-power-of-two
+// threadgroup is still correct.
+inline void m1_reduce_argmax_mt(
+    const device uchar* input,
+    device uchar* output,
+    device uchar* temporary,
+    const M1ValueDesc in_desc,
+    uint tid,
+    uint nthreads,
+    threadgroup M1ArgmaxCandidate* tgbuf) {
+  if (in_desc.dtype != 0) {
+    // Integer argmax rows are small in every shipped program; keep the serial
+    // path rather than duplicating it.
+    if (tid == 0) m1_reduce_argmax(input, output, temporary, in_desc);
+    return;
+  }
+  device int* result = reinterpret_cast<device int*>(output);
+  const device float* values = reinterpret_cast<const device float*>(input);
+  for (uint row = 0; row < in_desc.rows; ++row) {
+    const uint base = row * in_desc.last;
+    M1ArgmaxCandidate best = {-INFINITY, 0u, 0u, 0u};
+    for (uint i = tid; i < in_desc.last; i += nthreads) {
+      const float value = values[base + i];
+      best = m1_argmax_combine(
+          best, M1ArgmaxCandidate{value, i, isnan(value) ? 0u : 1u, 0u});
+    }
+    tgbuf[tid] = best;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 1u; stride < nthreads; stride <<= 1) {
+      if ((tid % (2u * stride)) == 0u && tid + stride < nthreads) {
+        tgbuf[tid] = m1_argmax_combine(tgbuf[tid], tgbuf[tid + stride]);
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) result[row] = int(tgbuf[0].index);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
   }
 }
 
@@ -936,4 +1001,41 @@ inline void ptir_m1_execute(
   }
 
   m1_fault_op(status, 3u, p);
+}
+
+// The grouped region hands a lane a whole threadgroup. Ops whose partition is
+// provably free run across it; everything else stays on thread 0 and keeps the
+// exact serial semantics (m1_reduce_float's sum tree, for one, is a numeric
+// ABI and must not be repartitioned). The caller barriers between ops.
+inline void ptir_m1_execute_mt(
+    uint generated_tag,
+    device M1Status* status,
+    const device M1ValueDesc* descriptors,
+    const device M1OpParams* params,
+    const device uchar* a0,
+    const device uchar* a1,
+    const device uchar* a2,
+    device uchar* o0,
+    device uchar* o1,
+    device uchar* temporary,
+    uint tid,
+    uint nthreads,
+    threadgroup M1ArgmaxCandidate* tgbuf) {
+  if (status->state != 1) return;
+  M1OpParams p = params[0];
+  p.tag = generated_tag;
+  const M1ValueDesc d0 = descriptors[p.a0];
+
+  if (p.tag == 0x33) {  // argmax: order-independent, so partition it
+    m1_reduce_argmax_mt(a0, o0, temporary, d0, tid, nthreads, tgbuf);
+    return;
+  }
+  if (p.tag == 0x39 || p.tag == 0xA1) {  // reshape / semantic-boundary identity
+    const M1ValueDesc out0 = descriptors[p.o0];
+    m1_copy_typed_range(a0, o0, out0.len, out0.dtype, tid, nthreads);
+    return;
+  }
+  if (tid != 0) return;
+  ptir_m1_execute(generated_tag, status, descriptors, params, a0, a1, a2, o0, o1,
+                  temporary);
 }

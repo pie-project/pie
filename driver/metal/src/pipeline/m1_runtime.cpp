@@ -22,6 +22,10 @@
 
 namespace pie::metal::pipeline {
 
+// Threads a grouped generated region gets per lane. Must equal
+// `METAL_M3_REGION_THREADS` in compiler/codegen/src/metal/fused.rs.
+inline constexpr std::uint32_t kM3RegionThreads = 256;
+
 std::string encode_m1_cache_identity(
     std::uint64_t device,
     std::uint64_t signature,
@@ -3020,13 +3024,28 @@ bool M1Runtime::prepare_m3_group(
                 };
                 encoded.threadgroup = {256, 1, 1};
             } else {
+                // A generated region used to get one thread per lane, which put
+                // every vocabulary-wide op in a PTIR program on a single lane of
+                // the GPU: ~155ms of a ~159ms decode step, against a ~3ms model
+                // forward. It now gets a threadgroup per lane, matching
+                // METAL_M3_REGION_THREADS in compiler/codegen/src/metal/fused.rs
+                // — the emitted kernel sizes its reduction buffer to exactly
+                // this and faults if the launch disagrees.
+                const std::uint64_t threads =
+                    static_cast<std::uint64_t>(stage_lane_count) *
+                    kM3RegionThreads;
+                if (threads > std::numeric_limits<std::uint32_t>::max()) {
+                    error = "Metal M3 region launch exceeds u32 grid";
+                    group->stages.push_back(std::move(stage));
+                    release_group();
+                    return false;
+                }
                 encoded.grid = {
-                    static_cast<std::uint32_t>(
-                        stage_lane_count),
+                    static_cast<std::uint32_t>(threads),
                     1,
                     1,
                 };
-                encoded.threadgroup = {1, 1, 1};
+                encoded.threadgroup = {kM3RegionThreads, 1, 1};
             }
             stage.regions.push_back(encoded);
         }

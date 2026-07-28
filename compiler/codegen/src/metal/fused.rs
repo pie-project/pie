@@ -73,6 +73,15 @@ fn slots_for(op: &OpView, base: u32) -> Slots {
     slots
 }
 
+/// Threads a grouped region's threadgroup gets per lane. The emitted kernel
+/// sizes its threadgroup reduction buffer to this, and `m1_runtime.cpp` must
+/// launch exactly this many.
+pub const METAL_M3_REGION_THREADS: u32 = 256;
+
+/// Device+threadgroup barrier between two ops of a region.
+const BARRIER: &str =
+    "  threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);\n";
+
 /// `emit_fused_region_msl` — single lane, channels bound directly.
 pub fn emit_fused_region(
     function_name: &str,
@@ -178,7 +187,18 @@ pub fn emit_grouped_fused_region(
     source.push_str("    const device uint* lane_indices [[buffer(8)]],\n");
     source.push_str("    const device M3RowMeta* all_row_meta [[buffer(9)]],\n");
     source.push_str("    const device uint* row_indices [[buffer(10)]],\n");
-    source.push_str("    uint dispatch_lane [[thread_position_in_grid]]) {\n");
+    source.push_str("    uint dispatch_lane [[threadgroup_position_in_grid]],\n");
+    source.push_str("    uint m3_tid [[thread_position_in_threadgroup]],\n");
+    source.push_str("    uint m3_threads [[threads_per_threadgroup]]) {\n");
+    // A lane now owns a threadgroup rather than a thread. Everything the region
+    // does still happens once per lane -- ops that cannot be partitioned run on
+    // thread 0 -- but the two that walk the whole vocabulary (the logits gather
+    // and argmax) split across it. Single-threading them cost ~155ms of a
+    // ~159ms decode step against a ~3ms model forward.
+    let _ = writeln!(
+        source,
+        "  threadgroup M1ArgmaxCandidate m3_tgbuf[{METAL_M3_REGION_THREADS}];"
+    );
     source.push_str("  if (dispatch_lane >= layout->lane_count) return;\n");
     source.push_str("  const uint lane_index = lane_indices[dispatch_lane];\n");
     source.push_str(
@@ -201,6 +221,14 @@ pub fn emit_grouped_fused_region(
          reinterpret_cast<device M1Status*>(lane.commit_slot);\n",
     );
     source.push_str("  if (status->state != 1) return;\n");
+    // The threadgroup buffer above is sized for exactly this width, and the
+    // driver launches it (see `m1_runtime.cpp`). A mismatch is a wiring bug, so
+    // say so rather than reading past the buffer.
+    let _ = writeln!(
+        source,
+        "  if (m3_threads != {METAL_M3_REGION_THREADS}u) {{ \
+         if (m3_tid == 0) m1_fault(status, 0xB3u); return; }}"
+    );
     source.push_str(
         "  const device M1ValueDesc* descriptors = all_descriptors + \
          dispatch_lane * layout->value_count;\n",
@@ -250,10 +278,12 @@ pub fn emit_grouped_fused_region(
         let mut slots = slots_for(op, base);
         if op.tag == OP_INTRINSIC_VAL && op.intr == INTR_MTP_DRAFTS {
             emit_mtp_drafts(&mut source, base, &slots.o0);
+            source.push_str(BARRIER);
             continue;
         }
         if op.tag == OP_INTRINSIC_VAL && (op.intr == INTR_LOGITS || op.intr == INTR_MTP_LOGITS) {
             emit_logits_gather(&mut source, base, op.intr == INTR_MTP_LOGITS, &slots.o0);
+            source.push_str(BARRIER);
             continue;
         }
         if op.tag == OP_CHAN_TAKE || op.tag == OP_CHAN_READ {
@@ -270,13 +300,23 @@ pub fn emit_grouped_fused_region(
         }
         let _ = writeln!(
             source,
-            "  ptir_m1_execute({}u, status, descriptors, lane_params + {node}, {}, {}, {}, {}, {}, temporary);",
+            "  ptir_m1_execute_mt({}u, status, descriptors, lane_params + {node}, {}, {}, {}, {}, {}, temporary, m3_tid, m3_threads, m3_tgbuf);",
             op.tag, slots.a0, slots.a1, slots.a2, slots.o0, slots.o1
         );
+        // The next op reads what this one wrote, and `status` is how a fault
+        // reaches the other threads, so both need to be visible before either
+        // is read. The status test is uniform across the threadgroup, so the
+        // return below never strands a thread at a later barrier.
+        source.push_str(BARRIER);
         source.push_str("  if (status->state != 1) return;\n");
         if op.tag == OP_CHAN_PUT {
             let _ = writeln!(source, "  current_{} = pending_{};", op.chan, op.chan);
-            let _ = writeln!(source, "  pending_flags[pending_index_{}] = 1;", op.chan);
+            let _ = writeln!(
+                source,
+                "  if (m3_tid == 0) pending_flags[pending_index_{}] = 1;",
+                op.chan
+            );
+            source.push_str(BARRIER);
         }
     }
     source.push_str("}\n");
@@ -286,6 +326,11 @@ pub fn emit_grouped_fused_region(
 /// The `mtp_drafts` intrinsic: a per-draft argmax over the lane's logits.
 fn emit_mtp_drafts(source: &mut String, base: u32, o0: &str) {
     source.push_str("  {\n");
+    // Per-draft argmax over the vocabulary. Drafts are few, so partition by
+    // draft rather than by column; a lane with one draft keeps one thread busy,
+    // which is what the serial emitter did anyway.
+    source.push_str("    const uint draft_begin = m3_tid;\n");
+    source.push_str("    const uint draft_step = m3_threads;\n");
     let _ = writeln!(
         source,
         "    const M1ValueDesc draft_desc = descriptors[{base}];"
@@ -299,7 +344,10 @@ fn emit_mtp_drafts(source: &mut String, base: u32, o0: &str) {
         source,
         "    device int* draft_out = reinterpret_cast<device int*>({o0});"
     );
-    source.push_str("    for (uint draft = 0; draft < draft_desc.len; ++draft) {\n");
+    source.push_str(
+        "    for (uint draft = draft_begin; draft < draft_desc.len; \
+         draft += draft_step) {\n",
+    );
     source.push_str(
         "      const uint source_row = \
          row_indices[row_meta.offset + row_meta.mtp_offset + draft];\n",
@@ -326,6 +374,10 @@ fn emit_mtp_drafts(source: &mut String, base: u32, o0: &str) {
 /// logits buffer, rebased for MTP rows.
 fn emit_logits_gather(source: &mut String, base: u32, mtp: bool, o0: &str) {
     source.push_str("  {\n");
+    // This walks the whole vocabulary. In the grouped region every thread of
+    // the lane's threadgroup reaches it, so it must be split, not repeated.
+    source.push_str("    const uint gather_begin = m3_tid;\n");
+    source.push_str("    const uint gather_step = m3_threads;\n");
     let _ = writeln!(
         source,
         "    const M1ValueDesc intrinsic_desc = descriptors[{base}];"
@@ -345,17 +397,37 @@ fn emit_logits_gather(source: &mut String, base: u32, mtp: bool, o0: &str) {
         source,
         "    device float* intrinsic_out = reinterpret_cast<device float*>({o0});"
     );
-    source.push_str("    for (uint element = 0; element < intrinsic_desc.len; ++element) {\n");
-    source.push_str("      const uint logical_row = element / layout->vocab;\n");
-    source.push_str("      const uint column = element % layout->vocab;\n");
+    // Row-major, not a flat walk with a divide. `layout` is device memory and
+    // `intrinsic_out` is a device store the compiler cannot prove disjoint from
+    // it, so a flat loop reloaded `layout->vocab` three times per element and
+    // paid a runtime div and mod on top -- a vocabulary-sized row cost ~85ms of
+    // an ~89ms decode step. Hoisting the extent turns it into a coalesced copy.
+    source.push_str("    const uint gather_vocab = layout->vocab;\n");
     source.push_str(
-        "      const uint source_row = \
-         row_indices[row_meta.offset + intrinsic_row_base + logical_row];\n",
+        "    const uint gather_rows = intrinsic_desc.len / gather_vocab;\n",
     );
     source.push_str(
-        "      intrinsic_out[element] = \
-         float(logits[ulong(source_row) * layout->vocab + column]);\n",
+        "    const uint gather_row_base = row_meta.offset + intrinsic_row_base;\n",
     );
+    source.push_str("    for (uint gr = 0u; gr < gather_rows; ++gr) {\n");
+    source.push_str(
+        "      const uint source_row = row_indices[gather_row_base + gr];\n",
+    );
+    source.push_str(
+        "      const device bfloat* gather_src = logits + \
+         ulong(source_row) * gather_vocab;\n",
+    );
+    source.push_str(
+        "      device float* gather_dst = intrinsic_out + ulong(gr) * gather_vocab;\n",
+    );
+    source.push_str(
+        "      for (uint column = gather_begin; column < gather_vocab; \
+         column += gather_step) {\n",
+    );
+    source.push_str(
+        "        gather_dst[column] = float(gather_src[column]);\n",
+    );
+    source.push_str("      }\n");
     source.push_str("    }\n");
     source.push_str("  }\n");
 }

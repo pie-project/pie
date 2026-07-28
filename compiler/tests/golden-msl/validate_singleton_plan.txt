@@ -1,7 +1,7 @@
 # oracle dump: pie::metal::pipeline::validate_singleton_plan
 # source of truth: compiler/codegen/src/metal/ (the C++ oracle this was dumped from is deleted)
-# emitter_version: 27
-# @runtime: bytes=35582 fnv1a64=0x83bd7cbda467df1
+# emitter_version: 29
+# @runtime: bytes=39611 fnv1a64=0x310a2f7d72f22fd5
 # @grouped: bytes=970 fnv1a64=0xa8ab9e1ebf8714d9
 # cases: 456
 #   re-blessed again (emitter 27): `m1_reduce_argmax` no longer materializes one
@@ -10,6 +10,11 @@
 #   same answer -- and the bf16 logits intrinsic copies unrolled. Both loops run
 #   on the single thread that owns a lane, so at a 248320 vocab they were ~250ms
 #   per decode step against a ~4ms model forward. Only @runtime bytes moved.
+#   re-blessed again (emitter 29): a generated region now gets a threadgroup per
+#   lane instead of a thread, and the three things that walked a vocabulary-wide
+#   row -- the logits gather, argmax, and the typed copy behind a reshape -- are
+#   split across it. m1_copy_typed also moved from one device access per BYTE to
+#   one per word. Between them a decode step's GPU time went 89ms -> 6.5ms.
 === beam_epilogue#0 none
 applicable: true
 ok: true
