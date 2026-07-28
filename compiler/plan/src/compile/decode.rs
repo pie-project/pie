@@ -5,7 +5,7 @@
 //! [`pie_ir::read::Reader`]'s two bounds rather than being trusted.
 
 use pie_ir::container::{MAX_CHANNELS, MAX_OPS};
-use pie_ir::op::IntrinsicId;
+use pie_ir::op::{IntrinsicId, tags};
 use pie_ir::read::{ReadError, Reader};
 use pie_ir::registry::Stage;
 use pie_ir::types::{DType, MAX_RANK};
@@ -79,73 +79,109 @@ pub(crate) fn scan_plan_shape(reader: &mut Reader<'_>) -> Result<(), PlanDecodeE
     Ok(())
 }
 
+/// Validates one planned-op record and reports how many results it defines.
+///
+/// The payload *layout* below is the plan encoding's own business (it is not
+/// the trace container's), but the two facts this used to re-derive by hand —
+/// which tags exist, and how many results each defines — belong to
+/// [`pie_ir::op::OP_TABLE`]. Both are now read from there, so a new op cannot
+/// be given a second, disagreeing result count here. What remains hand-written
+/// is the payload scan, and `planned_op_scan_covers_every_op` pins that no
+/// declared tag falls through to the catch-all.
 pub(crate) fn scan_planned_op(bytes: &[u8]) -> Result<u32, PlanDecodeError> {
     let mut reader = Reader::new(bytes);
     let tag = reader.u8()?;
-    let results = match tag {
-        0x01..=0x06 | 0x1E | 0x30..=0x33 | 0x3A | 0x40 | 0x41 | 0x50 | 0x64 | 0x90 | 0x91 => {
+    let spec = pie_ir::op::spec(tag).ok_or(PlanDecodeError::InvalidRecord)?;
+    match tag {
+        tags::EXP
+        | tags::LOG
+        | tags::NEG
+        | tags::RECIP
+        | tags::ABS
+        | tags::SIGN
+        | tags::NOT
+        | tags::REDUCE_SUM
+        | tags::REDUCE_MAX
+        | tags::REDUCE_MIN
+        | tags::REDUCE_ARGMAX
+        | tags::TRANSPOSE
+        | tags::CUMSUM
+        | tags::CUMPROD
+        | tags::SORT_DESC
+        | tags::IOTA
+        | tags::CHAN_TAKE
+        | tags::CHAN_READ => {
             reader.take(4)?;
-            if tag == 0x50 { 2 } else { 1 }
         }
-        0x07 => {
+        tags::CAST => {
             reader.take(4)?;
             if reader.u8()? > DType::Bool as u8 {
                 return Err(PlanDecodeError::InvalidRecord);
             }
-            1
         }
-        0x10..=0x1D | 0x1F | 0x51 | 0x55 | 0x60 | 0x61 | 0x65 | 0x66 => {
+        tags::ADD
+        | tags::SUB
+        | tags::MUL
+        | tags::DIV
+        | tags::MAX_ELEM
+        | tags::MIN_ELEM
+        | tags::GT
+        | tags::GE
+        | tags::EQ
+        | tags::NE
+        | tags::LT
+        | tags::LE
+        | tags::AND
+        | tags::OR
+        | tags::REM
+        | tags::TOP_K
+        | tags::MATMUL
+        | tags::GATHER
+        | tags::GATHER_ROW
+        | tags::MASK_APPLY_PACKED
+        | tags::CAUSAL_MASK => {
             reader.take(8)?;
-            if tag == 0x51 { 2 } else { 1 }
         }
-        0x20 | 0x62 | 0x63 | 0x67 => {
+        tags::SELECT | tags::SCATTER_ADD | tags::SCATTER_SET | tags::SLIDING_WINDOW_MASK => {
             reader.take(12)?;
-            1
         }
-        0x68 => {
+        tags::SINK_WINDOW_MASK => {
             reader.take(16)?;
-            1
         }
-        0x38 | 0x39 => {
+        tags::BROADCAST | tags::RESHAPE => {
             reader.take(4)?;
             scan_plan_shape(&mut reader)?;
-            1
         }
-        0x58 => {
+        tags::PIVOT_THRESHOLD => {
             reader.take(4)?;
             if reader.u8()? > 2 {
                 return Err(PlanDecodeError::InvalidRecord);
             }
             reader.take(4)?;
-            1
         }
-        0x70 | 0x71 => {
+        tags::RNG | tags::RNG_KEYED => {
             reader.take(4)?;
             scan_plan_shape(&mut reader)?;
             if reader.u8()? > 1 {
                 return Err(PlanDecodeError::InvalidRecord);
             }
-            1
         }
-        0x81 => {
+        tags::CONST => {
             if reader.u8()? > DType::Bool as u8 {
                 return Err(PlanDecodeError::InvalidRecord);
             }
             reader.take(4)?;
-            1
         }
-        0x92 => {
+        tags::CHAN_PUT => {
             reader.take(8)?;
-            0
         }
-        0xA0 => {
+        tags::INTRINSIC_VAL => {
             if reader.u16()? > IntrinsicId::AttnScore as u16 || reader.u8()? > DType::Bool as u8 {
                 return Err(PlanDecodeError::InvalidRecord);
             }
             scan_plan_shape(&mut reader)?;
-            1
         }
-        0xA1 => {
+        tags::KERNEL_CALL => {
             reader.u16()?;
             if reader.u8()? > DType::Bool as u8 {
                 return Err(PlanDecodeError::InvalidRecord);
@@ -159,9 +195,8 @@ pub(crate) fn scan_planned_op(bytes: &[u8]) -> Result<u32, PlanDecodeError> {
                     .checked_mul(4)
                     .ok_or(PlanDecodeError::CountTooLarge("kernel argument vector"))?,
             )?;
-            1
         }
-        0xA2 => {
+        tags::SINK_CALL => {
             reader.u16()?;
             let arguments = reader.u8()? as u32;
             let arguments =
@@ -171,14 +206,16 @@ pub(crate) fn scan_planned_op(bytes: &[u8]) -> Result<u32, PlanDecodeError> {
                     .checked_mul(4)
                     .ok_or(PlanDecodeError::CountTooLarge("sink argument vector"))?,
             )?;
-            0
         }
+        // Unreachable for undeclared tags — `spec` above already rejected
+        // those. Reached only by a tag `declare_ops!` added and this scan did
+        // not, which `planned_op_scan_covers_every_op` fails on.
         _ => return Err(PlanDecodeError::InvalidRecord),
-    };
+    }
     if reader.offset() != bytes.len() {
         return Err(PlanDecodeError::InvalidRecord);
     }
-    Ok(results)
+    Ok(spec.results as u32)
 }
 
 pub(crate) fn scan_index_vector(
@@ -393,4 +430,48 @@ pub fn decode_plan_header(bytes: &[u8]) -> Result<EncodedPlanHeader, PlanDecodeE
         singleton_regions,
         fused_regions,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `scan_planned_op` ends in a catch-all, and a catch-all cannot tell the
+    /// difference between "this tag does not exist" and "nobody taught me
+    /// this tag". `pie_ir::op::spec` handles the first case, so the second is
+    /// the only way to reach `_`, and this is what notices.
+    ///
+    /// A one-byte record is the probe: every payload arm reads at least one
+    /// more byte, so a tag the scan knows fails as `Truncated`, while a tag
+    /// it forgot fails as `InvalidRecord`.
+    #[test]
+    fn planned_op_scan_covers_every_op() {
+        let unhandled: Vec<&str> = pie_ir::op::OP_TABLE
+            .iter()
+            .filter(|spec| scan_planned_op(&[spec.tag]) == Err(PlanDecodeError::InvalidRecord))
+            .map(|spec| spec.name)
+            .collect();
+        assert!(
+            unhandled.is_empty(),
+            "{} op(s) reach the catch-all in scan_planned_op: {unhandled:?}",
+            unhandled.len()
+        );
+    }
+
+    /// The dual: the plan format must not admit a tag `declare_ops!` never
+    /// allocated. Without the `spec` lookup an undeclared tag could land in a
+    /// range pattern and be scanned as its neighbour.
+    #[test]
+    fn planned_op_scan_rejects_undeclared_tags() {
+        for tag in 0u8..=u8::MAX {
+            if pie_ir::op::spec(tag).is_some() {
+                continue;
+            }
+            assert_eq!(
+                scan_planned_op(&[tag]),
+                Err(PlanDecodeError::InvalidRecord),
+                "tag {tag:#04x} is not in OP_TABLE but scan_planned_op accepted it"
+            );
+        }
+    }
 }

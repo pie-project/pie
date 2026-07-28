@@ -16,7 +16,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
-use super::op::{ChannelIndex, IntrinsicId, Op};
+use super::op::{ChannelIndex, IntrinsicId, Op, tags};
 use super::read::{ReadError, Reader};
 use super::registry::{Port, Stage};
 use crate::types::{DType, Literal, MAX_RANK, Predicate, RngKind, Shape};
@@ -680,59 +680,59 @@ pub fn decode(bytes: &[u8]) -> Result<TraceContainer, ContainerDecodeError> {
 fn decode_op(r: &mut Reader<'_>) -> Result<Op, ContainerDecodeError> {
     let tag = r.u8()?;
     let op = match tag {
-        0x01 => Op::Exp(r.u32()?),
-        0x02 => Op::Log(r.u32()?),
-        0x03 => Op::Neg(r.u32()?),
-        0x04 => Op::Recip(r.u32()?),
-        0x05 => Op::Abs(r.u32()?),
-        0x06 => Op::Sign(r.u32()?),
-        0x07 => Op::Cast {
+        tags::EXP => Op::Exp(r.u32()?),
+        tags::LOG => Op::Log(r.u32()?),
+        tags::NEG => Op::Neg(r.u32()?),
+        tags::RECIP => Op::Recip(r.u32()?),
+        tags::ABS => Op::Abs(r.u32()?),
+        tags::SIGN => Op::Sign(r.u32()?),
+        tags::CAST => Op::Cast {
             value: r.u32()?,
             dtype: decode_dtype(r.u8()?)?,
         },
-        0x10 => Op::Add(r.u32()?, r.u32()?),
-        0x11 => Op::Sub(r.u32()?, r.u32()?),
-        0x12 => Op::Mul(r.u32()?, r.u32()?),
-        0x13 => Op::Div(r.u32()?, r.u32()?),
-        0x14 => Op::MaxElem(r.u32()?, r.u32()?),
-        0x15 => Op::MinElem(r.u32()?, r.u32()?),
-        0x16 => Op::Gt(r.u32()?, r.u32()?),
-        0x17 => Op::Ge(r.u32()?, r.u32()?),
-        0x18 => Op::Eq(r.u32()?, r.u32()?),
-        0x19 => Op::Ne(r.u32()?, r.u32()?),
-        0x1A => Op::Lt(r.u32()?, r.u32()?),
-        0x1B => Op::Le(r.u32()?, r.u32()?),
-        0x1C => Op::And(r.u32()?, r.u32()?),
-        0x1D => Op::Or(r.u32()?, r.u32()?),
-        0x1E => Op::Not(r.u32()?),
-        0x1F => Op::Rem(r.u32()?, r.u32()?),
-        0x20 => Op::Select {
+        tags::ADD => Op::Add(r.u32()?, r.u32()?),
+        tags::SUB => Op::Sub(r.u32()?, r.u32()?),
+        tags::MUL => Op::Mul(r.u32()?, r.u32()?),
+        tags::DIV => Op::Div(r.u32()?, r.u32()?),
+        tags::MAX_ELEM => Op::MaxElem(r.u32()?, r.u32()?),
+        tags::MIN_ELEM => Op::MinElem(r.u32()?, r.u32()?),
+        tags::GT => Op::Gt(r.u32()?, r.u32()?),
+        tags::GE => Op::Ge(r.u32()?, r.u32()?),
+        tags::EQ => Op::Eq(r.u32()?, r.u32()?),
+        tags::NE => Op::Ne(r.u32()?, r.u32()?),
+        tags::LT => Op::Lt(r.u32()?, r.u32()?),
+        tags::LE => Op::Le(r.u32()?, r.u32()?),
+        tags::AND => Op::And(r.u32()?, r.u32()?),
+        tags::OR => Op::Or(r.u32()?, r.u32()?),
+        tags::NOT => Op::Not(r.u32()?),
+        tags::REM => Op::Rem(r.u32()?, r.u32()?),
+        tags::SELECT => Op::Select {
             cond: r.u32()?,
             a: r.u32()?,
             b: r.u32()?,
         },
-        0x30 => Op::ReduceSum(r.u32()?),
-        0x31 => Op::ReduceMax(r.u32()?),
-        0x32 => Op::ReduceMin(r.u32()?),
-        0x33 => Op::ReduceArgmax(r.u32()?),
-        0x38 => Op::Broadcast {
+        tags::REDUCE_SUM => Op::ReduceSum(r.u32()?),
+        tags::REDUCE_MAX => Op::ReduceMax(r.u32()?),
+        tags::REDUCE_MIN => Op::ReduceMin(r.u32()?),
+        tags::REDUCE_ARGMAX => Op::ReduceArgmax(r.u32()?),
+        tags::BROADCAST => Op::Broadcast {
             value: r.u32()?,
             shape: decode_shape(r)?,
         },
-        0x39 => Op::Reshape {
+        tags::RESHAPE => Op::Reshape {
             value: r.u32()?,
             shape: decode_shape(r)?,
         },
-        0x3A => Op::Transpose(r.u32()?),
-        0x40 => Op::CumSum(r.u32()?),
-        0x41 => Op::CumProd(r.u32()?),
-        0x50 => Op::SortDesc(r.u32()?),
-        0x51 => Op::TopK {
+        tags::TRANSPOSE => Op::Transpose(r.u32()?),
+        tags::CUMSUM => Op::CumSum(r.u32()?),
+        tags::CUMPROD => Op::CumProd(r.u32()?),
+        tags::SORT_DESC => Op::SortDesc(r.u32()?),
+        tags::TOP_K => Op::TopK {
             input: r.u32()?,
             k: r.u32()?,
         },
-        0x55 => Op::MatMul(r.u32()?, r.u32()?),
-        0x58 => {
+        tags::MATMUL => Op::MatMul(r.u32()?, r.u32()?),
+        tags::PIVOT_THRESHOLD => {
             let input = r.u32()?;
             let predicate = match r.u8()? {
                 0 => Predicate::RankLe(r.u32()?),
@@ -747,55 +747,55 @@ fn decode_op(r: &mut Reader<'_>) -> Result<Op, ContainerDecodeError> {
             };
             Op::PivotThreshold { input, predicate }
         }
-        0x60 => Op::Gather {
+        tags::GATHER => Op::Gather {
             src: r.u32()?,
             idx: r.u32()?,
         },
-        0x61 => Op::GatherRow {
+        tags::GATHER_ROW => Op::GatherRow {
             src: r.u32()?,
             idx: r.u32()?,
         },
-        0x62 => Op::ScatterAdd {
+        tags::SCATTER_ADD => Op::ScatterAdd {
             base: r.u32()?,
             idx: r.u32()?,
             vals: r.u32()?,
         },
-        0x63 => Op::ScatterSet {
+        tags::SCATTER_SET => Op::ScatterSet {
             base: r.u32()?,
             idx: r.u32()?,
             vals: r.u32()?,
         },
-        0x64 => Op::Iota { len: r.u32()? },
-        0x65 => Op::MaskApply {
+        tags::IOTA => Op::Iota { len: r.u32()? },
+        tags::MASK_APPLY_PACKED => Op::MaskApply {
             logits: r.u32()?,
             mask: r.u32()?,
         },
-        0x66 => Op::CausalMask {
+        tags::CAUSAL_MASK => Op::CausalMask {
             positions: r.u32()?,
             len: r.u32()?,
         },
-        0x67 => Op::SlidingWindowMask {
+        tags::SLIDING_WINDOW_MASK => Op::SlidingWindowMask {
             positions: r.u32()?,
             len: r.u32()?,
             window: r.u32()?,
         },
-        0x68 => Op::SinkWindowMask {
+        tags::SINK_WINDOW_MASK => Op::SinkWindowMask {
             positions: r.u32()?,
             len: r.u32()?,
             sink: r.u32()?,
             window: r.u32()?,
         },
-        0x70 => Op::Rng {
+        tags::RNG => Op::Rng {
             stream: r.u32()?,
             shape: decode_shape(r)?,
             kind: decode_rng_kind(r.u8()?)?,
         },
-        0x71 => Op::RngKeyed {
+        tags::RNG_KEYED => Op::RngKeyed {
             state: r.u32()?,
             shape: decode_shape(r)?,
             kind: decode_rng_kind(r.u8()?)?,
         },
-        0x81 => {
+        tags::CONST => {
             let dt = r.u8()?;
             let bits = r.u32()?;
             Op::Const(match dt {
@@ -811,13 +811,13 @@ fn decode_op(r: &mut Reader<'_>) -> Result<Op, ContainerDecodeError> {
                 }
             })
         }
-        0x90 => Op::ChanTake(r.u32()?),
-        0x91 => Op::ChanRead(r.u32()?),
-        0x92 => Op::ChanPut {
+        tags::CHAN_TAKE => Op::ChanTake(r.u32()?),
+        tags::CHAN_READ => Op::ChanRead(r.u32()?),
+        tags::CHAN_PUT => Op::ChanPut {
             chan: r.u32()?,
             value: r.u32()?,
         },
-        0xA0 => {
+        tags::INTRINSIC_VAL => {
             let iv = r.u16()?;
             let intr = IntrinsicId::from_u16(iv).ok_or(ContainerDecodeError::UnknownTag {
                 what: "intrinsic",
@@ -827,7 +827,7 @@ fn decode_op(r: &mut Reader<'_>) -> Result<Op, ContainerDecodeError> {
             let shape = decode_shape(r)?;
             Op::IntrinsicVal { intr, shape, dtype }
         }
-        0xA1 => {
+        tags::KERNEL_CALL => {
             let name = r.u16()?;
             let dtype = decode_dtype(r.u8()?)?;
             let shape = decode_shape(r)?;
@@ -843,7 +843,7 @@ fn decode_op(r: &mut Reader<'_>) -> Result<Op, ContainerDecodeError> {
                 dtype,
             }
         }
-        0xA2 => {
+        tags::SINK_CALL => {
             let name = r.u16()?;
             let n = r.u8()? as usize;
             let mut args = Vec::with_capacity(n);
@@ -1107,6 +1107,22 @@ mod tests {
                 args: vec![0],
             },
         ];
+        // The list above is hand-written, so it can fall behind `declare_ops!`.
+        // `table_matches_op_metadata` pins one representative per variant
+        // against `OP_TABLE`; this pins the *wire* path, and nothing else does.
+        // Without the sweep a new op could land in `declare_ops!` with an
+        // `encode_op` arm and no `decode_op` arm, and the first thing to read
+        // the missing half back would be a driver.
+        let missing: Vec<&str> = crate::op::OP_TABLE
+            .iter()
+            .filter(|spec| !ops.iter().any(|op| op.tag() == spec.tag))
+            .map(|spec| spec.name)
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "{} op(s) never round-trip through the container: {missing:?}",
+            missing.len()
+        );
         let c = TraceContainer {
             names: vec!["k".to_string()],
             channels: vec![
@@ -1161,6 +1177,27 @@ mod tests {
             decode_op(&mut reader),
             Err(ContainerDecodeError::UnknownOpcode(0x59))
         );
+    }
+
+    /// The dual of `round_trip_every_op`: the 201 byte values `declare_ops!`
+    /// does not allocate must all come back as `UnknownOpcode`, not as a
+    /// neighbouring op that happens to share a decode arm. `0x59` above pins
+    /// one of them by hand; a retired tag is only the case anyone thinks to
+    /// write down.
+    #[test]
+    fn decode_rejects_every_tag_the_table_does_not_declare() {
+        for tag in 0u8..=u8::MAX {
+            if crate::op::OP_TABLE.iter().any(|spec| spec.tag == tag) {
+                continue;
+            }
+            let bytes = [tag];
+            let mut reader = Reader::new(&bytes);
+            assert_eq!(
+                decode_op(&mut reader),
+                Err(ContainerDecodeError::UnknownOpcode(tag)),
+                "tag {tag:#04x} is not in OP_TABLE but decode_op accepted it"
+            );
+        }
     }
 
     #[test]
