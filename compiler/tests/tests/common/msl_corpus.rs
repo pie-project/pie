@@ -22,7 +22,7 @@ use pie_ir::op::{IntrinsicId, Op};
 use pie_ir::registry::{KernelInfo, ModelProfile, SinkScope, Stage};
 use pie_ir::types::{DType, RngKind, Shape};
 use pie_ir::validate::bind;
-use pie_plan::{CompiledStage, compile_bound, encode_stage_plan};
+use pie_plan::{CompiledStage, compile_bound, debug_stage_plan};
 
 /// Golden names in the order the corpus enumerates them.
 pub const GOLDEN_NAMES: &[&str] = &[
@@ -237,7 +237,10 @@ pub struct CorpusStage {
     pub stage_index: usize,
     pub stage_tag: u8,
     pub plan: CompiledStage,
-    pub wire: Vec<u8>,
+    /// The plan rendered the way the runtime engine renders it
+    /// (`pie_plan::debug_stage_plan`). Pinned instead of an encoding so a
+    /// planning change lands in a golden as a readable diff.
+    pub debug: String,
 }
 
 impl CorpusStage {
@@ -256,13 +259,13 @@ pub fn corpus_stages() -> Vec<CorpusStage> {
             return;
         };
         for (stage_index, plan) in compile_bound(&bound).into_iter().enumerate() {
-            let wire = encode_stage_plan(&plan);
+            let debug = debug_stage_plan(&plan);
             stages.push(CorpusStage {
                 golden: name.into(),
                 stage_index,
                 stage_tag: plan.normalized.stage as u8,
                 plan,
-                wire,
+                debug,
             });
         }
     };
@@ -615,13 +618,13 @@ pub fn extended_stages() -> Vec<CorpusStage> {
         let bound = bind(container, profile)
             .unwrap_or_else(|error| panic!("extended trace `{name}` must bind: {error:?}"));
         for (stage_index, plan) in compile_bound(&bound).into_iter().enumerate() {
-            let wire = encode_stage_plan(&plan);
+            let debug = debug_stage_plan(&plan);
             stages.push(CorpusStage {
                 golden: name.into(),
                 stage_index,
                 stage_tag: plan.normalized.stage as u8,
                 plan,
-                wire,
+                debug,
             });
         }
     }

@@ -10,7 +10,7 @@ use pie_ir::container::{encode_op, put_u32};
 use pie_ir::op::Op;
 use pie_ir::types::{DType, Literal};
 
-use super::encode::encode_symbolic_type;
+use super::canonical::canonical_symbolic_type;
 use super::symbolic::{Dimension, SymbolicType};
 
 pub(crate) fn simplify_alias(
@@ -192,7 +192,7 @@ pub(crate) fn cse_key(op: &Op, result_types: &[SymbolicType]) -> Vec<u8> {
     encode_op(&mut bytes, op);
     put_u32(&mut bytes, result_types.len() as u32);
     for value_type in result_types {
-        encode_symbolic_type(&mut bytes, value_type);
+        canonical_symbolic_type(&mut bytes, value_type);
     }
     bytes
 }

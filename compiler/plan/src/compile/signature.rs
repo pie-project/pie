@@ -12,7 +12,7 @@ use pie_ir::registry::Stage;
 use pie_ir::validate::BoundTrace;
 
 use super::COMPILER_VERSION;
-use super::encode::{encode_planned_op, encode_static_shape, encode_symbolic_type};
+use super::canonical::{canonical_op, canonical_static_shape, canonical_symbolic_type};
 use super::normalize::NormalizedStage;
 use super::symbolic::{symbolic_channel_type, symbolic_port_type};
 
@@ -45,7 +45,7 @@ pub(crate) fn stage_signature(bound: &BoundTrace, stage: &NormalizedStage) -> St
     for &global in &stage.channel_bindings {
         let declaration = &bound.container.channels[global as usize];
         let value_type = symbolic_channel_type(bound, global, bound.channel_types[global as usize]);
-        encode_symbolic_type(&mut bytes, &value_type);
+        canonical_symbolic_type(&mut bytes, &value_type);
         put_u32(&mut bytes, declaration.capacity);
         bytes.push(declaration.host_role as u8);
         bytes.push(u8::from(declaration.seeded));
@@ -76,12 +76,12 @@ pub(crate) fn stage_signature(bound: &BoundTrace, stage: &NormalizedStage) -> St
                 );
                 let port_type =
                     symbolic_port_type(binding.port, bound.channel_types[*global as usize]);
-                encode_symbolic_type(&mut bytes, &port_type);
+                canonical_symbolic_type(&mut bytes, &port_type);
             }
             PortSource::Const { dtype, shape, data } => {
                 bytes.push(1);
                 bytes.push(*dtype as u8);
-                encode_static_shape(&mut bytes, *shape);
+                canonical_static_shape(&mut bytes, *shape);
                 put_u32(&mut bytes, data.len() as u32);
                 bytes.extend_from_slice(data);
             }
@@ -97,12 +97,12 @@ pub(crate) fn stage_signature(bound: &BoundTrace, stage: &NormalizedStage) -> St
     put_u32(&mut bytes, stage.ops.len() as u32);
     let mut next_value = 0usize;
     for op in &stage.ops {
-        encode_planned_op(&mut bytes, op, stage.value_types.get(next_value));
+        canonical_op(&mut bytes, op, stage.value_types.get(next_value));
         next_value += op.result_count() as usize;
     }
     put_u32(&mut bytes, stage.value_types.len() as u32);
     for (value_type, domain) in stage.value_types.iter().zip(&stage.value_domains) {
-        encode_symbolic_type(&mut bytes, value_type);
+        canonical_symbolic_type(&mut bytes, value_type);
         bytes.push(*domain as u8);
     }
     StageSignature {

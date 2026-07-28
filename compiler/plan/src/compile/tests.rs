@@ -17,8 +17,7 @@
 use super::*;
 use alloc::vec;
 use pie_ir::container::{
-    ChanDType, ChannelDecl, HostRole, MAX_CHANNELS, PortBinding, PortSource, StageProgram,
-    TraceContainer,
+    ChanDType, ChannelDecl, HostRole, PortBinding, PortSource, StageProgram, TraceContainer,
 };
 use pie_ir::op::{IntrinsicId, Op};
 use pie_ir::registry::{KernelInfo, ModelProfile, Port};
@@ -803,11 +802,12 @@ fn scaled_nucleus_absorbs_temperature_and_peels_reshape() {
     assert_eq!(nucleus.outputs, vec![18]);
 }
 
-/// The scaled nucleus carries 5 inputs, not 3. Every CUDA site accepts
-/// both arities; the structural decoder used to accept only 3, so it
-/// rejected a plan this crate's own encoder had just produced.
+/// The scaled nucleus carries 5 inputs, not 3, and still matches as one
+/// library region. Every CUDA site accepts both arities; a structural decoder
+/// that has since been deleted accepted only 3, and so rejected a plan this
+/// crate had just produced.
 #[test]
-fn a_scaled_nucleus_plan_survives_its_own_structural_decoder() {
+fn a_scaled_nucleus_matches_as_one_region_at_five_inputs() {
     let compiled = compile_stage(&scaled_nucleus_program(), Stage::Epilogue).unwrap();
     let nucleus = compiled
         .fused
@@ -816,9 +816,6 @@ fn a_scaled_nucleus_plan_survives_its_own_structural_decoder() {
         .find(|region| region.kind == RegionKind::Library(LibraryOp::NucleusSample))
         .expect("scaled nucleus library region");
     assert_eq!(nucleus.inputs.len(), 5);
-    let bytes = encode_stage_plan(&compiled);
-    let header = decode_plan_header(&bytes).expect("scaled nucleus plan must decode");
-    assert_eq!(header.signature_hash, compiled.signature.hash);
 }
 
 #[test]
@@ -833,7 +830,7 @@ fn byte_identical_nucleus_dags_share_signature_and_library_plan() {
     let second = compile_stage(&second, Stage::Epilogue).unwrap();
     assert_eq!(first.signature, second.signature);
     assert_eq!(first.fused, second.fused);
-    assert_eq!(encode_stage_plan(&first), encode_stage_plan(&second));
+    assert_eq!(debug_stage_plan(&first), debug_stage_plan(&second));
 }
 
 #[test]
@@ -1073,68 +1070,28 @@ fn explicit_candidate_batch_does_not_inherit_sampled_rows() {
 // extents cannot reach the signature. That is enforced by the signature of
 // the function, which a test cannot strengthen.
 
+/// The rendering a plan reaches humans through is a pure function of the plan.
+///
+/// `debug_stage_plan` is what `runtime/engine/src/pipeline/program.rs` prints
+/// when a program is registered under a debug flag, and what the extended
+/// golden pins. Both uses assume it does not vary run to run.
 #[test]
-fn plan_encoding_is_deterministic_and_self_describing() {
+fn plan_rendering_is_deterministic_and_self_describing() {
     let bound = program(1, 1);
     let stage = compile_stage(&bound, Stage::Epilogue).unwrap();
-    let first = encode_stage_plan(&stage);
-    let second = encode_stage_plan(&stage);
-    assert_eq!(first, second);
-    let header = decode_plan_header(&first).unwrap();
-    assert_eq!(header.stage, Stage::Epilogue);
-    assert_eq!(header.signature_hash, stage.signature.hash);
+    let rendered = debug_stage_plan(&stage);
+    assert_eq!(rendered, debug_stage_plan(&stage));
+    assert!(rendered.contains("epilogue signature="));
+    assert!(rendered.contains(&format!("{:016x}", stage.signature.hash)));
+    assert!(rendered.contains("Fused"));
     assert_eq!(
-        header.singleton_regions as usize,
-        stage.singleton.regions.len()
+        rendered.matches("    r").count(),
+        stage.singleton.regions.len() + stage.fused.regions.len(),
+        "every region of both partitions is rendered"
     );
-    assert_eq!(header.fused_regions as usize, stage.fused.regions.len());
-    let debug = debug_stage_plan(&stage);
-    assert!(debug.contains("epilogue signature="));
-    assert!(debug.contains("Fused"));
     assert_eq!(
         stage.metrics().normalized_ops,
         stage.normalized.ops.len() as u32
-    );
-    let mut corrupted = first;
-    corrupted[21] ^= 1;
-    assert_eq!(
-        decode_plan_header(&corrupted),
-        Err(PlanDecodeError::InvalidRecord)
-    );
-}
-
-/// The byte bound alone is only as strong as the record size, so each
-/// plan table also carries an absolute ceiling. These three were the last
-/// `usize::MAX` in the decoders: with no ceiling, padding the input was
-/// enough to make any of them accept an arbitrary count.
-#[test]
-fn plan_tables_have_a_structural_ceiling() {
-    let bound = program(1, 1);
-    let stage = compile_stage(&bound, Stage::Epilogue).unwrap();
-    let plan = encode_stage_plan(&stage);
-    // magic(4) + region version(2) + compiler version(2) + stage(1)
-    // + signature hash(8) + signature length(4), then the signature.
-    let signature_len = u32::from_le_bytes(plan[17..21].try_into().unwrap()) as usize;
-    let channel_count_at = 21 + signature_len;
-
-    let patch = |claim: u32, pad: usize| {
-        let mut bytes = plan.clone();
-        bytes[channel_count_at..channel_count_at + 4].copy_from_slice(&claim.to_le_bytes());
-        bytes.extend(core::iter::repeat_n(0u8, pad));
-        decode_plan_header(&bytes)
-    };
-
-    // Unbacked by the bytes present: refused by the byte bound.
-    assert_eq!(
-        patch(u32::MAX, 0),
-        Err(PlanDecodeError::CountTooLarge("plan channel table"))
-    );
-    // Backed by the bytes present, over the ceiling. This is the case the
-    // byte bound cannot see and `usize::MAX` used to wave through.
-    let over = MAX_CHANNELS as u32 + 1;
-    assert_eq!(
-        patch(over, over as usize * 4),
-        Err(PlanDecodeError::CountTooLarge("plan channel table"))
     );
 }
 

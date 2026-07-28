@@ -28,15 +28,11 @@ pub fn generate_c_header() -> String {
         "#define PTIR_MAGIC \"PTIR\"\n#define PTIR_VERSION {PTIR_VERSION}\n"
     ));
     s.push_str(&format!(
-        "#define PTIB_MAGIC \"PTIB\" // bound-trace typed sidecar (PTIR-CONTAINER.md section 7)\n#define PTIB_VERSION {}\n",
-        pie_plan::sidecar::PTIB_VERSION
-    ));
-    s.push_str(&format!(
         "// v1.1 extern channels (PTIR-CONTAINER.md section 6b): wire-version 2 iff externs\n#define PTIR_VERSION_EXTERN {}\nenum PtirExternDir : uint8_t {{ PTIR_EXTERN_IMPORT = 0, PTIR_EXTERN_EXPORT = 1 }};\n\n",
         pie_ir::PTIR_VERSION_EXTERN
     ));
     s.push_str(&format!(
-        "#define PTIR_COMPILER_VERSION {}\n#define PTIR_REGION_PLAN_VERSION {}\n#define PTIR_LANE_TABLE_ABI_VERSION {}\n\n",
+        "// Cache-identity tokens, not wire versions: fold them into a compiled-module\n// cache key so a change in host planning invalidates what a device already built.\n#define PTIR_COMPILER_VERSION {}\n#define PTIR_REGION_PLAN_VERSION {}\n#define PTIR_LANE_TABLE_ABI_VERSION {}\n\n",
         pie_plan::COMPILER_VERSION,
         pie_plan::REGION_PLAN_VERSION,
         pie_plan::LANE_TABLE_ABI_VERSION

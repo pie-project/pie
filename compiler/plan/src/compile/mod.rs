@@ -12,8 +12,7 @@ use pie_ir::Fnv1a;
 use pie_ir::registry::Stage;
 use pie_ir::validate::BoundTrace;
 
-mod decode;
-mod encode;
+mod canonical;
 mod fold;
 mod lane;
 mod normalize;
@@ -21,16 +20,23 @@ mod region;
 mod signature;
 mod symbolic;
 
-pub use decode::*;
-pub use encode::*;
 pub use lane::*;
 pub use normalize::*;
 pub use region::*;
 pub use signature::*;
 pub use symbolic::*;
 
+/// Cache-identity tokens, not wire-format versions.
+///
+/// Both drivers fold these into the key of their compiled-module caches
+/// (`driver/cuda/.../module_cache.hpp`, `driver/metal/.../m1_runtime.cpp`), so
+/// bumping one is how a change in this crate's planning semantics invalidates
+/// everything a device already built. Nothing parses a byte stream stamped with
+/// them.
 pub const COMPILER_VERSION: u16 = 3;
+/// Bumped when region partitioning changes shape. See [`COMPILER_VERSION`].
 pub const REGION_PLAN_VERSION: u16 = 4;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct CompiledStage {
     pub normalized: NormalizedStage,
@@ -182,18 +188,16 @@ pub fn debug_stage_plan(stage: &CompiledStage) -> String {
 
 /// The graph-cache identity of one compiled stage.
 ///
-/// The CUDA driver computes exactly this in `program_identity.hpp` after
-/// decoding the plan, and keys its CUDA-graph cache on it. It is a decision
-/// about the program, so under `ptir-refactor.md`'s north star it belongs to
-/// the host: the driver should be told, not re-derive.
+/// A driver keys its graph cache on this value, so it is a decision about the
+/// program and — under `ptir-refactor.md`'s north star — belongs to the host.
+/// The Metal runtime is handed the bytes rather than deriving them
+/// (`m1_runtime.cpp:1089`, carried by `interface/driver/src/plan.rs`'s
+/// `identity`); the CUDA copy in `program_identity.hpp` no longer exists.
 ///
-/// The walk is byte-order-locked to the C++ one — the same fields, in the same
-/// order, through the same FNV-1a 64. `stage_identity_matches_the_driver` in
-/// `compiler/tests` pins the two together, and while both exist the driver
-/// compares its own value against this one and counts any divergence
-/// (`ProgramRuntimeStats::host_stage_identities` /
-/// `divergent_stage_identities`), which is what makes deleting the C++ copy an
-/// evidenced step rather than a leap.
+/// Because the key is published, moving it is an operational event and not a
+/// refactor: a stale key is silent, reusing a graph built by a different
+/// planner. `stage_identity_is_pinned` in `compiler/tests` catches the move,
+/// and [`COMPILER_VERSION`] must be bumped alongside it.
 pub fn stage_identity(stage: &CompiledStage) -> u64 {
     let mut hash = Fnv1a::new();
     hash.byte(stage.normalized.stage as u8);

@@ -6,7 +6,7 @@ use pie_dsl::ptir::types::{Literal, Predicate, RngKind};
 use pie_dsl::ptir::validate::{BoundTrace, bind};
 use pie_dsl::{Channel, Traced};
 use pie_eval::interp::{Instance, NoKernels, PassInputs, Value};
-use pie_plan::{LibraryOp, NodeIndex, RegionKind, compile_stage, encode_stage_plan};
+use pie_plan::{LibraryOp, NodeIndex, RegionKind, compile_stage, debug_stage_plan};
 
 #[test]
 fn row_membership_is_general_ssa_and_evaluates_per_row() {
@@ -106,8 +106,9 @@ fn nucleus_helper_is_byte_identical_to_general_ssa_and_compiles_as_library() {
     assert_eq!(helper_compiled.signature, explicit_compiled.signature);
     assert_eq!(helper_compiled.fused, explicit_compiled.fused);
     assert_eq!(
-        encode_stage_plan(&helper_compiled),
-        encode_stage_plan(&explicit_compiled)
+        debug_stage_plan(&helper_compiled),
+        debug_stage_plan(&explicit_compiled),
+        "the helper and the explicit spelling must compile to the same plan"
     );
     let region = helper_compiled
         .fused

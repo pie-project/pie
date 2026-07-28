@@ -6,12 +6,12 @@
 
 #define PTIR_MAGIC "PTIR"
 #define PTIR_VERSION 1
-#define PTIB_MAGIC "PTIB" // bound-trace typed sidecar (PTIR-CONTAINER.md section 7)
-#define PTIB_VERSION 2
 // v1.1 extern channels (PTIR-CONTAINER.md section 6b): wire-version 2 iff externs
 #define PTIR_VERSION_EXTERN 2
 enum PtirExternDir : uint8_t { PTIR_EXTERN_IMPORT = 0, PTIR_EXTERN_EXPORT = 1 };
 
+// Cache-identity tokens, not wire versions: fold them into a compiled-module
+// cache key so a change in host planning invalidates what a device already built.
 #define PTIR_COMPILER_VERSION 3
 #define PTIR_REGION_PLAN_VERSION 4
 #define PTIR_LANE_TABLE_ABI_VERSION 3

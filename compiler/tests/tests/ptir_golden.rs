@@ -44,16 +44,10 @@ impl Report {
         match r {
             Ok(b) => {
                 writeln!(self.0, "verdict: OK").unwrap();
-                // The PTIB typed sidecar (PTIR-CONTAINER.md §7): per-value
-                // (shape, dtype) + readiness + channel classes — what a
-                // backend consumes instead of re-inferring (option B). The
-                // readiness/class lines below restate it human-readably.
-                writeln!(
-                    self.0,
-                    "sidecar: {}",
-                    hex(&pie_plan::sidecar::encode_bound(b))
-                )
-                .unwrap();
+                // Per-value (shape, dtype), readiness, and channel classes:
+                // what a backend is handed instead of re-inferring. This used
+                // to be dumped twice, once as `PTIB` sidecar hex and once as
+                // the readable lines below; the hex is gone with the format.
                 for stage in pie_plan::compile_bound(b) {
                     let metrics = stage.metrics();
                     writeln!(

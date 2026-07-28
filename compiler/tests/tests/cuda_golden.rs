@@ -446,18 +446,21 @@ fn emit_program_metal_covers_every_family() {
     }
 }
 
-/// `pie_plan::stage_identity` must equal the CUDA driver's
-/// `compiled_stage_identity` byte for byte.
+/// `pie_plan::stage_identity` is a cache key, so it must not move by accident.
 ///
-/// The driver keys its CUDA-graph cache on this value, and a wrong key is
-/// silent: it does not fail, it reuses the wrong graph. So the two
-/// implementations are pinned here while both exist, the same way the emitters
-/// were pinned by `golden-{msl,cuda}/` (`ptir-refactor.md` §3.2). The expected
-/// column was produced by compiling `driver/cuda/src/pipeline/program_identity.hpp`
-/// on the host and running it over `corpus_stages()`; regenerate with
-/// `PTIR_REGEN=1` only after re-deriving it the same way.
+/// A driver keys its graph cache on this value and a wrong key is silent: it
+/// does not fail, it reuses the wrong graph. The expected column was produced
+/// by compiling `driver/cuda/src/pipeline/program_identity.hpp` on the host and
+/// running it over `corpus_stages()`, which is why the file still names it —
+/// but nothing recomputes the value today. That header is gone, and Metal is
+/// *handed* the bytes (`m1_runtime.cpp:1089`, from `interface/driver/src/plan.rs`'s
+/// `identity`). So this is no longer a differential check against C++; it is
+/// the weaker but still necessary thing, a tripwire that an edit to
+/// normalization, signatures, or region partitioning changed a published cache
+/// key. Bump `pie_plan::COMPILER_VERSION` when regenerating, or deployed
+/// devices will keep serving graphs built for the old planner.
 #[test]
-fn stage_identity_matches_the_driver() {
+fn stage_identity_is_pinned() {
     let header = "# GENERATED from driver/cuda/src/pipeline/program_identity.hpp\n\
                   # <golden>#<stage_index> <compiled_stage_identity as hex>\n";
     let mut rendered = String::new();
@@ -482,26 +485,9 @@ fn stage_identity_matches_the_driver() {
         .collect();
     assert_eq!(
         rendered, expected,
-        "pie_plan::stage_identity has diverged from the CUDA driver's \
-         compiled_stage_identity"
+        "pie_plan::stage_identity moved: a published graph-cache key changed, \
+         so pie_plan::COMPILER_VERSION must move with it"
     );
-}
-
-/// Escape hatch for re-deriving `golden-stage-identity.txt` against the C++
-/// driver: `PTIR_DUMP_PLANS=<path> cargo test -p pie-compiler-tests --test
-/// cuda_golden dump_corpus_plans` writes the PTRP wire bytes the host oracle
-/// in `program_identity.hpp` decodes. Not a check; it fails nothing.
-#[test]
-fn dump_corpus_plans() {
-    let Ok(path) = std::env::var("PTIR_DUMP_PLANS") else {
-        return;
-    };
-    let mut out = String::new();
-    for stage in corpus_stages() {
-        let hex: String = stage.wire.iter().map(|b| format!("{b:02x}")).collect();
-        let _ = writeln!(out, "id={} bytes={hex}", stage.id());
-    }
-    std::fs::write(path, out).unwrap();
 }
 
 /// Emit the CUDA kernel table for the traces the driver's own tests register.

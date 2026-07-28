@@ -18,60 +18,60 @@
 === extended_unary#0
 stage_tag: 0x03
 signature: 73b900a6023e5811
-wire: bytes=569 fnv1a64=0x21b31aed55c6ceaa
+plan: lines=16 fnv1a64=0x7dc1df81690c7e45
 fused#0: library=0 library_op=0 schedule=1 nodes=6 inputs=0 outputs=0 sinks=1
 === extended_minmax#0
 stage_tag: 0x03
 signature: bad41330c6565406
-wire: bytes=687 fnv1a64=0x5add6761c202321c
+plan: lines=18 fnv1a64=0x4a62b96ec48fd3d5
 fused#0: library=0 library_op=0 schedule=1 nodes=7 inputs=0 outputs=0 sinks=2
 === extended_predicates#0
 stage_tag: 0x03
 signature: a3180d84d3a0b0a2
-wire: bytes=862 fnv1a64=0x18efc9d47bc4bc36
+plan: lines=22 fnv1a64=0xef02eae38212e9db
 fused#0: library=0 library_op=0 schedule=1 nodes=9 inputs=0 outputs=0 sinks=1
 === extended_transpose_cumsum#0
 stage_tag: 0x03
 signature: 33a1e6bac94bd661
-wire: bytes=689 fnv1a64=0x7440a87aaad8bf37
+plan: lines=18 fnv1a64=0x1ff62bde662880af
 fused#0: library=0 library_op=0 schedule=1 nodes=4 inputs=0 outputs=1 sinks=1
 fused#1: library=1 library_op=3 schedule=3 nodes=1 inputs=1 outputs=1 sinks=0
 fused#2: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
 === extended_gather_scatter#0
 stage_tag: 0x03
 signature: 47cd877f69b3db71
-wire: bytes=743 fnv1a64=0xea34f4192badf0c7
+plan: lines=18 fnv1a64=0x136e7e5d75df6528
 fused#0: library=0 library_op=0 schedule=1 nodes=7 inputs=0 outputs=0 sinks=2
 === extended_rng_stream#0
 stage_tag: 0x03
 signature: c5334e7e4cff1020
-wire: bytes=271 fnv1a64=0x344362ff3eb52936
+plan: lines=8 fnv1a64=0xf366111b84b142b5
 fused#0: library=0 library_op=0 schedule=1 nodes=2 inputs=0 outputs=0 sinks=1
 === extended_hierarchical#0
 stage_tag: 0x03
 signature: 0f2776c5a4dd6d79
-wire: bytes=335 fnv1a64=0xe52361bac45add04
+plan: lines=10 fnv1a64=0x97ac29b5f715a8f8
 fused#0: library=0 library_op=0 schedule=2 nodes=3 inputs=0 outputs=0 sinks=1
 === extended_hidden#0
 stage_tag: 0x03
 signature: 606306b9d45d7b17
-wire: bytes=358 fnv1a64=0xf2a6fb71f077b149
+plan: lines=10 fnv1a64=0x35bf552fd4ea663a
 fused#0: library=0 library_op=0 schedule=1 nodes=3 inputs=0 outputs=0 sinks=1
 === extended_on_attn#0
 stage_tag: 0x02
 signature: f295aab2cb6146e8
-wire: bytes=416 fnv1a64=0xbf4a8b153a4570e7
+plan: lines=12 fnv1a64=0x392967c20a6a49e4
 fused#0: library=0 library_op=0 schedule=1 nodes=4 inputs=0 outputs=0 sinks=2
 === extended_metal_identity#0
 stage_tag: 0x03
 signature: aa86c48194c2c4d0
-wire: bytes=454 fnv1a64=0x3e040736576e661b
+plan: lines=12 fnv1a64=0x7420cdd203418529
 fused#0: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
 fused#1: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=1 sinks=0
 fused#2: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
 === extended_metal_discard#0
 stage_tag: 0x00
 signature: 3dfafd36e271f128
-wire: bytes=298 fnv1a64=0x3770feb5a29b2d1b
+plan: lines=9 fnv1a64=0xa580563d943e6097
 fused#0: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
 fused#1: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=0 sinks=0
