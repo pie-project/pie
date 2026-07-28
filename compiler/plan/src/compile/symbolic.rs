@@ -289,6 +289,17 @@ pub(crate) fn propagate_preserved_dimensions(
     }
 }
 
+/// The normalized SSA id standing in for `original_value`.
+///
+/// Normalization renumbers, so a shape-changing op's operand has to be read
+/// off the *normalized* op rather than the original. The named arms are
+/// exactly the op kinds the four callers in [`symbolic_type_of`] can be
+/// holding; `_` is the case where normalization produced something else
+/// entirely, and there is no renumbering to follow — the original id is what
+/// the caller already has. `the_fallback_is_only_for_a_changed_op_kind` pins
+/// that the seven are read and everything else falls through.
+///
+/// [`symbolic_type_of`]: self::symbolic_type_of
 pub(crate) fn mapped_value(mapped_op: &Op, original_value: u32) -> u32 {
     match mapped_op {
         Op::ReduceSum(value)
@@ -406,4 +417,40 @@ pub(crate) fn symbolic_dims_match_expected(
                             if actual == concrete
                     )
             })
+}
+
+#[cfg(test)]
+mod mapped_value_tests {
+    use super::*;
+
+    /// Every op kind `mapped_value` names reads its own operand; every other
+    /// op falls through to the id the caller already had.
+    ///
+    /// The interesting half is the fallthrough. It is right only because a
+    /// normalized op of a *different* kind carries no renumbering to follow —
+    /// if a new shape-changing op were added and left out of the named set,
+    /// the fallthrough would silently return an id from the pre-normalization
+    /// numbering, and the symbolic type would be read off the wrong value.
+    #[test]
+    fn the_fallback_is_only_for_a_changed_op_kind() {
+        const SENTINEL: u32 = 0xdead;
+        for op in pie_ir::op::representatives() {
+            let named = matches!(
+                op,
+                Op::ReduceSum(..)
+                    | Op::ReduceMax(..)
+                    | Op::ReduceMin(..)
+                    | Op::ReduceArgmax(..)
+                    | Op::Transpose(..)
+                    | Op::Broadcast { .. }
+                    | Op::Reshape { .. }
+            );
+            let got = mapped_value(&op, SENTINEL);
+            assert_eq!(
+                got != SENTINEL,
+                named,
+                "{op:?}: mapped_value returned {got:#x}, named = {named}"
+            );
+        }
+    }
 }

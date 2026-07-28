@@ -740,4 +740,36 @@ mod tests {
         assert!(taint.device_decided.is_empty());
         assert!(taint.host_derivable());
     }
+
+    /// The `_` arm of the fold hands its op to `eval_op` as a pure function of
+    /// already-evaluated operands. That is right for everything the arms above
+    /// do not name — and the arms above name exactly the effectful ops plus
+    /// `IntrinsicVal`.
+    ///
+    /// A new channel or call op would fall into `_` and be folded as if the
+    /// host could perform it, which is how a device-carried value would end up
+    /// classified host-derivable and a pass scheduled that cannot run. The list
+    /// below is a second spelling of the match arms, so it will not drift
+    /// silently: `Op::is_effectful` is exhaustive, so a new effectful op forces
+    /// an edit there, and that edit fails here until the fold names it too.
+    #[test]
+    fn the_fold_only_generalises_over_pure_ops() {
+        for op in pie_ir::op::representatives() {
+            let named_by_the_fold = matches!(
+                op,
+                Op::ChanTake(..)
+                    | Op::ChanRead(..)
+                    | Op::ChanPut { .. }
+                    | Op::KernelCall { .. }
+                    | Op::SinkCall { .. }
+                    | Op::IntrinsicVal { .. }
+            );
+            let must_be_named = op.is_effectful() || matches!(op, Op::IntrinsicVal { .. });
+            assert_eq!(
+                named_by_the_fold, must_be_named,
+                "{op:?} disagrees: the fold names it {named_by_the_fold}, \
+                 but purity says {must_be_named}"
+            );
+        }
+    }
 }
