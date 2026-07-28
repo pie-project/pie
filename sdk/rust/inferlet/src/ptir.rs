@@ -125,16 +125,6 @@ pub struct Channel {
     dtype: DType,
 }
 
-/// Default number of decode fires kept submitted ahead of host consumption.
-///
-/// DEPRECATED IN PRACTICE — do not use in new code. It is a flat constant
-/// standing in for three different quantities (window depth in frames, channel
-/// capacity in cells, and one guest's KV extent in tokens) that only coincide
-/// because [`ForwardPass::submit`] pads to one live slot per frame. Use
-/// [`channel_capacity`] for channel sizing and [`run_ahead`] for window depth;
-/// both are derived by the engine and track `frame_size()` correctly.
-pub const DEFAULT_RUNAHEAD_DEPTH: usize = 2;
-
 /// In-band validity sentinel: a token slot holding `-1` does not exist —
 /// it embeds nothing, appends no KV, and advances no position. Envelope
 /// shapes stay fixed while `-1` decides which slots are real (shape decides
@@ -1225,10 +1215,11 @@ impl Default for Pipeline {
 /// four author-facing wrapper types.
 pub mod prelude {
     pub use super::{
-        Channel, DEFAULT_RUNAHEAD_DEPTH, ForwardPass, PageGrant, Pipeline, RsWorkingSet, TOKEN_PAD,
+        Channel, ForwardPass, PageGrant, Pipeline, RsWorkingSet, TOKEN_PAD,
         WorkingSet, channel_capacity, frame_size, live_slots, max_embed_length, pad_tokens,
         prefill_chunks, run_ahead, submit_frame, unpad_tokens,
     };
+    pub use std::ops::ControlFlow;
     pub use pie_dsl::dtype;
     pub use pie_dsl::intrinsics;
     pub use pie_dsl::value::{

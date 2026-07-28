@@ -6,20 +6,18 @@
 use pie_driver_abi::{
     PIE_DRIVER_ABI_VERSION, PieBytes, PieChannelDesc, PieChannelValueDesc,
     PieChannelValueDescSlice, PieDirectArgmax, PieDirectArgmaxSlice, PieEmittedKernel,
-    PieEmittedKernelSlice, PieEncodeDesc,
-    PieInstanceDesc, PieKvCopyDesc,
-    PieKvMoveCellSlice, PieMaskWordsDesc, PieMutBytes, PiePoolRangeSlice, PiePoolResizeDesc,
-    PieProgramDesc, PieRegionAnalysis, PieRegionAnalysisSlice, PieStateCopyDesc,
-    PieStateCopyRangeSlice, PieTerminalCellPtrSlice, PieU8Slice,
-    PieU32MutSlice, PieU32Slice, PieU64Slice,
+    PieEmittedKernelSlice, PieEncodeDesc, PieInstanceDesc, PieKvCopyDesc, PieKvMoveCellSlice,
+    PieMaskWordsDesc, PieMutBytes, PiePoolRangeSlice, PiePoolResizeDesc, PieProgramDesc,
+    PieRegionAnalysis, PieRegionAnalysisSlice, PieStateCopyDesc, PieStateCopyRangeSlice,
+    PieTerminalCellPtrSlice, PieU8Slice, PieU32MutSlice, PieU32Slice, PieU64Slice,
 };
 
 use super::command::{
     ChannelRegistrationPlan, KvCopyPlan, LaunchPlan, PoolResizePlan, ProgramRegistration,
     StateCopyPlan,
 };
-use super::launch_abi::LaunchPackageBorrow;
 use super::instance::InstanceBindingPlan;
+use super::launch_abi::LaunchPackageBorrow;
 use super::submission::{FrameSubmission, StepSubmission};
 
 fn bytes_slice(bytes: &[u8]) -> PieBytes {

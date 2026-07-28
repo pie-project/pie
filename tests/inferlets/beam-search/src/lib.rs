@@ -77,7 +77,10 @@ async fn main(input: Input) -> Result<String> {
         return Err("beams must be at least 1".into());
     }
     if b > POOL - 1 {
-        return Err(format!("beams exceeds the fixed pool ({} positions)", POOL - 1));
+        return Err(format!(
+            "beams exceeds the fixed pool ({} positions)",
+            POOL - 1
+        ));
     }
     // Bind the width once so the epilogue closure captures a plain `u32`
     // exactly where the old `const B` was substituted.
@@ -252,7 +255,10 @@ async fn main(input: Input) -> Result<String> {
         let page_count = div(add(&filled, PAGE_T - 1), PAGE_T);
         let pages_ig = gather(
             &pids,
-            rem(iota(B * POOL_PAGES), broadcast(&page_count, [B * POOL_PAGES])),
+            rem(
+                iota(B * POOL_PAGES),
+                broadcast(&page_count, [B * POOL_PAGES]),
+            ),
         );
         pages.take();
         pages.put(&pages_ig);
@@ -274,15 +280,8 @@ async fn main(input: Input) -> Result<String> {
     let mut final_scores = vec![f32::NEG_INFINITY; B as usize];
     let mut greedy_mismatches = 0usize;
     if rs_working_sets.is_empty() {
-        let mut submitted = 0usize;
-        let mut in_flight = 0usize;
-        while in_flight < DEFAULT_RUNAHEAD_DEPTH && submitted < max_steps {
-            fwd.submit(&pipeline)
-                .map_err(|e| format!("submit @{submitted}: {e}"))?;
-            submitted += 1;
-            in_flight += 1;
-        }
-        for step in 0..max_steps {
+        let mut step = 0usize;
+        run_ahead(&pipeline, &fwd, max_steps, async || {
             let picked = out
                 .take()
                 .get::<i32>()
@@ -304,16 +303,11 @@ async fn main(input: Input) -> Result<String> {
                 .await
                 .map_err(|e| format!("out_greedy.take @{step}: {e}"))?;
             greedy_mismatches += count_greedy_mismatches(&picked, &greedy, B);
-            in_flight -= 1;
             hypotheses = advance_hypotheses(&hypotheses, &picked, &parents, B)?;
-            if submitted < max_steps {
-                fwd.submit(&pipeline)
-                    .map_err(|e| format!("submit @{submitted}: {e}"))?;
-                submitted += 1;
-                in_flight += 1;
-            }
-        }
-        debug_assert_eq!(in_flight, 0);
+            step += 1;
+            Ok(ControlFlow::Continue(()))
+        })
+        .await?;
     } else {
         for step in 0..max_steps {
             fwd.submit(&pipeline)

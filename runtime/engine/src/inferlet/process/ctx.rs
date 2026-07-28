@@ -348,9 +348,10 @@ impl ProcessCtx {
     pub(crate) fn note_take_returned(&mut self, wake_us: u64) {
         let now = crate::scheduler::fire_timing_now_us();
         if wake_us > 0 {
-            crate::scheduler::GUEST_PHASES
-                .wake_ns
-                .fetch_add(now.saturating_sub(wake_us) * 1_000, std::sync::atomic::Ordering::Relaxed);
+            crate::scheduler::GUEST_PHASES.wake_ns.fetch_add(
+                now.saturating_sub(wake_us) * 1_000,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
         self.last_take_us = now;
     }

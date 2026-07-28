@@ -1,8 +1,9 @@
 //! Naive text completion — the performance control for the algorithm inferlets.
 //!
 //! Structurally identical to every truncation/penalty inferlet in this
-//! directory: one N-wide prefill fire, then a 1-wide device-carried decode
-//! loop kept `DEFAULT_RUNAHEAD_DEPTH` fires ahead of the host drain. The only
+//! directory: one N-wide prefill fire, then a device-carried decode loop
+//! driven by `ptir::run_ahead`, which keeps the engine's run-ahead window
+//! (`model.channel-capacity()`) full ahead of the host drain. The only
 //! difference is the epilogue, which does nothing but temperature-scale the
 //! logits and draw a Gumbel-max sample. Whatever an algorithm inferlet costs
 //! above this number is the algorithm.
@@ -123,10 +124,10 @@ async fn main(input: Input) -> Result<Output> {
         let pages_p = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages_p");
         let page_indptr_p =
             Channel::from(vec![0u32, end.div_ceil(page_size)]).named("page_indptr_p");
-        let w_slot_p = Channel::from((base..end).map(|p| p / page_size).collect::<Vec<_>>())
-            .named("w_slot_p");
-        let w_off_p = Channel::from((base..end).map(|p| p % page_size).collect::<Vec<_>>())
-            .named("w_off_p");
+        let w_slot_p =
+            Channel::from((base..end).map(|p| p / page_size).collect::<Vec<_>>()).named("w_slot_p");
+        let w_off_p =
+            Channel::from((base..end).map(|p| p % page_size).collect::<Vec<_>>()).named("w_off_p");
         let kv_len_p = Channel::from(vec![end]).named("kv_len_p");
         let rng_p = Channel::from(vec![input.seed, 0]).named("rng_p");
         let tok_out_p = Channel::new([1], dtype::i32).named("tok_out_p");
@@ -185,7 +186,6 @@ async fn main(input: Input) -> Result<Output> {
                 .await
                 .map_err(|e| format!("s2 take @{base}: {e}"))?;
         }
-
     }
     generated.push(g0 as u32);
 
@@ -252,15 +252,7 @@ async fn main(input: Input) -> Result<Output> {
         });
 
         let budget = max_tokens - 1;
-        let mut submitted = 0usize;
-        let mut in_flight = 0usize;
-        while in_flight < DEFAULT_RUNAHEAD_DEPTH && submitted < budget {
-            fwd.submit(&pipe)
-                .map_err(|e| format!("decode submit @{}: {e}", submitted + 1))?;
-            submitted += 1;
-            in_flight += 1;
-        }
-        while in_flight > 0 {
+        run_ahead(&pipe, &fwd, budget, async || {
             let t = tok_out
                 .take()
                 .get::<i32>()
@@ -278,15 +270,10 @@ async fn main(input: Input) -> Result<Output> {
                     .await
                     .map_err(|e| format!("s2_out.take @{}: {e}", generated.len()))?;
             }
-            in_flight -= 1;
             generated.push(t as u32);
-            if submitted < budget {
-                fwd.submit(&pipe)
-                    .map_err(|e| format!("decode submit @{}: {e}", submitted + 1))?;
-                submitted += 1;
-                in_flight += 1;
-            }
-        }
+            Ok(ControlFlow::Continue(()))
+        })
+        .await?;
     }
     pipe.close();
 

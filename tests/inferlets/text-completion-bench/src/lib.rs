@@ -447,19 +447,20 @@ async fn run_one(
     //   k=2 cover 3                 median 28654   <- within noise of it
     // So the cover floor is what removes the k = 1 collapse, and it costs
     // k >= 3 nothing (there the frame floor already dominates).
-    let submit_ahead = |mut submitted: usize, drained: usize| -> std::result::Result<usize, String> {
-        let window_fires = live_slots + live_slots.max(3);
-        while submitted < budget && submitted - drained < window_fires {
-            let s = (budget - submitted).min(live_slots);
-            reserve_to_tokens(n + (submitted + s) as u32 + 1)
-                .map_err(|e| format!("reserve decode frame: {e}"))?;
-            let fwd = fwd_d.as_ref().expect("decode pass exists while budget > 0");
-            let slots: Vec<Option<&ForwardPass>> = (0..s).map(|_| Some(fwd)).collect();
-            submit_frame(&pipe, &slots).map_err(|e| format!("decode frame submit: {e}"))?;
-            submitted += s;
-        }
-        Ok(submitted)
-    };
+    let submit_ahead =
+        |mut submitted: usize, drained: usize| -> std::result::Result<usize, String> {
+            let window_fires = live_slots + live_slots.max(3);
+            while submitted < budget && submitted - drained < window_fires {
+                let s = (budget - submitted).min(live_slots);
+                reserve_to_tokens(n + (submitted + s) as u32 + 1)
+                    .map_err(|e| format!("reserve decode frame: {e}"))?;
+                let fwd = fwd_d.as_ref().expect("decode pass exists while budget > 0");
+                let slots: Vec<Option<&ForwardPass>> = (0..s).map(|_| Some(fwd)).collect();
+                submit_frame(&pipe, &slots).map_err(|e| format!("decode frame submit: {e}"))?;
+                submitted += s;
+            }
+            Ok(submitted)
+        };
 
     // Stage the window before the prefill token even arrives — the decode
     // successors ride the queue behind the prefill, off the g0 critical path.

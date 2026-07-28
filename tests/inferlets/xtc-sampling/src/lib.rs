@@ -365,15 +365,7 @@ async fn main(input: Input) -> Result<Output> {
         });
 
         let budget = max_tokens - 1;
-        let mut submitted = 0usize;
-        let mut in_flight = 0usize;
-        while in_flight < DEFAULT_RUNAHEAD_DEPTH && submitted < budget {
-            fwd.submit(&pipe)
-                .map_err(|e| format!("decode submit @{}: {e}", submitted + 1))?;
-            submitted += 1;
-            in_flight += 1;
-        }
-        while in_flight > 0 {
+        run_ahead(&pipe, &fwd, budget as usize, async || {
             let t = tok_out
                 .take()
                 .get::<i32>()
@@ -389,24 +381,18 @@ async fn main(input: Input) -> Result<Output> {
                 .get::<f32>()
                 .await
                 .map_err(|e| format!("s2_out.take @{}: {e}", generated.len()))?[0];
-            in_flight -= 1;
             generated.push(t as u32);
             s1.push(a);
             s2.push(b);
-            if submitted < budget {
-                fwd.submit(&pipe)
-                    .map_err(|e| format!("decode submit @{}: {e}", submitted + 1))?;
-                submitted += 1;
-                in_flight += 1;
-            }
-        }
+            Ok(ControlFlow::Continue(()))
+        })
+        .await?;
     }
     pipe.close();
 
     let mean_s1 = s1.iter().sum::<f32>() / s1.len() as f32;
     let mean_s2 = s2.iter().sum::<f32>() / s2.len() as f32;
     let min_s1 = s1.iter().fold(f32::INFINITY, |a, &b| a.min(b)).max(0.0);
-
 
     Ok(Output {
         sampler: "xtc",

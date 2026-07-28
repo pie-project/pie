@@ -166,7 +166,7 @@ async fn main(input: Input) -> Result<Output> {
     if max_tokens == 0 {
         return Ok(Output {
             sampler: "truncation",
-        mode: input.mode.clone(),
+            mode: input.mode.clone(),
             text: String::new(),
             count: 0,
             epsilon,
@@ -295,7 +295,8 @@ async fn main(input: Input) -> Result<Output> {
             let length = kv_len.take().tensor();
             let r = rng.take();
             let logits = intrinsics::logits();
-            let (token, kept, kmass) = truncation_step(logits, vocab, mode, temperature, epsilon, &r);
+            let (token, kept, kmass) =
+                truncation_step(logits, vocab, mode, temperature, epsilon, &r);
 
             let r_next = add(&r, iota(2));
             let next_length = add(&length, 1u32);
@@ -315,15 +316,7 @@ async fn main(input: Input) -> Result<Output> {
         });
 
         let budget = max_tokens - 1;
-        let mut submitted = 0usize;
-        let mut in_flight = 0usize;
-        while in_flight < DEFAULT_RUNAHEAD_DEPTH && submitted < budget {
-            fwd.submit(&pipe)
-                .map_err(|e| format!("decode submit @{}: {e}", submitted + 1))?;
-            submitted += 1;
-            in_flight += 1;
-        }
-        while in_flight > 0 {
+        run_ahead(&pipe, &fwd, budget as usize, async || {
             let t = tok_out
                 .take()
                 .get::<i32>()
@@ -339,17 +332,12 @@ async fn main(input: Input) -> Result<Output> {
                 .get::<f32>()
                 .await
                 .map_err(|e| format!("mass_out.take @{}: {e}", generated.len()))?[0];
-            in_flight -= 1;
             generated.push(t as u32);
             kept_sizes.push(k);
             kept_mass.push(m);
-            if submitted < budget {
-                fwd.submit(&pipe)
-                    .map_err(|e| format!("decode submit @{}: {e}", submitted + 1))?;
-                submitted += 1;
-                in_flight += 1;
-            }
-        }
+            Ok(ControlFlow::Continue(()))
+        })
+        .await?;
     }
     pipe.close();
 

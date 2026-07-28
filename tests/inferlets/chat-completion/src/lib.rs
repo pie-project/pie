@@ -269,24 +269,15 @@ async fn main(input: Input) -> Result<String> {
     } else {
         max_tokens.saturating_sub(1) // g0 already emitted
     };
-    let mut submitted = 0usize;
-    let mut in_flight = 0usize;
-    while in_flight < DEFAULT_RUNAHEAD_DEPTH && submitted < budget {
-        fwd.submit(&pipe)
-            .map_err(|e| format!("decode submit: {e}"))?;
-        submitted += 1;
-        in_flight += 1;
-    }
-    while !done && in_flight > 0 {
+    run_ahead(&pipe, &fwd, budget, async || {
         let t = out
             .take()
             .get::<i32>()
             .await
             .map_err(|e| format!("out.take: {e}"))?;
-        in_flight -= 1;
         let token = *t.first().unwrap_or(&0) as u32;
         if stop.contains(&token) {
-            break;
+            return Ok(ControlFlow::Break(()));
         }
         match chat_dec.feed(&[token])? {
             chat::Event::Delta(s) => {
@@ -295,26 +286,16 @@ async fn main(input: Input) -> Result<String> {
             }
             chat::Event::Done(s) => {
                 text = s;
-                break;
+                return Ok(ControlFlow::Break(()));
             }
             _ => {}
         }
-        if submitted < budget {
-            fwd.submit(&pipe)
-                .map_err(|e| format!("decode submit: {e}"))?;
-            submitted += 1;
-            in_flight += 1;
-        }
-    }
-    while in_flight > 0 {
-        out.take()
-            .get::<i32>()
-            .await
-            .map_err(|e| format!("drain run-ahead output: {e}"))?;
-        in_flight -= 1;
-    }
-    // Every submitted fire was drained above, so close only releases the
-    // scheduler wait-set and rejects future submissions.
+        Ok(ControlFlow::Continue(()))
+    })
+    .await?;
+    // Any fire still in flight after an early stop is left untaken; close
+    // releases the scheduler wait-set, reclaims them, and rejects further
+    // submissions.
     pipe.close();
 
     Ok(text)

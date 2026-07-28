@@ -205,44 +205,21 @@ async fn main(input: Input) -> Result<String> {
     });
 
     let budget = input.max_tokens.saturating_sub(generated.len());
-    let mut submitted = 0usize;
-    let mut in_flight = 0usize;
-    while in_flight < DEFAULT_RUNAHEAD_DEPTH && submitted < budget {
-        decode
-            .submit(&pipeline)
-            .map_err(|e| format!("attention-sink decode: {e}"))?;
-        submitted += 1;
-        in_flight += 1;
-    }
-    while in_flight > 0 {
+    run_ahead(&pipeline, &decode, budget, async || {
         let token = token_out
             .take()
             .get::<i32>()
             .await
             .map_err(|e| format!("read generated token: {e}"))?[0] as u32;
-        in_flight -= 1;
         if stop_tokens.contains(&token) {
-            break;
+            return Ok(ControlFlow::Break(()));
         }
         generated.push(token);
-        if submitted < budget {
-            decode
-                .submit(&pipeline)
-                .map_err(|e| format!("attention-sink decode: {e}"))?;
-            submitted += 1;
-            in_flight += 1;
-        }
-    }
-    while in_flight > 0 {
-        token_out
-            .take()
-            .get::<i32>()
-            .await
-            .map_err(|e| format!("drain run-ahead token: {e}"))?;
-        in_flight -= 1;
-    }
-    // Every submitted fire was drained above, so close only releases the
-    // scheduler wait-set.
+        Ok(ControlFlow::Continue(()))
+    })
+    .await?;
+    // Any fire still in flight after an early stop is left untaken; close
+    // releases the scheduler wait-set and reclaims them.
     pipeline.close();
     wit_model::decode(&generated)
 }

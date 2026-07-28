@@ -315,9 +315,7 @@ pub(crate) fn fire_timing_full() -> bool {
 /// scheduler look like the bottleneck it is being used to find.
 pub(crate) fn fire_timing_per_fire() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        !std::env::var("PIE_FIRE_TIMING").is_ok_and(|value| value == "waves")
-    })
+    *ENABLED.get_or_init(|| !std::env::var("PIE_FIRE_TIMING").is_ok_and(|value| value == "waves"))
 }
 
 /// Worker-loop phase accumulators, in nanoseconds, summed across every pass

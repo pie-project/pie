@@ -106,10 +106,7 @@ struct Cfg {
 /// `x[i + 1]`, with the final element repeated so the difference vanishes at
 /// the end of the candidate window instead of wrapping.
 fn shift1(x: &Tensor, k: u32) -> Tensor {
-    let idx = min_elem(
-        add(iota(k), 1u32),
-        broadcast(Tensor::constant(k - 1), [k]),
-    );
+    let idx = min_elem(add(iota(k), 1u32), broadcast(Tensor::constant(k - 1), [k]));
     gather(x, &idx)
 }
 
@@ -342,15 +339,7 @@ async fn main(input: Input) -> Result<Output> {
         });
 
         let budget = max_tokens - 1;
-        let mut submitted = 0usize;
-        let mut in_flight = 0usize;
-        while in_flight < DEFAULT_RUNAHEAD_DEPTH && submitted < budget {
-            fwd.submit(&pipe)
-                .map_err(|e| format!("decode submit @{}: {e}", submitted + 1))?;
-            submitted += 1;
-            in_flight += 1;
-        }
-        while in_flight > 0 {
+        run_ahead(&pipe, &fwd, budget as usize, async || {
             let t = tok_out
                 .take()
                 .get::<i32>()
@@ -366,17 +355,12 @@ async fn main(input: Input) -> Result<Output> {
                 .get::<f32>()
                 .await
                 .map_err(|e| format!("s2_out.take @{}: {e}", generated.len()))?[0];
-            in_flight -= 1;
             generated.push(t as u32);
             s1.push(a);
             s2.push(b);
-            if submitted < budget {
-                fwd.submit(&pipe)
-                    .map_err(|e| format!("decode submit @{}: {e}", submitted + 1))?;
-                submitted += 1;
-                in_flight += 1;
-            }
-        }
+            Ok(ControlFlow::Continue(()))
+        })
+        .await?;
     }
     pipe.close();
 

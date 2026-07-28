@@ -160,7 +160,7 @@ fn sliding_window_attention_masked_decode_runs() {
 
 /// Benchmark-inferlet canary — text-completion-bench (the V5 reference
 /// workload): chat-templated prefill, in-graph greedy sampling, device
-/// loop-carried decode submitted `DEFAULT_RUNAHEAD_DEPTH` ahead, exact token
+/// loop-carried decode driven by `ptir::run_ahead`, exact token
 /// accounting in the Return envelope. `ignore_eos` keeps the run at exactly
 /// `max_tokens` (the mock echoes a constant token, which would otherwise
 /// depend on the chat template's stop set).
