@@ -16,12 +16,14 @@ mod canonical;
 mod fold;
 mod lane;
 mod normalize;
+mod nucleus;
 mod region;
 mod signature;
 mod symbolic;
 
 pub use lane::*;
 pub use normalize::*;
+use nucleus::recognize_library_dataflows;
 pub use region::*;
 pub use signature::*;
 pub use symbolic::*;
