@@ -246,6 +246,12 @@ def main() -> None:
     parser.add_argument("--repeats", type=int, default=200)
     parser.add_argument("--warmup", type=int, default=30)
     parser.add_argument("--skip-forward", action="store_true")
+    # Excluding declared names from the generic key removes the commonest
+    # reason a prefix has several readings. Measured with every sequence in the
+    # same parse state it looks like a loss, because it buys nothing there and
+    # costs lexer states; this harness is the one that can tell whether it pays
+    # where a real batch puts its sequences.
+    parser.add_argument("--exact", action="store_true")
     arguments = parser.parse_args()
 
     import gpugrammar
@@ -263,7 +269,9 @@ def main() -> None:
     for schema_index in arguments.schema_index:
         instance = instances[schema_index]
         try:
-            ours = our_compiler.compile_json_schema(instance["schema"])
+            ours = our_compiler.compile_json_schema(
+                instance["schema"], None, arguments.exact
+            )
             theirs = their_compiler.compile_json_schema(instance["schema"])
         except Exception as error:  # noqa: BLE001
             print(f"schema {schema_index}: skipped ({error})")
