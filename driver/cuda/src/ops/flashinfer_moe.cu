@@ -267,15 +267,35 @@ Runner& get_runner() {
                 best_gemm1 = select_first_profile(gemm1, "GEMM1", &defaults.gemm1);
                 best_gemm2 = select_first_profile(gemm2, "GEMM2", &defaults.gemm2);
             } else {
-                // Default: first tactic the runner reports as occupancy-viable.
+                // Default: first tactic the runner reports as occupancy-viable,
+                // with the plain (NONE) epilogue on GEMM2.
                 //
-                // For GEMM2 prefer the FINALIZE epilogue: it folds the topk
-                // weighted reduction (and the unpermute) into the GEMM epilogue
-                // instead of running a separate finalize pass. Measured at GLM
-                // shapes (M=128, H=6144, I=2048, E=8, topk=8) this is 147.0 us
-                // vs 174.6 us for the unfused epilogue -- the single largest
-                // knob on this path. Fall back to any supported tactic if the
-                // fused epilogue is unavailable for this problem.
+                // The alternative, FINALIZE, folds the topk-weighted reduction
+                // and the unpermute into the GEMM epilogue, and in isolation it
+                // is faster: 147.0 us against 174.6 us at GLM's shapes (M=128,
+                // H=6144, I=2048, E=8, topk=8). It is not the default anyway,
+                // because of how it performs that reduction. Each expert's
+                // contribution to a token is committed with
+                // `red.global.add.noftz.bf16x2` -- a hardware reduction-add
+                // straight to global memory, in bf16 (see
+                // cutlass_extensions/arch/copy_red_global.hpp). So the topk sum
+                //
+                //   * accumulates in bf16, rounding after each of the topk
+                //     terms, where the unfused path accumulates in fp32, and
+                //   * adds them in whatever order the CTAs finish in, which is
+                //     not the same order twice.
+                //
+                // The second point makes the whole engine irreproducible: the
+                // same prompt decodes to different tokens on different runs
+                // whenever two logits land within the resulting ~1 ulp. That
+                // was worth paying for a 16% cut of GEMM2 if it showed up end
+                // to end -- it does not. Median of 5 runs on glm5.2-mini, 256
+                // output tokens: 3518.8 vs 3515.8 tok/s at c=8 and 36824.6 vs
+                // 36931.3 at c=128, i.e. a tie at both ends, because GEMM2 is a
+                // small enough slice of the step that 27 us/layer disappears
+                // into it. Determinism and an fp32 reduction for nothing.
+                //
+                // `PIE_NEMOTRON_FLASHINFER_MOE_GEMM2=finalize` opts back in.
                 best_gemm1 = first_supported(
                     *runner, gemm1, std::nullopt,
                     env_index("PIE_NEMOTRON_FLASHINFER_MOE_GEMM1_INDEX"),
@@ -286,7 +306,7 @@ Runner& get_runner() {
                 best_gemm2 = first_supported(
                     *runner, gemm2,
                     gemm2_fusion.value_or(
-                        ce::CutlassGemmConfig::EpilogueFusionType::FINALIZE),
+                        ce::CutlassGemmConfig::EpilogueFusionType::NONE),
                     gemm2_index, "GEMM2", &defaults.gemm2);
                 if (!best_gemm2 && !gemm2_fusion) {
                     best_gemm2 = first_supported(
@@ -608,10 +628,18 @@ TacticPair autotune(RunnerState& s, Runner& runner, const MoeProblem& p,
     auto sweep = [&](const std::vector<ce::CutlassGemmConfig>& configs,
                      bool is_gemm1) {
         int best_idx = is_gemm1 ? best.gemm1 : best.gemm2;
+        if (best_idx < 0 || best_idx >= static_cast<int>(configs.size())) return;
+        // Tune within the chosen epilogue, never across it. Which epilogue
+        // GEMM2 runs decides how the topk sum is accumulated -- fp32 in a
+        // separate pass, or bf16 reduction-adds in CTA completion order (see
+        // `get_runner`) -- so it is a numerics decision, and a tuner chasing a
+        // sub-percent timing difference must not be able to reverse it.
+        const auto fusion = configs[best_idx].epilogue_fusion_type;
         std::vector<std::pair<int, float>> timings;
         timings.reserve(configs.size());
         float fastest = best_ms;
         for (int i = 0; i < static_cast<int>(configs.size()); ++i) {
+            if (configs[i].epilogue_fusion_type != fusion) continue;
             if (runner.queryOccupancyForConfig(configs[i]) <= 0) continue;
             TacticPair cand = best;
             (is_gemm1 ? cand.gemm1 : cand.gemm2) = i;
