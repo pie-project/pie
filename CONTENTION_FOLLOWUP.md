@@ -2816,3 +2816,75 @@ guest rule as well, and costs less staging depth per lane; §20.8's reasons for
 the default are untouched. The finding's real content is that **run-ahead cover
 is a guest responsibility and must be sized in waves, not frames** — any
 inferlet that hard-codes a frame-count window inherits this bug at k = 1.
+
+### 20.11.1 Why the natural "two frames in flight" pattern is not enough
+
+The old rule is the obvious pipelining discipline: submit two frames, then top
+up one frame per frame that drains. It is correct in shape. What it gets wrong
+is the *runway* it leaves, which is easiest to see in steady state:
+
+* a lane holds `W = window_fires` submitted-but-undrained fires;
+* a whole guest frame settles atomically, so `k` fires drain at once and the
+  lane drops to `W - k` outstanding;
+* those `W - k` fires are the lane's runway — `(W - k) * T_wave` of already
+  queued work before the engine has nothing from this lane to seal with.
+
+`W = 2k` therefore leaves a runway of exactly `k` waves *whatever k is*, while
+the thing it has to hide — the host turnaround `H` from settlement to the
+guest's next `submit_frame` — does not shrink with `k` at all. At conc 256,
+`T_wave` is 8.76 ms, so k = 1 gets 8.8 ms of runway and k = 2 gets 17.5 ms.
+Measured `H_max` there is 17-26 ms: k = 2 clears it by a hair, k = 1 does not.
+That is the entire asymmetry.
+
+Note also that a lane running dry is not a lane-local slowdown. The seal is
+wait-for-ALL, so one dry lane stalls the whole cross-lane batch.
+
+### 20.11.2 Guest window vs engine depth — two different "frames"
+
+The word *frame* names two different objects and the distinction is what makes
+the accounting work:
+
+| | guest frame | engine frame (a "batch") |
+| --- | --- | --- |
+| what | `k` fires from ONE lane (`submit_frame`) | one guest frame from EVERY lane |
+| size | `k` waves | `k` waves x N lanes |
+| who caps it | the inferlet, via `window_fires` | the engine, via `configured_max_in_flight()` |
+
+`in_flight_launches` (`scheduler/worker.rs:2105`) is a single deque in the
+scheduler loop, so `configured_max_in_flight()` = 2 is a **global** cap of two
+cross-lane batches posted to the driver — not a per-lane depth. Confirmed by
+the batch arithmetic on 512 x 128 = 65536 output tokens at conc 256: k = 1
+reports 260 batches (252 tok/batch = 256 lanes x 1 wave), k = 2 reports 130
+(504 tok/batch = 256 lanes x 2 waves).
+
+The consequence is that widening the guest window does **not** deepen the
+device pipeline — the driver's depth is fixed by the engine and by
+`kSchedulerMaxInFlight`/`kUploadStagingDepth`. The extra fires simply wait in
+the engine's `pending` queue. That is precisely their job: what the seal gate
+needs is for every lane to *have a fire queued* when it evaluates, and a lane
+whose guest has not resubmitted yet has none.
+
+### 20.11.3 Cover sweep — why 3, and the cost of more
+
+Cover is a time budget (`cover * T_wave` must exceed `H_max`), so it was swept
+against both concurrency and cover. `T_wave` is the per-wave service period,
+`wall / batches / k`:
+
+| conc | `T_wave` | cover 1 | cover 2 | cover 3 | cover 6 |
+| --- | --- | --- | --- | --- | --- |
+| 64 | 3.97 ms | 16357 ok | - | 16276 ok | - |
+| 256 | 8.76 ms | 25184 **multimodal** | 28687 (7/8) | **29044 ok** | 28372 ok |
+| 512 | 16.9 ms | 23269 **collapsed** | 30280 ok | 30256 ok | - |
+
+Reading the failures as a time threshold: conc 64 clears at 3.97 ms of runway,
+conc 256 fails at 8.8 ms and clears at 26.3 ms, conc 512 fails at 16.9 ms and
+clears at 33.8 ms. So `H_max` grows with lane count but *sublinearly relative
+to* `T_wave`, which grows too — and the ratio peaks in the middle. **conc 256
+is the binding point**, needing 3 waves; 512 needs only 2 and 64 needs 1.
+
+More cover is not free, which is why the constant is 3 and not 8. At conc 256
+cover 6 is perfectly stable but measures 28372 against cover 3's 29044, a 2.3%
+loss: a larger window reserves more KV ahead per lane (`reserve_to_tokens`
+covers every submitted fire) and lengthens the queue the scheduler scans each
+seal. Cover 3 is simultaneously the maximum the sweep requires and the optimum
+at the point that requires it.
