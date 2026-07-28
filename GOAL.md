@@ -1059,6 +1059,41 @@ So the replay is the work, and making it cheaper needs a table that does not
 fit rather than a better filter. That is the honest state of the remaining gap
 at small batch, and it is recorded rather than left as an intention.
 
+**Why a mixture costs us (2026-07-28), attributed.** Mixing was measured at up
+to 3.5x for us and about 1x for XGrammar, and two causes were possible: our
+deduplication finds less to share, which is inherent, or our ceilings are
+maxima over the pool, which is not. Four conditions separate them - one schema;
+one schema with the sequences spread over its document so deduplication has as
+little to share; the mixture; and the mixture's *pool* with every sequence
+under one schema, which is the ceilings alone:
+
+| batch 128 | step | distinct states | work items | ns per item |
+|---|---:|---:|---:|---:|
+| one schema | 186 us | 10 | 4,131 | 30.5 |
+| one schema, states spread | 293 | 21 | 9,977 | 22.3 |
+| **8 schemas mixed** | **1,209** | 60 | 45,792 | 36.1 |
+| one schema, mixed pool's ceilings | 191 | 10 | 4,131 | 31.3 |
+
+**The ceilings are almost innocent: 1.06x.** Carrying another grammar's window
+and group count costs essentially nothing, because the sweep enumerates the
+work rather than the ceiling - which is the property this design was rebuilt
+around, now confirmed on the case it was meant for.
+
+What the mixture actually does is *make more work*: 45,792 items against 4,131,
+because eight schemas at sixty distinct parse states have that much more to
+replay. Per item the mixture is 36.1 ns against 22.3, and that 1.6x is the
+whole of the fixable part.
+
+So the mixed penalty is mostly real work and only slightly implementation. That
+is worth knowing before optimising it: **per-grammar ceilings would buy 6%.**
+
+One attempt is recorded as a failure. Five kernels find which configuration
+owns a work item by binary searching the offsets, twelve dependent loads each,
+so the answer was written down once and read instead. It was **twice as slow**:
+the table is sized by the ceiling - rows times the widest state's group count -
+so writing it moves megabytes to save loads that were already in cache. The
+searches stay.
+
 **Host contention (q21).** Weaker than expected and worth saying so. With
 twenty-four cores deliberately saturated, XGrammar's fill slows by 1.06x and
 ours by 1.01x; both engines' p99 degrades to about 3 ms, which is the operating
