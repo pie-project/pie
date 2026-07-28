@@ -11,13 +11,13 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
-
-#include <sys/stat.h>
 
 #include <cuda_bf16.h>
 
 #include "cutlass_fused_moe_kernels.cuh"
+#include "ops/tuning_cache.hpp"
 
 namespace pie_cuda_driver::ops {
 namespace {
@@ -244,8 +244,6 @@ void log_config(const char* name, const ce::CutlassGemmConfig& cfg) {
                  name, config_str(cfg).c_str());
 }
 
-void tactic_cache_load(RunnerState& s);
-
 Runner& get_runner() {
     RunnerState& s = state();
     std::call_once(s.init_once, [&] {
@@ -310,7 +308,6 @@ Runner& get_runner() {
                     "flashinfer CUTLASS MoE: default tactic has no index");
             }
             s.default_tactics = defaults;
-            tactic_cache_load(s);
             s.runner = std::move(runner);
             s.ready = true;
         } catch (...) {
@@ -425,10 +422,7 @@ int autotune_m_bucket(int m) {
 }
 
 std::uint64_t tactic_key(const MoeProblem& p) {
-    auto mix = [](std::uint64_t h, std::uint64_t v) {
-        h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
-        return h;
-    };
+    const auto mix = tuning_hash;
     std::uint64_t h = 0;
     h = mix(h, static_cast<std::uint64_t>(autotune_m_bucket(p.num_rows)));
     h = mix(h, static_cast<std::uint64_t>(p.hidden_size));
@@ -600,8 +594,23 @@ TacticPair autotune(RunnerState& s, Runner& runner, const MoeProblem& p,
                                 arena.stream);
     const float baseline_ms = best_ms;
     int tried = 0;
+    // Sweeps one of the two GEMMs, holding the other at the incumbent.
+    //
+    // The winner is not simply the fastest sample. Dozens of these tactics
+    // land within a percent of each other, so which one records the lowest
+    // time is decided by noise -- and since each tile shape accumulates in a
+    // different order, letting noise pick meant the model's own output could
+    // change between runs on a near-tied token. Instead every candidate within
+    // `kTacticMargin` of the fastest is treated as tied, and the tie is broken
+    // by the candidate's position in the list. That is stable as long as the
+    // *set* of near-optimal tactics is stable, which it is; only the ordering
+    // within it was noisy.
     auto sweep = [&](const std::vector<ce::CutlassGemmConfig>& configs,
                      bool is_gemm1) {
+        int best_idx = is_gemm1 ? best.gemm1 : best.gemm2;
+        std::vector<std::pair<int, float>> timings;
+        timings.reserve(configs.size());
+        float fastest = best_ms;
         for (int i = 0; i < static_cast<int>(configs.size()); ++i) {
             if (runner.queryOccupancyForConfig(configs[i]) <= 0) continue;
             TacticPair cand = best;
@@ -609,16 +618,21 @@ TacticPair autotune(RunnerState& s, Runner& runner, const MoeProblem& p,
             ++tried;
             const float ms = time_tactic(s, runner, p, b, cand, arena.start,
                                          arena.stop, arena.stream);
-            // Only switch on a margin clearly outside run-to-run timing noise.
-            // Dozens of these tactics land within a percent of each other, and
-            // letting noise pick between them makes the choice -- and with it
-            // the GEMM's accumulation order, and so the sampled token on a
-            // near-tie -- differ from run to run.
-            if (ms > 0.0f && (best_ms < 0.0f || ms < best_ms * kTacticMargin)) {
-                best_ms = ms;
-                best = cand;
-            }
+            if (ms <= 0.0f) continue;
+            timings.emplace_back(i, ms);
+            if (fastest < 0.0f || ms < fastest) fastest = ms;
         }
+        if (fastest <= 0.0f) return;
+        const float cutoff = fastest / kTacticMargin;
+        float chosen_ms = best_ms;
+        for (const auto& [i, ms] : timings) {
+            if (ms > cutoff) continue;
+            best_idx = i;
+            chosen_ms = ms;
+            break;
+        }
+        (is_gemm1 ? best.gemm1 : best.gemm2) = best_idx;
+        best_ms = chosen_ms;
     };
     sweep(s.gemm1_tactics, true);
     sweep(s.gemm2_tactics, false);
@@ -638,29 +652,7 @@ TacticPair autotune(RunnerState& s, Runner& runner, const MoeProblem& p,
 }
 
 
-// ---- Tuning cache ---------------------------------------------------------
-//
-// Sweeping 318 tactics takes ~0.3s per shape, and a server sees roughly a
-// dozen shapes (one per CUDA-graph bucket), so an untuned start costs several
-// seconds and perturbs the first requests. Results are keyed by shape and
-// stored as indices into the runner's candidate lists, which is only
-// meaningful for the exact GPU and tactic list that produced them -- so the
-// header pins both, and a mismatch discards the file rather than replaying
-// indices that now name different kernels.
-
-std::string tactic_cache_path() {
-    const char* explicit_path = std::getenv("PIE_MOE_TACTIC_CACHE");
-    if (explicit_path != nullptr && explicit_path[0] != '\0') {
-        return explicit_path;
-    }
-    const char* xdg = std::getenv("XDG_CACHE_HOME");
-    if (xdg != nullptr && xdg[0] != '\0') return std::string(xdg) + "/pie/moe_tactics.txt";
-    const char* home = std::getenv("HOME");
-    if (home == nullptr || home[0] == '\0') return {};
-    return std::string(home) + "/.cache/pie/moe_tactics.txt";
-}
-
-std::string tactic_cache_header(const RunnerState& s) {
+std::string tactic_cache_signature(const RunnerState& s) {
     int device = 0;
     cudaDeviceProp prop{};
     if (cudaGetDevice(&device) != cudaSuccess ||
@@ -676,69 +668,9 @@ std::string tactic_cache_header(const RunnerState& s) {
     return buf;
 }
 
-void tactic_cache_load(RunnerState& s) {
-    if (!autotune_enabled()) return;
-    const std::string path = tactic_cache_path();
-    const std::string want = tactic_cache_header(s);
-    if (path.empty() || want.empty()) return;
-    FILE* f = std::fopen(path.c_str(), "r");
-    if (f == nullptr) return;
-
-    char line[512];
-    bool header_ok = false;
-    if (std::fgets(line, sizeof(line), f) != nullptr) {
-        std::string got(line);
-        while (!got.empty() && (got.back() == '\n' || got.back() == '\r')) {
-            got.pop_back();
-        }
-        header_ok = (got == want);
-    }
-    if (header_ok) {
-        unsigned long long key = 0;
-        int g1 = 0;
-        int g2 = 0;
-        while (std::fscanf(f, "%llx %d %d", &key, &g1, &g2) == 3) {
-            if (g1 < 0 || g2 < 0 ||
-                g1 >= static_cast<int>(s.gemm1_tactics.size()) ||
-                g2 >= static_cast<int>(s.gemm2_tactics.size())) {
-                continue;
-            }
-            s.tuned[static_cast<std::uint64_t>(key)] = TacticPair{g1, g2};
-        }
-    }
-    std::fclose(f);
-    if (!header_ok) {
-        std::remove(path.c_str());
-    } else if (log_enabled()) {
-        std::fprintf(stderr,
-                     "[pie-driver-cuda] FlashInfer MoE loaded %zu tuned shapes "
-                     "from %s\n",
-                     s.tuned.size(), path.c_str());
-    }
-}
-
-void mkdir_parents(const std::string& path) {
-    for (std::size_t i = 1; i < path.size(); ++i) {
-        if (path[i] != '/') continue;
-        ::mkdir(path.substr(0, i).c_str(), 0755);
-    }
-}
-
-void tactic_cache_store(RunnerState& s, std::uint64_t key, const TacticPair& t) {
-    if (t.gemm1 < 0 || t.gemm2 < 0) return;
-    const std::string path = tactic_cache_path();
-    const std::string header = tactic_cache_header(s);
-    if (path.empty() || header.empty()) return;
-    mkdir_parents(path);
-    // Appending (rather than rewriting) keeps concurrent TP ranks from
-    // truncating each other's entries; a duplicate key just loses to whichever
-    // line is read last.
-    FILE* f = std::fopen(path.c_str(), "a");
-    if (f == nullptr) return;
-    if (std::ftell(f) == 0) std::fprintf(f, "%s\n", header.c_str());
-    std::fprintf(f, "%016llx %d %d\n", static_cast<unsigned long long>(key),
-                 t.gemm1, t.gemm2);
-    std::fclose(f);
+TuningCache& tactic_cache(const RunnerState& s) {
+    static TuningCache cache("moe_tactics.txt", tactic_cache_signature(s));
+    return cache;
 }
 
 // Chooses (and on first sight of a shape, measures) the tactic pair for this
@@ -748,11 +680,18 @@ void install_tactics(RunnerState& s, Runner& runner, const MoeProblem& p,
     if (!autotune_enabled()) return;
     const std::uint64_t key = tactic_key(p);
     std::lock_guard<std::mutex> lock(s.tune_mutex);
+    TuningCache& disk = tactic_cache(s);
     auto it = s.tuned.find(key);
     if (it == s.tuned.end()) {
-        const TacticPair chosen = autotune(s, runner, p, b, workspace_bytes);
+        TacticPair chosen{};
+        if (!disk.lookup(key, &chosen.gemm1, &chosen.gemm2) ||
+            chosen.gemm1 < 0 || chosen.gemm2 < 0 ||
+            chosen.gemm1 >= static_cast<int>(s.gemm1_tactics.size()) ||
+            chosen.gemm2 >= static_cast<int>(s.gemm2_tactics.size())) {
+            chosen = autotune(s, runner, p, b, workspace_bytes);
+            disk.store(key, chosen.gemm1, chosen.gemm2);
+        }
         it = s.tuned.emplace(key, chosen).first;
-        tactic_cache_store(s, key, chosen);
     }
     runner.setTactic(s.gemm1_tactics[it->second.gemm1],
                      s.gemm2_tactics[it->second.gemm2]);
