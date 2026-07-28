@@ -303,6 +303,11 @@ namespace {
 // on this list -- each token appends at its own position, and the group barrier
 // below already orders the whole append group ahead of the whole attention
 // group.
+// The tail that exists only to produce a row's logits.
+bool produces_logits(Kernel kind) {
+    return kind == Kernel::QmvLmHead || kind == Kernel::Argmax;
+}
+
 bool carries_cross_token_state(Kernel kind) {
     switch (kind) {
         case Kernel::GdnPrep:
@@ -334,7 +339,8 @@ void encode_prefill_dags_mb(StepEncoder& se,
                             int n_tokens,
                             const DecodeStepPsos& base_psos,
                             const MultiBatchPsos& mb_psos,
-                            bool force_barriers) {
+                            bool force_barriers,
+                            const std::vector<std::uint8_t>& row_needs_logits) {
     const size_t n = n_tokens > 0 ? size_t(n_tokens) : 0;
     if (n == 0 || dags.size() < n) return;
     const size_t length = dags[0].size();
@@ -350,9 +356,15 @@ void encode_prefill_dags_mb(StepEncoder& se,
     // Every group ends in a barrier. Letting the adjacent-group hazard rule
     // relax some of them was measured and moved nothing (93.6ms against 93.0ms):
     // N-way concurrency inside a group already saturates the machine.
+    // lm_head reads the whole output embedding -- 127MB for this checkpoint,
+    // far past any cache -- so running it for a prompt row nobody samples is the
+    // single most expensive wasted dispatch in a prefill.
+    const bool skip_unsampled_logits = row_needs_logits.size() >= n;
     for (size_t i = 0; i < length; ++i) {
         const bool serialize = carries_cross_token_state(dags[0][i].kind);
+        const bool logits_tail = skip_unsampled_logits && produces_logits(dags[0][i].kind);
         for (size_t t = 0; t < n; ++t) {
+            if (logits_tail && row_needs_logits[t] == 0) continue;
             const Dispatch& d = dags[t][i];
             if (d.kind != dags[0][i].kind) {
                 for (size_t k = 0; k < n; ++k)
