@@ -277,46 +277,6 @@ impl<'a> Builder<'a> {
         })
     }
 
-    /// Assemble the raw container WITHOUT lint — for debugging emission.
-    #[doc(hidden)]
-    pub fn debug_container(&self) -> TraceContainer {
-        let rows = self.rows();
-        let (result, channels, names) =
-            crate::model::with_constants(self.vocab, self.page_size, || {
-                context::with_session(|| self.record(rows))
-            });
-        let (stage_results, ports) = result;
-        let channel_decls: Vec<ChannelDecl> = channels
-            .iter()
-            .map(|c| {
-                let st = c.borrow();
-                ChannelDecl {
-                    shape: st.shape,
-                    dtype: ChanDType::Concrete(st.dtype),
-                    capacity: st.capacity,
-                    host_role: HostRole::None,
-                    seeded: st.seeded,
-                }
-            })
-            .collect();
-        let stages = stage_results
-            .into_iter()
-            .map(|r| StageProgram {
-                stage: r.stage,
-                ops: r.ops,
-            })
-            .collect();
-        let mut ports = ports;
-        ports.sort_by_key(|p| p.port as u8);
-        TraceContainer {
-            externs: Vec::new(),
-            names,
-            channels: channel_decls,
-            ports,
-            stages,
-        }
-    }
-
     /// Intern descriptor-port channels + trace each present stage (inside a session).
     fn record(&self, rows: u32) -> (Vec<context::StageResult>, Vec<PortBinding>) {
         let mut ports: Vec<PortBinding> = Vec::new();

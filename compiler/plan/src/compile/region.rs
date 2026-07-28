@@ -445,11 +445,13 @@ pub(crate) fn fused_partition(
             continue;
         }
 
-        if generated.first().is_some_and(|first| {
-            !compatible_schedule(&stage.ops[first.index()], &stage.ops[node.index()])
-        }) {
-            flush_generated_region(stage, index, &mut regions, &mut generated);
-        }
+        // Nothing else can break the run. `compatible_schedule` used to sit
+        // here, refusing to fuse cumsum/cumprod/sort_desc/top_k/matmul with a
+        // neighbour -- but every one of those five is a `library_op_for_tag`
+        // op, so the branch above took them and `continue`d before this line
+        // could see one. It was provably `true`, and read as a scheduling
+        // policy the planner did not have. If a *generated* op ever needs its
+        // own run, the check comes back here, against a table, not a list.
         generated.push(node);
     }
     flush_generated_region(stage, index, &mut regions, &mut generated);
@@ -522,19 +524,6 @@ pub(crate) fn region_kind_for_node(stage: &NormalizedStage, node: NodeIndex) -> 
         Some(library) => RegionKind::Library(library),
         None => RegionKind::Generated,
     }
-}
-
-pub(crate) fn compatible_schedule(first: &Op, next: &Op) -> bool {
-    !matches!(
-        (first, next),
-        (
-            Op::CumSum(_) | Op::CumProd(_) | Op::SortDesc(_) | Op::TopK { .. } | Op::MatMul(_, _),
-            _
-        ) | (
-            _,
-            Op::CumSum(_) | Op::CumProd(_) | Op::SortDesc(_) | Op::TopK { .. } | Op::MatMul(_, _)
-        )
-    )
 }
 
 /// A stage's SSA layout and consumer map, computed once.

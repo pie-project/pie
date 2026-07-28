@@ -21,6 +21,26 @@ use super::fold::{canonicalize_commutative, cse_candidate, cse_key, fold_scalar,
 use super::signature::signature_ports;
 use super::symbolic::{Dimension, SymbolicType, symbolic_result_type};
 
+/// What a normalized value is *about*, coarsely.
+///
+/// Read for meaning by nothing — no emitter, planner or driver branches on it.
+/// It is not dead, though, and deleting it is not a cleanup: it is hashed into
+/// [`StageSignature`](super::signature::StageSignature), whose hash becomes the
+/// emitted kernel's entry-point name (`pie_codegen::program`) and the driver's
+/// pipeline cache key (`launch::build`). So its only observable effect is to
+/// make two stages that agree on every op and type, but disagree here, compile
+/// to differently named kernels that the driver caches apart.
+///
+/// [`the_signature_still_depends_on_value_domains`](self) pins that, because
+/// the effect is invisible from this file and the goldens it moves are dumps of
+/// a C++ oracle that no longer exists — they cannot be re-derived, so this has
+/// to be a decision rather than a discovery.
+///
+/// Two rough edges are recorded rather than fixed, for the same reason:
+/// `PageDescriptor` and `EffectToken` are never produced, and
+/// [`ValueDomain::LibraryResult`] claims four of the seven ops
+/// `region::library_op_for_tag` calls library (cumsum, cumprod and sink_call
+/// fall through to `PerRow`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ValueDomain {
@@ -303,12 +323,8 @@ pub(crate) fn value_domain(bound: &BoundTrace, op: &Op, value_type: &SymbolicTyp
     ) {
         return ValueDomain::LibraryResult;
     }
-    if matches!(
-        op,
-        Op::ReduceSum(_) | Op::ReduceMax(_) | Op::ReduceMin(_) | Op::ReduceArgmax(_)
-    ) {
-        return ValueDomain::PerRow;
-    }
+    // Everything else, reductions included -- they had their own arm returning
+    // exactly this, which read like a rule and was a duplicate.
     ValueDomain::PerRow
 }
 
@@ -351,5 +367,72 @@ pub(crate) fn local_name(global_names: &[String], names: &mut Vec<String>, globa
     } else {
         names.push(name.clone());
         (names.len() - 1) as u16
+    }
+}
+
+#[cfg(test)]
+mod value_domain_tests {
+    use super::*;
+    use crate::compile::signature::stage_signature;
+
+    /// [`ValueDomain`] has no reader that branches on it, so the only thing
+    /// stopping it from being deleted as dead is that the signature hashes it —
+    /// and that hash is the emitted kernel's entry-point name and the driver's
+    /// pipeline cache key. Deleting the field would rename every kernel in
+    /// `golden-{msl,cuda}/`, which are dumps of a C++ oracle that no longer
+    /// exists and cannot be re-derived.
+    ///
+    /// So this makes the dependency visible from the definition: change what
+    /// `value_domain` returns and this fails, instead of a golden diff twenty
+    /// files away.
+    #[test]
+    fn the_signature_still_depends_on_value_domains() {
+        let mut stage = NormalizedStage {
+            stage: Stage::Epilogue,
+            source_op_count: 1,
+            ops: alloc::vec![Op::Iota { len: 4 }],
+            value_types: alloc::vec![SymbolicType {
+                dtype: DType::U32,
+                dims: alloc::vec![Dimension::Static(4)],
+            }],
+            value_domains: alloc::vec![ValueDomain::GeneratedIndex],
+            source_ops: alloc::vec![alloc::vec![0]],
+            channel_bindings: alloc::vec![],
+            names: alloc::vec![],
+        };
+        let bound = super::super::tests::program(0, 1);
+        let before = stage_signature(&bound, &stage).hash;
+        stage.value_domains[0] = ValueDomain::PerRow;
+        assert_ne!(
+            before,
+            stage_signature(&bound, &stage).hash,
+            "the signature stopped hashing value_domains, so the field now \
+             affects nothing at all and should be deleted rather than kept as \
+             an unread enum -- but deleting it renames every emitted kernel"
+        );
+    }
+
+    /// The reduce arm that returned `PerRow` next to a fallthrough that
+    /// returned `PerRow` is gone. This is what says the removal was a no-op, so
+    /// re-adding it as a "rule" is a change to be argued rather than restored.
+    #[test]
+    fn reductions_are_per_row_by_falling_through() {
+        let per_row = SymbolicType {
+            dtype: DType::F32,
+            dims: alloc::vec![Dimension::Static(3), Dimension::Static(5)],
+        };
+        let bound = super::super::tests::program(0, 1);
+        for op in [
+            Op::ReduceSum(0),
+            Op::ReduceMax(0),
+            Op::ReduceMin(0),
+            Op::Add(0, 0),
+        ] {
+            assert_eq!(
+                value_domain(&bound, &op, &per_row),
+                ValueDomain::PerRow,
+                "{op:?}"
+            );
+        }
     }
 }

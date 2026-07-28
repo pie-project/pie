@@ -1,11 +1,18 @@
 //! Planner tests.
 //!
-//! These stay inside the crate rather than moving to `tests/`: most of them
-//! reach for `normalize_stage`, `stage_signature` and the partitioners
-//! directly, which is the point -- they pin the intermediate results, not just
-//! the bytes that come out the far end. The fixtures below (`program`,
-//! `nucleus_program`, `top_k_program`, ...) are shared by nearly all of them,
-//! so they live together here rather than being copied per module.
+//! All twenty-nine of them go through `compile_stage`, the public entry point,
+//! and read the whole `CompiledStage` it returns -- normalized ops, both
+//! partitions, the signature. (This used to claim they reached for
+//! `normalize_stage`, `stage_signature` and the partitioners directly; none of
+//! them did, and describing a strategy the file does not follow is worse than
+//! describing none.)
+//!
+//! What keeps them in-crate is the fixtures: `program`, `nucleus_program`,
+//! `top_k_program` and friends build `BoundTrace`s at a level of detail that is
+//! only readable next to the planner, and `NucleusMutation` is a crate-private
+//! way to bend one of them. They are shared by nearly all the tests, so they
+//! live together here rather than being copied per module -- and
+//! `normalize::value_domain_tests` reaches for `program` too.
 
 use super::*;
 use alloc::vec;
@@ -178,7 +185,7 @@ fn structured_masks_use_remapped_positions_after_dce() {
     }
 }
 
-fn program(prefix_constant: u32, global_channel_offset: usize) -> BoundTrace {
+pub(super) fn program(prefix_constant: u32, global_channel_offset: usize) -> BoundTrace {
     let vocab = 32;
     let mut channels = Vec::new();
     for _ in 0..global_channel_offset {
