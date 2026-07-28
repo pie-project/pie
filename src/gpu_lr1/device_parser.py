@@ -1035,7 +1035,12 @@ def _locate_kernel(
     group_set_offset_ptr,
     group_set_length_ptr,
     set_payload_ptr,
+    verdict_offsets_ptr,
+    verdicts_ptr,
+    verdict_stride_ptr,
     lexer_state_ptr,
+    stack_ptr,
+    stack_depth_ptr,
     config_count_ptr,
     widest_ptr,
     token_ptr,
@@ -1047,6 +1052,8 @@ def _locate_kernel(
     CONFIGS: tl.constexpr,
     GROUP_BLOCK: tl.constexpr,
     SEARCH_STEPS: tl.constexpr,
+    STACK_STRIDE: tl.constexpr,
+    HAS_VERDICTS: tl.constexpr,
 ):
     """Which group holds the sampled token, for each live configuration.
 
@@ -1084,7 +1091,12 @@ def _locate_kernel(
             group_set_offset_ptr,
             group_set_length_ptr,
             set_payload_ptr,
+            verdict_offsets_ptr,
+            verdicts_ptr,
+            verdict_stride_ptr,
             lexer_state_ptr,
+            stack_ptr,
+            stack_depth_ptr,
             token_ptr,
             grammar_ptr,
             bases_ptr,
@@ -1093,6 +1105,8 @@ def _locate_kernel(
             row_index,
             GROUP_BLOCK=GROUP_BLOCK,
             SEARCH_STEPS=SEARCH_STEPS,
+            STACK_STRIDE=STACK_STRIDE,
+            HAS_VERDICTS=HAS_VERDICTS,
         )
         slot = slot + programs
 
@@ -1104,7 +1118,12 @@ def _locate_one(
     group_set_offset_ptr,
     group_set_length_ptr,
     set_payload_ptr,
+    verdict_offsets_ptr,
+    verdicts_ptr,
+    verdict_stride_ptr,
     lexer_state_ptr,
+    stack_ptr,
+    stack_depth_ptr,
     token_ptr,
     grammar_ptr,
     bases_ptr,
@@ -1113,6 +1132,8 @@ def _locate_one(
     row_index,
     GROUP_BLOCK: tl.constexpr,
     SEARCH_STEPS: tl.constexpr,
+    STACK_STRIDE: tl.constexpr,
+    HAS_VERDICTS: tl.constexpr,
 ):
     """Search one configuration's groups for the sampled token."""
     state = tl.load(lexer_state_ptr + row_index)
@@ -1131,6 +1152,23 @@ def _locate_one(
     # loads for the whole block, which is the difference this kernel is made
     # of: it is bound by how many scattered loads it issues, not by arithmetic.
     token = tl.load(token_ptr + sequence)
+    verdict_row = verdicts_ptr
+    verdict_stride = 0
+    if HAS_VERDICTS == 1:
+        verdict_stride = tl.load(
+            verdict_stride_ptr + tl.load(at + _B_VERDICT_STRIDE) + state
+        )
+        depth = tl.load(stack_depth_ptr + row_index)
+        if verdict_stride > 0 and depth > 0:
+            top = tl.load(stack_ptr + row_index * STACK_STRIDE + depth - 1)
+            verdict_row = (
+                verdicts_ptr
+                + tl.load(at + _B_VERDICTS)
+                + tl.load(
+                    verdict_offsets_ptr + tl.load(at + _B_VERDICT_OFFSETS) + state
+                )
+                + top * verdict_stride
+            )
     glane = tl.arange(0, GROUP_BLOCK)
     start = first
     while start < last:
@@ -1170,6 +1208,18 @@ def _locate_one(
         inside = tl.where(
             dense, in_dense, tl.where(complement, found == 0, found)
         ) & live_lane
+        # A group the tables already refused for this parser state cannot be
+        # the one that advances, and on real grammars 91% of them are. Applied
+        # to the decision rather than to the loads, because the loads are
+        # masked already and narrowing them changes what the minimum below
+        # reduces over.
+        if HAS_VERDICTS == 1:
+            if verdict_stride > 0 and depth > 0:
+                at_slot = group - first
+                packed = tl.load(
+                    verdict_row + at_slot // 16, mask=live_lane, other=0
+                )
+                inside = inside & (((packed >> (2 * (at_slot % 16))) & 3) != 1)
 
         if tl.sum(inside.to(tl.int32)) != 0:
             tl.atomic_min(
@@ -1246,6 +1296,14 @@ def _candidate_kernel(
     row_index = block
     while row_index < ROWS:
         group = tl.load(found_ptr + row_index)
+        # Written for every row, not only the ones that found a group. The
+        # count replaced a buffer of flags that was cleared each step, and
+        # clearing is exactly what a row skipped here does not get - so a
+        # configuration whose token is in no group kept whatever count the
+        # previous step left, and the commit read candidates that were not
+        # there. It survived because a row almost always finds a group.
+        if group >= NO_GROUP:
+            tl.store(cand_count_ptr + row_index, 0)
         if group < NO_GROUP:
             sequence = row_index // CONFIGS
             depth = tl.load(stack_depth_ptr + row_index)
@@ -3131,7 +3189,12 @@ class DeviceBatch:
             grammar.group_set_offset,
             grammar.group_set_length,
             grammar.set_payload,
+            grammar.verdict_offsets,
+            grammar.verdicts,
+            grammar.verdict_stride,
             self.lexer_state,
+            self.stack,
+            self.depth,
             self.config_count,
             self.widest,
             self.token,
@@ -3143,6 +3206,8 @@ class DeviceBatch:
             CONFIGS=self.configs,
             GROUP_BLOCK=_GROUP_BLOCK,
             SEARCH_STEPS=grammar.search_steps,
+            STACK_STRIDE=grammar.max_stack,
+            HAS_VERDICTS=grammar.has_verdicts,
         )
         _candidate_kernel[(self.sweep_blocks,)](
             grammar.group_offsets,

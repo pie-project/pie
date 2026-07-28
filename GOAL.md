@@ -1122,9 +1122,10 @@ caught by the corpus.
 | `_mask_kernel` at batch 32 | 36.6 us | **22.5** |
 | whole step, batch 32 | 103.0 | **88.0** |
 | whole step, batch 512 | 149.5 | **135.0** |
-| against XGrammar at batch 32 | 0.82x | **0.92x** |
-| at batch 128 | 2.71x | **2.95x** |
-| at batch 512 | 9.19x | **9.96x** |
+| whole step, batch 512, with the search shortcut too | 149.5 | **116.2** |
+| against XGrammar at batch 32 | 0.82x | **0.94x** |
+| at batch 128 | 2.71x | **3.04x** |
+| at batch 512 | 9.19x | **9.53x** |
 
 The table costs 1.27 MB for the median schema, which is 40-70% of what the rest
 of the tables cost, and it is abandoned above four million words so a
@@ -1132,14 +1133,25 @@ pathological grammar falls back to replaying everything. That trade - memory
 for per-step work - is the same one this whole design makes, applied one level
 down.
 
-The same shortcut applied to the advance's token search is **19 us at batch 512
-and wrong**, and is not in. It gives two corpus schemas more configurations
-than the matcher, by the mechanism that when the advance finds nothing the
-commit retains the previous, larger set - so a group is being refused that
-should not be. The table itself is not the fault: checked exhaustively against
-an actual replay over every (lexer state, parser state, group) of a grammar it
-disagrees nowhere (`files/verify_verdicts.py`). The fault is in how the search
-kernel addresses it, and it is left recorded rather than shipped.
+The same table makes the advance's token search cheaper too - a group already
+refused cannot be the one that advances - and that is another 19 us at batch
+512. Getting there found a latent bug worth more than the microseconds.
+
+The search shortcut made two corpus schemas produce *more* configurations than
+the reference matcher, which is impossible for a change that only removes
+candidates. Four measurements settled it: the table agrees with an actual
+replay over every (lexer state, parser state, group) of a grammar
+(`files/verify_verdicts.py`); the plumbing with a filter that cannot match
+passes all 591 corpus steps; the filter provably only ever turns "found group
+75" into "found nothing"; and yet the answer grew.
+
+The cause was in an earlier change of ours. Replacing the per-slot candidate
+flags with a per-configuration count removed a 2 MB clear from every step - but
+`_candidate_kernel` writes the count *inside* the branch that runs when a group
+was found, so a configuration whose token is in no group kept the count the
+previous step left behind, and the commit read candidates that were not there.
+It survived because a configuration almost always finds a group. The search
+shortcut made that common, and that is how it surfaced.
 
 **Host contention (q21).** Weaker than expected and worth saying so. With
 twenty-four cores deliberately saturated, XGrammar's fill slows by 1.06x and
