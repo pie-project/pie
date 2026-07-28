@@ -391,6 +391,98 @@ impl Op {
         }
     }
 
+    /// This op's [`Family`], read from [`OP_TABLE`].
+    ///
+    /// The family is a fact about the op's shape on the wire, so a pass that
+    /// keys on "is this a channel op" should ask here rather than restate a
+    /// variant list that can fall behind the table.
+    pub fn family(&self) -> Family {
+        match family_of(self.tag()) {
+            Some(family) => family,
+            // Same argument as `result_count`: `tag()` is exhaustive over
+            // `Op`, and every tag has a row.
+            None => unreachable!("op tag has no OP_TABLE row"),
+        }
+    }
+
+    /// True when the op must survive dead-code elimination even if nothing
+    /// reads its results, and must never be merged with an identical
+    /// neighbour by CSE.
+    ///
+    /// Two things qualify: touching a channel (`take` pops; `read` and `put`
+    /// order against its contents) and calling second-party code.
+    ///
+    /// `IntrinsicVal` is deliberately absent — it names a device-provided
+    /// value such as the logits, so two of them *are* the same value and
+    /// merging them is correct. So is `Rng`: within one fire it is a function
+    /// of its stream and shape, which is why `pareval` can call it
+    /// device-decided (the host does not know the ambient seed) while CSE
+    /// still merges it. Taint and purity are different questions.
+    ///
+    /// Exhaustive on purpose. `fold::cse_candidate` and `normalize::live_ops`
+    /// each carried this list; a new channel or call op missing from either
+    /// would be quietly deleted by DCE or folded away by CSE.
+    pub fn is_effectful(&self) -> bool {
+        match self {
+            Op::ChanTake(..)
+            | Op::ChanRead(..)
+            | Op::ChanPut { .. }
+            | Op::KernelCall { .. }
+            | Op::SinkCall { .. } => true,
+
+            Op::Const(..)
+            | Op::Exp(..)
+            | Op::Log(..)
+            | Op::Neg(..)
+            | Op::Recip(..)
+            | Op::Abs(..)
+            | Op::Sign(..)
+            | Op::Cast { .. }
+            | Op::Add(..)
+            | Op::Sub(..)
+            | Op::Mul(..)
+            | Op::Div(..)
+            | Op::MaxElem(..)
+            | Op::MinElem(..)
+            | Op::Rem(..)
+            | Op::Gt(..)
+            | Op::Ge(..)
+            | Op::Eq(..)
+            | Op::Ne(..)
+            | Op::Lt(..)
+            | Op::Le(..)
+            | Op::And(..)
+            | Op::Or(..)
+            | Op::Not(..)
+            | Op::Select { .. }
+            | Op::ReduceSum(..)
+            | Op::ReduceMax(..)
+            | Op::ReduceMin(..)
+            | Op::ReduceArgmax(..)
+            | Op::Broadcast { .. }
+            | Op::Reshape { .. }
+            | Op::Transpose(..)
+            | Op::CumSum(..)
+            | Op::CumProd(..)
+            | Op::SortDesc(..)
+            | Op::TopK { .. }
+            | Op::PivotThreshold { .. }
+            | Op::MatMul(..)
+            | Op::Gather { .. }
+            | Op::GatherRow { .. }
+            | Op::ScatterAdd { .. }
+            | Op::ScatterSet { .. }
+            | Op::Iota { .. }
+            | Op::MaskApply { .. }
+            | Op::CausalMask { .. }
+            | Op::SlidingWindowMask { .. }
+            | Op::SinkWindowMask { .. }
+            | Op::Rng { .. }
+            | Op::RngKeyed { .. }
+            | Op::IntrinsicVal { .. } => false,
+        }
+    }
+
     /// The value ids this op reads, in a stable order (immediates excluded;
     /// the value-id predicate operands of `PivotThreshold` included).
     pub fn operands(&self) -> Vec<ValueId> {

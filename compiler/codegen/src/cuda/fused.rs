@@ -45,20 +45,53 @@ pub const PTIR_INTRINSIC_SLOTS: u32 = 8;
 
 const DT_F32: u8 = 0;
 
-/// The ops the runtime has a block-parallel elementwise helper for.
+/// The ops `ptir_parallel_elementwise` in `fused_block0.cuh` has an arm for.
+///
+/// Answering `true` for a tag that helper does not handle is not a fallback —
+/// the helper's dispatch chain simply runs off the end of the loop body,
+/// writing nothing, and the region goes on with an untouched output buffer and
+/// a clean status word. The single-thread path this competes with ends in
+/// `m1_fault(status, p.tag)`, so being wrong in the other direction is loud.
+///
+/// Hence the explicit list (it used to be `EXP..=CAST` and `ADD..=SELECT`,
+/// which would absorb any tag allocated into a gap) and hence
+/// `parallel_elementwise_matches_the_cuda_runtime`, which reads the arms back
+/// out of the `.cuh` and fails if the two sides disagree either way.
 fn parallel_elementwise(tag: u8) -> bool {
-    (tags::EXP..=tags::CAST).contains(&tag)
-        || (tags::ADD..=tags::SELECT).contains(&tag)
-        || matches!(
-            tag,
-            tags::IOTA
-                | tags::MASK_APPLY_PACKED
-                | tags::CAUSAL_MASK
-                | tags::SLIDING_WINDOW_MASK
-                | tags::SINK_WINDOW_MASK
-                | tags::RNG
-                | tags::RNG_KEYED
-        )
+    matches!(
+        tag,
+        tags::EXP
+            | tags::LOG
+            | tags::NEG
+            | tags::RECIP
+            | tags::ABS
+            | tags::SIGN
+            | tags::CAST
+            | tags::ADD
+            | tags::SUB
+            | tags::MUL
+            | tags::DIV
+            | tags::MAX_ELEM
+            | tags::MIN_ELEM
+            | tags::GT
+            | tags::GE
+            | tags::EQ
+            | tags::NE
+            | tags::LT
+            | tags::LE
+            | tags::AND
+            | tags::OR
+            | tags::NOT
+            | tags::REM
+            | tags::SELECT
+            | tags::IOTA
+            | tags::MASK_APPLY_PACKED
+            | tags::CAUSAL_MASK
+            | tags::SLIDING_WINDOW_MASK
+            | tags::SINK_WINDOW_MASK
+            | tags::RNG
+            | tags::RNG_KEYED
+    )
 }
 
 /// A value's row decomposition: everything but the trailing dim is rows.
@@ -599,4 +632,38 @@ fn emit_chan_put(source: &mut String, op: &OpView, a0: &str, o0: &str) {
     );
     source.push_str("      }\n");
     source.push_str("    }\n");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime_scan::{function_body, tags_compared_in};
+    use alloc::collections::BTreeSet;
+
+    /// `parallel_elementwise` is a claim about C++ that the C++ cannot check:
+    /// the helper's dispatch runs off the end for a tag it does not know,
+    /// leaving the output buffer untouched and the status word clean. So the
+    /// two lists are compared here instead.
+    #[test]
+    fn parallel_elementwise_matches_the_cuda_runtime() {
+        let handled = tags_compared_in(function_body(PROLOGUE, "ptir_parallel_elementwise"));
+        let claimed: BTreeSet<u8> = pie_ir::op::OP_TABLE
+            .iter()
+            .map(|spec| spec.tag)
+            .filter(|tag| parallel_elementwise(*tag))
+            .collect();
+        let name = |tag: &u8| pie_ir::op::spec(*tag).map_or("?", |spec| spec.name);
+        let unhandled: Vec<&str> = claimed.difference(&handled).map(name).collect();
+        let unclaimed: Vec<&str> = handled.difference(&claimed).map(name).collect();
+        assert!(
+            unhandled.is_empty(),
+            "emitted to ptir_parallel_elementwise but not handled there \
+             (these write nothing, silently): {unhandled:?}"
+        );
+        assert!(
+            unclaimed.is_empty(),
+            "handled by ptir_parallel_elementwise but never emitted to it \
+             (dead runtime code, or a missing tag in parallel_elementwise): {unclaimed:?}"
+        );
+    }
 }

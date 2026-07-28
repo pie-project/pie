@@ -31,3 +31,14 @@ pub fn singleton_runtime_source() -> String {
     source.push_str(BODY);
     source
 }
+
+#[cfg(test)]
+mod tests {
+    use super::BODY;
+    use crate::runtime_scan::assert_execute_covers_the_table;
+
+    #[test]
+    fn cuda_execute_covers_the_op_table() {
+        assert_execute_covers_the_table(BODY, "ptir_m1_runtime_body.cuh");
+    }
+}

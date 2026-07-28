@@ -50,4 +50,6 @@ pub mod op_view;
 pub mod program;
 pub mod region_analysis;
 pub mod rng;
+#[cfg(test)]
+mod runtime_scan;
 pub mod slots;

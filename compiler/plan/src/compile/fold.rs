@@ -181,15 +181,10 @@ pub(crate) fn canonicalize_commutative(op: &mut Op, result_type: Option<&Symboli
     }
 }
 
+/// CSE may merge two identical ops only when neither has an effect, since
+/// merging removes one of them. [`Op::is_effectful`] owns that list.
 pub(crate) fn cse_candidate(op: &Op) -> bool {
-    !matches!(
-        op,
-        Op::ChanTake(_)
-            | Op::ChanRead(_)
-            | Op::ChanPut { .. }
-            | Op::KernelCall { .. }
-            | Op::SinkCall { .. }
-    )
+    !op.is_effectful()
 }
 
 pub(crate) fn cse_key(op: &Op, result_types: &[SymbolicType]) -> Vec<u8> {

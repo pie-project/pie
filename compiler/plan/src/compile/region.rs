@@ -9,7 +9,7 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec;
 use alloc::vec::Vec;
 
-use pie_ir::op::{ChannelIndex, Op};
+use pie_ir::op::{ChannelIndex, Family, Op};
 use pie_ir::types::{DType, Literal, Predicate, RngKind, ValueId};
 
 use super::normalize::{NodeIndex, NormalizedStage, result_layout};
@@ -637,12 +637,17 @@ pub(crate) fn build_region(
     let schedule = match kind {
         RegionKind::Library(_) => ScheduleTemplate::Library,
         RegionKind::Generated => {
-            let has_compute = nodes.iter().any(|node| {
-                !matches!(
-                    stage.ops[node.index()],
-                    Op::ChanTake(_) | Op::ChanRead(_) | Op::ChanPut { .. } | Op::SinkCall { .. }
-                )
-            });
+            // A generated region that is nothing but channel traffic gets
+            // the effects-only schedule. `Family::Channel` is the whole
+            // answer here: `library_op_for_tag` already routed `kernel_call`
+            // and `sink_call` to `RegionKind::Library`, so the only ops that
+            // can reach this arm and emit no arithmetic are the channel ops.
+            // The variant list this replaces named `sink_call` (unreachable)
+            // and omitted `kernel_call` (also unreachable) — two mistakes
+            // that cancelled, and would not have next time.
+            let has_compute = nodes
+                .iter()
+                .any(|node| stage.ops[node.index()].family() != Family::Channel);
             let hierarchical = nodes.iter().any(|node| {
                 let op = &stage.ops[node.index()];
                 if !matches!(

@@ -255,14 +255,9 @@ pub(crate) fn live_ops(
     let mut keep = vec![false; stage_program.ops.len()];
     let mut values = Vec::new();
     for (op_index, op) in stage_program.ops.iter().enumerate() {
-        if matches!(
-            op,
-            Op::ChanTake(_)
-                | Op::ChanRead(_)
-                | Op::ChanPut { .. }
-                | Op::KernelCall { .. }
-                | Op::SinkCall { .. }
-        ) {
+        // DCE roots at the effectful ops: everything else is kept only
+        // because one of these reaches it.
+        if op.is_effectful() {
             keep[op_index] = true;
             values.extend(op.operands());
         }

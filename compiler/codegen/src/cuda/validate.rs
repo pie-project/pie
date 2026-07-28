@@ -9,7 +9,9 @@ use alloc::string::{String, ToString};
 use pie_ir::op::Op;
 use pie_ir::registry::Stage;
 use pie_ir::types::DType;
-use pie_plan::{CompiledStage, NodeIndex, Region, RegionKind, ScheduleTemplate};
+use pie_plan::{
+    CompiledStage, NodeIndex, Region, RegionKind, ScheduleTemplate, library_op_for_tag,
+};
 
 /// `second_party_region_supported` — `envelope_dot` is the only second-party
 /// kernel this backend launches, so anything else fails at bind rather than
@@ -83,7 +85,13 @@ pub fn validate_generated_region(stage: &CompiledStage, region: &Region) -> Resu
             return Err("generated region nodes are invalid or unordered".to_string());
         }
         let op = &stage.normalized.ops[node.index()];
-        if matches!(op, Op::KernelCall { .. } | Op::SinkCall { .. }) {
+        // Asked through the same classifier `region_kind_for_node` used to
+        // build the region, so the check cannot disagree with the decision it
+        // is checking. The variant list this replaces named `kernel_call` and
+        // `sink_call` only, and would have let a fused `top_k`, `sort_desc`,
+        // `cumsum`, `cumprod` or `matmul` through to an emitter with no arm
+        // for it.
+        if library_op_for_tag(op.tag()).is_some() {
             return Err("generated region contains a non-generated boundary".to_string());
         }
         previous = node;

@@ -105,6 +105,13 @@ struct M3RowMeta {
 
 #[cfg(test)]
 mod tests {
+    use crate::runtime_scan::assert_execute_covers_the_table;
+
+    #[test]
+    fn metal_execute_covers_the_op_table() {
+        assert_execute_covers_the_table(super::RUNTIME_TEMPLATE, "ptir_m1_runtime.metal");
+    }
+
     use super::*;
 
     /// `ptir_m1_grouped.metal` exists because the Metal driver's
