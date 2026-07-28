@@ -30,6 +30,42 @@
       "instrs_before": 45,
       "instrs_after": 31,
       "rewrites": 14
+    },
+    {
+      "pass": "slab-scatter-arena-writes",
+      "instrs_before": 31,
+      "instrs_after": 31,
+      "rewrites": 0
+    },
+    {
+      "pass": "merge-adjacent-extent-writes",
+      "instrs_before": 31,
+      "instrs_after": 31,
+      "rewrites": 0
+    },
+    {
+      "pass": "recompute-memory-plan",
+      "instrs_before": 31,
+      "instrs_after": 31,
+      "rewrites": 0
+    },
+    {
+      "pass": "validate-fill-order",
+      "instrs_before": 31,
+      "instrs_after": 31,
+      "rewrites": 0
+    },
+    {
+      "pass": "validate-target-support",
+      "instrs_before": 31,
+      "instrs_after": 31,
+      "rewrites": 0
+    },
+    {
+      "pass": "validate-persistent-layout",
+      "instrs_before": 31,
+      "instrs_after": 31,
+      "rewrites": 0
     }
   ],
   "files": [

@@ -30,9 +30,11 @@ struct LoadPlanResult {
 /// `WeightStore` is addressed by.
 ///
 /// Only a translation. The pairing itself used to be *inferred* here by matching
-/// name suffixes over the plan's tensor list — guessing at something the loader
-/// already knew, since it is what named the scale tensor in the first place. The
-/// plan now states it (`loader/src/load_plan.rs`, `derive_quant_attachments`).
+/// name suffixes over the plan's tensor list, and then, for a while, by matching
+/// them one layer earlier inside the loader. It is now recorded by whoever
+/// declares the scale tensor: `plan/build.rs::quant_metadata_outputs` for scales
+/// the loader writes, and the contract's `scales` field — see
+/// `dsv4_block_scales_to_fp32` -- for scales the checkpoint shipped.
 inline std::vector<RustQuantAttachment> resolve_quant_attachments(
     const pie_loader::LoadPlanView& view) {
     std::unordered_map<std::uint32_t, pie_loader::PieLoaderBytes> names;

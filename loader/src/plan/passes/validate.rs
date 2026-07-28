@@ -26,6 +26,15 @@ use crate::types::{BufferId, QuantScheme, RepackLayout};
 /// late and the plan still validates, still has the right instruction count,
 /// and hands back a tensor whose padded region has eaten real data. Passes
 /// that reorder are free to move fills as long as this holds.
+///
+/// Two kinds of write have to be matched to a fill, and only one of them names
+/// a buffer. `ExtentWrite` and `TileMap` carry [`BufferId`]s, so the match is a
+/// lookup. `BulkExtentWrite` and `SlabScatter` address the persistent arena
+/// directly — coalescing is what turns a buffer-relative write into an
+/// arena-relative one, and it may fold several buffers into a single copy — so
+/// they are matched by *overlap* against the arena window each filled buffer
+/// owns. That is also the only formulation that stays right once a bulk write
+/// spans more than one buffer.
 pub(super) fn validate_fill_order(program: &mut LoadPlan) -> Result<usize> {
     let mut filled: HashMap<BufferId, usize> = HashMap::new();
     for (at, id) in program.schedule.iter().enumerate() {
@@ -36,38 +45,92 @@ pub(super) fn validate_fill_order(program: &mut LoadPlan) -> Result<usize> {
     if filled.is_empty() {
         return Ok(0);
     }
+
+    let mut windows = Vec::new();
+    for (buffer, fill_at) in &filled {
+        let decl = program.buffer(*buffer)?;
+        let Some(start) = decl.persistent_offset else {
+            continue;
+        };
+        windows.push(FilledWindow {
+            start,
+            end: start
+                .checked_add(decl.bytes)
+                .or_overflow("filled persistent buffer window overflow")?,
+            buffer: *buffer,
+            fill_at: *fill_at,
+        });
+    }
+    // `filled` is a map, so its iteration order is not stable; sorting keeps the
+    // reported violation the same one on every run.
+    windows.sort_by_key(|window| (window.start, window.buffer.0));
+
     for (at, id) in program.schedule.iter().enumerate() {
         let instr = instr_by_id(&program.instrs, *id)?;
-        let buffer = match instr {
-            StorageInstr::ExtentWrite { dest, .. } => dest.buffer,
-            StorageInstr::BulkExtentWrite { .. } | StorageInstr::SlabScatter { .. } => {
-                // Arena-relative: the destination is an offset, not a buffer,
-                // so any fill of a persistent buffer could overlap it.
-                match filled.keys().find(|buffer| {
-                    program
-                        .buffer(**buffer)
-                        .is_ok_and(|decl| decl.persistent_offset.is_some())
-                }) {
-                    Some(buffer) => *buffer,
-                    None => continue,
+
+        // Writes that name their destination.
+        let named: &[BufferId] = match instr {
+            StorageInstr::ExtentWrite { dest, .. } => std::slice::from_ref(&dest.buffer),
+            StorageInstr::TileMap { outputs, .. } => outputs.as_slice(),
+            _ => &[],
+        };
+        for buffer in named {
+            if let Some(fill_at) = filled.get(buffer)
+                && *fill_at > at
+            {
+                return Err(late_fill(*buffer, at, *fill_at));
+            }
+        }
+
+        // Writes that name an arena offset.
+        match instr {
+            StorageInstr::BulkExtentWrite {
+                source,
+                dest_offset,
+                ..
+            } => check_arena_write(&windows, *dest_offset, source.span_bytes, at)?,
+            StorageInstr::SlabScatter { placements, .. } => {
+                for placement in placements {
+                    check_arena_write(&windows, placement.dest_offset, placement.bytes, at)?;
                 }
             }
-            StorageInstr::TileMap { outputs, .. } => match outputs.first() {
-                Some(buffer) => *buffer,
-                None => continue,
-            },
-            _ => continue,
-        };
-        if let Some(fill_at) = filled.get(&buffer)
-            && *fill_at > at
-        {
-            return Err(Error::Internal(format!(
-                "buffer {} is written at step {at} but not zeroed until step {fill_at}",
-                buffer.0
-            )));
+            _ => {}
         }
     }
     Ok(0)
+}
+
+/// A zeroed persistent buffer, as the arena window it owns.
+struct FilledWindow {
+    start: u64,
+    end: u64,
+    buffer: BufferId,
+    fill_at: usize,
+}
+
+/// Refuse an arena-relative write that lands in a buffer zeroed after it.
+fn check_arena_write(
+    windows: &[FilledWindow],
+    dest_offset: u64,
+    bytes: u64,
+    at: usize,
+) -> Result<()> {
+    let end = dest_offset
+        .checked_add(bytes)
+        .or_overflow("arena write window overflow")?;
+    for window in windows {
+        if dest_offset < window.end && window.start < end && window.fill_at > at {
+            return Err(late_fill(window.buffer, at, window.fill_at));
+        }
+    }
+    Ok(())
+}
+
+fn late_fill(buffer: BufferId, at: usize, fill_at: usize) -> Error {
+    Error::Internal(format!(
+        "buffer {} is written at step {at} but not zeroed until step {fill_at}",
+        buffer.0
+    ))
 }
 
 pub(super) fn validate_target_support(program: &mut LoadPlan) -> Result<usize> {

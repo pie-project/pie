@@ -40,12 +40,12 @@ use crate::plan::geometry::{
     strided_physical_source_bytes,
 };
 use crate::plan::{
-    BufferDecl, CheckpointFileDecl, DestExtent, LoadPlan, SourceExtent, SourceTensorDecl,
-    StorageInstr, StorageTarget, TileMapKind, TileSpec, TransformSpec,
+    BufferDecl, CheckpointFileDecl, DestExtent, LoadPlan, QuantAttachment, SourceExtent,
+    SourceTensorDecl, StorageInstr, StorageTarget, TileMapKind, TileSpec, TransformSpec,
 };
 use crate::types::{
-    BufferId, DType, Encoding, InstrId, QuantScheme, RepackSpec, TensorDecl, TensorId,
-    encoding_dense_element_bytes, encoding_nbytes,
+    BufferId, DType, Encoding, InstrId, QuantGranularity, QuantScheme, RepackSpec, ScaleForm,
+    TensorDecl, TensorId, encoding_dense_element_bytes, encoding_nbytes,
 };
 
 /// How many contiguous stretches one expression may break into before the
@@ -100,6 +100,7 @@ pub fn build(
         })
         .collect();
 
+    let mut declared_at: HashMap<&str, TensorId> = HashMap::new();
     for (index, tensor) in contract.tensors.iter().enumerate() {
         // Rejected here rather than left to collide downstream: two entries
         // under one name would each publish a value and each be finalized, and
@@ -111,6 +112,40 @@ pub fn build(
             )));
         }
         builder.tensor(tensor, TensorId(index as u32))?;
+        declared_at.insert(tensor.name.as_str(), TensorId(index as u32));
+    }
+
+    // Resolved after every declaration, not against the ones before it:
+    // `Scales` pairs two published tensors rather than feeding one into the
+    // other, so it carries none of the ordering `Expr::Out` needs — and the one
+    // authoring site in the tree, `dsv4_block_scales_to_fp32`, runs before the
+    // pass that publishes the weights it names.
+    for (index, tensor) in contract.tensors.iter().enumerate() {
+        let Some(scales) = &tensor.scales else {
+            continue;
+        };
+        let Some(&of) = declared_at.get(scales.of.as_str()) else {
+            return Err(Error::Contract(format!(
+                "'{}' holds the scales for '{}', which the contract does not declare",
+                tensor.name, scales.of
+            )));
+        };
+        if builder.program.attachments.iter().any(|a| a.tensor == of) {
+            return Err(Error::Contract(format!(
+                "'{}' holds the scales for '{}', which already has scales; a weight the \
+                 loader quantizes gets the scales the loader writes, so the contract must \
+                 not name a second set",
+                tensor.name, scales.of
+            )));
+        }
+        builder.program.attachments.push(QuantAttachment {
+            tensor: of,
+            scale_tensor: TensorId(index as u32),
+            granularity: scales.granularity,
+            group_size: scales.group_size,
+            channel_axis: scales.channel_axis,
+            scale_form: scales.form,
+        });
     }
     Ok(builder.program)
 }
@@ -270,7 +305,10 @@ impl Builder<'_> {
                         tensor_id: source.tensor_id,
                         shape: decl.shape.clone(),
                         encoding: decl.encoding.clone(),
-                        offset_bytes: source.offset_bytes + rect.src_offset,
+                        offset_bytes: source
+                            .offset_bytes
+                            .checked_add(rect.src_offset)
+                            .or_overflow("source view offset")?,
                         stride,
                     }));
                 }
@@ -309,13 +347,17 @@ impl Builder<'_> {
                     let raw = self.raw(source.tensor_id)?;
                     let (file_id, tensor_id, base) = (raw.file_id, raw.id, raw.file_offset);
                     let (src_stride, dst_stride) = rect.split()?;
+                    let file_offset = base
+                        .checked_add(source.offset_bytes)
+                        .and_then(|at| at.checked_add(rect.src_offset))
+                        .or_overflow("source extent file offset")?;
                     let instr = self.next_instr();
                     self.program.instrs.push(StorageInstr::ExtentWrite {
                         id: instr,
                         source: SourceExtent {
                             file_id,
                             tensor_id,
-                            file_offset: base + source.offset_bytes + rect.src_offset,
+                            file_offset,
                             span_bytes: rect.bytes(),
                             stride: src_stride,
                         },
@@ -664,31 +706,52 @@ impl Builder<'_> {
         if decl.shape.len() != 2 {
             return Vec::new();
         }
-        let (name, shape, encoding) = match spec.scheme {
-            QuantScheme::Fp8E4M3 | QuantScheme::Int8Symmetric => (
-                format!("{}_scale_inv", contract.name),
-                vec![decl.shape[0]],
-                Encoding::Raw(DType::F32),
-            ),
-            QuantScheme::Mxfp4E2M1E8M0 => {
-                // E8M0 block scale: one uint8 per 32-element block along K. The
-                // encode-tile kernel writes a row-major `[rows, cols/32]` byte
-                // tensor. The name matches GPT-OSS so downstream lookups of
-                // `*.weight_scale` find it.
-                let cols = decl.shape[1];
-                if cols % 32 != 0 {
-                    return Vec::new();
+        let (name, shape, encoding, granularity, group_size, channel_axis, scale_form) =
+            match spec.scheme {
+                QuantScheme::Fp8E4M3 | QuantScheme::Int8Symmetric => (
+                    format!("{}_scale_inv", contract.name),
+                    vec![decl.shape[0]],
+                    Encoding::Raw(DType::F32),
+                    // `[rows]` of F32, one per output channel.
+                    QuantGranularity::PerChannel,
+                    0,
+                    0,
+                    ScaleForm::F32Factors,
+                ),
+                QuantScheme::Mxfp4E2M1E8M0 => {
+                    // E8M0 block scale: one uint8 per 32-element block along K.
+                    // The encode-tile kernel writes a row-major `[rows,
+                    // cols/32]` byte tensor, and the MXFP4 kernels want those
+                    // bytes as they are.
+                    let cols = decl.shape[1];
+                    if cols % 32 != 0 {
+                        return Vec::new();
+                    }
+                    (
+                        format!("{}_scale", contract.name),
+                        vec![decl.shape[0], cols / 32],
+                        Encoding::Raw(DType::U8),
+                        QuantGranularity::PerGroup,
+                        32,
+                        1,
+                        ScaleForm::RawE8M0,
+                    )
                 }
-                (
-                    format!("{}_scale", contract.name),
-                    vec![decl.shape[0], cols / 32],
-                    Encoding::Raw(DType::U8),
-                )
-            }
-            _ => return Vec::new(),
-        };
+                _ => return Vec::new(),
+            };
         let id = TensorId(self.next_generated_tensor);
         self.next_generated_tensor = self.next_generated_tensor.saturating_add(1);
+        // Stated here because here is where both halves are known. The
+        // granularity is the encode kernel's, describing the layout it writes,
+        // not anything readable off `spec`.
+        self.program.attachments.push(QuantAttachment {
+            tensor: decl.id,
+            scale_tensor: id,
+            granularity,
+            group_size,
+            channel_axis,
+            scale_form,
+        });
         vec![TensorDecl {
             id,
             name,
@@ -775,7 +838,11 @@ impl Builder<'_> {
         let span_bytes = encoding_nbytes(&source.shape, &source.encoding)
             .or_overflow("source extent byte size")?;
         let physical_bytes = strided_physical_source_bytes(&source.stride)?;
-        if source.offset_bytes + physical_bytes > raw.span_bytes {
+        let source_end = source
+            .offset_bytes
+            .checked_add(physical_bytes)
+            .or_overflow("source extent end")?;
+        if source_end > raw.span_bytes {
             return Err(Error::Contract(format!(
                 "source extent for '{}' exceeds tensor span",
                 raw.name
@@ -784,7 +851,10 @@ impl Builder<'_> {
         Ok(SourceExtent {
             file_id: raw.file_id,
             tensor_id: raw.id,
-            file_offset: raw.file_offset + source.offset_bytes,
+            file_offset: raw
+                .file_offset
+                .checked_add(source.offset_bytes)
+                .or_overflow("source extent file offset")?,
             span_bytes,
             stride: source.stride.clone(),
         })

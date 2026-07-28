@@ -41,7 +41,6 @@ fn fixture(n: u32) -> (CheckpointMetadata, ModelContract) {
             .collect(),
     };
     let contract = ModelContract {
-        abi_version: 1,
         alignment: 256,
         tensors: (0..n)
             .map(|i| {

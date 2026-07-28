@@ -29,13 +29,12 @@ pub const PIE_LOADER_NO_TENSOR: u32 = u32::MAX;
 // producing a plan the device cannot run.
 //
 // These live here, in the module that owns the C surface, because the header is
-// where they have to be correct. `crate::load_plan` re-exports them under short
-// names for use inside the compiler.
-// `crate::plan` states the same seven bits. Restated here rather than aliased
-// because cbindgen emits a literal and cannot follow a path — and because the
-// arrow used to run the other way, with `load_plan.rs` importing its own
-// serialization format's constants. Two independent statements, checked below,
-// is the same shape as the loader/driver cross-check in `ffi/mod.rs`.
+// where they have to be correct. `crate::plan` states the same six bits.
+// Restated here rather than aliased because cbindgen emits a literal and cannot
+// follow a path — and because the arrow used to run the other way, with the
+// compiler importing its own serialization format's constants. Two independent
+// statements, checked below, is the same shape as the loader/driver cross-check
+// in `ffi/mod.rs`.
 pub const PIE_LOADER_TILE_MAP_CAST: u32 = 1 << 0;
 pub const PIE_LOADER_TILE_MAP_DECODE: u32 = 1 << 1;
 pub const PIE_LOADER_TILE_MAP_ENCODE: u32 = 1 << 2;
@@ -518,8 +517,9 @@ pub type PieLoaderTensorDeclSlice = PieLoaderSlice<PieLoaderTensorDeclView>;
 
 /// How a scale tensor's entries map onto the tensor they scale.
 #[repr(u32)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PieLoaderQuantGranularity {
+    #[default]
     PerChannel = 0,
     PerGroup = 1,
 }
@@ -530,9 +530,10 @@ pub enum PieLoaderQuantGranularity {
 /// not how the kernel wants them. The driver used to infer this from
 /// `group_size == 32`.
 #[repr(u32)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PieLoaderScaleForm {
     /// Raw E8M0 exponent bytes, consumed as-is.
+    #[default]
     RawE8M0 = 0,
     /// F32 multipliers; expand before the GEMM sees them.
     F32Factors = 1,
@@ -543,8 +544,7 @@ pub enum PieLoaderScaleForm {
 /// Both are entries in [`PieLoaderPlan::tensors`], named by `id`. The driver has
 /// to know the pairing in order to attach the quant metadata its kernels read;
 /// it used to rediscover it by matching name suffixes over the tensor list,
-/// which guessed at something the loader states here (`load_plan.rs`'s
-/// `derive_quant_attachments`).
+/// which guessed at something stated here.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct PieLoaderQuantAttachmentView {

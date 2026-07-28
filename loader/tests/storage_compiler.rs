@@ -15,12 +15,12 @@ fn stored_contract(name: &str) -> ModelContract {
     serde_json::from_str(&text).unwrap_or_else(|err| panic!("{name}: parsing: {err}"))
 }
 use pie_loader::checkpoint::{CheckpointFile, CheckpointMetadata, RawTensor};
-use pie_loader::contract::{Expr, ModelContract, TensorContract, TensorType};
+use pie_loader::contract::{Expr, ModelContract, Scales, TensorContract, TensorType};
 use pie_loader::plan::compile as compile_load_plan;
 use pie_loader::plan::{StorageInstr, StorageTarget, TileMapKind};
 use pie_loader::types::{
-    Axis, BackendKind, CheckpointFormat, DType, Encoding, FileId, QuantScheme, QuantSpec,
-    RepackLayout, RowMap, TensorId,
+    Axis, BackendKind, CheckpointFormat, DType, Encoding, FileId, QuantGranularity, QuantScheme,
+    QuantSpec, RepackLayout, RowMap, ScaleForm, TensorId,
 };
 
 #[test]
@@ -115,7 +115,6 @@ fn metal_qwen35_schema_emits_canonical_affine_u4_arena() {
         )
     };
     let contract = ModelContract {
-        abi_version: 1,
         alignment: 256,
         tensors: vec![
             packed("lm_head.weight", "lm_head.weight", 2, 64),
@@ -160,7 +159,6 @@ fn metal_qwen35_schema_emits_canonical_affine_u4_arena() {
 #[test]
 fn buffer_join_tile_maps_carry_destination_offsets() {
     let contract = ModelContract {
-        abi_version: 1,
         alignment: 1,
         tensors: vec![
             TensorContract::new(
@@ -232,7 +230,6 @@ fn direct_copy_lowers_to_identity_extent_write() {
     };
 
     let contract = ModelContract {
-        abi_version: 1,
         alignment: 1,
         tensors: vec![TensorContract::new(
             "runtime.weight",
@@ -276,7 +273,6 @@ fn direct_copy_lowers_to_identity_extent_write() {
 fn packed_quant_row_select_uses_byte_exact_offsets() {
     // Row 2 of a [4, 8] int4 tensor: 8 elements at 4 bits is 4 bytes a row.
     let contract = ModelContract {
-        abi_version: 1,
         alignment: 1,
         tensors: vec![TensorContract::new(
             "q.row",
@@ -315,7 +311,6 @@ fn packed_quant_row_select_uses_byte_exact_offsets() {
 #[test]
 fn an_expression_may_not_outgrow_the_tensor_it_is_declared_for() {
     let contract = ModelContract {
-        abi_version: 1,
         alignment: 1,
         tensors: vec![TensorContract::new(
             "q.bad",
@@ -335,7 +330,6 @@ fn an_expression_may_not_outgrow_the_tensor_it_is_declared_for() {
 #[test]
 fn target_support_rejects_cuda_decode_at_compile_time() {
     let contract = ModelContract {
-        abi_version: 1,
         alignment: 1,
         tensors: vec![TensorContract::new(
             "decoded",
@@ -373,7 +367,6 @@ fn packed_quant_source_requires_exact_affine_size() {
     });
 
     let contract = ModelContract {
-        abi_version: 1,
         alignment: 1,
         tensors: vec![TensorContract::new(
             "blocked",
@@ -668,7 +661,6 @@ fn a_contract_that_declares_a_name_twice_is_rejected() {
         )
     };
     let contract = pie_loader::contract::ModelContract {
-        abi_version: 1,
         alignment: 256,
         tensors: vec![one("dup"), one("dup")],
     };
@@ -681,7 +673,6 @@ fn a_contract_that_declares_a_name_twice_is_rejected() {
 #[test]
 fn a_contract_whose_declared_shape_is_wrong_is_rejected() {
     let contract = pie_loader::contract::ModelContract {
-        abi_version: 1,
         alignment: 256,
         tensors: vec![pie_loader::contract::TensorContract::new(
             "a",
@@ -941,7 +932,6 @@ fn slab_scatter_merges_nearby_bulk_extent_writes() {
         ],
     };
     let contract = ModelContract {
-        abi_version: 1,
         alignment: 1,
         tensors: (0..3u32)
             .map(|i| {
@@ -1014,7 +1004,6 @@ fn slab_scatter_rejects_excessive_overread() {
         ],
     };
     let contract = ModelContract {
-        abi_version: 1,
         alignment: 1,
         tensors: ["near", "far"]
             .into_iter()
@@ -1067,7 +1056,6 @@ fn slab_scatter_placement_offsets_are_within_span() {
         ],
     };
     let contract = ModelContract {
-        abi_version: 1,
         alignment: 1,
         tensors: ["a", "b", "c"]
             .into_iter()
@@ -1269,7 +1257,6 @@ fn a_block_scaled_fp8_source_carries_its_scale_tensor() {
         ..StorageTarget::default()
     };
     let contract = ModelContract {
-        abi_version: 1,
         alignment: 1,
         tensors: vec![TensorContract::new(
             "runtime.w",
@@ -1312,7 +1299,6 @@ fn a_source_without_a_scale_sibling_names_none() {
         ..StorageTarget::default()
     };
     let contract = ModelContract {
-        abi_version: 1,
         alignment: 1,
         tensors: vec![TensorContract::new(
             "runtime.w",
@@ -1353,7 +1339,6 @@ fn a_padded_head_dim_zeroes_the_buffer_before_it_writes_the_rows() {
     };
 
     let contract = ModelContract {
-        abi_version: 1,
         alignment: 1,
         tensors: vec![TensorContract::new(
             "q_proj.weight",
@@ -1433,7 +1418,6 @@ fn an_e8m0_block_scale_read_as_fp32_lowers_to_a_cast() {
         ..StorageTarget::default()
     };
     let contract = ModelContract {
-        abi_version: 1,
         alignment: 1,
         tensors: vec![TensorContract::new(
             "runtime.w.scale",
@@ -1463,4 +1447,292 @@ fn an_e8m0_block_scale_read_as_fp32_lowers_to_a_cast() {
         })
         .count();
     assert_eq!(casts, 1, "expected exactly one Cast, got plan {program:#?}");
+}
+
+// ── quant attachments ──────────────────────────────────
+//
+// A quantized weight and its scales are two runtime tensors, and the driver has
+// to know they belong together. The loader used to work that out after the fact,
+// by matching `_scale_inv` / `.scale` suffixes over the finished tensor table
+// with the group size hardcoded to 128 beside them, in
+// `plan::derive_quant_attachments`. Every entry is now recorded by whoever
+// declared the scale tensor, at the point of declaring it — which is why these
+// exercise `compile` rather than a name-matching function: there is no longer
+// anything to call in between.
+
+fn scale_target() -> StorageTarget {
+    StorageTarget {
+        backend: BackendKind::Cuda,
+        tile_map_mask: u32::MAX,
+        ..StorageTarget::default()
+    }
+}
+
+/// The MXFP4 GEMM asserts its scale operand is U8, so a plan that asks the
+/// driver to expand these to F32 makes the kernel reject the load.
+#[test]
+fn scales_the_loader_writes_while_encoding_mxfp4_stay_raw_e8m0() {
+    let metadata = CheckpointMetadata {
+        files: vec![CheckpointFile {
+            id: FileId(0),
+            path: "model.safetensors".to_string(),
+            size_bytes: 1 << 20,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors: vec![sized_raw(0, "w.weight", 0, 8192, &[64, 64], DType::BF16)],
+    };
+    let contract = ModelContract {
+        alignment: 1,
+        tensors: vec![TensorContract::new(
+            "runtime.w",
+            Expr::src("w.weight"),
+            vec![64, 64],
+            Encoding::Quant(quant(QuantScheme::Mxfp4E2M1E8M0, DType::BF16)),
+        )],
+    };
+    let program = compile_load_plan(&metadata, &contract, scale_target()).unwrap();
+    assert_eq!(program.attachments.len(), 1, "{:#?}", program.attachments);
+    let attach = program.attachments[0];
+    assert_eq!(attach.scale_form, ScaleForm::RawE8M0);
+    assert_eq!(attach.granularity, QuantGranularity::PerGroup);
+    assert_eq!(attach.group_size, 32);
+    // Both halves name real entries, which is the part the name matching could
+    // get wrong without anything noticing.
+    assert_eq!(program.tensors[attach.tensor.0 as usize].name, "runtime.w");
+    assert_eq!(
+        program.tensors[attach.scale_tensor.0 as usize].name,
+        "runtime.w_scale"
+    );
+}
+
+/// The same, for the per-channel schemes: one F32 factor per output row.
+#[test]
+fn scales_the_loader_writes_while_encoding_fp8_are_f32_factors() {
+    let metadata = CheckpointMetadata {
+        files: vec![CheckpointFile {
+            id: FileId(0),
+            path: "model.safetensors".to_string(),
+            size_bytes: 1 << 20,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors: vec![sized_raw(0, "w.weight", 0, 8192, &[64, 64], DType::BF16)],
+    };
+    let contract = ModelContract {
+        alignment: 1,
+        tensors: vec![TensorContract::new(
+            "runtime.w",
+            Expr::src("w.weight"),
+            vec![64, 64],
+            Encoding::Quant(quant(QuantScheme::Fp8E4M3, DType::BF16)),
+        )],
+    };
+    let program = compile_load_plan(&metadata, &contract, scale_target()).unwrap();
+    assert_eq!(program.attachments.len(), 1, "{:#?}", program.attachments);
+    assert_eq!(program.attachments[0].scale_form, ScaleForm::F32Factors);
+    assert_eq!(
+        program.attachments[0].granularity,
+        QuantGranularity::PerChannel
+    );
+}
+
+/// Block-scaled FP8 (DeepSeek-V3 and its descendants) arrives already
+/// quantized: the loader writes no scales, so the contract states the pairing.
+///
+/// This is the case the suffix matching existed for, and the case it was worst
+/// at. It tried `{name}_scale_inv` and then `{base}.scale`, and hardcoded
+/// `group_size: 128` — while the only authoring site in the tree,
+/// `dsv4_block_scales_to_fp32`, publishes `<base>.scale` and knows the real
+/// block size. Note the 64 here: a checkpoint that blocks by anything other
+/// than 128 used to be silently mislabelled.
+#[test]
+fn scales_the_checkpoint_shipped_are_paired_by_the_contract() {
+    let metadata = CheckpointMetadata {
+        files: vec![CheckpointFile {
+            id: FileId(0),
+            path: "model.safetensors".to_string(),
+            size_bytes: 1 << 20,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors: vec![
+            sized_raw(0, "w.weight", 0, 4096, &[64, 64], DType::F8E4M3),
+            sized_raw(1, "w.scale", 4096, 4, &[1, 1], DType::F32),
+        ],
+    };
+    let contract = ModelContract {
+        alignment: 1,
+        tensors: vec![
+            TensorContract::new(
+                "runtime.w",
+                Expr::src("w.weight"),
+                vec![64, 64],
+                Encoding::Raw(DType::F8E4M3),
+            ),
+            TensorContract::new(
+                "runtime.w_scale",
+                Expr::src("w.scale"),
+                vec![1, 1],
+                Encoding::Raw(DType::F32),
+            )
+            .scaling(Scales {
+                of: "runtime.w".to_string(),
+                granularity: QuantGranularity::PerGroup,
+                group_size: 64,
+                channel_axis: 0,
+                form: ScaleForm::F32Factors,
+            }),
+        ],
+    };
+    let program = compile_load_plan(&metadata, &contract, scale_target()).unwrap();
+    assert_eq!(program.attachments.len(), 1, "{:#?}", program.attachments);
+    let attach = program.attachments[0];
+    assert_eq!(attach.group_size, 64);
+    assert_eq!(attach.scale_form, ScaleForm::F32Factors);
+    assert_eq!(program.tensors[attach.tensor.0 as usize].name, "runtime.w");
+    assert_eq!(
+        program.tensors[attach.scale_tensor.0 as usize].name,
+        "runtime.w_scale"
+    );
+}
+
+/// A contract that names a tensor no earlier entry declares is rejected.
+///
+/// The suffix matching could not fail: a name that resolved to nothing produced
+/// no attachment, and the plan came out of the compiler silently missing the
+/// metadata its kernels would go looking for at bind time.
+#[test]
+fn scales_named_for_a_weight_the_loader_quantizes_are_a_contract_error() {
+    // The loader writes this weight's scales itself while encoding it, and
+    // states that pairing. A contract that names a second set would attach
+    // quant metadata to one weight twice, which the driver discovers only at
+    // load time.
+    let metadata = CheckpointMetadata {
+        files: vec![CheckpointFile {
+            id: FileId(0),
+            path: "model.safetensors".to_string(),
+            size_bytes: 1 << 20,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors: vec![
+            sized_raw(0, "w.weight", 0, 8192, &[64, 64], DType::BF16),
+            sized_raw(1, "w.weight_scale_inv", 8192, 4, &[1, 1], DType::F32),
+        ],
+    };
+    let contract = ModelContract {
+        alignment: 1,
+        tensors: vec![
+            TensorContract::new(
+                "runtime.w",
+                Expr::src("w.weight"),
+                vec![64, 64],
+                Encoding::Quant(quant(QuantScheme::Fp8E4M3, DType::BF16)),
+            ),
+            TensorContract::new(
+                "runtime.w_shipped_scales",
+                Expr::src("w.weight_scale_inv"),
+                vec![1, 1],
+                Encoding::Raw(DType::F32),
+            )
+            .scaling(Scales {
+                of: "runtime.w".to_string(),
+                granularity: QuantGranularity::PerGroup,
+                group_size: 128,
+                channel_axis: 0,
+                form: ScaleForm::F32Factors,
+            }),
+        ],
+    };
+    let err = compile_load_plan(&metadata, &contract, scale_target())
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("already has scales"), "{err}");
+}
+
+#[test]
+fn scales_naming_an_undeclared_tensor_are_a_contract_error() {
+    let metadata = CheckpointMetadata {
+        files: vec![CheckpointFile {
+            id: FileId(0),
+            path: "model.safetensors".to_string(),
+            size_bytes: 1 << 20,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors: vec![sized_raw(0, "w.scale", 0, 4, &[1, 1], DType::F32)],
+    };
+    let contract = ModelContract {
+        alignment: 1,
+        tensors: vec![
+            TensorContract::new(
+                "runtime.w_scale",
+                Expr::src("w.scale"),
+                vec![1, 1],
+                Encoding::Raw(DType::F32),
+            )
+            .scaling(Scales {
+                of: "runtime.w".to_string(),
+                granularity: QuantGranularity::PerGroup,
+                group_size: 128,
+                channel_axis: 0,
+                form: ScaleForm::F32Factors,
+            }),
+        ],
+    };
+    let error = compile_load_plan(&metadata, &contract, scale_target())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("runtime.w"), "{error}");
+    assert!(error.contains("the contract does not declare"), "{error}");
+}
+
+/// Scales may be declared before the tensor they scale.
+///
+/// `dsv4_block_scales_to_fp32` runs before `author_dense_contract`, so the real
+/// contract declares every block scale ahead of its weight. Resolving `of`
+/// against earlier entries only — the rule `Expr::Out` follows — would reject
+/// every DeepSeek-V4 contract in the tree.
+#[test]
+fn scales_may_name_a_tensor_declared_after_them() {
+    let metadata = CheckpointMetadata {
+        files: vec![CheckpointFile {
+            id: FileId(0),
+            path: "model.safetensors".to_string(),
+            size_bytes: 1 << 20,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors: vec![
+            sized_raw(0, "w.scale", 0, 4, &[1, 1], DType::F32),
+            sized_raw(1, "w.weight", 4096, 4096, &[64, 64], DType::F8E4M3),
+        ],
+    };
+    let contract = ModelContract {
+        alignment: 1,
+        tensors: vec![
+            TensorContract::new(
+                "runtime.w_scale",
+                Expr::src("w.scale"),
+                vec![1, 1],
+                Encoding::Raw(DType::F32),
+            )
+            .scaling(Scales {
+                of: "runtime.w".to_string(),
+                granularity: QuantGranularity::PerGroup,
+                group_size: 64,
+                channel_axis: 0,
+                form: ScaleForm::F32Factors,
+            }),
+            TensorContract::new(
+                "runtime.w",
+                Expr::src("w.weight"),
+                vec![64, 64],
+                Encoding::Raw(DType::F8E4M3),
+            ),
+        ],
+    };
+    let program = compile_load_plan(&metadata, &contract, scale_target()).unwrap();
+    assert_eq!(program.attachments.len(), 1, "{:#?}", program.attachments);
+    let attach = program.attachments[0];
+    assert_eq!(program.tensors[attach.tensor.0 as usize].name, "runtime.w");
+    assert_eq!(
+        program.tensors[attach.scale_tensor.0 as usize].name,
+        "runtime.w_scale"
+    );
 }

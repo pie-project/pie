@@ -73,8 +73,24 @@ inline void dsv4_block_scales_to_fp32(ContractBuilder& b) {
             b.contract().bitcast(b.contract().src(std::string(raw.name)), shape,
                                  pie_loader::raw(PieLoaderDType::E8M0)),
             shape, b.shard_axis(raw.name));
-        b.define(b.output_name(raw.name), expr, pie_loader::raw(PieLoaderDType::F32),
-                 std::move(local));
+        auto defined = b.define(b.output_name(raw.name), expr,
+                                pie_loader::raw(PieLoaderDType::F32), std::move(local));
+        // The pairing this loop just established, stated rather than dropped.
+        // The loader used to rediscover it by appending `_scale_inv` and then
+        // `.scale` to every F8E4M3 tensor's name, with `group_size` hardcoded to
+        // 128 -- a guess about the checkpoint made three layers away from the
+        // only code that checks it. Here both shapes are in hand, so the block
+        // size is read off them instead of assumed.
+        const std::vector<std::int64_t> weight_shape = contract_detail::shape_of(*companion);
+        if (defined.has_value() && !shape.empty() && shape.back() > 0 &&
+            !weight_shape.empty()) {
+            const std::int64_t block = weight_shape.back() / shape.back();
+            if (block > 0) {
+                defined->scaling(b.output_name(weight), PieLoaderQuantGranularity::PerGroup,
+                                 static_cast<std::uint32_t>(block), 0,
+                                 PieLoaderScaleForm::F32Factors);
+            }
+        }
         b.consume(raw.id);
     }
 }

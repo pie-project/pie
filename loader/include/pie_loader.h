@@ -50,10 +50,6 @@ enum class PieLoaderStatus : uint32_t {
   ContractViolation = 3,
   /// The compiler failed on input it should have handled. A bug in the loader.
   Internal = 4,
-  /// A panic was caught at the boundary. Also a bug in the loader, but
-  /// distinguished because the diagnostic is a panic payload rather than a
-  /// structured error.
-  Panic = 5,
 };
 
 /// Which on-disk format a checkpoint file uses.
@@ -68,6 +64,24 @@ enum class PieLoaderSeverity : uint32_t {
   /// choice without failing.
   Warning = 0,
   Error = 1,
+};
+
+/// How a scale tensor's entries map onto the tensor they scale.
+enum class PieLoaderQuantGranularity : uint32_t {
+  PerChannel = 0,
+  PerGroup = 1,
+};
+
+/// What the driver's kernels expect a scale tensor to hold when they read it.
+///
+/// Not derivable from the scale tensor: its dtype says how the bytes are stored,
+/// not how the kernel wants them. The driver used to infer this from
+/// `group_size == 32`.
+enum class PieLoaderScaleForm : uint32_t {
+  /// Raw E8M0 exponent bytes, consumed as-is.
+  RawE8M0 = 0,
+  /// F32 multipliers; expand before the GEMM sees them.
+  F32Factors = 1,
 };
 
 enum class PieLoaderDType : uint32_t {
@@ -159,24 +173,6 @@ enum class PieLoaderBackendKind : uint32_t {
   Cuda = 0,
   Metal = 1,
   Unknown = 255,
-};
-
-/// How a scale tensor's entries map onto the tensor they scale.
-enum class PieLoaderQuantGranularity : uint32_t {
-  PerChannel = 0,
-  PerGroup = 1,
-};
-
-/// What the driver's kernels expect a scale tensor to hold when they read it.
-///
-/// Not derivable from the scale tensor: its dtype says how the bytes are stored,
-/// not how the kernel wants them. The driver used to infer this from
-/// `group_size == 32`.
-enum class PieLoaderScaleForm : uint32_t {
-  /// Raw E8M0 exponent bytes, consumed as-is.
-  RawE8M0 = 0,
-  /// F32 multipliers; expand before the GEMM sees them.
-  F32Factors = 1,
 };
 
 /// Which constructor a node is. Mirrors [`crate::contract::Expr`] exactly; a
@@ -408,6 +404,31 @@ struct PieLoaderExprNode {
 
 using PieLoaderExprNodeSlice = PieLoaderSlice<PieLoaderExprNode>;
 
+/// What a scale tensor scales, said by the entry that declares the scales.
+///
+/// The loader used to work this pairing out by matching name suffixes —
+/// `{name}_scale_inv`, then `{base}.scale`, with the group size hardcoded to 128
+/// beside them. The driver had already found it properly and thrown it away:
+/// `dsv4_block_scales_to_fp32` takes a `.scale` tensor, looks up `<base>.weight`
+/// and publishes only if that companion is really FP8-E4M3. This is where that
+/// finding is kept.
+///
+/// Only for scales the *checkpoint* shipped. Scales the loader creates while
+/// quantizing are paired at creation, with no name involved.
+struct PieLoaderScalesView {
+  /// Name of the tensor these scales belong to. Empty means this entry is
+  /// not a scale tensor and the rest of this struct is ignored.
+  ///
+  /// Unlike `Expr::Out` this may name a *later* declaration: it pairs two
+  /// published tensors rather than feeding one into the other.
+  PieLoaderBytes of;
+  PieLoaderQuantGranularity granularity;
+  /// Elements of `of` per scale entry, for `PerGroup`.
+  uint32_t group_size;
+  uint32_t channel_axis;
+  PieLoaderScaleForm form;
+};
+
 /// One declared tensor: a name, the expression that produces it, and what the
 /// driver believes the result is.
 struct PieLoaderTensorContractView {
@@ -426,13 +447,14 @@ struct PieLoaderTensorContractView {
   /// optional, because it is not a prediction: the loader inserts whatever
   /// cast, decode or encode is needed to reach it.
   PieLoaderEncodingSpec encoding;
+  /// Set when this entry holds the scales for another entry.
+  PieLoaderScalesView scales;
 };
 
 using PieLoaderTensorContractSlice = PieLoaderSlice<PieLoaderTensorContractView>;
 
 /// Everything one driver rank declares.
 struct PieLoaderModelContractView {
-  uint32_t abi_version;
   /// Byte alignment every materialized buffer must satisfy.
   uint32_t alignment;
   /// The node pool, shared by every tensor. Topologically sorted: a node may
@@ -712,8 +734,7 @@ struct PieLoaderTargetView {
 /// Both are entries in [`PieLoaderPlan::tensors`], named by `id`. The driver has
 /// to know the pairing in order to attach the quant metadata its kernels read;
 /// it used to rediscover it by matching name suffixes over the tensor list,
-/// which guessed at something the loader states here (`load_plan.rs`'s
-/// `derive_quant_attachments`).
+/// which guessed at something stated here.
 struct PieLoaderQuantAttachmentView {
   uint32_t tensor_id;
   uint32_t scale_tensor_id;

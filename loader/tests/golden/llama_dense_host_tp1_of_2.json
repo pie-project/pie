@@ -20,10 +20,52 @@
       "rewrites": 21
     },
     {
+      "pass": "coalesce-persistent-arena-writes",
+      "instrs_before": 63,
+      "instrs_after": 63,
+      "rewrites": 0
+    },
+    {
       "pass": "hoist-bulk-arena-writes",
       "instrs_before": 63,
       "instrs_after": 61,
       "rewrites": 2
+    },
+    {
+      "pass": "slab-scatter-arena-writes",
+      "instrs_before": 61,
+      "instrs_after": 61,
+      "rewrites": 0
+    },
+    {
+      "pass": "merge-adjacent-extent-writes",
+      "instrs_before": 61,
+      "instrs_after": 61,
+      "rewrites": 0
+    },
+    {
+      "pass": "recompute-memory-plan",
+      "instrs_before": 61,
+      "instrs_after": 61,
+      "rewrites": 0
+    },
+    {
+      "pass": "validate-fill-order",
+      "instrs_before": 61,
+      "instrs_after": 61,
+      "rewrites": 0
+    },
+    {
+      "pass": "validate-target-support",
+      "instrs_before": 61,
+      "instrs_after": 61,
+      "rewrites": 0
+    },
+    {
+      "pass": "validate-persistent-layout",
+      "instrs_before": 61,
+      "instrs_after": 61,
+      "rewrites": 0
     }
   ],
   "files": [

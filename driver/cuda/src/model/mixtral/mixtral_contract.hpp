@@ -12,6 +12,27 @@
 namespace pie_cuda_driver::model {
 namespace contract_detail {
 
+/// State that an MXFP4 scale tensor holds the block scales for `weight`.
+///
+/// The loader used to work this out for itself, by looking for `{weight}_scale`
+/// beside every `Encoding::Quant(Mxfp4E2M1E8M0)` tensor — which happened to
+/// match the names below, and would have stopped matching the moment either side
+/// was renamed.
+///
+/// `channel_axis` is 1 for both halves even though `down_proj` is declared with
+/// `mxfp4_encoding(.., 2)`. That is what the name matching produced — it read
+/// the axis off the scheme, not off the encoding — and the value is live: it
+/// reaches `QuantMeta` and is serialized into the weight-store cache. Changing
+/// it is a separate question from moving where it is stated.
+inline void state_mxfp4_block_scales(std::optional<pie_loader::ModelContract::Defined>& scales,
+                                     std::string weight) {
+    if (!scales.has_value()) {
+        return;
+    }
+    scales->scaling(std::move(weight), PieLoaderQuantGranularity::PerGroup, 32, 1,
+                    PieLoaderScaleForm::RawE8M0);
+}
+
 inline void gpt_oss_native_gate_up(ContractBuilder& b, const SourceTensor& block, const SourceTensor& scale,
                                 const SourceTensor& bias, const std::string& base) {
     if (block.shape.size() != 4 || scale.shape.size() != 3 || bias.shape.size() != 2) {
@@ -68,9 +89,10 @@ inline void gpt_oss_native_gate_up(ContractBuilder& b, const SourceTensor& block
         scale_spec.source_col_offset = 0;
         scale_spec.source_cols = u32_dim(groups, "GPT-OSS hidden groups");
         scale_spec.target_cols = u32_dim(groups, "GPT-OSS hidden groups");
-        b.push_repack(out_base + ".weight_scale", scale,
+        auto scales = b.push_repack(out_base + ".weight_scale", scale,
                     pie_loader::raw(PieLoaderDType::U8),
                     {experts, intermediate_native, groups}, scale_spec);
+        state_mxfp4_block_scales(scales, out_base + ".weight");
 
         PieLoaderRepackSpecView bias_spec =
             repack_spec(PieLoaderRepackLayout::DenseRowGather, half.row_map);
@@ -140,8 +162,9 @@ inline void gpt_oss_native_down(ContractBuilder& b, const SourceTensor& block, c
     scale_spec.source_col_offset = u32_dim(source_group_offset, "GPT-OSS down source group offset");
     scale_spec.source_cols = u32_dim(local_groups, "GPT-OSS down source groups");
     scale_spec.target_cols = u32_dim(intermediate_native / 32, "GPT-OSS down target groups");
-    b.push_repack(base + ".weight_scale", scale, pie_loader::raw(PieLoaderDType::U8),
+    auto scales = b.push_repack(base + ".weight_scale", scale, pie_loader::raw(PieLoaderDType::U8),
                 {experts, hidden, intermediate_native / 32}, scale_spec);
+    state_mxfp4_block_scales(scales, base + ".weight");
 
     b.push_direct(bias, base + ".bias", std::nullopt);
 }

@@ -274,3 +274,29 @@ pub fn encoding_nbytes(shape: &[i64], encoding: &Encoding) -> Option<u64> {
         }
     }
 }
+
+/// How a scale tensor's entries map onto the tensor they scale.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum QuantGranularity {
+    /// One scale per row of `channel_axis`.
+    PerChannel,
+    /// One scale per `group_size` elements along the axis after `channel_axis`.
+    PerGroup,
+}
+
+/// What the driver's kernels expect a scale tensor to hold by the time they read
+/// it.
+///
+/// Not derivable from the scale tensor itself — its dtype says how the bytes are
+/// stored, not how the kernel wants them — so whoever declared the scale states
+/// it. The driver used to infer it from `group_size == 32`, which was true only
+/// because MXFP4 is the one scheme with that group size today.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ScaleForm {
+    /// Consumed as raw E8M0 exponent bytes. The MXFP4 GEMM, the dequant kernels
+    /// and `make_expert_weight_view` all require U8 and assert on anything else.
+    RawE8M0,
+    /// Consumed as F32 multipliers. Whatever the scales were stored as (E8M0
+    /// bytes, BF16, or F32 already) is expanded before the GEMM sees them.
+    F32Factors,
+}

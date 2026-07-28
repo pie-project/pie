@@ -14,7 +14,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, OrOverflow};
-use crate::types::{Axis, DType, Encoding, QuantSpec, RepackSpec};
+use crate::types::{Axis, DType, Encoding, QuantGranularity, QuantSpec, RepackSpec, ScaleForm};
 
 pub mod compile;
 pub mod infer;
@@ -76,6 +76,8 @@ pub enum Expr {
     /// contract stays rank-independent — the author writes the partition, not
     /// the arithmetic — and so that it composes: a shard of one leg of a
     /// [`Expr::Cat`] is expressible, which a whole-expression flag cannot say.
+    ///
+    /// The partition itself is [`local_range`].
     Shard { src: Box<Expr>, axis: Axis },
     /// Escape hatch: a backend-specific layout swizzle. Opaque to the type
     /// checker, so it must declare its own output type.
@@ -159,6 +161,40 @@ pub struct TensorContract {
     pub expr: Expr,
     pub shape: Option<Vec<i64>>,
     pub encoding: Encoding,
+    /// Set when this entry holds scales for another entry. See [`Scales`].
+    pub scales: Option<Scales>,
+}
+
+/// What a scale tensor scales, said by the entry that declares the scales.
+///
+/// A quantized weight and its scales are two runtime tensors, and the driver's
+/// kernels need to know they belong together. The loader used to work that out
+/// by matching name suffixes — `{name}_scale_inv`, then `{base}.scale` — with
+/// the group size hardcoded to 128 beside them.
+///
+/// That guess had an author. `deepseek_v4_contract.hpp::dsv4_block_scales_to_fp32`
+/// finds the pairing properly: it takes a `.scale` tensor, looks up
+/// `<base>.weight`, and publishes the scale only if that companion is really
+/// FP8-E4M3 — "guessing is how a scale tensor gets silently reinterpreted", as
+/// its own comment puts it. Then it dropped the pair on the floor and the loader
+/// re-derived it from strings. This field is the driver keeping what it found.
+///
+/// Only for scales the *checkpoint* shipped. When the loader quantizes a tensor
+/// it creates the scale tensor itself and states the pairing from there, with no
+/// name involved at all.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Scales {
+    /// Declared name of the tensor these scales belong to.
+    ///
+    /// Unlike [`Expr::Out`] this may name a *later* entry: it pairs two
+    /// published tensors rather than feeding one into the other, and the one
+    /// authoring site in the tree declares the scales first.
+    pub of: String,
+    pub granularity: QuantGranularity,
+    /// Elements of `of` per scale entry, for [`QuantGranularity::PerGroup`].
+    pub group_size: u32,
+    pub channel_axis: u32,
+    pub form: ScaleForm,
 }
 
 impl TensorContract {
@@ -168,6 +204,7 @@ impl TensorContract {
             expr,
             shape: Some(shape),
             encoding,
+            scales: None,
         }
     }
 
@@ -179,7 +216,14 @@ impl TensorContract {
             expr,
             shape: None,
             encoding,
+            scales: None,
         }
+    }
+
+    /// Declare that this entry holds the scales for `of`.
+    pub fn scaling(mut self, scales: Scales) -> Self {
+        self.scales = Some(scales);
+        self
     }
 }
 
@@ -190,11 +234,86 @@ impl TensorContract {
 /// in one pass.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelContract {
-    pub abi_version: u32,
     /// Byte alignment every materialized buffer must satisfy. A target
     /// property; there is no reason to repeat it per tensor.
     pub alignment: u32,
     pub tensors: Vec<TensorContract>,
+}
+
+/// The `[start, len)` of a `full`-long axis that `rank` of `world` owns.///
+/// The arithmetic [`Expr::Shard`] denotes, in one place, because two callers
+/// need it: shape inference resolves a `Shard` node into a `Slice`, and the
+/// rewriter decides whether a row-sharded read can be coalesced. Split between
+/// them, the two answers were free to disagree — and did, on which
+/// [`Error`](crate::error::Error) an indivisible axis produces.
+///
+/// `what` names the thing being split, because this is the message a user gets
+/// for "tp_size does not divide this model". The driver used to pre-empt it with
+/// its own per-family table of divisibility rules read off `config.json` — the
+/// same fact checked twice, and only for the families someone had listed.
+pub fn local_range(full: i64, world: u32, rank: u32, what: &str) -> Result<(i64, i64), Error> {
+    let world = i64::from(world.max(1));
+    if full % world != 0 {
+        return Err(Error::Shard(format!(
+            "{what} is {full}, which tp_size {world} does not divide; use a \
+             tp_size that divides it or run single-GPU"
+        )));
+    }
+    let local = full / world;
+    Ok((i64::from(rank) * local, local))
+}
+
+/// Resolve a [`Expr::Reshape`] request against an operand holding `total`
+/// elements, replacing a single `-1` with the extent that makes the count work.
+///
+/// The only resolver. The type checker needs it to state the output shape and
+/// the byte-run compiler needs it to place the operand, and a second spelling
+/// of "what does `-1` mean here" is a plan that disagrees with the type it was
+/// checked against — silently, because both answers are plausible integers.
+pub fn resolve_reshape(requested: &[i64], total: i64) -> Result<Vec<i64>, Error> {
+    if requested.is_empty() {
+        return Err(Error::Contract(
+            "Reshape needs at least one extent".to_string(),
+        ));
+    }
+    let mut wildcard = None;
+    let mut known = 1_i64;
+    for (index, extent) in requested.iter().enumerate() {
+        match *extent {
+            -1 if wildcard.is_some() => {
+                return Err(Error::Contract(
+                    "Reshape allows at most one -1 extent".to_string(),
+                ));
+            }
+            -1 => wildcard = Some(index),
+            extent if extent < 1 => {
+                return Err(Error::Contract(format!(
+                    "Reshape extent {extent} must be >= 1 or -1"
+                )));
+            }
+            extent => {
+                known = known
+                    .checked_mul(extent)
+                    .or_overflow("Reshape extent overflows i64")?;
+            }
+        }
+    }
+    let mut shape = requested.to_vec();
+    match wildcard {
+        Some(index) if known > 0 && total % known == 0 => shape[index] = total / known,
+        Some(_) => {
+            return Err(Error::Contract(format!(
+                "Reshape to {requested:?} does not divide {total} elements evenly"
+            )));
+        }
+        None if known == total => {}
+        None => {
+            return Err(Error::Contract(format!(
+                "Reshape to {requested:?} ({known} elements) changes the element count from {total}"
+            )));
+        }
+    }
+    Ok(shape)
 }
 
 impl Expr {
