@@ -744,7 +744,7 @@ pub const VARIADIC: u8 = 0xFF;
 /// on exactly one line each. Nothing downstream may re-spell a tag literal —
 /// it imports [`tags`] instead.
 macro_rules! declare_ops {
-    ($($konst:ident = $tag:literal, $name:literal, $family:ident, $operands:expr, $results:expr;)*) => {
+    ($($konst:ident = $tag:literal, $name:literal, $family:ident, $operands:expr, $results:expr, $rep:expr;)*) => {
         /// The wire tag of every op, by name. **The only place a PTIR op tag
         /// is spelled as a number.** Downstream crates (`pie-plan`,
         /// `pie-codegen`, and drivers via the generated header) import these
@@ -767,65 +767,81 @@ macro_rules! declare_ops {
                 results: $results,
             },)*
         ];
+
+        /// One constructible [`Op`] per [`OP_TABLE`] row, in table order.
+        ///
+        /// Two tests used to keep hand-written lists of these — one in this
+        /// file, one in `container.rs` — each guarded by nothing better than
+        /// `len() == OP_TABLE.len()`. A variant that reused an existing tag
+        /// slipped past both. The constructor now lives in the row it
+        /// describes, so "is there an op for this tag" is answered by the
+        /// declaration rather than by a list somewhere else agreeing to stay
+        /// the same length.
+        ///
+        /// Not `#[cfg(test)]`: any crate that wants to say "for every op" can
+        /// say it here instead of writing a fifty-five-line vec of its own.
+        pub fn representatives() -> alloc::vec::Vec<Op> {
+            alloc::vec![$($rep,)*]
+        }
     };
 }
 
 declare_ops! {
-    EXP = 0x01, "exp", Map, 1, 1;
-    LOG = 0x02, "log", Map, 1, 1;
-    NEG = 0x03, "neg", Map, 1, 1;
-    RECIP = 0x04, "recip", Map, 1, 1;
-    ABS = 0x05, "abs", Map, 1, 1;
-    SIGN = 0x06, "sign", Map, 1, 1;
-    CAST = 0x07, "cast", Map, 1, 1;
-    ADD = 0x10, "add", Map, 2, 1;
-    SUB = 0x11, "sub", Map, 2, 1;
-    MUL = 0x12, "mul", Map, 2, 1;
-    DIV = 0x13, "div", Map, 2, 1;
-    MAX_ELEM = 0x14, "max_elem", Map, 2, 1;
-    MIN_ELEM = 0x15, "min_elem", Map, 2, 1;
-    GT = 0x16, "gt", CompareLogic, 2, 1;
-    GE = 0x17, "ge", CompareLogic, 2, 1;
-    EQ = 0x18, "eq", CompareLogic, 2, 1;
-    NE = 0x19, "ne", CompareLogic, 2, 1;
-    LT = 0x1A, "lt", CompareLogic, 2, 1;
-    LE = 0x1B, "le", CompareLogic, 2, 1;
-    AND = 0x1C, "and", CompareLogic, 2, 1;
-    OR = 0x1D, "or", CompareLogic, 2, 1;
-    NOT = 0x1E, "not", CompareLogic, 1, 1;
-    REM = 0x1F, "rem", Map, 2, 1;
-    SELECT = 0x20, "select", Choice, 3, 1;
-    REDUCE_SUM = 0x30, "reduce_sum", ReduceScan, 1, 1;
-    REDUCE_MAX = 0x31, "reduce_max", ReduceScan, 1, 1;
-    REDUCE_MIN = 0x32, "reduce_min", ReduceScan, 1, 1;
-    REDUCE_ARGMAX = 0x33, "reduce_argmax", ReduceScan, 1, 1;
-    BROADCAST = 0x38, "broadcast", Shape, 1, 1;
-    RESHAPE = 0x39, "reshape", Shape, 1, 1;
-    TRANSPOSE = 0x3A, "transpose", Shape, 1, 1;
-    CUMSUM = 0x40, "cumsum", ReduceScan, 1, 1;
-    CUMPROD = 0x41, "cumprod", ReduceScan, 1, 1;
-    SORT_DESC = 0x50, "sort_desc", Order, 1, 2;
-    TOP_K = 0x51, "top_k", Order, 1, 2;
-    MATMUL = 0x55, "matmul", Linear, 2, 1;
-    PIVOT_THRESHOLD = 0x58, "pivot_threshold", Order, 2, 1;
-    GATHER = 0x60, "gather", Index, 2, 1;
-    GATHER_ROW = 0x61, "gather_row", Index, 2, 1;
-    SCATTER_ADD = 0x62, "scatter_add", Index, 3, 1;
-    SCATTER_SET = 0x63, "scatter_set", Index, 3, 1;
-    IOTA = 0x64, "iota", Index, 0, 1;
-    MASK_APPLY_PACKED = 0x65, "mask_apply_packed", Sampling, 2, 1;
-    CAUSAL_MASK = 0x66, "causal_mask", Index, 1, 1;
-    SLIDING_WINDOW_MASK = 0x67, "sliding_window_mask", Index, 1, 1;
-    SINK_WINDOW_MASK = 0x68, "sink_window_mask", Index, 1, 1;
-    RNG = 0x70, "rng", Sampling, 0, 1;
-    RNG_KEYED = 0x71, "rng_keyed", Sampling, 1, 1;
-    CONST = 0x81, "const", Leaf, 0, 1;
-    CHAN_TAKE = 0x90, "chan_take", Channel, 0, 1;
-    CHAN_READ = 0x91, "chan_read", Channel, 0, 1;
-    CHAN_PUT = 0x92, "chan_put", Channel, 1, 0;
-    INTRINSIC_VAL = 0xA0, "intrinsic_val", Intrinsic, 0, 1;
-    KERNEL_CALL = 0xA1, "kernel_call", Intrinsic, VARIADIC, 1;
-    SINK_CALL = 0xA2, "sink_call", Intrinsic, VARIADIC, 0;
+    EXP = 0x01, "exp", Map, 1, 1, Op::Exp(0);
+    LOG = 0x02, "log", Map, 1, 1, Op::Log(0);
+    NEG = 0x03, "neg", Map, 1, 1, Op::Neg(0);
+    RECIP = 0x04, "recip", Map, 1, 1, Op::Recip(0);
+    ABS = 0x05, "abs", Map, 1, 1, Op::Abs(0);
+    SIGN = 0x06, "sign", Map, 1, 1, Op::Sign(0);
+    CAST = 0x07, "cast", Map, 1, 1, Op::Cast { value: 0, dtype: DType::I32, };
+    ADD = 0x10, "add", Map, 2, 1, Op::Add(0, 1);
+    SUB = 0x11, "sub", Map, 2, 1, Op::Sub(0, 1);
+    MUL = 0x12, "mul", Map, 2, 1, Op::Mul(0, 1);
+    DIV = 0x13, "div", Map, 2, 1, Op::Div(0, 1);
+    MAX_ELEM = 0x14, "max_elem", Map, 2, 1, Op::MaxElem(0, 1);
+    MIN_ELEM = 0x15, "min_elem", Map, 2, 1, Op::MinElem(0, 1);
+    GT = 0x16, "gt", CompareLogic, 2, 1, Op::Gt(0, 1);
+    GE = 0x17, "ge", CompareLogic, 2, 1, Op::Ge(0, 1);
+    EQ = 0x18, "eq", CompareLogic, 2, 1, Op::Eq(0, 1);
+    NE = 0x19, "ne", CompareLogic, 2, 1, Op::Ne(0, 1);
+    LT = 0x1A, "lt", CompareLogic, 2, 1, Op::Lt(0, 1);
+    LE = 0x1B, "le", CompareLogic, 2, 1, Op::Le(0, 1);
+    AND = 0x1C, "and", CompareLogic, 2, 1, Op::And(0, 1);
+    OR = 0x1D, "or", CompareLogic, 2, 1, Op::Or(0, 1);
+    NOT = 0x1E, "not", CompareLogic, 1, 1, Op::Not(0);
+    REM = 0x1F, "rem", Map, 2, 1, Op::Rem(0, 1);
+    SELECT = 0x20, "select", Choice, 3, 1, Op::Select { cond: 0, a: 1, b: 2, };
+    REDUCE_SUM = 0x30, "reduce_sum", ReduceScan, 1, 1, Op::ReduceSum(0);
+    REDUCE_MAX = 0x31, "reduce_max", ReduceScan, 1, 1, Op::ReduceMax(0);
+    REDUCE_MIN = 0x32, "reduce_min", ReduceScan, 1, 1, Op::ReduceMin(0);
+    REDUCE_ARGMAX = 0x33, "reduce_argmax", ReduceScan, 1, 1, Op::ReduceArgmax(0);
+    BROADCAST = 0x38, "broadcast", Shape, 1, 1, Op::Broadcast { value: 0, shape: Shape::vector(4), };
+    RESHAPE = 0x39, "reshape", Shape, 1, 1, Op::Reshape { value: 0, shape: Shape::vector(4), };
+    TRANSPOSE = 0x3A, "transpose", Shape, 1, 1, Op::Transpose(0);
+    CUMSUM = 0x40, "cumsum", ReduceScan, 1, 1, Op::CumSum(0);
+    CUMPROD = 0x41, "cumprod", ReduceScan, 1, 1, Op::CumProd(0);
+    SORT_DESC = 0x50, "sort_desc", Order, 1, 2, Op::SortDesc(0);
+    TOP_K = 0x51, "top_k", Order, 1, 2, Op::TopK { input: 0, k: 4 };
+    MATMUL = 0x55, "matmul", Linear, 2, 1, Op::MatMul(0, 1);
+    PIVOT_THRESHOLD = 0x58, "pivot_threshold", Order, 2, 1, Op::PivotThreshold { input: 0, predicate: Predicate::RankLe(1), };
+    GATHER = 0x60, "gather", Index, 2, 1, Op::Gather { src: 0, idx: 1 };
+    GATHER_ROW = 0x61, "gather_row", Index, 2, 1, Op::GatherRow { src: 0, idx: 1 };
+    SCATTER_ADD = 0x62, "scatter_add", Index, 3, 1, Op::ScatterAdd { base: 0, idx: 1, vals: 2, };
+    SCATTER_SET = 0x63, "scatter_set", Index, 3, 1, Op::ScatterSet { base: 0, idx: 1, vals: 2, };
+    IOTA = 0x64, "iota", Index, 0, 1, Op::Iota { len: 8 };
+    MASK_APPLY_PACKED = 0x65, "mask_apply_packed", Sampling, 2, 1, Op::MaskApply { logits: 0, mask: 1 };
+    CAUSAL_MASK = 0x66, "causal_mask", Index, 1, 1, Op::CausalMask { positions: 0, len: 8, };
+    SLIDING_WINDOW_MASK = 0x67, "sliding_window_mask", Index, 1, 1, Op::SlidingWindowMask { positions: 0, len: 8, window: 4, };
+    SINK_WINDOW_MASK = 0x68, "sink_window_mask", Index, 1, 1, Op::SinkWindowMask { positions: 0, len: 8, sink: 2, window: 4, };
+    RNG = 0x70, "rng", Sampling, 0, 1, Op::Rng { stream: 0, shape: Shape::vector(4), kind: RngKind::Gumbel, };
+    RNG_KEYED = 0x71, "rng_keyed", Sampling, 1, 1, Op::RngKeyed { state: 0, shape: Shape::vector(4), kind: RngKind::Uniform, };
+    CONST = 0x81, "const", Leaf, 0, 1, Op::Const(Literal::F32(1.0));
+    CHAN_TAKE = 0x90, "chan_take", Channel, 0, 1, Op::ChanTake(0);
+    CHAN_READ = 0x91, "chan_read", Channel, 0, 1, Op::ChanRead(0);
+    CHAN_PUT = 0x92, "chan_put", Channel, 1, 0, Op::ChanPut { chan: 0, value: 0 };
+    INTRINSIC_VAL = 0xA0, "intrinsic_val", Intrinsic, 0, 1, Op::IntrinsicVal { intr: IntrinsicId::Logits, shape: Shape::matrix(1, 8), dtype: DType::F32, };
+    KERNEL_CALL = 0xA1, "kernel_call", Intrinsic, VARIADIC, 1, Op::KernelCall { name: 0, args: vec![0, 1], shape: Shape::vector(4), dtype: DType::F32, };
+    SINK_CALL = 0xA2, "sink_call", Intrinsic, VARIADIC, 0, Op::SinkCall { name: 0, args: vec![0], };
 }
 
 /// The table row for a wire tag, or `None` when the tag is not a PTIR op.
@@ -869,126 +885,16 @@ mod tests {
 
     #[test]
     fn table_matches_op_metadata() {
-        // One representative per variant; table row must agree with tag(),
-        // result_count(), and operands().len().
-        let reps: Vec<Op> = vec![
-            Op::Exp(0),
-            Op::Log(0),
-            Op::Neg(0),
-            Op::Recip(0),
-            Op::Abs(0),
-            Op::Sign(0),
-            Op::Cast {
-                value: 0,
-                dtype: DType::I32,
-            },
-            Op::Add(0, 1),
-            Op::Sub(0, 1),
-            Op::Mul(0, 1),
-            Op::Div(0, 1),
-            Op::MaxElem(0, 1),
-            Op::MinElem(0, 1),
-            Op::Gt(0, 1),
-            Op::Ge(0, 1),
-            Op::Eq(0, 1),
-            Op::Ne(0, 1),
-            Op::Lt(0, 1),
-            Op::Le(0, 1),
-            Op::And(0, 1),
-            Op::Or(0, 1),
-            Op::Not(0),
-            Op::Rem(0, 1),
-            Op::Select {
-                cond: 0,
-                a: 1,
-                b: 2,
-            },
-            Op::ReduceSum(0),
-            Op::ReduceMax(0),
-            Op::ReduceMin(0),
-            Op::ReduceArgmax(0),
-            Op::Broadcast {
-                value: 0,
-                shape: Shape::vector(4),
-            },
-            Op::Reshape {
-                value: 0,
-                shape: Shape::vector(4),
-            },
-            Op::Transpose(0),
-            Op::CumSum(0),
-            Op::CumProd(0),
-            Op::SortDesc(0),
-            Op::TopK { input: 0, k: 4 },
-            Op::MatMul(0, 1),
-            Op::PivotThreshold {
-                input: 0,
-                predicate: Predicate::RankLe(1),
-            },
-            Op::Gather { src: 0, idx: 1 },
-            Op::GatherRow { src: 0, idx: 1 },
-            Op::ScatterAdd {
-                base: 0,
-                idx: 1,
-                vals: 2,
-            },
-            Op::ScatterSet {
-                base: 0,
-                idx: 1,
-                vals: 2,
-            },
-            Op::Iota { len: 8 },
-            Op::MaskApply { logits: 0, mask: 1 },
-            Op::CausalMask {
-                positions: 0,
-                len: 8,
-            },
-            Op::SlidingWindowMask {
-                positions: 0,
-                len: 8,
-                window: 4,
-            },
-            Op::SinkWindowMask {
-                positions: 0,
-                len: 8,
-                sink: 2,
-                window: 4,
-            },
-            Op::Rng {
-                stream: 0,
-                shape: Shape::vector(4),
-                kind: RngKind::Gumbel,
-            },
-            Op::RngKeyed {
-                state: 0,
-                shape: Shape::vector(4),
-                kind: RngKind::Uniform,
-            },
-            Op::Const(Literal::F32(1.0)),
-            Op::ChanTake(0),
-            Op::ChanRead(0),
-            Op::ChanPut { chan: 0, value: 0 },
-            Op::IntrinsicVal {
-                intr: IntrinsicId::Logits,
-                shape: Shape::matrix(1, 8),
-                dtype: DType::F32,
-            },
-            Op::KernelCall {
-                name: 0,
-                args: vec![0, 1],
-                shape: Shape::vector(4),
-                dtype: DType::F32,
-            },
-            Op::SinkCall {
-                name: 0,
-                args: vec![0],
-            },
-        ];
-        assert_eq!(
-            reps.len(),
-            OP_TABLE.len(),
-            "one representative per table row"
-        );
+        let reps = representatives();
+        for (op, spec) in reps.iter().zip(OP_TABLE) {
+            assert_eq!(
+                op.tag(),
+                spec.tag,
+                "the {} row constructs an op with tag {:#04x}",
+                spec.name,
+                op.tag()
+            );
+        }
         for op in &reps {
             let spec = OP_TABLE
                 .iter()

@@ -991,128 +991,21 @@ mod tests {
 
     #[test]
     fn round_trip_every_op() {
-        let ops = vec![
-            Op::Const(Literal::F32(0.5)),
+        // `representatives()` is one op per `declare_ops!` row, so the wire
+        // sweep cannot fall behind the table. The extra `Const` literals are
+        // payload variation, not table coverage: `Literal` has four arms and
+        // the row can only carry one.
+        let mut ops = alloc::vec![
             Op::Const(Literal::I32(-1)),
             Op::Const(Literal::U32(7)),
             Op::Const(Literal::Bool(true)),
-            Op::Exp(0),
-            Op::Log(0),
-            Op::Neg(0),
-            Op::Recip(0),
-            Op::Abs(0),
-            Op::Sign(0),
-            Op::Cast {
-                value: 0,
-                dtype: DType::U32,
-            },
-            Op::Add(0, 1),
-            Op::Sub(0, 1),
-            Op::Mul(0, 1),
-            Op::Div(0, 1),
-            Op::MaxElem(0, 1),
-            Op::MinElem(0, 1),
-            Op::Rem(0, 1),
-            Op::Gt(0, 1),
-            Op::Ge(0, 1),
-            Op::Eq(0, 1),
-            Op::Ne(0, 1),
-            Op::Lt(0, 1),
-            Op::Le(0, 1),
-            Op::And(4, 5),
-            Op::Or(4, 5),
-            Op::Not(4),
-            Op::Select {
-                cond: 4,
-                a: 0,
-                b: 1,
-            },
-            Op::ReduceSum(0),
-            Op::ReduceMax(0),
-            Op::ReduceMin(0),
-            Op::ReduceArgmax(0),
-            Op::Broadcast {
-                value: 0,
-                shape: Shape::matrix(2, 3),
-            },
-            Op::Reshape {
-                value: 0,
-                shape: Shape::vector(6),
-            },
-            Op::Transpose(0),
-            Op::CumSum(0),
-            Op::CumProd(0),
-            Op::SortDesc(0),
-            Op::TopK { input: 0, k: 3 },
-            Op::MatMul(0, 1),
-            Op::PivotThreshold {
-                input: 0,
-                predicate: Predicate::CummassLe(2),
-            },
-            Op::Gather { src: 0, idx: 1 },
-            Op::GatherRow { src: 0, idx: 1 },
-            Op::ScatterAdd {
-                base: 0,
-                idx: 1,
-                vals: 2,
-            },
-            Op::ScatterSet {
-                base: 0,
-                idx: 1,
-                vals: 2,
-            },
-            Op::Iota { len: 5 },
-            Op::MaskApply { logits: 0, mask: 1 },
-            Op::CausalMask {
-                positions: 0,
-                len: 8,
-            },
-            Op::SlidingWindowMask {
-                positions: 0,
-                len: 8,
-                window: 4,
-            },
-            Op::SinkWindowMask {
-                positions: 0,
-                len: 8,
-                sink: 2,
-                window: 4,
-            },
-            Op::Rng {
-                stream: 2,
-                shape: Shape::vector(4),
-                kind: RngKind::Uniform,
-            },
-            Op::RngKeyed {
-                state: 0,
-                shape: Shape::vector(4),
-                kind: RngKind::Gumbel,
-            },
-            Op::ChanTake(0),
-            Op::ChanRead(1),
-            Op::ChanPut { chan: 0, value: 0 },
-            Op::IntrinsicVal {
-                intr: IntrinsicId::Layer,
-                shape: Shape::SCALAR,
-                dtype: DType::U32,
-            },
-            Op::KernelCall {
-                name: 0,
-                args: vec![0, 1, 2],
-                shape: Shape::vector(9),
-                dtype: DType::F32,
-            },
-            Op::SinkCall {
-                name: 0,
-                args: vec![0],
-            },
         ];
-        // The list above is hand-written, so it can fall behind `declare_ops!`.
-        // `table_matches_op_metadata` pins one representative per variant
-        // against `OP_TABLE`; this pins the *wire* path, and nothing else does.
-        // Without the sweep a new op could land in `declare_ops!` with an
-        // `encode_op` arm and no `decode_op` arm, and the first thing to read
-        // the missing half back would be a driver.
+        ops.extend(crate::op::representatives());
+        // `table_matches_op_metadata` pins the table's metadata; this pins
+        // the *wire* path, and nothing else does. Without the sweep a new op
+        // could land in `declare_ops!` with an `encode_op` arm and no
+        // `decode_op` arm, and the first thing to read the missing half back
+        // would be a driver.
         let missing: Vec<&str> = crate::op::OP_TABLE
             .iter()
             .filter(|spec| !ops.iter().any(|op| op.tag() == spec.tag))
