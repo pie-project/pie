@@ -90,7 +90,10 @@ struct RawMetalContext::Impl {
     NSMutableArray*           retained = nil;  // keeps PSOs / sub-buffers alive
     std::unordered_set<void*> retained_psos;
     NSMutableDictionary*      argtables = nil;  // NSNumber(argkey) -> id<MTL4ArgumentTable>
-    std::unordered_set<uint64_t> bound_arg_slots;
+    // Key is (ordinal << 8) | bind_index -> the address bound there. One
+    // container, not two: the set that used to sit beside this was exactly its
+    // key set, so every bind paid two hashes and every released ordinal paid two
+    // erases per probe, over a table the prefill grows to ~123k entries.
     std::unordered_map<uint64_t, uint64_t> bound_arg_addresses;
     std::unordered_map<void*, size_t> external_allocations;
     bool saw_ptir_compile = false;
@@ -1049,13 +1052,12 @@ void RawMetalContext::arg_bind_ordinal(int ordinal, uint8_t bind_index, SlotHand
     if (t == nil) return;
     [t setAddress:(slot.gpu_address + offset) atIndex:bind_index];
     const uint64_t key = (uint64_t(uint32_t(ordinal)) << 8) | bind_index;
-    I.bound_arg_slots.insert(key);
     I.bound_arg_addresses[key] = slot.gpu_address + offset;
 }
 
 bool RawMetalContext::arg_slot_is_bound(int ordinal, uint8_t bind_index) const {
     const auto key = (uint64_t(uint32_t(ordinal)) << 8) | bind_index;
-    return impl_->bound_arg_slots.find(key) != impl_->bound_arg_slots.end();
+    return impl_->bound_arg_addresses.find(key) != impl_->bound_arg_addresses.end();
 }
 
 uint64_t RawMetalContext::arg_slot_address(int ordinal, uint8_t bind_index) const {
@@ -1076,9 +1078,7 @@ void RawMetalContext::release_argtable_ordinal(int ordinal) {
     for (std::uint32_t bind = 0; bind < 256u; ++bind) {
         const std::uint64_t key =
             (static_cast<std::uint64_t>(static_cast<std::uint32_t>(ordinal)) << 8) | bind;
-        if (I.bound_arg_slots.erase(key) != 0) {
-            I.bound_arg_addresses.erase(key);
-        }
+        I.bound_arg_addresses.erase(key);
     }
 }
 
