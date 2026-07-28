@@ -221,6 +221,59 @@ if(EXISTS "${_FI_PATCH_FILE}" AND NOT EXISTS "${_FI_PATCH_SENTINEL}")
   message(STATUS "Patched FlashInfer narrowing conversion in ${_FI_PATCH_FILE}")
 endif()
 
+# `finalizeMoeRoutingKernel` unpermutes GEMM2's output and does the topk-weighted
+# reduction. Its launcher asks for exactly `num_rows` blocks and the kernel reads
+# the token count back out of `gridDim.x`, so the grid is pinned to the batch
+# size: at decode that is 8 blocks on a 148-SM B200, and the kernel runs at about
+# 57 GB/s (15.5 us per MoE layer, 62 us/step, 3% of GLM at c=8). Upstream already
+# knows better -- the sibling `finalizeMoeRoutingNoFillingKernel` launches
+# `smCount * 8` blocks with the comment "can fully leverage the memory bandwidth
+# (tested on B200)" -- but pie cannot take that branch, which needs `ep_size > 1`
+# and all-to-all.
+#
+# Give the grid a second dimension over column chunks instead. `gridDim.x` still
+# equals `num_rows`, so the kernel's own derivation of it is untouched, and every
+# output element is still produced by exactly one thread reducing the same topk
+# terms in the same order -- the change is bit-exact. Blocks drop to 64 threads
+# so a decode batch spreads over ~96 blocks instead of 8.
+set(_FI_FINALIZE_SENTINEL "${flashinfer_SOURCE_DIR}/.pie_finalize_grid_patched")
+set(_FI_FINALIZE_FILE
+  "${flashinfer_SOURCE_DIR}/csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh")
+if(EXISTS "${_FI_FINALIZE_FILE}" AND NOT EXISTS "${_FI_FINALIZE_SENTINEL}")
+  file(READ "${_FI_FINALIZE_FILE}" _fi_fin_src)
+  set(_FI_FIN_KERNEL_OLD [[  int64_t const start_offset = threadIdx.x;
+  int64_t const stride = FINALIZE_THREADS_PER_BLOCK;]])
+  set(_FI_FIN_KERNEL_NEW [[  int64_t const start_offset = threadIdx.x + blockIdx.y * blockDim.x;
+  int64_t const stride = static_cast<int64_t>(blockDim.x) * gridDim.y;]])
+  set(_FI_FIN_LAUNCH_OLD [[    int64_t const blocks = num_rows;
+    int64_t const threads = FINALIZE_THREADS_PER_BLOCK;
+    config.gridDim = blocks;
+    config.blockDim = threads;]])
+  set(_FI_FIN_LAUNCH_NEW [[    int64_t const threads = 64;
+    constexpr int64_t pie_elems_per_thread =
+        128 / std::min(sizeof_bits<OutputType>::value, sizeof_bits<GemmOutputType>::value);
+    int64_t const pie_vec_cols =
+        (unpadded_cols + pie_elems_per_thread - 1) / pie_elems_per_thread;
+    int64_t const pie_col_blocks =
+        pie_vec_cols > threads ? (pie_vec_cols + threads - 1) / threads : 1;
+    config.gridDim = dim3(static_cast<unsigned>(num_rows),
+                          static_cast<unsigned>(pie_col_blocks));
+    config.blockDim = dim3(static_cast<unsigned>(threads));]])
+  string(FIND "${_fi_fin_src}" "${_FI_FIN_KERNEL_OLD}" _fi_fin_k_off)
+  string(FIND "${_fi_fin_src}" "${_FI_FIN_LAUNCH_OLD}" _fi_fin_l_off)
+  if(_fi_fin_k_off EQUAL -1 OR _fi_fin_l_off EQUAL -1)
+    message(FATAL_ERROR
+      "FlashInfer finalize-grid patch no longer applies to ${_FI_FINALIZE_FILE}")
+  endif()
+  string(REPLACE "${_FI_FIN_KERNEL_OLD}" "${_FI_FIN_KERNEL_NEW}"
+    _fi_fin_src "${_fi_fin_src}")
+  string(REPLACE "${_FI_FIN_LAUNCH_OLD}" "${_FI_FIN_LAUNCH_NEW}"
+    _fi_fin_src "${_fi_fin_src}")
+  file(WRITE "${_FI_FINALIZE_FILE}" "${_fi_fin_src}")
+  file(WRITE "${_FI_FINALIZE_SENTINEL}" "patched")
+  message(STATUS "Patched FlashInfer finalizeMoeRouting grid in ${_FI_FINALIZE_FILE}")
+endif()
+
 # FlashInfer's `fastdiv.cuh` is a thin wrapper over `cuda::fast_mod_div`, which
 # CCCL only grew in 3.1. A CUDA toolkit that ships an older CCCL cannot compile
 # any FlashInfer attention kernel at all -- CUDA 13.0 ships CCCL 3.0, so the
