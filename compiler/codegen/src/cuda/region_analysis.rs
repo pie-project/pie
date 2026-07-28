@@ -1,4 +1,12 @@
-//! Per-region decisions the host makes and the driver currently re-derives.
+//! Per-region decisions the host makes and the CUDA driver currently
+//! re-derives.
+//!
+//! CUDA-only, and filed here to say so. These are the other half of *this*
+//! backend's contract — which regions bind, and how the generated kernel's
+//! intrinsic side tables are laid out — so they mean nothing to a driver
+//! running someone else's kernels. The engine already gates on that
+//! (`runtime/engine/src/driver/backend.rs`, `codegen_backend == Some("cuda")`)
+//! and no Metal path reads a [`RegionAnalysis`].
 //!
 //! `ptir-refactor.md` §4.2 lists five per-program fields the launch package
 //! still has to absorb. Two of them live in one C++ file,
@@ -27,8 +35,8 @@ use alloc::vec::Vec;
 
 use pie_plan::CompiledStage;
 
-use crate::cuda::fused::analyze_direct_argmax;
-use crate::cuda::validate::{second_party_region_supported, validate_generated_region};
+use super::fused::analyze_direct_argmax;
+use super::validate::{second_party_region_supported, validate_generated_region};
 use crate::op_view::{OpView, result_bases};
 
 /// The region can be bound as a second-party (non-generated) region — today

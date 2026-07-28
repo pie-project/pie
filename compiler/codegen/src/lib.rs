@@ -28,9 +28,11 @@
 //! `m1_codegen.cpp`. Supporting them:
 //!
 //! * [`op_view`] — a decoded, borrow-free view of a normalized op.
-//! * [`region_analysis`] — the per-region facts both backends need.
 //! * [`launch`] — the launch descriptors the drivers execute.
 //! * [`program`] — the whole-program bundle handed across the C ABI.
+//!
+//! Anything only one backend's driver reads lives under that backend, not here
+//! — see [`cuda::region_analysis`].
 //!
 //! Those last two are built out of [`pie_driver_abi`], which is why this crate
 //! is the one that reaches outside `compiler/`. That crate is the contract, not
@@ -53,7 +55,6 @@ pub mod layout;
 pub mod metal;
 pub mod op_view;
 pub mod program;
-pub mod region_analysis;
 pub mod rng;
 #[cfg(test)]
 mod runtime_scan;

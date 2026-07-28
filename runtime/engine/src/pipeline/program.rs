@@ -114,7 +114,7 @@ impl RegisteredProgram {
     /// why it must not be answered twice. Shipped on the same terms as
     /// `stage_identities` — the driver compares while both exist.
     pub fn region_analysis(&self) -> Vec<RegionAnalysis> {
-        pie_codegen::region_analysis::analyze_program(&self.compiled_stages)
+        pie_codegen::cuda::region_analysis::analyze_program(&self.compiled_stages)
             .into_iter()
             .map(|region| RegionAnalysis {
                 stage_index: region.stage_index,

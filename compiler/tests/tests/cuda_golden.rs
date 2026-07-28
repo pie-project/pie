@@ -547,7 +547,7 @@ fn emit_driver_test_kernel_fixtures() {
         //   `region <stage> <region> <flags> <argmax-count> <skipped...>`
         //   `argmax <node> <source_value> <intrinsic> <requires_single_row>`
         let mut regions = String::new();
-        for region in pie_codegen::region_analysis::analyze_program(&stages) {
+        for region in pie_codegen::cuda::region_analysis::analyze_program(&stages) {
             let mut header = format!(
                 "region {} {} {} {}",
                 region.stage_index,
