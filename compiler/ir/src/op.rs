@@ -316,7 +316,63 @@ pub enum Op {
     },
 }
 
+/// How an op touches a channel. See [`Op::channel_use`].
+///
+/// An enum rather than a bool because the three uses are not interchangeable:
+/// readiness needs a full slot for `Take`/`Read` and an empty one for `Put`,
+/// and SPSC endpoint counting treats `Take` and `Read` as consumers. Every
+/// consumer matches this exhaustively, so a fourth channel op cannot be added
+/// without each of them being asked what it means.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ChannelUse {
+    /// Consuming read (`chan_take`) — empties the slot.
+    Take,
+    /// Non-consuming read (`chan_read`) — requires a full slot, leaves it full.
+    Read,
+    /// Write (`chan_put`) — requires an empty slot.
+    Put,
+}
+
 impl Op {
+    /// How this op uses a channel, and which one, or `None` if it uses none.
+    ///
+    /// The single answer to "is this a channel op?". It replaced six separate
+    /// `match op { Op::ChanTake(c) | Op::ChanRead(c) => .., Op::ChanPut { .. }
+    /// => .., _ => {} }` scans across the planner, the validator and the DSL
+    /// builder. Six copies is six chances to miss a new channel op, and the
+    /// failure is not a crash: two of those scans rewrite channel ids, so a
+    /// missed op keeps a stale id and reads the wrong channel.
+    ///
+    /// `table_matches_op_metadata` pins this to `Family::Channel`, so the op
+    /// table and this accessor cannot disagree about what a channel op is.
+    pub fn channel_use(&self) -> Option<(ChannelUse, ChannelIndex)> {
+        match self {
+            Op::ChanTake(chan) => Some((ChannelUse::Take, *chan)),
+            Op::ChanRead(chan) => Some((ChannelUse::Read, *chan)),
+            Op::ChanPut { chan, .. } => Some((ChannelUse::Put, *chan)),
+            _ => None,
+        }
+    }
+
+    /// The channel id this op names, for rewriting it. See [`Op::channel_use`].
+    pub fn channel_mut(&mut self) -> Option<&mut ChannelIndex> {
+        match self {
+            Op::ChanTake(chan) | Op::ChanRead(chan) | Op::ChanPut { chan, .. } => Some(chan),
+            _ => None,
+        }
+    }
+
+    /// The name-table index this op names, for rewriting it when a stage's
+    /// name table is localized. `intrinsic_val` shares `Family::Intrinsic`
+    /// with these two but carries no name, so this set is pinned by tag rather
+    /// than by family.
+    pub fn name_index_mut(&mut self) -> Option<&mut NameIndex> {
+        match self {
+            Op::KernelCall { name, .. } | Op::SinkCall { name, .. } => Some(name),
+            _ => None,
+        }
+    }
+
     /// Number of SSA ids this op defines.
     ///
     /// Read from [`OP_TABLE`] rather than re-derived here. The catch-all this
@@ -850,6 +906,28 @@ mod tests {
                 spec.results as u32,
                 op.result_count(),
                 "results for {}",
+                spec.name
+            );
+
+            // The channel accessors and the table must agree on what a
+            // channel op is; six scans across three crates depend on it.
+            let is_channel = spec.family == Family::Channel;
+            assert_eq!(
+                op.channel_use().is_some(),
+                is_channel,
+                "channel_use for {}",
+                spec.name
+            );
+            assert_eq!(
+                op.clone().channel_mut().is_some(),
+                is_channel,
+                "channel_mut for {}",
+                spec.name
+            );
+            assert_eq!(
+                op.clone().name_index_mut().is_some(),
+                spec.tag == tags::KERNEL_CALL || spec.tag == tags::SINK_CALL,
+                "name_index_mut for {}",
                 spec.name
             );
             if spec.val_operands != VARIADIC {

@@ -16,7 +16,7 @@ use core::fmt;
 
 use super::container::{ChannelDecl, ExternDir, HostRole, PortSource, TraceContainer};
 use super::infer::{BodyCtx, BodyError, body_types};
-use super::op::{IntrinsicId, Op};
+use super::op::{ChannelUse, IntrinsicId, Op};
 use super::registry::{
     KNOWN_SINKS, ModelProfile, Phase, Port, SinkScope, Stage, intrinsic_available, intrinsic_stages,
 };
@@ -518,40 +518,34 @@ pub fn bind(container: TraceContainer, profile: ModelProfile) -> Result<BoundTra
     };
     for sp in &container.stages {
         for op in &sp.ops {
-            match *op {
-                Op::ChanPut { chan, .. } => {
-                    if container.channels[chan as usize].host_role == HostRole::Writer {
-                        return Err(ValidateError::SecondProducer {
-                            chan,
-                            stage: sp.stage,
-                        });
+            let Some((use_, chan)) = op.channel_use() else {
+                continue;
+            };
+            // Which endpoint a local op occupies, and therefore which peer it
+            // would be a second copy of.
+            let (local_role, peer_dir) = match use_ {
+                ChannelUse::Put => (HostRole::Writer, ExternDir::Import),
+                // A non-consuming read still occupies the consumer endpoint.
+                ChannelUse::Take | ChannelUse::Read => (HostRole::Reader, ExternDir::Export),
+            };
+            if container.channels[chan as usize].host_role == local_role {
+                return Err(if use_ == ChannelUse::Put {
+                    ValidateError::SecondProducer {
+                        chan,
+                        stage: sp.stage,
                     }
-                    if extern_dir(chan) == Some(ExternDir::Import) {
-                        // The peer instance is the producer — a local put is a
-                        // second producer endpoint.
-                        return Err(ValidateError::ExternDirViolation {
-                            chan,
-                            stage: sp.stage,
-                        });
+                } else {
+                    ValidateError::SecondConsumer {
+                        chan,
+                        stage: sp.stage,
                     }
-                }
-                Op::ChanTake(chan) | Op::ChanRead(chan) => {
-                    if container.channels[chan as usize].host_role == HostRole::Reader {
-                        return Err(ValidateError::SecondConsumer {
-                            chan,
-                            stage: sp.stage,
-                        });
-                    }
-                    if extern_dir(chan) == Some(ExternDir::Export) {
-                        // The peer instance is the consumer — a local take/read
-                        // is a second consumer endpoint.
-                        return Err(ValidateError::ExternDirViolation {
-                            chan,
-                            stage: sp.stage,
-                        });
-                    }
-                }
-                _ => {}
+                });
+            }
+            if extern_dir(chan) == Some(peer_dir) {
+                return Err(ValidateError::ExternDirViolation {
+                    chan,
+                    stage: sp.stage,
+                });
             }
         }
     }
@@ -667,14 +661,12 @@ pub fn readiness_table(c: &TraceContainer) -> Vec<ReadinessEntry> {
                 };
                 if let Some(sp) = stage_prog(stage) {
                     for op in &sp.ops {
-                        match *op {
-                            Op::ChanTake(chan) | Op::ChanRead(chan) => {
-                                visit(chan, phase, Direction::NeedsFull, &mut seen)
-                            }
-                            Op::ChanPut { chan, .. } => {
-                                visit(chan, phase, Direction::NeedsEmpty, &mut seen)
-                            }
-                            _ => {}
+                        if let Some((use_, chan)) = op.channel_use() {
+                            let direction = match use_ {
+                                ChannelUse::Take | ChannelUse::Read => Direction::NeedsFull,
+                                ChannelUse::Put => Direction::NeedsEmpty,
+                            };
+                            visit(chan, phase, direction, &mut seen);
                         }
                     }
                 }
@@ -722,21 +714,27 @@ pub fn classify_channels(c: &TraceContainer, readiness: &[ReadinessEntry]) -> Ve
         for (si, sp) in c.stages.iter().enumerate() {
             let mut next_id = 0u32;
             for (oi, op) in sp.ops.iter().enumerate() {
-                match *op {
-                    Op::ChanTake(ch) if ch == ci => {
-                        if take.is_some() {
-                            extra = true;
+                if let Some((use_, ch)) = op.channel_use()
+                    && ch == ci
+                {
+                    match use_ {
+                        ChannelUse::Take => {
+                            if take.is_some() {
+                                extra = true;
+                            }
+                            take = Some((si, oi, next_id));
                         }
-                        take = Some((si, oi, next_id));
-                    }
-                    Op::ChanRead(ch) if ch == ci => extra = true,
-                    Op::ChanPut { chan, value } if chan == ci => {
-                        if put.is_some() {
-                            extra = true;
+                        // A peek is a second reader, so never linear.
+                        ChannelUse::Read => extra = true,
+                        ChannelUse::Put => {
+                            if put.is_some() {
+                                extra = true;
+                            }
+                            if let Op::ChanPut { value, .. } = *op {
+                                put = Some((si, oi, value));
+                            }
                         }
-                        put = Some((si, oi, value));
                     }
-                    _ => {}
                 }
                 next_id += op.result_count();
             }

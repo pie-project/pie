@@ -80,9 +80,13 @@ exclude = [
 # Everything below is at zero occurrences across the compiler crates as of this
 # commit, so each is a ratchet that costs nothing today and blocks a
 # regression tomorrow. Lints that would need a cleanup first are deliberately
-# absent — notably `clippy::wildcard_enum_match_arm` (38 sites in `src/`, 15 of
-# them in `plan/compile.rs`), which is the lint that would have caught the
-# catch-all `_ =>` arms that silently absorbed new ops and intrinsics.
+# absent — notably `clippy::wildcard_enum_match_arm`, the lint that would have
+# caught the catch-all `_ =>` arms that silently absorbed new ops. Down from 38
+# sites to 26; the survivors were each read and are fail-safe (`_ => None`,
+# `_ => {}`, "skip this optimization") or delegate to a match that *is*
+# exhaustive, so a new variant inherits a conservative answer rather than a
+# confident wrong one. Turning the lint on would now mean 26 `#[allow]`s or 26
+# hand-written variant lists that drift, which buys less than it costs.
 [workspace.lints.rust]
 # Promoted from `compiler/dsl`, which was the only crate carrying it. There is
 # no `unsafe` anywhere under `compiler/`, so this extends that crate's existing

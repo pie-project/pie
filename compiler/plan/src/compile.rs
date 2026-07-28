@@ -1086,15 +1086,13 @@ fn localize_stage(bound: &BoundTrace, stage: &mut NormalizedStage) {
     let mut channels = Vec::new();
     let mut names = Vec::new();
     for op in &mut stage.ops {
-        match op {
-            Op::ChanTake(channel) | Op::ChanRead(channel) => {
-                *channel = local_channel(&mut channels, *channel)
-            }
-            Op::ChanPut { chan, .. } => *chan = local_channel(&mut channels, *chan),
-            Op::KernelCall { name, .. } | Op::SinkCall { name, .. } => {
-                *name = local_name(&bound.container.names, &mut names, *name)
-            }
-            _ => {}
+        // Not `else if`: an op could carry both. Missing either rewrite leaves
+        // a global id in a stage-local table, which reads the wrong slot.
+        if let Some(channel) = op.channel_mut() {
+            *channel = local_channel(&mut channels, *channel);
+        }
+        if let Some(name) = op.name_index_mut() {
+            *name = local_name(&bound.container.names, &mut names, *name);
         }
     }
     for port in signature_ports(bound, stage.stage) {

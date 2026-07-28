@@ -10,7 +10,7 @@ use core::fmt::Write as _;
 
 use alloc::vec::Vec;
 
-use pie_ir::op::Op;
+use pie_ir::op::ChannelUse;
 use pie_ir::validate::{BoundTrace, Direction};
 
 use super::M1ChannelEffect;
@@ -269,10 +269,21 @@ pub fn channel_effects(bound: &BoundTrace) -> Vec<M1ChannelEffect> {
         };
         for program in &bound.container.stages {
             for op in &program.ops {
-                match op {
-                    Op::ChanTake(taken) if *taken == chan => effect.take = true,
-                    Op::ChanPut { chan: put, .. } if *put == chan => effect.put = true,
-                    _ => {}
+                let Some((use_, used)) = op.channel_use() else {
+                    continue;
+                };
+                if used != chan {
+                    continue;
+                }
+                // The driver advances the ring off these two flags, so a
+                // channel op that is not classified here leaves the ring
+                // un-advanced rather than raising anything.
+                match use_ {
+                    ChannelUse::Take => effect.take = true,
+                    ChannelUse::Put => effect.put = true,
+                    // A peek neither drains nor fills; `requires_full` below
+                    // is what keeps it ordered.
+                    ChannelUse::Read => {}
                 }
             }
         }

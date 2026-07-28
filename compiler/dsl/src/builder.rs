@@ -21,7 +21,6 @@ use alloc::vec::Vec;
 use pie_ir::container::{
     ChanDType, ChannelDecl, HostRole, PortBinding, PortSource, StageProgram, TraceContainer,
 };
-use pie_ir::op::Op;
 use pie_ir::registry::{Port, Stage};
 
 use crate::channel::Channel;
@@ -149,10 +148,8 @@ impl<'a> Builder<'a> {
             .into_iter()
             .map(|mut r| {
                 for op in &mut r.ops {
-                    match op {
-                        Op::ChanTake(c) | Op::ChanRead(c) => *c = remap[*c as usize],
-                        Op::ChanPut { chan, .. } => *chan = remap[*chan as usize],
-                        _ => {}
+                    if let Some(chan) = op.channel_mut() {
+                        *chan = remap[*chan as usize];
                     }
                 }
                 r
@@ -184,11 +181,8 @@ impl<'a> Builder<'a> {
             .into_iter()
             .map(|mut r| {
                 for op in &mut r.ops {
-                    match op {
-                        Op::KernelCall { name, .. } | Op::SinkCall { name, .. } => {
-                            *name = name_remap[*name as usize];
-                        }
-                        _ => {}
+                    if let Some(name) = op.name_index_mut() {
+                        *name = name_remap[*name as usize];
                     }
                 }
                 r
