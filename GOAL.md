@@ -977,6 +977,53 @@ Read against the single-schema numbers, the effect runs both ways: those
 *understate* the gap at batch 512 with many schemas, where it reaches 20x, and
 *overstate* it at batch 128 with two, where we lose at 0.79x.
 
+**Where a small batch's microseconds went (2026-07-28).** The step lost to
+XGrammar below about batch 100, and profiling said why: at batch 32 only 27% of
+134.8 us of device time was the replay. The rest was fourteen small kernels
+whose cost barely moved with the batch. Four fixes, each measured:
+
+| | was | now |
+|---|---:|---:|
+| `_hash_kernel` | 8.1 us | **2.6** |
+| `_dedup_kernel` | 8.6 | **3.2** |
+| counting and prefix-summing | 15.0 | **8.8** |
+| `_broadcast_kernel` | 11.9 | **2.5** |
+| `_commit_kernel` | 8.6 | **3.9** |
+| clearing the candidate flags | 2 MB a step | **gone** |
+| **whole step, batch 32** | **134.8** | **103.0** |
+| **whole step, batch 512** | **207.9** | **149.5** |
+
+Three of the five are the same bug this design keeps making: a loop over the
+*ceiling* rather than over what exists. `for config in range(0, CONFIGS)` is
+unrolled whole, so hashing a sequence's one to twelve configurations ran 128
+bodies each loading 256 stack slots. The candidate flags were one per slot, so
+every step cleared 2 MB to make room for a few dozen answers - replaced by a
+count per configuration, which also removed the commit's ceiling loop. The
+fourth was bandwidth: the broadcast is a copy and ran one program per sequence,
+32 programs on 108 multiprocessors, moving 606 KB at 51 GB/s.
+
+Re-sweeping the sweep width afterwards moved it from 2,048 blocks to 4,096:
+103 and 149 us against 103 and 175. Fewer is much worse (256 blocks is 180 and
+516), which says the blocks were never the floor - the items were.
+
+Against XGrammar, charging both engines the whole step with one
+synchronisation:
+
+| batch | ours | XGrammar | was | now |
+|---:|---:|---:|---:|---:|
+| 32 | 162.9 us | 133.1 us | 0.61x | **0.82x** |
+| 128 | 189.3 | 512.7 | 1.97x | **2.71x** |
+| 512 | 217.5 | 1,998.6 | 5.77x | **9.19x** |
+
+**We still lose at batch 32**, and the remaining 103 us of device time is 36.6
+of replay and the rest spread over kernels that are now at their launch floor.
+Closing it needs the replay itself to shrink, not more of this.
+
+What did change is the answer to "what if XGrammar ported its fill to the GPU".
+Their advance stays on the host either way, and at batch 512 it alone is 330 us
+against our whole step at 244: **1.35x, where before this it was 0.94x.** A
+perfect port of the half they could port would no longer be enough.
+
 **Host contention (q21).** Weaker than expected and worth saying so. With
 twenty-four cores deliberately saturated, XGrammar's fill slows by 1.06x and
 ours by 1.01x; both engines' p99 degrades to about 3 ms, which is the operating

@@ -45,7 +45,19 @@ _GROUP_BLOCK = 64
 # what a CUDA graph needs and what a batch of mixed grammars would need. It also
 # bounds the replay scratch, which is now one window per block rather than one
 # per (sequence, configuration, group).
-_SWEEP_BLOCKS = 2048
+# Rows below which one block counting and scanning beats three launches. Set
+# from measurement rather than reasoning: at 4,096 rows the fused kernel is
+# 2 us against 15, and by 65,536 the parallel scan has caught up.
+_SCAN_ALONE = 16384
+# One chunk rather than four: the scan is sequential across chunks, so a
+# narrower block turns a log-depth reduction into a serial chain. Measured at
+# batch 32, 8.8 us against 12.4 at a block of 1,024 and 15.0 for the three
+# launches this replaces.
+_SCAN_BLOCK = 4096
+_SCAN_WARPS = 8
+
+_SWEEP_BLOCKS = 4096
+
 # Sentinel for "no group of this configuration holds the sampled token". Above
 # any group index, so an atomic minimum picks the earliest real finder.
 _NO_GROUP = 2**31 - 1
@@ -618,6 +630,67 @@ def _count_kernel(
 
 
 @triton.jit
+def _count_scan_kernel(
+    group_offsets_ptr,
+    lexer_state_ptr,
+    config_count_ptr,
+    widest_ptr,
+    representative_ptr,
+    grammar_ptr,
+    bases_ptr,
+    offsets_ptr,
+    CONFIGS: tl.constexpr,
+    ROWS: tl.constexpr,
+    SKIP_DUPLICATES: tl.constexpr,
+    UNIT: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """The same counts as `_count_kernel`, already summed.
+
+    One launch instead of three. The counts were written out, read back by
+    cuBLAS's two-kernel scan and written again, which at batch 32 was 15 us of
+    a 124 us step to prefix-sum four thousand numbers most of which are zero.
+    One block is enough for that, and a block that has just computed a value
+    can scan it without it ever reaching memory.
+
+    Deliberately one program: the scan is sequential across chunks, so a wider
+    grid would need a second pass, which is the thing being removed. At large
+    `ROWS` a single block loses to the parallel scan, so the caller picks.
+    """
+    running = 0
+    start = 0
+    tl.store(offsets_ptr, 0)
+    while start < ROWS:
+        lane = start + tl.arange(0, BLOCK)
+        live = lane < ROWS
+        sequence = lane // CONFIGS
+        config = lane % CONFIGS
+        keep = live
+        keep = keep & (config < tl.load(widest_ptr))
+        keep = keep & (
+            config < tl.load(config_count_ptr + sequence, mask=live, other=0)
+        )
+        if SKIP_DUPLICATES == 1:
+            keep = keep & (
+                tl.load(representative_ptr + sequence, mask=live, other=-1) == sequence
+            )
+        if UNIT == 1:
+            value = tl.where(keep, 1, 0)
+        else:
+            grammar = tl.load(grammar_ptr + sequence, mask=live, other=0)
+            at = tl.load(
+                bases_ptr + grammar * _NBASES + _B_GROUP_OFFSETS, mask=keep, other=0
+            )
+            state = tl.load(lexer_state_ptr + lane, mask=keep, other=0)
+            first = tl.load(group_offsets_ptr + at + state, mask=keep, other=0)
+            last = tl.load(group_offsets_ptr + at + state + 1, mask=keep, other=0)
+            value = tl.where(keep, last - first, 0)
+        tl.store(offsets_ptr + 1 + lane, running + tl.cumsum(value, axis=0), mask=live)
+        running = running + tl.sum(value)
+        start = start + BLOCK
+
+
+@triton.jit
 def _history_kernel(
     lexer_state_ptr,
     stack_ptr,
@@ -1103,7 +1176,7 @@ def _candidate_kernel(
     grammar_ptr,
     bases_ptr,
     scratch_ptr,
-    cand_valid_ptr,
+    cand_count_ptr,
     cand_lexer_ptr,
     cand_depth_ptr,
     cand_floor_ptr,
@@ -1388,7 +1461,6 @@ def _candidate_kernel(
                         # there, so what is stored is the floor and the window.
                         # Whole stacks made this 151 MB at batch 512, four fifths of
                         # everything a batch allocated.
-                        tl.store(cand_valid_ptr + out_base + index, 1)
                         tl.store(cand_lexer_ptr + out_base + index, next_state)
                         tl.store(cand_depth_ptr + out_base + index, copy_depth)
                         tl.store(cand_floor_ptr + out_base + index, floor)
@@ -1411,6 +1483,11 @@ def _candidate_kernel(
                     span = tl.maximum(span, radix)
                     path = path + 1
                 use = use + 1
+            # How many candidates this configuration produced, so the commit
+            # reads that many rather than the ceiling - and so nothing has to
+            # be cleared between steps. Clearing the ceiling was 2 MB a step at
+            # batch 32 to make room for a few dozen answers.
+            tl.store(cand_count_ptr + row_index, index)
             # A configuration with more derivations than there is room for keeps
             # a prefix of them, which narrows the mask at the next token. That
             # is the one failure this engine must not do quietly, and the slot
@@ -1431,7 +1508,7 @@ def _commit_kernel(
     old_lexer_ptr,
     old_count_ptr,
     old_stack_ptr,
-    cand_valid_ptr,
+    cand_count_ptr,
     cand_lexer_ptr,
     cand_depth_ptr,
     cand_floor_ptr,
@@ -1484,12 +1561,13 @@ def _commit_kernel(
                     if 1 == 1:
                         if tl.load(old_lexer_ptr + sequence * CONFIGS + source) == state:
                             base = (sequence * CONFIGS + source) * MAX_READINGS
-                            for index in range(0, MAX_READINGS):
-                                if tl.load(cand_valid_ptr + base + index) == 1:
-                                    if written >= CONFIGS:
-                                        saturated = 1
+                            made = tl.load(cand_count_ptr + sequence * CONFIGS + source)
+                            index = 0
+                            while index < made:
+                                if written >= CONFIGS:
+                                    saturated = 1
                                 if written < CONFIGS:
-                                    if tl.load(cand_valid_ptr + base + index) == 1:
+                                    if 1 == 1:
                                         next_state = tl.load(cand_lexer_ptr + base + index)
                                         depth = tl.load(cand_depth_ptr + base + index)
                                         # The candidate's stack, put back
@@ -1552,6 +1630,7 @@ def _commit_kernel(
                                                 mask=lane < depth,
                                             )
                                             written = written + 1
+                                index = index + 1
                         source = source + 1
         state_slot = state_slot + 1
 
@@ -1599,19 +1678,25 @@ def _hash_kernel(
     # different tokens, so sharing a mask between them would be wrong.
     digest = (digest ^ tl.load(grammar_ptr + sequence)) * 16777619
     digest = (digest ^ count) * 16777619
-    for config in range(0, CONFIGS):
-        if config < count:
-            row = sequence * CONFIGS + config
-            depth = tl.load(stack_depth_ptr + row)
-            digest = (digest ^ tl.load(lexer_state_ptr + row)) * 16777619
-            digest = (digest ^ depth) * 16777619
-            lane = tl.arange(0, STACK_STRIDE)
-            values = tl.load(
-                stack_ptr + row * STACK_STRIDE + lane, mask=lane < depth, other=0
-            )
-            # Order matters, so fold with a position-dependent weight rather
-            # than a plain sum.
-            digest = (digest ^ tl.sum(values * (lane + 1))) * 16777619
+    # Over the configurations that exist, not the ceiling. A `range` over a
+    # constexpr is unrolled whole, so this was 128 bodies each loading 256
+    # stack slots to fold the one to twelve a sequence actually holds - the
+    # same mistake as the fill grid and the replay scratch, in a kernel small
+    # enough that nobody looked.
+    config = 0
+    while config < count:
+        row = sequence * CONFIGS + config
+        depth = tl.load(stack_depth_ptr + row)
+        digest = (digest ^ tl.load(lexer_state_ptr + row)) * 16777619
+        digest = (digest ^ depth) * 16777619
+        lane = tl.arange(0, STACK_STRIDE)
+        values = tl.load(
+            stack_ptr + row * STACK_STRIDE + lane, mask=lane < depth, other=0
+        )
+        # Order matters, so fold with a position-dependent weight rather
+        # than a plain sum.
+        digest = (digest ^ tl.sum(values * (lane + 1))) * 16777619
+        config = config + 1
     tl.store(hash_ptr + sequence, digest)
 
 
@@ -1666,28 +1751,32 @@ def _dedup_kernel(
             # The fingerprint only narrows it. Two different parse states that
             # hash alike would otherwise share a mask and one would be wrong.
             same = 1
-            for config in range(0, CONFIGS):
-                if config < count:
-                    a = sequence * CONFIGS + config
-                    b = other * CONFIGS + config
-                    depth = tl.load(stack_depth_ptr + a)
-                    if tl.load(lexer_state_ptr + a) != tl.load(lexer_state_ptr + b):
-                        same = 0
-                    if depth != tl.load(stack_depth_ptr + b):
-                        same = 0
-                    slot = tl.arange(0, STACK_STRIDE)
-                    left = tl.load(
-                        stack_ptr + a * STACK_STRIDE + slot,
-                        mask=slot < depth,
-                        other=0,
-                    )
-                    right = tl.load(
-                        stack_ptr + b * STACK_STRIDE + slot,
-                        mask=slot < depth,
-                        other=0,
-                    )
-                    if tl.sum(tl.where(left != right, 1, 0)) != 0:
-                        same = 0
+            config = 0
+            # Stops at the first difference as well as at the count: a
+            # candidate that fails is usually going to fail on its first
+            # configuration, and there is nothing to learn from the rest.
+            while config < count and same == 1:
+                a = sequence * CONFIGS + config
+                b = other * CONFIGS + config
+                depth = tl.load(stack_depth_ptr + a)
+                if tl.load(lexer_state_ptr + a) != tl.load(lexer_state_ptr + b):
+                    same = 0
+                if depth != tl.load(stack_depth_ptr + b):
+                    same = 0
+                slot = tl.arange(0, STACK_STRIDE)
+                left = tl.load(
+                    stack_ptr + a * STACK_STRIDE + slot,
+                    mask=slot < depth,
+                    other=0,
+                )
+                right = tl.load(
+                    stack_ptr + b * STACK_STRIDE + slot,
+                    mask=slot < depth,
+                    other=0,
+                )
+                if tl.sum(tl.where(left != right, 1, 0)) != 0:
+                    same = 0
+                config = config + 1
             if same == 1:
                 found = other
             else:
@@ -1715,13 +1804,17 @@ def _broadcast_kernel(
     mask_words,
     BLOCK: tl.constexpr,
 ):
-    """Copy each duplicate's mask from the sequence that computed it."""
+    """Copy each duplicate's mask from the sequence that computed it.
+
+    Two dimensions, because this is a copy and copies are bandwidth. One
+    program per sequence walked a whole 19 KiB row in chunks and left a batch
+    of 32 running 32 programs on 108 multiprocessors: 606 KB moved at 51 GB/s
+    on a device that does twenty times that. The words are the second axis.
+    """
     sequence = tl.program_id(0)
     source = tl.load(representative_ptr + sequence)
-    if source == sequence:
-        return
-    for start in range(0, mask_words, BLOCK):
-        lane = start + tl.arange(0, BLOCK)
+    if source != sequence:
+        lane = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
         live = lane < mask_words
         value = tl.load(mask_ptr + source * mask_words + lane, mask=live, other=0)
         tl.store(mask_ptr + sequence * mask_words + lane, value, mask=live)
@@ -2560,7 +2653,13 @@ class DeviceBatch:
         readings = min(grammar.max_readings * grammar.paths, self.configs)
         self.max_readings = readings
         slots = batch * self.configs * readings
-        self.cand_valid = torch.zeros(slots, dtype=torch.int32, device="cuda")
+        # One count per (sequence, configuration), not one flag per slot. The
+        # candidate kernel writes every row the commit will read, so nothing
+        # here has to start at a known value - which is what removes a 2 MB
+        # clear from every step at batch 32.
+        self.cand_count = torch.zeros(
+            batch * self.configs, dtype=torch.int32, device="cuda"
+        )
         self.cand_lexer = torch.zeros(slots, dtype=torch.int32, device="cuda")
         self.cand_depth = torch.zeros(slots, dtype=torch.int32, device="cuda")
         self.cand_floor = torch.zeros(slots, dtype=torch.int32, device="cuda")
@@ -2616,6 +2715,10 @@ class DeviceBatch:
         # tried and is worse: a batch of eight went from 74 us to 154 us on 64
         # blocks, because fewer blocks means more items each, while a batch of
         # one was unchanged - its cost is the eight launches, not the grid.
+        # Swept again once the small kernels were out of the way: 256 blocks is
+        # 180 us at batch 32 and 516 at 512, 2,048 is 103 and 175, and 4,096 is
+        # 103 and 149. Past that batch 32 loses more to the launch than batch
+        # 512 gains. The blocks are not the floor; the items are.
         self.sweep_blocks = _SWEEP_BLOCKS
         self.max_groups = grammar.max_groups_per_state
         self.advance_blocks = (self.max_groups + _GROUP_BLOCK - 1) // _GROUP_BLOCK
@@ -2934,7 +3037,6 @@ class DeviceBatch:
 
     def _advance(self) -> None:
         grammar = self.grammar
-        self.cand_valid.zero_()
         self.found.fill_(_NO_GROUP)
         rows = self.batch * self.configs
         # One entry per live configuration, enumerated the way the fill
@@ -2943,25 +3045,9 @@ class DeviceBatch:
         # nothing checked; sizing it by the ceiling meant launching for every
         # configuration and returning at once from fifteen of sixteen, which was
         # 38 us of a 163 us step.
-        _count_kernel[((rows + 255) // 256,)](
-            grammar.group_offsets,
-            self.lexer_state,
-            self.config_count,
-            self.widest,
-            self.representative,
-            self.grammar_of,
-            grammar.bases,
-            self.live_counts,
-            CONFIGS=self.configs,
-            ROWS=rows,
-            SKIP_DUPLICATES=0,
-            UNIT=1,
-            BLOCK=256,
+        self._count_and_scan(
+            grammar, rows, self.live_counts, self.live_offsets, skip=0, unit=1
         )
-        # Torch's scan rather than one of our own: a single program carrying a
-        # running total across eight thousand words is one multiprocessor doing
-        # what thirty could, and measured 16 us against 9.
-        torch.cumsum(self.live_counts, 0, out=self.live_offsets[1:])
         # After the running sum, so the history knows which configurations are
         # in play: before it, `live_offsets` still describes the previous step.
         if self.rollback_depth > 0:
@@ -3039,7 +3125,7 @@ class DeviceBatch:
             self.grammar_of,
             grammar.bases,
             self.advance_scratch,
-            self.cand_valid,
+            self.cand_count,
             self.cand_lexer,
             self.cand_depth,
             self.cand_floor,
@@ -3063,7 +3149,7 @@ class DeviceBatch:
             self.old_lexer,
             self.old_count,
             self.old_stack,
-            self.cand_valid,
+            self.cand_count,
             self.cand_lexer,
             self.cand_depth,
             self.cand_floor,
@@ -3172,6 +3258,51 @@ class DeviceBatch:
             return self.mask
         return self._fill()
 
+    def _count_and_scan(self, grammar, rows, counts, offsets, skip, unit) -> None:
+        """Count each configuration's work and prefix-sum it.
+
+        One block does both when the row count is small, which is where the
+        three launches this replaces were most of the step. Past the threshold
+        a single program carrying a running total is one multiprocessor doing
+        what thirty could - measured 16 us against 9 - so the parallel scan
+        keeps that end. The choice is made from the batch shape, which is fixed
+        when the graph is recorded, so it is not a branch inside a step.
+        """
+        if rows <= _SCAN_ALONE:
+            _count_scan_kernel[(1,)](
+                grammar.group_offsets,
+                self.lexer_state,
+                self.config_count,
+                self.widest,
+                self.representative,
+                self.grammar_of,
+                grammar.bases,
+                offsets,
+                CONFIGS=self.configs,
+                ROWS=rows,
+                SKIP_DUPLICATES=skip,
+                UNIT=unit,
+                BLOCK=_SCAN_BLOCK,
+                num_warps=_SCAN_WARPS,
+            )
+            return
+        _count_kernel[((rows + 255) // 256,)](
+            grammar.group_offsets,
+            self.lexer_state,
+            self.config_count,
+            self.widest,
+            self.representative,
+            self.grammar_of,
+            grammar.bases,
+            counts,
+            CONFIGS=self.configs,
+            ROWS=rows,
+            SKIP_DUPLICATES=skip,
+            UNIT=unit,
+            BLOCK=256,
+        )
+        torch.cumsum(counts, 0, out=offsets[1:])
+
     def _fill(self) -> torch.Tensor:
         grammar = self.grammar
         # The mask is not cleared here. Deduplication knows which rows the
@@ -3205,25 +3336,12 @@ class DeviceBatch:
             num_warps=4,
         )
         rows = self.batch * self.configs
-        _count_kernel[((rows + 255) // 256,)](
-            grammar.group_offsets,
-            self.lexer_state,
-            self.config_count,
-            self.widest,
-            self.representative,
-            self.grammar_of,
-            grammar.bases,
-            self.counts,
-            CONFIGS=self.configs,
-            ROWS=rows,
-            SKIP_DUPLICATES=1,
-            UNIT=0,
-            BLOCK=256,
-        )
         # The running sum turns an item back into a configuration and a group.
         # It is a device op on a device value, so the total never comes to the
         # host and the launches below do not depend on it.
-        torch.cumsum(self.counts, 0, out=self.work_offsets[1:])
+        self._count_and_scan(
+            grammar, rows, self.counts, self.work_offsets, skip=1, unit=0
+        )
         _mask_kernel[(self.sweep_blocks,)](
             grammar.group_offsets,
             grammar.group_set_kind,
@@ -3283,11 +3401,11 @@ class DeviceBatch:
             BLOCK=128,
             num_warps=1,
         )
-        _broadcast_kernel[(self.batch,)](
+        _broadcast_kernel[(self.batch, (grammar.mask_words + 511) // 512)](
             self.representative,
             self.mask,
             grammar.mask_words,
-            BLOCK=128,
+            BLOCK=512,
             num_warps=4,
         )
         # A complement sets the last word whole, so the bits past the final
