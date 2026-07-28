@@ -232,8 +232,7 @@ bool a_padded_contract_stages_zeros_where_no_source_reaches() {
             fill_step = step;
         }
         if ((instr.op.tag == Tag::ExtentWrite ||
-             instr.op.tag == Tag::BulkExtentWrite ||
-             instr.op.tag == Tag::SlabScatter) &&
+             instr.op.tag == Tag::BulkExtentWrite) &&
             step < first_write_step) {
             first_write_step = step;
         }
