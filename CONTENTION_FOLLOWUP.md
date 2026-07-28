@@ -2623,34 +2623,75 @@ k=2 at conc 256 is now 8/8 trials inside 1% (28371–28656) against a vLLM
 reference of 29621–29688, i.e. 0.962× on throughput where it was 0.937×.
 Contention suite: 16/16.
 
-## §20.10 Why k=1 at conc 256 is bimodal (2026-07-28)
+## §20.10 Why k=1 at conc 256 is multimodal (2026-07-28)
 
-k=1 alternates between ~27k and ~19–22k tok/s across process launches while
-k=2 does not. Ruled out first, all measured, none of them the cause:
+k=1 lands anywhere in 18.8-29.0 k tok/s across process launches while k=2 does
+not. Ruled out first, all measured, none of them the cause:
 
-* **GPU clocks** — SM clock is pinned at 2520 MHz in both modes, no throttle
-  reason asserted, temp ≤ 44 °C.
-* **NUMA** — the GPU is local to node 1, but `taskset` onto node 1 *or*
-  node 0 both stay bimodal.
-* **Host CPU frequency** — schedutil governor, but max/8th/median core MHz are
-  identical (3250 / 2846 / 1500) in fast and slow runs.
-* **External contention** — GPU is empty (1 MiB) and load is ~11 on 128 cores.
+* **GPU clocks** — SM clock pinned at 2520 MHz in every mode, no throttle
+  reason asserted, temp <= 44 C.
+* **NUMA** — the GPU is local to node 1, but `taskset` onto node 1 *or* node 0
+  is equally multimodal.
+* **Host CPU frequency** — schedutil governor, but max / 8th / median core MHz
+  are identical (3250 / 2846 / 1500) in fast and slow runs.
+* **External contention** — GPU empty (1 MiB), load ~11 on 128 cores.
 * **Engine decisions** — memory planner output, 51 captured decode graphs,
-  batch count (258), batch-size histogram, `max forward requests: 256`,
-  prompt and output token counts are all identical between modes.
+  batch count, batch-size histogram, `max forward requests: 256`, prompt and
+  output token counts are all identical across modes.
 
-The distinguishing signal is *overlap*, not work. The slow run has a **lower**
-mean batch latency (11.0 ms) than the fast run (13.7 ms) yet a longer wall
-(3.45 s vs 2.42 s): its batch-latency sum falls below the wall (the GPU idles)
-while the fast run's exceeds it (waves overlap).
+### It is duty, and duty is quantised
 
-`PIE_SCHED_MAX_IN_FLIGHT=1` reproduces the slow mode exactly and, unlike the
-default, *stably*: 20249 / 19826 / 20140 tok/s, σ = 220. So the slow mode is
-simply "run-ahead collapsed to depth 1". Depth 3 does not help — the cap is
-not the limiter, arrival rate is.
+Duty = mean forward batches in flight = `avg batch latency / (wall / batches)`.
+Measured (conc 256, 12288-page-equivalent budget, 8 trials per arm):
 
-nsys on a k=1 run localises every stall to one place. Merged-device-op gaps
-above 200 µs, by bracketing operation:
+| arm | duty | tok/s |
+| --- | ---- | ----- |
+| k=2 (default), 8/8 | 1.56-1.60 | 28371-28656 |
+| k=1, fast | 1.54-1.58 | 26.8-29.0 k |
+| k=1, mid | 1.09-1.11 | 21.4-22.2 k |
+| k=1, slow | 0.82-0.85 | 18.7-18.8 k |
+| k=1 with `PIE_SCHED_MAX_IN_FLIGHT=1` | 0.84-0.85 | 19.8-20.2 k |
+
+Two things follow immediately.
+
+**k does not create the overlap.** A healthy k=1 run reaches duty 1.58 — the
+same as k=2. Frame overlap is structural and k-independent: `FramePolicy`
+seals the next frame the moment the wait-all gate holds, normally while the
+current frame is still executing, and posts its waves behind the executing
+frame's tail at the run-ahead depth. There is no launch-time barrier; the
+driver's device-side `pass_commit` tickets order dependent fires by stream
+order and a frame-boundary dependency is structurally identical to an
+intra-frame one. What k changes is how *often* the wait-all seal boundary
+occurs (once per k waves) and therefore how much GPU time is available to
+cover one host turn.
+
+**The slow mode is the run-ahead collapsing, not extra work.** Forcing
+`PIE_SCHED_MAX_IN_FLIGHT=1` reproduces the slowest mode exactly and, unlike
+the default, *stably* (sigma = 220 tok/s). Depth 3 does not help: the cap is
+not the limiter, arrival into the seal window is.
+
+### The mode is per COHORT, not per run
+
+512 requests at concurrency 256 is two cohorts of 256. Splitting each run in
+half (`cohort1 = 2*lat_mean - wall`):
+
+```
+k=1 fixed  28586 tok/s   cohort1 30.4k   cohort2 27.0k     fast, fast
+k=1 fixed  22225 tok/s   cohort1 29.5k   cohort2 17.8k     fast, slow
+k=1 fixed  22156 tok/s   cohort1 18.2k   cohort2 28.2k     slow, fast
+k=1 fixed  18779 tok/s   cohort1 18.2k   cohort2 19.4k     slow, slow
+k=2 fixed  (8 runs)      every cohort 28.0-29.0k
+```
+
+Each 256-process cohort independently settles into duty ~1.58 or ~0.83 when it
+forms, holds it for all 128 of its decode waves, and the run-level modes are
+just the two combinations: 28.5 k (fast+fast), ~22 k (mixed), 18.8 k
+(slow+slow). Matching duty levels 1.58 / 1.10 / 0.83 confirm the arithmetic.
+k=2 never collapses in any of its 16 observed cohorts.
+
+### Where the stall is
+
+nsys on a k=1 run, merged device-op gaps above 200 us by bracketing operation:
 
 ```
 258  786 ms  avg 3046 us   k_settle_host_channels_batch -> MEMCPY
@@ -2658,34 +2699,42 @@ above 200 µs, by bracketing operation:
 143   53 ms  avg  371 us   MEMCPY -> embed_bf16_kernel
 ```
 
-258 is exactly the batch count: **every wave** stalls right after the
-settlement kernel. The idle *preceding* a wave's `k_pull_validate` is p50
-1.4 µs — the GPU is never waiting for the batch to be built, it is waiting
-inside the settle→resubmit turn.
+258 is exactly the batch count: the stall is at the seal boundary, between one
+frame's settlement and the next frame's H2D upload. The idle *immediately*
+before a wave's `k_pull_validate` is p50 1.4 us, so nothing is waiting on
+batch construction once the frame has been sealed — the wait is for the seal.
 
-That turn is the whole explanation. At k=1 a lane stages nothing, so its next
-fire cannot exist until it receives the current token, and the wave period is
-`GPU forward + full host round trip` (settle kernel → CUDA host callback →
-runtime wakes 256 guests → 256 guest resubmits → wave sealed → H2D). The round
-trip is what is bistable: ≈1.7 ms when the wake path stays hot, 4–6.5 ms when
-it does not. Two independent levers confirm the mechanism:
+The seal is wait-for-ALL: it holds until every awaited lane's oldest queued
+frame is arrival-complete, so the binding term is the **slowest of 256** lanes'
+resubmit each frame. At k=1 that maximum is paid once per wave and has one
+wave of GPU time (~7.1 ms) to hide behind; at k=2 it is paid half as often and
+has two waves (~14.9 ms). The absolute cost of the turn scales with lane count,
+not with k — which is why k=2 is comfortably covered and k=1 sits on the edge.
 
-* **Any added host cost pins it slow.** `PIE_FIRE_TIMING=1` (65 664 per-fire
-  JSON records) parks k=1 at 14.9–15.8 k tok/s, 4/4; nsys parks it at
-  17.0–21.7 k, 4/4. Neither perturbs k=2 comparably.
+Two levers confirm the turn is the term that varies:
+
+* **Any added host cost pins k=1 slow.** `PIE_FIRE_TIMING=1` (65 664 per-fire
+  JSON records) parks it at 14.9-15.8 k, 4/4; nsys parks it at 17.0-21.7 k,
+  4/4. Neither perturbs k=2 comparably.
 * **Tokio worker count moves it.** conc 256, k=1, 4 trials each:
-  `--worker-threads 8` → 27100/27084/26664/23177; `16` → bimodal;
-  `32` → 18987/18677/19015/19079 (σ = 179); default 64 → bimodal.
-  (`default_worker_threads()` already caps at 64 for exactly this class of
-  variance on EPYC — see `worker/src/config.rs`.)
+  `--worker-threads 8` -> 27100/27084/26664/23177; `32` ->
+  18987/18677/19015/19079 (sigma = 179); 16 and the default 64 are multimodal.
+  (`default_worker_threads()` in `worker/src/config.rs` already caps at 64 for
+  exactly this class of variance on EPYC.)
 
-The §20.9 fix raises the fast mode (26981 → 28656, +6.2%) and leaves the slow
-mode where it was (baseline 18.9–21.7 k, fixed 18.8–22.2 k), i.e. it is a
-strict improvement but does not remove the bistability, because the residual
-stall is the host round trip itself rather than the callback node.
+### Status
 
-**Not a defect, and not on the default path.** k=2 has been the default since
-§20.8 precisely because it staged the next frame past this turn: on the fixed
-build conc 256 k=2 is 28371–28656 over 8 trials, a 1.0% spread. k=1 exposes
-the round trip by construction. If k=1 ever has to be used at high
-concurrency, `--worker-threads 8` is the lever.
+**Open**: what decides a cohort's mode at formation is not yet identified. It
+is not any of the environmental or planner variables above, it is stable for
+the cohort's entire life, and it is independent between consecutive cohorts in
+one process.
+
+**Not on the default path.** k=2 has been the default since §20.8 precisely
+because it puts the seal boundary behind two waves of cover: on the fixed
+build conc 256 k=2 is 28371-28656 over 8 trials, a 1.0% spread, with no
+collapsed cohort observed. The §20.9 fix raises k=1's fast mode
+(26981 -> 28656, +6.2%) and leaves the collapsed mode where it was (baseline
+18.9-21.7 k, fixed 18.8-22.2 k) — a strict improvement that does not remove
+the bistability, because the residual stall is the seal turn rather than the
+callback node. If k=1 must be used at high concurrency, `--worker-threads 8`
+is the lever.
