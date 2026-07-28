@@ -2738,3 +2738,81 @@ collapsed cohort observed. The §20.9 fix raises k=1's fast mode
 the bistability, because the residual stall is the seal turn rather than the
 callback node. If k=1 must be used at high concurrency, `--worker-threads 8`
 is the lever.
+
+## 20.11 The k = 1 collapse was a guest window-sizing bug, not a law
+
+§20.10 left one question open: what latches a cohort into the collapsed mode.
+The answer is that nothing latches it *in the engine* — the cohort simply never
+had enough queued work to absorb a straggler, and the shortfall was written
+into the **guest**, not the runtime.
+
+### The cover rule
+
+`tests/inferlets/text-completion-bench/src/lib.rs` kept a run-ahead window of
+`2 * live_slots` fires, i.e. exactly **two frames**, for every `k`. The engine's
+frame seal is wait-for-ALL: it holds until every awaited lane's oldest queued
+frame is arrival-complete, so the binding term is the slowest of `concurrency`
+lanes' resubmit. What buys that straggler its time is the work already queued
+*behind* the running frame:
+
+```
+cover_waves = window_fires - live_slots = (window_frames - 1) * k
+```
+
+A two-frame window therefore gives `k` waves of cover — **two** at k = 2, and
+**one** (~7.1 ms) at k = 1. The old rule sized the window in frames, but the
+quantity that has to cover a straggler is measured in waves. k = 1 was running
+with a third of the cover k = 2 got, from the same line of guest code.
+
+### Measurement (Qwen3-0.6B, L40S, conc 256, on the §20.9 build)
+
+| arm | cover | result | median |
+| --- | --- | --- | --- |
+| k=1, `2*k` (old) | 1 wave | multimodal 18.8k / 22k / 28.5k | 25184 |
+| k=1, 3 frames | 2 waves | 7/8 at 28.6-29.5k, 1/8 collapsed | 28687 |
+| k=1, 4 frames | 3 waves | **6/6 at 28663-29488** | **29044** |
+| k=2, `2*k` (old) | 2 waves | 8/8 at 28371-28656 | 28497 |
+| k=2, cover 3 | 3 waves | 6/6 at 28217-28795 | 28654 |
+
+Duty (mean forward batches in flight) confirms the mechanism directly: the
+k = 1 window-3 arm runs at **1.72-1.74**, up from 1.58 in the healthy old-rule
+runs and 0.83 in the collapsed ones. 15 of its 16 cohorts sit at 27.6-30.5k.
+
+Two conclusions:
+
+1. **The collapse is removable.** At three waves of cover k = 1 is unimodal
+   over 6/6 trials, and its median (29044) is *above* k = 2's (28497) — a
+   smaller frame with adequate cover beats a larger frame, because the seal
+   quantum is finer. Against vLLM's 29621-29688 that is a ratio of 0.979,
+   up from 0.961.
+2. **k >= 2 was already saturated.** Giving k = 2 a third wave of cover moves
+   nothing (28497 -> 28654, inside the noise), which is why the defect only
+   ever showed at k = 1 and why k = 2 has been a safe default.
+
+### Fix
+
+The window now takes the max of two independent floors:
+
+```rust
+let window_fires = live_slots + live_slots.max(3);
+```
+
+* `>= 1 whole extra frame` — frames settle atomically, so a window shorter
+  than two frames leaves zero queued frames while a k >= 2 frame runs.
+* `>= 3 waves of cover` — the straggler allowance, independent of `k`.
+
+At k = 1 this is 4 fires (was 2), at k = 2 it is 5 (was 4), and at k >= 3 the
+frame floor already dominates so the value is unchanged (k = 4: 8 either way).
+
+Verified: conc 64 k = 2 measures 16132-16200 (median 16153) against the §20.9
+baseline of 16145 — no regression on the default path — and the contention
+suite is 16/16.
+
+### What this does not change
+
+`PIE_FRAME_SIZE` stays at 2. k = 1 with a correctly sized window is marginally
+faster at conc 256, but k = 2 is within 2% there, is unimodal under the *old*
+guest rule as well, and costs less staging depth per lane; §20.8's reasons for
+the default are untouched. The finding's real content is that **run-ahead cover
+is a guest responsibility and must be sized in waves, not frames** — any
+inferlet that hard-codes a frame-count window inherits this bug at k = 1.
