@@ -2980,8 +2980,34 @@ same rule, which is what makes the single spare cell the correct margin.
 | 64 | **16326** | 16150 | 15475 | **1.055** | 1.044 |
 | 128 | **23241** | 22712 | 22133 | **1.050** | 1.026 |
 | 256 | 29031 | 28840 | 29439 | 0.986 | 0.980 |
+| 512 | 30530 | 30578 | 32453 | 0.941 | 0.942 |
 
 conc 256 at every frame size: k=1 29031, k=2 28840, k=3 28677, k=4 28392.
+
+### The high-concurrency gap is pre-existing and is NOT this window
+
+pie wins at 64 and 128 and trails at 256 and 512. Everything below was swept to
+see whether run-ahead sizing explains the trailing half. None of it does:
+
+| lever | conc 512 k=2 median |
+| --- | --- |
+| default (R=3, worker threads auto) | **30578** |
+| `--worker-threads 16` | 30524 |
+| `--worker-threads 32` | 30264 |
+| `--worker-threads 64` | 29546 |
+| 4096 requests instead of 1024 (8 cohorts, not 2) | 30314 (vLLM 32676) |
+
+The long run is the informative one: with four times the cohorts the ratio does
+not move (0.942 -> 0.928), so the gap is steady-state throughput, not prefill
+ramp or cohort-boundary accounting. §20.10 already named the mechanism — the
+seal is wait-for-ALL, so its binding term is the SLOWEST of `concurrency` lanes'
+resubmit, and the maximum of N samples grows with N. Run-ahead buys the
+straggler time but cannot remove it from the critical path; only changing the
+quorum can. That is an architectural item, tracked as an open finding, not a
+regression from this work.
+
+What this work did move: conc 256 went 0.962 (§20.9) -> 0.979 (§20.11) ->
+0.986, and conc 128 went from behind to 1.050.
 
 conc 64 k=2 is 16150 against the 16145-16153 baseline — the migration is
 neutral where it should be, and the gain at 128/256 is the window.
