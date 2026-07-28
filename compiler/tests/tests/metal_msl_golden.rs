@@ -52,15 +52,6 @@ use device_text::OracleInputs;
 use msl_corpus::{CorpusStage, corpus_stages, is_library, op_tag, region_shape};
 
 /// FNV-1a 64, the hash the oracle header records for the shared prefixes.
-fn fnv1a64(text: &str) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in text.bytes() {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
-}
-
 /// The embedded runtime template must be the same bytes the C++ emitter read
 /// from `driver/metal/src/kernels/ptir_m1_runtime.metal`. Everything else here
 /// compares kernel *tails* with the shared prefix elided, so without this the
@@ -90,7 +81,7 @@ fn embedded_runtime_matches_the_oracle() {
 
     let runtime = runtime_prefix();
     assert_eq!(
-        (runtime.len(), fnv1a64(&runtime)),
+        (runtime.len(), pie_ir::fnv1a64(runtime.as_bytes())),
         field("# @runtime:"),
         "compiler/codegen/runtime/metal/ptir_m1_runtime.metal has drifted from the copy \
          the C++ oracle read out of driver/metal/src/kernels/"
@@ -98,7 +89,7 @@ fn embedded_runtime_matches_the_oracle() {
 
     let grouped = grouped_preamble();
     assert_eq!(
-        (grouped.len(), fnv1a64(grouped)),
+        (grouped.len(), pie_ir::fnv1a64(grouped.as_bytes())),
         field("# @grouped:"),
         "the grouped preamble has drifted from the C++ emitter"
     );
@@ -286,24 +277,13 @@ fn cases(body: &str) -> Vec<(String, String)> {
 /// `#` header (it records provenance, not behaviour).
 fn compare(dump: &Dump) {
     let path = golden_msl_dir().join(format!("{}.txt", dump.emitter));
-    let oracle = std::fs::read_to_string(&path)
-        .unwrap_or_else(|error| panic!("{} missing ({error})", path.display()));
-    let header: String = oracle
-        .lines()
-        .take_while(|line| line.starts_with('#'))
-        .map(|line| format!("{line}\n"))
-        .collect();
-    let expected = &oracle[header.len()..];
-
-    if std::env::var("PTIR_REGEN").is_ok() {
-        provenance::regenerate_foreign(&path, &header, &dump.body);
+    let Some(expected) =
+        provenance::body_to_diff(&path, &dump.body, provenance::Regenerate::Foreign)
+    else {
         return;
-    }
-    if expected == dump.body {
-        return;
-    }
+    };
     let mine_cases = cases(&dump.body);
-    let their_cases = cases(expected);
+    let their_cases = cases(&expected);
     assert_eq!(
         mine_cases.iter().map(|(id, _)| id).collect::<Vec<_>>(),
         their_cases.iter().map(|(id, _)| id).collect::<Vec<_>>(),

@@ -44,15 +44,6 @@ fn oracle_inputs() -> OracleInputs {
     )
 }
 
-fn fnv1a64(text: &str) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in text.bytes() {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
-}
-
 struct Dump {
     emitter: &'static str,
     body: String,
@@ -141,7 +132,7 @@ impl Dump {
                 "source: bytes={} prefix={prefix} tail_bytes={} fnv1a64=0x{:016x}",
                 source.len(),
                 tail.len(),
-                fnv1a64(tail)
+                pie_ir::fnv1a64(tail.as_bytes())
             );
         }
         self.end();
@@ -150,41 +141,16 @@ impl Dump {
 
 fn compare(dump: &Dump) {
     let path = golden_cuda_dir().join(format!("{}.txt", dump.emitter));
-    let oracle = std::fs::read_to_string(&path)
-        .unwrap_or_else(|error| panic!("{} missing ({error})", path.display()));
-    let header: String = oracle
-        .lines()
-        .take_while(|line| line.starts_with('#'))
-        .map(|line| format!("{line}\n"))
-        .collect();
-    let expected = &oracle[header.len()..];
-
-    if std::env::var("PTIR_REGEN").is_ok() {
-        provenance::regenerate_foreign(&path, &header, &dump.body);
+    let Some(expected) =
+        provenance::body_to_diff(&path, &dump.body, provenance::Regenerate::Foreign)
+    else {
         return;
-    }
-    if expected == dump.body {
-        return;
-    }
-    let mut case = String::from("<before the first case>");
-    let hint = dump.inputs.hint();
-    for (index, (mine, theirs)) in dump.body.lines().zip(expected.lines()).enumerate() {
-        if let Some(id) = theirs.strip_prefix("=== ") {
-            case = id.to_string();
-        }
-        assert_eq!(
-            mine,
-            theirs,
-            "{} diverged from the C++ oracle at line {} (case `{case}`)\n{hint}",
-            dump.emitter,
-            index + 1
-        );
-    }
-    assert_eq!(
-        dump.body.lines().count(),
-        expected.lines().count(),
-        "{} emitted a different number of lines than the C++ oracle",
-        dump.emitter
+    };
+    provenance::assert_same_lines(
+        &dump.body,
+        &expected,
+        &format!("{} against the C++ oracle", dump.emitter),
+        &format!("\n{}", dump.inputs.hint()),
     );
 }
 
@@ -196,7 +162,10 @@ fn runtime_matches_oracle() {
     let runtime = dump.runtime.clone();
     dump.open_case("runtime");
     dump.field("bytes", &runtime.len().to_string());
-    dump.field("fnv1a64", &format!("0x{:016x}", fnv1a64(&runtime)));
+    dump.field(
+        "fnv1a64",
+        &format!("0x{:016x}", pie_ir::fnv1a64(runtime.as_bytes())),
+    );
     dump.end();
     compare(&dump);
 }
@@ -461,8 +430,6 @@ fn emit_program_metal_covers_every_family() {
 /// devices will keep serving graphs built for the old planner.
 #[test]
 fn stage_identity_is_pinned() {
-    let header = "# GENERATED from driver/cuda/src/pipeline/program_identity.hpp\n\
-                  # <golden>#<stage_index> <compiled_stage_identity as hex>\n";
     let mut rendered = String::new();
     for stage in corpus_stages() {
         let _ = writeln!(
@@ -473,21 +440,15 @@ fn stage_identity_is_pinned() {
         );
     }
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("golden-stage-identity.txt");
-    if std::env::var("PTIR_REGEN").is_ok() {
-        provenance::regenerate_foreign(&path, header, &rendered);
-        return;
+    if let Some(expected) =
+        provenance::body_to_diff(&path, &rendered, provenance::Regenerate::Foreign)
+    {
+        assert_eq!(
+            rendered, expected,
+            "pie_plan::stage_identity moved: a published graph-cache key changed, \
+             so pie_plan::COMPILER_VERSION must move with it"
+        );
     }
-    let file = std::fs::read_to_string(&path).expect("golden-stage-identity.txt");
-    let expected: String = file
-        .lines()
-        .skip_while(|line| line.starts_with('#'))
-        .map(|line| format!("{line}\n"))
-        .collect();
-    assert_eq!(
-        rendered, expected,
-        "pie_plan::stage_identity moved: a published graph-cache key changed, \
-         so pie_plan::COMPILER_VERSION must move with it"
-    );
 }
 
 /// Emit the CUDA kernel table for the traces the driver's own tests register.

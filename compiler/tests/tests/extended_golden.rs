@@ -16,6 +16,8 @@
 mod device_text;
 #[path = "common/msl_corpus.rs"]
 mod msl_corpus;
+#[path = "common/provenance.rs"]
+mod provenance;
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -46,15 +48,6 @@ fn golden_extended_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("golden-extended")
 }
 
-fn fnv1a64(text: &str) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in text.bytes() {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
-}
-
 /// A kernel is pinned by length plus digest, not verbatim: the point is to
 /// notice that it changed, and 200 KB of inlined runtime in the diff hides that
 /// rather than showing it. For the same reason the hand-written device text is
@@ -67,7 +60,7 @@ fn digest(emitted: &Result<String, String>, device: &[String]) -> String {
             format!(
                 "ok bytes={} fnv1a64=0x{:016x}",
                 generated.len(),
-                fnv1a64(&generated)
+                pie_ir::fnv1a64(generated.as_bytes())
             )
         }
         Err(error) => format!("err {error}"),
@@ -90,45 +83,10 @@ fn device_text() -> Vec<String> {
 fn compare(name: &str, body: &str) {
     let path = golden_extended_dir().join(format!("{name}.txt"));
 
-    if std::env::var("PTIR_REGEN").is_ok() {
-        std::fs::create_dir_all(golden_extended_dir()).expect("create golden-extended/");
-        std::fs::write(&path, format!("{HEADER}{body}")).expect("write golden");
-        return;
+    let how = provenance::Regenerate::Own { header: HEADER };
+    if let Some(expected) = provenance::body_to_diff(&path, body, how) {
+        provenance::assert_same_lines(body, &expected, name, "");
     }
-
-    let golden = std::fs::read_to_string(&path).unwrap_or_else(|error| {
-        panic!(
-            "{} missing ({error}); re-pin with PTIR_REGEN=1",
-            path.display()
-        )
-    });
-    let header: String = golden
-        .lines()
-        .take_while(|line| line.starts_with('#'))
-        .map(|line| format!("{line}\n"))
-        .collect();
-    let expected = &golden[header.len()..];
-    if expected == body {
-        return;
-    }
-
-    let mut case = String::from("<before the first case>");
-    for (index, (mine, theirs)) in body.lines().zip(expected.lines()).enumerate() {
-        if let Some(id) = theirs.strip_prefix("=== ") {
-            case = id.to_string();
-        }
-        assert_eq!(
-            mine,
-            theirs,
-            "{name} changed at line {} (case `{case}`)",
-            index + 1
-        );
-    }
-    assert_eq!(
-        body.lines().count(),
-        expected.lines().count(),
-        "{name} produced a different number of lines"
-    );
 }
 
 #[test]
@@ -206,7 +164,7 @@ fn extended_corpus_plans_are_pinned() {
             body,
             "plan: lines={} fnv1a64=0x{:016x}",
             stage.debug.lines().count(),
-            fnv1a64(&stage.debug)
+            pie_ir::fnv1a64(stage.debug.as_bytes())
         );
         for (index, region) in stage.plan.fused.regions.iter().enumerate() {
             let _ = writeln!(body, "fused#{index}: {}", region_shape(region));
