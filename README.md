@@ -72,7 +72,9 @@ grammar allows. Narrowing is the one failure this engine must never do quietly.
   are valid JSON satisfying their own schema, 98.0% are accepted (99.8% with a
   larger configuration ceiling).
 - **Regular expressions** — compiled to the same tables.
-- **EBNF** — `compile_ebnf(source, root)`.
+- **EBNF** — `compile_ebnf(source, root)`, including grammars a regular
+  language cannot express. On a SQL SELECT subset the parser stack grows one
+  entry per level of parenthesis nesting, which is the thing a DFA cannot do.
 
 Grammars are LALR(1), and a conflicted cell is forked at runtime rather than
 refused at construction, so ambiguity is handled rather than rejected. No schema
@@ -88,10 +90,21 @@ for a mask and an advance per sequence — which is what a decode step costs:
 | regex, vs XGrammar | 2.26x | 6.42x | 21.33x |
 | regex, vs llguidance | 4.00x | 10.31x | 37.56x |
 | JSON Schema, vs XGrammar | **0.94x** | 3.04x | 9.53x |
+| SQL nested 32 deep, vs XGrammar | 177x | 653x | 1,739x |
+| SQL nested 32 deep, vs llguidance | 1.91x | 6.10x | 17.26x |
 
-We lose to XGrammar on JSON Schema at batch 32, and on compile time throughout
-(120 ms median against 16), and on memory (3.27 MB resident per schema against
-a 52 KiB host cache). Those are real and they are in `GOAL.md` with the rest.
+Two things the table does not say. Our cost is flat in the nesting depth and
+llguidance's is not — at batch 128, depth 1 to 32 takes them from 654 µs to
+1,653 and us from 226 to 271 — which is the axis a device-resident stack is
+for. And XGrammar's collapse on SQL is real rather than a misuse: one
+sequence's fill reaches 70 ms where an expression can continue with almost any
+token.
+
+We lose to llguidance at batch 1 on SQL (0.15x), to XGrammar on JSON Schema at
+batch 32 (0.94x), on compile time throughout (120 ms median against 16, and
+1.3 s for the SQL grammar against 88 ms), and on memory (3.27 MB resident per
+schema against a 52 KiB host cache, 91 MB for SQL). Those are real and they are
+in `GOAL.md` with the rest.
 
 ## Reproducing
 
