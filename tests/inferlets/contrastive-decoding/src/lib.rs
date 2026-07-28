@@ -238,8 +238,7 @@ async fn main(input: Input) -> Result<String> {
             .collect::<Vec<_>>(),
     );
     let amateur_pages = Channel::from(amateur_ids.clone());
-    let amateur_page_indptr =
-        Channel::from_shaped([2], vec![0u32, (n + 1).div_ceil(PAGE_T)]);
+    let amateur_page_indptr = Channel::from_shaped([2], vec![0u32, (n + 1).div_ceil(PAGE_T)]);
     let amateur_ids_input = Channel::from(amateur_ids.clone()).named("amateur_pool_ids");
     let amateur_logits_out = Channel::new([vocab], dtype::f32)
         .capacity(channel_capacity() as u32)

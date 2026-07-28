@@ -248,31 +248,16 @@ async fn main(input: Input) -> Result<Output> {
         });
 
         let budget = input.max_tokens - 1;
-        let mut submitted = 0usize;
-        let mut in_flight = 0usize;
-        while in_flight < DEFAULT_RUNAHEAD_DEPTH && submitted < budget {
-            decode
-                .submit(&pipeline)
-                .map_err(|e| format!("token-healing decode: {e}"))?;
-            submitted += 1;
-            in_flight += 1;
-        }
-        while in_flight > 0 {
+        run_ahead(&pipeline, &decode, budget as usize, async || {
             let token = token_out
                 .take()
                 .get::<i32>()
                 .await
                 .map_err(|e| format!("read token: {e}"))?[0] as u32;
-            in_flight -= 1;
             generated.push(token);
-            if submitted < budget {
-                decode
-                    .submit(&pipeline)
-                    .map_err(|e| format!("token-healing decode: {e}"))?;
-                submitted += 1;
-                in_flight += 1;
-            }
-        }
+            Ok(ControlFlow::Continue(()))
+        })
+        .await?;
     }
     pipeline.close();
 

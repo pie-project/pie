@@ -1,6 +1,6 @@
 # oracle dump: pie::metal::pipeline::emit_grouped_fused_region_msl
 # source of truth: compiler/codegen/src/metal/ (the C++ oracle this was dumped from is deleted)
-# emitter_version: 32
+# emitter_version: 33
 # @runtime: bytes=39611 fnv1a64=0x310a2f7d72f22fd5
 # @grouped: bytes=970 fnv1a64=0xa8ab9e1ebf8714d9
 # cases: 192
@@ -33,6 +33,8 @@
 #   value's offset. The runtime executed it as a byte-for-byte copy of the whole
 #   value, which in the sampler's graph was a vocabulary-wide round trip through
 #   device memory for nothing.
+# REGENERATED: the body below is this compiler's output, not the recorded output of the source of truth above
+#   reason: argmax over the logits intrinsic is fused, so the gather that only widened bf16 to f32 is gone; bf16->f32 is exact so the argmax picks the same value and index
 === beam_epilogue#0 singleton#0
 function_name: ptir_m3s_b4fadd8446eb58dd_r0
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
@@ -8292,48 +8294,8 @@ kernel void ptir_m3_82921040f7bc2612_r2(
 === pentathlon_iter#0 singleton#0
 function_name: ptir_m3s_14f667a41eb30669_r0
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
-ok: true
-source: bytes=43391 prefix=@runtime+@grouped tail_bytes=2810
-kernel void ptir_m3s_14f667a41eb30669_r0(
-    const device uchar* lane_bytes [[buffer(0)]],
-    const device M1ValueDesc* all_descriptors [[buffer(1)]],
-    const device M1OpParams* params [[buffer(2)]],
-    const device uint* offsets [[buffer(3)]],
-    device uchar* all_scratch [[buffer(4)]],
-    const device M3GroupLayout* layout [[buffer(5)]],
-    const device uint* channel_bindings [[buffer(6)]],
-    device uchar* pending_flags [[buffer(7)]],
-    const device uint* lane_indices [[buffer(8)]],
-    const device M3RowMeta* all_row_meta [[buffer(9)]],
-    const device uint* row_indices [[buffer(10)]],
-    uint dispatch_lane [[threadgroup_position_in_grid]],
-    uint m3_tid [[thread_position_in_threadgroup]],
-    uint m3_threads [[threads_per_threadgroup]]) {
-  threadgroup M1ArgmaxCandidate m3_tgbuf[512];
-  if (dispatch_lane >= layout->lane_count) return;
-  const uint lane_index = lane_indices[dispatch_lane];
-  const device M3LaneHeader* header = reinterpret_cast<const device M3LaneHeader*>(lane_bytes);
-  const device M3LaneRecord* lanes = reinterpret_cast<const device M3LaneRecord*>(lane_bytes + sizeof(M3LaneHeader));
-  const device M3LaneChannelSlot* slots = reinterpret_cast<const device M3LaneChannelSlot*>(lane_bytes + sizeof(M3LaneHeader) + header->lane_count * sizeof(M3LaneRecord));
-  const M3LaneRecord lane = lanes[lane_index];
-  const M3RowMeta row_meta = all_row_meta[lane_index];
-  device M1Status* status = reinterpret_cast<device M1Status*>(lane.commit_slot);
-  if (status->state != 1) return;
-  if (m3_threads > 512u) { if (m3_tid == 0) m1_fault(status, 0xB3u); return; }
-  const device M1ValueDesc* descriptors = all_descriptors + dispatch_lane * layout->value_count;
-  const device M1OpParams* lane_params = params + dispatch_lane * layout->reserved2;
-  device uchar* scratch = all_scratch + dispatch_lane * layout->scratch_stride;
-  device uchar* temporary = scratch + layout->temporary_offset;
-  const device bfloat* logits = reinterpret_cast<const device bfloat*>(lane.logits_base);
-  const uint dense_0 = channel_bindings[dispatch_lane * layout->reserved0 + 0];
-  const M3LaneChannelSlot channel_0 = slots[lane.channel_slot_offset + dense_0];
-  const uint pending_index_0 = lane.channel_slot_offset + dense_0;
-  const device uchar* current_0 = reinterpret_cast<const device uchar*>(pending_flags[pending_index_0] != 0 ? channel_0.pending_cell : channel_0.committed_cell);
-  device uchar* pending_0 = reinterpret_cast<device uchar*>(channel_0.pending_cell);
-  ptir_m1_execute_mt(160u, status, descriptors, lane_params + 0, reinterpret_cast<const device uchar*>(logits), scratch, scratch, scratch + offsets[0], scratch, temporary, m3_tid, m3_threads, m3_tgbuf);
-  threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
-  if (status->state != 1) return;
-}
+ok: false
+error: Metal binds only the logits buffer for intrinsics; intrinsic id 3 has no binding
 === end
 === pentathlon_iter#0 singleton#1
 function_name: ptir_m3s_14f667a41eb30669_r1
@@ -8568,48 +8530,8 @@ kernel void ptir_m3s_14f667a41eb30669_r5(
 === pentathlon_iter#0 fused#0
 function_name: ptir_m3_14f667a41eb30669_r0
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
-ok: true
-source: bytes=43390 prefix=@runtime+@grouped tail_bytes=2809
-kernel void ptir_m3_14f667a41eb30669_r0(
-    const device uchar* lane_bytes [[buffer(0)]],
-    const device M1ValueDesc* all_descriptors [[buffer(1)]],
-    const device M1OpParams* params [[buffer(2)]],
-    const device uint* offsets [[buffer(3)]],
-    device uchar* all_scratch [[buffer(4)]],
-    const device M3GroupLayout* layout [[buffer(5)]],
-    const device uint* channel_bindings [[buffer(6)]],
-    device uchar* pending_flags [[buffer(7)]],
-    const device uint* lane_indices [[buffer(8)]],
-    const device M3RowMeta* all_row_meta [[buffer(9)]],
-    const device uint* row_indices [[buffer(10)]],
-    uint dispatch_lane [[threadgroup_position_in_grid]],
-    uint m3_tid [[thread_position_in_threadgroup]],
-    uint m3_threads [[threads_per_threadgroup]]) {
-  threadgroup M1ArgmaxCandidate m3_tgbuf[512];
-  if (dispatch_lane >= layout->lane_count) return;
-  const uint lane_index = lane_indices[dispatch_lane];
-  const device M3LaneHeader* header = reinterpret_cast<const device M3LaneHeader*>(lane_bytes);
-  const device M3LaneRecord* lanes = reinterpret_cast<const device M3LaneRecord*>(lane_bytes + sizeof(M3LaneHeader));
-  const device M3LaneChannelSlot* slots = reinterpret_cast<const device M3LaneChannelSlot*>(lane_bytes + sizeof(M3LaneHeader) + header->lane_count * sizeof(M3LaneRecord));
-  const M3LaneRecord lane = lanes[lane_index];
-  const M3RowMeta row_meta = all_row_meta[lane_index];
-  device M1Status* status = reinterpret_cast<device M1Status*>(lane.commit_slot);
-  if (status->state != 1) return;
-  if (m3_threads > 512u) { if (m3_tid == 0) m1_fault(status, 0xB3u); return; }
-  const device M1ValueDesc* descriptors = all_descriptors + dispatch_lane * layout->value_count;
-  const device M1OpParams* lane_params = params + dispatch_lane * layout->reserved2;
-  device uchar* scratch = all_scratch + dispatch_lane * layout->scratch_stride;
-  device uchar* temporary = scratch + layout->temporary_offset;
-  const device bfloat* logits = reinterpret_cast<const device bfloat*>(lane.logits_base);
-  const uint dense_0 = channel_bindings[dispatch_lane * layout->reserved0 + 0];
-  const M3LaneChannelSlot channel_0 = slots[lane.channel_slot_offset + dense_0];
-  const uint pending_index_0 = lane.channel_slot_offset + dense_0;
-  const device uchar* current_0 = reinterpret_cast<const device uchar*>(pending_flags[pending_index_0] != 0 ? channel_0.pending_cell : channel_0.committed_cell);
-  device uchar* pending_0 = reinterpret_cast<device uchar*>(channel_0.pending_cell);
-  ptir_m1_execute_mt(160u, status, descriptors, lane_params + 0, reinterpret_cast<const device uchar*>(logits), scratch, scratch, scratch + offsets[0], scratch, temporary, m3_tid, m3_threads, m3_tgbuf);
-  threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
-  if (status->state != 1) return;
-}
+ok: false
+error: Metal binds only the logits buffer for intrinsics; intrinsic id 3 has no binding
 === end
 === pentathlon_iter#0 fused#1
 function_name: ptir_m3_14f667a41eb30669_r1
@@ -10067,92 +9989,8 @@ kernel void ptir_m3_dff3bc6795a9dcdf_r1(
 === pentathlon_iter#1 fused#2
 function_name: ptir_m3_dff3bc6795a9dcdf_r2
 region: library=0 library_op=0 schedule=1 nodes=6 inputs=2 outputs=0 sinks=3
-ok: true
-source: bytes=47169 prefix=@runtime+@grouped tail_bytes=6588
-kernel void ptir_m3_dff3bc6795a9dcdf_r2(
-    const device uchar* lane_bytes [[buffer(0)]],
-    const device M1ValueDesc* all_descriptors [[buffer(1)]],
-    const device M1OpParams* params [[buffer(2)]],
-    const device uint* offsets [[buffer(3)]],
-    device uchar* all_scratch [[buffer(4)]],
-    const device M3GroupLayout* layout [[buffer(5)]],
-    const device uint* channel_bindings [[buffer(6)]],
-    device uchar* pending_flags [[buffer(7)]],
-    const device uint* lane_indices [[buffer(8)]],
-    const device M3RowMeta* all_row_meta [[buffer(9)]],
-    const device uint* row_indices [[buffer(10)]],
-    uint dispatch_lane [[threadgroup_position_in_grid]],
-    uint m3_tid [[thread_position_in_threadgroup]],
-    uint m3_threads [[threads_per_threadgroup]]) {
-  threadgroup M1ArgmaxCandidate m3_tgbuf[512];
-  if (dispatch_lane >= layout->lane_count) return;
-  const uint lane_index = lane_indices[dispatch_lane];
-  const device M3LaneHeader* header = reinterpret_cast<const device M3LaneHeader*>(lane_bytes);
-  const device M3LaneRecord* lanes = reinterpret_cast<const device M3LaneRecord*>(lane_bytes + sizeof(M3LaneHeader));
-  const device M3LaneChannelSlot* slots = reinterpret_cast<const device M3LaneChannelSlot*>(lane_bytes + sizeof(M3LaneHeader) + header->lane_count * sizeof(M3LaneRecord));
-  const M3LaneRecord lane = lanes[lane_index];
-  const M3RowMeta row_meta = all_row_meta[lane_index];
-  device M1Status* status = reinterpret_cast<device M1Status*>(lane.commit_slot);
-  if (status->state != 1) return;
-  if (m3_threads > 512u) { if (m3_tid == 0) m1_fault(status, 0xB3u); return; }
-  const device M1ValueDesc* descriptors = all_descriptors + dispatch_lane * layout->value_count;
-  const device M1OpParams* lane_params = params + dispatch_lane * layout->reserved2;
-  device uchar* scratch = all_scratch + dispatch_lane * layout->scratch_stride;
-  device uchar* temporary = scratch + layout->temporary_offset;
-  const device bfloat* logits = reinterpret_cast<const device bfloat*>(lane.logits_base);
-  const uint dense_0 = channel_bindings[dispatch_lane * layout->reserved0 + 0];
-  const M3LaneChannelSlot channel_0 = slots[lane.channel_slot_offset + dense_0];
-  const uint pending_index_0 = lane.channel_slot_offset + dense_0;
-  const device uchar* current_0 = reinterpret_cast<const device uchar*>(pending_flags[pending_index_0] != 0 ? channel_0.pending_cell : channel_0.committed_cell);
-  device uchar* pending_0 = reinterpret_cast<device uchar*>(channel_0.pending_cell);
-  const uint dense_1 = channel_bindings[dispatch_lane * layout->reserved0 + 1];
-  const M3LaneChannelSlot channel_1 = slots[lane.channel_slot_offset + dense_1];
-  const uint pending_index_1 = lane.channel_slot_offset + dense_1;
-  const device uchar* current_1 = reinterpret_cast<const device uchar*>(pending_flags[pending_index_1] != 0 ? channel_1.pending_cell : channel_1.committed_cell);
-  device uchar* pending_1 = reinterpret_cast<device uchar*>(channel_1.pending_cell);
-  const uint dense_2 = channel_bindings[dispatch_lane * layout->reserved0 + 2];
-  const M3LaneChannelSlot channel_2 = slots[lane.channel_slot_offset + dense_2];
-  const uint pending_index_2 = lane.channel_slot_offset + dense_2;
-  const device uchar* current_2 = reinterpret_cast<const device uchar*>(pending_flags[pending_index_2] != 0 ? channel_2.pending_cell : channel_2.committed_cell);
-  device uchar* pending_2 = reinterpret_cast<device uchar*>(channel_2.pending_cell);
-  const uint dense_3 = channel_bindings[dispatch_lane * layout->reserved0 + 3];
-  const M3LaneChannelSlot channel_3 = slots[lane.channel_slot_offset + dense_3];
-  const uint pending_index_3 = lane.channel_slot_offset + dense_3;
-  const device uchar* current_3 = reinterpret_cast<const device uchar*>(pending_flags[pending_index_3] != 0 ? channel_3.pending_cell : channel_3.committed_cell);
-  device uchar* pending_3 = reinterpret_cast<device uchar*>(channel_3.pending_cell);
-  const uint dense_4 = channel_bindings[dispatch_lane * layout->reserved0 + 4];
-  const M3LaneChannelSlot channel_4 = slots[lane.channel_slot_offset + dense_4];
-  const uint pending_index_4 = lane.channel_slot_offset + dense_4;
-  const device uchar* current_4 = reinterpret_cast<const device uchar*>(pending_flags[pending_index_4] != 0 ? channel_4.pending_cell : channel_4.committed_cell);
-  device uchar* pending_4 = reinterpret_cast<device uchar*>(channel_4.pending_cell);
-  ptir_m1_execute_mt(57u, status, descriptors, lane_params + 32, scratch + offsets[31], scratch, scratch, scratch + offsets[33], scratch, temporary, m3_tid, m3_threads, m3_tgbuf);
-  threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
-  if (status->state != 1) return;
-  ptir_m1_execute_mt(57u, status, descriptors, lane_params + 33, scratch + offsets[32], scratch, scratch, scratch + offsets[34], scratch, temporary, m3_tid, m3_threads, m3_tgbuf);
-  threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
-  if (status->state != 1) return;
-  ptir_m1_execute_mt(146u, status, descriptors, lane_params + 34, scratch + offsets[33], scratch, scratch, pending_2, scratch, temporary, m3_tid, m3_threads, m3_tgbuf);
-  threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
-  if (status->state != 1) return;
-  current_2 = pending_2;
-  if (m3_tid == 0) pending_flags[pending_index_2] = 1;
-  threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
-  ptir_m1_execute_mt(146u, status, descriptors, lane_params + 35, scratch + offsets[34], scratch, scratch, pending_3, scratch, temporary, m3_tid, m3_threads, m3_tgbuf);
-  threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
-  if (status->state != 1) return;
-  current_3 = pending_3;
-  if (m3_tid == 0) pending_flags[pending_index_3] = 1;
-  threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
-  ptir_m1_execute_mt(160u, status, descriptors, lane_params + 36, reinterpret_cast<const device uchar*>(logits), scratch, scratch, scratch + offsets[35], scratch, temporary, m3_tid, m3_threads, m3_tgbuf);
-  threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
-  if (status->state != 1) return;
-  ptir_m1_execute_mt(146u, status, descriptors, lane_params + 37, scratch + offsets[35], scratch, scratch, pending_4, scratch, temporary, m3_tid, m3_threads, m3_tgbuf);
-  threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
-  if (status->state != 1) return;
-  current_4 = pending_4;
-  if (m3_tid == 0) pending_flags[pending_index_4] = 1;
-  threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
-}
+ok: false
+error: Metal binds only the logits buffer for intrinsics; intrinsic id 4 has no binding
 === end
 === pivot_predicates_multistage#1 singleton#0
 function_name: ptir_m3s_09a2719886970a85_r0
@@ -14064,7 +13902,7 @@ kernel void ptir_m3s_9eda8aa42400c4c2_r5(
 function_name: ptir_m3_9eda8aa42400c4c2_r0
 region: library=0 library_op=0 schedule=1 nodes=6 inputs=0 outputs=0 sinks=1
 ok: true
-source: bytes=46677 prefix=@runtime+@grouped tail_bytes=6096
+source: bytes=46633 prefix=@runtime+@grouped tail_bytes=6052
 kernel void ptir_m3_9eda8aa42400c4c2_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -14121,26 +13959,29 @@ kernel void ptir_m3_9eda8aa42400c4c2_r0(
   }
   threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
   {
-    const uint gather_begin = m3_tid;
-    const uint gather_step = m3_threads;
-    const M1ValueDesc intrinsic_desc = descriptors[1];
-    const uint intrinsic_row_base = row_meta.mtp_offset;
-    if (layout->vocab == 0u || intrinsic_desc.len % layout->vocab != 0u || intrinsic_row_base > row_meta.count || intrinsic_desc.len / layout->vocab > row_meta.count - intrinsic_row_base) { m1_fault(status, 0xA0u); return; }
-    device float* intrinsic_out = reinterpret_cast<device float*>(scratch + offsets[1]);
-    const uint gather_vocab = layout->vocab;
-    const uint gather_rows = intrinsic_desc.len / gather_vocab;
-    const uint gather_row_base = row_meta.offset + intrinsic_row_base;
-    for (uint gr = 0u; gr < gather_rows; ++gr) {
-      const uint source_row = row_indices[gather_row_base + gr];
-      const device bfloat* gather_src = logits + ulong(source_row) * gather_vocab;
-      device float* gather_dst = intrinsic_out + ulong(gr) * gather_vocab;
-      for (uint column = gather_begin; column < gather_vocab; column += gather_step) {
-        gather_dst[column] = float(gather_src[column]);
+    const M1ValueDesc am_in = descriptors[1];
+    const uint am_row_base = row_meta.offset + row_meta.mtp_offset;
+    const uint am_vocab = layout->vocab;
+    if (am_vocab == 0u || am_in.last != am_vocab || am_in.rows > row_meta.count) { m1_fault(status, 0xA0u); return; }
+    device int* am_out = reinterpret_cast<device int*>(scratch + offsets[2]);
+    for (uint am_r = 0u; am_r < am_in.rows; ++am_r) {
+      const uint am_src_row = row_indices[am_row_base + am_r];
+      const device bfloat* am_src = logits + ulong(am_src_row) * am_vocab;
+      M1ArgmaxCandidate am_best = {-INFINITY, 0u, 0u, 0u};
+      for (uint am_c = m3_tid; am_c < am_vocab; am_c += m3_threads) {
+        const float am_v = float(am_src[am_c]);
+        am_best = m1_argmax_combine(am_best, M1ArgmaxCandidate{am_v, am_c, isnan(am_v) ? 0u : 1u, 0u});
       }
+      m3_tgbuf[m3_tid] = am_best;
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (uint am_s = 1u; am_s < m3_threads; am_s <<= 1) {
+        if ((m3_tid % (2u * am_s)) == 0u && m3_tid + am_s < m3_threads) m3_tgbuf[m3_tid] = m1_argmax_combine(m3_tgbuf[m3_tid], m3_tgbuf[m3_tid + am_s]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      }
+      if (m3_tid == 0) am_out[am_r] = int(m3_tgbuf[0].index);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
     }
   }
-  threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
-  ptir_m1_execute_mt(51u, status, descriptors, lane_params + 2, scratch + offsets[1], scratch, scratch, scratch + offsets[2], scratch, temporary, m3_tid, m3_threads, m3_tgbuf);
   threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
   if (status->state != 1) return;
   ptir_m1_execute_mt(7u, status, descriptors, lane_params + 3, scratch + offsets[2], scratch, scratch, scratch + offsets[3], scratch, temporary, m3_tid, m3_threads, m3_tgbuf);

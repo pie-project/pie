@@ -271,10 +271,10 @@ async fn main(input: Input) -> Result<Output> {
         let pages_c = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages_c");
         let page_indptr_c =
             Channel::from(vec![0u32, end.div_ceil(page_size)]).named("page_indptr_c");
-        let w_slot_c = Channel::from((base..end).map(|p| p / page_size).collect::<Vec<_>>())
-            .named("w_slot_c");
-        let w_off_c = Channel::from((base..end).map(|p| p % page_size).collect::<Vec<_>>())
-            .named("w_off_c");
+        let w_slot_c =
+            Channel::from((base..end).map(|p| p / page_size).collect::<Vec<_>>()).named("w_slot_c");
+        let w_off_c =
+            Channel::from((base..end).map(|p| p % page_size).collect::<Vec<_>>()).named("w_off_c");
         let kv_len_c = Channel::from(vec![end]).named("kv_len_c");
         let rng_c = Channel::from(vec![input.seed ^ 0x5bd1, 0]).named("rng_c");
         let tok_out_c = Channel::new([1], dtype::i32).named("tok_out_c");
@@ -313,8 +313,7 @@ async fn main(input: Input) -> Result<Output> {
     // ── FINAL CHUNK `[base, n)`: the observed one. ──
     let base = spans[spans.len() - 1].0;
     let tail = n - base;
-    let toks_p =
-        Channel::from(prompt_i32[base as usize..n as usize].to_vec()).named("toks_p");
+    let toks_p = Channel::from(prompt_i32[base as usize..n as usize].to_vec()).named("toks_p");
     let embed_indptr_p = Channel::from(vec![0u32, tail]).named("embed_indptr_p");
     let positions_p = Channel::from((base..n).collect::<Vec<_>>()).named("positions_p");
     let pages_p = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages_p");
@@ -481,10 +480,7 @@ async fn main(input: Input) -> Result<Output> {
         //    whatever this says -- it holds the token this fire is writing. ──
         fwd.on_attn_proj(move || {
             let mass = page_mass.take().tensor();
-            intrinsics::kernel::attn_page_mask(&pivot_threshold(
-                &mass,
-                rank_le(effective_budget),
-            ));
+            intrinsics::kernel::attn_page_mask(&pivot_threshold(&mass, rank_le(effective_budget)));
             page_mass.put(&mass);
         });
 
@@ -509,29 +505,16 @@ async fn main(input: Input) -> Result<Output> {
         });
 
         let budget_n = max_tokens - 1;
-        let mut submitted = 0usize;
-        let mut in_flight = 0usize;
-        while in_flight < DEFAULT_RUNAHEAD_DEPTH && submitted < budget_n {
-            fwd.submit(&pipe)
-                .map_err(|e| format!("decode submit @{}: {e}", submitted + 1))?;
-            submitted += 1;
-            in_flight += 1;
-        }
-        while in_flight > 0 {
+        run_ahead(&pipe, &fwd, budget_n as usize, async || {
             let t = tok_out
                 .take()
                 .get::<i32>()
                 .await
                 .map_err(|e| format!("tok_out.take @{}: {e}", generated.len()))?[0];
-            in_flight -= 1;
             generated.push(t as u32);
-            if submitted < budget_n {
-                fwd.submit(&pipe)
-                    .map_err(|e| format!("decode submit @{}: {e}", submitted + 1))?;
-                submitted += 1;
-                in_flight += 1;
-            }
-        }
+            Ok(ControlFlow::Continue(()))
+        })
+        .await?;
     }
     pipe.close();
 

@@ -98,7 +98,8 @@ async fn main(input: Input) -> Result<String> {
     // The unconditional stream drops the conditioning text. With no negative
     // prompt it keeps only the chat scaffolding, which is the paper's
     // "unconditional" ∅ context for an instruction-tuned model.
-    let mut uncond_prompt = chat::system_user("You are a helpful assistant.", &input.negative_prompt);
+    let mut uncond_prompt =
+        chat::system_user("You are a helpful assistant.", &input.negative_prompt);
     uncond_prompt.extend(chat::cue());
     if uncond_prompt.is_empty() {
         uncond_prompt.push(0);

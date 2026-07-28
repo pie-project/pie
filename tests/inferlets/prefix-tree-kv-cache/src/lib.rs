@@ -160,40 +160,19 @@ async fn generate(
     });
 
     let budget = max_tokens.saturating_sub(generated.len());
-    let mut submitted = 0usize;
-    let mut in_flight = 0usize;
-    while in_flight < DEFAULT_RUNAHEAD_DEPTH && submitted < budget {
-        fwd.submit(&pipeline)
-            .map_err(|e| format!("generate leaf: {e}"))?;
-        submitted += 1;
-        in_flight += 1;
-    }
-    while in_flight > 0 {
+    run_ahead(&pipeline, &fwd, budget as usize, async || {
         let token = token_out
             .take()
             .get::<i32>()
             .await
             .map_err(|e| format!("read leaf token: {e}"))?[0] as u32;
-        in_flight -= 1;
         if stop_tokens.contains(&token) {
-            break;
+            return Ok(ControlFlow::Break(()));
         }
         generated.push(token);
-        if submitted < budget {
-            fwd.submit(&pipeline)
-                .map_err(|e| format!("generate leaf: {e}"))?;
-            submitted += 1;
-            in_flight += 1;
-        }
-    }
-    while in_flight > 0 {
-        token_out
-            .take()
-            .get::<i32>()
-            .await
-            .map_err(|e| format!("drain leaf run-ahead token: {e}"))?;
-        in_flight -= 1;
-    }
+        Ok(ControlFlow::Continue(()))
+    })
+    .await?;
     Ok(generated)
 }
 

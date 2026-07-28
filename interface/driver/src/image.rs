@@ -53,7 +53,8 @@ pub fn encode(package: &LaunchPackage) -> Vec<u8> {
         reloc_count: image.relocs.len() as u64,
         root: root as u64,
     };
-    let mut out = Vec::with_capacity(size_of::<ImageHeader>() + image.blob.len() + image.relocs.len() * 8);
+    let mut out =
+        Vec::with_capacity(size_of::<ImageHeader>() + image.blob.len() + image.relocs.len() * 8);
     out.extend_from_slice(&header.magic.to_le_bytes());
     out.extend_from_slice(&header.abi_version.to_le_bytes());
     out.extend_from_slice(&header.blob_len.to_le_bytes());
@@ -77,7 +78,10 @@ impl Default for Image {
         // pointer field, so data at offset 0 would be indistinguishable from
         // the null that marks an empty slice -- and the relocation pass would
         // skip it, handing the consumer a null pointer with a nonzero length.
-        Self { blob: vec![0; 8], relocs: Vec::new() }
+        Self {
+            blob: vec![0; 8],
+            relocs: Vec::new(),
+        }
     }
 }
 
@@ -124,7 +128,11 @@ impl Image {
     fn u32s(&mut self, items: &[u32]) -> PieU32Slice {
         let offset = self.put(items);
         PieU32Slice {
-            ptr: if items.is_empty() { core::ptr::null() } else { offset_ptr(offset) },
+            ptr: if items.is_empty() {
+                core::ptr::null()
+            } else {
+                offset_ptr(offset)
+            },
             len: items.len(),
         }
     }
@@ -132,7 +140,11 @@ impl Image {
     fn u8s(&mut self, items: &[u8]) -> PieU8Slice {
         let offset = self.put(items);
         PieU8Slice {
-            ptr: if items.is_empty() { core::ptr::null() } else { offset_ptr(offset) },
+            ptr: if items.is_empty() {
+                core::ptr::null()
+            } else {
+                offset_ptr(offset)
+            },
             len: items.len(),
         }
     }
@@ -140,33 +152,54 @@ impl Image {
     fn bytes(&mut self, items: &[u8]) -> PieBytes {
         let offset = self.put(items);
         PieBytes {
-            ptr: if items.is_empty() { core::ptr::null() } else { offset_ptr(offset) },
+            ptr: if items.is_empty() {
+                core::ptr::null()
+            } else {
+                offset_ptr(offset)
+            },
             len: items.len(),
         }
     }
 
     fn name_table(&mut self, names: &[String]) -> PieBytesSlice {
-        let records: Vec<PieBytes> = names.iter().map(|name| self.bytes(name.as_bytes())).collect();
+        let records: Vec<PieBytes> = names
+            .iter()
+            .map(|name| self.bytes(name.as_bytes()))
+            .collect();
         let base = self.put(&records);
         if records.is_empty() {
-            return PieBytesSlice { ptr: core::ptr::null(), len: 0 };
+            return PieBytesSlice {
+                ptr: core::ptr::null(),
+                len: 0,
+            };
         }
         for (index, record) in records.iter().enumerate() {
             if !record.ptr.is_null() {
-                self.relocs.push((base + index * size_of::<PieBytes>()) as u64);
+                self.relocs
+                    .push((base + index * size_of::<PieBytes>()) as u64);
             }
         }
-        PieBytesSlice { ptr: offset_ptr(base), len: records.len() }
+        PieBytesSlice {
+            ptr: offset_ptr(base),
+            len: records.len(),
+        }
     }
 
     fn puts(&mut self, puts: &[LaunchPut]) -> PieLaunchPutSlice {
         let records: Vec<PieLaunchPut> = puts
             .iter()
-            .map(|put| PieLaunchPut { channel: put.channel, value: put.value })
+            .map(|put| PieLaunchPut {
+                channel: put.channel,
+                value: put.value,
+            })
             .collect();
         let base = self.put(&records);
         PieLaunchPutSlice {
-            ptr: if records.is_empty() { core::ptr::null() } else { offset_ptr(base) },
+            ptr: if records.is_empty() {
+                core::ptr::null()
+            } else {
+                offset_ptr(base)
+            },
             len: records.len(),
         }
     }
@@ -198,10 +231,16 @@ impl Image {
             .collect();
         let base = self.put(&records);
         if records.is_empty() {
-            return PieLaunchOpSlice { ptr: core::ptr::null(), len: 0 };
+            return PieLaunchOpSlice {
+                ptr: core::ptr::null(),
+                len: 0,
+            };
         }
         reloc!(self, base, &records, PieLaunchOp, args, shape);
-        PieLaunchOpSlice { ptr: offset_ptr(base), len: records.len() }
+        PieLaunchOpSlice {
+            ptr: offset_ptr(base),
+            len: records.len(),
+        }
     }
 
     fn regions(&mut self, regions: &[LaunchRegion]) -> PieLaunchRegionSlice {
@@ -221,10 +260,25 @@ impl Image {
             .collect();
         let base = self.put(&records);
         if records.is_empty() {
-            return PieLaunchRegionSlice { ptr: core::ptr::null(), len: 0 };
+            return PieLaunchRegionSlice {
+                ptr: core::ptr::null(),
+                len: 0,
+            };
         }
-        reloc!(self, base, &records, PieLaunchRegion, nodes, inputs, outputs, sinks);
-        PieLaunchRegionSlice { ptr: offset_ptr(base), len: records.len() }
+        reloc!(
+            self,
+            base,
+            &records,
+            PieLaunchRegion,
+            nodes,
+            inputs,
+            outputs,
+            sinks
+        );
+        PieLaunchRegionSlice {
+            ptr: offset_ptr(base),
+            len: records.len(),
+        }
     }
 
     fn plan(&mut self, plan: &LaunchStagePlan) -> PieLaunchStagePlan {
@@ -241,22 +295,41 @@ impl Image {
             .collect();
         let value_base = self.put(&value_records);
         let value_types = if value_records.is_empty() {
-            PieLaunchPlanValueSlice { ptr: core::ptr::null(), len: 0 }
+            PieLaunchPlanValueSlice {
+                ptr: core::ptr::null(),
+                len: 0,
+            }
         } else {
-            reloc!(self, value_base, &value_records, PieLaunchPlanValue, extents, dims);
-            PieLaunchPlanValueSlice { ptr: offset_ptr(value_base), len: value_records.len() }
+            reloc!(
+                self,
+                value_base,
+                &value_records,
+                PieLaunchPlanValue,
+                extents,
+                dims
+            );
+            PieLaunchPlanValueSlice {
+                ptr: offset_ptr(value_base),
+                len: value_records.len(),
+            }
         };
 
         let rule_records: Vec<PieLaunchChannelRule> = plan
             .channel_rules
             .iter()
-            .map(|rule| PieLaunchChannelRule { value: rule.value, local: rule.local })
+            .map(|rule| PieLaunchChannelRule {
+                value: rule.value,
+                local: rule.local,
+            })
             .collect();
         let rule_base = self.put(&rule_records);
 
         let flat_sources: Vec<u32> = plan.source_ops.iter().flatten().copied().collect();
-        let source_counts: Vec<u32> =
-            plan.source_ops.iter().map(|sources| sources.len() as u32).collect();
+        let source_counts: Vec<u32> = plan
+            .source_ops
+            .iter()
+            .map(|sources| sources.len() as u32)
+            .collect();
 
         PieLaunchStagePlan {
             signature_hash: plan.signature_hash,
@@ -302,10 +375,16 @@ impl Image {
             .collect();
         let value_base = self.put(&value_records);
         let values = if value_records.is_empty() {
-            PieLaunchValueSlice { ptr: core::ptr::null(), len: 0 }
+            PieLaunchValueSlice {
+                ptr: core::ptr::null(),
+                len: 0,
+            }
         } else {
             reloc!(self, value_base, &value_records, PieLaunchValue, shape);
-            PieLaunchValueSlice { ptr: offset_ptr(value_base), len: value_records.len() }
+            PieLaunchValueSlice {
+                ptr: offset_ptr(value_base),
+                len: value_records.len(),
+            }
         };
 
         let channel_records: Vec<PieLaunchChannel> = package
@@ -325,10 +404,23 @@ impl Image {
             .collect();
         let channel_base = self.put(&channel_records);
         let channels = if channel_records.is_empty() {
-            PieLaunchChannelSlice { ptr: core::ptr::null(), len: 0 }
+            PieLaunchChannelSlice {
+                ptr: core::ptr::null(),
+                len: 0,
+            }
         } else {
-            reloc!(self, channel_base, &channel_records, PieLaunchChannel, shape, extern_name);
-            PieLaunchChannelSlice { ptr: offset_ptr(channel_base), len: channel_records.len() }
+            reloc!(
+                self,
+                channel_base,
+                &channel_records,
+                PieLaunchChannel,
+                shape,
+                extern_name
+            );
+            PieLaunchChannelSlice {
+                ptr: offset_ptr(channel_base),
+                len: channel_records.len(),
+            }
         };
 
         let port_records: Vec<PieLaunchPort> = package
@@ -346,10 +438,23 @@ impl Image {
             .collect();
         let port_base = self.put(&port_records);
         let ports = if port_records.is_empty() {
-            PieLaunchPortSlice { ptr: core::ptr::null(), len: 0 }
+            PieLaunchPortSlice {
+                ptr: core::ptr::null(),
+                len: 0,
+            }
         } else {
-            reloc!(self, port_base, &port_records, PieLaunchPort, const_shape, const_data);
-            PieLaunchPortSlice { ptr: offset_ptr(port_base), len: port_records.len() }
+            reloc!(
+                self,
+                port_base,
+                &port_records,
+                PieLaunchPort,
+                const_shape,
+                const_data
+            );
+            PieLaunchPortSlice {
+                ptr: offset_ptr(port_base),
+                len: port_records.len(),
+            }
         };
 
         let names = self.name_table(&package.names);
@@ -370,17 +475,35 @@ impl Image {
             .collect();
         let stage_base = self.put(&stage_records);
         let stages = if stage_records.is_empty() {
-            PieLaunchStageSlice { ptr: core::ptr::null(), len: 0 }
+            PieLaunchStageSlice {
+                ptr: core::ptr::null(),
+                len: 0,
+            }
         } else {
-            reloc!(self, stage_base, &stage_records, PieLaunchStage, ops, puts, takes, reads);
-            PieLaunchStageSlice { ptr: offset_ptr(stage_base), len: stage_records.len() }
+            reloc!(
+                self,
+                stage_base,
+                &stage_records,
+                PieLaunchStage,
+                ops,
+                puts,
+                takes,
+                reads
+            );
+            PieLaunchStageSlice {
+                ptr: offset_ptr(stage_base),
+                len: stage_records.len(),
+            }
         };
 
         let plan_records: Vec<PieLaunchStagePlan> =
             package.plans.iter().map(|plan| self.plan(plan)).collect();
         let plan_base = self.put(&plan_records);
         let plans = if plan_records.is_empty() {
-            PieLaunchStagePlanSlice { ptr: core::ptr::null(), len: 0 }
+            PieLaunchStagePlanSlice {
+                ptr: core::ptr::null(),
+                len: 0,
+            }
         } else {
             reloc!(
                 self,
@@ -399,10 +522,20 @@ impl Image {
                 channel_rules,
                 error,
             );
-            PieLaunchStagePlanSlice { ptr: offset_ptr(plan_base), len: plan_records.len() }
+            PieLaunchStagePlanSlice {
+                ptr: offset_ptr(plan_base),
+                len: plan_records.len(),
+            }
         };
 
-        let root = [PieLaunchPackage { values, channels, ports, names, stages, plans }];
+        let root = [PieLaunchPackage {
+            values,
+            channels,
+            ports,
+            names,
+            stages,
+            plans,
+        }];
         let root_base = self.put(&root);
         reloc!(
             self,

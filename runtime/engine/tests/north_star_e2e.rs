@@ -297,7 +297,7 @@ fn north_star_quest_attention_sink() {
     use pie_ir::op::{IntrinsicId, Op};
     use pie_ir::registry::{KernelInfo, ModelProfile, Stage};
     use pie_ir::types::{DType, Literal, Predicate, Shape};
-    use pie_ir::validate::{bind, ValidateError};
+    use pie_ir::validate::{ValidateError, bind};
 
     const PAGES: u32 = 8;
     const BUDGET: u32 = 3;
@@ -339,7 +339,10 @@ fn north_star_quest_attention_sink() {
                     predicate: Predicate::RankLe(2),
                 },
                 // 4: apply. No result id -- the sink configures this forward.
-                Op::SinkCall { name: 0, args: vec![3] },
+                Op::SinkCall {
+                    name: 0,
+                    args: vec![3],
+                },
             ],
         }],
     };
@@ -368,8 +371,9 @@ fn north_star_quest_attention_sink() {
     assert!(!quest_leg(BUDGET).encode().is_empty());
 
     // (1) The §4 bind rule, both directions.
-    let bound = bind(quest_leg(BUDGET), profile(true))
-        .expect("the quest leg must bind against a backend that advertises envelope_dot + attn_page_mask");
+    let bound = bind(quest_leg(BUDGET), profile(true)).expect(
+        "the quest leg must bind against a backend that advertises envelope_dot + attn_page_mask",
+    );
 
     match bind(quest_leg(BUDGET), profile(false)) {
         Err(ValidateError::KernelUnavailable { .. }) => {}
