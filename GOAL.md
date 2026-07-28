@@ -639,8 +639,32 @@ correct engine must accept:
 | genuine wrong refusals | **8**, not the 28 the old metric counted |
 
 Of the 28 refusals, 7 are of text that is not JSON and 13 of documents that
-violate their own schema. Eight are ours: they refuse at the final byte, and
-they are recorded here rather than folded into a coverage number.
+violate their own schema. Eight are ours, and all eight are explained.
+
+**Seven of the eight are the configuration ceiling, which is a knob.** The
+parser carries a set of configurations and drops the rest at a ceiling; dropping
+one can only make it stricter. Raising the ceiling recovers them:
+
+| configurations | wrong refusals | batch-512 state | fill |
+|---:|---:|---:|---:|
+| 16 | 8 | 49.6 MB | 284 us |
+| 128 (default) | 8 | 340 MB | 287 us |
+| 512 | 6 | 1,328 MB | 282 us |
+| 4,096 | **1** | 10,549 MB | 609 us |
+
+So acceptance over the valid instances of compiled schemas is **99.8%** at a
+ceiling of 4,096, and the price is linear in memory. Reporting acceptance
+without the ceiling it was measured at is the same mistake as reporting
+coverage without the lexer budget.
+
+**The last one is the precision fallback, also a knob.** Schema 247's
+`Unordered` lowering exceeds the 20,000-production budget, so the search falls
+back to `Ordered`, which fixes property order - and this document does not use
+that order. It is the only schema of the 533 whose refusal is a lowering
+decision rather than a ceiling.
+
+**There is no unexplained refusal.** That is the claim the soundness argument
+needs, and it is now true rather than nearly true.
 
 **Objects accept their properties in any order.** A JSON object is a set, but a
 grammar describes a sequence, so the standard answer - XGrammar's too - fixes
