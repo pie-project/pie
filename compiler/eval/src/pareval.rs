@@ -272,7 +272,18 @@ fn stage_taint(ops: &[Op], device_decided: &BTreeSet<u32>) -> (BTreeMap<u32, boo
     for op in ops {
         let arg_tainted = op.operands().iter().any(|&arg| tainted[arg as usize]);
         let out = match op {
-            Op::KernelCall { .. } | Op::IntrinsicVal { .. } => true,
+            // Device-decided at their source. A kernel or intrinsic result
+            // exists only once the device has run. `Rng` belongs here too: it
+            // is the ambient-seed form, and the ambient seed is a per-fire
+            // device fact, not something the host can replay. `SinkCall`
+            // defines no results, so its answer is never read.
+            Op::KernelCall { .. }
+            | Op::IntrinsicVal { .. }
+            | Op::SinkCall { .. }
+            | Op::Rng { .. } => true,
+
+            // A read inherits whatever this stage already put, else whatever
+            // an earlier stage proved.
             Op::ChanTake(chan) | Op::ChanRead(chan) => match pending.get(chan) {
                 Some(&t) => t,
                 None => device_decided.contains(chan),
@@ -285,7 +296,65 @@ fn stage_taint(ops: &[Op], device_decided: &BTreeSet<u32>) -> (BTreeMap<u32, boo
                 }
                 false
             }
-            _ => arg_tainted,
+
+            // Everything else is a pure function of its operands, so it is
+            // host-derivable exactly when all of them are. `RngKeyed` is in
+            // this set on purpose: PTIR-CONTAINER.md pins it as a pure
+            // function of its `state` operand, so replaying the state
+            // replays the noise.
+            //
+            // Spelled out rather than left to `_` because the answer for a
+            // new op is a judgement, not a default: a wrong `false` here
+            // tells the scheduler it can derive a descriptor it cannot, and
+            // the audit that prompted this found `Rng` doing exactly that.
+            Op::Const(..)
+            | Op::Exp(..)
+            | Op::Log(..)
+            | Op::Neg(..)
+            | Op::Recip(..)
+            | Op::Abs(..)
+            | Op::Sign(..)
+            | Op::Cast { .. }
+            | Op::Add(..)
+            | Op::Sub(..)
+            | Op::Mul(..)
+            | Op::Div(..)
+            | Op::MaxElem(..)
+            | Op::MinElem(..)
+            | Op::Rem(..)
+            | Op::Gt(..)
+            | Op::Ge(..)
+            | Op::Eq(..)
+            | Op::Ne(..)
+            | Op::Lt(..)
+            | Op::Le(..)
+            | Op::And(..)
+            | Op::Or(..)
+            | Op::Not(..)
+            | Op::Select { .. }
+            | Op::ReduceSum(..)
+            | Op::ReduceMax(..)
+            | Op::ReduceMin(..)
+            | Op::ReduceArgmax(..)
+            | Op::Broadcast { .. }
+            | Op::Reshape { .. }
+            | Op::Transpose(..)
+            | Op::CumSum(..)
+            | Op::CumProd(..)
+            | Op::SortDesc(..)
+            | Op::TopK { .. }
+            | Op::PivotThreshold { .. }
+            | Op::MatMul(..)
+            | Op::Gather { .. }
+            | Op::GatherRow { .. }
+            | Op::ScatterAdd { .. }
+            | Op::ScatterSet { .. }
+            | Op::Iota { .. }
+            | Op::MaskApply { .. }
+            | Op::CausalMask { .. }
+            | Op::SlidingWindowMask { .. }
+            | Op::SinkWindowMask { .. }
+            | Op::RngKeyed { .. } => arg_tainted,
         };
         for _ in 0..op.result_count() {
             tainted.push(out);
@@ -352,7 +421,7 @@ mod tests {
     };
     use pie_ir::op::IntrinsicId;
     use pie_ir::registry::ModelProfile;
-    use pie_ir::types::{DType, Literal, Shape};
+    use pie_ir::types::{DType, Literal, RngKind, Shape};
     use pie_ir::validate::bind;
 
     fn chan(shape: Shape, dtype: DType, capacity: u32) -> ChannelDecl {
@@ -597,6 +666,71 @@ mod tests {
             !taint.device_dependent_ports.contains(&Port::Pages),
             "iota-broadcast pages stay host-derivable"
         );
+    }
+
+    /// `Rng` draws from an ambient per-fire seed, so its result is a device
+    /// fact even though the op has no value operands. It used to reach
+    /// `stage_taint`'s catch-all and inherit `arg_tainted` — vacuously
+    /// `false` for an operand-free op — which told the scheduler it could
+    /// derive a descriptor whose width came out of the device's noise.
+    #[test]
+    fn ambient_rng_taints_what_it_reaches() {
+        use Op::*;
+        let mut trace = sdk_geometry_trace();
+        trace.stages.push(StageProgram {
+            stage: Stage::Epilogue,
+            ops: vec![
+                Rng {
+                    stream: 0,
+                    shape: Shape::vector(3),
+                    kind: RngKind::Uniform,
+                }, // 0 F32 [3]
+                Cast {
+                    value: 0,
+                    dtype: DType::U32,
+                }, // 1
+                Cast {
+                    value: 1,
+                    dtype: DType::I32,
+                }, // 2
+                ChanPut { chan: 0, value: 2 },
+            ],
+        });
+        let bound = bind(trace, ModelProfile::dummy()).unwrap();
+        let taint = geometry_taint(&bound);
+        assert!(taint.device_decided.contains(&0), "rng-fed tokens");
+        assert!(taint.device_dependent_ports.contains(&Port::EmbedTokens));
+        assert!(taint.device_dependent_ports.contains(&Port::Positions));
+        assert!(!taint.host_derivable());
+    }
+
+    /// The keyed form is the opposite case and must stay untainted:
+    /// PTIR-CONTAINER.md §5 pins it as a pure function of its `state`
+    /// operand, so a host holding the state replays the same noise.
+    #[test]
+    fn keyed_rng_is_only_as_tainted_as_its_state() {
+        use Op::*;
+        let mut trace = sdk_geometry_trace();
+        trace.channels.push(chan(Shape::vector(2), DType::U32, 1));
+        trace.stages.push(StageProgram {
+            stage: Stage::Epilogue,
+            ops: vec![
+                ChanRead(8), // 0 state [2] U32, seeded ⇒ host-known
+                RngKeyed {
+                    state: 0,
+                    shape: Shape::vector(3),
+                    kind: RngKind::Uniform,
+                }, // 1
+                Cast {
+                    value: 1,
+                    dtype: DType::I32,
+                }, // 2
+                ChanPut { chan: 0, value: 2 },
+            ],
+        });
+        let bound = bind(trace, ModelProfile::dummy()).unwrap();
+        let taint = geometry_taint(&bound);
+        assert!(taint.host_derivable(), "keyed noise is replayable");
     }
 
     #[test]

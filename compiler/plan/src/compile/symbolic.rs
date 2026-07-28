@@ -187,7 +187,48 @@ pub(crate) fn symbolic_result_type(
             );
             ty
         }
-        _ => {
+        // Rank-preserving default: the op's own declared shape, with any
+        // symbolic dimension carried over from the first operand of equal
+        // rank. Every op above either invents a shape or reshapes one, so
+        // these are the ops for which "same rank in, same rank out" is the
+        // whole rule.
+        //
+        // Named rather than left to `_` because that is the difference
+        // between an op the default *fits* and an op nobody classified: a new
+        // reducer or gather silently taking this arm would be given its
+        // operand's rank and go on to size a buffer.
+        Op::Const(..)
+        | Op::Exp(..)
+        | Op::Log(..)
+        | Op::Neg(..)
+        | Op::Recip(..)
+        | Op::Abs(..)
+        | Op::Sign(..)
+        | Op::Cast { .. }
+        | Op::Add(..)
+        | Op::Sub(..)
+        | Op::Mul(..)
+        | Op::Div(..)
+        | Op::MaxElem(..)
+        | Op::MinElem(..)
+        | Op::Rem(..)
+        | Op::Gt(..)
+        | Op::Ge(..)
+        | Op::Eq(..)
+        | Op::Ne(..)
+        | Op::Lt(..)
+        | Op::Le(..)
+        | Op::And(..)
+        | Op::Or(..)
+        | Op::Not(..)
+        | Op::Select { .. }
+        | Op::PivotThreshold { .. }
+        | Op::Iota { .. }
+        | Op::Rng { .. }
+        | Op::RngKeyed { .. }
+        | Op::ChanPut { .. }
+        | Op::KernelCall { .. }
+        | Op::SinkCall { .. } => {
             let mut ty = SymbolicType::static_type(value_type);
             if let Some((original, mapped)) = original_op
                 .operands()
