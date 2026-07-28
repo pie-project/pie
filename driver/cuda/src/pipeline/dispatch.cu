@@ -1334,6 +1334,22 @@ struct Dispatch::Impl {
     // different stream), consumed at the instance's first completed wave.
     cudaEvent_t publications_done = nullptr;
     bool publications_recorded = false;
+    // Settlement notification runs on its OWN stream. `cudaLaunchHostFunc`
+    // blocks the stream it is enqueued on until the driver's callback thread
+    // wakes and returns, so hosting it on the compute stream stalled the GPU
+    // between one wave's `k_settle_host_channels_batch` and the next wave's
+    // `k_pull_validate_host_channels_batch` — measured 111 us fixed (callback
+    // thread wakeup) + 0.44 us per lane, i.e. 224 us at 256 lanes. The next
+    // wave was already submitted, so no amount of frame lookahead (k) could
+    // hide it: a blocking node cannot be jumped by pre-queueing.
+    //
+    // `settlement_ready` orders the callback after the wave's settlement;
+    // `settlement_callbacks_done` re-establishes the ordering the compute
+    // stream used to get for free (see the wait before this wave's host
+    // publications in `Dispatch::finish`).
+    cudaEvent_t settlement_ready = nullptr;
+    cudaEvent_t settlement_callbacks_done = nullptr;
+    bool settlement_callbacks_recorded = false;
     std::vector<BoundInstance::CommitSnapshot> available_commit_snapshots;
     // W4 exit reaper: a closed instance's resources may only be reclaimed
     // after its callback fence drains and its publication events settle —
@@ -1388,6 +1404,7 @@ struct Dispatch::Impl {
     std::uint32_t* h_envelope_kills = nullptr;
     std::uint32_t envelope_kills_reported = 0;
     cudaStream_t output_copy_stream = nullptr;
+    cudaStream_t notify_stream = nullptr;
     cudaStream_t group_streams[2] = {nullptr, nullptr};
     cudaStream_t signature_streams[kSignatureStreamCount] = {};
     bool attention_hook_coverage = false;
@@ -2081,10 +2098,12 @@ class NotifyContextLease {
         NotifyContext* context,
         cudaStream_t stream,
         cudaStream_t auxiliary_stream,
+        cudaStream_t notify_stream,
         std::unique_lock<std::mutex> lock)
         : context_(context),
           stream_(stream),
           auxiliary_stream_(auxiliary_stream),
+          notify_stream_(notify_stream),
           lock_(std::move(lock)) {}
     ~NotifyContextLease() {
         if (context_ != nullptr) {
@@ -2092,17 +2111,26 @@ class NotifyContextLease {
                 auxiliary_stream_ == stream_
                 ? cudaSuccess
                 : cudaStreamSynchronize(auxiliary_stream_);
+            // The settlement callback rides its own stream now, so an
+            // exception thrown after it was enqueued must drain that stream
+            // too before the fences it releases are touched here.
+            const cudaError_t notify_status =
+                (notify_stream_ == nullptr || notify_stream_ == stream_)
+                ? cudaSuccess
+                : cudaStreamSynchronize(notify_stream_);
             const cudaError_t status =
                 cudaStreamSynchronize(stream_);
             if (auxiliary_status == cudaSuccess &&
+                notify_status == cudaSuccess &&
                 status == cudaSuccess) {
                 release_callback_fences(*context_);
                 context_->in_use.store(false, std::memory_order_release);
             } else {
                 std::fprintf(
                     stderr,
-                    "[pie-driver-cuda] settlement cleanup stream sync failed: %s / %s\n",
+                    "[pie-driver-cuda] settlement cleanup stream sync failed: %s / %s / %s\n",
                     cudaGetErrorString(auxiliary_status),
+                    cudaGetErrorString(notify_status),
                     cudaGetErrorString(status));
             }
         }
@@ -2118,6 +2146,7 @@ class NotifyContextLease {
     NotifyContext* context_;
     cudaStream_t stream_;
     cudaStream_t auxiliary_stream_;
+    cudaStream_t notify_stream_;
     std::unique_lock<std::mutex> lock_;
 };
 
@@ -2443,6 +2472,8 @@ __global__ void cast_query_bf16_to_f32(
 Dispatch::Dispatch() : impl_(std::make_unique<Impl>()) {
     CUDA_CHECK(cudaStreamCreateWithFlags(
         &impl_->output_copy_stream, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaStreamCreateWithFlags(
+        &impl_->notify_stream, cudaStreamNonBlocking));
     for (std::size_t index = 0; index < 2; ++index) {
         CUDA_CHECK(cudaStreamCreateWithFlags(
             &impl_->group_streams[index], cudaStreamNonBlocking));
@@ -2561,6 +2592,9 @@ Dispatch::~Dispatch() {
         CUDA_CHECK(cudaStreamSynchronize(
             impl_->output_copy_stream));
     }
+    if (impl_->notify_stream != nullptr) {
+        CUDA_CHECK(cudaStreamSynchronize(impl_->notify_stream));
+    }
     impl_->generated_runtime.clear();
     CUDA_CHECK(cudaStreamSynchronize(
         sampling_ir::FrameCarrierEngine::instance().copy_stream()));
@@ -2599,9 +2633,21 @@ Dispatch::~Dispatch() {
         CUDA_CHECK(cudaStreamDestroy(impl_->output_copy_stream));
         impl_->output_copy_stream = nullptr;
     }
+    if (impl_->notify_stream != nullptr) {
+        CUDA_CHECK(cudaStreamDestroy(impl_->notify_stream));
+        impl_->notify_stream = nullptr;
+    }
     if (impl_->publications_done != nullptr) {
         CUDA_CHECK(cudaEventDestroy(impl_->publications_done));
         impl_->publications_done = nullptr;
+    }
+    if (impl_->settlement_ready != nullptr) {
+        CUDA_CHECK(cudaEventDestroy(impl_->settlement_ready));
+        impl_->settlement_ready = nullptr;
+    }
+    if (impl_->settlement_callbacks_done != nullptr) {
+        CUDA_CHECK(cudaEventDestroy(impl_->settlement_callbacks_done));
+        impl_->settlement_callbacks_done = nullptr;
     }
 }
 
@@ -4939,6 +4985,7 @@ bool Dispatch::finish(
         notify,
         callback_stream,
         impl_->output_copy_stream,
+        impl_->notify_stream,
         std::move(settlement_lock));
     if (runtime != nullptr) notify->runtime = *runtime;
     notify->completion = completion;
@@ -5078,6 +5125,19 @@ bool Dispatch::finish(
             0));
         settlement_stream = impl_->output_copy_stream;
     }
+    // Commit snapshots are pooled per (instance, wave-occurrence) and reused
+    // every wave, so this wave's D2H publications write the very buffers the
+    // PREVIOUS wave's settlement callback reads. That callback used to sit on
+    // the compute stream, which enforced the ordering implicitly; it now runs
+    // on `notify_stream`, so state the dependency explicitly. Placed here
+    // rather than at the wave's head it costs nothing: a full forward pass
+    // separates the two, and the callback has long since retired.
+    if (impl_->settlement_callbacks_recorded) {
+        CUDA_CHECK(cudaStreamWaitEvent(
+            settlement_stream,
+            impl_->settlement_callbacks_done,
+            0));
+    }
     enqueue_host_publish_copies(
         *notify, settlement_stream, publish_transport);
     launch_settle_host_channels_batch(
@@ -5141,22 +5201,35 @@ bool Dispatch::finish(
     ensure_event(&impl_->publications_done);
     CUDA_CHECK(cudaEventRecord(impl_->publications_done, callback_stream));
     impl_->publications_recorded = true;
+    // Hand the settlement callback to a stream of its own: `cudaLaunchHostFunc`
+    // holds its stream until the driver's callback thread runs the function, so
+    // leaving it here would stall the compute stream for the wakeup latency
+    // even though the next wave is already queued behind it.
+    ensure_event(&impl_->settlement_ready);
+    CUDA_CHECK(cudaEventRecord(
+        impl_->settlement_ready, settlement_stream));
+    CUDA_CHECK(cudaStreamWaitEvent(
+        impl_->notify_stream, impl_->settlement_ready, 0));
     const cudaError_t callback_status = cudaLaunchHostFunc(
-        settlement_stream, notify_runtime_callback, notify);
+        impl_->notify_stream, notify_runtime_callback, notify);
     if (callback_status != cudaSuccess) {
         CUDA_CHECK(callback_status);
     }
     const cudaError_t event_status = cudaEventRecord(
-        notify->callback_done, settlement_stream);
+        notify->callback_done, impl_->notify_stream);
     if (event_status == cudaSuccess) {
         notify->callback_pending = true;
+        ensure_event(&impl_->settlement_callbacks_done);
+        CUDA_CHECK(cudaEventRecord(
+            impl_->settlement_callbacks_done, impl_->notify_stream));
+        impl_->settlement_callbacks_recorded = true;
     } else {
         std::fprintf(
             stderr,
             "[pie-driver-cuda] settlement callback event record failed: %s\n",
             cudaGetErrorString(event_status));
         const cudaError_t sync_status =
-            cudaStreamSynchronize(settlement_stream);
+            cudaStreamSynchronize(impl_->notify_stream);
         if (sync_status != cudaSuccess) {
             std::fprintf(
                 stderr,

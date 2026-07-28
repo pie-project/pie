@@ -2513,3 +2513,179 @@ pie is ahead of vLLM at concurrency 1–64 and within 3–5% at 128/256 (from
 (27110) where the sweep above caught its bad mode (21767): k = 1 is
 bimodal at that point and k = 2 is not — the run-to-run spread is the
 reason to take the default, independent of the mean.
+
+## §20.9 The settlement callback sat on the compute stream (2026-07-28)
+
+### Question
+
+With `PIE_FRAME_SIZE=2` the decode pipeline should be perfectly covered:
+frame *N+1* is submitted while frame *N* runs, the sampled token carries over
+**on device** through the channel, and no host round trip separates the two
+forward passes. Yet uncontended conc 256 still trailed vLLM by 3–7%, and
+raising *k* to 3 or 4 changed nothing. Why?
+
+Steady-state cycle, two-point `(wall@256tok − wall@128tok)/128`, 12288 pages,
+conc 256:
+
+| engine | cycle |
+| ------ | ----- |
+| pie k=1 | 13.835 ms |
+| pie k=2 | 13.407 ms |
+| vLLM    | 12.946 ms |
+
+k=2 is 1.036× vLLM, i.e. **+461 µs per wave** to account for.
+
+### First diagnosis — wrong
+
+`PIE_FIRE_TIMING=1` puts p50 host work at 1525 µs/wave, of which FrameSettle
+is 859 µs and `finish_epilogue` 709 µs (execute 286 / group 279 / assemble
+71). Tempting, but wrong: NVTX shows that work starting *mid* graph replay and
+the submitting thread idle ~70% of the wall. It is not GPU-visible. Rejecting
+it is what forced the real answer out.
+
+### Evidence chain
+
+Against a conc-256 k=2 nsys capture (`--cuda-graph-trace`, KERNEL ∪ MEMCPY ∪
+MEMSET ∪ GRAPH_TRACE merged — omitting any of those tables manufactures fake
+idle):
+
+1. The wave is 8205 µs: 7476 µs graph replay (91.1%) + 382 µs non-graph
+   device + **347 µs idle**. The single largest idle window sits between
+   `k_settle_host_channels_batch` and the next wave's
+   `k_pull_validate_host_channels_batch`, p50 224 µs.
+2. Not starvation. In 284 of 290 steady gaps the next wave's
+   `k_pull_validate` had *already been submitted*, p50 8673 µs **before** the
+   GPU went idle.
+3. Genuinely idle, not misattributed: p50 busy inside the window is 8.9 µs of
+   224.2 µs.
+4. Not a cross-stream wait. `STREAM_WAIT_EVENT` totals 1.1 µs over the whole
+   window set, and the last op on any non-main stream ends p50 2360 µs before
+   the window closes.
+5. **Zero host CUDA API calls occur during the window.** Whatever holds the
+   stream makes no CUDA calls — a driver-internal thread.
+6. Scaling control at conc 32 vs 256: 124.8 µs vs 224.2 µs, i.e.
+   **gap = 111 µs + 0.44 µs × lanes**.
+
+### Root cause
+
+`dispatch.cu` enqueued the settlement notification on the **compute stream**:
+
+```
+:4942  cudaStream_t callback_stream = stream;
+:5088  cudaStream_t settlement_stream = callback_stream;   // batch_copies == false here
+:5161  cudaLaunchHostFunc(settlement_stream, notify_runtime_callback, notify);
+```
+
+A host-function node holds its stream until the CUDA driver's callback thread
+wakes on the CPU and returns. Everything queued behind it — including the
+already-submitted next wave — cannot start. The 111 µs constant is the
+callback-thread wakeup; the 0.44 µs/lane term is `notify_runtime_callback`
+releasing each instance's `callback_fence`.
+
+This is precisely why *k* never helped: **k pre-queues wave N+1 behind the
+blocking node**, and a blocking node cannot be jumped by pre-queueing. k=2,
+3 and 4 all measured the same because they were all waiting on the same CPU
+thread.
+
+### Fix
+
+Move the host function to a dedicated `notify_stream`:
+
+* record `settlement_ready` on the settlement stream after
+  `launch_settle_host_channels_batch`, have `notify_stream` wait on it, and
+  launch `cudaLaunchHostFunc` there;
+* record both `notify->callback_done` and a new
+  `settlement_callbacks_done` on `notify_stream`.
+
+One hazard has to be handled. `commit_snapshot()` pools pinned host buffers
+per **(BoundInstance, occurrence-within-wave)** and reuses them every wave, so
+wave *N+1*'s D2H publications write the very buffers wave *N*'s callback
+reads. The on-compute-stream host func was providing that barrier by accident.
+It is restored explicitly with a `cudaStreamWaitEvent` on
+`settlement_callbacks_done` placed immediately **before** this wave's
+`enqueue_host_publish_copies` — a full forward pass downstream of the record,
+so it never blocks in the covered case, and no cycle is possible because the
+awaited record is always from a strictly earlier wave (`Dispatch::finish` is
+serialized by `settlement_mutex`). `NotifyContextLease` now drains
+`notify_stream` on the exception path as well.
+
+### Result (conc 256 unless noted, 4–8 trials each)
+
+| case | before | after | Δ |
+| ---- | ------ | ----- | - |
+| conc 64, k=1 | 15634 | 16243 | +3.9% |
+| conc 64, k=2 | 15758 | 16145 | +2.5% |
+| conc 256, k=2 | 27866 | **28497** | +2.3% |
+| conc 256, k=1 fast mode | 26981 | **28656** | +6.2% |
+| steady cycle vs vLLM | 1.0356× | **1.0154×** | gap halved |
+
+k=2 at conc 256 is now 8/8 trials inside 1% (28371–28656) against a vLLM
+reference of 29621–29688, i.e. 0.962× on throughput where it was 0.937×.
+Contention suite: 16/16.
+
+## §20.10 Why k=1 at conc 256 is bimodal (2026-07-28)
+
+k=1 alternates between ~27k and ~19–22k tok/s across process launches while
+k=2 does not. Ruled out first, all measured, none of them the cause:
+
+* **GPU clocks** — SM clock is pinned at 2520 MHz in both modes, no throttle
+  reason asserted, temp ≤ 44 °C.
+* **NUMA** — the GPU is local to node 1, but `taskset` onto node 1 *or*
+  node 0 both stay bimodal.
+* **Host CPU frequency** — schedutil governor, but max/8th/median core MHz are
+  identical (3250 / 2846 / 1500) in fast and slow runs.
+* **External contention** — GPU is empty (1 MiB) and load is ~11 on 128 cores.
+* **Engine decisions** — memory planner output, 51 captured decode graphs,
+  batch count (258), batch-size histogram, `max forward requests: 256`,
+  prompt and output token counts are all identical between modes.
+
+The distinguishing signal is *overlap*, not work. The slow run has a **lower**
+mean batch latency (11.0 ms) than the fast run (13.7 ms) yet a longer wall
+(3.45 s vs 2.42 s): its batch-latency sum falls below the wall (the GPU idles)
+while the fast run's exceeds it (waves overlap).
+
+`PIE_SCHED_MAX_IN_FLIGHT=1` reproduces the slow mode exactly and, unlike the
+default, *stably*: 20249 / 19826 / 20140 tok/s, σ = 220. So the slow mode is
+simply "run-ahead collapsed to depth 1". Depth 3 does not help — the cap is
+not the limiter, arrival rate is.
+
+nsys on a k=1 run localises every stall to one place. Merged-device-op gaps
+above 200 µs, by bracketing operation:
+
+```
+258  786 ms  avg 3046 us   k_settle_host_channels_batch -> MEMCPY
+149  461 ms  avg 3097 us   MEMCPY -> MEMCPY
+143   53 ms  avg  371 us   MEMCPY -> embed_bf16_kernel
+```
+
+258 is exactly the batch count: **every wave** stalls right after the
+settlement kernel. The idle *preceding* a wave's `k_pull_validate` is p50
+1.4 µs — the GPU is never waiting for the batch to be built, it is waiting
+inside the settle→resubmit turn.
+
+That turn is the whole explanation. At k=1 a lane stages nothing, so its next
+fire cannot exist until it receives the current token, and the wave period is
+`GPU forward + full host round trip` (settle kernel → CUDA host callback →
+runtime wakes 256 guests → 256 guest resubmits → wave sealed → H2D). The round
+trip is what is bistable: ≈1.7 ms when the wake path stays hot, 4–6.5 ms when
+it does not. Two independent levers confirm the mechanism:
+
+* **Any added host cost pins it slow.** `PIE_FIRE_TIMING=1` (65 664 per-fire
+  JSON records) parks k=1 at 14.9–15.8 k tok/s, 4/4; nsys parks it at
+  17.0–21.7 k, 4/4. Neither perturbs k=2 comparably.
+* **Tokio worker count moves it.** conc 256, k=1, 4 trials each:
+  `--worker-threads 8` → 27100/27084/26664/23177; `16` → bimodal;
+  `32` → 18987/18677/19015/19079 (σ = 179); default 64 → bimodal.
+  (`default_worker_threads()` already caps at 64 for exactly this class of
+  variance on EPYC — see `worker/src/config.rs`.)
+
+The §20.9 fix raises the fast mode (26981 → 28656, +6.2%) and leaves the slow
+mode where it was (baseline 18.9–21.7 k, fixed 18.8–22.2 k), i.e. it is a
+strict improvement but does not remove the bistability, because the residual
+stall is the host round trip itself rather than the callback node.
+
+**Not a defect, and not on the default path.** k=2 has been the default since
+§20.8 precisely because it staged the next frame past this turn: on the fixed
+build conc 256 k=2 is 28371–28656 over 8 trials, a 1.0% spread. k=1 exposes
+the round trip by construction. If k=1 ever has to be used at high
+concurrency, `--worker-threads 8` is the lever.
