@@ -3726,3 +3726,84 @@ expected value:
 
 `waves.py` / `turnover.py` (session artifacts, outside the repo) implement the
 gap decomposition and the in-gap lifecycle census used here.
+
+## §20.19 — quick test of the two fix directions: both valid, and correctly sized
+
+§20.18 named two directions without testing either. Both are now measured, and
+§20.18's idle accounting is corrected here.
+
+### Correction: measure TRUE GPU idle, not scheduler-empty time
+
+§20.18 computed the gap as `next.dispatch_started_us - this.native_complete_us`.
+That is when the SCHEDULER resumed, not when the GPU got work. The GPU is idle
+until `launch_returned_us`, so the correct gap is
+`max(prev.native_complete_us, launch_returned_us) - prev.native_complete_us`,
+and the difference between the two is host submit time with the GPU stopped.
+
+| run | TRUE idle | before PREFILL wave | of which sched-empty | of which host submit |
+| --- | --------: | ------------------: | -------------------: | -------------------: |
+| homo 512  | 1.35 s (7.9%)  | 1.19 s (**88%**) | 1.03 s | 0.16 s |
+| homo 1024 | 1.30 s (7.7%)  | 1.15 s (**88%**) | 1.08 s | 0.07 s |
+| mix 512   | 11.07 s (39.7%)| 9.04 s (**82%**) | 3.60 s | **5.44 s** |
+
+The §20.18 headline survives in a sharper form: **idle before a decode wave is
+0.00 s of scheduler-empty time in every run** (504-567 boundaries each); the
+only thing that ever leaves the scheduler with nothing to dispatch is a prefill
+wave. What the corrected accounting ADDS is the submit term: on mixed-phase,
+**5.44 s of a 27.87 s run — 19.5% — is the host submitting a prefill wave while
+the GPU sits idle**, which the §20.18 metric could not see at all.
+
+Reconfirmed on the current build (`--total-pages 8192`, 528 waves): 87% of true
+idle before the 23 prefill waves, decode-wave sched-empty exactly 0.00 s.
+
+### Direction 1 — KV-aware admission: VALID, +13.6% measured
+
+Right-sizing the admission cap to the KV budget is approximated by lowering
+`--concurrency` at a fixed pool. Mixed-phase, 8192 pages, n=2:
+
+| concurrency | tok/s | vs conc 512 |
+| ---: | ---: | ---: |
+| 128 | 9059 | -24% |
+| 192 | 11424 | |
+| 256 | 12293 | |
+| **320** | **13591 / 13385 (mean 13488)** | **+13.6%** |
+| 384 | 12251 / 12589 (mean 12420) | +4.6% |
+| 512 (today's cap) | 11424 / 12328 (mean 11876) | — |
+
+conc 320's WORST run beats conc 512's BEST by 8.6%, so this clears the
+mixed-phase noise band (identical configs spread 9844-12328). Ratio against
+vLLM moves **0.643 -> 0.863**. The optimum matches the arithmetic: a 530-token
+prompt is 33 pages, so 8192 pages holds ~248 full prompts, and the best cap
+sits just above that once short-prompt lanes are counted.
+
+This lever is worth nothing on the homogeneous workload, where prompts are
+short and KV is not the constraint — confirmed by the page-headroom null below.
+
+### Direction 2 — overlap prefill preparation with the running decode wave: VALID
+
+Not implementable as a knob, so measured as headroom instead. Removing the
+prefill-adjacent idle would give **+5.3%** on homogeneous conc 512
+(31383 -> 33046 vs vLLM 32755 = **1.009**, i.e. it flips the sign of the only
+remaining loss) and **+48%** on mixed-phase conc 512.
+
+Two knobs confirm it needs real work rather than tuning:
+
+- **Not page-bound.** Homogeneous conc 512 at 8192 vs 32768 pages: 30831 vs
+  30565 tok/s, and idle 0.94 s vs 1.16 s — a null. The homogeneous prefill
+  stall is host-side preparation, not page starvation. (Contrast mixed-phase,
+  where pages DO matter: 11703 -> 13472 at 16384.)
+- **Not fixable by pipeline depth.** `PIE_SCHED_MAX_IN_FLIGHT` 2/3/4 on
+  mixed-phase gave 11115 / 10864 / 12204 — inside the noise band, no trend.
+  `kSchedulerMaxInFlight = 3` with `kUploadStagingDepth = 13`
+  (driver/cuda/src/runahead.hpp) already sizes the staging pools for depth 3,
+  so this is not a staging limit; the prefill wave's submit simply cannot start
+  until its predecessor completes.
+
+### Ordering
+
+Direction 1 is a policy change with a proven +13.6% on the workload that
+exposes it, and is the cheaper of the two. Direction 2 is a pipeline
+restructuring worth +5.3% on homogeneous conc 512 — which is precisely the
+4.2% deficit that started this whole investigation — and +48% on mixed-phase.
+They are independent: 1 addresses sched-empty idle, 2 addresses both the
+sched-empty and the 5.44 s submit term.
