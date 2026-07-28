@@ -20,48 +20,10 @@ use super::METAL_M2_MAX_FUSED_CHANNELS;
 use super::preamble::{RUNTIME_TEMPLATE, grouped_preamble};
 use super::validate::{intrinsics_bindable, library_region_valid, used_channel_slots};
 use crate::op_view::{OpView, result_bases};
+use crate::slots::Slots;
 
 fn value_ptr(value: u32) -> String {
     format!("scratch + offsets[{value}]")
-}
-
-/// The five operand slots `ptir_m1_execute` takes, defaulted to `scratch` the
-/// way the C++ does before the per-tag overrides.
-struct Slots {
-    a0: String,
-    a1: String,
-    a2: String,
-    o0: String,
-    o1: String,
-}
-
-fn slots_for(op: &OpView, base: u32) -> Slots {
-    let mut slots = Slots {
-        a0: "scratch".to_string(),
-        a1: "scratch".to_string(),
-        a2: "scratch".to_string(),
-        o0: "scratch".to_string(),
-        o1: "scratch".to_string(),
-    };
-    if !op.args.is_empty() {
-        slots.a0 = value_ptr(op.args[0]);
-    }
-    if op.args.len() > 1 {
-        slots.a1 = value_ptr(op.args[1]);
-    }
-    if op.args.len() > 2 {
-        slots.a2 = value_ptr(op.args[2]);
-    }
-    if op.tag == tags::PIVOT_THRESHOLD {
-        slots.a1 = value_ptr(op.pred_payload);
-    }
-    if op.results > 0 {
-        slots.o0 = value_ptr(base);
-    }
-    if op.results > 1 {
-        slots.o1 = value_ptr(base + 1);
-    }
-    slots
 }
 
 /// `emit_fused_region_msl` — single lane, channels bound directly.
@@ -114,7 +76,7 @@ pub fn emit_fused_region(
         let Some(op) = ops.get(node) else {
             return Err("fused region node out of range".to_string());
         };
-        let mut slots = slots_for(op, bases[node]);
+        let mut slots = Slots::of(op, bases[node], value_ptr);
         if op.tag == tags::CHAN_TAKE || op.tag == tags::CHAN_READ {
             if op.chan < 0 || op.chan as usize >= channel_bindings.len() {
                 return Err("fused channel root binding out of range".to_string());
@@ -242,7 +204,7 @@ pub fn emit_grouped_fused_region(
             return Err("grouped fused region node out of range".to_string());
         };
         let base = bases[node];
-        let mut slots = slots_for(op, base);
+        let mut slots = Slots::of(op, base, value_ptr);
         if op.tag == tags::INTRINSIC_VAL && op.intr == intrinsic_tags::MTP_DRAFTS {
             emit_mtp_drafts(&mut source, base, &slots.o0);
             continue;

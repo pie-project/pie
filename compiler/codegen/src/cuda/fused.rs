@@ -30,6 +30,7 @@ use pie_plan::{
 };
 
 use crate::op_view::{OpView, result_bases};
+use crate::slots::Slots;
 
 use super::runtime::singleton_runtime_source;
 use super::singleton::valid_identifier;
@@ -327,32 +328,17 @@ pub fn emit_fused_region(
             continue;
         }
 
-        let mut a0 = "scratch".to_string();
-        let mut a1 = "scratch".to_string();
-        let mut a2 = "scratch".to_string();
-        let mut o0 = "scratch".to_string();
-        let mut o1 = "scratch".to_string();
-        let pointer = |value: u32, aliases: &[u32]| {
-            format!("scratch + offsets[{}]", resolve_alias(aliases, value))
-        };
-        if !op.args.is_empty() {
-            a0 = pointer(op.args[0], &aliases);
-        }
-        if op.args.len() > 1 {
-            a1 = pointer(op.args[1], &aliases);
-        }
-        if op.args.len() > 2 {
-            a2 = pointer(op.args[2], &aliases);
-        }
-        if op.tag == tags::PIVOT_THRESHOLD {
-            a1 = pointer(op.pred_payload, &aliases);
-        }
-        if op.results > 0 {
-            o0 = pointer(base, &aliases);
-        }
-        if op.results > 1 {
-            o1 = pointer(base + 1, &aliases);
-        }
+        // CUDA resolves reshape aliases before indexing the offsets table;
+        // which value lands in which slot is shared with Metal.
+        let Slots {
+            mut a0,
+            a1,
+            a2,
+            mut o0,
+            o1,
+        } = Slots::of(op, base, |value| {
+            format!("scratch + offsets[{}]", resolve_alias(&aliases, value))
+        });
 
         source.push_str("  {\n");
         let _ = writeln!(source, "    M1OpParams p = params[{node}u];");

@@ -12,21 +12,15 @@ const PROLOGUE: &str = include_str!("../../runtime/cuda/ptir_m1_runtime_prologue
 const BODY: &str = include_str!("../../runtime/cuda/ptir_m1_runtime_body.cuh");
 
 /// The `__device__` projection of the RNG contract, as the C++ spliced it in.
+///
+/// The C++ read this out of `PTIR_RNG_CUDA_PREAMBLE`, whose raw-string literal
+/// opens immediately after `(` — so its leading newline is part of the
+/// constant's value, and is reproduced here. `rng_contract`'s
+/// `cuda_preamble_matches_the_header_literal` holds the two forms together.
 fn rng_preamble() -> String {
-    let header = crate::rng::generate_cuda_header();
-    // The raw-string literal begins immediately after `(`, so its leading
-    // newline is part of the constant's value.
-    let open = "inline constexpr char PTIR_RNG_CUDA_PREAMBLE[] = R\"PTIR_RNG_CUDA(";
-    let close = ")PTIR_RNG_CUDA\";";
-    let start = header
-        .find(open)
-        .expect("the generated RNG header defines PTIR_RNG_CUDA_PREAMBLE")
-        + open.len();
-    let end = header[start..]
-        .find(close)
-        .expect("the RNG preamble literal is terminated")
-        + start;
-    header[start..end].into()
+    let mut preamble = String::from("\n");
+    preamble.push_str(&crate::rng::cuda_device_functions());
+    preamble
 }
 
 /// `singleton_runtime_cuda_source()`.

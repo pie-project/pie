@@ -33,3 +33,4 @@ pub mod op_view;
 pub mod program;
 pub mod region_analysis;
 pub mod rng;
+pub mod slots;
