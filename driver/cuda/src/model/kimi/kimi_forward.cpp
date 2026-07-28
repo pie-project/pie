@@ -736,6 +736,30 @@ void kimi_forward_paged(
                 static_cast<std::uint32_t>(total_tokens),
                 static_cast<std::uint32_t>(heads * (q_nope + q_rope)),
                 static_cast<std::uint32_t>(li), stream);
+            auto layer_view = mla_cache.layer_view(li);
+            const bool yarn =
+                cfg.has_rope_scaling &&
+                cfg.rope_scaling_kind == HfConfig::RopeScaling::OriginalYaRN;
+            const bool fuse_prepare =
+                kernels::mla_prepare_supported(q_rope) && !act_dump_enabled() &&
+                (!cfg.has_rope_scaling || yarn);
+            if (fuse_prepare) {
+                kernels::YarnOriginalParams yp{};
+                yp.factor = cfg.rope_factor;
+                yp.beta_fast = cfg.rope_beta_fast;
+                yp.beta_slow = cfg.rope_beta_slow;
+                yp.attention_factor = cfg.rope_attention_factor;
+                yp.original_max_position = cfg.rope_original_max_position;
+                kernels::launch_mla_prepare_bf16(
+                    layer_view,
+                    kv_a_src, Lw.kv_a_norm->data(), kimi_ws.q_b.data(),
+                    kimi_ws.kv_c.data(), kimi_ws.k_pe.data(),
+                    kimi_ws.q_nope.data(), kimi_ws.q_pe.data(),
+                    positions, qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, total_tokens, num_requests,
+                    heads, q_nope, eps, cfg.rope_theta, /*interleaved=*/true,
+                    kv_a_row_stride, yarn ? &yp : nullptr, stream, row_valid_d);
+            } else {
             kernels::launch_kimi_split_kv_a_norm_bf16(
                 kv_a_src, Lw.kv_a_norm->data(),
                 kimi_ws.kv_c.data(), kimi_ws.k_pe.data(),
@@ -782,7 +806,6 @@ void kimi_forward_paged(
                     total_tokens, heads, 1, q_rope, cfg.rope_theta, stream,
                     /*interleaved=*/true);
             }
-            auto layer_view = mla_cache.layer_view(li);
             act_dump_bf16(act_dump_layer_tag("q_pe", li).c_str(),
                 kimi_ws.q_pe.data(), total_tokens, heads * q_rope, stream);
             act_dump_bf16(act_dump_layer_tag("k_pe", li).c_str(),
@@ -791,6 +814,7 @@ void kimi_forward_paged(
                 layer_view, kimi_ws.kv_c.data(), kimi_ws.k_pe.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 total_tokens, num_requests, stream, row_valid_d);
+            }
 
             profile_cuda_stage(&profile, &profile.attn_absorb_ms, stream, [&] {
             ops::mla_absorb_q_to_latent_bf16(cublas.handle(),

@@ -2,6 +2,8 @@
 
 #include <cuda_bf16.h>
 
+#include "kernels/rope_device.cuh"
+
 namespace pie_cuda_driver::kernels {
 
 namespace {
@@ -9,25 +11,8 @@ namespace {
 // One block per token; threads cover the full QK head_dim grid:
 // (head, dim_pair_idx). For Qwen the convention pairs index `i` with
 // `i + head_dim/2`, with frequency theta^(-2*i / head_dim).
-__device__ __forceinline__ void rotate_pair(
-    __nv_bfloat16* h_ptr, int half, int dim_pair, float cos_v, float sin_v)
-{
-    const float a = __bfloat162float(h_ptr[dim_pair]);
-    const float b = __bfloat162float(h_ptr[dim_pair + half]);
-    h_ptr[dim_pair]        = __float2bfloat16(a * cos_v - b * sin_v);
-    h_ptr[dim_pair + half] = __float2bfloat16(b * cos_v + a * sin_v);
-}
-
-// GPT-J / interleaved pairing: rotate adjacent dims (2i, 2i+1). Required by
-// GLM (`rope_interleave=true`). Same per-pair frequency as the half variant.
-__device__ __forceinline__ void rotate_pair_interleaved(
-    __nv_bfloat16* h_ptr, int dim_pair, float cos_v, float sin_v)
-{
-    const float a = __bfloat162float(h_ptr[2 * dim_pair]);
-    const float b = __bfloat162float(h_ptr[2 * dim_pair + 1]);
-    h_ptr[2 * dim_pair]     = __float2bfloat16(a * cos_v - b * sin_v);
-    h_ptr[2 * dim_pair + 1] = __float2bfloat16(b * cos_v + a * sin_v);
-}
+// `rotate_pair` / `rotate_pair_interleaved` live in rope_device.cuh so the
+// fused MLA-prepare kernel rotates through byte-identical code.
 
 __global__ void rope_standard_table_kernel(
     const std::int32_t* __restrict__ positions,
@@ -536,23 +521,8 @@ void launch_rope_yarn_bf16(
 
 namespace {
 
-// Linear ramp over dim index: 0 below low_dim, 1 above high_dim. Used
-// to blend between unscaled (high freq) and `1/factor`-scaled (low
-// freq) inv_freq, in the dim-index domain rather than the wavelen
-// domain that Llama-3 YaRN uses.
-__device__ __forceinline__ float yarn_original_freq(
-    float base_freq, float factor,
-    float low_dim, float high_dim, int dim_pair)
-{
-    const float denom = (high_dim == low_dim) ? (high_dim + 1e-3f - low_dim)
-                                              : (high_dim - low_dim);
-    float ramp = (static_cast<float>(dim_pair) - low_dim) / denom;
-    if (ramp < 0.f) ramp = 0.f;
-    if (ramp > 1.f) ramp = 1.f;
-    // Below low_dim (ramp=0): extrapolation = base. Above high_dim
-    // (ramp=1): interpolation = base / factor. Linear blend between.
-    return base_freq * ((1.f - ramp) + ramp / factor);
-}
+// `yarn_original_freq` lives in rope_device.cuh, shared with the fused
+// MLA-prepare kernel.
 
 __global__ void rope_yarn_original_bf16_kernel(
     __nv_bfloat16* __restrict__ q,
@@ -627,24 +597,14 @@ void launch_rope_yarn_original_bf16(
     cudaStream_t stream,
     bool interleaved)
 {
-    constexpr float TWO_PI = 6.2831853071795864769f;
-    // correction_dim(rot) = head_dim * ln(max_pos / (rot * 2π)) / (2 * ln(theta))
-    const float ln_theta = logf(theta);
-    auto corr_dim = [&](float rot) -> float {
-        return head_dim * logf(static_cast<float>(original_max_position) /
-                               (rot * TWO_PI)) / (2.f * ln_theta);
-    };
-    // beta_slow → "low rotation count" → larger correction_dim → upper
-    // bound on the ramp (above this, fully interpolated). beta_fast →
-    // smaller correction_dim → lower bound (below this, fully
-    // extrapolated). HF clamps to [0, head_dim/2 - 1] (we ramp over
-    // dim_pair which has range [0, head_dim/2)).
-    float low_dim  = floorf(corr_dim(beta_fast));
-    float high_dim = ceilf(corr_dim(beta_slow));
-    if (low_dim < 0.f) low_dim = 0.f;
-    const float max_pair = static_cast<float>(head_dim / 2) - 1.f;
-    if (high_dim > max_pair) high_dim = max_pair;
-    if (high_dim < low_dim)  high_dim = low_dim;
+    // correction_dim(rot) = head_dim * ln(max_pos / (rot * 2π)) / (2 * ln(theta)).
+    // beta_slow → "low rotation count" → larger correction_dim → upper bound on
+    // the ramp (above this, fully interpolated). beta_fast → smaller
+    // correction_dim → lower bound (below this, fully extrapolated). HF clamps
+    // to [0, head_dim/2 - 1].
+    float low_dim = 0.f, high_dim = 0.f;
+    yarn_original_ramp_bounds(head_dim, theta, beta_fast, beta_slow,
+                              original_max_position, low_dim, high_dim);
 
     constexpr int BLOCK = 256;
     // One block per token leaves 147 of the B200's 148 SMs idle during decode,

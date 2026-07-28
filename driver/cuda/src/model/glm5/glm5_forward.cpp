@@ -400,6 +400,25 @@ void glm5_forward_paged(
             idx_mask_stride = total_tokens;
         }
 
+        auto layer_view = mla_cache.layer_view(li);
+        const bool fuse_prepare =
+            kernels::mla_prepare_supported(q_rope) && !act_dump_enabled();
+        if (fuse_prepare) {
+            // GLM-5.1+ sets `rope_interleave=true` (config.json), i.e. the
+            // GPT-J adjacent-pair convention (dims 2i, 2i+1), not the half/half
+            // (NeoX) pairing used by Llama/Kimi. Using the wrong pairing
+            // scrambles the rotary subspace for every position > 0.
+            kernels::launch_mla_prepare_bf16(
+                layer_view,
+                ws.kv_a_mqa.data(), Lw.kv_a_norm->data(), ws.q_b.data(),
+                ws.kv_c.data(), ws.k_pe.data(),
+                ws.q_nope.data(), ws.q_pe.data(),
+                positions, qo_indptr, kv_page_indices, kv_page_indptr,
+                kv_last_page_lens, total_tokens, num_requests,
+                heads, q_nope, eps, cfg.rope_theta, /*interleaved=*/true,
+                /*kv_a_row_stride=*/0, /*yarn=*/nullptr, stream, row_valid_d);
+        } else {
+
         kernels::launch_kimi_split_kv_a_norm_bf16(
             ws.kv_a_mqa.data(), Lw.kv_a_norm->data(),
             ws.kv_c.data(), ws.k_pe.data(),
@@ -419,11 +438,11 @@ void glm5_forward_paged(
             total_tokens, heads, 1, q_rope, cfg.rope_theta, stream,
             /*interleaved=*/true);
 
-        auto layer_view = mla_cache.layer_view(li);
         kernels::launch_write_mla_to_pages(
             layer_view, ws.kv_c.data(), ws.k_pe.data(),
             qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
             total_tokens, num_requests, stream, row_valid_d);
+        }
 
         // kv_b_proj_bf16 holds a BF16 copy of the (possibly FP8) kv_b
         // weight that the kimi_mla kernels require.
