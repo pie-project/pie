@@ -1,4 +1,5 @@
-//! The Quest authoring surface: `intrinsics::kernel::envelope_dot`.
+//! Emitting a `KernelCall`, via the `intrinsics::kernel::envelope_dot`
+//! authoring surface.
 //!
 //! Until this lowering existed the DSL could not emit `Op::KernelCall` at all —
 //! `builder.rs` hard-coded `names: Vec::new()` in both `TraceContainer`

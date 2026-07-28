@@ -6,10 +6,6 @@ description = "Conformance suite for the PTIR toolchain: golden traces, the malf
 license = "Apache-2.0"
 publish = false
 
-[lib]
-name = "pie_compiler_tests"
-path = "src/lib.rs"
-
 [dev-dependencies]
 pie-ir = { path = "../ir" }
 pie-plan = { path = "../plan" }

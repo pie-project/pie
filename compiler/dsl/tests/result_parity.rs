@@ -1,4 +1,6 @@
-//! Tier-0 result-parity tests (the semantic correctness gate): the SDK-emitted
+//! Result parity with the IR's own fixtures — the semantic correctness gate.
+//!
+//! The SDK-emitted
 //! §3 / greedy container, bound and run on the IR's reference interpreter
 //! (`ptir::interp`, `eval` feature), yields the SAME TOKEN RESULTS as the IR's
 //! golden `greedy_argmax` / `section3_masked_gumbel` fixtures — and encode→decode

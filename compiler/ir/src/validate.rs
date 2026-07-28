@@ -288,7 +288,7 @@ impl fmt::Display for ValidateError {
 impl std::error::Error for ValidateError {}
 
 /// Program-side view of a channel's element type.
-pub fn channel_value_type(decl: &ChannelDecl) -> ValueType {
+pub(crate) fn channel_value_type(decl: &ChannelDecl) -> ValueType {
     ValueType::new(decl.shape, decl.dtype.program_dtype())
 }
 
@@ -711,7 +711,7 @@ fn intrinsic_type_ok(
 /// Walk the pass's phases in execution order (prologue → descriptor →
 /// attn-proj → attn → epilogue) and record, per channel, the FIRST op's
 /// required bit. Take/read ⇒ full; put ⇒ empty (§7.1).
-pub fn readiness_table(c: &TraceContainer) -> Vec<ReadinessEntry> {
+pub(crate) fn readiness_table(c: &TraceContainer) -> Vec<ReadinessEntry> {
     let mut seen: Vec<bool> = alloc::vec![false; c.channels.len()];
     let mut out = Vec::new();
     let mut visit = |chan: u32, phase: Phase, dir: Direction, seen: &mut Vec<bool>| {
@@ -765,7 +765,7 @@ pub fn readiness_table(c: &TraceContainer) -> Vec<ReadinessEntry> {
 /// A stage is *fallible* here when it owns the first op of a host-coupled
 /// channel (a late host edge — the only readiness fire time cannot settle;
 /// §7.1). The descriptor phase inherits fallibility from host-fed ports.
-pub fn classify_channels(c: &TraceContainer, readiness: &[ReadinessEntry]) -> Vec<ChannelClass> {
+pub(crate) fn classify_channels(c: &TraceContainer, readiness: &[ReadinessEntry]) -> Vec<ChannelClass> {
     // Fallible phases: first-use of a host-coupled OR extern channel (an
     // extern edge crosses pipelines — fire time cannot settle it, like a
     // late host edge; §7.1).

@@ -1,4 +1,4 @@
-//! Design B beam goldens (host-side, pie-dsl + CPU reference interp).
+//! Beam search goldens (host-side, pie-dsl + CPU reference interp).
 //!
 //! **Design B: logical mask-out + lazy compaction** (supersedes Design A's eager
 //! freeze / designated-heir / fresh-page-per-fork scheme). The KV cache is a

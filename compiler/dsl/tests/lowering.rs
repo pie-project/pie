@@ -1,7 +1,9 @@
-//! P1 exit tests: the overview §3 greedy-decode pipeline lowers to a canonical
-//! trace container and hashes stably (byte-identity locked to golden C3 hashes),
-//! plus error-message snapshot tests for the lint set (double-endpoint,
-//! readiness-direction conflict, sink misplacement).
+//! Lowering a program to a canonical trace container.
+//!
+//! The greedy-decode pipeline of overview §3, lowered and hashed for byte
+//! identity against the golden C3 hashes, plus error-message snapshots for
+//! the lint set (double-endpoint, readiness-direction conflict, sink
+//! misplacement).
 //!
 //! These drive the neutral [`Builder`] directly (the author-facing
 //! `ForwardPass`/`WorkingSet` surface lives in `inferlet`). Idiom note: values
