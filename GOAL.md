@@ -443,6 +443,14 @@ an argued **soundness and completeness** result for the stack abstraction —
 over-approximation admits invalid strings, under-approximation silently removes
 valid ones.
 
+**[measured, and it fails]** The runtime only ever narrows, which was the whole
+of the claim; the *lowering* over-approximates, because `oneOf` becomes a union
+and a union is "at least one" where `oneOf` is "exactly one". We admit 7 of the
+22 corpus documents that violate their own schema. XGrammar admits all 22. So
+the result this challenge asks for has to be stated over the pipeline rather
+than the parser, and it is currently a negative one - see the soundness section
+below.
+
 ### C9. Sampler and speculative-decoding integration
 
 Masks must compose with temperature/top-k/top-p sampling, and support rollback
@@ -1277,6 +1285,66 @@ margin, 2.89x to 6.10x at batch 128 and 8.47x to 17.26x at 512.
 The cost is at the front. This grammar takes **1.3 seconds to compile** against
 XGrammar's 88 ms, and its tables are **91 MB** - by far the worst numbers in
 this document, and the same trade as everywhere else, at its extreme.
+
+**Neither engine is sound, and ours was claimed to be (2026-07-28).** This
+document has said for a long time that the engine only ever *narrows* - that
+dropping a configuration or reaching a ceiling can make a mask stricter but
+never looser. That is true of the runtime. It says nothing about the lowering,
+and the lowering is where it fails.
+
+`oneOf` in JSON Schema means **exactly one** branch matches. We lower it to a
+union, which means **at least one**. The two readings differ on any document
+that matches two branches, and objects match two branches easily, because
+`additionalProperties` is permitted unless a schema forbids it:
+
+```json
+{"oneOf": [
+  {"type":"object", "properties":{"a":{"type":"string"}}, "required":["a"]},
+  {"type":"object", "properties":{"b":{"type":"string"}}, "required":["b"]}]}
+```
+
+`{"a":"x","b":"y"}` matches both branches, so the schema rejects it. A real
+validator agrees. **We accept it. XGrammar rejects it.** On this case they are
+right and we are wrong.
+
+Adding `additionalProperties: false` to both branches makes the branches
+disjoint and the conflict disappears - `max_actions` goes from 2 to 1. So the
+conflicts this corpus produces and the unsoundness have **the same cause**: a
+`oneOf` whose branches overlap is both ambiguous to parse and mis-lowered by a
+union. The GLR-lite work follows the ambiguity; it does not fix the semantics.
+
+Over the corpus, against a real validator:
+
+| of the 22 documents that violate their own schema and whose schema compiles | |
+|---|---|
+| **we admit** | **7 (32%)** |
+| **XGrammar admits** | **22 (100%)** |
+| llguidance | refuses these schemas outright - `oneOf` needs a coercion flag |
+
+Charged the same way, with their `is_completed` standing for our
+`can_terminate`, so neither gets the laxer test.
+
+Three things follow, and the first is the uncomfortable one.
+
+**The claim was wrong and is withdrawn.** "This engine only narrows" holds for
+the runtime and not for the pipeline, and the paper cannot state it unqualified.
+
+**No engine here is sound.** XGrammar admits every invalid document in the
+corpus; llguidance declines to answer by refusing the construct. Constrained
+decoding is generally presented as a guarantee, and on `oneOf` it is not one in
+any of these implementations. That is worth saying in a paper rather than
+leaving for a reader to discover.
+
+**We are tighter than the baseline, which is the honest form of the claim.**
+32% against 100% is a real difference and it comes from the precision search -
+the pipeline tries an exact lowering before a relaxed one, and reports which it
+settled on. What it cannot yet do is refuse rather than relax, which is the
+option a deployment that would rather be told than misled should have.
+
+The exclusivity `oneOf` asks for is not context-free in general, so a parser
+cannot simply be made to enforce it. What is achievable is narrower and worth
+doing: lower `oneOf` exactly when the branches can be shown disjoint - which
+closing the objects does - and report the approximation when they cannot.
 
 **Host contention (q21).** Weaker than expected and worth saying so. With
 twenty-four cores deliberately saturated, XGrammar's fill slows by 1.06x and
