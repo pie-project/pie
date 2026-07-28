@@ -524,8 +524,11 @@ fn pack_configurations<'py>(
     ))
 }
 
+/// The compiled front end, imported by the `gpugrammar` package rather than
+/// directly: the public library is Python over this, and keeping the extension
+/// under a private name is what lets the package own the name users type.
 #[pymodule]
-fn gpugrammar(module: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _gpugrammar(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Compiler>()?;
     module.add_class::<CompiledGrammar>()?;
     module.add_class::<Matcher>()?;

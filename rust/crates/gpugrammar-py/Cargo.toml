@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [lib]
-name = "gpugrammar"
+name = "_gpugrammar"
 crate-type = ["cdylib"]
 
 [dependencies]

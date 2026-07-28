@@ -1,4 +1,12 @@
-"""GPU JSON Schema constrained-decoding feasibility prototype."""
+"""The research tree: kernels, benchmarks, and the prototypes that came first.
+
+The library is `gpugrammar`; this is what it is built on and what it was built
+out of. The current engine is `gpu_lr1.device_parser`, re-exported as
+`gpugrammar.device`. The names below are the earlier pure-Python prototype -
+a canonical LR(1) compiler and a byte-DFA schema compiler - kept because their
+tests still pass and they are the record of how the design arrived where it is.
+Nothing in the current path imports them.
+"""
 
 from gpu_lr1.automata import ByteDFA
 from gpu_lr1.lr1 import (

@@ -1,0 +1,237 @@
+"""gpugrammar - constrained decoding whose parser state lives on the GPU.
+
+A constrained decoder has to answer one question at every step: which of the
+model's tokens may come next? Every deployed system answers it on the host,
+which means the answer cannot be inside the CUDA graph a serving engine records
+for its decode step - a graph holds device work, and host work put inside it
+does not go in at all. This library moves the parser onto the device so that it
+can.
+
+The shortest useful program:
+
+    import gpugrammar, torch
+
+    engine = gpugrammar.Engine(vocabulary)          # bytes per token id
+    grammar = engine.compile_json_schema(schema)    # or compile_regex(...)
+
+    batch = engine.batch(size=64)
+    batch.set_grammars([grammar] * 64)
+
+    mask = batch.fill_mask()                        # (64, words) on the device
+    batch.advance(sampled_tokens)                   # (64,) on the device
+
+`fill_mask` and `advance` are both capturable: call `batch.capture()` once and
+every later call replays a recorded graph, with no host work and no
+synchronisation on the path. That is the property the design exists for.
+
+Three layers, and you can reach any of them:
+
+- `Engine` and `Batch` here, which is what a serving integration wants.
+- `CompiledGrammar.matcher()`, a host-side reference parser used to check the
+  device against, and to seed a sequence's state.
+- `DeviceGrammar` and `DeviceBatch` in `gpugrammar.device`, which `Engine`
+  wraps and which expose the pool, the arena and the graph directly.
+"""
+
+from __future__ import annotations
+
+from typing import Iterable, Sequence
+
+from _gpugrammar import CompiledGrammar, Compiler, Matcher, pack_configurations
+
+__all__ = [
+    "Batch",
+    "CompiledGrammar",
+    "Compiler",
+    "Engine",
+    "Matcher",
+    "pack_configurations",
+    "__version__",
+]
+
+__version__ = "0.1.0"
+
+
+class Engine:
+    """A vocabulary, the grammars compiled against it, and their tables.
+
+    One engine per model. Grammars are admitted into a single device arena so
+    that a batch under many of them is one launch rather than one per grammar -
+    which is what a serving batch looks like, since requests bring their own.
+
+    The arena is bounded by `table_budget_bytes` if you give one. Past it a
+    grammar no sequence is running under is evicted, and re-admitted from its
+    compiled form if it comes back; nothing moves and no identifier changes, so
+    a recorded graph survives the churn.
+    """
+
+    def __init__(
+        self,
+        vocabulary: Sequence[bytes],
+        *,
+        max_configurations: int = 128,
+        table_budget_bytes: int | None = None,
+    ) -> None:
+        from gpugrammar.device import DeviceGrammar
+
+        self.compiler = Compiler(list(vocabulary))
+        self._pool = DeviceGrammar(
+            max_configs=max_configurations, budget_bytes=table_budget_bytes
+        )
+        self._ids: dict[int, int] = {}
+
+    def compile_json_schema(self, schema: str, **kwargs) -> CompiledGrammar:
+        """Compile a JSON Schema and put its tables on the device.
+
+        Raises `ValueError` naming the stage that refused it. Set
+        `GPUGRAMMAR_WHY=1` in the environment for the underlying diagnostic.
+        """
+        return self._admitted(self.compiler.compile_json_schema(schema, **kwargs))
+
+    def compile_regex(self, pattern: str) -> CompiledGrammar:
+        """Compile a regular expression. Not everything here is JSON."""
+        return self._admitted(self.compiler.compile_regex(pattern))
+
+    def compile_ebnf(self, source: str, root: str) -> CompiledGrammar:
+        return self._admitted(self.compiler.compile_ebnf(source, root))
+
+    def _admitted(self, grammar: CompiledGrammar) -> CompiledGrammar:
+        # Admitted as soon as it is compiled, rather than when a batch first
+        # uses it. A batch's buffers are sized from the pool - the mask width
+        # among them - so a pool holding nothing cannot size one, and the
+        # alternative was an API where `batch()` had to come second.
+        self.admit(grammar)
+        return grammar
+
+    def admit(self, grammar: CompiledGrammar) -> int:
+        """Put a grammar's tables on the device and return its pool id.
+
+        Idempotent: a grammar already in the pool keeps the id it has.
+        """
+        key = id(grammar)
+        if key not in self._ids:
+            self._ids[key] = self._pool.admit(grammar)
+        return self._ids[key]
+
+    def batch(self, size: int, *, rollback: int = 0) -> "Batch":
+        """A batch of `size` sequences.
+
+        `rollback` is how many steps of history to keep, which speculative
+        decoding needs and an ordinary decode loop does not; it costs one
+        parse state per step kept.
+        """
+        if not self._ids:
+            raise RuntimeError(
+                "compile a grammar before making a batch: a batch's buffers "
+                "are sized from the grammars the engine holds"
+            )
+        return Batch(self, self._pool.new_batch(size, rollback=rollback))
+
+    @property
+    def mask_words(self) -> int:
+        """Words in one mask row, which is the vocabulary rounded up to 32."""
+        return self._pool.mask_words
+
+    @property
+    def resident_bytes(self) -> int:
+        """What the tables occupy on the device, capacity included."""
+        return self._pool.resident_bytes()
+
+    @property
+    def pool(self):
+        """The underlying `DeviceGrammar`, for callers that need the arena."""
+        return self._pool
+
+
+class Batch:
+    """Sequences being decoded, and the parse state of each.
+
+    A sequence's state is a *set* of configurations rather than one, because
+    scanning a generated lexicon is ambiguous - `{` may be a token or the start
+    of a longer one - and because a grammar may be ambiguous too. Everything
+    below carries the set.
+    """
+
+    def __init__(self, engine: Engine, batch) -> None:
+        self._engine = engine
+        self._batch = batch
+
+    def set_grammars(self, grammars: Iterable[CompiledGrammar | int]) -> None:
+        """Say which grammar each sequence is under, and reset them to its start.
+
+        Takes compiled grammars or pool ids. A grammar not yet on the device is
+        admitted here.
+        """
+        ids = [
+            item if isinstance(item, int) else self._engine.admit(item)
+            for item in grammars
+        ]
+        self._batch.set_grammars(ids)
+
+    def set_matchers(self, matchers: Sequence[Matcher]) -> None:
+        """Take each sequence's state from a host matcher.
+
+        The fast path for an integration that keeps host matchers as well, and
+        the one a serving backend uses: the states go straight to the packer
+        rather than through Python lists.
+        """
+        self._batch.set_matchers(list(matchers))
+
+    def fill_mask(self):
+        """The allowed-token bitmask for every sequence, `(batch, words)`.
+
+        Stays on the device. Replays a recorded graph once `capture` has been
+        called, which is the deployed path.
+        """
+        return self._batch.fill_mask()
+
+    def advance(self, tokens) -> None:
+        """Consume one sampled token per sequence, `(batch,)` on the device.
+
+        The tokens are never read on the host, so this does not synchronise.
+        """
+        self._batch.advance(tokens)
+
+    def capture(self) -> None:
+        """Record the fill and the advance as CUDA graphs.
+
+        Every later `fill_mask` and `advance` is a replay. The recording is
+        valid for any assignment of grammars to sequences and any batch
+        composition, which is why it can live inside a serving engine's own
+        graph; it is invalidated only when the pool's arrays move, and that is
+        detected rather than assumed.
+        """
+        self._batch.capture()
+        self._batch.capture_advance()
+
+    def rollback(self, steps: int) -> None:
+        """Undo `steps` advances. Needs `rollback` room at construction."""
+        self._batch.rollback(steps)
+
+    def configurations(self, sequence: int) -> list[tuple[int, list[int]]]:
+        """One sequence's parse states, as `(lexer state, parser stack)`.
+
+        A device-to-host copy. For checking against a reference matcher, not
+        for a decode loop.
+        """
+        return self._batch.configurations(sequence)
+
+    def problems(self):
+        """`(terminated, overflow)`, one flag per sequence.
+
+        `terminated` means the parser refused the token it was given.
+        `overflow` means a ceiling was reached - the replay window, the
+        candidate slots, the configuration set - and the mask that follows may
+        be narrower than the grammar allows. Narrowing is the one failure this
+        engine must not do quietly, so it is reported here rather than absorbed.
+        """
+        return self._batch.problems()
+
+    @property
+    def size(self) -> int:
+        return self._batch.batch
+
+    @property
+    def raw(self):
+        """The underlying `DeviceBatch`."""
+        return self._batch
