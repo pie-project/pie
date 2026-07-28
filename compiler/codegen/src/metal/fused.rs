@@ -284,12 +284,66 @@ pub fn emit_grouped_fused_region(
             _ => false,
         };
 
+    // A logits gather whose only consumer is an argmax does not need to exist:
+    // the pair fuses into one pass over the bf16 row. Decided up front because
+    // the gather is emitted before the argmax is reached.
+    let mut consumers: BTreeMap<u32, usize> = BTreeMap::new();
+    for &node in &region.nodes {
+        if let Some(op) = ops.get(node.index()) {
+            for &arg in &op.args {
+                *consumers.entry(arg).or_insert(0) += 1;
+            }
+        }
+    }
+    let mut fused_argmax: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut elided_gather: BTreeSet<usize> = BTreeSet::new();
+    for &node in &region.nodes {
+        let node = node.index();
+        let Some(op) = ops.get(node) else { continue };
+        if op.tag != tags::REDUCE_ARGMAX || op.args.len() != 1 {
+            continue;
+        }
+        let source_value = op.args[0];
+        if consumers.get(&source_value).copied().unwrap_or(0) != 1
+            || escapes.contains(&source_value)
+        {
+            continue;
+        }
+        let producer = region.nodes.iter().map(|n| n.index()).find(|&n| {
+            bases[n] == source_value
+                && ops.get(n).is_some_and(|p| {
+                    p.tag == tags::INTRINSIC_VAL
+                        && (p.intr == intrinsic_tags::LOGITS
+                            || p.intr == intrinsic_tags::MTP_LOGITS)
+                })
+        });
+        if let Some(producer) = producer {
+            fused_argmax.insert(node, producer);
+            elided_gather.insert(producer);
+        }
+    }
+
     for &node in &region.nodes {
         let node = node.index();
         let Some(op) = ops.get(node) else {
             return Err("grouped fused region node out of range".to_string());
         };
         let base = bases[node];
+        if elided_gather.contains(&node) {
+            continue;
+        }
+        if let Some(&producer) = fused_argmax.get(&node) {
+            let slots = Slots::of(op, base, |value| value_ptr(resolve_alias(&alias, value)));
+            emit_logits_argmax(
+                &mut source,
+                bases[producer],
+                ops[producer].intr == intrinsic_tags::MTP_LOGITS,
+                &slots.o0,
+            );
+            source.push_str(BARRIER);
+            source.push_str("  if (status->state != 1) return;\n");
+            continue;
+        }
         if op.tag == tags::RESHAPE
             && op.results == 1
             && op.args.len() == 1
@@ -397,6 +451,57 @@ fn emit_mtp_drafts(source: &mut String, base: u32, o0: &str) {
     );
     source.push_str("      }\n");
     source.push_str("      draft_out[draft] = int(have ? best_index : 0u);\n");
+    source.push_str("    }\n");
+    source.push_str("  }\n");
+}
+
+/// `argmax(logits)` without materializing the logits.
+///
+/// The gather's only job in this shape is to widen bf16 to f32 so the generic
+/// reduction can read it, and bf16 -> f32 is exact, so the argmax over the
+/// stored halves has the same value and the same index. Fusing the two removes a
+/// vocabulary-wide f32 write and the read back of it, which was the sampler's
+/// whole remaining traffic for a graph that only wants one integer.
+fn emit_logits_argmax(source: &mut String, in_base: u32, mtp: bool, o0: &str) {
+    source.push_str("  {\n");
+    let _ = writeln!(source, "    const M1ValueDesc am_in = descriptors[{in_base}];");
+    let _ = writeln!(
+        source,
+        "    const uint am_row_base = row_meta.offset + {};",
+        if mtp { "row_meta.mtp_offset" } else { "0u" }
+    );
+    source.push_str("    const uint am_vocab = layout->vocab;\n");
+    source.push_str(
+        "    if (am_vocab == 0u || am_in.last != am_vocab || am_in.rows > row_meta.count) { m1_fault(status, 0xA0u); return; }\n",
+    );
+    let _ = writeln!(
+        source,
+        "    device int* am_out = reinterpret_cast<device int*>({o0});"
+    );
+    source.push_str("    for (uint am_r = 0u; am_r < am_in.rows; ++am_r) {\n");
+    source.push_str("      const uint am_src_row = row_indices[am_row_base + am_r];\n");
+    source.push_str(
+        "      const device bfloat* am_src = logits + ulong(am_src_row) * am_vocab;\n",
+    );
+    source.push_str("      M1ArgmaxCandidate am_best = {-INFINITY, 0u, 0u, 0u};\n");
+    source.push_str(
+        "      for (uint am_c = m3_tid; am_c < am_vocab; am_c += m3_threads) {\n",
+    );
+    source.push_str("        const float am_v = float(am_src[am_c]);\n");
+    source.push_str(
+        "        am_best = m1_argmax_combine(am_best, M1ArgmaxCandidate{am_v, am_c, isnan(am_v) ? 0u : 1u, 0u});\n",
+    );
+    source.push_str("      }\n");
+    source.push_str("      m3_tgbuf[m3_tid] = am_best;\n");
+    source.push_str("      threadgroup_barrier(mem_flags::mem_threadgroup);\n");
+    source.push_str("      for (uint am_s = 1u; am_s < m3_threads; am_s <<= 1) {\n");
+    source.push_str(
+        "        if ((m3_tid % (2u * am_s)) == 0u && m3_tid + am_s < m3_threads) m3_tgbuf[m3_tid] = m1_argmax_combine(m3_tgbuf[m3_tid], m3_tgbuf[m3_tid + am_s]);\n",
+    );
+    source.push_str("        threadgroup_barrier(mem_flags::mem_threadgroup);\n");
+    source.push_str("      }\n");
+    source.push_str("      if (m3_tid == 0) am_out[am_r] = int(m3_tgbuf[0].index);\n");
+    source.push_str("      threadgroup_barrier(mem_flags::mem_threadgroup);\n");
     source.push_str("    }\n");
     source.push_str("  }\n");
 }
