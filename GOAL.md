@@ -201,6 +201,85 @@ either: it is a capability that was missing, now with a cost curve that favours
 us at serving batch sizes and them at small ones - which is the same boundary
 everything else in this document falls on.
 
+## Where the automaton ends
+
+**[settled by measurement, 2026-07-28]** Constrained decoding answers a prefix
+question - given the bytes so far, which tokens may come next - and that is a
+narrower question than "does this document satisfy the schema". Trying to
+answer the second one with a grammar was the mistake, and the boundary between
+them is the design rather than an implementation detail.
+
+**The contract.** The automaton must answer *widely*:
+
+    widening   -> an invalid document becomes generatable. A checker fixes it.
+    narrowing  -> a valid document becomes ungeneratable. Nothing fixes it.
+
+A superset is something a downstream check can filter. A subset is a document
+the model can no longer produce, and no amount of validation afterwards brings
+it back. So every approximation in the pipeline belongs on the widening side,
+and every one that is not is a bug rather than a trade-off. This inverts what
+this document used to say - that the engine only ever narrows, which was
+offered as a safety property and is in fact the dangerous direction.
+
+**What belongs inside.** Properties decidable from a prefix by a finite state
+and a stack: structure and nesting, which property names may appear and which
+must, `additionalProperties: false`, value types, `enum` and `const`, `pattern`,
+bounded lengths and counts, and property sets in any order.
+
+**What belongs outside.** Properties that need the whole document, or memory
+the stack does not have:
+
+| keyword | why the automaton cannot |
+|---|---|
+| `oneOf` exclusivity | "exactly one branch" is a count over the whole document |
+| `uniqueItems` | every pair of elements has to be compared |
+| `multipleOf` on reals | arithmetic a finite state cannot carry |
+| `not` over a context-free set | the complement of a context-free language need not be context-free |
+| `allOf` of two context-free sets | intersection likewise |
+
+**The audit.** Each case is a schema, a document it accepts, and a document it
+rejects; refusing the first is a violation and admitting the second is an
+approximation (`files/probe_boundary.py`):
+
+| | verdict |
+|---|---|
+| required properties, closed objects, value types, lengths, numeric bounds, nesting | exact |
+| `oneOf` exclusivity | **widens** - inherent, belongs outside |
+| `uniqueItems` | **widens** - inherent, belongs outside |
+| **declared property types, when the object is open** | **widens - and this one is ours** |
+| **the `Ordered` precision level** | **narrows** |
+| **the configuration ceiling** | **narrows** |
+
+Three findings, and two of them are bugs by the contract above.
+
+**A declared property's type is not enforced when `additionalProperties` is
+permitted**, which is the default. `{"a": 1}` against `{"properties": {"a":
+{"type":"string"}}}` is invalid and we admit it, because the object body has an
+arm taking any name with any value and a declared name goes through it. Adding
+`additionalProperties: false` makes it exact. This is not an inherent limit -
+"any name except these" is a regular set - so it is fixable, and it is probably
+the largest single source of the 7 invalid corpus documents we admit.
+
+**`Ordered` narrows, and its own source says so.** The `Precision` enum's
+header states that no level describes less than the schema allows; the
+`Ordered` variant three lines below states that it rejects permutations of
+valid documents. Both cannot hold. It is the fallback for four corpus schemas
+and it is why schema 247 refuses a document its schema accepts.
+
+**The ceilings narrow.** Dropping a configuration at the ceiling is the
+engine's oldest safety story - "narrowing is the safe direction" - and by this
+contract it is exactly backwards. Seven of the eight documents we wrongly
+refuse are the configuration ceiling.
+
+So the boundary is not a grammar-class question. Restricting to a deterministic
+class would not move it: on grammars that already have no parser conflict, a
+sequence still carries a median of 2 configurations and up to the ceiling of
+128, and those configurations differ in their *parser stacks* rather than only
+in their lexer state. Measured with a byte vocabulary, where there is no
+tokenizer ambiguity at all, a two-property object still reaches eight. The set
+comes from where lexemes end in a generated lexicon, which is C1, and it is
+independent of the parser's grammar class (`files/probe_determinism.py`).
+
 ## Grammar class decision
 
 **[settled by measurement, 2026-07-27]** IELR(1) was the target: it accepts the
