@@ -444,6 +444,18 @@ KimiWorkspace KimiWorkspace::allocate(
     ws.expert_up     = DeviceTensor::allocate(DType::BF16, {routes, max_I});
     ws.expert_out    = DeviceTensor::allocate(DType::BF16, {routes, H});
     ws.moe_out       = DeviceTensor::allocate(DType::BF16, {N, H});
+    // fp16 activation staging for the W4A16 decode GEMVs, whose inner loop is
+    // pure `__hfma2` and so wants its activation already in fp16.
+    //
+    // Sized for N, not for `moe_gemv_max_tokens`. The decode-GEMV branch is not
+    // only reached below that threshold: `want_batched` also requires
+    // `routes > 4 * min(E, routes)` and a bf16 stacked expert weight, so a
+    // 2-to-4 token decode -- or any decode at all on a checkpoint that ships no
+    // bf16 copy -- lands here too. Under-sizing these and guarding the branch
+    // drops those cases into the prefill path, which synchronises the stream and
+    // therefore fails outright during CUDA-graph capture.
+    ws.norm_y_fp16 = DeviceTensor::allocate(DType::FP16, {N, H});
+    ws.expert_act_fp16 = DeviceTensor::allocate(DType::FP16, {routes, max_I});
     ws.shared_gate   = DeviceTensor::allocate(DType::BF16, {N, std::max(1, 2 * shared_I)});
     ws.shared_up     = DeviceTensor::allocate(DType::BF16, {N, std::max(1, shared_I)});
     ws.shared_act    = DeviceTensor::allocate(DType::BF16, {N, std::max(1, shared_I)});
@@ -1002,8 +1014,11 @@ void kimi_forward_paged(
             });
         } else if (is_pure_decode && !force_prefill_moe) {
             profile_cuda_stage(&profile, &profile.moe_gate_up_ms, stream, [&] {
+                kernels::launch_bf16_to_fp16(
+                    kimi_ws.norm_y.data(), kimi_ws.norm_y_fp16.data(),
+                    static_cast<std::size_t>(total_tokens) * H, stream);
                 kernels::launch_wna16_gate_up_decode_bf16(
-                    kimi_ws.norm_y.data(),
+                    kimi_ws.norm_y_fp16.data(),
                     static_cast<const std::int32_t*>(kimi_ws.topk_idx.data()),
                     Lw.expert_gate_packed_ptrs.data(),
                     Lw.expert_gate_scale_ptrs.data(),
@@ -1017,10 +1032,14 @@ void kimi_forward_paged(
                 kernels::launch_swiglu_bf16(
                     kimi_ws.expert_gate.data(), kimi_ws.expert_up.data(),
                     kimi_ws.expert_gate.data(), routes * routed_I, stream);
+                kernels::launch_bf16_to_fp16(
+                    kimi_ws.expert_gate.data(),
+                    kimi_ws.expert_act_fp16.data(),
+                    static_cast<std::size_t>(routes) * routed_I, stream);
             });
             profile_cuda_stage(&profile, &profile.moe_down_ms, stream, [&] {
                 kernels::launch_wna16_down_decode_bf16(
-                    kimi_ws.expert_gate.data(),
+                    kimi_ws.expert_act_fp16.data(),
                     static_cast<const std::int32_t*>(kimi_ws.topk_idx.data()),
                     Lw.expert_down_packed_ptrs.data(),
                     Lw.expert_down_scale_ptrs.data(),

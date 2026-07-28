@@ -54,6 +54,10 @@ struct KimiWorkspace {
     DeviceTensor expert_up;         // [N*top_k, routed_I]
     DeviceTensor expert_out;        // [N*top_k, H]
     DeviceTensor moe_out;           // [N, H]
+    // fp16 staging for the W4A16 decode GEMVs, whose inner loop is pure
+    // `__hfma2` and so wants its activation already in fp16.
+    DeviceTensor norm_y_fp16;       // [N, H]
+    DeviceTensor expert_act_fp16;   // [N*top_k, routed_I]
     // Device-side aligned MoE scratch (batched-GEMM path).
     DeviceTensor aligned_route_ids;
     DeviceTensor aligned_expert_ids;
