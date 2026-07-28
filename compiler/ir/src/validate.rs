@@ -10,6 +10,7 @@
 //! returns a [`BoundTrace`] — the validated, typed artifact the reference
 //! interpreter ([`super::interp`]) and the CUDA tiers execute.
 
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 

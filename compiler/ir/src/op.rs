@@ -41,64 +41,78 @@ pub type ChannelIndex = u32;
 /// Index into the container's name table (second-party kernel / sink names).
 pub type NameIndex = u16;
 
-/// First-party stage-scoped value intrinsics (overview §4, §5.3).
-/// Wire tags are stable `u16` constants — see [`crate::registry`] for
-/// scope + gating rules.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[repr(u16)]
-pub enum IntrinsicId {
+/// Declares the first-party value intrinsics once and derives the enum, the
+/// [`intrinsic_tags`] wire constants, [`IntrinsicId::ALL`], `from_u16` and
+/// `name` from it.
+///
+/// Same rule as [`declare_ops`]: an intrinsic's id is spelled as a number on
+/// exactly one line. `from_u16`, the name table and the generated C++ header's
+/// `PtirIntrinsic` enum used to be three hand-kept copies of this list, and a
+/// missed entry there is an intrinsic the driver never learns about.
+macro_rules! declare_intrinsics {
+    ($($(#[$doc:meta])* $variant:ident = $id:literal, $konst:ident, $name:literal;)*) => {
+        /// First-party stage-scoped value intrinsics (overview §4, §5.3).
+        /// Wire tags are stable `u16` constants — see [`crate::registry`] for
+        /// scope + gating rules.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+        #[repr(u16)]
+        pub enum IntrinsicId {
+            $($(#[$doc])* $variant = $id,)*
+        }
+
+        /// The wire id of every intrinsic, by name — the `u16` counterpart of
+        /// [`tags`], for downstream `match` arms that see a raw payload id.
+        pub mod intrinsic_tags {
+            $(pub const $konst: u16 = $id;)*
+        }
+
+        impl IntrinsicId {
+            /// Every intrinsic, in wire-id order. Anything that must cover the
+            /// whole set (the generated C++ header, a driver dispatch table)
+            /// iterates this instead of repeating the list.
+            pub const ALL: &'static [IntrinsicId] = &[$(IntrinsicId::$variant,)*];
+
+            pub fn from_u16(v: u16) -> Option<Self> {
+                Some(match v {
+                    $($id => IntrinsicId::$variant,)*
+                    _ => return None,
+                })
+            }
+
+            pub fn name(self) -> &'static str {
+                match self {
+                    $(IntrinsicId::$variant => $name,)*
+                }
+            }
+        }
+    };
+}
+
+declare_intrinsics! {
     /// `[n_out, vocab]` F32 — epilogue only.
-    Logits = 0,
+    Logits = 0, LOGITS, "logits";
     /// `[K, vocab]` F32 — epilogue only; model-gated.
-    MtpLogits = 1,
+    MtpLogits = 1, MTP_LOGITS, "mtp_logits";
     /// `[n_out, d]` F32 — epilogue only.
-    Hidden = 2,
+    Hidden = 2, HIDDEN, "hidden";
     /// This layer's projected query — attn taps only.
-    Query = 3,
+    Query = 3, QUERY, "query";
     /// `[n_out]` F32 — epilogue only; model-gated.
-    ValueHead = 4,
+    ValueHead = 4, VALUE_HEAD, "value_head";
     /// Scalar U32 — the invocation's layer index; attn taps only. Replayable
     /// per-invocation value, not a register read (overview §5.3).
-    Layer = 5,
+    Layer = 5, LAYER, "layer";
     /// `[k]` I32 — epilogue only; model-gated. The MTP head's `k` draft token
     /// ids for the prior fire (device-resident spec-decode drafts channel).
     /// APPENDED (id 6) — existing ids 0..5 unchanged so every prior program's
     /// bytecode + identity hash stays byte-stable.
-    MtpDrafts = 6,
+    MtpDrafts = 6, MTP_DRAFTS, "mtp_drafts";
     /// `[num_heads, kv_len]` F32 — `OnAttn` only; model-gated. This layer's
     /// softmax attention weights over the request's live KV, the quantity
     /// H2O (arXiv:2306.14048) and TOVA (arXiv:2305.19370) evict on.
     /// Backend-shaped like `Query`, so the type rule stays loose.
     /// APPENDED (id 7) — ids 0..6 unchanged, same byte-stability contract.
-    AttnScore = 7,
-}
-
-impl IntrinsicId {
-    pub fn from_u16(v: u16) -> Option<Self> {
-        Some(match v {
-            0 => IntrinsicId::Logits,
-            1 => IntrinsicId::MtpLogits,
-            2 => IntrinsicId::Hidden,
-            3 => IntrinsicId::Query,
-            4 => IntrinsicId::ValueHead,
-            5 => IntrinsicId::Layer,
-            6 => IntrinsicId::MtpDrafts,
-            7 => IntrinsicId::AttnScore,
-            _ => return None,
-        })
-    }
-    pub fn name(self) -> &'static str {
-        match self {
-            IntrinsicId::Logits => "logits",
-            IntrinsicId::MtpLogits => "mtp_logits",
-            IntrinsicId::Hidden => "hidden",
-            IntrinsicId::Query => "query",
-            IntrinsicId::ValueHead => "value_head",
-            IntrinsicId::Layer => "layer",
-            IntrinsicId::MtpDrafts => "mtp_drafts",
-            IntrinsicId::AttnScore => "attn_score",
-        }
-    }
+    AttnScore = 7, ATTN_SCORE, "attn_score";
 }
 
 /// A PTIR stage-body op. See the module docs for the SSA model and the
@@ -475,61 +489,61 @@ impl Op {
     /// This op's wire tag (see [`OP_TABLE`]).
     pub fn tag(&self) -> u8 {
         match self {
-            Op::Exp(_) => 0x01,
-            Op::Log(_) => 0x02,
-            Op::Neg(_) => 0x03,
-            Op::Recip(_) => 0x04,
-            Op::Abs(_) => 0x05,
-            Op::Sign(_) => 0x06,
-            Op::Cast { .. } => 0x07,
-            Op::Add(..) => 0x10,
-            Op::Sub(..) => 0x11,
-            Op::Mul(..) => 0x12,
-            Op::Div(..) => 0x13,
-            Op::MaxElem(..) => 0x14,
-            Op::MinElem(..) => 0x15,
-            Op::Gt(..) => 0x16,
-            Op::Ge(..) => 0x17,
-            Op::Eq(..) => 0x18,
-            Op::Ne(..) => 0x19,
-            Op::Lt(..) => 0x1A,
-            Op::Le(..) => 0x1B,
-            Op::And(..) => 0x1C,
-            Op::Or(..) => 0x1D,
-            Op::Not(_) => 0x1E,
-            Op::Rem(..) => 0x1F,
-            Op::Select { .. } => 0x20,
-            Op::ReduceSum(_) => 0x30,
-            Op::ReduceMax(_) => 0x31,
-            Op::ReduceMin(_) => 0x32,
-            Op::ReduceArgmax(_) => 0x33,
-            Op::Broadcast { .. } => 0x38,
-            Op::Reshape { .. } => 0x39,
-            Op::Transpose(_) => 0x3A,
-            Op::CumSum(_) => 0x40,
-            Op::CumProd(_) => 0x41,
-            Op::SortDesc(_) => 0x50,
-            Op::TopK { .. } => 0x51,
-            Op::MatMul(..) => 0x55,
-            Op::PivotThreshold { .. } => 0x58,
-            Op::Gather { .. } => 0x60,
-            Op::GatherRow { .. } => 0x61,
-            Op::ScatterAdd { .. } => 0x62,
-            Op::ScatterSet { .. } => 0x63,
-            Op::Iota { .. } => 0x64,
-            Op::MaskApply { .. } => 0x65,
-            Op::CausalMask { .. } => 0x66,
-            Op::SlidingWindowMask { .. } => 0x67,
-            Op::SinkWindowMask { .. } => 0x68,
-            Op::Rng { .. } => 0x70,
-            Op::RngKeyed { .. } => 0x71,
-            Op::Const(_) => 0x81,
-            Op::ChanTake(_) => 0x90,
-            Op::ChanRead(_) => 0x91,
-            Op::ChanPut { .. } => 0x92,
-            Op::IntrinsicVal { .. } => 0xA0,
-            Op::KernelCall { .. } => 0xA1,
-            Op::SinkCall { .. } => 0xA2,
+            Op::Exp(_) => tags::EXP,
+            Op::Log(_) => tags::LOG,
+            Op::Neg(_) => tags::NEG,
+            Op::Recip(_) => tags::RECIP,
+            Op::Abs(_) => tags::ABS,
+            Op::Sign(_) => tags::SIGN,
+            Op::Cast { .. } => tags::CAST,
+            Op::Add(..) => tags::ADD,
+            Op::Sub(..) => tags::SUB,
+            Op::Mul(..) => tags::MUL,
+            Op::Div(..) => tags::DIV,
+            Op::MaxElem(..) => tags::MAX_ELEM,
+            Op::MinElem(..) => tags::MIN_ELEM,
+            Op::Gt(..) => tags::GT,
+            Op::Ge(..) => tags::GE,
+            Op::Eq(..) => tags::EQ,
+            Op::Ne(..) => tags::NE,
+            Op::Lt(..) => tags::LT,
+            Op::Le(..) => tags::LE,
+            Op::And(..) => tags::AND,
+            Op::Or(..) => tags::OR,
+            Op::Not(_) => tags::NOT,
+            Op::Rem(..) => tags::REM,
+            Op::Select { .. } => tags::SELECT,
+            Op::ReduceSum(_) => tags::REDUCE_SUM,
+            Op::ReduceMax(_) => tags::REDUCE_MAX,
+            Op::ReduceMin(_) => tags::REDUCE_MIN,
+            Op::ReduceArgmax(_) => tags::REDUCE_ARGMAX,
+            Op::Broadcast { .. } => tags::BROADCAST,
+            Op::Reshape { .. } => tags::RESHAPE,
+            Op::Transpose(_) => tags::TRANSPOSE,
+            Op::CumSum(_) => tags::CUMSUM,
+            Op::CumProd(_) => tags::CUMPROD,
+            Op::SortDesc(_) => tags::SORT_DESC,
+            Op::TopK { .. } => tags::TOP_K,
+            Op::MatMul(..) => tags::MATMUL,
+            Op::PivotThreshold { .. } => tags::PIVOT_THRESHOLD,
+            Op::Gather { .. } => tags::GATHER,
+            Op::GatherRow { .. } => tags::GATHER_ROW,
+            Op::ScatterAdd { .. } => tags::SCATTER_ADD,
+            Op::ScatterSet { .. } => tags::SCATTER_SET,
+            Op::Iota { .. } => tags::IOTA,
+            Op::MaskApply { .. } => tags::MASK_APPLY_PACKED,
+            Op::CausalMask { .. } => tags::CAUSAL_MASK,
+            Op::SlidingWindowMask { .. } => tags::SLIDING_WINDOW_MASK,
+            Op::SinkWindowMask { .. } => tags::SINK_WINDOW_MASK,
+            Op::Rng { .. } => tags::RNG,
+            Op::RngKeyed { .. } => tags::RNG_KEYED,
+            Op::Const(_) => tags::CONST,
+            Op::ChanTake(_) => tags::CHAN_TAKE,
+            Op::ChanRead(_) => tags::CHAN_READ,
+            Op::ChanPut { .. } => tags::CHAN_PUT,
+            Op::IntrinsicVal { .. } => tags::INTRINSIC_VAL,
+            Op::KernelCall { .. } => tags::KERNEL_CALL,
+            Op::SinkCall { .. } => tags::SINK_CALL,
         }
     }
 }
@@ -551,10 +565,10 @@ pub enum Family {
     Intrinsic,
 }
 
-/// One op-table row: the declarative identity charlie's C++ tables are
-/// generated from. `operand layout` is documented per-op in
-/// PTIR-CONTAINER.md §4; `val_operands` counts value-id operands
-/// (`0xFF` = variadic, count byte on the wire).
+/// One op-table row: the declarative identity the generated C++ tables are
+/// built from. `operand layout` is documented per-op in PTIR-CONTAINER.md §4;
+/// `val_operands` counts value-id operands (`0xFF` = variadic, count byte on
+/// the wire).
 #[derive(Clone, Copy, Debug)]
 pub struct OpSpec {
     pub tag: u8,
@@ -567,395 +581,123 @@ pub struct OpSpec {
 /// Variadic marker for [`OpSpec::val_operands`].
 pub const VARIADIC: u8 = 0xFF;
 
-/// The op table — one row per wire tag, sorted by tag. The generated C++
-/// header and any driver-side dispatch table MUST be derived from this list.
-pub const OP_TABLE: &[OpSpec] = &[
-    OpSpec {
-        tag: 0x01,
-        name: "exp",
-        family: Family::Map,
-        val_operands: 1,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x02,
-        name: "log",
-        family: Family::Map,
-        val_operands: 1,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x03,
-        name: "neg",
-        family: Family::Map,
-        val_operands: 1,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x04,
-        name: "recip",
-        family: Family::Map,
-        val_operands: 1,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x05,
-        name: "abs",
-        family: Family::Map,
-        val_operands: 1,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x06,
-        name: "sign",
-        family: Family::Map,
-        val_operands: 1,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x07,
-        name: "cast",
-        family: Family::Map,
-        val_operands: 1,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x10,
-        name: "add",
-        family: Family::Map,
-        val_operands: 2,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x11,
-        name: "sub",
-        family: Family::Map,
-        val_operands: 2,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x12,
-        name: "mul",
-        family: Family::Map,
-        val_operands: 2,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x13,
-        name: "div",
-        family: Family::Map,
-        val_operands: 2,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x14,
-        name: "max_elem",
-        family: Family::Map,
-        val_operands: 2,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x15,
-        name: "min_elem",
-        family: Family::Map,
-        val_operands: 2,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x16,
-        name: "gt",
-        family: Family::CompareLogic,
-        val_operands: 2,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x17,
-        name: "ge",
-        family: Family::CompareLogic,
-        val_operands: 2,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x18,
-        name: "eq",
-        family: Family::CompareLogic,
-        val_operands: 2,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x19,
-        name: "ne",
-        family: Family::CompareLogic,
-        val_operands: 2,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x1A,
-        name: "lt",
-        family: Family::CompareLogic,
-        val_operands: 2,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x1B,
-        name: "le",
-        family: Family::CompareLogic,
-        val_operands: 2,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x1C,
-        name: "and",
-        family: Family::CompareLogic,
-        val_operands: 2,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x1D,
-        name: "or",
-        family: Family::CompareLogic,
-        val_operands: 2,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x1E,
-        name: "not",
-        family: Family::CompareLogic,
-        val_operands: 1,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x1F,
-        name: "rem",
-        family: Family::Map,
-        val_operands: 2,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x20,
-        name: "select",
-        family: Family::Choice,
-        val_operands: 3,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x30,
-        name: "reduce_sum",
-        family: Family::ReduceScan,
-        val_operands: 1,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x31,
-        name: "reduce_max",
-        family: Family::ReduceScan,
-        val_operands: 1,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x32,
-        name: "reduce_min",
-        family: Family::ReduceScan,
-        val_operands: 1,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x33,
-        name: "reduce_argmax",
-        family: Family::ReduceScan,
-        val_operands: 1,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x38,
-        name: "broadcast",
-        family: Family::Shape,
-        val_operands: 1,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x39,
-        name: "reshape",
-        family: Family::Shape,
-        val_operands: 1,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x3A,
-        name: "transpose",
-        family: Family::Shape,
-        val_operands: 1,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x40,
-        name: "cumsum",
-        family: Family::ReduceScan,
-        val_operands: 1,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x41,
-        name: "cumprod",
-        family: Family::ReduceScan,
-        val_operands: 1,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x50,
-        name: "sort_desc",
-        family: Family::Order,
-        val_operands: 1,
-        results: 2,
-    },
-    OpSpec {
-        tag: 0x51,
-        name: "top_k",
-        family: Family::Order,
-        val_operands: 1,
-        results: 2,
-    },
-    OpSpec {
-        tag: 0x55,
-        name: "matmul",
-        family: Family::Linear,
-        val_operands: 2,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x58,
-        name: "pivot_threshold",
-        family: Family::Order,
-        val_operands: 2,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x60,
-        name: "gather",
-        family: Family::Index,
-        val_operands: 2,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x61,
-        name: "gather_row",
-        family: Family::Index,
-        val_operands: 2,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x62,
-        name: "scatter_add",
-        family: Family::Index,
-        val_operands: 3,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x63,
-        name: "scatter_set",
-        family: Family::Index,
-        val_operands: 3,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x64,
-        name: "iota",
-        family: Family::Index,
-        val_operands: 0,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x65,
-        name: "mask_apply_packed",
-        family: Family::Sampling,
-        val_operands: 2,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x66,
-        name: "causal_mask",
-        family: Family::Index,
-        val_operands: 1,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x67,
-        name: "sliding_window_mask",
-        family: Family::Index,
-        val_operands: 1,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x68,
-        name: "sink_window_mask",
-        family: Family::Index,
-        val_operands: 1,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x70,
-        name: "rng",
-        family: Family::Sampling,
-        val_operands: 0,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x71,
-        name: "rng_keyed",
-        family: Family::Sampling,
-        val_operands: 1,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x81,
-        name: "const",
-        family: Family::Leaf,
-        val_operands: 0,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x90,
-        name: "chan_take",
-        family: Family::Channel,
-        val_operands: 0,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x91,
-        name: "chan_read",
-        family: Family::Channel,
-        val_operands: 0,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0x92,
-        name: "chan_put",
-        family: Family::Channel,
-        val_operands: 1,
-        results: 0,
-    },
-    OpSpec {
-        tag: 0xA0,
-        name: "intrinsic_val",
-        family: Family::Intrinsic,
-        val_operands: 0,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0xA1,
-        name: "kernel_call",
-        family: Family::Intrinsic,
-        val_operands: VARIADIC,
-        results: 1,
-    },
-    OpSpec {
-        tag: 0xA2,
-        name: "sink_call",
-        family: Family::Intrinsic,
-        val_operands: VARIADIC,
-        results: 0,
-    },
-];
+/// Declares the op set once and derives [`tags`] and [`OP_TABLE`] from it.
+///
+/// A wire tag, its name, family, value-operand count and result count appear
+/// on exactly one line each. Nothing downstream may re-spell a tag literal —
+/// it imports [`tags`] instead.
+macro_rules! declare_ops {
+    ($($konst:ident = $tag:literal, $name:literal, $family:ident, $operands:expr, $results:expr;)*) => {
+        /// The wire tag of every op, by name. **The only place a PTIR op tag
+        /// is spelled as a number.** Downstream crates (`pie-plan`,
+        /// `pie-codegen`, and drivers via the generated header) import these
+        /// instead of keeping their own copies: a hand-copied tag that drifts
+        /// by one hex digit is a silently wrong kernel, and nothing but a
+        /// single definition can rule that out.
+        pub mod tags {
+            $(pub const $konst: u8 = $tag;)*
+        }
+
+        /// The op table — one row per wire tag, sorted by tag. The generated
+        /// C++ header and any driver-side dispatch table MUST be derived from
+        /// this list.
+        pub const OP_TABLE: &[OpSpec] = &[
+            $(OpSpec {
+                tag: tags::$konst,
+                name: $name,
+                family: Family::$family,
+                val_operands: $operands,
+                results: $results,
+            },)*
+        ];
+    };
+}
+
+declare_ops! {
+    EXP = 0x01, "exp", Map, 1, 1;
+    LOG = 0x02, "log", Map, 1, 1;
+    NEG = 0x03, "neg", Map, 1, 1;
+    RECIP = 0x04, "recip", Map, 1, 1;
+    ABS = 0x05, "abs", Map, 1, 1;
+    SIGN = 0x06, "sign", Map, 1, 1;
+    CAST = 0x07, "cast", Map, 1, 1;
+    ADD = 0x10, "add", Map, 2, 1;
+    SUB = 0x11, "sub", Map, 2, 1;
+    MUL = 0x12, "mul", Map, 2, 1;
+    DIV = 0x13, "div", Map, 2, 1;
+    MAX_ELEM = 0x14, "max_elem", Map, 2, 1;
+    MIN_ELEM = 0x15, "min_elem", Map, 2, 1;
+    GT = 0x16, "gt", CompareLogic, 2, 1;
+    GE = 0x17, "ge", CompareLogic, 2, 1;
+    EQ = 0x18, "eq", CompareLogic, 2, 1;
+    NE = 0x19, "ne", CompareLogic, 2, 1;
+    LT = 0x1A, "lt", CompareLogic, 2, 1;
+    LE = 0x1B, "le", CompareLogic, 2, 1;
+    AND = 0x1C, "and", CompareLogic, 2, 1;
+    OR = 0x1D, "or", CompareLogic, 2, 1;
+    NOT = 0x1E, "not", CompareLogic, 1, 1;
+    REM = 0x1F, "rem", Map, 2, 1;
+    SELECT = 0x20, "select", Choice, 3, 1;
+    REDUCE_SUM = 0x30, "reduce_sum", ReduceScan, 1, 1;
+    REDUCE_MAX = 0x31, "reduce_max", ReduceScan, 1, 1;
+    REDUCE_MIN = 0x32, "reduce_min", ReduceScan, 1, 1;
+    REDUCE_ARGMAX = 0x33, "reduce_argmax", ReduceScan, 1, 1;
+    BROADCAST = 0x38, "broadcast", Shape, 1, 1;
+    RESHAPE = 0x39, "reshape", Shape, 1, 1;
+    TRANSPOSE = 0x3A, "transpose", Shape, 1, 1;
+    CUMSUM = 0x40, "cumsum", ReduceScan, 1, 1;
+    CUMPROD = 0x41, "cumprod", ReduceScan, 1, 1;
+    SORT_DESC = 0x50, "sort_desc", Order, 1, 2;
+    TOP_K = 0x51, "top_k", Order, 1, 2;
+    MATMUL = 0x55, "matmul", Linear, 2, 1;
+    PIVOT_THRESHOLD = 0x58, "pivot_threshold", Order, 2, 1;
+    GATHER = 0x60, "gather", Index, 2, 1;
+    GATHER_ROW = 0x61, "gather_row", Index, 2, 1;
+    SCATTER_ADD = 0x62, "scatter_add", Index, 3, 1;
+    SCATTER_SET = 0x63, "scatter_set", Index, 3, 1;
+    IOTA = 0x64, "iota", Index, 0, 1;
+    MASK_APPLY_PACKED = 0x65, "mask_apply_packed", Sampling, 2, 1;
+    CAUSAL_MASK = 0x66, "causal_mask", Index, 1, 1;
+    SLIDING_WINDOW_MASK = 0x67, "sliding_window_mask", Index, 1, 1;
+    SINK_WINDOW_MASK = 0x68, "sink_window_mask", Index, 1, 1;
+    RNG = 0x70, "rng", Sampling, 0, 1;
+    RNG_KEYED = 0x71, "rng_keyed", Sampling, 1, 1;
+    CONST = 0x81, "const", Leaf, 0, 1;
+    CHAN_TAKE = 0x90, "chan_take", Channel, 0, 1;
+    CHAN_READ = 0x91, "chan_read", Channel, 0, 1;
+    CHAN_PUT = 0x92, "chan_put", Channel, 1, 0;
+    INTRINSIC_VAL = 0xA0, "intrinsic_val", Intrinsic, 0, 1;
+    KERNEL_CALL = 0xA1, "kernel_call", Intrinsic, VARIADIC, 1;
+    SINK_CALL = 0xA2, "sink_call", Intrinsic, VARIADIC, 0;
+}
+
+/// The table row for a wire tag, or `None` when the tag is not a PTIR op.
+///
+/// [`OP_TABLE`] is sorted by tag, so this is a binary search. Downstream
+/// dispatch asks this instead of matching hex ranges: a range literal silently
+/// swallows any tag landing in one of its gaps, and the gaps are where new ops
+/// go.
+pub fn spec(tag: u8) -> Option<&'static OpSpec> {
+    let mut lo = 0usize;
+    let mut hi = OP_TABLE.len();
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let row = &OP_TABLE[mid];
+        if row.tag == tag {
+            return Some(row);
+        } else if row.tag < tag {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    None
+}
+
+/// The family of a wire tag, or `None` when the tag is not a PTIR op.
+pub fn family_of(tag: u8) -> Option<Family> {
+    spec(tag).map(|row| row.family)
+}
 
 #[cfg(test)]
 mod tests {

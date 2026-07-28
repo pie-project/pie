@@ -8,6 +8,7 @@
 //! two inline expansions the single-lane form does not have — the MTP-draft
 //! argmax and the logits gather.
 
+use pie_ir::op::{intrinsic_tags, tags};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -17,18 +18,8 @@ use pie_plan::{CompiledStage, Region};
 
 use super::METAL_M2_MAX_FUSED_CHANNELS;
 use super::preamble::{RUNTIME_TEMPLATE, grouped_preamble};
-use super::validate::{library_region_valid, used_channel_slots};
+use super::validate::{intrinsics_bindable, library_region_valid, used_channel_slots};
 use crate::op_view::{OpView, result_bases};
-
-const OP_PIVOT_THRESHOLD: u8 = 0x58;
-const OP_CHAN_TAKE: u8 = 0x90;
-const OP_CHAN_READ: u8 = 0x91;
-const OP_CHAN_PUT: u8 = 0x92;
-const OP_INTRINSIC_VAL: u8 = 0xA0;
-
-const INTR_LOGITS: u16 = 0;
-const INTR_MTP_LOGITS: u16 = 1;
-const INTR_MTP_DRAFTS: u16 = 6;
 
 fn value_ptr(value: u32) -> String {
     format!("scratch + offsets[{value}]")
@@ -61,7 +52,7 @@ fn slots_for(op: &OpView, base: u32) -> Slots {
     if op.args.len() > 2 {
         slots.a2 = value_ptr(op.args[2]);
     }
-    if op.tag == OP_PIVOT_THRESHOLD {
+    if op.tag == tags::PIVOT_THRESHOLD {
         slots.a1 = value_ptr(op.pred_payload);
     }
     if op.results > 0 {
@@ -87,6 +78,7 @@ pub fn emit_fused_region(
         return Err("fused region exceeds the 12-channel direct-binding limit".to_string());
     }
     let ops: Vec<OpView> = OpView::of_all(&stage.normalized.ops);
+    intrinsics_bindable(&ops, region)?;
     let bases = result_bases(&ops);
 
     let mut source = String::new();
@@ -122,17 +114,17 @@ pub fn emit_fused_region(
             return Err("fused region node out of range".to_string());
         };
         let mut slots = slots_for(op, bases[node as usize]);
-        if op.tag == OP_CHAN_TAKE || op.tag == OP_CHAN_READ {
+        if op.tag == tags::CHAN_TAKE || op.tag == tags::CHAN_READ {
             if op.chan < 0 || op.chan as usize >= channel_bindings.len() {
                 return Err("fused channel root binding out of range".to_string());
             }
             slots.a0 = format!("current_{}", op.chan);
-        } else if op.tag == OP_CHAN_PUT {
+        } else if op.tag == tags::CHAN_PUT {
             if op.chan < 0 || op.chan as usize >= channel_bindings.len() {
                 return Err("fused channel sink binding out of range".to_string());
             }
             slots.o0 = format!("pending_{}", op.chan);
-        } else if op.tag == OP_INTRINSIC_VAL {
+        } else if op.tag == tags::INTRINSIC_VAL {
             slots.a0 = "logits".to_string();
         }
         let _ = writeln!(
@@ -141,7 +133,7 @@ pub fn emit_fused_region(
             op.tag, slots.a0, slots.a1, slots.a2, slots.o0, slots.o1
         );
         source.push_str("  if (status->state != 1) return;\n");
-        if op.tag == OP_CHAN_PUT {
+        if op.tag == tags::CHAN_PUT {
             let _ = writeln!(source, "  current_{} = pending_{};", op.chan, op.chan);
         }
     }
@@ -159,6 +151,7 @@ pub fn emit_grouped_fused_region(
         return Err("grouped library region ABI is invalid".to_string());
     }
     let ops: Vec<OpView> = OpView::of_all(&stage.normalized.ops);
+    intrinsics_bindable(&ops, region)?;
     let bases = result_bases(&ops);
     let channel_count = used_channel_slots(&ops);
 
@@ -248,19 +241,19 @@ pub fn emit_grouped_fused_region(
         };
         let base = bases[node as usize];
         let mut slots = slots_for(op, base);
-        if op.tag == OP_INTRINSIC_VAL && op.intr == INTR_MTP_DRAFTS {
+        if op.tag == tags::INTRINSIC_VAL && op.intr == intrinsic_tags::MTP_DRAFTS {
             emit_mtp_drafts(&mut source, base, &slots.o0);
             continue;
         }
-        if op.tag == OP_INTRINSIC_VAL && (op.intr == INTR_LOGITS || op.intr == INTR_MTP_LOGITS) {
-            emit_logits_gather(&mut source, base, op.intr == INTR_MTP_LOGITS, &slots.o0);
+        if op.tag == tags::INTRINSIC_VAL && (op.intr == intrinsic_tags::LOGITS || op.intr == intrinsic_tags::MTP_LOGITS) {
+            emit_logits_gather(&mut source, base, op.intr == intrinsic_tags::MTP_LOGITS, &slots.o0);
             continue;
         }
-        if op.tag == OP_CHAN_TAKE || op.tag == OP_CHAN_READ {
+        if op.tag == tags::CHAN_TAKE || op.tag == tags::CHAN_READ {
             slots.a0 = format!("current_{}", op.chan);
-        } else if op.tag == OP_CHAN_PUT {
+        } else if op.tag == tags::CHAN_PUT {
             slots.o0 = format!("pending_{}", op.chan);
-        } else if op.tag == OP_INTRINSIC_VAL {
+        } else if op.tag == tags::INTRINSIC_VAL {
             slots.a0 = "logits".to_string();
         }
         let _ = writeln!(
@@ -269,7 +262,7 @@ pub fn emit_grouped_fused_region(
             op.tag, slots.a0, slots.a1, slots.a2, slots.o0, slots.o1
         );
         source.push_str("  if (status->state != 1) return;\n");
-        if op.tag == OP_CHAN_PUT {
+        if op.tag == tags::CHAN_PUT {
             let _ = writeln!(source, "  current_{} = pending_{};", op.chan, op.chan);
             let _ = writeln!(source, "  pending_flags[pending_index_{}] = 1;", op.chan);
         }

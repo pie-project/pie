@@ -26,6 +26,21 @@ pub enum DType {
 }
 
 impl DType {
+    /// Every scalar dtype, in wire-tag order. See [`crate::registry::Stage::ALL`].
+    /// Channel decls may additionally carry the late-bound
+    /// [`crate::container::ChanDType::Act`] tag, which is not a `DType`.
+    pub const ALL: &'static [DType] = &[DType::F32, DType::I32, DType::U32, DType::Bool];
+
+    /// Lowercase wire name, used by the generated C header and diagnostics.
+    pub fn name(self) -> &'static str {
+        match self {
+            DType::F32 => "f32",
+            DType::I32 => "i32",
+            DType::U32 => "u32",
+            DType::Bool => "bool",
+        }
+    }
+
     pub fn is_float(self) -> bool {
         matches!(self, DType::F32)
     }

@@ -25,6 +25,15 @@ pub enum Stage {
 }
 
 impl Stage {
+    /// Every stage, in wire-tag order. The generated C header and any other
+    /// enumeration of stages derives from this rather than re-listing them.
+    pub const ALL: &'static [Stage] = &[
+        Stage::Prologue,
+        Stage::OnAttnProj,
+        Stage::OnAttn,
+        Stage::Epilogue,
+    ];
+
     pub fn from_u8(v: u8) -> Option<Self> {
         Some(match v {
             0 => Stage::Prologue,
@@ -113,6 +122,20 @@ pub enum Port {
 }
 
 impl Port {
+    /// Every descriptor port, in wire-tag order. See [`Stage::ALL`].
+    pub const ALL: &'static [Port] = &[
+        Port::EmbedTokens,
+        Port::EmbedIndptr,
+        Port::Positions,
+        Port::Pages,
+        Port::PageIndptr,
+        Port::KvLen,
+        Port::WSlot,
+        Port::WOff,
+        Port::Readout,
+        Port::AttnMask,
+    ];
+
     pub fn from_u8(v: u8) -> Option<Self> {
         Some(match v {
             0 => Port::EmbedTokens,

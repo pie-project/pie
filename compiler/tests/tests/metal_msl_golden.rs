@@ -181,6 +181,84 @@ impl Dump {
     }
 }
 
+/// Cases where this compiler *deliberately* disagrees with the recorded C++
+/// oracle, each with the reason.
+///
+/// The oracle binary is gone (deleted with the C++ emitters), so these dumps
+/// are the only surviving record of its behaviour. That makes `PTIR_REGEN=1`
+/// the wrong tool for a fix: regenerating would overwrite the evidence and
+/// leave no trace that the divergence was intended. An entry here is the
+/// trace. Adding one is a claim that the oracle was *wrong*, so it needs to
+/// say why.
+const INTENDED_ORACLE_DIVERGENCES: &[(&str, &str)] = &[
+    // The oracle emitted these: it bound `intrinsic_val` ids 3 (`query`) and 4
+    // (`value_head`) to the `logits` buffer, because that is the only buffer
+    // `ptir_m1_runtime.metal` binds for op tag 0xA0 and neither the emitter nor
+    // the Metal driver looks at `p.intr` except for `MtpDrafts`. The kernel ran,
+    // faulted nothing, and returned logits rows in place of the requested
+    // intrinsic. `intrinsics_bindable` now rejects the region instead.
+    (
+        "pentathlon_iter#0 singleton#0",
+        "oracle emitted a kernel binding intrinsic id 3 (query) to `logits`",
+    ),
+    (
+        "pentathlon_iter#0 fused#0",
+        "oracle emitted a kernel binding intrinsic id 3 (query) to `logits`",
+    ),
+    (
+        "pentathlon_iter#1 fused#2",
+        "oracle emitted a kernel binding intrinsic id 4 (value_head) to `logits`",
+    ),
+    // Same defect on the interpreted path: `m1_runtime.cpp` binds
+    // `inputs.logits_bf16` for every `PTIR_OP_INTRINSIC_VAL` and only consults
+    // `op.intr` to size the row range, so the oracle accepted these plans too
+    // (`pentathlon_iter#1` verbatim; `#0` it rejected, but for an unrelated
+    // kernel boundary further down the stage).
+    (
+        "pentathlon_iter#0",
+        "oracle accepted intrinsic id 3 (query) on the interpreted path",
+    ),
+    (
+        "pentathlon_iter#1",
+        "oracle accepted intrinsic id 4 (value_head) on the interpreted path",
+    ),
+];
+
+/// One-line gist of a case body: the verdict plus its error or byte count.
+fn summarize(case: &str) -> String {
+    case.lines()
+        .filter(|line| {
+            line.starts_with("ok:") || line.starts_with("error:") || line.starts_with("source:")
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+fn intended_divergence(case: &str) -> Option<&'static str> {
+    INTENDED_ORACLE_DIVERGENCES
+        .iter()
+        .find(|(id, _)| *id == case)
+        .map(|(_, reason)| *reason)
+}
+
+/// Split a dump body into `(case-id, case-text)` pairs.
+fn cases(body: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for line in body.lines() {
+        if let Some(id) = line.strip_prefix("=== ")
+            && id != "end"
+        {
+            out.push((id.to_string(), String::new()));
+            continue;
+        }
+        if let Some((_, text)) = out.last_mut() {
+            text.push_str(line);
+            text.push('\n');
+        }
+    }
+    out
+}
+
 /// Compare one emitter's cases against the oracle dump, ignoring the oracle's
 /// `#` header (it records provenance, not behaviour).
 fn compare(dump: &Dump) {
@@ -201,26 +279,45 @@ fn compare(dump: &Dump) {
     if expected == dump.body {
         return;
     }
-    // Point at the first differing case instead of dumping 12 000 lines.
-    let mut case = String::from("<before the first case>");
-    for (index, (mine, theirs)) in dump.body.lines().zip(expected.lines()).enumerate() {
-        if let Some(id) = theirs.strip_prefix("=== ") {
-            case = id.to_string();
-        }
-        assert_eq!(
-            mine,
-            theirs,
-            "{} diverged from the C++ oracle at line {} (case `{case}`)",
-            dump.emitter,
-            index + 1
-        );
-    }
+    let mine_cases = cases(&dump.body);
+    let their_cases = cases(expected);
     assert_eq!(
-        dump.body.lines().count(),
-        expected.lines().count(),
-        "{} emitted a different number of lines than the C++ oracle",
+        mine_cases.iter().map(|(id, _)| id).collect::<Vec<_>>(),
+        their_cases.iter().map(|(id, _)| id).collect::<Vec<_>>(),
+        "{} case list diverged from the oracle dump",
         dump.emitter
     );
+    let mut unexpected: Vec<String> = Vec::new();
+    let mut stale: Vec<String> = Vec::new();
+    for ((id, mine), (_, theirs)) in mine_cases.iter().zip(&their_cases) {
+        match (intended_divergence(id), mine == theirs) {
+            (Some(_), false) => {}
+            (Some(reason), true) => stale.push(format!("{id} ({reason})")),
+            (None, true) => {}
+            (None, false) => unexpected.push(format!(
+                "  `{id}`\n    rust  : {}\n    oracle: {}",
+                summarize(mine),
+                summarize(theirs)
+            )),
+        }
+    }
+    assert!(
+        unexpected.is_empty(),
+        "{} diverged from the C++ oracle in {} case(s):\n{}",
+        dump.emitter,
+        unexpected.len(),
+        unexpected.join("\n")
+    );
+    assert!(
+        stale.is_empty(),
+        "{} cases are listed in INTENDED_ORACLE_DIVERGENCES but now match the \
+         oracle -- drop the entries:\n{}",
+        dump.emitter,
+        stale.join("\n")
+    );
+    // Line counts legitimately differ once a case is in the ledger (a rejection
+    // is one line where an emitted kernel is hundreds). The per-case comparison
+    // above, gated on identical case-id lists, is the stronger check.
 }
 
 fn effect_from_flags(flags: u32, capacity: u32) -> M1ChannelEffect {
@@ -444,6 +541,15 @@ fn validate_singleton_plan_matches_oracle_on_clean_plans() {
         let same = mine.ok == theirs.ok
             && mine.error == theirs.error
             && (!mine.ok || mine.operations == theirs.operations);
+        if let Some(reason) = intended_divergence(&stage.id()) {
+            assert!(
+                !same,
+                "{} is listed in INTENDED_ORACLE_DIVERGENCES ({reason}) but now \
+                 matches the oracle -- drop the entry",
+                stage.id()
+            );
+            continue;
+        }
         if !same {
             divergences.push(format!(
                 "{}:\n  rust: {mine:?}\n  cxx : {theirs:?}",

@@ -8,8 +8,10 @@ use alloc::format;
 use alloc::string::String;
 
 use pie_ir::PTIR_VERSION;
+use pie_ir::container::DT_ACT;
 use pie_ir::op::{IntrinsicId, OP_TABLE, VARIADIC};
 use pie_ir::registry::{KNOWN_SINKS, PHASE_DESCRIPTOR_TAG, Port, Stage};
+use pie_ir::types::DType;
 
 /// Render `include/ptir_abi.h`. Pure function of the tables — byte-stable.
 pub fn generate_c_header() -> String {
@@ -126,20 +128,23 @@ typedef struct PtirLaneChannelSlot {\n\
     s.push_str(
         "// ── dtypes (channel decls may also carry PTIR_DT_ACT = late-bound activation) ──\n",
     );
-    s.push_str("enum PtirDType : uint8_t {\n  PTIR_DT_F32 = 0,\n  PTIR_DT_I32 = 1,\n  PTIR_DT_U32 = 2,\n  PTIR_DT_BOOL = 3,\n  PTIR_DT_ACT = 4,\n};\n\n");
+    s.push_str("enum PtirDType : uint8_t {\n");
+    for dtype in DType::ALL {
+        s.push_str(&format!(
+            "  PTIR_DT_{} = {},\n",
+            dtype.name().to_uppercase(),
+            *dtype as u8
+        ));
+    }
+    s.push_str(&format!("  PTIR_DT_ACT = {DT_ACT},\n}};\n\n"));
 
     s.push_str("// ── stages (per-layer taps: ON_ATTN_PROJ, ON_ATTN) ──\n");
     s.push_str("enum PtirStage : uint8_t {\n");
-    for st in [
-        Stage::Prologue,
-        Stage::OnAttnProj,
-        Stage::OnAttn,
-        Stage::Epilogue,
-    ] {
+    for st in Stage::ALL {
         s.push_str(&format!(
             "  PTIR_STAGE_{} = {},\n",
             st.name().to_uppercase(),
-            st as u8
+            *st as u8
         ));
     }
     s.push_str("};\n");
@@ -149,42 +154,22 @@ typedef struct PtirLaneChannelSlot {\n\
 
     s.push_str("// ── descriptor ports (token family CONSUMES, geometry/masks PEEK) ──\n");
     s.push_str("enum PtirPort : uint8_t {\n");
-    for p in [
-        Port::EmbedTokens,
-        Port::EmbedIndptr,
-        Port::Positions,
-        Port::Pages,
-        Port::PageIndptr,
-        Port::KvLen,
-        Port::WSlot,
-        Port::WOff,
-        Port::Readout,
-        Port::AttnMask,
-    ] {
+    for p in Port::ALL {
         s.push_str(&format!(
             "  PTIR_PORT_{} = {},\n",
             p.name().to_uppercase(),
-            p as u8
+            *p as u8
         ));
     }
     s.push_str("};\n\n");
 
     s.push_str("// ── first-party value intrinsics (op 0xA0 payload) ──\n");
     s.push_str("enum PtirIntrinsic : uint16_t {\n");
-    for i in [
-        IntrinsicId::Logits,
-        IntrinsicId::MtpLogits,
-        IntrinsicId::Hidden,
-        IntrinsicId::Query,
-        IntrinsicId::ValueHead,
-        IntrinsicId::Layer,
-        IntrinsicId::MtpDrafts,
-        IntrinsicId::AttnScore,
-    ] {
+    for i in IntrinsicId::ALL {
         s.push_str(&format!(
             "  PTIR_INTR_{} = {},\n",
             i.name().to_uppercase(),
-            i as u16
+            *i as u16
         ));
     }
     s.push_str("};\n\n");
@@ -203,6 +188,20 @@ typedef struct PtirLaneChannelSlot {\n\
             *scope as u8
         ));
     }
+    s.push_str(
+        "\n// ── backend emitter identity ──\n// Each driver keys its compiled-module disk cache on the emitter version of the\n// backend it loads, so a change to emitted source that does not bump these will\n// silently reuse a stale cubin/metallib. They are emitted here rather than\n// retyped in the drivers precisely because the two copies cannot be compared at\n// runtime -- the mismatch shows up as a wrong answer, not as an error.\n",
+    );
+    s.push_str(&format!(
+        "#define PTIR_CUDA_EMITTER_VERSION {}\n#define PTIR_METAL_M1_EMITTER_VERSION {}\n",
+        crate::cuda::CUDA_GENERATED_EMITTER_VERSION,
+        crate::metal::METAL_M1_EMITTER_VERSION
+    ));
+    s.push_str(&format!(
+        "#define PTIR_METAL_M1_MAX_CHANNELS {}\n#define PTIR_METAL_M2_MAX_FUSED_CHANNELS {}\n",
+        crate::metal::METAL_M1_MAX_CHANNELS,
+        crate::metal::METAL_M2_MAX_FUSED_CHANNELS
+    ));
+
     s.push_str("\n// ── numeric contract (T8 replay determinism; golden interp is normative) ──\n");
     s.push_str("// argmax: lower index wins ties; NaN never selected (all-NaN row -> index 0).\n");
     s.push_str("// sort_desc/top_k: descending, ties -> lower original index first; NaN sorts below -inf.\n");

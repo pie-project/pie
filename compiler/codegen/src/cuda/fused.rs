@@ -18,6 +18,7 @@
 //!   buffer straight, which makes both the intrinsic materialisation and the
 //!   reshapes redundant.
 
+use pie_ir::op::{intrinsic_tags, tags};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec;
@@ -39,55 +40,21 @@ const PREAMBLE: &str = include_str!("../../runtime/cuda/fused_block2.cuh");
 /// `kPtirIntrinsicSlots` — per-lane intrinsic descriptor slots.
 pub const PTIR_INTRINSIC_SLOTS: u32 = 8;
 
-const OP_EXP: u8 = 0x01;
-const OP_CAST: u8 = 0x07;
-const OP_ADD: u8 = 0x10;
-const OP_SELECT: u8 = 0x20;
-const OP_CONST: u8 = 0x81;
-const OP_IOTA: u8 = 0x64;
-const OP_BROADCAST: u8 = 0x38;
-const OP_RESHAPE: u8 = 0x39;
-const OP_TRANSPOSE: u8 = 0x3A;
-const OP_REDUCE_SUM: u8 = 0x30;
-const OP_REDUCE_MAX: u8 = 0x31;
-const OP_REDUCE_MIN: u8 = 0x32;
-const OP_REDUCE_ARGMAX: u8 = 0x33;
-const OP_PIVOT_THRESHOLD: u8 = 0x58;
-const OP_GATHER: u8 = 0x60;
-const OP_GATHER_ROW: u8 = 0x61;
-const OP_SCATTER_ADD: u8 = 0x62;
-const OP_SCATTER_SET: u8 = 0x63;
-const OP_MASK_APPLY_PACKED: u8 = 0x65;
-const OP_CAUSAL_MASK: u8 = 0x66;
-const OP_SLIDING_WINDOW_MASK: u8 = 0x67;
-const OP_SINK_WINDOW_MASK: u8 = 0x68;
-const OP_RNG: u8 = 0x70;
-const OP_RNG_KEYED: u8 = 0x71;
-const OP_CHAN_TAKE: u8 = 0x90;
-const OP_CHAN_READ: u8 = 0x91;
-const OP_CHAN_PUT: u8 = 0x92;
-const OP_INTRINSIC_VAL: u8 = 0xA0;
-
-const INTR_LOGITS: u16 = 0;
-const INTR_MTP_LOGITS: u16 = 1;
-const INTR_LAYER: u16 = 5;
-const INTR_MTP_DRAFTS: u16 = 6;
-
 const DT_F32: u8 = 0;
 
 /// The ops the runtime has a block-parallel elementwise helper for.
 fn parallel_elementwise(tag: u8) -> bool {
-    (OP_EXP..=OP_CAST).contains(&tag)
-        || (OP_ADD..=OP_SELECT).contains(&tag)
+    (tags::EXP..=tags::CAST).contains(&tag)
+        || (tags::ADD..=tags::SELECT).contains(&tag)
         || matches!(
             tag,
-            OP_IOTA
-                | OP_MASK_APPLY_PACKED
-                | OP_CAUSAL_MASK
-                | OP_SLIDING_WINDOW_MASK
-                | OP_SINK_WINDOW_MASK
-                | OP_RNG
-                | OP_RNG_KEYED
+            tags::IOTA
+                | tags::MASK_APPLY_PACKED
+                | tags::CAUSAL_MASK
+                | tags::SLIDING_WINDOW_MASK
+                | tags::SINK_WINDOW_MASK
+                | tags::RNG
+                | tags::RNG_KEYED
         )
 }
 
@@ -177,7 +144,7 @@ pub(crate) fn analyze_direct_argmax(
     for &node in &region.nodes {
         let node = node as usize;
         let reduction = &ops[node];
-        if reduction.tag != OP_REDUCE_ARGMAX || reduction.args.is_empty() {
+        if reduction.tag != tags::REDUCE_ARGMAX || reduction.args.is_empty() {
             continue;
         }
         let mut value = reduction.args[0];
@@ -191,12 +158,12 @@ pub(crate) fn analyze_direct_argmax(
             let producer = producers[value as usize];
             let op = &ops[producer as usize];
             chain.push(producer);
-            if op.tag == OP_RESHAPE && !op.args.is_empty() {
+            if op.tag == tags::RESHAPE && !op.args.is_empty() {
                 expected_consumer = producer;
                 value = op.args[0];
                 continue;
             }
-            if op.tag != OP_INTRINSIC_VAL || (op.intr != INTR_LOGITS && op.intr != INTR_MTP_LOGITS)
+            if op.tag != tags::INTRINSIC_VAL || (op.intr != intrinsic_tags::LOGITS && op.intr != intrinsic_tags::MTP_LOGITS)
             {
                 break;
             }
@@ -258,8 +225,53 @@ pub fn emit_fused_region(
     let direct = analyze_direct_argmax(stage, region, &bases);
     let mut skipped = direct.skipped;
 
-    // A nucleus library region elsewhere in the stage consumes the logits and
-    // the sampler state directly, so whatever produced them here is redundant.
+    // A nucleus library region elsewhere in the stage reads the logits and the
+    // sampler state straight out of the lane's bf16 rows, so the nodes that
+    // would have materialized them here are redundant -- but only under the
+    // same two conditions the driver applies when it shrinks those value slots
+    // to four bytes (`fused_runtime.cuh` `resolves_to_logits_intrinsic` /
+    // `lone_generated_node`). Skipping a node the driver still budgets a full
+    // slot for leaves that slot unwritten: whatever the region emits next reads
+    // uninitialized scratch and publishes it. No fault, no failing test, just a
+    // wrong sample. The sibling analysis `analyze_direct_argmax` above has
+    // always checked its chain; this one did not.
+    let producer_of = |value: u32| -> Option<usize> {
+        region
+            .nodes
+            .iter()
+            .map(|node| *node as usize)
+            .chain(0..ops.len())
+            .find(|&node| value >= bases[node] && value < bases[node] + ops[node].results)
+    };
+    let produces_logits_intrinsic = |value: u32| -> bool {
+        producer_of(value).is_some_and(|node| {
+            let op = &ops[node];
+            op.tag == tags::INTRINSIC_VAL
+                && (op.intr == intrinsic_tags::LOGITS || op.intr == intrinsic_tags::MTP_LOGITS)
+        })
+    };
+    let resolves_to_logits_intrinsic = |value: u32| -> bool {
+        if produces_logits_intrinsic(value) {
+            return true;
+        }
+        producer_of(value).is_some_and(|node| {
+            let op = &ops[node];
+            op.tag == tags::RESHAPE
+                && !op.args.is_empty()
+                && produces_logits_intrinsic(op.args[0])
+        })
+    };
+    // The scale divide is folded into the nucleus kernel only when it is a
+    // region of its own; fused into a larger generated region it still runs and
+    // still writes a full tensor.
+    let mut lone_generated_node = vec![false; ops.len()];
+    for candidate in &stage.fused.regions {
+        if !matches!(candidate.kind, RegionKind::Library(_)) && candidate.nodes.len() == 1 {
+            lone_generated_node[candidate.nodes[0] as usize] = true;
+        }
+    }
+    let in_region = |node: usize| region.nodes.contains(&(node as u32));
+
     for candidate in &stage.fused.regions {
         if !matches!(
             candidate.kind,
@@ -268,31 +280,30 @@ pub fn emit_fused_region(
         {
             continue;
         }
-        for start in [candidate.inputs[0], candidate.inputs[2]] {
-            let mut value = start;
-            let mut depth = 0;
-            while depth < 2 {
-                let mut found = false;
-                for &node in &region.nodes {
-                    let node = node as usize;
-                    let op = &ops[node];
-                    if value < bases[node] || value >= bases[node] + op.results {
-                        continue;
-                    }
-                    found = true;
-                    skipped[node] = 1;
-                    if op.tag == OP_RESHAPE && !op.args.is_empty() {
-                        value = op.args[0];
-                    } else {
-                        depth = 2;
-                    }
-                    break;
-                }
-                if !found {
-                    break;
-                }
-                depth += 1;
-            }
+        if resolves_to_logits_intrinsic(candidate.inputs[0])
+            && let Some(node) = producer_of(candidate.inputs[0])
+            && in_region(node)
+        {
+            skipped[node] = 1;
+        }
+        let Some(node) = producer_of(candidate.inputs[2]) else {
+            continue;
+        };
+        if !lone_generated_node[node] {
+            continue;
+        }
+        if in_region(node) {
+            skipped[node] = 1;
+        }
+        let op = &ops[node];
+        if op.tag == tags::DIV
+            && !op.args.is_empty()
+            && resolves_to_logits_intrinsic(op.args[0])
+            && let Some(reshape) = producer_of(op.args[0])
+            && ops[reshape].tag == tags::RESHAPE
+            && in_region(reshape)
+        {
+            skipped[reshape] = 1;
         }
     }
 
@@ -307,10 +318,10 @@ pub fn emit_fused_region(
         let node = node as usize;
         let op = &ops[node];
         let base = bases[node];
-        if skipped[node] != 0 && op.tag != OP_RESHAPE {
+        if skipped[node] != 0 && op.tag != tags::RESHAPE {
             continue;
         }
-        if op.tag == OP_RESHAPE && !region.outputs.contains(&base) {
+        if op.tag == tags::RESHAPE && !region.outputs.contains(&base) {
             aliases[base as usize] = resolve_alias(&aliases, op.args[0]);
             continue;
         }
@@ -332,7 +343,7 @@ pub fn emit_fused_region(
         if op.args.len() > 2 {
             a2 = pointer(op.args[2], &aliases);
         }
-        if op.tag == OP_PIVOT_THRESHOLD {
+        if op.tag == tags::PIVOT_THRESHOLD {
             a1 = pointer(op.pred_payload, &aliases);
         }
         if op.results > 0 {
@@ -346,21 +357,21 @@ pub fn emit_fused_region(
         let _ = writeln!(source, "    M1OpParams p = params[{node}u];");
         source.push_str("    p.rng_seed = 0u;\n");
 
-        if matches!(op.tag, OP_CHAN_TAKE | OP_CHAN_READ | OP_CHAN_PUT) {
+        if matches!(op.tag, tags::CHAN_TAKE | tags::CHAN_READ | tags::CHAN_PUT) {
             let _ = writeln!(
                 source,
                 "    const m1_u32 channel_index = lane.channel_slot_offset + {}u;",
                 op.chan as u32
             );
             source.push_str("    const PtirLaneChannelSlot channel = channels[channel_index];\n");
-            if op.tag == OP_CHAN_PUT {
+            if op.tag == tags::CHAN_PUT {
                 o0 = "reinterpret_cast<m1_u8*>(channel.pending_cell)".to_string();
             } else {
                 a0 = "reinterpret_cast<const m1_u8*>(pending_flags[channel_index] != 0u ? \
                       channel.pending_cell : channel.committed_cell)"
                     .to_string();
             }
-        } else if op.tag == OP_INTRINSIC_VAL {
+        } else if op.tag == tags::INTRINSIC_VAL {
             let _ = writeln!(
                 source,
                 "    const m1_u32 intrinsic_index = dispatch_lane * {PTIR_INTRINSIC_SLOTS}u + p.intr;"
@@ -390,7 +401,7 @@ pub fn emit_fused_region(
         source.push_str("      if (threadIdx.x == 0u) *commit = 0u;\n");
         source.push_str("      return;\n");
         source.push_str("    }\n");
-        if op.tag == OP_CHAN_PUT {
+        if op.tag == tags::CHAN_PUT {
             source.push_str("    if (threadIdx.x == 0u) pending_flags[channel_index] = 1u;\n");
             source.push_str("    __syncthreads();\n");
         }
@@ -422,7 +433,7 @@ fn emit_body(
         );
     };
 
-    if tag == OP_CONST {
+    if tag == tags::CONST {
         source.push_str("    const M1ValueDesc out = descriptors[p.o0];\n");
         source.push_str("    for (m1_u32 i = threadIdx.x; i < out.len; i += blockDim.x) {\n");
         let _ = writeln!(
@@ -439,16 +450,16 @@ fn emit_body(
         );
         let _ = writeln!(source, "      else m1_store_b({o0}, i, p.lit_bits != 0u);");
         source.push_str("    }\n");
-    } else if matches!(tag, OP_CHAN_TAKE | OP_CHAN_READ) {
+    } else if matches!(tag, tags::CHAN_TAKE | tags::CHAN_READ) {
         source.push_str("    const M1ValueDesc out = descriptors[p.o0];\n");
         let _ = writeln!(
             source,
             "    ptir_parallel_copy({a0}, {o0}, out.len, out.dtype);"
         );
-    } else if tag == OP_CHAN_PUT {
+    } else if tag == tags::CHAN_PUT {
         emit_chan_put(source, op, a0, o0);
-    } else if tag == OP_INTRINSIC_VAL {
-        if op.intr == INTR_LAYER || op.intr == INTR_MTP_DRAFTS {
+    } else if tag == tags::INTRINSIC_VAL {
+        if op.intr == intrinsic_tags::LAYER || op.intr == intrinsic_tags::MTP_DRAFTS {
             fallback(source);
         } else {
             let _ = writeln!(
@@ -456,23 +467,23 @@ fn emit_body(
                 "    ptir_parallel_intrinsic({a0}, {o0}, descriptors[p.o0], p);"
             );
         }
-    } else if tag == OP_BROADCAST {
+    } else if tag == tags::BROADCAST {
         let _ = writeln!(
             source,
             "    ptir_parallel_broadcast({a0}, {o0}, descriptors[p.a0], descriptors[p.o0]);"
         );
-    } else if tag == OP_RESHAPE {
+    } else if tag == tags::RESHAPE {
         source.push_str("    const M1ValueDesc out = descriptors[p.o0];\n");
         let _ = writeln!(
             source,
             "    ptir_parallel_copy({a0}, {o0}, out.len, out.dtype);"
         );
-    } else if tag == OP_TRANSPOSE {
+    } else if tag == tags::TRANSPOSE {
         let _ = writeln!(
             source,
             "    ptir_parallel_transpose(&status, {a0}, {o0}, descriptors[p.a0], descriptors[p.o0]);"
         );
-    } else if matches!(tag, OP_REDUCE_SUM | OP_REDUCE_MAX | OP_REDUCE_MIN) {
+    } else if matches!(tag, tags::REDUCE_SUM | tags::REDUCE_MAX | tags::REDUCE_MIN) {
         if stage.normalized.value_types[op.args[0] as usize].dtype as u8 == DT_F32 {
             let _ = writeln!(
                 source,
@@ -481,7 +492,7 @@ fn emit_body(
         } else {
             fallback(source);
         }
-    } else if tag == OP_REDUCE_ARGMAX {
+    } else if tag == tags::REDUCE_ARGMAX {
         if direct_intrinsic[node] != u16::MAX {
             let _ = writeln!(
                 source,
@@ -503,12 +514,12 @@ fn emit_body(
                 "    ptir_fast_argmax({a0}, {o0}, descriptors[p.a0]);"
             );
         }
-    } else if matches!(tag, OP_GATHER | OP_GATHER_ROW) {
+    } else if matches!(tag, tags::GATHER | tags::GATHER_ROW) {
         let _ = writeln!(
             source,
             "    ptir_parallel_gather({tag}u, {a0}, {a1}, {o0}, descriptors[p.a0], descriptors[p.a1], descriptors[p.o0]);"
         );
-    } else if matches!(tag, OP_SCATTER_ADD | OP_SCATTER_SET) {
+    } else if matches!(tag, tags::SCATTER_ADD | tags::SCATTER_SET) {
         let _ = writeln!(
             source,
             "    ptir_parallel_copy({a0}, {o0}, descriptors[p.a0].len, descriptors[p.a0].dtype);"
@@ -518,12 +529,12 @@ fn emit_body(
             source,
             "    if (threadIdx.x == 0u) ptir_scatter_updates({tag}u, {a1}, {a2}, {o0}, descriptors[p.a0], descriptors[p.a1], descriptors[p.a2]);"
         );
-    } else if tag == OP_PIVOT_THRESHOLD && op.pred_tag == 1 {
+    } else if tag == tags::PIVOT_THRESHOLD && op.pred_tag == 1 {
         let _ = writeln!(
             source,
             "    ptir_parallel_pivot_cummass({a0}, {a1}, {o0}, descriptors[p.a0], descriptors[p.a1]);"
         );
-    } else if tag == OP_PIVOT_THRESHOLD {
+    } else if tag == tags::PIVOT_THRESHOLD {
         let _ = writeln!(
             source,
             "    ptir_parallel_pivot({a0}, {a1}, {o0}, descriptors[p.a0], descriptors[p.a1], p);"

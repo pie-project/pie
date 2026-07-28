@@ -248,6 +248,17 @@ enum PtirChannelClass : uint8_t { PTIR_CHAN_FULL_RING = 0, PTIR_CHAN_IN_PLACE = 
 #define PTIR_SINK_LORA "lora" // scope 0
 #define PTIR_SINK_MINFERENCE_SPARSE "minference_sparse" // scope 0
 
+// ── backend emitter identity ──
+// Each driver keys its compiled-module disk cache on the emitter version of the
+// backend it loads, so a change to emitted source that does not bump these will
+// silently reuse a stale cubin/metallib. They are emitted here rather than
+// retyped in the drivers precisely because the two copies cannot be compared at
+// runtime -- the mismatch shows up as a wrong answer, not as an error.
+#define PTIR_CUDA_EMITTER_VERSION 19
+#define PTIR_METAL_M1_EMITTER_VERSION 23
+#define PTIR_METAL_M1_MAX_CHANNELS 29
+#define PTIR_METAL_M2_MAX_FUSED_CHANNELS 12
+
 // ── numeric contract (T8 replay determinism; golden interp is normative) ──
 // argmax: lower index wins ties; NaN never selected (all-NaN row -> index 0).
 // sort_desc/top_k: descending, ties -> lower original index first; NaN sorts below -inf.

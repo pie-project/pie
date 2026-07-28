@@ -1319,8 +1319,16 @@ fn encode_planned_op(bytes: &mut Vec<u8>, op: &Op, result_type: Option<&Symbolic
 }
 
 fn singleton_partition(stage: &NormalizedStage) -> RegionPartition {
+    let index = StageIndex::of(stage);
     let regions = (0..stage.ops.len())
-        .map(|node| build_region(stage, vec![node as u32], region_kind_for_node(stage, node)))
+        .map(|node| {
+            build_region(
+                stage,
+                &index,
+                vec![node as u32],
+                region_kind_for_node(stage, node),
+            )
+        })
         .collect();
     RegionPartition {
         kind: PartitionKind::Singleton,
@@ -1697,6 +1705,7 @@ fn symbolic_dims_match_expected(
 }
 
 fn fused_partition(stage: &NormalizedStage, library_matches: &[LibraryMatch]) -> RegionPartition {
+    let index = StageIndex::of(stage);
     let matched_nodes: BTreeSet<u32> = library_matches
         .iter()
         .flat_map(|candidate| candidate.nodes.iter().copied())
@@ -1714,28 +1723,28 @@ fn fused_partition(stage: &NormalizedStage, library_matches: &[LibraryMatch]) ->
     let mut generated = Vec::new();
     for node in 0..stage.ops.len() as u32 {
         if matched_nodes.contains(&node) {
-            flush_generated_region(stage, &mut regions, &mut generated);
+            flush_generated_region(stage, &index, &mut regions, &mut generated);
             if let Some(candidate) = matches_by_end.get(&node) {
-                regions.push(build_library_match_region(stage, candidate));
+                regions.push(build_library_match_region(stage, &index, candidate));
             }
             continue;
         }
 
         let kind = region_kind_for_node(stage, node as usize);
         if matches!(kind, RegionKind::Library(_)) {
-            flush_generated_region(stage, &mut regions, &mut generated);
-            regions.push(build_region(stage, vec![node], kind));
+            flush_generated_region(stage, &index, &mut regions, &mut generated);
+            regions.push(build_region(stage, &index, vec![node], kind));
             continue;
         }
 
         if generated.first().is_some_and(|first| {
             !compatible_schedule(&stage.ops[*first as usize], &stage.ops[node as usize])
         }) {
-            flush_generated_region(stage, &mut regions, &mut generated);
+            flush_generated_region(stage, &index, &mut regions, &mut generated);
         }
         generated.push(node);
     }
-    flush_generated_region(stage, &mut regions, &mut generated);
+    flush_generated_region(stage, &index, &mut regions, &mut generated);
     RegionPartition {
         kind: PartitionKind::Fused,
         regions,
@@ -1745,21 +1754,28 @@ fn fused_partition(stage: &NormalizedStage, library_matches: &[LibraryMatch]) ->
 
 fn flush_generated_region(
     stage: &NormalizedStage,
+    index: &StageIndex,
     regions: &mut Vec<Region>,
     nodes: &mut Vec<u32>,
 ) {
     if !nodes.is_empty() {
         regions.push(build_region(
             stage,
+            index,
             core::mem::take(nodes),
             RegionKind::Generated,
         ));
     }
 }
 
-fn build_library_match_region(stage: &NormalizedStage, candidate: &LibraryMatch) -> Region {
+fn build_library_match_region(
+    stage: &NormalizedStage,
+    index: &StageIndex,
+    candidate: &LibraryMatch,
+) -> Region {
     let mut region = build_region(
         stage,
+        index,
         candidate.nodes.clone(),
         RegionKind::Library(candidate.library),
     );
@@ -1792,15 +1808,54 @@ fn compatible_schedule(first: &Op, next: &Op) -> bool {
     )
 }
 
-fn build_region(stage: &NormalizedStage, nodes: Vec<u32>, kind: RegionKind) -> Region {
-    let node_set: BTreeSet<u32> = nodes.iter().copied().collect();
-    let (bases, producer) = result_layout(&stage.ops);
-    let mut consumers: Vec<Vec<u32>> = vec![Vec::new(); stage.value_types.len()];
-    for (node, op) in stage.ops.iter().enumerate() {
-        for operand in op.operands() {
-            consumers[operand as usize].push(node as u32);
+/// A stage's SSA layout and consumer map, computed once.
+///
+/// `build_region` used to recompute `result_layout` and rebuild the whole
+/// consumer map on every call, and `singleton_partition` calls it once per op
+/// — so partitioning an N-op stage did N passes over N ops. That is a clean
+/// quadratic: 128 ops planned in 1.2 ms, 1024 in 65 ms, 4096 in 1.1 s, with
+/// `singleton_partition` accounting for >95% of it. Since a stage body is
+/// bounded only by the container length, and the container is guest-supplied,
+/// the curve was reachable from untrusted input. Hoisting the two tables out
+/// of the loop makes partitioning linear.
+struct StageIndex {
+    /// First SSA id each op defines.
+    bases: Vec<u32>,
+    /// Op index that defines each SSA id.
+    producer: Vec<usize>,
+    /// Op indices reading each SSA id.
+    consumers: Vec<Vec<u32>>,
+}
+
+impl StageIndex {
+    fn of(stage: &NormalizedStage) -> Self {
+        let (bases, producer) = result_layout(&stage.ops);
+        let mut consumers: Vec<Vec<u32>> = vec![Vec::new(); stage.value_types.len()];
+        for (node, op) in stage.ops.iter().enumerate() {
+            for operand in op.operands() {
+                consumers[operand as usize].push(node as u32);
+            }
+        }
+        Self {
+            bases,
+            producer,
+            consumers,
         }
     }
+}
+
+fn build_region(
+    stage: &NormalizedStage,
+    index: &StageIndex,
+    nodes: Vec<u32>,
+    kind: RegionKind,
+) -> Region {
+    let node_set: BTreeSet<u32> = nodes.iter().copied().collect();
+    let StageIndex {
+        bases,
+        producer,
+        consumers,
+    } = index;
 
     let mut inputs = BTreeSet::new();
     let mut outputs = BTreeSet::new();
@@ -1898,12 +1953,13 @@ pub fn encode_stage_plan(stage: &CompiledStage) -> Vec<u8> {
     }
 
     put_u32(&mut bytes, stage.normalized.ops.len() as u32);
+    // `result_layout` once, not a prefix sum re-walked per op: the inline
+    // `ops[..op_index].map(result_count).sum()` this replaces made encoding
+    // quadratic in the op count, on the same curve as `build_region`.
+    let (result_bases, _) = result_layout(&stage.normalized.ops);
     for (op_index, op) in stage.normalized.ops.iter().enumerate() {
         let mut encoded = Vec::new();
-        let result_base = stage.normalized.ops[..op_index]
-            .iter()
-            .map(Op::result_count)
-            .sum::<u32>() as usize;
+        let result_base = result_bases[op_index] as usize;
         encode_planned_op(
             &mut encoded,
             op,

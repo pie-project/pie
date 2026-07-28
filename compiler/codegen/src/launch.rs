@@ -22,6 +22,7 @@ use pie_driver_abi::plan::{
     LaunchChannel, LaunchChannelRule, LaunchOp, LaunchPackage, LaunchPlanValue, LaunchPort,
     LaunchPut, LaunchRegion, LaunchStage, LaunchStagePlan, LaunchValue,
 };
+use pie_ir::op::{intrinsic_tags, tags};
 use pie_ir::DType;
 use pie_ir::container::{ExternDir, HostRole, PortSource};
 use pie_ir::types::ValueType;
@@ -36,19 +37,6 @@ use crate::op_view::OpView;
 // Op tags and enum values shared with the generated ABI header
 // (`compiler/codegen/include/ptir_abi.h`). Named rather than inlined so the
 // mapping below reads like the container's own op table.
-const OP_CONST: u8 = 0x81;
-const OP_CHAN_TAKE: u8 = 0x90;
-const OP_CHAN_READ: u8 = 0x91;
-const OP_CHAN_PUT: u8 = 0x92;
-const OP_INTRINSIC_VAL: u8 = 0xA0;
-const OP_KERNEL_CALL: u8 = 0xA1;
-const OP_SINK_CALL: u8 = 0xA2;
-
-const INTR_LOGITS: u16 = 0;
-const INTR_MTP_LOGITS: u16 = 1;
-const INTR_QUERY: u16 = 3;
-const INTR_LAYER: u16 = 5;
-const INTR_ATTN_SCORE: u16 = 7;
 
 /// Value sources, mirroring `PIE_VALUE_*`.
 const VALUE_CONST: u8 = 0;
@@ -126,11 +114,11 @@ fn lower_values(bound: &BoundTrace) -> Vec<LaunchValue> {
         for op in &program.ops {
             let view = OpView::of(op);
             match view.tag {
-                OP_CHAN_TAKE | OP_CHAN_READ => {
+                tags::CHAN_TAKE | tags::CHAN_READ => {
                     push(
                         local,
                         LaunchValue {
-                            source: if view.tag == OP_CHAN_TAKE {
+                            source: if view.tag == tags::CHAN_TAKE {
                                 VALUE_CHANNEL_TAKE
                             } else {
                                 VALUE_CHANNEL_READ
@@ -141,7 +129,7 @@ fn lower_values(bound: &BoundTrace) -> Vec<LaunchValue> {
                     );
                     local += 1;
                 }
-                OP_CONST => {
+                tags::CONST => {
                     push(
                         local,
                         LaunchValue {
@@ -152,7 +140,7 @@ fn lower_values(bound: &BoundTrace) -> Vec<LaunchValue> {
                     );
                     local += 1;
                 }
-                OP_INTRINSIC_VAL => {
+                tags::INTRINSIC_VAL => {
                     push(
                         local,
                         LaunchValue {
@@ -163,7 +151,7 @@ fn lower_values(bound: &BoundTrace) -> Vec<LaunchValue> {
                     );
                     local += 1;
                 }
-                OP_CHAN_PUT | OP_SINK_CALL => {}
+                tags::CHAN_PUT | tags::SINK_CALL => {}
                 _ => {
                     for result in 0..view.results {
                         push(
@@ -292,16 +280,16 @@ fn lower_stages(bound: &BoundTrace) -> Vec<LaunchStage> {
         for op in &program.ops {
             let view = OpView::of(op);
             match view.tag {
-                OP_CHAN_TAKE | OP_CHAN_READ => {
-                    if view.tag == OP_CHAN_TAKE {
+                tags::CHAN_TAKE | tags::CHAN_READ => {
+                    if view.tag == tags::CHAN_TAKE {
                         stage.takes.push(view.chan as u32);
                     } else {
                         stage.reads.push(view.chan as u32);
                     }
                     local += 1;
                 }
-                OP_CONST | OP_INTRINSIC_VAL => local += 1,
-                OP_CHAN_PUT => stage.puts.push(LaunchPut {
+                tags::CONST | tags::INTRINSIC_VAL => local += 1,
+                tags::CHAN_PUT => stage.puts.push(LaunchPut {
                     channel: view.chan as u32,
                     value: global(view.args[0]),
                 }),
@@ -496,24 +484,24 @@ impl GroupedPlan {
             // lane-binding metadata the fused path resolves through, so it
             // describes the op rather than rejecting it. `requires_query` is
             // set because the kernel consumes the lane's post-rope query row.
-            if op.tag == OP_KERNEL_CALL {
+            if op.tag == tags::KERNEL_CALL {
                 plan.flags |= REQUIRES_QUERY | REQUIRES_KERNEL_CALL;
                 continue;
             }
             // `attn_page_mask` is grouped-walkable but only fused-executable.
             // Described here for the same reason.
-            if op.tag == OP_SINK_CALL {
+            if op.tag == tags::SINK_CALL {
                 plan.flags |= REQUIRES_PAGE_MASK;
             }
             if !grouped_supported_tag(op.tag) {
                 return plan.invalid("stage contains an unsupported grouped op");
             }
-            if op.tag == OP_INTRINSIC_VAL {
+            if op.tag == tags::INTRINSIC_VAL {
                 match op.intr {
-                    INTR_QUERY => plan.flags |= REQUIRES_QUERY,
-                    INTR_LAYER => plan.flags |= REQUIRES_LAYER,
-                    INTR_ATTN_SCORE => plan.flags |= REQUIRES_ATTN_SCORE,
-                    INTR_MTP_LOGITS => {
+                    intrinsic_tags::QUERY => plan.flags |= REQUIRES_QUERY,
+                    intrinsic_tags::LAYER => plan.flags |= REQUIRES_LAYER,
+                    intrinsic_tags::ATTN_SCORE => plan.flags |= REQUIRES_ATTN_SCORE,
+                    intrinsic_tags::MTP_LOGITS => {
                         let value = value_bases[node] as usize;
                         let rows = match value_types.get(value).map(|ty| ty.dims.as_slice()) {
                             Some([Dimension::Static(rows), _]) => *rows,
@@ -527,14 +515,14 @@ impl GroupedPlan {
                         plan.flags |= REQUIRES_MTP_ROWS;
                         plan.mtp_rows = rows;
                     }
-                    INTR_LOGITS => {}
+                    intrinsic_tags::LOGITS => {}
                     _ => return plan.invalid("stage uses an unsupported intrinsic"),
                 }
             }
 
             let value = match op.tag {
-                OP_CHAN_TAKE | OP_CHAN_READ => value_bases[node],
-                OP_CHAN_PUT if !op.args.is_empty() => op.args[0],
+                tags::CHAN_TAKE | tags::CHAN_READ => value_bases[node],
+                tags::CHAN_PUT if !op.args.is_empty() => op.args[0],
                 _ => continue,
             };
             if value as usize >= value_types.len()
@@ -564,23 +552,44 @@ impl GroupedPlan {
 /// Whether a generic grouped op can cover this tag. The list is the grouped
 /// interpreter's own coverage: everything except `kernel_call`, which names a
 /// second-party kernel only the fused path can launch.
+/// Ops the grouped runtime has no body for. Everything else in
+/// [`pie_ir::op::OP_TABLE`] is emittable.
+///
+/// This used to be a list of raw hex ranges (`0x01..=0x07 | 0x10..=0x20 | ...`).
+/// The gaps between those ranges are exactly where new op tags go, so a new op
+/// was silently classified unsupported — no compile error, no test failure,
+/// just a stage that stopped taking the grouped path. Asking the op table
+/// closes the gaps; `grouped_classification_is_exhaustive` makes a new op
+/// force a decision here.
+const GROUPED_UNSUPPORTED: &[u8] = &[tags::KERNEL_CALL];
+
 fn grouped_supported_tag(tag: u8) -> bool {
-    matches!(
-        tag,
-        // unary
-        0x01..=0x07
-        // binary + select
-        | 0x10..=0x20
-        // reductions, shape ops, scans
-        | 0x30..=0x33 | 0x38..=0x3A | 0x40 | 0x41
-        // order + matmul
-        | 0x50 | 0x51 | 0x55 | 0x58
-        // gather/scatter, iota, masks
-        | 0x60..=0x68
-        // rng
-        | 0x70 | 0x71
-        // const, channels, intrinsics, sinks
-        | OP_CONST | OP_CHAN_TAKE | OP_CHAN_READ | OP_CHAN_PUT
-        | OP_INTRINSIC_VAL | OP_SINK_CALL
-    )
+    pie_ir::op::spec(tag).is_some() && !GROUPED_UNSUPPORTED.contains(&tag)
+}
+
+#[cfg(test)]
+mod grouped_coverage {
+    use super::*;
+
+    /// A tripwire, not a tautology: bump the count only together with a
+    /// decision about whether the grouped runtime can emit the new op, and
+    /// with `GROUPED_UNSUPPORTED` updated if it cannot.
+    #[test]
+    fn grouped_classification_is_exhaustive() {
+        assert_eq!(
+            pie_ir::op::OP_TABLE.len(),
+            55,
+            "a new op landed in OP_TABLE — decide whether the grouped runtime \
+             has a body for it, update GROUPED_UNSUPPORTED if not, then bump \
+             this count"
+        );
+        for tag in GROUPED_UNSUPPORTED {
+            assert!(
+                pie_ir::op::spec(*tag).is_some(),
+                "GROUPED_UNSUPPORTED names a tag that is not an op"
+            );
+            assert!(!grouped_supported_tag(*tag));
+        }
+        assert!(!grouped_supported_tag(0xFF), "a non-op tag is not supported");
+    }
 }

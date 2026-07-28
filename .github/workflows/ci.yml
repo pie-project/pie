@@ -43,6 +43,17 @@ jobs:
           cargo test -p pie --lib
           cargo test -p pie-client --lib
 
+      # `pie-ir` and `pie-plan` declare `#![no_std]` behind `not(feature =
+      # "std")` and the wasm SDK depends on them that way, but nothing ever
+      # built that configuration -- the `std` prelude was covering a missing
+      # `alloc::string::String` import, so `--no-default-features` had been
+      # broken without failing anything. A declared `no_std` that is never
+      # compiled is not a `no_std` crate.
+      - name: cargo check (compiler IR core, no_std)
+        run: |
+          cargo check -p pie-ir --no-default-features
+          cargo check -p pie-plan --no-default-features
+
   # Full-workspace verification — the guardrail + anti-bitrot net. Closes the
   # gap that let the runtime benches rot unseen: the dedicated jobs only build a
   # curated subset, so new crates (`pie-transport`) and the benches were

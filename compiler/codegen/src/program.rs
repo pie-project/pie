@@ -17,6 +17,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
+use pie_ir::op::tags;
 use pie_ir::validate::BoundTrace;
 use pie_plan::{CompiledStage, LibraryOp, Region, RegionKind};
 
@@ -275,7 +276,7 @@ fn grouped_library(stage: &CompiledStage, region: &Region) -> Option<LibraryOp> 
             // kernel that would read the wrong operands.
             let node = *region.nodes.first()? as usize;
             let op = stage.normalized.ops.get(node)?;
-            (crate::op_view::OpView::of(op).tag == crate::metal::validate::OP_TOP_K)
+            (crate::op_view::OpView::of(op).tag == tags::TOP_K)
                 .then_some(LibraryOp::TopK)
         }
         _ => None,
