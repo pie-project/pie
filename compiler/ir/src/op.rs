@@ -483,6 +483,88 @@ impl Op {
         }
     }
 
+    /// Where this op's result comes from — the question host partial
+    /// evaluation asks, and **not** the question [`Self::is_effectful`]
+    /// answers.
+    ///
+    /// The two disagree, on purpose, about [`Op::Rng`]: within one fire it is
+    /// a function of its stream and shape, so CSE may merge two of them and
+    /// `is_effectful` says `false`; but the ambient seed it draws from is a
+    /// per-fire *device* fact, so the host cannot produce its value and this
+    /// says [`ValueSource::Device`]. Purity and derivability are different
+    /// properties and an op can have either without the other.
+    ///
+    /// Exhaustive on purpose, and the only copy. A pass that decides "can the
+    /// host compute this?" must ask here rather than restate the variant list:
+    /// a wrong answer does not fail to compile, it schedules a pass that
+    /// cannot run, or refuses one that can.
+    pub fn value_source(&self) -> ValueSource {
+        match self {
+            // The device decides these at their source, whatever their
+            // operands. `SinkCall` defines no results, so nothing reads its
+            // answer; it is grouped here because it is likewise not something
+            // the host can perform.
+            Op::KernelCall { .. }
+            | Op::IntrinsicVal { .. }
+            | Op::SinkCall { .. }
+            | Op::Rng { .. } => ValueSource::Device,
+
+            Op::ChanTake(..) | Op::ChanRead(..) | Op::ChanPut { .. } => ValueSource::Channel,
+
+            // `RngKeyed` is here on purpose: PTIR-CONTAINER.md pins it as a
+            // pure function of its `state` operand, so replaying the state
+            // replays the noise.
+            Op::Const(..)
+            | Op::Exp(..)
+            | Op::Log(..)
+            | Op::Neg(..)
+            | Op::Recip(..)
+            | Op::Abs(..)
+            | Op::Sign(..)
+            | Op::Cast { .. }
+            | Op::Add(..)
+            | Op::Sub(..)
+            | Op::Mul(..)
+            | Op::Div(..)
+            | Op::MaxElem(..)
+            | Op::MinElem(..)
+            | Op::Rem(..)
+            | Op::Gt(..)
+            | Op::Ge(..)
+            | Op::Eq(..)
+            | Op::Ne(..)
+            | Op::Lt(..)
+            | Op::Le(..)
+            | Op::And(..)
+            | Op::Or(..)
+            | Op::Not(..)
+            | Op::Select { .. }
+            | Op::ReduceSum(..)
+            | Op::ReduceMax(..)
+            | Op::ReduceMin(..)
+            | Op::ReduceArgmax(..)
+            | Op::Broadcast { .. }
+            | Op::Reshape { .. }
+            | Op::Transpose(..)
+            | Op::CumSum(..)
+            | Op::CumProd(..)
+            | Op::SortDesc(..)
+            | Op::TopK { .. }
+            | Op::PivotThreshold { .. }
+            | Op::MatMul(..)
+            | Op::Gather { .. }
+            | Op::GatherRow { .. }
+            | Op::ScatterAdd { .. }
+            | Op::ScatterSet { .. }
+            | Op::Iota { .. }
+            | Op::MaskApply { .. }
+            | Op::CausalMask { .. }
+            | Op::SlidingWindowMask { .. }
+            | Op::SinkWindowMask { .. }
+            | Op::RngKeyed { .. } => ValueSource::Operands,
+        }
+    }
+
     /// The value ids this op reads, in a stable order (immediates excluded;
     /// the value-id predicate operands of `PivotThreshold` included).
     pub fn operands(&self) -> Vec<ValueId> {
@@ -703,6 +785,19 @@ impl Op {
             Op::SinkCall { .. } => tags::SINK_CALL,
         }
     }
+}
+
+/// Where an op's result comes from, as [`Op::value_source`] answers it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ValueSource {
+    /// The device decides it: a second-party kernel, a device intrinsic, or
+    /// the ambient RNG seed. No amount of host-known input produces it.
+    Device,
+    /// A channel's contents decide it, so the answer depends on what the host
+    /// knows about that channel rather than on the op.
+    Channel,
+    /// A pure function of its operands: host-derivable exactly when they are.
+    Operands,
 }
 
 /// Op family (the overview appendix's row grouping).
