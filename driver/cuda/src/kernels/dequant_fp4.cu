@@ -105,14 +105,23 @@ __device__ __forceinline__ float mxfp4_block_scale(std::uint8_t b) {
                   : __int_as_float(static_cast<int>(b) << 23);
 }
 
-// One warp per (route, intermediate row). Each warp walks the row's packed
-// words with a stride of 32, accumulating in fp16 pairs and folding the
-// block scale in once per 32-element group -- exact, because the scale is
-// constant across the group, and it keeps the promotion to fp32 at one per
-// group so error cannot walk down the row.
+// One warp per (route, slab of output rows). Each lane owns whole 32-element
+// scale groups and loads them as a `uint4`: one group is exactly 16 packed
+// bytes, so the widest possible load lines up with the smallest unit the
+// scale is constant over. That constancy is also why the block scale can be
+// folded in once per group in fp32 -- it keeps the fp16 accumulation depth
+// at four and stops error walking down the row.
 //
-// gate and up are two rows of the *same* packed tensor (2i and 2i+1), so
-// one warp covers both and the expert's base pointers are loaded once.
+// The slab exists because the activation is re-read by every output row.
+// One row per warp made the activation loads a third of the instruction
+// stream and pinned `down` at 1.8 TB/s; four rows amortise each activation
+// `float4` over four weight `uint4`s and take it to 3.3 TB/s. Going wider
+// still helps at high route counts but starts losing at low ones, where
+// there are no longer enough blocks to fill the machine.
+//
+// gate and up are adjacent rows of the *same* packed tensor (2i and 2i+1),
+// so a slab of kPairs intermediate rows is 2*kPairs contiguous rows and
+// needs no gather.
 __global__ void mxfp4_moe_gate_up_decode_kernel(
     const __half* __restrict__ act,
     const std::int32_t* __restrict__ topk_idx,
@@ -126,11 +135,14 @@ __global__ void mxfp4_moe_gate_up_decode_kernel(
     int hidden,
     int intermediate)
 {
+    constexpr int kPairs = 2;                      // intermediate rows per warp
+    constexpr int kRows = 2 * kPairs;              // packed rows per warp
     const int route = blockIdx.x;
     const int warp_in_block = threadIdx.x >> 5;
     const int lane_id = threadIdx.x & 31;
-    const int row = blockIdx.y * (blockDim.x >> 5) + warp_in_block;
-    if (row >= intermediate) return;
+    const int row0 =
+        (blockIdx.y * (blockDim.x >> 5) + warp_in_block) * kPairs;
+    if (row0 >= intermediate) return;
     const int token = route / top_k;
     const int expert = topk_idx[route];
 
@@ -139,63 +151,92 @@ __global__ void mxfp4_moe_gate_up_decode_kernel(
 
     const int words_per_row = hidden / 8;          // 8 codes per 32-bit word
     const int groups_per_row = hidden / 32;
-    constexpr int kWordsPerGroup = 4;              // 32 codes / 8 per word
-    const long long gate_base =
-        static_cast<long long>(2 * row) * words_per_row;
-    const long long up_base = gate_base + words_per_row;
-    const long long gate_scale_base =
-        static_cast<long long>(2 * row) * groups_per_row;
-    const long long up_scale_base = gate_scale_base + groups_per_row;
+    // A slab can overhang the tail when `intermediate` is not a multiple of
+    // kPairs. Clamp the overhanging rows onto the last real one: their
+    // results are discarded at store time, and the alternative -- letting
+    // the loads run past the tensor -- is an out-of-bounds read.
+    int row_of[kRows];
+#pragma unroll
+    for (int p = 0; p < kPairs; ++p) {
+        const int r = min(row0 + p, intermediate - 1);
+        row_of[2 * p] = 2 * r;
+        row_of[2 * p + 1] = 2 * r + 1;
+    }
 
     const unsigned* w32 = reinterpret_cast<const unsigned*>(packed);
     const float4* x4 = reinterpret_cast<const float4*>(
         act + static_cast<long long>(token) * hidden);
 
-    float gate_acc = 0.f;
-    float up_acc = 0.f;
-    for (int word_col = lane_id; word_col < words_per_row; word_col += 32) {
-        __half2 xp[4], gq[4], uq[4];
-        const float4 xv = x4[word_col];
-        const unsigned* xu = reinterpret_cast<const unsigned*>(&xv);
+    // Row r of the warp's slab is gate row (row0+r/2) for even r and its up
+    // row for odd r -- the interleaving HF ships, so the whole slab is
+    // 2*kPairs contiguous rows and no gather is needed.
+    float acc[kRows];
 #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            xp[j] = *reinterpret_cast<const __half2*>(&xu[j]);
-        }
-        mxfp4_unpack8(w32[gate_base + word_col], gq);
-        mxfp4_unpack8(w32[up_base + word_col], uq);
-        __half2 gsum = __float2half2_rn(0.f);
-        __half2 usum = gsum;
+    for (int r = 0; r < kRows; ++r) acc[r] = 0.f;
+    const uint4* wq = reinterpret_cast<const uint4*>(w32);
+    for (int g = lane_id; g < groups_per_row; g += 32) {
+        uint4 ww[kRows];
 #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            gsum = __hfma2(gq[j], xp[j], gsum);
-            usum = __hfma2(uq[j], xp[j], usum);
+        for (int r = 0; r < kRows; ++r)
+            ww[r] = wq[static_cast<long long>(row_of[r]) *
+                       (words_per_row >> 2) + g];
+        __half2 sum[kRows];
+#pragma unroll
+        for (int r = 0; r < kRows; ++r) sum[r] = __float2half2_rn(0.f);
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            __half2 xp[4];
+            const float4 xv = x4[g * 4 + q];
+            const unsigned* xu = reinterpret_cast<const unsigned*>(&xv);
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+                xp[j] = *reinterpret_cast<const __half2*>(&xu[j]);
+#pragma unroll
+            for (int r = 0; r < kRows; ++r) {
+                __half2 qd[4];
+                mxfp4_unpack8((&ww[r].x)[q], qd);
+#pragma unroll
+                for (int j = 0; j < 4; ++j)
+                    sum[r] = __hfma2(qd[j], xp[j], sum[r]);
+            }
         }
-        const int group = word_col / kWordsPerGroup;
-        const float2 gf = __half22float2(gsum);
-        const float2 uf = __half22float2(usum);
-        gate_acc = fmaf(gf.x + gf.y,
-                        mxfp4_block_scale(scales[gate_scale_base + group]),
-                        gate_acc);
-        up_acc = fmaf(uf.x + uf.y,
-                      mxfp4_block_scale(scales[up_scale_base + group]),
-                      up_acc);
+#pragma unroll
+        for (int r = 0; r < kRows; ++r) {
+            const float2 f = __half22float2(sum[r]);
+            acc[r] = fmaf(f.x + f.y,
+                mxfp4_block_scale(scales[
+                    static_cast<long long>(row_of[r]) * groups_per_row + g]),
+                acc[r]);
+        }
     }
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
-        gate_acc += __shfl_xor_sync(0xffffffffu, gate_acc, off);
-        up_acc += __shfl_xor_sync(0xffffffffu, up_acc, off);
+#pragma unroll
+        for (int r = 0; r < kRows; ++r)
+            acc[r] += __shfl_xor_sync(0xffffffffu, acc[r], off);
     }
     if (lane_id == 0) {
-        if (gate_bias_ptrs != nullptr) {
-            gate_acc += __bfloat162float(
-                static_cast<const __nv_bfloat16*>(gate_bias_ptrs[expert])[row]);
-            up_acc += __bfloat162float(
-                static_cast<const __nv_bfloat16*>(up_bias_ptrs[expert])[row]);
+        const auto* gb = gate_bias_ptrs != nullptr
+            ? static_cast<const __nv_bfloat16*>(gate_bias_ptrs[expert])
+            : nullptr;
+        const auto* ub = gate_bias_ptrs != nullptr
+            ? static_cast<const __nv_bfloat16*>(up_bias_ptrs[expert])
+            : nullptr;
+#pragma unroll
+        for (int p = 0; p < kPairs; ++p) {
+            const int row = row0 + p;
+            if (row >= intermediate) break;
+            float gv = acc[2 * p];
+            float uv = acc[2 * p + 1];
+            if (gb != nullptr) {
+                gv += __bfloat162float(gb[row]);
+                uv += __bfloat162float(ub[row]);
+            }
+            const long long o =
+                static_cast<long long>(route) * intermediate + row;
+            gate_out[o] = __float2bfloat16(gv);
+            up_out[o] = __float2bfloat16(uv);
         }
-        const long long out_idx =
-            static_cast<long long>(route) * intermediate + row;
-        gate_out[out_idx] = __float2bfloat16(gate_acc);
-        up_out[out_idx] = __float2bfloat16(up_acc);
     }
 }
 
@@ -209,11 +250,13 @@ __global__ void mxfp4_moe_down_decode_kernel(
     int hidden,
     int intermediate)
 {
+    constexpr int kRows = 4;
     const int route = blockIdx.x;
     const int warp_in_block = threadIdx.x >> 5;
     const int lane_id = threadIdx.x & 31;
-    const int row = blockIdx.y * (blockDim.x >> 5) + warp_in_block;
-    if (row >= hidden) return;
+    const int row0 =
+        (blockIdx.y * (blockDim.x >> 5) + warp_in_block) * kRows;
+    if (row0 >= hidden) return;
     const int expert = topk_idx[route];
 
     const std::uint8_t* packed = packed_ptrs[expert];
@@ -221,45 +264,71 @@ __global__ void mxfp4_moe_down_decode_kernel(
 
     const int words_per_row = intermediate / 8;
     const int groups_per_row = intermediate / 32;
-    constexpr int kWordsPerGroup = 4;
-    const long long row_base = static_cast<long long>(row) * words_per_row;
-    const long long scale_base =
-        static_cast<long long>(row) * groups_per_row;
+    int row_of[kRows];
+#pragma unroll
+    for (int r = 0; r < kRows; ++r) row_of[r] = min(row0 + r, hidden - 1);
 
     const unsigned* w32 = reinterpret_cast<const unsigned*>(packed);
     const float4* x4 = reinterpret_cast<const float4*>(
         act + static_cast<long long>(route) * intermediate);
 
-    float acc = 0.f;
-    for (int word_col = lane_id; word_col < words_per_row; word_col += 32) {
-        __half2 xp[4], q[4];
-        const float4 xv = x4[word_col];
-        const unsigned* xu = reinterpret_cast<const unsigned*>(&xv);
+    float acc[kRows];
 #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            xp[j] = *reinterpret_cast<const __half2*>(&xu[j]);
+    for (int r = 0; r < kRows; ++r) acc[r] = 0.f;
+    const uint4* wq = reinterpret_cast<const uint4*>(w32);
+    for (int g = lane_id; g < groups_per_row; g += 32) {
+        uint4 ww[kRows];
+#pragma unroll
+        for (int r = 0; r < kRows; ++r)
+            ww[r] = wq[static_cast<long long>(row_of[r]) *
+                       (words_per_row >> 2) + g];
+        __half2 sum[kRows];
+#pragma unroll
+        for (int r = 0; r < kRows; ++r) sum[r] = __float2half2_rn(0.f);
+#pragma unroll
+        for (int qi = 0; qi < 4; ++qi) {
+            __half2 xp[4];
+            const float4 xv = x4[g * 4 + qi];
+            const unsigned* xu = reinterpret_cast<const unsigned*>(&xv);
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+                xp[j] = *reinterpret_cast<const __half2*>(&xu[j]);
+#pragma unroll
+            for (int r = 0; r < kRows; ++r) {
+                __half2 q[4];
+                mxfp4_unpack8((&ww[r].x)[qi], q);
+#pragma unroll
+                for (int j = 0; j < 4; ++j)
+                    sum[r] = __hfma2(q[j], xp[j], sum[r]);
+            }
         }
-        mxfp4_unpack8(w32[row_base + word_col], q);
-        __half2 sum = __float2half2_rn(0.f);
 #pragma unroll
-        for (int j = 0; j < 4; ++j) sum = __hfma2(q[j], xp[j], sum);
-        const int group = word_col / kWordsPerGroup;
-        const float2 f = __half22float2(sum);
-        acc = fmaf(f.x + f.y,
-                   mxfp4_block_scale(scales[scale_base + group]), acc);
+        for (int r = 0; r < kRows; ++r) {
+            const float2 f = __half22float2(sum[r]);
+            acc[r] = fmaf(f.x + f.y,
+                mxfp4_block_scale(scales[
+                    static_cast<long long>(row_of[r]) * groups_per_row + g]),
+                acc[r]);
+        }
     }
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
-        acc += __shfl_xor_sync(0xffffffffu, acc, off);
+#pragma unroll
+        for (int r = 0; r < kRows; ++r)
+            acc[r] += __shfl_xor_sync(0xffffffffu, acc[r], off);
     }
     if (lane_id == 0) {
-        if (bias_ptrs != nullptr) {
-            const auto* bias =
-                static_cast<const __nv_bfloat16*>(bias_ptrs[expert]);
-            acc += __bfloat162float(bias[row]);
+        const auto* bias = bias_ptrs != nullptr
+            ? static_cast<const __nv_bfloat16*>(bias_ptrs[expert]) : nullptr;
+#pragma unroll
+        for (int r = 0; r < kRows; ++r) {
+            const int row = row0 + r;
+            if (row >= hidden) break;
+            float v = acc[r];
+            if (bias != nullptr) v += __bfloat162float(bias[row]);
+            out[static_cast<long long>(route) * hidden + row] =
+                __float2bfloat16(v);
         }
-        out[static_cast<long long>(route) * hidden + row] =
-            __float2bfloat16(acc);
     }
 }
 
@@ -301,7 +370,9 @@ void launch_mxfp4_moe_gate_up_decode_bf16(
     }
     if (hidden % 32 != 0) return;
     const int warps = kMxfp4DecodeBlock / 32;
-    dim3 grid(num_tokens * top_k, (intermediate + warps - 1) / warps);
+    const int pairs_per_block = warps * 2;   // kPairs = 2 rows per warp
+    dim3 grid(num_tokens * top_k,
+              (intermediate + pairs_per_block - 1) / pairs_per_block);
     mxfp4_moe_gate_up_decode_kernel<<<grid, kMxfp4DecodeBlock, 0, stream>>>(
         static_cast<const __half*>(act_fp16), topk_idx,
         gate_up_packed, gate_up_scales, gate_bias, up_bias,
@@ -325,7 +396,10 @@ void launch_mxfp4_moe_down_decode_bf16(
     }
     if (intermediate % 32 != 0) return;
     const int warps = kMxfp4DecodeBlock / 32;
-    dim3 grid(num_tokens * top_k, (hidden + warps - 1) / warps);
+    const int rows_per_warp = 4;
+    const int rows_per_block = warps * rows_per_warp;
+    dim3 grid(num_tokens * top_k,
+              (hidden + rows_per_block - 1) / rows_per_block);
     mxfp4_moe_down_decode_kernel<<<grid, kMxfp4DecodeBlock, 0, stream>>>(
         static_cast<const __half*>(act_fp16), topk_idx,
         down_packed, down_scales, down_bias,
