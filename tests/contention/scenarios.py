@@ -149,29 +149,27 @@ SCENARIOS: list[Scenario] = [
     # the rebind escape applied unconditionally (`PIE_FRAME_REBIND_ESCAPE=1`)
     # this served 12/128 with 116 starvation kills.
     #
-    # The contract is deliberately liveness-only, not "serve the fleet
-    # whole". The shared prefix is ~60 pages and each process adds ~5 more,
-    # so a 64-wide fleet needs ~380 pages even when sharing perfectly — it
-    # cannot fit in 256, and killing most of it is the CORRECT outcome (see
-    # §20.5 on pie having no KV-aware admission control). Measured over four
-    # runs per mode at this size: mode 1 completed 16-24, mode 2 completed
-    # 31-59. The distributions touch, so a completion threshold here would
-    # be a flaky gate rather than a regression test; §20.3's A/B harness is
-    # what actually pins that difference. What must hold unconditionally is
-    # that the run terminates, every request is accounted for, eviction does
-    # not run away, and the pool is genuinely contended (`parks` > 0 — a good
-    # run serves the fleet whole, so `starved` cannot be required here).
+    # The fleet does NOT fit: the shared prefix is 61 pages, so a 256-page
+    # pool funds FOUR processes at a time out of 64. The correct outcome is
+    # that the other 60 PARK and are served in waves as holders retire — the
+    # whole 128 completes in ~8.5 s. It is not "kill most of the fleet":
+    # §20.17 traced the runs that killed 115 of 128 to a head-of-line wedge
+    # in the planner (an uncoverable 61-page head hoarding the 12 free pages
+    # that four 1-page asks needed), which is a defect, not the design. The
+    # contract is therefore the full fleet, and it is a real regression test
+    # for that rung — the bug reproduced roughly one run in three.
     Scenario(
         name="allshared_noswap",
-        target="AllShared + no swap; starvation rung under an unfundable fleet",
+        target="AllShared + no swap; head-of-line wedge under an unfundable fleet",
         args=["--total-pages", "256", "--swap-pool-size", "0",
               "--num-requests", "128", "--concurrency", "64",
               "--max-tokens", "64", "--shared-prefix-words", "900",
               "--no-unique-prompts"],
-        contract=Contract(max_wall_s=120, min_completed=8,
+        contract=Contract(max_wall_s=120, min_completed=128, max_failed=0,
                           require_counters=("parks",),
                           max_counters={"evict_rollbacks": _ROLLBACK_CAP}),
         warmup=1,
+        repeat=3,
     ),
     # ---- head's own held pages plus its ask exceed the pool ----------------
     Scenario(

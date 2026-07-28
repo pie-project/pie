@@ -3504,3 +3504,93 @@ has been admitted-and-unparked at least once since the head parked, rather
 than reading the instantaneous set. Until then `allshared_noswap` will keep
 flaking and, more importantly, a real cold-start fleet can be destroyed
 instead of queued.
+
+## §20.17 DONE — the wedge was HEAD-OF-LINE HOARDING, not a cold-start race
+
+§20.16's fix shape was WRONG and the evidence refuted it. The hypothesis was
+"at t=0 nobody is admitted yet, so `is_wedged` reads 'nobody is running' as
+'no completion can ever arrive'". `is_wedged`'s own doc already argues that
+exclusion is deliberate (counting an unadmitted process as relief is what let
+a `num_requests > max_concurrent_processes` fleet deadlock silently — the
+thing `admission_tail` guards), and the WEDGE-KILL post-mortem shows the
+opposite state entirely.
+
+EVIDENCE (PIE_CONTENTION_TRACE_MS on 4 runs of allshared_noswap; 3 failed
+with 116/116/117 kills, 1 passed with 0):
+
+  procs = 128 x Resident:prog=true          <- nothing unadmitted, nothing cold
+  queue = 64 waiters:  4 x need=1 , 60 x need=61
+  reclaim quotes: the 4 need=1 waiters are Some(Pages(61)) -- they are the
+                  page HOLDERS; the other 60 hold Nothing(HoldsNothing)
+  the 4 lines immediately before the kill are their parks, 576 us earlier:
+     park key=(2,60) kv=1 / (5,61) kv=1 / (3,63) kv=1 / (12,62) kv=1
+
+MECHANISM. 900-word shared prefix = 61 pages, so a 256-page pool funds FOUR
+of the 64-wide fleet: 244 used, 12 free. The four holders decode until each
+needs ONE more page and park. The instant the last one parks, no process is
+`admitted && !parked`, so `is_wedged` is TRUE -- and it is right that nothing
+is running. What it cannot see is that the queue is fundable:
+
+  `plan` accumulates HEAD-FIRST. The head (seq 1, need=61) pulls all 12 free
+  pages into `accum` and sits on them, still 49 short. The pool now reports
+  ZERO free -- which is why the error text reads "61 pages asked, 0 free of
+  256" -- so `salvage_free_pages` (which also only ever salvages FOR THE
+  HEAD) finds nothing, and the youngest parked ask is destroyed. 115 of 128
+  requests died to this cascade.
+
+  Those hoarded 12 pages are EXACTLY what the four 1-page asks needed. Serve
+  any one of them and that holder finishes and returns 61 pages, which funds
+  the head and unwedges the fleet. The queue was blocked by FCFS alone.
+
+FIX: a new last rung, `serve_from_hoard`, placed AFTER the final salvage and
+immediately BEFORE destruction in `check_starvation`. It serves the oldest
+unmet allocation, other than the head, whose device ask the hoard already
+covers in full, and returns. Strict FCFS is worth an unbounded wait; it is
+not worth a destroyed request, so the inversion is admitted here and nowhere
+else. Restores are not bypassable (boarding one is a multi-step handoff and
+the measured wedge is an allocation wedge).
+
+WHY IT IS SAFE, structurally:
+ - The only path it can divert is one that today unconditionally returns
+   `PlannerError::Starved`. Every earlier rung is untouched, and if no ask is
+   covered by the hoard it returns false and destruction proceeds verbatim.
+   `impossible` (16 pages, asks larger than the pool) and `admission_tail`
+   both still destroy exactly as before -- verified below.
+ - It cannot spin. Each bypass moves one waiter to SERVED, which strictly
+   shrinks `accum` and also makes `is_wedged` FALSE until the grant is
+   collected; at most `accum.len()` asks can be diverted before the rung
+   stops finding one. A served waiter runs, completes and returns at least
+   what it took.
+ - It mirrors `Step::ServeAllocation` exactly: RS reserved outside the
+   planner lock, re-validated under it, and a rejected RS reservation handed
+   back OUT so its Drop takes the store lock outside the planner lock.
+ - New counter `hoard_bypasses` (PlannerDiagnostics.hoard_bypasses_total).
+
+DIRECT CAUSAL PROOF, not just a green run: on a traced run the rung fires
+exactly 3 times, each serving a kv=1 ask, and WEDGE-KILL goes 116 -> 0.
+
+  hoard-bypass serve key=(51, 257) kv=1
+  hoard-bypass serve key=(51, 261) kv=1
+  hoard-bypass serve key=(51, 262) kv=1
+
+RESULTS
+  allshared_noswap x6:  128/128 completed, 0 failed, every run (8.4-9.2 s)
+  baseline x6 (§20.16): 6, 128, 128, 5, 9, 13   <- 1-in-3 lost 115 requests
+  contention suite 16/16, incl. impossible 0/16-destroyed and admission_tail
+    11 completed / 501 destroyed -- the rung is NOT disarmed
+  pie-eval 17 passed; inferlet_canary 2 passed / 3 ignored
+  conc 512: 30326 / 30297 / 29894 / 29733 (baseline ~30200) -- no regression,
+    and structurally there cannot be one: the rung is unreachable unless the
+    fleet is already wedged.
+
+CONTRACT TIGHTENED. allshared_noswap was `min_completed=8`, justified by a
+comment claiming the fleet "cannot fit in 256, and killing most of it is the
+CORRECT outcome". That is now disproven: the fleet does not fit, but the
+correct behaviour is that 60 processes PARK and are served in waves as
+holders retire -- the whole 128 completes in ~8.5 s. Raised to
+`min_completed=128, max_failed=0, repeat=3`, which makes it a real regression
+test for this rung (the bug reproduced ~1 run in 3).
+
+This also resolves the §20.7 / §20.3 contradiction noted in §20.16: §20.7's
+"128/128" was the good mode of a bistable scenario, §20.3's "31-59" was a mix
+of modes, and neither was a fix.
