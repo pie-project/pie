@@ -1132,6 +1132,15 @@ pathological grammar falls back to replaying everything. That trade - memory
 for per-step work - is the same one this whole design makes, applied one level
 down.
 
+The same shortcut applied to the advance's token search is **19 us at batch 512
+and wrong**, and is not in. It gives two corpus schemas more configurations
+than the matcher, by the mechanism that when the advance finds nothing the
+commit retains the previous, larger set - so a group is being refused that
+should not be. The table itself is not the fault: checked exhaustively against
+an actual replay over every (lexer state, parser state, group) of a grammar it
+disagrees nowhere (`files/verify_verdicts.py`). The fault is in how the search
+kernel addresses it, and it is left recorded rather than shipped.
+
 **Host contention (q21).** Weaker than expected and worth saying so. With
 twenty-four cores deliberately saturated, XGrammar's fill slows by 1.06x and
 ours by 1.01x; both engines' p99 degrades to about 3 ms, which is the operating
