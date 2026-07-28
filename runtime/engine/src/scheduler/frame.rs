@@ -1010,6 +1010,7 @@ impl FramePolicy {
             // to the quorum.
             let mut missing = 0usize;
             let mut missing_rebind = 0usize;
+            let mut missing_idle = 0usize;
             for lane in self.lanes.values() {
                 if !lane.awaited {
                     continue;
@@ -1018,29 +1019,39 @@ impl FramePolicy {
                     continue;
                 }
                 missing += 1;
-                if lane.frames.is_empty()
-                    && lane
+                if lane.frames.is_empty() {
+                    missing_idle += 1;
+                    if lane
                         .owner
                         .is_some_and(|owner| self.pending_binds.contains_key(&owner))
-                {
-                    missing_rebind += 1;
+                    {
+                        missing_rebind += 1;
+                    }
                 }
             }
             let joining = !self.joins_in_flight.is_empty()
                 || ((self.pending_slots > 0 || !self.departing.is_empty())
                     && !self.staged.is_empty());
             let mode = rebind_escape_mode();
-            // Mode 2 escapes only from the deadlock shape itself: every
-            // missing lane is an empty rebinder AND nothing is executing, so
-            // no retirement will free the control slot the binds need. The
-            // grace period keeps a healthy gather (which resolves in
-            // microseconds) on the dense wait-all path.
-            let escaping = missing_rebind > 0
+            // Mode 2 escapes only from the deadlock shape itself: every missing
+            // lane is EMPTY and nothing is executing, so nothing the engine
+            // controls will ever make one of them submit -- their next fire is
+            // ordered behind a result only this seal can produce, which is the
+            // cycle `seal -> result -> submit -> seal`. An empty rebinder is one
+            // way to land there (its fire is ordered behind a bind that needs
+            // the control slot this boundary holds); a lane simply idle between
+            // frames is another, and it is the shape two concurrent request
+            // streams hit as soon as one of them drains its run-ahead window
+            // while the other still has work. Escaping cannot reorder anything
+            // that was going to resolve, because nothing is executing. The grace
+            // period keeps a healthy gather (which resolves in microseconds) on
+            // the dense wait-all path.
+            let escaping = missing_idle > 0
                 && match mode {
                     0 => false,
-                    1 => true,
+                    1 => missing_rebind > 0,
                     _ => {
-                        !joining && !executing && missing == missing_rebind && {
+                        !joining && !executing && missing == missing_idle && {
                             let deadline = *self
                                 .rebind_escape_deadline
                                 .get_or_insert(now + Duration::from_micros(REBIND_ESCAPE_US));
@@ -1048,14 +1059,17 @@ impl FramePolicy {
                         }
                     }
                 };
-            if !escaping && mode == 2 && (missing != missing_rebind || executing || joining) {
+            let escaped = if !escaping {
+                0
+            } else if mode == 1 {
+                missing_rebind
+            } else {
+                missing_idle
+            };
+            if !escaping && mode == 2 && (missing != missing_idle || executing || joining) {
                 self.rebind_escape_deadline = None;
             }
-            let missing = if escaping {
-                missing - missing_rebind
-            } else {
-                missing
-            };
+            let missing = missing - escaped;
             if joining || missing > 0 {
                 let mut stalled = false;
                 if executing {
