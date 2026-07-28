@@ -493,12 +493,27 @@ fn emit_logits_argmax(source: &mut String, in_base: u32, mtp: bool, o0: &str) {
     source.push_str("      const uint am_src_row = row_indices[am_row_base + am_r];\n");
     source.push_str("      const device bfloat* am_src = logits + ulong(am_src_row) * am_vocab;\n");
     source.push_str("      M1ArgmaxCandidate am_best = {-INFINITY, 0u, 0u, 0u};\n");
-    source.push_str("      for (uint am_c = m3_tid; am_c < am_vocab; am_c += m3_threads) {\n");
-    source.push_str("        const float am_v = float(am_src[am_c]);\n");
-    source.push_str(
-        "        am_best = m1_argmax_combine(am_best, M1ArgmaxCandidate{am_v, am_c, isnan(am_v) ? 0u : 1u, 0u});\n",
-    );
+    // Four independent accumulators. The combine is a strict total order, so
+    // splitting the fold changes nothing, and it breaks the dependency chain
+    // that otherwise serialises one device load per iteration in each thread.
+    source.push_str("      M1ArgmaxCandidate am_b1 = am_best, am_b2 = am_best, am_b3 = am_best;\n");
+    let _ = writeln!(source, "      constexpr uint am_w = {METAL_M3_REGION_THREADS}u;");
+    source.push_str("      uint am_c = m3_tid;\n");
+    source.push_str("      for (; am_c + 3u * am_w < am_vocab; am_c += 4u * am_w) {\n");
+    source.push_str("        const float v0 = float(am_src[am_c]);\n");
+    source.push_str("        const float v1 = float(am_src[am_c + am_w]);\n");
+    source.push_str("        const float v2 = float(am_src[am_c + 2u * am_w]);\n");
+    source.push_str("        const float v3 = float(am_src[am_c + 3u * am_w]);\n");
+    source.push_str("        am_best = m1_argmax_combine(am_best, M1ArgmaxCandidate{v0, am_c, isnan(v0) ? 0u : 1u, 0u});\n");
+    source.push_str("        am_b1 = m1_argmax_combine(am_b1, M1ArgmaxCandidate{v1, am_c + am_w, isnan(v1) ? 0u : 1u, 0u});\n");
+    source.push_str("        am_b2 = m1_argmax_combine(am_b2, M1ArgmaxCandidate{v2, am_c + 2u * am_w, isnan(v2) ? 0u : 1u, 0u});\n");
+    source.push_str("        am_b3 = m1_argmax_combine(am_b3, M1ArgmaxCandidate{v3, am_c + 3u * am_w, isnan(v3) ? 0u : 1u, 0u});\n");
     source.push_str("      }\n");
+    source.push_str("      for (; am_c < am_vocab; am_c += am_w) {\n");
+    source.push_str("        const float am_v = float(am_src[am_c]);\n");
+    source.push_str("        am_best = m1_argmax_combine(am_best, M1ArgmaxCandidate{am_v, am_c, isnan(am_v) ? 0u : 1u, 0u});\n");
+    source.push_str("      }\n");
+    source.push_str("      am_best = m1_argmax_combine(m1_argmax_combine(am_best, am_b1), m1_argmax_combine(am_b2, am_b3));\n");
     source.push_str("      m3_tgbuf[m3_tid] = am_best;\n");
     source.push_str("      threadgroup_barrier(mem_flags::mem_threadgroup);\n");
     source.push_str("      for (uint am_s = 1u; am_s < m3_threads; am_s <<= 1) {\n");

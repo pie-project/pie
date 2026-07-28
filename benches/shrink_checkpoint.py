@@ -152,10 +152,24 @@ class SrcTensor:
     shape: list[int]
     start: int          # absolute byte offset in the shard file
     end: int
+    # When the expert bank is stacked on dim 0, only the leading `keep_rows`
+    # rows survive -- and they are a contiguous prefix, so only that prefix
+    # needs to be fetched.
+    keep_rows: int | None = None
 
     @property
     def nbytes(self) -> int:
         return self.end - self.start
+
+    @property
+    def keep_bytes(self) -> int:
+        if self.keep_rows is None or not self.shape or self.shape[0] <= self.keep_rows:
+            return self.nbytes
+        return self.nbytes // self.shape[0] * self.keep_rows
+
+    @property
+    def keep_end(self) -> int:
+        return self.start + self.keep_bytes
 
 
 def read_shard_header(repo: str, revision: str, shard: str) -> dict[str, SrcTensor]:
@@ -281,6 +295,16 @@ def _rewrite_kimi(cfg: dict, plan: Plan) -> None:
             1 for i in plan.src_layers if i < tc["first_k_dense_replace"])
 
 
+def _rewrite_gpt_oss(cfg: dict, plan: Plan) -> None:
+    _rewrite_common(cfg, plan)
+    # `layer_types` is what makes a layer sliding vs full attention.
+    if isinstance(cfg.get("layer_types"), list):
+        cfg["layer_types"] = _slice_list(cfg["layer_types"], plan.src_layers)
+    # gpt-oss carries the top-k under two names and HF reads both.
+    if plan.experts is not None and isinstance(cfg.get("experts_per_token"), int):
+        cfg["experts_per_token"] = min(cfg["experts_per_token"], plan.experts)
+
+
 FAMILIES: dict[str, dict[str, Any]] = {
     "glm_moe_dsa": dict(
         layer_prefix="model.layers.",
@@ -310,6 +334,29 @@ FAMILIES: dict[str, dict[str, Any]] = {
         config_rewrite=_rewrite_kimi,
         text_cfg_key="text_config",
         keep_res=(re.compile(r"^vision_tower\."), re.compile(r"^mm_projector\.")),
+    ),
+    "gpt_oss": dict(
+        layer_prefix="model.layers.",
+        # gpt-oss stacks the whole expert bank on dim 0 of a handful of
+        # tensors instead of giving each expert its own name, so there is no
+        # per-expert name to filter -- `router_suffixes` does all the slicing.
+        expert_re=None,
+        router_suffixes=(
+            "mlp.router.weight",
+            "mlp.router.bias",
+            "mlp.experts.gate_up_proj_blocks",
+            "mlp.experts.gate_up_proj_scales",
+            "mlp.experts.gate_up_proj_bias",
+            "mlp.experts.down_proj_blocks",
+            "mlp.experts.down_proj_scales",
+            "mlp.experts.down_proj_bias",
+        ),
+        globals_keep=("model.embed_tokens.weight", "model.norm.weight",
+                      "lm_head.weight"),
+        # `layer_types` alternates sliding/full, so an even block starting at 0
+        # covers both.
+        default_layers="0-3",
+        config_rewrite=_rewrite_gpt_oss,
     ),
 }
 
@@ -456,15 +503,21 @@ def main() -> int:
             raise SystemExit(f"{name} missing from {shard} header")
         src[name] = t
 
-    total = sum(src[n].nbytes for n in src_names)
+    print("[3/6] applying expert-bank slicing")
+    outs = assign_rows(pairs, src, plan)
+    raw_total = sum(src[n].nbytes for n in src_names)
+    total = sum(src[n].keep_bytes for n in src_names)
+    if total < raw_total:
+        print(f"      expert banks stacked on dim 0 keep only their prefix: "
+              f"{total / 1024**3:.2f} GiB instead of {raw_total / 1024**3:.2f}")
     print(f"      download size: {total / 1024**3:.2f} GiB from {len(shards)} shards")
     if args.dry_run:
         for n in src_names[:20]:
             t = src[n]
-            print(f"      {n}  {t.dtype}{t.shape}  {t.nbytes/1024**2:.1f} MiB")
+            print(f"      {n}  {t.dtype}{t.shape}  {t.keep_bytes/1024**2:.1f} MiB")
         return 0
 
-    print("[3/6] downloading tensors")
+    print("[4/6] downloading tensors")
     by_shard: dict[str, list[SrcTensor]] = {}
     for n in src_names:
         by_shard.setdefault(src[n].shard, []).append(src[n])
@@ -474,16 +527,17 @@ def main() -> int:
         tensors.sort(key=lambda t: t.start)
         groups: list[list[SrcTensor]] = []
         for t in tensors:
-            if groups and t.start - groups[-1][-1].end <= COALESCE_GAP:
+            if groups and t.start - groups[-1][-1].keep_end <= COALESCE_GAP:
                 groups[-1].append(t)
             else:
                 groups.append([t])
         for grp in groups:
             missing = [t for t in grp if not (cache / cache_key(t)).exists()]
             if not missing:
-                done_bytes += sum(t.nbytes for t in grp)
+                done_bytes += sum(t.keep_bytes for t in grp)
                 continue
-            lo, hi = grp[0].start, grp[-1].end
+            lo = grp[0].start
+            hi = max(t.keep_end for t in grp)
             blob_path = cache / f"span-{shard.replace('/', '_')}-{lo}-{hi}.bin"
             fetch_to_file(args.repo, args.revision, shard, blob_path, lo, hi)
             with blob_path.open("rb") as bf:
@@ -492,31 +546,16 @@ def main() -> int:
                     if dest.exists():
                         continue
                     bf.seek(t.start - lo)
-                    data = bf.read(t.nbytes)
+                    data = bf.read(t.keep_bytes)
                     tmp = dest.with_suffix(".part")
                     tmp.write_bytes(data)
                     tmp.rename(dest)
             blob_path.unlink(missing_ok=True)
-            done_bytes += sum(t.nbytes for t in grp)
+            done_bytes += sum(t.keep_bytes for t in grp)
             el = time.time() - t0
             print(f"      {done_bytes/1024**3:7.2f}/{total/1024**3:.2f} GiB "
                   f"({done_bytes/1024**2/max(el,1e-3):.0f} MiB/s)", end="\r", flush=True)
     print(" " * 78, end="\r")
-
-    print("[4/6] applying expert-bank slicing")
-    outs: list[OutTensor] = []
-    router_rows = plan.experts
-    for out_name, src_name in pairs:
-        t = src[src_name]
-        ot = OutTensor(out_name, t)
-        if router_rows is not None:
-            tail = out_name.split(plan.layer_prefix, 1)[-1]
-            tail = tail.split(".", 1)[-1] if "." in tail else tail
-            if tail in plan.router_suffixes and t.shape and t.shape[0] > router_rows:
-                ot.rows = router_rows
-            if tail.endswith("gate.tid2eid"):
-                ot.mod = router_rows
-        outs.append(ot)
 
     print("[5/6] writing shards")
     shard_files = write_output(out_dir, cache, outs)
@@ -539,13 +578,50 @@ def main() -> int:
 
 def cache_key(t: SrcTensor) -> str:
     safe = t.name.replace("/", "_")
-    return f"{safe}.bin"
+    # The cached blob is a *prefix* when the expert bank is sliced, so the row
+    # count has to be part of the key or a full blob from an earlier run with a
+    # different `--experts` would be reused as if it were the prefix.
+    rows = "" if t.keep_rows is None else f".rows{t.keep_rows}"
+    return f"{safe}{rows}.bin"
+
+
+def assign_rows(pairs: list[tuple[str, str]], src: dict[str, SrcTensor],
+                plan: Plan) -> list["OutTensor"]:
+    """Decide the dim-0 slice for every output tensor.
+
+    Runs *before* the download so that stacked expert banks (gpt-oss keeps all
+    128 experts in one tensor) only fetch the prefix that survives.
+    """
+    outs: list[OutTensor] = []
+    router_rows = plan.experts
+    full: set[str] = set()
+    for out_name, src_name in pairs:
+        t = src[src_name]
+        ot = OutTensor(out_name, t)
+        if router_rows is not None:
+            tail = out_name.split(plan.layer_prefix, 1)[-1]
+            tail = tail.split(".", 1)[-1] if "." in tail else tail
+            if tail in plan.router_suffixes and t.shape and t.shape[0] > router_rows:
+                ot.rows = router_rows
+            if tail.endswith("gate.tid2eid"):
+                ot.mod = router_rows
+        if ot.rows is None:
+            full.add(src_name)
+        outs.append(ot)
+    for ot in outs:
+        # A source tensor reused by two outputs with different slices has to be
+        # fetched whole; only mark the prefix when every use agrees.
+        if ot.rows is not None and ot.src.name not in full:
+            ot.src.keep_rows = ot.rows
+    return outs
 
 
 def transform_bytes(ot: OutTensor, raw: bytes) -> tuple[bytes, list[int]]:
     shape = list(ot.src.shape)
     if ot.rows is not None and shape and shape[0] > ot.rows:
-        row = len(raw) // shape[0]
+        # `raw` may already be the prefix (see `assign_rows`), so size the row
+        # from the full tensor rather than from what was downloaded.
+        row = ot.src.nbytes // shape[0]
         raw = raw[: ot.rows * row]
         shape[0] = ot.rows
     if ot.mod:

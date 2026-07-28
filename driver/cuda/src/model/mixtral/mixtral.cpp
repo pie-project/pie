@@ -138,6 +138,8 @@ void mixtral_forward_paged(
     int N,
     int R,
     bool is_pure_decode,
+    const std::int32_t* logit_row_indices_d,
+    int num_logit_rows,
     const std::uint8_t* custom_mask_d,
     const std::int32_t* custom_mask_indptr_d)
 {
@@ -542,6 +544,31 @@ void mixtral_forward_paged(
         }
     }
 
+    if (!fwd_cfg.emit_logits) {
+        return;
+    }
+    // Compact logits: gather only the rows that will be sampled before the
+    // lm_head, instead of materializing [N, vocab]. Every other family already
+    // declares this; without it the batch engine hands the device-side sampler
+    // an empty row list and its descriptor channel is never produced.
+    const bool compact_logits =
+        logit_row_indices_d != nullptr && num_logit_rows > 0 &&
+        num_logit_rows < N;
+    const int lm_head_rows = compact_logits ? num_logit_rows : N;
+    if (compact_logits) {
+        kernels::launch_gather_bf16_rows(
+            static_cast<const std::uint16_t*>(ws.y.data()),
+            logit_row_indices_d,
+            static_cast<std::uint16_t*>(ws.norm_x.data()),
+            num_logit_rows, H, stream);
+        kernels::launch_rmsnorm_bf16(
+            ws.norm_x.data(), w.final_norm->data(), ws.norm_y.data(),
+            num_logit_rows, H, eps, stream);
+        ops::gemm_act_x_wt_bf16(cublas.handle(),
+            ws.norm_y.data(), w.lm_head->data(), ws.logits.data(),
+            lm_head_rows, V, H);
+        return;
+    }
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), w.final_norm->data(), ws.norm_x.data(),
         N, H, eps, stream);
