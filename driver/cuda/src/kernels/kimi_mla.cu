@@ -62,12 +62,11 @@ __global__ void split_kv_a_norm_kernel(
     const __nv_bfloat16* __restrict__ norm_weight,
     __nv_bfloat16* __restrict__ kv_c,
     __nv_bfloat16* __restrict__ k_pe,
-    int kv_lora, int rope, float eps)
+    int kv_lora, int rope, int src_row_stride, float eps)
 {
     const int n = blockIdx.x;
     const int tid = threadIdx.x;
-    const int per = kv_lora + rope;
-    const __nv_bfloat16* row = kv_a + static_cast<long long>(n) * per;
+    const __nv_bfloat16* row = kv_a + static_cast<long long>(n) * src_row_stride;
 
     // Copy k_pe (no normalization)
     for (int d = tid; d < rope; d += BLOCK_DIM) {
@@ -145,61 +144,6 @@ __global__ void topk_sigmoid_kernel(
     }
 }
 
-__global__ void q_nope_to_latent_kernel(
-    const __nv_bfloat16* __restrict__ q_nope,
-    const __nv_bfloat16* __restrict__ kv_b,
-    __nv_bfloat16* __restrict__ out,
-    int tokens,
-    int heads,
-    int nope,
-    int v_dim,
-    int kv_lora)
-{
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int total = tokens * heads * kv_lora;
-    if (idx >= total) return;
-    const int l = idx % kv_lora;
-    const int h = (idx / kv_lora) % heads;
-    const int n = idx / (heads * kv_lora);
-    const __nv_bfloat16* q =
-        q_nope + (static_cast<long long>(n) * heads + h) * nope;
-    const __nv_bfloat16* w =
-        kv_b + static_cast<long long>(h) * (nope + v_dim) * kv_lora + l;
-    float acc = 0.f;
-    for (int d = 0; d < nope; ++d) {
-        acc += __bfloat162float(q[d]) *
-               __bfloat162float(w[static_cast<long long>(d) * kv_lora]);
-    }
-    out[idx] = __float2bfloat16(acc);
-}
-
-__global__ void latent_to_v_kernel(
-    const __nv_bfloat16* __restrict__ latent,
-    const __nv_bfloat16* __restrict__ kv_b,
-    __nv_bfloat16* __restrict__ out,
-    int tokens,
-    int heads,
-    int nope,
-    int v_dim,
-    int kv_lora)
-{
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int total = tokens * heads * v_dim;
-    if (idx >= total) return;
-    const int v = idx % v_dim;
-    const int h = (idx / v_dim) % heads;
-    const int n = idx / (heads * v_dim);
-    const __nv_bfloat16* x =
-        latent + (static_cast<long long>(n) * heads + h) * kv_lora;
-    const __nv_bfloat16* w =
-        kv_b + (static_cast<long long>(h) * (nope + v_dim) + nope + v) * kv_lora;
-    float acc = 0.f;
-    for (int l = 0; l < kv_lora; ++l) {
-        acc += __bfloat162float(x[l]) * __bfloat162float(w[l]);
-    }
-    out[idx] = __float2bfloat16(acc);
-}
-
 }  // namespace
 
 void launch_kimi_split_q_b_bf16(
@@ -248,16 +192,19 @@ void launch_kimi_split_kv_a_norm_bf16(
     int kv_lora_rank,
     int qk_rope_dim,
     float eps,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    int src_row_stride)
 {
     if (tokens <= 0) return;
     constexpr int BS = 256;
+    const int stride =
+        src_row_stride > 0 ? src_row_stride : kv_lora_rank + qk_rope_dim;
     split_kv_a_norm_kernel<BS><<<tokens, BS, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(kv_a),
         static_cast<const __nv_bfloat16*>(norm_weight),
         static_cast<__nv_bfloat16*>(kv_c),
         static_cast<__nv_bfloat16*>(k_pe),
-        kv_lora_rank, qk_rope_dim, eps);
+        kv_lora_rank, qk_rope_dim, stride, eps);
 }
 
 void launch_topk_sigmoid_bf16(
@@ -278,46 +225,6 @@ void launch_topk_sigmoid_bf16(
         static_cast<const __nv_bfloat16*>(logits),
         topk_idx, topk_w, correction_bias, num_experts, top_k,
         renormalize, routed_scaling_factor);
-}
-
-void launch_kimi_q_nope_to_latent_bf16(
-    const void* q_nope,
-    const void* kv_b_proj,
-    void* q_latent,
-    int tokens,
-    int heads,
-    int qk_nope_dim,
-    int v_head_dim,
-    int kv_lora_rank,
-    cudaStream_t stream)
-{
-    const int total = tokens * heads * kv_lora_rank;
-    if (total <= 0) return;
-    q_nope_to_latent_kernel<<<(total + BLOCK - 1) / BLOCK, BLOCK, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(q_nope),
-        static_cast<const __nv_bfloat16*>(kv_b_proj),
-        static_cast<__nv_bfloat16*>(q_latent),
-        tokens, heads, qk_nope_dim, v_head_dim, kv_lora_rank);
-}
-
-void launch_kimi_latent_to_v_bf16(
-    const void* attn_latent,
-    const void* kv_b_proj,
-    void* attn_v,
-    int tokens,
-    int heads,
-    int qk_nope_dim,
-    int v_head_dim,
-    int kv_lora_rank,
-    cudaStream_t stream)
-{
-    const int total = tokens * heads * v_head_dim;
-    if (total <= 0) return;
-    latent_to_v_kernel<<<(total + BLOCK - 1) / BLOCK, BLOCK, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(attn_latent),
-        static_cast<const __nv_bfloat16*>(kv_b_proj),
-        static_cast<__nv_bfloat16*>(attn_v),
-        tokens, heads, qk_nope_dim, v_head_dim, kv_lora_rank);
 }
 
 }  // namespace pie_cuda_driver::kernels

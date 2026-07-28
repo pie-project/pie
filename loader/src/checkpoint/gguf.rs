@@ -124,9 +124,9 @@ fn map_tensor_type(ty: GgmlType, tensor_name: &str) -> Result<GgufTensorType, Er
         GgmlType::Bf16 => dense(DType::BF16, 2),
         GgmlType::I8 => dense(DType::I8, 1),
         GgmlType::I32 => dense(DType::I32, 4),
-        // The Rust loader dtype set has no 64-bit integer; GGUF `I64` tensors
-        // are metadata-only (token types), never weights. Reject with the same
-        // 64-bit rationale as the safetensors parser.
+        // GGUF `I64` tensors are metadata-only (token types), never weights,
+        // and no driver binds them — so they are rejected here even though the
+        // loader dtype set does carry `I64` for safetensors index tables.
         GgmlType::I64 => {
             return Err(Error::Checkpoint(format!(
                 "gguf: tensor '{tensor_name}' is I64 (64-bit), unsupported by the loader dtype set"
@@ -357,9 +357,11 @@ pub fn parse_gguf_checkpoint(path: &Path) -> Result<CheckpointMetadata, Error> {
         }
     }
 
-    let mut pending: Vec<PendingTensor> = Vec::with_capacity(
-        usize::try_from(tensor_count).or_overflow("gguf: tensor count too large")?,
-    );
+    // No `with_capacity`: `tensor_count` is a number the file claims, read
+    // before any of the tensors it describes. Reserving on it lets a twelve-byte
+    // header ask for an allocation the process cannot refuse politely. The loop
+    // is bounded by the bytes actually present.
+    let mut pending: Vec<PendingTensor> = Vec::new();
     for _ in 0..tensor_count {
         let name = r.read_string("tensor name")?;
         let dim_count = r.read_u32("tensor dimension count")?;

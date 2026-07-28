@@ -1792,6 +1792,17 @@ async fn finalize_fire_await(fire: PendingFire) -> Anyhow<FinalizeOutcome> {
     let device_geometry = matches!(&kv, FireKv::DeviceGeom { .. });
     let prior_failure = failure.lock().unwrap().clone();
     let result = completion.await;
+    if crate::scheduler::fire_timing_enabled() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let resolved = crate::scheduler::LAST_RESOLVE_US.load(Relaxed);
+        if resolved > 0 {
+            let resume = crate::scheduler::fire_timing_now_us().saturating_sub(resolved) * 1_000;
+            let acc = &crate::scheduler::GUEST_PHASES;
+            acc.resume_ns.fetch_add(resume, Relaxed);
+            acc.resume_max_ns.fetch_max(resume, Relaxed);
+            acc.resume_n.fetch_add(1, Relaxed);
+        }
+    }
     let success = result.is_ok() && prior_failure.is_none();
 
     let (kv_failure, rs_failure) = {

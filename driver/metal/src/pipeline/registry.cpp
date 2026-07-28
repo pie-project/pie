@@ -188,31 +188,87 @@ int Registry::register_channel(
     return PIE_STATUS_OK;
 }
 
+namespace {
+/// A device-only private channel a second instance may legally attach to.
+///
+/// R4-4 cross-pass chaining: a prefill instance hands its channel to the decode
+/// instance that follows, so the channel outlives the instance that created it.
+/// `driver/dummy` states the same rule where it decides which channels get a
+/// shared ring -- "extern-declared channels AND chainable device-only private
+/// channels (no host role, unseeded)". This driver refused *every* second
+/// attachment on a non-extern channel, which made the second pass of every
+/// two-pass program fail to bind.
+template <typename Decl>
+bool chainable(const Decl& decl) {
+    return host_role_for(decl) == PIE_CHANNEL_HOST_ROLE_NONE && !decl.has_seed;
+}
+
+template <typename Dims>
+std::string shape_text(const Dims& dims) {
+    std::string out = "[";
+    bool first = true;
+    for (const auto& d : dims) {
+        if (!first) out += ",";
+        out += std::to_string(d);
+        first = false;
+    }
+    return out + "]";
+}
+}  // namespace
+
 int Registry::bind_instance(
     const PieInstanceDesc& instance,
     PieInstanceBinding* binding) {
-    if (instance.geometry_class != PIE_GEOMETRY_CLASS_HOST) {
-        return PIE_STATUS_UNSUPPORTED;
+    // Every rejection below returns the same status, and the caller reports
+    // only that number. Say which rule refused, or a bind failure is a bisect.
+    const auto refuse = [](int status, const std::string& why) {
+        std::cerr << "[pie-driver-metal] bind_instance: " << why << "\n";
+        return status;
+    };
+    // All three classes, as `driver/dummy` and `driver/cuda` accept. The
+    // per-program decision is made later and by the program itself:
+    // `build_member_forward` asks `requires_descriptor_resolution(trace)` and
+    // runs `descriptor_resolve.hpp` when the answer is yes. This gate stayed at
+    // HOST-only from before that resolver existed, which refused every
+    // device-resolved decode at bind.
+    if (instance.geometry_class != PIE_GEOMETRY_CLASS_HOST &&
+        instance.geometry_class != PIE_GEOMETRY_CLASS_DECODE_ENVELOPE &&
+        instance.geometry_class != PIE_GEOMETRY_CLASS_DEVICE_GEOMETRY) {
+        return refuse(PIE_STATUS_UNSUPPORTED,
+                      "geometry class " +
+                          std::to_string(instance.geometry_class) +
+                          " is not one this driver binds");
     }
     const ProgramRecord* program_ptr = find_program(instance.program_id);
-    if (program_ptr == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
+    if (program_ptr == nullptr) {
+        return refuse(PIE_STATUS_INVALID_ARGUMENT,
+                      "no program " + std::to_string(instance.program_id));
+    }
     const std::uint64_t instance_id =
         instance.requested_instance_id != 0
             ? instance.requested_instance_id
             : next_instance_id_++;
     if (find_instance(instance_id) != nullptr) {
-        return PIE_STATUS_INVALID_ARGUMENT;
+        return refuse(PIE_STATUS_INVALID_ARGUMENT,
+                      "instance " + std::to_string(instance_id) +
+                          " is already bound");
     }
     const ProgramRecord& program = *program_ptr;
     if (instance.channel_ids.len != program.channels.size()) {
-        return PIE_STATUS_INVALID_ARGUMENT;
+        return refuse(PIE_STATUS_INVALID_ARGUMENT,
+                      "instance supplies " +
+                          std::to_string(instance.channel_ids.len) +
+                          " channel(s), program " +
+                          std::to_string(instance.program_id) + " declares " +
+                          std::to_string(program.channels.size()));
     }
 
     std::unordered_set<std::uint64_t> unique_ids(
         instance.channel_ids.ptr,
         instance.channel_ids.ptr + instance.channel_ids.len);
     if (unique_ids.size() != instance.channel_ids.len) {
-        return PIE_STATUS_INVALID_ARGUMENT;
+        return refuse(PIE_STATUS_INVALID_ARGUMENT,
+                      "the instance names the same channel twice");
     }
     std::unordered_set<std::uint64_t> seeded_ids;
     for (std::size_t i = 0; i < instance.seed_values.len; ++i) {
@@ -223,20 +279,36 @@ int Registry::bind_instance(
             seed.channel_id);
         if (id == instance.channel_ids.ptr + instance.channel_ids.len ||
             !seeded_ids.insert(seed.channel_id).second) {
-            return PIE_STATUS_INVALID_ARGUMENT;
+            return refuse(PIE_STATUS_INVALID_ARGUMENT,
+                          "seed names channel " +
+                              std::to_string(seed.channel_id) +
+                              ", which this instance does not bind (or seeds twice)");
         }
         const std::size_t channel =
             static_cast<std::size_t>(id - instance.channel_ids.ptr);
         if (!program.channels[channel].has_seed ||
             seed.bytes.len != cell_bytes_for(program.channels[channel]) ||
             seed.bytes.ptr == nullptr) {
-            return PIE_STATUS_INVALID_ARGUMENT;
+            return refuse(PIE_STATUS_INVALID_ARGUMENT,
+                          "seed for channel " + std::to_string(seed.channel_id) +
+                              " is " + std::to_string(seed.bytes.len) +
+                              " bytes; the program declares " +
+                              std::to_string(
+                                  cell_bytes_for(program.channels[channel])) +
+                              (program.channels[channel].has_seed
+                                   ? ""
+                                   : " and declares no seed"));
         }
     }
 
     for (std::size_t i = 0; i < instance.channel_ids.len; ++i) {
         ChannelRecord* endpoint = find_channel(instance.channel_ids.ptr[i]);
-        if (endpoint == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
+        if (endpoint == nullptr) {
+            return refuse(PIE_STATUS_INVALID_ARGUMENT,
+                          "channel " +
+                              std::to_string(instance.channel_ids.ptr[i]) +
+                              " is not registered");
+        }
         const auto& decl = program.channels[i];
         const auto& endpoint_desc = endpoint->desc;
         if (endpoint_desc.dtype != channel_dtype_for(decl.type.dtype) ||
@@ -246,7 +318,7 @@ int Registry::bind_instance(
             endpoint->shape != decl.type.shape.dims ||
             (extern_dir_for(decl) == PIE_CHANNEL_EXTERN_NONE
                  ? endpoint_desc.extern_dir != PIE_CHANNEL_EXTERN_NONE ||
-                       !endpoint->attachments.empty()
+                       (!endpoint->attachments.empty() && !chainable(decl))
                  : endpoint_desc.extern_dir == PIE_CHANNEL_EXTERN_NONE ||
                        endpoint->extern_name != decl.extern_name ||
                        std::any_of(
@@ -255,7 +327,26 @@ int Registry::bind_instance(
                            [&](const auto& attachment) {
                                return attachment.second == extern_dir_for(decl);
                            }))) {
-            return PIE_STATUS_INVALID_ARGUMENT;
+            return refuse(
+                PIE_STATUS_INVALID_ARGUMENT,
+                "channel " + std::to_string(instance.channel_ids.ptr[i]) +
+                    " (slot " + std::to_string(i) +
+                    ") does not match what the program declares: endpoint dtype=" +
+                    std::to_string(endpoint_desc.dtype) + " capacity=" +
+                    std::to_string(endpoint_desc.capacity) + " host_role=" +
+                    std::to_string(endpoint_desc.host_role) + " seeded=" +
+                    std::to_string(endpoint_desc.seeded) + " extern_dir=" +
+                    std::to_string(endpoint_desc.extern_dir) +
+                    "; program dtype=" +
+                    std::to_string(channel_dtype_for(decl.type.dtype)) +
+                    " capacity=" + std::to_string(decl.capacity) +
+                    " host_role=" + std::to_string(host_role_for(decl)) +
+                    " seeded=" + std::to_string(decl.has_seed) +
+                    " extern_dir=" + std::to_string(extern_dir_for(decl)) +
+                    "; endpoint shape=" + shape_text(endpoint->shape) +
+                    " program shape=" + shape_text(decl.type.shape.dims) +
+                    "; endpoint attachments=" +
+                    std::to_string(endpoint->attachments.size()));
         }
     }
 
@@ -263,6 +354,7 @@ int Registry::bind_instance(
     record.instance_id = instance_id;
     record.program_id = instance.program_id;
     record.program_hash = program.program_hash;
+    record.geometry_class = instance.geometry_class;
     record.channel_ids.assign(
         instance.channel_ids.ptr,
         instance.channel_ids.ptr + instance.channel_ids.len);

@@ -49,6 +49,7 @@
 #include "store/mla_cache.hpp"
 #include "store/dsa_cache.hpp"
 #include "model/deepseek_v4/deepseek_v4_forward.hpp"
+#include "store/dsv4_compress_cache.hpp"
 #include "model/gemma/gemma2.hpp"
 #include "model/gemma4/gemma4.hpp"
 #include "model/gemma4/gemma4_audio_adapter.hpp"
@@ -71,6 +72,24 @@
 
 namespace pie::cuda {
 namespace {
+
+// Load every cubin when the CUDA runtime initializes rather than at each
+// kernel's first launch. CUDA defaults to lazy module loading, and the first
+// launch of nearly every kernel lands inside the very first (prefill) step —
+// squarely on the critical path. Measured on Kimi K2.6 at c=128, the prefill's
+// host-side driver submit cost 125ms and stalled the scheduler thread for a
+// whole extra wave; eager loading roughly halves it, for ~1s of extra startup
+// that is off the serving path.
+//
+// This must run before the first CUDA entry point in the process, because that
+// is when the runtime latches the variable — doing it in `Impl::initialize` is
+// already too late. A load-time initializer in the driver's own translation
+// unit runs at dlopen of the engine library, before any Rust code executes.
+// `overwrite = 0` so an explicit CUDA_MODULE_LOADING in the environment wins.
+const int kEagerCudaModuleLoading = [] {
+    ::setenv("CUDA_MODULE_LOADING", "EAGER", 0);
+    return 0;
+}();
 
 struct OwnedValue {
     void* ptr = nullptr;
@@ -1023,9 +1042,10 @@ int Context::Impl::load_model(
          family == model::Family::Qwen3_5 ||
          family == model::Family::Qwen3_5Moe ||
          family == model::Family::Gemma4 ||
-         family == model::Family::NemotronH) ||
-        family == model::Family::Kimi ||
-        family == model::Family::Glm5;
+         family == model::Family::NemotronH ||
+         family == model::Family::Kimi ||
+         family == model::Family::Glm5 ||
+         family == model::Family::DeepSeekV4);
     const int physical_kv_pages =
         runtime_kv_pages +
         (runtime_kv_pages > 0 && !page_zero_dummy_safe ? 1 : 0);
@@ -1118,6 +1138,18 @@ int Context::Impl::load_model(
     }
     auto& kv_cache = *kv_cache_p;
     kv_cache.set_elastic_allocator(kv_allocator_);
+
+    DsV4CompressCache* dsv4_comp_cache_p = nullptr;
+    {
+        ScopedCudaArenaAllocator arena(*kv_allocator_);
+        dsv4_comp_cache_p = own_value(
+            family == model::Family::DeepSeekV4
+                ? DsV4CompressCache::allocate(
+                      engine.hf_config(), physical_kv_pages,
+                      mem_plan.kv_page_size)
+                : DsV4CompressCache{});
+    }
+    auto& dsv4_comp_cache = *dsv4_comp_cache_p;
 
     MlaCache* mla_cache_p = nullptr;
     {
@@ -1470,6 +1502,7 @@ int Context::Impl::load_model(
     resources.nemotron_h_ws = &nemotron_h_ws;
     resources.nemotron_h_state_cache = &nemotron_h_state_cache;
     resources.dsv4_ws = &dsv4_ws;
+    resources.dsv4_comp_cache = &dsv4_comp_cache;
     resources.kimi_ws = &kimi_ws;
     resources.glm5_ws = &glm5_ws;
 

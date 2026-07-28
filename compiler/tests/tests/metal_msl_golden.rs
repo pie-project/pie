@@ -411,12 +411,12 @@ fn readiness_and_commit_match_oracle() {
                 ),
             );
         }
-        readiness.source(&emit_readiness(&ready_name, &channels));
+        readiness.result(emit_readiness(&ready_name, &channels));
 
         commit.open_case(&id);
         commit.field("function_name", &commit_name);
         commit.field("channels", &channels.len().to_string());
-        commit.source(&emit_commit(&commit_name, &channels));
+        commit.result(emit_commit(&commit_name, &channels));
     }
     compare(&readiness);
     compare(&commit);

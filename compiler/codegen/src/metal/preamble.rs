@@ -23,6 +23,20 @@ const M3: &str = "M3";
 /// the driver's job at library-build time, not the emitter's.
 pub const RUNTIME_TEMPLATE: &str = include_str!("../../runtime/metal/ptir_m1_runtime.metal");
 
+/// The grouped (M3) lane-table structs, in a file rather than a literal for the
+/// same reason `RUNTIME_TEMPLATE` is: a C++ reader needs them too. The Metal
+/// driver's `msl_compile_test` reconstructs the emitter's full sources from the
+/// golden dump plus these two prefixes, and a raw string literal in this crate
+/// is reachable from nothing but this crate.
+///
+/// This file is a *replica*, not the authority: [`grouped_preamble`] prints the
+/// same structs from [`layout::HOST_SHARED`], and `file_matches_emitted_text`
+/// below fails the build if the two ever disagree. Without that the file would
+/// be a seventh hand-written copy of the lane table — the exact failure
+/// [`layout`] exists to rule out, reintroduced by the C++ reader's need for a
+/// path it can open.
+pub const GROUPED_PREAMBLE: &str = include_str!("../../runtime/metal/ptir_m1_grouped.metal");
+
 /// `common_effect_preamble()` — the structs the single-lane readiness and
 /// commit kernels read out of the lane table.
 pub fn common_effect_preamble() -> &'static str {
@@ -87,4 +101,24 @@ struct M3RowMeta {
         out
     });
     &TEXT
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `ptir_m1_grouped.metal` exists because the Metal driver's
+    /// `msl_compile_test` needs a path it can open; it is not a second place to
+    /// declare the lane table. Adding a field to [`layout::HOST_SHARED`] and
+    /// not to the file (or the reverse) fails here instead of shipping a
+    /// kernel that reads different offsets than the host wrote.
+    #[test]
+    fn file_matches_emitted_text() {
+        assert_eq!(
+            GROUPED_PREAMBLE,
+            grouped_preamble(),
+            "compiler/codegen/runtime/metal/ptir_m1_grouped.metal has drifted from \
+             what layout::HOST_SHARED prints; re-copy the emitted text into the file"
+        );
+    }
 }

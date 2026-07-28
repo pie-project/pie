@@ -277,6 +277,7 @@ fn encode_plan(encoding: Encoding, rows: i64, cols: i64) -> LoadPlan {
             file_offset: 0,
             span_bytes: 0,
             stride: Extent::dense(&[rows, cols], 2),
+            dtype: DType::BF16,
         }),
         dest: None,
         inputs: Vec::new(),

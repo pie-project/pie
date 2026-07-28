@@ -108,11 +108,12 @@ PIE_MARLIN_SHAPE(bfloat16, fe2m1f, bfloat16)  // MXFP4 (gpt_oss)
 // new MoE arch through CutlassMoeFCRunner requires adding its activation here,
 // or it throws at run time.
 PIE_MOE_ACTIVATION(Relu2)     // nemotron_h
-PIE_MOE_ACTIVATION(Swiglu)    // qwen3_5_moe fc1 (qwen3.5 / qwen3.6)
+PIE_MOE_ACTIVATION(Swiglu)    // qwen3_5_moe fc1 (qwen3.5 / qwen3.6),
+                              // glm5 / kimi / deepseek_v4 routed experts (fc1)
 // A gated activation splits across the two grouped GEMMs: fc1 carries the
 // gate (Swiglu above), and fc2's epilogue is plain Identity. Reaching one
 // without the other throws at load time.
-PIE_MOE_ACTIVATION(Identity)  // qwen3_5_moe fc2
+PIE_MOE_ACTIVATION(Identity)  // second grouped GEMM (fc2) of every gated MoE
 
 // ---- all-reduce: fused residual+RMSNorm epilogue --------------------------
 // flashinfer's allreduce_fusion_op() turns four runtime values into one

@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 use crate::types::{
-    BackendKind, BufferId, CheckpointFormat, DType, Encoding, FileId, InstrId, QuantScheme,
-    RepackSpec, TensorDecl, TensorId,
+    BackendKind, BufferId, CheckpointFormat, DType, FileId, InstrId, QuantGranularity, QuantScheme,
+    RepackSpec, ScaleForm, TensorDecl, TensorId,
 };
 
 pub mod build;
@@ -24,8 +24,8 @@ pub use passes::tile::{CUDA_TILE_MAP_MASK, HOST_TILE_MAP_MASK, METAL_TILE_MAP_MA
 /// Which tile-map transforms a target's kernels implement.
 ///
 /// Defined here, not in `ffi/`: the plan is the thing that has transforms, and
-/// the ABI is a view of the plan. The arrow used to point the other way —
-/// `load_plan.rs` imported `crate::ffi::types::PIE_LOADER_TILE_MAP_*` — which
+/// the ABI is a view of the plan. The arrow used to point the other way — the
+/// compiler imported `crate::ffi::types::PIE_LOADER_TILE_MAP_*` — which
 /// made the core depend on its own serialization format. `ffi/types.rs` now
 /// restates these under the C names and a `const` assertion pins the two
 /// together, because cbindgen emits literals and cannot follow a path.
@@ -58,7 +58,6 @@ pub fn compile(
     // Runs last, so a plan is never observable in a state where its tiling and
     // fusion fields are still placeholders.
     passes::tile::lower(&mut plan);
-    plan.attachments = derive_quant_attachments(&plan.tensors);
     Ok(plan)
 }
 
@@ -168,42 +167,16 @@ pub struct SourceTensorDecl {
     pub encoding: crate::types::Encoding,
 }
 
-/// How a scale tensor's entries map onto the tensor they scale.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum QuantGranularity {
-    /// One scale per row of `channel_axis`.
-    PerChannel,
-    /// One scale per `group_size` elements along the axis after `channel_axis`.
-    PerGroup,
-}
-
-/// What the driver's kernels expect a scale tensor to hold by the time they read
-/// it.
-///
-/// The distinction is not derivable from the scale tensor itself — its dtype says
-/// how the bytes are stored, not how the kernel wants them — so the loader, which
-/// chose the encoding, states it. The driver used to infer it from
-/// `group_size == 32`, which was true only because MXFP4 is the one scheme with
-/// that group size today.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ScaleForm {
-    /// Consumed as raw E8M0 exponent bytes. The MXFP4 GEMM, the dequant kernels
-    /// and `make_expert_weight_view` all require U8 and assert on anything else.
-    RawE8M0,
-    /// Consumed as F32 multipliers. Whatever the scales were stored as (E8M0
-    /// bytes, BF16, or F32 already) is expanded before the GEMM sees them.
-    F32Factors,
-}
-
 /// A quantized tensor and the tensor holding its scales.
 ///
 /// The two are separate runtime tensors — the driver materializes both and then
 /// has to know they belong together in order to attach the quant metadata its
-/// kernels read. That pairing used to be re-derived driver-side by matching name
-/// suffixes against the plan's tensor list, which guessed at a fact the loader
-/// already had: `frontend.rs` names the scale tensor when it creates it, and the
-/// [`QuantSpec`](crate::types::QuantSpec) it came from carries the granularity.
-/// Stating it in the plan removes the guess.
+/// kernels read.
+///
+/// Every entry here is recorded by whoever declared the scale tensor, at the
+/// point of declaring it: `plan/build.rs::quant_metadata_outputs` for scales the
+/// loader creates, and [`Scales`](crate::contract::Scales) for scales the
+/// checkpoint shipped. Neither involves inspecting a name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuantAttachment {
     pub tensor: TensorId,
@@ -214,104 +187,6 @@ pub struct QuantAttachment {
     pub scale_form: ScaleForm,
 }
 
-/// Pair every quantized runtime tensor with the runtime tensor holding its
-/// scales.
-///
-/// Two shapes of pairing exist, and they are found differently:
-///
-/// * **The loader quantized it.** The tensor carries [`Encoding::Quant`], and
-///   `frontend.rs::quant_metadata_outputs` created the scale tensor and chose
-///   its name. The name formula below is that function's, restated — which is
-///   why the two must move together.
-/// * **The checkpoint shipped it quantized.** The tensor is a plain
-///   [`DType::F8E4M3`] passthrough whose scales came out of the checkpoint
-///   under the checkpoint's own name, so there is nothing more authoritative to
-///   consult than the name.
-///
-/// The granularity, group size and channel axis are fixed per shape rather than
-/// read from the [`QuantSpec`](crate::types::QuantSpec): they describe the
-/// *scale tensor's* layout, which the encode kernels fix, not the quantized
-/// tensor's.
-pub fn derive_quant_attachments(tensors: &[TensorDecl]) -> Vec<QuantAttachment> {
-    use std::collections::HashMap;
-
-    let by_name: HashMap<&str, TensorId> = tensors
-        .iter()
-        .map(|tensor| (tensor.name.as_str(), tensor.id))
-        .collect();
-
-    let mut out = Vec::new();
-    for tensor in tensors {
-        let mut attach = |scale: &str, granularity, group_size, channel_axis, scale_form| {
-            let Some(&scale_tensor) = by_name.get(scale) else {
-                return false;
-            };
-            out.push(QuantAttachment {
-                tensor: tensor.id,
-                scale_tensor,
-                granularity,
-                group_size,
-                channel_axis,
-                scale_form,
-            });
-            true
-        };
-
-        if let Encoding::Quant(spec) = &tensor.encoding {
-            match spec.scheme {
-                QuantScheme::Fp8E4M3 | QuantScheme::Int8Symmetric => {
-                    // `[rows]` of F32, one per output channel.
-                    attach(
-                        &format!("{}_scale_inv", tensor.name),
-                        QuantGranularity::PerChannel,
-                        0,
-                        0,
-                        ScaleForm::F32Factors,
-                    );
-                }
-                QuantScheme::Mxfp4E2M1E8M0 => {
-                    // `[rows, cols/32]` of E8M0 bytes, one per 32-element block
-                    // along K, and the MXFP4 kernels want those bytes as they
-                    // are.
-                    attach(
-                        &format!("{}_scale", tensor.name),
-                        QuantGranularity::PerGroup,
-                        32,
-                        1,
-                        ScaleForm::RawE8M0,
-                    );
-                }
-                _ => {}
-            }
-            continue;
-        }
-
-        // A checkpoint-quantized weight copied through untouched. Block-scaled
-        // FP8 (DeepSeek-V3 and its descendants) is the only such format the
-        // driver attaches metadata for, and it spells the scales either way.
-        if tensor.dtype() != DType::F8E4M3 {
-            continue;
-        }
-        let Some(base) = tensor.name.strip_suffix(".weight") else {
-            continue;
-        };
-        let _ = attach(
-            &format!("{}_scale_inv", tensor.name),
-            QuantGranularity::PerGroup,
-            128,
-            0,
-            ScaleForm::F32Factors,
-        ) || attach(
-            &format!("{base}.scale"),
-            QuantGranularity::PerGroup,
-            128,
-            0,
-            ScaleForm::F32Factors,
-        );
-    }
-    out
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceExtent {
     pub file_id: FileId,
@@ -319,6 +194,16 @@ pub struct SourceExtent {
     pub file_offset: u64,
     pub span_bytes: u64,
     pub stride: Extent,
+    /// The type these bytes are read as, which is not always the type the
+    /// checkpoint declares: `Expr::Bitcast` exists precisely to say that a
+    /// tensor stored as `U8` is to be read as `E8M0`. Looking the dtype up
+    /// from `tensor_id` instead would discard that, and the executor would be
+    /// asked for a cast from the storage type it was told to stop believing.
+    ///
+    /// Only the dtype can differ. `Bitcast` is checked raw-to-raw and
+    /// byte-size preserving (`contract::infer`), so an extent's quantization
+    /// scheme is still whatever `PieLoaderPlan::sources[tensor_id]` says.
+    pub dtype: DType,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -326,13 +211,6 @@ pub struct DestExtent {
     pub buffer: BufferId,
     pub offset: u64,
     pub stride: Extent,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SlabPlacement {
-    pub src_offset: u64,
-    pub dest_offset: u64,
-    pub bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -432,13 +310,6 @@ pub enum StorageInstr {
         source: SourceExtent,
         dest_offset: u64,
     },
-    SlabScatter {
-        id: InstrId,
-        file_id: FileId,
-        file_offset: u64,
-        span_bytes: u64,
-        placements: Vec<SlabPlacement>,
-    },
     TileMap {
         id: InstrId,
         kind: TileMapKind,
@@ -495,74 +366,5 @@ impl LoadPlan {
             memory: MemoryPlan::default(),
             attachments: Vec::new(),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::types::{Axis, QuantScheme, QuantSpec, TensorId};
-
-    fn tensor(id: u32, name: &str, encoding: Encoding) -> TensorDecl {
-        TensorDecl {
-            id: TensorId(id),
-            name: name.to_string(),
-            shape: vec![8, 32],
-            encoding,
-            alignment: 256,
-        }
-    }
-
-    fn quant(scheme: QuantScheme, group_size: u32) -> Encoding {
-        Encoding::Quant(QuantSpec {
-            scheme,
-            logical_dtype: DType::BF16,
-            bits_per_element: 0,
-            group_size,
-            channel_axis: Some(Axis(0)),
-        })
-    }
-
-    /// The MXFP4 GEMM asserts its scale operand is U8, so a plan that asks the
-    /// driver to expand these to F32 makes the kernel reject the load. Nothing
-    /// else pins this: the synthetic MXFP4 goldens are checkpoint-quantized
-    /// passthroughs, which produce no attachment at all.
-    #[test]
-    fn mxfp4_scales_stay_raw_e8m0() {
-        let tensors = vec![
-            tensor(0, "w.weight", quant(QuantScheme::Mxfp4E2M1E8M0, 32)),
-            tensor(1, "w.weight_scale", Encoding::Raw(DType::U8)),
-        ];
-        let attachments = derive_quant_attachments(&tensors);
-        assert_eq!(attachments.len(), 1);
-        assert_eq!(attachments[0].scale_form, ScaleForm::RawE8M0);
-        assert_eq!(attachments[0].group_size, 32);
-    }
-
-    #[test]
-    fn runtime_quantized_scales_are_f32_factors() {
-        let tensors = vec![
-            tensor(0, "w.weight", quant(QuantScheme::Fp8E4M3, 0)),
-            tensor(1, "w.weight_scale_inv", Encoding::Raw(DType::F32)),
-        ];
-        let attachments = derive_quant_attachments(&tensors);
-        assert_eq!(attachments.len(), 1);
-        assert_eq!(attachments[0].scale_form, ScaleForm::F32Factors);
-        assert_eq!(attachments[0].granularity, QuantGranularity::PerChannel);
-    }
-
-    /// Block-scaled FP8 arrives already quantized, so the pairing is found by
-    /// name rather than by encoding — but its scales still reach the GEMM as
-    /// F32 multipliers.
-    #[test]
-    fn checkpoint_block_scaled_fp8_is_f32_factors() {
-        let tensors = vec![
-            tensor(0, "w.weight", Encoding::Raw(DType::F8E4M3)),
-            tensor(1, "w.weight_scale_inv", Encoding::Raw(DType::F32)),
-        ];
-        let attachments = derive_quant_attachments(&tensors);
-        assert_eq!(attachments.len(), 1);
-        assert_eq!(attachments[0].scale_form, ScaleForm::F32Factors);
-        assert_eq!(attachments[0].group_size, 128);
     }
 }

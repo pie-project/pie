@@ -126,36 +126,46 @@ __global__ void hc_pre_postprocess_kernel(
 
 __global__ void hc_post_kernel(
     const __nv_bfloat16* __restrict__ x,        // [N, H]
-    const __nv_bfloat16* __restrict__ residual,  // [N, M, H]
+    const __nv_bfloat16* residual,               // [N, M, H]
     const float* __restrict__ post_mix,          // [N, M]
     const float* __restrict__ comb_mix,          // [N, M, M]
-    __nv_bfloat16* __restrict__ out,             // [N, M, H]
+    __nv_bfloat16* out,                          // [N, M, H], may alias residual
+    int N,
     int M,
     int H)
 {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int total = gridDim.x * blockDim.x;
+    // One thread owns a whole (n, h) column across all M streams. The caller
+    // runs this in place (`residual == out`), so a thread must load every
+    // residual value it needs before writing any of them; splitting the M
+    // outputs across threads would let one block overwrite a value another
+    // block has not read yet.
+    const long long idx =
+        static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= static_cast<long long>(N) * H) return;
 
-    // Each thread handles one (n, j, h) element
-    const int n_j_h = idx;
-    if (n_j_h >= total) return;
-
-    const int h = n_j_h % H;
-    const int j = (n_j_h / H) % M;
-    const int n = n_j_h / (H * M);
+    const int h = static_cast<int>(idx % H);
+    const int n = static_cast<int>(idx / H);
 
     const float* comb_n = comb_mix + static_cast<long long>(n) * M * M;
-    const float post_j = post_mix[static_cast<long long>(n) * M + j];
+    const float* post_n = post_mix + static_cast<long long>(n) * M;
     const float x_h = __bfloat162float(x[static_cast<long long>(n) * H + h]);
-
-    float acc = post_j * x_h;
     const __nv_bfloat16* res_n = residual + static_cast<long long>(n) * M * H;
+
+    float r[MAX_HC_MULT];
+    for (int i = 0; i < M; ++i) {
+        r[i] = __bfloat162float(res_n[static_cast<long long>(i) * H + h]);
+    }
+
+    __nv_bfloat16* out_n = out + static_cast<long long>(n) * M * H;
     // Reference: y[c=j, d=h] = post[c]*x[d] + sum_r comb[r, c] * residual[r, d]
     // comb is stored as [row, col] with row-major layout: comb[r*M + c].
-    for (int i = 0; i < M; ++i) {
-        acc += comb_n[i * M + j] * __bfloat162float(res_n[i * H + h]);
+    for (int j = 0; j < M; ++j) {
+        float acc = post_n[j] * x_h;
+        for (int i = 0; i < M; ++i) {
+            acc += comb_n[i * M + j] * r[i];
+        }
+        out_n[static_cast<long long>(j) * H + h] = __float2bfloat16(acc);
     }
-    out[static_cast<long long>(n) * M * H + j * H + h] = __float2bfloat16(acc);
 }
 
 __global__ void hc_head_postprocess_kernel(
@@ -196,13 +206,15 @@ __global__ void hc_head_postprocess_kernel(
 __global__ void hc_expand_kernel(
     const __nv_bfloat16* __restrict__ input,  // [N, H]
     __nv_bfloat16* __restrict__ output,       // [N, M, H]
+    int N,
     int M,
     int H)
 {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int n = idx / H;
-    const int h = idx % H;
-    if (h >= H) return;
+    const long long idx =
+        static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= static_cast<long long>(N) * H) return;
+    const int n = static_cast<int>(idx / H);
+    const int h = static_cast<int>(idx % H);
 
     const __nv_bfloat16 val = input[static_cast<long long>(n) * H + h];
     for (int m = 0; m < M; ++m) {
@@ -221,28 +233,33 @@ __global__ void hc_rmsnorm_to_f32_kernel(
     const __nv_bfloat16* row = input + static_cast<long long>(n) * dim;
     float* out = output + static_cast<long long>(n) * dim;
 
-    // Two-pass: first compute sum-of-squares, then scale
-    __shared__ float shared_sum;
-    if (tid == 0) shared_sum = 0.f;
-    __syncthreads();
     float local_sum = 0.f;
     for (int d = tid; d < dim; d += blockDim.x) {
         float v = __bfloat162float(row[d]);
         local_sum += v * v;
     }
-    // Warp reduce
+    // Fixed-order tree reduction. An atomicAdd across warps would make the
+    // sum depend on warp scheduling, and the hyper-connection mixes derived
+    // from it amplify that into run-to-run token differences.
     for (int offset = 16; offset > 0; offset >>= 1)
         local_sum += __shfl_down_sync(0xFFFFFFFF, local_sum, offset);
-    if (tid % 32 == 0)
-        atomicAdd(&shared_sum, local_sum);
+
+    __shared__ float warp_sums[BLOCK / 32];
+    if ((tid & 31) == 0) warp_sums[tid >> 5] = local_sum;
     __syncthreads();
 
-    if (tid == 0) shared_sum = rsqrtf(shared_sum / dim + eps);
+    __shared__ float scale;
+    if (tid == 0) {
+        float total = 0.f;
+        const int nwarps = (blockDim.x + 31) / 32;
+        for (int w = 0; w < nwarps; ++w) total += warp_sums[w];
+        scale = rsqrtf(total / dim + eps);
+    }
     __syncthreads();
 
-    const float scale = shared_sum;
+    const float s = scale;
     for (int d = tid; d < dim; d += blockDim.x) {
-        out[d] = __bfloat162float(row[d]) * scale;
+        out[d] = __bfloat162float(row[d]) * s;
     }
 }
 
@@ -284,15 +301,15 @@ void launch_hc_post_bf16(
     int hidden_size,
     cudaStream_t stream)
 {
-    const long long total = static_cast<long long>(N) * hc_mult * hidden_size;
-    if (total <= 0) return;
+    const long long total = static_cast<long long>(N) * hidden_size;
+    if (total <= 0 || hc_mult > MAX_HC_MULT) return;
     const int grid = static_cast<int>((total + BLOCK - 1) / BLOCK);
     hc_post_kernel<<<grid, BLOCK, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x),
         static_cast<const __nv_bfloat16*>(residual),
         post_mix, comb_mix,
         static_cast<__nv_bfloat16*>(out_residual),
-        hc_mult, hidden_size);
+        N, hc_mult, hidden_size);
 }
 
 void launch_hc_head_postprocess_bf16(
@@ -329,7 +346,7 @@ void launch_hc_expand_bf16(
     hc_expand_kernel<<<grid, BLOCK, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(input),
         static_cast<__nv_bfloat16*>(output),
-        hc_mult, hidden_size);
+        N, hc_mult, hidden_size);
 }
 
 void launch_hc_rmsnorm_to_f32(

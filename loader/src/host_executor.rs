@@ -129,33 +129,6 @@ impl HostExecutor<'_> {
                     let bytes = self.read_extent(&source)?;
                     self.write_arena(dest_offset, &bytes)?;
                 }
-                StorageInstr::SlabScatter {
-                    file_id,
-                    file_offset,
-                    span_bytes,
-                    placements,
-                    ..
-                } => {
-                    let slab = self.read_file(
-                        file_id.0,
-                        file_offset,
-                        span_bytes,
-                        self.plan.target.max_tile_bytes,
-                    )?;
-                    for placement in placements {
-                        let start = usize::try_from(placement.src_offset)
-                            .map_err(|_| invalid("slab source offset overflow"))?;
-                        let len = usize::try_from(placement.bytes)
-                            .map_err(|_| invalid("slab placement size overflow"))?;
-                        let end = start
-                            .checked_add(len)
-                            .ok_or_else(|| invalid("slab source range overflow"))?;
-                        let bytes = slab
-                            .get(start..end)
-                            .ok_or_else(|| invalid("slab source placement is out of bounds"))?;
-                        self.write_arena(placement.dest_offset, bytes)?;
-                    }
-                }
                 StorageInstr::TileMap {
                     kind,
                     source,
@@ -682,6 +655,12 @@ fn decode_values(bytes: &[u8], dtype: DType) -> Result<Vec<f64>, Error> {
                 DType::F8E4M3 | DType::F8E5M2 => {
                     return Err(invalid("host Cast does not implement FP8"));
                 }
+                // A 64-bit integer does not survive the f64 pivot this cast
+                // is written around, and nothing asks it to: `I64`/`U64`
+                // tensors are index tables that move byte-for-byte.
+                DType::I64 | DType::U64 => {
+                    return Err(invalid("host Cast does not implement 64-bit integers"));
+                }
             })
         })
         .collect()
@@ -711,6 +690,9 @@ fn encode_values(values: &[f64], dtype: DType) -> Result<Vec<u8>, Error> {
             DType::F8E4M3 | DType::F8E5M2 => {
                 return Err(invalid("host Cast does not implement FP8"));
             }
+            DType::I64 | DType::U64 => {
+                return Err(invalid("host Cast does not implement 64-bit integers"));
+            }
         }
     }
     Ok(out)
@@ -722,7 +704,6 @@ fn instr_id(instr: &StorageInstr) -> crate::types::InstrId {
         | StorageInstr::Fill { id, .. }
         | StorageInstr::ExtentWrite { id, .. }
         | StorageInstr::BulkExtentWrite { id, .. }
-        | StorageInstr::SlabScatter { id, .. }
         | StorageInstr::TileMap { id, .. }
         | StorageInstr::CreateView { id, .. }
         | StorageInstr::Finalize { id, .. } => *id,
@@ -804,7 +785,6 @@ mod tests {
             }],
         };
         let contract = ModelContract {
-            abi_version: 1,
             alignment: 1,
             tensors: vec![TensorContract::new(
                 "padded",
@@ -911,6 +891,7 @@ mod tests {
                     file_offset: data_offset,
                     span_bytes: 4,
                     stride: extent(1, 1, &[(2, 3, 2), (2, 1, 1)]),
+                    dtype: DType::U16,
                 },
                 dest: DestExtent {
                     buffer: BufferId(0),
@@ -1021,6 +1002,7 @@ mod tests {
             file_offset,
             span_bytes: 4,
             stride: extent(1, 1, &[(2, 3, 2), (2, 1, 1)]),
+            dtype: DType::U16,
         });
         inputs.clear();
         let storage = execute_plan(&plan, &dir).unwrap();

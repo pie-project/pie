@@ -17,13 +17,15 @@ __global__ void rmsnorm_bf16_kernel(
     const __nv_bfloat16* __restrict__ weight,
     __nv_bfloat16* __restrict__ y,
     int hidden,
+    int x_row_stride,
+    int y_row_stride,
     float eps)
 {
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
 
-    const __nv_bfloat16* xr = x + row * hidden;
-    __nv_bfloat16* yr = y + row * hidden;
+    const __nv_bfloat16* xr = x + static_cast<long long>(row) * x_row_stride;
+    __nv_bfloat16* yr = y + static_cast<long long>(row) * y_row_stride;
 
     // L2 norm across the row, accumulated in fp32.
     float local = 0.f;
@@ -253,6 +255,15 @@ void launch_rmsnorm_bf16(
     const void* x, const void* weight, void* y,
     int num_rows, int hidden, float eps, cudaStream_t stream)
 {
+    launch_rmsnorm_strided_bf16(
+        x, weight, y, num_rows, hidden, hidden, hidden, eps, stream);
+}
+
+void launch_rmsnorm_strided_bf16(
+    const void* x, const void* weight, void* y,
+    int num_rows, int hidden, int x_row_stride, int y_row_stride,
+    float eps, cudaStream_t stream)
+{
     constexpr int BLOCK = 256;
     dim3 grid(num_rows);
     dim3 block(BLOCK);
@@ -260,7 +271,7 @@ void launch_rmsnorm_bf16(
         static_cast<const __nv_bfloat16*>(x),
         static_cast<const __nv_bfloat16*>(weight),
         static_cast<__nv_bfloat16*>(y),
-        hidden, eps);
+        hidden, x_row_stride, y_row_stride, eps);
 }
 
 void launch_residual_add_rmsnorm_bf16(
@@ -363,7 +374,7 @@ void launch_rmsnorm_gemma_bf16(
         static_cast<const __nv_bfloat16*>(x),
         static_cast<const __nv_bfloat16*>(weight),
         static_cast<__nv_bfloat16*>(y),
-        hidden, eps);
+        hidden, hidden, hidden, eps);
 }
 
 namespace {

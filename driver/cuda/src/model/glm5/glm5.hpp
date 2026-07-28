@@ -85,10 +85,24 @@ struct Glm5LayerWeights {
     std::optional<QuantMeta> dense_up_quant;
     std::optional<QuantMeta> dense_down_quant;
 
+    // When the checkpoint's dense gate/up are BF16 and TP==1, the loader
+    // concatenates them into `mlp.gate_up_proj.fused.weight` and drops the
+    // originals; `dense_gate_proj` / `dense_up_proj` then point at row views
+    // owned here (see `bind_glm5`).
+    std::unique_ptr<DeviceTensor> dense_gate_view;
+    std::unique_ptr<DeviceTensor> dense_up_view;
+
     // Routed + shared MoE (layers >= first_k_dense_replace).
     const DeviceTensor* router = nullptr;                  // [E, H]  (typically bf16/fp32)
     const DeviceTensor* e_score_correction_bias = nullptr; // [E] or null
     std::vector<Glm5ExpertWeights> experts;                // size E
+
+    // Contiguous BF16 expert stacks produced by the loader contract when the
+    // checkpoint ships plain per-expert BF16 weights. When both are present the
+    // forward takes the device-side aligned MoE path (no host round-trip);
+    // otherwise it falls back to the per-expert loop over `experts`.
+    const DeviceTensor* moe_gate_up_proj = nullptr;  // [E, 2*I_moe, H] bf16
+    const DeviceTensor* moe_down_proj    = nullptr;  // [E, H, I_moe]   bf16
 
     const DeviceTensor* shared_gate_proj = nullptr;        // [I_shared, H]
     const DeviceTensor* shared_up_proj   = nullptr;        // [I_shared, H]

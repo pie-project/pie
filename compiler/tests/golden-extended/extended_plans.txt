@@ -1,4 +1,6 @@
-# Emitter output for the extended corpus (`msl_corpus::extended_traces`).
+# A pin of the extended corpus (`msl_corpus::extended_traces`) -- the traces
+# added to reach the ops, intrinsics, schedules and stages that
+# `corpus_stages()` never compiles.
 #
 # Source of truth: THIS COMPILER. Unlike `golden-{msl,cuda}/`, no C++ oracle
 # ever produced or reviewed these bytes -- they were never cross-checked against

@@ -33,7 +33,11 @@ void launch_kimi_split_kv_a_norm_bf16(
     int kv_lora_rank,
     int qk_rope_dim,
     float eps,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    // Row pitch of `kv_a`, for reading the kv half straight out of Kimi's
+    // fused `q_a + kv_a` projection. 0 means the rows are exactly
+    // `kv_lora_rank + qk_rope_dim` wide.
+    int src_row_stride = 0);
 
 void launch_topk_sigmoid_bf16(
     const void* logits,
@@ -45,28 +49,6 @@ void launch_topk_sigmoid_bf16(
     int top_k,
     bool renormalize,
     float routed_scaling_factor,
-    cudaStream_t stream);
-
-void launch_kimi_q_nope_to_latent_bf16(
-    const void* q_nope,     // [tokens, heads, qk_nope_dim]
-    const void* kv_b_proj,  // [heads * (qk_nope_dim + v_head_dim), kv_lora_rank]
-    void* q_latent,         // [tokens, heads, kv_lora_rank]
-    int tokens,
-    int heads,
-    int qk_nope_dim,
-    int v_head_dim,
-    int kv_lora_rank,
-    cudaStream_t stream);
-
-void launch_kimi_latent_to_v_bf16(
-    const void* attn_latent, // [tokens, heads, kv_lora_rank]
-    const void* kv_b_proj,   // [heads * (qk_nope_dim + v_head_dim), kv_lora_rank]
-    void* attn_v,            // [tokens, heads, v_head_dim]
-    int tokens,
-    int heads,
-    int qk_nope_dim,
-    int v_head_dim,
-    int kv_lora_rank,
     cudaStream_t stream);
 
 }  // namespace pie_cuda_driver::kernels

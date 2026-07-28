@@ -428,4 +428,428 @@ void launch_attention_compressed_bf16(
     CUDA_CHECK(cudaFreeAsync(params_d, stream));
 }
 
+
+namespace {
+
+__global__ void dsv4_compress_gather_kernel(
+    const __nv_bfloat16* __restrict__ kv_proj,
+    const __nv_bfloat16* __restrict__ score_proj,
+    const float* __restrict__ ape,
+    const std::int32_t* __restrict__ boundary_tok,
+    const std::int32_t* __restrict__ boundary_pos,
+    const std::int32_t* __restrict__ window_lo,
+    __nv_bfloat16* __restrict__ out,
+    int head_dim,
+    int ratio,
+    int coff) {
+    const int c = blockIdx.x;
+    const int window = coff * ratio;
+    const int proj_dim = coff * head_dim;
+    const int btok = boundary_tok[c];
+    const int bpos = boundary_pos[c];
+    const int lo = window_lo[c];
+
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float max_s = -INFINITY;
+        for (int i = 0; i < window; ++i) {
+            const int rel = i - (window - 1);
+            const int tok = btok + rel;
+            const int pos = bpos + rel;
+            if (tok < lo || pos < 0) continue;
+            const int col = ((i >= ratio) ? head_dim : 0) + d;
+            float s = __bfloat162float(score_proj[static_cast<long long>(tok) * proj_dim + col]);
+            if (ape != nullptr) {
+                s += ape[static_cast<long long>(pos % ratio) * proj_dim + col];
+            }
+            max_s = fmaxf(max_s, s);
+        }
+        if (!isfinite(max_s)) {
+            out[static_cast<long long>(c) * head_dim + d] = __float2bfloat16(0.0f);
+            continue;
+        }
+        float sum_e = 0.0f;
+        float acc = 0.0f;
+        for (int i = 0; i < window; ++i) {
+            const int rel = i - (window - 1);
+            const int tok = btok + rel;
+            const int pos = bpos + rel;
+            if (tok < lo || pos < 0) continue;
+            const int col = ((i >= ratio) ? head_dim : 0) + d;
+            const long long idx = static_cast<long long>(tok) * proj_dim + col;
+            float s = __bfloat162float(score_proj[idx]);
+            if (ape != nullptr) {
+                s += ape[static_cast<long long>(pos % ratio) * proj_dim + col];
+            }
+            const float e = __expf(s - max_s);
+            sum_e += e;
+            acc += e * __bfloat162float(kv_proj[idx]);
+        }
+        out[static_cast<long long>(c) * head_dim + d] =
+            __float2bfloat16(sum_e > 0.0f ? acc / sum_e : 0.0f);
+    }
+}
+
+}  // namespace
+
+void launch_dsv4_compress_gather_bf16(
+    const void* kv_proj,
+    const void* score_proj,
+    const float* ape,
+    const std::int32_t* boundary_tok,
+    const std::int32_t* boundary_pos,
+    const std::int32_t* window_lo,
+    void* out,
+    int num_entries,
+    int head_dim,
+    int ratio,
+    int coff,
+    cudaStream_t stream) {
+    if (num_entries <= 0 || head_dim <= 0 || ratio <= 0 || coff <= 0) return;
+    const int threads = head_dim < BLOCK ? ((head_dim + 31) / 32) * 32 : BLOCK;
+    dsv4_compress_gather_kernel<<<num_entries, threads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(kv_proj),
+        static_cast<const __nv_bfloat16*>(score_proj),
+        ape,
+        boundary_tok,
+        boundary_pos,
+        window_lo,
+        static_cast<__nv_bfloat16*>(out),
+        head_dim,
+        ratio,
+        coff);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+
+namespace {
+
+__device__ __forceinline__ long long paged_slot(
+    const std::uint32_t* __restrict__ kv_page_indices,
+    const std::uint32_t* __restrict__ kv_page_indptr,
+    int req, int pos, int page_size) {
+    const std::uint32_t page =
+        kv_page_indices[kv_page_indptr[req] + pos / page_size];
+    return static_cast<long long>(page) * page_size + (pos % page_size);
+}
+
+// Device-side boundary metadata for the pure-decode path.
+//
+// The host path scans `positions` on the CPU and emits a compacted boundary
+// list, which needs a D2H copy plus a stream sync and so makes the whole
+// forward ineligible for CUDA graph capture. In pure decode every request
+// contributes exactly one token, so instead we emit one *fixed* slot per
+// token and mark non-boundaries with `pos = -1`; the consumers skip those.
+// Nothing is read back to the host, so the layer is capturable.
+__global__ void dsv4_boundary_meta_decode_kernel(
+    const std::int32_t* __restrict__ positions,
+    std::int32_t* __restrict__ out_pos,
+    std::int32_t* __restrict__ out_req,
+    std::int32_t* __restrict__ out_rope,
+    int n,
+    int ratio,
+    const std::uint8_t* __restrict__ row_valid) {
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= n) return;
+    const int p = positions[t];
+    // CUDA-graph padding rows must never emit a compressed entry.
+    const bool valid = (row_valid == nullptr) || (row_valid[t] != 0);
+    const bool is_boundary = valid && (((p + 1) % ratio) == 0);
+    out_pos[t] = is_boundary ? p : -1;
+    out_req[t] = t;                              // one token per request
+    out_rope[t] = is_boundary ? (p / ratio) * ratio : 0;
+}
+
+__global__ void dsv4_compress_gather_paged_kernel(
+    const __nv_bfloat16* __restrict__ state_kv,
+    const __nv_bfloat16* __restrict__ state_score,
+    const float* __restrict__ ape,
+    const std::int32_t* __restrict__ boundary_pos,
+    const std::int32_t* __restrict__ boundary_req,
+    const std::uint32_t* __restrict__ kv_page_indices,
+    const std::uint32_t* __restrict__ kv_page_indptr,
+    __nv_bfloat16* __restrict__ out,
+    int head_dim,
+    int ratio,
+    int coff,
+    int page_size) {
+    const int c = blockIdx.x;
+    const int window = coff * ratio;
+    const int width = coff * head_dim;
+    const int bpos = boundary_pos[c];
+    const int req = boundary_req[c];
+    // `bpos < 0` marks a padding row: the CUDA-graph-safe decode path emits a
+    // fixed-length boundary list (one slot per token) instead of a host-
+    // compacted one, so slots for tokens that are not window boundaries have
+    // to fall through as zeros rather than shrink the launch.
+    if (bpos < 0) {
+        __nv_bfloat16* z = out + static_cast<long long>(c) * head_dim;
+        for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+            z[d] = __float2bfloat16(0.f);
+        }
+        return;
+    }
+
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float max_s = -INFINITY;
+        for (int i = 0; i < window; ++i) {
+            const int pos = bpos + i - (window - 1);
+            if (pos < 0) continue;
+            const int col = ((i >= ratio) ? head_dim : 0) + d;
+            const long long slot =
+                paged_slot(kv_page_indices, kv_page_indptr, req, pos, page_size);
+            float sc = __bfloat162float(state_score[slot * width + col]);
+            if (ape != nullptr) {
+                sc += ape[static_cast<long long>(pos % ratio) * width + col];
+            }
+            max_s = fmaxf(max_s, sc);
+        }
+        if (!isfinite(max_s)) {
+            out[static_cast<long long>(c) * head_dim + d] = __float2bfloat16(0.0f);
+            continue;
+        }
+        float sum_e = 0.0f;
+        float acc = 0.0f;
+        for (int i = 0; i < window; ++i) {
+            const int pos = bpos + i - (window - 1);
+            if (pos < 0) continue;
+            const int col = ((i >= ratio) ? head_dim : 0) + d;
+            const long long slot =
+                paged_slot(kv_page_indices, kv_page_indptr, req, pos, page_size);
+            float sc = __bfloat162float(state_score[slot * width + col]);
+            if (ape != nullptr) {
+                sc += ape[static_cast<long long>(pos % ratio) * width + col];
+            }
+            const float e = __expf(sc - max_s);
+            sum_e += e;
+            acc += e * __bfloat162float(state_kv[slot * width + col]);
+        }
+        out[static_cast<long long>(c) * head_dim + d] =
+            __float2bfloat16(sum_e > 0.0f ? acc / sum_e : 0.0f);
+    }
+}
+
+__global__ void dsv4_store_comp_entries_kernel(
+    const __nv_bfloat16* __restrict__ entries,
+    __nv_bfloat16* __restrict__ comp_kv_pages,
+    const std::int32_t* __restrict__ boundary_pos,
+    const std::int32_t* __restrict__ boundary_req,
+    const std::uint32_t* __restrict__ kv_page_indices,
+    const std::uint32_t* __restrict__ kv_page_indptr,
+    int head_dim,
+    int page_size) {
+    const int c = blockIdx.x;
+    if (boundary_pos[c] < 0) return;   // padding row (see gather kernel)
+    const long long slot = paged_slot(kv_page_indices, kv_page_indptr,
+                                      boundary_req[c], boundary_pos[c], page_size);
+    const __nv_bfloat16* src = entries + static_cast<long long>(c) * head_dim;
+    __nv_bfloat16* dst = comp_kv_pages + slot * head_dim;
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) dst[d] = src[d];
+}
+
+__global__ void compressed_attn_paged_kernel(
+    const __nv_bfloat16* __restrict__ q,
+    const __nv_bfloat16* __restrict__ comp_kv_pages,
+    __nv_bfloat16* __restrict__ o,
+    float* __restrict__ lse_out,
+    const std::int32_t* __restrict__ positions,
+    const std::uint32_t* __restrict__ kv_page_indices,
+    const std::uint32_t* __restrict__ kv_page_indptr,
+    const std::int32_t* __restrict__ req_of_token,
+    int num_q_heads,
+    int head_dim,
+    int ratio,
+    int page_size,
+    float scale) {
+    const int qi = blockIdx.x;
+    const int q_head = blockIdx.y;
+    const int tid = threadIdx.x;
+
+    const int req = req_of_token[qi];
+    const int qpos = positions[qi];
+    // Entry c ends at absolute position (c + 1) * ratio - 1.
+    const int num_visible = (qpos + 1) / ratio;
+
+    extern __shared__ float smem[];
+    float* q_smem = smem;                  // [head_dim]
+    float* reduce = smem + head_dim;       // [ATTN_BLOCK]
+
+    const __nv_bfloat16* q_row =
+        q + (static_cast<long long>(qi) * num_q_heads + q_head) * head_dim;
+    for (int d = tid; d < head_dim; d += ATTN_BLOCK) {
+        q_smem[d] = __bfloat162float(q_row[d]);
+    }
+    __syncthreads();
+
+    __nv_bfloat16* o_row =
+        o + (static_cast<long long>(qi) * num_q_heads + q_head) * head_dim;
+
+    if (num_visible <= 0) {
+        for (int d = tid; d < head_dim; d += ATTN_BLOCK) {
+            o_row[d] = __float2bfloat16(0.f);
+        }
+        if (lse_out != nullptr && tid == 0) {
+            lse_out[qi * num_q_heads + q_head] = -INFINITY;
+        }
+        return;
+    }
+
+    float local_max = -INFINITY;
+    for (int c = tid; c < num_visible; c += ATTN_BLOCK) {
+        const long long slot = paged_slot(kv_page_indices, kv_page_indptr, req,
+                                          (c + 1) * ratio - 1, page_size);
+        const __nv_bfloat16* k_row = comp_kv_pages + slot * head_dim;
+        float dot = 0.f;
+        for (int d = 0; d < head_dim; ++d) {
+            dot += q_smem[d] * __bfloat162float(k_row[d]);
+        }
+        local_max = fmaxf(local_max, dot * scale);
+    }
+    reduce[tid] = local_max;
+    __syncthreads();
+    for (int off = ATTN_BLOCK / 2; off > 0; off >>= 1) {
+        if (tid < off) reduce[tid] = fmaxf(reduce[tid], reduce[tid + off]);
+        __syncthreads();
+    }
+    const float row_max = reduce[0];
+
+    const int dims_per_thread = (head_dim + ATTN_BLOCK - 1) / ATTN_BLOCK;
+    float acc[8] = {};
+    float local_z = 0.f;
+
+    for (int c = 0; c < num_visible; ++c) {
+        const long long slot = paged_slot(kv_page_indices, kv_page_indptr, req,
+                                          (c + 1) * ratio - 1, page_size);
+        const __nv_bfloat16* k_row = comp_kv_pages + slot * head_dim;
+        float dot = 0.f;
+        for (int d = tid; d < head_dim; d += ATTN_BLOCK) {
+            dot += q_smem[d] * __bfloat162float(k_row[d]);
+        }
+        reduce[tid] = dot;
+        __syncthreads();
+        for (int off = ATTN_BLOCK / 2; off > 0; off >>= 1) {
+            if (tid < off) reduce[tid] += reduce[tid + off];
+            __syncthreads();
+        }
+        const float w = expf(reduce[0] * scale - row_max);
+        if (tid == 0) local_z += w;
+        __syncthreads();
+
+        for (int i = 0; i < dims_per_thread; ++i) {
+            const int d = tid + i * ATTN_BLOCK;
+            if (d < head_dim) acc[i] += w * __bfloat162float(k_row[d]);
+        }
+    }
+
+    __shared__ float z_shared;
+    if (tid == 0) z_shared = local_z;
+    __syncthreads();
+    const float inv_z = z_shared > 0.f ? 1.0f / z_shared : 0.f;
+
+    if (lse_out != nullptr && tid == 0) {
+        lse_out[qi * num_q_heads + q_head] =
+            z_shared > 0.f ? (logf(z_shared) + row_max) : -INFINITY;
+    }
+    for (int i = 0; i < dims_per_thread; ++i) {
+        const int d = tid + i * ATTN_BLOCK;
+        if (d < head_dim) o_row[d] = __float2bfloat16(acc[i] * inv_z);
+    }
+}
+
+}  // namespace
+
+void launch_dsv4_compress_gather_paged_bf16(
+    const void* state_kv,
+    const void* state_score,
+    const float* ape,
+    const std::int32_t* boundary_pos,
+    const std::int32_t* boundary_req,
+    const std::uint32_t* kv_page_indices,
+    const std::uint32_t* kv_page_indptr,
+    void* out,
+    int num_entries,
+    int head_dim,
+    int ratio,
+    int coff,
+    int page_size,
+    cudaStream_t stream) {
+    if (num_entries <= 0 || head_dim <= 0 || ratio <= 0 || coff <= 0) return;
+    const int threads = head_dim < BLOCK ? ((head_dim + 31) / 32) * 32 : BLOCK;
+    dsv4_compress_gather_paged_kernel<<<num_entries, threads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(state_kv),
+        static_cast<const __nv_bfloat16*>(state_score),
+        ape, boundary_pos, boundary_req, kv_page_indices, kv_page_indptr,
+        static_cast<__nv_bfloat16*>(out),
+        head_dim, ratio, coff, page_size);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_dsv4_boundary_meta_decode(
+    const std::int32_t* positions,
+    std::int32_t* out_pos,
+    std::int32_t* out_req,
+    std::int32_t* out_rope,
+    int n,
+    int ratio,
+    cudaStream_t stream,
+    const std::uint8_t* row_valid) {
+    if (n <= 0 || ratio <= 0) return;
+    const int threads = 128;
+    const int blocks = (n + threads - 1) / threads;
+    dsv4_boundary_meta_decode_kernel<<<blocks, threads, 0, stream>>>(
+        positions, out_pos, out_req, out_rope, n, ratio, row_valid);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_dsv4_store_comp_entries_bf16(
+    const void* entries,
+    void* comp_kv_pages,
+    const std::int32_t* boundary_pos,
+    const std::int32_t* boundary_req,
+    const std::uint32_t* kv_page_indices,
+    const std::uint32_t* kv_page_indptr,
+    int num_entries,
+    int head_dim,
+    int page_size,
+    cudaStream_t stream) {
+    if (num_entries <= 0 || head_dim <= 0) return;
+    const int threads = head_dim < BLOCK ? ((head_dim + 31) / 32) * 32 : BLOCK;
+    dsv4_store_comp_entries_kernel<<<num_entries, threads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(entries),
+        static_cast<__nv_bfloat16*>(comp_kv_pages),
+        boundary_pos, boundary_req, kv_page_indices, kv_page_indptr,
+        head_dim, page_size);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_attention_compressed_paged_bf16(
+    const void* q,
+    const void* comp_kv_pages,
+    void* o,
+    float* lse_out,
+    const std::int32_t* positions,
+    const std::uint32_t* /*qo_indptr*/,
+    const std::uint32_t* kv_page_indices,
+    const std::uint32_t* kv_page_indptr,
+    const std::int32_t* req_of_token,
+    int total_tokens,
+    int num_q_heads,
+    int head_dim,
+    int ratio,
+    int page_size,
+    float sm_scale,
+    cudaStream_t stream) {
+    if (total_tokens <= 0 || num_q_heads <= 0) return;
+    dim3 grid(static_cast<unsigned>(total_tokens),
+              static_cast<unsigned>(num_q_heads));
+    const std::size_t smem =
+        (static_cast<std::size_t>(head_dim) + ATTN_BLOCK) * sizeof(float);
+    compressed_attn_paged_kernel<<<grid, ATTN_BLOCK, smem, stream>>>(
+        static_cast<const __nv_bfloat16*>(q),
+        static_cast<const __nv_bfloat16*>(comp_kv_pages),
+        static_cast<__nv_bfloat16*>(o), lse_out,
+        positions, kv_page_indices, kv_page_indptr, req_of_token,
+        num_q_heads, head_dim, ratio, page_size, sm_scale);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 }  // namespace pie_cuda_driver::kernels

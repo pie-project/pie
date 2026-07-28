@@ -98,6 +98,32 @@ void test_expect_states_a_shape() {
     check(v.tensors.ptr[0].shape.ptr[1] == 8, "the stated extents come back");
 }
 
+// A scale tensor states which weight it scales. The name it states is stored
+// by the builder, not borrowed from the caller, so it has to outlive the
+// argument it came from.
+void test_scaling_states_the_weight() {
+    pie_loader::ModelContract c;
+    c.define("w", c.src("w"), pie_loader::raw(pie_loader::PieLoaderDType::F8E4M3))
+        .expect({256, 512});
+    {
+        std::string weight = "w";
+        c.define("w_scale_inv", c.src("w_scale_inv"),
+                 pie_loader::raw(pie_loader::PieLoaderDType::F32))
+            .expect({2, 4})
+            .scaling(weight, pie_loader::PieLoaderQuantGranularity::PerGroup, 128, 0,
+                     pie_loader::PieLoaderScaleForm::F32Factors);
+    }
+    const auto v = c.view();
+    check(v.tensors.len == 2, "two declarations");
+    check(view_of(v.tensors.ptr[0].scales.of).empty(), "a weight states no scales of its own");
+    const auto& sc = v.tensors.ptr[1].scales;
+    check(view_of(sc.of) == "w", "the scale states the weight it belongs to");
+    check(sc.group_size == 128 && sc.channel_axis == 0, "the stated block size comes back");
+    check(sc.granularity == pie_loader::PieLoaderQuantGranularity::PerGroup &&
+              sc.form == pie_loader::PieLoaderScaleForm::F32Factors,
+          "the stated granularity and form come back");
+}
+
 // The reason the builder stores names, shapes and nodes in deques. With a
 // vector, growing past the initial capacity would move everything and leave the
 // already-borrowed view pointing at freed memory — a use-after-free the loader
@@ -182,12 +208,22 @@ nlohmann::json contract_to_json(const pie_loader::PieLoaderModelContractView& v)
     nlohmann::json tensors = nlohmann::json::array();
     for (std::size_t i = 0; i < v.tensors.len; ++i) {
         const auto& t = v.tensors.ptr[i];
-        tensors.push_back({{"name", std::string(view_of(t.name))},
-                           {"root", t.root},
-                           {"shape", shape_to_json(t.shape)}});
+        nlohmann::json entry = {{"name", std::string(view_of(t.name))},
+                                {"root", t.root},
+                                {"shape", shape_to_json(t.shape)}};
+        // Which weight a scale belongs to is now the contract's to say, so a
+        // dump that omitted it would be blind to the pairing changing — the
+        // same reason `repack` above is spelled out.
+        if (t.scales.of.len != 0) {
+            entry["scales"] = {{"of", std::string(view_of(t.scales.of))},
+                               {"granularity", static_cast<std::uint32_t>(t.scales.granularity)},
+                               {"group_size", t.scales.group_size},
+                               {"channel_axis", t.scales.channel_axis},
+                               {"form", static_cast<std::uint32_t>(t.scales.form)}};
+        }
+        tensors.push_back(std::move(entry));
     }
-    return {{"abi_version", v.abi_version},
-            {"alignment", v.alignment},
+    return {{"alignment", v.alignment},
             {"nodes", std::move(nodes)},
             {"tensors", std::move(tensors)}};
 }
@@ -312,14 +348,6 @@ nlohmann::json plan_to_json(const pie_loader::LoadPlanView& p) {
             entry["dest_offset"] = op.dest_offset;
             break;
         }
-        case Tag::SlabScatter: {
-            const auto& op = in.op.slab_scatter;
-            entry["slab_file"] = op.file_id;
-            entry["slab_offset"] = op.file_offset;
-            entry["slab_span"] = op.span_bytes;
-            entry["slab_placements"] = op.placements.len;
-            break;
-        }
         case Tag::TileMap: {
             const auto& op = in.op.tile_map;
             entry["tile_kind"] = static_cast<int>(op.tile_kind);
@@ -373,10 +401,28 @@ nlohmann::json plan_to_json(const pie_loader::LoadPlanView& p) {
     }
     nlohmann::json schedule = nlohmann::json::array();
     for (std::size_t i = 0; i < p.schedule.len; ++i) schedule.push_back(p.schedule.ptr[i]);
+    nlohmann::json attachments = nlohmann::json::array();
+    for (std::size_t i = 0; i < p.attachments.len; ++i) {
+        const auto& a = p.attachments.ptr[i];
+        auto name_of = [&](std::uint32_t id) {
+            for (std::size_t t = 0; t < p.tensors.len; ++t)
+                if (p.tensors.ptr[t].id == id)
+                    return std::string(view_of(p.tensors.ptr[t].name));
+            return std::string("<unknown>");
+        };
+        attachments.push_back(
+            {{"tensor", name_of(a.tensor_id)},
+             {"scale_tensor", name_of(a.scale_tensor_id)},
+             {"granularity", static_cast<int>(a.granularity)},
+             {"group_size", a.group_size},
+             {"channel_axis", a.channel_axis},
+             {"scale_form", static_cast<int>(a.scale_form)}});
+    }
     return {{"instrs", std::move(instrs)},
             {"buffers", std::move(buffers)},
             {"tensors", std::move(tensors)},
             {"schedule", std::move(schedule)},
+            {"attachments", std::move(attachments)},
             {"read_bytes", p.memory.checkpoint_read_bytes},
             {"write_bytes", p.memory.device_write_bytes},
             {"persistent_bytes", p.memory.persistent_bytes}};
@@ -507,6 +553,7 @@ void author_real_contract(const std::string& snapshot, const char* dest) {
 int main() {
     test_a_handle_names_one_node();
     test_expect_states_a_shape();
+    test_scaling_states_the_weight();
     test_the_view_survives_growth();
 
     const char* snapshot = std::getenv("PIE_TEST_SNAPSHOT");

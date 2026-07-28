@@ -18,7 +18,7 @@ constexpr static const uint32_t PIE_LOADER_NO_NODE = UINT32_MAX;
 constexpr static const int32_t PIE_LOADER_NO_AXIS = -1;
 
 /// Sentinel for "no buffer", mirroring the C++ `numeric_limits<uint32_t>::max()`
-/// defaults on `PieLoaderStorageInstrView::buffer_id` and `slab_file_id`.
+/// default on `PieLoaderStorageInstrView::buffer_id`.
 constexpr static const uint32_t PIE_LOADER_NO_BUFFER = UINT32_MAX;
 
 /// Sentinel for "no source tensor", on the optional tensor-id fields.
@@ -50,10 +50,6 @@ enum class PieLoaderStatus : uint32_t {
   ContractViolation = 3,
   /// The compiler failed on input it should have handled. A bug in the loader.
   Internal = 4,
-  /// A panic was caught at the boundary. Also a bug in the loader, but
-  /// distinguished because the diagnostic is a panic payload rather than a
-  /// structured error.
-  Panic = 5,
 };
 
 /// Which on-disk format a checkpoint file uses.
@@ -70,6 +66,24 @@ enum class PieLoaderSeverity : uint32_t {
   Error = 1,
 };
 
+/// How a scale tensor's entries map onto the tensor they scale.
+enum class PieLoaderQuantGranularity : uint32_t {
+  PerChannel = 0,
+  PerGroup = 1,
+};
+
+/// What the driver's kernels expect a scale tensor to hold when they read it.
+///
+/// Not derivable from the scale tensor: its dtype says how the bytes are stored,
+/// not how the kernel wants them. The driver used to infer this from
+/// `group_size == 32`.
+enum class PieLoaderScaleForm : uint32_t {
+  /// Raw E8M0 exponent bytes, consumed as-is.
+  RawE8M0 = 0,
+  /// F32 multipliers; expand before the GEMM sees them.
+  F32Factors = 1,
+};
+
 enum class PieLoaderDType : uint32_t {
   F32 = 0,
   F16 = 1,
@@ -84,6 +98,8 @@ enum class PieLoaderDType : uint32_t {
   U8 = 10,
   Bool = 11,
   E8M0 = 12,
+  I64 = 13,
+  U64 = 14,
 };
 
 enum class PieLoaderEncodingKind : uint32_t {
@@ -155,24 +171,6 @@ enum class PieLoaderBackendKind : uint32_t {
   Cuda = 0,
   Metal = 1,
   Unknown = 255,
-};
-
-/// How a scale tensor's entries map onto the tensor they scale.
-enum class PieLoaderQuantGranularity : uint32_t {
-  PerChannel = 0,
-  PerGroup = 1,
-};
-
-/// What the driver's kernels expect a scale tensor to hold when they read it.
-///
-/// Not derivable from the scale tensor: its dtype says how the bytes are stored,
-/// not how the kernel wants them. The driver used to infer this from
-/// `group_size == 32`.
-enum class PieLoaderScaleForm : uint32_t {
-  /// Raw E8M0 exponent bytes, consumed as-is.
-  RawE8M0 = 0,
-  /// F32 multipliers; expand before the GEMM sees them.
-  F32Factors = 1,
 };
 
 /// Which constructor a node is. Mirrors [`crate::contract::Expr`] exactly; a
@@ -404,6 +402,31 @@ struct PieLoaderExprNode {
 
 using PieLoaderExprNodeSlice = PieLoaderSlice<PieLoaderExprNode>;
 
+/// What a scale tensor scales, said by the entry that declares the scales.
+///
+/// The loader used to work this pairing out by matching name suffixes —
+/// `{name}_scale_inv`, then `{base}.scale`, with the group size hardcoded to 128
+/// beside them. The driver had already found it properly and thrown it away:
+/// `dsv4_block_scales_to_fp32` takes a `.scale` tensor, looks up `<base>.weight`
+/// and publishes only if that companion is really FP8-E4M3. This is where that
+/// finding is kept.
+///
+/// Only for scales the *checkpoint* shipped. Scales the loader creates while
+/// quantizing are paired at creation, with no name involved.
+struct PieLoaderScalesView {
+  /// Name of the tensor these scales belong to. Empty means this entry is
+  /// not a scale tensor and the rest of this struct is ignored.
+  ///
+  /// Unlike `Expr::Out` this may name a *later* declaration: it pairs two
+  /// published tensors rather than feeding one into the other.
+  PieLoaderBytes of;
+  PieLoaderQuantGranularity granularity;
+  /// Elements of `of` per scale entry, for `PerGroup`.
+  uint32_t group_size;
+  uint32_t channel_axis;
+  PieLoaderScaleForm form;
+};
+
 /// One declared tensor: a name, the expression that produces it, and what the
 /// driver believes the result is.
 struct PieLoaderTensorContractView {
@@ -422,13 +445,14 @@ struct PieLoaderTensorContractView {
   /// optional, because it is not a prediction: the loader inserts whatever
   /// cast, decode or encode is needed to reach it.
   PieLoaderEncodingSpec encoding;
+  /// Set when this entry holds the scales for another entry.
+  PieLoaderScalesView scales;
 };
 
 using PieLoaderTensorContractSlice = PieLoaderSlice<PieLoaderTensorContractView>;
 
 /// Everything one driver rank declares.
 struct PieLoaderModelContractView {
-  uint32_t abi_version;
   /// Byte alignment every materialized buffer must satisfy.
   uint32_t alignment;
   /// The node pool, shared by every tensor. Topologically sorted: a node may
@@ -524,6 +548,12 @@ struct PieLoaderSourceExtentView {
   uint64_t file_offset;
   uint64_t span_bytes;
   PieLoaderStridedExtentView stride;
+  /// The type these bytes are read as. Not necessarily
+  /// `PieLoaderPlan::sources[tensor_id].dtype`: a contract that reinterprets a
+  /// tensor with `Bitcast` — DeepSeek-V4's E8M0 block scales are stored as
+  /// `U8` — says so here, and an executor that consulted the source table
+  /// instead would undo the reinterpretation.
+  PieLoaderDType dtype;
 };
 
 struct PieLoaderDestExtentView {
@@ -531,14 +561,6 @@ struct PieLoaderDestExtentView {
   uint64_t offset;
   PieLoaderStridedExtentView stride;
 };
-
-struct PieLoaderSlabPlacementView {
-  uint64_t src_offset;
-  uint64_t dest_offset;
-  uint64_t bytes;
-};
-
-using PieLoaderSlabPlacementSlice = PieLoaderSlice<PieLoaderSlabPlacementView>;
 
 /// What an instruction does, as a tagged union carrying only that operation's
 /// operands.
@@ -553,8 +575,8 @@ using PieLoaderSlabPlacementSlice = PieLoaderSlice<PieLoaderSlabPlacementView>;
 /// can only apologise for.
 ///
 /// The discriminants are the wire tag and are written out for the same reason
-/// the mirror enums' are — 4 is absent because a retired instruction had it, and
-/// renumbering to close the gap would silently move six others.
+/// the mirror enums' are — 4 and 7 are absent because retired instructions had
+/// them, and renumbering to close a gap would silently move every tag above it.
 struct PieLoaderStorageOp {
   enum class Tag : uint32_t {
     Allocate = 0,
@@ -567,7 +589,6 @@ struct PieLoaderStorageOp {
     /// an arena allocation whose only content the executor ever read was
     /// `dest.offset`.
     BulkExtentWrite = 6,
-    SlabScatter = 7,
     Fill = 8,
   };
 
@@ -642,13 +663,6 @@ struct PieLoaderStorageOp {
     uint64_t dest_offset;
   };
 
-  struct SlabScatter_Body {
-    uint32_t file_id;
-    uint64_t file_offset;
-    uint64_t span_bytes;
-    PieLoaderSlabPlacementSlice placements;
-  };
-
   struct Fill_Body {
     uint32_t buffer_id;
   };
@@ -661,7 +675,6 @@ struct PieLoaderStorageOp {
     CreateView_Body create_view;
     Finalize_Body finalize;
     BulkExtentWrite_Body bulk_extent_write;
-    SlabScatter_Body slab_scatter;
     Fill_Body fill;
   };
 };
@@ -708,8 +721,7 @@ struct PieLoaderTargetView {
 /// Both are entries in [`PieLoaderPlan::tensors`], named by `id`. The driver has
 /// to know the pairing in order to attach the quant metadata its kernels read;
 /// it used to rediscover it by matching name suffixes over the tensor list,
-/// which guessed at something the loader states here (`load_plan.rs`'s
-/// `derive_quant_attachments`).
+/// which guessed at something stated here.
 struct PieLoaderQuantAttachmentView {
   uint32_t tensor_id;
   uint32_t scale_tensor_id;

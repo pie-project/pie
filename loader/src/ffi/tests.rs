@@ -66,6 +66,7 @@ fn source_extent(span_bytes: u64) -> SourceExtent {
         file_offset: 512,
         span_bytes,
         stride: stride(2, &[(4, 8, 16)]),
+        dtype: DType::BF16,
     }
 }
 
@@ -184,26 +185,8 @@ fn plan_with_every_instr() -> LoadPlan {
             source: source_extent(65536),
             dest_offset: 4096,
         },
-        StorageInstr::SlabScatter {
-            id: InstrId(3),
-            file_id: FileId(0),
-            file_offset: 128,
-            span_bytes: 2048,
-            placements: vec![
-                SlabPlacement {
-                    src_offset: 0,
-                    dest_offset: 16,
-                    bytes: 1024,
-                },
-                SlabPlacement {
-                    src_offset: 1024,
-                    dest_offset: 2048,
-                    bytes: 1024,
-                },
-            ],
-        },
         StorageInstr::TileMap {
-            id: InstrId(4),
+            id: InstrId(3),
             kind: TileMapKind::Repack,
             source: Some(source_extent(256)),
             dest: Some(dest_extent(11)),
@@ -532,45 +515,10 @@ fn bulk_extent_write_carries_a_bare_arena_offset() {
 }
 
 #[test]
-fn slab_scatter_carries_placements() {
-    let plan = plan_with_every_instr();
-    with_plan(&plan, |pod| {
-        let slab = &unsafe { view::instrs(pod) }[3];
-        let (file_id, file_offset, span_bytes, placements) = operands!(
-            slab,
-            SlabScatter {
-                file_id,
-                file_offset,
-                span_bytes,
-                placements,
-            }
-        );
-        assert_eq!(*file_id, 0);
-        assert_eq!(*file_offset, 128);
-        assert_eq!(*span_bytes, 2048);
-        assert_eq!(
-            unsafe { view::slabs(placements) },
-            &[
-                PieLoaderSlabPlacementView {
-                    src_offset: 0,
-                    dest_offset: 16,
-                    bytes: 1024,
-                },
-                PieLoaderSlabPlacementView {
-                    src_offset: 1024,
-                    dest_offset: 2048,
-                    bytes: 1024,
-                },
-            ]
-        );
-    });
-}
-
-#[test]
 fn tile_map_carries_the_whole_transform() {
     let plan = plan_with_every_instr();
     with_plan(&plan, |pod| {
-        let tile = &unsafe { view::instrs(pod) }[4];
+        let tile = &unsafe { view::instrs(pod) }[3];
         let (
             tile_kind,
             input_buffers,
@@ -687,7 +635,7 @@ fn create_view_and_finalize_name_their_operands() {
         let instrs = unsafe { view::instrs(pod) };
 
         let (input_buffer, output_buffer, view_extent) = operands!(
-            &instrs[5],
+            &instrs[4],
             CreateView {
                 input_buffer,
                 output_buffer,
@@ -698,7 +646,7 @@ fn create_view_and_finalize_name_their_operands() {
         assert_eq!(*output_buffer, 13);
         assert_eq!(view_extent.buffer_id, 13);
 
-        let (buffer_id, name) = operands!(&instrs[6], Finalize { buffer_id, name });
+        let (buffer_id, name) = operands!(&instrs[5], Finalize { buffer_id, name });
         assert_eq!(*buffer_id, 0);
         assert_eq!(
             unsafe { view::bytes(name) },
@@ -711,10 +659,7 @@ fn create_view_and_finalize_name_their_operands() {
 fn the_schedule_survives() {
     let plan = plan_with_every_instr();
     with_plan(&plan, |pod| {
-        assert_eq!(
-            unsafe { view::schedule(pod) },
-            &[0, 1, 2, 3, 4, 5, 6, 7][..]
-        );
+        assert_eq!(unsafe { view::schedule(pod) }, &[0, 1, 2, 3, 4, 5, 6][..]);
     });
 }
 
@@ -789,7 +734,7 @@ fn plans_can_be_built_and_released_from_other_threads() {
         .collect();
     for handle in handles {
         let (pod, count) = handle.join().unwrap();
-        assert_eq!(count, 8);
+        assert_eq!(count, 7);
         unsafe { arena::release(pod as *mut PieLoaderPlan) };
     }
 }
@@ -1103,7 +1048,6 @@ fn a_contract_naming_a_tensor_the_plan_does_not_deliver_is_a_violation() {
         let (status, message) = verify_against(
             plan,
             &ModelContract {
-                abi_version: 1,
                 alignment: 256,
                 tensors: Vec::new(),
             },
@@ -1167,6 +1111,8 @@ fn dtype_survives_the_c_boundary() {
         DType::U16,
         DType::U8,
         DType::Bool,
+        DType::I64,
+        DType::U64,
     ] {
         let round_tripped: DType = PieLoaderDType::from(dtype).into();
         assert_eq!(round_tripped, dtype);
@@ -1277,7 +1223,6 @@ fn contract_request(
 fn minimal_contract() -> crate::contract::ModelContract {
     use crate::contract::{Expr, ModelContract, TensorContract};
     ModelContract {
-        abi_version: 1,
         alignment: 256,
         tensors: vec![TensorContract::inferred(
             "model.norm.weight",
@@ -1291,7 +1236,6 @@ fn minimal_contract() -> crate::contract::ModelContract {
 fn fused_contract() -> crate::contract::ModelContract {
     use crate::contract::{Expr, ModelContract, TensorContract};
     ModelContract {
-        abi_version: 1,
         alignment: 256,
         tensors: vec![TensorContract::new(
             "ab.weight",
@@ -1462,6 +1406,8 @@ fn mirror_enum_discriminants_are_pinned() {
     assert_eq!(PieLoaderDType::U8 as u32, 10);
     assert_eq!(PieLoaderDType::Bool as u32, 11);
     assert_eq!(PieLoaderDType::E8M0 as u32, 12);
+    assert_eq!(PieLoaderDType::I64 as u32, 13);
+    assert_eq!(PieLoaderDType::U64 as u32, 14);
 
     // PieLoaderEncodingKind
     assert_eq!(PieLoaderEncodingKind::Raw as u32, 0);
@@ -1594,15 +1540,6 @@ fn storage_op_tags_are_the_wire_values() {
             dest_offset: 0,
         }),
         6
-    );
-    assert_eq!(
-        tag(Op::SlabScatter {
-            file_id: 0,
-            file_offset: 0,
-            span_bytes: 0,
-            placements: PieLoaderSlabPlacementSlice::default(),
-        }),
-        7
     );
     assert_eq!(tag(Op::Fill { buffer_id: 0 }), 8);
 }

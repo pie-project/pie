@@ -57,6 +57,19 @@ struct DecodeStepPsos {
 std::vector<Dispatch> build_decode_dag(const DecodeGeometry& g, bool with_argmax = false,
                                        bool fuse_residual = false, bool gdn_prep = false);
 
+// ── Concurrent runs ──────────────────────────────────────────────────────────
+// A maximal run of consecutive same-layer dispatches that may execute at once:
+// they read an activation their predecessors already produced and write disjoint
+// scratch, so no barrier is needed between them. Returns, per dispatch, the index
+// of the last dispatch of its run (== its own index when it runs alone).
+//
+// One derivation, three readers: the two encoders decide barriers from it, and
+// the scratch allocator extends a value's live range to the end of the run its
+// last use falls in, so a buffer is never rewritten by a dispatch still running
+// alongside its reader. Keeping those in one place is what makes widening a run
+// safe -- they cannot disagree.
+std::vector<int> concurrent_run_ends(const std::vector<Dispatch>& dag);
+
 // ── GPU-exec attribution hook (optimization-phase prep; off by default) ───────
 // When provided to encode_decode_step, the walker emits a timestamp mark at boundary i
 // (BEFORE dispatch i) and one final mark after the last dispatch — so diffing the

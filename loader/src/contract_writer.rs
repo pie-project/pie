@@ -17,18 +17,17 @@
 use crate::contract::{Expr, ModelContract};
 use crate::ffi::contract::{
     PieLoaderExprKind, PieLoaderExprNode, PieLoaderExprNodeSlice, PieLoaderModelContractView,
-    PieLoaderRepackSpecView, PieLoaderTensorContractSlice, PieLoaderTensorContractView,
-    write_encoding, write_quant,
+    PieLoaderRepackSpecView, PieLoaderScalesView, PieLoaderTensorContractSlice,
+    PieLoaderTensorContractView, write_encoding, write_quant,
 };
 use crate::ffi::types::*;
-use crate::types::RepackSpec;
+use crate::types::{QuantGranularity, RepackSpec, ScaleForm};
 
 /// A contract flattened into the POD form, with its backing storage.
 ///
 /// Handles are indices, so nothing here points into anything that moves; the
 /// `Box`ed backing stores exist because the POD views point into *them*.
 pub struct OwnedContract {
-    abi_version: u32,
     alignment: u32,
     nodes: Vec<PieLoaderExprNode>,
     tensors: Vec<PieLoaderTensorContractView>,
@@ -41,7 +40,6 @@ impl OwnedContract {
     /// A borrowed POD view, exactly as a C++ `ModelContract::view()` produces.
     pub fn view(&self) -> PieLoaderModelContractView {
         PieLoaderModelContractView {
-            abi_version: self.abi_version,
             alignment: self.alignment,
             nodes: PieLoaderExprNodeSlice {
                 ptr: self.nodes.as_ptr(),
@@ -200,7 +198,6 @@ fn write_repack(spec: &RepackSpec) -> PieLoaderRepackSpecView {
 /// Flatten a contract into the POD form a driver would have written by hand.
 pub fn write_contract(contract: &ModelContract) -> OwnedContract {
     let mut owned = OwnedContract {
-        abi_version: contract.abi_version,
         alignment: contract.alignment,
         nodes: Vec::new(),
         tensors: Vec::new(),
@@ -220,11 +217,28 @@ pub fn write_contract(contract: &ModelContract) -> OwnedContract {
             None => PieLoaderI64Slice::default(),
         };
         let encoding = write_encoding(&tensor.encoding);
+        let scales = match &tensor.scales {
+            Some(scales) => PieLoaderScalesView {
+                of: owned.name(&scales.of),
+                granularity: match scales.granularity {
+                    QuantGranularity::PerChannel => PieLoaderQuantGranularity::PerChannel,
+                    QuantGranularity::PerGroup => PieLoaderQuantGranularity::PerGroup,
+                },
+                group_size: scales.group_size,
+                channel_axis: scales.channel_axis,
+                form: match scales.form {
+                    ScaleForm::RawE8M0 => PieLoaderScaleForm::RawE8M0,
+                    ScaleForm::F32Factors => PieLoaderScaleForm::F32Factors,
+                },
+            },
+            None => PieLoaderScalesView::default(),
+        };
         owned.tensors.push(PieLoaderTensorContractView {
             name,
             root,
             shape,
             encoding,
+            scales,
         });
     }
     owned

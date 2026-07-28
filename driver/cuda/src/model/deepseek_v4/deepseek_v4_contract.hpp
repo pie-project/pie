@@ -58,9 +58,19 @@ inline void dsv4_block_scales_to_fp32(ContractBuilder& b) {
             !contract_detail::is_raw(raw.encoding, PieLoaderDType::U8)) {
             continue;
         }
-        // Only a companion to an FP8 weight is an E8M0 exponent. A `.scale`
-        // beside anything else is some other convention, and guessing is how
-        // a scale tensor gets silently reinterpreted.
+        // Only a companion to a **block-FP8** weight is an fp32-bound E8M0
+        // exponent. A `.scale` beside anything else is some other convention,
+        // and guessing is how a scale tensor gets silently reinterpreted.
+        //
+        // DeepSeek-V4 ships exactly two quantizations, and only one of them
+        // belongs here. The dense and shared paths store F8E4M3 weights with
+        // 128x128 block scales, which the FP8 GEMM wants as fp32 -- 50 tensors
+        // on both minis. The routed experts store **packed MXFP4**: an `I8`
+        // tensor holding two E2M1 nibbles per byte, whose E8M0 scales
+        // (`[rows, cols/32]`) `launch_dequant_mxfp4_to_bf16` consumes as raw
+        // bytes -- 144 tensors. Widening this guard to I8 hands that kernel
+        // fp32 words to read as exponents, and the routed experts come out
+        // four orders of magnitude too large.
         const std::string weight =
             std::string(raw.name.substr(0, raw.name.size() - kSuffix.size())) + ".weight";
         const SourceTensor* companion = b.find(weight);
@@ -73,8 +83,24 @@ inline void dsv4_block_scales_to_fp32(ContractBuilder& b) {
             b.contract().bitcast(b.contract().src(std::string(raw.name)), shape,
                                  pie_loader::raw(PieLoaderDType::E8M0)),
             shape, b.shard_axis(raw.name));
-        b.define(b.output_name(raw.name), expr, pie_loader::raw(PieLoaderDType::F32),
-                 std::move(local));
+        auto defined = b.define(b.output_name(raw.name), expr,
+                                pie_loader::raw(PieLoaderDType::F32), std::move(local));
+        // The pairing this loop just established, stated rather than dropped.
+        // The loader used to rediscover it by appending `_scale_inv` and then
+        // `.scale` to every F8E4M3 tensor's name, with `group_size` hardcoded to
+        // 128 -- a guess about the checkpoint made three layers away from the
+        // only code that checks it. Here both shapes are in hand, so the block
+        // size is read off them instead of assumed.
+        const std::vector<std::int64_t> weight_shape = contract_detail::shape_of(*companion);
+        if (defined.has_value() && !shape.empty() && shape.back() > 0 &&
+            !weight_shape.empty()) {
+            const std::int64_t block = weight_shape.back() / shape.back();
+            if (block > 0) {
+                defined->scaling(b.output_name(weight), PieLoaderQuantGranularity::PerGroup,
+                                 static_cast<std::uint32_t>(block), 0,
+                                 PieLoaderScaleForm::F32Factors);
+            }
+        }
         b.consume(raw.id);
     }
 }

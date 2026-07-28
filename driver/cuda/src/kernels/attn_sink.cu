@@ -52,7 +52,21 @@ __global__ void attn_sink_rescale_bf16_kernel(
     }
 }
 
+__global__ void lse_log2_to_ln_kernel(float* __restrict__ lse, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    constexpr float kLn2 = 0.69314718055994530942f;
+    const float v = lse[i];
+    if (isfinite(v)) lse[i] = v * kLn2;
+}
+
 }  // namespace
+
+void launch_lse_log2_to_ln(float* lse, int n, cudaStream_t stream) {
+    if (n <= 0) return;
+    const int block = 256;
+    lse_log2_to_ln_kernel<<<(n + block - 1) / block, block, 0, stream>>>(lse, n);
+}
 
 void launch_attention_sink_rescale_bf16(
     void*        o,

@@ -1,5 +1,14 @@
-//! Memory accounting: recompute the plan's persistent / temporary /
-//! scratch peaks and its checkpoint-read and device-write totals.
+//! Memory accounting: recompute the plan's persistent / temporary / scratch
+//! peaks and its checkpoint-read and device-write totals.
+//!
+//! `live_peak` is a running total, not a liveness analysis: buffers enter the
+//! `live` set at `Allocate` and never leave, because the plan has no instruction
+//! that frees one and the executor frees nothing until its destructor
+//! (`load_plan_executor.hpp:57-61`). The peak and the sum are therefore the same
+//! number today, and this is written as a max so it stays right rather than
+//! because anything currently makes it fall. Adding a free — to the plan or to
+//! the executor — means removing from `live` here too, or the "peak" silently
+//! becomes an over-estimate.
 
 use std::collections::HashSet;
 
@@ -60,25 +69,6 @@ pub(super) fn recompute_memory_plan(program: &mut LoadPlan) -> Result<usize> {
                 device_write_bytes = device_write_bytes
                     .checked_add(source.span_bytes)
                     .or_overflow("write byte overflow")?;
-            }
-            StorageInstr::SlabScatter {
-                span_bytes,
-                placements,
-                ..
-            } => {
-                checkpoint_read_bytes = checkpoint_read_bytes
-                    .checked_add(*span_bytes)
-                    .or_overflow("read byte overflow")?;
-                let mut payload_bytes = 0u64;
-                for placement in placements {
-                    payload_bytes = payload_bytes
-                        .checked_add(placement.bytes)
-                        .or_overflow("write byte overflow")?;
-                }
-                device_write_bytes = device_write_bytes
-                    .checked_add(payload_bytes)
-                    .or_overflow("write byte overflow")?;
-                transform_scratch_peak_bytes = transform_scratch_peak_bytes.max(*span_bytes);
             }
             StorageInstr::TileMap {
                 source,

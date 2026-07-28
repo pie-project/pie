@@ -23,7 +23,6 @@ fn instr_name(instr: &StorageInstr) -> &'static str {
         StorageInstr::Fill { .. } => "Fill",
         StorageInstr::ExtentWrite { .. } => "ExtentWrite",
         StorageInstr::BulkExtentWrite { .. } => "BulkExtentWrite",
-        StorageInstr::SlabScatter { .. } => "SlabScatter",
         StorageInstr::TileMap { .. } => "TileMap",
         StorageInstr::CreateView { .. } => "CreateView",
         StorageInstr::Finalize { .. } => "Finalize",

@@ -1,5 +1,6 @@
 #include "model/glm5/glm5_model.hpp"
 
+#include <algorithm>
 #include <utility>
 
 namespace pie_cuda_driver::model {
@@ -24,6 +25,16 @@ Glm5Model::Glm5Model(
     fwd_cfg_.emit_logits = emit_logits;
 
     caps_.supports_compact_logits = true;
+    // The forward is sync-free only when the checkpoint ships stacked BF16
+    // experts; the per-expert fallback copies routing to the host every layer.
+    const bool stacked_moe =
+        !weights_.layers.empty() &&
+        std::all_of(weights_.layers.begin(), weights_.layers.end(),
+                    [](const Glm5LayerWeights& L) {
+                        return !L.is_moe || L.moe_gate_up_proj != nullptr;
+                    });
+    caps_.graph_safe = stacked_moe && mla_cache_.dtype() == DType::BF16;
+    caps_.graph_padding_kv_write_safe = true;
 }
 
 void Glm5Model::prepare(AttentionWorkspace& attn_ws,

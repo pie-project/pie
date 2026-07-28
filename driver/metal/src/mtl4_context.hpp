@@ -270,6 +270,11 @@ class RawMetalContext {
     // writes a timestamp at an index; AFTER run_step (GPU complete — the event is
     // already waited) resolve_timestamps copies the `count` resolved GPU timestamps
     // (nanoseconds on this device) into `out`. Returns nullptr on failure.
+    // Largest threadgroup this pipeline can be launched with. A big fused
+    // kernel can fall well short of the device maximum on registers alone, and
+    // asking for more than it allows fails the dispatch.
+    uint32_t pso_max_threads(Pso pso) const;
+
     void* create_timestamp_heap(uint32_t count);
     void  resolve_timestamps(void* heap, uint32_t count, uint64_t* out);
     void  release_timestamp_heap(void* heap);

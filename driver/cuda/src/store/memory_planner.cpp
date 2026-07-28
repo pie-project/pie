@@ -29,6 +29,7 @@
 #include "../model/config.hpp"
 #include "../model/gemma4/gemma4.hpp"
 #include "../model/deepseek_v4/deepseek_v4_forward.hpp"
+#include "dsv4_compress_cache.hpp"
 #include "../model/glm5/glm5_forward.hpp"
 #include "../model/kimi/kimi_forward.hpp"
 #include "../model/loaded_model.hpp"
@@ -393,7 +394,8 @@ CudaMemoryPlan plan_cuda_memory(
         deepseek_v4_selected
             ? static_cast<std::size_t>(hf.num_hidden_layers) *
                   pie_cuda_driver::kv_cache_device_bytes_per_page(
-                      kv_format, 1, 1, hf.head_dim)
+                      kv_format, 1, 1, hf.head_dim) +
+                  pie_cuda_driver::dsv4_compress_bytes_per_token(hf)
             : (kimi_selected || glm5_selected)
             ? static_cast<std::size_t>(hf.num_hidden_layers) *
                   (static_cast<std::size_t>(hf.kv_lora_rank) +

@@ -8,11 +8,13 @@
 #include <iostream>
 #include <stdexcept>
 #include <vector>
+#include <memory>
 
 #include <cuda_runtime.h>
 
 #include "cuda_check.hpp"
 #include "kernels/argmax.hpp"
+#include "model/act_dump.hpp"
 #include "kernels/dequant_wna16.hpp"
 #include "kernels/embed.hpp"
 #include "kernels/gather_rows.hpp"
@@ -25,6 +27,16 @@
 #include "kernels/swiglu.hpp"
 
 namespace pie_cuda_driver::model {
+
+
+// Below this token count the W4A16 GEMVs win: they stream int4 weights
+// (a quarter of the BF16 traffic) and there is no reuse to exploit yet.
+constexpr int kKimiMoeGemvMaxTokens = 8;
+// Per-layer budget for the materialised BF16 expert stack. The mini
+// checkpoints (E=8) need ~0.7 GiB; a full 384-expert Kimi would need ~34 GiB,
+// so it stays on the W4A16 path where each expert is touched at most a few
+// times per step anyway.
+constexpr std::size_t kKimiMoeBf16StackBudget = 4ull << 30;
 
 namespace {
 
@@ -124,6 +136,10 @@ struct KimiForwardProfile {
 
     double embed_ms = 0.0;
     double attn_ms = 0.0;
+    double attn_proj_ms = 0.0;
+    double attn_absorb_ms = 0.0;
+    double attn_core_ms = 0.0;
+    double attn_oproj_ms = 0.0;
     double dense_mlp_ms = 0.0;
     double moe_router_ms = 0.0;
     double moe_gate_up_ms = 0.0;
@@ -168,6 +184,7 @@ struct KimiForwardProfile {
         dense_layers = 0;
         moe_layers = 0;
         embed_ms = attn_ms = dense_mlp_ms = 0.0;
+        attn_absorb_ms = attn_core_ms = attn_oproj_ms = attn_proj_ms = 0.0;
         moe_router_ms = moe_gate_up_ms = moe_swiglu_ms = moe_down_ms = 0.0;
         moe_weighted_sum_ms = moe_prefill_ms = moe_shared_ms = moe_allreduce_ms = 0.0;
         residual_ms = lm_head_ms = forward_ms = 0.0;
@@ -213,7 +230,8 @@ void maybe_print_profile(const KimiForwardProfile& p) {
     if (limit == 0 || seq > limit) return;
 
     const double named =
-        p.embed_ms + p.attn_ms + p.dense_mlp_ms + p.moe_router_ms +
+        p.embed_ms + p.attn_proj_ms + p.attn_absorb_ms + p.attn_core_ms +
+        p.attn_oproj_ms + p.dense_mlp_ms + p.moe_router_ms +
         p.moe_gate_up_ms + p.moe_swiglu_ms + p.moe_down_ms +
         p.moe_weighted_sum_ms + p.moe_prefill_ms + p.moe_shared_ms +
         p.moe_allreduce_ms + p.residual_ms + p.lm_head_ms;
@@ -228,7 +246,10 @@ void maybe_print_profile(const KimiForwardProfile& p) {
         << " layers_moe=" << p.moe_layers
         << " total_ms=" << p.forward_ms
         << " embed_ms=" << p.embed_ms
-        << " attn_ms=" << p.attn_ms
+        << " attn_proj_ms=" << p.attn_proj_ms
+        << " attn_absorb_ms=" << p.attn_absorb_ms
+        << " attn_core_ms=" << p.attn_core_ms
+        << " attn_oproj_ms=" << p.attn_oproj_ms
         << " dense_mlp_ms=" << p.dense_mlp_ms
         << " moe_router_ms=" << p.moe_router_ms
         << " moe_gate_up_ms=" << p.moe_gate_up_ms
@@ -292,6 +313,57 @@ void dequant_expert_w4(
 
 }  // namespace
 
+void kimi_materialize_bf16_expert_stacks(
+    KimiWeights& weights,
+    const HfConfig& cfg,
+    int tp_size)
+{
+    const int T = std::max(1, tp_size);
+    const int H = cfg.hidden_size;
+    const int I = cfg.moe_intermediate_size > 0 ? cfg.moe_intermediate_size / T : 0;
+    const int E = cfg.num_experts;
+    if (H <= 0 || I <= 0 || E <= 0) return;
+
+    const std::size_t stack_bytes =
+        static_cast<std::size_t>(E) * 3 * I * H * sizeof(std::uint16_t);
+    if (stack_bytes > kKimiMoeBf16StackBudget) return;
+
+    const std::size_t half = static_cast<std::size_t>(I) * H;
+    const std::size_t gu_stride = 2 * half;
+    const std::size_t dn_stride = static_cast<std::size_t>(H) * I;
+    cudaStream_t stream = nullptr;
+
+    for (auto& Lw : weights.layers) {
+        if (!Lw.is_moe || static_cast<int>(Lw.experts.size()) < E) continue;
+        if (Lw.experts[0].gate_packed == nullptr) continue;
+        if (Lw.moe_gate_up_bf16 != nullptr) continue;
+
+        Lw.moe_gate_up_bf16 = std::make_unique<DeviceTensor>(
+            DeviceTensor::allocate(DType::BF16, {E, 2 * I, H}));
+        Lw.moe_down_bf16 = std::make_unique<DeviceTensor>(
+            DeviceTensor::allocate(DType::BF16, {E, H, I}));
+        auto* gu = static_cast<std::uint16_t*>(Lw.moe_gate_up_bf16->data());
+        auto* dn = static_cast<std::uint16_t*>(Lw.moe_down_bf16->data());
+        for (int e = 0; e < E; ++e) {
+            const auto& ew = Lw.experts[static_cast<std::size_t>(e)];
+            if (ew.gate_packed == nullptr) continue;
+            kernels::launch_dequant_wna16_int4b8_to_bf16(
+                static_cast<const std::int32_t*>(ew.gate_packed->data()),
+                ew.gate_scale->data(),
+                gu + static_cast<std::size_t>(e) * gu_stride, I, H, 32, stream);
+            kernels::launch_dequant_wna16_int4b8_to_bf16(
+                static_cast<const std::int32_t*>(ew.up_packed->data()),
+                ew.up_scale->data(),
+                gu + static_cast<std::size_t>(e) * gu_stride + half, I, H, 32, stream);
+            kernels::launch_dequant_wna16_int4b8_to_bf16(
+                static_cast<const std::int32_t*>(ew.down_packed->data()),
+                ew.down_scale->data(),
+                dn + static_cast<std::size_t>(e) * dn_stride, H, I, 32, stream);
+        }
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
 KimiWorkspace KimiWorkspace::allocate(
     const HfConfig& cfg,
     int max_tokens,
@@ -329,6 +401,7 @@ KimiWorkspace KimiWorkspace::allocate(
     ws.y             = DeviceTensor::allocate(DType::BF16, {N, H});
     ws.norm_x        = DeviceTensor::allocate(DType::BF16, {N, H});
     ws.q_a           = DeviceTensor::allocate(DType::BF16, {N, q_lora});
+    ws.qkv_a         = DeviceTensor::allocate(DType::BF16, {N, q_lora + kv_lora + q_rope});
     ws.q_b           = DeviceTensor::allocate(DType::BF16, {N, local_heads * (q_nope + q_rope)});
     ws.q_nope        = DeviceTensor::allocate(DType::BF16, {N, local_heads * q_nope});
     ws.kv_a_mqa      = DeviceTensor::allocate(DType::BF16, {N, kv_lora + q_rope});
@@ -359,6 +432,39 @@ KimiWorkspace KimiWorkspace::allocate(
     ws.shared_up     = DeviceTensor::allocate(DType::BF16, {N, std::max(1, shared_I)});
     ws.shared_act    = DeviceTensor::allocate(DType::BF16, {N, std::max(1, shared_I)});
     ws.shared_out    = DeviceTensor::allocate(DType::BF16, {N, H});
+
+    // Aligned MoE scratch (batched-GEMM path). Worst case is every route
+    // landing in its own expert block, each padded up to `block` rows.
+    if (routed_I > 0 && cfg.num_experts > 0) {
+        const int E = cfg.num_experts;
+        // `block` is picked per forward from that batch's route count, so the
+        // scratch has to cover both extremes: the smallest block produces the
+        // most blocks, the largest produces the most padded rows.
+        const int block = kernels::moe_aligned_block(routes, E);
+        const int active_expert_cap = std::min(E, routes);
+        const int max_blocks =
+            (routes + active_expert_cap * (kernels::kMoeAlignedBlockMin - 1) +
+             kernels::kMoeAlignedBlockMin - 1) /
+            kernels::kMoeAlignedBlockMin;
+        const int aligned_rows =
+            std::max(max_blocks * kernels::kMoeAlignedBlockMin,
+                     ((routes + active_expert_cap * (block - 1) + block - 1) /
+                      block) * block);
+        ws.aligned_block_size = block;
+        ws.aligned_max_blocks = max_blocks;
+        ws.aligned_route_ids  = DeviceTensor::allocate(DType::INT32, {aligned_rows});
+        ws.aligned_expert_ids = DeviceTensor::allocate(DType::INT32, {max_blocks});
+        ws.aligned_expert_in  = DeviceTensor::allocate(DType::BF16, {aligned_rows, H});
+        ws.aligned_gate_up    = DeviceTensor::allocate(DType::BF16, {aligned_rows, 2 * routed_I});
+        ws.aligned_act        = DeviceTensor::allocate(DType::BF16, {aligned_rows, routed_I});
+        ws.aligned_out        = DeviceTensor::allocate(DType::BF16, {aligned_rows, H});
+        const std::int64_t pw =
+            static_cast<std::int64_t>(max_blocks) * sizeof(void*) / sizeof(std::int64_t);
+        for (DeviceTensor* t : {&ws.a_gu_ptrs, &ws.b_gu_ptrs, &ws.c_gu_ptrs,
+                                &ws.a_dn_ptrs, &ws.b_dn_ptrs, &ws.c_dn_ptrs}) {
+            *t = DeviceTensor::allocate(DType::INT64, {std::max<std::int64_t>(pw, 1)});
+        }
+    }
     ws.logits        = DeviceTensor::allocate(DType::BF16, {O, cfg.vocab_size});
     ws.probs         = DeviceTensor::allocate(DType::FP32, {O, cfg.vocab_size});
     return ws;
@@ -420,7 +526,9 @@ void prepare_kimi_mla_plan(
         attn_ws,
         0,
         causal,
-        1.0f / std::sqrt(static_cast<float>(cfg.qk_nope_head_dim + cfg.qk_rope_head_dim)));
+        (1.0f / std::sqrt(static_cast<float>(
+             cfg.qk_nope_head_dim + cfg.qk_rope_head_dim))) *
+            cfg.rope_mla_softmax_mscale * cfg.rope_mla_softmax_mscale);
     (void)kv_page_indices_d;
     (void)kv_page_indptr_d;
     (void)kv_last_page_lens_d;
@@ -473,6 +581,7 @@ void kimi_forward_paged(
     KimiForwardProfile profile;
     profile.begin(total_tokens, num_requests, is_pure_decode,
         tp != nullptr ? tp->rank() : 0, stream);
+    act_dump_step_begin(stream);
 
     profile_cuda_stage(&profile, &profile.embed_ms, stream, [&] {
         if (w.embed_tp_sharded) {
@@ -529,25 +638,39 @@ void kimi_forward_paged(
 
     for (int li = 0; li < cfg.num_hidden_layers; ++li) {
         const auto& Lw = w.layers[static_cast<std::size_t>(li)];
-
-        profile_cuda_stage(&profile, &profile.attn_ms, stream, [&] {
+        if (li == 0) {
+            act_dump_i32("tokens", token_ids, total_tokens, 1, stream);
+            act_dump_i32("positions", positions, total_tokens, 1, stream);
+            act_dump_bf16("embed", kimi_ws.y.data(), total_tokens, H, stream);
+        }
+        profile_cuda_stage(&profile, &profile.attn_proj_ms, stream, [&] {
             kernels::launch_rmsnorm_bf16(
                 kimi_ws.y.data(), Lw.attn_norm->data(), kimi_ws.norm_x.data(),
                 total_tokens, H, eps, stream);
+            act_dump_bf16(act_dump_layer_tag("norm_x", li).c_str(),
+                kimi_ws.norm_x.data(), total_tokens, H, stream);
 
+            // Where the kv half ends up, and its row pitch. The fused path
+            // leaves both halves interleaved per token in `qkv_a`; the split
+            // path writes a compact `kv_a_mqa`.
+            const void* kv_a_src = kimi_ws.kv_a_mqa.data();
+            int kv_a_row_stride = 0;
             if (Lw.q_kv_a_fused != nullptr) {
-                // Fused q_a + kv_a projection: one GEMM instead of two
+                // Fused q_a + kv_a projection: one GEMM instead of two. The
+                // result is row-major `[T, q_lora + kv_lora + q_rope]`, so the
+                // halves interleave per token and neither is a contiguous
+                // block of the buffer -- both consumers below take a pitch.
                 ops::gemm_act_x_w(cublas.handle(),
                     kimi_ws.norm_x.data(), *Lw.q_kv_a_fused,
-                    kimi_ws.q_a.data(), total_tokens, q_lora + kv_lora + q_rope, H);
-                // Split the fused output: q_a is first q_lora rows, kv_a is the rest
-                // q_a is already in place; copy kv_a part to kv_a_mqa buffer
-                CUDA_CHECK(cudaMemcpyAsync(
-                    kimi_ws.kv_a_mqa.data(),
-                    static_cast<const char*>(kimi_ws.q_a.data()) +
-                        static_cast<std::size_t>(total_tokens) * q_lora * sizeof(std::uint16_t),
-                    static_cast<std::size_t>(total_tokens) * (kv_lora + q_rope) * sizeof(std::uint16_t),
-                    cudaMemcpyDeviceToDevice, stream));
+                    kimi_ws.qkv_a.data(), total_tokens, q_lora + kv_lora + q_rope, H);
+                kv_a_src = static_cast<const char*>(kimi_ws.qkv_a.data()) +
+                    static_cast<std::size_t>(q_lora) * sizeof(std::uint16_t);
+                kv_a_row_stride = q_lora + kv_lora + q_rope;
+                kernels::launch_rmsnorm_strided_bf16(
+                    kimi_ws.qkv_a.data(), Lw.q_a_norm->data(), kimi_ws.q_a.data(),
+                    total_tokens, q_lora,
+                    /*x_row_stride=*/q_lora + kv_lora + q_rope,
+                    /*y_row_stride=*/q_lora, eps, stream);
             } else {
                 ops::gemm_act_x_w(cublas.handle(),
                     kimi_ws.norm_x.data(), *Lw.q_a_proj,
@@ -555,26 +678,36 @@ void kimi_forward_paged(
                 ops::gemm_act_x_w(cublas.handle(),
                     kimi_ws.norm_x.data(), *Lw.kv_a_proj_with_mqa,
                     kimi_ws.kv_a_mqa.data(), total_tokens, kv_lora + q_rope, H);
+                kernels::launch_rmsnorm_bf16(
+                    kimi_ws.q_a.data(), Lw.q_a_norm->data(), kimi_ws.q_a.data(),
+                    total_tokens, q_lora, eps, stream);
             }
-            kernels::launch_rmsnorm_bf16(
-                kimi_ws.q_a.data(), Lw.q_a_norm->data(), kimi_ws.q_a.data(),
-                total_tokens, q_lora, eps, stream);
+            act_dump_bf16(act_dump_layer_tag("q_a", li).c_str(),
+                kimi_ws.q_a.data(), total_tokens, q_lora, stream);
             ops::gemm_act_x_w(cublas.handle(),
                 kimi_ws.q_a.data(), *Lw.q_b_proj,
                 kimi_ws.q_b.data(), total_tokens, heads * (q_nope + q_rope), q_lora);
+            act_dump_bf16(act_dump_layer_tag("q_b", li).c_str(),
+                kimi_ws.q_b.data(), total_tokens, heads * (q_nope + q_rope), stream);
             invoke_stage_hook(
                 StageHookPoint::OnAttnProj, kimi_ws.q_b.data(),
                 static_cast<std::uint32_t>(total_tokens),
                 static_cast<std::uint32_t>(heads * (q_nope + q_rope)),
                 static_cast<std::uint32_t>(li), stream);
             kernels::launch_kimi_split_kv_a_norm_bf16(
-                kimi_ws.kv_a_mqa.data(), Lw.kv_a_norm->data(),
+                kv_a_src, Lw.kv_a_norm->data(),
                 kimi_ws.kv_c.data(), kimi_ws.k_pe.data(),
-                total_tokens, kv_lora, q_rope, eps, stream);
+                total_tokens, kv_lora, q_rope, eps, stream, kv_a_row_stride);
+            act_dump_bf16(act_dump_layer_tag("kv_c", li).c_str(),
+                kimi_ws.kv_c.data(), total_tokens, kv_lora, stream);
 
             kernels::launch_kimi_split_q_b_bf16(
                 kimi_ws.q_b.data(), kimi_ws.q_nope.data(), kimi_ws.q_pe.data(),
                 total_tokens, heads, q_nope, q_rope, stream);
+            act_dump_bf16(act_dump_layer_tag("q_pe_pre", li).c_str(),
+                kimi_ws.q_pe.data(), total_tokens, heads * q_rope, stream);
+            act_dump_bf16(act_dump_layer_tag("k_pe_pre", li).c_str(),
+                kimi_ws.k_pe.data(), total_tokens, q_rope, stream);
             if (kimi_dump_logits_enabled() && li == 0 && (tp == nullptr || tp->rank() == 0)) {
                 char buf[256];
                 std::snprintf(buf, sizeof(buf),
@@ -585,6 +718,13 @@ void kimi_forward_paged(
                     cfg.rope_attention_factor, cfg.rope_original_max_position);
                 write(2, buf, std::strlen(buf));
             }
+            // DeepSeek-V2/V3 (and Kimi-K2, same arch) rotate *adjacent* dim
+            // pairs on q_pe/k_pe. HF `modeling_deepseek.py` writes it as an
+            // interleave-transpose followed by a NeoX `rotate_half`, which is
+            // the identical rotation; vLLM builds the rope with
+            // `is_neox_style=False`. The NeoX half/half pairing this used to
+            // apply is a different rotation and made attention drift with
+            // position (row 0 exact, later rows increasingly wrong).
             if (cfg.has_rope_scaling &&
                 cfg.rope_scaling_kind == HfConfig::RopeScaling::OriginalYaRN) {
                 kernels::launch_rope_yarn_original_bf16(
@@ -592,26 +732,35 @@ void kimi_forward_paged(
                     total_tokens, heads, 1, q_rope, cfg.rope_theta,
                     cfg.rope_factor, cfg.rope_beta_fast, cfg.rope_beta_slow,
                     cfg.rope_attention_factor,
-                    cfg.rope_original_max_position, stream);
+                    cfg.rope_original_max_position, stream,
+                    /*interleaved=*/true);
             } else {
                 kernels::launch_rope_bf16(
                     kimi_ws.q_pe.data(), kimi_ws.k_pe.data(), positions,
-                    total_tokens, heads, 1, q_rope, cfg.rope_theta, stream);
+                    total_tokens, heads, 1, q_rope, cfg.rope_theta, stream,
+                    /*interleaved=*/true);
             }
             auto layer_view = mla_cache.layer_view(li);
+            act_dump_bf16(act_dump_layer_tag("q_pe", li).c_str(),
+                kimi_ws.q_pe.data(), total_tokens, heads * q_rope, stream);
+            act_dump_bf16(act_dump_layer_tag("k_pe", li).c_str(),
+                kimi_ws.k_pe.data(), total_tokens, q_rope, stream);
             kernels::launch_write_mla_to_pages(
                 layer_view, kimi_ws.kv_c.data(), kimi_ws.k_pe.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 total_tokens, num_requests, stream, row_valid_d);
 
-            kernels::launch_kimi_q_nope_to_latent_bf16(
+            profile_cuda_stage(&profile, &profile.attn_absorb_ms, stream, [&] {
+            ops::mla_absorb_q_to_latent_bf16(cublas.handle(),
                 kimi_ws.q_nope.data(), Lw.kv_b_proj->data(),
                 kimi_ws.q_nope_latent.data(),
-                total_tokens, heads, q_nope, v_dim, kv_lora, stream);
+                total_tokens, heads, q_nope, v_dim, kv_lora);
+            });
 
             if (!plan_state.mla_plan) {
                 throw std::runtime_error("kimi: MLA plan missing; prepare hook did not run");
             }
+            profile_cuda_stage(&profile, &profile.attn_core_ms, stream, [&] {
             ops::dispatch_attention_mla_bf16(
                 *plan_state.mla_plan,
                 kimi_ws.q_nope_latent.data(),
@@ -623,16 +772,22 @@ void kimi_forward_paged(
                 stream,
                 /*lse_out=*/nullptr,
                 qo_indptr, kv_page_indptr, kv_last_page_lens);
-            kernels::launch_kimi_latent_to_v_bf16(
+            });
+            profile_cuda_stage(&profile, &profile.attn_absorb_ms, stream, [&] {
+            ops::mla_absorb_latent_to_v_bf16(cublas.handle(),
                 kimi_ws.attn_latent.data(), Lw.kv_b_proj->data(),
                 kimi_ws.attn_v.data(),
-                total_tokens, heads, q_nope, v_dim, kv_lora, stream);
+                total_tokens, heads, q_nope, v_dim, kv_lora);
+            });
+            act_dump_bf16(act_dump_layer_tag("attn_v", li).c_str(),
+                kimi_ws.attn_v.data(), total_tokens, heads * v_dim, stream);
             invoke_stage_hook(
                 StageHookPoint::OnAttn, kimi_ws.q_b.data(),
                 static_cast<std::uint32_t>(total_tokens),
                 static_cast<std::uint32_t>(heads * (q_nope + q_rope)),
                 static_cast<std::uint32_t>(li), stream);
 
+            profile_cuda_stage(&profile, &profile.attn_oproj_ms, stream, [&] {
             if (T == 1) {
                 ops::gemm_act_x_w(cublas.handle(),
                     kimi_ws.attn_v.data(), *Lw.o_proj,
@@ -647,12 +802,14 @@ void kimi_forward_paged(
                     kimi_ws.y.data(), kimi_ws.norm_x.data(),
                     static_cast<std::size_t>(total_tokens) * H, stream);
             }
+            });
         });
 
         kernels::launch_rmsnorm_bf16(
             kimi_ws.y.data(), Lw.mlp_norm->data(), kimi_ws.norm_y.data(),
             total_tokens, H, eps, stream);
-
+        act_dump_bf16(act_dump_layer_tag("post_attn", li).c_str(),
+            kimi_ws.y.data(), total_tokens, H, stream);
         if (!Lw.is_moe) {
             ++profile.dense_layers;
             profile_cuda_stage(&profile, &profile.dense_mlp_ms, stream, [&] {
@@ -680,6 +837,8 @@ void kimi_forward_paged(
                         static_cast<std::size_t>(total_tokens) * H, stream);
                 }
             });
+            act_dump_bf16(act_dump_layer_tag("out", li).c_str(),
+                kimi_ws.y.data(), total_tokens, H, stream);
             continue;
         }
 
@@ -703,8 +862,82 @@ void kimi_forward_paged(
             const char* v = std::getenv("PIE_CUDA_KIMI_FORCE_PREFILL_MOE");
             return v != nullptr && v[0] != '\0';
         }();
-        if (is_pure_decode && !force_prefill_moe) {
-            const int routes = total_tokens * K;
+
+        // The W4A16 GEMVs re-read every routed expert once per token, so their
+        // weight traffic grows linearly with the batch. A batched GEMM over a
+        // materialised BF16 stack reads each active expert exactly once. BF16
+        // is 4x the bytes of int4, so the batched path wins once
+        // `routes > 4 * active_experts`.
+        const int routes = total_tokens * K;
+        const bool want_batched =
+            Lw.moe_gate_up_bf16 != nullptr && kimi_ws.aligned_block_size > 0 &&
+            total_tokens > kKimiMoeGemvMaxTokens &&
+            routes > 4 * std::min(E, routes) && !force_prefill_moe;
+
+        if (want_batched) {
+            profile_cuda_stage(&profile, &profile.moe_prefill_ms, stream, [&] {
+                const int block = std::min(kimi_ws.aligned_block_size,
+                                           kernels::moe_aligned_block(routes, E));
+                const int active_expert_cap = std::min(E, routes);
+                const int max_blocks =
+                    (routes + active_expert_cap * (block - 1) + block - 1) / block;
+                const int aligned_rows = max_blocks * block;
+                if (max_blocks > kimi_ws.aligned_max_blocks ||
+                    aligned_rows >
+                        static_cast<int>(kimi_ws.aligned_expert_in.shape()[0])) {
+                    throw std::runtime_error("kimi: aligned MoE scratch too small");
+                }
+                kernels::launch_moe_align_decode(
+                    static_cast<const std::int32_t*>(kimi_ws.topk_idx.data()),
+                    static_cast<std::int32_t*>(kimi_ws.aligned_route_ids.data()),
+                    static_cast<std::int32_t*>(kimi_ws.aligned_expert_ids.data()),
+                    /*route_to_aligned_row=*/nullptr,
+                    routes, E, block, max_blocks, stream);
+                kernels::launch_gather_moe_aligned_inputs_bf16(
+                    kimi_ws.norm_y.data(),
+                    static_cast<const std::int32_t*>(kimi_ws.aligned_route_ids.data()),
+                    kimi_ws.aligned_expert_in.data(),
+                    routes, aligned_rows, K, H,
+                    /*shared_row_begin=*/-1, total_tokens, stream);
+                kernels::launch_build_moe_ptrs_aligned_bf16(
+                    static_cast<const std::int32_t*>(kimi_ws.aligned_expert_ids.data()),
+                    Lw.moe_gate_up_bf16->data(), Lw.moe_down_bf16->data(),
+                    kimi_ws.aligned_expert_in.data(), kimi_ws.aligned_gate_up.data(),
+                    kimi_ws.aligned_act.data(), kimi_ws.aligned_out.data(),
+                    reinterpret_cast<const void**>(kimi_ws.a_gu_ptrs.data()),
+                    reinterpret_cast<const void**>(kimi_ws.b_gu_ptrs.data()),
+                    reinterpret_cast<void**>(kimi_ws.c_gu_ptrs.data()),
+                    reinterpret_cast<const void**>(kimi_ws.a_dn_ptrs.data()),
+                    reinterpret_cast<const void**>(kimi_ws.b_dn_ptrs.data()),
+                    reinterpret_cast<void**>(kimi_ws.c_dn_ptrs.data()),
+                    max_blocks, block, H, routed_I,
+                    /*routed_blocks=*/max_blocks, nullptr, nullptr, stream);
+
+                ops::gemm_batched_act_x_wt_bf16(cublas.handle(),
+                    reinterpret_cast<const void* const*>(kimi_ws.b_gu_ptrs.data()),
+                    reinterpret_cast<const void* const*>(kimi_ws.a_gu_ptrs.data()),
+                    reinterpret_cast<void* const*>(kimi_ws.c_gu_ptrs.data()),
+                    block, 2 * routed_I, H, max_blocks);
+                kernels::launch_chunked_swiglu_bf16(
+                    kimi_ws.aligned_gate_up.data(), kimi_ws.aligned_act.data(),
+                    aligned_rows, routed_I, stream);
+                ops::gemm_batched_act_x_wt_bf16(cublas.handle(),
+                    reinterpret_cast<const void* const*>(kimi_ws.b_dn_ptrs.data()),
+                    reinterpret_cast<const void* const*>(kimi_ws.a_dn_ptrs.data()),
+                    reinterpret_cast<void* const*>(kimi_ws.c_dn_ptrs.data()),
+                    block, H, routed_I, max_blocks);
+                kernels::launch_reorder_moe_aligned_output_bf16(
+                    kimi_ws.aligned_out.data(),
+                    static_cast<const std::int32_t*>(kimi_ws.aligned_route_ids.data()),
+                    kimi_ws.expert_out.data(),
+                    routes, aligned_rows, H,
+                    /*shared_row_begin=*/-1, total_tokens, nullptr, stream);
+                kernels::launch_token_batched_weighted_sum_bf16(
+                    kimi_ws.moe_out.data(), kimi_ws.expert_out.data(),
+                    static_cast<const float*>(kimi_ws.topk_weights.data()),
+                    total_tokens, K, H, stream);
+            });
+        } else if (is_pure_decode && !force_prefill_moe) {
             profile_cuda_stage(&profile, &profile.moe_gate_up_ms, stream, [&] {
                 kernels::launch_wna16_gate_up_decode_bf16(
                     kimi_ws.norm_y.data(),
@@ -802,22 +1035,20 @@ void kimi_forward_paged(
             });
         }
 
-        if (shared_I > 0 && Lw.shared_gate_proj != nullptr) {
+        if (shared_I > 0 &&
+            (Lw.shared_gate_proj != nullptr || Lw.shared_gate_up_fused != nullptr)) {
             profile_cuda_stage(&profile, &profile.moe_shared_ms, stream, [&] {
-                if (Lw.shared_gate_up_fused != nullptr && total_tokens == 1) {
-                    // Fused gate+up for single-token decode: one GEMM
-                    // Output: [1, 2*shared_I] = [gate..., up...]
-                    ops::gemm_act_x_w(cublas.handle(),
-                        kimi_ws.norm_y.data(), *Lw.shared_gate_up_fused,
-                        kimi_ws.shared_gate.data(), 1, 2 * shared_I, H);
-                    // SwiGLU reads gate from shared_gate, up from shared_gate+shared_I
-                    // For N=1, shared_up can point into the fused buffer
-                } else if (Lw.shared_gate_up_fused != nullptr) {
-                    // Multi-token: fall back to unfused (need interleaved layout)
-                    // TODO: implement strided SwiGLU for fused gate+up
+                if (Lw.shared_gate_up_fused != nullptr) {
+                    // One GEMM into `[T, 2*shared_I]` (gate half first, up half
+                    // second) followed by the chunked SwiGLU that reads both
+                    // halves of a row. `shared_gate` is allocated at
+                    // `2 * shared_I` columns precisely for this.
                     ops::gemm_act_x_w(cublas.handle(),
                         kimi_ws.norm_y.data(), *Lw.shared_gate_up_fused,
                         kimi_ws.shared_gate.data(), total_tokens, 2 * shared_I, H);
+                    kernels::launch_chunked_swiglu_bf16(
+                        kimi_ws.shared_gate.data(), kimi_ws.shared_act.data(),
+                        total_tokens, shared_I, stream);
                 } else {
                     ops::gemm_act_x_w(cublas.handle(),
                         kimi_ws.norm_y.data(), *Lw.shared_gate_proj,
@@ -825,15 +1056,8 @@ void kimi_forward_paged(
                     ops::gemm_act_x_w(cublas.handle(),
                         kimi_ws.norm_y.data(), *Lw.shared_up_proj,
                         kimi_ws.shared_up.data(), total_tokens, shared_I, H);
-                }
-                {
-                    // For fused gate+up with N=1: gate at offset 0, up at offset shared_I
-                    const void* up_ptr = (Lw.shared_gate_up_fused != nullptr && total_tokens == 1)
-                        ? static_cast<const char*>(kimi_ws.shared_gate.data()) +
-                          static_cast<std::size_t>(shared_I) * sizeof(std::uint16_t)
-                        : kimi_ws.shared_up.data();
                     kernels::launch_swiglu_bf16(
-                        kimi_ws.shared_gate.data(), up_ptr,
+                        kimi_ws.shared_gate.data(), kimi_ws.shared_up.data(),
                         kimi_ws.shared_act.data(), total_tokens * shared_I, stream);
                 }
                 ops::gemm_act_x_w(cublas.handle(),
@@ -857,6 +1081,8 @@ void kimi_forward_paged(
         });
         dump_hidden_norm(kimi_ws.y.data(), total_tokens, H, li,
             "post_moe", tp != nullptr ? tp->rank() : 0, stream);
+        act_dump_bf16(act_dump_layer_tag("out", li).c_str(),
+            kimi_ws.y.data(), total_tokens, H, stream);
     }
 
     if (!fwd_cfg.emit_logits) {
@@ -893,6 +1119,8 @@ void kimi_forward_paged(
             rows, V, H);
         dump_top_logits(logits_out, rows, V,
             tp != nullptr ? tp->rank() : 0, 0, stream);
+        act_dump_bf16("final_norm", kimi_ws.norm_y.data(), rows, H, stream);
+        act_dump_bf16("logits", logits_out, rows, V, stream);
     });
     profile.end(stream);
     maybe_print_profile(profile);

@@ -29,9 +29,11 @@ pub enum DType {
     /// DeepSeek-V4 pairs it with FP8-E4M3 weights instead, a combination that
     /// composite cannot name.
     E8M0,
+    I64,
     I32,
     I16,
     I8,
+    U64,
     U32,
     U16,
     U8,
@@ -41,6 +43,7 @@ pub enum DType {
 impl DType {
     pub fn bytes(self) -> u64 {
         match self {
+            Self::I64 | Self::U64 => 8,
             Self::F32 | Self::I32 | Self::U32 => 4,
             Self::F16 | Self::BF16 | Self::I16 | Self::U16 => 2,
             Self::F8E4M3 | Self::F8E5M2 | Self::E8M0 | Self::I8 | Self::U8 | Self::Bool => 1,
@@ -212,6 +215,17 @@ pub enum Encoding {
     Quant(QuantSpec),
 }
 
+impl Encoding {
+    /// The type one element reads as. For a quantized encoding this is the
+    /// logical type the elements decode to, not their storage width.
+    pub fn dtype(&self) -> DType {
+        match self {
+            Encoding::Raw(dtype) => *dtype,
+            Encoding::Quant(spec) => spec.logical_dtype,
+        }
+    }
+}
+
 pub fn normalize_encoding(encoding: &Encoding) -> Encoding {
     match encoding {
         Encoding::Raw(dtype) => Encoding::Raw(*dtype),
@@ -230,10 +244,7 @@ pub struct TensorDecl {
 
 impl TensorDecl {
     pub fn dtype(&self) -> DType {
-        match &self.encoding {
-            Encoding::Raw(dtype) => *dtype,
-            Encoding::Quant(spec) => spec.logical_dtype,
-        }
+        self.encoding.dtype()
     }
 }
 
@@ -270,4 +281,30 @@ pub fn encoding_nbytes(shape: &[i64], encoding: &Encoding) -> Option<u64> {
             Some(bits.div_ceil(8))
         }
     }
+}
+
+/// How a scale tensor's entries map onto the tensor they scale.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum QuantGranularity {
+    /// One scale per row of `channel_axis`.
+    PerChannel,
+    /// One scale per `group_size` elements along the axis after `channel_axis`.
+    PerGroup,
+}
+
+/// What the driver's kernels expect a scale tensor to hold by the time they read
+/// it.
+///
+/// Not derivable from the scale tensor itself — its dtype says how the bytes are
+/// stored, not how the kernel wants them — so whoever declared the scale states
+/// it. The driver used to infer it from `group_size == 32`, which was true only
+/// because MXFP4 is the one scheme with that group size today.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ScaleForm {
+    /// Consumed as raw E8M0 exponent bytes. The MXFP4 GEMM, the dequant kernels
+    /// and `make_expert_weight_view` all require U8 and assert on anything else.
+    RawE8M0,
+    /// Consumed as F32 multipliers. Whatever the scales were stored as (E8M0
+    /// bytes, BF16, or F32 already) is expanded before the GEMM sees them.
+    F32Factors,
 }

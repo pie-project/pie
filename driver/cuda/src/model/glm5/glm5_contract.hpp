@@ -18,6 +18,11 @@ inline void author_glm5_contract(ContractBuilder& b) {
     b.shard_embed_tokens();
     b.allow_bf16_runtime_quant();
     b.allow_mxfp4_runtime_quant();
+    // GLM-5.2 ships routed experts one tensor per expert; glm5_forward reads
+    // the fused 3-D slabs. Float only: this family's quantised checkpoints
+    // keep the per-expert layout and take the per-expert forward path.
+    contract_detail::hf_moe_expert_stacks(b, /*gate_second=*/false,
+                                          /*float_only=*/true);
     author_dense_contract(b);
 }
 

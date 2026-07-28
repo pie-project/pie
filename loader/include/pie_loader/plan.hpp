@@ -183,7 +183,6 @@ class LoadPlan {
         case PieLoaderStatus::InvalidCheckpoint: return "invalid checkpoint";
         case PieLoaderStatus::ContractViolation: return "contract violation";
         case PieLoaderStatus::Internal: return "internal error";
-        case PieLoaderStatus::Panic: return "panic";
         }
         return "unknown status";
     }

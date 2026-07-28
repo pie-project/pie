@@ -12,13 +12,16 @@ from typing import Any
 from common import (
     RequestResult,
     add_mode_subcommands,
+    add_output_dump_args,
     cuda_profiler_start,
     cuda_profiler_stop,
     finish,
     gpu_clock_state,
+    hash_output_tokens,
     hf_chat_prompts_and_counts,
     make_prompts,
     maybe_set_cpu_affinity,
+    print_first_output,
     request_max_tokens,
     run_timed_warmup_sync,
     summarize,
@@ -131,6 +134,8 @@ def run(args: argparse.Namespace):
         llm_kwargs["num_gpu_blocks_override"] = args.num_gpu_blocks_override
     if getattr(args, "block_size", 0):
         llm_kwargs["block_size"] = args.block_size
+    if getattr(args, "kv_cache_dtype", "auto") != "auto":
+        llm_kwargs["kv_cache_dtype"] = args.kv_cache_dtype
     speculative_config = None
     if args.speculative_config is not None:
         speculative_config = json.loads(args.speculative_config)
@@ -239,6 +244,26 @@ def run(args: argparse.Namespace):
     run_prompts = prompts[args.warmup:]
     run_prompt_counts = prompt_counts[args.warmup:]
     results: list[RequestResult] = []
+    first_output_text: str | None = None
+
+    def record(out: Any, req_wall: float, prompt_count: int) -> None:
+        nonlocal first_output_text
+        token_ids = [int(t) for t in out.outputs[0].token_ids]
+        result = RequestResult(
+            True,
+            float(req_wall),
+            len(token_ids),
+            prompt_count,
+        )
+        result.output_token_sha256 = hash_output_tokens(token_ids)
+        if getattr(args, "dump_all_token_ids", False):
+            result.output_token_ids = token_ids
+        if getattr(args, "dump_all_texts", False):
+            result.output_text = out.outputs[0].text
+        if first_output_text is None:
+            first_output_text = out.outputs[0].text
+        results.append(result)
+
     cuda_profiler_start(args.cuda_profiler_capture)
     start = time.perf_counter()
     try:
@@ -251,14 +276,7 @@ def run(args: argparse.Namespace):
                 outputs = llm.generate([p], sampling_for(i))
                 req_wall = time.perf_counter() - req_start
                 for out in outputs:
-                    results.append(
-                        RequestResult(
-                            True,
-                            float(req_wall),
-                            len(out.outputs[0].token_ids),
-                            prompt_count,
-                        )
-                    )
+                    record(out, req_wall, prompt_count)
         else:
             measured_sampling = (
                 [
@@ -270,14 +288,13 @@ def run(args: argparse.Namespace):
             )
             outputs = llm.generate(run_prompts, measured_sampling)
             for out, prompt_count in zip(outputs, run_prompt_counts):
-                results.append(
-                    RequestResult(True, 0.0, len(out.outputs[0].token_ids), prompt_count)
-                )
+                record(out, 0.0, prompt_count)
     finally:
         wall = time.perf_counter() - start
         cuda_profiler_stop(args.cuda_profiler_capture)
         clocks_at_end = gpu_clock_state()
     spec_metrics_after = _vllm_spec_metrics(llm)
+    print_first_output(args, first_output_text)
 
     summary = summarize(
         mode=args.mode,
@@ -547,6 +564,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="vLLM canonical latency/throughput benchmark")
     add_mode_subcommands(parser)
     for sp in parser._subparsers._group_actions[0].choices.values():
+        add_output_dump_args(sp)
         sp.add_argument("--attention-backend", default=None)
         sp.add_argument("--enforce-eager", action="store_true")
         sp.add_argument(
@@ -571,6 +589,12 @@ def main() -> None:
             default=False,
         )
         sp.add_argument("--max-num-batched-tokens", type=int, default=None)
+        sp.add_argument(
+            "--kv-cache-dtype",
+            default="auto",
+            help="vLLM KV cache dtype. DeepSeek-V4 needs 'fp8' because its "
+                 "fp8_ds_mla cache layout refuses anything else.",
+        )
         sp.add_argument(
             "--speculative-config",
             default=None,

@@ -179,16 +179,54 @@ inline void m1_fault(device M1Status* status, uint code) {
   status->state = 3;
 }
 
+// A fault that says which op and which guard. `fault` alone is the op tag, and
+// several ops share one tag -- every intrinsic is 0xA0 -- so the tag names a
+// family rather than a cause. `reserved0` carries the intrinsic id and
+// `reserved1` packs the guard site with the immediate, which is what turns
+// "instance N launch failed: op tag 0xA0" into something actionable.
+//   site 1 = channel sink is narrower than the value
+//   site 2 = MtpDrafts with a zero row width
+//   site 3 = no arm claimed this tag
+inline void m1_fault_op(device M1Status* status, uint site, M1OpParams p) {
+  status->reserved0 = p.intr;
+  status->reserved1 = (site << 24) | (p.imm & 0x00ffffffu);
+  status->fault = p.tag;
+  status->state = 3;
+}
+
+// A strided, word-wide typed copy. `begin`/`step` partition it across a
+// threadgroup; 0/1 is the serial walk. The byte-at-a-time version this replaces
+// issued one device access per byte, so copying a vocabulary-wide f32 row -- a
+// plain reshape in the sampler's PTIR graph -- was ~1M dependent accesses on a
+// single thread, about 85ms of an ~89ms decode step.
+inline void m1_copy_typed_range(
+    const device uchar* input,
+    device uchar* output,
+    uint len,
+    uint dtype,
+    uint begin,
+    uint step) {
+  if (dtype == 3) {
+    for (uint i = begin; i < len; i += step) output[i] = input[i];
+    return;
+  }
+  const bool aligned =
+      ((ulong(input) | ulong(output)) & 3ul) == 0ul;
+  if (aligned) {
+    const device uint* src = reinterpret_cast<const device uint*>(input);
+    device uint* dst = reinterpret_cast<device uint*>(output);
+    for (uint i = begin; i < len; i += step) dst[i] = src[i];
+  } else {
+    for (uint i = begin; i < len * 4u; i += step) output[i] = input[i];
+  }
+}
+
 inline void m1_copy_typed(
     const device uchar* input,
     device uchar* output,
     uint len,
     uint dtype) {
-  if (dtype == 3) {
-    for (uint i = 0; i < len; ++i) output[i] = input[i];
-  } else {
-    for (uint i = 0; i < len * 4; ++i) output[i] = input[i];
-  }
+  m1_copy_typed_range(input, output, len, dtype, 0u, 1u);
 }
 
 inline void m1_reduce_float(
@@ -297,84 +335,109 @@ inline void m1_reduce_integer(
   }
 }
 
+// Sequential fold, not a staged tree. `m1_argmax_combine` is a strict total
+// order on (have, value desc, index asc), so its maximum is unique and every
+// evaluation order yields the same (value, index) -- unlike m1_reduce_float's
+// sum, whose tree shape is part of the numeric ABI. The tree here cost a
+// materialization of one 16-byte candidate per element into device `temporary`
+// plus a full read-modify-write per pass, all on the single thread that owns the
+// lane; on a 248k vocab that was ~257ms, roughly 60x the entire model forward.
 inline void m1_reduce_argmax(
     const device uchar* input,
     device uchar* output,
     device uchar* temporary,
     const M1ValueDesc in_desc) {
+  (void)temporary;
   device int* result = reinterpret_cast<device int*>(output);
   if (in_desc.dtype != 0) {
-    device M1IntArgmaxCandidate* work =
-        reinterpret_cast<device M1IntArgmaxCandidate*>(temporary);
     for (uint row = 0; row < in_desc.rows; ++row) {
       const uint base = row * in_desc.last;
+      M1IntArgmaxCandidate best = {0l, 0u, 0u};
       for (uint i = 0; i < in_desc.last; ++i) {
-        work[i] = {
-            m1_load_index(input, base + i, in_desc.dtype), i, 1u};
+        best = m1_int_argmax_combine(
+            best,
+            M1IntArgmaxCandidate{
+                m1_load_index(input, base + i, in_desc.dtype), i, 1u});
       }
-      uint count = in_desc.last;
-      if (count == 0) {
-        result[row] = 0;
-        continue;
-      }
-      while (count > 1) {
-        const uint chunks = (count + 31) / 32;
-        for (uint chunk = 0; chunk < chunks; ++chunk) {
-          M1IntArgmaxCandidate lanes[32];
-          for (uint lane = 0; lane < 32; ++lane) {
-            const uint index = chunk * 32 + lane;
-            lanes[lane] =
-                index < count
-                    ? work[index]
-                    : M1IntArgmaxCandidate{0l, 0u, 0u};
-          }
-          for (uint offset = 16; offset > 0; offset >>= 1)
-            for (uint lane = 0; lane < offset; ++lane)
-              lanes[lane] = m1_int_argmax_combine(
-                  lanes[lane], lanes[lane + offset]);
-          work[chunk] = lanes[0];
-        }
-        count = chunks;
-      }
-      result[row] = int(work[0].index);
+      result[row] = int(best.index);
     }
     return;
   }
 
   const device float* values =
       reinterpret_cast<const device float*>(input);
-  device M1ArgmaxCandidate* work =
-      reinterpret_cast<device M1ArgmaxCandidate*>(temporary);
   for (uint row = 0; row < in_desc.rows; ++row) {
     const uint base = row * in_desc.last;
-    for (uint i = 0; i < in_desc.last; ++i) {
+    // Four independent accumulators, folded at the end. Associativity makes the
+    // split free (see the note above), and it breaks the dependent chain that
+    // otherwise serialises one device load per iteration on this single thread.
+    M1ArgmaxCandidate best[4] = {
+        {-INFINITY, 0u, 0u, 0u}, {-INFINITY, 0u, 0u, 0u},
+        {-INFINITY, 0u, 0u, 0u}, {-INFINITY, 0u, 0u, 0u}};
+    uint i = 0;
+    for (; i + 4u <= in_desc.last; i += 4u) {
+      const float v0 = values[base + i + 0], v1 = values[base + i + 1];
+      const float v2 = values[base + i + 2], v3 = values[base + i + 3];
+      best[0] = m1_argmax_combine(
+          best[0], M1ArgmaxCandidate{v0, i + 0u, isnan(v0) ? 0u : 1u, 0u});
+      best[1] = m1_argmax_combine(
+          best[1], M1ArgmaxCandidate{v1, i + 1u, isnan(v1) ? 0u : 1u, 0u});
+      best[2] = m1_argmax_combine(
+          best[2], M1ArgmaxCandidate{v2, i + 2u, isnan(v2) ? 0u : 1u, 0u});
+      best[3] = m1_argmax_combine(
+          best[3], M1ArgmaxCandidate{v3, i + 3u, isnan(v3) ? 0u : 1u, 0u});
+    }
+    for (; i < in_desc.last; ++i) {
       const float value = values[base + i];
-      work[i] = {value, i, isnan(value) ? 0u : 1u, 0u};
+      best[0] = m1_argmax_combine(
+          best[0], M1ArgmaxCandidate{value, i, isnan(value) ? 0u : 1u, 0u});
     }
-    uint count = in_desc.last;
-    if (count == 0) {
-      result[row] = 0;
-      continue;
+    M1ArgmaxCandidate folded = m1_argmax_combine(
+        m1_argmax_combine(best[0], best[1]),
+        m1_argmax_combine(best[2], best[3]));
+    result[row] = int(folded.index);
+  }
+}
+
+// Threadgroup-cooperative argmax, for the grouped region launch that gives a
+// lane a whole threadgroup instead of one thread. Same strict total order as
+// m1_argmax_combine, so the answer is identical to the serial fold above; only
+// the partition changes. The tree guards `tid + stride` so a non-power-of-two
+// threadgroup is still correct.
+inline void m1_reduce_argmax_mt(
+    const device uchar* input,
+    device uchar* output,
+    device uchar* temporary,
+    const M1ValueDesc in_desc,
+    uint tid,
+    uint nthreads,
+    threadgroup M1ArgmaxCandidate* tgbuf) {
+  if (in_desc.dtype != 0) {
+    // Integer argmax rows are small in every shipped program; keep the serial
+    // path rather than duplicating it.
+    if (tid == 0) m1_reduce_argmax(input, output, temporary, in_desc);
+    return;
+  }
+  device int* result = reinterpret_cast<device int*>(output);
+  const device float* values = reinterpret_cast<const device float*>(input);
+  for (uint row = 0; row < in_desc.rows; ++row) {
+    const uint base = row * in_desc.last;
+    M1ArgmaxCandidate best = {-INFINITY, 0u, 0u, 0u};
+    for (uint i = tid; i < in_desc.last; i += nthreads) {
+      const float value = values[base + i];
+      best = m1_argmax_combine(
+          best, M1ArgmaxCandidate{value, i, isnan(value) ? 0u : 1u, 0u});
     }
-    while (count > 1) {
-      const uint chunks = (count + 31) / 32;
-      for (uint chunk = 0; chunk < chunks; ++chunk) {
-        M1ArgmaxCandidate lanes[32];
-        for (uint lane = 0; lane < 32; ++lane) {
-          const uint index = chunk * 32 + lane;
-          lanes[lane] = index < count
-                            ? work[index]
-                            : M1ArgmaxCandidate{-INFINITY, 0u, 0u, 0u};
-        }
-        for (uint offset = 16; offset > 0; offset >>= 1)
-          for (uint lane = 0; lane < offset; ++lane)
-            lanes[lane] =
-                m1_argmax_combine(lanes[lane], lanes[lane + offset]);
-        work[chunk] = lanes[0];
+    tgbuf[tid] = best;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 1u; stride < nthreads; stride <<= 1) {
+      if ((tid % (2u * stride)) == 0u && tid + stride < nthreads) {
+        tgbuf[tid] = m1_argmax_combine(tgbuf[tid], tgbuf[tid + stride]);
       }
-      count = chunks;
+      threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    result[row] = int(work[0].index);
+    if (tid == 0) result[row] = int(tgbuf[0].index);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
   }
 }
 
@@ -419,7 +482,7 @@ inline void ptir_m1_execute(
     const uint logical_bytes =
         d0.dtype == 3 ? (d0.len + 7u) / 8u : d0.len * 4u;
     if (logical_bytes > p.sink_bytes) {
-      m1_fault(status, p.tag);
+      m1_fault_op(status, 1u, p);
       return;
     }
     if (d0.dtype == 3) {
@@ -438,7 +501,7 @@ inline void ptir_m1_execute(
         ulong(p.imm2) * p.imm;
     if (p.intr == 6u) {  // MtpDrafts: bounded argmax of the bound MTP rows
       if (p.imm == 0u) {
-        m1_fault(status, p.tag);
+        m1_fault_op(status, 2u, p);
         return;
       }
       for (uint row = 0; row < out0.len; ++row) {
@@ -459,7 +522,20 @@ inline void ptir_m1_execute(
       }
       return;
     }
-    for (uint i = 0; i < out0.len; ++i) m1_store_f(o0, i, float(logits[i]));
+    // Unrolled: the lane that owns this region is a single thread, so a scalar
+    // loop over a vocab-wide row is a chain of dependent device round trips.
+    // Eight independent loads per iteration let the memory pipeline overlap them.
+    device float* out_f = reinterpret_cast<device float*>(o0);
+    uint i = 0;
+    for (; i + 8u <= out0.len; i += 8u) {
+      const float v0 = float(logits[i + 0]), v1 = float(logits[i + 1]);
+      const float v2 = float(logits[i + 2]), v3 = float(logits[i + 3]);
+      const float v4 = float(logits[i + 4]), v5 = float(logits[i + 5]);
+      const float v6 = float(logits[i + 6]), v7 = float(logits[i + 7]);
+      out_f[i + 0] = v0; out_f[i + 1] = v1; out_f[i + 2] = v2; out_f[i + 3] = v3;
+      out_f[i + 4] = v4; out_f[i + 5] = v5; out_f[i + 6] = v6; out_f[i + 7] = v7;
+    }
+    for (; i < out0.len; ++i) out_f[i] = float(logits[i]);
     return;
   }
   if (p.tag == 0xA1) {  // explicit Metal semantic boundary: identity
@@ -924,5 +1000,42 @@ inline void ptir_m1_execute(
     return;
   }
 
-  m1_fault(status, p.tag);
+  m1_fault_op(status, 3u, p);
+}
+
+// The grouped region hands a lane a whole threadgroup. Ops whose partition is
+// provably free run across it; everything else stays on thread 0 and keeps the
+// exact serial semantics (m1_reduce_float's sum tree, for one, is a numeric
+// ABI and must not be repartitioned). The caller barriers between ops.
+inline void ptir_m1_execute_mt(
+    uint generated_tag,
+    device M1Status* status,
+    const device M1ValueDesc* descriptors,
+    const device M1OpParams* params,
+    const device uchar* a0,
+    const device uchar* a1,
+    const device uchar* a2,
+    device uchar* o0,
+    device uchar* o1,
+    device uchar* temporary,
+    uint tid,
+    uint nthreads,
+    threadgroup M1ArgmaxCandidate* tgbuf) {
+  if (status->state != 1) return;
+  M1OpParams p = params[0];
+  p.tag = generated_tag;
+  const M1ValueDesc d0 = descriptors[p.a0];
+
+  if (p.tag == 0x33) {  // argmax: order-independent, so partition it
+    m1_reduce_argmax_mt(a0, o0, temporary, d0, tid, nthreads, tgbuf);
+    return;
+  }
+  if (p.tag == 0x39 || p.tag == 0xA1) {  // reshape / semantic-boundary identity
+    const M1ValueDesc out0 = descriptors[p.o0];
+    m1_copy_typed_range(a0, o0, out0.len, out0.dtype, tid, nthreads);
+    return;
+  }
+  if (tid != 0) return;
+  ptir_m1_execute(generated_tag, status, descriptors, params, a0, a1, a2, o0, o1,
+                  temporary);
 }

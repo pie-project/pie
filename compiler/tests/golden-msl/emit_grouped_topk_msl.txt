@@ -1,9 +1,20 @@
 # oracle dump: pie::metal::pipeline::emit_grouped_topk_msl
-# source of truth: driver/metal/src/pipeline/m1_codegen.cpp (transitional; the Rust port is compiler/codegen/src/metal/)
-# emitter_version: 23
-# @runtime: bytes=33947 fnv1a64=0x87250720781b2a8f
+# source of truth: compiler/codegen/src/metal/ (the C++ oracle this was dumped from is deleted)
+# emitter_version: 30
+# @runtime: bytes=39611 fnv1a64=0x310a2f7d72f22fd5
 # @grouped: bytes=970 fnv1a64=0xa8ab9e1ebf8714d9
 # cases: 192
+#   re-blessed again (emitter 27): `m1_reduce_argmax` no longer materializes one
+#   16-byte candidate per element into device `temporary` and tree-reduces it in
+#   passes -- `m1_argmax_combine` is a strict total order, so a fold gives the
+#   same answer -- and the bf16 logits intrinsic copies unrolled. Both loops run
+#   on the single thread that owns a lane, so at a 248320 vocab they were ~250ms
+#   per decode step against a ~4ms model forward. Only @runtime bytes moved.
+#   re-blessed again (emitter 29): a generated region now gets a threadgroup per
+#   lane instead of a thread, and the three things that walked a vocabulary-wide
+#   row -- the logits gather, argmax, and the typed copy behind a reshape -- are
+#   split across it. m1_copy_typed also moved from one device access per BYTE to
+#   one per word. Between them a decode step's GPU time went 89ms -> 6.5ms.
 === beam_epilogue#0 singleton#0
 function_name: ptir_m3_b4fadd8446eb58dd_r0
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
@@ -68,7 +79,7 @@ error: invalid grouped TopK library region
 function_name: ptir_m3_b4fadd8446eb58dd_r14
 region: library=1 library_op=1 schedule=3 nodes=1 inputs=1 outputs=2 sinks=0
 ok: true
-source: bytes=40172 prefix=@runtime+@grouped tail_bytes=5255
+source: bytes=45836 prefix=@runtime+@grouped tail_bytes=5255
 
 inline uint m3_topk_order_digit(float value, uint pass) {
   if (pass < 8u) {
@@ -290,7 +301,7 @@ error: invalid grouped TopK library region
 function_name: ptir_m3_b4fadd8446eb58dd_r1
 region: library=1 library_op=1 schedule=3 nodes=1 inputs=1 outputs=2 sinks=0
 ok: true
-source: bytes=40171 prefix=@runtime+@grouped tail_bytes=5254
+source: bytes=45835 prefix=@runtime+@grouped tail_bytes=5254
 
 inline uint m3_topk_order_digit(float value, uint pass) {
   if (pass < 8u) {
@@ -1028,7 +1039,7 @@ error: invalid grouped TopK library region
 function_name: ptir_m3_dff3bc6795a9dcdf_r31
 region: library=1 library_op=1 schedule=3 nodes=1 inputs=1 outputs=2 sinks=0
 ok: true
-source: bytes=40172 prefix=@runtime+@grouped tail_bytes=5255
+source: bytes=45836 prefix=@runtime+@grouped tail_bytes=5255
 
 inline uint m3_topk_order_digit(float value, uint pass) {
   if (pass < 8u) {
@@ -1178,7 +1189,7 @@ error: invalid grouped TopK library region
 function_name: ptir_m3_dff3bc6795a9dcdf_r1
 region: library=1 library_op=1 schedule=3 nodes=1 inputs=1 outputs=2 sinks=0
 ok: true
-source: bytes=40171 prefix=@runtime+@grouped tail_bytes=5254
+source: bytes=45835 prefix=@runtime+@grouped tail_bytes=5254
 
 inline uint m3_topk_order_digit(float value, uint pass) {
   if (pass < 8u) {

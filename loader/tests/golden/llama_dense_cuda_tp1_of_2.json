@@ -20,10 +20,52 @@
       "rewrites": 21
     },
     {
+      "pass": "coalesce-persistent-arena-writes",
+      "instrs_before": 63,
+      "instrs_after": 63,
+      "rewrites": 0
+    },
+    {
       "pass": "hoist-bulk-arena-writes",
       "instrs_before": 63,
       "instrs_after": 61,
       "rewrites": 2
+    },
+    {
+      "pass": "group-shared-source-reads",
+      "instrs_before": 61,
+      "instrs_after": 61,
+      "rewrites": 0
+    },
+    {
+      "pass": "merge-adjacent-extent-writes",
+      "instrs_before": 61,
+      "instrs_after": 61,
+      "rewrites": 0
+    },
+    {
+      "pass": "recompute-memory-plan",
+      "instrs_before": 61,
+      "instrs_after": 61,
+      "rewrites": 0
+    },
+    {
+      "pass": "validate-fill-order",
+      "instrs_before": 61,
+      "instrs_after": 61,
+      "rewrites": 0
+    },
+    {
+      "pass": "validate-target-support",
+      "instrs_before": 61,
+      "instrs_after": 61,
+      "rewrites": 0
+    },
+    {
+      "pass": "validate-persistent-layout",
+      "instrs_before": 61,
+      "instrs_after": 61,
+      "rewrites": 0
     }
   ],
   "files": [
@@ -889,7 +931,8 @@
                 "dst_stride": 1
               }
             ]
-          }
+          },
+          "dtype": "BF16"
         },
         "dest_offset": 0
       }
@@ -912,7 +955,8 @@
                 "dst_stride": 1
               }
             ]
-          }
+          },
+          "dtype": "BF16"
         },
         "dest_offset": 262656
       }
@@ -935,7 +979,8 @@
                 "dst_stride": 1
               }
             ]
-          }
+          },
+          "dtype": "BF16"
         },
         "dest_offset": 328192
       }
@@ -958,7 +1003,8 @@
                 "dst_stride": 1
               }
             ]
-          }
+          },
+          "dtype": "BF16"
         },
         "dest_offset": 344576
       }
@@ -981,7 +1027,8 @@
                 "dst_stride": 1
               }
             ]
-          }
+          },
+          "dtype": "BF16"
         },
         "dest_offset": 360960
       }
@@ -1004,7 +1051,8 @@
                 "dst_stride": 1
               }
             ]
-          }
+          },
+          "dtype": "BF16"
         },
         "dest_offset": 361472
       }
@@ -1027,7 +1075,8 @@
                 "dst_stride": 1
               }
             ]
-          }
+          },
+          "dtype": "BF16"
         },
         "dest_offset": 541696
       }
@@ -1050,7 +1099,8 @@
                 "dst_stride": 1
               }
             ]
-          }
+          },
+          "dtype": "BF16"
         },
         "dest_offset": 721920
       }
@@ -1073,7 +1123,8 @@
                 "dst_stride": 1
               }
             ]
-          }
+          },
+          "dtype": "BF16"
         },
         "dest_offset": 722432
       }
@@ -1096,7 +1147,8 @@
                 "dst_stride": 1
               }
             ]
-          }
+          },
+          "dtype": "BF16"
         },
         "dest_offset": 787968
       }
@@ -1119,7 +1171,8 @@
                 "dst_stride": 1
               }
             ]
-          }
+          },
+          "dtype": "BF16"
         },
         "dest_offset": 804352
       }
@@ -1142,7 +1195,8 @@
                 "dst_stride": 1
               }
             ]
-          }
+          },
+          "dtype": "BF16"
         },
         "dest_offset": 820736
       }
@@ -1165,7 +1219,8 @@
                 "dst_stride": 1
               }
             ]
-          }
+          },
+          "dtype": "BF16"
         },
         "dest_offset": 821248
       }
@@ -1188,7 +1243,8 @@
                 "dst_stride": 1
               }
             ]
-          }
+          },
+          "dtype": "BF16"
         },
         "dest_offset": 1001472
       }
@@ -1211,7 +1267,8 @@
                 "dst_stride": 1
               }
             ]
-          }
+          },
+          "dtype": "BF16"
         },
         "dest_offset": 1181696
       }
@@ -1269,7 +1326,8 @@
                 "dst_stride": 256
               }
             ]
-          }
+          },
+          "dtype": "BF16"
         },
         "dest": {
           "buffer": 5,
@@ -1339,7 +1397,8 @@
                 "dst_stride": 704
               }
             ]
-          }
+          },
+          "dtype": "BF16"
         },
         "dest": {
           "buffer": 9,
@@ -1416,7 +1475,8 @@
                 "dst_stride": 256
               }
             ]
-          }
+          },
+          "dtype": "BF16"
         },
         "dest": {
           "buffer": 14,
@@ -1486,7 +1546,8 @@
                 "dst_stride": 704
               }
             ]
-          }
+          },
+          "dtype": "BF16"
         },
         "dest": {
           "buffer": 18,

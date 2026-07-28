@@ -24,6 +24,11 @@ namespace pie_cuda_driver::kernels {
 //   `lse`   fp32 [N, H_q]
 //   `sinks` bf16 [H_q]
 //
+// FlashInfer writes `m + log2(d)` into its `lse` output (see the note in
+// attn_sink.cu). Kernels that combine a FlashInfer LSE with a natively
+// produced one - or that read it as a natural log - need this rescale first.
+void launch_lse_log2_to_ln(float* lse, int n, cudaStream_t stream);
+
 // One block per (token, head); threads stride along the head dim.
 void launch_attention_sink_rescale_bf16(
     void*        o,

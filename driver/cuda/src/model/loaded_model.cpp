@@ -191,6 +191,7 @@ LoadedModel LoadedModel::load(
     // never decided anything with: an expert weight is MXFP4 in the plan because
     // a contract node says so, and this is the same resolution the contract was
     // written from.
+    e.mxfp4_moe_request_ = mxfp4_moe;
     e.mxfp4_moe_policy_ =
         model::resolve_mxfp4_moe(mxfp4_moe, device_target.native_mxfp4_moe);
 
@@ -386,19 +387,11 @@ LoadedModel LoadedModel::load(
                   << " bulk_copies=" << materialized.h2d_bulk_copy_count
                   << " pinned_copies="
                   << materialized.h2d_pinned_copy_count
-                  << " slab_scatter="
-                  << materialized.slab_scatter_count
-                  << " slab_placements="
-                  << materialized.slab_scatter_placements
                   << " h2d_bytes=" << to_mib(materialized.h2d_copy_bytes)
                   << " MiB bulk_bytes="
                   << to_mib(materialized.h2d_bulk_copy_bytes)
                   << " MiB pinned_bytes="
                   << to_mib(materialized.h2d_pinned_copy_bytes)
-                  << " MiB slab_source_bytes="
-                  << to_mib(materialized.slab_scatter_source_bytes)
-                  << " MiB slab_payload_bytes="
-                  << to_mib(materialized.slab_scatter_payload_bytes)
                   << " MiB copy_flushes="
                   << materialized.copy_stream_flushes
                   << " batch_calls="

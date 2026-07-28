@@ -59,11 +59,13 @@ using pie_loader::PieLoaderBackendKind;
 using pie_loader::PieLoaderDType;
 using pie_loader::PieLoaderEncodingKind;
 using pie_loader::PieLoaderEncodingSpec;
+using pie_loader::PieLoaderQuantGranularity;
 using pie_loader::PieLoaderQuantScheme;
 using pie_loader::PieLoaderQuantSpecView;
 using pie_loader::PieLoaderRepackLayout;
 using pie_loader::PieLoaderRepackSpecView;
 using pie_loader::PieLoaderRowMap;
+using pie_loader::PieLoaderScaleForm;
 
 /// Which half of a multimodal checkpoint to load.
 ///
@@ -543,24 +545,32 @@ public:
     /// contract because "declare only what you want" is the whole mechanism a
     /// contract offers. `retain_outputs` existed because the loader authored
     /// first and narrowed afterwards.
-    void define(std::string name, Node expr, PieLoaderEncodingSpec encoding,
-                std::optional<std::vector<std::int64_t>> shape) {
+    ///
+    /// Returns the handle only when the tensor was really published: an Encode
+    /// component drops everything that is not a tower output, and there is then
+    /// nothing to attach further declarations to.
+    std::optional<pie_loader::ModelContract::Defined> define(
+        std::string name, Node expr, PieLoaderEncodingSpec encoding,
+        std::optional<std::vector<std::int64_t>> shape) {
         if (component_ == Component::Encode && !is_tower_output(name)) {
-            return;
+            return std::nullopt;
         }
         auto defined = contract_.define(std::move(name), expr, encoding);
         if (shape.has_value()) {
             defined.expect(std::move(*shape));
         }
+        return defined;
     }
 
-    void push_direct(const SourceTensor& raw, std::string output, ShardAxis axis) {
+    std::optional<pie_loader::ModelContract::Defined> push_direct(const SourceTensor& raw,
+                                                                  std::string output,
+                                                                  ShardAxis axis) {
         std::vector<std::int64_t> raw_shape = shape_of(raw);
         axis = splittable_axis(raw.name, raw_shape, axis);
         check_head_granularity(raw.name, raw_shape, axis);
         auto [expr, shape] =
             shard(contract_.src(std::string(raw.name)), std::move(raw_shape), axis);
-        define(std::move(output), expr, raw.encoding, std::move(shape));
+        return define(std::move(output), expr, raw.encoding, std::move(shape));
     }
 
     /// True for a tensor that only scales another one.
@@ -666,11 +676,12 @@ public:
         consumed_.insert(raw.id);
     }
 
-    void push_repack(std::string output, const SourceTensor& raw, PieLoaderEncodingSpec encoding,
-                     std::vector<std::int64_t> shape, PieLoaderRepackSpecView spec) {
+    std::optional<pie_loader::ModelContract::Defined> push_repack(
+        std::string output, const SourceTensor& raw, PieLoaderEncodingSpec encoding,
+        std::vector<std::int64_t> shape, PieLoaderRepackSpecView spec) {
         const Node node =
             contract_.repack(contract_.src(std::string(raw.name)), spec, shape, encoding);
-        define(std::move(output), node, encoding, std::move(shape));
+        return define(std::move(output), node, encoding, std::move(shape));
     }
 
     // -- shared passes -------------------------------------------------------
@@ -887,9 +898,84 @@ public:
             if (scheme.has_value() && runtime_quantizable_name(raw.name, *scheme)) {
                 push_runtime_quant(raw, std::string(raw.name), *scheme);
             } else {
-                push_direct(raw, output_name(raw.name), shard_axis(raw.name));
+                auto defined = push_direct(raw, output_name(raw.name), shard_axis(raw.name));
+                state_shipped_block_scales(raw, defined);
             }
         }
+    }
+
+    /// State the pairing for a scale the checkpoint shipped beside an FP8
+    /// weight.
+    ///
+    /// The loader used to do this itself, after the fact, over the finished
+    /// tensor table: for every plain `F8E4M3` tensor whose name ended `.weight`
+    /// it looked for `{name}_scale_inv` and then `{base}.scale`, and labelled
+    /// whatever it found `PerGroup` with `group_size` hardcoded to 128.
+    ///
+    /// Which suffix a checkpoint uses is this driver's knowledge, not the
+    /// loader's -- it is the same knowledge `is_companion_scale` and
+    /// `hf_shard_axis` already keep here -- so the guess is made where it can be
+    /// checked. Like `dsv4_block_scales_to_fp32`, a companion that is not really
+    /// FP8 is left alone rather than reinterpreted, and the block size is read
+    /// off the two shapes instead of assumed.
+    void state_shipped_block_scales(const SourceTensor& raw,
+                                    std::optional<pie_loader::ModelContract::Defined>& scales) {
+        if (!scales.has_value()) {
+            return;
+        }
+        const std::string weight = companion_weight_name(raw.name);
+        if (weight.empty()) {
+            return;
+        }
+        const SourceTensor* companion = find(weight);
+        if (companion == nullptr || !is_raw(companion->encoding, PieLoaderDType::F8E4M3)) {
+            return;
+        }
+        // A weight an earlier pass claimed — a fused QKV join, say — is not
+        // published under this name, and naming it would be a contract the
+        // loader rejects outright. The suffix matching reached the same outcome
+        // by finding nothing, quietly.
+        if (consumed_.count(companion->id) != 0 || !source_name_allowed(companion->name)) {
+            return;
+        }
+        // A weight the loader re-quantizes gets the scales the loader itself
+        // writes, and states that pairing when it creates them. The shipped
+        // scale is then stale input, not this weight's scales; claiming it too
+        // would attach quant metadata to one weight twice.
+        const std::optional<PieLoaderQuantScheme> scheme = runtime_quant_scheme();
+        if (scheme.has_value() && runtime_quantizable_name(companion->name, *scheme)) {
+            return;
+        }
+        const std::vector<std::int64_t> weight_shape = shape_of(*companion);
+        const std::vector<std::int64_t> scale_shape = shape_of(raw);
+        if (weight_shape.empty() || scale_shape.empty() || scale_shape.back() <= 0) {
+            return;
+        }
+        const std::int64_t block = weight_shape.back() / scale_shape.back();
+        if (block <= 0) {
+            return;
+        }
+        scales->scaling(output_name(weight), PieLoaderQuantGranularity::PerGroup,
+                        static_cast<std::uint32_t>(block), 0, PieLoaderScaleForm::F32Factors);
+    }
+
+    /// The weight a companion scale belongs to, or empty if `name` is not one.
+    ///
+    /// `.weight_scale_inv` and `.weight_scale` hang off the weight's own name,
+    /// so only the scale part comes off; a bare `.scale` shares a base with the
+    /// weight, so `.weight` goes back on. All three end at `<base>.weight`.
+    static std::string companion_weight_name(std::string_view name) {
+        for (std::string_view part : {"_scale_inv", "_scale"}) {
+            if (ends_with(name, part) && ends_with(name.substr(0, name.size() - part.size()),
+                                                   ".weight")) {
+                return std::string(name.substr(0, name.size() - part.size()));
+            }
+        }
+        if (ends_with(name, ".scale")) {
+            return std::string(name.substr(0, name.size() - std::string_view(".scale").size())) +
+                   ".weight";
+        }
+        return {};
     }
 
     /// Check what only the whole contract can answer, after the family is done.
@@ -1033,6 +1119,117 @@ private:
     bool allow_mxfp4_rq_ = false;
     bool encode_scope_allowed_ = false;
 };
+
+/// Stack per-expert MoE weights into the fused 3-D tensors a fused-MoE
+/// forward consumes. This is the plain HF MoE source layout, not anything
+/// qwen-specific: GLM-5.2 ships it too. Per expert `e`,
+/// `mlp.experts.{e}.gate_proj.weight` / `.up_proj.weight` as `[I, H]` and
+/// `.down_proj.weight` as `[H, I]`. Output:
+///   `mlp.experts.gate_up_proj` -> `[E, 2I, H]`; `gate_second` selects which
+///   half leads, matching what the bound driver's activation reads.
+///   `mlp.experts.down_proj`    -> `[E, H, I]`
+/// Built as an expression over the sources, so no GPU-side duplicate exists.
+/// A no-op when the checkpoint already ships the fused tensors.
+///
+/// `float_only` skips layers whose experts are quantised. A quantised expert
+/// carries companion scale tensors that this stack does not join, so folding
+/// the weights alone would orphan them; families that can ship either layout
+/// set it and fall back to their per-expert path for quantised checkpoints.
+inline void hf_moe_expert_stacks(
+    ContractBuilder& b, bool gate_second, bool float_only = false) {
+    if (b.target().tp_size != 1) {
+        // TP>1 per-expert sharding is not wired; the bind then fails loudly
+        // on the missing fused tensor rather than loading silently wrong.
+        return;
+    }
+    const std::int64_t num_experts = b.facts().num_experts;
+    if (num_experts <= 0) {
+        return;
+    }
+    for (std::uint32_t layer = 0; layer < b.facts().num_hidden_layers; ++layer) {
+        // `bound` is the name the bind path uses; `prefix` is where the source
+        // tensors actually live, which is the same thing unless the family
+        // declared a `source_prefix`.
+        const std::string bound =
+            "model.layers." + std::to_string(layer) + ".mlp.experts.";
+        const std::string prefix = b.source_name(bound);
+        if (b.find(prefix + "gate_up_proj") != nullptr) {
+            continue;  // already pre-fused; the direct and TP-slice paths take it.
+        }
+        const SourceTensor* gate0 = b.find(prefix + "0.gate_proj.weight");
+        if (gate0 == nullptr) {
+            continue;  // not a per-expert checkpoint at this layer.
+        }
+        if (gate0->shape.size() != 2) {
+            fail("qwen moe expert stack: '" + std::string(gate0->name) + "' expected 2-D");
+        }
+        const std::int64_t inter = gate0->shape[0];
+        const std::int64_t hidden = gate0->shape[1];
+        const PieLoaderDType dtype = logical_dtype(gate0->encoding);
+        if (float_only && dtype != PieLoaderDType::BF16 &&
+            dtype != PieLoaderDType::F16) {
+            continue;  // quantised experts keep the per-expert layout.
+        }
+        if (!is_dense_addressable(gate0->encoding)) {
+            fail("qwen moe expert stack: '" + std::string(gate0->name) +
+                 "' has a non-affine packed encoding");
+        }
+
+        std::vector<Node> gate_up_parts;
+        std::vector<Node> down_parts;
+        std::vector<std::uint32_t> consumed;
+        gate_up_parts.reserve(static_cast<std::size_t>(num_experts));
+        down_parts.reserve(static_cast<std::size_t>(num_experts));
+        for (std::int64_t e = 0; e < num_experts; ++e) {
+            const std::string tag = prefix + std::to_string(e) + ".";
+            const SourceTensor* g = b.find(tag + "gate_proj.weight");
+            const SourceTensor* u = b.find(tag + "up_proj.weight");
+            const SourceTensor* d = b.find(tag + "down_proj.weight");
+            if (g == nullptr || u == nullptr || d == nullptr) {
+                fail("qwen moe expert stack: layer " + std::to_string(layer) + " expert " +
+                     std::to_string(e) + " missing gate/up/down");
+            }
+            const bool shapes_ok = g->shape.size() == 2 && u->shape.size() == 2 &&
+                                   d->shape.size() == 2 && g->shape[0] == inter &&
+                                   g->shape[1] == hidden && u->shape[0] == inter &&
+                                   u->shape[1] == hidden && d->shape[0] == hidden &&
+                                   d->shape[1] == inter;
+            if (!shapes_ok) {
+                fail("qwen moe expert stack: layer " + std::to_string(layer) + " expert " +
+                     std::to_string(e) + " shape mismatch");
+            }
+            if (logical_dtype(g->encoding) != dtype || logical_dtype(u->encoding) != dtype ||
+                logical_dtype(d->encoding) != dtype) {
+                fail("qwen moe expert stack: layer " + std::to_string(layer) + " expert " +
+                     std::to_string(e) + " dtype mismatch");
+            }
+            // One expert slab is gate over up; the leading 1 makes the
+            // per-expert concatenation a stack.
+            const Node gate_src = b.contract().src(std::string(g->name));
+            const Node up_src = b.contract().src(std::string(u->name));
+            gate_up_parts.push_back(b.contract().reshape(
+                b.contract().cat(gate_second
+                                     ? std::vector<Node>{up_src, gate_src}
+                                     : std::vector<Node>{gate_src, up_src},
+                                 0),
+                {1, 2 * inter, hidden}));
+            down_parts.push_back(b.contract().reshape(
+                b.contract().src(std::string(d->name)), {1, hidden, inter}));
+            consumed.push_back(g->id);
+            consumed.push_back(u->id);
+            consumed.push_back(d->id);
+        }
+
+        b.define(bound + "gate_up_proj", b.contract().cat(gate_up_parts, 0),
+               pie_loader::raw(dtype),
+               std::vector<std::int64_t>{num_experts, 2 * inter, hidden});
+        b.define(bound + "down_proj", b.contract().cat(down_parts, 0), pie_loader::raw(dtype),
+               std::vector<std::int64_t>{num_experts, hidden, inter});
+        for (std::uint32_t id : consumed) {
+            b.consume(id);
+        }
+    }
+}
 
 }  // namespace contract_detail
 

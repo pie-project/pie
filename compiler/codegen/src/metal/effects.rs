@@ -18,15 +18,26 @@ use crate::layout;
 use pie_ir::op::ChannelUse;
 use pie_ir::validate::{BoundTrace, Direction};
 
-use super::M1ChannelEffect;
 use super::preamble::{common_effect_preamble, emit_word_arguments, grouped_preamble};
+use super::{M1ChannelEffect, METAL_M1_MAX_CHANNELS};
 
 /// The lane-table ABI revision the emitted readiness kernel refuses to run
 /// against anything else (`PTIR_LANE_TABLE_ABI_VERSION`).
 const LANE_TABLE_ABI_VERSION: u32 = pie_plan::LANE_TABLE_ABI_VERSION;
 
 /// `emit_readiness_msl` — one lane, channel effects baked in.
-pub fn emit_readiness(function_name: &str, channels: &[M1ChannelEffect]) -> String {
+///
+/// Rejects a channel count past [`METAL_M1_MAX_CHANNELS`] rather than emitting
+/// it. The constant states where buffer 30 falls; before anything compiled the
+/// emitter's output it stated only that, and a program one channel wider
+/// produced a `[[buffer(31)]]` Metal rejects — a raw shader diagnostic at PSO
+/// build time, from a count a guest container chooses.
+pub fn emit_readiness(function_name: &str, channels: &[M1ChannelEffect]) -> Result<String, String> {
+    if channels.len() > METAL_M1_MAX_CHANNELS {
+        return Err(format!(
+            "readiness kernel exceeds the {METAL_M1_MAX_CHANNELS}-channel direct-binding limit"
+        ));
+    }
     let mut source = String::new();
     source.push_str(common_effect_preamble());
     let _ = write!(
@@ -108,11 +119,16 @@ pub fn emit_readiness(function_name: &str, channels: &[M1ChannelEffect]) -> Stri
         source.push_str("  }\n");
     }
     source.push_str("  status->state = 1;\n}\n");
-    source
+    Ok(source)
 }
 
 /// `emit_commit_msl` — one lane; advance head for takes, tail for puts.
-pub fn emit_commit(function_name: &str, channels: &[M1ChannelEffect]) -> String {
+pub fn emit_commit(function_name: &str, channels: &[M1ChannelEffect]) -> Result<String, String> {
+    if channels.len() > METAL_M1_MAX_CHANNELS {
+        return Err(format!(
+            "commit kernel exceeds the {METAL_M1_MAX_CHANNELS}-channel direct-binding limit"
+        ));
+    }
     let mut source = String::new();
     source.push_str(common_effect_preamble());
     let _ = write!(
@@ -144,7 +160,7 @@ pub fn emit_commit(function_name: &str, channels: &[M1ChannelEffect]) -> String 
         source.push_str("  }\n");
     }
     source.push_str("  status->state = 4;\n}\n");
-    source
+    Ok(source)
 }
 
 /// `emit_grouped_readiness_msl` — one thread per lane, effects read from

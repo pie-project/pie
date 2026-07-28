@@ -193,6 +193,12 @@ struct SetupConfig {
     // Which storage schema to author against. It selects a contract on this
     // side of the loader call and never crosses it (§10.4).
     std::string model_type;
+    // `config.json`'s RoPE hyperparameters, read out of the nested
+    // `rope_parameters` object this family uses (context.cpp). The defaults
+    // below are Qwen3.5's, so a checkpoint that omits them still lands on the
+    // values the reference implementation applies.
+    float rope_theta = 1.0e7f;
+    float partial_rotary_factor = 0.25f;
     std::uint32_t storage_page_size = 1;
 };
 

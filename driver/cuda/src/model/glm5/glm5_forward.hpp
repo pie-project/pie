@@ -59,6 +59,19 @@ struct Glm5Workspace {
     DeviceTensor shared_up;         // [N, shared_I]
     DeviceTensor shared_act;        // [N, shared_I]
     DeviceTensor shared_out;        // [N, H]
+    // Device-side aligned MoE scratch (vLLM/SGL-style expert bucketing). Used
+    // when the checkpoint ships stacked BF16 experts; keeps routing on device
+    // so the whole forward stays graph-capturable.
+    DeviceTensor aligned_route_ids;   // [aligned_rows] int32
+    DeviceTensor aligned_expert_ids;  // [max_blocks]   int32
+    DeviceTensor aligned_expert_in;   // [aligned_rows, H]
+    DeviceTensor aligned_gate_up;     // [aligned_rows, 2*routed_I]
+    DeviceTensor aligned_act;         // [aligned_rows, routed_I]
+    DeviceTensor aligned_out;         // [aligned_rows, H]
+    DeviceTensor a_gu_ptrs, b_gu_ptrs, c_gu_ptrs;
+    DeviceTensor a_dn_ptrs, b_dn_ptrs, c_dn_ptrs;
+    int aligned_block_size = 0;
+    int aligned_max_blocks = 0;
     DeviceTensor logits;            // [O, vocab]
 
     static Glm5Workspace allocate(

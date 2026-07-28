@@ -26,6 +26,21 @@ fn value_ptr(value: u32) -> String {
     format!("scratch + offsets[{value}]")
 }
 
+/// The widest threadgroup a grouped region's kernel can serve. The emitted
+/// kernel sizes its threadgroup reduction buffer to this and rejects a launch
+/// wider than it; `m1_runtime.cpp` picks the actual width from the pipeline's
+/// own `maxTotalThreadsPerThreadgroup`, which is why the kernel checks a bound
+/// rather than equality.
+///
+/// It must not be lowered below what a driver may ask for: the check faults
+/// with `0xB3` instead of reading past `m3_tgbuf`, so a value under the
+/// pipeline limit turns every grouped dispatch on that device into a fault.
+pub const METAL_M3_REGION_THREADS: u32 = 1024;
+
+/// Device+threadgroup barrier between two ops of a region.
+const BARRIER: &str =
+    "  threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);\n";
+
 /// `emit_fused_region_msl` — single lane, channels bound directly.
 pub fn emit_fused_region(
     function_name: &str,
@@ -134,7 +149,19 @@ pub fn emit_grouped_fused_region(
     source.push_str("    const device uint* lane_indices [[buffer(8)]],\n");
     source.push_str("    const device M3RowMeta* all_row_meta [[buffer(9)]],\n");
     source.push_str("    const device uint* row_indices [[buffer(10)]],\n");
-    source.push_str("    uint dispatch_lane [[thread_position_in_grid]]) {\n");
+    source.push_str("    uint dispatch_lane [[threadgroup_position_in_grid]],\n");
+    source.push_str("    uint m3_tid [[thread_position_in_threadgroup]],\n");
+    source.push_str("    uint m3_threads [[threads_per_threadgroup]]) {\n");
+    // A lane owns a threadgroup rather than a thread. Everything the region does
+    // still happens once per lane -- ops that cannot be partitioned run on thread
+    // 0 -- but the ones that walk the whole vocabulary split across it. The
+    // driver picks the actual width from the pipeline's own limit and passes it
+    // in `m3_threads`; this array only has to be big enough for the largest it
+    // will ever ask for.
+    let _ = writeln!(
+        source,
+        "  threadgroup M1ArgmaxCandidate m3_tgbuf[{METAL_M3_REGION_THREADS}];"
+    );
     source.push_str("  if (dispatch_lane >= layout->lane_count) return;\n");
     source.push_str("  const uint lane_index = lane_indices[dispatch_lane];\n");
     source.push_str(
@@ -157,6 +184,14 @@ pub fn emit_grouped_fused_region(
          reinterpret_cast<device M1Status*>(lane.commit_slot);\n",
     );
     source.push_str("  if (status->state != 1) return;\n");
+    // The threadgroup buffer above is sized for this width and the driver asks
+    // for no more than it, so a wider launch would read past the buffer. Say so
+    // rather than doing it.
+    let _ = writeln!(
+        source,
+        "  if (m3_threads > {METAL_M3_REGION_THREADS}u) {{ \
+         if (m3_tid == 0) m1_fault(status, 0xB3u); return; }}"
+    );
     source.push_str(
         "  const device M1ValueDesc* descriptors = all_descriptors + \
          dispatch_lane * layout->value_count;\n",
@@ -207,6 +242,7 @@ pub fn emit_grouped_fused_region(
         let mut slots = Slots::of(op, base, value_ptr);
         if op.tag == tags::INTRINSIC_VAL && op.intr == intrinsic_tags::MTP_DRAFTS {
             emit_mtp_drafts(&mut source, base, &slots.o0);
+            source.push_str(BARRIER);
             continue;
         }
         if op.tag == tags::INTRINSIC_VAL
@@ -218,6 +254,7 @@ pub fn emit_grouped_fused_region(
                 op.intr == intrinsic_tags::MTP_LOGITS,
                 &slots.o0,
             );
+            source.push_str(BARRIER);
             continue;
         }
         if op.tag == tags::CHAN_TAKE || op.tag == tags::CHAN_READ {
@@ -225,17 +262,32 @@ pub fn emit_grouped_fused_region(
         } else if op.tag == tags::CHAN_PUT {
             slots.o0 = format!("pending_{}", op.chan);
         } else if op.tag == tags::INTRINSIC_VAL {
-            slots.a0 = "logits".to_string();
+            // `logits` is a `const device bfloat*` here because the gather and
+            // the draft argmax above index it as one; `ptir_m1_execute` takes a
+            // `const device uchar*`, and MSL will not convert between them. The
+            // singleton emitter has no cast because there `logits` arrives as a
+            // kernel parameter already typed `uchar*`.
+            slots.a0 = "reinterpret_cast<const device uchar*>(logits)".to_string();
         }
         let _ = writeln!(
             source,
-            "  ptir_m1_execute({}u, status, descriptors, lane_params + {node}, {}, {}, {}, {}, {}, temporary);",
+            "  ptir_m1_execute_mt({}u, status, descriptors, lane_params + {node}, {}, {}, {}, {}, {}, temporary, m3_tid, m3_threads, m3_tgbuf);",
             op.tag, slots.a0, slots.a1, slots.a2, slots.o0, slots.o1
         );
+        // The next op reads what this one wrote, and `status` is how a fault
+        // reaches the other threads, so both need to be visible before either
+        // is read. The status test is uniform across the threadgroup, so the
+        // return below never strands a thread at a later barrier.
+        source.push_str(BARRIER);
         source.push_str("  if (status->state != 1) return;\n");
         if op.tag == tags::CHAN_PUT {
             let _ = writeln!(source, "  current_{} = pending_{};", op.chan, op.chan);
-            let _ = writeln!(source, "  pending_flags[pending_index_{}] = 1;", op.chan);
+            let _ = writeln!(
+                source,
+                "  if (m3_tid == 0) pending_flags[pending_index_{}] = 1;",
+                op.chan
+            );
+            source.push_str(BARRIER);
         }
     }
     source.push_str("}\n");
@@ -245,6 +297,11 @@ pub fn emit_grouped_fused_region(
 /// The `mtp_drafts` intrinsic: a per-draft argmax over the lane's logits.
 fn emit_mtp_drafts(source: &mut String, base: u32, o0: &str) {
     source.push_str("  {\n");
+    // Per-draft argmax over the vocabulary. Drafts are few, so partition by
+    // draft rather than by column; a lane with one draft keeps one thread busy,
+    // which is what the serial emitter did anyway.
+    source.push_str("    const uint draft_begin = m3_tid;\n");
+    source.push_str("    const uint draft_step = m3_threads;\n");
     let _ = writeln!(
         source,
         "    const M1ValueDesc draft_desc = descriptors[{base}];"
@@ -258,7 +315,10 @@ fn emit_mtp_drafts(source: &mut String, base: u32, o0: &str) {
         source,
         "    device int* draft_out = reinterpret_cast<device int*>({o0});"
     );
-    source.push_str("    for (uint draft = 0; draft < draft_desc.len; ++draft) {\n");
+    source.push_str(
+        "    for (uint draft = draft_begin; draft < draft_desc.len; \
+         draft += draft_step) {\n",
+    );
     source.push_str(
         "      const uint source_row = \
          row_indices[row_meta.offset + row_meta.mtp_offset + draft];\n",
@@ -285,6 +345,10 @@ fn emit_mtp_drafts(source: &mut String, base: u32, o0: &str) {
 /// logits buffer, rebased for MTP rows.
 fn emit_logits_gather(source: &mut String, base: u32, mtp: bool, o0: &str) {
     source.push_str("  {\n");
+    // This walks the whole vocabulary. In the grouped region every thread of
+    // the lane's threadgroup reaches it, so it must be split, not repeated.
+    source.push_str("    const uint gather_begin = m3_tid;\n");
+    source.push_str("    const uint gather_step = m3_threads;\n");
     let _ = writeln!(
         source,
         "    const M1ValueDesc intrinsic_desc = descriptors[{base}];"
@@ -304,17 +368,27 @@ fn emit_logits_gather(source: &mut String, base: u32, mtp: bool, o0: &str) {
         source,
         "    device float* intrinsic_out = reinterpret_cast<device float*>({o0});"
     );
-    source.push_str("    for (uint element = 0; element < intrinsic_desc.len; ++element) {\n");
-    source.push_str("      const uint logical_row = element / layout->vocab;\n");
-    source.push_str("      const uint column = element % layout->vocab;\n");
+    // Row-major, not a flat walk with a divide. `layout` is device memory and
+    // `intrinsic_out` is a device store the compiler cannot prove disjoint from
+    // it, so a flat loop reloaded `layout->vocab` three times per element and
+    // paid a runtime div and mod on top -- a vocabulary-sized row cost ~85ms of
+    // an ~89ms decode step. Hoisting the extent turns it into a coalesced copy.
+    source.push_str("    const uint gather_vocab = layout->vocab;\n");
+    source.push_str("    const uint gather_rows = intrinsic_desc.len / gather_vocab;\n");
+    source.push_str("    const uint gather_row_base = row_meta.offset + intrinsic_row_base;\n");
+    source.push_str("    for (uint gr = 0u; gr < gather_rows; ++gr) {\n");
+    source.push_str("      const uint source_row = row_indices[gather_row_base + gr];\n");
     source.push_str(
-        "      const uint source_row = \
-         row_indices[row_meta.offset + intrinsic_row_base + logical_row];\n",
+        "      const device bfloat* gather_src = logits + \
+         ulong(source_row) * gather_vocab;\n",
     );
+    source.push_str("      device float* gather_dst = intrinsic_out + ulong(gr) * gather_vocab;\n");
     source.push_str(
-        "      intrinsic_out[element] = \
-         float(logits[ulong(source_row) * layout->vocab + column]);\n",
+        "      for (uint column = gather_begin; column < gather_vocab; \
+         column += gather_step) {\n",
     );
+    source.push_str("        gather_dst[column] = float(gather_src[column]);\n");
+    source.push_str("      }\n");
     source.push_str("    }\n");
     source.push_str("  }\n");
 }

@@ -2513,3 +2513,378 @@ pie is ahead of vLLM at concurrency 1–64 and within 3–5% at 128/256 (from
 (27110) where the sweep above caught its bad mode (21767): k = 1 is
 bimodal at that point and k = 2 is not — the run-to-run spread is the
 reason to take the default, independent of the mean.
+
+## §20.9 The settlement callback sat on the compute stream (2026-07-28)
+
+### Question
+
+With `PIE_FRAME_SIZE=2` the decode pipeline should be perfectly covered:
+frame *N+1* is submitted while frame *N* runs, the sampled token carries over
+**on device** through the channel, and no host round trip separates the two
+forward passes. Yet uncontended conc 256 still trailed vLLM by 3–7%, and
+raising *k* to 3 or 4 changed nothing. Why?
+
+Steady-state cycle, two-point `(wall@256tok − wall@128tok)/128`, 12288 pages,
+conc 256:
+
+| engine | cycle |
+| ------ | ----- |
+| pie k=1 | 13.835 ms |
+| pie k=2 | 13.407 ms |
+| vLLM    | 12.946 ms |
+
+k=2 is 1.036× vLLM, i.e. **+461 µs per wave** to account for.
+
+### First diagnosis — wrong
+
+`PIE_FIRE_TIMING=1` puts p50 host work at 1525 µs/wave, of which FrameSettle
+is 859 µs and `finish_epilogue` 709 µs (execute 286 / group 279 / assemble
+71). Tempting, but wrong: NVTX shows that work starting *mid* graph replay and
+the submitting thread idle ~70% of the wall. It is not GPU-visible. Rejecting
+it is what forced the real answer out.
+
+### Evidence chain
+
+Against a conc-256 k=2 nsys capture (`--cuda-graph-trace`, KERNEL ∪ MEMCPY ∪
+MEMSET ∪ GRAPH_TRACE merged — omitting any of those tables manufactures fake
+idle):
+
+1. The wave is 8205 µs: 7476 µs graph replay (91.1%) + 382 µs non-graph
+   device + **347 µs idle**. The single largest idle window sits between
+   `k_settle_host_channels_batch` and the next wave's
+   `k_pull_validate_host_channels_batch`, p50 224 µs.
+2. Not starvation. In 284 of 290 steady gaps the next wave's
+   `k_pull_validate` had *already been submitted*, p50 8673 µs **before** the
+   GPU went idle.
+3. Genuinely idle, not misattributed: p50 busy inside the window is 8.9 µs of
+   224.2 µs.
+4. Not a cross-stream wait. `STREAM_WAIT_EVENT` totals 1.1 µs over the whole
+   window set, and the last op on any non-main stream ends p50 2360 µs before
+   the window closes.
+5. **Zero host CUDA API calls occur during the window.** Whatever holds the
+   stream makes no CUDA calls — a driver-internal thread.
+6. Scaling control at conc 32 vs 256: 124.8 µs vs 224.2 µs, i.e.
+   **gap = 111 µs + 0.44 µs × lanes**.
+
+### Root cause
+
+`dispatch.cu` enqueued the settlement notification on the **compute stream**:
+
+```
+:4942  cudaStream_t callback_stream = stream;
+:5088  cudaStream_t settlement_stream = callback_stream;   // batch_copies == false here
+:5161  cudaLaunchHostFunc(settlement_stream, notify_runtime_callback, notify);
+```
+
+A host-function node holds its stream until the CUDA driver's callback thread
+wakes on the CPU and returns. Everything queued behind it — including the
+already-submitted next wave — cannot start. The 111 µs constant is the
+callback-thread wakeup; the 0.44 µs/lane term is `notify_runtime_callback`
+releasing each instance's `callback_fence`.
+
+This is precisely why *k* never helped: **k pre-queues wave N+1 behind the
+blocking node**, and a blocking node cannot be jumped by pre-queueing. k=2,
+3 and 4 all measured the same because they were all waiting on the same CPU
+thread.
+
+### Fix
+
+Move the host function to a dedicated `notify_stream`:
+
+* record `settlement_ready` on the settlement stream after
+  `launch_settle_host_channels_batch`, have `notify_stream` wait on it, and
+  launch `cudaLaunchHostFunc` there;
+* record both `notify->callback_done` and a new
+  `settlement_callbacks_done` on `notify_stream`.
+
+One hazard has to be handled. `commit_snapshot()` pools pinned host buffers
+per **(BoundInstance, occurrence-within-wave)** and reuses them every wave, so
+wave *N+1*'s D2H publications write the very buffers wave *N*'s callback
+reads. The on-compute-stream host func was providing that barrier by accident.
+It is restored explicitly with a `cudaStreamWaitEvent` on
+`settlement_callbacks_done` placed immediately **before** this wave's
+`enqueue_host_publish_copies` — a full forward pass downstream of the record,
+so it never blocks in the covered case, and no cycle is possible because the
+awaited record is always from a strictly earlier wave (`Dispatch::finish` is
+serialized by `settlement_mutex`). `NotifyContextLease` now drains
+`notify_stream` on the exception path as well.
+
+### Result (conc 256 unless noted, 4–8 trials each)
+
+| case | before | after | Δ |
+| ---- | ------ | ----- | - |
+| conc 64, k=1 | 15634 | 16243 | +3.9% |
+| conc 64, k=2 | 15758 | 16145 | +2.5% |
+| conc 256, k=2 | 27866 | **28497** | +2.3% |
+| conc 256, k=1 fast mode | 26981 | **28656** | +6.2% |
+| steady cycle vs vLLM | 1.0356× | **1.0154×** | gap halved |
+
+k=2 at conc 256 is now 8/8 trials inside 1% (28371–28656) against a vLLM
+reference of 29621–29688, i.e. 0.962× on throughput where it was 0.937×.
+Contention suite: 16/16.
+
+## §20.10 Why k=1 at conc 256 is multimodal (2026-07-28)
+
+k=1 lands anywhere in 18.8-29.0 k tok/s across process launches while k=2 does
+not. Ruled out first, all measured, none of them the cause:
+
+* **GPU clocks** — SM clock pinned at 2520 MHz in every mode, no throttle
+  reason asserted, temp <= 44 C.
+* **NUMA** — the GPU is local to node 1, but `taskset` onto node 1 *or* node 0
+  is equally multimodal.
+* **Host CPU frequency** — schedutil governor, but max / 8th / median core MHz
+  are identical (3250 / 2846 / 1500) in fast and slow runs.
+* **External contention** — GPU empty (1 MiB), load ~11 on 128 cores.
+* **Engine decisions** — memory planner output, 51 captured decode graphs,
+  batch count, batch-size histogram, `max forward requests: 256`, prompt and
+  output token counts are all identical across modes.
+
+### It is duty, and duty is quantised
+
+Duty = mean forward batches in flight = `avg batch latency / (wall / batches)`.
+Measured (conc 256, 12288-page-equivalent budget, 8 trials per arm):
+
+| arm | duty | tok/s |
+| --- | ---- | ----- |
+| k=2 (default), 8/8 | 1.56-1.60 | 28371-28656 |
+| k=1, fast | 1.54-1.58 | 26.8-29.0 k |
+| k=1, mid | 1.09-1.11 | 21.4-22.2 k |
+| k=1, slow | 0.82-0.85 | 18.7-18.8 k |
+| k=1 with `PIE_SCHED_MAX_IN_FLIGHT=1` | 0.84-0.85 | 19.8-20.2 k |
+
+Two things follow immediately.
+
+**k does not create the overlap.** A healthy k=1 run reaches duty 1.58 — the
+same as k=2. Frame overlap is structural and k-independent: `FramePolicy`
+seals the next frame the moment the wait-all gate holds, normally while the
+current frame is still executing, and posts its waves behind the executing
+frame's tail at the run-ahead depth. There is no launch-time barrier; the
+driver's device-side `pass_commit` tickets order dependent fires by stream
+order and a frame-boundary dependency is structurally identical to an
+intra-frame one. What k changes is how *often* the wait-all seal boundary
+occurs (once per k waves) and therefore how much GPU time is available to
+cover one host turn.
+
+**The slow mode is the run-ahead collapsing, not extra work.** Forcing
+`PIE_SCHED_MAX_IN_FLIGHT=1` reproduces the slowest mode exactly and, unlike
+the default, *stably* (sigma = 220 tok/s). Depth 3 does not help: the cap is
+not the limiter, arrival into the seal window is.
+
+### The mode is per COHORT, not per run
+
+512 requests at concurrency 256 is two cohorts of 256. Splitting each run in
+half (`cohort1 = 2*lat_mean - wall`):
+
+```
+k=1 fixed  28586 tok/s   cohort1 30.4k   cohort2 27.0k     fast, fast
+k=1 fixed  22225 tok/s   cohort1 29.5k   cohort2 17.8k     fast, slow
+k=1 fixed  22156 tok/s   cohort1 18.2k   cohort2 28.2k     slow, fast
+k=1 fixed  18779 tok/s   cohort1 18.2k   cohort2 19.4k     slow, slow
+k=2 fixed  (8 runs)      every cohort 28.0-29.0k
+```
+
+Each 256-process cohort independently settles into duty ~1.58 or ~0.83 when it
+forms, holds it for all 128 of its decode waves, and the run-level modes are
+just the two combinations: 28.5 k (fast+fast), ~22 k (mixed), 18.8 k
+(slow+slow). Matching duty levels 1.58 / 1.10 / 0.83 confirm the arithmetic.
+k=2 never collapses in any of its 16 observed cohorts.
+
+### Where the stall is
+
+nsys on a k=1 run, merged device-op gaps above 200 us by bracketing operation:
+
+```
+258  786 ms  avg 3046 us   k_settle_host_channels_batch -> MEMCPY
+149  461 ms  avg 3097 us   MEMCPY -> MEMCPY
+143   53 ms  avg  371 us   MEMCPY -> embed_bf16_kernel
+```
+
+258 is exactly the batch count: the stall is at the seal boundary, between one
+frame's settlement and the next frame's H2D upload. The idle *immediately*
+before a wave's `k_pull_validate` is p50 1.4 us, so nothing is waiting on
+batch construction once the frame has been sealed — the wait is for the seal.
+
+The seal is wait-for-ALL: it holds until every awaited lane's oldest queued
+frame is arrival-complete, so the binding term is the **slowest of 256** lanes'
+resubmit each frame. At k=1 that maximum is paid once per wave and has one
+wave of GPU time (~7.1 ms) to hide behind; at k=2 it is paid half as often and
+has two waves (~14.9 ms). The absolute cost of the turn scales with lane count,
+not with k — which is why k=2 is comfortably covered and k=1 sits on the edge.
+
+Two levers confirm the turn is the term that varies:
+
+* **Any added host cost pins k=1 slow.** `PIE_FIRE_TIMING=1` (65 664 per-fire
+  JSON records) parks it at 14.9-15.8 k, 4/4; nsys parks it at 17.0-21.7 k,
+  4/4. Neither perturbs k=2 comparably.
+* **Tokio worker count moves it.** conc 256, k=1, 4 trials each:
+  `--worker-threads 8` -> 27100/27084/26664/23177; `32` ->
+  18987/18677/19015/19079 (sigma = 179); 16 and the default 64 are multimodal.
+  (`default_worker_threads()` in `worker/src/config.rs` already caps at 64 for
+  exactly this class of variance on EPYC.)
+
+### Status
+
+**Open**: what decides a cohort's mode at formation is not yet identified. It
+is not any of the environmental or planner variables above, it is stable for
+the cohort's entire life, and it is independent between consecutive cohorts in
+one process.
+
+**Not on the default path.** k=2 has been the default since §20.8 precisely
+because it puts the seal boundary behind two waves of cover: on the fixed
+build conc 256 k=2 is 28371-28656 over 8 trials, a 1.0% spread, with no
+collapsed cohort observed. The §20.9 fix raises k=1's fast mode
+(26981 -> 28656, +6.2%) and leaves the collapsed mode where it was (baseline
+18.9-21.7 k, fixed 18.8-22.2 k) — a strict improvement that does not remove
+the bistability, because the residual stall is the seal turn rather than the
+callback node. If k=1 must be used at high concurrency, `--worker-threads 8`
+is the lever.
+
+## 20.11 The k = 1 collapse was a guest window-sizing bug, not a law
+
+§20.10 left one question open: what latches a cohort into the collapsed mode.
+The answer is that nothing latches it *in the engine* — the cohort simply never
+had enough queued work to absorb a straggler, and the shortfall was written
+into the **guest**, not the runtime.
+
+### The cover rule
+
+`tests/inferlets/text-completion-bench/src/lib.rs` kept a run-ahead window of
+`2 * live_slots` fires, i.e. exactly **two frames**, for every `k`. The engine's
+frame seal is wait-for-ALL: it holds until every awaited lane's oldest queued
+frame is arrival-complete, so the binding term is the slowest of `concurrency`
+lanes' resubmit. What buys that straggler its time is the work already queued
+*behind* the running frame:
+
+```
+cover_waves = window_fires - live_slots = (window_frames - 1) * k
+```
+
+A two-frame window therefore gives `k` waves of cover — **two** at k = 2, and
+**one** (~7.1 ms) at k = 1. The old rule sized the window in frames, but the
+quantity that has to cover a straggler is measured in waves. k = 1 was running
+with a third of the cover k = 2 got, from the same line of guest code.
+
+### Measurement (Qwen3-0.6B, L40S, conc 256, on the §20.9 build)
+
+| arm | cover | result | median |
+| --- | --- | --- | --- |
+| k=1, `2*k` (old) | 1 wave | multimodal 18.8k / 22k / 28.5k | 25184 |
+| k=1, 3 frames | 2 waves | 7/8 at 28.6-29.5k, 1/8 collapsed | 28687 |
+| k=1, 4 frames | 3 waves | **6/6 at 28663-29488** | **29044** |
+| k=2, `2*k` (old) | 2 waves | 8/8 at 28371-28656 | 28497 |
+| k=2, cover 3 | 3 waves | 6/6 at 28217-28795 | 28654 |
+
+Duty (mean forward batches in flight) confirms the mechanism directly: the
+k = 1 window-3 arm runs at **1.72-1.74**, up from 1.58 in the healthy old-rule
+runs and 0.83 in the collapsed ones. 15 of its 16 cohorts sit at 27.6-30.5k.
+
+Two conclusions:
+
+1. **The collapse is removable.** At three waves of cover k = 1 is unimodal
+   over 6/6 trials, and its median (29044) is *above* k = 2's (28497) — a
+   smaller frame with adequate cover beats a larger frame, because the seal
+   quantum is finer. Against vLLM's 29621-29688 that is a ratio of 0.979,
+   up from 0.961.
+2. **k >= 2 was already saturated.** Giving k = 2 a third wave of cover moves
+   nothing (28497 -> 28654, inside the noise), which is why the defect only
+   ever showed at k = 1 and why k = 2 has been a safe default.
+
+### Fix
+
+The window now takes the max of two independent floors:
+
+```rust
+let window_fires = live_slots + live_slots.max(3);
+```
+
+* `>= 1 whole extra frame` — frames settle atomically, so a window shorter
+  than two frames leaves zero queued frames while a k >= 2 frame runs.
+* `>= 3 waves of cover` — the straggler allowance, independent of `k`.
+
+At k = 1 this is 4 fires (was 2), at k = 2 it is 5 (was 4), and at k >= 3 the
+frame floor already dominates so the value is unchanged (k = 4: 8 either way).
+
+Verified: conc 64 k = 2 measures 16132-16200 (median 16153) against the §20.9
+baseline of 16145 — no regression on the default path — and the contention
+suite is 16/16.
+
+### What this does not change
+
+`PIE_FRAME_SIZE` stays at 2. k = 1 with a correctly sized window is marginally
+faster at conc 256, but k = 2 is within 2% there, is unimodal under the *old*
+guest rule as well, and costs less staging depth per lane; §20.8's reasons for
+the default are untouched. The finding's real content is that **run-ahead cover
+is a guest responsibility and must be sized in waves, not frames** — any
+inferlet that hard-codes a frame-count window inherits this bug at k = 1.
+
+### 20.11.1 Why the natural "two frames in flight" pattern is not enough
+
+The old rule is the obvious pipelining discipline: submit two frames, then top
+up one frame per frame that drains. It is correct in shape. What it gets wrong
+is the *runway* it leaves, which is easiest to see in steady state:
+
+* a lane holds `W = window_fires` submitted-but-undrained fires;
+* a whole guest frame settles atomically, so `k` fires drain at once and the
+  lane drops to `W - k` outstanding;
+* those `W - k` fires are the lane's runway — `(W - k) * T_wave` of already
+  queued work before the engine has nothing from this lane to seal with.
+
+`W = 2k` therefore leaves a runway of exactly `k` waves *whatever k is*, while
+the thing it has to hide — the host turnaround `H` from settlement to the
+guest's next `submit_frame` — does not shrink with `k` at all. At conc 256,
+`T_wave` is 8.76 ms, so k = 1 gets 8.8 ms of runway and k = 2 gets 17.5 ms.
+Measured `H_max` there is 17-26 ms: k = 2 clears it by a hair, k = 1 does not.
+That is the entire asymmetry.
+
+Note also that a lane running dry is not a lane-local slowdown. The seal is
+wait-for-ALL, so one dry lane stalls the whole cross-lane batch.
+
+### 20.11.2 Guest window vs engine depth — two different "frames"
+
+The word *frame* names two different objects and the distinction is what makes
+the accounting work:
+
+| | guest frame | engine frame (a "batch") |
+| --- | --- | --- |
+| what | `k` fires from ONE lane (`submit_frame`) | one guest frame from EVERY lane |
+| size | `k` waves | `k` waves x N lanes |
+| who caps it | the inferlet, via `window_fires` | the engine, via `configured_max_in_flight()` |
+
+`in_flight_launches` (`scheduler/worker.rs:2105`) is a single deque in the
+scheduler loop, so `configured_max_in_flight()` = 2 is a **global** cap of two
+cross-lane batches posted to the driver — not a per-lane depth. Confirmed by
+the batch arithmetic on 512 x 128 = 65536 output tokens at conc 256: k = 1
+reports 260 batches (252 tok/batch = 256 lanes x 1 wave), k = 2 reports 130
+(504 tok/batch = 256 lanes x 2 waves).
+
+The consequence is that widening the guest window does **not** deepen the
+device pipeline — the driver's depth is fixed by the engine and by
+`kSchedulerMaxInFlight`/`kUploadStagingDepth`. The extra fires simply wait in
+the engine's `pending` queue. That is precisely their job: what the seal gate
+needs is for every lane to *have a fire queued* when it evaluates, and a lane
+whose guest has not resubmitted yet has none.
+
+### 20.11.3 Cover sweep — why 3, and the cost of more
+
+Cover is a time budget (`cover * T_wave` must exceed `H_max`), so it was swept
+against both concurrency and cover. `T_wave` is the per-wave service period,
+`wall / batches / k`:
+
+| conc | `T_wave` | cover 1 | cover 2 | cover 3 | cover 6 |
+| --- | --- | --- | --- | --- | --- |
+| 64 | 3.97 ms | 16357 ok | - | 16276 ok | - |
+| 256 | 8.76 ms | 25184 **multimodal** | 28687 (7/8) | **29044 ok** | 28372 ok |
+| 512 | 16.9 ms | 23269 **collapsed** | 30280 ok | 30256 ok | - |
+
+Reading the failures as a time threshold: conc 64 clears at 3.97 ms of runway,
+conc 256 fails at 8.8 ms and clears at 26.3 ms, conc 512 fails at 16.9 ms and
+clears at 33.8 ms. So `H_max` grows with lane count but *sublinearly relative
+to* `T_wave`, which grows too — and the ratio peaks in the middle. **conc 256
+is the binding point**, needing 3 waves; 512 needs only 2 and 64 needs 1.
+
+More cover is not free, which is why the constant is 3 and not 8. At conc 256
+cover 6 is perfectly stable but measures 28372 against cover 3's 29044, a 2.3%
+loss: a larger window reserves more KV ahead per lane (`reserve_to_tokens`
+covers every submitted fire) and lengthens the queue the scheduler scans each
+seal. Cover 3 is simultaneously the maximum the sweep requires and the optimum
+at the point that requires it.

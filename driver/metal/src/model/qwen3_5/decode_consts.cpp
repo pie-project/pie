@@ -20,7 +20,7 @@ struct RmsParams {       // rms_norm.metal:22  (buffer 3)
     float eps;
     uint32_t axis_size;  // feature dim
     uint32_t w_stride;   // 1 (contiguous)
-    uint32_t plus_one;   // qwen3.5: 1 for ALL norms → gain (1+weight)
+    uint32_t plus_one;   // qwen3.5: 0 for ALL norms → gain is the raw weight
 };
 struct GatedRmsParams {  // gated_rms.metal:20  (buffer 4)
     float eps;
@@ -102,17 +102,22 @@ int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                 bind_const<int>(ctx, ord, (uint8_t)bind::Embed::Hidden, g.hidden, &count);
                 break;
 
-            // RMSNorm variants — plus_one=1 for ALL (qwen3.5/Gemma gain = 1+weight).
+            // RMSNorm variants — gain is the RAW weight. qwen3.5 is not Gemma:
+            // its norm weights are absolute (input_layernorm averages 1.24 and
+            // `model.norm` 4.31 on the 0.8B checkpoint), not the (w-1) offsets a
+            // (1+w) gain expects, and mlx_lm builds every one of these as a plain
+            // nn.RMSNorm. A (1+w) gain here is finite and quiet, so it survives as
+            // a ~80% per-norm error that the residual stream compounds.
             case Kernel::Rms:
             case Kernel::FfnRms:
             case Kernel::FinalRms:
                 bind_const<RmsParams>(ctx, ord, (uint8_t)bind::Rms::Params,
-                                      RmsParams{g.eps, (uint32_t)g.hidden, 1u, 1u}, &count);
+                                      RmsParams{g.eps, (uint32_t)g.hidden, 1u, 0u}, &count);
                 break;
             case Kernel::QNorm:
             case Kernel::KNorm:
                 bind_const<RmsParams>(ctx, ord, (uint8_t)bind::Rms::Params,
-                                      RmsParams{g.eps, (uint32_t)g.head_dim, 1u, 1u}, &count);
+                                      RmsParams{g.eps, (uint32_t)g.head_dim, 1u, 0u}, &count);
                 break;
 
             // GDN in_proj_a / in_proj_b — DENSE bf16 GEMV [16,1024].

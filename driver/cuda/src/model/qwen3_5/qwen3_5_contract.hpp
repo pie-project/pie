@@ -13,105 +13,6 @@
 namespace pie_cuda_driver::model {
 namespace contract_detail {
 
-/// Stack per-expert MoE weights into the fused 3-D tensors the qwen3_5_moe
-/// forward consumes. The HF Qwen3-MoE source layout is, per expert `e`,
-/// `mlp.experts.{e}.gate_proj.weight` / `.up_proj.weight` as `[I, H]` and
-/// `.down_proj.weight` as `[H, I]`. Output:
-///   `mlp.experts.gate_up_proj` -> `[E, 2I, H]`; `gate_second` selects which
-///   half leads, matching what the bound driver's activation reads.
-///   `mlp.experts.down_proj`    -> `[E, H, I]`
-/// Built as an expression over the sources, so no GPU-side duplicate exists.
-/// A no-op when the checkpoint already ships the fused tensors.
-inline void qwen_moe_expert_stacks(ContractBuilder& b, bool gate_second) {
-    if (b.target().tp_size != 1) {
-        // TP>1 per-expert sharding is not wired; the bind then fails loudly
-        // on the missing fused tensor rather than loading silently wrong.
-        return;
-    }
-    const std::int64_t num_experts = b.facts().num_experts;
-    if (num_experts <= 0) {
-        return;
-    }
-    for (std::uint32_t layer = 0; layer < b.facts().num_hidden_layers; ++layer) {
-        // `bound` is the name the bind path uses; `prefix` is where the source
-        // tensors actually live, which is the same thing unless the family
-        // declared a `source_prefix`.
-        const std::string bound =
-            "model.layers." + std::to_string(layer) + ".mlp.experts.";
-        const std::string prefix = b.source_name(bound);
-        if (b.find(prefix + "gate_up_proj") != nullptr) {
-            continue;  // already pre-fused; the direct and TP-slice paths take it.
-        }
-        const SourceTensor* gate0 = b.find(prefix + "0.gate_proj.weight");
-        if (gate0 == nullptr) {
-            continue;  // not a per-expert checkpoint at this layer.
-        }
-        if (gate0->shape.size() != 2) {
-            fail("qwen moe expert stack: '" + std::string(gate0->name) + "' expected 2-D");
-        }
-        const std::int64_t inter = gate0->shape[0];
-        const std::int64_t hidden = gate0->shape[1];
-        const PieLoaderDType dtype = logical_dtype(gate0->encoding);
-        if (!is_dense_addressable(gate0->encoding)) {
-            fail("qwen moe expert stack: '" + std::string(gate0->name) +
-                 "' has a non-affine packed encoding");
-        }
-
-        std::vector<Node> gate_up_parts;
-        std::vector<Node> down_parts;
-        std::vector<std::uint32_t> consumed;
-        gate_up_parts.reserve(static_cast<std::size_t>(num_experts));
-        down_parts.reserve(static_cast<std::size_t>(num_experts));
-        for (std::int64_t e = 0; e < num_experts; ++e) {
-            const std::string tag = prefix + std::to_string(e) + ".";
-            const SourceTensor* g = b.find(tag + "gate_proj.weight");
-            const SourceTensor* u = b.find(tag + "up_proj.weight");
-            const SourceTensor* d = b.find(tag + "down_proj.weight");
-            if (g == nullptr || u == nullptr || d == nullptr) {
-                fail("qwen moe expert stack: layer " + std::to_string(layer) + " expert " +
-                     std::to_string(e) + " missing gate/up/down");
-            }
-            const bool shapes_ok = g->shape.size() == 2 && u->shape.size() == 2 &&
-                                   d->shape.size() == 2 && g->shape[0] == inter &&
-                                   g->shape[1] == hidden && u->shape[0] == inter &&
-                                   u->shape[1] == hidden && d->shape[0] == hidden &&
-                                   d->shape[1] == inter;
-            if (!shapes_ok) {
-                fail("qwen moe expert stack: layer " + std::to_string(layer) + " expert " +
-                     std::to_string(e) + " shape mismatch");
-            }
-            if (logical_dtype(g->encoding) != dtype || logical_dtype(u->encoding) != dtype ||
-                logical_dtype(d->encoding) != dtype) {
-                fail("qwen moe expert stack: layer " + std::to_string(layer) + " expert " +
-                     std::to_string(e) + " dtype mismatch");
-            }
-            // One expert slab is gate over up; the leading 1 makes the
-            // per-expert concatenation a stack.
-            const Node gate_src = b.contract().src(std::string(g->name));
-            const Node up_src = b.contract().src(std::string(u->name));
-            gate_up_parts.push_back(b.contract().reshape(
-                b.contract().cat(gate_second
-                                     ? std::vector<Node>{up_src, gate_src}
-                                     : std::vector<Node>{gate_src, up_src},
-                                 0),
-                {1, 2 * inter, hidden}));
-            down_parts.push_back(b.contract().reshape(
-                b.contract().src(std::string(d->name)), {1, hidden, inter}));
-            consumed.push_back(g->id);
-            consumed.push_back(u->id);
-            consumed.push_back(d->id);
-        }
-
-        b.define(bound + "gate_up_proj", b.contract().cat(gate_up_parts, 0),
-               pie_loader::raw(dtype),
-               std::vector<std::int64_t>{num_experts, 2 * inter, hidden});
-        b.define(bound + "down_proj", b.contract().cat(down_parts, 0), pie_loader::raw(dtype),
-               std::vector<std::int64_t>{num_experts, hidden, inter});
-        for (std::uint32_t id : consumed) {
-            b.consume(id);
-        }
-    }
-}
 
 /// Shard the Gated DeltaNet tensors whose leading axis stacks `[K | K | V]`.
 ///
@@ -186,7 +87,7 @@ inline void author_qwen3_5_moe_contract(ContractBuilder& b) {
     // order the bound driver expects.
     const bool gate_second = qwen35_moe_gate_up_swapped();
     b.fused_moe_gate_up_tp_slices(gate_second);
-    contract_detail::qwen_moe_expert_stacks(b, gate_second);
+    contract_detail::hf_moe_expert_stacks(b, gate_second);
     b.publish_remaining();
 }
 }  // namespace pie_cuda_driver::model

@@ -71,25 +71,39 @@ __global__ void topk_sqrtsoftplus_kernel(
 __global__ void hash_route_lookup_kernel(
     const std::int32_t* __restrict__ token_ids,
     const std::int64_t* __restrict__ tid2eid,
+    const __nv_bfloat16* __restrict__ logits,
     std::int32_t* __restrict__ topk_idx,
     float* __restrict__ topk_w,
+    int tokens,
     int vocab_size,
+    int E,
     int K,
-    float weight_per_expert)
+    bool renormalize,
+    float routed_scaling_factor)
 {
     const int n = blockIdx.x * blockDim.x + threadIdx.x;
-    // bounds check happens in launch
+    if (n >= tokens) return;
     const int tok = token_ids[n];
     const int clamped = (tok >= 0 && tok < vocab_size) ? tok : 0;
 
     const std::int64_t* row = tid2eid + static_cast<long long>(clamped) * K;
+    const __nv_bfloat16* lg = logits + static_cast<long long>(n) * E;
     std::int32_t* out_idx = topk_idx + static_cast<long long>(n) * K;
     float* out_w = topk_w + static_cast<long long>(n) * K;
 
+    float sum = 0.f;
     for (int k = 0; k < K; ++k) {
-        out_idx[k] = static_cast<std::int32_t>(row[k]);
-        out_w[k] = weight_per_expert;
+        const int e = static_cast<int>(row[k]);
+        const int ec = (e >= 0 && e < E) ? e : 0;
+        out_idx[k] = ec;
+        const float w = sqrtsoftplus(__bfloat162float(lg[ec]));
+        out_w[k] = w;
+        sum += w;
     }
+    const float scale = renormalize
+        ? routed_scaling_factor / fmaxf(sum, 1e-20f)
+        : routed_scaling_factor;
+    for (int k = 0; k < K; ++k) out_w[k] *= scale;
 }
 
 }  // namespace
@@ -117,20 +131,26 @@ void launch_topk_sqrtsoftplus_bf16(
 void launch_hash_route_lookup(
     const std::int32_t* token_ids,
     const std::int64_t* tid2eid,
+    const void* logits,
     std::int32_t* topk_idx,
     float* topk_w,
     int tokens,
     int vocab_size,
+    int num_experts,
     int top_k,
-    float weight_per_expert,
+    bool renormalize,
+    float routed_scaling_factor,
     cudaStream_t stream)
 {
     if (tokens <= 0 || top_k <= 0) return;
     constexpr int BLOCK = 256;
     const int grid = (tokens + BLOCK - 1) / BLOCK;
     hash_route_lookup_kernel<<<grid, BLOCK, 0, stream>>>(
-        token_ids, tid2eid, topk_idx, topk_w,
-        vocab_size, top_k, weight_per_expert);
+        token_ids, tid2eid,
+        static_cast<const __nv_bfloat16*>(logits),
+        topk_idx, topk_w,
+        tokens, vocab_size, num_experts, top_k,
+        renormalize, routed_scaling_factor);
 }
 
 }  // namespace pie_cuda_driver::kernels

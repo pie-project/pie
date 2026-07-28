@@ -74,6 +74,25 @@ struct Input {
     /// the live `t0` message.
     #[serde(default)]
     report_arrivals: bool,
+    /// Frames of decode run-ahead each lane keeps queued in the engine. The
+    /// wave quorum waits for every lane, so a lane that drops to one queued
+    /// frame puts its whole guest turnaround on the fleet's critical path;
+    /// deeper queues buy slack for that turnaround.
+    #[serde(default = "default_run_ahead_frames")]
+    run_ahead_frames: usize,
+}
+
+fn default_run_ahead_frames() -> usize {
+    // Two frames only covers a guest turnaround shorter than one wave. Real
+    // wake latency at fleet scale is a large fraction of a wave, so a lane
+    // that queues only two frames intermittently drops to one and — under
+    // the wait-all wave quorum — puts its whole turnaround on the fleet's
+    // critical path. Measured at c=128 on Kimi K2.6: R <= 4 sits in a slow
+    // regime (wave-to-wave 7.6ms, settle->dispatch +3.0ms, i.e. the seal
+    // waits on guests), R >= 5 flips to a fully pipelined one (3.6ms,
+    // settle->dispatch -2.6ms) and stays flat out to R = 10. Six is the
+    // boundary plus margin.
+    6
 }
 
 fn default_max_tokens() -> usize {
@@ -257,16 +276,20 @@ async fn run_one(
     let k = frame_size();
     let tok_in = Channel::new([1], dtype::i32).named("tok_in");
     let g0_ch = Channel::new([1], dtype::i32).named("g0");
-    // Take-side ring ceiling under the two-frame window discipline: the
-    // window (`submitted - taken`) peaks at 3k - 1 — a top-up starting at
-    // window 2k - 1 adds one k-slot frame — and every outstanding fire can
+    // Take-side ring ceiling, tied to the run-ahead window depth R: the
+    // window (`submitted - taken`) peaks at (R+1)k - 1 — a top-up starting at
+    // window Rk - 1 adds one k-slot frame — and every outstanding fire can
     // settle before the host takes. The ring needs ONE MORE cell than that
-    // peak: 3k. Measured, not theoretical — at k=2 a 3k-1 ring throttled the
+    // peak: (R+1)k. Undersizing it does not merely throttle, it POISONS the
+    // channel ("work item completion published Failed terminal outcome") once
+    // a publish finds no free cell, so this must track `run_ahead_frames`.
+    // Measured, not theoretical — at k=2 and R=2 a 3k-1 ring throttled the
     // pipeline back to one frame in flight (28.0k vs 34.3k; the engine's
     // conservative ticket staging needs publish room for the next frame
     // before the host's takes are observable), while k=1 reproduces the
     // classic depth-2 ring either way.
-    let out_capacity = 3 * k;
+    let run_ahead_frames = input.run_ahead_frames.max(1);
+    let out_capacity = (run_ahead_frames + 1) * k;
     let out = Channel::new([1], dtype::i32)
         .capacity(out_capacity as u32)
         .named("out");
@@ -395,19 +418,37 @@ async fn run_one(
     submit_frame(&pipe, &first_slots).map_err(|e| format!("first frame submit: {e}"))?;
     let mut submitted = first_decodes;
 
-    // Unified run-ahead discipline (ONE rule for every k): keep TWO FRAMES
-    // of decode fires in flight (2k fires) — submit frames of min(k,
-    // remaining) decode slots until the window (submitted minus drained) is
-    // full or the budget is spent, returning the new submitted count. At
-    // k = 1 this is exactly the classic depth-2 window (burst two, then one
-    // per drained token). The window is measured in FRAMES because frames
-    // settle atomically: results arrive only at frame boundaries, so a
-    // fire-count window of 2 would leave ZERO queued frames while a k ≥ 2
-    // frame runs — the pipe drains to a full host round trip per frame.
-    // Decode geometry is device-carried (`tok_in`), so a successor never
-    // waits on a sampled token.
+    // Unified run-ahead discipline (ONE rule for every k): submit frames of
+    // min(k, remaining) decode slots until the window (submitted minus
+    // drained) is full or the budget is spent, returning the new submitted
+    // count. Decode geometry is device-carried (`tok_in`), so a successor
+    // never waits on a sampled token.
+    //
+    // The window has TWO independent floors and takes the max of both:
+    //
+    //  * >= 1 whole extra FRAME (`live_slots`), because frames settle
+    //    atomically — results arrive only at frame boundaries, so a window
+    //    of one frame plus a few fires would leave ZERO queued frames while
+    //    a k >= 2 frame runs, draining the pipe to a host round trip.
+    //
+    //  * >= 3 waves of COVER (`window_fires - live_slots`), because the
+    //    engine's frame seal is wait-for-ALL: it holds until every awaited
+    //    lane's oldest queued frame is arrival-complete, so the binding term
+    //    is the SLOWEST of `concurrency` lanes' resubmit. Cover is what buys
+    //    that straggler time, and it is counted in WAVES, not frames — a
+    //    2-frame window gives only k waves, so k = 1 got a single ~7 ms wave
+    //    and a cohort that fell behind never caught back up (see §20.10).
+    //
+    // Measured, Qwen3-0.6B / L40S / conc 256, median of 6-8 trials:
+    //   k=1 cover 1 (old 2*k rule)  multimodal 18.8k / 22k / 28.5k
+    //   k=1 cover 2                 7/8 at 28.6-29.5k, 1/8 still collapsed
+    //   k=1 cover 3                 6/6 at 28.7-29.5k, median 29044
+    //   k=2 cover 2 (old rule)      median 28497   <- already saturated
+    //   k=2 cover 3                 median 28654   <- within noise of it
+    // So the cover floor is what removes the k = 1 collapse, and it costs
+    // k >= 3 nothing (there the frame floor already dominates).
     let submit_ahead = |mut submitted: usize, drained: usize| -> std::result::Result<usize, String> {
-        let window_fires = 2 * live_slots;
+        let window_fires = live_slots + live_slots.max(3);
         while submitted < budget && submitted - drained < window_fires {
             let s = (budget - submitted).min(live_slots);
             reserve_to_tokens(n + (submitted + s) as u32 + 1)

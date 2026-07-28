@@ -19,6 +19,21 @@ void launch_rmsnorm_bf16(
     float eps,
     cudaStream_t stream);
 
+// RMSNorm over the leading `hidden` columns of rows that may be wider than
+// they are normalized. Kimi's fused `q_a + kv_a` projection lands both halves
+// in one row-major buffer, and the q half is normalized in place from there
+// rather than compacted first.
+void launch_rmsnorm_strided_bf16(
+    const void* x,        // [num_rows, x_row_stride], reads [:, :hidden]
+    const void* weight,   // [hidden]
+    void* y,              // [num_rows, y_row_stride], writes [:, :hidden]
+    int num_rows,
+    int hidden,
+    int x_row_stride,
+    int y_row_stride,
+    float eps,
+    cudaStream_t stream);
+
 // Fused pre-norm TP helper:
 //   hidden = round_bf16(hidden + residual)
 //   norm_out = rmsnorm(hidden, weight)

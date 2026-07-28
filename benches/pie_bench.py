@@ -20,6 +20,7 @@ from common import (
     ROOT,
     RequestResult,
     add_mode_subcommands,
+    hash_output_tokens,
     cuda_profiler_start,
     cuda_profiler_stop,
     finish,
@@ -41,17 +42,15 @@ if str(SERVER_SDK) not in sys.path:
 
 EMBEDDED_CLI_DRIVERS: set[str] = {
     "dummy",
+    # Apple Silicon: the Metal driver is linked into the `pie` binary, and
+    # there is no maturin `pie._engine` built for it, so drive the CLI.
+    "metal",
     "vllm",
     "sglang",
     "tensorrt_llm",
 }
 
 
-def hash_output_tokens(token_ids: list[int]) -> str:
-    digest = hashlib.sha256()
-    for token in token_ids:
-        digest.update(int(token).to_bytes(4, "little", signed=False))
-    return digest.hexdigest()
 KV_CACHE_DTYPES = [
     "auto",
     "bf16",
@@ -90,11 +89,16 @@ def bench_inferlet_paths(inferlet_dir: str | None) -> tuple[Path, Path, str]:
             "--inferlet-dir or set PIE_BENCH_INFERLET_DIR"
         )
     inferlet_dir = Path(inferlet_dir).expanduser().resolve()
-    wasm = (
-        inferlet_dir / "target" / "wasm32-wasip2" / "release"
-        / "text_completion_bench.wasm"
-    )
+    rel = Path("target") / "wasm32-wasip2" / "release" / "text_completion_bench.wasm"
+    candidates = [inferlet_dir / rel]
+    for parent in inferlet_dir.parents:
+        candidates.append(parent / rel)
+        if (parent / "Cargo.toml").exists() and "[workspace]" in (
+            parent / "Cargo.toml"
+        ).read_text():
+            break
     manifest = inferlet_dir / "Pie.toml"
+    wasm = next((c for c in candidates if c.exists()), candidates[0])
     if not wasm.exists():
         raise FileNotFoundError(
             f"missing {wasm}; build with: cd {inferlet_dir} && "
@@ -237,6 +241,18 @@ def build_config(args: argparse.Namespace):
             driver_options["total_pages"] = args.total_pages
         if getattr(args, "swap_pool_size", 0):
             driver_options["swap_pool_size"] = args.swap_pool_size
+    elif args.driver == "metal":
+        # Apple Silicon. The Metal driver sizes its own heap from the
+        # checkpoint and exposes no memory-fraction knob, so the CUDA-shaped
+        # `gpu_mem_utilization` has nowhere to go; the batching caps are the
+        # only tunables it reads.
+        driver_options = {}
+        if getattr(args, "max_forward_tokens", 0):
+            driver_options["max_forward_tokens"] = args.max_forward_tokens
+        if getattr(args, "max_forward_requests", 0):
+            driver_options["max_forward_requests"] = args.max_forward_requests
+        if getattr(args, "total_pages", 0):
+            driver_options["total_pages"] = args.total_pages
     elif args.driver == "vllm":
         driver_options = {
             "gpu_memory_utilization": args.gpu_mem_util,
@@ -505,7 +521,9 @@ async def cli_pie_client(args: argparse.Namespace):
             if should_surface_server_line(text):
                 sys.stderr.write(text)
                 sys.stderr.flush()
-            if "Server ready at ws://" in text:
+            # The banner's scheme moved from `ws://` to `gateway://` when the
+            # gateway edge landed; match the phrase, not the scheme.
+            if "Server ready at " in text:
                 server_ready = True
                 break
             if proc.returncode is not None:
@@ -581,6 +599,11 @@ async def run(args: argparse.Namespace):
                 "top_p": args.top_p,
                 "ignore_eos": args.ignore_eos,
                 "wasm_delay_us": args.wasm_delay_us,
+                **(
+                    {"run_ahead_frames": args.run_ahead_frames}
+                    if getattr(args, "run_ahead_frames", None)
+                    else {}
+                ),
                 "return_text": args.dump_first_text or args.dump_all_texts,
                 "report_timing": args.report_timing,
                 "report_arrivals": args.report_arrivals,
@@ -1176,7 +1199,7 @@ def build_parser() -> argparse.ArgumentParser:
         )
         sp.add_argument("--device", default=PIE_BENCH_DEFAULT_DEVICE)
         sp.add_argument("--driver", default="cuda_native",
-                        choices=["cuda_native", "vllm", "sglang", "tensorrt_llm", "dummy"])
+                        choices=["cuda_native", "metal", "vllm", "sglang", "tensorrt_llm", "dummy"])
         sp.add_argument("--default-token-limit", type=int, default=200_000)
         sp.add_argument("--default-endowment-pages", type=int, default=64)
         sp.add_argument("--admission-oversubscription-factor", type=float, default=4.0)

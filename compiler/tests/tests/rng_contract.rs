@@ -200,6 +200,9 @@ fn rng_magic_is_owned_by_the_contract() {
         // splitmix64 id generation: the canonical splitmix increment happens
         // to be the same golden-ratio word; not a keyed-RNG transcription.
         Path::new("runtime/engine/src/pipeline/offload.rs"),
+        // boost-style `hash_combine` for the GEMM autotune cache key; the
+        // golden-ratio word again, and nothing to do with the PTIR stream.
+        Path::new("driver/cuda/src/ops/gemm.cpp"),
     ];
     let unrelated_mask_users = [
         Path::new("driver/cuda/tests/ptir_tier0_test.cu"),

@@ -214,6 +214,56 @@ pub(super) enum FramePlan {
     Park,
 }
 
+/// The stamped fire ids still in the worker queue, sorted.
+///
+/// This is rebuilt on EVERY scheduler pass (~46 per wave at 128 requests),
+/// so its build cost is on the hot path: as a `HashSet<u64>` the rebuild
+/// measured 35us per pass / 1.6ms per wave — the single largest scheduler
+/// item, against a 3ms GPU wave. Sorted-push plus binary search costs no
+/// hashing and no table growth, and the queue is already in ascending id
+/// order (ids come from one monotonic counter), so the sort is a no-op scan.
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
+pub struct QueuedFireIds {
+    ids: Vec<u64>,
+}
+
+impl QueuedFireIds {
+    pub fn clear(&mut self) {
+        self.ids.clear();
+    }
+
+    pub fn push(&mut self, fire_id: u64) {
+        self.ids.push(fire_id);
+    }
+
+    /// Restore the sorted invariant `contains` relies on. Retries and
+    /// re-admissions can put a lower id behind a higher one, so this cannot
+    /// assume queue order.
+    pub fn seal(&mut self) {
+        if !self.ids.windows(2).all(|pair| pair[0] <= pair[1]) {
+            self.ids.sort_unstable();
+        }
+    }
+
+    pub fn contains(&self, fire_id: &u64) -> bool {
+        self.ids.binary_search(fire_id).is_ok()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+}
+
+impl FromIterator<u64> for QueuedFireIds {
+    fn from_iter<T: IntoIterator<Item = u64>>(iter: T) -> Self {
+        let mut out = Self {
+            ids: iter.into_iter().collect(),
+        };
+        out.seal();
+        out
+    }
+}
+
 pub(super) struct FramePolicy {
     k: usize,
     max_wave_tokens: usize,
@@ -899,7 +949,7 @@ impl FramePolicy {
     /// frame's post.
     pub fn plan_dispatch(
         &mut self,
-        still_queued: &HashSet<u64>,
+        still_queued: &QueuedFireIds,
         blocked_lanes: &HashSet<ProcessId>,
         executing: bool,
         now: Instant,
@@ -1140,11 +1190,11 @@ mod tests {
         }
     }
 
-    fn plan(policy: &mut FramePolicy, queued: &HashSet<u64>, now: Instant) -> FramePlan {
+    fn plan(policy: &mut FramePolicy, queued: &QueuedFireIds, now: Instant) -> FramePlan {
         policy.plan_dispatch(queued, &HashSet::new(), false, now)
     }
 
-    fn drive_past_cold_hold(policy: &mut FramePolicy, queued: &HashSet<u64>) -> FramePlan {
+    fn drive_past_cold_hold(policy: &mut FramePolicy, queued: &QueuedFireIds) -> FramePlan {
         let now = Instant::now();
         match plan(policy, queued, now) {
             FramePlan::Hold(hold) => plan(policy, queued, now + hold + Duration::from_micros(1)),
@@ -1178,7 +1228,7 @@ mod tests {
         let mut policy = FramePolicy::new(1, 1, 4096, None);
         let lane = pid();
         policy.on_fire_enqueued(stamp(lane, 0, 0, 1), Some(lane), 7, 1, 1);
-        let queued: HashSet<u64> = [7].into_iter().collect();
+        let queued: QueuedFireIds = [7].into_iter().collect();
         assert_eq!(
             plan(&mut policy, &queued, Instant::now()),
             FramePlan::Dispatch(vec![vec![7]]),
@@ -1197,7 +1247,7 @@ mod tests {
         // seq = the fire id, slot 0, one fire per frame.
         policy.on_fire_enqueued(stamp(a, 10, 0, 1), Some(a), 10, 1, 1);
         policy.on_fire_enqueued(stamp(b, 11, 0, 1), Some(b), 11, 1, 1);
-        let queued: HashSet<u64> = [10, 11].into_iter().collect();
+        let queued: QueuedFireIds = [10, 11].into_iter().collect();
         let t0 = Instant::now();
         let FramePlan::Hold(hold) = plan(&mut policy, &queued, t0) else {
             panic!("bootstrap membership is forming: the cold hold must arm");
@@ -1211,14 +1261,14 @@ mod tests {
 
         // Steady state: `a` resubmits, `b` does not — the wave holds.
         policy.on_fire_enqueued(stamp(a, 12, 0, 1), Some(a), 12, 1, 1);
-        let queued: HashSet<u64> = [12].into_iter().collect();
+        let queued: QueuedFireIds = [12].into_iter().collect();
         match plan(&mut policy, &queued, Instant::now()) {
             FramePlan::Hold(_) => {}
             plan => panic!("wait-all must hold for the idle lane, got {plan:?}"),
         }
         // `b`'s next fire arrives: the wave seals dense, no cold hold.
         policy.on_fire_enqueued(stamp(b, 13, 0, 1), Some(b), 13, 1, 1);
-        let queued: HashSet<u64> = [12, 13].into_iter().collect();
+        let queued: QueuedFireIds = [12, 13].into_iter().collect();
         let next = plan(&mut policy, &queued, Instant::now());
         assert_eq!(fires(&next).len(), 2);
     }
@@ -1233,7 +1283,7 @@ mod tests {
         }
         policy.on_fire_enqueued(stamp(b, 0, 0, 1), Some(b), 200, 37, 1);
 
-        let queued: HashSet<u64> = [100, 101, 102, 103, 200].into_iter().collect();
+        let queued: QueuedFireIds = [100, 101, 102, 103, 200].into_iter().collect();
         let sealed = drive_past_cold_hold(&mut policy, &queued);
         // One whole frame: wave 0 = both lanes' slot-0 fires (lane-id order
         // preserved), later slots in slot order.
@@ -1261,7 +1311,7 @@ mod tests {
         // `slow` declared 2 fires but only one arrived: a missing member.
         policy.on_fire_enqueued(stamp(slow, 0, 0, 2), Some(slow), 3, 1, 1);
 
-        let queued: HashSet<u64> = [1, 2, 3].into_iter().collect();
+        let queued: QueuedFireIds = [1, 2, 3].into_iter().collect();
         let t0 = Instant::now();
         match plan(&mut policy, &queued, t0) {
             FramePlan::Hold(hold) => {
@@ -1277,7 +1327,7 @@ mod tests {
 
         // The straggler completes: one dense epoch, both lanes' slot-0.
         policy.on_fire_enqueued(stamp(slow, 0, 1, 2), Some(slow), 4, 1, 1);
-        let queued: HashSet<u64> = [1, 2, 3, 4].into_iter().collect();
+        let queued: QueuedFireIds = [1, 2, 3, 4].into_iter().collect();
         let FramePlan::Dispatch(waves) = drive_past_cold_hold(&mut policy, &queued) else {
             panic!("all lanes ready: the epoch must seal");
         };
@@ -1294,7 +1344,7 @@ mod tests {
         let (a, b) = (pid(), pid());
         policy.on_fire_enqueued(stamp(a, 0, 0, 2), Some(a), 50, 1, 1);
         policy.on_fire_enqueued(stamp(a, 0, 1, 2), Some(a), 51, 1, 1);
-        let queued: HashSet<u64> = [50, 51].into_iter().collect();
+        let queued: QueuedFireIds = [50, 51].into_iter().collect();
         let FramePlan::Dispatch(frame0) = drive_past_cold_hold(&mut policy, &queued) else {
             panic!("expected lane a's whole frame");
         };
@@ -1306,7 +1356,7 @@ mod tests {
         policy.on_fire_enqueued(stamp(b, 0, 1, 2), Some(b), 61, 1, 1);
         policy.on_fire_enqueued(stamp(a, 1, 0, 2), Some(a), 52, 1, 1);
         policy.on_fire_enqueued(stamp(a, 1, 1, 2), Some(a), 53, 1, 1);
-        let queued: HashSet<u64> = [52, 53, 60, 61].into_iter().collect();
+        let queued: QueuedFireIds = [52, 53, 60, 61].into_iter().collect();
         let FramePlan::Dispatch(merged) =
             policy.plan_dispatch(&queued, &HashSet::new(), true, Instant::now())
         else {
@@ -1325,7 +1375,7 @@ mod tests {
         let mut policy = FramePolicy::new(1, 64, 4096, None);
         let lane = pid();
         policy.on_fire_enqueued(stamp(lane, 0, 0, 1), Some(lane), 70, 1, 1);
-        let queued: HashSet<u64> = [70].into_iter().collect();
+        let queued: QueuedFireIds = [70].into_iter().collect();
         let blocked: HashSet<ProcessId> = [lane].into_iter().collect();
         // Seal happens; dispatch holds on the blocked lane.
         let now = Instant::now();
@@ -1356,12 +1406,12 @@ mod tests {
         let lane = pid();
         policy.on_fire_enqueued(stamp(lane, 0, 0, 2), Some(lane), 20, 1, 1);
         policy.on_fire_enqueued(stamp(lane, 0, 1, 2), Some(lane), 21, 1, 1);
-        let queued: HashSet<u64> = [20, 21].into_iter().collect();
+        let queued: QueuedFireIds = [20, 21].into_iter().collect();
         let FramePlan::Dispatch(waves) = drive_past_cold_hold(&mut policy, &queued) else {
             panic!("expected the whole frame");
         };
         assert_eq!(waves, vec![vec![20], vec![21]]);
-        let queued: HashSet<u64> = HashSet::new();
+        let queued = QueuedFireIds::default();
         assert_eq!(plan(&mut policy, &queued, Instant::now()), FramePlan::Park);
         assert_eq!(policy.sealed.len(), 0, "frame popped at dispatch");
         assert!(
@@ -1474,7 +1524,7 @@ mod tests {
         policy.on_fire_enqueued(stamp(lane, 0, 1, 4), Some(lane), 31, 1, 1);
         // Host submit failed at slot 2: only 2 fires exist.
         policy.on_frame_truncated(lane, 0, 2);
-        let queued: HashSet<u64> = [30, 31].into_iter().collect();
+        let queued: QueuedFireIds = [30, 31].into_iter().collect();
         let FramePlan::Dispatch(waves) = drive_past_cold_hold(&mut policy, &queued) else {
             panic!("truncated frame must still seal");
         };
@@ -1497,7 +1547,7 @@ mod tests {
         };
         policy.on_fire_enqueued(stamp(a, 0, 0, 1), Some(a), 40, 37, 1);
         policy.on_fire_enqueued(stamp(b, 0, 0, 1), Some(b), 41, 37, 1);
-        let queued: HashSet<u64> = [40, 41].into_iter().collect();
+        let queued: QueuedFireIds = [40, 41].into_iter().collect();
         let FramePlan::Dispatch(frame_a) = drive_past_cold_hold(&mut policy, &queued) else {
             panic!("expected a seal");
         };
@@ -1509,7 +1559,7 @@ mod tests {
         };
         assert_eq!(frame_b[0], vec![41]);
         // Round closed at b's seal: the next epoch awaits BOTH lanes again.
-        let queued: HashSet<u64> = HashSet::new();
+        let queued = QueuedFireIds::default();
         assert_eq!(plan(&mut policy, &queued, Instant::now()), FramePlan::Park);
     }
 
@@ -1522,7 +1572,7 @@ mod tests {
         let (a, b) = (pid(), pid());
         policy.on_fire_enqueued(stamp(a, 0, 0, 2), Some(a), 60, 1, 1);
         policy.on_fire_enqueued(stamp(a, 0, 1, 2), Some(a), 61, 1, 1);
-        let queued: HashSet<u64> = [60, 61].into_iter().collect();
+        let queued: QueuedFireIds = [60, 61].into_iter().collect();
         let FramePlan::Dispatch(frame_a) = drive_past_cold_hold(&mut policy, &queued) else {
             panic!("expected lane a's whole frame");
         };
@@ -1532,7 +1582,7 @@ mod tests {
         // no seal until a's next frame is in (or a leaves).
         policy.on_fire_enqueued(stamp(b, 0, 0, 2), Some(b), 70, 1, 1);
         policy.on_fire_enqueued(stamp(b, 0, 1, 2), Some(b), 71, 1, 1);
-        let queued: HashSet<u64> = [70, 71].into_iter().collect();
+        let queued: QueuedFireIds = [70, 71].into_iter().collect();
         match plan(&mut policy, &queued, Instant::now()) {
             FramePlan::Hold(_) => {}
             plan => panic!("the epoch must wait for lane a to resubmit, got {plan:?}"),
@@ -1541,7 +1591,7 @@ mod tests {
         // a resubmits: the epoch seals DENSE with both lanes.
         policy.on_fire_enqueued(stamp(a, 1, 0, 2), Some(a), 80, 1, 1);
         policy.on_fire_enqueued(stamp(a, 1, 1, 2), Some(a), 81, 1, 1);
-        let queued: HashSet<u64> = [70, 71, 80, 81].into_iter().collect();
+        let queued: QueuedFireIds = [70, 71, 80, 81].into_iter().collect();
         let FramePlan::Dispatch(dense) = plan(&mut policy, &queued, Instant::now()) else {
             panic!("all lanes ready: the epoch must seal");
         };
@@ -1557,13 +1607,13 @@ mod tests {
         let (a, b) = (pid(), pid());
         policy.on_fire_enqueued(stamp(a, 0, 0, 1), Some(a), 90, 1, 1);
         policy.on_fire_enqueued(stamp(b, 0, 0, 1), Some(b), 91, 1, 1);
-        let queued: HashSet<u64> = [90, 91].into_iter().collect();
+        let queued: QueuedFireIds = [90, 91].into_iter().collect();
         let bootstrap = drive_past_cold_hold(&mut policy, &queued);
         assert_eq!(fires(&bootstrap).len(), 2);
 
         // b resubmits; a does not — the gather blocks on a.
         policy.on_fire_enqueued(stamp(b, 1, 0, 1), Some(b), 92, 1, 1);
-        let queued: HashSet<u64> = [92].into_iter().collect();
+        let queued: QueuedFireIds = [92].into_iter().collect();
         match plan(&mut policy, &queued, Instant::now()) {
             FramePlan::Hold(_) => {}
             plan => panic!("the gather must block on lane a, got {plan:?}"),
@@ -1584,7 +1634,7 @@ mod tests {
         let binder = pid();
         policy.on_fire_enqueued(stamp(lane, 0, 0, 1), Some(lane), 95, 1, 1);
         policy.on_bind_enqueued(Some(binder));
-        let queued: HashSet<u64> = [95].into_iter().collect();
+        let queued: QueuedFireIds = [95].into_iter().collect();
         let sealed = drive_past_cold_hold(&mut policy, &queued);
         assert_eq!(fires(&sealed), vec![95]);
     }
@@ -1657,7 +1707,7 @@ mod tests {
         policy.on_bind_enqueued(Some(successor));
         policy.on_bind_completed(Some(successor));
         policy.on_execution_slot_released(pid());
-        let queued: HashSet<u64> = [95].into_iter().collect();
+        let queued: QueuedFireIds = [95].into_iter().collect();
         match drive_past_cold_hold(&mut policy, &queued) {
             FramePlan::Hold(_) => {}
             plan => panic!("a freed slot with a staged taker must hold, got {plan:?}"),
@@ -1668,7 +1718,7 @@ mod tests {
             plan => panic!("an admitted-but-unfired join must hold, got {plan:?}"),
         }
         policy.on_fire_enqueued(stamp(successor, 0, 0, 1), Some(successor), 96, 1, 1);
-        let queued: HashSet<u64> = [95, 96].into_iter().collect();
+        let queued: QueuedFireIds = [95, 96].into_iter().collect();
         let sealed = drive_past_cold_hold(&mut policy, &queued);
         let mut wave0 = fires(&sealed);
         wave0.sort_unstable();
@@ -1693,7 +1743,7 @@ mod tests {
         policy.on_bind_completed(Some(successor));
         policy.on_execution_slot_released(pid());
         policy.on_execution_slot_consumed(successor);
-        let queued: HashSet<u64> = [95].into_iter().collect();
+        let queued: QueuedFireIds = [95].into_iter().collect();
         match drive_past_cold_hold(&mut policy, &queued) {
             FramePlan::Hold(_) => {}
             plan => panic!("an admitted-but-unfired join must hold, got {plan:?}"),
@@ -1748,7 +1798,7 @@ mod tests {
         policy.on_slotted_terminate(predecessor);
         policy.on_lane_leave(predecessor, None, true);
         policy.on_process_leave(predecessor);
-        let queued: HashSet<u64> = [95].into_iter().collect();
+        let queued: QueuedFireIds = [95].into_iter().collect();
         match drive_past_cold_hold(&mut policy, &queued) {
             FramePlan::Hold(_) => {}
             plan => panic!("a departed slot holder's in-flight release must hold, got {plan:?}"),
@@ -1763,7 +1813,7 @@ mod tests {
         }
         policy.on_execution_slot_consumed(successor);
         policy.on_fire_enqueued(stamp(successor, 0, 0, 1), Some(successor), 96, 1, 1);
-        let queued: HashSet<u64> = [95, 96].into_iter().collect();
+        let queued: QueuedFireIds = [95, 96].into_iter().collect();
         let sealed = drive_past_cold_hold(&mut policy, &queued);
         let mut wave = fires(&sealed);
         wave.sort_unstable();
@@ -1791,7 +1841,7 @@ mod tests {
         policy.on_execution_slot_released(holder);
         policy.on_execution_slot_consumed(bystander);
         policy.on_fire_enqueued(stamp(bystander, 0, 0, 1), Some(bystander), 96, 1, 1);
-        let queued: HashSet<u64> = [95, 96].into_iter().collect();
+        let queued: QueuedFireIds = [95, 96].into_iter().collect();
         assert!(
             matches!(
                 drive_past_cold_hold(&mut policy, &queued),
@@ -1816,7 +1866,7 @@ mod tests {
         policy.on_bind_enqueued(Some(successor));
         policy.on_bind_completed(Some(successor));
         policy.on_slotted_terminate(holder);
-        let queued: HashSet<u64> = [95].into_iter().collect();
+        let queued: QueuedFireIds = [95].into_iter().collect();
         match drive_past_cold_hold(&mut policy, &queued) {
             FramePlan::Hold(_) => {}
             plan => panic!("an unresolved departure must hold, got {plan:?}"),
@@ -1843,14 +1893,14 @@ mod tests {
         policy.on_bind_enqueued(Some(b));
         policy.on_execution_slot_consumed(a);
         policy.on_fire_enqueued(stamp(a, 10, 0, 1), Some(a), 10, 1, 1);
-        let queued: HashSet<u64> = [10].into_iter().collect();
+        let queued: QueuedFireIds = [10].into_iter().collect();
         match drive_past_cold_hold(&mut policy, &queued) {
             FramePlan::Hold(_) => {}
             plan => panic!("free slot with staged taker must gather, got {plan:?}"),
         }
         policy.on_execution_slot_consumed(b);
         policy.on_fire_enqueued(stamp(b, 11, 0, 1), Some(b), 11, 1, 1);
-        let queued: HashSet<u64> = [10, 11].into_iter().collect();
+        let queued: QueuedFireIds = [10, 11].into_iter().collect();
         let sealed = drive_past_cold_hold(&mut policy, &queued);
         let mut wave = fires(&sealed);
         wave.sort_unstable();
@@ -1880,7 +1930,7 @@ mod tests {
         policy.on_execution_slot_released(pid());
         policy.on_execution_slot_consumed(executing);
         policy.on_bind_enqueued(Some(bystander));
-        let queued: HashSet<u64> = [95].into_iter().collect();
+        let queued: QueuedFireIds = [95].into_iter().collect();
         assert!(
             matches!(
                 drive_past_cold_hold(&mut policy, &queued),
@@ -1899,7 +1949,7 @@ mod tests {
         let lane = pid();
         let successor = pid();
         policy.on_fire_enqueued(stamp(lane, 0, 0, 1), Some(lane), 95, 1, 1);
-        let queued: HashSet<u64> = [95].into_iter().collect();
+        let queued: QueuedFireIds = [95].into_iter().collect();
 
         // Slot released with an empty staged pool: no earmark, no hold.
         policy.on_execution_slot_released(pid());
@@ -1910,7 +1960,7 @@ mod tests {
         // then let it die before firing: the leave releases the hold.
         policy.on_fire_enqueued(stamp(lane, 1, 0, 1), Some(lane), 96, 1, 1);
         policy.on_bind_enqueued(Some(successor));
-        let queued: HashSet<u64> = [96].into_iter().collect();
+        let queued: QueuedFireIds = [96].into_iter().collect();
         match plan(&mut policy, &queued, Instant::now()) {
             FramePlan::Hold(_) | FramePlan::Park => {}
             plan => panic!("freed slot with staged taker must hold, got {plan:?}"),
@@ -1937,7 +1987,7 @@ mod tests {
 
         policy.on_lane_leave(closed, None, false);
         policy.on_lane_leave(terminated, None, true);
-        let queued: HashSet<u64> = [50].into_iter().collect();
+        let queued: QueuedFireIds = [50].into_iter().collect();
         let sealed = drive_past_cold_hold(&mut policy, &queued);
         assert_eq!(fires(&sealed), vec![50]);
     }

@@ -11,10 +11,8 @@
 //! reclaims it. Between those two points nothing mutates, so handing the plan to
 //! another thread is sound.
 
-use crate::plan::{
-    DestExtent, Extent, LoadPlan, QuantGranularity, ScaleForm, SourceExtent, StorageInstr,
-};
-use crate::types::{Encoding, QuantScheme};
+use crate::plan::{DestExtent, Extent, LoadPlan, SourceExtent, StorageInstr};
+use crate::types::{Encoding, QuantGranularity, QuantScheme, ScaleForm};
 
 use super::types::*;
 
@@ -29,7 +27,6 @@ pub struct PlanArena {
     u32_runs: Vec<Box<[u32]>>,
     i64_runs: Vec<Box<[i64]>>,
     dim_runs: Vec<Box<[PieLoaderDimSpecView]>>,
-    slab_runs: Vec<Box<[PieLoaderSlabPlacementView]>>,
     files: Vec<PieLoaderCheckpointFileView>,
     sources: Vec<PieLoaderSourceTensorView>,
     tensors: Vec<PieLoaderTensorDeclView>,
@@ -84,20 +81,6 @@ impl PlanArena {
         view
     }
 
-    fn store_slab(
-        &mut self,
-        values: impl IntoIterator<Item = PieLoaderSlabPlacementView>,
-    ) -> PieLoaderSlabPlacementSlice {
-        let boxed: Box<[PieLoaderSlabPlacementView]> =
-            values.into_iter().collect::<Vec<_>>().into_boxed_slice();
-        let view = PieLoaderSlabPlacementSlice {
-            ptr: boxed.as_ptr(),
-            len: boxed.len(),
-        };
-        self.slab_runs.push(boxed);
-        view
-    }
-
     fn stride(&mut self, stride: &Extent) -> PieLoaderStridedExtentView {
         let dims = self.store_dims(stride.dims.iter().map(|dim| PieLoaderDimSpecView {
             count: dim.count,
@@ -119,6 +102,7 @@ impl PlanArena {
             file_offset: source.file_offset,
             span_bytes: source.span_bytes,
             stride,
+            dtype: source.dtype.into(),
         }
     }
 
@@ -284,27 +268,6 @@ fn flatten_instr(arena: &mut PlanArena, instr: &StorageInstr) -> PieLoaderStorag
             Op::BulkExtentWrite {
                 source: arena.source_extent(source),
                 dest_offset: *dest_offset,
-            },
-        ),
-        StorageInstr::SlabScatter {
-            id,
-            file_id,
-            file_offset,
-            span_bytes,
-            placements,
-        } => (
-            id,
-            Op::SlabScatter {
-                file_id: file_id.0,
-                file_offset: *file_offset,
-                span_bytes: *span_bytes,
-                placements: arena.store_slab(placements.iter().map(|p| {
-                    PieLoaderSlabPlacementView {
-                        src_offset: p.src_offset,
-                        dest_offset: p.dest_offset,
-                        bytes: p.bytes,
-                    }
-                })),
             },
         ),
         StorageInstr::TileMap {
@@ -590,15 +553,6 @@ pub(crate) mod view {
     }
 
     pub unsafe fn dims(value: &PieLoaderDimSpecSlice) -> &'static [PieLoaderDimSpecView] {
-        if value.ptr.is_null() {
-            return &[];
-        }
-        unsafe { std::slice::from_raw_parts(value.ptr, value.len) }
-    }
-
-    pub unsafe fn slabs(
-        value: &PieLoaderSlabPlacementSlice,
-    ) -> &'static [PieLoaderSlabPlacementView] {
         if value.ptr.is_null() {
             return &[];
         }

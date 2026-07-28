@@ -44,6 +44,7 @@ namespace pie_cuda_driver {
 struct HfConfig;
 class LoadedModel;
 class MlaCache;
+class DsV4CompressCache;
 struct DsaCache;
 class NcclComm;
 class RecurrentStateCache;
@@ -197,6 +198,7 @@ struct ModelResources {
 
     // DeepSeek-V4 / Kimi / GLM-5 per-fire scratch.
     DsV4Workspace* dsv4_ws = nullptr;
+    DsV4CompressCache* dsv4_comp_cache = nullptr;
     KimiWorkspace* kimi_ws = nullptr;
     Glm5Workspace* glm5_ws = nullptr;
 };

@@ -5,6 +5,7 @@
 #include <bit>
 #include <chrono>
 #include <cstdlib>
+#include <iostream>
 #include <cstring>
 #include <filesystem>
 #include <iomanip>
@@ -20,6 +21,10 @@
 #include "pipeline/region_support.hpp"
 
 namespace pie::metal::pipeline {
+
+// Threads a grouped generated region gets per lane. Must equal
+// `METAL_M3_REGION_THREADS` in compiler/codegen/src/metal/fused.rs.
+inline constexpr std::uint32_t kM3RegionThreads = 256;
 
 std::string encode_m1_cache_identity(
     std::uint64_t device,
@@ -2387,6 +2392,15 @@ M1ExecuteOutcome M1Runtime::finish_m2_command(
     return M1ExecuteOutcome::Failed;
 }
 
+// `PIE_METAL_M3_GPU_TIMESTAMPS=1` re-enables the per-fire GPU counter sampling.
+static bool m3_gpu_timestamps_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("PIE_METAL_M3_GPU_TIMESTAMPS");
+        return e != nullptr && e[0] != '\0' && e[0] != '0';
+    }();
+    return on;
+}
+
 bool M1Runtime::prepare_m3_group(
     const std::vector<M3LaneCandidate>& candidates,
     RawMetalContext& target,
@@ -2461,7 +2475,14 @@ bool M1Runtime::prepare_m3_group(
     group->commit = impl_->grouped_commit;
     group->readiness_ordinal = impl_->next_ordinal++;
     group->commit_ordinal = impl_->next_ordinal++;
-    group->timestamp_heap = target.create_timestamp_heap(2);
+    // GPU counter sampling for the M3 epilogue, off unless asked for. It buys
+    // one diagnostic stat (post_forward_critical_ns) and costs a counter-heap
+    // create, a resolveCounterRange and a release on EVERY fire --- measured at
+    // 5.0ms of a ~13ms token, which is the entire host gap between two forwards
+    // and, because the GPU is idle across it, most of the reason the clock
+    // drops. The host-clock fallback below reports the same span for free.
+    if (m3_gpu_timestamps_enabled())
+        group->timestamp_heap = target.create_timestamp_heap(2);
     const std::size_t lane_count = candidates.size();
     const std::size_t lane_bytes =
         sizeof(PtirLaneTableHeader) +
@@ -3019,13 +3040,35 @@ bool M1Runtime::prepare_m3_group(
                 };
                 encoded.threadgroup = {256, 1, 1};
             } else {
+                // A generated region used to get one thread per lane, which put
+                // every vocabulary-wide op in a PTIR program on a single lane of
+                // the GPU: ~155ms of a ~159ms decode step against a ~3ms model
+                // forward. It gets a threadgroup per lane instead.
+                //
+                // Take the widest threadgroup this pipeline actually allows,
+                // rounded down to a multiple of the simd width, and never more
+                // than the threadgroup buffer the kernel declares. The region's
+                // vocabulary-wide ops are latency-bound inside one threadgroup,
+                // so width is throughput.
+                std::uint32_t width = std::min<std::uint32_t>(
+                    kM3RegionThreads,
+                    std::max<std::uint32_t>(
+                        32u, context().pso_max_threads(region.pso)));
+                width = std::max<std::uint32_t>(32u, (width / 32u) * 32u);
+                const std::uint64_t threads =
+                    static_cast<std::uint64_t>(stage_lane_count) * width;
+                if (threads > std::numeric_limits<std::uint32_t>::max()) {
+                    error = "Metal M3 region launch exceeds u32 grid";
+                    group->stages.push_back(std::move(stage));
+                    release_group();
+                    return false;
+                }
                 encoded.grid = {
-                    static_cast<std::uint32_t>(
-                        stage_lane_count),
+                    static_cast<std::uint32_t>(threads),
                     1,
                     1,
                 };
-                encoded.threadgroup = {1, 1, 1};
+                encoded.threadgroup = {width, 1, 1};
             }
             stage.regions.push_back(encoded);
         }
@@ -3114,17 +3157,84 @@ std::vector<M1ExecuteOutcome> M1Runtime::finish_m3_group(
     const auto* statuses =
         static_cast<const DeviceStatus*>(command->statuses.contents());
     outcomes.reserve(command->candidates.size());
+    // The lane status is written by the kernel, and on the failure path it is
+    // the only account of what happened: `m1_fault` stores the op tag it could
+    // not execute in `fault`, and the lane-table guard stores the ABI version
+    // and the (lane_count, channel_count) it saw. Dropping it left the driver
+    // printing "launch failed:" with nothing after the colon.
+    std::string faults;
     for (std::size_t lane = 0; lane < command->candidates.size(); ++lane) {
-        if (statuses[lane].state == 4)
+        if (statuses[lane].state == 4) {
             outcomes.push_back(M1ExecuteOutcome::Committed);
-        else if (statuses[lane].state == 2)
+            continue;
+        }
+        if (statuses[lane].state == 2) {
             outcomes.push_back(M1ExecuteOutcome::Retry);
-        else
-            outcomes.push_back(M1ExecuteOutcome::Failed);
+            continue;
+        }
+        outcomes.push_back(M1ExecuteOutcome::Failed);
+        if (!faults.empty()) faults += "; ";
+        // `m1_fault_op` packs the guard site into the top byte of reserved1
+        // and the immediate into the rest; `reserved0` is the intrinsic id.
+        // The lane-table guard (fault 0x100) uses the same fields differently,
+        // so it is reported raw.
+        const std::uint32_t site = statuses[lane].reserved1 >> 24;
+        const char* site_name =
+            site == 1   ? "channel sink narrower than the value"
+            : site == 2 ? "MtpDrafts with a zero row width"
+            : site == 3 ? "no arm claimed this op tag"
+                        : "unknown";
+        faults += "lane " + std::to_string(lane) + " state=" +
+                  std::to_string(statuses[lane].state) + " op_tag=0x" +
+                  hex64(statuses[lane].fault) + " intr=" +
+                  std::to_string(statuses[lane].reserved0) + " imm=" +
+                  std::to_string(statuses[lane].reserved1 & 0x00ffffffu) +
+                  " guard=" + site_name;
+    }
+    // The emitted regions guard on the group layout the host wrote, so a fault
+    // there is usually a layout the host got wrong rather than a bad op. Report
+    // it alongside, or the next reader is back to reading the emitter.
+    if (!faults.empty()) {
+        for (const auto& stage : command->stages) {
+            if (!stage.layout.valid() || stage.layout.contents() == nullptr) continue;
+            const auto* layout =
+                static_cast<const M3GroupLayout*>(stage.layout.contents());
+            faults += "; stage layout lanes=" + std::to_string(layout->lane_count) +
+                      " values=" + std::to_string(layout->value_count) +
+                      " vocab=" + std::to_string(layout->vocab) +
+                      " scratch_stride=" + std::to_string(layout->scratch_stride);
+            if (stage.descriptors.valid() &&
+                stage.descriptors.contents() != nullptr) {
+                const auto* descs = static_cast<const DeviceValueDesc*>(
+                    stage.descriptors.contents());
+                faults += " desc_len=[";
+                for (std::uint32_t i = 0; i < layout->value_count; ++i) {
+                    if (i != 0) faults += ",";
+                    faults += std::to_string(descs[i].len);
+                }
+                faults += "]";
+            }
+            break;
+        }
+    }
+    if (!faults.empty() && command->row_meta.valid() &&
+        command->row_meta.contents() != nullptr) {
+        const auto* meta =
+            static_cast<const M3RowMeta*>(command->row_meta.contents());
+        faults += "; row_meta[0] offset=" + std::to_string(meta[0].offset) +
+                  " count=" + std::to_string(meta[0].count) +
+                  " mtp_offset=" + std::to_string(meta[0].mtp_offset);
+    }
+    if (!faults.empty() && error.empty()) {
+        error = "Metal M3 group reported a device fault (" + faults +
+                "); fault 0x100 is the lane-table ABI/shape guard, any other "
+                "value is the PTIR op tag the runtime could not execute";
     }
     std::uint64_t timestamps[2] = {0, 0};
-    command->target->resolve_timestamps(
-        command->timestamp_heap, 2, timestamps);
+    if (command->timestamp_heap != nullptr) {
+        command->target->resolve_timestamps(
+            command->timestamp_heap, 2, timestamps);
+    }
     if (timestamps[1] > timestamps[0]) {
         command->stats.post_forward_critical_ns =
             timestamps[1] - timestamps[0];

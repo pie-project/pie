@@ -17,7 +17,7 @@
 use crate::types::{BackendKind, DType, QuantScheme, RepackLayout, RowMap};
 
 /// Sentinel for "no buffer", mirroring the C++ `numeric_limits<uint32_t>::max()`
-/// defaults on `PieLoaderStorageInstrView::buffer_id` and `slab_file_id`.
+/// default on `PieLoaderStorageInstrView::buffer_id`.
 pub const PIE_LOADER_NO_BUFFER: u32 = u32::MAX;
 
 /// Sentinel for "no source tensor", on the optional tensor-id fields.
@@ -29,13 +29,12 @@ pub const PIE_LOADER_NO_TENSOR: u32 = u32::MAX;
 // producing a plan the device cannot run.
 //
 // These live here, in the module that owns the C surface, because the header is
-// where they have to be correct. `crate::load_plan` re-exports them under short
-// names for use inside the compiler.
-// `crate::plan` states the same seven bits. Restated here rather than aliased
-// because cbindgen emits a literal and cannot follow a path — and because the
-// arrow used to run the other way, with `load_plan.rs` importing its own
-// serialization format's constants. Two independent statements, checked below,
-// is the same shape as the loader/driver cross-check in `ffi/mod.rs`.
+// where they have to be correct. `crate::plan` states the same six bits.
+// Restated here rather than aliased because cbindgen emits a literal and cannot
+// follow a path — and because the arrow used to run the other way, with the
+// compiler importing its own serialization format's constants. Two independent
+// statements, checked below, is the same shape as the loader/driver cross-check
+// in `ffi/mod.rs`.
 pub const PIE_LOADER_TILE_MAP_CAST: u32 = 1 << 0;
 pub const PIE_LOADER_TILE_MAP_DECODE: u32 = 1 << 1;
 pub const PIE_LOADER_TILE_MAP_ENCODE: u32 = 1 << 2;
@@ -85,8 +84,9 @@ impl TryFrom<u32> for PieLoaderBackendKind {
 }
 
 #[repr(u32)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PieLoaderDType {
+    #[default]
     F32 = 0,
     F16 = 1,
     BF16 = 2,
@@ -99,7 +99,11 @@ pub enum PieLoaderDType {
     U16 = 9,
     U8 = 10,
     Bool = 11,
+    // Appended after `Bool` so existing discriminants keep their values: the
+    // enum is an ABI, not a declaration order.
     E8M0 = 12,
+    I64 = 13,
+    U64 = 14,
 }
 
 impl From<DType> for PieLoaderDType {
@@ -118,6 +122,8 @@ impl From<DType> for PieLoaderDType {
             DType::U8 => Self::U8,
             DType::Bool => Self::Bool,
             DType::E8M0 => Self::E8M0,
+            DType::I64 => Self::I64,
+            DType::U64 => Self::U64,
         }
     }
 }
@@ -140,6 +146,8 @@ impl From<PieLoaderDType> for DType {
             PieLoaderDType::U8 => Self::U8,
             PieLoaderDType::Bool => Self::Bool,
             PieLoaderDType::E8M0 => Self::E8M0,
+            PieLoaderDType::I64 => Self::I64,
+            PieLoaderDType::U64 => Self::U64,
         }
     }
 }
@@ -299,6 +307,8 @@ impl TryFrom<u32> for PieLoaderDType {
             10 => Self::U8,
             11 => Self::Bool,
             12 => Self::E8M0,
+            13 => Self::I64,
+            14 => Self::U64,
             other => return Err(other),
         })
     }
@@ -480,6 +490,12 @@ pub struct PieLoaderSourceExtentView {
     pub file_offset: u64,
     pub span_bytes: u64,
     pub stride: PieLoaderStridedExtentView,
+    /// The type these bytes are read as. Not necessarily
+    /// `PieLoaderPlan::sources[tensor_id].dtype`: a contract that reinterprets
+    /// a tensor with `Bitcast` -- DeepSeek-V4's E8M0 block scales are stored
+    /// as `U8` -- says so here, and an executor that consulted the source
+    /// table instead would undo the reinterpretation.
+    pub dtype: PieLoaderDType,
 }
 
 #[repr(C)]
@@ -508,8 +524,9 @@ pub type PieLoaderTensorDeclSlice = PieLoaderSlice<PieLoaderTensorDeclView>;
 
 /// How a scale tensor's entries map onto the tensor they scale.
 #[repr(u32)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PieLoaderQuantGranularity {
+    #[default]
     PerChannel = 0,
     PerGroup = 1,
 }
@@ -520,9 +537,10 @@ pub enum PieLoaderQuantGranularity {
 /// not how the kernel wants them. The driver used to infer this from
 /// `group_size == 32`.
 #[repr(u32)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PieLoaderScaleForm {
     /// Raw E8M0 exponent bytes, consumed as-is.
+    #[default]
     RawE8M0 = 0,
     /// F32 multipliers; expand before the GEMM sees them.
     F32Factors = 1,
@@ -533,8 +551,7 @@ pub enum PieLoaderScaleForm {
 /// Both are entries in [`PieLoaderPlan::tensors`], named by `id`. The driver has
 /// to know the pairing in order to attach the quant metadata its kernels read;
 /// it used to rediscover it by matching name suffixes over the tensor list,
-/// which guessed at something the loader states here (`load_plan.rs`'s
-/// `derive_quant_attachments`).
+/// which guessed at something stated here.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct PieLoaderQuantAttachmentView {
@@ -614,16 +631,6 @@ pub struct PieLoaderBufferDeclView {
 
 pub type PieLoaderBufferDeclSlice = PieLoaderSlice<PieLoaderBufferDeclView>;
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct PieLoaderSlabPlacementView {
-    pub src_offset: u64,
-    pub dest_offset: u64,
-    pub bytes: u64,
-}
-
-pub type PieLoaderSlabPlacementSlice = PieLoaderSlice<PieLoaderSlabPlacementView>;
-
 /// One entry of the plan's instruction stream: an identity, and an operation.
 ///
 /// `id` is the schedule's handle on this instruction and is the only thing every
@@ -649,8 +656,8 @@ pub struct PieLoaderStorageInstrView {
 /// can only apologise for.
 ///
 /// The discriminants are the wire tag and are written out for the same reason
-/// the mirror enums' are — 4 is absent because a retired instruction had it, and
-/// renumbering to close the gap would silently move six others.
+/// the mirror enums' are — 4 and 7 are absent because retired instructions had
+/// them, and renumbering to close a gap would silently move every tag above it.
 #[repr(C, u32)]
 #[derive(Clone, Copy, Debug)]
 pub enum PieLoaderStorageOp {
@@ -723,12 +730,6 @@ pub enum PieLoaderStorageOp {
         source: PieLoaderSourceExtentView,
         dest_offset: u64,
     } = 6,
-    SlabScatter {
-        file_id: u32,
-        file_offset: u64,
-        span_bytes: u64,
-        placements: PieLoaderSlabPlacementSlice,
-    } = 7,
     Fill {
         buffer_id: u32,
     } = 8,

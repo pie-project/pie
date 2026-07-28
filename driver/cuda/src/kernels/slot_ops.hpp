@@ -11,19 +11,6 @@
 
 namespace pie_cuda_driver {
 
-struct SlabScatterPlacement {
-    std::uint64_t src_offset;
-    std::uint64_t dest_offset;
-    std::uint64_t bytes;
-};
-
-void launch_slab_scatter(
-    const std::uint8_t* src,
-    std::uint8_t* dst,
-    const SlabScatterPlacement* placements,
-    std::size_t placement_count,
-    cudaStream_t stream);
-
 void launch_zero_slots_if_fresh(
     std::uint8_t* base,
     std::size_t slot_bytes,

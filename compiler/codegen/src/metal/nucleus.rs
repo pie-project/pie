@@ -303,16 +303,22 @@ pub fn emit_grouped_nucleus(
     stage: &CompiledStage,
     region: &Region,
 ) -> Result<String, String> {
+    let scaled = region.inputs.len() == 5;
     if library_op_byte(region) != LibraryOp::NucleusSample as u8
         || !library_region_valid(stage, region)
-        || region.inputs.len() < 3
+        || !(region.inputs.len() == 3 || scaled)
         || region.outputs.is_empty()
     {
         return Err("invalid grouped nucleus library region".to_string());
     }
-    let logits_value = region.inputs[0];
-    let top_p_value = region.inputs[1];
-    let state_value = region.inputs[2];
+    // The scaled arity carries the pre-division logits and the divisor ahead of
+    // the operands this kernel reads. The scaled logits at index 2 are a real
+    // materialized value -- `compile.rs` refuses the match if any library input
+    // is produced inside the region, so the Div ran as its own region and left
+    // the result in scratch -- so the body below is identical for both forms.
+    let logits_value = region.inputs[if scaled { 2 } else { 0 }];
+    let top_p_value = region.inputs[if scaled { 3 } else { 1 }];
+    let state_value = region.inputs[if scaled { 4 } else { 2 }];
     let output_value = region.outputs[0];
 
     let mut source = String::new();

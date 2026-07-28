@@ -42,6 +42,13 @@ struct InstanceRecord {
     std::uint64_t instance_id = 0;
     std::uint64_t program_id = 0;
     std::uint64_t program_hash = 0;
+    /// What the runtime classified this instance as. The driver used to infer
+    /// "does this need descriptor resolution?" from the trace's port shapes,
+    /// which predates the class travelling on the wire and disagrees with it:
+    /// a decode envelope that leaves `pages` constant produces six of the seven
+    /// ports `is_loop_carried_explicit_geometry_trace` demands, so the driver
+    /// silently used the wire's placeholder geometry.
+    std::uint32_t geometry_class = PIE_GEOMETRY_CLASS_HOST;
     std::vector<std::uint64_t> channel_ids;
     std::uint64_t fire_seq = 0;
     InterpInstance interp;

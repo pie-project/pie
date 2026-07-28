@@ -269,6 +269,20 @@ bool build_member_forward_desc(
                 desc.kv_last_page_len =
                     view.kv_last_page_lens.data()[member];
             }
+            // A wire fire that names KV pages is paged, exactly as a resolved
+            // one is. The sealed M=1 ring path used to claim every wire fire,
+            // so a prefill posted on the wire landed in the ring while the
+            // decode that continues it -- device-resolved, therefore paged --
+            // could not find its history. The two halves of one sequence have
+            // to agree on where the KV lives.
+            if (!desc.kv_pages.empty()) {
+                desc.requires_paged = true;
+                desc.qo_indptr = {
+                    0u, static_cast<std::uint32_t>(desc.token_ids.size())};
+                desc.kv_page_indptr = {
+                    0u, static_cast<std::uint32_t>(desc.kv_pages.size())};
+                desc.kv_last_page_lens = {desc.kv_last_page_len};
+            }
         }
     }
 

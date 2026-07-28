@@ -163,20 +163,33 @@ private:
                     "rust storage executor: non-compact Cast source is not "
                     "implemented");
             }
-            const auto& info = plan_index_.source(instr.source.tensor_id);
             DeviceTensor scratch =
                 DeviceTensor::allocate(
-                    dtype_from_rust(info.dtype),
+                    dtype_from_rust(instr.source.dtype),
                     pie_loader::extent_shape(instr.source.stride));
             if (scratch.nbytes() != instr.source.span_bytes) {
                 throw std::runtime_error(
                     "rust storage executor: Cast source byte size mismatch");
             }
+#if PIE_CUDA_TRANSCODE_ENGINE_HAS_CUDA
+            // Stream-0 H2D: `cast_tensor_to_ptr` launches on stream 0 and reads
+            // this scratch immediately. The batched/pinned `queue()` path lands
+            // on a private copy stream with no flush before the kernel, so the
+            // cast would read an unwritten buffer -- every DeepSeek-V4 block
+            // scale decoded to zero, and every quantized GEMM with it.
+            copy_engine_.queue_on_stream(
+                instr.source.file_id,
+                instr.source.file_offset + instr.source.stride.base_offset,
+                instr.source.span_bytes,
+                scratch.data(),
+                /*stream=*/0);
+#else
             copy_engine_.queue(
                 instr.source.file_id,
-                instr.source.file_offset,
+                instr.source.file_offset + instr.source.stride.base_offset,
                 instr.source.span_bytes,
                 scratch.data());
+#endif
             cast_tensor_to_ptr(scratch, dst, out.dtype());
             return;
         }
@@ -204,8 +217,7 @@ private:
         };
         DeviceTensor source;
         if (instr.has_source) {
-            const auto& info = plan_index_.source(instr.source.tensor_id);
-            const DType source_dtype = dtype_from_rust(info.dtype);
+            const DType source_dtype = dtype_from_rust(instr.source.dtype);
             const bool compact = pie_loader::compact_extent(instr.source.stride);
 #if PIE_CUDA_TRANSCODE_ENGINE_HAS_CUDA
             // Reuse a persistent device tile buffer for compact sources — the
@@ -830,26 +842,64 @@ private:
     }
 #endif
 
-    DeviceTensor materialize_repack_source(
+    // Stage the bytes a Repack reads, reusing the block staged for the tile map
+    // before it when both read the same extent.
+    //
+    // The compiler puts tile maps that share a source next to each other (see
+    // `group-shared-source-reads`), so remembering one block is enough to serve
+    // them all: GPT-OSS cuts its gate and up projections from a single
+    // `gate_up_proj` block and would otherwise stage every one of them twice.
+    //
+    // Reuse is safe because the staging copy and the repack kernel that reads it
+    // both run on stream 0, so the copy has landed before any kernel that sees
+    // the block, and because repack kernels only ever read their source.
+    const DeviceTensor& materialize_repack_source(
         const lp::PieLoaderStorageOp::TileMap_Body& instr)
     {
         if (instr.has_source) {
+            const bool compact = pie_loader::compact_extent(instr.source.stride);
+            const StagedSource staged{
+                /*valid=*/compact,
+                instr.source.file_id,
+                instr.source.file_offset + instr.source.stride.base_offset,
+                instr.source.span_bytes};
+            if (staged.valid && staged == staged_source_) {
+                return repack_source_;
+            }
+            // Drop the previous block before taking the next so that two are
+            // never resident at once.
+            repack_source_ = DeviceTensor{};
+            staged_source_ = StagedSource{};
             DeviceTensor scratch = DeviceTensor::allocate(
                 DType::UINT8,
                 {static_cast<std::int64_t>(instr.source.span_bytes)});
-            if (!pie_loader::compact_extent(instr.source.stride)) {
+            if (!compact) {
                 copy_strided_extent_to_device(
                     loader_, instr.source,
                     scratch.data(),
                     scratch.nbytes());
             } else {
+#if PIE_CUDA_TRANSCODE_ENGINE_HAS_CUDA
+                // Stream-0 H2D for the same reason as the Cast path: the repack
+                // kernel that consumes this scratch runs on stream 0 with no
+                // intervening flush.
+                copy_engine_.queue_on_stream(
+                    staged.file_id,
+                    staged.file_offset,
+                    staged.span_bytes,
+                    scratch.data(),
+                    /*stream=*/0);
+#else
                 copy_engine_.queue(
-                    instr.source.file_id,
-                    instr.source.file_offset + instr.source.stride.base_offset,
-                    instr.source.span_bytes,
+                    staged.file_id,
+                    staged.file_offset,
+                    staged.span_bytes,
                     scratch.data());
+#endif
             }
-            return scratch;
+            repack_source_ = std::move(scratch);
+            staged_source_ = staged;
+            return repack_source_;
         }
         if (instr.input_buffers.len != 1) {
             throw std::runtime_error(
@@ -857,6 +907,8 @@ private:
         }
         const DeviceTensor& input =
             resolver_.or_finalized(instr.input_buffers.ptr[0]);
+        repack_source_ = DeviceTensor{};
+        staged_source_ = StagedSource{};
         DeviceTensor scratch = DeviceTensor::allocate(
             DType::UINT8,
             {static_cast<std::int64_t>(input.nbytes())});
@@ -871,7 +923,8 @@ private:
         throw std::runtime_error(
             "rust storage executor: CUDA Repack compiled without CUDA headers");
 #endif
-        return scratch;
+        repack_source_ = std::move(scratch);
+        return repack_source_;
     }
 
     void repack_tile_map(
@@ -908,7 +961,7 @@ private:
         DeviceTensor& output = resolver_.tensor(instr.output_buffers.ptr[0]);
         auto* dst_base = static_cast<std::uint8_t*>(output.data()) +
             instr.dest.offset + instr.dest.stride.base_offset;
-        DeviceTensor source = materialize_repack_source(instr);
+        const DeviceTensor& source = materialize_repack_source(instr);
         const auto* src_base =
             static_cast<const std::uint8_t*>(source.data());
         const auto row_map = repack_row_map(instr.row_map);
@@ -1090,12 +1143,25 @@ private:
     }
 
 
+    // The checkpoint extent currently held in `repack_source_`. A strided read
+    // is never cached, so `valid` also says "this holds a whole block".
+    struct StagedSource {
+        bool valid = false;
+        std::uint32_t file_id = 0;
+        std::uint64_t file_offset = 0;
+        std::uint64_t span_bytes = 0;
+
+        bool operator==(const StagedSource& other) const = default;
+    };
+
     pie_loader::CheckpointSource& loader_;
     WeightCopyEngine& copy_engine_;
     const pie_loader::LoadPlanIndex& plan_index_;
     BufferResolver& resolver_;
     void* fp8_bf16_scratch_ptr_ = nullptr;
     std::size_t fp8_bf16_scratch_bytes_ = 0;
+    DeviceTensor repack_source_;
+    StagedSource staged_source_;
     struct CachedFp8Scale { void* data = nullptr; std::size_t nbytes = 0; };
     std::unordered_map<std::string, CachedFp8Scale> fp8_scale_cache_;
     void* fp8_scale_local_ptr_ = nullptr;

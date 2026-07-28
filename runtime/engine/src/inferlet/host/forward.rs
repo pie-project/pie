@@ -184,6 +184,7 @@ async fn materialize_channel(
         None
     };
     let mut settle_ready_take = true;
+    let mut woke_us = 0u64;
     loop {
         let state = accessor
             .with(|mut access| poll_channel(access.get(), &this, mode, false, settle_ready_take))?;
@@ -214,7 +215,10 @@ async fn materialize_channel(
         };
 
         match state {
-            ChannelPoll::Ready(value) => return Ok(value),
+            ChannelPoll::Ready(value) => {
+                accessor.with(|mut access| access.get().note_take_returned(woke_us));
+                return Ok(value);
+            }
             ChannelPoll::Finalize(_) => unreachable!("finalizer gate required before FIFO pop"),
             ChannelPoll::Pending { cell, fires, .. } => {
                 settle_ready_take = true;
@@ -228,6 +232,7 @@ async fn materialize_channel(
                 if let Some(pid) = trace_pid {
                     crate::planner::trace_mark!("build", pid, "rx-wake");
                 }
+                woke_us = crate::scheduler::fire_timing_now_us();
             }
         }
     }
@@ -252,6 +257,7 @@ impl pie::inferlet::forward::Host for ProcessCtx {
         }
         crate::inferlet::process::ensure_execution_admitted(self).await;
         crate::inferlet::process::gate::residency_gate(self).await?;
+        self.note_submit();
         crate::pipeline::fire::submit_frame(self, on, slot_reps).await
     }
 }

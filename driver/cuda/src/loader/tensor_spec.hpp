@@ -55,13 +55,9 @@ struct LoadExecutionStats {
     std::size_t h2d_copy_count = 0;
     std::size_t h2d_bulk_copy_count = 0;
     std::size_t h2d_pinned_copy_count = 0;
-    std::size_t slab_scatter_count = 0;
-    std::size_t slab_scatter_placements = 0;
     std::uint64_t h2d_copy_bytes = 0;
     std::uint64_t h2d_bulk_copy_bytes = 0;
     std::uint64_t h2d_pinned_copy_bytes = 0;
-    std::uint64_t slab_scatter_source_bytes = 0;
-    std::uint64_t slab_scatter_payload_bytes = 0;
     std::size_t copy_stream_flushes = 0;
     std::size_t max_pending_copies_seen = 0;
     std::size_t h2d_batch_calls = 0;
@@ -69,7 +65,7 @@ struct LoadExecutionStats {
     // instruction); surfaced only when PIE_LOAD_EXECUTOR_PROFILE is set.
     double phase_alloc_ms = 0;          // device buffer/arena allocation
     double phase_transfer_ms = 0;       // staged H2D copy + stream sync (flush)
-    double phase_transform_ms = 0;      // slab-scatter / tile-map / finalize (GPU)
+    double phase_transform_ms = 0;      // tile-map / finalize (GPU)
     double phase_pinned_alloc_ms = 0;   // one-time reader-lane pinned staging alloc
 };
 

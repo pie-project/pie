@@ -30,6 +30,42 @@
       "instrs_before": 42,
       "instrs_after": 32,
       "rewrites": 10
+    },
+    {
+      "pass": "group-shared-source-reads",
+      "instrs_before": 32,
+      "instrs_after": 32,
+      "rewrites": 0
+    },
+    {
+      "pass": "merge-adjacent-extent-writes",
+      "instrs_before": 32,
+      "instrs_after": 32,
+      "rewrites": 0
+    },
+    {
+      "pass": "recompute-memory-plan",
+      "instrs_before": 32,
+      "instrs_after": 32,
+      "rewrites": 0
+    },
+    {
+      "pass": "validate-fill-order",
+      "instrs_before": 32,
+      "instrs_after": 32,
+      "rewrites": 0
+    },
+    {
+      "pass": "validate-target-support",
+      "instrs_before": 32,
+      "instrs_after": 32,
+      "rewrites": 0
+    },
+    {
+      "pass": "validate-persistent-layout",
+      "instrs_before": 32,
+      "instrs_after": 32,
+      "rewrites": 0
     }
   ],
   "files": [
@@ -681,7 +717,8 @@
                 "dst_stride": 1
               }
             ]
-          }
+          },
+          "dtype": "BF16"
         },
         "dest_offset": 0
       }
@@ -704,7 +741,8 @@
                 "dst_stride": 1
               }
             ]
-          }
+          },
+          "dtype": "BF16"
         },
         "dest_offset": 689664
       }
@@ -727,7 +765,8 @@
                 "dst_stride": 1
               }
             ]
-          }
+          },
+          "dtype": "BF16"
         },
         "dest_offset": 296448
       }
@@ -750,7 +789,8 @@
                 "dst_stride": 1
               }
             ]
-          }
+          },
+          "dtype": "BF16"
         },
         "dest_offset": 755200
       }
@@ -773,7 +813,8 @@
                 "dst_stride": 1
               }
             ]
-          }
+          },
+          "dtype": "BF16"
         },
         "dest_offset": 427520
       }
@@ -796,7 +837,8 @@
                 "dst_stride": 1
               }
             ]
-          }
+          },
+          "dtype": "BF16"
         },
         "dest_offset": 820736
       }
@@ -819,7 +861,8 @@
                 "dst_stride": 1
               }
             ]
-          }
+          },
+          "dtype": "BF16"
         },
         "dest_offset": 558592
       }
@@ -842,7 +885,8 @@
                 "dst_stride": 1
               }
             ]
-          }
+          },
+          "dtype": "BF16"
         },
         "dest_offset": 886272
       }

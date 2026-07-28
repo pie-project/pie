@@ -1904,9 +1904,22 @@ namespace {
 
 struct EnqProfile {
     enum Phase { kUploads = 0, kCompose, kAttnPlan, kForward, kOther,
-                 kPhaseCount };
+                 kBeginEnq, kGeometry, kPhaseCount };
     std::array<std::uint64_t, kPhaseCount> ns{};
     std::array<std::uint64_t, kPhaseCount> hits{};
+    // Steady-state only: the first steps pay one-time costs (cold pinned
+    // plan-staging slots cost 3-20ms EACH, `cudaMallocHost` on first
+    // rotation) that swamp the per-step averages and made `enq.attn_plan`
+    // read as a 2.5ms steady cost when its steady value is ~2us.
+    std::uint64_t steps = 0;
+    static std::uint64_t warmup() {
+        static const std::uint64_t n = [] {
+            const char* v = std::getenv("PIE_STEP_PROFILE_WARMUP");
+            return (v != nullptr && v[0] != '\0')
+                ? std::strtoull(v, nullptr, 10) : 32ull;
+        }();
+        return n;
+    }
     static bool enabled() {
         static const bool on = [] {
             const char* v = std::getenv("PIE_STEP_PROFILE");
@@ -1919,7 +1932,9 @@ struct EnqProfile {
         if (!enabled()) return;
         static const char* names[kPhaseCount] = {
             "enq.uploads", "enq.compose", "enq.attn_plan", "enq.forward",
-            "enq.other"};
+            "enq.other", "enq.begin", "enq.geometry"};
+        std::cerr << "[step-profile] steady steps=" << steps
+                  << " (warmup " << warmup() << " skipped)\n";
         for (int i = 0; i < kPhaseCount; ++i) {
             if (hits[i] == 0) continue;
             std::cerr << "[step-profile] " << names[i]
@@ -1941,6 +1956,8 @@ class EnqTimer {
         if (!on_ || stopped_) return;
         stopped_ = true;
         auto& p = EnqProfile::instance();
+        if (phase_ == EnqProfile::kBeginEnq) ++p.steps;
+        if (p.steps <= EnqProfile::warmup()) return;
         p.ns[phase_] += static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - start_).count());
@@ -1963,12 +1980,18 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
     auto& pi = engine.inputs;
     auto& cublas = engine.cublas;
 
-    engine.dispatch->begin_enqueue(*s.staged);
+    {
+        EnqTimer begin_timer(EnqProfile::kBeginEnq);
+        engine.dispatch->begin_enqueue(*s.staged);
+    }
     // Original wave order: the Prologue (begin_enqueue) runs against the
     // pre-resolution state; the resolved geometry lands on the wave only
     // now, before every later phase (attention hooks, Epilogue, settle).
-    engine.dispatch->update_launch_geometry(
-        *s.staged, s.dispatch_view, s.program_token_starts);
+    {
+        EnqTimer geometry_timer(EnqProfile::kGeometry);
+        engine.dispatch->update_launch_geometry(
+            *s.staged, s.dispatch_view, s.program_token_starts);
+    }
 
     // Wake the follower FIRST, before this rank's uploads, compose and payload
     // broadcast, so it gets that window as a head start. Rank 0 pre-enqueues

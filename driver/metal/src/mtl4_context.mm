@@ -1067,14 +1067,17 @@ uint64_t RawMetalContext::arg_slot_address(int ordinal, uint8_t bind_index) cons
 void RawMetalContext::release_argtable_ordinal(int ordinal) {
     auto& I = *impl_;
     [I.argtables removeObjectForKey:@(argkey(ordinal))];
-    for (auto iterator = I.bound_arg_slots.begin();
-         iterator != I.bound_arg_slots.end();) {
-        if (static_cast<std::uint32_t>(*iterator >> 8) ==
-            static_cast<std::uint32_t>(ordinal)) {
-            I.bound_arg_addresses.erase(*iterator);
-            iterator = I.bound_arg_slots.erase(iterator);
-        } else {
-            ++iterator;
+    // A key is (ordinal << 8) | bind_index and bind_index is a uint8_t, so an
+    // ordinal owns at most 256 keys and they can be probed directly. Scanning
+    // the whole set instead was O(all bound slots) per released ordinal, and
+    // the prefill alone binds ~123k of them (34 token DAGs x 363 dispatches x
+    // their slots) -- 2.7ms per fire, which was the entire remaining host gap
+    // between two forwards.
+    for (std::uint32_t bind = 0; bind < 256u; ++bind) {
+        const std::uint64_t key =
+            (static_cast<std::uint64_t>(static_cast<std::uint32_t>(ordinal)) << 8) | bind;
+        if (I.bound_arg_slots.erase(key) != 0) {
+            I.bound_arg_addresses.erase(key);
         }
     }
 }
@@ -1299,6 +1302,12 @@ std::uint64_t RawMetalContext::device_cache_id() const {
         hash *= 0x100000001b3ULL;
     }
     return hash;
+}
+
+uint32_t RawMetalContext::pso_max_threads(Pso pso) const {
+    if (pso.obj == nullptr) return 0;
+    auto p = (__bridge id<MTLComputePipelineState>)pso.obj;
+    return static_cast<uint32_t>(p.maxTotalThreadsPerThreadgroup);
 }
 
 void* RawMetalContext::create_timestamp_heap(uint32_t count) {
