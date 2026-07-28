@@ -2392,6 +2392,15 @@ M1ExecuteOutcome M1Runtime::finish_m2_command(
     return M1ExecuteOutcome::Failed;
 }
 
+// `PIE_METAL_M3_GPU_TIMESTAMPS=1` re-enables the per-fire GPU counter sampling.
+static bool m3_gpu_timestamps_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("PIE_METAL_M3_GPU_TIMESTAMPS");
+        return e != nullptr && e[0] != '\0' && e[0] != '0';
+    }();
+    return on;
+}
+
 bool M1Runtime::prepare_m3_group(
     const std::vector<M3LaneCandidate>& candidates,
     RawMetalContext& target,
@@ -2466,7 +2475,14 @@ bool M1Runtime::prepare_m3_group(
     group->commit = impl_->grouped_commit;
     group->readiness_ordinal = impl_->next_ordinal++;
     group->commit_ordinal = impl_->next_ordinal++;
-    group->timestamp_heap = target.create_timestamp_heap(2);
+    // GPU counter sampling for the M3 epilogue, off unless asked for. It buys
+    // one diagnostic stat (post_forward_critical_ns) and costs a counter-heap
+    // create, a resolveCounterRange and a release on EVERY fire --- measured at
+    // 5.0ms of a ~13ms token, which is the entire host gap between two forwards
+    // and, because the GPU is idle across it, most of the reason the clock
+    // drops. The host-clock fallback below reports the same span for free.
+    if (m3_gpu_timestamps_enabled())
+        group->timestamp_heap = target.create_timestamp_heap(2);
     const std::size_t lane_count = candidates.size();
     const std::size_t lane_bytes =
         sizeof(PtirLaneTableHeader) +
@@ -3215,8 +3231,10 @@ std::vector<M1ExecuteOutcome> M1Runtime::finish_m3_group(
                 "value is the PTIR op tag the runtime could not execute";
     }
     std::uint64_t timestamps[2] = {0, 0};
-    command->target->resolve_timestamps(
-        command->timestamp_heap, 2, timestamps);
+    if (command->timestamp_heap != nullptr) {
+        command->target->resolve_timestamps(
+            command->timestamp_heap, 2, timestamps);
+    }
     if (timestamps[1] > timestamps[0]) {
         command->stats.post_forward_critical_ns =
             timestamps[1] - timestamps[0];
