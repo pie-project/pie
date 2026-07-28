@@ -8,12 +8,13 @@
 //! two inline expansions the single-lane form does not have — the MTP-draft
 //! argmax and the logits gather.
 
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt::Write as _;
 
-use pie_plan::{CompiledStage, Region};
+use pie_plan::{CompiledStage, Dimension, Region};
 
 use super::METAL_M2_MAX_FUSED_CHANNELS;
 use super::preamble::{RUNTIME_TEMPLATE, grouped_preamble};
@@ -25,6 +26,7 @@ const OP_CHAN_TAKE: u8 = 0x90;
 const OP_CHAN_READ: u8 = 0x91;
 const OP_CHAN_PUT: u8 = 0x92;
 const OP_INTRINSIC_VAL: u8 = 0xA0;
+const OP_RESHAPE: u8 = 0x39;
 
 const INTR_LOGITS: u16 = 0;
 const INTR_MTP_LOGITS: u16 = 1;
@@ -32,6 +34,18 @@ const INTR_MTP_DRAFTS: u16 = 6;
 
 fn value_ptr(value: u32) -> String {
     format!("scratch + offsets[{value}]")
+}
+
+/// Follow a chain of elided reshapes to the value that actually holds the bytes.
+fn resolve_alias(alias: &BTreeMap<u32, u32>, mut value: u32) -> u32 {
+    // The chain is acyclic (SSA), but bound the walk anyway.
+    for _ in 0..64 {
+        match alias.get(&value) {
+            Some(&source) => value = source,
+            None => break,
+        }
+    }
+    value
 }
 
 /// The five operand slots `ptir_m1_execute` takes, defaulted to `scratch` the
@@ -45,6 +59,15 @@ struct Slots {
 }
 
 fn slots_for(op: &OpView, base: u32) -> Slots {
+    slots_for_aliased(op, base, &BTreeMap::new())
+}
+
+fn slots_for_aliased(
+    op: &OpView,
+    base: u32,
+    alias: &BTreeMap<u32, u32>,
+) -> Slots {
+    let value_ptr = |value: u32| value_ptr(resolve_alias(alias, value));
     let mut slots = Slots {
         a0: "scratch".to_string(),
         a1: "scratch".to_string(),
@@ -271,12 +294,59 @@ pub fn emit_grouped_fused_region(
              channel_{channel}.pending_cell);"
         );
     }
+    // A reshape that does not change the element count or dtype is a view, but
+    // the runtime still executes it as a byte-for-byte copy of the whole value.
+    // In the sampler's graph that is a vocabulary-wide round trip through device
+    // memory for nothing. Elide it and point its consumers at the source
+    // instead, as long as the result stays inside this region -- a region output
+    // or sink is read through its own offset by someone else, so those keep the
+    // copy.
+    let escapes: BTreeSet<u32> = region
+        .outputs
+        .iter()
+        .copied()
+        .chain(region.sinks.iter().map(|sink| sink.value))
+        .collect();
+    let mut alias: BTreeMap<u32, u32> = BTreeMap::new();
+    let value_types = &stage.normalized.value_types;
+    // Element count, and only when every extent is static: a symbolic dim could
+    // resolve differently for the two values and the copy would not be a view.
+    let static_elements = |value: u32| -> Option<u64> {
+        let ty = value_types.get(value as usize)?;
+        let mut total: u64 = 1;
+        for dim in &ty.dims {
+            match dim {
+                Dimension::Static(extent) => total *= u64::from(*extent),
+                Dimension::Symbolic(_) => return None,
+            }
+        }
+        Some(total)
+    };
+    let same_footprint = |a: u32, b: u32| {
+        match (value_types.get(a as usize), value_types.get(b as usize)) {
+            (Some(x), Some(y)) if x.dtype == y.dtype => {
+                matches!((static_elements(a), static_elements(b)),
+                         (Some(m), Some(n)) if m == n)
+            }
+            _ => false,
+        }
+    };
+
     for &node in &region.nodes {
         let Some(op) = ops.get(node as usize) else {
             return Err("grouped fused region node out of range".to_string());
         };
         let base = bases[node as usize];
-        let mut slots = slots_for(op, base);
+        if op.tag == OP_RESHAPE
+            && op.results == 1
+            && op.args.len() == 1
+            && !escapes.contains(&base)
+            && same_footprint(op.args[0], base)
+        {
+            alias.insert(base, resolve_alias(&alias, op.args[0]));
+            continue;
+        }
+        let mut slots = slots_for_aliased(op, base, &alias);
         if op.tag == OP_INTRINSIC_VAL && op.intr == INTR_MTP_DRAFTS {
             emit_mtp_drafts(&mut source, base, &slots.o0);
             source.push_str(BARRIER);
