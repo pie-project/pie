@@ -384,6 +384,11 @@ pub struct PlannerStats {
     /// Nonzero means the fleet reached the state that used to lose requests
     /// at high oversubscription.
     pub salvages: AtomicU64,
+    /// Asks served out of FCFS order by the last rung before destruction,
+    /// because the head's own hoard covered them and the head itself was
+    /// uncoverable. Nonzero means the fleet reached the head-of-line wedge
+    /// that used to destroy a request over a fundable pool (§20.17).
+    pub hoard_bypasses: AtomicU64,
     /// Evictions that had to relax the E6 post-restore hysteresis because
     /// no normally-eligible victim could fund the head. Nonzero means the
     /// fleet reached the state that used to destroy a request (§18.7).
@@ -443,6 +448,7 @@ pub struct PlannerDiagnostics {
     pub hog_failures_total: u64,
     pub starvations_total: u64,
     pub salvages_total: u64,
+    pub hoard_bypasses_total: u64,
     pub e6_relaxations_total: u64,
     pub host_swap_exhaustions_total: u64,
     pub host_swap_unblocks_total: u64,
@@ -501,9 +507,7 @@ impl VictimSet {
             .map(|v| (v.pid, v.seq))
             .collect()
     }
-
 }
-
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Residency {
@@ -657,12 +661,20 @@ impl Inner {
 /// port/store outside it.
 enum Step {
     /// The head still misses `count` device pages; pull them from the pool.
-    Absorb { count: u32 },
+    Absorb {
+        count: u32,
+    },
     /// The head's KV side is covered; finish an allocation with `rs` slots.
-    ServeAllocation { key: EntryKey, demand: Demand },
+    ServeAllocation {
+        key: EntryKey,
+        demand: Demand,
+    },
     /// The head is a restore whose recorded demand is covered; re-validate
     /// its swapped count and board it.
-    ServeRestore { key: EntryKey, pid: ProcessId },
+    ServeRestore {
+        key: EntryKey,
+        pid: ProcessId,
+    },
     /// Nobody waits: return the stranded accumulation to the pool.
     Release(DevicePageReservation),
     Done,
@@ -770,8 +782,7 @@ impl ResidencyPlanner {
     /// re-arms rung 0 (the idle-reclaim scan may find work again). Every
     /// caller pairs it with a poke; only the poke's condition differs.
     fn re_arm_idle_reclaim(&self) {
-        self.idle_reclaim_exhausted
-            .store(false, Ordering::Release);
+        self.idle_reclaim_exhausted.store(false, Ordering::Release);
     }
 
     /// The `(model, driver)` pair this planner manages.
@@ -1198,8 +1209,7 @@ impl ResidencyPlanner {
                         .swap(true, std::sync::atomic::Ordering::AcqRel)
                         && self.port.reclaim_idle() > 0
                     {
-                        self.idle_reclaim_exhausted
-                            .store(false, Ordering::Release);
+                        self.idle_reclaim_exhausted.store(false, Ordering::Release);
                         continue;
                     }
                     self.plan_eviction();
@@ -1227,7 +1237,10 @@ impl ResidencyPlanner {
                         }
                         let kv = inner.accum.donate(demand.kv_pages as usize);
                         let waiter = inner.queue.get_mut(&key).expect("head exists");
-                        let WaitKind::Allocation { outcome, notify, .. } = &mut waiter.kind else {
+                        let WaitKind::Allocation {
+                            outcome, notify, ..
+                        } = &mut waiter.kind
+                        else {
                             unreachable!("ServeAllocation only targets allocation entries");
                         };
                         debug_assert!(outcome.is_none(), "unserved head carries no outcome");
@@ -1721,6 +1734,106 @@ impl ResidencyPlanner {
         true
     }
 
+    /// Last rung before destruction: serve the OLDEST queued ask that the
+    /// head's own hoard already covers, head-of-line order be damned.
+    ///
+    /// `plan` accumulates head-first, so an uncoverable head pulls every
+    /// free page into `accum` and sits on it. When the pool can only ever
+    /// be completed by the processes currently holding it, those hoarded
+    /// pages are exactly what those holders need to finish and release.
+    /// Measured (§20.17): four processes holding 61 pages each of a
+    /// 256-page pool parked asking for ONE page apiece, while a 61-page
+    /// head hoarded the 12 pages that would have served all four — and the
+    /// starvation rung then destroyed a request over a pool that was
+    /// fundable all along. The queue was wedged by FCFS alone, not by
+    /// exhaustion.
+    ///
+    /// Strict FCFS is worth an unbounded wait; it is not worth a destroyed
+    /// request. So the inversion is admitted HERE and nowhere else: only
+    /// inside the wedge, only once the head is proven uncoverable by
+    /// salvage and eviction both, and only for an ask the hoard already
+    /// covers in full. Every earlier rung keeps its exact behaviour, and
+    /// the only path this can divert is one that would otherwise return a
+    /// `Starved` error.
+    ///
+    /// It cannot spin: each bypass moves one waiter to SERVED (which also
+    /// un-wedges the predicate until it is collected) and strictly shrinks
+    /// the hoard, so at most `accum.len()` asks can be diverted before the
+    /// rung stops finding one and destruction proceeds as before. A served
+    /// waiter runs, completes and returns at least what it took.
+    ///
+    /// Restores are deliberately NOT bypassable: boarding one is a
+    /// multi-step handoff through `spawn_restore`, and the measured wedge
+    /// is an allocation wedge. A queue of pure restores falls through to
+    /// destruction exactly as it does today.
+    fn serve_from_hoard(self: &Arc<Self>) -> bool {
+        let Some((key, demand)) = self.with_inner(|inner| {
+            let (head_key, _) = inner.unmet_head()?;
+            let hoard = inner.accum.len() as u32;
+            inner.queue.iter().find_map(|(&key, waiter)| {
+                if key == head_key || !waiter.is_unmet() {
+                    return None;
+                }
+                match &waiter.kind {
+                    WaitKind::Allocation { demand, .. } if demand.kv_pages <= hoard => {
+                        Some((key, *demand))
+                    }
+                    _ => None,
+                }
+            })
+        }) else {
+            return false;
+        };
+        let rs = if demand.rs_slots > 0 {
+            match self.port.reserve_rs(demand.rs_slots) {
+                Some(slots) => RsSlotReservation::new(slots, self.port.clone()),
+                None => return false,
+            }
+        } else {
+            RsSlotReservation::empty()
+        };
+        // Mirrors `Step::ServeAllocation`: re-validate under the lock, and
+        // hand a rejected RS reservation back OUT so it is dropped (which
+        // takes the store lock) outside the planner lock.
+        let outcome = self.with_inner(|inner| {
+            if (inner.accum.len() as u32) < demand.kv_pages {
+                return ServeOutcome::Stale(rs);
+            }
+            let Some(waiter) = inner.queue.get_mut(&key) else {
+                return ServeOutcome::Stale(rs);
+            };
+            let WaitKind::Allocation {
+                demand: queued,
+                outcome,
+                notify,
+                yielded,
+            } = &mut waiter.kind
+            else {
+                return ServeOutcome::Stale(rs);
+            };
+            if outcome.is_some() || *yielded || *queued != demand {
+                return ServeOutcome::Stale(rs);
+            }
+            let kv = inner.accum.donate(demand.kv_pages as usize);
+            *outcome = Some(Ok(AllocationGrant::new(demand, kv, rs)));
+            ServeOutcome::Served(notify.clone())
+        });
+        match outcome {
+            ServeOutcome::Served(notify) => {
+                self.stats.serves.fetch_add(1, Ordering::Relaxed);
+                self.stats.hoard_bypasses.fetch_add(1, Ordering::Relaxed);
+                ptrace!("hoard-bypass serve key={:?} kv={}", key, demand.kv_pages);
+                notify.notify_waiters();
+                self.poke();
+                true
+            }
+            ServeOutcome::Stale(rs) => {
+                drop(rs);
+                false
+            }
+        }
+    }
+
     fn check_starvation(self: &Arc<Self>, cause: StarveCause) {
         if !self.is_wedged() {
             return;
@@ -1752,6 +1865,13 @@ impl ResidencyPlanner {
         // a teardown to land.
         if self.salvage_free_pages() {
             self.poke();
+            return;
+        }
+        // Nothing can be assembled for the head. Before destroying anyone,
+        // check whether the head's own hoard already covers a younger ask —
+        // the head-of-line wedge (§20.17). Only reachable on a path that
+        // would otherwise return `Starved`.
+        if self.serve_from_hoard() {
             return;
         }
         // Trace-gated post-mortem: the exact state that reached destruction.
@@ -2007,9 +2127,7 @@ impl ResidencyPlanner {
         // victim parked on `HostSwapFull` may now fit.
         self.clear_host_swap_blocks();
         let (model, driver) = self.port.locus();
-        for handle in
-            crate::inferlet::process::residency::kv_suspend_handles(pid, model, driver)
-        {
+        for handle in crate::inferlet::process::residency::kv_suspend_handles(pid, model, driver) {
             handle.unfence();
         }
         let signal = self.with_inner(|inner| {
@@ -2163,6 +2281,7 @@ impl ResidencyPlanner {
             hog_failures_total: self.stats.hog_failures.load(Relaxed),
             starvations_total: self.stats.starvations.load(Relaxed),
             salvages_total: self.stats.salvages.load(Relaxed),
+            hoard_bypasses_total: self.stats.hoard_bypasses.load(Relaxed),
             e6_relaxations_total: self.stats.e6_relaxations.load(Relaxed),
             host_swap_exhaustions_total: self.stats.host_swap_exhaustions.load(Relaxed),
             host_swap_unblocks_total: self.stats.host_swap_unblocks.load(Relaxed),
@@ -2244,8 +2363,7 @@ fn kv_page_count(
         &std::collections::HashSet<crate::store::kv::page_table::WorkingSetId>,
     ) -> usize,
 ) -> u32 {
-    let working_sets =
-        crate::inferlet::process::residency::kv_working_set_ids(pid, model, driver);
+    let working_sets = crate::inferlet::process::residency::kv_working_set_ids(pid, model, driver);
     if working_sets.is_empty() {
         return 0;
     }

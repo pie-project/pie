@@ -83,6 +83,52 @@ pub(crate) fn post_process_terminate(pid: ProcessId) {
     post_pipeline_leave(pid, None, LeaveKind::Terminate);
 }
 
+/// Post `pid`'s Terminate leave to every driver and hand back the fences that
+/// resolve once each scheduler has PROCESSED it — the posting half of
+/// [`notify_process_terminate`], split from its await.
+///
+/// The split is what lets a retiring process release its execution seat
+/// SYNCHRONOUSLY, in `ProcessCtx::drop`, instead of carrying the permit into
+/// the spawned teardown task: the leave is already queued ahead of the
+/// release broadcast on the same producer, so every driver still observes
+/// leave-then-release, while the deferred teardown keeps the awaited fence it
+/// needs before recycling pooled resources. Measured at conc 512, holding the
+/// permit until the teardown task ran cost 27.8 ms p50 per retiree — 16.7 ms
+/// of it purely waiting for the spawn to be scheduled behind 511 siblings.
+pub(crate) fn post_process_terminate_fenced(pid: ProcessId) -> Vec<TerminateFence> {
+    let handles = super::handle_registry().read().unwrap();
+    handles
+        .iter()
+        .flatten()
+        .filter_map(|handle| {
+            let (response, received) = tokio::sync::oneshot::channel();
+            handle
+                .send(SchedulerItem::PipelineLeave(
+                    pid,
+                    None,
+                    LeaveKind::Terminate,
+                    Some(response),
+                ))
+                .ok()
+                .map(|_| received)
+        })
+        .collect()
+}
+
+/// One driver's acknowledgement that it has processed a posted Terminate
+/// leave (see [`post_process_terminate_fenced`]).
+pub(crate) type TerminateFence = tokio::sync::oneshot::Receiver<()>;
+
+/// Await fences from [`post_process_terminate_fenced`]. Equivalent to the
+/// tail of [`notify_process_terminate`]: once this resolves, every driver's
+/// scheduler has purged the pid's queued work and cancelled its protected
+/// in-flight control, so pooled resources can be recycled.
+pub(crate) async fn await_terminate_fences(fences: Vec<TerminateFence>) {
+    for fence in fences {
+        let _ = fence.await;
+    }
+}
+
 async fn notify_pipeline_leave_and_wait(pid: ProcessId, kind: LeaveKind) {
     let responses = {
         let handles = super::handle_registry().read().unwrap();
@@ -112,39 +158,18 @@ pub(crate) async fn notify_pipeline_close(pid: ProcessId) {
     notify_pipeline_leave_and_wait(pid, LeaveKind::Close).await;
 }
 
-/// Deferred teardown's reference fence: resolves only after every driver's
-/// scheduler has PROCESSED the pid's Terminate leave — purged its queued
-/// work and cancelled its protected in-flight control — so the teardown
-/// that runs after this await can finalize pending operations and drop
-/// pooled resources with no scheduler-side reference left to them. (The
-/// mailbox alone orders the counter events; the await exists for the
-/// cancellation fence, not the accounting.)
-pub(crate) async fn notify_process_terminate(pid: ProcessId) {
-    notify_pipeline_leave_and_wait(pid, LeaveKind::Terminate).await;
-}
-
-/// A retiring process's deferred teardown dropped its capped execution
-/// permit. Broadcast to every driver's scheduler (mirrors
+/// A retiring process released its capped execution permit (capped
+/// deployments only). Broadcast to every driver's scheduler (mirrors
 /// [`notify_pipeline_leave`]): a policy with no staged successor ignores it,
 /// the policy holding the successor's staged bind earmarks the join.
 /// Carries the retiree's identity so the policy resolves exactly that
-/// holder's departure. Fire-and-forget: the sending teardown task already
-/// delivered the holder's Terminate leave (the awaited fence above), so
-/// every driver sees leave-then-release.
+/// holder's departure. Fire-and-forget: the caller posted the holder's
+/// Terminate leave first, on this same producer, so every driver sees
+/// leave-then-release.
 pub(crate) fn notify_execution_slot_released(pid: ProcessId) {
     let handles = super::handle_registry().read().unwrap();
     for handle in handles.iter().flatten() {
         let _ = handle.send(SchedulerItem::ExecutionSlotReleased(pid));
-    }
-}
-
-/// The no-runtime teardown error path leaked the holder's permit: the slot
-/// is destroyed, not freed. The policy resolves the departure without
-/// crediting its balance (see `FramePolicy::on_execution_slot_forfeited`).
-pub(crate) fn notify_execution_slot_forfeited(pid: ProcessId) {
-    let handles = super::handle_registry().read().unwrap();
-    for handle in handles.iter().flatten() {
-        let _ = handle.send(SchedulerItem::ExecutionSlotForfeited(pid));
     }
 }
 
@@ -459,9 +484,7 @@ fn item_census_idx(item: &SchedulerItem) -> usize {
         SchedulerItem::CloseChannel { .. } | SchedulerItem::CloseChannels { .. } => 3,
         SchedulerItem::Lane(_) => 4,
         SchedulerItem::PipelineLeave(..) => 5,
-        SchedulerItem::ExecutionSlotReleased(_)
-        | SchedulerItem::ExecutionSlotForfeited(_)
-        | SchedulerItem::ProcessQuiesced(_) => 6,
+        SchedulerItem::ExecutionSlotReleased(_) | SchedulerItem::ProcessQuiesced(_) => 6,
         SchedulerItem::ExecutionSlotConsumed(_) => 7,
         SchedulerItem::Nudge => 8,
         SchedulerItem::CopyKv { .. }
@@ -576,9 +599,6 @@ enum SchedulerItem {
     /// waits, so a cohort turnover gathers the incoming herd instead of
     /// sealing narrow epochs. Uncapped deployments never send this.
     ExecutionSlotReleased(ProcessId),
-    /// The named retiree's permit was leaked on the no-runtime teardown
-    /// error path: resolve its departure without freeing a slot.
-    ExecutionSlotForfeited(ProcessId),
     /// The named process's deferred teardown finished; no event from it can
     /// follow. Retires its terminate tombstone.
     ProcessQuiesced(ProcessId),
@@ -2636,9 +2656,6 @@ impl BatchScheduler {
             // already-admitted request drain untracked.
             SchedulerItem::ExecutionSlotReleased(pid) => {
                 frame_policy.on_execution_slot_released(pid);
-            }
-            SchedulerItem::ExecutionSlotForfeited(pid) => {
-                frame_policy.on_execution_slot_forfeited(pid);
             }
             SchedulerItem::ProcessQuiesced(pid) => {
                 terminated_processes.remove(&pid);

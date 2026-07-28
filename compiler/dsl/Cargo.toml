@@ -39,5 +39,7 @@ pie-ir = { path = "../ir", default-features = false }
 pie-eval = { path = "../eval" }
 pie-plan = { path = "../plan" }
 
-[lints.rust]
-unsafe_code = "forbid"
+# Shared ratchet from the root manifest. These six crates are gated with
+# `-D warnings` in CI; see `[workspace.lints]` in the workspace `Cargo.toml`.
+[lints]
+workspace = true

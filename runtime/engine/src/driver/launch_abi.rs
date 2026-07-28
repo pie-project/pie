@@ -15,8 +15,8 @@ use pie_driver_abi::local::{
     PieLaunchChannelSlice, PieLaunchOp, PieLaunchOpSlice, PieLaunchPackage, PieLaunchPlanValue,
     PieLaunchPlanValueSlice, PieLaunchPort, PieLaunchPortSlice, PieLaunchPut, PieLaunchPutSlice,
     PieLaunchRegion, PieLaunchRegionSlice, PieLaunchStage, PieLaunchStagePlan,
-    PieLaunchStagePlanSlice, PieLaunchStageSlice, PieLaunchValue, PieLaunchValueSlice, PieU32Slice,
-    PieU8Slice,
+    PieLaunchStagePlanSlice, PieLaunchStageSlice, PieLaunchValue, PieLaunchValueSlice, PieU8Slice,
+    PieU32Slice,
 };
 use pie_driver_abi::plan::{LaunchOp, LaunchPackage, LaunchRegion, LaunchStagePlan};
 

@@ -292,23 +292,38 @@ bool build_member_forward_desc(
             : 1;
     if (has_linear_attn) {
         if (resolved != nullptr) {
-            if (view.rs_slot_ids.size() != request_count ||
-                view.rs_slot_flags.size() != request_count) {
+            // The launch's recurrent-state arrays are indexed one of two ways
+            // and the difference only shows up once a batch carries more than
+            // one member: either they are already scoped to this member's
+            // requests, or they are launch-wide with one entry per member --
+            // which is what the host branch below has always assumed. Reading
+            // the launch-wide form from index 0 gave member 1 member 0's slot
+            // and rejected any batch whose member count differed from one
+            // member's request count, so two concurrent decodes could never
+            // share a forward.
+            const std::uint32_t* rs_ids = nullptr;
+            const std::uint8_t* rs_flags = nullptr;
+            if (view.rs_slot_ids.size() == request_count &&
+                view.rs_slot_flags.size() == request_count) {
+                rs_ids = view.rs_slot_ids.data();
+                rs_flags = view.rs_slot_flags.data();
+            } else if (request_count == 1 &&
+                       view.rs_slot_ids.size() == member_count &&
+                       view.rs_slot_flags.size() == member_count) {
+                rs_ids = view.rs_slot_ids.data() + member;
+                rs_flags = view.rs_slot_flags.data() + member;
+            } else {
                 error =
                     "resolved hybrid geometry requires exactly one folded "
                     "recurrent-state slot and flag per request";
                 return false;
             }
-            desc.request_rs_slot_ids.assign(
-                view.rs_slot_ids.data(),
-                view.rs_slot_ids.data() + request_count);
+            desc.request_rs_slot_ids.assign(rs_ids, rs_ids + request_count);
             for (std::size_t request = 0;
                  request < request_count;
                  ++request) {
-                const std::uint8_t flag =
-                    view.rs_slot_flags.data()[request];
                 desc.request_rs_reset.push_back(
-                    (flag & kRsFlagReset) != 0);
+                    (rs_flags[request] & kRsFlagReset) != 0);
             }
         } else if (
             view.rs_slot_ids.size() == member_count &&

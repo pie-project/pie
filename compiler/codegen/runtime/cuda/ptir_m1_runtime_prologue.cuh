@@ -4,6 +4,12 @@ typedef unsigned short m1_u16;
 typedef unsigned int m1_u32;
 typedef unsigned long long m1_u64;
 
+// A 16-byte load, spelled without depending on NVRTC providing CUDA's built-in
+// vector types: these headers are compiled with no include path at all.
+struct alignas(16) M1U32x4 {
+  unsigned int x, y, z, w;
+};
+
 struct M1Status {
   m1_u32 state;
   m1_u32 fault;
@@ -319,6 +325,31 @@ __device__ __forceinline__ float m1_intrinsic_row_load(
   const m1_u16 value =
       reinterpret_cast<const m1_u16*>(row_address)[column];
   return __uint_as_float((m1_u32)value << 16);
+}
+
+// Resolve a row once, then read columns off it.
+//
+// `mode == 2` keeps a table of row pointers, so calling `m1_intrinsic_row_load`
+// per column put a dependent global load in front of every element: the greedy
+// argmax over a 154k vocabulary read its logits at 37 GB/s. The row is loop
+// invariant and the dtype branch is block-uniform, so both belong outside the
+// column loop.
+__device__ __forceinline__ const m1_u8* m1_intrinsic_row_base(
+    const m1_u8* input, m1_u64 row, m1_u32 stride, m1_u32 mode) {
+  if (mode == 2u) {
+    return reinterpret_cast<const m1_u8*>(
+        reinterpret_cast<const m1_u64*>(input)[row]);
+  }
+  const m1_u64 element = mode == 0u ? 4u : 2u;
+  return input + row * (m1_u64)stride * element;
+}
+
+__device__ __forceinline__ float m1_intrinsic_column_load(
+    const m1_u8* row_base, m1_u32 column, m1_u32 mode) {
+  if (mode == 0u) return reinterpret_cast<const float*>(row_base)[column];
+  const m1_u32 bits =
+      (m1_u32)reinterpret_cast<const m1_u16*>(row_base)[column] << 16;
+  return __uint_as_float(bits);
 }
 
 __device__ __forceinline__ void m1_reduce_float(

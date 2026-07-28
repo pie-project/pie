@@ -291,14 +291,23 @@ class ModuleCache {
                     host_region.entry != nullptr && !host_region.entry->empty()
                         ? *host_region.entry
                         : entry_name(plan.signature_hash, region_index);
+                // The stage key is built from version constants, which someone
+                // has to remember to bump. Editing `compiler/codegen`'s device
+                // templates changes none of them, so a cubin compiled from the
+                // previous source stayed on disk and was silently reused --
+                // kernel edits appeared to do nothing, and the model's output
+                // was whatever the stale kernel computed. Keying the file on
+                // the source that produced it removes the remembering.
+                const std::string disk_key =
+                    key + source_fingerprint(host_region.source);
                 std::shared_ptr<FusedRegionExecutable> executable;
                 if (auto cubin = load_cached_cubin(
-                        key, region_index, entry)) {
+                        disk_key, region_index, entry)) {
                     executable = load_region(*cubin, entry, error);
                     if (executable != nullptr) {
                         ++stats_.disk_hits;
                     } else {
-                        invalidate_cached_cubin(key, region_index);
+                        invalidate_cached_cubin(disk_key, region_index);
                         ++stats_.disk_errors;
                         std::fprintf(
                             stderr,
@@ -352,7 +361,7 @@ class ModuleCache {
                     }
                     ++stats_.compilations;
                     store_cached_cubin(
-                        key,
+                        disk_key,
                         region_index,
                         entry,
                         compiled_cubin);
@@ -432,6 +441,17 @@ class ModuleCache {
             }
         }
         return {};
+    }
+
+    /// The bytes of a region's generated source, folded to eight.
+    static std::string source_fingerprint(const std::string* source) {
+        const std::uint64_t hash =
+            source == nullptr ? 0ULL : cache_key_hash(*source);
+        std::string bytes;
+        for (unsigned shift = 0; shift < 64; shift += 8) {
+            bytes.push_back(static_cast<char>(hash >> shift));
+        }
+        return bytes;
     }
 
     static std::uint64_t cache_key_hash(const std::string& key) {

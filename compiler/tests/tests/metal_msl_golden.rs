@@ -30,8 +30,12 @@
 //!   `0 == PTIR_LIBRARY_NUCLEUS_SAMPLE`, so it reaches an out-of-bounds read of
 //!   `region.inputs[0..3]`. There is no defined oracle output to match.
 
+#[path = "common/device_text.rs"]
+mod device_text;
 #[path = "common/msl_corpus.rs"]
 mod msl_corpus;
+#[path = "common/provenance.rs"]
+mod provenance;
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -44,18 +48,10 @@ use pie_codegen::metal::{
     emit_singleton_region, validate_singleton_plan,
 };
 
+use device_text::OracleInputs;
 use msl_corpus::{CorpusStage, corpus_stages, is_library, op_tag, region_shape};
 
 /// FNV-1a 64, the hash the oracle header records for the shared prefixes.
-fn fnv1a64(text: &str) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in text.bytes() {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
-}
-
 /// The embedded runtime template must be the same bytes the C++ emitter read
 /// from `driver/metal/src/kernels/ptir_m1_runtime.metal`. Everything else here
 /// compares kernel *tails* with the shared prefix elided, so without this the
@@ -85,7 +81,7 @@ fn embedded_runtime_matches_the_oracle() {
 
     let runtime = runtime_prefix();
     assert_eq!(
-        (runtime.len(), fnv1a64(&runtime)),
+        (runtime.len(), pie_ir::fnv1a64(runtime.as_bytes())),
         field("# @runtime:"),
         "compiler/codegen/runtime/metal/ptir_m1_runtime.metal has drifted from the copy \
          the C++ oracle read out of driver/metal/src/kernels/"
@@ -93,7 +89,7 @@ fn embedded_runtime_matches_the_oracle() {
 
     let grouped = grouped_preamble();
     assert_eq!(
-        (grouped.len(), fnv1a64(grouped)),
+        (grouped.len(), pie_ir::fnv1a64(grouped.as_bytes())),
         field("# @grouped:"),
         "the grouped preamble has drifted from the C++ emitter"
     );
@@ -101,6 +97,19 @@ fn embedded_runtime_matches_the_oracle() {
 
 fn golden_msl_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("golden-msl")
+}
+
+/// The live Metal device source and the oracle-era copy of whichever part of it
+/// has moved since the dump was taken. See `common/device_text.rs`. Nothing has
+/// moved yet, so `golden-msl/oracle-inputs/` does not exist and this is the
+/// identity — it is here so the first kernel change lands on the mechanism
+/// instead of on a wall of unexplained byte diffs.
+fn oracle_inputs() -> OracleInputs {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    OracleInputs::load(
+        manifest.join("../codegen/runtime/metal"),
+        golden_msl_dir().join("oracle-inputs"),
+    )
 }
 
 /// The runtime prefix every emitted kernel starts with, elided from the dump
@@ -123,15 +132,18 @@ struct Dump {
     body: String,
     runtime: String,
     grouped: String,
+    inputs: OracleInputs,
 }
 
 impl Dump {
     fn new(emitter: &'static str) -> Self {
+        let inputs = oracle_inputs();
         Self {
             emitter,
             body: String::new(),
-            runtime: runtime_prefix(),
-            grouped: grouped_prefix(),
+            runtime: inputs.rewrite(&runtime_prefix()),
+            grouped: inputs.rewrite(&grouped_prefix()),
+            inputs,
         }
     }
 
@@ -149,6 +161,8 @@ impl Dump {
 
     fn source(&mut self, text: &str) {
         self.body.push_str("ok: true\n");
+        let text = self.inputs.rewrite(text);
+        let text = text.as_str();
         let (prefix, tail) = if !self.grouped.is_empty() && text.starts_with(&self.grouped) {
             ("@runtime+@grouped", &text[self.grouped.len()..])
         } else if !self.runtime.is_empty() && text.starts_with(&self.runtime) {
@@ -181,46 +195,167 @@ impl Dump {
     }
 }
 
+/// Cases where this compiler *deliberately* disagrees with the recorded C++
+/// oracle, each with the reason.
+///
+/// The oracle binary is gone (deleted with the C++ emitters), so these dumps
+/// are the only surviving record of its behaviour. That makes `PTIR_REGEN=1`
+/// the wrong tool for a fix: regenerating would overwrite the evidence and
+/// leave no trace that the divergence was intended. An entry here is the
+/// trace. Adding one is a claim that the oracle was *wrong*, so it needs to
+/// say why.
+const INTENDED_ORACLE_DIVERGENCES: &[(&str, &str)] = &[
+    // The oracle emitted these: it bound `intrinsic_val` ids 3 (`query`) and 4
+    // (`value_head`) to the `logits` buffer, because that is the only buffer
+    // `ptir_m1_runtime.metal` binds for op tag 0xA0 and neither the emitter nor
+    // the Metal driver looks at `p.intr` except for `MtpDrafts`. The kernel ran,
+    // faulted nothing, and returned logits rows in place of the requested
+    // intrinsic. `intrinsics_bindable` now rejects the region instead.
+    (
+        "pentathlon_iter#0 singleton#0",
+        "oracle emitted a kernel binding intrinsic id 3 (query) to `logits`",
+    ),
+    (
+        "pentathlon_iter#0 fused#0",
+        "oracle emitted a kernel binding intrinsic id 3 (query) to `logits`",
+    ),
+    (
+        "pentathlon_iter#1 fused#2",
+        "oracle emitted a kernel binding intrinsic id 4 (value_head) to `logits`",
+    ),
+    // Same defect on the interpreted path: `m1_runtime.cpp` binds
+    // `inputs.logits_bf16` for every `PTIR_OP_INTRINSIC_VAL` and only consults
+    // `op.intr` to size the row range, so the oracle accepted these plans too
+    // (`pentathlon_iter#1` verbatim; `#0` it rejected, but for an unrelated
+    // kernel boundary further down the stage).
+    (
+        "pentathlon_iter#0",
+        "oracle accepted intrinsic id 3 (query) on the interpreted path",
+    ),
+    (
+        "pentathlon_iter#1",
+        "oracle accepted intrinsic id 4 (value_head) on the interpreted path",
+    ),
+];
+
+/// One-line gist of a case body: the verdict plus its error or byte count.
+fn summarize(case: &str) -> String {
+    case.lines()
+        .filter(|line| {
+            line.starts_with("ok:") || line.starts_with("error:") || line.starts_with("source:")
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+fn intended_divergence(case: &str) -> Option<&'static str> {
+    INTENDED_ORACLE_DIVERGENCES
+        .iter()
+        .find(|(id, _)| *id == case)
+        .map(|(_, reason)| *reason)
+}
+
+/// Split a dump body into `(case-id, case-text)` pairs.
+fn cases(body: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for line in body.lines() {
+        if let Some(id) = line.strip_prefix("=== ")
+            && id != "end"
+        {
+            out.push((id.to_string(), String::new()));
+            continue;
+        }
+        if let Some((_, text)) = out.last_mut() {
+            text.push_str(line);
+            text.push('\n');
+        }
+    }
+    out
+}
+
 /// Compare one emitter's cases against the oracle dump, ignoring the oracle's
 /// `#` header (it records provenance, not behaviour).
 fn compare(dump: &Dump) {
     let path = golden_msl_dir().join(format!("{}.txt", dump.emitter));
-    let oracle = std::fs::read_to_string(&path)
-        .unwrap_or_else(|error| panic!("{} missing ({error})", path.display()));
-    let header: String = oracle
-        .lines()
-        .take_while(|line| line.starts_with('#'))
-        .map(|line| format!("{line}\n"))
-        .collect();
-    let expected = &oracle[header.len()..];
-
-    if std::env::var("PTIR_REGEN").is_ok() {
-        std::fs::write(&path, header.clone() + &dump.body).unwrap();
+    let Some(expected) =
+        provenance::body_to_diff(&path, &dump.body, provenance::Regenerate::Foreign)
+    else {
         return;
-    }
-    if expected == dump.body {
-        return;
-    }
-    // Point at the first differing case instead of dumping 12 000 lines.
-    let mut case = String::from("<before the first case>");
-    for (index, (mine, theirs)) in dump.body.lines().zip(expected.lines()).enumerate() {
-        if let Some(id) = theirs.strip_prefix("=== ") {
-            case = id.to_string();
-        }
-        assert_eq!(
-            mine,
-            theirs,
-            "{} diverged from the C++ oracle at line {} (case `{case}`)",
-            dump.emitter,
-            index + 1
-        );
-    }
+    };
+    let mine_cases = cases(&dump.body);
+    let their_cases = cases(&expected);
     assert_eq!(
-        dump.body.lines().count(),
-        expected.lines().count(),
-        "{} emitted a different number of lines than the C++ oracle",
+        mine_cases.iter().map(|(id, _)| id).collect::<Vec<_>>(),
+        their_cases.iter().map(|(id, _)| id).collect::<Vec<_>>(),
+        "{} case list diverged from the oracle dump",
         dump.emitter
     );
+    let mut unexpected: Vec<String> = Vec::new();
+    let mut stale: Vec<String> = Vec::new();
+    for ((id, mine), (_, theirs)) in mine_cases.iter().zip(&their_cases) {
+        match (intended_divergence(id), mine == theirs) {
+            (Some(_), false) => {}
+            (Some(reason), true) => stale.push(format!("{id} ({reason})")),
+            (None, true) => {}
+            (None, false) => unexpected.push(format!(
+                "  `{id}`\n    rust  : {}\n    oracle: {}",
+                summarize(mine),
+                summarize(theirs)
+            )),
+        }
+    }
+    assert!(
+        unexpected.is_empty(),
+        "{} diverged from the C++ oracle in {} case(s):\n{}\n{}",
+        dump.emitter,
+        unexpected.len(),
+        unexpected.join("\n"),
+        dump.inputs.hint()
+    );
+    assert!(
+        stale.is_empty(),
+        "{} cases are listed in INTENDED_ORACLE_DIVERGENCES but now match the \
+         oracle -- drop the entries:\n{}",
+        dump.emitter,
+        stale.join("\n")
+    );
+    // Line counts legitimately differ once a case is in the ledger (a rejection
+    // is one line where an emitted kernel is hundreds). The per-case comparison
+    // above, gated on identical case-id lists, is the stronger check.
+}
+
+/// What makes the oracle-era rewrite safe: the emitter splices each device file
+/// in whole and verbatim, so putting the oracle-era text back can only ever
+/// restore bytes the kernel side owns.
+#[test]
+fn every_live_device_file_is_spliced_into_a_kernel_verbatim() {
+    let inputs = oracle_inputs();
+    // 0x10 is a real op tag, so this is a kernel and not a rejection.
+    let singleton = emit_singleton_region("ptir_singleton_probe", 0x10);
+    let grouped = emit_grouped_readiness("ptir_grouped_readiness_probe");
+
+    let files = inputs.live_files();
+    assert_eq!(
+        files.len(),
+        2,
+        "compiler/codegen/runtime/metal/ holds two device files; a new one needs \
+         a home in this assertion and, once it moves, in golden-msl/oracle-inputs/"
+    );
+    for (name, text) in files {
+        let hosts = [&singleton, &grouped];
+        assert!(
+            hosts.iter().any(|host| host.contains(&text)),
+            "{name} is include_str!d into the emitters but no emitted kernel \
+             contains it verbatim, so the oracle-era rewrite cannot stand in \
+             for it"
+        );
+    }
+}
+
+/// A copy that no longer differs from its live file stands in for nothing.
+#[test]
+fn oracle_inputs_are_live_files_that_moved() {
+    oracle_inputs().assert_entries_are_live_files_that_moved();
 }
 
 fn effect_from_flags(flags: u32, capacity: u32) -> M1ChannelEffect {
@@ -370,11 +505,11 @@ fn plan_emitters_match_oracle() {
                     // covers the partition without dozens of near-identical
                     // 10 KB kernels.
                     if region.nodes.len() != 1
-                        || region.nodes[0] as usize >= stage.plan.normalized.ops.len()
+                        || region.nodes[0].index() >= stage.plan.normalized.ops.len()
                     {
                         continue;
                     }
-                    let tag = op_tag(&stage.plan, region.nodes[0]);
+                    let tag = op_tag(&stage.plan, region.nodes[0].get());
                     if seen[tag as usize] {
                         continue;
                     }
@@ -444,6 +579,15 @@ fn validate_singleton_plan_matches_oracle_on_clean_plans() {
         let same = mine.ok == theirs.ok
             && mine.error == theirs.error
             && (!mine.ok || mine.operations == theirs.operations);
+        if let Some(reason) = intended_divergence(&stage.id()) {
+            assert!(
+                !same,
+                "{} is listed in INTENDED_ORACLE_DIVERGENCES ({reason}) but now \
+                 matches the oracle -- drop the entry",
+                stage.id()
+            );
+            continue;
+        }
         if !same {
             divergences.push(format!(
                 "{}:\n  rust: {mine:?}\n  cxx : {theirs:?}",

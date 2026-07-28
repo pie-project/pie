@@ -1,6 +1,6 @@
 //! `intrinsics::*` — first-party stage-scoped values + model constants (overview
 //! §4). Model constants are functions (a runtime value can't be a bare path in
-//! Rust; deviation approved). Stage-scoped values emit echo's
+//! Rust; deviation approved). Stage-scoped values emit the IR's
 //! [`Op::IntrinsicVal`](pie_ir::op::Op::IntrinsicVal) with the
 //! trace-known shape/dtype the registry checks. `intrinsics::kernel::*` second-
 //! party surface: a minimal `attn_page_mask` sink now; full rollout in P7.
@@ -20,7 +20,13 @@ pub fn vocab() -> u32 {
 pub fn page_size() -> u32 {
     model::page_size()
 }
-/// The late-bound backend activation dtype (`intrinsics::activation_type`, §4).
+/// The interpreter-visible activation dtype.
+///
+/// Named `activation_type` because §4 calls the backend's activation dtype
+/// late-bound, but this constant is not late-bound and never was: the
+/// materialization every intrinsic declares — and every tier-0 run produces —
+/// is F32. A backend storing bf16/fp8 does so beneath this; nothing in a trace
+/// observes that choice, so nothing here can vary with it.
 #[allow(non_upper_case_globals)]
 pub const activation_type: DType = DType::F32;
 
@@ -32,14 +38,14 @@ fn logits_shape() -> Shape {
 
 /// `intrinsics::logits()` — the LM-head logits, `[n_out, vocab]` F32 (§5.1). For
 /// a single read-out row the SDK reshapes to `[vocab]` so single-position
-/// samplers read a vector (echo's §3 golden does the same).
+/// samplers read a vector (the IR's §3 golden does the same).
 pub fn logits() -> Tensor {
     let t = intrinsic_val(IntrinsicId::Logits, logits_shape(), DType::F32);
     single_row_reshape(t)
 }
 /// `intrinsics::mtp_logits(k)` — the model's `k` draft/future-token heads (§4),
-/// decl'd `[k, vocab]` regardless of the embed row count. echo's §6.1 contract:
-/// the classic `K` drafts vs `K+1` verify window are DISTINCT shapes — charlie's
+/// decl'd `[k, vocab]` regardless of the embed row count. the IR's §6.1 contract:
+/// the classic `K` drafts vs `K+1` verify window are DISTINCT shapes — the CUDA driver's
 /// Stage-2 resolves the MtpLogits rows FROM THIS DECL (`mtp_draft_row .. +k`), so
 /// a `[K+1,V]` decl would request more rows than the head produces. Model-gated
 /// on `has_mtp_logits`. Mirrors the eDSL's `intrinsic_mtp_logits_matrix_dyn(k)`.
@@ -50,19 +56,31 @@ pub fn mtp_logits(k: u32) -> Tensor {
         DType::F32,
     )
 }
-/// `intrinsics::hidden()` — the residual stream at read-out (epilogue).
-pub fn hidden() -> Tensor {
+/// `intrinsics::hidden(width)` — the residual stream at read-out (epilogue),
+/// `[n_out, width]`.
+///
+/// `width` is a parameter because the hidden size is not in
+/// [`ModelProfile`](pie_ir::registry::ModelProfile) and the SDK cannot derive
+/// it. `bind` deliberately checks only the rank and row count for this
+/// intrinsic, so a wrong width is not refused — it is carried into the plan's
+/// extents. Pass the model's hidden size; it is the same kind of declared
+/// ceiling as `mtp_logits`'s `k` and `attn_score`'s `kv_max`.
+pub fn hidden(width: u32) -> Tensor {
     let rows = current_rows().max(1);
-    // Hidden width is a model constant; modeled here as the activation rows.
     intrinsic_val(
         IntrinsicId::Hidden,
-        Shape::matrix(rows, vocab()),
+        Shape::matrix(rows, width.max(1)),
         activation_type,
     )
 }
-/// `intrinsics::query()` — this layer's projected query (attn taps, §5.3).
-pub fn query() -> Tensor {
-    intrinsic_val(IntrinsicId::Query, Shape::vector(vocab()), activation_type)
+/// `intrinsics::query(width)` — this layer's projected query (attn taps, §5.3),
+/// `[width]`. Declared, not derived, for the same reason as [`hidden`].
+pub fn query(width: u32) -> Tensor {
+    intrinsic_val(
+        IntrinsicId::Query,
+        Shape::vector(width.max(1)),
+        activation_type,
+    )
 }
 /// `intrinsics::value_head()` — model-gated scalar value head (epilogue).
 pub fn value_head() -> Tensor {
@@ -112,7 +130,7 @@ pub fn attn_score(kv_max: u32) -> Tensor {
 }
 
 /// Reshape a `[1, vocab]` logits matrix to `[vocab]` for the single-row case
-/// (matches echo's §3 golden). Multi-row passes keep the matrix.
+/// (matches the IR's §3 golden). Multi-row passes keep the matrix.
 fn single_row_reshape(t: Tensor) -> Tensor {
     let s = t.shape();
     if s.rank() == 2 && s.dims()[0] == 1 {

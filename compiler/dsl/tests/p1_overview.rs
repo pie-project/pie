@@ -236,7 +236,7 @@ fn s6_2_beam_epilogue_binds() {
     const P: u32 = 3;
     const PAGE_T: u32 = 4;
 
-    // channels 0..=15 as in overview §6.2 / echo's beam_trace.
+    // channels 0..=15 as in overview §6.2 / the IR's beam_trace.
     let pages: &'static Channel = leak(Channel::seeded([B, P], dtype::u32).named("pages"));
     let lens: &'static Channel = leak(Channel::seeded([B, P], dtype::u32).named("lens"));
     let klen: &'static Channel = leak(Channel::from(vec![0u32; B as usize]).named("klen"));
@@ -403,7 +403,7 @@ fn s6_1_mtp_grammar_binds() {
     b.stage(Stage::Epilogue, move || {
         let masked = mask_apply(intrinsics::logits(), gmask.take()); // [K+1, V]
         let picked = reduce_argmax(&masked); // [K+1] grammar-constrained target
-        // NATIVE MTP: K distinct draft heads [K, V] (echo's §6.1 K-vs-K+1 contract).
+        // NATIVE MTP: K distinct draft heads [K, V] (the IR's §6.1 K-vs-K+1 contract).
         let mtp = intrinsics::mtp_logits(K); // [K, V]
         let draft = reduce_argmax(&mtp); // [K]
         // mtp_verify_tail: head = picked[0..K]; accept-prefix = leading run of matches.

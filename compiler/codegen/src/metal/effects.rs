@@ -10,11 +10,16 @@ use core::fmt::Write as _;
 
 use alloc::vec::Vec;
 
-use pie_ir::op::Op;
+use crate::fault::{
+    LANE_HEADER_MISMATCH, M1_HEAD_STALE, M1_NOT_EMPTY, M1_NOT_FULL, M1_PUT_BLOCKED,
+    M1_RING_CORRUPT, M3_NOT_READY, M3_RING_CORRUPT,
+};
+use crate::layout;
+use pie_ir::op::ChannelUse;
 use pie_ir::validate::{BoundTrace, Direction};
 
-use super::{M1ChannelEffect, METAL_M1_MAX_CHANNELS};
 use super::preamble::{common_effect_preamble, emit_word_arguments, grouped_preamble};
+use super::{M1ChannelEffect, METAL_M1_MAX_CHANNELS};
 
 /// The lane-table ABI revision the emitted readiness kernel refuses to run
 /// against anything else (`PTIR_LANE_TABLE_ABI_VERSION`).
@@ -27,10 +32,7 @@ const LANE_TABLE_ABI_VERSION: u32 = pie_plan::LANE_TABLE_ABI_VERSION;
 /// emitter's output it stated only that, and a program one channel wider
 /// produced a `[[buffer(31)]]` Metal rejects — a raw shader diagnostic at PSO
 /// build time, from a count a guest container chooses.
-pub fn emit_readiness(
-    function_name: &str,
-    channels: &[M1ChannelEffect],
-) -> Result<String, String> {
+pub fn emit_readiness(function_name: &str, channels: &[M1ChannelEffect]) -> Result<String, String> {
     if channels.len() > METAL_M1_MAX_CHANNELS {
         return Err(format!(
             "readiness kernel exceeds the {METAL_M1_MAX_CHANNELS}-channel direct-binding limit"
@@ -55,12 +57,12 @@ pub fn emit_readiness(
          reinterpret_cast<const device M1LaneChannelSlot*>(lane_bytes + \
          sizeof(M1LaneHeader) + sizeof(M1LaneRecord));\n",
     );
-    let _ = write!(
+    let _ = writeln!(
         source,
         "  if (header->abi_version != {LANE_TABLE_ABI_VERSION} || header->lane_count != 1 || \
-         header->channel_count != {}) {{ status->state = 3; status->fault = 0x100; \
+         header->channel_count != {}) {{ status->state = 3; status->fault = {LANE_HEADER_MISMATCH:#x}; \
          status->reserved0 = header->abi_version; \
-         status->reserved1 = (header->lane_count << 16) | header->channel_count; return; }}\n",
+         status->reserved1 = (header->lane_count << 16) | header->channel_count; return; }}",
         channels.len()
     );
     source.push_str("  status->state = 0; status->fault = 0;\n");
@@ -72,7 +74,7 @@ pub fn emit_readiness(
             source,
             "    if (words_{channel}[2] != 0ul || words_{channel}[3] != 0ul || tail < head) \
              {{ status->state = 3; status->fault = {}; return; }}",
-            0x200 + channel
+            M1_RING_CORRUPT + channel as u32
         );
         let _ = writeln!(
             source,
@@ -86,13 +88,13 @@ pub fn emit_readiness(
             source,
             "    if (expected_head != ~0ul && head != expected_head) \
              {{ status->state = 2; status->fault = {}; return; }}",
-            0x300 + channel
+            M1_HEAD_STALE + channel as u32
         );
         if effect.requires_full {
             let _ = writeln!(
                 source,
                 "    if (tail <= head) {{ status->state = 2; status->fault = {}; return; }}",
-                0x400 + channel
+                M1_NOT_FULL + channel as u32
             );
         }
         if effect.requires_empty {
@@ -100,7 +102,7 @@ pub fn emit_readiness(
                 source,
                 "    if (tail - head >= {}ul) {{ status->state = 2; status->fault = {}; return; }}",
                 effect.capacity,
-                0x480 + channel
+                M1_NOT_EMPTY + channel as u32
             );
         }
         if effect.put {
@@ -111,7 +113,7 @@ pub fn emit_readiness(
                  tail - head >= {}ul + {credit}ul) \
                  {{ status->state = 2; status->fault = {}; return; }}",
                 effect.capacity,
-                0x500 + channel
+                M1_PUT_BLOCKED + channel as u32
             );
         }
         source.push_str("  }\n");
@@ -121,10 +123,7 @@ pub fn emit_readiness(
 }
 
 /// `emit_commit_msl` — one lane; advance head for takes, tail for puts.
-pub fn emit_commit(
-    function_name: &str,
-    channels: &[M1ChannelEffect],
-) -> Result<String, String> {
+pub fn emit_commit(function_name: &str, channels: &[M1ChannelEffect]) -> Result<String, String> {
     if channels.len() > METAL_M1_MAX_CHANNELS {
         return Err(format!(
             "commit kernel exceeds the {METAL_M1_MAX_CHANNELS}-channel direct-binding limit"
@@ -169,14 +168,13 @@ pub fn emit_commit(
 pub fn emit_grouped_readiness(function_name: &str) -> String {
     let mut source = String::new();
     source.push_str("#include <metal_stdlib>\nusing namespace metal;\n");
-    source
-        .push_str("struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };\n");
+    source.push_str(&layout::STATUS.emit_msl("M1"));
     source.push_str(grouped_preamble());
-    let _ = write!(
+    let _ = writeln!(
         source,
         "kernel void {function_name}(const device uchar* lane_bytes [[buffer(0)]], \
          const device M3ChannelMeta* meta [[buffer(1)]], \
-         uint lane_index [[thread_position_in_grid]]) {{\n"
+         uint lane_index [[thread_position_in_grid]]) {{"
     );
     source.push_str(
         "  const device M3LaneHeader* header = reinterpret_cast<const device M3LaneHeader*>(lane_bytes);\n",
@@ -203,9 +201,10 @@ pub fn emit_grouped_readiness(function_name: &str) -> String {
     source.push_str(
         "    const M3LaneChannelSlot slot = slots[lane.channel_slot_offset + channel];\n",
     );
-    source.push_str(
+    let _ = writeln!(
+        source,
         "    if (words[2] != 0ul || words[3] != 0ul || tail < head) \
-         { status->state = 3; status->fault = 0x700u + channel; return; }\n",
+         {{ status->state = 3; status->fault = {M3_RING_CORRUPT:#x}u + channel; return; }}"
     );
     source.push_str("    bool retry = slot.expected_head != ~0ul && head != slot.expected_head;\n");
     source.push_str("    retry = retry || (((m.flags & 2u) != 0u) && tail <= head);\n");
@@ -219,9 +218,10 @@ pub fn emit_grouped_readiness(function_name: &str) -> String {
          tail - head >= ulong(m.capacity) + credit;\n",
     );
     source.push_str("    }\n");
-    source.push_str(
-        "    if (retry) { status->state = (m.flags & 32u) != 0u ? 3u : 2u; \
-         status->fault = 0x780u + channel; return; }\n",
+    let _ = writeln!(
+        source,
+        "    if (retry) {{ status->state = (m.flags & 32u) != 0u ? 3u : 2u; \
+         status->fault = {M3_NOT_READY:#x}u + channel; return; }}"
     );
     source.push_str("  }\n");
     source.push_str("  status->state = 1;\n}\n");
@@ -232,14 +232,13 @@ pub fn emit_grouped_readiness(function_name: &str) -> String {
 pub fn emit_grouped_commit(function_name: &str) -> String {
     let mut source = String::new();
     source.push_str("#include <metal_stdlib>\nusing namespace metal;\n");
-    source
-        .push_str("struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };\n");
+    source.push_str(&layout::STATUS.emit_msl("M1"));
     source.push_str(grouped_preamble());
-    let _ = write!(
+    let _ = writeln!(
         source,
         "kernel void {function_name}(const device uchar* lane_bytes [[buffer(0)]], \
          const device M3ChannelMeta* meta [[buffer(1)]], \
-         uint lane_index [[thread_position_in_grid]]) {{\n"
+         uint lane_index [[thread_position_in_grid]]) {{"
     );
     source.push_str(
         "  const device M3LaneHeader* header = reinterpret_cast<const device M3LaneHeader*>(lane_bytes);\n",
@@ -291,10 +290,21 @@ pub fn channel_effects(bound: &BoundTrace) -> Vec<M1ChannelEffect> {
         };
         for program in &bound.container.stages {
             for op in &program.ops {
-                match op {
-                    Op::ChanTake(taken) if *taken == chan => effect.take = true,
-                    Op::ChanPut { chan: put, .. } if *put == chan => effect.put = true,
-                    _ => {}
+                let Some((use_, used)) = op.channel_use() else {
+                    continue;
+                };
+                if used != chan {
+                    continue;
+                }
+                // The driver advances the ring off these two flags, so a
+                // channel op that is not classified here leaves the ring
+                // un-advanced rather than raising anything.
+                match use_ {
+                    ChannelUse::Take => effect.take = true,
+                    ChannelUse::Put => effect.put = true,
+                    // A peek neither drains nor fills; `requires_full` below
+                    // is what keeps it ordered.
+                    ChannelUse::Read => {}
                 }
             }
         }

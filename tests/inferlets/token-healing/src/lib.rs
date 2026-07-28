@@ -214,7 +214,7 @@ async fn main(input: Input) -> Result<Output> {
         let w_off = Channel::from(vec![n % page_size]).named("w_off");
         let kv_len = Channel::from(vec![n + 1]).named("kv_len");
         let token_out = Channel::new([1], dtype::i32)
-            .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+            .capacity(channel_capacity() as u32)
             .named("token_out");
 
         let decode = ForwardPass::new();
@@ -248,31 +248,16 @@ async fn main(input: Input) -> Result<Output> {
         });
 
         let budget = input.max_tokens - 1;
-        let mut submitted = 0usize;
-        let mut in_flight = 0usize;
-        while in_flight < DEFAULT_RUNAHEAD_DEPTH && submitted < budget {
-            decode
-                .submit(&pipeline)
-                .map_err(|e| format!("token-healing decode: {e}"))?;
-            submitted += 1;
-            in_flight += 1;
-        }
-        while in_flight > 0 {
+        run_ahead(&pipeline, &decode, budget as usize, async || {
             let token = token_out
                 .take()
                 .get::<i32>()
                 .await
                 .map_err(|e| format!("read token: {e}"))?[0] as u32;
-            in_flight -= 1;
             generated.push(token);
-            if submitted < budget {
-                decode
-                    .submit(&pipeline)
-                    .map_err(|e| format!("token-healing decode: {e}"))?;
-                submitted += 1;
-                in_flight += 1;
-            }
-        }
+            Ok(ControlFlow::Continue(()))
+        })
+        .await?;
     }
     pipeline.close();
 

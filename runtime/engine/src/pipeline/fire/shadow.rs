@@ -33,6 +33,10 @@ pub struct HostShadow {
     /// Channels the trace net-takes each pass: any stage `ChanTake` plus
     /// consuming descriptor ports bound to channels.
     taken_per_pass: BTreeSet<u32>,
+    /// [`Self::advance`]'s phase order with the channel-inert stages already
+    /// dropped (see the fold loop). Derived from the bound trace, which never
+    /// changes for an instance, so it is built once and reused every fire.
+    phases: Option<Vec<Stage>>,
 }
 
 impl HostShadow {
@@ -69,6 +73,7 @@ impl HostShadow {
         HostShadow {
             queues,
             taken_per_pass,
+            phases: None,
         }
     }
 
@@ -111,12 +116,40 @@ impl HostShadow {
         // Cross-stage pass overlay: pending puts (Ok = known value, Err =
         // committed-but-unknown), visible to later stages' reads.
         let mut pending: BTreeMap<u32, Result<Value, EvalBlocker>> = BTreeMap::new();
-        let layers = bound.profile.num_layers;
-        let phases: Vec<Stage> = core::iter::once(Stage::Prologue)
-            .chain((0..layers).flat_map(|_| [Stage::OnAttnProj, Stage::OnAttn]))
-            .chain(core::iter::once(Stage::Epilogue))
-            .collect();
-        for stage in phases {
+        if self.phases.is_none() {
+            self.phases = Some({
+                // A stage program with no `ChanPut` cannot change `pending`: the
+                // fold's only consumed output is `fold.puts`, and the fault path
+                // shadows exactly that stage's `ChanPut` channels. Dropping those
+                // stages is therefore exact, and it is worth a lot — the layer
+                // stages repeat `2 * num_layers` times per fire and a transformer
+                // decode trace writes host channels only in the prologue and
+                // epilogue, so this turns 2*L+2 whole-trace evaluations into 2.
+                let puts = |stage: Stage| {
+                    bound
+                        .container
+                        .stages
+                        .iter()
+                        .filter(|program| program.stage == stage)
+                        .any(|program| {
+                            program
+                                .ops
+                                .iter()
+                                .any(|op| matches!(op, Op::ChanPut { .. }))
+                        })
+                };
+                let layers = bound.profile.num_layers;
+                core::iter::once(Stage::Prologue)
+                    .chain((0..layers).flat_map(|_| [Stage::OnAttnProj, Stage::OnAttn]))
+                    .chain(core::iter::once(Stage::Epilogue))
+                    .filter(|stage| puts(*stage))
+                    .collect()
+            });
+        }
+        // Indexed so the cached list stays borrowed immutably alongside the
+        // `known` closure's `&self` read of the shadow.
+        for index in 0..self.phases.as_ref().map_or(0, Vec::len) {
+            let stage = self.phases.as_ref().expect("primed above")[index];
             let fold = {
                 let mut known = |chan: u32| match pending.get(&chan) {
                     Some(Ok(value)) => Some(value.clone()),

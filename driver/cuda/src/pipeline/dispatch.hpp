@@ -8,8 +8,8 @@
 // executor opens a launch before descriptor resolution, invokes the declared
 // model phases at their anatomical hooks, then atomically finishes after
 // lm_head. `run()` remains the boundary-stage convenience path used by focused
-// tests. Programs are decoded from compiler-owned PTRP plans and instances stay
-// persistent by wire id. Owned once by `pipeline::Registry`
+// tests. Programs arrive as a compiler-built launch package -- there is no plan
+// format to decode here -- and instances stay persistent by wire id. Owned once by `pipeline::Registry`
 // (`registry.hpp`), which is the single construction site.
 
 #include <cstdint>

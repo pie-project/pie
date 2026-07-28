@@ -6,40 +6,40 @@
 
 #define PTIR_MAGIC "PTIR"
 #define PTIR_VERSION 1
-#define PTIB_MAGIC "PTIB" // bound-trace typed sidecar (PTIR-CONTAINER.md section 7)
-#define PTIB_VERSION 2
 // v1.1 extern channels (PTIR-CONTAINER.md section 6b): wire-version 2 iff externs
 #define PTIR_VERSION_EXTERN 2
 enum PtirExternDir : uint8_t { PTIR_EXTERN_IMPORT = 0, PTIR_EXTERN_EXPORT = 1 };
 
+// Cache-identity tokens, not wire versions: fold them into a compiled-module
+// cache key so a change in host planning invalidates what a device already built.
 #define PTIR_COMPILER_VERSION 3
 #define PTIR_REGION_PLAN_VERSION 4
 #define PTIR_LANE_TABLE_ABI_VERSION 3
 
 enum PtirSymbolicExtent : uint8_t {
-PTIR_EXTENT_KV_LEN = 0,
-PTIR_EXTENT_PAGE_COUNT = 1,
-PTIR_EXTENT_ROW_COUNT = 2,
-PTIR_EXTENT_TOKEN_COUNT = 3,
-PTIR_EXTENT_SAMPLED_ROWS = 4,
-PTIR_EXTENT_QUERY_LEN = 5,
-PTIR_EXTENT_KEY_LEN = 6,
+  PTIR_EXTENT_KV_LEN = 0,
+  PTIR_EXTENT_PAGE_COUNT = 1,
+  PTIR_EXTENT_ROW_COUNT = 2,
+  PTIR_EXTENT_TOKEN_COUNT = 3,
+  PTIR_EXTENT_SAMPLED_ROWS = 4,
+  PTIR_EXTENT_QUERY_LEN = 5,
+  PTIR_EXTENT_KEY_LEN = 6,
 };
 
 enum PtirScheduleTemplate : uint8_t {
-PTIR_SCHEDULE_EFFECTS = 0,
-PTIR_SCHEDULE_ONE_CTA_PER_ROW = 1,
-PTIR_SCHEDULE_HIERARCHICAL_ROW = 2,
-PTIR_SCHEDULE_LIBRARY = 3,
+  PTIR_SCHEDULE_EFFECTS = 0,
+  PTIR_SCHEDULE_ONE_CTA_PER_ROW = 1,
+  PTIR_SCHEDULE_HIERARCHICAL_ROW = 2,
+  PTIR_SCHEDULE_LIBRARY = 3,
 };
 
 enum PtirLibraryOp : uint8_t {
-PTIR_LIBRARY_NUCLEUS_SAMPLE = 0,
-PTIR_LIBRARY_TOP_K = 1,
-PTIR_LIBRARY_SORT = 2,
-PTIR_LIBRARY_SCAN = 3,
-PTIR_LIBRARY_MATMUL = 4,
-PTIR_LIBRARY_SECOND_PARTY = 5,
+  PTIR_LIBRARY_NUCLEUS_SAMPLE = 0,
+  PTIR_LIBRARY_TOP_K = 1,
+  PTIR_LIBRARY_SORT = 2,
+  PTIR_LIBRARY_SCAN = 3,
+  PTIR_LIBRARY_MATMUL = 4,
+  PTIR_LIBRARY_SECOND_PARTY = 5,
 };
 
 typedef struct PtirLaneTableHeader {
@@ -247,6 +247,22 @@ enum PtirChannelClass : uint8_t { PTIR_CHAN_FULL_RING = 0, PTIR_CHAN_IN_PLACE = 
 #define PTIR_SINK_ATTN_PAGE_MASK "attn_page_mask" // scope 1
 #define PTIR_SINK_LORA "lora" // scope 0
 #define PTIR_SINK_MINFERENCE_SPARSE "minference_sparse" // scope 0
+
+// ── backend emitter identity ──
+// Each driver keys its compiled-module disk cache on the emitter version of the
+// backend it loads, so a change to emitted source that does not bump these will
+// silently reuse a stale cubin/metallib. They are emitted here rather than
+// retyped in the drivers precisely because the two copies cannot be compared at
+// runtime -- the mismatch shows up as a wrong answer, not as an error.
+#define PTIR_CUDA_EMITTER_VERSION 19
+#define PTIR_METAL_M1_EMITTER_VERSION 35
+#define PTIR_METAL_M1_MAX_CHANNELS 29
+#define PTIR_METAL_M2_MAX_FUSED_CHANNELS 12
+// Threads a grouped generated region is launched with. The emitted MSL sizes
+// its threadgroup argmax buffer for exactly this many, so a driver that
+// dispatches more overruns it. Same argument as the emitter versions above: the
+// driver cannot compare its copy against the emitter's at runtime.
+#define PTIR_METAL_M3_REGION_THREADS 512
 
 // ── numeric contract (T8 replay determinism; golden interp is normative) ──
 // argmax: lower index wins ties; NaN never selected (all-NaN row -> index 0).

@@ -58,7 +58,8 @@ __global__ void rope_bf16_kernel(
     int num_kv_heads,
     int head_dim,
     float theta,
-    bool interleaved)
+    bool interleaved,
+    int cache_pairs)
 {
     const int n = blockIdx.x;
     const int total_heads = num_q_heads + num_kv_heads;
@@ -66,16 +67,41 @@ __global__ void rope_bf16_kernel(
     const int half = head_dim / 2;
     const int pos = positions[n];
 
+    // The rotation angle depends only on (pos, dim_pair): every head of this
+    // token shares it. Computing it inside the element loop ran a full-precision
+    // `powf` plus a `__sincosf` once per (head, pair) -- for GLM's 65 QK heads
+    // that is 65 evaluations of the same 32 transcendentals, and it made this
+    // kernel cost more than the attention it feeds. Hoisting them into shared
+    // memory keeps the arithmetic identical, so the outputs are bit-for-bit
+    // what the per-element form produced.
+    extern __shared__ float rope_cs[];
+    const int cached = cache_pairs;
+    for (int dp = threadIdx.x; dp < cached; dp += blockDim.x) {
+        const float freq = powf(theta, -2.f * static_cast<float>(dp) /
+                                       static_cast<float>(head_dim));
+        const float ang = static_cast<float>(pos) * freq;
+        float c, s;
+        __sincosf(ang, &s, &c);
+        rope_cs[dp] = c;
+        rope_cs[cached + dp] = s;
+    }
+    if (cached > 0) __syncthreads();
+
     // Each thread handles one (head, dim_pair_idx).
     for (int t = threadIdx.x; t < total_heads * half; t += blockDim.x) {
         const int head_idx = t / half;
         const int dim_pair = t % half;
 
-        const float freq = powf(theta, -2.f * static_cast<float>(dim_pair) /
-                                       static_cast<float>(head_dim));
-        const float ang = static_cast<float>(pos) * freq;
         float cos_v, sin_v;
-        __sincosf(ang, &sin_v, &cos_v);
+        if (dim_pair < cached) {
+            cos_v = rope_cs[dim_pair];
+            sin_v = rope_cs[cached + dim_pair];
+        } else {
+            const float freq = powf(theta, -2.f * static_cast<float>(dim_pair) /
+                                           static_cast<float>(head_dim));
+            const float ang = static_cast<float>(pos) * freq;
+            __sincosf(ang, &sin_v, &cos_v);
+        }
 
         if (head_idx < num_q_heads) {
             __nv_bfloat16* qp = q + (static_cast<long long>(n) * num_q_heads +
@@ -341,13 +367,18 @@ void launch_rope_bf16(
     bool interleaved)
 {
     constexpr int BLOCK = 256;
+    // 32 KB caps the table at head_dim 8192; past that the pairs are recomputed.
+    constexpr int kMaxCachedPairs = 4096;
+    const int half = head_dim / 2;
+    const int cache_pairs = half <= kMaxCachedPairs ? half : 0;
+    const std::size_t smem = static_cast<std::size_t>(cache_pairs) * 2 * sizeof(float);
     dim3 grid(num_tokens);
     dim3 block(BLOCK);
-    rope_bf16_kernel<<<grid, block, 0, stream>>>(
+    rope_bf16_kernel<<<grid, block, smem, stream>>>(
         static_cast<__nv_bfloat16*>(q),
         static_cast<__nv_bfloat16*>(k),
         positions,
-        num_q_heads, num_kv_heads, head_dim, theta, interleaved);
+        num_q_heads, num_kv_heads, head_dim, theta, interleaved, cache_pairs);
 }
 
 void launch_qk_rmsnorm_rope_bf16(

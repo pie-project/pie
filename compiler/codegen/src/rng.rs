@@ -72,9 +72,19 @@ fn render_cuda_functions(projection: CudaProjection) -> String {
     out
 }
 
+/// The `__device__` projection, as spliced into emitted CUDA sources.
+///
+/// [`generate_cuda_header`] embeds the same text in a raw string literal for
+/// the C++ side. `cuda::runtime` used to recover it by generating the whole
+/// header and searching for the literal's delimiters, so any whitespace change
+/// in the header would have killed the emitter at runtime with an `expect`.
+pub fn cuda_device_functions() -> String {
+    render_cuda_functions(CudaProjection::Source)
+}
+
 pub fn generate_cuda_header() -> String {
     let implementation = render_cuda_functions(CudaProjection::Header);
-    let source = render_cuda_functions(CudaProjection::Source);
+    let source = cuda_device_functions();
     format!(
         "// rng_contract.generated.h — GENERATED from compiler/ir/src/rng.rs.\n\
 // DO NOT EDIT. Regenerate: PTIR_REGEN=1 cargo test -p pie-compiler-tests --test rng_contract\n\

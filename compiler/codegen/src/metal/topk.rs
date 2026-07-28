@@ -7,14 +7,13 @@
 
 use alloc::string::{String, ToString};
 use core::fmt::Write as _;
+use pie_ir::op::tags;
 
 use pie_plan::{CompiledStage, LibraryOp, Region};
 
 use super::preamble::{RUNTIME_TEMPLATE, grouped_preamble};
 use super::validate::{is_library, library_op_byte, library_region_valid};
 use crate::op_view::{OpView, result_bases};
-
-const OP_TOP_K: u8 = 0x51;
 
 const PROLOGUE: &str = r#"
 inline uint m3_topk_order_digit(float value, uint pass) {
@@ -163,12 +162,12 @@ pub fn emit_grouped_topk(
     }
     let ops: alloc::vec::Vec<OpView> = OpView::of_all(&stage.normalized.ops);
     let bases = result_bases(&ops);
-    let topk_node = region.nodes[0] as usize;
+    let topk_node = region.nodes[0].index();
     if topk_node >= ops.len() {
         return Err("TopK library node is out of range".to_string());
     }
     let topk = &ops[topk_node];
-    if topk.tag != OP_TOP_K
+    if topk.tag != tags::TOP_K
         || topk.args.len() != 1
         || topk.results != 2
         || bases[topk_node] as usize + 1 >= stage.normalized.value_types.len()

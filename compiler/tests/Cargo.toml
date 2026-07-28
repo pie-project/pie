@@ -16,3 +16,8 @@ pie-plan = { path = "../plan" }
 pie-eval = { path = "../eval" }
 pie-codegen = { path = "../codegen" }
 pie-driver-abi = { path = "../../interface/driver" }
+
+# Shared ratchet from the root manifest. These six crates are gated with
+# `-D warnings` in CI; see `[workspace.lints]` in the workspace `Cargo.toml`.
+[lints]
+workspace = true

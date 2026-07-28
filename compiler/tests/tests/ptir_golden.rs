@@ -1,7 +1,7 @@
-//! Golden vectors (thrust-3 P0.4): canonical container bytes + identity hash
-//! + validator verdict + tier-0 reference results, checked into
+//! Golden vectors (thrust-3 P0.4): canonical container bytes, identity hash,
+//! validator verdict and tier-0 reference results, checked into
 //! `golden/*.txt`. **This is the conformance suite for every backend** —
-//! charlie's CUDA tiers and delta's SDK diff against these files: the SDK must
+//! the CUDA driver's tiers and the SDK diff against these files: the SDK must
 //! emit byte-identical containers (same hex, same hash) and any executor must
 //! reproduce the step lines exactly.
 //!
@@ -44,16 +44,10 @@ impl Report {
         match r {
             Ok(b) => {
                 writeln!(self.0, "verdict: OK").unwrap();
-                // The PTIB typed sidecar (PTIR-CONTAINER.md §7): per-value
-                // (shape, dtype) + readiness + channel classes — what a
-                // backend consumes instead of re-inferring (option B). The
-                // readiness/class lines below restate it human-readably.
-                writeln!(
-                    self.0,
-                    "sidecar: {}",
-                    hex(&pie_plan::sidecar::encode_bound(b))
-                )
-                .unwrap();
+                // Per-value (shape, dtype), readiness, and channel classes:
+                // what a backend is handed instead of re-inferring. This used
+                // to be dumped twice, once as `PTIB` sidecar hex and once as
+                // the readable lines below; the hex is gone with the format.
                 for stage in pie_plan::compile_bound(b) {
                     let metrics = stage.metrics();
                     writeln!(
@@ -823,7 +817,7 @@ fn golden_matrix_select_mask() {
     // [k,v])) -> per-row argmax. EVERY matrix operand materializes k FULL
     // rows (k*v, row-major). Non-degenerate: each row's raw argmax is masked
     // out, so undersized rows / bf16-vs-f32 indexing errors cannot pass.
-    // Cross-backend gate: charlie's CUDA JIT + mac-master's Metal both match
+    // Cross-backend gate: the CUDA driver's JIT + the Metal driver both match
     // these step lines bit-exact.
     let (k, v) = (4u32, 8u32);
     let mut b = B::new();
@@ -900,7 +894,7 @@ fn golden_matrix_select_mask() {
 
 #[test]
 fn golden_pivot_predicates_multistage() {
-    // Regression pin (charlie thrust-3 / driver bound.hpp): container.rs
+    // Regression pin (CUDA driver thrust-3 / driver bound.hpp): container.rs
     // decodes `Predicate::{RankLe,CummassLe,ProbGe}`'s payload as a
     // per-STAGE-LOCAL ValueId (same as any op arg) — a translator MUST remap
     // it through that stage's global-id base before dereferencing it, exactly
@@ -1149,7 +1143,7 @@ fn golden_mtp_verify_tail() {
     // r2->6 (WOULD match d3 — but the mask forbids 6, allows {2} -> picked 2,
     // miss), r3->4 (bonus row; unused since n_acc=2 -> bonus is picked[2]).
     let mut logits = vec![0.0f32; (kp1 * v) as usize];
-    logits[0 * 8 + 3] = 9.0;
+    logits[3] = 9.0;
     logits[8 + 5] = 9.0;
     logits[2 * 8 + 6] = 9.0; // masked out
     logits[2 * 8 + 2] = 1.0; // the allowed survivor

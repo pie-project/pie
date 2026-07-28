@@ -1,6 +1,6 @@
 # oracle dump: pie::metal::pipeline::emit_fused_region_msl
 # source of truth: compiler/codegen/src/metal/ (the C++ oracle this was dumped from is deleted)
-# emitter_version: 30
+# emitter_version: 33
 # @runtime: bytes=39611 fnv1a64=0x310a2f7d72f22fd5
 # @grouped: bytes=970 fnv1a64=0xa8ab9e1ebf8714d9
 # cases: 192
@@ -15,6 +15,13 @@
 #   row -- the logits gather, argmax, and the typed copy behind a reshape -- are
 #   split across it. m1_copy_typed also moved from one device access per BYTE to
 #   one per word. Between them a decode step's GPU time went 89ms -> 6.5ms.
+#   re-blessed again (emitter 31): a same-footprint reshape is a view, so the
+#   grouped emitter elides its copy and points the consumers at the source
+#   value's offset. The runtime executed it as a byte-for-byte copy of the whole
+#   value, which in the sampler's graph was a vocabulary-wide round trip through
+#   device memory for nothing.
+# REGENERATED: the body below is this compiler's output, not the recorded output of the source of truth above
+#   reason: reshape elision now recognises a prefix view, so the sampler's vocabulary-wide reshape and its logits gather both fuse away
 === beam_epilogue#0 singleton#0
 function_name: ptir_m2_b4fadd8446eb58dd_r0
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
@@ -2417,24 +2424,8 @@ kernel void ptir_m2_82921040f7bc2612_r2(
 === pentathlon_iter#0 singleton#0
 function_name: ptir_m2_14f667a41eb30669_r0
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
-ok: true
-source: bytes=40372 prefix=@runtime tail_bytes=761
-kernel void ptir_m2_14f667a41eb30669_r0(
-    device M1Status* status [[buffer(0)]],
-    const device M1ValueDesc* descriptors [[buffer(1)]],
-    const device M1OpParams* params [[buffer(2)]],
-    const device uint* offsets [[buffer(3)]],
-    device uchar* scratch [[buffer(4)]],
-    device uchar* temporary [[buffer(5)]],
-    const device uchar* logits [[buffer(6)]],
-    const device uchar* committed_0 [[buffer(7)]],
-    device uchar* pending_0 [[buffer(8)]],
-    uint gid [[thread_position_in_grid]]) {
-  if (gid != 0 || status->state != 1) return;
-  const device uchar* current_0 = committed_0;
-  ptir_m1_execute(160u, status, descriptors, params + 0, logits, scratch, scratch, scratch + offsets[0], scratch, temporary);
-  if (status->state != 1) return;
-}
+ok: false
+error: Metal binds only the logits buffer for intrinsics; intrinsic id 3 has no binding
 === end
 === pentathlon_iter#0 singleton#1
 function_name: ptir_m2_14f667a41eb30669_r1
@@ -2549,24 +2540,8 @@ kernel void ptir_m2_14f667a41eb30669_r5(
 === pentathlon_iter#0 fused#0
 function_name: ptir_m2_14f667a41eb30669_r0
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
-ok: true
-source: bytes=40372 prefix=@runtime tail_bytes=761
-kernel void ptir_m2_14f667a41eb30669_r0(
-    device M1Status* status [[buffer(0)]],
-    const device M1ValueDesc* descriptors [[buffer(1)]],
-    const device M1OpParams* params [[buffer(2)]],
-    const device uint* offsets [[buffer(3)]],
-    device uchar* scratch [[buffer(4)]],
-    device uchar* temporary [[buffer(5)]],
-    const device uchar* logits [[buffer(6)]],
-    const device uchar* committed_0 [[buffer(7)]],
-    device uchar* pending_0 [[buffer(8)]],
-    uint gid [[thread_position_in_grid]]) {
-  if (gid != 0 || status->state != 1) return;
-  const device uchar* current_0 = committed_0;
-  ptir_m1_execute(160u, status, descriptors, params + 0, logits, scratch, scratch, scratch + offsets[0], scratch, temporary);
-  if (status->state != 1) return;
-}
+ok: false
+error: Metal binds only the logits buffer for intrinsics; intrinsic id 3 has no binding
 === end
 === pentathlon_iter#0 fused#1
 function_name: ptir_m2_14f667a41eb30669_r1
@@ -3314,49 +3289,8 @@ kernel void ptir_m2_dff3bc6795a9dcdf_r1(
 === pentathlon_iter#1 fused#2
 function_name: ptir_m2_dff3bc6795a9dcdf_r2
 region: library=0 library_op=0 schedule=1 nodes=6 inputs=2 outputs=0 sinks=3
-ok: true
-source: bytes=41867 prefix=@runtime tail_bytes=2256
-kernel void ptir_m2_dff3bc6795a9dcdf_r2(
-    device M1Status* status [[buffer(0)]],
-    const device M1ValueDesc* descriptors [[buffer(1)]],
-    const device M1OpParams* params [[buffer(2)]],
-    const device uint* offsets [[buffer(3)]],
-    device uchar* scratch [[buffer(4)]],
-    device uchar* temporary [[buffer(5)]],
-    const device uchar* logits [[buffer(6)]],
-    const device uchar* committed_0 [[buffer(7)]],
-    device uchar* pending_0 [[buffer(8)]],
-    const device uchar* committed_1 [[buffer(9)]],
-    device uchar* pending_1 [[buffer(10)]],
-    const device uchar* committed_2 [[buffer(11)]],
-    device uchar* pending_2 [[buffer(12)]],
-    const device uchar* committed_3 [[buffer(13)]],
-    device uchar* pending_3 [[buffer(14)]],
-    const device uchar* committed_4 [[buffer(15)]],
-    device uchar* pending_4 [[buffer(16)]],
-    uint gid [[thread_position_in_grid]]) {
-  if (gid != 0 || status->state != 1) return;
-  const device uchar* current_0 = committed_0;
-  const device uchar* current_1 = committed_1;
-  const device uchar* current_2 = committed_2;
-  const device uchar* current_3 = committed_3;
-  const device uchar* current_4 = committed_4;
-  ptir_m1_execute(57u, status, descriptors, params + 32, scratch + offsets[31], scratch, scratch, scratch + offsets[33], scratch, temporary);
-  if (status->state != 1) return;
-  ptir_m1_execute(57u, status, descriptors, params + 33, scratch + offsets[32], scratch, scratch, scratch + offsets[34], scratch, temporary);
-  if (status->state != 1) return;
-  ptir_m1_execute(146u, status, descriptors, params + 34, scratch + offsets[33], scratch, scratch, pending_2, scratch, temporary);
-  if (status->state != 1) return;
-  current_2 = pending_2;
-  ptir_m1_execute(146u, status, descriptors, params + 35, scratch + offsets[34], scratch, scratch, pending_3, scratch, temporary);
-  if (status->state != 1) return;
-  current_3 = pending_3;
-  ptir_m1_execute(160u, status, descriptors, params + 36, logits, scratch, scratch, scratch + offsets[35], scratch, temporary);
-  if (status->state != 1) return;
-  ptir_m1_execute(146u, status, descriptors, params + 37, scratch + offsets[35], scratch, scratch, pending_4, scratch, temporary);
-  if (status->state != 1) return;
-  current_4 = pending_4;
-}
+ok: false
+error: Metal binds only the logits buffer for intrinsics; intrinsic id 4 has no binding
 === end
 === pivot_predicates_multistage#1 singleton#0
 function_name: ptir_m2_09a2719886970a85_r0

@@ -295,6 +295,91 @@ void bind_prefill_gdn_state(RawMetalContext& ctx, const BoundDecode& b,
     (void)slot;  // the slotted shader consumes the per-token SlotOfToken buffer.
 }
 
+namespace {
+
+// The only state a prompt token hands to the next one: the GDN recurrent and
+// convolution slots, which every token reads and writes in place (and which
+// ping-pong, so token t's output buffer is token t+1's input). Paged KV is not
+// on this list -- each token appends at its own position, and the group barrier
+// below already orders the whole append group ahead of the whole attention
+// group.
+// The tail that exists only to produce a row's logits.
+bool produces_logits(Kernel kind) {
+    return kind == Kernel::QmvLmHead || kind == Kernel::Argmax;
+}
+
+bool carries_cross_token_state(Kernel kind) {
+    switch (kind) {
+        case Kernel::GdnPrep:
+        case Kernel::GdnPrepSlotted:
+        case Kernel::GdnCore:
+        case Kernel::GdnCoreSlotted:
+            return true;
+        default:
+            return false;
+    }
+}
+
+}  // namespace
+
+// A prefill walked token by token streams the whole checkpoint once per prompt
+// token -- 34 passes over 405MB for a 34-token prompt, which measured 118ms of
+// GPU against a 1.0ms bandwidth floor. Every token's DAG is the same DAG with
+// different argument tables, so walking it dispatch by dispatch instead reads
+// each weight tensor once and hands it to all N tokens back to back, small
+// enough to stay in cache, and gives the GPU N-way work where it had one narrow
+// dispatch.
+//
+// The reorder is legal because a barrier closes every dispatch group: token t's
+// dispatch i is ordered ahead of any token's dispatch i+1, which is every
+// dependency inside a token and every dependency through paged KV. The one
+// exception is the GDN state above, which is serialized token by token.
+void encode_prefill_dags_mb(StepEncoder& se,
+                            const std::vector<std::vector<Dispatch>>& dags,
+                            int n_tokens,
+                            const DecodeStepPsos& base_psos,
+                            const MultiBatchPsos& mb_psos,
+                            bool force_barriers,
+                            const std::vector<std::uint8_t>& row_needs_logits) {
+    const size_t n = n_tokens > 0 ? size_t(n_tokens) : 0;
+    if (n == 0 || dags.size() < n) return;
+    const size_t length = dags[0].size();
+    // Token-major is the contract this reorders; if the DAGs ever stop being the
+    // same shape, that assumption is gone and so is the reorder.
+    for (size_t t = 1; t < n; ++t) {
+        if (dags[t].size() != length) {
+            for (size_t k = 0; k < n; ++k)
+                encode_decode_step_mb(se, dags[k], base_psos, mb_psos, force_barriers);
+            return;
+        }
+    }
+    // Every group ends in a barrier. Letting the adjacent-group hazard rule
+    // relax some of them was measured and moved nothing (93.6ms against 93.0ms):
+    // N-way concurrency inside a group already saturates the machine.
+    // lm_head reads the whole output embedding -- 127MB for this checkpoint,
+    // far past any cache -- so running it for a prompt row nobody samples is the
+    // single most expensive wasted dispatch in a prefill.
+    const bool skip_unsampled_logits = row_needs_logits.size() >= n;
+    for (size_t i = 0; i < length; ++i) {
+        const bool serialize = carries_cross_token_state(dags[0][i].kind);
+        const bool logits_tail = skip_unsampled_logits && produces_logits(dags[0][i].kind);
+        for (size_t t = 0; t < n; ++t) {
+            if (logits_tail && row_needs_logits[t] == 0) continue;
+            const Dispatch& d = dags[t][i];
+            if (d.kind != dags[0][i].kind) {
+                for (size_t k = 0; k < n; ++k)
+                    encode_decode_step_mb(se, dags[k], base_psos, mb_psos, force_barriers);
+                return;
+            }
+            se.set_pso(mb_pso(d, base_psos, mb_psos));
+            se.set_argtable(d.kind, d.ordinal);
+            se.dispatch(d.grid, d.tg);
+            if (serialize && t + 1 < n) se.barrier();
+        }
+        se.barrier();
+    }
+}
+
 void encode_decode_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
                            const DecodeStepPsos& base_psos, const MultiBatchPsos& mb_psos,
                            bool force_barriers) {

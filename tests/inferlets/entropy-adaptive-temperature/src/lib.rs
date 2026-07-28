@@ -289,13 +289,13 @@ async fn main(input: Input) -> Result<Output> {
         let tok_in = Channel::from(vec![g0; 1]).named("tok_in");
         let rng = Channel::from(vec![input.seed ^ 0x5bd1, 0]).named("rng");
         let tok_out = Channel::new([1], dtype::i32)
-            .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+            .capacity(channel_capacity() as u32)
             .named("tok_out");
         let s1_out = Channel::new([1], dtype::f32)
-            .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+            .capacity(channel_capacity() as u32)
             .named("s1_out");
         let s2_out = Channel::new([1], dtype::f32)
-            .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+            .capacity(channel_capacity() as u32)
             .named("s2_out");
         let lane1 = Channel::from(vec![0u32, 1u32]).named("embed_indptr");
         let positions = Channel::from(vec![n]).named("positions");
@@ -345,15 +345,7 @@ async fn main(input: Input) -> Result<Output> {
         });
 
         let budget = max_tokens - 1;
-        let mut submitted = 0usize;
-        let mut in_flight = 0usize;
-        while in_flight < DEFAULT_RUNAHEAD_DEPTH && submitted < budget {
-            fwd.submit(&pipe)
-                .map_err(|e| format!("decode submit @{}: {e}", submitted + 1))?;
-            submitted += 1;
-            in_flight += 1;
-        }
-        while in_flight > 0 {
+        run_ahead(&pipe, &fwd, budget as usize, async || {
             let t = tok_out
                 .take()
                 .get::<i32>()
@@ -369,17 +361,12 @@ async fn main(input: Input) -> Result<Output> {
                 .get::<f32>()
                 .await
                 .map_err(|e| format!("s2_out.take @{}: {e}", generated.len()))?[0];
-            in_flight -= 1;
             generated.push(t as u32);
             s1.push(a);
             s2.push(b);
-            if submitted < budget {
-                fwd.submit(&pipe)
-                    .map_err(|e| format!("decode submit @{}: {e}", submitted + 1))?;
-                submitted += 1;
-                in_flight += 1;
-            }
-        }
+            Ok(ControlFlow::Continue(()))
+        })
+        .await?;
     }
     pipe.close();
 

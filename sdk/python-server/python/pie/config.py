@@ -114,6 +114,43 @@ class Config:
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
 
+    def _emit_worker_tables(self, buf, prefix: str) -> None:
+        """Emit the worker-domain tables under `prefix` (`""` or `"worker."`).
+
+        Both consumers want the same tables and differ only in nesting, so
+        this is written once. Keeping them in one place is what stops the two
+        emitters from drifting apart again.
+        """
+        _emit_table(buf, f"{prefix}server", _block(self.server))
+        _emit_table(buf, f"{prefix}auth", _block(self.auth))
+        _emit_table(buf, f"{prefix}telemetry", _block(self.telemetry))
+        _emit_table(buf, f"{prefix}runtime", _block(self.runtime))
+        m = self.model
+        buf.write(f"\n[{prefix}model]\n")
+        _emit_kv(buf, "name", m.name)
+        _emit_kv(buf, "hf_repo", m.hf_repo)
+        _emit_table(buf, f"{prefix}model.driver", _driver_block(m.driver),
+                    leading_newline=True)
+        if m.driver.options:
+            buf.write(f"\n[{prefix}model.driver.options]\n")
+            for k, v in m.driver.options.items():
+                _emit_kv(buf, k, v)
+        if m.scheduler is not None:
+            _emit_table(buf, f"{prefix}model.scheduler", _block(m.scheduler),
+                        leading_newline=True)
+
+    def to_engine_toml(self) -> str:
+        """Serialize to the FLAT document the embedded engine parses.
+
+        `pie._engine.bootstrap` deserializes straight into the worker's own
+        `ServeConfig`, which knows nothing about roles — it rejects a
+        `[controller]` or `[worker]` table outright. The embedded wheel is
+        always single-node and IS the worker, so there is no role to select.
+        """
+        buf = io.StringIO()
+        self._emit_worker_tables(buf, "")
+        return buf.getvalue().lstrip("\n")
+
     def to_toml(self) -> str:
         """Serialize to the combined standalone TOML `pie serve --config` reads.
 
@@ -134,23 +171,7 @@ class Config:
         if port is not None:
             _emit_kv(buf, "listen", f"{host}:{port}")
         _emit_table(buf, "worker", {}, leading_newline=True)
-        _emit_table(buf, "worker.server", _block(self.server))
-        _emit_table(buf, "worker.auth", _block(self.auth))
-        _emit_table(buf, "worker.telemetry", _block(self.telemetry))
-        _emit_table(buf, "worker.runtime", _block(self.runtime))
-        m = self.model
-        buf.write("\n[worker.model]\n")
-        _emit_kv(buf, "name", m.name)
-        _emit_kv(buf, "hf_repo", m.hf_repo)
-        _emit_table(buf, "worker.model.driver", _driver_block(m.driver),
-                    leading_newline=True)
-        if m.driver.options:
-            buf.write("\n[worker.model.driver.options]\n")
-            for k, v in m.driver.options.items():
-                _emit_kv(buf, k, v)
-        if m.scheduler is not None:
-            _emit_table(buf, "worker.model.scheduler", _block(m.scheduler),
-                        leading_newline=True)
+        self._emit_worker_tables(buf, "worker.")
         return buf.getvalue()
 
 

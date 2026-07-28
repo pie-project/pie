@@ -140,6 +140,8 @@ void mixtral_forward_paged(
     int total_tokens,
     int num_requests,
     bool is_pure_decode,
+    const std::int32_t* logit_row_indices_d = nullptr,
+    int num_logit_rows = 0,
     const std::uint8_t* custom_mask_d = nullptr,
     const std::int32_t* custom_mask_indptr_d = nullptr);
 

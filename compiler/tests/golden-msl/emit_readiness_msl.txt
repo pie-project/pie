@@ -1,6 +1,6 @@
 # oracle dump: pie::metal::pipeline::emit_readiness_msl
 # source of truth: compiler/codegen/src/metal/ (the C++ oracle this was dumped from is deleted)
-# emitter_version: 30
+# emitter_version: 33
 # @runtime: bytes=39611 fnv1a64=0x310a2f7d72f22fd5
 # @grouped: bytes=970 fnv1a64=0xa8ab9e1ebf8714d9
 # cases: 45
@@ -28,6 +28,13 @@
 #   row -- the logits gather, argmax, and the typed copy behind a reshape -- are
 #   split across it. m1_copy_typed also moved from one device access per BYTE to
 #   one per word. Between them a decode step's GPU time went 89ms -> 6.5ms.
+#   re-blessed again (emitter 31): a same-footprint reshape is a view, so the
+#   grouped emitter elides its copy and points the consumers at the source
+#   value's offset. The runtime executed it as a byte-for-byte copy of the whole
+#   value, which in the sampler's graph was a vocabulary-wide round trip through
+#   device memory for nothing.
+# REGENERATED: the body below is this compiler's output, not the recorded output of the source of truth above
+#   reason: reshape elision now recognises a prefix view, so the sampler's vocabulary-wide reshape and its logits gather both fuse away
 === empty
 function_name: ptir_m1_empty_ready
 channels: 0

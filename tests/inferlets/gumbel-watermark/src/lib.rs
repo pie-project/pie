@@ -180,10 +180,7 @@ fn context_counter(hist: &Tensor, hlen: &Tensor, cfg: Cfg) -> Tensor {
         );
         // `+1` lifts the `-1` padding sentinel to 0 and keeps every real token
         // distinguishable from it.
-        let tok = cast(
-            add(gather(hist, &idx), Tensor::constant(1i32)),
-            DType::U32,
-        );
+        let tok = cast(add(gather(hist, &idx), Tensor::constant(1i32)), DType::U32);
         h = rem(
             add(mul(&h, Tensor::constant(HASH_MULTIPLIER)), tok),
             Tensor::constant(HASH_MODULUS),
@@ -405,13 +402,13 @@ async fn main(input: Input) -> Result<Output> {
         let hist_c = Channel::from(history.clone()).named("hist");
         let hlen_c = Channel::from(vec![n + 1]).named("hlen");
         let tok_out = Channel::new([1], dtype::i32)
-            .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+            .capacity(channel_capacity() as u32)
             .named("tok_out");
         let score_out = Channel::new([1], dtype::f32)
-            .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+            .capacity(channel_capacity() as u32)
             .named("score_out");
         let null_out = Channel::new([1], dtype::f32)
-            .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+            .capacity(channel_capacity() as u32)
             .named("null_out");
         let lane1 = Channel::from(vec![0u32, 1u32]).named("embed_indptr");
         let positions = Channel::from(vec![n]).named("positions");
@@ -465,15 +462,7 @@ async fn main(input: Input) -> Result<Output> {
         });
 
         let budget = max_tokens - 1;
-        let mut submitted = 0usize;
-        let mut in_flight = 0usize;
-        while in_flight < DEFAULT_RUNAHEAD_DEPTH && submitted < budget {
-            fwd.submit(&pipe)
-                .map_err(|e| format!("decode submit @{}: {e}", submitted + 1))?;
-            submitted += 1;
-            in_flight += 1;
-        }
-        while in_flight > 0 {
+        run_ahead(&pipe, &fwd, budget as usize, async || {
             let t = tok_out
                 .take()
                 .get::<i32>()
@@ -489,17 +478,12 @@ async fn main(input: Input) -> Result<Output> {
                 .get::<f32>()
                 .await
                 .map_err(|e| format!("null_out.take @{}: {e}", generated.len()))?[0];
-            in_flight -= 1;
             generated.push(t as u32);
             scores.push(s);
             nulls.push(z);
-            if submitted < budget {
-                fwd.submit(&pipe)
-                    .map_err(|e| format!("decode submit @{}: {e}", submitted + 1))?;
-                submitted += 1;
-                in_flight += 1;
-            }
-        }
+            Ok(ControlFlow::Continue(()))
+        })
+        .await?;
     }
     pipe.close();
 

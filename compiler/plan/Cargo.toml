@@ -3,7 +3,7 @@ name = "pie-plan"
 version = "0.1.0"
 edition = "2024"
 authors = ["In Gim <in.gim@yale.edu>"]
-description = "PTIR execution planning: normalization, stage signatures, value-domain analysis, region partitioning, and the lane-table ABI, serialized as the versioned region plan (`PTRP`) and the bound-trace sidecar (`PTIB`) drivers consume."
+description = "PTIR execution planning: normalization, stage signatures, value-domain analysis, region partitioning, and the lane-table ABI, produced as in-memory stage plans that emission consumes directly."
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 keywords = ["pie", "tensor", "ir", "ptir", "compiler"]
@@ -13,11 +13,17 @@ name = "pie_plan"
 crate-type = ["rlib"]
 path = "src/lib.rs"
 
-# `std` (default) only adds the `std::error::Error` impl on the sidecar decode
-# error; the planner itself is `no_std` (+ `alloc`).
+# The planner is `no_std` (+ `alloc`) and has no error type of its own, so
+# `std` (default) does nothing here but forward to `pie-ir`, whose decode and
+# validate errors carry the `std::error::Error` impls.
 [features]
 default = ["std"]
 std = ["pie-ir/std"]
 
 [dependencies]
 pie-ir = { path = "../ir", default-features = false }
+
+# Shared ratchet from the root manifest. These six crates are gated with
+# `-D warnings` in CI; see `[workspace.lints]` in the workspace `Cargo.toml`.
+[lints]
+workspace = true

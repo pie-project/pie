@@ -103,7 +103,7 @@ class Server:
         # longer auto-installs it). Best-effort, off-thread.
         await asyncio.to_thread(_ensure_py_runtime)
 
-        toml_str = self._config.to_toml()
+        toml_str = self._config.to_engine_toml()
         self._handle = await asyncio.to_thread(_engine.bootstrap, toml_str)
         return self
 

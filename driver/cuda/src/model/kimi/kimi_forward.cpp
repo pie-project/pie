@@ -25,13 +25,18 @@
 #include "kernels/rmsnorm.hpp"
 #include "kernels/rope.hpp"
 #include "kernels/swiglu.hpp"
+#include "ops/flashinfer_moe.hpp"
 
 namespace pie_cuda_driver::model {
 
 
-// Below this token count the W4A16 GEMVs win: they stream int4 weights
-// (a quarter of the BF16 traffic) and there is no reuse to exploit yet.
-constexpr int kKimiMoeGemvMaxTokens = 8;
+// The per-route decode GEMV wins only at a single token. It dequantises int4
+// with scalar FP32 ALU and re-reads each routed expert per token, while the
+// batched/fused paths run on tensor cores over a materialised BF16 stack.
+// Measured on kimi26-mini (output tok/s, GEMV vs batched): c=1 564/566,
+// c=2 896/1088, c=4 1301/2089, c=8 1718/4103. Override with
+// `PIE_MOE_GEMV_MAX_TOKENS`.
+constexpr int kKimiMoeGemvMaxTokens = 1;
 // Per-layer budget for the materialised BF16 expert stack. The mini
 // checkpoints (E=8) need ~0.7 GiB; a full 384-expert Kimi would need ~34 GiB,
 // so it stays on the W4A16 path where each expert is touched at most a few
@@ -344,17 +349,28 @@ void kimi_materialize_bf16_expert_stacks(
             DeviceTensor::allocate(DType::BF16, {E, H, I}));
         auto* gu = static_cast<std::uint16_t*>(Lw.moe_gate_up_bf16->data());
         auto* dn = static_cast<std::uint16_t*>(Lw.moe_down_bf16->data());
+        // Which half each projection lands in. There is no checkpoint tensor
+        // with this layout -- the loader publishes `gate_packed` and
+        // `up_packed` per expert and this stack is synthesised by dequantising
+        // them -- so the order is chosen here, at no cost, rather than undone
+        // later by a copy. `[up | gate]` is what flashinfer's grouped GEMM
+        // reads fc1 as.
+        const bool gate_second = kimi_moe_gate_up_swapped();
+        const std::size_t gate_off = gate_second ? half : 0;
+        const std::size_t up_off   = gate_second ? 0 : half;
         for (int e = 0; e < E; ++e) {
             const auto& ew = Lw.experts[static_cast<std::size_t>(e)];
             if (ew.gate_packed == nullptr) continue;
             kernels::launch_dequant_wna16_int4b8_to_bf16(
                 static_cast<const std::int32_t*>(ew.gate_packed->data()),
                 ew.gate_scale->data(),
-                gu + static_cast<std::size_t>(e) * gu_stride, I, H, 32, stream);
+                gu + static_cast<std::size_t>(e) * gu_stride + gate_off,
+                I, H, 32, stream);
             kernels::launch_dequant_wna16_int4b8_to_bf16(
                 static_cast<const std::int32_t*>(ew.up_packed->data()),
                 ew.up_scale->data(),
-                gu + static_cast<std::size_t>(e) * gu_stride + half, I, H, 32, stream);
+                gu + static_cast<std::size_t>(e) * gu_stride + up_off,
+                I, H, 32, stream);
             kernels::launch_dequant_wna16_int4b8_to_bf16(
                 static_cast<const std::int32_t*>(ew.down_packed->data()),
                 ew.down_scale->data(),
@@ -463,6 +479,20 @@ KimiWorkspace KimiWorkspace::allocate(
         for (DeviceTensor* t : {&ws.a_gu_ptrs, &ws.b_gu_ptrs, &ws.c_gu_ptrs,
                                 &ws.a_dn_ptrs, &ws.b_dn_ptrs, &ws.c_dn_ptrs}) {
             *t = DeviceTensor::allocate(DType::INT64, {std::max<std::int64_t>(pw, 1)});
+        }
+    }
+    if (routed_I > 0 && cfg.num_experts > 0 && Ktop > 0 &&
+        ops::flashinfer_cutlass_moe_enabled() && kimi_moe_gate_up_swapped()) {
+        ws.cutlass_max_rows = std::min(N, ops::flashinfer_cutlass_moe_max_rows());
+        const std::size_t bytes = ops::flashinfer_cutlass_moe_workspace_bytes(
+            ops::MoeActivation::Swiglu, ws.cutlass_max_rows, H, routed_I,
+            cfg.num_experts, Ktop, /*tp_size=*/1, /*tp_rank=*/0);
+        if (bytes > 0) {
+            ws.cutlass_ws = DeviceTensor::allocate(
+                DType::UINT8, {static_cast<std::int64_t>(bytes)});
+            ws.cutlass_row_map = DeviceTensor::allocate(
+                DType::INT32,
+                {static_cast<std::int64_t>(ws.cutlass_max_rows) * Ktop});
         }
     }
     ws.logits        = DeviceTensor::allocate(DType::BF16, {O, cfg.vocab_size});
@@ -863,18 +893,50 @@ void kimi_forward_paged(
             return v != nullptr && v[0] != '\0';
         }();
 
-        // The W4A16 GEMVs re-read every routed expert once per token, so their
-        // weight traffic grows linearly with the batch. A batched GEMM over a
-        // materialised BF16 stack reads each active expert exactly once. BF16
-        // is 4x the bytes of int4, so the batched path wins once
-        // `routes > 4 * active_experts`.
+        // The W4A16 GEMVs dequantise int4 with scalar FP32 ALU and re-read
+        // every routed expert once per token; the batched path materialises a
+        // BF16 stack and runs on tensor cores. Its weight traffic is 4x, but it
+        // is roughly 30x faster per token, so the crossover sits far below what
+        // `routes > 4 * active_experts` predicts. The traffic model still gates
+        // the compiled-in default; `PIE_MOE_GEMV_MAX_TOKENS=0` retires the GEMV.
         const int routes = total_tokens * K;
+        const int gemv_max = ops::moe_gemv_max_tokens(kKimiMoeGemvMaxTokens);
         const bool want_batched =
             Lw.moe_gate_up_bf16 != nullptr && kimi_ws.aligned_block_size > 0 &&
-            total_tokens > kKimiMoeGemvMaxTokens &&
-            routes > 4 * std::min(E, routes) && !force_prefill_moe;
+            total_tokens > gemv_max &&
+            (gemv_max <= 0 || routes > 4 * std::min(E, routes)) &&
+            !force_prefill_moe;
 
-        if (want_batched) {
+        // flashinfer's fused grouped GEMM does the batched path's whole job in
+        // one call and without its padding: it permutes rows by expert, runs
+        // both GEMMs over the actual row counts, and folds SwiGLU and the top-k
+        // weighted sum into GEMM2's FINALIZE epilogue. The batched path has to
+        // provision `max_blocks` for worst-case routing skew and run every
+        // block unconditionally, which is what makes it lose at high E.
+        bool fused_moe_ran = false;
+        if (want_batched && !kimi_ws.cutlass_ws.empty() &&
+            total_tokens <= kimi_ws.cutlass_max_rows &&
+            total_tokens >= ops::flashinfer_cutlass_moe_min_rows()) {
+            profile_cuda_stage(&profile, &profile.moe_prefill_ms, stream, [&] {
+                fused_moe_ran = ops::flashinfer_cutlass_moe_bf16(
+                    ops::MoeActivation::Swiglu,
+                    static_cast<const std::uint16_t*>(kimi_ws.norm_y.data()),
+                    static_cast<const std::int32_t*>(kimi_ws.topk_idx.data()),
+                    static_cast<const float*>(kimi_ws.topk_weights.data()),
+                    static_cast<const std::uint16_t*>(Lw.moe_gate_up_bf16->data()),
+                    static_cast<const std::uint16_t*>(Lw.moe_down_bf16->data()),
+                    static_cast<std::uint16_t*>(kimi_ws.moe_out.data()),
+                    static_cast<std::uint8_t*>(kimi_ws.cutlass_ws.data()),
+                    static_cast<std::size_t>(kimi_ws.cutlass_ws.nbytes()),
+                    static_cast<std::int32_t*>(kimi_ws.cutlass_row_map.data()),
+                    total_tokens, H, routed_I, E, K,
+                    /*tp_size=*/1, /*tp_rank=*/0, stream);
+            });
+        }
+
+        if (fused_moe_ran) {
+            // FINALIZE already applied `topk_weights` and summed the K experts.
+        } else if (want_batched) {
             profile_cuda_stage(&profile, &profile.moe_prefill_ms, stream, [&] {
                 const int block = std::min(kimi_ws.aligned_block_size,
                                            kernels::moe_aligned_block(routes, E));
@@ -920,7 +982,8 @@ void kimi_forward_paged(
                     block, 2 * routed_I, H, max_blocks);
                 kernels::launch_chunked_swiglu_bf16(
                     kimi_ws.aligned_gate_up.data(), kimi_ws.aligned_act.data(),
-                    aligned_rows, routed_I, stream);
+                    aligned_rows, routed_I, stream,
+                    /*gate_second=*/kimi_moe_gate_up_swapped());
                 ops::gemm_batched_act_x_wt_bf16(cublas.handle(),
                     reinterpret_cast<const void* const*>(kimi_ws.b_dn_ptrs.data()),
                     reinterpret_cast<const void* const*>(kimi_ws.a_dn_ptrs.data()),

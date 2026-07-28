@@ -84,4 +84,9 @@ struct KimiWeights {
 
 KimiWeights bind_kimi(const LoadedModel& engine);
 
+/// True when the materialised routed `gate_up` stack is written as
+/// `[up | gate]` -- the order flashinfer's CUTLASS grouped GEMM reads fc1 in.
+/// The stack builder and every consumer must agree, so both ask here.
+bool kimi_moe_gate_up_swapped();
+
 }  // namespace pie_cuda_driver::model

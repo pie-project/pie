@@ -151,6 +151,19 @@ pub fn fold_stage(
             // fold is value-only, so they are inert here.
             Op::SinkCall { .. } => {}
             _ => {
+                // The arms above name every effectful op plus `IntrinsicVal`;
+                // everything reaching here is folded as a pure function of its
+                // operands. An effectful op that slipped out of those arms
+                // would be folded as if the host could perform it, and a
+                // device-carried value would come back host-derivable — a pass
+                // scheduled that cannot run. `is_effectful` is exhaustive over
+                // `Op`, so this is the fold checking itself rather than a test
+                // restating it somewhere else.
+                debug_assert!(
+                    !op.is_effectful(),
+                    "{op:?} reached the fold's general arm, which evaluates it \
+                     as a pure function of its operands"
+                );
                 if let Some(blocker) = blocked {
                     for offset in 0..op.result_count() as usize {
                         push(
@@ -185,13 +198,21 @@ pub fn fold_stage(
     Ok(fold)
 }
 
+/// A dtype-correct stand-in for a blocked value.
+///
+/// Blocked operands short-circuit before `eval_op` (the `if let Some(blocker)
+/// = blocked` arm returns early), so nothing ever reads a placeholder —
+/// `dense` only needs an entry to stay index-aligned with `slots`. It is
+/// therefore empty on purpose: materialising the declared `numel()` zeroed a
+/// whole tensor per blocked op, and in a decode epilogue (where every kernel
+/// and intrinsic is blocked) that dominated the host cost of a forward
+/// submit.
 fn placeholder(ty: pie_ir::types::ValueType) -> Value {
-    let n = ty.shape.numel().max(1) as usize;
     match ty.dtype {
-        pie_ir::types::DType::F32 => Value::F32(alloc::vec![0.0; n]),
-        pie_ir::types::DType::I32 => Value::I32(alloc::vec![0; n]),
-        pie_ir::types::DType::U32 => Value::U32(alloc::vec![0; n]),
-        pie_ir::types::DType::Bool => Value::Bool(alloc::vec![false; n]),
+        pie_ir::types::DType::F32 => Value::F32(alloc::vec::Vec::new()),
+        pie_ir::types::DType::I32 => Value::I32(alloc::vec::Vec::new()),
+        pie_ir::types::DType::U32 => Value::U32(alloc::vec::Vec::new()),
+        pie_ir::types::DType::Bool => Value::Bool(alloc::vec::Vec::new()),
     }
 }
 
@@ -272,7 +293,18 @@ fn stage_taint(ops: &[Op], device_decided: &BTreeSet<u32>) -> (BTreeMap<u32, boo
     for op in ops {
         let arg_tainted = op.operands().iter().any(|&arg| tainted[arg as usize]);
         let out = match op {
-            Op::KernelCall { .. } | Op::IntrinsicVal { .. } => true,
+            // Device-decided at their source. A kernel or intrinsic result
+            // exists only once the device has run. `Rng` belongs here too: it
+            // is the ambient-seed form, and the ambient seed is a per-fire
+            // device fact, not something the host can replay. `SinkCall`
+            // defines no results, so its answer is never read.
+            Op::KernelCall { .. }
+            | Op::IntrinsicVal { .. }
+            | Op::SinkCall { .. }
+            | Op::Rng { .. } => true,
+
+            // A read inherits whatever this stage already put, else whatever
+            // an earlier stage proved.
             Op::ChanTake(chan) | Op::ChanRead(chan) => match pending.get(chan) {
                 Some(&t) => t,
                 None => device_decided.contains(chan),
@@ -285,7 +317,65 @@ fn stage_taint(ops: &[Op], device_decided: &BTreeSet<u32>) -> (BTreeMap<u32, boo
                 }
                 false
             }
-            _ => arg_tainted,
+
+            // Everything else is a pure function of its operands, so it is
+            // host-derivable exactly when all of them are. `RngKeyed` is in
+            // this set on purpose: PTIR-CONTAINER.md pins it as a pure
+            // function of its `state` operand, so replaying the state
+            // replays the noise.
+            //
+            // Spelled out rather than left to `_` because the answer for a
+            // new op is a judgement, not a default: a wrong `false` here
+            // tells the scheduler it can derive a descriptor it cannot, and
+            // the audit that prompted this found `Rng` doing exactly that.
+            Op::Const(..)
+            | Op::Exp(..)
+            | Op::Log(..)
+            | Op::Neg(..)
+            | Op::Recip(..)
+            | Op::Abs(..)
+            | Op::Sign(..)
+            | Op::Cast { .. }
+            | Op::Add(..)
+            | Op::Sub(..)
+            | Op::Mul(..)
+            | Op::Div(..)
+            | Op::MaxElem(..)
+            | Op::MinElem(..)
+            | Op::Rem(..)
+            | Op::Gt(..)
+            | Op::Ge(..)
+            | Op::Eq(..)
+            | Op::Ne(..)
+            | Op::Lt(..)
+            | Op::Le(..)
+            | Op::And(..)
+            | Op::Or(..)
+            | Op::Not(..)
+            | Op::Select { .. }
+            | Op::ReduceSum(..)
+            | Op::ReduceMax(..)
+            | Op::ReduceMin(..)
+            | Op::ReduceArgmax(..)
+            | Op::Broadcast { .. }
+            | Op::Reshape { .. }
+            | Op::Transpose(..)
+            | Op::CumSum(..)
+            | Op::CumProd(..)
+            | Op::SortDesc(..)
+            | Op::TopK { .. }
+            | Op::PivotThreshold { .. }
+            | Op::MatMul(..)
+            | Op::Gather { .. }
+            | Op::GatherRow { .. }
+            | Op::ScatterAdd { .. }
+            | Op::ScatterSet { .. }
+            | Op::Iota { .. }
+            | Op::MaskApply { .. }
+            | Op::CausalMask { .. }
+            | Op::SlidingWindowMask { .. }
+            | Op::SinkWindowMask { .. }
+            | Op::RngKeyed { .. } => arg_tainted,
         };
         for _ in 0..op.result_count() {
             tainted.push(out);
@@ -352,7 +442,7 @@ mod tests {
     };
     use pie_ir::op::IntrinsicId;
     use pie_ir::registry::ModelProfile;
-    use pie_ir::types::{DType, Literal, Shape};
+    use pie_ir::types::{DType, Literal, RngKind, Shape};
     use pie_ir::validate::bind;
 
     fn chan(shape: Shape, dtype: DType, capacity: u32) -> ChannelDecl {
@@ -599,11 +689,126 @@ mod tests {
         );
     }
 
+    /// `Rng` draws from an ambient per-fire seed, so its result is a device
+    /// fact even though the op has no value operands. It used to reach
+    /// `stage_taint`'s catch-all and inherit `arg_tainted` — vacuously
+    /// `false` for an operand-free op — which told the scheduler it could
+    /// derive a descriptor whose width came out of the device's noise.
+    #[test]
+    fn ambient_rng_taints_what_it_reaches() {
+        use Op::*;
+        let mut trace = sdk_geometry_trace();
+        trace.stages.push(StageProgram {
+            stage: Stage::Epilogue,
+            ops: vec![
+                Rng {
+                    stream: 0,
+                    shape: Shape::vector(3),
+                    kind: RngKind::Uniform,
+                }, // 0 F32 [3]
+                Cast {
+                    value: 0,
+                    dtype: DType::U32,
+                }, // 1
+                Cast {
+                    value: 1,
+                    dtype: DType::I32,
+                }, // 2
+                ChanPut { chan: 0, value: 2 },
+            ],
+        });
+        let bound = bind(trace, ModelProfile::dummy()).unwrap();
+        let taint = geometry_taint(&bound);
+        assert!(taint.device_decided.contains(&0), "rng-fed tokens");
+        assert!(taint.device_dependent_ports.contains(&Port::EmbedTokens));
+        assert!(taint.device_dependent_ports.contains(&Port::Positions));
+        assert!(!taint.host_derivable());
+    }
+
+    /// The keyed form is the opposite case and must stay untainted:
+    /// PTIR-CONTAINER.md §5 pins it as a pure function of its `state`
+    /// operand, so a host holding the state replays the same noise.
+    #[test]
+    fn keyed_rng_is_only_as_tainted_as_its_state() {
+        use Op::*;
+        let mut trace = sdk_geometry_trace();
+        trace.channels.push(chan(Shape::vector(2), DType::U32, 1));
+        trace.stages.push(StageProgram {
+            stage: Stage::Epilogue,
+            ops: vec![
+                ChanRead(8), // 0 state [2] U32, seeded ⇒ host-known
+                RngKeyed {
+                    state: 0,
+                    shape: Shape::vector(3),
+                    kind: RngKind::Uniform,
+                }, // 1
+                Cast {
+                    value: 1,
+                    dtype: DType::I32,
+                }, // 2
+                ChanPut { chan: 0, value: 2 },
+            ],
+        });
+        let bound = bind(trace, ModelProfile::dummy()).unwrap();
+        let taint = geometry_taint(&bound);
+        assert!(taint.host_derivable(), "keyed noise is replayable");
+    }
+
     #[test]
     fn seeded_prefill_is_host_derivable() {
         let bound = bind(sdk_geometry_trace(), ModelProfile::dummy()).unwrap();
         let taint = geometry_taint(&bound);
         assert!(taint.device_decided.is_empty());
         assert!(taint.host_derivable());
+    }
+
+    /// The `_` arm of the fold hands its op to `eval_op` as a pure function of
+    /// already-evaluated operands. That is right for everything the arms above
+    /// do not name — and the arms above name exactly the effectful ops plus
+    /// `IntrinsicVal`.
+    ///
+    /// A new channel or call op would fall into `_` and be folded as if the
+    /// host could perform it, which is how a device-carried value would end up
+    /// classified host-derivable and a pass scheduled that cannot run. The list
+    /// below is a second spelling of the match arms, so it will not drift
+    /// silently: `Op::is_effectful` is exhaustive, so a new effectful op forces
+    /// an edit there, and that edit fails here until the fold names it too.
+    /// The set of ops the fold names, pinned against `Op::is_effectful`.
+    ///
+    /// This is a *transcription* of the match arms, not a call into the fold,
+    /// and on its own it is blind to an edit of the fold itself — a mutation
+    /// that deleted `Op::ChanRead` from the match passed this test. The
+    /// behavioural half now lives in the fold: its general arm carries a
+    /// `debug_assert!(!op.is_effectful())`, so an effectful op that slips out
+    /// of the arms fails the moment any trace folds it, with a message naming
+    /// the op. What this test adds is the other direction — that the arms do
+    /// not name something `is_effectful` calls pure, which no trace would
+    /// reveal because the fold would simply be conservative.
+    #[test]
+    fn the_fold_only_generalises_over_pure_ops() {
+        let mut checked = 0usize;
+        for op in pie_ir::op::representatives() {
+            let named_by_the_fold = matches!(
+                op,
+                Op::ChanTake(..)
+                    | Op::ChanRead(..)
+                    | Op::ChanPut { .. }
+                    | Op::KernelCall { .. }
+                    | Op::SinkCall { .. }
+                    | Op::IntrinsicVal { .. }
+            );
+            let must_be_named = op.is_effectful() || matches!(op, Op::IntrinsicVal { .. });
+            assert_eq!(
+                named_by_the_fold, must_be_named,
+                "{op:?} disagrees: the fold names it {named_by_the_fold}, \
+                 but purity says {must_be_named}"
+            );
+            checked += 1;
+        }
+        assert_eq!(
+            checked,
+            pie_ir::op::OP_TABLE.len(),
+            "representatives() stopped covering the table"
+        );
     }
 }

@@ -8,75 +8,53 @@
 //! two inline expansions the single-lane form does not have — the MTP-draft
 //! argmax and the logits gather.
 
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt::Write as _;
+use pie_ir::op::{intrinsic_tags, tags};
 
-use pie_plan::{CompiledStage, Region};
+use pie_plan::{CompiledStage, Dimension, Region};
 
 use super::METAL_M2_MAX_FUSED_CHANNELS;
 use super::preamble::{RUNTIME_TEMPLATE, grouped_preamble};
-use super::validate::{library_region_valid, used_channel_slots};
+use super::validate::{intrinsics_bindable, library_region_valid, used_channel_slots};
+use crate::fault::{FUSED_GEOMETRY_MISMATCH, M3_THREADS_EXCEEDED};
 use crate::op_view::{OpView, result_bases};
-
-const OP_PIVOT_THRESHOLD: u8 = 0x58;
-const OP_CHAN_TAKE: u8 = 0x90;
-const OP_CHAN_READ: u8 = 0x91;
-const OP_CHAN_PUT: u8 = 0x92;
-const OP_INTRINSIC_VAL: u8 = 0xA0;
-
-const INTR_LOGITS: u16 = 0;
-const INTR_MTP_LOGITS: u16 = 1;
-const INTR_MTP_DRAFTS: u16 = 6;
+use crate::slots::Slots;
 
 fn value_ptr(value: u32) -> String {
     format!("scratch + offsets[{value}]")
 }
 
-/// The five operand slots `ptir_m1_execute` takes, defaulted to `scratch` the
-/// way the C++ does before the per-tag overrides.
-struct Slots {
-    a0: String,
-    a1: String,
-    a2: String,
-    o0: String,
-    o1: String,
-}
-
-fn slots_for(op: &OpView, base: u32) -> Slots {
-    let mut slots = Slots {
-        a0: "scratch".to_string(),
-        a1: "scratch".to_string(),
-        a2: "scratch".to_string(),
-        o0: "scratch".to_string(),
-        o1: "scratch".to_string(),
-    };
-    if !op.args.is_empty() {
-        slots.a0 = value_ptr(op.args[0]);
+/// Follow a chain of elided reshapes to the value that actually holds the bytes.
+fn resolve_alias(alias: &BTreeMap<u32, u32>, mut value: u32) -> u32 {
+    // The chain is acyclic (SSA), but bound the walk anyway.
+    for _ in 0..64 {
+        match alias.get(&value) {
+            Some(&source) => value = source,
+            None => break,
+        }
     }
-    if op.args.len() > 1 {
-        slots.a1 = value_ptr(op.args[1]);
-    }
-    if op.args.len() > 2 {
-        slots.a2 = value_ptr(op.args[2]);
-    }
-    if op.tag == OP_PIVOT_THRESHOLD {
-        slots.a1 = value_ptr(op.pred_payload);
-    }
-    if op.results > 0 {
-        slots.o0 = value_ptr(base);
-    }
-    if op.results > 1 {
-        slots.o1 = value_ptr(base + 1);
-    }
-    slots
+    value
 }
 
 /// Threads a grouped region's threadgroup gets per lane. The emitted kernel
-/// sizes its threadgroup reduction buffer to this, and `m1_runtime.cpp` must
-/// launch exactly this many.
-pub const METAL_M3_REGION_THREADS: u32 = 256;
+/// sizes its threadgroup reduction buffer to this; the driver launches the
+/// narrower of it and the pipeline's own maxTotalThreadsPerThreadgroup, and
+/// the kernel faults `0xB3` on a wider launch rather than reading past the
+/// buffer.
+///
+/// Emitted into `ptir_abi.h` as `PTIR_METAL_M3_REGION_THREADS`, which is what
+/// `m1_runtime.cpp`'s `kM3RegionThreads` now reads. It used to be a hand-kept
+/// copy with a "must equal" comment and nothing comparing them, and it did
+/// drift: 256 in the driver against a 1024-element buffer in the goldens.
+///
+/// 512 measured against 256 with the model DAG truncated away, interleaved to
+/// cancel thermal drift: 0.951ms vs 1.557ms for the sampler region, reproduced
+/// twice. 1024 is not better (0.963ms) and costs twice the threadgroup memory.
+pub const METAL_M3_REGION_THREADS: u32 = 512;
 
 /// Device+threadgroup barrier between two ops of a region.
 const BARRIER: &str =
@@ -96,6 +74,7 @@ pub fn emit_fused_region(
         return Err("fused region exceeds the 12-channel direct-binding limit".to_string());
     }
     let ops: Vec<OpView> = OpView::of_all(&stage.normalized.ops);
+    intrinsics_bindable(&ops, region)?;
     let bases = result_bases(&ops);
 
     let mut source = String::new();
@@ -127,21 +106,22 @@ pub fn emit_fused_region(
         );
     }
     for &node in &region.nodes {
-        let Some(op) = ops.get(node as usize) else {
+        let node = node.index();
+        let Some(op) = ops.get(node) else {
             return Err("fused region node out of range".to_string());
         };
-        let mut slots = slots_for(op, bases[node as usize]);
-        if op.tag == OP_CHAN_TAKE || op.tag == OP_CHAN_READ {
+        let mut slots = Slots::of(op, bases[node], value_ptr);
+        if op.tag == tags::CHAN_TAKE || op.tag == tags::CHAN_READ {
             if op.chan < 0 || op.chan as usize >= channel_bindings.len() {
                 return Err("fused channel root binding out of range".to_string());
             }
             slots.a0 = format!("current_{}", op.chan);
-        } else if op.tag == OP_CHAN_PUT {
+        } else if op.tag == tags::CHAN_PUT {
             if op.chan < 0 || op.chan as usize >= channel_bindings.len() {
                 return Err("fused channel sink binding out of range".to_string());
             }
             slots.o0 = format!("pending_{}", op.chan);
-        } else if op.tag == OP_INTRINSIC_VAL {
+        } else if op.tag == tags::INTRINSIC_VAL {
             slots.a0 = "logits".to_string();
         }
         let _ = writeln!(
@@ -150,7 +130,7 @@ pub fn emit_fused_region(
             op.tag, slots.a0, slots.a1, slots.a2, slots.o0, slots.o1
         );
         source.push_str("  if (status->state != 1) return;\n");
-        if op.tag == OP_CHAN_PUT {
+        if op.tag == tags::CHAN_PUT {
             let _ = writeln!(source, "  current_{} = pending_{};", op.chan, op.chan);
         }
     }
@@ -168,6 +148,7 @@ pub fn emit_grouped_fused_region(
         return Err("grouped library region ABI is invalid".to_string());
     }
     let ops: Vec<OpView> = OpView::of_all(&stage.normalized.ops);
+    intrinsics_bindable(&ops, region)?;
     let bases = result_bases(&ops);
     let channel_count = used_channel_slots(&ops);
 
@@ -222,13 +203,13 @@ pub fn emit_grouped_fused_region(
          reinterpret_cast<device M1Status*>(lane.commit_slot);\n",
     );
     source.push_str("  if (status->state != 1) return;\n");
-    // The threadgroup buffer above is sized for exactly this width, and the
-    // driver launches it (see `m1_runtime.cpp`). A mismatch is a wiring bug, so
-    // say so rather than reading past the buffer.
+    // The threadgroup buffer above is sized for this width and the driver asks
+    // for no more than it, so a wider launch would read past the buffer. Say so
+    // rather than doing it.
     let _ = writeln!(
         source,
         "  if (m3_threads > {METAL_M3_REGION_THREADS}u) {{ \
-         if (m3_tid == 0) m1_fault(status, 0xB3u); return; }}"
+         if (m3_tid == 0) m1_fault(status, {M3_THREADS_EXCEEDED:#X}u); return; }}"
     );
     source.push_str(
         "  const device M1ValueDesc* descriptors = all_descriptors + \
@@ -271,27 +252,180 @@ pub fn emit_grouped_fused_region(
              channel_{channel}.pending_cell);"
         );
     }
+    // A reshape that does not change the element count or dtype is a view, but
+    // the runtime still executes it as a byte-for-byte copy of the whole value.
+    // In the sampler's graph that is a vocabulary-wide round trip through device
+    // memory for nothing. Elide it and point its consumers at the source
+    // instead, as long as the result stays inside this region -- a region output
+    // or sink is read through its own offset by someone else, so those keep the
+    // copy.
+    let escapes: BTreeSet<u32> = region
+        .outputs
+        .iter()
+        .copied()
+        .chain(region.sinks.iter().map(|sink| sink.value))
+        .collect();
+    let value_types = &stage.normalized.value_types;
+    // What the runtime actually does for a reshape is
+    // `m1_copy_typed(src, dst, dst_desc.len, dtype)` -- it takes the *result's*
+    // element count from offset 0 of the source. So the result is a prefix view
+    // of the source whenever the source is at least as long, and pointing
+    // consumers at the source reproduces it byte for byte: they read through
+    // the result's own descriptor, so they still read exactly `dst.len`.
+    //
+    // Comparing lengths must survive symbolic extents, because the one graph
+    // that needs this is the sampler, whose reshape is
+    // `[SampledRows, vocab] -> [vocab]`. Splitting a shape into its static
+    // product and the multiset of its symbolic ids is enough: if the result's
+    // symbolic ids are a sub-multiset of the source's and its static product is
+    // no larger, the result is no longer than the source under every binding.
+    // (An earlier version demanded fully static extents on both sides and so
+    // never fired at all.)
+    let footprint = |value: u32| -> Option<(u8, u64, Vec<u8>)> {
+        let ty = value_types.get(value as usize)?;
+        let mut statics: u64 = 1;
+        let mut symbolic: Vec<u8> = Vec::new();
+        for dim in &ty.dims {
+            match dim {
+                Dimension::Static(extent) => statics *= u64::from(*extent),
+                Dimension::Symbolic(id) => symbolic.push(*id as u8),
+            }
+        }
+        symbolic.sort_unstable();
+        Some((ty.dtype as u8, statics, symbolic))
+    };
+    // `result` is never longer than `source`, whatever the symbolic dims are.
+    let covers = |source: u32, result: u32| match (footprint(source), footprint(result)) {
+        (
+            Some((src_dtype, src_static, src_symbolic)),
+            Some((dst_dtype, dst_static, mut dst_symbolic)),
+        ) => {
+            if src_dtype != dst_dtype || dst_static > src_static {
+                return false;
+            }
+            let mut remaining = src_symbolic;
+            dst_symbolic.retain(|id| match remaining.iter().position(|kept| kept == id) {
+                Some(at) => {
+                    remaining.remove(at);
+                    false
+                }
+                None => true,
+            });
+            dst_symbolic.is_empty()
+        }
+        _ => false,
+    };
+
+    // Decided before anything is emitted, because the gather/argmax fusion below
+    // has to see through these aliases to recognise its pattern.
+    let is_view_reshape = |node: usize| -> bool {
+        let Some(op) = ops.get(node) else {
+            return false;
+        };
+        op.tag == tags::RESHAPE
+            && op.results == 1
+            && op.args.len() == 1
+            && !escapes.contains(&bases[node])
+            && covers(op.args[0], bases[node])
+    };
+    let mut alias: BTreeMap<u32, u32> = BTreeMap::new();
     for &node in &region.nodes {
-        let Some(op) = ops.get(node as usize) else {
+        let node = node.index();
+        if is_view_reshape(node) {
+            let arg = ops[node].args[0];
+            alias.insert(bases[node], resolve_alias(&alias, arg));
+        }
+    }
+
+    // A logits gather whose only consumer is an argmax does not need to exist:
+    // the pair fuses into one pass over the bf16 row. Decided up front because
+    // the gather is emitted before the argmax is reached.
+    let mut consumers: BTreeMap<u32, usize> = BTreeMap::new();
+    for &node in &region.nodes {
+        if is_view_reshape(node.index()) {
+            continue;
+        }
+        if let Some(op) = ops.get(node.index()) {
+            for &arg in &op.args {
+                *consumers.entry(resolve_alias(&alias, arg)).or_insert(0) += 1;
+            }
+        }
+    }
+    let mut fused_argmax: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut elided_gather: BTreeSet<usize> = BTreeSet::new();
+    for &node in &region.nodes {
+        let node = node.index();
+        let Some(op) = ops.get(node) else { continue };
+        if op.tag != tags::REDUCE_ARGMAX || op.args.len() != 1 {
+            continue;
+        }
+        let source_value = resolve_alias(&alias, op.args[0]);
+        if consumers.get(&source_value).copied().unwrap_or(0) != 1
+            || escapes.contains(&source_value)
+        {
+            continue;
+        }
+        let producer = region.nodes.iter().map(|n| n.index()).find(|&n| {
+            bases[n] == source_value
+                && ops.get(n).is_some_and(|p| {
+                    p.tag == tags::INTRINSIC_VAL
+                        && (p.intr == intrinsic_tags::LOGITS
+                            || p.intr == intrinsic_tags::MTP_LOGITS)
+                })
+        });
+        if let Some(producer) = producer {
+            fused_argmax.insert(node, producer);
+            elided_gather.insert(producer);
+        }
+    }
+
+    for &node in &region.nodes {
+        let node = node.index();
+        let Some(op) = ops.get(node) else {
             return Err("grouped fused region node out of range".to_string());
         };
-        let base = bases[node as usize];
-        let mut slots = slots_for(op, base);
-        if op.tag == OP_INTRINSIC_VAL && op.intr == INTR_MTP_DRAFTS {
+        let base = bases[node];
+        if elided_gather.contains(&node) {
+            continue;
+        }
+        if let Some(&producer) = fused_argmax.get(&node) {
+            let slots = Slots::of(op, base, |value| value_ptr(resolve_alias(&alias, value)));
+            emit_logits_argmax(
+                &mut source,
+                bases[producer],
+                ops[producer].intr == intrinsic_tags::MTP_LOGITS,
+                &slots.o0,
+            );
+            source.push_str(BARRIER);
+            source.push_str("  if (status->state != 1) return;\n");
+            continue;
+        }
+        if is_view_reshape(node) {
+            continue;
+        }
+        let mut slots = Slots::of(op, base, |value| value_ptr(resolve_alias(&alias, value)));
+        if op.tag == tags::INTRINSIC_VAL && op.intr == intrinsic_tags::MTP_DRAFTS {
             emit_mtp_drafts(&mut source, base, &slots.o0);
             source.push_str(BARRIER);
             continue;
         }
-        if op.tag == OP_INTRINSIC_VAL && (op.intr == INTR_LOGITS || op.intr == INTR_MTP_LOGITS) {
-            emit_logits_gather(&mut source, base, op.intr == INTR_MTP_LOGITS, &slots.o0);
+        if op.tag == tags::INTRINSIC_VAL
+            && (op.intr == intrinsic_tags::LOGITS || op.intr == intrinsic_tags::MTP_LOGITS)
+        {
+            emit_logits_gather(
+                &mut source,
+                base,
+                op.intr == intrinsic_tags::MTP_LOGITS,
+                &slots.o0,
+            );
             source.push_str(BARRIER);
             continue;
         }
-        if op.tag == OP_CHAN_TAKE || op.tag == OP_CHAN_READ {
+        if op.tag == tags::CHAN_TAKE || op.tag == tags::CHAN_READ {
             slots.a0 = format!("current_{}", op.chan);
-        } else if op.tag == OP_CHAN_PUT {
+        } else if op.tag == tags::CHAN_PUT {
             slots.o0 = format!("pending_{}", op.chan);
-        } else if op.tag == OP_INTRINSIC_VAL {
+        } else if op.tag == tags::INTRINSIC_VAL {
             // `logits` is a `const device bfloat*` here because the gather and
             // the draft argmax above index it as one; `ptir_m1_execute` takes a
             // `const device uchar*`, and MSL will not convert between them. The
@@ -310,7 +444,7 @@ pub fn emit_grouped_fused_region(
         // return below never strands a thread at a later barrier.
         source.push_str(BARRIER);
         source.push_str("  if (status->state != 1) return;\n");
-        if op.tag == OP_CHAN_PUT {
+        if op.tag == tags::CHAN_PUT {
             let _ = writeln!(source, "  current_{} = pending_{};", op.chan, op.chan);
             let _ = writeln!(
                 source,
@@ -336,10 +470,11 @@ fn emit_mtp_drafts(source: &mut String, base: u32, o0: &str) {
         source,
         "    const M1ValueDesc draft_desc = descriptors[{base}];"
     );
-    source.push_str(
+    let _ = writeln!(
+        source,
         "    if (layout->vocab == 0u || row_meta.mtp_offset > row_meta.count || \
          draft_desc.len > row_meta.count - row_meta.mtp_offset) \
-         { m1_fault(status, 0xA0u); return; }\n",
+         {{ m1_fault(status, {FUSED_GEOMETRY_MISMATCH:#X}u); return; }}"
     );
     let _ = writeln!(
         source,
@@ -371,6 +506,76 @@ fn emit_mtp_drafts(source: &mut String, base: u32, o0: &str) {
     source.push_str("  }\n");
 }
 
+/// `argmax(logits)` without materializing the logits.
+///
+/// The gather's only job in this shape is to widen bf16 to f32 so the generic
+/// reduction can read it, and bf16 -> f32 is exact, so the argmax over the
+/// stored halves has the same value and the same index. Fusing the two removes a
+/// vocabulary-wide f32 write and the read back of it, which was the sampler's
+/// whole remaining traffic for a graph that only wants one integer.
+fn emit_logits_argmax(source: &mut String, in_base: u32, mtp: bool, o0: &str) {
+    source.push_str("  {\n");
+    let _ = writeln!(
+        source,
+        "    const M1ValueDesc am_in = descriptors[{in_base}];"
+    );
+    let _ = writeln!(
+        source,
+        "    const uint am_row_base = row_meta.offset + {};",
+        if mtp { "row_meta.mtp_offset" } else { "0u" }
+    );
+    source.push_str("    const uint am_vocab = layout->vocab;\n");
+    let _ = writeln!(
+        source,
+        "    if (am_vocab == 0u || am_in.last != am_vocab || am_in.rows > row_meta.count) \
+         {{ m1_fault(status, {FUSED_GEOMETRY_MISMATCH:#X}u); return; }}"
+    );
+    let _ = writeln!(
+        source,
+        "    device int* am_out = reinterpret_cast<device int*>({o0});"
+    );
+    source.push_str("    for (uint am_r = 0u; am_r < am_in.rows; ++am_r) {\n");
+    source.push_str("      const uint am_src_row = row_indices[am_row_base + am_r];\n");
+    source.push_str("      const device bfloat* am_src = logits + ulong(am_src_row) * am_vocab;\n");
+    source.push_str("      M1ArgmaxCandidate am_best = {-INFINITY, 0u, 0u, 0u};\n");
+    // Four independent accumulators. The combine is a strict total order, so
+    // splitting the fold changes nothing, and it breaks the dependency chain
+    // that otherwise serialises one device load per iteration in each thread.
+    source.push_str("      M1ArgmaxCandidate am_b1 = am_best, am_b2 = am_best, am_b3 = am_best;\n");
+    let _ = writeln!(
+        source,
+        "      constexpr uint am_w = {METAL_M3_REGION_THREADS}u;"
+    );
+    source.push_str("      uint am_c = m3_tid;\n");
+    source.push_str("      for (; am_c + 3u * am_w < am_vocab; am_c += 4u * am_w) {\n");
+    source.push_str("        const float v0 = float(am_src[am_c]);\n");
+    source.push_str("        const float v1 = float(am_src[am_c + am_w]);\n");
+    source.push_str("        const float v2 = float(am_src[am_c + 2u * am_w]);\n");
+    source.push_str("        const float v3 = float(am_src[am_c + 3u * am_w]);\n");
+    source.push_str("        am_best = m1_argmax_combine(am_best, M1ArgmaxCandidate{v0, am_c, isnan(v0) ? 0u : 1u, 0u});\n");
+    source.push_str("        am_b1 = m1_argmax_combine(am_b1, M1ArgmaxCandidate{v1, am_c + am_w, isnan(v1) ? 0u : 1u, 0u});\n");
+    source.push_str("        am_b2 = m1_argmax_combine(am_b2, M1ArgmaxCandidate{v2, am_c + 2u * am_w, isnan(v2) ? 0u : 1u, 0u});\n");
+    source.push_str("        am_b3 = m1_argmax_combine(am_b3, M1ArgmaxCandidate{v3, am_c + 3u * am_w, isnan(v3) ? 0u : 1u, 0u});\n");
+    source.push_str("      }\n");
+    source.push_str("      for (; am_c < am_vocab; am_c += am_w) {\n");
+    source.push_str("        const float am_v = float(am_src[am_c]);\n");
+    source.push_str("        am_best = m1_argmax_combine(am_best, M1ArgmaxCandidate{am_v, am_c, isnan(am_v) ? 0u : 1u, 0u});\n");
+    source.push_str("      }\n");
+    source.push_str("      am_best = m1_argmax_combine(m1_argmax_combine(am_best, am_b1), m1_argmax_combine(am_b2, am_b3));\n");
+    source.push_str("      m3_tgbuf[m3_tid] = am_best;\n");
+    source.push_str("      threadgroup_barrier(mem_flags::mem_threadgroup);\n");
+    source.push_str("      for (uint am_s = 1u; am_s < m3_threads; am_s <<= 1) {\n");
+    source.push_str(
+        "        if ((m3_tid % (2u * am_s)) == 0u && m3_tid + am_s < m3_threads) m3_tgbuf[m3_tid] = m1_argmax_combine(m3_tgbuf[m3_tid], m3_tgbuf[m3_tid + am_s]);\n",
+    );
+    source.push_str("        threadgroup_barrier(mem_flags::mem_threadgroup);\n");
+    source.push_str("      }\n");
+    source.push_str("      if (m3_tid == 0) am_out[am_r] = int(m3_tgbuf[0].index);\n");
+    source.push_str("      threadgroup_barrier(mem_flags::mem_threadgroup);\n");
+    source.push_str("    }\n");
+    source.push_str("  }\n");
+}
+
 /// The `logits` / `mtp_logits` intrinsics: a strided gather out of the lane's
 /// logits buffer, rebased for MTP rows.
 fn emit_logits_gather(source: &mut String, base: u32, mtp: bool, o0: &str) {
@@ -388,11 +593,12 @@ fn emit_logits_gather(source: &mut String, base: u32, mtp: bool, o0: &str) {
         "    const uint intrinsic_row_base = {};",
         if mtp { "row_meta.mtp_offset" } else { "0u" }
     );
-    source.push_str(
+    let _ = writeln!(
+        source,
         "    if (layout->vocab == 0u || intrinsic_desc.len % layout->vocab != 0u || \
          intrinsic_row_base > row_meta.count || \
          intrinsic_desc.len / layout->vocab > row_meta.count - intrinsic_row_base) \
-         { m1_fault(status, 0xA0u); return; }\n",
+         {{ m1_fault(status, {FUSED_GEOMETRY_MISMATCH:#X}u); return; }}"
     );
     let _ = writeln!(
         source,
@@ -404,30 +610,20 @@ fn emit_logits_gather(source: &mut String, base: u32, mtp: bool, o0: &str) {
     // paid a runtime div and mod on top -- a vocabulary-sized row cost ~85ms of
     // an ~89ms decode step. Hoisting the extent turns it into a coalesced copy.
     source.push_str("    const uint gather_vocab = layout->vocab;\n");
-    source.push_str(
-        "    const uint gather_rows = intrinsic_desc.len / gather_vocab;\n",
-    );
-    source.push_str(
-        "    const uint gather_row_base = row_meta.offset + intrinsic_row_base;\n",
-    );
+    source.push_str("    const uint gather_rows = intrinsic_desc.len / gather_vocab;\n");
+    source.push_str("    const uint gather_row_base = row_meta.offset + intrinsic_row_base;\n");
     source.push_str("    for (uint gr = 0u; gr < gather_rows; ++gr) {\n");
-    source.push_str(
-        "      const uint source_row = row_indices[gather_row_base + gr];\n",
-    );
+    source.push_str("      const uint source_row = row_indices[gather_row_base + gr];\n");
     source.push_str(
         "      const device bfloat* gather_src = logits + \
          ulong(source_row) * gather_vocab;\n",
     );
-    source.push_str(
-        "      device float* gather_dst = intrinsic_out + ulong(gr) * gather_vocab;\n",
-    );
+    source.push_str("      device float* gather_dst = intrinsic_out + ulong(gr) * gather_vocab;\n");
     source.push_str(
         "      for (uint column = gather_begin; column < gather_vocab; \
          column += gather_step) {\n",
     );
-    source.push_str(
-        "        gather_dst[column] = float(gather_src[column]);\n",
-    );
+    source.push_str("        gather_dst[column] = float(gather_src[column]);\n");
     source.push_str("      }\n");
     source.push_str("    }\n");
     source.push_str("  }\n");

@@ -202,7 +202,7 @@ struct ModelFacts {
 // multi-tenant paged pool. Shared between `build_caps_json` (what we
 // ADVERTISE) and the Phase 2 descriptor resolver's `validate_fire_geometry`
 // page-range check (what we ENFORCE) so both always agree.
-constexpr std::uint32_t kMetalPhase1aMaxCtxTokens = 4096;
+constexpr std::uint32_t kMetalPhase1aMaxCtxTokens = executor::kMetalMaxCtxTokens;
 
 std::uint32_t effective_total_pages(const Config& cfg, bool rs_cache_required) {
     const std::uint32_t kv_page_size = std::max<std::uint32_t>(1u, cfg.batching.kv_page_size);

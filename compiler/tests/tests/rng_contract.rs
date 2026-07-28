@@ -114,7 +114,7 @@ fn uniform_never_reaches_one() {
         unclamped_hits, 1,
         "expected exactly one of 2^24 draws to round up to 1.0 without the clamp"
     );
-    assert!(UNIFORM_MAX < 1.0);
+    const _: () = assert!(UNIFORM_MAX < 1.0);
     assert_eq!(UNIFORM_MAX.to_bits(), 0x3f7f_ffff);
 }
 
@@ -200,6 +200,9 @@ fn rng_magic_is_owned_by_the_contract() {
         // splitmix64 id generation: the canonical splitmix increment happens
         // to be the same golden-ratio word; not a keyed-RNG transcription.
         Path::new("runtime/engine/src/pipeline/offload.rs"),
+        // boost-style `hash_combine` for the GEMM autotune cache key; the
+        // golden-ratio word again, and nothing to do with the PTIR stream.
+        Path::new("driver/cuda/src/ops/gemm.cpp"),
     ];
     let unrelated_mask_users = [
         Path::new("driver/cuda/tests/ptir_tier0_test.cu"),
@@ -239,4 +242,32 @@ fn rng_magic_is_owned_by_the_contract() {
             );
         }
     }
+}
+
+/// The emitted CUDA source and the checked-in C++ header carry the same device
+/// RNG text, and both must keep coming from `render_cuda_functions`.
+///
+/// `cuda::runtime` used to recover the preamble by generating this header and
+/// searching for the literal's delimiters. It calls the generator directly
+/// now, so this test is what still ties the two together: the header's
+/// embedded literal must be exactly what the emitter splices in.
+#[test]
+fn cuda_preamble_matches_the_header_literal() {
+    let header = generate_cuda_header();
+    let open = "inline constexpr char PTIR_RNG_CUDA_PREAMBLE[] = R\"PTIR_RNG_CUDA(";
+    let close = ")PTIR_RNG_CUDA\";";
+    let start = header.find(open).expect("header defines the preamble") + open.len();
+    let end = header[start..].find(close).expect("literal terminates") + start;
+
+    let spliced = pie_codegen::cuda::singleton_runtime_source();
+    let embedded = &header[start..end];
+    assert!(
+        spliced.contains(embedded),
+        "the emitted CUDA runtime does not contain the header's preamble literal"
+    );
+    assert_eq!(
+        embedded,
+        format!("\n{}", pie_codegen::rng::cuda_device_functions()),
+        "the header literal and the emitter's preamble have drifted"
+    );
 }

@@ -63,60 +63,398 @@ fn contract_source() -> String {
     contract!(out, PieU64Slice, ptr, len);
     contract!(out, PieTerminalCell, outcome, reserved0);
     contract!(out, PieTerminalCellPtrSlice, ptr, len);
-    contract!(out, PieChannelDesc, abi_version, reserved0, channel_id, shape, dtype, host_role, seeded, extern_dir, capacity, reserved1, reader_wait_id, writer_wait_id, extern_name);
-    contract!(out, PieChannelEndpointBinding, channel_id, mirror_base, word_base, mirror_bytes, word_bytes, cell_bytes, capacity, head_word_index, tail_word_index, poison_word_index, closed_word_index);
+    contract!(
+        out,
+        PieChannelDesc,
+        abi_version,
+        reserved0,
+        channel_id,
+        shape,
+        dtype,
+        host_role,
+        seeded,
+        extern_dir,
+        capacity,
+        reserved1,
+        reader_wait_id,
+        writer_wait_id,
+        extern_name
+    );
+    contract!(
+        out,
+        PieChannelEndpointBinding,
+        channel_id,
+        mirror_base,
+        word_base,
+        mirror_bytes,
+        word_bytes,
+        cell_bytes,
+        capacity,
+        head_word_index,
+        tail_word_index,
+        poison_word_index,
+        closed_word_index
+    );
     contract!(out, PieChannelValueDesc, channel_id, bytes);
     contract!(out, PieChannelValueDescSlice, ptr, len);
     contract!(out, PieMaskWordsDesc, request_indptr, word_indptr, words);
-    contract!(out, PieKvMoveCell, dst_page_id, dst_token_offset, src_page_id, src_token_offset);
+    contract!(
+        out,
+        PieKvMoveCell,
+        dst_page_id,
+        dst_token_offset,
+        src_page_id,
+        src_token_offset
+    );
     contract!(out, PieKvMoveCellSlice, ptr, len);
-    contract!(out, PieStateCopyRange, src_slot_id, dst_slot_id, src_token_offset, dst_token_offset, token_count);
+    contract!(
+        out,
+        PieStateCopyRange,
+        src_slot_id,
+        dst_slot_id,
+        src_token_offset,
+        dst_token_offset,
+        token_count
+    );
     contract!(out, PieStateCopyRangeSlice, ptr, len);
     contract!(out, PiePoolRange, page_index, page_count);
     contract!(out, PiePoolRangeSlice, ptr, len);
-    contract!(out, PieRuntimeCallbacks, abi_version, reserved0, ctx, notify);
+    contract!(
+        out,
+        PieRuntimeCallbacks,
+        abi_version,
+        reserved0,
+        ctx,
+        notify
+    );
     contract!(out, PieCompletion, wait_id, target_epoch, terminal_cell);
-    contract!(out, PieDriverCreateDesc, abi_version, reserved0, config_bytes, runtime);
+    contract!(
+        out,
+        PieDriverCreateDesc,
+        abi_version,
+        reserved0,
+        config_bytes,
+        runtime
+    );
     contract!(out, PieDriverCaps, json_bytes, json_len);
-    contract!(out, PieModelLoadDesc, abi_version, component, mxfp4_moe, runtime_quant, snapshot_dir);
-    contract!(out, PieEmittedKernel, kind, stage_index, region_index, reserved0, entry_name, source, error);
+    contract!(
+        out,
+        PieModelLoadDesc,
+        abi_version,
+        component,
+        mxfp4_moe,
+        runtime_quant,
+        snapshot_dir
+    );
+    contract!(
+        out,
+        PieEmittedKernel,
+        kind,
+        stage_index,
+        region_index,
+        reserved0,
+        entry_name,
+        source,
+        error
+    );
     contract!(out, PieEmittedKernelSlice, ptr, len);
-    contract!(out, PieDirectArgmax, node, source_value, intrinsic, requires_single_row, reserved0);
+    contract!(
+        out,
+        PieDirectArgmax,
+        node,
+        source_value,
+        intrinsic,
+        requires_single_row,
+        reserved0
+    );
     contract!(out, PieDirectArgmaxSlice, ptr, len);
-    contract!(out, PieRegionAnalysis, stage_index, region_index, flags, reserved0, direct_argmax, skipped);
+    contract!(
+        out,
+        PieRegionAnalysis,
+        stage_index,
+        region_index,
+        flags,
+        reserved0,
+        direct_argmax,
+        skipped
+    );
     contract!(out, PieRegionAnalysisSlice, ptr, len);
-    contract!(out, PieProgramDesc, abi_version, reserved0, program_hash, emitter_version, reserved1, emitted_kernels, region_analysis, launch);
-    contract!(out, PieInstanceDesc, abi_version, reserved0, geometry_class, reserved1, program_id, requested_instance_id, pacing_wait_id, channel_ids, seed_values);
-    contract!(out, PieInstanceBinding, instance_id, geometry_class, reserved0);
-    contract!(out, PieStepDesc, roster_rows, sub_batch_indptr, sub_batch_class, terminal_cells, token_ids, position_ids, kv_page_indices, kv_page_indptr, kv_last_page_lens, qo_indptr, rs_slot_ids, rs_slot_flags, rs_fold_lens, rs_buffer_slot_ids, rs_buffer_slot_indptr, masks, sampling_indices, sampling_indptr, context_ids, single_token_mode, has_user_mask, reserved_flags, reserved0, image_indptr, image_grids, image_anchor_positions, image_pixels, image_pixel_indptr, image_mrope_positions, image_mrope_indptr, image_patch_positions, image_anchor_rows, audio_features, audio_feature_indptr, audio_anchor_rows, audio_indptr, embed_rows, embed_indptr, embed_shapes, embed_dtypes, embed_anchor_rows, embed_block_indptr, kv_len, kv_len_device, ptir_program_row_indptr, ptir_kv_write_lower_bounds, ptir_kv_write_upper_bounds, logical_fire_ids, channel_expected_head, channel_expected_tail, channel_ticket_indptr);
+    contract!(
+        out,
+        PieProgramDesc,
+        abi_version,
+        reserved0,
+        program_hash,
+        emitter_version,
+        reserved1,
+        emitted_kernels,
+        region_analysis,
+        launch
+    );
+    contract!(
+        out,
+        PieInstanceDesc,
+        abi_version,
+        reserved0,
+        geometry_class,
+        reserved1,
+        program_id,
+        requested_instance_id,
+        pacing_wait_id,
+        channel_ids,
+        seed_values
+    );
+    contract!(
+        out,
+        PieInstanceBinding,
+        instance_id,
+        geometry_class,
+        reserved0
+    );
+    contract!(
+        out,
+        PieStepDesc,
+        roster_rows,
+        sub_batch_indptr,
+        sub_batch_class,
+        terminal_cells,
+        token_ids,
+        position_ids,
+        kv_page_indices,
+        kv_page_indptr,
+        kv_last_page_lens,
+        qo_indptr,
+        rs_slot_ids,
+        rs_slot_flags,
+        rs_fold_lens,
+        rs_buffer_slot_ids,
+        rs_buffer_slot_indptr,
+        masks,
+        sampling_indices,
+        sampling_indptr,
+        context_ids,
+        single_token_mode,
+        has_user_mask,
+        reserved_flags,
+        reserved0,
+        image_indptr,
+        image_grids,
+        image_anchor_positions,
+        image_pixels,
+        image_pixel_indptr,
+        image_mrope_positions,
+        image_mrope_indptr,
+        image_patch_positions,
+        image_anchor_rows,
+        audio_features,
+        audio_feature_indptr,
+        audio_anchor_rows,
+        audio_indptr,
+        embed_rows,
+        embed_indptr,
+        embed_shapes,
+        embed_dtypes,
+        embed_anchor_rows,
+        embed_block_indptr,
+        kv_len,
+        kv_len_device,
+        ptir_program_row_indptr,
+        ptir_kv_write_lower_bounds,
+        ptir_kv_write_upper_bounds,
+        logical_fire_ids,
+        channel_expected_head,
+        channel_expected_tail,
+        channel_ticket_indptr
+    );
     contract!(out, PieStepDescSlice, ptr, len);
-    contract!(out, PieFrameDesc, abi_version, reserved0, instance_ids, kv_translation, kv_translation_indptr, required_kv_pages, reserved1, steps);
-    contract!(out, PieEncodeDesc, abi_version, reserved0, image_grids, image_pixels, image_pixel_indptr, image_patch_positions, image_anchor_rows, audio_features, audio_feature_indptr, audio_anchor_rows, output_rows, output_row_indptr);
-    contract!(out, PieKvCopyDesc, abi_version, src_domain, src_device_ordinal, dst_domain, dst_device_ordinal, reserved0, src_page_ids, dst_page_ids, cells);
+    contract!(
+        out,
+        PieFrameDesc,
+        abi_version,
+        reserved0,
+        instance_ids,
+        kv_translation,
+        kv_translation_indptr,
+        required_kv_pages,
+        reserved1,
+        steps
+    );
+    contract!(
+        out,
+        PieEncodeDesc,
+        abi_version,
+        reserved0,
+        image_grids,
+        image_pixels,
+        image_pixel_indptr,
+        image_patch_positions,
+        image_anchor_rows,
+        audio_features,
+        audio_feature_indptr,
+        audio_anchor_rows,
+        output_rows,
+        output_row_indptr
+    );
+    contract!(
+        out,
+        PieKvCopyDesc,
+        abi_version,
+        src_domain,
+        src_device_ordinal,
+        dst_domain,
+        dst_device_ordinal,
+        reserved0,
+        src_page_ids,
+        dst_page_ids,
+        cells
+    );
     contract!(out, PieStateCopyDesc, abi_version, reserved0, slot_ranges);
-    contract!(out, PiePoolResizeDesc, abi_version, reserved0, pool_id, target_pages, map_ranges, unmap_ranges);
-    contract!(out, PieLaunchValue, id, source, dtype, intrinsic, reserved1, channel, literal_bits, reserved0, shape);
+    contract!(
+        out,
+        PiePoolResizeDesc,
+        abi_version,
+        reserved0,
+        pool_id,
+        target_pages,
+        map_ranges,
+        unmap_ranges
+    );
+    contract!(
+        out,
+        PieLaunchValue,
+        id,
+        source,
+        dtype,
+        intrinsic,
+        reserved1,
+        channel,
+        literal_bits,
+        reserved0,
+        shape
+    );
     contract!(out, PieLaunchValueSlice, ptr, len);
-    contract!(out, PieLaunchOp, code, result_count, result_id, intrinsic, lit_dtype, dtype, pred_tag, rng_kind, reserved0, lit_bits, pred_payload, channel, name_index, imm, imm2, imm3, reserved1, args, shape);
+    contract!(
+        out,
+        PieLaunchOp,
+        code,
+        result_count,
+        result_id,
+        intrinsic,
+        lit_dtype,
+        dtype,
+        pred_tag,
+        rng_kind,
+        reserved0,
+        lit_bits,
+        pred_payload,
+        channel,
+        name_index,
+        imm,
+        imm2,
+        imm3,
+        reserved1,
+        args,
+        shape
+    );
     contract!(out, PieLaunchOpSlice, ptr, len);
-    contract!(out, PieLaunchChannel, id, capacity, dtype, flags, extern_dir, readiness, reserved1, shape, extern_name);
+    contract!(
+        out,
+        PieLaunchChannel,
+        id,
+        capacity,
+        dtype,
+        flags,
+        extern_dir,
+        readiness,
+        reserved1,
+        shape,
+        extern_name
+    );
     contract!(out, PieLaunchChannelSlice, ptr, len);
-    contract!(out, PieLaunchPort, port, is_const, const_dtype, reserved0, channel, const_shape, const_data);
+    contract!(
+        out,
+        PieLaunchPort,
+        port,
+        is_const,
+        const_dtype,
+        reserved0,
+        channel,
+        const_shape,
+        const_data
+    );
     contract!(out, PieLaunchPortSlice, ptr, len);
     contract!(out, PieLaunchPut, channel, value);
     contract!(out, PieLaunchPutSlice, ptr, len);
-    contract!(out, PieLaunchRegion, kind, library, schedule, reserved0, reserved1, nodes, inputs, outputs, sinks);
+    contract!(
+        out,
+        PieLaunchRegion,
+        kind,
+        library,
+        schedule,
+        reserved0,
+        reserved1,
+        nodes,
+        inputs,
+        outputs,
+        sinks
+    );
     contract!(out, PieLaunchRegionSlice, ptr, len);
-    contract!(out, PieLaunchPlanValue, dtype, reserved0, reserved1, extents, dims);
+    contract!(
+        out,
+        PieLaunchPlanValue,
+        dtype,
+        reserved0,
+        reserved1,
+        extents,
+        dims
+    );
     contract!(out, PieLaunchPlanValueSlice, ptr, len);
     contract!(out, PieLaunchChannelRule, value, local);
     contract!(out, PieLaunchChannelRuleSlice, ptr, len);
-    contract!(out, PieLaunchStagePlan, signature_hash, identity, flags, mtp_rows, ops, source_ops, source_op_counts, value_types, channel_bindings, names, singleton, fused, used_extents, channel_rules, error);
+    contract!(
+        out,
+        PieLaunchStagePlan,
+        signature_hash,
+        identity,
+        flags,
+        mtp_rows,
+        ops,
+        source_ops,
+        source_op_counts,
+        value_types,
+        channel_bindings,
+        names,
+        singleton,
+        fused,
+        used_extents,
+        channel_rules,
+        error
+    );
     contract!(out, PieLaunchStagePlanSlice, ptr, len);
-    contract!(out, PieLaunchStage, kind, reserved0, reserved1, reserved2, ops, puts, takes, reads);
+    contract!(
+        out,
+        PieLaunchStage,
+        kind,
+        reserved0,
+        reserved1,
+        reserved2,
+        ops,
+        puts,
+        takes,
+        reads
+    );
     contract!(out, PieLaunchStageSlice, ptr, len);
     contract!(out, PieBytesSlice, ptr, len);
-    contract!(out, PieLaunchPackage, values, channels, ports, names, stages, plans);
+    contract!(
+        out,
+        PieLaunchPackage,
+        values,
+        channels,
+        ports,
+        names,
+        stages,
+        plans
+    );
     out
 }
 
@@ -137,7 +475,8 @@ fn rust_layout_matches_committed_header_contract() {
     }
     let committed = std::fs::read_to_string(&path).expect("read layout contract");
     assert_eq!(
-        committed, generated,
+        committed,
+        generated,
         "{} is stale; re-run with PIE_REGEN=1",
         path.display()
     );

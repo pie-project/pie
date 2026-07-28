@@ -23,10 +23,14 @@ use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
+use pie_ir::op::{intrinsic_tags, tags};
 
-use pie_plan::{CompiledStage, Dimension, LANE_TABLE_ABI_VERSION, LibraryOp, Region, RegionKind};
+use pie_plan::{
+    CompiledStage, Dimension, LANE_TABLE_ABI_VERSION, LibraryOp, NodeIndex, Region, RegionKind,
+};
 
 use crate::op_view::{OpView, result_bases};
+use crate::slots::Slots;
 
 use super::runtime::singleton_runtime_source;
 use super::singleton::valid_identifier;
@@ -39,56 +43,55 @@ const PREAMBLE: &str = include_str!("../../runtime/cuda/fused_block2.cuh");
 /// `kPtirIntrinsicSlots` — per-lane intrinsic descriptor slots.
 pub const PTIR_INTRINSIC_SLOTS: u32 = 8;
 
-const OP_EXP: u8 = 0x01;
-const OP_CAST: u8 = 0x07;
-const OP_ADD: u8 = 0x10;
-const OP_SELECT: u8 = 0x20;
-const OP_CONST: u8 = 0x81;
-const OP_IOTA: u8 = 0x64;
-const OP_BROADCAST: u8 = 0x38;
-const OP_RESHAPE: u8 = 0x39;
-const OP_TRANSPOSE: u8 = 0x3A;
-const OP_REDUCE_SUM: u8 = 0x30;
-const OP_REDUCE_MAX: u8 = 0x31;
-const OP_REDUCE_MIN: u8 = 0x32;
-const OP_REDUCE_ARGMAX: u8 = 0x33;
-const OP_PIVOT_THRESHOLD: u8 = 0x58;
-const OP_GATHER: u8 = 0x60;
-const OP_GATHER_ROW: u8 = 0x61;
-const OP_SCATTER_ADD: u8 = 0x62;
-const OP_SCATTER_SET: u8 = 0x63;
-const OP_MASK_APPLY_PACKED: u8 = 0x65;
-const OP_CAUSAL_MASK: u8 = 0x66;
-const OP_SLIDING_WINDOW_MASK: u8 = 0x67;
-const OP_SINK_WINDOW_MASK: u8 = 0x68;
-const OP_RNG: u8 = 0x70;
-const OP_RNG_KEYED: u8 = 0x71;
-const OP_CHAN_TAKE: u8 = 0x90;
-const OP_CHAN_READ: u8 = 0x91;
-const OP_CHAN_PUT: u8 = 0x92;
-const OP_INTRINSIC_VAL: u8 = 0xA0;
-
-const INTR_LOGITS: u16 = 0;
-const INTR_MTP_LOGITS: u16 = 1;
-const INTR_LAYER: u16 = 5;
-const INTR_MTP_DRAFTS: u16 = 6;
-
 const DT_F32: u8 = 0;
 
-/// The ops the runtime has a block-parallel elementwise helper for.
+/// The ops `ptir_parallel_elementwise` in `fused_block0.cuh` has an arm for.
+///
+/// Answering `true` for a tag that helper does not handle is not a fallback —
+/// the helper's dispatch chain simply runs off the end of the loop body,
+/// writing nothing, and the region goes on with an untouched output buffer and
+/// a clean status word. The single-thread path this competes with ends in
+/// `m1_fault(status, p.tag)`, so being wrong in the other direction is loud.
+///
+/// Hence the explicit list (it used to be `EXP..=CAST` and `ADD..=SELECT`,
+/// which would absorb any tag allocated into a gap) and hence
+/// `parallel_elementwise_matches_the_cuda_runtime`, which reads the arms back
+/// out of the `.cuh` and fails if the two sides disagree either way.
 fn parallel_elementwise(tag: u8) -> bool {
-    (OP_EXP..=OP_CAST).contains(&tag)
-        || (OP_ADD..=OP_SELECT).contains(&tag)
-        || matches!(
-            tag,
-            OP_IOTA
-                | OP_MASK_APPLY_PACKED
-                | OP_CAUSAL_MASK
-                | OP_SLIDING_WINDOW_MASK
-                | OP_SINK_WINDOW_MASK
-                | OP_RNG
-                | OP_RNG_KEYED
-        )
+    matches!(
+        tag,
+        tags::EXP
+            | tags::LOG
+            | tags::NEG
+            | tags::RECIP
+            | tags::ABS
+            | tags::SIGN
+            | tags::CAST
+            | tags::ADD
+            | tags::SUB
+            | tags::MUL
+            | tags::DIV
+            | tags::MAX_ELEM
+            | tags::MIN_ELEM
+            | tags::GT
+            | tags::GE
+            | tags::EQ
+            | tags::NE
+            | tags::LT
+            | tags::LE
+            | tags::AND
+            | tags::OR
+            | tags::NOT
+            | tags::REM
+            | tags::SELECT
+            | tags::IOTA
+            | tags::MASK_APPLY_PACKED
+            | tags::CAUSAL_MASK
+            | tags::SLIDING_WINDOW_MASK
+            | tags::SINK_WINDOW_MASK
+            | tags::RNG
+            | tags::RNG_KEYED
+    )
 }
 
 /// A value's row decomposition: everything but the trailing dim is rows.
@@ -175,9 +178,9 @@ pub(crate) fn analyze_direct_argmax(
     };
 
     for &node in &region.nodes {
-        let node = node as usize;
+        let node = node.index();
         let reduction = &ops[node];
-        if reduction.tag != OP_REDUCE_ARGMAX || reduction.args.is_empty() {
+        if reduction.tag != tags::REDUCE_ARGMAX || reduction.args.is_empty() {
             continue;
         }
         let mut value = reduction.args[0];
@@ -191,12 +194,13 @@ pub(crate) fn analyze_direct_argmax(
             let producer = producers[value as usize];
             let op = &ops[producer as usize];
             chain.push(producer);
-            if op.tag == OP_RESHAPE && !op.args.is_empty() {
+            if op.tag == tags::RESHAPE && !op.args.is_empty() {
                 expected_consumer = producer;
                 value = op.args[0];
                 continue;
             }
-            if op.tag != OP_INTRINSIC_VAL || (op.intr != INTR_LOGITS && op.intr != INTR_MTP_LOGITS)
+            if op.tag != tags::INTRINSIC_VAL
+                || (op.intr != intrinsic_tags::LOGITS && op.intr != intrinsic_tags::MTP_LOGITS)
             {
                 break;
             }
@@ -258,8 +262,51 @@ pub fn emit_fused_region(
     let direct = analyze_direct_argmax(stage, region, &bases);
     let mut skipped = direct.skipped;
 
-    // A nucleus library region elsewhere in the stage consumes the logits and
-    // the sampler state directly, so whatever produced them here is redundant.
+    // A nucleus library region elsewhere in the stage reads the logits and the
+    // sampler state straight out of the lane's bf16 rows, so the nodes that
+    // would have materialized them here are redundant -- but only under the
+    // same two conditions the driver applies when it shrinks those value slots
+    // to four bytes (`fused_runtime.cuh` `resolves_to_logits_intrinsic` /
+    // `lone_generated_node`). Skipping a node the driver still budgets a full
+    // slot for leaves that slot unwritten: whatever the region emits next reads
+    // uninitialized scratch and publishes it. No fault, no failing test, just a
+    // wrong sample. The sibling analysis `analyze_direct_argmax` above has
+    // always checked its chain; this one did not.
+    let producer_of = |value: u32| -> Option<usize> {
+        region
+            .nodes
+            .iter()
+            .map(|node| node.index())
+            .chain(0..ops.len())
+            .find(|&node| value >= bases[node] && value < bases[node] + ops[node].results)
+    };
+    let produces_logits_intrinsic = |value: u32| -> bool {
+        producer_of(value).is_some_and(|node| {
+            let op = &ops[node];
+            op.tag == tags::INTRINSIC_VAL
+                && (op.intr == intrinsic_tags::LOGITS || op.intr == intrinsic_tags::MTP_LOGITS)
+        })
+    };
+    let resolves_to_logits_intrinsic = |value: u32| -> bool {
+        if produces_logits_intrinsic(value) {
+            return true;
+        }
+        producer_of(value).is_some_and(|node| {
+            let op = &ops[node];
+            op.tag == tags::RESHAPE && !op.args.is_empty() && produces_logits_intrinsic(op.args[0])
+        })
+    };
+    // The scale divide is folded into the nucleus kernel only when it is a
+    // region of its own; fused into a larger generated region it still runs and
+    // still writes a full tensor.
+    let mut lone_generated_node = vec![false; ops.len()];
+    for candidate in &stage.fused.regions {
+        if !matches!(candidate.kind, RegionKind::Library(_)) && candidate.nodes.len() == 1 {
+            lone_generated_node[candidate.nodes[0].index()] = true;
+        }
+    }
+    let in_region = |node: usize| region.nodes.contains(&NodeIndex(node as u32));
+
     for candidate in &stage.fused.regions {
         if !matches!(
             candidate.kind,
@@ -268,31 +315,30 @@ pub fn emit_fused_region(
         {
             continue;
         }
-        for start in [candidate.inputs[0], candidate.inputs[2]] {
-            let mut value = start;
-            let mut depth = 0;
-            while depth < 2 {
-                let mut found = false;
-                for &node in &region.nodes {
-                    let node = node as usize;
-                    let op = &ops[node];
-                    if value < bases[node] || value >= bases[node] + op.results {
-                        continue;
-                    }
-                    found = true;
-                    skipped[node] = 1;
-                    if op.tag == OP_RESHAPE && !op.args.is_empty() {
-                        value = op.args[0];
-                    } else {
-                        depth = 2;
-                    }
-                    break;
-                }
-                if !found {
-                    break;
-                }
-                depth += 1;
-            }
+        if resolves_to_logits_intrinsic(candidate.inputs[0])
+            && let Some(node) = producer_of(candidate.inputs[0])
+            && in_region(node)
+        {
+            skipped[node] = 1;
+        }
+        let Some(node) = producer_of(candidate.inputs[2]) else {
+            continue;
+        };
+        if !lone_generated_node[node] {
+            continue;
+        }
+        if in_region(node) {
+            skipped[node] = 1;
+        }
+        let op = &ops[node];
+        if op.tag == tags::DIV
+            && !op.args.is_empty()
+            && resolves_to_logits_intrinsic(op.args[0])
+            && let Some(reshape) = producer_of(op.args[0])
+            && ops[reshape].tag == tags::RESHAPE
+            && in_region(reshape)
+        {
+            skipped[reshape] = 1;
         }
     }
 
@@ -304,63 +350,42 @@ pub fn emit_fused_region(
     source.push_str(PREAMBLE);
 
     for &node in &region.nodes {
-        let node = node as usize;
+        let node = node.index();
         let op = &ops[node];
         let base = bases[node];
-        if skipped[node] != 0 && op.tag != OP_RESHAPE {
+        if skipped[node] != 0 && op.tag != tags::RESHAPE {
             continue;
         }
-        if op.tag == OP_RESHAPE && !region.outputs.contains(&base) {
+        if op.tag == tags::RESHAPE && !region.outputs.contains(&base) {
             aliases[base as usize] = resolve_alias(&aliases, op.args[0]);
             continue;
         }
 
-        let mut a0 = "scratch".to_string();
-        let mut a1 = "scratch".to_string();
-        let mut a2 = "scratch".to_string();
-        let mut o0 = "scratch".to_string();
-        let mut o1 = "scratch".to_string();
-        let pointer = |value: u32, aliases: &[u32]| {
-            format!("scratch + offsets[{}]", resolve_alias(aliases, value))
-        };
-        if !op.args.is_empty() {
-            a0 = pointer(op.args[0], &aliases);
-        }
-        if op.args.len() > 1 {
-            a1 = pointer(op.args[1], &aliases);
-        }
-        if op.args.len() > 2 {
-            a2 = pointer(op.args[2], &aliases);
-        }
-        if op.tag == OP_PIVOT_THRESHOLD {
-            a1 = pointer(op.pred_payload, &aliases);
-        }
-        if op.results > 0 {
-            o0 = pointer(base, &aliases);
-        }
-        if op.results > 1 {
-            o1 = pointer(base + 1, &aliases);
-        }
+        // CUDA resolves reshape aliases before indexing the offsets table;
+        // which value lands in which slot is shared with Metal.
+        let mut slots = Slots::of(op, base, |value| {
+            format!("scratch + offsets[{}]", resolve_alias(&aliases, value))
+        });
 
         source.push_str("  {\n");
         let _ = writeln!(source, "    M1OpParams p = params[{node}u];");
         source.push_str("    p.rng_seed = 0u;\n");
 
-        if matches!(op.tag, OP_CHAN_TAKE | OP_CHAN_READ | OP_CHAN_PUT) {
+        if matches!(op.tag, tags::CHAN_TAKE | tags::CHAN_READ | tags::CHAN_PUT) {
             let _ = writeln!(
                 source,
                 "    const m1_u32 channel_index = lane.channel_slot_offset + {}u;",
                 op.chan as u32
             );
             source.push_str("    const PtirLaneChannelSlot channel = channels[channel_index];\n");
-            if op.tag == OP_CHAN_PUT {
-                o0 = "reinterpret_cast<m1_u8*>(channel.pending_cell)".to_string();
+            if op.tag == tags::CHAN_PUT {
+                slots.o0 = "reinterpret_cast<m1_u8*>(channel.pending_cell)".to_string();
             } else {
-                a0 = "reinterpret_cast<const m1_u8*>(pending_flags[channel_index] != 0u ? \
+                slots.a0 = "reinterpret_cast<const m1_u8*>(pending_flags[channel_index] != 0u ? \
                       channel.pending_cell : channel.committed_cell)"
                     .to_string();
             }
-        } else if op.tag == OP_INTRINSIC_VAL {
+        } else if op.tag == tags::INTRINSIC_VAL {
             let _ = writeln!(
                 source,
                 "    const m1_u32 intrinsic_index = dispatch_lane * {PTIR_INTRINSIC_SLOTS}u + p.intr;"
@@ -369,28 +394,18 @@ pub fn emit_fused_region(
             source.push_str("    p.imm = intrinsic_widths[intrinsic_index];\n");
             source.push_str("    p.intrinsic_row_stride = intrinsic_strides[intrinsic_index];\n");
             source.push_str("    p.intrinsic_row_offset = intrinsic_offsets[intrinsic_index];\n");
-            a0 = "reinterpret_cast<const m1_u8*>(intrinsic_bases[intrinsic_index])".to_string();
+            slots.a0 =
+                "reinterpret_cast<const m1_u8*>(intrinsic_bases[intrinsic_index])".to_string();
         }
 
-        emit_body(
-            &mut source,
-            stage,
-            op,
-            node,
-            &direct.intrinsic,
-            &a0,
-            &a1,
-            &a2,
-            &o0,
-            &o1,
-        );
+        emit_body(&mut source, stage, op, node, &direct.intrinsic, &slots);
 
         source.push_str("    __syncthreads();\n");
         source.push_str("    if (status.state != 1u) {\n");
         source.push_str("      if (threadIdx.x == 0u) *commit = 0u;\n");
         source.push_str("      return;\n");
         source.push_str("    }\n");
-        if op.tag == OP_CHAN_PUT {
+        if op.tag == tags::CHAN_PUT {
             source.push_str("    if (threadIdx.x == 0u) pending_flags[channel_index] = 1u;\n");
             source.push_str("    __syncthreads();\n");
         }
@@ -401,19 +416,15 @@ pub fn emit_fused_region(
 }
 
 /// The per-op body: one runtime helper call, or the single-thread fallback.
-#[allow(clippy::too_many_arguments)]
 fn emit_body(
     source: &mut String,
     stage: &CompiledStage,
     op: &OpView,
     node: usize,
     direct_intrinsic: &[u16],
-    a0: &str,
-    a1: &str,
-    a2: &str,
-    o0: &str,
-    o1: &str,
+    slots: &Slots,
 ) {
+    let Slots { a0, a1, a2, o0, o1 } = slots;
     let tag = op.tag;
     let fallback = |source: &mut String| {
         let _ = writeln!(
@@ -422,7 +433,7 @@ fn emit_body(
         );
     };
 
-    if tag == OP_CONST {
+    if tag == tags::CONST {
         source.push_str("    const M1ValueDesc out = descriptors[p.o0];\n");
         source.push_str("    for (m1_u32 i = threadIdx.x; i < out.len; i += blockDim.x) {\n");
         let _ = writeln!(
@@ -439,16 +450,16 @@ fn emit_body(
         );
         let _ = writeln!(source, "      else m1_store_b({o0}, i, p.lit_bits != 0u);");
         source.push_str("    }\n");
-    } else if matches!(tag, OP_CHAN_TAKE | OP_CHAN_READ) {
+    } else if matches!(tag, tags::CHAN_TAKE | tags::CHAN_READ) {
         source.push_str("    const M1ValueDesc out = descriptors[p.o0];\n");
         let _ = writeln!(
             source,
             "    ptir_parallel_copy({a0}, {o0}, out.len, out.dtype);"
         );
-    } else if tag == OP_CHAN_PUT {
+    } else if tag == tags::CHAN_PUT {
         emit_chan_put(source, op, a0, o0);
-    } else if tag == OP_INTRINSIC_VAL {
-        if op.intr == INTR_LAYER || op.intr == INTR_MTP_DRAFTS {
+    } else if tag == tags::INTRINSIC_VAL {
+        if op.intr == intrinsic_tags::LAYER || op.intr == intrinsic_tags::MTP_DRAFTS {
             fallback(source);
         } else {
             let _ = writeln!(
@@ -456,23 +467,23 @@ fn emit_body(
                 "    ptir_parallel_intrinsic({a0}, {o0}, descriptors[p.o0], p);"
             );
         }
-    } else if tag == OP_BROADCAST {
+    } else if tag == tags::BROADCAST {
         let _ = writeln!(
             source,
             "    ptir_parallel_broadcast({a0}, {o0}, descriptors[p.a0], descriptors[p.o0]);"
         );
-    } else if tag == OP_RESHAPE {
+    } else if tag == tags::RESHAPE {
         source.push_str("    const M1ValueDesc out = descriptors[p.o0];\n");
         let _ = writeln!(
             source,
             "    ptir_parallel_copy({a0}, {o0}, out.len, out.dtype);"
         );
-    } else if tag == OP_TRANSPOSE {
+    } else if tag == tags::TRANSPOSE {
         let _ = writeln!(
             source,
             "    ptir_parallel_transpose(&status, {a0}, {o0}, descriptors[p.a0], descriptors[p.o0]);"
         );
-    } else if matches!(tag, OP_REDUCE_SUM | OP_REDUCE_MAX | OP_REDUCE_MIN) {
+    } else if matches!(tag, tags::REDUCE_SUM | tags::REDUCE_MAX | tags::REDUCE_MIN) {
         if stage.normalized.value_types[op.args[0] as usize].dtype as u8 == DT_F32 {
             let _ = writeln!(
                 source,
@@ -481,7 +492,7 @@ fn emit_body(
         } else {
             fallback(source);
         }
-    } else if tag == OP_REDUCE_ARGMAX {
+    } else if tag == tags::REDUCE_ARGMAX {
         if direct_intrinsic[node] != u16::MAX {
             let _ = writeln!(
                 source,
@@ -503,12 +514,12 @@ fn emit_body(
                 "    ptir_fast_argmax({a0}, {o0}, descriptors[p.a0]);"
             );
         }
-    } else if matches!(tag, OP_GATHER | OP_GATHER_ROW) {
+    } else if matches!(tag, tags::GATHER | tags::GATHER_ROW) {
         let _ = writeln!(
             source,
             "    ptir_parallel_gather({tag}u, {a0}, {a1}, {o0}, descriptors[p.a0], descriptors[p.a1], descriptors[p.o0]);"
         );
-    } else if matches!(tag, OP_SCATTER_ADD | OP_SCATTER_SET) {
+    } else if matches!(tag, tags::SCATTER_ADD | tags::SCATTER_SET) {
         let _ = writeln!(
             source,
             "    ptir_parallel_copy({a0}, {o0}, descriptors[p.a0].len, descriptors[p.a0].dtype);"
@@ -518,12 +529,12 @@ fn emit_body(
             source,
             "    if (threadIdx.x == 0u) ptir_scatter_updates({tag}u, {a1}, {a2}, {o0}, descriptors[p.a0], descriptors[p.a1], descriptors[p.a2]);"
         );
-    } else if tag == OP_PIVOT_THRESHOLD && op.pred_tag == 1 {
+    } else if tag == tags::PIVOT_THRESHOLD && op.pred_tag == 1 {
         let _ = writeln!(
             source,
             "    ptir_parallel_pivot_cummass({a0}, {a1}, {o0}, descriptors[p.a0], descriptors[p.a1]);"
         );
-    } else if tag == OP_PIVOT_THRESHOLD {
+    } else if tag == tags::PIVOT_THRESHOLD {
         let _ = writeln!(
             source,
             "    ptir_parallel_pivot({a0}, {a1}, {o0}, descriptors[p.a0], descriptors[p.a1], p);"
@@ -601,4 +612,72 @@ fn emit_chan_put(source: &mut String, op: &OpView, a0: &str, o0: &str) {
     );
     source.push_str("      }\n");
     source.push_str("    }\n");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout::{HOST_SHARED, LANE_CHANNEL_SLOT, LANE_RECORD, LANE_TABLE_HEADER};
+    use crate::runtime_scan::{function_body, tags_compared_in};
+    use alloc::collections::BTreeSet;
+
+    /// `fused_block0.cuh` declares the lane table a sixth time, in CUDA's own
+    /// width spellings. `layout.rs` knew about five copies and not this one.
+    ///
+    /// The file's own `static_assert(sizeof(...))` lines do not cover it:
+    /// swapping two `m1_u32` fields, or `rng_state` with `commit_slot`, keeps
+    /// every size and moves what the kernel reads. The host would write
+    /// `page_count` where the kernel looks for `kv_len` and nothing would say
+    /// so — not at compile time, not at launch, not in a golden, because the
+    /// golden records the emitted kernel and this file is the runtime the
+    /// kernel is prefixed with.
+    #[test]
+    fn cuda_runtime_lane_table_matches_layout() {
+        for declared in HOST_SHARED {
+            let expected = declared.emit_cuda();
+            assert!(
+                PROLOGUE.contains(&expected),
+                "fused_block0.cuh has drifted from layout.rs for {}; expected:\n{expected}",
+                declared.c_name
+            );
+        }
+        for (declared, note) in [
+            (LANE_TABLE_HEADER, "lane header ABI"),
+            (LANE_RECORD, "lane record ABI"),
+            (LANE_CHANNEL_SLOT, "lane channel ABI"),
+        ] {
+            let expected = declared.emit_cuda_size_assert(note);
+            assert!(
+                PROLOGUE.contains(&expected),
+                "fused_block0.cuh size assert has drifted; expected:\n{expected}"
+            );
+        }
+    }
+
+    /// `parallel_elementwise` is a claim about C++ that the C++ cannot check:
+    /// the helper's dispatch runs off the end for a tag it does not know,
+    /// leaving the output buffer untouched and the status word clean. So the
+    /// two lists are compared here instead.
+    #[test]
+    fn parallel_elementwise_matches_the_cuda_runtime() {
+        let handled = tags_compared_in(function_body(PROLOGUE, "ptir_parallel_elementwise"));
+        let claimed: BTreeSet<u8> = pie_ir::op::OP_TABLE
+            .iter()
+            .map(|spec| spec.tag)
+            .filter(|tag| parallel_elementwise(*tag))
+            .collect();
+        let name = |tag: &u8| pie_ir::op::spec(*tag).map_or("?", |spec| spec.name);
+        let unhandled: Vec<&str> = claimed.difference(&handled).map(name).collect();
+        let unclaimed: Vec<&str> = handled.difference(&claimed).map(name).collect();
+        assert!(
+            unhandled.is_empty(),
+            "emitted to ptir_parallel_elementwise but not handled there \
+             (these write nothing, silently): {unhandled:?}"
+        );
+        assert!(
+            unclaimed.is_empty(),
+            "handled by ptir_parallel_elementwise but never emitted to it \
+             (dead runtime code, or a missing tag in parallel_elementwise): {unclaimed:?}"
+        );
+    }
 }
