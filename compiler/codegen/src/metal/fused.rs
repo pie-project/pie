@@ -497,7 +497,10 @@ fn emit_logits_argmax(source: &mut String, in_base: u32, mtp: bool, o0: &str) {
     // splitting the fold changes nothing, and it breaks the dependency chain
     // that otherwise serialises one device load per iteration in each thread.
     source.push_str("      M1ArgmaxCandidate am_b1 = am_best, am_b2 = am_best, am_b3 = am_best;\n");
-    let _ = writeln!(source, "      constexpr uint am_w = {METAL_M3_REGION_THREADS}u;");
+    let _ = writeln!(
+        source,
+        "      constexpr uint am_w = {METAL_M3_REGION_THREADS}u;"
+    );
     source.push_str("      uint am_c = m3_tid;\n");
     source.push_str("      for (; am_c + 3u * am_w < am_vocab; am_c += 4u * am_w) {\n");
     source.push_str("        const float v0 = float(am_src[am_c]);\n");
