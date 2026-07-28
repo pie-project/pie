@@ -823,6 +823,17 @@ bool flashinfer_cutlass_moe_bf16(
                              workspace,
                              unpermuted_row_to_permuted_row};
     install_tactics(state(), runner, problem, buffers, needed);
+    // The runner leaves parts of its workspace untouched -- the permuted row
+    // buffers are only filled for real routes, and the grouped GEMM rounds
+    // each expert's row count up to a tile -- yet the padded rows are still
+    // multiplied and, with a fused finalize epilogue, still scattered back.
+    // Whatever the previous call left there therefore leaks into this one's
+    // result. FlashInfer's own binding hides this by allocating a fresh
+    // workspace per call, which a caching allocator hands back with the same
+    // contents every time; pie keeps one workspace for the life of the model,
+    // so the leftovers differ with every shape that ran before. That showed up
+    // as the same prompt decoding to different tokens on different runs.
+    cudaMemsetAsync(workspace, 0, needed, stream);
     run_moe(runner, problem, buffers, stream);
     return true;
 }
