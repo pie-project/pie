@@ -222,6 +222,28 @@ That is the decision: **LALR(1) tables, with conflicts forked at runtime rather
 than refused at construction.** IELR(1) is not needed for what it was wanted
 for, and the measurement above is why.
 
+**Built and measured (2026-07-28).** A conflicted cell contributes a digit to a
+mixed radix and a replay runs once per combination, on the host and on the
+device alike. A grammar with no conflicts has one path, so the loop is one
+iteration around unchanged code and nothing that already compiled pays for it.
+
+| | |
+|---|---|
+| compiled, was 470 | **510 of 533** |
+| accepted | **482** |
+| refusals still labelled `Conflict` | **0** |
+| conflicted schemas verified against the reference matcher | **64, the whole corpus** |
+| steps agreeing on both the mask and the configuration set | 3,641 |
+| widest cell handled | 32 actions |
+
+The cost is the fill and the advance at batch 512 going from 102 and 71 us on a
+conflict-free grammar to 164 and 168 on the worst conflicted one - under 2x for
+the fill, under 2.4x for the advance, and only on the grammars that need it.
+
+The path count is bounded (16, the same bound the reference uses) and losing a
+derivation can only narrow a mask, never widen one. That is why the bound is
+safe to have and why exceeding it raises the overflow flag.
+
 Also required at this layer: precedence/associativity declarations for conflict
 resolution, and an EBNF front-end, since practical grammars are not written in
 bare BNF.
