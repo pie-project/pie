@@ -943,6 +943,40 @@ running several decode steps - speculative drafts, multi-step scheduling -
 without returning to the host between them. That is what device residency buys,
 and no amount of optimising a host-side fill can buy it.
 
+**A mixed-schema batch (2026-07-28), which had never been compared.** Every
+number above puts one schema under the whole batch. That is not what a serving
+batch looks like - requests bring their own - and it is the case that should
+hurt *us* rather than them: our fill deduplicates rows sharing a grammar, a
+lexer state and a stack, and a mixture has fewer to share, while our ceilings
+are maxima over the pool, so one large schema sizes the buffers for every
+sequence. XGrammar's per-sequence host call is schema-agnostic; mixing costs it
+nothing structurally.
+
+Measured with a control - each schema also run alone at the same batch size, so
+what is reported is the cost of *mixing* rather than the cost of whichever
+schemas were in the mixture:
+
+| batch | schemas | ours | XGrammar | ratio | mixing costs us | and them |
+|---:|---:|---:|---:|---:|---:|---:|
+| 128 | 1 | 269 us | 545 us | 2.03x | 1.01x | 1.08x |
+| 128 | 2 | 879 | 693 | **0.79x** | 1.68x | 1.10x |
+| 128 | 4 | 884 | 1,607 | 1.82x | 1.43x | 0.99x |
+| 128 | 16 | 1,730 | 7,026 | 4.06x | **3.03x** | 0.66x |
+| 512 | 1 | 342 | 2,078 | 6.08x | 0.99x | 1.06x |
+| 512 | 2 | 951 | 2,723 | 2.86x | 1.60x | 1.16x |
+| 512 | 8 | 1,801 | 35,616 | **19.78x** | 2.51x | 0.83x |
+| 512 | 16 | 2,251 | 45,211 | **20.08x** | 3.49x | 1.06x |
+
+The prediction held: **mixing costs us up to 3.5x and costs XGrammar nothing.**
+That is the one place this design is structurally weaker, and it had not been
+measured. It is also not decisive, because their absolute cost is what a
+mixture multiplies - 35.6 ms at batch 512 over eight schemas is longer than the
+decode step it is meant to hide behind.
+
+Read against the single-schema numbers, the effect runs both ways: those
+*understate* the gap at batch 512 with many schemas, where it reaches 20x, and
+*overstate* it at batch 128 with two, where we lose at 0.79x.
+
 **Host contention (q21).** Weaker than expected and worth saying so. With
 twenty-four cores deliberately saturated, XGrammar's fill slows by 1.06x and
 ours by 1.01x; both engines' p99 degrades to about 3 ms, which is the operating
