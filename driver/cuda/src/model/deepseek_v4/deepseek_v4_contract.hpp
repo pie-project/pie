@@ -58,21 +58,24 @@ inline void dsv4_block_scales_to_fp32(ContractBuilder& b) {
             !contract_detail::is_raw(raw.encoding, PieLoaderDType::U8)) {
             continue;
         }
-        // Only a companion to a block-quantized weight is an E8M0 exponent. A
-        // `.scale` beside anything else is some other convention, and guessing
-        // is how a scale tensor gets silently reinterpreted.
+        // Only a companion to a **block-FP8** weight is an fp32-bound E8M0
+        // exponent. A `.scale` beside anything else is some other convention,
+        // and guessing is how a scale tensor gets silently reinterpreted.
         //
-        // Both quantizations DeepSeek-V4 ships qualify: the dense and shared
-        // paths store F8E4M3 weights, and the routed experts store INT8. On
-        // `dsv4flash-mini` that is 50 scales and 144 respectively -- reading
-        // the guard as "FP8 only" leaves the experts' scales as raw bytes, and
-        // `make_block_fp8_quant` then throws on a scale that never became F32.
+        // DeepSeek-V4 ships exactly two quantizations, and only one of them
+        // belongs here. The dense and shared paths store F8E4M3 weights with
+        // 128x128 block scales, which the FP8 GEMM wants as fp32 -- 50 tensors
+        // on both minis. The routed experts store **packed MXFP4**: an `I8`
+        // tensor holding two E2M1 nibbles per byte, whose E8M0 scales
+        // (`[rows, cols/32]`) `launch_dequant_mxfp4_to_bf16` consumes as raw
+        // bytes -- 144 tensors. Widening this guard to I8 hands that kernel
+        // fp32 words to read as exponents, and the routed experts come out
+        // four orders of magnitude too large.
         const std::string weight =
             std::string(raw.name.substr(0, raw.name.size() - kSuffix.size())) + ".weight";
         const SourceTensor* companion = b.find(weight);
         if (companion == nullptr ||
-            !(contract_detail::is_raw(companion->encoding, PieLoaderDType::F8E4M3) ||
-              contract_detail::is_raw(companion->encoding, PieLoaderDType::I8))) {
+            !contract_detail::is_raw(companion->encoding, PieLoaderDType::F8E4M3)) {
             continue;
         }
         std::vector<std::int64_t> shape = contract_detail::shape_of(raw);

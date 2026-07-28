@@ -171,11 +171,25 @@ private:
                 throw std::runtime_error(
                     "rust storage executor: Cast source byte size mismatch");
             }
+#if PIE_CUDA_TRANSCODE_ENGINE_HAS_CUDA
+            // Stream-0 H2D: `cast_tensor_to_ptr` launches on stream 0 and reads
+            // this scratch immediately. The batched/pinned `queue()` path lands
+            // on a private copy stream with no flush before the kernel, so the
+            // cast would read an unwritten buffer -- every DeepSeek-V4 block
+            // scale decoded to zero, and every quantized GEMM with it.
+            copy_engine_.queue_on_stream(
+                instr.source.file_id,
+                instr.source.file_offset + instr.source.stride.base_offset,
+                instr.source.span_bytes,
+                scratch.data(),
+                /*stream=*/0);
+#else
             copy_engine_.queue(
                 instr.source.file_id,
-                instr.source.file_offset,
+                instr.source.file_offset + instr.source.stride.base_offset,
                 instr.source.span_bytes,
                 scratch.data());
+#endif
             cast_tensor_to_ptr(scratch, dst, out.dtype());
             return;
         }
@@ -841,11 +855,23 @@ private:
                     scratch.data(),
                     scratch.nbytes());
             } else {
+#if PIE_CUDA_TRANSCODE_ENGINE_HAS_CUDA
+                // Stream-0 H2D for the same reason as the Cast path: the repack
+                // kernel that consumes this scratch runs on stream 0 with no
+                // intervening flush.
+                copy_engine_.queue_on_stream(
+                    instr.source.file_id,
+                    instr.source.file_offset + instr.source.stride.base_offset,
+                    instr.source.span_bytes,
+                    scratch.data(),
+                    /*stream=*/0);
+#else
                 copy_engine_.queue(
                     instr.source.file_id,
                     instr.source.file_offset + instr.source.stride.base_offset,
                     instr.source.span_bytes,
                     scratch.data());
+#endif
             }
             return scratch;
         }
