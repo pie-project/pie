@@ -583,8 +583,8 @@ Rust is 352 us. This is the shape of most of what was slow here: not arithmetic,
 but a ceiling paid for as if it were the work.
 
 **Coverage and acceptance on real schemas.** Of 533 JSONSchemaBench schemas,
-**469 compile** at the default lexer budget and feeding each schema's
-model-generated instance through the matcher one byte at a time accepts **451**.
+**510 compile** at the default lexer budget and feeding each schema's
+model-generated instance through the matcher one byte at a time accepts **482**.
 It was 431 and 416, and what moved it was reading the failures rather than
 counting them.
 
@@ -605,26 +605,42 @@ states as though it were a limit. It is not:
 
 | lexer states | compile | accepted | refused by the lexer |
 |---:|---:|---:|---:|
-| 4,000 | 456 | 440 | 38 |
-| 20,000 (default) | 469 | 451 | 21 |
-| 80,000 | 477 | 458 | **1** |
+| 4,000 | 495 | 471 | 17 |
+| 20,000 (default) | 510 | 482 | **1** |
 
-At 80,000 states one schema fails on the lexer and what is left is 28 conflicts,
-17 the front end cannot lower and 10 over the production budget. The price falls
-entirely on the tail: the median schema compiles in 17.6 ms and costs 0.05 MB of
-tables at every budget, because it comes nowhere near the ceiling. Reporting a
-single coverage figure without the budget it was measured at is what made this
-look like a wall.
+At the default budget one schema fails on the lexer, and since conflicts are
+forked at runtime rather than refused, none fails on the parser class either.
+What is left is 12 the front end cannot lower and 10 over the production
+budget. The price falls entirely on the tail: the median schema's compile time
+and table size are the same at every budget, because it comes nowhere near the
+ceiling. Reporting a single coverage figure without the budget it was measured
+at is what made this look like a wall.
 
-The remaining refusals split into 21 lexers over budget, 17 the front end cannot
-lower - `not`, and `anyOf` inside `allOf`, both of which need a real
-intersection - 16 genuine LALR conflicts and 10 over the production budget.
+**The acceptance metric was measuring the corpus.** Acceptance had been "how
+many of the 533 instances does the matcher consume", on the assumption that a
+benchmark's instances are valid documents. Handing each one to a real JSON
+Schema validator says otherwise:
 
-**Five documents are refused that their schemas accept.** Asking a real
-validator whether each refused instance actually satisfies its schema finds
-five that do, all refusing at the final byte, all built from `$ref` and `oneOf`.
-That is a bug in the parser rather than a coverage limit, and it is recorded
-here rather than folded into the coverage number.
+| the corpus's own instances | |
+|---|---|
+| valid JSON satisfying their schema | 420 |
+| violate their schema | 24 |
+| **not JSON at all** - truncated mid-string | **88** |
+
+So 78.8% is the *ceiling* any correct engine can score on this corpus, and an
+engine that refuses the other 113 is right to. Measured against the instances a
+correct engine must accept:
+
+| | |
+|---|---|
+| valid instances whose schema compiles | 406 |
+| accepted | 398 |
+| **acceptance** | **98.0%**, against the 94.5% the old metric reported |
+| genuine wrong refusals | **8**, not the 28 the old metric counted |
+
+Of the 28 refusals, 7 are of text that is not JSON and 13 of documents that
+violate their own schema. Eight are ours: they refuse at the final byte, and
+they are recorded here rather than folded into a coverage number.
 
 **Objects accept their properties in any order.** A JSON object is a set, but a
 grammar describes a sequence, so the standard answer - XGrammar's too - fixes
