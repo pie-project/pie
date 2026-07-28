@@ -16,6 +16,22 @@ The tags are emitted in forward order, so the *first* row with a large error is
 the sub-block to debug. Cosine similarity is the headline number because the
 shrunken checkpoints have wildly different activation scales per layer, which
 makes a raw absolute difference hard to read.
+
+A uniform error that appears at the *first* GEMM and then neither grows nor
+shrinks is not a bug -- it is a different arithmetic contract. vLLM runs
+DeepSeek-V4's MXFP8 weights as w8a8, quantizing the activation to FP8 as well;
+pie dequantizes the weight and keeps the activation in bf16. Against an fp64
+reference built from the checkpoint, pie's `wq_b` output is rel_l2 0.0017
+(bf16 rounding) and vLLM's is 0.0202, at every layer. So dsv4pro-mini emitting
+different tokens from vLLM is vLLM's quantization noise, not pie drift, and
+chasing it as a kernel bug is wasted effort. Build the fp64 reference before
+concluding anything:
+
+    W = w.to(f64) * scale.to(f32).to(f64).repeat_interleave(bn, 0)
+                                          .repeat_interleave(bk, 1)
+    ref = x @ W.T
+
+(The scales are `float8_e8m0fnu` -- pure exponent -- over 128x128 blocks.)
 """
 
 from __future__ import annotations
