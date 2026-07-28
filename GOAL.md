@@ -1225,6 +1225,59 @@ ahead of both**, 2.26x and 4.00x, where on JSON Schema at batch 32 we are behind
 XGrammar at 0.94x. The small-batch loss is a property of the schema workload's
 per-step cost, not of the design.
 
+**SQL, where LR(1) does work no finite automaton can (2026-07-28).** Regex
+answered "is this only JSON?" and did not answer "why LR(1)?" - a regex is a
+DFA, and JSON's nesting is bounded by the schema that generated it. A SELECT
+subset with a real expression rule is the case that needs the other thing: an
+expression may nest parentheses arbitrarily, and no finite automaton can match
+`(((...)))` to unbounded depth.
+
+Thirteen queries - projections, aliases, joins, an expression with precedence
+and parentheses, GROUP BY, LIMIT - walked byte by byte against the reference
+matcher: **all thirteen agree** on every mask and every configuration set. And
+the stack does what the grammar class says it must:
+
+| nesting depth | 1 | 8 | 32 | 128 | 256 |
+|---|---:|---:|---:|---:|---:|
+| deepest parser stack | 10 | 17 | 41 | 137 | ceiling |
+
+**One entry per level, exactly.** That is the property a DFA cannot have, and
+it is why the machinery is LR(1) rather than regular. At 256 the stack reaches
+`max_stack`, which is a documented ceiling rather than a silent truncation.
+
+Against both baselines on the same grammar, charging each for a mask and an
+advance per sequence:
+
+| | batch 1 | batch 32 | batch 128 | batch 512 |
+|---|---:|---:|---:|---:|
+| vs XGrammar, median | 41x | 1,244x | 3,981x | 9,613x |
+| vs llguidance, depth 1 | **0.15x** | **0.84x** | 2.89x | 8.47x |
+| vs llguidance, depth 32 | - | 1.91x | **6.10x** | **17.26x** |
+
+Three things, and the first is not in our favour.
+
+**llguidance beats us at small batch**, 27 us against our 179 at batch 1. Its
+per-sequence cost on this grammar is tiny and ours is a fixed device cost, so
+below about batch 32 it is simply the better engine here.
+
+**XGrammar collapses on a real context-free grammar.** A single sequence's fill
+reaches 70 ms at the `=` of `WHERE id=42`, verified by walking the query and
+confirming its masks are non-empty and its tokens accepted - this is their
+engine working correctly, not a misuse. An expression can continue with almost
+any identifier, number or operator, so the context-dependent set is enormous,
+and that is the case their adaptive cache is not built for. Where llguidance is
+27 us they are 17,329.
+
+**Only our cost is flat in the nesting depth.** At batch 128, going from depth
+1 to depth 32 takes llguidance from 654 us to 1,653 while ours goes from 226 to
+271. Depth is what a stack is for, and it is the axis on which a device-resident
+stack stops being an implementation detail: the deeper the grammar the wider the
+margin, 2.89x to 6.10x at batch 128 and 8.47x to 17.26x at 512.
+
+The cost is at the front. This grammar takes **1.3 seconds to compile** against
+XGrammar's 88 ms, and its tables are **91 MB** - by far the worst numbers in
+this document, and the same trade as everywhere else, at its extreme.
+
 **Host contention (q21).** Weaker than expected and worth saying so. With
 twenty-four cores deliberately saturated, XGrammar's fill slows by 1.06x and
 ours by 1.01x; both engines' p99 degrades to about 3 ms, which is the operating
