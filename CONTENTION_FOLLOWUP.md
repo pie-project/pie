@@ -3594,3 +3594,135 @@ test for this rung (the bug reproduced ~1 run in 3).
 This also resolves the §20.7 / §20.3 contradiction noted in §20.16: §20.7's
 "128/128" was the good mode of a bistable scenario, §20.3's "31-59" was a mix
 of modes, and neither was a fix.
+
+## §20.18 — the "turnover gap" is PREFILL PREPARATION, and nothing else
+
+Re-opened at the user's request ("512, even 1024"). The result overturns three
+earlier claims in §20.13/§20.14 and identifies a single mechanism behind all of
+them. NO CODE CHANGE — this section is the root cause, measured.
+
+### The one measurement that settles it
+
+Decompose a `PIE_FIRE_TIMING=waves` log into per-wave GPU gaps
+(`gap = next.dispatch_started_us - this.native_complete_us`) and split the gaps
+by whether the wave that follows carries prefill (`tokens > 2 * fire_count`):
+
+| run | waves | prefill waves | idle before PREFILL wave | idle before DECODE wave |
+| --- | ----: | ------------: | -----------------------: | ----------------------: |
+| homogeneous conc 512  | 592 | 24  | 1.03 s (**100%**) p90 90.8 ms  | **0.00 s** p50/p90/max = 0.0 |
+| homogeneous conc 1024 | 588 | 20  | 1.08 s (**100%**) p90 132.8 ms | **0.00 s** p50/p90/max = 0.0 |
+| mixed-phase conc 512  | 473 | 164 | 3.60 s (79%) p90 52.9 ms       | 0.95 s p90 9.5 ms |
+
+**pie's GPU never idles during decode. Every microsecond of idle is spent
+getting a prefill wave ready.** On the homogeneous runs that is not an
+approximation — decode-only gaps are exactly 0.0 ms at p50, p90 AND max, for
+567 of 591 wave boundaries in both runs.
+
+### What this corrects
+
+1. **§20.13's "turnover barrier" is misnamed and its fix shape was wrong.**
+   The gap is not teardown, not the terminate fence, not the seat handoff and
+   not the admission drain. Those all land in the gap because a cohort boundary
+   is where retirement AND prefill coincide — correlation, not cause. This is
+   why every lever aimed at turnover failed to buy throughput: §20.14's seat
+   release (0.05 ms, throughput unchanged), §20.16's close barrier (-19% gap,
+   throughput at the noise floor), §20.15's submit cost (-58%, throughput
+   neutral). They were all shrinking terms that were never on the critical path.
+
+2. **§20.13 Term 2 ("pie's per-step advantage decays with batch width") is an
+   artifact.** conc 512 and conc 1024 produce identical wave structure: 592 vs
+   588 waves, rows p50 1024 (max 1024) both, GPU busy 92.1% vs 92.3%,
+   decode-rate-on-busy 42876 vs 42890 tok/s. At conc 512, `fire_count` p50 is
+   already 1024 with only 512 processes — run-ahead k=2 saturates the 1024-row
+   cap, so both widths run the same batch shape.
+
+3. **§20.13's "the gap scales linearly with herd size" is wrong.** Measured mean
+   gap is ~110 ms at conc 512 and ~118 ms at conc 1024 — flat. Doubling
+   concurrency doubles the cohort's wall (2.1 s -> 4.2 s), so the same fixed
+   stall halves as a fraction. That, plus vLLM's own 4% degradation at 1024, is
+   the whole of the sign flip below.
+
+### Headline numbers (n=5 pie / n=2 vLLM, this machine)
+
+| workload | pie | vLLM | ratio |
+| --- | ---: | ---: | ---: |
+| conc 512 homogeneous  | 31383 +/- 510 | 32755 | 0.958 |
+| conc 1024 homogeneous | 32110 +/- 260 | 31367 | **1.024** (pie wins) |
+| conc 512 mixed-phase  | 10051 | 15637 | **0.643** |
+
+The deficit is NOT monotonic in concurrency; it is a dip at 512. Corroborated
+independently by a per-cohort marginal-cost regression (n = 512/1024/2048/4096):
+pie **2.0989 s/cohort** vs vLLM **1.9983 s/cohort** = **+100.6 ms per cohort**,
+matching the wave-log gap mean of 110 ms. Intercepts: pie 5 ms, vLLM 73 ms —
+pie's startup is the better of the two.
+
+### Mixed-phase: same mechanism, 7x the exposure
+
+`--mixed-phase` (even requests 400-word prompt / 16 tokens out, odd short
+prompt / 128 out) is the worst case because it makes prefill CONTINUOUS instead
+of confining it to cohort boundaries: 164 prefill waves instead of 24.
+
+Both engines do byte-identical work — 971,696 prompt + 294,912 output =
+1,266,608 tokens — so this is not a token-accounting artifact:
+
+    pie   1,266,608 tok / 28.75 s = 44,057 tok/s
+    vLLM  1,266,608 tok / 18.89 s = 67,053 tok/s
+
+But pie's rate WHILE THE GPU IS BUSY is **75,193 tok/s**, above vLLM's overall
+rate. The kernels are not the problem; the idle is the whole of it.
+
+Two properties of this workload compound the stall, both measured:
+
+- **KV oversubscription.** A 400-word prompt is ~530 tokens = 33 pages, so 512
+  concurrent lanes need ~16,896 pages against a pool of 8,192. pie admits by
+  PROCESS COUNT, not by KV (Open finding #1), so it admits 512 regardless.
+  Raising the pool to 16384 pages: 11703 -> **13472 tok/s (+15.1%)**, wall
+  25.2 -> 21.9 s.
+- **Over-admission.** At the same 8192 pages, conc 256 beats conc 512
+  (**12293** vs 11703, +5.0%); conc 128 is under-utilised (9059). pie's own
+  admission cap is above its optimum for this KV budget.
+
+### Ruled out this round (all measured, all negative)
+
+- **The wait-all seal quorum — four independent designs, all worse.** Adding
+  `PIE_SCHED_JOIN_RELIEF_PCT` (fire when the not-ready set is a small SHARE of
+  the awaited fleet, rather than §20.14 #6's bound-by-TIME) measured
+  10549 -> 9616 at 10%, and after correcting the guard to also escape idle
+  lanes and bypass the `joining` interlock: baseline 11098 vs 10323 at 5% vs
+  10574 at 20%. This is the THIRD and FOURTH confirmation that the seal is not
+  the lever; the experiment was reverted rather than landed.
+- `--max-forward-requests 4096` does not raise the observed batch above 1024;
+  the real limiter was not found. This matters because it is probably why
+  §20.14 #2's admission-oversubscription levers measured worse — extra
+  processes overflow a 1024-row cap and only make batches ragged.
+- `--run-ahead-frames 3` is harmless (31704); **`4` is a liveness bug** —
+  1090 tok/s with 1536 requests hitting `TimeoutError` and the wall pinned to
+  the 300 s cap. Not the default. Recorded, not investigated.
+
+### Two false trails worth recording
+
+- **`frame_wait_watchdog` never fires, and that proves nothing.**
+  `STRICT_WATCHDOG_US = 1_000_000` (frame.rs:132) while every gap measured here
+  is 40-439 ms. Its absence was briefly read as "the seal never holds"; it only
+  means no hold reached one second.
+- **Per-event timestamp fields differ** (`at_us`, `admitted_us`, `returned_us`,
+  `entered_us`, `pass_started_us`, `dispatch_started_us`). A census keyed on
+  `at_us` alone silently drops every process-lifecycle record and makes a busy
+  gap look like total engine silence. Select any `*_us` value above 1e12.
+
+### Fix shape (not done)
+
+The stall is the serial chain `predecessor retires -> pages free -> successor
+admitted -> guest tokenises and submits its first frame -> wave dispatches`,
+none of which overlaps the running decode wave. Two directions, in order of
+expected value:
+
+1. **KV-aware admission** (Open finding #1, now quantified for the first time:
+   +15% on the workload that exposes it). Admit against the page budget rather
+   than a process count, so the pool stops thrashing.
+2. **Overlap prefill preparation with the running decode wave** — prepare and
+   dispatch a successor's first frame while its predecessor is still executing.
+   This needs page headroom for both, which is why (1) comes first.
+
+`waves.py` / `turnover.py` (session artifacts, outside the repo) implement the
+gap decomposition and the in-gap lifecycle census used here.
