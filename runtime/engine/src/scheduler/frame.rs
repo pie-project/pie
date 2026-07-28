@@ -1177,7 +1177,7 @@ mod tests {
             panic!("expected the whole frame");
         };
         assert_eq!(waves, vec![vec![20], vec![21]]);
-        let queued: QueuedFireIds = HashSet::new();
+        let queued = QueuedFireIds::default();
         assert_eq!(plan(&mut policy, &queued, Instant::now()), FramePlan::Park);
         assert_eq!(policy.sealed.len(), 0, "frame popped at dispatch");
         assert!(
@@ -1236,7 +1236,7 @@ mod tests {
         };
         assert_eq!(frame_b[0], vec![41]);
         // Round closed at b's seal: the next epoch awaits BOTH lanes again.
-        let queued: QueuedFireIds = HashSet::new();
+        let queued = QueuedFireIds::default();
         assert_eq!(plan(&mut policy, &queued, Instant::now()), FramePlan::Park);
     }
 

@@ -1663,6 +1663,81 @@ struct QueueScan {
     drain_eligible: Vec<u64>,
 }
 
+impl QueueScan {
+    /// Reset for reuse, keeping the allocations.
+    fn clear(&mut self) {
+        self.queued_ids.clear();
+        self.blocked_lanes.clear();
+        self.untracked = None;
+        self.drain_eligible.clear();
+    }
+}
+
+/// The worker's pending queue, plus an epoch that changes on every mutation.
+///
+/// The epoch exists so [`BatchScheduler::scan_queue`] can skip a pass whose
+/// answer cannot have changed. `DerefMut` bumps it, which is what makes the
+/// invalidation total: every `&mut` reach into the queue counts, including
+/// rotations that leave the length alone, in-place edits through `iter_mut`,
+/// and the rebuild in `post_frame`. A length or endpoint fingerprint would
+/// have missed all three. Over-invalidation (a `&mut` taken but not used) is
+/// merely a wasted scan.
+#[derive(Default)]
+struct PendingQueue {
+    items: VecDeque<QueuedItem>,
+    epoch: u64,
+}
+
+impl PendingQueue {
+    fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Replace the contents wholesale, preserving the epoch counter.
+    fn replace(&mut self, items: VecDeque<QueuedItem>) {
+        self.items = items;
+        self.epoch = self.epoch.wrapping_add(1);
+    }
+}
+
+impl std::ops::Deref for PendingQueue {
+    type Target = VecDeque<QueuedItem>;
+    fn deref(&self) -> &Self::Target {
+        &self.items
+    }
+}
+
+impl std::ops::DerefMut for PendingQueue {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.epoch = self.epoch.wrapping_add(1);
+        &mut self.items
+    }
+}
+
+impl From<VecDeque<QueuedItem>> for PendingQueue {
+    fn from(items: VecDeque<QueuedItem>) -> Self {
+        Self { items, epoch: 0 }
+    }
+}
+
+impl FromIterator<QueuedItem> for PendingQueue {
+    fn from_iter<T: IntoIterator<Item = QueuedItem>>(iter: T) -> Self {
+        Self {
+            items: iter.into_iter().collect(),
+            epoch: 0,
+        }
+    }
+}
+
+/// A [`QueueScan`] plus the queue epoch it was taken at.
+#[derive(Default)]
+struct ScanCache {
+    scan: QueueScan,
+    /// `None` until the first scan; otherwise the (epoch, stopping) the
+    /// cached scan is valid for.
+    taken_at: Option<(u64, bool)>,
+}
+
 struct SchedulerControl {
     tx: crossbeam::channel::Sender<SchedulerItem>,
     active_senders: AtomicUsize,
@@ -2090,7 +2165,8 @@ impl BatchScheduler {
         let mut lane_inflight: u64 = 0;
         let mut lane_token: u64 = 0;
         let mut instances = HashMap::new();
-        let mut pending = VecDeque::new();
+        let mut pending = PendingQueue::default();
+        let mut scan_cache = ScanCache::default();
         let mut terminated_processes: HashSet<ProcessId> = HashSet::new();
         let mut in_flight_launches = VecDeque::new();
         let mut in_flight_control = None;
@@ -2208,6 +2284,7 @@ impl BatchScheduler {
                 limits,
                 &stats,
                 &mut frame_policy,
+                &mut scan_cache,
                 stopping,
             );
             progress |= dispatched;
@@ -2507,7 +2584,7 @@ impl BatchScheduler {
 
     #[allow(clippy::too_many_arguments)]
     fn enqueue_item(
-        pending: &mut VecDeque<QueuedItem>,
+        pending: &mut PendingQueue,
         terminated_processes: &mut HashSet<ProcessId>,
         in_flight_control: &mut Option<PendingControl>,
         instances: &HashMap<u64, TrackedInstance>,
@@ -2783,7 +2860,7 @@ impl BatchScheduler {
     }
 
     fn reject_pipeline_queued(
-        pending: &mut VecDeque<QueuedItem>,
+        pending: &mut PendingQueue,
         pid: ProcessId,
         protected: Option<&WorkItemCompletion>,
     ) {
@@ -2839,10 +2916,10 @@ impl BatchScheduler {
                 kept.push_back(item);
             }
         }
-        *pending = kept;
+        pending.replace(kept);
     }
 
-    fn queue_attempt(pending: &mut VecDeque<QueuedItem>, request: PendingRequest) {
+    fn queue_attempt(pending: &mut PendingQueue, request: PendingRequest) {
         let mut copies = Vec::with_capacity(2);
         if let Some(plan) = request.prelaunch_copy.clone() {
             copies.push(QueuedItem::PreLaunchCopy {
@@ -2958,7 +3035,7 @@ impl BatchScheduler {
         )
     }
 
-    fn queue_close_channel(pending: &mut VecDeque<QueuedItem>, id: u64) {
+    fn queue_close_channel(pending: &mut PendingQueue, id: u64) {
         // Coalesce teardown runs: consecutive channel closes ride one
         // control post. Bounded so a batch's lane occupancy stays a
         // fraction of a wave (~3-6 us per close driver-side).
@@ -2972,7 +3049,7 @@ impl BatchScheduler {
         }
     }
 
-    fn queue_bind_control(pending: &mut VecDeque<QueuedItem>, item: QueuedItem) {
+    fn queue_bind_control(pending: &mut PendingQueue, item: QueuedItem) {
         // Queue-priority invariant: execution outranks bring-up outranks
         // teardown. A queued LAUNCH never depends on a queued bind — a fire
         // exists only after its own lane's bind control completed and the
@@ -2999,7 +3076,7 @@ impl BatchScheduler {
 
     /// launch that reached the queue front has no queued copy left).
     fn rotate_launch_for_wave_work(
-        pending: &mut VecDeque<QueuedItem>,
+        pending: &mut PendingQueue,
         allow_controls: bool,
     ) -> bool {
         if !matches!(pending.front(), Some(QueuedItem::Launch(_))) {
@@ -3032,16 +3109,18 @@ impl BatchScheduler {
         lane_inflight: &mut u64,
         lane_token: &mut u64,
         instances: &mut HashMap<u64, TrackedInstance>,
-        pending: &mut VecDeque<QueuedItem>,
+        pending: &mut PendingQueue,
         in_flight_launches: &mut VecDeque<PendingLaunchBatch>,
         in_flight_control: &mut Option<PendingControl>,
         page_size: u32,
         limits: SchedulerLimits,
         stats: &Arc<SchedulerStats>,
         frame_policy: &mut FramePolicy,
+        scan_cache: &mut ScanCache,
         stopping: bool,
     ) -> (bool, Option<Duration>) {
         let (mut progress, wait_hint) = Self::dispatch_frame_work(
+            scan_cache,
             frame_policy,
             driver_lane,
             lane_inflight,
@@ -3428,8 +3507,22 @@ impl BatchScheduler {
     /// frame atomicity and the resize rotation refusal into a three-party
     /// queue-order deadlock under contention — a sealed frame straddling a
     /// {resize, copy} pair never posted (CONTENTION_FOLLOWUP.md §12).
-    fn scan_queue(pending: &VecDeque<QueuedItem>, stopping: bool) -> QueueScan {
-        let mut scan = QueueScan::default();
+    fn scan_queue<'a>(
+        cache: &'a mut ScanCache,
+        pending: &PendingQueue,
+        stopping: bool,
+    ) -> &'a QueueScan {
+        // The scan is a pure function of (queue contents, stopping), so a
+        // pass at an unchanged epoch would rebuild exactly what is already
+        // here. This matters: the worker scans once per pass and passes run
+        // ~50x per wave while the queue changes only a couple of times, and
+        // walking `pending` drags every large `QueuedItem` through cache
+        // (~25us per scan at 128 requests, about half of all dispatch time).
+        if cache.taken_at == Some((pending.epoch(), stopping)) {
+            return &cache.scan;
+        }
+        let scan = &mut cache.scan;
+        scan.clear();
         for item in pending.iter() {
             match item {
                 QueuedItem::Launch(request) => {
@@ -3451,7 +3544,8 @@ impl BatchScheduler {
             }
         }
         scan.queued_ids.seal();
-        scan
+        cache.taken_at = Some((pending.epoch(), stopping));
+        &cache.scan
     }
 
     /// Launch dispatch: post WHOLE sealed frames to the driver lane at the
@@ -3461,12 +3555,13 @@ impl BatchScheduler {
     /// this degenerates to the per-wave wait-all dispatch.
     #[allow(clippy::too_many_arguments)]
     fn dispatch_frame_work(
+        scan_cache: &mut ScanCache,
         frame_policy: &mut FramePolicy,
         driver_lane: &DriverLane,
         lane_inflight: &mut u64,
         lane_token: &mut u64,
         instances: &mut HashMap<u64, TrackedInstance>,
-        pending: &mut VecDeque<QueuedItem>,
+        pending: &mut PendingQueue,
         in_flight_launches: &mut VecDeque<PendingLaunchBatch>,
         in_flight_control: &Option<PendingControl>,
         page_size: u32,
@@ -3500,7 +3595,7 @@ impl BatchScheduler {
             }
             let now = Instant::now();
             let probe = super::fire_timing_enabled();
-            let scan = Self::scan_queue(pending, stopping);
+            let scan = Self::scan_queue(scan_cache, pending, stopping);
             if probe {
                 let acc = &super::LOOP_PHASES;
                 acc.scan_ns
@@ -3519,7 +3614,7 @@ impl BatchScheduler {
                 if scan.drain_eligible.is_empty() {
                     break;
                 }
-                vec![scan.drain_eligible]
+                vec![scan.drain_eligible.clone()]
             } else if let Some(untracked) = scan.untracked {
                 rider_batch = true;
                 vec![vec![untracked]]
@@ -3585,7 +3680,7 @@ impl BatchScheduler {
         lane_inflight: &mut u64,
         lane_token: &mut u64,
         instances: &mut HashMap<u64, TrackedInstance>,
-        pending: &mut VecDeque<QueuedItem>,
+        pending: &mut PendingQueue,
         in_flight_launches: &mut VecDeque<PendingLaunchBatch>,
         page_size: u32,
         limits: SchedulerLimits,
@@ -3610,7 +3705,7 @@ impl BatchScheduler {
                 item => kept.push_back(item),
             }
         }
-        *pending = kept;
+        pending.replace(kept);
         // In-wave order: the sealed wave's id order (lane admission order).
         for (wave, ids) in picked_waves.iter_mut().zip(waves) {
             let order: HashMap<u64, usize> = ids
@@ -3720,7 +3815,7 @@ impl BatchScheduler {
     fn retire_ready_launches(
         in_flight_launches: &mut VecDeque<PendingLaunchBatch>,
         instances: &mut HashMap<u64, TrackedInstance>,
-        pending: &mut VecDeque<QueuedItem>,
+        pending: &mut PendingQueue,
         stats: &Arc<SchedulerStats>,
     ) -> bool {
         let mut progress = false;
@@ -5191,7 +5286,7 @@ mod tests {
             None,
             false,
         );
-        let mut pending = VecDeque::from([QueuedItem::Launch(request)]);
+        let mut pending: PendingQueue = VecDeque::from([QueuedItem::Launch(request)]).into();
         completion.request_cancel();
         BatchScheduler::reject_pipeline_queued(&mut pending, pid, Some(&completion));
         assert_eq!(pending.len(), 1);
@@ -5246,7 +5341,7 @@ mod tests {
             None,
             false,
         );
-        let mut pending = VecDeque::new();
+        let mut pending = PendingQueue::default();
         BatchScheduler::queue_attempt(&mut pending, request);
 
         let QueuedItem::PreLaunchCopy {
@@ -5672,7 +5767,7 @@ mod tests {
     async fn synchronous_control_burst_dispatches_in_one_pass() {
         let (tx_a, mut rx_a) = tokio::sync::oneshot::channel();
         let (tx_b, mut rx_b) = tokio::sync::oneshot::channel();
-        let mut pending = VecDeque::from([
+        let mut pending: PendingQueue = VecDeque::from([
             QueuedItem::RegisterProgram {
                 plan: dummy_program(),
                 response: tx_a,
@@ -5681,7 +5776,7 @@ mod tests {
                 plan: dummy_program(),
                 response: tx_b,
             },
-        ]);
+        ]).into();
         let (lane, _lane_rx) = test_lane(None);
         let mut lane_inflight = 0u64;
         let mut lane_token = 0u64;
@@ -5713,6 +5808,7 @@ mod tests {
             limits,
             &stats,
             &mut frame_policy,
+            &mut ScanCache::default(),
             false,
         );
         assert!(progress);
@@ -6625,7 +6721,7 @@ mod tests {
     fn launch_rotation_preserves_per_instance_order() {
         let pipeline_a = ProcessId::new_v4();
         let pipeline_b = ProcessId::new_v4();
-        let mut pending = VecDeque::new();
+        let mut pending = PendingQueue::default();
         pending.push_back(QueuedItem::Launch(dummy_launch_request(pipeline_a, 1)));
         pending.push_back(QueuedItem::Launch(dummy_launch_request(pipeline_a, 1)));
         pending.push_back(QueuedItem::Launch(dummy_launch_request(pipeline_b, 2)));
@@ -6672,7 +6768,7 @@ mod tests {
     #[test]
     fn launch_rotation_reaches_a_pre_launch_copy() {
         let make_pending = || {
-            let mut pending = VecDeque::new();
+            let mut pending = PendingQueue::default();
             pending.push_back(QueuedItem::Launch(dummy_launch_request(
                 ProcessId::new_v4(),
                 1,
@@ -6736,7 +6832,7 @@ mod tests {
         let mut frame_policy = FramePolicy::new(1, 1, 4096, None);
         frame_policy.on_fire_enqueued(stamp, Some(pid), fire_id, 1, 1);
 
-        let mut pending = VecDeque::from([QueuedItem::Launch(request)]);
+        let mut pending: PendingQueue = VecDeque::from([QueuedItem::Launch(request)]).into();
         let (lane, _lane_rx) = test_lane(None);
         let mut lane_inflight = 0u64;
         let mut lane_token = 0u64;
@@ -6816,7 +6912,7 @@ mod tests {
         frame_policy.on_fire_enqueued(stamp, Some(pid), fire_id, 1, 1);
 
         let (resize_tx, _resize_rx) = tokio::sync::oneshot::channel();
-        let mut pending = VecDeque::from([
+        let mut pending: PendingQueue = VecDeque::from([
             QueuedItem::Launch(request),
             QueuedItem::ResizePool {
                 plan: PoolResizePlan::default(),
@@ -6826,7 +6922,7 @@ mod tests {
                 plan: crate::driver::KvCopyPlan::default(),
                 completion: ControlCompletion::new(),
             },
-        ]);
+        ]).into();
         let (lane, _lane_rx) = test_lane(None);
         let mut lane_inflight = 0u64;
         let mut lane_token = 0u64;
@@ -6852,6 +6948,7 @@ mod tests {
             limits,
             &stats,
             &mut frame_policy,
+            &mut ScanCache::default(),
             false,
         );
         assert!(progress, "the copy dispatch is progress");
@@ -6902,7 +6999,7 @@ mod tests {
         let fire_b = request_b.logical_fire_id;
         let (resize_tx, _resize_rx) = tokio::sync::oneshot::channel();
         let (copy_tx, _copy_rx) = tokio::sync::oneshot::channel();
-        let pending = VecDeque::from([
+        let pending: PendingQueue = VecDeque::from([
             QueuedItem::Launch(request_a),
             QueuedItem::ResizePool {
                 plan: PoolResizePlan::default(),
@@ -6923,12 +7020,13 @@ mod tests {
                 process_id: Some(coupled),
                 pipeline_id: Some(coupled),
             },
-        ]);
+        ]).into();
 
-        let scan = BatchScheduler::scan_queue(&pending);
+        let mut scan_cache = ScanCache::default();
+        let scan = BatchScheduler::scan_queue(&mut scan_cache, &pending, false);
         assert_eq!(
             scan.queued_ids,
-            [fire_a, fire_b].into_iter().collect::<HashSet<u64>>()
+            [fire_a, fire_b].into_iter().collect::<frame::QueuedFireIds>()
         );
         assert_eq!(
             scan.blocked_lanes,
@@ -6936,8 +7034,86 @@ mod tests {
             "only the pre-launch copy's lane blocks; the fire behind the \
              resize/copy run stays dispatchable (the deadlock's broken edge)"
         );
-        assert_eq!(scan.drain_eligible, vec![fire_a, fire_b]);
+        assert_eq!(
+            scan.drain_eligible,
+            Vec::<u64>::new(),
+            "the steady-state scan never builds the drain list"
+        );
         assert_eq!(scan.untracked, None);
+
+        // `stopping` is part of the cache key, so flipping it must re-scan
+        // even though the queue itself never moved.
+        let draining = BatchScheduler::scan_queue(&mut scan_cache, &pending, true);
+        assert_eq!(draining.drain_eligible, vec![fire_a, fire_b]);
+    }
+
+    /// The cached scan is keyed on a queue epoch that every `&mut` reach
+    /// bumps. A rotation is the case a length or endpoint fingerprint would
+    /// miss: same length, same id set, different answer for `untracked`.
+    #[test]
+    fn a_mutated_queue_invalidates_the_cached_scan() {
+        let lane = ProcessId::new_v4();
+        let make = |frame: Option<FrameStamp>| {
+            PendingRequest::direct(
+                dummy_launch(),
+                1,
+                WorkItemCompletion::deferred_with_guard(None),
+                0,
+                Some(lane),
+                Some(lane),
+                false,
+                None,
+                None,
+                frame,
+                false,
+            )
+        };
+        let stamped = make(Some(FrameStamp {
+            lane,
+            seq: 1,
+            slot: 0,
+            fires: 1,
+        }));
+        let rider = make(None);
+        let (stamped_id, rider_id) = (stamped.logical_fire_id, rider.logical_fire_id);
+        let mut pending: PendingQueue = VecDeque::from([
+            QueuedItem::Launch(stamped),
+            QueuedItem::Launch(rider),
+        ])
+        .into();
+
+        let mut cache = ScanCache::default();
+        let scan = BatchScheduler::scan_queue(&mut cache, &pending, false);
+        assert_eq!(scan.untracked, Some(rider_id));
+        assert!(scan.queued_ids.contains(&stamped_id));
+
+        // A repeat scan at an unchanged epoch is the whole point: it must be
+        // the cached one, and it must still be right.
+        let hit = BatchScheduler::scan_queue(&mut cache, &pending, false);
+        assert_eq!(hit.untracked, Some(rider_id));
+
+        let before = pending.epoch();
+        let front = pending.pop_front().expect("stamped front");
+        pending.push_back(front);
+        assert_ne!(before, pending.epoch(), "a rotation bumps the epoch");
+        assert_eq!(pending.len(), 2, "a rotation keeps the length");
+
+        let rescan = BatchScheduler::scan_queue(&mut cache, &pending, false);
+        assert_eq!(
+            rescan.untracked,
+            Some(rider_id),
+            "the rider is still the oldest unstamped fire"
+        );
+        assert!(rescan.queued_ids.contains(&stamped_id));
+
+        // Dropping the stamped fire (now at the back, after the rotation)
+        // must drop it from the cached id set.
+        let _ = pending.pop_back();
+        let after = BatchScheduler::scan_queue(&mut cache, &pending, false);
+        assert!(
+            !after.queued_ids.contains(&stamped_id),
+            "a scan cached at an older epoch must never be reused"
+        );
     }
 
     /// A settling standalone copy does not hold frame posting; a settling
@@ -6971,7 +7147,7 @@ mod tests {
             let fire_id = request.logical_fire_id;
             let mut frame_policy = FramePolicy::new(1, 1, 4096, None);
             frame_policy.on_fire_enqueued(stamp, Some(pid), fire_id, 1, 1);
-            let mut pending = VecDeque::from([QueuedItem::Launch(request)]);
+            let mut pending: PendingQueue = VecDeque::from([QueuedItem::Launch(request)]).into();
             let (lane, _lane_rx) = test_lane(None);
             let mut lane_inflight = 0u64;
             let mut lane_token = 1u64;
@@ -7004,6 +7180,7 @@ mod tests {
                 limits,
                 &stats,
                 &mut frame_policy,
+                &mut ScanCache::default(),
                 false,
             );
             pending.len()
