@@ -125,4 +125,10 @@ struct Glm5Weights {
 
 Glm5Weights bind_glm5(const LoadedModel& engine);
 
+/// True when the routed `gate_up` slab is published as `[up | gate]` -- the
+/// order flashinfer's CUTLASS grouped GEMM reads fc1 in (`silu(w[I:]) * w[:I]`),
+/// which is the mirror of pie's own `chunked_swiglu`. The contract author and
+/// every consumer of `moe_gate_up_proj` must agree, so both ask here.
+bool glm5_moe_gate_up_swapped();
+
 }  // namespace pie_cuda_driver::model

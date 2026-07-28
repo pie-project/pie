@@ -6,6 +6,37 @@ namespace pie_cuda_driver::kernels {
 
 namespace {
 
+// Block reduction that reproduces the shared-memory tree
+// `for (off = BLOCK/2; off; off >>= 1) buf[t] += buf[t+off]` **exactly**, but
+// runs the last five levels on warp shuffles. Those levels only ever touch
+// threads 0..31, so the pairing is identical and the fp32 rounding is
+// unchanged -- what goes away is five block-wide barriers, which at decode
+// (one block per token, eight blocks on 148 SMs) were a third of the kernel.
+template <int BLOCK>
+__device__ __forceinline__ float block_reduce_sum_exact(float local, float* buf)
+{
+    static_assert(BLOCK >= 32 && (BLOCK & (BLOCK - 1)) == 0,
+                  "block_reduce_sum_exact needs a power-of-two BLOCK >= 32");
+    const int tid = threadIdx.x;
+    buf[tid] = local;
+    __syncthreads();
+#pragma unroll
+    for (int off = BLOCK / 2; off >= 32; off >>= 1) {
+        if (tid < off) buf[tid] += buf[tid + off];
+        __syncthreads();
+    }
+    if (tid < 32) {
+        float v = buf[tid];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            v += __shfl_down_sync(0xffffffffu, v, off);
+        }
+        if (tid == 0) buf[0] = v;
+    }
+    __syncthreads();
+    return buf[0];
+}
+
 // One block per row. `BLOCK` threads cooperate on the L2-norm reduction;
 // each thread handles `hidden / BLOCK` elements. We always launch with
 // BLOCK == 256, so the per-thread chunk is small even for hidden=8192.
@@ -37,15 +68,9 @@ __global__ void rmsnorm_bf16_kernel(
     // Block-wide reduction via shared memory. CUB would be cleaner, but this
     // avoids a heavy header for the M1.2.2 build.
     __shared__ float buf[BLOCK];
-    buf[tid] = local;
-    __syncthreads();
+    const float buf_sum = block_reduce_sum_exact<BLOCK>(local, buf);
 
-    for (int off = BLOCK / 2; off > 0; off >>= 1) {
-        if (tid < off) buf[tid] += buf[tid + off];
-        __syncthreads();
-    }
-
-    const float inv_rms = rsqrtf(buf[0] / static_cast<float>(hidden) + eps);
+    const float inv_rms = rsqrtf(buf_sum / static_cast<float>(hidden) + eps);
 
     for (int i = tid; i < hidden; i += BLOCK) {
         const float xv = __bfloat162float(xr[i]);
@@ -81,16 +106,10 @@ __global__ void residual_add_rmsnorm_bf16_kernel(
     }
 
     __shared__ float buf[BLOCK];
-    buf[tid] = local;
-    __syncthreads();
-
-    for (int off = BLOCK / 2; off > 0; off >>= 1) {
-        if (tid < off) buf[tid] += buf[tid + off];
-        __syncthreads();
-    }
+    const float buf_sum = block_reduce_sum_exact<BLOCK>(local, buf);
 
     const float inv_rms =
-        rsqrtf(buf[0] / static_cast<float>(hidden_size) + eps);
+        rsqrtf(buf_sum / static_cast<float>(hidden_size) + eps);
 
     for (int i = tid; i < hidden_size; i += BLOCK) {
         const float xv = __bfloat162float(hr[i]);
@@ -129,16 +148,10 @@ __global__ void residual_add_scale_rmsnorm_bf16_kernel(
     }
 
     __shared__ float buf[BLOCK];
-    buf[tid] = local;
-    __syncthreads();
-
-    for (int off = BLOCK / 2; off > 0; off >>= 1) {
-        if (tid < off) buf[tid] += buf[tid + off];
-        __syncthreads();
-    }
+    const float buf_sum = block_reduce_sum_exact<BLOCK>(local, buf);
 
     const float inv_rms =
-        rsqrtf(buf[0] / static_cast<float>(hidden_size) + eps);
+        rsqrtf(buf_sum / static_cast<float>(hidden_size) + eps);
 
     for (int i = tid; i < hidden_size; i += BLOCK) {
         const float xv = __bfloat162float(hr[i]);
@@ -167,15 +180,10 @@ __global__ void rmsnorm_residual_add_bf16_kernel(
     }
 
     __shared__ float buf[BLOCK];
-    buf[tid] = local;
-    __syncthreads();
-    for (int off = BLOCK / 2; off > 0; off >>= 1) {
-        if (tid < off) buf[tid] += buf[tid + off];
-        __syncthreads();
-    }
+    const float buf_sum = block_reduce_sum_exact<BLOCK>(local, buf);
 
     const float inv_rms =
-        rsqrtf(buf[0] / static_cast<float>(hidden_size) + eps);
+        rsqrtf(buf_sum / static_cast<float>(hidden_size) + eps);
     for (int i = tid; i < hidden_size; i += BLOCK) {
         const __nv_bfloat16 norm = __float2bfloat16(
             __bfloat162float(xr[i]) * inv_rms *
@@ -209,15 +217,10 @@ __global__ void rmsnorm_residual_add_scale_rmsnorm_bf16_kernel(
     }
 
     __shared__ float buf[BLOCK];
-    buf[tid] = local;
-    __syncthreads();
-    for (int off = BLOCK / 2; off > 0; off >>= 1) {
-        if (tid < off) buf[tid] += buf[tid + off];
-        __syncthreads();
-    }
+    const float buf_sum = block_reduce_sum_exact<BLOCK>(local, buf);
 
     const float inv_rms =
-        rsqrtf(buf[0] / static_cast<float>(hidden_size) + eps);
+        rsqrtf(buf_sum / static_cast<float>(hidden_size) + eps);
     const float scale_rounded = __bfloat162float(__float2bfloat16(scale));
     float local_next = 0.f;
     for (int i = tid; i < hidden_size; i += BLOCK) {
@@ -233,15 +236,11 @@ __global__ void rmsnorm_residual_add_scale_rmsnorm_bf16_kernel(
         local_next += v * v;
     }
 
-    buf[tid] = local_next;
-    __syncthreads();
-    for (int off = BLOCK / 2; off > 0; off >>= 1) {
-        if (tid < off) buf[tid] += buf[tid + off];
-        __syncthreads();
-    }
+    __shared__ float buf_next[BLOCK];
+    const float buf_next_sum = block_reduce_sum_exact<BLOCK>(local_next, buf_next);
 
     const float inv_next =
-        rsqrtf(buf[0] / static_cast<float>(hidden_size) + eps);
+        rsqrtf(buf_next_sum / static_cast<float>(hidden_size) + eps);
     for (int i = tid; i < hidden_size; i += BLOCK) {
         nr[i] = __float2bfloat16(
             __bfloat162float(hr[i]) * inv_next *
@@ -400,13 +399,8 @@ __global__ void rmsnorm_no_scale_bf16_kernel(
     }
 
     __shared__ float buf[BLOCK];
-    buf[tid] = local;
-    __syncthreads();
-    for (int off = BLOCK / 2; off > 0; off >>= 1) {
-        if (tid < off) buf[tid] += buf[tid + off];
-        __syncthreads();
-    }
-    const float inv_rms = rsqrtf(buf[0] / static_cast<float>(hidden) + eps);
+    const float buf_sum = block_reduce_sum_exact<BLOCK>(local, buf);
+    const float inv_rms = rsqrtf(buf_sum / static_cast<float>(hidden) + eps);
 
     for (int i = tid; i < hidden; i += BLOCK) {
         yr[i] = __float2bfloat16(__bfloat162float(xr[i]) * inv_rms);
@@ -458,13 +452,8 @@ __global__ void rmsnorm_gated_bf16_kernel(
     }
 
     __shared__ float buf[BLOCK];
-    buf[tid] = local;
-    __syncthreads();
-    for (int off = BLOCK / 2; off > 0; off >>= 1) {
-        if (tid < off) buf[tid] += buf[tid + off];
-        __syncthreads();
-    }
-    const float inv_rms = rsqrtf(buf[0] / static_cast<float>(hidden) + eps);
+    const float buf_sum = block_reduce_sum_exact<BLOCK>(local, buf);
+    const float inv_rms = rsqrtf(buf_sum / static_cast<float>(hidden) + eps);
 
     for (int i = tid; i < hidden; i += BLOCK) {
         const float xv = __bfloat162float(xr[i]) * inv_rms;
@@ -506,13 +495,8 @@ __global__ void rmsnorm_gated_fp32_in_bf16_kernel(
     }
 
     __shared__ float buf[BLOCK];
-    buf[tid] = local;
-    __syncthreads();
-    for (int off = BLOCK / 2; off > 0; off >>= 1) {
-        if (tid < off) buf[tid] += buf[tid + off];
-        __syncthreads();
-    }
-    const float inv_rms = rsqrtf(buf[0] / static_cast<float>(hidden) + eps);
+    const float buf_sum = block_reduce_sum_exact<BLOCK>(local, buf);
+    const float inv_rms = rsqrtf(buf_sum / static_cast<float>(hidden) + eps);
 
     for (int i = tid; i < hidden; i += BLOCK) {
         const float xv = xr[i] * inv_rms;

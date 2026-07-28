@@ -287,6 +287,38 @@ bool flashinfer_cutlass_moe_enabled() {
     return enabled;
 }
 
+int flashinfer_cutlass_moe_max_rows() {
+    static const int rows = [] {
+        constexpr int kDefault = 1024;
+        const char* v = std::getenv("PIE_MOE_FUSED_MAX_ROWS");
+        if (v == nullptr || v[0] == '\0') return kDefault;
+        const long parsed = std::strtol(v, nullptr, 10);
+        if (parsed <= 0) return kDefault;
+        return static_cast<int>(std::min<long>(parsed, 1 << 20));
+    }();
+    return rows;
+}
+
+int flashinfer_cutlass_moe_min_rows() {
+    static const int rows = [] {
+        const char* v = std::getenv("PIE_MOE_FUSED_MIN_ROWS");
+        if (v == nullptr || v[0] == '\0') return 0;
+        const long parsed = std::strtol(v, nullptr, 10);
+        return parsed > 0 ? static_cast<int>(parsed) : 0;
+    }();
+    return rows;
+}
+
+int moe_gemv_max_tokens(int fallback) {
+    static const long override_value = [] {
+        const char* v = std::getenv("PIE_MOE_GEMV_MAX_TOKENS");
+        if (v == nullptr || v[0] == '\0') return -1L;
+        const long parsed = std::strtol(v, nullptr, 10);
+        return parsed >= 0 ? parsed : -1L;
+    }();
+    return override_value >= 0 ? static_cast<int>(override_value) : fallback;
+}
+
 std::size_t flashinfer_cutlass_moe_workspace_bytes(
     MoeActivation activation,
     int num_rows,
@@ -301,7 +333,7 @@ std::size_t flashinfer_cutlass_moe_workspace_bytes(
         return 0;
     }
     Runner& runner = get_runner();
-    return runner.getWorkspaceSize(
+    const std::size_t bytes = runner.getWorkspaceSize(
         num_rows,
         hidden_size,
         inter_size,
@@ -314,6 +346,15 @@ std::size_t flashinfer_cutlass_moe_workspace_bytes(
         false,
         false,
         false);
+    if (log_enabled()) {
+        std::fprintf(
+            stderr,
+            "[pie-driver-cuda] FlashInfer MoE workspace %zu MiB "
+            "(rows=%d hidden=%d inter=%d experts=%d topk=%d)\n",
+            bytes >> 20, num_rows, hidden_size, inter_size, num_experts,
+            experts_per_token);
+    }
+    return bytes;
 }
 
 bool flashinfer_cutlass_moe_bf16(
