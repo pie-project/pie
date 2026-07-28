@@ -190,11 +190,12 @@ pub fn emit_grouped_fused_region(
     source.push_str("    uint dispatch_lane [[threadgroup_position_in_grid]],\n");
     source.push_str("    uint m3_tid [[thread_position_in_threadgroup]],\n");
     source.push_str("    uint m3_threads [[threads_per_threadgroup]]) {\n");
-    // A lane now owns a threadgroup rather than a thread. Everything the region
-    // does still happens once per lane -- ops that cannot be partitioned run on
-    // thread 0 -- but the two that walk the whole vocabulary (the logits gather
-    // and argmax) split across it. Single-threading them cost ~155ms of a
-    // ~159ms decode step against a ~3ms model forward.
+    // A lane owns a threadgroup rather than a thread. Everything the region does
+    // still happens once per lane -- ops that cannot be partitioned run on thread
+    // 0 -- but the ones that walk the whole vocabulary split across it. The
+    // driver picks the actual width from the pipeline's own limit and passes it
+    // in `m3_threads`; this array only has to be big enough for the largest it
+    // will ever ask for.
     let _ = writeln!(
         source,
         "  threadgroup M1ArgmaxCandidate m3_tgbuf[{METAL_M3_REGION_THREADS}];"
@@ -226,7 +227,7 @@ pub fn emit_grouped_fused_region(
     // say so rather than reading past the buffer.
     let _ = writeln!(
         source,
-        "  if (m3_threads != {METAL_M3_REGION_THREADS}u) {{ \
+        "  if (m3_threads > {METAL_M3_REGION_THREADS}u) {{ \
          if (m3_tid == 0) m1_fault(status, 0xB3u); return; }}"
     );
     source.push_str(

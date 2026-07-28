@@ -1301,6 +1301,12 @@ std::uint64_t RawMetalContext::device_cache_id() const {
     return hash;
 }
 
+uint32_t RawMetalContext::pso_max_threads(Pso pso) const {
+    if (pso.obj == nullptr) return 0;
+    auto p = (__bridge id<MTLComputePipelineState>)pso.obj;
+    return static_cast<uint32_t>(p.maxTotalThreadsPerThreadgroup);
+}
+
 void* RawMetalContext::create_timestamp_heap(uint32_t count) {
     auto& I = *impl_;
     if (count == 0) return nullptr;

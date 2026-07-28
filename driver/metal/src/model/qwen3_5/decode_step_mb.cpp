@@ -97,16 +97,10 @@ void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
     }
 }
 
-bool barrier_after_mb(const std::vector<Dispatch>& dag, size_t i) {
+bool barrier_after_mb(const std::vector<Dispatch>& dag, size_t i,
+                      const std::vector<int>& run_ends) {
     if (i + 1 >= dag.size()) return true;
-    const Dispatch& a = dag[i];
-    const Dispatch& b = dag[i + 1];
-    if (a.layer != b.layer) return true;
-    return !((a.kind == Kernel::QmvK && b.kind == Kernel::QmvV) ||
-             (a.kind == Kernel::QNorm && b.kind == Kernel::KNorm) ||
-             (a.kind == Kernel::QmvGate && b.kind == Kernel::QmvUp) ||
-             (a.kind == Kernel::QmvIn && b.kind == Kernel::QmvInZ) ||
-             (a.kind == Kernel::GdnInA && b.kind == Kernel::GdnInB));
+    return run_ends[i] == int(i);
 }
 
 Pso mb_pso(const Dispatch& d, const DecodeStepPsos& base, const MultiBatchPsos& mb) {
@@ -304,12 +298,13 @@ void bind_prefill_gdn_state(RawMetalContext& ctx, const BoundDecode& b,
 void encode_decode_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
                            const DecodeStepPsos& base_psos, const MultiBatchPsos& mb_psos,
                            bool force_barriers) {
+    const std::vector<int> run_ends = concurrent_run_ends(dag);
     for (size_t i = 0; i < dag.size(); ++i) {
         const Dispatch& d = dag[i];
         se.set_pso(mb_pso(d, base_psos, mb_psos));
         se.set_argtable(d.kind, d.ordinal);
         se.dispatch(d.grid, d.tg);
-        if (force_barriers || barrier_after_mb(dag, i)) se.barrier();
+        if (force_barriers || barrier_after_mb(dag, i, run_ends)) se.barrier();
     }
 }
 

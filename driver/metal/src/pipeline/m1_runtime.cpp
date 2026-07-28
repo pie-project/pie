@@ -3026,14 +3026,21 @@ bool M1Runtime::prepare_m3_group(
             } else {
                 // A generated region used to get one thread per lane, which put
                 // every vocabulary-wide op in a PTIR program on a single lane of
-                // the GPU: ~155ms of a ~159ms decode step, against a ~3ms model
-                // forward. It now gets a threadgroup per lane, matching
-                // METAL_M3_REGION_THREADS in compiler/codegen/src/metal/fused.rs
-                // — the emitted kernel sizes its reduction buffer to exactly
-                // this and faults if the launch disagrees.
+                // the GPU: ~155ms of a ~159ms decode step against a ~3ms model
+                // forward. It gets a threadgroup per lane instead.
+                //
+                // Take the widest threadgroup this pipeline actually allows,
+                // rounded down to a multiple of the simd width, and never more
+                // than the threadgroup buffer the kernel declares. The region's
+                // vocabulary-wide ops are latency-bound inside one threadgroup,
+                // so width is throughput.
+                std::uint32_t width = std::min<std::uint32_t>(
+                    kM3RegionThreads,
+                    std::max<std::uint32_t>(
+                        32u, context().pso_max_threads(region.pso)));
+                width = std::max<std::uint32_t>(32u, (width / 32u) * 32u);
                 const std::uint64_t threads =
-                    static_cast<std::uint64_t>(stage_lane_count) *
-                    kM3RegionThreads;
+                    static_cast<std::uint64_t>(stage_lane_count) * width;
                 if (threads > std::numeric_limits<std::uint32_t>::max()) {
                     error = "Metal M3 region launch exceeds u32 grid";
                     group->stages.push_back(std::move(stage));
@@ -3045,7 +3052,7 @@ bool M1Runtime::prepare_m3_group(
                     1,
                     1,
                 };
-                encoded.threadgroup = {kM3RegionThreads, 1, 1};
+                encoded.threadgroup = {width, 1, 1};
             }
             stage.regions.push_back(encoded);
         }

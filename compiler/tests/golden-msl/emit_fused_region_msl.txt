@@ -1,6 +1,6 @@
 # oracle dump: pie::metal::pipeline::emit_fused_region_msl
 # source of truth: compiler/codegen/src/metal/ (the C++ oracle this was dumped from is deleted)
-# emitter_version: 29
+# emitter_version: 30
 # @runtime: bytes=39611 fnv1a64=0x310a2f7d72f22fd5
 # @grouped: bytes=970 fnv1a64=0xa8ab9e1ebf8714d9
 # cases: 192
