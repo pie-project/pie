@@ -137,6 +137,13 @@ enum class TpFollowerStage : int {
 void tp_watchdog_mark_rank0_stage(TpRank0Stage stage);
 void tp_watchdog_mark_follower_stage(TpFollowerStage stage);
 
+// Per-layer progress beacon from inside a model forward, printed by the stall
+// watchdog. A TP forward that stops mid-layer is otherwise indistinguishable
+// from one that never started: both ranks just report "forward". `phase` is
+// model-defined (Mixtral: 0=attn done, 1=attn all-reduce done, 2=MoE routing
+// sync done, 3=MoE all-reduce done). Relaxed stores, no cost when unread.
+void tp_watchdog_mark_model_progress(int rank, int layer, int phase);
+
 void tp_cpu_gate_notify(const std::string& key);
 
 // Release every waiter parked on the CPU gate keyed by `key` and mark the gate

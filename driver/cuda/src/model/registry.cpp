@@ -526,6 +526,21 @@ std::unique_ptr<IModel> create_gemma3n_model(
 std::unique_ptr<IModel> create_mixtral_model(
     std::unique_ptr<ModelPlan> plan_base, ModelResources& res) {
     auto& plan = plan_cast<MixtralPlan>(*plan_base, "mixtral");
+    // Size the forward's scratch for the widest fire NOW, at load, while the
+    // TP group is quiescent. Growing it later would call the allocator on the
+    // fire path, which synchronizes the context and deadlocks against a peer
+    // spinning in a collective (see mixtral_scratch_reserve).
+    const int tp = std::max(1, res.tp_size);
+    const int hidden = res.hf_config->hidden_size;
+    const int intermediate_local = res.hf_config->intermediate_size / tp;
+    const int intermediate_padded =
+        std::max(intermediate_local, plan.weights.mxfp4_intermediate_padded);
+    mixtral_scratch_reserve(
+        res.max_workspace_tokens,
+        res.hf_config->num_experts_per_tok,
+        hidden,
+        intermediate_padded,
+        std::max(1, res.hf_config->num_attention_heads / tp));
     return std::make_unique<MixtralModel>(
         std::move(plan.weights), *res.hf_config, *res.llama_fwd_cfg,
         res.hf_config->num_experts, res.hf_config->num_experts_per_tok);

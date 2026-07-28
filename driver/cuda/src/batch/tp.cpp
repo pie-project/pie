@@ -323,6 +323,8 @@ struct TpStallWatchdog {
     std::atomic<std::uint64_t> rank0_phase_seq{0};
     std::atomic<int> rank0_stage{0};
     std::atomic<int> follower_stage{0};
+    std::array<std::atomic<int>, 2> model_layer{};
+    std::array<std::atomic<int>, 2> model_phase{};
     std::atomic<bool> running{false};
     std::thread thread;
     static bool enabled() {
@@ -367,7 +369,8 @@ struct TpStallWatchdog {
                         "[tp-watchdog] STALLED %ds: published=%llu consumed=%llu "
                         "(delta=%lld) rank0_last_phase=%s seq=%llu "
                         "follower_forwards=%llu collectives=[r0=%llu r1=%llu] "
-                        "rank0_stage=%s follower_stage=%s\n",
+                        "rank0_stage=%s follower_stage=%s "
+                        "model=[r0 L%d p%d | r1 L%d p%d]\n",
                         (++stuck) * 5,
                         (unsigned long long)p, (unsigned long long)c,
                         (long long)(p - c),
@@ -377,7 +380,9 @@ struct TpStallWatchdog {
                         (unsigned long long)collectives[0].load(),
                         (unsigned long long)collectives[1].load(),
                         (r0s >= 0 && r0s <= 12) ? kR0Stage[r0s] : "?",
-                        (f1s >= 0 && f1s <= 11) ? kF1Stage[f1s] : "?");
+                        (f1s >= 0 && f1s <= 11) ? kF1Stage[f1s] : "?",
+                        model_layer[0].load(), model_phase[0].load(),
+                        model_layer[1].load(), model_phase[1].load());
                 } else {
                     stuck = 0;
                 }
@@ -848,6 +853,14 @@ void tp_watchdog_mark_rank0_stage(TpRank0Stage stage) {
 void tp_watchdog_mark_follower_stage(TpFollowerStage stage) {
     TpStallWatchdog::instance().follower_stage.store(
         static_cast<int>(stage), std::memory_order_relaxed);
+}
+
+void tp_watchdog_mark_model_progress(int rank, int layer, int phase) {
+    if (rank < 0 || rank > 1) return;
+    TpStallWatchdog::instance().model_layer[rank].store(
+        layer, std::memory_order_relaxed);
+    TpStallWatchdog::instance().model_phase[rank].store(
+        phase, std::memory_order_relaxed);
 }
 
 void tp_cpu_gate_notify(const std::string& key) {

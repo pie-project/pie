@@ -2,6 +2,12 @@
 #include "model/stage_hooks.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <unordered_map>
+#include <mutex>
+#include <memory>
+#include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -26,6 +32,7 @@
 #include "kernels/topk_softmax.hpp"
 #include "ops/gemm.hpp"
 #include "ops/attention_flashinfer.hpp"
+#include "batch/tp.hpp"
 
 namespace pie_cuda_driver::model {
 
@@ -117,6 +124,81 @@ ExpertRouting build_routing(
 
 }  // namespace
 
+// Grow-only per-fire scratch, owned per CUDA device.
+//
+// The forward used to allocate nine DeviceBuffers per fire. That is fatal
+// under TP for the reason spelled out at the call site: an allocator call
+// synchronizes the context while the peer spins in a collective. Growth
+// still allocates, but only when a fire exceeds every previous high-water
+// mark, and the caller warms it before the TP group starts issuing
+// collectives (see `mixtral_scratch_reserve`).
+class MixtralScratch {
+  public:
+    float* lse(std::size_t n)                 { return grow(lse_, n); }
+    std::int32_t* topk_idx(std::size_t n)     { return grow(topk_idx_, n); }
+    float* topk_w(std::size_t n)              { return grow(topk_w_, n); }
+    std::uint16_t* expert_in(std::size_t n)   { return grow(expert_in_, n); }
+    std::uint16_t* expert_gate(std::size_t n) { return grow(expert_gate_, n); }
+    std::uint16_t* expert_up(std::size_t n)   { return grow(expert_up_, n); }
+    std::uint16_t* expert_out(std::size_t n)  { return grow(expert_out_, n); }
+    std::int32_t* expert_idx(std::size_t n)   { return grow(expert_idx_, n); }
+    float* expert_w(std::size_t n)            { return grow(expert_w_, n); }
+
+  private:
+    template <typename T>
+    T* grow(DeviceBuffer<T>& buffer, std::size_t count) {
+        if (count == 0) return buffer.data();
+        if (buffer.size() < count) {
+            // Round up so a ramp of growing shapes stops reallocating early.
+            std::size_t target = buffer.size() == 0 ? count : buffer.size();
+            while (target < count) target *= 2;
+            buffer = DeviceBuffer<T>::alloc(target);
+        }
+        return buffer.data();
+    }
+
+    DeviceBuffer<float> lse_;
+    DeviceBuffer<std::int32_t> topk_idx_;
+    DeviceBuffer<float> topk_w_;
+    DeviceBuffer<std::uint16_t> expert_in_;
+    DeviceBuffer<std::uint16_t> expert_gate_;
+    DeviceBuffer<std::uint16_t> expert_up_;
+    DeviceBuffer<std::uint16_t> expert_out_;
+    DeviceBuffer<std::int32_t> expert_idx_;
+    DeviceBuffer<float> expert_w_;
+};
+
+MixtralScratch& mixtral_scratch() {
+    // Per device: TP ranks are threads of one process on different devices,
+    // and a DeviceBuffer belongs to the device that allocated it.
+    static std::mutex mu;
+    static std::unordered_map<int, std::unique_ptr<MixtralScratch>> by_device;
+    int device = 0;
+    cudaGetDevice(&device);
+    std::lock_guard<std::mutex> lock(mu);
+    auto& slot = by_device[device];
+    if (!slot) slot = std::make_unique<MixtralScratch>();
+    return *slot;
+}
+
+
+void mixtral_scratch_reserve(int max_tokens, int top_k, int hidden,
+                             int intermediate_padded, int q_heads_local) {
+    if (max_tokens <= 0 || top_k <= 0) return;
+    const std::size_t tokens = static_cast<std::size_t>(max_tokens);
+    const std::size_t routed = tokens * static_cast<std::size_t>(top_k);
+    MixtralScratch& s = mixtral_scratch();
+    s.lse(tokens * static_cast<std::size_t>(std::max(1, q_heads_local)));
+    s.topk_idx(routed);
+    s.topk_w(routed);
+    s.expert_in(routed * static_cast<std::size_t>(hidden));
+    s.expert_gate(routed * static_cast<std::size_t>(intermediate_padded));
+    s.expert_up(routed * static_cast<std::size_t>(intermediate_padded));
+    s.expert_out(routed * static_cast<std::size_t>(hidden));
+    s.expert_idx(routed);
+    s.expert_w(routed);
+}
+
 void mixtral_forward_paged(
     const MixtralWeights& w,
     const HfConfig& cfg,
@@ -165,6 +247,25 @@ void mixtral_forward_paged(
     NcclComm* tp = (T > 1) ? fwd_cfg.tp_comm : nullptr;
     const bool tp_is_leader = (T == 1) || (tp != nullptr && tp->rank() == 0);
 
+    const int beacon_rank = (tp != nullptr) ? tp->rank() : 0;
+    // Global per-rank all-reduce sequence. Two ranks must issue the SAME
+    // sequence of collectives; NCCL pairs them by ORDER, so one extra call
+    // on either side shifts every later pairing and hangs the group on the
+    // first size disagreement. Printing (seq, shape, layer, phase) makes the
+    // first divergence visible instead of inferred.
+    static std::atomic<long> ar_seq_global{0};
+    static const bool ar_trace = std::getenv("PIE_MIXTRAL_AR_TRACE") != nullptr;
+    const auto ar_log = [&](int layer, int phase) {
+        if (!ar_trace) return;
+        std::fprintf(stderr,
+                     "[ar] rank=%d seq=%ld N=%d R=%d pure=%d L=%d p=%d\n",
+                     beacon_rank,
+                     ar_seq_global.fetch_add(1, std::memory_order_relaxed),
+                     N, R, is_pure_decode ? 1 : 0, layer, phase);
+    };
+    const auto beacon = [&](int layer, int phase) {
+        if (T > 1) tp_watchdog_mark_model_progress(beacon_rank, layer, phase);
+    };
     const bool use_decode_path = is_pure_decode && !fwd_cfg.force_prefill_path;
     int ar_count = 0;  // per-fire all-reduce census (PIE_MIXTRAL_AR_TRACE)
     const bool any_sinks = [&]{
@@ -177,12 +278,19 @@ void mixtral_forward_paged(
     // sinks are active, then consumed by the rescale post-pass. Per-layer
     // overwrite is fine; we only need the layer's own lse during its own
     // rescale step. Allocate once per fire instead of once per layer.
-    DeviceBuffer<float> d_lse;
+    // NOTHING on this path may allocate. `cudaMalloc`/`cudaFree`
+    // synchronize the whole CUDA context, and under TP the peer rank is
+    // simultaneously spinning inside a collective kernel that only this
+    // rank's matching call can release — a context-synchronizing call here
+    // deadlocks the pair. (Same class as the fire-path pinned alloc/free
+    // fixed in pipeline/dispatch.cu; it is why gpt-oss hung at tp2 the
+    // moment a fire grew past the warmup shape and re-sized this scratch.)
+    // Allocation happens once per (process, shape high-water) in a
+    // grow-only cache instead, so steady state never calls the allocator.
     float* lse_ptr = nullptr;
     if (any_sinks) {
-        d_lse = DeviceBuffer<float>::alloc(
+        lse_ptr = mixtral_scratch().lse(
             static_cast<std::size_t>(N) * num_q_heads_local);
-        lse_ptr = d_lse.data();
     }
 
     kernels::launch_embed_bf16(
@@ -206,20 +314,17 @@ void mixtral_forward_paged(
     // alloc. Device-side topk buffers go through DeviceBuffer for ABI
     // simplicity; if profiling shows alloc latency we can hoist these
     // into Workspace.
-    auto d_topk_idx = DeviceBuffer<std::int32_t>::alloc(
-        static_cast<std::size_t>(N) * top_k);
-    auto d_topk_w   = DeviceBuffer<float>::alloc(
-        static_cast<std::size_t>(N) * top_k);
-    // Per-expert scratch for gathered inputs and projection outputs.
-    // Worst case: a single expert receives all N*K routes. Pre-size to
-    // that bound to avoid re-allocating inside the layer loop.
+    // Worst case: a single expert receives all N*K routes.
     const std::size_t max_routed = static_cast<std::size_t>(N) * top_k;
-    auto d_expert_in    = DeviceBuffer<std::uint16_t>::alloc(max_routed * H);
-    auto d_expert_gate  = DeviceBuffer<std::uint16_t>::alloc(max_routed * Ip);
-    auto d_expert_up    = DeviceBuffer<std::uint16_t>::alloc(max_routed * Ip);
-    auto d_expert_out   = DeviceBuffer<std::uint16_t>::alloc(max_routed * H);
-    auto d_expert_idx   = DeviceBuffer<std::int32_t>::alloc(max_routed);
-    auto d_expert_w     = DeviceBuffer<float>::alloc(max_routed);
+    MixtralScratch& scratch = mixtral_scratch();
+    auto* d_topk_idx_p    = scratch.topk_idx(max_routed);
+    auto* d_topk_w_p      = scratch.topk_w(max_routed);
+    auto* d_expert_in_p   = scratch.expert_in(max_routed * H);
+    auto* d_expert_gate_p = scratch.expert_gate(max_routed * Ip);
+    auto* d_expert_up_p   = scratch.expert_up(max_routed * Ip);
+    auto* d_expert_out_p  = scratch.expert_out(max_routed * H);
+    auto* d_expert_idx_p  = scratch.expert_idx(max_routed);
+    auto* d_expert_w_p    = scratch.expert_w(max_routed);
 
     for (int L = 0; L < cfg.num_hidden_layers; ++L) {
         const auto& layer = w.layers[L];
@@ -337,8 +442,11 @@ void mixtral_forward_paged(
                     ws.norm_x.data(), layer.o_bias->data(), N, H, stream);
             }
             ++ar_count;
+            beacon(L, 0);
+            ar_log(L, 0);
             tp->all_reduce_bf16(ws.norm_x.data(),
                 static_cast<std::size_t>(N) * H, ncclSum, stream);
+            beacon(L, 1);
             kernels::launch_residual_add_bf16(
                 ws.y.data(), ws.norm_x.data(), N * H, stream);
         }
@@ -359,19 +467,20 @@ void mixtral_forward_paged(
         if (layer.router_bias) kernels::launch_add_bias_bf16(
             ws.gate.data(), layer.router_bias->data(), N, num_experts, stream);
         kernels::launch_topk_softmax_bf16(
-            ws.gate.data(), d_topk_idx.data(), d_topk_w.data(),
+            ws.gate.data(), d_topk_idx_p, d_topk_w_p,
             N, num_experts, top_k, stream);
 
         // 2. D2H copy of routing decisions; build per-expert lists.
         std::vector<std::int32_t> topk_idx_h(static_cast<std::size_t>(N) * top_k);
         std::vector<float>        topk_w_h  (static_cast<std::size_t>(N) * top_k);
-        CUDA_CHECK(cudaMemcpyAsync(topk_idx_h.data(), d_topk_idx.data(),
+        CUDA_CHECK(cudaMemcpyAsync(topk_idx_h.data(), d_topk_idx_p,
                                    topk_idx_h.size() * sizeof(std::int32_t),
                                    cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaMemcpyAsync(topk_w_h.data(), d_topk_w.data(),
+        CUDA_CHECK(cudaMemcpyAsync(topk_w_h.data(), d_topk_w_p,
                                    topk_w_h.size() * sizeof(float),
                                    cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
+        beacon(L, 2);
         const auto routing = build_routing(topk_idx_h, topk_w_h,
                                            N, top_k, num_experts);
 
@@ -398,17 +507,17 @@ void mixtral_forward_paged(
             if (Ne == 0) continue;
 
             CUDA_CHECK(cudaMemcpyAsync(
-                d_expert_idx.data(), tok_idx.data(),
+                d_expert_idx_p, tok_idx.data(),
                 Ne * sizeof(std::int32_t), cudaMemcpyHostToDevice, stream));
             CUDA_CHECK(cudaMemcpyAsync(
-                d_expert_w.data(), weights.data(),
+                d_expert_w_p, weights.data(),
                 Ne * sizeof(float), cudaMemcpyHostToDevice, stream));
 
             // Gather norm_y rows routed to this expert.
             kernels::launch_gather_bf16_rows(
                 static_cast<const std::uint16_t*>(ws.norm_y.data()),
-                d_expert_idx.data(),
-                d_expert_in.data(),
+                d_expert_idx_p,
+                d_expert_in_p,
                 Ne, H, stream);
 
             // SwiGLU MLP.
@@ -424,43 +533,43 @@ void mixtral_forward_paged(
                         "mixtral/gpt_oss: incomplete native MXFP4 expert backend");
                 }
                 ops::gemm_act_x_w(cublas.handle(),
-                    d_expert_in.data(),
+                    d_expert_in_p,
                     ops::WeightView::mxfp4_marlin(
                         *expert.w_gate_mxfp4, *expert.w_gate_mxfp4_scale),
-                    d_expert_gate.data(), Ne, Ip, H);
+                    d_expert_gate_p, Ne, Ip, H);
                 ops::gemm_act_x_w(cublas.handle(),
-                    d_expert_in.data(),
+                    d_expert_in_p,
                     ops::WeightView::mxfp4_marlin(
                         *expert.w_up_mxfp4, *expert.w_up_mxfp4_scale),
-                    d_expert_up.data(), Ne, Ip, H);
+                    d_expert_up_p, Ne, Ip, H);
                 if (expert.b_gate) kernels::launch_add_bias_bf16_strided(
-                    d_expert_gate.data(), expert.b_gate->data(), Ne, I, Ip,
+                    d_expert_gate_p, expert.b_gate->data(), Ne, I, Ip,
                     stream);
                 if (expert.b_up) kernels::launch_add_bias_bf16_strided(
-                    d_expert_up.data(), expert.b_up->data(), Ne, I, Ip,
+                    d_expert_up_p, expert.b_up->data(), Ne, I, Ip,
                     stream);
                 if (cfg.swiglu_limit > 0.f) {
                     kernels::launch_gpt_oss_glu_bf16(
-                        d_expert_gate.data(), d_expert_up.data(),
-                        d_expert_gate.data(),
+                        d_expert_gate_p, d_expert_up_p,
+                        d_expert_gate_p,
                         static_cast<int>(static_cast<std::size_t>(Ne) * Ip), stream,
                         /*limit=*/cfg.swiglu_limit);
                 } else {
                     kernels::launch_swiglu_bf16(
-                        d_expert_gate.data(), d_expert_up.data(),
-                        d_expert_gate.data(),
+                        d_expert_gate_p, d_expert_up_p,
+                        d_expert_gate_p,
                         static_cast<std::size_t>(Ne) * Ip, stream);
                 }
                 ops::gemm_act_x_w(cublas.handle(),
-                    d_expert_gate.data(),
+                    d_expert_gate_p,
                     ops::WeightView::mxfp4_marlin(
                         *expert.w_down_mxfp4, *expert.w_down_mxfp4_scale),
-                    d_expert_out.data(), Ne, H, Ip);
+                    d_expert_out_p, Ne, H, Ip);
                 if (expert.b_down && tp_is_leader) kernels::launch_add_bias_bf16(
-                    d_expert_out.data(), expert.b_down->data(), Ne, H, stream);
+                    d_expert_out_p, expert.b_down->data(), Ne, H, stream);
                 kernels::launch_scatter_add_weighted_bf16(
-                    moe_target, d_expert_out.data(),
-                    d_expert_idx.data(), d_expert_w.data(),
+                    moe_target, d_expert_out_p,
+                    d_expert_idx_p, d_expert_w_p,
                     Ne, H, stream);
                 continue;
             }
@@ -501,46 +610,48 @@ void mixtral_forward_paged(
                 down_w = expert.w_down->data();
             }
             ops::gemm_act_x_wt_bf16(cublas.handle(),
-                d_expert_in.data(), gate_w,
-                d_expert_gate.data(), Ne, I, H);
+                d_expert_in_p, gate_w,
+                d_expert_gate_p, Ne, I, H);
             ops::gemm_act_x_wt_bf16(cublas.handle(),
-                d_expert_in.data(), up_w,
-                d_expert_up.data(), Ne, I, H);
+                d_expert_in_p, up_w,
+                d_expert_up_p, Ne, I, H);
             if (expert.b_gate) kernels::launch_add_bias_bf16(
-                d_expert_gate.data(), expert.b_gate->data(), Ne, I, stream);
+                d_expert_gate_p, expert.b_gate->data(), Ne, I, stream);
             if (expert.b_up) kernels::launch_add_bias_bf16(
-                d_expert_up.data(), expert.b_up->data(), Ne, I, stream);
+                d_expert_up_p, expert.b_up->data(), Ne, I, stream);
             if (cfg.swiglu_limit > 0.f) {
                 kernels::launch_gpt_oss_glu_bf16(
-                    d_expert_gate.data(), d_expert_up.data(),
-                    d_expert_gate.data(),
+                    d_expert_gate_p, d_expert_up_p,
+                    d_expert_gate_p,
                     static_cast<int>(static_cast<std::size_t>(Ne) * I), stream,
                     /*limit=*/cfg.swiglu_limit);
             } else {
                 kernels::launch_swiglu_bf16(
-                    d_expert_gate.data(), d_expert_up.data(),
-                    d_expert_gate.data(),
+                    d_expert_gate_p, d_expert_up_p,
+                    d_expert_gate_p,
                     static_cast<std::size_t>(Ne) * I, stream);
             }
             ops::gemm_act_x_wt_bf16(cublas.handle(),
-                d_expert_gate.data(), down_w,
-                d_expert_out.data(), Ne, H, I);
+                d_expert_gate_p, down_w,
+                d_expert_out_p, Ne, H, I);
             // b_down is replicated across ranks; only the leader applies
             // it so the all-reduce sums it once. Plain Mixtral has no
             // b_down so this branch is dead until GPT-OSS.
             if (expert.b_down && tp_is_leader) kernels::launch_add_bias_bf16(
-                d_expert_out.data(), expert.b_down->data(), Ne, H, stream);
+                d_expert_out_p, expert.b_down->data(), Ne, H, stream);
 
             // Scatter into ws.y (TP=1) or moe_target scratch (TP>1) with
             // routing weight, residual-add style.
             kernels::launch_scatter_add_weighted_bf16(
-                moe_target, d_expert_out.data(),
-                d_expert_idx.data(), d_expert_w.data(),
+                moe_target, d_expert_out_p,
+                d_expert_idx_p, d_expert_w_p,
                 Ne, H, stream);
         }
 
         if (T > 1) {
             ++ar_count;
+            beacon(L, 3);
+            ar_log(L, 3);
             tp->all_reduce_bf16(ws.norm_x.data(),
                 static_cast<std::size_t>(N) * H, ncclSum, stream);
             kernels::launch_residual_add_bf16(

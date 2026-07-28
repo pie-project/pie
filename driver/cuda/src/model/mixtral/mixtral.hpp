@@ -119,6 +119,16 @@ struct MixtralWeights {
 
 MixtralWeights bind_mixtral(const LoadedModel& engine);
 
+/// Pre-size the forward's per-fire scratch to the deployment's widest fire.
+///
+/// MUST be called while no TP collective can be in flight (model load), not
+/// lazily on first use: the allocator synchronizes the CUDA context, and a
+/// peer rank spinning in a collective it cannot leave until this rank posts
+/// the match turns that synchronize into a deadlock. Sizing it once here is
+/// what keeps the fire path allocation-free forever after.
+void mixtral_scratch_reserve(int max_tokens, int top_k, int hidden,
+                             int intermediate_padded, int q_heads_local);
+
 void mixtral_forward_paged(
     const MixtralWeights& w,
     const HfConfig& cfg,
