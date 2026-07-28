@@ -1,3 +1,7 @@
+// Included by several test binaries via `#[path]`; each uses a different
+// subset, so "never used" here means "unused by *this* binary".
+#![allow(dead_code)]
+
 //! The shared corpus the Metal MSL emitters are exercised over.
 //!
 //! The plan-taking emitters are driven from **real plans**: every golden in
@@ -16,7 +20,7 @@
 use pie_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
 use pie_ir::op::{IntrinsicId, Op};
 use pie_ir::registry::{KernelInfo, ModelProfile, SinkScope, Stage};
-use pie_ir::types::{DType, Shape};
+use pie_ir::types::{DType, RngKind, Shape};
 use pie_ir::validate::bind;
 use pie_plan::{CompiledStage, compile_bound, encode_stage_plan};
 
@@ -314,4 +318,236 @@ pub fn region_shape(region: &pie_plan::Region) -> String {
 pub fn corpus_bound() -> pie_ir::validate::BoundTrace {
     let name = GOLDEN_NAMES[0];
     bind(golden_container(name), golden_profile(name)).expect("first golden binds")
+}
+
+fn staged(stage: Stage, channels: Vec<ChannelDecl>, ops: Vec<Op>) -> TraceContainer {
+    TraceContainer {
+        names: Vec::new(),
+        channels,
+        ports: Vec::new(),
+        stages: vec![StageProgram { stage, ops }],
+        externs: Vec::new(),
+    }
+}
+
+/// Traces that exist only to reach what the goldens and `synthetic_traces` do
+/// not: 17 of the 55 ops in `OP_TABLE`, three of the eight intrinsics, the
+/// `HierarchicalRow` schedule, and `Stage::OnAttn`.
+///
+/// Kept apart from [`corpus_stages`] on purpose. That corpus is the input to
+/// `golden-{msl,cuda}/`, which are dumps of a C++ oracle that no longer exists;
+/// adding cases there would change the case list of files whose expected column
+/// can never be re-derived. These are pinned separately, against this
+/// compiler's own output, and their goldens say so.
+pub fn extended_traces() -> Vec<(&'static str, TraceContainer, ModelProfile)> {
+    let mut small = ModelProfile::dummy();
+    small.vocab = 8;
+    let mut attn = small.clone();
+    attn.has_attn_score = true;
+
+    let f32v = |n: u32, role: HostRole, seeded: bool| chan(Shape::vector(n), DType::F32, role, seeded);
+    let read = |n: u32| f32v(n, HostRole::None, true);
+    let write = |n: u32| f32v(n, HostRole::Reader, false);
+    let write_scalar =
+        || chan(Shape::new(&[]).unwrap(), DType::F32, HostRole::Reader, false);
+
+    vec![
+        (
+            "extended_unary",
+            staged(
+                Stage::Epilogue,
+                vec![read(4), write(4)],
+                vec![
+                    Op::ChanRead(0),
+                    Op::Neg(0),
+                    Op::Recip(1),
+                    Op::Abs(2),
+                    Op::Sign(3),
+                    Op::ChanPut { chan: 1, value: 4 },
+                ],
+            ),
+            small.clone(),
+        ),
+        (
+            "extended_minmax",
+            staged(
+                Stage::Epilogue,
+                vec![read(4), read(4), write(4), write_scalar()],
+                vec![
+                    Op::ChanRead(0),
+                    Op::ChanRead(1),
+                    Op::MaxElem(0, 1),
+                    Op::MinElem(0, 1),
+                    Op::ReduceMin(2),
+                    Op::ChanPut { chan: 2, value: 3 },
+                    Op::ChanPut { chan: 3, value: 4 },
+                ],
+            ),
+            small.clone(),
+        ),
+        (
+            "extended_predicates",
+            staged(
+                Stage::Epilogue,
+                vec![
+                    read(4),
+                    read(4),
+                    chan(Shape::vector(4), DType::Bool, HostRole::Reader, false),
+                ],
+                vec![
+                    Op::ChanRead(0),
+                    Op::ChanRead(1),
+                    Op::Gt(0, 1),
+                    Op::Ne(0, 1),
+                    Op::Le(0, 1),
+                    Op::Or(2, 3),
+                    Op::Not(5),
+                    Op::And(6, 4),
+                    Op::ChanPut { chan: 2, value: 7 },
+                ],
+            ),
+            small.clone(),
+        ),
+        (
+            "extended_transpose_cumsum",
+            staged(
+                Stage::Epilogue,
+                vec![
+                    chan(Shape::matrix(2, 3), DType::F32, HostRole::None, true),
+                    chan(Shape::matrix(3, 2), DType::F32, HostRole::Reader, false),
+                    write(4),
+                    read(4),
+                ],
+                vec![
+                    Op::ChanRead(0),
+                    Op::Transpose(0),
+                    Op::ChanPut { chan: 1, value: 1 },
+                    Op::ChanRead(3),
+                    Op::CumSum(2),
+                    Op::ChanPut { chan: 2, value: 3 },
+                ],
+            ),
+            small.clone(),
+        ),
+        (
+            "extended_gather_scatter",
+            staged(
+                Stage::Epilogue,
+                vec![
+                    chan(Shape::matrix(3, 4), DType::F32, HostRole::None, true),
+                    chan(Shape::vector(3), DType::U32, HostRole::None, true),
+                    read(4),
+                    write(3),
+                    write(4),
+                ],
+                vec![
+                    Op::ChanRead(0),
+                    Op::ChanRead(1),
+                    Op::ChanRead(2),
+                    Op::GatherRow { src: 0, idx: 1 },
+                    Op::ChanPut { chan: 3, value: 3 },
+                    Op::ScatterAdd {
+                        base: 2,
+                        idx: 1,
+                        vals: 3,
+                    },
+                    Op::ChanPut { chan: 4, value: 4 },
+                ],
+            ),
+            small.clone(),
+        ),
+        (
+            "extended_rng_stream",
+            staged(
+                Stage::Epilogue,
+                vec![write(4)],
+                vec![
+                    Op::Rng {
+                        stream: 0,
+                        shape: Shape::vector(4),
+                        kind: RngKind::Uniform,
+                    },
+                    Op::ChanPut { chan: 0, value: 0 },
+                ],
+            ),
+            small.clone(),
+        ),
+        (
+            // Reduction over a static extent past the 32 768 the planner uses
+            // to pick `HierarchicalRow`; no other corpus stage reaches it.
+            "extended_hierarchical",
+            staged(
+                Stage::Epilogue,
+                vec![read(65_536), write_scalar()],
+                vec![
+                    Op::ChanRead(0),
+                    Op::ReduceSum(0),
+                    Op::ChanPut { chan: 1, value: 1 },
+                ],
+            ),
+            small.clone(),
+        ),
+        (
+            "extended_hidden",
+            staged(
+                Stage::Epilogue,
+                vec![write(1)],
+                vec![
+                    Op::IntrinsicVal {
+                        intr: IntrinsicId::Hidden,
+                        shape: Shape::matrix(1, 8),
+                        dtype: DType::F32,
+                    },
+                    Op::ReduceSum(0),
+                    Op::ChanPut { chan: 0, value: 1 },
+                ],
+            ),
+            small.clone(),
+        ),
+        (
+            "extended_on_attn",
+            staged(
+                Stage::OnAttn,
+                vec![
+                    chan(Shape::new(&[]).unwrap(), DType::U32, HostRole::Reader, false),
+                    write(4),
+                ],
+                vec![
+                    Op::IntrinsicVal {
+                        intr: IntrinsicId::Layer,
+                        shape: Shape::new(&[]).unwrap(),
+                        dtype: DType::U32,
+                    },
+                    Op::IntrinsicVal {
+                        intr: IntrinsicId::AttnScore,
+                        shape: Shape::vector(4),
+                        dtype: DType::F32,
+                    },
+                    Op::ChanPut { chan: 0, value: 0 },
+                    Op::ChanPut { chan: 1, value: 1 },
+                ],
+            ),
+            attn,
+        ),
+    ]
+}
+
+/// [`extended_traces`] compiled, in declaration order.
+pub fn extended_stages() -> Vec<CorpusStage> {
+    let mut stages = Vec::new();
+    for (name, container, profile) in extended_traces() {
+        let bound = bind(container, profile)
+            .unwrap_or_else(|error| panic!("extended trace `{name}` must bind: {error:?}"));
+        for (stage_index, plan) in compile_bound(&bound).into_iter().enumerate() {
+            let wire = encode_stage_plan(&plan);
+            stages.push(CorpusStage {
+                golden: name.into(),
+                stage_index,
+                stage_tag: plan.normalized.stage as u8,
+                plan,
+                wire,
+            });
+        }
+    }
+    stages
 }
