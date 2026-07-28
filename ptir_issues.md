@@ -540,6 +540,21 @@ dsl 비테스트 코드의 panic 지점 총 **28곳**: `context.rs` 17, `value.r
 
 ### M12. CUDA/Metal fused emitter의 슬롯 구성 + 노드 순회가 3벌
 
+> **정정 (부분 REFUTED, 나머지는 처리됨).** 슬롯 구성은 3벌이 아니라 **2벌**이었다.
+> Metal의 두 경로(단일/grouped)는 이미 `slots_for` 하나를 공유하고 있었고,
+> 사본은 `cuda/fused.rs`의 인라인 판뿐이다. 그 계약(어느 피연산자가 어느 슬롯에
+> 가는가, `pivot_threshold`가 predicate payload를 `a1`로 넘긴다는 것,
+> 두 번째 결과가 `base + 1`이라는 것)은 M1 op ABI이지 백엔드 사정이 아니므로
+> `codegen::slots::Slots::of`로 올렸다. 값→포인터 렌더링만 클로저로 남겼다
+> (Metal은 `offsets` 인덱싱, CUDA는 reshape alias 해소 후 인덱싱).
+> 공유 규칙 하나를 바꾸면 CUDA·Metal·extended 골든이 **함께** 깨지는 것을 확인.
+>
+> **`walk_region` + `BackendDialect` trait은 하지 않았다.** 두 순회는 겉모습만
+> 닮았다 — CUDA는 노드마다 `{ M1OpParams p = params[n]; ... __syncthreads(); }`
+> 블록을 열고 reshape alias를 건너뛰며, Metal은 `ptir_m1_execute(...)` 한 줄을
+> 쓴다. trait으로 묶으면 공유되는 건 `for` 루프 하나이고 나머지는 전부 훅이 된다.
+> 추상화 비용이 제거되는 중복보다 크다.
+
 동일한 골격 — *검증 → `OpView`/`result_bases` 구성 → `region.nodes` 순회 →
 슬롯 셋업 → op 호출 → status 검사 → chan-put 보정* — 이 세 번 작성돼 있다.
 
@@ -574,6 +589,25 @@ fn emit_status_check(..); fn runtime_preamble(..); }`로 매개화.
 
 ### M13. codegen의 문자열 조립 soup + 타입 없는 에러
 
+> **정정 (처방 일부 REFUTED, 핵심 지적은 처리됨).**
+> - **`CodeWriter` — 기각.** 방출 소스 758,928줄 중 122,971줄(16%)이 "brace 깊이
+>   × 2칸" 규칙과 어긋난다. 전수 확인 결과 전부 (a) 체크인된 런타임 템플릿
+>   (`ptir_m1_runtime_*.cuh`) 본문이거나 (b) 시그니처를 접은 연속행이다.
+>   `CodeWriter`가 이를 재현하려면 예외를 전부 인코딩해야 하고, 재현하지 못하면
+>   바이트가 바뀐다. 그 바이트는 삭제된 C++ 오라클이 남긴 **유일한 독립 증인**이다.
+>   잘못된 들여쓰기는 미용 문제이고, 증인을 잃는 것은 그렇지 않다.
+> - **`EmitError` enum — 기각.** 문맥이 없다는 지적은 틀렸다. `EmittedKernel::new`가
+>   호출 지점에서 `stage_index`/`region_index`를 이미 붙인다. 그리고 `error`는
+>   Rust 에러가 아니라 **C ABI를 건너가는 바이트열**이다
+>   (`PieEmittedKernel.error`). 어디에서도 매칭되지 않으므로 enum은 경계에서 다시
+>   문자열이 되고, 소비자가 없는 타입만 남는다.
+> - **"신규 경로의 오류를 못 잡는다" — 맞다, 처리함.** 코퍼스 전체
+>   (골든+synthetic+extended)를 양쪽 백엔드로 방출해 **861개 커널**에
+>   구조 검사를 건다(`emitted_source_shape.rs`): 괄호 균형·중첩,
+>   리터럴/주석 종결, 그리고 `EmittedKernel` 불변식(소스면 자기 entry point를
+>   담고, 아니면 사유가 있다 — 둘 다이거나 둘 다 아닌 경우 없음).
+>   `metal::fused`에서 닫는 중괄호 하나를 지워 발화 확인.
+
 - `push_str` / `write!` / `writeln!` / `format!` 호출 약 **380회**
   (`metal/fused.rs` 89, `cuda/fused.rs` 87, `metal/effects.rs` 79, `header.rs` 44 …).
 - **들여쓰기 수동 관리.** 예: `cuda/fused.rs:440`의
@@ -591,6 +625,10 @@ fn emit_status_check(..); fn runtime_preamble(..); }`로 매개화.
 ---
 
 ### M14. 생성된 헤더를 문자열 검색으로 되파싱
+
+> **정정 (사실, 수정 완료).** `cuda::runtime::rng_preamble`이
+> `rng::cuda_device_functions()`를 직접 호출한다. 헤더의 raw literal과 방출
+> preamble이 같음을 `cuda_preamble_matches_the_header_literal`이 고정한다.
 
 `compiler/codegen/src/cuda/runtime.rs:15-30`
 
@@ -612,6 +650,19 @@ header[start..end].into()
 ---
 
 ### M15. 약한 타입 — id가 전부 type alias
+
+> **정정 (범위 축소, 실제 위험만 처리).** 네 개 중 `NodeIndex`만 newtype으로 만들었다.
+> - **실증된 위험은 node ↔ value 하나뿐이다.** 둘 다 같은 스테이지 위의 dense u32이고
+>   둘 다 0에서 시작하며, `StageIndex`가 둘 사이를 오가는 표 셋을 들고 있다
+>   (`bases`: node→value, `producer`: value→node, `consumers`: value→nodes).
+>   바꿔 넣으면 컴파일되고, 나오는 plan은 **구조적으로 멀쩡한 채 엉뚱한 op을 융합한다.**
+>   `NodeIndex(u32)`로 분리 + `StageIndex` 필드 private화 + 접근자 3개.
+>   양방향 스왑으로 발화 확인.
+> - **`ValueId`/`ChannelIndex`는 하지 않았다.** 두 공간을 분리하는 데는 **한쪽만**
+>   nominal이면 충분하고, 그쪽은 이미 됐다. `ValueId`는 109곳 + wire,
+>   `ChannelIndex`는 383곳이며 둘 다 6개 크레이트와 드라이버 ABI에 걸쳐 있다.
+>   남는 이득(value ↔ channel 혼동)은 실증된 사례가 없다.
+> - `LaneId`/`ChannelSlot`은 **alias로도 존재하지 않았다.**
 
 ```rust
 compiler/ir/src/types.rs:11   pub type ValueId = u32;
@@ -783,6 +834,21 @@ F16/BF16/E8M0 같은 dtype이 추가되면 **컴파일 에러 없이 잘못된 �
 지뢰가 보이지 않는다. 위 항목 중 즉시 고치지 않을 것들은 해당 지점에 마커를 남기고
 이 문서의 항목 번호를 참조하도록 권장.
 
+> **정정 — MINOR 일괄 판정 (§5 착수 순서 9단계).** 실측 후 6건 수정, 4건 기각.
+>
+> | 항목 | 판정 |
+> |---|---|
+> | m1 코드네임 | **수정.** 28건이 아니라 **34건**(`echo's`/`Echo's`/`charlie's`/`delta's`/`mac-master's` + `echo op`). 전부 `the IR's`/`the CUDA driver's`/`the SDK`/`the Metal driver`로. 주석 외 변경 0줄 |
+> | m2 낡은 크레이트 문서 | **수정.** "land here next"는 이미 도착한 뒤였다. 11개 모듈 전부를 ABI 투영(`header`/`rng`/`layout`/`slots`)과 리전 에미터(`cuda`/`metal` + 조력 4종)로 나눠 기술 |
+> | m3 해시 중복 | **수정, 그리고 지적보다 나빴다.** `program_hash`의 유일한 크레이트 외 호출자(`metal/validate.rs`)는 **프로그램이 아니라 서명 바이트**에 쓰고 있었다. 같은 서명 바이트를 다른 두 곳은 `container_hash`로 부른다 — 이름이 잡음임을 스스로 증명한 셈. `Fnv1a` 누산기 + `fnv1a64` 프리미티브로 통합, `program_hash` 삭제, 서명 3곳은 `fnv1a64`로. published FNV-1a 64 벡터로 알고리즘 자체를 고정(구현이 진짜 FNV-1a임을 처음으로 검증) |
+> | m4 `elem_size` | **이미 해소.** `dsl/value.rs`의 사본은 catch-all 정리(`d5b9b04fe`)에서 사라졌다 |
+> | m5 깨진 링크 | **수정.** `[`crate::types::Op`]` → 평문 |
+> | m6 `ModelProfile::dummy()` | **기각.** `#[cfg(test)]`로는 안 된다 — `runtime/engine`, `pie-dsl`의 **테스트가 크레이트를 건너 쓴다**(20곳). `test-support` feature는 4개 크레이트 Cargo.toml 변경인데 얻는 게 명명 위생뿐 |
+> | m7 매직 상수 | **수정, 범위 조정.** `codegen::fault`가 fault 코드 공간 전부를 이름과 함께 선언. **아무도 디코드하지 않는 진단 숫자**라 두 조건이 같은 값을 내도 실패하는 테스트가 없다 — 그래서 겹침 검사를 붙였다. `M1_NOT_FULL`(0x400)과 `M1_NOT_EMPTY`(0x480) 간격이 0x80이므로 `METAL_M1_MAX_CHANNELS`(29)를 128 너머로 올리면 두 클래스가 조용히 aliasing된다. CUDA는 같은 필드에 **op 태그**를 쓰는데(Metal은 구조적 코드) 소비자가 없어 ABI 결정으로 남기고 기록만 함. `32_768`/`MAX_SIDECAR_STAGES`는 각각 주석과 파생 근거가 이미 그 자리에 있어 제외 |
+> | m8 eval 중복 헬퍼 | **부분 수정 — `canonical/element_max/min` 4벌만.** 축이 둘뿐이었다(방향 × NaN쌍 정책). `extremum(left, right, Extremum, NanPair)` 하나로. **NaN/부호0 정책을 직접 고정하는 테스트가 없었다** — 4×8 표로 추가하고, `&&`→`||`와 identity 부호 뒤집기 두 mutation으로 발화 확인. 나머지 쌍(`bin_arith`/`cmp_op` 등)은 축이 하나가 아니라 제외 |
+> | m9 API 잡음 | **부분 수정.** hidden/query 폭이 실재 — `bind`가 폭을 **일부러 안 보고**(rank만), `symbolic.rs` 주석은 "statically shaped by the model profile"이라 주장하지만 hidden 폭은 `ModelProfile`에 없다. `hidden(width)`/`query(width)`로 선언 파라미터화(`mtp_logits(k)`/`attn_score(kv_max)`와 같은 형태), 거짓 주석 정정. `activation_type` "late-bound" 문서도 정정(late-bound인 적 없음). op 재수출 3벌 → `pub use value::*;` 글롭 2곳(op 추가가 1편집, 반쪽 추가 불가). `Put(())`는 기각 — 문서가 이미 P3 전방호환 seam이라고 밝히고 있다 |
+> | m10 `TODO` 0개 | **기각.** 이 문서가 판정과 커밋 해시까지 담은 원장이 됐다. 코드에 마커를 뿌리면 원장이 둘이 되고, 둘째 것은 갱신되지 않는다 |
+
 ---
 
 ## 4. 유지해야 할 것 (리팩토링 중 깨뜨리지 말 것)
@@ -832,6 +898,25 @@ F16/BF16/E8M0 같은 dtype이 추가되면 **컴파일 에러 없이 잘못된 �
 | **7** | codegen: `CodeWriter` + `BackendDialect` trait, catch-all 제거, `EmitError` 도입, RNG 문자열 수술 제거 | **M6, M12, M13, M14**, C5 일부 | 새 백엔드 추가 비용의 실체 |
 | **8** | C5 잔여: MSL 구조체를 Rust에서 생성 (CUDA 헤더처럼) | **C5** | 레이아웃 불일치의 마지막 구멍 |
 | **9** | 문서/이름 정리 (m1~m10) | MINOR 전부 | 저비용, 별도 커밋 |
+
+> **진행 상황 — §5 착수 순서 1~9단계 전부 처리됨.**
+> 아래 옛 진행 메모는 `c6fcd1b0f` 시점 기록이므로 그대로 둔다.
+>
+> | 단계 | 상태 | 커밋 |
+> |---|---|---|
+> | 1 `OP_TABLE` 선언화 | 완료 | `5e24b16d7` |
+> | 2 `expand.rs` 단일화 | 완료 (Sink 트레잇으로 시퀀스 1벌, 기록기 2벌) | `c11dea3f6` |
+> | 3 `Reader` 추출 | 완료 (+ 마지막 `usize::MAX` 3곳 해소) | `2f1d31428` |
+> | 4 `compile.rs` 분할 | 완료 (3,593줄 → 9모듈, `use super::*` 없음) | `51d84b165` |
+> | 5 `debug_assert` 승격 | 완료 (C6 실사례 + 구조적 상한) | `c6fcd1b0f`, `2f1d31428` |
+> | 6 newtype | **범위 축소** — `NodeIndex`만. M15 정정 참조 | `555e3ff9a` |
+> | 7 codegen | **부분** — `Slots` 공유 + M14 수정 + 구조 검사. `CodeWriter`/`BackendDialect`/`EmitError`는 기각, M12·M13 정정 참조 | `6a8676697`, `de905b903` |
+> | 8 C5 잔여 (MSL 구조체 생성) | 완료 — `codegen::layout`이 C·MSL 양쪽을 방출, `offset_of!`로 `pie-plan`에 고정 | `628d005e6` |
+> | 9 MINOR (m1~m10) | 6건 수정 / 4건 기각. §3 끝의 판정표 참조 | 아래 |
+>
+> **원 문서에 없던 작업이 더 컸다.** §0-A의 CRITICAL 7건, 코퍼스 공백(op 38/55),
+> catch-all 정리(40→26), 오라클 출처 방어가 전부 이 표 바깥에 있었다.
+> 181 테스트 green, clippy 0, fmt clean, no_std green.
 
 > **진행 상황 (`c6fcd1b0f` 기준).**
 > - **1단계 완료.** `declare_ops!`/`declare_intrinsics!` 매크로로 승격, `tags`/

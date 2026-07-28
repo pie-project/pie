@@ -5,7 +5,7 @@
 //!
 //! ## Relation to PSIR v4
 //!
-//! Where an op coincides with a [`crate::types::Op`] variant, the **wire tag is
+//! Where an op coincides with a PSIR v4 op, the **wire tag is
 //! identical** (e.g. `Add` = 0x10, `Gather` = 0x60), so a driver-side decoder
 //! extends its v4 table instead of forking. New tags occupy previously free
 //! space; tag `0x80` (`Input`) is *reserved-unused* — PTIR stage bodies have no

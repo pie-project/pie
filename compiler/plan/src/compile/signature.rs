@@ -106,7 +106,7 @@ pub(crate) fn stage_signature(bound: &BoundTrace, stage: &NormalizedStage) -> St
         bytes.push(*domain as u8);
     }
     StageSignature {
-        hash: pie_ir::container_hash(&bytes),
+        hash: pie_ir::fnv1a64(&bytes),
         canonical_bytes: bytes,
     }
 }

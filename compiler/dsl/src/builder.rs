@@ -3,7 +3,7 @@
 //! [`Builder`] is the boundary-agnostic half of what used to be `ForwardPass`:
 //! it takes descriptor-port bindings ([`bind_port`](Builder::bind_port)) and
 //! stage closures ([`stage`](Builder::stage)), traces the closures once into
-//! echo's canonical [`TraceContainer`], and runs the SDK span lints. It does
+//! the IR's canonical [`TraceContainer`], and runs the SDK span lints. It does
 //! **not** bind (D6: the guest does not bind — `forward-pass.program` is the
 //! authoritative gate); the author-facing `ForwardPass`/`Pipeline`/`WorkingSet`
 //! lifetime objects live in `inferlet`, wrap the WIT resources, and drive this
@@ -195,7 +195,7 @@ impl<'a> Builder<'a> {
             .flat_map(|r| r.sinks.iter().map(move |s| (r.stage, s.clone())))
             .collect();
 
-        // Build echo's channel declarations with derived HostRole + seeded.
+        // Build the IR's channel declarations with derived HostRole + seeded.
         let channel_decls: Vec<ChannelDecl> = channels
             .iter()
             .map(|c| {
@@ -260,7 +260,7 @@ impl<'a> Builder<'a> {
             stages,
         };
 
-        // SDK span lints (friendly, spans). Echo's authoritative bind lives on
+        // SDK span lints (friendly, spans). The IR's authoritative bind lives on
         // the host at `forward-pass.program` (D6); native parity tests bind explicitly.
         let mut errs: Vec<TraceError> = Vec::new();
         crate::lint::lint(&channels, &sinks, &mut errs);
@@ -346,7 +346,7 @@ impl<'a> Builder<'a> {
     }
 }
 
-/// A traced, linted forward pass: echo's canonical [`TraceContainer`] plus the
+/// A traced, linted forward pass: the IR's canonical [`TraceContainer`] plus the
 /// dense-order channel identities (gids) and names. Identity is the C3 hash
 /// (FNV-1a over the canonical container bytes); binding is the host's job (D6).
 #[derive(Debug)]

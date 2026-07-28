@@ -235,7 +235,7 @@ fn validate_into(stage: &CompiledStage, operations: &mut Vec<M1OpMeta>) -> Resul
     let channel_bindings = &normalized.channel_bindings;
 
     if stage.signature.hash == 0
-        || pie_ir::program_hash(&stage.signature.canonical_bytes) != stage.signature.hash
+        || pie_ir::fnv1a64(&stage.signature.canonical_bytes) != stage.signature.hash
         || stage.singleton.kind != PartitionKind::Singleton
     {
         return Err("invalid singleton plan identity".to_string());

@@ -8,7 +8,7 @@
 //! This crate is the boundary-agnostic authoring core: the `Tensor`/`Channel`
 //! eDSL, the trace-recording session, the SDK span lints, and the neutral
 //! [`Builder`](builder::Builder) that lowers stage closures + descriptor-port
-//! bindings into echo's canonical
+//! bindings into the IR's canonical
 //! [`TraceContainer`](pie_ir::container::TraceContainer). Tracing is its
 //! *implementation strategy*, not its identity — hence `pie-dsl`.
 //!
@@ -66,15 +66,10 @@ pub mod value;
 pub use builder::{Builder, PortInput, Traced};
 pub use channel::{Channel, HostError, IntoPut, Put, Taken};
 pub use error::{Endpoint, Span, TraceError, TraceErrors};
-pub use value::{
-    AsTensor, IntoConst, IntoShape, PredicateArg, Tensor, abs, add, and, broadcast, cast,
-    causal_mask, cummass_le, cumprod, cumsum, div, entropy, entropy_from_logprobs, eq, exp, gather,
-    gather_row, ge, gt, gumbel, gumbel_max, iota, l2norm, le, log, log_softmax, lt, mask_apply,
-    masked_argmax, matmul, max_elem, min_elem, mul, ne, neg, not, nucleus_sample, or,
-    pivot_threshold, prob_ge, rank_le, recip, reduce_argmax, reduce_max, reduce_min, reduce_sum,
-    rem, reshape, rng, row_membership, scalar_gather, scatter_add, scatter_set, select, sign,
-    sink_window_mask, sliding_window_mask, softmax, sort_desc, sub, top_k, transpose,
-};
+/// The eDSL op surface. Glob-re-exported rather than listed: an op is public
+/// exactly when it is `pub` in [`value`], so adding one is a single edit and
+/// cannot be half-done (present at the root, missing from [`prelude`]).
+pub use value::*;
 
 /// The canonical PTIR contract (op-table, container, validator, interpreter) —
 /// re-exported for tests and downstream carriers.
@@ -90,14 +85,6 @@ pub mod prelude {
     pub use crate::channel::Channel;
     pub use crate::dtype;
     pub use crate::intrinsics;
-    pub use crate::value::{
-        Tensor, abs, add, and, broadcast, cast, causal_mask, cummass_le, cumprod, cumsum, div,
-        entropy, entropy_from_logprobs, eq, exp, gather, gather_row, ge, gt, gumbel, gumbel_max,
-        iota, l2norm, le, log, log_softmax, lt, mask_apply, masked_argmax, matmul, max_elem,
-        min_elem, mul, ne, neg, not, nucleus_sample, or, pivot_threshold, prob_ge, rank_le, recip,
-        reduce_argmax, reduce_max, reduce_min, reduce_sum, rem, reshape, rng, row_membership,
-        scalar_gather, scatter_add, scatter_set, select, sign, sink_window_mask,
-        sliding_window_mask, softmax, sort_desc, sub, top_k, transpose,
-    };
+    pub use crate::value::*;
     pub use pie_ir::registry::{Port, Stage};
 }

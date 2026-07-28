@@ -1,7 +1,7 @@
 //! `Tensor` — an SSA value (overview §1) — plus the free-function op surface that
-//! matches the overview §3/§6 examples verbatim. Ops emit echo's canonical
+//! matches the overview §3/§6 examples verbatim. Ops emit the IR's canonical
 //! [`ptir::op::Op`](pie_ir::op::Op); composed ops (`gumbel`,
-//! `mask_apply`, `softmax`, …) inline echo's [`expand`](pie_ir::expand)
+//! `mask_apply`, `softmax`, …) inline the IR's [`expand`](pie_ir::expand)
 //! expansions so a backend that fuses the core fuses these for free.
 
 use alloc::vec::Vec;
@@ -81,7 +81,7 @@ impl Arg {
             Arg::Const(c) => ValueType::new(c.shape, c.dtype),
         }
     }
-    /// Materialize into the current stage as echo ops, yielding an SSA id + type.
+    /// Materialize into the current stage as IR ops, yielding an SSA id + type.
     pub(crate) fn materialize(self) -> (ValueId, ValueType) {
         match self {
             Arg::Node { id, ty } => (id, ty),
@@ -129,7 +129,7 @@ impl AsTensor for f32 {
 }
 
 // ---------------------------------------------------------------------------
-// Constant → echo op materialization
+// Constant → IR op materialization
 // ---------------------------------------------------------------------------
 
 fn scalar_literal(dtype: DType, bytes: &[u8]) -> Literal {
@@ -153,7 +153,7 @@ fn elem_at(dtype: DType, bytes: &[u8], i: usize) -> f64 {
     }
 }
 
-/// Lower a trace-known constant to echo ops (see [`Tensor::constant`]).
+/// Lower a trace-known constant to IR ops (see [`Tensor::constant`]).
 fn materialize_const(c: ConstData) -> (ValueId, ValueType) {
     let ty = ValueType::new(c.shape, c.dtype);
     if c.shape.is_scalar() {
@@ -753,7 +753,7 @@ pub fn matmul(a: impl AsTensor, b: impl AsTensor) -> Tensor {
     Tensor::node(emit(Op::MatMul(ia, ib), &[rty]), rty)
 }
 
-// -- sampling (echo's expand: gumbel = RngKeyed; mask_apply = select(mask, x, -inf)) --
+// -- sampling (the IR's expand: gumbel = RngKeyed; mask_apply = select(mask, x, -inf)) --
 /// `gumbel(state, shape)` — Gumbel noise, a pure function of the `[2]` U32 rng
 /// `state` (`[key, ctr]`) + element index (overview §3; replay-deterministic T8).
 pub fn gumbel(state: impl AsTensor, shape: impl IntoShape) -> Tensor {
@@ -780,7 +780,7 @@ fn rng_noise(state: impl AsTensor, shape: impl IntoShape, kind: RngKind) -> Tens
     )
 }
 /// `mask_apply(logits, mask)` — bool-mask over logits (allowed → pass, else −∞),
-/// expanded to `select(mask, logits, -inf)` (echo's composed form).
+/// expanded to `select(mask, logits, -inf)` (the IR's composed form).
 pub fn mask_apply(logits: impl AsTensor, mask: impl AsTensor) -> Tensor {
     let (il, tyl) = logits.to_arg().materialize();
     let (im, _) = mask.to_arg().materialize();

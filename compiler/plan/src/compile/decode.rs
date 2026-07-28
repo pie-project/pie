@@ -301,7 +301,7 @@ pub fn decode_plan_header(bytes: &[u8]) -> Result<EncodedPlanHeader, PlanDecodeE
     let signature_len = reader.u32()?;
     let signature_len = length_with_tail(&reader, signature_len, 0, "stage signature")?;
     let signature = reader.take(signature_len)?;
-    if pie_ir::container_hash(signature) != signature_hash {
+    if pie_ir::fnv1a64(signature) != signature_hash {
         return Err(PlanDecodeError::InvalidRecord);
     }
 

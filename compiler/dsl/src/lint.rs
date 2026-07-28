@@ -1,10 +1,10 @@
 //! SDK span lints (overview P1.3): SPSC double-endpoint, readiness-direction
 //! conflict, and sink stage-precedence — caught during assembly with source
-//! spans. Echo's [`bind`](pie_ir::validate::bind) is the
+//! spans. The IR's [`bind`](pie_ir::validate::bind) is the
 //! authoritative SPSC gate (host-role vs pass; the descriptor + all stages are
 //! one pass endpoint, so a channel touched by both the descriptor and a stage is
 //! legal). These run first for friendly, span-rich author errors and mirror
-//! echo's model.
+//! the IR's model.
 
 use alloc::vec::Vec;
 
@@ -34,7 +34,7 @@ pub(crate) fn lint(
 
         // Double-endpoint (SPSC, T2): the host claims *both* endpoints (writes
         // and consumes the same channel) — no pass endpoint remains. (Host-vs-
-        // stage conflicts are structurally avoided by role derivation; echo's
+        // stage conflicts are structurally avoided by role derivation; the IR's
         // bind is the authoritative gate on the container.)
         if let (Some(w), Some(c)) = (host_writes, host_consumes) {
             errs.push(TraceError::DoubleEndpoint {

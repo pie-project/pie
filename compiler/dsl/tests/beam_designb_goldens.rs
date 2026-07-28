@@ -23,7 +23,7 @@
 //! compactions) — the mask does all the per-beam selection.
 //!
 //! These goldens assert the mask evolution across a fork step and the write
-//! descriptor, on echo's reference interpreter. They are the Design B contract;
+//! descriptor, on the IR's reference interpreter. They are the Design B contract;
 //! they replaced the retired Design A `ptir_beam.rs`/`beam_goldens` vectors (B5).
 
 use pie_eval::interp::{Instance, NoKernels, PassInputs, Value};

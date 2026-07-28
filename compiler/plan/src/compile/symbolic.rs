@@ -297,9 +297,12 @@ pub(crate) fn symbolic_intrinsic_type(
                 ty.dims[0] = Dimension::Symbolic(SymbolicExtent::SampledRows);
             }
         }
-        // `MtpLogits` and `MtpDrafts` are shaped by the draft count, not the
-        // sampled-row count; `Hidden`, `Query`, `ValueHead`, `AttnScore` and
-        // `Layer` are all statically shaped by the model profile.
+        // `MtpLogits` and `MtpDrafts` are shaped by the draft count; `ValueHead`
+        // and `Layer` by the model profile. `Hidden`, `Query` and `AttnScore`
+        // are shaped by extents the *trace* declares (hidden width, query
+        // width, KV ceiling) — none of the three is in the profile, so `bind`
+        // checks their rank and not their width. Either way the dims are
+        // already static, so there is nothing to make symbolic here.
         IntrinsicId::MtpLogits
         | IntrinsicId::MtpDrafts
         | IntrinsicId::Hidden

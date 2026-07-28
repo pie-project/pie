@@ -1,7 +1,7 @@
 //! Golden vectors (thrust-3 P0.4): canonical container bytes, identity hash,
 //! validator verdict and tier-0 reference results, checked into
 //! `golden/*.txt`. **This is the conformance suite for every backend** —
-//! charlie's CUDA tiers and delta's SDK diff against these files: the SDK must
+//! the CUDA driver's tiers and the SDK diff against these files: the SDK must
 //! emit byte-identical containers (same hex, same hash) and any executor must
 //! reproduce the step lines exactly.
 //!
@@ -823,7 +823,7 @@ fn golden_matrix_select_mask() {
     // [k,v])) -> per-row argmax. EVERY matrix operand materializes k FULL
     // rows (k*v, row-major). Non-degenerate: each row's raw argmax is masked
     // out, so undersized rows / bf16-vs-f32 indexing errors cannot pass.
-    // Cross-backend gate: charlie's CUDA JIT + mac-master's Metal both match
+    // Cross-backend gate: the CUDA driver's JIT + the Metal driver both match
     // these step lines bit-exact.
     let (k, v) = (4u32, 8u32);
     let mut b = B::new();
@@ -900,7 +900,7 @@ fn golden_matrix_select_mask() {
 
 #[test]
 fn golden_pivot_predicates_multistage() {
-    // Regression pin (charlie thrust-3 / driver bound.hpp): container.rs
+    // Regression pin (CUDA driver thrust-3 / driver bound.hpp): container.rs
     // decodes `Predicate::{RankLe,CummassLe,ProbGe}`'s payload as a
     // per-STAGE-LOCAL ValueId (same as any op arg) — a translator MUST remap
     // it through that stage's global-id base before dereferencing it, exactly

@@ -927,68 +927,75 @@ fn argmax_ordered<T: Ord>(row: &[T]) -> i32 {
     best_index as i32
 }
 
+/// Which end of the float order an extremum walks toward.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Extremum {
+    Max,
+    Min,
+}
+
+/// What a NaN-against-NaN pair produces — the only axis on which the reduction
+/// and elementwise forms differ.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum NanPair {
+    /// A reduction folds NaN∧NaN to its identity, so an all-NaN row reduces to
+    /// ∓inf rather than to NaN. (A single NaN is already dropped by the
+    /// asymmetric arms, so this is what makes the fold associative.)
+    Identity,
+    /// Elementwise `max`/`min` propagate: NaN∧NaN yields the left operand.
+    Left,
+}
+
+/// The one extremum rule. IEEE leaves two cases to the caller — NaN pairs and
+/// signed zeros — and both matter here: this is the tier-0 oracle, so whatever
+/// it decides is the contract every backend is compared against.
+fn extremum(left: f32, right: f32, end: Extremum, pair: NanPair) -> f32 {
+    match (left.is_nan(), right.is_nan()) {
+        (true, true) => match pair {
+            NanPair::Identity => match end {
+                Extremum::Max => f32::NEG_INFINITY,
+                Extremum::Min => f32::INFINITY,
+            },
+            NanPair::Left => left,
+        },
+        (true, false) => right,
+        (false, true) => left,
+        // `-0.0 == 0.0`, so `f32::max`/`min` are free to return either operand.
+        // Pin the sign instead: a max is negative only when both inputs are, a
+        // min whenever either is. Getting these backwards is invisible in every
+        // comparison and visible in `to_bits`.
+        (false, false) if left == 0.0 && right == 0.0 => {
+            let negative = match end {
+                Extremum::Max => left.is_sign_negative() && right.is_sign_negative(),
+                Extremum::Min => left.is_sign_negative() || right.is_sign_negative(),
+            };
+            if negative { -0.0 } else { 0.0 }
+        }
+        (false, false) => match end {
+            Extremum::Max => left.max(right),
+            Extremum::Min => left.min(right),
+        },
+    }
+}
+
+/// `reduce_max`'s combiner — see [`NanPair::Identity`].
 fn canonical_max(left: f32, right: f32) -> f32 {
-    match (left.is_nan(), right.is_nan()) {
-        (true, true) => f32::NEG_INFINITY,
-        (true, false) => right,
-        (false, true) => left,
-        (false, false) if left == 0.0 && right == 0.0 => {
-            if left.is_sign_negative() && right.is_sign_negative() {
-                -0.0
-            } else {
-                0.0
-            }
-        }
-        (false, false) => left.max(right),
-    }
+    extremum(left, right, Extremum::Max, NanPair::Identity)
 }
 
+/// `reduce_min`'s combiner — see [`NanPair::Identity`].
 fn canonical_min(left: f32, right: f32) -> f32 {
-    match (left.is_nan(), right.is_nan()) {
-        (true, true) => f32::INFINITY,
-        (true, false) => right,
-        (false, true) => left,
-        (false, false) if left == 0.0 && right == 0.0 => {
-            if left.is_sign_negative() || right.is_sign_negative() {
-                -0.0
-            } else {
-                0.0
-            }
-        }
-        (false, false) => left.min(right),
-    }
+    extremum(left, right, Extremum::Min, NanPair::Identity)
 }
 
+/// `max_elem`'s combiner — see [`NanPair::Left`].
 fn element_max(left: f32, right: f32) -> f32 {
-    match (left.is_nan(), right.is_nan()) {
-        (true, true) => left,
-        (true, false) => right,
-        (false, true) => left,
-        (false, false) if left == 0.0 && right == 0.0 => {
-            if left.is_sign_negative() && right.is_sign_negative() {
-                -0.0
-            } else {
-                0.0
-            }
-        }
-        (false, false) => left.max(right),
-    }
+    extremum(left, right, Extremum::Max, NanPair::Left)
 }
 
+/// `min_elem`'s combiner — see [`NanPair::Left`].
 fn element_min(left: f32, right: f32) -> f32 {
-    match (left.is_nan(), right.is_nan()) {
-        (true, true) => left,
-        (true, false) => right,
-        (false, true) => left,
-        (false, false) if left == 0.0 && right == 0.0 => {
-            if left.is_sign_negative() || right.is_sign_negative() {
-                -0.0
-            } else {
-                0.0
-            }
-        }
-        (false, false) => left.min(right),
-    }
+    extremum(left, right, Extremum::Min, NanPair::Left)
 }
 
 /// sort_desc order with the pinned contract: descending; ties → lower
@@ -2206,9 +2213,51 @@ mod tests {
             canonical_reduce(&[-0.0, 0.0], f32::INFINITY, canonical_min).to_bits(),
             (-0.0f32).to_bits()
         );
-        assert_eq!(element_max(-0.0, 0.0).to_bits(), 0.0f32.to_bits());
-        assert_eq!(element_min(0.0, -0.0).to_bits(), (-0.0f32).to_bits());
         assert_eq!(argmax_ordered(&[16_777_216u32, 16_777_217]), 1);
         assert_eq!(argmax_ordered(&[-2i32, -1]), 1);
+    }
+
+    /// The two axes of [`extremum`], every combination, on the inputs IEEE
+    /// leaves to the caller. Four hand-written copies used to encode this; one
+    /// mis-copied `&&` or identity would have been invisible in every
+    /// comparison and wrong only in the bits.
+    #[test]
+    fn the_extremum_rule_pins_nan_and_signed_zero() {
+        const NAN: f32 = f32::NAN;
+        // (left, right, canonical_max, canonical_min, element_max, element_min)
+        let table: &[(f32, f32, f32, f32, f32, f32)] = &[
+            // A NaN pair: reductions fold to their identity, elementwise keeps left.
+            (NAN, NAN, f32::NEG_INFINITY, f32::INFINITY, NAN, NAN),
+            // One NaN: dropped by both forms, either side.
+            (NAN, -3.0, -3.0, -3.0, -3.0, -3.0),
+            (-3.0, NAN, -3.0, -3.0, -3.0, -3.0),
+            // Signed zeros: max is negative only when both are, min when either is.
+            (-0.0, 0.0, 0.0, -0.0, 0.0, -0.0),
+            (0.0, -0.0, 0.0, -0.0, 0.0, -0.0),
+            (-0.0, -0.0, -0.0, -0.0, -0.0, -0.0),
+            (0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+            // Ordinary values: no policy, just the order.
+            (1.0, 2.0, 2.0, 1.0, 2.0, 1.0),
+        ];
+        for &(left, right, c_max, c_min, e_max, e_min) in table {
+            for (name, got, want) in [
+                ("canonical_max", canonical_max(left, right), c_max),
+                ("canonical_min", canonical_min(left, right), c_min),
+                ("element_max", element_max(left, right), e_max),
+                ("element_min", element_min(left, right), e_min),
+            ] {
+                if want.is_nan() {
+                    assert!(got.is_nan(), "{name}({left}, {right}) = {got}, want NaN");
+                } else {
+                    assert_eq!(
+                        got.to_bits(),
+                        want.to_bits(),
+                        "{name}({left}, {right}) = {got} ({:#010x}), want {want} ({:#010x})",
+                        got.to_bits(),
+                        want.to_bits()
+                    );
+                }
+            }
+        }
     }
 }

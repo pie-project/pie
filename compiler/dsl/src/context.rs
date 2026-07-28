@@ -1,6 +1,6 @@
 //! The trace-recording context: a thread-local **session** holding the stage
 //! currently being traced plus the channel registry. Channel/Tensor methods
-//! consult it — inside a traced stage closure they record echo's canonical
+//! consult it — inside a traced stage closure they record the IR's canonical
 //! [`ptir::op::Op`](pie_ir::op::Op); on the host they take the
 //! async path.
 //!
@@ -18,7 +18,7 @@ use pie_ir::types::{DType, Shape, ValueType};
 use crate::error::Span;
 use crate::value::ConstData;
 
-/// Attachment stage — re-export of echo's canonical [`Stage`](pie_ir::registry::Stage).
+/// Attachment stage — re-export of the IR's canonical [`Stage`](pie_ir::registry::Stage).
 pub use pie_ir::registry::Stage;
 
 /// A channel's mutable shared state (behind `Rc<RefCell<..>>`; a `Channel` is a
@@ -58,7 +58,7 @@ impl ChannelState {
 
 pub type ChannelRef = Rc<RefCell<ChannelState>>;
 
-/// A sink call recorded in a stage (for the T11 span pre-lint; echo's validator
+/// A sink call recorded in a stage (for the T11 span pre-lint; the IR's validator
 /// is the authoritative gate).
 #[derive(Clone, Debug)]
 pub(crate) struct SinkCall {
@@ -73,7 +73,7 @@ pub(crate) struct Recorder {
     /// Read-out rows for `intrinsics::logits()` shape.
     pub rows: u32,
     pub ops: Vec<Op>,
-    /// Light per-value types (author ergonomics; echo's `infer` is authoritative).
+    /// Light per-value types (author ergonomics; the IR's `infer` is authoritative).
     pub types: Vec<ValueType>,
     pub sinks: Vec<SinkCall>,
 }
