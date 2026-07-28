@@ -91,8 +91,11 @@ ExpertRouting build_routing(
 // Expert-block size for the device-side aligned MoE path.
 // TEMP ablation switch for perf bring-up: PIE_GLM_ABLATE=lmhead,dsa,moe
 
-// Above this token count the aligned batched GEMM beats the decode GEMVs.
-static constexpr int kGlm5MoeGemvMaxTokens = 8;
+// The decode GEMV wins only at a single token: it is one warp per output row
+// doing scalar FP32 math, against a batched GEMM on tensor cores. Measured on
+// glm5.2-mini (output tok/s, GEMV vs batched): c=1 455/421, c=2 739/790,
+// c=4 1195/1555, c=8 1706/3062. Override with `PIE_MOE_GEMV_MAX_TOKENS`.
+static constexpr int kGlm5MoeGemvMaxTokens = 1;
 
 Glm5Workspace Glm5Workspace::allocate(
     const HfConfig& cfg,
@@ -212,7 +215,7 @@ Glm5Workspace Glm5Workspace::allocate(
     // skew and every block runs unconditionally).
     if (routed_I > 0 && cfg.num_experts > 0 && Ktop > 0 &&
         ops::flashinfer_cutlass_moe_enabled() && glm5_moe_gate_up_swapped()) {
-        ws.cutlass_max_rows = N;
+        ws.cutlass_max_rows = std::min(N, ops::flashinfer_cutlass_moe_max_rows());
         const std::size_t bytes = ops::flashinfer_cutlass_moe_workspace_bytes(
             ops::MoeActivation::Swiglu, ws.cutlass_max_rows, H, routed_I,
             cfg.num_experts, Ktop, /*tp_size=*/1, /*tp_rank=*/0);
@@ -545,12 +548,13 @@ void glm5_forward_paged(
         // only above that, where it is unambiguously better.
         const bool gemv_ok =
             Lw.moe_gate_up_proj != nullptr && ws.aligned_block_size > 0 &&
-            total_tokens <= kGlm5MoeGemvMaxTokens && (H % 8) == 0 &&
-            (routed_I % 8) == 0;
+            total_tokens <= ops::moe_gemv_max_tokens(kGlm5MoeGemvMaxTokens) &&
+            (H % 8) == 0 && (routed_I % 8) == 0;
         const bool fused_moe_fits =
             !gemv_ok &&
             Lw.moe_gate_up_proj != nullptr && !ws.cutlass_ws.empty() &&
-            total_tokens <= ws.cutlass_max_rows;
+            total_tokens <= ws.cutlass_max_rows &&
+            total_tokens >= ops::flashinfer_cutlass_moe_min_rows();
         if (fused_moe_fits &&
             ops::flashinfer_cutlass_moe_bf16(
                 ops::MoeActivation::Swiglu,

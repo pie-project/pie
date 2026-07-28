@@ -22,6 +22,30 @@ enum class MoeActivation {
 
 bool flashinfer_cutlass_moe_enabled();
 
+/// Row budget the runner's workspace is sized for. The workspace holds the
+/// permuted activations, so it scales with `rows * experts_per_token *
+/// hidden_size` -- at the full prefill token budget that is gigabytes of
+/// VMM-backed arena, and mapping it makes every later `cuMemCreate` /
+/// `cuMemSetAccess` on the shared physical pool an order of magnitude more
+/// expensive. The fused path pays off at decode-sized batches, so cap the
+/// budget there and let anything larger fall back. Override with
+/// `PIE_MOE_FUSED_MAX_ROWS`.
+int flashinfer_cutlass_moe_max_rows();
+
+/// Row count below which the fused path is declined, so a model can keep its
+/// small-batch GEMM for the shapes where the grouped GEMM's permute/finalize
+/// overhead is not amortised. Off (`0`) unless `PIE_MOE_FUSED_MIN_ROWS` says
+/// otherwise.
+int flashinfer_cutlass_moe_min_rows();
+
+/// Token count at or below which a model keeps its W4A16 per-route MoE GEMV
+/// instead of the BF16 batched / fused grouped GEMM. The GEMV dequantises int4
+/// with scalar FP32 ALU while the batched paths run on tensor cores, so the
+/// crossover is far lower than its weight-traffic model suggests. Each model
+/// passes its own compiled-in default; `PIE_MOE_GEMV_MAX_TOKENS` overrides it,
+/// and `0` disables the GEMV path entirely.
+int moe_gemv_max_tokens(int fallback);
+
 std::size_t flashinfer_cutlass_moe_workspace_bytes(
     MoeActivation activation,
     int num_rows,

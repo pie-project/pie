@@ -31,12 +31,17 @@
 #include "kernels/dsv4_compress.hpp"
 #include "ops/attention_naive_paged.hpp"
 #include "ops/gemm.hpp"
+#include "ops/flashinfer_moe.hpp"
 
 namespace pie_cuda_driver::model {
 
 // Expert-block granularity for the device-side aligned MoE, and the token
-// count below which the per-route GEMV path beats a batched GEMM.
-static constexpr int kDsV4MoeGemvMaxTokens = 8;
+// count below which the per-route GEMV path beats a batched GEMM. The GEMV is
+// one warp per output row doing scalar FP32 math, so it only wins at a single
+// token; from two tokens up the batched GEMM's tensor cores dominate. Measured
+// at c=8 (output tok/s, GEMV vs batched): dsv4pro-mini 805/1318,
+// dsv4flash-mini 1614/2137. Override with `PIE_MOE_GEMV_MAX_TOKENS`.
+static constexpr int kDsV4MoeGemvMaxTokens = 1;
 
 inline void dsv4_chunked_swiglu(const void* packed, void* y, int rows, int I,
                                 float limit, cudaStream_t stream) {
@@ -1172,7 +1177,8 @@ void dsv4_forward_paged(
             // whatever allocator the forward happens to run under.
             const bool stacked = Lw.moe_gate_up_bf16 != nullptr;
             if (stacked && ws.aligned_block_size > 0 &&
-                N <= kDsV4MoeGemvMaxTokens && (H % 8) == 0 &&
+                N <= ops::moe_gemv_max_tokens(kDsV4MoeGemvMaxTokens) &&
+                (H % 8) == 0 &&
                 (local_moe_I % 8) == 0) {
                 // Decode: at M=1 the routed GEMMs stream weights with no reuse,
                 // so a warp-per-output-row GEMV beats a batched GEMM whose

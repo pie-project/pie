@@ -69,6 +69,12 @@ struct KimiWorkspace {
     DeviceTensor c_dn_ptrs;
     int aligned_block_size = 0;
     int aligned_max_blocks = 0;
+    // flashinfer CUTLASS fused-MoE scratch. The runner permutes, runs both
+    // grouped GEMMs, applies SwiGLU and finalises the top-k weighted sum in one
+    // call, replacing the whole gather/batched-GEMM/scatter chain above.
+    DeviceTensor cutlass_ws;        // opaque runner workspace (uint8)
+    DeviceTensor cutlass_row_map;   // [cutlass_max_rows * top_k] int32
+    int cutlass_max_rows = 0;
     DeviceTensor shared_gate;       // [N, shared_I]
     DeviceTensor shared_up;         // [N, shared_I]
     DeviceTensor shared_act;        // [N, shared_I]
