@@ -15,7 +15,7 @@ use alloc::vec::Vec;
 use core::fmt::Write as _;
 use pie_ir::op::{intrinsic_tags, tags};
 
-use pie_plan::{CompiledStage, Dimension, Region};
+use pie_plan::{CompiledStage, Region};
 
 use super::METAL_M2_MAX_FUSED_CHANNELS;
 use super::preamble::{RUNTIME_TEMPLATE, grouped_preamble};
@@ -259,62 +259,9 @@ pub fn emit_grouped_fused_region(
     // instead, as long as the result stays inside this region -- a region output
     // or sink is read through its own offset by someone else, so those keep the
     // copy.
-    let escapes: BTreeSet<u32> = region
-        .outputs
-        .iter()
-        .copied()
-        .chain(region.sinks.iter().map(|sink| sink.value))
-        .collect();
+    let escapes = crate::alias::escaping_values(region);
     let value_types = &stage.normalized.value_types;
-    // What the runtime actually does for a reshape is
-    // `m1_copy_typed(src, dst, dst_desc.len, dtype)` -- it takes the *result's*
-    // element count from offset 0 of the source. So the result is a prefix view
-    // of the source whenever the source is at least as long, and pointing
-    // consumers at the source reproduces it byte for byte: they read through
-    // the result's own descriptor, so they still read exactly `dst.len`.
-    //
-    // Comparing lengths must survive symbolic extents, because the one graph
-    // that needs this is the sampler, whose reshape is
-    // `[SampledRows, vocab] -> [vocab]`. Splitting a shape into its static
-    // product and the multiset of its symbolic ids is enough: if the result's
-    // symbolic ids are a sub-multiset of the source's and its static product is
-    // no larger, the result is no longer than the source under every binding.
-    // (An earlier version demanded fully static extents on both sides and so
-    // never fired at all.)
-    let footprint = |value: u32| -> Option<(u8, u64, Vec<u8>)> {
-        let ty = value_types.get(value as usize)?;
-        let mut statics: u64 = 1;
-        let mut symbolic: Vec<u8> = Vec::new();
-        for dim in &ty.dims {
-            match dim {
-                Dimension::Static(extent) => statics *= u64::from(*extent),
-                Dimension::Symbolic(id) => symbolic.push(*id as u8),
-            }
-        }
-        symbolic.sort_unstable();
-        Some((ty.dtype as u8, statics, symbolic))
-    };
-    // `result` is never longer than `source`, whatever the symbolic dims are.
-    let covers = |source: u32, result: u32| match (footprint(source), footprint(result)) {
-        (
-            Some((src_dtype, src_static, src_symbolic)),
-            Some((dst_dtype, dst_static, mut dst_symbolic)),
-        ) => {
-            if src_dtype != dst_dtype || dst_static > src_static {
-                return false;
-            }
-            let mut remaining = src_symbolic;
-            dst_symbolic.retain(|id| match remaining.iter().position(|kept| kept == id) {
-                Some(at) => {
-                    remaining.remove(at);
-                    false
-                }
-                None => true,
-            });
-            dst_symbolic.is_empty()
-        }
-        _ => false,
-    };
+    let covers = |source: u32, result: u32| crate::alias::covers(value_types, source, result);
 
     // Decided before anything is emitted, because the gather/argmax fusion below
     // has to see through these aliases to recognise its pattern.

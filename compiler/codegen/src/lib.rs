@@ -47,6 +47,7 @@
 // still use them; `alloc` is available here through `std`.
 extern crate alloc;
 
+pub mod alias;
 pub mod cuda;
 pub mod fault;
 pub mod header;

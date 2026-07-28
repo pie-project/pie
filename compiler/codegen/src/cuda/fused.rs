@@ -361,7 +361,26 @@ pub fn emit_fused_region(
         if skipped[node] != 0 && op.tag != tags::RESHAPE {
             continue;
         }
-        if op.tag == tags::RESHAPE && !region.outputs.contains(&base) {
+        // Both runtimes execute a reshape as a copy of the *result's* element
+        // count out of the source (`ptir_parallel_copy(a0, o0, out.len, ...)`
+        // here, `m1_copy_typed(src, dst, dst_desc.len, ...)` on Metal), so
+        // pointing consumers at the source only reproduces it when the source
+        // is at least as long. This asked `region.outputs` alone, which is a
+        // question about who reads the result, not about whether the source
+        // can stand in for it: `[vocab] -> [SampledRows, vocab]`, as legal in
+        // the IR as the sampler's `[SampledRows, vocab] -> [vocab]`, was
+        // aliased to a buffer too short to read.
+        //
+        // Not also `region.sinks`, which is what `metal::fused` excludes. A
+        // sink is a `chan_put` *inside* this region (`compile/region.rs:302`)
+        // and its operand is alias-resolved with every other operand below, so
+        // eliding a reshape that feeds one is sound here; Metal's extra
+        // exclusion costs it a copy rather than buying it a guarantee.
+        if op.tag == tags::RESHAPE
+            && !op.args.is_empty()
+            && !region.outputs.contains(&base)
+            && crate::alias::covers(&stage.normalized.value_types, op.args[0], base)
+        {
             aliases[base as usize] = resolve_alias(&aliases, op.args[0]);
             continue;
         }
