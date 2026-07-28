@@ -15,7 +15,7 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use super::container::{ChannelDecl, ExternDir, HostRole, PortSource, TraceContainer};
-use super::infer::{BodyCtx, BodyError, body_types};
+use super::infer::{BodyCtx, BodyError, BodyErrorKind, body_types};
 use super::op::{ChannelUse, IntrinsicId, Op};
 use super::registry::{
     KNOWN_SINKS, ModelProfile, Phase, Port, SinkScope, Stage, intrinsic_available, intrinsic_stages,
@@ -294,7 +294,68 @@ pub fn channel_value_type(decl: &ChannelDecl) -> ValueType {
 
 /// Validate a container against a profile; returns the typed, bound trace.
 pub fn bind(container: TraceContainer, profile: ModelProfile) -> Result<BoundTrace, ValidateError> {
-    // ── container-level structure ────────────────────────────────────────
+    // One pass per rule group, in the order the rules depend on each other.
+    // The order is not cosmetic: `check_spsc_endpoints` reads a channel decl by
+    // the index an op carries, and `check_bodies` is what proved that index is
+    // in range. That used to be a bare `container.channels[chan as usize]`
+    // three hundred lines below the check that made it safe, with nothing
+    // saying so; the accessor it uses now returns the same error `check_bodies`
+    // would have, so a reordering is a wrong *message*, not a panic on decoded
+    // bytes.
+    check_structure(&container)?;
+    check_externs(&container)?;
+    let channel_types: Vec<ValueType> = container.channels.iter().map(channel_value_type).collect();
+    let stage_types = check_bodies(&container, &channel_types)?;
+    check_intrinsics(&container, &profile)?;
+    check_second_party_names(&container, &profile)?;
+    check_spsc_endpoints(&container)?;
+
+    let readiness = readiness_table(&container);
+    let classes = classify_channels(&container, &readiness);
+
+    let hash = container.hash();
+    Ok(BoundTrace {
+        container,
+        profile,
+        hash,
+        channel_types,
+        stage_types,
+        readiness,
+        classes,
+    })
+}
+
+/// The channel decl an op names, or the error [`check_bodies`] would have
+/// raised for it.
+///
+/// Every caller runs after [`check_bodies`], so the `None` arm is unreachable —
+/// but it is the arm that used to be a raw index, and "unreachable because a
+/// different function ran first" is not something the reader of a slice index
+/// can see. Total instead, at the cost of one `match`.
+fn channel_decl(
+    container: &TraceContainer,
+    chan: u32,
+    stage: Stage,
+    op_index: u32,
+) -> Result<&ChannelDecl, ValidateError> {
+    container
+        .channels
+        .get(chan as usize)
+        .ok_or(ValidateError::Body {
+            stage,
+            err: BodyError {
+                op_index,
+                kind: BodyErrorKind::ChannelOutOfRange(chan),
+            },
+        })
+}
+
+/// Container-level shape: sorted/unique tables, non-zero capacities, port
+/// sources in range, and the geometry ports `embed_tokens` implies.
+///
+/// Establishes that every `PortSource::Channel` index is in range, which
+/// [`check_spsc_endpoints`] relies on.
+fn check_structure(container: &TraceContainer) -> Result<(), ValidateError> {
     if container.names.windows(2).any(|names| names[0] >= names[1]) {
         return Err(ValidateError::NamesUnsortedOrDuplicate);
     }
@@ -362,8 +423,12 @@ pub fn bind(container: TraceContainer, profile: ModelProfile) -> Result<BoundTra
             }
         }
     }
+    Ok(())
+}
 
-    // ── v1.1 extern channels: structure + decl constraints ──────────────
+/// v1.1 extern channels: sorted and unique, and each one declared in a way that
+/// leaves the endpoint free for its peer.
+fn check_externs(container: &TraceContainer) -> Result<(), ValidateError> {
     for w in container.externs.windows(2) {
         if w[0].chan >= w[1].chan {
             return Err(ValidateError::ExternsUnsortedOrDup);
@@ -380,11 +445,19 @@ pub fn bind(container: TraceContainer, profile: ModelProfile) -> Result<BoundTra
             return Err(ValidateError::ExternNameOutOfRange { chan: e.chan });
         }
     }
+    Ok(())
+}
 
-    // ── per-stage bodies: SSA + shape/dtype ──────────────────────────────
-    let channel_types: Vec<ValueType> = container.channels.iter().map(channel_value_type).collect();
+/// Per-stage bodies: SSA numbering, shapes and dtypes.
+///
+/// Establishes that every channel and name index an op carries is in range —
+/// the precondition the passes below are written against.
+fn check_bodies(
+    container: &TraceContainer,
+    channel_types: &[ValueType],
+) -> Result<Vec<Vec<ValueType>>, ValidateError> {
     let ctx = BodyCtx {
-        channel_types: &channel_types,
+        channel_types,
         n_names: container.names.len() as u16,
     };
     let mut stage_types = Vec::with_capacity(container.stages.len());
@@ -395,8 +468,14 @@ pub fn bind(container: TraceContainer, profile: ModelProfile) -> Result<BoundTra
         })?;
         stage_types.push(types);
     }
+    Ok(stage_types)
+}
 
-    // ── intrinsics: stage scope, model gating, registry type rules ──────
+/// Intrinsics: stage scope, model gating, and the registry's type rules.
+fn check_intrinsics(
+    container: &TraceContainer,
+    profile: &ModelProfile,
+) -> Result<(), ValidateError> {
     for sp in &container.stages {
         for op in &sp.ops {
             if let Op::IntrinsicVal { intr, shape, dtype } = *op {
@@ -406,10 +485,10 @@ pub fn bind(container: TraceContainer, profile: ModelProfile) -> Result<BoundTra
                         stage: sp.stage,
                     });
                 }
-                if !intrinsic_available(intr, &profile) {
+                if !intrinsic_available(intr, profile) {
                     return Err(ValidateError::IntrinsicUnavailable { intr });
                 }
-                if !intrinsic_type_ok(intr, shape, dtype, &profile) {
+                if !intrinsic_type_ok(intr, shape, dtype, profile) {
                     return Err(ValidateError::IntrinsicTypeRule {
                         intr,
                         stage: sp.stage,
@@ -418,13 +497,22 @@ pub fn bind(container: TraceContainer, profile: ModelProfile) -> Result<BoundTra
             }
         }
     }
+    Ok(())
+}
 
-    // ── second-party names: availability, T10, sink/kernel kind + T11 ───
+/// Second-party names: availability, T10 replayability, and the sink/kernel
+/// kind and placement rules (T11).
+///
+/// Runs after [`check_bodies`], which is what puts every `name` index in range.
+fn check_second_party_names(
+    container: &TraceContainer,
+    profile: &ModelProfile,
+) -> Result<(), ValidateError> {
     for sp in &container.stages {
         for op in &sp.ops {
             match op {
                 Op::KernelCall { name, .. } => {
-                    let n = resolve_name(&container, *name);
+                    let n = resolve_name(container, *name);
                     let info =
                         profile
                             .kernel(n)
@@ -446,7 +534,7 @@ pub fn bind(container: TraceContainer, profile: ModelProfile) -> Result<BoundTra
                     }
                 }
                 Op::SinkCall { name, .. } => {
-                    let n = resolve_name(&container, *name);
+                    let n = resolve_name(container, *name);
                     // First-party sinks have spec-owned scopes; second-party
                     // sinks come from the profile.
                     // A first-party sink name always type-checks, so the
@@ -507,8 +595,15 @@ pub fn bind(container: TraceContainer, profile: ModelProfile) -> Result<BoundTra
             }
         }
     }
+    Ok(())
+}
 
-    // ── SPSC endpoints (T2; v1.1 extends across the extern pair) ─────────
+/// SPSC endpoints (T2), extended across the extern pair in v1.1: at most one
+/// producer and one consumer per channel, counting the host role and the
+/// descriptor ports as endpoints.
+///
+/// Runs after [`check_structure`] and [`check_bodies`]; see [`channel_decl`].
+fn check_spsc_endpoints(container: &TraceContainer) -> Result<(), ValidateError> {
     let extern_dir = |chan: u32| -> Option<ExternDir> {
         container
             .externs
@@ -517,7 +612,7 @@ pub fn bind(container: TraceContainer, profile: ModelProfile) -> Result<BoundTra
             .map(|e| e.dir)
     };
     for sp in &container.stages {
-        for op in &sp.ops {
+        for (op_index, op) in sp.ops.iter().enumerate() {
             let Some((use_, chan)) = op.channel_use() else {
                 continue;
             };
@@ -528,7 +623,8 @@ pub fn bind(container: TraceContainer, profile: ModelProfile) -> Result<BoundTra
                 // A non-consuming read still occupies the consumer endpoint.
                 ChannelUse::Take | ChannelUse::Read => (HostRole::Reader, ExternDir::Export),
             };
-            if container.channels[chan as usize].host_role == local_role {
+            let decl = channel_decl(container, chan, sp.stage, op_index as u32)?;
+            if decl.host_role == local_role {
                 return Err(if use_ == ChannelUse::Put {
                     ValidateError::SecondProducer {
                         chan,
@@ -564,7 +660,7 @@ pub fn bind(container: TraceContainer, profile: ModelProfile) -> Result<BoundTra
     // Ports are pass-side consumers too.
     for p in &container.ports {
         if let PortSource::Channel(c) = p.source
-            && container.channels[c as usize].host_role == HostRole::Reader
+            && channel_decl(container, c, Stage::Prologue, 0)?.host_role == HostRole::Reader
         {
             // Attribute to the descriptor; report with the epilogue tag
             // absent a stage — use Prologue? Keep a dedicated message via
@@ -575,23 +671,7 @@ pub fn bind(container: TraceContainer, profile: ModelProfile) -> Result<BoundTra
             });
         }
     }
-
-    // ── readiness: per-channel first-op direction (§7.1) ─────────────────
-    let readiness = readiness_table(&container);
-
-    // ── §7.1 channel classes ─────────────────────────────────────────────
-    let classes = classify_channels(&container, &readiness);
-
-    let hash = container.hash();
-    Ok(BoundTrace {
-        container,
-        profile,
-        hash,
-        channel_types,
-        stage_types,
-        readiness,
-        classes,
-    })
+    Ok(())
 }
 
 fn resolve_name(c: &TraceContainer, idx: u16) -> &str {
@@ -1343,6 +1423,86 @@ mod tests {
         assert!(matches!(
             bind(duplicate, ModelProfile::dummy()),
             Err(ValidateError::NamesUnsortedOrDuplicate)
+        ));
+    }
+
+    /// A `ChanPut` naming a channel that does not exist.
+    ///
+    /// `check_bodies` rejects it, so `check_spsc_endpoints` never sees one in
+    /// production. This asks for the other half: that the pass which *would*
+    /// have indexed the table blind also answers, and answers the same thing.
+    /// Before the split that was `container.channels[chan as usize]` three
+    /// hundred lines below the check that made it safe — a panic waiting on
+    /// whoever moved the blocks around.
+    #[test]
+    fn a_pass_that_runs_second_still_answers_when_run_first() {
+        let mut container = TraceContainer {
+            names: vec![],
+            channels: vec![chan(Shape::vector(1), DType::I32, HostRole::None, true)],
+            ports: vec![],
+            stages: vec![StageProgram {
+                stage: Stage::Prologue,
+                ops: vec![Op::Iota { len: 1 }, Op::ChanPut { chan: 7, value: 0 }],
+            }],
+            externs: vec![],
+        };
+
+        let direct = check_spsc_endpoints(&container).unwrap_err();
+        let whole = bind(container.clone(), ModelProfile::dummy()).unwrap_err();
+        for err in [&direct, &whole] {
+            assert!(
+                matches!(
+                    err,
+                    ValidateError::Body {
+                        err: BodyError {
+                            kind: BodyErrorKind::ChannelOutOfRange(7),
+                            ..
+                        },
+                        ..
+                    }
+                ),
+                "out-of-range channel should read the same from either pass, got {err:?}"
+            );
+        }
+
+        // And the same for a descriptor port, which is the second raw index.
+        container.stages[0].ops.pop();
+        container.ports = vec![PortBinding {
+            port: Port::EmbedTokens,
+            source: PortSource::Channel(7),
+        }];
+        assert!(matches!(
+            check_spsc_endpoints(&container).unwrap_err(),
+            ValidateError::Body {
+                err: BodyError {
+                    kind: BodyErrorKind::ChannelOutOfRange(7),
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    /// Two rules broken at once. Which complaint you hear is decided by the
+    /// call order in [`bind`] and by nothing else, so it is pinned here: a
+    /// reorder is a test failure with a diff, not a silent change of contract.
+    #[test]
+    fn the_pass_order_decides_which_complaint_wins() {
+        let container = TraceContainer {
+            names: vec!["b".to_string(), "a".to_string()],
+            channels: vec![chan(Shape::vector(1), DType::I32, HostRole::None, true)],
+            ports: vec![],
+            stages: vec![StageProgram {
+                stage: Stage::Prologue,
+                ops: vec![Op::ChanTake(9)],
+            }],
+            externs: vec![],
+        };
+        // Unsorted names (check_structure) and a bad channel index
+        // (check_bodies). Structure runs first.
+        assert!(matches!(
+            bind(container, ModelProfile::dummy()).unwrap_err(),
+            ValidateError::NamesUnsortedOrDuplicate
         ));
     }
 }
