@@ -89,6 +89,7 @@ if(APPLE)
     src/pipeline/shared_storage.mm
     src/pipeline/m1_runtime.cpp
     src/batch/decode_timing.cpp
+    src/batch/golden_tap.cpp
     src/batch/scratch.cpp
     src/model/qwen3_5/decode_consts.cpp
     src/model/qwen3_5/decode_step.cpp

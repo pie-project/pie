@@ -1,7 +1,7 @@
 # oracle dump: pie::metal::pipeline::emit_commit_msl
 # source of truth: compiler/codegen/src/metal/ (the C++ oracle this was dumped from is deleted)
-# emitter_version: 25
-# @runtime: bytes=34685 fnv1a64=0xac1c05ffc5f276a
+# emitter_version: 27
+# @runtime: bytes=35582 fnv1a64=0x83bd7cbda467df1
 # @grouped: bytes=970 fnv1a64=0xa8ab9e1ebf8714d9
 # cases: 45
 # re-blessed: the C++ oracle (driver/metal/src/pipeline/m1_codegen.cpp) is
@@ -17,6 +17,12 @@
 #       MSL will not convert. They now cast.
 #   Nothing else in this directory moved, and `msl_compile_test` is the standing
 #   check that took over from the oracle for the question it could not answer.
+#   re-blessed again (emitter 27): `m1_reduce_argmax` no longer materializes one
+#   16-byte candidate per element into device `temporary` and tree-reduces it in
+#   passes -- `m1_argmax_combine` is a strict total order, so a fold gives the
+#   same answer -- and the bf16 logits intrinsic copies unrolled. Both loops run
+#   on the single thread that owns a lane, so at a 248320 vocab they were ~250ms
+#   per decode step against a ~4ms model forward. Only @runtime bytes moved.
 === empty
 function_name: ptir_m1_empty_commit
 channels: 0

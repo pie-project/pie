@@ -182,12 +182,14 @@ struct ModelFacts {
     std::uint32_t max_model_len = 8192;
     std::string arch_name = "llama";
     bool has_linear_attn = false;
-    // Qwen3.5/3.6 ship a config with no `rope_theta`, so the family default is
-    // what applies. The geometry header carried 1e7, which is 100x the value
-    // the reference implementations use for this family -- finite, so it does
-    // not fail anything, it just decays the attention until the activations
-    // overflow a dozen layers in.
-    float rope_theta = 1.0e5f;
+    // Qwen3.5/3.6 carry the RoPE hyperparameters in a nested `rope_parameters`
+    // object rather than at the top level, so a reader that only knows the flat
+    // key finds nothing and silently keeps its default. Nothing fails: the
+    // rotated channels just come out wrong, and the error compounds layer over
+    // layer until the activations saturate. tests/mlx/loader/hf_config.cpp
+    // reads the nested form; this must agree with it.
+    float rope_theta = 1.0e7f;
+    float partial_rotary_factor = 0.25f;
     // Which storage schema this driver authors against. Parsed here because
     // this is already the driver's one read of `config.json`; the loader no
     // longer opens it (`loader/architecture.md` §10.4).
@@ -254,8 +256,25 @@ ModelFacts read_model_facts(const std::string& hf_path) {
             }
             return false;
         };
-        if (!f32_of(tc, "rope_theta", facts.rope_theta)) {
-            f32_of(j, "rope_theta", facts.rope_theta);
+        // `rope_parameters` first (the current schema), then the flat key.
+        const nlohmann::json* rp = nullptr;
+        for (const nlohmann::json* scope : {&tc, const_cast<const nlohmann::json*>(&j)}) {
+            if (scope->contains("rope_parameters") &&
+                (*scope)["rope_parameters"].is_object()) {
+                rp = &(*scope)["rope_parameters"];
+                break;
+            }
+        }
+        if (rp == nullptr || !f32_of(*rp, "rope_theta", facts.rope_theta)) {
+            if (!f32_of(tc, "rope_theta", facts.rope_theta)) {
+                f32_of(j, "rope_theta", facts.rope_theta);
+            }
+        }
+        if (rp == nullptr ||
+            !f32_of(*rp, "partial_rotary_factor", facts.partial_rotary_factor)) {
+            if (!f32_of(tc, "partial_rotary_factor", facts.partial_rotary_factor)) {
+                f32_of(j, "partial_rotary_factor", facts.partial_rotary_factor);
+            }
         }
         if (j.contains("architectures") && j["architectures"].is_array() &&
             !j["architectures"].empty()) {
@@ -1924,6 +1943,7 @@ class Context::Impl {
         setup_cfg.snapshot_dir = cfg_.model.hf_path;
         setup_cfg.model_type = facts_.model_type;
         setup_cfg.rope_theta = facts_.rope_theta;
+        setup_cfg.partial_rotary_factor = facts_.partial_rotary_factor;
         setup_cfg.storage_page_size = storage_page_size_;
         // Create + `setup()` the executor ON THE WORKER THREAD (Phase 3, §7):
         // MetalExecutor::setup builds the Metal device/heap/PSOs, which must

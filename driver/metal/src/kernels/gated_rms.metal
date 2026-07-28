@@ -6,9 +6,12 @@
 //   ms     = mean(out^2, axis=-1)           # over V_d
 //   outhat = out * rsqrt(ms + eps)
 //   normed = (outhat * gate_norm_w) * (z * sigmoid(z))
-// All math in float32 (MLX upcasts; gate_norm_w is stored F32). gate_norm_w is the
-// RAW weight (NO (1+w) — unlike the standard rms_norm). `out` (core_out) arrives
-// as beta's GdnCore output (T); we read it, recompute in float, store T.
+// All math in float32 (MLX upcasts), but gate_norm_w is read at the checkpoint's
+// own width: `linear_attn.norm.weight` ships bf16, and the loader stages weights
+// byte-for-byte, so a float* parameter here reads element 2i+1 in place of i (and
+// runs off the end of the tensor past V_d/2). gate_norm_w is the RAW weight (NO
+// (1+w) — unlike the standard rms_norm). `out` (core_out) arrives as beta's
+// GdnCore output (T); we read it, recompute in float, store T.
 // Gates against golden `gdn_core` (gated-RMSNorm is folded into that tag).
 //
 // Launch: dispatchThreads grid=(V_d, V_h, 1), tg=(V_d, 1, 1) -> one threadgroup
@@ -26,7 +29,7 @@ template <typename T>
 [[kernel]] void gated_rms(
     const device T* x        [[buffer(0)]],   // core_out [V_h, V_d]
     const device T* z        [[buffer(1)]],   // gate     [V_h, V_d]
-    const device float* w    [[buffer(2)]],   // gate_norm_w [V_d] (F32, raw)
+    const device T* w        [[buffer(2)]],   // gate_norm_w [V_d] (raw, act dtype)
     device T* out            [[buffer(3)]],   // [V_h, V_d]
     constant GatedRmsParams& p [[buffer(4)]],
     uint3 tgpos       [[threadgroup_position_in_grid]],
@@ -67,13 +70,13 @@ template <typename T>
   float y   = 1.0f / (1.0f + metal::exp(-metal::fabs(zr)));
   float sig = (zr < 0.0f) ? (1.0f - y) : y;       // MLX stable sigmoid
   float siluz = zr * sig;                          // silu(z) = z*sigmoid(z)
-  out[idx] = T((outhat * w[lid]) * siluz);
+  out[idx] = T((outhat * float(w[lid])) * siluz);
 }
 
 #define instantiate_gated_rms(name, itype)                        \
   template [[host_name("gated_rms_" #name)]]                      \
   [[kernel]] void gated_rms<itype>(                               \
-      const device itype*, const device itype*, const device float*, \
+      const device itype*, const device itype*, const device itype*, \
       device itype*, constant GatedRmsParams&, uint3, uint3, uint3, uint, uint);
 
 instantiate_gated_rms(float32, float)

@@ -1,6 +1,7 @@
 #include "forward.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <cstdlib>
 #include <filesystem>
@@ -20,6 +21,7 @@
 #include "decode_step.hpp"
 #include "decode_step_mb.hpp"
 #include "decode_timing.hpp"
+#include "golden_tap.hpp"
 #include "heap_bind.hpp"
 #include "heap_bind_metal.hpp"
 #include "heap_layout.hpp"
@@ -662,18 +664,21 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
         std::max<std::size_t>(1, load_plan.preferred_alignment()));
 
     // ── Build the decode DAG (shipped config: GdnPrep ON, no argmax dispatch — host samples). ──
+    // Under the accuracy gate every activation value gets its own pool buffer, so a
+    // tap's producer is still readable once the command buffer retires.
+    const bool taps = golden_taps_enabled();
     dag_ = build_decode_dag(g_, /*with_argmax=*/false, fuse_residual_, gdn_prep_);
     if (g_.paged_kv_enabled) {
         mb_dag_ = build_decode_dag_mb(g_, std::max(1, g_.max_tokens),
                                       kMultiBatchOrdinalBase, fuse_residual_, gdn_prep_);
-        mb_sched_ = build_scratch_schedule(mb_dag_, g_, /*no_recycle=*/false);
+        mb_sched_ = build_scratch_schedule(mb_dag_, g_, /*no_recycle=*/taps);
         prefill_dags_ = build_decode_prefill_dags(g_, std::max(1, g_.max_tokens),
                                                    fuse_residual_, gdn_prep_);
-        prefill_sched_ = build_scratch_schedule(prefill_dags_.front(), g_, /*no_recycle=*/false);
+        prefill_sched_ = build_scratch_schedule(prefill_dags_.front(), g_, /*no_recycle=*/taps);
     }
 
     // ── beta's scratch schedule (WAR/WAW coloring). e2e path always recycles. ──
-    sched_ = build_scratch_schedule(dag_, g_, /*no_recycle=*/false);
+    sched_ = build_scratch_schedule(dag_, g_, /*no_recycle=*/taps);
 
     size_t prefill_consts_budget = 0;
     for (const auto& dag : prefill_dags_) prefill_consts_budget += decode_consts_budget(dag);
@@ -689,7 +694,7 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
         consts_budget + (32u << 20);
     const size_t elastic_budget =
         plan_.kv_bytes + plan_.state_bytes + plan_.scratch_bytes +
-        plan_.kv_pool_bytes + scratch_pool_bytes;
+        plan_.kv_pool_bytes + (taps ? 0u : scratch_pool_bytes);
 
     ctx_ = RawMetalContext::create(heap_bytes, elastic_budget);
     if (!ctx_) {
@@ -711,8 +716,9 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
     // The GDN and KV allocations next door go through `alloc_zeroed`, which
     // always passes a commit size; this one was the exception.
     for (size_t i = 0; i < pool_.size(); ++i) {
-        pool_[i] = ctx_->create_elastic_buffer(
-            plan_.scratch_slot_bytes, plan_.scratch_slot_bytes);
+        pool_[i] = taps ? ctx_->create_standalone_buffer(plan_.scratch_slot_bytes)
+                        : ctx_->create_elastic_buffer(
+                              plan_.scratch_slot_bytes, plan_.scratch_slot_bytes);
         if (!pool_[i].valid()) {
             if (err) {
                 *err = "scratch slot " + std::to_string(i) + " (" +
@@ -1660,6 +1666,19 @@ bool MetalExecutor::Impl::run_prefill_step(
     });
     if (!timing.succeeded())
         return fail("Metal command timed out before its completion fence");
+    if (golden_taps_enabled()) {
+        // Every prefill token walks its own copy of the DAG, and bind_scratch lays
+        // token t's row at t * (widest * sizeof(bf16)) inside each pool slot — so one
+        // walk of dag[0]'s schedule reads every row of every tap.
+        dump_golden_taps(prefill_dags_.front(), prefill_sched_, pool_.data(),
+                         int(pool_.size()), g_, schedule.N,
+                         size_t(scratch_widest_elems(g_)) * 2u);
+        dump_golden_bf16("logits", logits_bf16(), schedule.N, g_.vocab,
+                         size_t(g_.vocab));
+        dump_golden_tokens(
+            static_cast<const std::uint32_t*>(b_.io[int(IoSlot::TokenId)].contents()),
+            schedule.N);
+    }
     for (uint32_t slot : schedule.slot_of_token) ++step_count_for(slot);
     return true;
 }
@@ -1898,6 +1917,13 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
                                                 kPagedMaxForwardTokens));
     geom.max_slots = std::max(geom.max_slots, geom.max_requests);
     geom.rope_theta = cfg.rope_theta;
+    // rope_dims = 2*floor(0.5 * partial_rotary_factor * head_dim), matching
+    // tests/mlx/model/qwen3_5.cpp. A factor >= 1 rotates the whole head.
+    geom.rotary_dims =
+        cfg.partial_rotary_factor < 1.0f
+            ? std::max(2, 2 * int(std::floor(0.5f * cfg.partial_rotary_factor *
+                                             float(geom.head_dim))))
+            : geom.head_dim;
     geom.kv_page_size = static_cast<int>(cfg.kv_page_size);
     geom.total_pages = static_cast<int>(cfg.total_pages);
     geom.paged_kv_enabled = cfg.total_pages > 0 && cfg.kv_page_size > 0 &&

@@ -1,9 +1,15 @@
 # oracle dump: pie::metal::pipeline::validate_singleton_plan
 # source of truth: compiler/codegen/src/metal/ (the C++ oracle this was dumped from is deleted)
-# emitter_version: 25
-# @runtime: bytes=34685 fnv1a64=0xac1c05ffc5f276a
+# emitter_version: 27
+# @runtime: bytes=35582 fnv1a64=0x83bd7cbda467df1
 # @grouped: bytes=970 fnv1a64=0xa8ab9e1ebf8714d9
 # cases: 456
+#   re-blessed again (emitter 27): `m1_reduce_argmax` no longer materializes one
+#   16-byte candidate per element into device `temporary` and tree-reduces it in
+#   passes -- `m1_argmax_combine` is a strict total order, so a fold gives the
+#   same answer -- and the bf16 logits intrinsic copies unrolled. Both loops run
+#   on the single thread that owns a lane, so at a 248320 vocab they were ~250ms
+#   per decode step against a ~4ms model forward. Only @runtime bytes moved.
 === beam_epilogue#0 none
 applicable: true
 ok: true

@@ -312,84 +312,67 @@ inline void m1_reduce_integer(
   }
 }
 
+// Sequential fold, not a staged tree. `m1_argmax_combine` is a strict total
+// order on (have, value desc, index asc), so its maximum is unique and every
+// evaluation order yields the same (value, index) -- unlike m1_reduce_float's
+// sum, whose tree shape is part of the numeric ABI. The tree here cost a
+// materialization of one 16-byte candidate per element into device `temporary`
+// plus a full read-modify-write per pass, all on the single thread that owns the
+// lane; on a 248k vocab that was ~257ms, roughly 60x the entire model forward.
 inline void m1_reduce_argmax(
     const device uchar* input,
     device uchar* output,
     device uchar* temporary,
     const M1ValueDesc in_desc) {
+  (void)temporary;
   device int* result = reinterpret_cast<device int*>(output);
   if (in_desc.dtype != 0) {
-    device M1IntArgmaxCandidate* work =
-        reinterpret_cast<device M1IntArgmaxCandidate*>(temporary);
     for (uint row = 0; row < in_desc.rows; ++row) {
       const uint base = row * in_desc.last;
+      M1IntArgmaxCandidate best = {0l, 0u, 0u};
       for (uint i = 0; i < in_desc.last; ++i) {
-        work[i] = {
-            m1_load_index(input, base + i, in_desc.dtype), i, 1u};
+        best = m1_int_argmax_combine(
+            best,
+            M1IntArgmaxCandidate{
+                m1_load_index(input, base + i, in_desc.dtype), i, 1u});
       }
-      uint count = in_desc.last;
-      if (count == 0) {
-        result[row] = 0;
-        continue;
-      }
-      while (count > 1) {
-        const uint chunks = (count + 31) / 32;
-        for (uint chunk = 0; chunk < chunks; ++chunk) {
-          M1IntArgmaxCandidate lanes[32];
-          for (uint lane = 0; lane < 32; ++lane) {
-            const uint index = chunk * 32 + lane;
-            lanes[lane] =
-                index < count
-                    ? work[index]
-                    : M1IntArgmaxCandidate{0l, 0u, 0u};
-          }
-          for (uint offset = 16; offset > 0; offset >>= 1)
-            for (uint lane = 0; lane < offset; ++lane)
-              lanes[lane] = m1_int_argmax_combine(
-                  lanes[lane], lanes[lane + offset]);
-          work[chunk] = lanes[0];
-        }
-        count = chunks;
-      }
-      result[row] = int(work[0].index);
+      result[row] = int(best.index);
     }
     return;
   }
 
   const device float* values =
       reinterpret_cast<const device float*>(input);
-  device M1ArgmaxCandidate* work =
-      reinterpret_cast<device M1ArgmaxCandidate*>(temporary);
   for (uint row = 0; row < in_desc.rows; ++row) {
     const uint base = row * in_desc.last;
-    for (uint i = 0; i < in_desc.last; ++i) {
+    // Four independent accumulators, folded at the end. Associativity makes the
+    // split free (see the note above), and it breaks the dependent chain that
+    // otherwise serialises one device load per iteration on this single thread.
+    M1ArgmaxCandidate best[4] = {
+        {-INFINITY, 0u, 0u, 0u}, {-INFINITY, 0u, 0u, 0u},
+        {-INFINITY, 0u, 0u, 0u}, {-INFINITY, 0u, 0u, 0u}};
+    uint i = 0;
+    for (; i + 4u <= in_desc.last; i += 4u) {
+      const float v0 = values[base + i + 0], v1 = values[base + i + 1];
+      const float v2 = values[base + i + 2], v3 = values[base + i + 3];
+      best[0] = m1_argmax_combine(
+          best[0], M1ArgmaxCandidate{v0, i + 0u, isnan(v0) ? 0u : 1u, 0u});
+      best[1] = m1_argmax_combine(
+          best[1], M1ArgmaxCandidate{v1, i + 1u, isnan(v1) ? 0u : 1u, 0u});
+      best[2] = m1_argmax_combine(
+          best[2], M1ArgmaxCandidate{v2, i + 2u, isnan(v2) ? 0u : 1u, 0u});
+      best[3] = m1_argmax_combine(
+          best[3], M1ArgmaxCandidate{v3, i + 3u, isnan(v3) ? 0u : 1u, 0u});
+    }
+    for (; i < in_desc.last; ++i) {
       const float value = values[base + i];
-      work[i] = {value, i, isnan(value) ? 0u : 1u, 0u};
+      best[0] = m1_argmax_combine(
+          best[0], M1ArgmaxCandidate{value, i, isnan(value) ? 0u : 1u, 0u});
     }
-    uint count = in_desc.last;
-    if (count == 0) {
-      result[row] = 0;
-      continue;
-    }
-    while (count > 1) {
-      const uint chunks = (count + 31) / 32;
-      for (uint chunk = 0; chunk < chunks; ++chunk) {
-        M1ArgmaxCandidate lanes[32];
-        for (uint lane = 0; lane < 32; ++lane) {
-          const uint index = chunk * 32 + lane;
-          lanes[lane] = index < count
-                            ? work[index]
-                            : M1ArgmaxCandidate{-INFINITY, 0u, 0u, 0u};
-        }
-        for (uint offset = 16; offset > 0; offset >>= 1)
-          for (uint lane = 0; lane < offset; ++lane)
-            lanes[lane] =
-                m1_argmax_combine(lanes[lane], lanes[lane + offset]);
-        work[chunk] = lanes[0];
-      }
-      count = chunks;
-    }
-    result[row] = int(work[0].index);
+    M1ArgmaxCandidate folded = m1_argmax_combine(
+        m1_argmax_combine(best[0], best[1]),
+        m1_argmax_combine(best[2], best[3]));
+    result[row] = int(folded.index);
   }
 }
 
@@ -474,7 +457,20 @@ inline void ptir_m1_execute(
       }
       return;
     }
-    for (uint i = 0; i < out0.len; ++i) m1_store_f(o0, i, float(logits[i]));
+    // Unrolled: the lane that owns this region is a single thread, so a scalar
+    // loop over a vocab-wide row is a chain of dependent device round trips.
+    // Eight independent loads per iteration let the memory pipeline overlap them.
+    device float* out_f = reinterpret_cast<device float*>(o0);
+    uint i = 0;
+    for (; i + 8u <= out0.len; i += 8u) {
+      const float v0 = float(logits[i + 0]), v1 = float(logits[i + 1]);
+      const float v2 = float(logits[i + 2]), v3 = float(logits[i + 3]);
+      const float v4 = float(logits[i + 4]), v5 = float(logits[i + 5]);
+      const float v6 = float(logits[i + 6]), v7 = float(logits[i + 7]);
+      out_f[i + 0] = v0; out_f[i + 1] = v1; out_f[i + 2] = v2; out_f[i + 3] = v3;
+      out_f[i + 4] = v4; out_f[i + 5] = v5; out_f[i + 6] = v6; out_f[i + 7] = v7;
+    }
+    for (; i < out0.len; ++i) out_f[i] = float(logits[i]);
     return;
   }
   if (p.tag == 0xA1) {  // explicit Metal semantic boundary: identity
