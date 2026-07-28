@@ -549,21 +549,61 @@ impl<'a> Reader<'a> {
         self.pos = end;
         Ok(s)
     }
+    /// Reads a table count that the following bytes must be able to back.
+    ///
+    /// Two independent bounds, because either alone is insufficient:
+    ///
+    /// * `minimum_record_bytes` ties the count to the bytes actually present,
+    ///   so a header claiming four billion records cannot make us allocate for
+    ///   four billion.
+    /// * `structural_maximum` is an absolute ceiling, because the first bound
+    ///   is only as strong as the record size. The op table has a one-byte
+    ///   minimum record, so without a ceiling a caller who controls the input
+    ///   gets one op per byte -- and the ops are then decoded, bound and
+    ///   compiled while a global lock is held. That is a denial of service
+    ///   with a text file.
+    ///
+    /// This is the same shape as the two `Reader`s in `pie-plan`; it used to be
+    /// the odd one out, taking neither a ceiling nor a checked multiply.
     fn bounded_count(
         &self,
         count: u32,
         minimum_record_bytes: usize,
+        structural_maximum: usize,
         table: &'static str,
     ) -> Result<usize, ContainerDecodeError> {
         let count = count as usize;
+        let minimum_bytes = count
+            .checked_mul(minimum_record_bytes)
+            .ok_or(ContainerDecodeError::CountTooLarge(table))?;
         if minimum_record_bytes == 0
-            || count > self.buf.len().saturating_sub(self.pos) / minimum_record_bytes
+            || count > structural_maximum
+            || minimum_bytes > self.buf.len().saturating_sub(self.pos)
         {
             return Err(ContainerDecodeError::CountTooLarge(table));
         }
         Ok(count)
     }
 }
+
+/// Decoder ceilings.
+///
+/// These are resource limits, not semantic ones: a container within them can
+/// still be rejected by `bind`, and the numbers are chosen to bound work and
+/// memory for input we did not write, not to express what a sampling pass is
+/// allowed to say. They sit far above anything a traced pass produces -- the
+/// whole test corpus is three orders of magnitude below `MAX_OPS`.
+///
+/// `MAX_STAGES` is different in kind: a container carries at most one program
+/// per stage, so `Stage::ALL.len()` is a structural fact rather than a budget.
+pub const MAX_STAGES: usize = Stage::ALL.len();
+/// Per-stage op ceiling. Planning is linear in this, so it bounds compile time
+/// as well as memory.
+pub const MAX_OPS: usize = 1 << 16;
+pub const MAX_CHANNELS: usize = 1 << 12;
+pub const MAX_NAMES: usize = 1 << 12;
+pub const MAX_PORTS: usize = 1 << 8;
+pub const MAX_EXTERNS: usize = MAX_CHANNELS;
 
 /// Parse container bytes back into the model. Does not validate (bind does).
 pub fn decode(bytes: &[u8]) -> Result<TraceContainer, ContainerDecodeError> {
@@ -586,14 +626,14 @@ pub fn decode(bytes: &[u8]) -> Result<TraceContainer, ContainerDecodeError> {
         0
     };
 
-    let mut names = Vec::with_capacity(r.bounded_count(n_names, 2, "name table")?);
+    let mut names = Vec::with_capacity(r.bounded_count(n_names, 2, MAX_NAMES, "name table")?);
     for _ in 0..n_names {
         let len = r.u16()? as usize;
         let bytes = r.take(len)?;
         names.push(String::from_utf8(bytes.to_vec()).map_err(|_| ContainerDecodeError::BadUtf8)?);
     }
 
-    let mut channels = Vec::with_capacity(r.bounded_count(n_channels, 8, "channel table")?);
+    let mut channels = Vec::with_capacity(r.bounded_count(n_channels, 8, MAX_CHANNELS, "channel table")?);
     for _ in 0..n_channels {
         let dt = r.u8()?;
         let dtype = ChanDType::from_tag(dt).ok_or(ContainerDecodeError::UnknownTag {
@@ -617,7 +657,7 @@ pub fn decode(bytes: &[u8]) -> Result<TraceContainer, ContainerDecodeError> {
         });
     }
 
-    let mut ports = Vec::with_capacity(r.bounded_count(n_ports, 4, "port table")?);
+    let mut ports = Vec::with_capacity(r.bounded_count(n_ports, 4, MAX_PORTS, "port table")?);
     for _ in 0..n_ports {
         let pt = r.u8()?;
         let port = Port::from_u8(pt).ok_or(ContainerDecodeError::UnknownTag {
@@ -651,7 +691,7 @@ pub fn decode(bytes: &[u8]) -> Result<TraceContainer, ContainerDecodeError> {
         ports.push(PortBinding { port, source });
     }
 
-    let mut stages = Vec::with_capacity(r.bounded_count(n_stages, 5, "stage table")?);
+    let mut stages = Vec::with_capacity(r.bounded_count(n_stages, 5, MAX_STAGES, "stage table")?);
     for _ in 0..n_stages {
         let st = r.u8()?;
         let stage = Stage::from_u8(st).ok_or(ContainerDecodeError::UnknownTag {
@@ -659,13 +699,13 @@ pub fn decode(bytes: &[u8]) -> Result<TraceContainer, ContainerDecodeError> {
             tag: st,
         })?;
         let n_ops = r.u32()?;
-        let mut ops = Vec::with_capacity(r.bounded_count(n_ops, 1, "operation table")?);
+        let mut ops = Vec::with_capacity(r.bounded_count(n_ops, 1, MAX_OPS, "operation table")?);
         for _ in 0..n_ops {
             ops.push(decode_op(&mut r)?);
         }
         stages.push(StageProgram { stage, ops });
     }
-    let mut externs = Vec::with_capacity(r.bounded_count(n_externs, 7, "extern table")?);
+    let mut externs = Vec::with_capacity(r.bounded_count(n_externs, 7, MAX_EXTERNS, "extern table")?);
     for _ in 0..n_externs {
         let name = r.u16()?;
         let d = r.u8()?;

@@ -75,7 +75,6 @@ pub(crate) struct Recorder {
     pub ops: Vec<Op>,
     /// Light per-value types (author ergonomics; echo's `infer` is authoritative).
     pub types: Vec<ValueType>,
-    pub next_id: u32,
     pub sinks: Vec<SinkCall>,
 }
 
@@ -86,22 +85,33 @@ impl Recorder {
             rows,
             ops: Vec::new(),
             types: Vec::new(),
-            next_id: 0,
             sinks: Vec::new(),
         }
     }
 
+    /// Records `op` and returns the id of its first result.
+    ///
+    /// The SSA id space has exactly one authority: `Op::result_count`. Every
+    /// consumer downstream -- `infer`, `stage_signature`, the container
+    /// encoder -- walks the op list advancing by it, so if the recorder
+    /// advanced by anything else the two numberings would separate and every
+    /// later id would name a different value. That is not a crash; it is a
+    /// structurally valid program that computes something else.
+    ///
+    /// So `result_tys` is checked against it rather than trusted, and with a
+    /// real assert: this used to be a `debug_assert_eq!`, which is compiled out
+    /// of the release builds that actually run guest traces.
     fn push(&mut self, op: Op, result_tys: &[ValueType]) -> u32 {
-        let base = self.next_id;
-        debug_assert_eq!(
-            op.result_count(),
-            result_tys.len() as u32,
-            "result arity mismatch: {op:?}"
+        let base = self.types.len() as u32;
+        assert_eq!(
+            op.result_count() as usize,
+            result_tys.len(),
+            "result arity mismatch for {op:?}: recording {} types against \
+             {} results would shift every later value id",
+            result_tys.len(),
+            op.result_count()
         );
-        for ty in result_tys {
-            self.types.push(*ty);
-        }
-        self.next_id += result_tys.len() as u32;
+        self.types.extend_from_slice(result_tys);
         self.ops.push(op);
         base
     }

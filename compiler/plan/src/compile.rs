@@ -257,64 +257,31 @@ pub struct RuntimeExtents {
     pub key_len: u32,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ScheduleBucket {
-    pub row_bucket: u8,
-    pub lane_bucket: u8,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[repr(u8)]
-pub enum BackendKind {
-    Cuda = 0,
-    Metal = 1,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[repr(u8)]
-pub enum SemanticMode {
-    Exact = 0,
-}
-
-/// Complete executable-cache identity. `device_arch` is the backend's stable
-/// architecture identifier (for example CUDA SM or Metal GPU family).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ExecutableCacheKey {
-    pub backend: BackendKind,
-    pub device_arch: u64,
-    pub compiler_version: u16,
-    pub stage_signature: u64,
-    pub schedule_bucket: ScheduleBucket,
-    pub semantic_mode: SemanticMode,
-}
-
-impl ExecutableCacheKey {
-    pub fn encode(self) -> [u8; 22] {
-        let mut bytes = [0u8; 22];
-        bytes[0] = self.backend as u8;
-        bytes[1..9].copy_from_slice(&self.device_arch.to_le_bytes());
-        bytes[9..11].copy_from_slice(&self.compiler_version.to_le_bytes());
-        bytes[11..19].copy_from_slice(&self.stage_signature.to_le_bytes());
-        bytes[19] = self.schedule_bucket.row_bucket;
-        bytes[20] = self.schedule_bucket.lane_bucket;
-        bytes[21] = self.semantic_mode as u8;
-        bytes
-    }
-}
-
-impl ScheduleBucket {
-    pub fn for_dispatch(lane_count: u32, extents: RuntimeExtents) -> Self {
-        let rows = extents.sampled_rows.max(extents.row_count).max(1);
-        Self {
-            row_bucket: power_of_two_bucket(rows),
-            lane_bucket: power_of_two_bucket(lane_count.max(1)),
-        }
-    }
-}
-
-fn power_of_two_bucket(value: u32) -> u8 {
-    (u32::BITS - value.saturating_sub(1).leading_zeros()) as u8
-}
+// `ExecutableCacheKey` used to live here: a struct of `{backend, device_arch,
+// compiler_version, stage_signature, schedule_bucket, semantic_mode}` with an
+// `encode() -> [u8; 22]`, described as "complete executable-cache identity".
+//
+// It was deleted because it was not one. Nothing called it -- not this crate,
+// not codegen, not the drivers -- and it did not describe the cache it claimed
+// to key. The CUDA driver builds its own key in
+// `driver/cuda/src/pipeline/generated/module_cache.hpp` (`stage_cache_key`),
+// and that key is a different shape in both directions: it adds
+// `PTIR_REGION_PLAN_VERSION`, `PTIR_LANE_TABLE_ABI_VERSION`, the generated
+// emitter version, the NVRTC major/minor, and the normalized op bytes
+// themselves; it carries neither `schedule_bucket` nor `semantic_mode`. The
+// two were never the same key, so there was no drift to repair -- only a
+// description of a cache nobody had built.
+//
+// Worth recording, because it is the reason this file no longer worries about
+// 64-bit signature collisions: the driver's key is the full material as a
+// `std::string` map key, compared byte for byte, and `pipeline::program`'s
+// registry likewise re-compares the container bytes on a hash hit and returns
+// `RegisterError::HashCollision`. The FNV-1a hash is an index into those
+// caches, never the identity.
+//
+// If a Rust-side key is ever wanted again, it has to be generated into the
+// driver's header the way the op table now is -- otherwise it is a comment
+// that compiles.
 
 /// Stable grouped-dispatch header. Address fields in the lane records are
 /// device virtual addresses represented as `u64` on both supported backends.
@@ -869,6 +836,13 @@ fn set_first_symbolic(ty: &mut SymbolicType, extent: SymbolicExtent) {
     }
 }
 
+/// The symbolic type of an intrinsic's result.
+///
+/// Written as an exhaustive match rather than a catch-all: adding an intrinsic
+/// should make this fail to compile, not silently fall through to the static
+/// type. The `Logits` arm is the only one that lifts a dimension to
+/// `SampledRows`, and getting that wrong for a new row-shaped intrinsic would
+/// pin its extent to whatever the tracing pass happened to see.
 fn symbolic_intrinsic_type(
     bound: &BoundTrace,
     intrinsic: IntrinsicId,
@@ -881,7 +855,16 @@ fn symbolic_intrinsic_type(
                 ty.dims[0] = Dimension::Symbolic(SymbolicExtent::SampledRows);
             }
         }
-        _ => {}
+        // `MtpLogits` and `MtpDrafts` are shaped by the draft count, not the
+        // sampled-row count; `Hidden`, `Query`, `ValueHead`, `AttnScore` and
+        // `Layer` are all statically shaped by the model profile.
+        IntrinsicId::MtpLogits
+        | IntrinsicId::MtpDrafts
+        | IntrinsicId::Hidden
+        | IntrinsicId::Query
+        | IntrinsicId::ValueHead
+        | IntrinsicId::AttnScore
+        | IntrinsicId::Layer => {}
     }
     ty
 }
@@ -3500,38 +3483,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn runtime_extents_do_not_change_signature() {
-        let bound = program(1, 1);
-        let stage = compile_stage(&bound, Stage::Epilogue).unwrap();
-        let signature = stage.signature.clone();
-        let first = ScheduleBucket::for_dispatch(
-            2,
-            RuntimeExtents {
-                kv_len: 8,
-                page_count: 1,
-                row_count: 1,
-                token_count: 1,
-                sampled_rows: 1,
-                query_len: 1,
-                key_len: 8,
-            },
-        );
-        let second = ScheduleBucket::for_dispatch(
-            8,
-            RuntimeExtents {
-                kv_len: 4096,
-                page_count: 64,
-                row_count: 8,
-                token_count: 32,
-                sampled_rows: 8,
-                query_len: 32,
-                key_len: 4096,
-            },
-        );
-        assert_ne!(first, second);
-        assert_eq!(stage.signature, signature);
-    }
+    // `runtime_extents_do_not_change_signature` used to sit here. It built two
+    // `ScheduleBucket`s, asserted they differed, and then asserted
+    // `stage.signature == stage.signature.clone()` -- with nothing in between
+    // that could have changed it. The property it was named for holds for a
+    // better reason: `compile_stage` does not take `RuntimeExtents` at all, so
+    // extents cannot reach the signature. That is enforced by the signature of
+    // the function, which a test cannot strengthen.
 
     #[test]
     fn plan_encoding_is_deterministic_and_self_describing() {
@@ -3568,25 +3526,6 @@ mod tests {
         assert_eq!(core::mem::size_of::<LaneTableHeader>(), 16);
         assert_eq!(core::mem::size_of::<LaneRecord>(), 96);
         assert_eq!(core::mem::size_of::<LaneChannelSlot>(), 32);
-        let key = ExecutableCacheKey {
-            backend: BackendKind::Cuda,
-            device_arch: 89,
-            compiler_version: COMPILER_VERSION,
-            stage_signature: 7,
-            schedule_bucket: ScheduleBucket {
-                row_bucket: 2,
-                lane_bucket: 3,
-            },
-            semantic_mode: SemanticMode::Exact,
-        };
-        assert_ne!(
-            key.encode(),
-            ExecutableCacheKey {
-                backend: BackendKind::Metal,
-                ..key
-            }
-            .encode()
-        );
     }
 }
 

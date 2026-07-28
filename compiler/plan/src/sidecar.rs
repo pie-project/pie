@@ -213,118 +213,27 @@ impl<'a> Reader<'a> {
 
 const MAX_SIDECAR_STAGES: usize = 4;
 
-fn preflight_bound(bytes: &[u8]) -> Result<(), SidecarDecodeError> {
-    use SidecarDecodeError::*;
-
-    let mut reader = Reader { bytes, offset: 0 };
-    if reader.take(4)? != PTIB_MAGIC {
-        return Err(BadMagic);
-    }
-    let version = reader.u16()?;
-    if version != PTIB_VERSION && version != PTIB_VERSION_LEGACY {
-        return Err(UnsupportedVersion(version));
-    }
-    reader.u16()?;
-    reader.u64()?;
-
-    let channels = reader.u32()?;
-    let channel_count = reader.bounded_count(channels, 1, usize::MAX, "sidecar channel table")?;
-    for _ in 0..channel_count {
-        let tag = reader.u8()?;
-        if tag > 2 {
-            return Err(UnknownTag {
-                what: "channel class",
-                tag,
-            });
-        }
-    }
-
-    let readiness = reader.u32()?;
-    let readiness_count =
-        reader.bounded_count(readiness, 6, channel_count, "sidecar readiness table")?;
-    for _ in 0..readiness_count {
-        reader.u32()?;
-        let phase = reader.u8()?;
-        if Stage::from_u8(phase).is_none() && phase != PHASE_DESCRIPTOR_TAG {
-            return Err(UnknownTag {
-                what: "readiness phase",
-                tag: phase,
-            });
-        }
-        let direction = reader.u8()?;
-        if direction > 1 {
-            return Err(UnknownTag {
-                what: "direction",
-                tag: direction,
-            });
-        }
-    }
-
-    let stages = reader.u32()?;
-    let stage_count = reader.bounded_count(stages, 5, MAX_SIDECAR_STAGES, "sidecar stage table")?;
-    for _ in 0..stage_count {
-        let stage = reader.u8()?;
-        if Stage::from_u8(stage).is_none() {
-            return Err(UnknownTag {
-                what: "stage",
-                tag: stage,
-            });
-        }
-        let values = reader.u32()?;
-        let value_count = reader.bounded_count(values, 2, usize::MAX, "sidecar value table")?;
-        for _ in 0..value_count {
-            let dtype = reader.u8()?;
-            if dtype > DType::Bool as u8 {
-                return Err(UnknownTag {
-                    what: "dtype",
-                    tag: dtype,
-                });
-            }
-            let rank = reader.u8()?;
-            if rank as usize > MAX_RANK {
-                return Err(RankTooLarge(rank));
-            }
-            let rank =
-                reader.bounded_count(rank as u32, 4, MAX_RANK, "sidecar shape dimensions")?;
-            let mut elements = 1u64;
-            for _ in 0..rank {
-                let dimension = reader.u32()?;
-                if dimension == 0 {
-                    return Err(InvalidShape);
-                }
-                elements = elements.checked_mul(dimension as u64).ok_or(InvalidShape)?;
-            }
-        }
-    }
-
-    if version == PTIB_VERSION {
-        let plans = reader.u32()?;
-        let plan_count =
-            reader.bounded_count(plans, 5, MAX_SIDECAR_STAGES, "sidecar plan table")?;
-        for _ in 0..plan_count {
-            let stage = reader.u8()?;
-            if Stage::from_u8(stage).is_none() {
-                return Err(UnknownTag {
-                    what: "plan stage",
-                    tag: stage,
-                });
-            }
-            let raw_length = reader.u32()?;
-            let length = reader.length(raw_length, "sidecar plan payload")?;
-            reader.take(length)?;
-        }
-    }
-
-    if reader.offset != bytes.len() {
-        return Err(TrailingBytes);
-    }
-    Ok(())
-}
+// `preflight_bound` used to sit here: a second, hand-written parser over the
+// same bytes, run to completion before `decode_bound` parsed them again.
+//
+// Two parsers for one format have to agree, and these had already stopped.
+// Every check preflight made, decode also made -- tags, ranks, trailing bytes,
+// zero and overflowing dimensions (the last two via `Shape::new`, which
+// rejects both) -- with exactly one exception: the readiness *phase* tag.
+// Decode read that byte and pushed it unvalidated, so the only thing standing
+// between a malformed phase and a `BoundSidecar` was a separate function that
+// happened to be called first.
+//
+// That is the whole argument against the arrangement. The asymmetry was
+// invisible precisely because the two passes were far apart and looked alike,
+// and it will reappear the moment someone edits one and not the other. So the
+// check moved into `decode_bound` and the second parser is gone: the format is
+// now read in one place, and "validated" and "decoded" cannot drift because
+// they are the same walk.
 
 pub fn decode_bound(bytes: &[u8]) -> Result<BoundSidecar, SidecarDecodeError> {
     use SidecarDecodeError::*;
 
-    preflight_bound(bytes)?;
     let mut r = Reader { bytes, offset: 0 };
     if r.take(4)? != PTIB_MAGIC {
         return Err(BadMagic);
@@ -357,6 +266,12 @@ pub fn decode_bound(bytes: &[u8]) -> Result<BoundSidecar, SidecarDecodeError> {
     for _ in 0..n_rd {
         let chan = r.u32()?;
         let phase = r.u8()?;
+        if Stage::from_u8(phase).is_none() && phase != PHASE_DESCRIPTOR_TAG {
+            return Err(UnknownTag {
+                what: "readiness phase",
+                tag: phase,
+            });
+        }
         let dir = match r.u8()? {
             0 => Direction::NeedsFull,
             1 => Direction::NeedsEmpty,
@@ -495,6 +410,69 @@ mod tests {
                 .iter()
                 .map(|e| (e.chan, e.phase.tag(), e.dir))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    /// The one check `decode_bound` did not make for itself.
+    ///
+    /// Until the preflight pass was folded in, this byte was read and pushed
+    /// unvalidated, and the format was only safe because a second parser had
+    /// already walked it. If someone ever splits the walk in two again, this
+    /// fails.
+    #[test]
+    fn decode_rejects_an_unknown_readiness_phase() {
+        let c = TraceContainer {
+            names: vec![],
+            channels: vec![
+                ChannelDecl {
+                    shape: Shape::vector(1),
+                    dtype: ChanDType::Concrete(DType::U32),
+                    capacity: 1,
+                    host_role: HostRole::None,
+                    seeded: true,
+                },
+                ChannelDecl {
+                    shape: Shape::vector(1),
+                    dtype: ChanDType::Concrete(DType::U32),
+                    capacity: 1,
+                    host_role: HostRole::Reader,
+                    seeded: false,
+                },
+            ],
+            ports: vec![],
+            stages: vec![StageProgram {
+                stage: Stage::Epilogue,
+                ops: vec![
+                    Op::ChanRead(0),
+                    Op::ChanPut { chan: 1, value: 0 },
+                ],
+            }],
+            externs: alloc::vec::Vec::new(),
+        };
+        let b = bind(c, ModelProfile::dummy()).unwrap();
+        let bytes = encode_bound(&b);
+        decode_bound(&bytes).expect("the unmodified sidecar decodes");
+
+        // magic(4) version(2) flags(2) hash(8) channel-count(4) + two class
+        // bytes, then readiness-count(4), then the first entry's chan(4);
+        // the phase byte follows.
+        let phase_offset = 4 + 2 + 2 + 8 + 4 + 2 + 4 + 4;
+        assert!(
+            !b.readiness.is_empty(),
+            "this fixture must produce a readiness entry"
+        );
+        let mut corrupted = bytes.clone();
+        corrupted[phase_offset] = 0x7E;
+        assert!(
+            matches!(
+                decode_bound(&corrupted),
+                Err(SidecarDecodeError::UnknownTag {
+                    what: "readiness phase",
+                    tag: 0x7E,
+                })
+            ),
+            "decode accepted an unknown readiness phase: {:?}",
+            decode_bound(&corrupted)
         );
     }
 }
