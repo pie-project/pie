@@ -2630,6 +2630,9 @@ class DeviceBatch:
         self.configs = grammar.max_configs
         self.graph: torch.cuda.CUDAGraph | None = None
         self.advance_graph: torch.cuda.CUDAGraph | None = None
+        # A whole draft walk as one recording. See `capture_draft`.
+        self.draft_graph: torch.cuda.CUDAGraph | None = None
+        self.draft_length = 0
         # Which shape of the pool the graphs were recorded against. Admitting a
         # grammar into spare capacity leaves this alone, but one that makes an
         # array grow moves it to a new address, and a graph holds the address it
@@ -3247,12 +3250,88 @@ class DeviceBatch:
             self._fill()
         self.recorded = self.grammar.revision
 
+    def capture_draft(self, length: int) -> torch.Tensor:
+        """Record a whole draft walk - every position's mask - as one graph.
+
+        A draft of `k` tokens was `k` fills and `k` advances, which is `2k`
+        graph replays and a rollback, and linear in `k` in the one cost this
+        design exists to remove. XGrammar's `traverse_draft_tree` walks the
+        whole tree in one call and is flat in `k`, and that is the comparison
+        this loses at `k = 4` and beyond.
+
+        The walk is the same work either way; what is not the same is issuing
+        it. Here it is one recording: the state is saved, every position is
+        advanced and filled into its own row, and the state is put back - all
+        of it device-side, so the parse is where it started and nothing came to
+        the host. Replaying it costs one launch whatever `k` is.
+
+        Returns the buffer the masks land in, shaped (length, batch, words).
+        """
+        self.draft_length = length
+        self.draft_tokens = torch.zeros(
+            (length, self.batch), dtype=torch.int32, device="cuda"
+        )
+        self.draft_mask = torch.zeros(
+            (length, self.batch, self.grammar.mask_words),
+            dtype=torch.int32,
+            device="cuda",
+        )
+        live = (
+            self.lexer_state,
+            self.stack,
+            self.depth,
+            self.config_count,
+            self.widest,
+        )
+        # A copy of the parse to come back to. Nothing to do with the rollback
+        # ring: a draft walk always returns to exactly where it began, so it
+        # needs one slot and no arithmetic, and it stays capturable.
+        self._draft_saved = tuple(item.clone() for item in live)
+
+        def walk() -> None:
+            for saved, item in zip(self._draft_saved, live):
+                saved.copy_(item)
+            for position in range(length):
+                self.token = self.draft_tokens[position]
+                self._advance()
+                self.mask = self.draft_mask[position]
+                self._fill()
+            for saved, item in zip(self._draft_saved, live):
+                item.copy_(saved)
+
+        held_token, held_mask = self.token, self.mask
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                walk()
+        torch.cuda.current_stream().wait_stream(stream)
+
+        self.draft_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.draft_graph):
+            walk()
+        self.token, self.mask = held_token, held_mask
+        self.recorded = self.grammar.revision
+        return self.draft_mask
+
+    def walk_draft(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Every position of a draft, in one replay. Leaves the parse alone.
+
+        `tokens` is (length, batch) on the device and is never read on the host.
+        """
+        self.draft_tokens.copy_(tokens.to(torch.int32).reshape(self.draft_length, -1))
+        if self.draft_graph is not None and self.recorded == self.grammar.revision:
+            self.draft_graph.replay()
+            return self.draft_mask
+        raise RuntimeError("call capture_draft first")
+
     def fill_mask(self) -> torch.Tensor:
         if self.graph is not None and self.recorded != self.grammar.revision:
             # The pool moved under us. Re-record rather than replay a graph that
             # points at where the tables used to be.
             self.graph = None
             self.advance_graph = None
+            self.draft_graph = None
         if self.graph is not None:
             self.graph.replay()
             return self.mask

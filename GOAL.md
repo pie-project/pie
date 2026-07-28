@@ -170,9 +170,22 @@ fill and an advance per position and the rollback at the end:
 | 128 | 1.75x | 0.55x | 0.33x |
 | 512 | **4.94x** | 1.06x | 0.74x |
 
-We are far better where there is no draft to walk and lose as the draft grows,
-because every position is its own fill and advance while theirs is one walk. The
-crossover is near k=4 at batch 512 and below it at batch 128. Being flat in `k`
+**The whole walk is one launch now (2026-07-28).** It was `k` fills and `k`
+advances - `2k` graph replays - which is linear in `k` in exactly the cost this
+design exists to remove. `capture_draft` records the lot: the state is saved,
+every position is advanced and filled into its own row, and the state is put
+back, all device-side, so the parse ends where it began and nothing reaches the
+host. Verified against the reference matcher, 276 draft masks over eight
+schemas, plus three tests.
+
+| batch | k=1 | k=4 | k=8 |
+|---:|---:|---:|---:|
+| 128 | 1.41x | 0.75x | 0.46x |
+| 512 | 3.15x | **2.34x** | **1.26x** |
+
+At batch 512 we now win at every draft length, where k=8 was 0.74x. At 128 we
+still lose past k=1, and the reason has changed: the launches are gone and what
+is left is the work, `k` times a fill and an advance. Being flat in `k`
 would need the draft tree walked on the device in one launch; that is a real
 possibility and not what this does.
 

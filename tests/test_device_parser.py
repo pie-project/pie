@@ -637,6 +637,86 @@ class GrammarPool(unittest.TestCase):
         )
 
 
+class DraftWalk(unittest.TestCase):
+    """A speculative draft, walked in one launch.
+
+    A draft of `k` tokens was `k` fills and `k` advances, which is `2k` graph
+    replays - linear in `k` in the one cost this design exists to remove. The
+    whole walk is one recording now, and what has to hold is that it produces
+    the same masks and puts the parse back where it found it.
+    """
+
+    def setUp(self):
+        _requirements()
+        from gpu_lr1.device_parser import DeviceGrammar
+
+        self.compiler = gpugrammar.Compiler(VOCABULARY)
+        self.compiled = self.compiler.compile_json_schema(
+            json.dumps(
+                {
+                    "type": "object",
+                    "properties": {"name": {"type": "string"}},
+                    "required": ["name"],
+                }
+            )
+        )
+        self.pool = DeviceGrammar(self.compiled)
+
+    def _draft(self, pieces, batch):
+        return torch.tensor(
+            [[VOCABULARY.index(piece)] * batch for piece in pieces],
+            dtype=torch.int32,
+            device="cuda",
+        )
+
+    def test_every_position_agrees_with_the_matcher(self):
+        batch = 4
+        pieces = [b'{"', b"name", b'":', b'"']
+        device = self.pool.new_batch(batch)
+        matcher = self.compiled.matcher(0)
+        device.set_batch_configurations(
+            {row: matcher.configurations() for row in range(batch)}
+        )
+        device.capture_draft(len(pieces))
+        masks = device.walk_draft(self._draft(pieces, batch)).cpu()
+
+        reference = torch.zeros(self.pool.mask_words, dtype=torch.int32)
+        for position, piece in enumerate(pieces):
+            self.assertTrue(matcher.accept_token(VOCABULARY.index(piece)))
+            reference.zero_()
+            matcher.fill_bitmask(reference)
+            for row in range(batch):
+                self.assertTrue(
+                    torch.equal(masks[position, row], reference),
+                    f"position {position} row {row}",
+                )
+
+    def test_the_walk_leaves_the_parse_where_it_found_it(self):
+        device = self.pool.new_batch(2)
+        matcher = self.compiled.matcher(0)
+        device.set_batch_configurations({row: matcher.configurations() for row in (0, 1)})
+        before = [sorted(device.configurations(row)) for row in (0, 1)]
+        device.capture_draft(3)
+        device.walk_draft(self._draft([b'{"', b"name", b'":'], 2))
+        after = [sorted(device.configurations(row)) for row in (0, 1)]
+        self.assertEqual(before, after)
+
+    def test_a_draft_the_grammar_refuses_does_not_poison_the_rest(self):
+        """A rejected position must not leave the sequence broken."""
+        batch = 2
+        device = self.pool.new_batch(batch)
+        matcher = self.compiled.matcher(0)
+        device.set_batch_configurations(
+            {row: matcher.configurations() for row in range(batch)}
+        )
+        device.capture_draft(2)
+        device.walk_draft(self._draft([b"]", b"]"], batch))
+        # The parse is back at the start, so an ordinary fill still agrees.
+        reference = torch.zeros(self.pool.mask_words, dtype=torch.int32)
+        matcher.fill_bitmask(reference)
+        self.assertTrue(torch.equal(device.fill_mask()[0].cpu(), reference))
+
+
 class ArenaPaging(unittest.TestCase):
     """Grammars come and go faster than a graph can be re-recorded.
 
