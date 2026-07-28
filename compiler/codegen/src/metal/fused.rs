@@ -97,9 +97,13 @@ fn slots_for_aliased(
 }
 
 /// Threads a grouped region's threadgroup gets per lane. The emitted kernel
-/// sizes its threadgroup reduction buffer to this, and `m1_runtime.cpp` must
-/// launch exactly this many.
-pub const METAL_M3_REGION_THREADS: u32 = 256;
+/// sizes its threadgroup reduction buffer to this; the driver launches the
+/// narrower of it and the pipeline's own maxTotalThreadsPerThreadgroup.
+///
+/// 512 measured against 256 with the model DAG truncated away, interleaved to
+/// cancel thermal drift: 0.951ms vs 1.557ms for the sampler region, reproduced
+/// twice. 1024 is not better (0.963ms) and costs twice the threadgroup memory.
+pub const METAL_M3_REGION_THREADS: u32 = 512;
 
 /// Device+threadgroup barrier between two ops of a region.
 const BARRIER: &str =
