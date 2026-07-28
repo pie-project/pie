@@ -108,6 +108,8 @@ PIE_MARLIN_SHAPE(bfloat16, fe2m1f, bfloat16)  // MXFP4 (gpt_oss)
 // new MoE arch through CutlassMoeFCRunner requires adding its activation here,
 // or it throws at run time.
 PIE_MOE_ACTIVATION(Relu2)  // nemotron_h
+PIE_MOE_ACTIVATION(Swiglu)  // glm5 / kimi / deepseek_v4 routed experts (fc1)
+PIE_MOE_ACTIVATION(Identity)  // second grouped GEMM (fc2) of every MoE arch
 
 // ---- all-reduce: fused residual+RMSNorm epilogue --------------------------
 // flashinfer's allreduce_fusion_op() turns four runtime values into one

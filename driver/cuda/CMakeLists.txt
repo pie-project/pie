@@ -604,6 +604,29 @@ else()
     "FlashInfer fused MoE launchers omitted: no Silu/Gelu-class activation in kernels.def")
 endif()
 
+# Blackwell TMA warp-specialized grouped GEMMs. Without
+# COMPILE_BLACKWELL_TMA_GROUPED_GEMMS the launcher bodies collapse to a
+# "recompile with 100-real" throw, so on sm100 the CutlassMoeFCRunner has no
+# usable config at all and MoE falls back to cuBLAS batched GEMM over
+# worst-case-padded expert blocks. Requires the `a` architecture target for TMA
+# and tcgen05 -- see cmake/DetectCudaArchitecture.cmake.
+#
+# These come from third_party/flashinfer_generated/regenerate_sm100.sh, and
+# unlike the sm80 set they are needed whenever the runner is reachable at all,
+# independent of which activations kernels.def enables.
+if(PIE_HAS_SM100)
+  set(PIE_FLASHINFER_MOE_SM100_SOURCES)
+  foreach(_pie_moe_group RANGE 0 23)
+    list(APPEND PIE_FLASHINFER_MOE_SM100_SOURCES
+      "third_party/flashinfer_generated/gemm_grouped/100/cutlass_kernel_file_gemm_grouped_sm100_group${_pie_moe_group}.generated.cu")
+  endforeach()
+  list(LENGTH PIE_FLASHINFER_MOE_SM100_SOURCES PIE_FLASHINFER_MOE_SM100_COUNT)
+  message(STATUS
+    "Enabling Blackwell TMA warp-specialized MoE grouped GEMMs (${PIE_FLASHINFER_MOE_SM100_COUNT} generated units)")
+else()
+  set(PIE_FLASHINFER_MOE_SM100_SOURCES)
+endif()
+
 # FlashInfer/TensorRT-LLM CUTLASS MoE runner. Kept as a separate OBJECT
 # library because its dependency slice (nv_internal/) is large and should
 # stay a clear opt-in boundary for Nemotron experimentation.
@@ -623,7 +646,8 @@ add_library(pie_flashinfer_cutlass_moe OBJECT
   third_party/flashinfer_moe/moe_gemm_kernels_bf16_bf16.cu
   ${flashinfer_SOURCE_DIR}/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.cu
   ${flashinfer_SOURCE_DIR}/csrc/nv_internal/tensorrt_llm/kernels/lora/lora.cpp
-  ${PIE_FLASHINFER_MOE_GENERATED_SOURCES})
+  ${PIE_FLASHINFER_MOE_GENERATED_SOURCES}
+  ${PIE_FLASHINFER_MOE_SM100_SOURCES})
 target_include_directories(pie_flashinfer_cutlass_moe PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party/flashinfer_moe
@@ -646,7 +670,8 @@ target_include_directories(pie_flashinfer_cutlass_moe PRIVATE
 target_compile_definitions(pie_flashinfer_cutlass_moe PRIVATE
   ENABLE_BF16=1
   ENABLE_FP8=1
-  USING_OSS_CUTLASS_MOE_GEMM=1)
+  USING_OSS_CUTLASS_MOE_GEMM=1
+  $<$<BOOL:${PIE_HAS_SM100}>:COMPILE_BLACKWELL_TMA_GROUPED_GEMMS=1>)
 target_compile_options(pie_flashinfer_cutlass_moe PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda --expt-relaxed-constexpr>)
 set_target_properties(pie_flashinfer_cutlass_moe PROPERTIES

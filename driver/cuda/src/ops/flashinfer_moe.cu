@@ -60,9 +60,9 @@ bool log_enabled() {
     return env_truthy(std::getenv("PIE_NEMOTRON_FLASHINFER_MOE_LOG"));
 }
 
-bool use_supported_tactic_selection() {
+bool use_first_tactic_selection() {
     const char* v = std::getenv("PIE_NEMOTRON_FLASHINFER_MOE_SELECT");
-    return v != nullptr && std::strcmp(v, "supported") == 0;
+    return v != nullptr && std::strcmp(v, "first") == 0;
 }
 
 bool use_raw_tactic_selection() {
@@ -211,18 +211,35 @@ Runner& get_runner() {
                     gemm2,
                     env_index("PIE_NEMOTRON_FLASHINFER_MOE_GEMM2_INDEX"),
                     "GEMM2");
-            } else if (use_supported_tactic_selection()) {
+            } else if (use_first_tactic_selection()) {
+                best_gemm1 = select_first_profile(gemm1, "GEMM1");
+                best_gemm2 = select_first_profile(gemm2, "GEMM2");
+            } else {
+                // Default: first tactic the runner reports as occupancy-viable.
+                //
+                // For GEMM2 prefer the FINALIZE epilogue: it folds the topk
+                // weighted reduction (and the unpermute) into the GEMM epilogue
+                // instead of running a separate finalize pass. Measured at GLM
+                // shapes (M=128, H=6144, I=2048, E=8, topk=8) this is 147.0 us
+                // vs 174.6 us for the unfused epilogue -- the single largest
+                // knob on this path. Fall back to any supported tactic if the
+                // fused epilogue is unavailable for this problem.
                 best_gemm1 = first_supported(
                     *runner, gemm1, std::nullopt,
                     env_index("PIE_NEMOTRON_FLASHINFER_MOE_GEMM1_INDEX"),
                     "GEMM1");
+                const auto gemm2_fusion = requested_gemm2_fusion();
+                const int gemm2_index =
+                    env_index("PIE_NEMOTRON_FLASHINFER_MOE_GEMM2_INDEX");
                 best_gemm2 = first_supported(
-                    *runner, gemm2, requested_gemm2_fusion(),
-                    env_index("PIE_NEMOTRON_FLASHINFER_MOE_GEMM2_INDEX"),
-                    "GEMM2");
-            } else {
-                best_gemm1 = select_first_profile(gemm1, "GEMM1");
-                best_gemm2 = select_first_profile(gemm2, "GEMM2");
+                    *runner, gemm2,
+                    gemm2_fusion.value_or(
+                        ce::CutlassGemmConfig::EpilogueFusionType::FINALIZE),
+                    gemm2_index, "GEMM2");
+                if (!best_gemm2 && !gemm2_fusion) {
+                    best_gemm2 = first_supported(
+                        *runner, gemm2, std::nullopt, gemm2_index, "GEMM2");
+                }
             }
             if (!best_gemm1 || !best_gemm2) {
                 throw std::runtime_error(
@@ -245,6 +262,14 @@ Runner& get_runner() {
     return *s.runner;
 }
 
+ck::ActivationType to_cutlass_activation(MoeActivation activation) {
+    switch (activation) {
+        case MoeActivation::Swiglu: return ck::ActivationType::Swiglu;
+        case MoeActivation::Relu2: break;
+    }
+    return ck::ActivationType::Relu2;
+}
+
 ck::MOEParallelismConfig parallelism_config(int tp_size, int tp_rank) {
     return ck::MOEParallelismConfig(std::max(1, tp_size), tp_rank, 1, 0);
 }
@@ -258,6 +283,7 @@ bool flashinfer_cutlass_moe_enabled() {
 }
 
 std::size_t flashinfer_cutlass_moe_workspace_bytes(
+    MoeActivation activation,
     int num_rows,
     int hidden_size,
     int inter_size,
@@ -276,7 +302,7 @@ std::size_t flashinfer_cutlass_moe_workspace_bytes(
         inter_size,
         num_experts,
         experts_per_token,
-        ck::ActivationType::Relu2,
+        to_cutlass_activation(activation),
         parallelism_config(tp_size, tp_rank),
         false,
         false,
@@ -285,7 +311,8 @@ std::size_t flashinfer_cutlass_moe_workspace_bytes(
         false);
 }
 
-bool flashinfer_cutlass_moe_bf16_relu2(
+bool flashinfer_cutlass_moe_bf16(
+    MoeActivation activation,
     const std::uint16_t* input,
     const std::int32_t* token_selected_experts,
     const float* token_final_scales,
@@ -303,7 +330,6 @@ bool flashinfer_cutlass_moe_bf16_relu2(
     int tp_size,
     int tp_rank,
     cudaStream_t stream) {
-    if (!flashinfer_cutlass_moe_enabled()) return false;
     if (input == nullptr || token_selected_experts == nullptr ||
         token_final_scales == nullptr || fc1_expert_weights == nullptr ||
         fc2_expert_weights == nullptr || output == nullptr ||
@@ -311,8 +337,8 @@ bool flashinfer_cutlass_moe_bf16_relu2(
         return false;
     }
     const std::size_t needed = flashinfer_cutlass_moe_workspace_bytes(
-        num_rows, hidden_size, inter_size, num_experts, experts_per_token,
-        tp_size, tp_rank);
+        activation, num_rows, hidden_size, inter_size, num_experts,
+        experts_per_token, tp_size, tp_rank);
     if (needed == 0 || workspace_bytes < needed) return false;
 
     Runner& runner = get_runner();
@@ -327,7 +353,7 @@ bool flashinfer_cutlass_moe_bf16_relu2(
         token_final_scales,
         fc1_expert_weights,
         nullptr,
-        ck::ActivationParams(ck::ActivationType::Relu2),
+        ck::ActivationParams(to_cutlass_activation(activation)),
         fc2_expert_weights,
         nullptr,
         quant_params,
