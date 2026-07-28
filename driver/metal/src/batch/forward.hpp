@@ -164,7 +164,7 @@ bool validate_request_local_positions(
 // idle memory.  The paged command path uses these four slots concurrently;
 // caps report exactly this value — never a larger, aspirational one — via
 // `MetalExecutor::rs_slots()`.
-inline constexpr std::uint32_t kPhase1bRsSlots = 4;
+inline constexpr std::uint32_t kPhase1bRsSlots = 16;
 inline constexpr std::uint32_t kPagedMaxForwardRequests = kPhase1bRsSlots;
 // Paged prompts run one correct N=1 GDN recurrence DAG per token inside one
 // command buffer.  This bounds IO/scratch/logits allocation independently of

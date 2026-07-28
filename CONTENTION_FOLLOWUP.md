@@ -3292,3 +3292,133 @@ The tax is ~4.8 % of wall at every concurrency (§20.13). It is only *visible* a
 256 and above because pie's per-step advantage over vLLM decays with batch width
 (+7.1 % at 128, +1.7 % at 256, +1.1 % at 512), so a flat tax flips the sign
 exactly where the measured ratio flips.
+
+## §20.15 — (A) profiled: the forward submit spends 77% of its host time
+## symbolically re-evaluating the trace, and process exit is 100% one
+## mailbox round trip
+
+§20.14 closed with two remaining shapes: (a) make per-process bring-up and
+teardown substantially cheaper, or (b) a partial-fleet seal quorum. This is
+(a), profiled end to end with per-phase probes (`PIE_FIRE_TIMING=waves`,
+conc 512, N=4096, mt 128, Qwen3-0.6B / 28 layers).
+
+### EXIT: it is entirely `notify_pipeline_close`
+
+| component of the guest exit | p50 | p90 | sum over run |
+| --------------------------- | ---:| ---:| ------------:|
+| `notify_pipeline_close` (scheduler round trip) | **25.40 ms** | **40.20 ms** | 101.45 s |
+| `drain_settled`                                | 0.01 ms | 0.01 ms | 0.03 s |
+| close -> `guest_main_returned` (guest epilogue) | 0.26 ms | 0.40 ms | 1.13 s |
+
+The ~45 ms guest-exit spread §20.14 measured is 100% one call. Chain:
+`HostPipeline::close` -> `pipeline_close_inner` -> `notify_pipeline_close`
+-> `notify_pipeline_leave_and_wait(pid, LeaveKind::Close)` (worker.rs:132).
+That posts **one `SchedulerItem::PipelineLeave` plus one oneshot per process
+per driver** and awaits every ack.
+
+The handler (worker.rs:2650) replies *immediately* — it does no waiting of
+its own. So the 25 ms is **pure queueing**: 512 items land at once and each
+waits roughly one worker pass. This is exactly §20.14's un-implemented
+"Step 2" (batch `PipelineLeave` into one item per driver carrying a pid set,
+mirroring the channel-close batching already in `teardown.rs`); its value is
+now measured at 25-40 ms per turnover rather than the +0.5% first guessed.
+NOT YET FIXED.
+
+### BRING-UP: nothing is waiting; it is all CPU inside `submit`
+
+| component | value |
+| --------- | ----- |
+| `residency_gate` (admission -> first fire) | 0 us |
+| `acquire_grant` (planner KV/RS) | **mean 0 us, max 24 us — hypothesis rejected** |
+| `submit_frame`, steady-state | 136-157 us per submit |
+| `submit_frame`, turnover | 169-190 us per submit |
+| submits per wave | steady 441, turnover **1565** |
+
+`ensure_execution_admitted` lives *inside* `forward::submit`, so a staged
+process runs its whole guest prologue and parks on the admission semaphore
+in its first submit; "admitted -> first fire" is only the gate plus one
+submit. Neither is a wait. The turnover is expensive because it pays 3x the
+submits at once with no previous wave to hide behind (steady-state waves
+overlap: inter-wave gap p50 = -24.9 ms).
+
+### The submit decomposed (conc 512, steady waves, per submit)
+
+| phase | us | % of submit |
+| ----- | --:| -----------:|
+| validate + wire channels + geometry/mask build | 11.5 | 7.3% |
+| KV/RS reserve | 3.1 | 2.0% |
+| KV translate | 0.7 | 0.4% |
+| scheduler submit | 11.0 | 7.0% |
+| fire-timing + ticket commit | 1.1 | 0.7% |
+| **`HostShadow::advance`** | **121.6** | **77.6%** |
+| push `PendingFire` | 0.5 | 0.3% |
+
+`HostShadow::advance` folds the bound trace's stage programs through
+`pie_eval::pareval::fold_stage` on **every forward pass** to mirror what each
+host channel now holds (the value oracle behind evaluated fire geometry and
+attention masks). At 441 submits/wave and one wave per ~30 ms this is ~54 ms
+of host CPU per wave — about 1.8 cores, continuously, and ~200 ms of CPU in
+one burst at each turnover.
+
+### Two exact fixes, both landed
+
+**1. Skip channel-inert stages (`fire/shadow.rs`).** `advance` folded
+`2 * num_layers + 2` phases — 58 for this model — but `fold_stage`'s only
+consumed output is `fold.puts`, and its fault path shadows exactly the
+stage's `ChanPut` channels. **A stage program with no `ChanPut` is therefore
+a provable no-op.** Filtering them (once, cached on the shadow: the bound
+trace never changes for an instance) takes the fold from 58 phases to a
+measured **1.61** per fire.
+
+**2. Blocked-value placeholders are now empty (`compiler/eval/pareval.rs`).**
+This is where the time actually was. `placeholder()` allocated and zeroed a
+`numel()`-sized dense vector for **every blocked SSA value**, and in a decode
+prologue/epilogue every kernel and intrinsic is blocked. The vectors are
+never read — `pareval.rs`'s own comment says so, and the `if let Some(blocker)
+= blocked { ...; continue; }` arm enforces it: `eval_op` runs only when every
+operand is a real value. `dense` needs the entry only to stay index-aligned
+with `slots`.
+
+Measured, same build, same run shape:
+
+| | submit | `advance` | fold loop | phases/fire |
+| - | -----:| ---------:| ---------:| -----------:|
+| baseline                | 157.2 us | 121.8 us |  —       | 58 |
+| + stage filter          | 151.0 us | 115.5 us | 109.8 us | 1.61 |
+| + empty placeholders    | **66.3 us** | **28.1 us** | **21.7 us** | 1.63 |
+
+**Per-submit host cost -58%; `HostShadow::advance` -77%.** Turnover idle over
+an 8-cohort run fell 750 ms -> 642 ms (-14%); total dark time 1214 -> 1078 ms.
+
+### Throughput: NEUTRAL, and that is the finding
+
+True A/B, same machine session, fix stashed and rebuilt:
+
+| | baseline | with fix |
+| - | -------:| --------:|
+| conc 64 (N=512)   | 15896 / 15947 / 15786 | 15926 / 15828 / 15965 |
+| conc 512 (N=4096) | 30199 / 30261         | 30267 / 29798 / 30190 |
+
+At conc 512 on an L40S the engine is GPU-bound at 92.7% busy (§20.13), so the
+freed host CPU (~2.7 core-seconds over a 17.7 s run) has nothing to convert
+into. The change is kept because it is provably exact, strictly removes work,
+and the cost it removes scales with lanes x layers — i.e. with everything that
+gets bigger.
+
+MEASUREMENT TRAP RECORDED: this session's machine baseline is ~2.7% below
+§20.14's (conc 64: 15896 vs 16336). A cross-session number is not a control.
+Three consecutive runs looked like a -2.5% regression and were not; only the
+stash-and-rebuild A/B settled it. Also, the first bench run after the
+contention suite read 28386 at conc 512 and was a pure outlier (next three:
+30267 / 29798 / 30190).
+
+VERIFIED: contention suite 16/16; `cargo test -p pie-eval` 17 passed;
+inferlet_canary 2 passed / 3 ignored; conc 256 28494 / 28522 / 28578 and
+conc 128 22575, both inside the drifted baseline band.
+
+REMAINING, MEASURED, NOT FIXED:
+ - `notify_pipeline_close` 25-40 ms per turnover -> batch the leave.
+ - `fold_stage` still re-walks the prologue/epilogue op list every fire
+   (21.7 us). The trace is identical every pass; only a few input channel
+   values change. Compiling each channel-writing stage once into a closure
+   over its live inputs would remove the rest.
