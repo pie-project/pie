@@ -77,7 +77,7 @@ impl Value {
     pub fn from_le_bytes(dtype: DType, bytes: &[u8]) -> Option<Value> {
         match dtype {
             DType::Bool => Some(Value::Bool(bytes.iter().map(|&b| b != 0).collect())),
-            DType::F32 | DType::I32 | DType::U32 if bytes.len() % 4 != 0 => None,
+            DType::F32 | DType::I32 | DType::U32 if !bytes.len().is_multiple_of(4) => None,
             DType::F32 => Some(Value::F32(
                 bytes
                     .chunks_exact(4)
@@ -571,10 +571,8 @@ impl Instance {
                     None
                 };
                 let overflow = self.with_chan_mut(ci, |st| {
-                    if taken {
-                        if let Some(v) = st.queue.pop_front() {
-                            st.last = v;
-                        }
+                    if taken && let Some(v) = st.queue.pop_front() {
+                        st.last = v;
                     }
                     if let Some(v) = put_v {
                         if st.queue.len() >= st.capacity {
@@ -1257,7 +1255,7 @@ pub(crate) fn eval_op(
             let t = ty_of(a);
             let rows = rows_of(t.shape);
             let data = v(a);
-            let len = if rows == 0 { 0 } else { data.len() / rows };
+            let len = data.len().checked_div(rows).unwrap_or(0);
             if t.dtype == DType::F32 {
                 let x = lanes_f32(data);
                 let f: fn(&[f32]) -> f32 = match op {
@@ -1288,19 +1286,19 @@ pub(crate) fn eval_op(
             let rows = rows_of(t.shape);
             let result = match v(a) {
                 Value::F32(values) => {
-                    let len = if rows == 0 { 0 } else { values.len() / rows };
+                    let len = values.len().checked_div(rows).unwrap_or(0);
                     (0..rows)
                         .map(|row| argmax_row(&values[row * len..(row + 1) * len]))
                         .collect()
                 }
                 Value::I32(values) => {
-                    let len = if rows == 0 { 0 } else { values.len() / rows };
+                    let len = values.len().checked_div(rows).unwrap_or(0);
                     (0..rows)
                         .map(|row| argmax_ordered(&values[row * len..(row + 1) * len]))
                         .collect()
                 }
                 Value::U32(values) => {
-                    let len = if rows == 0 { 0 } else { values.len() / rows };
+                    let len = values.len().checked_div(rows).unwrap_or(0);
                     (0..rows)
                         .map(|row| argmax_ordered(&values[row * len..(row + 1) * len]))
                         .collect()
@@ -1329,7 +1327,7 @@ pub(crate) fn eval_op(
             let t = ty_of(a);
             let rows = rows_of(t.shape);
             let x = lanes_f32(v(a));
-            let len = if rows == 0 { 0 } else { x.len() / rows };
+            let len = x.len().checked_div(rows).unwrap_or(0);
             let is_sum = matches!(op, Op::CumSum(_));
             let mut out = Vec::with_capacity(x.len());
             for r in 0..rows {
@@ -1352,7 +1350,7 @@ pub(crate) fn eval_op(
             let t = ty_of(input);
             let rows = rows_of(t.shape);
             let x = lanes_f32(v(input));
-            let len = if rows == 0 { 0 } else { x.len() / rows };
+            let len = x.len().checked_div(rows).unwrap_or(0);
             let k = k as usize;
             let mut vs = Vec::with_capacity(rows * k);
             let mut is = Vec::with_capacity(rows * k);
@@ -1394,7 +1392,7 @@ pub(crate) fn eval_op(
             let t = ty_of(input);
             let rows = rows_of(t.shape);
             let x = lanes_f32(v(input));
-            let len = if rows == 0 { 0 } else { x.len() / rows };
+            let len = x.len().checked_div(rows).unwrap_or(0);
             let mut keep = vec![false; x.len()];
             for r in 0..rows {
                 let row = &x[r * len..(r + 1) * len];
@@ -1449,7 +1447,7 @@ pub(crate) fn eval_op(
                     let base = i as usize * rest;
                     flat.extend(base..base + rest);
                 } else {
-                    flat.extend(core::iter::repeat(usize::MAX).take(rest)); // fill-0
+                    flat.extend(std::iter::repeat_n(usize::MAX, rest)); // fill-0
                 }
             }
             One(gather_flat_fill0(v(src), &flat))

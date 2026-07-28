@@ -256,7 +256,13 @@ fn emit_metal_program_effects(bound: &BoundTrace, out: &mut Vec<EmittedKernel>) 
     let signature = format!("{:016x}", bound.hash);
     let ready = format!("ptir_m1_{signature}_ready");
     let source = crate::metal::emit_readiness(&ready, &effects);
-    out.push(EmittedKernel::new(KERNEL_READINESS, 0, 1, ready, Ok(source)));
+    out.push(EmittedKernel::new(
+        KERNEL_READINESS,
+        0,
+        1,
+        ready,
+        Ok(source),
+    ));
     let commit = format!("ptir_m1_{signature}_commit");
     let source = crate::metal::emit_commit(&commit, &effects);
     out.push(EmittedKernel::new(KERNEL_COMMIT, 0, 1, commit, Ok(source)));
@@ -276,8 +282,7 @@ fn grouped_library(stage: &CompiledStage, region: &Region) -> Option<LibraryOp> 
             // kernel that would read the wrong operands.
             let node = *region.nodes.first()? as usize;
             let op = stage.normalized.ops.get(node)?;
-            (crate::op_view::OpView::of(op).tag == tags::TOP_K)
-                .then_some(LibraryOp::TopK)
+            (crate::op_view::OpView::of(op).tag == tags::TOP_K).then_some(LibraryOp::TopK)
         }
         _ => None,
     }

@@ -21,3 +21,8 @@ std = ["pie-ir/std"]
 
 [dependencies]
 pie-ir = { path = "../ir", default-features = false }
+
+# Shared ratchet from the root manifest. These six crates are gated with
+# `-D warnings` in CI; see `[workspace.lints]` in the workspace `Cargo.toml`.
+[lints]
+workspace = true

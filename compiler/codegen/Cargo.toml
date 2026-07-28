@@ -20,3 +20,8 @@ path = "src/lib.rs"
 pie-ir = { path = "../ir" }
 pie-plan = { path = "../plan" }
 pie-driver-abi = { path = "../../interface/driver" }
+
+# Shared ratchet from the root manifest. These six crates are gated with
+# `-D warnings` in CI; see `[workspace.lints]` in the workspace `Cargo.toml`.
+[lints]
+workspace = true

@@ -1,5 +1,5 @@
-//! Golden vectors (thrust-3 P0.4): canonical container bytes + identity hash
-//! + validator verdict + tier-0 reference results, checked into
+//! Golden vectors (thrust-3 P0.4): canonical container bytes, identity hash,
+//! validator verdict and tier-0 reference results, checked into
 //! `golden/*.txt`. **This is the conformance suite for every backend** —
 //! charlie's CUDA tiers and delta's SDK diff against these files: the SDK must
 //! emit byte-identical containers (same hex, same hash) and any executor must
@@ -1149,7 +1149,7 @@ fn golden_mtp_verify_tail() {
     // r2->6 (WOULD match d3 — but the mask forbids 6, allows {2} -> picked 2,
     // miss), r3->4 (bonus row; unused since n_acc=2 -> bonus is picked[2]).
     let mut logits = vec![0.0f32; (kp1 * v) as usize];
-    logits[0 * 8 + 3] = 9.0;
+    logits[3] = 9.0;
     logits[8 + 5] = 9.0;
     logits[2 * 8 + 6] = 9.0; // masked out
     logits[2 * 8 + 2] = 1.0; // the allowed survivor

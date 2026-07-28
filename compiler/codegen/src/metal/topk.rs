@@ -5,9 +5,9 @@
 //! index results. The `top_k` op defines two results, so the emitter needs the
 //! node's result base as well as its argument.
 
-use pie_ir::op::tags;
 use alloc::string::{String, ToString};
 use core::fmt::Write as _;
+use pie_ir::op::tags;
 
 use pie_plan::{CompiledStage, LibraryOp, Region};
 

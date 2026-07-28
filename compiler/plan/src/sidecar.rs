@@ -88,7 +88,7 @@ pub fn encode_bound_with_plans(b: &BoundTrace, plans: &[crate::compile::Compiled
     }
     w.extend_from_slice(&(plans.len() as u32).to_le_bytes());
     for plan in plans {
-        let bytes = crate::compile::encode_stage_plan(&plan);
+        let bytes = crate::compile::encode_stage_plan(plan);
         w.push(plan.normalized.stage as u8);
         w.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
         w.extend_from_slice(&bytes);
@@ -442,10 +442,7 @@ mod tests {
             ports: vec![],
             stages: vec![StageProgram {
                 stage: Stage::Epilogue,
-                ops: vec![
-                    Op::ChanRead(0),
-                    Op::ChanPut { chan: 1, value: 0 },
-                ],
+                ops: vec![Op::ChanRead(0), Op::ChanPut { chan: 1, value: 0 }],
             }],
             externs: alloc::vec::Vec::new(),
         };

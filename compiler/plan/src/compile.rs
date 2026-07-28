@@ -482,14 +482,14 @@ fn normalize_stage(bound: &BoundTrace, stage_index: usize) -> NormalizedStage {
         } else {
             None
         };
-        if let Some(key) = cse_key.as_ref() {
-            if let Some(&(existing_base, existing_op)) = cse.get(key) {
-                for result in 0..result_count {
-                    value_map[base + result] = existing_base + result as u32;
-                }
-                source_ops[existing_op as usize].push(op_index as u32);
-                continue;
+        if let Some(key) = cse_key.as_ref()
+            && let Some(&(existing_base, existing_op)) = cse.get(key)
+        {
+            for result in 0..result_count {
+                value_map[base + result] = existing_base + result as u32;
             }
+            source_ops[existing_op as usize].push(op_index as u32);
+            continue;
         }
 
         let new_base = normalized_types.len() as u32;
@@ -785,7 +785,7 @@ fn propagate_preserved_dimensions(
 }
 
 fn mapped_value(mapped_op: &Op, original_value: u32) -> u32 {
-    let original_operands = match mapped_op {
+    match mapped_op {
         Op::ReduceSum(value)
         | Op::ReduceMax(value)
         | Op::ReduceMin(value)
@@ -794,8 +794,7 @@ fn mapped_value(mapped_op: &Op, original_value: u32) -> u32 {
         | Op::Broadcast { value, .. }
         | Op::Reshape { value, .. } => *value,
         _ => original_value,
-    };
-    original_operands
+    }
 }
 
 fn symbolic_channel_type(
@@ -940,9 +939,7 @@ fn fold_scalar(op: &Op, literals: &[Option<Literal>]) -> Option<Literal> {
             (Literal::I32(a), Literal::I32(b)) => {
                 Some(Literal::I32(if b == 0 { 0 } else { a.wrapping_div(b) }))
             }
-            (Literal::U32(a), Literal::U32(b)) => {
-                Some(Literal::U32(if b == 0 { 0 } else { a / b }))
-            }
+            (Literal::U32(a), Literal::U32(b)) => Some(Literal::U32(a.checked_div(b).unwrap_or(0))),
             _ => None,
         },
         Op::Rem(a, b) => match (get(a)?, get(b)?) {
@@ -1026,10 +1023,10 @@ fn canonicalize_commutative(op: &mut Op, result_type: Option<&SymbolicType>) {
         | Op::Eq(a, b)
         | Op::Ne(a, b)
         | Op::And(a, b)
-        | Op::Or(a, b) => {
-            if *a > *b {
-                core::mem::swap(a, b);
-            }
+        | Op::Or(a, b)
+            if *a > *b =>
+        {
+            core::mem::swap(a, b);
         }
         _ => {}
     }
@@ -2435,6 +2432,69 @@ pub fn decode_plan_header(bytes: &[u8]) -> Result<EncodedPlanHeader, PlanDecodeE
     })
 }
 
+/// The graph-cache identity of one compiled stage.
+///
+/// The CUDA driver computes exactly this in `program_identity.hpp` after
+/// decoding the plan, and keys its CUDA-graph cache on it. It is a decision
+/// about the program, so under `ptir-refactor.md`'s north star it belongs to
+/// the host: the driver should be told, not re-derive.
+///
+/// The walk is byte-order-locked to the C++ one — the same fields, in the same
+/// order, through the same FNV-1a 64. `stage_identity_matches_the_driver` in
+/// `compiler/tests` pins the two together, and while both exist the driver
+/// compares its own value against this one and counts any divergence
+/// (`ProgramRuntimeStats::host_stage_identities` /
+/// `divergent_stage_identities`), which is what makes deleting the C++ copy an
+/// evidenced step rather than a leap.
+pub fn stage_identity(stage: &CompiledStage) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let add_byte = |hash: &mut u64, byte: u8| {
+        *hash ^= u64::from(byte);
+        *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    };
+    let add_u32 = |hash: &mut u64, value: u32| {
+        for shift in (0..32).step_by(8) {
+            add_byte(hash, (value >> shift) as u8);
+        }
+    };
+
+    add_byte(&mut hash, stage.normalized.stage as u8);
+    add_u32(&mut hash, stage.signature.canonical_bytes.len() as u32);
+    for &byte in &stage.signature.canonical_bytes {
+        add_byte(&mut hash, byte);
+    }
+    add_byte(&mut hash, stage.fused.kind as u8);
+    add_byte(&mut hash, u8::from(stage.fused.whole_stage_fallback));
+    add_u32(&mut hash, stage.fused.regions.len() as u32);
+    for region in &stage.fused.regions {
+        add_byte(&mut hash, region.schedule as u8);
+        let (library, library_op) = match region.kind {
+            RegionKind::Generated => (0u8, 0u8),
+            RegionKind::Library(op) => (1u8, op as u8),
+        };
+        add_byte(&mut hash, library);
+        add_byte(&mut hash, library_op);
+        add_u32(&mut hash, region.nodes.len() as u32);
+        for &node in &region.nodes {
+            add_u32(&mut hash, node);
+        }
+        add_u32(&mut hash, region.inputs.len() as u32);
+        for &input in &region.inputs {
+            add_u32(&mut hash, input);
+        }
+        add_u32(&mut hash, region.outputs.len() as u32);
+        for &output in &region.outputs {
+            add_u32(&mut hash, output);
+        }
+        add_u32(&mut hash, region.sinks.len() as u32);
+        for sink in &region.sinks {
+            add_u32(&mut hash, sink.channel_slot);
+            add_u32(&mut hash, sink.value);
+        }
+    }
+    if hash == 0 { 1 } else { hash }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3527,67 +3587,4 @@ mod tests {
         assert_eq!(core::mem::size_of::<LaneRecord>(), 96);
         assert_eq!(core::mem::size_of::<LaneChannelSlot>(), 32);
     }
-}
-
-/// The graph-cache identity of one compiled stage.
-///
-/// The CUDA driver computes exactly this in `program_identity.hpp` after
-/// decoding the plan, and keys its CUDA-graph cache on it. It is a decision
-/// about the program, so under `ptir-refactor.md`'s north star it belongs to
-/// the host: the driver should be told, not re-derive.
-///
-/// The walk is byte-order-locked to the C++ one — the same fields, in the same
-/// order, through the same FNV-1a 64. `stage_identity_matches_the_driver` in
-/// `compiler/tests` pins the two together, and while both exist the driver
-/// compares its own value against this one and counts any divergence
-/// (`ProgramRuntimeStats::host_stage_identities` /
-/// `divergent_stage_identities`), which is what makes deleting the C++ copy an
-/// evidenced step rather than a leap.
-pub fn stage_identity(stage: &CompiledStage) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    let add_byte = |hash: &mut u64, byte: u8| {
-        *hash ^= u64::from(byte);
-        *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    };
-    let add_u32 = |hash: &mut u64, value: u32| {
-        for shift in (0..32).step_by(8) {
-            add_byte(hash, (value >> shift) as u8);
-        }
-    };
-
-    add_byte(&mut hash, stage.normalized.stage as u8);
-    add_u32(&mut hash, stage.signature.canonical_bytes.len() as u32);
-    for &byte in &stage.signature.canonical_bytes {
-        add_byte(&mut hash, byte);
-    }
-    add_byte(&mut hash, stage.fused.kind as u8);
-    add_byte(&mut hash, u8::from(stage.fused.whole_stage_fallback));
-    add_u32(&mut hash, stage.fused.regions.len() as u32);
-    for region in &stage.fused.regions {
-        add_byte(&mut hash, region.schedule as u8);
-        let (library, library_op) = match region.kind {
-            RegionKind::Generated => (0u8, 0u8),
-            RegionKind::Library(op) => (1u8, op as u8),
-        };
-        add_byte(&mut hash, library);
-        add_byte(&mut hash, library_op);
-        add_u32(&mut hash, region.nodes.len() as u32);
-        for &node in &region.nodes {
-            add_u32(&mut hash, node);
-        }
-        add_u32(&mut hash, region.inputs.len() as u32);
-        for &input in &region.inputs {
-            add_u32(&mut hash, input);
-        }
-        add_u32(&mut hash, region.outputs.len() as u32);
-        for &output in &region.outputs {
-            add_u32(&mut hash, output);
-        }
-        add_u32(&mut hash, region.sinks.len() as u32);
-        for sink in &region.sinks {
-            add_u32(&mut hash, sink.channel_slot);
-            add_u32(&mut hash, sink.value);
-        }
-    }
-    if hash == 0 { 1 } else { hash }
 }

@@ -70,11 +70,11 @@ fn quest_tap() -> Traced {
     b.stage(Stage::OnAttnProj, move || {
         let prev = acc_tap.take().tensor();
         let scores = intrinsics::kernel::envelope_dot(PAGES);
-        acc_tap.put(&max_elem(&prev, &scores));
+        acc_tap.put(max_elem(&prev, &scores));
     });
     b.stage(Stage::Epilogue, move || {
-        out.put(&acc_epi.take().tensor());
-        acc_epi.put(&broadcast(f32::NEG_INFINITY, [PAGES]));
+        out.put(acc_epi.take().tensor());
+        acc_epi.put(broadcast(f32::NEG_INFINITY, [PAGES]));
     });
     b.build().expect("the quest tap traces")
 }
@@ -122,7 +122,7 @@ fn repeated_kernel_names_intern_once() {
         let _ = max_elem(&a, &c);
     });
     b.stage(Stage::Epilogue, move || {
-        sink.put(&intrinsics::kernel::envelope_dot(PAGES));
+        sink.put(intrinsics::kernel::envelope_dot(PAGES));
     });
     let t = b.build().expect("traces");
     assert_eq!(t.container().names, vec!["envelope_dot".to_string()]);
@@ -221,7 +221,7 @@ fn the_name_table_is_sorted_and_indices_are_remapped() {
         // Used first, sorts second.
         let scores = intrinsics::kernel::envelope_dot(PAGES);
         // Used second, sorts first.
-        intrinsics::kernel::attn_page_mask(&gt(&scores, 0.0f32));
+        intrinsics::kernel::attn_page_mask(gt(&scores, 0.0f32));
     });
     let t = b.build().expect("two second-party names trace");
     let c = t.container();

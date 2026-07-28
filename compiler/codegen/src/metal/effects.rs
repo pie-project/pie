@@ -41,12 +41,12 @@ pub fn emit_readiness(function_name: &str, channels: &[M1ChannelEffect]) -> Stri
          reinterpret_cast<const device M1LaneChannelSlot*>(lane_bytes + \
          sizeof(M1LaneHeader) + sizeof(M1LaneRecord));\n",
     );
-    let _ = write!(
+    let _ = writeln!(
         source,
         "  if (header->abi_version != {LANE_TABLE_ABI_VERSION} || header->lane_count != 1 || \
          header->channel_count != {}) {{ status->state = 3; status->fault = 0x100; \
          status->reserved0 = header->abi_version; \
-         status->reserved1 = (header->lane_count << 16) | header->channel_count; return; }}\n",
+         status->reserved1 = (header->lane_count << 16) | header->channel_count; return; }}",
         channels.len()
     );
     source.push_str("  status->state = 0; status->fault = 0;\n");
@@ -150,11 +150,11 @@ pub fn emit_grouped_readiness(function_name: &str) -> String {
     source
         .push_str("struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };\n");
     source.push_str(grouped_preamble());
-    let _ = write!(
+    let _ = writeln!(
         source,
         "kernel void {function_name}(const device uchar* lane_bytes [[buffer(0)]], \
          const device M3ChannelMeta* meta [[buffer(1)]], \
-         uint lane_index [[thread_position_in_grid]]) {{\n"
+         uint lane_index [[thread_position_in_grid]]) {{"
     );
     source.push_str(
         "  const device M3LaneHeader* header = reinterpret_cast<const device M3LaneHeader*>(lane_bytes);\n",
@@ -213,11 +213,11 @@ pub fn emit_grouped_commit(function_name: &str) -> String {
     source
         .push_str("struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };\n");
     source.push_str(grouped_preamble());
-    let _ = write!(
+    let _ = writeln!(
         source,
         "kernel void {function_name}(const device uchar* lane_bytes [[buffer(0)]], \
          const device M3ChannelMeta* meta [[buffer(1)]], \
-         uint lane_index [[thread_position_in_grid]]) {{\n"
+         uint lane_index [[thread_position_in_grid]]) {{"
     );
     source.push_str(
         "  const device M3LaneHeader* header = reinterpret_cast<const device M3LaneHeader*>(lane_bytes);\n",

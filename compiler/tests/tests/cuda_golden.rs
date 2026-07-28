@@ -504,7 +504,11 @@ fn emit_driver_test_kernel_fixtures() {
                 kernel.kind,
                 kernel.stage_index,
                 kernel.region_index,
-                if kernel.entry_name.is_empty() { "-" } else { &kernel.entry_name },
+                if kernel.entry_name.is_empty() {
+                    "-"
+                } else {
+                    &kernel.entry_name
+                },
                 kernel.source.len()
             );
             body.push_str(&kernel.source);
@@ -564,7 +568,12 @@ fn emit_driver_test_kernel_fixtures() {
         .filter(|reason| !reason.starts_with("neg_"))
         .collect();
     for reason in &drifted {
-        eprintln!("[driver kernel fixtures] skipped {reason}");
+        // The one stream write the compiler crates allow: the assert below
+        // only reports a count, and the count is useless without the names.
+        #[allow(clippy::print_stderr, reason = "names the fixtures the assert counts")]
+        {
+            eprintln!("[driver kernel fixtures] skipped {reason}");
+        }
     }
     // Zero, not a tolerance. The last survivor was `staged_dispatch`, and it
     // had not drifted at all -- `golden_profile` was guessing vocab 8 for a
@@ -576,4 +585,3 @@ fn emit_driver_test_kernel_fixtures() {
         "vendored driver traces no longer bind: {drifted:?}"
     );
 }
-

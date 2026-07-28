@@ -114,7 +114,7 @@ fn uniform_never_reaches_one() {
         unclamped_hits, 1,
         "expected exactly one of 2^24 draws to round up to 1.0 without the clamp"
     );
-    assert!(UNIFORM_MAX < 1.0);
+    const _: () = assert!(UNIFORM_MAX < 1.0);
     assert_eq!(UNIFORM_MAX.to_bits(), 0x3f7f_ffff);
 }
 

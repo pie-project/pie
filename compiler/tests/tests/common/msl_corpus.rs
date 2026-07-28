@@ -345,11 +345,18 @@ pub fn extended_traces() -> Vec<(&'static str, TraceContainer, ModelProfile)> {
     let mut attn = small.clone();
     attn.has_attn_score = true;
 
-    let f32v = |n: u32, role: HostRole, seeded: bool| chan(Shape::vector(n), DType::F32, role, seeded);
+    let f32v =
+        |n: u32, role: HostRole, seeded: bool| chan(Shape::vector(n), DType::F32, role, seeded);
     let read = |n: u32| f32v(n, HostRole::None, true);
     let write = |n: u32| f32v(n, HostRole::Reader, false);
-    let write_scalar =
-        || chan(Shape::new(&[]).unwrap(), DType::F32, HostRole::Reader, false);
+    let write_scalar = || {
+        chan(
+            Shape::new(&[]).unwrap(),
+            DType::F32,
+            HostRole::Reader,
+            false,
+        )
+    };
 
     vec![
         (
@@ -509,7 +516,12 @@ pub fn extended_traces() -> Vec<(&'static str, TraceContainer, ModelProfile)> {
             staged(
                 Stage::OnAttn,
                 vec![
-                    chan(Shape::new(&[]).unwrap(), DType::U32, HostRole::Reader, false),
+                    chan(
+                        Shape::new(&[]).unwrap(),
+                        DType::U32,
+                        HostRole::Reader,
+                        false,
+                    ),
                     write(4),
                 ],
                 vec![

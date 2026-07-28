@@ -23,3 +23,8 @@ pie-ir = { path = "../ir" }
 # `ir` remain independent of each other.
 [dev-dependencies]
 pie-plan = { path = "../plan" }
+
+# Shared ratchet from the root manifest. These six crates are gated with
+# `-D warnings` in CI; see `[workspace.lints]` in the workspace `Cargo.toml`.
+[lints]
+workspace = true

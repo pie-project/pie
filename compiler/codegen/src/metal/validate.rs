@@ -132,7 +132,9 @@ pub fn library_region_valid(stage: &CompiledStage, region: &Region) -> bool {
         RegionKind::Library(LibraryOp::Sort) => tag == tags::SORT_DESC,
         RegionKind::Library(LibraryOp::Scan) => tag == tags::CUMSUM || tag == tags::CUMPROD,
         RegionKind::Library(LibraryOp::MatMul) => tag == tags::MATMUL,
-        RegionKind::Library(LibraryOp::SecondParty) => tag == tags::KERNEL_CALL || tag == tags::SINK_CALL,
+        RegionKind::Library(LibraryOp::SecondParty) => {
+            tag == tags::KERNEL_CALL || tag == tags::SINK_CALL
+        }
         _ => false,
     }
 }
@@ -301,7 +303,8 @@ fn validate_into(stage: &CompiledStage, operations: &mut Vec<M1OpMeta>) -> Resul
         if op.tag == tags::PIVOT_THRESHOLD && (op.pred_tag > 2 || op.pred_payload >= result_base) {
             return Err("pivot predicate payload is out of range".to_string());
         }
-        let channel_op = op.tag == tags::CHAN_TAKE || op.tag == tags::CHAN_READ || op.tag == tags::CHAN_PUT;
+        let channel_op =
+            op.tag == tags::CHAN_TAKE || op.tag == tags::CHAN_READ || op.tag == tags::CHAN_PUT;
         if (channel_op && (op.chan < 0 || op.chan as usize >= channel_bindings.len()))
             || (!channel_op && op.chan >= 0)
         {

@@ -8,11 +8,11 @@
 //! two inline expansions the single-lane form does not have — the MTP-draft
 //! argmax and the logits gather.
 
-use pie_ir::op::{intrinsic_tags, tags};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt::Write as _;
+use pie_ir::op::{intrinsic_tags, tags};
 
 use pie_plan::{CompiledStage, Region};
 
@@ -245,8 +245,15 @@ pub fn emit_grouped_fused_region(
             emit_mtp_drafts(&mut source, base, &slots.o0);
             continue;
         }
-        if op.tag == tags::INTRINSIC_VAL && (op.intr == intrinsic_tags::LOGITS || op.intr == intrinsic_tags::MTP_LOGITS) {
-            emit_logits_gather(&mut source, base, op.intr == intrinsic_tags::MTP_LOGITS, &slots.o0);
+        if op.tag == tags::INTRINSIC_VAL
+            && (op.intr == intrinsic_tags::LOGITS || op.intr == intrinsic_tags::MTP_LOGITS)
+        {
+            emit_logits_gather(
+                &mut source,
+                base,
+                op.intr == intrinsic_tags::MTP_LOGITS,
+                &slots.o0,
+            );
             continue;
         }
         if op.tag == tags::CHAN_TAKE || op.tag == tags::CHAN_READ {

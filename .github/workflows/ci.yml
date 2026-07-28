@@ -1,5 +1,13 @@
 name: CI
 
+# Toolchain note: the `dtolnay/rust-toolchain@<rev>` steps below only decide
+# what the action downloads. `rust-toolchain.toml` at the repo root is what
+# cargo actually resolves to (1.97.1), and rustup auto-installs it — with the
+# components and targets that file declares — on the first cargo invocation.
+# The one exception is `schema-header-drift`, which needs a different compiler
+# for deterministic cbindgen output and gets it by setting `RUSTUP_TOOLCHAIN`,
+# which outranks the toolchain file.
+
 on:
   push:
     branches: [main]
@@ -53,6 +61,31 @@ jobs:
         run: |
           cargo check -p pie-ir --no-default-features
           cargo check -p pie-plan --no-default-features
+
+      # The compiler crates are at zero clippy warnings, so they are the only
+      # part of the workspace that can be gated. The rest still carries ~240
+      # warnings (167 in runtime/engine alone); widen the `-p` list as crates
+      # are cleaned rather than switching this to `--workspace` and reaching
+      # for `-A` to hold it up.
+      #
+      # `--no-deps` matters: cargo drives clippy through
+      # RUSTC_WORKSPACE_WRAPPER, which lints every *path* dependency that gets
+      # built, not just the selected packages. Without it this step fails on
+      # pie-driver-abi's 13 warnings, which are not the compiler's to fix.
+      - name: cargo clippy (compiler crates, deny warnings)
+        run: |
+          cargo clippy --no-deps --all-targets \
+            -p pie-ir -p pie-plan -p pie-eval \
+            -p pie-codegen -p pie-dsl -p pie-compiler-tests \
+            -- -D warnings
+
+      # Same scope, same reason: these six crates are rustfmt-clean, the rest
+      # of the workspace is not.
+      - name: cargo fmt (compiler crates)
+        run: |
+          cargo fmt --check \
+            -p pie-ir -p pie-plan -p pie-eval \
+            -p pie-codegen -p pie-dsl -p pie-compiler-tests
 
   # Full-workspace verification — the guardrail + anti-bitrot net. Closes the
   # gap that let the runtime benches rot unseen: the dedicated jobs only build a

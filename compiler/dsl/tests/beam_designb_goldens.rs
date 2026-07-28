@@ -18,6 +18,7 @@
 //!      OR the new position (`eq(col, wpos)`), and
 //!   4. the explicit write descriptor `w_slot = wpos / PAGE_T`, `w_off = wpos %
 //!      PAGE_T` (consumed by B2's `write_kv_explicit`).
+//!
 //! `Pages`/`PageIndptr` are CONSTANT (the shared pool is fixed between
 //! compactions) — the mask does all the per-beam selection.
 //!

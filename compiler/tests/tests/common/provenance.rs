@@ -43,7 +43,6 @@ pub fn regenerate_foreign(path: &Path, header: &str, body: &str) {
     lines.push(STAMP.to_string());
     lines.push(format!("{REASON_PREFIX}{reason}"));
     let text = lines.join("\n") + "\n" + body;
-    std::fs::write(path, text).unwrap_or_else(|error| {
-        panic!("{} could not be rewritten ({error})", path.display())
-    });
+    std::fs::write(path, text)
+        .unwrap_or_else(|error| panic!("{} could not be rewritten ({error})", path.display()));
 }

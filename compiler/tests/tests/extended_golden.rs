@@ -174,7 +174,13 @@ fn extended_corpus_plans_are_pinned() {
             body,
             "wire: bytes={} fnv1a64=0x{:016x}",
             stage.wire.len(),
-            fnv1a64(&stage.wire.iter().map(|b| format!("{b:02x}")).collect::<String>())
+            fnv1a64(
+                &stage
+                    .wire
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            )
         );
         for (index, region) in stage.plan.fused.regions.iter().enumerate() {
             let _ = writeln!(body, "fused#{index}: {}", region_shape(region));

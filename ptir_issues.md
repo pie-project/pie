@@ -15,21 +15,61 @@ Purpose: 전면 리팩토링 착수 전 현행 코드의 구조적 문제 정리
 
 | 지표 | 값 | 판정 |
 |---|---|---|
-| clippy 경고 (기본 lint, `--all-targets`) | 3건 (`write_with_newline`, 전부 사소) | ✅ |
-| 테스트 | 152건, 전부 통과 | ✅ |
+| clippy 경고 (기본 lint, `--all-targets`) | ~~3건~~ → **실측 29건** (compiler 한정). 워크스페이스 전체는 277건 | ⚠️ |
+| 테스트 | 152건 → **165건**, 전부 통과 | ✅ |
 | `unsafe` 블록 | 0 | ✅ |
 | `TODO`/`FIXME`/`HACK`/`XXX` | 0 | ⚠️ (§m10) |
-| `no_std` / `std` 분리 | 3개 `#[cfg(feature = "std")]`만, cfg soup 없음 | ✅ |
+| `no_std` / `std` 분리 | ~~3개~~ → 4~5곳. cfg soup은 없으나 **`--no-default-features`가 컴파일되지 않았음** | ❌ |
 | codegen 순수성 (`HashMap` / I/O / env / time) | 전부 없음 — `Plan -> String` 주장 성립 | ✅ |
 | 100줄 초과 함수 (clippy `too_many_lines`) | **17개** (compiler 내), 최대 643줄 | ❌ |
 | 인지 복잡도 25 초과 | 4개 (최대 39) | ❌ |
-| 비테스트 코드의 `unwrap`/`expect`/`panic!`/`unreachable!` | **190건** | ❌ |
+| 비테스트 코드의 `unwrap`/`expect`/`panic!`/`unreachable!` | ~~190건~~ → **68건** (부록 A의 grep이 `#[cfg(test)]`를 포함했다) | ⚠️ |
 
 한 줄 요약:
 
 > **컴파일러가 잡아줄 수 있었던 정합성을 사람이 손으로 지키고 있다.**
 > 위험은 "코드가 지저분하다"가 아니라 "테이블 6벌 중 하나가 어긋나면 조용히
 > 잘못된 커널이 나간다"이다.
+
+---
+
+## 0-A. 검증 결과 (2026-07-29, baseline `c6fcd1b0f`)
+
+이 문서의 주장을 코드로 하나씩 재현해 봤다. **다섯 건이 반증됐고, 문서에 없던
+CRITICAL이 더 나왔다.** 아래 표가 정본이고, 본문의 개별 항목에는 인라인으로
+정정 표시를 달았다. 리팩토링 착수 시 §1의 CRITICAL 목록을 그대로 신뢰하지 말 것 —
+실제보다 과장돼 있다.
+
+### 반증된 것 (고치지 않음)
+
+| 항목 | 문서의 주장 | 실측 |
+|---|---|---|
+| C3 | 두 구현이 드리프트했다 | 완전 일치. 중복은 사실이나 드리프트는 없음 |
+| M4 | 미localize 시그니처가 캐시 키를 오염 | 미localize 경로 자체가 없음. capacity만 다른 두 트레이스가 서로 다른 서명을 냄 |
+| M17 | `Family`로 4벌을 치환 | 치환하면 nucleus 융합이 깨짐. 네 곳은 서로 다른 질문에 답하고 있음 |
+| m4 | live bug | 도달 불가 |
+| P3(부록 외) | FNV-1a 64비트가 캐시 키의 전부 | 두 캐시 모두 전체 바이트를 비교. 해시는 인덱스지 신원이 아님 |
+
+### 문서에 없던 CRITICAL (전부 수정 완료)
+
+- **CUDA nucleus-skip이 소비자 검사 없이 노드를 삭제** → 조용한 오답
+- **Metal이 *모든* intrinsic을 logits 버퍼에 바인딩** → 조용한 오답
+- **C++ 오라클이 삭제됨**(`32c2a4a09`) → 골든이 재유도 불가능한 기록물로 전락.
+  `PTIR_REGEN=1`이 `#` 헤더는 보존한 채 본문만 갈아치워 **출처를 세탁**하고 있었음
+- **`pie-ir --no-default-features` 파손** — §4-1이 "유지해야 할 것"으로 적어둔 항목이
+  애초에 컴파일되지 않았음. 선언만 있고 아무도 빌드하지 않은 `no_std`
+- **`decode_bound`가 readiness phase를 미검증으로 통과** (M7의 실체)
+- **`bounded_count`가 입력 1바이트당 op 1개를 허용** — 게스트 입력 + 전역 락 = DoS
+- **`ExecutableCacheKey` 호출자 0** — 드라이버가 손으로 다른 키를 만들고 있었음.
+  드리프트가 아니라 아무도 안 쓴 설계
+
+### 코퍼스가 가려온 것
+
+기존 코퍼스(골든 19 + synthetic 4)의 실제 도달 범위는 **op 38/55, intrinsic 5/8,
+schedule 3/4, stage 3/4**였다. 미도달분을 채우자 hidden/layer/attn_score 3케이스가
+곧바로 Metal 바인딩 버그를 드러냈다 — 위 두 번째 CRITICAL은 가설이 아니었다.
+
+---
 
 ### 심각도 정의
 
@@ -127,6 +167,10 @@ compiler/plan/src/compile.rs:2085+            raw hex (상수명조차 없음)
 
 ### C3. composed op이 두 곳에 독립 구현돼 있고, "정본" 쪽은 죽어 있다
 
+> **정정 (REFUTED).** 두 구현의 op 시퀀스는 오늘 **완전히 일치**한다. 중복은
+> 사실이고 통합할 가치는 있지만, "이미 갈라졌다"는 전제는 틀렸다. CRITICAL이
+> 아니라 MAJOR다.
+
 **증상.** `softmax` / `log_softmax` / `l2norm` / `mask_apply` / `gumbel`의 op 시퀀스가
 두 곳에 각각 작성돼 있다.
 
@@ -215,6 +259,12 @@ compiler/codegen/src/metal/effects.rs:214        (push_str 인라인)
 ---
 
 ### C6. release 빌드에서 조용히 깨지는 불변식
+
+> **정정.** 아래 (a)의 `with_session`은 실제 위험이 낮다. **진짜 사례는 같은
+> 파일의 `Recorder::push`**였다 — SSA id 카운터가 `next_id`와 `result_tys.len()`
+> 두 벌로 존재하고 둘의 일치를 `debug_assert_eq!`로만 확인했다. release에서
+> 어긋나면 그 뒤 **모든 value id가 시프트**된다. 카운터를 하나로 줄이고 진짜
+> `assert_eq!`로 바꿔 수정 완료(`c6fcd1b0f`).
 
 **증상.** 핵심 불변식이 `debug_assert!` / sentinel 값으로만 지켜진다.
 release 빌드에서는 검사가 사라지고 손상된 상태가 그대로 흘러간다.
@@ -333,6 +383,13 @@ clippy `-W clippy::too_many_lines` 측정치 (주석·공백 제외):
 
 ### M4. 패스 순서가 타입으로 강제되지 않는다
 
+> **정정 (REFUTED).** `stage_signature`는 private이고 `compile_stage_at`이
+> 유일한 호출자이며 그 안에서 localize가 선행한다 — 미localize로 부를 경로가
+> **없다**. capacity만 다른 두 트레이스의 서명은 `36744c33` vs `bd38c301`로
+> 실제로 갈린다. 다른 스테이지의 채널 변화에 무반응인 것은 캐시 키가 스테이지
+> 단위이므로 정상이다. `NormalizedStage`/`LocalizedStage` 타입 분리는 근거가
+> 이 항목이었으므로 함께 소멸.
+
 `compile_stage_at`의 호출 순서 `normalize_stage → localize_stage → stage_signature
 → *_partition`은 **관례로만** 지켜진다. `localize_stage`는 `NormalizedStage`를
 제자리 변경하고, `stage_signature`는 그 결과(`channel_bindings`, `names`)를 읽는다.
@@ -383,6 +440,12 @@ fn build_region(stage: &NormalizedStage, nodes: Vec<u32>, kind: RegionKind) -> R
 
 ### M7. 사이드카가 모든 바이트를 두 번 읽는다
 
+> **정정 (실체 확인).** 두 번 읽는 것 자체보다, 두 파서의 **유일한 비대칭**이
+> 문제였다: readiness phase 태그를 `preflight_bound`만 검증하고 `decode_bound`는
+> 검증 없이 push했다. `Shape::new`가 이미 zero-dim과 overflow를 거부하므로
+> preflight의 나머지 검사는 전부 중복이었다. 검사를 decode로 옮기고 preflight를
+> 삭제 + 회귀 테스트 추가로 수정 완료(`c6fcd1b0f`).
+
 `plan/src/sidecar.rs`의 `preflight_bound`(`:216`, 106줄)와 `decode_bound`(`:324`,
 115줄)는 **같은 검증을 두 번** 수행한다. `decode_bound`가 `preflight_bound`를 부른
 뒤 처음부터 다시 읽으며 태그·rank·개수 검사를 반복한다.
@@ -417,6 +480,9 @@ fn lanes_f32(v: &Value) -> Vec<f32> {
 ---
 
 ### M9. 인터프리터의 원시 인덱싱 panic — 오라클이 죽는다
+
+> **정정.** 말미의 "`interp.rs` 전체에 44건"은 `#[cfg(test)]`를 포함한 수치다.
+> 프로덕션 코드에는 **2건**. 첨자 지적 자체는 유효하나 심각도는 MINOR에 가깝다.
 
 `eval/src/interp.rs`의 비테스트 코드에 경계 검사 없는 첨자가 최소 8곳:
 `:688`(`types[id as usize]`), `:698`, `:701`, `:703`, `:710`, `:711`, `:1001`,
@@ -593,6 +659,12 @@ pub struct TraceContainer {
 
 ### M17. 라이브러리 op 집합이 4곳에 열거돼 있다
 
+> **정정 (처방 REFUTED).** 네 곳은 같은 집합을 우연히 공유할 뿐 **서로 다른
+> 질문**에 답한다(값 도메인 / 리전 종류 / 융합 가능성 / 방출 형태).
+> `Family::Library` 하나로 치환하면 nucleus 융합이 깨진다. 중복 열거를 없애려면
+> 네 개의 독립적인 술어를 `OpSpec`에 각각 두어야 하고, 그건 이 항목의 처방이
+> 아니다.
+
 `{TopK, SortDesc, CumSum, CumProd, MatMul}`이 다음 4곳에 각각 나열된다:
 
 ```
@@ -649,6 +721,9 @@ compiler/dsl/src/intrinsics.rs:42 "... DISTINCT shapes — charlie's ..."
 알고리즘 이름을 밝히는 주석 없음).
 
 ### m4. `elem_size`가 중복이고 dtype 추가 시 조용히 틀린다
+
+> **정정 (REFUTED).** 도달 불가한 경로다. 중복 자체는 사실이므로 정리 대상으로는
+> 유효하지만 "조용히 틀린다"는 오늘 성립하지 않는다.
 
 ```rust
 // compiler/ir/src/container.rs:469
@@ -714,18 +789,24 @@ F16/BF16/E8M0 같은 dtype이 추가되면 **컴파일 에러 없이 잘못된 �
 
 리팩토링이 이것들을 후퇴시키면 순손실이다.
 
-1. **`no_std` 분리가 깨끗하다.** `#[cfg(feature = "std")]`가 정확히 3곳
-   (`validate.rs:287`, `infer.rs:69`, `container.rs:515`)에만 있고 전부
-   `std::error::Error` impl이다. cfg soup 없음. `pie-ir`는 의존성 0개.
+1. ~~**`no_std` 분리가 깨끗하다.**~~ — **정정 (거짓).** cfg soup이 없다는 것과
+   `pie-ir`의 의존성이 0개라는 것은 맞지만, cfg 지점은 3곳이 아니라 4~5곳이고
+   무엇보다 **`cargo check -p pie-ir --no-default-features`가 컴파일되지 않았다**:
+   `validate.rs`에 `alloc::string::String` import가 없었고 `std` 프렐류드가 그것을
+   가려주고 있었다. 한 번도 빌드된 적 없는 `no_std`는 `no_std`가 아니다.
+   import 추가 + CI 가드로 수정 완료(`5e24b16d7`). 이제부터는 진짜로 지킬 것.
 2. **codegen의 순수성이 실제로 성립한다.** `HashMap`/`HashSet` 0개, `std::{env,fs,io,time}`
    0개, 런타임 템플릿은 전부 `include_str!`. 반복은 전부 `Vec` 순서. `header.rs`와
    `rng.rs`에 `f() == f()` 결정성 테스트가 있다. → GPU 없이 골든 테스트가 되는 근거.
 3. **`ValidateError`가 모범적이다** (`ir/src/validate.rs:76-175`). 구조화돼 있고 문제의
    op/intrinsic/channel/stage를 실어 나르며 `Display`가 상세하다. 다른 에러 타입의
    목표 수준.
-4. **컨테이너 디코더의 방어가 견고하다.** `bounded_count`(`container.rs:552`)로 할당
-   폭탄 차단, `take`에 `checked_add`, const payload에 `checked_mul`, 그리고
-   재인코딩 비교로 canonical 강제. 악성 입력 코퍼스 테스트도 있다.
+4. **컨테이너 디코더의 방어가 견고하다** — 단, **부분적으로 거짓이었다.**
+   `take`의 `checked_add`와 재인코딩 canonical 강제는 사실이다. 그러나
+   `bounded_count`는 "입력에 남은 바이트 수"만을 상한으로 삼아 `n_ops`에
+   `bounded_count(n, 1, ...)`을 쓰고 있었다 — 1바이트당 op 1개, 즉 상한이 사실상
+   없었다. 게스트가 제출하는 입력이고 디코드가 전역 락 안에서 일어나므로 DoS다.
+   구조적 상한(`MAX_OPS = 1<<16` 등)을 추가해 수정 완료(`c6fcd1b0f`).
 5. **`pareval`가 `eval_op`를 실제로 재사용한다.** README 주장 검증됨 —
    `pareval.rs:25`가 `eval_op`를 import하고 `:168`에서 호출한다. 채널/커널/intrinsic
    단락 처리는 올바른 특수화이지 중복이 아니다. 두 번째 평가기는 없다.
@@ -752,6 +833,22 @@ F16/BF16/E8M0 같은 dtype이 추가되면 **컴파일 에러 없이 잘못된 �
 | **8** | C5 잔여: MSL 구조체를 Rust에서 생성 (CUDA 헤더처럼) | **C5** | 레이아웃 불일치의 마지막 구멍 |
 | **9** | 문서/이름 정리 (m1~m10) | MINOR 전부 | 저비용, 별도 커밋 |
 
+> **진행 상황 (`c6fcd1b0f` 기준).**
+> - **1단계 완료.** `declare_ops!`/`declare_intrinsics!` 매크로로 승격, `tags`/
+>   `spec()`/`family_of()`/`*::ALL` 제공. 다운스트림 중복 상수 64개 제거,
+>   `launch.rs`의 원시 hex 범위도 `spec()` 조회로 교체. `op.rs` 1136→864줄.
+>   **M17은 여기서 함께 처리되지 않는다** — 위 정정 참조.
+> - **3단계 절반 완료.** sidecar preflight는 삭제됐다(단일 패스). `Reader` 3벌
+>   추출(C4)은 미착수.
+> - **5단계 일부 완료.** C6의 실제 사례(`Recorder::push`)는 수정됐다. 세션 가드
+>   RAII화는 미착수.
+> - **문서에 없던 CRITICAL 7건**(§0-A)이 모두 이 순서 바깥에 있었다. 착수 순서를
+>   따르되 그것이 전부라고 가정하지 말 것.
+> - **방어망 신설**: `op_table_drift.rs`(Rust `OP_TABLE` ↔ C++ `op_info` 5테스트),
+>   `corpus_coverage.rs`(op/intrinsic/schedule/stage 커버리지 tripwire),
+>   `provenance.rs`(오라클 출처 골든의 무단 재생성 차단).
+>   6단계·7단계의 대규모 이동은 이 그물이 있어야 안전하다.
+
 **가장 위험한 순서는 1 → 2 → 3이다.** 이 셋은 "손으로 유지하는 사본이 어긋나면
 조용히 잘못된 커널/의미론이 나간다"는 동일한 병증이고, 이를 먼저 없애야 4번 이후의
 대규모 이동이 안전해진다.
@@ -769,13 +866,19 @@ C2(tag 사본 6벌)와 M12(emitter 로직 3벌) 때문이다. 7단계가 그 답
 cargo clippy -p pie-ir -p pie-plan -p pie-eval -p pie-codegen -p pie-dsl --lib -- \
   -W clippy::cognitive_complexity -W clippy::too_many_lines -W clippy::too_many_arguments
 
-# 기본 lint
-cargo clippy -p pie-ir -p pie-plan -p pie-eval -p pie-codegen -p pie-dsl --all-targets
+# 기본 lint. `--no-deps`가 없으면 cargo가 RUSTC_WORKSPACE_WRAPPER로 경로 의존
+# (pie-driver-abi 등)까지 린트해서 compiler 밖 경고가 섞여 든다 — 이 문서의
+# "3건"이 실제로 29건이었던 것과는 별개의 오차원이지만 둘 다 계수를 흐린다.
+cargo clippy --no-deps --all-targets \
+  -p pie-ir -p pie-plan -p pie-eval -p pie-codegen -p pie-dsl -p pie-compiler-tests
 
 # 테스트
 cargo test -p pie-ir -p pie-plan -p pie-eval -p pie-codegen -p pie-dsl -p pie-compiler-tests
 
-# panic 지점 분포
+# panic 지점 분포.
+# 주의: 아래 grep은 `src/` 안의 `#[cfg(test)]` 모듈을 함께 센다. 이 문서 초판의
+# "190건"이 그 결과다 (프로덕션 실측은 68건). 테스트를 빼려면 파일별 계수가
+# 아니라 모듈 경계를 봐야 하므로, 계수를 인용하기 전에 반드시 눈으로 확인할 것.
 grep -rn --include='*.rs' -E "\.unwrap\(\)|\.expect\(|panic!|unreachable!" compiler/*/src \
   | cut -d: -f1 | sort | uniq -c | sort -rn
 ```

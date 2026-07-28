@@ -22,9 +22,9 @@ use pie_driver_abi::plan::{
     LaunchChannel, LaunchChannelRule, LaunchOp, LaunchPackage, LaunchPlanValue, LaunchPort,
     LaunchPut, LaunchRegion, LaunchStage, LaunchStagePlan, LaunchValue,
 };
-use pie_ir::op::{intrinsic_tags, tags};
 use pie_ir::DType;
 use pie_ir::container::{ExternDir, HostRole, PortSource};
+use pie_ir::op::{intrinsic_tags, tags};
 use pie_ir::types::ValueType;
 use pie_ir::validate::{BoundTrace, Direction};
 use pie_plan::{
@@ -332,7 +332,11 @@ fn lower_stages(bound: &BoundTrace) -> Vec<LaunchStage> {
 fn lower_plan(stage: &CompiledStage) -> LaunchStagePlan {
     let normalized = &stage.normalized;
     let ops: Vec<OpView> = OpView::of_all(&normalized.ops);
-    let grouped = GroupedPlan::derive(&ops, &normalized.value_types, normalized.channel_bindings.len());
+    let grouped = GroupedPlan::derive(
+        &ops,
+        &normalized.value_types,
+        normalized.channel_bindings.len(),
+    );
 
     LaunchStagePlan {
         signature_hash: stage.signature.hash,
@@ -341,7 +345,11 @@ fn lower_plan(stage: &CompiledStage) -> LaunchStagePlan {
         mtp_rows: grouped.mtp_rows,
         ops: ops.iter().map(lower_plan_op).collect(),
         source_ops: normalized.source_ops.clone(),
-        value_types: normalized.value_types.iter().map(lower_plan_value).collect(),
+        value_types: normalized
+            .value_types
+            .iter()
+            .map(lower_plan_value)
+            .collect(),
         channel_bindings: normalized.channel_bindings.clone(),
         names: normalized.names.clone(),
         singleton: lower_partition(&stage.singleton),
@@ -590,6 +598,9 @@ mod grouped_coverage {
             );
             assert!(!grouped_supported_tag(*tag));
         }
-        assert!(!grouped_supported_tag(0xFF), "a non-op tag is not supported");
+        assert!(
+            !grouped_supported_tag(0xFF),
+            "a non-op tag is not supported"
+        );
     }
 }

@@ -54,8 +54,16 @@ fn drivers_do_not_retype_generated_tags() {
     let root = repo_root();
     // (file, constant-name fragment, the generated prefix it must derive from)
     let guarded = [
-        ("driver/abi/include/pie_native/fire/descriptor.hpp", "kPort", "PTIR_PORT_"),
-        ("driver/abi/include/pie_native/launch/program.hpp", "StageKind", "PTIR_STAGE_"),
+        (
+            "driver/abi/include/pie_native/fire/descriptor.hpp",
+            "kPort",
+            "PTIR_PORT_",
+        ),
+        (
+            "driver/abi/include/pie_native/launch/program.hpp",
+            "StageKind",
+            "PTIR_STAGE_",
+        ),
     ];
     for (relative, fragment, prefix) in guarded {
         let path = root.join(relative);
@@ -71,10 +79,9 @@ fn drivers_do_not_retype_generated_tags() {
                 // naming the generated constant.
                 line.contains('=')
                     && !line.contains(prefix)
-                    && line
-                        .split('=')
-                        .nth(1)
-                        .is_some_and(|rhs| rhs.trim_start().starts_with(|c: char| c.is_ascii_digit()))
+                    && line.split('=').nth(1).is_some_and(|rhs| {
+                        rhs.trim_start().starts_with(|c: char| c.is_ascii_digit())
+                    })
             })
             .collect();
         assert!(
@@ -84,4 +91,3 @@ fn drivers_do_not_retype_generated_tags() {
         );
     }
 }
-

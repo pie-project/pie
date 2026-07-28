@@ -435,12 +435,13 @@ pub fn bind(container: TraceContainer, profile: ModelProfile) -> Result<BoundTra
             match op {
                 Op::KernelCall { name, .. } => {
                     let n = resolve_name(&container, *name);
-                    let info = profile
-                        .kernel(n)
-                        .ok_or_else(|| ValidateError::KernelUnavailable {
-                            name_index: *name,
-                            name: n.into(),
-                        })?;
+                    let info =
+                        profile
+                            .kernel(n)
+                            .ok_or_else(|| ValidateError::KernelUnavailable {
+                                name_index: *name,
+                                name: n.into(),
+                            })?;
                     if info.sink_scope.is_some() {
                         return Err(ValidateError::SinkKernelKindMismatch {
                             name_index: *name,
@@ -480,12 +481,12 @@ pub fn bind(container: TraceContainer, profile: ModelProfile) -> Result<BoundTra
                         Some(s) => s,
                         None => {
                             // Unknown name: available? (bind-time rule)
-                            let info = profile
-                                .kernel(n)
-                                .ok_or_else(|| ValidateError::KernelUnavailable {
-                            name_index: *name,
-                            name: n.into(),
-                        })?;
+                            let info = profile.kernel(n).ok_or_else(|| {
+                                ValidateError::KernelUnavailable {
+                                    name_index: *name,
+                                    name: n.into(),
+                                }
+                            })?;
                             match info.sink_scope {
                                 Some(s) => s,
                                 None => {
@@ -567,27 +568,27 @@ pub fn bind(container: TraceContainer, profile: ModelProfile) -> Result<BoundTra
     // Ports consume too: an Export channel bound to a port would make this
     // pass a second consumer of its own export.
     for p in &container.ports {
-        if let PortSource::Channel(c) = p.source {
-            if extern_dir(c) == Some(ExternDir::Export) {
-                return Err(ValidateError::ExternDirViolation {
-                    chan: c,
-                    stage: Stage::Prologue,
-                });
-            }
+        if let PortSource::Channel(c) = p.source
+            && extern_dir(c) == Some(ExternDir::Export)
+        {
+            return Err(ValidateError::ExternDirViolation {
+                chan: c,
+                stage: Stage::Prologue,
+            });
         }
     }
     // Ports are pass-side consumers too.
     for p in &container.ports {
-        if let PortSource::Channel(c) = p.source {
-            if container.channels[c as usize].host_role == HostRole::Reader {
-                // Attribute to the descriptor; report with the epilogue tag
-                // absent a stage — use Prologue? Keep a dedicated message via
-                // SecondConsumer with the earliest stage marker.
-                return Err(ValidateError::SecondConsumer {
-                    chan: c,
-                    stage: Stage::Prologue,
-                });
-            }
+        if let PortSource::Channel(c) = p.source
+            && container.channels[c as usize].host_role == HostRole::Reader
+        {
+            // Attribute to the descriptor; report with the epilogue tag
+            // absent a stage — use Prologue? Keep a dedicated message via
+            // SecondConsumer with the earliest stage marker.
+            return Err(ValidateError::SecondConsumer {
+                chan: c,
+                stage: Stage::Prologue,
+            });
         }
     }
 

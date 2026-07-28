@@ -18,12 +18,12 @@
 //!   buffer straight, which makes both the intrinsic materialisation and the
 //!   reshapes redundant.
 
-use pie_ir::op::{intrinsic_tags, tags};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
+use pie_ir::op::{intrinsic_tags, tags};
 
 use pie_plan::{CompiledStage, Dimension, LANE_TABLE_ABI_VERSION, LibraryOp, Region, RegionKind};
 
@@ -163,7 +163,8 @@ pub(crate) fn analyze_direct_argmax(
                 value = op.args[0];
                 continue;
             }
-            if op.tag != tags::INTRINSIC_VAL || (op.intr != intrinsic_tags::LOGITS && op.intr != intrinsic_tags::MTP_LOGITS)
+            if op.tag != tags::INTRINSIC_VAL
+                || (op.intr != intrinsic_tags::LOGITS && op.intr != intrinsic_tags::MTP_LOGITS)
             {
                 break;
             }
@@ -256,9 +257,7 @@ pub fn emit_fused_region(
         }
         producer_of(value).is_some_and(|node| {
             let op = &ops[node];
-            op.tag == tags::RESHAPE
-                && !op.args.is_empty()
-                && produces_logits_intrinsic(op.args[0])
+            op.tag == tags::RESHAPE && !op.args.is_empty() && produces_logits_intrinsic(op.args[0])
         })
     };
     // The scale divide is folded into the nucleus kernel only when it is a

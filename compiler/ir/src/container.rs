@@ -633,7 +633,8 @@ pub fn decode(bytes: &[u8]) -> Result<TraceContainer, ContainerDecodeError> {
         names.push(String::from_utf8(bytes.to_vec()).map_err(|_| ContainerDecodeError::BadUtf8)?);
     }
 
-    let mut channels = Vec::with_capacity(r.bounded_count(n_channels, 8, MAX_CHANNELS, "channel table")?);
+    let mut channels =
+        Vec::with_capacity(r.bounded_count(n_channels, 8, MAX_CHANNELS, "channel table")?);
     for _ in 0..n_channels {
         let dt = r.u8()?;
         let dtype = ChanDType::from_tag(dt).ok_or(ContainerDecodeError::UnknownTag {
@@ -705,7 +706,8 @@ pub fn decode(bytes: &[u8]) -> Result<TraceContainer, ContainerDecodeError> {
         }
         stages.push(StageProgram { stage, ops });
     }
-    let mut externs = Vec::with_capacity(r.bounded_count(n_externs, 7, MAX_EXTERNS, "extern table")?);
+    let mut externs =
+        Vec::with_capacity(r.bounded_count(n_externs, 7, MAX_EXTERNS, "extern table")?);
     for _ in 0..n_externs {
         let name = r.u16()?;
         let d = r.u8()?;
