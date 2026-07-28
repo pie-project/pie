@@ -906,6 +906,14 @@ void prepare_step(
         // pushed every all-envelope decode step onto the generic readback
         // fallback, which cannot resolve chained values host-side and so
         // failed readiness forever.
+        //
+        // Composition is likewise orthogonal to CUDA-graph *capture*. All it
+        // asks of the model is that it run at the host's upper-bound geometry
+        // and let `row_valid` mask the padding -- exactly
+        // `graph_padding_kv_write_safe`. Demanding the strictly stronger
+        // `graph_safe` locked out families that satisfy that but keep a host
+        // sync somewhere (Mixtral/gpt-oss builds its MoE routing on the
+        // host), leaving them with no working path at all.
         s.dg_resolved = engine.dispatch->resolve_descriptors(
             view,
             static_cast<std::uint32_t>(kv_cache.page_size()),
@@ -915,7 +923,7 @@ void prepare_step(
             engine.forward_fn.supports_runtime_window,
             s.staged.get(),
             engine.graph_cache != nullptr &&
-                engine.forward_fn.graph_safe &&
+                engine.forward_fn.graph_padding_kv_write_safe &&
                 !(engine.tp_comm != nullptr && tp_device_compose_disabled()));
         if (!s.dg_resolved && !dg_err.empty()) {
             throw std::runtime_error(dg_err);
