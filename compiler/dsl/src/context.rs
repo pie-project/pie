@@ -246,18 +246,6 @@ pub(crate) fn emit(op: Op, result_tys: &[ValueType]) -> u32 {
     })
 }
 
-/// The recorded type of an already-defined value id (light inference). Retained
-/// for shape-derived ops; harmless if a given trace doesn't need it.
-#[allow(dead_code)]
-pub(crate) fn type_of(id: u32) -> ValueType {
-    SESSION.with_borrow(|s| {
-        s.as_ref()
-            .and_then(|s| s.current.as_ref())
-            .and_then(|r| r.types.get(id as usize).copied())
-            .expect("value id has no recorded type")
-    })
-}
-
 /// Record a channel `take`/`read` inside a stage: intern, push the op, register
 /// the endpoint claim; return the produced value id + type.
 pub(crate) fn record_channel_read(ch: &ChannelRef, consume: bool, span: Span) -> (u32, ValueType) {

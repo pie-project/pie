@@ -17,7 +17,7 @@ mod msl_corpus;
 
 use std::collections::BTreeSet;
 
-use msl_corpus::{corpus_stages, extended_stages};
+use msl_corpus::{GOLDEN_NAMES, corpus_stages, extended_stages, golden_dir};
 use pie_ir::op::{IntrinsicId, OP_TABLE, Op};
 use pie_ir::registry::Stage;
 use pie_plan::{LibraryOp, RegionKind, ScheduleTemplate};
@@ -143,4 +143,36 @@ fn every_stage_is_reached_by_the_corpus() {
         .filter(|stage| !covered.contains(stage))
         .collect();
     assert!(missing.is_empty(), "unreached stages: {missing:?}");
+}
+
+/// One level up from the rest of this file: is there a golden on disk that
+/// nothing compiles?
+///
+/// `GOLDEN_NAMES` is what every emitter sweep enumerates and `tests/golden/`
+/// is where the containers live, and nothing connected the two. A file added
+/// to the directory was read by no test; a name left behind after a deletion
+/// would fail late, in whichever sweep reached it first, with "missing".
+///
+/// The comparison is order-sensitive on purpose. The order is the order cases
+/// appear in every golden dump, so it is part of what those dumps pin.
+#[test]
+fn every_golden_on_disk_is_named_by_the_corpus() {
+    let mut on_disk: Vec<String> = std::fs::read_dir(golden_dir())
+        .expect("compiler/tests/golden/")
+        .map(|entry| entry.expect("golden dir entry").file_name())
+        .filter_map(|name| {
+            name.to_str()
+                .and_then(|name| name.strip_suffix(".txt"))
+                .map(str::to_string)
+        })
+        .collect();
+    on_disk.sort();
+    let named: Vec<String> = GOLDEN_NAMES.iter().map(|n| (*n).to_string()).collect();
+    assert_eq!(
+        on_disk, named,
+        "compiler/tests/golden/ and GOLDEN_NAMES disagree. This corpus is \
+         frozen -- new coverage belongs in `extended_traces` -- so a file here \
+         that is not named is either a mistake or a decision to unfreeze it, \
+         and a name with no file is a golden that was deleted without saying so"
+    );
 }
