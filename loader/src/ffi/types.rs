@@ -17,7 +17,7 @@
 use crate::types::{BackendKind, DType, QuantScheme, RepackLayout, RowMap};
 
 /// Sentinel for "no buffer", mirroring the C++ `numeric_limits<uint32_t>::max()`
-/// defaults on `PieLoaderStorageInstrView::buffer_id` and `slab_file_id`.
+/// default on `PieLoaderStorageInstrView::buffer_id`.
 pub const PIE_LOADER_NO_BUFFER: u32 = u32::MAX;
 
 /// Sentinel for "no source tensor", on the optional tensor-id fields.
@@ -631,16 +631,6 @@ pub struct PieLoaderBufferDeclView {
 
 pub type PieLoaderBufferDeclSlice = PieLoaderSlice<PieLoaderBufferDeclView>;
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct PieLoaderSlabPlacementView {
-    pub src_offset: u64,
-    pub dest_offset: u64,
-    pub bytes: u64,
-}
-
-pub type PieLoaderSlabPlacementSlice = PieLoaderSlice<PieLoaderSlabPlacementView>;
-
 /// One entry of the plan's instruction stream: an identity, and an operation.
 ///
 /// `id` is the schedule's handle on this instruction and is the only thing every
@@ -666,8 +656,8 @@ pub struct PieLoaderStorageInstrView {
 /// can only apologise for.
 ///
 /// The discriminants are the wire tag and are written out for the same reason
-/// the mirror enums' are — 4 is absent because a retired instruction had it, and
-/// renumbering to close the gap would silently move six others.
+/// the mirror enums' are — 4 and 7 are absent because retired instructions had
+/// them, and renumbering to close a gap would silently move every tag above it.
 #[repr(C, u32)]
 #[derive(Clone, Copy, Debug)]
 pub enum PieLoaderStorageOp {
@@ -740,12 +730,6 @@ pub enum PieLoaderStorageOp {
         source: PieLoaderSourceExtentView,
         dest_offset: u64,
     } = 6,
-    SlabScatter {
-        file_id: u32,
-        file_offset: u64,
-        span_bytes: u64,
-        placements: PieLoaderSlabPlacementSlice,
-    } = 7,
     Fill {
         buffer_id: u32,
     } = 8,

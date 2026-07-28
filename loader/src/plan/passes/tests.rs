@@ -7,12 +7,11 @@
 use super::rewrite::try_merge_bulk_extent_write;
 use super::validate::{validate_fill_order, validate_persistent_layout, validate_target_support};
 use crate::extent::Extent;
-use crate::types::DType;
 use crate::plan::{
-    BufferDecl, DestExtent, LoadPlan, SlabPlacement, SourceExtent, StorageInstr, StorageTarget,
-    TileMapKind, TileSpec, TransformSpec,
+    BufferDecl, DestExtent, LoadPlan, SourceExtent, StorageInstr, StorageTarget, TileMapKind,
+    TileSpec, TransformSpec,
 };
-use crate::types::{BackendKind, BufferId, FileId, InstrId, TensorId};
+use crate::types::{BackendKind, BufferId, DType, FileId, InstrId, TensorId};
 
 fn operand(id: u32, bytes: u64, alignment: u32, offset: Option<u64>) -> BufferDecl {
     BufferDecl {
@@ -154,7 +153,7 @@ fn fill_order_plan(write: StorageInstr, schedule: &[u32]) -> LoadPlan {
     plan
 }
 
-/// A bulk write into `B`'s arena window, as the slab/coalesce passes emit it.
+/// A bulk write into `B`'s arena window, as the coalesce pass emits it.
 fn bulk_into_b() -> StorageInstr {
     StorageInstr::BulkExtentWrite {
         id: InstrId(2),
@@ -190,32 +189,4 @@ fn rejects_a_bulk_write_into_a_buffer_zeroed_after_it() {
 fn accepts_a_bulk_write_beside_a_buffer_zeroed_after_it() {
     let mut plan = fill_order_plan(bulk_into_b(), &[1, 2, 0]);
     assert!(validate_fill_order(&mut plan).is_ok());
-}
-
-/// A slab scatter is checked per placement, not per instruction: the write it
-/// performs is a set of windows, and only one of them needs to land in a
-/// late-zeroed buffer for the plan to be wrong.
-#[test]
-fn rejects_a_slab_placement_landing_in_a_buffer_zeroed_after_it() {
-    let scatter = StorageInstr::SlabScatter {
-        id: InstrId(2),
-        file_id: FileId(0),
-        file_offset: 0,
-        span_bytes: 512,
-        placements: vec![
-            SlabPlacement {
-                src_offset: 0,
-                dest_offset: 0,
-                bytes: 256,
-            },
-            SlabPlacement {
-                src_offset: 256,
-                dest_offset: 256,
-                bytes: 256,
-            },
-        ],
-    };
-    // `A` first, the scatter, then `B` — the second placement is the offender.
-    let mut plan = fill_order_plan(scatter, &[0, 2, 1]);
-    assert!(validate_fill_order(&mut plan).is_err());
 }

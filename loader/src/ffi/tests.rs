@@ -185,26 +185,8 @@ fn plan_with_every_instr() -> LoadPlan {
             source: source_extent(65536),
             dest_offset: 4096,
         },
-        StorageInstr::SlabScatter {
-            id: InstrId(3),
-            file_id: FileId(0),
-            file_offset: 128,
-            span_bytes: 2048,
-            placements: vec![
-                SlabPlacement {
-                    src_offset: 0,
-                    dest_offset: 16,
-                    bytes: 1024,
-                },
-                SlabPlacement {
-                    src_offset: 1024,
-                    dest_offset: 2048,
-                    bytes: 1024,
-                },
-            ],
-        },
         StorageInstr::TileMap {
-            id: InstrId(4),
+            id: InstrId(3),
             kind: TileMapKind::Repack,
             source: Some(source_extent(256)),
             dest: Some(dest_extent(11)),
@@ -533,45 +515,10 @@ fn bulk_extent_write_carries_a_bare_arena_offset() {
 }
 
 #[test]
-fn slab_scatter_carries_placements() {
-    let plan = plan_with_every_instr();
-    with_plan(&plan, |pod| {
-        let slab = &unsafe { view::instrs(pod) }[3];
-        let (file_id, file_offset, span_bytes, placements) = operands!(
-            slab,
-            SlabScatter {
-                file_id,
-                file_offset,
-                span_bytes,
-                placements,
-            }
-        );
-        assert_eq!(*file_id, 0);
-        assert_eq!(*file_offset, 128);
-        assert_eq!(*span_bytes, 2048);
-        assert_eq!(
-            unsafe { view::slabs(placements) },
-            &[
-                PieLoaderSlabPlacementView {
-                    src_offset: 0,
-                    dest_offset: 16,
-                    bytes: 1024,
-                },
-                PieLoaderSlabPlacementView {
-                    src_offset: 1024,
-                    dest_offset: 2048,
-                    bytes: 1024,
-                },
-            ]
-        );
-    });
-}
-
-#[test]
 fn tile_map_carries_the_whole_transform() {
     let plan = plan_with_every_instr();
     with_plan(&plan, |pod| {
-        let tile = &unsafe { view::instrs(pod) }[4];
+        let tile = &unsafe { view::instrs(pod) }[3];
         let (
             tile_kind,
             input_buffers,
@@ -688,7 +635,7 @@ fn create_view_and_finalize_name_their_operands() {
         let instrs = unsafe { view::instrs(pod) };
 
         let (input_buffer, output_buffer, view_extent) = operands!(
-            &instrs[5],
+            &instrs[4],
             CreateView {
                 input_buffer,
                 output_buffer,
@@ -699,7 +646,7 @@ fn create_view_and_finalize_name_their_operands() {
         assert_eq!(*output_buffer, 13);
         assert_eq!(view_extent.buffer_id, 13);
 
-        let (buffer_id, name) = operands!(&instrs[6], Finalize { buffer_id, name });
+        let (buffer_id, name) = operands!(&instrs[5], Finalize { buffer_id, name });
         assert_eq!(*buffer_id, 0);
         assert_eq!(
             unsafe { view::bytes(name) },
@@ -712,10 +659,7 @@ fn create_view_and_finalize_name_their_operands() {
 fn the_schedule_survives() {
     let plan = plan_with_every_instr();
     with_plan(&plan, |pod| {
-        assert_eq!(
-            unsafe { view::schedule(pod) },
-            &[0, 1, 2, 3, 4, 5, 6, 7][..]
-        );
+        assert_eq!(unsafe { view::schedule(pod) }, &[0, 1, 2, 3, 4, 5, 6][..]);
     });
 }
 
@@ -790,7 +734,7 @@ fn plans_can_be_built_and_released_from_other_threads() {
         .collect();
     for handle in handles {
         let (pod, count) = handle.join().unwrap();
-        assert_eq!(count, 8);
+        assert_eq!(count, 7);
         unsafe { arena::release(pod as *mut PieLoaderPlan) };
     }
 }
@@ -1596,15 +1540,6 @@ fn storage_op_tags_are_the_wire_values() {
             dest_offset: 0,
         }),
         6
-    );
-    assert_eq!(
-        tag(Op::SlabScatter {
-            file_id: 0,
-            file_offset: 0,
-            span_bytes: 0,
-            placements: PieLoaderSlabPlacementSlice::default(),
-        }),
-        7
     );
     assert_eq!(tag(Op::Fill { buffer_id: 0 }), 8);
 }

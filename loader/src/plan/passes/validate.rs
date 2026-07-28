@@ -29,12 +29,12 @@ use crate::types::{BufferId, QuantScheme, RepackLayout};
 ///
 /// Two kinds of write have to be matched to a fill, and only one of them names
 /// a buffer. `ExtentWrite` and `TileMap` carry [`BufferId`]s, so the match is a
-/// lookup. `BulkExtentWrite` and `SlabScatter` address the persistent arena
-/// directly — coalescing is what turns a buffer-relative write into an
-/// arena-relative one, and it may fold several buffers into a single copy — so
-/// they are matched by *overlap* against the arena window each filled buffer
-/// owns. That is also the only formulation that stays right once a bulk write
-/// spans more than one buffer.
+/// lookup. `BulkExtentWrite` addresses the persistent arena directly —
+/// coalescing is what turns a buffer-relative write into an arena-relative one,
+/// and it may fold several buffers into a single copy — so it is matched by
+/// *overlap* against the arena window each filled buffer owns. That is also the
+/// only formulation that stays right once a bulk write spans more than one
+/// buffer.
 pub(super) fn validate_fill_order(program: &mut LoadPlan) -> Result<usize> {
     let mut filled: HashMap<BufferId, usize> = HashMap::new();
     for (at, id) in program.schedule.iter().enumerate() {
@@ -83,18 +83,13 @@ pub(super) fn validate_fill_order(program: &mut LoadPlan) -> Result<usize> {
         }
 
         // Writes that name an arena offset.
-        match instr {
-            StorageInstr::BulkExtentWrite {
-                source,
-                dest_offset,
-                ..
-            } => check_arena_write(&windows, *dest_offset, source.span_bytes, at)?,
-            StorageInstr::SlabScatter { placements, .. } => {
-                for placement in placements {
-                    check_arena_write(&windows, placement.dest_offset, placement.bytes, at)?;
-                }
-            }
-            _ => {}
+        if let StorageInstr::BulkExtentWrite {
+            source,
+            dest_offset,
+            ..
+        } = instr
+        {
+            check_arena_write(&windows, *dest_offset, source.span_bytes, at)?;
         }
     }
     Ok(0)

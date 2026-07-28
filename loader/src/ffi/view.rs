@@ -7,9 +7,8 @@
 //! no path that verifies the Rust plan directly, and that is the point: a bug in
 //! the marshalling is in scope for every caller, including the CLI and the
 //! goldens. When the two directions were separate constructors of the same
-//! `PlanView` they had already drifted — the `LoadPlan` side derived a plan's
-//! file reads from `StorageInstr::SlabScatter` while the POD side derived them
-//! from `slab_file_id`, and nothing compared the answers.
+//! `PlanView` they had already drifted — the two sides derived a plan's file
+//! reads from different fields, and nothing compared the answers.
 
 use super::arena;
 use super::entry::as_str;
@@ -98,9 +97,8 @@ pub(super) unsafe fn plan_view(
     let mut finalized = Vec::new();
     let mut reads = Vec::new();
     // Which instructions read a file used to be a question about resting
-    // values: `source` was present on all of them and meaningful on three, and
-    // `slab_file_id` was tested against a sentinel on every instruction because
-    // only one kind could ever set it. The operation now says so itself.
+    // values: `source` was present on all of them and meaningful on three. The
+    // operation now says so itself.
     for instr in instrs {
         match &instr.op {
             PieLoaderStorageOp::Finalize { name, .. } => finalized.push(
@@ -127,19 +125,6 @@ pub(super) unsafe fn plan_view(
                         span_bytes: source.span_bytes,
                     });
                 }
-            }
-            PieLoaderStorageOp::SlabScatter {
-                file_id,
-                file_offset,
-                span_bytes,
-                ..
-            } => {
-                reads.push(crate::verify::ReadView {
-                    instr: instr.id,
-                    file_id: *file_id,
-                    file_offset: *file_offset,
-                    span_bytes: *span_bytes,
-                });
             }
             // Named rather than left to a wildcard: `verify` decides a file is
             // unread by finding no `ReadView` for it, so an operation that

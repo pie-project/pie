@@ -348,14 +348,6 @@ nlohmann::json plan_to_json(const pie_loader::LoadPlanView& p) {
             entry["dest_offset"] = op.dest_offset;
             break;
         }
-        case Tag::SlabScatter: {
-            const auto& op = in.op.slab_scatter;
-            entry["slab_file"] = op.file_id;
-            entry["slab_offset"] = op.file_offset;
-            entry["slab_span"] = op.span_bytes;
-            entry["slab_placements"] = op.placements.len;
-            break;
-        }
         case Tag::TileMap: {
             const auto& op = in.op.tile_map;
             entry["tile_kind"] = static_cast<int>(op.tile_kind);

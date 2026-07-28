@@ -213,13 +213,6 @@ pub struct DestExtent {
     pub stride: Extent,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SlabPlacement {
-    pub src_offset: u64,
-    pub dest_offset: u64,
-    pub bytes: u64,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TileMapKind {
     Cast,
@@ -316,13 +309,6 @@ pub enum StorageInstr {
         id: InstrId,
         source: SourceExtent,
         dest_offset: u64,
-    },
-    SlabScatter {
-        id: InstrId,
-        file_id: FileId,
-        file_offset: u64,
-        span_bytes: u64,
-        placements: Vec<SlabPlacement>,
     },
     TileMap {
         id: InstrId,

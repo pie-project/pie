@@ -33,7 +33,6 @@
 #include <cuda_runtime.h>
 
 #include "cuda_check.hpp"
-#include "kernels/slab_scatter.hpp"  // slab_scatter() — the transcode kernels moved to transcode_engine.hpp
 #endif
 #include "loader/rust_quant_attachment.hpp"
 #include "pie_loader/checkpoint_source.hpp"
@@ -53,13 +52,6 @@ public:
           weights_(weights),
           quant_attachments_(std::move(quant_attachments))
     {}
-
-    ~LoadPlanExecutor()
-    {
-#if PIE_CUDA_RUST_STORAGE_EXECUTOR_HAS_CUDA
-        free_slab_buffers_noexcept();
-#endif
-    }
 
     LoadExecutionStats execute(
         const pie_loader::LoadPlanView& plan)
@@ -112,13 +104,6 @@ public:
                 break;
             case Tag::BulkExtentWrite:
                 bulk_extent_write(instr.op.bulk_extent_write, stats);
-                break;
-            case Tag::SlabScatter:
-                copy_engine_.flush();
-                {
-                    PhaseTimer _pt(&stats.phase_transform_ms);
-                    slab_scatter(instr.op.slab_scatter, stats);
-                }
                 break;
             case Tag::Finalize:
                 {
@@ -346,124 +331,6 @@ private:
         stats.h2d_bulk_copy_bytes += instr.source.span_bytes;
     }
 
-    void slab_scatter(
-        const pie_loader::PieLoaderStorageOp::SlabScatter_Body& instr,
-        LoadExecutionStats& stats)
-    {
-#if PIE_CUDA_RUST_STORAGE_EXECUTOR_HAS_CUDA
-        if (persistent_arena_base_ == nullptr) {
-            throw std::runtime_error(
-                "rust storage executor: SlabScatter requires persistent arena");
-        }
-        if (instr.placements.len == 0 || instr.span_bytes == 0) {
-            return;
-        }
-        ensure_slab_staging_capacity(instr.span_bytes);
-        ensure_slab_placement_capacity(instr.placements.len);
-
-        slab_placement_host_.resize(instr.placements.len);
-        std::uint64_t payload_bytes = 0;
-        for (std::size_t i = 0; i < instr.placements.len; ++i) {
-            const auto& placement = instr.placements.ptr[i];
-            if (placement.src_offset > instr.span_bytes ||
-                placement.bytes > instr.span_bytes - placement.src_offset) {
-                throw std::runtime_error(
-                    "rust storage executor: SlabScatter source placement out of bounds");
-            }
-            if (placement.dest_offset > persistent_arena_bytes_ ||
-                placement.bytes > persistent_arena_bytes_ - placement.dest_offset) {
-                throw std::runtime_error(
-                    "rust storage executor: SlabScatter destination out of bounds");
-            }
-            slab_placement_host_[i] = SlabScatterPlacement{
-                placement.src_offset,
-                placement.dest_offset,
-                placement.bytes,
-            };
-            payload_bytes += placement.bytes;
-        }
-
-        cudaStream_t stream = copy_engine_.acquire_stream();
-        copy_engine_.copy_span_to_device(
-            instr.file_id,
-            instr.file_offset,
-            instr.span_bytes,
-            slab_staging_,
-            stream);
-        CUDA_CHECK(cudaMemcpyAsync(
-            slab_placements_device_,
-            slab_placement_host_.data(),
-            instr.placements.len * sizeof(SlabScatterPlacement),
-            cudaMemcpyHostToDevice,
-            stream));
-        launch_slab_scatter(
-            static_cast<const std::uint8_t*>(slab_staging_),
-            persistent_arena_base_,
-            slab_placements_device_,
-            instr.placements.len,
-            stream);
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-
-        ++stats.h2d_copy_count;
-        stats.h2d_copy_bytes += instr.span_bytes;
-        ++stats.slab_scatter_count;
-        stats.slab_scatter_placements += instr.placements.len;
-        stats.slab_scatter_source_bytes += instr.span_bytes;
-        stats.slab_scatter_payload_bytes += payload_bytes;
-#else
-        (void)instr;
-        (void)stats;
-        throw std::runtime_error(
-            "rust storage executor: SlabScatter requires CUDA support");
-#endif
-    }
-
-#if PIE_CUDA_RUST_STORAGE_EXECUTOR_HAS_CUDA
-    void ensure_slab_staging_capacity(std::uint64_t bytes)
-    {
-        if (slab_staging_capacity_ >= bytes) {
-            return;
-        }
-        if (slab_staging_ != nullptr) {
-            CUDA_CHECK(cudaFree(slab_staging_));
-            slab_staging_ = nullptr;
-            slab_staging_capacity_ = 0;
-        }
-        CUDA_CHECK(cudaMalloc(&slab_staging_, static_cast<std::size_t>(bytes)));
-        slab_staging_capacity_ = bytes;
-    }
-
-    void ensure_slab_placement_capacity(std::size_t count)
-    {
-        if (slab_placement_capacity_ >= count) {
-            return;
-        }
-        if (slab_placements_device_ != nullptr) {
-            CUDA_CHECK(cudaFree(slab_placements_device_));
-            slab_placements_device_ = nullptr;
-            slab_placement_capacity_ = 0;
-        }
-        CUDA_CHECK(cudaMalloc(
-            &slab_placements_device_,
-            count * sizeof(SlabScatterPlacement)));
-        slab_placement_capacity_ = count;
-    }
-
-    void free_slab_buffers_noexcept() noexcept
-    {
-        if (slab_staging_ != nullptr) {
-            (void)cudaFree(slab_staging_);
-            slab_staging_ = nullptr;
-        }
-        if (slab_placements_device_ != nullptr) {
-            (void)cudaFree(slab_placements_device_);
-            slab_placements_device_ = nullptr;
-        }
-        slab_staging_capacity_ = 0;
-        slab_placement_capacity_ = 0;
-    }
-#endif
-
     void create_view(
         const pie_loader::LoadPlanView& plan,
         const pie_loader::PieLoaderStorageOp::CreateView_Body& instr)
@@ -650,14 +517,6 @@ private:
     std::uint64_t persistent_arena_bytes_ = 0;
     // Host->device copy path (streams, pinned staging, reader lanes, batching).
     WeightCopyEngine copy_engine_{loader_};
-#if PIE_CUDA_RUST_STORAGE_EXECUTOR_HAS_CUDA
-    void* slab_staging_ = nullptr;
-    std::uint64_t slab_staging_capacity_ = 0;
-    SlabScatterPlacement* slab_placements_device_ = nullptr;
-    std::size_t slab_placement_capacity_ = 0;
-    std::vector<SlabScatterPlacement> slab_placement_host_;
-
-#endif
     pie_loader::LoadPlanIndex plan_index_{"load plan executor"};
     BufferResolver resolver_{buffers_, finalized_buffer_names_, weights_};
     TranscodeEngine transcode_{loader_, copy_engine_, plan_index_, resolver_};

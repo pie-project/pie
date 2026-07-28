@@ -129,33 +129,6 @@ impl HostExecutor<'_> {
                     let bytes = self.read_extent(&source)?;
                     self.write_arena(dest_offset, &bytes)?;
                 }
-                StorageInstr::SlabScatter {
-                    file_id,
-                    file_offset,
-                    span_bytes,
-                    placements,
-                    ..
-                } => {
-                    let slab = self.read_file(
-                        file_id.0,
-                        file_offset,
-                        span_bytes,
-                        self.plan.target.max_tile_bytes,
-                    )?;
-                    for placement in placements {
-                        let start = usize::try_from(placement.src_offset)
-                            .map_err(|_| invalid("slab source offset overflow"))?;
-                        let len = usize::try_from(placement.bytes)
-                            .map_err(|_| invalid("slab placement size overflow"))?;
-                        let end = start
-                            .checked_add(len)
-                            .ok_or_else(|| invalid("slab source range overflow"))?;
-                        let bytes = slab
-                            .get(start..end)
-                            .ok_or_else(|| invalid("slab source placement is out of bounds"))?;
-                        self.write_arena(placement.dest_offset, bytes)?;
-                    }
-                }
                 StorageInstr::TileMap {
                     kind,
                     source,
@@ -731,7 +704,6 @@ fn instr_id(instr: &StorageInstr) -> crate::types::InstrId {
         | StorageInstr::Fill { id, .. }
         | StorageInstr::ExtentWrite { id, .. }
         | StorageInstr::BulkExtentWrite { id, .. }
-        | StorageInstr::SlabScatter { id, .. }
         | StorageInstr::TileMap { id, .. }
         | StorageInstr::CreateView { id, .. }
         | StorageInstr::Finalize { id, .. } => *id,

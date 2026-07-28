@@ -33,7 +33,7 @@
 
 #include "kernels/rmsnorm.hpp"
 #include "kernels/rope.hpp"
-#include "kernels/slab_scatter.hpp"
+#include "kernels/slot_ops.hpp"
 #include "kernels/swiglu.hpp"
 #include "kernels/topk_softmax.hpp"
 #include "ops/attention_flashinfer.hpp"

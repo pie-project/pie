@@ -45,8 +45,8 @@ pub fn all() -> &'static [Pass] {
             run: rewrite::hoist_bulk_extent_writes,
         },
         Pass {
-            name: "slab-scatter-arena-writes",
-            run: rewrite::build_slab_scatter_writes,
+            name: "group-shared-source-reads",
+            run: rewrite::group_shared_source_reads,
         },
         Pass {
             name: "merge-adjacent-extent-writes",

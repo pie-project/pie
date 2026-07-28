@@ -520,7 +520,7 @@ add_library(pie_driver_cuda_lib STATIC
   src/kernels/residual_add.cu
   src/kernels/rmsnorm.cu
   src/kernels/rope.cu
-  src/kernels/slab_scatter.cu
+  src/kernels/slot_ops.cu
   src/kernels/split_packed.cu
   src/kernels/swiglu.cu
   src/kernels/topk_softmax.cu

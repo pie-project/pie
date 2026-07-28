@@ -18,7 +18,7 @@ constexpr static const uint32_t PIE_LOADER_NO_NODE = UINT32_MAX;
 constexpr static const int32_t PIE_LOADER_NO_AXIS = -1;
 
 /// Sentinel for "no buffer", mirroring the C++ `numeric_limits<uint32_t>::max()`
-/// defaults on `PieLoaderStorageInstrView::buffer_id` and `slab_file_id`.
+/// default on `PieLoaderStorageInstrView::buffer_id`.
 constexpr static const uint32_t PIE_LOADER_NO_BUFFER = UINT32_MAX;
 
 /// Sentinel for "no source tensor", on the optional tensor-id fields.
@@ -97,8 +97,6 @@ enum class PieLoaderDType : uint32_t {
   U16 = 9,
   U8 = 10,
   Bool = 11,
-  // Appended after `Bool` so existing discriminants keep their values: the
-  // enum is an ABI, not a declaration order.
   E8M0 = 12,
   I64 = 13,
   U64 = 14,
@@ -564,14 +562,6 @@ struct PieLoaderDestExtentView {
   PieLoaderStridedExtentView stride;
 };
 
-struct PieLoaderSlabPlacementView {
-  uint64_t src_offset;
-  uint64_t dest_offset;
-  uint64_t bytes;
-};
-
-using PieLoaderSlabPlacementSlice = PieLoaderSlice<PieLoaderSlabPlacementView>;
-
 /// What an instruction does, as a tagged union carrying only that operation's
 /// operands.
 ///
@@ -585,8 +575,8 @@ using PieLoaderSlabPlacementSlice = PieLoaderSlice<PieLoaderSlabPlacementView>;
 /// can only apologise for.
 ///
 /// The discriminants are the wire tag and are written out for the same reason
-/// the mirror enums' are — 4 is absent because a retired instruction had it, and
-/// renumbering to close the gap would silently move six others.
+/// the mirror enums' are — 4 and 7 are absent because retired instructions had
+/// them, and renumbering to close a gap would silently move every tag above it.
 struct PieLoaderStorageOp {
   enum class Tag : uint32_t {
     Allocate = 0,
@@ -599,7 +589,6 @@ struct PieLoaderStorageOp {
     /// an arena allocation whose only content the executor ever read was
     /// `dest.offset`.
     BulkExtentWrite = 6,
-    SlabScatter = 7,
     Fill = 8,
   };
 
@@ -674,13 +663,6 @@ struct PieLoaderStorageOp {
     uint64_t dest_offset;
   };
 
-  struct SlabScatter_Body {
-    uint32_t file_id;
-    uint64_t file_offset;
-    uint64_t span_bytes;
-    PieLoaderSlabPlacementSlice placements;
-  };
-
   struct Fill_Body {
     uint32_t buffer_id;
   };
@@ -693,7 +675,6 @@ struct PieLoaderStorageOp {
     CreateView_Body create_view;
     Finalize_Body finalize;
     BulkExtentWrite_Body bulk_extent_write;
-    SlabScatter_Body slab_scatter;
     Fill_Body fill;
   };
 };

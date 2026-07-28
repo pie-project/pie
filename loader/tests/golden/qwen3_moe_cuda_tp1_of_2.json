@@ -32,7 +32,7 @@
       "rewrites": 3
     },
     {
-      "pass": "slab-scatter-arena-writes",
+      "pass": "group-shared-source-reads",
       "instrs_before": 63,
       "instrs_after": 63,
       "rewrites": 0

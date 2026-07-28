@@ -183,26 +183,6 @@ BoundDecode stage_decode_storage(
                 load.max_tile_bytes());
             break;
         }
-        case Tag::SlabScatter: {
-            const auto& op = instr.op.slab_scatter;
-            for (std::size_t i = 0; i < op.placements.len; ++i) {
-                const auto& placement = op.placements.ptr[i];
-                if (placement.dest_offset > b.weights_region.size ||
-                    placement.bytes >
-                        b.weights_region.size - placement.dest_offset) {
-                    throw std::runtime_error(
-                        "metal storage executor: slab destination is out of bounds");
-                }
-                view.copy_storage_bytes(
-                    op.file_id,
-                    op.file_offset + placement.src_offset,
-                    placement.bytes,
-                    static_cast<std::uint8_t*>(b.weights_region.contents()) +
-                        placement.dest_offset,
-                    load.max_tile_bytes());
-            }
-            break;
-        }
         case Tag::CreateView: {
             const auto& op = instr.op.create_view;
             const auto input = buffers.find(op.input_buffer);
