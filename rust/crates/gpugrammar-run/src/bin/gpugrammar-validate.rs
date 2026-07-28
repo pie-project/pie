@@ -55,6 +55,7 @@ fn main() -> Result<()> {
         .unwrap_or(20_000);
     let limits = Limits {
         lexer_states: state_limit,
+        exact: std::env::var_os("GPUGRAMMAR_EXACT").is_some(),
         ..Default::default()
     };
     let report = std::env::var("GPUGRAMMAR_REPORT").is_ok();

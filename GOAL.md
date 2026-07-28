@@ -335,6 +335,31 @@ engine's oldest safety story - "narrowing is the safe direction" - and by this
 contract it is exactly backwards. Seven of the eight documents we wrongly
 refuse are the configuration ceiling.
 
+**And most of that is the same bug again.** A configuration set grows when a
+prefix has several readings, and the commonest reading to fork on is a declared
+property name that also scans as the generic key. Excluding declared names
+takes the sample's counts from 128, 64 and 32 down to 5, 3 and 3, and takes
+four of the seven wrong refusals with them:
+
+| | default | `exact=True` |
+|---|---:|---:|
+| instances rejected | 24 | **19** |
+| rejected at the final byte | 1 | **0** |
+| of those, valid documents wrongly refused | 7 | **3** |
+| widest configuration set, sample of 60 | 128 | 5 typical, 139 worst |
+
+Nothing that was accepted becomes refused. So one lowering decision - letting a
+declared name be read two ways - was at once a widening hole, seven eighths of
+the parser conflicts, and most of the narrowing at the ceiling. The three
+problems the audit found separately have substantially one cause.
+
+What remains at the ceiling is a genuine resource limit rather than an
+artefact: one schema in the sample still reaches 139 configurations under
+either lowering. Since the typical grammar now needs fewer than eight, a
+per-grammar ceiling would be worth much more than when it was last costed
+against speed alone - it was cancelled at 6% there, and here it is the
+difference between a mask that narrows and one that does not.
+
 So the boundary is not a grammar-class question. Restricting to a deterministic
 class would not move it: on grammars that already have no parser conflict, a
 sequence still carries a median of 2 configurations and up to the ceiling of
