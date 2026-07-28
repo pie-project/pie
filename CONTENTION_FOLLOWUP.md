@@ -3422,3 +3422,85 @@ REMAINING, MEASURED, NOT FIXED:
    (21.7 us). The trace is identical every pass; only a few input channel
    values change. Compiling each channel-writing stage once into a closure
    over its live inputs would remove the rest.
+
+## §20.16 — the capped close barrier deleted, and what the `allshared_noswap`
+## flake actually is
+
+### `close()` no longer waits for a scheduler ack
+
+`pipeline_close_inner` branched: under a capped execution admission it called
+`notify_pipeline_close(pid).await`, otherwise the fire-and-forget
+`notify_lane_close(pid, None)`. The two send the **identical**
+`SchedulerItem::PipelineLeave(pid, None, Close, ..)` — the only difference is
+a oneshot the caller then awaits. The policy effect is the same, and the
+handler (worker.rs:2650) replies immediately, so the await was a pure
+synchronisation barrier, measured in §20.15 at 25.40 ms p50 / 40.20 ms p90
+per process.
+
+It also contradicted the function's own contract, three lines above it:
+"Close is the sole end-of-stream verb: it rejects later submissions and
+releases the scheduler wait-set *immediately* ... close never waits for an
+unsettled fire."
+
+Deleted; both modes now take the fire-and-forget path. Ordering is unchanged
+— Close is posted on the same per-driver channel ahead of the Terminate that
+`ProcessCtx::drop` posts, so leave-then-release still holds.
+
+Measured (conc 512, N=4096, `PIE_FIRE_TIMING=waves`):
+
+| | per-turnover gap | startup gap |
+| - | ---------------:| -----------:|
+| awaited close   | 91.7 ms (mean of 7) | 435.6 ms |
+| fire-and-forget | **74.3 ms** (-19%)  | **377.4 ms** |
+
+Throughput is at the noise floor as expected (29894 / 30347 / 29897 vs
+30267 / 29798 / 30190): 17 ms x 7 turnovers is 0.7% of a 17.7 s run. Kept
+because it restores the documented contract, deletes a branch, and the
+barrier had no demonstrable purpose. `churn_extreme` 4/4 PASS — that is the
+regression test of `20060e93e "Fix extreme contention teardown"`, the commit
+that introduced the barrier.
+
+### `allshared_noswap` is bistable, and always has been
+
+The suite came back 15/16 with `allshared_noswap` failing `completed 7 < 8`.
+A/B, same machine session, 6 repeats each:
+
+| build | completions per run | fails |
+| ----- | ------------------- | ----: |
+| without this change | 6, 128, 128, 5, 9, 13 | 2/6 |
+| with this change    | 10, 128, 128, 128, 128, 5 | 1/6 |
+
+Not a regression — pre-existing, and if anything less frequent. The
+distribution is **bimodal**, not noisy: a run either completes 128/128 in
+~8.8 s or dies at ~0.9 s with 5-13 completions.
+
+Root cause of the two modes, from the failing run's own errors: 116 of 128
+requests fail `first frame submit: ... KV pool starved: 61 pages asked, 0
+free of 256`. The 900-word shared prefix costs **61 pages**, so a 256-page
+pool funds four of them. The good mode is not "everyone fits" — it is
+requests PARKING and being served ~4 at a time (which is exactly the 8.8 s).
+The bad mode is the same requests being **destroyed** by the starvation rung
+instead of parking.
+
+So the bistability is the wedge predicate, `ResidencyPlanner::is_wedged`
+(planner.rs:1552), firing at cold start. It reports wedged when no process
+is `Resident && admitted && !parked` — i.e. it takes "nobody is admitted
+yet" as proof that "no completion can ever arrive". At t=0 the whole fleet
+is registered, four asks consume the pool, and the rest park; whether an
+admitted-and-unparked process exists at the instant the predicate runs is a
+sub-millisecond race, which is exactly the 1-in-3 shape observed.
+
+This is NOT what the frame/run-ahead work addressed, and it was never fixed:
+§20.7 records `allshared_noswap` at "128/128, 0 failed under mode 2", but
+§20.3's calibration note in the same document records mode 2 completing
+"31-59, distributions that touch" and concludes "that scenario asserts
+liveness only". The contract was therefore set to `min_completed=8`, which
+is why the suite has never flagged the bad mode — 5 < 8 catches it only when
+the kill is unusually thorough.
+
+OPEN, newly localised: the wedge predicate needs to distinguish "no fire can
+ever complete" from "no fire has started yet" — e.g. require that some lane
+has been admitted-and-unparked at least once since the head parked, rather
+than reading the instantaneous set. Until then `allshared_noswap` will keep
+flaking and, more importantly, a real cold-start fleet can be destroyed
+instead of queued.

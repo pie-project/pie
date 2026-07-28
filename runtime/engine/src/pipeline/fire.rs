@@ -1592,11 +1592,7 @@ async fn pipeline_close_inner<C: FireContext>(
     });
     if let Some((first_close, pipeline_id, fires)) = state {
         if first_close {
-            if crate::inferlet::process::execution_admission_is_capped() {
-                crate::scheduler::worker::notify_pipeline_close(pipeline_id).await;
-            } else {
-                crate::scheduler::worker::notify_lane_close(pipeline_id, None);
-            }
+            crate::scheduler::worker::notify_lane_close(pipeline_id, None);
         }
         drain_settled(ctx, Some(&fires)).await?;
     }
