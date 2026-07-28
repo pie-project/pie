@@ -241,30 +241,94 @@ the stack does not have:
 rejects; refusing the first is a violation and admitting the second is an
 approximation (`files/probe_boundary.py`):
 
-| | verdict |
-|---|---|
-| required properties, closed objects, value types, lengths, numeric bounds, nesting | exact |
-| `oneOf` exclusivity | **widens** - inherent, belongs outside |
-| `uniqueItems` | **widens** - inherent, belongs outside |
-| **declared property types, when the object is open** | **widens - and this one is ours** |
-| **the `Ordered` precision level** | **narrows** |
-| **the configuration ceiling** | **narrows** |
+| | at the audit | now |
+|---|---|---|
+| required properties, closed objects, value types, lengths, numeric bounds, nesting | exact | exact |
+| `oneOf` exclusivity | **widens** - inherent, belongs outside | widens, **declared** |
+| `uniqueItems` | **widens** - inherent, belongs outside | widens, **declared** |
+| declared property types, when the object is open | **widens - and this one is ours** | widens, **declared**; exact on request |
+| the `Ordered` precision level | **narrows** | **deleted** |
+| the configuration ceiling | **narrows** | narrows, and still open |
 
-Three findings, and two of them are bugs by the contract above.
+Three findings, two of them bugs by the contract above. Both have been acted
+on and the audit now reports **0 narrowing violations** against 3.
 
 **A declared property's type is not enforced when `additionalProperties` is
 permitted**, which is the default. `{"a": 1}` against `{"properties": {"a":
 {"type":"string"}}}` is invalid and we admit it, because the object body has an
-arm taking any name with any value and a declared name goes through it. Adding
-`additionalProperties: false` makes it exact. This is not an inherent limit -
-"any name except these" is a regular set - so it is fixable, and it is probably
-the largest single source of the 7 invalid corpus documents we admit.
+arm taking any name with any value and a declared name goes through it.
 
-**`Ordered` narrows, and its own source says so.** The `Precision` enum's
-header states that no level describes less than the schema allows; the
-`Ordered` variant three lines below states that it rejects permutations of
-valid documents. Both cannot hold. It is the fallback for four corpus schemas
-and it is why schema 247 refuses a document its schema accepts.
+This is not an inherent limit. "Any name except these" is a regular set, and
+`string_body_excluding` builds the complement exactly: a string is not a
+declared name when it stops at a trie node no name ends at, or leaves the trie
+by a character no edge carries, after which the rest is free. Those two are
+built separately so the free tail is emitted once - building it per node is
+equally correct and more than doubles compile time, because the lexer then
+determinises a copy of "any string" for every character of every declared name.
+
+**And it is off by default, which is the more interesting result.** Excluding
+declared names costs the schema its one shared string lexeme: every object then
+carries a key terminal with its own trie, and the lexer determinises the union
+of all of them.
+
+| | default | `exact=True` |
+|---|---:|---:|
+| compile p50 | 27 ms | 159 ms |
+| compile p90 | 1.4 s | 3.2 s |
+| captured fill, batch 512 | 72 us | 155 us |
+| captured advance, batch 512 | 49 us | 96 us |
+| corpus instances accepted | 483 | **488** |
+| schemas needing conflict forking | 64 | **8** |
+
+The two things this project loses on are compile time and memory. Paying 6x
+compile and 2x per step to enforce one keyword interaction that a downstream
+type check settles for nothing is the wrong default, so the default declares it
+instead. Note the last row: most of the corpus's parser conflicts are this same
+ambiguity seen from the other side - a declared name has two readings, the
+literal and the generic key - which is why closing it removes seven eighths of
+them. That is the strongest evidence yet that the conflicts are a property of
+the lowering rather than of JSON Schema.
+
+**What makes a widened mask safe is being told how it widened.** A compiled
+grammar now carries `approximations`: exactly what it does not enforce, gated on
+both the level it settled on and the keywords the schema actually uses, so a
+closed object reports nothing and a schema that never mentions `uniqueItems` is
+not warned about it. A list that cries wolf is one callers learn to ignore, and
+it is the only thing standing between a widened mask and a wrong document.
+
+    >>> grammar = engine.compile_json_schema(schema)
+    >>> grammar.approximations
+    ['a property whose name the schema declares may also be read as an
+      additional one, so its declared type is not enforced while
+      additionalProperties is open']
+
+This is the boundary made into an API rather than a paragraph: the automaton
+says where it stops, and the caller knows what is left to do.
+
+**`Ordered` narrowed, and its own source said so.** The `Precision` enum's
+header stated that no level describes less than the schema allows; the
+`Ordered` variant three lines below stated that it rejects permutations of
+valid documents. Both cannot hold.
+
+The cause was that `Precision` was one enum over two axes. Whether an object
+takes its properties in any order is a *narrowing* knob, bought for a smaller
+lexer; how far branches merge is a widening one. They were walked in one order,
+and `unordered()` was true only at the first level, so `Merged` and `Branches`
+silently used the narrowing lowering too.
+
+**Fixed by making the chain one axis, every step of it widening.** `Ordered` is
+gone. What never fits is always *counting* - `required` needs a subset of the
+required set in the parser state, `minProperties`/`maxProperties` need a tally -
+while the shape of an object costs one choice regardless, so the fallback keeps
+the shape and drops the counting. That is a strict superset. It is applied to
+the object that did not fit and to nothing else; refusing the schema so the
+search retries it at a coarser level was measured and is worse, 494 schemas
+against 507, because it relaxes every other object too and those did fit.
+
+That deleted `build_property_state` and `intersperse_properties`, the
+subset-state machinery that existed only to serve the declared order, and with
+it schema 247 - the only wrong refusal in the corpus that was a lowering
+decision rather than the configuration ceiling.
 
 **The ceilings narrow.** Dropping a configuration at the ceiling is the
 engine's oldest safety story - "narrowing is the safe direction" - and by this
