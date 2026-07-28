@@ -76,6 +76,15 @@ pub enum Backend {
 }
 
 impl Backend {
+    /// Every backend, for callers that mean "all of them".
+    ///
+    /// A test that wants both backends would otherwise write the pair out,
+    /// and a third backend would leave that test quietly covering two of
+    /// three. `every_backend_is_in_all` keeps this honest against [`parse`].
+    ///
+    /// [`parse`]: Backend::parse
+    pub const ALL: &'static [Backend] = &[Backend::Cuda, Backend::Metal];
+
     /// Parse a driver's advertised backend. Unknown names mean "no host code
     /// generation", never a guess.
     pub fn parse(name: &str) -> Option<Self> {
@@ -83,6 +92,14 @@ impl Backend {
             "cuda" => Some(Backend::Cuda),
             "metal" => Some(Backend::Metal),
             _ => None,
+        }
+    }
+
+    /// The name a driver advertises. Inverse of [`Backend::parse`].
+    pub fn name(self) -> &'static str {
+        match self {
+            Backend::Cuda => "cuda",
+            Backend::Metal => "metal",
         }
     }
 
@@ -96,20 +113,33 @@ impl Backend {
 }
 
 /// Emit every kernel a driver needs for `stages`, in stage then region order.
+///
+/// One `match` owns the whole backend decision. The program-level effect
+/// kernels used to be reached by an `if backend == Backend::Metal` *after* the
+/// loop, which meant a third backend would compile, run, and quietly emit no
+/// readiness or commit kernels at all. Everything a backend does is now in its
+/// arm, so adding one is a compile error here rather than a missing kernel in
+/// a driver.
 pub fn emit_program(
     backend: Backend,
     stages: &[CompiledStage],
     bound: &BoundTrace,
 ) -> Vec<EmittedKernel> {
     let mut kernels = Vec::new();
-    for (stage_index, stage) in stages.iter().enumerate() {
-        match backend {
-            Backend::Cuda => emit_cuda_stage(stage, stage_index, &mut kernels),
-            Backend::Metal => emit_metal_stage(stage, stage_index, &mut kernels),
+    match backend {
+        Backend::Cuda => {
+            for (stage_index, stage) in stages.iter().enumerate() {
+                emit_cuda_stage(stage, stage_index, &mut kernels);
+            }
+            // No program-level effect kernels: the CUDA driver's readiness and
+            // commit are prebuilt tier-0 kernels, not generated ones.
         }
-    }
-    if backend == Backend::Metal {
-        emit_metal_program_effects(bound, &mut kernels);
+        Backend::Metal => {
+            for (stage_index, stage) in stages.iter().enumerate() {
+                emit_metal_stage(stage, stage_index, &mut kernels);
+            }
+            emit_metal_program_effects(bound, &mut kernels);
+        }
     }
     kernels
 }
@@ -286,5 +316,44 @@ fn grouped_library(stage: &CompiledStage, region: &Region) -> Option<LibraryOp> 
             (crate::op_view::OpView::of(op).tag == tags::TOP_K).then_some(LibraryOp::TopK)
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec::Vec;
+
+    /// Walk the enum by successor. Odd on purpose: the `match` is exhaustive,
+    /// so a new variant does not compile until it is given a place in the
+    /// order, and the walk that place produces is what [`Backend::ALL`] is
+    /// then required to equal. A plain `for backend in Backend::ALL` cannot do
+    /// that — it only ever visits what the list already contains, which is the
+    /// thing in question.
+    fn walk() -> Vec<Backend> {
+        let mut out = Vec::new();
+        let mut next = Some(Backend::Cuda);
+        while let Some(backend) = next {
+            out.push(backend);
+            next = match backend {
+                Backend::Cuda => Some(Backend::Metal),
+                Backend::Metal => None,
+            };
+        }
+        out
+    }
+
+    /// [`Backend::ALL`] is the whole enum, and every entry round-trips through
+    /// the two string conversions beside it. Without this, a third backend
+    /// could reach `name`, `emitter_version` and `emit_program` — all three of
+    /// which the compiler does insist on — and still quietly halve every "for
+    /// both backends" test that iterates `ALL`.
+    #[test]
+    fn all_is_the_whole_enum_and_round_trips() {
+        assert_eq!(Backend::ALL, walk().as_slice());
+        for backend in Backend::ALL {
+            assert_eq!(Backend::parse(backend.name()), Some(*backend));
+        }
+        assert_eq!(Backend::parse("vulkan"), None);
     }
 }

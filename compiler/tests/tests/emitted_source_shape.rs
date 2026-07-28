@@ -51,7 +51,7 @@ fn every_emitted_kernel() -> Vec<(String, Backend, EmittedKernel)> {
             continue;
         };
         let stages = compile_bound(&bound);
-        for backend in [Backend::Cuda, Backend::Metal] {
+        for &backend in Backend::ALL {
             for kernel in emit_program(backend, &stages, &bound) {
                 out.push((name.clone(), backend, kernel));
             }
