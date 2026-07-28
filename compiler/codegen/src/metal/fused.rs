@@ -464,7 +464,10 @@ fn emit_mtp_drafts(source: &mut String, base: u32, o0: &str) {
 /// whole remaining traffic for a graph that only wants one integer.
 fn emit_logits_argmax(source: &mut String, in_base: u32, mtp: bool, o0: &str) {
     source.push_str("  {\n");
-    let _ = writeln!(source, "    const M1ValueDesc am_in = descriptors[{in_base}];");
+    let _ = writeln!(
+        source,
+        "    const M1ValueDesc am_in = descriptors[{in_base}];"
+    );
     let _ = writeln!(
         source,
         "    const uint am_row_base = row_meta.offset + {};",
@@ -480,13 +483,9 @@ fn emit_logits_argmax(source: &mut String, in_base: u32, mtp: bool, o0: &str) {
     );
     source.push_str("    for (uint am_r = 0u; am_r < am_in.rows; ++am_r) {\n");
     source.push_str("      const uint am_src_row = row_indices[am_row_base + am_r];\n");
-    source.push_str(
-        "      const device bfloat* am_src = logits + ulong(am_src_row) * am_vocab;\n",
-    );
+    source.push_str("      const device bfloat* am_src = logits + ulong(am_src_row) * am_vocab;\n");
     source.push_str("      M1ArgmaxCandidate am_best = {-INFINITY, 0u, 0u, 0u};\n");
-    source.push_str(
-        "      for (uint am_c = m3_tid; am_c < am_vocab; am_c += m3_threads) {\n",
-    );
+    source.push_str("      for (uint am_c = m3_tid; am_c < am_vocab; am_c += m3_threads) {\n");
     source.push_str("        const float am_v = float(am_src[am_c]);\n");
     source.push_str(
         "        am_best = m1_argmax_combine(am_best, M1ArgmaxCandidate{am_v, am_c, isnan(am_v) ? 0u : 1u, 0u});\n",
