@@ -57,6 +57,16 @@ pub enum Precision {
     /// which is what JSON Schema means, and branches stay separate. Costs
     /// lexer states, because every property name is live at once.
     Exact,
+    /// The name of an additional property may repeat one the schema declares.
+    ///
+    /// Excluding them is exact and regular - `string_body_excluding` builds
+    /// the complement - but it costs the schema its one shared string lexeme:
+    /// every object needs a key terminal carrying its own trie, and the lexer
+    /// determinises the union of all of them. Measured over the corpus that
+    /// is 69 schemas past the lexer budget against 4, so where it does not
+    /// fit this level gives the key back and the caller must check that an
+    /// additional property is not a declared one wearing the wrong type.
+    Shadowed,
     /// `oneOf` branches that all describe objects collapse into one object:
     /// every property any branch names, required only where every branch
     /// requires it. Accepts documents that satisfy no branch exactly, which is
@@ -70,24 +80,42 @@ pub enum Precision {
     Branches,
 }
 
+pub const SHADOWED: &str = "a property whose name the schema declares may also be \
+read as an additional one, so its declared type is not enforced while \
+additionalProperties is open";
+pub const COUNTING: &str = "required, minProperties and maxProperties are not enforced";
+pub const MERGED: &str = "branches of a oneOf over objects are merged, so a document \
+may satisfy no branch exactly";
+pub const SIBLINGS: &str = "anyOf branches do not inherit the keywords beside them";
+
 impl Precision {
     /// Most faithful first.
-    pub const LEVELS: [Precision; 3] = [
+    pub const LEVELS: [Precision; 4] = [
         Precision::Exact,
+        Precision::Shadowed,
         Precision::Merged,
         Precision::Branches,
     ];
 
-    /// May objects put their properties in any order?
-    /// Do `anyOf` branches inherit their sibling keywords?
-    /// Whether objects must enforce `required`, `minProperties` and
-    /// `maxProperties`. Only the first level does; the rest drop them and say
-    /// so, because those are the keywords that need a tally in the parser
-    /// state and a tally is what does not fit.
-    pub fn exact(self) -> bool {
+    /// Must objects enforce `required`, `minProperties` and `maxProperties`?
+    ///
+    /// These are the keywords that need a tally in the parser state, and the
+    /// tally is what costs productions. A single object too large to count is
+    /// handled where it is built, by widening that object alone; this is the
+    /// coarser lever, for a schema whose *whole* grammar is over budget, which
+    /// is a measure no one object can see.
+    pub fn enforces_counting(self) -> bool {
+        matches!(self, Precision::Exact | Precision::Shadowed)
+    }
+
+    /// May the generic key of `additionalProperties` also spell a name the
+    /// schema declares? Only the first level says no, because saying no is
+    /// what costs the shared string lexeme.
+    pub fn excludes_declared_names(self) -> bool {
         self == Precision::Exact
     }
 
+    /// Do `anyOf` branches inherit their sibling keywords?
     pub fn merges_branches(self) -> bool {
         self != Precision::Branches
     }

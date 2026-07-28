@@ -83,6 +83,16 @@ class Engine:
     def compile_json_schema(self, schema: str, **kwargs) -> CompiledGrammar:
         """Compile a JSON Schema and put its tables on the device.
 
+        The mask may admit more than the schema allows, and never less, so a
+        caller that needs the schema itself checks the finished document. Read
+        `grammar.approximations` for what to check: it lists exactly what this
+        grammar does not enforce, and is empty when there is nothing to do.
+
+        Pass `exact=True` to enforce a declared property's type even where
+        `additionalProperties` is open. It is off by default because it costs
+        every object its own key terminal - compile p50 27 ms to 159 ms, and a
+        captured step at batch 512 from 72 us to 155 us.
+
         Raises `ValueError` naming the stage that refused it. Set
         `GPUGRAMMAR_WHY=1` in the environment for the underlying diagnostic.
         """

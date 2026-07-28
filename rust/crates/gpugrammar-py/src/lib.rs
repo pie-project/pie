@@ -46,14 +46,16 @@ impl Compiler {
     }
 
     /// Compile a JSON Schema, searching the lowerings for one that is LALR(1).
-    #[pyo3(signature = (schema, lexer_states = None))]
+    #[pyo3(signature = (schema, lexer_states = None, exact = false))]
     fn compile_json_schema(
         &self,
         schema: &str,
         lexer_states: Option<usize>,
+        exact: bool,
     ) -> PyResult<CompiledGrammar> {
         let limits = Limits {
             lexer_states: lexer_states.unwrap_or(Limits::default().lexer_states),
+            exact,
             ..Default::default()
         };
         let compiled = compile_schema(schema, &self.vocabulary, limits)
@@ -61,6 +63,7 @@ impl Compiler {
         Ok(CompiledGrammar {
             artifact: Arc::new(compiled.artifact),
             precision: format!("{:?}", compiled.precision),
+            approximations: compiled.approximations,
         })
     }
 
@@ -70,6 +73,7 @@ impl Compiler {
         Ok(CompiledGrammar {
             artifact: Arc::new(compile(&self.vocabulary, grammar)?),
             precision: "n/a".to_string(),
+            approximations: Vec::new(),
         })
     }
 
@@ -79,6 +83,7 @@ impl Compiler {
         Ok(CompiledGrammar {
             artifact: Arc::new(compile(&self.vocabulary, grammar)?),
             precision: "n/a".to_string(),
+            approximations: Vec::new(),
         })
     }
 
@@ -97,6 +102,11 @@ pub struct CompiledGrammar {
     /// acceptance has to be able to separate the schemas that got the exact
     /// treatment from those that had to be relaxed.
     precision: String,
+    /// What the grammar does not enforce. A mask may admit more than the
+    /// schema allows - that is the direction it must err in - so a caller that
+    /// needs the schema itself has to check the finished document against
+    /// these, and cannot do that without being told which they are.
+    approximations: Vec<String>,
 }
 
 #[pymethods]
@@ -138,6 +148,11 @@ impl CompiledGrammar {
     #[getter]
     fn precision(&self) -> &str {
         &self.precision
+    }
+
+    #[getter]
+    fn approximations(&self) -> Vec<String> {
+        self.approximations.clone()
     }
 
     #[getter]

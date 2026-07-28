@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::{Result, anyhow, bail};
 use serde_json::Value;
@@ -656,7 +656,29 @@ impl<'a> Converter<'a> {
             repeatable.push(seq(vec![key, self.ws(), lit(":"), self.ws(), value]));
         }
         if let Some(value) = additional {
-            let name = self.json_string(0, None)?;
+            // Every name `properties` declares is governed by that declaration
+            // and not by `additionalProperties`, so this arm must exclude
+            // them. Doing so is also what stops a declared name from having
+            // two readings - the literal and the generic key - which is one of
+            // the two things that forks a configuration at run time.
+            let declared: Vec<String> = properties
+                .into_iter()
+                .flat_map(|declared| declared.keys())
+                .cloned()
+                .collect();
+            let excluded = self
+                .options
+                .precision
+                .excludes_declared_names()
+                .then(|| string_body_excluding(&declared))
+                .flatten();
+            let name = match excluded {
+                Some(body) => self.lexeme(
+                    "key",
+                    seq(vec![lit("\""), body, lit("\"")]),
+                )?,
+                None => self.json_string(0, None)?,
+            };
             repeatable.push(seq(vec![name, self.ws(), lit(":"), self.ws(), value]));
         }
         let additional_pair = match repeatable.len() {
@@ -684,7 +706,7 @@ impl<'a> Converter<'a> {
         // any order while `required` is still enforced. The cost is one rule
         // per subset, so it is affordable exactly while the required set is
         // small - which, in practice, is nearly always.
-        if self.options.precision.exact()
+        if self.options.precision.enforces_counting()
             && min <= required.len() as u32
             && max.is_none()
             && let Some(object) = self.build_unordered(hint, &known, &additional_pair)?
@@ -1671,14 +1693,22 @@ fn count_keyword(object: &serde_json::Map<String, Value>, name: &str) -> Result<
 }
 
 fn json_character() -> Expr {
-    let unescaped = char_class(
-        true,
-        vec![
-            (0, 0x1f),
-            (b'"' as u32, b'"' as u32),
-            (b'\\' as u32, b'\\' as u32),
-        ],
-    );
+    json_character_except(&[])
+}
+
+/// One JSON string character, except that it may not be any of `excluded`.
+///
+/// `excluded` holds plain bytes. An escape sequence is never one of them - it
+/// is two bytes or more and starts with a backslash - so the escape arm is
+/// unaffected, and only the unescaped class narrows.
+fn json_character_except(excluded: &[u8]) -> Expr {
+    let mut forbidden = vec![
+        (0, 0x1f),
+        (b'"' as u32, b'"' as u32),
+        (b'\\' as u32, b'\\' as u32),
+    ];
+    forbidden.extend(excluded.iter().map(|byte| (*byte as u32, *byte as u32)));
+    let unescaped = char_class(true, forbidden);
     let simple_escape = Expr::choice(
         ["\"", "\\", "/", "b", "f", "n", "r", "t"]
             .into_iter()
@@ -1701,6 +1731,105 @@ fn json_character() -> Expr {
             Expr::choice(vec![simple_escape, unicode_escape]),
         ]),
     ])
+}
+
+/// A JSON string that is *not* any of `names`.
+///
+/// `additionalProperties` governs the names `properties` does not declare, so
+/// the arm that carries it must not also spell a declared name. Left open, an
+/// object with one declared string property admits `{"a": 1}`, because the
+/// additional arm accepts any name at all - including `a` - with any value.
+///
+/// "Any name except these" is a regular set, so this is a complement rather
+/// than an approximation. Walk a trie of the declared names: a string is not a
+/// name exactly when it stops at a node no name ends at, or when it leaves the
+/// trie by a character no edge carries - after which the rest is
+/// unconstrained. Those two are built separately so that the unconstrained
+/// tail is written once rather than once per character of every name.
+///
+/// `None` when some name does not survive the round trip through JSON as plain
+/// bytes - anything needing an escape, or non-ASCII. The trie walks bytes and
+/// an escape spells one character in several of them, so rather than get that
+/// subtly wrong the caller keeps the unrestricted key, which only ever admits
+/// more.
+fn string_body_excluding(names: &[String]) -> Option<Expr> {
+    // Excluding nothing is the plain string, and it has to be spelled the way
+    // `json_string` spells it or the lexeme cache sees a different shape and
+    // gives this object a key terminal of its own. An object with no declared
+    // properties is common enough - every free-form value has one - that the
+    // duplicates were a measurable part of the lexer.
+    if names.is_empty() {
+        return None;
+    }
+    let mut bodies: Vec<Vec<u8>> = Vec::with_capacity(names.len());
+    for name in names {
+        if !name.is_ascii() || name.bytes().any(|byte| byte < 0x20 || byte == b'"' || byte == b'\\')
+        {
+            return None;
+        }
+        bodies.push(name.as_bytes().to_vec());
+    }
+    let suffixes: Vec<&[u8]> = bodies.iter().map(|body| body.as_slice()).collect();
+    // A string is not one of the names exactly when it either stops at a node
+    // no name ends at, or leaves the trie and then does whatever it likes.
+    let mut alternatives = vec![seq(vec![
+        leaves_trie(&suffixes),
+        json_character().repeat(0, None),
+    ])];
+    alternatives.extend(stops_inside(&suffixes));
+    Some(Expr::choice(alternatives))
+}
+
+/// The paths into the trie that stop at a node no name ends at.
+///
+/// `None` when every node reachable from here ends a name, so there is no such
+/// path and the alternative does not exist.
+fn stops_inside(suffixes: &[&[u8]]) -> Option<Expr> {
+    let mut alternatives = Vec::new();
+    if !suffixes.iter().any(|suffix| suffix.is_empty()) {
+        alternatives.push(Expr::Empty);
+    }
+    for (byte, rest) in trie_edges(suffixes) {
+        if let Some(tail) = stops_inside(&rest) {
+            alternatives.push(seq(vec![byte_literal(byte), tail]));
+        }
+    }
+    (!alternatives.is_empty()).then(|| Expr::choice(alternatives))
+}
+
+/// The shortest paths that leave the trie: a walk to some node followed by one
+/// character no edge out of it carries.
+///
+/// Everything after such a prefix is unconstrained, which is why the free tail
+/// is concatenated once by the caller rather than at every node. Building it
+/// per node instead is correct and was measured to be far more expensive - the
+/// lexer determinises a copy of "any string" for every character of every
+/// declared name.
+fn leaves_trie(suffixes: &[&[u8]]) -> Expr {
+    let edges = trie_edges(suffixes);
+    let taken: Vec<u8> = edges.iter().map(|(byte, _)| *byte).collect();
+    let mut alternatives = vec![json_character_except(&taken)];
+    for (byte, rest) in edges {
+        // Recurse even when every remaining suffix is empty. That node ends a
+        // name and has no edges, so *any* character leaves the trie there -
+        // which is what lets a name's own extensions through.
+        alternatives.push(seq(vec![byte_literal(byte), leaves_trie(&rest)]));
+    }
+    Expr::choice(alternatives)
+}
+
+fn trie_edges<'a>(suffixes: &[&'a [u8]]) -> Vec<(u8, Vec<&'a [u8]>)> {
+    let mut edges: BTreeMap<u8, Vec<&'a [u8]>> = BTreeMap::new();
+    for suffix in suffixes {
+        if let Some((first, rest)) = suffix.split_first() {
+            edges.entry(*first).or_default().push(rest);
+        }
+    }
+    edges.into_iter().collect()
+}
+
+fn byte_literal(byte: u8) -> Expr {
+    Expr::literal(vec![byte])
 }
 
 fn unbounded_number() -> Expr {
@@ -1726,4 +1855,120 @@ fn optional(expr: Expr) -> Expr {
 
 fn char_class(negated: bool, ranges: Vec<(u32, u32)>) -> Expr {
     Expr::CharacterClass { negated, ranges }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Walk the expression over a candidate string. Only the shapes
+    /// `string_body_excluding` builds appear, which is why this is a test
+    /// helper rather than a general matcher.
+    fn matches(expr: &Expr, input: &[u8]) -> bool {
+        fn walk(expr: &Expr, input: &[u8], rest: &mut Vec<usize>) {
+            match expr {
+                Expr::Empty => rest.push(0),
+                Expr::Literal(bytes) => {
+                    if input.starts_with(bytes) {
+                        rest.push(bytes.len());
+                    }
+                }
+                Expr::CharacterClass { negated, ranges } => {
+                    if let Some(byte) = input.first() {
+                        let inside = ranges
+                            .iter()
+                            .any(|(low, high)| (*low..=*high).contains(&(*byte as u32)));
+                        if inside != *negated {
+                            rest.push(1);
+                        }
+                    }
+                }
+                Expr::Choice(alternatives) => {
+                    for alternative in alternatives {
+                        walk(alternative, input, rest);
+                    }
+                }
+                Expr::Sequence(elements) => {
+                    let mut heads = vec![0usize];
+                    for element in elements {
+                        let mut next = Vec::new();
+                        for head in &heads {
+                            let mut tails = Vec::new();
+                            walk(element, &input[*head..], &mut tails);
+                            next.extend(tails.into_iter().map(|tail| head + tail));
+                        }
+                        next.sort_unstable();
+                        next.dedup();
+                        heads = next;
+                    }
+                    rest.extend(heads);
+                }
+                Expr::Repeat { expr, min, max } => {
+                    let mut heads = vec![0usize];
+                    let mut count = 0u32;
+                    if *min == 0 {
+                        rest.push(0);
+                    }
+                    while !heads.is_empty() && max.is_none_or(|max| count < max) {
+                        let mut next = Vec::new();
+                        for head in &heads {
+                            let mut tails = Vec::new();
+                            walk(expr, &input[*head..], &mut tails);
+                            next.extend(
+                                tails
+                                    .into_iter()
+                                    .filter(|tail| *tail > 0)
+                                    .map(|tail| head + tail),
+                            );
+                        }
+                        next.sort_unstable();
+                        next.dedup();
+                        count += 1;
+                        if count >= *min {
+                            rest.extend(next.iter().copied());
+                        }
+                        heads = next;
+                    }
+                }
+                other => panic!("unexpected shape in an excluded key: {other:?}"),
+            }
+        }
+        let mut ends = Vec::new();
+        walk(expr, input, &mut ends);
+        ends.contains(&input.len())
+    }
+
+    #[test]
+    fn a_key_may_be_any_string_that_is_not_a_declared_name() {
+        let names = ["al".to_string(), "alpha".to_string(), "b".to_string()];
+        let body = string_body_excluding(&names).expect("plain ASCII names");
+        for declared in ["al", "alpha", "b"] {
+            assert!(
+                !matches(&body, declared.as_bytes()),
+                "{declared} is declared, so it is not an additional property"
+            );
+        }
+        // Prefixes, extensions and neighbours of a declared name are not the
+        // name, and excluding them would narrow the language - the one thing a
+        // mask may not do.
+        for allowed in ["", "a", "alp", "alphas", "ala", "bb", "z", "AL"] {
+            assert!(
+                matches(&body, allowed.as_bytes()),
+                "{allowed} is not a declared name, so it must still be allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn a_name_needing_an_escape_gives_up_rather_than_guess() {
+        // The trie walks bytes and an escape spells one character in several,
+        // so the answer is None and the caller keeps the unrestricted key.
+        assert!(string_body_excluding(&["a\"b".to_string()]).is_none());
+        assert!(string_body_excluding(&["é".to_string()]).is_none());
+    }
+
+    #[test]
+    fn excluding_nothing_is_left_to_the_shared_string_lexeme() {
+        assert!(string_body_excluding(&[]).is_none());
+    }
 }

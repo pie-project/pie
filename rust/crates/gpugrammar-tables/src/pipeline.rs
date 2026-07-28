@@ -16,7 +16,7 @@
 use std::fmt;
 
 use anyhow::{Result, anyhow};
-use gpugrammar_ir::json_schema::{JsonSchemaOptions, Precision, json_schema_to_grammar};
+use gpugrammar_ir::json_schema::{self, JsonSchemaOptions, Precision, json_schema_to_grammar};
 use gpugrammar_lex::lexicon::{DEFAULT_TERMINAL_BUDGET, extract_within, terminal_automata_within};
 use gpugrammar_lex::regular::analyze;
 use gpugrammar_lex::{build_lexer_within, group_vocabulary};
@@ -34,6 +34,13 @@ pub struct Limits {
     pub lexer_states: usize,
     /// Productions the flattened grammar may hold.
     pub productions: usize,
+    /// Start the search at the most precise level rather than below it.
+    ///
+    /// Buys one thing - a name the schema declares can no longer be read as an
+    /// additional property, so a declared type is enforced even while
+    /// `additionalProperties` is open - and it is not cheap. See the note on
+    /// `compile_json_schema`.
+    pub exact: bool,
 }
 
 impl Default for Limits {
@@ -42,6 +49,7 @@ impl Default for Limits {
             terminals: DEFAULT_TERMINAL_BUDGET,
             lexer_states: 20_000,
             productions: DEFAULT_PRODUCTION_BUDGET,
+            exact: false,
         }
     }
 }
@@ -83,19 +91,109 @@ pub struct Compiled {
     pub artifact: Artifact,
     /// The most precise level that built tables.
     pub precision: Precision,
+    /// What this grammar does not enforce, so the caller knows what a
+    /// downstream check still has to do.
+    pub approximations: Vec<String>,
+}
+
+/// What this grammar does not enforce, given the level it settled on and the
+/// keywords the schema actually uses.
+///
+/// Gated on both, because a declaration is only useful if it is exact. Saying
+/// that `uniqueItems` is unenforced to a caller whose schema never mentions it
+/// teaches them to ignore the list, and the list is the only thing standing
+/// between a widened mask and a wrong document.
+///
+/// `oneOf` and `uniqueItems` are here whatever the level: `oneOf` means
+/// *exactly one* branch, and a mask that admits a token because some branch
+/// allows it cannot also know no other branch does; `uniqueItems` compares an
+/// item with every earlier one, which is not a property of the prefix. Both
+/// are decidable on the finished document and cheap there.
+fn approximations(schema: &str, precision: Precision) -> Vec<String> {
+    let mut found = Vec::new();
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(schema) else {
+        return found;
+    };
+    let (mut shadowable, mut counted, mut one_of_objects, mut any_of) = (false, false, false, false);
+    let (mut one_of, mut unique) = (false, false);
+    let mut stack = vec![&value];
+    while let Some(node) = stack.pop() {
+        match node {
+            serde_json::Value::Object(map) => {
+                let open = !matches!(
+                    map.get("additionalProperties"),
+                    Some(serde_json::Value::Bool(false))
+                );
+                let declares = map
+                    .get("properties")
+                    .and_then(|properties| properties.as_object())
+                    .is_some_and(|properties| !properties.is_empty());
+                shadowable |= declares && open;
+                counted |= ["required", "minProperties", "maxProperties"]
+                    .iter()
+                    .any(|keyword| map.contains_key(*keyword));
+                if let Some(branches) = map.get("oneOf").and_then(|value| value.as_array()) {
+                    one_of = true;
+                    one_of_objects |= branches.len() > 1
+                        && branches.iter().all(|branch| {
+                            branch.get("properties").is_some()
+                                || branch.get("type") == Some(&serde_json::Value::from("object"))
+                        });
+                }
+                any_of |= map.contains_key("anyOf");
+                unique |= map.get("uniqueItems") == Some(&serde_json::Value::Bool(true));
+                stack.extend(map.values());
+            }
+            serde_json::Value::Array(items) => stack.extend(items),
+            _ => {}
+        }
+    }
+    if shadowable && !precision.excludes_declared_names() {
+        found.push(json_schema::SHADOWED.to_string());
+    }
+    if counted && !precision.enforces_counting() {
+        found.push(json_schema::COUNTING.to_string());
+    }
+    if one_of_objects && precision.merges_objects() {
+        found.push(json_schema::MERGED.to_string());
+    }
+    if any_of && !precision.merges_branches() {
+        found.push(json_schema::SIBLINGS.to_string());
+    }
+    if one_of {
+        found.push(
+            "oneOf exclusivity is not enforced: a document may satisfy more than one branch"
+                .to_string(),
+        );
+    }
+    if unique {
+        found.push("uniqueItems is not enforced".to_string());
+    }
+    found
 }
 
 /// Compile a JSON Schema, trying each lowering from most precise to least.
 ///
 /// Reports the failure of the *most precise* level that got furthest, since
 /// that is the one that says what the schema actually needs.
+///
+/// The search starts below the most precise level, and that is a measured
+/// choice rather than an oversight. `Exact` differs from `Shadowed` only in
+/// excluding declared names from the generic key, which is exact and regular -
+/// but it costs the schema its one shared string lexeme, since every object
+/// then carries a key terminal of its own. Over the corpus that is compile p50
+/// 27 ms -> 159 ms and a captured step at batch 512 of 72 us -> 155 us, to
+/// enforce one keyword interaction a downstream type check settles for
+/// nothing. So the default declares it instead, and a caller who would rather
+/// pay can start the search at `Exact`.
 pub fn compile_json_schema(
     schema: &str,
     vocabulary: &[Vec<u8>],
     limits: Limits,
 ) -> std::result::Result<Compiled, Failure> {
     let mut worst = Failure::Lowering;
-    for precision in Precision::LEVELS {
+    let entry = if limits.exact { 0 } else { ENTRY };
+    for precision in Precision::LEVELS.iter().copied().skip(entry) {
         let options = JsonSchemaOptions {
             precision,
             ..Default::default()
@@ -105,6 +203,7 @@ pub fn compile_json_schema(
                 return Ok(Compiled {
                     artifact,
                     precision,
+                    approximations: approximations(schema, precision),
                 });
             }
             // Report the last level's failure: it is the one that had the
@@ -115,6 +214,9 @@ pub fn compile_json_schema(
     }
     Err(worst)
 }
+
+/// Where the search starts in `Precision::LEVELS`.
+const ENTRY: usize = 1;
 
 fn compile_at(
     schema: &str,

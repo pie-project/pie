@@ -139,3 +139,56 @@ class PublicApi(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Approximations(unittest.TestCase):
+    """A widened mask is only safe if the caller is told how it widened."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.engine = gpugrammar.Engine([bytes([b]) for b in range(256)])
+
+    def accepts(self, grammar, text: str) -> bool:
+        matcher = grammar.matcher(0)
+        for byte in text.encode():
+            if not matcher.accept_token(byte):
+                return False
+        return matcher.can_terminate()
+
+    def test_a_schema_it_enforces_exactly_declares_nothing(self):
+        schema = json.dumps(
+            {
+                "type": "object",
+                "properties": {"a": {"type": "string"}},
+                "additionalProperties": False,
+            }
+        )
+        self.assertEqual(self.engine.compile_json_schema(schema).approximations, [])
+
+    def test_an_open_object_declares_that_a_declared_type_may_not_hold(self):
+        schema = json.dumps({"type": "object", "properties": {"a": {"type": "string"}}})
+        grammar = self.engine.compile_json_schema(schema)
+        # The declaration has to match what the mask actually does.
+        self.assertEqual(len(grammar.approximations), 1)
+        self.assertTrue(self.accepts(grammar, '{"a":1}'))
+
+    def test_exact_enforces_it_and_then_declares_nothing(self):
+        schema = json.dumps({"type": "object", "properties": {"a": {"type": "string"}}})
+        grammar = self.engine.compile_json_schema(schema, exact=True)
+        self.assertEqual(grammar.approximations, [])
+        self.assertFalse(self.accepts(grammar, '{"a":1}'))
+        self.assertTrue(self.accepts(grammar, '{"a":"x"}'))
+        # Widening is what a level may do; narrowing is not. A name that only
+        # shares a prefix with a declared one is still an additional property.
+        self.assertTrue(self.accepts(grammar, '{"ab":1}'))
+
+    def test_keywords_no_level_enforces_are_declared(self):
+        schema = json.dumps(
+            {"type": "array", "items": {"type": "integer"}, "uniqueItems": True}
+        )
+        declared = self.engine.compile_json_schema(schema).approximations
+        self.assertTrue(any("uniqueItems" in text for text in declared))
+
+    def test_a_schema_that_never_mentions_them_is_not_warned_about_them(self):
+        schema = json.dumps({"type": "array", "items": {"type": "integer"}})
+        self.assertEqual(self.engine.compile_json_schema(schema).approximations, [])
