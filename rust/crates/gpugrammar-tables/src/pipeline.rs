@@ -161,8 +161,12 @@ fn compile_at(
             lexer.num_terminals()
         );
     }
-    let groups = group_vocabulary(&lexer, vocabulary);
-    lap("groups");
+    // Grouping last of the expensive stages, because it is the expensive one:
+    // it scans the whole vocabulary from every lexer state and is 62% of all
+    // the time this pipeline spends. The grammar and its tables cost 3%, so
+    // finding out whether they build at all is worth doing first - a level
+    // that is going to be refused should not pay for a vocabulary it will
+    // throw away, and the search tries several levels per schema.
     let cfg = flatten_within(&lexicon, limits.productions).ok_or(Failure::Productions)?;
     lap("cfg");
     let tables = build(&cfg).map_err(|error| {
@@ -172,6 +176,8 @@ fn compile_at(
         Failure::Conflict
     })?;
     lap("tables");
+    let groups = group_vocabulary(&lexer, vocabulary);
+    lap("groups");
     emit(&lexicon, &lexer, &groups, &cfg, &tables, vocabulary.len()).map_err(|_| Failure::Emit)
 }
 

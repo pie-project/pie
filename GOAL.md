@@ -769,12 +769,40 @@ forward pass by a worker thread; the advance cannot, because it follows the
 sampled token. The tail is ours: at batch 512 on one schema we are p50 2,550us
 and p99 2,561us against 11,487us and 12,342us - a 10us spread against 855us.
 
-**Compile time (q18).** Cold, no cache on either side: **82 ms p50 against
-XGrammar's 16 ms**, p99 6.5 s against 0.6 s. It was 916 ms and 71 s until
-vocabulary grouping was parallelised - it scans all 151,669 tokens from every
-lexer state, no state depends on another, and it was using one core of
-twenty-four. Being 5x slower cold is the honest number, and it matters because
-schemas arrive per request.
+**Compile time (q18), remeasured at the new coverage.** Cold, no cache on
+either side, over all 510 schemas that compile: **153 ms p50 against XGrammar's
+16 ms**, p99 11.5 s against 0.6 s. Split by whether the grammar forks:
+
+| | n | p50 | p90 | p99 |
+|---|---:|---:|---:|---:|
+| conflict-free | 446 | 125 ms | 1.4 s | 8.6 s |
+| forked, newly compiling | 64 | **3.0 s** | 10.2 s | 28.2 s |
+
+So the schemas GLR-lite added cost about 24x the median to compile. That is the
+price of the coverage, and it is charged to the schemas that needed it rather
+than spread over the rest.
+
+Where the time goes, over the whole corpus:
+
+| stage | share |
+|---|---:|
+| grouping the vocabulary | **62.4%** |
+| building the lexer DFA | 34.4% |
+| LALR tables, including the conflict forking | 2.8% |
+| everything else | 0.4% |
+
+Grouping scans all 151,669 tokens from every lexer state. It is embarrassingly
+parallel and already parallelised across twenty-four cores; it is simply the
+work, and it is exactly the work a host-side matcher repeats at every decode
+step instead of doing once. Moving it after the tables build - so a lowering
+level that is going to be refused does not pay for a vocabulary it will throw
+away - took p99 from 15.2 s to 11.5 s and left p50 alone, since the median
+schema succeeds at the first level and pays either way.
+
+Being 8x slower cold is the honest number, and it matters because schemas
+arrive per request. The structural answer is to group lazily - a real document
+reaches 2-44% of the states its grammar can - which `group_state` already
+supports and the pipeline does not yet use.
 
 **Memory (q16).** The median schema costs 0.94 MB resident, about seven tokens
 of KV cache for a 7B model. This is not comparable to XGrammar's 52 KB cache
