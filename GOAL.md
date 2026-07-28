@@ -325,6 +325,46 @@ memory with the model and KV cache. Needs structural sharing (interned mask
 sets, a DAG over states, suffix sharing across schemas), plus paging/eviction
 policy — while keeping lookups branch-free on device.
 
+**Paging, built and measured (2026-07-28).** The hard part is not reclaiming
+memory; it is reclaiming it *without moving anything*. Compaction renumbers
+every survivor, so every holder of a grammar id has to be told and every
+recorded CUDA graph is re-recorded — under continuous batching that would be
+every few requests, which would give back exactly what residency bought.
+
+So the arena is not a bump pointer with wholesale compaction. Each array
+carries a free list with coalescing, and identifiers are recycled rather than
+renumbered: a released run goes back, the next admission takes it, and no
+address and no number moves. A grammar a sequence is running under is pinned
+and never chosen; the rest are evicted least-recently-used, where "recently"
+is stamped at the last unpin rather than per step, so the decode loop does no
+bookkeeping at all.
+
+40 schemas, 92.9 MB of tables in all, driven through 400 admissions:
+
+| budget | arena | evictions | graph re-records, warm | holes | per round |
+|---:|---:|---:|---:|---:|---:|
+| 32 MB | 33.9 MB | 399 | **0** | 0.0% | 679 us |
+| 64 MB | 63.7 MB | 384 | **0** | 18.2% | 698 us |
+| 96 MB | 99.4 MB | 374 | 1 | 11.1% | 699 us |
+| 128 MB | 110.3 MB | 0 | 0 | 0.0% | 76 us |
+| unbounded | 110.3 MB | 0 | 0 | 0.0% | 70 us |
+
+**399 evictions cost zero graph re-records.** The re-records that do happen are
+one-off, from an array doubling during warm-up. The mask of the pinned grammar
+agrees with its matcher after all of it.
+
+The price of paging is the re-admission: 700 us against 76 when everything
+fits, which is the device copy of ~2.3 MB of tables. It is paid when a request
+arrives, not when a token is sampled. Making it that cheap needed separating
+what a grammar *is* from where it lands - re-admission had been 8.2 ms, of
+which the copy was 0.7 and the rest was materialising arrays from Rust and
+recomputing ceilings that had not changed.
+
+What a release cannot lower is a ceiling - the window, the readings a group can
+have, the paths a replay follows - because those size buffers a running step is
+reading. A pool that has seen a large grammar keeps its shape after it leaves.
+That is recorded rather than fixed.
+
 ### C5. The latency floor is dispatch, not compute
 
 **[measured]** For the direct LR(1) step at batch 1: reported 36.4 µs, CPU

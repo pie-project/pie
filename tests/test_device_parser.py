@@ -637,6 +637,151 @@ class GrammarPool(unittest.TestCase):
         )
 
 
+class ArenaPaging(unittest.TestCase):
+    """Grammars come and go faster than a graph can be re-recorded.
+
+    Under continuous batching a request brings a schema and takes it away
+    again, so the pool churns. The costly answer is to compact, which
+    renumbers every survivor and re-records every graph. This is the other
+    one: a released run goes back to a free list, its identifier goes back
+    too, and neither the addresses nor the numbering move.
+    """
+
+    def setUp(self):
+        _requirements()
+        from gpu_lr1.device_parser import DeviceGrammar
+
+        self.DeviceGrammar = DeviceGrammar
+        self.compiler = gpugrammar.Compiler(VOCABULARY)
+
+    def _schema(self, index):
+        # Distinguishable, and different enough in size that a hole left by one
+        # does not automatically fit the next.
+        names = [f"p{index}_{n}" for n in range(1 + index % 4)]
+        return json.dumps(
+            {
+                "type": "object",
+                "properties": {name: {"type": "string"} for name in names},
+                "required": names,
+                "additionalProperties": False,
+            }
+        )
+
+    def _compile(self, index):
+        return self.compiler.compile_json_schema(self._schema(index))
+
+    def _mask_agrees(self, pool, batch, row, compiled, identifier):
+        matcher = compiled.matcher(0)
+        batch.set_grammars([identifier] * batch.batch)
+        batch.set_batch_configurations({row: matcher.configurations()})
+        mask = batch.fill_mask()[row].cpu()
+        reference = torch.zeros(pool.mask_words, dtype=torch.int32)
+        matcher.fill_bitmask(reference)
+        return torch.equal(mask, reference)
+
+    def test_a_released_run_is_reused_rather_than_appended(self):
+        """The arena must not grow forever under churn."""
+        pool = self.DeviceGrammar()
+        first = pool.admit(self._compile(0))
+        held = dict(pool._used)
+        for round_ in range(12):
+            pool.release(first)
+            first = pool.admit(self._compile(0))
+        self.assertEqual(dict(pool._used), held)
+        self.assertEqual(pool.count, 1)
+
+    def test_an_identifier_is_reused_and_nothing_is_renumbered(self):
+        pool = self.DeviceGrammar()
+        keep = [pool.admit(self._compile(index)) for index in range(3)]
+        pool.release(keep[1])
+        again = pool.admit(self._compile(1))
+        self.assertEqual(again, keep[1], "a freed slot should be reused")
+        self.assertEqual(keep[2], 2, "the survivors must keep their identifiers")
+
+    def test_a_recorded_graph_survives_churn(self):
+        """The property the whole design is for.
+
+        Compaction re-records every graph in the engine. Admitting into a hole
+        left by a release must not, or a serving loop would spend its time
+        re-recording.
+        """
+        pool = self.DeviceGrammar()
+        compiled = [self._compile(index) for index in range(4)]
+        kept = [pool.admit(item) for item in compiled]
+        batch = pool.new_batch(2)
+        batch.set_grammars([kept[0], kept[1]])
+        batch.set_batch_configurations(
+            {i: compiled[i].matcher(0).configurations() for i in (0, 1)}
+        )
+        batch.fill_mask()
+        batch.capture()
+        recorded = pool.revision
+
+        # Everything the batch is not using leaves and comes back, repeatedly.
+        for _ in range(8):
+            pool.release(kept[2])
+            pool.release(kept[3])
+            kept[2] = pool.admit(compiled[2])
+            kept[3] = pool.admit(compiled[3])
+        self.assertEqual(pool.revision, recorded, "churn re-recorded the graph")
+        self.assertEqual(batch.recorded, pool.revision)
+        batch.fill_mask()
+        self.assertTrue(self._mask_agrees(pool, batch, 0, compiled[0], kept[0]))
+
+    def test_a_budget_evicts_the_least_recently_used(self):
+        pool = self.DeviceGrammar(budget_bytes=1)
+        first = pool.admit(self._compile(0))
+        stamp = pool.generation(first)
+        second = pool.admit(self._compile(1))
+        self.assertGreater(pool.evictions, 0)
+        # The slot is reused, so the identifier alone says nothing - which is
+        # exactly why anyone holding one has to ask whether it still holds.
+        self.assertFalse(pool.holds(first, stamp))
+        self.assertTrue(pool.holds(second, pool.generation(second)))
+        self.assertTrue(
+            self._mask_agrees(pool, pool.new_batch(1), 0, self._compile(1), second)
+        )
+
+    def test_a_pinned_grammar_is_never_evicted(self):
+        """A sequence is running under it; evicting it would mask against another."""
+        pool = self.DeviceGrammar(budget_bytes=1)
+        held = pool.admit(self._compile(0))
+        pool.pin(held)
+        for index in range(1, 5):
+            pool.admit(self._compile(index))
+        self.assertTrue(pool.is_live(held))
+
+    def test_a_reused_slot_is_not_mistaken_for_the_old_grammar(self):
+        pool = self.DeviceGrammar()
+        first = pool.admit(self._compile(0))
+        stamp = pool.generation(first)
+        self.assertTrue(pool.holds(first, stamp))
+        pool.release(first)
+        self.assertFalse(pool.holds(first, stamp))
+        again = pool.admit(self._compile(2))
+        self.assertEqual(again, first)
+        self.assertFalse(
+            pool.holds(first, stamp), "a cached identifier must not survive an eviction"
+        )
+        self.assertTrue(pool.holds(again, pool.generation(again)))
+
+    def test_holes_are_joined_so_a_big_grammar_still_fits(self):
+        pool = self.DeviceGrammar()
+        small = [pool.admit(self._compile(index)) for index in range(4)]
+        big = pool.admit(self._compile(3))
+        size = sum(pool._extent[big].get(name, (0, 0))[1] for name in pool._extent[big])
+        pool.release(big)
+        for identifier in small:
+            pool.release(identifier)
+        self.assertEqual(pool.dead_fraction, 0.0, "freeing everything should leave no holes")
+        self.assertEqual(sum(pool._used.values()), 0)
+        again = pool.admit(self._compile(3))
+        self.assertEqual(
+            sum(pool._extent[again].get(name, (0, 0))[1] for name in pool._extent[again]),
+            size,
+        )
+
+
 class CorpusAgreement(unittest.TestCase):
     """The same check on real schemas, if the corpus is present."""
 

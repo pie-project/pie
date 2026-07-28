@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import bisect
 import json
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -1996,6 +1997,34 @@ _ARENA = {
     "action_extra": _B_ACTION_EXTRA,
 }
 
+@dataclass
+class ResidentTables:
+    """A grammar as the pool wants it: arrays to upload and ceilings to raise.
+
+    Made once by `DeviceGrammar.prepare` and kept by whoever may need to admit
+    the same grammar again. Under a memory budget that is the ordinary case -
+    a schema no request is using is evicted and comes back when one arrives -
+    and doing this work again each time is what made re-admission twelve times
+    the cost of the copy it performs.
+    """
+
+    runs: dict
+    vocab_size: int
+    mask_words: int
+    start_parser_state: int
+    max_groups_per_state: int
+    max_readings: int
+    max_reading_terms: int
+    nullable_chain: int
+    window_bound: int
+    paths: int
+    longest_set: int
+
+    @property
+    def words(self) -> int:
+        return sum(run.numel() for run in self.runs.values())
+
+
 # One base per array, but the CSR offset arrays carry a sentinel element, so
 # concatenating them shifts every following grammar by one. The base is
 # whatever the concatenation actually produced, computed rather than derived.
@@ -2033,6 +2062,7 @@ class DeviceGrammar:
         max_configs: int = 128,
         window: int | None = None,
         capacity: int = 16,
+        budget_bytes: int | None = None,
     ):
         # Ceilings are policy, not properties of any one grammar, so they are
         # fixed here rather than derived from whatever the pool happens to hold.
@@ -2073,8 +2103,32 @@ class DeviceGrammar:
         self._extent: list[dict[str, tuple[int, int]]] = []
         self._dead_words = 0
 
+        # What the tables may occupy, capacity included. Past it a grammar
+        # nothing is running under is evicted to make room. None means the pool
+        # grows until the allocator says no, which is what a benchmark wants and
+        # not what a serving engine does.
+        self.budget_bytes = budget_bytes
+        self.evictions = 0
+        self.admissions = 0
+
         self._capacity = max(1, capacity)
+        # A bump pointer with wholesale compaction was enough while grammars
+        # only arrived. Under continuous batching they leave too, and
+        # compaction renumbers every survivor and bumps `revision`, which
+        # re-records every CUDA graph in the engine. So each array carries a
+        # free list instead: a released run goes back to it and the next
+        # admission takes it, nothing moves, and no identifier changes.
         self._used = {name: 0 for name in _ARENA}
+        self._free = {name: [] for name in _ARENA}
+        self._free_ids: list[int] = []
+        self._stamp = 0
+        self._used_at: list[int] = []
+        self._pinned: list[int] = []
+        # Bumped every time a slot is admitted into. A holder that kept an
+        # identifier across an eviction would otherwise be masked against
+        # whatever grammar took the slot, which is a wrong mask that looks like
+        # a working one. See `holds`.
+        self._generation: list[int] = []
         for name in _ARENA:
             setattr(self, name, torch.zeros(1024, dtype=torch.int32, device="cuda"))
         self.bases = torch.zeros(
@@ -2092,7 +2146,23 @@ class DeviceGrammar:
         return self.start_parser_states[0] if self.start_parser_states else 0
 
     def _reserve(self, name: str, extra: int) -> int:
-        """Room for `extra` more words of `name`, growing if there is not."""
+        """Room for `extra` more words of `name`, growing if there is not.
+
+        First fit in whatever released grammars left behind, and only past the
+        high-water mark when nothing fits. Growing moves the array, which is
+        the one thing here that invalidates a recorded graph, so it is also the
+        one thing this tries to avoid.
+        """
+        if extra == 0:
+            return self._used[name]
+        holes = self._free[name]
+        for index, (start, size) in enumerate(holes):
+            if size >= extra:
+                if size == extra:
+                    holes.pop(index)
+                else:
+                    holes[index] = (start + extra, size - extra)
+                return start
         held = getattr(self, name)
         at = self._used[name]
         if at + extra > held.numel():
@@ -2106,18 +2176,178 @@ class DeviceGrammar:
         self._used[name] = at + extra
         return at
 
-    def admit(self, compiled) -> int:
-        """Add one compiled grammar to the pool and return the id to use for it."""
+    def _return(self, name: str, at: int, size: int) -> None:
+        """Give a run back, joined to whatever it now touches.
+
+        Coalescing is what keeps a pool that has churned for hours from holding
+        its memory in pieces too small to admit anything into.
+        """
+        if size == 0:
+            return
+        holes = self._free[name]
+        holes.append((at, size))
+        holes.sort()
+        merged: list[tuple[int, int]] = []
+        for start, length in holes:
+            if merged and merged[-1][0] + merged[-1][1] == start:
+                previous, held = merged[-1]
+                merged[-1] = (previous, held + length)
+            else:
+                merged.append((start, length))
+        # A hole against the high-water mark is not a hole, it is the mark in
+        # the wrong place.
+        while merged and merged[-1][0] + merged[-1][1] == self._used[name]:
+            start, length = merged.pop()
+            self._used[name] = start
+        self._free[name] = merged
+
+    def _room_for(self, sizes: dict[str, int]) -> bool:
+        """Would admitting a grammar of these sizes stay inside the budget?"""
+        if self.budget_bytes is None:
+            return True
+        wanted = 0
+        for name, size in sizes.items():
+            held = getattr(self, name).numel()
+            if any(hole >= size for _, hole in self._free[name]):
+                continue
+            need = self._used[name] + size
+            while held < need:
+                held *= 2
+            wanted += held - getattr(self, name).numel()
+        return self.resident_bytes() + wanted * 4 <= self.budget_bytes
+
+    def _evict_for(self, sizes: dict[str, int]) -> None:
+        """Release grammars nothing is running under until this one fits.
+
+        Least recently used first, and never one a sequence is still under -
+        that is what `pin` says. A pool that cannot evict enough admits anyway
+        and goes over budget, because refusing to admit a grammar is a refused
+        request and being over budget is not.
+        """
+        while not self._room_for(sizes):
+            victims = [
+                index
+                for index in range(len(self._live))
+                if self._live[index] and not self._pinned[index]
+            ]
+            if not victims:
+                return
+            self.release(min(victims, key=lambda index: self._used_at[index]))
+            self.evictions += 1
+
+    def pin(self, identifier: int) -> None:
+        """Say a sequence is running under this grammar, so it cannot be evicted."""
+        self._pinned[identifier] += 1
+
+    def unpin(self, identifier: int) -> None:
+        """Say one sequence has finished with it.
+
+        The eviction order is stamped here rather than at every step. Only
+        unpinned grammars are ever evicted, so what orders them is when they
+        stopped being used - and reading that off the last unpin costs nothing,
+        where stamping a batch of 512 every step would be 512 lines of Python
+        on the path this design exists to keep clear.
+        """
+        if self._pinned[identifier] > 0:
+            self._pinned[identifier] -= 1
+            if self._pinned[identifier] == 0:
+                self._stamp += 1
+                self._used_at[identifier] = self._stamp
+
+    def holds(self, identifier: int, generation: int) -> bool:
+        """Is this still the grammar that was admitted into this slot?
+
+        A slot freed by an eviction is reused, so an identifier alone does not
+        identify a grammar across one. Whoever cached an identifier has to ask.
+        """
+        return (
+            0 <= identifier < len(self._live)
+            and self._live[identifier]
+            and self._generation[identifier] == generation
+        )
+
+    def generation(self, identifier: int) -> int:
+        return self._generation[identifier]
+
+    def is_live(self, identifier: int) -> bool:
+        return 0 <= identifier < len(self._live) and self._live[identifier]
+
+    @staticmethod
+    def prepare(compiled) -> "ResidentTables":
+        """Everything about a grammar that does not depend on where it lands.
+
+        Separated from `admit` because an evicted grammar comes back. Doing
+        this at every admission made re-admission 8.2 ms where the device copy
+        it exists to perform is 0.7 - the rest was materialising arrays from
+        Rust and recomputing ceilings that had not changed. Held in pinned host
+        memory, which is not the scarce resource here: the whole point of a
+        budget is that device memory is.
+        """
         arrays = compiled.device_arrays()
-        if self.count == 0:
-            self.vocab_size = int(arrays["vocab_size"])
-            self.mask_words = int(arrays["bitset_words"])
-        elif int(arrays["vocab_size"]) != self.vocab_size:
+        runs = {}
+        for name in _ARENA:
+            dtype = np.int32 if name in _SIGNED else np.uint32
+            run = np.frombuffer(arrays[name], dtype=dtype).astype(np.int32)
+            runs[name] = torch.from_numpy(run).pin_memory()
+
+        def widest(name):
+            values = np.frombuffer(arrays[name], dtype=np.uint32)
+            return int(np.diff(values).max()) if values.size > 1 else 1
+
+        lengths = np.frombuffer(arrays["group_set_length"], dtype=np.uint32)
+        nullable = _nullable_chain(arrays)
+        return ResidentTables(
+            runs=runs,
+            vocab_size=int(arrays["vocab_size"]),
+            mask_words=int(arrays["bitset_words"]),
+            start_parser_state=int(arrays["start_parser_state"]),
+            max_groups_per_state=widest("group_offsets"),
+            max_readings=widest("reading_offsets"),
+            max_reading_terms=widest("reading_term_offsets"),
+            nullable_chain=nullable,
+            window_bound=_window_bound(arrays, nullable),
+            paths=min(_MAX_PATHS, max(1, int(arrays.get("max_actions", 1)))),
+            longest_set=int(lengths.max()) if lengths.size else 1,
+        )
+
+    def admit(self, compiled) -> int:
+        """Add one compiled grammar to the pool and return the id to use for it.
+
+        Takes either a compiled grammar or what `prepare` made of one. A
+        serving engine wanting cheap re-admission after an eviction keeps the
+        latter.
+        """
+        tables = compiled if isinstance(compiled, ResidentTables) else self.prepare(
+            compiled
+        )
+        if self.count == 0 and not self.vocab_size:
+            self.vocab_size = tables.vocab_size
+            self.mask_words = tables.mask_words
+        elif tables.vocab_size != self.vocab_size:
             raise ValueError("grammars in one pool must share a vocabulary")
 
-        identifier = self.count
+        runs = tables.runs
+        # Room is made before anything is written, because reserving array by
+        # array and running out halfway would leave a grammar half in the pool.
+        self._evict_for({name: run.numel() for name, run in runs.items()})
+
+        # An identifier freed by an eviction is reused rather than renumbered.
+        # Renumbering is what `compact` does and why it is a last resort: every
+        # holder of a `grammar_of` has to be told, and every recorded graph
+        # dies. Under continuous batching that would be every few requests.
+        if self._free_ids:
+            identifier = self._free_ids.pop(0)
+        else:
+            identifier = len(self._live)
+            self._live.append(False)
+            self._extent.append({})
+            self.start_parser_states.append(0)
+            self._used_at.append(0)
+            self._pinned.append(0)
+            self._generation.append(0)
         if identifier >= self._capacity:
-            self._capacity *= 2
+            while identifier >= self._capacity:
+                self._capacity *= 2
             grown = torch.zeros(
                 self._capacity * int(_NBASES.value), dtype=torch.int32, device="cuda"
             )
@@ -2128,41 +2358,34 @@ class DeviceGrammar:
         rows = np.zeros(int(_NBASES.value), dtype=np.int32)
         extent: dict[str, tuple[int, int]] = {}
         for name, slot in _ARENA.items():
-            dtype = np.int32 if name in _SIGNED else np.uint32
-            run = np.frombuffer(arrays[name], dtype=dtype).astype(np.int32)
-            at = self._reserve(name, run.size)
-            getattr(self, name)[at : at + run.size] = torch.from_numpy(
-                run.copy()
-            ).cuda()
+            run = runs[name]
+            size = run.numel()
+            at = self._reserve(name, size)
+            getattr(self, name)[at : at + size] = run.cuda(non_blocking=True)
             rows[int(slot.value)] = at
-            extent[name] = (at, run.size)
+            extent[name] = (at, size)
         self.bases[
             identifier * int(_NBASES.value) : (identifier + 1) * int(_NBASES.value)
         ] = torch.from_numpy(rows).cuda()
 
-        def widest(name):
-            values = np.frombuffer(arrays[name], dtype=np.uint32)
-            return int(np.diff(values).max()) if values.size > 1 else 1
-
-        self.max_groups_per_state = max(self.max_groups_per_state, widest("group_offsets"))
-        self.max_readings = max(self.max_readings, widest("reading_offsets"))
-        self.max_reading_terms = max(
-            self.max_reading_terms, widest("reading_term_offsets")
+        self.max_groups_per_state = max(
+            self.max_groups_per_state, tables.max_groups_per_state
         )
-        self.nullable_chain = max(self.nullable_chain, _nullable_chain(arrays))
+        self.max_readings = max(self.max_readings, tables.max_readings)
+        self.max_reading_terms = max(
+            self.max_reading_terms, tables.max_reading_terms
+        )
+        self.nullable_chain = max(self.nullable_chain, tables.nullable_chain)
         # A conflicted cell holds up to `max_actions` actions and a reading
         # meets several, so the product is what enumerating them all would
         # cost. Bounded at the reference matcher's own bound: past it both
         # refuse the same derivations, which is what keeps them in step.
-        wanted_paths = min(_MAX_PATHS, max(1, int(arrays.get("max_actions", 1))))
+        wanted_paths = tables.paths
         if wanted_paths > self.paths:
             self.paths = wanted_paths
             self.revision += 1
-        self.window_bound = max(
-            self.window_bound, _window_bound(arrays, self.nullable_chain)
-        )
-        lengths = np.frombuffer(arrays["group_set_length"], dtype=np.uint32)
-        longest = int(lengths.max()) if lengths.size else 1
+        self.window_bound = max(self.window_bound, tables.window_bound)
+        longest = tables.longest_set
         # The lanes of a block search in lockstep, so the loop runs a fixed
         # number of times and every lane must have finished by it. A halving
         # over `n` needs ceil(log2(n)) steps; the margin covers the ends being
@@ -2181,28 +2404,53 @@ class DeviceGrammar:
                 self.window = wanted
                 self.revision += 1
 
-        self.start_parser_states.append(int(arrays["start_parser_state"]))
-        self._live.append(True)
-        self._extent.append(extent)
+        self.start_parser_states[identifier] = tables.start_parser_state
+        self._live[identifier] = True
+        self._extent[identifier] = extent
+        self._pinned[identifier] = 0
+        self._generation[identifier] += 1
+        self._stamp += 1
+        self._used_at[identifier] = self._stamp
         self.count += 1
+        self.admissions += 1
         return identifier
 
     def release(self, identifier: int) -> None:
         """Say that nothing is under this grammar any more.
 
-        The space is not reclaimed here: the runs of a pool are interleaved with
-        no gaps and moving one moves every base after it, which would be wrong
-        under a running batch. `compact` does that, when it is worth it.
+        The space *is* reclaimed, into each array's free list, and the
+        identifier goes back too. Nothing moves and nothing is renumbered, so a
+        recorded graph is still valid - which is the property that makes
+        admitting and evicting affordable at the rate requests arrive at.
+
+        What a release cannot lower is a ceiling: the window, the readings a
+        group can have, the paths a replay follows. Those are maxima over every
+        grammar the pool has *ever* held, because lowering one would resize the
+        batch buffers a running step is reading. A pool that has seen a large
+        grammar keeps its shape after it leaves.
         """
         if not self._live[identifier]:
             return
         self._live[identifier] = False
-        self._dead_words += sum(size for _, size in self._extent[identifier].values())
+        self._pinned[identifier] = 0
+        for name, (at, size) in self._extent[identifier].items():
+            self._return(name, at, size)
+        self._extent[identifier] = {}
+        self._free_ids.append(identifier)
+        self.count -= 1
 
     @property
     def dead_fraction(self) -> float:
+        """How much of the arena is holes rather than tables.
+
+        Free space below the high-water mark, which a release put there and a
+        later admission may or may not be able to use - a hole only takes a
+        grammar whose run fits in it. This is the fragmentation `compact`
+        exists to answer, and the number that says whether it is worth it.
+        """
         total = sum(self._used.values())
-        return self._dead_words / total if total else 0.0
+        holes = sum(size for name in _ARENA for _, size in self._free[name])
+        return holes / total if total else 0.0
 
     def compact(self) -> dict[int, int]:
         """Rebuild the arena around the grammars still in use.
@@ -2211,7 +2459,7 @@ class DeviceGrammar:
         them and whoever holds a `grammar_of` has to be told. Bumps `revision`,
         so any recorded graph is re-recorded.
         """
-        keep = [index for index in range(self.count) if self._live[index]]
+        keep = [index for index in range(len(self._live)) if self._live[index]]
         remap = {old: new for new, old in enumerate(keep)}
         held = {
             name: getattr(self, name)[: self._used[name]].clone() for name in _ARENA
@@ -2227,6 +2475,7 @@ class DeviceGrammar:
         for name in _ARENA:
             wanted = sum(extent[name][1] for extent in extents)
             self._used[name] = 0
+            self._free[name] = []
             setattr(
                 self,
                 name,
@@ -2234,7 +2483,6 @@ class DeviceGrammar:
                     max(1024, int(wanted * 1.25)), dtype=torch.int32, device="cuda"
                 ),
             )
-        self._dead_words = 0
         rows = np.zeros((max(len(keep), 1), int(_NBASES.value)), dtype=np.int32)
         for new, extent in enumerate(extents):
             for name, slot in _ARENA.items():
@@ -2251,6 +2499,10 @@ class DeviceGrammar:
         self.count = len(keep)
         self.start_parser_states = starts
         self._live = [True] * len(keep)
+        self._free_ids = []
+        self._used_at = [self._used_at[index] for index in keep]
+        self._pinned = [self._pinned[index] for index in keep]
+        self._generation = [self._generation[index] + 1 for index in keep]
         self._extent = [
             {
                 name: (int(rows[new, int(slot.value)]), extents[new][name][1])
