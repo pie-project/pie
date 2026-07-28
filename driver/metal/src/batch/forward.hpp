@@ -164,6 +164,22 @@ bool validate_request_local_positions(
 // idle memory.  The paged command path uses these four slots concurrently;
 // caps report exactly this value — never a larger, aspirational one — via
 // `MetalExecutor::rs_slots()`.
+// Tokens the resident KV/GDN ring holds, across the WHOLE fleet -- it is one
+// linear ring, not a per-request allocation, so sixteen concurrent requests
+// share it. At 4096 that ceiling was reached by sixteen requests generating
+// ~230 tokens each, and the planner failed them all with `NoSwapRoom`; a
+// concurrent fleet could not run a normal-length generation at all.
+//
+// The KV region is `n_full_attn * 2 * n_kv_heads * max_ctx * head_dim * 2B`,
+// which is ~100MB for this checkpoint at 4096 and ~800MB at 32768 -- worth it
+// against a 405MB weight set on a machine with tens of GB, and it buys sixteen
+// requests 2048 tokens each.
+//
+// ADVERTISED and ENFORCED from here: `context.cpp` builds the capabilities page
+// count from this and `validate_fire_geometry` bounds page ids by the same
+// number, so the two can never drift (they were separate 4096 literals).
+inline constexpr std::uint32_t kMetalMaxCtxTokens = 32768;
+
 inline constexpr std::uint32_t kPhase1bRsSlots = 16;
 inline constexpr std::uint32_t kPagedMaxForwardRequests = kPhase1bRsSlots;
 // Paged prompts run one correct N=1 GDN recurrence DAG per token inside one

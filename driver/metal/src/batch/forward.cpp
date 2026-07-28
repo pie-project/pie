@@ -547,7 +547,7 @@ struct MetalExecutor::Impl {
     // with byte-identical output.
     static constexpr bool fuse_residual_ = true;
     static constexpr bool force_barriers_ = false;
-    static constexpr int max_ctx_ = 4096;
+    static constexpr int max_ctx_ = int(kMetalMaxCtxTokens);
 
     // No checkpoint directory: since §6 the plan declares the files it reads,
     // so staging weights needs the plan and nothing else.
