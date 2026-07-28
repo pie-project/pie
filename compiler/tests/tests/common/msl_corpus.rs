@@ -13,9 +13,6 @@
 //! deleted with those emitters). What survives is `golden-{msl,cuda}/`: 2,838
 //! cases that now serve as the Rust emitters' regression net. Bless with
 //! `PTIR_REGEN=1` only after reading `ptir-refactor.md` §3.2.
-//!
-//! (The goldens' own `sidecar:` blobs are not used as the plan source: three
-//! of them are stale on this branch relative to today's `pie-plan`.)
 
 use pie_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
 use pie_ir::op::{IntrinsicId, Op};

@@ -32,6 +32,11 @@
 //! * [`launch`] — the launch descriptors the drivers execute.
 //! * [`program`] — the whole-program bundle handed across the C ABI.
 //!
+//! Those last two are built out of [`pie_driver_abi`], which is why this crate
+//! is the one that reaches outside `compiler/`. That crate is the contract, not
+//! a driver: the compiler writes a `LaunchPackage` and the driver reads one out
+//! of the same declarations, so there is no second copy to keep in step.
+//!
 //! [`pie_plan`]: https://github.com/pie-project/pie/tree/dev/compiler/plan
 //! [`CompiledStage`]: https://github.com/pie-project/pie/tree/dev/compiler/plan
 //! [`EmittedKernel`]: program::EmittedKernel
