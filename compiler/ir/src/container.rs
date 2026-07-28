@@ -1045,6 +1045,61 @@ mod tests {
         assert_eq!(decode(&bytes).expect("decode"), c);
     }
 
+    /// Every byte an op encodes is a byte its decoder reads.
+    ///
+    /// `round_trip_every_op` puts exactly one value through each field, so a
+    /// decoder that ignores what was written and substitutes a constant still
+    /// round-trips whenever that constant is the value the representative
+    /// happened to carry. A mutation proved it: dropping `sink` from
+    /// `SinkWindowMask`'s encoding while decode hardcoded `2` — the
+    /// representative's own value — passed all three round-trip tests, and
+    /// only the byte goldens noticed.
+    ///
+    /// Flipping each byte in turn closes the decode half without needing a
+    /// second value per field: an ignored byte is one whose mutation changes
+    /// nothing. The encode half — a field never written at all — leaves no
+    /// byte to flip and is still held only by the byte goldens and the C++
+    /// mirror in `op_table_drift`.
+    #[test]
+    fn no_byte_of_an_op_encoding_is_ignored_by_its_decoder() {
+        let mut ignored: Vec<String> = Vec::new();
+        let mut flipped = 0usize;
+        for op in crate::op::representatives() {
+            let mut bytes = alloc::vec::Vec::new();
+            encode_op(&mut bytes, &op);
+            // Byte 0 is the tag, which selects the decoder arm rather than
+            // feeding it; `decode_rejects_every_tag_the_table_does_not_declare`
+            // is what holds that byte.
+            for index in 1..bytes.len() {
+                for mask in [0x01u8, 0x80, 0xff] {
+                    let mut mutant = bytes.clone();
+                    mutant[index] ^= mask;
+                    flipped += 1;
+                    let mut r = Reader::new(&mutant);
+                    if let Ok(decoded) = decode_op(&mut r)
+                        && decoded == op
+                        && r.remaining() == 0
+                    {
+                        ignored.push(format!(
+                            "{}: byte {index} ^ {mask:#04x} decodes back to \
+                             the same op",
+                            op.tag()
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            flipped > 500,
+            "only {flipped} flips; the representatives stopped carrying payload"
+        );
+        assert!(
+            ignored.is_empty(),
+            "{} encoded byte(s) do not reach the op they encode: {ignored:?}",
+            ignored.len()
+        );
+    }
+
     #[test]
     fn rejects_bad_magic_version_and_truncation() {
         let mut b = encode(&sample());

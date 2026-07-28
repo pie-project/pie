@@ -237,6 +237,9 @@ mod tests {
     #[test]
     fn only_ops_that_are_nothing_but_operands_may_reach_the_general_arm() {
         let empty = encoded_len(alloc::vec::Vec::new());
+        let mut asserted = 0usize;
+        let mut skipped_effectful = 0usize;
+        let mut skipped_bare = 0usize;
         for op in pie_ir::op::representatives() {
             // A channel index or a name index of zero is a legal payload that
             // is byte-identical to the default, so these cannot be told apart
@@ -244,6 +247,7 @@ mod tests {
             // `the_fold_only_generalises_over_pure_ops` is what holds that set
             // to `Op::is_effectful`.
             if op.is_effectful() {
+                skipped_effectful += 1;
                 continue;
             }
             let payload = encoded_len(alloc::vec![op.clone()]) - empty;
@@ -257,6 +261,7 @@ mod tests {
                 ..OpView::default()
             };
             if payload == operands_only {
+                skipped_bare += 1;
                 continue;
             }
             assert_ne!(
@@ -265,6 +270,22 @@ mod tests {
                  {operands_only}, but projects the same view the general arm \
                  would build; the extra payload reaches the driver as zeros"
             );
+            asserted += 1;
         }
+        // Both `continue`s above are unconditional, so without this the whole
+        // test would pass having compared nothing — which is exactly what
+        // would happen if `encoded_len` ever started returning the same number
+        // for every op.
+        assert_eq!(
+            asserted + skipped_effectful + skipped_bare,
+            pie_ir::op::OP_TABLE.len(),
+            "representatives() stopped covering the table"
+        );
+        assert!(
+            asserted >= 13,
+            "only {asserted} of the table's ops carry payload beyond their \
+             operands (13 did when this was written); the length measurement \
+             has stopped distinguishing anything"
+        );
     }
 }

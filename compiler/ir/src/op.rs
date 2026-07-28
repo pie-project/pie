@@ -886,6 +886,11 @@ mod tests {
     #[test]
     fn table_matches_op_metadata() {
         let reps = representatives();
+        assert_eq!(
+            reps.len(),
+            OP_TABLE.len(),
+            "one representative per row, or the zip below compares a prefix"
+        );
         for (op, spec) in reps.iter().zip(OP_TABLE) {
             assert_eq!(
                 op.tag(),
@@ -900,12 +905,17 @@ mod tests {
                 .iter()
                 .find(|s| s.tag == op.tag())
                 .unwrap_or_else(|| panic!("no table row for {op:?}"));
-            assert_eq!(
-                spec.results as u32,
-                op.result_count(),
-                "results for {}",
-                spec.name
-            );
+
+            // `results` is deliberately not checked here. `Op::result_count`
+            // reads `spec(self.tag()).results`, so asserting the two agree
+            // compares a field with itself — it passed when a row's result
+            // count was mutated, and only the C++ mirror noticed. Result count
+            // has one declaration in this crate, which is the point; its
+            // witness is necessarily outside it, in
+            // `op_table_drift::driver_rows_agree_on_arity_and_result_count`.
+            //
+            // Operand count below is different: `operands()` derives from the
+            // enum's own fields, so this really is two sources meeting.
 
             // The channel accessors and the table must agree on what a
             // channel op is; six scans across three crates depend on it.

@@ -151,6 +151,19 @@ pub fn fold_stage(
             // fold is value-only, so they are inert here.
             Op::SinkCall { .. } => {}
             _ => {
+                // The arms above name every effectful op plus `IntrinsicVal`;
+                // everything reaching here is folded as a pure function of its
+                // operands. An effectful op that slipped out of those arms
+                // would be folded as if the host could perform it, and a
+                // device-carried value would come back host-derivable — a pass
+                // scheduled that cannot run. `is_effectful` is exhaustive over
+                // `Op`, so this is the fold checking itself rather than a test
+                // restating it somewhere else.
+                debug_assert!(
+                    !op.is_effectful(),
+                    "{op:?} reached the fold's general arm, which evaluates it \
+                     as a pure function of its operands"
+                );
                 if let Some(blocker) = blocked {
                     for offset in 0..op.result_count() as usize {
                         push(
@@ -752,8 +765,20 @@ mod tests {
     /// below is a second spelling of the match arms, so it will not drift
     /// silently: `Op::is_effectful` is exhaustive, so a new effectful op forces
     /// an edit there, and that edit fails here until the fold names it too.
+    /// The set of ops the fold names, pinned against `Op::is_effectful`.
+    ///
+    /// This is a *transcription* of the match arms, not a call into the fold,
+    /// and on its own it is blind to an edit of the fold itself — a mutation
+    /// that deleted `Op::ChanRead` from the match passed this test. The
+    /// behavioural half now lives in the fold: its general arm carries a
+    /// `debug_assert!(!op.is_effectful())`, so an effectful op that slips out
+    /// of the arms fails the moment any trace folds it, with a message naming
+    /// the op. What this test adds is the other direction — that the arms do
+    /// not name something `is_effectful` calls pure, which no trace would
+    /// reveal because the fold would simply be conservative.
     #[test]
     fn the_fold_only_generalises_over_pure_ops() {
+        let mut checked = 0usize;
         for op in pie_ir::op::representatives() {
             let named_by_the_fold = matches!(
                 op,
@@ -770,6 +795,12 @@ mod tests {
                 "{op:?} disagrees: the fold names it {named_by_the_fold}, \
                  but purity says {must_be_named}"
             );
+            checked += 1;
         }
+        assert_eq!(
+            checked,
+            pie_ir::op::OP_TABLE.len(),
+            "representatives() stopped covering the table"
+        );
     }
 }

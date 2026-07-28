@@ -138,11 +138,13 @@ fn every_rust_op_has_a_driver_row() {
 fn driver_rows_agree_on_arity_and_result_count() {
     let source = std::fs::read_to_string(op_table_hpp()).expect("read op_table.hpp");
     let rows = cxx_rows(&source);
+    let mut compared = 0usize;
 
     for spec in OP_TABLE {
         let Some(row) = rows.iter().find(|row| row.name == spec.name) else {
             continue; // reported by `every_rust_op_has_a_driver_row`
         };
+        compared += 1;
         let expected_arity = if spec.val_operands == VARIADIC {
             CXX_VARIADIC
         } else {
@@ -159,6 +161,17 @@ fn driver_rows_agree_on_arity_and_result_count() {
             spec.name, spec.results, row.results
         );
     }
+
+    // The `continue` above is a name-match miss. If the two naming conventions
+    // ever diverge wholesale, every row would take it and this test would pass
+    // having compared nothing — while being the only witness `OP_TABLE`'s
+    // result counts have, since `Op::result_count` reads them.
+    assert_eq!(
+        compared,
+        OP_TABLE.len(),
+        "only {compared} of {} ops matched a row in op_table.hpp by name",
+        OP_TABLE.len()
+    );
 }
 
 #[test]

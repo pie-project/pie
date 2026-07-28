@@ -526,47 +526,57 @@ impl GroupedPlan {
     }
 }
 
-/// Whether a generic grouped op can cover this tag. The list is the grouped
-/// interpreter's own coverage: everything except `kernel_call`, which names a
-/// second-party kernel only the fused path can launch.
-/// Ops the grouped runtime has no body for. Everything else in
-/// [`pie_ir::op::OP_TABLE`] is emittable.
+/// Whether the grouped runtime has a body for this tag.
 ///
 /// This used to be a list of raw hex ranges (`0x01..=0x07 | 0x10..=0x20 | ...`).
 /// The gaps between those ranges are exactly where new op tags go, so a new op
-/// was silently classified unsupported — no compile error, no test failure,
-/// just a stage that stopped taking the grouped path. Asking the op table
-/// closes the gaps; `grouped_classification_is_exhaustive` makes a new op
-/// force a decision here.
-const GROUPED_UNSUPPORTED: &[u8] = &[tags::KERNEL_CALL];
-
+/// was silently classified unsupported. Replacing the ranges with a
+/// `GROUPED_UNSUPPORTED` exception list closed the gaps but created a worse
+/// problem: `grouped_supported_tag` was *defined* as "not in the list", so the
+/// test that walked the list asserted `!contains(x)` for `x in list` — a
+/// tautology that survived both emptying the list and adding `add` to it.
+///
+/// The list is gone. It held one tag, `kernel_call`, and that entry was wrong
+/// twice over: `lower_stage_plan` `continue`s on `kernel_call` before this gate
+/// is ever consulted, and `ptir_m1_execute` does have an arm for it — which
+/// `metal::preamble::tests::metal_execute_covers_the_op_table` proves. The
+/// runtime source is the authority now, and
+/// `grouped_support_is_what_the_runtime_can_execute` holds this function to it.
 fn grouped_supported_tag(tag: u8) -> bool {
-    pie_ir::op::spec(tag).is_some() && !GROUPED_UNSUPPORTED.contains(&tag)
+    pie_ir::op::spec(tag).is_some()
 }
 
 #[cfg(test)]
 mod grouped_coverage {
     use super::*;
 
-    /// A tripwire, not a tautology: bump the count only together with a
-    /// decision about whether the grouped runtime can emit the new op, and
-    /// with `GROUPED_UNSUPPORTED` updated if it cannot.
+    /// Grouped support is whatever `ptir_m1_execute` can dispatch on, because
+    /// `emit_grouped_fused_region` pastes that runtime into every kernel it
+    /// emits. Reading the arms out of the source makes this a claim about the
+    /// emitted program rather than a restatement of a constant.
     #[test]
-    fn grouped_classification_is_exhaustive() {
-        assert_eq!(
-            pie_ir::op::OP_TABLE.len(),
-            55,
-            "a new op landed in OP_TABLE — decide whether the grouped runtime \
-             has a body for it, update GROUPED_UNSUPPORTED if not, then bump \
-             this count"
+    fn grouped_support_is_what_the_runtime_can_execute() {
+        let handled = crate::runtime_scan::tags_compared_in(crate::runtime_scan::function_body(
+            crate::metal::RUNTIME_TEMPLATE,
+            "void ptir_m1_execute",
+        ));
+        assert!(
+            handled.len() > 40,
+            "only {} tag arms parsed out of ptir_m1_execute; the scan broke and              every comparison below would be vacuous",
+            handled.len()
         );
-        for tag in GROUPED_UNSUPPORTED {
-            assert!(
-                pie_ir::op::spec(*tag).is_some(),
-                "GROUPED_UNSUPPORTED names a tag that is not an op"
+        let mut checked = 0usize;
+        for spec in pie_ir::op::OP_TABLE {
+            assert_eq!(
+                grouped_supported_tag(spec.tag),
+                handled.contains(&spec.tag),
+                "{} ({:#04x}): the classifier and ptir_m1_execute disagree",
+                spec.name,
+                spec.tag
             );
-            assert!(!grouped_supported_tag(*tag));
+            checked += 1;
         }
+        assert_eq!(checked, pie_ir::op::OP_TABLE.len());
         assert!(
             !grouped_supported_tag(0xFF),
             "a non-op tag is not supported"

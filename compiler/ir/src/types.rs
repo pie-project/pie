@@ -83,6 +83,46 @@ macro_rules! declare_dtypes {
                 )*
                 assert_eq!(DType::ALL.len(), usize::from(wire));
                 assert!(DType::from_wire(wire).is_none());
+                assert!(wire > 0, "declare_dtypes! declared nothing");
+            }
+
+            /// `is_numeric` is the one predicate that is not a restatement of
+            /// its dtype's row.
+            ///
+            /// `is_float` and `is_int` compare `class()` against the class the
+            /// row declares, so they cannot drift. `is_numeric` names *two of
+            /// three* classes, and nothing about adding a fourth would edit it
+            /// — a `Complex` class would silently read as non-numeric in every
+            /// arithmetic rule in `infer` and `validate`. The walk forces the
+            /// decision the way `Backend::ALL` is forced: a new class is a
+            /// compile error here, and answering it means saying whether
+            /// `is_numeric` covers it.
+            #[test]
+            fn a_new_dtype_class_has_to_answer_to_is_numeric() {
+                fn numeric(class: DTypeClass) -> bool {
+                    match class {
+                        DTypeClass::Float | DTypeClass::Int => true,
+                        DTypeClass::Logical => false,
+                    }
+                }
+                let mut seen = 0usize;
+                for dtype in DType::ALL {
+                    assert_eq!(
+                        dtype.is_numeric(),
+                        numeric(dtype.class()),
+                        "{} is {:?}",
+                        dtype.name(),
+                        dtype.class()
+                    );
+                    assert_eq!(dtype.is_float(), dtype.class() == DTypeClass::Float);
+                    assert_eq!(dtype.is_int(), dtype.class() == DTypeClass::Int);
+                    assert!(!dtype.name().is_empty());
+                    seen += 1;
+                }
+                assert_eq!(seen, DType::ALL.len());
+                let names: alloc::collections::BTreeSet<&str> =
+                    DType::ALL.iter().map(|d| d.name()).collect();
+                assert_eq!(names.len(), DType::ALL.len(), "two dtypes share a name");
             }
         }
     };
