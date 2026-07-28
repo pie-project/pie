@@ -720,6 +720,13 @@ target_sources(pie_driver_cuda_lib PRIVATE
 #
 # Vendored under third_party/marlin/; the wrapper exposes a torch-free C++ API.
 # Enable with -DPIE_CUDA_BUILD_MARLIN=ON or PIE_CUDA_BUILD_MARLIN=1.
+# OFF by default (build it with PIE_CUDA_BUILD_MARLIN=1). Worth knowing what
+# turning it on buys and costs: on gpt-oss the routed fallback dequantizes
+# every routed expert per fire — 78% of all GPU time on gpt-oss-20b, plus 8%
+# in the row deinterleave it feeds — and the vendored sm80 BF16 x FE2M1 x
+# E8M0 kernels are the path vLLM selects on A100. The native path measured
+# 3.8x faster there but produced garbage output, so it stays behind both
+# this switch and an explicit `--mxfp4-moe native`.
 option(PIE_CUDA_BUILD_MARLIN "Build vendored marlin W4A16/MXFP4 GEMM" OFF)
 # Env override (previously forwarded by worker/build.rs as -D...).
 if(DEFINED ENV{PIE_CUDA_BUILD_MARLIN})

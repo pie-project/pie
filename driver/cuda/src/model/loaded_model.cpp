@@ -125,12 +125,31 @@ LoadedModel LoadedModel::load(
     const bool fp8_native = (dev_prop.major > 8) ||
                             (dev_prop.major == 8 && dev_prop.minor >= 9);
 #ifdef PIE_CUDA_HAS_MARLIN
-    // Native MXFP4 expert execution requires a Blackwell-class FP4 path.
-    // Older GPUs keep packed MXFP4 resident but use routed BF16 dequant
-    // scratch for the selected experts.
-    const bool mxfp4_native_gemm = dev_prop.major >= 10;
+    // Ampere and newer. The vendored Marlin ships sm80 kernels for BF16
+    // activations against kFE2M1f weights with kFE8M0fnu block scales
+    // (third_party/marlin/sm80_kernel_bfloat16_fe2m1f_bfloat16.cu) — the
+    // path vLLM selects on A100. Restricting this to Blackwell left every
+    // Ampere GPU on the routed fallback, which re-dequantizes each routed
+    // expert on EVERY fire: measured at 78% of all GPU time on gpt-oss-20b,
+    // with another 8% in the row deinterleave it feeds.
+    //
+    // This is the gate the loader actually reads; the identical-looking one
+    // in context.cpp only fills the `native_mxfp4_moe` device fact.
+    const bool mxfp4_native_gemm = dev_prop.major >= 8;
+    // ...but AUTO must not pick it below Blackwell yet. Measured on A100
+    // (sm80) with gpt-oss-20b: the native path is 3.8x faster (180 -> 688
+    // tok/s at 64x128) and produces GARBAGE text (", , , , ,..."). The
+    // repack/GEMM combination is unvalidated on this arch — it was gated to
+    // hardware nobody here has, so it has never executed. Auto therefore
+    // keeps the correct routed path on sm80..sm9x; `--mxfp4-moe native`
+    // still reaches it so the remaining correctness bug can be worked on
+    // (prime suspect: the [I, I_native) pad columns of the repacked gate/up
+    // weights are not zeroed, so the down projection consumes garbage —
+    // intermediate_size 2880 is not a multiple of the 128 alignment).
+    const bool mxfp4_auto_prefers_native = dev_prop.major >= 10;
 #else
     const bool mxfp4_native_gemm = false;
+    const bool mxfp4_auto_prefers_native = false;
 #endif
 
     // Compile the plan for *this* device. The driver states what the device can
@@ -143,7 +162,10 @@ LoadedModel LoadedModel::load(
         auto target = cuda_device_target();
         target.tp_rank = static_cast<std::uint32_t>(boot_cfg.distributed.tp_rank);
         target.tp_size = static_cast<std::uint32_t>(boot_cfg.distributed.tp_size);
-        target.native_mxfp4_moe = mxfp4_native_gemm;
+        target.native_mxfp4_moe =
+            mxfp4_moe == model::Mxfp4MoeRequest::Auto
+                ? mxfp4_auto_prefers_native
+                : mxfp4_native_gemm;
         return target;
     }();
 

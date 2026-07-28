@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <iostream>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -63,6 +64,13 @@ MixtralWeights bind_gpt_oss(const LoadedModel& engine) {
     const int I = I_full / T;
     const bool native_mxfp4 = engine.mxfp4_moe_policy() ==
         Mxfp4MoePolicy::NativeGemm;
+    // Which MXFP4 backend the checkpoint actually bound to. The routed
+    // fallback re-dequantizes every routed expert per fire (measured at 78%
+    // of GPU time), so silently landing on it is a performance cliff worth
+    // stating out loud rather than inferring from a profile.
+    std::cerr << "[pie-driver-cuda] gpt_oss MXFP4 backend: "
+              << (native_mxfp4 ? "NATIVE (marlin)" : "ROUTED (dequant)")
+              << "\n";
     const int I_native = native_mxfp4 ? align_up_int(I, 128) : I;
     const int L = cfg.num_hidden_layers;
     const int Hq = (cfg.num_attention_heads * cfg.head_dim) / T;

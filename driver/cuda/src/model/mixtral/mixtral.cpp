@@ -674,6 +674,7 @@ void mixtral_forward_paged(
                          is_pure_decode ? 1 : 0,
                          static_cast<int>(w.layers.size()), ar_count);
         }
+    }
     if (!fwd_cfg.emit_logits) {
         return;
     }
