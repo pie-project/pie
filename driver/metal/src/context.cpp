@@ -182,6 +182,12 @@ struct ModelFacts {
     std::uint32_t max_model_len = 8192;
     std::string arch_name = "llama";
     bool has_linear_attn = false;
+    // Qwen3.5/3.6 ship a config with no `rope_theta`, so the family default is
+    // what applies. The geometry header carried 1e7, which is 100x the value
+    // the reference implementations use for this family -- finite, so it does
+    // not fail anything, it just decays the attention until the activations
+    // overflow a dozen layers in.
+    float rope_theta = 1.0e5f;
     // Which storage schema this driver authors against. Parsed here because
     // this is already the driver's one read of `config.json`; the loader no
     // longer opens it (`loader/architecture.md` §10.4).
@@ -239,6 +245,17 @@ ModelFacts read_model_facts(const std::string& hf_path) {
         }
         if (!u32_of(tc, "max_position_embeddings", facts.max_model_len)) {
             u32_of(j, "max_position_embeddings", facts.max_model_len);
+        }
+        const auto f32_of = [](const nlohmann::json& obj, const char* key,
+                               float& out) {
+            if (obj.contains(key) && obj[key].is_number()) {
+                out = obj[key].get<float>();
+                return true;
+            }
+            return false;
+        };
+        if (!f32_of(tc, "rope_theta", facts.rope_theta)) {
+            f32_of(j, "rope_theta", facts.rope_theta);
         }
         if (j.contains("architectures") && j["architectures"].is_array() &&
             !j["architectures"].empty()) {
@@ -345,7 +362,14 @@ std::string build_caps_json(const Config& cfg,
         {"rs_cache_required", rs_cache_required},
         {"rs_cache_slots", rs_cache_slots},
         {"rs_cache_slot_bytes", rs_cache_slot_bytes},
-        {"device_geometry_port_mask", 0},
+        // `pipeline/descriptor_resolve.hpp` implements every port in this set
+        // (and `AttnMask`, which is not in it), and `build_member_forward`
+        // drives it: resolve, retry while a producer is behind, fail on poison,
+        // translate WorkingSet pages, validate. The mask stayed 0 from before
+        // that resolver existed, so the runtime kept falling back to
+        // host-evaluated geometry -- which cannot work for a decode whose token
+        // was sampled on device (`EmbedTokens is not host-derivable`).
+        {"device_geometry_port_mask", PIE_DEVICE_GEOMETRY_PORTS},
         {"max_forward_tokens", max_forward_tokens},
         {"max_forward_requests", max_forward_requests},
         {"max_page_refs", rs_cache_required
@@ -1899,6 +1923,7 @@ class Context::Impl {
         setup_cfg.max_forward_requests = cfg_.batching.max_forward_requests;
         setup_cfg.snapshot_dir = cfg_.model.hf_path;
         setup_cfg.model_type = facts_.model_type;
+        setup_cfg.rope_theta = facts_.rope_theta;
         setup_cfg.storage_page_size = storage_page_size_;
         // Create + `setup()` the executor ON THE WORKER THREAD (Phase 3, §7):
         // MetalExecutor::setup builds the Metal device/heap/PSOs, which must
@@ -1938,7 +1963,11 @@ class Context::Impl {
         desc.sequence_id = member.instance_id;
 
         pie_native::launch::FireGeometry resolved;
+        // The runtime states the class at bind; trust it. The trace-shape
+        // predicate stays as the fallback for a HOST-class instance whose
+        // program nonetheless traces its geometry.
         const bool device_geometry =
+            member.geometry_class != PIE_GEOMETRY_CLASS_HOST ||
             interp::requires_descriptor_resolution(program.plan.trace);
         if (device_geometry) {
             const interp::GeometryResolveResult resolution =
@@ -1992,17 +2021,65 @@ class Context::Impl {
                 return ForwardBuildResult::Failed;
             }
         }
-        return executor::build_member_forward_desc(
-                   view,
-                   m,
-                   member_count,
-                   facts_.has_linear_attn,
-                   cfg_.batching.kv_page_size,
-                   device_geometry ? &resolved : nullptr,
-                   desc,
-                   failure)
-                   ? ForwardBuildResult::Ready
-                   : ForwardBuildResult::Failed;
+        if (!executor::build_member_forward_desc(
+                view,
+                m,
+                member_count,
+                facts_.has_linear_attn,
+                cfg_.batching.kv_page_size,
+                device_geometry ? &resolved : nullptr,
+                desc,
+                failure)) {
+            // Say whether the geometry came off the wire or off the device, and
+            // what the resolver produced -- otherwise a rejected fire looks the
+            // same whichever half got it wrong.
+            failure += device_geometry
+                           ? " [device-resolved geometry: tokens=" +
+                                 std::to_string(resolved.token_ids.size()) +
+                                 " first_position=" +
+                                 (resolved.position_ids.empty()
+                                      ? std::string("<none>")
+                                      : std::to_string(resolved.position_ids.front())) +
+                                 "]"
+                           : " [wire geometry]";
+            return ForwardBuildResult::Failed;
+        }
+        // A wire fire's page ids came out of a guest channel too, and the ABI
+        // is explicit that "guests never see physical ids": when the frame
+        // carries a translation segment for this lane, the wire list is
+        // WorkingSet-relative exactly like a resolved one. Translating only the
+        // resolved half left a chained program's prefill writing physical
+        // pages and its decode reading translated ones -- the KV-lineage
+        // rejection this fixes.
+        if (!device_geometry &&
+            view.kv_translation_indptr.size() == member_count + 1) {
+            const std::uint32_t lo = view.kv_translation_indptr.data()[m];
+            const std::uint32_t hi = view.kv_translation_indptr.data()[m + 1];
+            if (hi > lo && hi <= view.kv_translation.size()) {
+                const std::uint32_t* table = view.kv_translation.data() + lo;
+                const std::size_t len = hi - lo;
+                const auto map = [&](std::vector<std::uint32_t>& ids) {
+                    for (std::uint32_t& id : ids) {
+                        id = id < len ? table[id] : 0u;
+                    }
+                };
+                map(desc.kv_pages);
+                map(desc.w_page);
+            }
+        }
+
+        // What makes two fires one sequence is the recurrent-state slot the
+        // runtime assigned to the request, not the instance that posted them.
+        // A two-pass program prefills under one instance and decodes under the
+        // next while keeping the same slot, so identifying the resident
+        // sequence by `instance_id` rejected the decode as "a different
+        // sequence" and made every chained program unrunnable. The high bit
+        // keeps the two id spaces from colliding for an arch with no slot.
+        if (desc.has_rs_slot) {
+            desc.sequence_id =
+                (1ull << 63) | static_cast<std::uint64_t>(desc.rs_slot_id);
+        }
+        return ForwardBuildResult::Ready;
     }
 
     void queue_channel_notifications(

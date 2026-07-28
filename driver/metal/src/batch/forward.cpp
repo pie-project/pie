@@ -103,8 +103,10 @@ bool validate_linear_sequence_geometry(const LinearSequenceState& state,
     if (desc.position_ids.front() != state.resident_next_position) {
         return reject(
             "Metal Phase 1a: this member's positions do not extend the "
-            "currently resident sequence (forks/shared-prefix/interleaved "
-            "sequences are unsupported)");
+            "currently resident sequence (starts at " +
+            std::to_string(desc.position_ids.front()) + ", resident sequence " +
+            "next expects " + std::to_string(state.resident_next_position) +
+            "; forks/shared-prefix/interleaved sequences are unsupported)");
     }
     // The resident page list must survive as a literal PREFIX of this fire's
     // full list — the prior pages must still be exactly where they were;
@@ -308,7 +310,7 @@ bool validate_paged_request_state(
     const MemberForwardDesc& desc,
     std::size_t request,
     std::string* error) {
-    auto fail = [&](const char* message) {
+    auto fail = [&](const std::string& message) {
         if (error != nullptr) *error = message;
         return false;
     };
@@ -335,14 +337,36 @@ bool validate_paged_request_state(
     }
     if (reset) return true;
     const auto found = states.find(slot);
-    if (found == states.end() ||
-        !found->second.has_resident ||
-        !found->second.paged_backed ||
-        found->second.resident_sequence_id != desc.sequence_id ||
-        found->second.resident_next_position !=
-            desc.position_ids[desc.qo_indptr[request]]) {
-        return fail(
-            "paged continuation has no matching resident recurrent state");
+    // Five ways to not match; say which, or the caller cannot tell a slot that
+    // was never resident from one that is a token behind.
+    const std::uint32_t want_position =
+        desc.position_ids[desc.qo_indptr[request]];
+    if (found == states.end()) {
+        return fail("paged continuation: recurrent slot " +
+                    std::to_string(slot) + " has no state at all");
+    }
+    if (!found->second.has_resident) {
+        return fail("paged continuation: recurrent slot " +
+                    std::to_string(slot) + " holds no resident sequence");
+    }
+    if (!found->second.paged_backed) {
+        return fail("paged continuation: recurrent slot " +
+                    std::to_string(slot) +
+                    " is ring-backed, not paged — the prior fire took the "
+                    "sealed M=1 path and this one is paged");
+    }
+    if (found->second.resident_sequence_id != desc.sequence_id) {
+        return fail("paged continuation: recurrent slot " +
+                    std::to_string(slot) + " holds sequence " +
+                    std::to_string(found->second.resident_sequence_id) +
+                    ", this fire is sequence " +
+                    std::to_string(desc.sequence_id));
+    }
+    if (found->second.resident_next_position != want_position) {
+        return fail("paged continuation: recurrent slot " +
+                    std::to_string(slot) + " is at position " +
+                    std::to_string(found->second.resident_next_position) +
+                    ", this fire starts at " + std::to_string(want_position));
     }
     const std::size_t page_begin =
         desc.kv_page_indptr[request];
@@ -354,8 +378,22 @@ bool validate_paged_request_state(
             found->second.resident_pages.begin(),
             found->second.resident_pages.end(),
             desc.kv_pages.begin() + page_begin)) {
+        const auto list = [](const std::vector<std::uint32_t>& v,
+                            std::size_t from, std::size_t to) {
+            std::string out = "[";
+            for (std::size_t i = from; i < to && i < v.size(); ++i) {
+                if (i != from) out += ",";
+                out += std::to_string(v[i]);
+            }
+            return out + "]";
+        };
         return fail(
-            "paged continuation does not preserve recurrent-state KV lineage");
+            "paged continuation does not preserve recurrent-state KV lineage: "
+            "resident pages " +
+            list(found->second.resident_pages, 0,
+                 found->second.resident_pages.size()) +
+            " is not a prefix of this fire's " +
+            list(desc.kv_pages, page_begin, page_end));
     }
     return true;
 }
@@ -666,8 +704,25 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
     // ── Scratch pool (colors_used slots) → beta's bind pass. ──
     pool_.resize(std::max({sched_.colors_used, mb_sched_.colors_used,
                            prefill_sched_.colors_used}));
-    for (size_t i = 0; i < pool_.size(); ++i)
-        pool_[i] = ctx_->create_elastic_buffer(plan_.scratch_slot_bytes);
+    // Commit the scratch slots. `create_elastic_buffer`'s second argument
+    // defaults to zero, which leaves a placement-sparse VA with no memory
+    // behind it -- and every activation in the graph passes through this pool,
+    // so an uncommitted slot is read as whatever the sparse mapping returns.
+    // The GDN and KV allocations next door go through `alloc_zeroed`, which
+    // always passes a commit size; this one was the exception.
+    for (size_t i = 0; i < pool_.size(); ++i) {
+        pool_[i] = ctx_->create_elastic_buffer(
+            plan_.scratch_slot_bytes, plan_.scratch_slot_bytes);
+        if (!pool_[i].valid()) {
+            if (err) {
+                *err = "scratch slot " + std::to_string(i) + " (" +
+                       std::to_string(plan_.scratch_slot_bytes) +
+                       " bytes) failed to commit";
+            }
+            ctx_.reset();
+            return false;
+        }
+    }
     bind_scratch(*ctx_, dag_, sched_, pool_.data(), int(pool_.size()));
 
     // ── Geometry const-params. ──
@@ -1498,8 +1553,10 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
     for (uint32_t slot : active_slots) {
         if ((step_count_for(slot) & 1) == 0) continue;
         const size_t off = size_t(slot) * g_.gdn_conv_stride_bytes();
-        // copy C -> A (different handles, same offset).
+        // copy C -> A (different handles, same offset). A full-attention layer
+        // has no GDN slab; skip it exactly as the commit below does.
         for (auto& gs : b_.gdn) {
+            if (!gs.conv_state.valid() && !gs.conv_state_out.valid()) continue;
             if (!gs.conv_state.valid() ||
                 !ctx_->copy_buffer_range(
                     gs.conv_state, off,
@@ -1527,13 +1584,34 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
 
     for (uint32_t slot : active_slots) {
         const size_t off = size_t(slot) * g_.gdn_conv_stride_bytes();
-        for (auto& gs : b_.gdn) {
+        for (std::size_t layer = 0; layer < b_.gdn.size(); ++layer) {
+            auto& gs = b_.gdn[layer];
+            // A full-attention layer has no GDN slab: `build_bound_decode`
+            // leaves its entry default-constructed. Every other loop over
+            // `b_.gdn` treats that as a no-op (see `copy_state_slot`, whose
+            // comment says so); this one read it as a failure, so committing
+            // the ping-pong after a paged step died on the first full-attn
+            // layer of a hybrid.
+            if (!gs.conv_state.valid() && !gs.conv_state_out.valid()) continue;
             if (!gs.conv_state.valid() ||
                 !ctx_->copy_buffer_range(
                     gs.conv_state, off,
                     gs.conv_state_out, off,
-                    g_.gdn_conv_stride_bytes()))
-                return fail("failed to commit GDN ping-pong state");
+                    g_.gdn_conv_stride_bytes())) {
+                return fail(
+                    "failed to commit GDN ping-pong state: layer " +
+                    std::to_string(layer) + " slot " + std::to_string(slot) +
+                    " offset " + std::to_string(off) + " stride " +
+                    std::to_string(g_.gdn_conv_stride_bytes()) +
+                    " conv_state " +
+                    (gs.conv_state.valid()
+                         ? "size " + std::to_string(gs.conv_state.size)
+                         : "<invalid>") +
+                    " conv_state_out " +
+                    (gs.conv_state_out.valid()
+                         ? "size " + std::to_string(gs.conv_state_out.size)
+                         : "<invalid>"));
+            }
         }
     }
     for (uint32_t slot : schedule.slot_of_token) ++step_count_for(slot);
@@ -1819,6 +1897,7 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
     geom.max_tokens = static_cast<int>(std::min(cfg.max_forward_tokens,
                                                 kPagedMaxForwardTokens));
     geom.max_slots = std::max(geom.max_slots, geom.max_requests);
+    geom.rope_theta = cfg.rope_theta;
     geom.kv_page_size = static_cast<int>(cfg.kv_page_size);
     geom.total_pages = static_cast<int>(cfg.total_pages);
     geom.paged_kv_enabled = cfg.total_pages > 0 && cfg.kv_page_size > 0 &&

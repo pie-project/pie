@@ -1,7 +1,7 @@
 # oracle dump: pie::metal::pipeline::emit_grouped_topk_msl
 # source of truth: compiler/codegen/src/metal/ (the C++ oracle this was dumped from is deleted)
-# emitter_version: 24
-# @runtime: bytes=33947 fnv1a64=0x87250720781b2a8f
+# emitter_version: 25
+# @runtime: bytes=34685 fnv1a64=0xac1c05ffc5f276a
 # @grouped: bytes=970 fnv1a64=0xa8ab9e1ebf8714d9
 # cases: 192
 === beam_epilogue#0 singleton#0
@@ -68,7 +68,7 @@ error: invalid grouped TopK library region
 function_name: ptir_m3_b4fadd8446eb58dd_r14
 region: library=1 library_op=1 schedule=3 nodes=1 inputs=1 outputs=2 sinks=0
 ok: true
-source: bytes=40172 prefix=@runtime+@grouped tail_bytes=5255
+source: bytes=40910 prefix=@runtime+@grouped tail_bytes=5255
 
 inline uint m3_topk_order_digit(float value, uint pass) {
   if (pass < 8u) {
@@ -290,7 +290,7 @@ error: invalid grouped TopK library region
 function_name: ptir_m3_b4fadd8446eb58dd_r1
 region: library=1 library_op=1 schedule=3 nodes=1 inputs=1 outputs=2 sinks=0
 ok: true
-source: bytes=40171 prefix=@runtime+@grouped tail_bytes=5254
+source: bytes=40909 prefix=@runtime+@grouped tail_bytes=5254
 
 inline uint m3_topk_order_digit(float value, uint pass) {
   if (pass < 8u) {
@@ -1028,7 +1028,7 @@ error: invalid grouped TopK library region
 function_name: ptir_m3_dff3bc6795a9dcdf_r31
 region: library=1 library_op=1 schedule=3 nodes=1 inputs=1 outputs=2 sinks=0
 ok: true
-source: bytes=40172 prefix=@runtime+@grouped tail_bytes=5255
+source: bytes=40910 prefix=@runtime+@grouped tail_bytes=5255
 
 inline uint m3_topk_order_digit(float value, uint pass) {
   if (pass < 8u) {
@@ -1178,7 +1178,7 @@ error: invalid grouped TopK library region
 function_name: ptir_m3_dff3bc6795a9dcdf_r1
 region: library=1 library_op=1 schedule=3 nodes=1 inputs=1 outputs=2 sinks=0
 ok: true
-source: bytes=40171 prefix=@runtime+@grouped tail_bytes=5254
+source: bytes=40909 prefix=@runtime+@grouped tail_bytes=5254
 
 inline uint m3_topk_order_digit(float value, uint pass) {
   if (pass < 8u) {

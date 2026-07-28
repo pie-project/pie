@@ -21,11 +21,24 @@ static MODEL: OnceLock<Arc<Model>> = OnceLock::new();
 /// `config.json`, located beside the tokenizer. `None` if absent (e.g. mock
 /// fixtures) — callers fall back to the tokenizer vocab. Mirrors the driver's
 /// `config.json` discovery so host + driver agree on the logits dim.
+///
+/// A multimodal release nests the text decoder's facts under `text_config`,
+/// which `read_snapshot_num_layers` below already accounts for. Without the
+/// same fallback here the read misses, the caller silently substitutes the
+/// *tokenizer* vocab, and host and driver disagree by exactly the LM head's
+/// padding — which the emitted logits gather then rejects as a device fault.
 fn read_snapshot_vocab_size(tokenizer_path: &std::path::Path) -> Option<u32> {
     let cfg = tokenizer_path.parent()?.join("config.json");
     let text = std::fs::read_to_string(cfg).ok()?;
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
-    v.get("vocab_size")?.as_u64().map(|n| n as u32)
+    v.get("vocab_size")
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| {
+            v.get("text_config")
+                .and_then(|text| text.get("vocab_size"))
+                .and_then(serde_json::Value::as_u64)
+        })
+        .map(|n| n as u32)
 }
 
 fn read_snapshot_num_layers(tokenizer_path: &std::path::Path) -> Option<u32> {

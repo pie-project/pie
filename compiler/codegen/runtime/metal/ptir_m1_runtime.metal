@@ -179,6 +179,21 @@ inline void m1_fault(device M1Status* status, uint code) {
   status->state = 3;
 }
 
+// A fault that says which op and which guard. `fault` alone is the op tag, and
+// several ops share one tag -- every intrinsic is 0xA0 -- so the tag names a
+// family rather than a cause. `reserved0` carries the intrinsic id and
+// `reserved1` packs the guard site with the immediate, which is what turns
+// "instance N launch failed: op tag 0xA0" into something actionable.
+//   site 1 = channel sink is narrower than the value
+//   site 2 = MtpDrafts with a zero row width
+//   site 3 = no arm claimed this tag
+inline void m1_fault_op(device M1Status* status, uint site, M1OpParams p) {
+  status->reserved0 = p.intr;
+  status->reserved1 = (site << 24) | (p.imm & 0x00ffffffu);
+  status->fault = p.tag;
+  status->state = 3;
+}
+
 inline void m1_copy_typed(
     const device uchar* input,
     device uchar* output,
@@ -419,7 +434,7 @@ inline void ptir_m1_execute(
     const uint logical_bytes =
         d0.dtype == 3 ? (d0.len + 7u) / 8u : d0.len * 4u;
     if (logical_bytes > p.sink_bytes) {
-      m1_fault(status, p.tag);
+      m1_fault_op(status, 1u, p);
       return;
     }
     if (d0.dtype == 3) {
@@ -438,7 +453,7 @@ inline void ptir_m1_execute(
         ulong(p.imm2) * p.imm;
     if (p.intr == 6u) {  // MtpDrafts: bounded argmax of the bound MTP rows
       if (p.imm == 0u) {
-        m1_fault(status, p.tag);
+        m1_fault_op(status, 2u, p);
         return;
       }
       for (uint row = 0; row < out0.len; ++row) {
@@ -924,5 +939,5 @@ inline void ptir_m1_execute(
     return;
   }
 
-  m1_fault(status, p.tag);
+  m1_fault_op(status, 3u, p);
 }

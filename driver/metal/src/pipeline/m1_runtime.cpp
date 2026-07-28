@@ -3132,11 +3132,56 @@ std::vector<M1ExecuteOutcome> M1Runtime::finish_m3_group(
         }
         outcomes.push_back(M1ExecuteOutcome::Failed);
         if (!faults.empty()) faults += "; ";
+        // `m1_fault_op` packs the guard site into the top byte of reserved1
+        // and the immediate into the rest; `reserved0` is the intrinsic id.
+        // The lane-table guard (fault 0x100) uses the same fields differently,
+        // so it is reported raw.
+        const std::uint32_t site = statuses[lane].reserved1 >> 24;
+        const char* site_name =
+            site == 1   ? "channel sink narrower than the value"
+            : site == 2 ? "MtpDrafts with a zero row width"
+            : site == 3 ? "no arm claimed this op tag"
+                        : "unknown";
         faults += "lane " + std::to_string(lane) + " state=" +
-                  std::to_string(statuses[lane].state) + " fault=0x" +
-                  hex64(statuses[lane].fault) + " reserved0=" +
-                  std::to_string(statuses[lane].reserved0) + " reserved1=0x" +
-                  hex64(statuses[lane].reserved1);
+                  std::to_string(statuses[lane].state) + " op_tag=0x" +
+                  hex64(statuses[lane].fault) + " intr=" +
+                  std::to_string(statuses[lane].reserved0) + " imm=" +
+                  std::to_string(statuses[lane].reserved1 & 0x00ffffffu) +
+                  " guard=" + site_name;
+    }
+    // The emitted regions guard on the group layout the host wrote, so a fault
+    // there is usually a layout the host got wrong rather than a bad op. Report
+    // it alongside, or the next reader is back to reading the emitter.
+    if (!faults.empty()) {
+        for (const auto& stage : command->stages) {
+            if (!stage.layout.valid() || stage.layout.contents() == nullptr) continue;
+            const auto* layout =
+                static_cast<const M3GroupLayout*>(stage.layout.contents());
+            faults += "; stage layout lanes=" + std::to_string(layout->lane_count) +
+                      " values=" + std::to_string(layout->value_count) +
+                      " vocab=" + std::to_string(layout->vocab) +
+                      " scratch_stride=" + std::to_string(layout->scratch_stride);
+            if (stage.descriptors.valid() &&
+                stage.descriptors.contents() != nullptr) {
+                const auto* descs = static_cast<const DeviceValueDesc*>(
+                    stage.descriptors.contents());
+                faults += " desc_len=[";
+                for (std::uint32_t i = 0; i < layout->value_count; ++i) {
+                    if (i != 0) faults += ",";
+                    faults += std::to_string(descs[i].len);
+                }
+                faults += "]";
+            }
+            break;
+        }
+    }
+    if (!faults.empty() && command->row_meta.valid() &&
+        command->row_meta.contents() != nullptr) {
+        const auto* meta =
+            static_cast<const M3RowMeta*>(command->row_meta.contents());
+        faults += "; row_meta[0] offset=" + std::to_string(meta[0].offset) +
+                  " count=" + std::to_string(meta[0].count) +
+                  " mtp_offset=" + std::to_string(meta[0].mtp_offset);
     }
     if (!faults.empty() && error.empty()) {
         error = "Metal M3 group reported a device fault (" + faults +

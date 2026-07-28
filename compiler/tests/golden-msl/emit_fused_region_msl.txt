@@ -1,7 +1,7 @@
 # oracle dump: pie::metal::pipeline::emit_fused_region_msl
 # source of truth: compiler/codegen/src/metal/ (the C++ oracle this was dumped from is deleted)
-# emitter_version: 24
-# @runtime: bytes=33947 fnv1a64=0x87250720781b2a8f
+# emitter_version: 25
+# @runtime: bytes=34685 fnv1a64=0xac1c05ffc5f276a
 # @grouped: bytes=970 fnv1a64=0xa8ab9e1ebf8714d9
 # cases: 192
 === beam_epilogue#0 singleton#0
@@ -170,7 +170,7 @@ error: fused region exceeds the 12-channel direct-binding limit
 function_name: ptir_m2_f4e949004f50e90e_r0
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=34853 prefix=@runtime tail_bytes=906
+source: bytes=35591 prefix=@runtime tail_bytes=906
 kernel void ptir_m2_f4e949004f50e90e_r0(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -195,7 +195,7 @@ kernel void ptir_m2_f4e949004f50e90e_r0(
 function_name: ptir_m2_f4e949004f50e90e_r1
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=34851 prefix=@runtime tail_bytes=904
+source: bytes=35589 prefix=@runtime tail_bytes=904
 kernel void ptir_m2_f4e949004f50e90e_r1(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -220,7 +220,7 @@ kernel void ptir_m2_f4e949004f50e90e_r1(
 function_name: ptir_m2_f4e949004f50e90e_r2
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=34876 prefix=@runtime tail_bytes=929
+source: bytes=35614 prefix=@runtime tail_bytes=929
 kernel void ptir_m2_f4e949004f50e90e_r2(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -245,7 +245,7 @@ kernel void ptir_m2_f4e949004f50e90e_r2(
 function_name: ptir_m2_f4e949004f50e90e_r3
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
 ok: true
-source: bytes=34878 prefix=@runtime tail_bytes=931
+source: bytes=35616 prefix=@runtime tail_bytes=931
 kernel void ptir_m2_f4e949004f50e90e_r3(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -271,7 +271,7 @@ kernel void ptir_m2_f4e949004f50e90e_r3(
 function_name: ptir_m2_f4e949004f50e90e_r0
 region: library=0 library_op=0 schedule=1 nodes=5 inputs=0 outputs=0 sinks=2
 ok: true
-source: bytes=35576 prefix=@runtime tail_bytes=1629
+source: bytes=36314 prefix=@runtime tail_bytes=1629
 kernel void ptir_m2_f4e949004f50e90e_r0(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -306,7 +306,7 @@ kernel void ptir_m2_f4e949004f50e90e_r0(
 function_name: ptir_m2_4f4b856e5ef3e8b4_r0
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=35136 prefix=@runtime tail_bytes=1189
+source: bytes=35874 prefix=@runtime tail_bytes=1189
 kernel void ptir_m2_4f4b856e5ef3e8b4_r0(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -337,7 +337,7 @@ kernel void ptir_m2_4f4b856e5ef3e8b4_r0(
 function_name: ptir_m2_4f4b856e5ef3e8b4_r1
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=35139 prefix=@runtime tail_bytes=1192
+source: bytes=35877 prefix=@runtime tail_bytes=1192
 kernel void ptir_m2_4f4b856e5ef3e8b4_r1(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -368,7 +368,7 @@ kernel void ptir_m2_4f4b856e5ef3e8b4_r1(
 function_name: ptir_m2_4f4b856e5ef3e8b4_r3
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=35139 prefix=@runtime tail_bytes=1192
+source: bytes=35877 prefix=@runtime tail_bytes=1192
 kernel void ptir_m2_4f4b856e5ef3e8b4_r3(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -399,7 +399,7 @@ kernel void ptir_m2_4f4b856e5ef3e8b4_r3(
 function_name: ptir_m2_4f4b856e5ef3e8b4_r4
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=35162 prefix=@runtime tail_bytes=1215
+source: bytes=35900 prefix=@runtime tail_bytes=1215
 kernel void ptir_m2_4f4b856e5ef3e8b4_r4(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -430,7 +430,7 @@ kernel void ptir_m2_4f4b856e5ef3e8b4_r4(
 function_name: ptir_m2_4f4b856e5ef3e8b4_r5
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=35137 prefix=@runtime tail_bytes=1190
+source: bytes=35875 prefix=@runtime tail_bytes=1190
 kernel void ptir_m2_4f4b856e5ef3e8b4_r5(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -461,7 +461,7 @@ kernel void ptir_m2_4f4b856e5ef3e8b4_r5(
 function_name: ptir_m2_4f4b856e5ef3e8b4_r6
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
 ok: true
-source: bytes=35175 prefix=@runtime tail_bytes=1228
+source: bytes=35913 prefix=@runtime tail_bytes=1228
 kernel void ptir_m2_4f4b856e5ef3e8b4_r6(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -492,7 +492,7 @@ kernel void ptir_m2_4f4b856e5ef3e8b4_r6(
 function_name: ptir_m2_4f4b856e5ef3e8b4_r7
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=35149 prefix=@runtime tail_bytes=1202
+source: bytes=35887 prefix=@runtime tail_bytes=1202
 kernel void ptir_m2_4f4b856e5ef3e8b4_r7(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -523,7 +523,7 @@ kernel void ptir_m2_4f4b856e5ef3e8b4_r7(
 function_name: ptir_m2_4f4b856e5ef3e8b4_r8
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
 ok: true
-source: bytes=35164 prefix=@runtime tail_bytes=1217
+source: bytes=35902 prefix=@runtime tail_bytes=1217
 kernel void ptir_m2_4f4b856e5ef3e8b4_r8(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -555,7 +555,7 @@ kernel void ptir_m2_4f4b856e5ef3e8b4_r8(
 function_name: ptir_m2_4f4b856e5ef3e8b4_r10
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=35164 prefix=@runtime tail_bytes=1217
+source: bytes=35902 prefix=@runtime tail_bytes=1217
 kernel void ptir_m2_4f4b856e5ef3e8b4_r10(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -586,7 +586,7 @@ kernel void ptir_m2_4f4b856e5ef3e8b4_r10(
 function_name: ptir_m2_4f4b856e5ef3e8b4_r11
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=35151 prefix=@runtime tail_bytes=1204
+source: bytes=35889 prefix=@runtime tail_bytes=1204
 kernel void ptir_m2_4f4b856e5ef3e8b4_r11(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -617,7 +617,7 @@ kernel void ptir_m2_4f4b856e5ef3e8b4_r11(
 function_name: ptir_m2_4f4b856e5ef3e8b4_r12
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=35166 prefix=@runtime tail_bytes=1219
+source: bytes=35904 prefix=@runtime tail_bytes=1219
 kernel void ptir_m2_4f4b856e5ef3e8b4_r12(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -648,7 +648,7 @@ kernel void ptir_m2_4f4b856e5ef3e8b4_r12(
 function_name: ptir_m2_4f4b856e5ef3e8b4_r0
 region: library=0 library_op=0 schedule=1 nodes=15 inputs=0 outputs=0 sinks=2
 ok: true
-source: bytes=37622 prefix=@runtime tail_bytes=3675
+source: bytes=38360 prefix=@runtime tail_bytes=3675
 kernel void ptir_m2_4f4b856e5ef3e8b4_r0(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -709,7 +709,7 @@ kernel void ptir_m2_4f4b856e5ef3e8b4_r0(
 function_name: ptir_m2_d01f407b22863878_r0
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=34708 prefix=@runtime tail_bytes=761
+source: bytes=35446 prefix=@runtime tail_bytes=761
 kernel void ptir_m2_d01f407b22863878_r0(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -731,7 +731,7 @@ kernel void ptir_m2_d01f407b22863878_r0(
 function_name: ptir_m2_d01f407b22863878_r1
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
 ok: true
-source: bytes=34736 prefix=@runtime tail_bytes=789
+source: bytes=35474 prefix=@runtime tail_bytes=789
 kernel void ptir_m2_d01f407b22863878_r1(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -754,7 +754,7 @@ kernel void ptir_m2_d01f407b22863878_r1(
 function_name: ptir_m2_d01f407b22863878_r0
 region: library=0 library_op=0 schedule=1 nodes=2 inputs=0 outputs=0 sinks=1
 ok: true
-source: bytes=34896 prefix=@runtime tail_bytes=949
+source: bytes=35634 prefix=@runtime tail_bytes=949
 kernel void ptir_m2_d01f407b22863878_r0(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -779,7 +779,7 @@ kernel void ptir_m2_d01f407b22863878_r0(
 function_name: ptir_m2_f2566cc0c1e0529a_r0
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=34850 prefix=@runtime tail_bytes=903
+source: bytes=35588 prefix=@runtime tail_bytes=903
 kernel void ptir_m2_f2566cc0c1e0529a_r0(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -804,7 +804,7 @@ kernel void ptir_m2_f2566cc0c1e0529a_r0(
 function_name: ptir_m2_f2566cc0c1e0529a_r1
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=34863 prefix=@runtime tail_bytes=916
+source: bytes=35601 prefix=@runtime tail_bytes=916
 kernel void ptir_m2_f2566cc0c1e0529a_r1(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -829,7 +829,7 @@ kernel void ptir_m2_f2566cc0c1e0529a_r1(
 function_name: ptir_m2_f2566cc0c1e0529a_r2
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=34863 prefix=@runtime tail_bytes=916
+source: bytes=35601 prefix=@runtime tail_bytes=916
 kernel void ptir_m2_f2566cc0c1e0529a_r2(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -854,7 +854,7 @@ kernel void ptir_m2_f2566cc0c1e0529a_r2(
 function_name: ptir_m2_f2566cc0c1e0529a_r4
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
 ok: true
-source: bytes=34878 prefix=@runtime tail_bytes=931
+source: bytes=35616 prefix=@runtime tail_bytes=931
 kernel void ptir_m2_f2566cc0c1e0529a_r4(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -880,7 +880,7 @@ kernel void ptir_m2_f2566cc0c1e0529a_r4(
 function_name: ptir_m2_f2566cc0c1e0529a_r0
 region: library=0 library_op=0 schedule=1 nodes=6 inputs=0 outputs=0 sinks=2
 ok: true
-source: bytes=35745 prefix=@runtime tail_bytes=1798
+source: bytes=36483 prefix=@runtime tail_bytes=1798
 kernel void ptir_m2_f2566cc0c1e0529a_r0(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -917,7 +917,7 @@ kernel void ptir_m2_f2566cc0c1e0529a_r0(
 function_name: ptir_m2_6612fe00a51d7edc_r0
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=34708 prefix=@runtime tail_bytes=761
+source: bytes=35446 prefix=@runtime tail_bytes=761
 kernel void ptir_m2_6612fe00a51d7edc_r0(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -939,7 +939,7 @@ kernel void ptir_m2_6612fe00a51d7edc_r0(
 function_name: ptir_m2_6612fe00a51d7edc_r1
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=34709 prefix=@runtime tail_bytes=762
+source: bytes=35447 prefix=@runtime tail_bytes=762
 kernel void ptir_m2_6612fe00a51d7edc_r1(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -961,7 +961,7 @@ kernel void ptir_m2_6612fe00a51d7edc_r1(
 function_name: ptir_m2_6612fe00a51d7edc_r2
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=34721 prefix=@runtime tail_bytes=774
+source: bytes=35459 prefix=@runtime tail_bytes=774
 kernel void ptir_m2_6612fe00a51d7edc_r2(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -983,7 +983,7 @@ kernel void ptir_m2_6612fe00a51d7edc_r2(
 function_name: ptir_m2_6612fe00a51d7edc_r3
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=34735 prefix=@runtime tail_bytes=788
+source: bytes=35473 prefix=@runtime tail_bytes=788
 kernel void ptir_m2_6612fe00a51d7edc_r3(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -1005,7 +1005,7 @@ kernel void ptir_m2_6612fe00a51d7edc_r3(
 function_name: ptir_m2_6612fe00a51d7edc_r4
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=34721 prefix=@runtime tail_bytes=774
+source: bytes=35459 prefix=@runtime tail_bytes=774
 kernel void ptir_m2_6612fe00a51d7edc_r4(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -1027,7 +1027,7 @@ kernel void ptir_m2_6612fe00a51d7edc_r4(
 function_name: ptir_m2_6612fe00a51d7edc_r5
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
 ok: true
-source: bytes=34736 prefix=@runtime tail_bytes=789
+source: bytes=35474 prefix=@runtime tail_bytes=789
 kernel void ptir_m2_6612fe00a51d7edc_r5(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -1050,7 +1050,7 @@ kernel void ptir_m2_6612fe00a51d7edc_r5(
 function_name: ptir_m2_6612fe00a51d7edc_r0
 region: library=0 library_op=0 schedule=1 nodes=6 inputs=0 outputs=0 sinks=1
 ok: true
-source: bytes=35590 prefix=@runtime tail_bytes=1643
+source: bytes=36328 prefix=@runtime tail_bytes=1643
 kernel void ptir_m2_6612fe00a51d7edc_r0(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -1083,7 +1083,7 @@ kernel void ptir_m2_6612fe00a51d7edc_r0(
 function_name: ptir_m2_101abcfb79b08b89_r0
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=34850 prefix=@runtime tail_bytes=903
+source: bytes=35588 prefix=@runtime tail_bytes=903
 kernel void ptir_m2_101abcfb79b08b89_r0(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -1108,7 +1108,7 @@ kernel void ptir_m2_101abcfb79b08b89_r0(
 function_name: ptir_m2_101abcfb79b08b89_r1
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=34853 prefix=@runtime tail_bytes=906
+source: bytes=35591 prefix=@runtime tail_bytes=906
 kernel void ptir_m2_101abcfb79b08b89_r1(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -1133,7 +1133,7 @@ kernel void ptir_m2_101abcfb79b08b89_r1(
 function_name: ptir_m2_101abcfb79b08b89_r2
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=34851 prefix=@runtime tail_bytes=904
+source: bytes=35589 prefix=@runtime tail_bytes=904
 kernel void ptir_m2_101abcfb79b08b89_r2(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -1158,7 +1158,7 @@ kernel void ptir_m2_101abcfb79b08b89_r2(
 function_name: ptir_m2_101abcfb79b08b89_r3
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
 ok: true
-source: bytes=34889 prefix=@runtime tail_bytes=942
+source: bytes=35627 prefix=@runtime tail_bytes=942
 kernel void ptir_m2_101abcfb79b08b89_r3(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -1183,7 +1183,7 @@ kernel void ptir_m2_101abcfb79b08b89_r3(
 function_name: ptir_m2_101abcfb79b08b89_r4
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=34863 prefix=@runtime tail_bytes=916
+source: bytes=35601 prefix=@runtime tail_bytes=916
 kernel void ptir_m2_101abcfb79b08b89_r4(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -1208,7 +1208,7 @@ kernel void ptir_m2_101abcfb79b08b89_r4(
 function_name: ptir_m2_101abcfb79b08b89_r5
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
 ok: true
-source: bytes=34878 prefix=@runtime tail_bytes=931
+source: bytes=35616 prefix=@runtime tail_bytes=931
 kernel void ptir_m2_101abcfb79b08b89_r5(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -1234,7 +1234,7 @@ kernel void ptir_m2_101abcfb79b08b89_r5(
 function_name: ptir_m2_101abcfb79b08b89_r0
 region: library=0 library_op=0 schedule=1 nodes=6 inputs=0 outputs=0 sinks=1
 ok: true
-source: bytes=35734 prefix=@runtime tail_bytes=1787
+source: bytes=36472 prefix=@runtime tail_bytes=1787
 kernel void ptir_m2_101abcfb79b08b89_r0(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -1270,7 +1270,7 @@ kernel void ptir_m2_101abcfb79b08b89_r0(
 function_name: ptir_m2_963137d4ffed0445_r0
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=35136 prefix=@runtime tail_bytes=1189
+source: bytes=35874 prefix=@runtime tail_bytes=1189
 kernel void ptir_m2_963137d4ffed0445_r0(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -1301,7 +1301,7 @@ kernel void ptir_m2_963137d4ffed0445_r0(
 function_name: ptir_m2_963137d4ffed0445_r2
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=35139 prefix=@runtime tail_bytes=1192
+source: bytes=35877 prefix=@runtime tail_bytes=1192
 kernel void ptir_m2_963137d4ffed0445_r2(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -1332,7 +1332,7 @@ kernel void ptir_m2_963137d4ffed0445_r2(
 function_name: ptir_m2_963137d4ffed0445_r3
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=35137 prefix=@runtime tail_bytes=1190
+source: bytes=35875 prefix=@runtime tail_bytes=1190
 kernel void ptir_m2_963137d4ffed0445_r3(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -1363,7 +1363,7 @@ kernel void ptir_m2_963137d4ffed0445_r3(
 function_name: ptir_m2_963137d4ffed0445_r4
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
 ok: true
-source: bytes=35175 prefix=@runtime tail_bytes=1228
+source: bytes=35913 prefix=@runtime tail_bytes=1228
 kernel void ptir_m2_963137d4ffed0445_r4(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -1394,7 +1394,7 @@ kernel void ptir_m2_963137d4ffed0445_r4(
 function_name: ptir_m2_963137d4ffed0445_r5
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=35149 prefix=@runtime tail_bytes=1202
+source: bytes=35887 prefix=@runtime tail_bytes=1202
 kernel void ptir_m2_963137d4ffed0445_r5(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -1425,7 +1425,7 @@ kernel void ptir_m2_963137d4ffed0445_r5(
 function_name: ptir_m2_963137d4ffed0445_r7
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=35137 prefix=@runtime tail_bytes=1190
+source: bytes=35875 prefix=@runtime tail_bytes=1190
 kernel void ptir_m2_963137d4ffed0445_r7(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -1456,7 +1456,7 @@ kernel void ptir_m2_963137d4ffed0445_r7(
 function_name: ptir_m2_963137d4ffed0445_r8
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=35162 prefix=@runtime tail_bytes=1215
+source: bytes=35900 prefix=@runtime tail_bytes=1215
 kernel void ptir_m2_963137d4ffed0445_r8(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -1487,7 +1487,7 @@ kernel void ptir_m2_963137d4ffed0445_r8(
 function_name: ptir_m2_963137d4ffed0445_r9
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=35162 prefix=@runtime tail_bytes=1215
+source: bytes=35900 prefix=@runtime tail_bytes=1215
 kernel void ptir_m2_963137d4ffed0445_r9(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -1518,7 +1518,7 @@ kernel void ptir_m2_963137d4ffed0445_r9(
 function_name: ptir_m2_963137d4ffed0445_r13
 region: library=1 library_op=3 schedule=3 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=35153 prefix=@runtime tail_bytes=1206
+source: bytes=35891 prefix=@runtime tail_bytes=1206
 kernel void ptir_m2_963137d4ffed0445_r13(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -1549,7 +1549,7 @@ kernel void ptir_m2_963137d4ffed0445_r13(
 function_name: ptir_m2_963137d4ffed0445_r14
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=35153 prefix=@runtime tail_bytes=1206
+source: bytes=35891 prefix=@runtime tail_bytes=1206
 kernel void ptir_m2_963137d4ffed0445_r14(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -1580,7 +1580,7 @@ kernel void ptir_m2_963137d4ffed0445_r14(
 function_name: ptir_m2_963137d4ffed0445_r15
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=35152 prefix=@runtime tail_bytes=1205
+source: bytes=35890 prefix=@runtime tail_bytes=1205
 kernel void ptir_m2_963137d4ffed0445_r15(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -1611,7 +1611,7 @@ kernel void ptir_m2_963137d4ffed0445_r15(
 function_name: ptir_m2_963137d4ffed0445_r16
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=35153 prefix=@runtime tail_bytes=1206
+source: bytes=35891 prefix=@runtime tail_bytes=1206
 kernel void ptir_m2_963137d4ffed0445_r16(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -1642,7 +1642,7 @@ kernel void ptir_m2_963137d4ffed0445_r16(
 function_name: ptir_m2_963137d4ffed0445_r18
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=35167 prefix=@runtime tail_bytes=1220
+source: bytes=35905 prefix=@runtime tail_bytes=1220
 kernel void ptir_m2_963137d4ffed0445_r18(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -1673,7 +1673,7 @@ kernel void ptir_m2_963137d4ffed0445_r18(
 function_name: ptir_m2_963137d4ffed0445_r21
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
 ok: true
-source: bytes=35167 prefix=@runtime tail_bytes=1220
+source: bytes=35905 prefix=@runtime tail_bytes=1220
 kernel void ptir_m2_963137d4ffed0445_r21(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -1705,7 +1705,7 @@ kernel void ptir_m2_963137d4ffed0445_r21(
 function_name: ptir_m2_963137d4ffed0445_r0
 region: library=0 library_op=0 schedule=1 nodes=13 inputs=0 outputs=3 sinks=0
 ok: true
-source: bytes=37217 prefix=@runtime tail_bytes=3270
+source: bytes=37955 prefix=@runtime tail_bytes=3270
 kernel void ptir_m2_963137d4ffed0445_r0(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -1760,7 +1760,7 @@ kernel void ptir_m2_963137d4ffed0445_r0(
 function_name: ptir_m2_963137d4ffed0445_r1
 region: library=1 library_op=3 schedule=3 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=35152 prefix=@runtime tail_bytes=1205
+source: bytes=35890 prefix=@runtime tail_bytes=1205
 kernel void ptir_m2_963137d4ffed0445_r1(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -1791,7 +1791,7 @@ kernel void ptir_m2_963137d4ffed0445_r1(
 function_name: ptir_m2_963137d4ffed0445_r2
 region: library=0 library_op=0 schedule=1 nodes=11 inputs=3 outputs=0 sinks=3
 ok: true
-source: bytes=36967 prefix=@runtime tail_bytes=3020
+source: bytes=37705 prefix=@runtime tail_bytes=3020
 kernel void ptir_m2_963137d4ffed0445_r2(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -1845,7 +1845,7 @@ kernel void ptir_m2_963137d4ffed0445_r2(
 function_name: ptir_m2_82921040f7bc2612_r0
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=34993 prefix=@runtime tail_bytes=1046
+source: bytes=35731 prefix=@runtime tail_bytes=1046
 kernel void ptir_m2_82921040f7bc2612_r0(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -1873,7 +1873,7 @@ kernel void ptir_m2_82921040f7bc2612_r0(
 function_name: ptir_m2_82921040f7bc2612_r1
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=34996 prefix=@runtime tail_bytes=1049
+source: bytes=35734 prefix=@runtime tail_bytes=1049
 kernel void ptir_m2_82921040f7bc2612_r1(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -1901,7 +1901,7 @@ kernel void ptir_m2_82921040f7bc2612_r1(
 function_name: ptir_m2_82921040f7bc2612_r2
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=34996 prefix=@runtime tail_bytes=1049
+source: bytes=35734 prefix=@runtime tail_bytes=1049
 kernel void ptir_m2_82921040f7bc2612_r2(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -1929,7 +1929,7 @@ kernel void ptir_m2_82921040f7bc2612_r2(
 function_name: ptir_m2_82921040f7bc2612_r3
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=35006 prefix=@runtime tail_bytes=1059
+source: bytes=35744 prefix=@runtime tail_bytes=1059
 kernel void ptir_m2_82921040f7bc2612_r3(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -1957,7 +1957,7 @@ kernel void ptir_m2_82921040f7bc2612_r3(
 function_name: ptir_m2_82921040f7bc2612_r4
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=35006 prefix=@runtime tail_bytes=1059
+source: bytes=35744 prefix=@runtime tail_bytes=1059
 kernel void ptir_m2_82921040f7bc2612_r4(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -1985,7 +1985,7 @@ kernel void ptir_m2_82921040f7bc2612_r4(
 function_name: ptir_m2_82921040f7bc2612_r5
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=35019 prefix=@runtime tail_bytes=1072
+source: bytes=35757 prefix=@runtime tail_bytes=1072
 kernel void ptir_m2_82921040f7bc2612_r5(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -2013,7 +2013,7 @@ kernel void ptir_m2_82921040f7bc2612_r5(
 function_name: ptir_m2_82921040f7bc2612_r6
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=35005 prefix=@runtime tail_bytes=1058
+source: bytes=35743 prefix=@runtime tail_bytes=1058
 kernel void ptir_m2_82921040f7bc2612_r6(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -2041,7 +2041,7 @@ kernel void ptir_m2_82921040f7bc2612_r6(
 function_name: ptir_m2_82921040f7bc2612_r7
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=35006 prefix=@runtime tail_bytes=1059
+source: bytes=35744 prefix=@runtime tail_bytes=1059
 kernel void ptir_m2_82921040f7bc2612_r7(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -2069,7 +2069,7 @@ kernel void ptir_m2_82921040f7bc2612_r7(
 function_name: ptir_m2_82921040f7bc2612_r9
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=35019 prefix=@runtime tail_bytes=1072
+source: bytes=35757 prefix=@runtime tail_bytes=1072
 kernel void ptir_m2_82921040f7bc2612_r9(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -2097,7 +2097,7 @@ kernel void ptir_m2_82921040f7bc2612_r9(
 function_name: ptir_m2_82921040f7bc2612_r10
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=35022 prefix=@runtime tail_bytes=1075
+source: bytes=35760 prefix=@runtime tail_bytes=1075
 kernel void ptir_m2_82921040f7bc2612_r10(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -2125,7 +2125,7 @@ kernel void ptir_m2_82921040f7bc2612_r10(
 function_name: ptir_m2_82921040f7bc2612_r11
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=34997 prefix=@runtime tail_bytes=1050
+source: bytes=35735 prefix=@runtime tail_bytes=1050
 kernel void ptir_m2_82921040f7bc2612_r11(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -2153,7 +2153,7 @@ kernel void ptir_m2_82921040f7bc2612_r11(
 function_name: ptir_m2_82921040f7bc2612_r12
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
 ok: true
-source: bytes=35037 prefix=@runtime tail_bytes=1090
+source: bytes=35775 prefix=@runtime tail_bytes=1090
 kernel void ptir_m2_82921040f7bc2612_r12(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -2181,7 +2181,7 @@ kernel void ptir_m2_82921040f7bc2612_r12(
 function_name: ptir_m2_82921040f7bc2612_r13
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=35010 prefix=@runtime tail_bytes=1063
+source: bytes=35748 prefix=@runtime tail_bytes=1063
 kernel void ptir_m2_82921040f7bc2612_r13(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -2209,7 +2209,7 @@ kernel void ptir_m2_82921040f7bc2612_r13(
 function_name: ptir_m2_82921040f7bc2612_r14
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=35024 prefix=@runtime tail_bytes=1077
+source: bytes=35762 prefix=@runtime tail_bytes=1077
 kernel void ptir_m2_82921040f7bc2612_r14(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -2237,7 +2237,7 @@ kernel void ptir_m2_82921040f7bc2612_r14(
 function_name: ptir_m2_82921040f7bc2612_r15
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=35010 prefix=@runtime tail_bytes=1063
+source: bytes=35748 prefix=@runtime tail_bytes=1063
 kernel void ptir_m2_82921040f7bc2612_r15(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -2265,7 +2265,7 @@ kernel void ptir_m2_82921040f7bc2612_r15(
 function_name: ptir_m2_82921040f7bc2612_r16
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
 ok: true
-source: bytes=35024 prefix=@runtime tail_bytes=1077
+source: bytes=35762 prefix=@runtime tail_bytes=1077
 kernel void ptir_m2_82921040f7bc2612_r16(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -2294,7 +2294,7 @@ kernel void ptir_m2_82921040f7bc2612_r16(
 function_name: ptir_m2_82921040f7bc2612_r0
 region: library=0 library_op=0 schedule=1 nodes=3 inputs=0 outputs=3 sinks=0
 ok: true
-source: bytes=35319 prefix=@runtime tail_bytes=1372
+source: bytes=36057 prefix=@runtime tail_bytes=1372
 kernel void ptir_m2_82921040f7bc2612_r0(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -2326,7 +2326,7 @@ kernel void ptir_m2_82921040f7bc2612_r0(
 function_name: ptir_m2_82921040f7bc2612_r1
 region: library=1 library_op=0 schedule=3 nodes=13 inputs=3 outputs=1 sinks=0
 ok: true
-source: bytes=37165 prefix=@runtime tail_bytes=3218
+source: bytes=37903 prefix=@runtime tail_bytes=3218
 kernel void ptir_m2_82921040f7bc2612_r1(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -2378,7 +2378,7 @@ kernel void ptir_m2_82921040f7bc2612_r1(
 function_name: ptir_m2_82921040f7bc2612_r2
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
 ok: true
-source: bytes=35023 prefix=@runtime tail_bytes=1076
+source: bytes=35761 prefix=@runtime tail_bytes=1076
 kernel void ptir_m2_82921040f7bc2612_r2(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -2407,7 +2407,7 @@ kernel void ptir_m2_82921040f7bc2612_r2(
 function_name: ptir_m2_14f667a41eb30669_r0
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=34708 prefix=@runtime tail_bytes=761
+source: bytes=35446 prefix=@runtime tail_bytes=761
 kernel void ptir_m2_14f667a41eb30669_r0(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -2429,7 +2429,7 @@ kernel void ptir_m2_14f667a41eb30669_r0(
 function_name: ptir_m2_14f667a41eb30669_r1
 region: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=34722 prefix=@runtime tail_bytes=775
+source: bytes=35460 prefix=@runtime tail_bytes=775
 kernel void ptir_m2_14f667a41eb30669_r1(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -2451,7 +2451,7 @@ kernel void ptir_m2_14f667a41eb30669_r1(
 function_name: ptir_m2_14f667a41eb30669_r2
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=34711 prefix=@runtime tail_bytes=764
+source: bytes=35449 prefix=@runtime tail_bytes=764
 kernel void ptir_m2_14f667a41eb30669_r2(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -2473,7 +2473,7 @@ kernel void ptir_m2_14f667a41eb30669_r2(
 function_name: ptir_m2_14f667a41eb30669_r3
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=34721 prefix=@runtime tail_bytes=774
+source: bytes=35459 prefix=@runtime tail_bytes=774
 kernel void ptir_m2_14f667a41eb30669_r3(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -2495,7 +2495,7 @@ kernel void ptir_m2_14f667a41eb30669_r3(
 function_name: ptir_m2_14f667a41eb30669_r4
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=34734 prefix=@runtime tail_bytes=787
+source: bytes=35472 prefix=@runtime tail_bytes=787
 kernel void ptir_m2_14f667a41eb30669_r4(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -2517,7 +2517,7 @@ kernel void ptir_m2_14f667a41eb30669_r4(
 function_name: ptir_m2_14f667a41eb30669_r5
 region: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=0 sinks=0
 ok: true
-source: bytes=34709 prefix=@runtime tail_bytes=762
+source: bytes=35447 prefix=@runtime tail_bytes=762
 kernel void ptir_m2_14f667a41eb30669_r5(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -2539,7 +2539,7 @@ kernel void ptir_m2_14f667a41eb30669_r5(
 function_name: ptir_m2_14f667a41eb30669_r0
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=34708 prefix=@runtime tail_bytes=761
+source: bytes=35446 prefix=@runtime tail_bytes=761
 kernel void ptir_m2_14f667a41eb30669_r0(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -2561,7 +2561,7 @@ kernel void ptir_m2_14f667a41eb30669_r0(
 function_name: ptir_m2_14f667a41eb30669_r1
 region: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=34722 prefix=@runtime tail_bytes=775
+source: bytes=35460 prefix=@runtime tail_bytes=775
 kernel void ptir_m2_14f667a41eb30669_r1(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -2583,7 +2583,7 @@ kernel void ptir_m2_14f667a41eb30669_r1(
 function_name: ptir_m2_14f667a41eb30669_r2
 region: library=0 library_op=0 schedule=1 nodes=3 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=35070 prefix=@runtime tail_bytes=1123
+source: bytes=35808 prefix=@runtime tail_bytes=1123
 kernel void ptir_m2_14f667a41eb30669_r2(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -2609,7 +2609,7 @@ kernel void ptir_m2_14f667a41eb30669_r2(
 function_name: ptir_m2_14f667a41eb30669_r3
 region: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=0 sinks=0
 ok: true
-source: bytes=34709 prefix=@runtime tail_bytes=762
+source: bytes=35447 prefix=@runtime tail_bytes=762
 kernel void ptir_m2_14f667a41eb30669_r3(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -2631,7 +2631,7 @@ kernel void ptir_m2_14f667a41eb30669_r3(
 function_name: ptir_m2_dff3bc6795a9dcdf_r0
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=35279 prefix=@runtime tail_bytes=1332
+source: bytes=36017 prefix=@runtime tail_bytes=1332
 kernel void ptir_m2_dff3bc6795a9dcdf_r0(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -2665,7 +2665,7 @@ kernel void ptir_m2_dff3bc6795a9dcdf_r0(
 function_name: ptir_m2_dff3bc6795a9dcdf_r1
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=35282 prefix=@runtime tail_bytes=1335
+source: bytes=36020 prefix=@runtime tail_bytes=1335
 kernel void ptir_m2_dff3bc6795a9dcdf_r1(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -2699,7 +2699,7 @@ kernel void ptir_m2_dff3bc6795a9dcdf_r1(
 function_name: ptir_m2_dff3bc6795a9dcdf_r3
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=35292 prefix=@runtime tail_bytes=1345
+source: bytes=36030 prefix=@runtime tail_bytes=1345
 kernel void ptir_m2_dff3bc6795a9dcdf_r3(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -2733,7 +2733,7 @@ kernel void ptir_m2_dff3bc6795a9dcdf_r3(
 function_name: ptir_m2_dff3bc6795a9dcdf_r4
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=35292 prefix=@runtime tail_bytes=1345
+source: bytes=36030 prefix=@runtime tail_bytes=1345
 kernel void ptir_m2_dff3bc6795a9dcdf_r4(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -2767,7 +2767,7 @@ kernel void ptir_m2_dff3bc6795a9dcdf_r4(
 function_name: ptir_m2_dff3bc6795a9dcdf_r5
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=35305 prefix=@runtime tail_bytes=1358
+source: bytes=36043 prefix=@runtime tail_bytes=1358
 kernel void ptir_m2_dff3bc6795a9dcdf_r5(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -2801,7 +2801,7 @@ kernel void ptir_m2_dff3bc6795a9dcdf_r5(
 function_name: ptir_m2_dff3bc6795a9dcdf_r6
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=35291 prefix=@runtime tail_bytes=1344
+source: bytes=36029 prefix=@runtime tail_bytes=1344
 kernel void ptir_m2_dff3bc6795a9dcdf_r6(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -2835,7 +2835,7 @@ kernel void ptir_m2_dff3bc6795a9dcdf_r6(
 function_name: ptir_m2_dff3bc6795a9dcdf_r7
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=35292 prefix=@runtime tail_bytes=1345
+source: bytes=36030 prefix=@runtime tail_bytes=1345
 kernel void ptir_m2_dff3bc6795a9dcdf_r7(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -2869,7 +2869,7 @@ kernel void ptir_m2_dff3bc6795a9dcdf_r7(
 function_name: ptir_m2_dff3bc6795a9dcdf_r8
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=35291 prefix=@runtime tail_bytes=1344
+source: bytes=36029 prefix=@runtime tail_bytes=1344
 kernel void ptir_m2_dff3bc6795a9dcdf_r8(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -2903,7 +2903,7 @@ kernel void ptir_m2_dff3bc6795a9dcdf_r8(
 function_name: ptir_m2_dff3bc6795a9dcdf_r19
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=35283 prefix=@runtime tail_bytes=1336
+source: bytes=36021 prefix=@runtime tail_bytes=1336
 kernel void ptir_m2_dff3bc6795a9dcdf_r19(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -2937,7 +2937,7 @@ kernel void ptir_m2_dff3bc6795a9dcdf_r19(
 function_name: ptir_m2_dff3bc6795a9dcdf_r20
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=35310 prefix=@runtime tail_bytes=1363
+source: bytes=36048 prefix=@runtime tail_bytes=1363
 kernel void ptir_m2_dff3bc6795a9dcdf_r20(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -2971,7 +2971,7 @@ kernel void ptir_m2_dff3bc6795a9dcdf_r20(
 function_name: ptir_m2_dff3bc6795a9dcdf_r23
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
 ok: true
-source: bytes=35323 prefix=@runtime tail_bytes=1376
+source: bytes=36061 prefix=@runtime tail_bytes=1376
 kernel void ptir_m2_dff3bc6795a9dcdf_r23(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -3005,7 +3005,7 @@ kernel void ptir_m2_dff3bc6795a9dcdf_r23(
 function_name: ptir_m2_dff3bc6795a9dcdf_r25
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=35296 prefix=@runtime tail_bytes=1349
+source: bytes=36034 prefix=@runtime tail_bytes=1349
 kernel void ptir_m2_dff3bc6795a9dcdf_r25(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -3039,7 +3039,7 @@ kernel void ptir_m2_dff3bc6795a9dcdf_r25(
 function_name: ptir_m2_dff3bc6795a9dcdf_r28
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=35310 prefix=@runtime tail_bytes=1363
+source: bytes=36048 prefix=@runtime tail_bytes=1363
 kernel void ptir_m2_dff3bc6795a9dcdf_r28(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -3073,7 +3073,7 @@ kernel void ptir_m2_dff3bc6795a9dcdf_r28(
 function_name: ptir_m2_dff3bc6795a9dcdf_r29
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=35310 prefix=@runtime tail_bytes=1363
+source: bytes=36048 prefix=@runtime tail_bytes=1363
 kernel void ptir_m2_dff3bc6795a9dcdf_r29(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -3107,7 +3107,7 @@ kernel void ptir_m2_dff3bc6795a9dcdf_r29(
 function_name: ptir_m2_dff3bc6795a9dcdf_r31
 region: library=1 library_op=1 schedule=3 nodes=1 inputs=1 outputs=2 sinks=0
 ok: true
-source: bytes=35310 prefix=@runtime tail_bytes=1363
+source: bytes=36048 prefix=@runtime tail_bytes=1363
 kernel void ptir_m2_dff3bc6795a9dcdf_r31(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -3141,7 +3141,7 @@ kernel void ptir_m2_dff3bc6795a9dcdf_r31(
 function_name: ptir_m2_dff3bc6795a9dcdf_r34
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
 ok: true
-source: bytes=35310 prefix=@runtime tail_bytes=1363
+source: bytes=36048 prefix=@runtime tail_bytes=1363
 kernel void ptir_m2_dff3bc6795a9dcdf_r34(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -3176,7 +3176,7 @@ kernel void ptir_m2_dff3bc6795a9dcdf_r34(
 function_name: ptir_m2_dff3bc6795a9dcdf_r0
 region: library=0 library_op=0 schedule=1 nodes=31 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=40631 prefix=@runtime tail_bytes=6684
+source: bytes=41369 prefix=@runtime tail_bytes=6684
 kernel void ptir_m2_dff3bc6795a9dcdf_r0(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -3270,7 +3270,7 @@ kernel void ptir_m2_dff3bc6795a9dcdf_r0(
 function_name: ptir_m2_dff3bc6795a9dcdf_r1
 region: library=1 library_op=1 schedule=3 nodes=1 inputs=1 outputs=2 sinks=0
 ok: true
-source: bytes=35309 prefix=@runtime tail_bytes=1362
+source: bytes=36047 prefix=@runtime tail_bytes=1362
 kernel void ptir_m2_dff3bc6795a9dcdf_r1(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -3304,7 +3304,7 @@ kernel void ptir_m2_dff3bc6795a9dcdf_r1(
 function_name: ptir_m2_dff3bc6795a9dcdf_r2
 region: library=0 library_op=0 schedule=1 nodes=6 inputs=2 outputs=0 sinks=3
 ok: true
-source: bytes=36203 prefix=@runtime tail_bytes=2256
+source: bytes=36941 prefix=@runtime tail_bytes=2256
 kernel void ptir_m2_dff3bc6795a9dcdf_r2(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -3351,7 +3351,7 @@ kernel void ptir_m2_dff3bc6795a9dcdf_r2(
 function_name: ptir_m2_09a2719886970a85_r0
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=35136 prefix=@runtime tail_bytes=1189
+source: bytes=35874 prefix=@runtime tail_bytes=1189
 kernel void ptir_m2_09a2719886970a85_r0(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -3382,7 +3382,7 @@ kernel void ptir_m2_09a2719886970a85_r0(
 function_name: ptir_m2_09a2719886970a85_r1
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=35149 prefix=@runtime tail_bytes=1202
+source: bytes=35887 prefix=@runtime tail_bytes=1202
 kernel void ptir_m2_09a2719886970a85_r1(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -3413,7 +3413,7 @@ kernel void ptir_m2_09a2719886970a85_r1(
 function_name: ptir_m2_09a2719886970a85_r2
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=35149 prefix=@runtime tail_bytes=1202
+source: bytes=35887 prefix=@runtime tail_bytes=1202
 kernel void ptir_m2_09a2719886970a85_r2(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -3444,7 +3444,7 @@ kernel void ptir_m2_09a2719886970a85_r2(
 function_name: ptir_m2_09a2719886970a85_r3
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=35162 prefix=@runtime tail_bytes=1215
+source: bytes=35900 prefix=@runtime tail_bytes=1215
 kernel void ptir_m2_09a2719886970a85_r3(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -3475,7 +3475,7 @@ kernel void ptir_m2_09a2719886970a85_r3(
 function_name: ptir_m2_09a2719886970a85_r4
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=35148 prefix=@runtime tail_bytes=1201
+source: bytes=35886 prefix=@runtime tail_bytes=1201
 kernel void ptir_m2_09a2719886970a85_r4(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -3506,7 +3506,7 @@ kernel void ptir_m2_09a2719886970a85_r4(
 function_name: ptir_m2_09a2719886970a85_r5
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=35149 prefix=@runtime tail_bytes=1202
+source: bytes=35887 prefix=@runtime tail_bytes=1202
 kernel void ptir_m2_09a2719886970a85_r5(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -3537,7 +3537,7 @@ kernel void ptir_m2_09a2719886970a85_r5(
 function_name: ptir_m2_09a2719886970a85_r7
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=35162 prefix=@runtime tail_bytes=1215
+source: bytes=35900 prefix=@runtime tail_bytes=1215
 kernel void ptir_m2_09a2719886970a85_r7(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -3568,7 +3568,7 @@ kernel void ptir_m2_09a2719886970a85_r7(
 function_name: ptir_m2_09a2719886970a85_r8
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=35139 prefix=@runtime tail_bytes=1192
+source: bytes=35877 prefix=@runtime tail_bytes=1192
 kernel void ptir_m2_09a2719886970a85_r8(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -3599,7 +3599,7 @@ kernel void ptir_m2_09a2719886970a85_r8(
 function_name: ptir_m2_09a2719886970a85_r10
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=35165 prefix=@runtime tail_bytes=1218
+source: bytes=35903 prefix=@runtime tail_bytes=1218
 kernel void ptir_m2_09a2719886970a85_r10(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -3630,7 +3630,7 @@ kernel void ptir_m2_09a2719886970a85_r10(
 function_name: ptir_m2_09a2719886970a85_r12
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
 ok: true
-source: bytes=35167 prefix=@runtime tail_bytes=1220
+source: bytes=35905 prefix=@runtime tail_bytes=1220
 kernel void ptir_m2_09a2719886970a85_r12(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -3662,7 +3662,7 @@ kernel void ptir_m2_09a2719886970a85_r12(
 function_name: ptir_m2_09a2719886970a85_r0
 region: library=0 library_op=0 schedule=1 nodes=14 inputs=0 outputs=0 sinks=2
 ok: true
-source: bytes=37454 prefix=@runtime tail_bytes=3507
+source: bytes=38192 prefix=@runtime tail_bytes=3507
 kernel void ptir_m2_09a2719886970a85_r0(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -3721,7 +3721,7 @@ kernel void ptir_m2_09a2719886970a85_r0(
 function_name: ptir_m2_4cf3882bf2fff913_r0
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=35279 prefix=@runtime tail_bytes=1332
+source: bytes=36017 prefix=@runtime tail_bytes=1332
 kernel void ptir_m2_4cf3882bf2fff913_r0(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -3755,7 +3755,7 @@ kernel void ptir_m2_4cf3882bf2fff913_r0(
 function_name: ptir_m2_4cf3882bf2fff913_r1
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=35292 prefix=@runtime tail_bytes=1345
+source: bytes=36030 prefix=@runtime tail_bytes=1345
 kernel void ptir_m2_4cf3882bf2fff913_r1(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -3789,7 +3789,7 @@ kernel void ptir_m2_4cf3882bf2fff913_r1(
 function_name: ptir_m2_4cf3882bf2fff913_r2
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=35282 prefix=@runtime tail_bytes=1335
+source: bytes=36020 prefix=@runtime tail_bytes=1335
 kernel void ptir_m2_4cf3882bf2fff913_r2(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -3823,7 +3823,7 @@ kernel void ptir_m2_4cf3882bf2fff913_r2(
 function_name: ptir_m2_4cf3882bf2fff913_r4
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=35293 prefix=@runtime tail_bytes=1346
+source: bytes=36031 prefix=@runtime tail_bytes=1346
 kernel void ptir_m2_4cf3882bf2fff913_r4(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -3857,7 +3857,7 @@ kernel void ptir_m2_4cf3882bf2fff913_r4(
 function_name: ptir_m2_4cf3882bf2fff913_r5
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=35280 prefix=@runtime tail_bytes=1333
+source: bytes=36018 prefix=@runtime tail_bytes=1333
 kernel void ptir_m2_4cf3882bf2fff913_r5(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -3891,7 +3891,7 @@ kernel void ptir_m2_4cf3882bf2fff913_r5(
 function_name: ptir_m2_4cf3882bf2fff913_r6
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
 ok: true
-source: bytes=35318 prefix=@runtime tail_bytes=1371
+source: bytes=36056 prefix=@runtime tail_bytes=1371
 kernel void ptir_m2_4cf3882bf2fff913_r6(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -3925,7 +3925,7 @@ kernel void ptir_m2_4cf3882bf2fff913_r6(
 function_name: ptir_m2_4cf3882bf2fff913_r7
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=35305 prefix=@runtime tail_bytes=1358
+source: bytes=36043 prefix=@runtime tail_bytes=1358
 kernel void ptir_m2_4cf3882bf2fff913_r7(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -3959,7 +3959,7 @@ kernel void ptir_m2_4cf3882bf2fff913_r7(
 function_name: ptir_m2_4cf3882bf2fff913_r8
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=35292 prefix=@runtime tail_bytes=1345
+source: bytes=36030 prefix=@runtime tail_bytes=1345
 kernel void ptir_m2_4cf3882bf2fff913_r8(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -3993,7 +3993,7 @@ kernel void ptir_m2_4cf3882bf2fff913_r8(
 function_name: ptir_m2_4cf3882bf2fff913_r9
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=35280 prefix=@runtime tail_bytes=1333
+source: bytes=36018 prefix=@runtime tail_bytes=1333
 kernel void ptir_m2_4cf3882bf2fff913_r9(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -4027,7 +4027,7 @@ kernel void ptir_m2_4cf3882bf2fff913_r9(
 function_name: ptir_m2_4cf3882bf2fff913_r11
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
 ok: true
-source: bytes=35310 prefix=@runtime tail_bytes=1363
+source: bytes=36048 prefix=@runtime tail_bytes=1363
 kernel void ptir_m2_4cf3882bf2fff913_r11(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -4062,7 +4062,7 @@ kernel void ptir_m2_4cf3882bf2fff913_r11(
 function_name: ptir_m2_4cf3882bf2fff913_r0
 region: library=0 library_op=0 schedule=1 nodes=19 inputs=0 outputs=0 sinks=4
 ok: true
-source: bytes=38473 prefix=@runtime tail_bytes=4526
+source: bytes=39211 prefix=@runtime tail_bytes=4526
 kernel void ptir_m2_4cf3882bf2fff913_r0(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -4136,7 +4136,7 @@ kernel void ptir_m2_4cf3882bf2fff913_r0(
 function_name: ptir_m2_1752e0dfb0bf5827_r0
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=35568 prefix=@runtime tail_bytes=1621
+source: bytes=36306 prefix=@runtime tail_bytes=1621
 kernel void ptir_m2_1752e0dfb0bf5827_r0(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -4176,7 +4176,7 @@ kernel void ptir_m2_1752e0dfb0bf5827_r0(
 function_name: ptir_m2_1752e0dfb0bf5827_r3
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=35579 prefix=@runtime tail_bytes=1632
+source: bytes=36317 prefix=@runtime tail_bytes=1632
 kernel void ptir_m2_1752e0dfb0bf5827_r3(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -4216,7 +4216,7 @@ kernel void ptir_m2_1752e0dfb0bf5827_r3(
 function_name: ptir_m2_1752e0dfb0bf5827_r4
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
 ok: true
-source: bytes=35593 prefix=@runtime tail_bytes=1646
+source: bytes=36331 prefix=@runtime tail_bytes=1646
 kernel void ptir_m2_1752e0dfb0bf5827_r4(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -4257,7 +4257,7 @@ kernel void ptir_m2_1752e0dfb0bf5827_r4(
 function_name: ptir_m2_1752e0dfb0bf5827_r5
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=35579 prefix=@runtime tail_bytes=1632
+source: bytes=36317 prefix=@runtime tail_bytes=1632
 kernel void ptir_m2_1752e0dfb0bf5827_r5(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -4297,7 +4297,7 @@ kernel void ptir_m2_1752e0dfb0bf5827_r5(
 function_name: ptir_m2_1752e0dfb0bf5827_r7
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=35579 prefix=@runtime tail_bytes=1632
+source: bytes=36317 prefix=@runtime tail_bytes=1632
 kernel void ptir_m2_1752e0dfb0bf5827_r7(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -4337,7 +4337,7 @@ kernel void ptir_m2_1752e0dfb0bf5827_r7(
 function_name: ptir_m2_1752e0dfb0bf5827_r9
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=35578 prefix=@runtime tail_bytes=1631
+source: bytes=36316 prefix=@runtime tail_bytes=1631
 kernel void ptir_m2_1752e0dfb0bf5827_r9(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -4377,7 +4377,7 @@ kernel void ptir_m2_1752e0dfb0bf5827_r9(
 function_name: ptir_m2_1752e0dfb0bf5827_r10
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=35568 prefix=@runtime tail_bytes=1621
+source: bytes=36306 prefix=@runtime tail_bytes=1621
 kernel void ptir_m2_1752e0dfb0bf5827_r10(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -4417,7 +4417,7 @@ kernel void ptir_m2_1752e0dfb0bf5827_r10(
 function_name: ptir_m2_1752e0dfb0bf5827_r11
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=35568 prefix=@runtime tail_bytes=1621
+source: bytes=36306 prefix=@runtime tail_bytes=1621
 kernel void ptir_m2_1752e0dfb0bf5827_r11(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -4457,7 +4457,7 @@ kernel void ptir_m2_1752e0dfb0bf5827_r11(
 function_name: ptir_m2_1752e0dfb0bf5827_r12
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=35593 prefix=@runtime tail_bytes=1646
+source: bytes=36331 prefix=@runtime tail_bytes=1646
 kernel void ptir_m2_1752e0dfb0bf5827_r12(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -4497,7 +4497,7 @@ kernel void ptir_m2_1752e0dfb0bf5827_r12(
 function_name: ptir_m2_1752e0dfb0bf5827_r14
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=35595 prefix=@runtime tail_bytes=1648
+source: bytes=36333 prefix=@runtime tail_bytes=1648
 kernel void ptir_m2_1752e0dfb0bf5827_r14(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -4537,7 +4537,7 @@ kernel void ptir_m2_1752e0dfb0bf5827_r14(
 function_name: ptir_m2_1752e0dfb0bf5827_r15
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=35595 prefix=@runtime tail_bytes=1648
+source: bytes=36333 prefix=@runtime tail_bytes=1648
 kernel void ptir_m2_1752e0dfb0bf5827_r15(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -4577,7 +4577,7 @@ kernel void ptir_m2_1752e0dfb0bf5827_r15(
 function_name: ptir_m2_1752e0dfb0bf5827_r16
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=35596 prefix=@runtime tail_bytes=1649
+source: bytes=36334 prefix=@runtime tail_bytes=1649
 kernel void ptir_m2_1752e0dfb0bf5827_r16(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -4617,7 +4617,7 @@ kernel void ptir_m2_1752e0dfb0bf5827_r16(
 function_name: ptir_m2_1752e0dfb0bf5827_r17
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=35595 prefix=@runtime tail_bytes=1648
+source: bytes=36333 prefix=@runtime tail_bytes=1648
 kernel void ptir_m2_1752e0dfb0bf5827_r17(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -4657,7 +4657,7 @@ kernel void ptir_m2_1752e0dfb0bf5827_r17(
 function_name: ptir_m2_1752e0dfb0bf5827_r24
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=35596 prefix=@runtime tail_bytes=1649
+source: bytes=36334 prefix=@runtime tail_bytes=1649
 kernel void ptir_m2_1752e0dfb0bf5827_r24(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -4697,7 +4697,7 @@ kernel void ptir_m2_1752e0dfb0bf5827_r24(
 function_name: ptir_m2_1752e0dfb0bf5827_r25
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=35581 prefix=@runtime tail_bytes=1634
+source: bytes=36319 prefix=@runtime tail_bytes=1634
 kernel void ptir_m2_1752e0dfb0bf5827_r25(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -4737,7 +4737,7 @@ kernel void ptir_m2_1752e0dfb0bf5827_r25(
 function_name: ptir_m2_1752e0dfb0bf5827_r26
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=35582 prefix=@runtime tail_bytes=1635
+source: bytes=36320 prefix=@runtime tail_bytes=1635
 kernel void ptir_m2_1752e0dfb0bf5827_r26(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -4777,7 +4777,7 @@ kernel void ptir_m2_1752e0dfb0bf5827_r26(
 function_name: ptir_m2_1752e0dfb0bf5827_r0
 region: library=0 library_op=0 schedule=1 nodes=29 inputs=0 outputs=0 sinks=4
 ok: true
-source: bytes=40573 prefix=@runtime tail_bytes=6626
+source: bytes=41311 prefix=@runtime tail_bytes=6626
 kernel void ptir_m2_1752e0dfb0bf5827_r0(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -4877,7 +4877,7 @@ kernel void ptir_m2_1752e0dfb0bf5827_r0(
 function_name: ptir_m2_dc132d209d85d958_r0
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=34996 prefix=@runtime tail_bytes=1049
+source: bytes=35734 prefix=@runtime tail_bytes=1049
 kernel void ptir_m2_dc132d209d85d958_r0(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -4905,7 +4905,7 @@ kernel void ptir_m2_dc132d209d85d958_r0(
 function_name: ptir_m2_dc132d209d85d958_r1
 region: library=1 library_op=2 schedule=3 nodes=1 inputs=1 outputs=2 sinks=0
 ok: true
-source: bytes=35019 prefix=@runtime tail_bytes=1072
+source: bytes=35757 prefix=@runtime tail_bytes=1072
 kernel void ptir_m2_dc132d209d85d958_r1(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -4933,7 +4933,7 @@ kernel void ptir_m2_dc132d209d85d958_r1(
 function_name: ptir_m2_dc132d209d85d958_r2
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
 ok: true
-source: bytes=35021 prefix=@runtime tail_bytes=1074
+source: bytes=35759 prefix=@runtime tail_bytes=1074
 kernel void ptir_m2_dc132d209d85d958_r2(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -4962,7 +4962,7 @@ kernel void ptir_m2_dc132d209d85d958_r2(
 function_name: ptir_m2_dc132d209d85d958_r0
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=34996 prefix=@runtime tail_bytes=1049
+source: bytes=35734 prefix=@runtime tail_bytes=1049
 kernel void ptir_m2_dc132d209d85d958_r0(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -4990,7 +4990,7 @@ kernel void ptir_m2_dc132d209d85d958_r0(
 function_name: ptir_m2_dc132d209d85d958_r1
 region: library=1 library_op=2 schedule=3 nodes=1 inputs=1 outputs=2 sinks=0
 ok: true
-source: bytes=35019 prefix=@runtime tail_bytes=1072
+source: bytes=35757 prefix=@runtime tail_bytes=1072
 kernel void ptir_m2_dc132d209d85d958_r1(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -5018,7 +5018,7 @@ kernel void ptir_m2_dc132d209d85d958_r1(
 function_name: ptir_m2_dc132d209d85d958_r2
 region: library=0 library_op=0 schedule=0 nodes=2 inputs=2 outputs=0 sinks=2
 ok: true
-source: bytes=35209 prefix=@runtime tail_bytes=1262
+source: bytes=35947 prefix=@runtime tail_bytes=1262
 kernel void ptir_m2_dc132d209d85d958_r2(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -5050,7 +5050,7 @@ kernel void ptir_m2_dc132d209d85d958_r2(
 function_name: ptir_m2_92d86f95b487e729_r0
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=34996 prefix=@runtime tail_bytes=1049
+source: bytes=35734 prefix=@runtime tail_bytes=1049
 kernel void ptir_m2_92d86f95b487e729_r0(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -5078,7 +5078,7 @@ kernel void ptir_m2_92d86f95b487e729_r0(
 function_name: ptir_m2_92d86f95b487e729_r2
 region: library=1 library_op=4 schedule=3 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=35019 prefix=@runtime tail_bytes=1072
+source: bytes=35757 prefix=@runtime tail_bytes=1072
 kernel void ptir_m2_92d86f95b487e729_r2(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -5106,7 +5106,7 @@ kernel void ptir_m2_92d86f95b487e729_r2(
 function_name: ptir_m2_92d86f95b487e729_r3
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
 ok: true
-source: bytes=35021 prefix=@runtime tail_bytes=1074
+source: bytes=35759 prefix=@runtime tail_bytes=1074
 kernel void ptir_m2_92d86f95b487e729_r3(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -5135,7 +5135,7 @@ kernel void ptir_m2_92d86f95b487e729_r3(
 function_name: ptir_m2_92d86f95b487e729_r0
 region: library=0 library_op=0 schedule=0 nodes=2 inputs=0 outputs=2 sinks=0
 ok: true
-source: bytes=35159 prefix=@runtime tail_bytes=1212
+source: bytes=35897 prefix=@runtime tail_bytes=1212
 kernel void ptir_m2_92d86f95b487e729_r0(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -5165,7 +5165,7 @@ kernel void ptir_m2_92d86f95b487e729_r0(
 function_name: ptir_m2_92d86f95b487e729_r1
 region: library=1 library_op=4 schedule=3 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=35019 prefix=@runtime tail_bytes=1072
+source: bytes=35757 prefix=@runtime tail_bytes=1072
 kernel void ptir_m2_92d86f95b487e729_r1(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -5193,7 +5193,7 @@ kernel void ptir_m2_92d86f95b487e729_r1(
 function_name: ptir_m2_92d86f95b487e729_r2
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
 ok: true
-source: bytes=35021 prefix=@runtime tail_bytes=1074
+source: bytes=35759 prefix=@runtime tail_bytes=1074
 kernel void ptir_m2_92d86f95b487e729_r2(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -5222,7 +5222,7 @@ kernel void ptir_m2_92d86f95b487e729_r2(
 function_name: ptir_m2_9eda8aa42400c4c2_r0
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=34708 prefix=@runtime tail_bytes=761
+source: bytes=35446 prefix=@runtime tail_bytes=761
 kernel void ptir_m2_9eda8aa42400c4c2_r0(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -5244,7 +5244,7 @@ kernel void ptir_m2_9eda8aa42400c4c2_r0(
 function_name: ptir_m2_9eda8aa42400c4c2_r2
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=34721 prefix=@runtime tail_bytes=774
+source: bytes=35459 prefix=@runtime tail_bytes=774
 kernel void ptir_m2_9eda8aa42400c4c2_r2(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -5266,7 +5266,7 @@ kernel void ptir_m2_9eda8aa42400c4c2_r2(
 function_name: ptir_m2_9eda8aa42400c4c2_r3
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=34720 prefix=@runtime tail_bytes=773
+source: bytes=35458 prefix=@runtime tail_bytes=773
 kernel void ptir_m2_9eda8aa42400c4c2_r3(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -5288,7 +5288,7 @@ kernel void ptir_m2_9eda8aa42400c4c2_r3(
 function_name: ptir_m2_9eda8aa42400c4c2_r4
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=34734 prefix=@runtime tail_bytes=787
+source: bytes=35472 prefix=@runtime tail_bytes=787
 kernel void ptir_m2_9eda8aa42400c4c2_r4(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -5310,7 +5310,7 @@ kernel void ptir_m2_9eda8aa42400c4c2_r4(
 function_name: ptir_m2_9eda8aa42400c4c2_r5
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
 ok: true
-source: bytes=34736 prefix=@runtime tail_bytes=789
+source: bytes=35474 prefix=@runtime tail_bytes=789
 kernel void ptir_m2_9eda8aa42400c4c2_r5(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -5333,7 +5333,7 @@ kernel void ptir_m2_9eda8aa42400c4c2_r5(
 function_name: ptir_m2_9eda8aa42400c4c2_r0
 region: library=0 library_op=0 schedule=1 nodes=6 inputs=0 outputs=0 sinks=1
 ok: true
-source: bytes=35587 prefix=@runtime tail_bytes=1640
+source: bytes=36325 prefix=@runtime tail_bytes=1640
 kernel void ptir_m2_9eda8aa42400c4c2_r0(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -5366,7 +5366,7 @@ kernel void ptir_m2_9eda8aa42400c4c2_r0(
 function_name: ptir_m2_a297c60f7a5de47e_r0
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=34711 prefix=@runtime tail_bytes=764
+source: bytes=35449 prefix=@runtime tail_bytes=764
 kernel void ptir_m2_a297c60f7a5de47e_r0(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -5388,7 +5388,7 @@ kernel void ptir_m2_a297c60f7a5de47e_r0(
 function_name: ptir_m2_a297c60f7a5de47e_r1
 region: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=0 sinks=0
 ok: true
-source: bytes=34709 prefix=@runtime tail_bytes=762
+source: bytes=35447 prefix=@runtime tail_bytes=762
 kernel void ptir_m2_a297c60f7a5de47e_r1(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -5410,7 +5410,7 @@ kernel void ptir_m2_a297c60f7a5de47e_r1(
 function_name: ptir_m2_a297c60f7a5de47e_r0
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=34711 prefix=@runtime tail_bytes=764
+source: bytes=35449 prefix=@runtime tail_bytes=764
 kernel void ptir_m2_a297c60f7a5de47e_r0(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],
@@ -5432,7 +5432,7 @@ kernel void ptir_m2_a297c60f7a5de47e_r0(
 function_name: ptir_m2_a297c60f7a5de47e_r1
 region: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=0 sinks=0
 ok: true
-source: bytes=34709 prefix=@runtime tail_bytes=762
+source: bytes=35447 prefix=@runtime tail_bytes=762
 kernel void ptir_m2_a297c60f7a5de47e_r1(
     device M1Status* status [[buffer(0)]],
     const device M1ValueDesc* descriptors [[buffer(1)]],

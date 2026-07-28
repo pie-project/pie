@@ -313,9 +313,13 @@ endif()
 
 function(add_metal_host_test target source)
   add_executable(${target} ${source})
+  # `${PIE_DRIVER_ABI_INCLUDE_DIR}` carries the generated `pie_driver_abi.h`,
+  # which `interp.hpp` and `launch/program.hpp` both include. Every other target
+  # here lists it; without it these two do not compile.
   target_include_directories(${target} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${CMAKE_CURRENT_SOURCE_DIR}/../abi/include ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../abi/include ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include
+    ${PIE_DRIVER_ABI_INCLUDE_DIR})
   add_test(NAME ${target} COMMAND ${target})
 endfunction()
 

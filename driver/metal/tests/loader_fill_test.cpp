@@ -226,14 +226,14 @@ bool a_padded_contract_stages_zeros_where_no_source_reaches() {
     std::size_t fills = 0, fill_step = 0, first_write_step = view.schedule.len;
     for (std::size_t step = 0; step < view.schedule.len; ++step) {
         const auto& instr = view.instrs.ptr[view.schedule.ptr[step]];
-        const auto kind = static_cast<pie_loader::PieLoaderStorageInstrKind>(instr.kind);
-        if (kind == pie_loader::PieLoaderStorageInstrKind::Fill) {
+        using Tag = pie_loader::PieLoaderStorageOp::Tag;
+        if (instr.op.tag == Tag::Fill) {
             ++fills;
             fill_step = step;
         }
-        if ((kind == pie_loader::PieLoaderStorageInstrKind::ExtentWrite ||
-             kind == pie_loader::PieLoaderStorageInstrKind::BulkExtentWrite ||
-             kind == pie_loader::PieLoaderStorageInstrKind::SlabScatter) &&
+        if ((instr.op.tag == Tag::ExtentWrite ||
+             instr.op.tag == Tag::BulkExtentWrite ||
+             instr.op.tag == Tag::SlabScatter) &&
             step < first_write_step) {
             first_write_step = step;
         }

@@ -193,6 +193,10 @@ struct SetupConfig {
     // Which storage schema to author against. It selects a contract on this
     // side of the loader call and never crosses it (§10.4).
     std::string model_type;
+    // `config.json`'s `rope_theta`, or this family's default when it is
+    // omitted (which is the usual case: the shipped configs state neither
+    // `rope_theta` nor `partial_rotary_factor`).
+    float rope_theta = 1.0e5f;
     std::uint32_t storage_page_size = 1;
 };
 

@@ -15,7 +15,7 @@ struct DecodeGeometry {
     int n_kv_heads = 2;
     int head_dim = 256;
     int rotary_dims = 64;
-    float rope_theta = 1e7f;
+    float rope_theta = 1e5f;  // the family default; `config.json` overrides
     int mrope_section[3] = {11, 11, 10};
 
     int gdn_k_heads = 16;
