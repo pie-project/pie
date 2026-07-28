@@ -3,6 +3,7 @@
 use super::numeric::*;
 use super::*;
 use pie_ir::container::{ChanDType, ChannelDecl, StageProgram, TraceContainer};
+use pie_ir::op::Op;
 use pie_ir::registry::ModelProfile;
 use pie_ir::types::{Literal, Predicate, RngKind};
 use pie_ir::validate::bind;

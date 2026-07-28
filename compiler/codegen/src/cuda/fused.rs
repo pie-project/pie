@@ -363,13 +363,7 @@ pub fn emit_fused_region(
 
         // CUDA resolves reshape aliases before indexing the offsets table;
         // which value lands in which slot is shared with Metal.
-        let Slots {
-            mut a0,
-            a1,
-            a2,
-            mut o0,
-            o1,
-        } = Slots::of(op, base, |value| {
+        let mut slots = Slots::of(op, base, |value| {
             format!("scratch + offsets[{}]", resolve_alias(&aliases, value))
         });
 
@@ -385,9 +379,9 @@ pub fn emit_fused_region(
             );
             source.push_str("    const PtirLaneChannelSlot channel = channels[channel_index];\n");
             if op.tag == tags::CHAN_PUT {
-                o0 = "reinterpret_cast<m1_u8*>(channel.pending_cell)".to_string();
+                slots.o0 = "reinterpret_cast<m1_u8*>(channel.pending_cell)".to_string();
             } else {
-                a0 = "reinterpret_cast<const m1_u8*>(pending_flags[channel_index] != 0u ? \
+                slots.a0 = "reinterpret_cast<const m1_u8*>(pending_flags[channel_index] != 0u ? \
                       channel.pending_cell : channel.committed_cell)"
                     .to_string();
             }
@@ -400,21 +394,11 @@ pub fn emit_fused_region(
             source.push_str("    p.imm = intrinsic_widths[intrinsic_index];\n");
             source.push_str("    p.intrinsic_row_stride = intrinsic_strides[intrinsic_index];\n");
             source.push_str("    p.intrinsic_row_offset = intrinsic_offsets[intrinsic_index];\n");
-            a0 = "reinterpret_cast<const m1_u8*>(intrinsic_bases[intrinsic_index])".to_string();
+            slots.a0 =
+                "reinterpret_cast<const m1_u8*>(intrinsic_bases[intrinsic_index])".to_string();
         }
 
-        emit_body(
-            &mut source,
-            stage,
-            op,
-            node,
-            &direct.intrinsic,
-            &a0,
-            &a1,
-            &a2,
-            &o0,
-            &o1,
-        );
+        emit_body(&mut source, stage, op, node, &direct.intrinsic, &slots);
 
         source.push_str("    __syncthreads();\n");
         source.push_str("    if (status.state != 1u) {\n");
@@ -432,19 +416,15 @@ pub fn emit_fused_region(
 }
 
 /// The per-op body: one runtime helper call, or the single-thread fallback.
-#[allow(clippy::too_many_arguments)]
 fn emit_body(
     source: &mut String,
     stage: &CompiledStage,
     op: &OpView,
     node: usize,
     direct_intrinsic: &[u16],
-    a0: &str,
-    a1: &str,
-    a2: &str,
-    o0: &str,
-    o1: &str,
+    slots: &Slots,
 ) {
+    let Slots { a0, a1, a2, o0, o1 } = slots;
     let tag = op.tag;
     let fallback = |source: &mut String| {
         let _ = writeln!(

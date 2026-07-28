@@ -53,7 +53,7 @@ use alloc::vec::Vec;
 use std::sync::{Arc, Mutex};
 
 use pie_ir::container::{HostRole, PortSource};
-use pie_ir::op::{IntrinsicId, Op};
+use pie_ir::op::IntrinsicId;
 use pie_ir::registry::{Phase, Port, Stage};
 use pie_ir::types::{DType, Shape, ValueId, ValueType};
 use pie_ir::validate::{BoundTrace, Direction};
@@ -515,41 +515,26 @@ impl Instance {
         }
 
         // 2. Run every phase over a pass-local overlay.
-        let mut ov = Overlay {
-            pending: BTreeMap::new(),
-            taken: vec![false; self.channels.len()],
-            put: vec![false; self.channels.len()],
+        let mut effects = PassEffects {
+            overlay: Overlay {
+                pending: BTreeMap::new(),
+                taken: vec![false; self.channels.len()],
+                put: vec![false; self.channels.len()],
+            },
+            sinks: Vec::new(),
         };
-        let mut sinks = Vec::new();
         let mut descriptor = Vec::new();
 
-        let run = |this: &mut Instance,
-                   ov: &mut Overlay,
-                   sinks: &mut Vec<SinkRecord>,
-                   stage: Stage,
-                   layer: u32,
-                   host: &mut dyn KernelHost|
-         -> Result<(), StepError> {
-            let Some(si) = bound.container.stages.iter().position(|s| s.stage == stage) else {
-                return Ok(());
-            };
-            let ops = &bound.container.stages[si].ops;
-            let types = &bound.stage_types[si];
-            exec_body(
-                this, bound, ov, sinks, ops, types, stage, layer, inputs, host,
-            )
-        };
-
-        run(self, &mut ov, &mut sinks, Stage::Prologue, 0, host)?;
+        exec_body(self, bound, &mut effects, Stage::Prologue, 0, inputs, host)?;
 
         // Descriptor phase: ports peek (or take, for the token family).
         for p in &bound.container.ports {
             let v = match &p.source {
                 PortSource::Channel(c) => {
                     if p.port.consumes() {
-                        ov.take(self, *c)
+                        effects.overlay.take(self, *c)
                     } else {
-                        ov.read(self, *c)
+                        effects.overlay.read(self, *c)
                     }
                 }
                 PortSource::Const { dtype, shape, data } => const_value(*dtype, *shape, data),
@@ -558,33 +543,43 @@ impl Instance {
         }
 
         // Per-layer taps, layer by layer (forward anatomy).
-        let layers = bound.profile.num_layers;
-        let has_proj = bound
+        // Layer-major, not stage-major: one layer's taps all run before the
+        // next layer's. `Phase::ORDER` is the order *within* a layer, so it
+        // cannot drive this loop, but which stages are taps is `per_layer`'s
+        // to say — a new tap belongs here without editing this.
+        let taps: Vec<Stage> = Stage::ALL
+            .iter()
+            .copied()
+            .filter(|s| s.per_layer())
+            .collect();
+        if bound
             .container
             .stages
             .iter()
-            .any(|s| s.stage == Stage::OnAttnProj);
-        let has_attn = bound
-            .container
-            .stages
-            .iter()
-            .any(|s| s.stage == Stage::OnAttn);
-        if has_proj || has_attn {
-            for l in 0..layers {
-                run(self, &mut ov, &mut sinks, Stage::OnAttnProj, l, host)?;
-                run(self, &mut ov, &mut sinks, Stage::OnAttn, l, host)?;
+            .any(|s| taps.contains(&s.stage))
+        {
+            for l in 0..bound.profile.num_layers {
+                for &stage in &taps {
+                    exec_body(self, bound, &mut effects, stage, l, inputs, host)?;
+                }
             }
         }
 
-        run(self, &mut ov, &mut sinks, Stage::Epilogue, 0, host)?;
+        exec_body(self, bound, &mut effects, Stage::Epilogue, 0, inputs, host)?;
 
         // 3. Commit: predicated per-channel index bump (§7.1).
         let committed = missed.is_none();
         if committed {
             for ci in 0..self.channels.len() {
-                let taken = ov.taken[ci];
-                let put_v = if ov.put[ci] {
-                    Some(ov.pending.remove(&(ci as u32)).expect("pending put value"))
+                let taken = effects.overlay.taken[ci];
+                let put_v = if effects.overlay.put[ci] {
+                    Some(
+                        effects
+                            .overlay
+                            .pending
+                            .remove(&(ci as u32))
+                            .expect("pending put value"),
+                    )
                 } else {
                     None
                 };
@@ -615,7 +610,7 @@ impl Instance {
             committed,
             missed,
             descriptor,
-            sinks,
+            sinks: effects.sinks,
         })
     }
 }
@@ -685,19 +680,34 @@ pub(crate) fn const_value(dtype: DType, shape: Shape, data: &[u8]) -> Value {
 // Body execution
 // ===========================================================================
 
-#[allow(clippy::too_many_arguments)]
+/// What one pass accumulates: channel writes staged until commit, and the
+/// sink records the report carries out. Both are threaded through every stage
+/// of the pass and neither outlives it, which is why they travel together.
+struct PassEffects {
+    overlay: Overlay,
+    sinks: Vec<SinkRecord>,
+}
+
+/// Run one stage of a pass. A stage the program does not define is a no-op.
+///
+/// The ops and their inferred types are looked up here rather than passed in:
+/// they have to be the two halves of the same stage, and that was previously
+/// an invariant of the call site.
 fn exec_body(
     inst: &mut Instance,
     bound: &BoundTrace,
-    ov: &mut Overlay,
-    sinks: &mut Vec<SinkRecord>,
-    ops: &[Op],
-    types: &[ValueType],
+    effects: &mut PassEffects,
     stage: Stage,
     layer: u32,
     inputs: &PassInputs,
     host: &mut dyn KernelHost,
 ) -> Result<(), StepError> {
+    let Some(si) = bound.container.stages.iter().position(|s| s.stage == stage) else {
+        return Ok(());
+    };
+    let ops = &bound.container.stages[si].ops;
+    let types = &bound.stage_types[si];
+    let PassEffects { overlay, sinks } = effects;
     let mut vals: Vec<Value> = Vec::with_capacity(types.len());
     let mut next_id: u32 = 0;
     for op in ops {
@@ -709,9 +719,9 @@ fn exec_body(
                 vals.push(b);
             }
             Evaled::Chan(effect) => match effect {
-                ChanEffect::Take(c) => vals.push(ov.take(inst, c)),
-                ChanEffect::Read(c) => vals.push(ov.read(inst, c)),
-                ChanEffect::Put(c, vid) => ov.put(c, vals[vid as usize].clone()),
+                ChanEffect::Take(c) => vals.push(overlay.take(inst, c)),
+                ChanEffect::Read(c) => vals.push(overlay.read(inst, c)),
+                ChanEffect::Put(c, vid) => overlay.put(c, vals[vid as usize].clone()),
             },
             Evaled::Sink { name, args } => {
                 let vs: Vec<Value> = args.iter().map(|&a| vals[a as usize].clone()).collect();
