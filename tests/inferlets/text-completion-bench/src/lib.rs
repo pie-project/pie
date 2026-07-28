@@ -418,19 +418,37 @@ async fn run_one(
     submit_frame(&pipe, &first_slots).map_err(|e| format!("first frame submit: {e}"))?;
     let mut submitted = first_decodes;
 
-    // Unified run-ahead discipline (ONE rule for every k): keep TWO FRAMES
-    // of decode fires in flight (2k fires) — submit frames of min(k,
-    // remaining) decode slots until the window (submitted minus drained) is
-    // full or the budget is spent, returning the new submitted count. At
-    // k = 1 this is exactly the classic depth-2 window (burst two, then one
-    // per drained token). The window is measured in FRAMES because frames
-    // settle atomically: results arrive only at frame boundaries, so a
-    // fire-count window of 2 would leave ZERO queued frames while a k ≥ 2
-    // frame runs — the pipe drains to a full host round trip per frame.
-    // Decode geometry is device-carried (`tok_in`), so a successor never
-    // waits on a sampled token.
+    // Unified run-ahead discipline (ONE rule for every k): submit frames of
+    // min(k, remaining) decode slots until the window (submitted minus
+    // drained) is full or the budget is spent, returning the new submitted
+    // count. Decode geometry is device-carried (`tok_in`), so a successor
+    // never waits on a sampled token.
+    //
+    // The window has TWO independent floors and takes the max of both:
+    //
+    //  * >= 1 whole extra FRAME (`live_slots`), because frames settle
+    //    atomically — results arrive only at frame boundaries, so a window
+    //    of one frame plus a few fires would leave ZERO queued frames while
+    //    a k >= 2 frame runs, draining the pipe to a host round trip.
+    //
+    //  * >= 3 waves of COVER (`window_fires - live_slots`), because the
+    //    engine's frame seal is wait-for-ALL: it holds until every awaited
+    //    lane's oldest queued frame is arrival-complete, so the binding term
+    //    is the SLOWEST of `concurrency` lanes' resubmit. Cover is what buys
+    //    that straggler time, and it is counted in WAVES, not frames — a
+    //    2-frame window gives only k waves, so k = 1 got a single ~7 ms wave
+    //    and a cohort that fell behind never caught back up (see §20.10).
+    //
+    // Measured, Qwen3-0.6B / L40S / conc 256, median of 6-8 trials:
+    //   k=1 cover 1 (old 2*k rule)  multimodal 18.8k / 22k / 28.5k
+    //   k=1 cover 2                 7/8 at 28.6-29.5k, 1/8 still collapsed
+    //   k=1 cover 3                 6/6 at 28.7-29.5k, median 29044
+    //   k=2 cover 2 (old rule)      median 28497   <- already saturated
+    //   k=2 cover 3                 median 28654   <- within noise of it
+    // So the cover floor is what removes the k = 1 collapse, and it costs
+    // k >= 3 nothing (there the frame floor already dominates).
     let submit_ahead = |mut submitted: usize, drained: usize| -> std::result::Result<usize, String> {
-        let window_fires = run_ahead_frames * live_slots;
+        let window_fires = live_slots + live_slots.max(3);
         while submitted < budget && submitted - drained < window_fires {
             let s = (budget - submitted).min(live_slots);
             reserve_to_tokens(n + (submitted + s) as u32 + 1)

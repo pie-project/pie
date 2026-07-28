@@ -2738,3 +2738,153 @@ collapsed cohort observed. The §20.9 fix raises k=1's fast mode
 the bistability, because the residual stall is the seal turn rather than the
 callback node. If k=1 must be used at high concurrency, `--worker-threads 8`
 is the lever.
+
+## 20.11 The k = 1 collapse was a guest window-sizing bug, not a law
+
+§20.10 left one question open: what latches a cohort into the collapsed mode.
+The answer is that nothing latches it *in the engine* — the cohort simply never
+had enough queued work to absorb a straggler, and the shortfall was written
+into the **guest**, not the runtime.
+
+### The cover rule
+
+`tests/inferlets/text-completion-bench/src/lib.rs` kept a run-ahead window of
+`2 * live_slots` fires, i.e. exactly **two frames**, for every `k`. The engine's
+frame seal is wait-for-ALL: it holds until every awaited lane's oldest queued
+frame is arrival-complete, so the binding term is the slowest of `concurrency`
+lanes' resubmit. What buys that straggler its time is the work already queued
+*behind* the running frame:
+
+```
+cover_waves = window_fires - live_slots = (window_frames - 1) * k
+```
+
+A two-frame window therefore gives `k` waves of cover — **two** at k = 2, and
+**one** (~7.1 ms) at k = 1. The old rule sized the window in frames, but the
+quantity that has to cover a straggler is measured in waves. k = 1 was running
+with a third of the cover k = 2 got, from the same line of guest code.
+
+### Measurement (Qwen3-0.6B, L40S, conc 256, on the §20.9 build)
+
+| arm | cover | result | median |
+| --- | --- | --- | --- |
+| k=1, `2*k` (old) | 1 wave | multimodal 18.8k / 22k / 28.5k | 25184 |
+| k=1, 3 frames | 2 waves | 7/8 at 28.6-29.5k, 1/8 collapsed | 28687 |
+| k=1, 4 frames | 3 waves | **6/6 at 28663-29488** | **29044** |
+| k=2, `2*k` (old) | 2 waves | 8/8 at 28371-28656 | 28497 |
+| k=2, cover 3 | 3 waves | 6/6 at 28217-28795 | 28654 |
+
+Duty (mean forward batches in flight) confirms the mechanism directly: the
+k = 1 window-3 arm runs at **1.72-1.74**, up from 1.58 in the healthy old-rule
+runs and 0.83 in the collapsed ones. 15 of its 16 cohorts sit at 27.6-30.5k.
+
+Two conclusions:
+
+1. **The collapse is removable.** At three waves of cover k = 1 is unimodal
+   over 6/6 trials, and its median (29044) is *above* k = 2's (28497) — a
+   smaller frame with adequate cover beats a larger frame, because the seal
+   quantum is finer. Against vLLM's 29621-29688 that is a ratio of 0.979,
+   up from 0.961.
+2. **k >= 2 was already saturated.** Giving k = 2 a third wave of cover moves
+   nothing (28497 -> 28654, inside the noise), which is why the defect only
+   ever showed at k = 1 and why k = 2 has been a safe default.
+
+### Fix
+
+The window now takes the max of two independent floors:
+
+```rust
+let window_fires = live_slots + live_slots.max(3);
+```
+
+* `>= 1 whole extra frame` — frames settle atomically, so a window shorter
+  than two frames leaves zero queued frames while a k >= 2 frame runs.
+* `>= 3 waves of cover` — the straggler allowance, independent of `k`.
+
+At k = 1 this is 4 fires (was 2), at k = 2 it is 5 (was 4), and at k >= 3 the
+frame floor already dominates so the value is unchanged (k = 4: 8 either way).
+
+Verified: conc 64 k = 2 measures 16132-16200 (median 16153) against the §20.9
+baseline of 16145 — no regression on the default path — and the contention
+suite is 16/16.
+
+### What this does not change
+
+`PIE_FRAME_SIZE` stays at 2. k = 1 with a correctly sized window is marginally
+faster at conc 256, but k = 2 is within 2% there, is unimodal under the *old*
+guest rule as well, and costs less staging depth per lane; §20.8's reasons for
+the default are untouched. The finding's real content is that **run-ahead cover
+is a guest responsibility and must be sized in waves, not frames** — any
+inferlet that hard-codes a frame-count window inherits this bug at k = 1.
+
+### 20.11.1 Why the natural "two frames in flight" pattern is not enough
+
+The old rule is the obvious pipelining discipline: submit two frames, then top
+up one frame per frame that drains. It is correct in shape. What it gets wrong
+is the *runway* it leaves, which is easiest to see in steady state:
+
+* a lane holds `W = window_fires` submitted-but-undrained fires;
+* a whole guest frame settles atomically, so `k` fires drain at once and the
+  lane drops to `W - k` outstanding;
+* those `W - k` fires are the lane's runway — `(W - k) * T_wave` of already
+  queued work before the engine has nothing from this lane to seal with.
+
+`W = 2k` therefore leaves a runway of exactly `k` waves *whatever k is*, while
+the thing it has to hide — the host turnaround `H` from settlement to the
+guest's next `submit_frame` — does not shrink with `k` at all. At conc 256,
+`T_wave` is 8.76 ms, so k = 1 gets 8.8 ms of runway and k = 2 gets 17.5 ms.
+Measured `H_max` there is 17-26 ms: k = 2 clears it by a hair, k = 1 does not.
+That is the entire asymmetry.
+
+Note also that a lane running dry is not a lane-local slowdown. The seal is
+wait-for-ALL, so one dry lane stalls the whole cross-lane batch.
+
+### 20.11.2 Guest window vs engine depth — two different "frames"
+
+The word *frame* names two different objects and the distinction is what makes
+the accounting work:
+
+| | guest frame | engine frame (a "batch") |
+| --- | --- | --- |
+| what | `k` fires from ONE lane (`submit_frame`) | one guest frame from EVERY lane |
+| size | `k` waves | `k` waves x N lanes |
+| who caps it | the inferlet, via `window_fires` | the engine, via `configured_max_in_flight()` |
+
+`in_flight_launches` (`scheduler/worker.rs:2105`) is a single deque in the
+scheduler loop, so `configured_max_in_flight()` = 2 is a **global** cap of two
+cross-lane batches posted to the driver — not a per-lane depth. Confirmed by
+the batch arithmetic on 512 x 128 = 65536 output tokens at conc 256: k = 1
+reports 260 batches (252 tok/batch = 256 lanes x 1 wave), k = 2 reports 130
+(504 tok/batch = 256 lanes x 2 waves).
+
+The consequence is that widening the guest window does **not** deepen the
+device pipeline — the driver's depth is fixed by the engine and by
+`kSchedulerMaxInFlight`/`kUploadStagingDepth`. The extra fires simply wait in
+the engine's `pending` queue. That is precisely their job: what the seal gate
+needs is for every lane to *have a fire queued* when it evaluates, and a lane
+whose guest has not resubmitted yet has none.
+
+### 20.11.3 Cover sweep — why 3, and the cost of more
+
+Cover is a time budget (`cover * T_wave` must exceed `H_max`), so it was swept
+against both concurrency and cover. `T_wave` is the per-wave service period,
+`wall / batches / k`:
+
+| conc | `T_wave` | cover 1 | cover 2 | cover 3 | cover 6 |
+| --- | --- | --- | --- | --- | --- |
+| 64 | 3.97 ms | 16357 ok | - | 16276 ok | - |
+| 256 | 8.76 ms | 25184 **multimodal** | 28687 (7/8) | **29044 ok** | 28372 ok |
+| 512 | 16.9 ms | 23269 **collapsed** | 30280 ok | 30256 ok | - |
+
+Reading the failures as a time threshold: conc 64 clears at 3.97 ms of runway,
+conc 256 fails at 8.8 ms and clears at 26.3 ms, conc 512 fails at 16.9 ms and
+clears at 33.8 ms. So `H_max` grows with lane count but *sublinearly relative
+to* `T_wave`, which grows too — and the ratio peaks in the middle. **conc 256
+is the binding point**, needing 3 waves; 512 needs only 2 and 64 needs 1.
+
+More cover is not free, which is why the constant is 3 and not 8. At conc 256
+cover 6 is perfectly stable but measures 28372 against cover 3's 29044, a 2.3%
+loss: a larger window reserves more KV ahead per lane (`reserve_to_tokens`
+covers every submitted fire) and lengthens the queue the scheduler scans each
+seal. Cover 3 is simultaneously the maximum the sweep requires and the optimum
+at the point that requires it.
