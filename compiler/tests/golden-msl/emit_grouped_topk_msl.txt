@@ -21,7 +21,7 @@
 #   value, which in the sampler's graph was a vocabulary-wide round trip through
 #   device memory for nothing.
 # REGENERATED: the body below is this compiler's output, not the recorded output of the source of truth above
-#   reason: the fused argmax strides by the emit-time region width so the compiler sees a constant
+#   reason: reshape elision now recognises a prefix view, so the sampler's vocabulary-wide reshape and its logits gather both fuse away
 === beam_epilogue#0 singleton#0
 function_name: ptir_m3_b4fadd8446eb58dd_r0
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
