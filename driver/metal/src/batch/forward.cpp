@@ -1664,9 +1664,8 @@ bool MetalExecutor::Impl::run_prefill_step(
             for (const auto& callbacks : *ptir)
                 if (callbacks.pre_forward) callbacks.pre_forward(se);
         }
-        for (int t = 0; t < schedule.N; ++t)
-            encode_decode_step_mb(se, prefill_dags_[size_t(t)], psos_, mb_psos_,
-                                  force_barriers_);
+        encode_prefill_dags_mb(se, prefill_dags_, schedule.N, psos_, mb_psos_,
+                               force_barriers_);
         if (ptir != nullptr) {
             for (const auto& callbacks : *ptir)
                 if (callbacks.post_forward) callbacks.post_forward(se);
