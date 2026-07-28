@@ -343,21 +343,46 @@ impl Lexer {
     /// of them. Here the readings go into two flat buffers the caller keeps,
     /// and the only allocation left is for a reading nobody has seen before.
     pub fn scan_into(&self, token: &[u8], state: LexState, scratch: &mut ScanScratch) -> bool {
+        self.scan_into_with(token, state, scratch, None)
+    }
+
+    /// As `scan_into`, splicing in a token's readings from the start state
+    /// rather than walking them again.
+    pub fn scan_into_with(
+        &self,
+        token: &[u8],
+        state: LexState,
+        scratch: &mut ScanScratch,
+        memo: Option<(&StartScans, usize)>,
+    ) -> bool {
+        self.readings_from(token, 0, state, scratch, memo);
+        !scratch.ends.is_empty()
+    }
+
+    /// The readings of `token[index..]` from `state`, into the caller's
+    /// buffers. `scan_into_with` is this at index zero.
+    fn readings_from(
+        &self,
+        token: &[u8],
+        index: usize,
+        state: LexState,
+        scratch: &mut ScanScratch,
+        memo: Option<(&StartScans, usize)>,
+    ) {
         scratch.clear();
         // Nothing to do if the first byte cannot be taken and nothing can be
         // settled here, which is most of the vocabulary at a structural
         // position. One transition lookup rather than a call and a recursion.
-        if let Some(&first) = token.first()
+        if let Some(&first) = token.get(index)
             && self.step(state, first).is_none()
             && self.accepting(state).is_empty()
         {
-            return false;
+            return;
         }
         let mut budget = MAX_STEPS;
         let mut emitted = std::mem::take(&mut scratch.emitted);
-        self.readings(token, 0, state, &mut emitted, scratch, &mut budget);
+        self.readings(token, index, state, &mut emitted, scratch, &mut budget, memo);
         scratch.emitted = emitted;
-        !scratch.ends.is_empty()
     }
 
     fn readings(
@@ -368,6 +393,7 @@ impl Lexer {
         emitted: &mut Vec<TerminalId>,
         out: &mut ScanScratch,
         budget: &mut usize,
+        memo: Option<(&StartScans, usize)>,
     ) {
         // A branch that settles a lexeme and finds nothing after it produces no
         // option, so capping the output does not cap the search: a state that
@@ -394,14 +420,33 @@ impl Lexer {
         }
 
         if let Some(next) = self.step(state, token[index]) {
-            self.readings(token, index + 1, next, emitted, out, budget);
+            self.readings(token, index + 1, next, emitted, out, budget, memo);
         }
         // Settling restarts the scan at the same byte. It cannot loop, because
         // the start state accepts nothing: nullable terminals were removed, so
         // no lexeme is empty.
         for terminal in self.accepting(state) {
             emitted.push(*terminal);
-            self.readings(token, index, START, emitted, out, budget);
+            // At the first byte the restart is the whole token from the start
+            // state, which is the same walk for every state that can settle.
+            // Spliced from the memo when there is one.
+            match memo {
+                // Only at the first byte: memoising every suffix cut the walk
+                // from 22 nodes a token to 2.5 and was *slower*, which is how
+                // it is known that the walk was never the cost.
+                Some((held, token_id)) if index == 0 => {
+                    for (terminals, next_state) in held.readings_of(token_id) {
+                        if out.ends.len() >= MAX_OPTIONS {
+                            break;
+                        }
+                        let before = emitted.len();
+                        emitted.extend_from_slice(terminals);
+                        out.push(emitted, next_state);
+                        emitted.truncate(before);
+                    }
+                }
+                _ => self.readings(token, index, START, emitted, out, budget, memo),
+            }
             emitted.pop();
         }
     }
@@ -412,6 +457,96 @@ impl Lexer {
 pub struct ScanOption {
     pub terminals: Vec<TerminalId>,
     pub next_state: LexState,
+}
+
+/// The vocabulary as one buffer, so scanning it does not chase pointers.
+///
+/// Grouping walks every token from every lexer state, and a `&[Vec<u8>]` is a
+/// hundred and fifty thousand separate allocations - one cache miss per token
+/// per state, before any lexer work happens at all. Flattened once it is under
+/// a megabyte and stays in cache for every state that follows.
+struct FlatVocabulary {
+    bytes: Vec<u8>,
+    ends: Vec<u32>,
+}
+
+impl FlatVocabulary {
+    fn of(vocabulary: &[Vec<u8>]) -> Self {
+        let mut bytes = Vec::with_capacity(vocabulary.iter().map(Vec::len).sum());
+        let mut ends = Vec::with_capacity(vocabulary.len());
+        for token in vocabulary {
+            bytes.extend_from_slice(token);
+            ends.push(bytes.len() as u32);
+        }
+        FlatVocabulary { bytes, ends }
+    }
+
+    fn len(&self) -> usize {
+        self.ends.len()
+    }
+
+    fn get(&self, index: usize) -> &[u8] {
+        let from = if index == 0 { 0 } else { self.ends[index - 1] } as usize;
+        &self.bytes[from..self.ends[index] as usize]
+    }
+}
+
+/// Every token read from the start state, computed once.
+///
+/// A state that can settle a lexeme restarts the scan at the same byte from
+/// the start state, and what comes of that depends only on the bytes left -
+/// not on where the restart came from. Settles nest, so the walk of one token
+/// is a tree rather than a path: measured on a real lexicon it is 22 nodes for
+/// a token of about five bytes, and grouping repeats it for every state.
+///
+/// Built once for the whole vocabulary, back to front so that a suffix can use
+/// the suffixes inside it. That costs about `len` steps per entry and turns
+/// each of the tens of millions of scans that follow into a forward walk with
+/// splices.
+#[derive(Debug, Default)]
+pub struct StartScans {
+    /// Where each token's readings begin and end in `ends`.
+    span: Vec<(u32, u32)>,
+    /// Each reading: where its terminals end in `flat`, and the state it
+    /// leaves the lexer in.
+    ends: Vec<(u32, LexState)>,
+    flat: Vec<TerminalId>,
+}
+
+impl StartScans {
+    fn build(lexer: &Lexer, vocabulary: &FlatVocabulary) -> Self {
+        let mut held = StartScans::default();
+        let mut scratch = ScanScratch::default();
+        for index in 0..vocabulary.len() {
+            let bytes = vocabulary.get(index);
+            let from = held.ends.len() as u32;
+            if !bytes.is_empty() {
+                // No memo of its own: the start state accepts nothing, so this
+                // cannot recurse into what it is building.
+                lexer.readings_from(bytes, 0, START, &mut scratch, None);
+                let mut previous = 0usize;
+                for (end, next_state) in &scratch.ends {
+                    let to = *end as usize;
+                    held.flat.extend_from_slice(&scratch.flat[previous..to]);
+                    held.ends.push((held.flat.len() as u32, *next_state));
+                    previous = to;
+                }
+            }
+            held.span.push((from, held.ends.len() as u32));
+        }
+        held
+    }
+
+    fn readings_of(&self, token_id: usize) -> impl Iterator<Item = (&[TerminalId], LexState)> {
+        let (from, to) = self.span[token_id];
+        // `flat` is one run after another over the whole vocabulary, so a
+        // reading's terminals start where the previous one ended.
+        (from..to).map(move |at| {
+            let start = if at == 0 { 0 } else { self.ends[at as usize - 1].0 };
+            let (end, state) = self.ends[at as usize];
+            (&self.flat[start as usize..end as usize], state)
+        })
+    }
 }
 
 /// The readings of one token, flat, in buffers a caller reuses.
@@ -698,6 +833,11 @@ pub fn group_vocabulary(lexer: &Lexer, vocabulary: &[Vec<u8>]) -> VocabularyGrou
     // embarrassingly parallel - and the one that dominates it. It is also
     // where residency is paid for: this is precisely the work a host-side
     // matcher repeats at every decode step instead of doing once.
+    // Built once and shared by every state. A state that can settle restarts
+    // the scan from the start state, and doing that again for each of a
+    // thousand states was most of what this cost.
+    let flat = FlatVocabulary::of(vocabulary);
+    let start_scans = StartScans::build(lexer, &flat);
     let (per_state, rejected): (Vec<Vec<Group>>, Vec<u32>) = (0..lexer.num_states())
         .into_par_iter()
         .map(|state| {
@@ -709,12 +849,18 @@ pub fn group_vocabulary(lexer: &Lexer, vocabulary: &[Vec<u8>]) -> VocabularyGrou
             let mut buckets: FxHashMap<Box<[u8]>, usize> = FxHashMap::default();
             let mut groups: Vec<Group> = Vec::new();
             let mut scratch = ScanScratch::default();
-            for (token_id, bytes) in vocabulary.iter().enumerate() {
+            for token_id in 0..flat.len() {
+                let bytes = flat.get(token_id);
                 if bytes.is_empty() {
                     refused += 1;
                     continue;
                 }
-                if !lexer.scan_into(bytes, from, &mut scratch) {
+                if !lexer.scan_into_with(
+                    bytes,
+                    from,
+                    &mut scratch,
+                    Some((&start_scans, token_id)),
+                ) {
                     refused += 1;
                     continue;
                 }
