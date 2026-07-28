@@ -132,12 +132,12 @@ impl Matcher {
         let eof = self.artifact.eof_terminal;
         self.configs.iter().any(|config| {
             if config.lexer_state == 0
-                && replay(&self.artifact, &config.stack, &[eof], true).is_some()
+                && !replay_all(&self.artifact, &config.stack, &[eof], true).is_empty()
             {
                 return true;
             }
             self.accepting(config.lexer_state).iter().any(|terminal| {
-                replay(&self.artifact, &config.stack, &[*terminal, eof], true).is_some()
+                !replay_all(&self.artifact, &config.stack, &[*terminal, eof], true).is_empty()
             })
         })
     }
@@ -230,26 +230,27 @@ impl Matcher {
                 continue;
             }
             for reading in &group.readings {
-                let Some(stack) = replay(&self.artifact, &config.stack, &reading.terminals, false)
-                else {
-                    continue;
-                };
-                let pending = self.pending(reading.next_lexer_state);
-                let viable = pending.is_empty()
-                    || pending.iter().any(|terminal| {
-                        replay(&self.artifact, &stack, &[*terminal], true).is_some()
-                    });
-                if !viable {
-                    continue;
-                }
-                let candidate = Config {
-                    lexer_state: reading.next_lexer_state,
-                    stack,
-                };
-                if !next.contains(&candidate) {
-                    next.push(candidate);
-                    if next.len() == max_configs() {
-                        return next;
+                // Every derivation the reading admits, not the first: two of
+                // them are two places the parse can be, and both stay alive.
+                for stack in replay_all(&self.artifact, &config.stack, &reading.terminals, false)
+                {
+                    let pending = self.pending(reading.next_lexer_state);
+                    let viable = pending.is_empty()
+                        || pending.iter().any(|terminal| {
+                            !replay_all(&self.artifact, &stack, &[*terminal], true).is_empty()
+                        });
+                    if !viable {
+                        continue;
+                    }
+                    let candidate = Config {
+                        lexer_state: reading.next_lexer_state,
+                        stack,
+                    };
+                    if !next.contains(&candidate) {
+                        next.push(candidate);
+                        if next.len() == max_configs() {
+                            return next;
+                        }
                     }
                 }
             }
@@ -421,37 +422,109 @@ impl Matcher {
 /// Returns the resulting stack, or `None` if the parser refuses. With
 /// `accept_is_success` an ACCEPT action counts as surviving, which is what the
 /// end-of-input check wants.
-fn replay(
+/// How many derivations one replay will follow before giving up.
+///
+/// A reduce/reduce conflict doubles the paths, and they compound over a
+/// reading's terminals, so this is bounded rather than exhaustive. Losing a
+/// derivation can only make the parser stricter, never looser, so the bound is
+/// a source of refusals - which is why it is generous and why exceeding it is
+/// worth knowing about.
+const MAX_PATHS: usize = 16;
+
+/// Run a terminal sequence against a copy of `stack`, following every
+/// derivation.
+///
+/// Usually there is one. The grammars a JSON Schema lowers to are ambiguous
+/// where its `oneOf` branches overlap, and a mask does not need the ambiguity
+/// resolved: it needs to know whether *some* derivation admits the token, and
+/// what states all of them reach. So a cell holding two actions forks here
+/// rather than being refused when the tables were built.
+fn replay_all(
     artifact: &Artifact,
     from: &[u32],
     terminals: &[u32],
     accept_is_success: bool,
-) -> Option<Vec<u32>> {
-    let mut stack = from.to_vec();
+) -> Vec<Vec<u32>> {
+    let mut live: Vec<Vec<u32>> = vec![from.to_vec()];
+    let mut accepted: Vec<Vec<u32>> = Vec::new();
     for terminal in terminals {
-        loop {
-            let top = *stack.last()? as usize;
-            let value = action(artifact, top, *terminal)?;
-            if value == gpugrammar_lr::tables::ACCEPT {
-                return accept_is_success.then_some(stack);
-            }
-            if value > 0 {
-                stack.push(gpugrammar_lr::tables::decode_shift(value) as u32);
+        // Stacks that have not yet consumed this terminal, against those that
+        // have. A reduction returns to the first; a shift moves to the second.
+        let mut agenda = std::mem::take(&mut live);
+        let mut settled: Vec<Vec<u32>> = Vec::new();
+        let mut steps = 0usize;
+        while let Some(stack) = agenda.pop() {
+            steps += 1;
+            if steps > MAX_PATHS * 64 {
                 break;
             }
-            let production = gpugrammar_lr::tables::decode_reduce(value);
-            let lhs = artifact.production_lhs[production];
-            let arity = artifact.production_arity[production] as usize;
-            if stack.len() <= arity {
-                return None;
+            let Some(&top) = stack.last() else {
+                continue;
+            };
+            let Some(actions) = actions_for(artifact, top as usize, *terminal) else {
+                continue;
+            };
+            for value in actions {
+                if value == gpugrammar_lr::tables::ACCEPT {
+                    if accept_is_success {
+                        accepted.push(stack.clone());
+                    }
+                } else if value > 0 {
+                    if settled.len() < MAX_PATHS {
+                        let mut shifted = stack.clone();
+                        shifted.push(gpugrammar_lr::tables::decode_shift(value) as u32);
+                        settled.push(shifted);
+                    }
+                } else if agenda.len() < MAX_PATHS
+                    && let Some(reduced) = reduce_once(artifact, stack.clone(), value)
+                {
+                    agenda.push(reduced);
+                }
             }
-            stack.truncate(stack.len() - arity);
-            let exposed = *stack.last()? as usize;
-            let target = goto(artifact, exposed, lhs)?;
-            stack.push(target);
+        }
+        live = settled;
+        live.sort();
+        live.dedup();
+        if live.is_empty() {
+            break;
         }
     }
+    live.extend(accepted);
+    live.sort();
+    live.dedup();
+    live
+}
+
+/// Pop a production's right-hand side and push where GOTO lands.
+fn reduce_once(artifact: &Artifact, mut stack: Vec<u32>, value: i32) -> Option<Vec<u32>> {
+    let production = gpugrammar_lr::tables::decode_reduce(value);
+    let lhs = artifact.production_lhs[production];
+    let arity = artifact.production_arity[production] as usize;
+    if stack.len() <= arity {
+        return None;
+    }
+    stack.truncate(stack.len() - arity);
+    let exposed = *stack.last()? as usize;
+    let target = goto(artifact, exposed, lhs)?;
+    stack.push(target);
     Some(stack)
+}
+
+/// Every action a cell holds, first one first.
+fn actions_for(artifact: &Artifact, state: usize, terminal: u32) -> Option<Vec<i32>> {
+    let from = artifact.action_offsets[state] as usize;
+    let to = artifact.action_offsets[state + 1] as usize;
+    let at = from
+        + artifact.action_terminals[from..to]
+            .binary_search(&terminal)
+            .ok()?;
+    let mut values = vec![artifact.action_values[at]];
+    if !artifact.action_extra_offsets.is_empty() {
+        let low = artifact.action_extra_offsets[at] as usize;
+        let high = artifact.action_extra_offsets[at + 1] as usize;
+        values.extend_from_slice(&artifact.action_extra[low..high]);
+    }
+    Some(values)
 }
 
 fn action(artifact: &Artifact, state: usize, terminal: u32) -> Option<i32> {

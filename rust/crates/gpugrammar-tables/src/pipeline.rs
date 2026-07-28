@@ -122,6 +122,17 @@ fn compile_at(
     limits: Limits,
     options: &JsonSchemaOptions,
 ) -> std::result::Result<Artifact, Failure> {
+    // Which stage a compile spends its time in, since the search tries several
+    // lowerings and a slow one is invisible from outside. Behind the same
+    // variable as the failure reasons, so the hot path is unchanged.
+    let trace = std::env::var_os("GPUGRAMMAR_WHY").is_some();
+    let mut mark = std::time::Instant::now();
+    let mut lap = |stage: &str| {
+        if trace {
+            eprintln!("  {:?} {stage} {:?}", options.precision, mark.elapsed());
+            mark = std::time::Instant::now();
+        }
+    };
     let grammar = json_schema_to_grammar(schema, options).map_err(|error| {
         // The reason a schema cannot be lowered is the whole diagnostic - which
         // keyword, in what shape - and collapsing it to a code left the largest
@@ -132,20 +143,35 @@ fn compile_at(
         }
         Failure::Lowering
     })?;
+    lap("lower");
     let lexicon = extract_within(&grammar, &analyze(&grammar), limits.terminals);
     // Ask from the declared bounds first: a length bound is unrolled into the
     // automaton, so a schema that cannot fit is cheaper to refuse than to build.
+    lap("lexicon");
     let automata = terminal_automata_within(&grammar, &lexicon, limits.lexer_states as u64)
         .ok_or(Failure::Lexer)?;
+    lap("automata");
     let lexer = build_lexer_within(automata, limits.lexer_states).ok_or(Failure::Lexer)?;
+    lap("lexer");
+    if trace {
+        eprintln!(
+            "  {:?} lexer has {} states, {} terminals",
+            options.precision,
+            lexer.num_states(),
+            lexer.num_terminals()
+        );
+    }
     let groups = group_vocabulary(&lexer, vocabulary);
+    lap("groups");
     let cfg = flatten_within(&lexicon, limits.productions).ok_or(Failure::Productions)?;
+    lap("cfg");
     let tables = build(&cfg).map_err(|error| {
         if std::env::var_os("GPUGRAMMAR_WHY").is_some() {
             eprintln!("conflict: {error:#}");
         }
         Failure::Conflict
     })?;
+    lap("tables");
     emit(&lexicon, &lexer, &groups, &cfg, &tables, vocabulary.len()).map_err(|_| Failure::Emit)
 }
 

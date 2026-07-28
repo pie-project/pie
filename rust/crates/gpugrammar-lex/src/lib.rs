@@ -331,7 +331,8 @@ impl Lexer {
     pub fn scan(&self, token: &[u8], state: LexState) -> Option<Scan> {
         let mut options = Vec::new();
         let mut emitted = Vec::new();
-        self.readings(token, 0, state, &mut emitted, &mut options);
+        let mut budget = MAX_STEPS;
+        self.readings(token, 0, state, &mut emitted, &mut options, &mut budget);
         (!options.is_empty()).then_some(Scan { options })
     }
 
@@ -342,7 +343,18 @@ impl Lexer {
         state: LexState,
         emitted: &mut Vec<TerminalId>,
         out: &mut Vec<ScanOption>,
+        budget: &mut usize,
     ) {
+        // A branch that settles a lexeme and finds nothing after it produces no
+        // option, so capping the output does not cap the search: a state that
+        // accepts several terminals branches at every byte and most branches
+        // die. One schema spent minutes here on a 49-state lexer. Losing a
+        // reading can only narrow a mask, never widen one, which is what makes
+        // a budget the safe way to bound it.
+        if *budget == 0 {
+            return;
+        }
+        *budget -= 1;
         if out.len() >= MAX_OPTIONS {
             return;
         }
@@ -364,14 +376,14 @@ impl Lexer {
         }
 
         if let Some(next) = self.step(state, token[index]) {
-            self.readings(token, index + 1, next, emitted, out);
+            self.readings(token, index + 1, next, emitted, out, budget);
         }
         // Settling restarts the scan at the same byte. It cannot loop, because
         // the start state accepts nothing: nullable terminals were removed, so
         // no lexeme is empty.
         for terminal in self.accepting(state) {
             emitted.push(*terminal);
-            self.readings(token, index, START, emitted, out);
+            self.readings(token, index, START, emitted, out, budget);
             emitted.pop();
         }
     }
@@ -396,6 +408,13 @@ pub struct Scan {
 /// How many readings one token may carry. Real grammars stay at one or two;
 /// the cap only stops a pathological fan-out.
 const MAX_OPTIONS: usize = 16;
+
+/// How many nodes one token's reading search may visit.
+///
+/// Generous against what a real token needs - a settle point per byte over a
+/// long token is already past it - and small enough that a pathological lexer
+/// costs microseconds rather than minutes.
+const MAX_STEPS: usize = 4096;
 
 /// Build a scanner by determinising the union of the terminal automata.
 ///

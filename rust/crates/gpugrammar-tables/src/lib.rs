@@ -127,6 +127,11 @@ pub struct Artifact {
     pub action_offsets: Vec<u32>,
     pub action_terminals: Vec<u32>,
     pub action_values: Vec<i32>,
+    /// Actions beyond the first, for the cells a conflict left with several.
+    /// `action_extra_offsets[entry]..[entry + 1]` indexes `action_extra`, and
+    /// both are empty for a grammar with no conflicts.
+    pub action_extra_offsets: Vec<u32>,
+    pub action_extra: Vec<i32>,
 
     /// CSR GOTO rows.
     pub goto_offsets: Vec<u32>,
@@ -146,6 +151,8 @@ impl Artifact {
             + self.action_offsets.len()
             + self.action_terminals.len()
             + self.action_values.len()
+            + self.action_extra_offsets.len()
+            + self.action_extra.len()
             + self.goto_offsets.len()
             + self.goto_nonterminals.len()
             + self.goto_targets.len()
@@ -322,7 +329,8 @@ pub fn emit(
         accepting_offsets.push(accepting_terminals.len() as u32);
     }
 
-    let (action_offsets, action_terminals, action_values) = flatten_action(tables);
+    let (action_offsets, action_terminals, action_values, action_extra_offsets, action_extra) =
+        flatten_action(tables);
     let (goto_offsets, goto_nonterminals, goto_targets) = flatten_goto(tables);
 
     Ok(Artifact {
@@ -343,6 +351,8 @@ pub fn emit(
         accepting_terminals,
         lexer_transitions,
         action_offsets,
+        action_extra_offsets,
+        action_extra,
         action_terminals,
         action_values,
         goto_offsets,
@@ -353,21 +363,32 @@ pub fn emit(
     })
 }
 
-fn flatten_action(tables: &Tables) -> (Vec<u32>, Vec<u32>, Vec<i32>) {
+/// The ACTION table, flattened.
+///
+/// A cell usually holds one action, and those three arrays are what they always
+/// were: terminals sorted and unique so the device can binary-search, one value
+/// each. A reduce/reduce conflict leaves a cell holding two, and the extras go
+/// in a fourth array indexed by entry rather than being interleaved with the
+/// terminals - so a grammar without conflicts emits an empty `extra` and its
+/// lookup is unchanged, which is the point. Most grammars have none.
+fn flatten_action(tables: &Tables) -> (Vec<u32>, Vec<u32>, Vec<i32>, Vec<u32>, Vec<i32>) {
     let mut offsets = Vec::with_capacity(tables.num_states() + 1);
     let mut terminals = Vec::new();
     let mut values = Vec::new();
+    let mut extra_offsets = vec![0u32];
+    let mut extra = Vec::new();
     offsets.push(0);
     for row in &tables.action {
-        // Sorted so a device-side binary search is possible.
-        let ordered: BTreeMap<u32, i32> = row.iter().map(|(k, v)| (*k, *v)).collect();
-        for (terminal, action) in ordered {
+        let ordered: BTreeMap<u32, &Vec<i32>> = row.iter().map(|(k, v)| (*k, v)).collect();
+        for (terminal, actions) in ordered {
             terminals.push(terminal);
-            values.push(action);
+            values.push(actions[0]);
+            extra.extend_from_slice(&actions[1..]);
+            extra_offsets.push(extra.len() as u32);
         }
         offsets.push(terminals.len() as u32);
     }
-    (offsets, terminals, values)
+    (offsets, terminals, values, extra_offsets, extra)
 }
 
 fn flatten_goto(tables: &Tables) -> (Vec<u32>, Vec<u32>, Vec<u32>) {

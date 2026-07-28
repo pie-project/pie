@@ -257,6 +257,11 @@ impl CompiledGrammar {
             words(python, &artifact.action_terminals),
         )?;
         out.set_item("action_values", signed(python, &artifact.action_values))?;
+        out.set_item(
+            "action_extra_offsets",
+            words(python, &artifact.action_extra_offsets),
+        )?;
+        out.set_item("action_extra", signed(python, &artifact.action_extra))?;
         out.set_item("goto_offsets", words(python, &artifact.goto_offsets))?;
         out.set_item(
             "goto_nonterminals",
@@ -277,6 +282,18 @@ impl CompiledGrammar {
         out.set_item("start_parser_state", artifact.start_parser_state)?;
         out.set_item("vocab_size", artifact.vocab_size)?;
         out.set_item("bitset_words", artifact.bitset_words)?;
+        // How many actions the widest ACTION cell holds. One unless the grammar
+        // is ambiguous, and the device compiles a replay that does not fork at
+        // all when it is one - which is every grammar that used to compile.
+        out.set_item(
+            "max_actions",
+            artifact
+                .action_extra_offsets
+                .windows(2)
+                .map(|pair| 1 + pair[1] - pair[0])
+                .max()
+                .unwrap_or(1),
+        )?;
         Ok(out)
     }
 

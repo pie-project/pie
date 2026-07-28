@@ -52,8 +52,15 @@ struct Item {
 /// The compiled parser.
 #[derive(Debug, Clone)]
 pub struct Tables {
-    /// `action[state]` maps a terminal (with EOF last) to an encoded action.
-    pub action: Vec<FxHashMap<u32, i32>>,
+    /// `action[state]` maps a terminal (with EOF last) to its encoded actions.
+    ///
+    /// Usually one. A reduce/reduce conflict leaves two, because the grammars a
+    /// JSON Schema lowers to are genuinely ambiguous where its `oneOf` branches
+    /// overlap - measured, by building canonical LR(1) tables and finding that
+    /// every conflict survives them - and a mask does not need the ambiguity
+    /// resolved. It needs to know whether *some* derivation admits the next
+    /// token, so the runtime follows both.
+    pub action: Vec<FxHashMap<u32, Vec<i32>>>,
     /// `goto[state]` maps a nonterminal to the next state.
     pub goto: Vec<FxHashMap<u32, u32>>,
     /// `(lhs, rhs_len)` per production, in the augmented numbering.
@@ -75,7 +82,27 @@ impl Tables {
     }
 
     pub fn action_entries(&self) -> usize {
-        self.action.iter().map(FxHashMap::len).sum()
+        self.action
+            .iter()
+            .map(|row| row.values().map(Vec::len).sum::<usize>())
+            .sum()
+    }
+
+    /// How many `(state, terminal)` cells hold more than one action.
+    pub fn conflicts(&self) -> usize {
+        self.action
+            .iter()
+            .map(|row| row.values().filter(|actions| actions.len() > 1).count())
+            .sum()
+    }
+
+    /// The most actions any one cell holds, which bounds how far a replay forks.
+    pub fn widest_cell(&self) -> usize {
+        self.action
+            .iter()
+            .flat_map(|row| row.values().map(Vec::len))
+            .max()
+            .unwrap_or(1)
     }
 
     /// Terminals admissible in `state`, which is what the group check needs.
@@ -84,8 +111,13 @@ impl Tables {
     }
 
     /// The encoded action for a terminal, or `None` when the row has no entry.
+    ///
+    /// The first of them where there are several. Callers that have to follow
+    /// every derivation read `action[state]` directly.
     pub fn action(&self, state: usize, terminal: u32) -> Option<i32> {
-        self.action[state].get(&terminal).copied()
+        self.action[state]
+            .get(&terminal)
+            .and_then(|actions| actions.first().copied())
     }
 }
 
@@ -108,7 +140,8 @@ pub fn build(cfg: &Cfg) -> Result<Tables> {
     let lookaheads = propagate(&augmented, &automaton, eof, dummy);
 
     let mut resolved = 0usize;
-    let mut action: Vec<FxHashMap<u32, i32>> = vec![FxHashMap::default(); automaton.states.len()];
+    let mut action: Vec<FxHashMap<u32, Vec<i32>>> =
+        vec![FxHashMap::default(); automaton.states.len()];
     let mut goto: Vec<FxHashMap<u32, u32>> = vec![FxHashMap::default(); automaton.states.len()];
 
     for (index, state) in automaton.states.iter().enumerate() {
@@ -246,7 +279,7 @@ pub fn build_canonical(cfg: &Cfg, budget: usize) -> Result<Tables> {
     }
 
     let mut resolved = 0usize;
-    let mut action: Vec<FxHashMap<u32, i32>> = vec![FxHashMap::default(); states.len()];
+    let mut action: Vec<FxHashMap<u32, Vec<i32>>> = vec![FxHashMap::default(); states.len()];
     let mut goto: Vec<FxHashMap<u32, u32>> = vec![FxHashMap::default(); states.len()];
     for (state, kernel) in states.iter().enumerate() {
         for (symbol, target) in &transitions[state] {
@@ -297,36 +330,41 @@ pub fn build_canonical(cfg: &Cfg, budget: usize) -> Result<Tables> {
 }
 
 fn set_action(
-    action: &mut [FxHashMap<u32, i32>],
+    action: &mut [FxHashMap<u32, Vec<i32>>],
     resolved: &mut usize,
     state: usize,
     terminal: u32,
     incoming: i32,
 ) -> Result<()> {
-    match action[state].get(&terminal) {
-        Some(&existing) if existing != incoming => {
+    let held = action[state].entry(terminal).or_default();
+    if held.contains(&incoming) {
+        return Ok(());
+    }
+    match held.first().copied() {
+        Some(existing) => {
             // Shift wins over reduce, as in every parser generator since yacc.
-            // The conflicts a lowered schema produces are adjacent optionals -
-            // `ws? ws?` from whitespace allowed between every pair of tokens -
-            // where both parses accept the same strings and shifting means
-            // "this optional takes it". Reduce/reduce has no such reading and
-            // is still an error.
+            // The conflicts a lowered schema produces there are adjacent
+            // optionals - `ws? ws?` from whitespace allowed between every pair
+            // of tokens - where both parses accept the same strings and
+            // shifting means "this optional takes it".
             let shift = existing.max(incoming);
             let reduce = existing.min(incoming);
             if shift > 0 && reduce < 0 && reduce != ACCEPT {
-                action[state].insert(terminal, shift);
+                held.clear();
+                held.push(shift);
                 *resolved += 1;
                 return Ok(());
             }
-            bail!(
-                "grammar is not LALR(1): state {state}, terminal {terminal}, \
-                 {} versus {}",
-                describe(existing),
-                describe(incoming)
-            )
+            // Reduce/reduce has no such reading, and on these grammars it is
+            // not an artefact of LALR's state merging - canonical LR(1) has it
+            // too. So it is kept rather than refused, and the runtime follows
+            // both derivations. Ordered so the tables are deterministic.
+            held.push(incoming);
+            held.sort_unstable();
+            Ok(())
         }
-        _ => {
-            action[state].insert(terminal, incoming);
+        None => {
+            held.push(incoming);
             Ok(())
         }
     }
