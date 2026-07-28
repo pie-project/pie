@@ -1165,6 +1165,32 @@ previous step left behind, and the commit read candidates that were not there.
 It survived because a configuration almost always finds a group. The search
 shortcut made that common, and that is how it surfaced.
 
+**Not only JSON (2026-07-28).** Every measurement above is on JSON Schema,
+which invites the obvious objection that this is a JSON parser with an LR(1)
+story attached. A regex is the cheapest constraint that is not JSON, both
+engines take one directly, and the front end already lowers one. Fifteen
+patterns of the shape a deployment actually constrains with - identifiers,
+dates, UUIDs, paths, quantities - each walked over a string it accepts:
+
+| | |
+|---|---|
+| patterns whose masks and configuration sets agree with the reference | **15 of 15** |
+| median step against XGrammar at batch 128 | **6.25x** |
+| worst | 3.83x |
+| compile time, median | **6.6 ms**, against 120 for a schema |
+
+The interesting number is the spread rather than the median. XGrammar's cost
+depends on the pattern by a factor of **240**: one fill is 1.6 us on `[0-9]+`
+and **385 us** on `[a-z]+(,[a-z]+)*`, where after a letter both a letter and a
+comma continue and the uncertain set is large. Ours moves by 2.4x over the same
+set, 84 to 206 us, because the per-step work is a function of the automaton
+rather than of how many tokens need deciding.
+
+That is the tail llguidance criticises, measured here on a pattern nobody would
+call adversarial - and it is the same asymmetry as the batch scaling, in a
+second dimension: their cost tracks the work the constraint implies, ours
+tracks the constraint's shape.
+
 **Host contention (q21).** Weaker than expected and worth saying so. With
 twenty-four cores deliberately saturated, XGrammar's fill slows by 1.06x and
 ours by 1.01x; both engines' p99 degrades to about 3 ms, which is the operating
