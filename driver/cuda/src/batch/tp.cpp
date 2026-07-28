@@ -277,6 +277,14 @@ struct TpFireSlot {
     std::vector<std::uint32_t> kv_page_indptr;
     std::vector<std::uint32_t> kv_last_page_lens;
     std::vector<std::uint32_t> kv_page_indices;
+    // Host-known rs metadata: the follower uploads these H2D itself instead
+    // of receiving per-fire broadcasts (see TpFirePlanViews).
+    std::vector<std::int32_t> slot_ids;
+    std::vector<std::uint8_t> is_fresh;
+    std::vector<std::uint8_t> rs_slot_flags;
+    std::vector<std::uint32_t> rs_fold_lens;
+    std::vector<std::uint32_t> rs_buffer_slot_indptr;
+    std::vector<std::uint32_t> rs_buffer_slot_ids;
 };
 
 // Depth is a throughput buffer, NOT a correctness bound: `MAX_IN_FLIGHT`
@@ -313,6 +321,8 @@ struct TpStallWatchdog {
     std::atomic<std::uint64_t> follower_forwards{0};
     std::array<std::atomic<std::uint64_t>, 8> collectives{};
     std::atomic<std::uint64_t> rank0_phase_seq{0};
+    std::atomic<int> rank0_stage{0};
+    std::atomic<int> follower_stage{0};
     std::atomic<bool> running{false};
     std::thread thread;
     static bool enabled() {
@@ -340,10 +350,24 @@ struct TpStallWatchdog {
                 const auto c = consumed.load(std::memory_order_acquire);
                 if (p == last_pub && c == last_con) {
                     const int ph = rank0_phase.load(std::memory_order_acquire);
+                    static const char* kR0Stage[] = {
+                        "none", "publish", "uploads", "compose", "graph_pad",
+                        "wait_slot", "broadcast", "broadcast_done",
+                        "attn_plan", "forward", "record_slot", "mtp_drafts",
+                        "settle"};
+                    static const char* kF1Stage[] = {
+                        "none", "gate_wait", "header_read", "payload_recv",
+                        "host_views", "rs_plan", "attn_plan", "graph_lookup",
+                        "graph_capture", "graph_launch", "eager_forward",
+                        "loop_top"};
+                    const int r0s = rank0_stage.load(std::memory_order_acquire);
+                    const int f1s =
+                        follower_stage.load(std::memory_order_acquire);
                     std::fprintf(stderr,
                         "[tp-watchdog] STALLED %ds: published=%llu consumed=%llu "
                         "(delta=%lld) rank0_last_phase=%s seq=%llu "
-                        "follower_forwards=%llu collectives=[r0=%llu r1=%llu]\n",
+                        "follower_forwards=%llu collectives=[r0=%llu r1=%llu] "
+                        "rank0_stage=%s follower_stage=%s\n",
                         (++stuck) * 5,
                         (unsigned long long)p, (unsigned long long)c,
                         (long long)(p - c),
@@ -351,7 +375,9 @@ struct TpStallWatchdog {
                         (unsigned long long)rank0_phase_seq.load(),
                         (unsigned long long)follower_forwards.load(),
                         (unsigned long long)collectives[0].load(),
-                        (unsigned long long)collectives[1].load());
+                        (unsigned long long)collectives[1].load(),
+                        (r0s >= 0 && r0s <= 12) ? kR0Stage[r0s] : "?",
+                        (f1s >= 0 && f1s <= 11) ? kF1Stage[f1s] : "?");
                 } else {
                     stuck = 0;
                 }
@@ -379,6 +405,34 @@ void assign_span(std::vector<T>& dst, const T* src, std::size_t count) {
     if (count != 0 && src != nullptr) {
         std::memcpy(dst.data(), src, count * sizeof(T));
     }
+}
+
+// Which mailbox-carried metadata the follower uploads itself instead of
+// receiving via broadcast. Both ranks are threads of one process, so one
+// env read keeps them agreed. PIE_TP_MAILBOX_META: unset/"0" = none (all
+// broadcasts), "csr" = planner CSRs only, "full" = CSRs + rs metadata.
+//
+// DEFAULT OFF, and the non-default modes are EXPERIMENTAL ONLY: for
+// device-composed decode fires the compose kernel rewrites
+// kv_page_indices / kv_last_page_lens / rs_slot_ids ON DEVICE after the
+// host staging (dummy-page substitution and lane kills), so the broadcast
+// carries device-authoritative values the host views cannot reproduce.
+// Uploading the host views diverges the ranks the moment any lane is
+// padded or killed. The broadcast group is also cheap: NCCL fuses it into
+// ~one kernel per fire (~0.3 ms/step measured at 128-wide).
+enum class TpMailboxMeta : int { kNone = 0, kCsr = 1, kFull = 2 };
+TpMailboxMeta tp_mailbox_meta_mode() {
+    static const TpMailboxMeta mode = [] {
+        const char* v = std::getenv("PIE_TP_MAILBOX_META");
+        if (v != nullptr && std::strcmp(v, "csr") == 0) {
+            return TpMailboxMeta::kCsr;
+        }
+        if (v != nullptr && std::strcmp(v, "full") == 0) {
+            return TpMailboxMeta::kFull;
+        }
+        return TpMailboxMeta::kNone;
+    }();
+    return mode;
 }
 
 constexpr std::int32_t TP_FIRE_MAGIC = 0x55504954;  // 'TPIU' tag
@@ -498,6 +552,20 @@ void tp_publish_fire(const std::string& cpu_gate_key,
     assign_span(fire.kv_last_page_lens, views.kv_last_page_lens, requests);
     assign_span(fire.kv_page_indices, views.kv_page_indices,
                 views.kv_page_indices_len);
+    assign_span(fire.slot_ids, views.slot_ids,
+                has_slot_ids ? requests : 0);
+    assign_span(fire.is_fresh, views.is_fresh,
+                has_slot_ids ? requests : 0);
+    assign_span(fire.rs_slot_flags, views.rs_slot_flags,
+                has_slot_ids ? requests : 0);
+    assign_span(fire.rs_fold_lens, views.rs_fold_lens,
+                views.rs_fold_lens_len);
+    const bool buffered_rs = rs_mode == RsExecutionMode::BufferWrite ||
+                             rs_mode == RsExecutionMode::BufferFold;
+    assign_span(fire.rs_buffer_slot_indptr, views.rs_buffer_slot_indptr,
+                buffered_rs ? requests + 1 : 0);
+    assign_span(fire.rs_buffer_slot_ids, views.rs_buffer_slot_ids,
+                views.rs_buffer_ids_len);
     ++box->fire_seq;
     {
         auto& wd = TpStallWatchdog::instance();
@@ -597,6 +665,12 @@ void tp_broadcast_inputs(NcclComm& comm, PersistentInputs& pi,
             static_cast<std::size_t>(N) * 4, ncclChar, 0,
             comm.comm(), stream));
     }
+    // Everything carried by the mailbox (planner CSRs + rs metadata) is
+    // uploaded H2D by the follower itself; only the device-resident payload
+    // still travels through NCCL when the mailbox is on.
+    const TpMailboxMeta meta_mode =
+        via_mailbox ? tp_mailbox_meta_mode() : TpMailboxMeta::kNone;
+    if (meta_mode == TpMailboxMeta::kNone) {
     NCCL_CHECK(ncclBroadcast(pi.qo_indptr.data(), pi.qo_indptr.data(),
                              static_cast<std::size_t>(R + 1) * 4, ncclChar, 0,
                              comm.comm(), stream));
@@ -625,6 +699,7 @@ void tp_broadcast_inputs(NcclComm& comm, PersistentInputs& pi,
                                  static_cast<std::size_t>(kv_indices_count) * 4,
                                  ncclChar, 0, comm.comm(), stream));
     }
+    }
     if (!state_only_fold && mask_indptr_count > 0) {
         if (mask_bytes > 0) {
             NCCL_CHECK(ncclBroadcast(
@@ -637,6 +712,7 @@ void tp_broadcast_inputs(NcclComm& comm, PersistentInputs& pi,
                                  static_cast<std::size_t>(mask_indptr_count) * 4,
                                  ncclChar, 0, comm.comm(), stream));
     }
+    if (meta_mode != TpMailboxMeta::kFull) {
     if (has_slot_ids && R > 0) {
         NCCL_CHECK(ncclBroadcast(pi.slot_ids.data(), pi.slot_ids.data(),
                                  static_cast<std::size_t>(R) * 4, ncclChar, 0,
@@ -671,6 +747,7 @@ void tp_broadcast_inputs(NcclComm& comm, PersistentInputs& pi,
                     sizeof(std::uint32_t),
                 ncclChar, 0, comm.comm(), stream));
         }
+    }
     }
     if (!state_only_fold && logit_rows > 0) {
         NCCL_CHECK(ncclBroadcast(pi.sample_idx.data(), pi.sample_idx.data(),
@@ -763,6 +840,16 @@ void tp_watchdog_mark_phase(int phase) {
         phase, std::memory_order_release);
 }
 
+void tp_watchdog_mark_rank0_stage(TpRank0Stage stage) {
+    TpStallWatchdog::instance().rank0_stage.store(
+        static_cast<int>(stage), std::memory_order_relaxed);
+}
+
+void tp_watchdog_mark_follower_stage(TpFollowerStage stage) {
+    TpStallWatchdog::instance().follower_stage.store(
+        static_cast<int>(stage), std::memory_order_relaxed);
+}
+
 void tp_cpu_gate_notify(const std::string& key) {
     if (key.empty()) return;
     auto gate = tp_cpu_gate_for(key);
@@ -820,10 +907,51 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
             ? nullptr
             : tp_mailbox_for(engine.tp_cpu_gate_key);
 
+    // Pinned staging for the follower's own H2D uploads of the
+    // mailbox-carried metadata (planner CSRs + rs arrays). Allocated ONCE
+    // here, before any collective is posted: pinned allocation synchronizes
+    // the whole context and must never run on the fire path (see the
+    // dispatch arenas). Slots rotate so a fire can stage while the previous
+    // fire's uploads are still queued behind GPU work.
+    struct StagingSlot {
+        std::uint8_t* base = nullptr;
+        cudaEvent_t done = nullptr;
+        bool pending = false;
+    };
+    constexpr int kStagingSlots = 4;
+    std::array<StagingSlot, kStagingSlots> staging{};
+    const std::size_t cap_r = pi.kv_last_page_lens.size();
+    const std::size_t cap_kvpi = pi.kv_page_indices.size();
+    const std::size_t cap_fold = pi.rs_fold_lens.size();
+    const std::size_t cap_bids = pi.rs_buffer_slot_ids.size();
+    auto align256 = [](std::size_t v) { return (v + 255) & ~std::size_t{255}; };
+    const std::size_t off_qo = 0;
+    const std::size_t off_kvpp = off_qo + align256((cap_r + 1) * 4);
+    const std::size_t off_kvlpl = off_kvpp + align256((cap_r + 1) * 4);
+    const std::size_t off_kvpi = off_kvlpl + align256(cap_r * 4);
+    const std::size_t off_slot_ids = off_kvpi + align256(cap_kvpi * 4);
+    const std::size_t off_is_fresh = off_slot_ids + align256(cap_r * 4);
+    const std::size_t off_flags = off_is_fresh + align256(cap_r);
+    const std::size_t off_fold = off_flags + align256(cap_r);
+    const std::size_t off_bindptr = off_fold + align256(cap_fold * 4);
+    const std::size_t off_bids = off_bindptr + align256((cap_r + 1) * 4);
+    const std::size_t staging_bytes = off_bids + align256(cap_bids * 4);
+    if (mailbox != nullptr) {
+        for (StagingSlot& slot : staging) {
+            void* raw = nullptr;
+            CUDA_CHECK(cudaMallocHost(&raw, staging_bytes));
+            slot.base = static_cast<std::uint8_t*>(raw);
+            CUDA_CHECK(cudaEventCreateWithFlags(&slot.done,
+                                                cudaEventDisableTiming));
+        }
+    }
+    std::size_t staging_next = 0;
+
     while (!stop.load()) {
         // A false return means shutdown, not a fire. Posting the header
         // broadcast anyway would block forever on a collective rank 0 will
         // never match, which is what previously wedged teardown.
+        tp_watchdog_mark_follower_stage(TpFollowerStage::kGateWait);
         {
             TpStageTimer gate_timer(TpProfile::kGateWait);
             if (!tp_cpu_gate_wait(engine.tp_cpu_gate_key, cpu_gate_seq, stop)) {
@@ -844,6 +972,7 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
         //    until it has the header's contents host-side.
         TpFireHeader hdr{};
         std::uint64_t fire_slot = 0;
+        tp_watchdog_mark_follower_stage(TpFollowerStage::kHeaderRead);
         {
             TpStageTimer header_timer(TpProfile::kHeaderRecv);
             if (mailbox != nullptr) {
@@ -998,6 +1127,7 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
         const bool have_custom_mask =
             !state_only_fold && hdr.mask_indptr_count > 0;
         const bool have_slot_ids = (hdr.has_slot_ids != 0) && R > 0;
+        tp_watchdog_mark_follower_stage(TpFollowerStage::kPayloadRecv);
         TpStageTimer payload_timer(TpProfile::kPayloadRecv);
         NCCL_CHECK(ncclGroupStart());
         if (!state_only_fold) {
@@ -1021,6 +1151,12 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
                 static_cast<std::size_t>(N) * 4, ncclChar, 0,
                 comm.comm(), stream));
         }
+        // Mailbox-carried metadata is uploaded H2D by this rank below —
+        // mirror rank 0's skip exactly or the group op counts diverge.
+        const TpMailboxMeta meta_mode = mailbox != nullptr
+            ? tp_mailbox_meta_mode()
+            : TpMailboxMeta::kNone;
+        if (meta_mode == TpMailboxMeta::kNone) {
         NCCL_CHECK(ncclBroadcast(pi.qo_indptr.data(), pi.qo_indptr.data(),
                                  static_cast<std::size_t>(R + 1) * 4,
                                  ncclChar, 0, comm.comm(), stream));
@@ -1042,6 +1178,7 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
                                      static_cast<std::size_t>(hdr.kv_indices_count) * 4,
                                      ncclChar, 0, comm.comm(), stream));
         }
+        }
         if (!state_only_fold && have_custom_mask) {
             if (hdr.mask_bytes > 0) {
                 NCCL_CHECK(ncclBroadcast(
@@ -1054,6 +1191,7 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
                                      static_cast<std::size_t>(hdr.mask_indptr_count) * 4,
                                      ncclChar, 0, comm.comm(), stream));
         }
+        if (meta_mode != TpMailboxMeta::kFull) {
         if (have_slot_ids) {
             NCCL_CHECK(ncclBroadcast(pi.slot_ids.data(), pi.slot_ids.data(),
                                      static_cast<std::size_t>(R) * 4,
@@ -1090,6 +1228,7 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
                     ncclChar, 0, comm.comm(), stream));
             }
         }
+        }
         if (!state_only_fold && logit_rows > 0) {
             NCCL_CHECK(ncclBroadcast(pi.sample_idx.data(), pi.sample_idx.data(),
                                      static_cast<std::size_t>(logit_rows) * 4,
@@ -1104,6 +1243,7 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
         // exactly these, and plans from them itself, so take them from the
         // mailbox: no readback, no synchronize, and both ranks provably plan
         // from the same numbers.
+        tp_watchdog_mark_follower_stage(TpFollowerStage::kHostViews);
         TpStageTimer host_views_timer(TpProfile::kHostViews);
         h_qo.resize(R + 1);
         h_kvpp.resize(R + 1);
@@ -1133,56 +1273,202 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
                 copy_from(h_kvlpl, fire.kv_last_page_lens);
                 copy_from(h_kvpi, fire.kv_page_indices);
             }
-            // Everything this fire's slot carries now lives in locals, so rank
-            // 0 may reuse it. Released before the payload collectives below for
-            // the same reason as the MTP branch.
+            // The mailbox also carries the rs metadata host-side, so the
+            // follower fills its host views directly and uploads its own
+            // device copies from a pinned staging slot — no broadcast, no
+            // D2H readback, and (critically) no per-fire stream synchronize.
+            const TpMailboxMeta meta = tp_mailbox_meta_mode();
+            const bool buffered_rs =
+                rs_mode == RsExecutionMode::BufferWrite ||
+                rs_mode == RsExecutionMode::BufferFold;
+            if (meta == TpMailboxMeta::kFull) {
+                if (have_slot_ids) {
+                    h_slot_ids.resize(R);
+                    h_is_fresh.resize(R);
+                    copy_from(h_slot_ids, fire.slot_ids);
+                    copy_from(h_is_fresh, fire.is_fresh);
+                    std::memcpy(pi.rs_slot_flags_host.data(),
+                                fire.rs_slot_flags.data(),
+                                std::min<std::size_t>(
+                                    fire.rs_slot_flags.size(),
+                                    static_cast<std::size_t>(R)));
+                }
+                if (rs_fold_lens_count > 0) {
+                    std::memcpy(pi.rs_fold_lens_host.data(),
+                                fire.rs_fold_lens.data(),
+                                std::min<std::size_t>(
+                                    fire.rs_fold_lens.size(),
+                                    rs_fold_lens_count) *
+                                    sizeof(std::uint32_t));
+                }
+                if (buffered_rs) {
+                    std::memcpy(pi.rs_buffer_slot_indptr_host.data(),
+                                fire.rs_buffer_slot_indptr.data(),
+                                std::min<std::size_t>(
+                                    fire.rs_buffer_slot_indptr.size(),
+                                    static_cast<std::size_t>(R + 1)) *
+                                    sizeof(std::uint32_t));
+                    if (rs_buffer_ids_count > 0) {
+                        std::memcpy(
+                            pi.rs_buffer_slot_ids_host.data(),
+                            fire.rs_buffer_slot_ids.data(),
+                            std::min<std::size_t>(
+                                fire.rs_buffer_slot_ids.size(),
+                                static_cast<std::size_t>(
+                                    rs_buffer_ids_count)) *
+                                sizeof(std::uint32_t));
+                    }
+                }
+            }
+
+            // Stage the device-bound copies into pinned memory BEFORE the
+            // mailbox slot is released; the H2D reads only the pinned copy.
+            StagingSlot& stage = staging[staging_next % kStagingSlots];
+            if (meta != TpMailboxMeta::kNone) {
+                ++staging_next;
+                if (stage.pending) {
+                    CUDA_CHECK(cudaEventSynchronize(stage.done));
+                    stage.pending = false;
+                }
+                const auto stage_bytes = [&](std::size_t off, const void* src,
+                                             std::size_t bytes) {
+                    std::memcpy(stage.base + off, src, bytes);
+                };
+                stage_bytes(off_qo, fire.qo_indptr.data(),
+                            fire.qo_indptr.size() * 4);
+                if (!state_only_fold) {
+                    stage_bytes(off_kvpp, fire.kv_page_indptr.data(),
+                                fire.kv_page_indptr.size() * 4);
+                    stage_bytes(off_kvlpl, fire.kv_last_page_lens.data(),
+                                fire.kv_last_page_lens.size() * 4);
+                    stage_bytes(off_kvpi, fire.kv_page_indices.data(),
+                                fire.kv_page_indices.size() * 4);
+                }
+                if (meta == TpMailboxMeta::kFull) {
+                    if (have_slot_ids) {
+                        stage_bytes(off_slot_ids, fire.slot_ids.data(),
+                                    fire.slot_ids.size() * 4);
+                        stage_bytes(off_is_fresh, fire.is_fresh.data(),
+                                    fire.is_fresh.size());
+                        stage_bytes(off_flags, fire.rs_slot_flags.data(),
+                                    fire.rs_slot_flags.size());
+                    }
+                    if (rs_fold_lens_count > 0) {
+                        stage_bytes(off_fold, fire.rs_fold_lens.data(),
+                                    fire.rs_fold_lens.size() * 4);
+                    }
+                    if (buffered_rs) {
+                        stage_bytes(off_bindptr,
+                                    fire.rs_buffer_slot_indptr.data(),
+                                    fire.rs_buffer_slot_indptr.size() * 4);
+                        if (rs_buffer_ids_count > 0) {
+                            stage_bytes(off_bids,
+                                        fire.rs_buffer_slot_ids.data(),
+                                        fire.rs_buffer_slot_ids.size() * 4);
+                        }
+                    }
+                }
+            }
+
+            // Everything this fire's slot carries now lives in locals or the
+            // pinned stage, so rank 0 may reuse it.
             mailbox->consumed_fires.store(cpu_gate_seq,
                                           std::memory_order_release);
             auto& wd_ = TpStallWatchdog::instance();
             wd_.consumed.store(cpu_gate_seq, std::memory_order_release);
             wd_.follower_forwards.fetch_add(1, std::memory_order_release);
-            // Recurrent-state metadata still comes back from device; those
-            // paths are cold and not worth widening the mailbox for.
-            if (have_slot_ids) {
-                h_slot_ids.resize(R);
-                h_is_fresh.resize(R);
-                host_readback = true;
-                CUDA_CHECK(cudaMemcpyAsync(
-                    h_slot_ids.data(), pi.slot_ids.data(),
-                    static_cast<std::size_t>(R) * 4,
-                    cudaMemcpyDeviceToHost, stream));
-                CUDA_CHECK(cudaMemcpyAsync(
-                    h_is_fresh.data(), pi.is_fresh.data(),
-                    static_cast<std::size_t>(R),
-                    cudaMemcpyDeviceToHost, stream));
-                CUDA_CHECK(cudaMemcpyAsync(
-                    pi.rs_slot_flags_host.data(), pi.rs_slot_flags.data(),
-                    static_cast<std::size_t>(R),
-                    cudaMemcpyDeviceToHost, stream));
+
+            if (meta != TpMailboxMeta::kNone) {
+                const auto upload = [&](void* dst, std::size_t off,
+                                        std::size_t bytes) {
+                    if (bytes == 0) return;
+                    CUDA_CHECK(cudaMemcpyAsync(dst, stage.base + off, bytes,
+                                               cudaMemcpyHostToDevice,
+                                               stream));
+                };
+                upload(pi.qo_indptr.data(), off_qo,
+                       static_cast<std::size_t>(R + 1) * 4);
+                if (!state_only_fold) {
+                    upload(pi.kv_page_indptr.data(), off_kvpp,
+                           static_cast<std::size_t>(R + 1) * 4);
+                    upload(pi.kv_last_page_lens.data(), off_kvlpl,
+                           static_cast<std::size_t>(R) * 4);
+                    upload(pi.kv_page_indices.data(), off_kvpi,
+                           static_cast<std::size_t>(
+                               std::max(0, hdr.kv_indices_count)) * 4);
+                }
+                if (meta == TpMailboxMeta::kFull) {
+                    if (have_slot_ids) {
+                        upload(pi.slot_ids.data(), off_slot_ids,
+                               static_cast<std::size_t>(R) * 4);
+                        upload(pi.is_fresh.data(), off_is_fresh,
+                               static_cast<std::size_t>(R));
+                        upload(pi.rs_slot_flags.data(), off_flags,
+                               static_cast<std::size_t>(R));
+                    }
+                    if (rs_fold_lens_count > 0) {
+                        upload(pi.rs_fold_lens.data(), off_fold,
+                               static_cast<std::size_t>(rs_fold_lens_count) *
+                                   4);
+                    }
+                    if (buffered_rs) {
+                        upload(pi.rs_buffer_slot_indptr.data(), off_bindptr,
+                               static_cast<std::size_t>(R + 1) * 4);
+                        if (rs_buffer_ids_count > 0) {
+                            upload(pi.rs_buffer_slot_ids.data(), off_bids,
+                                   static_cast<std::size_t>(
+                                       rs_buffer_ids_count) * 4);
+                        }
+                    }
+                }
+                CUDA_CHECK(cudaEventRecord(stage.done, stream));
+                stage.pending = true;
             }
-            if (rs_fold_lens_count > 0) {
-                host_readback = true;
-                CUDA_CHECK(cudaMemcpyAsync(
-                    pi.rs_fold_lens_host.data(), pi.rs_fold_lens.data(),
-                    static_cast<std::size_t>(rs_fold_lens_count) *
-                        sizeof(std::uint32_t),
-                    cudaMemcpyDeviceToHost, stream));
-            }
-            if (rs_mode == RsExecutionMode::BufferWrite ||
-                rs_mode == RsExecutionMode::BufferFold) {
-                host_readback = true;
-                CUDA_CHECK(cudaMemcpyAsync(
-                    pi.rs_buffer_slot_indptr_host.data(),
-                    pi.rs_buffer_slot_indptr.data(),
-                    static_cast<std::size_t>(R + 1) * sizeof(std::uint32_t),
-                    cudaMemcpyDeviceToHost, stream));
-                if (rs_buffer_ids_count > 0) {
+
+            // In the non-full modes the rs metadata still arrives via
+            // broadcast, so read it back from the device as before.
+            if (meta != TpMailboxMeta::kFull) {
+                if (have_slot_ids) {
+                    h_slot_ids.resize(R);
+                    h_is_fresh.resize(R);
+                    host_readback = true;
                     CUDA_CHECK(cudaMemcpyAsync(
-                        pi.rs_buffer_slot_ids_host.data(),
-                        pi.rs_buffer_slot_ids.data(),
-                        static_cast<std::size_t>(rs_buffer_ids_count) *
+                        h_slot_ids.data(), pi.slot_ids.data(),
+                        static_cast<std::size_t>(R) * 4,
+                        cudaMemcpyDeviceToHost, stream));
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        h_is_fresh.data(), pi.is_fresh.data(),
+                        static_cast<std::size_t>(R),
+                        cudaMemcpyDeviceToHost, stream));
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        pi.rs_slot_flags_host.data(), pi.rs_slot_flags.data(),
+                        static_cast<std::size_t>(R),
+                        cudaMemcpyDeviceToHost, stream));
+                }
+                if (rs_fold_lens_count > 0) {
+                    host_readback = true;
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        pi.rs_fold_lens_host.data(), pi.rs_fold_lens.data(),
+                        static_cast<std::size_t>(rs_fold_lens_count) *
                             sizeof(std::uint32_t),
                         cudaMemcpyDeviceToHost, stream));
+                }
+                if (buffered_rs) {
+                    host_readback = true;
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        pi.rs_buffer_slot_indptr_host.data(),
+                        pi.rs_buffer_slot_indptr.data(),
+                        static_cast<std::size_t>(R + 1) *
+                            sizeof(std::uint32_t),
+                        cudaMemcpyDeviceToHost, stream));
+                    if (rs_buffer_ids_count > 0) {
+                        CUDA_CHECK(cudaMemcpyAsync(
+                            pi.rs_buffer_slot_ids_host.data(),
+                            pi.rs_buffer_slot_ids.data(),
+                            static_cast<std::size_t>(rs_buffer_ids_count) *
+                                sizeof(std::uint32_t),
+                            cudaMemcpyDeviceToHost, stream));
+                    }
                 }
             }
         } else {
@@ -1281,6 +1567,7 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
         const std::span<const std::uint32_t> rs_buffer_indptr(
             buffered ? pi.rs_buffer_slot_indptr_host.data() : nullptr,
             buffered ? static_cast<std::size_t>(R + 1) : 0);
+        tp_watchdog_mark_follower_stage(TpFollowerStage::kRsPlan);
         pipeline::RsExecutionPlan follower_rs_plan;
         std::string rs_error;
         if (!pipeline::plan_rs_execution(
@@ -1302,6 +1589,7 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
         // 4. Run the same forward function as rank 0. Channel publication is
         // rank-0-only after the collectives complete.
         if (rs_mode != RsExecutionMode::BufferFold) {
+            tp_watchdog_mark_follower_stage(TpFollowerStage::kAttnPlan);
             TpStageTimer plan_timer(TpProfile::kAttnPlan);
             // Claim a plan-staging slot exactly as rank 0 does. Without this
             // the follower rewrites slot 0 on every fire and never records an
@@ -1363,9 +1651,12 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
                                have_custom_mask,
                                graph_layout);
         if (try_graphs) {
+            tp_watchdog_mark_follower_stage(TpFollowerStage::kGraphLookup);
             const ForwardGraphKey key{R, N, graph_variant};
             cudaGraphExec_t exec = engine.graph_cache->get(key);
             if (exec == nullptr) {
+                tp_watchdog_mark_follower_stage(
+                    TpFollowerStage::kGraphCapture);
                 exec = capture_forward_graph_exec(
                     engine, h_qo.data(), h_kvpi.data(), h_kvpp.data(),
                     h_kvlpl.data(),
@@ -1382,8 +1673,10 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
                     structured_window_left);
                 engine.graph_cache->put(key, exec);
             }
+            tp_watchdog_mark_follower_stage(TpFollowerStage::kGraphLaunch);
             CUDA_CHECK(cudaGraphLaunch(exec, /*stream=*/nullptr));
         } else {
+            tp_watchdog_mark_follower_stage(TpFollowerStage::kEagerForward);
             pie_cuda_driver::ForwardFn::ForwardInputs fwd_in;
             fwd_in.token_ids = reinterpret_cast<const std::int32_t*>(pi.tokens.data());
             fwd_in.positions = reinterpret_cast<const std::int32_t*>(pi.positions.data());
@@ -1435,6 +1728,7 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
                 fwd_in);
         }
         forward_timer.stop();
+        tp_watchdog_mark_follower_stage(TpFollowerStage::kLoopTop);
         if (mailbox != nullptr && TpProfile::enabled()) {
             const auto now = std::chrono::steady_clock::now();
             auto& prof = TpProfile::instance();
@@ -1444,6 +1738,15 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
                         now - mailbox->notify_time).count()));
             ++prof.hits[TpProfile::kStartSkew];
         }
+    }
+    // Teardown: the serve loop has exited, so no collectives are pending on
+    // this rank and the context-synchronizing frees are safe again.
+    for (StagingSlot& slot : staging) {
+        if (slot.pending && slot.done != nullptr) {
+            static_cast<void>(cudaEventSynchronize(slot.done));
+        }
+        if (slot.done != nullptr) cudaEventDestroy(slot.done);
+        if (slot.base != nullptr) cudaFreeHost(slot.base);
     }
 }
 

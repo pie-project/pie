@@ -844,6 +844,16 @@ impl FramePolicy {
             }
             sealed_any = true;
             self.ever_sealed = true;
+            if crate::scheduler::fire_timing_full() {
+                crate::scheduler::fire_timing_write(&serde_json::json!({
+                    "schema": 1,
+                    "source": "scheduler",
+                    "event": "frame_sealed",
+                    "at_us": crate::scheduler::fire_timing_now_us(),
+                    "members": members.len(),
+                    "sealed_depth": self.sealed.len(),
+                }));
+            }
             served.extend(members.iter().copied());
             self.record_sealed_waves(
                 waves.iter().filter(|wave| !wave.is_empty()).count(),
@@ -1075,6 +1085,45 @@ impl FramePolicy {
                 if executing {
                     // An epoch is executing: its retirements re-decide and
                     // the gather continues in the background.
+                    // Rate-limited gather diagnostics (PIE_FIRE_TIMING): why
+                    // the boundary did not seal early during execution.
+                    if crate::scheduler::fire_timing_full() {
+                        use std::sync::atomic::{AtomicU64, Ordering};
+                        static PARKS: AtomicU64 = AtomicU64::new(0);
+                        if PARKS.fetch_add(1, Ordering::Relaxed) % 512 == 0 {
+                            crate::scheduler::fire_timing_write(&serde_json::json!({
+                                "schema": 1,
+                                "source": "scheduler",
+                                "event": "frame_gather_park",
+                                "at_us": crate::scheduler::fire_timing_now_us(),
+                                "missing": missing,
+                                "joining": joining,
+                                "joins_in_flight": self.joins_in_flight.len(),
+                                "pending_slots": self.pending_slots,
+                                "staged": self.staged.len(),
+                                "departing": self.departing.len(),
+                                "awaited": self
+                                    .lanes
+                                    .values()
+                                    .filter(|lane| lane.awaited)
+                                    .count(),
+                                "front_complete": self
+                                    .lanes
+                                    .values()
+                                    .filter(|lane| {
+                                        lane.frames
+                                            .front()
+                                            .is_some_and(PendingFrame::is_complete)
+                                    })
+                                    .count(),
+                                "empty_lanes": self
+                                    .lanes
+                                    .values()
+                                    .filter(|lane| lane.frames.is_empty())
+                                    .count(),
+                            }));
+                        }
+                    }
                     return FramePlan::Park;
                 }
                 let deadline = self

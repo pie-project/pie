@@ -3615,6 +3615,19 @@ impl BatchScheduler {
             // frees a slot; posting never waits on completion beyond this
             // backpressure.
             if in_flight_launches.len() >= frame::configured_max_in_flight() {
+                if super::fire_timing_full() {
+                    use std::sync::atomic::{AtomicU64, Ordering};
+                    static BLOCKED: AtomicU64 = AtomicU64::new(0);
+                    if BLOCKED.fetch_add(1, Ordering::Relaxed) % 64 == 0 {
+                        super::fire_timing_write(&serde_json::json!({
+                            "schema": 1,
+                            "source": "scheduler",
+                            "event": "dispatch_blocked_inflight",
+                            "at_us": super::fire_timing_now_us(),
+                            "in_flight": in_flight_launches.len(),
+                        }));
+                    }
+                }
                 break;
             }
             let now = Instant::now();

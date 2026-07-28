@@ -33,6 +33,20 @@ struct TpFirePlanViews {
     const std::uint32_t* kv_last_page_lens = nullptr;  // R
     const std::uint32_t* kv_page_indices = nullptr;    // kv_page_indices_len
     std::size_t kv_page_indices_len = 0;
+    // Host-known recurrent-state metadata (present when the header's
+    // has_slot_ids / rs counts say so). Rank 0 stages exactly these bytes to
+    // its own device, so carrying them through the mailbox lets the follower
+    // upload its copy H2D instead of receiving ~6 sub-KB broadcasts whose
+    // cost is pure launch latency — and drop its per-fire D2H readback +
+    // stream synchronize entirely.
+    const std::int32_t* slot_ids = nullptr;              // R
+    const std::uint8_t* is_fresh = nullptr;              // R
+    const std::uint8_t* rs_slot_flags = nullptr;         // R
+    const std::uint32_t* rs_fold_lens = nullptr;         // rs_fold_lens_len
+    std::size_t rs_fold_lens_len = 0;
+    const std::uint32_t* rs_buffer_slot_indptr = nullptr;  // R + 1 (buffered)
+    const std::uint32_t* rs_buffer_slot_ids = nullptr;     // rs_buffer_ids_len
+    std::size_t rs_buffer_ids_len = 0;
 };
 
 // Publish the fire's host-known metadata (header + planner CSR views) into the
@@ -105,6 +119,23 @@ void tp_broadcast_mtp_step(
 // begun broadcasting a new fire. No-op when `key` is empty (CPU gate off).
 void tp_watchdog_mark_phase(int phase);
 void tp_watchdog_count_collective(int rank);
+
+// Fine-grained stall localization (PIE_TP_WATCHDOG=1). Each rank stores the
+// stage it last entered as a relaxed atomic; the watchdog thread prints both
+// on stall. Stores are branch-free and ~free, so they do not perturb the
+// cross-rank timing the way per-fire logging does.
+enum class TpRank0Stage : int {
+    kNone = 0, kPublish, kUploads, kCompose, kGraphPad, kWaitSlot,
+    kBroadcast, kBroadcastDone, kAttnPlan, kForward, kRecordSlot, kMtpDrafts,
+    kSettle,
+};
+enum class TpFollowerStage : int {
+    kNone = 0, kGateWait, kHeaderRead, kPayloadRecv, kHostViews, kRsPlan,
+    kAttnPlan, kGraphLookup, kGraphCapture, kGraphLaunch, kEagerForward,
+    kLoopTop,
+};
+void tp_watchdog_mark_rank0_stage(TpRank0Stage stage);
+void tp_watchdog_mark_follower_stage(TpFollowerStage stage);
 
 void tp_cpu_gate_notify(const std::string& key);
 

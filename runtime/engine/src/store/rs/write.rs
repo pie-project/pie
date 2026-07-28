@@ -53,13 +53,20 @@ impl RsBufferTarget {
     }
 }
 
-/// A prepared, not-yet-committed RS write for one fire.
+/// A prepared RS write for one fire. Mappings are applied OPTIMISTICALLY at
+/// prepare (so a run-ahead successor prepares against the state its
+/// predecessors will leave behind); commit only performs the deferred
+/// releases, and abort restores the pre-prepare mapping.
 #[derive(Debug)]
 pub struct RsPreparedWrite {
     pub(crate) ws: RsWorkingSetId,
     pub(crate) state: Option<RsStateTarget>,
     pub(crate) buffers: Vec<RsBufferTarget>,
     pub(crate) allocated: Vec<RsSlotId>,
+    /// The folded slot this write displaced at prepare (released at commit,
+    /// restored at abort). `None` when the folded write was in place or the
+    /// working set had no folded state yet.
+    pub(crate) displaced_state: Option<RsSlotId>,
     /// Submission sequence stamped at prepare (see `KvPreparedWrite::seq`).
     pub(crate) seq: u64,
 }
@@ -67,6 +74,17 @@ pub struct RsPreparedWrite {
 impl RsPreparedWrite {
     pub fn working_set(&self) -> RsWorkingSetId {
         self.ws
+    }
+
+    /// True when this pending write cannot invalidate a successor's prepare.
+    /// With optimistic prepare-time mapping application, every write is
+    /// already visible when the successor prepares — the ONE exception is a
+    /// fold, whose boundary advance and buffer-page drops still land at
+    /// commit. A successor must therefore wait out pending folds only.
+    pub fn mapping_stable(&self) -> bool {
+        self.state
+            .as_ref()
+            .is_none_or(|state| state.fold_tokens.is_none())
     }
 
     /// Submission sequence for epoch retirement at finalize.

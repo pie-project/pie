@@ -130,6 +130,10 @@ def run(args: argparse.Namespace):
         llm_kwargs["attention_config"] = {"backend": args.attention_backend}
     if args.enforce_eager:
         llm_kwargs["enforce_eager"] = True
+    if getattr(args, "disable_custom_all_reduce", False):
+        llm_kwargs["disable_custom_all_reduce"] = True
+    if getattr(args, "mm_encoder_attn_backend", None):
+        llm_kwargs["mm_encoder_attn_backend"] = args.mm_encoder_attn_backend
     if getattr(args, "num_gpu_blocks_override", 0):
         llm_kwargs["num_gpu_blocks_override"] = args.num_gpu_blocks_override
     if getattr(args, "block_size", 0):
@@ -567,6 +571,19 @@ def main() -> None:
         add_output_dump_args(sp)
         sp.add_argument("--attention-backend", default=None)
         sp.add_argument("--enforce-eager", action="store_true")
+        sp.add_argument(
+            "--disable-custom-all-reduce",
+            action="store_true",
+            help="Fall back to NCCL for TP allreduce. Required on drivers "
+                 "too old for the cuMem handles the custom kernel needs.",
+        )
+        sp.add_argument(
+            "--mm-encoder-attn-backend",
+            default=None,
+            help="Attention backend for the multimodal encoder tower "
+                 "(e.g. TORCH_SDPA). The main-model --attention-backend "
+                 "does not apply to it.",
+        )
         sp.add_argument(
             "--num-gpu-blocks-override",
             type=int,

@@ -154,9 +154,20 @@ inline void submit_batch(const std::vector<void*>& dsts,
     cudaMemcpyAttributes attrs{};
     attrs.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
     std::size_t attrs_index = 0;
+#if CUDART_VERSION >= 13000
     CUDA_CHECK(cudaMemcpyBatchAsync(
         const_cast<void* const*>(dsts.data()), srcs.data(), sizes.data(),
         dsts.size(), &attrs, &attrs_index, 1, stream));
+#else
+    // CUDA 12.8 spells this API with an extra failIdx out-parameter and
+    // non-const pointer arrays.
+    std::size_t fail_idx = 0;
+    CUDA_CHECK(cudaMemcpyBatchAsync(
+        const_cast<void**>(dsts.data()),
+        const_cast<void**>(srcs.data()),
+        const_cast<std::size_t*>(sizes.data()),
+        dsts.size(), &attrs, &attrs_index, 1, &fail_idx, stream));
+#endif
 }
 
 }  // namespace

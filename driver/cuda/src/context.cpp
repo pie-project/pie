@@ -1570,6 +1570,22 @@ int Context::Impl::load_model(
                   ));
     }
     executor_p->dispatch = &registry_->dispatch();
+    // Bring every fire-path staging arena to its lifetime maximum NOW,
+    // while the TP follower has no collectives posted. Mid-run growth
+    // pins/frees host memory, which synchronizes the whole context and
+    // deadlocks against the follower's spin-waiting NCCL receives (the
+    // 128-wide tp2 hang: envelope template pages outgrew their initial
+    // capacity on the fire where every sequence crossed its 5th KV page).
+    registry_->dispatch().preallocate_fire_staging(
+        static_cast<std::size_t>(
+            std::max(1, mem_plan.capacity.max_forward_requests)),
+        static_cast<std::size_t>(std::max(0, kv_cache.num_pages())) +
+            static_cast<std::size_t>(
+                std::max(1, mem_plan.capacity.max_forward_requests)),
+        static_cast<std::size_t>(std::max(0, kv_cache.num_pages())) +
+            2 * static_cast<std::size_t>(
+                    std::max(1, mem_plan.capacity.max_forward_requests)) +
+            1024);
     executor_ = executor_p;
     const bool has_usable_mtp_logits =
         has_mtp_logits && static_cast<bool>(executor_p->system_drafter);

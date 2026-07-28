@@ -462,7 +462,7 @@ impl RsStore {
             None
         };
 
-        let buffers = buffer_targets_src
+        let buffers: Vec<RsBufferTarget> = buffer_targets_src
             .into_iter()
             .map(|(index, slot)| match slot {
                 None => RsBufferTarget::Fresh {
@@ -478,6 +478,35 @@ impl RsStore {
             })
             .collect();
 
+        // Optimistic application (run-ahead): make the new mappings visible
+        // NOW so a successor fire prepares against the state this write will
+        // leave behind — the double-RESET / repeated-CoW hazard of preparing
+        // against stale committed state disappears because there is no
+        // "stale" window. Commit is left with only the deferred releases
+        // (and the fold-boundary advance, which stays commit-time; fold
+        // writes serialize via `mapping_stable`). Abort restores the
+        // displaced mapping.
+        let mut displaced_state = None;
+        if let Some(state) = &state {
+            let old = self.entry(ws).expect("validated above").folded;
+            if old != Some(state.slot) {
+                self.refs.insert(state.slot, 1);
+                self.entry_mut(ws).expect("validated above").folded = Some(state.slot);
+                displaced_state = old;
+            }
+        }
+        for target in &buffers {
+            match *target {
+                RsBufferTarget::Fresh { index, dst }
+                | RsBufferTarget::Cow { index, dst, .. } => {
+                    self.refs.insert(dst, 1);
+                    self.entry_mut(ws).expect("validated above").buffer[index as usize] =
+                        Some(dst);
+                }
+                RsBufferTarget::InPlace { .. } => {}
+            }
+        }
+
         self.seq += 1;
         self.in_flight += 1;
         Ok(RsPreparedWrite {
@@ -485,6 +514,7 @@ impl RsStore {
             state,
             buffers,
             allocated,
+            displaced_state,
             seq: self.seq,
         })
     }
@@ -529,43 +559,78 @@ impl RsStore {
 
     fn commit_prevalidated(&mut self, prepared: RsPreparedWrite, epoch: u64) {
         let ws = prepared.ws;
+        // Mappings were applied at prepare; commit performs only the
+        // deferred releases (and the fold advance — fold writes serialize
+        // against every other in-flight write, see `mapping_stable`).
         if let Some(state) = &prepared.state {
-            let old = self.entry(ws).expect("batch prevalidated").folded;
-            if old != Some(state.slot) {
-                self.refs.insert(state.slot, 1);
-                self.entry_mut(ws).expect("batch prevalidated").folded = Some(state.slot);
-                if let Some(old) = old {
-                    self.decref(old, epoch);
-                }
+            if let Some(old) = prepared.displaced_state {
+                self.decref(old, epoch);
             }
             if let Some(tokens) = state.fold_tokens {
                 self.advance_fold(ws, tokens, epoch);
             }
         }
-
         for target in &prepared.buffers {
-            match *target {
-                RsBufferTarget::Fresh { index, dst } => {
-                    self.refs.insert(dst, 1);
-                    self.entry_mut(ws).expect("batch prevalidated").buffer[index as usize] =
-                        Some(dst);
-                }
-                RsBufferTarget::Cow { index, src, dst } => {
-                    self.refs.insert(dst, 1);
-                    self.entry_mut(ws).expect("batch prevalidated").buffer[index as usize] =
-                        Some(dst);
-                    self.decref(src, epoch);
-                }
-                RsBufferTarget::InPlace { .. } => {}
+            if let RsBufferTarget::Cow { src, .. } = *target {
+                self.decref(src, epoch);
             }
         }
         self.in_flight = self.in_flight.saturating_sub(1);
     }
 
-    /// Driver failure/poison/dummy-run: release pending slots; the committed
-    /// state stays authoritative.
+    /// Driver failure/poison/dummy-run: restore the pre-prepare mappings and
+    /// release the pending slots. Restoration is best-effort — a failed fire
+    /// fail-stops its pipeline, so successors that prepared on top of the
+    /// aborted mapping are themselves aborted (their targets were in-place
+    /// on the restored-away slots and undo nothing).
     pub fn abort(&mut self, prepared: RsPreparedWrite, epoch: u64) {
-        self.pool.recycle_after_epoch(prepared.allocated, epoch);
+        let mut dropped_refs: Vec<RsSlotId> = Vec::new();
+        if let Some(state) = &prepared.state {
+            if !prepared.allocated.is_empty() || prepared.displaced_state.is_some() {
+                if let Ok(entry) = self.entry_mut(prepared.ws) {
+                    if entry.folded == Some(state.slot) {
+                        entry.folded = prepared.displaced_state;
+                        dropped_refs.push(state.slot);
+                    }
+                }
+            }
+        }
+        for target in &prepared.buffers {
+            match *target {
+                RsBufferTarget::Fresh { index, dst } => {
+                    if let Ok(entry) = self.entry_mut(prepared.ws) {
+                        if entry.buffer.get(index as usize).copied().flatten()
+                            == Some(dst)
+                        {
+                            entry.buffer[index as usize] = None;
+                            dropped_refs.push(dst);
+                        }
+                    }
+                }
+                RsBufferTarget::Cow { index, src, dst } => {
+                    if let Ok(entry) = self.entry_mut(prepared.ws) {
+                        if entry.buffer.get(index as usize).copied().flatten()
+                            == Some(dst)
+                        {
+                            entry.buffer[index as usize] = Some(src);
+                            dropped_refs.push(dst);
+                        }
+                    }
+                }
+                RsBufferTarget::InPlace { .. } => {}
+            }
+        }
+        for slot in &dropped_refs {
+            self.refs.remove(slot);
+        }
+        // Recycle exactly the slots whose optimistic mapping insertion the
+        // undo above reversed (a subset of `allocated` by construction —
+        // every allocated slot enters the mapping at prepare). A slot whose
+        // mapping is no longer ours was already handed off: a released
+        // working set recycled it through its entry teardown, and a
+        // displacing successor's own commit/abort owns its release. Blindly
+        // recycling `allocated` double-freed in both cases.
+        self.pool.recycle_after_epoch(dropped_refs, epoch);
         self.in_flight = self.in_flight.saturating_sub(1);
     }
 

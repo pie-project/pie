@@ -162,6 +162,20 @@ class Dispatch {
     // any registration traffic) so grow() never fires mid-ramp.
     void reserve_channel_slots(std::uint32_t min_slots);
 
+    // Preallocate every fire-path staging arena to its lifetime maximum at
+    // model load. Mid-run growth is not merely slow here: cudaMallocHost /
+    // cudaFreeHost synchronize the whole context, and with TP ranks as
+    // threads of one process the follower keeps spin-waiting NCCL receive
+    // kernels posted ahead of rank 0's payload broadcast — a
+    // context-synchronizing call inside compose deadlocked the pair the
+    // moment the 128-wide decode ramp first outgrew a staging arena
+    // (envelope template pages crossed the 512 initial capacity at 640).
+    // `max_pages` is the KV pool page count; `max_translation_entries`
+    // bounds the fixed-decode per-program translation tables.
+    void preallocate_fire_staging(std::size_t max_lanes,
+                                  std::size_t max_pages,
+                                  std::size_t max_translation_entries);
+
     // `package` is the program in the shape this driver executes it; the
     // driver has no other source for it. `emitted` is the host's generated
     // kernels, which the driver cannot regenerate -- its emitters are gone.

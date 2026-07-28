@@ -107,19 +107,19 @@ int tp_fire_runahead_depth() {
             const int parsed = std::atoi(v);
             if (parsed >= 0 && parsed <= 8) return parsed;
         }
-        // Depth 1 (one TP fire in flight on the device).
+        // Depth 4 (up to four TP fires in flight on the device).
         //
-        // The follower's missing attention plan-staging slot was ONE cause of
-        // the k>1 TP deadlock and is fixed at its source, but it was not the
-        // only one: with bind-time projection packing enabled the hang comes
-        // back at k=1 and k=2 (and not at k=4), which is the signature of a
-        // second overlap hazard that packing's different timing exposes. Until
-        // that one is found too, keep the bound.
-        //
-        // Cost measured at 1.9% (39,182 vs 39,941 tok/s at 448-wide, k=4),
-        // small because rank 0 is the rank with slack — the follower is
-        // reactive and already waits inside the payload broadcast.
-        return 1;
+        // The depth-1 bound was a containment for overlap hazards whose root
+        // turned out to be context-synchronizing CUDA calls on the fire path
+        // (pinned alloc/free during staging growth) deadlocking against the
+        // follower's spin-waiting posted receives — fixed at the source
+        // (Dispatch::preallocate_fire_staging + retire-instead-of-free).
+        // With that class removed, depth 4 ran the 128-wide Qwen3.6 tp2
+        // decode workload repeatedly without a hang, including the staging
+        // high-water crossings that used to wedge it, and measured ~5-10%
+        // faster than depth 1 (rank 0's broadcasts and forward enqueue for
+        // fire N+1 no longer wait for fire N to retire).
+        return 4;
     }();
     return depth;
 }
@@ -2020,6 +2020,15 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
                 .kv_page_indices_len = s.rs_is_fold
                     ? 0
                     : static_cast<std::size_t>(tp_kv_indices_count),
+                .slot_ids = s.use_slots ? s.slot_ids_h.data() : nullptr,
+                .is_fresh = s.use_slots ? s.is_fresh_h.data() : nullptr,
+                .rs_slot_flags =
+                    s.use_slots ? s.rs_flag_view.data() : nullptr,
+                .rs_fold_lens = s.rs_fold_len_view.data(),
+                .rs_fold_lens_len = s.rs_fold_len_view.size(),
+                .rs_buffer_slot_indptr = s.rs_buf_indptr_view.data(),
+                .rs_buffer_slot_ids = s.rs_buf_id_view.data(),
+                .rs_buffer_ids_len = s.rs_buf_id_view.size(),
             },
             s.forward_N, s.forward_R, s.is_pure_decode,
             tp_kv_indices_count,
@@ -2034,6 +2043,7 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
             static_cast<int>(s.rs_fold_len_view.size()),
             static_cast<int>(s.rs_buf_id_view.size()));
         tp_commit.key = &engine.tp_cpu_gate_key;
+        tp_watchdog_mark_rank0_stage(TpRank0Stage::kPublish);
     }
     if (s.empty_step) {
         if (dbg_fire) {
@@ -2045,6 +2055,9 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
     }
 
     // Parameter-block commits, in the original per-fire order.
+    if (engine.tp_comm != nullptr) {
+        tp_watchdog_mark_rank0_stage(TpRank0Stage::kUploads);
+    }
     EnqTimer uploads_timer(EnqProfile::kUploads);
     if (s.wire_refill) {
         pi.tokens.commit_staged(s.up_tokens);
@@ -2106,6 +2119,9 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
             cublas.stream()));
     }
     uploads_timer.stop();
+    if (engine.tp_comm != nullptr) {
+        tp_watchdog_mark_rank0_stage(TpRank0Stage::kCompose);
+    }
     std::optional<EnqTimer> forward_timer;
     EnqTimer compose_timer(EnqProfile::kCompose);
     if (s.has_decode_envelopes) {
@@ -2123,6 +2139,9 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
         }
     }
 
+    if (engine.tp_comm != nullptr) {
+        tp_watchdog_mark_rank0_stage(TpRank0Stage::kGraphPad);
+    }
     if (s.graph_pad_requests > 0) {
         launch_graph_pad_rows(
             reinterpret_cast<std::uint32_t*>(pi.qo_indptr.data()),
@@ -2158,7 +2177,9 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
                 ? 0
                 : static_cast<std::size_t>(tp_kv_indices_count),
         };
+        tp_watchdog_mark_rank0_stage(TpRank0Stage::kWaitSlot);
         tp_runahead::wait_for_slot();
+        tp_watchdog_mark_rank0_stage(TpRank0Stage::kBroadcast);
         tp_broadcast_inputs(*engine.tp_comm, pi,
                             engine.tp_cpu_gate_key,
                             tp_views,
@@ -2176,6 +2197,7 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
                             static_cast<int>(s.rs_buf_id_view.size()),
                             /*stream=*/nullptr);
         tp_commit.completed = true;
+        tp_watchdog_mark_rank0_stage(TpRank0Stage::kBroadcastDone);
         pie_cuda_driver::tp_watchdog_mark_phase(2);
         // One TP fire in flight on the device at a time.
         //
@@ -2207,6 +2229,9 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
     // workspace already holds the identical plan.
     if (!s.rs_is_fold && !s.skip_plan) {
         compose_timer.stop();
+        if (engine.tp_comm != nullptr) {
+            tp_watchdog_mark_rank0_stage(TpRank0Stage::kAttnPlan);
+        }
         EnqTimer plan_timer(EnqProfile::kAttnPlan);
         engine.attn_ws.begin_plan_update();
         engine.forward_fn.invoke_prepare(
@@ -2305,6 +2330,9 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
                 query_is_f32);
         },
     };
+    if (engine.tp_comm != nullptr) {
+        tp_watchdog_mark_rank0_stage(TpRank0Stage::kForward);
+    }
     run_forward_dispatch(
         engine, ForwardDispatchInputs{
             .forward_R = s.forward_R,
@@ -2369,12 +2397,16 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
         s.timing.forward_enqueue_end = fire_timing::Clock::now();
     }
     if (!s.rs_is_fold) {
+        if (engine.tp_comm != nullptr) {
+            tp_watchdog_mark_rank0_stage(TpRank0Stage::kMtpDrafts);
+        }
         enqueue_mtp_draft_logits(engine, s.mtp_plan);
     }
     // Close this fire's slot in the bounded TP pipeline: everything this fire
     // puts on the communicator and the shared `pi.*` buffers is now enqueued,
     // so a later fire may reuse the slot once this event retires.
     if (engine.tp_comm != nullptr && !s.empty_step) {
+        tp_watchdog_mark_rank0_stage(TpRank0Stage::kRecordSlot);
         tp_runahead::record_slot(cublas.stream());
     }
 }
@@ -2386,6 +2418,9 @@ void settle_step(
     PreparedStep& step) {
     PreparedStep::Impl& s = *step.impl();
     const bool dbg_fire = s.timing.enabled;
+    if (engine.tp_comm != nullptr) {
+        tp_watchdog_mark_rank0_stage(TpRank0Stage::kSettle);
+    }
     s.timing.wave_id = completion.wait_id;
     const pipeline::DispatchStats stats_before = dbg_fire
         ? engine.dispatch->stats()

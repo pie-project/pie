@@ -494,6 +494,19 @@ impl PendingOp {
             })
         )
     }
+
+    /// True when this op's eventual RS finalize changes no mapping (see
+    /// [`crate::store::rs::write::RsPreparedWrite::mapping_stable`], via
+    /// the txns this fire holds). Ops without RS rows are trivially stable.
+    pub(crate) fn rs_mapping_stable(&self) -> bool {
+        match self {
+            PendingOp::Fire(fire) => {
+                fire.rstxns.iter().all(rs::RsTxn::mapping_stable)
+            }
+            #[cfg(test)]
+            PendingOp::TestStub => true,
+        }
+    }
 }
 
 enum FinalizeAction {
@@ -655,6 +668,30 @@ pub(crate) async fn drain_rs_predecessors<C: FireContext>(
     ctx: &mut C,
     fires: &PendingFires,
 ) -> Anyhow<()> {
+    // Run-ahead fast path: RS mappings publish only at finalize, so a
+    // successor must normally wait out its predecessors before preparing.
+    // But a MAPPING-STABLE predecessor (fully in-place folded/buffer write,
+    // no fold advance — the steady decode step) commits a mapping no-op, so
+    // preparing against committed state while only stable fires are in
+    // flight reads exactly the values that will hold at their finalize.
+    // This is what lets a decode lane keep a queued successor during
+    // execution instead of paying a full host round trip per token
+    // (measured: dispatch of step N+1 started strictly AFTER settle of
+    // step N without this, ~6 ms of exposed host time per step at 128-wide
+    // tp2). Any unstable pending op (page materialize, CoW, fold) falls
+    // back to the full drain.
+    fn rs_runahead_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("PIE_RS_RUNAHEAD").ok().is_none_or(|v| v != "0")
+        })
+    }
+    if rs_runahead_enabled() {
+        let queue = fires.lock().unwrap();
+        if queue.iter().all(PendingOp::rs_mapping_stable) {
+            return Ok(());
+        }
+    }
     loop {
         let completion = fires
             .lock()

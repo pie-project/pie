@@ -402,6 +402,8 @@ __global__ void pack_descriptor_cells(
 class DescriptorReadbackArena {
   public:
     ~DescriptorReadbackArena() noexcept {
+        for (void* p : retired_host_) cudaFreeHost(p);
+        for (void* p : retired_device_) cudaFree(p);
         if (device_copies_ != nullptr) cudaFree(device_copies_);
         if (host_copies_ != nullptr) cudaFreeHost(host_copies_);
         if (device_bytes_ != nullptr) cudaFree(device_bytes_);
@@ -412,6 +414,13 @@ class DescriptorReadbackArena {
     DescriptorReadbackArena(const DescriptorReadbackArena&) = delete;
     DescriptorReadbackArena& operator=(const DescriptorReadbackArena&) =
         delete;
+
+    // Load-time sizing so growth (a context-synchronizing pinned alloc)
+    // never runs on the fire path; see Dispatch::preallocate_fire_staging.
+    void preallocate(std::size_t copies, std::size_t bytes) {
+        reserve_copies(copies);
+        reserve_bytes(bytes);
+    }
 
     const std::uint8_t* read(
         std::span<const DescriptorPackCopy> copies,
@@ -485,8 +494,11 @@ class DescriptorReadbackArena {
             cudaFreeHost(host);
             throw;
         }
-        if (device_copies_ != nullptr) cudaFree(device_copies_);
-        if (host_copies_ != nullptr) cudaFreeHost(host_copies_);
+        // Retired, not freed: context-synchronizing frees on the fire path
+        // deadlock against the TP follower's posted receives (see
+        // FixedDecodeUploadArena).
+        if (device_copies_ != nullptr) retired_device_.push_back(device_copies_);
+        if (host_copies_ != nullptr) retired_host_.push_back(host_copies_);
         device_copies_ = device;
         host_copies_ = host;
         copy_capacity_ = capacity;
@@ -507,8 +519,8 @@ class DescriptorReadbackArena {
             cudaFreeHost(host);
             throw;
         }
-        if (device_bytes_ != nullptr) cudaFree(device_bytes_);
-        if (host_bytes_ != nullptr) cudaFreeHost(host_bytes_);
+        if (device_bytes_ != nullptr) retired_device_.push_back(device_bytes_);
+        if (host_bytes_ != nullptr) retired_host_.push_back(host_bytes_);
         device_bytes_ = device;
         host_bytes_ = host;
         byte_capacity_ = capacity;
@@ -520,6 +532,10 @@ class DescriptorReadbackArena {
     std::uint8_t* device_bytes_ = nullptr;
     std::size_t copy_capacity_ = 0;
     std::size_t byte_capacity_ = 0;
+    // Superseded growth generations, freed at teardown (see
+    // FixedDecodeUploadArena for the TP deadlock this avoids).
+    std::vector<void*> retired_host_;
+    std::vector<void*> retired_device_;
 };
 
 struct FixedDecodeLane {
@@ -800,6 +816,8 @@ class FixedDecodeUploadArena {
         if (copy_stream_ != nullptr) {
             static_cast<void>(cudaStreamSynchronize(copy_stream_));
         }
+        for (void* p : retired_host_) cudaFreeHost(p);
+        for (void* p : retired_device_) cudaFree(p);
         if (device_lanes_ != nullptr) cudaFree(device_lanes_);
         if (device_translation_ != nullptr) cudaFree(device_translation_);
         if (device_done_ != nullptr) cudaEventDestroy(device_done_);
@@ -830,10 +848,18 @@ class FixedDecodeUploadArena {
             translations <= translation_capacity_) {
             return;
         }
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-        CUDA_CHECK(cudaStreamSynchronize(copy_stream_));
-        device_pending_ = false;
-        for (HostSlot& slot : host_slots_) slot.pending = false;
+        // No synchronize and no inline free on growth: cudaFree/cudaFreeHost
+        // synchronize the whole context, and with TP ranks as threads of one
+        // process the follower keeps spin-waiting NCCL receive kernels posted
+        // ahead of rank 0's broadcast — a context-synchronizing call here
+        // deadlocked the pair at the first capacity growth after the
+        // 128-wide decode ramp. Superseded device buffers are RETIRED
+        // instead and freed with the arena, after the TP group has quiesced;
+        // in-flight consumers of the old buffers stay valid for the same
+        // reason. Host slots and their pending flags are untouched: they are
+        // replaced lazily by `acquire_host_slot`, whose per-slot event sync
+        // is stream-scoped and cannot wedge the group.
+        static_cast<void>(stream);
 
         const std::size_t lane_capacity =
             grown_capacity(lane_capacity_, lanes, kFixedDecodeInitialLanes);
@@ -861,8 +887,10 @@ class FixedDecodeUploadArena {
             cudaFree(device_lanes);
             throw;
         }
-        if (device_lanes_ != nullptr) cudaFree(device_lanes_);
-        if (device_translation_ != nullptr) cudaFree(device_translation_);
+        if (device_lanes_ != nullptr) retired_device_.push_back(device_lanes_);
+        if (device_translation_ != nullptr) {
+            retired_device_.push_back(device_translation_);
+        }
         device_lanes_ = device_lanes;
         device_translation_ = device_translation;
         lane_capacity_ = lane_capacity;
@@ -872,6 +900,19 @@ class FixedDecodeUploadArena {
     const std::uint32_t* translation_at(
         std::size_t offset) const noexcept {
         return device_translation_ + offset;
+    }
+
+    // Load-time sizing: brings the device arrays AND every pinned host slot
+    // to their lifetime maximum so nothing on the fire path ever allocates
+    // or frees pinned memory (context-synchronizing; see
+    // Dispatch::preallocate_fire_staging).
+    void preallocate(std::size_t lanes, std::size_t translations) {
+        reserve(std::max(lanes, kFixedDecodeInitialLanes),
+                std::max<std::size_t>(translations, 16384),
+                /*stream=*/nullptr);
+        for (HostSlot& slot : host_slots_) {
+            acquire_host_slot(slot, copy_stream_);
+        }
     }
 
     const FixedDecodeLane* upload(
@@ -960,7 +1001,11 @@ class FixedDecodeUploadArena {
             CUDA_CHECK(cudaMallocHost(
                 reinterpret_cast<void**>(&replacement),
                 lane_capacity_ * sizeof(FixedDecodeLane)));
-            if (slot.lanes != nullptr) cudaFreeHost(slot.lanes);
+            // Retired, not freed: cudaFreeHost synchronizes the whole
+            // context and deadlocks against the TP follower's posted
+            // receives (see `reserve`). This was the measured wedge at
+            // fire 352 of the 128-wide tp2 decode ramp.
+            if (slot.lanes != nullptr) retired_host_.push_back(slot.lanes);
             slot.lanes = replacement;
             slot.lane_capacity = lane_capacity_;
         }
@@ -970,7 +1015,7 @@ class FixedDecodeUploadArena {
                 reinterpret_cast<void**>(&replacement),
                 translation_capacity_ * sizeof(std::uint32_t)));
             if (slot.translation != nullptr) {
-                cudaFreeHost(slot.translation);
+                retired_host_.push_back(slot.translation);
             }
             slot.translation = replacement;
             slot.translation_capacity = translation_capacity_;
@@ -992,6 +1037,10 @@ class FixedDecodeUploadArena {
     std::size_t lane_capacity_ = 0;
     std::size_t translation_capacity_ = 0;
     std::size_t next_slot_ = 0;
+    // Superseded growth generations, freed at teardown (bounded: capacities
+    // double, so the retired total stays under one final generation).
+    std::vector<void*> retired_host_;
+    std::vector<void*> retired_device_;
 };
 
 constexpr std::size_t kDecodeEnvelopeMaxLanes = 1024;
@@ -1140,6 +1189,8 @@ class DecodeEnvelopeUploadArena {
     };
 
     ~DecodeEnvelopeUploadArena() noexcept {
+        for (void* p : retired_host_) cudaFreeHost(p);
+        for (void* p : retired_device_) cudaFree(p);
         if (device_ != nullptr) cudaFree(device_);
         if (pages_device_ != nullptr) cudaFree(pages_device_);
         if (device_done_ != nullptr) cudaEventDestroy(device_done_);
@@ -1202,6 +1253,13 @@ class DecodeEnvelopeUploadArena {
         device_pending_ = true;
     }
 
+    // Load-time sizing; `reserve` allocates the device arrays and every
+    // pinned host slot eagerly, so the fire path never pins memory (see
+    // Dispatch::preallocate_fire_staging).
+    void preallocate(std::size_t lanes, std::size_t pages) {
+        reserve(lanes, pages, /*stream=*/nullptr);
+    }
+
   private:
     struct HostSlot {
         DecodeEnvelopeLane* host = nullptr;
@@ -1215,7 +1273,10 @@ class DecodeEnvelopeUploadArena {
         if (required <= capacity_ && required_pages <= pages_capacity_) {
             return;
         }
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        // Growth retires the old buffers instead of syncing + freeing:
+        // context-synchronizing calls on the fire path deadlock against the
+        // TP follower's posted receives (see FixedDecodeUploadArena).
+        static_cast<void>(stream);
         const std::size_t capacity =
             std::max({required, capacity_, kFixedDecodeInitialLanes});
         const std::size_t pages_capacity = std::max(
@@ -1272,11 +1333,13 @@ class DecodeEnvelopeUploadArena {
             throw;
         }
 
-        if (device_ != nullptr) cudaFree(device_);
-        if (pages_device_ != nullptr) cudaFree(pages_device_);
+        if (device_ != nullptr) retired_device_.push_back(device_);
+        if (pages_device_ != nullptr) retired_device_.push_back(pages_device_);
         for (HostSlot& slot : host_slots_) {
-            if (slot.host != nullptr) cudaFreeHost(slot.host);
+            if (slot.host != nullptr) retired_host_.push_back(slot.host);
             if (slot.copy_done != nullptr) {
+                // Deferred by the driver until the event retires; never a
+                // context synchronize.
                 cudaEventDestroy(slot.copy_done);
             }
         }
@@ -1299,6 +1362,10 @@ class DecodeEnvelopeUploadArena {
     std::size_t capacity_ = 0;
     std::size_t pages_capacity_ = 0;
     std::size_t next_slot_ = 0;
+    // Superseded growth generations, freed at teardown (see
+    // FixedDecodeUploadArena for the TP deadlock this avoids).
+    std::vector<void*> retired_host_;
+    std::vector<void*> retired_device_;
 };
 
 }  // namespace
@@ -3000,6 +3067,38 @@ void close_bound_instance(
 
 void Dispatch::reserve_channel_slots(std::uint32_t min_slots) {
     impl_->channels.reserve_slots(min_slots);
+}
+
+void Dispatch::preallocate_fire_staging(std::size_t max_lanes,
+                                        std::size_t max_pages,
+                                        std::size_t max_translation_entries) {
+    Impl& state = *impl_;
+    state.fixed_decode_upload.preallocate(max_lanes, max_translation_entries);
+    state.decode_envelope_upload.preallocate(max_lanes, max_pages);
+    // Bounds chosen generously (a few MB total): the readback arena doubles
+    // from 64 copies / 4 KB, and any mid-run doubling is a
+    // context-synchronizing pinned alloc.
+    state.descriptor_readback.preallocate(/*copies=*/8192,
+                                          /*bytes=*/std::size_t{1} << 21);
+    // The chain-kill counters were lazily allocated on the first envelope /
+    // fixed-decode enqueue — also a pinned alloc on the fire path.
+    if (state.d_envelope_kills == nullptr) {
+        CUDA_CHECK(cudaMalloc(&state.d_envelope_kills, sizeof(std::uint32_t)));
+        CUDA_CHECK(cudaMemset(state.d_envelope_kills, 0,
+                              sizeof(std::uint32_t)));
+        CUDA_CHECK(cudaMallocHost(&state.h_envelope_kills,
+                                  sizeof(std::uint32_t)));
+        *state.h_envelope_kills = 0;
+    }
+    if (state.d_fixed_decode_kills == nullptr) {
+        CUDA_CHECK(cudaMalloc(&state.d_fixed_decode_kills,
+                              sizeof(std::uint32_t)));
+        CUDA_CHECK(cudaMemset(state.d_fixed_decode_kills, 0,
+                              sizeof(std::uint32_t)));
+        CUDA_CHECK(cudaMallocHost(&state.h_fixed_decode_kills,
+                                  sizeof(std::uint32_t)));
+        *state.h_fixed_decode_kills = 0;
+    }
 }
 
 int Dispatch::register_program(std::uint64_t program_hash,

@@ -19,6 +19,13 @@ pub struct RsTxn {
     prepared: RsPreparedWrite,
 }
 
+impl RsTxn {
+    /// See [`RsPreparedWrite::mapping_stable`].
+    pub fn mapping_stable(&self) -> bool {
+        self.prepared.mapping_stable()
+    }
+}
+
 /// Validate the recurrent-state arity against the resolved forward rows.
 pub fn validate_count(
     rs_count: usize,
