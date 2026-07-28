@@ -30,6 +30,8 @@
 //!   `0 == PTIR_LIBRARY_NUCLEUS_SAMPLE`, so it reaches an out-of-bounds read of
 //!   `region.inputs[0..3]`. There is no defined oracle output to match.
 
+#[path = "common/device_text.rs"]
+mod device_text;
 #[path = "common/msl_corpus.rs"]
 mod msl_corpus;
 #[path = "common/provenance.rs"]
@@ -46,6 +48,7 @@ use pie_codegen::metal::{
     emit_singleton_region, validate_singleton_plan,
 };
 
+use device_text::OracleInputs;
 use msl_corpus::{CorpusStage, corpus_stages, is_library, op_tag, region_shape};
 
 /// FNV-1a 64, the hash the oracle header records for the shared prefixes.
@@ -105,6 +108,19 @@ fn golden_msl_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("golden-msl")
 }
 
+/// The live Metal device source and the oracle-era copy of whichever part of it
+/// has moved since the dump was taken. See `common/device_text.rs`. Nothing has
+/// moved yet, so `golden-msl/oracle-inputs/` does not exist and this is the
+/// identity — it is here so the first kernel change lands on the mechanism
+/// instead of on a wall of unexplained byte diffs.
+fn oracle_inputs() -> OracleInputs {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    OracleInputs::load(
+        manifest.join("../codegen/runtime/metal"),
+        golden_msl_dir().join("oracle-inputs"),
+    )
+}
+
 /// The runtime prefix every emitted kernel starts with, elided from the dump
 /// the way the oracle elides it.
 fn runtime_prefix() -> String {
@@ -125,15 +141,18 @@ struct Dump {
     body: String,
     runtime: String,
     grouped: String,
+    inputs: OracleInputs,
 }
 
 impl Dump {
     fn new(emitter: &'static str) -> Self {
+        let inputs = oracle_inputs();
         Self {
             emitter,
             body: String::new(),
-            runtime: runtime_prefix(),
-            grouped: grouped_prefix(),
+            runtime: inputs.rewrite(&runtime_prefix()),
+            grouped: inputs.rewrite(&grouped_prefix()),
+            inputs,
         }
     }
 
@@ -151,6 +170,8 @@ impl Dump {
 
     fn source(&mut self, text: &str) {
         self.body.push_str("ok: true\n");
+        let text = self.inputs.rewrite(text);
+        let text = text.as_str();
         let (prefix, tail) = if !self.grouped.is_empty() && text.starts_with(&self.grouped) {
             ("@runtime+@grouped", &text[self.grouped.len()..])
         } else if !self.runtime.is_empty() && text.starts_with(&self.runtime) {
@@ -305,10 +326,11 @@ fn compare(dump: &Dump) {
     }
     assert!(
         unexpected.is_empty(),
-        "{} diverged from the C++ oracle in {} case(s):\n{}",
+        "{} diverged from the C++ oracle in {} case(s):\n{}\n{}",
         dump.emitter,
         unexpected.len(),
-        unexpected.join("\n")
+        unexpected.join("\n"),
+        dump.inputs.hint()
     );
     assert!(
         stale.is_empty(),
@@ -320,6 +342,40 @@ fn compare(dump: &Dump) {
     // Line counts legitimately differ once a case is in the ledger (a rejection
     // is one line where an emitted kernel is hundreds). The per-case comparison
     // above, gated on identical case-id lists, is the stronger check.
+}
+
+/// What makes the oracle-era rewrite safe: the emitter splices each device file
+/// in whole and verbatim, so putting the oracle-era text back can only ever
+/// restore bytes the kernel side owns.
+#[test]
+fn every_live_device_file_is_spliced_into_a_kernel_verbatim() {
+    let inputs = oracle_inputs();
+    // 0x10 is a real op tag, so this is a kernel and not a rejection.
+    let singleton = emit_singleton_region("ptir_singleton_probe", 0x10);
+    let grouped = emit_grouped_readiness("ptir_grouped_readiness_probe");
+
+    let files = inputs.live_files();
+    assert_eq!(
+        files.len(),
+        2,
+        "compiler/codegen/runtime/metal/ holds two device files; a new one needs \
+         a home in this assertion and, once it moves, in golden-msl/oracle-inputs/"
+    );
+    for (name, text) in files {
+        let hosts = [&singleton, &grouped];
+        assert!(
+            hosts.iter().any(|host| host.contains(&text)),
+            "{name} is include_str!d into the emitters but no emitted kernel \
+             contains it verbatim, so the oracle-era rewrite cannot stand in \
+             for it"
+        );
+    }
+}
+
+/// A copy that no longer differs from its live file stands in for nothing.
+#[test]
+fn oracle_inputs_are_live_files_that_moved() {
+    oracle_inputs().assert_entries_are_live_files_that_moved();
 }
 
 fn effect_from_flags(flags: u32, capacity: u32) -> M1ChannelEffect {

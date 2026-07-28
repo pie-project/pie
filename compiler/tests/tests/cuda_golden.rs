@@ -12,6 +12,8 @@
 //! (`emit_fused_region_cuda_verbatim`) so a failure can be read, not just
 //! detected.
 
+#[path = "common/device_text.rs"]
+mod device_text;
 #[path = "common/msl_corpus.rs"]
 mod msl_corpus;
 #[path = "common/provenance.rs"]
@@ -25,10 +27,21 @@ use pie_codegen::cuda::{
     second_party_region_supported, singleton_runtime_source, validate_generated_region,
 };
 
+use device_text::OracleInputs;
 use msl_corpus::{corpus_bound, corpus_stages, region_shape};
 
 fn golden_cuda_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("golden-cuda")
+}
+
+/// The live CUDA device source and the oracle-era copy of whichever part of it
+/// has moved since the dump was taken. See `common/device_text.rs`.
+fn oracle_inputs() -> OracleInputs {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    OracleInputs::load(
+        manifest.join("../codegen/runtime/cuda"),
+        golden_cuda_dir().join("oracle-inputs"),
+    )
 }
 
 fn fnv1a64(text: &str) -> u64 {
@@ -44,14 +57,17 @@ struct Dump {
     emitter: &'static str,
     body: String,
     runtime: String,
+    inputs: OracleInputs,
 }
 
 impl Dump {
     fn new(emitter: &'static str) -> Self {
+        let inputs = oracle_inputs();
         Self {
             emitter,
             body: String::new(),
-            runtime: singleton_runtime_source(),
+            runtime: inputs.rewrite(&singleton_runtime_source()),
+            inputs,
         }
     }
 
@@ -93,7 +109,8 @@ impl Dump {
             self.end();
             return;
         };
-        let (prefix, tail) = self.split(source);
+        let source = self.inputs.rewrite(source);
+        let (prefix, tail) = self.split(&source);
         let _ = writeln!(
             self.body,
             "source: bytes={} prefix={prefix} tail_bytes={}",
@@ -117,7 +134,8 @@ impl Dump {
         );
         let _ = writeln!(self.body, "entry_name: {entry_name}");
         if let Ok(source) = emitted {
-            let (prefix, tail) = self.split(source);
+            let source = self.inputs.rewrite(source);
+            let (prefix, tail) = self.split(&source);
             let _ = writeln!(
                 self.body,
                 "source: bytes={} prefix={prefix} tail_bytes={} fnv1a64=0x{:016x}",
@@ -149,6 +167,7 @@ fn compare(dump: &Dump) {
         return;
     }
     let mut case = String::from("<before the first case>");
+    let hint = dump.inputs.hint();
     for (index, (mine, theirs)) in dump.body.lines().zip(expected.lines()).enumerate() {
         if let Some(id) = theirs.strip_prefix("=== ") {
             case = id.to_string();
@@ -156,7 +175,7 @@ fn compare(dump: &Dump) {
         assert_eq!(
             mine,
             theirs,
-            "{} diverged from the C++ oracle at line {} (case `{case}`)",
+            "{} diverged from the C++ oracle at line {} (case `{case}`)\n{hint}",
             dump.emitter,
             index + 1
         );
@@ -174,12 +193,59 @@ fn compare(dump: &Dump) {
 #[test]
 fn runtime_matches_oracle() {
     let mut dump = Dump::new("singleton_runtime_cuda_source");
-    let runtime = singleton_runtime_source();
+    let runtime = dump.runtime.clone();
     dump.open_case("runtime");
     dump.field("bytes", &runtime.len().to_string());
     dump.field("fnv1a64", &format!("0x{:016x}", fnv1a64(&runtime)));
     dump.end();
     compare(&dump);
+}
+
+/// What makes the oracle-era rewrite safe: the emitter splices each device file
+/// in whole and verbatim, so putting the oracle-era text back can only ever
+/// restore bytes the kernel side owns. An emitter that started editing, folding
+/// or regenerating one of these blocks would fail here first, and the rewrite
+/// would stop firing for it rather than quietly cover the change up.
+#[test]
+fn every_live_device_file_is_spliced_into_a_kernel_verbatim() {
+    let inputs = oracle_inputs();
+    let runtime = singleton_runtime_source();
+    let singleton = emit_singleton_region("ptir_singleton_probe", 0x10)
+        .expect("the singleton emitter accepts op tag 0x10");
+    let stages = corpus_stages();
+    let fused =
+        stages
+            .iter()
+            .flat_map(|stage| {
+                stage.plan.fused.regions.iter().map(move |region| {
+                    emit_fused_region("ptir_fused_probe_r0", &stage.plan, region)
+                })
+            })
+            .find_map(Result::ok)
+            .expect("at least one corpus region emits a fused CUDA kernel");
+
+    let files = inputs.live_files();
+    assert_eq!(
+        files.len(),
+        6,
+        "compiler/codegen/runtime/cuda/ holds six device files; a new one needs \
+         a home in this assertion and, once it moves, in golden-cuda/oracle-inputs/"
+    );
+    for (name, text) in files {
+        let hosts = [&runtime, &singleton, &fused];
+        assert!(
+            hosts.iter().any(|host| host.contains(&text)),
+            "{name} is include_str!d into the emitters but no emitted kernel \
+             contains it verbatim, so the oracle-era rewrite cannot stand in \
+             for it"
+        );
+    }
+}
+
+/// A copy that no longer differs from its live file stands in for nothing.
+#[test]
+fn oracle_inputs_are_live_files_that_moved() {
+    oracle_inputs().assert_entries_are_live_files_that_moved();
 }
 
 /// Entry names the emitters must accept or reject on their own terms.

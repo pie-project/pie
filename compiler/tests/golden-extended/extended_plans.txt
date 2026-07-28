@@ -9,6 +9,12 @@
 #
 # A mismatch here is a question, not a verdict: decide whether the new output is
 # right, then re-pin with `PTIR_REGEN=1 cargo test -p pie-compiler-tests`.
+#
+# Where a kernel is digested, `bytes` and the hash cover what the *compiler*
+# generated: the hand-written device text under `compiler/codegen/runtime/` is
+# dropped first, so tuning a kernel does not re-pin every case. That the
+# emitters still splice those blocks in whole is
+# `every_live_device_file_is_spliced_into_a_kernel_verbatim`.
 === extended_unary#0
 stage_tag: 0x03
 signature: 73b900a6023e5811
