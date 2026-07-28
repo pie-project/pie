@@ -419,6 +419,8 @@ enum NucleusMutation {
     PartialArgmax,
     WrongSumOperand,
     EscapedIntermediate,
+    ForeignMaximum,
+    DeadResult,
 }
 
 /// The id defined by the one canonical step matching `want`.
@@ -469,6 +471,13 @@ fn nucleus_program(mutation: NucleusMutation) -> BoundTrace {
         Op::ChanRead(1), // top-p
         Op::ChanTake(2), // logits
     ];
+    // A second logits channel, so `ForeignMaximum` has somewhere else of the
+    // right shape to reduce over.
+    let decoy = expand::next_id(&ops);
+    if matches!(mutation, M::ForeignMaximum) {
+        channels.push(channel(shape, DType::F32, HostRole::None, true));
+        ops.push(Op::ChanTake(4));
+    }
     let token = expand::nucleus_sample(&mut ops, 2, 1, 0, shape);
 
     // Each targeted op kind occurs exactly once in the chain, so naming the
@@ -497,15 +506,29 @@ fn nucleus_program(mutation: NucleusMutation) -> BoundTrace {
             (M::PartialArgmax, Op::ReduceArgmax(input)) => *input = masked,
             // Normalize by the sum of the centered logits, not their exp.
             (M::WrongSumOperand, Op::ReduceSum(input)) => *input = centered,
+            // Centre against a maximum taken over different logits.
+            (M::ForeignMaximum, Op::ReduceMax(input)) => *input = decoy,
             // `Exact` breaks nothing; `EscapedIntermediate` adds a reader
             // below rather than editing a step.
             _ => {}
         }
     }
-    ops.push(Op::ChanPut {
-        chan: 3,
-        value: token,
-    });
+    if matches!(mutation, M::DeadResult) {
+        // Chan 3 gets a token-shaped value from somewhere else, so the sampled
+        // token is read by nothing.
+        channels.push(channel(Shape::vector(2), DType::I32, HostRole::None, true));
+        let substitute = expand::next_id(&ops);
+        ops.push(Op::ChanRead(4));
+        ops.push(Op::ChanPut {
+            chan: 3,
+            value: substitute,
+        });
+    } else {
+        ops.push(Op::ChanPut {
+            chan: 3,
+            value: token,
+        });
+    }
     if matches!(mutation, M::EscapedIntermediate) {
         channels.push(channel(shape, DType::F32, HostRole::Reader, false));
         ops.push(Op::ChanPut {
@@ -847,6 +870,7 @@ fn nucleus_lookalikes_remain_generic() {
         NucleusMutation::PartialArgmax,
         NucleusMutation::WrongSumOperand,
         NucleusMutation::EscapedIntermediate,
+        NucleusMutation::ForeignMaximum,
     ] {
         let near = compile_stage(&nucleus_program(mutation), Stage::Epilogue).unwrap();
         assert_ne!(near.signature, exact.signature);
@@ -1069,4 +1093,33 @@ fn lane_layout_is_stable() {
     assert_eq!(core::mem::size_of::<LaneTableHeader>(), 16);
     assert_eq!(core::mem::size_of::<LaneRecord>(), 96);
     assert_eq!(core::mem::size_of::<LaneChannelSlot>(), 32);
+}
+
+/// Why the "the result has to escape" check in `region::chain_is_exclusive`
+/// is silent.
+///
+/// A nucleus chain whose token nothing reads is pure and unread, so
+/// normalization deletes it and the matcher never sees it. In SSA every
+/// consumer of the argmax comes after it, so no chain node can be one, and
+/// "every consumer is inside the chain" therefore means "there are none" --
+/// exactly the case DCE has already removed. The check stays as the matcher's
+/// own statement of what it is for; this is the fact that keeps it honest,
+/// and it fails if DCE ever stops running first.
+#[test]
+fn a_sampler_nobody_reads_is_deleted_before_it_is_matched() {
+    let compiled = compile_stage(
+        &nucleus_program(NucleusMutation::DeadResult),
+        Stage::Epilogue,
+    )
+    .unwrap();
+    assert!(
+        !compiled
+            .normalized
+            .ops
+            .iter()
+            .any(|op| matches!(op, Op::ReduceArgmax(_) | Op::PivotThreshold { .. })),
+        "the dead chain survived normalization, so the escape check is now \
+         reachable and needs a mutation that reaches it: {:?}",
+        compiled.normalized.ops
+    );
 }
