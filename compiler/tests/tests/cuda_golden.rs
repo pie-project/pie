@@ -14,6 +14,8 @@
 
 #[path = "common/msl_corpus.rs"]
 mod msl_corpus;
+#[path = "common/provenance.rs"]
+mod provenance;
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -140,7 +142,7 @@ fn compare(dump: &Dump) {
     let expected = &oracle[header.len()..];
 
     if std::env::var("PTIR_REGEN").is_ok() {
-        std::fs::write(&path, header.clone() + &dump.body).unwrap();
+        provenance::regenerate_foreign(&path, &header, &dump.body);
         return;
     }
     if expected == dump.body {
@@ -390,9 +392,9 @@ fn emit_program_metal_covers_every_family() {
 /// `PTIR_REGEN=1` only after re-deriving it the same way.
 #[test]
 fn stage_identity_matches_the_driver() {
+    let header = "# GENERATED from driver/cuda/src/pipeline/program_identity.hpp\n\
+                  # <golden>#<stage_index> <compiled_stage_identity as hex>\n";
     let mut rendered = String::new();
-    rendered.push_str("# GENERATED from driver/cuda/src/pipeline/program_identity.hpp\n");
-    rendered.push_str("# <golden>#<stage_index> <compiled_stage_identity as hex>\n");
     for stage in corpus_stages() {
         let _ = writeln!(
             rendered,
@@ -403,10 +405,15 @@ fn stage_identity_matches_the_driver() {
     }
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("golden-stage-identity.txt");
     if std::env::var("PTIR_REGEN").is_ok() {
-        std::fs::write(&path, &rendered).unwrap();
+        provenance::regenerate_foreign(&path, header, &rendered);
         return;
     }
-    let expected = std::fs::read_to_string(&path).expect("golden-stage-identity.txt");
+    let file = std::fs::read_to_string(&path).expect("golden-stage-identity.txt");
+    let expected: String = file
+        .lines()
+        .skip_while(|line| line.starts_with('#'))
+        .map(|line| format!("{line}\n"))
+        .collect();
     assert_eq!(
         rendered, expected,
         "pie_plan::stage_identity has diverged from the CUDA driver's \

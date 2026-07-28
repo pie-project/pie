@@ -32,6 +32,8 @@
 
 #[path = "common/msl_corpus.rs"]
 mod msl_corpus;
+#[path = "common/provenance.rs"]
+mod provenance;
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -273,7 +275,7 @@ fn compare(dump: &Dump) {
     let expected = &oracle[header.len()..];
 
     if std::env::var("PTIR_REGEN").is_ok() {
-        std::fs::write(&path, header.clone() + &dump.body).unwrap();
+        provenance::regenerate_foreign(&path, &header, &dump.body);
         return;
     }
     if expected == dump.body {
