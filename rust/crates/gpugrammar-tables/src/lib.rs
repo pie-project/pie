@@ -199,10 +199,27 @@ impl Artifact {
 /// identical set already stored.
 ///
 /// The three forms cost `tokens`, `vocabulary - tokens`, and
-/// `vocabulary / 32` words respectively, so the choice is arithmetic. Sharing
-/// matters as much as the choice: the set a state admits changes far less often
-/// than the state does, and the same set arrives from two to twenty-seven
-/// different places.
+/// `vocabulary / 32` words respectively, so the choice is *nearly* arithmetic.
+/// Sharing matters as much as the choice: the set a state admits changes far
+/// less often than the state does, and the same set arrives from two to
+/// twenty-seven different places.
+///
+/// The exception is the complement, and it is the reason for the factor of two
+/// below. A sparse set and a bitset are both written into the mask by a
+/// vectorised OR, but a complement is written by walking its exclusions one at
+/// a time - the walk is a chain of dependent loads and cannot be vectorised,
+/// because each exclusion clears a different bit. So a complement costs time
+/// linear in its own length where the other two cost time linear in the mask,
+/// and taking it purely on size picks it whenever it is one word smaller.
+///
+/// That is exactly what happened: a group excluding 4,693 of 151,669 tokens
+/// was stored as a complement because 4,693 is less than the bitset's 4,740
+/// words. It saved 47 words - a tenth of a percent - and cost 500 us of serial
+/// walking in every mask fill, which at batch 1 was 93% of the whole step.
+/// Requiring a complement to be at most half the bitset costs 0.5% more
+/// resident memory and makes the fill three times faster below batch 128;
+/// requiring an eighth or a thirty-second costs more memory and buys nothing
+/// further, so this is the knee rather than a guess.
 pub fn store_set(
     tokens: &[u32],
     vocab_size: usize,
@@ -216,7 +233,7 @@ pub fn store_set(
         let mut ordered = tokens.to_vec();
         ordered.sort_unstable();
         (SetKind::Sparse, ordered)
-    } else if complement <= bitset_words {
+    } else if complement * 2 <= bitset_words {
         let mut present = vec![false; vocab_size];
         for token in tokens {
             present[*token as usize] = true;
