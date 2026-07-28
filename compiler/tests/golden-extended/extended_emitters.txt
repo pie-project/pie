@@ -415,3 +415,73 @@ cuda_validate: ok=true error=
 cuda_second_party: false
 metal_fused: err Metal binds only the logits buffer for intrinsics; intrinsic id 5 has no binding
 metal_grouped: err Metal binds only the logits buffer for intrinsics; intrinsic id 5 has no binding
+=== extended_metal_identity#0 singleton#0
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+cuda_fused: ok bytes=87547 fnv1a64=0xea6956e2a411be82
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=40520 fnv1a64=0x86459e904f287264
+metal_grouped: ok bytes=43832 fnv1a64=0xbf031097d63aca86
+=== extended_metal_identity#0 singleton#1
+region: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=1 sinks=0
+cuda_fused: err fused CUDA emitter requires a non-library generated region
+cuda_validate: ok=false error=fused CUDA emitter requires a non-library generated region
+cuda_second_party: false
+metal_fused: ok bytes=40531 fnv1a64=0xd225da2e02d671a2
+metal_grouped: ok bytes=43843 fnv1a64=0x8de942500b06104c
+=== extended_metal_identity#0 singleton#2
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+cuda_fused: ok bytes=89087 fnv1a64=0x0bde2905327ebaa5
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=40545 fnv1a64=0x9c4915098dae21bd
+metal_grouped: ok bytes=43987 fnv1a64=0x278e4545119a0027
+=== extended_metal_identity#0 fused#0
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+cuda_fused: ok bytes=87547 fnv1a64=0xea6956e2a411be82
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=40520 fnv1a64=0x86459e904f287264
+metal_grouped: ok bytes=43832 fnv1a64=0xbf031097d63aca86
+=== extended_metal_identity#0 fused#1
+region: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=1 sinks=0
+cuda_fused: err fused CUDA emitter requires a non-library generated region
+cuda_validate: ok=false error=fused CUDA emitter requires a non-library generated region
+cuda_second_party: false
+metal_fused: ok bytes=40531 fnv1a64=0xd225da2e02d671a2
+metal_grouped: ok bytes=43843 fnv1a64=0x8de942500b06104c
+=== extended_metal_identity#0 fused#2
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+cuda_fused: ok bytes=89087 fnv1a64=0x0bde2905327ebaa5
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=40545 fnv1a64=0x9c4915098dae21bd
+metal_grouped: ok bytes=43987 fnv1a64=0x278e4545119a0027
+=== extended_metal_discard#0 singleton#0
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+cuda_fused: ok bytes=87547 fnv1a64=0xccda63ce404b5510
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=40378 fnv1a64=0xfeeaf2da619ee46f
+metal_grouped: ok bytes=43357 fnv1a64=0x5e5eab40f9831265
+=== extended_metal_discard#0 singleton#1
+region: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=0 sinks=0
+cuda_fused: err fused CUDA emitter requires a non-library generated region
+cuda_validate: ok=false error=fused CUDA emitter requires a non-library generated region
+cuda_second_party: false
+metal_fused: ok bytes=40376 fnv1a64=0xbaeaa3a46b4a0f08
+metal_grouped: ok bytes=43355 fnv1a64=0x45fee7dd7451c752
+=== extended_metal_discard#0 fused#0
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+cuda_fused: ok bytes=87547 fnv1a64=0xccda63ce404b5510
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=40378 fnv1a64=0xfeeaf2da619ee46f
+metal_grouped: ok bytes=43357 fnv1a64=0x5e5eab40f9831265
+=== extended_metal_discard#0 fused#1
+region: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=0 sinks=0
+cuda_fused: err fused CUDA emitter requires a non-library generated region
+cuda_validate: ok=false error=fused CUDA emitter requires a non-library generated region
+cuda_second_party: false
+metal_fused: ok bytes=40376 fnv1a64=0xbaeaa3a46b4a0f08
+metal_grouped: ok bytes=43355 fnv1a64=0x45fee7dd7451c752

@@ -344,6 +344,18 @@ pub fn extended_traces() -> Vec<(&'static str, TraceContainer, ModelProfile)> {
     small.vocab = 8;
     let mut attn = small.clone();
     attn.has_attn_score = true;
+    let mut identity_kernel = small.clone();
+    identity_kernel.kernels.push(KernelInfo {
+        name: "metal.identity".into(),
+        sink_scope: None,
+        replayable: true,
+    });
+    let mut discard_sink = small.clone();
+    discard_sink.kernels.push(KernelInfo {
+        name: "metal.discard".into(),
+        sink_scope: Some(SinkScope::PassWide),
+        replayable: true,
+    });
 
     let f32v =
         |n: u32, role: HostRole, seeded: bool| chan(Shape::vector(n), DType::F32, role, seeded);
@@ -540,6 +552,58 @@ pub fn extended_traces() -> Vec<(&'static str, TraceContainer, ModelProfile)> {
                 ],
             ),
             attn,
+        ),
+        (
+            // `validate_singleton_plan` accepts exactly one kernel_call --
+            // `metal.identity`, whose one argument has the result's type -- and
+            // exactly one sink_call, `metal.discard`. Both are magic strings
+            // matched against the container's name table and spelled in one
+            // place each; nothing else in the corpus carries a name that
+            // reaches an *accepted* plan, so both accept arms were unreached
+            // and the name lookup behind them untested.
+            "extended_metal_identity",
+            TraceContainer {
+                names: vec!["metal.identity".into()],
+                channels: vec![read(4), write(4)],
+                ports: Vec::new(),
+                stages: vec![StageProgram {
+                    stage: Stage::Epilogue,
+                    ops: vec![
+                        Op::ChanRead(0),
+                        Op::KernelCall {
+                            name: 0,
+                            args: vec![0],
+                            shape: Shape::vector(4),
+                            dtype: DType::F32,
+                        },
+                        Op::ChanPut { chan: 1, value: 1 },
+                    ],
+                }],
+                externs: Vec::new(),
+            },
+            identity_kernel,
+        ),
+        (
+            "extended_metal_discard",
+            TraceContainer {
+                names: vec!["metal.discard".into()],
+                channels: vec![read(4)],
+                ports: Vec::new(),
+                stages: vec![StageProgram {
+                    // Prologue: a PassWide sink's effect is consumed for the
+                    // whole pass, which is where bind will take one.
+                    stage: Stage::Prologue,
+                    ops: vec![
+                        Op::ChanRead(0),
+                        Op::SinkCall {
+                            name: 0,
+                            args: vec![0],
+                        },
+                    ],
+                }],
+                externs: Vec::new(),
+            },
+            discard_sink,
         ),
     ]
 }

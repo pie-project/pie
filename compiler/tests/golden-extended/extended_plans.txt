@@ -56,3 +56,16 @@ stage_tag: 0x02
 signature: f295aab2cb6146e8
 wire: bytes=416 fnv1a64=0xbf4a8b153a4570e7
 fused#0: library=0 library_op=0 schedule=1 nodes=4 inputs=0 outputs=0 sinks=2
+=== extended_metal_identity#0
+stage_tag: 0x03
+signature: aa86c48194c2c4d0
+wire: bytes=454 fnv1a64=0x3e040736576e661b
+fused#0: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+fused#1: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=1 sinks=0
+fused#2: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+=== extended_metal_discard#0
+stage_tag: 0x00
+signature: 3dfafd36e271f128
+wire: bytes=298 fnv1a64=0x3770feb5a29b2d1b
+fused#0: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+fused#1: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=0 sinks=0
