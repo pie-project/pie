@@ -1869,6 +1869,20 @@ void CUDART_CB notify_runtime_callback(void* userdata) {
             entry.commit_host != nullptr && entry.commit_host[1] != 0;
         const bool failed = entry.poison || killed;
         const bool retry = !failed && !committed;
+        if (failed) {
+            // A FAILED lane poisons its channels, and the guest sees only
+            // "channel is poisoned" — which of the two causes it was is
+            // otherwise unrecoverable from the outside. Bounded, and only
+            // on a path that is already fatal for the fire.
+            static std::atomic<int> failed_reports{0};
+            if (failed_reports.fetch_add(1, std::memory_order_relaxed) < 16) {
+                std::fprintf(stderr,
+                             "[pie-driver-cuda] lane FAILED: poison=%d "
+                             "compose_kill=%d committed=%d\n",
+                             entry.poison ? 1 : 0, killed ? 1 : 0,
+                             committed ? 1 : 0);
+            }
+        }
         if (retry && ctx->fire_timing_enabled) {
             // Bounded diagnostic: dump the retried lane's endpoint state so
             // an uncommitted pass names the gate that refused it (ring

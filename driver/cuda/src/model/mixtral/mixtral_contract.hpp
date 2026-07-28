@@ -207,15 +207,30 @@ inline void gpt_oss_mxfp4_groups(ContractBuilder& b) {
         if (native) {
             gpt_oss_native_group(b, block, *scale, *bias, base);
         } else {
-            b.push_direct(block, base + ".weight", std::nullopt);
-            auto scales = b.push_direct(*scale, base + ".weight_scale", std::nullopt);
+            // Routed-decode at tp>1: shard on the expert INTERMEDIATE axis.
+            // gate_up is interleaved [g0,u0,g1,u1,...] on axis 1, so a
+            // contiguous slice keeps every (gate,up) pair together and the
+            // local layout stays interleaved — blocks and scales band the
+            // same axis. down_proj's intermediate axis is its packed-K axis
+            // (2); its bias is the row-parallel OUTPUT bias, which stays
+            // replicated (the forward adds it on the TP leader only, after
+            // the all-reduce).
+            const bool is_down =
+                base.size() >= 9 &&
+                base.compare(base.size() - 9, 9, "down_proj") == 0;
+            const ShardAxis weight_axis =
+                is_down ? ShardAxis{std::uint8_t{2}} : ShardAxis{std::uint8_t{1}};
+            const ShardAxis bias_axis =
+                is_down ? ShardAxis{std::nullopt} : ShardAxis{std::uint8_t{1}};
+            b.push_direct(block, base + ".weight", weight_axis);
+            auto scales = b.push_direct(*scale, base + ".weight_scale", weight_axis);
             // The routed-dequant path reads these bytes through
             // `engine.quant_meta(...)->scale`, exactly as the native path does,
             // so it needs the same pairing stated. Publishing the scale as a
             // plain tensor leaves `quant_meta` empty and the bind fails with
             // "packed MXFP4 expert tensors are missing quant metadata".
             state_mxfp4_block_scales(scales, base + ".weight");
-            b.push_direct(*bias, base + ".bias", std::nullopt);
+            b.push_direct(*bias, base + ".bias", bias_axis);
         }
         b.consume(block.id);
         b.consume(scale->id);

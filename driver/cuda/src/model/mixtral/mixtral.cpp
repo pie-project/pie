@@ -141,7 +141,8 @@ void mixtral_forward_paged(
     const std::int32_t* logit_row_indices_d,
     int num_logit_rows,
     const std::uint8_t* custom_mask_d,
-    const std::int32_t* custom_mask_indptr_d)
+    const std::int32_t* custom_mask_indptr_d,
+    const std::uint8_t* row_valid_d)
 {
     // TP-local dims. tp_size == 1 keeps the original single-GPU shapes.
     // For Mixtral we shard *within* each expert (per-expert TP), not
@@ -265,7 +266,7 @@ void mixtral_forward_paged(
         kernels::launch_write_kv_to_pages(
             kv_view, ws.k.data(), ws.v.data(),
             qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            N, R, stream);
+            N, R, stream, row_valid_d);
 
         // Only ask flashinfer for lse on layers that actually use sinks.
         // Saves a per-layer kernel write on plain Mixtral, and on

@@ -143,6 +143,11 @@ void mixtral_forward_paged(
     const std::int32_t* logit_row_indices_d = nullptr,
     int num_logit_rows = 0,
     const std::uint8_t* custom_mask_d = nullptr,
-    const std::int32_t* custom_mask_indptr_d = nullptr);
+    const std::int32_t* custom_mask_indptr_d = nullptr,
+    // Row-validity mask for composed frames: dummy-run rows must not write
+    // KV (their page indices point at the shared dummy page — page 0 —
+    // which real requests own). Gating the write here is what makes
+    // page-zero-as-dummy safe for this family.
+    const std::uint8_t* row_valid_d = nullptr);
 
 }  // namespace pie_cuda_driver::model

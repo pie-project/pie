@@ -1045,13 +1045,21 @@ int Context::Impl::load_model(
          family == model::Family::NemotronH ||
          family == model::Family::Kimi ||
          family == model::Family::Glm5 ||
-         family == model::Family::DeepSeekV4);
-    const int physical_kv_pages =
-        runtime_kv_pages +
-        (runtime_kv_pages > 0 && !page_zero_dummy_safe ? 1 : 0);
-    const int graph_pad_page = runtime_kv_pages > 0
-        ? (page_zero_dummy_safe ? 0 : runtime_kv_pages)
-        : -1;
+         family == model::Family::DeepSeekV4 ||
+         // Mixtral/GPT-OSS: the paged KV write is row_valid-gated (see
+         // mixtral_forward_paged), so dummy-run rows never write into
+         // page 0 and it can serve as the shared dummy page.
+         family == model::Family::Mixtral);
+    // Families outside the dummy-safe list never run graph-padded decode
+    // (graph_safe requires native-bf16 KV plus a family that IS in the
+    // list), so they need no pad page at all. The old fallback appended
+    // the pad at the END of the pool, and `required_kv_pages` folding
+    // `graph_pad_page + 1` into every fire then demanded the ENTIRE pool
+    // committed per launch — GPT-OSS's first fire asked for 58 GB of KV
+    // for a 2-request probe and was rejected as impossible.
+    const int physical_kv_pages = runtime_kv_pages;
+    const int graph_pad_page =
+        runtime_kv_pages > 0 && page_zero_dummy_safe ? 0 : -1;
     const bool has_recurrent_state_cache =
         (family == model::Family::Qwen3_5 ||
          family == model::Family::Qwen3_5Moe) &&
