@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 
 use crate::checkpoint::CheckpointMetadata;
 use crate::checkpoint::gguf::parse_gguf_checkpoint;
-use crate::checkpoint::header::parse_safetensors_checkpoint;
+use crate::checkpoint::safetensors::parse_safetensors_checkpoint;
 use crate::error::Error;
 
 /// Discover the safetensors shard files for a snapshot directory, matching the

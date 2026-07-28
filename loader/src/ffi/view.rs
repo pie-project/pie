@@ -112,6 +112,8 @@ pub(super) unsafe fn plan_view(
                 reads.push(crate::verify::ReadView {
                     instr: instr.id,
                     file_id: source.file_id,
+                    file_offset: source.file_offset,
+                    span_bytes: source.span_bytes,
                 });
             }
             PieLoaderStorageOp::TileMap {
@@ -121,13 +123,22 @@ pub(super) unsafe fn plan_view(
                     reads.push(crate::verify::ReadView {
                         instr: instr.id,
                         file_id: source.file_id,
+                        file_offset: source.file_offset,
+                        span_bytes: source.span_bytes,
                     });
                 }
             }
-            PieLoaderStorageOp::SlabScatter { file_id, .. } => {
+            PieLoaderStorageOp::SlabScatter {
+                file_id,
+                file_offset,
+                span_bytes,
+                ..
+            } => {
                 reads.push(crate::verify::ReadView {
                     instr: instr.id,
                     file_id: *file_id,
+                    file_offset: *file_offset,
+                    span_bytes: *span_bytes,
                 });
             }
             // Named rather than left to a wildcard: `verify` decides a file is

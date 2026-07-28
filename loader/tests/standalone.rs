@@ -159,7 +159,6 @@ fn a_plan_compiles_from_a_value_with_no_checkpoint_anywhere() {
         }],
     };
     let contract = ModelContract {
-        abi_version: 1,
         alignment: 256,
         tensors: vec![TensorContract::new(
             "w",

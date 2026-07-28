@@ -5,12 +5,12 @@
 //! can express, and the validators exist for exactly those.
 
 use super::rewrite::try_merge_bulk_extent_write;
-use super::validate::{validate_persistent_layout, validate_target_support};
+use super::validate::{validate_fill_order, validate_persistent_layout, validate_target_support};
 use crate::extent::Extent;
 use crate::types::DType;
 use crate::plan::{
-    BufferDecl, DestExtent, LoadPlan, SourceExtent, StorageInstr, StorageTarget, TileMapKind,
-    TileSpec, TransformSpec,
+    BufferDecl, DestExtent, LoadPlan, SlabPlacement, SourceExtent, StorageInstr, StorageTarget,
+    TileMapKind, TileSpec, TransformSpec,
 };
 use crate::types::{BackendKind, BufferId, FileId, InstrId, TensorId};
 
@@ -126,4 +126,95 @@ fn target_transform_matrix_matches_host_and_metal_executors() {
     });
     metal.instrs.push(tile(TileMapKind::Cast));
     assert!(validate_target_support(&mut metal).is_err());
+}
+
+/// Two persistent buffers, so that an arena-relative write has to be matched to
+/// the one it actually lands in.
+///
+/// `A` owns `[0, 256)` and `B` owns `[256, 512)`. The instruction table is
+/// fixed and dense — fill `A`, fill `B`, then the write — and only the
+/// *schedule* varies, which is the thing the invariant is about.
+fn fill_order_plan(write: StorageInstr, schedule: &[u32]) -> LoadPlan {
+    let mut plan = program_with(vec![
+        operand(0, 256, 1, Some(0)),
+        operand(1, 256, 1, Some(256)),
+    ]);
+    plan.instrs = vec![
+        StorageInstr::Fill {
+            id: InstrId(0),
+            buffer: BufferId(0),
+        },
+        StorageInstr::Fill {
+            id: InstrId(1),
+            buffer: BufferId(1),
+        },
+        write,
+    ];
+    plan.schedule = schedule.iter().map(|id| InstrId(*id)).collect();
+    plan
+}
+
+/// A bulk write into `B`'s arena window, as the slab/coalesce passes emit it.
+fn bulk_into_b() -> StorageInstr {
+    StorageInstr::BulkExtentWrite {
+        id: InstrId(2),
+        source: SourceExtent {
+            file_id: FileId(0),
+            tensor_id: TensorId(0),
+            file_offset: 0,
+            span_bytes: 256,
+            stride: Extent::byte_run(256),
+        },
+        dest_offset: 256,
+    }
+}
+
+/// The write lands in `B`, and `B` is zeroed after it — the fill would eat the
+/// bytes just copied.
+///
+/// This is the case the check used to decide by picking an arbitrary key out of
+/// a `HashMap`: with `A` zeroed first and `B` last, whichever of the two the
+/// iterator happened to yield decided the answer, so the pass caught this about
+/// half the time and was reproducible neither way.
+#[test]
+fn rejects_a_bulk_write_into_a_buffer_zeroed_after_it() {
+    let mut plan = fill_order_plan(bulk_into_b(), &[0, 2, 1]);
+    assert!(validate_fill_order(&mut plan).is_err());
+}
+
+/// The mirror: `A` is zeroed late, but the write goes to `B`, which was zeroed
+/// first. Nothing is wrong, and a check that matched by identity rather than by
+/// overlap would reject a correct plan.
+#[test]
+fn accepts_a_bulk_write_beside_a_buffer_zeroed_after_it() {
+    let mut plan = fill_order_plan(bulk_into_b(), &[1, 2, 0]);
+    assert!(validate_fill_order(&mut plan).is_ok());
+}
+
+/// A slab scatter is checked per placement, not per instruction: the write it
+/// performs is a set of windows, and only one of them needs to land in a
+/// late-zeroed buffer for the plan to be wrong.
+#[test]
+fn rejects_a_slab_placement_landing_in_a_buffer_zeroed_after_it() {
+    let scatter = StorageInstr::SlabScatter {
+        id: InstrId(2),
+        file_id: FileId(0),
+        file_offset: 0,
+        span_bytes: 512,
+        placements: vec![
+            SlabPlacement {
+                src_offset: 0,
+                dest_offset: 0,
+                bytes: 256,
+            },
+            SlabPlacement {
+                src_offset: 256,
+                dest_offset: 256,
+                bytes: 256,
+            },
+        ],
+    };
+    // `A` first, the scatter, then `B` — the second placement is the offender.
+    let mut plan = fill_order_plan(scatter, &[0, 2, 1]);
+    assert!(validate_fill_order(&mut plan).is_err());
 }

@@ -13,8 +13,8 @@
 
 use std::collections::HashMap;
 
-use super::Expr;
 use super::infer::Checked;
+use super::{Expr, resolve_reshape};
 use crate::error::{Error, OrOverflow};
 use crate::extent::{Dim, Rect};
 use crate::types::Encoding;
@@ -270,8 +270,11 @@ impl ByteScale {
     }
 
     fn offset(&self, elems: i64, what: &str) -> Result<u64, Error> {
-        u64::try_from(self.scaled(elems, what)?)
-            .map_err(|_| Error::Contract("negative byte offset".to_string()))
+        u64::try_from(self.scaled(elems, what)?).map_err(|_| {
+            Error::Internal(format!(
+                "{what} lowered to a negative byte offset from {elems} elements"
+            ))
+        })
     }
 
     fn extent(&self, elems: i64, what: &str) -> Result<u64, Error> {
@@ -619,18 +622,7 @@ impl Builder<'_> {
             }
             Expr::Reshape { src, shape } => {
                 let inner = self.build(src)?;
-                let elements = self.nodes[inner].elements;
-                let known: i64 = shape.iter().filter(|dim| **dim > 0).product();
-                let resolved = shape
-                    .iter()
-                    .map(|dim| {
-                        if *dim == -1 {
-                            elements / known.max(1)
-                        } else {
-                            *dim
-                        }
-                    })
-                    .collect();
+                let resolved = resolve_reshape(shape, self.nodes[inner].elements)?;
                 self.push(Kind::Reshape { src: inner }, resolved)
             }
             Expr::Pad {
@@ -1095,7 +1087,6 @@ mod tests {
     #[test]
     fn a_view_reads_from_the_contract_that_backs_it() {
         let contract = ModelContract {
-            abi_version: 1,
             alignment: 256,
             tensors: vec![
                 TensorContract::new(
@@ -1708,7 +1699,6 @@ mod tests {
         // check the one property that matters: a view of a bank reads exactly
         // the bank rows it names.
         let contract = ModelContract {
-            abi_version: 1,
             alignment: 256,
             tensors: vec![
                 TensorContract::new(

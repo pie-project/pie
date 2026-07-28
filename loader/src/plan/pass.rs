@@ -44,9 +44,10 @@ pub struct PassStats {
 
 /// Run the standard pipeline, in order, recording what each pass did.
 ///
-/// Only passes that fired are recorded, which keeps the report the same size it
-/// was under v1 while making the passes that never fire discoverable: run with
-/// every pass recorded and the dead ones are the ones missing from the list.
+/// Every pass is recorded, including the ones that rewrote nothing. Dropping
+/// the zeroes is what let v1's dead optimizer hide: a pass that never fires
+/// then looks exactly like a pass that is not in the pipeline, and telling
+/// those two apart is the whole reason the count is kept.
 pub fn run_all(plan: &mut LoadPlan) -> Result<Vec<PassStats>> {
     let mut stats = Vec::new();
     for pass in super::passes::all() {
@@ -60,9 +61,6 @@ pub fn run_all(plan: &mut LoadPlan) -> Result<Vec<PassStats>> {
                 started.elapsed().as_millis(),
                 plan.instrs.len()
             );
-        }
-        if rewrites == 0 {
-            continue;
         }
         stats.push(PassStats {
             pass: pass.name.to_string(),

@@ -38,13 +38,22 @@ pub struct PlanView<'a> {
     /// Names the instruction stream finalizes, in stream order. Duplicates are
     /// kept: finalizing the same name twice is one of the things being checked.
     pub finalized: Vec<&'a str>,
-    /// Every instruction that reads the checkpoint, and the file it reads.
+    /// Every instruction that reads the checkpoint, and the bytes it reads.
+    ///
+    /// The range is carried, not just the file, because the plan's *sources*
+    /// and the plan's *reads* are different claims. A source says which bytes a
+    /// tensor occupies; a read says which bytes an instruction will hand to the
+    /// executor, and the compiler derives the second from the first through
+    /// offsets it computes. Checking only sources leaves every derivation
+    /// unchecked.
     pub reads: Vec<ReadView>,
 }
 
 pub struct ReadView {
     pub instr: u32,
     pub file_id: u32,
+    pub file_offset: u64,
+    pub span_bytes: u64,
 }
 
 pub struct FileView<'a> {
@@ -354,12 +363,20 @@ fn check_files(plan: &PlanView<'_>, found: &mut Vec<Violation>) {
     }
 
     for read in &plan.reads {
-        if read.file_id as usize >= plan.files.len() {
+        let Some(file) = plan.files.get(read.file_id as usize) else {
             found.push(Violation::plan(format!(
                 "instruction {} reads from file {}, but the plan declares {} files",
                 read.instr,
                 read.file_id,
                 plan.files.len()
+            )));
+            continue;
+        };
+        let end = read.file_offset.saturating_add(read.span_bytes);
+        if end > file.size_bytes {
+            found.push(Violation::plan(format!(
+                "instruction {} reads bytes [{}, {end}) of {}, which is {} bytes long",
+                read.instr, read.file_offset, file.path, file.size_bytes
             )));
         }
     }
@@ -501,6 +518,48 @@ mod tests {
             tensor: BufferId(index),
             name: name.to_string(),
         }
+    }
+
+    #[test]
+    fn a_read_that_runs_past_the_end_of_its_file_is_a_violation() {
+        // The plan's *sources* and its *reads* are different claims, and only
+        // the second is what the executor is handed. A source declaring 8 legal
+        // bytes says nothing about an instruction that reads 4096 from the same
+        // file, and until `ReadView` carried the range nothing could.
+        use crate::plan::{CheckpointFileDecl, DestExtent, SourceExtent};
+        use crate::types::{CheckpointFormat, FileId};
+
+        let mut plan = plan_with(vec![decl("w")], vec![finalize(0, "w")]);
+        plan.files.push(CheckpointFileDecl {
+            id: FileId(0),
+            path: "model.safetensors".to_string(),
+            size_bytes: 8,
+            format: CheckpointFormat::Safetensors,
+        });
+        plan.instrs.push(StorageInstr::ExtentWrite {
+            id: InstrId(1),
+            source: SourceExtent {
+                file_id: FileId(0),
+                tensor_id: TensorId(0),
+                file_offset: 0,
+                span_bytes: 4096,
+                stride: crate::extent::Extent::byte_run(4096),
+            },
+            dest: DestExtent {
+                buffer: BufferId(0),
+                offset: 0,
+                stride: crate::extent::Extent::byte_run(4096),
+            },
+        });
+        plan.schedule.push(InstrId(1));
+
+        let violations = verify_marshalled(&plan, None).unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.message.contains("reads bytes [0, 4096)")),
+            "got: {violations:?}"
+        );
     }
 
     #[test]

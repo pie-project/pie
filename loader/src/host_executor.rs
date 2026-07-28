@@ -813,7 +813,6 @@ mod tests {
             }],
         };
         let contract = ModelContract {
-            abi_version: 1,
             alignment: 1,
             tensors: vec![TensorContract::new(
                 "padded",

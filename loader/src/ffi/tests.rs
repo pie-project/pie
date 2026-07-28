@@ -1104,7 +1104,6 @@ fn a_contract_naming_a_tensor_the_plan_does_not_deliver_is_a_violation() {
         let (status, message) = verify_against(
             plan,
             &ModelContract {
-                abi_version: 1,
                 alignment: 256,
                 tensors: Vec::new(),
             },
@@ -1280,7 +1279,6 @@ fn contract_request(
 fn minimal_contract() -> crate::contract::ModelContract {
     use crate::contract::{Expr, ModelContract, TensorContract};
     ModelContract {
-        abi_version: 1,
         alignment: 256,
         tensors: vec![TensorContract::inferred(
             "model.norm.weight",
@@ -1294,7 +1292,6 @@ fn minimal_contract() -> crate::contract::ModelContract {
 fn fused_contract() -> crate::contract::ModelContract {
     use crate::contract::{Expr, ModelContract, TensorContract};
     ModelContract {
-        abi_version: 1,
         alignment: 256,
         tensors: vec![TensorContract::new(
             "ab.weight",

@@ -7,7 +7,7 @@
 //! driver's business, not the compiler's.
 
 use crate::checkpoint::{CheckpointMetadata, RawTensor};
-use crate::contract::{Expr, ModelContract, TensorContract};
+use crate::contract::{Expr, ModelContract, TensorContract, local_range};
 use crate::error::{Error, OrOverflow};
 use crate::plan::StorageTarget;
 use crate::types::{Axis, Encoding};
@@ -65,7 +65,8 @@ pub fn coalesce_direct_row_shards(
         };
         let (_, local_rows) = local_range(
             raw.shape[0],
-            target,
+            target.tp_size,
+            target.tp_rank,
             &format!("the row count of '{}'", tensor.name),
         )?;
         if tensor.shape.as_deref() != Some(&[local_rows, raw.shape[1]][..]) {
@@ -175,8 +176,12 @@ fn emit_row_shard_bank(
     let rows = first_raw.shape[0];
     let cols = first_raw.shape[1];
     dense_element_bytes(first_raw, "direct row shard coalescing")?;
-    let (local_start, local_rows) =
-        local_range(rows, target, &format!("the row count of '{}'", first.name))?;
+    let (local_start, local_rows) = local_range(
+        rows,
+        target.tp_size,
+        target.tp_rank,
+        &format!("the row count of '{}'", first.name),
+    )?;
 
     // The bank is the local row band of every member, end to end. Stated as
     // an expression the offsets are the compiler's problem, not this pass's.
@@ -244,26 +249,6 @@ fn dense_element_bytes(raw: &RawTensor, context: &str) -> Result<u64, Error> {
             ))
         }),
     }
-}
-
-/// The `[start, len)` this rank owns of a `full`-long axis.
-///
-/// `what` names the thing being split, because this is the message a user gets
-/// for "tp_size does not divide this model". The driver used to pre-empt it with
-/// its own per-family table of divisibility rules read off `config.json` — the
-/// same fact checked twice, and only for the families someone had listed.
-fn local_range(full: i64, target: &StorageTarget, what: &str) -> Result<(i64, i64), Error> {
-    let world = i64::from(target.tp_size.max(1));
-    let rank = i64::from(target.tp_rank);
-    if full % world != 0 {
-        return Err(Error::Contract(format!(
-            "{what} is {full}, which tp_size {} does not divide; use a tp_size \
-             that divides it or run single-GPU",
-            target.tp_size
-        )));
-    }
-    let local = full / world;
-    Ok((rank * local, local))
 }
 
 fn checked_mul_i64(lhs: i64, rhs: u64, context: &str) -> Result<u64, Error> {

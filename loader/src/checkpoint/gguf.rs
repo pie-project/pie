@@ -357,9 +357,11 @@ pub fn parse_gguf_checkpoint(path: &Path) -> Result<CheckpointMetadata, Error> {
         }
     }
 
-    let mut pending: Vec<PendingTensor> = Vec::with_capacity(
-        usize::try_from(tensor_count).or_overflow("gguf: tensor count too large")?,
-    );
+    // No `with_capacity`: `tensor_count` is a number the file claims, read
+    // before any of the tensors it describes. Reserving on it lets a twelve-byte
+    // header ask for an allocation the process cannot refuse politely. The loop
+    // is bounded by the bytes actually present.
+    let mut pending: Vec<PendingTensor> = Vec::new();
     for _ in 0..tensor_count {
         let name = r.read_string("tensor name")?;
         let dim_count = r.read_u32("tensor dimension count")?;

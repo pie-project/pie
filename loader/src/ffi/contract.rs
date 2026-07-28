@@ -29,13 +29,15 @@
 //! the largest contract, borrowed for one call — and buys the property that a
 //! field the caller forgot is a zero, not garbage from another variant.
 
-use crate::contract::{Expr, ModelContract, TensorContract, TensorType};
+use crate::contract::{Expr, ModelContract, Scales, TensorContract, TensorType};
 use crate::ffi::types::{
-    PieLoaderBytes, PieLoaderDType, PieLoaderEncodingKind, PieLoaderI64Slice, PieLoaderQuantScheme,
-    PieLoaderRepackLayout, PieLoaderRowMap, PieLoaderSlice, PieLoaderU32Slice,
+    PieLoaderBytes, PieLoaderDType, PieLoaderEncodingKind, PieLoaderI64Slice,
+    PieLoaderQuantGranularity, PieLoaderQuantScheme, PieLoaderRepackLayout, PieLoaderRowMap,
+    PieLoaderScaleForm, PieLoaderSlice, PieLoaderU32Slice,
 };
 use crate::types::{
-    Axis, DType, Encoding, QuantScheme, QuantSpec, RepackLayout, RepackSpec, RowMap,
+    Axis, DType, Encoding, QuantGranularity, QuantScheme, QuantSpec, RepackLayout, RepackSpec,
+    RowMap, ScaleForm,
 };
 
 /// `PieLoaderExprNode::src` when the node has no single operand.
@@ -257,6 +259,35 @@ pub struct PieLoaderTensorContractView {
     /// optional, because it is not a prediction: the loader inserts whatever
     /// cast, decode or encode is needed to reach it.
     pub encoding: PieLoaderEncodingSpec,
+    /// Set when this entry holds the scales for another entry.
+    pub scales: PieLoaderScalesView,
+}
+
+/// What a scale tensor scales, said by the entry that declares the scales.
+///
+/// The loader used to work this pairing out by matching name suffixes —
+/// `{name}_scale_inv`, then `{base}.scale`, with the group size hardcoded to 128
+/// beside them. The driver had already found it properly and thrown it away:
+/// `dsv4_block_scales_to_fp32` takes a `.scale` tensor, looks up `<base>.weight`
+/// and publishes only if that companion is really FP8-E4M3. This is where that
+/// finding is kept.
+///
+/// Only for scales the *checkpoint* shipped. Scales the loader creates while
+/// quantizing are paired at creation, with no name involved.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PieLoaderScalesView {
+    /// Name of the tensor these scales belong to. Empty means this entry is
+    /// not a scale tensor and the rest of this struct is ignored.
+    ///
+    /// Unlike `Expr::Out` this may name a *later* declaration: it pairs two
+    /// published tensors rather than feeding one into the other.
+    pub of: PieLoaderBytes,
+    pub granularity: PieLoaderQuantGranularity,
+    /// Elements of `of` per scale entry, for `PerGroup`.
+    pub group_size: u32,
+    pub channel_axis: u32,
+    pub form: PieLoaderScaleForm,
 }
 
 pub type PieLoaderTensorContractSlice = PieLoaderSlice<PieLoaderTensorContractView>;
@@ -265,7 +296,6 @@ pub type PieLoaderTensorContractSlice = PieLoaderSlice<PieLoaderTensorContractVi
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PieLoaderModelContractView {
-    pub abi_version: u32,
     /// Byte alignment every materialized buffer must satisfy.
     pub alignment: u32,
     /// The node pool, shared by every tensor. Topologically sorted: a node may
@@ -361,6 +391,37 @@ fn read_type(
         shape: unsafe { slice_of(shape.ptr, shape.len) }.to_vec(),
         encoding: read_encoding(encoding, what)?,
     })
+}
+
+/// Read the scale pairing a declaration states, if it states one.
+///
+/// # Safety
+///
+/// `view.of` must be valid for the duration of the call.
+unsafe fn read_scales(view: &PieLoaderScalesView, what: &str) -> Result<Option<Scales>, String> {
+    if view.of.len == 0 {
+        return Ok(None);
+    }
+    let of = unsafe { text(&view.of, &format!("{what}.scales.of")) }?;
+    let granularity = match view.granularity {
+        PieLoaderQuantGranularity::PerChannel => QuantGranularity::PerChannel,
+        PieLoaderQuantGranularity::PerGroup => QuantGranularity::PerGroup,
+    };
+    if granularity == QuantGranularity::PerGroup && view.group_size == 0 {
+        return Err(format!(
+            "{what}.scales is PerGroup with group_size 0, which describes no grouping"
+        ));
+    }
+    Ok(Some(Scales {
+        of,
+        granularity,
+        group_size: view.group_size,
+        channel_axis: view.channel_axis,
+        form: match view.form {
+            PieLoaderScaleForm::RawE8M0 => ScaleForm::RawE8M0,
+            PieLoaderScaleForm::F32Factors => ScaleForm::F32Factors,
+        },
+    }))
 }
 
 /// Materialize one node, given the nodes already materialized.
@@ -476,16 +537,17 @@ pub unsafe fn read_contract(view: &PieLoaderModelContractView) -> Result<ModelCo
             .cloned()
             .ok_or_else(|| format!("{what}.root: {} is not a node", tensor.root))?;
         let shape = unsafe { slice_of(tensor.shape.ptr, tensor.shape.len) };
+        let scales = unsafe { read_scales(&tensor.scales, &what) }?;
         declared.push(TensorContract {
             name,
             expr,
             shape: (!shape.is_empty()).then(|| shape.to_vec()),
             encoding: read_encoding(&tensor.encoding, &what)?,
+            scales,
         });
     }
 
     Ok(ModelContract {
-        abi_version: view.abi_version,
         alignment: view.alignment,
         tensors: declared,
     })

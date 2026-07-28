@@ -1,5 +1,14 @@
-//! Memory accounting: recompute the plan's persistent / temporary /
-//! scratch peaks and its checkpoint-read and device-write totals.
+//! Memory accounting: recompute the plan's persistent / temporary / scratch
+//! peaks and its checkpoint-read and device-write totals.
+//!
+//! `live_peak` is a running total, not a liveness analysis: buffers enter the
+//! `live` set at `Allocate` and never leave, because the plan has no instruction
+//! that frees one and the executor frees nothing until its destructor
+//! (`load_plan_executor.hpp:57-61`). The peak and the sum are therefore the same
+//! number today, and this is written as a max so it stays right rather than
+//! because anything currently makes it fall. Adding a free — to the plan or to
+//! the executor — means removing from `live` here too, or the "peak" silently
+//! becomes an over-estimate.
 
 use std::collections::HashSet;
 

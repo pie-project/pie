@@ -59,11 +59,13 @@ using pie_loader::PieLoaderBackendKind;
 using pie_loader::PieLoaderDType;
 using pie_loader::PieLoaderEncodingKind;
 using pie_loader::PieLoaderEncodingSpec;
+using pie_loader::PieLoaderQuantGranularity;
 using pie_loader::PieLoaderQuantScheme;
 using pie_loader::PieLoaderQuantSpecView;
 using pie_loader::PieLoaderRepackLayout;
 using pie_loader::PieLoaderRepackSpecView;
 using pie_loader::PieLoaderRowMap;
+using pie_loader::PieLoaderScaleForm;
 
 /// Which half of a multimodal checkpoint to load.
 ///
@@ -543,24 +545,32 @@ public:
     /// contract because "declare only what you want" is the whole mechanism a
     /// contract offers. `retain_outputs` existed because the loader authored
     /// first and narrowed afterwards.
-    void define(std::string name, Node expr, PieLoaderEncodingSpec encoding,
-                std::optional<std::vector<std::int64_t>> shape) {
+    ///
+    /// Returns the handle only when the tensor was really published: an Encode
+    /// component drops everything that is not a tower output, and there is then
+    /// nothing to attach further declarations to.
+    std::optional<pie_loader::ModelContract::Defined> define(
+        std::string name, Node expr, PieLoaderEncodingSpec encoding,
+        std::optional<std::vector<std::int64_t>> shape) {
         if (component_ == Component::Encode && !is_tower_output(name)) {
-            return;
+            return std::nullopt;
         }
         auto defined = contract_.define(std::move(name), expr, encoding);
         if (shape.has_value()) {
             defined.expect(std::move(*shape));
         }
+        return defined;
     }
 
-    void push_direct(const SourceTensor& raw, std::string output, ShardAxis axis) {
+    std::optional<pie_loader::ModelContract::Defined> push_direct(const SourceTensor& raw,
+                                                                  std::string output,
+                                                                  ShardAxis axis) {
         std::vector<std::int64_t> raw_shape = shape_of(raw);
         axis = splittable_axis(raw.name, raw_shape, axis);
         check_head_granularity(raw.name, raw_shape, axis);
         auto [expr, shape] =
             shard(contract_.src(std::string(raw.name)), std::move(raw_shape), axis);
-        define(std::move(output), expr, raw.encoding, std::move(shape));
+        return define(std::move(output), expr, raw.encoding, std::move(shape));
     }
 
     /// True for a tensor that only scales another one.
@@ -666,11 +676,12 @@ public:
         consumed_.insert(raw.id);
     }
 
-    void push_repack(std::string output, const SourceTensor& raw, PieLoaderEncodingSpec encoding,
-                     std::vector<std::int64_t> shape, PieLoaderRepackSpecView spec) {
+    std::optional<pie_loader::ModelContract::Defined> push_repack(
+        std::string output, const SourceTensor& raw, PieLoaderEncodingSpec encoding,
+        std::vector<std::int64_t> shape, PieLoaderRepackSpecView spec) {
         const Node node =
             contract_.repack(contract_.src(std::string(raw.name)), spec, shape, encoding);
-        define(std::move(output), node, encoding, std::move(shape));
+        return define(std::move(output), node, encoding, std::move(shape));
     }
 
     // -- shared passes -------------------------------------------------------
@@ -887,9 +898,84 @@ public:
             if (scheme.has_value() && runtime_quantizable_name(raw.name, *scheme)) {
                 push_runtime_quant(raw, std::string(raw.name), *scheme);
             } else {
-                push_direct(raw, output_name(raw.name), shard_axis(raw.name));
+                auto defined = push_direct(raw, output_name(raw.name), shard_axis(raw.name));
+                state_shipped_block_scales(raw, defined);
             }
         }
+    }
+
+    /// State the pairing for a scale the checkpoint shipped beside an FP8
+    /// weight.
+    ///
+    /// The loader used to do this itself, after the fact, over the finished
+    /// tensor table: for every plain `F8E4M3` tensor whose name ended `.weight`
+    /// it looked for `{name}_scale_inv` and then `{base}.scale`, and labelled
+    /// whatever it found `PerGroup` with `group_size` hardcoded to 128.
+    ///
+    /// Which suffix a checkpoint uses is this driver's knowledge, not the
+    /// loader's -- it is the same knowledge `is_companion_scale` and
+    /// `hf_shard_axis` already keep here -- so the guess is made where it can be
+    /// checked. Like `dsv4_block_scales_to_fp32`, a companion that is not really
+    /// FP8 is left alone rather than reinterpreted, and the block size is read
+    /// off the two shapes instead of assumed.
+    void state_shipped_block_scales(const SourceTensor& raw,
+                                    std::optional<pie_loader::ModelContract::Defined>& scales) {
+        if (!scales.has_value()) {
+            return;
+        }
+        const std::string weight = companion_weight_name(raw.name);
+        if (weight.empty()) {
+            return;
+        }
+        const SourceTensor* companion = find(weight);
+        if (companion == nullptr || !is_raw(companion->encoding, PieLoaderDType::F8E4M3)) {
+            return;
+        }
+        // A weight an earlier pass claimed — a fused QKV join, say — is not
+        // published under this name, and naming it would be a contract the
+        // loader rejects outright. The suffix matching reached the same outcome
+        // by finding nothing, quietly.
+        if (consumed_.count(companion->id) != 0 || !source_name_allowed(companion->name)) {
+            return;
+        }
+        // A weight the loader re-quantizes gets the scales the loader itself
+        // writes, and states that pairing when it creates them. The shipped
+        // scale is then stale input, not this weight's scales; claiming it too
+        // would attach quant metadata to one weight twice.
+        const std::optional<PieLoaderQuantScheme> scheme = runtime_quant_scheme();
+        if (scheme.has_value() && runtime_quantizable_name(companion->name, *scheme)) {
+            return;
+        }
+        const std::vector<std::int64_t> weight_shape = shape_of(*companion);
+        const std::vector<std::int64_t> scale_shape = shape_of(raw);
+        if (weight_shape.empty() || scale_shape.empty() || scale_shape.back() <= 0) {
+            return;
+        }
+        const std::int64_t block = weight_shape.back() / scale_shape.back();
+        if (block <= 0) {
+            return;
+        }
+        scales->scaling(output_name(weight), PieLoaderQuantGranularity::PerGroup,
+                        static_cast<std::uint32_t>(block), 0, PieLoaderScaleForm::F32Factors);
+    }
+
+    /// The weight a companion scale belongs to, or empty if `name` is not one.
+    ///
+    /// `.weight_scale_inv` and `.weight_scale` hang off the weight's own name,
+    /// so only the scale part comes off; a bare `.scale` shares a base with the
+    /// weight, so `.weight` goes back on. All three end at `<base>.weight`.
+    static std::string companion_weight_name(std::string_view name) {
+        for (std::string_view part : {"_scale_inv", "_scale"}) {
+            if (ends_with(name, part) && ends_with(name.substr(0, name.size() - part.size()),
+                                                   ".weight")) {
+                return std::string(name.substr(0, name.size() - part.size()));
+            }
+        }
+        if (ends_with(name, ".scale")) {
+            return std::string(name.substr(0, name.size() - std::string_view(".scale").size())) +
+                   ".weight";
+        }
+        return {};
     }
 
     /// Check what only the whole contract can answer, after the family is done.

@@ -18,7 +18,7 @@ use crate::error::{Error, OrOverflow};
 use crate::types::{Axis, Encoding, QuantSpec};
 
 use super::compile;
-use super::{Expr, TensorType};
+use super::{Expr, TensorType, local_range, resolve_reshape};
 
 /// Resolves [`Expr::Src`] names against a checkpoint.
 pub trait CheckpointTypes {
@@ -76,10 +76,12 @@ pub fn infer_type(
 
 /// A scope built up one entry at a time.
 ///
-/// [`ModelContract::check`] resolves a whole declaration in one call, which is
-/// what a declared contract wants. A *compiler* wants to interleave: check an
-/// expression, lower it, publish what it produced, then move to the next entry
-/// with that name in scope. This exposes the same machinery in that order.
+/// The only way to type-check a contract, and incremental on purpose: the
+/// compiler interleaves. It checks an expression, lowers it, publishes what
+/// that produced, then moves to the next entry with the new name in scope. A
+/// whole-contract `check(&ModelContract)` would be the more obvious shape, but
+/// it would have no caller — the pass that wants it is the same pass that has
+/// to lower each entry before the next one can be resolved.
 pub struct Resolver<'a> {
     scope: Scope<'a>,
 }
@@ -283,20 +285,13 @@ fn specialize(
             }
             let ty = infer(&src, scope)?;
             let index = axis_index(axis, ty.shape.len(), what)?;
-            let extent = ty.shape[index];
-            if extent % i64::from(world) != 0 {
-                // Named, because this is the message a user gets for "tp_size
-                // does not divide this model". The driver used to pre-empt it
-                // with its own per-family divisibility table over `config.json`,
-                // which was the same fact checked twice and reachable only for
-                // the families someone had listed.
-                return Err(Error::Shard(format!(
-                    "'{what}' has {extent} along axis {index}, which tp_size {world} does not \
-                     divide; use a tp_size that divides it or run single-GPU"
-                )));
-            }
-            let len = extent / i64::from(world);
-            src.slice(axis.0, i64::from(rank) * len, len)
+            let (start, len) = local_range(
+                ty.shape[index],
+                world,
+                rank,
+                &format!("'{what}' along axis {index}"),
+            )?;
+            src.slice(axis.0, start, len)
         }
     })
 }
@@ -443,11 +438,6 @@ fn infer_cat(axis: Axis, parts: &[TensorType]) -> Result<TensorType, Error> {
 }
 
 fn infer_reshape(ty: &TensorType, requested: &[i64]) -> Result<TensorType, Error> {
-    if requested.is_empty() {
-        return Err(Error::Contract(
-            "Reshape needs at least one extent".to_string(),
-        ));
-    }
     if matches!(ty.encoding, Encoding::Quant(_)) {
         // A block-quantized tensor's element order is tied to its block
         // structure, so a row-major reinterpretation is not generally a byte
@@ -457,48 +447,8 @@ fn infer_reshape(ty: &TensorType, requested: &[i64]) -> Result<TensorType, Error
             ty.encoding
         )));
     }
-    let total = ty.element_count()?;
-    let mut wildcard = None;
-    let mut known = 1_i64;
-    for (index, extent) in requested.iter().enumerate() {
-        match *extent {
-            -1 if wildcard.is_some() => {
-                return Err(Error::Contract(
-                    "Reshape allows at most one -1 extent".to_string(),
-                ));
-            }
-            -1 => wildcard = Some(index),
-            extent if extent < 1 => {
-                return Err(Error::Contract(format!(
-                    "Reshape extent {extent} must be >= 1 or -1"
-                )));
-            }
-            extent => {
-                known = known
-                    .checked_mul(extent)
-                    .or_overflow("Reshape extent overflows i64")?;
-            }
-        }
-    }
-    let mut shape = requested.to_vec();
-    match wildcard {
-        Some(index) if known > 0 && total % known == 0 => shape[index] = total / known,
-        Some(_) => {
-            return Err(Error::Contract(format!(
-                "Reshape of {:?} ({total} elements) to {requested:?} does not divide evenly",
-                ty.shape
-            )));
-        }
-        None if known == total => {}
-        None => {
-            return Err(Error::Contract(format!(
-                "Reshape of {:?} ({total} elements) to {requested:?} ({known} elements) changes the element count",
-                ty.shape
-            )));
-        }
-    }
     Ok(TensorType {
-        shape,
+        shape: resolve_reshape(requested, ty.element_count()?)?,
         encoding: ty.encoding.clone(),
     })
 }
@@ -658,7 +608,7 @@ mod tests {
     fn an_indivisible_extent_is_rejected_by_name() {
         let err = specialize_one(Expr::src("k_proj").shard(0), 0, 3).unwrap_err();
         let message = format!("{err}");
-        assert!(message.contains("'q' has 1024 along axis 0"), "{message}");
+        assert!(message.contains("'q' along axis 0 is 1024"), "{message}");
         assert!(message.contains("tp_size 3"), "{message}");
     }
 
@@ -865,7 +815,6 @@ mod tests {
 
     fn model(tensors: Vec<TensorContract>) -> ModelContract {
         ModelContract {
-            abi_version: 1,
             alignment: 256,
             tensors,
         }

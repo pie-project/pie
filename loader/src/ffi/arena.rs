@@ -11,10 +11,8 @@
 //! reclaims it. Between those two points nothing mutates, so handing the plan to
 //! another thread is sound.
 
-use crate::plan::{
-    DestExtent, Extent, LoadPlan, QuantGranularity, ScaleForm, SourceExtent, StorageInstr,
-};
-use crate::types::{Encoding, QuantScheme};
+use crate::plan::{DestExtent, Extent, LoadPlan, SourceExtent, StorageInstr};
+use crate::types::{Encoding, QuantGranularity, QuantScheme, ScaleForm};
 
 use super::types::*;
 
