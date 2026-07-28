@@ -164,6 +164,7 @@ fn bulk_into_b() -> StorageInstr {
             file_offset: 0,
             span_bytes: 256,
             stride: Extent::byte_run(256),
+            dtype: DType::U8,
         },
         dest_offset: 256,
     }

@@ -544,6 +544,7 @@ mod tests {
                 file_offset: 0,
                 span_bytes: 4096,
                 stride: crate::extent::Extent::byte_run(4096),
+                dtype: crate::types::DType::U8,
             },
             dest: DestExtent {
                 buffer: BufferId(0),
