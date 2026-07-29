@@ -12,7 +12,7 @@
 //! SAME TopP mask + Gumbel-max epilogue runs PIPELINED without touching that
 //! baseline.
 
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 use inferlet::{Result, model as wit_model};
 
 const TEMPERATURE: f32 = 0.8;

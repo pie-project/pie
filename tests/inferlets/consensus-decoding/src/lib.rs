@@ -8,7 +8,7 @@
 //! while per-lane attention masks isolate their divergent continuations.
 //! Independent Gumbel noise drives top-p sampling in each lane.
 
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 use inferlet::{Result, chat, model as wit_model};
 use serde::Deserialize;
 use std::time::Instant;

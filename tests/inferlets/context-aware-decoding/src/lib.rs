@@ -28,7 +28,7 @@
 //! constant that cancels in the softmax. See
 //! `inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 use inferlet::{Result, chat, model as wit_model};
 use serde::Deserialize;
 

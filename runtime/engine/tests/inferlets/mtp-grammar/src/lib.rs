@@ -16,7 +16,7 @@
 //! Stage-2 (`mtp_logits` driver head); the intrinsic API is stable, so this
 //! pre-stages the §6.1 pass.
 
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 use inferlet::{Result, model as wit_model};
 
 /// MTP draft width (K); the verify window is `[K+1, V]`.

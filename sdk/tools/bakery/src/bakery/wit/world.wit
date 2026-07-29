@@ -1,4 +1,4 @@
-package pie:inferlet@0.2.0;
+package pie:inferlet@0.3.0;
 
 world inferlet {
     import types;
@@ -7,7 +7,9 @@ world inferlet {
     import pipeline;
     import working-set;
     import channel;
-    import forward;
+    import forward;             // attention-only
+    import forward-recurrent;
+    import forward-hybrid;
     import grammar;
     import chat;
     import tools;

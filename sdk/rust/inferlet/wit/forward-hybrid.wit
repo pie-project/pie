@@ -30,20 +30,18 @@
 // unrepresentable instead of runtime-guarded. Adding a field to one interface's
 // record must never move another's ABI.
 
-// THIS FILE: pure attention. llama_like, gemma*, mixtral, kimi, deepseek_v4,
-// glm5, qwen3_vl, csm. Valid only when `model.pass-kind()` == attention.
+// THIS FILE: attention layers and recurrent layers coexist in ONE forward
+// (Qwen3.5 GDN dense/MoE, Nemotron-H Mamba2).
+// Valid only when `model.pass-kind()` == hybrid.
 //
-// Legal stages: prologue, on_attn_proj, on_attn, epilogue.
-//
-// The resource name `forward-pass` is shared by all three interfaces: WIT
-// scopes resource names to their interface, so this is legal and the generated
-// bindings differ only by module path. That is what collapses guest migration
-// to a single changed `use` line.
+// Legal stages: all five -- prologue, on_attn_proj, on_attn, on_recurrent,
+// epilogue. The attention taps fire on attention layers only; `on_recurrent`
+// fires on recurrent layers only.
 
-interface forward {
+interface forward-hybrid {
     use types.{error, data};
     use channel.{channel};
-    use working-set.{kv-working-set, page-span};
+    use working-set.{kv-working-set, rs-working-set, page-span};
     use pipeline.{pipeline};
 
     /// Attention geometry. Every input is an individual channel; the record
@@ -64,17 +62,100 @@ interface forward {
         mask:        option<borrow<channel>>,
     }
 
-    /// A forward-pass builder. Construction is empty; descriptor resources are
-    /// attached explicitly, then `program` supplies the traced container.
+    /// The recurrent counterpart of `kv-geometry`: the BUFFERED slots of the
+    /// bound recurrent-state working sets. Every channel value is a
+    /// WorkingSet-relative buffer page index; the runtime translates them to
+    /// physical slots and lowers them as the `rs_buffer_slot_ids` /
+    /// `rs_buffer_slot_indptr` wire fields.
+    ///
+    /// The FOLDED state slot is not named here -- it comes from the
+    /// working-set handle itself.
+    ///
+    /// This is only meaningful when the fire actually touches the buffer, so
+    /// `attention` takes it as an OPTION rather than requiring it: a plain
+    /// `fold` prefill/decode passes `none`. Requiring it unconditionally would
+    /// reintroduce exactly the mandatory-dummy-geometry wart this refactor
+    /// exists to remove.
+    record rs-geometry {
+        /// Buffer page range a `fold-buffered` replay may read.
+        readable-buffer: page-span,
+        /// Buffer page range a `buffer` write may target.
+        writable-buffer: page-span,
+        /// Live buffered token count per request.
+        buffer-len:    borrow<channel>,
+        /// CSR values -- buffer page ids, densely packed per request.
+        buffer-pages:  borrow<channel>,
+        /// CSR row bounds, one entry per request plus one.
+        buffer-indptr: borrow<channel>,
+        /// Buffer page each token of this fire writes into.
+        w-slot:        borrow<channel>,
+        /// Offset within that page.
+        w-off:         borrow<channel>,
+    }
+
+    /// Groups the KV half so it can be made optional AS A UNIT. Without this
+    /// wrapper a `fold-buffered` fire could not omit KV without inventing the
+    /// dummy geometry this refactor exists to delete.
+    record kv-binding {
+        working-set: borrow<kv-working-set>,
+        geometry:    kv-geometry,
+    }
+
     resource forward-pass {
         constructor();
 
-        /// State binding. REQUIRED -- a pass with no attention binding is not
-        /// submittable.
+        /// State binding -- a hybrid binds KV and RS in ONE call (D7). They are
+        /// one set of geometry describing different layers of the same forward,
+        /// not two independent decisions.
+        ///
+        /// `kv` is `none` in exactly one case: a `fold-buffered` fire, which
+        /// runs recurrent layers only. The RS working sets stay REQUIRED even
+        /// there -- the driver still needs the folded slot and the buffered CSR
+        /// -- which is why `rs` is a plain list and only `kv` is optional.
+        ///
+        /// This optional is also what preserves FRAME MONOMORPHISM: `submit`'s
+        /// `slots` list is monomorphic and WIT has no existential types, so a
+        /// frame mixing a recurrent-only fire with a normal fire is expressible
+        /// only if both are the SAME resource type.
         attention: func(
-            kv:   borrow<kv-working-set>,
-            geom: kv-geometry,
+            kv:      option<kv-binding>,
+            rs:      list<borrow<rs-working-set>>,
+            rs-geom: option<rs-geometry>,
         ) -> result<_, error>;
+
+        // -- Fold mode ------------------------------------------------
+        // The former `rs-mode` variant, flattened into methods (D5): adding a
+        // variant case is BREAKING, adding a resource method is ADDITIVE, and
+        // `rs-mode` was the highest-evolution-risk type in the old surface.
+        // At most one of the three; `fold` is the default if none is called.
+
+        /// Fold every token of this fire into the folded state, in-forward and
+        /// IRREVERSIBLY. The plain prefill/decode path and the default. Needs
+        /// no `rs-geometry` -- it never touches the buffer.
+        fold: func() -> result<_, error>;
+
+        /// Write each token's pre-recurrence activations into the buffered
+        /// slots named by `rs-geometry.w-slot` / `w-off`, leaving the folded
+        /// state UNTOUCHED. This is what makes a linear model speculatable: an
+        /// uncertain tail that is never folded costs nothing to abandon.
+        /// Requires an already-materialized folded state.
+        ///
+        /// `start-token` is the buffer-relative token offset this fire writes
+        /// from, and must be a multiple of `model.rs-buffer-page-size()`: the
+        /// driver fills a request's slabs page-major FROM SLAB ZERO of the
+        /// listed CSR span, so an unaligned start would silently shift every
+        /// token within its slab. It is REDUNDANT with `rs-geometry.w-slot` /
+        /// `w-off` and is ignored when those are bound -- it exists because
+        /// the host-derived lowering path (which derives the buffered CSR from
+        /// `(start-token, row-tokens)`) is the only one wired end to end today.
+        buffer: func(start-token: u32) -> result<_, error>;
+
+        /// Replay buffered tokens into the folded state: one length per bound
+        /// working set, in request order. Runs ONLY the recurrent layers,
+        /// advances the folded boundary, and drops fully covered head slots.
+        /// Each length must be a positive multiple of
+        /// `model.rs-fold-granularity()`. Requires an `rs-geometry`.
+        fold-buffered: func(lens: list<u32>) -> result<_, error>;
 
         /// Bind embedding token ids and CSR row indptr. Both are channels.
         embed: func(

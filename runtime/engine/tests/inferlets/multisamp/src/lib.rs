@@ -31,7 +31,7 @@
 //! the kept set without an explicit normalize. `r` is a `[2]` u32 rng state
 //! (`gumbel`'s `state` operand is validated as EXACTLY `[2]` u32).
 
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 use inferlet::{Result, model as wit_model};
 
 const TEMPERATURE: f32 = 0.8;

@@ -23,7 +23,7 @@
 //! Input: the number of speculative tokens to accept (default all of them),
 //! e.g. `"2"`. Output names the three phases so a harness can assert them.
 
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::hybrid::prelude::*;
 use inferlet::{Result, model as wit_model};
 
 /// Tokens written in the buffered (speculative) chunk.
@@ -85,7 +85,7 @@ async fn main(input: String) -> Result<String> {
         &positions_p,
         None,
     )?;
-    fwd_p.rs_working_sets(std::slice::from_ref(&rs))?;
+    fwd_p.recurrent(std::slice::from_ref(&rs))?;
     fwd_p.epilogue(move || {
         let t = reduce_argmax(intrinsics::logits());
         g0_ch.put(&t);
@@ -140,7 +140,7 @@ async fn main(input: String) -> Result<String> {
         &spec_positions,
         None,
     )?;
-    fwd_s.rs_working_sets(std::slice::from_ref(&rs))?;
+    fwd_s.recurrent(std::slice::from_ref(&rs))?;
     fwd_s
         .buffer_recurrent(0)
         .map_err(|e| format!("buffer_recurrent: {e}"))?;
@@ -192,7 +192,7 @@ async fn main(input: String) -> Result<String> {
             &commit_positions,
             None,
         )?;
-        fwd_c.rs_working_sets(std::slice::from_ref(&rs))?;
+        fwd_c.recurrent(std::slice::from_ref(&rs))?;
         fwd_c
             .fold_buffered(&[accepted])
             .map_err(|e| format!("fold_buffered: {e}"))?;

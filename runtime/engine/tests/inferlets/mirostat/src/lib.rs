@@ -18,7 +18,7 @@
 //!     (`pivot_threshold(logits, rank_le(k_min))`).
 //!   - `k_min=0` (no floor override): the plain, degenerate control.
 
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 use inferlet::{Result, model as wit_model, serde_json};
 
 /// Default target surprise τ (nats); override via `_input` `"tau"`.

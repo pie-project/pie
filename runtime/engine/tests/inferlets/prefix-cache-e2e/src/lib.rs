@@ -6,7 +6,7 @@
 //! only the uncached suffix.
 
 use inferlet::Result;
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 
 const N: u32 = 24; // prompt length: one full cached page (16) + 8-token suffix
 const PAGE_T: u32 = 16; // tokens per KV page (matches the engine store)

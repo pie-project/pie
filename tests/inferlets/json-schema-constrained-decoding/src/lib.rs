@@ -4,7 +4,7 @@
 //! the next allowed-token mask to a PTIR `mask_apply` + argmax epilogue.
 
 use inferlet::mask::bit_allowed;
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 use inferlet::{Constrain, JsonSchema, Result, Schema, chat, model as wit_model};
 use serde::Deserialize;
 use serde_json::Value;

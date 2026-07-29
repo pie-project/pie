@@ -29,7 +29,7 @@
 //!
 //! JSON/plain input: optional draft window `k` (default 4).
 
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::hybrid::prelude::*;
 use inferlet::{Result, model as wit_model};
 
 const PROMPT: &str = "The quick brown fox jumps over";
@@ -157,7 +157,7 @@ async fn bootstrap(
     let fwd = ForwardPass::new();
     let kv_len = Channel::from(vec![n]).named("b_kv_len");
     bind_single_sequence(&fwd, ws, &toks, &kv_len, n, max_pages, &readout)?;
-    fwd.rs_working_sets(std::slice::from_ref(rs))?;
+    fwd.recurrent(std::slice::from_ref(rs))?;
     fwd.epilogue(move || {
         let picked = reduce_argmax(intrinsics::logits()); // [k] target argmax
         let seed = gather(&picked, Tensor::constant(vec![0u32])); // [1] row-0
@@ -206,7 +206,7 @@ async fn verify_window(
     let kv_len =
         Channel::from((1..=kp1).map(|row| seq_len + row).collect::<Vec<_>>()).named("v_kv_len");
     bind_verify_rows(&fwd, ws, &toks, &kv_len, seq_len, kp1, max_pages)?;
-    fwd.rs_working_sets(std::slice::from_ref(rs))?;
+    fwd.recurrent(std::slice::from_ref(rs))?;
     fwd.epilogue(move || {
         // Device-alias read: peek the embedded window (NOT a resubmitted draft
         // channel) and gather rows 1..=k as the verify operand.

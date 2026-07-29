@@ -162,17 +162,68 @@ impl KvDeclaration {
     }
 }
 
+/// Which WIT forward interface a pass was built through — the host mirror of
+/// `model.forward-kind`. One Rust `ForwardPass` backs all three interfaces
+/// (WIT scopes resource names per interface, so the guest still cannot mix
+/// them), and this field is what makes a mis-selected interface fail loudly at
+/// the first binding call instead of silently running attention-only logic on
+/// a folded recurrent state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PassKind {
+    Attention,
+    Recurrent,
+    Hybrid,
+}
+
+impl PassKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            PassKind::Attention => "attention",
+            PassKind::Recurrent => "recurrent",
+            PassKind::Hybrid => "hybrid",
+        }
+    }
+
+    /// The interface a guest must use for this kind.
+    pub fn interface(self) -> &'static str {
+        match self {
+            PassKind::Attention => "pie:inferlet/forward",
+            PassKind::Recurrent => "pie:inferlet/forward-recurrent",
+            PassKind::Hybrid => "pie:inferlet/forward-hybrid",
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct ForwardBindings {
     pub embed: Option<EmbedBinding>,
     pub attention: Option<AttentionBinding>,
     pub readout: Option<u32>,
     pub rs_ws: Vec<u32>,
+    pub rs_geom: Option<RsGeometryBinding>,
     pub rs_mode: RsMode,
 }
 
-/// How a pass treats the recurrent state of its bound working sets — the
-/// host mirror of WIT `rs-mode`. See `interface/inferlet/forward.wit`.
+/// The buffered half of a recurrent-state binding — the host mirror of WIT
+/// `rs-geometry`. Each field is a channel resource rep that lowers to the
+/// matching `Port::Rs*` descriptor port (registry tags 10-14).
+///
+/// Absent for a plain `fold` fire, which never touches the buffer.
+#[derive(Clone, Copy, Debug)]
+pub struct RsGeometryBinding {
+    pub readable: KvPageSpan,
+    pub writable: KvPageSpan,
+    pub buffer_len: u32,
+    pub buffer_pages: u32,
+    pub buffer_indptr: u32,
+    pub w_slot: u32,
+    pub w_off: u32,
+}
+
+/// How a pass treats the recurrent state of its bound working sets. Formerly
+/// the WIT `rs-mode` variant; now the flattened `fold` / `buffer` /
+/// `fold-buffered` methods of `forward-recurrent` and `forward-hybrid`
+/// (adding a variant case is breaking, adding a resource method is additive).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum RsMode {
     /// Fold every token in-forward, irreversibly. The default.
@@ -209,13 +260,16 @@ pub struct AttentionBinding {
 /// The WIT forward-pass builder. It starts empty and acquires a native bound
 /// pass only when canonical program bytes are attached.
 pub struct ForwardPass {
+    /// The interface this pass was constructed through.
+    pub kind: PassKind,
     pub bindings: ForwardBindings,
     bound: Option<Box<BoundForwardPass>>,
 }
 
 impl ForwardPass {
-    pub fn new() -> Self {
+    pub fn new(kind: PassKind) -> Self {
         Self {
+            kind,
             bindings: ForwardBindings::default(),
             bound: None,
         }
@@ -243,12 +297,6 @@ impl ForwardPass {
         self.bound
             .as_deref_mut()
             .ok_or_else(|| "forward pass program is not attached".to_string())
-    }
-}
-
-impl Default for ForwardPass {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -1114,7 +1162,7 @@ mod tests {
                 dense_mask: false,
                 closed: false,
             };
-            let mut pass = ForwardPass::new();
+            let mut pass = ForwardPass::new(PassKind::Attention);
             pass.attach_bound(bound).unwrap();
             pass
         }

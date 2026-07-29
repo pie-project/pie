@@ -26,7 +26,7 @@
 //! drive an in-graph `select`); the host never `put`s a mask tensor, so the
 //! deferred host-writer-mask staging gap does not arise.
 
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 use inferlet::{Result, model as wit_model};
 
 const B: u32 = 2; // beams

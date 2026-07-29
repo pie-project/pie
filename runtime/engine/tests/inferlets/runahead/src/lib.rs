@@ -40,7 +40,7 @@
 //!
 //! JSON/plain input: an optional token budget (defaults to 8), e.g. `"16"`.
 
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 use inferlet::{Result, model as wit_model};
 
 const PROMPT: &str = "hello world";

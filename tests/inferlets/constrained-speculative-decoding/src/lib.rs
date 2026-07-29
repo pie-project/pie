@@ -52,7 +52,7 @@
 //! rather than assumed.
 
 use inferlet::mask::bit_allowed;
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 use inferlet::{Constrain, JsonSchema, Result, Schema, chat, model as wit_model};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

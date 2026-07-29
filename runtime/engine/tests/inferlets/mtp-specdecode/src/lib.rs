@@ -25,7 +25,7 @@
 //!
 //! JSON/plain input: optional draft window `k` (default 4).
 
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 use inferlet::{Result, model as wit_model};
 
 const PROMPT: &str = "The quick brown fox jumps over";

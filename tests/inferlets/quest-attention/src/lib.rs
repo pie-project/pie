@@ -50,7 +50,7 @@
 //!    generation leaves genuinely-absent slots at every earlier step. Those
 //!    slots read `-inf`, and `pages_absent` counts them.
 
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 use inferlet::{Result, model as wit_model};
 use serde::{Deserialize, Serialize};
 

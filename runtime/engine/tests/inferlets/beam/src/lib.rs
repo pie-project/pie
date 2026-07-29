@@ -18,7 +18,7 @@
 //! pre-submit `put` (D2). The GPU e2e RUN is gated on charlie's [B,P]
 //! fork/freeze/compact driver geometry (thrust-1+3).
 
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 use inferlet::{Result, model as wit_model};
 
 /// Beam width (lanes) — small, matching the validated reference.

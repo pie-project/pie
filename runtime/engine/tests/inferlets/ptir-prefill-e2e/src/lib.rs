@@ -35,7 +35,7 @@
 //! `[N,POOL]` mask), read-out row N-1 = g0; (2) a windowed-style 1-token/pass
 //! decode loop continues over the SAME pool pages.
 
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 use inferlet::{Result, model as wit_model};
 
 const POOL_PAGES: u32 = 24; // shared physical pool (prompt + decode headroom)
