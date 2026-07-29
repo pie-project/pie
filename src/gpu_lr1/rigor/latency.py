@@ -39,6 +39,7 @@ It is measured separately, once, for the ratio.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import json
 import random
 from dataclasses import asdict
@@ -150,10 +151,42 @@ def measure_xgrammar(
     host_mask = xg.allocate_token_bitmask(batch, vocabulary_size)
     device_mask = torch.zeros_like(host_mask, device="cuda")
 
-    def fill() -> None:
-        for index, matcher in enumerate(matchers):
-            matcher.fill_next_token_bitmask(host_mask, index)
-        device_mask.copy_(host_mask, non_blocking=True)
+    # `fill_next_token_bitmask` releases the GIL, and XGrammar's own serving
+    # integrations thread it. Timing the serial loop measures Python, not
+    # XGrammar, and the ratios it produces are not ours to claim - so the
+    # thread count is swept and the *fastest* is what gets reported.
+    def fill_with(workers: int):
+        if workers <= 1:
+            def serial() -> None:
+                for index, matcher in enumerate(matchers):
+                    matcher.fill_next_token_bitmask(host_mask, index)
+                device_mask.copy_(host_mask, non_blocking=True)
+
+            return serial
+
+        pool = ThreadPoolExecutor(max_workers=workers)
+        chunks = [
+            list(range(start, batch, workers)) for start in range(min(workers, batch))
+        ]
+
+        def piece(indices: list[int]) -> None:
+            for index in indices:
+                matchers[index].fill_next_token_bitmask(host_mask, index)
+
+        def threaded() -> None:
+            list(pool.map(piece, chunks))
+            device_mask.copy_(host_mask, non_blocking=True)
+
+        return threaded
+
+    best = None
+    for workers in (1, 2, 4, 8, 16, 32):
+        if workers > 1 and workers > batch:
+            continue
+        measured = _timed(fill_with(workers), warmup=warmup, repeats=repeats, sync=True)
+        if best is None or measured.p50 < best.p50:
+            best = measured
+    fill_best = best
 
     # One host call per sequence, and it cannot be overlapped with the forward
     # pass because it follows the token that was just sampled. The rollback
@@ -168,7 +201,7 @@ def measure_xgrammar(
                 matcher.rollback(1)
 
     return {
-        "fill": _timed(fill, warmup=warmup, repeats=repeats, sync=True),
+        "fill": fill_best,
         "advance": _timed(advance, warmup=warmup, repeats=repeats, sync=False),
     }
 
