@@ -13,11 +13,10 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
-// The worker runs the inference runtime (scheduler + chain-extender pool), whose
-// burst-allocation pattern benefits from mimalloc — as the pre-refactor worker
-// binary used. A `#[global_allocator]` must live in the final binary crate.
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+// The allocator is not set here. `pie-worker` declares it, because that lib is
+// the one crate this bin, the `pie` CLI and the pyo3 wheel all link, and the
+// wheel links nothing else in common with us. Declaring a second one here is a
+// link error, not an override.
 
 /// Pie worker daemon. Global flags (`--config` / `--log-level` / `--metrics-addr`)
 /// come from `startup`'s [`GlobalArgs`](startup::GlobalArgs); the worker adds
