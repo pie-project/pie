@@ -26,6 +26,14 @@ inline constexpr std::uint8_t kPortWSlot = PTIR_PORT_W_SLOT;
 inline constexpr std::uint8_t kPortWOff = PTIR_PORT_W_OFF;
 inline constexpr std::uint8_t kPortReadout = PTIR_PORT_READOUT;
 inline constexpr std::uint8_t kPortAttnMask = PTIR_PORT_ATTN_MASK;
+// Recurrent-state buffered-slot family (tags 10-14). The device-resolved
+// counterpart of the host-composed `rs_buffer_slot_ids` / `rs_buffer_slot_indptr`
+// lowering; resolved by the same pre-forward port->field copier as the KV family.
+inline constexpr std::uint8_t kPortRsBufferPages = PTIR_PORT_RS_BUFFER_PAGES;
+inline constexpr std::uint8_t kPortRsBufferIndptr = PTIR_PORT_RS_BUFFER_INDPTR;
+inline constexpr std::uint8_t kPortRsBufferLen = PTIR_PORT_RS_BUFFER_LEN;
+inline constexpr std::uint8_t kPortRsWSlot = PTIR_PORT_RS_W_SLOT;
+inline constexpr std::uint8_t kPortRsWOff = PTIR_PORT_RS_W_OFF;
 
 inline bool is_device_geometry_trace(const Trace& trace) {
     bool has_write_desc = false;

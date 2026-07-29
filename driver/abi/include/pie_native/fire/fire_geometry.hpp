@@ -48,10 +48,22 @@ struct FireGeometry {
     std::vector<std::uint32_t> w_page;            // w_slot (PHYSICAL page id per lane)
     std::vector<std::uint32_t> w_off;             // w_off (offset-in-page per lane)
     std::vector<std::uint8_t>  mask;              // attn_mask, dense [lanes, stride] bytes
+    // Recurrent-state buffered-slot family — the RS mirror of the KV family.
+    // `rs_buffer_slot_ids` is the flattened slab-id vector and
+    // `rs_buffer_slot_indptr` its per-request CSR bounds, in exactly the
+    // layout `qwen3_5_forward.cpp` already walks page-major from slab zero.
+    // `rs_buffer_lens` is the per-request live buffered token count.
+    std::vector<std::uint32_t> rs_buffer_slot_ids;
+    std::vector<std::uint32_t> rs_buffer_slot_indptr;
+    std::vector<std::uint32_t> rs_buffer_lens;
+    std::vector<std::uint32_t> rs_w_slot;         // rs_w_slot (buffered slab per token)
+    std::vector<std::uint32_t> rs_w_off;          // rs_w_off (offset within that slab)
     StructuredMaskDescriptor structured_mask;
     bool has_kv_family = false;                   // pages/page_indptr present
     bool has_write_desc = false;                  // w_slot/w_off present
     bool has_mask = false;                        // attn_mask present
+    bool has_rs_buffer_family = false;            // rs_buffer_pages/indptr present
+    bool has_rs_write_desc = false;               // rs_w_slot/rs_w_off present
 };
 
 // Pre-forward descriptor resolution over a whole batch: one entry per

@@ -92,6 +92,18 @@ crate::declare_tagged_enum! {
         WOff = 7, "w_off";
         Readout = 8, "readout";
         AttnMask = 9, "attn_mask";
+        // ── Recurrent-state buffered-slot family (wire-additive: tags 0-9 are
+        // unmoved, so a pure-attention guest's container is byte-identical).
+        // The device-resolved counterpart of the host's `RsStore`-derived
+        // `rs_buffer_slot_ids` / `rs_buffer_slot_indptr` lowering: a hybrid or
+        // recurrent pass that traces its own buffered geometry in-graph binds
+        // these instead, and the driver resolves them pre-forward exactly like
+        // the KV family.
+        RsBufferPages = 10, "rs_buffer_pages";
+        RsBufferIndptr = 11, "rs_buffer_indptr";
+        RsBufferLen = 12, "rs_buffer_len";
+        RsWSlot = 13, "rs_w_slot";
+        RsWOff = 14, "rs_w_off";
     }
 }
 
@@ -103,7 +115,8 @@ impl Port {
     pub fn consumes(self) -> bool {
         matches!(
             self,
-            Port::EmbedTokens | Port::Positions | Port::WSlot | Port::WOff
+            Port::EmbedTokens | Port::Positions | Port::WSlot | Port::WOff | Port::RsWSlot
+                | Port::RsWOff
         )
     }
 }
