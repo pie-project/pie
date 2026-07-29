@@ -28,6 +28,32 @@ inline void qmv_mb_dispatch(int out_vec, int N, Grid& g, Threadgroup& tg) {
     tg = Threadgroup{32, 2, 1};
 }
 
+// Below this batch the GEMV is the faster kernel: measured, pie's per-step cost
+// beats mlx-lm's at every batch up to 8 with the GEMV and only loses above it.
+inline constexpr int kQmmMinBatch = 12;
+// The ported steel GEMM is instantiated aligned-only, at BM=16 and BK=32. K is
+// not checked: every qwen3.6 projection has K % 512 == 0 (the same fact the
+// GEMV port relies on for its "fast" variant), so K % BK == 0 is free.
+inline constexpr int kQmmBM = 16;
+
+// Output columns per threadgroup. Prefer the wider tile only when it still
+// leaves enough threadgroups to fill the machine.
+inline int qmm_bn(int out_vec, int N) {
+    if (N < kQmmMinBatch || N % kQmmBM != 0) return 0;
+    if (out_vec % 64 == 0 && out_vec / 64 >= 64) return 64;
+    if (out_vec % 32 == 0) return 32;
+    return 0;
+}
+
+// `out/BN` threadgroups across the output, `M/BM` across the batch, each
+// 32x2x2 = 128 threads (WM=WN=2 simdgroups), which is the shape steel's
+// BlockMMA is written for.
+inline void qmm_t_dispatch(int out_vec, int N, int bn, Grid& g, Threadgroup& tg) {
+    g  = Grid{32u * (uint32_t(out_vec) / uint32_t(bn)),
+              2u * (uint32_t(N) / uint32_t(kQmmBM)), 2};
+    tg = Threadgroup{32, 2, 2};
+}
+
 // rms_single_row over N tokens × n_rows rows-per-token (e.g. per-head q/k norm). One
 // threadgroup per row; rows stack token-major [N*n_rows, row_size]. grid.x = (row_size/4)*n_rows*N.
 inline void rms_mb_dispatch(int row_size, int n_rows, int N, Grid& g, Threadgroup& tg) {

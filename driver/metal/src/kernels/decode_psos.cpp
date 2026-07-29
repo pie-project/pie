@@ -112,6 +112,19 @@ bool load_multibatch_psos(RawMetalContext& ctx,
         {"sdpa_paged.metal",   "sdpa_paged_decode_bfloat16_d_512",        &out.sdpa_paged_d512, false},
         {"kv_append_paged.metal", "kv_append_paged_bfloat16",             &out.kv_append_paged, true},
     };
+    for (int i = 0; i < 2; ++i) {
+        const int bn = i == 0 ? 32 : 64;
+        const std::string suffix =
+            "_bfloat16_gs_64_b_4_bm_16_bn_" + std::to_string(bn);
+        out.qmm_t[i] = ctx.compile_pso_from_file(
+            dir + "quantized_qmm_t.metal", "affine_qmm_t" + suffix);
+        out.qmm_t_residual[i] = ctx.compile_pso_from_file(
+            dir + "quantized_qmm_t.metal", "affine_qmm_t_residual" + suffix);
+        if (!out.qmm_t[i].valid() || !out.qmm_t_residual[i].valid()) {
+            if (err) *err = "affine_qmm_t" + suffix + " (quantized_qmm_t.metal)";
+            return false;
+        }
+    }
     for (const MbSpec& s : specs) {
         if (!s.required && !with_d512) continue;
         Pso pso = ctx.compile_pso_from_file(dir + s.file, s.fn);

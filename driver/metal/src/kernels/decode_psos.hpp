@@ -43,6 +43,10 @@ struct MultiBatchPsos {
     Pso sdpa_paged{};      // sdpa_paged_decode_bfloat16_d_256          (page-table gather)
     Pso sdpa_paged_d512{}; // sdpa_paged_decode_bfloat16_d_512          (gemma4 full-attn)
     Pso kv_append_paged{}; // kv_append_paged_bfloat16                  (page-table scatter write)
+    // affine_qmm_t: MLX's steel quantized GEMM, for the batched decode. [0] is
+    // BN=32, [1] is BN=64. Selected only above `kQmmMinBatch`.
+    Pso qmm_t[2]{};
+    Pso qmm_t_residual[2]{};
     bool valid() const {
         return embed_mb.valid() && rope_mb.valid() && gdn_slotted.valid() &&
                gdn_prep_slotted.valid() &&

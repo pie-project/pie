@@ -42,7 +42,11 @@ int qmv_out(Kernel k, const DecodeGeometry& g) {
 void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
     auto rms = [&](int row, int rows) { rms_mb_dispatch(row, rows, n, d.grid, d.tg); };
     if (const int out = qmv_out(d.kind, g); out != 0) {
-        qmv_mb_dispatch(out, n, d.grid, d.tg);
+        d.qmm_bn = qmm_bn(out, n);
+        if (d.qmm_bn > 0)
+            qmm_t_dispatch(out, n, d.qmm_bn, d.grid, d.tg);
+        else
+            qmv_mb_dispatch(out, n, d.grid, d.tg);
         return;
     }
     switch (d.kind) {
@@ -112,7 +116,15 @@ Pso mb_pso(const Dispatch& d, const DecodeStepPsos& base, const MultiBatchPsos& 
         case Kernel::GdnCoreSlotted: return mb.gdn_recurrent_slotted;
         case Kernel::KvAppendPaged: return mb.kv_append_paged;
         case Kernel::SdpaPaged: return mb.sdpa_paged;
-        default: return d.fuse_residual ? base.qmv_residual : base[d.kind];
+        default: {
+            if (d.qmm_bn > 0) {
+                const int slot = d.qmm_bn == 64 ? 1 : 0;
+                const Pso& gemm =
+                    d.fuse_residual ? mb.qmm_t_residual[slot] : mb.qmm_t[slot];
+                if (gemm.valid()) return gemm;
+            }
+            return d.fuse_residual ? base.qmv_residual : base[d.kind];
+        }
     }
 }
 
