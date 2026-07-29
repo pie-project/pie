@@ -36,6 +36,8 @@ constexpr static const uint32_t PIE_LOADER_TILE_MAP_REBLOCK = (1 << 4);
 
 constexpr static const uint32_t PIE_LOADER_TILE_MAP_REPACK = (1 << 6);
 
+constexpr static const uint32_t PIE_LOADER_TILE_MAP_SCALE = (1 << 7);
+
 constexpr static const uint32_t PIE_LOADER_FUSION_FP8_TO_MXFP4 = (1 << 0);
 
 enum class PieLoaderStatus : uint32_t {
@@ -66,22 +68,12 @@ enum class PieLoaderSeverity : uint32_t {
   Error = 1,
 };
 
-/// How a scale tensor's entries map onto the tensor they scale.
-enum class PieLoaderQuantGranularity : uint32_t {
-  PerChannel = 0,
-  PerGroup = 1,
-};
-
-/// What the driver's kernels expect a scale tensor to hold when they read it.
-///
-/// Not derivable from the scale tensor: its dtype says how the bytes are stored,
-/// not how the kernel wants them. The driver used to infer this from
-/// `group_size == 32`.
-enum class PieLoaderScaleForm : uint32_t {
-  /// Raw E8M0 exponent bytes, consumed as-is.
-  RawE8M0 = 0,
-  /// F32 multipliers; expand before the GEMM sees them.
-  F32Factors = 1,
+/// Whether a declared tensor is bound by the driver. Mirrors [`Visibility`](crate::types::Visibility).
+enum class PieLoaderVisibility : uint32_t {
+  /// A runtime weight, bound by name.
+  Public = 0,
+  /// A name the contract needed for itself: not bound, not persistent.
+  Internal = 1,
 };
 
 enum class PieLoaderDType : uint32_t {
@@ -128,11 +120,18 @@ enum class PieLoaderQuantScheme : uint32_t {
   GgufQ5_0 = 11,
   GgufQ5K = 12,
   GgufQ8_0 = 13,
+  Int4B8 = 14,
 };
 
 /// `None` is the resting value for instructions that carry no tile map, so it
-/// sorts last rather than first — matching the C++ enum and the default on
-/// `PieLoaderStorageInstrView::tile_kind`.
+/// sorts after the transforms that existed when it was chosen — matching the
+/// C++ enum and the default on `PieLoaderStorageInstrView::tile_kind`.
+///
+/// These discriminants are not the `TILE_MAP_*` capability bits and are not
+/// required to agree with them: the two happen to line up below `None` and stop
+/// there, because a kind added afterwards has to take a free discriminant while
+/// its bit is chosen from the free bits. The loader's `TileMapKind` states the
+/// pairing in one place, by name, and nothing derives one from the other.
 enum class PieLoaderTileMapKind : uint32_t {
   Cast = 0,
   Decode = 1,
@@ -141,6 +140,7 @@ enum class PieLoaderTileMapKind : uint32_t {
   Reblock = 4,
   Repack = 6,
   None = 7,
+  Scale = 8,
 };
 
 /// A transform chain the backend collapsed into a single kernel.
@@ -173,21 +173,50 @@ enum class PieLoaderBackendKind : uint32_t {
   Unknown = 255,
 };
 
+/// How a scale tensor's entries map onto the tensor they scale.
+enum class PieLoaderQuantGranularity : uint32_t {
+  PerChannel = 0,
+  PerGroup = 1,
+};
+
+/// What the driver's kernels expect a scale tensor to hold when they read it.
+///
+/// Not derivable from the scale tensor: its dtype says how the bytes are stored,
+/// not how the kernel wants them. The driver used to infer this from
+/// `group_size == 32`.
+enum class PieLoaderScaleForm : uint32_t {
+  /// Raw E8M0 exponent bytes, consumed as-is.
+  RawE8M0 = 0,
+  /// F32 multipliers; expand before the GEMM sees them.
+  F32Factors = 1,
+};
+
 /// Which constructor a node is. Mirrors [`crate::contract::Expr`] exactly; a
 /// variant added there without a variant here is a compile error in
-/// [`read_expr`].
+/// `read_expr`.
 enum class PieLoaderExprKind : uint32_t {
   Src = 0,
   Out = 1,
-  Slice = 2,
-  Cat = 3,
-  Reshape = 4,
-  Pad = 5,
-  Shard = 6,
-  Repack = 7,
-  Quantize = 8,
-  Bitcast = 9,
+  Fill = 2,
+  Slice = 3,
+  Stride = 4,
+  Gather = 5,
+  Concat = 6,
+  Transmute = 7,
+  Shard = 8,
+  Repack = 9,
+  Cast = 10,
+  Scale = 11,
 };
+
+/// Which slice of a tensor-parallel world an expression is being read for.
+///
+/// The whole of a target's rank-dependence, as one value. [`Expr::Shard`] is
+/// the only node that consults it, and it is carried rather than threaded so
+/// that the type checker and the specializer cannot be given different answers:
+/// they share one [`Resolver`](crate::contract::infer::Resolver), so they share
+/// this.
+struct Partition;
 
 /// A borrowed UTF-8 string. Not NUL-terminated: plan strings come from Rust
 /// `String`s, and copying them only to append a NUL would double the arena for
@@ -199,7 +228,7 @@ struct PieLoaderBytes {
 
 /// One file the plan reads from. `PieLoaderSourceTensorView::file_id` indexes
 /// `PieLoaderPlan::files`, so the driver no longer has to re-derive the file
-/// order for itself (§6).
+/// order for itself (`architecture.md` §6).
 struct PieLoaderCheckpointFileView {
   uint32_t id;
   PieLoaderBytes path;
@@ -268,6 +297,8 @@ struct PieLoaderRawTensorSlice {
 /// close, so it may be read from several threads — which is the case that
 /// matters, because the ranks of a TP group compile in parallel from one
 /// checkpoint.
+///
+/// [`pie_loader_close_checkpoint`]: crate::ffi::entry::pie_loader_close_checkpoint
 struct PieLoaderCheckpoint {
   PieLoaderCheckpointFileSlice files;
   /// Every tensor in every file, in the order the reader found them.
@@ -297,10 +328,10 @@ struct PieLoaderDiagnostics {
 
 /// The device-measured half of a request.
 ///
-/// Every field is a fact only the driver can state: what the device is, how wide
-/// the TP group is, and which transforms this backend's kernels implement. The
-/// loader never guesses any of it, which is what makes a plan reproducible from
-/// a recorded spec on a machine with no GPU (§2 P2).
+/// Every field is a fact only the driver can state: what the device is, how
+/// wide the TP group is, and which transforms this backend's kernels implement.
+/// The loader never guesses any of it, which is what makes a plan reproducible
+/// from a recorded spec on a machine with no GPU (`architecture.md` §2 P2).
 ///
 /// `backend` and `encode_scratch_dtype` are plain `uint32_t` rather than their
 /// enum types, and the same goes for every enum-valued *input* field. C++ lets a
@@ -323,7 +354,7 @@ struct PieLoaderTargetSpec {
   /// The opt-out that used to be `PIE_CUDA_DISABLE_FUSED_TRANSCODE`, read
   /// inside the executor. As a request field it changes the *plan*, so two
   /// settings produce two artifacts instead of one plan that runs two ways
-  /// (§8.1). Backends with no fused kernels pass `0`.
+  /// (`architecture.md` §8.1). Backends with no fused kernels pass `0`.
   uint32_t fusion_mask;
   /// The dtype this target's encode kernels dequantize through. Decides how
   /// many rows of scratch fit in `max_tile_bytes`.
@@ -363,7 +394,7 @@ struct PieLoaderRepackSpecView {
 /// One node of the expression graph.
 ///
 /// Every field is read by exactly the kinds that need it and ignored by the
-/// rest; see [`read_expr`] for the mapping, which is the only place it is
+/// rest; see `read_expr` for the mapping, which is the only place it is
 /// written down.
 struct PieLoaderExprNode {
   /// A `PieLoaderExprKind` value, as `uint32_t`. Not the enum type, so that a
@@ -374,30 +405,62 @@ struct PieLoaderExprNode {
   PieLoaderBytes name;
   /// The single operand, for every kind that has one. Must be strictly less
   /// than this node's own index. [`PIE_LOADER_NO_NODE`] for `Src`, `Out` and
-  /// `Cat`.
+  /// `Concat`.
   uint32_t src;
-  /// `Cat`: the operands, in order. Same index rule.
+  /// `Concat`: the operands, in order. Same index rule.
   PieLoaderU32Slice parts;
-  /// `Slice`, `Cat`, `Pad`, `Shard`.
+  /// `Slice`, `Stride`, `Concat`, `Shard`, and a per-group `Scale`.
   uint8_t axis;
-  /// `Slice`.
+  /// `Slice` and `Stride`.
   int64_t start;
   int64_t len;
-  /// `Slice`. `0` is rejected; state `1` for a contiguous run.
+  /// `Stride`. A contiguous run is a `Slice`, so this must be at least 2.
   int64_t step;
-  /// `Pad`.
-  int64_t before;
-  int64_t after;
-  /// `Reshape`: the new shape. At most one extent may be `-1`.
-  PieLoaderI64Slice shape;
-  /// `Repack`, `Bitcast`: the declared output type, which the checker takes on
-  /// trust because it cannot see through either.
+  /// `Gather`: the indices to read along `axis`, in output order.
+  ///
+  /// Constants rather than a nested node, which is what keeps a contract
+  /// comparable and hashable. Borrowed for the call, like every other slice
+  /// in this struct.
+  PieLoaderI64Slice indices;
+  /// `Fill`: the constant, as the bit pattern of an IEEE-754 binary32, for
+  /// the reason `scale_factor_bits` gives.
+  ///
+  /// An unset field reads as `+0.0`, which is the one value a fill may
+  /// carry -- so unlike `Scale`, a `Fill` is not told apart from a forgotten
+  /// field by this. Its shape is: the loader rejects a rank-0 fill, and a
+  /// zeroed node has no shape at all.
+  uint32_t fill_bits;
+  /// `Transmute`: the type to read the same bytes under. `Repack`: the declared
+  /// output type, which the checker takes on trust because it cannot see
+  /// through the swizzle. `Fill`: the type of the constant tensor. At most
+  /// one extent may be `-1`, and never for a `Fill`.
   PieLoaderI64Slice out_shape;
   PieLoaderEncodingSpec out_encoding;
   /// `Repack`.
   PieLoaderRepackSpecView repack;
-  /// `Quantize`.
-  PieLoaderQuantSpecView quant;
+  /// `Scale`: the multiplier, as the bit pattern of an IEEE-754 binary32.
+  ///
+  /// A `float` field would make this struct's layout depend on the C++
+  /// compiler agreeing about float ABI. `pie_loader::ModelContract::scale`
+  /// does the conversion, so no author writes a bit pattern.
+  ///
+  /// Leaving it unset means zero, which reads as `+0.0`; the loader rejects
+  /// that rather than scaling a tensor to nothing.
+  uint32_t scale_factor_bits;
+  /// `Scale`: the operand holding one factor per `scale_group` elements along
+  /// `axis`. Same index rule as `src`.
+  ///
+  /// [`PIE_LOADER_NO_NODE`] for a uniform factor, which is what an unset
+  /// field reads as.
+  uint32_t scale_by;
+  /// `Scale`: elements per factor. Zero selects the uniform factor in
+  /// `scale_factor_bits`.
+  ///
+  /// The two forms are told apart by this field rather than by which of the
+  /// others happens to be set, so a node built by zeroing the struct and
+  /// filling in one field is always the uniform case and never a per-group
+  /// case with a missing operand.
+  uint32_t scale_group;
 };
 
 using PieLoaderExprNodeSlice = PieLoaderSlice<PieLoaderExprNode>;
@@ -420,11 +483,22 @@ struct PieLoaderScalesView {
   /// Unlike `Expr::Out` this may name a *later* declaration: it pairs two
   /// published tensors rather than feeding one into the other.
   PieLoaderBytes of;
-  PieLoaderQuantGranularity granularity;
+  /// A [`PieLoaderQuantGranularity`], as a `u32`.
+  ///
+  /// Spelled as the underlying integer for the reason
+  /// [`PieLoaderTargetSpec::encode_scratch_dtype`] is: this struct is an
+  /// *input*, so the value is whatever C++ wrote, and a Rust enum holding a
+  /// value outside its variants is undefined behaviour the moment the
+  /// containing slice is borrowed — before `read_scales` could reject it.
+  /// `read_scales` converts it.
+  ///
+  /// [`PieLoaderTargetSpec::encode_scratch_dtype`]: crate::ffi::entry::PieLoaderTargetSpec::encode_scratch_dtype
+  uint32_t granularity;
   /// Elements of `of` per scale entry, for `PerGroup`.
   uint32_t group_size;
   uint32_t channel_axis;
-  PieLoaderScaleForm form;
+  /// A [`PieLoaderScaleForm`], as a `u32`. See [`Self::granularity`].
+  uint32_t form;
 };
 
 /// One declared tensor: a name, the expression that produces it, and what the
@@ -439,7 +513,8 @@ struct PieLoaderTensorContractView {
   /// for a packed quantized weight, whose on-disk extents are a property of
   /// the quantizer that produced the checkpoint and not of the model. The
   /// alternative — the driver guessing, and the loader checking the guess —
-  /// is what `LogicalShape` in `model_contracts.hpp` was working around.
+  /// is what a `LogicalShape`-style helper exists to work around, and the
+  /// reason there is no such helper here.
   PieLoaderI64Slice shape;
   /// What the driver wants the tensor to *be*. Unlike the shape this is never
   /// optional, because it is not a prediction: the loader inserts whatever
@@ -447,6 +522,11 @@ struct PieLoaderTensorContractView {
   PieLoaderEncodingSpec encoding;
   /// Set when this entry holds the scales for another entry.
   PieLoaderScalesView scales;
+  /// Whether the driver binds this tensor, or the contract just needed a
+  /// name for it. Zero -- the default -- is `Public`, so an author who does
+  /// not set it gets the tensor bound, which is what every existing
+  /// declaration means.
+  PieLoaderVisibility visibility;
 };
 
 using PieLoaderTensorContractSlice = PieLoaderSlice<PieLoaderTensorContractView>;
@@ -511,6 +591,7 @@ struct PieLoaderTensorDeclView {
   uint32_t quant_group_size;
   PieLoaderI64Slice shape;
   uint32_t alignment;
+  PieLoaderVisibility visibility;
 };
 
 using PieLoaderTensorDeclSlice = PieLoaderSlice<PieLoaderTensorDeclView>;
@@ -549,10 +630,10 @@ struct PieLoaderSourceExtentView {
   uint64_t span_bytes;
   PieLoaderStridedExtentView stride;
   /// The type these bytes are read as. Not necessarily
-  /// `PieLoaderPlan::sources[tensor_id].dtype`: a contract that reinterprets a
-  /// tensor with `Bitcast` — DeepSeek-V4's E8M0 block scales are stored as
-  /// `U8` — says so here, and an executor that consulted the source table
-  /// instead would undo the reinterpretation.
+  /// `PieLoaderPlan::sources[tensor_id].dtype`: a contract that reinterprets
+  /// a tensor with `Transmute` -- DeepSeek-V4's E8M0 block scales are stored
+  /// as `U8` -- says so here, and an executor that consulted the source
+  /// table instead would undo the reinterpretation.
   PieLoaderDType dtype;
 };
 
@@ -619,7 +700,8 @@ struct PieLoaderStorageOp {
     /// budget itself does not cross the boundary: the driver stated it in
     /// the request, the loader answered with a row count in
     /// `backend::lower`, and sending the question back alongside the answer
-    /// would only invite the executor to re-derive it (§8.1).
+    /// would only invite the executor to re-derive it (`architecture.md`
+    /// §8.1).
     uint32_t rows_per_tile;
     /// A transform chain the backend collapsed into one kernel.
     PieLoaderTransformFusion transform_fusion;
@@ -645,6 +727,24 @@ struct PieLoaderStorageOp {
     /// shape the way it reaches the payload's — instead of appending
     /// `_scale_inv` to a name and hoping the checkpoint agrees.
     uint32_t transform_metadata_source;
+    /// The multiplier for a [`PieLoaderTileMapKind::Scale`], as the bit
+    /// pattern of an IEEE-754 binary32; zero on every other kind.
+    ///
+    /// Bits rather than a `float` field so this union's layout does not
+    /// depend on float ABI, and so the executor multiplies with exactly the
+    /// constant the contract named — `__uint_as_float` on the CUDA side
+    /// costs nothing and cannot round.
+    uint32_t transform_scale_factor_bits;
+    /// Elements per factor along `transform_scale_axis` for a per-group
+    /// [`PieLoaderTileMapKind::Scale`]; zero when the factor is the uniform
+    /// constant above.
+    ///
+    /// Non-zero is what tells the executor to read its factors from
+    /// `input_buffers[0]` — the operand the contract paired with the
+    /// payload — instead of from `transform_scale_factor_bits`.
+    uint32_t transform_scale_group;
+    /// The axis `transform_scale_group` counts along.
+    uint8_t transform_scale_axis;
   };
 
   struct CreateView_Body {
@@ -702,7 +802,7 @@ struct PieLoaderMemoryPlanView {
 /// The target the plan was compiled against. The driver reads it back to assert
 /// the plan it received is the plan it asked for — the same fields it supplied
 /// in the request, plus the rank identity that makes a TP shard distinguishable
-/// from its siblings (§6.2).
+/// from its siblings (`architecture.md` §6.2).
 struct PieLoaderTargetView {
   PieLoaderBackendKind backend;
   uint32_t tp_rank;
@@ -769,6 +869,8 @@ struct PieLoaderPlan {
   void *owner;
 };
 
+
+
 extern "C" {
 
 /// Open a checkpoint and read its tensor table.
@@ -795,8 +897,11 @@ void pie_loader_close_checkpoint(PieLoaderCheckpoint *checkpoint);
 
 /// Compile a driver-authored contract into a plan.
 ///
-/// The contract path and [`pie_loader_compile`] produce the same kind of plan
-/// and are freed the same way; they differ only in who decides what to build.
+/// This is the only way to obtain a plan: what gets built is decided by the
+/// contract the driver authors, never by a model name the loader recognizes.
+/// The plan is owned by the caller and freed with [`pie_loader_release`];
+/// diagnostics are a separate allocation freed with
+/// [`pie_loader_release_diagnostics`].
 ///
 /// # Safety
 ///
@@ -817,7 +922,10 @@ PieLoaderStatus pie_loader_compile_contract(const PieLoaderContractRequest *req,
 ///
 /// # Safety
 ///
-/// As [`pie_loader_verify`], with a [`PieLoaderContractRequest`].
+/// `plan` must point at a plan from [`pie_loader_compile_contract`] that has
+/// not been released. `req` must point at a valid [`PieLoaderContractRequest`]
+/// whose borrowed memory is live for the call. `out_diags` is either null or a
+/// writable slot.
 PieLoaderStatus pie_loader_verify_contract(const PieLoaderPlan *plan,
                                            const PieLoaderContractRequest *req,
                                            PieLoaderDiagnostics **out_diags);

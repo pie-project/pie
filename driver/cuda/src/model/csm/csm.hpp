@@ -79,14 +79,9 @@ struct CsmWeights {
     MimiDecoderWeights mimi;
     std::vector<std::unique_ptr<DeviceTensor>> mimi_owned;   // resolved codebook embeds
 
-    // bf16 copies of any F32 checkpoint tensors (eustlb/csm-1b ships F32; the
-    // loader preserves the on-disk dtype). Owned here so the bf16 storage that
-    // the Raw weight pointers reference outlives the model.
-    std::vector<std::unique_ptr<DeviceTensor>> bf16_owned;
-
     HfConfig config;   // copy (carries hf.csm + backbone dims)
 
-    // Resolve a tensor by name as bf16, casting F32 -> bf16 (owned) if needed.
+    // Resolve a tensor by name. bf16 by contract, not by a copy made here.
     const DeviceTensor* bf16_tensor(LoadedModel& engine, const std::string& name);
 
     // Build the cuda-only Raw weight structs for the kernels.

@@ -26,7 +26,6 @@ use std::path::PathBuf;
 
 use pie_loader::checkpoint::{CheckpointFile, CheckpointMetadata, RawTensor};
 use pie_loader::contract::ModelContract;
-use pie_loader::contract_writer::write_contract;
 use pie_loader::ffi::contract::read_contract;
 use pie_loader::ffi::view::verify_marshalled;
 use pie_loader::plan::compile as compile_load_plan;
@@ -34,6 +33,7 @@ use pie_loader::plan::{
     CUDA_TILE_MAP_MASK, FUSION_FP8_TO_MXFP4, HOST_TILE_MAP_MASK, LoadPlan, StorageTarget,
     compiler_version,
 };
+use pie_loader::testkit::contract_writer::write_contract;
 use pie_loader::types::{
     BackendKind, CheckpointFormat, DType, Encoding, FileId, QuantScheme, QuantSpec, TensorId,
 };
@@ -335,7 +335,7 @@ fn target(backend: BackendKind, tp_rank: u32, tp_size: u32) -> StorageTarget {
 /// is what lets the loader stop knowing what a model is: after `arch/` is gone
 /// there is no function in this crate that could produce one, and there should
 /// not be — authorship is the driver's job. Freezing them here keeps every
-/// construct the real families use (the MXFP4 repacks, the fused QKV `Cat`, the
+/// construct the real families use (the MXFP4 repacks, the fused QKV `Concat`, the
 /// `Out` aliases into a bank, the strided GPTQ slices) under test, expressed as
 /// what they actually are: programs over a checkpoint.
 fn contract_fixture(name: &str) -> ModelContract {
@@ -463,7 +463,7 @@ fn check(name: &str, metadata: &CheckpointMetadata, target: StorageTarget) {
 /// hand in C++ and produce the identical plan; that claim is only checkable if
 /// the FFI representation is known to be lossless for every construct the real
 /// families use. Asserting it here, on every golden, means each family covers
-/// its own constructs — the MXFP4 repacks, the fused QKV `Cat`, the `Out`
+/// its own constructs — the MXFP4 repacks, the fused QKV `Concat`, the `Out`
 /// aliases into a bank, the strided GPTQ slices — instead of on a synthetic
 /// expression that happens to use the ones someone thought of.
 ///
@@ -496,8 +496,9 @@ fn replay(name: &str, plan: &LoadPlan, metadata: &CheckpointMetadata) {
         return;
     }
     let snapshot = PathBuf::from(&metadata.files[0].path);
-    let storage = pie_loader::host_executor::execute_plan(plan, snapshot.parent().unwrap())
-        .unwrap_or_else(|err| panic!("{name}: the plan does not execute: {err}"));
+    let storage =
+        pie_loader::testkit::host_executor::execute_plan(plan, snapshot.parent().unwrap())
+            .unwrap_or_else(|err| panic!("{name}: the plan does not execute: {err}"));
     for tensor in &plan.tensors {
         let materialized = storage
             .tensors

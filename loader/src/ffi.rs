@@ -2,12 +2,16 @@
 //!
 //! `types` is the published `#[repr(C)]` vocabulary, `arena` turns a compiled
 //! [`LoadPlan`](crate::plan::LoadPlan) into it, and `entry` holds the
-//! `extern "C"` functions the driver calls. The generated header
-//! (`loader/include/pie_loader.h`) is the C view of exactly these three files.
+//! `extern "C"` functions the driver calls. `contract` and `checkpoint` read the
+//! two inputs back the other way — what the driver asks for, and which
+//! checkpoint to ask it of. The generated header (`loader/include/pie_loader.h`)
+//! is the C view of exactly those five files; `view` is Rust-side borrowing
+//! helpers over them and publishes nothing.
 //!
-//! This is the only boundary the design has (§10). There is no serialized form:
-//! a plan is compiled and executed in one process, so a JSON round-trip would be
-//! a second representation to keep in step with no reader on the far end.
+//! This is the only boundary the design has (`architecture.md` §10). There is
+//! no serialized form: a plan is compiled and executed in one process, so a
+//! JSON round-trip would be a second representation to keep in step with no
+//! reader on the far end.
 
 pub mod arena;
 pub mod checkpoint;
@@ -36,9 +40,9 @@ fn storage_target(
 ) -> Result<StorageTarget, String> {
     // A target that reports no tile budget is not saying "no limit"; it is
     // saying it did not measure one, and the loader used to guess 64 MiB on its
-    // behalf. Guessing a device constant is exactly what §9 forbids: the number
-    // decided how much scratch every Encode allocated, so the guess was a
-    // silent performance contract nobody had signed.
+    // behalf. Guessing a device constant is exactly what `architecture.md` §9
+    // forbids: the number decided how much scratch every Encode allocated, so
+    // the guess was a silent performance contract nobody had signed.
     if spec.max_tile_bytes == 0 {
         return Err(
             "request.target.max_tile_bytes is 0; the driver must state its tile \
@@ -55,11 +59,12 @@ fn storage_target(
     // The driver's `tile_map_mask` and the loader's `plan::passes::tile` masks
     // are two independent statements of the same fact — the C++ constant is
     // written by hand next to the kernels, the Rust one next to the lowering
-    // rules that decide when to emit them. §9 makes the driver the authority, so
-    // a driver may implement *fewer* transforms than the loader knows how to
-    // lower. What it may not do is claim one the loader has never heard of:
-    // that bit would silently pass `validate_target_support` and then fail as an
-    // unrecognized kernel dispatch at load time, far from its cause (§8).
+    // rules that decide when to emit them. `architecture.md` §9 makes the
+    // driver the authority, so a driver may implement *fewer* transforms than
+    // the loader knows how to lower. What it may not do is claim one the loader
+    // has never heard of: that bit would silently pass
+    // `validate_target_support` and then fail as an unrecognized kernel
+    // dispatch at load time, far from its cause (`architecture.md` §8).
     let known = crate::plan::passes::tile::tile_map_mask(kind);
     if spec.tile_map_mask & !known != 0 {
         return Err(format!(

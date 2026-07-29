@@ -6,7 +6,7 @@
     "tp_size": 1,
     "max_tile_bytes": 67108864,
     "preferred_alignment": 256,
-    "tile_map_mask": 17,
+    "tile_map_mask": 145,
     "native_mxfp4_moe": false,
     "fusion_mask": 0,
     "encode_scratch_dtype": "BF16",
@@ -57,6 +57,12 @@
     },
     {
       "pass": "validate-target-support",
+      "instrs_before": 43,
+      "instrs_after": 43,
+      "rewrites": 0
+    },
+    {
+      "pass": "validate-scale-factors",
       "instrs_before": 43,
       "instrs_after": 43,
       "rewrites": 0

@@ -93,15 +93,6 @@ struct KimiWorkspace {
         int tp_size);
 };
 
-// Dequantises the routed experts into per-layer BF16 stacks (`[E, 2I, H]` and
-// `[E, H, I]`) so the batched-GEMM MoE path can read each expert once. Skipped
-// when the stacks would exceed `kKimiMoeBf16StackBudget`. Must be called before
-// any CUDA graph capture: allocating during capture yields graph-ordered memory.
-void kimi_materialize_bf16_expert_stacks(
-    KimiWeights& weights,
-    const HfConfig& cfg,
-    int tp_size);
-
 std::size_t kimi_workspace_bytes(
     const HfConfig& cfg,
     int max_tokens,

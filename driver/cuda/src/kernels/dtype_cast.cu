@@ -103,6 +103,80 @@ void launch_cast_e8m0_to_fp32(
 
 namespace {
 
+// One multiply per element, in fp32 whatever the storage dtype. The narrow
+// dtypes round once, on the store -- accumulating in bf16 would round the
+// operand as well, and the loader's host executor (which multiplies in fp32
+// and is compared against this) would disagree.
+__global__ void scale_bf16_kernel(
+    const __nv_bfloat16* __restrict__ src,
+    __nv_bfloat16*       __restrict__ dst,
+    std::size_t                       n,
+    float                             factor)
+{
+    const std::size_t i = static_cast<std::size_t>(blockIdx.x) * BLOCK + threadIdx.x;
+    if (i >= n) return;
+    dst[i] = __float2bfloat16(__bfloat162float(src[i]) * factor);
+}
+
+__global__ void scale_fp32_kernel(
+    const float* __restrict__ src,
+    float*       __restrict__ dst,
+    std::size_t               n,
+    float                     factor)
+{
+    const std::size_t i = static_cast<std::size_t>(blockIdx.x) * BLOCK + threadIdx.x;
+    if (i >= n) return;
+    dst[i] = src[i] * factor;
+}
+
+__global__ void scale_fp16_kernel(
+    const __half* __restrict__ src,
+    __half*       __restrict__ dst,
+    std::size_t                n,
+    float                      factor)
+{
+    const std::size_t i = static_cast<std::size_t>(blockIdx.x) * BLOCK + threadIdx.x;
+    if (i >= n) return;
+    dst[i] = __float2half(__half2float(src[i]) * factor);
+}
+
+}  // namespace
+
+void launch_scale_bf16(
+    const void* src_bf16, void* dst_bf16,
+    std::size_t n, float factor, cudaStream_t stream)
+{
+    if (n == 0) return;
+    const auto blocks = static_cast<unsigned>((n + BLOCK - 1) / BLOCK);
+    scale_bf16_kernel<<<blocks, BLOCK, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(src_bf16),
+        static_cast<__nv_bfloat16*>(dst_bf16), n, factor);
+}
+
+void launch_scale_fp32(
+    const void* src_fp32, void* dst_fp32,
+    std::size_t n, float factor, cudaStream_t stream)
+{
+    if (n == 0) return;
+    const auto blocks = static_cast<unsigned>((n + BLOCK - 1) / BLOCK);
+    scale_fp32_kernel<<<blocks, BLOCK, 0, stream>>>(
+        static_cast<const float*>(src_fp32),
+        static_cast<float*>(dst_fp32), n, factor);
+}
+
+void launch_scale_fp16(
+    const void* src_fp16, void* dst_fp16,
+    std::size_t n, float factor, cudaStream_t stream)
+{
+    if (n == 0) return;
+    const auto blocks = static_cast<unsigned>((n + BLOCK - 1) / BLOCK);
+    scale_fp16_kernel<<<blocks, BLOCK, 0, stream>>>(
+        static_cast<const __half*>(src_fp16),
+        static_cast<__half*>(dst_fp16), n, factor);
+}
+
+namespace {
+
 // Marlin scale permutation (per-group case). Each block of 64 scalars
 // is reshuffled by the perm `i + 8*j` for (i, j) in [0..8) × [0..8).
 // Equivalent to a 8×8 transpose of an 8x8 sub-block. Applied in-place

@@ -187,6 +187,11 @@ KimiWeights bind_kimi(const LoadedModel& engine) {
         require_rank2(*L.router, mp + "gate.weight");
         L.e_score_correction_bias =
             maybe(engine, mp + "gate.e_score_correction_bias");
+        // The batched MoE path's dense slabs, when the contract judged them
+        // affordable beside the packed weights the GEMV path reads. Both forms
+        // are bound because Kimi picks between them per step.
+        L.moe_gate_up_bf16 = maybe(engine, mp + "experts.gate_up.weight");
+        L.moe_down_bf16 = maybe(engine, mp + "experts.down.weight");
         L.experts.resize(static_cast<std::size_t>(cfg.num_experts));
         std::vector<const std::int32_t*> gate_packed_ptrs;
         std::vector<const void*> gate_scale_ptrs;

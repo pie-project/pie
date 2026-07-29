@@ -14,14 +14,14 @@
 //! not part of it: no `extern "C"` function reaches this code, and cbindgen
 //! emits nothing from it.
 
-use crate::contract::{Expr, ModelContract};
+use crate::contract::{Expr, ModelContract, ScaleFactor, Visibility};
 use crate::ffi::contract::{
     PieLoaderExprKind, PieLoaderExprNode, PieLoaderExprNodeSlice, PieLoaderModelContractView,
     PieLoaderRepackSpecView, PieLoaderScalesView, PieLoaderTensorContractSlice,
-    PieLoaderTensorContractView, write_encoding, write_quant,
+    PieLoaderTensorContractView, write_encoding,
 };
 use crate::ffi::types::*;
-use crate::types::{QuantGranularity, RepackSpec, ScaleForm};
+use crate::types::RepackSpec;
 
 /// A contract flattened into the POD form, with its backing storage.
 ///
@@ -57,6 +57,27 @@ impl OwnedContract {
     /// exactly what was written.
     pub fn node_count(&self) -> usize {
         self.nodes.len()
+    }
+
+    /// Write raw integers into a declared tensor's `scales` enum codes.
+    ///
+    /// `granularity` and `form` are `u32` on the ABI because they are *input*
+    /// fields: the value is whatever the driver wrote, and a Rust enum holding
+    /// something outside its variants is undefined behaviour before any check
+    /// could run. A well-typed writer cannot express a value a driver could
+    /// nonetheless produce, so a test that wants to prove the loader *rejects*
+    /// one reaches past the typed builder here.
+    pub fn set_raw_scale_codes(&mut self, tensor: usize, granularity: u32, form: u32) {
+        let scales = &mut self.tensors[tensor].scales;
+        scales.granularity = granularity;
+        scales.form = form;
+    }
+
+    /// Position of the first declaration that carries scales.
+    pub fn first_scaled(&self) -> Option<usize> {
+        self.tensors
+            .iter()
+            .position(|tensor| tensor.scales.of.len != 0)
     }
 
     fn name(&mut self, value: &str) -> PieLoaderBytes {
@@ -112,7 +133,6 @@ impl OwnedContract {
                 axis,
                 start,
                 len,
-                step,
             } => {
                 let src = self.write_expr(src);
                 node.kind = PieLoaderExprKind::Slice as u32;
@@ -120,32 +140,47 @@ impl OwnedContract {
                 node.axis = axis.0;
                 node.start = *start;
                 node.len = *len;
+            }
+            Expr::Stride {
+                src,
+                axis,
+                start,
+                len,
+                step,
+            } => {
+                let src = self.write_expr(src);
+                node.kind = PieLoaderExprKind::Stride as u32;
+                node.src = src;
+                node.axis = axis.0;
+                node.start = *start;
+                node.len = *len;
                 node.step = *step;
             }
-            Expr::Cat { axis, parts } => {
+            Expr::Gather { src, axis, indices } => {
+                let src = self.write_expr(src);
+                node.kind = PieLoaderExprKind::Gather as u32;
+                node.src = src;
+                node.axis = axis.0;
+                node.indices = self.shape(indices);
+            }
+            Expr::Concat { axis, parts } => {
                 let indices: Vec<u32> = parts.iter().map(|part| self.write_expr(part)).collect();
-                node.kind = PieLoaderExprKind::Cat as u32;
+                node.kind = PieLoaderExprKind::Concat as u32;
                 node.axis = axis.0;
                 node.parts = self.part_list(&indices);
             }
-            Expr::Reshape { src, shape } => {
+            Expr::Transmute { src, to } => {
                 let src = self.write_expr(src);
-                node.kind = PieLoaderExprKind::Reshape as u32;
+                node.kind = PieLoaderExprKind::Transmute as u32;
                 node.src = src;
-                node.shape = self.shape(shape);
+                node.out_shape = self.shape(&to.shape);
+                node.out_encoding = write_encoding(&to.encoding);
             }
-            Expr::Pad {
-                src,
-                axis,
-                before,
-                after,
-            } => {
-                let src = self.write_expr(src);
-                node.kind = PieLoaderExprKind::Pad as u32;
-                node.src = src;
-                node.axis = axis.0;
-                node.before = *before;
-                node.after = *after;
+            Expr::Fill { value, ty } => {
+                node.kind = PieLoaderExprKind::Fill as u32;
+                node.fill_bits = *value;
+                node.out_shape = self.shape(&ty.shape);
+                node.out_encoding = write_encoding(&ty.encoding);
             }
             Expr::Shard { src, axis } => {
                 let src = self.write_expr(src);
@@ -153,26 +188,32 @@ impl OwnedContract {
                 node.src = src;
                 node.axis = axis.0;
             }
-            Expr::Repack { src, spec, out } => {
+            Expr::Repack { src, spec, to } => {
                 let src = self.write_expr(src);
                 node.kind = PieLoaderExprKind::Repack as u32;
                 node.src = src;
                 node.repack = write_repack(spec);
-                node.out_shape = self.shape(&out.shape);
-                node.out_encoding = write_encoding(&out.encoding);
+                node.out_shape = self.shape(&to.shape);
+                node.out_encoding = write_encoding(&to.encoding);
             }
-            Expr::Quantize { src, spec } => {
+            Expr::Cast { src, to } => {
                 let src = self.write_expr(src);
-                node.kind = PieLoaderExprKind::Quantize as u32;
+                node.kind = PieLoaderExprKind::Cast as u32;
                 node.src = src;
-                node.quant = write_quant(spec);
+                node.out_encoding = write_encoding(to);
             }
-            Expr::Bitcast { src, out } => {
+            Expr::Scale { src, factor } => {
                 let src = self.write_expr(src);
-                node.kind = PieLoaderExprKind::Bitcast as u32;
+                node.kind = PieLoaderExprKind::Scale as u32;
                 node.src = src;
-                node.out_shape = self.shape(&out.shape);
-                node.out_encoding = write_encoding(&out.encoding);
+                match factor {
+                    ScaleFactor::Uniform(bits) => node.scale_factor_bits = *bits,
+                    ScaleFactor::PerGroup { by, group, axis } => {
+                        node.scale_by = self.write_expr(by);
+                        node.scale_group = *group;
+                        node.axis = axis.0;
+                    }
+                }
             }
         }
         self.push(node)
@@ -220,16 +261,10 @@ pub fn write_contract(contract: &ModelContract) -> OwnedContract {
         let scales = match &tensor.scales {
             Some(scales) => PieLoaderScalesView {
                 of: owned.name(&scales.of),
-                granularity: match scales.granularity {
-                    QuantGranularity::PerChannel => PieLoaderQuantGranularity::PerChannel,
-                    QuantGranularity::PerGroup => PieLoaderQuantGranularity::PerGroup,
-                },
+                granularity: PieLoaderQuantGranularity::from(scales.granularity) as u32,
                 group_size: scales.group_size,
                 channel_axis: scales.channel_axis,
-                form: match scales.form {
-                    ScaleForm::RawE8M0 => PieLoaderScaleForm::RawE8M0,
-                    ScaleForm::F32Factors => PieLoaderScaleForm::F32Factors,
-                },
+                form: PieLoaderScaleForm::from(scales.form) as u32,
             },
             None => PieLoaderScalesView::default(),
         };
@@ -239,6 +274,10 @@ pub fn write_contract(contract: &ModelContract) -> OwnedContract {
             shape,
             encoding,
             scales,
+            visibility: match tensor.visibility {
+                Visibility::Public => PieLoaderVisibility::Public,
+                Visibility::Internal => PieLoaderVisibility::Internal,
+            },
         });
     }
     owned

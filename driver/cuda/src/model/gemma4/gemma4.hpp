@@ -85,7 +85,7 @@ struct Gemma4LayerWeights {
     // stand-alone module: RMSNorm-no-scale → channel-scale → 1/sqrt(H)
     // → linear → softmax → top-k → renorm → per-expert-scale.
     const DeviceTensor* router_proj            = nullptr;  // [E, H]
-    const DeviceTensor* router_scale           = nullptr;  // [H]
+    const DeviceTensor* router_scale           = nullptr;  // [H], 1/sqrt(H) folded in
     const DeviceTensor* router_per_expert_scale = nullptr; // [E]
     const DeviceTensor* moe_gate_up_proj       = nullptr;  // [E, 2*Im, H]
     const DeviceTensor* moe_down_proj          = nullptr;  // [E, H, Im]
@@ -124,11 +124,6 @@ struct Gemma4Weights {
     const DeviceTensor* final_norm  = nullptr;       // model.language_model.norm
     const DeviceTensor* lm_head     = nullptr;       // tied to embed unless lm_head.weight present
     std::vector<Gemma4LayerWeights> layers;
-
-    // Owned per-layer `router.scale` baked together with `1/sqrt(H)`,
-    // so the router pipeline collapses to a single rmsnorm+weight call.
-    // Empty on dense Gemma-4 ckpts; one tensor per layer when MoE is on.
-    std::vector<DeviceTensor> owned_router_combined_scales;
 
     // Cached per-layer arrays for the forward / KV-cache allocator.
     std::vector<int> per_layer_head_dim;

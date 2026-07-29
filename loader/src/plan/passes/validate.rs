@@ -138,16 +138,18 @@ pub(super) fn validate_target_support(program: &mut LoadPlan) -> Result<usize> {
         };
         let advertised = program.target.tile_map_mask & kind.capability_bit() != 0;
         let supported = advertised
-            && (matches!(kind, TileMapKind::Cast | TileMapKind::Reblock)
-                || (*kind == TileMapKind::Encode
-                    && matches!(
-                        transform.to,
-                        Some(
-                            QuantScheme::Fp8E4M3
-                                | QuantScheme::Int8Symmetric
-                                | QuantScheme::Mxfp4E2M1E8M0
-                        )
-                    ))
+            && (matches!(
+                kind,
+                TileMapKind::Cast | TileMapKind::Reblock | TileMapKind::Scale
+            ) || (*kind == TileMapKind::Encode
+                && matches!(
+                    transform.to,
+                    Some(
+                        QuantScheme::Fp8E4M3
+                            | QuantScheme::Int8Symmetric
+                            | QuantScheme::Mxfp4E2M1E8M0
+                    )
+                ))
                 || (*kind == TileMapKind::Repack
                     && (matches!(transform.repack.layout, RepackLayout::DenseRowGather)
                         || (program.target.native_mxfp4_moe
@@ -159,6 +161,41 @@ pub(super) fn validate_target_support(program: &mut LoadPlan) -> Result<usize> {
             return Err(Error::Unsupported(format!(
                 "{:?} target does not support {:?} TileMap ({:?}->{:?})",
                 program.target.backend, kind, transform.from, transform.to
+            )));
+        }
+    }
+    Ok(0)
+}
+
+/// A per-group [`TileMapKind::Scale`] keeps the operand holding its factors.
+///
+/// The pairing is stated in the contract and checked by `infer`, but it only
+/// reaches the executor as an entry in `inputs`, and an optimizer pass that
+/// rewrites operands has no other reason to keep that entry. Losing it would
+/// not fail to compile — it would silently scale by whatever the executor found
+/// first — so the final plan says the invariant out loud.
+pub(super) fn validate_scale_factors(program: &mut LoadPlan) -> Result<usize> {
+    for instr in &program.instrs {
+        let StorageInstr::TileMap {
+            kind,
+            source,
+            inputs,
+            transform,
+            ..
+        } = instr
+        else {
+            continue;
+        };
+        if *kind != TileMapKind::Scale || transform.scale_group == 0 {
+            continue;
+        }
+        // One operand carries the payload unless it arrives as a source
+        // extent, and one carries the factors. Both, or neither is found.
+        let wanted = 1 + usize::from(source.is_none());
+        if inputs.len() != wanted {
+            return Err(Error::Contract(format!(
+                "per-group Scale has {} input operands, expected {wanted}                  (payload then factors)",
+                inputs.len()
             )));
         }
     }
@@ -211,12 +248,7 @@ pub(super) fn validate_persistent_layout(program: &mut LoadPlan) -> Result<usize
         let StorageInstr::CreateView { input, view, .. } = instr else {
             continue;
         };
-        let Some(backing) = program.buffers.iter().find(|buffer| buffer.id == *input) else {
-            return Err(Error::Contract(format!(
-                "CreateView references missing backing buffer {}",
-                input.0
-            )));
-        };
+        let backing = program.buffer(*input)?;
         let extent = extent_storage_bytes(&view.stride)?;
         let end = view
             .offset

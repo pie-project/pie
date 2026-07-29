@@ -17,7 +17,7 @@ fn stored_contract(name: &str) -> ModelContract {
 use pie_loader::checkpoint::{CheckpointFile, CheckpointMetadata, RawTensor};
 use pie_loader::contract::{Expr, ModelContract, Scales, TensorContract, TensorType};
 use pie_loader::plan::compile as compile_load_plan;
-use pie_loader::plan::{StorageInstr, StorageTarget, TileMapKind};
+use pie_loader::plan::{LoadPlan, StorageInstr, StorageTarget, TileMapKind};
 use pie_loader::types::{
     Axis, BackendKind, CheckpointFormat, DType, Encoding, FileId, QuantGranularity, QuantScheme,
     QuantSpec, RepackLayout, RowMap, ScaleForm, TensorId,
@@ -109,7 +109,7 @@ fn metal_qwen35_schema_emits_canonical_affine_u4_arena() {
         let ty = pie_loader::contract::TensorType::new(vec![rows, cols], affine_u4(64));
         TensorContract::new(
             output.to_string(),
-            Expr::src(source.to_string()).bitcast(ty),
+            Expr::src(source.to_string()).transmute(ty),
             vec![rows, cols],
             affine_u4(64),
         )
@@ -163,19 +163,19 @@ fn buffer_join_tile_maps_carry_destination_offsets() {
         tensors: vec![
             TensorContract::new(
                 "a.cast",
-                Expr::src("a"),
+                Expr::src("a").cast(Encoding::Raw(DType::BF16)),
                 vec![2],
                 Encoding::Raw(DType::BF16),
             ),
             TensorContract::new(
                 "b.cast",
-                Expr::src("b"),
+                Expr::src("b").cast(Encoding::Raw(DType::BF16)),
                 vec![2],
                 Encoding::Raw(DType::BF16),
             ),
             TensorContract::new(
                 "joined",
-                Expr::cat(0, vec![Expr::out("a.cast"), Expr::out("b.cast")]),
+                Expr::concat(0, vec![Expr::out("a.cast"), Expr::out("b.cast")]),
                 vec![4],
                 Encoding::Raw(DType::BF16),
             ),
@@ -333,7 +333,7 @@ fn target_support_rejects_cuda_decode_at_compile_time() {
         alignment: 1,
         tensors: vec![TensorContract::new(
             "decoded",
-            Expr::src("fp8"),
+            Expr::src("fp8").cast(Encoding::Raw(DType::BF16)),
             vec![4],
             Encoding::Raw(DType::BF16),
         )],
@@ -741,6 +741,101 @@ fn a_contract_whose_declared_shape_is_wrong_is_rejected() {
     assert!(error.contains("yields [2]"), "{error}");
 }
 
+/// A shard that must land on a unit boundary is said by reshaping the axis.
+///
+/// `Shard` splits an extent, and an extent cannot say what it is a
+/// concatenation *of*: `[heads * head_dim, cols]` divides by a `tp_size` that
+/// does not divide `heads`, and the split then cuts a head in half. Reshaping
+/// to `[heads, head_dim * cols]` first moves the divisibility question onto the
+/// thing that has to answer it, and reshaping back afterwards costs nothing --
+/// both are byte identities, so the whole composition still compiles to one
+/// contiguous run.
+///
+/// Nemotron-H's Mamba mixer depends on this for every band of its fused
+/// `in_proj`. The driver used to shard those on the host after the load, which
+/// is how the rule ended up restated as a hand-written divisibility check.
+#[test]
+fn a_head_boundary_shard_is_one_contiguous_run() {
+    // 4 heads of 2 rows, 2 columns; rank 1 of 2 takes heads 2 and 3, which is
+    // rows 4..8, which is bytes 32..64 of an F32 tensor.
+    let metadata = CheckpointMetadata {
+        files: vec![CheckpointFile {
+            id: FileId(0),
+            path: "model.safetensors".to_string(),
+            size_bytes: 64,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors: vec![sized_raw(0, "w", 0, 64, &[8, 2], DType::F32)],
+    };
+    let expr = Expr::src("w")
+        .transmute(TensorType::raw(vec![4, 4], DType::F32))
+        .shard(0)
+        .transmute(TensorType::raw(vec![-1, 2], DType::F32));
+    let contract = ModelContract {
+        alignment: 256,
+        tensors: vec![TensorContract::new(
+            "local",
+            expr,
+            vec![4, 2],
+            Encoding::Raw(DType::F32),
+        )],
+    };
+    let target = StorageTarget {
+        tp_rank: 1,
+        tp_size: 2,
+        ..StorageTarget::default()
+    };
+    let program = compile_load_plan(&metadata, &contract, target).unwrap();
+    let reads: Vec<&pie_loader::plan::SourceExtent> = program
+        .instrs
+        .iter()
+        .filter_map(|instr| match instr {
+            StorageInstr::BulkExtentWrite { source, .. } => Some(source),
+            StorageInstr::ExtentWrite { source, .. } => Some(source),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reads.len(), 1, "{reads:#?}");
+    assert_eq!(reads[0].file_offset, 32);
+    assert_eq!(reads[0].span_bytes, 32);
+}
+
+/// A `tp_size` that does not divide the unit count is rejected, not rounded.
+#[test]
+fn a_head_boundary_shard_rejects_an_indivisible_world() {
+    let metadata = CheckpointMetadata {
+        files: vec![CheckpointFile {
+            id: FileId(0),
+            path: "model.safetensors".to_string(),
+            size_bytes: 48,
+            format: CheckpointFormat::Safetensors,
+        }],
+        // 3 heads of 2 rows: 6 rows divides by 2, 3 heads does not.
+        tensors: vec![sized_raw(0, "w", 0, 48, &[6, 2], DType::F32)],
+    };
+    let contract = ModelContract {
+        alignment: 256,
+        tensors: vec![TensorContract::new(
+            "local",
+            Expr::src("w")
+                .transmute(TensorType::raw(vec![3, 4], DType::F32))
+                .shard(0)
+                .transmute(TensorType::raw(vec![-1, 2], DType::F32)),
+            vec![4, 2],
+            Encoding::Raw(DType::F32),
+        )],
+    };
+    let target = StorageTarget {
+        tp_rank: 1,
+        tp_size: 2,
+        ..StorageTarget::default()
+    };
+    let error = compile_load_plan(&metadata, &contract, target)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains('3') && error.contains('2'), "{error}");
+}
+
 fn metadata() -> CheckpointMetadata {
     CheckpointMetadata {
         files: vec![CheckpointFile {
@@ -754,6 +849,367 @@ fn metadata() -> CheckpointMetadata {
             raw(1, "b", 8, &[2], DType::F32),
         ],
     }
+}
+
+/// The escape hatches lower through their own arm of `Builder::tensor` instead
+/// of through `affine`, so each one has to reach the type checker on its own.
+///
+/// `Scale` shipped without doing so, and the unit tests over `infer_scale` all
+/// passed: they call `infer_type` directly, which the arm that handles the only
+/// supported form of the node never did. A zero factor — the value an FFI node
+/// carries when the author forgets to set it — compiled to a plan that loaded a
+/// tensor of zeros, cached it, and ran. Everything asserted below is a rule
+/// `infer_scale` already stated; what is under test is that `compile` asks.
+fn scale_contract(factor: f32, source: &str, dtype: DType) -> ModelContract {
+    ModelContract {
+        alignment: 256,
+        tensors: vec![TensorContract::new(
+            "out",
+            Expr::src(source).scale(factor),
+            vec![2],
+            Encoding::Raw(dtype),
+        )],
+    }
+}
+
+#[test]
+fn a_scale_by_zero_is_rejected_at_compile_time() {
+    let error = compile_load_plan(
+        &metadata(),
+        &scale_contract(0.0, "a", DType::F32),
+        StorageTarget::default(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("zero"), "{error}");
+}
+
+#[test]
+fn a_scale_by_a_non_finite_factor_is_rejected_at_compile_time() {
+    let error = compile_load_plan(
+        &metadata(),
+        &scale_contract(f32::NAN, "a", DType::F32),
+        StorageTarget::default(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("finite"), "{error}");
+}
+
+#[test]
+fn a_scale_over_integer_elements_is_rejected_at_compile_time() {
+    let metadata = CheckpointMetadata {
+        tensors: vec![raw(0, "ids", 0, &[2], DType::I32)],
+        ..metadata()
+    };
+    let error = compile_load_plan(
+        &metadata,
+        &scale_contract(0.5, "ids", DType::I32),
+        StorageTarget::default(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("I32"), "{error}");
+}
+
+#[test]
+fn a_scale_over_quantized_elements_is_rejected_at_compile_time() {
+    let contract = ModelContract {
+        alignment: 256,
+        tensors: vec![TensorContract::new(
+            "out",
+            Expr::src("q").scale(0.5),
+            vec![4, 8],
+            Encoding::Quant(quant(QuantScheme::AwqInt4, DType::BF16)),
+        )],
+    };
+    let error = compile_load_plan(&quant_metadata(), &contract, StorageTarget::default())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("quantized"), "{error}");
+}
+
+#[test]
+fn a_scale_whose_declared_shape_is_wrong_is_rejected() {
+    let contract = ModelContract {
+        alignment: 256,
+        tensors: vec![TensorContract::new(
+            "out",
+            Expr::src("a").scale(0.5),
+            vec![4],
+            Encoding::Raw(DType::F32),
+        )],
+    };
+    let error = compile_load_plan(&metadata(), &contract, StorageTarget::default())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("declares shape [4]"), "{error}");
+}
+
+/// A checkpoint holding one block-scaled MXFP4 tensor and its factors.
+///
+/// Both arrive as the bytes a safetensors file actually stores — `U8` payloads
+/// with no encoding of their own — because that is what a checkpoint records.
+/// The contract is what says one of them is four rows of thirty-two MXFP4
+/// elements and the other is one E8M0 exponent per row.
+fn block_scaled_metadata() -> CheckpointMetadata {
+    CheckpointMetadata {
+        files: vec![CheckpointFile {
+            id: FileId(0),
+            path: "model.safetensors".to_string(),
+            size_bytes: 256,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors: vec![
+            sized_raw(0, "w", 0, 64, &[4, 16], DType::U8),
+            sized_raw(1, "s", 64, 4, &[4, 1], DType::U8),
+        ],
+    }
+}
+
+fn mxfp4(channel_axis: u8) -> QuantSpec {
+    QuantSpec {
+        channel_axis: Some(Axis(channel_axis)),
+        ..quant(QuantScheme::Mxfp4E2M1E8M0, DType::BF16)
+    }
+}
+
+/// The dequantization a driver used to do by hand, said as one declaration.
+///
+/// `factors` names the tensor holding the exponents, and is the whole point:
+/// the payload and its factors are paired by a name the contract already
+/// checks, not by a suffix the executor appends to a name and hopes for.
+fn block_scaled_contract(factors: &str, group: u32, axis: u8) -> ModelContract {
+    ModelContract {
+        alignment: 256,
+        tensors: vec![
+            TensorContract::new(
+                "scales",
+                Expr::src("s").transmute(TensorType {
+                    shape: vec![4, 1],
+                    encoding: Encoding::Raw(DType::E8M0),
+                }),
+                vec![4, 1],
+                Encoding::Raw(DType::E8M0),
+            ),
+            TensorContract::new(
+                "w",
+                Expr::src("w")
+                    .transmute(TensorType {
+                        shape: vec![4, 32],
+                        encoding: Encoding::Quant(mxfp4(1)),
+                    })
+                    .scale_per_group(Expr::out(factors), group, axis),
+                vec![4, 32],
+                Encoding::Raw(DType::BF16),
+            ),
+        ],
+    }
+}
+
+#[test]
+fn a_block_scaled_dequant_is_one_scale_with_its_factors_as_an_operand() {
+    let plan = compile_load_plan(
+        &block_scaled_metadata(),
+        &block_scaled_contract("scales", 32, 1),
+        StorageTarget::default(),
+    )
+    .expect("block-scaled dequant should compile");
+
+    let scales: Vec<_> = plan
+        .instrs
+        .iter()
+        .filter_map(|instr| match instr {
+            StorageInstr::TileMap {
+                kind: TileMapKind::Scale,
+                inputs,
+                transform,
+                ..
+            } => Some((inputs.clone(), transform.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(scales.len(), 1, "{:#?}", plan.instrs);
+    let (inputs, transform) = &scales[0];
+    assert_eq!(transform.scale_group, 32);
+    assert_eq!(transform.scale_axis, 1);
+    assert_eq!(transform.from, Some(QuantScheme::Mxfp4E2M1E8M0));
+    assert_eq!(
+        transform.scale_factor_bits, 0,
+        "the uniform factor must stay unset so the two forms cannot be confused"
+    );
+    assert_eq!(
+        inputs.len(),
+        1,
+        "the payload is the source extent, so the one operand is the factors"
+    );
+}
+
+/// The capability the routed-expert families need: each rank dequantizes the
+/// shard it will compute with, and never sees the rest.
+///
+/// The shard is byte spans and the multiply is a kernel, so the two compose
+/// without either one learning about the other. What makes this worth pinning
+/// is the alignment it depends on: the factors were sharded by the contract
+/// that published them, and the payload is sharded here, and `infer` compares
+/// the two *after* both have been specialized for the rank.
+#[test]
+fn a_sharded_block_scaled_dequant_scales_only_its_own_rank() {
+    let contract = ModelContract {
+        alignment: 256,
+        tensors: vec![
+            TensorContract::new(
+                "scales",
+                Expr::src("s")
+                    .transmute(TensorType {
+                        shape: vec![4, 1],
+                        encoding: Encoding::Raw(DType::E8M0),
+                    })
+                    .shard(0),
+                vec![2, 1],
+                Encoding::Raw(DType::E8M0),
+            ),
+            TensorContract::new(
+                "w",
+                Expr::src("w")
+                    .transmute(TensorType {
+                        shape: vec![4, 32],
+                        encoding: Encoding::Quant(mxfp4(1)),
+                    })
+                    .shard(0)
+                    .scale_per_group(Expr::out("scales"), 32, 1),
+                vec![2, 32],
+                Encoding::Raw(DType::BF16),
+            ),
+        ],
+    };
+    let target = StorageTarget {
+        tp_size: 2,
+        tp_rank: 1,
+        ..StorageTarget::default()
+    };
+    let plan = compile_load_plan(&block_scaled_metadata(), &contract, target)
+        .expect("a sharded block-scaled dequant should compile");
+
+    let scale = plan
+        .instrs
+        .iter()
+        .find_map(|instr| match instr {
+            StorageInstr::TileMap {
+                kind: TileMapKind::Scale,
+                source,
+                inputs,
+                transform,
+                ..
+            } => Some((source.clone(), inputs.clone(), transform.clone())),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no Scale instruction: {:#?}", plan.instrs));
+    let (source, inputs, transform) = scale;
+    assert_eq!(transform.scale_group, 32);
+    assert_eq!(inputs.len(), 1, "the one operand is the factors");
+    let source = source.expect("rank 1's rows are contiguous, so they stay a source read");
+    assert_eq!(
+        source.span_bytes, 32,
+        "only rank 1's half of the packed bytes is read"
+    );
+    let out = plan
+        .tensors
+        .iter()
+        .find(|tensor| tensor.name == "w")
+        .expect("the contract publishes 'w'");
+    assert_eq!(
+        out.shape,
+        vec![2, 32],
+        "the output is this rank's rows, dequantized"
+    );
+}
+
+#[test]
+fn a_scale_by_a_tensor_no_contract_declares_is_rejected() {
+    let error = compile_load_plan(
+        &block_scaled_metadata(),
+        &block_scaled_contract("absent", 32, 1),
+        StorageTarget::default(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("is declared before this one"), "{error}");
+}
+
+#[test]
+fn a_scale_by_the_wrong_number_of_factors_is_rejected() {
+    let error = compile_load_plan(
+        &block_scaled_metadata(),
+        &block_scaled_contract("scales", 16, 1),
+        StorageTarget::default(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("needs [4, 2]"), "{error}");
+}
+
+#[test]
+fn a_scale_grouped_on_an_axis_that_is_not_the_last_is_rejected() {
+    let error = compile_load_plan(
+        &block_scaled_metadata(),
+        &block_scaled_contract("scales", 4, 0),
+        StorageTarget::default(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("last axis"), "{error}");
+}
+
+#[test]
+fn a_scale_by_an_unset_group_is_rejected() {
+    let error = compile_load_plan(
+        &block_scaled_metadata(),
+        &block_scaled_contract("scales", 0, 1),
+        StorageTarget::default(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("group size is zero"), "{error}");
+}
+
+/// Scaling by an expression, rather than by a tensor some contract published,
+/// is refused — and refused with the fix in the message.
+///
+/// The restriction is what keeps one copy of the factors: a driver reads them
+/// anyway, so the contract that publishes them is the one that should say what
+/// they are.
+#[test]
+fn a_scale_by_an_undeclared_expression_is_rejected() {
+    let contract = ModelContract {
+        alignment: 256,
+        tensors: vec![TensorContract::new(
+            "w",
+            Expr::src("w")
+                .transmute(TensorType {
+                    shape: vec![4, 32],
+                    encoding: Encoding::Quant(mxfp4(1)),
+                })
+                .scale_per_group(
+                    Expr::src("s").transmute(TensorType {
+                        shape: vec![4, 1],
+                        encoding: Encoding::Raw(DType::E8M0),
+                    }),
+                    32,
+                    1,
+                ),
+            vec![4, 32],
+            Encoding::Raw(DType::BF16),
+        )],
+    };
+    let error = compile_load_plan(
+        &block_scaled_metadata(),
+        &contract,
+        StorageTarget::default(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("declare them first"), "{error}");
 }
 
 fn nemotron_h_expert_metadata() -> CheckpointMetadata {
@@ -1108,7 +1564,10 @@ fn a_block_scaled_fp8_source_carries_its_scale_tensor() {
         alignment: 1,
         tensors: vec![TensorContract::new(
             "runtime.w",
-            Expr::src("w.weight"),
+            Expr::src("w.weight").cast(Encoding::Quant(quant(
+                QuantScheme::Mxfp4E2M1E8M0,
+                DType::BF16,
+            ))),
             vec![64, 64],
             Encoding::Quant(quant(QuantScheme::Mxfp4E2M1E8M0, DType::BF16)),
         )],
@@ -1150,7 +1609,10 @@ fn a_source_without_a_scale_sibling_names_none() {
         alignment: 1,
         tensors: vec![TensorContract::new(
             "runtime.w",
-            Expr::src("w.weight"),
+            Expr::src("w.weight").cast(Encoding::Quant(quant(
+                QuantScheme::Mxfp4E2M1E8M0,
+                DType::BF16,
+            ))),
             vec![64, 64],
             Encoding::Quant(quant(QuantScheme::Mxfp4E2M1E8M0, DType::BF16)),
         )],
@@ -1190,7 +1652,13 @@ fn a_padded_head_dim_zeroes_the_buffer_before_it_writes_the_rows() {
         alignment: 1,
         tensors: vec![TensorContract::new(
             "q_proj.weight",
-            Expr::src("q_proj.weight").pad(1, 0, 1),
+            Expr::concat(
+                1,
+                vec![
+                    Expr::src("q_proj.weight"),
+                    Expr::fill(0.0, TensorType::raw(vec![4, 1], DType::BF16)),
+                ],
+            ),
             vec![4, 5],
             Encoding::Raw(DType::BF16),
         )],
@@ -1269,13 +1737,9 @@ fn an_e8m0_block_scale_read_as_fp32_lowers_to_a_cast() {
         alignment: 1,
         tensors: vec![TensorContract::new(
             "runtime.w.scale",
-            Expr::Bitcast {
-                src: Box::new(Expr::src("w.scale")),
-                out: TensorType {
-                    shape: vec![8, 8],
-                    encoding: Encoding::Raw(DType::E8M0),
-                },
-            },
+            Expr::src("w.scale")
+                .transmute(TensorType::raw(vec![8, 8], DType::E8M0))
+                .cast(Encoding::Raw(DType::F32)),
             vec![8, 8],
             Encoding::Raw(DType::F32),
         )],
@@ -1333,7 +1797,10 @@ fn scales_the_loader_writes_while_encoding_mxfp4_stay_raw_e8m0() {
         alignment: 1,
         tensors: vec![TensorContract::new(
             "runtime.w",
-            Expr::src("w.weight"),
+            Expr::src("w.weight").cast(Encoding::Quant(quant(
+                QuantScheme::Mxfp4E2M1E8M0,
+                DType::BF16,
+            ))),
             vec![64, 64],
             Encoding::Quant(quant(QuantScheme::Mxfp4E2M1E8M0, DType::BF16)),
         )],
@@ -1369,7 +1836,7 @@ fn scales_the_loader_writes_while_encoding_fp8_are_f32_factors() {
         alignment: 1,
         tensors: vec![TensorContract::new(
             "runtime.w",
-            Expr::src("w.weight"),
+            Expr::src("w.weight").cast(Encoding::Quant(quant(QuantScheme::Fp8E4M3, DType::BF16))),
             vec![64, 64],
             Encoding::Quant(quant(QuantScheme::Fp8E4M3, DType::BF16)),
         )],
@@ -1470,7 +1937,8 @@ fn scales_named_for_a_weight_the_loader_quantizes_are_a_contract_error() {
         tensors: vec![
             TensorContract::new(
                 "runtime.w",
-                Expr::src("w.weight"),
+                Expr::src("w.weight")
+                    .cast(Encoding::Quant(quant(QuantScheme::Fp8E4M3, DType::BF16))),
                 vec![64, 64],
                 Encoding::Quant(quant(QuantScheme::Fp8E4M3, DType::BF16)),
             ),
@@ -1583,4 +2051,147 @@ fn scales_may_name_a_tensor_declared_after_them() {
         program.tensors[attach.scale_tensor.0 as usize].name,
         "runtime.w_scale"
     );
+}
+
+/// A quantized weight without its scales is not a smaller weight, it is an
+/// unreadable one. Each of these used to compile, publish exactly one tensor,
+/// and hand the driver an encoding whose scales did not exist.
+fn encode_to(
+    name: &str,
+    shape: &[i64],
+    scheme: QuantScheme,
+) -> Result<LoadPlan, pie_loader::error::Error> {
+    let metadata = CheckpointMetadata {
+        files: vec![CheckpointFile {
+            id: FileId(0),
+            path: "model.safetensors".to_string(),
+            size_bytes: 1 << 20,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors: vec![sized_raw(
+            0,
+            "w.weight",
+            0,
+            (shape.iter().product::<i64>() * 2) as u64,
+            shape,
+            DType::BF16,
+        )],
+    };
+    let contract = ModelContract {
+        alignment: 1,
+        tensors: vec![TensorContract::new(
+            name,
+            Expr::src("w.weight").cast(Encoding::Quant(quant(scheme, DType::BF16))),
+            shape.to_vec(),
+            Encoding::Quant(quant(scheme, DType::BF16)),
+        )],
+    };
+    compile_load_plan(&metadata, &contract, scale_target())
+}
+
+/// The encode kernels walk `[rows, cols]` tiles, so a rank-3 output has no
+/// scale layout at all -- not a different one.
+#[test]
+fn an_encode_that_cannot_place_its_scales_is_refused() {
+    let err = encode_to("runtime.w", &[2, 64, 64], QuantScheme::Mxfp4E2M1E8M0).unwrap_err();
+    assert!(err.to_string().contains("rank-3"), "{err}");
+    assert!(err.to_string().contains("runtime.w"), "{err}");
+}
+
+/// The column count is part of the scale layout, not just of the payload.
+#[test]
+fn an_encode_whose_columns_do_not_fill_a_block_is_refused() {
+    let err = encode_to("runtime.w", &[64, 48], QuantScheme::Mxfp4E2M1E8M0).unwrap_err();
+    assert!(err.to_string().contains("blocks 32 columns"), "{err}");
+}
+
+/// `QuantScheme` names every format the loader can *read*. Only three have an
+/// encoder, and asking for one of the others used to be accepted in silence.
+#[test]
+fn an_encode_into_a_scheme_no_kernel_writes_is_refused() {
+    let err = encode_to("runtime.w", &[64, 64], QuantScheme::AwqInt4).unwrap_err();
+    assert!(err.to_string().contains("no encode kernel writes"), "{err}");
+}
+
+/// Re-encoding one quantized scheme as another produced a `Transcode` neither
+/// backend implements, and no scale tensor for the new scheme's blocks. It is
+/// now refused where it is written.
+#[test]
+fn re_encoding_one_quantized_scheme_as_another_is_refused() {
+    let metadata = CheckpointMetadata {
+        files: vec![CheckpointFile {
+            id: FileId(0),
+            path: "model.safetensors".to_string(),
+            size_bytes: 1 << 20,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors: vec![RawTensor {
+            id: TensorId(0),
+            name: "w.weight".to_string(),
+            file_id: FileId(0),
+            file_offset: 0,
+            span_bytes: 4096,
+            shape: vec![64, 64],
+            encoding: Encoding::Quant(quant(QuantScheme::Fp8E4M3, DType::BF16)),
+        }],
+    };
+    let contract = ModelContract {
+        alignment: 1,
+        tensors: vec![TensorContract::new(
+            "runtime.w",
+            Expr::src("w.weight").cast(Encoding::Quant(quant(
+                QuantScheme::Mxfp4E2M1E8M0,
+                DType::BF16,
+            ))),
+            vec![64, 64],
+            Encoding::Quant(quant(QuantScheme::Mxfp4E2M1E8M0, DType::BF16)),
+        )],
+    };
+    let err = compile_load_plan(&metadata, &contract, scale_target()).unwrap_err();
+    assert!(err.to_string().contains("re-encodes Fp8E4M3"), "{err}");
+    assert!(
+        err.to_string().contains("cast to a raw type first"),
+        "{err}"
+    );
+}
+
+/// The defect `Expr::Cast` closes: a declaration that disagreed with its
+/// expression used to *cause* a conversion, so two lines that were merely
+/// inconsistent silently ran a kernel and — encoding — invented a scale tensor
+/// nothing in the type layer had checked.
+#[test]
+fn a_declaration_that_disagrees_with_its_expression_is_a_mistake_not_a_kernel() {
+    let metadata = CheckpointMetadata {
+        files: vec![CheckpointFile {
+            id: FileId(0),
+            path: "model.safetensors".to_string(),
+            size_bytes: 1 << 20,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors: vec![sized_raw(0, "w.weight", 0, 8192, &[64, 64], DType::BF16)],
+    };
+    let contract = ModelContract {
+        alignment: 1,
+        tensors: vec![TensorContract::new(
+            "runtime.w",
+            Expr::src("w.weight"),
+            vec![64, 64],
+            Encoding::Quant(quant(QuantScheme::Fp8E4M3, DType::BF16)),
+        )],
+    };
+    let err = compile_load_plan(&metadata, &contract, scale_target())
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("but its expression yields Raw(BF16)"), "{err}");
+    assert!(err.contains("explicit cast"), "{err}");
+}
+
+/// And with the cast written down, the same pair compiles and publishes the
+/// scales the encoder needs — so the assertion is not merely refusing work.
+#[test]
+fn the_same_pair_with_the_cast_written_down_encodes() {
+    let plan = encode_to("runtime.w", &[64, 64], QuantScheme::Fp8E4M3).unwrap();
+    let names: Vec<&str> = plan.tensors.iter().map(|t| t.name.as_str()).collect();
+    assert!(names.contains(&"runtime.w"), "{names:?}");
+    assert!(names.contains(&"runtime.w_scale_inv"), "{names:?}");
 }

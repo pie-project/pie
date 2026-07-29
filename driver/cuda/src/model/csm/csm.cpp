@@ -19,30 +19,23 @@ const bf* P(const DeviceTensor* t) {
 }
 }  // namespace
 
-// Resolve a tensor by name and ensure it is bf16. eustlb/csm-1b ships
-// torch_dtype float32 and the default loader ABI preserves the on-disk dtype,
-// so the bound DeviceTensors are F32. The CSM kernels are bf16-store/fp32-
-// compute, so any F32 tensor is cast to an owned bf16 copy once here (kept in
-// `bf16_owned` so the bf16 storage outlives the model). Already-bf16 tensors
-// pass through (the returned pointer aliases the loader-owned storage).
+// Resolve a tensor by name, which `csm_bf16_weights` has already declared bf16.
+//
+// eustlb/csm-1b ships torch_dtype float32, and the CSM kernels are
+// bf16-store/fp32-compute, so the contract asks for bf16 and the loader casts
+// during the load. The dtype check stays because a checkpoint that fails to
+// narrow must not reach a kernel that would read its bytes as bf16.
 const DeviceTensor* CsmWeights::bf16_tensor(LoadedModel& e, const std::string& name) {
     if (!e.has(name)) {
         throw std::runtime_error("bind_csm: missing tensor '" + name + "'");
     }
     const DeviceTensor& t = e.get(name);
-    if (t.dtype() == DType::BF16) return &t;
-    if (t.dtype() != DType::FP32) {
+    if (t.dtype() != DType::BF16) {
         throw std::runtime_error("bind_csm: tensor '" + name +
-                                 "' has unsupported dtype (expected FP32 or BF16)");
+                                 "' is not bf16; the contract asks for bf16 on "
+                                 "every CSM weight");
     }
-    auto out = std::make_unique<DeviceTensor>(
-        DeviceTensor::allocate(DType::BF16, t.shape()));
-    csm_cast_f32_to_bf16(static_cast<const float*>(t.data()),
-                         static_cast<bf*>(out->data()),
-                         static_cast<long>(t.numel()));
-    const DeviceTensor* ptr = out.get();
-    bf16_owned.push_back(std::move(out));
-    return ptr;
+    return &t;
 }
 
 CsmBackboneRawWeights CsmWeights::backbone_raw() const {

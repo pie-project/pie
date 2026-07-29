@@ -6,7 +6,7 @@
     "tp_size": 1,
     "max_tile_bytes": 67108864,
     "preferred_alignment": 256,
-    "tile_map_mask": 85,
+    "tile_map_mask": 213,
     "native_mxfp4_moe": false,
     "fusion_mask": 1,
     "encode_scratch_dtype": "BF16",
@@ -57,6 +57,12 @@
     },
     {
       "pass": "validate-target-support",
+      "instrs_before": 89,
+      "instrs_after": 89,
+      "rewrites": 0
+    },
+    {
+      "pass": "validate-scale-factors",
       "instrs_before": 89,
       "instrs_after": 89,
       "rewrites": 0
@@ -1492,12 +1498,17 @@
           "span_bytes": 131072,
           "stride": {
             "base_offset": 0,
-            "element_bytes": 1,
+            "element_bytes": 2,
             "dims": [
               {
-                "count": 131072,
-                "src_stride": 1,
-                "dst_stride": 1
+                "count": 256,
+                "src_stride": 512,
+                "dst_stride": 512
+              },
+              {
+                "count": 256,
+                "src_stride": 2,
+                "dst_stride": 2
               }
             ]
           },
@@ -1531,7 +1542,10 @@
           },
           "scratch_bytes": 0,
           "fusion": "None",
-          "metadata_source": null
+          "metadata_source": null,
+          "scale_factor_bits": 0,
+          "scale_group": 0,
+          "scale_axis": 0
         }
       }
     },
@@ -1560,12 +1574,17 @@
           "span_bytes": 32768,
           "stride": {
             "base_offset": 0,
-            "element_bytes": 1,
+            "element_bytes": 2,
             "dims": [
               {
-                "count": 32768,
-                "src_stride": 1,
-                "dst_stride": 1
+                "count": 64,
+                "src_stride": 512,
+                "dst_stride": 512
+              },
+              {
+                "count": 256,
+                "src_stride": 2,
+                "dst_stride": 2
               }
             ]
           },
@@ -1599,7 +1618,10 @@
           },
           "scratch_bytes": 0,
           "fusion": "None",
-          "metadata_source": null
+          "metadata_source": null,
+          "scale_factor_bits": 0,
+          "scale_group": 0,
+          "scale_axis": 0
         }
       }
     },
@@ -1628,12 +1650,17 @@
           "span_bytes": 32768,
           "stride": {
             "base_offset": 0,
-            "element_bytes": 1,
+            "element_bytes": 2,
             "dims": [
               {
-                "count": 32768,
-                "src_stride": 1,
-                "dst_stride": 1
+                "count": 64,
+                "src_stride": 512,
+                "dst_stride": 512
+              },
+              {
+                "count": 256,
+                "src_stride": 2,
+                "dst_stride": 2
               }
             ]
           },
@@ -1667,7 +1694,10 @@
           },
           "scratch_bytes": 0,
           "fusion": "None",
-          "metadata_source": null
+          "metadata_source": null,
+          "scale_factor_bits": 0,
+          "scale_group": 0,
+          "scale_axis": 0
         }
       }
     },
@@ -1696,12 +1726,17 @@
           "span_bytes": 131072,
           "stride": {
             "base_offset": 0,
-            "element_bytes": 1,
+            "element_bytes": 2,
             "dims": [
               {
-                "count": 131072,
-                "src_stride": 1,
-                "dst_stride": 1
+                "count": 256,
+                "src_stride": 512,
+                "dst_stride": 512
+              },
+              {
+                "count": 256,
+                "src_stride": 2,
+                "dst_stride": 2
               }
             ]
           },
@@ -1735,7 +1770,10 @@
           },
           "scratch_bytes": 0,
           "fusion": "None",
-          "metadata_source": null
+          "metadata_source": null,
+          "scale_factor_bits": 0,
+          "scale_group": 0,
+          "scale_axis": 0
         }
       }
     },
@@ -1771,12 +1809,17 @@
           "span_bytes": 360448,
           "stride": {
             "base_offset": 0,
-            "element_bytes": 1,
+            "element_bytes": 2,
             "dims": [
               {
-                "count": 360448,
-                "src_stride": 1,
-                "dst_stride": 1
+                "count": 704,
+                "src_stride": 512,
+                "dst_stride": 512
+              },
+              {
+                "count": 256,
+                "src_stride": 2,
+                "dst_stride": 2
               }
             ]
           },
@@ -1810,7 +1853,10 @@
           },
           "scratch_bytes": 0,
           "fusion": "None",
-          "metadata_source": null
+          "metadata_source": null,
+          "scale_factor_bits": 0,
+          "scale_group": 0,
+          "scale_axis": 0
         }
       }
     },
@@ -1839,12 +1885,17 @@
           "span_bytes": 360448,
           "stride": {
             "base_offset": 0,
-            "element_bytes": 1,
+            "element_bytes": 2,
             "dims": [
               {
-                "count": 360448,
-                "src_stride": 1,
-                "dst_stride": 1
+                "count": 704,
+                "src_stride": 512,
+                "dst_stride": 512
+              },
+              {
+                "count": 256,
+                "src_stride": 2,
+                "dst_stride": 2
               }
             ]
           },
@@ -1878,7 +1929,10 @@
           },
           "scratch_bytes": 0,
           "fusion": "None",
-          "metadata_source": null
+          "metadata_source": null,
+          "scale_factor_bits": 0,
+          "scale_group": 0,
+          "scale_axis": 0
         }
       }
     },
@@ -1907,12 +1961,17 @@
           "span_bytes": 360448,
           "stride": {
             "base_offset": 0,
-            "element_bytes": 1,
+            "element_bytes": 2,
             "dims": [
               {
-                "count": 360448,
-                "src_stride": 1,
-                "dst_stride": 1
+                "count": 256,
+                "src_stride": 1408,
+                "dst_stride": 1408
+              },
+              {
+                "count": 704,
+                "src_stride": 2,
+                "dst_stride": 2
               }
             ]
           },
@@ -1946,7 +2005,10 @@
           },
           "scratch_bytes": 0,
           "fusion": "None",
-          "metadata_source": null
+          "metadata_source": null,
+          "scale_factor_bits": 0,
+          "scale_group": 0,
+          "scale_axis": 0
         }
       }
     },
@@ -1982,12 +2044,17 @@
           "span_bytes": 131072,
           "stride": {
             "base_offset": 0,
-            "element_bytes": 1,
+            "element_bytes": 2,
             "dims": [
               {
-                "count": 131072,
-                "src_stride": 1,
-                "dst_stride": 1
+                "count": 256,
+                "src_stride": 512,
+                "dst_stride": 512
+              },
+              {
+                "count": 256,
+                "src_stride": 2,
+                "dst_stride": 2
               }
             ]
           },
@@ -2021,7 +2088,10 @@
           },
           "scratch_bytes": 0,
           "fusion": "None",
-          "metadata_source": null
+          "metadata_source": null,
+          "scale_factor_bits": 0,
+          "scale_group": 0,
+          "scale_axis": 0
         }
       }
     },
@@ -2050,12 +2120,17 @@
           "span_bytes": 32768,
           "stride": {
             "base_offset": 0,
-            "element_bytes": 1,
+            "element_bytes": 2,
             "dims": [
               {
-                "count": 32768,
-                "src_stride": 1,
-                "dst_stride": 1
+                "count": 64,
+                "src_stride": 512,
+                "dst_stride": 512
+              },
+              {
+                "count": 256,
+                "src_stride": 2,
+                "dst_stride": 2
               }
             ]
           },
@@ -2089,7 +2164,10 @@
           },
           "scratch_bytes": 0,
           "fusion": "None",
-          "metadata_source": null
+          "metadata_source": null,
+          "scale_factor_bits": 0,
+          "scale_group": 0,
+          "scale_axis": 0
         }
       }
     },
@@ -2118,12 +2196,17 @@
           "span_bytes": 32768,
           "stride": {
             "base_offset": 0,
-            "element_bytes": 1,
+            "element_bytes": 2,
             "dims": [
               {
-                "count": 32768,
-                "src_stride": 1,
-                "dst_stride": 1
+                "count": 64,
+                "src_stride": 512,
+                "dst_stride": 512
+              },
+              {
+                "count": 256,
+                "src_stride": 2,
+                "dst_stride": 2
               }
             ]
           },
@@ -2157,7 +2240,10 @@
           },
           "scratch_bytes": 0,
           "fusion": "None",
-          "metadata_source": null
+          "metadata_source": null,
+          "scale_factor_bits": 0,
+          "scale_group": 0,
+          "scale_axis": 0
         }
       }
     },
@@ -2186,12 +2272,17 @@
           "span_bytes": 131072,
           "stride": {
             "base_offset": 0,
-            "element_bytes": 1,
+            "element_bytes": 2,
             "dims": [
               {
-                "count": 131072,
-                "src_stride": 1,
-                "dst_stride": 1
+                "count": 256,
+                "src_stride": 512,
+                "dst_stride": 512
+              },
+              {
+                "count": 256,
+                "src_stride": 2,
+                "dst_stride": 2
               }
             ]
           },
@@ -2225,7 +2316,10 @@
           },
           "scratch_bytes": 0,
           "fusion": "None",
-          "metadata_source": null
+          "metadata_source": null,
+          "scale_factor_bits": 0,
+          "scale_group": 0,
+          "scale_axis": 0
         }
       }
     },
@@ -2261,12 +2355,17 @@
           "span_bytes": 360448,
           "stride": {
             "base_offset": 0,
-            "element_bytes": 1,
+            "element_bytes": 2,
             "dims": [
               {
-                "count": 360448,
-                "src_stride": 1,
-                "dst_stride": 1
+                "count": 704,
+                "src_stride": 512,
+                "dst_stride": 512
+              },
+              {
+                "count": 256,
+                "src_stride": 2,
+                "dst_stride": 2
               }
             ]
           },
@@ -2300,7 +2399,10 @@
           },
           "scratch_bytes": 0,
           "fusion": "None",
-          "metadata_source": null
+          "metadata_source": null,
+          "scale_factor_bits": 0,
+          "scale_group": 0,
+          "scale_axis": 0
         }
       }
     },
@@ -2329,12 +2431,17 @@
           "span_bytes": 360448,
           "stride": {
             "base_offset": 0,
-            "element_bytes": 1,
+            "element_bytes": 2,
             "dims": [
               {
-                "count": 360448,
-                "src_stride": 1,
-                "dst_stride": 1
+                "count": 704,
+                "src_stride": 512,
+                "dst_stride": 512
+              },
+              {
+                "count": 256,
+                "src_stride": 2,
+                "dst_stride": 2
               }
             ]
           },
@@ -2368,7 +2475,10 @@
           },
           "scratch_bytes": 0,
           "fusion": "None",
-          "metadata_source": null
+          "metadata_source": null,
+          "scale_factor_bits": 0,
+          "scale_group": 0,
+          "scale_axis": 0
         }
       }
     },
@@ -2397,12 +2507,17 @@
           "span_bytes": 360448,
           "stride": {
             "base_offset": 0,
-            "element_bytes": 1,
+            "element_bytes": 2,
             "dims": [
               {
-                "count": 360448,
-                "src_stride": 1,
-                "dst_stride": 1
+                "count": 256,
+                "src_stride": 1408,
+                "dst_stride": 1408
+              },
+              {
+                "count": 704,
+                "src_stride": 2,
+                "dst_stride": 2
               }
             ]
           },
@@ -2436,7 +2551,10 @@
           },
           "scratch_bytes": 0,
           "fusion": "None",
-          "metadata_source": null
+          "metadata_source": null,
+          "scale_factor_bits": 0,
+          "scale_group": 0,
+          "scale_axis": 0
         }
       }
     },

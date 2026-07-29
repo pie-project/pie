@@ -157,7 +157,8 @@ impl Options {
         };
         // Not inferred from the backend: a CUDA driver running with
         // PIE_CUDA_DISABLE_FUSED_TRANSCODE=1 compiles a *different* plan, and a
-        // tool that could not express that would fail to reproduce it (§2 P2).
+        // tool that could not express that would fail to reproduce it
+        // (`architecture.md` §2 P2).
         let fused_transcode = match args.next() {
             None => backend == BackendKind::Cuda,
             Some("fused") => true,
@@ -214,10 +215,10 @@ impl Options {
     ///
     /// Without a target file this is a *stand-in*, not a claim: the numbers are
     /// CUDA's as of writing, and nothing keeps them equal to
-    /// `driver/cuda/src/loader/load_plan.hpp`. They live here rather than in the
-    /// library because a device constant inside the compiler is the thing §9
-    /// removed, and `tests/standalone.rs` enforces that. Pass a target file to
-    /// reproduce a specific driver exactly.
+    /// `driver/cuda/src/loader/load_plan.hpp`. They live here rather than in
+    /// the library because a device constant inside the compiler is the thing
+    /// `architecture.md` §9 removed, and `tests/standalone.rs` enforces that.
+    /// Pass a target file to reproduce a specific driver exactly.
     fn target(&self) -> StorageTarget {
         if let Some(target) = &self.target {
             return target.clone();
@@ -335,7 +336,7 @@ fn diff(
 fn replay(snapshot: &Path, contract: &ModelContract, options: &Options) -> Result<(), Fail> {
     let plan = compile(snapshot, contract, options)?;
     let started = Instant::now();
-    let storage = pie_loader::host_executor::execute_plan(&plan, snapshot)?;
+    let storage = pie_loader::testkit::host_executor::execute_plan(&plan, snapshot)?;
     let bytes: usize = storage.tensors.values().map(Vec::len).sum();
     eprintln!(
         "replayed {} tensors ({bytes} bytes materialized, {} arena bytes) in {:?}",
@@ -348,18 +349,11 @@ fn replay(snapshot: &Path, contract: &ModelContract, options: &Options) -> Resul
     names.sort();
     for name in names {
         let tensor = &storage.tensors[name];
-        println!("{name}\t{}\t{:016x}", tensor.len(), checksum(tensor));
+        println!(
+            "{name}\t{}\t{:016x}",
+            tensor.len(),
+            pie_loader::cache_key::fnv1a(tensor)
+        );
     }
     Ok(())
-}
-
-/// FNV-1a over the materialized bytes. Not cryptographic — it exists so two
-/// plans that claim to produce the same tensor can be compared cheaply.
-fn checksum(bytes: &[u8]) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
 }

@@ -27,14 +27,6 @@ const DeviceTensor* maybe(const LoadedModel& e, const std::string& name) {
     return e.has(name) ? &e.get(name) : nullptr;
 }
 
-bool fused_gdn_projection_weights_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_QWEN35_FUSED_GDN_PROJ");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-    return enabled;
-}
-
 // The shared expert's scalar gate is a [1, H] projection. Packed onto the
 // gate/up weight it is one extra row of a GEMM that already runs; left on
 // its own it is a whole kernel (`sigmoid_dot_scalar_gate_add`, ~7 us per
@@ -92,57 +84,6 @@ const char* select_prefix(const LoadedModel& e) {
         return "model.language_model.";
     }
     return "model.";
-}
-
-// Per-rank slice of fused linear-attn QKV / conv1d tensors. Shares the
-// same [K1 | K2 | V] block layout as Qwen3_5; copy the helper here
-// rather than expose it across translation units.
-DeviceTensor slice_la_kkv_blocked(
-    const DeviceTensor& full, int K_dim, int V_dim,
-    int rank, int world_size)
-{
-    if (world_size <= 1) {
-        throw std::runtime_error(
-            "slice_la_kkv_blocked: world_size must be > 1");
-    }
-    if (K_dim % world_size != 0 || V_dim % world_size != 0) {
-        throw std::runtime_error(
-            "slice_la_kkv_blocked: K_dim/V_dim must divide world_size");
-    }
-    const int K_local = K_dim / world_size;
-    const int V_local = V_dim / world_size;
-    const int conv_dim       = 2 * K_dim   + V_dim;
-    const int conv_dim_local = 2 * K_local + V_local;
-    if (full.shape().empty() ||
-        static_cast<int>(full.shape()[0]) != conv_dim) {
-        throw std::runtime_error("slice_la_kkv_blocked: leading-dim mismatch");
-    }
-    std::size_t trailing = 1;
-    for (std::size_t i = 1; i < full.shape().size(); ++i) {
-        trailing *= static_cast<std::size_t>(full.shape()[i]);
-    }
-    const std::size_t row_bytes = trailing * dtype_bytes(full.dtype());
-    std::vector<std::int64_t> out_shape = full.shape();
-    out_shape[0] = conv_dim_local;
-    auto sliced = DeviceTensor::allocate(full.dtype(), out_shape);
-    const auto* src = static_cast<const std::uint8_t*>(full.data());
-    auto* dst = static_cast<std::uint8_t*>(sliced.data());
-    auto copy_block = [&](int src_offset_rows, int dst_offset_rows,
-                          int rows_per_rank) {
-        const std::size_t src_off =
-            static_cast<std::size_t>(src_offset_rows + rank * rows_per_rank) *
-            row_bytes;
-        const std::size_t dst_off =
-            static_cast<std::size_t>(dst_offset_rows) * row_bytes;
-        const std::size_t bytes =
-            static_cast<std::size_t>(rows_per_rank) * row_bytes;
-        CUDA_CHECK(cudaMemcpy(dst + dst_off, src + src_off, bytes,
-                              cudaMemcpyDeviceToDevice));
-    };
-    copy_block(0,             0,           K_local);
-    copy_block(K_dim,         K_local,     K_local);
-    copy_block(2 * K_dim,     2 * K_local, V_local);
-    return sliced;
 }
 
 DeviceTensor concat_axis0_bf16(
@@ -212,6 +153,14 @@ DeviceTensor concat_axis0_bf16(
 
 }  // namespace
 
+bool qwen35_fused_gdn_projection_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_QWEN35_FUSED_GDN_PROJ");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return enabled;
+}
+
 bool qwen35_moe_gate_up_swapped() {
     static const bool swapped = [] {
         const char* v = std::getenv("PIE_QWEN35_MOE_FLASHINFER");
@@ -278,8 +227,6 @@ Qwen3_5MoeWeights bind_qwen3_5_moe(const LoadedModel& engine) {
     // gate/up tensor.
     w.owned_bf16_buffers.reserve(static_cast<std::size_t>(L) * 8);
 
-    const int T = std::max(1, engine.distributed().tp_size);
-    const int rank = engine.distributed().tp_rank;
     int kv_slot = 0;
     for (int li = 0; li < L; ++li) {
         const std::string lp = p + "layers." + std::to_string(li) + ".";
@@ -293,51 +240,23 @@ Qwen3_5MoeWeights bind_qwen3_5_moe(const LoadedModel& engine) {
         if (kind == "linear_attention") {
             Lw.kind = Qwen3_5MoeLayerWeights::Kind::LinearAttn;
             const std::string la = lp + "linear_attn.";
-            const auto* full_qkv = &must(engine, la + "in_proj_qkv.weight");
-            const auto* full_conv_w = &must(engine, la + "conv1d.weight");
-            const auto* full_conv_b = maybe(engine, la + "conv1d.bias");
-            // Linear-attn fused QKV / conv1d use the [K1 | K2 | V] block
-            // layout — same custom slicing as Qwen3_5 dense.
-            const int K_dim = cfg.linear_num_key_heads * cfg.linear_key_head_dim;
-            const int V_dim = cfg.linear_num_value_heads * cfg.linear_value_head_dim;
-            if (T > 1) {
-                w.owned_bf16_buffers.push_back(
-                    slice_la_kkv_blocked(*full_qkv, K_dim, V_dim, rank, T));
-                Lw.la_in_proj_qkv = &w.owned_bf16_buffers.back();
-                w.owned_bf16_buffers.push_back(
-                    slice_la_kkv_blocked(*full_conv_w, K_dim, V_dim, rank, T));
-                Lw.la_conv1d_w = &w.owned_bf16_buffers.back();
-                if (full_conv_b) {
-                    w.owned_bf16_buffers.push_back(
-                        slice_la_kkv_blocked(*full_conv_b, K_dim, V_dim, rank, T));
-                    Lw.la_conv1d_b = &w.owned_bf16_buffers.back();
-                } else {
-                    Lw.la_conv1d_b = nullptr;
-                }
-            } else {
-                Lw.la_in_proj_qkv = full_qkv;
-                Lw.la_conv1d_w    = full_conv_w;
-                Lw.la_conv1d_b    = full_conv_b;
-            }
-            Lw.la_in_proj_z   = &must(engine, la + "in_proj_z.weight");
-            Lw.la_in_proj_b   = &must(engine, la + "in_proj_b.weight");
-            Lw.la_in_proj_a   = &must(engine, la + "in_proj_a.weight");
-            // Measured on Qwen3.6-35B-A3B: fusing b/a saves nothing (the
-            // split kernel that unpacks the result costs back what the
-            // dropped GEMV saved), and fusing qkv/z needs 1.4 GB of
-            // duplicate weights — the originals are arena-backed, so
-            // erasing them reclaims nothing — which leaves no viable
-            // forward/KV layout. Both stay opt-in.
-            if (fused_gdn_projection_weights_enabled()) {
-                w.owned_bf16_buffers.push_back(concat_axis0_bf16(
-                    *Lw.la_in_proj_qkv, *Lw.la_in_proj_z,
-                    "qwen3_5_moe: fuse linear_attn.in_proj_qkvz"));
-                Lw.la_in_proj_qkvz = &w.owned_bf16_buffers.back();
-                w.owned_bf16_buffers.push_back(concat_axis0_bf16(
-                    *Lw.la_in_proj_b, *Lw.la_in_proj_a,
-                    "qwen3_5_moe: fuse linear_attn.in_proj_ba"));
-                Lw.la_in_proj_ba = &w.owned_bf16_buffers.back();
-            }
+            // Whichever layout the contract published. The fused switch makes
+            // the join a load-time `Concat`, so the separate tensors are simply
+            // absent -- there is never a moment when both are resident. That
+            // is what retired the old objection to fusing qkv/z on
+            // Qwen3.6-35B-A3B: the bind-time concatenation needed 1.4 GB of
+            // duplicate weights, because the arena-backed sources reclaimed
+            // nothing when erased. Joining b/a is still measured as a wash.
+            Lw.la_in_proj_qkvz = maybe(engine, la + "in_proj_qkvz.weight");
+            Lw.la_in_proj_ba = maybe(engine, la + "in_proj_ba.weight");
+            Lw.la_in_proj_qkv = maybe(engine, la + "in_proj_qkv.weight");
+            Lw.la_in_proj_z = maybe(engine, la + "in_proj_z.weight");
+            Lw.la_in_proj_b = maybe(engine, la + "in_proj_b.weight");
+            Lw.la_in_proj_a = maybe(engine, la + "in_proj_a.weight");
+            // This rank's `[K/T | K/T | V/T]`: the contract states the
+            // per-block shard, so the whole tensor is never resident here.
+            Lw.la_conv1d_w = &must(engine, la + "conv1d.weight");
+            Lw.la_conv1d_b = maybe(engine, la + "conv1d.bias");
             Lw.la_dt_bias     = &must(engine, la + "dt_bias");
             // Materialise fp32 copies of A_log + RMSNormGated weight so
             // the kernel signature stays uniform across Qwen3.5 (fp32 on

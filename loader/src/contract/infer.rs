@@ -1,24 +1,29 @@
-//! The type checker: what an [`Expr`] denotes, and what it denotes at one rank.
+//! The type checker: what an [`Expr`] denotes, at one point in a
+//! tensor-parallel split.
 //!
 //! Inference answers *"what shape and encoding does this expression produce"*,
-//! and refuses the expressions that do not denote anything — a `Cat` whose parts
+//! and refuses the expressions that do not denote anything — a `Concat` whose parts
 //! disagree off the joined axis, a `Slice` that cuts a quantization group in
-//! half, a `Reshape` that changes the element count.
+//! half, a `Reshape` that changes the element count. It is *total*: every
+//! [`Expr`] variant has a type, including [`Expr::Shard`], which reads its
+//! extent off the [`Partition`] the resolver was built with.
 //!
-//! Specialization answers the same question one rank at a time: it replaces
-//! every [`Expr::Shard`] with the slice that rank reads, and it is the only
-//! place a rank enters the algebra. `spec.md` §6.3 rests on that being true.
+//! Specialization is the rewrite that eliminates [`Expr::Shard`], replacing each
+//! one with the concrete slice this rank reads. Lowering requires it, because
+//! byte offsets cannot be symbolic; typing does not. Keeping it a rewrite rather
+//! than a typing precondition is what leaves the algebra with one grammar
+//! instead of two.
 //!
-//! Both walk the same expression under the same [`Scope`], which is why they
-//! live together: they resolve names identically, and a specializer that
-//! disagreed with the checker about what a name meant would be a bug that only
-//! showed up at tp > 1.
+//! A rank enters the algebra through [`local_range`] and nowhere else;
+//! `architecture.md` §6.3 rests on that being true. Both the checker and the
+//! specializer reach it through the same [`shard_range`], so a rank they
+//! disagreed about is not expressible.
 
 use crate::error::{Error, OrOverflow};
-use crate::types::{Axis, Encoding, QuantSpec};
+use crate::types::{Axis, DType, Encoding, RepackLayout, RepackSpec};
 
 use super::compile;
-use super::{Expr, TensorType, local_range, resolve_reshape};
+use super::{Expr, Partition, ScaleFactor, TensorType, local_range, resolve_extents};
 
 /// Resolves [`Expr::Src`] names against a checkpoint.
 pub trait CheckpointTypes {
@@ -59,9 +64,14 @@ impl Checked {
 struct Scope<'a> {
     checkpoint: &'a dyn CheckpointTypes,
     resolved: Checked,
+    partition: Partition,
+    /// What the caller is resolving, for the message an indivisible axis
+    /// produces. This is the text a user sees when a `tp_size` does not fit the
+    /// model, so it wants to be a tensor name rather than a shape.
+    what: String,
 }
 
-/// Type-check a standalone expression, with no prior contracts in scope.
+/// Type-check a standalone expression against the unsplit tensor.
 ///
 /// Returns the inferred type alongside the resolution the compiler needs. Used
 /// by builders that would rather derive a shape than declare it, and by tests.
@@ -69,8 +79,8 @@ pub fn infer_type(
     expr: &Expr,
     checkpoint: &dyn CheckpointTypes,
 ) -> Result<(TensorType, Checked), Error> {
-    let mut resolver = Resolver::new(checkpoint);
-    let ty = resolver.infer(expr)?;
+    let mut resolver = Resolver::new(checkpoint, Partition::WHOLE);
+    let ty = resolver.infer(expr, "expression")?;
     Ok((ty, resolver.into_checked()))
 }
 
@@ -82,39 +92,46 @@ pub fn infer_type(
 /// whole-contract `check(&ModelContract)` would be the more obvious shape, but
 /// it would have no caller — the pass that wants it is the same pass that has
 /// to lower each entry before the next one can be resolved.
+///
+/// Built for one [`Partition`], because that is what makes typing total: a
+/// resolver that did not know the split would have nothing to say about a
+/// [`Expr::Shard`], and the hole would have to be paid for by every consumer.
 pub struct Resolver<'a> {
     scope: Scope<'a>,
 }
 
 impl<'a> Resolver<'a> {
-    pub fn new(checkpoint: &'a dyn CheckpointTypes) -> Self {
+    pub fn new(checkpoint: &'a dyn CheckpointTypes, partition: Partition) -> Self {
         Self {
             scope: Scope {
                 checkpoint,
                 resolved: Checked::default(),
+                partition,
+                what: String::new(),
             },
         }
     }
 
     /// Infer `expr`'s type, resolving [`Expr::Out`] against what has been
     /// published so far.
-    pub fn infer(&mut self, expr: &Expr) -> Result<TensorType, Error> {
+    ///
+    /// `what` names the thing being resolved and appears in the divisibility
+    /// error a [`Expr::Shard`] can raise.
+    pub fn infer(&mut self, expr: &Expr, what: &str) -> Result<TensorType, Error> {
+        self.scope.what.clear();
+        self.scope.what.push_str(what);
         infer(expr, &mut self.scope)
     }
 
-    /// Rewrite `expr` for one rank of a `world`-way tensor-parallel split,
-    /// replacing every [`Expr::Shard`] with the slice that rank reads.
+    /// Rewrite `expr` for this resolver's rank, replacing every
+    /// [`Expr::Shard`] with the slice that rank reads.
     ///
-    /// `what` names the thing being specialized and appears in the divisibility
-    /// error, which is what a user sees when a tp_size does not fit the model.
-    pub fn specialize(
-        &mut self,
-        expr: Expr,
-        rank: u32,
-        world: u32,
-        what: &str,
-    ) -> Result<Expr, Error> {
-        specialize(expr, &mut self.scope, rank, world, what)
+    /// Lowering's precondition, not typing's: [`Resolver::infer`] types a
+    /// `Shard` directly, but a byte offset cannot be symbolic.
+    pub fn specialize(&mut self, expr: Expr, what: &str) -> Result<Expr, Error> {
+        self.scope.what.clear();
+        self.scope.what.push_str(what);
+        specialize(expr, &mut self.scope)
     }
 
     /// Bring `name` into scope for later expressions.
@@ -146,7 +163,17 @@ fn infer(expr: &Expr, scope: &mut Scope<'_>) -> Result<TensorType, Error> {
                 "no contract named '{name}' is declared before this one"
             ))
         }),
+        Expr::Fill { value, ty } => infer_fill(*value, ty),
         Expr::Slice {
+            src,
+            axis,
+            start,
+            len,
+        } => {
+            let ty = infer(src, scope)?;
+            infer_slice(&ty, *axis, *start, *len)
+        }
+        Expr::Stride {
             src,
             axis,
             start,
@@ -154,146 +181,129 @@ fn infer(expr: &Expr, scope: &mut Scope<'_>) -> Result<TensorType, Error> {
             step,
         } => {
             let ty = infer(src, scope)?;
-            infer_slice(&ty, *axis, *start, *len, *step)
+            infer_stride(&ty, *axis, *start, *len, *step)
         }
-        Expr::Cat { axis, parts } => {
+        Expr::Gather { src, axis, indices } => {
+            let ty = infer(src, scope)?;
+            infer_gather(&ty, *axis, indices)
+        }
+        Expr::Concat { axis, parts } => {
             let mut types = Vec::with_capacity(parts.len());
             for part in parts {
                 types.push(infer(part, scope)?);
             }
-            infer_cat(*axis, &types)
+            infer_concat(*axis, &types)
         }
-        Expr::Reshape { src, shape } => {
+        Expr::Transmute { src, to } => {
             let ty = infer(src, scope)?;
-            infer_reshape(&ty, shape)
+            infer_transmute(&ty, to, src)
         }
-        Expr::Pad {
-            src,
-            axis,
-            before,
-            after,
-        } => {
-            let ty = infer(src, scope)?;
-            infer_pad(&ty, *axis, *before, *after)
-        }
-        Expr::Repack { src, out, .. } => {
-            // Opaque by construction: we still evaluate the operand so that a
-            // broken subtree is reported, but the layout transform declares its
-            // own result.
-            infer(src, scope)?;
-            Ok(out.clone())
-        }
-        Expr::Quantize { src, spec } => {
-            let ty = infer(src, scope)?;
-            infer_quantize(&ty, spec)
-        }
-        Expr::Bitcast { src, out } => {
-            let ty = infer(src, scope)?;
-            let from = ty.byte_size()?;
-            let to = out.byte_size()?;
-            if from != to {
-                return Err(Error::Contract(format!(
-                    "Bitcast changes the byte size, {from} -> {to}"
-                )));
-            }
-            if !matches!(src.as_ref(), Expr::Src(_) | Expr::Out(_)) {
+        Expr::Repack { src, spec, to } => {
+            // A repack is a kernel reading a checkpoint tensor, so its operand
+            // is the one thing the algebra can say about it. Stated here rather
+            // than at lowering because a contract that says otherwise is
+            // wrong when it is written, not when it is compiled -- and because
+            // `check` is what an author runs.
+            if !matches!(src.as_ref(), Expr::Src(_)) {
                 return Err(Error::Contract(
-                    "Bitcast may only reinterpret a whole tensor".to_string(),
+                    "Repack reads a checkpoint tensor directly; publish the \
+                     expression first and repack that name"
+                        .to_string(),
                 ));
             }
-            Ok(out.clone())
+            let ty = infer(src, scope)?;
+            infer_repack(&ty, spec, to)
         }
-        Expr::Shard { .. } => Err(Error::Internal(
-            "Shard has no type until it is specialized against a target; call \
-             Resolver::specialize first"
-                .to_string(),
-        )),
+        Expr::Cast { src, to } => {
+            let ty = infer(src, scope)?;
+            infer_cast(&ty, to)
+        }
+        Expr::Scale { src, factor } => {
+            let ty = infer(src, scope)?;
+            match factor {
+                ScaleFactor::Uniform(bits) => infer_scale(ty, *bits),
+                ScaleFactor::PerGroup { by, group, axis } => {
+                    // The kernel reads the factors out of memory, so they have
+                    // to be a tensor that exists rather than an expression the
+                    // multiply would have to evaluate on its way past. Declare
+                    // them -- `Visibility::Internal` if the driver has no use
+                    // for them -- and scale by that name.
+                    if !matches!(by.as_ref(), Expr::Out(_)) {
+                        return Err(Error::Contract(
+                            "Scale factors must be a declared tensor; declare \
+                             them first and scale by that name"
+                                .to_string(),
+                        ));
+                    }
+                    let by = infer(by, scope)?;
+                    infer_scale_per_group(ty, by, *group, *axis)
+                }
+            }
+        }
+        Expr::Shard { src, axis } => {
+            let ty = infer(src, scope)?;
+            let (start, len) = shard_range(&ty, *axis, scope.partition, &scope.what)?;
+            // Routed through `infer_slice` rather than rewriting the extent
+            // directly, so that a shard is checked by everything a slice is —
+            // in particular the quantization-group alignment that decides
+            // whether this rank's band still lines up with its scales.
+            infer_slice(&ty, *axis, start, len)
+        }
     }
 }
 
-/// Rewrite every [`Expr::Shard`] in `expr` into the concrete slice `rank` reads,
-/// resolving extents through `scope`.
+/// The band of `ty`'s `axis` that `partition` owns.
 ///
-/// Children first, so that a shard over a shard — or over a [`Expr::Cat`] whose
-/// legs are themselves sharded — sees an operand it can already type.
-fn specialize(
-    expr: Expr,
-    scope: &mut Scope<'_>,
-    rank: u32,
-    world: u32,
+/// The one place [`Expr::Shard`] is given meaning. Both the checker and
+/// [`specialize`] come through here, so the extent one states and the slice the
+/// other emits are the same arithmetic by construction.
+fn shard_range(
+    ty: &TensorType,
+    axis: Axis,
+    partition: Partition,
     what: &str,
-) -> Result<Expr, Error> {
-    macro_rules! go {
-        ($src:expr) => {
-            Box::new(specialize(*$src, scope, rank, world, what)?)
-        };
+) -> Result<(i64, i64), Error> {
+    let index = axis_index(axis, ty.rank(), what)?;
+    local_range(
+        ty.shape[index],
+        partition.world,
+        partition.rank,
+        &format!("'{what}' along axis {index}"),
+    )
+}
+
+/// Fill in everything about `expr` that only the target knows: which band a
+/// [`Expr::Shard`] denotes, and what a [`Expr::Transmute`] wildcard stands for.
+///
+/// Both are extents the author declined to compute, and a byte offset cannot be
+/// symbolic, so lowering sees neither. Doing it here rather than at lowering is
+/// what lets the two agree by construction: the shape a `Transmute` is *checked*
+/// against and the shape its bytes are *placed* under come from the same call.
+///
+/// Children first, so that a shard over a shard — or over a [`Expr::Concat`] whose
+/// legs are themselves sharded — sees an operand it can already type.
+fn specialize(expr: Expr, scope: &mut Scope<'_>) -> Result<Expr, Error> {
+    if let Expr::Transmute { src, to } = expr {
+        let src = specialize(*src, scope)?;
+        let ty = infer(&src, scope)?;
+        let to = infer_transmute(&ty, &to, &src)?;
+        return Ok(src.transmute(to));
     }
-    Ok(match expr {
-        Expr::Src(_) | Expr::Out(_) => expr,
-        Expr::Slice {
-            src,
-            axis,
-            start,
-            len,
-            step,
-        } => Expr::Slice {
-            src: go!(src),
-            axis,
-            start,
-            len,
-            step,
-        },
-        Expr::Reshape { src, shape } => Expr::Reshape {
-            src: go!(src),
-            shape,
-        },
-        Expr::Pad {
-            src,
-            axis,
-            before,
-            after,
-        } => Expr::Pad {
-            src: go!(src),
-            axis,
-            before,
-            after,
-        },
-        Expr::Repack { src, spec, out } => Expr::Repack {
-            src: go!(src),
-            spec,
-            out,
-        },
-        Expr::Quantize { src, spec } => Expr::Quantize {
-            src: go!(src),
-            spec,
-        },
-        Expr::Bitcast { src, out } => Expr::Bitcast { src: go!(src), out },
-        Expr::Cat { axis, parts } => Expr::Cat {
-            axis,
-            parts: parts
-                .into_iter()
-                .map(|part| specialize(part, scope, rank, world, what))
-                .collect::<Result<_, _>>()?,
-        },
-        Expr::Shard { src, axis } => {
-            let src = specialize(*src, scope, rank, world, what)?;
-            if world <= 1 {
-                // Not a degenerate one-rank slice but the operand itself, so
-                // that a single-GPU plan is identical to one compiled from a
-                // contract that never mentioned sharding.
-                return Ok(src);
-            }
-            let ty = infer(&src, scope)?;
-            let index = axis_index(axis, ty.shape.len(), what)?;
-            let (start, len) = local_range(
-                ty.shape[index],
-                world,
-                rank,
-                &format!("'{what}' along axis {index}"),
-            )?;
-            src.slice(axis.0, start, len)
-        }
-    })
+    // Every other variant is structural: its operands specialize and it puts
+    // itself back together, which is what `map_children` says once.
+    let Expr::Shard { src, axis } = expr else {
+        return expr.map_children(|src| specialize(src, scope));
+    };
+    let src = specialize(*src, scope)?;
+    if scope.partition.world <= 1 {
+        // Not a degenerate one-rank slice but the operand itself, so that a
+        // single-GPU plan is identical to one compiled from a contract that
+        // never mentioned sharding.
+        return Ok(src);
+    }
+    let ty = infer(&src, scope)?;
+    let (start, len) = shard_range(&ty, axis, scope.partition, &scope.what)?;
+    Ok(src.slice(axis.0, start, len))
 }
 
 /// Resolve an [`Axis`] against a rank, rejecting out-of-range axes.
@@ -324,27 +334,25 @@ fn block_granularity(encoding: &Encoding, axis: usize) -> Option<i64> {
     (group > 1).then_some(group)
 }
 
-fn infer_slice(
+/// Shared by [`Expr::Slice`] and [`Expr::Stride`]: both name `len` positions
+/// `step` apart from `start`, and both must land inside the axis.
+fn selected_axis(
     ty: &TensorType,
     axis: Axis,
     start: i64,
     len: i64,
     step: i64,
-) -> Result<TensorType, Error> {
-    let index = axis_index(axis, ty.rank(), "Slice")?;
-    if step < 1 {
-        return Err(Error::Contract(format!(
-            "Slice step must be >= 1, got {step}"
-        )));
-    }
+    what: &str,
+) -> Result<usize, Error> {
+    let index = axis_index(axis, ty.rank(), what)?;
     if len < 1 {
         return Err(Error::Contract(format!(
-            "Slice len must be >= 1, got {len}"
+            "{what} len must be >= 1, got {len}"
         )));
     }
     if start < 0 {
         return Err(Error::Contract(format!(
-            "Slice start must be >= 0, got {start}"
+            "{what} start must be >= 0, got {start}"
         )));
     }
     let extent = ty.shape[index];
@@ -352,44 +360,128 @@ fn infer_slice(
         .checked_add(
             len.checked_sub(1)
                 .and_then(|n| n.checked_mul(step))
-                .or_overflow("Slice extent overflows i64")?,
+                .or_overflow("selection overflows i64")?,
         )
-        .or_overflow("Slice extent overflows i64")?;
+        .or_overflow("selection overflows i64")?;
     if last >= extent {
         return Err(Error::Contract(format!(
-            "Slice reads index {last} of axis {index}, which has extent {extent}"
+            "{what} reads index {last} of axis {index}, which has extent {extent}"
         )));
     }
+    Ok(index)
+}
+
+fn narrowed(ty: &TensorType, index: usize, len: i64) -> TensorType {
+    let mut shape = ty.shape.clone();
+    shape[index] = len;
+    TensorType {
+        shape,
+        encoding: ty.encoding.clone(),
+    }
+}
+
+fn infer_slice(ty: &TensorType, axis: Axis, start: i64, len: i64) -> Result<TensorType, Error> {
+    let index = selected_axis(ty, axis, start, len, 1, "Slice")?;
+    if let Some(group) = block_granularity(&ty.encoding, index)
+        && (start % group != 0 || len % group != 0)
+    {
+        return Err(Error::Contract(format!(
+            "Slice [{start}, {len}) on quantized axis {index} is not aligned to its {group}-element groups"
+        )));
+    }
+    Ok(narrowed(ty, index, len))
+}
+
+fn infer_stride(
+    ty: &TensorType,
+    axis: Axis,
+    start: i64,
+    len: i64,
+    step: i64,
+) -> Result<TensorType, Error> {
+    if step < 2 {
+        return Err(Error::Contract(format!(
+            "Stride step must be >= 2, got {step}; a contiguous run is a Slice"
+        )));
+    }
+    let index = selected_axis(ty, axis, start, len, step, "Stride")?;
+    // A band may land on a quantized axis if it lands on group boundaries. A
+    // stride may not land on one at all: taking every other element of a block
+    // leaves a block that no scale describes.
     if let Some(group) = block_granularity(&ty.encoding, index) {
-        if step != 1 {
+        return Err(Error::Contract(format!(
+            "Stride with step {step} on quantized axis {index} would split its {group}-element groups"
+        )));
+    }
+    Ok(narrowed(ty, index, len))
+}
+
+/// The general placement, and the one the other two are special cases of.
+///
+/// Every rule here exists to keep the three nodes telling the truth about what
+/// they cost. A list that is a run, or a run with a constant gap, denotes
+/// something [`Expr::Slice`] or [`Expr::Stride`] says in constant space and
+/// lowers to correspondingly fewer byte runs, so writing it as a list is not a
+/// second way to say the same thing — it is a way to hide the cheaper one. The
+/// same principle already refuses a `Stride` of step 1.
+///
+/// [`Expr::Slice`]: crate::contract::Expr::Slice
+/// [`Expr::Stride`]: crate::contract::Expr::Stride
+fn infer_gather(ty: &TensorType, axis: Axis, indices: &[i64]) -> Result<TensorType, Error> {
+    let index = axis_index(axis, ty.rank(), "Gather")?;
+    let extent = ty.shape[index];
+    let Some((&first, rest)) = indices.split_first() else {
+        return Err(Error::Contract(
+            "Gather needs at least one index".to_string(),
+        ));
+    };
+    for &i in indices {
+        if i < 0 || i >= extent {
             return Err(Error::Contract(format!(
-                "Slice with step {step} on quantized axis {index} would split its {group}-element groups"
-            )));
-        }
-        if start % group != 0 || len % group != 0 {
-            return Err(Error::Contract(format!(
-                "Slice [{start}, {len}) on quantized axis {index} is not aligned to its {group}-element groups"
+                "Gather reads index {i} of axis {index}, which has extent {extent}"
             )));
         }
     }
-    let mut shape = ty.shape.clone();
-    shape[index] = len;
-    Ok(TensorType {
-        shape,
-        encoding: ty.encoding.clone(),
-    })
+    // Same reason a stride may not: a permutation of the elements inside a
+    // block leaves a block no scale describes. Permuting whole blocks is a
+    // `Concat` of `Slice`s, which keeps every group intact and is checked as such.
+    if let Some(group) = block_granularity(&ty.encoding, index) {
+        return Err(Error::Contract(format!(
+            "Gather on quantized axis {index} would split its {group}-element groups"
+        )));
+    }
+    // A single index is a band of one, and every constant-gap list is one of
+    // the two cheaper nodes. `step` is only a progression if it is positive:
+    // a descending or repeating list is a genuine gather.
+    let step = rest.first().map_or(1, |second| second - first);
+    if step >= 1
+        && rest
+            .iter()
+            .zip(indices)
+            .all(|(next, prev)| next - prev == step)
+    {
+        let name = if step == 1 { "Slice" } else { "Stride" };
+        return Err(Error::Contract(format!(
+            "Gather of {} indices from {first} in steps of {step} is a {name}, \
+             which costs less to lower; say that instead",
+            indices.len()
+        )));
+    }
+    Ok(narrowed(ty, index, indices.len() as i64))
 }
 
-fn infer_cat(axis: Axis, parts: &[TensorType]) -> Result<TensorType, Error> {
+fn infer_concat(axis: Axis, parts: &[TensorType]) -> Result<TensorType, Error> {
     let Some((head, tail)) = parts.split_first() else {
-        return Err(Error::Contract("Cat needs at least one part".to_string()));
+        return Err(Error::Contract(
+            "Concat needs at least one part".to_string(),
+        ));
     };
-    let index = axis_index(axis, head.rank(), "Cat")?;
+    let index = axis_index(axis, head.rank(), "Concat")?;
     let mut total = head.shape[index];
     for (offset, part) in tail.iter().enumerate() {
         if part.rank() != head.rank() {
             return Err(Error::Contract(format!(
-                "Cat part {} has rank {} but part 0 has rank {}",
+                "Concat part {} has rank {} but part 0 has rank {}",
                 offset + 1,
                 part.rank(),
                 head.rank()
@@ -398,7 +490,7 @@ fn infer_cat(axis: Axis, parts: &[TensorType]) -> Result<TensorType, Error> {
         for (other, (lhs, rhs)) in head.shape.iter().zip(part.shape.iter()).enumerate() {
             if other != index && lhs != rhs {
                 return Err(Error::Contract(format!(
-                    "Cat on axis {index}: part {} has shape {:?}, incompatible with part 0's {:?}",
+                    "Concat on axis {index}: part {} has shape {:?}, incompatible with part 0's {:?}",
                     offset + 1,
                     part.shape,
                     head.shape
@@ -409,7 +501,7 @@ fn infer_cat(axis: Axis, parts: &[TensorType]) -> Result<TensorType, Error> {
             != crate::types::normalize_encoding(&head.encoding)
         {
             return Err(Error::Contract(format!(
-                "Cat part {} is encoded as {:?}, incompatible with part 0's {:?}",
+                "Concat part {} is encoded as {:?}, incompatible with part 0's {:?}",
                 offset + 1,
                 part.encoding,
                 head.encoding
@@ -417,13 +509,13 @@ fn infer_cat(axis: Axis, parts: &[TensorType]) -> Result<TensorType, Error> {
         }
         total = total
             .checked_add(part.shape[index])
-            .or_overflow("Cat extent overflows i64")?;
+            .or_overflow("Concat extent overflows i64")?;
     }
     if let Some(group) = block_granularity(&head.encoding, index) {
         for (offset, part) in parts.iter().enumerate() {
             if part.shape[index] % group != 0 {
                 return Err(Error::Contract(format!(
-                    "Cat part {offset} contributes {} elements to quantized axis {index}, which is not a multiple of its {group}-element groups",
+                    "Concat part {offset} contributes {} elements to quantized axis {index}, which is not a multiple of its {group}-element groups",
                     part.shape[index]
                 )));
             }
@@ -437,81 +529,355 @@ fn infer_cat(axis: Axis, parts: &[TensorType]) -> Result<TensorType, Error> {
     })
 }
 
-fn infer_reshape(ty: &TensorType, requested: &[i64]) -> Result<TensorType, Error> {
-    if matches!(ty.encoding, Encoding::Quant(_)) {
-        // A block-quantized tensor's element order is tied to its block
-        // structure, so a row-major reinterpretation is not generally a byte
-        // identity. No production case needs it; see spec.md §8.
-        return Err(Error::Contract(format!(
-            "Reshape of a quantized tensor ({:?}) is not supported",
-            ty.encoding
-        )));
+/// Bits one element of `encoding` occupies. `None` when the encoding has no
+/// fixed width.
+fn element_bits(encoding: &Encoding) -> Option<u64> {
+    match encoding {
+        Encoding::Raw(dtype) => dtype.bytes().checked_mul(8),
+        Encoding::Quant(spec) => Some(u64::from(spec.clone().normalized().normalized_bits())),
     }
-    Ok(TensorType {
-        shape: resolve_reshape(requested, ty.element_count()?)?,
-        encoding: ty.encoding.clone(),
-    })
 }
 
-fn infer_pad(ty: &TensorType, axis: Axis, before: i64, after: i64) -> Result<TensorType, Error> {
-    let index = axis_index(axis, ty.rank(), "Pad")?;
-    if before < 0 || after < 0 {
+/// The shape from the blocked axis onward, when the encoding blocks one.
+///
+/// What a rename may not touch: a quantized tensor's scales are laid out
+/// against these extents, so regrouping them moves data out from under its
+/// factors while the byte count still balances.
+fn blocked_suffix(ty: &TensorType) -> Option<&[i64]> {
+    let Encoding::Quant(spec) = &ty.encoding else {
+        return None;
+    };
+    let channel = usize::from(spec.channel_axis?.0);
+    ty.shape.get(channel..)
+}
+
+/// [`Expr::Transmute`]: the same bytes named differently.
+///
+/// `src` is passed for its *form* alone — whether it is a whole tensor — which
+/// is the one thing a type cannot say and the one thing a change of element
+/// width needs to know.
+fn infer_transmute(ty: &TensorType, to: &TensorType, src: &Expr) -> Result<TensorType, Error> {
+    let from_bytes = ty.byte_size()?;
+    let bits = element_bits(&to.encoding).ok_or_else(|| {
+        Error::Contract(format!(
+            "Transmute to {:?} has no element width",
+            to.encoding
+        ))
+    })?;
+    let total_bits = from_bytes
+        .checked_mul(8)
+        .or_overflow("Transmute byte size")?;
+    if !total_bits.is_multiple_of(bits) {
         return Err(Error::Contract(format!(
-            "Pad amounts must be >= 0, got before={before} after={after}"
+            "Transmute of {from_bytes} bytes does not divide into {bits}-bit elements"
         )));
     }
-    if before == 0 && after == 0 {
+    let total = i64::try_from(total_bits / bits).or_overflow("Transmute element count")?;
+    let resolved = TensorType {
+        shape: resolve_extents(&to.shape, total)?,
+        encoding: to.encoding.clone(),
+    };
+
+    let to_bytes = resolved.byte_size()?;
+    if from_bytes != to_bytes {
+        return Err(Error::Contract(format!(
+            "Transmute changes the byte size, {from_bytes} -> {to_bytes}"
+        )));
+    }
+    if element_bits(&ty.encoding) != Some(bits) && !matches!(src, Expr::Src(_) | Expr::Out(_)) {
         return Err(Error::Contract(
-            "Pad by zero on both sides has no effect; omit it".to_string(),
+            "Transmute changes the element width, so it may only rename a whole \
+             tensor; publish the expression first and transmute that name"
+                .to_string(),
         ));
     }
-    if let Some(group) = block_granularity(&ty.encoding, index)
-        && (before % group != 0 || after % group != 0)
+    if let (Some(from), Some(to)) = (blocked_suffix(ty), blocked_suffix(&resolved))
+        && from != to
     {
         return Err(Error::Contract(format!(
-            "Pad by ({before}, {after}) on quantized axis {index} is not aligned to its {group}-element groups"
+            "Transmute regroups a quantized tensor from {from:?} to {to:?} at and \
+             below its blocked axis; only leading axes may regroup"
         )));
     }
-    let extent = ty.shape[index]
-        .checked_add(before)
-        .and_then(|sum| sum.checked_add(after))
-        .or_overflow("Pad extent overflows i64")?;
-    let mut shape = ty.shape.clone();
-    shape[index] = extent;
-    Ok(TensorType {
-        shape,
-        encoding: ty.encoding.clone(),
-    })
+    Ok(resolved)
 }
 
-fn infer_quantize(ty: &TensorType, spec: &QuantSpec) -> Result<TensorType, Error> {
-    if matches!(ty.encoding, Encoding::Quant(_)) {
+/// A fill is a leaf, so it is its own declared type -- with three conditions,
+/// all of which come from the fact that the plan realizes it by zeroing the
+/// destination and never writing there.
+fn infer_fill(value: u32, ty: &TensorType) -> Result<TensorType, Error> {
+    if ty.shape.is_empty() {
+        return Err(Error::Contract(
+            "Fill has no extents; a zeroed FFI node reads as a rank-0 fill of \
+             zero, so the rank is what tells one apart from a forgotten field"
+                .to_string(),
+        ));
+    }
+    if let Some(bad) = ty.shape.iter().find(|extent| **extent < 1) {
         return Err(Error::Contract(format!(
-            "Quantize of an already-quantized tensor ({:?}) is not supported",
-            ty.encoding
+            "Fill shape {:?} has a non-positive extent {bad}; a fill has no \
+             operand to solve a wildcard against, so every extent must be given",
+            ty.shape
         )));
     }
-    let spec = spec.clone().normalized();
-    if let Some(channel) = spec.channel_axis {
-        let index = axis_index(channel, ty.rank(), "Quantize channel_axis")?;
-        let group = i64::from(spec.normalized_group_size());
-        if group > 1 && ty.shape[index] % group != 0 {
+    let Encoding::Raw(dtype) = &ty.encoding else {
+        return Err(Error::Contract(format!(
+            "Fill into {:?} is not a constant: a quantized code word means \
+             nothing without the block scale beside it, and which code reads as \
+             zero is scheme-specific",
+            ty.encoding
+        )));
+    };
+    if value != 0.0_f32.to_bits() || *dtype == DType::E8M0 {
+        return Err(Error::Contract(format!(
+            "Fill of {} as {dtype:?} is not a run of zero bytes, which is all \
+             the zeroing can write",
+            f32::from_bits(value)
+        )));
+    }
+    Ok(ty.clone())
+}
+
+/// A repack is opaque to the checker in one direction only.
+///
+/// What the swizzle does to a byte is a kernel's business, and this cannot see
+/// through it -- which is why `out` is declared rather than derived. But *how
+/// many* bytes there are on each side is not opaque at all: a
+/// [`RepackSpec`] states the source and target geometry in full, so both types
+/// are determined by it, and a declaration that disagrees is wrong.
+///
+/// Leaving them unrelated was a memory-safety hole, not a stylistic one. The
+/// destination buffer is sized from `out` and the kernel writes
+/// `batch * target_rows * target_cols` elements from `spec`; a contract that
+/// understated `out` produced a device-side overrun with nothing between the
+/// author and the fault.
+fn infer_repack(ty: &TensorType, spec: &RepackSpec, to: &TensorType) -> Result<TensorType, Error> {
+    if spec.layout == RepackLayout::None {
+        return Err(Error::Contract(
+            "Repack has no layout; a zeroed spec names no kernel, so the \
+             transform would be discovered missing on the device"
+                .to_string(),
+        ));
+    }
+    // The batch and row axes are common to every layout; what a layout adds is
+    // the shape of the columns, which `plan::geometry` checks where it narrows
+    // them.
+    let (batch, rows) = (i64::from(spec.batch), i64::from(spec.source_rows));
+    if ty.rank() < 2 || ty.shape[0] != batch || ty.shape[1] != rows {
+        return Err(Error::Contract(format!(
+            "Repack operand {:?} does not begin with the [batch, source_rows] \
+             its spec declares, {batch:?}/{rows}",
+            ty.shape
+        )));
+    }
+    let cols = i64::from(spec.target_cols);
+    let want = vec![batch, i64::from(spec.target_rows), cols];
+    // A single-column target is written as the rank-2 tensor it is: a bias is
+    // `[experts, rows]`, not `[experts, rows, 1]`.
+    if to.shape != want && !(cols == 1 && to.shape == want[..2]) {
+        return Err(Error::Contract(format!(
+            "Repack declares {:?} but its spec produces {want:?}",
+            to.shape
+        )));
+    }
+    Ok(to.clone())
+}
+
+/// A cast keeps the shape and replaces the representation.
+///
+/// Which of the three directions this is falls out of the pair of encodings, so
+/// there is nothing for an author to choose beyond naming the destination --
+/// and nothing for the plan builder to derive from a coincidence of types.
+///
+/// The one pair with no meaning is quantized to quantized. There is no kernel
+/// for it in either backend, and there is no obvious one either: the scales of
+/// the destination scheme are not a function of the source's, so it is a decode
+/// and an encode however it is spelled. Saying that here makes the two-step
+/// visible instead of hiding it behind a declaration.
+fn infer_cast(ty: &TensorType, to: &Encoding) -> Result<TensorType, Error> {
+    if *to == ty.encoding {
+        return Err(Error::Contract(format!(
+            "Cast to {to:?} is what its operand already is"
+        )));
+    }
+    match (&ty.encoding, to) {
+        (Encoding::Quant(from), Encoding::Quant(into)) => {
             return Err(Error::Contract(format!(
-                "Quantize groups axis {index} by {group}, but its extent is {}",
-                ty.shape[index]
+                "Cast re-encodes {:?} as {:?}; no kernel does that in one step, \
+                 so cast to a raw type first and cast that",
+                from.scheme, into.scheme
             )));
         }
+        (_, Encoding::Quant(spec)) => {
+            // The blocked axis has to divide, or the last group of every row is
+            // short and the scales stop describing the payload.
+            if let Some(channel) = spec.channel_axis {
+                let index = axis_index(channel, ty.rank(), "Cast channel_axis")?;
+                let group = i64::from(spec.normalized_group_size());
+                if group > 1 && ty.shape[index] % group != 0 {
+                    return Err(Error::Contract(format!(
+                        "Cast groups axis {index} by {group}, but its extent is {}",
+                        ty.shape[index]
+                    )));
+                }
+            }
+        }
+        _ => {}
     }
     Ok(TensorType {
         shape: ty.shape.clone(),
-        encoding: Encoding::Quant(spec),
+        encoding: match to {
+            Encoding::Quant(spec) => Encoding::Quant(spec.clone().normalized()),
+            raw => raw.clone(),
+        },
+    })
+}
+/// A uniform `Scale` preserves both shape and encoding; only the values move.
+///
+/// Restricted to raw floating-point elements, and the restriction is the useful
+/// part. A uniform factor over a `Quant` encoding would have to mean one of two
+/// different things — decode, multiply and re-encode, or multiply the stored
+/// factors and leave the payload — and a family that wrote it would get
+/// whichever the executor happened to implement. Scaling an integer tensor is a
+/// rounding rule nobody stated. Both are refused here, where the message can
+/// name the tensor, rather than reaching a kernel that has no way to signal it
+/// did something other than what was asked.
+///
+/// A quantized operand is not refused for lack of meaning in general — it is
+/// refused for lack of meaning *with one constant*. Say the scales and it is
+/// dequantization; see [`ScaleFactor::PerGroup`].
+fn infer_scale(ty: TensorType, factor_bits: u32) -> Result<TensorType, Error> {
+    let dtype = match ty.encoding {
+        Encoding::Raw(dtype) => dtype,
+        Encoding::Quant(_) => {
+            return Err(Error::Contract(format!(
+                "Scale of a quantized tensor ({:?}) is not supported",
+                ty.encoding
+            )));
+        }
+    };
+    if !matches!(dtype, DType::F32 | DType::F16 | DType::BF16) {
+        return Err(Error::Contract(format!(
+            "Scale requires F32, F16 or BF16 elements, got {dtype:?}"
+        )));
+    }
+    // A non-finite constant scales every element to the same non-finite value,
+    // which is never what a contract meant to say and is invisible until the
+    // model produces garbage.
+    let factor = f32::from_bits(factor_bits);
+    if !factor.is_finite() {
+        return Err(Error::Contract(format!(
+            "Scale factor must be finite, got {factor}"
+        )));
+    }
+    // Zero is rejected for a different reason than the value being useless: it
+    // is what an all-zero `PieLoaderExprNode` carries, so a C++ author who
+    // builds a `Scale` node without setting `scale_factor_bits` gets exactly
+    // this. Allowing it would turn that omission into a tensor of zeros that
+    // loads, caches and runs. `-0.0` is the same bit-pattern hazard with the
+    // sign bit set, so it goes too.
+    if factor == 0.0 {
+        return Err(Error::Contract(
+            "Scale factor is zero, which is also what an unset factor field \
+             reads as; state the constant the contract meant"
+                .to_string(),
+        ));
+    }
+    Ok(ty)
+}
+
+/// A per-group `Scale` yields the logical type of what it read.
+///
+/// Over `Raw` that is the input type unchanged, as with a uniform factor. Over
+/// `Quant` it is the scheme's `logical_dtype`, and the operation is
+/// dequantization: the stored elements mean nothing without their scales, so
+/// multiplying by them is exactly what turns the payload back into numbers.
+/// That is why this is the one place the algebra unpacks a quantized tensor,
+/// and why it needs no `Dequantize` sibling.
+///
+/// The check that earns its keep is the last one. `by` must be `src` with
+/// `axis` divided by `group`, so a partition applied to the weight and not to
+/// the scales — or applied to both on different axes — is a compile error that
+/// names both shapes. Recovering that pairing from a name convention instead,
+/// below the contract, is unfalsifiable by construction.
+fn infer_scale_per_group(
+    ty: TensorType,
+    by: TensorType,
+    group: u32,
+    axis: Axis,
+) -> Result<TensorType, Error> {
+    if group == 0 {
+        return Err(Error::Contract(
+            "Scale group size is zero, which is also what an unset group field \
+             reads as; state the elements per factor the contract meant"
+                .to_string(),
+        ));
+    }
+    let out_dtype = match &ty.encoding {
+        Encoding::Raw(dtype) => *dtype,
+        Encoding::Quant(spec) => spec.logical_dtype,
+    };
+    if !matches!(out_dtype, DType::F32 | DType::F16 | DType::BF16) {
+        return Err(Error::Contract(format!(
+            "Scale requires F32, F16 or BF16 elements, got {out_dtype:?}"
+        )));
+    }
+    // The factors are read as numbers, so they must be a type that denotes one.
+    // `E8M0` is here because that is what a block-scaled checkpoint stores: a
+    // bare exponent, no sign and no mantissa.
+    match &by.encoding {
+        Encoding::Raw(DType::F32 | DType::F16 | DType::BF16 | DType::E8M0) => {}
+        other => {
+            return Err(Error::Contract(format!(
+                "Scale factors must be raw F32, F16, BF16 or E8M0 elements, got {other:?}"
+            )));
+        }
+    }
+    let index = usize::from(axis.0);
+    if index >= ty.shape.len() {
+        return Err(Error::Contract(format!(
+            "Scale group axis {index} is out of range for shape {:?}",
+            ty.shape
+        )));
+    }
+    // A group is a run of adjacent elements only on the last axis, and both
+    // executors read it as one. Requiring the axis to be named rather than
+    // assumed is what lets this be a rejection an author sees instead of a
+    // silent mis-scaling, and it is the only line that moves the day a kernel
+    // learns to stride.
+    if index + 1 != ty.shape.len() {
+        return Err(Error::Contract(format!(
+            "Scale groups run along the last axis; axis {index} of {:?} is not it",
+            ty.shape
+        )));
+    }
+    let mut want = ty.shape.clone();
+    let extent = want[index];
+    let group = i64::from(group);
+    if extent % group != 0 {
+        return Err(Error::Contract(format!(
+            "Scale group size {group} does not divide axis {index} of {:?}",
+            ty.shape
+        )));
+    }
+    want[index] = extent / group;
+    if by.shape != want {
+        return Err(Error::Contract(format!(
+            "Scale factors have shape {:?}, but scaling {:?} in groups of \
+             {group} along axis {index} needs {want:?}",
+            by.shape, ty.shape
+        )));
+    }
+    Ok(TensorType {
+        shape: ty.shape,
+        encoding: Encoding::Raw(out_dtype),
     })
 }
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::contract::{ModelContract, TensorContract};
-    use crate::types::{DType, QuantScheme};
+    use crate::types::{DType, QuantScheme, QuantSpec};
     use std::collections::HashMap;
 
     struct FakeCheckpoint(HashMap<String, TensorType>);
@@ -560,13 +926,199 @@ mod tests {
 
     fn specialize_one(expr: Expr, rank: u32, world: u32) -> Result<Expr, Error> {
         let checkpoint = qwen3();
-        Resolver::new(&checkpoint).specialize(expr, rank, world, "q")
+        Resolver::new(&checkpoint, Partition::new(rank, world)).specialize(expr, "q")
+    }
+
+    fn check_at(expr: &Expr, rank: u32, world: u32) -> Result<TensorType, Error> {
+        let checkpoint = qwen3();
+        Resolver::new(&checkpoint, Partition::new(rank, world)).infer(expr, "q")
     }
 
     #[test]
-    fn shard_has_no_type_until_it_is_specialized() {
-        let err = check_one(Expr::src("q_proj").shard(0), &qwen3()).unwrap_err();
-        assert!(format!("{err}").contains("specialize"), "{err}");
+    fn shard_types_as_this_ranks_band() {
+        // Typing is total: a `Shard` reads its extent off the resolver's
+        // partition instead of being a variant the checker has no answer for.
+        let ty = check_at(&Expr::src("q_proj").shard(0), 3, 4).unwrap();
+        assert_eq!(ty, TensorType::raw(vec![512, 2048], DType::BF16));
+    }
+
+    #[test]
+    fn a_shard_and_its_specialization_have_the_same_type() {
+        // The invariant that lets specialization be a lowering rewrite rather
+        // than a typing precondition. Both answers come from `shard_range`, so
+        // a disagreement is not expressible -- this pins that they still do.
+        let shard = Expr::concat(
+            0,
+            vec![Expr::src("k_proj").shard(0), Expr::src("v_proj").shard(0)],
+        );
+        let specialized = specialize_one(shard.clone(), 1, 2).unwrap();
+        assert_eq!(
+            check_at(&shard, 1, 2).unwrap(),
+            check_at(&specialized, 1, 2).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_shard_is_checked_by_everything_a_slice_is() {
+        // Routing through `infer_slice` is what makes this a rejection. Read
+        // as bare extent arithmetic, a shard that halves a 128-element group
+        // types fine and hands the rank a band its scales no longer describe.
+        let checkpoint = FakeCheckpoint(HashMap::from([(
+            "w".to_string(),
+            TensorType {
+                shape: vec![256, 2048],
+                encoding: Encoding::Quant(QuantSpec {
+                    scheme: QuantScheme::Mxfp4E2M1E8M0,
+                    logical_dtype: DType::BF16,
+                    bits_per_element: 4,
+                    group_size: 128,
+                    channel_axis: Some(Axis(0)),
+                }),
+            },
+        )]));
+        let expr = Expr::src("w").shard(0);
+        let mut ok = Resolver::new(&checkpoint, Partition::new(0, 2));
+        assert!(ok.infer(&expr, "w").is_ok());
+        let mut split = Resolver::new(&checkpoint, Partition::new(0, 4));
+        let err = split.infer(&expr, "w").unwrap_err();
+        assert!(format!("{err}").contains("128-element groups"), "{err}");
+    }
+
+    /// A checkpoint whose only tensor is blocked along axis 1, so the two
+    /// selection nodes can be asked the same question about the same axis.
+    fn blocked() -> FakeCheckpoint {
+        FakeCheckpoint(HashMap::from([(
+            "w".to_string(),
+            TensorType {
+                shape: vec![64, 256],
+                encoding: Encoding::Quant(QuantSpec {
+                    scheme: QuantScheme::Mxfp4E2M1E8M0,
+                    logical_dtype: DType::BF16,
+                    bits_per_element: 4,
+                    group_size: 32,
+                    channel_axis: Some(Axis(1)),
+                }),
+            },
+        )]))
+    }
+
+    /// The two nodes exist because one is cheap and the other is not, so the
+    /// cheap one must not be spellable as the expensive one.
+    #[test]
+    fn a_contiguous_run_is_a_slice_not_a_stride() {
+        let err = check_one(Expr::src("q_proj").stride(0, 0, 512, 1), &qwen3()).unwrap_err();
+        assert!(
+            err.to_string().contains("a contiguous run is a Slice"),
+            "{err}"
+        );
+    }
+
+    /// The rule that distinguishes the two on a blocked axis: a band can land
+    /// on group boundaries, a stride never can.
+    #[test]
+    fn a_band_may_cross_a_blocked_axis_where_a_stride_may_not() {
+        let ty = check_one(Expr::src("w").slice(1, 32, 64), &blocked()).unwrap();
+        assert_eq!(ty.shape, vec![64, 64]);
+
+        let err = check_one(Expr::src("w").stride(1, 0, 64, 2), &blocked()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("would split its 32-element groups"),
+            "{err}"
+        );
+    }
+
+    /// `start + (len - 1) * step` is the last index read, and it is the bound
+    /// that matters — `start + len` would admit a stride that runs off the end.
+    #[test]
+    fn a_stride_is_bounded_by_the_last_index_it_reads() {
+        let ok = check_one(Expr::src("q_proj").stride(0, 0, 1024, 2), &qwen3()).unwrap();
+        assert_eq!(ok.shape, vec![1024, 2048]);
+
+        // `start + len` is 1026, comfortably inside the axis; only the strided
+        // last index reveals that the selection runs off the end.
+        let err = check_one(Expr::src("q_proj").stride(0, 2, 1024, 2), &qwen3()).unwrap_err();
+        assert!(err.to_string().contains("reads index 2048"), "{err}");
+    }
+
+    /// The cost hierarchy, stated in the type checker: a list that either of
+    /// the cheaper nodes could express is refused with that node named. This is
+    /// the same rule that refuses a `Stride` of step 1, one rung further up.
+    #[test]
+    fn a_gather_must_not_be_expressible_as_a_slice_or_a_stride() {
+        let run = check_one(Expr::src("q_proj").gather(0, vec![4, 5, 6, 7]), &qwen3()).unwrap_err();
+        assert!(run.to_string().contains("is a Slice"), "{run}");
+
+        let progression =
+            check_one(Expr::src("q_proj").gather(0, vec![1, 4, 7, 10]), &qwen3()).unwrap_err();
+        assert!(
+            progression.to_string().contains("is a Stride"),
+            "{progression}"
+        );
+
+        // A single index is a band of one, so it is a `Slice` too.
+        let one = check_one(Expr::src("q_proj").gather(0, vec![9]), &qwen3()).unwrap_err();
+        assert!(one.to_string().contains("is a Slice"), "{one}");
+    }
+
+    /// What is left once the two cheaper nodes are excluded: an order nobody
+    /// can compute. Descending and repeating lists are genuine gathers, not
+    /// progressions in disguise.
+    #[test]
+    fn a_gather_takes_the_orders_nothing_cheaper_can_say() {
+        let permuted =
+            check_one(Expr::src("q_proj").gather(0, vec![3, 0, 2, 1]), &qwen3()).unwrap();
+        assert_eq!(permuted.shape, vec![4, 2048]);
+
+        let descending = check_one(Expr::src("q_proj").gather(0, vec![9, 6, 3]), &qwen3()).unwrap();
+        assert_eq!(descending.shape, vec![3, 2048]);
+
+        // Reading one row twice is a broadcast, and a well-defined thing to ask
+        // for -- nothing in a placement node requires the map to be injective.
+        let repeated = check_one(Expr::src("q_proj").gather(0, vec![7, 7, 7]), &qwen3()).unwrap();
+        assert_eq!(repeated.shape, vec![3, 2048]);
+    }
+
+    #[test]
+    fn a_gather_is_bounded_by_every_index_it_reads() {
+        let empty = check_one(Expr::src("q_proj").gather(0, vec![]), &qwen3()).unwrap_err();
+        assert!(empty.to_string().contains("at least one index"), "{empty}");
+
+        let past =
+            check_one(Expr::src("q_proj").gather(0, vec![0, 2048, 1]), &qwen3()).unwrap_err();
+        assert!(past.to_string().contains("reads index 2048"), "{past}");
+
+        let negative = check_one(Expr::src("q_proj").gather(0, vec![2, -1]), &qwen3()).unwrap_err();
+        assert!(
+            negative.to_string().contains("reads index -1"),
+            "{negative}"
+        );
+    }
+
+    /// The same rule a stride is held to, and for the same reason: a
+    /// permutation *inside* a block leaves a block no scale describes. Whole
+    /// blocks may be permuted, and that is a `Concat` of `Slice`s.
+    #[test]
+    fn a_gather_may_not_touch_a_quantized_axis() {
+        let err = check_one(Expr::src("w").gather(1, vec![3, 0, 2, 1]), &blocked()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("would split its 32-element groups"),
+            "{err}"
+        );
+
+        let by_block = check_one(
+            Expr::concat(
+                1,
+                vec![
+                    Expr::src("w").slice(1, 32, 32),
+                    Expr::src("w").slice(1, 0, 32),
+                ],
+            ),
+            &blocked(),
+        )
+        .unwrap();
+        assert_eq!(by_block.shape, vec![64, 64]);
     }
 
     #[test]
@@ -590,7 +1142,7 @@ mod tests {
     #[test]
     fn shard_composes_under_the_affine_fragment() {
         let expr = specialize_one(
-            Expr::cat(
+            Expr::concat(
                 0,
                 vec![Expr::src("k_proj").shard(0), Expr::src("v_proj").shard(0)],
             ),
@@ -625,9 +1177,9 @@ mod tests {
     }
 
     #[test]
-    fn cat_sums_the_joined_axis() {
+    fn concat_sums_the_joined_axis() {
         let ty = check_one(
-            Expr::cat(
+            Expr::concat(
                 0,
                 vec![
                     Expr::src("q_proj"),
@@ -642,11 +1194,11 @@ mod tests {
     }
 
     #[test]
-    fn cat_rejects_mismatched_other_axes() {
+    fn concat_rejects_mismatched_other_axes() {
         let checkpoint =
             FakeCheckpoint::new(&[("a", &[4, 8], DType::BF16), ("b", &[4, 9], DType::BF16)]);
         let err = check_one(
-            Expr::cat(0, vec![Expr::src("a"), Expr::src("b")]),
+            Expr::concat(0, vec![Expr::src("a"), Expr::src("b")]),
             &checkpoint,
         )
         .unwrap_err();
@@ -654,11 +1206,11 @@ mod tests {
     }
 
     #[test]
-    fn cat_rejects_mismatched_encodings() {
+    fn concat_rejects_mismatched_encodings() {
         let checkpoint =
             FakeCheckpoint::new(&[("a", &[4, 8], DType::BF16), ("b", &[4, 8], DType::F32)]);
         let err = check_one(
-            Expr::cat(0, vec![Expr::src("a"), Expr::src("b")]),
+            Expr::concat(0, vec![Expr::src("a"), Expr::src("b")]),
             &checkpoint,
         )
         .unwrap_err();
@@ -669,7 +1221,7 @@ mod tests {
     fn tp_shard_then_fuse_composes() {
         // TP=2 rank 0: half of each projection, concatenated.
         let ty = check_one(
-            Expr::cat(
+            Expr::concat(
                 0,
                 vec![
                     Expr::src("q_proj").slice(0, 0, 1024),
@@ -692,26 +1244,28 @@ mod tests {
     #[test]
     fn strided_slice_selects_every_other_row() {
         let checkpoint = FakeCheckpoint::new(&[("gate_up", &[512, 64], DType::BF16)]);
-        let gate = check_one(Expr::src("gate_up").slice_step(0, 0, 256, 2), &checkpoint).unwrap();
-        let up = check_one(Expr::src("gate_up").slice_step(0, 1, 256, 2), &checkpoint).unwrap();
+        let gate = check_one(Expr::src("gate_up").stride(0, 0, 256, 2), &checkpoint).unwrap();
+        let up = check_one(Expr::src("gate_up").stride(0, 1, 256, 2), &checkpoint).unwrap();
         assert_eq!(gate.shape, vec![256, 64]);
         assert_eq!(up.shape, vec![256, 64]);
         // One past the last selectable odd row.
-        assert!(check_one(Expr::src("gate_up").slice_step(0, 1, 257, 2), &checkpoint).is_err());
+        assert!(check_one(Expr::src("gate_up").stride(0, 1, 257, 2), &checkpoint).is_err());
     }
 
     #[test]
-    fn expert_stack_via_reshape_and_cat() {
+    fn expert_stack_via_transmute_and_concat() {
         let checkpoint = FakeCheckpoint::new(&[
             ("e0.gate", &[6144, 2048], DType::BF16),
             ("e1.gate", &[6144, 2048], DType::BF16),
         ]);
         let ty = check_one(
-            Expr::cat(
+            Expr::concat(
                 0,
                 vec![
-                    Expr::src("e0.gate").reshape(vec![1, 6144, 2048]),
-                    Expr::src("e1.gate").reshape(vec![1, 6144, 2048]),
+                    Expr::src("e0.gate")
+                        .transmute(TensorType::raw(vec![1, 6144, 2048], DType::BF16)),
+                    Expr::src("e1.gate")
+                        .transmute(TensorType::raw(vec![1, 6144, 2048], DType::BF16)),
                 ],
             ),
             &checkpoint,
@@ -721,32 +1275,332 @@ mod tests {
     }
 
     #[test]
-    fn reshape_infers_one_wildcard() {
-        let ty = check_one(Expr::src("q_proj").reshape(vec![16, 128, -1]), &qwen3()).unwrap();
+    fn transmute_infers_one_wildcard() {
+        let ty = check_one(
+            Expr::src("q_proj").transmute(TensorType::raw(vec![16, 128, -1], DType::BF16)),
+            &qwen3(),
+        )
+        .unwrap();
         assert_eq!(ty.shape, vec![16, 128, 2048]);
     }
 
     #[test]
-    fn reshape_rejects_element_count_changes() {
-        let err = check_one(Expr::src("q_proj").reshape(vec![2048, 2049]), &qwen3()).unwrap_err();
-        assert!(err.to_string().contains("changes the element count"));
+    fn transmute_rejects_a_shape_the_bytes_do_not_fill() {
+        let err = check_one(
+            Expr::src("q_proj").transmute(TensorType::raw(vec![2048, 2049], DType::BF16)),
+            &qwen3(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not the"), "{err}");
     }
 
+    /// The wildcard counts elements of the *output* type, so a rename that also
+    /// halves the element width doubles what `-1` stands for.
     #[test]
-    fn pad_extends_the_axis() {
-        let ty = check_one(Expr::src("k_proj").pad(0, 0, 128), &qwen3()).unwrap();
+    fn a_wildcard_is_measured_in_the_type_being_named() {
+        let ty = check_one(
+            Expr::src("q_proj").transmute(TensorType::raw(vec![2048, -1], DType::F8E4M3)),
+            &qwen3(),
+        )
+        .unwrap();
+        assert_eq!(ty.shape, vec![2048, 4096]);
+    }
+
+    /// The rule `Bitcast` had and `Reshape` did not, now stated once: a partial
+    /// view's element offsets stop meaning anything when the element size
+    /// changes under them.
+    #[test]
+    fn a_change_of_element_width_needs_a_whole_tensor() {
+        let err = check_one(
+            Expr::src("q_proj")
+                .slice(0, 0, 1024)
+                .transmute(TensorType::raw(vec![1024, 4096], DType::F8E4M3)),
+            &qwen3(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("whole"), "{err}");
+        // The same rename of the whole tensor is fine.
+        check_one(
+            Expr::src("q_proj").transmute(TensorType::raw(vec![2048, 4096], DType::F8E4M3)),
+            &qwen3(),
+        )
+        .unwrap();
+    }
+
+    /// The other half of the merge: `Reshape` refused every quantized operand,
+    /// so a stack of quantized experts had to fold its rank lift into a
+    /// `Bitcast` of the whole packed tensor. Leading axes may now regroup.
+    #[test]
+    fn a_quantized_tensor_may_gain_a_leading_axis() {
+        let checkpoint = FakeCheckpoint::new(&[("packed", &[128, 64], DType::U8)]);
+        let mxfp4 = Encoding::Quant(QuantSpec {
+            scheme: QuantScheme::Mxfp4E2M1E8M0,
+            logical_dtype: DType::BF16,
+            bits_per_element: 4,
+            group_size: 32,
+            channel_axis: Some(Axis(1)),
+        });
+        let packed = Expr::src("packed").transmute(TensorType {
+            shape: vec![128, 128],
+            encoding: mxfp4.clone(),
+        });
+        let ty = check_one(
+            packed.clone().transmute(TensorType {
+                shape: vec![1, 128, 128],
+                encoding: Encoding::Quant(QuantSpec {
+                    channel_axis: Some(Axis(2)),
+                    ..match &mxfp4 {
+                        Encoding::Quant(spec) => spec.clone(),
+                        _ => unreachable!(),
+                    }
+                }),
+            }),
+            &checkpoint,
+        )
+        .unwrap();
+        assert_eq!(ty.shape, vec![1, 128, 128]);
+
+        // Reblocking is not a rename: the byte count balances, but every scale
+        // would then cover a different 32 elements.
+        let err = check_one(
+            packed.transmute(TensorType {
+                shape: vec![256, 64],
+                encoding: mxfp4,
+            }),
+            &checkpoint,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("only leading axes"), "{err}");
+    }
+
+    /// The node that replaced `Pad`: the padding is a leg of a `Concat` with a
+    /// type of its own, which is what lets `Concat`'s existing check see it.
+    #[test]
+    fn a_fill_extends_an_axis_as_a_concat_leg() {
+        let ty = check_one(
+            Expr::concat(
+                0,
+                vec![
+                    Expr::src("k_proj"),
+                    Expr::fill(0.0, TensorType::raw(vec![128, 2048], DType::BF16)),
+                ],
+            ),
+            &qwen3(),
+        )
+        .unwrap();
         assert_eq!(ty.shape, vec![1152, 2048]);
+
+        // And a leg whose other extents disagree is now a `Concat` error, where a
+        // `Pad` could not have been wrong about them at all.
+        let err = check_one(
+            Expr::concat(
+                0,
+                vec![
+                    Expr::src("k_proj"),
+                    Expr::fill(0.0, TensorType::raw(vec![128, 2049], DType::BF16)),
+                ],
+            ),
+            &qwen3(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("Concat"), "{err}");
     }
 
     #[test]
-    fn quantize_keeps_shape_and_replaces_encoding() {
-        let ty = check_one(Expr::src("q_proj").quantize(fp8_per_row()), &qwen3()).unwrap();
+    fn a_fill_must_name_a_value_the_zeroing_can_write() {
+        for (value, encoding, why) in [
+            (
+                1.0_f32,
+                Encoding::Raw(DType::BF16),
+                "a nonzero constant is not a run of zero bytes",
+            ),
+            (
+                0.0,
+                Encoding::Raw(DType::E8M0),
+                "E8M0's zero byte is 2^-127, not zero",
+            ),
+            (
+                0.0,
+                Encoding::Quant(fp8_per_row()),
+                "a code word means nothing without its scale",
+            ),
+        ] {
+            let err = check_one(
+                Expr::fill(
+                    value,
+                    TensorType {
+                        shape: vec![4, 4],
+                        encoding,
+                    },
+                ),
+                &qwen3(),
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("Fill"), "{why}: {err}");
+        }
+    }
+
+    /// A fill has no operand, so there is nothing for a wildcard to be solved
+    /// against and nothing for a zeroed FFI node to be mistaken for.
+    #[test]
+    fn a_fill_must_give_every_extent() {
+        for shape in [vec![4, -1], vec![4, 0], vec![]] {
+            let err = check_one(
+                Expr::fill(0.0, TensorType::raw(shape.clone(), DType::BF16)),
+                &qwen3(),
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("extent") || err.to_string().contains("rank"),
+                "{shape:?}: {err}"
+            );
+        }
+    }
+
+    fn dense_row_gather(batch: u32, source_rows: u32, target_rows: u32) -> RepackSpec {
+        RepackSpec {
+            layout: RepackLayout::DenseRowGather,
+            batch,
+            source_rows,
+            target_rows,
+            valid_rows: target_rows,
+            source_stride_cols: 1,
+            source_cols: 1,
+            target_cols: 1,
+            ..RepackSpec::default()
+        }
+    }
+
+    /// The invariant `Repack` was missing. It is opaque in one direction only:
+    /// what the swizzle does to a byte is the kernel's business, but how many
+    /// bytes come out is stated twice -- once in the declaration the buffer is
+    /// sized from, once in the spec the kernel writes according to -- and
+    /// nothing made the two agree.
+    #[test]
+    fn a_repack_output_must_be_the_geometry_its_spec_produces() {
+        let checkpoint = FakeCheckpoint::new(&[("bias", &[4, 16], DType::BF16)]);
+        let spec = dense_row_gather(4, 16, 8);
+        for shape in [vec![4, 8], vec![4, 8, 1]] {
+            check_one(
+                Expr::src("bias").repack(spec, TensorType::raw(shape.clone(), DType::BF16)),
+                &checkpoint,
+            )
+            .unwrap_or_else(|err| panic!("{shape:?}: {err}"));
+        }
+        // Understating the output is the memory-safety case: the buffer would
+        // hold four rows and the kernel would write eight.
+        let err = check_one(
+            Expr::src("bias").repack(spec, TensorType::raw(vec![4, 4], DType::BF16)),
+            &checkpoint,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("[4, 8, 1]"), "{err}");
+    }
+
+    #[test]
+    fn a_repack_operand_must_be_the_source_its_spec_reads() {
+        let checkpoint = FakeCheckpoint::new(&[("bias", &[4, 16], DType::BF16)]);
+        let err = check_one(
+            Expr::src("bias").repack(
+                dense_row_gather(4, 32, 8),
+                TensorType::raw(vec![4, 8], DType::BF16),
+            ),
+            &checkpoint,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("source_rows"), "{err}");
+    }
+
+    /// `RepackLayout::None` is what a zeroed spec carries, and the device is
+    /// where it used to be discovered.
+    #[test]
+    fn a_repack_must_name_a_layout() {
+        let checkpoint = FakeCheckpoint::new(&[("bias", &[4, 16], DType::BF16)]);
+        let err = check_one(
+            Expr::src("bias").repack(
+                RepackSpec {
+                    layout: RepackLayout::None,
+                    ..dense_row_gather(4, 16, 8)
+                },
+                TensorType::raw(vec![4, 8], DType::BF16),
+            ),
+            &checkpoint,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("no layout"), "{err}");
+    }
+
+    #[test]
+    fn a_cast_keeps_shape_and_replaces_encoding() {
+        let ty = check_one(
+            Expr::src("q_proj").cast(Encoding::Quant(fp8_per_row())),
+            &qwen3(),
+        )
+        .unwrap();
         assert_eq!(ty.shape, vec![2048, 2048]);
         assert!(matches!(ty.encoding, Encoding::Quant(_)));
     }
 
+    /// Both directions, and the pair matters: one node covers encoding and
+    /// decoding because the destination is the whole of the question.
     #[test]
-    fn quantize_rejects_a_ragged_group_axis() {
+    fn a_cast_decodes_as_readily_as_it_encodes() {
+        let quantized = Expr::src("q_proj").cast(Encoding::Quant(fp8_per_row()));
+        let decoded = quantized.cast(Encoding::Raw(DType::BF16));
+        let ty = check_one(decoded, &qwen3()).unwrap();
+        assert_eq!(ty.shape, vec![2048, 2048]);
+        assert_eq!(ty.encoding, Encoding::Raw(DType::BF16));
+    }
+
+    /// A cast to what the operand already is would be a kernel that does
+    /// nothing, and it is more likely a mistake than a request.
+    #[test]
+    fn a_cast_to_the_encoding_already_held_is_rejected() {
+        let err = check_one(
+            Expr::src("q_proj").cast(Encoding::Raw(DType::BF16)),
+            &qwen3(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("already is"), "{err}");
+    }
+
+    /// There is no kernel that goes scheme to scheme, and there is no obvious
+    /// one either -- the destination's scales are not a function of the
+    /// source's. Refused here so the two-step is written down.
+    #[test]
+    fn a_cast_between_quantized_schemes_is_rejected() {
+        let mxfp4 = QuantSpec {
+            scheme: QuantScheme::Mxfp4E2M1E8M0,
+            logical_dtype: DType::BF16,
+            bits_per_element: 4,
+            group_size: 32,
+            channel_axis: Some(Axis(1)),
+        };
+        let err = check_one(
+            Expr::src("q_proj")
+                .cast(Encoding::Quant(fp8_per_row()))
+                .cast(Encoding::Quant(mxfp4)),
+            &qwen3(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("re-encodes Fp8E4M3"), "{err}");
+        assert!(
+            err.to_string().contains("cast to a raw type first"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_cast_needs_a_kernel() {
+        assert!(
+            !Expr::src("q_proj")
+                .cast(Encoding::Raw(DType::F32))
+                .is_affine()
+        );
+    }
+
+    #[test]
+    fn a_cast_rejects_a_ragged_group_axis() {
         let checkpoint = FakeCheckpoint::new(&[("w", &[64, 100], DType::BF16)]);
         let mxfp4 = QuantSpec {
             scheme: QuantScheme::Mxfp4E2M1E8M0,
@@ -755,8 +1609,8 @@ mod tests {
             group_size: 32,
             channel_axis: Some(Axis(1)),
         };
-        let err = check_one(Expr::src("w").quantize(mxfp4), &checkpoint).unwrap_err();
-        assert!(err.to_string().contains("groups axis 1 by 32"));
+        let err = check_one(Expr::src("w").cast(Encoding::Quant(mxfp4)), &checkpoint).unwrap_err();
+        assert!(err.to_string().contains("Cast groups axis 1 by 32"));
     }
 
     #[test]
@@ -769,7 +1623,7 @@ mod tests {
             group_size: 32,
             channel_axis: Some(Axis(1)),
         };
-        let quantized = Expr::src("w").quantize(mxfp4);
+        let quantized = Expr::src("w").cast(Encoding::Quant(mxfp4));
         // Aligned to the 32-element groups: fine.
         assert!(check_one(quantized.clone().slice(1, 32, 64), &checkpoint).is_ok());
         // Straddles them: rejected.
@@ -779,14 +1633,62 @@ mod tests {
 
     #[test]
     fn affine_fragment_is_recognized() {
-        let fused = Expr::cat(0, vec![Expr::src("q_proj"), Expr::src("k_proj")]);
+        let fused = Expr::concat(0, vec![Expr::src("q_proj"), Expr::src("k_proj")]);
         assert!(fused.is_affine());
-        assert!(!fused.quantize(fp8_per_row()).is_affine());
+        assert!(!fused.cast(Encoding::Quant(fp8_per_row())).is_affine());
+    }
+
+    #[test]
+    fn scale_keeps_the_type_it_was_given() {
+        let ty = check_one(Expr::src("q_proj").scale(0.25), &qwen3()).unwrap();
+        assert_eq!(ty.shape, vec![2048, 2048]);
+        assert_eq!(ty.encoding, Encoding::Raw(DType::BF16));
+        // Multiplying a value is not a coordinate map, so it leaves the
+        // fragment that compiles to byte runs.
+        assert!(!Expr::src("q_proj").scale(0.25).is_affine());
+    }
+
+    #[test]
+    fn scale_rejects_a_quantized_operand() {
+        let scaled = Expr::src("q_proj")
+            .cast(Encoding::Quant(fp8_per_row()))
+            .scale(0.25);
+        let err = check_one(scaled, &qwen3()).unwrap_err();
+        assert!(err.to_string().contains("Scale of a quantized tensor"));
+    }
+
+    #[test]
+    fn scale_rejects_an_integer_operand() {
+        let checkpoint = FakeCheckpoint::new(&[("ids", &[16], DType::I32)]);
+        let err = check_one(Expr::src("ids").scale(2.0), &checkpoint).unwrap_err();
+        assert!(err.to_string().contains("I32"));
+    }
+
+    /// A NaN or infinite factor would silently poison every element, and the
+    /// bit-pattern encoding means it survives the cache key and the FFI
+    /// unchanged. Rejecting it here is the only place it can be caught.
+    #[test]
+    fn scale_rejects_a_factor_that_is_not_finite() {
+        for factor in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let err = check_one(Expr::src("q_proj").scale(factor), &qwen3()).unwrap_err();
+            assert!(err.to_string().contains("finite"), "{factor} was accepted");
+        }
+    }
+
+    /// Zero is the resting value of the FFI's `scale_factor_bits`, so a C++
+    /// author who forgets to set it must not get a tensor of zeros that loads
+    /// and runs.
+    #[test]
+    fn scale_rejects_the_factor_an_unset_field_reads_as() {
+        for factor in [0.0f32, -0.0f32] {
+            let err = check_one(Expr::src("q_proj").scale(factor), &qwen3()).unwrap_err();
+            assert!(err.to_string().contains("zero"), "{factor} was accepted");
+        }
     }
 
     #[test]
     fn sources_are_reported_in_order() {
-        let fused = Expr::cat(
+        let fused = Expr::concat(
             0,
             vec![
                 Expr::src("q_proj").slice(0, 0, 1024),
@@ -800,7 +1702,7 @@ mod tests {
     fn qkv_contract(shape: Vec<i64>) -> TensorContract {
         TensorContract::new(
             "qkv.fused",
-            Expr::cat(
+            Expr::concat(
                 0,
                 vec![
                     Expr::src("q_proj"),
@@ -827,11 +1729,11 @@ mod tests {
         tensors: &[TensorContract],
         checkpoint: &dyn CheckpointTypes,
     ) -> Result<Vec<TensorType>, Error> {
-        let mut resolver = Resolver::new(checkpoint);
+        let mut resolver = Resolver::new(checkpoint, Partition::WHOLE);
         tensors
             .iter()
             .map(|tensor| {
-                let ty = resolver.infer(&tensor.expr)?;
+                let ty = resolver.infer(&tensor.expr, &tensor.name)?;
                 resolver.publish(&tensor.name, ty.clone());
                 Ok(ty)
             })
@@ -904,7 +1806,13 @@ mod tests {
             &[
                 TensorContract::new(
                     "q_proj",
-                    Expr::src("q_proj").pad(0, 0, 64),
+                    Expr::concat(
+                        0,
+                        vec![
+                            Expr::src("q_proj"),
+                            Expr::fill(0.0, TensorType::raw(vec![64, 2048], DType::BF16)),
+                        ],
+                    ),
                     vec![2112, 2048],
                     Encoding::Raw(DType::BF16),
                 ),
@@ -925,8 +1833,9 @@ mod tests {
     #[test]
     fn qwen3_tp2_rank0_fp8_is_one_expression() {
         // The worked example from spec.md §5: shard, fuse, and quantize in one
-        // declaration. Today's abi/fusion.rs refuses all three combinations.
-        let expr = Expr::cat(
+        // declaration. The hand-written per-model fusion pass this replaced
+        // refused all three in combination.
+        let expr = Expr::concat(
             0,
             vec![
                 Expr::src("q_proj").slice(0, 0, 1024),
@@ -934,7 +1843,7 @@ mod tests {
                 Expr::src("v_proj").slice(0, 0, 512),
             ],
         )
-        .quantize(fp8_per_row());
+        .cast(Encoding::Quant(fp8_per_row()));
         let contract = model(vec![TensorContract::new(
             "model.layers.0.self_attn.qkv_proj.fused.weight",
             expr,
