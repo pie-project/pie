@@ -138,7 +138,10 @@ fn os_thread_id() -> u64 {
     }
 }
 
-const MAX_PREWARM_PROCESSES: usize = 64;
+/// Prewarm-conveyor width when execution admission is UNCAPPED. With a cap the
+/// conveyor is one cohort wide instead (see `init_admission`); without one
+/// there is no cohort to size it by, so this flat ladder stands.
+const UNCAPPED_PREWARM_PROCESSES: usize = 64;
 
 static PROCESS_COMPLETED: AtomicU64 = AtomicU64::new(0);
 static PROCESS_ADMISSION_WAIT_US: AtomicU64 = AtomicU64::new(0);
@@ -251,15 +254,13 @@ pub fn init_admission(max_concurrent: Option<usize>) {
     // One whole cohort wide when execution is capped: a turnover has to be
     // able to hand its entire successor cohort a slot at once, and the
     // cohort is the unit every other stage here is sized in. Uncapped
-    // execution has no cohort, so the flat MAX_PREWARM_PROCESSES ladder
+    // execution has no cohort, so the flat UNCAPPED_PREWARM_PROCESSES ladder
     // stands — with unlimited execution an unbounded prewarm would fan
     // every queued process's instantiation out at once, a thundering herd
     // of Store/linker/WASI setup competing with the scheduler threads.
-    let prewarm = Some(Arc::new(Semaphore::new(if prewarm_holds_through_bind() {
-        limit.unwrap_or(MAX_PREWARM_PROCESSES)
-    } else {
-        limit.map_or(MAX_PREWARM_PROCESSES, |n| n.min(MAX_PREWARM_PROCESSES))
-    })));
+    let prewarm = Some(Arc::new(Semaphore::new(
+        limit.unwrap_or(UNCAPPED_PREWARM_PROCESSES),
+    )));
     // Double-buffered bring-up: the executing cohort plus STAGED_COHORTS
     // whole successor cohorts hold bind permits. A staged cohort
     // instantiates and binds DURING the previous generation's execution;
@@ -283,14 +284,11 @@ pub fn init_admission(max_concurrent: Option<usize>) {
     // prologues, and the opening wave cannot dispatch until the LAST of the
     // 512 is admitted. Staging is by definition an overlap with a RUNNING
     // generation, so the reserve is held back until there is one.
-    let staged = limit.map_or(0, |n| n.saturating_mul(STAGED_COHORTS));
-    let (initial_extra, deferred) = if stage_binds_lazily() {
-        (0, staged)
-    } else {
-        (staged, 0)
-    };
-    let bind_ahead = limit.map(|n| Arc::new(Semaphore::new(n + initial_extra)));
-    BIND_STAGED_RESERVE.store(deferred, Relaxed);
+    let bind_ahead = limit.map(|n| Arc::new(Semaphore::new(n)));
+    BIND_STAGED_RESERVE.store(
+        limit.map_or(0, |n| n.saturating_mul(STAGED_COHORTS)),
+        Relaxed,
+    );
     EXECUTION_SLOT_CAPACITY
         .set(limit)
         .expect("execution slot capacity already initialized");
@@ -303,23 +301,6 @@ pub fn init_admission(max_concurrent: Option<usize>) {
     PREWARM_ADMISSION
         .set(prewarm)
         .expect("prewarm admission controller already initialized");
-}
-
-fn env_off(key: &str) -> bool {
-    matches!(
-        std::env::var(key).as_deref(),
-        Ok("0") | Ok("off") | Ok("false")
-    )
-}
-
-fn prewarm_holds_through_bind() -> bool {
-    static ON: LazyLock<bool> = LazyLock::new(|| !env_off("PIE_PREWARM_HOLD"));
-    *ON
-}
-
-fn stage_binds_lazily() -> bool {
-    static ON: LazyLock<bool> = LazyLock::new(|| !env_off("PIE_BIND_STAGE_LAZY"));
-    *ON
 }
 
 pub(crate) fn execution_admission_is_capped() -> bool {
@@ -369,6 +350,13 @@ fn open_staged_bind_pool() {
 // admission also cannot be what a join is waiting for — `joins_in_flight`
 // is populated at execution-slot consumption, which is downstream of bind
 // admission on the same task.)
+//
+// SCOPE: process-global, like the pools it gates — `ADMISSION`,
+// `BIND_ADMISSION`, `PREWARM_ADMISSION` and `EXECUTION_SLOT_CAPACITY` are all
+// `OnceLock`s set once by `init_admission`. A second engine in the same
+// process would share this hold with the first, which is the same constraint
+// the semaphores themselves already impose. Reset is by process exit only:
+// nothing here is per-run state.
 static BIND_RELEASE_HOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static HELD_BIND_PERMITS: Mutex<Vec<tokio::sync::OwnedSemaphorePermit>> = Mutex::new(Vec::new());
 
@@ -397,14 +385,7 @@ pub(crate) fn release_bind_permit(permit: Option<tokio::sync::OwnedSemaphorePerm
 
 /// Scheduler-pass assertion of the boundary hold. Clearing it hands every
 /// parked permit over at once.
-pub fn set_bind_release_hold(hold: bool) {
-    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
-        !matches!(
-            std::env::var("PIE_BIND_DEFER").as_deref(),
-            Ok("0") | Ok("off") | Ok("false")
-        )
-    });
-    let hold = hold && *ENABLED;
+pub(crate) fn set_bind_release_hold(hold: bool) {
     if !BIND_RELEASE_HOLD.swap(hold, Relaxed) || hold {
         return;
     }
@@ -434,9 +415,6 @@ pub(crate) async fn ensure_bind_admitted(ctx: &mut ProcessCtx) {
     // conveyor only buys the next arrival the right to instantiate work
     // nothing is waiting for. The conveyor is one cohort wide, so a
     // turnover still hands its whole successor cohort through in one go.
-    if !prewarm_holds_through_bind() {
-        ctx.release_prewarm_permit();
-    }
     let started = Instant::now();
     let permit = match BIND_ADMISSION.get().and_then(|value| value.as_ref()) {
         Some(semaphore) => Some(

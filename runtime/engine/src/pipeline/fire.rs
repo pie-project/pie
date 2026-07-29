@@ -833,14 +833,17 @@ pub async fn submit_pass_stamped<C: FireContext>(
         if ctx.resources().get(&fwd)?.devgeo.is_some() {
             let metered = crate::scheduler::phase_start();
             let out = fire_device_geometry(ctx, this, fwd, frame).await;
-            crate::scheduler::phase_add(6, metered);
+            crate::scheduler::cpu_phase_add(
+                crate::scheduler::CpuPhase::DeviceGeometrySubmit,
+                metered,
+            );
             return out;
         }
         // Contention-probe marker: when the guest's WIT call reached the
         // host (vs `hp-acquire` below — the delta is the build preamble,
         // including the settlement drain).
         crate::planner::trace_mark!("build", ctx.process_id(), "hp-enter");
-        let hp_preamble = crate::scheduler::phase_start();
+        let preamble_cpu = crate::scheduler::phase_start();
         // W3.1: the PIPELINE owns the in-flight FIFO. Point each of this
         // pass's channels at this pipeline's queue so their `take`/`read`
         // await the right FIFO — enforcing the same-pipeline constraint
@@ -869,10 +872,10 @@ pub async fn submit_pass_stamped<C: FireContext>(
         // An RS-binding pass needs no extra serialization here: its mapping
         // publishes at prepare, in submission order, so it runs ahead like
         // any other pass.
-        crate::scheduler::phase_add(1, hp_preamble);
+        crate::scheduler::cpu_phase_add(crate::scheduler::CpuPhase::Preamble, preamble_cpu);
         let timing_enabled = ctx.fire_timing_requested();
-        let hp_total = crate::scheduler::phase_start();
-        let mut hp = hp_total;
+        let submit_cpu = crate::scheduler::phase_start();
+        let mut phase_cpu = submit_cpu;
         let (
             geometry,
             cells,
@@ -969,8 +972,8 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 p.decode_envelope.clone(),
             )
         };
-        crate::scheduler::phase_add(2, hp);
-        hp = crate::scheduler::phase_start();
+        crate::scheduler::cpu_phase_add(crate::scheduler::CpuPhase::BindGeometry, phase_cpu);
+        phase_cpu = crate::scheduler::phase_start();
         let mut req = crate::driver::LaunchPlan::default();
         geometry.apply_to(&mut req);
         req.device_resolved_geometry = decode_envelope.is_some();
@@ -1057,8 +1060,8 @@ pub async fn submit_pass_stamped<C: FireContext>(
         };
         crate::planner::trace_mark!("build", pid, "hp-acquire");
         let mut attempts = 0;
-        crate::scheduler::phase_add(3, hp);
-        hp = crate::scheduler::phase_start();
+        crate::scheduler::cpu_phase_add(crate::scheduler::CpuPhase::Declare, phase_cpu);
+        phase_cpu = crate::scheduler::phase_start();
         let (ws_guard, (copy_src, copy_dst), kvtxn, rs_prepared) = loop {
             let kv_demand = match host_kv_demand(
                 &stores,
@@ -1143,8 +1146,8 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 Err(ReservedError::Fatal(error)) => return Ok(Err(error)),
             }
         };
-        crate::scheduler::phase_add(4, hp);
-        hp = crate::scheduler::phase_start();
+        crate::scheduler::cpu_phase_add(crate::scheduler::CpuPhase::Grant, phase_cpu);
+        phase_cpu = crate::scheduler::phase_start();
         rs_prepared.apply_to(&mut req);
         let (rs_copy_src, rs_copy_dst) = rs_prepared.copies.clone();
         let rstxns = RsTxnsGuard::new(model, driver, rs_prepared.txn);
@@ -1192,8 +1195,8 @@ pub async fn submit_pass_stamped<C: FireContext>(
             record_submit_failure(ctx, &fwd, &pipeline_failure, &reason);
             return Ok(Err(reason));
         }
-        crate::scheduler::phase_add(5, hp);
-        crate::scheduler::phase_add(0, hp_total);
+        crate::scheduler::cpu_phase_add(crate::scheduler::CpuPhase::Launch, phase_cpu);
+        crate::scheduler::cpu_phase_add(crate::scheduler::CpuPhase::SubmitTotal, submit_cpu);
         ctx.commit_fire_timing(timing_enabled);
         ticket_reservation.commit();
 
@@ -1968,7 +1971,6 @@ async fn fire_device_geometry<C: FireContext>(
     // (vs when its build reaches `acquire` — the delta is the build
     // preamble, including the settlement drain below).
     crate::planner::trace_mark!("build", ctx.process_id(), "dg-enter");
-    let mut metered = crate::scheduler::phase_start();
     // Wire each of this pass's channels at this pipeline's FIFO (§3.4: all
     // passes binding a channel must submit on ONE pipeline — the entire
     // ordering/FIFO correctness argument).
@@ -1991,8 +1993,6 @@ async fn fire_device_geometry<C: FireContext>(
     if let Err(e) = wire_channels_to_pipeline(ctx, &fwd, &pipe_fires)? {
         return Ok(Err(e));
     }
-    crate::scheduler::phase_add(11, metered);
-    metered = crate::scheduler::phase_start();
     // No RS serialization: the mapping publishes at prepare (submission
     // order), so a recurrent-state device-geometry pass runs ahead too.
     let timing_enabled = ctx.fire_timing_requested();
@@ -2223,8 +2223,6 @@ async fn fire_device_geometry<C: FireContext>(
             }
         }
     };
-    crate::scheduler::phase_add(11, metered);
-    metered = crate::scheduler::phase_start();
     let (rs_copy_src, rs_copy_dst) = rs_prepared.copies.clone();
     let mut rs_prepared = rs_prepared;
     let rstxns = RsTxnsGuard::new(ws.model, ws.driver, rs_prepared.txn.take());
@@ -2294,8 +2292,6 @@ async fn fire_device_geometry<C: FireContext>(
         }
     };
 
-    crate::scheduler::phase_add(11, metered);
-    metered = crate::scheduler::phase_start();
     let mut req = crate::driver::LaunchPlan::default();
     req.qo_indptr = resolved_qo_indptr;
     req.kv_translation = kv_translation;
@@ -2329,7 +2325,6 @@ async fn fire_device_geometry<C: FireContext>(
         record_submit_failure(ctx, &fwd, &pipeline_failure, &reason);
         return Ok(Err(reason));
     }
-    crate::scheduler::phase_add(11, metered);
     ctx.commit_fire_timing(timing_enabled);
     ticket_reservation.commit();
     {

@@ -591,6 +591,12 @@ const CPU_CLASSES: usize = 3;
 static CPU_CENSUS: [[AtomicU64; CPU_CENSUS_BUCKETS]; CPU_CLASSES] =
     [const { [const { AtomicU64::new(0) }; CPU_CENSUS_BUCKETS] }; CPU_CLASSES];
 static CPU_CENSUS_EPOCH_US: AtomicU64 = AtomicU64::new(0);
+/// CPU that arrived after the census window closed. The window is finite
+/// (`CPU_CENSUS_BUCKETS * CPU_CENSUS_BUCKET_US`, currently 81.9 s) and runs
+/// longer than that do exist — the contention `soak` scenario is 124 s. This
+/// is reported with the dump so a truncated census is never read as a whole
+/// one.
+static CPU_CENSUS_DROPPED_NS: [AtomicU64; CPU_CLASSES] = [const { AtomicU64::new(0) }; CPU_CLASSES];
 
 /// `HostShadow::advance` accounting, written only when fire timing is on.
 pub(crate) static SHADOW_ADVANCE_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -630,41 +636,123 @@ pub(crate) fn record_task_cpu(class: CpuClass, at_us: u64, cpu_ns: u64) {
     let bucket = (at_us.saturating_sub(epoch) / CPU_CENSUS_BUCKET_US) as usize;
     if bucket < CPU_CENSUS_BUCKETS {
         CPU_CENSUS[class as usize][bucket].fetch_add(cpu_ns, Ordering::Relaxed);
+    } else {
+        CPU_CENSUS_DROPPED_NS[class as usize].fetch_add(cpu_ns, Ordering::Relaxed);
     }
 }
 
-/// Names of the guest-submit phases metered by [`phase_add`], in index order.
-pub(crate) const PHASE_NAMES: [&str; 12] = [
-    "submit_total",
-    "hp_preamble",
-    "hp_bind_geometry",
-    "hp_declare",
-    "hp_grant",
-    "hp_launch",
-    "devgeo_total",
-    "rx_wall",
-    "rx_poll",
-    "rx_finalize",
-    "rx_wait",
-    "unused",
-];
-pub(crate) static PHASE_NS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
-pub(crate) static PHASE_CALLS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+/// A region metered as CPU: it contains no `.await`, so the task holds its
+/// thread throughout and the elapsed wall is its CPU there — up to preemption,
+/// which inflates every phase together on a contended box (measured: uniformly
+/// +10-20% at `/proc/loadavg` 18 against a 13.6-core quota). Read as a share of
+/// [`CPU_CENSUS`], not as an absolute.
+#[derive(Clone, Copy)]
+pub(crate) enum CpuPhase {
+    /// The whole host-geometry submit, `Preamble` excluded.
+    SubmitTotal = 0,
+    /// `drain_settled` + `wire_channels_to_pipeline`, ahead of the submit.
+    Preamble,
+    BindGeometry,
+    Declare,
+    Grant,
+    /// Handing the built fire to the scheduler.
+    Launch,
+    /// The device-geometry submit, whole. Zero on host-geometry workloads.
+    DeviceGeometrySubmit,
+    /// One non-blocking channel poll in `materialize_channel`.
+    ChannelPoll,
+}
 
-/// Accumulate one sample into a guest-submit phase. `started` is `None` when
-/// fire timing is off, which makes every call site a branch and nothing else.
-#[inline]
-pub(crate) fn phase_add(index: usize, started: Option<std::time::Instant>) {
-    if let Some(started) = started {
-        PHASE_NS[index].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        PHASE_CALLS[index].fetch_add(1, Ordering::Relaxed);
+impl CpuPhase {
+    const COUNT: usize = 8;
+    const NAMES: [&'static str; Self::COUNT] = [
+        "submit_total",
+        "submit_preamble",
+        "submit_bind_geometry",
+        "submit_declare",
+        "submit_grant",
+        "submit_launch",
+        "devgeo_submit_total",
+        "chan_poll",
+    ];
+}
+
+/// A region metered as WALL time: it spans `.await` points, so most of what it
+/// measures is the task NOT running. Deliberately a separate type and a
+/// separate record from [`CpuPhase`]: the two live in different units and a
+/// single table invited exactly the mistake of adding them together.
+#[derive(Clone, Copy)]
+pub(crate) enum WaitPhase {
+    /// A whole `materialize_channel`, park included.
+    ChannelTake = 0,
+    /// The park itself, entered only when the channel is not already ready.
+    ChannelProgress,
+}
+
+impl WaitPhase {
+    const COUNT: usize = 2;
+    const NAMES: [&'static str; Self::COUNT] = ["chan_take", "chan_await_progress"];
+}
+
+/// Counters behind one phase enum. Both tables share this so the two units
+/// cannot drift apart in how they accumulate.
+struct PhaseTable<const N: usize> {
+    ns: [AtomicU64; N],
+    calls: [AtomicU64; N],
+}
+
+impl<const N: usize> PhaseTable<N> {
+    const fn new() -> Self {
+        Self {
+            ns: [const { AtomicU64::new(0) }; N],
+            calls: [const { AtomicU64::new(0) }; N],
+        }
     }
+
+    #[inline]
+    fn add(&self, index: usize, started: Option<std::time::Instant>) {
+        if let Some(started) = started {
+            self.ns[index].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            self.calls[index].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+static CPU_PHASES: PhaseTable<{ CpuPhase::COUNT }> = PhaseTable::new();
+static WAIT_PHASES: PhaseTable<{ WaitPhase::COUNT }> = PhaseTable::new();
+
+/// Accumulate one CPU-phase sample. `started` is `None` when fire timing is
+/// off, which makes every call site a branch and nothing else.
+#[inline]
+pub(crate) fn cpu_phase_add(phase: CpuPhase, started: Option<std::time::Instant>) {
+    CPU_PHASES.add(phase as usize, started);
+}
+
+/// Accumulate one wall-phase sample. See [`cpu_phase_add`] for `started`.
+#[inline]
+pub(crate) fn wait_phase_add(phase: WaitPhase, started: Option<std::time::Instant>) {
+    WAIT_PHASES.add(phase as usize, started);
 }
 
 /// `Some(Instant::now())` exactly when fire timing is on.
 #[inline]
 pub(crate) fn phase_start() -> Option<std::time::Instant> {
     fire_timing_enabled().then(std::time::Instant::now)
+}
+
+fn dump_phase_table<const N: usize>(event: &str, names: [&'static str; N], table: &PhaseTable<N>) {
+    for (index, name) in names.iter().enumerate() {
+        // Emitted even at zero calls: an absent row cannot be told apart from
+        // a path that was never reached.
+        fire_timing_write(&serde_json::json!({
+            "schema": 1,
+            "source": "runtime",
+            "event": event,
+            "phase": name,
+            "calls": table.calls[index].load(Ordering::Relaxed),
+            "ns": table.ns[index].load(Ordering::Relaxed),
+        }));
+    }
 }
 
 /// Emit the census as one record per class. Called on scheduler shutdown, so
@@ -681,17 +769,8 @@ pub(crate) fn fire_timing_dump_cpu_census() {
         "folds": SHADOW_ADVANCE_FOLDS.load(Ordering::Relaxed),
         "ns": SHADOW_ADVANCE_NS.load(Ordering::Relaxed),
     }));
-    for (index, name) in PHASE_NAMES.iter().enumerate() {
-        let calls = PHASE_CALLS[index].load(Ordering::Relaxed);
-        fire_timing_write(&serde_json::json!({
-            "schema": 1,
-            "source": "runtime",
-            "event": "submit_phase",
-            "phase": name,
-            "calls": calls,
-            "ns": PHASE_NS[index].load(Ordering::Relaxed),
-        }));
-    }
+    dump_phase_table("submit_phase", CpuPhase::NAMES, &CPU_PHASES);
+    dump_phase_table("submit_wait", WaitPhase::NAMES, &WAIT_PHASES);
     let epoch = CPU_CENSUS_EPOCH_US.load(Ordering::Relaxed);
     if epoch == 0 {
         return;
@@ -705,8 +784,11 @@ pub(crate) fn fire_timing_dump_cpu_census() {
             .iter()
             .map(|slot| slot.load(Ordering::Relaxed) / 1_000)
             .collect();
+        let dropped_us = CPU_CENSUS_DROPPED_NS[index].load(Ordering::Relaxed) / 1_000;
         let last = buckets.iter().rposition(|&value| value != 0);
-        let Some(last) = last else { continue };
+        if last.is_none() && dropped_us == 0 {
+            continue;
+        }
         fire_timing_write(&serde_json::json!({
             "schema": 1,
             "source": "runtime",
@@ -714,7 +796,11 @@ pub(crate) fn fire_timing_dump_cpu_census() {
             "class": name,
             "epoch_us": epoch,
             "bucket_us": CPU_CENSUS_BUCKET_US,
-            "cpu_us": &buckets[..=last],
+            "window_us": CPU_CENSUS_BUCKET_US * CPU_CENSUS_BUCKETS as u64,
+            // Nonzero means the run outlived the window and this record is a
+            // prefix of the truth, not the whole of it.
+            "dropped_us": dropped_us,
+            "cpu_us": &buckets[..last.map_or(0, |last| last + 1)],
         }));
     }
 }
@@ -1089,10 +1175,28 @@ pub async fn get_stats() -> AggregateStats {
 
 #[cfg(test)]
 mod phase_counter_tests {
+    use super::{CPU_PHASES, CpuPhase, Ordering, WAIT_PHASES, WaitPhase};
+
     #[test]
-    fn phase_add_writes_the_array_slot_the_dump_reads() {
-        super::PHASE_CALLS[11].store(0, super::Ordering::Relaxed);
-        super::phase_add(11, Some(std::time::Instant::now()));
-        assert_eq!(super::PHASE_CALLS[11].load(super::Ordering::Relaxed), 1);
+    fn a_phase_writes_the_slot_its_name_is_dumped_from() {
+        // The dump pairs `NAMES[i]` with slot `i`, so a variant whose
+        // discriminant drifts from its name would silently mislabel a column.
+        let index = CpuPhase::ChannelPoll as usize;
+        assert_eq!(CpuPhase::NAMES[index], "chan_poll");
+        CPU_PHASES.calls[index].store(0, Ordering::Relaxed);
+        CPU_PHASES.add(index, Some(std::time::Instant::now()));
+        assert_eq!(CPU_PHASES.calls[index].load(Ordering::Relaxed), 1);
+
+        let index = WaitPhase::ChannelProgress as usize;
+        assert_eq!(WaitPhase::NAMES[index], "chan_await_progress");
+        WAIT_PHASES.calls[index].store(0, Ordering::Relaxed);
+        WAIT_PHASES.add(index, Some(std::time::Instant::now()));
+        assert_eq!(WAIT_PHASES.calls[index].load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn the_last_variant_of_each_table_is_in_range() {
+        assert!((CpuPhase::ChannelPoll as usize) < CpuPhase::COUNT);
+        assert!((WaitPhase::ChannelProgress as usize) < WaitPhase::COUNT);
     }
 }

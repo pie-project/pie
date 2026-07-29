@@ -185,33 +185,31 @@ async fn materialize_channel(
     };
     let mut settle_ready_take = true;
     let mut woke_us = 0u64;
-    let rx_wall = crate::scheduler::phase_start();
+    let take_wall = crate::scheduler::phase_start();
     loop {
-        let rx_poll = crate::scheduler::phase_start();
+        let poll_cpu = crate::scheduler::phase_start();
         let state = accessor
             .with(|mut access| poll_channel(access.get(), &this, mode, false, settle_ready_take))?;
-        crate::scheduler::phase_add(8, rx_poll);
+        crate::scheduler::cpu_phase_add(crate::scheduler::CpuPhase::ChannelPoll, poll_cpu);
         let state = match state {
             ChannelPoll::Pending {
                 fires: Some(fires), ..
             } => {
                 let _finalize_guard = fires.finalize_guard().await;
-                let rx_poll = crate::scheduler::phase_start();
+                let poll_cpu = crate::scheduler::phase_start();
                 let state = accessor.with(|mut access| {
                     poll_channel(access.get(), &this, mode, true, settle_ready_take)
                 })?;
-                crate::scheduler::phase_add(8, rx_poll);
+                crate::scheduler::cpu_phase_add(crate::scheduler::CpuPhase::ChannelPoll, poll_cpu);
                 match state {
                     ChannelPoll::Finalize(op) => {
                         if let Some(pid) = trace_pid {
                             crate::planner::trace_mark!("build", pid, "rx-finalize");
                         }
-                        let rx_fin = crate::scheduler::phase_start();
                         let finalized = crate::pipeline::fire::finalize_op_await(op).await?;
                         accessor.with(|mut access| {
                             crate::pipeline::fire::complete_finalize(access.get(), finalized);
                         });
-                        crate::scheduler::phase_add(9, rx_fin);
                         settle_ready_take = false;
                         continue;
                     }
@@ -224,7 +222,10 @@ async fn materialize_channel(
         match state {
             ChannelPoll::Ready(value) => {
                 accessor.with(|mut access| access.get().note_take_returned(woke_us));
-                crate::scheduler::phase_add(7, rx_wall);
+                crate::scheduler::wait_phase_add(
+                    crate::scheduler::WaitPhase::ChannelTake,
+                    take_wall,
+                );
                 return Ok(value);
             }
             ChannelPoll::Finalize(_) => unreachable!("finalizer gate required before FIFO pop"),
@@ -232,13 +233,16 @@ async fn materialize_channel(
                 settle_ready_take = true;
                 // A plain await: an idle channel wait holds no pooled
                 // state, so the planner can evict around it freely.
-                let rx_wait = crate::scheduler::phase_start();
+                let progress_wall = crate::scheduler::phase_start();
                 if let Err(error) =
                     crate::pipeline::fire::await_channel_progress(&cell, fires.as_ref()).await
                 {
                     return Ok(Err(error));
                 }
-                crate::scheduler::phase_add(10, rx_wait);
+                crate::scheduler::wait_phase_add(
+                    crate::scheduler::WaitPhase::ChannelProgress,
+                    progress_wall,
+                );
                 if let Some(pid) = trace_pid {
                     crate::planner::trace_mark!("build", pid, "rx-wake");
                 }

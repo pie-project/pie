@@ -37,14 +37,6 @@ pub enum Phase {
     Unknown(Vec<u32>),
 }
 
-/// A/B escape hatch: fold every channel-writing stage on every fire, the way
-/// the shadow did before the taint demotion. The demotion is proved exact by
-/// `stage_put_taint`, so this exists only to re-measure what it is worth.
-fn fold_everything() -> bool {
-    static CONFIGURED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CONFIGURED.get_or_init(|| std::env::var("PIE_SHADOW_FOLD").as_deref() == Ok("full"))
-}
-
 /// The per-pass fold schedule and net-take set of a bound trace.
 /// Both are functions of the trace alone, which never changes for a program,
 /// so this is derived once per [`crate::pipeline::program::RegisteredProgram`]
@@ -120,11 +112,7 @@ impl ShadowPlan {
             if all_tainted {
                 puts.sort_unstable();
                 puts.dedup();
-                return Some(if fold_everything() {
-                    Phase::Fold(stage)
-                } else {
-                    Phase::Unknown(puts)
-                });
+                return Some(Phase::Unknown(puts));
             }
             Some(Phase::Fold(stage))
         };

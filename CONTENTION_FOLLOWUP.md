@@ -5478,3 +5478,48 @@ cost. Halving per-fire guest CPU would take the boundary's 474 core-ms to
 ~370 and its 39 ms floor to ~30 ms — about **0.4% of wall** across seven
 boundaries. That is the honest ceiling on this whole line of work, and it is
 why it is documented rather than pursued further.
+
+## §20.32 — collapsing the experiment scaffolding
+
+Every change in §20.24-§20.31 was landed behind an env kill switch so an A/B
+could be run against the shipped binary without a rebuild. All of them are
+settled now, so the scaffolding comes out: a default-ON gate whose `else`
+branch is never taken in production is a second, untested code path that
+nothing measures and nothing tests.
+
+**Gates removed** (each was `!env_off(KEY)`, i.e. ON unless explicitly
+disabled), with the measurement that settled it:
+
+| knob | what the OFF branch did | verdict |
+|---|---|---|
+| `PIE_PREWARM_HOLD` | release the prewarm slot in FRONT of the bind park, and cap the conveyor at 64 | §20.27: holding through bind is what makes the conveyor one cohort wide |
+| `PIE_BIND_STAGE_LAZY` | open the whole 2n bind pool at t=0 instead of after the first cohort seats | §20.28: cohort 0's bind -> admit step is 155 ms p50 against 1536 concurrent prologues |
+| `PIE_BIND_DEFER` | release departing bind permits during a boundary join | §20.26: 512 `process_bind_admitted` land inside the window the boundary needs |
+| `PIE_SHADOW_FOLD=full` | fold every channel-writing stage, pre-demotion | §20.29: the demotion is proved exact by `stage_put_taint` |
+
+`MAX_PREWARM_PROCESSES` was renamed `UNCAPPED_PREWARM_PROCESSES`: with an
+execution cap the conveyor is sized to one cohort and never consults it, so
+the old name described a bound it no longer imposes.
+
+**The phase counters are typed.** They were a 12-slot array indexed by bare
+integers at the call sites (`phase_add(4, hp)`), with the names in a different
+file — including one `"unused"` slot that four distinct regions of
+`fire_device_geometry` all summed into, which is worse than no measurement.
+Now `CpuPhase` and `WaitPhase` are `#[repr(usize)]`-style enums with their
+names alongside, the four bogus marks are gone, and the whole-device-geometry
+meter is kept.
+
+**CPU and wall meters are no longer in the same table.** `submit_total` and
+the `submit_*` phases contain no `.await`, so their elapsed wall IS CPU and
+they are summable with the census. `chan_take` and `chan_await_progress` span
+parks and are mostly the task *not running*. Both used to be emitted as
+`"event":"submit_phase"`, which invites adding them. They are now
+`submit_phase` (CPU) and `submit_wait` (wall), and `rx_finalize` — which
+overlapped `chan_take` entirely — is dropped.
+
+**The census reports its own truncation.** `CPU_CENSUS` is
+8192 x 10 ms = 81.9 s and silently dropped everything past that; the
+contention `soak` scenario runs 124 s and was already losing samples. Late CPU
+now accumulates into `CPU_CENSUS_DROPPED_NS` and every `cpu_census` record
+carries `window_us` and `dropped_us`, so a truncated census can no longer be
+read as a complete one.
