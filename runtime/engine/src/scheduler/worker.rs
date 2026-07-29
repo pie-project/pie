@@ -4131,6 +4131,12 @@ impl BatchScheduler {
             "schema": 1,
             "source": "scheduler",
             "event": "scheduler_wave",
+            "planner_parks_total": crate::planner::planner()
+                .map(|planner| planner.park_census().0)
+                .unwrap_or(0),
+            "planner_parked_now": crate::planner::planner()
+                .map(|planner| planner.park_census().1)
+                .unwrap_or(0),
             "wave_id": timing.wave_id,
             "membership_hash": timing.membership_hash,
             "cuda_submitted": cuda_submitted,

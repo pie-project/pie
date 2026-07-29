@@ -3807,3 +3807,77 @@ restructuring worth +5.3% on homogeneous conc 512 — which is precisely the
 4.2% deficit that started this whole investigation — and +48% on mixed-phase.
 They are independent: 1 addresses sched-empty idle, 2 addresses both the
 sched-empty and the 5.44 s submit term.
+
+## §20.20 — seat-release-on-park is refuted, and so is the KV story behind it
+
+§20.19's Direction 1 was rejected as heuristic (it predicts a process's page
+demand). The structural replacement was: a process that parks on pages should
+YIELD its execution seat, so effective concurrency self-tunes to whatever the
+pool supports with no constant to choose. That premise is now measured, and it
+is false.
+
+### Instrumentation
+
+`ResidencyPlanner::park_census()` returns `(stats.parks, waiters)` — the
+cumulative park count and the current parked width. Both are emitted on every
+`scheduler_wave` record (`planner_parks_total`, `planner_parked_now`). Sampling
+the width ALONE is what nearly produced a false refutation in the other
+direction: parks shorter than the ~40 ms inter-wave sample vanish from it, so
+the cumulative counter is the one that decides.
+
+### Result: parking is a 1.4-second startup transient
+
+| run | span | GPU idle | parks (whole run) | parks/fire |
+| --- | ---: | ---: | ---: | ---: |
+| mixed 512 @ 8192 pages  | 26.59 s | 8.14 s (30.6%) | **512** | 0.002 |
+| mixed 320 @ 8192 pages  | 21.05 s | 3.63 s (17.2%) | **0** | 0 |
+| mixed 512 @ 16384 pages | 22.37 s | 4.29 s (19.2%) | **0** | 0 |
+| homogeneous 512 @ 8192  | 16.53 s | 1.00 s (6.1%)  | **0** | 0 |
+
+All 512 parks in the only run that parks at all land in the first 1.39 s
+(15 parks at t=0.00, 264 by t=1.10, 512 by t=1.39) — the opening cohort's
+simultaneous prefill against a pool that cannot hold 512 x 33 pages at once.
+And that window is not where the time goes:
+
+    idle in the first 3 s: 0.49 s over  48 waves
+    idle after 3 s:        7.65 s over 353 waves
+
+**After t=3 s there are ZERO parks and 7.65 s of idle.** A seat that is
+released on park would therefore be released 512 times, all during startup,
+against 6% of the run's idle. The lever does not exist. Direction 1 is closed
+in both its heuristic and its structural form.
+
+### What this also corrects in §20.18/§20.19
+
+The page-headroom effect is REAL but is not what those sections said it was.
+Re-measured n=2 at conc 512 mixed: 8192 pages gives 11238/11318 (mean 11278),
+16384 gives 12127/13060 (mean 12594) — **+11.7%**, with both large-pool runs
+above both small-pool runs. But since the large-pool run parks ZERO times and
+the small-pool run parks only during startup, the mechanism is NOT page
+starvation, and "pie admits by process count and the pool thrashes" is wrong.
+Whatever the pool buys, it is not relief from parking.
+
+Likewise the conc-320 win (13798 vs 10926 here; 13488 vs 11876 in §20.19) is
+not KV-aware admission. conc 320 parks zero times at the SAME 8192 pages that
+makes conc 512 park. The difference is wave WIDTH:
+
+| | waves | rows p50 | `guest_wake_us` p50 / max | idle before prefill |
+| --- | ---: | ---: | ---: | ---: |
+| conc 512 | 409 | 1024 | 15.0 ms / **672 ms** | 6.70 s |
+| conc 320 | 590 | 640  | 11.9 ms / **95 ms**  | 3.89 s |
+
+Same 1,262,506 tokens either way. The narrower fleet wakes and resumes faster,
+and the wake round trip is what sits on the GPU's critical path whenever the
+next wave carries prefill.
+
+### Where this leaves the fix
+
+Direction 2 is now the ONLY surviving lever, and the evidence for it is
+stronger than before: when a wave carries prefill, the fleet-wide
+wake -> resume -> first-submit round trip is exposed on the GPU's critical
+path, and its cost grows superlinearly with fleet width (672 ms at 1024 rows
+against 95 ms at 640). Run-ahead already hides this for steady-state decode —
+decode-wave scheduler-empty idle is 0.00 s in every run ever measured here —
+but it cannot hide it for a process's FIRST frame, which has nothing queued
+ahead of it. Extending run-ahead to cover the first frame of a newly admitted
+process is the fix, and it involves no predicted quantity.
