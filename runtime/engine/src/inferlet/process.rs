@@ -36,6 +36,13 @@ use crate::service::{ServiceHandler, ServiceMap};
 use super::linker;
 use super::program::ProgramName;
 
+/// The versioned component export every inferlet provides. wasmtime's export
+/// name map is semver-aware, so this must be the EXACT package version declared
+/// in `interface/inferlet/world.wit` — an unversioned or stale-versioned lookup
+/// silently finds nothing and every program fails to start. Kept honest by
+/// `tests::run_interface_version_matches_wit`.
+const RUN_INTERFACE: &str = "pie:inferlet/run@0.3.0";
+
 // =============================================================================
 // ProcessEvent
 // =============================================================================
@@ -666,7 +673,10 @@ impl Process {
             // unversioned lookup does NOT match a versioned component export in
             // wasmtime's semver-aware name map, so this must track the
             // `pie:inferlet@<version>` package version declared in world.wit.
-            let run_interface = "pie:inferlet/run@0.2.0";
+            // `run_interface_version_matches_wit` pins the two together — the
+            // 0.2.0 -> 0.3.0 bump was missed once and made EVERY inferlet
+            // unloadable, a break only an e2e run could surface.
+            let run_interface = RUN_INTERFACE;
 
             let (_, run_export) = instance
                 .get_export(&mut store, None, run_interface)
@@ -821,5 +831,38 @@ impl ServiceHandler for Process {
                 }));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RUN_INTERFACE;
+
+    /// `RUN_INTERFACE` is a hand-written string that must track the WIT package
+    /// version. When the package went 0.2.0 -> 0.3.0 this constant was left
+    /// behind, and because the lookup fails at component-instantiation time the
+    /// only symptom was every program dying with "No 'run' interface found" —
+    /// invisible to `cargo test` and visible only on a box with real weights.
+    #[test]
+    fn run_interface_version_matches_wit() {
+        let wit = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../interface/inferlet/world.wit"),
+        )
+        .expect("read interface/inferlet/world.wit");
+
+        let declared = wit
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("package pie:inferlet@"))
+            .map(|v| v.trim_end_matches(';').trim().to_string())
+            .expect("world.wit declares `package pie:inferlet@<version>;`");
+
+        let expected = format!("pie:inferlet/run@{declared}");
+        assert_eq!(
+            RUN_INTERFACE, expected,
+            "process.rs RUN_INTERFACE is stale: world.wit declares \
+             pie:inferlet@{declared}. wasmtime's export lookup is semver-exact, \
+             so a mismatch makes EVERY inferlet fail to start."
+        );
     }
 }
