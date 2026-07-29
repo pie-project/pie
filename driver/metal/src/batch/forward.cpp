@@ -1653,6 +1653,7 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
         seq_len[size_t(t)] = schedule.spans[schedule.req_of_token[size_t(t)]].seqlen;
     copy_to(IoSlot::SeqLen, seq_len);
 
+    const auto step_t0 = std::chrono::steady_clock::now();
     if (!schedule.is_pure_decode) {
         if (std::getenv("PIE_METAL_PREFILL_TRACE") == nullptr)
             return run_prefill_step(schedule, in, err, ptir);
@@ -1718,20 +1719,37 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
     });
     if (!timing.succeeded())
         return fail("Metal command timed out before its completion fence");
-    // GPU-only step meter.  This machine is permanently contended (the agent
-    // process alone runs at ~250% CPU), so wall-clock A/B swings 3x and cannot
-    // decide anything; the command buffer's own execution time can.  Bucketed by
-    // lane count, since the cost is strongly batch-dependent.
+    // Step meter.  This machine is permanently contended (the agent process
+    // alone runs at ~250% CPU), so wall-clock A/B swings 3x and cannot decide
+    // anything; the command buffer's own execution time can.  Bucketed by lane
+    // count, since the cost is strongly batch-dependent.
+    //
+    // `wall` is this function's own span, so `host` = wall - gpu - encode is the
+    // driver's per-step CPU with nothing else folded in.  It reads 0.013ms at 32
+    // lanes, which is how the search for a throughput gap was steered away from
+    // the driver and into the engine.
     if (std::getenv("PIE_METAL_GPU_METER") != nullptr) {
         static double sum[2][33] = {};
+        static double wall[33] = {};
+        static double enc[33] = {};
         static int n[2][33] = {};
         const int lanes = schedule.N < 33 ? schedule.N : 32;
         const int arm = ab_enabled() && ab_arm() ? 1 : 0;
         sum[arm][lanes] += timing.gpu_exec_ms;
+        wall[lanes] += std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - step_t0).count();
+        enc[lanes] += timing.encode_ms;
         if (++n[arm][lanes] % 128 == 0) {
-            std::fprintf(stderr, "[gpu] lanes=%d A n=%d %.4f ms | B n=%d %.4f ms\n", lanes,
-                         n[0][lanes], n[0][lanes] ? sum[0][lanes] / n[0][lanes] : 0.0,
-                         n[1][lanes], n[1][lanes] ? sum[1][lanes] / n[1][lanes] : 0.0);
+            std::fprintf(stderr,
+                         "[gpu] lanes=%d A n=%d %.4f | B n=%d %.4f | wall %.4f enc %.4f "
+                         "host %.4f ms\n",
+                         lanes, n[0][lanes],
+                         n[0][lanes] ? sum[0][lanes] / n[0][lanes] : 0.0, n[1][lanes],
+                         n[1][lanes] ? sum[1][lanes] / n[1][lanes] : 0.0,
+                         wall[lanes] / (n[0][lanes] + n[1][lanes]),
+                         enc[lanes] / (n[0][lanes] + n[1][lanes]),
+                         (wall[lanes] - sum[0][lanes] - sum[1][lanes] - enc[lanes]) /
+                             (n[0][lanes] + n[1][lanes]));
         }
     }
 
