@@ -592,6 +592,11 @@ static CPU_CENSUS: [[AtomicU64; CPU_CENSUS_BUCKETS]; CPU_CLASSES] =
     [const { [const { AtomicU64::new(0) }; CPU_CENSUS_BUCKETS] }; CPU_CLASSES];
 static CPU_CENSUS_EPOCH_US: AtomicU64 = AtomicU64::new(0);
 
+/// `HostShadow::advance` accounting, written only when fire timing is on.
+pub(crate) static SHADOW_ADVANCE_CALLS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static SHADOW_ADVANCE_FOLDS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static SHADOW_ADVANCE_NS: AtomicU64 = AtomicU64::new(0);
+
 /// Per-thread CPU time. Unlike `CLOCK_MONOTONIC` this stops while the thread
 /// is off-core, so a poll that waits for a core costs the census nothing.
 pub(crate) fn thread_cpu_ns() -> u64 {
@@ -628,11 +633,64 @@ pub(crate) fn record_task_cpu(class: CpuClass, at_us: u64, cpu_ns: u64) {
     }
 }
 
+/// Names of the guest-submit phases metered by [`phase_add`], in index order.
+pub(crate) const PHASE_NAMES: [&str; 12] = [
+    "submit_total",
+    "hp_preamble",
+    "hp_bind_geometry",
+    "hp_declare",
+    "hp_grant",
+    "hp_launch",
+    "devgeo_total",
+    "rx_wall",
+    "rx_poll",
+    "rx_finalize",
+    "rx_wait",
+    "unused",
+];
+pub(crate) static PHASE_NS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+pub(crate) static PHASE_CALLS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+
+/// Accumulate one sample into a guest-submit phase. `started` is `None` when
+/// fire timing is off, which makes every call site a branch and nothing else.
+#[inline]
+pub(crate) fn phase_add(index: usize, started: Option<std::time::Instant>) {
+    if let Some(started) = started {
+        PHASE_NS[index].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        PHASE_CALLS[index].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// `Some(Instant::now())` exactly when fire timing is on.
+#[inline]
+pub(crate) fn phase_start() -> Option<std::time::Instant> {
+    fire_timing_enabled().then(std::time::Instant::now)
+}
+
 /// Emit the census as one record per class. Called on scheduler shutdown, so
 /// the arrays are read once and never on a hot path.
 pub(crate) fn fire_timing_dump_cpu_census() {
     if !fire_timing_enabled() {
         return;
+    }
+    fire_timing_write(&serde_json::json!({
+        "schema": 1,
+        "source": "runtime",
+        "event": "shadow_advance",
+        "calls": SHADOW_ADVANCE_CALLS.load(Ordering::Relaxed),
+        "folds": SHADOW_ADVANCE_FOLDS.load(Ordering::Relaxed),
+        "ns": SHADOW_ADVANCE_NS.load(Ordering::Relaxed),
+    }));
+    for (index, name) in PHASE_NAMES.iter().enumerate() {
+        let calls = PHASE_CALLS[index].load(Ordering::Relaxed);
+        fire_timing_write(&serde_json::json!({
+            "schema": 1,
+            "source": "runtime",
+            "event": "submit_phase",
+            "phase": name,
+            "calls": calls,
+            "ns": PHASE_NS[index].load(Ordering::Relaxed),
+        }));
     }
     let epoch = CPU_CENSUS_EPOCH_US.load(Ordering::Relaxed);
     if epoch == 0 {
@@ -1027,4 +1085,14 @@ pub async fn get_stats() -> AggregateStats {
         .filter_map(|slot| slot.as_ref().map(|handle| handle.stats()))
         .collect();
     stats::aggregate(&scheduler_stats)
+}
+
+#[cfg(test)]
+mod phase_counter_tests {
+    #[test]
+    fn phase_add_writes_the_array_slot_the_dump_reads() {
+        super::PHASE_CALLS[11].store(0, super::Ordering::Relaxed);
+        super::phase_add(11, Some(std::time::Instant::now()));
+        assert_eq!(super::PHASE_CALLS[11].load(super::Ordering::Relaxed), 1);
+    }
 }

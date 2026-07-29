@@ -293,6 +293,19 @@ impl GeometryTaint {
     }
 }
 
+/// For each channel this stage puts, whether the put's VALUE is statically
+/// device-decided, resolved against a settled [`GeometryTaint::device_decided`].
+///
+/// A statically tainted value is `Err` in `fold_stage` on EVERY fire — taint
+/// sources are kernel calls, device intrinsics and ambient RNG, all of which
+/// the fold blocks unconditionally, and a tainted channel read resolves
+/// through the same set. So a stage whose every put is tainted commits
+/// nothing host-derivable in any fire, and folding it per fire re-derives a
+/// constant.
+pub fn stage_put_taint(ops: &[Op], device_decided: &BTreeSet<u32>) -> BTreeMap<u32, bool> {
+    stage_taint(ops, device_decided).0
+}
+
 /// One taint pass over a stage's ops against the current device-decided set.
 /// Returns (this stage's pending put taint by channel, channels newly proven
 /// device-decided by a tainted put).
