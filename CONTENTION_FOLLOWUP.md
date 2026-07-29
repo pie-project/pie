@@ -3997,3 +3997,126 @@ Recorded, not attempted.
 REVERTED — the tree carries none of this. `park_census` /
 `planner_parks_total` from §20.20 stay; `runahead_first_frames` went with the
 experiment.
+
+---
+
+## §20.22 — the BANKED first-frame reserve: +3.6% measured, then refuted on liveness
+
+§20.21 closed first-frame run-ahead in its *dispatching* form and left exactly
+one variant open: submit the first frame early but **hold it undispatched**,
+releasing it only when the GPU would otherwise stand still. That variant is now
+built, measured and closed. It is a real throughput win and a structural
+liveness break, and both halves are worth recording.
+
+### What was built
+
+A `held` lane state in the frame policy — a lane that is *present* (its frame
+is assembled and counted) but neither **awaited** by the wait-all seal nor
+**dispatchable** by `seal()`. A `runahead_held` process set arms it; the arm
+also drops the owner's `staged` earmark, because a reserve is not a successor
+the boundary should wait for (its frame is already assembled, so there is no
+fire to gather).
+
+Release had to be moved twice before it was live, and each move is a lesson:
+
+1. **Release at slot consumption** (the obvious design) **deadlocks.** An
+   unseated guest blocks on its first frame's *result*, so it never reaches the
+   next `submit` that would take the seat: `seal -> result -> submit -> seat ->
+   seal`. Measured 865 tok/s, 2063/4096 requests failed.
+2. **Release when the GPU is idle and nothing is sealable** fixes that, but a
+   banked reserve that still held its `staged` earmark blocked the boundary
+   through the `joining` interlock instead — the same cycle one indirection
+   out. (`[frame-stall]` in `soak`, a 120 s hang in `tinyswap`.)
+3. **Final shape, and the only correct one:** release inside `plan_dispatch`
+   when `!executing && (joining || missing > 0 || !have_seal_candidate())` —
+   nothing is in flight *and* this boundary cannot dispatch for any reason. The
+   `!executing` key is what makes it unconditional progress: releasing cannot
+   reorder anything, because there is nothing in flight to reorder against.
+   (Same argument the mode-2 rebind escape rests on.)
+
+### It works, and the mechanism is confirmed
+
+Homogeneous conc 512, 4096 requests, 8192 pages, n=5 per arm, interleaved:
+
+```
+  off  31039  31331  29975  31236  30645   mean 30845
+  on   32184  31728  32025  31911  31931   mean 31956   +3.6%
+```
+
+The arms do not overlap: the on-arm's **minimum** (31728) beats the off-arm's
+**maximum** (31331), 5/5 vs 5/5. The on-arm is also four times tighter (1.4% vs
+4.5% spread) — consistent with the boundary hole being the variance source.
+vs vLLM 32755: **0.958 -> 0.976**.
+
+Wave decomposition of an instrumented pair (30695 off / 31414 on) confirms the
+mechanism rather than a side effect:
+
+```
+  off  528 waves  24 prefill waves  idle 1.09s  (prefill 1.00  decode 0.09)
+  on   528 waves  24 prefill waves  idle 0.79s  (prefill 0.57  decode 0.21)
+  off top gaps  293 140 135 121  97  96  75  40 ms   (all before prefill)
+  on  top gaps  326  59  39  32  31  31  30  26 ms
+```
+
+Wave count and prefill-wave count are **identical** — no fleet fragmentation,
+which is what every quorum-relaxation attempt failed on. The per-turnover holes
+collapse by roughly the 83.6 ms a prefill wave costs on the GPU, exactly as
+§20.21 predicted. The one unchanged gap (293 -> 326 ms) is startup, where by
+construction nothing has been banked yet.
+
+### Why it cannot land: a reserve holds KV without holding a seat
+
+Contention suite: **7 of 16 scenarios failed** (`hog` 1/32 completed, `soak`
+515/4096, `tinyswap` stops evicting entirely). All three are the tightest pools
+in the suite — `hog` 40 pages, `tinyswap` 128, `soak` 160.
+
+Pairing each reserve 1:1 with a real departure (an `AtomicU64` credit
+incremented where the execution seat is released in `ProcessCtx::drop`,
+consumed by the run-ahead pass — an accounting identity, no constant, and zero
+at startup) fixed `hog` outright, 32/32. It does **not** fix the others, and
+the planner trace says why:
+
+```
+queue=18 head_pages=1 accum=0 free=0/128 resident=49 evicting=1 admitted=30
+runners=[12 procs, all h4]
+```
+
+`admitted=30` against an execution cap of **16**. The credit bounds the *flow*
+of new reserves; it cannot bound the *stock*, because a reserve keeps its pages
+from its prefill until it eventually finishes — long after the departure that
+funded it returned its own. The pool then has 0 free pages, the head ask is
+1 page, and the single `evicting` process can never complete.
+
+This is not a bug in the implementation. It is the design:
+
+> **A banked reserve holds pooled pages without holding an execution seat. The
+> KV pool is sized against the execution cap. Therefore any run-ahead that
+> reaches the allocator oversubscribes the pool by construction, and no
+> accounting on the run-ahead side can repair that — the extra pages are real.**
+
+Bounding the reserve by a page budget would work, and is exactly the predicted
+quantity the user has ruled out (and §20.20 already closed KV-aware admission
+in both its heuristic and its structural forms).
+
+### Status
+
+REVERTED — the tree carries none of this.
+
+### What is now closed
+
+The fleet-wide join at a cohort boundary (§20.21's root cause) has three
+conceivable levers, and all three are closed by measurement:
+
+| lever | where | result |
+| --- | --- | --- |
+| relax the seal quorum | §20.14 #6/#7 + two share-based designs | worse; the fleet splits into sub-cohorts that never re-merge |
+| move the join earlier | §20.21 | -5.7%; the hole follows the join |
+| bank work across the join | §20.22 (this) | +3.6%, but oversubscribes the KV pool by construction |
+
+The remaining ~100 ms per boundary is 512 guest exits + 512 admissions + 512
+first submits. Only §20.14's already-recorded shape can still attack it: make
+per-process bring-up and teardown substantially cheaper, so the round trip
+itself shrinks. §20.15 (submit -58%) and §20.16 (close barrier -19%) were the
+first two instalments of that and were individually throughput-neutral; the
+finding here is that they were attacking the right term after all, just not
+enough of it to clear the noise band.
