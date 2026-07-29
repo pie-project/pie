@@ -340,5 +340,51 @@ class TheMatcherRefusesABufferItCannotWriteTo(unittest.TestCase):
         self.matcher.fill_bitmask(torch.zeros(self.words, dtype=torch.int32))
 
 
+
+class ABatchThePoolOutgrew(unittest.TestCase):
+    """Admitting a grammar can raise a ceiling a live batch was sized from.
+
+    Buffers do not overflow, they read past themselves - the kernels index
+    what they are given - so this has to be refused rather than flagged.
+    """
+
+    def setUp(self):
+        _requirements()
+        self.engine = gpugrammar.Engine(VOCABULARY)
+
+    def _wide(self):
+        return self.engine.compile_json_schema(json.dumps({
+            "type": "object",
+            "properties": {name: {"type": "string"} for name in "abcdefghijklmnop"},
+            "required": list("abcdefgh"),
+        }))
+
+    def test_a_wider_grammar_makes_a_live_batch_refuse(self):
+        narrow = self.engine.compile_json_schema(json.dumps({"type": "boolean"}))
+        batch = self.engine.batch(size=4)
+        batch.set_grammars([narrow] * 4)
+        batch.capture()
+        self.assertFalse(batch.outgrown)
+        wide = self._wide()
+        self.assertTrue(batch.outgrown)
+        with self.assertRaises(RuntimeError):
+            batch.set_grammars([wide] * 4)
+        with self.assertRaises(RuntimeError):
+            batch.fill_mask()
+
+    def test_and_a_new_batch_serves_it(self):
+        narrow = self.engine.compile_json_schema(json.dumps({"type": "boolean"}))
+        stale = self.engine.batch(size=4)
+        stale.set_grammars([narrow] * 4)
+        wide = self._wide()
+        fresh = self.engine.batch(size=4)
+        fresh.set_grammars([wide] * 4)
+        self.assertFalse(fresh.outgrown)
+        mask = fresh.fill_mask()
+        reference = torch.zeros(wide.bitset_words, dtype=torch.int32)
+        wide.matcher(32).fill_bitmask(reference)
+        self.assertTrue(bool((mask[0].cpu()[: wide.bitset_words] == reference).all()))
+
+
 if __name__ == "__main__":
     unittest.main()

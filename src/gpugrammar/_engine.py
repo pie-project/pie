@@ -3263,6 +3263,12 @@ class DeviceBatch:
         # old ones are too small for the new. Silently, since a kernel indexes
         # what it is given.
         self.pool_revision = grammar.revision
+        # And the ceilings themselves, because `revision` tracks where the
+        # arrays *are* and these are how big they have to be - a grammar can
+        # raise one without moving anything. Compared before every operation
+        # by `_check_shape`, since the alternative is a kernel indexing past a
+        # buffer with whatever it finds there.
+        self.sized_for = self._ceilings()
 
         # A conflicted reading yields one candidate per surviving derivation,
         # so the slot count would be readings times paths - a product of two
@@ -3498,6 +3504,7 @@ class DeviceBatch:
         fixed, so the same CUDA graph covers any assignment.
         """
         values = torch.as_tensor(ids, dtype=torch.int32).reshape(-1)
+        self._check_shape()
         if values.numel() != self.batch:
             raise ValueError(
                 f"{values.numel()} grammar ids for a batch of {self.batch}"
@@ -3666,6 +3673,7 @@ class DeviceBatch:
         pays a device-to-host round trip per token, and no amount of making the
         parser itself faster removes it.
         """
+        self._check_shape()
         self.token.copy_(tokens.to(torch.int32).reshape(-1)[: self.batch])
         if self.rollback_depth > 0:
             self.history_length = min(self.history_length + 1, self.rollback_depth)
@@ -3673,6 +3681,50 @@ class DeviceBatch:
             self.advance_graph.replay()
             return
         self._advance()
+
+    @property
+    def outgrown(self) -> bool:
+        """Has the pool outgrown the buffers this batch was sized for?
+
+        True when a grammar admitted since raised a ceiling. The batch cannot
+        answer by resizing - a recorded graph holds the addresses it recorded -
+        so a caller that keeps a batch across admissions asks this and makes a
+        new one. Every operation checks it too, and refuses rather than letting
+        a kernel index past a buffer.
+        """
+        return self.sized_for != self._ceilings()
+
+    def _ceilings(self) -> tuple[int, ...]:
+        """Every pool-wide maximum this batch's buffers were sized from."""
+        grammar = self.grammar
+        return (
+            grammar.max_configs,
+            grammar.max_readings,
+            grammar.paths,
+            grammar.window,
+            grammar.max_stack,
+            grammar.max_groups_per_state,
+        )
+
+    def _check_shape(self) -> None:
+        """Refuse to run against a pool that outgrew this batch.
+
+        Admitting a grammar can raise a ceiling, and a kernel indexes what it
+        is given: buffers sized against the old maxima do not overflow, they
+        read past themselves. This engine's one rule is that a mask may be
+        wider than the grammar and never narrower, and neither a wrong mask
+        nor a wrong address is something to discover from a flag.
+
+        A batch cannot resize itself - a recorded graph holds the addresses it
+        recorded, and the caller holds the mask tensor - so this raises and
+        names the fix.
+        """
+        if self.outgrown:
+            raise RuntimeError(
+                "a grammar admitted since this batch was made needs more room "
+                f"than it has (sized for {self.sized_for}, pool now needs "
+                f"{self._ceilings()}): make a new batch from the engine"
+            )
 
     def _snapshot_live(self) -> dict[str, torch.Tensor]:
         """Everything a rehearsal disturbs and a caller can observe.
@@ -3766,6 +3818,7 @@ class DeviceBatch:
         `advance(tokens)` followed by `fill_mask()`, and the mask it returns is
         the same tensor `fill_mask` returns.
         """
+        self._check_shape()
         self.token.copy_(tokens.to(torch.int32).reshape(-1)[: self.batch])
         if self.rollback_depth > 0:
             self.history_length = min(self.history_length + 1, self.rollback_depth)
@@ -4069,6 +4122,7 @@ class DeviceBatch:
         raise RuntimeError("call capture_draft first")
 
     def fill_mask(self) -> torch.Tensor:
+        self._check_shape()
         if self.memo_revision != self.grammar.revision:
             # Compaction renumbers the grammars, so an entry saying "grammar 2"
             # now names a different one and its mask would be handed to it. The

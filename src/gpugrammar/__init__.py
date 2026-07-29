@@ -302,6 +302,19 @@ class Batch:
         return self._batch.problems()
 
     @property
+    def outgrown(self) -> bool:
+        """Has a grammar admitted since this batch was made outgrown it?
+
+        A batch's buffers are sized from the pool's ceilings, and admitting a
+        grammar can raise one. A batch cannot resize itself - a recorded graph
+        holds the addresses it recorded, and you hold the mask tensor - so
+        make a new batch when this is true. Every operation checks it and
+        raises rather than letting a kernel index past a buffer, so ignoring
+        it is safe; asking is how you avoid the exception.
+        """
+        return self._batch.outgrown
+
+    @property
     def size(self) -> int:
         return self._batch.batch
 
