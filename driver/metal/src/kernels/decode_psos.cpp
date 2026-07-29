@@ -118,8 +118,8 @@ bool load_multibatch_psos(RawMetalContext& ctx,
         {"gdn_prep.metal",     "gdn_core_recurrent_prefill_bfloat16",
                                                              &out.gdn_core_prefill,  true},
     };
-    for (int i = 0; i < 2; ++i) {
-        const int bn = i == 0 ? 32 : 64;
+    for (int i = 0; i < 3; ++i) {
+        const int bn = 16 << i;
         const std::string suffix =
             "_bfloat16_gs_64_b_4_bm_16_bn_" + std::to_string(bn);
         out.qmm_t[i] = ctx.compile_pso_from_file(

@@ -122,7 +122,7 @@ Pso mb_pso(const Dispatch& d, const DecodeStepPsos& base, const MultiBatchPsos& 
         case Kernel::SdpaPaged: return mb.sdpa_paged;
         default: {
             if (d.qmm_bn > 0) {
-                const int slot = d.qmm_bn == 64 ? 1 : 0;
+                const int slot = d.qmm_bn == 64 ? 2 : (d.qmm_bn == 32 ? 1 : 0);
                 const Pso& gemm =
                     d.fuse_residual ? mb.qmm_t_residual[slot] : mb.qmm_t[slot];
                 if (gemm.valid()) return gemm;

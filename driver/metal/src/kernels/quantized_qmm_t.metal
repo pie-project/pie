@@ -1525,6 +1525,7 @@ template <typename T, int group_size, int bits, int BM, int BK, int BN>
 
 instantiate_qmm_t(16, 32, 32)
 instantiate_qmm_t(16, 32, 64)
+instantiate_qmm_t(16, 32, 16)
 
 // ── Strided form, for the prefill ────────────────────────────────────────────
 // Identical to the aligned kernel above except that the row pitch of `x`, `y`

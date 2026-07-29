@@ -36,13 +36,33 @@ inline constexpr int kQmmMinBatch = 12;
 // GEMV port relies on for its "fast" variant), so K % BK == 0 is free.
 inline constexpr int kQmmBM = 16;
 
-// Output columns per threadgroup. Prefer the wider tile only when it still
-// leaves enough threadgroups to fill the machine.
+// Output columns per threadgroup.  This GEMM is occupancy-bound, not bandwidth-
+// bound: measured standalone at the model's shapes it turns in ~380 GFLOP/s at
+// 16 threadgroups, ~900 at 32, ~1600 at 112 and saturates around 2.2-2.6 TFLOP/s
+// past ~200, against a 389 GB/s machine it only ever reaches 11% of.  So take
+// the widest tile -- wider means each x row is loaded fewer times -- that still
+// leaves enough threadgroups to fill the machine, and past that prefer more
+// threadgroups over a wider tile.
+//
+// The measured optimum for every projection in the checkpoint falls out of that
+// one rule: BN=64 for lm_head (3880 tg), 32 for the GDN in-projection (192),
+// 16 for everything else.  The old rule asked only whether `out_vec/64 >= 64`,
+// which handed the GDN in-projection a BN=64 that measured 21% slower.
+//
+// BN partitions output columns only -- every element's K sum is unchanged -- so
+// the choice is bit-exact whichever way it goes.
+inline constexpr int kQmmMinThreadgroups = 192;
+
 inline int qmm_bn(int out_vec, int N) {
     if (N < kQmmMinBatch || N % kQmmBM != 0) return 0;
-    if (out_vec % 64 == 0 && out_vec / 64 >= 64) return 64;
-    if (out_vec % 32 == 0) return 32;
-    return 0;
+    const int row_blocks = N / kQmmBM;
+    int best = 0;
+    for (int bn : {16, 32, 64}) {
+        if (out_vec % bn != 0) continue;
+        if (best == 0) best = bn;  // the narrowest that divides, as a floor
+        if ((out_vec / bn) * row_blocks >= kQmmMinThreadgroups) best = bn;
+    }
+    return best;
 }
 
 // `out/BN` threadgroups across the output, `M/BM` across the batch, each
