@@ -22,7 +22,7 @@ use gpugrammar_tables::pipeline::{
 };
 use gpugrammar_run::Matcher as RunMatcher;
 use gpugrammar_tables::Artifact;
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use rustc_hash::FxHashMap;
 use pyo3::create_exception;
@@ -665,6 +665,62 @@ fn pack_configurations<'py>(
     ))
 }
 
+/// The device runtime, exposed as functions rather than as a class: it holds
+/// no state a caller owns - the module is loaded once per process - and the
+/// tensors it works on belong to PyTorch.
+///
+/// Device pointers arrive as integers from `tensor.data_ptr()` and the stream
+/// as one from `torch.cuda.current_stream().cuda_stream`. That is the whole
+/// interface, and it is what lets a launch be recorded by PyTorch's own graph
+/// capture rather than run - which is the property this engine exists for.
+#[pyfunction]
+fn cuda_available() -> bool {
+    gpugrammar_cuda::available()
+}
+
+#[pyfunction]
+fn cuda_fatbin_bytes() -> usize {
+    gpugrammar_cuda::fatbin_bytes()
+}
+
+/// Launch one kernel by name. The bring-up path, and the shape every later
+/// launch site will take.
+#[pyfunction]
+#[pyo3(signature = (name, grid, block, stream, pointers, scalars, shared_bytes = 0))]
+fn cuda_launch(
+    name: &str,
+    grid: u32,
+    block: u32,
+    stream: u64,
+    pointers: Vec<u64>,
+    scalars: Vec<i32>,
+    shared_bytes: u32,
+) -> PyResult<()> {
+    let kernel = gpugrammar_cuda::Kernel::named(name).map_err(PyRuntimeError::new_err)?;
+    // The driver takes an array of pointers *to* the arguments, so the values
+    // have to outlive the launch call - hence binding them before taking
+    // addresses rather than building the array inline.
+    let mut addresses: Vec<u64> = pointers;
+    let mut values: Vec<i32> = scalars;
+    let mut arguments: Vec<*mut std::ffi::c_void> = Vec::with_capacity(
+        addresses.len() + values.len(),
+    );
+    for address in &mut addresses {
+        arguments.push(std::ptr::from_mut(address).cast());
+    }
+    for value in &mut values {
+        arguments.push(std::ptr::from_mut(value).cast());
+    }
+    // Safety: the caller supplies the argument list in the order the named
+    // kernel declares. Checked by the tests that launch each kernel, not by
+    // the type system - see the note on `Kernel::launch`.
+    unsafe {
+        kernel
+            .launch((grid, 1, 1), (block, 1, 1), shared_bytes, stream, &mut arguments)
+            .map_err(PyRuntimeError::new_err)
+    }
+}
+
 /// The compiled front end, imported by the `gpugrammar` package rather than
 /// directly: the public library is Python over this, and keeping the extension
 /// under a private name is what lets the package own the name users type.
@@ -675,5 +731,8 @@ fn _gpugrammar(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Matcher>()?;
     module.add_function(wrap_pyfunction!(pack_configurations, module)?)?;
     module.add("CompileError", module.py().get_type::<CompileError>())?;
+    module.add_function(wrap_pyfunction!(cuda_available, module)?)?;
+    module.add_function(wrap_pyfunction!(cuda_fatbin_bytes, module)?)?;
+    module.add_function(wrap_pyfunction!(cuda_launch, module)?)?;
     Ok(())
 }

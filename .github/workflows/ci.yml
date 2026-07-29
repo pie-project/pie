@@ -77,9 +77,20 @@ jobs:
               raise SystemExit("an exponential pattern was not refused")
           print("the wheel imports and compiles")
           PY
+      # A hosted runner has no CUDA toolkit, so `build.rs` finds no nvcc and
+      # embeds an empty fatbin. That degradation is deliberate - the front end
+      # must stay buildable by a contributor without CUDA - and it is worth
+      # asserting either way, because both halves fail silently: a wheel that
+      # ships no kernels looks identical to one that does until something runs.
+      - name: without a toolkit, no kernels, and the front end still works
+        run: |
+          uv run --python /tmp/clean/bin/python python -c "
+          from gpugrammar import _gpugrammar as g
+          assert not g.cuda_available(), 'a runner with no nvcc produced kernels'
+          print('no toolkit, no kernels, front end fine')"
 
   # The one thing a hosted runner cannot do. Everything here needs a real
-  # device: the kernels are Triton, the step is a CUDA graph, and the
+  # device: the kernels are CUDA, the step is a CUDA graph, and the
   # verifications compare the device against the reference matcher row by row.
   gpu:
     runs-on: [self-hosted, cuda]
@@ -94,6 +105,15 @@ jobs:
           uv venv
           uv pip install torch triton numpy
           uv pip install --no-deps dist/*.whl
+      # This runner has nvcc, so the wheel it just built must carry kernels.
+      # The whole point of the fatbin is that nothing compiles at run time, so
+      # a build that quietly found no nvcc has to be a failure here.
+      - name: the wheel carries CUDA kernels
+        run: |
+          uv run python -c "
+          from gpugrammar import _gpugrammar as g
+          assert g.cuda_available(), 'nvcc is present but no kernels were embedded'
+          print(f'{g.cuda_fatbin_bytes()} bytes of fatbin')"
       - name: tests
         run: uv run --with numpy python -m unittest discover -s tests
         env:

@@ -1,0 +1,13 @@
+[package]
+name = "gpugrammar-cuda"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The device runtime: CUDA kernels, compiled to a fatbin and embedded"
+build = "build.rs"
+
+[dependencies]
+
+[lints]
+workspace = true

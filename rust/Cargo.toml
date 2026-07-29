@@ -6,6 +6,7 @@ members = [
     "crates/gpugrammar-lr",
     "crates/gpugrammar-tables",
     "crates/gpugrammar-run",
+    "crates/gpugrammar-cuda",
     "crates/gpugrammar-py",
 ]
 
