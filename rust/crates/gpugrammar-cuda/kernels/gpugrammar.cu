@@ -12,3 +12,4 @@
 #include "arena.cuh"
 #include "probe.cuh"
 #include "readback.cuh"
+#include "locate.cuh"

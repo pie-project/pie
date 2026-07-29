@@ -38,6 +38,9 @@ import triton
 import triton.language as tl
 
 _GROUP_BLOCK = 64
+# Threads per block for the CUDA kernels that give a warp to a configuration.
+# Four warps, which is what the Triton locate uses, so the two are comparable.
+_LOCATE_THREADS = 128
 # Blocks that drain the sweep. Fixed, and deliberately so: the grid no longer
 # depends on the batch, on how wide its parses are, or on the grammar, which is
 # what a CUDA graph needs and what a batch of mixed grammars would need. It also
@@ -3953,6 +3956,60 @@ class DeviceBatch:
             return self.mask
         self._advance()
         return self._fill()
+
+    # The per-batch state as the CUDA kernels want it, in the order
+    # `gg::BatchState` declares. Built once: these buffers do not move, which
+    # is the same property that lets a recorded graph hold their addresses.
+    _BATCH_FIELDS = (
+        "lexer_state",
+        "stack",
+        "depth",
+        "config_count",
+        "widest",
+        "grammar_of",
+        "token",
+        "terminated",
+        "overflow",
+        "mask",
+    )
+
+    def state_struct(self) -> torch.Tensor:
+        held = getattr(self, "_state_struct", None)
+        if held is None:
+            held = torch.tensor(
+                [getattr(self, name).data_ptr() for name in self._BATCH_FIELDS],
+                dtype=torch.int64,
+                device=self.device,
+            )
+            self._state_struct = held
+        return held
+
+    def _locate_cuda(self, grammar, rows) -> None:
+        """`gg_locate`: one warp per live configuration."""
+        from gpugrammar import _gpugrammar
+
+        _gpugrammar.cuda_launch(
+            "gg_locate",
+            self.sweep_blocks,
+            _LOCATE_THREADS,
+            torch.cuda.current_stream().cuda_stream,
+            [
+                self.grammar.arena_struct().data_ptr(),
+                self.state_struct().data_ptr(),
+                self.live_offsets.data_ptr(),
+                self.found.data_ptr(),
+                self.old_lexer.data_ptr(),
+                self.old_count.data_ptr(),
+                self.old_stack.data_ptr(),
+            ],
+            [
+                self.batch,
+                self.configs,
+                grammar.max_stack,
+                rows,
+                grammar.has_verdicts,
+            ],
+        )
 
     def _advance_triton(self) -> None:
         grammar = self.grammar

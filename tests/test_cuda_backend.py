@@ -321,5 +321,115 @@ class TheArenaStructDescribesThePool(unittest.TestCase):
         )
 
 
+
+class TheCudaLocateAgreesWithTriton(unittest.TestCase):
+    """`gg_locate` against `_locate_kernel`, entry for entry.
+
+    The first ported kernel that does real work: arena lookups through a
+    grammar's bases and CSR traversal, but not the reduction chain, which is
+    why it is first. Four outputs, and all four matter - `found` is the answer,
+    and the three `old_*` are the pre-advance state the candidate pass reads
+    while the advance is overwriting the live one.
+    """
+
+    def setUp(self):
+        if not HAVE_CUDA or not _gpugrammar.cuda_available():
+            raise unittest.SkipTest("no CUDA device or no kernels in this build")
+        import json
+
+        import gpugrammar
+
+        self.engine = gpugrammar.Engine([bytes([i]) for i in range(256)])
+        self.grammars = [
+            self.engine.compile_json_schema(json.dumps(schema))
+            for schema in (
+                {"type": "string"},
+                {
+                    "type": "object",
+                    "properties": {"a": {"type": "string"}, "b": {"type": "integer"}},
+                    "required": ["a"],
+                },
+                {"type": "array", "items": {"type": "boolean"}},
+            )
+        ]
+
+    def _both(self, sequences, token_seed):
+        from gpugrammar import _engine
+
+        batch = self.engine.batch(size=sequences)
+        batch.set_grammars([self.grammars[i % 3] for i in range(sequences)])
+        raw = batch.raw
+        grammar = raw.grammar
+        rows = raw.batch * raw.configs
+
+        torch.manual_seed(token_seed)
+        raw.token.copy_(
+            torch.randint(0, 256, (sequences,), dtype=torch.int32, device="cuda")
+        )
+        raw._count_and_scan(grammar, rows, raw.counts, raw.live_offsets, skip=0, unit=1)
+        torch.cuda.synchronize()
+
+        raw.found.fill_(_engine._NO_GROUP)
+        _engine._locate_kernel[(raw.sweep_blocks,)](
+            grammar.group_offsets, grammar.group_set_kind, grammar.group_set_offset,
+            grammar.group_set_length, grammar.set_payload, grammar.verdict_offsets,
+            grammar.verdicts, grammar.verdict_stride, raw.lexer_state, raw.stack,
+            raw.depth, raw.config_count, raw.widest, raw.token, raw.grammar_of,
+            grammar.bases, raw.live_offsets, raw.found, raw.old_lexer,
+            raw.old_count, raw.old_stack,
+            ROWS=rows, CONFIGS=raw.configs, GROUP_BLOCK=_engine._GROUP_BLOCK,
+            SEARCH_STEPS=grammar.search_steps, STACK_STRIDE=grammar.max_stack,
+            HAS_VERDICTS=grammar.has_verdicts, NO_GROUP=_engine._NO_GROUP,
+        )
+        torch.cuda.synchronize()
+        theirs = {
+            name: getattr(raw, name).clone()
+            for name in ("found", "old_lexer", "old_count", "old_stack")
+        }
+
+        raw.found.fill_(_engine._NO_GROUP)
+        raw.old_lexer.zero_()
+        raw.old_count.zero_()
+        raw.old_stack.zero_()
+        raw._locate_cuda(grammar, rows)
+        torch.cuda.synchronize()
+        return raw, theirs
+
+    def test_the_two_kernels_produce_the_same_four_arrays(self):
+        for seed in range(8):
+            raw, theirs = self._both(16, seed)
+            for name, expected in theirs.items():
+                mine = getattr(raw, name)
+                self.assertTrue(
+                    bool(torch.equal(mine, expected)),
+                    f"seed {seed}: {name} differs in "
+                    f"{int((mine != expected).sum())} of {mine.numel()}",
+                )
+
+    def test_it_holds_at_a_serving_batch_size(self):
+        raw, theirs = self._both(256, 99)
+        for name, expected in theirs.items():
+            self.assertTrue(bool(torch.equal(getattr(raw, name), expected)), name)
+
+    def test_a_token_no_group_holds_is_reported_as_no_group(self):
+        from gpugrammar import _engine
+
+        batch = self.engine.batch(size=4)
+        batch.set_grammars([self.grammars[0]] * 4)
+        raw = batch.raw
+        rows = raw.batch * raw.configs
+        # Past the vocabulary, so nothing can hold it.
+        raw.token.fill_(255)
+        raw._count_and_scan(
+            raw.grammar, rows, raw.counts, raw.live_offsets, skip=0, unit=1
+        )
+        raw.found.zero_()
+        raw._locate_cuda(raw.grammar, rows)
+        torch.cuda.synchronize()
+        live = int(raw.live_offsets[rows])
+        self.assertGreater(live, 0, "nothing was live, so nothing was tested")
+        self.assertEqual(int(raw.found[0]), _engine._NO_GROUP)
+
+
 if __name__ == "__main__":
     unittest.main()
