@@ -36,6 +36,7 @@ Three layers, and you can reach any of them:
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
+from importlib import metadata as _metadata
 
 from gpugrammar._gpugrammar import (
     CompiledGrammar,
@@ -56,7 +57,13 @@ __all__ = [
     "__version__",
 ]
 
-__version__ = "0.1.0"
+# One source, which is the wheel's own metadata. It had been written out in
+# three places - here, `pyproject.toml` and the Cargo workspace - and the
+# first of those is the one a caller reads.
+try:
+    __version__ = _metadata.version("gpugrammar")
+except _metadata.PackageNotFoundError:  # running from a checkout
+    __version__ = "0.0.0+source"
 
 
 class Engine:

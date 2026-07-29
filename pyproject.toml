@@ -13,6 +13,7 @@ classifiers = [
   "Development Status :: 3 - Alpha",
   "Programming Language :: Python :: 3",
   "Programming Language :: Rust",
+  "Typing :: Typed",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
