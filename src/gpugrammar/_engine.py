@@ -28,11 +28,8 @@ pure function of the grammar and the vocabulary.
 
 from __future__ import annotations
 
-import argparse
 import bisect
-import json
 from dataclasses import dataclass
-from pathlib import Path
 
 import numpy as np
 import os
@@ -195,6 +192,30 @@ def _search(keys_ptr, low, high, needle):
         else:
             high = middle
     return found
+
+
+@triton.jit
+def _owner(offsets_ptr, rows, item):
+    """Which row owns work item `item`, given that row's CSR offsets.
+
+    The last row whose offset is at or below the item. Rows that contribute
+    nothing have equal offsets, so taking the *last* such row steps past them
+    and lands on the one that actually holds it - which is why this is an
+    upper bound rather than the exact-match `_search`.
+
+    Written out at five launch sites before this existed. `@triton.jit`
+    helpers are inlined, so the generated code is the same; what changes is
+    that there is one copy of the off-by-one to get right.
+    """
+    low = 0
+    high = rows - 1
+    while low < high:
+        middle = (low + high + 1) // 2
+        if tl.load(offsets_ptr + middle) <= item:
+            low = middle
+        else:
+            high = middle - 1
+    return low
 
 
 @triton.jit
@@ -634,15 +655,7 @@ def _mask_kernel(
         # Which configuration owns this item. Rows that contribute nothing have
         # equal offsets, so taking the *last* row whose offset is at or below
         # the item lands past them and on the row that holds it.
-        low = 0
-        high = ROWS - 1
-        while low < high:
-            middle = (low + high + 1) // 2
-            if tl.load(work_offsets_ptr + middle) <= item:
-                low = middle
-            else:
-                high = middle - 1
-        row_index = low
+        row_index = _owner(work_offsets_ptr, ROWS, item)
         slot = item - tl.load(work_offsets_ptr + row_index)
         sequence = row_index // CONFIGS
         state = tl.load(lexer_state_ptr + row_index)
@@ -896,15 +909,7 @@ def _history_kernel(
     # actually holds - which took the advance from 133 us to 1,200.
     item = program
     while item < total:
-        low = 0
-        high = ROWS - 1
-        while low < high:
-            middle = (low + high + 1) // 2
-            if tl.load(live_offsets_ptr + middle) <= item:
-                low = middle
-            else:
-                high = middle - 1
-        row_index = low
+        row_index = _owner(live_offsets_ptr, ROWS, item)
         depth = tl.load(stack_depth_ptr + row_index)
         tl.store(hist_lexer_ptr + at + row_index, tl.load(lexer_state_ptr + row_index))
         tl.store(hist_depth_ptr + at + row_index, depth)
@@ -1000,15 +1005,7 @@ def _snapshot_kernel(
     total = tl.load(live_offsets_ptr + ROWS)
     slot = program
     while slot < total:
-        low = 0
-        high = ROWS - 1
-        while low < high:
-            middle = (low + high + 1) // 2
-            if tl.load(live_offsets_ptr + middle) <= slot:
-                low = middle
-            else:
-                high = middle - 1
-        row_index = low
+        row_index = _owner(live_offsets_ptr, ROWS, slot)
         tl.store(old_lexer_ptr + row_index, tl.load(lexer_state_ptr + row_index))
         sequence = row_index // CONFIGS
         tl.store(old_count_ptr + sequence, tl.load(config_count_ptr + sequence))
@@ -1056,15 +1053,7 @@ def _scatter_kernel(
     item = block
     while item < total:
         if tl.load(admitted_ptr + item) != 0:
-            low = 0
-            high = ROWS - 1
-            while low < high:
-                middle = (low + high + 1) // 2
-                if tl.load(work_offsets_ptr + middle) <= item:
-                    low = middle
-                else:
-                    high = middle - 1
-            row_index = low
+            row_index = _owner(work_offsets_ptr, ROWS, item)
             sequence = row_index // CONFIGS
             state = tl.load(lexer_state_ptr + row_index)
             at = bases_ptr + tl.load(grammar_ptr + sequence) * _NBASES
@@ -1218,15 +1207,7 @@ def _locate_kernel(
         # Which configuration this slot is. Launching for the ceiling instead
         # was 38 us of a 163 us step at batch 512, nearly all of it blocks that
         # returned at once - the same mistake the fill's grid used to make.
-        low = 0
-        high = ROWS - 1
-        while low < high:
-            middle = (low + high + 1) // 2
-            if tl.load(live_offsets_ptr + middle) <= slot:
-                low = middle
-            else:
-                high = middle - 1
-        row_index = low
+        row_index = _owner(live_offsets_ptr, ROWS, slot)
         sequence = row_index // CONFIGS
         # The old state, saved here rather than in a launch of its own. The
         # advance writes new configurations while reading old ones, so the copy
@@ -4437,138 +4418,3 @@ class DeviceBatch:
             num_warps=4,
         )
         return self.mask
-
-
-def _time(function, warmup: int = 5, iterations: int = 20) -> float:
-    for _ in range(warmup):
-        function()
-    torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(iterations):
-        function()
-    end.record()
-    torch.cuda.synchronize()
-    return start.elapsed_time(end) * 1000.0 / iterations
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
-    parser.add_argument(
-        "--instances", type=Path, default=Path("results/jsonschemabench-instances.json")
-    )
-    parser.add_argument("--schema-index", type=int, default=0)
-    parser.add_argument("--batches", type=int, nargs="+", default=[1, 32, 128, 512])
-    parser.add_argument(
-        "--states",
-        choices=["visited", "start"],
-        default="visited",
-        help="which lexer states the sequences sit in. 'visited' replays the "
-        "corpus document and samples the states it actually reaches; 'start' "
-        "puts everything in the start state, which is the worst one - it has "
-        "1,673 groups against a median of 11.",
-    )
-    parser.add_argument("--output", type=Path, default=None)
-    arguments = parser.parse_args()
-
-    import gpugrammar
-    from transformers import AutoTokenizer
-
-    tokenizer = AutoTokenizer.from_pretrained(arguments.model)
-    vocabulary: list[bytes] = []
-    for token_id in range(len(tokenizer)):
-        piece = tokenizer.convert_ids_to_tokens(token_id)
-        try:
-            vocabulary.append(tokenizer.convert_tokens_to_string([piece]).encode())
-        except Exception:  # noqa: BLE001
-            vocabulary.append(b"")
-
-    instances = json.loads(arguments.instances.read_text())["instances"]
-    schema = instances[arguments.schema_index]["schema"]
-    compiled = gpugrammar.Compiler(vocabulary).compile_json_schema(schema)
-    grammar = DeviceGrammar(compiled)
-
-    print(
-        f"schema {arguments.schema_index}: {compiled.num_lexer_states} lexer states, "
-        f"{compiled.num_groups} groups, {compiled.num_parser_states} parser states"
-    )
-    print(f"  resident on device: {grammar.resident_bytes() / 1024:.1f} KiB")
-
-    # Agreement with the CPU matcher, which is the reference implementation.
-    # Checked at every step of a real document rather than only at the start,
-    # since the start state exercises none of the reduce path.
-    matcher = compiled.matcher(0)
-    probe = grammar.new_batch(1)
-    reference = torch.zeros(grammar.mask_words, dtype=torch.int32)
-    checked = 0
-    for token in tokenizer.encode(
-        instances[arguments.schema_index]["text"], add_special_tokens=False
-    ):
-        reference.zero_()
-        matcher.fill_bitmask(reference)
-        configurations = matcher.configurations()
-        probe.set_configurations(0, configurations)
-        device = probe.fill_mask()[0].cpu()
-        if not torch.equal(device, reference):
-            differing = int((device != reference).sum())
-            raise SystemExit(
-                f"device and CPU masks differ in {differing} words at step {checked}"
-            )
-        checked += 1
-        if not matcher.accept_token(token):
-            break
-    print(f"  agrees with the CPU matcher at every one of {checked} steps")
-
-    # Which states does a real document reach? Everything in the start state is
-    # a worst case, not a workload.
-    visited = [0]
-    if arguments.states == "visited":
-        matcher = compiled.matcher(0)
-        for token in tokenizer.encode(
-            instances[arguments.schema_index]["text"], add_special_tokens=False
-        ):
-            visited.append(matcher.lexer_state)
-            if not matcher.accept_token(token):
-                break
-        groups_here = [
-            int(grammar.group_offsets[state + 1] - grammar.group_offsets[state])
-            for state in visited
-        ]
-        print(
-            f"  a real document visits {len(set(visited))} states, "
-            f"median {int(np.median(groups_here))} groups each"
-        )
-
-    results = []
-    generator = np.random.default_rng(0)
-    for size in arguments.batches:
-        batch = grammar.new_batch(size)
-        # One configuration each, in a state the document actually reached.
-        chosen = generator.choice(np.array(visited, dtype=np.int32), size=size)
-        batch.lexer_state.view(size, batch.configs)[:, 0] = torch.from_numpy(
-            chosen
-        ).cuda()
-        microseconds = _time(batch.fill_mask)
-        print(f"  batch {size:>4}: {microseconds:8.1f} us")
-        results.append({"batch_size": size, "device_fill_us": microseconds})
-
-    if arguments.output:
-        arguments.output.write_text(
-            json.dumps(
-                {
-                    "schema_index": arguments.schema_index,
-                    "lexer_states": compiled.num_lexer_states,
-                    "groups": compiled.num_groups,
-                    "resident_bytes": grammar.resident_bytes(),
-                    "measurements": results,
-                },
-                indent=2,
-            )
-        )
-        print(f"wrote {arguments.output}")
-
-
-if __name__ == "__main__":
-    main()
