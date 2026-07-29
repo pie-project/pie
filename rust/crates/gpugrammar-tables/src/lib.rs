@@ -23,6 +23,7 @@ pub mod pipeline;
 use std::collections::BTreeMap;
 
 use anyhow::{Result, bail};
+use rayon::prelude::*;
 use gpugrammar_lex::lexicon::Lexicon;
 use gpugrammar_lex::{Lexer, VocabularyGroups};
 use gpugrammar_lr::cfg::Cfg;
@@ -225,7 +226,7 @@ pub fn store_set(
     vocab_size: usize,
     bitset_words: usize,
     payload: &mut Vec<u32>,
-    interned: &mut FxHashMap<(SetKind, Vec<u32>), TokenSet>,
+    interned: &mut FxHashMap<(SetKind, u64), TokenSet>,
 ) -> TokenSet {
     let sparse = tokens.len();
     let complement = vocab_size - sparse;
@@ -234,13 +235,19 @@ pub fn store_set(
         ordered.sort_unstable();
         (SetKind::Sparse, ordered)
     } else if complement * 2 <= bitset_words {
-        let mut present = vec![false; vocab_size];
-        for token in tokens {
-            present[*token as usize] = true;
+        // The tokens of a group are sorted, so the ones missing are the gaps
+        // between them. Marking a vocabulary-sized array and then scanning it
+        // was two passes over 151,669 entries for a group that is usually
+        // nearly all of them - and the array was allocated per group.
+        let mut ordered = tokens.to_vec();
+        ordered.sort_unstable();
+        let mut missing = Vec::with_capacity(complement);
+        let mut expected = 0u32;
+        for token in &ordered {
+            missing.extend(expected..*token);
+            expected = token + 1;
         }
-        let missing = (0..vocab_size as u32)
-            .filter(|token| !present[*token as usize])
-            .collect();
+        missing.extend(expected..vocab_size as u32);
         (SetKind::Complement, missing)
     } else {
         let mut bits = vec![0u32; bitset_words];
@@ -250,17 +257,32 @@ pub fn store_set(
         (SetKind::Dense, bits)
     };
 
-    let key = (kind, body);
-    if let Some(&existing) = interned.get(&key) {
-        return existing;
+    // Keyed by a digest of the body rather than by the body. A dense set is
+    // 4,740 words and a complement can be nearly the vocabulary, so keeping a
+    // copy of every distinct one in the map doubled what the artifact cost to
+    // build. Collisions are settled by comparing against what was stored, so
+    // the digest narrows and the payload decides - the same shape as
+    // everything else here.
+    let mut digest = 0xcbf29ce484222325u64;
+    digest ^= kind as u64;
+    digest = digest.wrapping_mul(0x100000001b3);
+    for word in &body {
+        digest ^= *word as u64;
+        digest = digest.wrapping_mul(0x100000001b3);
+    }
+    if let Some(found) = interned.get(&(kind, digest))
+        && found.length as usize == body.len()
+        && payload[found.offset as usize..][..body.len()] == body[..]
+    {
+        return *found;
     }
     let set = TokenSet {
         kind,
         offset: payload.len() as u32,
-        length: key.1.len() as u32,
+        length: body.len() as u32,
     };
-    payload.extend_from_slice(&key.1);
-    interned.insert(key, set);
+    payload.extend_from_slice(&body);
+    interned.insert((kind, digest), set);
     set
 }
 
@@ -312,7 +334,7 @@ pub fn emit(
     // the same set is reached from many places. Measured on JSONSchemaBench the
     // duplication is 2x to 27x, and since a bitset is the whole vocabulary -
     // 19 KiB at 151,669 tokens - this is where the artifact's size lives.
-    let mut interned: FxHashMap<(SetKind, Vec<u32>), TokenSet> = FxHashMap::default();
+    let mut interned: FxHashMap<(SetKind, u64), TokenSet> = FxHashMap::default();
     for (state, state_groups) in groups.per_state.iter().enumerate() {
         for group in state_groups {
             let set = store_set(
@@ -470,25 +492,40 @@ fn precompute_verdicts(
     };
 
     let mut offsets = Vec::with_capacity(lexer_states + 1);
-    let mut verdicts = vec![0u32; words];
     let mut at = 0usize;
     for lexer_state in 0..lexer_states {
         offsets.push(at as u32);
+        at += stride[lexer_state] as usize * parser_states;
+    }
+    offsets.push(at as u32);
+
+    // One lexer state per task. This was the single largest thing a compile
+    // did - 83% of the emit and 56% of the whole - and it was serial, which
+    // was invisible because nothing timed the emit at all. Every state writes
+    // a run of its own, so the output splits exactly where the tasks do.
+    let mut verdicts = vec![0u32; words];
+    let mut rest = verdicts.as_mut_slice();
+    let mut rows: Vec<(usize, &mut [u32])> = Vec::with_capacity(lexer_states);
+    for lexer_state in 0..lexer_states {
+        let span = stride[lexer_state] as usize * parser_states;
+        let (mine, tail) = rest.split_at_mut(span);
+        rest = tail;
+        rows.push((lexer_state, mine));
+    }
+    rows.into_par_iter().for_each(|(lexer_state, row_out)| {
         let first = group_offsets[lexer_state] as usize;
         let last = group_offsets[lexer_state + 1] as usize;
         let row = stride[lexer_state] as usize;
         for parser_state in 0..parser_states {
-            let base = at + parser_state * row;
+            let base = parser_state * row;
             for (slot, group) in entries[first..last].iter().enumerate() {
                 let verdict = settle(group, parser_state, &action);
                 if verdict != VERDICT_UNDECIDED {
-                    verdicts[base + slot / 16] |= verdict << (2 * (slot % 16));
+                    row_out[base + slot / 16] |= verdict << (2 * (slot % 16));
                 }
             }
         }
-        at += row * parser_states;
-    }
-    offsets.push(at as u32);
+    });
     (offsets, verdicts, stride)
 }
 

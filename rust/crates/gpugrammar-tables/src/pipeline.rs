@@ -280,7 +280,10 @@ fn compile_at(
     lap("tables");
     let groups = group_vocabulary(&lexer, vocabulary);
     lap("groups");
-    emit(&lexicon, &lexer, &groups, &cfg, &tables, vocabulary.len()).map_err(|_| Failure::Emit)
+    let artifact =
+        emit(&lexicon, &lexer, &groups, &cfg, &tables, vocabulary.len()).map_err(|_| Failure::Emit);
+    lap("emit");
+    artifact
 }
 
 /// The same search, reporting the failure as an error rather than a code.

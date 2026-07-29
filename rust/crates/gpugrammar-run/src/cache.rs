@@ -30,7 +30,7 @@ pub struct Cache {
     filled: FxHashMap<u32, (u32, u32)>,
     /// Sets already stored, so two states admitting the same tokens share one
     /// copy. Duplication is 2x to 27x across real schemas.
-    interned: FxHashMap<(SetKind, Vec<u32>), TokenSet>,
+    interned: FxHashMap<(SetKind, u64), TokenSet>,
     misses: usize,
     hits: usize,
 }
