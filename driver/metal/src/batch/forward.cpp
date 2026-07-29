@@ -634,6 +634,12 @@ struct MetalExecutor::Impl {
     std::uint32_t argmax() const;
     bool ensure_ptir_logits_rows(std::uint32_t rows, std::string* error);
     std::uint32_t reserve_ptir_logits_rows(std::uint32_t rows);
+    // Rows the forward should copy into the PTIR staging buffer as part of its
+    // OWN command buffer. Staging used to be a second `run_step` -- a whole
+    // command-buffer submit and completion wait per token, for a copy that is
+    // ~1 us of bandwidth. Set before `run_batch_step`, consumed by its encoder.
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> pending_logits_stage_{};
+    bool encode_logits_stage(StepEncoder& encoder, std::string* error);
     bool stage_ptir_logits_rows(
         const std::vector<std::pair<std::uint32_t, std::uint32_t>>& rows,
         std::string* error);
@@ -1718,6 +1724,8 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
     // Alternate the two arms fire by fire so both see the same machine.
     static bool ab_flip = false;
     if (ab_enabled()) ab_set_arm(ab_flip = !ab_flip);
+    std::string stage_err;
+    bool stage_failed = false;
     const std::vector<Dispatch> fire_dag =
         build_decode_dag_mb(g_, schedule.N, kMultiBatchOrdinalBase, fuse_residual_, gdn_prep_);
     const StepTiming timing = ctx_->run_step([&](StepEncoder& se) {
@@ -1730,9 +1738,11 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
             for (const auto& callbacks : *ptir)
                 if (callbacks.post_forward) callbacks.post_forward(se);
         }
+        if (!encode_logits_stage(se, &stage_err)) stage_failed = true;
     });
     if (!timing.succeeded())
         return fail("Metal command timed out before its completion fence");
+    if (stage_failed) return fail(stage_err);
     // Step meter.  This machine is permanently contended (the agent process
     // alone runs at ~250% CPU), so wall-clock A/B swings 3x and cannot decide
     // anything; the command buffer's own execution time can.  Bucketed by lane
@@ -1950,6 +1960,38 @@ std::uint32_t MetalExecutor::Impl::reserve_ptir_logits_rows(
     const std::uint32_t base = ptir_logits_next_row_;
     ptir_logits_next_row_ += rows;
     return base;
+}
+
+bool MetalExecutor::Impl::encode_logits_stage(StepEncoder& encoder, std::string* error) {
+    const auto& rows = pending_logits_stage_;
+    if (rows.empty()) return true;
+    if (!ptir_logits_copy_pso_.valid() || rows.size() > kPtirLogitsCopyMaxRows) {
+        if (error != nullptr) *error = "PTIR logits staging is not ready";
+        return false;
+    }
+    auto* params =
+        static_cast<PtirLogitsCopyParams*>(ptir_logits_copy_params_.contents());
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+        if (rows[i].second >= ptir_logits_capacity_rows_) {
+            if (error != nullptr) *error = "PTIR logits staging is not ready";
+            return false;
+        }
+        params[i] = {
+            .source_row = rows[i].first,
+            .destination_row = rows[i].second,
+            .vocab = static_cast<std::uint32_t>(g_.vocab),
+            .reserved = 0,
+        };
+    }
+    // The copy reads the logits the forward just wrote.
+    encoder.barrier();
+    encoder.set_pso(ptir_logits_copy_pso_);
+    encoder.set_argtable_ordinal(kPtirLogitsCopyOrdinal);
+    encoder.dispatch(
+        Grid{static_cast<std::uint32_t>(g_.vocab),
+             static_cast<std::uint32_t>(rows.size()), 1},
+        Threadgroup{256, 1, 1});
+    return true;
 }
 
 bool MetalExecutor::Impl::stage_ptir_logits_rows(
@@ -2791,16 +2833,13 @@ bool MetalExecutor::run_paged_batch_forward(const std::vector<MemberForwardDesc>
             *ptir);
         dispatch_callbacks = &compacted_callbacks;
     }
-    if (!impl_->run_batch_step(
-            schedule, in, &batch_err, dispatch_callbacks)) {
-        for (const std::size_t member : accepted_members) {
-            errors[member] = batch_err;
-        }
-        return false;
-    }
-    // Every member's rows go in ONE staging dispatch. One command buffer per
-    // row meant a sixteen-request fire paid sixteen round trips per token.
-    std::vector<std::pair<std::uint32_t, std::uint32_t>> staged_rows;
+    // Every member's rows go in ONE staging dispatch, and that dispatch rides
+    // the forward's OWN command buffer. It used to be a second `run_step`:
+    // another submit and another completion wait, per token, for a copy worth
+    // about a microsecond of bandwidth. Nothing here depends on the forward's
+    // result -- the destination rows are just a bump allocation -- so it can all
+    // be decided first and encoded at the tail of the same buffer.
+    impl_->pending_logits_stage_.clear();
     for (const std::size_t i : accepted_members) {
         LogitsOut& out = outs[i];
         out.vocab = vocab_;
@@ -2811,15 +2850,19 @@ bool MetalExecutor::run_paged_batch_forward(const std::vector<MemberForwardDesc>
         impl_->attach_ptir_logits_view(out);
         if (ptir != nullptr && (*ptir)[i].consumes_logits_directly) continue;
         for (uint32_t row = 0; row < out.rows; ++row)
-            staged_rows.emplace_back(rows[row], out.device_row_offset + row);
+            impl_->pending_logits_stage_.emplace_back(
+                rows[row], out.device_row_offset + row);
     }
-    std::string staging_error;
-    const bool staged = impl_->stage_ptir_logits_rows(staged_rows, &staging_error);
-    for (const std::size_t i : accepted_members) {
-        if (!staged) {
-            errors[i] = staging_error;
-            continue;
+    const bool ran = impl_->run_batch_step(
+        schedule, in, &batch_err, dispatch_callbacks);
+    impl_->pending_logits_stage_.clear();
+    if (!ran) {
+        for (const std::size_t member : accepted_members) {
+            errors[member] = batch_err;
         }
+        return false;
+    }
+    for (const std::size_t i : accepted_members) {
         if (!errors[i].empty()) continue;
         success[i] = 1;
     }
