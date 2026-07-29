@@ -966,8 +966,6 @@ class CorpusAgreement(unittest.TestCase):
         self.assertGreater(checked, 0)
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class FusedStep(unittest.TestCase):
@@ -1071,3 +1069,7 @@ class SizedForTheMachine(unittest.TestCase):
         batch = DeviceBatch(pool, 4)
         self.assertLessEqual(batch.memo_configs, batch.configs)
         self.assertLessEqual(batch.memo_stride, pool.max_stack)
+
+
+if __name__ == "__main__":
+    unittest.main()

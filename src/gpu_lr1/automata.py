@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-from typing import Iterable
+from collections.abc import Iterable
 
 import numpy as np
 
@@ -58,7 +58,7 @@ class NFABuilder:
         parts = list(fragments)
         if not parts:
             return self.empty()
-        for left, right in zip(parts, parts[1:]):
+        for left, right in zip(parts, parts[1:], strict=False):
             self.add_epsilon(left.end, right.start)
         return Fragment(parts[0].start, parts[-1].end)
 

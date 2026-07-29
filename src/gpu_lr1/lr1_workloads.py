@@ -191,7 +191,7 @@ def sequence_grammar(length: int) -> Grammar:
 def benchmark_lr1_workloads() -> list[NamedLR1Workload]:
     arithmetic = arithmetic_grammar()
     json_grammar = json_structure_grammar()
-    balanced = balanced_grammar()
+
     workloads = [
         NamedLR1Workload(
             "arithmetic-reduce",

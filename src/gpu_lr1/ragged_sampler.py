@@ -366,7 +366,7 @@ class RaggedSamplerTables:
         self.narrow_max_nnz = int(narrow.max()) if narrow.size else 0
         self.has_wide_rows = bool((widths > MAX_SINGLE_TILE).any())
 
-    def build_wide_bitsets(self, vocab_size: int) -> "RaggedSamplerTables":
+    def build_wide_bitsets(self, vocab_size: int) -> RaggedSamplerTables:
         """Attach a complement bitset for every row wider than one tile."""
         if not self.has_wide_rows:
             return self
@@ -429,7 +429,7 @@ class RaggedSamplerTables:
         self._wide_rows = wide_rows
         return self
 
-    def drop_wide_token_lists(self) -> "RaggedSamplerTables":
+    def drop_wide_token_lists(self) -> RaggedSamplerTables:
         """Free the CSR token list of every wide row.
 
         After `build_wide_bitsets` the wide rows are described by a bitset plus

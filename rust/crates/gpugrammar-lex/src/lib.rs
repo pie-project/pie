@@ -306,16 +306,6 @@ impl Lexer {
         let next = self.transitions[state.0 as usize * 256 + byte as usize];
         (next != NO_STATE).then_some(LexState(next))
     }
-
-    /// True when no byte can extend this state, so a lexeme ending here is
-    /// final and cannot be continued by the next token.
-    fn is_dead_end(&self, state: LexState) -> bool {
-        let row = state.0 as usize * 256;
-        self.transitions[row..row + 256]
-            .iter()
-            .all(|&next| next == NO_STATE)
-    }
-
     /// Every way this token can be read, longest match first.
     ///
     /// `None` means the token is lexically impossible here, which is what

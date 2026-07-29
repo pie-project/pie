@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -110,7 +110,7 @@ class Grammar:
         *,
         terminals: Iterable[str] | None = None,
         eof: str = "$",
-    ) -> "Grammar":
+    ) -> Grammar:
         productions: list[Production] = []
         nonterminals = tuple(rules)
         nonterminal_set = set(nonterminals)
@@ -556,7 +556,7 @@ class PackedLR1Tables:
     def torch_tensors(
         self,
         device: torch.device | str = "cuda",
-    ) -> "TorchPackedLR1Tables":
+    ) -> TorchPackedLR1Tables:
         target = torch.device(device)
         return TorchPackedLR1Tables(
             state_offsets=torch.from_numpy(self.state_offsets).to(target),
@@ -729,7 +729,7 @@ class RaggedLR1Stacks:
         cls,
         start_states: Sequence[int] | np.ndarray,
         capacities: int | Sequence[int] | np.ndarray,
-    ) -> "RaggedLR1Stacks":
+    ) -> RaggedLR1Stacks:
         starts = np.asarray(start_states, dtype=np.int32)
         if starts.ndim != 1:
             raise ValueError("start states must be one-dimensional")
@@ -772,7 +772,7 @@ class RaggedLR1Stacks:
     def top_states(self) -> np.ndarray:
         return self.values[self.offsets[:-1] + self.pointers - 1]
 
-    def clone(self) -> "RaggedLR1Stacks":
+    def clone(self) -> RaggedLR1Stacks:
         return RaggedLR1Stacks(
             values=self.values.copy(),
             offsets=self.offsets.copy(),
@@ -782,7 +782,7 @@ class RaggedLR1Stacks:
     def torch_tensors(
         self,
         device: torch.device | str = "cuda",
-    ) -> "TorchRaggedLR1Stacks":
+    ) -> TorchRaggedLR1Stacks:
         target = torch.device(device)
         return TorchRaggedLR1Stacks(
             values=torch.from_numpy(self.values).to(target),
@@ -797,7 +797,7 @@ class TorchRaggedLR1Stacks:
     offsets: torch.Tensor
     pointers: torch.Tensor
 
-    def clone(self) -> "TorchRaggedLR1Stacks":
+    def clone(self) -> TorchRaggedLR1Stacks:
         return TorchRaggedLR1Stacks(
             values=self.values.clone(),
             offsets=self.offsets.clone(),

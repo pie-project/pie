@@ -1109,42 +1109,6 @@ fn narrow_repeat(parts: &[Expr], min: u64, max: Option<u64>) -> Option<Expr> {
     Some(Expr::Sequence(rebuilt))
 }
 
-fn length_range(expr: &Expr) -> (u64, Option<u64>) {
-    match expr {
-        Expr::Empty => (0, Some(0)),
-        Expr::Literal(bytes) => (bytes.len() as u64, Some(bytes.len() as u64)),
-        // A character class is one codepoint, and UTF-8 spends up to four bytes
-        // on one. Both ends are needed, since the bound is over characters.
-        Expr::CharacterClass { .. } => (1, Some(4)),
-        // A rule reference could be anything without resolving it, and guessing
-        // would defeat the point of deciding rather than approximating.
-        Expr::RuleRef(_) => (0, None),
-        Expr::Group(inner) => length_range(inner),
-        Expr::Sequence(parts) => parts.iter().fold((0, Some(0)), |(low, high), part| {
-            let (part_low, part_high) = length_range(part);
-            (
-                low.saturating_add(part_low),
-                high.zip(part_high).map(|(a, b)| a.saturating_add(b)),
-            )
-        }),
-        Expr::Choice(alternatives) => {
-            alternatives
-                .iter()
-                .fold((u64::MAX, Some(0)), |(low, high), alternative| {
-                    let (alt_low, alt_high) = length_range(alternative);
-                    (low.min(alt_low), high.zip(alt_high).map(|(a, b)| a.max(b)))
-                })
-        }
-        Expr::Repeat { expr, min, max } => {
-            let (inner_low, inner_high) = length_range(expr);
-            (
-                inner_low.saturating_mul(u64::from(*min)),
-                max.and_then(|max| inner_high.map(|high| high.saturating_mul(u64::from(max)))),
-            )
-        }
-    }
-}
-
 /// Fold branches that all describe objects into a single object.
 ///
 /// The union of their properties, required only where every branch requires it,

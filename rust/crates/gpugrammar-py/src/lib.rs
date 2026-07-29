@@ -17,27 +17,55 @@ use std::sync::Arc;
 
 use gpugrammar_ir::grammar::Grammar;
 use gpugrammar_ir::regex::regex_to_grammar;
-use gpugrammar_tables::pipeline::{Limits, compile_json_schema as compile_schema};
-use gpugrammar_lex::lexicon::{extract, terminal_automata};
-use gpugrammar_lex::regular::analyze;
-use gpugrammar_lex::{build_lexer, group_vocabulary};
-use gpugrammar_lr::cfg::flatten;
-use gpugrammar_lr::tables::build;
+use gpugrammar_tables::pipeline::{
+    Failure, Limits, compile_grammar_within, compile_json_schema as compile_schema,
+};
 use gpugrammar_run::Matcher as RunMatcher;
-use gpugrammar_tables::{Artifact, emit};
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use gpugrammar_tables::Artifact;
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use rustc_hash::FxHashMap;
+use pyo3::create_exception;
 use pyo3::types::{PyBytes, PyDict};
 
-fn compile(vocabulary: &[Vec<u8>], grammar: Grammar) -> PyResult<Artifact> {
-    let lexicon = extract(&grammar, &analyze(&grammar));
-    let lexer = build_lexer(terminal_automata(&grammar, &lexicon));
-    let groups = group_vocabulary(&lexer, vocabulary);
-    let cfg = flatten(&lexicon);
-    let tables = build(&cfg).map_err(|error| PyValueError::new_err(error.to_string()))?;
-    emit(&lexicon, &lexer, &groups, &cfg, &tables, vocabulary.len())
-        .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+create_exception!(
+    _gpugrammar,
+    CompileError,
+    PyValueError,
+    "A grammar the compiler refused, carrying the stage that refused it."
+);
+
+/// The stage as a value rather than as prose. A serving engine has to decide
+/// whether to fall back to another backend or to reject the request, and
+/// those are different answers for different stages: a budget may be raised,
+/// a lowering failure will not be.
+fn refusal(failure: Failure) -> PyErr {
+    let stage = match failure {
+        Failure::Lowering => "lowering",
+        Failure::Lexer => "lexer",
+        Failure::Productions => "productions",
+        Failure::Conflict => "conflict",
+        Failure::Emit => "emit",
+    };
+    Python::attach(|python| {
+        let error = CompileError::new_err(format!("{failure}"));
+        if let Ok(value) = error.value(python).setattr("stage", stage) {
+            let _ = value;
+        }
+        error
+    })
+}
+
+fn compile(
+    vocabulary: &[Vec<u8>],
+    grammar: Grammar,
+    lexer_states: Option<usize>,
+) -> PyResult<Artifact> {
+    let limits = Limits {
+        lexer_states: lexer_states.unwrap_or(Limits::default().lexer_states),
+        ..Default::default()
+    };
+    compile_grammar_within(&grammar, vocabulary, limits).map_err(refusal)
 }
 
 /// A vocabulary-bound compiler. Build one per model.
@@ -73,7 +101,7 @@ impl Compiler {
         // whatever else the process is doing.
         let compiled = python
             .detach(|| compile_schema(schema, &self.vocabulary, limits))
-            .map_err(|failure| PyValueError::new_err(failure.to_string()))?;
+            .map_err(refusal)?;
         Ok(CompiledGrammar {
             artifact: Arc::new(compiled.artifact),
             precision: format!("{:?}", compiled.precision),
@@ -81,21 +109,32 @@ impl Compiler {
         })
     }
 
-    fn compile_ebnf(&self, source: &str, root: &str) -> PyResult<CompiledGrammar> {
+    #[pyo3(signature = (source, root, lexer_states = None))]
+    fn compile_ebnf(
+        &self,
+        source: &str,
+        root: &str,
+        lexer_states: Option<usize>,
+    ) -> PyResult<CompiledGrammar> {
         let grammar = Grammar::from_ebnf(source, root)
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
         Ok(CompiledGrammar {
-            artifact: Arc::new(compile(&self.vocabulary, grammar)?),
+            artifact: Arc::new(compile(&self.vocabulary, grammar, lexer_states)?),
             precision: "n/a".to_string(),
             approximations: Vec::new(),
         })
     }
 
-    fn compile_regex(&self, pattern: &str) -> PyResult<CompiledGrammar> {
+    #[pyo3(signature = (pattern, lexer_states = None))]
+    fn compile_regex(
+        &self,
+        pattern: &str,
+        lexer_states: Option<usize>,
+    ) -> PyResult<CompiledGrammar> {
         let grammar =
             regex_to_grammar(pattern).map_err(|error| PyValueError::new_err(error.to_string()))?;
         Ok(CompiledGrammar {
-            artifact: Arc::new(compile(&self.vocabulary, grammar)?),
+            artifact: Arc::new(compile(&self.vocabulary, grammar, lexer_states)?),
             precision: "n/a".to_string(),
             approximations: Vec::new(),
         })
@@ -562,5 +601,6 @@ fn _gpugrammar(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<CompiledGrammar>()?;
     module.add_class::<Matcher>()?;
     module.add_function(wrap_pyfunction!(pack_configurations, module)?)?;
+    module.add("CompileError", module.py().get_type::<CompileError>())?;
     Ok(())
 }

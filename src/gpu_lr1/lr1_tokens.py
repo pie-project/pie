@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -83,7 +83,7 @@ class LR1TokenVocabulary:
         sequences: Sequence[Sequence[str | int] | None],
         *,
         name: str | None = None,
-    ) -> "LR1TokenVocabulary":
+    ) -> LR1TokenVocabulary:
         if len(sequences) != vocabulary.size:
             raise ValueError("one symbol sequence is required per token")
         terminal_ids = {
@@ -128,7 +128,7 @@ class LR1TokenVocabulary:
         byte_terminals: Mapping[int, str],
         *,
         name: str | None = None,
-    ) -> "LR1TokenVocabulary":
+    ) -> LR1TokenVocabulary:
         terminal_ids = {
             terminal: index
             for index, terminal in enumerate(compiled.terminal_names)
@@ -397,7 +397,7 @@ class PackedLR1TokenTables:
     def torch_tensors(
         self,
         device: torch.device | str = "cuda",
-    ) -> "TorchPackedLR1TokenTables":
+    ) -> TorchPackedLR1TokenTables:
         target = torch.device(device)
         return TorchPackedLR1TokenTables(
             state_offsets=torch.from_numpy(self.state_offsets).to(target),

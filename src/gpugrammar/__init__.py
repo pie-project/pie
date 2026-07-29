@@ -37,10 +37,17 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
 
-from _gpugrammar import CompiledGrammar, Compiler, Matcher, pack_configurations
+from _gpugrammar import (
+    CompiledGrammar,
+    CompileError,
+    Compiler,
+    Matcher,
+    pack_configurations,
+)
 
 __all__ = [
     "Batch",
+    "CompileError",
     "CompiledGrammar",
     "Compiler",
     "Engine",
@@ -93,17 +100,29 @@ class Engine:
         every object its own key terminal - compile p50 27 ms to 159 ms, and a
         captured step at batch 512 from 72 us to 155 us.
 
-        Raises `ValueError` naming the stage that refused it. Set
-        `GPUGRAMMAR_WHY=1` in the environment for the underlying diagnostic.
+        Raises `CompileError` - a `ValueError` - carrying `stage`, one of
+        `lowering`, `lexer`, `productions`, `conflict` or `emit`. The stage is
+        the answer to what a caller should do: a budget may be raised and
+        retried, a lowering failure will not be. Set `GPUGRAMMAR_WHY=1` in the
+        environment for the underlying diagnostic.
+
+        A ceiling reached at *decode* time is not an exception - nothing can
+        raise from inside a graph replay - and is reported by `Batch.problems`.
         """
         return self._admitted(self.compiler.compile_json_schema(schema, **kwargs))
 
-    def compile_regex(self, pattern: str) -> CompiledGrammar:
-        """Compile a regular expression. Not everything here is JSON."""
-        return self._admitted(self.compiler.compile_regex(pattern))
+    def compile_regex(self, pattern: str, **kwargs) -> CompiledGrammar:
+        """Compile a regular expression. Not everything here is JSON.
 
-    def compile_ebnf(self, source: str, root: str) -> CompiledGrammar:
-        return self._admitted(self.compiler.compile_ebnf(source, root))
+        Bounded by the same `lexer_states` budget as a schema, because a
+        pattern is the one grammar a request supplies directly and a DFA is
+        exponential in the worst case. Raise it with `lexer_states=` when a
+        legitimate pattern needs it.
+        """
+        return self._admitted(self.compiler.compile_regex(pattern, **kwargs))
+
+    def compile_ebnf(self, source: str, root: str, **kwargs) -> CompiledGrammar:
+        return self._admitted(self.compiler.compile_ebnf(source, root, **kwargs))
 
     def _admitted(self, grammar: CompiledGrammar) -> CompiledGrammar:
         # Admitted as soon as it is compiled, rather than when a batch first

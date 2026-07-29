@@ -123,7 +123,7 @@ def main() -> None:
         for threads in (1, 2, 4, 8, 16):
             batched = xgr.BatchGrammarMatcher(max_threads=threads)
 
-            def fill(batched=batched) -> None:
+            def fill(batched=batched, matchers=matchers, mask=mask) -> None:
                 batched.batch_fill_next_token_bitmask(matchers, mask)
 
             candidate = _time_wall(fill)

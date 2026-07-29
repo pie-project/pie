@@ -504,8 +504,12 @@ class CanonicalJSONSchemaCompiler:
         return [first]
 
     def _integer_grammar(self) -> Fragment:
-        digit = lambda: self.builder.charset(range(ord("0"), ord("9") + 1))
-        nonzero = lambda: self.builder.charset(range(ord("1"), ord("9") + 1))
+        def digit():
+            return self.builder.charset(range(ord("0"), ord("9") + 1))
+
+        def nonzero():
+            return self.builder.charset(range(ord("1"), ord("9") + 1))
+
         magnitude = self.builder.alternate(
             [
                 self.builder.literal(b"0"),
@@ -520,8 +524,12 @@ class CanonicalJSONSchemaCompiler:
         )
 
     def _number_grammar(self) -> Fragment:
-        digit = lambda: self.builder.charset(range(ord("0"), ord("9") + 1))
-        nonzero = lambda: self.builder.charset(range(ord("1"), ord("9") + 1))
+        def digit():
+            return self.builder.charset(range(ord("0"), ord("9") + 1))
+
+        def nonzero():
+            return self.builder.charset(range(ord("1"), ord("9") + 1))
+
         integer = self.builder.alternate(
             [
                 self.builder.literal(b"0"),

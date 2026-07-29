@@ -412,9 +412,6 @@ impl Matcher {
         self.terminated = true;
     }
 
-    fn action(&self, state: usize, terminal: u32) -> Option<i32> {
-        action(&self.artifact, state, terminal)
-    }
 }
 
 /// Run a terminal sequence against a copy of `stack`.
@@ -525,15 +522,6 @@ fn actions_for(artifact: &Artifact, state: usize, terminal: u32) -> Option<Vec<i
         values.extend_from_slice(&artifact.action_extra[low..high]);
     }
     Some(values)
-}
-
-fn action(artifact: &Artifact, state: usize, terminal: u32) -> Option<i32> {
-    let from = artifact.action_offsets[state] as usize;
-    let to = artifact.action_offsets[state + 1] as usize;
-    artifact.action_terminals[from..to]
-        .binary_search(&terminal)
-        .ok()
-        .map(|index| artifact.action_values[from + index])
 }
 
 fn goto(artifact: &Artifact, state: usize, nonterminal: u32) -> Option<u32> {

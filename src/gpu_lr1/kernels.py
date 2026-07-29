@@ -943,7 +943,7 @@ class CSRArgmaxAdvancePlan:
     def capture(
         self,
         logits: torch.Tensor,
-    ) -> "CSRArgmaxAdvanceGraph":
+    ) -> CSRArgmaxAdvanceGraph:
         inplace_states = (
             self.output_states.data_ptr() == self.rows.data_ptr()
         )

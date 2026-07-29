@@ -29,7 +29,6 @@ of the grammar is how much longer the pair takes than the forward pass alone.
 from __future__ import annotations
 
 import argparse
-import json
 import time
 from typing import Any
 
@@ -113,7 +112,7 @@ def measure(
             cache = out.past_key_values
 
         forward_graph = _graph_of(
-            lambda: network(ids, past_key_values=cache, use_cache=True)
+            lambda network=network: network(ids, past_key_values=cache, use_cache=True)
         )
 
         # The parser already captured its two halves, and a graph cannot be

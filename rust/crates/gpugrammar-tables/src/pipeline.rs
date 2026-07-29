@@ -16,6 +16,7 @@
 use std::fmt;
 
 use anyhow::{Result, anyhow};
+use gpugrammar_ir::grammar::Grammar;
 use gpugrammar_ir::json_schema::{self, JsonSchemaOptions, Precision, json_schema_to_grammar};
 use gpugrammar_lex::lexicon::{DEFAULT_TERMINAL_BUDGET, extract_within, terminal_automata_within};
 use gpugrammar_lex::regular::analyze;
@@ -296,6 +297,28 @@ fn compile_at(
     drop(lexer);
     lap("drop");
     artifact
+}
+
+/// Compile a grammar that is already lowered, under the same budgets the
+/// schema search uses.
+///
+/// A regular expression or an EBNF source arrives lowered, so it skips the
+/// search - but it must not skip the budgets. It had been building its lexer
+/// and flattening its grammar unbounded, which for a pattern supplied by a
+/// request is a way to spend the server's memory rather than to be refused.
+pub fn compile_grammar_within(
+    grammar: &Grammar,
+    vocabulary: &[Vec<u8>],
+    limits: Limits,
+) -> std::result::Result<Artifact, Failure> {
+    let lexicon = extract_within(grammar, &analyze(grammar), limits.terminals);
+    let automata = terminal_automata_within(grammar, &lexicon, limits.lexer_states as u64)
+        .ok_or(Failure::Lexer)?;
+    let lexer = build_lexer_within(automata, limits.lexer_states).ok_or(Failure::Lexer)?;
+    let cfg = flatten_within(&lexicon, limits.productions).ok_or(Failure::Productions)?;
+    let tables = build(&cfg).map_err(|_| Failure::Conflict)?;
+    let groups = group_vocabulary(&lexer, vocabulary);
+    emit(&lexicon, &lexer, &groups, &cfg, &tables, vocabulary.len()).map_err(|_| Failure::Emit)
 }
 
 /// The same search, reporting the failure as an error rather than a code.

@@ -1,6 +1,5 @@
 pub mod builder;
 mod ebnf;
-pub(crate) mod normalize;
 
 use std::fmt;
 

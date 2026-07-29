@@ -44,7 +44,7 @@ class Vocabulary:
         schemas: Iterable[Mapping[str, Any]] = (),
         seed: int = 0,
         max_token_bytes: int = 12,
-    ) -> "Vocabulary":
+    ) -> Vocabulary:
         if size < 257:
             raise ValueError("synthetic vocabulary needs EOS plus 256 byte tokens")
 
@@ -114,7 +114,7 @@ class Vocabulary:
         cls,
         encoding_name: str = "gpt2",
         size: int | None = None,
-    ) -> "Vocabulary":
+    ) -> Vocabulary:
         try:
             import tiktoken
         except ImportError as exc:
@@ -149,7 +149,7 @@ class Vocabulary:
         *,
         size: int | None = None,
         trust_remote_code: bool = False,
-    ) -> "Vocabulary":
+    ) -> Vocabulary:
         try:
             from transformers import AutoTokenizer
         except ImportError as exc:
@@ -259,4 +259,4 @@ def _bytes_to_unicode() -> dict[int, str]:
             byte_values.append(byte)
             unicode_values.append(256 + extra)
             extra += 1
-    return dict(zip(byte_values, map(chr, unicode_values)))
+    return dict(zip(byte_values, map(chr, unicode_values), strict=True))

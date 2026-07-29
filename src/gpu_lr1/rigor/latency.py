@@ -40,10 +40,8 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
-import json
 import random
 from dataclasses import asdict
-from pathlib import Path
 from typing import Any
 
 from .harness import (
@@ -196,7 +194,7 @@ def measure_xgrammar(
     # restores the state so the measurement repeats; a sequence that refuses
     # the token has nothing to roll back, so it is charged the refusal only.
     def advance() -> None:
-        for matcher, token in zip(matchers, tokens):
+        for matcher, token in zip(matchers, tokens, strict=True):
             if matcher.accept_token(token):
                 matcher.rollback(1)
 
@@ -280,7 +278,7 @@ def measure_step(
     def our_reset() -> None:
         seed()
 
-    their_matchers = seed_theirs = None
+    their_matchers = None
 
     def their_reset() -> None:
         nonlocal their_matchers

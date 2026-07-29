@@ -161,7 +161,7 @@ def main() -> None:
                     [attention, torch.ones_like(tokens)], dim=1
                 )
 
-        for task, tokens in zip(group, emitted):
+        for task, tokens in zip(group, emitted, strict=True):
             results.append(
                 {
                     "config": task["config"],

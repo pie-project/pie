@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any
+from collections.abc import Iterable
 
 import numpy as np
 import torch
@@ -76,7 +77,7 @@ class PackedTables:
             values["dense_next_state"] = int(self.next_state.nbytes)
         return values
 
-    def torch_tensors(self, device: torch.device | str = "cuda") -> "TorchTables":
+    def torch_tensors(self, device: torch.device | str = "cuda") -> TorchTables:
         token_bytes, token_lengths = self.vocabulary.padded_bytes()
         target = torch.device(device)
         return TorchTables(

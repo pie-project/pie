@@ -131,14 +131,29 @@ class PublicApi(unittest.TestCase):
         self.assertEqual(first, self.engine.admit(grammar))
 
     def test_a_refused_schema_says_why(self):
-        with self.assertRaises(ValueError):
+        with self.assertRaises(ValueError) as refusal:
             self.engine.compile_json_schema(json.dumps({"type": "object",
                                                         "patternProperties": {
                                                             "^a{0,70000}$": {}}}))
+        # The stage is the answer to what a caller should do next: a budget can
+        # be raised and retried, a lowering failure cannot.
+        self.assertIsInstance(refusal.exception, gpugrammar.CompileError)
+        self.assertIn(refusal.exception.stage,
+                      {"lowering", "lexer", "productions", "conflict", "emit"})
+
+    def test_a_pattern_whose_automaton_explodes_is_refused_not_run(self):
+        # A regex is the one grammar a request hands over directly, and its
+        # DFA is exponential in the worst case. This path used to build it
+        # unbounded, which spends the server's memory instead of refusing.
+        with self.assertRaises(gpugrammar.CompileError) as refusal:
+            self.engine.compile_regex("(a|b)*a" + "(a|b)" * 24)
+        self.assertEqual(refusal.exception.stage, "lexer")
+
+    def test_the_budget_can_be_raised_deliberately(self):
+        self.assertIsNotNone(
+            self.engine.compile_regex("(a|b)*a" + "(a|b)" * 8, lexer_states=100_000))
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class Approximations(unittest.TestCase):
@@ -224,3 +239,7 @@ class FusedStepThroughTheLibrary(unittest.TestCase):
             together.step(token)
             steps += 1
         self.assertEqual(steps, 8)
+
+
+if __name__ == "__main__":
+    unittest.main()

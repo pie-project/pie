@@ -23,7 +23,8 @@ import statistics
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any
+from collections.abc import Callable, Iterable, Sequence
 
 RESULTS = Path("results")
 CORPUS = RESULTS / "jsonschemabench-instances.json"
@@ -51,7 +52,7 @@ class Distribution:
     mean: float
 
     @classmethod
-    def of(cls, samples: Sequence[float]) -> "Distribution":
+    def of(cls, samples: Sequence[float]) -> Distribution:
         ordered = sorted(samples)
         if not ordered:
             return cls(0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)

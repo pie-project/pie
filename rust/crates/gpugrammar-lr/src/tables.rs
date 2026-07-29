@@ -369,16 +369,6 @@ fn set_action(
         }
     }
 }
-
-fn describe(action: i32) -> String {
-    match action {
-        ERROR => "error".to_string(),
-        ACCEPT => "accept".to_string(),
-        value if value > 0 => format!("shift {}", decode_shift(value)),
-        value => format!("reduce {}", decode_reduce(value)),
-    }
-}
-
 /// Prepend `S' -> S`, so accepting is a single distinguished item.
 fn augment(cfg: &Cfg) -> Vec<Production> {
     let mut productions = Vec::with_capacity(cfg.productions.len() + 1);

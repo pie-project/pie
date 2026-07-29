@@ -26,16 +26,14 @@ tokenizers = ["tiktoken>=0.9", "transformers>=4.45"]
 baselines = ["xgrammar>=0.1.29"]
 
 [project.scripts]
-gpu-lr1-bench = "gpu_lr1.benchmark:main"
-gpu-lr1-csr-opt-bench = "gpu_lr1.csr_optimization_benchmark:main"
-gpu-lr1-density-bench = "gpu_lr1.density_benchmark:main"
-gpu-lr1-fair-xgrammar-bench = "gpu_lr1.fair_xgrammar_benchmark:main"
-gpu-lr1-lr-bench = "gpu_lr1.lr1_benchmark:main"
-gpu-lr1-lr-token-bench = "gpu_lr1.lr1_token_benchmark:main"
-gpu-lr1-ragged-sample-bench = "gpu_lr1.ragged_sampler_benchmark:main"
-gpu-lr1-collect-real-rows = "gpu_lr1.collect_real_rows:main"
-gpu-lr1-stack-bench = "gpu_lr1.stack_benchmark:main"
-gpu-lr1-xgrammar-bench = "gpu_lr1.xgrammar_benchmark:main"
+# The measurement suite, which is what produces the numbers in the paper. The
+# prototype-era benchmarks it superseded are gone; `gpu_lr1` is the research
+# package and `gpugrammar` is the library.
+gpugrammar-latency = "gpu_lr1.rigor.latency:main"
+gpugrammar-soundness = "gpu_lr1.rigor.soundness:main"
+gpugrammar-overlap = "gpu_lr1.rigor.overlap:main"
+gpugrammar-serving = "gpu_lr1.rigor.serving:main"
+gpugrammar-crossover = "gpu_lr1.crossover:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
