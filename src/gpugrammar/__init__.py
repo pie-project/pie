@@ -36,6 +36,7 @@ Three layers, and you can reach any of them:
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
+import threading as _threading
 from importlib import metadata as _metadata
 
 from gpugrammar._gpugrammar import (
@@ -92,7 +93,11 @@ class Engine:
         self._pool = DeviceGrammar(
             max_configs=max_configurations, budget_bytes=table_budget_bytes
         )
-        self._ids: dict[int, int] = {}
+        self._ids: dict[int, tuple[int, int]] = {}
+        # Keyed on `id`, so the grammar has to stay alive for the key to mean
+        # anything; and a grammar the pool evicts is re-admitted from here.
+        self._held: dict[int, CompiledGrammar] = {}
+        self._lock = _threading.Lock()
 
     def compile_json_schema(self, schema: str, **kwargs) -> CompiledGrammar:
         """Compile a JSON Schema and put its tables on the device.
@@ -142,12 +147,31 @@ class Engine:
     def admit(self, grammar: CompiledGrammar) -> int:
         """Put a grammar's tables on the device and return its pool id.
 
-        Idempotent: a grammar already in the pool keeps the id it has.
+        Idempotent: a grammar already in the pool keeps the id it has, and one
+        the pool has since evicted is re-admitted rather than reported at an
+        identifier that now names something else.
+
+        Safe to call from several threads. A serving engine compiles on a
+        thread pool while a decode loop runs, and the check and the admission
+        have to be one step or two requests take the same slot.
         """
-        key = id(grammar)
-        if key not in self._ids:
-            self._ids[key] = self._pool.admit(grammar)
-        return self._ids[key]
+        with self._lock:
+            key = id(grammar)
+            held = self._ids.get(key)
+            # The identifier alone does not identify a grammar across an
+            # eviction - the slot is reused, deliberately, so that nothing
+            # moves and a recorded graph survives. Ask whether it is still ours.
+            if held is not None and self._pool.holds(*held):
+                return held[0]
+            identifier = self._pool.admit(grammar)
+            self._ids[key] = (identifier, self._pool.generation(identifier))
+            # Holding the grammar is what makes `id` a key at all: CPython
+            # reuses the address of a dropped object, so without this a caller
+            # who let a schema go out of scope could compile a different one,
+            # land on the same address, and be handed the first one's tables.
+            # It is also what an eviction needs to re-admit from.
+            self._held[key] = grammar
+            return identifier
 
     def batch(self, size: int, *, rollback: int = 0) -> Batch:
         """A batch of `size` sequences.

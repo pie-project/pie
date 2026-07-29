@@ -3513,6 +3513,14 @@ class DeviceBatch:
         self.depth.fill_(1)
         self.config_count.fill_(1)
         self.lexer_state.zero_()
+        # This is a reset, so what the previous parse reported about itself is
+        # no longer about anything. Leaving the flags would carry a refusal, or
+        # an overflow, into a sequence that has not taken a step yet.
+        self.terminated.zero_()
+        self.overflow.zero_()
+        if self.rollback_depth > 0:
+            self.hist_slot.zero_()
+            self.history_length = 0
 
     def set_matchers(self, matchers: list) -> None:
         """Load the parse state of many reference matchers, in one transfer.
@@ -3666,6 +3674,32 @@ class DeviceBatch:
             return
         self._advance()
 
+    def _snapshot_live(self) -> dict[str, torch.Tensor]:
+        """Everything a rehearsal disturbs and a caller can observe.
+
+        By name rather than by position, because it was a positional tuple
+        that let `terminated` and `overflow` fall out of the restore: a
+        rehearsal advances on a synthetic token the grammar refuses, so after
+        `capture()` every sequence reported itself terminated and a serving
+        engine polling `problems` would retire the whole batch.
+        """
+        return {
+            name: getattr(self, name).clone()
+            for name in (
+                "lexer_state",
+                "stack",
+                "depth",
+                "config_count",
+                "widest",
+                "terminated",
+                "overflow",
+            )
+        }
+
+    def _restore_live(self, held: dict[str, torch.Tensor]) -> None:
+        for name, value in held.items():
+            getattr(self, name).copy_(value)
+
     def capture_advance(self) -> None:
         """Record the advance too, so a decode step launches two graphs.
 
@@ -3676,13 +3710,7 @@ class DeviceBatch:
         one does not. The live state is put back afterwards, and the history the
         rehearsal wrote is discarded with it.
         """
-        held = (
-            self.lexer_state.clone(),
-            self.stack.clone(),
-            self.depth.clone(),
-            self.config_count.clone(),
-            self.widest.clone(),
-        )
+        held = self._snapshot_live()
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
@@ -3694,11 +3722,7 @@ class DeviceBatch:
         with torch.cuda.graph(self.advance_graph):
             self._advance()
 
-        self.lexer_state.copy_(held[0])
-        self.stack.copy_(held[1])
-        self.depth.copy_(held[2])
-        self.config_count.copy_(held[3])
-        self.widest.copy_(held[4])
+        self._restore_live(held)
         if self.rollback_depth > 0:
             self.hist_slot.zero_()
             self.history_length = 0
@@ -3716,13 +3740,7 @@ class DeviceBatch:
         The rehearsal runs the advance, and an advance moves the parse, so the
         live state is put back afterwards exactly as `capture_advance` does.
         """
-        held = (
-            self.lexer_state.clone(),
-            self.stack.clone(),
-            self.depth.clone(),
-            self.config_count.clone(),
-            self.widest.clone(),
-        )
+        held = self._snapshot_live()
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
@@ -3736,11 +3754,7 @@ class DeviceBatch:
             self._advance()
             self._fill()
 
-        self.lexer_state.copy_(held[0])
-        self.stack.copy_(held[1])
-        self.depth.copy_(held[2])
-        self.config_count.copy_(held[3])
-        self.widest.copy_(held[4])
+        self._restore_live(held)
         if self.rollback_depth > 0:
             self.hist_slot.zero_()
             self.history_length = 0
@@ -3905,10 +3919,18 @@ class DeviceBatch:
         step - a serving engine sees that as a latency spike of tens of
         milliseconds on one token. Nothing here depends on the state, so it can
         be run against whatever the batch currently holds.
+
+        The advance is a real advance, so the live state is put back the same
+        way the recordings put theirs back.
         """
+        held = self._snapshot_live()
         self._fill()
         self._advance()
         torch.cuda.synchronize()
+        self._restore_live(held)
+        if self.rollback_depth > 0:
+            self.hist_slot.zero_()
+            self.history_length = 0
 
     def problems(self) -> tuple[torch.Tensor, torch.Tensor]:
         """`(terminated, overflow)`, on the device, one entry per sequence.

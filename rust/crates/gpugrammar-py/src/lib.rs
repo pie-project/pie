@@ -66,7 +66,13 @@ fn compile(
         lexer_states: lexer_states.unwrap_or(Limits::default().lexer_states),
         ..Default::default()
     };
-    compile_grammar_within(&grammar, vocabulary, limits).map_err(refusal)
+    // Released for the same reason the schema path releases it: this holds no
+    // Python object, takes tens of milliseconds across every core, and a
+    // serving engine compiles on a thread pool while a decode loop runs.
+    Python::attach(|python| {
+        python.detach(|| compile_grammar_within(&grammar, vocabulary, limits))
+    })
+    .map_err(refusal)
 }
 
 /// A vocabulary-bound compiler. Build one per model.
@@ -419,9 +425,40 @@ pub struct Matcher {
 
 #[pymethods]
 impl Matcher {
-    /// Write the allowed-token bitmask into `buffer`, which must hold at least
-    /// `bitset_words` 32-bit words.
+    /// Write the allowed-token bitmask into `buffer`, which must be a
+    /// contiguous 32-bit CPU tensor of at least `bitset_words` elements.
+    ///
+    /// Everything in that sentence is checked. This writes through a raw
+    /// pointer the caller supplies, so a CUDA tensor would have the host
+    /// dereference a device address and an 8-bit tensor of the same length
+    /// would be a quarter of the bytes needed - both reachable from Python,
+    /// and neither one a Python exception without these checks.
     fn fill_bitmask(&self, buffer: Bound<'_, PyAny>) -> PyResult<()> {
+        let device: String = buffer
+            .getattr("device")?
+            .getattr("type")?
+            .extract()
+            .unwrap_or_default();
+        if device != "cpu" {
+            return Err(PyValueError::new_err(format!(
+                "the bitmask buffer must be on the host, not on {device}"
+            )));
+        }
+        if !buffer.getattr("is_contiguous")?.call0()?.extract::<bool>()? {
+            return Err(PyValueError::new_err(
+                "the bitmask buffer must be contiguous",
+            ));
+        }
+        let width: usize = buffer
+            .getattr("dtype")?
+            .getattr("itemsize")?
+            .extract()
+            .unwrap_or(0);
+        if width != 4 {
+            return Err(PyValueError::new_err(format!(
+                "the bitmask buffer must hold 32-bit words, not {width}-byte ones"
+            )));
+        }
         let pointer: usize = buffer.getattr("data_ptr")?.call0()?.extract()?;
         let length: usize = buffer.getattr("numel")?.call0()?.extract()?;
         if length < self.words {
@@ -430,8 +467,8 @@ impl Matcher {
                 self.words
             )));
         }
-        // Safety: the caller supplies a contiguous int32 tensor and the length
-        // has just been checked against the artifact's word count.
+        // Safety: checked above to be a contiguous 32-bit host buffer of at
+        // least `self.words` elements.
         let slice = unsafe { std::slice::from_raw_parts_mut(pointer as *mut u32, self.words) };
         self.inner.fill_bitmask(slice);
         Ok(())

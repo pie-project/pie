@@ -241,5 +241,104 @@ class FusedStepThroughTheLibrary(unittest.TestCase):
         self.assertEqual(steps, 8)
 
 
+
+
+class WhatARehearsalMustNotLeaveBehind(unittest.TestCase):
+    """`capture` and `warmup` run the advance. A caller must not see it.
+
+    Recording a graph rehearses the advance on a synthetic token, and the
+    grammar refuses that token, so before this was fixed every sequence
+    reported itself terminated the moment the documented flow ran `capture()`
+    - and a serving engine polling `problems` to retire sequences would have
+    retired the whole batch on its first step.
+    """
+
+    def setUp(self):
+        _requirements()
+        self.engine = gpugrammar.Engine(VOCABULARY)
+        self.grammar = self.engine.compile_json_schema(SCHEMA)
+
+    def test_capture_leaves_no_sequence_terminated(self):
+        batch = self.engine.batch(size=4)
+        batch.set_grammars([self.grammar] * 4)
+        batch.capture()
+        terminated, overflow = batch.problems()
+        self.assertEqual(terminated.tolist(), [0, 0, 0, 0])
+        self.assertEqual(overflow.tolist(), [0, 0, 0, 0])
+
+    def test_warmup_leaves_no_sequence_terminated(self):
+        batch = self.engine.batch(size=4)
+        batch.set_grammars([self.grammar] * 4)
+        batch.raw.warmup()
+        self.assertEqual(batch.problems()[0].tolist(), [0, 0, 0, 0])
+
+    def test_set_grammars_clears_what_the_last_parse_reported(self):
+        batch = self.engine.batch(size=2)
+        batch.set_grammars([self.grammar] * 2)
+        batch.raw.terminated.fill_(1)
+        batch.raw.overflow.fill_(1)
+        batch.set_grammars([self.grammar] * 2)
+        self.assertEqual(batch.problems()[0].tolist(), [0, 0])
+        self.assertEqual(batch.problems()[1].tolist(), [0, 0])
+
+
+class TheEngineDoesNotConfuseTwoGrammars(unittest.TestCase):
+    def setUp(self):
+        _requirements()
+        self.engine = gpugrammar.Engine(VOCABULARY)
+
+    def test_a_dropped_grammar_does_not_lend_its_slot_to_the_next(self):
+        # The admission cache is keyed on `id`, and CPython reuses the address
+        # of a dropped object - so unless a reference is held, a caller who let
+        # one schema go out of scope could compile another, land on the same
+        # address, and be handed the first one's tables.
+        import gc
+
+        first = self.engine.compile_json_schema(json.dumps({"type": "string"}))
+        first_id, address = self.engine.admit(first), id(first)
+        del first
+        gc.collect()
+        for _ in range(200):
+            other = self.engine.compile_json_schema(json.dumps({"type": "integer"}))
+            if self.engine.admit(other) == first_id:
+                self.fail("a different grammar was given an occupied slot")
+            if id(other) == address:
+                return
+
+
+class TheMatcherRefusesABufferItCannotWriteTo(unittest.TestCase):
+    """`fill_bitmask` writes through a pointer the caller supplies."""
+
+    def setUp(self):
+        _requirements()
+        self.engine = gpugrammar.Engine(VOCABULARY)
+        self.grammar = self.engine.compile_json_schema(SCHEMA)
+        self.matcher = self.grammar.matcher(32)
+        self.words = self.grammar.bitset_words
+
+    def test_a_device_buffer_is_refused(self):
+        # Its `data_ptr` is a device address and this write is on the host.
+        with self.assertRaises(ValueError):
+            self.matcher.fill_bitmask(
+                torch.zeros(self.words, dtype=torch.int32, device="cuda")
+            )
+
+    def test_a_narrower_element_is_refused(self):
+        # `numel` passes while the buffer is a quarter of the bytes needed.
+        with self.assertRaises(ValueError):
+            self.matcher.fill_bitmask(torch.zeros(self.words, dtype=torch.uint8))
+
+    def test_a_strided_buffer_is_refused(self):
+        # At least two elements, or the stride has nothing to skip over and a
+        # single element is contiguous by definition.
+        stride = torch.zeros(max(2, self.words) * 2, dtype=torch.int32)[::2]
+        self.assertFalse(stride.is_contiguous())
+        with self.assertRaises(ValueError):
+            self.matcher.fill_bitmask(stride)
+
+    def test_the_buffer_it_documents_is_accepted(self):
+        self.matcher.fill_bitmask(torch.zeros(self.words, dtype=torch.int32))
+
+
 if __name__ == "__main__":
     unittest.main()
