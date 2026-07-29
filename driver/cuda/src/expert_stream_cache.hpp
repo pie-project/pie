@@ -49,6 +49,8 @@ struct StreamedExpertTable {
     int num_layers = 0;
     int num_experts = 0;
     int sections_per_expert = 0;
+    // Matches pie_weight_loader::PieLoaderExpertPackKind / ExpertPackKind.
+    std::uint32_t pack_kind = 0;
     std::vector<std::uint64_t> section_bytes;
     std::vector<std::uint64_t> section_offsets;
     std::uint64_t slot_bytes = 0;  // 0 = cache computes from section_bytes

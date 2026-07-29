@@ -6,7 +6,7 @@ use crate::types::{
     TensorDecl, TensorId,
 };
 
-pub const STORAGE_PROGRAM_VERSION: u32 = 4;
+pub const STORAGE_PROGRAM_VERSION: u32 = 5;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryPlan {
@@ -177,6 +177,21 @@ pub enum StorageInstr {
     },
 }
 
+/// Offline expert-pack materialization requested by a stream recipe.
+///
+/// When non-[`Self::None`], the CUDA driver builds (or opens) a transformed
+/// host pack with bounded staging before paging sections through the expert
+/// stream cache. Plain ExtentWrite streams (HF packs / Mixtral BF16) leave
+/// this as `None`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[repr(u32)]
+pub enum ExpertPackKind {
+    #[default]
+    None = 0,
+    GptOssNativeMarlin = 1,
+    GptOssEagerBf16 = 2,
+}
+
 /// One deferred source extent for a streamed expert section.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamBinding {
@@ -208,6 +223,9 @@ pub struct StreamPlan {
     pub section_offsets: Vec<u64>,
     /// Per-section payload sizes (`len == sections_per_expert`).
     pub section_bytes: Vec<u64>,
+    /// Offline pack builder selected by the stream arch recipe.
+    #[serde(default)]
+    pub pack_kind: ExpertPackKind,
 }
 
 impl StreamPlan {

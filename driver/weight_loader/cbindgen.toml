@@ -14,6 +14,7 @@ include = [
   "PieLoaderEncodingKind",
   "PieLoaderQuantScheme",
   "PieLoaderMxfp4MoePolicy",
+  "PieLoaderExpertPackKind",
   "PieLoaderSemanticRole",
   "PieLoaderStorageInstrKind",
   "PieLoaderTileMapKind",

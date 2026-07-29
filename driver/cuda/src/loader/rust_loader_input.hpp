@@ -405,6 +405,7 @@ private:
         case DType::INT64:
         case DType::INT4_PACKED:
         case DType::MXFP4_PACKED:
+        case DType::MXFP4_MARLIN:
             return pie_weight_loader::PieLoaderDType::U8;
         }
         return pie_weight_loader::PieLoaderDType::U8;

@@ -172,6 +172,9 @@ add_library(pie_driver_cuda_lib STATIC
   src/spec_expansion.cpp
   src/tensor.cpp
   src/expert_stream_cache.cpp
+  src/model/expert_pack_build.cpp
+  src/model/gpt_oss_native_marlin_pack.cpp
+  src/model/gpt_oss_eager_bf16_pack.cpp
   src/model/weight_store.cpp
   src/mla_cache.cpp
   src/model/loaded_model.cpp

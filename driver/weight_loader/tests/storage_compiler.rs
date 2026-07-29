@@ -1571,6 +1571,10 @@ fn gpt_oss_stream_routed_experts_fused_plan() {
     assert_eq!(streamed.stream.sections_per_expert, 4);
     assert_eq!(streamed.stream.template.len(), 4);
     assert_eq!(streamed.stream.bindings.len(), 1 * 2 * 4);
+    assert_eq!(
+        streamed.stream.pack_kind,
+        pie_weight_loader::storage::ExpertPackKind::None
+    );
     // Per-expert slices: gate_up weight 100, scale 20, down weight 50, scale 10.
     assert_eq!(streamed.stream.section_bytes, vec![100, 20, 50, 10]);
     assert_eq!(streamed.stream.bindings[0].span_bytes, 100);
@@ -1581,25 +1585,183 @@ fn gpt_oss_stream_routed_experts_fused_plan() {
 }
 
 #[test]
-fn gpt_oss_stream_rejects_native_mxfp4() {
-    // Enough of a streamed tensor for skip_streamed to fire before the policy check.
+fn gpt_oss_eager_bf16_stream_plan_section_bytes() {
+    // E=2, I=128, H=64 → gate/up: 128*64*2=16384; down: 64*128*2=16384.
+    let mut offset = 0u64;
+    let mut tensors = Vec::new();
+    let mut push = |id: u32, name: &str, shape: Vec<i64>, span: u64| {
+        tensors.push(RawTensor {
+            id: TensorId(id),
+            name: name.to_string(),
+            file_id: FileId(0),
+            file_offset: offset,
+            span_bytes: span,
+            shape,
+            encoding: Encoding::Raw(DType::U8),
+            layout: Layout::dense(1),
+        });
+        offset += span;
+    };
+    let mut id = 0u32;
+    let mut next = || {
+        let v = id;
+        id += 1;
+        v
+    };
+    push(next(), "model.embed_tokens.weight", vec![64], 64);
+    push(
+        next(),
+        "model.layers.0.mlp.experts.gate_up_proj_blocks",
+        vec![2, 256, 2, 16],
+        16384,
+    );
+    push(
+        next(),
+        "model.layers.0.mlp.experts.gate_up_proj_scales",
+        vec![2, 256, 2],
+        1024,
+    );
+    push(
+        next(),
+        "model.layers.0.mlp.experts.gate_up_proj_bias",
+        vec![2, 256],
+        1024,
+    );
+    push(
+        next(),
+        "model.layers.0.mlp.experts.down_proj_blocks",
+        vec![2, 64, 4, 16],
+        8192,
+    );
+    push(
+        next(),
+        "model.layers.0.mlp.experts.down_proj_scales",
+        vec![2, 64, 4],
+        512,
+    );
+    push(
+        next(),
+        "model.layers.0.mlp.experts.down_proj_bias",
+        vec![2, 64],
+        256,
+    );
     let meta = CheckpointMetadata {
         files: vec![CheckpointFile {
             id: FileId(0),
             path: "gpt-oss.safetensors".into(),
-            size_bytes: 8,
+            size_bytes: offset,
             format: CheckpointFormat::Safetensors,
         }],
-        tensors: vec![RawTensor {
-            id: TensorId(0),
-            name: "model.layers.0.mlp.experts.gate_up_proj_blocks".into(),
+        tensors,
+    };
+    let cfg = pie_weight_loader::config::ModelConfig {
+        model_type: "gpt_oss".to_string(),
+        num_hidden_layers: 1,
+        num_experts: 2,
+        num_experts_per_tok: 2,
+        ..pie_weight_loader::config::ModelConfig::default()
+    };
+    let target = StorageTarget {
+        backend: BackendKind::Cuda,
+        stream_routed_experts: true,
+        mxfp4_moe: pie_weight_loader::types::Mxfp4MoePolicy::EagerBf16,
+        ..StorageTarget::default()
+    };
+    let abi =
+        pie_weight_loader::abi::RuntimeAbi::default_for_target(&meta, &cfg, &target).unwrap();
+    let streamed = compile_storage_program(&meta, &cfg, &abi, target).unwrap();
+    assert_eq!(streamed.stream.sections_per_expert, 3);
+    assert_eq!(
+        streamed.stream.section_bytes,
+        vec![16384, 16384, 16384]
+    );
+    assert_eq!(streamed.stream.bindings.len(), 1 * 2 * 3);
+    assert_eq!(
+        streamed.stream.pack_kind,
+        pie_weight_loader::storage::ExpertPackKind::GptOssEagerBf16
+    );
+    assert!(
+        streamed
+            .tensors
+            .iter()
+            .any(|t| t.name.contains("gate_up_proj.bias")),
+        "biases must remain resident"
+    );
+}
+
+#[test]
+fn gpt_oss_native_stream_plan_section_bytes() {
+    // E=2, I=128, H=64 → I_native=128, groups=2.
+    // gate/up weight: 128*64/2=4096; scale: 128*2=256;
+    // down weight: 64*128/2=4096; scale: 64*(128/32)=256.
+    let mut offset = 0u64;
+    let mut tensors = Vec::new();
+    let mut push = |id: u32, name: &str, shape: Vec<i64>, span: u64| {
+        tensors.push(RawTensor {
+            id: TensorId(id),
+            name: name.to_string(),
             file_id: FileId(0),
-            file_offset: 0,
-            span_bytes: 8,
-            shape: vec![8],
+            file_offset: offset,
+            span_bytes: span,
+            shape,
             encoding: Encoding::Raw(DType::U8),
             layout: Layout::dense(1),
+        });
+        offset += span;
+    };
+    let mut id = 0u32;
+    let mut next = || {
+        let v = id;
+        id += 1;
+        v
+    };
+    push(next(), "model.embed_tokens.weight", vec![64], 64);
+    // gate_up [E=2, 2I=256, H/32=2, 16]; bytes per bank = 2*256*2*16 = 16384
+    push(
+        next(),
+        "model.layers.0.mlp.experts.gate_up_proj_blocks",
+        vec![2, 256, 2, 16],
+        16384,
+    );
+    push(
+        next(),
+        "model.layers.0.mlp.experts.gate_up_proj_scales",
+        vec![2, 256, 2],
+        1024,
+    );
+    push(
+        next(),
+        "model.layers.0.mlp.experts.gate_up_proj_bias",
+        vec![2, 256],
+        1024,
+    );
+    // down [E=2, H=64, I/32=4, 16]; bytes = 2*64*4*16 = 8192
+    push(
+        next(),
+        "model.layers.0.mlp.experts.down_proj_blocks",
+        vec![2, 64, 4, 16],
+        8192,
+    );
+    push(
+        next(),
+        "model.layers.0.mlp.experts.down_proj_scales",
+        vec![2, 64, 4],
+        512,
+    );
+    push(
+        next(),
+        "model.layers.0.mlp.experts.down_proj_bias",
+        vec![2, 64],
+        256,
+    );
+    let meta = CheckpointMetadata {
+        files: vec![CheckpointFile {
+            id: FileId(0),
+            path: "gpt-oss.safetensors".into(),
+            size_bytes: offset,
+            format: CheckpointFormat::Safetensors,
         }],
+        tensors,
     };
     let cfg = pie_weight_loader::config::ModelConfig {
         model_type: "gpt_oss".to_string(),
@@ -1615,12 +1777,33 @@ fn gpt_oss_stream_rejects_native_mxfp4() {
         native_mxfp4_moe: true,
         ..StorageTarget::default()
     };
-    let err = pie_weight_loader::abi::RuntimeAbi::default_for_target(&meta, &cfg, &target)
-        .unwrap_err()
-        .to_string();
+    let abi =
+        pie_weight_loader::abi::RuntimeAbi::default_for_target(&meta, &cfg, &target).unwrap();
+    let streamed = compile_storage_program(&meta, &cfg, &abi, target).unwrap();
+    assert_eq!(streamed.stream.sections_per_expert, 6);
+    assert_eq!(
+        streamed.stream.section_bytes,
+        vec![4096, 256, 4096, 256, 4096, 256]
+    );
+    assert_eq!(
+        streamed.stream.pack_kind,
+        pie_weight_loader::storage::ExpertPackKind::GptOssNativeMarlin
+    );
     assert!(
-        err.contains("routed_dequant") || err.contains("ExtentWrite"),
-        "unexpected error: {err}"
+        streamed
+            .tensors
+            .iter()
+            .any(|t| t.name.contains("gate_up_proj.bias")),
+        "biases must remain resident"
+    );
+    assert!(
+        !streamed
+            .tensors
+            .iter()
+            .any(|t| t.name.contains("gate_proj.weight")
+                || t.name.contains("gate_up_proj.weight")),
+        "native Marlin weights must not be resident; got: {:?}",
+        streamed.tensors.iter().map(|t| &t.name).collect::<Vec<_>>()
     );
 }
 

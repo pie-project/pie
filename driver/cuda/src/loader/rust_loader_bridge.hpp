@@ -138,7 +138,7 @@ inline std::string rust_loader_compile_cache_key(
     // content-hashes the loader source), so this no longer needs bumping per
     // code change.
     constexpr const char* cache_version =
-        "pie-cuda-rust-storage-program-cache-v10";
+        "pie-cuda-rust-storage-program-cache-v11";
     h.update_bytes(cache_version, std::char_traits<char>::length(cache_version));
     // Auto-invalidate when the Rust compiler logic changes (build.rs content-
     // hashes the loader source into this weak FFI symbol). Weak-guarded so the
@@ -630,7 +630,8 @@ inline RustLoaderCompileResult compile_rust_loader_plan_from_metadata(
         max_tile_bytes,
         preferred_alignment,
         backend_target.mxfp4_moe,
-        backend_target.mxfp4_native_gemm,
+        /*native_mxfp4_moe=*/backend_target.mxfp4_native_gemm ||
+            backend_target.gptq_marlin_int4,
         backend_target.stream_routed_experts);
     input.set_runtime_abi_name("pie-cuda", /*version=*/1);
 

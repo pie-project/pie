@@ -103,7 +103,7 @@ struct WeightView {
     {
         WeightView v;
         v.data = weight.data();
-        v.dtype = DType::MXFP4_PACKED;
+        v.dtype = DType::MXFP4_MARLIN;
         v.nbytes = weight.nbytes();
         v.scale_data = scale.data();
         v.scale_dtype = DType::UINT8;
