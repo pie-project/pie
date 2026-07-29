@@ -18,7 +18,8 @@
 #include <algorithm>
 #include <cstdlib>
 
-#include "decode_dispatch.hpp"  // M=1 helpers (qmv_dispatch, rms_dispatch, ...)
+#include "decode_dispatch.hpp"
+#include "decode_step_mb.hpp"  // M=1 helpers (qmv_dispatch, rms_dispatch, ...)
 #include "mtl4_context.hpp"     // Grid, Threadgroup
 
 namespace pie::metal {
@@ -87,7 +88,16 @@ inline int qmm_bn(int out_vec, int N) {
 // point independently.  A projection to hidden (N=1024, 32 tiles) takes a split
 // of 16, gate/up (N=3584, 112 tiles) takes 4, and lm_head has 7760 tiles of its
 // own and takes none.
-inline constexpr int kQmmSplitTargetTgs = 512;
+// MLX targets 512 threadgroups here, which is right for the hardware it was
+// tuned on and 7% wrong for this one: swept on an M1 Max, the decode step is
+// 29.0ms at 64, 24.7 at 128, 24.7 at 256 and 26.1 at 512, and an interleaved
+// A/B against MLX's value reads 86.85ms to 93.61ms at 32 lanes.  256 sits in
+// the middle of the flat region rather than on its edge.
+//
+// The shape of the curve is the reason: past the point where the machine is
+// full, more partitions only add reduce traffic, and a 32-core M1 Max fills at
+// a lower count than the parts MLX tunes for.
+inline constexpr int kQmmSplitTargetTgs = 256;
 inline constexpr int kQmmSplitBN = 32;
 inline constexpr int kQmmSplitMaxSplits = 16;
 // The widest projection that takes this path.  lm_head has enough output tiles
@@ -106,7 +116,11 @@ inline int qmm_split_k(int out_vec, int N, int K, int bm) {
     // 8% (32.37ms split against 29.86 unsplit), where at 16 lanes splitting
     // wins 11% (18.29 against 20.50).
     const int tiles = (out_vec / kQmmSplitBN) * ((N + kQmmBM - 1) / kQmmBM);
-    int split = tiles > 0 ? kQmmSplitTargetTgs / tiles : 1;
+    static const int target = [] {
+        const char* e = std::getenv("PIE_METAL_SPLIT_TGS");
+        return e ? std::atoi(e) : kQmmSplitTargetTgs;
+    }();
+    int split = tiles > 0 ? target / tiles : 1;
     split = std::min(split, kQmmSplitMaxSplits);
     const int k_align = 64;  // group_size, and a multiple of BK=32
     split = std::min(split, K / k_align);
