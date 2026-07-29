@@ -1193,6 +1193,71 @@ that was always legal is now reachable.
 
 ---
 
+## 10.8 Running the fold path end to end — the over-broad logits rule
+
+§10.7 got `mtp-native-verify` through buffer -> verify -> commit. Building the
+first GPU test for `gdn-foldcommit` (`bin/pie/tests/cuda_gdn_foldcommit.rs`)
+immediately failed at frame step 0 with
+
+    generated fused value shape exceeds u32
+
+which was two faults wearing one message. `describe_generated_value` raised it
+both for a shape whose product overflows u32 and for a dimension that resolved
+to ZERO -- opposite causes, since a zero extent means a symbolic extent was
+never bound and has nothing to do with size. Splitting the message named it at
+once: symbolic extent #4, `PTIR_EXTENT_SAMPLED_ROWS`, resolving to zero.
+
+The cause was `aa359f825`, from §10.7. It suppressed the synthesized read-out
+for any plan that folds, justified by the rule *"a fold fire produces no usable
+logits"*. That rule is about REPLAY, and folding is far wider than replay:
+
+- `RsPlan::FoldBuffered` replays activations an EARLIER fire computed into the
+  buffer slabs. It returns before the output projection, so it genuinely has no
+  logits. This is the case the rule was written for.
+- `RsPlan::Fold` advances the folded state over the fire's OWN new tokens,
+  through the full backbone. **That is what a prefill on a linear model is.**
+  Its logits are ordinary and required. And a pass with no RS working sets at
+  all classifies as `Fold` too, so the suppression also silently removed the
+  read-out from every attention-model fire.
+
+So the "no logits" rule, applied to `Fold`, disabled generation on every
+architecture at once. The driver had it right the whole time -- its
+`rs_is_fold` is `mode == BufferFold`, nothing wider -- and the WIT text was
+right too ("a fire that REPLAYS BUFFERED tokens"). Only the engine generalized
+from the sentence rather than from the mechanism. The predicate now matches the
+driver's.
+
+This also accounts for `cuda_chat_completion_e2e`'s "fused value shape exceeds
+u32", recorded in §10.7 as pre-existing and unrelated. It was neither: same
+bug, reached through the attention path. That test now runs the model and fails
+later and differently ("ptir: descriptor channel 0 not ready" during decode),
+which IS unrelated to RS and remains open.
+
+### What the new test pins
+
+`cuda_gdn_foldcommit.rs` has two cases, and the split is the point:
+
+- `one_chunk_folds_from_the_buffer` -- buffer 4, fold 2, abandon 2. Passes on
+  real weights; the first execution of `gdn-foldcommit` ever. Its commit fire
+  needed `epilogue(|| {})`: a pass with no stages has no PTIR program and
+  registration fails outright, so an empty epilogue is the minimal well-formed
+  program that samples nothing.
+- `two_chunks_need_the_buffer_read_path` -- append a SECOND chunk onto the
+  unfolded tail. The read path in its smallest honest form. It asserts the
+  refusal names the BUFFER, and confirms the exact occupancy from `f1f498e0a`
+  on hardware ("2 buffered token(s)", not a page). It is written to flip: when
+  the read path lands it asserts the chain folded instead.
+
+### Lesson, again
+
+§10.7's lesson was "a warning comment is not a mechanism". This one is
+narrower and sharper: **a rule stated in prose gets applied by its wording, not
+by its reason.** "A fold produces no logits" was a true sentence about one
+plan, generalized to a predicate over three. Both the driver and the WIT
+carried the precise version; the imprecise restatement is what shipped. Where a
+rule has a mechanical form -- here `mode == BufferFold` -- the code should name
+that form and not a paraphrase of it.
+
 ## 11. The boundary model — ratified after Step B, supersedes §3.3/§3.4 fold modes
 
 Step B shipped the fold modes as three sibling methods because that is the
