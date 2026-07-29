@@ -1145,6 +1145,52 @@ canonicalize containers, which is the thing D4 exists to avoid.
   included: `paged_batch_validation_test` compiles this header without the
   generated-ABI include directory.
 
+### 10.7 First execution on real weights — three blockers, all silent
+
+Everything above was written without ever running a linear model: the box had
+no weights. Downloading Qwen3.5-0.8B and pointing the CUDA driver at a GPU
+surfaced three defects in a row, none of which any unit test could have caught,
+and all of which sat between the guest and the fold path.
+
+**(a) No inferlet could load at all.** `34d38027f` bumped the package to
+`pie:inferlet@0.3.0`; `process.rs` still looked up `pie:inferlet/run@0.2.0`.
+wasmtime's export map is semver-exact, so every program failed with "No 'run'
+interface found". The constant's comment already warned it must track
+world.wit — a comment is not a mechanism, so it is now pinned by
+`run_interface_version_matches_wit`, which parses the version out of the WIT.
+
+**(b) The empty-buffer append was refused as a non-empty one.** `rs_plan_for`
+read occupancy as `buffer_size() * page_size`, a page-granular upper bound. A
+guest must reserve a page before buffering into it, so a brand-new empty buffer
+claimed a full page and every speculative window died at submit. The host
+already knew the exact figure — each buffering fire names its `(start, len)`
+span — so the store now publishes it and keeps an exact `buffer_fill`.
+
+**(c) Fold was unwritable.** An absent `readout` binding does not mean "sample
+nothing"; the host synthesizes each lane's last row, and an empty readout
+channel has no expressible shape. So the host gave every fold fire a sample row
+it never requested, and the driver then refused the fire for requesting it
+(§10.6). The default is now dropped once the plan is known to fold; an EXPLICIT
+readout is still refused, loudly. Both fold-commit inferlets had been written
+against the broken shape and had never run — each sampled `intrinsics::logits()`
+in its commit fire while its own comment claimed "no logits".
+
+**Result.** `mtp-native-verify` completes the full
+buffer -> verify(`fold_len=0`) -> commit(`fold_len=accepted`) loop on an L40S
+against Qwen3.5-0.8B: 14 windows, 22 tokens committed. The §11 model is now
+executed rather than merely asserted. Acceptance quality is a separate question
+(`mean_accept` is low, consistent with the known FLA commit-advance caveat) —
+what is settled is that the shape runs.
+
+**Toolchain note.** CUDA 13 needs an r580+ driver; an r550 host must build
+against 12.x, which `swap_pool.cpp` had broken by calling `cudaMemcpyBatchAsync`
+unconditionally (the signature differs across the 12/13 boundary). Now guarded,
+with the per-copy fallback restored below 13.0.
+
+**Still refused, still unimplemented:** the buffer READ path (§10.2). Nothing
+here relaxes it — (b) only makes the classifier's input honest, so the position
+that was always legal is now reachable.
+
 ---
 
 ## 11. The boundary model — ratified after Step B, supersedes §3.3/§3.4 fold modes
