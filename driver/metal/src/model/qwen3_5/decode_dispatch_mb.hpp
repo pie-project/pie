@@ -15,6 +15,8 @@
 // decode_dispatch.hpp + RawMetalContext::dispatch).
 
 #include "decode_abi.hpp"
+#include <algorithm>
+
 #include "decode_dispatch.hpp"  // M=1 helpers (qmv_dispatch, rms_dispatch, ...)
 #include "mtl4_context.hpp"     // Grid, Threadgroup
 
@@ -75,6 +77,53 @@ inline int qmm_bn(int out_vec, int N) {
         if ((out_vec / bn) * row_blocks >= kQmmMinThreadgroups) best = bn;
     }
     return best;
+}
+
+// Split the K dimension when the output tiles alone leave the machine short.
+// MLX picks the split to land near 512 threadgroups (backend/metal/
+// quantized.cpp:880) and sends every transposed non-batched decode down this
+// path rather than the plain GEMM; `roofline_probe` finds the same saturation
+// point independently.  A projection to hidden (N=1024, 32 tiles) takes a split
+// of 16, gate/up (N=3584, 112 tiles) takes 4, and lm_head has 7760 tiles of its
+// own and takes none.
+inline constexpr int kQmmSplitTargetTgs = 512;
+inline constexpr int kQmmSplitBN = 32;
+inline constexpr int kQmmSplitMaxSplits = 16;
+// The widest projection that takes this path.  lm_head has enough output tiles
+// of its own to never need a split, which is what keeps the partials buffer to
+// a few MB instead of the vocabulary's hundreds.
+inline constexpr int kQmmSplitMaxOut = 8192;
+
+// Each partition must be a whole number of BK-wide tiles AND whole quantization
+// groups, or it reads into the next group's scales.
+inline int qmm_split_k(int out_vec, int N, int K, int bm) {
+    if (out_vec % kQmmSplitBN != 0 || bm <= 0) return 1;
+    // Count the batch in units of the NARROW row block, not the one this
+    // dispatch happens to use.  A wide block covers twice the rows in one
+    // threadgroup, so counting by it would call a 32-row batch as parallel as a
+    // 16-row one and split both the same -- measured at 32 lanes that costs
+    // 8% (32.37ms split against 29.86 unsplit), where at 16 lanes splitting
+    // wins 11% (18.29 against 20.50).
+    const int tiles = (out_vec / kQmmSplitBN) * ((N + kQmmBM - 1) / kQmmBM);
+    int split = tiles > 0 ? kQmmSplitTargetTgs / tiles : 1;
+    split = std::min(split, kQmmSplitMaxSplits);
+    const int k_align = 64;  // group_size, and a multiple of BK=32
+    split = std::min(split, K / k_align);
+    while (split > 1 && K % (split * k_align) != 0) --split;
+    return split < 2 ? 1 : split;
+}
+
+inline void qmm_t_splitk_dispatch(int out_vec, int N, int bm, int split, Grid& g,
+                                  Threadgroup& tg) {
+    // dispatchThreads: (tiles_n * 32 lanes, tiles_m * 2, split * 2).
+    g  = Grid{32u * (uint32_t(out_vec) / uint32_t(kQmmSplitBN)),
+              2u * uint32_t((N + bm - 1) / bm), 2u * uint32_t(split)};
+    tg = Threadgroup{32, 2, 2};
+}
+
+inline void qmm_splitk_reduce_dispatch(int out_vec, int N, Grid& g, Threadgroup& tg) {
+    g  = Grid{uint32_t(out_vec), uint32_t(N), 1};
+    tg = Threadgroup{256, 1, 1};
 }
 
 // `out/BN` threadgroups across the output, `M/BM` across the batch, each

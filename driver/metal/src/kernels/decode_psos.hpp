@@ -51,6 +51,11 @@ struct MultiBatchPsos {
     // affine_qmm_t_strided: the same GEMM with an explicit row pitch, for the
     // prefill, whose scratch rows are laid at a uniform `scratch_widest_elems`
     // rather than packed at `K`.
+    // Split-K: [bm_wide] x {gemm, reduce}.  MLX sends every transposed
+    // non-batched decode down this path; the split is chosen per shape.
+    Pso qmm_t_splitk[2]{};
+    Pso qmm_splitk_reduce{};
+    Pso qmm_splitk_reduce_residual{};
     Pso qmm_t_strided{};
     Pso qmm_t_strided_residual{};
     // Row-independent prefill kernels with an explicit row pitch, so a whole

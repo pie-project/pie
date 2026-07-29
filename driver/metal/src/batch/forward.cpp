@@ -18,6 +18,7 @@
 #if defined(__APPLE__)
 #include "batch_schedule.hpp"
 #include "decode_consts.hpp"
+#include "decode_dispatch_mb.hpp"
 #include "decode_psos.hpp"
 #include "decode_step.hpp"
 #include "decode_step_mb.hpp"
@@ -532,6 +533,11 @@ struct MetalExecutor::Impl {
     // requests, each with its own scan length, and the row's argument table is
     // what selects the segment -- so the length has to be per row too.
     std::vector<SlotHandle> prefill_scan_rows_{};
+    // Split-K partials, shared by every projection on that path: each is
+    // serialized behind its own reduce, so one buffer serves all of them.
+    SlotHandle splitk_partial_{};
+    std::vector<SlotHandle> splitk_split_{};
+    std::vector<SlotHandle> splitk_stride_{};
     // A slot whose conv history was last written by the prefill's ping-pong may
     // hold it in ConvStateOut; the paged decode writes in place and always
     // leaves it in ConvState, so only the handover needs a copy.
@@ -787,6 +793,10 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
             static_cast<std::int32_t>(scratch_widest_elems(g_));
     }
     prefill_scan_rows_.clear();
+    // Widest projection row x the widest batch x the largest split.
+    splitk_partial_ = ctx_->create_standalone_buffer(
+        sizeof(std::uint16_t) * std::size_t(pie::metal::kQmmSplitMaxSplits) *
+        std::size_t(kPagedMaxForwardRequests) * std::size_t(pie::metal::kQmmSplitMaxOut));
     if (!ptir_logits_copy_pso_.valid() ||
         !ptir_logits_copy_params_.valid() ||
         !ensure_ptir_logits_rows(1, &load_err)) {
@@ -1141,6 +1151,25 @@ bool MetalExecutor::Impl::bind_paged_dag(std::string* err) {
             // channels -- which saves copying every slot's whole conv slab back
             // on the host after every single token.
             alias_decode_conv_state_out(*ctx_, b_, mb_dag_);
+            // Split-K binds: the partials buffer plus this dispatch's own split
+            // count and slice stride, which depend on its shape.
+            splitk_split_.clear();
+            splitk_stride_.clear();
+            for (const Dispatch& d : mb_dag_) {
+                if (d.qmm_split <= 1 || !splitk_partial_.valid()) continue;
+                SlotHandle sp = ctx_->create_standalone_buffer(sizeof(std::int32_t));
+                SlotHandle st = ctx_->create_standalone_buffer(sizeof(std::int32_t));
+                if (!sp.valid() || !st.valid()) continue;
+                *static_cast<std::int32_t*>(sp.contents()) = d.qmm_split;
+                *static_cast<std::int32_t*>(st.contents()) =
+                    std::int32_t(qmv_out_size(d.kind, g_)) *
+                    std::int32_t(int(d.grid.y / 2u) * d.qmm_bm);
+                ctx_->arg_bind_ordinal(d.ordinal, 8, splitk_partial_);
+                ctx_->arg_bind_ordinal(d.ordinal, 9, sp);
+                ctx_->arg_bind_ordinal(d.ordinal, 10, st);
+                splitk_split_.push_back(sp);
+                splitk_stride_.push_back(st);
+            }
             prefill_scan_rows_.assign(prefill_dags_.size(), SlotHandle{});
             for (size_t t = 0; t < prefill_dags_.size(); ++t) {
                 bind_scratch(*ctx_, prefill_dags_[t], prefill_sched_, pool_.data(),

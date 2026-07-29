@@ -142,6 +142,25 @@ bool load_multibatch_psos(RawMetalContext& ctx,
             }
         }
     }
+    for (int w = 0; w < 2; ++w) {
+        const int bm = w == 0 ? pie::metal::kQmmBM : pie::metal::kQmmBMWide;
+        out.qmm_t_splitk[w] = ctx.compile_pso_from_file(
+            dir + "quantized_qmm_t.metal",
+            "affine_qmm_t_splitk_bfloat16_gs_64_b_4_bm_" + std::to_string(bm) +
+                "_bn_" + std::to_string(pie::metal::kQmmSplitBN));
+        if (!out.qmm_t_splitk[w].valid()) {
+            if (err) *err = "affine_qmm_t_splitk (quantized_qmm_t.metal)";
+            return false;
+        }
+    }
+    out.qmm_splitk_reduce = ctx.compile_pso_from_file(
+        dir + "quantized_qmm_t.metal", "qmm_splitk_reduce_bfloat16");
+    out.qmm_splitk_reduce_residual = ctx.compile_pso_from_file(
+        dir + "quantized_qmm_t.metal", "qmm_splitk_reduce_residual_bfloat16");
+    if (!out.qmm_splitk_reduce.valid() || !out.qmm_splitk_reduce_residual.valid()) {
+        if (err) *err = "qmm_splitk_reduce (quantized_qmm_t.metal)";
+        return false;
+    }
     out.qmm_t_strided = ctx.compile_pso_from_file(
         dir + "quantized_qmm_t.metal",
         "affine_qmm_t_strided_bfloat16_gs_64_b_4_bm_16_bn_32");

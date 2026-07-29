@@ -28,6 +28,11 @@ namespace pie::metal {
 class RawMetalContext;
 struct Dispatch;  // beta: decode_step.hpp
 
+// A projection's in/out vector lengths, from geometry (matches the staged
+// weight shapes).  The split-K rule needs K, not just the output width.
+struct KN { int K, N; };
+KN qmv_kn(Kernel k, const DecodeGeometry& g);
+
 // Allocate + fill + bind every const-param buffer for every dispatch in the DAG, by
 // ordinal. `max_ctx` MUST match the value passed to plan_heap (KV cache stride basis).
 // Returns the number of const slots allocated (for accounting / the heap budget check).

@@ -6,6 +6,7 @@
 #include <stdexcept>
 
 #include "decode_dispatch.hpp"
+#include "decode_consts.hpp"
 #include "decode_dispatch_mb.hpp"
 #include "heap_bind.hpp"
 
@@ -59,7 +60,13 @@ void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
     if (const int out = qmv_out_size(d.kind, g); out != 0) {
         d.qmm_bn = qmm_bn(out, n);
         d.qmm_bm = qmm_bm(n);
-        if (d.qmm_bn > 0)
+        static const bool split_off = std::getenv("PIE_METAL_NO_SPLITK") != nullptr;
+        d.qmm_split = (d.qmm_bn > 0 && !split_off)
+                          ? qmm_split_k(out, n, qmv_kn(d.kind, g).K, d.qmm_bm)
+                          : 1;
+        if (d.qmm_split > 1)
+            qmm_t_splitk_dispatch(out, n, d.qmm_bm, d.qmm_split, d.grid, d.tg);
+        else if (d.qmm_bn > 0)
             qmm_t_dispatch(out, n, d.qmm_bn, d.qmm_bm, d.grid, d.tg);
         else
             qmv_mb_dispatch(out, n, d.grid, d.tg);
@@ -133,9 +140,12 @@ Pso mb_pso(const Dispatch& d, const DecodeStepPsos& base, const MultiBatchPsos& 
         case Kernel::KvAppendPaged: return mb.kv_append_paged;
         case Kernel::SdpaPaged: return mb.sdpa_paged;
         default: {
+            const int wide_ = d.qmm_bm == kQmmBMWide ? 1 : 0;
+            if (d.qmm_split > 1 && mb.qmm_t_splitk[wide_].valid())
+                return mb.qmm_t_splitk[wide_];
             if (d.qmm_bn > 0) {
                 const int slot = d.qmm_bn == 64 ? 2 : (d.qmm_bn == 32 ? 1 : 0);
-                const int wide = d.qmm_bm == kQmmBMWide ? 1 : 0;
+                const int wide = wide_;
                 const Pso& gemm = d.fuse_residual ? mb.qmm_t_residual[wide][slot]
                                                   : mb.qmm_t[wide][slot];
                 if (gemm.valid()) return gemm;
