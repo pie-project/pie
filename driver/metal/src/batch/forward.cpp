@@ -528,6 +528,7 @@ struct MetalExecutor::Impl {
     // The prefill's uniform scratch row pitch, in elements, for the batched
     // projection (`affine_qmm_t_strided` reads it at buffer 8).
     SlotHandle prefill_row_stride_{};
+    SlotHandle prefill_scan_rows_{};
     Pso ptir_logits_copy_pso_{};
     std::uint32_t ptir_logits_capacity_rows_ = 0;
     std::uint32_t ptir_logits_next_row_ = 0;
@@ -774,6 +775,7 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
         *static_cast<std::int32_t*>(prefill_row_stride_.contents()) =
             static_cast<std::int32_t>(scratch_widest_elems(g_));
     }
+    prefill_scan_rows_ = ctx_->create_standalone_buffer(sizeof(std::int32_t));
     if (!ptir_logits_copy_pso_.valid() ||
         !ptir_logits_copy_params_.valid() ||
         !ensure_ptir_logits_rows(1, &load_err)) {
@@ -1132,8 +1134,33 @@ bool MetalExecutor::Impl::bind_paged_dag(std::string* err) {
             // rest of the prompt with this pitch.
             if (prefill_row_stride_.valid() && !prefill_dags_.empty()) {
                 for (const Dispatch& d : prefill_dags_[0]) {
-                    if (qmv_out_size(d.kind, g_) == 0) continue;
-                    ctx_->arg_bind_ordinal(d.ordinal, 8, prefill_row_stride_);
+                    if (qmv_out_size(d.kind, g_) != 0) {
+                        ctx_->arg_bind_ordinal(d.ordinal, 8, prefill_row_stride_);
+                        continue;
+                    }
+                    // The row-blocked elementwise/norm kernels take the same pitch,
+                    // at whichever index follows their own signature.
+                    switch (d.kind) {
+                        case Kernel::Rms:
+                        case Kernel::FfnRms:
+                        case Kernel::FinalRms:
+                        case Kernel::SiluMul:
+                            ctx_->arg_bind_ordinal(d.ordinal, 4, prefill_row_stride_);
+                            break;
+                        case Kernel::GatedRms:
+                            ctx_->arg_bind_ordinal(d.ordinal, 5, prefill_row_stride_);
+                            break;
+                        case Kernel::GdnPrepSlotted:
+                            ctx_->arg_bind_ordinal(d.ordinal, 14, prefill_row_stride_);
+                            ctx_->arg_bind_ordinal(d.ordinal, 15, prefill_scan_rows_);
+                            break;
+                        case Kernel::GdnCoreSlotted:
+                            ctx_->arg_bind_ordinal(d.ordinal, 12, prefill_row_stride_);
+                            ctx_->arg_bind_ordinal(d.ordinal, 13, prefill_scan_rows_);
+                            break;
+                        default:
+                            break;
+                    }
                 }
             }
             mb_bound_ = true;
@@ -1679,6 +1706,20 @@ bool MetalExecutor::Impl::run_prefill_step(
         ++next_step[slot];
     }
 
+    // The GDN scan replaces the per-token chain only when the prompt is one
+    // request's (a shared recurrent slot) and its length is odd -- the conv
+    // ping-pong alternates per token, so an odd count leaves the history in the
+    // buffer token `scan_rows` reads, and an even prompt keeps one trailing
+    // token on the per-token path.
+    int gdn_scan_rows = 0;
+    static const bool gdn_scan_off = std::getenv("PIE_METAL_NO_GDN_SCAN") != nullptr;
+    if (!gdn_scan_off && schedule.R == 1 && prefill_scan_rows_.valid() &&
+        prefill_row_stride_.valid()) {
+        gdn_scan_rows = schedule.N % 2 == 1 ? schedule.N : schedule.N - 1;
+        if (gdn_scan_rows < 3) gdn_scan_rows = 0;
+        *static_cast<std::int32_t*>(prefill_scan_rows_.contents()) =
+            static_cast<std::int32_t>(gdn_scan_rows);
+    }
     // One command buffer, request-major token order.  Every complete layer DAG
     // ends in a barrier, so token t+1 observes token t's GDN and paged KV writes.
     const StepTiming timing = ctx_->run_step([&](StepEncoder& se) {
@@ -1688,7 +1729,7 @@ bool MetalExecutor::Impl::run_prefill_step(
         }
         encode_prefill_dags_mb(se, prefill_dags_, schedule.N, psos_, mb_psos_,
                                force_barriers_, in.row_needs_logits, &g_,
-                               int(prefill_dags_.size()));
+                               int(prefill_dags_.size()), gdn_scan_rows);
         if (ptir != nullptr) {
             for (const auto& callbacks : *ptir)
                 if (callbacks.post_forward) callbacks.post_forward(se);

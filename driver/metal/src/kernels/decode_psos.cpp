@@ -111,6 +111,12 @@ bool load_multibatch_psos(RawMetalContext& ctx,
         {"sdpa_paged.metal",   "sdpa_paged_decode_bfloat16_d_256",        &out.sdpa_paged,      true},
         {"sdpa_paged.metal",   "sdpa_paged_decode_bfloat16_d_512",        &out.sdpa_paged_d512, false},
         {"kv_append_paged.metal", "kv_append_paged_bfloat16",             &out.kv_append_paged, true},
+        {"rms_norm.metal",     "rms_strided_row_bfloat16",   &out.rms_strided,       true},
+        {"silu_mul.metal",     "silu_mul_strided_bfloat16",  &out.silu_mul_strided,  true},
+        {"gated_rms.metal",    "gated_rms_strided_bfloat16", &out.gated_rms_strided, true},
+        {"gdn_prep.metal",     "gdn_prep_prefill_bfloat16",  &out.gdn_prep_prefill,  true},
+        {"gdn_prep.metal",     "gdn_core_recurrent_prefill_bfloat16",
+                                                             &out.gdn_core_prefill,  true},
     };
     for (int i = 0; i < 2; ++i) {
         const int bn = i == 0 ? 32 : 64;

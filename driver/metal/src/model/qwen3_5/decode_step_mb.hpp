@@ -62,7 +62,8 @@ void encode_prefill_dags_mb(StepEncoder& se,
                             bool force_barriers,
                             const std::vector<std::uint8_t>& row_needs_logits = {},
                             const DecodeGeometry* geometry = nullptr,
-                            int max_rows = 0);
+                            int max_rows = 0,
+                            int gdn_scan_rows = 0);
 
 void encode_decode_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
                            const DecodeStepPsos& base_psos, const MultiBatchPsos& mb_psos,

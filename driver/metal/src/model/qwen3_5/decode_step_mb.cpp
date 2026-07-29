@@ -358,7 +358,8 @@ void encode_prefill_dags_mb(StepEncoder& se,
                             bool force_barriers,
                             const std::vector<std::uint8_t>& row_needs_logits,
                             const DecodeGeometry* geometry,
-                            int max_rows) {
+                            int max_rows,
+                            int gdn_scan_rows) {
     const size_t n = n_tokens > 0 ? size_t(n_tokens) : 0;
     if (n == 0 || dags.size() < n) return;
     const size_t length = dags[0].size();
@@ -404,9 +405,77 @@ void encode_prefill_dags_mb(StepEncoder& se,
                 }
             }
         }
+        // Row-independent kernels: the prefill's scratch rows are a uniform pitch
+        // apart, so one dispatch over the whole prompt replaces one per token.
+        // The row-blocked variants take that pitch explicitly and are otherwise
+        // byte-for-byte the same arithmetic.
+        {
+            Pso strided{};
+            Grid grid = d0.grid;
+            switch (d0.kind) {
+                case Kernel::Rms:
+                case Kernel::FfnRms:
+                case Kernel::FinalRms:
+                    // One threadgroup per row only; the per-head norms (q/k) stack
+                    // several rows inside one dispatch and do not have a uniform pitch.
+                    if (d0.grid.x == d0.tg.x && d0.grid.y == 1 && d0.grid.z == 1) {
+                        strided = mb_psos.rms_strided;
+                        grid.x = d0.grid.x * uint32_t(n);
+                    }
+                    break;
+                case Kernel::SiluMul:
+                    if (d0.grid.y == 1 && d0.grid.z == 1) {
+                        strided = mb_psos.silu_mul_strided;
+                        grid.y = uint32_t(n);
+                    }
+                    break;
+                case Kernel::GatedRms:
+                    if (d0.grid.z == 1) {
+                        strided = mb_psos.gated_rms_strided;
+                        grid.z = uint32_t(n);
+                    }
+                    break;
+                default:
+                    break;
+            }
+            if (strided.valid()) {
+                se.set_pso(strided);
+                se.set_argtable(d0.kind, d0.ordinal);
+                se.dispatch(grid, d0.tg);
+                se.barrier();
+                continue;
+            }
+        }
         const bool serialize = carries_cross_token_state(dags[0][i].kind);
+        // The GDN pair is the prefill's only strict chain -- a barrier per token,
+        // 34 of them per layer.  When the caller says the prompt is one request's
+        // and hands us an even scan length (so the ping-pong lands where the
+        // trailing per-token dispatch expects it), the whole prompt goes through
+        // in one dispatch each: prep is token-parallel once its conv window comes
+        // off `mixed`, and the recurrent scan runs in registers.
+        size_t first_serial = 0;
+        if (serialize && gdn_scan_rows > 1) {
+            const Pso& scan = dags[0][i].kind == Kernel::GdnPrepSlotted
+                                  ? mb_psos.gdn_prep_prefill
+                                  : mb_psos.gdn_core_prefill;
+            if (scan.valid()) {
+                Grid grid = dags[0][i].grid;
+                if (dags[0][i].kind == Kernel::GdnPrepSlotted) {
+                    grid.z = dags[0][i].grid.z * uint32_t(gdn_scan_rows);
+                } else {
+                    // (dk, dv, hv): the token dimension moves into the kernel.
+                    grid.z = dags[0][i].grid.z;
+                }
+                se.set_pso(scan);
+                se.set_argtable(dags[0][i].kind, dags[0][i].ordinal);
+                se.dispatch(grid, dags[0][i].tg);
+                se.barrier();
+                first_serial = size_t(gdn_scan_rows);
+            }
+        }
         const bool logits_tail = skip_unsampled_logits && produces_logits(dags[0][i].kind);
-        for (size_t t = 0; t < n; ++t) {
+        const size_t rows = n;
+        for (size_t t = first_serial; t < rows; ++t) {
             if (logits_tail && row_needs_logits[t] == 0) continue;
             const Dispatch& d = dags[t][i];
             if (d.kind != dags[0][i].kind) {
@@ -417,7 +486,7 @@ void encode_prefill_dags_mb(StepEncoder& se,
             se.set_pso(mb_pso(d, base_psos, mb_psos));
             se.set_argtable(d.kind, d.ordinal);
             se.dispatch(d.grid, d.tg);
-            if (serialize && t + 1 < n) se.barrier();
+            if (serialize && t + 1 < rows) se.barrier();
         }
         se.barrier();
     }

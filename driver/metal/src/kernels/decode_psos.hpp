@@ -52,6 +52,17 @@ struct MultiBatchPsos {
     // rather than packed at `K`.
     Pso qmm_t_strided{};
     Pso qmm_t_strided_residual{};
+    // Row-independent prefill kernels with an explicit row pitch, so a whole
+    // prompt runs as one dispatch instead of one per token.  Same arithmetic as
+    // the M=1 kernels beside them -- only the row's base address is computed
+    // from the prefill layout's uniform pitch.
+    Pso rms_strided{};
+    Pso silu_mul_strided{};
+    Pso gated_rms_strided{};
+    // GDN over a whole prompt in one dispatch (prep is token-parallel, the
+    // recurrent scan runs in registers) instead of one serialized pair per token.
+    Pso gdn_prep_prefill{};
+    Pso gdn_core_prefill{};
     bool valid() const {
         return embed_mb.valid() && rope_mb.valid() && gdn_slotted.valid() &&
                gdn_prep_slotted.valid() &&
