@@ -42,6 +42,14 @@ jobs:
               ;;
           esac
       
+      # The generated bindings under src/bindings/interfaces are not checked by
+      # `npm run build`, and this package has no test step, so an interface the
+      # runtime no longer offers would publish silently. See
+      # forward_refactor.md 10.4.
+      - name: Check SDK targets a live WIT surface
+        if: steps.info.outputs.path == 'sdk/javascript'
+        run: scripts/check-sdk-interfaces.sh
+
       - name: Install dependencies
         working-directory: ${{ steps.info.outputs.path }}
         run: npm ci

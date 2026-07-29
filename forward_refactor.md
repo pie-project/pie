@@ -1070,11 +1070,51 @@ same two-fire shape.
 
 ### 10.4 E — Python / JavaScript SDKs
 
-Larger than §7 implies. Both target an older `pie:core/inference` surface
-(`imports/inference.py`, `pie-core-inference.d.ts`) rather than
-`pie:inferlet/forward`, and neither is in the `scripts/sync-wit.sh` set, so
-they did not break with B and will not track future WIT changes automatically.
-Bringing them onto the current surface is a port, not a rename.
+Larger than §7 implies, and larger than "a port" implies either. Three
+compounding facts, in increasing order of severity:
+
+1. **The interface they target no longer exists.** Not "is older" — `pie:core/
+   inference` is gone from the tree; there is no `inference.wit` anywhere, and
+   `world.wit` imports `forward` / `forward-recurrent` / `forward-hybrid`
+   instead. `sdk/python/.../forward.py:22` still does
+   `from wit_world.imports import inference as _inf`, and the JS side still
+   ships `bindings/interfaces/pie-core-inference.d.ts`.
+
+2. **The programming model changed, not just the names.** The current surface
+   is PTIR: channels, traced stage closures, epilogues, per-architecture state
+   bindings. The Rust SDK needs ~1950 lines of `ptir.rs` to express it. There
+   is no mapping from `_inf.forward(...)` onto that — the Python and JS layers
+   (`forward.py` 413 ln, `context.py` 441 ln, `generation.py` 590 ln, plus the
+   generated bindings) have to be rewritten against a different shape, and the
+   epilogue eDSL has no Python/JS equivalent at all today.
+
+3. **Nothing would have told us.** Neither SDK is in `scripts/sync-wit.sh`, so
+   they do not track WIT drift; and neither appears in any CI workflow — the
+   only references are `release-pypi.yml` and `release-npm.yml`, which are
+   manually triggered publishes. So these packages can be RELEASED in their
+   current state, against an interface that does not exist. That is the part
+   worth fixing first, and it is independent of the port: either gate the
+   release workflows on a build, or mark the packages unsupported until the
+   port lands.
+
+Sequencing: (3) is a small, standalone change and should not wait for (1)/(2),
+so it is DONE. `scripts/check-sdk-interfaces.sh` resolves the interface names
+each SDK references against `interface/inferlet/`, and both release workflows
+run it for their SDK package. It needs no componentize-py or jco — just the
+names, which is what actually drifted. It currently fails, correctly:
+
+- Python references `adapter`, `inference`, `runtime`, `tool-use`, `zo`.
+- Every JavaScript binding is `pie-core-*` / `pie-instruct-*` / `pie-zo-*`; the
+  only pie package that exists is `pie:inferlet`. For JS the PACKAGE is the
+  sharper signal — bindings whose interface name happens to have survived the
+  move (`model`, `session`, `chat`, ...) are just as unreachable as
+  `inference`.
+
+It is deliberately NOT in `ci.yml`: the breakage predates this work, and
+red-lighting all of CI for it would be someone else's emergency. Gating the
+publishes stops it from reaching users, which is the actual harm.
+
+The port itself is its own project and should not be smuggled into this one.
 
 ### 10.5 D — per-stage PTIR containers  *(separate PR)*
 
