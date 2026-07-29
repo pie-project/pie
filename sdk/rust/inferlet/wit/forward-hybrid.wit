@@ -74,10 +74,15 @@ interface forward-hybrid {
     /// it absorbs will never be modified again. Only the guest knows that,
     /// which is why this is an API rather than a runtime heuristic.
     ///
-    /// Every buffer channel value is a WorkingSet-relative buffer page index;
-    /// the runtime translates them to physical slots and lowers them as the
-    /// `rs_buffer_slot_ids` / `rs_buffer_slot_indptr` wire fields. The FOLDED
-    /// state slot is not named here -- it comes from the working-set handle.
+    /// The guest states POSITIONS; the runtime derives ADDRESSES. Where each
+    /// token's activations land, which pages a row occupies, how many tokens
+    /// are live, and how far back a replay reaches are all functions of the
+    /// store's own occupancy, which the runtime is authoritative for -- so
+    /// they are not on this record. They used to be, and the runtime computed
+    /// them anyway and refused any fire whose copy disagreed: six channels of
+    /// page arithmetic with exactly one satisfying assignment. The FOLDED
+    /// state slot is likewise not named here -- it comes from the working-set
+    /// handle.
     ///
     /// This rides on the STATE BINDING, not on a fold-mode method: once the
     /// buffer is understood as half the state, its addressing is an input to
@@ -113,21 +118,25 @@ interface forward-hybrid {
         /// the commit fuse into one fire, instead of the guest round-tripping
         /// the count through the host first. `kv-len` is already permitted to
         /// be device-resident in exactly this way.
-        fold-len:        borrow<channel>,
-        /// Buffer page range the replay may read.
-        readable-buffer: page-span,
-        /// Buffer page range an append may target.
-        writable-buffer: page-span,
-        /// Live buffered token count per request.
-        buffer-len:      borrow<channel>,
-        /// CSR values -- buffer page ids, densely packed per request.
-        buffer-pages:    borrow<channel>,
-        /// CSR row bounds, one entry per request plus one.
-        buffer-indptr:   borrow<channel>,
-        /// Buffer page each token of this fire writes into.
-        w-slot:          borrow<channel>,
-        /// Offset within that page.
-        w-off:           borrow<channel>,
+        fold-len: borrow<channel>,
+        /// How many buffer pages this fire may occupy, per request.
+        ///
+        /// A CAPACITY GRANT, not an address. Allocation is the one buffer
+        /// decision the guest still owns -- a fire that needs a page it was
+        /// not granted must fail rather than have the runtime quietly find
+        /// one -- so it stays on the API. WHERE within the grant each token
+        /// lands is not a decision at all: new tokens append at the buffer
+        /// tail, and the runtime is the only party that knows where the tail
+        /// is.
+        ///
+        /// There is deliberately no `readable` / `writable` split. Reading and
+        /// writing the buffer really are different intents -- a write may
+        /// allocate, a read must not, and a read of a merely-reserved page
+        /// would gather uninitialized activations straight into the recurrence
+        /// -- but that distinction is enforced by the store's own write
+        /// targets, not by anything the guest can say. Two spans only let the
+        /// guest state it twice, inconsistently.
+        buffer:   page-span,
     }
 
     /// Groups the KV half so it can be made optional AS A UNIT. Without this

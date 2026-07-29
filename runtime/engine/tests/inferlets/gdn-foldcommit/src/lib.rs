@@ -110,25 +110,10 @@ impl Arm {
         )?;
         match buffered {
             None => fwd.recurrent(std::slice::from_ref(&self.rs))?,
-            Some((start, fold_len)) => {
-                let rp = self.rs_page;
-                // The write span is [start, start + t) in LOGICAL buffer
-                // tokens; the runtime resolves it against the physical head.
-                let first = start / rp;
-                let last = (start + t - 1) / rp;
-                let pages: Vec<u32> = (first..=last).collect();
-                let count = pages.len() as u32;
-                fwd.recurrent_with(
-                    std::slice::from_ref(&self.rs),
-                    &ch(vec![fold_len]),
-                    ..,
-                    ..,
-                    &ch(vec![t]),
-                    &ch(pages),
-                    &ch(vec![0, count]),
-                    &ch((start..start + t).map(|x| x / rp - first).collect()),
-                    &ch((start..start + t).map(|x| x % rp).collect()),
-                )
+            Some((_start, fold_len)) => {
+                // Where the tokens land in the buffer is not stated: new
+                // tokens append at the tail, which only the runtime knows.
+                fwd.recurrent_with(std::slice::from_ref(&self.rs), &ch(vec![fold_len]), ..)
                 .map_err(|e| format!("{tag} recurrent binding: {e}"))?;
             }
         }
@@ -291,17 +276,7 @@ impl Duo {
                     }
                 }
             }
-            fwd.recurrent_with(
-                &self.rs,
-                &ch(fold_len),
-                ..,
-                ..,
-                &ch(buffer_len),
-                &Channel::from(buffer_pages),
-                &Channel::from(buffer_indptr),
-                &Channel::from(w_slot),
-                &Channel::from(w_off),
-            )
+            fwd.recurrent_with(&self.rs, &ch(fold_len), ..)
             .map_err(|e| format!("{tag} recurrent binding: {e}"))?;
         }
 
@@ -640,29 +615,9 @@ async fn main(input: String) -> Result<String> {
     // page-major from slab zero. `fold_len = 0` holds the folded boundary
     // still, so nothing here is committed -- that is what makes this fire
     // abandonable.
-    let rs_page = inferlet::model::rs_buffer_page_size().max(1);
-    let rs_pages = SPEC_TOKENS.div_ceil(rs_page);
-    let spec_rs_len = Channel::from(vec![SPEC_TOKENS]).named("spec_rs_len");
-    let spec_rs_pages = Channel::from((0..rs_pages).collect::<Vec<_>>()).named("spec_rs_pages");
-    let spec_rs_indptr = Channel::from(vec![0u32, rs_pages]).named("spec_rs_indptr");
-    let spec_rs_w_slot =
-        Channel::from((0..SPEC_TOKENS).map(|t| t / rs_page).collect::<Vec<_>>())
-            .named("spec_rs_w_slot");
-    let spec_rs_w_off = Channel::from((0..SPEC_TOKENS).map(|t| t % rs_page).collect::<Vec<_>>())
-        .named("spec_rs_w_off");
     let spec_fold_len = Channel::from(vec![0u32]).named("spec_fold_len");
     fwd_s
-        .recurrent_with(
-            std::slice::from_ref(&rs),
-            &spec_fold_len,
-            ..,
-            ..,
-            &spec_rs_len,
-            &spec_rs_pages,
-            &spec_rs_indptr,
-            &spec_rs_w_slot,
-            &spec_rs_w_off,
-        )
+        .recurrent_with(std::slice::from_ref(&rs), &spec_fold_len, ..)
         .map_err(|e| format!("speculative recurrent binding: {e}"))?;
     fwd_s.epilogue(move || {
         let t = reduce_argmax(intrinsics::logits());
@@ -714,33 +669,12 @@ async fn main(input: String) -> Result<String> {
             &commit_positions,
             None,
         )?;
-        // The commit replays `accepted` buffered tokens, so it reads exactly
-        // the span the speculate fire wrote.
-        let commit_rs_pages_n = accepted.div_ceil(rs_page);
-        let commit_rs_len = Channel::from(vec![accepted]).named("commit_rs_len");
-        let commit_rs_pages =
-            Channel::from((0..commit_rs_pages_n).collect::<Vec<_>>()).named("commit_rs_pages");
-        let commit_rs_indptr =
-            Channel::from(vec![0u32, commit_rs_pages_n]).named("commit_rs_indptr");
-        let commit_rs_w_slot =
-            Channel::from((0..accepted).map(|t| t / rs_page).collect::<Vec<_>>())
-                .named("commit_rs_w_slot");
-        let commit_rs_w_off =
-            Channel::from((0..accepted).map(|t| t % rs_page).collect::<Vec<_>>())
-                .named("commit_rs_w_off");
+        // The commit replays `accepted` buffered tokens. WHICH tokens is not
+        // stated: the replay reaches back over the row's own occupancy, which
+        // the runtime tracks.
         let commit_fold_len = Channel::from(vec![accepted]).named("commit_fold_len");
         fwd_c
-            .recurrent_with(
-                std::slice::from_ref(&rs),
-                &commit_fold_len,
-                ..,
-                ..,
-                &commit_rs_len,
-                &commit_rs_pages,
-                &commit_rs_indptr,
-                &commit_rs_w_slot,
-                &commit_rs_w_off,
-            )
+            .recurrent_with(std::slice::from_ref(&rs), &commit_fold_len, ..)
             .map_err(|e| format!("commit recurrent binding: {e}"))?;
         // An EMPTY epilogue, not an absent one. The commit samples nothing —
         // it replays buffered activations and stops at the recurrence — but a
@@ -767,7 +701,6 @@ async fn main(input: String) -> Result<String> {
     // the harness flips from asserting the refusal to asserting the value.
     let mut chained = "n/a";
     if chain {
-        let tail = SPEC_TOKENS - committed;
         let base = n + SPEC_TOKENS;
         let c2_toks = Channel::from(vec![drafted; SPEC_TOKENS as usize]).named("c2_toks");
         let c2_indptr = Channel::from(vec![0u32, SPEC_TOKENS]).named("c2_indptr");
@@ -805,38 +738,12 @@ async fn main(input: String) -> Result<String> {
             &c2_positions,
             None,
         )?;
-        // The new chunk starts at buffer token `tail`, immediately after what
-        // the commit left unfolded — that offset is exactly what makes this the
-        // read path rather than a fresh chunk.
-        let c2_rs_pages = (tail + SPEC_TOKENS).div_ceil(rs_page);
-        let c2_rs_len = Channel::from(vec![SPEC_TOKENS]).named("c2_rs_len");
-        let c2_rs_pages_ch =
-            Channel::from((0..c2_rs_pages).collect::<Vec<_>>()).named("c2_rs_pages");
-        let c2_rs_indptr = Channel::from(vec![0u32, c2_rs_pages]).named("c2_rs_indptr");
-        let c2_rs_w_slot = Channel::from(
-            (tail..tail + SPEC_TOKENS)
-                .map(|t| t / rs_page)
-                .collect::<Vec<_>>(),
-        )
-        .named("c2_rs_w_slot");
-        let c2_rs_w_off = Channel::from(
-            (tail..tail + SPEC_TOKENS)
-                .map(|t| t % rs_page)
-                .collect::<Vec<_>>(),
-        )
-        .named("c2_rs_w_off");
+        // The new chunk lands at buffer token `tail`, immediately after what
+        // the commit left unfolded — which is what makes this the read path
+        // rather than a fresh chunk. The guest does not say so; the runtime
+        // appends at the tail because there is nowhere else to append.
         let c2_fold_len = Channel::from(vec![0u32]).named("c2_fold_len");
-        fwd2.recurrent_with(
-            std::slice::from_ref(&rs),
-            &c2_fold_len,
-            ..,
-            ..,
-            &c2_rs_len,
-            &c2_rs_pages_ch,
-            &c2_rs_indptr,
-            &c2_rs_w_slot,
-            &c2_rs_w_off,
-        )
+        fwd2.recurrent_with(std::slice::from_ref(&rs), &c2_fold_len, ..)
         .map_err(|e| format!("chain recurrent binding: {e}"))?;
         fwd2.epilogue(move || {
             let t = reduce_argmax(intrinsics::logits());

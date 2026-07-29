@@ -92,13 +92,22 @@ crate::declare_tagged_enum! {
         WOff = 7, "w_off";
         Readout = 8, "readout";
         AttnMask = 9, "attn_mask";
-        // ── Recurrent-state buffered-slot family (wire-additive: tags 0-9 are
-        // unmoved, so a pure-attention guest's container is byte-identical).
-        // The device-resolved counterpart of the host's `RsStore`-derived
-        // `rs_buffer_slot_ids` / `rs_buffer_slot_indptr` lowering: a hybrid or
-        // recurrent pass that traces its own buffered geometry in-graph binds
-        // these instead, and the driver resolves them pre-forward exactly like
-        // the KV family.
+        // ── Recurrent-state buffered-slot family. Wire-additive: tags 0-9 are
+        // unmoved, so a pure-attention guest's container is byte-identical.
+        //
+        // NO GUEST BINDS THESE ANY MORE. `rs-geometry` used to carry the
+        // buffer's addressing, and the runtime derived the same values from
+        // the `RsStore` it is authoritative for and refused any fire whose
+        // guest copy disagreed — five channels of page arithmetic with one
+        // satisfying assignment. The tags are RESERVED rather than reclaimed:
+        // renumbering would silently change the meaning of already-compiled
+        // containers, which is a far worse trade than five unused names.
+        //
+        // `RsBufferLen` is the exception, and its direction is INVERTING. The
+        // live buffered token count is exactly the quantity t15 makes
+        // device-resident, so it comes back not as something the guest states
+        // but as something the device writes and the host reads as an upper
+        // bound. `FireGeometry::rs_buffer_lens` is already staged for it.
         RsBufferPages = 10, "rs_buffer_pages";
         RsBufferIndptr = 11, "rs_buffer_indptr";
         RsBufferLen = 12, "rs_buffer_len";

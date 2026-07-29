@@ -166,21 +166,6 @@ fn bind_window(
     )
 }
 
-/// The five `rs-geometry` buffer-addressing channels for a span of `count`
-/// buffered tokens starting at buffer token 0, on one request row.
-fn rs_span(rs_page: u32, count: u32, tag: &str) -> (Channel, Channel, Channel, Channel, Channel) {
-    let pages_n = count.div_ceil(rs_page);
-    (
-        Channel::from(vec![count]).named(&format!("{tag}_rs_len")),
-        Channel::from((0..pages_n).collect::<Vec<_>>()).named(&format!("{tag}_rs_pages")),
-        Channel::from(vec![0u32, pages_n]).named(&format!("{tag}_rs_indptr")),
-        Channel::from((0..count).map(|t| t / rs_page).collect::<Vec<_>>())
-            .named(&format!("{tag}_rs_w_slot")),
-        Channel::from((0..count).map(|t| t % rs_page).collect::<Vec<_>>())
-            .named(&format!("{tag}_rs_w_off")),
-    )
-}
-
 /// Bootstrap fire over `prompt + (k-1)` fillers: yields the seed (row-0 target
 /// argmax at the prompt's REAL last position) + the first REAL `[k]` drafts
 /// (native MTP argmax) for window 1. No verify (nothing to verify yet).
@@ -241,7 +226,6 @@ async fn verify_window(
     rs: &RsWorkingSet,
     pipeline: &Pipeline,
     k: u32,
-    rs_page: u32,
     seed: i32,
     draft: &[i32],
     seq_len: u32,
@@ -267,19 +251,8 @@ async fn verify_window(
     // slots to discard. So the window's pre-recurrence activations are parked
     // in the buffer with the folded boundary held still, and the NEXT fire
     // moves it through exactly the accepted prefix.
-    let (rs_len, rs_pages, rs_indptr, rs_w_slot, rs_w_off) = rs_span(rs_page, kp1, "v");
     let fold_len = Channel::from(vec![0u32]).named("v_fold_len");
-    fwd.recurrent_with(
-        std::slice::from_ref(rs),
-        &fold_len,
-        ..,
-        ..,
-        &rs_len,
-        &rs_pages,
-        &rs_indptr,
-        &rs_w_slot,
-        &rs_w_off,
-    )
+    fwd.recurrent_with(std::slice::from_ref(rs), &fold_len, ..)
     .map_err(|e| format!("verify recurrent binding: {e}"))?;
     fwd.epilogue(move || {
         // Device-alias read: peek the embedded window (NOT a resubmitted draft
@@ -335,7 +308,6 @@ async fn commit_window(
     ws: &WorkingSet,
     rs: &RsWorkingSet,
     pipeline: &Pipeline,
-    rs_page: u32,
     window_prefix: &[i32],
     seq_len: u32,
     max_pages: u32,
@@ -350,19 +322,8 @@ async fn commit_window(
     let kv_len = Channel::from(vec![seq_len + clen]).named("c_kv_len");
     bind_window(&fwd, ws, &toks, &kv_len, seq_len, clen, max_pages, &[])?;
 
-    let (rs_len, rs_pages, rs_indptr, rs_w_slot, rs_w_off) = rs_span(rs_page, clen, "c");
     let fold_len = Channel::from(vec![clen]).named("c_fold_len");
-    fwd.recurrent_with(
-        std::slice::from_ref(rs),
-        &fold_len,
-        ..,
-        ..,
-        &rs_len,
-        &rs_pages,
-        &rs_indptr,
-        &rs_w_slot,
-        &rs_w_off,
-    )
+    fwd.recurrent_with(std::slice::from_ref(rs), &fold_len, ..)
     .map_err(|e| format!("commit recurrent binding: {e}"))?;
     // A stage-less pass has no PTIR program to register at all, which the
     // driver rejects. An EMPTY epilogue is the minimal well-formed program: it
@@ -429,7 +390,7 @@ async fn main(input: String) -> Result<String> {
             .map_err(|e| format!("rs.alloc_buffer: {e}"))?;
 
         let (commit, drafts) = verify_window(
-            &ws, &rs, &pipeline, k, rs_page, seed, &draft, seq_len, max_pages,
+            &ws, &rs, &pipeline, k, seed, &draft, seq_len, max_pages,
         )
         .await?;
         let clen = committed_len(&commit); // n_acc accepted + 1 bonus (≥ 1)
@@ -451,7 +412,7 @@ async fn main(input: String) -> Result<String> {
             .chain(draft.iter().copied())
             .take(clen)
             .collect();
-        commit_window(&ws, &rs, &pipeline, rs_page, &window_prefix, seq_len, max_pages).await?;
+        commit_window(&ws, &rs, &pipeline, &window_prefix, seq_len, max_pages).await?;
         let remaining = rs.buffer_size();
         if remaining > 0 {
             rs.free_buffer(&(0..remaining).collect::<Vec<_>>())

@@ -207,14 +207,18 @@ pub struct ForwardBindings {
     pub rs_fold_len: Vec<u32>,
 }
 
-/// Where a fire's recurrent state lives and where its folded boundary lands —
-/// the host mirror of WIT `rs-geometry`. Each field is a channel resource rep
-/// that lowers to the matching `Port::Rs*` descriptor port (registry tags
-/// 10-14).
+/// Where a fire's folded boundary lands — the host mirror of WIT
+/// `rs-geometry`. Absent only when no recurrent state is bound.
 ///
 /// Bound together WITH the working sets, not with a fold-mode method: the
-/// buffer is half the state representation, so its addressing is an input to
-/// the recurrence on every fire. Absent only when no recurrent state is bound.
+/// buffer is half the state representation, so where its boundary falls is an
+/// input to the recurrence on every fire.
+///
+/// This used to carry six more channels of buffer ADDRESSING. They are gone:
+/// the runtime derives every one of them from the store it is already
+/// authoritative for, and did so even while the guest was sending its own
+/// copy — which the driver then checked and refused on disagreement. Registry
+/// tags 10-14 stay RESERVED so already-compiled containers keep their meaning.
 #[derive(Clone, Copy, Debug)]
 pub struct RsGeometryBinding {
     /// How far the folded boundary advances, per request, counted over
@@ -223,13 +227,12 @@ pub struct RsGeometryBinding {
     /// [`ForwardBindings::rs_fold_len`] because the mapping onto a per-row plan
     /// also needs the fire's token counts, which arrive later.
     pub fold_len: u32,
-    pub readable: KvPageSpan,
-    pub writable: KvPageSpan,
-    pub buffer_len: u32,
-    pub buffer_pages: u32,
-    pub buffer_indptr: u32,
-    pub w_slot: u32,
-    pub w_off: u32,
+    /// Capacity grant: how many buffer pages this fire may occupy. The only
+    /// buffer decision left to the guest, because allocation must fail loudly
+    /// rather than be found quietly. Everything else the buffer needs — the
+    /// pages a row holds, the tail each token appends at, how far a replay
+    /// reaches — is derived from the store's own occupancy.
+    pub buffer: KvPageSpan,
 }
 
 #[derive(Clone, Copy)]

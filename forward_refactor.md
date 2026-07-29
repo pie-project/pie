@@ -1342,6 +1342,82 @@ reference row-wise. Two things make it non-vacuous:
   report the FOLDING reference's value (16.50 instead of 14.19), so the test
   observes the mask and not merely that the fire ran.
 
+### 10.2.6 `rs-geometry` rebalanced — the guest states positions, the runtime derives addresses — LANDED
+
+`rs-geometry` had eight fields. Exactly ONE of them, `fold-len`, was a guest
+decision. The other seven were buffer ADDRESSING, and the runtime computed
+every one of them itself, from a store it is authoritative for, while the guest
+was busy computing the same values and shipping them across the wire. Four
+sites, all verified by reading before changing anything:
+
+- `fire.rs:451` classifies rows from `store.buffer_tokens()`. The guest's
+  `buffer-len` never reached the classifier.
+- `rs.rs:411` builds the wire write CSR from `prepared.buffer_targets()` — the
+  store's own allocation — not from the guest's `buffer-pages` / `indptr`.
+- `rs.rs:432` rebuilds the read span from `store.buffer_head` plus the plan's
+  start, under a comment that says outright it is doing so "rather than the
+  mapping the guest saw".
+- `batch_compose.hpp:731` does not USE `rs_w_slot` / `rs_w_off`. It checks that
+  they describe the one contiguous page-major layout the recurrence scatters
+  into, and REFUSES the fire if they do not.
+
+So the guest's page arithmetic was a proof obligation with exactly one
+satisfying assignment: get it right and nothing happens, get it wrong and the
+fire is refused. `readable-buffer` and `writable-buffer` did not even reach
+that bar — they were parsed into `RsGeometryBinding` and never read at all.
+
+```wit
+record rs-geometry {
+    fold-len: borrow<channel>,   // the one decision: where the boundary lands
+    buffer:   page-span,         // capacity grant, not an address
+}
+```
+
+**Allocation stays on the API, addressing does not.** The distinction is
+whether a wrong answer should FAIL or be FOUND. A fire that needs a buffer page
+it was not granted must fail loudly, so the grant is guest-stated. Where within
+that grant a token lands is not a decision at all — new tokens append at the
+tail, and the runtime is the only party that knows where the tail is. Calling
+this a rebalance rather than a simplification is the point: nothing moved to a
+heuristic, because there was never a choice on that side to make.
+
+**This is the same collapse §10.2 already performed on the other half.**
+`fold` / `buffer` / `fold-buffered` were three values of one scalar and became
+`fold-len`, a number over positions. The addressing half simply never got the
+same treatment.
+
+**It is a PREREQUISITE for §11.4 (`t15`), not a detour.** The guest derived
+`w-slot` / `w-off` from a host-side `start`. t15's whole thesis is that the
+host keeps only an UPPER BOUND on the folded boundary, which makes `start`
+unknowable at trace time — so under the old record t15 was implementable only
+if the guest stated a position it could not know. The record had to shrink
+before the boundary could move.
+
+**Cost.** Not one wire field changed: the runtime already derived what the
+guest was sending, so the driver and the ABI are untouched. Registry tags 10-14
+are RESERVED rather than reclaimed — renumbering would silently change the
+meaning of already-compiled containers, a far worse trade than five unused
+names. `RsBufferLen` is the exception and its DIRECTION inverts: the live
+buffered token count is exactly what t15 makes device-resident, so it returns
+not as something the guest states but as something the device writes and the
+host reads as a bound. `FireGeometry::rs_buffer_lens` is already staged for it.
+
+**What became inexpressible, honestly.** Per-token buffered-activation
+targeting (already refused by the driver as "not implemented"), non-tail
+placement (already closed by §11 as "expressible and wrong"), and a guest
+under-reporting its own buffer occupancy (never consulted). The one real loss
+is narrowing a replay to less than the row's occupancy — a partial or selective
+fold. That is a meaningful algorithm, but it was never reachable through these
+fields either, and when it arrives it should arrive as a SEMANTIC field beside
+`fold-len` saying which tokens the fold absorbs, not as a page span that makes
+the guest reconstruct the runtime's physical layout again.
+
+**The guest code is the evidence.** Deleting the fields made `rs_page` — the
+buffer page size — fall out of both test inferlets everywhere EXCEPT the
+`alloc_buffer` / reserve calls. The only thing an author still needs the
+physical page geometry for is the capacity grant, which is precisely the one
+decision the record kept.
+
 ### 10.3 `mtp-native-verify` rewritten as fold-commit — LANDED
 
 The Tier-1.5 acceptance test was broken in two independent ways, both of which

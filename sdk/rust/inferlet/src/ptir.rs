@@ -686,19 +686,11 @@ struct KvBind {
 /// A recorded `rs-geometry`: where the bound recurrent state lives for this
 /// fire and where its folded boundary lands.
 struct RsGeometryBind {
-    /// The five buffer-addressing channels as PTIR descriptor ports, or `None`
-    /// for the synthesized fold-everything geometry. A pass always binds
-    /// `rs-geometry`, but claiming ports for a buffer it never touches would
-    /// put five dead ports in every plain recurrent trace.
-    ports: Option<[(Port, Channel); 5]>,
     fold_len: Rc<wit_channel::Channel>,
-    readable: PageDeclaration,
-    writable: PageDeclaration,
-    buffer_len: Rc<wit_channel::Channel>,
-    buffer_pages: Rc<wit_channel::Channel>,
-    buffer_indptr: Rc<wit_channel::Channel>,
-    w_slot: Rc<wit_channel::Channel>,
-    w_off: Rc<wit_channel::Channel>,
+    /// Capacity grant, not an address. The buffer's addressing is derived by
+    /// the runtime from its own occupancy; a guest copy of it could only
+    /// agree or be refused.
+    buffer: PageDeclaration,
 }
 
 #[derive(Clone, Copy)]
@@ -924,11 +916,6 @@ impl PassCore {
         }
         let mut inner = self.inner.borrow_mut();
         inner.rs_working_sets = working_sets.iter().map(|rs| rs.rs.clone()).collect();
-        if let Some(ports) = geom.ports {
-            for (port, channel) in ports {
-                inner.ports.push((port, claim_port(port, &channel)));
-            }
-        }
         inner.rs_bind = Some(geom);
         Ok(())
     }
@@ -1605,33 +1592,16 @@ pub mod recurrent {
         /// and the semantics are identical.
         ///
         /// [`hybrid::ForwardPass::recurrent_with`]: crate::ptir::hybrid::ForwardPass::recurrent_with
-        #[allow(clippy::too_many_arguments)]
-        pub fn attention_with<R, W>(
+        pub fn attention_with<B>(
             &self,
             working_sets: &[RsWorkingSet],
             fold_len: &Channel,
-            readable: R,
-            writable: W,
-            buffer_len: &Channel,
-            buffer_pages: &Channel,
-            buffer_indptr: &Channel,
-            w_slot: &Channel,
-            w_off: &Channel,
+            buffer: B,
         ) -> Result<(), String>
         where
-            R: RangeBounds<u32>,
-            W: RangeBounds<u32>,
+            B: RangeBounds<u32>,
         {
-            let geom = rs_geometry_bind(
-                fold_len,
-                readable,
-                writable,
-                buffer_len,
-                buffer_pages,
-                buffer_indptr,
-                w_slot,
-                w_off,
-            )?;
+            let geom = rs_geometry_bind(fold_len, buffer)?;
             self.0.bind_recurrent(working_sets, geom)
         }
     }
@@ -1719,33 +1689,16 @@ pub mod hybrid {
         /// one fire.
         ///
         /// [`recurrent`]: ForwardPass::recurrent
-        #[allow(clippy::too_many_arguments)]
-        pub fn recurrent_with<R, W>(
+        pub fn recurrent_with<B>(
             &self,
             working_sets: &[RsWorkingSet],
             fold_len: &Channel,
-            readable: R,
-            writable: W,
-            buffer_len: &Channel,
-            buffer_pages: &Channel,
-            buffer_indptr: &Channel,
-            w_slot: &Channel,
-            w_off: &Channel,
+            buffer: B,
         ) -> Result<(), String>
         where
-            R: RangeBounds<u32>,
-            W: RangeBounds<u32>,
+            B: RangeBounds<u32>,
         {
-            let geom = rs_geometry_bind(
-                fold_len,
-                readable,
-                writable,
-                buffer_len,
-                buffer_pages,
-                buffer_indptr,
-                w_slot,
-                w_off,
-            )?;
+            let geom = rs_geometry_bind(fold_len, buffer)?;
             self.0.bind_recurrent(working_sets, geom)
         }
     }
@@ -1760,60 +1713,24 @@ pub mod hybrid {
 fn recurrent_rs_geometry(geom: &RsGeometryBind) -> wit_recurrent::RsGeometry<'_> {
     wit_recurrent::RsGeometry {
         fold_len: geom.fold_len.as_ref(),
-        readable_buffer: geom.readable.wit(),
-        writable_buffer: geom.writable.wit(),
-        buffer_len: geom.buffer_len.as_ref(),
-        buffer_pages: geom.buffer_pages.as_ref(),
-        buffer_indptr: geom.buffer_indptr.as_ref(),
-        w_slot: geom.w_slot.as_ref(),
-        w_off: geom.w_off.as_ref(),
+        buffer: geom.buffer.wit(),
     }
 }
 
 fn hybrid_rs_geometry(geom: &RsGeometryBind) -> wit_hybrid::RsGeometry<'_> {
     wit_hybrid::RsGeometry {
         fold_len: geom.fold_len.as_ref(),
-        readable_buffer: geom.readable.wit(),
-        writable_buffer: geom.writable.wit(),
-        buffer_len: geom.buffer_len.as_ref(),
-        buffer_pages: geom.buffer_pages.as_ref(),
-        buffer_indptr: geom.buffer_indptr.as_ref(),
-        w_slot: geom.w_slot.as_ref(),
-        w_off: geom.w_off.as_ref(),
+        buffer: geom.buffer.wit(),
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn rs_geometry_bind<R, W>(
-    fold_len: &Channel,
-    readable: R,
-    writable: W,
-    buffer_len: &Channel,
-    buffer_pages: &Channel,
-    buffer_indptr: &Channel,
-    w_slot: &Channel,
-    w_off: &Channel,
-) -> Result<RsGeometryBind, String>
+fn rs_geometry_bind<B>(fold_len: &Channel, buffer: B) -> Result<RsGeometryBind, String>
 where
-    R: RangeBounds<u32>,
-    W: RangeBounds<u32>,
+    B: RangeBounds<u32>,
 {
     Ok(RsGeometryBind {
-        ports: Some([
-            (Port::RsBufferLen, *buffer_len),
-            (Port::RsBufferPages, *buffer_pages),
-            (Port::RsBufferIndptr, *buffer_indptr),
-            (Port::RsWSlot, *w_slot),
-            (Port::RsWOff, *w_off),
-        ]),
         fold_len: fold_len.wit(),
-        readable: PageDeclaration::from_range(readable)?,
-        writable: PageDeclaration::from_range(writable)?,
-        buffer_len: buffer_len.wit(),
-        buffer_pages: buffer_pages.wit(),
-        buffer_indptr: buffer_indptr.wit(),
-        w_slot: w_slot.wit(),
-        w_off: w_off.wit(),
+        buffer: PageDeclaration::from_range(buffer)?,
     })
 }
 
@@ -1826,19 +1743,10 @@ where
 fn rs_geometry_fold_all() -> Result<RsGeometryBind, String> {
     thread_local! {
         /// Minted once per guest thread: a rebind must not leak a fresh
-        /// channel quintuple every time the request set changes.
-        static CHANNELS: (Channel, Channel, Channel) = (
-            Channel::from(vec![u32::MAX]),
-            Channel::from(vec![0u32]),
-            Channel::from(vec![0u32, 0]),
-        );
+        /// channel every time the request set changes.
+        static FOLD_ALL: Channel = Channel::from(vec![u32::MAX]);
     }
-    CHANNELS.with(|(fold_len, zero, indptr)| {
-        let mut geom =
-            rs_geometry_bind(fold_len, 0..0, 0..0, zero, zero, indptr, zero, zero)?;
-        geom.ports = None;
-        Ok(geom)
-    })
+    FOLD_ALL.with(|fold_len| rs_geometry_bind(fold_len, 0..0))
 }
 
 #[cfg(test)]
