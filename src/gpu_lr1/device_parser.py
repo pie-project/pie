@@ -1892,103 +1892,6 @@ def _hash_kernel(
 
 
 @triton.jit
-def _dedup_kernel(
-    lexer_state_ptr,
-    stack_ptr,
-    stack_depth_ptr,
-    config_count_ptr,
-    grammar_ptr,
-    hash_ptr,
-    representative_ptr,
-    mask_ptr,
-    mask_words,
-    BATCH: tl.constexpr,
-    CONFIGS: tl.constexpr,
-    STACK_STRIDE: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    """The lowest-numbered sequence holding the same parse state.
-
-    The fingerprint narrows the search; this confirms it exactly, because two
-    different parse states that happen to hash alike would otherwise share a
-    mask and one of them would be wrong.
-    """
-    sequence = tl.program_id(0)
-    mine = tl.load(hash_ptr + sequence)
-    count = tl.load(config_count_ptr + sequence)
-    grammar = tl.load(grammar_ptr + sequence)
-    found = sequence
-
-    # Scanned a block of candidates at a time rather than one at a time. Every
-    # sequence walks every earlier one, so this is quadratic in the batch and it
-    # showed: 36 us of a 182 us step at batch 512, second only to the replay.
-    # The scan itself is three loads a candidate and nothing else, which is
-    # exactly the shape a block does for free.
-    lane = tl.arange(0, BLOCK)
-    start = 0
-    while start < sequence and found == sequence:
-        index = start + lane
-        live = index < sequence
-        alike = live
-        alike = alike & (tl.load(hash_ptr + index, mask=live, other=0) == mine)
-        alike = alike & (
-            tl.load(config_count_ptr + index, mask=live, other=-1) == count
-        )
-        alike = alike & (tl.load(grammar_ptr + index, mask=live, other=-1) == grammar)
-        other = tl.min(tl.where(alike, index, BATCH))
-        if other >= BATCH:
-            start = start + BLOCK
-        else:
-            # The fingerprint only narrows it. Two different parse states that
-            # hash alike would otherwise share a mask and one would be wrong.
-            same = 1
-            config = 0
-            # Stops at the first difference as well as at the count: a
-            # candidate that fails is usually going to fail on its first
-            # configuration, and there is nothing to learn from the rest.
-            while config < count and same == 1:
-                a = sequence * CONFIGS + config
-                b = other * CONFIGS + config
-                depth = tl.load(stack_depth_ptr + a)
-                if tl.load(lexer_state_ptr + a) != tl.load(lexer_state_ptr + b):
-                    same = 0
-                if depth != tl.load(stack_depth_ptr + b):
-                    same = 0
-                slot = tl.arange(0, STACK_STRIDE)
-                left = tl.load(
-                    stack_ptr + a * STACK_STRIDE + slot,
-                    mask=slot < depth,
-                    other=0,
-                )
-                right = tl.load(
-                    stack_ptr + b * STACK_STRIDE + slot,
-                    mask=slot < depth,
-                    other=0,
-                )
-                if tl.sum(tl.where(left != right, 1, 0)) != 0:
-                    same = 0
-                config = config + 1
-            if same == 1:
-                found = other
-            else:
-                start = other + 1
-    tl.store(representative_ptr + sequence, found)
-
-    # Only a representative's row is built up by the scatter, and every other
-    # row is overwritten wholesale by the broadcast, so those are the only rows
-    # that have to start empty. Clearing all of them was 9.7 MB a step to make
-    # room for 0.6 MB of answers.
-    if found == sequence:
-        for start in range(0, mask_words, BLOCK):
-            slot = start + tl.arange(0, BLOCK)
-            tl.store(
-                mask_ptr + sequence * mask_words + slot,
-                tl.zeros((BLOCK,), tl.int32),
-                mask=slot < mask_words,
-            )
-
-
-@triton.jit
 def _probe_kernel(
     lexer_state_ptr,
     stack_ptr,
@@ -1996,7 +1899,7 @@ def _probe_kernel(
     config_count_ptr,
     grammar_ptr,
     hash_ptr,
-    representative_ptr,
+    suffix_hash_ptr,
     memo_hash_ptr,
     memo_lexer_ptr,
     memo_stack_ptr,
@@ -2004,44 +1907,46 @@ def _probe_kernel(
     memo_count_ptr,
     memo_grammar_ptr,
     memo_read_ptr,
-    suffix_hash_ptr,
     memo_slot_ptr,
+    representative_ptr,
     memo_store_ptr,
     row_floor_ptr,
+    mask_ptr,
+    mask_words,
+    BATCH: tl.constexpr,
     CONFIGS: tl.constexpr,
     STACK_STRIDE: tl.constexpr,
     SLOTS: tl.constexpr,
     MEMO_CONFIGS: tl.constexpr,
     MEMO_STRIDE: tl.constexpr,
     SUFFIXES: tl.constexpr,
+    BLOCK: tl.constexpr,
 ):
-    """Has this parse state been masked before, and may this sequence save one?
+    """Where this sequence's mask is coming from: a table, a neighbour, or work.
 
-    Deduplication already finds the sequences of *this* step that share a parse
-    state, which on a serving batch is most of them. It cannot find the far
-    larger overlap, which is with the steps that came before: a document
-    returns to the same place constantly - every character inside a string is
-    the same configuration - so 92% to 96% of the sequences a step masks were
-    masked at some earlier step, at every batch size down to one.
+    One question - has this parse state been masked already - asked in the two
+    places an answer can be. The table holds what earlier steps computed; the
+    batch holds what *this* step is about to. These were separate mechanisms
+    with separate kernels, and the second is only the first with its provider
+    written moments ago rather than moments before.
 
-    Direct-mapped on the fingerprint, and the entry is compared exactly against
-    the live state afterwards, for the same reason deduplication does: a
-    fingerprint collision would hand back another state's mask, and a wrong
-    mask is worse than a slow one. A miss simply computes, so a collision costs
-    an entry rather than an answer.
+    Three outcomes, and every sequence gets exactly one:
+
+        a slot        the table holds this state; take the mask out of it
+        a neighbour   a lower sequence holds it and is about to compute it
+        neither       compute it, and save it if the slot is free
+
+    The fingerprint only narrows; both lookups confirm the state exactly,
+    because a collision would hand back another state's mask and a wrong mask
+    is worse than a slow one. Two sequences with the same state have the same
+    fingerprint and probe the same slot, so a neighbour that matches is one
+    that missed the table too - nothing ends up following a follower.
     """
     sequence = tl.program_id(0)
-    # One exit. A `return` under a runtime branch reads as a jump and is a
-    # predicate, which this file has been bitten by before.
     count = tl.load(config_count_ptr + sequence)
     mine = tl.load(grammar_ptr + sequence)
-    usable = tl.load(representative_ptr + sequence) == sequence
-    usable = usable & (count <= MEMO_CONFIGS)
 
     found = -1
-    # Suffixes first, shortest first, then the whole stack. A shorter key is
-    # the more general one - it matches stacks that differ underneath - so
-    # finding it first is what makes a nesting document hit.
     attempt = 0
     while attempt <= SUFFIXES and found < 0:
         if attempt == 0:
@@ -2051,7 +1956,7 @@ def _probe_kernel(
             want = attempt
             digest = tl.load(suffix_hash_ptr + sequence * SUFFIXES + attempt - 1)
         slot = (digest & 0x7FFFFFFF) % SLOTS
-        if usable:
+        if count <= MEMO_CONFIGS:
             same = 1
             if tl.load(memo_hash_ptr + slot) != digest:
                 same = 0
@@ -2091,17 +1996,81 @@ def _probe_kernel(
         attempt = attempt + 1
     tl.store(memo_slot_ptr + sequence, found)
 
-    # Seed the floors the sweep will reduce. Done here because this kernel
-    # already walks the configurations and runs before the sweep.
+    # The batch, scanned a block of candidates at a time: every sequence walks
+    # every earlier one, so this is quadratic, and one at a time it showed -
+    # 36 us of a 182 us step at batch 512.
+    neighbour = sequence
+    if found < 0:
+        digest = tl.load(hash_ptr + sequence)
+        lane = tl.arange(0, BLOCK)
+        begin = 0
+        while begin < sequence and neighbour == sequence:
+            index = begin + lane
+            live = index < sequence
+            alike = live
+            alike = alike & (tl.load(hash_ptr + index, mask=live, other=0) == digest)
+            alike = alike & (
+                tl.load(config_count_ptr + index, mask=live, other=-1) == count
+            )
+            alike = alike & (tl.load(grammar_ptr + index, mask=live, other=-1) == mine)
+            other = tl.min(tl.where(alike, index, BATCH))
+            if other >= BATCH:
+                begin = begin + BLOCK
+            else:
+                same = 1
+                config = 0
+                while config < count and same == 1:
+                    a = sequence * CONFIGS + config
+                    b = other * CONFIGS + config
+                    depth = tl.load(stack_depth_ptr + a)
+                    if tl.load(lexer_state_ptr + a) != tl.load(lexer_state_ptr + b):
+                        same = 0
+                    if depth != tl.load(stack_depth_ptr + b):
+                        same = 0
+                    place = tl.arange(0, STACK_STRIDE)
+                    left = tl.load(
+                        stack_ptr + a * STACK_STRIDE + place,
+                        mask=place < depth,
+                        other=0,
+                    )
+                    right = tl.load(
+                        stack_ptr + b * STACK_STRIDE + place,
+                        mask=place < depth,
+                        other=0,
+                    )
+                    if tl.sum(tl.where(left != right, 1, 0)) != 0:
+                        same = 0
+                    config = config + 1
+                if same == 1:
+                    neighbour = other
+                else:
+                    begin = other + 1
+    tl.store(representative_ptr + sequence, neighbour)
+
+    # Only what computes has to start empty; everything else is written whole
+    # by the copy. Clearing all of them was 9.7 MB a step to make room for
+    # 0.6 MB of answers.
+    computes = (found < 0) & (neighbour == sequence)
+    if computes:
+        for start in range(0, mask_words, BLOCK):
+            place = start + tl.arange(0, BLOCK)
+            tl.store(
+                mask_ptr + sequence * mask_words + place,
+                tl.zeros((BLOCK,), tl.int32),
+                mask=place < mask_words,
+            )
+
+    # Seed the floors the sweep reduces.
     seed = 0
     while seed < count:
         row = sequence * CONFIGS + seed
         tl.store(row_floor_ptr + row, tl.load(stack_depth_ptr + row))
         seed = seed + 1
 
-    # Who may write a slot is settled after the sweep, once the read depth is
-    # known, so `_store_kernel` does that. Here only the miss is recorded.
-    tl.store(memo_store_ptr + sequence, tl.where(usable & (found < 0), 1, -1))
+    tl.store(
+        memo_store_ptr + sequence,
+        tl.where(computes & (count <= MEMO_CONFIGS), 1, -1),
+    )
 
 
 @triton.jit
@@ -2146,20 +2115,40 @@ def _claim_kernel(
 
 
 @triton.jit
-def _recall_kernel(
+def _copy_kernel(
     memo_slot_ptr,
+    representative_ptr,
     memo_mask_ptr,
     mask_ptr,
     mask_words,
     BLOCK: tl.constexpr,
 ):
-    """Put a remembered mask back, in place of having computed it."""
+    """Give every sequence that did not compute the mask it was promised.
+
+    Two sources and one pass, because the probe already decided which: a table
+    slot for a state an earlier step masked, or a neighbour's row for one this
+    step is masking anyway. These were two kernels, and the difference between
+    them was never more than where the bytes were.
+
+    Two dimensions, because this is a copy and copies are bandwidth. One
+    program per sequence walked a whole 19 KiB row in chunks and left a batch
+    of 32 running 32 programs on 108 multiprocessors.
+
+    Before the store, so a sequence reading a slot reads the entry it matched
+    rather than one a provider has since replaced.
+    """
     sequence = tl.program_id(0)
     slot = tl.load(memo_slot_ptr + sequence)
-    if slot >= 0:
+    source = tl.load(representative_ptr + sequence)
+    if (slot >= 0) or (source != sequence):
         lane = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
         live = lane < mask_words
-        value = tl.load(memo_mask_ptr + slot * mask_words + lane, mask=live, other=0)
+        if slot >= 0:
+            value = tl.load(
+                memo_mask_ptr + slot * mask_words + lane, mask=live, other=0
+            )
+        else:
+            value = tl.load(mask_ptr + source * mask_words + lane, mask=live, other=0)
         tl.store(mask_ptr + sequence * mask_words + lane, value, mask=live)
 
 
@@ -2273,29 +2262,6 @@ def _store_kernel(
         live = lane < mask_words
         value = tl.load(mask_ptr + sequence * mask_words + lane, mask=live, other=0)
         tl.store(memo_mask_ptr + slot * mask_words + lane, value, mask=live)
-
-
-@triton.jit
-def _broadcast_kernel(
-    representative_ptr,
-    mask_ptr,
-    mask_words,
-    BLOCK: tl.constexpr,
-):
-    """Copy each duplicate's mask from the sequence that computed it.
-
-    Two dimensions, because this is a copy and copies are bandwidth. One
-    program per sequence walked a whole 19 KiB row in chunks and left a batch
-    of 32 running 32 programs on 108 multiprocessors: 606 KB moved at 51 GB/s
-    on a device that does twenty times that. The words are the second axis.
-    """
-    sequence = tl.program_id(0)
-    source = tl.load(representative_ptr + sequence)
-    if source != sequence:
-        lane = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-        live = lane < mask_words
-        value = tl.load(mask_ptr + source * mask_words + lane, mask=live, other=0)
-        tl.store(mask_ptr + sequence * mask_words + lane, value, mask=live)
 
 
 def _run_rise(arrays: dict, cap: int = 48) -> tuple[dict[int, int], set[int]]:
@@ -3994,9 +3960,9 @@ class DeviceBatch:
 
     def _fill(self) -> torch.Tensor:
         grammar = self.grammar
-        # The mask is not cleared here. Deduplication knows which rows the
-        # scatter will build up and clears only those; the rest are overwritten
-        # whole by the broadcast.
+        # The mask is not cleared here. The probe knows which rows the scatter
+        # will build up - the ones with no answer anywhere - and clears only
+        # those; the rest are overwritten whole by the copy.
         _hash_kernel[(self.batch,)](
             self.lexer_state,
             self.stack,
@@ -4010,22 +3976,6 @@ class DeviceBatch:
             SUFFIXES=_MEMO_SUFFIXES,
             num_warps=1,
         )
-        _dedup_kernel[(self.batch,)](
-            self.lexer_state,
-            self.stack,
-            self.depth,
-            self.config_count,
-            self.grammar_of,
-            self.state_hash,
-            self.representative,
-            self.mask,
-            grammar.mask_words,
-            BATCH=self.batch,
-            CONFIGS=self.configs,
-            STACK_STRIDE=grammar.max_stack,
-            BLOCK=128,
-            num_warps=4,
-        )
         _probe_kernel[(self.batch,)](
             self.lexer_state,
             self.stack,
@@ -4033,7 +3983,7 @@ class DeviceBatch:
             self.config_count,
             self.grammar_of,
             self.state_hash,
-            self.representative,
+            self.suffix_hash,
             self.memo_hash,
             self.memo_lexer,
             self.memo_stack,
@@ -4041,17 +3991,21 @@ class DeviceBatch:
             self.memo_count,
             self.memo_grammar,
             self.memo_read,
-            self.suffix_hash,
             self.memo_slot,
+            self.representative,
             self.memo_store,
             self.row_floor,
+            self.mask,
+            grammar.mask_words,
+            BATCH=triton.next_power_of_2(self.batch),
             CONFIGS=self.configs,
             STACK_STRIDE=grammar.max_stack,
             SLOTS=self.memo_slots,
             MEMO_CONFIGS=_MEMO_CONFIGS,
             MEMO_STRIDE=self.memo_stride,
             SUFFIXES=_MEMO_SUFFIXES,
-            num_warps=1,
+            BLOCK=128,
+            num_warps=4,
         )
         rows = self.batch * self.configs
         # The running sum turns an item back into a configuration and a group.
@@ -4136,8 +4090,9 @@ class DeviceBatch:
             SUFFIXES=_MEMO_SUFFIXES,
             num_warps=1,
         )
-        _recall_kernel[(self.batch, words)](
+        _copy_kernel[(self.batch, words)](
             self.memo_slot,
+            self.representative,
             self.memo_mask,
             self.mask,
             grammar.mask_words,
@@ -4174,18 +4129,6 @@ class DeviceBatch:
             BLOCK=512,
             num_warps=4,
         )
-        _broadcast_kernel[(self.batch, words)](
-            self.representative,
-            self.mask,
-            grammar.mask_words,
-            BLOCK=512,
-            num_warps=4,
-        )
-        # A complement sets the last word whole, so the bits past the final
-        # token have to go: nothing may be allowed that is not a token.
-        spare = grammar.mask_words * 32 - grammar.vocab_size
-        if spare:
-            self.mask[:, -1] &= 0xFFFFFFFF >> spare
         return self.mask
 
 
