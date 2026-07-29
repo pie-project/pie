@@ -24,7 +24,7 @@ public:
               ops::CublasHandle& cublas,
               const ForwardFn::ForwardInputs& in) override;
 
-    ModelCapabilities capabilities() const override {}
+    ModelCapabilities capabilities() const override { return {}; }
 
 private:
     const MixtralWeights& weights_;
