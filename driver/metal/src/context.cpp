@@ -663,6 +663,18 @@ class Context::Impl {
         // system. Whether the engine actually sends k > 1 decides whether the
         // per-step host round trip is the driver's to remove or the engine's.
         if (std::getenv("PIE_METAL_FRAME_TRACE") != nullptr) {
+            // Whether a step's tokens come off the device decides whether a
+            // non-tail step could commit without waiting. Measured: every step
+            // carries HOST token ids (device=0 host=256), so `commit_step_async`
+            // cannot be used here without double-buffering the per-step IO --
+            // the host's write for step i+1 would race step i's read.
+            for (std::size_t si = 0; si < step_count; ++si) {
+                static int dg = 0, hg = 0;
+                (steps[si].token_ids.len == 0 ? dg : hg) += 1;
+                if ((dg + hg) % 512 == 0)
+                    std::fprintf(stderr, "[geom] device-carried=%d host-carried=%d\n", dg,
+                                 hg);
+            }
             static std::map<std::size_t, int> hist;
             static int n = 0;
             ++hist[step_count];
