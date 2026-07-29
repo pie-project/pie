@@ -882,6 +882,12 @@ pub fn group_vocabulary(lexer: &Lexer, vocabulary: &[Vec<u8>]) -> VocabularyGrou
     // Built once and shared by every state. A state that can settle restarts
     // the scan from the start state, and doing that again for each of a
     // thousand states was most of what this cost.
+    // Timed: flattening is 4.5% of this stage and depends on the vocabulary
+    // alone, so a caller compiling many schemas against one tokenizer rebuilds
+    // it every time. Hoisting it means threading a prepared vocabulary through
+    // three crates for 3.3% of compile, which is worth doing and is not worth
+    // doing last. The start scans are another 11% and are not hoistable - they
+    // depend on the lexer.
     let flat = FlatVocabulary::of(vocabulary);
     let start_scans = StartScans::build(lexer, &flat);
     let (per_state, rejected): (Vec<Vec<Group>>, Vec<u32>) = (0..lexer.num_states())
