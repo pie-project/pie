@@ -181,8 +181,11 @@ async fn main(input: String) -> Result<String> {
         .map_err(|e| format!("spec_out take: {e}"))?[0];
 
     // ─────────────── 3. COMMIT — `fold_len = accepted` ────────────────────
-    // Replays only the accepted prefix into the folded state. No logits: the
-    // driver runs the recurrent layers alone.
+    // Replays only the accepted prefix into the folded state. No logits, and
+    // none are possible: a fold fire returns from the linear layers before the
+    // output projection, so the driver refuses one that declares sample rows.
+    // Hence the empty readout and the absent epilogue — and nothing to await,
+    // since pipeline order already puts the fold ahead of whatever reads next.
     let mut committed = 0u32;
     if accepted > 0 {
         let commit_toks = Channel::from(vec![g0; accepted as usize]).named("commit_toks");
@@ -198,7 +201,6 @@ async fn main(input: String) -> Result<String> {
         let commit_w_off =
             Channel::from((n..n + accepted).map(|p| p % page_size).collect::<Vec<_>>())
                 .named("commit_w_off");
-        let commit_done = Channel::new([1], dtype::i32).named("commit_done");
 
         let fwd_c = ForwardPass::new();
         fwd_c.embed(&commit_toks, &commit_indptr)?;
@@ -243,18 +245,9 @@ async fn main(input: String) -> Result<String> {
                 &commit_rs_w_off,
             )
             .map_err(|e| format!("commit recurrent binding: {e}"))?;
-        fwd_c.epilogue(move || {
-            let t = reduce_argmax(intrinsics::logits());
-            commit_done.put(&t);
-        });
         fwd_c
             .submit(&pipe)
             .map_err(|e| format!("commit submit: {e}"))?;
-        commit_done
-            .take()
-            .get::<i32>()
-            .await
-            .map_err(|e| format!("commit_done take: {e}"))?;
         committed = accepted;
     }
 

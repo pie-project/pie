@@ -522,6 +522,31 @@ fn rs_plan_for(
 
 /// Phase-A RS demand for the acquisition grant.
 
+/// Drop the SYNTHESIZED read-out rows from a fire that folds.
+///
+/// A fold fire returns from the linear layers before the output projection, so
+/// it produces no usable logits and the driver refuses one that declares
+/// sample rows. But an absent `readout` binding does not mean "sample nothing"
+/// — it means "sample each lane's last row" — and an empty readout channel has
+/// no expressible shape. So a guest that simply folded got a sample row it
+/// never asked for and a fire that could not run.
+///
+/// Only the default is dropped. An EXPLICIT readout on a fold fire still
+/// reaches the driver and is still refused, loudly: asking for logits that
+/// cannot exist is a guest bug worth reporting, not one worth papering over.
+fn suppress_defaulted_readout_for_fold(
+    req: &mut crate::driver::LaunchPlan,
+    readout_defaulted: bool,
+    plan: &rs::RsPlan,
+) {
+    let folds = matches!(plan, rs::RsPlan::Fold | rs::RsPlan::FoldBuffered { .. });
+    if !folds || !readout_defaulted {
+        return;
+    }
+    req.sampling_indices.clear();
+    req.sampling_indptr = vec![0; req.sampling_indptr.len()];
+}
+
 fn rs_slot_demand(
     stores: &crate::store::registry::Stores,
     ids: &[crate::store::rs::RsWorkingSetId],
@@ -1069,6 +1094,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             )
         };
         let mut req = crate::driver::LaunchPlan::default();
+        let readout_defaulted = geometry.readout_defaulted;
         geometry.apply_to(&mut req);
         req.device_resolved_geometry = decode_envelope.is_some();
         req.single_token_mode = req.token_ids.len() + 1 == req.qo_indptr.len()
@@ -1152,6 +1178,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 return Ok(Err(format!("pipeline: recurrent-state mode: {error}")));
             }
         };
+        suppress_defaulted_readout_for_fold(&mut req, readout_defaulted, &rs_plan);
         crate::planner::trace_mark!("build", pid, "hp-acquire");
         let mut attempts = 0;
         let (ws_guard, (copy_src, copy_dst), kvtxn, rs_prepared) = loop {

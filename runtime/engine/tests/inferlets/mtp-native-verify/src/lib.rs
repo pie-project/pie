@@ -143,9 +143,15 @@ fn bind_window(
             .collect::<Vec<_>>(),
     )
     .named("w_w_off");
-    let readout = Channel::from(readout.to_vec()).named("w_readout");
+    // A fold fire reads nothing, and `Channel::from(vec![])` cannot express
+    // that (an empty shape has no vector length). Omitting `readout` entirely
+    // is the honest encoding of "this fire samples no rows" — and the driver
+    // requires it, since a fold returns before the output projection.
+    if !readout.is_empty() {
+        let readout = Channel::from(readout.to_vec()).named("w_readout");
+        pass.readout(&readout)?;
+    }
     pass.embed(toks, &embed_indptr)?;
-    pass.readout(&readout)?;
     pass.attention(
         ws,
         ..,
@@ -316,8 +322,14 @@ async fn verify_window(
 /// write back the same values. Feeding the predicted tokens here would shift
 /// the sequence by one and corrupt the accepted prefix's KV.
 ///
-/// Nothing here is read: with a fold boundary set, the linear layers stop
-/// after the recurrence and emit no logits.
+/// Nothing here is read, and nothing here CAN be read: with a fold boundary
+/// set the linear layers stop after the recurrence and never reach the output
+/// projection, so the driver refuses a fold fire that declares sample rows
+/// ("buffered RS fold is state-only and cannot sample logits"). The fire is
+/// therefore submitted with an empty readout and no epilogue, and it is not
+/// awaited — fires on one pipeline are ordered, so the next window already
+/// observes the advanced boundary, and any driver failure surfaces as channel
+/// poison on that window's first read.
 #[allow(clippy::too_many_arguments)]
 async fn commit_window(
     ws: &WorkingSet,
@@ -333,11 +345,10 @@ async fn commit_window(
         return Ok(());
     }
     let toks = Channel::from(window_prefix.to_vec()).named("c_toks");
-    let done = Channel::new([1], dtype::i32).named("c_done");
 
     let fwd = ForwardPass::new();
     let kv_len = Channel::from(vec![seq_len + clen]).named("c_kv_len");
-    bind_window(&fwd, ws, &toks, &kv_len, seq_len, clen, max_pages, &[clen - 1])?;
+    bind_window(&fwd, ws, &toks, &kv_len, seq_len, clen, max_pages, &[])?;
 
     let (rs_len, rs_pages, rs_indptr, rs_w_slot, rs_w_off) = rs_span(rs_page, clen, "c");
     let fold_len = Channel::from(vec![clen]).named("c_fold_len");
@@ -353,13 +364,12 @@ async fn commit_window(
         &rs_w_off,
     )
     .map_err(|e| format!("commit recurrent binding: {e}"))?;
-    fwd.epilogue(move || {
-        let t = reduce_argmax(intrinsics::logits());
-        done.put(&t);
-    });
+    // A stage-less pass has no PTIR program to register at all, which the
+    // driver rejects. An EMPTY epilogue is the minimal well-formed program: it
+    // samples nothing, so the fold fire declares no readout rows.
+    fwd.epilogue(|| {});
     fwd.submit(pipeline)
         .map_err(|e| format!("commit submit: {e}"))?;
-    get_i32(done.take()).await?;
     Ok(())
 }
 

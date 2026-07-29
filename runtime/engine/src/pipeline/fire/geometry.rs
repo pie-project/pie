@@ -50,12 +50,16 @@ impl DecodeEnvelope {
             Some(bytes) => as_u32(Port::Positions, bytes)?,
             None => vec![0; token_count as usize],
         };
+        let mut readout_defaulted = false;
         let readout = match const_port(container, Port::Readout) {
             Some(bytes) => as_u32(Port::Readout, bytes)?,
-            None => qo_indptr
-                .windows(2)
-                .map(|lane| lane[1].saturating_sub(1))
-                .collect(),
+            None => {
+                readout_defaulted = true;
+                qo_indptr
+                    .windows(2)
+                    .map(|lane| lane[1].saturating_sub(1))
+                    .collect()
+            }
         };
         let mut sampling_indices = Vec::with_capacity(readout.len());
         let mut sampling_indptr = Vec::with_capacity(qo_indptr.len());
@@ -79,6 +83,7 @@ impl DecodeEnvelope {
             qo_indptr,
             sampling_indptr,
             sampling_indices,
+            readout_defaulted,
             ..ReqGeometry::default()
         })
     }
@@ -407,6 +412,16 @@ pub struct ReqGeometry {
     pub sampling_indices: Vec<u32>,
     /// Per-lane read-out CSR.
     pub sampling_indptr: Vec<u32>,
+    /// True when `readout` was ABSENT and the last row of each lane was
+    /// synthesized as a convenience default.
+    ///
+    /// A fold fire samples nothing — the linear layers return before the output
+    /// projection — so this default silently made every fold fire invalid, and
+    /// a guest had no way to say "sample no rows" (omitting the binding means
+    /// "the last row", and an empty channel has no expressible shape).
+    /// `rs_plan_for`'s callers drop the synthesized rows for a folding fire;
+    /// an EXPLICIT readout is left alone so the driver still refuses it loudly.
+    pub readout_defaulted: bool,
 }
 
 /// A geometry-mapping failure.
@@ -672,11 +687,13 @@ pub fn map_geometry_evaluated(
     // readout samples each lane's last row.
     let readout = match optional_u32(Port::Readout)? {
         Some(readout) => readout,
-        None => g
-            .qo_indptr
-            .windows(2)
-            .map(|lane| lane[1].saturating_sub(1))
-            .collect(),
+        None => {
+            g.readout_defaulted = true;
+            g.qo_indptr
+                .windows(2)
+                .map(|lane| lane[1].saturating_sub(1))
+                .collect()
+        }
     };
     let mut sampling_indices = Vec::with_capacity(readout.len());
     let mut sampling_indptr = Vec::with_capacity(g.qo_indptr.len());
