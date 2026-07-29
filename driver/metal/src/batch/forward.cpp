@@ -1523,9 +1523,19 @@ StepTiming MetalExecutor::Impl::step(
     return t;
 }
 
+namespace {
+// The step meter's `gap` covers everything between one forward's encode and the
+// next's, and `run_batch_step` does a lane-wide preamble before it ever reaches
+// that point.  These two marks split the gap into the caller's share
+// (`forward_batch` composing the batch) and this function's own, which is what
+// separated "the engine is late" from "the driver is busy" -- it is the driver.
+std::chrono::steady_clock::time_point g_forward_batch_t0{};
+}  // namespace
+
 bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const BatchStepInputs& in,
                                      std::string* err,
                                      const std::vector<PtirCommandCallbacks>* ptir) {
+    const auto fn_t0 = std::chrono::steady_clock::now();
     auto fail = [&](const std::string& why) {
         if (err) *err = "MetalExecutor::Impl::run_batch_step: " + why;
         return false;
@@ -1744,6 +1754,8 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
         static int gap_lt1[33] = {};
         static int gap_ge1[33] = {};
         static double gap_max[33] = {};
+        static double pre_fb[33] = {};
+        static double pre_fn[33] = {};
         static std::chrono::steady_clock::time_point last[33] = {};
         static int n[2][33] = {};
         const int lanes = schedule.N < 33 ? schedule.N : 32;
@@ -1752,6 +1764,9 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
         const auto now_tp = std::chrono::steady_clock::now();
         wall[lanes] += std::chrono::duration<double, std::milli>(now_tp - step_t0).count();
         enc[lanes] += timing.encode_ms;
+        pre_fb[lanes] +=
+            std::chrono::duration<double, std::milli>(fn_t0 - g_forward_batch_t0).count();
+        pre_fn[lanes] += std::chrono::duration<double, std::milli>(step_t0 - fn_t0).count();
         if (last[lanes].time_since_epoch().count() != 0) {
             const double g =
                 std::chrono::duration<double, std::milli>(step_t0 - last[lanes]).count();
@@ -1772,9 +1787,12 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
                          (wall[lanes] - sum[0][lanes] - sum[1][lanes] - enc[lanes]) /
                              (n[0][lanes] + n[1][lanes]));
             std::fprintf(stderr,
-                         "[gap] lanes=%d mean %.4f ms  <1ms=%d  >=1ms=%d  max %.2f ms\n",
+                         "[gap] lanes=%d mean %.4f ms  <1ms=%d  >=1ms=%d  max %.2f ms"
+                         "  | fb_pre %.4f  step_pre %.4f ms\n",
                          lanes, gap[lanes] / (n[0][lanes] + n[1][lanes]), gap_lt1[lanes],
-                         gap_ge1[lanes], gap_max[lanes]);
+                         gap_ge1[lanes], gap_max[lanes],
+                         pre_fb[lanes] / (n[0][lanes] + n[1][lanes]),
+                         pre_fn[lanes] / (n[0][lanes] + n[1][lanes]));
         }
     }
 
@@ -2368,6 +2386,7 @@ void MetalExecutor::forward_batch(const std::vector<MemberForwardDesc>& descs,
                                   std::vector<std::uint8_t>& success,
                                   std::vector<std::string>& errors,
                                   const std::vector<PtirCommandCallbacks>* ptir) {
+    g_forward_batch_t0 = std::chrono::steady_clock::now();
     outs.assign(descs.size(), LogitsOut{});
     success.assign(descs.size(), 0);
     errors.assign(descs.size(), std::string{});
@@ -2443,6 +2462,15 @@ bool MetalExecutor::run_paged_batch_forward(const std::vector<MemberForwardDesc>
     }
     in.attention_mask_stride =
         static_cast<std::uint32_t>(mask_stride64);
+    // The dense mask is one byte per addressable KV token per row -- 131072 bytes
+    // here -- so materializing it costs `rows * stride` of zero-fill plus the same
+    // again copying it to the IO slot. `run_batch_step` treats a non-empty
+    // `attention_mask_enabled` as "this batch is masked", so pushing a zero per
+    // token made every batch pay both, for a buffer no kernel reads: 8.4 MB of
+    // memory traffic per step at 32 lanes, growing linearly with lane count.
+    // Nothing downstream needs either vector when no member carries a mask.
+    bool any_attention_mask = false;
+    for (const auto& d : descs) any_attention_mask = any_attention_mask || d.has_attention_mask;
     struct AcceptedRequest {
         std::size_t member = 0;
         std::uint32_t local_request = 0;
@@ -2706,22 +2734,24 @@ bool MetalExecutor::run_paged_batch_forward(const std::vector<MemberForwardDesc>
                     d.has_write_desc
                         ? d.w_off[token]
                         : token_pos % pool.page_size);
-                in.attention_mask_enabled.push_back(
-                    d.has_attention_mask ? 1 : 0);
-                const std::size_t mask_base =
-                    in.attention_mask.size();
-                in.attention_mask.resize(
-                    mask_base + in.attention_mask_stride,
-                    0);
-                if (d.has_attention_mask) {
-                    const auto* source =
-                        d.attention_mask.data() +
-                        token * d.attention_mask_stride;
-                    std::copy(
-                        source,
-                        source + d.attention_mask_stride,
-                        in.attention_mask.begin() +
-                            mask_base);
+                if (any_attention_mask) {
+                    in.attention_mask_enabled.push_back(
+                        d.has_attention_mask ? 1 : 0);
+                    const std::size_t mask_base =
+                        in.attention_mask.size();
+                    in.attention_mask.resize(
+                        mask_base + in.attention_mask_stride,
+                        0);
+                    if (d.has_attention_mask) {
+                        const auto* source =
+                            d.attention_mask.data() +
+                            token * d.attention_mask_stride;
+                        std::copy(
+                            source,
+                            source + d.attention_mask_stride,
+                            in.attention_mask.begin() +
+                                mask_base);
+                    }
                 }
             }
             for (std::uint32_t sample = span.s0;
