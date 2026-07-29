@@ -4120,3 +4120,127 @@ itself shrinks. §20.15 (submit -58%) and §20.16 (close barrier -19%) were the
 first two instalments of that and were individually throughput-neutral; the
 finding here is that they were attacking the right term after all, just not
 enough of it to clear the noise band.
+
+---
+
+## §20.23 — profiling the turnover hole: it is the scheduler loop's pass time
+
+§20.22 closed the last of the three levers on the fleet-wide join and left one
+direction standing: make per-process bring-up and teardown cheap enough that
+the round trip itself shrinks. This section profiles that round trip. Every
+number below comes from the stock engine's own instrumentation
+(`PIE_FIRE_TIMING=waves`, homogeneous conc 512, 4096 requests, 8192 pages,
+16.6 s wall, 528 waves, 24 of them prefill).
+
+### It is not the GPU, not the pool, and not host parallelism
+
+`worker_threads` sweep at conc 512 — 16 / 64 / 128 threads:
+
+```
+  31286 / 30388 / 30540 tok/s
+```
+
+Flat inside the 4.5% band, and 16 is nominally the best. The box has 128 CPUs
+and the default is `min(cores, 64)`. Adding parallelism does nothing, so the
+boundary is not throughput-bound: there is a **serial section**.
+
+### The single dominant cost: a bind is 775x its own work
+
+PAIRED per-process deltas across one 140 ms boundary (n = 512 successors):
+
+```
+  bind_started -> bind_finished (TOTAL)   p50  54.36  p90 118.95  max 131.41 ms
+    of which: driver round trip           p50  54.30  p90 118.87  max 131.34 ms
+    of which: host-side work              p50   0.07  p90   0.12  max   0.24 ms
+```
+
+The lane's own execution is trivial and so is the driver's:
+
+```
+  register_channels_bind occupancy   p50 0.10 ms   (8192 controls, sum 1.08 s)
+  cuda_bind total                    p50 0.02 ms   (sum 0.23 s)
+  cuda_channel_register (9 per bind) p50 0.00 ms   (73728 regs, sum 0.05 s)
+  engine bind_us / set_us            p50 0.03 / 0.05 ms
+```
+
+### Where the 54 ms goes: arrival vs service curves
+
+Same boundary, times relative to `t0` = the last frame's `native_complete`:
+
+```
+  A predecessor guest_main_returned    p05   4.1  p50  27.8  p95  49.8 ms
+  B predecessor drop_entered           p05   4.1  p50  27.9  p95  49.8 ms
+  C successor bind_admitted            p05  14.8  p50  61.9  p95 112.6 ms
+  D successor exec admitted            p05  13.3  p50  61.1  p95 112.5 ms
+  E successor bind_started  (SUPPLY)   p05  17.6  p50  62.1  p95 114.9 ms
+  F bind control SERVICED by the lane  p05  18.3  p50  65.2  p95 197.2 ms
+  G bind finished (guest observes)     p05  54.0  p50  95.0  p95 194.4 ms
+```
+
+Read it as a queue: **service (F) trails supply (E) by 3 ms.** The driver lane
+is keeping up and is NOT the bottleneck — during the gap the GPU is idle, so no
+frame submit is occupying the lane either. Binds arrive at only ~5/ms, and the
+GPU restarts at t0+140 once essentially all of them have landed (the wait-all
+seal waits for the LAST one, p95 115 ms, not the median).
+
+So the cost is the **supply chain**, and it is a chain of round trips through
+one thread. Rank-paired lane-completion to guest-observation:
+
+```
+  lane done -> guest sees bind   p50 1.3 - 13.4 ms   p95 25 - 36 ms
+  bind_finished per 5 ms bucket:  50:38 55:77 60:74 65:7  [25 ms hole]  90:45 95:51 ...
+```
+
+Those holes are the loop's own pass. Its time budget over the run:
+
+```
+  loop_mailbox_us  p50  1.59  SUM  0.96 s
+  loop_retire_us   p50  4.19  SUM  2.20 s
+  loop_dispatch_us p50  5.16  SUM  3.94 s   (of which loop_post_us p50 4.58, SUM 2.27 s)
+  loop_park_us     p50 17.55  SUM  9.73 s
+  loop_lag_us      p50  5.52 ms   max 28.93 ms
+  driver_submit_us p50  9.04  SUM  5.53 s   (lane thread, blocks controls behind it)
+```
+
+A pass costs mailbox + retire + dispatch ~= **14 ms**, and `loop_lag_us` p50
+5.5 ms says the loop runs that far behind. Every hop a process needs —
+`ExecutionSlotConsumed`, the bind post, the bind reply that resolves its
+oneshot — costs up to one pass. A successor needs two or three of them, which
+is exactly the ~60 ms by which curve D lags curve B, and exactly why a 50 ms
+predecessor spread (A) is stretched into a 100 ms bind spread (E).
+
+Per-guest, the same ratio shows up in the steady state:
+
+```
+  mean per-guest wake  32.2 us      mean per-guest work  0.1 us
+  (249856 guest observations, guest_wake SUM 8.04 s of a 16.6 s run)
+```
+
+### What this rules out
+
+- **The single control slot is NOT the cause.** `worker.rs` only holds the slot
+  for async-completing controls; lifecycle controls (register / bind / close)
+  are pipe-concurrent and flush to the lane FIFO freely in one pass.
+- **A dedicated control lane would not help the gap.** During the hole the GPU
+  is idle, so no frame submit is occupying the lane; binds still trickle at
+  5/ms.
+- **Channel registration, program registration and the CUDA bind are free**
+  (sums of 0.05 s, 0.00 s and 0.23 s across the whole run).
+
+### The lever
+
+The boundary hole is `passes x pass_time`, and `pass_time` is ~14 ms of
+single-threaded work dominated by three per-fire costs at 512 fires per frame:
+
+```
+  loop_post_us    4.58 ms  (~9 us per fire)   building and posting the frame
+  loop_retire_us  4.19 ms  (~8 us per fire)   retiring it
+  loop_dispatch_us 5.16 ms                    the queue scan + seal + post
+```
+
+Cutting per-fire host cost shortens every hop of every process at every
+boundary, and it also shortens `loop_lag_us` in the steady state. This is the
+same term §20.15 (submit -58%) and §20.16 (close barrier -19%) attacked; the
+finding here is that they were aimed correctly but were each too small a slice
+of a 14 ms pass to clear a 4.5% noise band. The measurement to hold them to is
+`loop_lag_us` and the A..G curve above, NOT end-to-end tok/s.
