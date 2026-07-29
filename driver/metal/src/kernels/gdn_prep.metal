@@ -275,7 +275,13 @@ template <typename T>
     acc += float(mixed[b_idx * CDIM + c]) * float(conv_w[c * Kc + (Kc - 1)]);
     return acc / (1.0f + exp(-acc));
   };
-  const float vval = convsilu(p.v_off + hv_idx * Dv + dv_idx);
+  // `c` below depends only on (hv, dv), never on `dk_idx`, so all 32 lanes of
+  // this simdgroup were computing the identical convolution and, at the end,
+  // storing the identical bytes to the identical addresses -- 32x the reads and
+  // 32x the (same-address, hence serialized) writes. Compute it on one lane and
+  // broadcast: same inputs, same order, bit-identical result.
+  const float vval =
+      simd_broadcast(simd_lane == 0 ? convsilu(p.v_off + hv_idx * Dv + dv_idx) : 0.0f, 0);
   const device float* iq = pre_q + size_t(n) * Dk;
   const device float* ik = pre_k + size_t(n) * Dk;
   float q[8], k[8], st[8];
@@ -293,11 +299,13 @@ template <typename T>
   out = simd_sum(out);
   if (simd_lane == 0) core_out[(b_idx * Hv + hv_idx) * Dv + dv_idx] = static_cast<T>(out);
   for (int i = 0; i < n_per_t; ++i) i_state[n_per_t * dk_idx + i] = st[i];
-  const int c = p.v_off + hv_idx * Dv + dv_idx;
-  for (int j = 0; j < Kc - 1; ++j)
-    new_conv_state[(slot * Kc + j) * CDIM + c] =
-        conv_state[(slot * Kc + (j + 1)) * CDIM + c];
-  new_conv_state[(slot * Kc + (Kc - 1)) * CDIM + c] = float(mixed[b_idx * CDIM + c]);
+  if (simd_lane == 0) {
+    const int c = p.v_off + hv_idx * Dv + dv_idx;
+    for (int j = 0; j < Kc - 1; ++j)
+      new_conv_state[(slot * Kc + j) * CDIM + c] =
+          conv_state[(slot * Kc + (j + 1)) * CDIM + c];
+    new_conv_state[(slot * Kc + (Kc - 1)) * CDIM + c] = float(mixed[b_idx * CDIM + c]);
+  }
 }
 
 #define instantiate_gdn_prep(name, itype)                                  \
@@ -329,6 +337,7 @@ template <typename T>
       const device itype*, const device itype*, const device float*,        \
       const device float*, const device float*, device float*,              \
       constant GdnCoreParams&, const device uint*, uint3, uint);
+
 
 instantiate_gdn_prep(float32, float)
 instantiate_gdn_prep(float16, half)
