@@ -804,7 +804,11 @@ void linear_attn_body(
     const std::uint32_t* rs_buffer_heads_h = nullptr,
     const std::uint32_t* qo_ext_h = nullptr,
     const std::uint32_t* qo_ext_d = nullptr,
-    int N_ext = 0)
+    int N_ext = 0,
+    // MIXED pass only: one byte per request, non-zero where this row's
+    // recurrent/conv state must persist. Null means every row agrees and
+    // `write_state` alone decides.
+    const std::uint8_t* rs_write_state_mask = nullptr)
 {
     // The linear layers run over the EXTENDED token layout `[B_r | T_r]` per
     // request: a recurrence always resumes from the folded boundary, so any
@@ -1154,7 +1158,8 @@ void linear_attn_body(
                     slot_ids_d, qo_indptr_d,
                     static_cast<long long>(state_cache.conv_kernel()) *
                         state_cache.conv_dim(),
-                    R, conv_dim, conv_K, stream, write_state, commit_len);
+                    R, conv_dim, conv_K, stream, write_state, commit_len,
+                    rs_write_state_mask);
             } else {
                 for (int r = 0; r < R; ++r) {
                     const int t0 = static_cast<int>(qo_indptr_h[r]);
@@ -1318,7 +1323,7 @@ void linear_attn_body(
                                 slot_stride,
                                 la.core_out.data(),
                                 R, K_h, V_h, K_d, V_d,
-                                stream, write_state);
+                                stream, write_state, rs_write_state_mask);
                         } else {
                             kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa(
                                 la.q_pre.data(),
@@ -1331,7 +1336,7 @@ void linear_attn_body(
                                 slot_stride,
                                 la.core_out.data(),
                                 R, K_h, V_h, K_d, V_d,
-                                stream, write_state);
+                                stream, write_state, rs_write_state_mask);
                         }
                     } else if (use_warp_tiled_recurrent) {
                         if (state_bf16) {
@@ -1346,7 +1351,7 @@ void linear_attn_body(
                                 slot_stride,
                                 la.core_out.data(),
                                 R, V_h, K_d, V_d,
-                                stream, write_state);
+                                stream, write_state, rs_write_state_mask);
                         } else {
                             kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled(
                                 q_recur_full,
@@ -1359,7 +1364,7 @@ void linear_attn_body(
                                 slot_stride,
                                 la.core_out.data(),
                                 R, V_h, K_d, V_d,
-                                stream, write_state);
+                                stream, write_state, rs_write_state_mask);
                         }
                     } else if (
                         commit_len == nullptr &&
@@ -1376,7 +1381,7 @@ void linear_attn_body(
                                 slot_stride,
                                 la.core_out.data(),
                                 R, V_h, K_d, V_d,
-                                stream, write_state);
+                                stream, write_state, rs_write_state_mask);
                         } else {
                             kernels::launch_chunk_gated_delta_prefill_batched_cached(
                                 q_recur_full,
@@ -1389,7 +1394,7 @@ void linear_attn_body(
                                 slot_stride,
                                 la.core_out.data(),
                                 R, V_h, K_d, V_d,
-                                stream, write_state);
+                                stream, write_state, rs_write_state_mask);
                         }
                     } else {
                         if (state_bf16) {
@@ -2420,17 +2425,44 @@ void qwen3_5_moe_forward_paged(
     const int V  = cfg.vocab_size;
     const int N  = total_tokens;
     const int R  = num_requests;
+    const float eps = cfg.rms_norm_eps;
+    cudaStream_t stream = cublas.stream();
     // A buffered write that ALSO folds: the boundary is a `commit_len` over
     // the extended layout rather than a separate replay pass, so it rides the
     // ordinary write path. `rs_fold_lens` is emitted for every row of every
     // buffered pass, so an all-zero one means "pure append" and must not turn
     // the pass into a fold.
-    const bool write_folds =
-        rs_buffer_write && rs_fold_lens_h != nullptr &&
-        std::any_of(rs_fold_lens_h, rs_fold_lens_h + R,
-                    [](std::uint32_t n) { return n != 0; });
-    const float eps = cfg.rms_norm_eps;
-    cudaStream_t stream = cublas.stream();
+    //
+    // A MIXED fire is the same thing per row: one request folds while another
+    // only appends. The rows share an initial state, an extended layout and
+    // their outputs -- they differ ONLY in whether the recurrence persists.
+    // So the pass-level `write_state` becomes "does ANY row persist", refined
+    // by a per-row device mask. A row persists when it folds, or when it has
+    // no buffer of its own at all (an empty write CSR span), which is the
+    // plain in-forward advance riding along in a buffered fire.
+    std::vector<std::uint8_t> rs_write_mask_h;
+    const std::uint8_t* rs_write_state_mask_d = nullptr;
+    bool write_folds = false;
+    if (rs_buffer_write && rs_fold_lens_h != nullptr &&
+        rs_buffer_slot_indptr_h != nullptr) {
+        rs_write_mask_h.resize(static_cast<std::size_t>(R));
+        bool all_persist = true;
+        for (int r = 0; r < R; ++r) {
+            const bool row_buffered =
+                rs_buffer_slot_indptr_h[r + 1] > rs_buffer_slot_indptr_h[r];
+            const bool persists = rs_fold_lens_h[r] != 0 || !row_buffered;
+            rs_write_mask_h[r] = persists ? 1 : 0;
+            write_folds = write_folds || persists;
+            all_persist = all_persist && persists;
+        }
+        if (write_folds && !all_persist) {
+            CUDA_CHECK(cudaMemcpyAsync(
+                la_ws.rs_write_state_mask.data(), rs_write_mask_h.data(),
+                rs_write_mask_h.size() * sizeof(std::uint8_t),
+                cudaMemcpyHostToDevice, stream));
+            rs_write_state_mask_d = la_ws.rs_write_state_mask.data();
+        }
+    }
 
     // The extended token layout for the buffer-read path, built once per fire
     // because every linear layer runs over the same rows.
@@ -2601,7 +2633,7 @@ void qwen3_5_moe_forward_paged(
                     has_buffer_read ? rs_buffer_read_lens_h : nullptr,
                     rs_buffer_heads_h,
                     has_buffer_read ? qo_ext_h.data() : nullptr,
-                    qo_ext_d, n_ext);
+                    qo_ext_d, n_ext, rs_write_state_mask_d);
             });
         } else {
             ++profile.full_layers;

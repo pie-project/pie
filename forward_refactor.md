@@ -1268,6 +1268,80 @@ model. It is harmless (the flags are consumed in `frame.cpp` to derive
 `is_fresh`), but it is dead storage of exactly the shape that hid the two real
 bugs, and should go.
 
+### 10.2.5 Mixed-position batches — LANDED
+
+One fire may now land its rows' folded boundaries in DIFFERENT places: request
+A appends to its buffer while request B folds outright. This is the last of the
+"a fire folds uniformly today" refusals and the shape real serving wants — one
+request committing while another speculates.
+
+**Why it is nearly free.** A buffered append and a plain in-forward fold are
+the SAME dispatch. Both run this fire's own tokens through the whole stack over
+the extended `[buffered | new]` layout, from the same initial state, producing
+the same outputs. They disagree about exactly one thing: whether the recurrence
+PERSISTS at the end. So the fix is not a second pass — it is to demote
+`write_state` from a per-pass boolean to a per-row mask.
+
+`const std::uint8_t* write_state_mask` now rides alongside `bool write_state`
+in every GDN and conv kernel; the gate is
+`write_state && (mask == nullptr || mask[r] != 0)`. A null mask means the pass
+is uniform, so every pre-existing call site is byte-identical to before, and
+`write_state = false` (frozen verify) still vetoes at the pass level. There are
+only six real gate sites across the two kernel files; the rest is signatures.
+
+The mask is derived IN THE MODEL, from arrays it already has:
+
+```
+persists(r) = rs_fold_lens[r] != 0            // this row folds
+           || buffer CSR span of r is empty   // this row owns no buffer
+```
+
+and uploaded into the linear-attention workspace next to `qo_ext`. Deriving it
+rather than wiring a new per-request array is deliberate: `ForwardInputs`,
+`run_forward_dispatch`'s copy block and the TP follower readback have now
+swallowed a per-request array three times (§10.2.3, §10.2.4). An array that is
+never plumbed cannot be dropped.
+
+**A row that folds in-forward inside a buffered pass** carries
+`start_tokens = row_tokens = fold_tokens = 0` and `RsPlan::Buffer::in_forward`.
+It cannot carry a fold LENGTH: `validate_fold` measures against buffered
+capacity, which such a row does not have. The driver recognises it by its empty
+buffer CSR span — which also makes the buffered-write slab check skip it, and
+makes the scatter loop skip it for free (the loop is bounded by the CSR).
+
+**Three refusals were relaxed and one added.** `rs_plan_for` now classifies
+each row independently and only requires uniformity for a pure COMMIT;
+`plan_rs_execution` reads the write off the CSR span rather than the flag (
+`PIE_RS_FLAG_BUFFER_WRITE` marks write-AND-fold, so a pure append carries no
+flags at all) and refuses only a replay row sharing with a computing one; and
+`LaunchGrouping` no longer sends every RS-buffer fire out alone —
+`touches_rs_buffer` became `rs_batch_kind`, with `Solo` reserved for the pure
+commit and a new rule that an RS-bound fire cannot share a wave with one that
+binds none (the RS arrays are one-per-request; a partial batch does not
+resolve). Metal, which has only the pass-level flag, now refuses a mixed pass
+loudly instead of folding every row or none.
+
+**A pure commit still cannot mix**, and this is not a limitation waiting to be
+lifted: its rows are not computed at all. The linear layers gather activations
+out of the slabs and return before the output projection. There is no per-row
+switch that lets a computing row ride along.
+
+**The acceptance test is one fire with two rows**, not two co-batched fires:
+the scheduler admits at most one fire per instance per wave, so a single
+inferlet cannot produce a mixed batch by submitting twice. `Duo` binds two RS
+working sets and two disjoint page ranges of one KV working set, and
+`gdn-foldcommit mixed` runs three identical duos — one buffering both rows, one
+folding both rows, one mixed — comparing the mixed one against each uniform
+reference row-wise. Two things make it non-vacuous:
+
+- The observable is the PEAK LOGIT, not the greedy token. This model has strong
+  attractors; the first attempt compared argmax and both references returned
+  the same token from genuinely different states. The vacuity guard, which
+  demands the two references disagree, is what caught it.
+- Verified by negative control: forcing the mask pointer to null makes row 0
+  report the FOLDING reference's value (16.50 instead of 14.19), so the test
+  observes the mask and not merely that the fire ran.
+
 ### 10.3 `mtp-native-verify` rewritten as fold-commit — LANDED
 
 The Tier-1.5 acceptance test was broken in two independent ways, both of which

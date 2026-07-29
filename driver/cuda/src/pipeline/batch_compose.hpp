@@ -360,35 +360,45 @@ inline bool plan_rs_execution(
     // as a `commit_len` over that layout rather than as a separate replay, so
     // the mode is still a write. Only a pure commit -- a fold with no write --
     // takes the gather-from-slabs BufferFold path.
-    const bool any_buffer_write = std::any_of(
-        slot_flags.begin(), slot_flags.end(), [](std::uint8_t flags) {
-            return (flags & PIE_RS_FLAG_BUFFER_WRITE) != 0;
-        });
-    const bool all_buffer_write = std::all_of(
-        slot_flags.begin(), slot_flags.end(), [](std::uint8_t flags) {
-            return (flags & PIE_RS_FLAG_BUFFER_WRITE) != 0;
-        });
-    if (any_buffer_write != all_buffer_write) {
+    //
+    // Rows are classified individually, because a fire may MIX them. A row
+    // that owns no buffer in this pass -- empty CSR span, no BUFFER_WRITE --
+    // is the plain in-forward advance, and it composes with buffered rows: the
+    // two shapes run the identical dispatch over the extended layout and
+    // disagree only about whether the recurrence persists, which travels as a
+    // per-row mask. A pure REPLAY row does NOT compose: it gathers activations
+    // out of the slabs instead of computing them.
+    auto row_span = [&](std::size_t r) -> std::uint32_t {
+        return has_buffer_csr
+            ? buffer_slot_indptr[r + 1] - buffer_slot_indptr[r]
+            : 0;
+    };
+    // NOTE `PIE_RS_FLAG_BUFFER_WRITE` marks a row that writes the buffer AND
+    // folds; a pure append carries no flags at all. So the write is read off
+    // the CSR span, and the flags only say whether the row's state persists.
+    bool any_buffer = false;
+    bool any_replay = false;
+    bool all_replay = true;
+    for (std::size_t r = 0; r < requests; ++r) {
+        const std::uint8_t flags = slot_flags[r];
+        const bool buffered_row = row_span(r) > 0;
+        const bool replays = buffered_row &&
+            (flags & PIE_RS_FLAG_FOLD) != 0 &&
+            (flags & PIE_RS_FLAG_BUFFER_WRITE) == 0;
+        any_buffer = any_buffer || buffered_row;
+        any_replay = any_replay || replays;
+        all_replay = all_replay && replays;
+    }
+    if (any_replay && !all_replay) {
         if (error != nullptr) {
-            *error = "mixed buffered-write and replay RS rows are unsupported";
+            *error =
+                "an RS row that only replays buffered tokens cannot share a fire with "
+                "one that computes new ones";
         }
         return false;
     }
-    const bool any_fold = !any_buffer_write && std::any_of(
-        slot_flags.begin(), slot_flags.end(), [](std::uint8_t flags) {
-            return (flags & PIE_RS_FLAG_FOLD) != 0;
-        });
-    const bool all_fold = !any_buffer_write && std::all_of(
-        slot_flags.begin(), slot_flags.end(), [](std::uint8_t flags) {
-            return (flags & PIE_RS_FLAG_FOLD) != 0;
-        });
-    if (any_fold != all_fold) {
-        if (error != nullptr) {
-            *error = "mixed folded and forward RS rows are unsupported";
-        }
-        return false;
-    }
-    if (!any_fold && buffer_slot_ids.empty()) {
+    const bool any_fold = all_replay;
+    if (!any_fold && !any_buffer) {
         plan.mode = pie_cuda_driver::RsExecutionMode::Forward;
         return true;
     }
@@ -444,6 +454,9 @@ inline bool plan_rs_execution(
             if (error != nullptr) *error = "resolved RS query CSR is not monotonic";
             return false;
         }
+        // An in-forward row riding along in a mixed fire owns no slabs and
+        // scatters nothing; its tokens are not buffer tokens.
+        if (row_span(request) == 0) continue;
         const std::uint64_t required_slabs =
             (static_cast<std::uint64_t>(end - begin) + buffer_page_tokens - 1) /
             buffer_page_tokens;

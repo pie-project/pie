@@ -135,18 +135,296 @@ impl Arm {
         let out = Channel::new([1], dtype::i32).named("arm_out");
         let sink = out.clone();
         fwd.epilogue(move || {
-            let t = reduce_argmax(intrinsics::logits());
-            sink.put(&t);
+            sink.put(&reduce_argmax(&intrinsics::logits()));
         });
         fwd.submit(pipe)
             .map_err(|e| format!("{tag} submit: {e}"))?;
-        Ok(Some(
-            out.take()
-                .get::<i32>()
-                .await
-                .map_err(|e| format!("{tag} take: {e}"))?[0],
-        ))
+        let token = out
+            .take()
+            .get::<i32>()
+            .await
+            .map_err(|e| format!("{tag} take: {e}"))?[0];
+        Ok(Some(token))
     }
+}
+
+/// TWO RS working sets in ONE fire, landing their folded boundaries in
+/// DIFFERENT places: row 0 only appends to its buffer, row 1 folds outright.
+///
+/// This is the shape the planner used to refuse ("a fire folds uniformly
+/// today") and the one real serving wants: a request committing while another
+/// speculates. The two rows run the identical dispatch -- same initial state,
+/// same layout, same outputs -- and disagree only about whether the recurrence
+/// PERSISTS, which now travels as a per-row device mask instead of a per-pass
+/// flag.
+///
+/// The check is an equivalence against the same two shapes run SOLO, drawn one
+/// token PAST the mixed fire so it pins the resulting states rather than the
+/// logits along the way. It is only meaningful because the two references
+/// disagree with each other -- a buffered row's state does not move, a folded
+/// row's does -- so the test asserts that first. A mask that was ignored in
+/// either direction collapses one row onto the wrong reference.
+/// How far two peak logits may drift and still count as the same state. The
+/// two sides run the same math on the same inputs in the same batch shape, so
+/// this is slack against reduction-order noise, not against a real difference.
+const TOL: f32 = 1e-2;
+
+/// TWO recurrent contexts in ONE fire, so a single pass can land their folded
+/// boundaries in DIFFERENT places.
+///
+/// Both rows share a KV working set but own DISJOINT page ranges, so each row
+/// is an independent context that happens to be batched. The rows carry the
+/// same tokens at the same positions; the only thing that ever differs between
+/// them is what the fire asks their recurrence to do.
+struct Duo {
+    ws: WorkingSet,
+    rs: [RsWorkingSet; 2],
+    page_size: u32,
+    rs_page: u32,
+    /// Pages per ROW. Row r owns `[r * span, (r + 1) * span)`.
+    span: u32,
+    pos: u32,
+}
+
+impl Duo {
+    fn new(span: u32) -> Result<Self> {
+        let ws = WorkingSet::new();
+        let page_size = ws.page_size();
+        ws.reserve(2 * span)
+            .map_err(|e| format!("duo reserve: {e}"))?;
+        let rs = [RsWorkingSet::new(), RsWorkingSet::new()];
+        Ok(Duo {
+            ws,
+            rs_page: inferlet::model::rs_buffer_page_size().max(1),
+            rs,
+            page_size,
+            span,
+            pos: 0,
+        })
+    }
+
+    /// One two-row fire over `toks` (the SAME tokens on both rows).
+    ///
+    /// `buffered[r]` is `Some((start, fold_len))` for a row that scatters into
+    /// its buffer, `None` for the plain in-forward fold. A fire whose two
+    /// entries disagree is the mixed pass this whole path exists for.
+    ///
+    /// Returns each row's peak logit. The greedy token is far too coarse to
+    /// witness a state difference on this model -- it has strong attractors
+    /// and two genuinely different states routinely pick the same argmax --
+    /// whereas the peak logit VALUE moves with the state continuously.
+    async fn fire(
+        &self,
+        toks: &[u32],
+        buffered: [Option<(u32, u32)>; 2],
+        pipe: &Pipeline,
+        tag: &str,
+    ) -> Result<[f32; 2]> {
+        let t = toks.len() as u32;
+        let base = self.pos;
+        let end = base + t;
+        let ps = self.page_size;
+        let row_pages = end.div_ceil(ps);
+        let ch = |v: Vec<u32>| Channel::from(v);
+
+        let fwd = ForwardPass::new();
+        let embed: Vec<i32> = (0..2)
+            .flat_map(|_| toks.iter().map(|&x| x as i32))
+            .collect();
+        fwd.embed(&Channel::from(embed), &ch(vec![0, t, 2 * t]))?;
+
+        // Row r reads and writes only its own page range; `w-slot` is the
+        // index INTO THAT ROW'S page list, so both rows use the identical
+        // row-relative descriptor and differ only in which pages the list
+        // names.
+        let pages: Vec<u32> = (0..2)
+            .flat_map(|r| (0..row_pages).map(move |p| r * self.span + p))
+            .collect();
+        let slots: Vec<u32> = (base..end).map(|p| p / ps).collect();
+        let offs: Vec<u32> = (base..end).map(|p| p % ps).collect();
+        fwd.attention(
+            &self.ws,
+            ..,
+            ..,
+            &ch(vec![end, end]),
+            &Channel::from(pages),
+            &ch(vec![0, row_pages, 2 * row_pages]),
+            &ch([slots.clone(), slots].concat()),
+            &ch([offs.clone(), offs].concat()),
+            &ch([(base..end).collect::<Vec<_>>(), (base..end).collect()].concat()),
+            None,
+        )?;
+
+        if buffered.iter().all(Option::is_none) {
+            fwd.recurrent(&self.rs)?;
+        } else {
+            let rp = self.rs_page;
+            let mut fold_len = Vec::with_capacity(2);
+            let mut buffer_len = Vec::with_capacity(2);
+            let mut buffer_pages: Vec<u32> = Vec::new();
+            let mut buffer_indptr = vec![0u32];
+            let mut w_slot: Vec<u32> = Vec::new();
+            let mut w_off: Vec<u32> = Vec::new();
+            for entry in buffered {
+                match entry {
+                    // A row that folds in-forward owns no buffer in this pass:
+                    // it declares zero buffer tokens and no pages, and asks for
+                    // the fire-invariant "fold everything".
+                    None => {
+                        fold_len.push(u32::MAX);
+                        buffer_len.push(0);
+                        buffer_indptr.push(buffer_pages.len() as u32);
+                    }
+                    Some((buf_start, fold)) => {
+                        let first = buf_start / rp;
+                        let last = (buf_start + t - 1) / rp;
+                        fold_len.push(fold);
+                        buffer_len.push(t);
+                        for p in first..=last {
+                            buffer_pages.push(p);
+                        }
+                        buffer_indptr.push(buffer_pages.len() as u32);
+                        for x in buf_start..buf_start + t {
+                            w_slot.push(x / rp - first);
+                            w_off.push(x % rp);
+                        }
+                    }
+                }
+            }
+            fwd.recurrent_with(
+                &self.rs,
+                &ch(fold_len),
+                ..,
+                ..,
+                &ch(buffer_len),
+                &Channel::from(buffer_pages),
+                &Channel::from(buffer_indptr),
+                &Channel::from(w_slot),
+                &Channel::from(w_off),
+            )
+            .map_err(|e| format!("{tag} recurrent binding: {e}"))?;
+        }
+
+        // The default read-out is each lane's last row, so `logits` is
+        // `[2, vocab]` and both reductions come back per row.
+        let peak = Channel::new([2], dtype::f32).named("duo_peak");
+        let sink = peak.clone();
+        fwd.epilogue(move || {
+            sink.put(&reduce_max(intrinsics::logits()));
+        });
+        fwd.submit(pipe)
+            .map_err(|e| format!("{tag} submit: {e}"))?;
+        let v = peak
+            .take()
+            .get::<f32>()
+            .await
+            .map_err(|e| format!("{tag} take: {e}"))?;
+        Ok([v[0], v[1]])
+    }
+}
+
+/// One fire landing its two rows' folded boundaries in DIFFERENT places: row 0
+/// only appends to its buffer, row 1 folds outright.
+///
+/// This is the shape the planner used to refuse ("a fire folds uniformly
+/// today") and the one real serving wants -- a request committing while
+/// another speculates. The two rows run the identical dispatch over the
+/// identical layout and disagree only about whether the recurrence PERSISTS,
+/// which now travels as a per-row device mask instead of a per-pass flag.
+///
+/// The check is an equivalence against the SAME two-row fire run uniformly:
+/// one duo buffers on both rows, one folds on both rows, and the mixed duo
+/// must match the buffering reference on row 0 and the folding reference on
+/// row 1. Every shape is identical -- same batch, same pages, same tokens --
+/// so the only variable is the mask.
+///
+/// It asserts up front that the two uniform references DISAGREE with each
+/// other. Without that the equivalence holds vacuously and a mask ignored in
+/// either direction would go unnoticed.
+async fn mixed_positions(prompt: &[u32]) -> Result<String> {
+    // The rows differ ONLY in their recurrent state -- same tokens, same KV
+    // positions -- so the continuation must be long and varied enough that the
+    // difference moves the logits. A short repeated one does not.
+    let cont: Vec<u32> = {
+        let c = wit_model::encode(" quick brown fox jumps over the lazy dog and runs away");
+        if c.is_empty() { vec![1, 2, 3, 4, 5, 6, 7, 8] } else { c }
+    };
+    let t = cont.len() as u32;
+    let n = prompt.len() as u32;
+    let pipe = Pipeline::new();
+
+    let span = {
+        let probe = WorkingSet::new();
+        (n + t + 2).div_ceil(probe.page_size()).max(1)
+    };
+    let buf_pages = |d: &Duo| t.div_ceil(d.rs_page);
+
+    // Three duos, identical in every way except what the middle fire asks of
+    // each row: uniformly buffering, uniformly folding, and mixed.
+    let mut duos = Vec::new();
+    for _ in 0..3 {
+        duos.push(Duo::new(span)?);
+    }
+    let next = {
+        let mut peaks: Vec<[f32; 2]> = Vec::new();
+        for (i, duo) in duos.iter_mut().enumerate() {
+            duo.fire(prompt, [None, None], &pipe, "prefill").await?;
+            duo.pos = n;
+            let shapes: [Option<(u32, u32)>; 2] = match i {
+                0 => [Some((0, 0)), Some((0, 0))],
+                1 => [None, None],
+                _ => [Some((0, 0)), None],
+            };
+            for (row, shape) in shapes.iter().enumerate() {
+                if shape.is_some() {
+                    duo.rs[row]
+                        .alloc_buffer(buf_pages(duo))
+                        .map_err(|e| format!("duo {i} row {row} alloc_buffer: {e}"))?;
+                }
+            }
+            duo.fire(&cont, shapes, &pipe, "middle").await?;
+            duo.pos += t;
+            // Abandon whatever was buffered, so the follow-up fire sees an
+            // empty buffer on every row of every duo.
+            for (row, shape) in shapes.iter().enumerate() {
+                if shape.is_some() {
+                    duo.rs[row]
+                        .free_buffer(&[0])
+                        .map_err(|e| format!("duo {i} row {row} free_buffer: {e}"))?;
+                }
+            }
+            peaks.push(duo.fire(&[cont[0]], [None, None], &pipe, "next").await?);
+        }
+        peaks
+    };
+    pipe.close();
+
+    let (buf_ref, fold_ref, mixed) = (next[0], next[1], next[2]);
+    let spread = (fold_ref[0] - buf_ref[0]).abs();
+    if spread <= 16.0 * TOL {
+        return Err(format!(
+            "buffering and folding leave indistinguishable states \
+             (buffer={:.4} fold={:.4}); this prompt cannot witness a per-row fold \
+             and the test would pass vacuously",
+            buf_ref[0], fold_ref[0]
+        ));
+    }
+    let agree =
+        (mixed[0] - buf_ref[0]).abs() <= TOL && (mixed[1] - fold_ref[1]).abs() <= TOL;
+    let result = format!(
+        "mixed tokens={t} row0={:.4} buf_ref={:.4} row1={:.4} fold_ref={:.4} \
+         spread={spread:.4} agree={}",
+        mixed[0],
+        buf_ref[0],
+        mixed[1],
+        fold_ref[1],
+        if agree { "yes" } else { "no" }
+    );
+    eprintln!("[GDN_FOLDCOMMIT] {result}");
+    if !agree {
+        return Err(result);
+    }
+    Ok(result)
 }
 
 /// A fold running THROUGH a non-empty buffer, in the same fire that fills it.
@@ -241,6 +519,12 @@ async fn main(input: String) -> Result<String> {
 
     if !wit_model::is_linear() {
         return Ok("skipped: fold-commit needs a linear model".to_string());
+    }
+
+    if input.trim() == "mixed" {
+        let prompt = wit_model::encode("hello world");
+        let prompt: Vec<u32> = if prompt.is_empty() { vec![0] } else { prompt };
+        return mixed_positions(&prompt).await;
     }
 
     if input.trim() == "inside" {

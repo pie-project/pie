@@ -322,27 +322,62 @@ impl PendingRequest {
     fn requires_solo_submission(&self) -> bool {
         (self.prebuilt && self.pipeline_id.is_none())
             || (self.preserves_inner_rows() && self.request.qo_indptr.last().copied() == Some(0))
-            || self.touches_rs_buffer()
+            || self.rs_batch_kind() == RsBatchKind::Solo
     }
 
-    /// A fire that buffers recurrent activations, or folds them back, picks
-    /// the driver's RS execution mode for the WHOLE composed batch: the mode
-    /// is read off `rs_slot_flags` and the buffered CSR, and the driver
-    /// rejects a batch that mixes folded and forward rows or that gives a
-    /// plain row no slabs. Coalescing such a fire with an ordinary one would
-    /// therefore fail the whole wave, so it goes out alone.
-    fn touches_rs_buffer(&self) -> bool {
-        !self.request.rs_buffer_slot_ids.is_empty()
-            || self
-                .request
-                .rs_slot_flags
-                .iter()
-                .any(|flags| flags & pie_driver_abi::RS_FLAG_FOLD != 0)
+    /// How this fire's recurrent-state rows constrain the wave it joins.
+    ///
+    /// The driver's RS execution mode is read off `rs_slot_flags` and the
+    /// buffered CSR for the WHOLE composed batch, so a fire that touches the
+    /// RS buffer used to go out alone unconditionally. It no longer has to:
+    /// a row that appends to its buffer and a row that folds in-forward run
+    /// the identical dispatch and differ only in whether the recurrence
+    /// persists, which the driver now expresses per row. What still cannot
+    /// share a batch is a pure COMMIT — it gathers its activations out of the
+    /// slabs instead of computing them, a wholly different dispatch — and an
+    /// RS row cannot share with a row that has no RS binding at all, because
+    /// the RS arrays are one-per-request and a partial batch does not resolve.
+    fn rs_batch_kind(&self) -> RsBatchKind {
+        if self.request.rs_slot_ids.is_empty() {
+            return RsBatchKind::None;
+        }
+        let indptr = &self.request.rs_buffer_slot_indptr;
+        let replays = self
+            .request
+            .rs_slot_flags
+            .iter()
+            .enumerate()
+            .any(|(row, flags)| {
+                let span = indptr
+                    .get(row + 1)
+                    .zip(indptr.get(row))
+                    .is_some_and(|(end, begin)| end > begin);
+                span && flags & pie_driver_abi::RS_FLAG_FOLD != 0
+                    && flags & pie_driver_abi::RS_FLAG_BUFFER_WRITE == 0
+            });
+        if replays {
+            RsBatchKind::Solo
+        } else {
+            RsBatchKind::Composable
+        }
     }
 
     pub(crate) fn preserves_inner_rows(&self) -> bool {
         self.wire_row_count() > 1
     }
+}
+
+/// See [`PendingRequest::rs_batch_kind`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RsBatchKind {
+    /// No recurrent-state rows.
+    None,
+    /// Recurrent rows that compute their own tokens: a plain in-forward fold,
+    /// a buffered append, or a write-and-fold. These compose with each other.
+    Composable,
+    /// A pure commit, which replays buffered activations instead of computing
+    /// them. Goes out alone.
+    Solo,
 }
 
 fn fire_membership_hash<'a>(logical_fire_ids: impl IntoIterator<Item = &'a u64>) -> u64 {
@@ -371,6 +406,7 @@ pub(crate) struct LaunchGrouping {
     forward_tokens: usize,
     page_refs: usize,
     has_solo_submission: bool,
+    has_rs_rows: bool,
     has_user_mask: bool,
     has_device_geometry: bool,
 }
@@ -403,6 +439,14 @@ impl LaunchGrouping {
             return false;
         }
         if self.count != 0 && (request.requires_solo_submission() || self.has_solo_submission) {
+            return false;
+        }
+        // RS rows are one per request across the whole composed batch, so a
+        // fire that binds recurrent state and one that does not cannot share
+        // a wave: the driver would see fewer slot ids than requests.
+        if self.count != 0
+            && (request.rs_batch_kind() == RsBatchKind::None) != !self.has_rs_rows
+        {
             return false;
         }
         // Custom wire masks co-batch freely with other wire-geometry fires —
@@ -450,6 +494,7 @@ impl LaunchGrouping {
         self.forward_tokens = self.forward_tokens.saturating_add(usage.forward_tokens);
         self.page_refs = self.page_refs.saturating_add(usage.page_refs);
         self.has_solo_submission |= request.requires_solo_submission();
+        self.has_rs_rows |= request.rs_batch_kind() != RsBatchKind::None;
         self.has_user_mask |= request.request.has_user_mask;
         self.has_device_geometry |= request.request.device_resolved_geometry;
         request.requires_solo_submission()

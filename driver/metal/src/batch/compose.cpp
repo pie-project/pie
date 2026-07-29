@@ -8,6 +8,7 @@ namespace pie::metal::batch {
 
 namespace {
 
+constexpr std::uint8_t kRsFlagFold = 2;
 constexpr std::uint8_t kRsFlagReset = 1;
 
 template <typename T>
@@ -77,6 +78,29 @@ pie_native::LaunchView build_launch_view(const pie_native::StepLaunch& launch) {
         throw std::runtime_error(
             "this driver cannot address a buffer whose first live token is "
             "mid-page; fold whole pages only");
+    }
+    // And likewise for a MIXED fire, where one row folds its recurrence while
+    // another only buffers. The two shapes are the same dispatch and differ
+    // only in whether the state persists, which CUDA expresses as a per-row
+    // mask; this driver has only the pass-level flag, so it would fold every
+    // row or none of them. Either way one row's state is wrong and the error
+    // is unrecoverable once folded.
+    if (launch.rs_slot_flags.len != 0 &&
+        launch.rs_buffer_slot_indptr.len == launch.rs_slot_flags.len + 1) {
+        const auto persists = [&](std::size_t r) {
+            const bool buffered =
+                launch.rs_buffer_slot_indptr.ptr[r + 1] >
+                launch.rs_buffer_slot_indptr.ptr[r];
+            return !buffered ||
+                (launch.rs_slot_flags.ptr[r] & kRsFlagFold) != 0;
+        };
+        for (std::size_t r = 1; r < launch.rs_slot_flags.len; ++r) {
+            if (persists(r) != persists(0)) {
+                throw std::runtime_error(
+                    "this driver cannot fold one request's recurrent state while "
+                    "another only buffers; split the fire");
+            }
+        }
     }
     view.rs_translation =
         pie_native::slice_from_u32(

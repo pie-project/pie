@@ -194,3 +194,33 @@ async fn a_fire_can_append_to_a_buffer_and_fold_through_it() -> Result<()> {
     eprintln!("[gdn-foldcommit] {result}");
     Ok(())
 }
+
+/// TWO requests in ONE fire landing their folded boundaries in DIFFERENT
+/// places — the shape the planner used to refuse ("a fire folds uniformly
+/// today") and the one real serving wants: a request committing while another
+/// speculates.
+///
+/// The two rows run the identical dispatch over the identical layout; they
+/// differ only in whether the recurrence PERSISTS, which now travels as a
+/// per-row device mask rather than a per-pass flag. The inferlet submits both
+/// fires before awaiting either so the batcher composes them, then checks each
+/// row against the same shape run SOLO — one token PAST the mixed fire, so a
+/// pass pins the resulting states and not the logits along the way.
+///
+/// It also asserts up front that the two references DISAGREE with each other.
+/// Without that the equivalence would hold vacuously and a mask ignored in
+/// either direction would go unnoticed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a GPU + Qwen3.5-0.8B (GDN backbone) in the HF cache"]
+async fn one_fire_can_fold_one_request_while_another_only_buffers() -> Result<()> {
+    let result = run_foldcommit("mixed")
+        .await?
+        .map_err(|error| anyhow::anyhow!("mixed-position fire failed: {error}"))?;
+    anyhow::ensure!(
+        result.contains("agree=yes"),
+        "a fire that folds one row and buffers another must match the same two \
+         shapes run solo: {result}"
+    );
+    eprintln!("[gdn-foldcommit] {result}");
+    Ok(())
+}

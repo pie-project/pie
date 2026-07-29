@@ -95,10 +95,18 @@ pub enum RsPlan {
     /// `fold_tokens[r]` via `commit_len`, so the outputs cover every new token
     /// while the boundary lands wherever the guest asked — including strictly
     /// INSIDE this fire's own new tokens.
+    ///
+    /// `in_forward[r]` marks a row that owns NO buffer in this pass: it folds
+    /// its own new tokens straight into the folded state, exactly as
+    /// `RsPlan::Fold` does, while riding along in a fire whose other rows
+    /// buffer. Such a row carries `start_tokens = row_tokens = fold_tokens =
+    /// 0` — it has no buffered span to measure a fold against — and the driver
+    /// recognises it by its empty buffer CSR span.
     Buffer {
         start_tokens: Vec<u32>,
         row_tokens: Vec<u32>,
         fold_tokens: Vec<u32>,
+        in_forward: Vec<bool>,
     },
     /// Replay `tokens[r]` buffered tokens of row `r` into its folded state.
     FoldBuffered { tokens: Vec<u32> },
@@ -117,7 +125,11 @@ impl RsPlan {
                 start_tokens,
                 row_tokens,
                 fold_tokens,
+                in_forward,
             } => {
+                if in_forward.get(index).copied().unwrap_or(false) {
+                    return (true, None, None, RsBufferIntent::Write);
+                }
                 let n = fold_tokens.get(index).copied().unwrap_or(0);
                 (
                     n > 0,
@@ -654,6 +666,7 @@ mod tests {
         RsPlan::Buffer {
             start_tokens: vec![start_token; row_tokens.len()],
             fold_tokens: vec![0; row_tokens.len()],
+            in_forward: vec![false; row_tokens.len()],
             row_tokens,
         }
     }

@@ -204,7 +204,11 @@ void launch_chunk_gated_delta_prefill_batched(
     // only commit_len[r] tokens (the confirmed [input|accepted] prefix) into the
     // committed state. FLA path only.
     bool write_state = true,
-    const int* commit_len = nullptr);
+    const int* commit_len = nullptr,
+    // Per-row refinement of `write_state`: row r persists only if the mask is
+    // null or `mask[r] != 0`. A MIXED fire folds some rows and leaves others
+    // buffered; they share an initial state and outputs and differ only here.
+    const std::uint8_t* write_state_mask = nullptr);
 void launch_chunk_gated_delta_prefill_batched_state_bf16(
     const float* q_norm,
     const float* k_norm,
@@ -219,7 +223,11 @@ void launch_chunk_gated_delta_prefill_batched_state_bf16(
     int R, int K_h, int V_h, int K_d, int V_d,
     cudaStream_t stream,
     bool write_state = true,
-    const int* commit_len = nullptr);
+    const int* commit_len = nullptr,
+    // Per-row refinement of `write_state`: row r persists only if the mask is
+    // null or `mask[r] != 0`. A MIXED fire folds some rows and leaves others
+    // buffered; they share an initial state and outputs and differ only here.
+    const std::uint8_t* write_state_mask = nullptr);
 
 // Small-T variant for target verification. One block per (request, head)
 // caches the [K_d, V_d] recurrent state tile in shared memory, walks the
@@ -240,7 +248,8 @@ void launch_chunk_gated_delta_prefill_batched_cached(
     long long    slot_stride_elems,
     float*       out,
     int R, int V_h, int K_d, int V_d,
-    cudaStream_t stream, bool write_state = true);
+    cudaStream_t stream, bool write_state = true,
+    const std::uint8_t* write_state_mask = nullptr);
 void launch_chunk_gated_delta_prefill_batched_cached_state_bf16(
     const float* q_norm,
     const float* k_norm,
@@ -253,7 +262,8 @@ void launch_chunk_gated_delta_prefill_batched_cached_state_bf16(
     long long    slot_stride_elems,
     float*       out,
     int R, int V_h, int K_d, int V_d,
-    cudaStream_t stream, bool write_state = true);
+    cudaStream_t stream, bool write_state = true,
+    const std::uint8_t* write_state_mask = nullptr);
 
 // Warp-tiled small-T variant. Four warps per block process four V rows for a
 // single (request, head), keeping each lane's K-fragment of recurrent state in
@@ -270,7 +280,8 @@ void launch_chunk_gated_delta_prefill_batched_warp_tiled(
     long long    slot_stride_elems,
     float*       out,
     int R, int V_h, int K_d, int V_d,
-    cudaStream_t stream, bool write_state = true);
+    cudaStream_t stream, bool write_state = true,
+    const std::uint8_t* write_state_mask = nullptr);
 void launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16(
     const float* q_norm,
     const float* k_norm,
@@ -283,7 +294,8 @@ void launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16(
     long long    slot_stride_elems,
     float*       out,
     int R, int V_h, int K_d, int V_d,
-    cudaStream_t stream, bool write_state = true);
+    cudaStream_t stream, bool write_state = true,
+    const std::uint8_t* write_state_mask = nullptr);
 
 // Same warp-tiled small-T recurrence, but Q/K are stored with fewer heads
 // than V and are repeated logically (`V_h % K_h == 0`). This avoids
@@ -300,7 +312,8 @@ void launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa(
     long long    slot_stride_elems,
     float*       out,
     int R, int K_h, int V_h, int K_d, int V_d,
-    cudaStream_t stream, bool write_state = true);
+    cudaStream_t stream, bool write_state = true,
+    const std::uint8_t* write_state_mask = nullptr);
 void launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16(
     const float* q_norm_kh,
     const float* k_norm_kh,
@@ -313,7 +326,8 @@ void launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16(
     long long    slot_stride_elems,
     float*       out,
     int R, int K_h, int V_h, int K_d, int V_d,
-    cudaStream_t stream, bool write_state = true);
+    cudaStream_t stream, bool write_state = true,
+    const std::uint8_t* write_state_mask = nullptr);
 
 // L2-normalise rows of `[N, hidden]` bf16, optionally scale each row
 // element by `scale` after normalisation, and emit fp32 output. Used

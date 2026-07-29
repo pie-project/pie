@@ -57,6 +57,14 @@ struct Qwen3_5LinearAttnWorkspace {
     // run over when a request must replay buffered tokens before its own
     // (`[B_r | T_r]` per row). Capacity R+1 <= max_tokens+1.
     DeviceBuffer<std::uint32_t> qo_ext;        // [R+1] u32
+
+    // MIXED passes only: one byte per request, non-zero where the row's
+    // recurrent state must persist. A fire may fold one request while another
+    // only appends to its buffer, and the two shapes differ ONLY here -- same
+    // initial state, same extended layout, same outputs. Left unset (and the
+    // pointer null) whenever every row agrees, so the uniform path is
+    // byte-identical to before.
+    DeviceBuffer<std::uint8_t>  rs_write_state_mask;  // [R] u8
     int max_tokens = 0;
 
     static Qwen3_5LinearAttnWorkspace allocate(

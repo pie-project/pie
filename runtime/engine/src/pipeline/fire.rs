@@ -430,7 +430,7 @@ fn rs_plan_for(
             fold_len.len()
         ));
     }
-    let row_tokens: Vec<u32> = (0..rows)
+    let mut row_tokens: Vec<u32> = (0..rows)
         .map(|row| {
             qo_indptr
                 .get(row + 1)
@@ -446,24 +446,27 @@ fn rs_plan_for(
     // occupancy and the legal "append onto an empty buffer" fire was refused
     // as an append onto a non-empty one. The store now publishes the written
     // span, so `buffer_tokens` is exact.
-    let buffered: Vec<u32> = {
+    let mut buffered: Vec<u32> = {
         let store = stores.rs.lock().unwrap();
         ids.iter()
             .map(|id| store.buffer_tokens(*id).unwrap_or(0))
             .collect()
     };
 
-    // The plan is per-pass, not per-row, so every row must land in the same
-    // position. Classify row 0 and require the rest to agree — a mixed batch
-    // is a real use case (one request commits while another speculates) but it
-    // needs the driver-side read path, so refuse it explicitly.
-    #[derive(PartialEq, Eq, Debug)]
+    // Classify each row independently, then decide what the PASS can be.
+    // `Fold` and `Buffer` mix freely: both run this fire's own tokens through
+    // the full stack over the extended layout, and they differ only in whether
+    // the row's recurrence persists — which the driver now expresses as a
+    // per-row mask rather than a per-pass flag. `Commit` does not mix with
+    // anything: it replays activations out of the slabs instead of computing
+    // them, which is a different dispatch, not a different flag.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     enum Position {
         Fold,
         Buffer,
         Commit,
     }
-    let mut position: Option<Position> = None;
+    let mut kinds: Vec<Position> = Vec::with_capacity(rows);
     let mut fold_tokens: Vec<u32> = vec![0; rows];
     for row in 0..rows {
         let (b, t) = (buffered[row], row_tokens[row]);
@@ -510,19 +513,49 @@ fn rs_plan_for(
                 b + t
             ));
         };
-        match &position {
-            None => position = Some(here),
-            Some(seen) if *seen == here => {}
-            Some(seen) => {
-                return Err(format!(
-                    "request row {row} lands the folded boundary at {here:?} while an \
-                     earlier row lands it at {seen:?}; a fire folds uniformly today"
-                ));
-            }
+        kinds.push(here);
+    }
+
+    // A pure commit cannot share a fire. Its rows are not computed at all --
+    // the linear layers gather already-buffered activations and return before
+    // the output projection -- so there is no per-row switch that would let a
+    // computing row ride along.
+    if kinds.iter().any(|k| *k == Position::Commit)
+        && !kinds.iter().all(|k| *k == Position::Commit)
+    {
+        let row = kinds
+            .iter()
+            .position(|k| *k == Position::Commit)
+            .expect("checked above");
+        return Err(format!(
+            "request row {row} only replays buffered tokens while another row of the same \
+             fire computes new ones; a buffered commit gathers its activations instead of \
+             producing them, so it cannot share a pass. Split the fire"
+        ));
+    }
+
+    let pass = if kinds.iter().all(|k| *k == Position::Commit) {
+        Position::Commit
+    } else if kinds.iter().all(|k| *k == Position::Fold) {
+        Position::Fold
+    } else {
+        // Mixed, or uniformly buffered. Either way the pass runs the buffered
+        // shape; an `in_forward` row simply owns no buffer inside it.
+        Position::Buffer
+    };
+    let in_forward: Vec<bool> = kinds.iter().map(|k| *k == Position::Fold).collect();
+    for (row, forward) in in_forward.iter().enumerate() {
+        if *forward {
+            // Its boundary moves through its OWN tokens, not through a buffer,
+            // so it carries no fold length: `validate_fold` measures against
+            // buffered capacity, which this row does not have.
+            fold_tokens[row] = 0;
+            buffered[row] = 0;
+            row_tokens[row] = 0;
         }
     }
 
-    Ok(match position.expect("rows > 0") {
+    Ok(match pass {
         Position::Fold => rs::RsPlan::Fold,
         // Each row opens at its own exact occupancy. The planner still refuses
         // a non-zero one above until the recurrence can read the buffer, but
@@ -532,6 +565,7 @@ fn rs_plan_for(
             start_tokens: buffered,
             row_tokens,
             fold_tokens,
+            in_forward,
         },
         Position::Commit => rs::RsPlan::FoldBuffered {
             tokens: fold_len.to_vec(),
