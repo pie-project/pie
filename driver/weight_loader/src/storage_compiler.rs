@@ -38,7 +38,7 @@ pub fn compile_storage_program(
     let mut program = lower_layout_plan(metadata, &optimized.plan, target.clone())?;
     program.optimizer = optimized.report;
     if target.stream_routed_experts {
-        let Some(arch) = crate::abi::stream_arch_for(&cfg.model_type) else {
+        let Some(arch) = crate::abi::stream_arch_for(&cfg.model_type, &target) else {
             return Err(CompileError::InvalidInput(format!(
                 "stream_routed_experts is not supported for model_type='{}' \
                  (supported: deepseek_v4, gpt_oss, mixtral, qwen3_moe, qwen3_5_moe)",

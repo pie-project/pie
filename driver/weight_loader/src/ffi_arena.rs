@@ -9,6 +9,7 @@ use crate::ffi_types::{
     PieLoaderStorageProgramView, PieLoaderStreamBindingSlice, PieLoaderStreamBindingView,
     PieLoaderStreamPlanView, PieLoaderStridedExtentView, PieLoaderTensorDeclSlice,
     PieLoaderTensorDeclView, PieLoaderTileMapKind, PieLoaderU32Slice, PieLoaderU64Slice,
+    PieLoaderExpertPackKind,
 };
 use crate::storage::{
     DestExtent, SourceExtent, StorageInstr, StorageProgram, StridedExtent, TileMapKind,
@@ -175,6 +176,17 @@ impl FfiArena {
                 section_bytes: PieLoaderU64Slice {
                     ptr: self.stream_section_bytes.as_ptr(),
                     len: self.stream_section_bytes.len(),
+                },
+                pack_kind: match program.stream.pack_kind {
+                    crate::storage::ExpertPackKind::None => {
+                        PieLoaderExpertPackKind::None
+                    }
+                    crate::storage::ExpertPackKind::GptOssNativeMarlin => {
+                        PieLoaderExpertPackKind::GptOssNativeMarlin
+                    }
+                    crate::storage::ExpertPackKind::GptOssEagerBf16 => {
+                        PieLoaderExpertPackKind::GptOssEagerBf16
+                    }
                 },
             },
         }

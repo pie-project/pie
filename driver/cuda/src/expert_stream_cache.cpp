@@ -128,6 +128,7 @@ StreamedExpertTable streamed_expert_table_from_program(
     table.num_layers = static_cast<int>(stream.num_layers);
     table.num_experts = static_cast<int>(stream.num_experts);
     table.sections_per_expert = sections;
+    table.pack_kind = static_cast<std::uint32_t>(stream.pack_kind);
     table.slot_bytes = stream.slot_bytes;
     table.section_bytes.assign(
         stream.section_bytes.ptr,

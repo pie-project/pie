@@ -472,10 +472,10 @@ struct ArchProfile {
     /// llama-family rules; archs with a different expert/attention layout (e.g.
     /// DeepSeek-V4's native `.ffn.experts.w*`) register their own function.
     shard_axis_fn: fn(&str) -> Option<Axis>,
-    /// SSD expert streaming: arch-specific section layout + name parser for the
-    /// deferred [`crate::storage::StreamPlan`]. `None` = arch does not support
-    /// `stream_routed_experts`.
-    stream: Option<crate::stream::StreamArchDesc>,
+    /// SSD expert streaming: resolve the arch stream recipe under `target`
+    /// (policy-dependent arches like GPT-OSS native vs routed). `None` = arch
+    /// does not support `stream_routed_experts`.
+    stream_for: Option<fn(&crate::storage::StorageTarget) -> Option<crate::stream::StreamArchDesc>>,
 }
 
 const GENERIC_ARCH: ArchProfile = ArchProfile {
@@ -491,7 +491,7 @@ const GENERIC_ARCH: ArchProfile = ArchProfile {
     skip_dense_qkv_fusion: false,
     stack_per_expert_moe: false,
     shard_axis_fn: llama_like_shard_axis,
-    stream: None,
+    stream_for: None,
 };
 
 /// (matching model_type strings, profile). Matched case-insensitively. The
@@ -517,7 +517,7 @@ const ARCH_PROFILES: &[(&[&str], ArchProfile)] = &[
         &["deepseek_v4"],
         ArchProfile {
             shard_axis_fn: dsv4_shard_axis,
-            stream: Some(crate::stream_arch::DSV4_STREAM_ARCH),
+            stream_for: Some(crate::stream_arch::select_dsv4),
             ..GENERIC_ARCH
         },
     ),
@@ -533,7 +533,7 @@ const ARCH_PROFILES: &[(&[&str], ArchProfile)] = &[
             // bind_gpt_oss reads separate q/k/v (and biases); the generic
             // dense QKV join would consume them into qkv_proj.fused.weight.
             skip_dense_qkv_fusion: true,
-            stream: Some(crate::stream_arch::GPT_OSS_STREAM_ARCH),
+            stream_for: Some(crate::stream_arch::select_gpt_oss),
             ..GENERIC_ARCH
         },
     ),
@@ -543,7 +543,7 @@ const ARCH_PROFILES: &[(&[&str], ArchProfile)] = &[
         &["mixtral"],
         ArchProfile {
             skip_dense_qkv_fusion: true,
-            stream: Some(crate::stream_arch::MIXTRAL_STREAM_ARCH),
+            stream_for: Some(crate::stream_arch::select_mixtral),
             ..GENERIC_ARCH
         },
     ),
@@ -564,7 +564,7 @@ const ARCH_PROFILES: &[(&[&str], ArchProfile)] = &[
             bf16_runtime_quant: true,
             skip_dense_qkv_fusion: true,
             stack_per_expert_moe: true,
-            stream: Some(crate::stream_arch::QWEN3_MOE_STREAM_ARCH),
+            stream_for: Some(crate::stream_arch::select_qwen3_moe),
             ..GENERIC_ARCH
         },
     ),
@@ -575,7 +575,7 @@ const ARCH_PROFILES: &[(&[&str], ArchProfile)] = &[
             bf16_runtime_quant: true,
             skip_dense_qkv_fusion: true,
             stack_per_expert_moe: true,
-            stream: Some(crate::stream_arch::QWEN35_MOE_STREAM_ARCH),
+            stream_for: Some(crate::stream_arch::select_qwen35_moe),
             ..GENERIC_ARCH
         },
     ),
@@ -594,9 +594,14 @@ fn arch_profile(model_type: &str) -> ArchProfile {
     GENERIC_ARCH
 }
 
-/// Stream-plan recipe for `model_type`, if the arch supports SSD expert streaming.
-pub(crate) fn stream_arch_for(model_type: &str) -> Option<crate::stream::StreamArchDesc> {
-    arch_profile(model_type).stream
+/// Stream-plan recipe for `model_type` + target policy.
+pub(crate) fn stream_arch_for(
+    model_type: &str,
+    target: &crate::storage::StorageTarget,
+) -> Option<crate::stream::StreamArchDesc> {
+    arch_profile(model_type)
+        .stream_for
+        .and_then(|select| select(target))
 }
 
 impl DefaultAbiBuilder<'_> {
@@ -641,7 +646,7 @@ impl DefaultAbiBuilder<'_> {
         if !self.target.stream_routed_experts {
             return Ok(());
         }
-        let Some(arch) = self.profile().stream else {
+        let Some(arch) = stream_arch_for(&self.cfg.model_type, &self.target) else {
             return Err(CompileError::InvalidInput(format!(
                 "stream_routed_experts is not supported for model_type='{}' \
                  (supported: deepseek_v4, gpt_oss, mixtral, qwen3_moe, qwen3_5_moe)",
@@ -655,20 +660,22 @@ impl DefaultAbiBuilder<'_> {
                     .to_string(),
             ));
         }
-        // GPT-OSS streaming copies packed MXFP4 extents only (RoutedDequant).
-        // Native Marlin / eager BF16 need different stream templates.
+        // GPT-OSS: RoutedDequant streams HF MXFP4 packs; NativeGemm streams a
+        // Marlin-layout pack; EagerBf16 streams an offline BF16 pack (bounded
+        // dequant staging). All keep biases resident.
         if self.profile().gpt_oss_mxfp4_groups {
             match self.target.mxfp4_moe {
-                crate::types::Mxfp4MoePolicy::NativeGemm
-                | crate::types::Mxfp4MoePolicy::EagerBf16 => {
-                    return Err(CompileError::InvalidInput(
-                        "stream_routed_experts for gpt_oss requires \
-                         mxfp4_moe=auto|routed_dequant (plain ExtentWrite of \
-                         packed MXFP4); native and eager_bf16 are unsupported"
-                            .to_string(),
-                    ));
+                crate::types::Mxfp4MoePolicy::NativeGemm => {
+                    if !self.target.native_mxfp4_moe {
+                        return Err(CompileError::InvalidInput(
+                            "stream_routed_experts with mxfp4_moe=native requires \
+                             a target that supports native MXFP4 MoE"
+                                .to_string(),
+                        ));
+                    }
                 }
-                crate::types::Mxfp4MoePolicy::RoutedDecode => {}
+                crate::types::Mxfp4MoePolicy::RoutedDecode
+                | crate::types::Mxfp4MoePolicy::EagerBf16 => {}
             }
         }
         let mut skipped = 0usize;
@@ -1655,7 +1662,13 @@ impl DefaultAbiBuilder<'_> {
                 continue;
             };
             if native {
-                self.add_gpt_oss_native_mxfp4_group(block, scale, bias, base)?;
+                if self.target.stream_routed_experts {
+                    // Marlin weights live in the offline expert pack; keep
+                    // biases resident for bind-time deinterleave.
+                    self.push_direct(bias, format!("{base}.bias"), None);
+                } else {
+                    self.add_gpt_oss_native_mxfp4_group(block, scale, bias, base)?;
+                }
             } else if self.target.stream_routed_experts
                 && crate::stream_arch::is_gpt_oss_streamed_expert_tensor(&block.name)
             {

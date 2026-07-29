@@ -630,7 +630,8 @@ inline RustLoaderCompileResult compile_rust_loader_plan_from_metadata(
         max_tile_bytes,
         preferred_alignment,
         backend_target.mxfp4_moe,
-        backend_target.mxfp4_native_gemm,
+        /*native_mxfp4_moe=*/backend_target.mxfp4_native_gemm ||
+            backend_target.gptq_marlin_int4,
         backend_target.stream_routed_experts);
     input.set_runtime_abi_name("pie-cuda", /*version=*/1);
 

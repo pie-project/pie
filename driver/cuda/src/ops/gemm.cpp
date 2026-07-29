@@ -827,9 +827,10 @@ void validate_quant_weight_view(const char* api, const WeightView& w, int N, int
     if (w.scale_data == nullptr) {
         throw std::runtime_error(std::string(api) + ": quant scale data is null");
     }
-    const bool is_nibble_packed =
-        w.dtype == DType::INT4_PACKED || w.dtype == DType::MXFP4_PACKED;
-    const std::size_t expected_weight_bytes = is_nibble_packed
+    const bool is_4bit_packed =
+        w.dtype == DType::INT4_PACKED || w.dtype == DType::MXFP4_PACKED ||
+        w.dtype == DType::MXFP4_MARLIN;
+    const std::size_t expected_weight_bytes = is_4bit_packed
         ? (static_cast<std::size_t>(N) * static_cast<std::size_t>(K) + 1) / 2
         : static_cast<std::size_t>(N) * static_cast<std::size_t>(K) *
               dtype_bytes(w.dtype);
@@ -1449,7 +1450,8 @@ void gemm_act_x_w(
             "-DPIE_CUDA_BUILD_MARLIN=ON to enable W4A16 GEMM.");
 #endif
     }
-    if (act_dtype == DType::BF16 && w.dtype == DType::MXFP4_PACKED &&
+    if (act_dtype == DType::BF16 &&
+        (w.dtype == DType::MXFP4_PACKED || w.dtype == DType::MXFP4_MARLIN) &&
         y_dtype == DType::BF16) {
         cudaStream_t stream = nullptr;
         cublasGetStream(handle, &stream);
@@ -1467,13 +1469,17 @@ void gemm_act_x_w(
 
         // Decide path: Marlin needs pre-repacked weights. Runtime FP4 quant
         // emits raw nibble-packed weights, so default to a dequant→bf16 GEMM
-        // fallback (correct but ~2× the memory pass of native). The env var
-        // PIE_MXFP4_GEMM=marlin opts into the native path when weights are
-        // known to be Marlin-repacked (e.g., V4 / GPT-OSS prepacked ckpts).
-        static const bool use_marlin = [] {
+        // fallback (correct but ~2× the memory pass of native). Call sites
+        // with Marlin-repacked weights use DType::MXFP4_MARLIN (via
+        // WeightView::mxfp4_marlin). The env var PIE_MXFP4_GEMM=marlin opts
+        // into the native path when MXFP4_PACKED views are known to be
+        // Marlin-repacked (e.g., V4 / GPT-OSS prepacked ckpts).
+        static const bool use_marlin_env = [] {
             const char* v = std::getenv("PIE_MXFP4_GEMM");
             return (v != nullptr && std::string(v) == "marlin");
         }();
+        const bool use_marlin =
+            w.dtype == DType::MXFP4_MARLIN || use_marlin_env;
 
         if (use_marlin) {
 #ifdef PIE_CUDA_HAS_MARLIN

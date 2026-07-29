@@ -33,19 +33,28 @@ They are described by `StorageProgram.stream`:
   `schedule`. These are `ExtentWrite`s whose `dest.offset` is relative to a
   cache-slot base and whose `dest.buffer` is the sentinel `BufferId(u32::MAX)`.
   Section count is arch-defined (DeepSeek-V4: 6; GPT-OSS RoutedDequant: 4;
-  Mixtral: 3 BF16 `w1/w2/w3.weight`; Qwen3-MoE: 3 named `gate/up/down_proj`;
-  Qwen3.5-MoE: 2 fused `gate_up`/`down`).
+  GPT-OSS Native Marlin pack: 6; GPT-OSS Eager BF16 pack: 3 `gate/up/down`;
+  Mixtral: 3 BF16 `w1/w2/w3.weight`;
+  Qwen3-MoE: 3 named `gate/up/down_proj`; Qwen3.5-MoE: 2 fused `gate_up`/`down`).
 - `stream.bindings`: flat `[num_layers × num_experts × sections]` source
   extents that instantiate the template at decode time. An arch plugin may
   map one checkpoint tensor per cell (DSv4, Mixtral, Qwen3-MoE) or slice
-  fused `[E, …]` banks into per-expert extents (GPT-OSS, Qwen3.5-MoE).
+  fused `[E, …]` banks into per-expert extents (GPT-OSS RoutedDequant,
+  Qwen3.5-MoE). GPT-OSS native / eager-BF16 bindings describe pack-relative
+  offsets; the driver builds the pack with bounded staging and remaps
+  `stream.files` to the pack path.
 - `stream.files` / `section_offsets` / `section_bytes` / `slot_bytes`: layout
   the driver's expert stream cache needs to open shards and size the slab.
+- `stream.pack_kind`: selects the driver's offline pack builder (`None`,
+  GPT-OSS Native Marlin, GPT-OSS Eager BF16); set by the same arch selectors
+  that choose section layout.
 
 Boot execution runs `schedule` only. On a cache miss the driver executes the
 template into `slot_base` with sources taken from `bindings` for that
 `(layer, expert)` — deferred loader execution, not a parallel I/O path.
 
 Supported arches today: `deepseek_v4`, `gpt_oss`, `mixtral`, `qwen3_moe`,
-`qwen3_5_moe` (plain ExtentWrite; GPT-OSS RoutedDequant only — biases stay
-resident; Qwen shared expert / router stay resident).
+`qwen3_5_moe` (plain ExtentWrite; GPT-OSS RoutedDequant streams HF packs;
+GPT-OSS native streams a Marlin expert pack; GPT-OSS eager_bf16 streams a
+BF16 expert pack; biases stay resident; Qwen shared expert / router stay
+resident).

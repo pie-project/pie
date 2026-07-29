@@ -8,13 +8,14 @@
 //! with a different destination binding.
 //!
 //! Arch-specific naming (which tensors stream, section order, binding grid)
-//! lives in [`crate::stream_arch`] plugins, registered per model on `ArchProfile`.
+//! lives in [`crate::stream_arch`] plugins; each arch registers a `select_*`
+//! resolver on `ArchProfile` in [`crate::abi`].
 
 use crate::error::CompileError;
 use crate::source::{CheckpointMetadata, RawTensor};
 use crate::storage::{
-    DestExtent, DimSpec, SourceExtent, StorageInstr, StorageProgram, StreamBinding, StreamPlan,
-    StridedExtent,
+    DestExtent, DimSpec, ExpertPackKind, SourceExtent, StorageInstr, StorageProgram, StreamBinding,
+    StreamPlan, StridedExtent,
 };
 use crate::types::{BufferId, InstrId, TensorId};
 
@@ -38,6 +39,8 @@ pub struct StreamArchDesc {
         num_layers: u32,
         num_experts: u32,
     ) -> Result<Vec<StreamBinding>, CompileError>,
+    /// Offline pack builder for this recipe (`None` = plain ExtentWrite stream).
+    pub pack_kind: ExpertPackKind,
 }
 
 const SECTION_ALIGN: u64 = 256;
@@ -258,6 +261,7 @@ pub fn attach_stream_plan(
         slot_bytes,
         section_offsets,
         section_bytes,
+        pack_kind: arch.pack_kind,
     };
     Ok(())
 }
@@ -307,6 +311,7 @@ mod tests {
         sections: FAKE_SECTIONS,
         is_streamed: fake_is_streamed,
         collect_bindings: fake_collect,
+        pack_kind: ExpertPackKind::None,
     };
 
     #[test]

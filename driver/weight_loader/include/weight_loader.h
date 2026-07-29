@@ -48,6 +48,12 @@ enum class PieLoaderEncodingKind {
   Quant = 1,
 };
 
+enum class PieLoaderExpertPackKind {
+  None = 0,
+  GptOssNativeMarlin = 1,
+  GptOssEagerBf16 = 2,
+};
+
 enum class PieLoaderMxfp4MoePolicy {
   RoutedDecode = 0,
   NativeGemm = 1,
@@ -454,6 +460,7 @@ struct PieLoaderStreamPlanView {
   uint64_t slot_bytes;
   PieLoaderU64Slice section_offsets;
   PieLoaderU64Slice section_bytes;
+  PieLoaderExpertPackKind pack_kind;
 };
 
 struct PieLoaderStorageProgramView {

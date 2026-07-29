@@ -391,11 +391,24 @@ void mixtral_forward_paged(
             !layer.experts.empty() &&
             layer.experts[0].format ==
                 MixtralExpertWeightFormat::Mxfp4RoutedDequant;
+        const bool stream_native =
+            expert_cache != nullptr &&
+            !layer.experts.empty() &&
+            layer.experts[0].format ==
+                MixtralExpertWeightFormat::Mxfp4NativeGemm &&
+            layer.experts[0].w_gate_mxfp4 == nullptr;
+        const bool stream_gpt_oss_bf16 =
+            expert_cache != nullptr &&
+            !layer.experts.empty() &&
+            layer.experts[0].format == MixtralExpertWeightFormat::Bf16 &&
+            layer.experts[0].w_gate == nullptr &&
+            layer.experts[0].b_gate != nullptr;
         const bool stream_bf16 =
             expert_cache != nullptr &&
             !layer.experts.empty() &&
             layer.experts[0].format == MixtralExpertWeightFormat::Bf16 &&
-            layer.experts[0].w_gate == nullptr;
+            layer.experts[0].w_gate == nullptr &&
+            !stream_gpt_oss_bf16;
 
         auto dequant_mxfp4_and_run_expert = [&](int e,
                                 const std::uint8_t* gate_up_mxfp4,
@@ -539,6 +552,189 @@ void mixtral_forward_paged(
                     dequant_mxfp4_and_run_expert(selected[off + j],
                                  gpt_oss_gate_up(p), gpt_oss_gate_up_scale(p),
                                  gpt_oss_down(p), gpt_oss_down_scale(p));
+                }
+            }
+        } else if (stream_native) {
+            const int Ip = w.mxfp4_intermediate_padded > 0
+                ? w.mxfp4_intermediate_padded : I;
+            std::vector<int> selected;
+            selected.reserve(static_cast<std::size_t>(num_experts));
+            for (int e = 0; e < num_experts; ++e) {
+                if (!routing.token_idx[static_cast<std::size_t>(e)].empty()) {
+                    selected.push_back(e);
+                }
+            }
+            std::vector<ExpertSectionPointers> ptrs;
+            const std::size_t max_batch =
+                static_cast<std::size_t>(expert_cache->num_slots());
+            for (std::size_t off = 0; off < selected.size(); off += max_batch) {
+                const std::size_t chunk =
+                    std::min(max_batch, selected.size() - off);
+                expert_cache->ensure_resident(
+                    L,
+                    std::span<const int>(selected.data() + off, chunk),
+                    stream, ptrs);
+                for (std::size_t j = 0; j < chunk; ++j) {
+                    const auto& p = ptrs[j];
+                    require_gpt_oss_native_sections(p);
+                    const int e = selected[off + j];
+                    const auto& tok_idx =
+                        routing.token_idx[static_cast<std::size_t>(e)];
+                    const auto& weights =
+                        routing.weights[static_cast<std::size_t>(e)];
+                    const int Ne = static_cast<int>(tok_idx.size());
+                    const auto& expert = layer.experts[static_cast<std::size_t>(e)];
+
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        d_expert_idx.data(), tok_idx.data(),
+                        Ne * sizeof(std::int32_t), cudaMemcpyHostToDevice,
+                        stream));
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        d_expert_w.data(), weights.data(),
+                        Ne * sizeof(float), cudaMemcpyHostToDevice, stream));
+                    kernels::launch_gather_bf16_rows(
+                        static_cast<const std::uint16_t*>(ws.norm_y.data()),
+                        d_expert_idx.data(),
+                        d_expert_in.data(),
+                        Ne, H, stream);
+
+                    auto gate_w = DeviceTensor::view(
+                        const_cast<std::uint8_t*>(gpt_oss_native_gate(p)),
+                        DType::UINT8, {Ip, H / 2});
+                    auto gate_s = DeviceTensor::view(
+                        const_cast<std::uint8_t*>(gpt_oss_native_gate_scale(p)),
+                        DType::UINT8, {Ip, H / 32});
+                    auto up_w = DeviceTensor::view(
+                        const_cast<std::uint8_t*>(gpt_oss_native_up(p)),
+                        DType::UINT8, {Ip, H / 2});
+                    auto up_s = DeviceTensor::view(
+                        const_cast<std::uint8_t*>(gpt_oss_native_up_scale(p)),
+                        DType::UINT8, {Ip, H / 32});
+                    auto down_w = DeviceTensor::view(
+                        const_cast<std::uint8_t*>(gpt_oss_native_down(p)),
+                        DType::UINT8, {H, Ip / 2});
+                    auto down_s = DeviceTensor::view(
+                        const_cast<std::uint8_t*>(gpt_oss_native_down_scale(p)),
+                        DType::UINT8, {H, Ip / 32});
+
+                    ops::gemm_act_x_w(cublas.handle(),
+                        d_expert_in.data(),
+                        ops::WeightView::mxfp4_marlin(gate_w, gate_s),
+                        d_expert_gate.data(), Ne, Ip, H);
+                    ops::gemm_act_x_w(cublas.handle(),
+                        d_expert_in.data(),
+                        ops::WeightView::mxfp4_marlin(up_w, up_s),
+                        d_expert_up.data(), Ne, Ip, H);
+                    if (expert.b_gate) kernels::launch_add_bias_bf16_strided(
+                        d_expert_gate.data(), expert.b_gate->data(), Ne, I, Ip,
+                        stream);
+                    if (expert.b_up) kernels::launch_add_bias_bf16_strided(
+                        d_expert_up.data(), expert.b_up->data(), Ne, I, Ip,
+                        stream);
+                    if (cfg.swiglu_limit > 0.f) {
+                        kernels::launch_gpt_oss_glu_bf16(
+                            d_expert_gate.data(), d_expert_up.data(),
+                            d_expert_gate.data(),
+                            static_cast<int>(static_cast<std::size_t>(Ne) * Ip),
+                            stream, /*limit=*/cfg.swiglu_limit);
+                    } else {
+                        kernels::launch_swiglu_bf16(
+                            d_expert_gate.data(), d_expert_up.data(),
+                            d_expert_gate.data(),
+                            static_cast<std::size_t>(Ne) * Ip, stream);
+                    }
+                    ops::gemm_act_x_w(cublas.handle(),
+                        d_expert_gate.data(),
+                        ops::WeightView::mxfp4_marlin(down_w, down_s),
+                        d_expert_out.data(), Ne, H, Ip);
+                    if (expert.b_down && tp_is_leader) {
+                        kernels::launch_add_bias_bf16(
+                            d_expert_out.data(), expert.b_down->data(), Ne, H,
+                            stream);
+                    }
+                    kernels::launch_scatter_add_weighted_bf16(
+                        moe_target, d_expert_out.data(),
+                        d_expert_idx.data(), d_expert_w.data(),
+                        Ne, H, stream);
+                }
+            }
+        } else if (stream_gpt_oss_bf16) {
+            std::vector<int> selected;
+            selected.reserve(static_cast<std::size_t>(num_experts));
+            for (int e = 0; e < num_experts; ++e) {
+                if (!routing.token_idx[static_cast<std::size_t>(e)].empty()) {
+                    selected.push_back(e);
+                }
+            }
+            std::vector<ExpertSectionPointers> ptrs;
+            const std::size_t max_batch =
+                static_cast<std::size_t>(expert_cache->num_slots());
+            for (std::size_t off = 0; off < selected.size(); off += max_batch) {
+                const std::size_t chunk =
+                    std::min(max_batch, selected.size() - off);
+                expert_cache->ensure_resident(
+                    L,
+                    std::span<const int>(selected.data() + off, chunk),
+                    stream, ptrs);
+                for (std::size_t j = 0; j < chunk; ++j) {
+                    const auto& p = ptrs[j];
+                    require_gpt_oss_eager_bf16_sections(p);
+                    const int e = selected[off + j];
+                    const auto& tok_idx =
+                        routing.token_idx[static_cast<std::size_t>(e)];
+                    const auto& weights =
+                        routing.weights[static_cast<std::size_t>(e)];
+                    const int Ne = static_cast<int>(tok_idx.size());
+                    const auto& expert = layer.experts[static_cast<std::size_t>(e)];
+
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        d_expert_idx.data(), tok_idx.data(),
+                        Ne * sizeof(std::int32_t), cudaMemcpyHostToDevice,
+                        stream));
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        d_expert_w.data(), weights.data(),
+                        Ne * sizeof(float), cudaMemcpyHostToDevice, stream));
+                    kernels::launch_gather_bf16_rows(
+                        static_cast<const std::uint16_t*>(ws.norm_y.data()),
+                        d_expert_idx.data(),
+                        d_expert_in.data(),
+                        Ne, H, stream);
+
+                    ops::gemm_act_x_wt_bf16(cublas.handle(),
+                        d_expert_in.data(), gpt_oss_eager_gate(p),
+                        d_expert_gate.data(), Ne, I, H);
+                    ops::gemm_act_x_wt_bf16(cublas.handle(),
+                        d_expert_in.data(), gpt_oss_eager_up(p),
+                        d_expert_up.data(), Ne, I, H);
+                    if (expert.b_gate) kernels::launch_add_bias_bf16(
+                        d_expert_gate.data(), expert.b_gate->data(), Ne, I,
+                        stream);
+                    if (expert.b_up) kernels::launch_add_bias_bf16(
+                        d_expert_up.data(), expert.b_up->data(), Ne, I, stream);
+                    if (cfg.swiglu_limit > 0.f) {
+                        kernels::launch_gpt_oss_glu_bf16(
+                            d_expert_gate.data(), d_expert_up.data(),
+                            d_expert_gate.data(),
+                            static_cast<int>(static_cast<std::size_t>(Ne) * I),
+                            stream, /*limit=*/cfg.swiglu_limit);
+                    } else {
+                        kernels::launch_swiglu_bf16(
+                            d_expert_gate.data(), d_expert_up.data(),
+                            d_expert_gate.data(),
+                            static_cast<std::size_t>(Ne) * I, stream);
+                    }
+                    ops::gemm_act_x_wt_bf16(cublas.handle(),
+                        d_expert_gate.data(), gpt_oss_eager_down(p),
+                        d_expert_out.data(), Ne, H, I);
+                    if (expert.b_down && tp_is_leader) {
+                        kernels::launch_add_bias_bf16(
+                            d_expert_out.data(), expert.b_down->data(), Ne, H,
+                            stream);
+                    }
+                    kernels::launch_scatter_add_weighted_bf16(
+                        moe_target, d_expert_out.data(),
+                        d_expert_idx.data(), d_expert_w.data(),
+                        Ne, H, stream);
                 }
             }
         } else if (stream_bf16) {

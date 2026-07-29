@@ -602,6 +602,15 @@ pub struct PieLoaderU64Slice {
     pub len: usize,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum PieLoaderExpertPackKind {
+    #[default]
+    None = 0,
+    GptOssNativeMarlin = 1,
+    GptOssEagerBf16 = 2,
+}
+
 /// Deferred expert-load plan exposed to the C++ stream cache.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -615,6 +624,7 @@ pub struct PieLoaderStreamPlanView {
     pub slot_bytes: u64,
     pub section_offsets: PieLoaderU64Slice,
     pub section_bytes: PieLoaderU64Slice,
+    pub pack_kind: PieLoaderExpertPackKind,
 }
 
 #[repr(C)]

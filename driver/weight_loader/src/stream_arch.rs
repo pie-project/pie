@@ -1,13 +1,16 @@
 //! Arch-specific [`StreamArchDesc`] plugins for SSD expert streaming.
 //!
 //! Generic plan construction lives in [`crate::stream`]. This module owns
-//! checkpoint naming, section order, and binding-grid collectors, registered
-//! on each model's `ArchProfile` in [`crate::abi`].
+//! checkpoint naming, section order, and binding-grid collectors. Each
+//! streaming-capable arch registers a `select_*` resolver on `ArchProfile`
+//! in [`crate::abi`]; policy-dependent recipes (e.g. GPT-OSS native vs
+//! routed) live in those selectors — not as special cases in `abi`.
 
 use crate::error::CompileError;
 use crate::source::{CheckpointMetadata, RawTensor};
-use crate::storage::StreamBinding;
+use crate::storage::{ExpertPackKind, StorageTarget, StreamBinding};
 use crate::stream::{StreamArchDesc, collect_bindings_from_named_tensors};
+use crate::types::Mxfp4MoePolicy;
 
 /// Fixed DSv4 section order — must match `dsv4_expert_sections.hpp` in the
 /// CUDA driver (`w1/w2/w3` × weight/scale).
@@ -79,7 +82,12 @@ pub(crate) const DSV4_STREAM_ARCH: StreamArchDesc = StreamArchDesc {
     sections: DSV4_EXPERT_SECTIONS,
     is_streamed: is_dsv4_routed_expert_tensor,
     collect_bindings: dsv4_collect_bindings,
+    pack_kind: ExpertPackKind::None,
 };
+
+pub(crate) fn select_dsv4(_target: &StorageTarget) -> Option<StreamArchDesc> {
+    Some(DSV4_STREAM_ARCH)
+}
 
 /// Fixed GPT-OSS section order — must match `gpt_oss_expert_sections.hpp`.
 /// Biases stay resident and are not part of the stream plan.
@@ -186,6 +194,249 @@ pub(crate) const GPT_OSS_STREAM_ARCH: StreamArchDesc = StreamArchDesc {
     sections: GPT_OSS_EXPERT_SECTIONS,
     is_streamed: is_gpt_oss_streamed_expert_tensor,
     collect_bindings: gpt_oss_collect_bindings,
+    pack_kind: ExpertPackKind::None,
+};
+
+/// Native Marlin stream sections — must match `gpt_oss_expert_sections.hpp`.
+/// Built offline into an expert pack; biases stay resident.
+pub const GPT_OSS_NATIVE_EXPERT_SECTIONS: &[&str] = &[
+    "gate.weight",
+    "gate.scale",
+    "up.weight",
+    "up.scale",
+    "down.weight",
+    "down.scale",
+];
+
+fn align_up_u64(v: u64, a: u64) -> u64 {
+    (v + a - 1) / a * a
+}
+
+/// Marlin per-expert section byte sizes from GPT-OSS fused HF bank shapes.
+pub(crate) fn gpt_oss_native_section_bytes(
+    gate_up_blocks: &RawTensor,
+    down_blocks: &RawTensor,
+) -> Result<[u64; 6], CompileError> {
+    if gate_up_blocks.shape.len() != 4 || down_blocks.shape.len() != 4 {
+        return Err(CompileError::InvalidInput(
+            "stream_routed_experts: GPT-OSS native stream expects 4-D \
+             gate_up/down _blocks tensors"
+                .to_string(),
+        ));
+    }
+    let fused_rows = gate_up_blocks.shape[1] as u64;
+    let gu_groups = gate_up_blocks.shape[2] as u64;
+    let gu_lanes = gate_up_blocks.shape[3] as u64;
+    if fused_rows % 2 != 0 || gu_lanes != 16 {
+        return Err(CompileError::InvalidInput(format!(
+            "stream_routed_experts: GPT-OSS native gate_up expected \
+             [E, 2I, H/32, 16], got {:?}",
+            gate_up_blocks.shape
+        )));
+    }
+    let intermediate = fused_rows / 2;
+    let intermediate_native = align_up_u64(intermediate, 128);
+    let hidden = gu_groups * 32;
+    let down_hidden = down_blocks.shape[1] as u64;
+    let down_groups = down_blocks.shape[2] as u64;
+    let down_lanes = down_blocks.shape[3] as u64;
+    if down_lanes != 16 || down_hidden != hidden || down_groups * 32 != intermediate {
+        return Err(CompileError::InvalidInput(format!(
+            "stream_routed_experts: GPT-OSS native down shape mismatch \
+             (gate_up {:?}, down {:?})",
+            gate_up_blocks.shape, down_blocks.shape
+        )));
+    }
+    // MXFP4 nibble packing: rows * cols / 2 bytes. Scales: rows * groups.
+    let gate_w = intermediate_native * hidden / 2;
+    let gate_s = intermediate_native * gu_groups;
+    let down_w = hidden * intermediate_native / 2;
+    let down_s = hidden * (intermediate_native / 32);
+    Ok([gate_w, gate_s, gate_w, gate_s, down_w, down_s])
+}
+
+fn gpt_oss_native_collect_bindings(
+    metadata: &CheckpointMetadata,
+    num_layers: u32,
+    num_experts: u32,
+) -> Result<Vec<StreamBinding>, CompileError> {
+    let e = num_experts as u64;
+    if e == 0 {
+        return Err(CompileError::InvalidInput(
+            "stream_routed_experts: GPT-OSS num_experts must be > 0".to_string(),
+        ));
+    }
+    // Pack layout is a single virtual file; C++ remaps path after pack build.
+    // Offsets are deterministic: (layer * E + expert) * slot + section_offset.
+    const SECTION_ALIGN: u64 = 256;
+    let mut bindings = Vec::with_capacity(
+        (num_layers as usize) * (num_experts as usize) * GPT_OSS_NATIVE_EXPERT_SECTIONS.len(),
+    );
+    let mut section_bytes: Option<[u64; 6]> = None;
+    let mut section_offsets = [0u64; 6];
+    let mut slot_bytes = 0u64;
+    for layer in 0..num_layers {
+        let prefix = format!("model.layers.{layer}.mlp.experts.");
+        let gate_up_w = gpt_oss_find_tensor(metadata, &format!("{prefix}gate_up_proj_blocks"))?;
+        let down_w = gpt_oss_find_tensor(metadata, &format!("{prefix}down_proj_blocks"))?;
+        // Still require scales to exist (consumed / validated by ABI skip).
+        let _ = gpt_oss_find_tensor(metadata, &format!("{prefix}gate_up_proj_scales"))?;
+        let _ = gpt_oss_find_tensor(metadata, &format!("{prefix}down_proj_scales"))?;
+        let bytes = gpt_oss_native_section_bytes(gate_up_w, down_w)?;
+        if let Some(prev) = section_bytes {
+            if prev != bytes {
+                return Err(CompileError::InvalidInput(format!(
+                    "stream_routed_experts: GPT-OSS native section sizes differ \
+                     across layers (layer {layer})"
+                )));
+            }
+        } else {
+            let mut off = 0u64;
+            for s in 0..6 {
+                section_offsets[s] = off;
+                off = align_up_u64(off + bytes[s], SECTION_ALIGN);
+            }
+            slot_bytes = off;
+            section_bytes = Some(bytes);
+        }
+        for expert in 0..e {
+            let base = (layer as u64 * e + expert) * slot_bytes;
+            for s in 0..6 {
+                bindings.push(StreamBinding {
+                    file_id: crate::types::FileId(0),
+                    file_offset: base + section_offsets[s],
+                    span_bytes: bytes[s],
+                });
+            }
+        }
+    }
+    Ok(bindings)
+}
+
+pub(crate) const GPT_OSS_NATIVE_STREAM_ARCH: StreamArchDesc = StreamArchDesc {
+    sections: GPT_OSS_NATIVE_EXPERT_SECTIONS,
+    // Same HF tensors are excluded from the resident schedule.
+    is_streamed: is_gpt_oss_streamed_expert_tensor,
+    collect_bindings: gpt_oss_native_collect_bindings,
+    pack_kind: ExpertPackKind::GptOssNativeMarlin,
+};
+
+/// GPT-OSS stream recipe depends on `mxfp4_moe`: HF packs (routed_dequant),
+/// Marlin pack (native), or offline BF16 pack (eager_bf16).
+pub(crate) fn select_gpt_oss(target: &StorageTarget) -> Option<StreamArchDesc> {
+    match target.mxfp4_moe {
+        Mxfp4MoePolicy::NativeGemm => Some(GPT_OSS_NATIVE_STREAM_ARCH),
+        Mxfp4MoePolicy::EagerBf16 => Some(GPT_OSS_EAGER_BF16_STREAM_ARCH),
+        Mxfp4MoePolicy::RoutedDecode => Some(GPT_OSS_STREAM_ARCH),
+    }
+}
+
+/// Eager-BF16 stream sections — offline dequant pack; biases stay resident.
+/// Must match `gpt_oss_expert_sections.hpp` BF16 helpers.
+pub const GPT_OSS_EAGER_BF16_EXPERT_SECTIONS: &[&str] =
+    &["gate.weight", "up.weight", "down.weight"];
+
+fn gpt_oss_eager_bf16_section_bytes(
+    gate_up_blocks: &RawTensor,
+    down_blocks: &RawTensor,
+) -> Result<[u64; 3], CompileError> {
+    if gate_up_blocks.shape.len() != 4 || down_blocks.shape.len() != 4 {
+        return Err(CompileError::InvalidInput(
+            "stream_routed_experts: GPT-OSS eager BF16 stream expects 4-D \
+             gate_up/down _blocks tensors"
+                .to_string(),
+        ));
+    }
+    let fused_rows = gate_up_blocks.shape[1] as u64;
+    let gu_groups = gate_up_blocks.shape[2] as u64;
+    let gu_lanes = gate_up_blocks.shape[3] as u64;
+    if fused_rows % 2 != 0 || gu_lanes != 16 {
+        return Err(CompileError::InvalidInput(format!(
+            "stream_routed_experts: GPT-OSS eager BF16 gate_up expected \
+             [E, 2I, H/32, 16], got {:?}",
+            gate_up_blocks.shape
+        )));
+    }
+    let intermediate = fused_rows / 2;
+    let hidden = gu_groups * 32;
+    let down_hidden = down_blocks.shape[1] as u64;
+    let down_groups = down_blocks.shape[2] as u64;
+    let down_lanes = down_blocks.shape[3] as u64;
+    if down_lanes != 16 || down_hidden != hidden || down_groups * 32 != intermediate {
+        return Err(CompileError::InvalidInput(format!(
+            "stream_routed_experts: GPT-OSS eager BF16 down shape mismatch \
+             (gate_up {:?}, down {:?})",
+            gate_up_blocks.shape, down_blocks.shape
+        )));
+    }
+    // BF16: rows * cols * 2.
+    let gate = intermediate * hidden * 2;
+    let down = hidden * intermediate * 2;
+    Ok([gate, gate, down])
+}
+
+fn gpt_oss_eager_bf16_collect_bindings(
+    metadata: &CheckpointMetadata,
+    num_layers: u32,
+    num_experts: u32,
+) -> Result<Vec<StreamBinding>, CompileError> {
+    let e = num_experts as u64;
+    if e == 0 {
+        return Err(CompileError::InvalidInput(
+            "stream_routed_experts: GPT-OSS num_experts must be > 0".to_string(),
+        ));
+    }
+    const SECTION_ALIGN: u64 = 256;
+    let mut bindings = Vec::with_capacity(
+        (num_layers as usize)
+            * (num_experts as usize)
+            * GPT_OSS_EAGER_BF16_EXPERT_SECTIONS.len(),
+    );
+    let mut section_bytes: Option<[u64; 3]> = None;
+    let mut section_offsets = [0u64; 3];
+    let mut slot_bytes = 0u64;
+    for layer in 0..num_layers {
+        let prefix = format!("model.layers.{layer}.mlp.experts.");
+        let gate_up_w = gpt_oss_find_tensor(metadata, &format!("{prefix}gate_up_proj_blocks"))?;
+        let down_w = gpt_oss_find_tensor(metadata, &format!("{prefix}down_proj_blocks"))?;
+        let _ = gpt_oss_find_tensor(metadata, &format!("{prefix}gate_up_proj_scales"))?;
+        let _ = gpt_oss_find_tensor(metadata, &format!("{prefix}down_proj_scales"))?;
+        let bytes = gpt_oss_eager_bf16_section_bytes(gate_up_w, down_w)?;
+        if let Some(prev) = section_bytes {
+            if prev != bytes {
+                return Err(CompileError::InvalidInput(format!(
+                    "stream_routed_experts: GPT-OSS eager BF16 section sizes \
+                     differ across layers (layer {layer})"
+                )));
+            }
+        } else {
+            let mut off = 0u64;
+            for s in 0..3 {
+                section_offsets[s] = off;
+                off = align_up_u64(off + bytes[s], SECTION_ALIGN);
+            }
+            slot_bytes = off;
+            section_bytes = Some(bytes);
+        }
+        for expert in 0..e {
+            let base = (layer as u64 * e + expert) * slot_bytes;
+            for s in 0..3 {
+                bindings.push(StreamBinding {
+                    file_id: crate::types::FileId(0),
+                    file_offset: base + section_offsets[s],
+                    span_bytes: bytes[s],
+                });
+            }
+        }
+    }
+    Ok(bindings)
+}
+
+pub(crate) const GPT_OSS_EAGER_BF16_STREAM_ARCH: StreamArchDesc = StreamArchDesc {
+    sections: GPT_OSS_EAGER_BF16_EXPERT_SECTIONS,
+    is_streamed: is_gpt_oss_streamed_expert_tensor,
+    collect_bindings: gpt_oss_eager_bf16_collect_bindings,
+    pack_kind: ExpertPackKind::GptOssEagerBf16,
 };
 
 /// Fixed Mixtral section order — must match `mixtral_expert_sections.hpp`.
@@ -238,7 +489,12 @@ pub(crate) const MIXTRAL_STREAM_ARCH: StreamArchDesc = StreamArchDesc {
     sections: MIXTRAL_EXPERT_SECTIONS,
     is_streamed: is_mixtral_routed_expert_tensor,
     collect_bindings: mixtral_collect_bindings,
+    pack_kind: ExpertPackKind::None,
 };
+
+pub(crate) fn select_mixtral(_target: &StorageTarget) -> Option<StreamArchDesc> {
+    Some(MIXTRAL_STREAM_ARCH)
+}
 
 /// Plain Qwen3-MoE per-expert BF16 weights — must match `qwen_moe_expert_sections.hpp`.
 pub const QWEN3_MOE_EXPERT_SECTIONS: &[&str] = &[
@@ -305,7 +561,12 @@ pub(crate) const QWEN3_MOE_STREAM_ARCH: StreamArchDesc = StreamArchDesc {
     sections: QWEN3_MOE_EXPERT_SECTIONS,
     is_streamed: is_qwen3_moe_routed_expert_tensor,
     collect_bindings: qwen3_moe_collect_bindings,
+    pack_kind: ExpertPackKind::None,
 };
+
+pub(crate) fn select_qwen3_moe(_target: &StorageTarget) -> Option<StreamArchDesc> {
+    Some(QWEN3_MOE_STREAM_ARCH)
+}
 
 /// Qwen3.5/3.6-MoE fused BF16 banks — must match `qwen_moe_expert_sections.hpp`.
 pub const QWEN35_MOE_EXPERT_SECTIONS: &[&str] = &["gate_up.weight", "down.weight"];
@@ -400,7 +661,12 @@ pub(crate) const QWEN35_MOE_STREAM_ARCH: StreamArchDesc = StreamArchDesc {
     sections: QWEN35_MOE_EXPERT_SECTIONS,
     is_streamed: is_qwen35_moe_streamed_expert_tensor,
     collect_bindings: qwen35_moe_collect_bindings,
+    pack_kind: ExpertPackKind::None,
 };
+
+pub(crate) fn select_qwen35_moe(_target: &StorageTarget) -> Option<StreamArchDesc> {
+    Some(QWEN35_MOE_STREAM_ARCH)
+}
 
 fn ends_with_any(value: &str, suffixes: &[&str]) -> bool {
     suffixes.iter().any(|suffix| value.ends_with(suffix))
