@@ -165,21 +165,7 @@ bool validate_request_local_positions(
 // idle memory.  The paged command path uses these four slots concurrently;
 // caps report exactly this value — never a larger, aspirational one — via
 // `MetalExecutor::rs_slots()`.
-// Tokens the resident KV/GDN ring holds, across the WHOLE fleet -- it is one
-// linear ring, not a per-request allocation, so sixteen concurrent requests
-// share it. At 4096 that ceiling was reached by sixteen requests generating
-// ~230 tokens each, and the planner failed them all with `NoSwapRoom`; a
-// concurrent fleet could not run a normal-length generation at all.
-//
-// The KV region is `n_full_attn * 2 * n_kv_heads * max_ctx * head_dim * 2B`,
-// which is ~100MB for this checkpoint at 4096 and ~800MB at 32768 -- worth it
-// against a 405MB weight set on a machine with tens of GB, and it buys sixteen
-// requests 2048 tokens each.
-//
-// ADVERTISED and ENFORCED from here: `context.cpp` builds the capabilities page
-// count from this and `validate_fire_geometry` bounds page ids by the same
-// number, so the two can never drift (they were separate 4096 literals).
-inline constexpr std::uint32_t kMetalMaxCtxTokens = 32768;
+
 
 // Concurrent recurrent-state slots, and through `kPagedMaxForwardRequests` the
 // driver's advertised `max_forward_requests` -- which bootstrap also adopts as
@@ -195,8 +181,31 @@ inline constexpr std::uint32_t kMetalMaxCtxTokens = 32768;
 // (32 requests at concurrency 16 are fine; 17 at concurrency 17 never starts).
 // That is a separate defect -- oversubscription should queue -- but until it is
 // fixed this bound is also a floor on usable concurrency.
-inline constexpr std::uint32_t kPhase1bRsSlots = 32;
+inline constexpr std::uint32_t kPhase1bRsSlots = 64;
 inline constexpr std::uint32_t kPagedMaxForwardRequests = kPhase1bRsSlots;
+
+// Tokens the resident KV/GDN ring holds, across the WHOLE fleet -- it is one
+// linear ring, not a per-request allocation, so the whole fleet shares it. At
+// 4096 that ceiling was reached by sixteen requests generating ~230 tokens
+// each, and the planner failed them all with `NoSwapRoom`; a concurrent fleet
+// could not run a normal-length generation at all.
+//
+// Derived from the slot count rather than written down, because the two are the
+// same statement about how many requests this driver serves: a ring sized for
+// sixteen requests starves the moment the slot count allows sixty-four, which
+// is exactly what happened -- 64 x 512 tokens needs ~35k and a 32768 ring
+// failed every request with `NoSwapRoom`.  Each request gets 2048 tokens.
+//
+// The KV region is `n_full_attn * 2 * n_kv_heads * max_ctx * head_dim * 2B`,
+// which is ~100MB for this checkpoint at 4096, ~800MB at 32768 and ~3.2GB at
+// 131072 -- worth it against a 405MB weight set on a machine with tens of GB.
+//
+// ADVERTISED and ENFORCED from here: `context.cpp` builds the capabilities page
+// count from this and `validate_fire_geometry` bounds page ids by the same
+// number, so the two can never drift (they were separate 4096 literals).
+inline constexpr std::uint32_t kMetalCtxTokensPerRequest = 2048;
+inline constexpr std::uint32_t kMetalMaxCtxTokens =
+    kPhase1bRsSlots * kMetalCtxTokensPerRequest;
 // How many prompt rows one fire may carry.
 //
 // This is not just an allocation bound: it is advertised through capabilities
