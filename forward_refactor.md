@@ -813,6 +813,11 @@ ignored, whereas ADDING one later is unambiguously breaking.
 
 ### 9.3 `rs-geometry` moves off `attention` and onto `buffer` / `fold-buffered`
 
+> **Superseded by §11.3.** The premise below — that the buffer is touched by
+> two calls out of many — stops holding once the buffer is understood as half
+> the state. The rule ("geometry goes where it is read") survives; the answer
+> to *where it is read* moves back to the state binding.
+
 Two changes to D9.
 
 **It is not part of the state binding.** D9 hung `rs-geometry` off `attention`
@@ -973,3 +978,260 @@ canonicalize containers, which is the thing D4 exists to avoid.
 - §8.2's Metal RS flag-bit collapse
   (`driver/metal/src/batch/batch_schedule.hpp:114` misreads `RS_FLAG_FOLD` as
   RESET) is pre-existing and still open.
+
+---
+
+## 11. The boundary model — ratified after Step B, supersedes §3.3/§3.4 fold modes
+
+Step B shipped the fold modes as three sibling methods because that is the
+shape the *implementation* had. Reviewing the RS cache's actual usage
+afterwards showed the shape the *concept* has is different, and simpler. This
+section records the corrected model and the surface it implies. It supersedes
+the `fold` / `buffer` / `fold-buffered` triple in §3.3 and §3.4.
+
+### 11.1 What the RS buffer is
+
+A linear model's context is two adjacent spans, not one object:
+
+```
+[0 .......... F) [F .......... F+B)
+ folded state     buffer
+ compressed       uncompressed
+ frozen           mutable
+ O(1) memory      O(B) memory
+ O(1) per token   O(B) replay per fire
+```
+
+The buffer holds each token's **pre-recurrence in-projection activations**
+(`[mixed_qkv|a|b]`, per linear layer) — the recurrence's *inputs*, not its
+state. So a buffered token still has an individual identity: it can be
+addressed, replayed, discarded, reordered. Its storage layout is already
+KV-shaped — page-major slabs, and `rs-buffer-page-size` is `kv-page-size` in v1.
+
+Reading the recurrent state means: start from `folded`, scan the buffer.
+`fold(n)` means: move `F` right by `n`.
+
+**`fold` is semantically a no-op.** It changes memory and cost, never output.
+It is a performance decision, legal exactly when the tokens it absorbs will
+never be modified again — and *the guest is the only party that knows that*.
+That single sentence is the whole linear-state programming model, and it is
+why this is a guest-facing API rather than a runtime heuristic.
+
+Corollaries:
+
+- **Never folding must be valid and correct.** A linear model run purely from
+  the buffer is O(n) memory and O(n) per fire — pathological, but it must
+  produce identical output. Fold is opt-in.
+- **Buffer ops are KV ops.** `discard` / `slice` / `copy-into` / `reorder` have
+  the same meaning on the buffer that they have on a KV cache, including being
+  the same kind of *approximation* (the buffer is a scan, so dropping an
+  interior token yields "the sequence without it", exactly as KV eviction
+  does). Only `fork` and `reset` are possible on the folded span.
+- **Observation belongs at the buffer.** Once folded there is nothing
+  per-token left to observe, so `on-recurrent` and any recurrent intrinsic tap
+  the replay. §10's Tier 2 therefore depends on the read path below.
+- **Fold is what enables sharing.** A content-addressed RS prefix requires the
+  prefix to be exactly one compressed object. Fold is the *producer* of
+  shareable state, not an obstacle to programmability.
+
+### 11.2 The blocking defect: the buffer has no read path
+
+The mental model above is **not** what is implemented. There are exactly two
+buffer operations in the driver
+(`driver/cuda/src/batch/forward.hpp:161-173`), and `rs_buffer_slab()` is
+called from exactly two sites per model file:
+
+- `rs_buffer_write` — scatter in-proj activations into slabs, `write_state`
+  forced false (`qwen3_5_forward.cpp:510`).
+- `rs_buffer_fold` — gather from slabs and fold `commit_len[r]` tokens into
+  `recurrent_state[slot]`.
+
+There is **no third site**. Nothing ever reads the buffer *as state*. Every
+recurrence initializes from `recurrent_state[slot]`, i.e. from the folded
+boundary. So a `buffer` fire actually means: advance transiently from the
+folded state over this fire's own tokens, emit logits, **discard** the advanced
+state, and stash the activations for one later fold.
+
+That is a staging area for a deferred fold, not a token-granular store.
+
+Consequences:
+
+1. A single `buffer` fire looks correct because its tokens are inside its own
+   span. **A second `buffer` fire on a non-empty buffer is wrong** — it
+   restarts from the folded boundary and cannot see the first chunk.
+   `gdn-foldcommit` buffers exactly one chunk at `start = 0`, so multi-chunk
+   accumulation has never executed in-tree.
+2. `buffer(start-token)` therefore does not merely carry a redundant argument
+   (§9.2): it *invites* the broken case. Under §11.3 it disappears.
+
+The storage layer is closer than this implies. The layout is already
+token-granular; `RsStore::resolve_buffer(ws, start, len)` already resolves
+arbitrary token ranges and has **no production caller** — only tests, which
+already cover non-prefix ranges (`store/rs/tests.rs:333`); and "advance without
+persisting" already exists as `write_state = false`. The missing read is a
+recombination of parts that exist: gather from slabs, advance a *scratch*
+state rather than the committed slot, continue into the fire's own tokens, do
+not persist.
+
+### 11.3 The surface: the fold modes disappear into the state binding
+
+A fire running `[P, P+T)` sees one contiguous uncommitted span
+`[F, P+T)` = `[buffer | this fire's tokens]`. All it declares is where `F`
+ends up. The three Step B modes are three values of that one scalar:
+
+| Step B | new boundary | `fold-len` |
+|---|---|---|
+| `fold` | `P+T` | everything |
+| `buffer(start)` | `F` | 0 |
+| `fold-buffered(n)` | `F+n` | n |
+
+An open enumeration of *kinds* collapsed into a closed scalar over
+*positions*. That is what makes the mode axis safe to fold into a record: a
+variant has cases to add, a number does not. It is the same move as folding
+the KV/RS geometry variants into parameters (D8).
+
+Once the read path exists, buffer addressing is an input to the **recurrence**,
+not to the fold decision — you cannot initialize the recurrence without knowing
+which slabs to replay, and that is true of every fire, not of two of them. So
+the geometry belongs on the state binding, exactly as `kv-geometry` does:
+
+```wit
+record rs-geometry {
+    /// How far the folded boundary advances, per request. The twin of
+    /// `kv-geometry.kv-len`: 0 = pure buffering, `buffer-len + fire tokens` =
+    /// fold everything. Counts over [buffer | this fire's tokens].
+    fold-len:        borrow<channel>,
+    /// Buffer pages the replay reads.
+    readable-buffer: page-span,
+    /// Buffer pages an append may target.
+    writable-buffer: page-span,
+    buffer-len:      borrow<channel>,
+    buffer-pages:    borrow<channel>,
+    buffer-indptr:   borrow<channel>,
+    w-slot:          borrow<channel>,
+    w-off:           borrow<channel>,
+}
+
+resource forward-pass {
+    /// State binding. The working set is the state's IDENTITY; the geometry is
+    /// where it lives for this fire and where its boundary lands -- the same
+    /// division as `attention(kv, kv-geometry)`.
+    attention: func(
+        rs: list<borrow<rs-working-set>>,
+        geom: rs-geometry,
+    ) -> result<_, error>;
+
+    // No fold / buffer / fold-buffered. There is nothing left for them to say.
+}
+```
+
+**This reverses §9.3, on a changed premise rather than a changed opinion.**
+§9.3 moved the geometry off the binding because the buffer was exceptional —
+touched by two calls out of many — so requiring it everywhere would have forced
+a dummy. §11.1 says the buffer is half the state. Under that premise the
+conclusion flips, and the plain-`fold` case stops being a dummy: an empty
+buffer with `fold-len = T` is *degenerate but meaningful*, not meaningless. The
+rule from §9.3 is unchanged — geometry goes where it is read — only the answer
+to "where is it read" moved.
+
+**`start-token` disappears.** New tokens always append at the buffer tail,
+which the runtime already knows. Step B let the guest state a value the runtime
+owns, which is why multi-chunk accumulation was expressible and wrong; under
+the boundary model multi-chunk is just consecutive fires with no special case.
+
+**The fast path is an SDK concern, not a WIT one.** A plain prefill/decode
+still has to name eight fields whose values are constant and mostly empty.
+Those lower through `PortSource::Const` into the cached container rather than
+per-fire channel traffic, so the cost is at trace time; the ergonomics are
+handled one layer up, where the SDK already defaults geometry (`fwd.attention(
+&ws, .., .., &kv_len, ..)` — the `..` are defaulted page-spans). WIT stays
+orthogonal and complete; the SDK supplies "fold everything, buffer empty" as
+the default.
+
+### 11.4 `fold-len` is geometry, and the price is a device-resident boundary
+
+`fold-len` is structurally `kv-len`'s twin: per-request, per-fire,
+device-resolvable, and already adjacent to the buffer CSR in the driver as
+`rs_fold_lens_d`. The precedent is exact — `kv-len` is **already permitted to
+be device-resident**: the decode-envelope path is selected by
+`puts_channel(kv_len_channel)` (`pipeline/fire/geometry.rs:130`), i.e. by a
+stage computing it with `ChanPut`, after which the host never learns the value
+and `descriptor_resolve` consumes it on device.
+
+That is the point of making it a channel. A speculative decode computes its
+accepted count on device; with a host `u32` (Step B's `fold-buffered(lens)`)
+the guest must round-trip it before issuing the commit fire — precisely the
+round-trip channels exist to remove. As a channel, **verify and commit fuse
+into one fire**:
+
+```rust
+fwd.epilogue(move || { n_acc_ch.put(&reduce_sum(cumprod(hit))); });
+fwd.attention(&[&rs], &rs_geometry_with(&n_acc_ch, ..))?;
+```
+
+This is also the real fix for §11.6: today the correct shape (fold-commit) is
+slower and more verbose than the incorrect one, so nobody writes it. Here the
+fused form is both the fastest and the only correct one. The incentive aligns.
+
+**The price.** `kv-len` is safe to be device-resident because it is
+*descriptive* — the host reserved a page superset, and `kv-len` only says how
+much to attend, so host ignorance costs nothing. `fold-len` is *imperative and
+irreversible*, and today the host uses it for three things (`store/rs.rs`
+module doc): `validate_fold` (granularity/capacity), publishing the boundary
+advance in submission order (the basis of run-ahead safety), and retiring
+fully covered head slabs.
+
+Adopting the channel therefore commits to **the folded boundary being
+device-resident state of the working set**, under the discipline the KV side
+already follows: *the host must never need the value for correctness.*
+
+- The host retains slabs conservatively and never retires on a device value.
+  Reclamation stays with the guest's explicit `free-buffer` — which is already
+  how it works (`gdn-foldcommit` calls it, and only the guest knows when).
+- `validate_fold` demotes to a device-side clamp (`min(fold_len, buffer_len)`).
+- The host tracks an upper bound on `F`; the exact position lives on device.
+  Exactly the KV arrangement, where the host knows the page reservation and
+  not `kv-len`.
+
+**Incremental path.** Add the field now — D8 chose records and adding a record
+field later is breaking, the same argument as §9.3 — but support only
+trace-known constant channels at first. The host reads the constant at prepare
+time and drives today's path unchanged; device-computed values open when the
+store can carry the boundary. The WIT changes once and no guest is rewritten.
+
+### 11.5 Ordering consequence for §10
+
+§10.1 said the surface was final and only lowering remained. §11.3 changes the
+surface, so §10.1's engine/SDK port wiring should land *against this shape*,
+not Step B's — and it now wires ports for a record reached through `attention`,
+not through two fold-mode methods. And the roadmap gains a tier ahead of observation:
+
+**Tier 1.5 — the buffer read path.** Initialize the recurrence from
+`folded state + replay(buffer)`. Without it the buffer is single-use staging,
+"never fold" is not a correct steady state, and Tiers 2 and 3 have nothing to
+attach to. It also resolves the §10.4 `fold-buffered` logits discrepancy: once
+a fire can read the buffer, producing normal output without folding is the
+ordinary case rather than a documented impossibility.
+
+Tier 1.5 is larger than the read itself, because §11.4 moves boundary
+ownership from host to device.
+
+### 11.6 `mtp-native-verify` folds rejected tokens
+
+Found while auditing RS usage. Of the RS consumers, only `gdn-foldcommit`
+touches the buffer; `generate-gdn{,-n1,-frame}`, `beam-search` (which rolls
+back with `fork` instead) and `mtp-native-verify` all use plain `fold`.
+
+`mtp-native-verify` is a speculative-decoding inferlet that runs its `k+1`-row
+verify fire under plain `fold` (`:209`) and only afterwards computes how many
+rows were accepted (`:280`). The rejected tail is irreversibly absorbed before
+the rejection is known. It passes today only because it has no `is-linear()`
+guard and `rs-state-size` is 0 on attention models, making the binding a
+no-op — but Step B moved it to `ptir::hybrid` because it constructs an
+`RsWorkingSet` unconditionally.
+
+The per-kind split does not catch this: it blocks *attention algorithms on
+hybrid models*, not *fold misuse within a hybrid pass*. `fold` and `buffered`
+are two methods on one type, so there is nothing for the compiler to see.
+Fixing it is the acceptance test for Tier 1.5 — and today `gdn-foldcommit` is
+the *only* coverage of the buffer path at all.
