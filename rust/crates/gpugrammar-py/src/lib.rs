@@ -5,6 +5,14 @@
 //! the compiled artifact, so admitting a new request costs an integer stack
 //! rather than a rebuilt automaton.
 
+// Compiling a schema makes and frees hundreds of thousands of small vectors -
+// one per group of tokens, one per reading, one per reading's terminals - and
+// freeing them was measured at 186 ms of a 2.45 s run over thirty schemas, or
+// 286 ns a group. That is the allocator, not the code, so this replaces the
+// allocator rather than restructuring what it is asked to do.
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::sync::Arc;
 
 use gpugrammar_ir::grammar::Grammar;
@@ -49,6 +57,7 @@ impl Compiler {
     #[pyo3(signature = (schema, lexer_states = None, exact = false))]
     fn compile_json_schema(
         &self,
+        python: Python<'_>,
         schema: &str,
         lexer_states: Option<usize>,
         exact: bool,
@@ -58,7 +67,12 @@ impl Compiler {
             exact,
             ..Default::default()
         };
-        let compiled = compile_schema(schema, &self.vocabulary, limits)
+        // Compiling holds no Python object and takes tens of milliseconds
+        // across every core, so holding the interpreter lock for it stops the
+        // caller's other threads and makes rayon's workers contend with
+        // whatever else the process is doing.
+        let compiled = python
+            .allow_threads(|| compile_schema(schema, &self.vocabulary, limits))
             .map_err(|failure| PyValueError::new_err(failure.to_string()))?;
         Ok(CompiledGrammar {
             artifact: Arc::new(compiled.artifact),

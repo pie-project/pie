@@ -11,6 +11,7 @@ name = "_gpugrammar"
 crate-type = ["cdylib"]
 
 [dependencies]
+mimalloc = { version = "0.1", default-features = false }
 anyhow.workspace = true
 gpugrammar-ir = { path = "../gpugrammar-ir" }
 gpugrammar-lex = { path = "../gpugrammar-lex" }

@@ -283,6 +283,18 @@ fn compile_at(
     let artifact =
         emit(&lexicon, &lexer, &groups, &cfg, &tables, vocabulary.len()).map_err(|_| Failure::Emit);
     lap("emit");
+    // Everything the pipeline built is freed on the way out of this function,
+    // and it is hundreds of thousands of small vectors - one per group of
+    // tokens, one per reading, one per reading's terminals. That was 186 ms of
+    // a 2.45 s run over thirty schemas until the extension took mimalloc as
+    // its global allocator, and 62 ms after. Named here rather than left as an
+    // unattributed gap between the last lap and the return.
+    drop(groups);
+    drop(cfg);
+    drop(tables);
+    drop(lexicon);
+    drop(lexer);
+    lap("drop");
     artifact
 }
 
