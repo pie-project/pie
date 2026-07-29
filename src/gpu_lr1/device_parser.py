@@ -64,6 +64,11 @@ _SWEEP_BLOCKS = 4096
 # bounds keep the state beside each entry small; a parse too wide or too deep
 # for them is not remembered, which costs a recomputation and nothing else.
 _MEMO_SLOTS = 256
+# How many stack suffixes to key on. The sweep measures how far down each mask
+# looked; on this corpus and on a recursive schema that is 1 or 2 for two
+# thirds to three quarters of configurations, with a long thin tail that the
+# whole-stack key still catches.
+_MEMO_SUFFIXES = 1
 _MEMO_CONFIGS = 8
 _MEMO_DEPTH = 64
 # No real fingerprint is asked to be this, and an empty entry has to miss.
@@ -189,6 +194,13 @@ def _replay_group(
     """
     admitted = 0
     high_water = 0
+    # The lowest stack entry any reading of this group looks at. A replay pops
+    # to expose what is underneath, and how far down it goes is what the answer
+    # actually depends on - everything below is untouched and cannot change it.
+    # Reported so the memo can key on that much of the stack instead of all of
+    # it, which is the difference between hitting and never hitting on a
+    # grammar whose stack grows with the document.
+    deepest = depth
     use = tl.load(reading_offsets_ptr + group)
     use_end = tl.load(reading_offsets_ptr + group + 1)
     while use < use_end:
@@ -287,6 +299,7 @@ def _replay_group(
                                     # window's contents are all above it and dead, so
                                     # the window empties rather than being rewritten.
                                     floor = tl.minimum(floor, copy_depth)
+                                    deepest = tl.minimum(deepest, copy_depth)
                                     exposed = _peek(
                                         stack_ptr,
                                         base,
@@ -448,7 +461,7 @@ def _replay_group(
             use = use_end
         else:
             use = use + 1
-    return admitted, high_water
+    return admitted, high_water, deepest
 
 
 @triton.jit
@@ -490,6 +503,7 @@ def _mask_kernel(
     admitted_ptr,
     overflow_ptr,
     high_water_ptr,
+    row_floor_ptr,
     ROWS: tl.constexpr,
     CONFIGS: tl.constexpr,
     STACK_STRIDE: tl.constexpr,
@@ -575,8 +589,12 @@ def _mask_kernel(
 
         admitted = 0
         reach = 0
+        # A settled group is refused without looking at the stack at all, so it
+        # constrains nothing; only a replay can widen how much of the stack the
+        # answer depends on.
+        read = depth
         if settled == 0:
-            admitted, reach = _replay_group(
+            admitted, reach, read = _replay_group(
                 my_group_offsets,
                 reading_offsets_ptr + tl.load(at + _B_READING_OFFSETS),
                 reading_index_ptr + tl.load(at + _B_READING_INDEX),
@@ -613,6 +631,16 @@ def _mask_kernel(
         # to be cleared - at batch 512 that clear was 13 MB a step.
         tl.store(admitted_ptr + item, admitted.to(tl.int8))
         high_water = tl.maximum(high_water, reach)
+        # The sweep asks every group, so the deepest any of them looked is how
+        # much of this configuration's stack the finished mask depends on.
+        # Atomic because a row's groups are spread across blocks - but only
+        # when there is something to say. A group that is settled, or whose
+        # readings die on their first terminal, never looks below the top and
+        # leaves `read` at the depth it was seeded with; those are most items,
+        # and doing the atomic for them anyway cost more than everything the
+        # suffix key buys - 40 to 146 us at batch 32 on the widest schema.
+        if read < depth:
+            tl.atomic_min(row_floor_ptr + row_index, read)
         item = item + blocks
 
     # How much of the window this block actually needed. Recorded once, not per
@@ -1782,10 +1810,12 @@ def _hash_kernel(
     config_count_ptr,
     grammar_ptr,
     hash_ptr,
+    suffix_hash_ptr,
     CONFIGS: tl.constexpr,
     STACK_STRIDE: tl.constexpr,
+    SUFFIXES: tl.constexpr,
 ):
-    """A fingerprint of one sequence's parse state.
+    """A fingerprint of one sequence's parse state, whole and by suffix.
 
     A serving batch runs many sequences against the same grammar at different
     points of their own documents, and there are only so many places to be: on
@@ -1822,6 +1852,43 @@ def _hash_kernel(
         digest = (digest ^ tl.sum(values * (lane + 1))) * 16777619
         config = config + 1
     tl.store(hash_ptr + sequence, digest)
+
+    # The same fingerprint over only the top `k` of every stack, for every k at
+    # once. A mask depends on the stack only as far down as its replay looked,
+    # which the sweep measures - so an entry saved under the suffix it actually
+    # needs is found again by whatever agrees on that much, however different
+    # the two stacks are underneath. That is the whole of the difference on a
+    # grammar that nests: the stack grows with the document and the answer does
+    # not.
+    #
+    # All the suffixes in one pass over the configurations. A pass apiece reads
+    # the stack `SUFFIXES` times over, and a sequence here can hold sixty-four
+    # configurations - that cost more than the suffix key buys, 40 to 146 us at
+    # batch 32 on the widest schema.
+    width = tl.arange(0, SUFFIXES) + 1
+    digests = tl.full((SUFFIXES,), 2166136261, tl.int32)
+    digests = (digests ^ tl.load(grammar_ptr + sequence)) * 16777619
+    digests = (digests ^ count) * 16777619
+    digests = (digests ^ width) * 16777619
+    config = 0
+    while config < count:
+        row = sequence * CONFIGS + config
+        depth = tl.load(stack_depth_ptr + row)
+        lane = tl.arange(0, STACK_STRIDE)
+        values = tl.load(stack_ptr + row * STACK_STRIDE + lane, mask=lane < depth, other=0)
+        kept = tl.minimum(depth, width)
+        floor = depth - kept
+        inside = (lane[None, :] >= floor[:, None]) & (lane[None, :] < depth)
+        weight = lane[None, :] - floor[:, None] + 1
+        folded = tl.sum(tl.where(inside, values[None, :] * weight, 0), axis=1)
+        digests = (digests ^ tl.load(lexer_state_ptr + row)) * 16777619
+        digests = (digests ^ kept) * 16777619
+        # A stack shorter than `k` is folded whole, so it can never look like a
+        # longer one that happens to end the same way.
+        digests = (digests ^ tl.where(depth <= width, 1, 0)) * 16777619
+        digests = (digests ^ folded) * 16777619
+        config = config + 1
+    tl.store(suffix_hash_ptr + sequence * SUFFIXES + tl.arange(0, SUFFIXES), digests)
 
 
 @triton.jit
@@ -1936,15 +2003,17 @@ def _probe_kernel(
     memo_depth_ptr,
     memo_count_ptr,
     memo_grammar_ptr,
+    memo_read_ptr,
+    suffix_hash_ptr,
     memo_slot_ptr,
     memo_store_ptr,
-    stack_depth_all_ptr,
+    row_floor_ptr,
     CONFIGS: tl.constexpr,
     STACK_STRIDE: tl.constexpr,
     SLOTS: tl.constexpr,
     MEMO_CONFIGS: tl.constexpr,
     MEMO_STRIDE: tl.constexpr,
-    BATCH: tl.constexpr,
+    SUFFIXES: tl.constexpr,
 ):
     """Has this parse state been masked before, and may this sequence save one?
 
@@ -1964,70 +2033,116 @@ def _probe_kernel(
     sequence = tl.program_id(0)
     # One exit. A `return` under a runtime branch reads as a jump and is a
     # predicate, which this file has been bitten by before.
-    mine = tl.load(hash_ptr + sequence)
     count = tl.load(config_count_ptr + sequence)
-    # The fingerprint is a folded hash and may be negative as an int32; a
-    # negative remainder indexes off the front of the table.
-    slot = (mine & 0x7FFFFFFF) % SLOTS
+    mine = tl.load(grammar_ptr + sequence)
     usable = tl.load(representative_ptr + sequence) == sequence
     usable = usable & (count <= MEMO_CONFIGS)
+
     found = -1
-    if usable:
-        same = 1
-        if tl.load(memo_hash_ptr + slot) != mine:
-            same = 0
-        if tl.load(memo_count_ptr + slot) != count:
-            same = 0
-        if tl.load(memo_grammar_ptr + slot) != tl.load(grammar_ptr + sequence):
-            same = 0
-        config = 0
-        while config < count and same == 1:
-            row = sequence * CONFIGS + config
-            held = slot * MEMO_CONFIGS + config
-            depth = tl.load(stack_depth_ptr + row)
-            if tl.load(lexer_state_ptr + row) != tl.load(memo_lexer_ptr + held):
+    # Suffixes first, shortest first, then the whole stack. A shorter key is
+    # the more general one - it matches stacks that differ underneath - so
+    # finding it first is what makes a nesting document hit.
+    attempt = 0
+    while attempt <= SUFFIXES and found < 0:
+        if attempt == 0:
+            want = -1
+            digest = tl.load(hash_ptr + sequence)
+        else:
+            want = attempt
+            digest = tl.load(suffix_hash_ptr + sequence * SUFFIXES + attempt - 1)
+        slot = (digest & 0x7FFFFFFF) % SLOTS
+        if usable:
+            same = 1
+            if tl.load(memo_hash_ptr + slot) != digest:
                 same = 0
-            if depth != tl.load(memo_depth_ptr + held):
+            if tl.load(memo_read_ptr + slot) != want:
                 same = 0
-            lane = tl.arange(0, STACK_STRIDE)
-            live = (lane < depth) & (lane < MEMO_STRIDE)
-            left = tl.load(stack_ptr + row * STACK_STRIDE + lane, mask=live, other=0)
-            right = tl.load(
-                memo_stack_ptr + held * MEMO_STRIDE + lane, mask=live, other=0
-            )
-            if tl.sum(tl.where(left != right, 1, 0)) != 0:
+            if tl.load(memo_count_ptr + slot) != count:
                 same = 0
-            config = config + 1
-        if same == 1:
-            found = slot
+            if tl.load(memo_grammar_ptr + slot) != mine:
+                same = 0
+            config = 0
+            while config < count and same == 1:
+                row = sequence * CONFIGS + config
+                held = slot * MEMO_CONFIGS + config
+                depth = tl.load(stack_depth_ptr + row)
+                kept = depth
+                if want > 0:
+                    kept = tl.minimum(depth, want)
+                if tl.load(lexer_state_ptr + row) != tl.load(memo_lexer_ptr + held):
+                    same = 0
+                if kept != tl.load(memo_depth_ptr + held):
+                    same = 0
+                lane = tl.arange(0, STACK_STRIDE)
+                live = (lane < kept) & (lane < MEMO_STRIDE)
+                left = tl.load(
+                    stack_ptr + row * STACK_STRIDE + depth - kept + lane,
+                    mask=live,
+                    other=0,
+                )
+                right = tl.load(
+                    memo_stack_ptr + held * MEMO_STRIDE + lane, mask=live, other=0
+                )
+                if tl.sum(tl.where(left != right, 1, 0)) != 0:
+                    same = 0
+                config = config + 1
+            if same == 1:
+                found = slot
+        attempt = attempt + 1
     tl.store(memo_slot_ptr + sequence, found)
 
-    # Who may write this slot. Two sequences of one step whose fingerprints
-    # collide would otherwise interleave their writes and leave an entry with
-    # one state and the other's mask, which a later probe would match and hand
-    # back wrongly. The lowest sequence wins, decided here rather than by an
-    # atomic so that the answer does not depend on how the blocks are ordered.
-    writing = usable & (found < 0)
-    if writing:
+    # Seed the floors the sweep will reduce. Done here because this kernel
+    # already walks the configurations and runs before the sweep.
+    seed = 0
+    while seed < count:
+        row = sequence * CONFIGS + seed
+        tl.store(row_floor_ptr + row, tl.load(stack_depth_ptr + row))
+        seed = seed + 1
+
+    # Who may write a slot is settled after the sweep, once the read depth is
+    # known, so `_store_kernel` does that. Here only the miss is recorded.
+    tl.store(memo_store_ptr + sequence, tl.where(usable & (found < 0), 1, -1))
+
+
+@triton.jit
+def _claim_kernel(
+    stack_depth_ptr,
+    config_count_ptr,
+    row_floor_ptr,
+    memo_store_ptr,
+    memo_want_ptr,
+    CONFIGS: tl.constexpr,
+    MEMO_STRIDE: tl.constexpr,
+    SUFFIXES: tl.constexpr,
+):
+    """How much of the stack each sequence's mask turned out to depend on.
+
+    The sweep reduces `row_floor` to the lowest entry any group looked at, so
+    `depth - floor + 1` is what the answer needs. Within the suffix bound the
+    entry is keyed on that much and will match any stack agreeing there, which
+    is what lets a nesting document hit; past it the whole stack is the key.
+
+    Separate from the store because the store has to know what *other*
+    sequences chose in order to give each slot one writer, and a kernel cannot
+    read its siblings' writes.
+    """
+    sequence = tl.program_id(0)
+    want = -1
+    keep = tl.load(memo_store_ptr + sequence) >= 0
+    if keep:
+        count = tl.load(config_count_ptr + sequence)
+        need = 1
         config = 0
         while config < count:
-            if tl.load(stack_depth_ptr + sequence * CONFIGS + config) > MEMO_STRIDE:
-                writing = False
+            row = sequence * CONFIGS + config
+            depth = tl.load(stack_depth_ptr + row)
+            need = tl.maximum(need, depth - tl.load(row_floor_ptr + row) + 1)
+            if depth > MEMO_STRIDE:
+                keep = False
             config = config + 1
-    if writing:
-        lane = tl.arange(0, BATCH)
-        rival = lane < sequence
-        rival = rival & (
-            tl.load(representative_ptr + lane, mask=rival, other=-1) == lane
-        )
-        rival = rival & (tl.load(memo_slot_ptr + lane, mask=rival, other=0) < 0)
-        rival = rival & (
-            ((tl.load(hash_ptr + lane, mask=rival, other=0) & 0x7FFFFFFF) % SLOTS)
-            == slot
-        )
-        if tl.sum(tl.where(rival, 1, 0)) != 0:
-            writing = False
-    tl.store(memo_store_ptr + sequence, tl.where(writing, slot, -1))
+        if need <= SUFFIXES:
+            want = need
+    tl.store(memo_want_ptr + sequence, tl.where(keep, want, -2))
 
 
 @triton.jit
@@ -2057,7 +2172,9 @@ def _store_kernel(
     grammar_ptr,
     hash_ptr,
     representative_ptr,
-    memo_store_ptr,
+    memo_want_ptr,
+    suffix_hash_ptr,
+    memo_read_ptr,
     memo_hash_ptr,
     memo_lexer_ptr,
     memo_stack_ptr,
@@ -2072,6 +2189,8 @@ def _store_kernel(
     SLOTS: tl.constexpr,
     MEMO_CONFIGS: tl.constexpr,
     MEMO_STRIDE: tl.constexpr,
+    SUFFIXES: tl.constexpr,
+    BATCH: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     """Remember a mask this step had to compute.
@@ -2086,29 +2205,69 @@ def _store_kernel(
     wrong answer.
     """
     sequence = tl.program_id(0)
-    slot = tl.load(memo_store_ptr + sequence)
-    if slot >= 0:
-        count = tl.load(config_count_ptr + sequence)
+    count = tl.load(config_count_ptr + sequence)
+    want = tl.load(memo_want_ptr + sequence)
+    wants = want != -2
+    digest = tl.load(hash_ptr + sequence)
+    if want > 0:
+        digest = tl.load(suffix_hash_ptr + sequence * SUFFIXES + want - 1)
+    slot = (digest & 0x7FFFFFFF) % SLOTS
+
+    # One writer per slot. Two sequences whose fingerprints collide would
+    # otherwise interleave and leave an entry holding one state and the
+    # other's mask, which a later probe matches and hands back. Decided by a
+    # scan rather than an atomic so the answer does not depend on block order.
+    if wants:
+        # A block of candidates at a time. Walking them one by one is quadratic
+        # in the batch, and it showed the moment it was written that way: the
+        # fill went from 40 to 148 us at batch 32 on the schema with the widest
+        # parses.
+        lane = tl.arange(0, BATCH)
+        live = lane < sequence
+        theirs_k = tl.load(memo_want_ptr + lane, mask=live, other=-2)
+        live = live & (theirs_k != -2)
+        theirs = tl.load(hash_ptr + lane, mask=live, other=0)
+        by_suffix = tl.load(
+            suffix_hash_ptr + lane * SUFFIXES + tl.maximum(theirs_k, 1) - 1,
+            mask=live & (theirs_k > 0),
+            other=0,
+        )
+        theirs = tl.where(theirs_k > 0, by_suffix, theirs)
+        rival = live & (((theirs & 0x7FFFFFFF) % SLOTS) == slot)
+        if tl.sum(rival.to(tl.int32)) != 0:
+            wants = False
+
+    if wants:
         if tl.program_id(1) == 0:
             config = 0
             while config < count:
                 row = sequence * CONFIGS + config
                 held = slot * MEMO_CONFIGS + config
                 depth = tl.load(stack_depth_ptr + row)
+                kept = depth
+                if want > 0:
+                    kept = tl.minimum(depth, want)
                 tl.store(memo_lexer_ptr + held, tl.load(lexer_state_ptr + row))
-                tl.store(memo_depth_ptr + held, depth)
+                tl.store(memo_depth_ptr + held, kept)
                 lane = tl.arange(0, STACK_STRIDE)
-                live = (lane < depth) & (lane < MEMO_STRIDE)
+                live = (lane < kept) & (lane < MEMO_STRIDE)
                 tl.store(
                     memo_stack_ptr + held * MEMO_STRIDE + lane,
-                    tl.load(stack_ptr + row * STACK_STRIDE + lane, mask=live, other=0),
+                    tl.load(
+                        stack_ptr + row * STACK_STRIDE + depth - kept + lane,
+                        mask=live,
+                        other=0,
+                    ),
                     mask=live,
                 )
                 config = config + 1
             tl.store(memo_count_ptr + slot, count)
             tl.store(memo_grammar_ptr + slot, tl.load(grammar_ptr + sequence))
+            tl.store(memo_read_ptr + slot, want)
+            # The fingerprint last, so a reader that sees it finds the rest of
+            # the entry already written.
             tl.debug_barrier()
-            tl.store(memo_hash_ptr + slot, tl.load(hash_ptr + sequence))
+            tl.store(memo_hash_ptr + slot, digest)
 
         lane = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
         live = lane < mask_words
@@ -3064,8 +3223,22 @@ class DeviceBatch:
         self.memo_mask = torch.zeros(
             self.memo_slots * grammar.mask_words, dtype=torch.int32, device="cuda"
         )
+        # How far down its own stack each configuration's mask actually looked.
+        # Set to the depth before the sweep and reduced by it.
+        self.row_floor = torch.zeros(
+            batch * self.configs, dtype=torch.int32, device="cuda"
+        )
+        self.suffix_hash = torch.zeros(
+            batch * _MEMO_SUFFIXES, dtype=torch.int32, device="cuda"
+        )
+        # What each entry was keyed on: `k` entries from the top, or -1 for the
+        # whole stack.
+        self.memo_read = torch.zeros(
+            self.memo_slots, dtype=torch.int32, device="cuda"
+        )
         self.memo_slot = torch.full((batch,), -1, dtype=torch.int32, device="cuda")
         self.memo_store = torch.full((batch,), -1, dtype=torch.int32, device="cuda")
+        self.memo_want = torch.full((batch,), -2, dtype=torch.int32, device="cuda")
         self.memo_revision = grammar.revision
         # Which grammar each sequence is under. A serving batch mixes them, and
         # everything else in the step reads this to find its tables.
@@ -3771,8 +3944,10 @@ class DeviceBatch:
             self.config_count,
             self.grammar_of,
             self.state_hash,
+            self.suffix_hash,
             CONFIGS=self.configs,
             STACK_STRIDE=grammar.max_stack,
+            SUFFIXES=_MEMO_SUFFIXES,
             num_warps=1,
         )
         _dedup_kernel[(self.batch,)](
@@ -3805,15 +3980,17 @@ class DeviceBatch:
             self.memo_depth,
             self.memo_count,
             self.memo_grammar,
+            self.memo_read,
+            self.suffix_hash,
             self.memo_slot,
             self.memo_store,
-            self.depth,
+            self.row_floor,
             CONFIGS=self.configs,
             STACK_STRIDE=grammar.max_stack,
             SLOTS=self.memo_slots,
             MEMO_CONFIGS=_MEMO_CONFIGS,
             MEMO_STRIDE=self.memo_stride,
-            BATCH=triton.next_power_of_2(self.batch),
+            SUFFIXES=_MEMO_SUFFIXES,
             num_warps=1,
         )
         rows = self.batch * self.configs
@@ -3859,6 +4036,7 @@ class DeviceBatch:
             self.admitted,
             self.overflow,
             self.high_water,
+            self.row_floor,
             ROWS=rows,
             CONFIGS=self.configs,
             STACK_STRIDE=grammar.max_stack,
@@ -3887,6 +4065,17 @@ class DeviceBatch:
             num_warps=1,
         )
         words = (grammar.mask_words + 511) // 512
+        _claim_kernel[(self.batch,)](
+            self.depth,
+            self.config_count,
+            self.row_floor,
+            self.memo_store,
+            self.memo_want,
+            CONFIGS=self.configs,
+            MEMO_STRIDE=self.memo_stride,
+            SUFFIXES=_MEMO_SUFFIXES,
+            num_warps=1,
+        )
         _recall_kernel[(self.batch, words)](
             self.memo_slot,
             self.memo_mask,
@@ -3903,7 +4092,9 @@ class DeviceBatch:
             self.grammar_of,
             self.state_hash,
             self.representative,
-            self.memo_store,
+            self.memo_want,
+            self.suffix_hash,
+            self.memo_read,
             self.memo_hash,
             self.memo_lexer,
             self.memo_stack,
@@ -3918,6 +4109,8 @@ class DeviceBatch:
             SLOTS=self.memo_slots,
             MEMO_CONFIGS=_MEMO_CONFIGS,
             MEMO_STRIDE=self.memo_stride,
+            SUFFIXES=_MEMO_SUFFIXES,
+            BATCH=triton.next_power_of_2(self.batch),
             BLOCK=512,
             num_warps=4,
         )
