@@ -28,7 +28,7 @@
 //! ## Layout
 //!
 //! * this module — values, channels, the ring, and `Instance`'s stepping
-//! * [`numeric`] — the pinned arithmetic contract: canonical reduction order,
+//! * `numeric` — the pinned arithmetic contract: canonical reduction order,
 //!   argmax tie-breaking, NaN handling, dtype-exact lanes
 //! * `eval_op` — one op, no state: the function `pareval` folds with
 

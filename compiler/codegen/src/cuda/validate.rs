@@ -1,8 +1,8 @@
 //! The region ABI checks the CUDA fused emitter gates on.
 //!
-//! Ported from `fused_codegen.hpp`; `validate_generated_region` is what decides
-//! whether a region can be emitted at all, and `second_party_region_supported`
-//! names the one second-party kernel this backend launches.
+//! `validate_generated_region` is what decides whether a region can be emitted
+//! at all, and `second_party_region_supported` names the one second-party
+//! kernel this backend launches.
 
 use crate::error::{EmitError, RegionForm};
 

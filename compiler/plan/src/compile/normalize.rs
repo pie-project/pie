@@ -34,7 +34,7 @@ use super::symbolic::{Dimension, SymbolicType, symbolic_result_type};
 /// `the_signature_still_depends_on_value_domains` pins that, because the
 /// effect is invisible from this file: the only other thing that would notice
 /// is a golden kernel name, and by then the cause is twenty files away.
-/// Changing what [`value_domain`] returns renames kernels, so it is a decision
+/// Changing what `value_domain` returns renames kernels, so it is a decision
 /// to be argued rather than a diff to be accepted.
 ///
 /// Two rough edges are recorded rather than fixed. `PageDescriptor` and
@@ -43,7 +43,7 @@ use super::symbolic::{Dimension, SymbolicType, symbolic_result_type};
 /// sink_call fall through to `PerRow`.
 ///
 /// The first of those is checked rather than merely asserted:
-/// `only_six_of_the_eight_domains_are_reachable` enumerates [`value_domain`]
+/// `only_six_of_the_eight_domains_are_reachable` enumerates `value_domain`
 /// over every op the table declares, so the two unused variants cannot quietly
 /// gain a producer, nor a used one quietly lose its last. A prose claim about
 /// reachability reads identically whether or not it is still true, which is
@@ -64,12 +64,12 @@ pub enum ValueDomain {
     GeneratedIndex = 3,
     /// A boolean (`DType::Bool`) mask.
     Mask = 4,
-    /// A KV-page descriptor. Reserved: [`value_domain`] never returns it.
+    /// A KV-page descriptor. Reserved: `value_domain` never returns it.
     PageDescriptor = 5,
     /// The result of a library op — [`Op::TopK`], [`Op::SortDesc`],
     /// [`Op::MatMul`], or [`Op::KernelCall`].
     LibraryResult = 6,
-    /// An effect token. Reserved: [`value_domain`] never returns it.
+    /// An effect token. Reserved: `value_domain` never returns it.
     EffectToken = 7,
 }
 
@@ -79,7 +79,7 @@ pub enum ValueDomain {
 /// and both start at zero, so swapping them type-checks. The plan that comes
 /// out then looks structurally valid while naming the wrong ops — regions
 /// fuse the wrong nodes, or a region's inputs point at op positions instead
-/// of values. Only [`StageIndex`](super::region::StageIndex) converts between
+/// of values. Only `StageIndex` converts between
 /// the two spaces.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct NodeIndex(pub u32);

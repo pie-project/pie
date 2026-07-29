@@ -6,9 +6,9 @@
 //! would still pass if the whole function were `Ok(...)`.
 //!
 //! So this damages each corpus stage in the 23 ways `common/msl_mutations.rs`
-//! describes — the same list the C++ oracle's `kMutations` uses — and requires
-//! the validator, or the emitter behind it, to notice. That turns the accept
-//! path from "these bytes came out" into "and nothing else would have".
+//! describes — the list the deleted C++ validator's `kMutations` used — and
+//! requires the validator, or the emitter behind it, to notice. That turns the
+//! accept path from "these bytes came out" into "and nothing else would have".
 //!
 //! Scope: these are *native* mutations of a [`pie_plan::CompiledStage`], not
 //! the oracle's wire-level ones. `metal_msl_golden.rs` explains why the wire

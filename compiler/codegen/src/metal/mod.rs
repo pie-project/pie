@@ -1,27 +1,24 @@
 //! # Metal (MSL) region emitters
 //!
-//! A direct port of `driver/metal/src/pipeline/m1_codegen.cpp` (namespace
-//! `pie::metal::pipeline`). The C++ original is the oracle: every function
-//! here emits the same bytes for the same input, and
-//! `compiler/tests/golden-msl/` is the checked-in proof.
+//! The only producer of Pie's generated MSL. Emission is a pure function of
+//! the plan — no device-architecture inputs — so the same stage emits the same
+//! bytes every time, and `compiler/tests/golden-msl/` pins them.
 //!
-//! The port keeps the C++ names and control flow so the two can be read
-//! side by side. The differences are deliberate and mechanical:
+//! Those goldens started as a dump of an in-driver C++ emitter that no longer
+//! exists, which is why they are formatted as a foreign dump and why
+//! regenerating one is guarded. They are now the contract itself rather than a
+//! transcript of one: nothing can re-derive them, so a diff is a decision to be
+//! justified, not a comparison to be re-run.
 //!
-//! * out-params + `bool` become [`Result<String, EmitError>`];
-//! * the `runtime_template` argument is gone — the runtime is embedded with
-//!   `include_str!` ([`RUNTIME_TEMPLATE`]) so the emitter is self-contained;
-//! * the wire plan (`pie_native::ptir::plan::StagePlan`) becomes the native
-//!   [`pie_plan::CompiledStage`], with [`OpView`](crate::op_view::OpView)
-//!   standing in for the
-//!   decoded `container::COp` the C++ switches on.
+//! Emitters return [`Result<String, EmitError>`] and refuse rather than emit a
+//! kernel they cannot justify. Three refusals the earlier design needed have no
+//! counterpart here — an out-of-range symbolic extent role, an out-of-range
+//! dtype, and an unknown op tag — because `SymbolicExtent`, `DType` and `Op`
+//! are closed enums whose variants are exactly the legal values. A refusal that
+//! the types already make unrepresentable is dead code that reads like a live
+//! guard.
 //!
 //! [`EmitError`]: crate::error::EmitError
-//!
-//! Three of the C++ validator's rejections are unreachable from the Rust
-//! types and have no counterpart here: an out-of-range symbolic extent role,
-//! an out-of-range dtype, and an unknown op tag. `SymbolicExtent`, `DType` and
-//! `Op` are closed enums whose variants are exactly the legal values.
 //!
 //! ## Modules
 //!

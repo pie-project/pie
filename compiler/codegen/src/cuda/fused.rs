@@ -13,7 +13,7 @@
 //! * **reshape aliasing** — a `reshape` whose result never leaves the region is
 //!   not emitted at all; its result id is aliased to its input's, so the copy
 //!   never exists rather than being generated and skipped.
-//! * **direct argmax** ([`analyze_direct_argmax`]) — an `argmax` fed by a
+//! * **direct argmax** (`analyze_direct_argmax`) — an `argmax` fed by a
 //!   logits intrinsic through nothing but reshapes reads the intrinsic's device
 //!   buffer straight, which makes both the intrinsic materialisation and the
 //!   reshapes redundant.

@@ -1,34 +1,31 @@
-//! The Metal MSL emitters, byte for byte against the C++ oracle.
+//! The Metal MSL emitters, pinned byte for byte.
 //!
-//! `compiler/tests/golden-msl/` is a dump of
-//! `driver/metal/src/pipeline/m1_codegen.cpp` over a fixed corpus, produced by
-//! `compiler/tests/oracle/m1_codegen_dump.cpp` (that file carries the build
-//! command). This test drives the Rust port in `compiler/codegen/src/metal/`
-//! over the same corpus, formats it identically, and requires the bytes to
-//! match. Any difference is a bug in the port: the C++ is the oracle until it
-//! is deleted, and this comparison is what survives it.
+//! `compiler/tests/golden-msl/` records this emitter's output over a fixed
+//! corpus. Emission is a pure function of the plan, so any byte that moves is a
+//! change someone made, and this test is where it has to be justified.
 //!
-//! Regenerating with `PTIR_REGEN=1` writes the *Rust* output over the goldens,
-//! so only do it after re-deriving the C++ side with the oracle and seeing an
-//! empty `git diff` — blessing from Rust alone erases the comparison this file
-//! exists to make.
+//! The goldens began as a dump of an in-driver C++ emitter that has since been
+//! deleted, which changes how a mismatch is read: the bytes cannot be
+//! re-derived from anything, so `PTIR_REGEN=1` overwrites evidence rather than
+//! refreshing it. It demands a written reason and stamps the header — see
+//! `provenance.rs` — and `INTENDED_ORACLE_DIVERGENCES` records the cases
+//! where the recorded bytes are known to be *wrong* and this emitter
+//! deliberately disagrees with them.
 //!
 //! Two deliberate scope limits:
 //!
 //! * `validate_singleton_plan` is compared on the **unmutated** corpus, and on
 //!   the rejection path only its verdict and message are compared, not the
-//!   `operations` vector. The oracle also dumps 23 wire-level mutations per
-//!   stage, but those model a plan decoded from bytes; the Rust validator takes
-//!   a native [`pie_plan::CompiledStage`] whose types make most of them
-//!   unrepresentable. And the C++ fills its out-param as it walks, so a late
-//!   rejection leaves a partially built vector behind — `m1_runtime.cpp` returns
-//!   `reject_deterministic(error)` without reading it, so those entries are
-//!   unobservable. Reproducing them would mean returning junk inside an `Err`.
-//! * `emit_grouped_nucleus` skips the cases the oracle marked
-//!   `cxx-oracle-undefined`. The C++ guard omits `!region.library` (its TopK
-//!   sibling has it) and a Generated region's `library_op` byte is
-//!   `0 == PTIR_LIBRARY_NUCLEUS_SAMPLE`, so it reaches an out-of-bounds read of
-//!   `region.inputs[0..3]`. There is no defined oracle output to match.
+//!   `operations` vector. The recorded dump also carries 23 wire-level
+//!   mutations per stage, but those model a plan decoded from bytes; this
+//!   validator takes a native [`pie_plan::CompiledStage`] whose types make most
+//!   of them unrepresentable. The recorded `operations` entries are the
+//!   half-built out-param of a walk that rejected late and never read it back,
+//!   so reproducing them would mean returning junk inside an `Err`.
+//! * `emit_grouped_nucleus` skips the cases recorded as `cxx-oracle-undefined`,
+//!   where the dump's own guard omitted `!region.library` and so reached an
+//!   out-of-bounds read of `region.inputs[0..3]`. There is no defined output to
+//!   match.
 
 #[path = "common/device_text.rs"]
 mod device_text;
@@ -307,7 +304,7 @@ fn compare(dump: &Dump) {
     }
     assert!(
         unexpected.is_empty(),
-        "{} diverged from the C++ oracle in {} case(s):\n{}\n{}",
+        "{} diverged from its recorded golden in {} case(s):\n{}\n{}",
         dump.emitter,
         unexpected.len(),
         unexpected.join("\n"),
@@ -598,7 +595,7 @@ fn validate_singleton_plan_matches_oracle_on_clean_plans() {
     }
     assert!(
         divergences.is_empty(),
-        "validate_singleton_plan diverged from the C++ oracle on {} of {} stages:\n{}",
+        "validate_singleton_plan diverged from its recorded golden on {} of {} stages:\n{}",
         divergences.len(),
         stages.len(),
         divergences.join("\n")

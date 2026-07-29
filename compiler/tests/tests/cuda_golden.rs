@@ -1,10 +1,10 @@
-//! The CUDA kernel emitters, byte for byte against the C++ oracle.
+//! The CUDA kernel emitters, pinned byte for byte.
 //!
-//! The sibling of `metal_msl_golden.rs`, for the CUDA backend.
-//! `compiler/tests/golden-cuda/` is a dump of
-//! `driver/cuda/src/pipeline/generated/` over the shared corpus, produced by
-//! `compiler/tests/oracle/cuda_codegen_dump.cpp`; the Rust port in
-//! `compiler/codegen/src/cuda/` must reproduce it.
+//! The sibling of `metal_msl_golden.rs`, for the CUDA backend, under the same
+//! rules: `compiler/tests/golden-cuda/` records this emitter's output over the
+//! shared corpus, it began as a dump of an in-driver C++ emitter that has since
+//! been deleted, and so regenerating it overwrites evidence rather than
+//! refreshing it.
 //!
 //! A fused CUDA kernel is 40-70 KB and the corpus has 320 regions, so unlike
 //! the Metal dump the fused bodies are pinned by FNV-1a of the tail rather than
@@ -156,7 +156,7 @@ fn compare(dump: &Dump) {
     provenance::assert_same_lines(
         &dump.body,
         &expected,
-        &format!("{} against the C++ oracle", dump.emitter),
+        &format!("{} against its recorded golden", dump.emitter),
         &format!("\n{}", dump.inputs.hint()),
     );
 }
@@ -334,10 +334,10 @@ fn emitter_version_matches_oracle() {
 
 /// Whole-program emission: the table a driver receives.
 ///
-/// The per-region emitters are pinned against the C++ oracle above; this pins
-/// the walk around them — that every region gets an entry, that entry names
-/// are exactly the ones the drivers look up, and that a failure is recorded
-/// rather than dropped.
+/// The per-region emitters are pinned against their recorded goldens above;
+/// this pins the walk around them — that every region gets an entry, that entry
+/// names are exactly the ones the drivers look up, and that a failure is
+/// recorded rather than dropped.
 #[test]
 fn emit_program_covers_every_region() {
     use pie_codegen::program::{Backend, PIE_KERNEL_FUSED, emit_program};

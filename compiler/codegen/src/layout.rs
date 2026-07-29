@@ -11,7 +11,7 @@
 //!
 //! | copy | how it is tied here |
 //! |---|---|
-//! | `#[repr(C)]` structs in `pie-plan` | `offset_of!` in [`static_assertions`] |
+//! | `#[repr(C)]` structs in `pie-plan` | `offset_of!` in `static_assertions` |
 //! | C text in [`crate::header`] → `ptir_abi.h` | printed by [`DeviceStruct::emit_c`] |
 //! | MSL `M1*` in `metal::preamble` | printed by [`DeviceStruct::emit_msl`] |
 //! | MSL `M3*` in `metal::preamble` | printed by [`DeviceStruct::emit_msl`] |

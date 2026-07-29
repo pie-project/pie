@@ -254,7 +254,7 @@ where
 /// # Panics
 ///
 /// If any table is longer than the wire width of its count; see
-/// [`wire_len`].
+/// `wire_len`.
 pub fn encode(c: &TraceContainer) -> Vec<u8> {
     let mut w = Vec::new();
     w.extend_from_slice(&PTIR_MAGIC);
@@ -386,7 +386,7 @@ pub fn encode_op(w: &mut Vec<u8>, op: &Op) {
 ///
 /// # Panics
 ///
-/// If the rank does not fit a byte; see [`MAX_RANK`](crate::types::MAX_RANK).
+/// If the rank does not fit a byte; see [`MAX_RANK`].
 pub fn encode_shape(w: &mut Vec<u8>, shape: Shape) {
     w.push(wire_len(shape.rank(), "shape dim"));
     for &d in shape.dims() {
@@ -423,7 +423,7 @@ pub fn const_elem_size(dtype: DType) -> usize {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ContainerDecodeError {
-    /// The leading bytes are not [`PTIR_MAGIC`](crate::PTIR_MAGIC), so this
+    /// The leading bytes are not [`PTIR_MAGIC`], so this
     /// is not a container at all.
     BadMagic,
     /// A container version this build cannot read.
@@ -439,7 +439,7 @@ pub enum ContainerDecodeError {
         /// The byte that no variant claims.
         tag: u8,
     },
-    /// A shape rank above [`MAX_RANK`](crate::types::MAX_RANK).
+    /// A shape rank above [`MAX_RANK`].
     RankTooLarge(u8),
     /// A shape dim of `0`; every extent must be at least 1.
     ZeroDimension,

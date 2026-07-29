@@ -23,9 +23,9 @@
 //!
 //! [`cuda`] and [`metal`] take a [`pie_plan`]-produced [`CompiledStage`] and
 //! return source (or a refusal — see [`EmittedKernel`]). They are pure
-//! `Plan -> String` with no device-architecture inputs, which is what let them
-//! move off the drivers' `fused_codegen.hpp` / `singleton_codegen.hpp` /
-//! `m1_codegen.cpp`. Supporting them:
+//! `Plan -> String` with no device-architecture inputs, which is what lets a
+//! kernel be emitted, diffed and reviewed on the host without a device in the
+//! loop. Supporting them:
 //!
 //! * [`op_view`] — a decoded, borrow-free view of a normalized op.
 //! * [`launch`] — the launch descriptors the drivers execute.
