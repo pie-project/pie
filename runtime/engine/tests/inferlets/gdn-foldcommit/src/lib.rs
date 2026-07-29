@@ -21,6 +21,14 @@
 //!
 //! Input: the number of speculative tokens to accept (default all of them),
 //! e.g. `"2"`. Output names the three phases so a harness can assert them.
+//!
+//! The special input `"chain"` accepts 2 and then buffers a SECOND chunk onto
+//! the surviving unfolded tail, without emptying the buffer in between. That
+//! second append is the buffer READ PATH: its tokens must recur from
+//! `folded ⊕ replay(buffer)`, not from the folded state alone. The runtime
+//! refuses it today, and `cuda_gdn_foldcommit.rs` pins that refusal — the mode
+//! exists so the read path has an executable acceptance test rather than a
+//! prose description.
 
 use inferlet::ptir::hybrid::prelude::*;
 use inferlet::{Result, model as wit_model};
@@ -30,7 +38,15 @@ const SPEC_TOKENS: u32 = 4;
 
 #[inferlet::main]
 async fn main(input: String) -> Result<String> {
-    let accepted: u32 = input.trim().parse().unwrap_or(SPEC_TOKENS).min(SPEC_TOKENS);
+    // `chain` folds a strict prefix so the buffer keeps an unfolded tail, then
+    // appends a second chunk onto it.
+    let chain = input.trim() == "chain";
+    let accepted: u32 = if chain {
+        SPEC_TOKENS / 2
+    } else {
+        input.trim().parse().unwrap_or(SPEC_TOKENS).min(SPEC_TOKENS)
+    };
+    let chunks: u32 = if chain { 2 } else { 1 };
 
     if !wit_model::is_linear() {
         return Ok("skipped: fold-commit needs a linear model".to_string());
@@ -47,13 +63,13 @@ async fn main(input: String) -> Result<String> {
     let prompt = wit_model::encode("hello world");
     let prompt: Vec<u32> = if prompt.is_empty() { vec![0] } else { prompt };
     let n = prompt.len() as u32;
-    let max_pages = (n + SPEC_TOKENS + 1).div_ceil(page_size);
+    let max_pages = (n + chunks * SPEC_TOKENS + 1).div_ceil(page_size);
     ws.reserve(max_pages)
         .map_err(|e| format!("ws.reserve: {e}"))?;
 
     // Buffered slots for the speculative chunk. Reserved logically here;
     // the buffering fire materializes them on first write.
-    let slabs = SPEC_TOKENS.div_ceil(buffer_page);
+    let slabs = (chunks * SPEC_TOKENS).div_ceil(buffer_page);
     rs.alloc_buffer(slabs)
         .map_err(|e| format!("rs.alloc_buffer: {e}"))?;
 
@@ -245,10 +261,114 @@ async fn main(input: String) -> Result<String> {
                 &commit_rs_w_off,
             )
             .map_err(|e| format!("commit recurrent binding: {e}"))?;
+        // An EMPTY epilogue, not an absent one. The commit samples nothing —
+        // it replays buffered activations and stops at the recurrence — but a
+        // pass with no stages has no PTIR program at all, and registration
+        // fails with PIE_STATUS_INVALID_ARGUMENT. An empty epilogue is the
+        // minimal well-formed program that produces no logits.
+        fwd_c.epilogue(|| {});
         fwd_c
             .submit(&pipe)
             .map_err(|e| format!("commit submit: {e}"))?;
         committed = accepted;
+    }
+
+    // ────────── 4. CHAIN — a SECOND chunk onto the unfolded tail ──────────
+    // The commit folded `accepted` of the `SPEC_TOKENS` buffered tokens, so the
+    // buffer still holds `SPEC_TOKENS - accepted` of them. Appending here means
+    // the new tokens sit at [F + tail, ...), and their recurrence has to start
+    // from `folded ⊕ replay(buffer)` — the buffer READ PATH. Every recurrence
+    // today initializes from `recurrent_state[slot]`, the state at F, so the
+    // runtime refuses this fire rather than running it and silently pretending
+    // the tail is not there.
+    //
+    // When the read path lands this becomes a real two-chunk speculation and
+    // the harness flips from asserting the refusal to asserting the value.
+    let mut chained = "n/a";
+    if chain {
+        let tail = SPEC_TOKENS - committed;
+        let base = n + SPEC_TOKENS;
+        let c2_toks = Channel::from(vec![drafted; SPEC_TOKENS as usize]).named("c2_toks");
+        let c2_indptr = Channel::from(vec![0u32, SPEC_TOKENS]).named("c2_indptr");
+        let c2_positions =
+            Channel::from((base..base + SPEC_TOKENS).collect::<Vec<_>>()).named("c2_positions");
+        let c2_pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("c2_pages");
+        let c2_page_indptr = Channel::from(vec![0u32, (base + SPEC_TOKENS).div_ceil(page_size)])
+            .named("c2_page_indptr");
+        let c2_w_slot = Channel::from(
+            (base..base + SPEC_TOKENS)
+                .map(|p| p / page_size)
+                .collect::<Vec<_>>(),
+        )
+        .named("c2_w_slot");
+        let c2_w_off = Channel::from(
+            (base..base + SPEC_TOKENS)
+                .map(|p| p % page_size)
+                .collect::<Vec<_>>(),
+        )
+        .named("c2_w_off");
+        let c2_out = Channel::new([1], dtype::i32).named("c2_out");
+
+        let fwd2 = ForwardPass::new();
+        fwd2.embed(&c2_toks, &c2_indptr)?;
+        let c2_kv_len = Channel::from(vec![base + SPEC_TOKENS]).named("c2_kv_len");
+        fwd2.attention(
+            &ws,
+            ..,
+            ..,
+            &c2_kv_len,
+            &c2_pages,
+            &c2_page_indptr,
+            &c2_w_slot,
+            &c2_w_off,
+            &c2_positions,
+            None,
+        )?;
+        // The new chunk starts at buffer token `tail`, immediately after what
+        // the commit left unfolded — that offset is exactly what makes this the
+        // read path rather than a fresh chunk.
+        let c2_rs_pages = (tail + SPEC_TOKENS).div_ceil(rs_page);
+        let c2_rs_len = Channel::from(vec![SPEC_TOKENS]).named("c2_rs_len");
+        let c2_rs_pages_ch =
+            Channel::from((0..c2_rs_pages).collect::<Vec<_>>()).named("c2_rs_pages");
+        let c2_rs_indptr = Channel::from(vec![0u32, c2_rs_pages]).named("c2_rs_indptr");
+        let c2_rs_w_slot = Channel::from(
+            (tail..tail + SPEC_TOKENS)
+                .map(|t| t / rs_page)
+                .collect::<Vec<_>>(),
+        )
+        .named("c2_rs_w_slot");
+        let c2_rs_w_off = Channel::from(
+            (tail..tail + SPEC_TOKENS)
+                .map(|t| t % rs_page)
+                .collect::<Vec<_>>(),
+        )
+        .named("c2_rs_w_off");
+        let c2_fold_len = Channel::from(vec![0u32]).named("c2_fold_len");
+        fwd2.recurrent_with(
+            std::slice::from_ref(&rs),
+            &c2_fold_len,
+            ..,
+            ..,
+            &c2_rs_len,
+            &c2_rs_pages_ch,
+            &c2_rs_indptr,
+            &c2_rs_w_slot,
+            &c2_rs_w_off,
+        )
+        .map_err(|e| format!("chain recurrent binding: {e}"))?;
+        fwd2.epilogue(move || {
+            let t = reduce_argmax(intrinsics::logits());
+            c2_out.put(&t);
+        });
+        fwd2.submit(&pipe)
+            .map_err(|e| format!("chain submit: {e}"))?;
+        c2_out
+            .take()
+            .get::<i32>()
+            .await
+            .map_err(|e| format!("c2_out take: {e}"))?;
+        chained = "ok";
     }
 
     // Whatever was buffered but not folded is abandoned by dropping its
@@ -264,7 +384,7 @@ async fn main(input: String) -> Result<String> {
 
     let result = format!(
         "foldcommit prefill=1 buffered={SPEC_TOKENS} committed={committed} \
-         abandoned={} g0={g0} drafted={drafted}",
+         abandoned={} g0={g0} drafted={drafted} chained={chained}",
         SPEC_TOKENS - committed
     );
     eprintln!("[GDN_FOLDCOMMIT] {result}");
