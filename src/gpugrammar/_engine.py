@@ -2791,6 +2791,13 @@ class DeviceGrammar:
         self.revision = 0
         self.vocab_size = 0
         self.vocabulary_digest = 0
+        # Every allocation below says `device="cuda"`, which means the *current*
+        # device rather than a fixed one. That is right for one process to one
+        # GPU, which is how a serving engine runs its ranks - and wrong the
+        # moment a compiler thread has switched the current device, since the
+        # arena would gain an array on another card. Recorded here and made
+        # current around anything that allocates or launches.
+        self.device = torch.device("cuda", torch.cuda.current_device())
         self.mask_words = 0
         self.window = window or 8
         self.window_bound = 0
@@ -3027,6 +3034,10 @@ class DeviceGrammar:
         serving engine wanting cheap re-admission after an eviction keeps the
         latter.
         """
+        with torch.cuda.device(self.device):
+            return self._admit(compiled)
+
+    def _admit(self, compiled) -> int:
         tables = (
             compiled if isinstance(compiled, ResidentTables) else self.prepare(compiled)
         )
@@ -3262,6 +3273,13 @@ class DeviceBatch:
     """Per-sequence parser state, in device memory."""
 
     def __init__(self, grammar: DeviceGrammar, batch: int, rollback: int = 0):
+        # See the note on `DeviceGrammar.device`: everything below allocates
+        # against the current device, and the pool's arrays are on the pool's.
+        self.device = grammar.device
+        with torch.cuda.device(self.device):
+            self._build(grammar, batch, rollback)
+
+    def _build(self, grammar: DeviceGrammar, batch: int, rollback: int = 0):
         self.grammar = grammar
         self.batch = batch
         self.configs = grammar.max_configs
