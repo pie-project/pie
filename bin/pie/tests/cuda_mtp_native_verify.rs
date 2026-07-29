@@ -27,14 +27,28 @@ use pie_client::client::Client;
 
 mod common;
 
-/// Draft window k (also set PIE_MTP_DRAFT_TOKENS to match so the native drafter's
-/// `max_drafts` >= k). Default 4.
+/// Draft window k, kept in lockstep with the driver's `max_drafts`.
+///
+/// The guest asks for `k` draft rows via `intrinsics::mtp_logits(k)`; the
+/// driver sizes `max_drafts` from `PIE_MTP_DRAFT_TOKENS`, falling back to
+/// `cfg.model.mtp_num_drafts` — which the test TOML does not set. So a bare
+/// `cargo test` used to run a guest wanting 4 drafts against a driver
+/// providing the config default, and fail deep in frame prepare with
+/// "MtpLogits draft-row requirement exceeds the production layout". Two
+/// defaults for one number is a trap, so this EXPORTS the value it returns:
+/// the env is the single source of truth, and the test supplies it when the
+/// caller did not. Must run before `boot_4090_mtp`, since the driver reads the
+/// variable once at init.
 fn draft_k() -> u32 {
-    std::env::var("PIE_MTP_DRAFT_TOKENS")
+    let k = std::env::var("PIE_MTP_DRAFT_TOKENS")
         .ok()
         .and_then(|v| v.trim().parse().ok())
         .filter(|&k| k >= 2)
-        .unwrap_or(4)
+        .unwrap_or(4);
+    // SAFETY: set before the engine boots, while the test is still
+    // single-threaded with respect to any driver init that reads it.
+    unsafe { std::env::set_var("PIE_MTP_DRAFT_TOKENS", k.to_string()) };
+    k
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
