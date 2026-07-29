@@ -198,21 +198,10 @@ fn infer(expr: &Expr, scope: &mut Scope<'_>) -> Result<TensorType, Error> {
             let ty = infer(src, scope)?;
             infer_transmute(&ty, to, src)
         }
-        Expr::Repack { src, spec, to } => {
-            // A repack is a kernel reading a checkpoint tensor, so its operand
-            // is the one thing the algebra can say about it. Stated here rather
-            // than at lowering because a contract that says otherwise is
-            // wrong when it is written, not when it is compiled -- and because
-            // `check` is what an author runs.
-            if !matches!(src.as_ref(), Expr::Src(_)) {
-                return Err(Error::Contract(
-                    "Repack reads a checkpoint tensor directly; publish the \
-                     expression first and repack that name"
-                        .to_string(),
-                ));
-            }
+        Expr::Repack { src, layout, to } => {
             let ty = infer(src, scope)?;
-            infer_repack(&ty, spec, to)
+            repack_spec(&ty, *layout, to)?;
+            Ok(to.clone())
         }
         Expr::Cast { src, to } => {
             let ty = infer(src, scope)?;
@@ -651,36 +640,100 @@ fn infer_fill(value: u32, ty: &TensorType) -> Result<TensorType, Error> {
 /// `batch * target_rows * target_cols` elements from `spec`; a contract that
 /// understated `out` produced a device-side overrun with nothing between the
 /// author and the fault.
-fn infer_repack(ty: &TensorType, spec: &RepackSpec, to: &TensorType) -> Result<TensorType, Error> {
-    if spec.layout == RepackLayout::None {
+/// The geometry a repack kernel needs, derived rather than restated.
+///
+/// A repack is opaque to the checker in one direction only. What the swizzle
+/// does to a byte is a kernel's business, and this cannot see through it --
+/// which is why `to` is declared rather than derived. But *how many* bytes
+/// there are on each side is not opaque at all: the operand's type says one
+/// side and `to` says the other, so a [`RepackSpec`] is a function of the two
+/// and a contract that also stated it could disagree with itself.
+///
+/// Deriving it is also what makes the source selection expressible. The fields
+/// this used to carry -- a row offset, a valid-row count, a column offset and
+/// stride, an even/odd row map -- were [`Expr::Slice`], [`Expr::Shard`] and
+/// [`Expr::Stride`] spelled as integers a kernel reads, which is why a repack
+/// could not be sharded like anything else: there was nowhere to put the node,
+/// so the rank had to be resolved before the contract existed.
+///
+/// Leaving the two sides unrelated was a memory-safety hole, not a stylistic
+/// one. The destination buffer is sized from `to` and the kernel writes
+/// `batch * target_rows * target_cols` elements; a declaration that understated
+/// it produced a device-side overrun with nothing between the author and the
+/// fault. A target *larger* than the source is allowed and is the padding a
+/// tile quantum needs -- the kernel zero-fills the tail.
+pub(crate) fn repack_spec(
+    ty: &TensorType,
+    layout: RepackLayout,
+    to: &TensorType,
+) -> Result<RepackSpec, Error> {
+    if layout == RepackLayout::None {
         return Err(Error::Contract(
-            "Repack has no layout; a zeroed spec names no kernel, so the \
-             transform would be discovered missing on the device"
+            "Repack has no layout; a repack names a kernel and nothing else, so \
+             the transform would be discovered missing on the device"
                 .to_string(),
         ));
     }
-    // The batch and row axes are common to every layout; what a layout adds is
-    // the shape of the columns, which `plan::geometry` checks where it narrows
-    // them.
-    let (batch, rows) = (i64::from(spec.batch), i64::from(spec.source_rows));
-    if ty.rank() < 2 || ty.shape[0] != batch || ty.shape[1] != rows {
+    // What each layout's operand looks like, and how many columns that is. The
+    // column count is the logical one -- MXFP4 groups of 32 for a weight -- so
+    // that a target's padding is comparable to it.
+    let (want_rank, cols) = match layout {
+        RepackLayout::MarlinMxfp4Weight => {
+            if ty.rank() != 4 || ty.shape[3] != 16 {
+                return Err(Error::Contract(format!(
+                    "MarlinMxfp4Weight Repack operand must be [B, R, K/32, 16], got {:?}",
+                    ty.shape
+                )));
+            }
+            (4, ty.shape[2].checked_mul(32).unwrap_or(i64::MAX))
+        }
+        RepackLayout::MarlinMxfp4Scale => {
+            if ty.rank() != 3 {
+                return Err(Error::Contract(format!(
+                    "MarlinMxfp4Scale Repack operand must be [B, R, groups], got {:?}",
+                    ty.shape
+                )));
+            }
+            (3, ty.shape[2])
+        }
+        RepackLayout::None => unreachable!("rejected above"),
+    };
+    debug_assert_eq!(ty.rank(), want_rank);
+    if to.rank() != 3 {
         return Err(Error::Contract(format!(
-            "Repack operand {:?} does not begin with the [batch, source_rows] \
-             its spec declares, {batch:?}/{rows}",
-            ty.shape
-        )));
-    }
-    let cols = i64::from(spec.target_cols);
-    let want = vec![batch, i64::from(spec.target_rows), cols];
-    // A single-column target is written as the rank-2 tensor it is: a bias is
-    // `[experts, rows]`, not `[experts, rows, 1]`.
-    if to.shape != want && !(cols == 1 && to.shape == want[..2]) {
-        return Err(Error::Contract(format!(
-            "Repack declares {:?} but its spec produces {want:?}",
+            "Repack declares {:?}; a repack produces [batch, rows, cols]",
             to.shape
         )));
     }
-    Ok(to.clone())
+    let (batch, rows) = (ty.shape[0], ty.shape[1]);
+    if to.shape[0] != batch {
+        return Err(Error::Contract(format!(
+            "Repack operand has batch {batch} but declares {:?}",
+            to.shape
+        )));
+    }
+    // Padding only. A target smaller than its source is a truncation the
+    // algebra can say -- `Expr::Slice` on the operand -- so a kernel doing it
+    // silently would be the same fact stated twice, and wrong once.
+    if to.shape[1] < rows || to.shape[2] < cols {
+        return Err(Error::Contract(format!(
+            "Repack declares {:?}, smaller than the [{batch}, {rows}, {cols}] it \
+             reads; narrow the operand instead",
+            to.shape
+        )));
+    }
+    Ok(RepackSpec {
+        layout,
+        batch: dim_u32(batch, "Repack batch")?,
+        source_rows: dim_u32(rows, "Repack source rows")?,
+        target_rows: dim_u32(to.shape[1], "Repack target rows")?,
+        source_cols: dim_u32(cols, "Repack source columns")?,
+        target_cols: dim_u32(to.shape[2], "Repack target columns")?,
+    })
+}
+
+fn dim_u32(value: i64, what: &str) -> Result<u32, Error> {
+    u32::try_from(value).map_err(|_| Error::Contract(format!("{what} {value} does not fit in u32")))
 }
 
 /// A cast keeps the shape and replaces the representation.
@@ -1457,72 +1510,146 @@ mod tests {
         }
     }
 
-    fn dense_row_gather(batch: u32, source_rows: u32, target_rows: u32) -> RepackSpec {
-        RepackSpec {
-            layout: RepackLayout::DenseRowGather,
-            batch,
-            source_rows,
-            target_rows,
-            valid_rows: target_rows,
-            source_stride_cols: 1,
-            source_cols: 1,
-            target_cols: 1,
-            ..RepackSpec::default()
-        }
+    /// A GPT-OSS expert block: `[experts, rows, groups, 16]` of packed nibbles.
+    fn mxfp4_blocks() -> FakeCheckpoint {
+        FakeCheckpoint::new(&[
+            ("blocks", &[2, 16, 2, 16], DType::U8),
+            ("scales", &[2, 16, 2], DType::U8),
+        ])
+    }
+
+    fn marlin_weight(src: Expr, rows: i64, cols: i64) -> Expr {
+        src.repack(
+            RepackLayout::MarlinMxfp4Weight,
+            TensorType::raw(vec![2, rows, cols], DType::BF16),
+        )
+    }
+
+    /// What `Repack` stopped restating.
+    ///
+    /// The spec used to name the operand's own geometry back to the checker --
+    /// `batch`, `source_rows`, `source_cols` -- so a contract could disagree
+    /// with the tensor it was reading and nothing would notice until a kernel
+    /// ran. There is no way to say it wrong now: the numbers *are* the operand's
+    /// type, and the author writes only the layout and the destination.
+    #[test]
+    fn a_repack_derives_its_geometry_from_its_operand() {
+        let checkpoint = mxfp4_blocks();
+        let mut resolver = Resolver::new(&checkpoint, Partition::default());
+        let ty = resolver
+            .infer(&marlin_weight(Expr::src("blocks"), 32, 64), "w")
+            .unwrap();
+        assert_eq!(ty.shape, vec![2, 32, 64]);
+
+        let operand = resolver.infer(&Expr::src("blocks"), "w").unwrap();
+        let spec = repack_spec(
+            &operand,
+            RepackLayout::MarlinMxfp4Weight,
+            &TensorType::raw(vec![2, 32, 64], DType::BF16),
+        )
+        .unwrap();
+        assert_eq!(spec.batch, 2);
+        assert_eq!(spec.source_rows, 16);
+        assert_eq!(spec.target_rows, 32);
+        // Two groups of 32 packed elements is 64 logical columns.
+        assert_eq!(spec.source_cols, 64);
+        assert_eq!(spec.target_cols, 64);
+    }
+
+    /// The selection the escape hatch gave back.
+    ///
+    /// `Repack` used to require a bare `Expr::Src`, because the spec narrowed in
+    /// checkpoint coordinates and a composed operand would have narrowed twice.
+    /// With the narrowing gone the operand is free, which is what lets a repack
+    /// be sharded by `Expr::Shard` like every other node instead of by a rank
+    /// resolved into an integer before the contract is written.
+    #[test]
+    fn a_repack_selects_in_its_operand() {
+        let checkpoint = mxfp4_blocks();
+        let mut resolver = Resolver::new(&checkpoint, Partition::new(1, 2));
+
+        // A shard, then the even rows of it: GPT-OSS's gate half, exactly.
+        let half = Expr::src("blocks").shard(1).stride(1, 0, 4, 2);
+        let ty = resolver
+            .infer(&marlin_weight(half.clone(), 8, 64), "w")
+            .unwrap();
+        assert_eq!(ty.shape, vec![2, 8, 64]);
+
+        let spec = repack_spec(
+            &resolver.infer(&half, "w").unwrap(),
+            RepackLayout::MarlinMxfp4Weight,
+            &TensorType::raw(vec![2, 8, 64], DType::BF16),
+        )
+        .unwrap();
+        assert_eq!(
+            spec.source_rows, 4,
+            "the shard's half, then every other row"
+        );
     }
 
     /// The invariant `Repack` was missing. It is opaque in one direction only:
     /// what the swizzle does to a byte is the kernel's business, but how many
     /// bytes come out is stated twice -- once in the declaration the buffer is
-    /// sized from, once in the spec the kernel writes according to -- and
+    /// sized from, once in the geometry the kernel writes according to -- and
     /// nothing made the two agree.
+    ///
+    /// Padding is the kernel's, so a target may be wider than the operand; a
+    /// target that is *narrower* is a truncation, which is `Slice`'s job and
+    /// not something a swizzle should be trusted to do.
     #[test]
-    fn a_repack_output_must_be_the_geometry_its_spec_produces() {
-        let checkpoint = FakeCheckpoint::new(&[("bias", &[4, 16], DType::BF16)]);
-        let spec = dense_row_gather(4, 16, 8);
-        for shape in [vec![4, 8], vec![4, 8, 1]] {
-            check_one(
-                Expr::src("bias").repack(spec, TensorType::raw(shape.clone(), DType::BF16)),
-                &checkpoint,
-            )
-            .unwrap_or_else(|err| panic!("{shape:?}: {err}"));
+    fn a_repack_target_may_pad_but_not_truncate() {
+        let checkpoint = mxfp4_blocks();
+        let mut resolver = Resolver::new(&checkpoint, Partition::default());
+        resolver
+            .infer(&marlin_weight(Expr::src("blocks"), 128, 128), "w")
+            .expect("padding both axes is the kernel's zero fill");
+
+        for (rows, cols) in [(8, 64), (32, 32)] {
+            let err = resolver
+                .infer(&marlin_weight(Expr::src("blocks"), rows, cols), "w")
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("smaller than"),
+                "{rows}x{cols}: {err}"
+            );
         }
-        // Understating the output is the memory-safety case: the buffer would
-        // hold four rows and the kernel would write eight.
-        let err = check_one(
-            Expr::src("bias").repack(spec, TensorType::raw(vec![4, 4], DType::BF16)),
-            &checkpoint,
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("[4, 8, 1]"), "{err}");
     }
 
+    /// Each layout reads one shape. Naming it in the type is what replaced the
+    /// spec's `source_rows`/`source_cols`, so a mismatch is now a type error
+    /// rather than a number nobody checked.
     #[test]
-    fn a_repack_operand_must_be_the_source_its_spec_reads() {
-        let checkpoint = FakeCheckpoint::new(&[("bias", &[4, 16], DType::BF16)]);
-        let err = check_one(
-            Expr::src("bias").repack(
-                dense_row_gather(4, 32, 8),
-                TensorType::raw(vec![4, 8], DType::BF16),
-            ),
-            &checkpoint,
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("source_rows"), "{err}");
+    fn a_repack_operand_must_have_the_shape_its_layout_reads() {
+        let checkpoint = mxfp4_blocks();
+        let mut resolver = Resolver::new(&checkpoint, Partition::default());
+
+        // The scale tensor is rank 3; the weight layout reads rank 4.
+        let err = resolver
+            .infer(&marlin_weight(Expr::src("scales"), 32, 64), "w")
+            .unwrap_err();
+        assert!(err.to_string().contains("[B, R, K/32, 16]"), "{err}");
+
+        let err = resolver
+            .infer(
+                &Expr::src("blocks").repack(
+                    RepackLayout::MarlinMxfp4Scale,
+                    TensorType::raw(vec![2, 32, 2], DType::U8),
+                ),
+                "s",
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("[B, R, groups]"), "{err}");
     }
 
     /// `RepackLayout::None` is what a zeroed spec carries, and the device is
     /// where it used to be discovered.
     #[test]
     fn a_repack_must_name_a_layout() {
-        let checkpoint = FakeCheckpoint::new(&[("bias", &[4, 16], DType::BF16)]);
+        let checkpoint = mxfp4_blocks();
         let err = check_one(
-            Expr::src("bias").repack(
-                RepackSpec {
-                    layout: RepackLayout::None,
-                    ..dense_row_gather(4, 16, 8)
-                },
-                TensorType::raw(vec![4, 8], DType::BF16),
+            Expr::src("blocks").repack(
+                RepackLayout::None,
+                TensorType::raw(vec![2, 32, 64], DType::BF16),
             ),
             &checkpoint,
         )

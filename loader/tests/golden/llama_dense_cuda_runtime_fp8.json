@@ -1529,14 +1529,9 @@
           "to": "Fp8E4M3",
           "repack": {
             "layout": "None",
-            "row_map": "Identity",
             "batch": 0,
             "source_rows": 0,
-            "source_row_offset": 0,
             "target_rows": 0,
-            "valid_rows": 0,
-            "source_stride_cols": 0,
-            "source_col_offset": 0,
             "source_cols": 0,
             "target_cols": 0
           },
@@ -1605,14 +1600,9 @@
           "to": "Fp8E4M3",
           "repack": {
             "layout": "None",
-            "row_map": "Identity",
             "batch": 0,
             "source_rows": 0,
-            "source_row_offset": 0,
             "target_rows": 0,
-            "valid_rows": 0,
-            "source_stride_cols": 0,
-            "source_col_offset": 0,
             "source_cols": 0,
             "target_cols": 0
           },
@@ -1681,14 +1671,9 @@
           "to": "Fp8E4M3",
           "repack": {
             "layout": "None",
-            "row_map": "Identity",
             "batch": 0,
             "source_rows": 0,
-            "source_row_offset": 0,
             "target_rows": 0,
-            "valid_rows": 0,
-            "source_stride_cols": 0,
-            "source_col_offset": 0,
             "source_cols": 0,
             "target_cols": 0
           },
@@ -1757,14 +1742,9 @@
           "to": "Fp8E4M3",
           "repack": {
             "layout": "None",
-            "row_map": "Identity",
             "batch": 0,
             "source_rows": 0,
-            "source_row_offset": 0,
             "target_rows": 0,
-            "valid_rows": 0,
-            "source_stride_cols": 0,
-            "source_col_offset": 0,
             "source_cols": 0,
             "target_cols": 0
           },
@@ -1840,14 +1820,9 @@
           "to": "Fp8E4M3",
           "repack": {
             "layout": "None",
-            "row_map": "Identity",
             "batch": 0,
             "source_rows": 0,
-            "source_row_offset": 0,
             "target_rows": 0,
-            "valid_rows": 0,
-            "source_stride_cols": 0,
-            "source_col_offset": 0,
             "source_cols": 0,
             "target_cols": 0
           },
@@ -1916,14 +1891,9 @@
           "to": "Fp8E4M3",
           "repack": {
             "layout": "None",
-            "row_map": "Identity",
             "batch": 0,
             "source_rows": 0,
-            "source_row_offset": 0,
             "target_rows": 0,
-            "valid_rows": 0,
-            "source_stride_cols": 0,
-            "source_col_offset": 0,
             "source_cols": 0,
             "target_cols": 0
           },
@@ -1992,14 +1962,9 @@
           "to": "Fp8E4M3",
           "repack": {
             "layout": "None",
-            "row_map": "Identity",
             "batch": 0,
             "source_rows": 0,
-            "source_row_offset": 0,
             "target_rows": 0,
-            "valid_rows": 0,
-            "source_stride_cols": 0,
-            "source_col_offset": 0,
             "source_cols": 0,
             "target_cols": 0
           },
@@ -2075,14 +2040,9 @@
           "to": "Fp8E4M3",
           "repack": {
             "layout": "None",
-            "row_map": "Identity",
             "batch": 0,
             "source_rows": 0,
-            "source_row_offset": 0,
             "target_rows": 0,
-            "valid_rows": 0,
-            "source_stride_cols": 0,
-            "source_col_offset": 0,
             "source_cols": 0,
             "target_cols": 0
           },
@@ -2151,14 +2111,9 @@
           "to": "Fp8E4M3",
           "repack": {
             "layout": "None",
-            "row_map": "Identity",
             "batch": 0,
             "source_rows": 0,
-            "source_row_offset": 0,
             "target_rows": 0,
-            "valid_rows": 0,
-            "source_stride_cols": 0,
-            "source_col_offset": 0,
             "source_cols": 0,
             "target_cols": 0
           },
@@ -2227,14 +2182,9 @@
           "to": "Fp8E4M3",
           "repack": {
             "layout": "None",
-            "row_map": "Identity",
             "batch": 0,
             "source_rows": 0,
-            "source_row_offset": 0,
             "target_rows": 0,
-            "valid_rows": 0,
-            "source_stride_cols": 0,
-            "source_col_offset": 0,
             "source_cols": 0,
             "target_cols": 0
           },
@@ -2303,14 +2253,9 @@
           "to": "Fp8E4M3",
           "repack": {
             "layout": "None",
-            "row_map": "Identity",
             "batch": 0,
             "source_rows": 0,
-            "source_row_offset": 0,
             "target_rows": 0,
-            "valid_rows": 0,
-            "source_stride_cols": 0,
-            "source_col_offset": 0,
             "source_cols": 0,
             "target_cols": 0
           },
@@ -2386,14 +2331,9 @@
           "to": "Fp8E4M3",
           "repack": {
             "layout": "None",
-            "row_map": "Identity",
             "batch": 0,
             "source_rows": 0,
-            "source_row_offset": 0,
             "target_rows": 0,
-            "valid_rows": 0,
-            "source_stride_cols": 0,
-            "source_col_offset": 0,
             "source_cols": 0,
             "target_cols": 0
           },
@@ -2462,14 +2402,9 @@
           "to": "Fp8E4M3",
           "repack": {
             "layout": "None",
-            "row_map": "Identity",
             "batch": 0,
             "source_rows": 0,
-            "source_row_offset": 0,
             "target_rows": 0,
-            "valid_rows": 0,
-            "source_stride_cols": 0,
-            "source_col_offset": 0,
             "source_cols": 0,
             "target_cols": 0
           },
@@ -2538,14 +2473,9 @@
           "to": "Fp8E4M3",
           "repack": {
             "layout": "None",
-            "row_map": "Identity",
             "batch": 0,
             "source_rows": 0,
-            "source_row_offset": 0,
             "target_rows": 0,
-            "valid_rows": 0,
-            "source_stride_cols": 0,
-            "source_col_offset": 0,
             "source_cols": 0,
             "target_cols": 0
           },

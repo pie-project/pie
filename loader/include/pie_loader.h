@@ -158,13 +158,6 @@ enum class PieLoaderRepackLayout : uint32_t {
   None = 0,
   MarlinMxfp4Weight = 1,
   MarlinMxfp4Scale = 2,
-  DenseRowGather = 3,
-};
-
-enum class PieLoaderRowMap : uint32_t {
-  Identity = 0,
-  Even = 1,
-  Odd = 2,
 };
 
 enum class PieLoaderBackendKind : uint32_t {
@@ -373,24 +366,6 @@ struct PieLoaderTargetSpec {
 
 using PieLoaderU32Slice = PieLoaderSlice<uint32_t>;
 
-/// [`crate::types::RepackSpec`], flattened. All eleven fields, because a repack
-/// is opaque to the type checker and therefore has to state everything.
-struct PieLoaderRepackSpecView {
-  /// A `PieLoaderRepackLayout` value, as `uint32_t`.
-  uint32_t layout;
-  /// A `PieLoaderRowMap` value, as `uint32_t`.
-  uint32_t row_map;
-  uint32_t batch;
-  uint32_t source_rows;
-  uint32_t source_row_offset;
-  uint32_t target_rows;
-  uint32_t valid_rows;
-  uint32_t source_stride_cols;
-  uint32_t source_col_offset;
-  uint32_t source_cols;
-  uint32_t target_cols;
-};
-
 /// One node of the expression graph.
 ///
 /// Every field is read by exactly the kinds that need it and ignored by the
@@ -436,8 +411,10 @@ struct PieLoaderExprNode {
   /// one extent may be `-1`, and never for a `Fill`.
   PieLoaderI64Slice out_shape;
   PieLoaderEncodingSpec out_encoding;
-  /// `Repack`.
-  PieLoaderRepackSpecView repack;
+  /// `Repack`: a `PieLoaderRepackLayout` value, as `uint32_t`. The whole of
+  /// what a repack says -- every count a kernel needs is the operand's type
+  /// or `out_shape`'s, so the loader derives it.
+  uint32_t repack_layout;
   /// `Scale`: the multiplier, as the bit pattern of an IEEE-754 binary32.
   ///
   /// A `float` field would make this struct's layout depend on the C++
@@ -708,14 +685,9 @@ struct PieLoaderStorageOp {
     PieLoaderQuantScheme transform_from;
     PieLoaderQuantScheme transform_to;
     PieLoaderRepackLayout repack_layout;
-    PieLoaderRowMap row_map;
     uint32_t transform_batch;
     uint32_t transform_source_rows;
-    uint32_t transform_source_row_offset;
     uint32_t transform_target_rows;
-    uint32_t transform_valid_rows;
-    uint32_t transform_source_stride_cols;
-    uint32_t transform_source_col_offset;
     uint32_t transform_source_cols;
     uint32_t transform_target_cols;
     uint64_t transform_scratch_bytes;

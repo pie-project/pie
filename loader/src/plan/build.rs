@@ -31,15 +31,14 @@ use std::collections::{HashMap, HashSet};
 
 use crate::checkpoint::{CheckpointMetadata, RawTensor, Sources};
 use crate::contract::compile::{Leaf, Lowering, compile};
-use crate::contract::infer::Resolver;
+use crate::contract::infer::{Resolver, repack_spec};
 use crate::contract::{
     Expr, ModelContract, Partition, ScaleFactor, TensorContract, TensorType, Visibility,
 };
 use crate::error::{Error, OrOverflow, Result};
 use crate::extent::Extent;
 use crate::plan::geometry::{
-    full_dest_extent, narrow_repack_source, repack_stage_bytes, storage_extent_for_shape,
-    strided_physical_source_bytes,
+    full_dest_extent, repack_stage_bytes, storage_extent_for_shape, strided_physical_source_bytes,
 };
 use crate::plan::{
     BufferDecl, CheckpointFileDecl, DestExtent, LoadPlan, QuantAttachment, SourceExtent,
@@ -198,19 +197,27 @@ impl Builder<'_> {
     fn tensor(&mut self, contract: &TensorContract, id: TensorId) -> Result<()> {
         let (value, decl) = match &contract.expr {
             // A repack is opaque: the layout transform declares its own result
-            // and the compiler does not model the permutation.
-            Expr::Repack { src, spec, to } => {
+            // and the compiler does not model the permutation. What it *reads*
+            // is not opaque, so the operand is lowered the way any other
+            // expression is and only the swizzle is a kernel.
+            Expr::Repack { .. } => {
+                // Sharding is resolved before lowering for the reason the
+                // `Scale` arm resolves it: below this line the operand has to
+                // mean the same thing on every rank, and `compile` has no arm
+                // for `Expr::Shard`.
+                let expr = self
+                    .resolver
+                    .specialize(contract.expr.clone(), &contract.name)
+                    .map_err(|err| annotate(err, &contract.name))?;
                 // Type-checked before lowering like everything else, even
                 // though the result is the declaration's: `infer` is where the
                 // operand rule lives, and skipping it would make that rule fire
                 // only for repacks nested somewhere it does run.
                 self.resolver
-                    .infer(&contract.expr, &contract.name)
+                    .infer(&expr, &contract.name)
                     .map_err(|err| annotate(err, &contract.name))?;
-                let Expr::Src(name) = src.as_ref() else {
-                    return Err(Error::Internal(
-                        "Repack operand should have been rejected by infer".to_string(),
-                    ));
+                let Expr::Repack { src, layout, to } = &expr else {
+                    return Err(Error::Internal("Repack arm lost its node".to_string()));
                 };
                 let decl = TensorDecl {
                     id,
@@ -220,8 +227,14 @@ impl Builder<'_> {
                     alignment: self.alignment,
                     visibility: Visibility::Public,
                 };
-                let source = self.source_view(name)?;
-                let value = self.repack(Value::Source(source), *spec, &decl)?;
+                let operand = self
+                    .resolver
+                    .infer(src, &contract.name)
+                    .map_err(|err| annotate(err, &contract.name))?;
+                let spec = repack_spec(&operand, *layout, to)
+                    .map_err(|err| annotate(err, &contract.name))?;
+                let (payload, _) = self.operand_bytes(src, &decl)?;
+                let value = self.repack(payload, spec, &decl)?;
                 (value, decl)
             }
             // A scale needs a kernel, so unlike the affine fragment it cannot
@@ -589,8 +602,8 @@ impl Builder<'_> {
             .any(|leaf| matches!(leaf, Leaf::Contract(_)))
         {
             return Err(Error::Contract(format!(
-                "'{}' scales an expression reading another contract's output; \
-                 scale the checkpoint tensors and publish the result",
+                "'{}' reads another contract's output through an expression; \
+                 transform the checkpoint tensors and publish the result",
                 decl.name
             )));
         }
@@ -755,14 +768,17 @@ impl Builder<'_> {
     }
 
     /// The one transform the algebra cannot denote (`spec.md` §3.5).
+    ///
+    /// `spec` arrives derived from the operand's type and the declaration, so
+    /// by the time this runs the operand *is* the block the kernel reads: no
+    /// narrowing is left to do here, and a strided operand -- an interleaved
+    /// half, say -- is already a strided extent the executor gathers.
     fn repack(&mut self, value: Value, spec: RepackSpec, decl: &TensorDecl) -> Result<Value> {
         let out = self.allocate(decl, true)?;
         let mut inputs = Vec::new();
-        let mut repack = spec;
+        let repack = spec;
         let (source, input_bytes) = match value {
             Value::Source(source) => {
-                let (source, narrowed) = narrow_repack_source(source, spec)?;
-                repack = narrowed;
                 let extent = self.source_extent(&source)?;
                 let bytes = extent.span_bytes;
                 (Some(extent), bytes)

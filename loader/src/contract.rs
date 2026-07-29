@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, OrOverflow};
 pub use crate::types::Visibility;
-use crate::types::{Axis, DType, Encoding, QuantGranularity, RepackSpec, ScaleForm};
+use crate::types::{Axis, DType, Encoding, QuantGranularity, RepackLayout, ScaleForm};
 
 pub mod compile;
 pub mod infer;
@@ -186,9 +186,28 @@ pub enum Expr {
     Shard { src: Box<Expr>, axis: Axis },
     /// Escape hatch: a backend-specific layout swizzle. Opaque to the type
     /// checker, so it must declare its own output type.
+    ///
+    /// Opaque in one direction only. *What* the swizzle does to a byte is the
+    /// kernel's business -- a sub-word tile interleave is a fact about a GEMM,
+    /// not about tensors -- but *how many* bytes there are on each side is not
+    /// opaque at all: the operand's type says one side and `to` says the other.
+    ///
+    /// So a repack names a kernel and nothing else. Which rows it reads is
+    /// `src`'s business, and `src` is an ordinary expression: a band is
+    /// [`Expr::Slice`], this rank's share is [`Expr::Shard`], an interleaved
+    /// half is [`Expr::Stride`]. That is what keeps the escape hatch from
+    /// re-implementing the algebra beside it, and what lets a repack be
+    /// sharded like everything else instead of by a rank resolved into an
+    /// integer before the contract is written.
+    ///
+    /// The one geometric fact left to the kernel is padding: a layout with a
+    /// tile quantum takes a `to` with more rows or columns than the operand
+    /// has and zero-fills the tail. Stating it as `Concat[src, Fill]` would be
+    /// truthful but would materialize the padded operand before the swizzle
+    /// that is about to rewrite it anyway.
     Repack {
         src: Box<Expr>,
-        spec: RepackSpec,
+        layout: RepackLayout,
         to: TensorType,
     },
     /// Escape hatch: the same values in a different representation.
@@ -620,10 +639,10 @@ impl Expr {
         }
     }
 
-    pub fn repack(self, spec: RepackSpec, to: TensorType) -> Self {
+    pub fn repack(self, layout: RepackLayout, to: TensorType) -> Self {
         Expr::Repack {
             src: Box::new(self),
-            spec,
+            layout,
             to,
         }
     }
@@ -787,9 +806,9 @@ impl Expr {
                 src: boxed(src)?,
                 to,
             },
-            Expr::Repack { src, spec, to } => Expr::Repack {
+            Expr::Repack { src, layout, to } => Expr::Repack {
                 src: boxed(src)?,
-                spec,
+                layout,
                 to,
             },
             Expr::Cast { src, to } => Expr::Cast {

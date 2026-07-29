@@ -271,6 +271,50 @@ fn gpt_oss_checkpoint() -> CheckpointMetadata {
     ck.finish("gpt_oss")
 }
 
+/// GPT-OSS at the ABI where the driver repacks into Marlin's layout.
+///
+/// The only fixture that reaches [`Expr::Repack`], and the biases are the only
+/// thing that reaches `RepackLayout::DenseRowGather`. Kept separate from
+/// [`gpt_oss_checkpoint`] because that one carries the decoder around the
+/// experts and none of the repack path.
+///
+/// `intermediate` is the *global* size. The stored contracts were authored
+/// against a fixed local size of 64, so the sharded one needs 128 here.
+fn gpt_oss_native_checkpoint(intermediate: i64) -> CheckpointMetadata {
+    let (hidden, experts) = (64, 2);
+    let mut ck = Checkpoint::new();
+    let p = "model.layers.0.mlp.experts";
+    let u8s = Encoding::Raw(DType::U8);
+    ck.push(
+        &format!("{p}.gate_up_proj_blocks"),
+        &[experts, 2 * intermediate, hidden / 32, 16],
+        u8s.clone(),
+    );
+    ck.push(
+        &format!("{p}.gate_up_proj_scales"),
+        &[experts, 2 * intermediate, hidden / 32],
+        u8s.clone(),
+    );
+    ck.push(
+        &format!("{p}.gate_up_proj_bias"),
+        &[experts, 2 * intermediate],
+        bf16(),
+    );
+    ck.push(
+        &format!("{p}.down_proj_blocks"),
+        &[experts, hidden, intermediate / 32, 16],
+        u8s.clone(),
+    );
+    ck.push(
+        &format!("{p}.down_proj_scales"),
+        &[experts, hidden, intermediate / 32],
+        u8s,
+    );
+    ck.push(&format!("{p}.down_proj_bias"), &[experts, hidden], bf16());
+    // The name keys the temp file, and the two sizes must not collide.
+    ck.finish(&format!("gpt_oss_native_{intermediate}"))
+}
+
 /// An AWQ-quantized dense decoder: the same passes as `llama_checkpoint`, but
 /// over a packed 4-bit encoding, so the plan's offsets are constrained by quant
 /// group boundaries rather than element boundaries.
@@ -643,6 +687,36 @@ fn gpt_oss_mxfp4_cuda_native_gemm() {
     check(
         "gpt_oss_mxfp4_cuda_native_gemm",
         &gpt_oss_checkpoint(),
+        target,
+    );
+}
+
+/// The repack path, which no other golden reaches: `MarlinMxfp4Weight`,
+/// `MarlinMxfp4Scale` and `DenseRowGather` all appear in this contract.
+#[test]
+fn gpt_oss_native_mxfp4() {
+    let mut target = target(BackendKind::Cuda, 0, 1);
+    target.native_mxfp4_moe = true;
+    check(
+        "gpt_oss_native_mxfp4",
+        &gpt_oss_native_checkpoint(64),
+        target,
+    );
+}
+
+/// The same at rank 1 of 2.
+///
+/// GPT-OSS is the only family that resolves the rank *inside* the escape hatch,
+/// as `RepackSpec::source_row_offset`, so it is the only family whose contract
+/// differs between one rank and another. Moving that split back out into an
+/// `Expr::Shard` must leave these bytes untouched.
+#[test]
+fn gpt_oss_native_mxfp4_tp1_of_2() {
+    let mut target = target(BackendKind::Cuda, 1, 2);
+    target.native_mxfp4_moe = true;
+    check(
+        "gpt_oss_native_mxfp4_tp1_of_2",
+        &gpt_oss_native_checkpoint(128),
         target,
     );
 }

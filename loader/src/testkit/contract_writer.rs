@@ -17,11 +17,9 @@
 use crate::contract::{Expr, ModelContract, ScaleFactor, Visibility};
 use crate::ffi::contract::{
     PieLoaderExprKind, PieLoaderExprNode, PieLoaderExprNodeSlice, PieLoaderModelContractView,
-    PieLoaderRepackSpecView, PieLoaderScalesView, PieLoaderTensorContractSlice,
-    PieLoaderTensorContractView, write_encoding,
+    PieLoaderScalesView, PieLoaderTensorContractSlice, PieLoaderTensorContractView, write_encoding,
 };
 use crate::ffi::types::*;
-use crate::types::RepackSpec;
 
 /// A contract flattened into the POD form, with its backing storage.
 ///
@@ -188,11 +186,11 @@ impl OwnedContract {
                 node.src = src;
                 node.axis = axis.0;
             }
-            Expr::Repack { src, spec, to } => {
+            Expr::Repack { src, layout, to } => {
                 let src = self.write_expr(src);
                 node.kind = PieLoaderExprKind::Repack as u32;
                 node.src = src;
-                node.repack = write_repack(spec);
+                node.repack_layout = PieLoaderRepackLayout::from(*layout) as u32;
                 node.out_shape = self.shape(&to.shape);
                 node.out_encoding = write_encoding(&to.encoding);
             }
@@ -217,22 +215,6 @@ impl OwnedContract {
             }
         }
         self.push(node)
-    }
-}
-
-fn write_repack(spec: &RepackSpec) -> PieLoaderRepackSpecView {
-    PieLoaderRepackSpecView {
-        layout: PieLoaderRepackLayout::from(spec.layout) as u32,
-        row_map: PieLoaderRowMap::from(spec.row_map) as u32,
-        batch: spec.batch,
-        source_rows: spec.source_rows,
-        source_row_offset: spec.source_row_offset,
-        target_rows: spec.target_rows,
-        valid_rows: spec.valid_rows,
-        source_stride_cols: spec.source_stride_cols,
-        source_col_offset: spec.source_col_offset,
-        source_cols: spec.source_cols,
-        target_cols: spec.target_cols,
     }
 }
 

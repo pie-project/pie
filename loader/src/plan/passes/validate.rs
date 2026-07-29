@@ -151,12 +151,11 @@ pub(super) fn validate_target_support(program: &mut LoadPlan) -> Result<usize> {
                     )
                 ))
                 || (*kind == TileMapKind::Repack
-                    && (matches!(transform.repack.layout, RepackLayout::DenseRowGather)
-                        || (program.target.native_mxfp4_moe
-                            && matches!(
-                                transform.repack.layout,
-                                RepackLayout::MarlinMxfp4Weight | RepackLayout::MarlinMxfp4Scale
-                            )))));
+                    && program.target.native_mxfp4_moe
+                    && matches!(
+                        transform.repack.layout,
+                        RepackLayout::MarlinMxfp4Weight | RepackLayout::MarlinMxfp4Scale
+                    )));
         if !supported {
             return Err(Error::Unsupported(format!(
                 "{:?} target does not support {:?} TileMap ({:?}->{:?})",

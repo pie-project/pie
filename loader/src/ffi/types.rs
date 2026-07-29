@@ -14,9 +14,7 @@
 //!   `has_*: bool` companion, matching the C++ views this replaces, so the
 //!   layout is legible from C without knowing Rust's niche rules.
 
-use crate::types::{
-    BackendKind, DType, QuantGranularity, QuantScheme, RepackLayout, RowMap, ScaleForm,
-};
+use crate::types::{BackendKind, DType, QuantGranularity, QuantScheme, RepackLayout, ScaleForm};
 
 /// Sentinel for "no buffer", mirroring the C++ `numeric_limits<uint32_t>::max()`
 /// default on `PieLoaderStorageInstrView::buffer_id`.
@@ -241,7 +239,6 @@ pub enum PieLoaderRepackLayout {
     None = 0,
     MarlinMxfp4Weight = 1,
     MarlinMxfp4Scale = 2,
-    DenseRowGather = 3,
 }
 
 impl From<RepackLayout> for PieLoaderRepackLayout {
@@ -250,7 +247,6 @@ impl From<RepackLayout> for PieLoaderRepackLayout {
             RepackLayout::None => Self::None,
             RepackLayout::MarlinMxfp4Weight => Self::MarlinMxfp4Weight,
             RepackLayout::MarlinMxfp4Scale => Self::MarlinMxfp4Scale,
-            RepackLayout::DenseRowGather => Self::DenseRowGather,
         }
     }
 }
@@ -261,35 +257,6 @@ impl From<PieLoaderRepackLayout> for RepackLayout {
             PieLoaderRepackLayout::None => Self::None,
             PieLoaderRepackLayout::MarlinMxfp4Weight => Self::MarlinMxfp4Weight,
             PieLoaderRepackLayout::MarlinMxfp4Scale => Self::MarlinMxfp4Scale,
-            PieLoaderRepackLayout::DenseRowGather => Self::DenseRowGather,
-        }
-    }
-}
-
-#[repr(u32)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PieLoaderRowMap {
-    Identity = 0,
-    Even = 1,
-    Odd = 2,
-}
-
-impl From<RowMap> for PieLoaderRowMap {
-    fn from(value: RowMap) -> Self {
-        match value {
-            RowMap::Identity => Self::Identity,
-            RowMap::Even => Self::Even,
-            RowMap::Odd => Self::Odd,
-        }
-    }
-}
-
-impl From<PieLoaderRowMap> for RowMap {
-    fn from(value: PieLoaderRowMap) -> Self {
-        match value {
-            PieLoaderRowMap::Identity => Self::Identity,
-            PieLoaderRowMap::Even => Self::Even,
-            PieLoaderRowMap::Odd => Self::Odd,
         }
     }
 }
@@ -362,19 +329,6 @@ impl TryFrom<u32> for PieLoaderRepackLayout {
             0 => Self::None,
             1 => Self::MarlinMxfp4Weight,
             2 => Self::MarlinMxfp4Scale,
-            3 => Self::DenseRowGather,
-            other => return Err(other),
-        })
-    }
-}
-
-impl TryFrom<u32> for PieLoaderRowMap {
-    type Error = u32;
-    fn try_from(value: u32) -> Result<Self, u32> {
-        Ok(match value {
-            0 => Self::Identity,
-            1 => Self::Even,
-            2 => Self::Odd,
             other => return Err(other),
         })
     }
@@ -779,14 +733,9 @@ pub enum PieLoaderStorageOp {
         transform_from: PieLoaderQuantScheme,
         transform_to: PieLoaderQuantScheme,
         repack_layout: PieLoaderRepackLayout,
-        row_map: PieLoaderRowMap,
         transform_batch: u32,
         transform_source_rows: u32,
-        transform_source_row_offset: u32,
         transform_target_rows: u32,
-        transform_valid_rows: u32,
-        transform_source_stride_cols: u32,
-        transform_source_col_offset: u32,
         transform_source_cols: u32,
         transform_target_cols: u32,
         transform_scratch_bytes: u64,

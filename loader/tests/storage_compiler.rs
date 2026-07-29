@@ -20,7 +20,7 @@ use pie_loader::plan::compile as compile_load_plan;
 use pie_loader::plan::{LoadPlan, StorageInstr, StorageTarget, TileMapKind};
 use pie_loader::types::{
     Axis, BackendKind, CheckpointFormat, DType, Encoding, FileId, QuantGranularity, QuantScheme,
-    QuantSpec, RepackLayout, RowMap, ScaleForm, TensorId,
+    QuantSpec, RepackLayout, ScaleForm, TensorId,
 };
 
 #[test]
@@ -406,7 +406,9 @@ fn gpt_oss_native_mxfp4_default_abi_lowers_to_repack_tile_maps() {
             _ => None,
         })
         .collect();
-    assert_eq!(repacks.len(), 8);
+    // Six, not eight: the two biases are a row selection and nothing else, so
+    // they are affine and never reach a kernel.
+    assert_eq!(repacks.len(), 6);
     assert!(
         repacks
             .iter()
@@ -416,11 +418,6 @@ fn gpt_oss_native_mxfp4_default_abi_lowers_to_repack_tile_maps() {
         repacks
             .iter()
             .any(|spec| spec.repack.layout == RepackLayout::MarlinMxfp4Scale)
-    );
-    assert!(
-        repacks
-            .iter()
-            .any(|spec| spec.repack.layout == RepackLayout::DenseRowGather)
     );
     let names = program
         .tensors
@@ -434,12 +431,14 @@ fn gpt_oss_native_mxfp4_default_abi_lowers_to_repack_tile_maps() {
     assert!(program.memory.transform_scratch_peak_bytes > 0);
 }
 
-/// GPT-OSS reads one `gate_up_proj` block twice, once for the even rows and
-/// once for the odd ones. The compiler cannot fold the two reads into one, but
-/// it can schedule them back to back so an executor that keeps the block it just
-/// staged serves the second one without going back to the checkpoint.
+/// GPT-OSS's gate and up halves are the even and odd rows of one block.
+///
+/// Each is now an `Expr::Stride`, so each repack reads only the rows it wants:
+/// two interleaved gathers of half the block instead of two full reads of all
+/// of it that an executor had to cache to make cheap. The two spans are equal,
+/// they start one row apart, and together they are the block exactly once.
 #[test]
-fn gpt_oss_native_mxfp4_schedules_shared_source_reads_together() {
+fn gpt_oss_native_mxfp4_reads_each_interleaved_half_once() {
     let target = StorageTarget {
         backend: BackendKind::Cuda,
         tile_map_mask: pie_loader::plan::CUDA_TILE_MAP_MASK,
@@ -453,162 +452,109 @@ fn gpt_oss_native_mxfp4_schedules_shared_source_reads_together() {
     )
     .unwrap();
 
-    let reads: Vec<(FileId, u64, u64)> = program
-        .schedule
+    // `gate_up_proj_blocks` is [2, 128, 2, 16] u8, so a row is 32 bytes and the
+    // whole tensor is 8192.
+    let blocks = TensorId(10);
+    let mut halves: Vec<(u64, u64)> = program
+        .instrs
         .iter()
-        .filter_map(|id| program.instrs.iter().find(|instr| instr_id(instr) == *id))
         .filter_map(|instr| match instr {
             StorageInstr::TileMap {
                 source: Some(source),
-                inputs,
                 ..
-            } if inputs.is_empty() => Some((source.file_id, source.file_offset, source.span_bytes)),
+            } if source.tensor_id == blocks => Some((source.file_offset, source.span_bytes)),
             _ => None,
         })
         .collect();
-
-    let mut shared = 0;
-    for (position, read) in reads.iter().enumerate() {
-        let readers = reads.iter().filter(|other| *other == read).count();
-        if readers == 1 {
-            continue;
-        }
-        shared += 1;
-        let adjacent =
-            (position > 0 && reads[position - 1] == *read) || reads.get(position + 1) == Some(read);
-        assert!(
-            adjacent,
-            "read {read:?} at {position} is separated from the tile map that shares it: {reads:?}"
-        );
-    }
-    assert_eq!(
-        shared, 6,
-        "expected the three gate/up pairs to share a source"
-    );
+    halves.sort_unstable();
+    assert_eq!(halves.len(), 2, "{halves:?}");
+    assert_eq!(halves[0].1, halves[1].1, "the halves are the same size");
+    assert_eq!(halves[1].0 - halves[0].0, 32, "one row apart");
+    assert_eq!(halves[0].1 + halves[1].1, 8192, "the block, once");
 }
 
+/// The acceptance test for moving the repack's source selection into the
+/// algebra.
+///
+/// The old contract carried `source_row_offset: 64` -- `rank * local` for rank
+/// one -- as an integer inside the spec, so the *contract* was valid for
+/// exactly one rank and the driver had to re-author it per rank. Flipping the
+/// target's rank then changed exactly one line of the plan: the recorded
+/// `tp_rank`. Every read offset was identical.
+///
+/// Now the selection is an `Expr::Shard`, so one contract serves every rank and
+/// the rank reaches the plan only through the target. Both halves of that are
+/// asserted here: the contract holds no rank-derived integer, and compiling it
+/// at two ranks reads two different bands.
 #[test]
-fn gpt_oss_native_mxfp4_tp_uses_row_and_column_offset_repack_contracts() {
-    let target = StorageTarget {
-        backend: BackendKind::Cuda,
-        tile_map_mask: pie_loader::plan::CUDA_TILE_MAP_MASK,
-        tp_rank: 1,
-        tp_size: 2,
-        native_mxfp4_moe: true,
-        ..StorageTarget::default()
-    };
+fn gpt_oss_native_mxfp4_tp_resolves_the_rank_from_the_target() {
     let metadata = gpt_oss_mxfp4_metadata_with_intermediate(128);
     let contract = stored_contract("gpt_oss_native_mxfp4_tp1_of_2");
-    let abi_repacks = contract
+
+    // Every repack now takes a composed operand, which is the shape of the
+    // claim: the selection is stated in the algebra, not in the spec.
+    let repacks = contract
         .tensors
         .iter()
-        .filter_map(|contract| match &contract.expr {
-            pie_loader::contract::Expr::Repack { spec, .. } => Some(*spec),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    assert!(
-        abi_repacks
-            .iter()
-            .any(|spec| spec.layout == RepackLayout::MarlinMxfp4Weight
-                && spec.row_map == RowMap::Even
-                && spec.source_row_offset == 64
-                && spec.valid_rows == 64
-                && spec.source_stride_cols == 64
-                && spec.source_col_offset == 0)
+        .filter(|tensor| matches!(tensor.expr, pie_loader::contract::Expr::Repack { .. }))
+        .count();
+    assert_eq!(
+        repacks, 6,
+        "a weight and a scale for each of gate, up and down -- the biases are affine"
     );
     assert!(
-        abi_repacks
-            .iter()
-            .any(|spec| spec.layout == RepackLayout::MarlinMxfp4Weight
-                && spec.row_map == RowMap::Identity
-                && spec.source_col_offset == 64
-                && spec.source_stride_cols == 128
-                && spec.source_cols == 64)
+        contract.tensors.iter().all(|tensor| !matches!(
+            &tensor.expr,
+            pie_loader::contract::Expr::Repack { src, .. } if matches!(**src, pie_loader::contract::Expr::Src(_))
+        )),
+        "a repack whose operand is a bare source has nowhere to have put the shard"
     );
 
-    let program = compile_load_plan(&metadata, &contract, target).unwrap();
+    let plan_at = |rank: u32| {
+        let target = StorageTarget {
+            backend: BackendKind::Cuda,
+            tile_map_mask: pie_loader::plan::CUDA_TILE_MAP_MASK,
+            tp_rank: rank,
+            tp_size: 2,
+            native_mxfp4_moe: true,
+            ..StorageTarget::default()
+        };
+        let program = compile_load_plan(&metadata, &contract, target).unwrap();
+        let mut reads: Vec<(u32, u64, u64)> = program
+            .instrs
+            .iter()
+            .filter_map(|instr| match instr {
+                StorageInstr::TileMap {
+                    source: Some(source),
+                    ..
+                } => Some((source.tensor_id.0, source.file_offset, source.span_bytes)),
+                _ => None,
+            })
+            .collect();
+        reads.sort_unstable();
+        (reads, program.memory.checkpoint_read_bytes)
+    };
 
-    let repacks = program
-        .instrs
-        .iter()
-        .filter_map(|instr| match instr {
-            StorageInstr::TileMap {
-                kind: TileMapKind::Repack,
-                transform,
-                ..
-            } => Some(transform.repack),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    let repack_sources = program
-        .instrs
-        .iter()
-        .filter_map(|instr| match instr {
-            StorageInstr::TileMap {
-                kind: TileMapKind::Repack,
-                source,
-                transform,
-                ..
-            } => source.as_ref().map(|source| (transform.repack, source)),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
+    let (rank0, bytes0) = plan_at(0);
+    let (rank1, bytes1) = plan_at(1);
+    assert_ne!(
+        rank0, rank1,
+        "the two ranks must not read the same bytes: {rank0:?}"
+    );
+    assert_eq!(bytes0, bytes1, "and each rank must read the same volume");
 
-    assert_eq!(repacks.len(), 8);
-    assert!(
-        repacks
+    // The gate/up block is [2, 256, 2, 16], so a row is 32 bytes and an expert
+    // is 8192. Rank one's band starts halfway into each expert.
+    let band_start = |reads: &[(u32, u64, u64)]| {
+        reads
             .iter()
-            .any(|spec| spec.layout == RepackLayout::MarlinMxfp4Weight
-                && spec.row_map == RowMap::Even
-                && spec.source_rows == 128
-                && spec.source_row_offset == 0
-                && spec.valid_rows == 64
-                && spec.target_rows == 128
-                && spec.source_stride_cols == 64
-                && spec.source_col_offset == 0
-                && spec.source_cols == 64
-                && spec.target_cols == 64)
-    );
-    assert!(
-        repacks
-            .iter()
-            .any(|spec| spec.layout == RepackLayout::DenseRowGather
-                && spec.row_map == RowMap::Odd
-                && spec.source_rows == 128
-                && spec.source_row_offset == 0
-                && spec.valid_rows == 64
-                && spec.target_rows == 64)
-    );
-    assert!(
-        repacks
-            .iter()
-            .any(|spec| spec.layout == RepackLayout::MarlinMxfp4Weight
-                && spec.row_map == RowMap::Identity
-                && spec.source_col_offset == 0
-                && spec.source_stride_cols == 64
-                && spec.source_cols == 64
-                && spec.target_cols == 128)
-    );
-    assert!(
-        repacks
-            .iter()
-            .any(|spec| spec.layout == RepackLayout::MarlinMxfp4Scale
-                && spec.row_map == RowMap::Identity
-                && spec.source_col_offset == 0
-                && spec.source_stride_cols == 2
-                && spec.source_cols == 2
-                && spec.target_cols == 4)
-    );
-    assert!(repack_sources.iter().any(|(spec, source)| spec.layout
-        == RepackLayout::MarlinMxfp4Weight
-        && spec.row_map == RowMap::Even
-        && source.span_bytes == 8192));
-    assert!(repack_sources.iter().any(|(spec, source)| spec.layout
-        == RepackLayout::MarlinMxfp4Weight
-        && spec.row_map == RowMap::Identity
-        && source.span_bytes == 4096));
-    assert_eq!(program.memory.checkpoint_read_bytes, 23_040);
+            .filter(|(id, ..)| *id == 10)
+            .map(|(_, offset, _)| *offset)
+            .min()
+            .unwrap()
+    };
+    assert_eq!(band_start(&rank0), 0);
+    assert_eq!(band_start(&rank1), 128 * 32);
 }
 
 #[test]

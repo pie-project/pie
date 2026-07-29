@@ -203,14 +203,9 @@ fn plan_with_every_instr() -> LoadPlan {
                 to: Some(QuantScheme::Mxfp4E2M1E8M0),
                 repack: RepackSpec {
                     layout: RepackLayout::MarlinMxfp4Weight,
-                    row_map: RowMap::Odd,
                     batch: 2,
                     source_rows: 32,
-                    source_row_offset: 4,
                     target_rows: 64,
-                    valid_rows: 30,
-                    source_stride_cols: 128,
-                    source_col_offset: 8,
                     source_cols: 96,
                     target_cols: 112,
                 },
@@ -533,7 +528,6 @@ fn tile_map_carries_the_whole_transform() {
             transform_from,
             transform_to,
             repack_layout,
-            row_map,
         ) = operands!(
             tile,
             TileMap {
@@ -545,7 +539,6 @@ fn tile_map_carries_the_whole_transform() {
                 transform_from,
                 transform_to,
                 repack_layout,
-                row_map,
             }
         );
         assert_eq!(*tile_kind, PieLoaderTileMapKind::Repack);
@@ -556,26 +549,20 @@ fn tile_map_carries_the_whole_transform() {
         assert_eq!(*transform_from, PieLoaderQuantScheme::MlxAffineU4);
         assert_eq!(*transform_to, PieLoaderQuantScheme::Mxfp4E2M1E8M0);
         assert_eq!(*repack_layout, PieLoaderRepackLayout::MarlinMxfp4Weight);
-        assert_eq!(*row_map, PieLoaderRowMap::Odd);
 
-        let (batch, source_rows, row_offset, target_rows, valid_rows) = operands!(
+        let (batch, source_rows, target_rows) = operands!(
             tile,
             TileMap {
                 transform_batch,
                 transform_source_rows,
-                transform_source_row_offset,
                 transform_target_rows,
-                transform_valid_rows,
             }
         );
-        assert_eq!((*batch, *source_rows, *row_offset), (2, 32, 4));
-        assert_eq!((*target_rows, *valid_rows), (64, 30));
+        assert_eq!((*batch, *source_rows, *target_rows), (2, 32, 64));
 
-        let (stride_cols, col_offset, cols, target_cols, scratch, metadata, factor) = operands!(
+        let (cols, target_cols, scratch, metadata, factor) = operands!(
             tile,
             TileMap {
-                transform_source_stride_cols,
-                transform_source_col_offset,
                 transform_source_cols,
                 transform_target_cols,
                 transform_scratch_bytes,
@@ -583,8 +570,8 @@ fn tile_map_carries_the_whole_transform() {
                 transform_scale_factor_bits,
             }
         );
-        assert_eq!((*stride_cols, *col_offset, *cols), (128, 8, 96));
-        assert_eq!((*target_cols, *scratch, *metadata), (112, 8192, 2));
+        assert_eq!((*cols, *target_cols), (96, 112));
+        assert_eq!((*scratch, *metadata), (8192, 2));
         assert_eq!(f32::from_bits(*factor), 0.5);
     });
 }
@@ -1524,12 +1511,6 @@ fn mirror_enum_discriminants_are_pinned() {
     assert_eq!(PieLoaderRepackLayout::None as u32, 0);
     assert_eq!(PieLoaderRepackLayout::MarlinMxfp4Weight as u32, 1);
     assert_eq!(PieLoaderRepackLayout::MarlinMxfp4Scale as u32, 2);
-    assert_eq!(PieLoaderRepackLayout::DenseRowGather as u32, 3);
-
-    // PieLoaderRowMap
-    assert_eq!(PieLoaderRowMap::Identity as u32, 0);
-    assert_eq!(PieLoaderRowMap::Even as u32, 1);
-    assert_eq!(PieLoaderRowMap::Odd as u32, 2);
 
     // PieLoaderTileMapKind
     assert_eq!(PieLoaderTileMapKind::Cast as u32, 0);
@@ -1595,14 +1576,9 @@ fn storage_op_tags_are_the_wire_values() {
             transform_from: PieLoaderQuantScheme::None,
             transform_to: PieLoaderQuantScheme::None,
             repack_layout: PieLoaderRepackLayout::None,
-            row_map: PieLoaderRowMap::Identity,
             transform_batch: 0,
             transform_source_rows: 0,
-            transform_source_row_offset: 0,
             transform_target_rows: 0,
-            transform_valid_rows: 0,
-            transform_source_stride_cols: 0,
-            transform_source_col_offset: 0,
             transform_source_cols: 0,
             transform_target_cols: 0,
             transform_scratch_bytes: 0,

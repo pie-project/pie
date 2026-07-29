@@ -369,15 +369,22 @@ public:
         return push(node);
     }
 
-    /// An opaque kernel-specific relayout.
+    /// A named hardware layout, applied to whatever `src` selects.
     ///
-    /// The type checker cannot see through a repack, so `out_shape` and
-    /// `out_encoding` are taken on trust and are the driver's responsibility.
-    Node repack(Node src, PieLoaderRepackSpecView spec, std::vector<std::int64_t> out_shape,
+    /// The escape hatch, and only for what genuinely escapes: `layout` names a
+    /// kernel and nothing else. Which rows and columns the kernel sees is
+    /// `src`'s business -- use `slice`, `shard` and `stride` for that -- and the
+    /// loader derives the kernel's geometry from `src`'s inferred type, so a
+    /// contract cannot disagree with the tensor it is reading.
+    ///
+    /// `out_shape` may be *larger* than what `src` holds on either of the last
+    /// two axes; the kernel zero-fills the difference, which is how a Marlin
+    /// tile size is met. It may not be smaller: a truncation is a `slice`.
+    Node repack(Node src, PieLoaderRepackLayout layout, std::vector<std::int64_t> out_shape,
                 PieLoaderEncodingSpec out_encoding) {
         PieLoaderExprNode node = blank(PieLoaderExprKind::Repack);
         node.src = src.index_;
-        node.repack = spec;
+        node.repack_layout = static_cast<std::uint32_t>(layout);
         node.out_shape = store_shape(std::move(out_shape));
         node.out_encoding = out_encoding;
         return push(node);
@@ -495,8 +502,7 @@ private:
         node.src = PIE_LOADER_NO_NODE;
         node.step = 1;
         node.out_encoding = raw(PieLoaderDType::BF16);
-        node.repack.layout = static_cast<std::uint32_t>(PieLoaderRepackLayout::None);
-        node.repack.row_map = static_cast<std::uint32_t>(PieLoaderRowMap::Identity);
+        node.repack_layout = static_cast<std::uint32_t>(PieLoaderRepackLayout::None);
         return node;
     }
 
