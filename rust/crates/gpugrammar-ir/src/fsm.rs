@@ -89,6 +89,40 @@ impl NfaGraph {
     }
 
     /// Compute the epsilon closure of a set of states (BFS).
+    /// Every state's epsilon closure, as one flat table.
+    ///
+    /// The subset construction asks for a closure once per byte per subset,
+    /// and a closure of a set is the union of the closures of its members - so
+    /// asking is a lookup and a merge once this exists, rather than a search
+    /// through a `BTreeSet` that allocates as it goes.
+    pub fn epsilon_closures(&self) -> (Vec<u32>, Vec<StateId>) {
+        let mut offsets = Vec::with_capacity(self.edges.len() + 1);
+        let mut flat = Vec::new();
+        let mut seen = vec![u32::MAX; self.edges.len()];
+        let mut stack = Vec::new();
+        for state in 0..self.edges.len() {
+            offsets.push(flat.len() as u32);
+            let mark = state as u32;
+            seen[state] = mark;
+            stack.push(StateId(state as u32));
+            flat.push(StateId(state as u32));
+            while let Some(at) = stack.pop() {
+                for edge in &self.edges[at.0 as usize] {
+                    if let FsmEdge::Epsilon(target) = edge
+                        && seen[target.0 as usize] != mark
+                    {
+                        seen[target.0 as usize] = mark;
+                        flat.push(*target);
+                        stack.push(*target);
+                    }
+                }
+            }
+            flat[offsets[state] as usize..].sort_unstable();
+        }
+        offsets.push(flat.len() as u32);
+        (offsets, flat)
+    }
+
     pub fn epsilon_closure(&self, states: &BTreeSet<StateId>) -> BTreeSet<StateId> {
         let mut closure = states.clone();
         let mut queue: VecDeque<StateId> = states.iter().copied().collect();

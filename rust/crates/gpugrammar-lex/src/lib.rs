@@ -741,16 +741,37 @@ fn determinise(
     terminal_names: Vec<String>,
     budget: usize,
 ) -> Option<Lexer> {
-    let mut subsets: FxHashMap<BTreeSet<StateId>, u32> = FxHashMap::default();
-    let mut order: Vec<BTreeSet<StateId>> = Vec::new();
-    let mut queue: VecDeque<BTreeSet<StateId>> = VecDeque::new();
+    // Sorted vectors rather than `BTreeSet`. The subsets are built once,
+    // hashed, and then only iterated in order - which a sorted slice does
+    // without a node per element or a pointer chase per step.
+    let mut subsets: FxHashMap<Box<[StateId]>, u32> = FxHashMap::default();
+    let mut order: Vec<Box<[StateId]>> = Vec::new();
+    let mut queue: VecDeque<Box<[StateId]>> = VecDeque::new();
 
-    let initial = nfa.epsilon_closure(&BTreeSet::from([start]));
+    // Every state's closure, once. A subset's closure is then the union of
+    // its members', which is a merge of sorted runs rather than a search.
+    let (closure_offsets, closure_flat) = nfa.epsilon_closures();
+    let closure_of = |targets: &[StateId], into: &mut Vec<StateId>| {
+        into.clear();
+        for state in targets {
+            let from = closure_offsets[state.0 as usize] as usize;
+            let to = closure_offsets[state.0 as usize + 1] as usize;
+            into.extend_from_slice(&closure_flat[from..to]);
+        }
+        into.sort_unstable();
+        into.dedup();
+    };
+    let mut merged: Vec<StateId> = Vec::new();
+    closure_of(&[start], &mut merged);
+    let initial: Box<[StateId]> = merged.clone().into_boxed_slice();
     subsets.insert(initial.clone(), 0);
     order.push(initial.clone());
     queue.push_back(initial);
 
     let mut transitions: Vec<u32> = Vec::new();
+    // Reused across subsets so the scatter does not allocate 256 vectors per
+    // state of the DFA.
+    let mut by_byte: Vec<Vec<StateId>> = vec![Vec::new(); 256];
     let mut work = 0usize;
     let work_budget = budget.saturating_mul(50_000);
     while let Some(subset) = queue.pop_front() {
@@ -760,28 +781,40 @@ fn determinise(
         if work > work_budget {
             return None;
         }
-        for byte in 0..=255u8 {
-            let mut targets = BTreeSet::new();
-            for &state in &subset {
-                for edge in nfa.edges(state) {
-                    if let FsmEdge::CharRange { min, max, target } = edge {
-                        if byte >= *min && byte <= *max {
-                            targets.insert(*target);
-                        }
+        // One pass over the subset's edges rather than 256. The inner loop was
+        // "for each byte, for each state, for each edge, is the byte in this
+        // range" - so an edge spanning a hundred bytes was examined 256 times
+        // to be used a hundred, and one spanning none was examined 256 times
+        // to be used never. Scattering each edge into the bytes it covers
+        // visits every edge once.
+        for slot in &mut by_byte {
+            slot.clear();
+        }
+        for &state in &subset {
+            for edge in nfa.edges(state) {
+                if let FsmEdge::CharRange { min, max, target } = edge {
+                    for byte in *min..=*max {
+                        by_byte[byte as usize].push(*target);
                     }
                 }
             }
-            if targets.is_empty() {
+        }
+        for byte in 0..=255u8 {
+            let reached = &mut by_byte[byte as usize];
+            if reached.is_empty() {
                 continue;
             }
-            let closure = nfa.epsilon_closure(&targets);
-            let id = match subsets.get(&closure) {
+            reached.sort_unstable();
+            reached.dedup();
+            closure_of(reached, &mut merged);
+            let id = match subsets.get(merged.as_slice()) {
                 Some(&existing) => existing,
                 None => {
                     if order.len() >= budget {
                         return None;
                     }
                     let fresh = order.len() as u32;
+                    let closure: Box<[StateId]> = merged.clone().into_boxed_slice();
                     subsets.insert(closure.clone(), fresh);
                     order.push(closure.clone());
                     queue.push_back(closure);
