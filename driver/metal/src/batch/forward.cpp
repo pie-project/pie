@@ -617,9 +617,8 @@ struct MetalExecutor::Impl {
     std::uint32_t argmax() const;
     bool ensure_ptir_logits_rows(std::uint32_t rows, std::string* error);
     std::uint32_t reserve_ptir_logits_rows(std::uint32_t rows);
-    bool stage_ptir_logits_row(
-        std::uint32_t source_row,
-        std::uint32_t destination_row,
+    bool stage_ptir_logits_rows(
+        const std::vector<std::pair<std::uint32_t, std::uint32_t>>& rows,
         std::string* error);
     void attach_ptir_logits_view(LogitsOut& output) const;
 
@@ -645,6 +644,9 @@ struct PtirLogitsCopyParams {
 };
 
 inline constexpr int kPtirLogitsCopyOrdinal = 90000;
+// Rows one staging dispatch can carry. Bounded by the paged forward's row
+// capacity, which is what `LogitsOut::rows` is drawn from.
+inline constexpr std::size_t kPtirLogitsCopyMaxRows = kPagedMaxForwardTokens;
 
 void write_u32(const SlotHandle& s, uint32_t v) {
     std::memcpy(s.contents(), &v, sizeof(v));
@@ -762,7 +764,8 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
         "ptir_copy_logits_bf16",
         &load_err);
     ptir_logits_copy_params_ =
-        ctx_->create_standalone_buffer(sizeof(PtirLogitsCopyParams));
+        ctx_->create_standalone_buffer(
+            sizeof(PtirLogitsCopyParams) * kPtirLogitsCopyMaxRows);
     if (!ptir_logits_copy_pso_.valid() ||
         !ptir_logits_copy_params_.valid() ||
         !ensure_ptir_logits_rows(1, &load_err)) {
@@ -1726,26 +1729,35 @@ std::uint32_t MetalExecutor::Impl::reserve_ptir_logits_rows(
     return base;
 }
 
-bool MetalExecutor::Impl::stage_ptir_logits_row(
-    std::uint32_t source_row,
-    std::uint32_t destination_row,
+bool MetalExecutor::Impl::stage_ptir_logits_rows(
+    const std::vector<std::pair<std::uint32_t, std::uint32_t>>& rows,
     std::string* error) {
+    if (rows.empty()) return true;
     if (!ptir_logits_copy_pso_.valid() ||
-        destination_row >= ptir_logits_capacity_rows_) {
+        rows.size() > kPtirLogitsCopyMaxRows) {
         if (error != nullptr) *error = "PTIR logits staging is not ready";
         return false;
     }
-    *static_cast<PtirLogitsCopyParams*>(ptir_logits_copy_params_.contents()) = {
-        .source_row = source_row,
-        .destination_row = destination_row,
-        .vocab = static_cast<std::uint32_t>(g_.vocab),
-        .reserved = 0,
-    };
+    auto* params =
+        static_cast<PtirLogitsCopyParams*>(ptir_logits_copy_params_.contents());
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+        if (rows[i].second >= ptir_logits_capacity_rows_) {
+            if (error != nullptr) *error = "PTIR logits staging is not ready";
+            return false;
+        }
+        params[i] = {
+            .source_row = rows[i].first,
+            .destination_row = rows[i].second,
+            .vocab = static_cast<std::uint32_t>(g_.vocab),
+            .reserved = 0,
+        };
+    }
     const StepTiming timing = ctx_->run_step([&](StepEncoder& encoder) {
         encoder.set_pso(ptir_logits_copy_pso_);
         encoder.set_argtable_ordinal(kPtirLogitsCopyOrdinal);
         encoder.dispatch(
-            Grid{static_cast<std::uint32_t>(g_.vocab), 1, 1},
+            Grid{static_cast<std::uint32_t>(g_.vocab),
+                 static_cast<std::uint32_t>(rows.size()), 1},
             Threadgroup{256, 1, 1});
     });
     if (!timing.succeeded()) {
@@ -2551,6 +2563,9 @@ bool MetalExecutor::run_paged_batch_forward(const std::vector<MemberForwardDesc>
         }
         return false;
     }
+    // Every member's rows go in ONE staging dispatch. One command buffer per
+    // row meant a sixteen-request fire paid sixteen round trips per token.
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> staged_rows;
     for (const std::size_t i : accepted_members) {
         LogitsOut& out = outs[i];
         out.vocab = vocab_;
@@ -2559,19 +2574,16 @@ bool MetalExecutor::run_paged_batch_forward(const std::vector<MemberForwardDesc>
         out.device_row_offset =
             impl_->reserve_ptir_logits_rows(out.rows);
         impl_->attach_ptir_logits_view(out);
-        for (uint32_t row = 0; row < out.rows; ++row) {
-            if (ptir != nullptr &&
-                (*ptir)[i].consumes_logits_directly) {
-                continue;
-            }
-            std::string staging_error;
-            if (!impl_->stage_ptir_logits_row(
-                    rows[row],
-                    out.device_row_offset + row,
-                    &staging_error)) {
-                errors[i] = staging_error;
-                continue;
-            }
+        if (ptir != nullptr && (*ptir)[i].consumes_logits_directly) continue;
+        for (uint32_t row = 0; row < out.rows; ++row)
+            staged_rows.emplace_back(rows[row], out.device_row_offset + row);
+    }
+    std::string staging_error;
+    const bool staged = impl_->stage_ptir_logits_rows(staged_rows, &staging_error);
+    for (const std::size_t i : accepted_members) {
+        if (!staged) {
+            errors[i] = staging_error;
+            continue;
         }
         if (!errors[i].empty()) continue;
         success[i] = 1;
@@ -2666,10 +2678,8 @@ bool MetalExecutor::run_member_forward(const MemberForwardDesc& desc, LogitsOut&
         for (std::uint32_t r = 0; r < desc.readout_local_indices.size(); ++r) {
             if (desc.readout_local_indices[r] != static_cast<std::uint32_t>(i)) continue;
             if (ptir != nullptr && ptir->consumes_logits_directly) continue;
-            if (!impl_->stage_ptir_logits_row(
-                    0,
-                    out.device_row_offset + r,
-                    err)) {
+            if (!impl_->stage_ptir_logits_rows(
+                    {{0u, out.device_row_offset + r}}, err)) {
                 return false;
             }
         }
