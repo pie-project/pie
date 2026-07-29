@@ -429,8 +429,23 @@ inline GeneratedValueDesc describe_generated_value(
          ++dimension) {
         const std::uint32_t value =
             grouped_dimension(type, dimension, lane);
-        if (value == 0 ||
-            length > std::numeric_limits<std::uint32_t>::max() / value) {
+        // A zero extent and an overflowing product are different faults with
+        // different causes -- a symbolic extent this lane never bound versus a
+        // genuinely huge shape -- so they must not share a message. Reporting
+        // an unbound extent as "exceeds u32" sends every investigation the
+        // wrong way.
+        if (value == 0) {
+            const plan::Dimension& dim = type.dims[dimension];
+            throw std::runtime_error(
+                "generated fused value has a zero extent at dim " +
+                std::to_string(dimension) + " of " +
+                std::to_string(type.dims.size()) +
+                (dim.symbolic
+                     ? " (symbolic extent #" + std::to_string(dim.value) +
+                           " is unbound or empty for this lane)"
+                     : " (static)"));
+        }
+        if (length > std::numeric_limits<std::uint32_t>::max() / value) {
             throw std::runtime_error(
                 "generated fused value shape exceeds u32");
         }
