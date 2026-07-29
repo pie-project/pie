@@ -691,9 +691,12 @@ land together**:
 build or bind against a hybrid model. If they still succeed, the split did not
 buy what it was for.
 
-### C — delete the SDK `required[]` pre-check
+### C — delete the SDK `required[]` pre-check  *(landed inside B)*
 
-Small follow-up to B. `TraceContainer.ports` is untouched (§1.2 note 5).
+Small follow-up to B. `TraceContainer.ports` is untouched (§1.2 note 5). In
+the event this fell out of B for free: the per-kind pass types made the
+hardcoded guest-side port list unreachable, so it was deleted in the same
+commit.
 
 ### E — Python / JavaScript SDKs
 
@@ -730,7 +733,11 @@ WIT method, and lands with B.
 
 ## 8. Open items
 
-### 8.1 `buffer()` vs `buffer(start-token: u32)` — decide during implementation
+### 8.1 `buffer()` vs `buffer(start-token: u32)` — ~~decide during implementation~~ RESOLVED
+
+**Resolved as `buffer(start-token, rs-geometry)`.** See §9.2 for the argument
+and §9.3 for where the geometry ended up. The rest of this section is the
+original framing, kept for the record.
 
 D9 gives `rs-geometry` explicit `w-slot` / `w-off` channels, which makes the
 former `start-token` argument redundant and removes both the
@@ -905,3 +912,64 @@ hybrid interface.
 `trackb-h2o`, `trackb-snapkv`, `tova-attention`, and `quest-attention` now
 import `ptir::attention::prelude` and can no longer name a hybrid model's pass
 type. There is deliberately no unprefixed `ptir::prelude`.
+
+---
+
+## 10. Remaining work
+
+A, B, and C have landed. What is left, in the order it should land.
+
+### 10.1 Lower `rs-geometry` (the other half of B0)
+
+The surface is final; the plumbing is not. The five RS ports exist
+(`Port::{RsBufferPages,RsBufferIndptr,RsBufferLen,RsWSlot,RsWOff}`, tags 10-14,
+`compiler/ir/src/registry.rs`) and CUDA `descriptor_resolve.hpp` reads them, but
+nothing connects the two: a `buffer` / `fold-buffered` fire still lowers through
+the host-derived `RsStore` path driven by `start-token`, and the engine never
+adds the RS ports to `program()`'s `expected` list, so the guest never claims
+them into the traced container.
+
+Closing the gap, mirroring the KV translation at each layer:
+
+- `rs_translation` / `rs_translation_indptr` on `LaunchPlan`
+  (`interface/driver/src/plan.rs:83`), its FFI mirror (`local.rs:1280`), the
+  engine producer (`pipeline/fire.rs:1146`), the submission struct
+  (`driver/submission.rs:47`), and the FFI marshal (`driver/abi.rs:373`).
+- CUDA: translate `fg.rs_buffer_slot_ids` / `fg.rs_w_slot` in `dispatch.cu`
+  beside the KV translation at 6855-6871; apply the resolved arrays in
+  `batch_compose.hpp`; extend `validate_fire_geometry`.
+- Engine: add the five RS ports to `core_program`'s `expected` list when
+  `bindings.rs_geom` is present. SDK: `claim_port` them.
+- Metal: mirror, or reject the RS ports explicitly rather than silently.
+
+Then drop the "recorded but not lowered" caveat from §9.3.
+
+**Open along the way:** whether `PortSource::Const` needs an RS analogue, and
+whether the host-derived and channel-driven RS paths should be made mutually
+exclusive per fire rather than merely unused-in-parallel.
+
+### 10.2 E — Python / JavaScript SDKs
+
+Larger than §7 implies. Both target an older `pie:core/inference` surface
+(`imports/inference.py`, `pie-core-inference.d.ts`) rather than
+`pie:inferlet/forward`, and neither is in the `scripts/sync-wit.sh` set, so
+they did not break with B and will not track future WIT changes automatically.
+Bringing them onto the current surface is a port, not a rename.
+
+### 10.3 D — per-stage PTIR containers  *(separate PR)*
+
+Unchanged from §7 / §9.1. D4(a) hooks-as-methods and D4(b) per-stage containers
+must land together; (a) alone would force the host to reassemble and
+canonicalize containers, which is the thing D4 exists to avoid.
+
+### 10.4 Loose ends
+
+- `model::pass_kind()` returns `recurrent` only when `kv_page_size() == 0`,
+  which no registered model satisfies. That arm is unreachable and therefore
+  untested, and `forward-recurrent.wit` has no in-tree consumer.
+- `forward-recurrent.wit` documents `fold-buffered` as computing no logits, but
+  `gdn-foldcommit` attaches an epilogue that reads `logits` and passes. One of
+  the two is wrong; the doc is the more likely candidate.
+- §8.2's Metal RS flag-bit collapse
+  (`driver/metal/src/batch/batch_schedule.hpp:114` misreads `RS_FLAG_FOLD` as
+  RESET) is pre-existing and still open.

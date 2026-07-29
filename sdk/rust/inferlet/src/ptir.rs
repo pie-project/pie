@@ -1,8 +1,11 @@
 //! `inferlet::ptir` — the author-facing PTIR bridge over the WIT `ptir` surface.
 //!
 //! This is the only home of the overview §3/§5 author surface
-//! (`ForwardPass`/`Pipeline`/`WorkingSet`/`Channel`). It wraps the WIT
-//! resources (`channel`, `forward-pass`, `kv-working-set`, `pipeline`) and
+//! (`ForwardPass`/`Pipeline`/`WorkingSet`/`Channel`). `ForwardPass` lives in
+//! one of three modules -- [`self::attention`], [`self::recurrent`], [`self::hybrid`] -- one per
+//! `pie:inferlet` forward interface, selected by `model::pass_kind()`. It
+//! wraps the WIT resources (`channel`, `forward-pass`, `kv-working-set`,
+//! `pipeline`) and
 //! drives the neutral [`Builder`](pie_dsl::Builder) from the `pie-dsl`
 //! crate: the author writes stage closures + port bindings, the bridge lowers
 //! them to the canonical PTIR container, orders the WIT channel handles by the
@@ -41,8 +44,8 @@ use crate::working_set::{KvWorkingSet, PageRange, PageSpan};
 
 pub use pie_dsl::intrinsics;
 
-// Re-export the eDSL vocabulary so an author writes stage closures with a single
-// `use inferlet::ptir::prelude::*;` (mirrors the old `ptir::prelude`).
+// Re-export the eDSL vocabulary so an author writes stage closures with a
+// single `use inferlet::ptir::<kind>::prelude::*;`.
 pub use pie_dsl::DType as Dtype;
 pub use pie_dsl::{
     abs, add, and, broadcast, cast, causal_mask, cummass_le, cumprod, cumsum, div, dtype, entropy,
@@ -62,7 +65,7 @@ pub use pie_dsl::{
 // dsl channel's gid; `forward-pass.program` wants the WIT handles in that dense
 // order. Every channel the author can reference is created via `Channel::new`/
 // `from`/`seeded`, so registering (gid -> Rc<wit_channel::Channel>) at construction
-// lets a `ForwardPass` resolve each `Traced.channel_order` entry. Inferlets are
+// lets a forward pass resolve each `Traced.channel_order` entry. Inferlets are
 // single-threaded (wasm), so a thread-local registry is sound.
 
 thread_local! {
@@ -116,7 +119,7 @@ fn claim_port(port: Port, ch: &Channel) -> DslChannel {
 /// A registry-backed COPY TOKEN (F9): the channel's shared state (DSL trace
 /// state + WIT handle) lives in thread-local registries keyed by gid, and
 /// this token holds only the gid plus immutable metadata. Stage closures
-/// capture tokens by value, so closures are `'static`, [`ForwardPass`] has
+/// capture tokens by value, so closures are `'static`, a `ForwardPass` has
 /// no lifetime parameter, and inferlets need no `Box::leak` to satisfy it.
 /// Handle lifetime is owned by the registries — which is what makes an
 /// explicit endpoint release at finish/close-settle possible later (the W2
@@ -557,8 +560,10 @@ impl IntoPut for PageGrant {
 
 /// The runtime's recurrent-state slots for hybrid / linear-attention models
 /// (GDN, Mamba2). Wraps the WIT `rs-working-set`. Bind via
-/// [`ForwardPass::rs_working_sets`] for models whose
-/// `model::rs_state_size()` is nonzero; pure-attention models bind none.
+/// [`self::recurrent::ForwardPass::attention`] or
+/// [`self::hybrid::ForwardPass::recurrent`]
+/// -- one per request, in resolved request order. A pure-attention model has
+/// no recurrent state, and its pass type has no method that accepts one.
 pub struct RsWorkingSet {
     rs: Rc<crate::working_set::RsWorkingSet>,
 }
@@ -587,7 +592,7 @@ impl RsWorkingSet {
 
     /// Append `n` reserved buffered page slots; returns the contiguous
     /// range. Purely logical — a slot is materialized by the first
-    /// [`ForwardPass::buffer_recurrent`] fire that writes it.
+    /// `buffer_recurrent` fire that writes it.
     pub fn alloc_buffer(&self, n: u32) -> Result<crate::working_set::PageRange, String> {
         self.rs.alloc_buffer(n)
     }
@@ -933,8 +938,7 @@ impl PassCore {
     /// Bind readout indexes through a channel, separately from embedding.
     /// Fold every token of this pass into the recurrent state, in-forward
     /// and irreversibly. The default; call this only to undo an earlier
-    /// [`ForwardPass::buffer_recurrent`] or [`ForwardPass::fold_buffered`]
-    /// on a reused pass.
+    /// `buffer_recurrent` or `fold_buffered` on a reused pass.
     fn fold_recurrent(&self) -> Result<(), String> {
         match &self.wit {
             PassWit::Recurrent(w) => w.fold(),
@@ -1403,7 +1407,7 @@ async fn run_ahead_core(
 /// it linearizes in submission order through the per-driver sequencer.
 /// Ordering across fires is carried by the channels' full/empty bits, not
 /// host code. Working-set mutators ([`WorkingSet::fork`]/`slice`/`discard`/
-/// `copy_into`) and [`ForwardPass::submit`] take `&Pipeline`.
+/// `copy_into`) and every pass `submit` take `&Pipeline`.
 ///
 /// # Canonical usage (one pipeline per sequential stream)
 ///
@@ -1652,7 +1656,7 @@ macro_rules! pass_module_fold_modes {
 /// and reordering algorithms belong HERE and nowhere else: evicting a KV page
 /// is reversible in a way that unfolding a recurrent state is not.
 ///
-/// [`ForwardKind::Attention`]: crate::ForwardKind
+/// [`ForwardKind::Attention`]: crate::model::ForwardKind
 pub mod attention {
     use super::*;
 
@@ -1712,7 +1716,7 @@ pub mod attention {
 /// no attention layers anywhere. `on_attn_proj` / `on_attn` do not exist here
 /// because there is no attention layer for them to fire on.
 ///
-/// [`ForwardKind::Recurrent`]: crate::ForwardKind
+/// [`ForwardKind::Recurrent`]: crate::model::ForwardKind
 pub mod recurrent {
     use super::*;
 
@@ -1746,7 +1750,7 @@ pub mod recurrent {
 /// are legal. KV eviction algorithms are NOT valid here: dropping a KV page
 /// does not undo the fold that already consumed those tokens.
 ///
-/// [`ForwardKind::Hybrid`]: crate::ForwardKind
+/// [`ForwardKind::Hybrid`]: crate::model::ForwardKind
 pub mod hybrid {
     use super::*;
 
