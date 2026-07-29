@@ -170,6 +170,17 @@ pub struct PreparedRs {
     pub buffer_read_slot_ids: Vec<u32>,
     pub buffer_read_indptr: Vec<u32>,
     pub buffer_read_lens: Vec<u32>,
+    /// Where each row's logical buffer token 0 physically sits, in tokens from
+    /// the start of its first page.
+    ///
+    /// A fold absorbs tokens off the front of the buffer but can only release
+    /// WHOLE covered pages, and `fold_granularity` is 1 in production while a
+    /// page is the KV page size — so a fold routinely lands mid-page and the
+    /// survivors keep their offsets. Every buffer span the driver walks is
+    /// therefore `head + logical`. Emitted whenever the pass touches the
+    /// buffer, including a pure write, because a buffer can be logically empty
+    /// and still be physically offset.
+    pub buffer_heads: Vec<u32>,
     /// WorkingSet-relative buffer page -> physical slot, concatenated over
     /// request rows with `translation_indptr` as the per-row CSR.
     ///
@@ -198,6 +209,7 @@ impl PreparedRs {
         request.rs_buffer_read_slot_ids = self.buffer_read_slot_ids.clone();
         request.rs_buffer_read_indptr = self.buffer_read_indptr.clone();
         request.rs_buffer_read_lens = self.buffer_read_lens.clone();
+        request.rs_buffer_heads = self.buffer_heads.clone();
         request.rs_translation = self.translation.clone();
         request.rs_translation_indptr = self.translation_indptr.clone();
     }
@@ -236,6 +248,7 @@ fn empty_prepared() -> PreparedRs {
         buffer_read_slot_ids: Vec::new(),
         buffer_read_indptr: Vec::new(),
         buffer_read_lens: Vec::new(),
+        buffer_heads: Vec::new(),
         buffer_slot_indptr: Vec::new(),
         translation: Vec::new(),
         translation_indptr: Vec::new(),
@@ -378,6 +391,15 @@ fn prepare_many_impl(
             .buffer_translation(ws)
             .map_err(|error| error.to_string())?;
 
+        let head = if buffered {
+            store.buffer_head(ws).map_err(|error| error.to_string())?
+        } else {
+            0
+        };
+        if buffered {
+            out.buffer_heads.push(head);
+        }
+
         // The read prefix is the row's PRE-EXISTING occupancy, which is
         // exactly where its own tokens begin.
         let read_tokens = match plan.row(index).2 {
@@ -388,8 +410,11 @@ fn prepare_many_impl(
         if read_tokens > 0 {
             any_read = true;
             let page = page_tokens_of(ws)?;
-            let pages = read_tokens.div_ceil(page) as usize;
-            for p in 0..pages {
+            // Physical, not logical: the replay starts at `head`, which a
+            // mid-page fold leaves non-zero.
+            let first = (head / page) as usize;
+            let last = ((head + read_tokens - 1) / page) as usize;
+            for p in first..=last {
                 match row.get(p) {
                     Some(&slot) if slot != crate::store::rs::RS_TRANSLATION_UNMAPPED => {
                         out.buffer_read_slot_ids.push(slot);

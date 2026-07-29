@@ -67,6 +67,17 @@ pie_native::LaunchView build_launch_view(const pie_native::StepLaunch& launch) {
             "this driver cannot replay buffered recurrent tokens; fold the "
             "buffer before appending to it");
     }
+    // Likewise for a mid-page fold: this driver's buffer gather/scatter treat
+    // logical buffer token 0 as physical offset 0, so a non-zero head would
+    // read the tokens a fold already absorbed and overwrite the live ones.
+    if (launch.rs_buffer_heads.len != 0 &&
+        std::any_of(launch.rs_buffer_heads.ptr,
+                    launch.rs_buffer_heads.ptr + launch.rs_buffer_heads.len,
+                    [](std::uint32_t head) { return head != 0; })) {
+        throw std::runtime_error(
+            "this driver cannot address a buffer whose first live token is "
+            "mid-page; fold whole pages only");
+    }
     view.rs_translation =
         pie_native::slice_from_u32(
             launch.rs_translation.ptr,

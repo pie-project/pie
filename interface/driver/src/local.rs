@@ -36,7 +36,14 @@ use crate::geometry::GeometryClass;
 /// Separate from the write CSR because a write may allocate a slab and a read
 /// must not. Additive, and an empty read side means "nothing to replay", but
 /// the struct grew, so drivers and workers ship together.
-pub const PIE_DRIVER_ABI_VERSION: u32 = 21;
+/// v22: `PieLaunchDesc::rs_buffer_heads` — where each row's logical buffer
+/// token 0 physically sits. A fold absorbs tokens off the front of the buffer
+/// but can only release WHOLE covered pages, and `fold_granularity` is 1 while
+/// a buffer page is the KV page size, so a fold routinely lands mid-page and
+/// the survivors keep their offsets. Every buffer span the driver walks is
+/// therefore `head + logical`. Zero for a buffer that was never partially
+/// folded, which is why this was invisible until the replay path landed.
+pub const PIE_DRIVER_ABI_VERSION: u32 = 22;
 pub const PIE_MODEL_COMPONENT_FULL: u32 = 0;
 pub const PIE_MODEL_COMPONENT_TEXT: u32 = 1;
 pub const PIE_MODEL_COMPONENT_ENCODE: u32 = 2;
@@ -1145,6 +1152,7 @@ pub struct PieStepDesc {
     pub rs_buffer_read_slot_ids: PieU32Slice,
     pub rs_buffer_read_indptr: PieU32Slice,
     pub rs_buffer_read_lens: PieU32Slice,
+    pub rs_buffer_heads: PieU32Slice,
     /// WorkingSet-relative buffer page -> physical slot for channel-resolved
     /// `rs-geometry`, concatenated over request rows. `rs_translation_indptr`
     /// is the row CSR (`rows + 1`). Per ROW, unlike `kv_translation`, because
@@ -1225,6 +1233,7 @@ impl Default for PieStepDesc {
             rs_buffer_read_slot_ids: PieU32Slice::default(),
             rs_buffer_read_indptr: PieU32Slice::default(),
             rs_buffer_read_lens: PieU32Slice::default(),
+            rs_buffer_heads: PieU32Slice::default(),
             rs_buffer_slot_indptr: PieU32Slice::default(),
             rs_translation: PieU32Slice::default(),
             rs_translation_indptr: PieU32Slice::default(),

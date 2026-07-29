@@ -55,6 +55,10 @@ pub struct LaunchPlan {
     pub rs_buffer_read_slot_ids: Vec<u32>,
     pub rs_buffer_read_indptr: Vec<u32>,
     pub rs_buffer_read_lens: Vec<u32>,
+    /// Physical offset of each row's logical buffer token 0 (`R`). A fold that
+    /// lands mid-page cannot release the page it half-consumed, so the
+    /// survivors keep their offsets and every buffer span is `head + logical`.
+    pub rs_buffer_heads: Vec<u32>,
     /// WorkingSet-relative buffer page -> physical slot, for channel-resolved
     /// `rs-geometry`. Per REQUEST ROW, unlike [`Self::kv_translation`]: a pass
     /// binds one RS working set per request, so there is no single table for

@@ -188,6 +188,7 @@ struct LaunchScratch {
         view.rs_buffer_read_slot_ids = pie_native::slice_from_u32(launch.rs_buffer_read_slot_ids.ptr, launch.rs_buffer_read_slot_ids.len);
         view.rs_buffer_read_indptr = pie_native::slice_from_u32(launch.rs_buffer_read_indptr.ptr, launch.rs_buffer_read_indptr.len);
         view.rs_buffer_read_lens = pie_native::slice_from_u32(launch.rs_buffer_read_lens.ptr, launch.rs_buffer_read_lens.len);
+        view.rs_buffer_heads = pie_native::slice_from_u32(launch.rs_buffer_heads.ptr, launch.rs_buffer_heads.len);
         view.rs_translation = pie_native::slice_from_u32(launch.rs_translation.ptr, launch.rs_translation.len);
         view.rs_translation_indptr = pie_native::slice_from_u32(launch.rs_translation_indptr.ptr, launch.rs_translation_indptr.len);
         view.flattened_masks = pie_native::slice_from_u32(launch.masks.words.ptr, launch.masks.words.len);
@@ -283,6 +284,7 @@ void expand_step(
     launch.rs_buffer_read_slot_ids = step.rs_buffer_read_slot_ids;
     launch.rs_buffer_read_indptr = step.rs_buffer_read_indptr;
     launch.rs_buffer_read_lens = step.rs_buffer_read_lens;
+    launch.rs_buffer_heads = step.rs_buffer_heads;
     launch.rs_translation = step.rs_translation;
     launch.rs_translation_indptr = step.rs_translation_indptr;
     launch.masks = step.masks;

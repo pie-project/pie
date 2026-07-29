@@ -171,6 +171,10 @@ struct ForwardFn {
         const std::uint32_t* rs_buffer_read_slot_ids_h = nullptr;
         const std::uint32_t* rs_buffer_read_indptr_h   = nullptr;
         const std::uint32_t* rs_buffer_read_lens_h     = nullptr;
+        // Physical offset of logical buffer token 0, per row. A fold that
+        // lands mid-page leaves the survivors where they were, so every
+        // buffer span is `head + logical`.
+        const std::uint32_t* rs_buffer_heads_h          = nullptr;
         const std::uint32_t* rs_fold_lens_h           = nullptr;  // R
         const std::int32_t*  rs_fold_lens_d           = nullptr;  // R
         bool                 rs_buffer_write          = false;
@@ -562,6 +566,8 @@ struct ForwardDispatchInputs {
     const std::uint32_t* rs_buffer_read_slot_ids_h = nullptr;
     const std::uint32_t* rs_buffer_read_indptr_h = nullptr;
     const std::uint32_t* rs_buffer_read_lens_h = nullptr;
+    /// Physical offset of logical buffer token 0, per row (see above).
+    const std::uint32_t* rs_buffer_heads_h = nullptr;
     const std::uint32_t* rs_fold_lens_h = nullptr;
     const std::int32_t*  rs_fold_lens_d = nullptr;
     bool                 rs_buffer_write = false;

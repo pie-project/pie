@@ -194,7 +194,11 @@ void qwen3_5_forward_paged(
     // whole live buffer, writes only the span this fire appends.
     const std::uint32_t* rs_buffer_read_slot_ids_h = nullptr,
     const std::uint32_t* rs_buffer_read_indptr_h = nullptr,
-    const std::uint32_t* rs_buffer_read_lens_h = nullptr);
+    const std::uint32_t* rs_buffer_read_lens_h = nullptr,
+    // Physical offset of each row's logical buffer token 0. A fold that lands
+    // mid-page cannot release the page it half-consumed, so the survivors keep
+    // their offsets and every buffer span is `head + logical`.
+    const std::uint32_t* rs_buffer_heads_h = nullptr);
 
 void qwen3_5_mtp_process_cache(
     const Qwen3_5Weights& w,

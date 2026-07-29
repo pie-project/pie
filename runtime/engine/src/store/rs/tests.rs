@@ -11,6 +11,16 @@ fn geom() -> RsGeometry {
     }
 }
 
+/// Production declares `fold_granularity = 1` (token-causal) while a buffer
+/// page is the KV page size, so folds routinely land mid-page. The default
+/// `geom()` hides that by making the two equal.
+fn geom_with_granularity(granularity: u32) -> RsGeometry {
+    RsGeometry {
+        fold_granularity: granularity,
+        ..geom()
+    }
+}
+
 fn store() -> RsStore {
     RsStore::new(12)
 }
@@ -621,4 +631,122 @@ fn fork_inherits_the_buffered_token_count() {
 
     let child = s.fork(ws).unwrap();
     assert_eq!(s.buffer_tokens(child).unwrap(), 5);
+}
+
+/// A fold that lands MID-PAGE cannot release the page it half-consumed, so the
+/// surviving tokens keep their physical offsets. `buffer_head` is what records
+/// that, and every later span has to be resolved through it — otherwise the
+/// next append overwrites live tokens and the next replay re-scans tokens that
+/// are already inside the folded state.
+#[test]
+fn a_partial_fold_moves_the_buffer_head_rather_than_compacting() {
+    let mut s = store();
+    let ws = s.create_working_set(geom_with_granularity(1));
+    s.alloc_buffer(ws, 2).unwrap();
+
+    // 4 tokens into page 0 (page = 4 tokens).
+    let prepared = s.prepare_write(ws, false, Some((0, 4))).unwrap();
+    settled(&mut s, prepared);
+    assert_eq!(s.buffer_tokens(ws).unwrap(), 4);
+    assert_eq!(s.buffer_head(ws).unwrap(), 0);
+
+    // Fold 2 of them. Page 0 is only half covered, so it survives.
+    let prepared = s.prepare_fold(ws, 2).unwrap();
+    settled(&mut s, prepared);
+    assert_eq!(s.buffer_tokens(ws).unwrap(), 2, "two tokens still buffered");
+    assert_eq!(s.buffer_size(ws).unwrap(), 2, "no page could be released");
+    assert_eq!(
+        s.buffer_head(ws).unwrap(),
+        2,
+        "logical token 0 now sits at physical offset 2"
+    );
+
+    // Appending onto that buffer starts at LOGICAL 2 == PHYSICAL 4, which is
+    // page 1. Resolving it as physical 2 would overwrite a live token.
+    let prepared = s.prepare_write(ws, false, Some((2, 2))).unwrap();
+    let pages: Vec<u32> = prepared
+        .buffer_targets()
+        .iter()
+        .map(|target| match *target {
+            RsBufferTarget::Fresh { index, .. }
+            | RsBufferTarget::InPlace { index, .. }
+            | RsBufferTarget::Cow { index, .. } => index,
+        })
+        .collect();
+    assert_eq!(
+        pages,
+        vec![1],
+        "the append lands on page 1, not back inside page 0"
+    );
+    settled(&mut s, prepared);
+    assert_eq!(s.buffer_tokens(ws).unwrap(), 4);
+}
+
+/// Folding whole pages away rebases the head back down: dropping page 0 moves
+/// every survivor one page earlier.
+#[test]
+fn folding_a_whole_page_rebases_the_head() {
+    let mut s = store();
+    let ws = s.create_working_set(geom_with_granularity(1));
+    s.alloc_buffer(ws, 2).unwrap();
+    let prepared = s.prepare_write(ws, false, Some((0, 8))).unwrap();
+    settled(&mut s, prepared);
+
+    let prepared = s.prepare_fold(ws, 6).unwrap();
+    settled(&mut s, prepared);
+    assert_eq!(s.buffer_size(ws).unwrap(), 1, "page 0 fully covered, dropped");
+    assert_eq!(
+        s.buffer_head(ws).unwrap(),
+        2,
+        "6 folded - 4 dropped with the page = 2 into the surviving page"
+    );
+    assert_eq!(s.buffer_tokens(ws).unwrap(), 2);
+}
+
+/// A fold's span names the pages it REPLAYS on the way into the folded state.
+/// Those tokens leave the buffer; counting the span as a write would re-add
+/// what the fold just removed.
+#[test]
+fn a_fold_does_not_count_its_replay_span_as_newly_buffered() {
+    let mut s = store();
+    let ws = s.create_working_set(geom_with_granularity(1));
+    s.alloc_buffer(ws, 2).unwrap();
+    let prepared = s.prepare_write(ws, false, Some((0, 4))).unwrap();
+    settled(&mut s, prepared);
+
+    // Fold 3 of 4 — more than half, which is what exposes the double count.
+    let prepared = s.prepare_write(ws, true, Some((0, 3))).unwrap();
+    let prepared = {
+        let _ = prepared;
+        s.prepare_fold(ws, 3).unwrap()
+    };
+    settled(&mut s, prepared);
+    assert_eq!(
+        s.buffer_tokens(ws).unwrap(),
+        1,
+        "one token left, not the 3 the replay span named"
+    );
+}
+
+/// The mtp-native-verify shape: every window allocates fresh pages, buffers a
+/// window, folds a prefix and frees everything. Without a rebase the head
+/// ratchets up until a fresh single-page window no longer fits its own tokens.
+#[test]
+fn emptying_the_buffer_rebases_the_head_so_the_next_window_starts_at_zero() {
+    let mut s = store();
+    let ws = s.create_working_set(geom_with_granularity(1));
+    for _ in 0..4 {
+        s.alloc_buffer(ws, 1).unwrap();
+        let prepared = s.prepare_write(ws, false, Some((0, 3))).unwrap();
+        settled(&mut s, prepared);
+        let prepared = s.prepare_fold(ws, 2).unwrap();
+        settled(&mut s, prepared);
+        let size = s.buffer_size(ws).unwrap();
+        s.free_buffer(ws, &(0..size).collect::<Vec<_>>(), 0).unwrap();
+        assert_eq!(
+            s.buffer_head(ws).unwrap(),
+            0,
+            "an emptied buffer must not carry a head into the next window"
+        );
+    }
 }

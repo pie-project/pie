@@ -500,6 +500,7 @@ inline int validate_step_desc(const PieStepDesc* desc,
     PIE_VALIDATE_SLICE(rs_buffer_read_slot_ids);
     PIE_VALIDATE_SLICE(rs_buffer_read_indptr);
     PIE_VALIDATE_SLICE(rs_buffer_read_lens);
+    PIE_VALIDATE_SLICE(rs_buffer_heads);
     PIE_VALIDATE_SLICE(rs_translation);
     PIE_VALIDATE_SLICE(rs_translation_indptr);
     PIE_VALIDATE_SLICE(sampling_indices);

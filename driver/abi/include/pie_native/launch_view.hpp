@@ -69,6 +69,7 @@ struct LaunchView {
     Slice<std::uint32_t> rs_buffer_read_slot_ids;
     Slice<std::uint32_t> rs_buffer_read_indptr;
     Slice<std::uint32_t> rs_buffer_read_lens;
+    Slice<std::uint32_t> rs_buffer_heads;
     // Per-request WorkingSet buffer-page translation (relative index ->
     // physical slot id), CSR-partitioned per request row. See
     // `PieStepLaunchDesc::rs_translation`.

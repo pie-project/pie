@@ -70,7 +70,7 @@ void Qwen35MoeModel::body(Workspace& ws,
         in.rs_fold_lens_d,
         in.rs_buffer_write, in.rs_buffer_fold,
         in.rs_buffer_read_slot_ids_h, in.rs_buffer_read_indptr_h,
-        in.rs_buffer_read_lens_h);
+        in.rs_buffer_read_lens_h, in.rs_buffer_heads_h);
 }
 
 std::uint32_t Qwen35MoeModel::graph_layout() {

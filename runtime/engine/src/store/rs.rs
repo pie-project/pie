@@ -154,6 +154,18 @@ struct RsEntry {
     /// upper bound; classifying fires against that bound made every freshly
     /// allocated buffer look full and rejected the legal empty-buffer append.
     buffer_fill: u32,
+    /// Where logical buffer token 0 physically sits, in tokens from the start
+    /// of page 0. Always `< buffer_page_tokens`.
+    ///
+    /// A fold absorbs tokens off the FRONT of the buffer, but only WHOLE
+    /// covered pages can be released — `fold_granularity` is 1 in production
+    /// while a buffer page is the KV page size, so a fold routinely lands
+    /// mid-page. The survivors keep their physical offsets, so logical token
+    /// `k` lives at physical `buffer_head + k`. Without this, a partial fold
+    /// silently re-aims every later read and write one fold earlier: the
+    /// replay would re-scan tokens that are ALREADY inside the folded state,
+    /// and the append would overwrite live ones.
+    buffer_head: u32,
 }
 
 /// The RS store: WorkingSets + the typed backing pool.
@@ -204,19 +216,21 @@ impl RsStore {
             folded: None,
             buffer: Vec::new(),
             buffer_fill: 0,
+            buffer_head: 0,
         })
     }
 
     /// Fork: shares the folded slot and every materialized buffered slot by
     /// reference; the first write on a shared slot copies it.
     pub fn fork(&mut self, ws: RsWorkingSetId) -> Result<RsWorkingSetId, RsError> {
-        let (geom, folded, buffer, buffer_fill) = {
+        let (geom, folded, buffer, buffer_fill, buffer_head) = {
             let entry = self.entry(ws)?;
             (
                 entry.geom,
                 entry.folded,
                 entry.buffer.clone(),
                 entry.buffer_fill,
+                entry.buffer_head,
             )
         };
         if let Some(id) = folded {
@@ -230,6 +244,7 @@ impl RsStore {
             folded,
             buffer,
             buffer_fill,
+            buffer_head,
         }))
     }
 
@@ -295,8 +310,15 @@ impl RsStore {
         // (freeing everything empties the buffer) and never an under-count.
         {
             let entry = self.entry_mut(ws)?;
-            let capacity =
-                (entry.buffer.len() as u32).saturating_mul(entry.geom.buffer_page_tokens.max(1));
+            // Removing page 0 rebases physical storage, so the head no longer
+            // names anything. An empty buffer has no survivors to hold in
+            // place either. Either way the next append starts at physical 0.
+            if remove[0] || entry.buffer.is_empty() {
+                entry.buffer_head = 0;
+            }
+            let capacity = (entry.buffer.len() as u32)
+                .saturating_mul(entry.geom.buffer_page_tokens.max(1))
+                .saturating_sub(entry.buffer_head);
             entry.buffer_fill = entry.buffer_fill.min(capacity);
         }
         for id in dropped {
@@ -370,7 +392,9 @@ impl RsStore {
                 granularity,
             });
         }
-        let capacity = (entry.buffer.len() as u32).saturating_mul(entry.geom.buffer_page_tokens);
+        let capacity = (entry.buffer.len() as u32)
+            .saturating_mul(entry.geom.buffer_page_tokens)
+            .saturating_sub(entry.buffer_head);
         if tokens > capacity {
             return Err(RsError::FoldExceedsBuffer { tokens, capacity });
         }
@@ -680,7 +704,17 @@ impl RsStore {
         // Exact occupancy: the write covers tokens [start, start+len), so the
         // buffer now holds at least start+len. `max` (not `+=`) because a
         // rewrite of an already-buffered span must not double-count.
-        if let Some((start, len)) = prepared.buffer_span {
+        //
+        // A FOLD's span is a GATHER, not a write: it names the pages the
+        // recurrence replays on its way into the folded state, and those
+        // tokens leave the buffer rather than joining it. Counting it here
+        // would re-add what `advance_fold` just subtracted, inflating the
+        // buffer past what it holds whenever the fold took more than half.
+        let folded_tokens = prepared
+            .state
+            .as_ref()
+            .and_then(|state| state.fold_tokens);
+        if let (Some((start, len)), None) = (prepared.buffer_span, folded_tokens) {
             let entry = self.entry_mut(ws).expect("batch prevalidated");
             entry.buffer_fill = entry.buffer_fill.max(start.saturating_add(len));
         }
@@ -724,15 +758,24 @@ impl RsStore {
     fn advance_fold(&mut self, ws: RsWorkingSetId, tokens: u32, epoch: u64) {
         let entry = self.entry_mut(ws).expect("batch prevalidated");
         let page = entry.geom.buffer_page_tokens.max(1);
-        let drop = ((tokens / page) as usize).min(entry.buffer.len());
         // The fold absorbed `tokens` buffered tokens into the folded prefix,
-        // so they are no longer buffered. Whole covered pages are released;
-        // a partial tail page survives and the guest owns its token<->slot
-        // bookkeeping, so clamp the remaining fill to what still fits.
+        // so they are no longer buffered. Only WHOLE covered pages can be
+        // released; whatever the fold consumed of the next page is recorded in
+        // `buffer_head` so the survivors keep their physical offsets. Dropping
+        // pages rebases those offsets, hence `head - drop * page`.
+        let head = entry.buffer_head.saturating_add(tokens);
+        let drop = ((head / page) as usize).min(entry.buffer.len());
+        entry.buffer_head = head - (drop as u32) * page;
         entry.buffer_fill = entry.buffer_fill.saturating_sub(tokens);
+        // A fold that absorbed the whole buffer leaves no survivor to hold in
+        // place, so the head can rebase and the next append starts at 0.
+        if entry.buffer_fill == 0 {
+            entry.buffer_head = 0;
+        }
         let dropped: Vec<RsSlotId> = entry.buffer.drain(..drop).flatten().collect();
-        let capacity =
-            (entry.buffer.len() as u32).saturating_mul(page);
+        let capacity = (entry.buffer.len() as u32)
+            .saturating_mul(page)
+            .saturating_sub(entry.buffer_head);
         entry.buffer_fill = entry.buffer_fill.min(capacity);
         for id in dropped {
             self.decref(id, epoch);
@@ -761,6 +804,13 @@ impl RsStore {
     /// one.
     pub fn buffer_tokens(&self, ws: RsWorkingSetId) -> Result<u32, RsError> {
         Ok(self.entry(ws)?.buffer_fill)
+    }
+
+    /// Physical offset of logical buffer token 0 within page 0. The driver
+    /// needs it because a fold that lands mid-page leaves the survivors where
+    /// they were rather than compacting them down.
+    pub fn buffer_head(&self, ws: RsWorkingSetId) -> Result<u32, RsError> {
+        Ok(self.entry(ws)?.buffer_head)
     }
 
     /// This working set's buffer-page translation: WorkingSet-relative buffer
@@ -840,6 +890,10 @@ impl RsStore {
 
 /// Inclusive page-index span covering the token range, validated against the
 /// buffered capacity.
+///
+/// `start_token` is LOGICAL — an offset from the oldest unfolded token. The
+/// span is resolved against physical page storage through `buffer_head`, so
+/// callers never have to know a fold landed mid-page.
 fn page_span(
     entry: &RsEntry,
     start_token: u32,
@@ -847,7 +901,8 @@ fn page_span(
 ) -> Result<(usize, usize), RsError> {
     let page = entry.geom.buffer_page_tokens.max(1);
     let capacity = (entry.buffer.len() as u32).saturating_mul(page);
-    let end = start_token
+    let start = entry.buffer_head.saturating_add(start_token);
+    let end = start
         .checked_add(len_tokens)
         .filter(|&e| e <= capacity)
         .ok_or(RsError::BufferRangeOutOfRange {
@@ -856,7 +911,7 @@ fn page_span(
             capacity,
         })?;
     debug_assert!(len_tokens > 0);
-    let first = (start_token / page) as usize;
+    let first = (start / page) as usize;
     let last = ((end - 1) / page) as usize;
     Ok((first, last))
 }

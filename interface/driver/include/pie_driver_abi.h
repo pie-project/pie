@@ -103,8 +103,15 @@
  * Separate from the write CSR because a write may allocate a slab and a read
  * must not. Additive, and an empty read side means "nothing to replay", but
  * the struct grew, so drivers and workers ship together.
+ * v22: `PieLaunchDesc::rs_buffer_heads` — where each row's logical buffer
+ * token 0 physically sits. A fold absorbs tokens off the front of the buffer
+ * but can only release WHOLE covered pages, and `fold_granularity` is 1 while
+ * a buffer page is the KV page size, so a fold routinely lands mid-page and
+ * the survivors keep their offsets. Every buffer span the driver walks is
+ * therefore `head + logical`. Zero for a buffer that was never partially
+ * folded, which is why this was invisible until the replay path landed.
  */
-#define PIE_DRIVER_ABI_VERSION 21
+#define PIE_DRIVER_ABI_VERSION 22
 
 #define PIE_MODEL_COMPONENT_FULL 0
 
@@ -1387,6 +1394,7 @@ typedef struct PieStepDesc {
   struct PieU32Slice rs_buffer_read_slot_ids;
   struct PieU32Slice rs_buffer_read_indptr;
   struct PieU32Slice rs_buffer_read_lens;
+  struct PieU32Slice rs_buffer_heads;
   /**
    * WorkingSet-relative buffer page -> physical slot for channel-resolved
    * `rs-geometry`, concatenated over request rows. `rs_translation_indptr`

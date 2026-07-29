@@ -490,6 +490,7 @@ void linear_attn_layer_body(
     const std::uint32_t* rs_buffer_read_slot_ids_h = nullptr,
     const std::uint32_t* rs_buffer_read_indptr_h = nullptr,
     const std::uint32_t* rs_buffer_read_lens_h = nullptr,
+    const std::uint32_t* rs_buffer_heads_h = nullptr,
     const std::uint32_t* qo_ext_h = nullptr,
     const std::uint32_t* qo_ext_d = nullptr,
     int N_ext = 0)
@@ -517,6 +518,16 @@ void linear_attn_layer_body(
     auto read_len_for = [&](int r) -> int {
         return has_buffer_read
             ? static_cast<int>(rs_buffer_read_lens_h[r])
+            : 0;
+    };
+    // Logical buffer token L of request r lives at physical `head + L`. A fold
+    // absorbs tokens off the FRONT of the buffer but can only release WHOLE
+    // covered pages, so a fold that lands mid-page leaves the survivors where
+    // they were. Reading or writing at the logical index would then re-scan
+    // tokens that are already inside the folded state, or overwrite live ones.
+    auto head_for = [&](int r) -> int {
+        return rs_buffer_heads_h != nullptr
+            ? static_cast<int>(rs_buffer_heads_h[r])
             : 0;
     };
     // TP-local dims for linear-attention. tp_size == 1 keeps everything
@@ -583,12 +594,23 @@ void linear_attn_layer_body(
                 for (int r = 0; r < R; ++r) {
                     const int qo0 = static_cast<int>(qo_indptr_h[r]);
                     const int nr  = static_cast<int>(qo_indptr_h[r + 1]) - qo0;
+                    // The fold replays LOGICAL tokens [0, nr), which live at
+                    // physical [head, head+nr). The CSR starts at the page
+                    // CONTAINING head, so the first page can begin earlier.
+                    const int head = head_for(r);
+                    const int page_first = (head / page) * page;
                     const std::uint32_t s0 = rs_buffer_slot_indptr_h[r];
                     const std::uint32_t s1 = rs_buffer_slot_indptr_h[r + 1];
                     for (std::uint32_t j = 0; s0 + j < s1; ++j) {
-                        const int tok0 = static_cast<int>(j) * page;
-                        const int cnt = std::min(page, nr - tok0);
+                        const int page_tok0 =
+                            page_first + static_cast<int>(j) * page;
+                        const int phys0 = std::max(page_tok0, head);
+                        const int cnt =
+                            std::min(page_tok0 + page, head + nr) - phys0;
                         if (cnt <= 0) break;
+                        const std::size_t in_page =
+                            static_cast<std::size_t>(phys0 - page_tok0);
+                        const int tok0 = phys0 - head;
                         auto* slab = static_cast<std::uint16_t*>(
                             state_cache.rs_buffer_slab(
                                 linear_idx,
@@ -597,21 +619,21 @@ void linear_attn_layer_body(
                         CUDA_CHECK(cudaMemcpyAsync(
                             la.mixed_qkv.data() +
                                 static_cast<std::size_t>(qo0 + tok0) * conv_dim,
-                            slab,
+                            slab + in_page * conv_dim,
                             static_cast<std::size_t>(cnt) * conv_dim *
                                 sizeof(std::uint16_t),
                             cudaMemcpyDeviceToDevice, stream));
                         CUDA_CHECK(cudaMemcpyAsync(
                             la.a.data() +
                                 static_cast<std::size_t>(qo0 + tok0) * V_h,
-                            slab + slab_a,
+                            slab + slab_a + in_page * V_h,
                             static_cast<std::size_t>(cnt) * V_h *
                                 sizeof(std::uint16_t),
                             cudaMemcpyDeviceToDevice, stream));
                         CUDA_CHECK(cudaMemcpyAsync(
                             la.b.data() +
                                 static_cast<std::size_t>(qo0 + tok0) * V_h,
-                            slab + slab_b,
+                            slab + slab_b + in_page * V_h,
                             static_cast<std::size_t>(cnt) * V_h *
                                 sizeof(std::uint16_t),
                             cudaMemcpyDeviceToDevice, stream));
@@ -713,12 +735,21 @@ void linear_attn_layer_body(
             for (int r = 0; r < R; ++r) {
                 const int qo0 = static_cast<int>(qo_indptr_h[r]);
                 const int br  = read_len_for(r);
+                if (br <= 0) continue;
+                const int head = head_for(r);
+                const int page_first = (head / page) * page;
                 const std::uint32_t s0 = rs_buffer_read_indptr_h[r];
                 const std::uint32_t s1 = rs_buffer_read_indptr_h[r + 1];
                 for (std::uint32_t j = 0; s0 + j < s1; ++j) {
-                    const int tok0 = static_cast<int>(j) * page;
-                    const int cnt = std::min(page, br - tok0);
+                    const int page_tok0 =
+                        page_first + static_cast<int>(j) * page;
+                    const int phys0 = std::max(page_tok0, head);
+                    const int cnt =
+                        std::min(page_tok0 + page, head + br) - phys0;
                     if (cnt <= 0) break;
+                    const std::size_t in_page =
+                        static_cast<std::size_t>(phys0 - page_tok0);
+                    const int tok0 = phys0 - head;
                     auto* slab = static_cast<std::uint16_t*>(
                         state_cache.rs_buffer_slab(
                             linear_idx,
@@ -732,21 +763,21 @@ void linear_attn_layer_body(
                     CUDA_CHECK(cudaMemcpyAsync(
                         la.mixed_qkv.data() +
                             static_cast<std::size_t>(qo0 + tok0) * conv_dim,
-                        slab,
+                        slab + in_page * conv_dim,
                         static_cast<std::size_t>(cnt) * conv_dim *
                             sizeof(std::uint16_t),
                         cudaMemcpyDeviceToDevice, stream));
                     CUDA_CHECK(cudaMemcpyAsync(
                         la.a.data() +
                             static_cast<std::size_t>(qo0 + tok0) * V_h,
-                        slab + slab_a,
+                        slab + slab_a + in_page * V_h,
                         static_cast<std::size_t>(cnt) * V_h *
                             sizeof(std::uint16_t),
                         cudaMemcpyDeviceToDevice, stream));
                     CUDA_CHECK(cudaMemcpyAsync(
                         la.b.data() +
                             static_cast<std::size_t>(qo0 + tok0) * V_h,
-                        slab + slab_b,
+                        slab + slab_b + in_page * V_h,
                         static_cast<std::size_t>(cnt) * V_h *
                             sizeof(std::uint16_t),
                         cudaMemcpyDeviceToDevice, stream));
@@ -782,8 +813,9 @@ void linear_attn_layer_body(
                 // Extended row index == buffer token index, so only rows at or
                 // past w0 are ours to write -- rows below it were gathered from
                 // the buffer and writing them back would be a no-op at best.
-                const int w0 = read_len_for(r);
-                const int wn = nr - w0;
+                const int head = head_for(r);
+                const int w0 = head + read_len_for(r);
+                const int wn = nr - read_len_for(r);
                 if (wn <= 0) continue;
                 // page_span() starts at the page CONTAINING w0, so the first
                 // listed page can begin before this fire's span.
@@ -792,12 +824,13 @@ void linear_attn_layer_body(
                 const std::uint32_t s1 = rs_buffer_slot_indptr_h[r + 1];
                 for (std::uint32_t j = 0; s0 + j < s1; ++j) {
                     const int page_tok0 = page_first + static_cast<int>(j) * page;
-                    const int tok0 = std::max(page_tok0, w0);
+                    const int phys0 = std::max(page_tok0, w0);
                     const int cnt =
-                        std::min(page_tok0 + page, w0 + wn) - tok0;
+                        std::min(page_tok0 + page, w0 + wn) - phys0;
                     if (cnt <= 0) break;
                     const std::size_t in_page =
-                        static_cast<std::size_t>(tok0 - page_tok0);
+                        static_cast<std::size_t>(phys0 - page_tok0);
+                    const int tok0 = phys0 - head;
                     auto* slab = static_cast<std::uint16_t*>(
                         state_cache.rs_buffer_slab(
                             linear_idx,
@@ -1713,7 +1746,8 @@ void qwen3_5_forward_paged(
     bool rs_buffer_fold,
     const std::uint32_t* rs_buffer_read_slot_ids_h,
     const std::uint32_t* rs_buffer_read_indptr_h,
-    const std::uint32_t* rs_buffer_read_lens_h)
+    const std::uint32_t* rs_buffer_read_lens_h,
+    const std::uint32_t* rs_buffer_heads_h)
 {
     const int H  = cfg.hidden_size;
     const int V  = cfg.vocab_size;
@@ -1882,8 +1916,10 @@ void qwen3_5_forward_paged(
                 cublas, stream, &profile, /*commit_len=*/commit_lens,
                 rs_buffer_slot_ids_h, rs_buffer_slot_indptr_h,
                 /*rs_buffer_write=*/false, rs_buffer_fold,
-                // A fold IS the replay; it never carries a read as well.
-                nullptr, nullptr, nullptr, nullptr, nullptr, 0);
+                // A fold IS the replay; it never carries a read as well. It
+                // still needs the head: its own gather is physical.
+                nullptr, nullptr, nullptr, rs_buffer_heads_h,
+                nullptr, nullptr, 0);
             ++linear_idx;
             continue;
         }
@@ -1912,6 +1948,7 @@ void qwen3_5_forward_paged(
                     has_buffer_read ? rs_buffer_read_slot_ids_h : nullptr,
                     has_buffer_read ? rs_buffer_read_indptr_h : nullptr,
                     has_buffer_read ? rs_buffer_read_lens_h : nullptr,
+                    rs_buffer_heads_h,
                     has_buffer_read ? qo_ext_h.data() : nullptr,
                     qo_ext_d, n_ext);
             });

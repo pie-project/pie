@@ -1080,6 +1080,52 @@ Still refused, and still needing work: a fold boundary strictly INSIDE the new
 tokens (needs `commit_len` expressed over the extended layout), and a fire
 whose rows disagree about where the boundary lands.
 
+#### 10.2.2 Logical vs physical buffer tokens — the `buffer_head` — LANDED
+
+Landing the read path exposed a deeper defect it had been standing on. A fold
+absorbs `n` buffered tokens, but a buffer PAGE holds `buffer_page_tokens` of
+them, and `bootstrap.rs` sets `fold_granularity: 1` while
+`buffer_page_size = kv_page_size`. A fold therefore lands MID-PAGE as the
+normal case, not an edge case. `advance_fold` released only the whole covered
+pages and decremented the fill — but the survivors kept their in-page offsets
+and nothing recorded that. Every buffer span was then computed as though
+logical token 0 still lived at physical offset 0, so:
+
+- the read gather REPLAYED tokens the fold had already absorbed;
+- the write scatter OVERWROTE live buffered tokens;
+- a second consecutive fold gathered from physical 0 — a bug that predates the
+  read path entirely.
+
+The fix names the thing that was missing. `RsEntry.buffer_head` is the physical
+offset of LOGICAL buffer token 0, always `< buffer_page_tokens`; logical `k`
+lives at physical `head + k`. `page_span` resolves it host-side so the CSRs
+start at the page CONTAINING the span, and the head travels per row on the wire
+(`rs_buffer_heads`, ABI 21 -> 22) because the driver's gathers and scatters
+must convert too:
+
+```
+start      = head + <logical start>       // fold/read: +0; write: +B
+page_first = (start / page) * page        // the CSR's first page
+phys0      = max(page_tok0, start)
+in_page    = phys0 - page_tok0            // offset INTO the slab
+tok0       = phys0 - head                 // back to LOGICAL -> extended row
+```
+
+Two rebases keep the head from ratcheting. A fold that empties the buffer, and
+a `free_buffer` that removes page 0 or empties the buffer, both reset it to 0:
+there is no survivor to hold in place, and the next append should start at
+physical 0. Without them `mtp-native-verify` — which frees all its slabs every
+window — walks the head up until a fresh one-page window cannot hold its own
+`k+1` tokens.
+
+A fold's gather span is a READ, not an append, so `publish_prevalidated` no
+longer adds it to `buffer_fill`; it had been re-adding what `advance_fold` had
+just subtracted, visible whenever a fold took more than half the buffer.
+
+Metal refuses a non-zero head for the same reason it refuses a non-zero read:
+its loops are still logical, and a wrong recurrent state gets folded and cannot
+be recovered.
+
 ### 10.3 `mtp-native-verify` rewritten as fold-commit — LANDED
 
 The Tier-1.5 acceptance test was broken in two independent ways, both of which

@@ -186,6 +186,7 @@ pub fn new_batched_forward_request_with_capacity(n_requests: usize) -> crate::dr
         rs_buffer_read_slot_ids: Vec::new(),
         rs_buffer_read_indptr: indptr(indptr_cap),
         rs_buffer_read_lens: Vec::new(),
+        rs_buffer_heads: Vec::new(),
         rs_translation: Vec::new(),
         rs_translation_indptr: indptr(indptr_cap),
         masks: Vec::new(),
@@ -404,6 +405,9 @@ pub fn append_request_with_options(
     batch
         .rs_buffer_read_lens
         .push(req.rs_buffer_read_lens.first().copied().unwrap_or(0));
+    batch
+        .rs_buffer_heads
+        .push(req.rs_buffer_heads.first().copied().unwrap_or(0));
     batch.rs_translation.extend(&req.rs_translation);
     batch
         .rs_translation_indptr
@@ -579,6 +583,9 @@ pub fn append_request_with_options(
             batch
                 .rs_buffer_read_lens
                 .push(req.rs_buffer_read_lens.get(row).copied().unwrap_or(0));
+            batch
+                .rs_buffer_heads
+                .push(req.rs_buffer_heads.get(row).copied().unwrap_or(0));
         }
 
         // Per-row like the buffer CSR, and for the same reason: one RS working

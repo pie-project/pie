@@ -700,6 +700,7 @@ struct PreparedStep::Impl {
     std::span<const std::uint32_t> rs_buf_read_id_view;
     std::span<const std::uint32_t> rs_buf_read_indptr_view;
     std::span<const std::uint32_t> rs_buf_read_len_view;
+    std::span<const std::uint32_t> rs_buf_head_view;
     bool rs_has_buffer_read = false;
     std::vector<std::int32_t> slot_ids_h;
     std::vector<std::uint8_t> is_fresh_h;
@@ -1218,6 +1219,7 @@ void prepare_step(
         s.rs_buf_read_indptr_view =
             view.rs_buffer_read_indptr.as<std::uint32_t>();
         s.rs_buf_read_len_view = view.rs_buffer_read_lens.as<std::uint32_t>();
+        s.rs_buf_head_view = view.rs_buffer_heads.as<std::uint32_t>();
     }
     s.rs_has_buffer_read =
         !s.rs_buf_read_len_view.empty() &&
@@ -2368,6 +2370,9 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
             .rs_buffer_read_lens_h = s.rs_has_buffer_read
                 ? s.rs_buf_read_len_view.data()
                 : nullptr,
+            .rs_buffer_heads_h = s.rs_buf_head_view.empty()
+                ? nullptr
+                : s.rs_buf_head_view.data(),
             .rs_fold_lens_h = !s.rs_fold_len_view.empty()
                 ? s.rs_fold_len_view.data()
                 : nullptr,
