@@ -4302,3 +4302,94 @@ the run. End-to-end tok/s could NOT resolve it — this box was running at load
 (11%) across three back-to-back runs. Per §20.23 the measurement to hold this
 class of change to is the loop phase itself.
 
+
+## §20.24 DONE — the retire cost was the ALLOCATOR; mimalloc landed, reaper rejected
+
+§20.23 left `loop_retire_us` at ~4.2 ms (~8 us/fire) as the last unattacked
+half of candidate 1. Instrumenting it (new `retire_instances/mark/resolve/
+drop/emit` sub-phases on `LoopPhaseAcc`, behind `fire_timing_enabled()`, kept)
+localised it precisely:
+
+```
+  loop_retire_us      p50 4.155 ms   SUM 2.181 s   4.16 us/fire
+    retire_instances      0.041 ms                 hash lookups
+    retire_mark           0.012 ms
+    retire_resolve        0.941 ms                 terminal load + wake
+    retire_drop           2.771 ms   SUM 1.443 s   <- 67%
+    retire_emit           0.300 ms
+```
+
+The resolve loop consumed `retired.requests` BY VALUE, so it ran 512
+destructors inline. A `PendingRequest` owns a `LaunchPlan` — thirty-odd
+`Vec`s plus `LaunchStagePlan { ops, source_ops: Vec<Vec<u32>>, value_types }`.
+**The scheduler loop spent 1.44 s of a 16.6 s run inside `free`, on the one
+thread that is the critical path for every process hop at a cohort boundary.**
+
+### FIRST ATTEMPT: a reaper thread — REJECTED BY MEASUREMENT
+Moved the retired vector to a `std::thread` over a `crossbeam::bounded(
+configured_max_in_flight())` with inline-drop overflow. Sound (nothing in the
+drop chain releases a scheduling resource; only pool returns). It did exactly
+what it was built to do — `retire_drop_us` 2.77 -> 0.007 ms — and bought
+nothing, because `loop_post_us` +23% and `batch_build_us` +45% ate it. That
+regression was the CLUE: a thread that never frees stops replenishing its own
+allocator cache.
+
+### ROOT CAUSE: `mimalloc` was a declared dependency that was NEVER REGISTERED
+`worker/Cargo.toml` has carried `mimalloc = "0.1"` since the disaggregated-
+serving refactor (cc4e77a7d) with no `#[global_allocator]` anywhere in the
+workspace. The engine has been running on glibc malloc, whose per-arena lock
+is exactly the wrong shape for "one thread allocates 512 plans, then frees 512
+plans, ~20k `free` calls per pass".
+
+### THE 2x2 (one build, both axes env-gated; conc 512, N=4096, 2 reps)
+```
+                       tok/s     retire_drop  loop_retire  loop_lag  TRUE-IDLE
+  glibc,  reaper off   30918        2.92 ms      4.29 ms    5.65 ms   1.006 s
+  mimalloc,reaper off  31246        0.78 ms      1.90 ms    4.10 ms   0.840 s
+  mimalloc,reaper on   31230        0.007ms      1.15 ms    3.82 ms   0.789 s
+  glibc,  reaper on    30808        0.008ms      1.45 ms    3.91 ms   0.994 s
+```
+The allocator arms DO NOT OVERLAP (mimalloc min 31050 > glibc max 30927 over
+4 runs each). The reaper adds nothing once the allocator is right, and costs a
+thread on a 13.6-CPU box. **Reaper reverted; mimalloc landed.**
+
+### LANDED
+`#[global_allocator] static GLOBAL_ALLOC: mimalloc::MiMalloc` in
+`worker/src/lib.rs` — the one crate the CLI, the standalone worker and the
+pyo3 wheel all link, so a single declaration covers every entry point.
+Feature `local_dynamic_tls` is REQUIRED: the wheel is `dlopen()`ed and
+mimalloc's default initial-exec TLS model fails there with "cannot allocate
+memory in static TLS block".
+
+### RESULT (landed build, n=3, vs the glibc arm of the same 2x2)
+```
+  retire_drop_us    2.924 -> 0.807 ms   -72%
+  loop_retire_us    4.295 -> 1.944 ms   -55%
+  loop_lag_us       5.649 -> 3.879 ms   -31%   <- §20.23's target metric
+  loop_post_us      3.628 -> 3.462 ms    -5%   (untouched = CONTROL)
+  loop_mailbox_us   1.575 -> 1.479 ms    -6%   (untouched = CONTROL)
+  TRUE-IDLE         1.006 -> 0.813 s    -19%
+  top boundary gaps 198/138/112/109 -> 163/128/98/88 ms
+  tok/s             30918 -> 31380      +1.5%
+```
+`driver_submit_us` rose 9.57 -> 11.25 ms, but that is the LANE thread and
+§20.23 already showed the lane keeps up (it services a bind 3 ms after it is
+posted); throughput and idle both moved the right way.
+
+VARIANCE IS THE OTHER HEADLINE: three back-to-back runs read 31339/31431/
+31371 = **0.3% spread**, against the 11% spread (28131/28999/31296) that
+§20.23 recorded as this box's noise floor. Much of what was called machine
+noise was glibc arena contention. This also explains the `guest_wake_us`
+multi-second maxima seen while chasing the reaper (10.3 s in one glibc run):
+they were allocator stalls, not a scheduling defect.
+
+VERIFIED: frame tests 25 pass / 2 pre-existing fail; contention hog 32/32,
+soak 4096/4096, tinyswap 3/3, allshared_noswap 128/128 x3, churn_extreme
+4096/4096 x4.
+
+### NEXT
+ 1. `loop_dispatch_us` (3.96 ms) and `loop_post_us` (3.46 ms) are now the two
+    largest phases; `retire_resolve_us` (0.79 ms) is the rest of retire.
+ 2. The 33 ms from predecessor `drop_entered` to successor `exec admitted`
+    still stands: teardown tasks wait p50 18.6 ms to be FIRST POLLED with
+    170-424 spawned-but-unpolled tasks at a boundary.

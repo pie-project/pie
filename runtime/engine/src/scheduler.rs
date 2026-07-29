@@ -338,6 +338,12 @@ pub(crate) struct LoopPhaseAcc {
     pub lag_max_ns: AtomicU64,
     pub lag_n: AtomicU64,
     pub pass_max_ns: AtomicU64,
+    pub retire_instances_ns: AtomicU64,
+    pub retire_mark_ns: AtomicU64,
+    pub retire_resolve_ns: AtomicU64,
+    pub retire_emit_ns: AtomicU64,
+    pub retire_drop_ns: AtomicU64,
+    pub retire_n: AtomicU64,
 }
 
 /// Guest-side turnaround probe: how long an inferlet lane takes between
@@ -387,6 +393,12 @@ pub(crate) static LOOP_PHASES: LoopPhaseAcc = LoopPhaseAcc {
     lag_max_ns: AtomicU64::new(0),
     lag_n: AtomicU64::new(0),
     pass_max_ns: AtomicU64::new(0),
+    retire_instances_ns: AtomicU64::new(0),
+    retire_mark_ns: AtomicU64::new(0),
+    retire_resolve_ns: AtomicU64::new(0),
+    retire_emit_ns: AtomicU64::new(0),
+    retire_drop_ns: AtomicU64::new(0),
+    retire_n: AtomicU64::new(0),
 };
 
 pub(crate) fn ledger_timing_enabled() -> bool {

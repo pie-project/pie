@@ -3887,16 +3887,24 @@ impl BatchScheduler {
                 }
                 _ => None,
             };
-            let retired = in_flight_launches.pop_front().expect("front batch exists");
+            let mut retired = in_flight_launches.pop_front().expect("front batch exists");
             let native_complete_us = retired.timing.as_ref().map(|_| super::fire_timing_now_us());
             let timing_snapshots = retired
                 .timing
                 .as_ref()
                 .map(|_| Self::fire_timing_snapshots(&retired.requests));
+            let sub = super::fire_timing_enabled().then(Instant::now);
             for request in &retired.requests {
                 if let Some(instance) = instances.get_mut(&request.instance_id) {
                     instance.in_flight = instance.in_flight.saturating_sub(1);
                 }
+            }
+            if let Some(mark) = sub {
+                let acc = &super::LOOP_PHASES;
+                acc.retire_instances_ns
+                    .fetch_add(mark.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                acc.retire_n
+                    .fetch_add(retired.requests.len() as u64, Ordering::Relaxed);
             }
             if let Some(message) = launch_failure {
                 if let (Some(timing), Some(native_complete_us), Some(snapshots)) =
@@ -3926,16 +3934,24 @@ impl BatchScheduler {
             let result = result.expect("accepted batch carries a settled result");
             match result {
                 Ok(()) => {
+                    let t_mark = sub.map(|_| Instant::now());
                     for request in &retired.requests {
                         request.completion.mark_native_retired();
                     }
+                    let t_resolve = t_mark.map(|t| {
+                        super::LOOP_PHASES
+                            .retire_mark_ns
+                            .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        Instant::now()
+                    });
                     if retired.timing.is_some() {
                         super::LAST_RESOLVE_US
                             .store(super::fire_timing_now_us(), Ordering::Relaxed);
                     }
-                    let mut outcomes = Vec::with_capacity(retired.requests.len());
+                    let requests = std::mem::take(&mut retired.requests);
+                    let mut outcomes = Vec::with_capacity(requests.len());
                     let mut token_instance_ids = Vec::new();
-                    for request in retired.requests {
+                    for request in &requests {
                         match request.completion.resolve_from_terminal() {
                             Ok(WorkItemAttemptOutcome::Committed) => {
                                 outcomes.push("committed");
@@ -3972,6 +3988,19 @@ impl BatchScheduler {
                             }
                         }
                     }
+                    let t_drop = t_resolve.map(|t| {
+                        super::LOOP_PHASES
+                            .retire_resolve_ns
+                            .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        Instant::now()
+                    });
+                    drop(requests);
+                    let t_emit = t_drop.map(|t| {
+                        super::LOOP_PHASES
+                            .retire_drop_ns
+                            .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        Instant::now()
+                    });
                     if let (Some(timing), Some(native_complete_us), Some(snapshots)) =
                         (retired.timing, native_complete_us, timing_snapshots)
                     {
@@ -3988,6 +4017,11 @@ impl BatchScheduler {
                             Self::queued_untracked_riders(pending),
                             &token_instance_ids,
                         );
+                    }
+                    if let Some(t) = t_emit {
+                        super::LOOP_PHASES
+                            .retire_emit_ns
+                            .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
                     }
                     stats::record_fire_stats(
                         stats,
@@ -4130,6 +4164,14 @@ impl BatchScheduler {
             take(&gacc.work_max_ns) / 1_000,
             take(&gacc.n),
         );
+        let (retire_instances, retire_mark, retire_resolve, retire_drop, retire_emit, retire_n) = (
+            take(&acc.retire_instances_ns) / 1_000,
+            take(&acc.retire_mark_ns) / 1_000,
+            take(&acc.retire_resolve_ns) / 1_000,
+            take(&acc.retire_drop_ns) / 1_000,
+            take(&acc.retire_emit_ns) / 1_000,
+            take(&acc.retire_n),
+        );
         let (loop_scan, loop_plan, loop_post, loop_scans) = (
             take(&acc.scan_ns) / 1_000,
             take(&acc.plan_ns) / 1_000,
@@ -4191,6 +4233,12 @@ impl BatchScheduler {
                 ("loop_scan_us", loop_scan),
                 ("loop_plan_us", loop_plan),
                 ("loop_post_us", loop_post),
+                ("retire_instances_us", retire_instances),
+                ("retire_mark_us", retire_mark),
+                ("retire_resolve_us", retire_resolve),
+                ("retire_drop_us", retire_drop),
+                ("retire_emit_us", retire_emit),
+                ("retire_n", retire_n),
                 ("loop_scans", loop_scans),
                 (
                     "loop_lag_us",
