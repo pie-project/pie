@@ -1,46 +1,21 @@
-"""The research tree: kernels, benchmarks, and the prototypes that came first.
+"""The research tree: the measurement suite, the verifications, the workloads.
 
-The library is `gpugrammar`; this is what it is built on and what it was built
-out of. The current engine is `gpugrammar._engine`, re-exported as
-`gpugrammar.device`. The names below are the earlier pure-Python prototype -
-a canonical LR(1) compiler and a byte-DFA schema compiler - kept because their
-tests still pass and they are the record of how the design arrived where it is.
-Nothing in the current path imports them.
+The library is `gpugrammar` and the engine is `gpugrammar._engine`, re-exported
+as `gpugrammar.device`. Nothing here ships in the wheel; it is what the numbers
+are produced with and what the device is checked against.
+
+    gpu_lr1.verify              every device check against the reference matcher
+    gpu_lr1.rigor               latency, soundness, overlap, serving, cost, fill
+    gpu_lr1.crossover           where a captured step overtakes a host matcher
+    gpu_lr1.vllm_smoke          end to end through vLLM, optionally verifying
+    gpu_lr1.generate_instances  stage one of the corpus: the JSON a model emits
+    gpu_lr1.replay_tokenizer    stage two: that text through a real tokenizer
+    gpu_lr1.residency           what one compiled schema costs to keep resident
+    gpu_lr1.token_groups        how far a real vocabulary collapses into groups
+
+The pure-Python prototypes that came first - a canonical LR(1) compiler, a
+byte-DFA schema compiler, the first Triton kernels and two samplers - were
+deleted once the Rust front end and `gpugrammar._engine` had superseded them
+and nothing in any path imported them. `docs/prototype-history.md` is the
+record of what they were for and what they measured; git holds the code.
 """
-
-from gpu_lr1.automata import ByteDFA
-from gpu_lr1.lr1 import (
-    CanonicalLR1Compiler,
-    Grammar,
-    LR1ConflictError,
-    Production,
-)
-from gpu_lr1.lr1_tokens import (
-    BoundedLR1TokenAutomaton,
-    LR1ConfigurationLimitError,
-    LR1TokenCompileTimeoutError,
-    LR1TokenVocabulary,
-    compile_bounded_lr1_token_automaton,
-    make_bounded_lr1_step_plan,
-    pack_bounded_lr1_token_automata,
-)
-from gpu_lr1.schema import CanonicalJSONSchemaCompiler, UnsupportedSchemaError
-from gpu_lr1.vocab import Vocabulary
-
-__all__ = [
-    "ByteDFA",
-    "BoundedLR1TokenAutomaton",
-    "CanonicalJSONSchemaCompiler",
-    "CanonicalLR1Compiler",
-    "Grammar",
-    "LR1ConfigurationLimitError",
-    "LR1ConflictError",
-    "LR1TokenCompileTimeoutError",
-    "LR1TokenVocabulary",
-    "Production",
-    "UnsupportedSchemaError",
-    "Vocabulary",
-    "compile_bounded_lr1_token_automaton",
-    "make_bounded_lr1_step_plan",
-    "pack_bounded_lr1_token_automata",
-]
