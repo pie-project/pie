@@ -4952,3 +4952,106 @@ advantage over vLLM at this width is the whole remaining margin. The lever
 that is still open and now correctly aimed is **cut per-turnover guest CPU**
 (285 us x 1024 processes per boundary), and raise the boundary's parallel
 efficiency above 58%.
+
+## §20.29 — the cohort boundary is per-request turnover CPU, and that is
+## architectural; conc 1024 is won at 1.046x, conc 512 sits at 0.980x
+
+Two small orderings land here. The value of the section is the anatomy: the
+boundary has now been decomposed link by link and every link is accounted for,
+which closes several standing hypotheses and identifies what is left as a
+property of the design rather than of the scheduler.
+
+### Landed: nothing precedes the seat release in `ProcessCtx::drop`
+
+The drop removed the process scratch directory and moved the `ResourceTable`
+*before* releasing the execution permit, putting a `remove_dir_all` syscall —
+512 of them at a cohort boundary — between the last token and the successor's
+admission. The release is now the first thing the drop does, and the scratch
+directory is torn down with the rest of the resources in the deferred teardown
+task. Measured neutral (the syscall is ~20 us, so ~10 ms of a 16.4 s run,
+below this box's noise floor); kept because the ordering is the contract the
+drop's own comment states.
+
+### The boundary, link by link (conc 512, all times relative to the last
+### wave of the retiring generation)
+
+```
+  guest drain loop ends   p10  3.0   p50 11.5   p90 22 ms
+  main returns            p10  3.1   p50 11.6   p90 22 ms   (+0.07 ms)
+  ProcessCtx::drop entered                      +0.01 ms
+  execution seat released                       immediately
+  successor admitted      p10 13     p50 27     p90 35 ms
+  last admit -> frame dispatches                +1.5 - 2.5 ms
+  ------------------------------------------------------------------
+  boundary gap                                   37 - 50 ms
+```
+
+Everything after the guest's last channel `take` is free: `pipeline.close()`
+drains in **3 us p50 with zero pending fires** (the run-ahead window is always
+already settled at close), and close-to-return is 72 us. The seat handoff is
+free (§20.14). The frame seals 2 ms after the last admission.
+
+So the gap is two spreads and nothing else:
+
+1. **512 guests waking to their final token** — 3 to 22 ms.
+2. **512 successors waking to a freed seat** — a flat ~15 ms behind (1).
+
+### What those spreads are: CPU, at 58% parallel efficiency
+
+From the `cpu_census` records, inside the seven boundary windows:
+
+```
+  guest    2.04 core-s     74%
+  teardown 0.37 core-s     13%
+  total    2.91 core-s   in 370 ms of wall  =  7.9 of 13.6 cores
+```
+
+~285 us of guest CPU per process turnover, 1024 turnovers per boundary. At
+perfect parallelism 2.91 core-s would take 214 ms; it takes 370 ms, because
+successors cannot start until predecessors release seats. Both halves are
+real: half the gap is the CPU, half is the dependency chain.
+
+**This is the architectural cost of per-request programmability.** vLLM retires
+a request with a few dictionary operations inside one Python scheduler step;
+pie retires a WASM guest task and brings up another, and 285 us x 1024 is
+36 ms of unavoidable work whenever a whole fleet turns over at once. The
+benchmark makes every request the same length, so every boundary is fleet-wide;
+a workload with varied lengths has no such boundary at all.
+
+### Closed again, by measurement, at the new noise floor
+
+`--worker-threads` was swept three times before mimalloc, when this box's noise
+floor was 11%. Re-run at the current 0.5% floor, it still says the stock
+sizing is right — and confirms the boundary's idle cores are the dependency
+chain, not a thread shortage:
+
+```
+  13 (default, = available_parallelism)   32075
+  20                                      31574
+  26                                      31904
+```
+
+### Standing
+
+Interleaved, one process at a time, alternating engines:
+
+```
+  conc 1024 @ 16384   pie 32565 32777   vLLM 30894 31565   = 1.046   WON
+  conc  512 @  8192   pie 32042 32140 31937   vLLM 32655 32763 32648   = 0.980
+```
+
+conc 1024 improved from 1.037 (§20.27) and conc 512 from 0.960.
+
+At conc 512 the remaining deficit and the remaining idle are now the same
+quantity, which is the useful part of the result:
+
+```
+  pie wall 16.37 s   vLLM wall 16.04 s   difference 320 ms
+  boundary idle, 7 clusters                          355 ms
+```
+
+There is no third term. Everything else is GPU-bound parity, and pie's own
+per-step decode advantage at this width is ~1.1% (§20.13), so **removing the
+boundary entirely is worth about 1.01x at conc 512, not more.** The reason
+conc 1024 wins comfortably is arithmetic: the same 4096 requests turn over
+three times instead of seven, against waves of identical width (§20.18).

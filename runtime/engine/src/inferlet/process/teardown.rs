@@ -1,8 +1,9 @@
 //! Deferred process-resource teardown: finalizes a departing process's
-//! pending pipeline operations off the guest task and batches its channel
-//! closes. The capped execution slot is NOT released here — `ProcessCtx::drop`
-//! frees it synchronously, ahead of this task, and hands down the terminate
-//! fences it posted (see `post_process_terminate_fenced`).
+//! pending pipeline operations off the guest task, removes its scratch
+//! directory and batches its channel closes. The capped execution slot is NOT
+//! released here — `ProcessCtx::drop` frees it synchronously, ahead of this
+//! task, and hands down the terminate fences it posted (see
+//! `post_process_terminate_fenced`).
 
 use std::sync::{Arc, Mutex};
 
@@ -28,6 +29,7 @@ pub(crate) fn defer_resource_teardown(
     residency: Arc<Mutex<crate::inferlet::process::ProcessResidency>>,
     terminate_fences: Option<Vec<crate::scheduler::worker::TerminateFence>>,
     bind_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    scratch_dir: std::path::PathBuf,
 ) {
     let capped_execution = terminate_fences.is_some();
     let snapshot = residency.lock().unwrap().teardown_snapshot();
@@ -45,6 +47,7 @@ pub(crate) fn defer_resource_teardown(
     {
         crate::inferlet::process::release_bind_permit(context.bind_permit.take());
         drop(context);
+        let _ = std::fs::remove_dir_all(&scratch_dir);
         return;
     }
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {
@@ -57,6 +60,7 @@ pub(crate) fn defer_resource_teardown(
         // POOLED RESOURCES are preserved here, never admission capacity.
         crate::inferlet::process::release_bind_permit(context.bind_permit.take());
         std::mem::forget(context);
+        let _ = std::fs::remove_dir_all(&scratch_dir);
         // `ProcessCtx::drop` already released the execution permit and
         // broadcast the release, so the semaphore's capacity is intact and
         // the policy's departure is resolved. (Before the permit moved out
@@ -124,6 +128,7 @@ pub(crate) fn defer_resource_teardown(
             .sum::<usize>();
         crate::inferlet::process::release_bind_permit(context.bind_permit.take());
         drop(context);
+        let _ = std::fs::remove_dir_all(&scratch_dir);
         let dropped_us = if timing {
             crate::scheduler::fire_timing_now_us()
         } else {
