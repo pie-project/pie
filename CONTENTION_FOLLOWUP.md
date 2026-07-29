@@ -5430,6 +5430,38 @@ Running total, conc 512, whole run:
   guest CPU census     35.41       -> 21.4 core-s (41 us/fire) still unmetered
 ```
 
+### ★ LANDED: the fold allocated every value twice
+
+`fold_stage` carried two parallel tracks indexed by SSA value id: `slots:
+Vec<Result<Value, EvalBlocker>>` for known/unknown, and `dense: Vec<Value>`
+for `eval_op`, which needs a flat `&[Value]`. `dense` was built by **cloning**
+each `slots` entry, so every host-folded value allocated twice on a path that
+runs once per fire per channel-writing stage.
+
+The two tracks carry independent information and do not need to be built from
+each other: `blocked_at: Vec<Option<EvalBlocker>>` holds the first blocker on a
+value's derivation chain and `dense` holds the value, each pushed once by move.
+The only clone left is at `ChanPut`, which is the fold's sole output, and there
+are a handful of those per stage against tens of ops. Same results, strictly
+fewer allocations.
+
+```
+  HostShadow::advance   11.27 -> 9.56 us/fire      5.91 -> 5.01 core-s   -15.1%
+  guest CPU census      36.59 -> 35.67 core-s
+```
+
+Both readings are CPU, not wall, which is what makes this measurable at all
+while the box is contended (`/proc/loadavg` 15.9-23.2 against a 13.6-CPU
+quota). The wall effect is about 0.1% and is not resolvable here.
+
+**A refinement that did NOT pay.** Refcounting the blocker track
+(`Vec<Option<Rc<EvalBlocker>>>`) to stop `EvalBlocker::Kernel`'s `String` from
+re-allocating at every step of a blocked chain measured **neutral to slightly
+worse** — advance 5.014 -> 5.080 core-s, guest CPU 35.67 -> 35.61. The folded
+stages on this trace are the geometry prologue, where most ops are *not*
+blocked, so the propagation clone barely runs. Reverted: an `Rc` indirection
+with no evidence behind it is not the more correct code.
+
 What is left is the WASM body itself plus wasmtime's async machinery: every
 host call that awaits costs a fiber switch out of and back into the guest
 stack, and the steady loop makes a `take`, a `submit` and a `reserve` per
