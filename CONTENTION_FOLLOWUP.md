@@ -4469,3 +4469,172 @@ quota. Two levers follow, and they are the next work:
 
 VERIFIED: frame 25 pass / 2 pre-existing fail; hog 32/32, soak 4096/4096,
 tinyswap 3/3, allshared_noswap 128/128 x3, churn_extreme 4096/4096 x4.
+
+## §20.26 — the boundary decomposed, two queue defects fixed, and the probe
+## that was measuring itself
+
+§20.25 localised every bit of GPU idle to the seven cohort boundaries (614 ms
+of 784 ms). This section takes a boundary apart with per-thread CPU
+attribution and per-phase scheduler instrumentation, lands two correctness
+fixes found on the way, and ends by removing an observer effect large enough
+to have distorted the very numbers below.
+
+### Per-thread CPU attribution
+
+`/proc/<pid>/task/*/schedstat` sampled at 200 Hz and grouped by thread `comm`
+(`/root/p512/thread_sampler.py`):
+
+```
+                   TOTAL   tokio   pie-sched-0   pie-driver-0   runq wait
+  steady state    4.4-5.0  2.1-2.6   0.25-0.33      1.1-2.1        0.00
+  cohort boundary 8.0-9.2  5.9-7.3   0.87-0.96      0.6-0.9        0.00
+```
+
+Two facts follow. `pie-sched-0` is a **single** thread and it runs at 90-96%
+of a core through a boundary, four times its steady-state draw. And steady
+state uses only **4.4-5.0 of the 13.6-CPU quota** — there is no shortage of
+capacity, the turnover work simply happens at a moment when the GPU has
+nothing else to do.
+
+Re-swept worker threads at the post-mimalloc 0.3% noise floor to be sure
+oversubscription is not the lever: 13 / 20 / 26 / 40 threads gave
+31286 / 31186 / 31287 / 31058 tok/s. Flat, third confirmation.
+
+### What `pie-sched-0` was doing: 320,645 rotations per boundary
+
+Per-wave loop phases, boundary vs steady:
+
+```
+  loop_passes  1187 vs 4      loop_scans   976 vs 1     loop_items 8599 vs 1024
+  loop_dispatch 119 ms vs 3.6  loop_park 0.26 ms vs 20.7
+```
+
+scan + plan + post + batch_build accounted for 9.5 of the 119 ms, so new
+`disp_*` sub-phase counters were added inside `dispatch_ready_items`. They
+found **`disp_rot_n` = 320,645 close-rotations per boundary** (max 779,642)
+against 0 in steady state. `PendingQueue` bumps an epoch on every `&mut`
+reach, so each rotation invalidates `ScanCache` and forces a full
+`scan_queue` — hence `loop_scans` 976.
+
+Reading that code found two defects, both fixed:
+
+ 1. the `!busy` branch **fell through into the rotation**. A close that
+    dispatched successfully then rotated the *next* item — possibly a Launch —
+    to the back of the queue. The comment on the rotation says "Busy: rotate".
+    Now `continue`s.
+ 2. a pure rotation claimed `progress = true`, so the run loop treated
+    "I moved an item" as "I did work" and never parked. The adjacent
+    `hold_closes` branch documents the opposite ("no progress claim"). `busy`
+    already guarantees a later wake, so the claim is now dropped.
+
+`QueuedItem` was also 1280 bytes (`PendingRequest` inline), so every rotation
+memcpy'd 1280 bytes twice; 320k rotations is ~820 MB of memcpy. Boxing the
+payload (`Launch(Box<PendingRequest>)`, threaded through `SlotBuffer`,
+`collisions`, `survivors`, `PendingLaunchBatch` and all of `scheduler/batch.rs`)
+took it to **376 bytes**: `loop_post_us` 5143 -> 3003 (-42%), `loop_lag_us`
+844 -> 570.
+
+**But `loop_dispatch_us` did not move** (~114 ms) and rotations rose to 571k.
+The rotation is a busy-wait that expands to fill the boundary; it is a
+symptom, not the cause. Both changes are kept because each is independently
+correct, not because either moved the benchmark (31247 / 31134 vs ~31200).
+
+### The boundary's actual critical path
+
+Lifecycle event distributions over four boundaries, t0 = start of the gap:
+
+```
+  guest_main_returned   p10  4.2   p50 18.8   p90 43.9   max 48.2
+  process_store_drop    (identical -- the permit is released 5 us in)
+  process_admitted      p10 22.8   p50 51.5   p90 66.8   max 70.6
+  FRAME DISPATCHES                                            82.9
+```
+
+So **58% of a boundary is the 512 old guests returning from `run()`**, then a
+uniform ~20 ms release->admit lag, then ~12 ms to seal and dispatch.
+
+Hypotheses killed here:
+ - the planner lock and the bind gate are innocent: instrumented
+   `note_us` p50 **4 us**, `bind_wait_us` p50 **0** (max 17 us).
+ - tokio's global injection queue is real but not the lever. Guests are woken
+   from non-runtime threads, so every wake lands in the global queue;
+   `global_queue_interval=1` cut the exit spread 50.4 -> 39.2 ms (-22%) and
+   total idle 0.881 -> 0.842 s, but throughput was neutral and **`lastAdmit`
+   stayed at 69-71 ms in every arm**. Reverted: it is a tuning constant that
+   buys nothing.
+
+The ~70 ms admit floor not moving when the exits are compressed is the open
+question this section leaves.
+
+### The probe was measuring itself
+
+`fire_timing_write` formatted each record and then took the **process-wide
+`stderr` lock and issued one `write` syscall, inline, on the emitting
+thread**. `PIE_FIRE_TIMING=waves` drops the per-fire stream but keeps the
+per-process lifecycle stream, which is ~28 records per process: a 512-lane
+boundary pushes **~14,000 locked syscalls through a single mutex**, paid by
+the guest, scheduler and driver-lane threads at once — landing exactly on the
+window the stream exists to measure. §20.23's "instrumentation costs 1.1% of
+the run" is true and misleading: 1.1% of 16.3 s is 180 ms, and essentially
+all of it is concentrated in the 7 boundaries.
+
+Records now go to a dedicated `pie-fire-timing` writer thread over an
+unbounded channel and are batched into a 1 MB `BufWriter` that flushes
+whenever the producers go quiet, so a burst costs one syscall instead of
+14,000 and no producer ever blocks on another. `SchedulerShutdownHandle::
+shutdown` flushes synchronously so a benchmark reading the stream after exit
+still sees the tail. Ordering is preserved: one consumer writes.
+
+### ★ The fix inverts the diagnosis: the boundary IS CPU-saturated
+
+Every "the boundary is not CPU-bound" reading in §20.25 and above was taken
+through the inline-stderr probe, and it was the probe that was serialising
+the runtime. Re-measured with the writer thread (`/root/p512/pf1.th`):
+
+```
+                   TOTAL (of 13.6)   tokio-rt-worker (13 threads)
+  steady state          3.0                 0.6 - 0.95
+  cohort boundary     14 - 17               11 - 13
+```
+
+At a boundary **every one of the 13 tokio workers is running**, and total
+demand exceeds the 13.6-CPU cgroup quota. §20.25's "9.0-10.1 cores, runqueue
+wait 0.00" and this segment's earlier "tokio 5.9-7.3 of 13" were both
+artefacts: threads were blocked on the `stderr` mutex, which schedstat scores
+as neither run time nor runqueue wait.
+
+Corroborating, `process_admitted` and `process_store_drop` now carry the
+emitting `tid`: at every boundary both are spread across **all 13 workers**,
+40-63 each. There is no serial section.
+
+The boundary is therefore, precisely:
+
+```
+  512 turnovers x ~1.5 ms of host CPU each / 13 cores = ~60 ms
+```
+
+and the admit "rate limit" of 8.5/ms is simply 13 cores divided by 1.5 ms of
+work per turnover. A free-permit census settles that it is not a dependency:
+**150-270 execution seats sit unclaimed for the entire boundary** (releases
+complete at t=40-45 ms, admits run to t=60-65 ms), so nothing is waiting on a
+predecessor — the successors are waiting for a core.
+
+Of the ~871 core-ms in a 67 ms boundary window, the instrumented per-process
+costs account for only ~215:
+
+```
+  store drop (wasmtime Store + ProcessCtx)   92 ms    p50 0.147 ms
+  control_dispatched occupancy               54 ms
+  ResourceTable drop                         22 ms
+  permit release + scratch_rm                12 ms
+  note_admitted / detach / terminate / ...    ~9 ms
+```
+
+The remaining ~650 core-ms is uninstrumented, and finding it is the next
+step: it is almost certainly guest-side WASM (the retiring cohort's epilogue
+and the successors' first-frame prologue), which no host timer can see.
+
+This also re-frames the whole §20.14 shape: "make per-process bring-up and
+teardown cheaper" is not a latency problem, it is a **CPU budget** problem.
+Steady-state decode uses 3.0 of 13.6 cores, so the machine has ~10 spare
+cores during decode and none at all at the boundary.
