@@ -1260,6 +1260,22 @@ mod tests {
         }
     }
 
+    /// The mode-2 rebind escape arms its deadline on the first blocked plan
+    /// and only releases the idle rebinder once [`REBIND_ESCAPE_US`] has
+    /// passed, which is longer than the gather poll one
+    /// [`drive_past_cold_hold`] step advances by.
+    fn drive_past_rebind_escape(policy: &mut FramePolicy, queued: &QueuedFireIds) -> FramePlan {
+        let now = Instant::now();
+        match plan(policy, queued, now) {
+            FramePlan::Hold(_) => plan(
+                policy,
+                queued,
+                now + Duration::from_micros(REBIND_ESCAPE_US + 1),
+            ),
+            plan => plan,
+        }
+    }
+
     /// Flatten a whole-frame dispatch for order-insensitive membership
     /// asserts.
     fn fires(plan: &FramePlan) -> Vec<u64> {
@@ -1372,8 +1388,14 @@ mod tests {
         let queued: QueuedFireIds = [1, 2, 3].into_iter().collect();
         let t0 = Instant::now();
         match plan(&mut policy, &queued, t0) {
+            // A blocked gather re-looks at the GATHER POLL cadence, not at
+            // the watchdog's. The watchdog is report-only and its deadline
+            // stays an order of magnitude further out; sleeping the whole
+            // way there with the GPU idle was the 2x regression that split
+            // the two constants apart.
             FramePlan::Hold(hold) => {
-                assert_eq!(hold, Duration::from_micros(STRICT_WATCHDOG_US));
+                assert_eq!(hold, Duration::from_micros(gather_poll_us()));
+                assert!(hold < Duration::from_micros(STRICT_WATCHDOG_US));
             }
             plan => panic!("wait-all must hold for the incomplete lane, got {plan:?}"),
         }
@@ -1727,7 +1749,7 @@ mod tests {
         policy.on_bind_enqueued(Some(rebinder));
 
         let queued: QueuedFireIds = [12].into_iter().collect();
-        let sealed = drive_past_cold_hold(&mut policy, &queued);
+        let sealed = drive_past_rebind_escape(&mut policy, &queued);
         assert_eq!(
             fires(&sealed),
             vec![12],
