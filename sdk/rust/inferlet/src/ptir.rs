@@ -31,6 +31,7 @@ use pie_dsl::{
     Tensor,
 };
 
+use crate::pie::inferlet::channel as wit_channel;
 use crate::pie::inferlet::forward as wit;
 use crate::pie::inferlet::pipeline as wit_pipeline;
 use crate::pie::inferlet::types::Dtype as WitDtype;
@@ -58,21 +59,21 @@ pub use pie_dsl::{
 // A stage trace interns channels and yields dense channel ids keyed by the
 // dsl channel's gid; `forward-pass.program` wants the WIT handles in that dense
 // order. Every channel the author can reference is created via `Channel::new`/
-// `from`/`seeded`, so registering (gid -> Rc<wit::Channel>) at construction
+// `from`/`seeded`, so registering (gid -> Rc<wit_channel::Channel>) at construction
 // lets a `ForwardPass` resolve each `Traced.channel_order` entry. Inferlets are
 // single-threaded (wasm), so a thread-local registry is sound.
 
 thread_local! {
-    static WIT_CHANNELS: RefCell<HashMap<u64, Rc<wit::Channel>>> = RefCell::new(HashMap::new());
+    static WIT_CHANNELS: RefCell<HashMap<u64, Rc<wit_channel::Channel>>> = RefCell::new(HashMap::new());
 }
 
-fn register_channel(gid: u64, wit: Rc<wit::Channel>) {
+fn register_channel(gid: u64, wit: Rc<wit_channel::Channel>) {
     WIT_CHANNELS.with(|m| {
         m.borrow_mut().insert(gid, wit);
     });
 }
 
-fn lookup_channel(gid: u64) -> Option<Rc<wit::Channel>> {
+fn lookup_channel(gid: u64) -> Option<Rc<wit_channel::Channel>> {
     WIT_CHANNELS.with(|m| m.borrow().get(&gid).cloned())
 }
 
@@ -185,14 +186,14 @@ impl Channel {
     }
 
     /// The registry-resolved WIT handle.
-    fn wit(&self) -> Rc<wit::Channel> {
+    fn wit(&self) -> Rc<wit_channel::Channel> {
         lookup_channel(self.gid).expect("channel token resolves in the WIT registry")
     }
 
     /// Widen the ring to `n` cells (deeper run-ahead).
     pub fn capacity(self, n: u32) -> Channel {
         let dsl = self.dsl().capacity(n);
-        let wit = Rc::new(wit::Channel::new(
+        let wit = Rc::new(wit_channel::Channel::new(
             &dims_of(self.shape),
             to_wit_dtype(self.dtype),
             n,
@@ -256,7 +257,7 @@ impl Channel {
         } else {
             dsl
         };
-        let wit = Rc::new(wit::Channel::new(
+        let wit = Rc::new(wit_channel::Channel::new(
             &dims_of(shape),
             to_wit_dtype(dtype),
             capacity,
@@ -329,7 +330,7 @@ impl Channel {
 /// [`bytes`](Self::bytes) await the committed value.
 pub struct Taken {
     dsl: pie_dsl::Taken,
-    wit: Rc<wit::Channel>,
+    wit: Rc<wit_channel::Channel>,
     mode: TakenMode,
     dtype: DType,
 }
@@ -977,12 +978,12 @@ impl ForwardPass {
         }
         let traced = builder.build().map_err(|error| error.to_string())?;
         drop(builder);
-        let handles: Vec<Rc<wit::Channel>> = traced
+        let handles: Vec<Rc<wit_channel::Channel>> = traced
             .channel_order()
             .iter()
             .map(|gid| lookup_channel(*gid).expect("channel registered before submit"))
             .collect();
-        let borrows: Vec<&wit::Channel> = handles.iter().map(Rc::as_ref).collect();
+        let borrows: Vec<&wit_channel::Channel> = handles.iter().map(Rc::as_ref).collect();
         let bytes = traced.encode();
         self.wit.program(&bytes, &borrows)?;
         drop(inner);

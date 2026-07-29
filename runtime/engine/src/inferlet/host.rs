@@ -73,9 +73,11 @@ wasmtime::component::bindgen!({
         // pie:inferlet/grammar
         "pie:inferlet/grammar.grammar": grammar::Grammar,
         "pie:inferlet/grammar.matcher": grammar::Matcher,
-        // pie:inferlet/forward — first-class channels + forward-pass
-        // submission (the registry surface folded into forward-pass.new).
-        "pie:inferlet/forward.channel": forward::Channel,
+        // pie:inferlet/channel — hoisted out of forward so all three
+        // forward-pass interfaces can name the same channel type.
+        "pie:inferlet/channel.channel": forward::Channel,
+        // pie:inferlet/forward — forward-pass submission (the registry surface
+        // folded into forward-pass.new).
         "pie:inferlet/forward.forward-pass": forward::ForwardPass,
         // pie:inferlet/pipeline — the ordering domain (hoisted out of forward
         // so working-set mutators can take borrow<pipeline> without a cycle).
@@ -110,6 +112,7 @@ pub fn add_to_linker(
     pie::inferlet::model::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
     pie::inferlet::tokenizer::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
     pie::inferlet::grammar::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
+    pie::inferlet::channel::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
     pie::inferlet::forward::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
     pie::inferlet::session::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
     pie::inferlet::media::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;

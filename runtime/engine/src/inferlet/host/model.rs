@@ -32,6 +32,25 @@ impl pie::inferlet::model::Host for ProcessCtx {
         Ok(model::model().rs_caps().state_size > 0)
     }
 
+    /// Which forward-pass interface the bound model requires, over STATE
+    /// SEMANTICS rather than architecture name. Recurrent state is present iff
+    /// the driver handshake reports a non-zero folded-state size (the same
+    /// predicate `is_linear` uses); paged KV is present iff the model has a KV
+    /// page size. Today every registered linear model (Qwen3.5 GDN dense/MoE,
+    /// Nemotron-H Mamba2) interleaves attention layers and therefore reports
+    /// `hybrid`; `recurrent` is reachable only for a model with no KV at all.
+    async fn pass_kind(&mut self) -> Result<pie::inferlet::model::ForwardKind> {
+        use pie::inferlet::model::ForwardKind;
+        let model = model::model();
+        let has_rs = model.rs_caps().state_size > 0;
+        let has_kv = model.kv_page_size() > 0;
+        Ok(match (has_kv, has_rs) {
+            (_, false) => ForwardKind::Attention,
+            (true, true) => ForwardKind::Hybrid,
+            (false, true) => ForwardKind::Recurrent,
+        })
+    }
+
     /// LM-head output dimension = `hf_config.vocab_size` (e.g. 151936 for
     /// qwen3), NOT the tokenizer vocab — the vocab the recognizer / program
     /// lowering targets. Sourced from the model config, not hardcoded.

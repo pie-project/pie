@@ -1,0 +1,53 @@
+// The channel resource, hoisted out of `forward` so that every forward-pass
+// interface (`forward`, `forward-recurrent`, `forward-hybrid`) can name the
+// SAME type. Declaring it per interface would mint three incompatible types
+// and no channel handle could be bound into more than one of them.
+//
+// Nothing outside the forward-pass surface referenced `channel` before this
+// split, so the extraction introduces no interface cycle.
+
+interface channel {
+    use types.{error, shape, dtype, data};
+
+    /// A GPU-resident bounded queue of cells with full/empty bits. Guest-
+    /// constructed and first-class: the SAME handle is bound into a forward pass
+    /// (by dense declaration index, via `forward-pass.program`) and used for host
+    /// `put`/`set`/`take`/`read`. `Channel::from(v)` in the DSL is constructor +
+    /// `put(v)`.
+    ///
+    /// The shape/dtype/capacity must match the container's declaration for the
+    /// index the handle is bound at — `forward-pass.program` validates this.
+    /// Direction comes from the container (`host-role`): a host-writer channel
+    /// takes `put`; a host-reader channel yields `take`/`read`. Before binding,
+    /// `put` stages freely (a seed or an early Writer cell); staged puts
+    /// coalesce into the next submit. A poisoned channel surfaces an
+    /// `error` instead of hanging (the `?` in `out.take().get::<T>().await?`).
+    resource channel {
+        constructor(shape: shape, dtype: dtype, capacity: u32);
+
+        /// Hand a value to the device. On a `seeded` channel before the first
+        /// fire this is the seed; on a host-writer channel it is the next
+        /// staged cell (empty -> fill; full -> back-pressure). `bool` payloads
+        /// are dtype-native (1 byte per bool); the wire packs to bits.
+        put:  func(value: data) -> result<_, error>;
+
+        /// Atomically replace the committed front cell without changing queue
+        /// occupancy. This is a fused take+put: it never exposes an empty slot,
+        /// never enqueues, and leaves any later put queued for the next fire
+        /// untouched. Errors when the channel is empty, poisoned/closed, or
+        /// its front is currently claimed by an in-flight fire.
+        set:  func(value: data) -> result<_, error>;
+
+        /// Move a committed value out to the host (host-reader channels). Full
+        /// -> value + empty the cell. Empty -> BLOCKS by awaiting the pass's
+        /// in-flight fires (submit order) until the cell fills; errors when no
+        /// in-flight fire remains (nothing will ever fill it) or the channel
+        /// is poisoned — a fire that feeds it failed, and the error carries
+        /// that fire's failure (under run-ahead, poison IS the error channel).
+        take: async func() -> result<data, error>;
+
+        /// Copy a committed value to the host, leaving the cell full. Same
+        /// await/poison discipline as `take`.
+        read: async func() -> result<data, error>;
+    }
+}

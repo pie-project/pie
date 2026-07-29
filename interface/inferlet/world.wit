@@ -6,6 +6,7 @@ world inferlet {
     import tokenizer;
     import pipeline;
     import working-set;
+    import channel;
     import forward;
     import grammar;
     import chat;

@@ -238,6 +238,11 @@ async fn materialize_channel(
     }
 }
 
+/// The `channel` interface declares no free functions — only the `channel`
+/// resource — but `add_to_linker` still requires the interface-level `Host`
+/// bound, so this impl is empty by construction.
+impl pie::inferlet::channel::Host for ProcessCtx {}
+
 impl pie::inferlet::forward::Host for ProcessCtx {
     /// Frame submission (`forward.submit(on, slots)`): exactly
     /// `model.frame-size()` ordered slots; slot i executes in wave i; `none`
@@ -262,7 +267,7 @@ impl pie::inferlet::forward::Host for ProcessCtx {
     }
 }
 
-impl pie::inferlet::forward::HostChannel for ProcessCtx {
+impl pie::inferlet::channel::HostChannel for ProcessCtx {
     async fn new(
         &mut self,
         shape: Vec<u32>,
@@ -324,7 +329,7 @@ impl pie::inferlet::forward::HostChannel for ProcessCtx {
     }
 }
 
-impl pie::inferlet::forward::HostChannelWithStore<ProcessCtx> for HasSelf<ProcessCtx> {
+impl pie::inferlet::channel::HostChannelWithStore<ProcessCtx> for HasSelf<ProcessCtx> {
     /// The direct-wake await point (plan §4.5): while the cell is empty,
     /// non-blockingly drain already-settled pipeline ops (their KV/RS txns
     /// finalize here, bounding pin float), then park on the channel's reader
