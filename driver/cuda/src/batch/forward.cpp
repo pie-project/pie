@@ -703,6 +703,10 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
         : nullptr;
     fwd_in.rs_buffer_slot_ids_h    = in.rs_buffer_slot_ids_h;
     fwd_in.rs_buffer_slot_indptr_h = in.rs_buffer_slot_indptr_h;
+    fwd_in.rs_buffer_read_slot_ids_h = in.rs_buffer_read_slot_ids_h;
+    fwd_in.rs_buffer_read_indptr_h   = in.rs_buffer_read_indptr_h;
+    fwd_in.rs_buffer_read_lens_h     = in.rs_buffer_read_lens_h;
+    fwd_in.rs_buffer_heads_h         = in.rs_buffer_heads_h;
     fwd_in.rs_fold_lens_h           = in.rs_fold_lens_h;
     fwd_in.rs_fold_lens_d           = in.rs_fold_lens_d;
     fwd_in.rs_buffer_write         = in.rs_buffer_write;

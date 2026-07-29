@@ -1211,16 +1211,23 @@ void prepare_step(
     s.rs_buf_indptr_view = s.composed_ready
         ? std::span<const std::uint32_t>(s.composed.rs_buffer_slot_indptr)
         : view.rs_buffer_slot_indptr.as<std::uint32_t>();
-    // Read side: host-only, so no device staging. Descriptor-composed batches
-    // do not carry it yet -- a channel-resolved rs-geometry cannot name a
-    // replay span, so a composed batch always replays nothing.
-    if (!s.composed_ready) {
-        s.rs_buf_read_id_view = view.rs_buffer_read_slot_ids.as<std::uint32_t>();
-        s.rs_buf_read_indptr_view =
-            view.rs_buffer_read_indptr.as<std::uint32_t>();
-        s.rs_buf_read_len_view = view.rs_buffer_read_lens.as<std::uint32_t>();
-        s.rs_buf_head_view = view.rs_buffer_heads.as<std::uint32_t>();
-    }
+    // Read side: host-only, so no device staging -- a replay span is a
+    // property of the working set's occupancy, which a channel-resolved
+    // rs-geometry cannot name. It still travels through composition, because
+    // composition REORDERS requests (wire programs first, device-geometry
+    // ones after) and the read rows have to follow their own requests.
+    s.rs_buf_read_id_view = s.composed_ready
+        ? std::span<const std::uint32_t>(s.composed.rs_buffer_read_slot_ids)
+        : view.rs_buffer_read_slot_ids.as<std::uint32_t>();
+    s.rs_buf_read_indptr_view = s.composed_ready
+        ? std::span<const std::uint32_t>(s.composed.rs_buffer_read_indptr)
+        : view.rs_buffer_read_indptr.as<std::uint32_t>();
+    s.rs_buf_read_len_view = s.composed_ready
+        ? std::span<const std::uint32_t>(s.composed.rs_buffer_read_lens)
+        : view.rs_buffer_read_lens.as<std::uint32_t>();
+    s.rs_buf_head_view = s.composed_ready
+        ? std::span<const std::uint32_t>(s.composed.rs_buffer_heads)
+        : view.rs_buffer_heads.as<std::uint32_t>();
     s.rs_has_buffer_read =
         !s.rs_buf_read_len_view.empty() &&
         std::any_of(

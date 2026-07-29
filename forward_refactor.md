@@ -1126,6 +1126,95 @@ Metal refuses a non-zero head for the same reason it refuses a non-zero read:
 its loops are still logical, and a wrong recurrent state gets folded and cannot
 be recovered.
 
+### 10.2.3 One fire can append AND fold — LANDED
+
+Until now a fire either wrote its tokens to the buffer or folded them, never
+both. `rs_plan_for` refused `fold-len == b + t` whenever `b != 0`, telling the
+guest to "fold and buffer in separate fires". That refusal cost a whole extra
+forward pass for the commonest speculative shape there is: buffer a draft,
+then accept it and keep going.
+
+It turns out to need no kernel work at all. The extended layout `[b | t]` IS
+the row's buffer token space, so when the fold takes the WHOLE extended row
+the boundary is the LAST extended token — exactly where the FLA's ordinary
+end-of-sequence state writeback already lands. The change is one bit of
+routing: `write_state` was being forced false for every buffered pass (a
+buffered pass must not disturb the folded state); it now stays true when the
+pass also folds.
+
+`RsPlan::Buffer` therefore carries `fold_tokens` per row, and the planner's
+classification runs in this order — the order matters:
+
+```
+n == 0            -> Buffer   pure append; extended layout when b > 0
+n == b + t, b==0  -> Fold     plain in-forward advance, no buffer at all
+n == b + t, b!=0  -> Buffer   write-and-fold
+n <= b            -> Commit   FoldBuffered; the rows ARE the replay
+otherwise         -> REFUSED  boundary strictly inside the new tokens
+```
+
+`n == 0` has to be tested first: with `b > 0` it otherwise falls into `n <= b`
+and calls `validate_fold(0)`, which rejects a zero-token fold.
+
+The store needed the same unbundling. `RsPreparedWrite.buffer_span` now
+carries an explicit `RsBufferIntent`: a `Write` span bumps `buffer_fill`, a
+`Replay` span does not. The old heuristic — "a span on a folding row must be a
+replay" — is exactly what a write-and-fold breaks. `publish_prevalidated` also
+had to be reordered to write, then count, then `advance_fold`, since the fold's
+arithmetic is over the POST-write buffer.
+
+On the wire, `RS_FLAG_FOLD` can no longer discriminate: a pure commit and a
+write-and-fold both set it but take opposite driver paths (gather-from-slabs
+vs. extended layout). A new orthogonal bit `PIE_RS_FLAG_BUFFER_WRITE` marks
+"this row's buffer span is a write", and `plan_rs_execution` gates its fold
+detection on it. ABI 22 -> 23.
+
+#### Why the interior boundary is still refused
+
+`b < n < b + t` — the boundary landing strictly INSIDE the fire's own new
+tokens — stays refused, and the refusal message now says why.
+
+The obvious implementation is `commit_len`, which the chunked FLA already
+takes. It does not work: `causal_conv1d.cu` and `gated_delta_net.cu` both do
+`if (c < Nr) Nr = c;`. `commit_len` TRUNCATES the sequence. That is right for
+the commit-advance replay, which is state-only and discards its outputs, but a
+fire folding at an interior boundary still owes logits for every one of its
+tokens — and the tokens past the boundary would get none. Measured directly:
+the fold landed on the right token, and the last token's logits were wrong.
+
+The shape that would work is two FLA calls over a 2R-segment layout tiling the
+extended array exactly — `[qo_ext[r], qo_ext[r]+n_r)` and
+`[qo_ext[r]+n_r, qo_ext[r+1])` — the first with `slot_ids = [slot_r, -1, ...]`
+and `write_state=true`, the second with `[-1, slot_r, ...]` and
+`write_state=false`, chained on the same stream through the state the first
+just wrote. Both kernels early-return on a negative slot and leave `out`
+untouched, so each call fills its own half. It costs a second launch per layer
+and has to be replicated across every FLA variant, so it is deferred.
+
+#### The read path had never actually run
+
+Landing this exposed that §10.2 and §10.2.2 were dead code on the GPU. Two
+independent gaps swallowed the read side between the wire and the kernels:
+
+- `run_forward_dispatch` copied the buffer WRITE CSR into `ForwardInputs` but
+  not `rs_buffer_read_*` or `rs_buffer_heads`, so `has_buffer_read` was always
+  false and the extended layout was never built.
+- `batch_compose` never carried the read side either. Every fire in this engine
+  is descriptor-composed, and composition REORDERS requests (wire programs
+  first, device-geometry ones after), so the read rows have to be permuted with
+  everything else. They are host-derived and translation-free — a replay span
+  is a property of the working set's occupancy, which a channel-resolved
+  `rs-geometry` cannot name — but they still have to travel through `append_rs`.
+
+The existing read-path tests passed because their fold shapes all routed to
+`FoldBuffered`, which gathers through the WRITE CSR. Only a fire that writes
+and reads in the same pass distinguishes them, which is what
+`a_fire_can_append_to_a_buffer_and_fold_through_it` now does: it appends two
+tokens onto a two-token buffer and folds all four, then compares against the
+same four tokens folded two fires at a time — continuing BOTH arms one token
+further, so agreement pins the folded state and not merely the logits along
+the way.
+
 ### 10.3 `mtp-native-verify` rewritten as fold-commit — LANDED
 
 The Tier-1.5 acceptance test was broken in two independent ways, both of which

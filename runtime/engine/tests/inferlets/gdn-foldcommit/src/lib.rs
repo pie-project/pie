@@ -36,6 +36,197 @@ use inferlet::{Result, model as wit_model};
 /// Tokens written in the buffered (speculative) chunk.
 const SPEC_TOKENS: u32 = 4;
 
+/// One arm of the `inside` comparison: a fresh context, prefilled with the
+/// prompt, then some number of fires over the SAME four continuation tokens.
+/// Everything is parameterised so the two arms differ only in how the fires
+/// are cut, never in what they compute.
+struct Arm {
+    ws: WorkingSet,
+    rs: RsWorkingSet,
+    page_size: u32,
+    rs_page: u32,
+    max_pages: u32,
+    pos: u32,
+}
+
+impl Arm {
+    /// Prefill `prompt` with the default fold, returning the greedy token.
+    async fn open(prompt: &[u32], max_pages: u32, pipe: &Pipeline) -> Result<(Self, i32)> {
+        let ws = WorkingSet::new();
+        let rs = RsWorkingSet::new();
+        let page_size = ws.page_size();
+        ws.reserve(max_pages)
+            .map_err(|e| format!("ws.reserve: {e}"))?;
+        let mut arm = Arm {
+            ws,
+            rs,
+            page_size,
+            rs_page: inferlet::model::rs_buffer_page_size().max(1),
+            max_pages,
+            pos: 0,
+        };
+        let g0 = arm.fire(prompt, None, pipe, "prefill").await?;
+        arm.pos = prompt.len() as u32;
+        Ok((arm, g0.unwrap_or(0)))
+    }
+
+    /// One fire over `toks`.
+    ///
+    /// `buffered` is `Some((buffer_start, fold_len))`: the fire scatters its
+    /// tokens into the buffer starting at logical token `buffer_start` and
+    /// folds `fold_len` of the resulting buffer. `fold_len == 0` is a pure
+    /// append; `0 < fold_len < buffer_start + toks.len()` is the boundary
+    /// landing strictly INSIDE this fire's own tokens. `None` is the plain
+    /// in-forward fold that touches no buffer at all.
+    async fn fire(
+        &self,
+        toks: &[u32],
+        buffered: Option<(u32, u32)>,
+        pipe: &Pipeline,
+        tag: &str,
+    ) -> Result<Option<i32>> {
+        let t = toks.len() as u32;
+        let base = self.pos;
+        let end = base + t;
+        let ps = self.page_size;
+        let ch = |v: Vec<u32>| Channel::from(v);
+
+        let fwd = ForwardPass::new();
+        fwd.embed(
+            &Channel::from(toks.iter().map(|&x| x as i32).collect::<Vec<_>>()),
+            &ch(vec![0, t]),
+        )?;
+        fwd.attention(
+            &self.ws,
+            ..,
+            ..,
+            &ch(vec![end]),
+            &ch((0..self.max_pages).collect()),
+            &ch(vec![0, end.div_ceil(ps)]),
+            &ch((base..end).map(|p| p / ps).collect()),
+            &ch((base..end).map(|p| p % ps).collect()),
+            &ch((base..end).collect()),
+            None,
+        )?;
+        match buffered {
+            None => fwd.recurrent(std::slice::from_ref(&self.rs))?,
+            Some((start, fold_len)) => {
+                let rp = self.rs_page;
+                // The write span is [start, start + t) in LOGICAL buffer
+                // tokens; the runtime resolves it against the physical head.
+                let first = start / rp;
+                let last = (start + t - 1) / rp;
+                let pages: Vec<u32> = (first..=last).collect();
+                let count = pages.len() as u32;
+                fwd.recurrent_with(
+                    std::slice::from_ref(&self.rs),
+                    &ch(vec![fold_len]),
+                    ..,
+                    ..,
+                    &ch(vec![t]),
+                    &ch(pages),
+                    &ch(vec![0, count]),
+                    &ch((start..start + t).map(|x| x / rp - first).collect()),
+                    &ch((start..start + t).map(|x| x % rp).collect()),
+                )
+                .map_err(|e| format!("{tag} recurrent binding: {e}"))?;
+            }
+        }
+        let out = Channel::new([1], dtype::i32).named("arm_out");
+        let sink = out.clone();
+        fwd.epilogue(move || {
+            let t = reduce_argmax(intrinsics::logits());
+            sink.put(&t);
+        });
+        fwd.submit(pipe)
+            .map_err(|e| format!("{tag} submit: {e}"))?;
+        Ok(Some(
+            out.take()
+                .get::<i32>()
+                .await
+                .map_err(|e| format!("{tag} take: {e}"))?[0],
+        ))
+    }
+}
+
+/// A fold running THROUGH a non-empty buffer, in the same fire that fills it.
+///
+/// Arm A appends two tokens onto a buffer that already holds two, and folds
+/// all four in that one fire. The buffered pair has to be replayed ahead of
+/// the new pair (the read path), and the folded boundary has to land past
+/// both -- so this is a write and a fold at once, over the extended layout.
+///
+/// Arm B computes the same four tokens the long way: fold the first two
+/// outright, then fold the last two outright. Both arms must agree, and
+/// because the comparison is drawn AFTER the fold -- each arm continues from
+/// its own resulting state -- agreement pins the folded state itself, not
+/// merely the logits along the way.
+async fn fold_inside_new_tokens(prompt: &[u32]) -> Result<String> {
+    const T: usize = 4;
+    const HALF: u32 = 2;
+
+    let n = prompt.len() as u32;
+    let pipe = Pipeline::new();
+    let probe = WorkingSet::new();
+    let max_pages = (n + 2 * T as u32 + 1).div_ceil(probe.page_size());
+    drop(probe);
+
+    let (mut a, g0) = Arm::open(prompt, max_pages, &pipe).await?;
+    let (mut b, g0b) = Arm::open(prompt, max_pages, &pipe).await?;
+    if g0 != g0b {
+        return Err(format!("arms disagree on the prefill token: {g0} vs {g0b}"));
+    }
+    let cont: Vec<u32> = vec![g0 as u32; T];
+
+    // Arm A: buffer the first pair, then append the second pair AND fold all
+    // four -- the write-and-fold through a non-empty buffer.
+    a.rs.alloc_buffer((T as u32).div_ceil(a.rs_page))
+        .map_err(|e| format!("A alloc_buffer: {e}"))?;
+    a.fire(&cont[..HALF as usize], Some((0, 0)), &pipe, "A-buffer")
+        .await?;
+    a.pos += HALF;
+    let a_last = a
+        .fire(
+            &cont[HALF as usize..],
+            Some((HALF, T as u32)),
+            &pipe,
+            "A-append-and-fold",
+        )
+        .await?
+        .unwrap_or(0);
+    a.pos += HALF;
+
+    // Arm B: the same four tokens, folded two fires at a time.
+    b.fire(&cont[..HALF as usize], None, &pipe, "B-fold-1").await?;
+    b.pos += HALF;
+    let b_last = b
+        .fire(&cont[HALF as usize..], None, &pipe, "B-fold-2")
+        .await?
+        .unwrap_or(0);
+    b.pos += HALF;
+
+    // Now compare the STATES the two arms arrived at, by continuing each one
+    // token further. If arm A's fold had missed the buffered pair (or replayed
+    // it twice) this is where it shows.
+    let next = vec![b_last as u32];
+    let a_next = a.fire(&next, None, &pipe, "A-next").await?.unwrap_or(0);
+    let b_next = b.fire(&next, None, &pipe, "B-next").await?.unwrap_or(0);
+
+    pipe.close();
+
+    let agree = a_last == b_last && a_next == b_next;
+    let result = format!(
+        "foldthrough tokens={T} buffered={HALF} a_last={a_last} b_last={b_last} \
+         a_next={a_next} b_next={b_next} agree={}",
+        if agree { "yes" } else { "no" }
+    );
+    eprintln!("[GDN_FOLDCOMMIT] {result}");
+    if !agree {
+        return Err(result);
+    }
+    Ok(result)
+}
+
 #[inferlet::main]
 async fn main(input: String) -> Result<String> {
     // `chain` folds a strict prefix so the buffer keeps an unfolded tail, then
@@ -50,6 +241,12 @@ async fn main(input: String) -> Result<String> {
 
     if !wit_model::is_linear() {
         return Ok("skipped: fold-commit needs a linear model".to_string());
+    }
+
+    if input.trim() == "inside" {
+        let prompt = wit_model::encode("hello world");
+        let prompt: Vec<u32> = if prompt.is_empty() { vec![0] } else { prompt };
+        return fold_inside_new_tokens(&prompt).await;
     }
 
     let ws = WorkingSet::new();

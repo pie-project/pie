@@ -59,7 +59,7 @@ use std::collections::HashMap;
 
 use crate::store::genmap::{GenKey, GenMap};
 use crate::store::pool::{Pool, PoolId};
-use write::{RsBufferTarget, RsPreparedWrite, RsPublished, RsStateTarget};
+use write::{RsBufferIntent, RsBufferTarget, RsPreparedWrite, RsPublished, RsStateTarget};
 
 /// Marker for RS WorkingSet ids.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -414,7 +414,7 @@ impl RsStore {
         write_state: bool,
         buffer_tokens: Option<(u32, u32)>,
     ) -> Result<RsPreparedWrite, RsError> {
-        self.prepare(ws, write_state, None, buffer_tokens, None)
+        self.prepare(ws, write_state, None, buffer_tokens, RsBufferIntent::Write, None)
     }
 
     /// Prepare a folded-state write from caller-owned reserved slots,
@@ -425,7 +425,7 @@ impl RsStore {
         ws: RsWorkingSetId,
         granted: &mut Vec<RsSlotId>,
     ) -> Result<RsPreparedWrite, RsError> {
-        self.prepare(ws, true, None, None, Some(granted))
+        self.prepare(ws, true, None, None, RsBufferIntent::Write, Some(granted))
     }
 
     /// The general prepare: any combination of a folded-state write, an
@@ -438,11 +438,12 @@ impl RsStore {
         write_state: bool,
         fold_tokens: Option<u32>,
         buffer_tokens: Option<(u32, u32)>,
+        buffer_intent: RsBufferIntent,
     ) -> Result<RsPreparedWrite, RsError> {
         if let Some(tokens) = fold_tokens {
             self.validate_fold(ws, tokens)?;
         }
-        self.prepare(ws, write_state, fold_tokens, buffer_tokens, None)
+        self.prepare(ws, write_state, fold_tokens, buffer_tokens, buffer_intent, None)
     }
 
     /// [`prepare_general`] from caller-owned reserved slots (the acquisition
@@ -453,12 +454,20 @@ impl RsStore {
         write_state: bool,
         fold_tokens: Option<u32>,
         buffer_tokens: Option<(u32, u32)>,
+        buffer_intent: RsBufferIntent,
         granted: &mut Vec<RsSlotId>,
     ) -> Result<RsPreparedWrite, RsError> {
         if let Some(tokens) = fold_tokens {
             self.validate_fold(ws, tokens)?;
         }
-        self.prepare(ws, write_state, fold_tokens, buffer_tokens, Some(granted))
+        self.prepare(
+            ws,
+            write_state,
+            fold_tokens,
+            buffer_tokens,
+            buffer_intent,
+            Some(granted),
+        )
     }
 
     /// Phase-A demand: slots a folded-state write for `ws` would allocate
@@ -510,7 +519,7 @@ impl RsStore {
         tokens: u32,
     ) -> Result<RsPreparedWrite, RsError> {
         self.validate_fold(ws, tokens)?;
-        self.prepare(ws, true, Some(tokens), None, None)
+        self.prepare(ws, true, Some(tokens), None, RsBufferIntent::Replay, None)
     }
 
     fn prepare(
@@ -519,6 +528,7 @@ impl RsStore {
         write_state: bool,
         fold_tokens: Option<u32>,
         buffer_tokens: Option<(u32, u32)>,
+        buffer_intent: RsBufferIntent,
         reserved: Option<&mut Vec<RsSlotId>>,
     ) -> Result<RsPreparedWrite, RsError> {
         let (folded, buffer_targets_src) = {
@@ -615,7 +625,9 @@ impl RsStore {
             state,
             buffers,
             allocated,
-            buffer_span: buffer_tokens.filter(|(_, len)| *len > 0),
+            buffer_span: buffer_tokens
+                .filter(|(_, len)| *len > 0)
+                .map(|(start, len)| (start, len, buffer_intent)),
             seq: self.seq,
         })
     }
@@ -679,9 +691,6 @@ impl RsStore {
                     self.decref(old, epoch);
                 }
             }
-            if let Some(tokens) = state.fold_tokens {
-                self.advance_fold(ws, tokens, epoch);
-            }
         }
 
         for target in &prepared.buffers {
@@ -703,20 +712,24 @@ impl RsStore {
 
         // Exact occupancy: the write covers tokens [start, start+len), so the
         // buffer now holds at least start+len. `max` (not `+=`) because a
-        // rewrite of an already-buffered span must not double-count.
+        // rewrite of an already-buffered span must not double-count. A
+        // `Replay` span is a gather, not a write, and is not counted at all.
         //
-        // A FOLD's span is a GATHER, not a write: it names the pages the
-        // recurrence replays on its way into the folded state, and those
-        // tokens leave the buffer rather than joining it. Counting it here
-        // would re-add what `advance_fold` just subtracted, inflating the
-        // buffer past what it holds whenever the fold took more than half.
-        let folded_tokens = prepared
-            .state
-            .as_ref()
-            .and_then(|state| state.fold_tokens);
-        if let (Some((start, len)), None) = (prepared.buffer_span, folded_tokens) {
+        // This runs BEFORE the fold. A fire may do both — buffer its new
+        // tokens and fold a prefix of the resulting buffer in the same pass —
+        // and the fold's arithmetic is over the buffer the write leaves
+        // behind, not the one it found.
+        if let Some((start, len, RsBufferIntent::Write)) = prepared.buffer_span {
             let entry = self.entry_mut(ws).expect("batch prevalidated");
             entry.buffer_fill = entry.buffer_fill.max(start.saturating_add(len));
+        }
+
+        if let Some(tokens) = prepared
+            .state
+            .as_ref()
+            .and_then(|state| state.fold_tokens)
+        {
+            self.advance_fold(ws, tokens, epoch);
         }
     }
 

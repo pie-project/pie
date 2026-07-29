@@ -110,8 +110,16 @@
  * the survivors keep their offsets. Every buffer span the driver walks is
  * therefore `head + logical`. Zero for a buffer that was never partially
  * folded, which is why this was invisible until the replay path landed.
+ * v23: `PIE_RS_FLAG_BUFFER_WRITE` — a new bit in `rs_slot_flags` marking a
+ * row whose buffer span is a WRITE. Orthogonal to `PIE_RS_FLAG_FOLD`: a pass
+ * may scatter its own tokens into the buffer AND fold a prefix of the result
+ * in one go, and the two flags together are what tell a write-and-fold (run
+ * the extended `[buffered | new]` layout, snapshot the state at
+ * `rs_fold_lens[r]`) apart from a pure commit (whose rows ARE the replay).
+ * No struct grew, but an older driver rejects the unknown bit, so drivers and
+ * workers ship together.
  */
-#define PIE_DRIVER_ABI_VERSION 22
+#define PIE_DRIVER_ABI_VERSION 23
 
 #define PIE_MODEL_COMPONENT_FULL 0
 
@@ -192,6 +200,16 @@
  * Fold buffered recurrent-state data into the slot after the pass.
  */
 #define PIE_RS_FLAG_FOLD 2
+
+/**
+ * The pass SCATTERS its own tokens into the buffer. Orthogonal to `FOLD`: a
+ * pass may write the buffer and fold a prefix of the result in one go, and
+ * the two together are what distinguishes a write-and-fold (which runs the
+ * extended `[buffered | new]` layout and snapshots the state at
+ * `rs_fold_lens[r]`) from a pure commit (whose rows ARE the replay, gathered
+ * straight from the slabs).
+ */
+#define PIE_RS_FLAG_BUFFER_WRITE 4
 
 /**
  * Concrete F32 channel element type.
@@ -381,6 +399,8 @@
 #define RS_FLAG_RESET 1
 
 #define RS_FLAG_FOLD 2
+
+#define RS_FLAG_BUFFER_WRITE 4
 
 #define REMOTE_WIRE_VERSION 8
 

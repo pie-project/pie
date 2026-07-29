@@ -793,6 +793,8 @@ void linear_attn_body(
     const std::uint32_t* rs_buffer_slot_ids_h = nullptr,
     const std::uint32_t* rs_buffer_slot_indptr_h = nullptr,
     bool rs_buffer_write = false,
+    // The buffered write folds the WHOLE extended row into the state.
+    bool rs_fold_after_write = false,
     bool rs_buffer_fold = false,
     // Buffer READ path -- see qwen3_5_forward.cpp's linear_attn_layer_body for
     // the full rationale; this body mirrors it against MoE weights.
@@ -848,8 +850,15 @@ void linear_attn_body(
     };
     // Frozen verify: produce outputs but persist no recurrent/conv state (the
     // repair forward advances it through [input|accepted]). See qwen3_5_forward.
+    // A buffered write leaves the folded state alone -- UNLESS it also folds.
+    // The extended `[buffered | new]` layout IS the row's buffer token space,
+    // so when the fold takes the WHOLE of it the boundary is the last extended
+    // token and the ordinary end-of-sequence writeback already lands there.
+    // (A boundary strictly inside is a different problem: `commit_len`
+    // truncates the sequence rather than just moving the snapshot, so the
+    // tokens past it would get no outputs. The planner refuses that.)
     const bool write_state =
-        !state_cache.verify_frozen() && !rs_buffer_write;
+        !state_cache.verify_frozen() && (!rs_buffer_write || rs_fold_after_write);
 
     const void* z_data = la.z.data();
     const void* a_data = la.a.data();
@@ -2372,6 +2381,7 @@ void qwen3_5_moe_forward_paged(
     const std::uint32_t* rs_buffer_slot_ids_h,
     const std::uint32_t* rs_buffer_slot_indptr_h,
     const std::int32_t* rs_fold_lens,
+    const std::uint32_t* rs_fold_lens_h,
     bool rs_buffer_write,
     bool rs_buffer_fold,
     const std::uint32_t* rs_buffer_read_slot_ids_h,
@@ -2410,6 +2420,15 @@ void qwen3_5_moe_forward_paged(
     const int V  = cfg.vocab_size;
     const int N  = total_tokens;
     const int R  = num_requests;
+    // A buffered write that ALSO folds: the boundary is a `commit_len` over
+    // the extended layout rather than a separate replay pass, so it rides the
+    // ordinary write path. `rs_fold_lens` is emitted for every row of every
+    // buffered pass, so an all-zero one means "pure append" and must not turn
+    // the pass into a fold.
+    const bool write_folds =
+        rs_buffer_write && rs_fold_lens_h != nullptr &&
+        std::any_of(rs_fold_lens_h, rs_fold_lens_h + R,
+                    [](std::uint32_t n) { return n != 0; });
     const float eps = cfg.rms_norm_eps;
     cudaStream_t stream = cublas.stream();
 
@@ -2536,7 +2555,8 @@ void qwen3_5_moe_forward_paged(
                 cublas, stream, &profile,
                 rs_buffer_fold ? rs_fold_lens : nullptr,
                 rs_buffer_slot_ids_h, rs_buffer_slot_indptr_h,
-                /*rs_buffer_write=*/false, rs_buffer_fold,
+                /*rs_buffer_write=*/false, /*rs_fold_after_write=*/false,
+                rs_buffer_fold,
                 // A fold IS the replay; it never carries a read as well. It
                 // still needs the head: its own gather is physical.
                 nullptr, nullptr, nullptr, rs_buffer_heads_h,
@@ -2574,7 +2594,8 @@ void qwen3_5_moe_forward_paged(
                     slot_ids_h, slot_ids_d, qo_indptr_h, qo_indptr,
                     cublas, stream, &profile, /*commit_len=*/nullptr,
                     rs_buffer_slot_ids_h, rs_buffer_slot_indptr_h,
-                    rs_buffer_write, /*rs_buffer_fold=*/false,
+                    rs_buffer_write, /*rs_fold_after_write=*/write_folds,
+                    /*rs_buffer_fold=*/false,
                     has_buffer_read ? rs_buffer_read_slot_ids_h : nullptr,
                     has_buffer_read ? rs_buffer_read_indptr_h : nullptr,
                     has_buffer_read ? rs_buffer_read_lens_h : nullptr,

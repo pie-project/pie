@@ -483,6 +483,8 @@ void linear_attn_layer_body(
     const std::uint32_t* rs_buffer_slot_ids_h = nullptr,
     const std::uint32_t* rs_buffer_slot_indptr_h = nullptr,
     bool rs_buffer_write = false,
+    // The buffered write folds the WHOLE extended row into the state.
+    bool rs_fold_after_write = false,
     bool rs_buffer_fold = false,
     // Buffer READ path: the prefix of already-buffered tokens each request
     // must replay before its own. `qo_ext_*` is the resulting per-request
@@ -557,7 +559,15 @@ void linear_attn_layer_body(
     // state as usual. Activation replay is the sole spec path now: the FLA, conv
     // and warp-tiled all honor write_state uniformly — frozen verify persists
     // nothing, the commit-advance replay (verify_frozen reset to false) writes.
-    const bool write_state = !state_cache.verify_frozen() && !rs_buffer_write;
+    // A buffered write leaves the folded state alone -- UNLESS it also folds.
+    // The extended `[buffered | new]` layout IS the row's buffer token space,
+    // so when the fold takes the WHOLE of it the boundary is the last extended
+    // token and the ordinary end-of-sequence writeback already lands there.
+    // (A boundary strictly inside is a different problem: `commit_len`
+    // truncates the sequence rather than just moving the snapshot, so the
+    // tokens past it would get no outputs. The planner refuses that.)
+    const bool write_state =
+        !state_cache.verify_frozen() && (!rs_buffer_write || rs_fold_after_write);
 
     // ── In-projections (or activation-replay load) ────────────────
     // Activation-replay stash layout per linear layer (bf16, max_tokens stride):
@@ -1742,6 +1752,7 @@ void qwen3_5_forward_paged(
     const std::uint32_t* rs_buffer_slot_ids_h,
     const std::uint32_t* rs_buffer_slot_indptr_h,
     const std::int32_t* rs_fold_lens,
+    const std::uint32_t* rs_fold_lens_h,
     bool rs_buffer_write,
     bool rs_buffer_fold,
     const std::uint32_t* rs_buffer_read_slot_ids_h,
@@ -1780,6 +1791,15 @@ void qwen3_5_forward_paged(
         commit_advance_gather != nullptr || rs_buffer_fold;
     const std::int32_t* commit_lens =
         rs_buffer_fold ? rs_fold_lens : commit_advance_gather;
+    // A buffered write that ALSO folds: the boundary is a `commit_len` over
+    // the extended layout rather than a separate replay pass, so it rides the
+    // ordinary write path. `rs_fold_lens` is emitted for every row of every
+    // buffered pass, so an all-zero one means "pure append" and must not turn
+    // the pass into a fold.
+    const bool write_folds =
+        rs_buffer_write && rs_fold_lens_h != nullptr &&
+        std::any_of(rs_fold_lens_h, rs_fold_lens_h + R,
+                    [](std::uint32_t n) { return n != 0; });
     if ((rs_buffer_write || rs_buffer_fold) &&
         (rs_buffer_slot_ids_h == nullptr ||
          rs_buffer_slot_indptr_h == nullptr ||
@@ -1915,7 +1935,8 @@ void qwen3_5_forward_paged(
                 slot_ids_h, slot_ids_d, qo_indptr_h, qo_indptr,
                 cublas, stream, &profile, /*commit_len=*/commit_lens,
                 rs_buffer_slot_ids_h, rs_buffer_slot_indptr_h,
-                /*rs_buffer_write=*/false, rs_buffer_fold,
+                /*rs_buffer_write=*/false, /*rs_fold_after_write=*/false,
+                rs_buffer_fold,
                 // A fold IS the replay; it never carries a read as well. It
                 // still needs the head: its own gather is physical.
                 nullptr, nullptr, nullptr, rs_buffer_heads_h,
@@ -1944,7 +1965,8 @@ void qwen3_5_forward_paged(
                     slot_ids_h, slot_ids_d, qo_indptr_h, qo_indptr,
                     cublas, stream, &profile, /*commit_len=*/nullptr,
                     rs_buffer_slot_ids_h, rs_buffer_slot_indptr_h,
-                    rs_buffer_write, /*rs_buffer_fold=*/false,
+                    rs_buffer_write, /*rs_fold_after_write=*/write_folds,
+                    /*rs_buffer_fold=*/false,
                     has_buffer_read ? rs_buffer_read_slot_ids_h : nullptr,
                     has_buffer_read ? rs_buffer_read_indptr_h : nullptr,
                     has_buffer_read ? rs_buffer_read_lens_h : nullptr,

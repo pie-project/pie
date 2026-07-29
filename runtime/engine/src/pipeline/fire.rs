@@ -402,9 +402,13 @@ fn bound_rs_working_set_ids<C: FireContext>(
 /// refused:
 ///
 /// - `n == B + T` with `B > 0` — the fast path, "fold everything I have".
-/// - `B < n < B + T` — a boundary inside this fire's own new tokens.
+/// - `B < n < B + T` — a boundary inside this fire's own new tokens. The
+///   extended layout describes it fine; the KERNELS do not, because
+///   `commit_len` truncates the sequence rather than merely moving the state
+///   snapshot, so the tokens past the boundary would get no outputs.
 /// - `n == 0` with `B > 0` — appending a second chunk. This one is quiet: the
 ///   fire happily emits logits computed as though the buffer were empty.
+///   (Both of the above now RUN; only the interior boundary is still refused.)
 ///
 /// They are errors rather than silent approximations because approximating a
 /// fold in either direction is unrecoverable: folding early destroys tokens
@@ -460,35 +464,50 @@ fn rs_plan_for(
         Commit,
     }
     let mut position: Option<Position> = None;
+    let mut fold_tokens: Vec<u32> = vec![0; rows];
     for row in 0..rows {
         let (b, t) = (buffered[row], row_tokens[row]);
         let n = fold_len[row].min(b + t);
+        fold_tokens[row] = n;
         let here = if n == 0 {
-            // Appending onto a NON-EMPTY buffer: the new tokens sit at
-            // [F+b, F+b+t), so their recurrence must start from
-            // `folded ⊕ replay(buffer)`. Every recurrence initializes from
-            // `recurrent_state[slot]`, which is the state at F — so the driver
-            // replays the b buffered tokens ahead of the new ones, over an
-            // extended `[b | t]` row layout, and slices the last t rows back
-            // out. `start_tokens` below carries the exact b that makes that
-            // replay describable.
+            // A pure append. Still the extended layout when b > 0, but the
+            // folded boundary does not move.
             Position::Buffer
         } else if n == b + t {
-            if b != 0 {
-                return Err(format!(
-                    "request row {row} folds through a non-empty buffer ({b} buffered \
-                     token(s)); the recurrence cannot read the buffer yet, so fold \
-                     and buffer in separate fires"
-                ));
+            // The fold takes the WHOLE row. With nothing buffered that is the
+            // plain in-forward advance and no buffer is involved at all; with
+            // a non-empty buffer it is the same thing over the extended
+            // `[b | t]` layout, and since the boundary is the last extended
+            // token the ordinary end-of-sequence state writeback lands exactly
+            // on it -- no `commit_len`, no kernel work.
+            if b == 0 {
+                Position::Fold
+            } else {
+                Position::Buffer
             }
-            Position::Fold
         } else if n <= b {
+            // A pure commit: the LINEAR layers ignore this fire's own token
+            // rows entirely and replay the buffered prefix [0, n) straight
+            // from the slabs. (The rows still exist -- the attention layers
+            // and the KV write need them.)
             Position::Commit
         } else {
+            // Everything else runs over the extended `[b | t]` layout, which
+            // IS the row's buffer token space. The driver replays the b
+            // buffered tokens ahead of the t new ones (every recurrence
+            // initializes from `recurrent_state[slot]`, the state at F),
+            // scatters all t new ones into the buffer, and snapshots the
+            // recurrent state at extended token n via `commit_len`. So one
+            // shape covers the append (n == 0), the fold through a non-empty
+            // buffer (n == b + t), and the boundary landing strictly INSIDE
+            // this fire's own new tokens (b < n < b + t).
             return Err(format!(
                 "request row {row} folds {n} token(s) over a {b}-token buffer plus \
-                 {t} new token(s); a boundary inside the new tokens requires the \
-                 buffer read path"
+                 {t} new token(s); a boundary strictly INSIDE the new tokens needs \
+                 the recurrence to produce outputs PAST its own state snapshot, \
+                 which `commit_len` does not do (it truncates the sequence). Fold \
+                 all {} or none of them, or split the fire at the boundary",
+                b + t
             ));
         };
         match &position {
@@ -512,6 +531,7 @@ fn rs_plan_for(
         Position::Buffer => rs::RsPlan::Buffer {
             start_tokens: buffered,
             row_tokens,
+            fold_tokens,
         },
         Position::Commit => rs::RsPlan::FoldBuffered {
             tokens: fold_len.to_vec(),

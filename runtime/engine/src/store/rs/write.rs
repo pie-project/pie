@@ -29,6 +29,21 @@ pub struct RsStateTarget {
     pub fold_tokens: Option<u32>,
 }
 
+/// What a prepared buffer span MEANS. Both intents name the same pages, but
+/// they move tokens in opposite directions, so the occupancy each implies is
+/// opposite too.
+///
+/// - `Write` — the fire scatters activations INTO the span, so the buffer now
+///   holds at least `start + len` tokens.
+/// - `Replay` — the fire gathers the span on its way into the folded state.
+///   Those tokens LEAVE the buffer; counting them as written would re-add
+///   exactly what `advance_fold` just subtracted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RsBufferIntent {
+    Write,
+    Replay,
+}
+
 /// One buffered-page write target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RsBufferTarget {
@@ -66,7 +81,7 @@ pub struct RsPreparedWrite {
     /// written token, and conflating the two made a freshly allocated (and
     /// genuinely empty) buffer read as a full page of occupancy. Publishing
     /// this span is what lets `RsStore::buffer_tokens` be exact.
-    pub(crate) buffer_span: Option<(u32, u32)>,
+    pub(crate) buffer_span: Option<(u32, u32, RsBufferIntent)>,
     /// Submission sequence stamped at prepare (see `KvPreparedWrite::seq`).
     pub(crate) seq: u64,
 }

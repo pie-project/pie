@@ -118,6 +118,10 @@ void qwen3_5_moe_forward_paged(
     const std::uint32_t* rs_buffer_slot_ids_h = nullptr,
     const std::uint32_t* rs_buffer_slot_indptr_h = nullptr,
     const std::int32_t* rs_fold_lens_d = nullptr,
+    // Host mirror. A buffered pass emits one length per row even when
+    // it folds nothing, so only the HOST copy can answer "does this
+    // write also fold?".
+    const std::uint32_t* rs_fold_lens_h = nullptr,
     bool rs_buffer_write = false,
     bool rs_buffer_fold = false,
     // Buffer READ: the tokens already buffered past the fold boundary that

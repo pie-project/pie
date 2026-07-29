@@ -21,6 +21,7 @@
 #![allow(dead_code)]
 
 use crate::store::rs::write::{RsPreparedWrite, RsPublished};
+use crate::store::rs::write::RsBufferIntent;
 use crate::store::rs::{RsStore, RsWorkingSetId};
 
 /// The published RS write for one in-flight PTIR fire, held across
@@ -74,8 +75,9 @@ pub enum RsPlan {
     /// Advance the folded state in-forward over every row.
     Fold,
     /// Scatter each row's pre-recurrence activations into buffered slots
-    /// covering `[start_tokens[r], start_tokens[r] + row_tokens[r])`, leaving
-    /// the folded state untouched.
+    /// covering `[start_tokens[r], start_tokens[r] + row_tokens[r])`, and
+    /// advance the folded boundary through `fold_tokens[r]` of the resulting
+    /// buffer.
     ///
     /// `start_tokens[r]` is row `r`'s existing buffer occupancy, so a non-zero
     /// entry means the fire appends onto a NON-EMPTY buffer and its recurrence
@@ -83,36 +85,55 @@ pub enum RsPlan {
     /// per-row rather than per-pass because occupancy is a property of the
     /// working set, not of the fire: one request commits while another
     /// speculates, and they arrive at different offsets in the same batch.
+    ///
+    /// `fold_tokens[r]` is where the folded boundary lands, counted in the
+    /// row's EXTENDED layout `[b | t]` — which is exactly the row's buffer
+    /// token space, so it is also just "fold this many buffered tokens". Zero
+    /// leaves the folded state untouched (a pure append). Any other value
+    /// makes the pass a fold as well as a write: the driver runs the whole
+    /// extended row but snapshots the recurrent state at token
+    /// `fold_tokens[r]` via `commit_len`, so the outputs cover every new token
+    /// while the boundary lands wherever the guest asked — including strictly
+    /// INSIDE this fire's own new tokens.
     Buffer {
         start_tokens: Vec<u32>,
         row_tokens: Vec<u32>,
+        fold_tokens: Vec<u32>,
     },
     /// Replay `tokens[r]` buffered tokens of row `r` into its folded state.
     FoldBuffered { tokens: Vec<u32> },
 }
 
 impl RsPlan {
-    /// `(write_state, fold_tokens, buffer_tokens)` for row `index` — exactly
-    /// the arguments `RsStore::prepare` classifies against.
-    fn row(&self, index: usize) -> (bool, Option<u32>, Option<(u32, u32)>) {
+    /// `(write_state, fold_tokens, buffer_tokens, buffer_intent)` for row
+    /// `index` — exactly the arguments `RsStore::prepare` classifies against.
+    fn row(
+        &self,
+        index: usize,
+    ) -> (bool, Option<u32>, Option<(u32, u32)>, RsBufferIntent) {
         match self {
-            RsPlan::Fold => (true, None, None),
+            RsPlan::Fold => (true, None, None, RsBufferIntent::Write),
             RsPlan::Buffer {
                 start_tokens,
                 row_tokens,
-            } => (
-                false,
-                None,
-                Some((
-                    start_tokens.get(index).copied().unwrap_or(0),
-                    row_tokens.get(index).copied().unwrap_or(0),
-                )),
-            ),
+                fold_tokens,
+            } => {
+                let n = fold_tokens.get(index).copied().unwrap_or(0);
+                (
+                    n > 0,
+                    (n > 0).then_some(n),
+                    Some((
+                        start_tokens.get(index).copied().unwrap_or(0),
+                        row_tokens.get(index).copied().unwrap_or(0),
+                    )),
+                    RsBufferIntent::Write,
+                )
+            }
             // A fold gathers the buffered PREFIX: the driver walks the CSR
             // from slab zero, so the span always starts at buffer token 0.
             RsPlan::FoldBuffered { tokens } => {
                 let n = tokens.get(index).copied().unwrap_or(0);
-                (true, Some(n), Some((0, n)))
+                (true, Some(n), Some((0, n)), RsBufferIntent::Replay)
             }
         }
     }
@@ -129,7 +150,7 @@ pub fn demand(
 ) -> Result<usize, String> {
     let mut total = 0;
     for (index, &ws) in working_sets.iter().enumerate() {
-        let (write_state, _, buffer_tokens) = plan.row(index);
+        let (write_state, _, buffer_tokens, _) = plan.row(index);
         total += store
             .write_demand(ws, write_state, buffer_tokens)
             .map_err(|e| e.to_string())?;
@@ -281,7 +302,7 @@ fn prepare_many_impl(
     let mut prepared_rows: Vec<RsPreparedWrite> = Vec::with_capacity(working_sets.len());
 
     for (index, &ws) in working_sets.iter().enumerate() {
-        let (write_state, fold_tokens, buffer_tokens) = plan.row(index);
+        let (write_state, fold_tokens, buffer_tokens, buffer_intent) = plan.row(index);
 
         // Buffered execution reads the folded state it does not write, and
         // a fold advances it — both need one already to exist. The driver
@@ -303,9 +324,22 @@ fn prepare_many_impl(
 
         let prepared = match granted.as_deref_mut() {
             Some(granted) => {
-                store.prepare_reserved(ws, write_state, fold_tokens, buffer_tokens, granted)
+                store.prepare_reserved(
+                    ws,
+                    write_state,
+                    fold_tokens,
+                    buffer_tokens,
+                    buffer_intent,
+                    granted,
+                )
             }
-            None => store.prepare_general(ws, write_state, fold_tokens, buffer_tokens),
+            None => store.prepare_general(
+                ws,
+                write_state,
+                fold_tokens,
+                buffer_tokens,
+                buffer_intent,
+            ),
         };
         let prepared = match prepared {
             Ok(prepared) => prepared,
@@ -329,6 +363,14 @@ fn prepare_many_impl(
                 };
                 if state.fold_tokens.is_some() {
                     flags |= crate::driver::RS_FLAG_FOLD;
+                }
+                // Orthogonal to FOLD. A pass that both writes the buffer and
+                // folds a prefix of the result runs the extended layout and
+                // snapshots the state at `fold_lens[r]`; a pure commit's rows
+                // ARE the replay. The driver cannot tell them apart from the
+                // fold flag alone.
+                if buffer_intent == RsBufferIntent::Write && buffer_tokens.is_some_and(|(_, len)| len > 0) {
+                    flags |= crate::driver::RS_FLAG_BUFFER_WRITE;
                 }
                 out.slot_flags.push(flags);
                 if let Some(src) = state.copy_from {
@@ -611,6 +653,7 @@ mod tests {
     fn buffer_plan(start_token: u32, row_tokens: Vec<u32>) -> RsPlan {
         RsPlan::Buffer {
             start_tokens: vec![start_token; row_tokens.len()],
+            fold_tokens: vec![0; row_tokens.len()],
             row_tokens,
         }
     }

@@ -43,7 +43,15 @@ use crate::geometry::GeometryClass;
 /// the survivors keep their offsets. Every buffer span the driver walks is
 /// therefore `head + logical`. Zero for a buffer that was never partially
 /// folded, which is why this was invisible until the replay path landed.
-pub const PIE_DRIVER_ABI_VERSION: u32 = 22;
+/// v23: `PIE_RS_FLAG_BUFFER_WRITE` — a new bit in `rs_slot_flags` marking a
+/// row whose buffer span is a WRITE. Orthogonal to `PIE_RS_FLAG_FOLD`: a pass
+/// may scatter its own tokens into the buffer AND fold a prefix of the result
+/// in one go, and the two flags together are what tell a write-and-fold (run
+/// the extended `[buffered | new]` layout, snapshot the state at
+/// `rs_fold_lens[r]`) apart from a pure commit (whose rows ARE the replay).
+/// No struct grew, but an older driver rejects the unknown bit, so drivers and
+/// workers ship together.
+pub const PIE_DRIVER_ABI_VERSION: u32 = 23;
 pub const PIE_MODEL_COMPONENT_FULL: u32 = 0;
 pub const PIE_MODEL_COMPONENT_TEXT: u32 = 1;
 pub const PIE_MODEL_COMPONENT_ENCODE: u32 = 2;
@@ -91,6 +99,13 @@ const _: () = {
 pub const PIE_RS_FLAG_RESET: u8 = 1;
 /// Fold buffered recurrent-state data into the slot after the pass.
 pub const PIE_RS_FLAG_FOLD: u8 = 2;
+/// The pass SCATTERS its own tokens into the buffer. Orthogonal to `FOLD`: a
+/// pass may write the buffer and fold a prefix of the result in one go, and
+/// the two together are what distinguishes a write-and-fold (which runs the
+/// extended `[buffered | new]` layout and snapshots the state at
+/// `rs_fold_lens[r]`) from a pure commit (whose rows ARE the replay, gathered
+/// straight from the slabs).
+pub const PIE_RS_FLAG_BUFFER_WRITE: u8 = 4;
 
 /// Concrete F32 channel element type.
 pub const PIE_CHANNEL_DTYPE_F32: u8 = 0;
@@ -2338,7 +2353,7 @@ pub unsafe fn validate_step_desc(desc: &PieStepDesc, roster_len: usize) -> PieAb
             unsafe { std::slice::from_raw_parts(desc.rs_slot_flags.ptr, desc.rs_slot_flags.len) };
         if flags
             .iter()
-            .any(|flag| flag & !(PIE_RS_FLAG_RESET | PIE_RS_FLAG_FOLD) != 0)
+            .any(|flag| flag & !(PIE_RS_FLAG_RESET | PIE_RS_FLAG_FOLD | PIE_RS_FLAG_BUFFER_WRITE) != 0)
         {
             return Err(invalid_argument(
                 "launch rs_slot_flags contains unknown bits",

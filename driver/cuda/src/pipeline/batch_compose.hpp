@@ -102,6 +102,15 @@ struct ComposedBatch {
     std::vector<std::uint32_t> rs_fold_lens;
     std::vector<std::uint32_t> rs_buffer_slot_ids;
     std::vector<std::uint32_t> rs_buffer_slot_indptr;
+    // Buffer READ side, in the same composed request order. Unlike the write
+    // CSR this is never channel-resolved: a replay span is a property of the
+    // working set's occupancy, which only the host knows, so it always comes
+    // straight off the wire. It still has to be REORDERED with everything else
+    // -- composition emits wire programs before device-geometry ones.
+    std::vector<std::uint32_t> rs_buffer_read_slot_ids;
+    std::vector<std::uint32_t> rs_buffer_read_indptr;
+    std::vector<std::uint32_t> rs_buffer_read_lens;
+    std::vector<std::uint32_t> rs_buffer_heads;
     std::vector<StructuredMaskDescriptor> structured_masks;
     // Explicit KV-write descriptor covering EVERY composed token row
     // (`has_write_desc` routes the whole forward's KV append through it, so
@@ -220,7 +229,8 @@ inline bool validate_folded_rs_bindings(
     }
     for (std::size_t request = 0; request < slot_flags.size(); ++request) {
         const std::uint8_t flags = slot_flags[request];
-        if ((flags & ~(PIE_RS_FLAG_RESET | PIE_RS_FLAG_FOLD)) != 0) {
+        if ((flags & ~(PIE_RS_FLAG_RESET | PIE_RS_FLAG_FOLD |
+                       PIE_RS_FLAG_BUFFER_WRITE)) != 0) {
             if (error != nullptr) {
                 *error = "folded RS flags contain unknown bits";
             }
@@ -345,11 +355,30 @@ inline bool plan_rs_execution(
         }
     }
 
-    const bool any_fold = std::any_of(
+    // A pass that scatters its own tokens into the buffer runs the extended
+    // `[buffered | new]` layout; if it ALSO folds, the boundary is expressed
+    // as a `commit_len` over that layout rather than as a separate replay, so
+    // the mode is still a write. Only a pure commit -- a fold with no write --
+    // takes the gather-from-slabs BufferFold path.
+    const bool any_buffer_write = std::any_of(
+        slot_flags.begin(), slot_flags.end(), [](std::uint8_t flags) {
+            return (flags & PIE_RS_FLAG_BUFFER_WRITE) != 0;
+        });
+    const bool all_buffer_write = std::all_of(
+        slot_flags.begin(), slot_flags.end(), [](std::uint8_t flags) {
+            return (flags & PIE_RS_FLAG_BUFFER_WRITE) != 0;
+        });
+    if (any_buffer_write != all_buffer_write) {
+        if (error != nullptr) {
+            *error = "mixed buffered-write and replay RS rows are unsupported";
+        }
+        return false;
+    }
+    const bool any_fold = !any_buffer_write && std::any_of(
         slot_flags.begin(), slot_flags.end(), [](std::uint8_t flags) {
             return (flags & PIE_RS_FLAG_FOLD) != 0;
         });
-    const bool all_fold = std::all_of(
+    const bool all_fold = !any_buffer_write && std::all_of(
         slot_flags.begin(), slot_flags.end(), [](std::uint8_t flags) {
             return (flags & PIE_RS_FLAG_FOLD) != 0;
         });
@@ -570,6 +599,22 @@ inline bool compose_forward_batch(const pie_native::LaunchView& view,
         view.rs_buffer_slot_ids.as<std::uint32_t>();
     const auto input_rs_buffer_indptr =
         view.rs_buffer_slot_indptr.as<std::uint32_t>();
+    const auto input_rs_read_ids =
+        view.rs_buffer_read_slot_ids.as<std::uint32_t>();
+    const auto input_rs_read_indptr =
+        view.rs_buffer_read_indptr.as<std::uint32_t>();
+    const auto input_rs_read_lens =
+        view.rs_buffer_read_lens.as<std::uint32_t>();
+    const auto input_rs_heads = view.rs_buffer_heads.as<std::uint32_t>();
+    const bool has_rs_read =
+        input_rs_read_lens.size() == input_request_count &&
+        input_rs_read_indptr.size() == input_request_count + 1;
+    const bool has_rs_heads = input_rs_heads.size() == input_request_count;
+    if (!input_rs_read_lens.empty() && !has_rs_read) {
+        if (err) *err =
+            "ptir compose: buffered RS read CSR does not cover resolved requests";
+        return false;
+    }
     const auto input_rs_translation = view.rs_translation.as<std::uint32_t>();
     const auto input_rs_translation_indptr =
         view.rs_translation_indptr.as<std::uint32_t>();
@@ -610,6 +655,7 @@ inline bool compose_forward_batch(const pie_native::LaunchView& view,
     out.kv_page_indptr.push_back(0);
     out.sampling_indptr.push_back(0);
     if (has_rs_buffer) out.rs_buffer_slot_indptr.push_back(0);
+    if (has_rs_read) out.rs_buffer_read_indptr.push_back(0);
     out.prog_sample_offsets.assign(n_prog + 1, 0);
     out.prog_sample_starts.assign(n_prog, 0);
     out.prog_sample_counts.assign(n_prog, 0);
@@ -641,6 +687,24 @@ inline bool compose_forward_batch(const pie_native::LaunchView& view,
                     input_rs_fold_lens.begin() + begin,
                     input_rs_fold_lens.begin() + begin + count);
             }
+        }
+        for (std::uint32_t request = begin; request < begin + count; ++request) {
+            if (has_rs_read) {
+                const std::uint32_t lo = input_rs_read_indptr[request];
+                const std::uint32_t hi = input_rs_read_indptr[request + 1];
+                if (hi < lo || hi > input_rs_read_ids.size()) {
+                    if (err) *err = "ptir compose: buffered RS read CSR malformed";
+                    return false;
+                }
+                out.rs_buffer_read_slot_ids.insert(
+                    out.rs_buffer_read_slot_ids.end(),
+                    input_rs_read_ids.begin() + lo,
+                    input_rs_read_ids.begin() + hi);
+                out.rs_buffer_read_indptr.push_back(
+                    static_cast<std::uint32_t>(out.rs_buffer_read_slot_ids.size()));
+                out.rs_buffer_read_lens.push_back(input_rs_read_lens[request]);
+            }
+            if (has_rs_heads) out.rs_buffer_heads.push_back(input_rs_heads[request]);
         }
         if (!has_rs_buffer) return true;
         // Channel-resolved `rs-geometry` wins over the host-derived CSR when
@@ -999,7 +1063,11 @@ inline bool compose_forward_batch(const pie_native::LaunchView& view,
           (!input_rs_fold_lens.empty() &&
            out.rs_fold_lens.size() != composed_requests))) ||
         (has_rs_buffer &&
-         out.rs_buffer_slot_indptr.size() != composed_requests + 1)) {
+         out.rs_buffer_slot_indptr.size() != composed_requests + 1) ||
+        (has_rs_read &&
+         (out.rs_buffer_read_lens.size() != composed_requests ||
+          out.rs_buffer_read_indptr.size() != composed_requests + 1)) ||
+        (has_rs_heads && out.rs_buffer_heads.size() != composed_requests)) {
         if (err) *err = "ptir compose: composed RS request attribution mismatch";
         return false;
     }

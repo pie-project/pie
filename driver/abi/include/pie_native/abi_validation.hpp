@@ -669,7 +669,8 @@ inline int validate_step_desc(const PieStepDesc* desc,
     const bool has_rs_fold_lens = desc->rs_fold_lens.len != 0;
     for (std::size_t i = 0; i < desc->rs_slot_flags.len; ++i) {
         const std::uint8_t flags = desc->rs_slot_flags.ptr[i];
-        if ((flags & ~(PIE_RS_FLAG_RESET | PIE_RS_FLAG_FOLD)) != 0) {
+        if ((flags & ~(PIE_RS_FLAG_RESET | PIE_RS_FLAG_FOLD |
+                       PIE_RS_FLAG_BUFFER_WRITE)) != 0) {
             return PIE_STATUS_INVALID_ARGUMENT;
         }
         const bool folds = (flags & PIE_RS_FLAG_FOLD) != 0;

@@ -34,7 +34,7 @@ pub use geometry::{
 pub use local::*;
 pub use plan::{
     CHANNEL_TICKET_NONE, ChannelRegistrationPlan, EmittedKernel, EncodedMask, KvCopyPlan,
-    LaunchPlan, MediaEncodePlan, PoolResizePlan, ProgramRegistration, RS_FLAG_FOLD, RS_FLAG_RESET,
+    LaunchPlan, MediaEncodePlan, PoolResizePlan, ProgramRegistration, RS_FLAG_BUFFER_WRITE, RS_FLAG_FOLD, RS_FLAG_RESET,
     StateCopyPlan,
 };
 pub use remote::*;

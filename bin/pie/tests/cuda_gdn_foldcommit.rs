@@ -164,3 +164,33 @@ async fn two_chunks_need_the_buffer_read_path() -> Result<()> {
     }
     Ok(())
 }
+
+/// A fold running THROUGH a non-empty buffer, in the same fire that fills it —
+/// a position the planner used to refuse outright ("fold and buffer in
+/// separate fires").
+///
+/// One fire appends two tokens onto a buffer already holding two and folds all
+/// four. It is a write and a fold at once: the driver replays the buffered
+/// pair ahead of the new pair over the extended `[buffered | new]` layout,
+/// scatters the new pair into the buffer, and — because the boundary is the
+/// last extended token — lets the ordinary end-of-sequence writeback land the
+/// folded state on it.
+///
+/// The inferlet checks it by equivalence against the same four tokens folded
+/// two fires at a time, and draws the comparison AFTER the fold by continuing
+/// each arm one token further. So a pass means the folded STATE matches, not
+/// merely that the fire ran.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a GPU + Qwen3.5-0.8B (GDN backbone) in the HF cache"]
+async fn a_fire_can_append_to_a_buffer_and_fold_through_it() -> Result<()> {
+    let result = run_foldcommit("inside")
+        .await?
+        .map_err(|error| anyhow::anyhow!("fold-through failed: {error}"))?;
+    anyhow::ensure!(
+        result.contains("agree=yes"),
+        "appending onto a buffer and folding through it must agree with the \
+         same tokens folded two fires at a time: {result}"
+    );
+    eprintln!("[gdn-foldcommit] {result}");
+    Ok(())
+}

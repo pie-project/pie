@@ -107,6 +107,7 @@ pub struct LaunchPlan {
 
 pub const RS_FLAG_RESET: u8 = 1;
 pub const RS_FLAG_FOLD: u8 = 2;
+pub const RS_FLAG_BUFFER_WRITE: u8 = 4;
 
 #[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProgramRegistration {
