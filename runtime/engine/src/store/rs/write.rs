@@ -61,6 +61,12 @@ pub struct RsPreparedWrite {
     pub(crate) state: Option<RsStateTarget>,
     pub(crate) buffers: Vec<RsBufferTarget>,
     pub(crate) allocated: Vec<RsSlotId>,
+    /// The `(start, len)` token span this write buffers, if any. Pages are the
+    /// allocation unit but NOT the accounting unit: a reserved page is not a
+    /// written token, and conflating the two made a freshly allocated (and
+    /// genuinely empty) buffer read as a full page of occupancy. Publishing
+    /// this span is what lets `RsStore::buffer_tokens` be exact.
+    pub(crate) buffer_span: Option<(u32, u32)>,
     /// Submission sequence stamped at prepare (see `KvPreparedWrite::seq`).
     pub(crate) seq: u64,
 }

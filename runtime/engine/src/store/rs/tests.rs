@@ -514,3 +514,111 @@ fn unmaterialized_read_is_an_error_and_zero_length_read_is_empty() {
         Err(RsError::UnmaterializedRead { index: 0 })
     );
 }
+
+/// Reserving a buffer page does not buffer a token.
+///
+/// The fire classifier asks "is the buffer empty?" to decide whether an append
+/// is the legal empty-buffer case or the unimplemented read path. It used to
+/// ask the PAGE count, but a guest must reserve a page before it can write into
+/// one — so a brand-new buffer claimed a full page of occupancy and every
+/// speculative window was refused before it ran.
+#[test]
+fn reserving_a_buffer_page_does_not_buffer_a_token() {
+    let mut s = store();
+    let ws = s.create_working_set(geom());
+
+    assert_eq!(s.buffer_tokens(ws).unwrap(), 0, "a new working set is empty");
+
+    s.alloc_buffer(ws, 2).unwrap();
+    assert_eq!(s.buffer_size(ws).unwrap(), 2, "two pages reserved");
+    assert_eq!(
+        s.buffer_tokens(ws).unwrap(),
+        0,
+        "reserved but unwritten: still zero buffered tokens"
+    );
+
+    let prepared = s.prepare_write(ws, false, Some((0, 3))).unwrap();
+    settled(&mut s, prepared);
+    assert_eq!(
+        s.buffer_tokens(ws).unwrap(),
+        3,
+        "exactly the tokens written, not the 4-token page they sit in"
+    );
+
+    // Rewriting the same span must not double-count.
+    let prepared = s.prepare_write(ws, false, Some((0, 3))).unwrap();
+    settled(&mut s, prepared);
+    assert_eq!(s.buffer_tokens(ws).unwrap(), 3, "a rewrite is not an append");
+
+    // A disjoint append advances the fill to its far edge.
+    let prepared = s.prepare_write(ws, false, Some((4, 4))).unwrap();
+    settled(&mut s, prepared);
+    assert_eq!(s.buffer_tokens(ws).unwrap(), 8);
+}
+
+/// Folding absorbs buffered tokens into the folded prefix, so they stop being
+/// buffered — which is what lets the next window append onto an empty buffer.
+#[test]
+fn folding_drains_the_buffered_token_count() {
+    let mut s = store();
+    let ws = s.create_working_set(geom());
+    s.alloc_buffer(ws, 2).unwrap();
+
+    let prepared = s.prepare_write(ws, false, Some((0, 8))).unwrap();
+    settled(&mut s, prepared);
+    assert_eq!(s.buffer_tokens(ws).unwrap(), 8);
+
+    let prepared = s.prepare_fold(ws, 4).unwrap();
+    settled(&mut s, prepared);
+    assert_eq!(
+        s.buffer_tokens(ws).unwrap(),
+        4,
+        "half the buffer folded away"
+    );
+
+    let prepared = s.prepare_fold(ws, 4).unwrap();
+    settled(&mut s, prepared);
+    assert_eq!(
+        s.buffer_tokens(ws).unwrap(),
+        0,
+        "folding everything empties the buffer"
+    );
+}
+
+/// Freeing every buffered page empties the buffer — the reset a speculative
+/// loop performs between windows.
+#[test]
+fn freeing_every_page_empties_the_buffered_token_count() {
+    let mut s = store();
+    let ws = s.create_working_set(geom());
+    s.alloc_buffer(ws, 2).unwrap();
+    let prepared = s.prepare_write(ws, false, Some((0, 8))).unwrap();
+    settled(&mut s, prepared);
+    assert_eq!(s.buffer_tokens(ws).unwrap(), 8);
+
+    s.free_buffer(ws, &[0, 1], 0).unwrap();
+    assert_eq!(s.buffer_size(ws).unwrap(), 0);
+    assert_eq!(
+        s.buffer_tokens(ws).unwrap(),
+        0,
+        "no pages left, so nothing is buffered"
+    );
+
+    // And a fresh reservation is once again genuinely empty.
+    s.alloc_buffer(ws, 1).unwrap();
+    assert_eq!(s.buffer_tokens(ws).unwrap(), 0);
+}
+
+/// A fork shares the buffer, so it must share the occupancy too — otherwise
+/// the child would classify its first fire as an empty-buffer append.
+#[test]
+fn fork_inherits_the_buffered_token_count() {
+    let mut s = store();
+    let ws = s.create_working_set(geom());
+    s.alloc_buffer(ws, 2).unwrap();
+    let prepared = s.prepare_write(ws, false, Some((0, 5))).unwrap();
+    settled(&mut s, prepared);
+
+    let child = s.fork(ws).unwrap();
+    assert_eq!(s.buffer_tokens(child).unwrap(), 5);
+}

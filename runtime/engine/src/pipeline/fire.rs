@@ -435,16 +435,17 @@ fn rs_plan_for(
                 .unwrap_or(0)
         })
         .collect();
-    // Buffer occupancy in TOKENS, as an upper bound: the store tracks buffered
-    // PAGES, and the live token count rides on `rs-geometry.buffer-len`, which
-    // is a channel the host may not be able to read. An upper bound is all the
-    // classification below needs — it only ever asks whether the buffer is
-    // empty, and whether a boundary lands inside it.
-    let page_tokens = pie_model::model().rs_caps().buffer_page_size.max(1);
+    // Buffer occupancy in TOKENS, exactly. This used to be a page-granular
+    // upper bound (`buffer_size() * page_tokens`), which is wrong in the one
+    // way that matters: you must reserve a page BEFORE you can buffer into it,
+    // so a freshly allocated, genuinely empty buffer reported a full page of
+    // occupancy and the legal "append onto an empty buffer" fire was refused
+    // as an append onto a non-empty one. The store now publishes the written
+    // span, so `buffer_tokens` is exact.
     let buffered: Vec<u32> = {
         let store = stores.rs.lock().unwrap();
         ids.iter()
-            .map(|id| store.buffer_size(*id).unwrap_or(0).saturating_mul(page_tokens))
+            .map(|id| store.buffer_tokens(*id).unwrap_or(0))
             .collect()
     };
 
@@ -471,8 +472,8 @@ fn rs_plan_for(
             // though the buffered tokens were not there. That is a wrong
             // answer with no symptom, which is worse than a refusal.
             //
-            // (`start_token` below would also be wrong: `b` is an upper bound
-            // derived from whole pages, exact only when the buffer is empty.)
+            // (`start_token` below is `b`, which is now exact — but the read
+            // path is still what makes a non-empty append correct.)
             if b != 0 {
                 return Err(format!(
                     "request row {row} appends {t} token(s) onto a non-empty buffer                      ({b} buffered token(s)); the recurrence would start from the folded                      state and silently ignore what is buffered. Fold the buffer first,                      or keep each speculative chunk to a single fire"
@@ -506,10 +507,9 @@ fn rs_plan_for(
 
     Ok(match position.expect("rows > 0") {
         Position::Fold => rs::RsPlan::Fold,
-        // Only reachable with an empty buffer, so the chunk always opens at
-        // token 0. `buffered[0]` is a whole-page upper bound and would be the
-        // wrong cursor for any other case; the read path will reintroduce the
-        // offset with the exact occupancy it needs.
+        // Only reachable with an empty buffer (`b == 0` above), so the chunk
+        // always opens at token 0. Occupancy is exact now, so when the read
+        // path lands this becomes `buffered[0]` unchanged.
         Position::Buffer => rs::RsPlan::Buffer {
             start_token: 0,
             row_tokens,
@@ -521,6 +521,7 @@ fn rs_plan_for(
 }
 
 /// Phase-A RS demand for the acquisition grant.
+
 fn rs_slot_demand(
     stores: &crate::store::registry::Stores,
     ids: &[crate::store::rs::RsWorkingSetId],

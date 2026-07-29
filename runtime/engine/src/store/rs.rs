@@ -149,6 +149,11 @@ struct RsEntry {
     folded: Option<RsSlotId>,
     /// Dense ordered buffered page slots. `None` = reserved, unmaterialized.
     buffer: Vec<Option<RsSlotId>>,
+    /// Buffered tokens actually WRITTEN, exactly — not `buffer.len() * page`.
+    /// Reserving a page does not buffer a token, so the page count is only an
+    /// upper bound; classifying fires against that bound made every freshly
+    /// allocated buffer look full and rejected the legal empty-buffer append.
+    buffer_fill: u32,
 }
 
 /// The RS store: WorkingSets + the typed backing pool.
@@ -198,15 +203,21 @@ impl RsStore {
             geom,
             folded: None,
             buffer: Vec::new(),
+            buffer_fill: 0,
         })
     }
 
     /// Fork: shares the folded slot and every materialized buffered slot by
     /// reference; the first write on a shared slot copies it.
     pub fn fork(&mut self, ws: RsWorkingSetId) -> Result<RsWorkingSetId, RsError> {
-        let (geom, folded, buffer) = {
+        let (geom, folded, buffer, buffer_fill) = {
             let entry = self.entry(ws)?;
-            (entry.geom, entry.folded, entry.buffer.clone())
+            (
+                entry.geom,
+                entry.folded,
+                entry.buffer.clone(),
+                entry.buffer_fill,
+            )
         };
         if let Some(id) = folded {
             *self.refs.entry(id).or_insert(1) += 1;
@@ -218,6 +229,7 @@ impl RsStore {
             geom,
             folded,
             buffer,
+            buffer_fill,
         }))
     }
 
@@ -277,6 +289,16 @@ impl RsStore {
             }
         }
         self.entry_mut(ws)?.buffer = kept;
+        // Freeing pages discards the tokens they held. Which tokens is the
+        // guest's business (`free_buffer` takes arbitrary indices), so clamp
+        // to the surviving capacity: still exact for the cases that matter
+        // (freeing everything empties the buffer) and never an under-count.
+        {
+            let entry = self.entry_mut(ws)?;
+            let capacity =
+                (entry.buffer.len() as u32).saturating_mul(entry.geom.buffer_page_tokens.max(1));
+            entry.buffer_fill = entry.buffer_fill.min(capacity);
+        }
         for id in dropped {
             self.decref(id, epoch);
         }
@@ -569,6 +591,7 @@ impl RsStore {
             state,
             buffers,
             allocated,
+            buffer_span: buffer_tokens.filter(|(_, len)| *len > 0),
             seq: self.seq,
         })
     }
@@ -653,6 +676,14 @@ impl RsStore {
                 RsBufferTarget::InPlace { .. } => {}
             }
         }
+
+        // Exact occupancy: the write covers tokens [start, start+len), so the
+        // buffer now holds at least start+len. `max` (not `+=`) because a
+        // rewrite of an already-buffered span must not double-count.
+        if let Some((start, len)) = prepared.buffer_span {
+            let entry = self.entry_mut(ws).expect("batch prevalidated");
+            entry.buffer_fill = entry.buffer_fill.max(start.saturating_add(len));
+        }
     }
 
     /// Settle a published write after its fire resolves, successfully or not.
@@ -694,7 +725,15 @@ impl RsStore {
         let entry = self.entry_mut(ws).expect("batch prevalidated");
         let page = entry.geom.buffer_page_tokens.max(1);
         let drop = ((tokens / page) as usize).min(entry.buffer.len());
+        // The fold absorbed `tokens` buffered tokens into the folded prefix,
+        // so they are no longer buffered. Whole covered pages are released;
+        // a partial tail page survives and the guest owns its token<->slot
+        // bookkeeping, so clamp the remaining fill to what still fits.
+        entry.buffer_fill = entry.buffer_fill.saturating_sub(tokens);
         let dropped: Vec<RsSlotId> = entry.buffer.drain(..drop).flatten().collect();
+        let capacity =
+            (entry.buffer.len() as u32).saturating_mul(page);
+        entry.buffer_fill = entry.buffer_fill.min(capacity);
         for id in dropped {
             self.decref(id, epoch);
         }
@@ -710,6 +749,18 @@ impl RsStore {
 
     pub fn buffer_size(&self, ws: RsWorkingSetId) -> Result<u32, RsError> {
         Ok(self.entry(ws)?.buffer.len() as u32)
+    }
+
+    /// Buffered tokens actually written — the exact `B` a fire must be
+    /// classified against.
+    ///
+    /// NOT `buffer_size() * buffer_page_tokens`: that is a page-granular upper
+    /// bound, and reserving a page in order to buffer into it made the buffer
+    /// look occupied before a single token had been written, so the legal
+    /// "append onto an empty buffer" fire was refused as an append onto a full
+    /// one.
+    pub fn buffer_tokens(&self, ws: RsWorkingSetId) -> Result<u32, RsError> {
+        Ok(self.entry(ws)?.buffer_fill)
     }
 
     /// This working set's buffer-page translation: WorkingSet-relative buffer
