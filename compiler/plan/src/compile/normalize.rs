@@ -31,26 +31,45 @@ use super::symbolic::{Dimension, SymbolicType, symbolic_result_type};
 /// make two stages that agree on every op and type, but disagree here, compile
 /// to differently named kernels that the driver caches apart.
 ///
-/// [`the_signature_still_depends_on_value_domains`](self) pins that, because
-/// the effect is invisible from this file and the goldens it moves are dumps of
-/// a C++ oracle that no longer exists — they cannot be re-derived, so this has
-/// to be a decision rather than a discovery.
+/// `the_signature_still_depends_on_value_domains` pins that, because the
+/// effect is invisible from this file: the only other thing that would notice
+/// is a golden kernel name, and by then the cause is twenty files away.
+/// Changing what [`value_domain`] returns renames kernels, so it is a decision
+/// to be argued rather than a diff to be accepted.
 ///
-/// Two rough edges are recorded rather than fixed, for the same reason:
-/// `PageDescriptor` and `EffectToken` are never produced, and
-/// [`ValueDomain::LibraryResult`] claims four of the seven ops
-/// `region::library_op_for_tag` calls library (cumsum, cumprod and sink_call
-/// fall through to `PerRow`).
+/// Two rough edges are recorded rather than fixed. `PageDescriptor` and
+/// `EffectToken` are never produced, and `LibraryResult` claims four of the
+/// seven ops `region::library_op_for_tag` calls library — cumsum, cumprod and
+/// sink_call fall through to `PerRow`.
+///
+/// The first of those is checked rather than merely asserted:
+/// `only_six_of_the_eight_domains_are_reachable` enumerates [`value_domain`]
+/// over every op the table declares, so the two unused variants cannot quietly
+/// gain a producer, nor a used one quietly lose its last. A prose claim about
+/// reachability reads identically whether or not it is still true, which is
+/// why it is not left as one. The discriminants are explicit, so retiring the
+/// two unused variants leaves `LibraryResult = 6` where it is and moves no
+/// signature byte.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ValueDomain {
+    /// A rank-0 value, or one whose every dimension is `1`.
     Scalar = 0,
+    /// A per-row tensor — the fallthrough when nothing else applies, so
+    /// reductions land here too.
     PerRow = 1,
+    /// A tensor whose trailing dimension is the model's vocabulary width.
     Vocabulary = 2,
+    /// Device-materialized indices, i.e. the result of [`Op::Iota`].
     GeneratedIndex = 3,
+    /// A boolean (`DType::Bool`) mask.
     Mask = 4,
+    /// A KV-page descriptor. Reserved: [`value_domain`] never returns it.
     PageDescriptor = 5,
+    /// The result of a library op — [`Op::TopK`], [`Op::SortDesc`],
+    /// [`Op::MatMul`], or [`Op::KernelCall`].
     LibraryResult = 6,
+    /// An effect token. Reserved: [`value_domain`] never returns it.
     EffectToken = 7,
 }
 
@@ -81,10 +100,17 @@ impl NodeIndex {
 /// A normalized stage with local channel/name numbering.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NormalizedStage {
+    /// The stage this body belongs to.
     pub stage: Stage,
+    /// PTIR op count before normalization, retained for the `source_ops`
+    /// metric now that [`ops`](Self::ops) has been thinned.
     pub source_op_count: u32,
+    /// The normalized op list, densely renumbered.
     pub ops: Vec<Op>,
+    /// Symbolic type of each SSA value, indexed by [`ValueId`].
     pub value_types: Vec<SymbolicType>,
+    /// [`ValueDomain`] of each SSA value, parallel to
+    /// [`value_types`](Self::value_types).
     pub value_domains: Vec<ValueDomain>,
     /// Original PTIR op positions represented by each normalized op.
     pub source_ops: Vec<Vec<u32>>,
@@ -179,7 +205,7 @@ pub(crate) fn normalize_stage(bound: &BoundTrace, stage_index: usize) -> Normali
         let normalized_op_index = normalized_ops.len() as u32;
         for (result, symbolic_type) in result_types.into_iter().enumerate() {
             value_map[base + result] = new_base + result as u32;
-            normalized_domains.push(value_domain(bound, &op, &symbolic_type));
+            normalized_domains.push(value_domain(bound.profile.vocab, &op, &symbolic_type));
             let literal = match &op {
                 Op::Const(literal) => Some(*literal),
                 _ => None,
@@ -300,7 +326,10 @@ pub(crate) fn live_ops(
     keep
 }
 
-pub(crate) fn value_domain(bound: &BoundTrace, op: &Op, value_type: &SymbolicType) -> ValueDomain {
+/// Classify one value. Takes `vocab` rather than the whole [`BoundTrace`]
+/// because that is all it reads — which is also what makes
+/// [`only_six_of_the_eight_domains_are_reachable`](self) able to enumerate it.
+pub(crate) fn value_domain(vocab: u32, op: &Op, value_type: &SymbolicType) -> ValueDomain {
     if value_type.is_scalar() {
         return ValueDomain::Scalar;
     }
@@ -313,7 +342,7 @@ pub(crate) fn value_domain(bound: &BoundTrace, op: &Op, value_type: &SymbolicTyp
     if value_type
         .dims
         .last()
-        .is_some_and(|dimension| *dimension == Dimension::Static(bound.profile.vocab))
+        .is_some_and(|dimension| *dimension == Dimension::Static(vocab))
     {
         return ValueDomain::Vocabulary;
     }
@@ -374,13 +403,13 @@ pub(crate) fn local_name(global_names: &[String], names: &mut Vec<String>, globa
 mod value_domain_tests {
     use super::*;
     use crate::compile::signature::stage_signature;
+    use crate::compile::symbolic::SymbolicExtent;
 
     /// [`ValueDomain`] has no reader that branches on it, so the only thing
     /// stopping it from being deleted as dead is that the signature hashes it —
     /// and that hash is the emitted kernel's entry-point name and the driver's
     /// pipeline cache key. Deleting the field would rename every kernel in
-    /// `golden-{msl,cuda}/`, which are dumps of a C++ oracle that no longer
-    /// exists and cannot be re-derived.
+    /// `golden-{msl,cuda}/`, so it is an ABI change rather than a cleanup.
     ///
     /// So this makes the dependency visible from the definition: change what
     /// `value_domain` returns and this fails, instead of a golden diff twenty
@@ -412,6 +441,79 @@ mod value_domain_tests {
         );
     }
 
+    /// The doc above says `PageDescriptor` and `EffectToken` are never
+    /// produced. `value_domain` is a total function of `(vocab, op, type)`,
+    /// so that is checkable rather than asserted: run every op the table
+    /// declares against a spread of value types wide enough to reach each
+    /// arm, and see what comes out.
+    ///
+    /// If a future arm produces one of the two, this fails and the comment
+    /// gets corrected. If the six shrink, this fails too — a domain that
+    /// stopped being reachable is the same finding.
+    #[test]
+    fn only_six_of_the_eight_domains_are_reachable() {
+        const VOCAB: u32 = 32_000;
+        let types = [
+            // scalar
+            SymbolicType {
+                dtype: DType::F32,
+                dims: alloc::vec![],
+            },
+            // bool -> Mask
+            SymbolicType {
+                dtype: DType::Bool,
+                dims: alloc::vec![Dimension::Static(4)],
+            },
+            // vocabulary-width trailing dim
+            SymbolicType {
+                dtype: DType::F32,
+                dims: alloc::vec![Dimension::Static(4), Dimension::Static(VOCAB)],
+            },
+            // anything else
+            SymbolicType {
+                dtype: DType::F32,
+                dims: alloc::vec![Dimension::Static(4), Dimension::Static(7)],
+            },
+            // symbolic extent, to be sure a runtime-varying row count does not
+            // accidentally compare equal to the vocabulary
+            SymbolicType {
+                dtype: DType::I32,
+                dims: alloc::vec![
+                    Dimension::Symbolic(SymbolicExtent::RowCount),
+                    Dimension::Static(7)
+                ],
+            },
+        ];
+
+        let mut seen = alloc::collections::BTreeSet::new();
+        for op in pie_ir::op::representatives() {
+            for value_type in &types {
+                seen.insert(value_domain(VOCAB, &op, value_type) as u8);
+            }
+        }
+
+        let expected: alloc::collections::BTreeSet<u8> = [
+            ValueDomain::Scalar,
+            ValueDomain::PerRow,
+            ValueDomain::Vocabulary,
+            ValueDomain::GeneratedIndex,
+            ValueDomain::Mask,
+            ValueDomain::LibraryResult,
+        ]
+        .into_iter()
+        .map(|domain| domain as u8)
+        .collect();
+
+        assert_eq!(
+            seen,
+            expected,
+            "the reachable value domains changed; PageDescriptor ({}) and \
+             EffectToken ({}) are documented as never produced",
+            ValueDomain::PageDescriptor as u8,
+            ValueDomain::EffectToken as u8,
+        );
+    }
+
     /// The reduce arm that returned `PerRow` next to a fallthrough that
     /// returned `PerRow` is gone. This is what says the removal was a no-op, so
     /// re-adding it as a "rule" is a change to be argued rather than restored.
@@ -429,7 +531,7 @@ mod value_domain_tests {
             Op::Add(0, 0),
         ] {
             assert_eq!(
-                value_domain(&bound, &op, &per_row),
+                value_domain(bound.profile.vocab, &op, &per_row),
                 ValueDomain::PerRow,
                 "{op:?}"
             );

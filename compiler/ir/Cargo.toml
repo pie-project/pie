@@ -2,6 +2,7 @@
 name = "pie-ir"
 version = "0.1.0"
 edition = "2024"
+rust-version.workspace = true
 authors = ["In Gim <in.gim@yale.edu>"]
 description = "PTIR — the Pie Tensor IR: the shape-typed op vocabulary, the stage-tagged channel-carrying trace container and its canonical wire format, shape/dtype inference, and the bind-time validator. The representation layer every other compiler crate builds on."
 license = "Apache-2.0"

@@ -1,4 +1,4 @@
-//! Golden vectors (thrust-3 P0.4): canonical container bytes, identity hash,
+//! Golden vectors: canonical container bytes, identity hash,
 //! validator verdict and tier-0 reference results, checked into
 //! `golden/*.txt`. **This is the conformance suite for every backend** —
 //! the CUDA driver's tiers and the SDK diff against these files: the SDK must
@@ -754,7 +754,7 @@ fn golden_neg_body_type_error() {
 
 #[test]
 fn golden_matrix_mask_apply_packed() {
-    // Per-row packed-mask semantics (pinned after the §6.1 matrix gap): ONE
+    // Per-row packed-mask semantics: ONE
     // packed mask broadcasts across rows, bit index = column (j % n) — never
     // the flat element index. Mask 0b00101000 allows columns 3 and 5 only.
     let mut b = B::new();
@@ -812,7 +812,7 @@ fn golden_matrix_mask_apply_packed() {
 
 #[test]
 fn golden_matrix_select_mask() {
-    // The §6.1 per-POSITION select-mask shape at k=4 (the cuda_mtpverify OOB
+    // The per-POSITION select-mask shape at k=4 (the cuda_mtpverify OOB
     // repro, pinned): dselect(allow[k,v], logits[k,v], broadcast(-inf ->
     // [k,v])) -> per-row argmax. EVERY matrix operand materializes k FULL
     // rows (k*v, row-major). Non-degenerate: each row's raw argmax is masked
@@ -894,7 +894,7 @@ fn golden_matrix_select_mask() {
 
 #[test]
 fn golden_pivot_predicates_multistage() {
-    // Regression pin (CUDA driver thrust-3 / driver bound.hpp): container.rs
+    // Regression pin (the CUDA driver's bound-trace decoder): container.rs
     // decodes `Predicate::{RankLe,CummassLe,ProbGe}`'s payload as a
     // per-STAGE-LOCAL ValueId (same as any op arg) — a translator MUST remap
     // it through that stage's global-id base before dereferencing it, exactly
@@ -1006,7 +1006,7 @@ fn golden_pivot_predicates_multistage() {
 
 #[test]
 fn golden_mtp_verify_tail() {
-    // The full MTP match-verify DAG at K=3, V=8 (overview §6.1 steps 1-6),
+    // The full MTP match-verify DAG at K=3, V=8,
     // hand-checkable — the cross-backend anchor for the accept-prefix logic
     // (eq → cumprod → select with the -1 sentinel) on top of the
     // matrix_select_mask shape. Non-degenerate: WITHOUT the mask row 2 would
@@ -1173,7 +1173,7 @@ fn golden_mtp_verify_tail() {
 // ═══════════════════════════════════════════════════════════════════════════
 // Capstone: Pentathlon+1 — one MCTS iteration composing all SIX techniques
 // (quest + mcts + beam + constrained + speculative + contrastive) through the
-// tier-0 oracle. docs/ptir/pentathlon-design.md §2; zero new ops.
+// tier-0 interpreter, composed entirely from existing ops.
 // ═══════════════════════════════════════════════════════════════════════════
 
 const PV: u32 = 8; // vocab
@@ -1219,7 +1219,7 @@ fn pentathlon_profile() -> ModelProfile {
     p
 }
 
-/// The Quest tap (design §2.1): per layer, envelope scores -> top-`budget`
+/// The Quest tap: per layer, envelope scores -> top-`budget`
 /// page mask -> the attn_page_mask sink. `budget_ch` is a [1] u32 channel.
 fn quest_tap(budget_ch: u32) -> StageProgram {
     let mut b = B::new();
@@ -1253,7 +1253,7 @@ fn quest_tap(budget_ch: u32) -> StageProgram {
     }
 }
 
-/// Contrastive pick (design §2.3, ORDER PINNED BY THIS GOLDEN): grammar folds
+/// Contrastive pick (ORDER PINNED BY THIS GOLDEN): grammar folds
 /// into the expert distribution BEFORE the plausibility max — i.e. the
 /// α-filter runs within the CONSTRAINED support. Computing plausibility
 /// against the unmasked max annihilates every legal token whenever the
@@ -1292,7 +1292,7 @@ fn contrastive_score(b: &mut B, lse_in: u32, am_take: u32, gmask: u32, rows: u32
 }
 use pie_ir::expand;
 
-/// design §2.1 + §2.3: quest tap + contrastive beam expansion + leaf value.
+/// Quest tap + contrastive beam expansion + leaf value.
 /// Channels: 0 am [1,V] f32 W · 1 gmask [1,V] bool W · 2 budget [1] u32 seed
 /// · 3 prio [B] f32 R · 4 pids [B] u32 R · 5 val [1] f32 R.
 fn expand_trace() -> TraceContainer {
@@ -1360,7 +1360,7 @@ fn expand_trace() -> TraceContainer {
     }
 }
 
-/// design §2.2 + §2.3: quest tap + contrastive pick over the [K+1] window +
+/// Quest tap + contrastive pick over the [K+1] window +
 /// the mtp_verify accept tail + value tap.
 /// Channels: 0 prev_drafts [K] i32 seed · 1 gmask [K+1,V] bool W ·
 /// 2 am [K+1,V] f32 W · 3 out [K+1] i32 R · 4 draft_out [K] i32 R ·
@@ -1625,11 +1625,11 @@ fn golden_pentathlon_iter() {
 
 #[test]
 fn golden_dfa_ingraph() {
-    // The G1 demonstrator (design §5): for a REGULAR grammar the mask walk
+    // The regular-grammar demonstrator: for a REGULAR grammar the mask walk
     // moves IN-GRAPH with existing ops — allow/next tables live in seeded
     // device-private channels (read-only), the DFA state is a [1] u32
     // ping-pong channel, and the per-step mask row is `gather(allow, state)`.
-    // ZERO host-fed channels: the grammar edge (the §3 "one host-coupled
+    // ZERO host-fed channels: the grammar edge (the "one host-coupled
     // edge") is deleted; the host only harvests `out`.
     //
     // DFA (S=3, V=8): state0 allows {1,2}; state1 allows {3}; state2 allows
@@ -1843,7 +1843,7 @@ fn golden_extern_contrastive() {
             .0,
     );
 
-    // The broker: ONE shared ring, handed to both instances (§1: SPSC
+    // The broker: ONE shared ring, handed to both instances (SPSC
     // constrains endpoints, not clocks).
     let ring = ExternChannel::for_decl(&am_trace.channels[0]);
     let mut am =

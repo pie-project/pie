@@ -14,8 +14,8 @@
 //! `pie-dsl`'s builder that re-listed the same four stages, so a fifth stage
 //! would have compiled, built a container, and simply never been traced.
 //!
-//! [`declare_tagged_enum!`] takes the list once and derives all three, the same
-//! way [`declare_ops!`](crate::declare_ops) does for the op table. Adding a
+//! `declare_tagged_enum!` takes the list once and derives all three, the same
+//! way the op table's own declaration macro does. Adding a
 //! variant is then a one-line edit that cannot be half-done.
 
 /// Declare a `#[repr(u8)]` enum with frozen wire tags.
@@ -95,7 +95,7 @@ mod tests {
             assert!(!name(variant).is_empty());
         }
         assert!(
-            from_u8(all.len() as u8).is_none(),
+            u8::try_from(all.len()).is_ok_and(|past_end| from_u8(past_end).is_none()),
             "from_u8 accepts a tag past the end of ALL"
         );
         for (i, a) in all.iter().enumerate() {

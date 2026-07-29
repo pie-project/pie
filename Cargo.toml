@@ -6,7 +6,11 @@
 # them into this workspace's resolver would pull wasm-only deps into the host
 # build graph.
 [workspace]
-resolver = "2"
+# Resolver 3 is the edition-2024 default and is MSRV-aware: it will not pick a
+# dependency version that needs a newer rustc than the `rust-version` declared
+# below. Nothing in the current lockfile changes under it — the point is that a
+# future `cargo update` cannot silently raise the floor.
+resolver = "3"
 members = [
     "runtime/engine",
     # X0 tensor-waker substrate (leaf crate; loom-model-checked in isolation).
@@ -71,6 +75,20 @@ exclude = [
     ".claude",
 ]
 
+# Shared package metadata. Opt in per field with `<field>.workspace = true`;
+# today only the `compiler/*` crates do.
+[workspace.package]
+# The floor is verified, not assumed: `cargo +1.91.1 check --all-targets` builds
+# all six compiler crates. `rust-toolchain.toml` pins 1.97.1 because that is the
+# version CI's `-D warnings` gate is calibrated against, but pinning a toolchain
+# is not the same claim as requiring one — a consumer of `pie-ir` needs only
+# what the source actually uses.
+#
+# Lowering this further needs a toolchain to check it against; raising it needs
+# a reason in the diff. Either way the number is a measurement, so re-measure
+# rather than edit it to match whatever is installed.
+rust-version = "1.91"
+
 # Shared lint table. Opt in per crate with `[lints] workspace = true`; today
 # only the `compiler/*` crates do, because they are the only ones at zero
 # clippy warnings and therefore the only ones CI can gate with `-D warnings`
@@ -92,6 +110,13 @@ exclude = [
 # no `unsafe` anywhere under `compiler/`, so this extends that crate's existing
 # guarantee to the other five at zero cost.
 unsafe_code = "forbid"
+# Every public item under `compiler/` is documented, and this keeps it that
+# way. These crates are read far more often than they are written -- the op
+# table, the wire layout and the type rules are all consulted from other
+# crates and from generated backend sources -- so an undocumented public item
+# is a rule someone has to reconstruct from the implementation, and the
+# reconstruction is what silently disagrees with it later.
+missing_docs = "deny"
 
 [workspace.lints.clippy]
 todo = "deny"
@@ -102,6 +127,17 @@ mem_forget = "deny"
 # behind or a diagnostic that belongs behind an explicit, annotated `allow`.
 print_stdout = "deny"
 print_stderr = "deny"
+# `cast_possible_truncation` is deliberately NOT set here. It fires on ~130
+# `usize as u32` sites that are all bounded -- by the container ceilings, by
+# the `u32` value-id space, or by `usize` being 64 bits on the only targets
+# `pie-eval` and `pie-codegen` build for -- so denying it workspace-wide buys
+# ~130 `#[allow]` and no guarantee.
+#
+# It is denied at the top of `compiler/ir/src/lib.rs` instead, which is where
+# it earns its keep: that crate narrows counts that came from bytes it did not
+# write. Anywhere else, a narrowing cast still deserves the same question --
+# what is the bound, and who enforces it -- the lint just cannot ask it
+# usefully.
 
 # Distribution profile for `pie-worker`. Use
 # `cargo build --profile release-min -p pie-worker`. The regular

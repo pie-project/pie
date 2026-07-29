@@ -3,6 +3,27 @@
 //! All of it is conservative: every function here returns `None`/`false` when
 //! it cannot prove a rewrite is sound, so a new op inherits "no rewrite"
 //! rather than a guess.
+//!
+//! ## Why F32 is excluded from the algebra
+//!
+//! Two functions bail out on `DType::F32` before doing anything, and the
+//! reason is the same one in both places: IEEE-754 floats are not the ring
+//! the identities are written for.
+//!
+//! * `x + 0.0` is not `x` — it is `x` for every value except `-0.0`, where it
+//!   is `+0.0`. `x * 1.0` and `x / 1.0` are likewise not identities for
+//!   `NaN` payloads.
+//! * Addition and multiplication are commutative but **not associative** over
+//!   floats, and they are not even reassociable in the presence of `NaN`
+//!   ordering: `MaxElem`/`MinElem` propagate operand order when one side is
+//!   `NaN`, so swapping the operands changes the result.
+//!
+//! Neither guard is about precision being "close enough". A rewrite that
+//! moves a sign of zero or flips which `NaN` survives changes bits a sampler
+//! reads, and the whole point of a signature-keyed plan cache is that two
+//! stages hashing alike compute alike. So the float cases are simply not
+//! rewritten, and the integer and boolean cases — where the identities do
+//! hold — are.
 
 use alloc::vec::Vec;
 
@@ -28,6 +49,9 @@ pub(crate) fn simplify_alias(
             _ => {}
         }
     }
+    // Not an identity over IEEE-754: `x + 0.0` normalizes `-0.0` to `+0.0`,
+    // and `x * 1.0` / `x / 1.0` do not preserve `NaN` payloads. See the module
+    // docs.
     if result_type.dtype == DType::F32 {
         return None;
     }
@@ -160,6 +184,11 @@ pub(crate) fn fold_compare(
     Some(Literal::Bool(predicate(ordering)))
 }
 
+/// Put commutative operands in a canonical order so that `a + b` and `b + a`
+/// share a CSE key and a stage signature.
+///
+/// Skipped for F32: `MaxElem`/`MinElem` propagate operand order when one side
+/// is `NaN`, so the swap is observable. See the module docs.
 pub(crate) fn canonicalize_commutative(op: &mut Op, result_type: Option<&SymbolicType>) {
     if result_type.is_some_and(|result_type| result_type.dtype == DType::F32) {
         return;

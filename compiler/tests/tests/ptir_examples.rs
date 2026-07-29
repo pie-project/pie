@@ -1,8 +1,8 @@
-//! Thrust-3 P0/P4 exit tests: the overview **§3 example** (grammar-masked
-//! gumbel-greedy decode) and the **§6.2 beam epilogue** serialize, validate,
+//! End-to-end examples: **grammar-masked gumbel-greedy decode** and the
+//! **beam epilogue** serialize, validate,
 //! and hash stably; and both run end-to-end on the tier-0 reference
 //! interpreter — dummy-run on a late host edge observed and recovered, replay
-//! determinism (T8), beam reorder/freeze geometry exact.
+//! determinism, beam reorder/freeze geometry exact.
 
 use pie_eval::interp::Value;
 use pie_eval::interp::{Instance, NoKernels, PassInputs};
@@ -52,7 +52,7 @@ fn section3_end_to_end_with_late_mask_and_recovery() {
     assert_eq!(inst.host_take(&b, 1).unwrap(), i32s(&[7]));
 
     // Step 1 submitted before mask_1 lands: sample parks (dummy-run, no
-    // commit) — §1's software-pipelining contract.
+    // commit) — the software-pipelining contract.
     let r = inst.step(&b, &inputs, &mut NoKernels).unwrap();
     assert!(!r.committed);
     assert_eq!(r.missed.unwrap().0, 2);
@@ -209,7 +209,7 @@ fn beam_step_reorder_freeze_geometry_exact() {
 fn beam_page_turn_takes_fresh_slot() {
     // Same setup but the tail page is FULL (fill 4): every heir takes the
     // fresh-slot path at offset 0 — the page boundary is just divergence's
-    // fresh path taken by every heir at once (§6.2).
+    // fresh path taken by every heir at once.
     let c = beam_trace();
     let b = bind(c, beam_profile()).unwrap();
     let seeds: Vec<(u32, Value)> = vec![

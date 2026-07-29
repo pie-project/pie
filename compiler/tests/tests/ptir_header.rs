@@ -44,10 +44,13 @@ fn ptir_header_uptodate() {
 
 /// No C++ header may re-type a value the generated header already owns.
 ///
-/// This is the bug class the emitter oracle caught three times (`ptir-refactor.md`
-/// §3.2: `iota` 0x31 for 0x64, `const` 0x30 for 0x81, `PTIR_INTR_LAYER` 4 for 5).
-/// The oracle is gone now that the C++ emitters are, so the discipline needs its
-/// own gate: a driver header that spells a port, stage or intrinsic tag as a bare
+/// A re-typed tag is a whole bug class, not a one-off: `iota` written `0x31`
+/// where the table says `0x64`, `const` `0x30` for `0x81`, `PTIR_INTR_LAYER`
+/// `4` for `5`. Each compiles, each is a plausible-looking constant, and each
+/// mis-dispatches only for the one op it names.
+///
+/// So the discipline needs its own gate: a driver header that spells a port,
+/// stage or intrinsic tag as a bare
 /// integer literal has forked from `pie_ir::registry` and nothing else will say so.
 #[test]
 fn drivers_do_not_retype_generated_tags() {

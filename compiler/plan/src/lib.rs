@@ -18,6 +18,29 @@
 //! to run rather than given bytes to parse. [`debug_stage_plan`] renders a plan
 //! for humans, and [`stage_identity`] hashes one for cache keys, but neither is
 //! a format anything decodes.
+//!
+//! ## Why this crate returns no `Result`
+//!
+//! Every entry point here is infallible — [`compile_bound`] returns
+//! `Vec<CompiledStage>`, not `Result`. That is a precondition, not an
+//! oversight: the input is a [`BoundTrace`](pie_ir::validate::BoundTrace), and producing one requires
+//! [`pie_ir::validate::bind`], which is where a malformed guest container is
+//! rejected. Arity, SSA dominance, value-id range, channel-slot validity,
+//! stage ordering and readiness are all settled before a plan is asked for, so
+//! there is no untrusted input left for this crate to refuse.
+//!
+//! What remains are *invariants*: places where the code relies on something
+//! `bind` guarantees. Those are written as `expect` with the invariant named,
+//! never as a silent fallback — a wrong default here becomes a wrong plan,
+//! which becomes a kernel computing the wrong answer, and that is far worse
+//! than a panic naming the broken assumption. Each such site cites the check
+//! that establishes it, so the claim can be audited rather than trusted. The
+//! full list is short by design; if it grows, that is a signal that something
+//! untrusted has reached this crate and the entry points need to change shape.
+//!
+//! The backends are the opposite case and are fallible for the opposite
+//! reason: `pie-codegen` refuses plans it cannot emit (`EmitError`) because
+//! "this backend has no lowering for that" is a normal outcome, not a bug.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -30,11 +53,10 @@ pub mod lane_table;
 // anywhere under `compile` part of this crate's API whether or not anything
 // called it, so the surface grew silently and nothing ever shrank it.
 pub use compile::{
-    COMPILER_VERSION, ChannelSink, CompiledStage, Dimension, LibraryOp, NodeIndex,
-    NormalizedStage, PartitionKind, PlanMetrics, REGION_PLAN_VERSION, Region, RegionKind,
-    RegionPartition, ScheduleTemplate, StageSignature, SymbolicExtent, SymbolicType, ValueDomain,
-    compile_bound, compile_stage, compile_stage_at, debug_stage_plan, library_op_for_tag,
-    stage_identity,
+    COMPILER_VERSION, ChannelSink, CompiledStage, Dimension, LibraryOp, NodeIndex, NormalizedStage,
+    PartitionKind, PlanMetrics, REGION_PLAN_VERSION, Region, RegionKind, RegionPartition,
+    ScheduleTemplate, StageSignature, SymbolicExtent, SymbolicType, ValueDomain, compile_bound,
+    compile_stage, compile_stage_at, debug_stage_plan, library_op_for_tag, stage_identity,
 };
 pub use lane_table::{
     LANE_TABLE_ABI_VERSION, LaneChannelSlot, LaneRecord, LaneTableHeader, RuntimeExtents,

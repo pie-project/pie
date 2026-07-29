@@ -1,9 +1,9 @@
-//! `intrinsics::*` — first-party stage-scoped values + model constants (overview
-//! §4). Model constants are functions (a runtime value can't be a bare path in
+//! `intrinsics::*` — first-party stage-scoped values + model constants.
+//! Model constants are functions (a runtime value can't be a bare path in
 //! Rust; deviation approved). Stage-scoped values emit the IR's
 //! [`Op::IntrinsicVal`](pie_ir::op::Op::IntrinsicVal) with the
 //! trace-known shape/dtype the registry checks. `intrinsics::kernel::*` second-
-//! party surface: a minimal `attn_page_mask` sink now; full rollout in P7.
+//! party surface: a minimal `attn_page_mask` sink now; full rollout deferred.
 
 use pie_ir::op::IntrinsicId;
 use pie_ir::types::{DType, Shape};
@@ -22,7 +22,7 @@ pub fn page_size() -> u32 {
 }
 /// The interpreter-visible activation dtype.
 ///
-/// Named `activation_type` because §4 calls the backend's activation dtype
+/// Named `activation_type` because the backend's activation dtype is
 /// late-bound, but this constant is not late-bound and never was: the
 /// materialization every intrinsic declares — and every tier-0 run produces —
 /// is F32. A backend storing bf16/fp8 does so beneath this; nothing in a trace
@@ -36,15 +36,15 @@ fn logits_shape() -> Shape {
     Shape::matrix(rows.max(1), v)
 }
 
-/// `intrinsics::logits()` — the LM-head logits, `[n_out, vocab]` F32 (§5.1). For
+/// `intrinsics::logits()` — the LM-head logits, `[n_out, vocab]` F32. For
 /// a single read-out row the SDK reshapes to `[vocab]` so single-position
-/// samplers read a vector (the IR's §3 golden does the same).
+/// samplers read a vector (the IR's golden reference does the same).
 pub fn logits() -> Tensor {
     let t = intrinsic_val(IntrinsicId::Logits, logits_shape(), DType::F32);
     single_row_reshape(t)
 }
-/// `intrinsics::mtp_logits(k)` — the model's `k` draft/future-token heads (§4),
-/// decl'd `[k, vocab]` regardless of the embed row count. the IR's §6.1 contract:
+/// `intrinsics::mtp_logits(k)` — the model's `k` draft/future-token heads,
+/// decl'd `[k, vocab]` regardless of the embed row count. The contract:
 /// the classic `K` drafts vs `K+1` verify window are DISTINCT shapes — the CUDA driver's
 /// Stage-2 resolves the MtpLogits rows FROM THIS DECL (`mtp_draft_row .. +k`), so
 /// a `[K+1,V]` decl would request more rows than the head produces. Model-gated
@@ -73,7 +73,7 @@ pub fn hidden(width: u32) -> Tensor {
         activation_type,
     )
 }
-/// `intrinsics::query(width)` — this layer's projected query (attn taps, §5.3),
+/// `intrinsics::query(width)` — this layer's projected query (attn taps),
 /// `[width]`. Declared, not derived, for the same reason as [`hidden`].
 pub fn query(width: u32) -> Tensor {
     intrinsic_val(
@@ -130,7 +130,7 @@ pub fn attn_score(kv_max: u32) -> Tensor {
 }
 
 /// Reshape a `[1, vocab]` logits matrix to `[vocab]` for the single-row case
-/// (matches the IR's §3 golden). Multi-row passes keep the matrix.
+/// (matches the IR's golden reference). Multi-row passes keep the matrix.
 fn single_row_reshape(t: Tensor) -> Tensor {
     let s = t.shape();
     if s.rank() == 2 && s.dims()[0] == 1 {
@@ -140,8 +140,8 @@ fn single_row_reshape(t: Tensor) -> Tensor {
     }
 }
 
-/// Second-party kernels (`intrinsics::kernel::*`, overview §4). Full rollout is
-/// P7; a minimal `attn_page_mask` sink exists now so T11 is enforceable.
+/// Second-party kernels (`intrinsics::kernel::*`). A minimal `attn_page_mask`
+/// sink exists now so the sink stage-precedence lint is enforceable.
 pub mod kernel {
     use crate::context::{emit, intern_name, record_sink};
     use crate::error::Span;
@@ -203,7 +203,7 @@ pub mod kernel {
         )
     }
 
-    /// `attn_page_mask(mask)` — a configuration sink (overview §6.1): this
+    /// `attn_page_mask(mask)` — a configuration sink: this
     /// layer's attention consumes the page mask. Returns nothing.
     ///
     /// `mask` is `[p_max]`, one entry per page of the request's page list in

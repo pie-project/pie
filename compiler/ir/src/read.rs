@@ -1,23 +1,25 @@
 //! The one little-endian cursor the PTIR decoders share.
 //!
-//! There used to be three of these — `container::Reader`, `sidecar::Reader`
-//! and `compile::PlanReader` — identical apart from the error enum they
-//! returned. That is the shape of duplication that looks harmless until the
-//! copies stop agreeing: the container's cursor was for a while the only one
-//! without a structural ceiling on table counts, which is what let a hostile
-//! trace claim one op per byte and get all of them decoded, bound and compiled
-//! under a global lock.
+//! Every decoder reads from this one cursor rather than keeping its own.
+//! Per-decoder cursors differ only in the error type they return, which makes
+//! them look like harmless duplication — until the copies stop agreeing about
+//! a bound. The bound that matters here is the structural ceiling on table
+//! counts: a cursor without one lets a hostile trace claim one op per byte and
+//! get all of them decoded, bound and compiled before anything notices the
+//! size. A ceiling added to one cursor and not its copies protects only the
+//! format that happened to get the edit.
 //!
-//! Rather than make the cursor generic over the error type, it returns its own
-//! [`ReadError`] and each decoder converts with `From`. `?` does the rest, so
-//! call sites read the same as before and each format keeps its own public
-//! error enum.
+//! The error type is not made generic. This returns its own [`ReadError`] and
+//! each decoder converts with `From`, so `?` does the work at the call sites
+//! and every format still exposes its own public error enum.
 
 use core::convert::TryInto;
+use core::fmt;
 
 /// What a cursor can fail at. Deliberately small: everything above this layer
 /// is a format question, not a bytes question.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ReadError {
     /// Fewer bytes remain than the read asked for.
     UnexpectedEof,
@@ -26,6 +28,20 @@ pub enum ReadError {
     /// the caller can say which one.
     CountTooLarge(&'static str),
 }
+
+impl fmt::Display for ReadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ReadError::UnexpectedEof => f.write_str("unexpected end of input"),
+            ReadError::CountTooLarge(table) => {
+                write!(f, "{table} count exceeds what the input can back")
+            }
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for ReadError {}
 
 /// A bounds-checked little-endian cursor over untrusted bytes.
 ///
@@ -37,6 +53,7 @@ pub struct Reader<'a> {
 }
 
 impl<'a> Reader<'a> {
+    /// A cursor positioned at the start of `bytes`.
     pub fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, offset: 0 }
     }
@@ -47,10 +64,18 @@ impl<'a> Reader<'a> {
         self.offset
     }
 
+    /// How many bytes are left ahead of the cursor.
     pub fn remaining(&self) -> usize {
         self.bytes.len() - self.offset
     }
 
+    /// The next `count` bytes, advancing past them.
+    ///
+    /// # Errors
+    ///
+    /// [`ReadError::UnexpectedEof`] if fewer than `count` bytes remain. The
+    /// cursor does not move when that happens, so a failed read cannot leave
+    /// a decoder reading from a half-consumed field.
     pub fn take(&mut self, count: usize) -> Result<&'a [u8], ReadError> {
         let end = self
             .offset
@@ -64,18 +89,38 @@ impl<'a> Reader<'a> {
         Ok(value)
     }
 
+    /// The next u8 (1 little-endian byte).
+    ///
+    /// # Errors
+    ///
+    /// [`ReadError::UnexpectedEof`] if fewer than 1 byte remain.
     pub fn u8(&mut self) -> Result<u8, ReadError> {
         Ok(self.take(1)?[0])
     }
 
+    /// The next u16 (2 little-endian bytes).
+    ///
+    /// # Errors
+    ///
+    /// [`ReadError::UnexpectedEof`] if fewer than 2 bytes remain.
     pub fn u16(&mut self) -> Result<u16, ReadError> {
         Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
     }
 
+    /// The next u32 (4 little-endian bytes).
+    ///
+    /// # Errors
+    ///
+    /// [`ReadError::UnexpectedEof`] if fewer than 4 bytes remain.
     pub fn u32(&mut self) -> Result<u32, ReadError> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }
 
+    /// The next u64 (8 little-endian bytes).
+    ///
+    /// # Errors
+    ///
+    /// [`ReadError::UnexpectedEof`] if fewer than 8 bytes remain.
     pub fn u64(&mut self) -> Result<u64, ReadError> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
     }

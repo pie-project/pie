@@ -4,7 +4,7 @@
 //! whether a region can be emitted at all, and `second_party_region_supported`
 //! names the one second-party kernel this backend launches.
 
-use alloc::string::{String, ToString};
+use crate::error::{EmitError, RegionForm};
 
 use pie_ir::op::Op;
 use pie_ir::registry::Stage;
@@ -71,18 +71,18 @@ pub fn second_party_region_supported(stage: &CompiledStage, region: &Region) -> 
 }
 
 /// `validate_generated_region`.
-pub fn validate_generated_region(stage: &CompiledStage, region: &Region) -> Result<(), String> {
+pub fn validate_generated_region(stage: &CompiledStage, region: &Region) -> Result<(), EmitError> {
     if matches!(region.kind, RegionKind::Library(_))
         || region.schedule == ScheduleTemplate::Library
         || region.nodes.is_empty()
     {
-        return Err("fused CUDA emitter requires a non-library generated region".to_string());
+        return Err(EmitError::FusedRequiresGeneratedRegion);
     }
     let mut previous = NodeIndex(0);
     let mut have_previous = false;
     for &node in &region.nodes {
         if node.index() >= stage.normalized.ops.len() || (have_previous && node <= previous) {
-            return Err("generated region nodes are invalid or unordered".to_string());
+            return Err(EmitError::RegionNodesUnordered(RegionForm::Fused));
         }
         let op = &stage.normalized.ops[node.index()];
         // Asked through the same classifier `region_kind_for_node` used to
@@ -92,7 +92,7 @@ pub fn validate_generated_region(stage: &CompiledStage, region: &Region) -> Resu
         // `cumsum`, `cumprod` or `matmul` through to an emitter with no arm
         // for it.
         if library_op_for_tag(op.tag()).is_some() {
-            return Err("generated region contains a non-generated boundary".to_string());
+            return Err(EmitError::GeneratedRegionHasBoundary);
         }
         previous = node;
         have_previous = true;

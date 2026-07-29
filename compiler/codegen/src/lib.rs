@@ -49,6 +49,7 @@ extern crate alloc;
 
 pub mod alias;
 pub mod cuda;
+pub mod error;
 pub mod fault;
 pub mod header;
 pub mod launch;

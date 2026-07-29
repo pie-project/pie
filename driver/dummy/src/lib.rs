@@ -22,7 +22,7 @@ use pie_driver_abi::{
 };
 use pie_driver_abi::plan::ProgramRegistration;
 use pie_eval::interp::{
-    ExternChannel, HostError, Instance as InterpInstance, NoKernels, PassInputs, StepError, Value,
+    ExternChannel, HostError, Instance as InterpInstance, NoKernels, PassInputs, Value,
 };
 use pie_ir::container::{self, ExternDir, HostRole};
 use pie_ir::op::{IntrinsicId, Op};
@@ -1408,7 +1408,7 @@ fn run_instance_step(
     let report = inner
         .interp
         .step(&program.bound, &pass_inputs, &mut NoKernels)
-        .map_err(|err| anyhow!("interp step failed: {}", format_step_error(&err)))?;
+        .map_err(|err| anyhow!("interp step failed: {err}"))?;
     if !report.committed {
         return Ok(InstanceStepResult::Retry);
     }
@@ -1795,15 +1795,6 @@ fn deterministic_drafts(ty: ValueType, base: u64, vocab: u32) -> Value {
         drafts.push(((base as u32 + idx as u32) % vocab.max(2)) as i32);
     }
     Value::I32(drafts)
-}
-
-fn format_step_error(err: &StepError) -> String {
-    match err {
-        StepError::Poisoned => "poisoned".to_string(),
-        StepError::KernelFault { name, message } => format!("kernel {name} fault: {message}"),
-        StepError::MissingIntrinsic(intr) => format!("missing intrinsic {}", intr.name()),
-        StepError::Fault(message) => message.clone(),
-    }
 }
 
 fn ensure_abi(abi_version: u32) -> Result<()> {

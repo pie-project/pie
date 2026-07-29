@@ -26,6 +26,7 @@ use pie_codegen::cuda::{
     CUDA_GENERATED_EMITTER_VERSION, emit_fused_region, emit_singleton_region,
     second_party_region_supported, singleton_runtime_source, validate_generated_region,
 };
+use pie_codegen::error::EmitError;
 
 use device_text::OracleInputs;
 use msl_corpus::{corpus_bound, corpus_stages, region_shape};
@@ -85,12 +86,15 @@ impl Dump {
 
     /// `GeneratedKernelSource` carries its own ok/error, so there is no
     /// separate failure path — the C++ dumps the same four fields either way.
-    fn kernel(&mut self, entry_name: &str, op_tag: u8, emitted: &Result<String, String>) {
+    fn kernel(&mut self, entry_name: &str, op_tag: u8, emitted: &Result<String, EmitError>) {
         let _ = writeln!(self.body, "ok: {}", emitted.is_ok());
         let _ = writeln!(
             self.body,
             "error: {}",
-            emitted.as_ref().err().map_or("", |error| error.as_str())
+            emitted
+                .as_ref()
+                .err()
+                .map_or(String::new(), |error| error.to_string())
         );
         let _ = writeln!(self.body, "entry_name: {entry_name}");
         // `GeneratedKernelSource::op_tag` defaults to 0 and only the singleton
@@ -116,12 +120,15 @@ impl Dump {
     }
 
     /// The hashed form used for the 320 fused kernels.
-    fn kernel_digest(&mut self, entry_name: &str, emitted: &Result<String, String>) {
+    fn kernel_digest(&mut self, entry_name: &str, emitted: &Result<String, EmitError>) {
         let _ = writeln!(self.body, "ok: {}", emitted.is_ok());
         let _ = writeln!(
             self.body,
             "error: {}",
-            emitted.as_ref().err().map_or("", |error| error.as_str())
+            emitted
+                .as_ref()
+                .err()
+                .map_or(String::new(), |error| error.to_string())
         );
         let _ = writeln!(self.body, "entry_name: {entry_name}");
         if let Ok(source) = emitted {
@@ -286,7 +293,10 @@ fn region_emitters_match_oracle() {
                 validate.field("ok", &verdict.is_ok().to_string());
                 validate.field(
                     "error",
-                    verdict.as_ref().err().map_or("", |error| error.as_str()),
+                    &verdict
+                        .as_ref()
+                        .err()
+                        .map_or(String::new(), |error| error.to_string()),
                 );
                 validate.end();
 
@@ -325,9 +335,9 @@ fn emitter_version_matches_oracle() {
 /// Whole-program emission: the table a driver receives.
 ///
 /// The per-region emitters are pinned against the C++ oracle above; this pins
-/// the walk around them — that every region gets an entry, that entry names are
-/// the ones the drivers used to generate for themselves, and that a failure is
-/// recorded rather than dropped.
+/// the walk around them — that every region gets an entry, that entry names
+/// are exactly the ones the drivers look up, and that a failure is recorded
+/// rather than dropped.
 #[test]
 fn emit_program_covers_every_region() {
     use pie_codegen::program::{Backend, PIE_KERNEL_FUSED, emit_program};
@@ -419,15 +429,13 @@ fn emit_program_metal_covers_every_family() {
 ///
 /// A driver keys its graph cache on this value and a wrong key is silent: it
 /// does not fail, it reuses the wrong graph. The expected column was produced
-/// by compiling `driver/cuda/src/pipeline/program_identity.hpp` on the host and
-/// running it over `corpus_stages()`, which is why the file still names it —
-/// but nothing recomputes the value today. That header is gone, and Metal is
-/// *handed* the bytes (`m1_runtime.cpp:1089`, from `interface/driver/src/plan.rs`'s
-/// `identity`). So this is no longer a differential check against C++; it is
-/// the weaker but still necessary thing, a tripwire that an edit to
-/// normalization, signatures, or region partitioning changed a published cache
-/// key. Bump `pie_plan::COMPILER_VERSION` when regenerating, or deployed
-/// devices will keep serving graphs built for the old planner.
+/// by an external host-side implementation and nothing recomputes it here, so
+/// this is not a differential check — it is the weaker but still necessary
+/// thing: a tripwire that an edit to normalization, signatures, or region
+/// partitioning changed a published cache key. Metal is *handed* these bytes
+/// rather than deriving them, so a change here reaches a device without any
+/// other test noticing. Bump `pie_plan::COMPILER_VERSION` when regenerating,
+/// or deployed devices will keep serving graphs built for the old planner.
 #[test]
 fn stage_identity_is_pinned() {
     let mut rendered = String::new();
@@ -453,20 +461,19 @@ fn stage_identity_is_pinned() {
 
 /// Emit the CUDA kernel table for the traces the driver's own tests register.
 ///
-/// The driver no longer generates kernels, so a C++ test that registers a
-/// program has to be handed the same table the engine would hand it. It cannot
-/// run the Rust emitter, so the table is written here as a fixture beside the
-/// traces (`ptir-refactor.md` §4.3 — retargeting the driver test surface at the
-/// launch package).
+/// Kernels are generated here, not in the driver, so a C++ test that registers
+/// a program has to be handed the same table the engine would hand it. It
+/// cannot run the Rust emitter, so the table is written here as a fixture
+/// beside the traces.
 ///
 /// The corpus is `compiler/tests/driver-corpus/`: one hex container per file,
 /// named for the program the driver's tests register under that name. It is not
 /// a subset of `compiler/tests/golden/` (`staged_dispatch` exists only here), so
 /// it stays a corpus of its own — but a corpus only, holding containers and
-/// nothing else. It used to live in `driver/cuda/tests/golden-ptir/` and carry
-/// decoded plans, sidecars, and readiness verdicts beside each container: a
-/// second source of truth for a decoder that no longer exists
-/// (`ptir-refactor.md` §4.3).
+/// nothing else. Decoded plans, sidecars and readiness verdicts must not be
+/// parked beside the containers: a fixture that records what a decoder
+/// produced is a second source of truth for the decoder, and it is the copy
+/// that gets blessed rather than fixed.
 ///
 /// Format, one record per kernel:
 ///   `kernel <kind> <stage> <region> <entry-or-dash> <source-byte-count>`

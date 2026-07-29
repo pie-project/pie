@@ -3,12 +3,14 @@
 //! This is the whole of what crosses the host→driver boundary for a program,
 //! and it deliberately is not PTIR. A driver reading it never sees a container,
 //! a sidecar, a wire format, or an identity to re-check: the compiler already
-//! decided all of that (`ptir-refactor.md` §2.3). What it gets is the value
-//! table, the channels and ports to allocate and bind, the per-stage op DAGs to
-//! launch, and the per-stage plan the emitted kernels were generated from.
+//! decided all of that. What it gets is the value table, the channels and
+//! ports to allocate and bind, the per-stage op DAGs to launch, and the
+//! per-stage plan the emitted kernels were generated from.
 //!
-//! Two things that used to be re-derived on the far side are folded in here,
-//! because they are decisions about the program rather than about the machine:
+//! Two things a driver could plausibly re-derive are folded in here instead,
+//! because they are decisions about the program rather than about the machine
+//! — and a driver that re-derives them is a second implementation that has to
+//! agree with this one forever:
 //!
 //! * each stage's **graph-cache identity** ([`pie_plan::stage_identity`]), and
 //! * the **grouped static plan** — which runtime extents the stage depends on,
@@ -414,8 +416,8 @@ fn library_tag(op: LibraryOp) -> u8 {
 /// depends on, which values bind through a channel, which intrinsics it reads,
 /// and whether the path can cover it at all.
 ///
-/// This used to be `GroupedStageStaticPlan`'s constructor in the CUDA driver.
-/// It is a decision about the program, so it is made once, here.
+/// A decision about the program rather than about the device, so it is made
+/// once here rather than in each driver's launch path.
 #[derive(Default)]
 struct GroupedPlan {
     flags: u32,
@@ -528,19 +530,20 @@ impl GroupedPlan {
 
 /// Whether the grouped runtime has a body for this tag.
 ///
-/// This used to be a list of raw hex ranges (`0x01..=0x07 | 0x10..=0x20 | ...`).
-/// The gaps between those ranges are exactly where new op tags go, so a new op
-/// was silently classified unsupported. Replacing the ranges with a
-/// `GROUPED_UNSUPPORTED` exception list closed the gaps but created a worse
-/// problem: `grouped_supported_tag` was *defined* as "not in the list", so the
-/// test that walked the list asserted `!contains(x)` for `x in list` — a
-/// tautology that survived both emptying the list and adding `add` to it.
+/// Answered from the runtime source, and neither of the two shapes this
+/// invites.
 ///
-/// The list is gone. It held one tag, `kernel_call`, and that entry was wrong
-/// twice over: `lower_stage_plan` `continue`s on `kernel_call` before this gate
-/// is ever consulted, and `ptir_m1_execute` does have an arm for it — which
-/// `metal::preamble::tests::metal_execute_covers_the_op_table` proves. The
-/// runtime source is the authority now, and
+/// *Raw tag ranges* (`0x01..=0x07 | 0x10..=0x20 | ...`) classify by numeric
+/// neighbourhood. The gaps between such ranges are exactly where new op tags
+/// get allocated, so a new op is silently classified unsupported.
+///
+/// *An exception list* closes the gaps and creates a worse problem: if support
+/// is **defined** as "not in the list", then a test walking the list to check
+/// it asserts `!contains(x)` for `x in list` — a tautology that passes whether
+/// the list is empty or holds `add`. A predicate must not be tested against
+/// the thing that defines it.
+///
+/// So the authority is the runtime source itself:
 /// `grouped_support_is_what_the_runtime_can_execute` holds this function to it.
 fn grouped_supported_tag(tag: u8) -> bool {
     pie_ir::op::spec(tag).is_some()

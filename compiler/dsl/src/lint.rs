@@ -1,4 +1,4 @@
-//! SDK span lints (overview P1.3): SPSC double-endpoint, readiness-direction
+//! SDK span lints: SPSC double-endpoint, readiness-direction
 //! conflict, and sink stage-precedence — caught during assembly with source
 //! spans. The IR's [`bind`](pie_ir::validate::bind) is the
 //! authoritative SPSC gate (host-role vs pass; the descriptor + all stages are
@@ -45,7 +45,7 @@ pub(crate) fn lint(
             });
         }
 
-        // Readiness-direction (T3): a consumed channel must be produced or
+        // Readiness-direction: a consumed channel must be produced or
         // seeded, else its `take`/`read` can never become full.
         let produced = stage_puts || host_writes.is_some() || st.seeded || st.seed.is_some();
         let consumed = stage_consumes
@@ -70,7 +70,7 @@ pub(crate) fn lint(
         }
     }
 
-    // Sink stage-precedence (T11).
+    // Sink stage-precedence.
     for (stage, s) in sinks {
         let ok = match s.scope {
             SinkScope::PassWide => *stage == Stage::Prologue,

@@ -1,18 +1,17 @@
 //! The neutral trace **builder** — the DSL crate's lowering core.
 //!
-//! [`Builder`] is the boundary-agnostic half of what used to be `ForwardPass`:
-//! it takes descriptor-port bindings ([`bind_port`](Builder::bind_port)) and
+//! [`Builder`] is the boundary-agnostic authoring core: it takes
+//! descriptor-port bindings ([`bind_port`](Builder::bind_port)) and
 //! stage closures ([`stage`](Builder::stage)), traces the closures once into
 //! the IR's canonical [`TraceContainer`], and runs the SDK span lints. It does
-//! **not** bind (D6: the guest does not bind — `forward-pass.program` is the
+//! **not** bind (the guest does not bind — `forward-pass.program` is the
 //! authoritative gate); the author-facing `ForwardPass`/`Pipeline`/`WorkingSet`
 //! lifetime objects live in `inferlet`, wrap the WIT resources, and drive this
 //! builder.
 //!
-//! The subtle assembly machinery is preserved verbatim from the pre-A1
-//! `ForwardPass::assemble`: gid re-key (interning order → declaration order),
+//! Assembly invariants: gid re-key (interning order → declaration order),
 //! `HostRole` derivation, terminal-output inference, and the reader auto-drain
-//! drop. See [`crate`] A.5 invariants.
+//! drop.
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -67,7 +66,7 @@ impl<'a> Builder<'a> {
     /// Bind a descriptor [`Port`] to a channel. Records the port's
     /// endpoint claim on the channel per its fixed consumption discipline
     /// ([`Port::consumes`]): the token-indexed family (`embed`, `positions`,
-    /// `w_slot`/`w_off`) **takes**; geometry and masks **read** (§5.1). The
+    /// `w_slot`/`w_off`) **takes**; geometry and masks **read**. The
     /// claim drives host-role derivation and the span lints.
     #[track_caller]
     pub fn bind_port(&mut self, port: Port, source: impl Into<PortInput>) {
@@ -100,14 +99,22 @@ impl<'a> Builder<'a> {
         }
     }
 
-    /// Read-out rows for `intrinsics::logits()`: an explicit `Readout` channel,
-    /// else the number of `EmbedIndptr` lanes.
+    /// Read-out rows for `intrinsics::logits()`: an explicit `Readout`
+    /// channel, else the number of `EmbedIndptr` lanes.
+    ///
+    /// Saturating rather than truncating: a channel's cell shape is only
+    /// bounded to a `u64` element product, so a rank-2 read-out channel can
+    /// carry more elements than a `u32` row count holds. Wrapping there lands
+    /// on a small row count that plans and runs, and the pass then reads out
+    /// one row where the author asked for billions.
     fn rows(&self) -> u32 {
         if let Some(channel) = self.channel_port(Port::Readout) {
-            return (channel.shape().numel() as u32).max(1);
+            return saturating_rows(channel.shape().numel()).max(1);
         }
         if let Some(channel) = self.channel_port(Port::EmbedIndptr) {
-            return (channel.shape().numel() as u32).saturating_sub(1).max(1);
+            return saturating_rows(channel.shape().numel())
+                .saturating_sub(1)
+                .max(1);
         }
         1
     }
@@ -120,13 +127,19 @@ impl<'a> Builder<'a> {
 
     /// Trace + lint, returning the canonical [`Traced`] artifact: container
     /// bytes, dense-order channel identities, and names. Runs the SDK span
-    /// lints only; authoritative validation is `forward-pass.program`'s result (D6).
+    /// lints only; authoritative validation is `forward-pass.program`'s result.
     pub fn build(&self) -> Result<Traced, TraceErrors> {
         let rows = self.rows();
-        let (result, channels, names) =
+        let (result, channels, names, authoring) =
             crate::model::with_constants(self.vocab, self.page_size, || {
                 context::with_session(|| self.record(rows))
             });
+        // Authoring mistakes come first and alone: everything below reads the
+        // recorded ops as if they typed, and a poisoned value makes the later
+        // diagnostics describe the recovery rather than the mistake.
+        if !authoring.is_empty() {
+            return Err(TraceErrors(authoring));
+        }
         let (stage_results, ports) = result;
 
         // The recorder interns channels in first-REFERENCE order (the order they
@@ -261,7 +274,7 @@ impl<'a> Builder<'a> {
         };
 
         // SDK span lints (friendly, spans). The IR's authoritative bind lives on
-        // the host at `forward-pass.program` (D6); native parity tests bind explicitly.
+        // the host at `forward-pass.program`; native parity tests bind explicitly.
         let mut errs: Vec<TraceError> = Vec::new();
         crate::lint::lint(&channels, &sinks, &mut errs);
         if !errs.is_empty() {
@@ -302,8 +315,8 @@ impl<'a> Builder<'a> {
 }
 
 /// A traced, linted forward pass: the IR's canonical [`TraceContainer`] plus the
-/// dense-order channel identities (gids) and names. Identity is the C3 hash
-/// (FNV-1a over the canonical container bytes); binding is the host's job (D6).
+/// dense-order channel identities (gids) and names. Identity is the FNV-1a hash
+/// over the canonical container bytes; binding is the host's job.
 #[derive(Debug)]
 pub struct Traced {
     container: TraceContainer,
@@ -333,4 +346,9 @@ impl Traced {
     pub fn channel_names(&self) -> &[String] {
         &self.channel_names
     }
+}
+
+/// An element count as a row count, clamped instead of wrapped.
+fn saturating_rows(numel: u64) -> u32 {
+    u32::try_from(numel).unwrap_or(u32::MAX)
 }

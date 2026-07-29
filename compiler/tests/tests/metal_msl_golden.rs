@@ -40,6 +40,7 @@ mod provenance;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
+use pie_codegen::error::EmitError;
 use pie_codegen::metal::preamble::grouped_preamble;
 use pie_codegen::metal::{
     M1ChannelEffect, METAL_M1_EMITTER_VERSION, METAL_M1_MAX_CHANNELS, RUNTIME_TEMPLATE,
@@ -183,7 +184,7 @@ impl Dump {
         self.end();
     }
 
-    fn result(&mut self, emitted: Result<String, String>) {
+    fn result(&mut self, emitted: Result<String, EmitError>) {
         match emitted {
             Ok(source) => self.source(&source),
             Err(error) => {
@@ -635,7 +636,7 @@ impl Verdict {
             },
             Err(error) => Self {
                 ok: false,
-                error,
+                error: error.to_string(),
                 operations: Vec::new(),
             },
         }

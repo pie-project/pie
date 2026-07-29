@@ -3,8 +3,7 @@
 //! A direct port of `driver/cuda/src/pipeline/generated/` (namespace
 //! `pie_cuda_driver::pipeline::generated`). The C++ original is the oracle:
 //! every function here emits the same bytes for the same input, and
-//! `compiler/tests/golden-cuda/` is the checked-in proof (see
-//! `compiler/tests/oracle/README.md`).
+//! `compiler/tests/golden-cuda/` is the checked-in proof.
 //!
 //! Like the Metal port, the differences from the C++ are mechanical: the
 //! `GeneratedKernelSource` out-struct becomes [`Result`], and the runtime

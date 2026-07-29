@@ -65,7 +65,7 @@ pub fn const_port(port: Port, dtype: DType, shape: Shape, words: &[u32]) -> Port
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Overview §3 — masked gumbel-greedy decode
+// Masked gumbel-greedy decode
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub const VOCAB: u32 = 32;
@@ -154,7 +154,7 @@ pub fn flat_logits(fav: usize, x: f32) -> Value {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Overview §6.2 — beam epilogue (reorder = gathers, divergence = freeze)
+// Beam epilogue (reorder = gathers, divergence = freeze)
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub const BB: u32 = 2; // beams
@@ -162,7 +162,7 @@ pub const V: u32 = 8; // vocab
 pub const P: u32 = 3; // page slots per row
 pub const PAGE: u32 = 4; // tokens per page
 
-/// Channels (indices as in overview §6.2):
+/// Channels, in declaration order:
 /// 0 pages [B,P] u32 · 1 lens [B,P] u32 · 2 klen [B] u32 · 3 kvm [B,P*page]
 /// bool · 4 pos [B] u32 · 5 np [B] u32 · 6 tslot [B] u32 · 7 tfill [B] u32 ·
 /// 8 w_slot [B] u32 · 9 w_off [B] u32 · 10 toks [B] i32 · 11 scores [B] f32 ·
@@ -314,9 +314,10 @@ pub fn beam_trace() -> TraceContainer {
         b.p(Op::Add(t, off1))
     };
     // klen/kvm are pure derivatives of `lens`, recomputed each step: drain
-    // the stale cell (take, value unused) before refilling — under §1's
+    // the stale cell (take, value unused) before refilling — under the
     // capacity-1 full/empty bits a put without a drain would back-pressure
-    // forever on step 2. (Overview §6.2 elides the drain; the trace can't.)
+    // forever on step 2. A prose sketch of a beam epilogue elides this
+    // drain; a trace cannot.
     b.p(Op::ChanTake(2));
     b.p(Op::ChanPut {
         chan: 2,

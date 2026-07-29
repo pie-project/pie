@@ -8,6 +8,7 @@
 //! two inline expansions the single-lane form does not have — the MTP-draft
 //! argmax and the logits gather.
 
+use crate::error::{EmitError, EmitterKind, RegionForm};
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -47,9 +48,10 @@ fn resolve_alias(alias: &BTreeMap<u32, u32>, mut value: u32) -> u32 {
 /// buffer.
 ///
 /// Emitted into `ptir_abi.h` as `PTIR_METAL_M3_REGION_THREADS`, which is what
-/// `m1_runtime.cpp`'s `kM3RegionThreads` now reads. It used to be a hand-kept
-/// copy with a "must equal" comment and nothing comparing them, and it did
-/// drift: 256 in the driver against a 1024-element buffer in the goldens.
+/// `m1_runtime.cpp`'s `kM3RegionThreads` reads. It must not be transcribed on
+/// the driver side: a hand-kept copy carrying a "must equal" comment has
+/// nothing comparing the two, and the failure mode is a threadgroup sized for
+/// one count reducing over a buffer built for another.
 ///
 /// 512 measured against 256 with the model DAG truncated away, interleaved to
 /// cancel thermal drift: 0.951ms vs 1.557ms for the sampler region, reproduced
@@ -65,13 +67,16 @@ pub fn emit_fused_region(
     function_name: &str,
     stage: &CompiledStage,
     region: &Region,
-) -> Result<String, String> {
+) -> Result<String, EmitError> {
     if !library_region_valid(stage, region) {
-        return Err("library region ABI is invalid".to_string());
+        return Err(EmitError::LibraryRegionAbiInvalid(RegionForm::Unnamed));
     }
     let channel_bindings = &stage.normalized.channel_bindings;
     if channel_bindings.len() > METAL_M2_MAX_FUSED_CHANNELS {
-        return Err("fused region exceeds the 12-channel direct-binding limit".to_string());
+        return Err(EmitError::ChannelLimitExceeded {
+            emitter: EmitterKind::MetalFused,
+            limit: METAL_M2_MAX_FUSED_CHANNELS,
+        });
     }
     let ops: Vec<OpView> = OpView::of_all(&stage.normalized.ops);
     intrinsics_bindable(&ops, region)?;
@@ -108,17 +113,17 @@ pub fn emit_fused_region(
     for &node in &region.nodes {
         let node = node.index();
         let Some(op) = ops.get(node) else {
-            return Err("fused region node out of range".to_string());
+            return Err(EmitError::RegionNodeOutOfRange(RegionForm::Fused));
         };
         let mut slots = Slots::of(op, bases[node], value_ptr);
         if op.tag == tags::CHAN_TAKE || op.tag == tags::CHAN_READ {
             if op.chan < 0 || op.chan as usize >= channel_bindings.len() {
-                return Err("fused channel root binding out of range".to_string());
+                return Err(EmitError::ChannelRootBindingOutOfRange);
             }
             slots.a0 = format!("current_{}", op.chan);
         } else if op.tag == tags::CHAN_PUT {
             if op.chan < 0 || op.chan as usize >= channel_bindings.len() {
-                return Err("fused channel sink binding out of range".to_string());
+                return Err(EmitError::ChannelSinkBindingOutOfRange);
             }
             slots.o0 = format!("pending_{}", op.chan);
         } else if op.tag == tags::INTRINSIC_VAL {
@@ -143,9 +148,9 @@ pub fn emit_grouped_fused_region(
     function_name: &str,
     stage: &CompiledStage,
     region: &Region,
-) -> Result<String, String> {
+) -> Result<String, EmitError> {
     if !library_region_valid(stage, region) {
-        return Err("grouped library region ABI is invalid".to_string());
+        return Err(EmitError::LibraryRegionAbiInvalid(RegionForm::GroupedFused));
     }
     let ops: Vec<OpView> = OpView::of_all(&stage.normalized.ops);
     intrinsics_bindable(&ops, region)?;
@@ -329,7 +334,7 @@ pub fn emit_grouped_fused_region(
     for &node in &region.nodes {
         let node = node.index();
         let Some(op) = ops.get(node) else {
-            return Err("grouped fused region node out of range".to_string());
+            return Err(EmitError::RegionNodeOutOfRange(RegionForm::GroupedFused));
         };
         let base = bases[node];
         if elided_gather.contains(&node) {

@@ -1,3 +1,12 @@
+//! The RNG constants live in exactly one place.
+//!
+//! Every backend has to reproduce PTIR's noise bit for bit, so each of them
+//! needs the same magic numbers. These tests check that the numbers reach the
+//! generated sources by projection from `pie_ir::rng::RNG_FORMULA` rather than
+//! by transcription: a transcribed constant keeps compiling after the formula
+//! moves, and the divergence only shows up as a replay that no longer matches
+//! its original.
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -203,6 +212,7 @@ fn rng_magic_is_owned_by_the_contract() {
         // boost-style `hash_combine` for the GEMM autotune cache key; the
         // golden-ratio word again, and nothing to do with the PTIR stream.
         Path::new("driver/cuda/src/ops/gemm.cpp"),
+        Path::new("driver/cuda/src/ops/tuning_cache.hpp"),
     ];
     let unrelated_mask_users = [
         Path::new("driver/cuda/tests/ptir_tier0_test.cu"),
@@ -247,10 +257,11 @@ fn rng_magic_is_owned_by_the_contract() {
 /// The emitted CUDA source and the checked-in C++ header carry the same device
 /// RNG text, and both must keep coming from `render_cuda_functions`.
 ///
-/// `cuda::runtime` used to recover the preamble by generating this header and
-/// searching for the literal's delimiters. It calls the generator directly
-/// now, so this test is what still ties the two together: the header's
-/// embedded literal must be exactly what the emitter splices in.
+/// Both callers reach `render_cuda_functions` directly; neither recovers the
+/// preamble by generating the header and searching for the raw literal's
+/// delimiters, which would make the emitter fail on a whitespace edit to a
+/// header. This test is what ties the two outputs together instead: the
+/// header's embedded literal must be exactly what the emitter splices in.
 #[test]
 fn cuda_preamble_matches_the_header_literal() {
     let header = generate_cuda_header();

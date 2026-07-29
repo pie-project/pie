@@ -62,8 +62,13 @@ pub fn escaping_values(region: &Region) -> BTreeSet<u32> {
 /// the IR, where `numel` is compared before symbolic lowering — is exactly the
 /// case this rejects.
 pub fn covers(value_types: &[SymbolicType], source: u32, result: u32) -> bool {
-    let (Some((src_dtype, src_static, src_symbolic)), Some((dst_dtype, dst_static, mut dst_symbolic))) =
-        (footprint(value_types, source), footprint(value_types, result))
+    let (
+        Some((src_dtype, src_static, src_symbolic)),
+        Some((dst_dtype, dst_static, mut dst_symbolic)),
+    ) = (
+        footprint(value_types, source),
+        footprint(value_types, result),
+    )
     else {
         return false;
     };

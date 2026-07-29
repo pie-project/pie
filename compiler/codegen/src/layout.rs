@@ -41,7 +41,10 @@ use alloc::string::String;
 /// supported backends, so there is no pointer-shaped case.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FieldType {
+    /// A 32-bit unsigned field (`uint32_t` / `uint` / `m1_u32`).
     U32,
+    /// A 64-bit unsigned field (`uint64_t` / `ulong` / `m1_u64`); also every
+    /// address, since both backends use 64-bit pointers.
     U64,
 }
 
@@ -80,14 +83,19 @@ impl FieldType {
     }
 }
 
+/// One field of a device struct: its C name, its MSL spelling, and its scalar
+/// width.
 #[derive(Clone, Copy, Debug)]
 pub struct Field {
+    /// The field's name in the generated C header and in `pie-plan`'s
+    /// `#[repr(C)]` struct.
     pub name: &'static str,
     /// The name MSL uses, when it differs. It differs in exactly one place —
     /// see [`LANE_TABLE_HEADER`] — and carrying the difference here is what
     /// lets the generator reproduce the existing bytes instead of quietly
     /// renaming a field the goldens and the driver already agree on.
     pub msl_name: &'static str,
+    /// The field's scalar width.
     pub ty: FieldType,
 }
 
@@ -127,6 +135,8 @@ pub enum MslStyle {
     Block,
 }
 
+/// One device struct: its name in each dialect, its MSL layout style, and its
+/// ordered field list.
 #[derive(Clone, Copy, Debug)]
 pub struct DeviceStruct {
     /// Name in the generated C header, `Ptir`-prefixed.
@@ -135,7 +145,10 @@ pub struct DeviceStruct {
     /// dialects do not agree on every suffix (`LaneTableHeader` is
     /// `LaneHeader` in MSL), so both are spelled out.
     pub msl_suffix: &'static str,
+    /// How the MSL printer lays the fields out.
     pub msl_style: MslStyle,
+    /// The struct's fields in declaration order; offsets follow from their
+    /// widths.
     pub fields: &'static [Field],
 }
 

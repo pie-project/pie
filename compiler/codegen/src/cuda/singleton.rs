@@ -3,6 +3,7 @@
 //! A thin wrapper: validate the entry name and the op tag, then append a
 //! single-thread `__global__` trampoline into the runtime's op switch.
 
+use crate::error::{EmitError, EmitterKind};
 use alloc::format;
 use alloc::string::String;
 
@@ -31,12 +32,14 @@ pub fn supported_tag(tag: u8) -> bool {
 }
 
 /// `emit_singleton_region_cuda`.
-pub fn emit_singleton_region(entry_name: &str, op_tag: u8) -> Result<String, String> {
+pub fn emit_singleton_region(entry_name: &str, op_tag: u8) -> Result<String, EmitError> {
     if !valid_identifier(entry_name) {
-        return Err("CUDA singleton entry name is not a C identifier".into());
+        return Err(EmitError::EntryNameNotCIdentifier(
+            EmitterKind::CudaSingleton,
+        ));
     }
     if !supported_tag(op_tag) {
-        return Err(format!("unsupported CUDA singleton opcode tag {op_tag}"));
+        return Err(EmitError::UnsupportedSingletonOpcode { tag: op_tag });
     }
     let mut source = singleton_runtime_source();
     source.push_str("\nextern \"C\" __global__ void ");
