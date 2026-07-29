@@ -206,6 +206,155 @@ def measure_xgrammar(
     }
 
 
+#: Calls per sample. A decode loop enqueues and moves on, so timing one call
+#: at a time means synchronising around it, and that synchronisation is charged
+#: to whoever has device work - which is us and not XGrammar's advance. Timing
+#: a run of calls and dividing removes the wait without giving up a
+#: distribution: each sample is still an independent measurement, just of a run
+#: rather than of a call. Measured on our own step, per-call timing reports 85
+#: us at batch 1 where a loop reports 45.
+_RUN = 10
+
+
+def measure_step(
+    ours: Any,
+    theirs: Any,
+    batch: int,
+    tokens: list[int],
+    vocabulary_size: int,
+    repeats: int,
+    warmup: int,
+) -> dict[str, Distribution]:
+    """A decode step that actually moves, for both engines.
+
+    Measuring the fill on its own means filling the *same* parse state over and
+    over, and a mask cached by parse state answers every repeat for free. That
+    flatters this engine and nothing else - it is not what a decode does, which
+    is fill, sample, advance, and then fill something new. Here each step
+    advances first, so every mask is for a state the step just arrived at, and
+    both engines walk the same tokens from the same places.
+
+    The walk is a window of the document, restarted when it runs out. Restarts
+    are outside the timing.
+    """
+    import torch
+
+    import xgrammar as xg
+
+    from gpu_lr1.device_parser import DeviceBatch, DeviceGrammar
+
+    window = tokens[: max(2, min(len(tokens), 24))]
+
+    device_grammar = DeviceGrammar(ours)
+    device_batch = DeviceBatch(device_grammar, batch)
+
+    def seed() -> list[Any]:
+        rng = random.Random(20260726)
+        held = []
+        for _ in range(batch):
+            matcher = ours.matcher()
+            for token in tokens[: rng.randrange(1, max(2, len(tokens)))]:
+                if not matcher.accept_token(token):
+                    break
+            held.append(matcher)
+        device_batch.set_batch_configurations(
+            {index: matcher.configurations() for index, matcher in enumerate(held)}
+        )
+        return held
+
+    seed()
+    device_batch.fill_mask()
+    device_batch.capture()
+    device_batch.advance(torch.zeros(batch, dtype=torch.int32, device="cuda"))
+    device_batch.capture_advance()
+    device_batch.capture_step()
+    steps = [
+        torch.full((batch,), token, dtype=torch.int32, device="cuda")
+        for token in window
+    ]
+
+    def our_run() -> None:
+        for token in steps:
+            device_batch.advance_and_fill(token)
+
+    def our_reset() -> None:
+        seed()
+
+    their_matchers = seed_theirs = None
+
+    def their_reset() -> None:
+        nonlocal their_matchers
+        rng = random.Random(20260726)
+        their_matchers = []
+        for _ in range(batch):
+            matcher = xg.GrammarMatcher(
+                theirs, terminate_without_stop_token=True, max_rollback_tokens=4
+            )
+            for token in tokens[: rng.randrange(1, max(2, len(tokens)))]:
+                if not matcher.accept_token(token):
+                    break
+            their_matchers.append(matcher)
+
+    their_reset()
+    host_mask = xg.allocate_token_bitmask(batch, vocabulary_size)
+    device_mask = torch.zeros_like(host_mask, device="cuda")
+
+    def their_run_with(workers: int) -> Any:
+        pool = ThreadPoolExecutor(max_workers=workers) if workers > 1 else None
+        chunks = [list(range(start, batch, workers)) for start in range(min(workers, batch))]
+
+        def piece(indices: list[int]) -> None:
+            for index in indices:
+                their_matchers[index].fill_next_token_bitmask(host_mask, index)
+
+        def run() -> None:
+            for token in window:
+                for matcher in their_matchers:
+                    matcher.accept_token(token)
+                if pool is None:
+                    for index, matcher in enumerate(their_matchers):
+                        matcher.fill_next_token_bitmask(host_mask, index)
+                else:
+                    list(pool.map(piece, chunks))
+                device_mask.copy_(host_mask, non_blocking=True)
+
+        return run
+
+    length = len(window)
+    ours_measured = _walked(our_run, our_reset, length, warmup, repeats)
+    best = None
+    for workers in (1, 2, 4, 8, 16, 32):
+        if workers > 1 and workers > batch:
+            continue
+        measured = _walked(
+            their_run_with(workers), their_reset, length, warmup, repeats
+        )
+        if best is None or measured.p50 < best.p50:
+            best = measured
+    return {"ours": ours_measured, "xgrammar": best}
+
+
+def _walked(
+    run: Any, reset: Any, length: int, warmup: int, repeats: int
+) -> Distribution:
+    """Time a walk of `length` steps, reporting the cost of one."""
+    import time
+
+    for _ in range(max(1, warmup // length)):
+        reset()
+        run()
+    cuda_sync()
+    samples = []
+    for _ in range(max(2, repeats // length)):
+        reset()
+        cuda_sync()
+        started = time.perf_counter()
+        run()
+        cuda_sync()
+        samples.append((time.perf_counter() - started) * 1e6 / length)
+    return Distribution.of(samples)
+
+
 def _timed(call: Any, *, warmup: int, repeats: int, sync: bool) -> Distribution:
     import time
 
@@ -215,14 +364,13 @@ def _timed(call: Any, *, warmup: int, repeats: int, sync: bool) -> Distribution:
         cuda_sync()
 
     samples = []
-    for _ in range(repeats):
-        if sync:
-            cuda_sync()
+    for _ in range(max(1, repeats // _RUN)):
         started = time.perf_counter()
-        call()
+        for _ in range(_RUN):
+            call()
         if sync:
             cuda_sync()
-        samples.append((time.perf_counter() - started) * 1e6)
+        samples.append((time.perf_counter() - started) * 1e6 / _RUN)
     return Distribution.of(samples)
 
 
@@ -320,6 +468,15 @@ def main() -> None:
             their = measure_xgrammar(
                 theirs, batch, tokens, len(tokenizer), arguments.repeats, arguments.warmup
             )
+            walked = measure_step(
+                ours,
+                theirs,
+                batch,
+                tokens,
+                len(tokenizer),
+                arguments.repeats,
+                arguments.warmup,
+            )
             rows.append(
                 {
                     "schema": schema_index,
@@ -327,13 +484,16 @@ def main() -> None:
                     "batch": batch,
                     "gpugrammar": {k: asdict(v) for k, v in our.items()},
                     "xgrammar": {k: asdict(v) for k, v in their.items()},
+                    "walked": {k: asdict(v) for k, v in walked.items()},
                 }
             )
             print(
                 f"  batch {batch:5}  ours fill {our['fill'].p50:9.1f}us "
                 f"advance {our['advance'].p50:8.1f}us | "
                 f"xgr fill {their['fill'].p50:9.1f}us "
-                f"advance {their['advance'].p50:8.1f}us"
+                f"advance {their['advance'].p50:8.1f}us "
+                f"| step {walked['ours'].p50:7.1f} vs {walked['xgrammar'].p50:8.1f}us "
+                f"= {walked['xgrammar'].p50 / max(walked['ours'].p50, 1e-9):5.2f}x"
             )
 
     forward = {}
