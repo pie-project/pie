@@ -57,6 +57,8 @@ struct MultiBatchPsos {
     Pso qmm_splitk_reduce{};
     Pso qmm_splitk_reduce_residual{};
     Pso qmm_t_strided{};
+    Pso qmm_t_strided_wide{};
+    Pso qmm_t_strided_wide_residual{};
     Pso qmm_t_strided_residual{};
     // Row-independent prefill kernels with an explicit row pitch, so a whole
     // prompt runs as one dispatch instead of one per token.  Same arithmetic as

@@ -1669,6 +1669,7 @@ template <typename T, int group_size, int bits, int BM, int BK, int BN>
       uint3, uint, uint);
 
 instantiate_qmm_t_strided(16, 32, 32)
+instantiate_qmm_t_strided(32, 32, 32)
 
 
 // Same as `qmm_t_aligned_impl`, except the K loop runs `k_len` columns from the

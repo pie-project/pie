@@ -427,8 +427,13 @@ void encode_prefill_dags_mb(StepEncoder& se,
         if (strided_rows > 0 && d0.kind != Kernel::QmvLmHead) {
             const int out = qmv_out_size(d0.kind, *geometry);
             if (out != 0 && out % 32 == 0) {
-                const Pso& gemm = d0.fuse_residual ? mb_psos.qmm_t_strided_residual
-                                                   : mb_psos.qmm_t_strided;
+                const bool wide = qmm_strided_bm(strided_rows) == kQmmBMWide &&
+                                  mb_psos.qmm_t_strided_wide.valid();
+                const Pso& gemm =
+                    wide ? (d0.fuse_residual ? mb_psos.qmm_t_strided_wide_residual
+                                             : mb_psos.qmm_t_strided_wide)
+                         : (d0.fuse_residual ? mb_psos.qmm_t_strided_residual
+                                             : mb_psos.qmm_t_strided);
                 if (gemm.valid()) {
                     Grid grid;
                     Threadgroup tg;

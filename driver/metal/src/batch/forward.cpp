@@ -1732,13 +1732,30 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
         static double sum[2][33] = {};
         static double wall[33] = {};
         static double enc[33] = {};
+        // Gap between one step returning and the next arriving: the GPU is idle
+        // for all of it, and nothing inside this driver can see it otherwise.
+        static double gap[33] = {};
+        // Bucketed, because the mean cannot tell "every step round-trips" from
+        // "only frame boundaries do".
+        static int gap_lt1[33] = {};
+        static int gap_ge1[33] = {};
+        static double gap_max[33] = {};
+        static std::chrono::steady_clock::time_point last[33] = {};
         static int n[2][33] = {};
         const int lanes = schedule.N < 33 ? schedule.N : 32;
         const int arm = ab_enabled() && ab_arm() ? 1 : 0;
         sum[arm][lanes] += timing.gpu_exec_ms;
-        wall[lanes] += std::chrono::duration<double, std::milli>(
-                           std::chrono::steady_clock::now() - step_t0).count();
+        const auto now_tp = std::chrono::steady_clock::now();
+        wall[lanes] += std::chrono::duration<double, std::milli>(now_tp - step_t0).count();
         enc[lanes] += timing.encode_ms;
+        if (last[lanes].time_since_epoch().count() != 0) {
+            const double g =
+                std::chrono::duration<double, std::milli>(step_t0 - last[lanes]).count();
+            gap[lanes] += g;
+            if (g < 1.0) ++gap_lt1[lanes]; else ++gap_ge1[lanes];
+            if (g > gap_max[lanes]) gap_max[lanes] = g;
+        }
+        last[lanes] = now_tp;
         if (++n[arm][lanes] % 128 == 0) {
             std::fprintf(stderr,
                          "[gpu] lanes=%d A n=%d %.4f | B n=%d %.4f | wall %.4f enc %.4f "
@@ -1750,6 +1767,10 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
                          enc[lanes] / (n[0][lanes] + n[1][lanes]),
                          (wall[lanes] - sum[0][lanes] - sum[1][lanes] - enc[lanes]) /
                              (n[0][lanes] + n[1][lanes]));
+            std::fprintf(stderr,
+                         "[gap] lanes=%d mean %.4f ms  <1ms=%d  >=1ms=%d  max %.2f ms\n",
+                         lanes, gap[lanes] / (n[0][lanes] + n[1][lanes]), gap_lt1[lanes],
+                         gap_ge1[lanes], gap_max[lanes]);
         }
     }
 

@@ -16,6 +16,7 @@
 
 #include "decode_abi.hpp"
 #include <algorithm>
+#include <cstdlib>
 
 #include "decode_dispatch.hpp"  // M=1 helpers (qmv_dispatch, rms_dispatch, ...)
 #include "mtl4_context.hpp"     // Grid, Threadgroup
@@ -133,15 +134,25 @@ inline void qmm_splitk_reduce_dispatch(int out_vec, int N, Grid& g, Threadgroup&
 // scratch pool holds `max_tokens` rows and the tail rows land in ones the fire
 // does not use, so the padding computes discardable values rather than needing
 // a bounds-checked inner loop.
+// A prompt has far more rows than a decode batch, so it can afford the wide
+// row block -- and needs it for the same reason the decode does: the tile is
+// dequantized once per row block, so a 512-row prompt at BM=16 unpacks every
+// weight thirty-two times.
+inline int qmm_strided_bm(int padded_rows) {
+    static const bool off = std::getenv("PIE_METAL_NO_PREFILL_BM32") != nullptr;
+    return (!off && padded_rows >= kQmmWideMinBatch) ? kQmmBMWide : kQmmBM;
+}
+
 inline int qmm_strided_rows(int N, int max_rows) {
-    const int padded = ((N + kQmmBM - 1) / kQmmBM) * kQmmBM;
+    const int bm = qmm_strided_bm(N);
+    const int padded = ((N + bm - 1) / bm) * bm;
     return padded <= max_rows ? padded : 0;
 }
 
 inline void qmm_t_strided_dispatch(int out_vec, int padded_rows, Grid& g,
                                    Threadgroup& tg) {
     g  = Grid{32u * (uint32_t(out_vec) / 32u),
-              2u * (uint32_t(padded_rows) / uint32_t(kQmmBM)), 2};
+              2u * (uint32_t(padded_rows) / uint32_t(qmm_strided_bm(padded_rows))), 2};
     tg = Threadgroup{32, 2, 2};
 }
 

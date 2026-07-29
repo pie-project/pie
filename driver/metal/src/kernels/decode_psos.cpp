@@ -167,6 +167,16 @@ bool load_multibatch_psos(RawMetalContext& ctx,
     out.qmm_t_strided_residual = ctx.compile_pso_from_file(
         dir + "quantized_qmm_t.metal",
         "affine_qmm_t_strided_residual_bfloat16_gs_64_b_4_bm_16_bn_32");
+    out.qmm_t_strided_wide = ctx.compile_pso_from_file(
+        dir + "quantized_qmm_t.metal",
+        "affine_qmm_t_strided_bfloat16_gs_64_b_4_bm_32_bn_32");
+    out.qmm_t_strided_wide_residual = ctx.compile_pso_from_file(
+        dir + "quantized_qmm_t.metal",
+        "affine_qmm_t_strided_residual_bfloat16_gs_64_b_4_bm_32_bn_32");
+    if (!out.qmm_t_strided_wide.valid() || !out.qmm_t_strided_wide_residual.valid()) {
+        if (err) *err = "affine_qmm_t_strided bm_32 (quantized_qmm_t.metal)";
+        return false;
+    }
     if (!out.qmm_t_strided.valid() || !out.qmm_t_strided_residual.valid()) {
         if (err) *err = "affine_qmm_t_strided (quantized_qmm_t.metal)";
         return false;
