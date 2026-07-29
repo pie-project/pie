@@ -118,6 +118,26 @@ static EXECUTION_SLOT_CAPACITY: OnceLock<Option<usize>> = OnceLock::new();
 pub(crate) fn execution_slot_capacity() -> Option<usize> {
     EXECUTION_SLOT_CAPACITY.get().copied().flatten()
 }
+
+/// The calling thread's OS id, for correlating timing records across threads.
+/// `libc::gettid` is Linux-only; Darwin spells it `pthread_threadid_np`.
+fn os_thread_id() -> u64 {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::gettid() as u64
+    }
+    #[cfg(target_os = "macos")]
+    unsafe {
+        let mut tid: u64 = 0;
+        libc::pthread_threadid_np(0, &mut tid);
+        tid
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        0
+    }
+}
+
 const MAX_PREWARM_PROCESSES: usize = 64;
 
 static PROCESS_COMPLETED: AtomicU64 = AtomicU64::new(0);
@@ -349,7 +369,7 @@ pub(crate) async fn ensure_execution_admitted(ctx: &mut ProcessCtx) {
             "bind_wait_us": duration_us(started.duration_since(entered)),
             "sem_us": duration_us(sem_done.duration_since(started)),
             "note_us": duration_us(note_started.elapsed()),
-            "tid": unsafe { libc::gettid() },
+            "tid": os_thread_id(),
         }));
     }
 }
@@ -736,7 +756,7 @@ impl Process {
                     "started_us": store_drop_started_us,
                     "store_drop_us":
                         crate::scheduler::fire_timing_now_us() - store_drop_started_us,
-                    "tid": unsafe { libc::gettid() },
+                    "tid": os_thread_id(),
                 }));
             } else {
                 drop(store);
