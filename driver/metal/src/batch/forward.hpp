@@ -192,7 +192,11 @@ inline constexpr std::uint32_t kPagedMaxForwardRequests = kPhase1bRsSlots;
 // ONE prompt in a fire.  Traced arrival times show them firing back to back
 // with sub-millisecond gaps -- the requests were all ready, the budget was the
 // only thing keeping them apart.
-inline constexpr std::uint32_t kPagedMaxForwardTokens = 256;
+//
+// 512 is where a sixteen-request fleet stops splitting: measured on one binary
+// with `--max-forward-tokens`, sixteen 34-token prompts take 6 fires at 256 and
+// 4 at both 512 and 1024, so past here the budget is no longer what binds.
+inline constexpr std::uint32_t kPagedMaxForwardTokens = 512;
 
 struct SetupConfig {
     std::string checkpoint_dir;  // HF snapshot dir (config.json + safetensors)
