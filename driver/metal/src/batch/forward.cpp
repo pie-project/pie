@@ -657,7 +657,7 @@ struct PtirLogitsCopyParams {
 inline constexpr int kPtirLogitsCopyOrdinal = 90000;
 // Rows one staging dispatch can carry. Bounded by the paged forward's row
 // capacity, which is what `LogitsOut::rows` is drawn from.
-inline constexpr std::size_t kPtirLogitsCopyMaxRows = kPagedMaxForwardTokens;
+inline constexpr std::size_t kPtirLogitsCopyMaxRows = kPagedMaxForwardTokensCeiling;
 
 void write_u32(const SlotHandle& s, uint32_t v) {
     std::memcpy(s.contents(), &v, sizeof(v));
@@ -2040,7 +2040,7 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
     geom.max_requests = static_cast<int>(std::min(cfg.max_forward_requests,
                                                   kPagedMaxForwardRequests));
     geom.max_tokens = static_cast<int>(std::min(cfg.max_forward_tokens,
-                                                kPagedMaxForwardTokens));
+                                                kPagedMaxForwardTokensCeiling));
     geom.max_slots = std::max(geom.max_slots, geom.max_requests);
     geom.rope_theta = cfg.rope_theta;
     // rope_dims = 2*floor(0.5 * partial_rotary_factor * head_dim), matching

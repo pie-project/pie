@@ -35,6 +35,7 @@
 #include "pipeline/registry.hpp"
 #include "batch/compose.hpp"
 #include "batch/forward.hpp"
+#include "batch/scratch.hpp"
 #include "batch/worker.hpp"
 #include "decode_abi.hpp"
 #include "observability.hpp"
@@ -329,8 +330,15 @@ std::string build_caps_json(const Config& cfg,
     // rows or GDN slots that do not exist in the resident decoder.
     constexpr std::uint32_t kMetalPagedMaxForwardRequests =
         executor::kPagedMaxForwardRequests;
-    constexpr std::uint32_t kMetalPagedMaxForwardTokens =
-        executor::kPagedMaxForwardTokens;
+    // Rows per fire, derived from what a row actually costs for THIS
+    // checkpoint (logits dominate) rather than a constant tuned against one.
+    const std::uint32_t kMetalPagedMaxForwardTokens = [&] {
+        const backend::DecodeGeometry g{};
+        return executor::paged_max_forward_tokens(
+            facts.vocab_size != 0 ? facts.vocab_size : std::uint32_t(g.vocab),
+            std::uint32_t(backend::scratch_widest_elems(g)),
+            executor::kPagedScratchColors);
+    }();
     // Phase 1b: the GDN recurrent-state region is genuinely sized for
     // `batch::kPhase1bRsSlots` addressable slots (heap_layout.hpp
     // plan_heap sizes State region as `max_slots * per_slot_bytes`, and
