@@ -35,7 +35,7 @@ Three layers, and you can reach any of them:
 
 from __future__ import annotations
 
-from typing import Iterable, Sequence
+from collections.abc import Iterable, Sequence
 
 from _gpugrammar import CompiledGrammar, Compiler, Matcher, pack_configurations
 
@@ -123,7 +123,7 @@ class Engine:
             self._ids[key] = self._pool.admit(grammar)
         return self._ids[key]
 
-    def batch(self, size: int, *, rollback: int = 0) -> "Batch":
+    def batch(self, size: int, *, rollback: int = 0) -> Batch:
         """A batch of `size` sequences.
 
         `rollback` is how many steps of history to keep, which speculative
@@ -202,17 +202,31 @@ class Batch:
         """
         self._batch.advance(tokens)
 
-    def capture(self) -> None:
-        """Record the fill and the advance as CUDA graphs.
+    def step(self, tokens):
+        """Consume one sampled token per sequence and return the next mask.
 
-        Every later `fill_mask` and `advance` is a replay. The recording is
-        valid for any assignment of grammars to sequences and any batch
-        composition, which is why it can live inside a serving engine's own
-        graph; it is invalidated only when the pool's arrays move, and that is
-        detected rather than assumed.
+        The whole of a decode step after sampling, in one graph replay. Only
+        the sample sits between a fill and the advance that follows it, and
+        nothing at all sits between that advance and the next fill, so the two
+        are one recording - which is a replay's fixed cost saved per token.
+
+        Equivalent to `advance(tokens)` then `fill_mask()`, and returns what
+        `fill_mask` returns. This is the path to use in a decode loop.
+        """
+        return self._batch.advance_and_fill(tokens)
+
+    def capture(self) -> None:
+        """Record the fill, the advance, and the two together, as CUDA graphs.
+
+        Every later `fill_mask`, `advance` and `step` is a replay. The
+        recording is valid for any assignment of grammars to sequences and any
+        batch composition, which is why it can live inside a serving engine's
+        own graph; it is invalidated only when the pool's arrays move, and that
+        is detected rather than assumed.
         """
         self._batch.capture()
         self._batch.capture_advance()
+        self._batch.capture_step()
 
     def rollback(self, steps: int) -> None:
         """Undo `steps` advances. Needs `rollback` room at construction."""

@@ -3,10 +3,18 @@ requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "gpu-lr1"
+name = "gpugrammar"
 version = "0.1.0"
-description = "GPU feasibility prototype for heterogeneous LR(1) and JSON Schema constrained decoding"
+description = "Constrained decoding with the parser state resident on the GPU"
+readme = "README.md"
+license = "Apache-2.0"
 requires-python = ">=3.10"
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Rust",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
   "numpy>=1.26",
   "torch>=2.4",
@@ -31,3 +39,19 @@ gpu-lr1-xgrammar-bench = "gpu_lr1.xgrammar_benchmark:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.ruff]
+line-length = 88
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+# The engine is Triton kernels and a device runtime, so the checks that matter
+# are the ones that catch a name that does not exist or an argument that is
+# never used - not style.
+select = ["E", "F", "W", "B", "UP"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# The kernels take the arguments their launch sites pass, whether or not a
+# given specialisation reads them.
+"src/gpu_lr1/device_parser.py" = ["B905"]

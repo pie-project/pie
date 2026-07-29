@@ -390,12 +390,11 @@ fn without_empty(mut automaton: Automaton<NfaGraph>) -> Automaton<NfaGraph> {
     closure[automaton.start.0 as usize] = true;
     while let Some(state) = stack.pop() {
         for edge in automaton.fsm.edges(state) {
-            if let FsmEdge::Epsilon(target) = edge {
-                if !closure[target.0 as usize] {
+            if let FsmEdge::Epsilon(target) = edge
+                && !closure[target.0 as usize] {
                     closure[target.0 as usize] = true;
                     stack.push(*target);
                 }
-            }
         }
     }
 
@@ -659,7 +658,7 @@ fn canonical(grammar: &Grammar, expr: ExprId) -> String {
 fn write_canonical(grammar: &Grammar, expr: ExprId, out: &mut String) {
     use std::fmt::Write;
     match grammar.get_expr(expr) {
-        Expr::EmptyString => out.push_str("e"),
+        Expr::EmptyString => out.push('e'),
         Expr::ByteString(bytes) => {
             let _ = write!(out, "b{}", String::from_utf8_lossy(bytes));
         }

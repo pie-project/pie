@@ -229,13 +229,12 @@ impl<'a> Lowerer<'a> {
                 Ok(self.builder.add_choices(alternatives))
             }
             FrontendExpr::Repeat { expr, min, max } => {
-                if *min == 0 && max.is_none() {
-                    if let FrontendExpr::CharacterClass { negated, ranges } = expr.as_ref() {
+                if *min == 0 && max.is_none()
+                    && let FrontendExpr::CharacterClass { negated, ranges } = expr.as_ref() {
                         return Ok(self
                             .builder
                             .add_character_class_star(*negated, ranges.clone()));
                     }
-                }
                 let repeated_rule = match expr.as_ref() {
                     FrontendExpr::RuleRef(name) => self
                         .rules

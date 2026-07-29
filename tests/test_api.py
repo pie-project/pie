@@ -192,3 +192,35 @@ class Approximations(unittest.TestCase):
     def test_a_schema_that_never_mentions_them_is_not_warned_about_them(self):
         schema = json.dumps({"type": "array", "items": {"type": "integer"}})
         self.assertEqual(self.engine.compile_json_schema(schema).approximations, [])
+
+
+class FusedStepThroughTheLibrary(unittest.TestCase):
+    """`Batch.step` is the decode path, so the library has to expose it."""
+
+    def test_step_agrees_with_advance_then_fill(self):
+        import torch
+
+        engine = gpugrammar.Engine([bytes([b]) for b in range(256)])
+        schema = json.dumps(
+            {"type": "object", "properties": {"a": {"type": "integer"}}}
+        )
+        grammar = engine.compile_json_schema(schema)
+
+        apart = engine.batch(2)
+        together = engine.batch(2)
+        for batch in (apart, together):
+            batch.set_grammars([grammar, grammar])
+            batch.fill_mask()
+            batch.capture()
+
+        steps = 0
+        for byte in b'{"a": 7}':
+            self.assertTrue(
+                torch.equal(apart.fill_mask(), together.fill_mask()),
+                f"masks diverge at step {steps}",
+            )
+            token = torch.full((2,), byte, dtype=torch.int32, device="cuda")
+            apart.advance(token)
+            together.step(token)
+            steps += 1
+        self.assertEqual(steps, 8)

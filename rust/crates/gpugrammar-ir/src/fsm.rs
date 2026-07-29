@@ -129,11 +129,10 @@ impl NfaGraph {
 
         while let Some(s) = queue.pop_front() {
             for edge in &self.edges[s.0 as usize] {
-                if let FsmEdge::Epsilon(target) = edge {
-                    if closure.insert(*target) {
+                if let FsmEdge::Epsilon(target) = edge
+                    && closure.insert(*target) {
                         queue.push_back(*target);
                     }
-                }
             }
         }
         closure
@@ -288,11 +287,10 @@ impl Automaton<NfaGraph> {
             let mut next = BTreeSet::new();
             for &state in &current {
                 for edge in self.fsm.edges(state) {
-                    if let FsmEdge::CharRange { min, max, target } = edge {
-                        if byte >= *min && byte <= *max {
+                    if let FsmEdge::CharRange { min, max, target } = edge
+                        && byte >= *min && byte <= *max {
                             next.insert(*target);
                         }
-                    }
                 }
             }
             if next.is_empty() {
@@ -470,12 +468,11 @@ impl Automaton<NfaGraph> {
         // Merge adjacent intervals with identical target sets
         let mut merged: Vec<(u8, u8, BTreeSet<StateId>)> = Vec::new();
         for (min, max, targets) in result {
-            if let Some(last) = merged.last_mut() {
-                if last.2 == targets && last.1.checked_add(1) == Some(min) {
+            if let Some(last) = merged.last_mut()
+                && last.2 == targets && last.1.checked_add(1) == Some(min) {
                     last.1 = max;
                     continue;
                 }
-            }
             merged.push((min, max, targets));
         }
 
@@ -545,12 +542,11 @@ fn complement_codepoint_ranges(ranges: &[(u32, u32)]) -> Vec<(u32, u32)> {
     // Merge overlapping ranges
     let mut merged: Vec<(u32, u32)> = Vec::new();
     for (lo, hi) in sorted {
-        if let Some(last) = merged.last_mut() {
-            if lo <= last.1 + 1 {
+        if let Some(last) = merged.last_mut()
+            && lo <= last.1 + 1 {
                 last.1 = last.1.max(hi);
                 continue;
             }
-        }
         merged.push((lo, hi));
     }
 

@@ -34,7 +34,7 @@ fn main() -> Result<()> {
                 println!(
                     "{index:4}  {}  |  {}",
                     error.to_string().lines().next().unwrap_or(""),
-                    &schema[..schema.len().min(150)].replace('\n', " ")
+                    schema[..schema.len().min(150)].replace('\n', " ")
                 );
             }
         }

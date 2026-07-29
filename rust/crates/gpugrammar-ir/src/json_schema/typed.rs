@@ -129,11 +129,10 @@ impl<'a> Converter<'a> {
                 // this corpus has plenty of - sanitises to a name nobody
                 // defines, and that was most of the "undefined frontend rule"
                 // refusals. Those fall through to the general pointer path.
-                if let Some(name) = reference.strip_prefix(prefix) {
-                    if !name.contains('/') {
+                if let Some(name) = reference.strip_prefix(prefix)
+                    && !name.contains('/') {
                         return Ok(Expr::RuleRef(sanitize_rule_name(name)));
                     }
-                }
             }
             // Any other pointer into the document. `$ref` is a JSON pointer,
             // not a name in a definitions block, and schemas in the wild point
@@ -1057,8 +1056,7 @@ fn narrow_repeat(parts: &[Expr], min: u64, max: Option<u64>) -> Option<Expr> {
             min: low,
             max: high,
         } = flat
-        {
-            if Some(*low) != *high {
+            && Some(*low) != *high {
                 if variable.is_some() {
                     // Two repeats share the budget between them, and which
                     // split to pick is a choice rather than a computation.
@@ -1071,7 +1069,6 @@ fn narrow_repeat(parts: &[Expr], min: u64, max: Option<u64>) -> Option<Expr> {
                 variable = Some((index, each_low, *low, *high));
                 continue;
             }
-        }
         let (low, high) = character_range(part);
         if Some(low) != high {
             return None;

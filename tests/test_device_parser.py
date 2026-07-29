@@ -452,7 +452,7 @@ class Rollback(unittest.TestCase):
             batch.advance(torch.tensor([token], dtype=torch.int32, device="cuda"))
             matcher.accept_token(token)
         batch.rollback(2)
-        for token in tokens[3:5]:
+        for _token in tokens[3:5]:
             matcher.rollback(1)
         self.assertEqual(
             sorted((s, tuple(k)) for s, k in batch.configurations(0)),
@@ -827,7 +827,7 @@ class ArenaPaging(unittest.TestCase):
         pool = self.DeviceGrammar()
         first = pool.admit(self._compile(0))
         held = dict(pool._used)
-        for round_ in range(12):
+        for _round in range(12):
             pool.release(first)
             first = pool.admit(self._compile(0))
         self.assertEqual(dict(pool._used), held)

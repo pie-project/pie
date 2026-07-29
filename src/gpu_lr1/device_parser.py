@@ -2881,7 +2881,7 @@ class DeviceGrammar:
         return 0 <= identifier < len(self._live) and self._live[identifier]
 
     @staticmethod
-    def prepare(compiled) -> "ResidentTables":
+    def prepare(compiled) -> ResidentTables:
         """Everything about a grammar that does not depend on where it lands.
 
         Separated from `admit` because an evicted grammar comes back. Doing
@@ -3141,7 +3141,7 @@ class DeviceGrammar:
         """What the grammars in the pool actually take up."""
         return sum(self._used.values()) * 4
 
-    def new_batch(self, batch: int, rollback: int = 0) -> "DeviceBatch":
+    def new_batch(self, batch: int, rollback: int = 0) -> DeviceBatch:
         return DeviceBatch(self, batch, rollback)
 
 

@@ -72,7 +72,7 @@ impl Compiler {
         // caller's other threads and makes rayon's workers contend with
         // whatever else the process is doing.
         let compiled = python
-            .allow_threads(|| compile_schema(schema, &self.vocabulary, limits))
+            .detach(|| compile_schema(schema, &self.vocabulary, limits))
             .map_err(|failure| PyValueError::new_err(failure.to_string()))?;
         Ok(CompiledGrammar {
             artifact: Arc::new(compiled.artifact),
