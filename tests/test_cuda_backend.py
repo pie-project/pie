@@ -198,5 +198,128 @@ class TheBackendIsSelectable(unittest.TestCase):
         self.assertIsInstance(_engine.ported(), frozenset)
 
 
+
+class TheArenaStructDescribesThePool(unittest.TestCase):
+    """Twenty-six pointers, packed by Python, read by a kernel.
+
+    Every later kernel takes `const gg::Arena*` instead of twenty-six
+    arguments, which is the fix for the thing the Triton launches do worst -
+    246 argument slots across eleven launches, all of them `int32*`, none of
+    them checkable. The cost of that fix is this: if Python packs the fields in
+    a different order from the struct, a table read through the wrong field is
+    still a valid pointer and still returns numbers. So the packing is checked
+    against a kernel that reads back values the host can derive on its own.
+    """
+
+    SLOTS = 10
+
+    def setUp(self):
+        if not HAVE_CUDA or not _gpugrammar.cuda_available():
+            raise unittest.SkipTest("no CUDA device or no kernels in this build")
+        import json
+
+        import gpugrammar
+
+        self.engine = gpugrammar.Engine([bytes([i]) for i in range(256)])
+        # Three different shapes, so a base that happened to be zero for one
+        # grammar cannot hide a wrong field.
+        self.grammars = [
+            self.engine.compile_json_schema(json.dumps(schema))
+            for schema in (
+                {"type": "string"},
+                {
+                    "type": "object",
+                    "properties": {"x": {"type": "integer"}},
+                    "required": ["x"],
+                },
+                {"type": "array", "items": {"type": "boolean"}},
+            )
+        ]
+        self.pool = self.engine.pool
+
+    def _readback(self, sequences):
+        batch = self.pool.new_batch(sequences)
+        batch.set_grammars(
+            [self.engine.admit(self.grammars[i % 3]) for i in range(sequences)]
+        )
+        out = torch.zeros(sequences * self.SLOTS, dtype=torch.int32, device="cuda")
+        _gpugrammar.cuda_launch(
+            "gg_arena_readback",
+            (sequences + 31) // 32,
+            32,
+            torch.cuda.current_stream().cuda_stream,
+            [
+                self.pool.arena_struct().data_ptr(),
+                batch.grammar_of.data_ptr(),
+                out.data_ptr(),
+            ],
+            [sequences, self.SLOTS],
+        )
+        torch.cuda.synchronize()
+        return batch, out.cpu().reshape(sequences, self.SLOTS)
+
+    def test_the_two_sides_agree_on_the_struct_size(self):
+        _, seen = self._readback(2)
+        self.assertEqual(int(seen[0][8]), self.pool.arena_slots)
+        self.assertEqual(int(seen[0][9]), 20)  # NBASES
+
+    def test_every_table_is_read_through_the_base_the_host_uses(self):
+        sequences = 6
+        batch, seen = self._readback(sequences)
+        bases = self.pool.bases.cpu()
+        nbases = 20
+        wrong = []
+        for index in range(sequences):
+            grammar = int(batch.grammar_of[index])
+            at = grammar * nbases
+            group, action, goto = (
+                int(bases[at + 0]),
+                int(bases[at + 8]),
+                int(bases[at + 10]),
+            )
+            want = {
+                0: group,
+                1: action,
+                2: goto,
+                3: int(self.pool.group_offsets[group]),
+                4: int(self.pool.group_offsets[group + 1]),
+                5: int(self.pool.action_offsets[action]),
+                6: int(self.pool.goto_offsets[goto]),
+                7: int(self.pool.reading_offsets[int(bases[at + 3])]),
+            }
+            for slot, expected in want.items():
+                if int(seen[index][slot]) != expected:
+                    wrong.append(
+                        f"sequence {index} grammar {grammar} slot {slot}: "
+                        f"kernel {int(seen[index][slot])} != host {expected}"
+                    )
+        self.assertEqual(wrong, [])
+
+    def test_the_struct_is_rebuilt_when_the_pool_moves(self):
+        import json
+
+        first = self.pool.arena_struct()
+        held = first.clone()
+        revision = self.pool.revision
+        # Admitting until an array has to grow is what moves the addresses -
+        # the same event that invalidates a recorded graph.
+        for size in range(4, 40):
+            self.engine.compile_json_schema(
+                json.dumps({
+                    "type": "object",
+                    "properties": {
+                        f"p{n}": {"type": "string"} for n in range(size)
+                    },
+                })
+            )
+            if self.pool.revision != revision:
+                break
+        self.assertNotEqual(self.pool.revision, revision, "the pool never moved")
+        self.assertFalse(
+            bool(torch.equal(self.pool.arena_struct(), held)),
+            "the struct still holds the addresses from before the pool moved",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

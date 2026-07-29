@@ -29,22 +29,18 @@ fn main() {
     println!("cargo:rerun-if-env-changed=GPUGRAMMAR_SKIP_CUDA");
 
     let kernels = Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels");
-    let mut sources: Vec<PathBuf> = std::fs::read_dir(&kernels)
-        .expect("the kernels directory should exist")
-        .filter_map(|entry| entry.ok().map(|e| e.path()))
-        .filter(|path| path.extension().is_some_and(|e| e == "cu"))
-        .collect();
-    // Sorted, so the fatbin is the same bytes from the same sources - a build
-    // that differs only in readdir order is a build nobody can compare.
-    sources.sort();
-    for source in &sources {
-        println!("cargo:rerun-if-changed={}", source.display());
+    // The directory, not each file: watching the files individually meant a
+    // *new* kernel was never noticed, because cargo only re-runs this when
+    // something it was told about changes - and it had not been told about a
+    // file that did not exist yet.
+    println!("cargo:rerun-if-changed={}", kernels.display());
+    for entry in std::fs::read_dir(&kernels).into_iter().flatten().flatten() {
+        println!("cargo:rerun-if-changed={}", entry.path().display());
     }
-    for header in std::fs::read_dir(&kernels).into_iter().flatten().flatten() {
-        if header.path().extension().is_some_and(|e| e == "cuh") {
-            println!("cargo:rerun-if-changed={}", header.path().display());
-        }
-    }
+    // `nvcc -fatbin` takes exactly one input, so there is one translation unit
+    // and it includes the rest. See the note at the top of `gpugrammar.cu`.
+    let unit = kernels.join("gpugrammar.cu");
+    assert!(unit.exists(), "kernels/gpugrammar.cu is the translation unit");
 
     let out = PathBuf::from(std::env::var("OUT_DIR").expect("cargo sets OUT_DIR"));
     let fatbin = out.join("gpugrammar.fatbin");
@@ -72,9 +68,7 @@ fn main() {
     }
     command.arg("-gencode").arg(format!("arch=compute_{NEWEST},code=compute_{NEWEST}"));
     command.arg("-I").arg(&kernels);
-    for source in &sources {
-        command.arg(source);
-    }
+    command.arg(&unit);
     command.arg("-o").arg(&fatbin);
 
     let output = command.output().expect("nvcc should be runnable once found");

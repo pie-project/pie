@@ -3276,6 +3276,29 @@ class DeviceGrammar:
         """What the grammars in the pool actually take up."""
         return sum(self._used.values()) * 4
 
+    # The arena as the CUDA kernels want it: one struct of pointers instead of
+    # twenty-six kernel arguments. Built from `_ARENA` so that the two backends
+    # cannot disagree about the order, and rebuilt when `revision` moves -
+    # which is exactly when an array has been reallocated and the addresses in
+    # it are stale, the same signal a recorded graph uses.
+    _ARENA_FIELDS = (*_ARENA, "bases")
+
+    def arena_struct(self) -> torch.Tensor:
+        """Device memory holding one `gg::Arena`. Cached until the pool moves."""
+        held = getattr(self, "_arena_struct", None)
+        if held is not None and self._arena_struct_revision == self.revision:
+            return held
+        addresses = [getattr(self, name).data_ptr() for name in self._ARENA_FIELDS]
+        packed = torch.tensor(addresses, dtype=torch.int64, device=self.device)
+        self._arena_struct = packed
+        self._arena_struct_revision = self.revision
+        return packed
+
+    @property
+    def arena_slots(self) -> int:
+        """How many pointers `arena_struct` packs. Checked against the kernel."""
+        return len(self._ARENA_FIELDS)
+
     def new_batch(self, batch: int, rollback: int = 0) -> DeviceBatch:
         return DeviceBatch(self, batch, rollback)
 
