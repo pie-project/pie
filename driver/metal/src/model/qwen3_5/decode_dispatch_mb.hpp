@@ -34,7 +34,18 @@ inline constexpr int kQmmMinBatch = 12;
 // The ported steel GEMM is instantiated aligned-only, at BM=16 and BK=32. K is
 // not checked: every qwen3.6 projection has K % 512 == 0 (the same fact the
 // GEMV port relies on for its "fast" variant), so K % BK == 0 is free.
+// Rows per threadgroup.  The GEMM dequantizes a weight tile once per row
+// block, so a batch that spans several blocks pays for the same dequantize
+// again in each -- which is why doubling M nearly doubles the time (14.6ms at
+// M=16, 24.4 at 32, 45.7 at 64, measured standalone across the checkpoint's
+// projections).  A taller block halves that work at the cost of halving the
+// threadgroup count, so it is only worth taking once the batch is wide enough
+// to have blocks to spare: at M=32, BM=32 measures 20.4ms against BM=16's 24.4.
 inline constexpr int kQmmBM = 16;
+inline constexpr int kQmmBMWide = 32;
+inline constexpr int kQmmWideMinBatch = 32;
+
+inline int qmm_bm(int N) { return N >= kQmmWideMinBatch ? kQmmBMWide : kQmmBM; }
 
 // Output columns per threadgroup.  This GEMM is occupancy-bound, not bandwidth-
 // bound: measured standalone at the model's shapes it turns in ~380 GFLOP/s at
@@ -54,8 +65,9 @@ inline constexpr int kQmmBM = 16;
 inline constexpr int kQmmMinThreadgroups = 192;
 
 inline int qmm_bn(int out_vec, int N) {
-    if (N < kQmmMinBatch || N % kQmmBM != 0) return 0;
-    const int row_blocks = N / kQmmBM;
+    const int bm = qmm_bm(N);
+    if (N < kQmmMinBatch || N % bm != 0) return 0;
+    const int row_blocks = N / bm;
     int best = 0;
     for (int bn : {16, 32, 64}) {
         if (out_vec % bn != 0) continue;
@@ -84,9 +96,9 @@ inline void qmm_t_strided_dispatch(int out_vec, int padded_rows, Grid& g,
     tg = Threadgroup{32, 2, 2};
 }
 
-inline void qmm_t_dispatch(int out_vec, int N, int bn, Grid& g, Threadgroup& tg) {
+inline void qmm_t_dispatch(int out_vec, int N, int bn, int bm, Grid& g, Threadgroup& tg) {
     g  = Grid{32u * (uint32_t(out_vec) / uint32_t(bn)),
-              2u * (uint32_t(N) / uint32_t(kQmmBM)), 2};
+              2u * (uint32_t(N) / uint32_t(bm)), 2};
     tg = Threadgroup{32, 2, 2};
 }
 

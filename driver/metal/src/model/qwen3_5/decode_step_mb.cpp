@@ -58,8 +58,9 @@ void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
     auto rms = [&](int row, int rows) { rms_mb_dispatch(row, rows, n, d.grid, d.tg); };
     if (const int out = qmv_out_size(d.kind, g); out != 0) {
         d.qmm_bn = qmm_bn(out, n);
+        d.qmm_bm = qmm_bm(n);
         if (d.qmm_bn > 0)
-            qmm_t_dispatch(out, n, d.qmm_bn, d.grid, d.tg);
+            qmm_t_dispatch(out, n, d.qmm_bn, d.qmm_bm, d.grid, d.tg);
         else
             qmv_mb_dispatch(out, n, d.grid, d.tg);
         return;
@@ -134,8 +135,9 @@ Pso mb_pso(const Dispatch& d, const DecodeStepPsos& base, const MultiBatchPsos& 
         default: {
             if (d.qmm_bn > 0) {
                 const int slot = d.qmm_bn == 64 ? 2 : (d.qmm_bn == 32 ? 1 : 0);
-                const Pso& gemm =
-                    d.fuse_residual ? mb.qmm_t_residual[slot] : mb.qmm_t[slot];
+                const int wide = d.qmm_bm == kQmmBMWide ? 1 : 0;
+                const Pso& gemm = d.fuse_residual ? mb.qmm_t_residual[wide][slot]
+                                                  : mb.qmm_t[wide][slot];
                 if (gemm.valid()) return gemm;
             }
             return d.fuse_residual ? base.qmv_residual : base[d.kind];

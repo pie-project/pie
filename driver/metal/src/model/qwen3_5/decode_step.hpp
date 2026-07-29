@@ -43,6 +43,10 @@ struct Dispatch {
     int         qmm_bn = 0;   // output columns per threadgroup when this
                               // projection runs as the steel GEMM
                               // (affine_qmm_t); 0 = use the GEMV.
+    int         qmm_bm = 16;  // rows per threadgroup for that GEMM: a wider
+                              // block dequantizes each weight tile once for
+                              // twice the rows, which only pays once the batch
+                              // has threadgroups to spare.
 };
 
 // PSOs compiled once from src/kernels/*.metal, indexed by Kernel kind.
