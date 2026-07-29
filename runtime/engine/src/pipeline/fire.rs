@@ -385,23 +385,31 @@ fn bound_rs_working_set_ids<C: FireContext>(
 /// the current boundary over `[buffer | this fire's tokens]`. That single
 /// scalar subsumes the three fold-mode methods this replaced:
 ///
-/// | `fold_len` | buffer | plan                      |
-/// |------------|--------|---------------------------|
-/// | `> 0`      | empty  | `Fold` — the fast path    |
-/// | `0`        | any    | `Buffer` — append at tail |
-/// | `0 < n <= B` | non-empty | `FoldBuffered` — commit |
+/// | `fold_len`   | buffer    | plan                       |
+/// |--------------|-----------|----------------------------|
+/// | `> 0`        | empty     | `Fold` — the fast path     |
+/// | `0`          | empty     | `Buffer` — open a chunk    |
+/// | `0 < n <= B` | non-empty | `FoldBuffered` — commit    |
 ///
 /// `fold-len` is CLAMPED to `B + T`, so "fold everything" is the fire-invariant
 /// constant `u32::MAX` — the SDK's default — rather than a value the guest
 /// would have to recompute from each fire's token count.
 ///
-/// The remaining positions are expressible in the surface but not yet in the
-/// driver: any boundary at or beyond the buffer tail while the buffer is
-/// non-empty requires the recurrence to READ the buffer, which it cannot do
-/// today (see `.wiki/designs/linear-state-programming-model.md` §2). Those are
-/// errors rather than silent approximations, because approximating a fold in
-/// either direction is unrecoverable: folding early destroys tokens the guest
-/// still wanted, and folding late silently drops them from the context.
+/// Every remaining position needs the SAME missing primitive: a recurrence
+/// that starts from `folded ⊕ replay(buffer)` rather than from `folded`. The
+/// driver has no such read path (see
+/// `.wiki/designs/linear-state-programming-model.md` §2), so all of them are
+/// refused:
+///
+/// - `n == B + T` with `B > 0` — the fast path, "fold everything I have".
+/// - `B < n < B + T` — a boundary inside this fire's own new tokens.
+/// - `n == 0` with `B > 0` — appending a second chunk. This one is quiet: the
+///   fire happily emits logits computed as though the buffer were empty.
+///
+/// They are errors rather than silent approximations because approximating a
+/// fold in either direction is unrecoverable: folding early destroys tokens
+/// the guest still wanted, and folding late silently drops them from the
+/// context.
 fn rs_plan_for(
     fold_len: &[u32],
     stores: &crate::store::registry::Stores,
@@ -455,6 +463,21 @@ fn rs_plan_for(
         let (b, t) = (buffered[row], row_tokens[row]);
         let n = fold_len[row].min(b + t);
         let here = if n == 0 {
+            // Appending onto a NON-EMPTY buffer is the same read-path gap in
+            // its quietest form. The new tokens sit at [F+b, F+b+t), so their
+            // recurrence must start from `folded ⊕ replay(buffer)` — but every
+            // recurrence initializes from `recurrent_state[slot]`, which is
+            // the state at F. The fire would still emit logits, computed as
+            // though the buffered tokens were not there. That is a wrong
+            // answer with no symptom, which is worse than a refusal.
+            //
+            // (`start_token` below would also be wrong: `b` is an upper bound
+            // derived from whole pages, exact only when the buffer is empty.)
+            if b != 0 {
+                return Err(format!(
+                    "request row {row} appends {t} token(s) onto a non-empty buffer                      ({b} buffered token(s)); the recurrence would start from the folded                      state and silently ignore what is buffered. Fold the buffer first,                      or keep each speculative chunk to a single fire"
+                ));
+            }
             Position::Buffer
         } else if n == b + t {
             if b != 0 {
@@ -483,10 +506,12 @@ fn rs_plan_for(
 
     Ok(match position.expect("rows > 0") {
         Position::Fold => rs::RsPlan::Fold,
+        // Only reachable with an empty buffer, so the chunk always opens at
+        // token 0. `buffered[0]` is a whole-page upper bound and would be the
+        // wrong cursor for any other case; the read path will reintroduce the
+        // offset with the exact occupancy it needs.
         Position::Buffer => rs::RsPlan::Buffer {
-            // New tokens always append at the buffer tail; the runtime owns
-            // that cursor, so the guest no longer states it.
-            start_token: buffered[0],
+            start_token: 0,
             row_tokens,
         },
         Position::Commit => rs::RsPlan::FoldBuffered {

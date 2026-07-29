@@ -971,7 +971,63 @@ What landed, layer by layer:
 whether the host-derived and channel-driven RS paths should be made mutually
 exclusive per fire rather than merely unused-in-parallel.
 
-### 10.2 E — Python / JavaScript SDKs
+### 10.2 The buffer read path — analysed, and one hole closed
+
+Every position `rs_plan_for` refuses needs the SAME missing primitive: a
+recurrence that starts from `folded ⊕ replay(buffer)` rather than from
+`folded`. There is no such read path — every recurrence initializes from
+`recurrent_state[slot]`, and `driver/cuda/src/batch/forward.hpp` defines
+exactly two buffer ops, `rs_buffer_write` (scatter in-proj activations) and
+`rs_buffer_fold` (gather them back and fold).
+
+**One of those positions was not refused — it was silently wrong.** `fold-len
+= 0` onto a NON-EMPTY buffer classified as `Buffer` and ran: the new tokens'
+recurrence started from the state at `F`, ignoring the `B` tokens already
+buffered, and the fire emitted logits anyway. A wrong answer with no symptom.
+It is now refused. (`start_token` was independently wrong for that case too:
+it was `buffered[0]`, a whole-page UPPER BOUND that is exact only when the
+buffer is empty. With the case gone, the planner emits `start_token = 0`
+always; `RsStore` keeps the general offset because the store was never the
+part that could not do this.)
+
+The cost is honest: a speculative chunk must now fit in one fire. That is a
+real limitation, but it is one the guest can see.
+
+**What the remaining work actually is — much less than it looked.** The
+chunked FLA kernel ALREADY takes `commit_len`, and already means by it "scan
+`N` tokens, but persist the state after only the first `n`"
+(`launch_chunk_gated_delta_prefill_batched_state_bf16`, threaded from the
+commit-advance replay). The primitive for a boundary strictly inside a scan
+therefore exists. What is missing is only the **token layout**: the linear
+layers must process `B_r + T_r` rows per request, with rows `[0, B_r)` gathered
+from the buffer slabs (no in-proj — the replay path already skips the GEMM
+entirely, so the buffered prefix needs no hidden states) and rows
+`[B_r, B_r + T_r)` produced by in-proj as usual. Then:
+
+- `commit_len[r] = n_r` in the extended layout gives every fold position,
+  including `n == B + T` (the fast path) and `B < n < B + T`.
+- Outputs are the last `T_r` rows of `core_out`; the early
+  `if (commit_len != nullptr) return;` at `qwen3_5_forward.cpp:1206` becomes a
+  slice instead of a bail-out.
+- `fold-len = 0` on a non-empty buffer needs no scratch state after all: give
+  the row a copy-on-write folded slot and simply do not publish it. `RsStore`
+  already allocates CoW slots for `write_state = true`; a scratch state is
+  just an unpublished one, so the driver needs no notion of "scratch".
+
+Concretely that is: extended `qo_indptr` for the linear layers only, an offset
+on the in-proj GEMM output, conv-state handling over the extended layout,
+workspace sized for `B + T`, and per-row `B` on the wire — duplicated across
+`qwen3_5_forward.cpp` and `qwen3_5_moe_forward.cpp`.
+
+**Why it is not landed here.** It is a numerics change to the FLA/conv
+indexing with no way to validate it in this environment: there are no model
+weights on the box, so nothing can run the kernel end to end. Landing several
+hundred lines of unvalidatable indexing changes into the one path where a
+wrong value is unrecoverable is worse than leaving the positions refused. The
+analysis above is the deliverable; `gdn-foldcommit` extended to two chunks is
+the test that must accompany the implementation.
+
+### 10.3 E — Python / JavaScript SDKs
 
 Larger than §7 implies. Both target an older `pie:core/inference` surface
 (`imports/inference.py`, `pie-core-inference.d.ts`) rather than
@@ -979,13 +1035,13 @@ Larger than §7 implies. Both target an older `pie:core/inference` surface
 they did not break with B and will not track future WIT changes automatically.
 Bringing them onto the current surface is a port, not a rename.
 
-### 10.3 D — per-stage PTIR containers  *(separate PR)*
+### 10.4 D — per-stage PTIR containers  *(separate PR)*
 
 Unchanged from §7 / §9.1. D4(a) hooks-as-methods and D4(b) per-stage containers
 must land together; (a) alone would force the host to reassemble and
 canonicalize containers, which is the thing D4 exists to avoid.
 
-### 10.4 Loose ends
+### 10.5 Loose ends
 
 - `model::pass_kind()` returns `recurrent` only when `kv_page_size() == 0`,
   which no registered model satisfies. That arm is unreachable and therefore

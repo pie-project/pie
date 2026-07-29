@@ -76,6 +76,12 @@ pub enum RsPlan {
     /// Scatter each row's pre-recurrence activations into buffered slots
     /// covering `[start_token, start_token + row_tokens[r])`, leaving the
     /// folded state untouched.
+    ///
+    /// `super::rs_plan_for` only ever emits `start_token == 0` today: writing
+    /// at an offset means the buffer was already non-empty, and the fire's
+    /// recurrence would then have to read what is already buffered. The store
+    /// below handles a non-zero offset correctly — it is the RECURRENCE that
+    /// cannot, so the restriction lives in the planner, not here.
     Buffer {
         start_token: u32,
         row_tokens: Vec<u32>,
