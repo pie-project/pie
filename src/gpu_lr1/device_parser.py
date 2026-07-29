@@ -57,6 +57,17 @@ _SCAN_BLOCK = 4096
 _SCAN_WARPS = 8
 
 _SWEEP_BLOCKS = 4096
+# The memo of masks already computed. 256 entries because the corpus reaches 27
+# to 551 distinct parse states over a whole document at batch 512, so this holds
+# the working set of any one batch while costing 256 rows of mask - 4.9 MB
+# against the 142 MB a batch of 128 already holds. The configuration and depth
+# bounds keep the state beside each entry small; a parse too wide or too deep
+# for them is not remembered, which costs a recomputation and nothing else.
+_MEMO_SLOTS = 256
+_MEMO_CONFIGS = 8
+_MEMO_DEPTH = 64
+# No real fingerprint is asked to be this, and an empty entry has to miss.
+_MEMO_EMPTY = 0x7EEDFACE
 
 # Sentinel for "no group of this configuration holds the sampled token". Above
 # any group index, so an atomic minimum picks the earliest real finder.
@@ -617,6 +628,7 @@ def _count_kernel(
     config_count_ptr,
     widest_ptr,
     representative_ptr,
+    memo_slot_ptr,
     grammar_ptr,
     bases_ptr,
     counts_ptr,
@@ -645,6 +657,9 @@ def _count_kernel(
         keep = keep & (
             tl.load(representative_ptr + sequence, mask=live, other=-1) == sequence
         )
+        # A remembered state enumerates nothing at all: its answer is already
+        # written and the restore puts it back.
+        keep = keep & (tl.load(memo_slot_ptr + sequence, mask=live, other=0) < 0)
     grammar = tl.load(grammar_ptr + sequence, mask=live, other=0)
     at = tl.load(bases_ptr + grammar * _NBASES + _B_GROUP_OFFSETS, mask=keep, other=0)
     state = tl.load(lexer_state_ptr + lane, mask=keep, other=0)
@@ -665,6 +680,7 @@ def _count_scan_kernel(
     config_count_ptr,
     widest_ptr,
     representative_ptr,
+    memo_slot_ptr,
     grammar_ptr,
     bases_ptr,
     offsets_ptr,
@@ -703,6 +719,7 @@ def _count_scan_kernel(
             keep = keep & (
                 tl.load(representative_ptr + sequence, mask=live, other=-1) == sequence
             )
+            keep = keep & (tl.load(memo_slot_ptr + sequence, mask=live, other=0) < 0)
         if UNIT == 1:
             value = tl.where(keep, 1, 0)
         else:
@@ -1885,6 +1902,201 @@ def _dedup_kernel(
 
 
 @triton.jit
+def _probe_kernel(
+    lexer_state_ptr,
+    stack_ptr,
+    stack_depth_ptr,
+    config_count_ptr,
+    grammar_ptr,
+    hash_ptr,
+    representative_ptr,
+    memo_hash_ptr,
+    memo_lexer_ptr,
+    memo_stack_ptr,
+    memo_depth_ptr,
+    memo_count_ptr,
+    memo_grammar_ptr,
+    memo_slot_ptr,
+    memo_store_ptr,
+    stack_depth_all_ptr,
+    CONFIGS: tl.constexpr,
+    STACK_STRIDE: tl.constexpr,
+    SLOTS: tl.constexpr,
+    MEMO_CONFIGS: tl.constexpr,
+    MEMO_STRIDE: tl.constexpr,
+    BATCH: tl.constexpr,
+):
+    """Has this parse state been masked before, and may this sequence save one?
+
+    Deduplication already finds the sequences of *this* step that share a parse
+    state, which on a serving batch is most of them. It cannot find the far
+    larger overlap, which is with the steps that came before: a document
+    returns to the same place constantly - every character inside a string is
+    the same configuration - so 92% to 96% of the sequences a step masks were
+    masked at some earlier step, at every batch size down to one.
+
+    Direct-mapped on the fingerprint, and the entry is compared exactly against
+    the live state afterwards, for the same reason deduplication does: a
+    fingerprint collision would hand back another state's mask, and a wrong
+    mask is worse than a slow one. A miss simply computes, so a collision costs
+    an entry rather than an answer.
+    """
+    sequence = tl.program_id(0)
+    # One exit. A `return` under a runtime branch reads as a jump and is a
+    # predicate, which this file has been bitten by before.
+    mine = tl.load(hash_ptr + sequence)
+    count = tl.load(config_count_ptr + sequence)
+    # The fingerprint is a folded hash and may be negative as an int32; a
+    # negative remainder indexes off the front of the table.
+    slot = (mine & 0x7FFFFFFF) % SLOTS
+    usable = tl.load(representative_ptr + sequence) == sequence
+    usable = usable & (count <= MEMO_CONFIGS)
+    found = -1
+    if usable:
+        same = 1
+        if tl.load(memo_hash_ptr + slot) != mine:
+            same = 0
+        if tl.load(memo_count_ptr + slot) != count:
+            same = 0
+        if tl.load(memo_grammar_ptr + slot) != tl.load(grammar_ptr + sequence):
+            same = 0
+        config = 0
+        while config < count and same == 1:
+            row = sequence * CONFIGS + config
+            held = slot * MEMO_CONFIGS + config
+            depth = tl.load(stack_depth_ptr + row)
+            if tl.load(lexer_state_ptr + row) != tl.load(memo_lexer_ptr + held):
+                same = 0
+            if depth != tl.load(memo_depth_ptr + held):
+                same = 0
+            lane = tl.arange(0, STACK_STRIDE)
+            live = (lane < depth) & (lane < MEMO_STRIDE)
+            left = tl.load(stack_ptr + row * STACK_STRIDE + lane, mask=live, other=0)
+            right = tl.load(
+                memo_stack_ptr + held * MEMO_STRIDE + lane, mask=live, other=0
+            )
+            if tl.sum(tl.where(left != right, 1, 0)) != 0:
+                same = 0
+            config = config + 1
+        if same == 1:
+            found = slot
+    tl.store(memo_slot_ptr + sequence, found)
+
+    # Who may write this slot. Two sequences of one step whose fingerprints
+    # collide would otherwise interleave their writes and leave an entry with
+    # one state and the other's mask, which a later probe would match and hand
+    # back wrongly. The lowest sequence wins, decided here rather than by an
+    # atomic so that the answer does not depend on how the blocks are ordered.
+    writing = usable & (found < 0)
+    if writing:
+        config = 0
+        while config < count:
+            if tl.load(stack_depth_ptr + sequence * CONFIGS + config) > MEMO_STRIDE:
+                writing = False
+            config = config + 1
+    if writing:
+        lane = tl.arange(0, BATCH)
+        rival = lane < sequence
+        rival = rival & (
+            tl.load(representative_ptr + lane, mask=rival, other=-1) == lane
+        )
+        rival = rival & (tl.load(memo_slot_ptr + lane, mask=rival, other=0) < 0)
+        rival = rival & (
+            ((tl.load(hash_ptr + lane, mask=rival, other=0) & 0x7FFFFFFF) % SLOTS)
+            == slot
+        )
+        if tl.sum(tl.where(rival, 1, 0)) != 0:
+            writing = False
+    tl.store(memo_store_ptr + sequence, tl.where(writing, slot, -1))
+
+
+@triton.jit
+def _recall_kernel(
+    memo_slot_ptr,
+    memo_mask_ptr,
+    mask_ptr,
+    mask_words,
+    BLOCK: tl.constexpr,
+):
+    """Put a remembered mask back, in place of having computed it."""
+    sequence = tl.program_id(0)
+    slot = tl.load(memo_slot_ptr + sequence)
+    if slot >= 0:
+        lane = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+        live = lane < mask_words
+        value = tl.load(memo_mask_ptr + slot * mask_words + lane, mask=live, other=0)
+        tl.store(mask_ptr + sequence * mask_words + lane, value, mask=live)
+
+
+@triton.jit
+def _store_kernel(
+    lexer_state_ptr,
+    stack_ptr,
+    stack_depth_ptr,
+    config_count_ptr,
+    grammar_ptr,
+    hash_ptr,
+    representative_ptr,
+    memo_store_ptr,
+    memo_hash_ptr,
+    memo_lexer_ptr,
+    memo_stack_ptr,
+    memo_depth_ptr,
+    memo_count_ptr,
+    memo_grammar_ptr,
+    memo_mask_ptr,
+    mask_ptr,
+    mask_words,
+    CONFIGS: tl.constexpr,
+    STACK_STRIDE: tl.constexpr,
+    SLOTS: tl.constexpr,
+    MEMO_CONFIGS: tl.constexpr,
+    MEMO_STRIDE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Remember a mask this step had to compute.
+
+    Written after the scatter, so what is stored is the finished row. Only a
+    representative that missed is stored - a hit is already there, and a
+    duplicate has not computed anything.
+
+    A state too wide or too deep for an entry is simply not remembered. The
+    bound keeps the table small enough to be worth having, and the states that
+    exceed it are rare; leaving them out costs a recomputation rather than a
+    wrong answer.
+    """
+    sequence = tl.program_id(0)
+    slot = tl.load(memo_store_ptr + sequence)
+    if slot >= 0:
+        count = tl.load(config_count_ptr + sequence)
+        if tl.program_id(1) == 0:
+            config = 0
+            while config < count:
+                row = sequence * CONFIGS + config
+                held = slot * MEMO_CONFIGS + config
+                depth = tl.load(stack_depth_ptr + row)
+                tl.store(memo_lexer_ptr + held, tl.load(lexer_state_ptr + row))
+                tl.store(memo_depth_ptr + held, depth)
+                lane = tl.arange(0, STACK_STRIDE)
+                live = (lane < depth) & (lane < MEMO_STRIDE)
+                tl.store(
+                    memo_stack_ptr + held * MEMO_STRIDE + lane,
+                    tl.load(stack_ptr + row * STACK_STRIDE + lane, mask=live, other=0),
+                    mask=live,
+                )
+                config = config + 1
+            tl.store(memo_count_ptr + slot, count)
+            tl.store(memo_grammar_ptr + slot, tl.load(grammar_ptr + sequence))
+            tl.debug_barrier()
+            tl.store(memo_hash_ptr + slot, tl.load(hash_ptr + sequence))
+
+        lane = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+        live = lane < mask_words
+        value = tl.load(mask_ptr + sequence * mask_words + lane, mask=live, other=0)
+        tl.store(memo_mask_ptr + slot * mask_words + lane, value, mask=live)
+
+
+@triton.jit
 def _broadcast_kernel(
     representative_ptr,
     mask_ptr,
@@ -2804,6 +3016,37 @@ class DeviceBatch:
         self.widest = torch.ones(1, dtype=torch.int32, device="cuda")
         self.state_hash = torch.zeros(batch, dtype=torch.int32, device="cuda")
         self.representative = torch.arange(batch, dtype=torch.int32, device="cuda")
+        # Masks this batch has already computed, keyed by the parse state that
+        # produced them. Deduplication finds the sequences of one step that
+        # agree; this finds the far larger overlap with the steps before, which
+        # measures at 92% to 96% on this corpus and does not fall off at batch
+        # one - a document keeps returning to the same configuration, and every
+        # character inside a string is the same one.
+        #
+        # Direct-mapped, so a lookup is one load and eviction needs no policy.
+        # An entry holds the state as well as the mask because the fingerprint
+        # only narrows the search, exactly as in deduplication.
+        self.memo_slots = _MEMO_SLOTS
+        self.memo_stride = min(grammar.max_stack, _MEMO_DEPTH)
+        held = self.memo_slots * _MEMO_CONFIGS
+        self.memo_hash = torch.full(
+            (self.memo_slots,), _MEMO_EMPTY, dtype=torch.int32, device="cuda"
+        )
+        self.memo_count = torch.zeros(self.memo_slots, dtype=torch.int32, device="cuda")
+        self.memo_grammar = torch.zeros(
+            self.memo_slots, dtype=torch.int32, device="cuda"
+        )
+        self.memo_lexer = torch.zeros(held, dtype=torch.int32, device="cuda")
+        self.memo_depth = torch.zeros(held, dtype=torch.int32, device="cuda")
+        self.memo_stack = torch.zeros(
+            held * self.memo_stride, dtype=torch.int32, device="cuda"
+        )
+        self.memo_mask = torch.zeros(
+            self.memo_slots * grammar.mask_words, dtype=torch.int32, device="cuda"
+        )
+        self.memo_slot = torch.full((batch,), -1, dtype=torch.int32, device="cuda")
+        self.memo_store = torch.full((batch,), -1, dtype=torch.int32, device="cuda")
+        self.memo_revision = grammar.revision
         # Which grammar each sequence is under. A serving batch mixes them, and
         # everything else in the step reads this to find its tables.
         self.grammar_of = torch.zeros(batch, dtype=torch.int32, device="cuda")
@@ -3438,6 +3681,15 @@ class DeviceBatch:
         raise RuntimeError("call capture_draft first")
 
     def fill_mask(self) -> torch.Tensor:
+        if self.memo_revision != self.grammar.revision:
+            # Compaction renumbers the grammars, so an entry saying "grammar 2"
+            # now names a different one and its mask would be handed to it. The
+            # state beside each entry cannot catch that - the identifier
+            # compares equal - so the memo is emptied whenever the pool moves.
+            # Found by the test that replays a graph after compaction, which is
+            # the only place the identifiers change under a live batch.
+            self.memo_hash.fill_(_MEMO_EMPTY)
+            self.memo_revision = self.grammar.revision
         if self.graph is not None and self.recorded != self.grammar.revision:
             # The pool moved under us. Re-record rather than replay a graph that
             # points at where the tables used to be.
@@ -3466,6 +3718,7 @@ class DeviceBatch:
                 self.config_count,
                 self.widest,
                 self.representative,
+                self.memo_slot,
                 self.grammar_of,
                 grammar.bases,
                 offsets,
@@ -3483,6 +3736,7 @@ class DeviceBatch:
             self.config_count,
             self.widest,
             self.representative,
+            self.memo_slot,
             self.grammar_of,
             grammar.bases,
             counts,
@@ -3525,6 +3779,31 @@ class DeviceBatch:
             STACK_STRIDE=grammar.max_stack,
             BLOCK=128,
             num_warps=4,
+        )
+        _probe_kernel[(self.batch,)](
+            self.lexer_state,
+            self.stack,
+            self.depth,
+            self.config_count,
+            self.grammar_of,
+            self.state_hash,
+            self.representative,
+            self.memo_hash,
+            self.memo_lexer,
+            self.memo_stack,
+            self.memo_depth,
+            self.memo_count,
+            self.memo_grammar,
+            self.memo_slot,
+            self.memo_store,
+            self.depth,
+            CONFIGS=self.configs,
+            STACK_STRIDE=grammar.max_stack,
+            SLOTS=self.memo_slots,
+            MEMO_CONFIGS=_MEMO_CONFIGS,
+            MEMO_STRIDE=self.memo_stride,
+            BATCH=triton.next_power_of_2(self.batch),
+            num_warps=1,
         )
         rows = self.batch * self.configs
         # The running sum turns an item back into a configuration and a group.
@@ -3596,7 +3875,42 @@ class DeviceBatch:
             BLOCK=128,
             num_warps=1,
         )
-        _broadcast_kernel[(self.batch, (grammar.mask_words + 511) // 512)](
+        words = (grammar.mask_words + 511) // 512
+        _recall_kernel[(self.batch, words)](
+            self.memo_slot,
+            self.memo_mask,
+            self.mask,
+            grammar.mask_words,
+            BLOCK=512,
+            num_warps=4,
+        )
+        _store_kernel[(self.batch, words)](
+            self.lexer_state,
+            self.stack,
+            self.depth,
+            self.config_count,
+            self.grammar_of,
+            self.state_hash,
+            self.representative,
+            self.memo_store,
+            self.memo_hash,
+            self.memo_lexer,
+            self.memo_stack,
+            self.memo_depth,
+            self.memo_count,
+            self.memo_grammar,
+            self.memo_mask,
+            self.mask,
+            grammar.mask_words,
+            CONFIGS=self.configs,
+            STACK_STRIDE=grammar.max_stack,
+            SLOTS=self.memo_slots,
+            MEMO_CONFIGS=_MEMO_CONFIGS,
+            MEMO_STRIDE=self.memo_stride,
+            BLOCK=512,
+            num_warps=4,
+        )
+        _broadcast_kernel[(self.batch, words)](
             self.representative,
             self.mask,
             grammar.mask_words,
