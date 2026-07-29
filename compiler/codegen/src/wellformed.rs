@@ -90,7 +90,7 @@ pub fn region_ranges_valid(
         return Err(EmitError::RegionOutputOutOfRange);
     }
     for sink in &region.sinks {
-        if sink.channel_slot as usize >= normalized.channel_bindings.len()
+        if sink.channel_slot.index() >= normalized.channel_bindings.len()
             || sink.value as usize >= normalized.value_types.len()
         {
             return Err(EmitError::RegionSinkOutOfRange);

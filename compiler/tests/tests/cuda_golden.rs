@@ -316,8 +316,13 @@ fn region_emitters_match_oracle() {
     compare(&second_party);
 }
 
-/// The emitter version is part of the driver's compile-cache key, so a silent
-/// bump would quietly invalidate or, worse, reuse the wrong cached cubin.
+/// The constant still names the version these recorded dumps were taken at, so
+/// the goldens below describe the emitter that is actually compiled.
+///
+/// This cannot tell whether the constant tracks the emitted *bytes*: the header
+/// it reads is deliberately preserved across regeneration, so a changed body
+/// under an unchanged version passes here. `emitter_version.rs` is what pins
+/// the version to a hash of the emitted text.
 #[test]
 fn emitter_version_matches_oracle() {
     let dump = std::fs::read_to_string(golden_cuda_dir().join("emit_fused_region_cuda.txt"))

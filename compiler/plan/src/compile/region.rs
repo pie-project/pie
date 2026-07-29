@@ -14,10 +14,10 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec;
 use alloc::vec::Vec;
 
-use pie_ir::op::{ChannelIndex, Family, Op};
+use pie_ir::op::{Family, Op};
 use pie_ir::types::ValueId;
 
-use super::normalize::{NodeIndex, NormalizedStage, result_layout};
+use super::normalize::{ChannelSlot, NodeIndex, NormalizedStage, result_layout};
 use super::nucleus::LibraryMatch;
 use super::symbolic::Dimension;
 
@@ -75,7 +75,7 @@ pub enum RegionKind {
 pub struct ChannelSink {
     /// The stage-local channel slot written, indexing
     /// [`NormalizedStage::channel_bindings`].
-    pub channel_slot: ChannelIndex,
+    pub channel_slot: ChannelSlot,
     /// The value whose contents are put into the channel.
     pub value: ValueId,
 }
@@ -336,8 +336,10 @@ pub(crate) fn build_region(
             }
         }
         if let Op::ChanPut { chan, value } = *op {
+            // `chan` is already stage-local: `localize_stage` rewrote it
+            // before regions were formed.
             sinks.push(ChannelSink {
-                channel_slot: chan,
+                channel_slot: ChannelSlot(chan),
                 value,
             });
         }

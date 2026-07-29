@@ -401,7 +401,7 @@ fn lower_region(region: &Region) -> LaunchRegion {
             .sinks
             .iter()
             .map(|sink| LaunchPut {
-                channel: sink.channel_slot,
+                channel: sink.channel_slot.get(),
                 value: sink.value,
             })
             .collect(),

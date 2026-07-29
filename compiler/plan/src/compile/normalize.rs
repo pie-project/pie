@@ -12,7 +12,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use pie_ir::container::PortSource;
-use pie_ir::op::Op;
+use pie_ir::op::{ChannelIndex, Op};
 use pie_ir::registry::Stage;
 use pie_ir::types::{DType, Literal, ValueId, ValueType};
 use pie_ir::validate::BoundTrace;
@@ -92,6 +92,39 @@ impl NodeIndex {
     }
 
     /// As a slice index into the stage's op list.
+    pub const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// A channel's position in one stage's own channel table.
+///
+/// Deliberately not a [`ChannelIndex`]: that numbers the container's channel
+/// declarations, this numbers [`NormalizedStage::channel_bindings`], and both
+/// are dense `u32` starting at zero. A stage binds only the channels it
+/// touches, so the two agree for the first channel of the first stage and
+/// diverge silently after that — the wrong slot is still in range, still
+/// reads, and still returns somebody's tensor.
+///
+/// `localize_stage` is the only place a [`ChannelIndex`] becomes a
+/// `ChannelSlot`. It cannot express the conversion in the op list it rewrites:
+/// `Op::ChanPut`'s field is a [`ChannelIndex`] because the same `Op` type
+/// carries a program before and after normalization, and the wire, the DSL and
+/// the interpreter all read it as a container index. So a normalized op holds
+/// a slot in a field whose type says index, and the only defence is that
+/// exactly one function performs the rewrite. Everything the planner builds
+/// *around* those ops says which space it means.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct ChannelSlot(pub u32);
+
+impl ChannelSlot {
+    /// The bare number, for the wire and the generated sources — neither can
+    /// tell the two spaces apart either.
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+
+    /// As a slice index into the stage's channel bindings.
     pub const fn index(self) -> usize {
         self.0 as usize
     }
@@ -364,7 +397,9 @@ pub(crate) fn localize_stage(bound: &BoundTrace, stage: &mut NormalizedStage) {
         // Not `else if`: an op could carry both. Missing either rewrite leaves
         // a global id in a stage-local table, which reads the wrong slot.
         if let Some(channel) = op.channel_mut() {
-            *channel = local_channel(&mut channels, *channel);
+            // Back to a bare number: the op's field is a `ChannelIndex`
+            // for the wire's sake, so this is where the type stops helping.
+            *channel = local_channel(&mut channels, *channel).get();
         }
         if let Some(name) = op.name_index_mut() {
             *name = local_name(&bound.container.names, &mut names, *name);
@@ -380,12 +415,14 @@ pub(crate) fn localize_stage(bound: &BoundTrace, stage: &mut NormalizedStage) {
     stage.names = names;
 }
 
-pub(crate) fn local_channel(channels: &mut Vec<u32>, global: u32) -> u32 {
+/// The slot `global` occupies in this stage's channel table, binding it if the
+/// stage has not touched it yet.
+pub(crate) fn local_channel(channels: &mut Vec<ChannelIndex>, global: ChannelIndex) -> ChannelSlot {
     if let Some(local) = channels.iter().position(|channel| *channel == global) {
-        local as u32
+        ChannelSlot(local as u32)
     } else {
         channels.push(global);
-        (channels.len() - 1) as u32
+        ChannelSlot((channels.len() - 1) as u32)
     }
 }
 

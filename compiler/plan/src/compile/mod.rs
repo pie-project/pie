@@ -266,7 +266,7 @@ pub fn stage_identity(stage: &CompiledStage) -> u64 {
         }
         hash.u32_le(region.sinks.len() as u32);
         for sink in &region.sinks {
-            hash.u32_le(sink.channel_slot);
+            hash.u32_le(sink.channel_slot.get());
             hash.u32_le(sink.value);
         }
     }

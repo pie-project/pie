@@ -18,8 +18,8 @@
 use pie_ir::op::Op;
 use pie_ir::types::{DType, Predicate};
 use pie_plan::{
-    ChannelSink, CompiledStage, Dimension, LibraryOp, NodeIndex, PartitionKind, RegionKind,
-    SymbolicType,
+    ChannelSink, ChannelSlot, CompiledStage, Dimension, LibraryOp, NodeIndex, PartitionKind,
+    RegionKind, SymbolicType,
 };
 
 pub const MUTATIONS: &[&str] = &[
@@ -128,7 +128,7 @@ pub fn mutate(stage: &mut CompiledStage, mutation: &str) -> bool {
             if stage.fused.regions.is_empty() {
                 return false;
             }
-            let channel_slot = stage.normalized.channel_bindings.len() as u32;
+            let channel_slot = ChannelSlot(stage.normalized.channel_bindings.len() as u32);
             stage.fused.regions[0].sinks.push(ChannelSink {
                 channel_slot,
                 value: 0,
