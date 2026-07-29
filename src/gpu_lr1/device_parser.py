@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+import os
 import torch
 import triton
 import triton.language as tl
@@ -56,7 +57,28 @@ _SCAN_ALONE = 16384
 _SCAN_BLOCK = 4096
 _SCAN_WARPS = 8
 
-_SWEEP_BLOCKS = 4096
+#: The blocks are one warp each, so what a machine can hold at once is its
+#: multiprocessors times its resident warps - 64 on everything since Volta.
+_WARPS_PER_SM = 64
+#: Blocks per sequence. The drain loops are correct at any width, so this only
+#: decides how much of the machine to occupy, and the right answer turns out to
+#: follow the *batch* at least as much as the device. Swept per block count in
+#: its own process, since the replay scratch is sized with the grid and sharing
+#: a process across widths reads out of bounds:
+#:
+#:     blocks    b1     b8     b32    b128     (us a step, schema 1)
+#:        512  41.0  121.2   144.5   470.9
+#:       1024  42.0   87.6   107.6   324.1
+#:       2048  44.1   89.5   101.2   315.9
+#:       4096  48.6   93.2   100.6   210.3
+#:       8192  57.5  100.3   107.6   173.3
+#:
+#: Every optimum on that grid is `batch * 128` rounded up, held between a floor
+#: that keeps a batch of one from running on a sliver of the device and the
+#: ceiling the machine itself sets. A fixed 4,096 - which is what this was -
+#: costs 16% at batch 1 and 18% at batch 128 on the very card it was swept on.
+_BLOCKS_PER_SEQUENCE = 128
+_MIN_SWEEP_BLOCKS = 512
 # The memo of masks already computed. 256 entries because the corpus reaches 27
 # to 551 distinct parse states over a whole document at batch 512, so this holds
 # the working set of any one batch while costing 256 rows of mask - 4.9 MB
@@ -74,9 +96,49 @@ _MEMO_DEPTH = 64
 # No real fingerprint is asked to be this, and an empty entry has to miss.
 _MEMO_EMPTY = 0x7EEDFACE
 
+#: What the memo may spend, before the machine has a say. Sized against the
+#: batch buffers it sits beside - 142 MB at batch 128 - rather than against
+#: anything the device promises.
+_MEMO_BUDGET = 16 << 20
+
 # Sentinel for "no group of this configuration holds the sampled token". Above
 # any group index, so an atomic minimum picks the earliest real finder.
 _NO_GROUP = 2**31 - 1
+
+
+def _round_up(value: int) -> int:
+    return 1 << max(value - 1, 1).bit_length()
+
+
+def _sweep_blocks(batch: int) -> int:
+    """How many blocks the drain loops should run, here and for this batch.
+
+    Every kernel shaped this way drains a list, so any width is correct and
+    only decides how much of the machine is occupied. It was a constant swept
+    on one card - the kind of thing that is wrong on the next one, and was
+    already wrong at both ends of the batch on that one.
+    """
+    override = os.environ.get("GPUGRAMMAR_SWEEP_BLOCKS")
+    if override:
+        # For sweeping the curve on a machine, and for a deployment that has.
+        return max(1, int(override))
+    device = torch.cuda.get_device_properties(torch.cuda.current_device())
+    ceiling = _round_up(device.multi_processor_count * _WARPS_PER_SM)
+    return max(_MIN_SWEEP_BLOCKS, min(ceiling, _round_up(batch * _BLOCKS_PER_SEQUENCE)))
+
+
+def _memo_slots(per_slot: int) -> int:
+    """How many masks to remember, given what one costs here.
+
+    A slot holds a mask row and the parse state that produced it, so its size
+    follows the vocabulary and the grammar rather than anything fixed. Sizing
+    the table by a count meant a schema with a large vocabulary quietly spent
+    several times what one with a small vocabulary did, and a small card paid
+    the same as a large one.
+    """
+    device = torch.cuda.get_device_properties(torch.cuda.current_device())
+    budget = min(_MEMO_BUDGET, device.total_memory // 1024)
+    return max(32, min(_MEMO_SLOTS, budget // max(per_slot, 1)))
 ACCEPT = -(2**31)
 SPARSE, COMPLEMENT, DENSE = 0, 1, 2
 
@@ -3172,9 +3234,17 @@ class DeviceBatch:
         # Direct-mapped, so a lookup is one load and eviction needs no policy.
         # An entry holds the state as well as the mask because the fingerprint
         # only narrows the search, exactly as in deduplication.
-        self.memo_slots = _MEMO_SLOTS
+        # Both bounds follow the grammar. A parse that cannot be as wide or as
+        # deep as the ceiling allows should not be charged for it, and every
+        # byte here is one the table cannot spend on another entry.
+        self.memo_configs = min(self.configs, _MEMO_CONFIGS)
         self.memo_stride = min(grammar.max_stack, _MEMO_DEPTH)
-        held = self.memo_slots * _MEMO_CONFIGS
+        self.memo_slots = _memo_slots(
+            grammar.mask_words * 4
+            + self.memo_configs * (8 + self.memo_stride * 4)
+            + 16
+        )
+        held = self.memo_slots * self.memo_configs
         self.memo_hash = torch.full(
             (self.memo_slots,), _MEMO_EMPTY, dtype=torch.int32, device="cuda"
         )
@@ -3230,7 +3300,7 @@ class DeviceBatch:
         # 180 us at batch 32 and 516 at 512, 2,048 is 103 and 175, and 4,096 is
         # 103 and 149. Past that batch 32 loses more to the launch than batch
         # 512 gains. The blocks are not the floor; the items are.
-        self.sweep_blocks = _SWEEP_BLOCKS
+        self.sweep_blocks = _sweep_blocks(batch)
         self.max_groups = grammar.max_groups_per_state
         self.advance_blocks = (self.max_groups + _GROUP_BLOCK - 1) // _GROUP_BLOCK
         # One entry per work item, so nothing has to be cleared between steps:
@@ -4001,7 +4071,7 @@ class DeviceBatch:
             CONFIGS=self.configs,
             STACK_STRIDE=grammar.max_stack,
             SLOTS=self.memo_slots,
-            MEMO_CONFIGS=_MEMO_CONFIGS,
+            MEMO_CONFIGS=self.memo_configs,
             MEMO_STRIDE=self.memo_stride,
             SUFFIXES=_MEMO_SUFFIXES,
             BLOCK=128,
@@ -4122,7 +4192,7 @@ class DeviceBatch:
             CONFIGS=self.configs,
             STACK_STRIDE=grammar.max_stack,
             SLOTS=self.memo_slots,
-            MEMO_CONFIGS=_MEMO_CONFIGS,
+            MEMO_CONFIGS=self.memo_configs,
             MEMO_STRIDE=self.memo_stride,
             SUFFIXES=_MEMO_SUFFIXES,
             BATCH=triton.next_power_of_2(self.batch),

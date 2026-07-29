@@ -1025,3 +1025,49 @@ class FusedStep(unittest.TestCase):
             fused.advance_and_fill(token)
             steps += 1
         self.assertGreater(steps, 8)
+
+
+class SizedForTheMachine(unittest.TestCase):
+    """Nothing that decides how much of a device to use may be a constant.
+
+    Every number here was swept on one A100, and a constant swept on one card
+    is wrong on the next one - and was already wrong at both ends of the batch
+    on that one.
+    """
+
+    def test_the_grid_follows_the_batch_and_stays_inside_the_machine(self):
+        import torch
+
+        from gpu_lr1.device_parser import _MIN_SWEEP_BLOCKS, _sweep_blocks
+
+        device = torch.cuda.get_device_properties(torch.cuda.current_device())
+        ceiling = 1 << max(device.multi_processor_count * 64 - 1, 1).bit_length()
+
+        widths = [_sweep_blocks(batch) for batch in (1, 8, 32, 128, 512, 4096)]
+        for width in widths:
+            self.assertGreaterEqual(width, _MIN_SWEEP_BLOCKS)
+            self.assertLessEqual(width, ceiling)
+            self.assertEqual(width & (width - 1), 0, "a power of two")
+        self.assertEqual(widths, sorted(widths), "more sequences, never fewer blocks")
+        self.assertGreater(widths[-1], widths[0], "and not the same number for all")
+
+    def test_the_memo_is_sized_by_what_an_entry_costs(self):
+        from gpu_lr1.device_parser import _MEMO_SLOTS, _memo_slots
+
+        # A larger entry buys fewer of them, and neither end runs away.
+        self.assertGreaterEqual(_memo_slots(1 << 10), _memo_slots(1 << 20))
+        self.assertLessEqual(_memo_slots(1), _MEMO_SLOTS)
+        self.assertGreaterEqual(_memo_slots(1 << 30), 32)
+
+    def test_a_narrow_grammar_is_not_charged_for_a_wide_one(self):
+        from gpu_lr1.device_parser import DeviceBatch, DeviceGrammar
+
+        compiler = gpugrammar.Compiler([bytes([b]) for b in range(256)])
+        grammar = compiler.compile_json_schema(
+            json.dumps({"type": "object", "properties": {"a": {"type": "integer"}}})
+        )
+        pool = DeviceGrammar()
+        pool.admit(grammar)
+        batch = DeviceBatch(pool, 4)
+        self.assertLessEqual(batch.memo_configs, batch.configs)
+        self.assertLessEqual(batch.memo_stride, pool.max_stack)
