@@ -142,6 +142,15 @@ pub struct PreparedRs {
     /// driver walks page-major. Empty unless the pass touches the buffer.
     pub buffer_slot_ids: Vec<u32>,
     pub buffer_slot_indptr: Vec<u32>,
+    /// WorkingSet-relative buffer page -> physical slot, concatenated over
+    /// request rows with `translation_indptr` as the per-row CSR.
+    ///
+    /// Per REQUEST, not per pass: a pass binds one RS working set per request,
+    /// so unlike `kv_translation` there is no single table for the fire. Built
+    /// after the prepare, because materializing or copying-on-write a buffer
+    /// page changes the mapping it publishes.
+    pub translation: Vec<u32>,
+    pub translation_indptr: Vec<u32>,
     pub txn: Option<RsTxn>,
 }
 
@@ -158,6 +167,8 @@ impl PreparedRs {
         request.rs_fold_lens = self.fold_lens.clone();
         request.rs_buffer_slot_ids = self.buffer_slot_ids.clone();
         request.rs_buffer_slot_indptr = self.buffer_slot_indptr.clone();
+        request.rs_translation = self.translation.clone();
+        request.rs_translation_indptr = self.translation_indptr.clone();
     }
 }
 
@@ -192,6 +203,8 @@ fn empty_prepared() -> PreparedRs {
         fold_lens: Vec::new(),
         buffer_slot_ids: Vec::new(),
         buffer_slot_indptr: Vec::new(),
+        translation: Vec::new(),
+        translation_indptr: Vec::new(),
         txn: None,
     }
 }
@@ -314,6 +327,17 @@ fn prepare_many_impl(
         .publish_batch(prepared_rows)
         .map_err(|error| error.to_string())?;
     out.txn = Some(RsTxn { published });
+
+    // Built AFTER the publish, so it reflects the pages this fire just
+    // materialized or privatized rather than the mapping the guest saw.
+    out.translation_indptr.push(0);
+    for &ws in working_sets {
+        let row = store
+            .buffer_translation(ws)
+            .map_err(|error| error.to_string())?;
+        out.translation.extend_from_slice(&row);
+        out.translation_indptr.push(out.translation.len() as u32);
+    }
     Ok(out)
 }
 

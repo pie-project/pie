@@ -53,6 +53,14 @@ pie_native::LaunchView build_launch_view(const pie_native::StepLaunch& launch) {
         pie_native::slice_from_u32(
             launch.rs_buffer_slot_indptr.ptr,
             launch.rs_buffer_slot_indptr.len);
+    view.rs_translation =
+        pie_native::slice_from_u32(
+            launch.rs_translation.ptr,
+            launch.rs_translation.len);
+    view.rs_translation_indptr =
+        pie_native::slice_from_u32(
+            launch.rs_translation_indptr.ptr,
+            launch.rs_translation_indptr.len);
     view.sampling_indices =
         pie_native::slice_from_u32(
             launch.sampling_indices.ptr,
@@ -102,6 +110,10 @@ OwnedLaunchView OwnedLaunchView::capture(const pie_native::StepLaunch& launch) {
         copy_slice(
             launch.rs_buffer_slot_indptr.ptr,
             launch.rs_buffer_slot_indptr.len);
+    owned.rs_translation =
+        copy_slice(launch.rs_translation.ptr, launch.rs_translation.len);
+    owned.rs_translation_indptr =
+        copy_slice(launch.rs_translation_indptr.ptr, launch.rs_translation_indptr.len);
     owned.sampling_indices =
         copy_slice(launch.sampling_indices.ptr, launch.sampling_indices.len);
     owned.sampling_indptr =
@@ -143,6 +155,10 @@ pie_native::LaunchView OwnedLaunchView::view() const {
         rs_buffer_slot_ids.data(), rs_buffer_slot_ids.size());
     view.rs_buffer_slot_indptr = pie_native::slice_from_u32(
         rs_buffer_slot_indptr.data(), rs_buffer_slot_indptr.size());
+    view.rs_translation =
+        pie_native::slice_from_u32(rs_translation.data(), rs_translation.size());
+    view.rs_translation_indptr = pie_native::slice_from_u32(
+        rs_translation_indptr.data(), rs_translation_indptr.size());
     view.sampling_indices =
         pie_native::slice_from_u32(sampling_indices.data(), sampling_indices.size());
     view.sampling_indptr =

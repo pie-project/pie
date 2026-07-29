@@ -48,6 +48,12 @@ pub struct LaunchPlan {
     pub rs_fold_lens: Vec<u32>,
     pub rs_buffer_slot_ids: Vec<u32>,
     pub rs_buffer_slot_indptr: Vec<u32>,
+    /// WorkingSet-relative buffer page -> physical slot, for channel-resolved
+    /// `rs-geometry`. Per REQUEST ROW, unlike [`Self::kv_translation`]: a pass
+    /// binds one RS working set per request, so there is no single table for
+    /// the fire. `rs_translation_indptr` is the row CSR, `R + 1` entries.
+    pub rs_translation: Vec<u32>,
+    pub rs_translation_indptr: Vec<u32>,
     pub masks: Vec<EncodedMask>,
     pub mask_indptr: Vec<u32>,
     pub sampling_indices: Vec<u32>,

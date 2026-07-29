@@ -686,6 +686,11 @@ struct KvBind {
 /// A recorded `rs-geometry`: where the bound recurrent state lives for this
 /// fire and where its folded boundary lands.
 struct RsGeometryBind {
+    /// The five buffer-addressing channels as PTIR descriptor ports, or `None`
+    /// for the synthesized fold-everything geometry. A pass always binds
+    /// `rs-geometry`, but claiming ports for a buffer it never touches would
+    /// put five dead ports in every plain recurrent trace.
+    ports: Option<[(Port, Channel); 5]>,
     fold_len: Rc<wit_channel::Channel>,
     readable: PageDeclaration,
     writable: PageDeclaration,
@@ -919,6 +924,11 @@ impl PassCore {
         }
         let mut inner = self.inner.borrow_mut();
         inner.rs_working_sets = working_sets.iter().map(|rs| rs.rs.clone()).collect();
+        if let Some(ports) = geom.ports {
+            for (port, channel) in ports {
+                inner.ports.push((port, claim_port(port, &channel)));
+            }
+        }
         inner.rs_bind = Some(geom);
         Ok(())
     }
@@ -1789,6 +1799,13 @@ where
     W: RangeBounds<u32>,
 {
     Ok(RsGeometryBind {
+        ports: Some([
+            (Port::RsBufferLen, *buffer_len),
+            (Port::RsBufferPages, *buffer_pages),
+            (Port::RsBufferIndptr, *buffer_indptr),
+            (Port::RsWSlot, *w_slot),
+            (Port::RsWOff, *w_off),
+        ]),
         fold_len: fold_len.wit(),
         readable: PageDeclaration::from_range(readable)?,
         writable: PageDeclaration::from_range(writable)?,
@@ -1817,7 +1834,10 @@ fn rs_geometry_fold_all() -> Result<RsGeometryBind, String> {
         );
     }
     CHANNELS.with(|(fold_len, zero, indptr)| {
-        rs_geometry_bind(fold_len, 0..0, 0..0, zero, zero, indptr, zero, zero)
+        let mut geom =
+            rs_geometry_bind(fold_len, 0..0, 0..0, zero, zero, indptr, zero, zero)?;
+        geom.ports = None;
+        Ok(geom)
     })
 }
 

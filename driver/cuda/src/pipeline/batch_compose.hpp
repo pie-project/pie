@@ -24,6 +24,7 @@
 //   * wire custom (non-causal) BRLE masks co-batched with device geometry
 
 #include <algorithm>
+#include "page_translation.hpp"
 #include <cstdint>
 #include <limits>
 #include <optional>
@@ -569,8 +570,20 @@ inline bool compose_forward_batch(const pie_native::LaunchView& view,
         view.rs_buffer_slot_ids.as<std::uint32_t>();
     const auto input_rs_buffer_indptr =
         view.rs_buffer_slot_indptr.as<std::uint32_t>();
-    const bool has_rs_buffer = !input_rs_buffer_indptr.empty();
-    if (has_rs_buffer) {
+    const auto input_rs_translation = view.rs_translation.as<std::uint32_t>();
+    const auto input_rs_translation_indptr =
+        view.rs_translation_indptr.as<std::uint32_t>();
+    bool any_resolved_rs_buffer = false;
+    for (std::size_t p = 0; p < n_prog; ++p) {
+        if (resolved.is_device_geometry[p] &&
+            resolved.per_program[p].has_rs_buffer_family) {
+            any_resolved_rs_buffer = true;
+            break;
+        }
+    }
+    const bool has_wire_rs_buffer = !input_rs_buffer_indptr.empty();
+    const bool has_rs_buffer = has_wire_rs_buffer || any_resolved_rs_buffer;
+    if (has_wire_rs_buffer) {
         if (input_rs_buffer_indptr.size() != input_request_count + 1 ||
             input_rs_buffer_indptr.front() != 0 ||
             input_rs_buffer_indptr.back() != input_rs_buffer_ids.size()) {
@@ -610,7 +623,7 @@ inline bool compose_forward_batch(const pie_native::LaunchView& view,
     out.prog_page_counts.assign(n_prog, unavailable);
     out.prog_query_lens.assign(n_prog, unavailable);
     out.prog_key_lens.assign(n_prog, unavailable);
-    auto append_rs = [&](std::size_t program) {
+    auto append_rs = [&](std::size_t program) -> bool {
         const std::uint32_t begin = input_request_starts[program];
         const std::uint32_t count = input_request_counts[program];
         if (has_folded_rs) {
@@ -629,23 +642,79 @@ inline bool compose_forward_batch(const pie_native::LaunchView& view,
                     input_rs_fold_lens.begin() + begin + count);
             }
         }
-        if (has_rs_buffer) {
-            for (std::uint32_t request = begin;
-                 request < begin + count;
-                 ++request) {
-                const std::uint32_t lo = input_rs_buffer_indptr[request];
-                const std::uint32_t hi = input_rs_buffer_indptr[request + 1];
-                if (hi != lo) {
-                    out.rs_buffer_slot_ids.insert(
-                        out.rs_buffer_slot_ids.end(),
-                        input_rs_buffer_ids.begin() + lo,
-                        input_rs_buffer_ids.begin() + hi);
-                }
-                out.rs_buffer_slot_indptr.push_back(
-                    static_cast<std::uint32_t>(
-                        out.rs_buffer_slot_ids.size()));
-            }
+        if (!has_rs_buffer) return true;
+        // Channel-resolved `rs-geometry` wins over the host-derived CSR when
+        // the program traced it. The values are WorkingSet-RELATIVE buffer
+        // page indexes -- the guest never holds a physical slot id -- so they
+        // must go through this request's translation segment. The segment is
+        // per REQUEST, not per program: a pass binds one RS working set per
+        // request, so there is no single table for the fire the way there is
+        // for KV.
+        const FireGeometry& geom = resolved.per_program[program];
+        const bool from_channels =
+            resolved.is_device_geometry[program] && geom.has_rs_buffer_family &&
+            geom.rs_buffer_slot_indptr.size() == count + 1;
+        const bool has_translation =
+            input_rs_translation_indptr.size() > begin + count;
+        if (from_channels && !has_translation) {
+            if (err) *err =
+                "ptir compose: channel-resolved rs-geometry without a "
+                "buffer-page translation";
+            return false;
         }
+        for (std::uint32_t request = begin; request < begin + count; ++request) {
+            if (!from_channels && !has_wire_rs_buffer) {
+                out.rs_buffer_slot_indptr.push_back(
+                    static_cast<std::uint32_t>(out.rs_buffer_slot_ids.size()));
+                continue;
+            }
+            const std::uint32_t lo = from_channels
+                ? geom.rs_buffer_slot_indptr[request - begin]
+                : input_rs_buffer_indptr[request];
+            const std::uint32_t hi = from_channels
+                ? geom.rs_buffer_slot_indptr[request - begin + 1]
+                : input_rs_buffer_indptr[request + 1];
+            const auto& source = from_channels
+                ? geom.rs_buffer_slot_ids
+                : input_rs_buffer_ids;
+            if (hi > lo) {
+                if (hi > source.size()) {
+                    if (err) *err = "ptir compose: buffered RS CSR overruns its ids";
+                    return false;
+                }
+                const std::size_t appended = out.rs_buffer_slot_ids.size();
+                out.rs_buffer_slot_ids.insert(
+                    out.rs_buffer_slot_ids.end(),
+                    source.begin() + lo,
+                    source.begin() + hi);
+                if (from_channels) {
+                    const std::uint32_t tr_lo =
+                        input_rs_translation_indptr[request];
+                    const std::uint32_t tr_hi =
+                        input_rs_translation_indptr[request + 1];
+                    if (tr_hi < tr_lo || tr_hi > input_rs_translation.size()) {
+                        if (err) *err =
+                            "ptir compose: rs translation CSR malformed";
+                        return false;
+                    }
+                    std::string translate_error;
+                    if (!translate_resolved_rs_slot_ids(
+                            std::span<std::uint32_t>(
+                                out.rs_buffer_slot_ids.data() + appended,
+                                hi - lo),
+                            std::span<const std::uint32_t>(
+                                input_rs_translation.data() + tr_lo,
+                                tr_hi - tr_lo),
+                            &translate_error)) {
+                        if (err) *err = "ptir compose: " + translate_error;
+                        return false;
+                    }
+                }
+            }
+            out.rs_buffer_slot_indptr.push_back(
+                static_cast<std::uint32_t>(out.rs_buffer_slot_ids.size()));
+        }
+        return true;
     };
 
     bool any_write_desc = false;
@@ -806,7 +875,7 @@ inline bool compose_forward_batch(const pie_native::LaunchView& view,
         out.prog_sample_counts[p] =
             static_cast<std::uint32_t>(out.sampling_indices.size()) -
             out.prog_sample_starts[p];
-        append_rs(p);
+        if (!append_rs(p)) return false;
     }
 
     // Pass 2 — device-geometry programs, appended in program order.
@@ -912,7 +981,7 @@ inline bool compose_forward_batch(const pie_native::LaunchView& view,
                 }
             }
         }
-        append_rs(p);
+        if (!append_rs(p)) return false;
     }
     out.prog_sample_offsets[n_prog] =
         static_cast<std::uint32_t>(out.sampling_indices.size());

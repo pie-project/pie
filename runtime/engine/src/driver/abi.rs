@@ -305,6 +305,8 @@ fn step_desc<'a>(
         rs_fold_lens: u32_slice(&plan.rs_fold_lens),
         rs_buffer_slot_ids: u32_slice(&plan.rs_buffer_slot_ids),
         rs_buffer_slot_indptr: u32_slice(&plan.rs_buffer_slot_indptr),
+        rs_translation: u32_slice(&plan.rs_translation),
+        rs_translation_indptr: u32_slice(&plan.rs_translation_indptr),
         masks: masks.as_desc(),
         sampling_indices: u32_slice(&plan.sampling_indices),
         sampling_indptr: u32_slice(&plan.sampling_indptr),

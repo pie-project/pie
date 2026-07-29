@@ -497,6 +497,8 @@ inline int validate_step_desc(const PieStepDesc* desc,
     PIE_VALIDATE_SLICE(rs_fold_lens);
     PIE_VALIDATE_SLICE(rs_buffer_slot_ids);
     PIE_VALIDATE_SLICE(rs_buffer_slot_indptr);
+    PIE_VALIDATE_SLICE(rs_translation);
+    PIE_VALIDATE_SLICE(rs_translation_indptr);
     PIE_VALIDATE_SLICE(sampling_indices);
     PIE_VALIDATE_SLICE(sampling_indptr);
     PIE_VALIDATE_SLICE(context_ids);
@@ -553,6 +555,8 @@ inline int validate_step_desc(const PieStepDesc* desc,
              desc->rs_fold_lens.len,
              desc->rs_buffer_slot_ids.len,
              desc->rs_buffer_slot_indptr.len,
+             desc->rs_translation.len,
+             desc->rs_translation_indptr.len,
              desc->masks.request_indptr.len,
              desc->masks.word_indptr.len,
              desc->masks.words.len,
@@ -725,6 +729,14 @@ inline int validate_step_desc(const PieStepDesc* desc,
         : validate_csr(
               desc->rs_buffer_slot_indptr,
               desc->rs_buffer_slot_ids.len,
+              wire_row_count);
+    if (status != PIE_STATUS_OK) return status;
+    status = defer_rs_outer
+        ? validate_deferred_outer_csr(
+              desc->rs_translation_indptr, desc->rs_translation.len)
+        : validate_csr(
+              desc->rs_translation_indptr,
+              desc->rs_translation.len,
               wire_row_count);
     if (status != PIE_STATUS_OK) return status;
     status = validate_csr(

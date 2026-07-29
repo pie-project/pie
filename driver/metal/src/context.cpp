@@ -709,6 +709,8 @@ class Context::Impl {
         launch.rs_fold_lens = step.rs_fold_lens;
         launch.rs_buffer_slot_ids = step.rs_buffer_slot_ids;
         launch.rs_buffer_slot_indptr = step.rs_buffer_slot_indptr;
+        launch.rs_translation = step.rs_translation;
+        launch.rs_translation_indptr = step.rs_translation_indptr;
         launch.masks = step.masks;
         launch.sampling_indices = step.sampling_indices;
         launch.sampling_indptr = step.sampling_indptr;

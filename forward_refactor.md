@@ -850,19 +850,14 @@ RsBufferLen, RsWSlot, RsWOff}` at registry tags 10–14 (wire-additive), the
 `descriptor_resolve` cases. `rs-geometry`'s five channels lower to exactly
 those ports.
 
-Still outstanding on that path, and the reason `rs-geometry` is today RECORDED
-AND VALIDATED but not yet LOWERED: the `rs_translation` segment (the mirror of
-`kv_translation`, which maps WorkingSet-relative page ids to physical slots),
-its application in `batch_compose`, and Metal, which advertises none of the new
-bits and so falls back to the host-derived path.
-
-Until those land, a `buffer` / `fold-buffered` fire still lowers through the
-host-derived `RsStore` path driven by `buffer`'s `start-token`, and the
-`rs-geometry` channels are checked for resolvable handles but do not bind the
-tag 10–14 ports. The surface is therefore already final; only the plumbing
-behind it is not. This is deliberate — getting the record's field set right
-BEFORE anything depends on it matters, because D8 chose records and adding a
-record field later is breaking.
+> **Lowered as of §10.1.** When this section was written, `rs-geometry` was
+> RECORDED AND VALIDATED but not LOWERED: the `rs_translation` segment and its
+> application in `batch_compose` did not exist, so a buffered fire still went
+> through the host-derived `RsStore` path. Both now exist, the ports are
+> claimed by the SDK and validated by the engine, and Metal mirrors the
+> slices. Keeping the record's field set right BEFORE anything depended on it
+> was the point — D8 chose records, and adding a record field later is
+> breaking.
 
 ### 9.4 One host implementation, one SDK core
 
@@ -924,30 +919,53 @@ type. There is deliberately no unprefixed `ptir::prelude`.
 
 A, B, and C have landed. What is left, in the order it should land.
 
-### 10.1 Lower `rs-geometry` (the other half of B0)
+### 10.1 Lower `rs-geometry` (the other half of B0) — LANDED
 
-The surface is final; the plumbing is not. The five RS ports exist
-(`Port::{RsBufferPages,RsBufferIndptr,RsBufferLen,RsWSlot,RsWOff}`, tags 10-14,
-`compiler/ir/src/registry.rs`) and CUDA `descriptor_resolve.hpp` reads them, but
-nothing connects the two: a `buffer` / `fold-buffered` fire still lowers through
-the host-derived `RsStore` path driven by `start-token`, and the engine never
-adds the RS ports to `program()`'s `expected` list, so the guest never claims
-them into the traced container.
+The surface was final; the plumbing was not. The five RS ports
+(`Port::{RsBufferPages,RsBufferIndptr,RsBufferLen,RsWSlot,RsWOff}`, tags 10-14)
+existed and CUDA `descriptor_resolve.hpp` resolved them into
+`FireGeometry::rs_buffer_*`, but **nothing anywhere read the result**. The
+descriptor-resolved RS family was write-only. That is now closed.
 
-Closing the gap, mirroring the KV translation at each layer:
+**The translation is per-`(program, request)`, not per-program.** This is the
+one place the RS path cannot mirror KV. A pass has ONE KV working set, so
+`kv_translation_indptr` has `n_prog + 1` entries. A pass has one RS working set
+per REQUEST, so `rs_translation_indptr` has `Σ_p R_p + 1`. That is also why the
+translation is applied in `batch_compose::append_rs` rather than beside the KV
+translation in `dispatch.cu` — the device-geometry loop there does not have
+per-program request offsets in scope, and `append_rs` does.
 
-- `rs_translation` / `rs_translation_indptr` on `LaunchPlan`
-  (`interface/driver/src/plan.rs:83`), its FFI mirror (`local.rs:1280`), the
-  engine producer (`pipeline/fire.rs:1146`), the submission struct
-  (`driver/submission.rs:47`), and the FFI marshal (`driver/abi.rs:373`).
-- CUDA: translate `fg.rs_buffer_slot_ids` / `fg.rs_w_slot` in `dispatch.cu`
-  beside the KV translation at 6855-6871; apply the resolved arrays in
-  `batch_compose.hpp`; extend `validate_fire_geometry`.
-- Engine: add the five RS ports to `core_program`'s `expected` list when
-  `bindings.rs_geom` is present. SDK: `claim_port` them.
-- Metal: mirror, or reject the RS ports explicitly rather than silently.
+**There is no masked-read escape for RS.** `translate_resolved_page_ids` maps an
+out-of-range KV read page to 0 when a mask will discard it anyway. The RS twin,
+`translate_resolved_rs_slot_ids`, refuses: out-of-range or unmapped is always an
+error. A KV page the mask discards costs nothing to misread; a buffered
+activation is folded into the state, where a wrong value is indistinguishable
+from a right one and is never recoverable.
 
-Then drop the "recorded but not lowered" caveat from §9.3.
+What landed, layer by layer:
+
+- Engine: `RsStore::buffer_translation` (dense WS-relative buffer page →
+  physical slot, `RS_TRANSLATION_UNMAPPED` for holes); `PreparedRs.translation`
+  built at the *end* of `prepare_many_impl`, after `publish_batch`, so it
+  reflects the pages this fire materialized or copied-on-write.
+- Wire: composition at both the single-row and multi-row merge sites in
+  `scheduler/wire.rs`, mirroring `rs_buffer_slot_indptr` exactly.
+- ABI: `LaunchPlan` + `PieStepLaunchDesc` + `LaunchView` + `step_launch.hpp`,
+  with CSR validation in `abi_validation.hpp`. **`PIE_DRIVER_ABI_VERSION`
+  19 → 20**; `pie_driver_abi.h` regenerated.
+- CUDA: `batch_compose.hpp` now prefers `geom.rs_buffer_slot_ids` for
+  device-geometry programs and translates per request; `append_rs` returns
+  `bool` so a bad translation fails the compose instead of silently producing
+  a wrong slot.
+- Engine `core_program`: the five RS ports are validated as **optional**
+  bindings. A pass always binds `rs-geometry`, but a program only traces the
+  buffer addressing when it actually addresses the buffer, so absent-but-
+  attached is legal here and remains an error for the KV family.
+- SDK: `bind_recurrent` claims the five ports — but only for an explicitly
+  supplied geometry, never for the synthesized `rs_geometry_fold_all()`
+  default, which would otherwise put five dead ports in every plain recurrent
+  trace.
+- Metal: mirrors the two new slices as pass-through.
 
 **Open along the way:** whether `PortSource::Const` needs an RS analogue, and
 whether the host-derived and channel-driven RS paths should be made mutually

@@ -48,6 +48,8 @@ struct OwnedLaunchView {
     // fallback for resolved request rows.
     std::vector<std::uint32_t> rs_buffer_slot_ids;
     std::vector<std::uint32_t> rs_buffer_slot_indptr;
+    std::vector<std::uint32_t> rs_translation;
+    std::vector<std::uint32_t> rs_translation_indptr;
     std::vector<std::uint32_t> sampling_indices;
     std::vector<std::uint32_t> sampling_indptr;
     std::vector<std::uint32_t> kv_translation;

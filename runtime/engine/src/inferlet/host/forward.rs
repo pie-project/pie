@@ -71,8 +71,32 @@ fn validate_descriptor_bindings(
     channel_reps: &[u32],
     expected: &[(Port, Option<u32>)],
 ) -> Result<(), String> {
+    validate_bindings(container, channel_reps, expected, false)
+}
+
+/// The RS geometry ports, which are OPTIONAL: a pass always binds
+/// `rs-geometry`, but a program only traces the buffer addressing when it
+/// actually addresses the buffer. Absent-but-attached is therefore legal here
+/// and an error for the KV family. Present-but-mismatched is an error for both.
+fn validate_optional_descriptor_bindings(
+    container: &TraceContainer,
+    channel_reps: &[u32],
+    expected: &[(Port, Option<u32>)],
+) -> Result<(), String> {
+    validate_bindings(container, channel_reps, expected, true)
+}
+
+fn validate_bindings(
+    container: &TraceContainer,
+    channel_reps: &[u32],
+    expected: &[(Port, Option<u32>)],
+    optional: bool,
+) -> Result<(), String> {
     for &(port, expected_rep) in expected {
         let binding = container.ports.iter().find(|binding| binding.port == port);
+        if optional && binding.is_none() {
+            continue;
+        }
         match (binding, expected_rep) {
             (None, None) => {}
             (None, Some(_)) => {
@@ -514,7 +538,7 @@ impl ProcessCtx {
         container_bytes: Vec<u8>,
         channels: Vec<Resource<Channel>>,
     ) -> Anyhow<Result<(), String>> {
-        let (embed, attention, readout, rs_working_sets, rs_fold_len) = {
+        let (embed, attention, readout, rs_working_sets, rs_fold_len, rs_geom) = {
             let pass = self.ctx().table.get(&this)?;
             if pass.is_bound() {
                 return Ok(Err("forward pass program is already attached".to_string()));
@@ -540,6 +564,7 @@ impl ProcessCtx {
                     .map(Resource::new_borrow)
                     .collect::<Vec<Resource<RsWorkingSet>>>(),
                 pass.bindings.rs_fold_len.clone(),
+                pass.bindings.rs_geom,
             )
         };
         let kv_working_set: Resource<KvWorkingSet> = Resource::new_borrow(attention.kv_ws);
@@ -613,6 +638,22 @@ impl ProcessCtx {
                 validate_descriptor_bindings(&prog.bound.container, &channel_reps, &expected)
             {
                 return Ok(Err(error));
+            }
+            if let Some(geom) = rs_geom.as_ref() {
+                let rs_expected = [
+                    (Port::RsBufferPages, Some(geom.buffer_pages)),
+                    (Port::RsBufferIndptr, Some(geom.buffer_indptr)),
+                    (Port::RsBufferLen, Some(geom.buffer_len)),
+                    (Port::RsWSlot, Some(geom.w_slot)),
+                    (Port::RsWOff, Some(geom.w_off)),
+                ];
+                if let Err(error) = validate_optional_descriptor_bindings(
+                    &prog.bound.container,
+                    &channel_reps,
+                    &rs_expected,
+                ) {
+                    return Ok(Err(error));
+                }
             }
             let mut cells: BoundCells = Vec::with_capacity(channels.len());
             for (i, ch) in channels.iter().enumerate() {

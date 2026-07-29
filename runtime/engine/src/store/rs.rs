@@ -138,6 +138,11 @@ pub enum RsError {
     GrantMismatch { required: usize, granted: usize },
 }
 
+/// A buffer page that is reserved but has no physical slot behind it yet.
+/// Distinct from every real slot id because the pool is capacity-bounded far
+/// below `u32::MAX`.
+pub const RS_TRANSLATION_UNMAPPED: u32 = u32::MAX;
+
 struct RsEntry {
     geom: RsGeometry,
     /// Folded composite state; `None` until the first write/fold commits.
@@ -705,6 +710,26 @@ impl RsStore {
 
     pub fn buffer_size(&self, ws: RsWorkingSetId) -> Result<u32, RsError> {
         Ok(self.entry(ws)?.buffer.len() as u32)
+    }
+
+    /// This working set's buffer-page translation: WorkingSet-relative buffer
+    /// page index -> physical slot id, dense, in page order.
+    ///
+    /// The RS twin of `KvWorkingSet::translation`, and the reason the guest's
+    /// `rs-geometry` channels can name pages at all: a guest never holds a
+    /// physical slot id, so channel-resolved buffer geometry is meaningless
+    /// until it is mapped through this. A page that is reserved but not yet
+    /// materialized has no physical backing and lowers as
+    /// [`RS_TRANSLATION_UNMAPPED`] -- naming one is a fire-geometry error,
+    /// not readable garbage, because unmaterialized activations would fold
+    /// silently into the state.
+    pub fn buffer_translation(&self, ws: RsWorkingSetId) -> Result<Vec<u32>, RsError> {
+        Ok(self
+            .entry(ws)?
+            .buffer
+            .iter()
+            .map(|slot| slot.map_or(RS_TRANSLATION_UNMAPPED, |id| id.0))
+            .collect())
     }
 
     pub fn folded_slot(&self, ws: RsWorkingSetId) -> Result<Option<RsSlotId>, RsError> {

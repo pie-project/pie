@@ -30,7 +30,7 @@ use crate::geometry::GeometryClass;
 /// verdicts and intrinsic side-table analysis the CUDA driver derives for
 /// itself in `region_support.hpp`. Additive, and empty means "not supplied",
 /// but the struct grew, so drivers and workers ship together.
-pub const PIE_DRIVER_ABI_VERSION: u32 = 19;
+pub const PIE_DRIVER_ABI_VERSION: u32 = 20;
 pub const PIE_MODEL_COMPONENT_FULL: u32 = 0;
 pub const PIE_MODEL_COMPONENT_TEXT: u32 = 1;
 pub const PIE_MODEL_COMPONENT_ENCODE: u32 = 2;
@@ -1128,6 +1128,13 @@ pub struct PieStepDesc {
     pub rs_fold_lens: PieU32Slice,
     pub rs_buffer_slot_ids: PieU32Slice,
     pub rs_buffer_slot_indptr: PieU32Slice,
+    /// WorkingSet-relative buffer page -> physical slot for channel-resolved
+    /// `rs-geometry`, concatenated over request rows. `rs_translation_indptr`
+    /// is the row CSR (`rows + 1`). Per ROW, unlike `kv_translation`, because
+    /// a pass binds one RS working set per request rather than one per pass.
+    /// `0xFFFF_FFFF` marks a reserved-but-unmaterialized page.
+    pub rs_translation: PieU32Slice,
+    pub rs_translation_indptr: PieU32Slice,
     pub masks: PieMaskWordsDesc,
     /// Model readout rows, flattened across the batch.
     pub sampling_indices: PieU32Slice,
@@ -1199,6 +1206,8 @@ impl Default for PieStepDesc {
             rs_fold_lens: PieU32Slice::default(),
             rs_buffer_slot_ids: PieU32Slice::default(),
             rs_buffer_slot_indptr: PieU32Slice::default(),
+            rs_translation: PieU32Slice::default(),
+            rs_translation_indptr: PieU32Slice::default(),
             masks: PieMaskWordsDesc::default(),
             sampling_indices: PieU32Slice::default(),
             sampling_indptr: PieU32Slice::default(),
@@ -1997,6 +2006,10 @@ pub unsafe fn validate_step_desc(desc: &PieStepDesc, roster_len: usize) -> PieAb
         "launch rs_buffer_slot_ids ptr/len mismatch",
     )?;
     validate_u32_slice(
+        desc.rs_translation,
+        "launch rs_translation ptr/len mismatch",
+    )?;
+    validate_u32_slice(
         desc.sampling_indices,
         "launch sampling_indices ptr/len mismatch",
     )?;
@@ -2137,6 +2150,13 @@ pub unsafe fn validate_step_desc(desc: &PieStepDesc, roster_len: usize) -> PieAb
             desc.rs_buffer_slot_indptr,
             "launch rs_buffer_slot_indptr malformed",
             desc.rs_buffer_slot_ids.len,
+            wire_row_count,
+            true,
+        )?;
+        validate_csr(
+            desc.rs_translation_indptr,
+            "launch rs_translation_indptr malformed",
+            desc.rs_translation.len,
             wire_row_count,
             true,
         )?;
