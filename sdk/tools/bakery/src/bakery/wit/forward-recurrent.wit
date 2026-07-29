@@ -78,6 +78,15 @@ interface forward-recurrent {
         /// which is what lets "fold everything" be a fire-invariant constant
         /// (`u32::MAX`) even though the token count varies per fire.
         ///
+        /// **A fire that replays buffered tokens produces NO USABLE LOGITS.**
+        /// The replay reloads each linear layer's cached in-projection
+        /// activations and stops at the recurrence -- it never runs the output
+        /// projection, so those layers contribute nothing to the residual
+        /// stream and whatever reaches `lm-head` is missing them. Read the
+        /// logits from the fire that BUFFERED the tokens, which ran the full
+        /// backbone; the fire that later folds them is a state advance, and
+        /// its readout is good for nothing but a completion signal.
+        ///
         /// A CHANNEL rather than a scalar because a speculative decode
         /// computes its accepted count ON DEVICE: as a channel the verify and
         /// the commit fuse into one fire, instead of the guest round-tripping

@@ -1086,13 +1086,24 @@ canonicalize containers, which is the thing D4 exists to avoid.
 
 - `model::pass_kind()` returns `recurrent` only when `kv_page_size() == 0`,
   which no registered model satisfies. That arm is unreachable and therefore
-  untested, and `forward-recurrent.wit` has no in-tree consumer.
-- `forward-recurrent.wit` documents `fold-buffered` as computing no logits, but
-  `gdn-foldcommit` attaches an epilogue that reads `logits` and passes. One of
-  the two is wrong; the doc is the more likely candidate.
-- §8.2's Metal RS flag-bit collapse
-  (`driver/metal/src/batch/batch_schedule.hpp:114` misreads `RS_FLAG_FOLD` as
-  RESET) is pre-existing and still open.
+  untested, and `forward-recurrent.wit` has no in-tree consumer. Left as is:
+  the classification is correct and a pure-Mamba model would reach it — the
+  gap is in the model zoo, not the code.
+- ~~The `fold-buffered` no-logits claim~~ — SETTLED, and the doc was right.
+  `qwen3_5_forward.cpp:1206` returns from the linear layer as soon as a fold
+  boundary is set, BEFORE the output projection, so those layers contribute
+  nothing to the residual stream and whatever reaches `lm_head` is missing
+  them. `gdn-foldcommit` "passes" only because it never asserts on the value.
+  The rule now lives on `rs-geometry.fold-len` in the WIT, where a guest will
+  actually see it, rather than on a method that no longer exists.
+- ~~§8.2's Metal RS flag-bit collapse~~ — FIXED.
+  `batch_schedule.hpp` truthiness-tested `rs_slot_flags[r] != 0`, but
+  `RS_FLAG_FOLD` (2) is also non-zero, so a FOLD row was read as a fresh
+  sequence and `forward.cpp` then called `reset_state(slot)` on it — zeroing a
+  live recurrent state. It now masks with RESET, as CUDA already did in both
+  places it reads the flag. The constant is mirrored locally rather than
+  included: `paged_batch_validation_test` compiles this header without the
+  generated-ABI include directory.
 
 ---
 
