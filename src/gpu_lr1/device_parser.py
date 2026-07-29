@@ -69,7 +69,7 @@ _MEMO_SLOTS = 256
 # thirds to three quarters of configurations, with a long thin tail that the
 # whole-stack key still catches.
 _MEMO_SUFFIXES = 1
-_MEMO_CONFIGS = 8
+_MEMO_CONFIGS = 64
 _MEMO_DEPTH = 64
 # No real fingerprint is asked to be this, and an empty entry has to miss.
 _MEMO_EMPTY = 0x7EEDFACE
@@ -3126,6 +3126,7 @@ class DeviceBatch:
         self.configs = grammar.max_configs
         self.graph: torch.cuda.CUDAGraph | None = None
         self.advance_graph: torch.cuda.CUDAGraph | None = None
+        self.step_graph: torch.cuda.CUDAGraph | None = None
         # A whole draft walk as one recording. See `capture_draft`.
         self.draft_graph: torch.cuda.CUDAGraph | None = None
         self.draft_length = 0
@@ -3579,6 +3580,64 @@ class DeviceBatch:
             self.hist_slot.zero_()
             self.history_length = 0
 
+    def capture_step(self) -> None:
+        """Record the advance and the *next* fill as one graph.
+
+        A decode step is fill, sample, advance - and then the next fill. Only
+        the sample sits between the fill and the advance; nothing at all sits
+        between the advance and the fill that follows it, so those two are one
+        graph and a step costs one replay instead of two. What that saves is
+        not kernel time but the fixed cost of a replay and the Python around
+        it, which at batch 8 is a fifth of the step.
+
+        The rehearsal runs the advance, and an advance moves the parse, so the
+        live state is put back afterwards exactly as `capture_advance` does.
+        """
+        held = (
+            self.lexer_state.clone(),
+            self.stack.clone(),
+            self.depth.clone(),
+            self.config_count.clone(),
+            self.widest.clone(),
+        )
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                self._advance()
+                self._fill()
+        torch.cuda.current_stream().wait_stream(stream)
+        self.recorded = self.grammar.revision
+        self.step_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.step_graph):
+            self._advance()
+            self._fill()
+
+        self.lexer_state.copy_(held[0])
+        self.stack.copy_(held[1])
+        self.depth.copy_(held[2])
+        self.config_count.copy_(held[3])
+        self.widest.copy_(held[4])
+        if self.rollback_depth > 0:
+            self.hist_slot.zero_()
+            self.history_length = 0
+
+    def advance_and_fill(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Accept one sampled token per sequence and return the next mask.
+
+        The whole of a decode step after sampling, in one launch. Equivalent to
+        `advance(tokens)` followed by `fill_mask()`, and the mask it returns is
+        the same tensor `fill_mask` returns.
+        """
+        self.token.copy_(tokens.to(torch.int32).reshape(-1)[: self.batch])
+        if self.rollback_depth > 0:
+            self.history_length = min(self.history_length + 1, self.rollback_depth)
+        if self.step_graph is not None and self.recorded == self.grammar.revision:
+            self.step_graph.replay()
+            return self.mask
+        self._advance()
+        return self._fill()
+
     def _advance(self) -> None:
         grammar = self.grammar
         rows = self.batch * self.configs
@@ -3879,6 +3938,7 @@ class DeviceBatch:
             # points at where the tables used to be.
             self.graph = None
             self.advance_graph = None
+            self.step_graph = None
             self.draft_graph = None
         if self.graph is not None:
             self.graph.replay()

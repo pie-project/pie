@@ -968,3 +968,60 @@ class CorpusAgreement(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FusedStep(unittest.TestCase):
+    """The advance and the next fill as one graph.
+
+    Only the sample sits between a fill and the advance that follows it;
+    nothing sits between that advance and the next fill, so they are one graph
+    and a decode step is one replay. What has to hold is that it produces the
+    masks the two graphs produce.
+    """
+
+    def test_a_fused_step_masks_what_the_two_graphs_mask(self):
+        import torch
+
+        from gpu_lr1.device_parser import DeviceGrammar, DeviceBatch
+
+        compiler = gpugrammar.Compiler([bytes([b]) for b in range(256)])
+        grammar = compiler.compile_json_schema(
+            json.dumps(
+                {
+                    "type": "object",
+                    "properties": {"a": {"type": "string"}, "b": {"type": "integer"}},
+                    "required": ["a"],
+                }
+            )
+        )
+        pool = DeviceGrammar()
+        pool.admit(grammar)
+        document = b'{"a": "xy", "b": 12}'
+
+        separate = DeviceBatch(pool, 2)
+        fused = DeviceBatch(pool, 2)
+        reference = grammar.matcher(0)
+        for batch in (separate, fused):
+            batch.set_batch_configurations(
+                {index: reference.configurations() for index in range(2)}
+            )
+            batch.fill_mask()
+            batch.capture()
+        separate.advance(torch.zeros(2, dtype=torch.int32, device="cuda"))
+        separate.capture_advance()
+        fused.capture_step()
+
+        steps = 0
+        for byte in document:
+            self.assertTrue(
+                torch.equal(separate.mask, fused.mask),
+                f"masks diverge at step {steps}",
+            )
+            if not reference.accept_token(byte):
+                break
+            token = torch.full((2,), byte, dtype=torch.int32, device="cuda")
+            separate.advance(token)
+            separate.fill_mask()
+            fused.advance_and_fill(token)
+            steps += 1
+        self.assertGreater(steps, 8)
