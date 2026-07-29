@@ -3032,6 +3032,32 @@ impl BatchScheduler {
         )
     }
 
+    /// Items that a rotation can usefully expose at the queue FRONT — the
+    /// only reason to move a held close backward.
+    ///
+    /// Three kinds dispatch without ever reaching the front, so rotating for
+    /// them is pure churn. A `Launch` is picked by fire id in
+    /// `dispatch_frame_work`, which reads the whole queue. A standalone copy
+    /// is pulled from any position by the tail sweep below. And a close is
+    /// excluded because this predicate is only asked while the WHOLE close
+    /// run is held, where exposing one held close behind another dispatches
+    /// nothing.
+    ///
+    /// Measured cost of asking the wrong question (`any non-close behind`,
+    /// which a queue of held closes followed by the next cohort's launches
+    /// always answers yes): 0.5M rotations and 103 ms of the loop thread in
+    /// ONE cohort boundary at 512 lanes, and 6.6M rotations over a 1024-lane
+    /// run whose GPU then idled 6.4 s. Each rotation also bumps the queue
+    /// epoch, so it invalidated `ScanCache` and re-walked the queue on top.
+    const fn rotation_target(item: &QueuedItem) -> bool {
+        !matches!(
+            item,
+            QueuedItem::Launch(_)
+                | QueuedItem::CloseInstance { .. }
+                | QueuedItem::CloseChannels { .. }
+        ) && !Self::standalone_copy(item)
+    }
+
     /// Controls that dispatch without draining in-flight launches. The
     /// registrations are synchronous and create entities nothing in flight
     /// can reference yet — with one caveat: a channel registration that
@@ -3248,13 +3274,7 @@ impl BatchScheduler {
                         // `pending_binds` is the wake that re-checks).
                         let rot_t = probe_disp.then(Instant::now);
                         let rot_stop = close_rotations >= pending.len()
-                            || !pending.iter().skip(1).any(|item| {
-                                !matches!(
-                                    item,
-                                    QueuedItem::CloseInstance { .. }
-                                        | QueuedItem::CloseChannels { .. }
-                                )
-                            });
+                            || !pending.iter().skip(1).any(Self::rotation_target);
                         if let Some(t) = rot_t {
                             rot_ns += t.elapsed().as_nanos() as u64;
                             rot_n += 1;
@@ -3328,12 +3348,7 @@ impl BatchScheduler {
                     // progress claim (see the CloseInstance hold branch).
                     let rot_t = probe_disp.then(Instant::now);
                     let rot_stop = close_rotations >= pending.len()
-                        || !pending.iter().skip(1).any(|item| {
-                            !matches!(
-                                item,
-                                QueuedItem::CloseInstance { .. } | QueuedItem::CloseChannels { .. }
-                            )
-                        });
+                        || !pending.iter().skip(1).any(Self::rotation_target);
                     if let Some(t) = rot_t {
                         rot_ns += t.elapsed().as_nanos() as u64;
                         rot_n += 1;

@@ -4638,3 +4638,111 @@ This also re-frames the whole §20.14 shape: "make per-process bring-up and
 teardown cheaper" is not a latency problem, it is a **CPU budget** problem.
 Steady-state decode uses 3.0 of 13.6 cores, so the machine has ~10 spare
 cores during decode and none at all at the boundary.
+
+## §20.27 — the boundary ROTATION STORM, and the conc-1024 page correction
+
+Two findings. One is a performance defect in the dispatch loop that cost up
+to 220 ms of the scheduler thread per cohort boundary; the other is that
+every "conc 1024 regressed" reading in this document since §20.18 was taken
+at the wrong page count.
+
+### ★ The defect: `dispatch_ready_items` rotated the whole queue, per pass
+
+At a cohort boundary the loop holds closes so a pending bind can jump them:
+
+```rust
+let hold_closes = !stopping && frame_policy.has_pending_binds();
+```
+
+Both held-close branches then rotated the front close to the back and asked
+whether to keep going. The question they asked was:
+
+```rust
+!pending.iter().skip(1).any(|item| !matches!(item, CloseInstance | CloseChannels))
+```
+
+— "is anything that is not a close still behind me?" At a boundary the queue
+is `[held closes …, the next cohort's Launches …]`, so the answer is
+permanently yes and the loop rotated **the entire queue, every wake**.
+
+Measured on `scheduler_wave` records (`disp_rot_n`, new this segment):
+
+```
+                          rotations in one       boundary
+                          inter-wave interval    loop_dispatch_us
+  conc 512  (8192 pages)   492k - 1,198k          103 - 220 ms
+  conc 1024 (8192 pages)   6,629,194 per RUN         —
+  steady state                 ~0                  2 - 3 ms
+```
+
+`QueuedItem` is 376 bytes, so 1.2 M `pop_front`+`push_back` is ~900 MB of
+`memmove` on the single scheduler thread, inside the GPU hole. Only the
+`rot_stop` *scan* was timed (`disp_rot_us` 20-94 ms); the moves themselves
+were untimed, which is where the rest of `loop_dispatch_us` went. Each
+rotation also bumps `PendingQueue::epoch`, invalidating `ScanCache` and
+forcing an O(n) re-walk in `dispatch_frame_work` on every pass on top.
+
+### The fix is exact, not a bound
+
+`Self::rotation_target` names the items a rotation can usefully expose at the
+FRONT. Three kinds are excluded because they dispatch without ever reaching
+the front:
+
+- `Launch` — `dispatch_frame_work` picks by `logical_fire_id` from a
+  full-queue scan, never by queue position.
+- standalone copies (`CopyKv` / `CopyKvTracked` / `CopyState`) — the tail
+  sweep at the end of `dispatch_ready_items` pulls them from any position.
+  `PreLaunchCopy` is deliberately NOT one of these: it is order-coupled to
+  its consumer fire, so it stays a rotation target.
+- closes — this predicate is only asked while the WHOLE close run is held,
+  and exposing one held close behind another dispatches nothing.
+
+Liveness is unchanged because `queue_bind_control` inserts a bind BEFORE the
+first close. With the closes now resting at the front instead of churning,
+an arriving bind lands at index 0 and dispatches on the next pass — which is
+required, since `hold_closes` is true precisely because binds are pending.
+
+The **busy** (non-held) rotation branch keeps its original predicate: there,
+rotating can expose a different, non-busy close, which is real progress.
+`disp_busy_n` at a boundary is 440-592, i.e. the busy arm was never the
+storm.
+
+### Result
+
+```
+                       rotations/run    boundary loop_dispatch_us
+  conc 512   before      ~3.5 M            103 - 220 ms
+             after        10,109            24 -  37 ms
+  conc 1024  before     6,629,194              —
+             after         13,498             4 -  10 ms
+```
+
+`disp_frame_us` (`dispatch_frame_work`) is now the largest boundary dispatch
+term at 16.9-30.6 ms (conc 512) and 35-45 ms (conc 1024).
+
+### ★ The conc-1024 parity pool is 16384 pages, not 8192
+
+conc 1024 had been measured at `--total-pages 8192` — the conc-512 pool —
+which is 8 pages per lane and genuinely starves:
+
+```
+  conc 1024 @  8192   planner_parks_total 11,814   parked_now p50 34
+  conc  512 @  8192   planner_parks_total      0
+```
+
+767-793 waves instead of 524, 28% GPU idle, and BOTH engines depressed. The
+proof that 16384 is the parity point is vLLM's own number: at 16384 it reads
+31353, which matches the 31367 recorded against pie's 32110 back in §20.18.
+
+Interleaved A/B on the fixed engine (v then p, alternating, one process at a
+time — this box carries foreign load, so only interleaved ratios are usable):
+
+```
+  conc  512 @  8192   pie 31123 31527 31714   vLLM 32842 32692 32731   0.960
+  conc 1024 @ 16384   pie 32203 31959         vLLM 30677 31186         1.037
+```
+
+**conc 1024 is won.** conc 512 still runs 4% behind, and the arithmetic says
+why: 4096 requests at 1024 lanes is 4 cohorts (3 boundaries), at 512 lanes it
+is 8 cohorts (7 boundaries), against a nearly identical wall. conc 512 pays
+the boundary tax twice as often. The boundary is the whole remaining deficit.
