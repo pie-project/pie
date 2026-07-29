@@ -13,3 +13,4 @@
 #include "probe.cuh"
 #include "readback.cuh"
 #include "locate.cuh"
+#include "commit.cuh"

@@ -59,7 +59,7 @@ _BACKENDS = (_TRITON, _CUDA, _DIFFERENTIAL)
 # the whole suite run under either name from the first day and makes each
 # kernel's arrival a one-line change here rather than a switch of everything at
 # once. Anything not named is Triton, honestly and by construction.
-_PORTED: frozenset[str] = frozenset()
+_PORTED: frozenset[str] = frozenset({"commit"})
 
 
 def ported() -> frozenset[str]:
@@ -4011,9 +4011,49 @@ class DeviceBatch:
             ],
         )
 
+    def _commit_cuda(self, grammar) -> None:
+        """`gg_commit`: one block per sequence, a thread per stack entry."""
+        from gpugrammar import _gpugrammar
+
+        _gpugrammar.cuda_launch(
+            "gg_commit",
+            self.batch,
+            # A thread owns a stack entry, so the block has to cover the
+            # stride. Rounded to a warp, and capped at what a block may hold.
+            min(1024, max(32, (grammar.max_stack + 31) // 32 * 32)),
+            torch.cuda.current_stream().cuda_stream,
+            [
+                self.state_struct().data_ptr(),
+                self.old_lexer.data_ptr(),
+                self.old_count.data_ptr(),
+                self.old_stack.data_ptr(),
+                self.cand_count.data_ptr(),
+                self.cand_lexer.data_ptr(),
+                self.cand_depth.data_ptr(),
+                self.cand_floor.data_ptr(),
+                self.cand_window.data_ptr(),
+            ],
+            [
+                self.configs,
+                self.max_readings,
+                grammar.max_stack,
+                grammar.window,
+            ],
+        )
+
     def _advance_triton(self) -> None:
         grammar = self.grammar
         rows = self.batch * self.configs
+        self._advance_prepare_triton(grammar, rows)
+        self._commit_triton(grammar)
+
+    def _advance_prepare_triton(self, grammar, rows) -> None:
+        """Everything the advance does before the commit: the history entry,
+        the work list, the group locate and the candidates.
+
+        Split out so the CUDA path can take the kernels that have landed and
+        leave the rest, rather than the whole advance being one switch.
+        """
         # One entry per live configuration, enumerated the way the fill
         # enumerates its groups. Sizing the grid by the width instead meant a
         # recorded advance was only valid while the parse stayed that wide, and
@@ -4115,6 +4155,9 @@ class DeviceBatch:
             PATHS=grammar.paths,
             num_warps=1,
         )
+        self._commit_triton(grammar)
+
+    def _commit_triton(self, grammar) -> None:
         _commit_kernel[(self.batch,)](
             self.lexer_state,
             self.stack,
@@ -4398,10 +4441,24 @@ class DeviceBatch:
         raise NotImplementedError("unreachable while `fill` is not in _PORTED")
 
     def _advance_cuda(self) -> None:
-        if "advance" not in _PORTED:
+        """The advance with each kernel taken from CUDA where it is ported.
+
+        Deliberately a separate path rather than a flag inside
+        `_advance_triton`: the two have to be able to run the same input
+        independently or the differential compares a backend with itself. A
+        kernel not in `_PORTED` falls back here, so the two paths differ by
+        exactly the kernels that have landed.
+        """
+        grammar = self.grammar
+        rows = self.batch * self.configs
+        if not _PORTED:
             self._advance_triton()
             return
-        raise NotImplementedError("unreachable while `advance` is not in _PORTED")
+        self._advance_prepare_triton(grammar, rows)
+        if "commit" in _PORTED:
+            self._commit_cuda(grammar)
+        else:
+            self._commit_triton(grammar)
 
     # What each path is allowed to change, and therefore what a differential
     # run has to put back between the two and compare afterwards. Naming them

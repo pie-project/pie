@@ -431,5 +431,103 @@ class TheCudaLocateAgreesWithTriton(unittest.TestCase):
         self.assertEqual(int(raw.found[0]), _engine._NO_GROUP)
 
 
+
+class TheCudaCommitAgreesWithTriton(unittest.TestCase):
+    """`gg_commit` against `_commit_kernel`, on candidates a real advance made.
+
+    The collection is serial on purpose: the reference matcher deduplicates in
+    a particular order and stops at its ceiling, so a parallel collection
+    producing the same *set* could still produce a different *prefix*. Equality
+    with the matcher is the verification strategy, so the order is part of the
+    contract and not an implementation detail.
+    """
+
+    def setUp(self):
+        if not HAVE_CUDA or not _gpugrammar.cuda_available():
+            raise unittest.SkipTest("no CUDA device or no kernels in this build")
+        import json
+
+        import gpugrammar
+
+        self.engine = gpugrammar.Engine([bytes([i]) for i in range(256)])
+        self.grammars = [
+            self.engine.compile_json_schema(json.dumps(schema))
+            for schema in (
+                {"type": "string"},
+                {
+                    "type": "object",
+                    "properties": {"a": {"type": "string"}, "b": {"type": "integer"}},
+                    "required": ["a"],
+                },
+                {"type": "array", "items": {"type": "boolean"}},
+            )
+        ]
+
+    OUTPUTS = (
+        "lexer_state",
+        "stack",
+        "depth",
+        "config_count",
+        "terminated",
+        "overflow",
+        "widest",
+    )
+
+    def test_both_commits_produce_the_same_configuration_set(self):
+        sequences = 16
+        batch = self.engine.batch(size=sequences)
+        batch.set_grammars([self.grammars[i % 3] for i in range(sequences)])
+        raw = batch.raw
+        grammar = raw.grammar
+        candidates = 0
+        for step in range(6):
+            # A token each grammar admits, so there are candidates to collect.
+            tokens = []
+            for index in range(sequences):
+                allowed = self.grammars[index % 3].matcher(0).allowed_tokens()
+                tokens.append(allowed[step % len(allowed)] if allowed else 0)
+            raw.token.copy_(
+                torch.tensor(tokens, dtype=torch.int32, device="cuda")
+            )
+            raw._advance_prepare_triton(grammar, raw.batch * raw.configs)
+            torch.cuda.synchronize()
+            candidates += int(raw.cand_count.sum())
+
+            before = {name: getattr(raw, name).clone() for name in self.OUTPUTS}
+            raw._commit_triton(grammar)
+            torch.cuda.synchronize()
+            theirs = {name: getattr(raw, name).clone() for name in self.OUTPUTS}
+
+            for name, value in before.items():
+                getattr(raw, name).copy_(value)
+            raw._commit_cuda(grammar)
+            torch.cuda.synchronize()
+            for name in self.OUTPUTS:
+                mine = getattr(raw, name)
+                self.assertTrue(
+                    bool(torch.equal(mine, theirs[name])),
+                    f"step {step}: {name} differs in "
+                    f"{int((mine != theirs[name]).sum())} of {mine.numel()}",
+                )
+            for name, value in theirs.items():
+                getattr(raw, name).copy_(value)
+        self.assertGreater(candidates, 0, "no candidate was ever collected")
+
+    def test_a_refused_token_terminates_rather_than_emptying_the_set(self):
+        batch = self.engine.batch(size=4)
+        batch.set_grammars([self.grammars[0]] * 4)
+        raw = batch.raw
+        grammar = raw.grammar
+        # 255 is not in any group of a JSON string's start state.
+        raw.token.fill_(255)
+        raw._advance_prepare_triton(grammar, raw.batch * raw.configs)
+        raw._commit_cuda(grammar)
+        torch.cuda.synchronize()
+        # A mask filled from an empty set would allow everything, so the set is
+        # left alone and the sequence is marked instead.
+        self.assertEqual(raw.terminated[0].item(), 1)
+        self.assertGreater(int(raw.config_count[0]), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
