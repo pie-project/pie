@@ -1027,7 +1027,48 @@ wrong value is unrecoverable is worse than leaving the positions refused. The
 analysis above is the deliverable; `gdn-foldcommit` extended to two chunks is
 the test that must accompany the implementation.
 
-### 10.3 E — Python / JavaScript SDKs
+### 10.3 `mtp-native-verify` rewritten as fold-commit — LANDED
+
+The Tier-1.5 acceptance test was broken in two independent ways, both of which
+the boundary model makes obvious.
+
+**It folded before it knew what was accepted.** The verify fire used the
+default fold-everything geometry, so all `k+1` window tokens went irreversibly
+into the recurrent state — and `n_acc` was computed from *that same fire's*
+logits, afterwards. A rejected tail was already absorbed by the time it was
+known to be rejected. This is precisely the situation the buffer exists to
+prevent, in the one inferlet meant to demonstrate it. It now runs the two-fire
+shape: verify with `fold_len = 0`, then commit with `fold_len = clen` once the
+accepted length is known, then `free_buffer` for the tail.
+
+**Its request layout could not exist on a linear model.** `bind_verify_rows`
+built `k+1` REQUEST ROWS — a staircase where row `i` had `kv_len = seq_len+i`.
+For attention that is equivalent to one causal row. For a linear model it is
+not expressible at all: state is per-REQUEST, so `k+1` rows demand `k+1`
+working sets holding divergent copies of one sequence's state, and
+`validate_count` rejects binding one. It is now a single row of `k+1` causal
+tokens, which is both equivalent for KV and the only shape with a single state
+to advance.
+
+**Two smaller bugs found while rewriting**, worth recording because both are
+silent:
+
+- The commit fire must re-supply the WINDOW's first `clen` tokens, not the
+  `clen` tokens the verify predicted. The latter is the window shifted by one
+  (each entry is what the target predicted *after* the corresponding window
+  token), and the commit fire rewrites KV over the same span — so feeding it
+  would have corrupted exactly the prefix being committed. The recurrent side
+  never reads these tokens at all; they matter only to KV.
+- The buffer must be re-reserved per window. Each window ends by freeing its
+  slabs, and appending onto a buffer still holding the previous window's tail
+  is now refused (§10.2) — correctly, since the recurrence would ignore it.
+
+The test still cannot be RUN here (`bin/pie/tests/cuda_mtp_native_verify.rs` is
+`--ignored` and needs Qwen3.5-0.8B weights), so this is a correctness rewrite
+validated by construction and by matching `gdn-foldcommit`, which drives the
+same two-fire shape.
+
+### 10.4 E — Python / JavaScript SDKs
 
 Larger than §7 implies. Both target an older `pie:core/inference` surface
 (`imports/inference.py`, `pie-core-inference.d.ts`) rather than
@@ -1035,13 +1076,13 @@ Larger than §7 implies. Both target an older `pie:core/inference` surface
 they did not break with B and will not track future WIT changes automatically.
 Bringing them onto the current surface is a port, not a rename.
 
-### 10.4 D — per-stage PTIR containers  *(separate PR)*
+### 10.5 D — per-stage PTIR containers  *(separate PR)*
 
 Unchanged from §7 / §9.1. D4(a) hooks-as-methods and D4(b) per-stage containers
 must land together; (a) alone would force the host to reassemble and
 canonicalize containers, which is the thing D4 exists to avoid.
 
-### 10.5 Loose ends
+### 10.6 Loose ends
 
 - `model::pass_kind()` returns `recurrent` only when `kv_page_size() == 0`,
   which no registered model satisfies. That arm is unreachable and therefore

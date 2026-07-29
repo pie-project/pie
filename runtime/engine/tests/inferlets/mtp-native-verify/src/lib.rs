@@ -27,6 +27,26 @@
 //! data (no anchor-row collapse) — yields the seed (row-0 target argmax) + the
 //! first REAL drafts (mtp argmax) for window 1.
 //!
+//! **The accept step is fold-commit, because this is a LINEAR model.** The
+//! verify fire cannot fold: how many of its k drafts are real is decided by
+//! its own logits, and a fold is irreversible — there is no recurrent-state
+//! equivalent of dropping a KV slot. So each window runs in two fires:
+//!
+//!   1. verify — `fold_len = 0`: the window's pre-recurrence activations land
+//!      in the RS buffer and the folded boundary does not move, leaving the
+//!      whole window abandonable while its logits are inspected.
+//!   2. commit — `fold_len = clen`: with the accepted length now known, the
+//!      boundary advances through exactly the accepted prefix plus its bonus
+//!      token, replaying the buffered activations instead of recomputing the
+//!      in-projection. Freeing the remaining slabs abandons the rejected tail,
+//!      which never touched the recurrent state.
+//!
+//! The window is also ONE request row of `k+1` causal tokens, not the `k+1`
+//! -request staircase this inferlet used to build. The two are equivalent for
+//! attention, but a linear model carries one recurrent state per REQUEST, so
+//! the staircase would demand `k+1` working sets holding divergent copies of a
+//! single sequence's state.
+//!
 //! JSON/plain input: optional draft window `k` (default 4).
 
 use inferlet::ptir::hybrid::prelude::*;
@@ -83,43 +103,53 @@ fn bind_single_sequence(
     )
 }
 
-fn bind_verify_rows(
+/// One request row of `count` tokens starting at absolute position
+/// `first_pos`, reading out the rows named by `readout` (row indices within
+/// the window).
+///
+/// This replaces the old `k+1`-REQUEST staircase. On a pure-attention model
+/// the staircase and a single causal row are equivalent — row `i` saw
+/// `seq_len + i` keys either way — but a linear model cannot express the
+/// staircase at all: it carries one recurrent state per REQUEST, so `k+1`
+/// rows would need `k+1` working sets holding `k+1` divergent copies of one
+/// sequence's state. One row of `k+1` causal tokens is the shape that has a
+/// single state to advance, which is the shape the buffer is built for.
+fn bind_window(
     pass: &ForwardPass,
     ws: &WorkingSet,
     toks: &Channel,
     kv_len: &Channel,
-    seq_len: u32,
-    rows: u32,
+    first_pos: u32,
+    count: u32,
     pool_pages: u32,
+    readout: &[u32],
 ) -> Result<()> {
-    let embed_indptr = Channel::from((0u32..=rows).collect::<Vec<_>>()).named("embed_indptr");
-    let positions = Channel::from((seq_len..seq_len + rows).collect::<Vec<_>>()).named("positions");
-    let lengths: Vec<u32> = (1..=rows).map(|row| seq_len + row).collect();
-    let mut page_values = Vec::new();
-    let mut page_indptr_values = vec![0u32];
-    for length in &lengths {
-        page_values.extend(0..length.div_ceil(PAGE_T).min(pool_pages));
-        page_indptr_values.push(page_values.len() as u32);
-    }
-    let pages = Channel::from(page_values).named("pages");
-    let page_indptr = Channel::from(page_indptr_values).named("page_indptr");
+    let embed_indptr = Channel::from(vec![0u32, count]).named("w_embed_indptr");
+    let positions =
+        Channel::from((first_pos..first_pos + count).collect::<Vec<_>>()).named("w_positions");
+    let pages = Channel::from((0..pool_pages).collect::<Vec<_>>()).named("w_pages");
+    let page_indptr =
+        Channel::from(vec![0u32, (first_pos + count).div_ceil(PAGE_T).min(pool_pages)])
+            .named("w_page_indptr");
     let w_slot = Channel::from(
-        (seq_len..seq_len + rows)
+        (first_pos..first_pos + count)
             .map(|p| p / PAGE_T)
             .collect::<Vec<_>>(),
     )
-    .named("w_slot");
+    .named("w_w_slot");
     let w_off = Channel::from(
-        (seq_len..seq_len + rows)
+        (first_pos..first_pos + count)
             .map(|p| p % PAGE_T)
             .collect::<Vec<_>>(),
     )
-    .named("w_off");
+    .named("w_w_off");
+    let readout = Channel::from(readout.to_vec()).named("w_readout");
     pass.embed(toks, &embed_indptr)?;
+    pass.readout(&readout)?;
     pass.attention(
         ws,
         ..,
-        (seq_len / PAGE_T)..,
+        ..,
         kv_len,
         &pages,
         &page_indptr,
@@ -127,6 +157,21 @@ fn bind_verify_rows(
         &w_off,
         &positions,
         None,
+    )
+}
+
+/// The five `rs-geometry` buffer-addressing channels for a span of `count`
+/// buffered tokens starting at buffer token 0, on one request row.
+fn rs_span(rs_page: u32, count: u32, tag: &str) -> (Channel, Channel, Channel, Channel, Channel) {
+    let pages_n = count.div_ceil(rs_page);
+    (
+        Channel::from(vec![count]).named(&format!("{tag}_rs_len")),
+        Channel::from((0..pages_n).collect::<Vec<_>>()).named(&format!("{tag}_rs_pages")),
+        Channel::from(vec![0u32, pages_n]).named(&format!("{tag}_rs_indptr")),
+        Channel::from((0..count).map(|t| t / rs_page).collect::<Vec<_>>())
+            .named(&format!("{tag}_rs_w_slot")),
+        Channel::from((0..count).map(|t| t % rs_page).collect::<Vec<_>>())
+            .named(&format!("{tag}_rs_w_off")),
     )
 }
 
@@ -184,11 +229,13 @@ async fn bootstrap(
 /// peeked off the SAME embedded tokens) against the target's per-row argmax,
 /// and draft the NEXT window natively off `mtp_logits`. Returns `(commit
 /// [k+1], next_drafts [k])`.
+#[allow(clippy::too_many_arguments)]
 async fn verify_window(
     ws: &WorkingSet,
     rs: &RsWorkingSet,
     pipeline: &Pipeline,
     k: u32,
+    rs_page: u32,
     seed: i32,
     draft: &[i32],
     seq_len: u32,
@@ -203,10 +250,31 @@ async fn verify_window(
     let drafts_out = Channel::new([k], dtype::i32).named("v_drafts");
 
     let fwd = ForwardPass::new();
-    let kv_len =
-        Channel::from((1..=kp1).map(|row| seq_len + row).collect::<Vec<_>>()).named("v_kv_len");
-    bind_verify_rows(&fwd, ws, &toks, &kv_len, seq_len, kp1, max_pages)?;
-    fwd.recurrent(std::slice::from_ref(rs))?;
+    let kv_len = Channel::from(vec![seq_len + kp1]).named("v_kv_len");
+    let readout: Vec<u32> = (0..kp1).collect();
+    bind_window(&fwd, ws, &toks, &kv_len, seq_len, kp1, max_pages, &readout)?;
+
+    // BUFFER, do not fold. The verify window is `seed + k drafts`, and how
+    // many of those k are real is not known until this fire's own logits come
+    // back. Folding them would advance the recurrent state through a tail that
+    // may be rejected, and a fold is irreversible — unlike KV, there are no
+    // slots to discard. So the window's pre-recurrence activations are parked
+    // in the buffer with the folded boundary held still, and the NEXT fire
+    // moves it through exactly the accepted prefix.
+    let (rs_len, rs_pages, rs_indptr, rs_w_slot, rs_w_off) = rs_span(rs_page, kp1, "v");
+    let fold_len = Channel::from(vec![0u32]).named("v_fold_len");
+    fwd.recurrent_with(
+        std::slice::from_ref(rs),
+        &fold_len,
+        ..,
+        ..,
+        &rs_len,
+        &rs_pages,
+        &rs_indptr,
+        &rs_w_slot,
+        &rs_w_off,
+    )
+    .map_err(|e| format!("verify recurrent binding: {e}"))?;
     fwd.epilogue(move || {
         // Device-alias read: peek the embedded window (NOT a resubmitted draft
         // channel) and gather rows 1..=k as the verify operand.
@@ -237,12 +305,79 @@ async fn verify_window(
     Ok((commit, drafts))
 }
 
+/// Move the folded boundary through the `clen` accepted tokens the verify
+/// window buffered, then drop whatever it did not reach.
+///
+/// `window_prefix` is the first `clen` tokens of the VERIFY WINDOW — not the
+/// tokens the verify predicted. The recurrent side ignores them entirely and
+/// replays the buffered activations instead, which is the whole point: the
+/// expensive in-projection is not recomputed. They matter only to the KV side,
+/// which re-runs the same span this window already wrote and must therefore
+/// write back the same values. Feeding the predicted tokens here would shift
+/// the sequence by one and corrupt the accepted prefix's KV.
+///
+/// Nothing here is read: with a fold boundary set, the linear layers stop
+/// after the recurrence and emit no logits.
+#[allow(clippy::too_many_arguments)]
+async fn commit_window(
+    ws: &WorkingSet,
+    rs: &RsWorkingSet,
+    pipeline: &Pipeline,
+    rs_page: u32,
+    window_prefix: &[i32],
+    seq_len: u32,
+    max_pages: u32,
+) -> Result<()> {
+    let clen = window_prefix.len() as u32;
+    if clen == 0 {
+        return Ok(());
+    }
+    let toks = Channel::from(window_prefix.to_vec()).named("c_toks");
+    let done = Channel::new([1], dtype::i32).named("c_done");
+
+    let fwd = ForwardPass::new();
+    let kv_len = Channel::from(vec![seq_len + clen]).named("c_kv_len");
+    bind_window(&fwd, ws, &toks, &kv_len, seq_len, clen, max_pages, &[clen - 1])?;
+
+    let (rs_len, rs_pages, rs_indptr, rs_w_slot, rs_w_off) = rs_span(rs_page, clen, "c");
+    let fold_len = Channel::from(vec![clen]).named("c_fold_len");
+    fwd.recurrent_with(
+        std::slice::from_ref(rs),
+        &fold_len,
+        ..,
+        ..,
+        &rs_len,
+        &rs_pages,
+        &rs_indptr,
+        &rs_w_slot,
+        &rs_w_off,
+    )
+    .map_err(|e| format!("commit recurrent binding: {e}"))?;
+    fwd.epilogue(move || {
+        let t = reduce_argmax(intrinsics::logits());
+        done.put(&t);
+    });
+    fwd.submit(pipeline)
+        .map_err(|e| format!("commit submit: {e}"))?;
+    get_i32(done.take()).await?;
+    Ok(())
+}
+
 #[inferlet::main]
 async fn main(input: String) -> Result<String> {
     let k: u32 = input.trim().parse().unwrap_or(4).max(2);
+    if !wit_model::is_linear() {
+        // The buffer this inferlet's accept step depends on only exists on a
+        // linear model. On a pure-attention model a rejected tail is discarded
+        // by dropping KV slots and none of the fold-commit machinery applies.
+        return Ok("skipped: mtp-native-verify needs a linear model".to_string());
+    }
     let ws = WorkingSet::new();
     let rs = RsWorkingSet::new();
-
+    let rs_page = rs.buffer_page_size();
+    if rs_page == 0 {
+        return Err("linear model reports no RS buffer page size".to_string());
+    }
     let mut prompt = wit_model::encode(PROMPT);
     if prompt.is_empty() {
         prompt.push(0);
@@ -270,16 +405,50 @@ async fn main(input: String) -> Result<String> {
     let mut generated: u32 = 1;
 
     // North-star spec-decode loop: verify the embedded drafts against the
-    // target → commit the [k+1] tail (accepted + bonus) → take the fresh
-    // native-MTP drafts as the NEXT window's proposals → repeat.
+    // target with the fold SUPPRESSED → fold exactly the accepted prefix and
+    // abandon the rest → take the fresh native-MTP drafts as the NEXT
+    // window's proposals → repeat.
+    let window_slabs = (k + 1).div_ceil(rs_page);
     while generated < MAX_TOKENS {
-        let (commit, drafts) =
-            verify_window(&ws, &rs, &pipeline, k, seed, &draft, seq_len, max_pages).await?;
+        // Each window buffers k+1 tokens and ends with an empty buffer, so
+        // the slabs are reserved per window rather than held across the loop.
+        // They must be reserved fresh: appending onto a buffer that still held
+        // the previous window's tail would ask the recurrence to read what is
+        // already buffered, which it cannot do.
+        rs.alloc_buffer(window_slabs)
+            .map_err(|e| format!("rs.alloc_buffer: {e}"))?;
+
+        let (commit, drafts) = verify_window(
+            &ws, &rs, &pipeline, k, rs_page, seed, &draft, seq_len, max_pages,
+        )
+        .await?;
         let clen = committed_len(&commit); // n_acc accepted + 1 bonus (≥ 1)
-        seq_len += clen as u32;
         let n_acc = clen.saturating_sub(1);
         accepted_lengths.push(n_acc);
         let commit_toks: Vec<u32> = commit.iter().take(clen).map(|&t| t as u32).collect();
+
+        // Only NOW is the accepted length known, so only now can the folded
+        // boundary move. It advances through exactly `clen` of the k+1
+        // buffered tokens; the rejected tail is abandoned by freeing its
+        // slabs, having never touched the recurrent state.
+        //
+        // The commit re-runs the WINDOW's first `clen` tokens, which is the
+        // span the verify fire already wrote KV for. `commit_toks` is the
+        // window shifted by one (each entry is what the target predicted
+        // AFTER the corresponding window token), so feeding it here would
+        // corrupt exactly the prefix being committed.
+        let window_prefix: Vec<i32> = std::iter::once(seed)
+            .chain(draft.iter().copied())
+            .take(clen)
+            .collect();
+        commit_window(&ws, &rs, &pipeline, rs_page, &window_prefix, seq_len, max_pages).await?;
+        let remaining = rs.buffer_size();
+        if remaining > 0 {
+            rs.free_buffer(&(0..remaining).collect::<Vec<_>>())
+                .map_err(|e| format!("free_buffer: {e}"))?;
+        }
+
+        seq_len += clen as u32;
         committed.extend(&commit_toks);
         generated += clen.max(1) as u32;
 
