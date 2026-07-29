@@ -1,4 +1,4 @@
-//! The emitter version constants change whenever the emitted bytes do.
+//! Where the emitter version constants meet the bytes they describe.
 //!
 //! Both drivers key their compiled-kernel cache on the emitter version. A
 //! version that stays put across a change to the emitted text is not a stale
@@ -11,11 +11,28 @@
 //! deliberately preserves that header — so "changed body, unchanged constant"
 //! passed. Metal had no guard at all.
 //!
-//! So each backend pins its version against a hash of everything
-//! `emit_program` produces for the corpus. Changing an emitter changes the
-//! hash, and the only way to make this pass again is to write down a new
-//! version next to a new hash, in one diff. The hash is a fingerprint, not a
-//! golden: it says *that* the output changed, and the golden dumps say what to.
+//! So each backend pins both numbers here: the version against the constant the
+//! drivers are compiled with, and a fingerprint against a hash of everything
+//! `emit_program` produces for both corpora. Neither number can move without
+//! failing this file — an emitter change moves the fingerprint, a constant
+//! change moves the version — so both have to be restated here, in the commit
+//! that changed them.
+//!
+//! What this does *not* do is make one imply the other. Every expected value
+//! here is a literal in this file, so the cheapest way to go green after
+//! changing an emitter is still to paste the new fingerprint and leave the
+//! version alone. No test that lives beside the values it checks can close
+//! that: the edit that repairs the check is free to move the number the check
+//! reads. What it buys is that the change cannot pass unnoticed — someone has
+//! to open this file and read a failure that names the constant to bump — and
+//! that whichever version is written here is the one being shipped.
+//!
+//! Closing it for real needs a cache key the compiler cannot forget rather than
+//! a stricter test: the drivers are already handed the `source` they compile,
+//! so a key derived from that would not need a maintained number at all.
+//!
+//! The hash is a fingerprint, not a golden: it says *that* the output changed,
+//! and the golden dumps say what to.
 
 #[path = "common/msl_corpus.rs"]
 mod msl_corpus;
@@ -27,16 +44,16 @@ use pie_codegen::program::{Backend, emit_program};
 
 /// `(backend, version, fingerprint)`, both numbers written out as literals.
 ///
-/// The version is a literal rather than the constant itself so that the two sit
-/// on one line and neither can be updated without looking at the other.
-/// Substituting the constant would make the version half true by construction,
-/// and the minimal way to get a green test after changing an emitter would be
-/// to paste a new fingerprint and leave the version alone — which is the exact
-/// failure this file exists to prevent.
+/// The version is a literal rather than the constant itself because a row that
+/// reads the constant describes nothing: that half would be true whatever the
+/// constant said, and the fingerprint beside it would stop recording which
+/// compiler produced it.
 ///
 /// A change that leaves the fingerprint alone did not change the emitted bytes
-/// and must not move the version either: a gratuitous bump throws away every
-/// driver's cache.
+/// and must not move the version either — a gratuitous bump throws away every
+/// driver's cache — so a constant that moves on its own fails
+/// `the_pinned_versions_are_the_compiled_ones` until someone comes here and
+/// says so in the same commit.
 const PINNED: &[(&str, u16, u64)] = &[
     ("cuda", 19, 0xe378_da9c_00f6_fda5),
     ("metal", 35, 0x16e9_a27d_8fc5_3b4b),
@@ -97,6 +114,12 @@ fn the_pinned_versions_are_the_compiled_ones() {
     }
 }
 
+/// The emitted bytes are still the ones the pinned version was written for.
+///
+/// A failure means the drivers would key a cache on a version that no longer
+/// describes what they will be handed. The repair is to bump the backend's
+/// constant and re-pin; this test sees only the re-pinning, so the bump is the
+/// reader's to make.
 #[test]
 fn each_emitter_version_still_describes_its_output() {
     let mut moved = Vec::new();
