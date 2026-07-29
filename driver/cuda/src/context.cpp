@@ -185,6 +185,9 @@ struct LaunchScratch {
         view.rs_fold_lens = pie_native::slice_from_u32(launch.rs_fold_lens.ptr, launch.rs_fold_lens.len);
         view.rs_buffer_slot_ids = pie_native::slice_from_u32(launch.rs_buffer_slot_ids.ptr, launch.rs_buffer_slot_ids.len);
         view.rs_buffer_slot_indptr = pie_native::slice_from_u32(launch.rs_buffer_slot_indptr.ptr, launch.rs_buffer_slot_indptr.len);
+        view.rs_buffer_read_slot_ids = pie_native::slice_from_u32(launch.rs_buffer_read_slot_ids.ptr, launch.rs_buffer_read_slot_ids.len);
+        view.rs_buffer_read_indptr = pie_native::slice_from_u32(launch.rs_buffer_read_indptr.ptr, launch.rs_buffer_read_indptr.len);
+        view.rs_buffer_read_lens = pie_native::slice_from_u32(launch.rs_buffer_read_lens.ptr, launch.rs_buffer_read_lens.len);
         view.rs_translation = pie_native::slice_from_u32(launch.rs_translation.ptr, launch.rs_translation.len);
         view.rs_translation_indptr = pie_native::slice_from_u32(launch.rs_translation_indptr.ptr, launch.rs_translation_indptr.len);
         view.flattened_masks = pie_native::slice_from_u32(launch.masks.words.ptr, launch.masks.words.len);
@@ -277,6 +280,9 @@ void expand_step(
     launch.rs_fold_lens = step.rs_fold_lens;
     launch.rs_buffer_slot_ids = step.rs_buffer_slot_ids;
     launch.rs_buffer_slot_indptr = step.rs_buffer_slot_indptr;
+    launch.rs_buffer_read_slot_ids = step.rs_buffer_read_slot_ids;
+    launch.rs_buffer_read_indptr = step.rs_buffer_read_indptr;
+    launch.rs_buffer_read_lens = step.rs_buffer_read_lens;
     launch.rs_translation = step.rs_translation;
     launch.rs_translation_indptr = step.rs_translation_indptr;
     launch.masks = step.masks;
@@ -1983,6 +1989,12 @@ std::size_t Context::Impl::required_state_slots(
     };
     include(launch.rs_slot_ids);
     include(launch.rs_buffer_slot_ids);
+    // Replayed slabs are read, never written, but they must still be resident:
+    // the gather gets a null slab pointer for an out-of-range id and would
+    // silently skip the replay, leaving the recurrence to start from the
+    // folded state alone -- the exact wrong answer the read path exists to
+    // prevent.
+    include(launch.rs_buffer_read_slot_ids);
     if (executor_->graph_pad_slot >= 0) {
         slots = std::max<std::size_t>(
             slots,

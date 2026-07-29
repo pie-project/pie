@@ -97,8 +97,14 @@
  * verdicts and intrinsic side-table analysis the CUDA driver derives for
  * itself in `region_support.hpp`. Additive, and empty means "not supplied",
  * but the struct grew, so drivers and workers ship together.
+ * v21: `PieLaunchDesc::rs_buffer_read_*` — the buffered prefix a fire must
+ * REPLAY before its own tokens, so a recurrence can start from
+ * `folded ⊕ replay(buffer)` instead of only from the folded boundary.
+ * Separate from the write CSR because a write may allocate a slab and a read
+ * must not. Additive, and an empty read side means "nothing to replay", but
+ * the struct grew, so drivers and workers ship together.
  */
-#define PIE_DRIVER_ABI_VERSION 20
+#define PIE_DRIVER_ABI_VERSION 21
 
 #define PIE_MODEL_COMPONENT_FULL 0
 
@@ -1368,6 +1374,19 @@ typedef struct PieStepDesc {
   struct PieU32Slice rs_fold_lens;
   struct PieU32Slice rs_buffer_slot_ids;
   struct PieU32Slice rs_buffer_slot_indptr;
+  /**
+   * Buffered slabs the fire REPLAYS, with the row CSR (`rows + 1`), and the
+   * token count to replay from each row's slabs (`rows` entries).
+   *
+   * Distinct from `rs_buffer_slot_ids`, which is what the fire WRITES: a
+   * write may materialize or privatize a slab, a read must not, and a read
+   * of a merely reserved page would gather uninitialized activations
+   * straight into the recurrent state. All three are empty when no row has
+   * anything buffered, which is the common case.
+   */
+  struct PieU32Slice rs_buffer_read_slot_ids;
+  struct PieU32Slice rs_buffer_read_indptr;
+  struct PieU32Slice rs_buffer_read_lens;
   /**
    * WorkingSet-relative buffer page -> physical slot for channel-resolved
    * `rs-geometry`, concatenated over request rows. `rs_translation_indptr`

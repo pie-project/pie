@@ -48,6 +48,13 @@ pub struct LaunchPlan {
     pub rs_fold_lens: Vec<u32>,
     pub rs_buffer_slot_ids: Vec<u32>,
     pub rs_buffer_slot_indptr: Vec<u32>,
+    /// The buffered prefix each row REPLAYS ahead of its own tokens: the slabs
+    /// (`rs_buffer_read_slot_ids`), the row CSR over them
+    /// (`rs_buffer_read_indptr`, `R + 1`), and how many tokens of them to
+    /// replay (`rs_buffer_read_lens`, `R`). Empty when nothing is buffered.
+    pub rs_buffer_read_slot_ids: Vec<u32>,
+    pub rs_buffer_read_indptr: Vec<u32>,
+    pub rs_buffer_read_lens: Vec<u32>,
     /// WorkingSet-relative buffer page -> physical slot, for channel-resolved
     /// `rs-geometry`. Per REQUEST ROW, unlike [`Self::kv_translation`]: a pass
     /// binds one RS working set per request, so there is no single table for

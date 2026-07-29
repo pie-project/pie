@@ -464,24 +464,14 @@ fn rs_plan_for(
         let (b, t) = (buffered[row], row_tokens[row]);
         let n = fold_len[row].min(b + t);
         let here = if n == 0 {
-            // Appending onto a NON-EMPTY buffer is the same read-path gap in
-            // its quietest form. The new tokens sit at [F+b, F+b+t), so their
-            // recurrence must start from `folded ⊕ replay(buffer)` — but every
-            // recurrence initializes from `recurrent_state[slot]`, which is
-            // the state at F. The fire would still emit logits, computed as
-            // though the buffered tokens were not there. That is a wrong
-            // answer with no symptom, which is worse than a refusal.
-            //
-            // (`start_token` below is `b`, which is now exact — but the read
-            // path is still what makes a non-empty append correct.)
-            if b != 0 {
-                return Err(format!(
-                    "request row {row} appends {t} token(s) onto a non-empty buffer \
-                     ({b} buffered token(s)); the recurrence would start from the \
-                     folded state and silently ignore what is buffered. Fold the \
-                     buffer first, or keep each speculative chunk to a single fire"
-                ));
-            }
+            // Appending onto a NON-EMPTY buffer: the new tokens sit at
+            // [F+b, F+b+t), so their recurrence must start from
+            // `folded ⊕ replay(buffer)`. Every recurrence initializes from
+            // `recurrent_state[slot]`, which is the state at F — so the driver
+            // replays the b buffered tokens ahead of the new ones, over an
+            // extended `[b | t]` row layout, and slices the last t rows back
+            // out. `start_tokens` below carries the exact b that makes that
+            // replay describable.
             Position::Buffer
         } else if n == b + t {
             if b != 0 {
@@ -515,11 +505,12 @@ fn rs_plan_for(
 
     Ok(match position.expect("rows > 0") {
         Position::Fold => rs::RsPlan::Fold,
-        // Only reachable with an empty buffer (`b == 0` above), so the chunk
-        // always opens at token 0. Occupancy is exact now, so when the read
-        // path lands this becomes `buffered[0]` unchanged.
+        // Each row opens at its own exact occupancy. The planner still refuses
+        // a non-zero one above until the recurrence can read the buffer, but
+        // the plan carries the truth either way, so relaxing that refusal is a
+        // one-line change rather than a re-derivation.
         Position::Buffer => rs::RsPlan::Buffer {
-            start_token: 0,
+            start_tokens: buffered,
             row_tokens,
         },
         Position::Commit => rs::RsPlan::FoldBuffered {

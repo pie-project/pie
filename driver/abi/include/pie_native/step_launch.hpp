@@ -32,6 +32,9 @@ struct StepLaunch {
     PieU32Slice rs_fold_lens;
     PieU32Slice rs_buffer_slot_ids;
     PieU32Slice rs_buffer_slot_indptr;
+    PieU32Slice rs_buffer_read_slot_ids;
+    PieU32Slice rs_buffer_read_indptr;
+    PieU32Slice rs_buffer_read_lens;
     // WorkingSet-relative buffer page -> physical slot for channel-resolved
     // `rs-geometry`, concatenated over request rows with `rs_translation_indptr`
     // as the row CSR. Per ROW, unlike `kv_translation`: a pass binds one RS

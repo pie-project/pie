@@ -53,6 +53,12 @@ struct Qwen3_5LinearAttnWorkspace {
     DeviceBuffer<std::uint16_t> fa_qg_packed;  // [N, 2*Hq] bf16
     DeviceBuffer<std::uint16_t> fa_gate;       // [N, Hq]   bf16
 
+    // Buffer-read path only: the per-request token layout the linear layers
+    // run over when a request must replay buffered tokens before its own
+    // (`[B_r | T_r]` per row). Capacity R+1 <= max_tokens+1.
+    DeviceBuffer<std::uint32_t> qo_ext;        // [R+1] u32
+    int max_tokens = 0;
+
     static Qwen3_5LinearAttnWorkspace allocate(
         int max_tokens, int conv_dim, int v_h, int k_h, int k_d, int v_d,
         int hq);
@@ -181,7 +187,14 @@ void qwen3_5_forward_paged(
     const std::uint32_t* rs_buffer_slot_indptr_h = nullptr,
     const std::int32_t* rs_fold_lens_d = nullptr,
     bool rs_buffer_write = false,
-    bool rs_buffer_fold = false);
+    bool rs_buffer_fold = false,
+    // Buffer READ: per-request CSR of the slab pool ids holding the tokens
+    // already buffered past the fold boundary, plus how many of them each
+    // request must replay. Distinct from the write CSR above: reads cover the
+    // whole live buffer, writes only the span this fire appends.
+    const std::uint32_t* rs_buffer_read_slot_ids_h = nullptr,
+    const std::uint32_t* rs_buffer_read_indptr_h = nullptr,
+    const std::uint32_t* rs_buffer_read_lens_h = nullptr);
 
 void qwen3_5_mtp_process_cache(
     const Qwen3_5Weights& w,

@@ -30,7 +30,13 @@ use crate::geometry::GeometryClass;
 /// verdicts and intrinsic side-table analysis the CUDA driver derives for
 /// itself in `region_support.hpp`. Additive, and empty means "not supplied",
 /// but the struct grew, so drivers and workers ship together.
-pub const PIE_DRIVER_ABI_VERSION: u32 = 20;
+/// v21: `PieLaunchDesc::rs_buffer_read_*` — the buffered prefix a fire must
+/// REPLAY before its own tokens, so a recurrence can start from
+/// `folded ⊕ replay(buffer)` instead of only from the folded boundary.
+/// Separate from the write CSR because a write may allocate a slab and a read
+/// must not. Additive, and an empty read side means "nothing to replay", but
+/// the struct grew, so drivers and workers ship together.
+pub const PIE_DRIVER_ABI_VERSION: u32 = 21;
 pub const PIE_MODEL_COMPONENT_FULL: u32 = 0;
 pub const PIE_MODEL_COMPONENT_TEXT: u32 = 1;
 pub const PIE_MODEL_COMPONENT_ENCODE: u32 = 2;
@@ -1128,6 +1134,17 @@ pub struct PieStepDesc {
     pub rs_fold_lens: PieU32Slice,
     pub rs_buffer_slot_ids: PieU32Slice,
     pub rs_buffer_slot_indptr: PieU32Slice,
+    /// Buffered slabs the fire REPLAYS, with the row CSR (`rows + 1`), and the
+    /// token count to replay from each row's slabs (`rows` entries).
+    ///
+    /// Distinct from `rs_buffer_slot_ids`, which is what the fire WRITES: a
+    /// write may materialize or privatize a slab, a read must not, and a read
+    /// of a merely reserved page would gather uninitialized activations
+    /// straight into the recurrent state. All three are empty when no row has
+    /// anything buffered, which is the common case.
+    pub rs_buffer_read_slot_ids: PieU32Slice,
+    pub rs_buffer_read_indptr: PieU32Slice,
+    pub rs_buffer_read_lens: PieU32Slice,
     /// WorkingSet-relative buffer page -> physical slot for channel-resolved
     /// `rs-geometry`, concatenated over request rows. `rs_translation_indptr`
     /// is the row CSR (`rows + 1`). Per ROW, unlike `kv_translation`, because
@@ -1205,6 +1222,9 @@ impl Default for PieStepDesc {
             rs_slot_flags: PieU8Slice::default(),
             rs_fold_lens: PieU32Slice::default(),
             rs_buffer_slot_ids: PieU32Slice::default(),
+            rs_buffer_read_slot_ids: PieU32Slice::default(),
+            rs_buffer_read_indptr: PieU32Slice::default(),
+            rs_buffer_read_lens: PieU32Slice::default(),
             rs_buffer_slot_indptr: PieU32Slice::default(),
             rs_translation: PieU32Slice::default(),
             rs_translation_indptr: PieU32Slice::default(),

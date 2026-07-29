@@ -62,6 +62,13 @@ struct LaunchView {
     Slice<std::uint32_t> rs_fold_lens;
     Slice<std::uint32_t> rs_buffer_slot_ids;
     Slice<std::uint32_t> rs_buffer_slot_indptr;
+    // The buffered prefix each row REPLAYS before its own tokens. Separate
+    // from the write CSR above: a write may materialize a slab, a read may
+    // not, and the two spans differ whenever a fire appends onto a non-empty
+    // buffer.
+    Slice<std::uint32_t> rs_buffer_read_slot_ids;
+    Slice<std::uint32_t> rs_buffer_read_indptr;
+    Slice<std::uint32_t> rs_buffer_read_lens;
     // Per-request WorkingSet buffer-page translation (relative index ->
     // physical slot id), CSR-partitioned per request row. See
     // `PieStepLaunchDesc::rs_translation`.

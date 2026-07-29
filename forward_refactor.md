@@ -971,7 +971,7 @@ What landed, layer by layer:
 whether the host-derived and channel-driven RS paths should be made mutually
 exclusive per fire rather than merely unused-in-parallel.
 
-### 10.2 The buffer read path — analysed, and one hole closed
+### 10.2 The buffer read path — LANDED
 
 Every position `rs_plan_for` refuses needs the SAME missing primitive: a
 recurrence that starts from `folded ⊕ replay(buffer)` rather than from
@@ -1019,13 +1019,66 @@ on the in-proj GEMM output, conv-state handling over the extended layout,
 workspace sized for `B + T`, and per-row `B` on the wire — duplicated across
 `qwen3_5_forward.cpp` and `qwen3_5_moe_forward.cpp`.
 
-**Why it is not landed here.** It is a numerics change to the FLA/conv
-indexing with no way to validate it in this environment: there are no model
-weights on the box, so nothing can run the kernel end to end. Landing several
+**Why it was not landed at the time.** It is a numerics change to the FLA/conv
+indexing with no way to validate it in this environment: there were no model
+weights on the box, so nothing could run the kernel end to end. Landing several
 hundred lines of unvalidatable indexing changes into the one path where a
 wrong value is unrecoverable is worse than leaving the positions refused. The
-analysis above is the deliverable; `gdn-foldcommit` extended to two chunks is
+analysis above was the deliverable; `gdn-foldcommit` extended to two chunks is
 the test that must accompany the implementation.
+
+#### 10.2.1 The read path, as built — LANDED
+
+A GPU is available now, so it landed against real weights.
+`cuda_gdn_foldcommit::two_chunks_need_the_buffer_read_path` flipped from
+asserting the refusal to asserting `chained=ok`.
+
+**The layout IS the buffer token space.** For request `r` with `B_r` buffered
+and `T_r` new tokens, the linear layers run over `E_r = B_r + T_r` rows, and
+extended row index equals buffer token index. That one identity makes the
+gather, the scatter and the conv/FLA windows all fall out of the same
+`qo_ext`, and it is why nothing needed a new kernel:
+
+- `qo_ext[r+1] = qo_ext[r] + B_r + T_r`, built ONCE per fire (every linear
+  layer runs the same rows) and uploaded into `Qwen3_5LinearAttnWorkspace::qo_ext`.
+- Inside `linear_attn_layer_body` the parameters are renamed `N_new` /
+  `qo_new_*` and `N` / `qo_indptr_*` are **rebound** to the extended space, so
+  conv, prep and every FLA variant inherit it without a single edit. Only the
+  three places that must stay in the fire's own token space name `N_new`: the
+  in-projection source, `z`, and the post-recurrence epilogue.
+- In-proj becomes one GEMM per request when a read is present, writing at
+  `qo_ext[r] + B_r`; with no read it is the same single full-width GEMM as
+  before, byte for byte.
+- The gather mirrors the fold gather, but off the **read** CSR: reads cover
+  the whole live buffer from page 0, writes only the span this fire appends.
+  They are different intents on the same pages, which is why the wire carries
+  both rather than widening one.
+- The scatter had a latent assumption that the write span starts at buffer
+  token 0. It does not any more: `page_span` starts at the page CONTAINING
+  `B_r`, so the first listed page can begin before the appended span. It now
+  clips per page and offsets into the slab.
+- The epilogue slices rows `[qo_ext[r]+B_r, qo_ext[r+1])` back down to
+  `[qo_new[r], ...)`. That shift overlaps itself, so it cannot be an in-place
+  memcpy — it lands in `v_fp32`, which has the identical shape and is dead the
+  moment the FLA returns. No allocation for a path most fires never take.
+- `linear_decode` is forced off when a read is present: those kernels assume
+  `N == R`, which an extended layout breaks.
+- `B + T > max_tokens` is refused explicitly; every LA scratch buffer is sized
+  to `max_tokens` and the replayed prefix consumes rows out of exactly those.
+
+**What did NOT change.** A fold still carries no read (`FoldBuffered` gathers
+from page 0 and its `start` is 0, so `buffer_read_lens` is 0 for it), and the
+"a fold fire produces no usable logits" rule is untouched — see §10.8. An
+all-zero read side is cleared on the wire, so the overwhelmingly common
+empty-buffer fire is bit-identical to before.
+
+**Metal refuses it.** Metal has no extended layout and would run the new
+tokens from the folded state, silently ignoring the buffer — the exact failure
+this design exists to prevent. `batch/compose.cpp` throws instead.
+
+Still refused, and still needing work: a fold boundary strictly INSIDE the new
+tokens (needs `commit_len` expressed over the extended layout), and a fire
+whose rows disagree about where the boundary lands.
 
 ### 10.3 `mtp-native-verify` rewritten as fold-commit — LANDED
 

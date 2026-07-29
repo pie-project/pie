@@ -1,6 +1,7 @@
 #include <pie_native/step_launch.hpp>
 #include "batch/compose.hpp"
 
+#include <stdexcept>
 #include <algorithm>
 
 namespace pie::metal::batch {
@@ -53,6 +54,19 @@ pie_native::LaunchView build_launch_view(const pie_native::StepLaunch& launch) {
         pie_native::slice_from_u32(
             launch.rs_buffer_slot_indptr.ptr,
             launch.rs_buffer_slot_indptr.len);
+    // The buffer READ path is CUDA-only. Metal has no extended token layout,
+    // so it would run the new tokens' recurrence from the FOLDED state and
+    // silently ignore what is already buffered -- a wrong answer that then
+    // gets folded and cannot be recovered. Refuse instead.
+    if (launch.rs_buffer_read_lens.len != 0 &&
+        std::any_of(launch.rs_buffer_read_lens.ptr,
+                    launch.rs_buffer_read_lens.ptr +
+                        launch.rs_buffer_read_lens.len,
+                    [](std::uint32_t len) { return len != 0; })) {
+        throw std::runtime_error(
+            "this driver cannot replay buffered recurrent tokens; fold the "
+            "buffer before appending to it");
+    }
     view.rs_translation =
         pie_native::slice_from_u32(
             launch.rs_translation.ptr,

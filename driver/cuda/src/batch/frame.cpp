@@ -696,6 +696,11 @@ struct PreparedStep::Impl {
     std::span<const std::uint32_t> rs_fold_len_view;
     std::span<const std::uint32_t> rs_buf_id_view;
     std::span<const std::uint32_t> rs_buf_indptr_view;
+    // The buffered prefix replayed ahead of this fire's own tokens.
+    std::span<const std::uint32_t> rs_buf_read_id_view;
+    std::span<const std::uint32_t> rs_buf_read_indptr_view;
+    std::span<const std::uint32_t> rs_buf_read_len_view;
+    bool rs_has_buffer_read = false;
     std::vector<std::int32_t> slot_ids_h;
     std::vector<std::uint8_t> is_fresh_h;
 
@@ -1205,6 +1210,21 @@ void prepare_step(
     s.rs_buf_indptr_view = s.composed_ready
         ? std::span<const std::uint32_t>(s.composed.rs_buffer_slot_indptr)
         : view.rs_buffer_slot_indptr.as<std::uint32_t>();
+    // Read side: host-only, so no device staging. Descriptor-composed batches
+    // do not carry it yet -- a channel-resolved rs-geometry cannot name a
+    // replay span, so a composed batch always replays nothing.
+    if (!s.composed_ready) {
+        s.rs_buf_read_id_view = view.rs_buffer_read_slot_ids.as<std::uint32_t>();
+        s.rs_buf_read_indptr_view =
+            view.rs_buffer_read_indptr.as<std::uint32_t>();
+        s.rs_buf_read_len_view = view.rs_buffer_read_lens.as<std::uint32_t>();
+    }
+    s.rs_has_buffer_read =
+        !s.rs_buf_read_len_view.empty() &&
+        std::any_of(
+            s.rs_buf_read_len_view.begin(),
+            s.rs_buf_read_len_view.end(),
+            [](std::uint32_t n) { return n != 0; });
     if (!pipeline::plan_rs_execution(
             s.rs_slot_view,
             s.rs_flag_view,
@@ -2339,6 +2359,15 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
                 (s.rs_is_write || s.rs_is_fold)
                     ? s.rs_buf_indptr_view.data()
                     : nullptr,
+            .rs_buffer_read_slot_ids_h = s.rs_has_buffer_read
+                ? s.rs_buf_read_id_view.data()
+                : nullptr,
+            .rs_buffer_read_indptr_h = s.rs_has_buffer_read
+                ? s.rs_buf_read_indptr_view.data()
+                : nullptr,
+            .rs_buffer_read_lens_h = s.rs_has_buffer_read
+                ? s.rs_buf_read_len_view.data()
+                : nullptr,
             .rs_fold_lens_h = !s.rs_fold_len_view.empty()
                 ? s.rs_fold_len_view.data()
                 : nullptr,

@@ -74,16 +74,17 @@ pub enum RsPlan {
     /// Advance the folded state in-forward over every row.
     Fold,
     /// Scatter each row's pre-recurrence activations into buffered slots
-    /// covering `[start_token, start_token + row_tokens[r])`, leaving the
-    /// folded state untouched.
+    /// covering `[start_tokens[r], start_tokens[r] + row_tokens[r])`, leaving
+    /// the folded state untouched.
     ///
-    /// `super::rs_plan_for` only ever emits `start_token == 0` today: writing
-    /// at an offset means the buffer was already non-empty, and the fire's
-    /// recurrence would then have to read what is already buffered. The store
-    /// below handles a non-zero offset correctly — it is the RECURRENCE that
-    /// cannot, so the restriction lives in the planner, not here.
+    /// `start_tokens[r]` is row `r`'s existing buffer occupancy, so a non-zero
+    /// entry means the fire appends onto a NON-EMPTY buffer and its recurrence
+    /// must read what is already there. That is the buffer read path. It is
+    /// per-row rather than per-pass because occupancy is a property of the
+    /// working set, not of the fire: one request commits while another
+    /// speculates, and they arrive at different offsets in the same batch.
     Buffer {
-        start_token: u32,
+        start_tokens: Vec<u32>,
         row_tokens: Vec<u32>,
     },
     /// Replay `tokens[r]` buffered tokens of row `r` into its folded state.
@@ -97,12 +98,15 @@ impl RsPlan {
         match self {
             RsPlan::Fold => (true, None, None),
             RsPlan::Buffer {
-                start_token,
+                start_tokens,
                 row_tokens,
             } => (
                 false,
                 None,
-                Some((*start_token, row_tokens.get(index).copied().unwrap_or(0))),
+                Some((
+                    start_tokens.get(index).copied().unwrap_or(0),
+                    row_tokens.get(index).copied().unwrap_or(0),
+                )),
             ),
             // A fold gathers the buffered PREFIX: the driver walks the CSR
             // from slab zero, so the span always starts at buffer token 0.
@@ -146,8 +150,26 @@ pub struct PreparedRs {
     pub fold_lens: Vec<u32>,
     /// Buffered slab ids, flattened, with the per-row CSR boundaries the
     /// driver walks page-major. Empty unless the pass touches the buffer.
+    ///
+    /// These are the slabs the fire WRITES: `prepare` may materialize or
+    /// privatize them, so they are targets, not sources.
     pub buffer_slot_ids: Vec<u32>,
     pub buffer_slot_indptr: Vec<u32>,
+    /// The slabs the fire READS, and how many tokens of them, per row.
+    ///
+    /// Separate from the write CSR because reading and writing the buffer are
+    /// different intents on the same pages. A write may allocate; a read must
+    /// not, and a read of a page that was merely reserved would gather
+    /// uninitialized activations straight into the recurrence. The WIT draws
+    /// the same line, with `readable-buffer` and `writable-buffer` as distinct
+    /// page spans.
+    ///
+    /// Non-empty only when a row appends onto a NON-EMPTY buffer: its
+    /// recurrence has to start from `folded ⊕ replay(buffer)`, so the driver
+    /// gathers `buffer_read_lens[r]` tokens ahead of the row's own tokens.
+    pub buffer_read_slot_ids: Vec<u32>,
+    pub buffer_read_indptr: Vec<u32>,
+    pub buffer_read_lens: Vec<u32>,
     /// WorkingSet-relative buffer page -> physical slot, concatenated over
     /// request rows with `translation_indptr` as the per-row CSR.
     ///
@@ -173,6 +195,9 @@ impl PreparedRs {
         request.rs_fold_lens = self.fold_lens.clone();
         request.rs_buffer_slot_ids = self.buffer_slot_ids.clone();
         request.rs_buffer_slot_indptr = self.buffer_slot_indptr.clone();
+        request.rs_buffer_read_slot_ids = self.buffer_read_slot_ids.clone();
+        request.rs_buffer_read_indptr = self.buffer_read_indptr.clone();
+        request.rs_buffer_read_lens = self.buffer_read_lens.clone();
         request.rs_translation = self.translation.clone();
         request.rs_translation_indptr = self.translation_indptr.clone();
     }
@@ -208,6 +233,9 @@ fn empty_prepared() -> PreparedRs {
         copies: (Vec::new(), Vec::new()),
         fold_lens: Vec::new(),
         buffer_slot_ids: Vec::new(),
+        buffer_read_slot_ids: Vec::new(),
+        buffer_read_indptr: Vec::new(),
+        buffer_read_lens: Vec::new(),
         buffer_slot_indptr: Vec::new(),
         translation: Vec::new(),
         translation_indptr: Vec::new(),
@@ -337,12 +365,62 @@ fn prepare_many_impl(
     // Built AFTER the publish, so it reflects the pages this fire just
     // materialized or privatized rather than the mapping the guest saw.
     out.translation_indptr.push(0);
-    for &ws in working_sets {
+    let page_tokens_of = |ws| -> Result<u32, String> {
+        store
+            .geometry(ws)
+            .map(|g| g.buffer_page_tokens.max(1))
+            .map_err(|error| error.to_string())
+    };
+    let mut any_read = false;
+    out.buffer_read_indptr.push(0);
+    for (index, &ws) in working_sets.iter().enumerate() {
         let row = store
             .buffer_translation(ws)
             .map_err(|error| error.to_string())?;
+
+        // The read prefix is the row's PRE-EXISTING occupancy, which is
+        // exactly where its own tokens begin.
+        let read_tokens = match plan.row(index).2 {
+            Some((start, _)) => start,
+            None => 0,
+        };
+        out.buffer_read_lens.push(read_tokens);
+        if read_tokens > 0 {
+            any_read = true;
+            let page = page_tokens_of(ws)?;
+            let pages = read_tokens.div_ceil(page) as usize;
+            for p in 0..pages {
+                match row.get(p) {
+                    Some(&slot) if slot != crate::store::rs::RS_TRANSLATION_UNMAPPED => {
+                        out.buffer_read_slot_ids.push(slot);
+                    }
+                    // Reserved-but-unmaterialized, or off the end. Either way
+                    // the recurrence would replay activations that were never
+                    // written, which is silent corruption of the state rather
+                    // than a visible failure -- so refuse.
+                    _ => {
+                        return Err(format!(
+                            "request row {index} must replay {read_tokens} buffered \
+                             token(s), but buffer page {p} of its working set \
+                             is not materialized"
+                        ));
+                    }
+                }
+            }
+        }
+        out.buffer_read_indptr
+            .push(out.buffer_read_slot_ids.len() as u32);
+
         out.translation.extend_from_slice(&row);
         out.translation_indptr.push(out.translation.len() as u32);
+    }
+    // Keep the wire quiet for the overwhelmingly common empty-buffer fire: an
+    // all-zero read side is the same statement as an absent one, and the
+    // driver's shape checks are simpler when "no read" is literally no data.
+    if !any_read {
+        out.buffer_read_slot_ids.clear();
+        out.buffer_read_indptr.clear();
+        out.buffer_read_lens.clear();
     }
     Ok(out)
 }
@@ -507,7 +585,7 @@ mod tests {
 
     fn buffer_plan(start_token: u32, row_tokens: Vec<u32>) -> RsPlan {
         RsPlan::Buffer {
-            start_token,
+            start_tokens: vec![start_token; row_tokens.len()],
             row_tokens,
         }
     }
