@@ -1065,12 +1065,16 @@ def _locate_kernel(
     bases_ptr,
     live_offsets_ptr,
     found_ptr,
+    old_lexer_ptr,
+    old_count_ptr,
+    old_stack_ptr,
     ROWS: tl.constexpr,
     CONFIGS: tl.constexpr,
     GROUP_BLOCK: tl.constexpr,
     SEARCH_STEPS: tl.constexpr,
     STACK_STRIDE: tl.constexpr,
     HAS_VERDICTS: tl.constexpr,
+    NO_GROUP: tl.constexpr,
 ):
     """Which group holds the sampled token, for each live configuration.
 
@@ -1102,7 +1106,18 @@ def _locate_kernel(
                 high = middle - 1
         row_index = low
         sequence = row_index // CONFIGS
-        _locate_one(
+        # The old state, saved here rather than in a launch of its own. The
+        # advance writes new configurations while reading old ones, so the copy
+        # has to happen before `_candidate_kernel` - but it reads the same row
+        # this program is already holding, and one program owns a row.
+        tl.store(old_lexer_ptr + row_index, tl.load(lexer_state_ptr + row_index))
+        tl.store(old_count_ptr + sequence, tl.load(config_count_ptr + sequence))
+        lane = tl.arange(0, STACK_STRIDE)
+        tl.store(
+            old_stack_ptr + row_index * STACK_STRIDE + lane,
+            tl.load(stack_ptr + row_index * STACK_STRIDE + lane),
+        )
+        tl.store(found_ptr + row_index, _locate_one(
             group_offsets_ptr,
             group_set_kind_ptr,
             group_set_offset_ptr,
@@ -1117,14 +1132,14 @@ def _locate_kernel(
             token_ptr,
             grammar_ptr,
             bases_ptr,
-            found_ptr,
             sequence,
             row_index,
             GROUP_BLOCK=GROUP_BLOCK,
             SEARCH_STEPS=SEARCH_STEPS,
             STACK_STRIDE=STACK_STRIDE,
             HAS_VERDICTS=HAS_VERDICTS,
-        )
+            NO_GROUP=NO_GROUP,
+        ))
         slot = slot + programs
 
 
@@ -1144,13 +1159,13 @@ def _locate_one(
     token_ptr,
     grammar_ptr,
     bases_ptr,
-    found_ptr,
     sequence,
     row_index,
     GROUP_BLOCK: tl.constexpr,
     SEARCH_STEPS: tl.constexpr,
     STACK_STRIDE: tl.constexpr,
     HAS_VERDICTS: tl.constexpr,
+    NO_GROUP: tl.constexpr,
 ):
     """Search one configuration's groups for the sampled token."""
     state = tl.load(lexer_state_ptr + row_index)
@@ -1160,6 +1175,12 @@ def _locate_one(
     my_group_offsets = group_offsets_ptr + tl.load(at + _B_GROUP_OFFSETS)
     first = tl.load(my_group_offsets + state)
     last = tl.load(my_group_offsets + state + 1)
+    # One program owns a row - the advance enumerates one item per live
+    # configuration - so the smallest group holding the token is a running
+    # minimum in a register. It used to be an atomic into an array the step
+    # had to clear first, which was a launch and a pass over the ceiling to
+    # initialise what this returns anyway.
+    best = NO_GROUP
 
     # Find the group holding the token a block of groups at a time rather than
     # one per program. A state can have hundreds of groups and only one of them
@@ -1239,10 +1260,9 @@ def _locate_one(
                 inside = inside & (((packed >> (2 * (at_slot % 16))) & 3) != 1)
 
         if tl.sum(inside.to(tl.int32)) != 0:
-            tl.atomic_min(
-                found_ptr + row_index, tl.min(tl.where(inside, group, last))
-            )
+            best = tl.minimum(best, tl.min(tl.where(inside, group, last)))
         start = start + GROUP_BLOCK
+    return best
 
 
 @triton.jit
@@ -3388,7 +3408,6 @@ class DeviceBatch:
 
     def _advance(self) -> None:
         grammar = self.grammar
-        self.found.fill_(_NO_GROUP)
         rows = self.batch * self.configs
         # One entry per live configuration, enumerated the way the fill
         # enumerates its groups. Sizing the grid by the width instead meant a
@@ -3419,18 +3438,6 @@ class DeviceBatch:
                 DEPTH=self.rollback_depth,
             )
             self.hist_slot += 1
-        _snapshot_kernel[(self.sweep_blocks,)](
-            self.lexer_state,
-            self.stack,
-            self.config_count,
-            self.live_offsets,
-            self.old_lexer,
-            self.old_count,
-            self.old_stack,
-            ROWS=rows,
-            CONFIGS=self.configs,
-            STACK_STRIDE=grammar.max_stack,
-        )
         _locate_kernel[(self.sweep_blocks,)](
             grammar.group_offsets,
             grammar.group_set_kind,
@@ -3450,12 +3457,16 @@ class DeviceBatch:
             grammar.bases,
             self.live_offsets,
             self.found,
+            self.old_lexer,
+            self.old_count,
+            self.old_stack,
             ROWS=rows,
             CONFIGS=self.configs,
             GROUP_BLOCK=_GROUP_BLOCK,
             SEARCH_STEPS=grammar.search_steps,
             STACK_STRIDE=grammar.max_stack,
             HAS_VERDICTS=grammar.has_verdicts,
+            NO_GROUP=_NO_GROUP,
         )
         _candidate_kernel[(self.sweep_blocks,)](
             grammar.group_offsets,
