@@ -383,7 +383,7 @@ void encode_prefill_dags_mb(StepEncoder& se,
                             const std::vector<std::uint8_t>& row_needs_logits,
                             const DecodeGeometry* geometry,
                             int max_rows,
-                            int gdn_scan_rows) {
+                            const std::vector<GdnScanSegment>& gdn_scans) {
     const size_t n = n_tokens > 0 ? size_t(n_tokens) : 0;
     if (n == 0 || dags.size() < n) return;
     const size_t length = dags[0].size();
@@ -477,29 +477,36 @@ void encode_prefill_dags_mb(StepEncoder& se,
         // trailing per-token dispatch expects it), the whole prompt goes through
         // in one dispatch each: prep is token-parallel once its conv window comes
         // off `mixed`, and the recurrent scan runs in registers.
-        size_t first_serial = 0;
-        if (serialize && gdn_scan_rows > 1) {
+        // Each request's recurrence is independent, so one scan per request
+        // replaces that request's whole per-token chain; rows a scan does not
+        // cover (an even tail) fall through to the per-token path below.
+        std::vector<bool> scanned(n, false);
+        if (serialize && !gdn_scans.empty()) {
             const Pso& scan = dags[0][i].kind == Kernel::GdnPrepSlotted
                                   ? mb_psos.gdn_prep_prefill
                                   : mb_psos.gdn_core_prefill;
             if (scan.valid()) {
-                Grid grid = dags[0][i].grid;
-                if (dags[0][i].kind == Kernel::GdnPrepSlotted) {
-                    grid.z = dags[0][i].grid.z * uint32_t(gdn_scan_rows);
-                } else {
-                    // (dk, dv, hv): the token dimension moves into the kernel.
-                    grid.z = dags[0][i].grid.z;
-                }
                 se.set_pso(scan);
-                se.set_argtable(dags[0][i].kind, dags[0][i].ordinal);
-                se.dispatch(grid, dags[0][i].tg);
+                for (const GdnScanSegment& seg : gdn_scans) {
+                    if (seg.rows < 2 || size_t(seg.start) >= n) continue;
+                    const Dispatch& d = dags[size_t(seg.start)][i];
+                    Grid grid = d.grid;
+                    // prep is (dk, 1, rows*heads); the recurrent kernel keeps
+                    // its (dk, dv, heads) grid and walks the rows internally.
+                    if (d.kind == Kernel::GdnPrepSlotted)
+                        grid.z = d.grid.z * uint32_t(seg.rows);
+                    se.set_argtable(d.kind, d.ordinal);
+                    se.dispatch(grid, d.tg);
+                    for (int r = 0; r < seg.rows; ++r)
+                        scanned[size_t(seg.start + r)] = true;
+                }
                 se.barrier();
-                first_serial = size_t(gdn_scan_rows);
             }
         }
         const bool logits_tail = skip_unsampled_logits && produces_logits(dags[0][i].kind);
-        const size_t rows = n;
-        for (size_t t = first_serial; t < rows; ++t) {
+        bool prev_emitted = false;
+        for (size_t t = 0; t < n; ++t) {
+            if (serialize && scanned[t]) continue;
             if (logits_tail && row_needs_logits[t] == 0) continue;
             const Dispatch& d = dags[t][i];
             if (d.kind != dags[0][i].kind) {
@@ -510,7 +517,11 @@ void encode_prefill_dags_mb(StepEncoder& se,
             se.set_pso(mb_pso(d, base_psos, mb_psos));
             se.set_argtable(d.kind, d.ordinal);
             se.dispatch(d.grid, d.tg);
-            if (serialize && t + 1 < rows) se.barrier();
+            // Barrier between consecutive per-token GDN dispatches only; a
+            // scanned row in between has already been ordered by the scan's
+            // own barrier above.
+            if (serialize && prev_emitted) se.barrier();
+            prev_emitted = true;
         }
         se.barrier();
     }

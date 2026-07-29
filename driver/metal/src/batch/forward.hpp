@@ -185,7 +185,14 @@ inline constexpr std::uint32_t kPagedMaxForwardRequests = kPhase1bRsSlots;
 // Paged prompts run one correct N=1 GDN recurrence DAG per token inside one
 // command buffer.  This bounds IO/scratch/logits allocation independently of
 // the four concurrently-addressable recurrent-state slots.
-inline constexpr std::uint32_t kPagedMaxForwardTokens = 64;
+//
+// This is also the scheduler's wave budget: it is advertised through
+// capabilities as `max_forward_tokens`, and `FramePolicy` defers any lane whose
+// fire does not fit, so at 64 a fleet of 34-token prompts could only ever put
+// ONE prompt in a fire.  Traced arrival times show them firing back to back
+// with sub-millisecond gaps -- the requests were all ready, the budget was the
+// only thing keeping them apart.
+inline constexpr std::uint32_t kPagedMaxForwardTokens = 256;
 
 struct SetupConfig {
     std::string checkpoint_dir;  // HF snapshot dir (config.json + safetensors)

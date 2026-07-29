@@ -528,7 +528,10 @@ struct MetalExecutor::Impl {
     // The prefill's uniform scratch row pitch, in elements, for the batched
     // projection (`affine_qmm_t_strided` reads it at buffer 8).
     SlotHandle prefill_row_stride_{};
-    SlotHandle prefill_scan_rows_{};
+    // One scan-length buffer per prompt row.  A grouped prefill carries several
+    // requests, each with its own scan length, and the row's argument table is
+    // what selects the segment -- so the length has to be per row too.
+    std::vector<SlotHandle> prefill_scan_rows_{};
     // A slot whose conv history was last written by the prefill's ping-pong may
     // hold it in ConvStateOut; the paged decode writes in place and always
     // leaves it in ConvState, so only the handover needs a copy.
@@ -779,7 +782,7 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
         *static_cast<std::int32_t*>(prefill_row_stride_.contents()) =
             static_cast<std::int32_t>(scratch_widest_elems(g_));
     }
-    prefill_scan_rows_ = ctx_->create_standalone_buffer(sizeof(std::int32_t));
+    prefill_scan_rows_.clear();
     if (!ptir_logits_copy_pso_.valid() ||
         !ptir_logits_copy_params_.valid() ||
         !ensure_ptir_logits_rows(1, &load_err)) {
@@ -1134,10 +1137,24 @@ bool MetalExecutor::Impl::bind_paged_dag(std::string* err) {
             // channels -- which saves copying every slot's whole conv slab back
             // on the host after every single token.
             alias_decode_conv_state_out(*ctx_, b_, mb_dag_);
+            prefill_scan_rows_.assign(prefill_dags_.size(), SlotHandle{});
             for (size_t t = 0; t < prefill_dags_.size(); ++t) {
                 bind_scratch(*ctx_, prefill_dags_[t], prefill_sched_, pool_.data(),
                              int(pool_.size()), t * prefill_scratch_row);
                 bind_decode_consts(*ctx_, prefill_dags_[t], g_, max_ctx_, gdn_prep_);
+                // A scan launched off row t's argument table reads its own
+                // length, so every row carries one.
+                prefill_scan_rows_[t] = ctx_->create_standalone_buffer(sizeof(std::int32_t));
+                if (!prefill_scan_rows_[t].valid() || !prefill_row_stride_.valid()) continue;
+                for (const Dispatch& d : prefill_dags_[t]) {
+                    if (d.kind == Kernel::GdnPrepSlotted) {
+                        ctx_->arg_bind_ordinal(d.ordinal, 14, prefill_row_stride_);
+                        ctx_->arg_bind_ordinal(d.ordinal, 15, prefill_scan_rows_[t]);
+                    } else if (d.kind == Kernel::GdnCoreSlotted) {
+                        ctx_->arg_bind_ordinal(d.ordinal, 12, prefill_row_stride_);
+                        ctx_->arg_bind_ordinal(d.ordinal, 13, prefill_scan_rows_[t]);
+                    }
+                }
             }
             // The batched projection runs off token 0's argument tables -- they
             // already point at row 0 of every scratch tensor -- and walks the
@@ -1160,14 +1177,7 @@ bool MetalExecutor::Impl::bind_paged_dag(std::string* err) {
                         case Kernel::GatedRms:
                             ctx_->arg_bind_ordinal(d.ordinal, 5, prefill_row_stride_);
                             break;
-                        case Kernel::GdnPrepSlotted:
-                            ctx_->arg_bind_ordinal(d.ordinal, 14, prefill_row_stride_);
-                            ctx_->arg_bind_ordinal(d.ordinal, 15, prefill_scan_rows_);
-                            break;
-                        case Kernel::GdnCoreSlotted:
-                            ctx_->arg_bind_ordinal(d.ordinal, 12, prefill_row_stride_);
-                            ctx_->arg_bind_ordinal(d.ordinal, 13, prefill_scan_rows_);
-                            break;
+
                         default:
                             break;
                     }
@@ -1610,7 +1620,23 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
         seq_len[size_t(t)] = schedule.spans[schedule.req_of_token[size_t(t)]].seqlen;
     copy_to(IoSlot::SeqLen, seq_len);
 
-    if (!schedule.is_pure_decode) return run_prefill_step(schedule, in, err, ptir);
+    if (!schedule.is_pure_decode) {
+        if (std::getenv("PIE_METAL_PREFILL_TRACE") == nullptr)
+            return run_prefill_step(schedule, in, err, ptir);
+        // Whether prompts are spread out in time or arriving together and just
+        // not being grouped is the difference between a scheduler problem and a
+        // budget one, and only the arrival pattern separates them.
+        using clock = std::chrono::steady_clock;
+        static const auto t_origin = clock::now();
+        const auto t0 = clock::now();
+        const bool ok = run_prefill_step(schedule, in, err, ptir);
+        const auto t1 = clock::now();
+        std::fprintf(
+            stderr, "[pf] at=%.1f ms N=%d R=%d took=%.1f ms\n",
+            std::chrono::duration<double, std::milli>(t0 - t_origin).count(), schedule.N,
+            schedule.R, std::chrono::duration<double, std::milli>(t1 - t0).count());
+        return ok;
+    }
 
     std::vector<uint32_t> active_slots;
     active_slots.reserve(size_t(schedule.R));
@@ -1711,12 +1737,28 @@ bool MetalExecutor::Impl::run_prefill_step(
     // ping-pong alternates per token, so an odd count leaves the history in the
     // buffer token `scan_rows` reads, and an even prompt keeps one trailing
     // token on the per-token path.
-    int gdn_scan_rows = 0;
-    if (schedule.R == 1 && prefill_scan_rows_.valid() && prefill_row_stride_.valid()) {
-        gdn_scan_rows = schedule.N % 2 == 1 ? schedule.N : schedule.N - 1;
-        if (gdn_scan_rows < 3) gdn_scan_rows = 0;
-        *static_cast<std::int32_t*>(prefill_scan_rows_.contents()) =
-            static_cast<std::int32_t>(gdn_scan_rows);
+    // One scan per request: the rows of a request are contiguous and share its
+    // recurrent slot, so each is its own independent recurrence.  The conv
+    // ping-pong alternates per row, so an odd scan length leaves the history
+    // where the segment's trailing per-token dispatch expects it -- an even
+    // segment keeps its last row on the per-token path.
+    std::vector<GdnScanSegment> gdn_scans;
+    if (prefill_row_stride_.valid() &&
+        prefill_scan_rows_.size() >= size_t(schedule.N)) {
+        int t = 0;
+        while (t < schedule.N) {
+            const uint32_t slot = schedule.slot_of_token[size_t(t)];
+            int end = t;
+            while (end < schedule.N && schedule.slot_of_token[size_t(end)] == slot) ++end;
+            const int len = end - t;
+            int rows = len % 2 == 1 ? len : len - 1;
+            if (rows >= 3) {
+                *static_cast<std::int32_t*>(prefill_scan_rows_[size_t(t)].contents()) =
+                    static_cast<std::int32_t>(rows);
+                gdn_scans.push_back(GdnScanSegment{t, rows});
+            }
+            t = end;
+        }
     }
     // One command buffer, request-major token order.  Every complete layer DAG
     // ends in a barrier, so token t+1 observes token t's GDN and paged KV writes.
@@ -1727,7 +1769,7 @@ bool MetalExecutor::Impl::run_prefill_step(
         }
         encode_prefill_dags_mb(se, prefill_dags_, schedule.N, psos_, mb_psos_,
                                force_barriers_, in.row_needs_logits, &g_,
-                               int(prefill_dags_.size()), gdn_scan_rows);
+                               int(prefill_dags_.size()), gdn_scans);
         if (ptir != nullptr) {
             for (const auto& callbacks : *ptir)
                 if (callbacks.post_forward) callbacks.post_forward(se);

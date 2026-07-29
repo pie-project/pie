@@ -54,6 +54,14 @@ void bind_decode_dag_mb(RawMetalContext& ctx, const BoundDecode& b,
 // token-major if the per-token DAGs are not the same shape.
 // `row_needs_logits`, when non-empty, is one byte per token: rows whose logits
 // nothing will read skip the lm_head projection and the argmax that follows it.
+// A run of prompt rows that share one recurrent slot, and how many of them the
+// GDN scan covers.  A grouped prefill carries several requests, and each one's
+// recurrence is independent, so each gets its own scan.
+struct GdnScanSegment {
+    int start = 0;  // first prompt row of the request
+    int rows = 0;   // rows the scan covers (the rest stay per-token)
+};
+
 void encode_prefill_dags_mb(StepEncoder& se,
                             const std::vector<std::vector<Dispatch>>& dags,
                             int n_tokens,
@@ -63,7 +71,7 @@ void encode_prefill_dags_mb(StepEncoder& se,
                             const std::vector<std::uint8_t>& row_needs_logits = {},
                             const DecodeGeometry* geometry = nullptr,
                             int max_rows = 0,
-                            int gdn_scan_rows = 0);
+                            const std::vector<GdnScanSegment>& gdn_scans = {});
 
 // Point ConvStateOut at ConvState so a paged decode shifts the conv history in
 // place; the prefill re-binds its own ordinals per fire and is unaffected.
