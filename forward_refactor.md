@@ -804,16 +804,30 @@ This is also the strictly safer direction: dropping a parameter later is
 breaking either way, but a parameter that becomes redundant can simply be
 ignored, whereas ADDING one later is unambiguously breaking.
 
-### 9.3 `rs-geometry` is optional on `attention`, and is now backed by real ports
+### 9.3 `rs-geometry` moves off `attention` and onto `buffer` / `fold-buffered`
 
 Two changes to D9.
 
-**It is an `option`.** A plain `fold` prefill/decode never touches the buffer,
-so requiring `rs-geometry` unconditionally would reintroduce exactly the
-mandatory-dummy-geometry wart of §1.2 defect 1. `attention` therefore takes
-`option<rs-geometry>`: `none` under `fold`, required under `buffer` /
-`fold-buffered`. The FOLDED slot is unaffected — it comes from the working-set
-handle, never from the geometry record.
+**It is not part of the state binding.** D9 hung `rs-geometry` off `attention`
+alongside the working sets. That forces a plain `fold` prefill/decode — which
+never touches the buffer — to supply one, which is exactly the
+mandatory-dummy-geometry wart of §1.2 defect 1. Making it an `option` there
+avoids the wart but reintroduces an unrepresentable-state hole in the other
+direction: `some(geometry)` under `fold` is meaningless, and `none` under
+`buffer` is an error the type could have prevented.
+
+The resolution is to attach it to the two methods that actually read it:
+
+```wit
+attention:     func(rs: list<borrow<rs-working-set>>) -> result<_, error>;
+fold:          func() -> result<_, error>;
+buffer:        func(start-token: u32, geom: rs-geometry) -> result<_, error>;
+fold-buffered: func(lens: list<u32>, geom: rs-geometry) -> result<_, error>;
+```
+
+No option, no dummy: unconditional where it is meaningful, absent where it is
+not. The FOLDED slot is unaffected either way — it comes from the working-set
+handle, never from a geometry record.
 
 **Its fields now exist.** When D9 was written, RS had no descriptor-port
 family: `rs_buffer_slot_ids` / `rs_buffer_slot_indptr` were derived host-side
@@ -824,10 +838,19 @@ RsBufferLen, RsWSlot, RsWOff}` at registry tags 10–14 (wire-additive), the
 `descriptor_resolve` cases. `rs-geometry`'s five channels lower to exactly
 those ports.
 
-Still outstanding on that path: the `rs_translation` segment (the mirror of
+Still outstanding on that path, and the reason `rs-geometry` is today RECORDED
+AND VALIDATED but not yet LOWERED: the `rs_translation` segment (the mirror of
 `kv_translation`, which maps WorkingSet-relative page ids to physical slots),
 its application in `batch_compose`, and Metal, which advertises none of the new
 bits and so falls back to the host-derived path.
+
+Until those land, a `buffer` / `fold-buffered` fire still lowers through the
+host-derived `RsStore` path driven by `buffer`'s `start-token`, and the
+`rs-geometry` channels are checked for resolvable handles but do not bind the
+tag 10–14 ports. The surface is therefore already final; only the plumbing
+behind it is not. This is deliberate — getting the record's field set right
+BEFORE anything depends on it matters, because D8 chose records and adding a
+record field later is breaking.
 
 ### 9.4 One host implementation, one SDK core
 

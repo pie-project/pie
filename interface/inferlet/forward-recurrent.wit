@@ -56,11 +56,13 @@ interface forward-recurrent {
     /// The FOLDED state slot is not named here -- it comes from the
     /// working-set handle itself.
     ///
-    /// This is only meaningful when the fire actually touches the buffer, so
-    /// `attention` takes it as an OPTION rather than requiring it: a plain
-    /// `fold` prefill/decode passes `none`. Requiring it unconditionally would
-    /// reintroduce exactly the mandatory-dummy-geometry wart this refactor
-    /// exists to remove.
+    /// It is REQUIRED by `buffer` and `fold-buffered`, and does not appear on
+    /// `attention` or `fold` at all. Hanging it off the state binding would
+    /// have forced a plain `fold` prefill/decode -- which never touches the
+    /// buffer -- to invent one, which is exactly the mandatory-dummy-geometry
+    /// wart this refactor exists to remove. Attaching it to the two methods
+    /// that actually read it makes it unconditional where it is meaningful and
+    /// absent where it is not.
     record rs-geometry {
         /// Buffer page range a `fold-buffered` replay may read.
         readable-buffer: page-span,
@@ -87,12 +89,9 @@ interface forward-recurrent {
         /// signature varies.
         ///
         /// `rs` is one working set per request, in resolved request order.
-        /// `geom` is `none` for a plain `fold` fire and REQUIRED under
-        /// `buffer` / `fold-buffered`.
-        attention: func(
-            rs:   list<borrow<rs-working-set>>,
-            geom: option<rs-geometry>,
-        ) -> result<_, error>;
+        /// The buffered geometry is NOT part of the state binding -- see
+        /// `rs-geometry`.
+        attention: func(rs: list<borrow<rs-working-set>>) -> result<_, error>;
 
         // -- Fold mode ------------------------------------------------
         // The former `rs-mode` variant, flattened into methods (D5): adding a
@@ -102,7 +101,7 @@ interface forward-recurrent {
 
         /// Fold every token of this fire into the folded state, in-forward and
         /// IRREVERSIBLY. The plain prefill/decode path and the default. Needs
-        /// no `rs-geometry` -- it never touches the buffer.
+        /// no buffer geometry -- it never touches the buffer.
         fold: func() -> result<_, error>;
 
         /// Write each token's pre-recurrence activations into the buffered
@@ -119,14 +118,14 @@ interface forward-recurrent {
         /// `w-off` and is ignored when those are bound -- it exists because
         /// the host-derived lowering path (which derives the buffered CSR from
         /// `(start-token, row-tokens)`) is the only one wired end to end today.
-        buffer: func(start-token: u32) -> result<_, error>;
+        buffer: func(start-token: u32, geom: rs-geometry) -> result<_, error>;
 
         /// Replay buffered tokens into the folded state: one length per bound
         /// working set, in request order. Runs ONLY the recurrent layers,
         /// advances the folded boundary, and drops fully covered head slots.
         /// Each length must be a positive multiple of
-        /// `model.rs-fold-granularity()`. Requires an `rs-geometry`.
-        fold-buffered: func(lens: list<u32>) -> result<_, error>;
+        /// `model.rs-fold-granularity()`.
+        fold-buffered: func(lens: list<u32>, geom: rs-geometry) -> result<_, error>;
 
         /// Both `embed` and `readout` may be omitted under `fold-buffered`:
         /// that fire replays buffered tokens through the recurrent layers

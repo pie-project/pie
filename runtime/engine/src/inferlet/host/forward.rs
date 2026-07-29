@@ -56,8 +56,8 @@ fn model_pass_kind() -> PassKind {
 /// they all funnel here so the validation lives once.
 enum WitRsMode {
     Fold,
-    Buffer(u32),
-    FoldBuffered(Vec<u32>),
+    Buffer(u32, RsGeometryBinding),
+    FoldBuffered(Vec<u32>, RsGeometryBinding),
 }
 
 fn page_span(
@@ -1054,10 +1054,17 @@ impl ProcessCtx {
         this: Resource<ForwardPass>,
         mode: WitRsMode,
     ) -> Anyhow<Result<(), String>> {
+        if let Err(error) = self.core_gate(&this)? {
+            return Ok(Err(error));
+        }
         let caps = pie_model::model().rs_caps();
+        // `rs-geometry` rides on `buffer` / `fold-buffered` rather than on the
+        // state binding: those are the only two fires that touch the buffer,
+        // so this is where it is unconditionally meaningful.
+        let mut geometries: Vec<RsGeometryBinding> = Vec::new();
         let mode = match mode {
             WitRsMode::Fold => RsMode::Fold,
-            WitRsMode::Buffer(start_token) => {
+            WitRsMode::Buffer(start_token, geometry) => {
                 if caps.state_size == 0 {
                     return Ok(Err(
                         "pipeline: fold mode: a pure-attention model has no recurrent state to \
@@ -1080,9 +1087,10 @@ impl ProcessCtx {
                          is not a multiple of the RS buffer page size {page}"
                     )));
                 }
+                geometries.push(geometry);
                 RsMode::Buffer { start_token }
             }
-            WitRsMode::FoldBuffered(tokens) => {
+            WitRsMode::FoldBuffered(tokens, geometry) => {
                 if caps.state_size == 0 {
                     return Ok(Err(
                         "pipeline: fold mode: a pure-attention model has no recurrent state to fold"
@@ -1096,6 +1104,7 @@ impl ProcessCtx {
                             .to_string(),
                     ));
                 }
+                geometries.push(geometry);
                 RsMode::FoldBuffered { tokens }
             }
         };
@@ -1127,14 +1136,23 @@ impl ProcessCtx {
                 tokens.len()
             )));
         }
+        let geometry = geometries.pop();
         let pass = self.ctx().table.get_mut(&this)?;
         if pass.is_bound() {
+            if geometry.is_some() {
+                return Ok(Err(
+                    "pipeline: fold mode: rs-geometry cannot be rebound after the program is \
+                     attached"
+                        .to_string(),
+                ));
+            }
             match pass.bound_mut() {
                 Ok(bound) => bound.rs_mode = mode,
                 Err(error) => return Ok(Err(error)),
             }
         } else {
             pass.bindings.rs_mode = mode;
+            pass.bindings.rs_geom = geometry;
         }
         Ok(Ok(()))
     }
@@ -1143,7 +1161,6 @@ impl ProcessCtx {
         &mut self,
         this: Resource<ForwardPass>,
         rs_working_sets: Vec<Resource<RsWorkingSet>>,
-        rs_geom: Option<RsGeometryBinding>,
     ) -> Anyhow<Result<(), String>> {
         if let Err(error) = self.core_gate(&this)? {
             return Ok(Err(error));
@@ -1158,16 +1175,9 @@ impl ProcessCtx {
             for resource in &rs_working_sets {
                 let _ = self.ctx().table.get(resource)?;
             }
-            let pass = self.ctx().table.get_mut(&this)?;
-            pass.bindings.rs_ws = rs_working_sets.iter().map(Resource::rep).collect();
-            pass.bindings.rs_geom = rs_geom;
+            self.ctx().table.get_mut(&this)?.bindings.rs_ws =
+                rs_working_sets.iter().map(Resource::rep).collect();
             return Ok(Ok(()));
-        }
-        if rs_geom.is_some() {
-            return Ok(Err(
-                "forward pass rs-geometry cannot be replaced after the program is attached"
-                    .to_string(),
-            ));
         }
         let has_recurrent_state = pie_model::model().rs_caps().state_size > 0;
         let (kv_rep, qo_indptr) = {
@@ -1322,7 +1332,7 @@ macro_rules! forward_pass_common {
 /// recurrent and hybrid interfaces (the attention-only interface has no fold
 /// mode at all -- that is the point of the split).
 macro_rules! forward_pass_fold_modes {
-    () => {
+    ($iface:ident) => {
         async fn fold(&mut self, this: Resource<ForwardPass>) -> Anyhow<Result<(), String>> {
             self.core_set_rs_mode(this, WitRsMode::Fold).await
         }
@@ -1331,8 +1341,10 @@ macro_rules! forward_pass_fold_modes {
             &mut self,
             this: Resource<ForwardPass>,
             start_token: u32,
+            geom: pie::inferlet::$iface::RsGeometry,
         ) -> Anyhow<Result<(), String>> {
-            self.core_set_rs_mode(this, WitRsMode::Buffer(start_token))
+            let geometry = rs_geometry_binding!(self, geom);
+            self.core_set_rs_mode(this, WitRsMode::Buffer(start_token, geometry))
                 .await
         }
 
@@ -1340,8 +1352,10 @@ macro_rules! forward_pass_fold_modes {
             &mut self,
             this: Resource<ForwardPass>,
             lens: Vec<u32>,
+            geom: pie::inferlet::$iface::RsGeometry,
         ) -> Anyhow<Result<(), String>> {
-            self.core_set_rs_mode(this, WitRsMode::FoldBuffered(lens))
+            let geometry = rs_geometry_binding!(self, geom);
+            self.core_set_rs_mode(this, WitRsMode::FoldBuffered(lens, geometry))
                 .await
         }
     };
@@ -1439,19 +1453,14 @@ impl pie::inferlet::forward_recurrent::Host for ProcessCtx {
 
 impl pie::inferlet::forward_recurrent::HostForwardPass for ProcessCtx {
     forward_pass_common!(forward_recurrent, PassKind::Recurrent);
-    forward_pass_fold_modes!();
+    forward_pass_fold_modes!(forward_recurrent);
 
     async fn attention(
         &mut self,
         this: Resource<ForwardPass>,
         rs: Vec<Resource<RsWorkingSet>>,
-        geom: Option<pie::inferlet::forward_recurrent::RsGeometry>,
     ) -> Anyhow<Result<(), String>> {
-        let binding = match geom {
-            Some(geom) => Some(rs_geometry_binding!(self, geom)),
-            None => None,
-        };
-        self.core_set_rs_working_sets(this, rs, binding).await
+        self.core_set_rs_working_sets(this, rs).await
     }
 }
 
@@ -1471,14 +1480,13 @@ impl pie::inferlet::forward_hybrid::Host for ProcessCtx {
 
 impl pie::inferlet::forward_hybrid::HostForwardPass for ProcessCtx {
     forward_pass_common!(forward_hybrid, PassKind::Hybrid);
-    forward_pass_fold_modes!();
+    forward_pass_fold_modes!(forward_hybrid);
 
     async fn attention(
         &mut self,
         this: Resource<ForwardPass>,
         kv: Option<pie::inferlet::forward_hybrid::KvBinding>,
         rs: Vec<Resource<RsWorkingSet>>,
-        rs_geom: Option<pie::inferlet::forward_hybrid::RsGeometry>,
     ) -> Anyhow<Result<(), String>> {
         let Some(kv) = kv else {
             // The WIT admits `none` so that a recurrent-only `fold-buffered`
@@ -1513,11 +1521,7 @@ impl pie::inferlet::forward_hybrid::HostForwardPass for ProcessCtx {
         {
             return Ok(Err(error));
         }
-        let binding = match rs_geom {
-            Some(geom) => Some(rs_geometry_binding!(self, geom)),
-            None => None,
-        };
-        self.core_set_rs_working_sets(this, rs, binding).await
+        self.core_set_rs_working_sets(this, rs).await
     }
 }
 

@@ -141,8 +141,32 @@ async fn main(input: String) -> Result<String> {
         None,
     )?;
     fwd_s.recurrent(std::slice::from_ref(&rs))?;
+    // The buffered geometry: `SPEC_TOKENS` tokens written from buffer token 0,
+    // page-major from slab zero. Required by `buffer_recurrent` because that
+    // is one of exactly two calls that touch the buffer -- unlike the KV half,
+    // it is NOT part of the state binding, so a plain `fold` fire never has to
+    // invent one.
+    let rs_page = inferlet::model::rs_buffer_page_size().max(1);
+    let rs_pages = SPEC_TOKENS.div_ceil(rs_page);
+    let spec_rs_len = Channel::from(vec![SPEC_TOKENS]).named("spec_rs_len");
+    let spec_rs_pages = Channel::from((0..rs_pages).collect::<Vec<_>>()).named("spec_rs_pages");
+    let spec_rs_indptr = Channel::from(vec![0u32, rs_pages]).named("spec_rs_indptr");
+    let spec_rs_w_slot =
+        Channel::from((0..SPEC_TOKENS).map(|t| t / rs_page).collect::<Vec<_>>())
+            .named("spec_rs_w_slot");
+    let spec_rs_w_off = Channel::from((0..SPEC_TOKENS).map(|t| t % rs_page).collect::<Vec<_>>())
+        .named("spec_rs_w_off");
     fwd_s
-        .buffer_recurrent(0)
+        .buffer_recurrent(
+            0,
+            ..,
+            ..,
+            &spec_rs_len,
+            &spec_rs_pages,
+            &spec_rs_indptr,
+            &spec_rs_w_slot,
+            &spec_rs_w_off,
+        )
         .map_err(|e| format!("buffer_recurrent: {e}"))?;
     fwd_s.epilogue(move || {
         let t = reduce_argmax(intrinsics::logits());
@@ -193,8 +217,31 @@ async fn main(input: String) -> Result<String> {
             None,
         )?;
         fwd_c.recurrent(std::slice::from_ref(&rs))?;
+        // The commit replays `accepted` buffered tokens, so it reads exactly
+        // the span the speculate fire wrote.
+        let commit_rs_pages_n = accepted.div_ceil(rs_page);
+        let commit_rs_len = Channel::from(vec![accepted]).named("commit_rs_len");
+        let commit_rs_pages =
+            Channel::from((0..commit_rs_pages_n).collect::<Vec<_>>()).named("commit_rs_pages");
+        let commit_rs_indptr =
+            Channel::from(vec![0u32, commit_rs_pages_n]).named("commit_rs_indptr");
+        let commit_rs_w_slot =
+            Channel::from((0..accepted).map(|t| t / rs_page).collect::<Vec<_>>())
+                .named("commit_rs_w_slot");
+        let commit_rs_w_off =
+            Channel::from((0..accepted).map(|t| t % rs_page).collect::<Vec<_>>())
+                .named("commit_rs_w_off");
         fwd_c
-            .fold_buffered(&[accepted])
+            .fold_buffered(
+                &[accepted],
+                ..,
+                ..,
+                &commit_rs_len,
+                &commit_rs_pages,
+                &commit_rs_indptr,
+                &commit_rs_w_slot,
+                &commit_rs_w_off,
+            )
             .map_err(|e| format!("fold_buffered: {e}"))?;
         fwd_c.epilogue(move || {
             let t = reduce_argmax(intrinsics::logits());
