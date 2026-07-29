@@ -3728,33 +3728,42 @@ impl BatchScheduler {
         waves: &[Vec<u64>],
     ) -> (bool, bool) {
         let mut progress = false;
-        let mut wave_of: HashMap<u64, usize> = HashMap::new();
+        // One map, carrying BOTH the wave and the in-wave position: the
+        // position is the sealed wave's id order (lane admission order), so
+        // carrying it here lets the sort below compare plain integers. The
+        // previous shape hashed twice per queued launch (`contains_key` then
+        // index) and rebuilt a second id->position map per wave that the sort
+        // comparator then hashed into once per comparison — n log n hash
+        // lookups on the loop's hottest per-fire path at 512 fires a frame.
+        let mut slot_of: HashMap<u64, (usize, usize)> =
+            HashMap::with_capacity(waves.iter().map(Vec::len).sum());
         for (index, wave) in waves.iter().enumerate() {
-            for &fire_id in wave {
-                wave_of.insert(fire_id, index);
+            for (position, &fire_id) in wave.iter().enumerate() {
+                slot_of.insert(fire_id, (index, position));
             }
         }
         let mut kept: VecDeque<QueuedItem> = VecDeque::with_capacity(pending.len());
-        let mut picked_waves: Vec<Vec<PendingRequest>> =
-            (0..waves.len()).map(|_| Vec::new()).collect();
+        let mut picked_waves: Vec<Vec<(usize, PendingRequest)>> = waves
+            .iter()
+            .map(|wave| Vec::with_capacity(wave.len()))
+            .collect();
         while let Some(item) = pending.pop_front() {
             match item {
-                QueuedItem::Launch(request) if wave_of.contains_key(&request.logical_fire_id) => {
-                    picked_waves[wave_of[&request.logical_fire_id]].push(request);
-                }
+                QueuedItem::Launch(request) => match slot_of.get(&request.logical_fire_id) {
+                    Some(&(wave, position)) => picked_waves[wave].push((position, request)),
+                    None => kept.push_back(QueuedItem::Launch(request)),
+                },
                 item => kept.push_back(item),
             }
         }
         pending.replace(kept);
-        // In-wave order: the sealed wave's id order (lane admission order).
-        for (wave, ids) in picked_waves.iter_mut().zip(waves) {
-            let order: HashMap<u64, usize> = ids
-                .iter()
-                .enumerate()
-                .map(|(index, &fire_id)| (fire_id, index))
-                .collect();
-            wave.sort_by_key(|request| order[&request.logical_fire_id]);
-        }
+        let picked_waves: Vec<Vec<PendingRequest>> = picked_waves
+            .into_iter()
+            .map(|mut wave| {
+                wave.sort_by_key(|&(position, _)| position);
+                wave.into_iter().map(|(_, request)| request).collect()
+            })
+            .collect();
         // Drop settled/cancelled/stale fires — the frame posts without them.
         let mut survivors: Vec<Vec<PendingRequest>> = Vec::with_capacity(picked_waves.len());
         for wave in picked_waves {

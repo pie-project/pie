@@ -4244,3 +4244,61 @@ same term §20.15 (submit -58%) and §20.16 (close barrier -19%) attacked; the
 finding here is that they were aimed correctly but were each too small a slice
 of a 14 ms pass to clear a 4.5% noise band. The measurement to hold them to is
 `loop_lag_us` and the A..G curve above, NOT end-to-end tok/s.
+
+### Addendum: the box has 13 CPUs, not 128
+
+`std::thread::available_parallelism()` returns **13** here — it reads the cgroup
+quota (`cpu.cfs_quota_us 1360000 / cpu.cfs_period_us 100000` = 13.6 CPUs),
+while `nproc` and `os.cpu_count()` both report 128. The engine's default
+`min(available_parallelism, 64)` is therefore **13 worker threads, not 64**, and
+the sweep above was testing 1.2x and 2.4x OVERSUBSCRIPTION against a hard
+quota — which is exactly why more threads got slower. Stock is already
+correctly sized; the sweep still rules out parallelism as the lever, but for
+the opposite reason to the one first assumed.
+
+This also sharpens the diagnosis: the scheduler loop is ONE dedicated thread
+running ~10 ms passes on a 13-CPU budget. Per-fire host cost in that loop is
+not merely a constant factor — it is the critical path's clock.
+
+### Refuted while profiling: instantiation is NOT in the hole
+
+WASM bring-up was the other candidate for the boundary cost, since
+`process_instantiated.instantiate_us` sums to 9.18 s of a 16.6 s run and
+`get_component_us` shows a p50 9 us / p90 2.15 ms lock-contention shape. It is
+not in the hole. All 4096 instantiations complete within the first **836 ms**
+of the run, and at each of the four largest boundaries the count of
+instantiations starting inside the hole is **zero** (the nearest cohort's
+instantiations run 1.9 - 10.5 s earlier). Prewarm is doing its job: the
+double-buffered cohort is fully instantiated long before it is needed.
+
+Teardown is likewise not the work — `terminate_ack` p50 0.00 ms, `finalize`
+p50 0.00 ms — but the teardown TASK waits p50 18.6 ms / p90 40.9 ms just to be
+first polled, with **170 (p50) to 424 (peak)** tasks spawned-but-unpolled at a
+boundary. That is the 13-CPU budget, not a lock.
+
+### Landed: post_frame's per-fire hash traffic (-20% loop_post)
+
+`post_frame` rebuilt its fire-id maps twice per frame: a `wave_of` map hashed
+once per queued launch for `contains_key` and again for the index, then a
+SECOND per-wave `order` map that the sort comparator hashed into on every
+comparison — n log n lookups (~4600 at 512 fires) on the loop's hottest path.
+One map now carries `(wave, position)` together, so the sort compares plain
+integers.
+
+Paired instrumented runs, same session, 528 waves each:
+
+```
+                     OLD        NEW      delta
+  loop_post_us      4.682 ms   3.733 ms  -20.3%
+  loop_dispatch_us  5.301 ms   4.344 ms  -18.1%
+  loop_retire_us    4.124 ms   4.172 ms   +1.2%  (untouched)
+  loop_mailbox_us   1.568 ms   1.607 ms   +2.5%  (untouched)
+  batch_build_us    1.575 ms   1.596 ms   +1.3%  (untouched)
+```
+
+The untouched phases moving <2.5% is the control: the delta is the change, not
+the run. End-to-end tok/s could NOT resolve it — this box was running at load
+15 against a 13.6-CPU quota that day and homogeneous 512 spread 28131..31296
+(11%) across three back-to-back runs. Per §20.23 the measurement to hold this
+class of change to is the loop phase itself.
+
