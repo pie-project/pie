@@ -476,14 +476,19 @@ fn rs_plan_for(
             // path is still what makes a non-empty append correct.)
             if b != 0 {
                 return Err(format!(
-                    "request row {row} appends {t} token(s) onto a non-empty buffer                      ({b} buffered token(s)); the recurrence would start from the folded                      state and silently ignore what is buffered. Fold the buffer first,                      or keep each speculative chunk to a single fire"
+                    "request row {row} appends {t} token(s) onto a non-empty buffer \
+                     ({b} buffered token(s)); the recurrence would start from the \
+                     folded state and silently ignore what is buffered. Fold the \
+                     buffer first, or keep each speculative chunk to a single fire"
                 ));
             }
             Position::Buffer
         } else if n == b + t {
             if b != 0 {
                 return Err(format!(
-                    "request row {row} folds through a non-empty buffer ({b} buffered token(s));                      the recurrence cannot read the buffer yet, so fold and buffer in separate                      fires"
+                    "request row {row} folds through a non-empty buffer ({b} buffered \
+                     token(s)); the recurrence cannot read the buffer yet, so fold \
+                     and buffer in separate fires"
                 ));
             }
             Position::Fold
@@ -491,7 +496,9 @@ fn rs_plan_for(
             Position::Commit
         } else {
             return Err(format!(
-                "request row {row} folds {n} token(s) over a {b}-token buffer plus {t} new                  token(s); a boundary inside the new tokens requires the buffer read path"
+                "request row {row} folds {n} token(s) over a {b}-token buffer plus \
+                 {t} new token(s); a boundary inside the new tokens requires the \
+                 buffer read path"
             ));
         };
         match &position {
@@ -499,7 +506,8 @@ fn rs_plan_for(
             Some(seen) if *seen == here => {}
             Some(seen) => {
                 return Err(format!(
-                    "request row {row} lands the folded boundary at {here:?} while an earlier row                      lands it at {seen:?}; a fire folds uniformly today"
+                    "request row {row} lands the folded boundary at {here:?} while an \
+                     earlier row lands it at {seen:?}; a fire folds uniformly today"
                 ));
             }
         }
@@ -522,16 +530,28 @@ fn rs_plan_for(
 
 /// Phase-A RS demand for the acquisition grant.
 
-/// Drop the SYNTHESIZED read-out rows from a fire that folds.
+/// Drop the SYNTHESIZED read-out rows from a fire that replays the BUFFER.
 ///
-/// A fold fire returns from the linear layers before the output projection, so
-/// it produces no usable logits and the driver refuses one that declares
+/// A `FoldBuffered` fire scans activations that were computed by an earlier
+/// fire and are already sitting in buffer slabs. It exists only to move the
+/// folded boundary, so it returns from the linear layers before the output
+/// projection and produces no logits; the driver refuses one that declares
 /// sample rows. But an absent `readout` binding does not mean "sample nothing"
 /// — it means "sample each lane's last row" — and an empty readout channel has
-/// no expressible shape. So a guest that simply folded got a sample row it
+/// no expressible shape. So a guest that simply committed got a sample row it
 /// never asked for and a fire that could not run.
 ///
-/// Only the default is dropped. An EXPLICIT readout on a fold fire still
+/// **Only `FoldBuffered`.** A plain `RsPlan::Fold` also advances the folded
+/// state, but it does so over the fire's OWN new tokens, running them through
+/// the full stack exactly as a prefill does — because that is what a prefill
+/// on a linear model IS. Its logits are ordinary and required. Suppressing
+/// them left `sampled_rows` at zero and the fused epilogue failed to launch
+/// with a zero extent, which is to say: every prefill on a linear model. The
+/// driver draws this line correctly already — its `rs_is_fold` is
+/// `mode == BufferFold`, nothing wider — so this must match it and not the
+/// looser "does this fire fold at all".
+///
+/// Only the default is dropped. An EXPLICIT readout on a buffered fold still
 /// reaches the driver and is still refused, loudly: asking for logits that
 /// cannot exist is a guest bug worth reporting, not one worth papering over.
 fn suppress_defaulted_readout_for_fold(
@@ -539,8 +559,8 @@ fn suppress_defaulted_readout_for_fold(
     readout_defaulted: bool,
     plan: &rs::RsPlan,
 ) {
-    let folds = matches!(plan, rs::RsPlan::Fold | rs::RsPlan::FoldBuffered { .. });
-    if !folds || !readout_defaulted {
+    let replays_buffer = matches!(plan, rs::RsPlan::FoldBuffered { .. });
+    if !replays_buffer || !readout_defaulted {
         return;
     }
     req.sampling_indices.clear();

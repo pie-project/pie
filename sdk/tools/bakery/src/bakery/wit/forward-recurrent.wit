@@ -87,6 +87,12 @@ interface forward-recurrent {
         /// backbone; the fire that later folds them is a state advance, and
         /// its readout is good for nothing but a completion signal.
         ///
+        /// This is about REPLAY, not about folding. A fire that folds its own
+        /// new tokens -- a prefill, or any ordinary fire that never buffers --
+        /// runs the full stack and its logits are perfectly good. Folding is
+        /// the common case on a linear model, so a rule phrased as "a fold
+        /// produces no logits" would condemn nearly every fire there is.
+        ///
         /// A CHANNEL rather than a scalar because a speculative decode
         /// computes its accepted count ON DEVICE: as a channel the verify and
         /// the commit fuse into one fire, instead of the guest round-tripping
