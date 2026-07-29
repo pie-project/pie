@@ -1525,3 +1525,144 @@ template <typename T, int group_size, int bits, int BM, int BK, int BN>
 
 instantiate_qmm_t(16, 32, 32)
 instantiate_qmm_t(16, 32, 64)
+
+// ── Strided form, for the prefill ────────────────────────────────────────────
+// Identical to the aligned kernel above except that the row pitch of `x`, `y`
+// and `residual` is given separately from `K`/`N`.
+//
+// The prefill lays token t's slice of EVERY scratch tensor at
+// `t * scratch_widest_elems`, a uniform pitch chosen so one pool slot can hold
+// any of them -- not at `t * K`, which is what the decode's packed layout does
+// and what the aligned kernel assumes. That pitch is a property of the model,
+// not of the fire, so it binds once at setup like `K` and `N` do.
+//
+// With it, a prompt's projections stop being N sequential GEMVs over the same
+// weights and become one GEMM: 34 reads of the checkpoint collapse to one.
+template <typename T, int group_size, int bits, int BM, int BK, int BN,
+          bool WITH_RESIDUAL>
+METAL_FUNC void qmm_t_strided_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const device T* residual,
+    threadgroup T* Xs,
+    threadgroup T* Ws,
+    const constant int& K,
+    const constant int& N,
+    const constant int& row_stride,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  constexpr int WM = 2;
+  constexpr int WN = 2;
+  constexpr int pack_factor = get_pack_factor<bits, 8>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+
+  using mma_t = mlx::steel::
+      BlockMMA<T, T, BM, BN, BK, WM, WN, false, true, BK_padded, BK_padded>;
+  using loader_x_t =
+      mlx::steel::BlockLoader<T, BM, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
+  using loader_w_t = QuantizedBlockLoader<
+      T, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE, group_size, bits>;
+
+  const int K_w = K * bytes_per_pack / pack_factor;
+  const int K_g = K / group_size;
+  const int y_row = int(tid.y) * BM;
+  const int y_col = int(tid.x) * BN;
+
+  auto wl = (const device uint8_t*)w;
+  x += y_row * static_cast<int64_t>(row_stride);
+  wl += y_col * K_w;
+  scales += y_col * K_g;
+  biases += y_col * K_g;
+  y += y_row * static_cast<int64_t>(row_stride) + y_col;
+
+  loader_x_t loader_x(x, row_stride, Xs, simd_gid, simd_lid);
+  loader_w_t loader_w(wl, scales, biases, K, Ws, simd_gid, simd_lid);
+  mma_t mma_op(simd_gid, simd_lid);
+
+  for (int k = 0; k < K; k += BK) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    loader_x.load_unsafe();
+    loader_w.load_unsafe();
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    mma_op.mma(Xs, Ws);
+    loader_x.next();
+    loader_w.next();
+  }
+
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  mma_op.store_result(y, row_stride);
+  if (WITH_RESIDUAL) {
+    residual += y_row * static_cast<int64_t>(row_stride) + y_col;
+    threadgroup_barrier(mem_flags::mem_device);
+    for (uint idx = simd_gid * 32u + simd_lid; idx < uint(BM * BN);
+         idx += uint(WM * WN * SIMD_SIZE)) {
+      const int r = int(idx) / BN;
+      const int c = int(idx) % BN;
+      const int64_t off = r * static_cast<int64_t>(row_stride) + c;
+      y[off] = static_cast<T>(float(y[off]) + float(residual[off]));
+    }
+  }
+}
+
+template <typename T, int group_size, int bits, int BM, int BK, int BN>
+[[kernel]] void affine_qmm_t_strided(
+    const device uint32_t* w   [[buffer(0)]],
+    const device T* scales     [[buffer(1)]],
+    const device T* biases     [[buffer(2)]],
+    const device T* x          [[buffer(3)]],
+    device T* y                [[buffer(4)]],
+    const constant int& K      [[buffer(5)]],
+    const constant int& N      [[buffer(6)]],
+    const constant int& row_stride [[buffer(8)]],
+    uint3 tid       [[threadgroup_position_in_grid]],
+    uint simd_gid   [[simdgroup_index_in_threadgroup]],
+    uint simd_lid   [[thread_index_in_simdgroup]]) {
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+  threadgroup T Xs[BM * BK_padded];
+  threadgroup T Ws[BN * BK_padded];
+  qmm_t_strided_impl<T, group_size, bits, BM, BK, BN, false>(
+      w, scales, biases, x, y, nullptr, Xs, Ws, K, N, row_stride,
+      tid, simd_gid, simd_lid);
+}
+
+template <typename T, int group_size, int bits, int BM, int BK, int BN>
+[[kernel]] void affine_qmm_t_strided_residual(
+    const device uint32_t* w   [[buffer(0)]],
+    const device T* scales     [[buffer(1)]],
+    const device T* biases     [[buffer(2)]],
+    const device T* x          [[buffer(3)]],
+    device T* y                [[buffer(4)]],
+    const constant int& K      [[buffer(5)]],
+    const constant int& N      [[buffer(6)]],
+    const device T* residual   [[buffer(7)]],
+    const constant int& row_stride [[buffer(8)]],
+    uint3 tid       [[threadgroup_position_in_grid]],
+    uint simd_gid   [[simdgroup_index_in_threadgroup]],
+    uint simd_lid   [[thread_index_in_simdgroup]]) {
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+  threadgroup T Xs[BM * BK_padded];
+  threadgroup T Ws[BN * BK_padded];
+  qmm_t_strided_impl<T, group_size, bits, BM, BK, BN, true>(
+      w, scales, biases, x, y, residual, Xs, Ws, K, N, row_stride,
+      tid, simd_gid, simd_lid);
+}
+
+#define instantiate_qmm_t_strided(bm, bk, bn)                                     \
+  template [[host_name("affine_qmm_t_strided_bfloat16_gs_64_b_4_bm_" #bm "_bn_" #bn)]] \
+  [[kernel]] void affine_qmm_t_strided<bfloat, 64, 4, bm, bk, bn>(                \
+      const device uint32_t*, const device bfloat*, const device bfloat*,         \
+      const device bfloat*, device bfloat*, const constant int&,                  \
+      const constant int&, const constant int&, uint3, uint, uint);               \
+  template [[host_name("affine_qmm_t_strided_residual_bfloat16_gs_64_b_4_bm_" #bm "_bn_" #bn)]] \
+  [[kernel]] void affine_qmm_t_strided_residual<bfloat, 64, 4, bm, bk, bn>(       \
+      const device uint32_t*, const device bfloat*, const device bfloat*,         \
+      const device bfloat*, device bfloat*, const constant int&,                  \
+      const constant int&, const device bfloat*, const constant int&,             \
+      uint3, uint, uint);
+
+instantiate_qmm_t_strided(16, 32, 32)

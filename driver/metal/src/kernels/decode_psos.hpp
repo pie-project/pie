@@ -47,6 +47,11 @@ struct MultiBatchPsos {
     // BN=32, [1] is BN=64. Selected only above `kQmmMinBatch`.
     Pso qmm_t[2]{};
     Pso qmm_t_residual[2]{};
+    // affine_qmm_t_strided: the same GEMM with an explicit row pitch, for the
+    // prefill, whose scratch rows are laid at a uniform `scratch_widest_elems`
+    // rather than packed at `K`.
+    Pso qmm_t_strided{};
+    Pso qmm_t_strided_residual{};
     bool valid() const {
         return embed_mb.valid() && rope_mb.valid() && gdn_slotted.valid() &&
                gdn_prep_slotted.valid() &&

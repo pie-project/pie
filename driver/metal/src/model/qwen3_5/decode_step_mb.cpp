@@ -22,7 +22,9 @@ Kernel mb_kind(Kernel k) {
     }
 }
 
-int qmv_out(Kernel k, const DecodeGeometry& g) {
+}  // namespace
+
+int qmv_out_size(Kernel k, const DecodeGeometry& g) {
     switch (k) {
         case Kernel::QmvIn: return g.gdn_conv_dim;
         case Kernel::QmvInZ: return g.gdn_v_total;
@@ -39,9 +41,11 @@ int qmv_out(Kernel k, const DecodeGeometry& g) {
     }
 }
 
+namespace {
+
 void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
     auto rms = [&](int row, int rows) { rms_mb_dispatch(row, rows, n, d.grid, d.tg); };
-    if (const int out = qmv_out(d.kind, g); out != 0) {
+    if (const int out = qmv_out_size(d.kind, g); out != 0) {
         d.qmm_bn = qmm_bn(out, n);
         if (d.qmm_bn > 0)
             qmm_t_dispatch(out, n, d.qmm_bn, d.grid, d.tg);
@@ -352,7 +356,9 @@ void encode_prefill_dags_mb(StepEncoder& se,
                             const DecodeStepPsos& base_psos,
                             const MultiBatchPsos& mb_psos,
                             bool force_barriers,
-                            const std::vector<std::uint8_t>& row_needs_logits) {
+                            const std::vector<std::uint8_t>& row_needs_logits,
+                            const DecodeGeometry* geometry,
+                            int max_rows) {
     const size_t n = n_tokens > 0 ? size_t(n_tokens) : 0;
     if (n == 0 || dags.size() < n) return;
     const size_t length = dags[0].size();
@@ -372,7 +378,32 @@ void encode_prefill_dags_mb(StepEncoder& se,
     // far past any cache -- so running it for a prompt row nobody samples is the
     // single most expensive wasted dispatch in a prefill.
     const bool skip_unsampled_logits = row_needs_logits.size() >= n;
+    // A projection does not depend on any other token's row, so the whole prompt
+    // can go through the GEMM in one dispatch instead of one GEMV per token --
+    // which is what turns N reads of the checkpoint into one. lm_head is left
+    // out: it writes the logits buffer, whose rows are the fire's readout rows
+    // and are not padded, and it already runs only for sampled rows.
+    const int strided_rows =
+        geometry != nullptr ? qmm_strided_rows(int(n), max_rows) : 0;
     for (size_t i = 0; i < length; ++i) {
+        const Dispatch& d0 = dags[0][i];
+        if (strided_rows > 0 && d0.kind != Kernel::QmvLmHead) {
+            const int out = qmv_out_size(d0.kind, *geometry);
+            if (out != 0 && out % 32 == 0) {
+                const Pso& gemm = d0.fuse_residual ? mb_psos.qmm_t_strided_residual
+                                                   : mb_psos.qmm_t_strided;
+                if (gemm.valid()) {
+                    Grid grid;
+                    Threadgroup tg;
+                    qmm_t_strided_dispatch(out, strided_rows, grid, tg);
+                    se.set_pso(gemm);
+                    se.set_argtable(d0.kind, d0.ordinal);
+                    se.dispatch(grid, tg);
+                    se.barrier();
+                    continue;
+                }
+            }
+        }
         const bool serialize = carries_cross_token_state(dags[0][i].kind);
         const bool logits_tail = skip_unsampled_logits && produces_logits(dags[0][i].kind);
         for (size_t t = 0; t < n; ++t) {

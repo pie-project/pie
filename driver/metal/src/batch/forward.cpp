@@ -525,6 +525,9 @@ struct MetalExecutor::Impl {
     std::uint64_t paged_bind_generation_ = 0;
     SlotHandle ptir_logits_{};
     SlotHandle ptir_logits_copy_params_{};
+    // The prefill's uniform scratch row pitch, in elements, for the batched
+    // projection (`affine_qmm_t_strided` reads it at buffer 8).
+    SlotHandle prefill_row_stride_{};
     Pso ptir_logits_copy_pso_{};
     std::uint32_t ptir_logits_capacity_rows_ = 0;
     std::uint32_t ptir_logits_next_row_ = 0;
@@ -766,6 +769,11 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
     ptir_logits_copy_params_ =
         ctx_->create_standalone_buffer(
             sizeof(PtirLogitsCopyParams) * kPtirLogitsCopyMaxRows);
+    prefill_row_stride_ = ctx_->create_standalone_buffer(sizeof(std::int32_t));
+    if (prefill_row_stride_.valid()) {
+        *static_cast<std::int32_t*>(prefill_row_stride_.contents()) =
+            static_cast<std::int32_t>(scratch_widest_elems(g_));
+    }
     if (!ptir_logits_copy_pso_.valid() ||
         !ptir_logits_copy_params_.valid() ||
         !ensure_ptir_logits_rows(1, &load_err)) {
@@ -1118,6 +1126,15 @@ bool MetalExecutor::Impl::bind_paged_dag(std::string* err) {
                 bind_scratch(*ctx_, prefill_dags_[t], prefill_sched_, pool_.data(),
                              int(pool_.size()), t * prefill_scratch_row);
                 bind_decode_consts(*ctx_, prefill_dags_[t], g_, max_ctx_, gdn_prep_);
+            }
+            // The batched projection runs off token 0's argument tables -- they
+            // already point at row 0 of every scratch tensor -- and walks the
+            // rest of the prompt with this pitch.
+            if (prefill_row_stride_.valid() && !prefill_dags_.empty()) {
+                for (const Dispatch& d : prefill_dags_[0]) {
+                    if (qmv_out_size(d.kind, g_) == 0) continue;
+                    ctx_->arg_bind_ordinal(d.ordinal, 8, prefill_row_stride_);
+                }
             }
             mb_bound_ = true;
         }
@@ -1670,7 +1687,8 @@ bool MetalExecutor::Impl::run_prefill_step(
                 if (callbacks.pre_forward) callbacks.pre_forward(se);
         }
         encode_prefill_dags_mb(se, prefill_dags_, schedule.N, psos_, mb_psos_,
-                               force_barriers_, in.row_needs_logits);
+                               force_barriers_, in.row_needs_logits, &g_,
+                               int(prefill_dags_.size()));
         if (ptir != nullptr) {
             for (const auto& callbacks : *ptir)
                 if (callbacks.post_forward) callbacks.post_forward(se);

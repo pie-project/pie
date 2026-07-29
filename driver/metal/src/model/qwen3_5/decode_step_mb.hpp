@@ -22,6 +22,9 @@ struct MbBindOffsets {
     size_t logits_bytes = 0;
 };
 
+// Output width of a projection kernel, or 0 if the kind is not one.
+int qmv_out_size(Kernel k, const DecodeGeometry& g);
+
 std::size_t paged_attention_mask_pitch_bytes(
     const DecodeGeometry& geometry);
 bool paged_pool_size_supported(
@@ -57,7 +60,9 @@ void encode_prefill_dags_mb(StepEncoder& se,
                             const DecodeStepPsos& base_psos,
                             const MultiBatchPsos& mb_psos,
                             bool force_barriers,
-                            const std::vector<std::uint8_t>& row_needs_logits = {});
+                            const std::vector<std::uint8_t>& row_needs_logits = {},
+                            const DecodeGeometry* geometry = nullptr,
+                            int max_rows = 0);
 
 void encode_decode_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
                            const DecodeStepPsos& base_psos, const MultiBatchPsos& mb_psos,

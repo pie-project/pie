@@ -48,6 +48,22 @@ inline int qmm_bn(int out_vec, int N) {
 // `out/BN` threadgroups across the output, `M/BM` across the batch, each
 // 32x2x2 = 128 threads (WM=WN=2 simdgroups), which is the shape steel's
 // BlockMMA is written for.
+// The prefill's batched projection. Rows are padded up to a whole BM tile: the
+// scratch pool holds `max_tokens` rows and the tail rows land in ones the fire
+// does not use, so the padding computes discardable values rather than needing
+// a bounds-checked inner loop.
+inline int qmm_strided_rows(int N, int max_rows) {
+    const int padded = ((N + kQmmBM - 1) / kQmmBM) * kQmmBM;
+    return padded <= max_rows ? padded : 0;
+}
+
+inline void qmm_t_strided_dispatch(int out_vec, int padded_rows, Grid& g,
+                                   Threadgroup& tg) {
+    g  = Grid{32u * (uint32_t(out_vec) / 32u),
+              2u * (uint32_t(padded_rows) / uint32_t(kQmmBM)), 2};
+    tg = Threadgroup{32, 2, 2};
+}
+
 inline void qmm_t_dispatch(int out_vec, int N, int bn, Grid& g, Threadgroup& tg) {
     g  = Grid{32u * (uint32_t(out_vec) / uint32_t(bn)),
               2u * (uint32_t(N) / uint32_t(kQmmBM)), 2};
