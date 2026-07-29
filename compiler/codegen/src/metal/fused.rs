@@ -29,18 +29,6 @@ fn value_ptr(value: u32) -> String {
     format!("scratch + offsets[{value}]")
 }
 
-/// Follow a chain of elided reshapes to the value that actually holds the bytes.
-fn resolve_alias(alias: &BTreeMap<u32, u32>, mut value: u32) -> u32 {
-    // The chain is acyclic (SSA), but bound the walk anyway.
-    for _ in 0..64 {
-        match alias.get(&value) {
-            Some(&source) => value = source,
-            None => break,
-        }
-    }
-    value
-}
-
 /// Threads a grouped region's threadgroup gets per lane. The emitted kernel
 /// sizes its threadgroup reduction buffer to this; the driver launches the
 /// narrower of it and the pipeline's own maxTotalThreadsPerThreadgroup, and
@@ -280,12 +268,12 @@ pub fn emit_grouped_fused_region(
             && !escapes.contains(&bases[node])
             && covers(op.args[0], bases[node])
     };
-    let mut alias: BTreeMap<u32, u32> = BTreeMap::new();
+    let mut alias = crate::alias::AliasTable::new();
     for &node in &region.nodes {
         let node = node.index();
         if is_view_reshape(node) {
             let arg = ops[node].args[0];
-            alias.insert(bases[node], resolve_alias(&alias, arg));
+            alias.elide(bases[node], arg);
         }
     }
 
@@ -299,7 +287,7 @@ pub fn emit_grouped_fused_region(
         }
         if let Some(op) = ops.get(node.index()) {
             for &arg in &op.args {
-                *consumers.entry(resolve_alias(&alias, arg)).or_insert(0) += 1;
+                *consumers.entry(alias.resolve(arg)).or_insert(0) += 1;
             }
         }
     }
@@ -311,7 +299,7 @@ pub fn emit_grouped_fused_region(
         if op.tag != tags::REDUCE_ARGMAX || op.args.len() != 1 {
             continue;
         }
-        let source_value = resolve_alias(&alias, op.args[0]);
+        let source_value = alias.resolve(op.args[0]);
         if consumers.get(&source_value).copied().unwrap_or(0) != 1
             || escapes.contains(&source_value)
         {
@@ -341,7 +329,7 @@ pub fn emit_grouped_fused_region(
             continue;
         }
         if let Some(&producer) = fused_argmax.get(&node) {
-            let slots = Slots::of(op, base, |value| value_ptr(resolve_alias(&alias, value)));
+            let slots = Slots::of(op, base, |value| value_ptr(alias.resolve(value)));
             emit_logits_argmax(
                 &mut source,
                 bases[producer],
@@ -355,7 +343,7 @@ pub fn emit_grouped_fused_region(
         if is_view_reshape(node) {
             continue;
         }
-        let mut slots = Slots::of(op, base, |value| value_ptr(resolve_alias(&alias, value)));
+        let mut slots = Slots::of(op, base, |value| value_ptr(alias.resolve(value)));
         if op.tag == tags::INTRINSIC_VAL && op.intr == intrinsic_tags::MTP_DRAFTS {
             emit_mtp_drafts(&mut source, base, &slots.o0);
             source.push_str(BARRIER);

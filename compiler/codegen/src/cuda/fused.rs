@@ -242,13 +242,6 @@ pub(crate) fn analyze_direct_argmax(
     analysis
 }
 
-fn resolve_alias(aliases: &[u32], mut value: u32) -> u32 {
-    while aliases[value as usize] != value {
-        value = aliases[value as usize];
-    }
-    value
-}
-
 /// `emit_fused_region_cuda`.
 pub fn emit_fused_region(
     entry_name: &str,
@@ -269,7 +262,7 @@ pub fn emit_fused_region(
         ));
     }
 
-    let mut aliases: Vec<u32> = (0..next_value).collect();
+    let mut aliases = crate::alias::AliasTable::new();
     let direct = analyze_direct_argmax(stage, region, &bases);
     let mut skipped = direct.skipped;
 
@@ -387,14 +380,14 @@ pub fn emit_fused_region(
             && !region.outputs.contains(&base)
             && crate::alias::covers(&stage.normalized.value_types, op.args[0], base)
         {
-            aliases[base as usize] = resolve_alias(&aliases, op.args[0]);
+            aliases.elide(base, op.args[0]);
             continue;
         }
 
         // CUDA resolves reshape aliases before indexing the offsets table;
         // which value lands in which slot is shared with Metal.
         let mut slots = Slots::of(op, base, |value| {
-            format!("scratch + offsets[{}]", resolve_alias(&aliases, value))
+            format!("scratch + offsets[{}]", aliases.resolve(value))
         });
 
         source.push_str("  {\n");

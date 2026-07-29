@@ -14,12 +14,68 @@
 //! view" has one answer rather than one per backend.
 //!
 //! The other condition is a boundary question, and the two backends legitimately
-//! answer it differently — see [`escaping_values`].
+//! answer it differently — see [`escaping_values`]. Once a reshape is elided,
+//! [`AliasTable`] is what carries that decision to every consumer.
 
-use alloc::collections::BTreeSet;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
 use pie_plan::{Dimension, Region, SymbolicType};
+
+/// Which value's bytes each elided reshape's consumers should read instead.
+///
+/// Both fused emitters build one of these while deciding elisions, then resolve
+/// every operand through it before emitting. Sharing the type is what keeps
+/// "elided" meaning the same thing on both backends; the emitters still decide
+/// *which* reshapes to elide themselves, because [`escaping_values`] documents
+/// a boundary they answer differently.
+///
+/// [`Self::resolve`] walks, rather than reading a single entry, because
+/// nothing here constrains the order elisions are recorded in: recording
+/// `b -> c` after `a -> b` leaves `a` one hop short. The walk is bounded by the
+/// number of entries, which is a termination proof rather than a guess — a
+/// chain that took more steps than there are entries would have to revisit one,
+/// and a revisited entry is a cycle. SSA makes cycles unreachable, so the bound
+/// is never hit; it exists so that a future caller who breaks that assumption
+/// gets a wrong answer in a debug build instead of a hang in production.
+#[derive(Debug, Default, Clone)]
+pub struct AliasTable {
+    of: BTreeMap<u32, u32>,
+}
+
+impl AliasTable {
+    /// An empty table: every value holds its own bytes.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record that `result` was elided and its consumers should read `source`.
+    pub fn elide(&mut self, result: u32, source: u32) {
+        let source = self.resolve(source);
+        self.of.insert(result, source);
+    }
+
+    /// The value that actually holds `value`'s bytes — `value` itself unless it
+    /// was elided.
+    pub fn resolve(&self, mut value: u32) -> u32 {
+        for _ in 0..self.of.len() {
+            match self.of.get(&value) {
+                Some(&source) => value = source,
+                None => return value,
+            }
+        }
+        debug_assert!(
+            !self.of.contains_key(&value),
+            "alias chain from {value} outlived the table; the aliases form a cycle"
+        );
+        value
+    }
+
+    /// Whether `value` was elided, and so is not written by any emitted node.
+    pub fn is_elided(&self, value: u32) -> bool {
+        self.of.contains_key(&value)
+    }
+}
 
 /// The values `metal::fused` refuses to elide: this region's outputs and sinks.
 ///
@@ -113,6 +169,42 @@ mod tests {
             dtype,
             dims: dims.to_vec(),
         }
+    }
+
+    #[test]
+    fn an_untouched_value_holds_its_own_bytes() {
+        let mut table = AliasTable::new();
+        assert_eq!(table.resolve(7), 7);
+        assert!(!table.is_elided(7));
+        table.elide(3, 1);
+        assert_eq!(table.resolve(7), 7);
+    }
+
+    #[test]
+    fn eliding_points_consumers_at_the_source() {
+        let mut table = AliasTable::new();
+        table.elide(4, 2);
+        assert_eq!(table.resolve(4), 2);
+        assert!(table.is_elided(4));
+        assert!(!table.is_elided(2));
+    }
+
+    #[test]
+    fn a_chain_resolves_whichever_order_it_was_recorded_in() {
+        // Recorded source-first, the second `elide` already sees a root.
+        let mut forward = AliasTable::new();
+        forward.elide(2, 1);
+        forward.elide(3, 2);
+
+        // Recorded result-first, `3 -> 2` is one hop short until the walk runs.
+        // Both emitters visit region nodes in an order this module does not
+        // constrain, so the two must agree.
+        let mut backward = AliasTable::new();
+        backward.elide(3, 2);
+        backward.elide(2, 1);
+
+        assert_eq!(forward.resolve(3), 1);
+        assert_eq!(backward.resolve(3), 1);
     }
 
     /// Index 0 is the sampler's source, 1 its result, 2 the reverse reshape's

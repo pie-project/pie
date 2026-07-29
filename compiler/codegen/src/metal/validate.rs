@@ -9,14 +9,15 @@
 //! ([`Op`](pie_ir::op::Op) only names known tags).
 
 use crate::error::{EmitError, RegionForm, ValueLayoutSite};
+use crate::wellformed::{region_ranges_valid, value_types_valid};
 use alloc::string::String;
 use alloc::vec::Vec;
 
 use pie_ir::op::{OP_TABLE, VARIADIC, intrinsic_tags, tags};
-use pie_ir::types::{DType, MAX_RANK};
+use pie_ir::types::DType;
 use pie_plan::{
     CompiledStage, Dimension, LibraryOp, PartitionKind, Region, RegionKind, RegionPartition,
-    ScheduleTemplate, SymbolicType,
+    ScheduleTemplate,
 };
 
 use super::M1OpMeta;
@@ -171,55 +172,11 @@ pub fn used_channel_slots(ops: &[OpView]) -> usize {
     count
 }
 
-fn value_type_valid(value_type: &SymbolicType) -> Result<(), EmitError> {
-    if value_type.dims.len() > MAX_RANK {
-        return Err(EmitError::NormalizedValueTypeInvalid);
-    }
-    let mut product: u64 = 1;
-    for dimension in &value_type.dims {
-        let Dimension::Static(extent) = *dimension else {
-            continue;
-        };
-        if extent == 0 || product > u64::from(u32::MAX) / u64::from(extent) {
-            return Err(EmitError::NormalizedValueShapeOverflow);
-        }
-        product *= u64::from(extent);
-    }
-    Ok(())
-}
-
+/// Well-formedness, plus the one rule that is Metal's own: a library region
+/// must match the ABI of the tier-0 kernel this backend will dispatch for it.
 fn partition_valid(stage: &CompiledStage, partition: &RegionPartition) -> Result<(), EmitError> {
-    let ops = &stage.normalized.ops;
-    let value_types = &stage.normalized.value_types;
-    let channel_bindings = &stage.normalized.channel_bindings;
     for region in &partition.regions {
-        if region.nodes.iter().any(|node| node.index() >= ops.len()) {
-            return Err(EmitError::RegionNodeOutOfRange(RegionForm::Unnamed));
-        }
-        if region.nodes.windows(2).any(|pair| pair[0] >= pair[1]) {
-            return Err(EmitError::RegionNodesUnordered(RegionForm::Unnamed));
-        }
-        if region
-            .inputs
-            .iter()
-            .any(|value| *value as usize >= value_types.len())
-        {
-            return Err(EmitError::RegionInputOutOfRange);
-        }
-        if region
-            .outputs
-            .iter()
-            .any(|value| *value as usize >= value_types.len())
-        {
-            return Err(EmitError::RegionOutputOutOfRange);
-        }
-        for sink in &region.sinks {
-            if sink.channel_slot as usize >= channel_bindings.len()
-                || sink.value as usize >= value_types.len()
-            {
-                return Err(EmitError::RegionSinkOutOfRange);
-            }
-        }
+        region_ranges_valid(stage, region, RegionForm::Unnamed)?;
         if !library_region_valid(stage, region) {
             return Err(EmitError::LibraryRegionAbiInvalid(RegionForm::Unnamed));
         }
@@ -261,9 +218,7 @@ fn validate_into(stage: &CompiledStage, operations: &mut Vec<M1OpMeta>) -> Resul
     {
         return Err(EmitError::SingletonPlanIdentityInvalid);
     }
-    for value_type in value_types {
-        value_type_valid(value_type)?;
-    }
+    value_types_valid(stage)?;
     partition_valid(stage, &stage.singleton)?;
     partition_valid(stage, &stage.fused)?;
 

@@ -28,6 +28,10 @@
 //! loop. Supporting them:
 //!
 //! * [`op_view`] — a decoded, borrow-free view of a normalized op.
+//! * [`wellformed`] — what a plan must satisfy before *either* backend emits
+//!   from it, so that "well formed" cannot mean two things.
+//! * [`alias`] — when a reshape may be elided and its consumers pointed at its
+//!   source, and the table that carries that decision.
 //! * [`launch`] — the launch descriptors the drivers execute.
 //! * [`program`] — the whole-program bundle handed across the C ABI.
 //!
@@ -61,3 +65,4 @@ pub mod rng;
 #[cfg(test)]
 mod runtime_scan;
 pub mod slots;
+pub mod wellformed;
