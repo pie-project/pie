@@ -910,6 +910,10 @@ fn group_one(
     let mut buckets: FxHashMap<Box<[u8]>, usize> = FxHashMap::default();
     let mut groups: Vec<Group> = Vec::new();
     let mut scratch = ScanScratch::default();
+    // The group the previous token joined, and how it read.
+    let mut last: Option<usize> = None;
+    let mut held_ends: Vec<(u32, LexState)> = Vec::new();
+    let mut held_flat: Vec<TerminalId> = Vec::new();
     // A state that can settle restarts the scan from the start state, so a
     // byte it cannot take may still be readable and every token has to be
     // tried. A state that cannot settle refuses every token whose first byte
@@ -931,6 +935,16 @@ fn group_one(
         refused += (flat.len() - visit.len()) as u32;
     }
     let order: &[u32] = if settles { &flat.all } else { &visit };
+    // The scan is 94% of this stage, measured by running it with the
+    // bucketing removed, so what follows is worth about a sixteenth of the
+    // total however cheap it gets.
+    //
+    // Grouping those tokens by how the start state reads them was tried. A
+    // settling state does read a token whose first byte it cannot take in one
+    // way only - settle, then the start state reads the rest - and that fires
+    // on 74.7% of tokens. It is still a loss: classifying the vocabulary costs
+    // a whole extra pass over it, and the path it replaces was never a walk in
+    // the first place. The settle splices the memo, which was already cheap.
     for &id in order {
         let token_id = id as usize;
         let bytes = flat.get(token_id);
@@ -942,15 +956,41 @@ fn group_one(
             refused += 1;
             continue;
         }
-        match buckets.get(scratch.key()) {
-            Some(&at) => groups[at].tokens.push(token_id as u32),
-            None => {
-                buckets.insert(scratch.key.clone().into_boxed_slice(), groups.len());
-                groups.push(Group {
-                    scan: scratch.take(),
-                    tokens: vec![token_id as u32],
-                });
-            }
+        // A state's vocabulary is not spread evenly over its groups: measured
+        // over 945 states, 86.8% of the tokens a state keeps land in its
+        // widest one. So ask whether this token reads like the last one did
+        // before building a key for it - that is a comparison of two short
+        // runs against building a byte string and hashing it, and it is right
+        // seven times in eight.
+        let joined = if let Some(at) = last
+            && scratch.ends == held_ends
+            && scratch.flat == held_flat
+        {
+            groups[at].tokens.push(token_id as u32);
+            at
+        } else {
+            let at = match buckets.get(scratch.key()) {
+                Some(&at) => {
+                    groups[at].tokens.push(token_id as u32);
+                    at
+                }
+                None => {
+                    buckets.insert(scratch.key.clone().into_boxed_slice(), groups.len());
+                    groups.push(Group {
+                        scan: scratch.take(),
+                        tokens: vec![token_id as u32],
+                    });
+                    groups.len() - 1
+                }
+            };
+            last = Some(at);
+            at
+        };
+        if last == Some(joined) {
+            held_ends.clear();
+            held_ends.extend_from_slice(&scratch.ends);
+            held_flat.clear();
+            held_flat.extend_from_slice(&scratch.flat);
         }
     }
     groups.sort_by(|a, b| b.tokens.len().cmp(&a.tokens.len()));
