@@ -378,40 +378,120 @@ fn bound_rs_working_set_ids<C: FireContext>(
     Ok(Ok(ids))
 }
 
-/// Resolve the pass's declared RS mode into the per-row plan the lowering
-/// needs: a buffered write covers each row's own token span, and a fold
-/// replays the lengths the guest supplied.
+/// Resolve the fire's `rs-geometry.fold-len` into the per-row plan the
+/// lowering needs.
+///
+/// `fold-len` says where each request's folded boundary lands, counted from
+/// the current boundary over `[buffer | this fire's tokens]`. That single
+/// scalar subsumes the three fold-mode methods this replaced:
+///
+/// | `fold_len` | buffer | plan                      |
+/// |------------|--------|---------------------------|
+/// | `> 0`      | empty  | `Fold` — the fast path    |
+/// | `0`        | any    | `Buffer` — append at tail |
+/// | `0 < n <= B` | non-empty | `FoldBuffered` — commit |
+///
+/// `fold-len` is CLAMPED to `B + T`, so "fold everything" is the fire-invariant
+/// constant `u32::MAX` — the SDK's default — rather than a value the guest
+/// would have to recompute from each fire's token count.
+///
+/// The remaining positions are expressible in the surface but not yet in the
+/// driver: any boundary at or beyond the buffer tail while the buffer is
+/// non-empty requires the recurrence to READ the buffer, which it cannot do
+/// today (see `.wiki/designs/linear-state-programming-model.md` §2). Those are
+/// errors rather than silent approximations, because approximating a fold in
+/// either direction is unrecoverable: folding early destroys tokens the guest
+/// still wanted, and folding late silently drops them from the context.
 fn rs_plan_for(
-    mode: &crate::pipeline::instance::RsMode,
-    rows: usize,
+    fold_len: &[u32],
+    stores: &crate::store::registry::Stores,
+    ids: &[crate::store::rs::RsWorkingSetId],
     qo_indptr: &[u32],
 ) -> Result<rs::RsPlan, String> {
-    use crate::pipeline::instance::RsMode;
-    Ok(match mode {
-        RsMode::Fold => rs::RsPlan::Fold,
-        RsMode::Buffer { start_token } => rs::RsPlan::Buffer {
-            start_token: *start_token,
-            row_tokens: (0..rows)
-                .map(|row| {
-                    qo_indptr
-                        .get(row + 1)
-                        .zip(qo_indptr.get(row))
-                        .map(|(end, start)| end.saturating_sub(*start))
-                        .unwrap_or(0)
-                })
-                .collect(),
-        },
-        RsMode::FoldBuffered { tokens } => {
-            if tokens.len() != rows {
+    let rows = ids.len();
+    if rows == 0 {
+        return Ok(rs::RsPlan::Fold);
+    }
+    if fold_len.len() != rows {
+        return Err(format!(
+            "rs-geometry.fold-len supplied {} length(s) for {rows} request row(s)",
+            fold_len.len()
+        ));
+    }
+    let row_tokens: Vec<u32> = (0..rows)
+        .map(|row| {
+            qo_indptr
+                .get(row + 1)
+                .zip(qo_indptr.get(row))
+                .map(|(end, start)| end.saturating_sub(*start))
+                .unwrap_or(0)
+        })
+        .collect();
+    // Buffer occupancy in TOKENS, as an upper bound: the store tracks buffered
+    // PAGES, and the live token count rides on `rs-geometry.buffer-len`, which
+    // is a channel the host may not be able to read. An upper bound is all the
+    // classification below needs — it only ever asks whether the buffer is
+    // empty, and whether a boundary lands inside it.
+    let page_tokens = pie_model::model().rs_caps().buffer_page_size.max(1);
+    let buffered: Vec<u32> = {
+        let store = stores.rs.lock().unwrap();
+        ids.iter()
+            .map(|id| store.buffer_size(*id).unwrap_or(0).saturating_mul(page_tokens))
+            .collect()
+    };
+
+    // The plan is per-pass, not per-row, so every row must land in the same
+    // position. Classify row 0 and require the rest to agree — a mixed batch
+    // is a real use case (one request commits while another speculates) but it
+    // needs the driver-side read path, so refuse it explicitly.
+    #[derive(PartialEq, Eq, Debug)]
+    enum Position {
+        Fold,
+        Buffer,
+        Commit,
+    }
+    let mut position: Option<Position> = None;
+    for row in 0..rows {
+        let (b, t) = (buffered[row], row_tokens[row]);
+        let n = fold_len[row].min(b + t);
+        let here = if n == 0 {
+            Position::Buffer
+        } else if n == b + t {
+            if b != 0 {
                 return Err(format!(
-                    "fold-buffered supplied {} length(s) for {rows} request row(s)",
-                    tokens.len()
+                    "request row {row} folds through a non-empty buffer ({b} buffered token(s));                      the recurrence cannot read the buffer yet, so fold and buffer in separate                      fires"
                 ));
             }
-            rs::RsPlan::FoldBuffered {
-                tokens: tokens.clone(),
+            Position::Fold
+        } else if n <= b {
+            Position::Commit
+        } else {
+            return Err(format!(
+                "request row {row} folds {n} token(s) over a {b}-token buffer plus {t} new                  token(s); a boundary inside the new tokens requires the buffer read path"
+            ));
+        };
+        match &position {
+            None => position = Some(here),
+            Some(seen) if *seen == here => {}
+            Some(seen) => {
+                return Err(format!(
+                    "request row {row} lands the folded boundary at {here:?} while an earlier row                      lands it at {seen:?}; a fire folds uniformly today"
+                ));
             }
         }
+    }
+
+    Ok(match position.expect("rows > 0") {
+        Position::Fold => rs::RsPlan::Fold,
+        Position::Buffer => rs::RsPlan::Buffer {
+            // New tokens always append at the buffer tail; the runtime owns
+            // that cursor, so the guest no longer states it.
+            start_token: buffered[0],
+            row_tokens,
+        },
+        Position::Commit => rs::RsPlan::FoldBuffered {
+            tokens: fold_len.to_vec(),
+        },
     })
 }
 
@@ -871,7 +951,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             cells,
             ws_rep,
             rs_reps,
-            rs_mode,
+            rs_fold_len,
             kv_declaration,
             kv_declaration_realized,
             fwd_rep,
@@ -951,7 +1031,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 p.cells.clone(),
                 p.kv_ws,
                 p.rs_ws.clone(),
-                p.rs_mode.clone(),
+                p.rs_fold_len.clone(),
                 p.kv_declaration,
                 p.kv_declaration_realized,
                 fwd.rep(),
@@ -1040,7 +1120,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             Ok(ids) => ids,
             Err(error) => return Ok(Err(error)),
         };
-        let rs_plan = match rs_plan_for(&rs_mode, rs_reps.len(), &req.qo_indptr) {
+        let rs_plan = match rs_plan_for(&rs_fold_len, &stores, &rs_ws_ids, &req.qo_indptr) {
             Ok(plan) => plan,
             Err(error) => {
                 return Ok(Err(format!("pipeline: recurrent-state mode: {error}")));
@@ -1976,9 +2056,9 @@ async fn fire_device_geometry<C: FireContext>(
     // order), so a recurrent-state device-geometry pass runs ahead too.
     let timing_enabled = ctx.fire_timing_requested();
 
-    let (ws_rep, rs_reps, rs_mode) = {
+    let (ws_rep, rs_reps, rs_fold_len) = {
         let pass = ctx.resources().get(&fwd)?;
-        (pass.kv_ws, pass.rs_ws.clone(), pass.rs_mode.clone())
+        (pass.kv_ws, pass.rs_ws.clone(), pass.rs_fold_len.clone())
     };
     let ws_res: Resource<KvWorkingSet> = Resource::new_borrow(ws_rep);
     let ws = ctx.resources().get(&ws_res)?.clone();
@@ -2109,7 +2189,7 @@ async fn fire_device_geometry<C: FireContext>(
                 "pipeline: KV demand exceeds the planner ABI".to_string()
             ));
         };
-        let rs_plan = match rs_plan_for(&rs_mode, rs_reps.len(), &resolved_qo_indptr) {
+        let rs_plan = match rs_plan_for(&rs_fold_len, &stores, &rs_ws_ids, &resolved_qo_indptr) {
             Ok(plan) => plan,
             Err(error) => {
                 reclaim_pending_device_grant(ctx, &fwd);

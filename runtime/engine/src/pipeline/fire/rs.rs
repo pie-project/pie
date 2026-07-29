@@ -66,7 +66,9 @@ pub fn validate_count(
 
 /// What a pass does with the recurrent state of its bound working sets, with
 /// the per-row token counts the lowering needs resolved from the fire's
-/// geometry. The host-side mirror of WIT `rs-mode` at prepare time.
+/// geometry. Derived from WIT `rs-geometry.fold-len` at prepare time by
+/// `super::rs_plan_for` — a position for the folded boundary, classified into
+/// the three shapes the driver implements.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RsPlan {
     /// Advance the folded state in-forward over every row.

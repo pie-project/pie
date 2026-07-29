@@ -62,42 +62,63 @@ interface forward-hybrid {
         mask:        option<borrow<channel>>,
     }
 
-    /// The recurrent counterpart of `kv-geometry`: the BUFFERED slots of the
-    /// bound recurrent-state working sets. Every channel value is a
-    /// WorkingSet-relative buffer page index; the runtime translates them to
-    /// physical slots and lowers them as the `rs_buffer_slot_ids` /
-    /// `rs_buffer_slot_indptr` wire fields.
+    /// The recurrent counterpart of `kv-geometry`: where this fire's recurrent
+    /// state lives, and where its folded boundary lands.
     ///
-    /// The FOLDED state slot is not named here -- it comes from the
-    /// working-set handle itself.
+    /// A linear model's context is TWO adjacent spans -- a compressed, frozen
+    /// folded prefix `[0, F)` and an uncompressed, mutable buffer `[F, F+B)`
+    /// holding each token's pre-recurrence activations. Reading the state means
+    /// starting from the folded prefix and scanning the buffer; `fold` just
+    /// moves `F` right. Folding is therefore semantically a NO-OP -- it trades
+    /// optionality for memory and compute, and is legal exactly when the tokens
+    /// it absorbs will never be modified again. Only the guest knows that,
+    /// which is why this is an API rather than a runtime heuristic.
     ///
-    /// It is REQUIRED by `buffer` and `fold-buffered`, and does not appear on
-    /// `attention` or `fold` at all. Hanging it off the state binding would
-    /// have forced a plain `fold` prefill/decode -- which never touches the
-    /// buffer -- to invent one, which is exactly the mandatory-dummy-geometry
-    /// wart this refactor exists to remove. Attaching it to the two methods
-    /// that actually read it makes it unconditional where it is meaningful and
-    /// absent where it is not.
+    /// Every buffer channel value is a WorkingSet-relative buffer page index;
+    /// the runtime translates them to physical slots and lowers them as the
+    /// `rs_buffer_slot_ids` / `rs_buffer_slot_indptr` wire fields. The FOLDED
+    /// state slot is not named here -- it comes from the working-set handle.
+    ///
+    /// This rides on the STATE BINDING, not on a fold-mode method: once the
+    /// buffer is understood as half the state, its addressing is an input to
+    /// the recurrence itself, needed by every fire rather than by two of them.
+    /// A plain prefill names an empty buffer and a full `fold-len`, which is
+    /// degenerate but meaningful -- not the dummy geometry this refactor
+    /// exists to delete.
     record rs-geometry {
-        /// Buffer page range a `fold-buffered` replay may read.
+        /// How far the folded boundary advances, per request -- the twin of
+        /// `kv-geometry.kv-len`. Counted over the concatenation
+        /// `[buffer | this fire's tokens]`, so `0` buffers everything and
+        /// `buffer-len + fire tokens` folds everything. CLAMPED to that tail,
+        /// which is what lets "fold everything" be a fire-invariant constant
+        /// (`u32::MAX`) even though the token count varies per fire.
+        ///
+        /// A CHANNEL rather than a scalar because a speculative decode
+        /// computes its accepted count ON DEVICE: as a channel the verify and
+        /// the commit fuse into one fire, instead of the guest round-tripping
+        /// the count through the host first. `kv-len` is already permitted to
+        /// be device-resident in exactly this way.
+        fold-len:        borrow<channel>,
+        /// Buffer page range the replay may read.
         readable-buffer: page-span,
-        /// Buffer page range a `buffer` write may target.
+        /// Buffer page range an append may target.
         writable-buffer: page-span,
         /// Live buffered token count per request.
-        buffer-len:    borrow<channel>,
+        buffer-len:      borrow<channel>,
         /// CSR values -- buffer page ids, densely packed per request.
-        buffer-pages:  borrow<channel>,
+        buffer-pages:    borrow<channel>,
         /// CSR row bounds, one entry per request plus one.
-        buffer-indptr: borrow<channel>,
+        buffer-indptr:   borrow<channel>,
         /// Buffer page each token of this fire writes into.
-        w-slot:        borrow<channel>,
+        w-slot:          borrow<channel>,
         /// Offset within that page.
-        w-off:         borrow<channel>,
+        w-off:           borrow<channel>,
     }
 
     /// Groups the KV half so it can be made optional AS A UNIT. Without this
-    /// wrapper a `fold-buffered` fire could not omit KV without inventing the
-    /// dummy geometry this refactor exists to delete.
+    /// wrapper a commit-only fire -- one that folds buffered tokens and runs
+    /// no attention -- could not omit KV without inventing the dummy geometry
+    /// this refactor exists to delete.
     record kv-binding {
         working-set: borrow<kv-working-set>,
         geometry:    kv-geometry,
@@ -110,12 +131,10 @@ interface forward-hybrid {
         /// one set of geometry describing different layers of the same forward,
         /// not two independent decisions.
         ///
-        /// `kv` is `none` in exactly one case: a `fold-buffered` fire, which
-        /// runs recurrent layers only. The RS working sets stay REQUIRED even
-        /// there -- the driver still needs the folded slot and the buffered CSR
-        /// -- which is why `rs` is a plain list and only `kv` is optional. The
-        /// buffered geometry is NOT part of the state binding -- see
-        /// `rs-geometry`.
+        /// `kv` is `none` in exactly one case: a fire that runs recurrent
+        /// layers only. The RS working sets stay REQUIRED even there -- the
+        /// driver still needs the folded slot and the buffered CSR -- which is
+        /// why `rs` is a plain list and only `kv` is optional.
         ///
         /// This optional is also what preserves FRAME MONOMORPHISM: `submit`'s
         /// `slots` list is monomorphic and WIT has no existential types, so a
@@ -124,41 +143,20 @@ interface forward-hybrid {
         attention: func(
             kv: option<kv-binding>,
             rs: list<borrow<rs-working-set>>,
+            rs-geom: rs-geometry,
         ) -> result<_, error>;
 
-        // -- Fold mode ------------------------------------------------
-        // The former `rs-mode` variant, flattened into methods (D5): adding a
-        // variant case is BREAKING, adding a resource method is ADDITIVE, and
-        // `rs-mode` was the highest-evolution-risk type in the old surface.
-        // At most one of the three; `fold` is the default if none is called.
-
-        /// Fold every token of this fire into the folded state, in-forward and
-        /// IRREVERSIBLY. The plain prefill/decode path and the default. Needs
-        /// no buffer geometry -- it never touches the buffer.
-        fold: func() -> result<_, error>;
-
-        /// Write each token's pre-recurrence activations into the buffered
-        /// slots named by `rs-geometry.w-slot` / `w-off`, leaving the folded
-        /// state UNTOUCHED. This is what makes a linear model speculatable: an
-        /// uncertain tail that is never folded costs nothing to abandon.
-        /// Requires an already-materialized folded state.
-        ///
-        /// `start-token` is the buffer-relative token offset this fire writes
-        /// from, and must be a multiple of `model.rs-buffer-page-size()`: the
-        /// driver fills a request's slabs page-major FROM SLAB ZERO of the
-        /// listed CSR span, so an unaligned start would silently shift every
-        /// token within its slab. It is REDUNDANT with `rs-geometry.w-slot` /
-        /// `w-off` and is ignored when those are bound -- it exists because
-        /// the host-derived lowering path (which derives the buffered CSR from
-        /// `(start-token, row-tokens)`) is the only one wired end to end today.
-        buffer: func(start-token: u32, geom: rs-geometry) -> result<_, error>;
-
-        /// Replay buffered tokens into the folded state: one length per bound
-        /// working set, in request order. Runs ONLY the recurrent layers,
-        /// advances the folded boundary, and drops fully covered head slots.
-        /// Each length must be a positive multiple of
-        /// `model.rs-fold-granularity()`.
-        fold-buffered: func(lens: list<u32>, geom: rs-geometry) -> result<_, error>;
+        // There is deliberately NO `fold` / `buffer` / `fold-buffered` triple.
+        // Those were three values of one scalar -- where the folded boundary
+        // lands -- so they collapsed into `rs-geometry.fold-len`. An open
+        // enumeration of KINDS became a closed number over POSITIONS, which is
+        // also why folding it into a record is safe: a variant has cases to
+        // add, a number does not.
+        //
+        // `start-token` disappeared with them. New tokens always append at the
+        // buffer tail, which the runtime already tracks; letting the guest
+        // state a runtime-owned value is what made multi-chunk buffering
+        // expressible and wrong.
 
         /// Bind embedding token ids and CSR row indptr. Both are channels.
         embed: func(

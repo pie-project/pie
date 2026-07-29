@@ -13,12 +13,11 @@
 //!
 //!  1. **prefill — `fold`** (the default): materializes the folded state.
 //!     Buffering and folding both read it, so this must come first.
-//!  2. **speculate — `buffer(start)`**: one chunk of `SPEC_TOKENS` tokens
-//!     written into buffered slots; the folded state is untouched, so the
-//!     chunk stays abandonable. `start` is page-aligned because the driver
-//!     fills a row's slabs page-major from the first one it is given.
-//!  3. **commit — `fold-buffered([accepted])`**: replays the accepted prefix
-//!     into the folded state and drops the fully covered head slots.
+//!  2. **speculate — `fold_len = 0`**: one chunk of `SPEC_TOKENS` tokens
+//!     appended to the buffer; the folded boundary does not move, so the
+//!     chunk stays abandonable.
+//!  3. **commit — `fold_len = accepted`**: advances the boundary through the
+//!     accepted prefix and drops the fully covered head slots.
 //!
 //! Input: the number of speculative tokens to accept (default all of them),
 //! e.g. `"2"`. Output names the three phases so a harness can assert them.
@@ -101,7 +100,7 @@ async fn main(input: String) -> Result<String> {
         .await
         .map_err(|e| format!("g0 take: {e}"))?[0];
 
-    // ───────────── 2. SPECULATE — mode `buffer`, fold suppressed ──────────
+    // ────────────── 2. SPECULATE — `fold_len = 0`, nothing folds ──────────
     // One SPEC_TOKENS-wide fire. Its activations land in the buffered slots;
     // the folded state does not move, so nothing here is committed yet.
     let spec_toks = Channel::from(vec![g0; SPEC_TOKENS as usize]).named("spec_toks");
@@ -140,12 +139,10 @@ async fn main(input: String) -> Result<String> {
         &spec_positions,
         None,
     )?;
-    fwd_s.recurrent(std::slice::from_ref(&rs))?;
-    // The buffered geometry: `SPEC_TOKENS` tokens written from buffer token 0,
-    // page-major from slab zero. Required by `buffer_recurrent` because that
-    // is one of exactly two calls that touch the buffer -- unlike the KV half,
-    // it is NOT part of the state binding, so a plain `fold` fire never has to
-    // invent one.
+    // The buffered geometry: `SPEC_TOKENS` tokens appended at the buffer tail,
+    // page-major from slab zero. `fold_len = 0` holds the folded boundary
+    // still, so nothing here is committed -- that is what makes this fire
+    // abandonable.
     let rs_page = inferlet::model::rs_buffer_page_size().max(1);
     let rs_pages = SPEC_TOKENS.div_ceil(rs_page);
     let spec_rs_len = Channel::from(vec![SPEC_TOKENS]).named("spec_rs_len");
@@ -156,9 +153,11 @@ async fn main(input: String) -> Result<String> {
             .named("spec_rs_w_slot");
     let spec_rs_w_off = Channel::from((0..SPEC_TOKENS).map(|t| t % rs_page).collect::<Vec<_>>())
         .named("spec_rs_w_off");
+    let spec_fold_len = Channel::from(vec![0u32]).named("spec_fold_len");
     fwd_s
-        .buffer_recurrent(
-            0,
+        .recurrent_with(
+            std::slice::from_ref(&rs),
+            &spec_fold_len,
             ..,
             ..,
             &spec_rs_len,
@@ -167,7 +166,7 @@ async fn main(input: String) -> Result<String> {
             &spec_rs_w_slot,
             &spec_rs_w_off,
         )
-        .map_err(|e| format!("buffer_recurrent: {e}"))?;
+        .map_err(|e| format!("speculative recurrent binding: {e}"))?;
     fwd_s.epilogue(move || {
         let t = reduce_argmax(intrinsics::logits());
         spec_out.put(&t);
@@ -181,7 +180,7 @@ async fn main(input: String) -> Result<String> {
         .await
         .map_err(|e| format!("spec_out take: {e}"))?[0];
 
-    // ─────────── 3. COMMIT — mode `fold-buffered([accepted])` ─────────────
+    // ─────────────── 3. COMMIT — `fold_len = accepted` ────────────────────
     // Replays only the accepted prefix into the folded state. No logits: the
     // driver runs the recurrent layers alone.
     let mut committed = 0u32;
@@ -216,7 +215,6 @@ async fn main(input: String) -> Result<String> {
             &commit_positions,
             None,
         )?;
-        fwd_c.recurrent(std::slice::from_ref(&rs))?;
         // The commit replays `accepted` buffered tokens, so it reads exactly
         // the span the speculate fire wrote.
         let commit_rs_pages_n = accepted.div_ceil(rs_page);
@@ -231,9 +229,11 @@ async fn main(input: String) -> Result<String> {
         let commit_rs_w_off =
             Channel::from((0..accepted).map(|t| t % rs_page).collect::<Vec<_>>())
                 .named("commit_rs_w_off");
+        let commit_fold_len = Channel::from(vec![accepted]).named("commit_fold_len");
         fwd_c
-            .fold_buffered(
-                &[accepted],
+            .recurrent_with(
+                std::slice::from_ref(&rs),
+                &commit_fold_len,
                 ..,
                 ..,
                 &commit_rs_len,
@@ -242,7 +242,7 @@ async fn main(input: String) -> Result<String> {
                 &commit_rs_w_slot,
                 &commit_rs_w_off,
             )
-            .map_err(|e| format!("fold_buffered: {e}"))?;
+            .map_err(|e| format!("commit recurrent binding: {e}"))?;
         fwd_c.epilogue(move || {
             let t = reduce_argmax(intrinsics::logits());
             commit_done.put(&t);

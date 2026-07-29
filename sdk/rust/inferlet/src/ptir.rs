@@ -591,8 +591,8 @@ impl RsWorkingSet {
     }
 
     /// Append `n` reserved buffered page slots; returns the contiguous
-    /// range. Purely logical — a slot is materialized by the first
-    /// `buffer_recurrent` fire that writes it.
+    /// range. Purely logical — a slot is materialized by the first fire whose
+    /// `fold-len` leaves tokens in the buffer.
     pub fn alloc_buffer(&self, n: u32) -> Result<crate::working_set::PageRange, String> {
         self.rs.alloc_buffer(n)
     }
@@ -662,6 +662,7 @@ struct ForwardInner {
     rs_working_sets: Vec<Rc<crate::working_set::RsWorkingSet>>,
     /// The KV half of the state binding, recorded but not yet sent.
     kv_bind: Option<KvBind>,
+    rs_bind: Option<RsGeometryBind>,
     program_attached: bool,
 }
 
@@ -682,10 +683,10 @@ struct KvBind {
     mask: Option<Rc<wit_channel::Channel>>,
 }
 
-/// A recorded `rs-geometry`: the BUFFERED slots of the bound recurrent-state
-/// working sets. Absent for a plain `fold` fire, which never touches the
-/// buffer.
+/// A recorded `rs-geometry`: where the bound recurrent state lives for this
+/// fire and where its folded boundary lands.
 struct RsGeometryBind {
+    fold_len: Rc<wit_channel::Channel>,
     readable: PageDeclaration,
     writable: PageDeclaration,
     buffer_len: Rc<wit_channel::Channel>,
@@ -778,6 +779,7 @@ impl PassCore {
         PassCore {
             wit,
             inner: RefCell::new(ForwardInner {
+                rs_bind: None,
                 ports: Vec::new(),
                 stages: Vec::new(),
                 vocab,
@@ -899,7 +901,11 @@ impl PassCore {
     /// Record the recurrent-state working sets (resolved request order) and,
     /// optionally, the buffered geometry. Like the KV half, the WIT call is
     /// deferred to `attach_program`.
-    fn bind_recurrent(&self, working_sets: &[RsWorkingSet]) -> Result<(), String> {
+    fn bind_recurrent(
+        &self,
+        working_sets: &[RsWorkingSet],
+        geom: RsGeometryBind,
+    ) -> Result<(), String> {
         if working_sets.is_empty() {
             return Err(
                 "forward pass needs one recurrent-state working set per request".to_string(),
@@ -909,122 +915,40 @@ impl PassCore {
             // Post-attachment this is a REBIND (a request-set change between
             // fires), which goes straight out over WIT instead of being
             // recorded for `flush_state_binding`.
-            return self.rebind_recurrent(working_sets);
+            return self.rebind_recurrent(working_sets, geom);
         }
-        self.inner.borrow_mut().rs_working_sets =
-            working_sets.iter().map(|rs| rs.rs.clone()).collect();
+        let mut inner = self.inner.borrow_mut();
+        inner.rs_working_sets = working_sets.iter().map(|rs| rs.rs.clone()).collect();
+        inner.rs_bind = Some(geom);
         Ok(())
     }
 
     /// Rebind the recurrent-state working sets of an ALREADY-BOUND pass (a
     /// request-set change between fires). Only legal after the program is
     /// attached; before that, `bind_recurrent` records instead.
-    fn rebind_recurrent(&self, working_sets: &[RsWorkingSet]) -> Result<(), String> {
+    fn rebind_recurrent(
+        &self,
+        working_sets: &[RsWorkingSet],
+        geom: RsGeometryBind,
+    ) -> Result<(), String> {
         let replacement: Vec<Rc<crate::working_set::RsWorkingSet>> =
             working_sets.iter().map(|rs| rs.rs.clone()).collect();
         let borrows: Vec<&crate::working_set::RsWorkingSet> =
             replacement.iter().map(Rc::as_ref).collect();
         match &self.wit {
-            PassWit::Recurrent(w) => w.attention(&borrows),
-            PassWit::Hybrid(w) => w.attention(None, &borrows),
+            PassWit::Recurrent(w) => w.attention(&borrows, &recurrent_rs_geometry(&geom)),
+            PassWit::Hybrid(w) => w.attention(None, &borrows, &hybrid_rs_geometry(&geom)),
             PassWit::Attention(_) => {
                 Err("an attention-only forward pass has no recurrent state".to_string())
             }
         }?;
-        self.inner.borrow_mut().rs_working_sets = replacement;
+        let mut inner = self.inner.borrow_mut();
+        inner.rs_working_sets = replacement;
+        inner.rs_bind = Some(geom);
         Ok(())
     }
 
     /// Bind readout indexes through a channel, separately from embedding.
-    /// Fold every token of this pass into the recurrent state, in-forward
-    /// and irreversibly. The default; call this only to undo an earlier
-    /// `buffer_recurrent` or `fold_buffered` on a reused pass.
-    fn fold_recurrent(&self) -> Result<(), String> {
-        match &self.wit {
-            PassWit::Recurrent(w) => w.fold(),
-            PassWit::Hybrid(w) => w.fold(),
-            PassWit::Attention(_) => {
-                Err("an attention-only forward pass has no recurrent state".to_string())
-            }
-        }
-    }
-
-    /// Write this pass's pre-recurrence activations into the bound
-    /// recurrent-state working sets' buffered slots, starting at buffer
-    /// token `start_token`, and leave the folded state UNTOUCHED.
-    ///
-    /// This is what makes a linear model speculatable: tokens that are
-    /// buffered but never folded cost nothing to abandon. `start_token` must
-    /// be a multiple of `rs-buffer-page-size`, and the working set must
-    /// already carry a folded state (run the folding prefill first).
-    fn buffer_recurrent(&self, start_token: u32, geom: RsGeometryBind) -> Result<(), String> {
-        match &self.wit {
-            PassWit::Recurrent(w) => w.buffer(
-                start_token,
-                &wit_recurrent::RsGeometry {
-                    readable_buffer: geom.readable.wit(),
-                    writable_buffer: geom.writable.wit(),
-                    buffer_len: geom.buffer_len.as_ref(),
-                    buffer_pages: geom.buffer_pages.as_ref(),
-                    buffer_indptr: geom.buffer_indptr.as_ref(),
-                    w_slot: geom.w_slot.as_ref(),
-                    w_off: geom.w_off.as_ref(),
-                },
-            ),
-            PassWit::Hybrid(w) => w.buffer(
-                start_token,
-                &wit_hybrid::RsGeometry {
-                    readable_buffer: geom.readable.wit(),
-                    writable_buffer: geom.writable.wit(),
-                    buffer_len: geom.buffer_len.as_ref(),
-                    buffer_pages: geom.buffer_pages.as_ref(),
-                    buffer_indptr: geom.buffer_indptr.as_ref(),
-                    w_slot: geom.w_slot.as_ref(),
-                    w_off: geom.w_off.as_ref(),
-                },
-            ),
-            PassWit::Attention(_) => {
-                Err("an attention-only forward pass has no recurrent state".to_string())
-            }
-        }
-    }
-
-    /// Replay `tokens[r]` buffered tokens of request row `r` into that row's
-    /// folded state, dropping the fully covered head slots. Runs only the
-    /// recurrent layers — no logits — so this is the COMMIT half of
-    /// fold-commit speculation.
-    fn fold_buffered(&self, tokens: &[u32], geom: RsGeometryBind) -> Result<(), String> {
-        match &self.wit {
-            PassWit::Recurrent(w) => w.fold_buffered(
-                tokens,
-                &wit_recurrent::RsGeometry {
-                    readable_buffer: geom.readable.wit(),
-                    writable_buffer: geom.writable.wit(),
-                    buffer_len: geom.buffer_len.as_ref(),
-                    buffer_pages: geom.buffer_pages.as_ref(),
-                    buffer_indptr: geom.buffer_indptr.as_ref(),
-                    w_slot: geom.w_slot.as_ref(),
-                    w_off: geom.w_off.as_ref(),
-                },
-            ),
-            PassWit::Hybrid(w) => w.fold_buffered(
-                tokens,
-                &wit_hybrid::RsGeometry {
-                    readable_buffer: geom.readable.wit(),
-                    writable_buffer: geom.writable.wit(),
-                    buffer_len: geom.buffer_len.as_ref(),
-                    buffer_pages: geom.buffer_pages.as_ref(),
-                    buffer_indptr: geom.buffer_indptr.as_ref(),
-                    w_slot: geom.w_slot.as_ref(),
-                    w_off: geom.w_off.as_ref(),
-                },
-            ),
-            PassWit::Attention(_) => {
-                Err("an attention-only forward pass has no recurrent state".to_string())
-            }
-        }
-    }
-
     pub fn readout(&self, indices: &Channel) -> Result<(), String> {
         self.ensure_ports_available(&[Port::Readout])?;
         let indices_wit = indices.wit();
@@ -1074,8 +998,8 @@ impl PassCore {
     /// the other k−1 slots pad to no-ops.
     ///
     /// This is the ONE-SHOT path — a prefill chunk, a partial trailing frame,
-    /// or a fire the runtime submits solo (a `buffer` / `fold-buffered`
-    /// recurrent pass). The padding
+    /// or a fire the runtime submits solo (a recurrent pass whose `fold-len`
+    /// differs from the fast path). The padding
     /// is unconditional, not a fallback when slots run out, so at k > 1 this
     /// spends a whole frame on a single pass: exactly as many frame boundaries
     /// per token as k = 1, with none of k's batching benefit.
@@ -1113,7 +1037,12 @@ impl PassCore {
                 };
                 w.attention(kv.ws.as_ref(), &geom)
             }
-            PassWit::Recurrent(w) => w.attention(&rs),
+            PassWit::Recurrent(w) => {
+                let Some(geom) = inner.rs_bind.as_ref() else {
+                    return Err("recurrent state must be bound before submit".to_string());
+                };
+                w.attention(&rs, &recurrent_rs_geometry(geom))
+            }
             PassWit::Hybrid(w) => {
                 let Some(kv) = inner.kv_bind.as_ref() else {
                     return Err("attention must be bound before submit".to_string());
@@ -1132,7 +1061,10 @@ impl PassCore {
                             mask: kv.mask.as_deref(),
                         },
                     };
-                w.attention(Some(&binding), &rs)
+                let Some(geom) = inner.rs_bind.as_ref() else {
+                    return Err("recurrent state must be bound before submit".to_string());
+                };
+                w.attention(Some(&binding), &rs, &hybrid_rs_geometry(geom))
             }
         }
     }
@@ -1203,8 +1135,8 @@ pub fn channel_capacity() -> usize {
 /// Kept as its own query rather than folded into [`frame_size`]: it answers
 /// "how much can this lane submit per frame", which is a model property that
 /// has diverged from k before and may again. It is NOT the place to encode
-/// per-PASS restrictions — a `buffer` / `fold-buffered` fire is submitted solo
-/// by the runtime because it picks the RS execution mode for the whole
+/// per-PASS restrictions — a fire that buffers or commits is submitted solo by
+/// the runtime because its `fold-len` picks the RS execution mode for the whole
 /// composed batch, and that is a property of the fire, not of the model.
 pub fn live_slots() -> usize {
     frame_size()
@@ -1573,83 +1505,6 @@ macro_rules! pass_module_attention_stages {
     };
 }
 
-/// The `fold` / `buffer` / `fold-buffered` triple plus recurrent rebinding.
-macro_rules! pass_module_fold_modes {
-    () => {
-        impl ForwardPass {
-            /// Fold every token of this pass into the recurrent state,
-            /// in-forward and irreversibly. The default.
-            pub fn fold_recurrent(&self) -> Result<(), String> {
-                self.0.fold_recurrent()
-            }
-
-            /// Write this pass's pre-recurrence activations into the bound
-            /// working sets' buffered slots starting at buffer token
-            /// `start_token`, leaving the folded state UNTOUCHED. This is what
-            /// makes a linear model speculatable.
-            /// The buffer geometry is REQUIRED here rather than on the state
-            /// binding: this is one of exactly two calls that touch the buffer.
-            #[allow(clippy::too_many_arguments)]
-            pub fn buffer_recurrent<R, W>(
-                &self,
-                start_token: u32,
-                readable: R,
-                writable: W,
-                buffer_len: &$crate::ptir::Channel,
-                buffer_pages: &$crate::ptir::Channel,
-                buffer_indptr: &$crate::ptir::Channel,
-                w_slot: &$crate::ptir::Channel,
-                w_off: &$crate::ptir::Channel,
-            ) -> Result<(), String>
-            where
-                R: ::std::ops::RangeBounds<u32>,
-                W: ::std::ops::RangeBounds<u32>,
-            {
-                let geom = $crate::ptir::rs_geometry_bind(
-                    readable,
-                    writable,
-                    buffer_len,
-                    buffer_pages,
-                    buffer_indptr,
-                    w_slot,
-                    w_off,
-                )?;
-                self.0.buffer_recurrent(start_token, geom)
-            }
-
-            /// Replay `tokens[r]` buffered tokens of request row `r` into that
-            /// row's folded state. The COMMIT half of fold-commit speculation.
-            #[allow(clippy::too_many_arguments)]
-            pub fn fold_buffered<R, W>(
-                &self,
-                tokens: &[u32],
-                readable: R,
-                writable: W,
-                buffer_len: &$crate::ptir::Channel,
-                buffer_pages: &$crate::ptir::Channel,
-                buffer_indptr: &$crate::ptir::Channel,
-                w_slot: &$crate::ptir::Channel,
-                w_off: &$crate::ptir::Channel,
-            ) -> Result<(), String>
-            where
-                R: ::std::ops::RangeBounds<u32>,
-                W: ::std::ops::RangeBounds<u32>,
-            {
-                let geom = $crate::ptir::rs_geometry_bind(
-                    readable,
-                    writable,
-                    buffer_len,
-                    buffer_pages,
-                    buffer_indptr,
-                    w_slot,
-                    w_off,
-                )?;
-                self.0.fold_buffered(tokens, geom)
-            }
-        }
-    };
-}
-
 /// `pie:inferlet/forward` — paged, per-token, reversibly discardable KV only.
 ///
 /// Valid when `model.pass_kind()` is [`ForwardKind::Attention`]. KV eviction
@@ -1725,14 +1580,49 @@ pub mod recurrent {
         wit_recurrent::ForwardPass,
         "A recurrent-only forward pass."
     );
-    pass_module_fold_modes!();
 
     impl ForwardPass {
         /// Bind the recurrent-state working sets in resolved request order.
         /// The mechanism is a recurrence, but the SLOT is the same one
         /// `attention` names in the other two interfaces.
         pub fn attention(&self, working_sets: &[RsWorkingSet]) -> Result<(), String> {
-            self.0.bind_recurrent(working_sets)
+            self.0
+                .bind_recurrent(working_sets, rs_geometry_fold_all()?)
+        }
+
+        /// Bind the recurrent state AND state where its folded boundary
+        /// lands. See [`hybrid::ForwardPass::recurrent_with`] -- the surface
+        /// and the semantics are identical.
+        ///
+        /// [`hybrid::ForwardPass::recurrent_with`]: crate::ptir::hybrid::ForwardPass::recurrent_with
+        #[allow(clippy::too_many_arguments)]
+        pub fn attention_with<R, W>(
+            &self,
+            working_sets: &[RsWorkingSet],
+            fold_len: &Channel,
+            readable: R,
+            writable: W,
+            buffer_len: &Channel,
+            buffer_pages: &Channel,
+            buffer_indptr: &Channel,
+            w_slot: &Channel,
+            w_off: &Channel,
+        ) -> Result<(), String>
+        where
+            R: RangeBounds<u32>,
+            W: RangeBounds<u32>,
+        {
+            let geom = rs_geometry_bind(
+                fold_len,
+                readable,
+                writable,
+                buffer_len,
+                buffer_pages,
+                buffer_indptr,
+                w_slot,
+                w_off,
+            )?;
+            self.0.bind_recurrent(working_sets, geom)
         }
     }
 
@@ -1756,7 +1646,6 @@ pub mod hybrid {
 
     pass_module!(Hybrid, wit_hybrid::ForwardPass, "A hybrid forward pass.");
     pass_module_attention_stages!();
-    pass_module_fold_modes!();
 
     impl ForwardPass {
         /// Bind the ATTENTION half. The two halves are recorded independently
@@ -1798,7 +1687,56 @@ pub mod hybrid {
         /// Bind the RECURRENT half: one working set per request, in resolved
         /// request order.
         pub fn recurrent(&self, working_sets: &[RsWorkingSet]) -> Result<(), String> {
-            self.0.bind_recurrent(working_sets)
+            self.0
+                .bind_recurrent(working_sets, rs_geometry_fold_all()?)
+        }
+
+        /// Bind the RECURRENT half AND state where its folded boundary lands.
+        ///
+        /// `fold_len` is a channel carrying, per request, how far the folded
+        /// boundary advances over `[buffer | this fire's tokens]`, clamped to
+        /// that tail:
+        ///
+        /// - `u32::MAX` -- fold everything. What [`recurrent`] supplies.
+        /// - `0` -- fold nothing; append every token of this fire to the
+        ///   buffer. This is what makes a linear model speculatable: buffered
+        ///   tokens that are never folded cost nothing to abandon.
+        /// - `n <= buffer_len` -- fold the first `n` buffered tokens and drop
+        ///   the covered head pages. The COMMIT half of speculation.
+        ///
+        /// A channel rather than a scalar so that a device-computed accepted
+        /// count can drive the fold directly, fusing verify and commit into
+        /// one fire.
+        ///
+        /// [`recurrent`]: ForwardPass::recurrent
+        #[allow(clippy::too_many_arguments)]
+        pub fn recurrent_with<R, W>(
+            &self,
+            working_sets: &[RsWorkingSet],
+            fold_len: &Channel,
+            readable: R,
+            writable: W,
+            buffer_len: &Channel,
+            buffer_pages: &Channel,
+            buffer_indptr: &Channel,
+            w_slot: &Channel,
+            w_off: &Channel,
+        ) -> Result<(), String>
+        where
+            R: RangeBounds<u32>,
+            W: RangeBounds<u32>,
+        {
+            let geom = rs_geometry_bind(
+                fold_len,
+                readable,
+                writable,
+                buffer_len,
+                buffer_pages,
+                buffer_indptr,
+                w_slot,
+                w_off,
+            )?;
+            self.0.bind_recurrent(working_sets, geom)
         }
     }
 
@@ -1809,8 +1747,35 @@ pub mod hybrid {
     }
 }
 
+fn recurrent_rs_geometry(geom: &RsGeometryBind) -> wit_recurrent::RsGeometry<'_> {
+    wit_recurrent::RsGeometry {
+        fold_len: geom.fold_len.as_ref(),
+        readable_buffer: geom.readable.wit(),
+        writable_buffer: geom.writable.wit(),
+        buffer_len: geom.buffer_len.as_ref(),
+        buffer_pages: geom.buffer_pages.as_ref(),
+        buffer_indptr: geom.buffer_indptr.as_ref(),
+        w_slot: geom.w_slot.as_ref(),
+        w_off: geom.w_off.as_ref(),
+    }
+}
+
+fn hybrid_rs_geometry(geom: &RsGeometryBind) -> wit_hybrid::RsGeometry<'_> {
+    wit_hybrid::RsGeometry {
+        fold_len: geom.fold_len.as_ref(),
+        readable_buffer: geom.readable.wit(),
+        writable_buffer: geom.writable.wit(),
+        buffer_len: geom.buffer_len.as_ref(),
+        buffer_pages: geom.buffer_pages.as_ref(),
+        buffer_indptr: geom.buffer_indptr.as_ref(),
+        w_slot: geom.w_slot.as_ref(),
+        w_off: geom.w_off.as_ref(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn rs_geometry_bind<R, W>(
+    fold_len: &Channel,
     readable: R,
     writable: W,
     buffer_len: &Channel,
@@ -1824,6 +1789,7 @@ where
     W: RangeBounds<u32>,
 {
     Ok(RsGeometryBind {
+        fold_len: fold_len.wit(),
         readable: PageDeclaration::from_range(readable)?,
         writable: PageDeclaration::from_range(writable)?,
         buffer_len: buffer_len.wit(),
@@ -1831,6 +1797,27 @@ where
         buffer_indptr: buffer_indptr.wit(),
         w_slot: w_slot.wit(),
         w_off: w_off.wit(),
+    })
+}
+
+/// The geometry of a pass that never buffers: an empty buffer and a `fold-len`
+/// past the tail, which clamps to "fold every token of every fire".
+///
+/// This is degenerate but MEANINGFUL -- it is the fast path stated explicitly,
+/// not the dummy geometry this surface exists to avoid. The buffer channels are
+/// never dereferenced because `buffer-len` is zero.
+fn rs_geometry_fold_all() -> Result<RsGeometryBind, String> {
+    thread_local! {
+        /// Minted once per guest thread: a rebind must not leak a fresh
+        /// channel quintuple every time the request set changes.
+        static CHANNELS: (Channel, Channel, Channel) = (
+            Channel::from(vec![u32::MAX]),
+            Channel::from(vec![0u32]),
+            Channel::from(vec![0u32, 0]),
+        );
+    }
+    CHANNELS.with(|(fold_len, zero, indptr)| {
+        rs_geometry_bind(fold_len, 0..0, 0..0, zero, zero, indptr, zero, zero)
     })
 }
 

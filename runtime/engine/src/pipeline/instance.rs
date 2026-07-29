@@ -201,16 +201,28 @@ pub struct ForwardBindings {
     pub readout: Option<u32>,
     pub rs_ws: Vec<u32>,
     pub rs_geom: Option<RsGeometryBinding>,
-    pub rs_mode: RsMode,
+    /// Host-known `rs-geometry.fold-len`, one per bound working set, read from
+    /// the channel when the state was bound. Empty when no recurrent state is
+    /// bound. See [`RsGeometryBinding::fold_len`].
+    pub rs_fold_len: Vec<u32>,
 }
 
-/// The buffered half of a recurrent-state binding — the host mirror of WIT
-/// `rs-geometry`. Each field is a channel resource rep that lowers to the
-/// matching `Port::Rs*` descriptor port (registry tags 10-14).
+/// Where a fire's recurrent state lives and where its folded boundary lands —
+/// the host mirror of WIT `rs-geometry`. Each field is a channel resource rep
+/// that lowers to the matching `Port::Rs*` descriptor port (registry tags
+/// 10-14).
 ///
-/// Absent for a plain `fold` fire, which never touches the buffer.
+/// Bound together WITH the working sets, not with a fold-mode method: the
+/// buffer is half the state representation, so its addressing is an input to
+/// the recurrence on every fire. Absent only when no recurrent state is bound.
 #[derive(Clone, Copy, Debug)]
 pub struct RsGeometryBinding {
+    /// How far the folded boundary advances, per request, counted over
+    /// `[buffer | this fire's tokens]` — the twin of `kv-len`. The channel rep
+    /// is kept for descriptor lowering; the host-known VALUE lives in
+    /// [`ForwardBindings::rs_fold_len`] because the mapping onto a per-row plan
+    /// also needs the fire's token counts, which arrive later.
+    pub fold_len: u32,
     pub readable: KvPageSpan,
     pub writable: KvPageSpan,
     pub buffer_len: u32,
@@ -218,23 +230,6 @@ pub struct RsGeometryBinding {
     pub buffer_indptr: u32,
     pub w_slot: u32,
     pub w_off: u32,
-}
-
-/// How a pass treats the recurrent state of its bound working sets. Formerly
-/// the WIT `rs-mode` variant; now the flattened `fold` / `buffer` /
-/// `fold-buffered` methods of `forward-recurrent` and `forward-hybrid`
-/// (adding a variant case is breaking, adding a resource method is additive).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub enum RsMode {
-    /// Fold every token in-forward, irreversibly. The default.
-    #[default]
-    Fold,
-    /// Buffer this fire's pre-recurrence activations starting at the given
-    /// buffer-relative token offset; the folded state is untouched.
-    Buffer { start_token: u32 },
-    /// Replay this many buffered tokens per bound working set (request
-    /// order) into the folded state.
-    FoldBuffered { tokens: Vec<u32> },
 }
 
 #[derive(Clone, Copy)]
@@ -354,7 +349,8 @@ pub struct BoundForwardPass {
     pub rs_ws: Vec<u32>,
     /// How this pass treats that recurrent state: fold in-forward (default),
     /// buffer without folding, or replay buffered tokens into the fold.
-    pub rs_mode: RsMode,
+    /// Host-known `fold-len` per bound working set (see `ForwardBindings`).
+    pub rs_fold_len: Vec<u32>,
     /// Whether the currently bound writable declaration has performed its
     /// one-shot COW against the sharing shape visible at first submit.
     pub kv_declaration_realized: bool,
@@ -1154,7 +1150,7 @@ mod tests {
                 kv_ws: 0,
                 kv_declaration: KvDeclaration::all(),
                 rs_ws: Vec::new(),
-                rs_mode: RsMode::default(),
+                rs_fold_len: Vec::new(),
                 kv_declaration_realized: false,
                 failed: None,
                 devgeo: None,

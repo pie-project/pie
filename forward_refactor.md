@@ -1235,3 +1235,46 @@ hybrid models*, not *fold misuse within a hybrid pass*. `fold` and `buffered`
 are two methods on one type, so there is nothing for the compiler to see.
 Fixing it is the acceptance test for Tier 1.5 — and today `gdn-foldcommit` is
 the *only* coverage of the buffer path at all.
+
+### 11.7 Implementation log — the boundary landed
+
+`rs-geometry` now carries `fold-len` as its first field and rides on
+`attention`; `fold` / `buffer` / `fold-buffered` are gone from both the
+recurrent and hybrid interfaces, and `start-token` with them (new tokens append
+at the buffer tail, which the runtime already tracks).
+
+**`fold-len` is clamped to the tail.** Without a clamp, "fold everything" would
+be `buffer-len + this fire's token count` — a value that changes per fire, so a
+run-ahead decode loop could not state it once at bind time. Clamping makes
+`u32::MAX` mean "through the tail", which is what the SDK's plain
+`recurrent(&[..])` supplies.
+
+**The host classifies, it does not compute.** `fire::rs_plan_for` reads the
+constant at bind time and maps three positions onto the three `RsPlan` shapes
+the driver already implements, so behaviour is byte-identical:
+
+| `fold-len` | buffer | plan |
+|---|---|---|
+| `> 0` | empty | `Fold` |
+| `0` | any | `Buffer { start_token = tail }` |
+| `0 < n <= B` | non-empty | `FoldBuffered { n }` |
+
+Everything else is a hard error, not a fallback: a boundary at or past the
+buffer tail while the buffer is non-empty needs the read path (§11.2), a mixed
+batch needs a per-row plan, and a device-computed `fold-len` needs the
+device-resident boundary (§11.4). Approximating a fold in either direction is
+unrecoverable — folding early destroys tokens the guest still wanted, folding
+late silently drops them from the context — so refusing is the only honest
+answer.
+
+**Buffer occupancy is an upper bound.** `RsStore` tracks buffered *pages*; the
+live token count rides on the `buffer-len` channel, which the host may not be
+able to read. `rs_plan_for` therefore works with `pages * buffer-page-size`.
+That is sufficient because the classification only asks whether the buffer is
+empty and whether a boundary lands inside it — never for an exact length.
+
+**SDK.** `recurrent(&[&rs])` (and `recurrent::attention`) keeps its signature
+and synthesizes the fold-everything geometry, so the plain inferlets are
+untouched; `recurrent_with(..)` / `attention_with(..)` state the boundary
+explicitly. `gdn-foldcommit` is the only rewrite: `fold_len = 0` to speculate,
+`fold_len = accepted` to commit.
