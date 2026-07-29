@@ -715,6 +715,35 @@ inline bool compose_forward_batch(const pie_native::LaunchView& view,
         // request, so there is no single table for the fire the way there is
         // for KV.
         const FireGeometry& geom = resolved.per_program[program];
+        // `rs_w_slot`/`rs_w_off` describe where each token's buffered
+        // activations land. The driver's scatter walks a row's listed slabs
+        // page-major and contiguously -- it has no per-token indirection --
+        // so the ONLY descriptor it can honour is the one that says exactly
+        // that. Rather than resolve these ports and silently ignore them,
+        // check that they agree with the layout and refuse if they do not.
+        if (geom.has_rs_write_desc) {
+            if (geom.rs_w_slot.size() != geom.rs_w_off.size()) {
+                if (err) *err =
+                    "ptir compose: rs write descriptor slot/off length mismatch";
+                return false;
+            }
+            for (std::size_t t = 1; t < geom.rs_w_slot.size(); ++t) {
+                const bool same_slab = geom.rs_w_slot[t] == geom.rs_w_slot[t - 1];
+                const bool steps_within =
+                    same_slab && geom.rs_w_off[t] == geom.rs_w_off[t - 1] + 1;
+                const bool steps_across =
+                    geom.rs_w_slot[t] == geom.rs_w_slot[t - 1] + 1 &&
+                    geom.rs_w_off[t] == 0;
+                if (!steps_within && !steps_across) {
+                    if (err) *err =
+                        "ptir compose: rs write descriptor is not the "
+                        "contiguous page-major layout the recurrence scatters "
+                        "into; a per-token buffered-activation target is not "
+                        "implemented";
+                    return false;
+                }
+            }
+        }
         const bool from_channels =
             resolved.is_device_geometry[program] && geom.has_rs_buffer_family &&
             geom.rs_buffer_slot_indptr.size() == count + 1;

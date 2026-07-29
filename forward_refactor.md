@@ -1215,6 +1215,59 @@ same four tokens folded two fires at a time — continuing BOTH arms one token
 further, so agreement pins the folded state and not merely the logits along
 the way.
 
+### 10.2.4 RS reachability audit — LANDED
+
+The read-path find in §10.2.3 was the second time an RS array had been built
+correctly, validated correctly, and then silently dropped inside the driver
+(§10.1 was the first: the descriptor-resolved RS family was write-only). Two
+instances is a pattern, so the whole RS surface was walked end to end —
+host build → wire → ABI → validation → composition → frame → the
+`ForwardDispatchInputs`/`ForwardInputs` copy → both model forwards → use site.
+
+Confirmed reachable, both dense and MoE: `rs_slot_ids`, `rs_slot_flags`,
+`rs_fold_lens` (host and device), `rs_buffer_slot_ids`/`_indptr`,
+`rs_buffer_read_*`, `rs_buffer_heads`, `rs_translation`/`_indptr` (consumed at
+composition, by design), and the resolved `FireGeometry::rs_buffer_slot_ids`/
+`_indptr`.
+
+Two more gaps found and closed.
+
+**The read side never reached a TP follower.** Only rank 0 sees the launch
+descriptor; a follower recovers every per-request array by reading it back off
+the device, so an array that is never STAGED to device never reaches it.
+`rs_buffer_read_*` and `rs_buffer_heads` were host-only spans and had no
+`PersistentInputs` home, no `TpBuf` id, and no broadcast. A TP follower would
+therefore skip the replay of the buffered prefix and fold a DIFFERENT recurrent
+state than rank 0 — and the per-layer all-reduce mixes the two without
+complaint, so the symptom is degraded output, not a crash. They now stage,
+broadcast, and read back exactly like `rs_buffer_slot_ids`, and the follower
+throws if the reconstructed read CSR disagrees with its id count.
+
+This box has one GPU, so the TP path is reasoned and pattern-matched rather
+than executed. The consistency check is there because of that.
+
+**`rs_w_slot` / `rs_w_off` were resolved and ignored.** `descriptor_resolve`
+fills them from the channels and nothing read them. The driver's scatter walks
+a row's listed slabs page-major and contiguously — it has no per-token
+indirection — so the only descriptor it can honour is the one that says exactly
+that, which is what every guest supplies today (`rs_span()` in
+`mtp-native-verify` is literally `t / page`, `t % page`). Rather than keep
+resolving a port and discarding it, `append_rs` now CHECKS the descriptor
+against that layout and refuses anything else with an explicit "not
+implemented". A silently ignored port and an honestly refused one are very
+different promises to a guest.
+
+**Still dropped, deliberately: `FireGeometry::rs_buffer_lens`.** The
+per-request live buffered token count resolved from a channel is not read; the
+host-derived value wins. That is exactly the inversion §11.4 (`t15`) exists to
+fix — when the folded boundary becomes device-resident the DEVICE value has to
+be authoritative — so it is left as the hook rather than half-wired now.
+
+`ForwardInputs::rs_slot_flags_h` is also set by every caller and read by no
+model. It is harmless (the flags are consumed in `frame.cpp` to derive
+`is_fresh`), but it is dead storage of exactly the shape that hid the two real
+bugs, and should go.
+
 ### 10.3 `mtp-native-verify` rewritten as fold-commit — LANDED
 
 The Tier-1.5 acceptance test was broken in two independent ways, both of which

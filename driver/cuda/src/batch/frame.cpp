@@ -774,6 +774,10 @@ struct PreparedStep::Impl {
     DeviceBuffer<std::uint32_t>::StagedUpload up_rs_fold_lens{};
     DeviceBuffer<std::uint32_t>::StagedUpload up_rs_buf_indptr{};
     DeviceBuffer<std::uint32_t>::StagedUpload up_rs_buf_ids{};
+    DeviceBuffer<std::uint32_t>::StagedUpload up_rs_read_ids{};
+    DeviceBuffer<std::uint32_t>::StagedUpload up_rs_read_indptr{};
+    DeviceBuffer<std::uint32_t>::StagedUpload up_rs_read_lens{};
+    DeviceBuffer<std::uint32_t>::StagedUpload up_rs_heads{};
     DeviceBuffer<std::int32_t>::StagedUpload up_sample_idx{};
 
     // Diagnostics. Declared last so its emission (at destruction) runs
@@ -1628,6 +1632,25 @@ void prepare_step(
             s.up_rs_buf_ids =
                 pi.rs_buffer_slot_ids.stage_from_host(s.rs_buf_id_view);
         }
+        // The read side is host-only for the model, but a TP follower never
+        // sees the launch descriptor -- it recovers every per-request array by
+        // reading it back off the device. So it has to be staged like the rest.
+        if (!s.rs_buf_read_id_view.empty()) {
+            s.up_rs_read_ids = pi.rs_buffer_read_slot_ids.stage_from_host(
+                s.rs_buf_read_id_view);
+        }
+        if (!s.rs_buf_read_indptr_view.empty()) {
+            s.up_rs_read_indptr = pi.rs_buffer_read_indptr.stage_from_host(
+                s.rs_buf_read_indptr_view);
+        }
+        if (!s.rs_buf_read_len_view.empty()) {
+            s.up_rs_read_lens = pi.rs_buffer_read_lens.stage_from_host(
+                s.rs_buf_read_len_view);
+        }
+        if (!s.rs_buf_head_view.empty()) {
+            s.up_rs_heads =
+                pi.rs_buffer_heads.stage_from_host(s.rs_buf_head_view);
+        }
     }
 
     if (!s.rs_is_fold &&
@@ -2069,7 +2092,8 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
             s.structured_window_left,
             s.rs_plan.mode,
             static_cast<int>(s.rs_fold_len_view.size()),
-            static_cast<int>(s.rs_buf_id_view.size()));
+            static_cast<int>(s.rs_buf_id_view.size()),
+            static_cast<int>(s.rs_buf_read_id_view.size()));
         tp_commit.key = &engine.tp_cpu_gate_key;
     }
     if (s.empty_step) {
@@ -2130,6 +2154,10 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
         pi.rs_fold_lens.commit_staged(s.up_rs_fold_lens);
         pi.rs_buffer_slot_indptr.commit_staged(s.up_rs_buf_indptr);
         pi.rs_buffer_slot_ids.commit_staged(s.up_rs_buf_ids);
+        pi.rs_buffer_read_slot_ids.commit_staged(s.up_rs_read_ids);
+        pi.rs_buffer_read_indptr.commit_staged(s.up_rs_read_indptr);
+        pi.rs_buffer_read_lens.commit_staged(s.up_rs_read_lens);
+        pi.rs_buffer_heads.commit_staged(s.up_rs_heads);
     }
     pi.sample_idx.commit_staged(s.up_sample_idx);
     if (engine.rs_cache != nullptr) {
@@ -2211,6 +2239,7 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
                             s.rs_plan.mode,
                             static_cast<int>(s.rs_fold_len_view.size()),
                             static_cast<int>(s.rs_buf_id_view.size()),
+                            static_cast<int>(s.rs_buf_read_id_view.size()),
                             /*stream=*/nullptr);
         tp_commit.completed = true;
         pie_cuda_driver::tp_watchdog_mark_phase(2);
