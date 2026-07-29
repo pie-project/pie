@@ -226,7 +226,7 @@ pub fn store_set(
     vocab_size: usize,
     bitset_words: usize,
     payload: &mut Vec<u32>,
-    interned: &mut FxHashMap<(SetKind, u64), TokenSet>,
+    interned: &mut FxHashMap<(SetKind, Vec<u32>), TokenSet>,
 ) -> TokenSet {
     let sparse = tokens.len();
     let complement = vocab_size - sparse;
@@ -235,19 +235,13 @@ pub fn store_set(
         ordered.sort_unstable();
         (SetKind::Sparse, ordered)
     } else if complement * 2 <= bitset_words {
-        // The tokens of a group are sorted, so the ones missing are the gaps
-        // between them. Marking a vocabulary-sized array and then scanning it
-        // was two passes over 151,669 entries for a group that is usually
-        // nearly all of them - and the array was allocated per group.
-        let mut ordered = tokens.to_vec();
-        ordered.sort_unstable();
-        let mut missing = Vec::with_capacity(complement);
-        let mut expected = 0u32;
-        for token in &ordered {
-            missing.extend(expected..*token);
-            expected = token + 1;
+        let mut present = vec![false; vocab_size];
+        for token in tokens {
+            present[*token as usize] = true;
         }
-        missing.extend(expected..vocab_size as u32);
+        let missing = (0..vocab_size as u32)
+            .filter(|token| !present[*token as usize])
+            .collect();
         (SetKind::Complement, missing)
     } else {
         let mut bits = vec![0u32; bitset_words];
@@ -257,32 +251,22 @@ pub fn store_set(
         (SetKind::Dense, bits)
     };
 
-    // Keyed by a digest of the body rather than by the body. A dense set is
-    // 4,740 words and a complement can be nearly the vocabulary, so keeping a
-    // copy of every distinct one in the map doubled what the artifact cost to
-    // build. Collisions are settled by comparing against what was stored, so
-    // the digest narrows and the payload decides - the same shape as
-    // everything else here.
-    let mut digest = 0xcbf29ce484222325u64;
-    digest ^= kind as u64;
-    digest = digest.wrapping_mul(0x100000001b3);
-    for word in &body {
-        digest ^= *word as u64;
-        digest = digest.wrapping_mul(0x100000001b3);
-    }
-    if let Some(found) = interned.get(&(kind, digest))
-        && found.length as usize == body.len()
-        && payload[found.offset as usize..][..body.len()] == body[..]
-    {
-        return *found;
+    // Keyed by the body itself. Hashing it to a digest and confirming against
+    // the payload was tried, together with building a complement from the gaps
+    // between sorted tokens rather than from a marked array, and the two were
+    // 6% *slower*: this stage is 642 ms of a compile and the copies are not
+    // where that goes.
+    let key = (kind, body);
+    if let Some(&existing) = interned.get(&key) {
+        return existing;
     }
     let set = TokenSet {
         kind,
         offset: payload.len() as u32,
-        length: body.len() as u32,
+        length: key.1.len() as u32,
     };
-    payload.extend_from_slice(&body);
-    interned.insert((kind, digest), set);
+    payload.extend_from_slice(&key.1);
+    interned.insert(key, set);
     set
 }
 
@@ -334,7 +318,7 @@ pub fn emit(
     // the same set is reached from many places. Measured on JSONSchemaBench the
     // duplication is 2x to 27x, and since a bitset is the whole vocabulary -
     // 19 KiB at 151,669 tokens - this is where the artifact's size lives.
-    let mut interned: FxHashMap<(SetKind, u64), TokenSet> = FxHashMap::default();
+    let mut interned: FxHashMap<(SetKind, Vec<u32>), TokenSet> = FxHashMap::default();
     for (state, state_groups) in groups.per_state.iter().enumerate() {
         for group in state_groups {
             let set = store_set(
