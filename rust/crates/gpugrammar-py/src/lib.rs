@@ -79,13 +79,25 @@ fn compile(
 #[pyclass]
 pub struct Compiler {
     vocabulary: Vec<Vec<u8>>,
+    /// A digest of the vocabulary, stamped onto everything this compiler
+    /// produces. Two tokenizers of the same size are not the same tokenizer,
+    /// and a grammar used against the wrong one gives a mask that is wrong
+    /// token by token with nothing to notice it.
+    digest: u64,
 }
 
 #[pymethods]
 impl Compiler {
     #[new]
     fn new(vocabulary: Vec<Vec<u8>>) -> Self {
-        Self { vocabulary }
+        let digest = vocabulary_digest(&vocabulary);
+        Self { vocabulary, digest }
+    }
+
+    /// The digest of the vocabulary this compiler was built for.
+    #[getter]
+    fn vocabulary_digest(&self) -> u64 {
+        self.digest
     }
 
     /// Compile a JSON Schema, searching the lowerings for one that is LALR(1).
@@ -113,6 +125,7 @@ impl Compiler {
             artifact: Arc::new(compiled.artifact),
             precision: format!("{:?}", compiled.precision),
             approximations: compiled.approximations,
+            digest: self.digest,
         })
     }
 
@@ -129,6 +142,7 @@ impl Compiler {
             artifact: Arc::new(compile(&self.vocabulary, grammar, lexer_states)?),
             precision: "n/a".to_string(),
             approximations: Vec::new(),
+            digest: self.digest,
         })
     }
 
@@ -144,6 +158,7 @@ impl Compiler {
             artifact: Arc::new(compile(&self.vocabulary, grammar, lexer_states)?),
             precision: "n/a".to_string(),
             approximations: Vec::new(),
+            digest: self.digest,
         })
     }
 
@@ -167,10 +182,30 @@ pub struct CompiledGrammar {
     /// needs the schema itself has to check the finished document against
     /// these, and cannot do that without being told which they are.
     approximations: Vec<String>,
+    /// The vocabulary this was compiled against, as a digest.
+    digest: u64,
+}
+
+/// Order-sensitive, because a vocabulary is a mapping from token id to bytes
+/// and a permutation of it is a different mapping.
+fn vocabulary_digest(vocabulary: &[Vec<u8>]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for (index, token) in vocabulary.iter().enumerate() {
+        for byte in index.to_le_bytes().iter().chain(token.iter()) {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    hash
 }
 
 #[pymethods]
 impl CompiledGrammar {
+    /// A digest of the vocabulary this grammar was compiled against.
+    #[getter]
+    fn vocabulary_digest(&self) -> u64 {
+        self.digest
+    }
     #[pyo3(signature = (max_rollback = 8))]
     fn matcher(&self, max_rollback: usize) -> Matcher {
         Matcher {

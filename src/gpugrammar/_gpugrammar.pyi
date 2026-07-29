@@ -52,6 +52,14 @@ class CompiledGrammar:
     @property
     def precision(self) -> str: ...
     @property
+    def vocabulary_digest(self) -> int:
+        """The vocabulary this was compiled against, as a digest.
+
+        Two tokenizers of the same size are not the same tokenizer, and a
+        grammar's groups are token ids, so one used against the wrong
+        vocabulary gives a mask that is wrong token by token.
+        """
+    @property
     def bitset_words(self) -> int: ...
     @property
     def num_groups(self) -> int: ...
@@ -74,6 +82,8 @@ class Compiler:
     def __init__(self, vocabulary: list[bytes]) -> None: ...
     @property
     def vocab_size(self) -> int: ...
+    @property
+    def vocabulary_digest(self) -> int: ...
     def compile_json_schema(
         self,
         schema: str,

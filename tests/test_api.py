@@ -386,5 +386,57 @@ class ABatchThePoolOutgrew(unittest.TestCase):
         self.assertTrue(bool((mask[0].cpu()[: wide.bitset_words] == reference).all()))
 
 
+
+class WrongMasksThatWouldNotRaise(unittest.TestCase):
+    """Three ways to get a mask that is simply about something else.
+
+    None of them is an overflow - the parse is perfectly happy - so none is
+    reachable by the flag that reports narrowing. They have to be refused.
+    """
+
+    def setUp(self):
+        _requirements()
+        self.engine = gpugrammar.Engine(VOCABULARY)
+
+    def test_a_grammar_from_another_tokenizer_is_refused(self):
+        # Same size is not the same tokenizer: a grammar's groups are token
+        # ids, so a permuted vocabulary gives a mask wrong token by token.
+        other = gpugrammar.Engine(list(reversed(VOCABULARY)))
+        foreign = other.compile_json_schema(SCHEMA)
+        ours = self.engine.compile_json_schema(SCHEMA)
+        self.assertNotEqual(foreign.vocabulary_digest, ours.vocabulary_digest)
+        with self.assertRaises(ValueError):
+            self.engine.admit(foreign)
+
+    def test_an_unassigned_batch_is_refused_once_the_pool_is_mixed(self):
+        first = self.engine.compile_json_schema(json.dumps({"type": "string"}))
+        # One grammar: slot 0 is right for every sequence, so this is allowed.
+        single = self.engine.batch(size=2)
+        self.assertEqual(single.fill_mask().shape[0], 2)
+        self.engine.compile_json_schema(json.dumps({"type": "integer"}))
+        mixed = self.engine.batch(size=2)
+        with self.assertRaises(RuntimeError):
+            mixed.fill_mask()
+        mixed.set_grammars([first, first])
+        self.assertEqual(mixed.fill_mask().shape[0], 2)
+
+    def test_a_released_grammar_cannot_be_assigned(self):
+        keep = self.engine.compile_json_schema(json.dumps({"type": "string"}))
+        gone = self.engine.compile_json_schema(json.dumps({"type": "integer"}))
+        batch = self.engine.batch(size=2)
+        identifier = self.engine.admit(gone)
+        self.engine.pool.release(identifier)
+        # The slot is still inside `count`; it holds nothing.
+        with self.assertRaises(ValueError):
+            batch.set_grammars([identifier, identifier])
+        batch.set_grammars([keep, keep])
+
+    def test_a_negative_id_is_refused(self):
+        self.engine.compile_json_schema(SCHEMA)
+        batch = self.engine.batch(size=2)
+        with self.assertRaises(ValueError):
+            batch.raw.set_grammars([-1, 0])
+
+
 if __name__ == "__main__":
     unittest.main()

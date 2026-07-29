@@ -2719,6 +2719,10 @@ class ResidentTables:
     paths: int
     longest_set: int
     has_verdicts: int
+    # The tokenizer this was compiled against, not just its size. Defaulted
+    # so a caller holding a `ResidentTables` from before this existed still
+    # works; 0 means "unknown" and matches anything.
+    vocabulary_digest: int = 0
 
     @property
     def words(self) -> int:
@@ -2786,6 +2790,7 @@ class DeviceGrammar:
         self.count = 0
         self.revision = 0
         self.vocab_size = 0
+        self.vocabulary_digest = 0
         self.mask_words = 0
         self.window = window or 8
         self.window_bound = 0
@@ -3012,6 +3017,7 @@ class DeviceGrammar:
             paths=min(_MAX_PATHS, max(1, int(arrays.get("max_actions", 1)))),
             longest_set=int(lengths.max()) if lengths.size else 1,
             has_verdicts=1 if len(arrays["verdicts"]) else 0,
+            vocabulary_digest=getattr(compiled, "vocabulary_digest", 0),
         )
 
     def admit(self, compiled) -> int:
@@ -3027,8 +3033,22 @@ class DeviceGrammar:
         if self.count == 0 and not self.vocab_size:
             self.vocab_size = tables.vocab_size
             self.mask_words = tables.mask_words
+            self.vocabulary_digest = tables.vocabulary_digest
         elif tables.vocab_size != self.vocab_size:
             raise ValueError("grammars in one pool must share a vocabulary")
+        elif (
+            tables.vocabulary_digest
+            and self.vocabulary_digest
+            and tables.vocabulary_digest != self.vocabulary_digest
+        ):
+            # Same size is not the same tokenizer. A grammar's groups are token
+            # ids, so one compiled against a different ordering yields a mask
+            # that is wrong token by token, with nothing in the parse to notice
+            # - the one failure mode no verification downstream can catch.
+            raise ValueError(
+                "this grammar was compiled against a different vocabulary "
+                "from the rest of the pool"
+            )
 
         runs = tables.runs
         # Room is made before anything is written, because reserving array by
@@ -3375,6 +3395,11 @@ class DeviceBatch:
         # Which grammar each sequence is under. A serving batch mixes them, and
         # everything else in the step reads this to find its tables.
         self.grammar_of = torch.zeros(batch, dtype=torch.int32, device="cuda")
+        # Nothing has said which grammar each sequence is under yet, and
+        # zero is a real identifier - so a fill before `set_grammars` or
+        # `set_batch_configurations` would mask every sequence against
+        # whichever grammar happens to hold slot 0.
+        self.assigned = False
         self.token = torch.zeros(batch, dtype=torch.int32, device="cuda")
         rows = batch * self.configs
         self.lexer_state = torch.zeros(rows, dtype=torch.int32, device="cuda")
@@ -3509,8 +3534,22 @@ class DeviceBatch:
             raise ValueError(
                 f"{values.numel()} grammar ids for a batch of {self.batch}"
             )
+        if int(values.min()) < 0:
+            raise ValueError("negative grammar id")
         if int(values.max()) >= self.grammar.count:
             raise ValueError("grammar id past the end of the pool")
+        # `count` is how many slots exist, not which of them hold anything. A
+        # slot an eviction freed is still inside `count`, and a sequence under
+        # it would be masked against whatever the arena last left there.
+        dead = sorted(
+            {
+                identifier
+                for identifier in values.tolist()
+                if not self.grammar.is_live(identifier)
+            }
+        )
+        if dead:
+            raise ValueError(f"grammar ids no longer in the pool: {dead}")
         self.grammar_of.copy_(values.cuda())
         starts = torch.tensor(self.grammar.start_parser_states, dtype=torch.int32)[
             values.long()
@@ -3520,6 +3559,7 @@ class DeviceBatch:
         self.depth.fill_(1)
         self.config_count.fill_(1)
         self.lexer_state.zero_()
+        self.assigned = True
         # This is a reset, so what the previous parse reported about itself is
         # no longer about anything. Leaving the flags would carry a refusal, or
         # an overflow, into a sequence that has not taken a step yet.
@@ -3673,7 +3713,7 @@ class DeviceBatch:
         pays a device-to-host round trip per token, and no amount of making the
         parser itself faster removes it.
         """
-        self._check_shape()
+        self._check_assigned()
         self.token.copy_(tokens.to(torch.int32).reshape(-1)[: self.batch])
         if self.rollback_depth > 0:
             self.history_length = min(self.history_length + 1, self.rollback_depth)
@@ -3724,6 +3764,22 @@ class DeviceBatch:
                 "a grammar admitted since this batch was made needs more room "
                 f"than it has (sized for {self.sized_for}, pool now needs "
                 f"{self._ceilings()}): make a new batch from the engine"
+            )
+
+    def _check_assigned(self) -> None:
+        """Refuse to read an assignment nothing has written.
+
+        Zero is a real identifier, so an unassigned batch does not fail - it
+        masks every sequence against whichever grammar holds slot 0. Only a
+        question when the pool holds more than one: with a single grammar zero
+        is right for everyone, which is what a batch loaded straight from
+        `set_configurations` relies on.
+        """
+        self._check_shape()
+        if not self.assigned and self.grammar.count > 1:
+            raise RuntimeError(
+                "the pool holds several grammars and this batch has not been "
+                "told which one each sequence is under: call set_grammars first"
             )
 
     def _snapshot_live(self) -> dict[str, torch.Tensor]:
@@ -3818,7 +3874,7 @@ class DeviceBatch:
         `advance(tokens)` followed by `fill_mask()`, and the mask it returns is
         the same tensor `fill_mask` returns.
         """
-        self._check_shape()
+        self._check_assigned()
         self.token.copy_(tokens.to(torch.int32).reshape(-1)[: self.batch])
         if self.rollback_depth > 0:
             self.history_length = min(self.history_length + 1, self.rollback_depth)
@@ -4122,7 +4178,7 @@ class DeviceBatch:
         raise RuntimeError("call capture_draft first")
 
     def fill_mask(self) -> torch.Tensor:
-        self._check_shape()
+        self._check_assigned()
         if self.memo_revision != self.grammar.revision:
             # Compaction renumbers the grammars, so an entry saying "grammar 2"
             # now names a different one and its mask would be handed to it. The
