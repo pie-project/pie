@@ -293,6 +293,19 @@ void bind_decode_dag_mb(RawMetalContext& ctx, const BoundDecode& b,
     }
 }
 
+void alias_decode_conv_state_out(RawMetalContext& ctx, const BoundDecode& b,
+                                 const std::vector<Dispatch>& dag) {
+    for (const Dispatch& d : dag) {
+        if (d.kind != Kernel::GdnPrepSlotted && d.kind != Kernel::GdnCoreSlotted) continue;
+        const auto& s = b.gdn[size_t(d.layer)];
+        if (!s.conv_state.valid()) continue;
+        const uint8_t idx = d.kind == Kernel::GdnPrepSlotted
+                                ? uint8_t(bind::GdnPrep::ConvStateOut)
+                                : uint8_t(bind::GdnCoreRecurrent::ConvStateOut);
+        ctx.arg_bind_ordinal(d.ordinal, idx, s.conv_state);
+    }
+}
+
 void bind_prefill_gdn_state(RawMetalContext& ctx, const BoundDecode& b,
                             const std::vector<Dispatch>& dag, uint32_t slot, bool even) {
     for (const Dispatch& d : dag) {

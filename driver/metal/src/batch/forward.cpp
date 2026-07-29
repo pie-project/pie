@@ -529,6 +529,10 @@ struct MetalExecutor::Impl {
     // projection (`affine_qmm_t_strided` reads it at buffer 8).
     SlotHandle prefill_row_stride_{};
     SlotHandle prefill_scan_rows_{};
+    // A slot whose conv history was last written by the prefill's ping-pong may
+    // hold it in ConvStateOut; the paged decode writes in place and always
+    // leaves it in ConvState, so only the handover needs a copy.
+    std::vector<std::uint8_t> conv_in_out_{};
     Pso ptir_logits_copy_pso_{};
     std::uint32_t ptir_logits_capacity_rows_ = 0;
     std::uint32_t ptir_logits_next_row_ = 0;
@@ -1124,6 +1128,12 @@ bool MetalExecutor::Impl::bind_paged_dag(std::string* err) {
         if (!mb_bound_) {
             bind_scratch(*ctx_, mb_dag_, mb_sched_, pool_.data(), int(pool_.size()));
             bind_decode_consts(*ctx_, mb_dag_, g_, max_ctx_, gdn_prep_);
+            // Decode writes the shifted conv history straight back over the one
+            // it read.  Safe because each channel is read and written by the
+            // same thread, in that order, and prep and recurrent touch disjoint
+            // channels -- which saves copying every slot's whole conv slab back
+            // on the host after every single token.
+            alias_decode_conv_state_out(*ctx_, b_, mb_dag_);
             for (size_t t = 0; t < prefill_dags_.size(); ++t) {
                 bind_scratch(*ctx_, prefill_dags_[t], prefill_sched_, pool_.data(),
                              int(pool_.size()), t * prefill_scratch_row);
@@ -1609,11 +1619,14 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
         if (std::find(active_slots.begin(), active_slots.end(), sp.rs_slot) == active_slots.end())
             active_slots.push_back(sp.rs_slot);
     }
-    // The paged kernels always read ConvState and write ConvStateOut.  Normalize
-    // slots last touched by the M=1 ping-pong path before dispatch, then fold the
-    // completed result back into ConvState for the next paged fire.
+    // The paged decode shifts the conv history in place -- each channel of each
+    // slot is read by exactly one thread before that same thread writes it, and
+    // a pure-decode fire gives every request its own slot -- so there is nothing
+    // to fold back afterwards.  The prefill still ping-pongs per prompt token,
+    // so a slot handed over mid-parity is copied once, here.
     for (uint32_t slot : active_slots) {
-        if ((step_count_for(slot) & 1) == 0) continue;
+        if (slot >= conv_in_out_.size() || conv_in_out_[slot] == 0) continue;
+        conv_in_out_[slot] = 0;
         const size_t off = size_t(slot) * g_.gdn_conv_stride_bytes();
         // copy C -> A (different handles, same offset). A full-attention layer
         // has no GDN slab; skip it exactly as the commit below does.
@@ -1644,38 +1657,6 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
     if (!timing.succeeded())
         return fail("Metal command timed out before its completion fence");
 
-    for (uint32_t slot : active_slots) {
-        const size_t off = size_t(slot) * g_.gdn_conv_stride_bytes();
-        for (std::size_t layer = 0; layer < b_.gdn.size(); ++layer) {
-            auto& gs = b_.gdn[layer];
-            // A full-attention layer has no GDN slab: `build_bound_decode`
-            // leaves its entry default-constructed. Every other loop over
-            // `b_.gdn` treats that as a no-op (see `copy_state_slot`, whose
-            // comment says so); this one read it as a failure, so committing
-            // the ping-pong after a paged step died on the first full-attn
-            // layer of a hybrid.
-            if (!gs.conv_state.valid() && !gs.conv_state_out.valid()) continue;
-            if (!gs.conv_state.valid() ||
-                !ctx_->copy_buffer_range(
-                    gs.conv_state, off,
-                    gs.conv_state_out, off,
-                    g_.gdn_conv_stride_bytes())) {
-                return fail(
-                    "failed to commit GDN ping-pong state: layer " +
-                    std::to_string(layer) + " slot " + std::to_string(slot) +
-                    " offset " + std::to_string(off) + " stride " +
-                    std::to_string(g_.gdn_conv_stride_bytes()) +
-                    " conv_state " +
-                    (gs.conv_state.valid()
-                         ? "size " + std::to_string(gs.conv_state.size)
-                         : "<invalid>") +
-                    " conv_state_out " +
-                    (gs.conv_state_out.valid()
-                         ? "size " + std::to_string(gs.conv_state_out.size)
-                         : "<invalid>"));
-            }
-        }
-    }
     for (uint32_t slot : schedule.slot_of_token) ++step_count_for(slot);
     return true;
 }
@@ -1712,9 +1693,7 @@ bool MetalExecutor::Impl::run_prefill_step(
     // buffer token `scan_rows` reads, and an even prompt keeps one trailing
     // token on the per-token path.
     int gdn_scan_rows = 0;
-    static const bool gdn_scan_off = std::getenv("PIE_METAL_NO_GDN_SCAN") != nullptr;
-    if (!gdn_scan_off && schedule.R == 1 && prefill_scan_rows_.valid() &&
-        prefill_row_stride_.valid()) {
+    if (schedule.R == 1 && prefill_scan_rows_.valid() && prefill_row_stride_.valid()) {
         gdn_scan_rows = schedule.N % 2 == 1 ? schedule.N : schedule.N - 1;
         if (gdn_scan_rows < 3) gdn_scan_rows = 0;
         *static_cast<std::int32_t*>(prefill_scan_rows_.contents()) =
@@ -1751,6 +1730,12 @@ bool MetalExecutor::Impl::run_prefill_step(
             schedule.N);
     }
     for (uint32_t slot : schedule.slot_of_token) ++step_count_for(slot);
+    // The prompt's last token decides which half of the ping-pong holds the
+    // history; the paged decode reads ConvState, so record an odd handover.
+    if (conv_in_out_.size() < size_t(g_.max_slots))
+        conv_in_out_.assign(size_t(g_.max_slots), 0);
+    for (uint32_t slot : schedule.slot_of_token)
+        conv_in_out_[slot] = std::uint8_t(step_count_for(slot) & 1);
     return true;
 }
 

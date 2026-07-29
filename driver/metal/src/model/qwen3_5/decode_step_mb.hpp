@@ -65,6 +65,11 @@ void encode_prefill_dags_mb(StepEncoder& se,
                             int max_rows = 0,
                             int gdn_scan_rows = 0);
 
+// Point ConvStateOut at ConvState so a paged decode shifts the conv history in
+// place; the prefill re-binds its own ordinals per fire and is unaffected.
+void alias_decode_conv_state_out(RawMetalContext& ctx, const BoundDecode& b,
+                                 const std::vector<Dispatch>& dag);
+
 void encode_decode_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
                            const DecodeStepPsos& base_psos, const MultiBatchPsos& mb_psos,
                            bool force_barriers = false);
