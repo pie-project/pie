@@ -1,5 +1,7 @@
 #include "pipeline/m1_runtime.hpp"
 
+#include "model/qwen3_5/decode_step_mb.hpp"
+
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -733,7 +735,11 @@ struct M1Runtime::Impl {
     std::unique_ptr<RawMetalContext> context;
     std::filesystem::path cache_dir;
     std::string ptir_rng_preamble;
-    int next_ordinal = 100000;
+    // Above every ordinal the decode/prefill DAGs can claim.  These two spaces
+    // share one argument-table namespace and were separated only by both being
+    // small; a prefill sized for 512 rows reaches 264192, which ran straight
+    // through the old 100000 base.
+    int next_ordinal = kPrefillOrdinalLimit;
     std::unordered_map<std::string, std::shared_ptr<M1StageExecutable>>
         stage_cache;
     std::unordered_map<

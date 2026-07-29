@@ -219,6 +219,9 @@ inline constexpr std::uint32_t kPagedForwardRowBudgetBytes = 384u << 20;
 inline constexpr std::uint32_t kPagedScratchColors = 16;
 inline constexpr std::uint32_t kPagedMinForwardTokens = 64;
 inline constexpr std::uint32_t kPagedMaxForwardTokensCeiling = 512;
+// Every row claims a block of argument-table ordinals, so this ceiling also
+// fixes where the prefill's ordinal space ends and PTIR's may begin; see
+// `kPrefillOrdinalLimit`, which the setup path cross-checks against this.
 
 inline std::uint32_t paged_max_forward_tokens(std::uint32_t vocab,
                                               std::uint32_t scratch_widest_elems,

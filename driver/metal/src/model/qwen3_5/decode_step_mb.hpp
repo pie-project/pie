@@ -13,6 +13,15 @@ namespace pie::metal {
 inline constexpr int kMultiBatchOrdinalBase = 1024;
 inline constexpr int kPrefillOrdinalBase = 2048;
 inline constexpr int kPrefillOrdinalStride = 512;
+// One past the highest ordinal a prefill row can claim.  The PTIR runtime
+// allocates its own ordinals and must start at or above this: the two spaces
+// were separated only by both being small, and raising the rows-per-fire bound
+// from 64 to 512 walked the prefill range straight through PTIR's base at
+// 100000, which showed up as "no argument table bound for ordinal=100038".
+// Deriving one from the other means they cannot silently overlap again.
+inline constexpr int kPrefillOrdinalMaxRows = 512;  // == executor::kPagedMaxForwardTokensCeiling
+inline constexpr int kPrefillOrdinalLimit =
+    kPrefillOrdinalBase + kPrefillOrdinalMaxRows * kPrefillOrdinalStride;
 
 // Per-token table offsets for the sequential prompt stream.  CSR page arrays
 // stay global; scalar/token-row ports and logits advance together (the caller

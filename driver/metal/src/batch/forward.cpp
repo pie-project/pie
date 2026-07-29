@@ -658,6 +658,10 @@ inline constexpr int kPtirLogitsCopyOrdinal = 90000;
 // Rows one staging dispatch can carry. Bounded by the paged forward's row
 // capacity, which is what `LogitsOut::rows` is drawn from.
 inline constexpr std::size_t kPtirLogitsCopyMaxRows = kPagedMaxForwardTokensCeiling;
+// The prefill's ordinal blocks and PTIR's allocations share one argument-table
+// namespace, and the ceiling above is what decides where the first ends.
+static_assert(int(kPagedMaxForwardTokensCeiling) <= kPrefillOrdinalMaxRows,
+              "prefill rows would claim ordinals PTIR hands out");
 
 void write_u32(const SlotHandle& s, uint32_t v) {
     std::memcpy(s.contents(), &v, sizeof(v));
