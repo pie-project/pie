@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <algorithm>
 #include <vector>
 
 #include "decode_abi.hpp"
@@ -33,12 +34,15 @@ constexpr size_t TSZ = 2;  // bfloat16
 // Amortize over `repeats` dispatches in one command buffer so the per-CB sync
 // floor drops out and what is left is what a fused decode step actually pays.
 double amortized_ms(RawMetalContext& ctx, Pso pso, Kernel k, int ord, Grid grid,
-                    Threadgroup tg, int repeats = 64) {
+                    Threadgroup tg, int repeats = 64, int copies = 1) {
     LatencyHarness h(ctx);
     auto fn = [&](StepEncoder& se) {
         se.set_pso(pso);
         for (int i = 0; i < repeats; ++i) {
-            se.set_argtable(k, ord);
+            // Rotate the argument table across distinct weight copies: repeating
+            // one dispatch measures a cache-hot GEMM, and a real decode step
+            // reads each projection's weights exactly once, cold.
+            se.set_argtable(k, ord + (copies > 1 ? i % copies : 0));
             se.dispatch(grid, tg);
             se.barrier();
         }
@@ -71,6 +75,8 @@ int main(int argc, char** argv) {
     if (argc > 1) dir = argv[1];
     const int M = argc > 2 ? atoi(argv[2]) : 16;
     const int BN = argc > 3 ? atoi(argv[3]) : 32;
+    const int SPLIT = argc > 4 ? atoi(argv[4]) : 1;
+    const bool COLD = getenv("PROBE_COLD") != nullptr;
 
     auto ctx = RawMetalContext::create(/*heap_bytes=*/3072ull << 20);
     if (!ctx) { printf("FAIL: no context\n"); return 1; }
@@ -86,6 +92,20 @@ int main(int argc, char** argv) {
     Pso qmv = ctx->compile_pso_from_file(dir + "/quantized_qmv.metal",
                                          "affine_qmv_fast_bfloat16_gs_64_b_4", &err);
     if (!qmv.valid()) { printf("FAIL qmv compile: %s\n", err.c_str()); return 1; }
+    Pso qsk, qred;
+    if (SPLIT > 1) {
+        const std::string sp = std::to_string(SPLIT);
+        qsk = ctx->compile_pso_from_file(
+            dir + "/quantized_qmm_t.metal",
+            "affine_qmm_t_splitk_bfloat16_gs_64_b_4_bm_16_bn_" +
+                std::to_string(BN) + "_sp_" + sp, &err);
+        qred = ctx->compile_pso_from_file(dir + "/quantized_qmm_t.metal",
+                                          "qmm_splitk_reduce_bfloat16_sp_" + sp, &err);
+        if (!qsk.valid() || !qred.valid()) {
+            printf("FAIL splitk compile: %s\n", err.c_str());
+            return 1;
+        }
+    }
 
     // ── the machine's streaming roof ────────────────────────────────────────
     double roof_gbs = 0;
@@ -107,7 +127,28 @@ int main(int argc, char** argv) {
                BYTES >> 20, ms, roof_gbs);
     }
 
-    printf("M=%d BN=%d  4-bit affine g64, per-dispatch amortized\n", M, BN);
+    // What one more barrier-separated dispatch costs, with no compute and no
+    // memory traffic in it -- the floor every dispatch in the step pays.
+    {
+        Pso nop = ctx->compile_pso_from_file(dir + "/nop_probe.metal", "nop_probe", &err);
+        if (nop.valid()) {
+            LatencyHarness h(*ctx);
+            for (int reps : {64, 256, 1024}) {
+                auto fn = [&](StepEncoder& se) {
+                    se.set_pso(nop);
+                    for (int i = 0; i < reps; ++i) {
+                        se.dispatch(Grid{1, 1, 1}, Threadgroup{1, 1, 1});
+                        se.barrier();
+                    }
+                };
+                const double ms = h.time_step("nop", fn, 40, 10).median.gpu_exec_ms;
+                printf("nop dispatch+barrier x%-5d %7.3f ms -> %.2f us each\n", reps, ms,
+                       ms * 1000.0 / reps);
+            }
+        }
+    }
+    printf("\nM=%d BN=%d SPLIT=%d  4-bit affine g64, per-dispatch amortized\n", M, BN,
+           SPLIT);
     printf("  (threadgroups per dispatch = N/BN x ceil(M/16))\n");
     printf("%-24s %9s %9s %8s %9s %8s\n", "shape", "ms", "GB/s", "%roof",
            "GFLOP/s", "n_tg");
@@ -117,6 +158,9 @@ int main(int argc, char** argv) {
         const uint32_t K = s.K, N = s.N;
         const size_t wb = size_t(N) * (K / 2);
         const size_t sb = size_t(N) * (K / GROUP) * TSZ;
+        // Enough distinct weight copies to exceed any cache the machine has, so
+        // the rotation above actually reaches memory.
+        const int copies = COLD ? int(std::min<size_t>(16, (192ull << 20) / (wb + 2 * sb) + 1)) : 1;
         SlotHandle w = ctx->heap_alloc(wb);
         SlotHandle sc = ctx->heap_alloc(sb);
         SlotHandle bi = ctx->heap_alloc(sb);
@@ -132,6 +176,20 @@ int main(int argc, char** argv) {
         *static_cast<int32_t*>(ks.contents()) = int32_t(K);
         *static_cast<int32_t*>(ns.contents()) = int32_t(N);
         const Kernel kk = Kernel::QmvIn;
+        std::vector<SlotHandle> extra;
+        for (int c = 1; c < copies; ++c) {
+            SlotHandle w2 = ctx->heap_alloc(wb);
+            if (!w2.valid()) break;
+            memset(w2.contents(), 0, wb);
+            extra.push_back(w2);
+            ctx->arg_bind(kk, ord + c, uint8_t(bind::Qmv::W), w2);
+            ctx->arg_bind(kk, ord + c, uint8_t(bind::Qmv::Scales), sc);
+            ctx->arg_bind(kk, ord + c, uint8_t(bind::Qmv::Biases), bi);
+            ctx->arg_bind(kk, ord + c, uint8_t(bind::Qmv::X), x);
+            ctx->arg_bind(kk, ord + c, uint8_t(bind::Qmv::Out), y);
+            ctx->arg_bind(kk, ord + c, uint8_t(bind::Qmv::K), ks);
+            ctx->arg_bind(kk, ord + c, uint8_t(bind::Qmv::N), ns);
+        }
         ctx->arg_bind(kk, ord, uint8_t(bind::Qmv::W), w);
         ctx->arg_bind(kk, ord, uint8_t(bind::Qmv::Scales), sc);
         ctx->arg_bind(kk, ord, uint8_t(bind::Qmv::Biases), bi);
@@ -155,7 +213,48 @@ int main(int argc, char** argv) {
             g = Grid{32u * (N / uint32_t(BN)), 2u * (rows / 16u), 2};
             tg = Threadgroup{32, 2, 2};
         }
-        const double ms = amortized_ms(*ctx, pso, kk, ord, g, tg);
+        double ms;
+        if (SPLIT > 1) {
+            const uint32_t rows = uint32_t((M + 15) / 16 * 16);
+            SlotHandle part = ctx->heap_alloc(size_t(SPLIT) * rows * N * sizeof(float));
+            SlotHandle ms_ = ctx->heap_alloc(sizeof(int32_t));
+            if (!part.valid()) { printf("  %s: partial OOM\n", s.label); continue; }
+            *static_cast<int32_t*>(ms_.contents()) = int32_t(rows);
+            // split-K argtable: partial at 4, M at 7 (K/N keep the Qmv slots)
+            ctx->arg_bind(kk, ord + 100, 0, w);
+            ctx->arg_bind(kk, ord + 100, 1, sc);
+            ctx->arg_bind(kk, ord + 100, 2, bi);
+            ctx->arg_bind(kk, ord + 100, 3, x);
+            ctx->arg_bind(kk, ord + 100, 4, y);
+            ctx->arg_bind(kk, ord + 100, 5, ks);
+            ctx->arg_bind(kk, ord + 100, 6, ns);
+            ctx->arg_bind(kk, ord + 100, 7, y);
+            ctx->arg_bind(kk, ord + 100, 8, part);
+            ctx->arg_bind(kk, ord + 100, 9, ms_);
+            ctx->make_resident();
+            const Grid gk{32u * (N / uint32_t(BN)), 2u * (rows / 16u),
+                          2u * uint32_t(SPLIT)};
+            const Threadgroup tgk{32, 2, 2};
+            const Grid gr{N, rows, 1};
+            const Threadgroup tgr{256, 1, 1};
+            LatencyHarness h2(*ctx);
+            const int reps = 32;
+            auto fn = [&](StepEncoder& se) {
+                for (int i = 0; i < reps; ++i) {
+                    se.set_pso(qsk);
+                    se.set_argtable(kk, ord + 100);
+                    se.dispatch(gk, tgk);
+                    se.barrier();
+                    se.set_pso(qred);
+                    se.set_argtable(kk, ord + 100);
+                    se.dispatch(gr, tgr);
+                    se.barrier();
+                }
+            };
+            ms = h2.time_step("sk", fn, 40, 10).median.gpu_exec_ms / reps;
+        } else {
+            ms = amortized_ms(*ctx, pso, kk, ord, g, tg, 64, int(extra.size()) + 1);
+        }
         const double bytes = double(weight_bytes(K, N));
         const double flop = 2.0 * double(M) * double(K) * double(N);
         printf("%-24s %9.4f %9.1f %7.0f%% %9.1f %8u\n", s.label, ms,
@@ -165,7 +264,7 @@ int main(int argc, char** argv) {
         total_ms += ms * s.count;
         total_bytes += bytes * s.count;
         total_flop += flop * s.count;
-        ++ord;
+        ord += 32;  // leave room for this shape's weight copies
     }
     printf("\nwhole step (projections only, x count):\n");
     printf("  %.2f ms   %.0f MB   %.1f GB/s (%.0f%% of roof)   %.2f TFLOP/s\n",

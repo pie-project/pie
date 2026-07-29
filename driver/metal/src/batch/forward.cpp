@@ -1641,6 +1641,9 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
         }
     }
 
+    // Alternate the two arms fire by fire so both see the same machine.
+    static bool ab_flip = false;
+    if (ab_enabled()) ab_set_arm(ab_flip = !ab_flip);
     const std::vector<Dispatch> fire_dag =
         build_decode_dag_mb(g_, schedule.N, kMultiBatchOrdinalBase, fuse_residual_, gdn_prep_);
     const StepTiming timing = ctx_->run_step([&](StepEncoder& se) {
@@ -1656,6 +1659,22 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
     });
     if (!timing.succeeded())
         return fail("Metal command timed out before its completion fence");
+    // GPU-only step meter.  This machine is permanently contended (the agent
+    // process alone runs at ~250% CPU), so wall-clock A/B swings 3x and cannot
+    // decide anything; the command buffer's own execution time can.  Bucketed by
+    // lane count, since the cost is strongly batch-dependent.
+    if (std::getenv("PIE_METAL_GPU_METER") != nullptr) {
+        static double sum[2][33] = {};
+        static int n[2][33] = {};
+        const int lanes = schedule.N < 33 ? schedule.N : 32;
+        const int arm = ab_enabled() && ab_arm() ? 1 : 0;
+        sum[arm][lanes] += timing.gpu_exec_ms;
+        if (++n[arm][lanes] % 128 == 0) {
+            std::fprintf(stderr, "[gpu] lanes=%d A n=%d %.4f ms | B n=%d %.4f ms\n", lanes,
+                         n[0][lanes], n[0][lanes] ? sum[0][lanes] / n[0][lanes] : 0.0,
+                         n[1][lanes], n[1][lanes] ? sum[1][lanes] / n[1][lanes] : 0.0);
+        }
+    }
 
     for (uint32_t slot : schedule.slot_of_token) ++step_count_for(slot);
     return true;

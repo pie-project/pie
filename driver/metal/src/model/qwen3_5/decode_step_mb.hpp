@@ -70,6 +70,17 @@ void encode_prefill_dags_mb(StepEncoder& se,
 void alias_decode_conv_state_out(RawMetalContext& ctx, const BoundDecode& b,
                                  const std::vector<Dispatch>& dag);
 
+// Interleaved A/B.  This machine is permanently contended -- the agent process
+// alone runs at ~250% CPU and macOS daemons spike on top of it -- so the same
+// binary measures anywhere from 11.5s to 23s and no before/after comparison
+// across runs means anything.  Alternating the arms fire by fire inside ONE run
+// puts both under identical conditions at millisecond granularity, which is the
+// only way left to decide a change here.  `ab_arm()` is read wherever the two
+// arms differ; `ab_enabled()` says whether to alternate at all.
+bool ab_enabled();
+bool ab_arm();
+void ab_set_arm(bool b);
+
 void encode_decode_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
                            const DecodeStepPsos& base_psos, const MultiBatchPsos& mb_psos,
                            bool force_barriers = false);

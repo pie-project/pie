@@ -42,6 +42,17 @@ int qmv_out_size(Kernel k, const DecodeGeometry& g) {
 }
 
 namespace {
+bool g_ab_arm = false;
+}  // namespace
+
+bool ab_enabled() {
+    static const bool on = std::getenv("PIE_METAL_AB") != nullptr;
+    return on;
+}
+bool ab_arm() { return g_ab_arm; }
+void ab_set_arm(bool b) { g_ab_arm = b; }
+
+namespace {
 
 void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
     auto rms = [&](int row, int rows) { rms_mb_dispatch(row, rows, n, d.grid, d.tg); };
@@ -514,7 +525,13 @@ void encode_decode_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
         se.set_pso(mb_pso(d, base_psos, mb_psos));
         se.set_argtable(d.kind, d.ordinal);
         se.dispatch(d.grid, d.tg);
-        if (force_barriers || barrier_after_mb(dag, i, run_ends)) se.barrier();
+        // Arm B of the interleaved A/B serializes the concurrency groups, which
+        // is the default question the meter answers: what is running independent
+        // dispatches together actually worth?  (Measured 3.8% at 16 lanes.)
+        // Point this at whatever change is being evaluated instead.
+        if (force_barriers || (ab_enabled() && ab_arm()) ||
+            barrier_after_mb(dag, i, run_ends))
+            se.barrier();
     }
 }
 
