@@ -4393,3 +4393,79 @@ soak 4096/4096, tinyswap 3/3, allshared_noswap 128/128 x3, churn_extreme
  2. The 33 ms from predecessor `drop_entered` to successor `exec admitted`
     still stands: teardown tasks wait p50 18.6 ms to be FIRST POLLED with
     170-424 spawned-but-unpolled tasks at a boundary.
+
+## §20.25 — post_frame placement, and where the idle ACTUALLY is
+
+### The change: place by slot instead of push-then-sort
+`post_frame` picked each queued fire into `Vec<(usize, PendingRequest)>` and
+then `sort_by_key`'d it back into the sealed wave's order. `PendingRequest`
+is **1280 bytes** (`LaunchPlan` alone is 1024), so that sort swapped 1288-byte
+elements n log n times — several MB of `memmove` per frame. But `position` is
+already a permutation of `0..wave.len()`, so the order is recovered by writing
+each request straight into its slot: one move per fire, no comparisons. The
+survivor filter then folds into the compaction pass, and the slot buffer is
+owned by the loop (`SlotBuffer`) so steady state neither allocates nor refills.
+
+```
+                  BEFORE      AFTER    delta
+  loop_post_us     3.506 ms   2.700 ms  -23.0%
+    post_sort        0.955 ms   (gone)
+    post_filter      0.533 ms   0.598 ms   (absorbs compaction)
+    post_drain       0.401 ms   0.409 ms
+  loop_dispatch_us 4.000 ms   3.282 ms  -17.9%
+  loop_lag_us      3.803 ms   3.154 ms  -17.0%
+```
+
+**Throughput: unchanged (31407 -> 31173, inside noise).** Kept anyway: an
+n log n sort of 1.3 KB payloads to recover an order that was already known is
+simply the wrong algorithm. But the fact that it bought NOTHING is the real
+result of this section.
+
+### Why it bought nothing: the loop was never the constraint
+GPU idle is not spread across the run. Of **528 waves, only 27 have any idle
+at all** — 501 waves have exactly zero. And the big ones land on waves
+
+```
+  66, 132, 198, 264, 330, 396, 462      <- every 66 waves, exactly
+```
+
+4096 requests / 512 concurrency = 8 cohorts; 528 waves / 8 = 66. **These are
+the seven cohort boundaries, and they carry 614 ms of the run's 784 ms of
+idle (78%).** Cutting `loop_lag_us` from 5.65 ms (§20.23) to 3.15 ms moved the
+boundary gap by 3% (161 -> 156 ms) and total idle not at all. The scheduler
+loop keeps up on 95% of waves; shaving its pass time is finished as a lever.
+
+### Anatomy of a boundary (wave 330, 122.9 ms, all 512 processes)
+```
+  +0.8 .. +38.6 ms   512 old guests return from main and drop
+  +13.5 ms (p50)     drop entered  (scratch_rm 7 us, permit release 12 us)
+  +44.8 ms (p50)     teardown task FIRST POLLED   <- +31 ms of nothing
+  +44.5 ms (p50)     successor exec-admitted (p10 +18.0, p90 +59.4)
+  +122.9 ms          the frame finally dispatches
+```
+The successors were already warm: `instantiate` / `guest_main_entered` ran at
+**-10.2 s** and `bind_admitted` at **-2.0 s**. Prewarm and bind are NOT on the
+boundary path. The whole cost is retirement -> readmission -> first fire.
+
+### It is NOT CPU saturation (measured, since perf/eBPF are unavailable here)
+Sampling `/proc/<pid>/task/*/schedstat` at 200 Hz through a run:
+```
+                   cores busy (of 13.6)   runqueue wait
+  steady state         3.6 - 5.5              0.00
+  cohort boundary      9.0 - 10.1             0.00 - 0.01
+```
+Runqueue wait is zero: nothing is starved of a core. But a spawned teardown
+task still waits **p50 17.0 ms / p90 30.5 ms** to be first polled. That is
+queueing INSIDE tokio — ~1500 tasks become runnable at once and each worker
+walks its local queue — not the OS.
+
+The boundary carries roughly 9.3 cores x 84 ms = **0.8 s of CPU for 512
+turnovers, i.e. ~1.5 ms of CPU per process turnover**, at only 68% of the
+quota. Two levers follow, and they are the next work:
+ 1. cut the per-turnover CPU (the teardown task's `drop(context)` — the
+    wasmtime `ResourceTable` — is *unmeasured*: `released_us` is written
+    before it; and there are 18 `cuda_channel_register` per process);
+ 2. raise boundary parallelism from 9.3 to 13.6 cores.
+
+VERIFIED: frame 25 pass / 2 pre-existing fail; hog 32/32, soak 4096/4096,
+tinyswap 3/3, allshared_noswap 128/128 x3, churn_extreme 4096/4096 x4.
