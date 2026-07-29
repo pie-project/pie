@@ -66,18 +66,25 @@ inline int qmm_bm(int N) { return N >= kQmmWideMinBatch ? kQmmBMWide : kQmmBM; }
 //
 // BN partitions output columns only -- every element's K sum is unchanged -- so
 // the choice is bit-exact whichever way it goes.
-inline constexpr int kQmmMinThreadgroups = 192;
 
 inline int qmm_bn(int out_vec, int N) {
     const int bm = qmm_bm(N);
     if (N < kQmmMinBatch || N % bm != 0) return 0;
-    const int row_blocks = N / bm;
+    // Take the WIDEST tile that divides the output, full stop.
+    //
+    // This used to gate on a threadgroup count, and that was right when the
+    // GEMM had nothing else supplying parallelism: measured then, BN=64 lost
+    // everywhere except lm_head and the occupancy rule was worth 677 -> 712
+    // tok/s.  Split-K changed the premise.  The split now supplies the
+    // threadgroups, so the only thing BN still decides is how many times each
+    // weight tile is dequantized -- and wider is strictly fewer.
+    //
+    // Interleaved A/B, decode step, widest against the old 192-threadgroup
+    // rule: 16 lanes 31.57ms to 37.02, 32 lanes 141.18 to 158.45.  The old
+    // rule is a pessimization now.
     int best = 0;
-    for (int bn : {16, 32, 64}) {
-        if (out_vec % bn != 0) continue;
-        if (best == 0) best = bn;  // the narrowest that divides, as a floor
-        if ((out_vec / bn) * row_blocks >= kQmmMinThreadgroups) best = bn;
-    }
+    for (int bn : {16, 32, 64})
+        if (out_vec % bn == 0) best = bn;
     return best;
 }
 
