@@ -21,6 +21,19 @@ import torch
 INSTANCES = Path("results/jsonschemabench-instances.json")
 
 
+
+def _capture_is_possible() -> bool:
+    """A differential run compares on the host, so nothing can be recorded.
+
+    The parts of these checks that compare a mask against the reference matcher
+    still run and are the point; only the assertions *about the recording* have
+    nothing to say when there is no recording.
+    """
+    import os
+
+    return os.environ.get("GPUGRAMMAR_BACKEND", "").strip().lower() != "differential"
+
+
 def main() -> None:
     import gpugrammar
     from transformers import AutoTokenizer
@@ -141,6 +154,9 @@ def main() -> None:
     import random
 
     rng = random.Random(20260727)
+    if not _capture_is_possible():
+        print("graph replay: skipped, nothing can be recorded in this mode")
+        return
     fresh = [rng.randrange(len(pool)) for _ in range(batch)]
     device.set_grammars(fresh)
     matchers = [pool[fresh[i]].matcher(0) for i in range(batch)]

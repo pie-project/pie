@@ -85,5 +85,118 @@ class AKernelReachesTheDevice(unittest.TestCase):
             self._launch("gg_no_such_kernel", self.count, 0)
 
 
+
+class TheDifferentialHarnessCanFail(unittest.TestCase):
+    """A comparison that has never failed is a comparison nobody has tested.
+
+    `GPUGRAMMAR_BACKEND=differential` runs both backends on the same input and
+    refuses to continue if they disagree. It is the only check that can catch a
+    CUDA-only difference - the verifications compare a backend against the
+    reference matcher, which finds a wrong answer but not one both backends
+    would share. So it has to be shown to notice, by making it notice.
+    """
+
+    def setUp(self):
+        if not HAVE_CUDA:
+            raise unittest.SkipTest("no CUDA device")
+        import json
+
+        import gpugrammar
+
+        vocabulary = [bytes([i]) for i in range(256)]
+        self.engine = gpugrammar.Engine(vocabulary)
+        self.grammar = self.engine.compile_json_schema(
+            json.dumps({
+                "type": "object",
+                "properties": {"a": {"type": "string"}},
+                "required": ["a"],
+            })
+        )
+
+    def _batch_that_disagrees(self, path, field):
+        from gpugrammar import _engine
+
+        batch = self.engine.batch(size=4)
+        batch.set_grammars([self.grammar] * 4)
+        raw = batch.raw
+        name = "_fill_cuda" if path == "fill" else "_advance_cuda"
+        original = getattr(raw, name)
+
+        def wrong():
+            result = original()
+            getattr(raw, field)[0] += 1  # one entry, of one tensor
+            return result
+
+        setattr(raw, name, wrong)
+        raw.backend = _engine._DIFFERENTIAL
+        return raw
+
+    def test_a_difference_in_the_mask_is_caught(self):
+        raw = self._batch_that_disagrees("fill", "mask")
+        with self.assertRaises(AssertionError) as caught:
+            raw._fill()
+        self.assertIn("mask", str(caught.exception))
+
+    def test_a_difference_in_the_parse_state_is_caught(self):
+        raw = self._batch_that_disagrees("advance", "lexer_state")
+        with self.assertRaises(AssertionError) as caught:
+            raw.advance(torch.zeros(4, dtype=torch.int32, device="cuda"))
+        self.assertIn("lexer_state", str(caught.exception))
+
+    def test_agreeing_backends_do_not_raise(self):
+        from gpugrammar import _engine
+
+        batch = self.engine.batch(size=4)
+        batch.set_grammars([self.grammar] * 4)
+        batch.raw.backend = _engine._DIFFERENTIAL
+        # Both sides are Triton until a kernel is ported, so this asserts the
+        # snapshot and restore are complete rather than that the port is right.
+        # It is still the load-bearing half: an incomplete restore would make
+        # every later comparison meaningless, and it did - the rollback history
+        # was missing from the first version and the rollback checks caught it.
+        batch.fill_mask()
+        batch.advance(torch.zeros(4, dtype=torch.int32, device="cuda"))
+        batch.fill_mask()
+
+    def test_differential_refuses_to_be_captured(self):
+        from gpugrammar import _engine
+
+        batch = self.engine.batch(size=4)
+        batch.set_grammars([self.grammar] * 4)
+        batch.raw.backend = _engine._DIFFERENTIAL
+        # Recording would capture whichever backend ran last and drop the
+        # comparison, which is a graph that silently checks nothing.
+        with self.assertRaises(RuntimeError):
+            batch.capture()
+
+
+class TheBackendIsSelectable(unittest.TestCase):
+    def test_only_the_three_names_are_accepted(self):
+        import os
+
+        from gpugrammar import _engine
+
+        held = os.environ.get("GPUGRAMMAR_BACKEND")
+        try:
+            for name in ("triton", "cuda", "differential"):
+                os.environ["GPUGRAMMAR_BACKEND"] = name
+                self.assertEqual(_engine._chosen_backend(), name)
+            os.environ["GPUGRAMMAR_BACKEND"] = "cudaa"
+            with self.assertRaises(ValueError):
+                _engine._chosen_backend()
+        finally:
+            if held is None:
+                os.environ.pop("GPUGRAMMAR_BACKEND", None)
+            else:
+                os.environ["GPUGRAMMAR_BACKEND"] = held
+
+    def test_what_is_ported_is_reported(self):
+        from gpugrammar import _engine
+
+        # Empty while the port is starting. This exists so that a claim about
+        # which paths are CUDA is checkable rather than a comment.
+        self.assertIsInstance(_engine.ported(), frozenset)
+
+
 if __name__ == "__main__":
     unittest.main()

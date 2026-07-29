@@ -118,6 +118,18 @@ jobs:
         run: uv run --with numpy python -m unittest discover -s tests
         env:
           PYTHONPATH: src
+      # The port's safety net. Both backends on the same input, compared word
+      # for word, and any disagreement fails the run. The verifications below
+      # check a backend against the reference matcher, which finds a wrong
+      # answer but not one both backends would share; this finds any
+      # difference at all, which is what a port needs.
+      - name: the two backends agree
+        run: |
+          uv run --with numpy python -m unittest discover -s tests
+          uv run python -m gpu_lr1.verify --quick
+        env:
+          PYTHONPATH: src
+          GPUGRAMMAR_BACKEND: differential
       # Not unit tests. Each walks real documents through the device and
       # compares the mask word for word against the reference matcher, which
       # is the only thing that can see a mask that narrowed - and it is what

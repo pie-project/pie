@@ -14,6 +14,7 @@ rest of the suite runs without them.
 from __future__ import annotations
 
 import json
+import os
 import unittest
 from pathlib import Path
 
@@ -52,6 +53,15 @@ def _requirements():
     if not HAS_GPUGRAMMAR:
         raise unittest.SkipTest("gpugrammar is not built")
 
+
+
+# A differential run compares the two backends on the host, so nothing in it
+# can be recorded into a graph. Tests whose subject *is* the recording have
+# nothing to say in that mode.
+NEEDS_CAPTURE = unittest.skipIf(
+    os.environ.get("GPUGRAMMAR_BACKEND", "").strip().lower() == "differential",
+    "differential mode compares on the host and cannot capture",
+)
 
 class DeviceParserAgreement(unittest.TestCase):
     """The device mask equals the CPU matcher's, step by step."""
@@ -255,6 +265,8 @@ class MixedGrammarBatch(unittest.TestCase):
         # The schemas differ, so at the very start their masks must differ too;
         # if dedup had merged them these rows would be identical.
         self.assertFalse(torch.equal(masks[0], masks[1]))
+
+    @NEEDS_CAPTURE
 
     def test_one_graph_serves_any_assignment(self):
         """A CUDA graph is a fixed sequence of launches.
@@ -477,6 +489,8 @@ class Rollback(unittest.TestCase):
         matcher.fill_bitmask(reference)
         self.assertTrue(torch.equal(batch.fill_mask()[0].cpu(), reference))
 
+    @NEEDS_CAPTURE
+
     def test_the_history_survives_a_captured_advance(self):
         """The advance keeps history from inside a CUDA graph.
 
@@ -573,6 +587,8 @@ class GrammarPool(unittest.TestCase):
         batch = pool.new_batch(4)
         self.assertTrue(self._mask_matches(pool, batch, [0, 1, 2, 3], compiled))
 
+    @NEEDS_CAPTURE
+
     def test_a_graph_survives_admission_into_spare_capacity(self):
         pool = self.DeviceGrammar()
         compiled = [self._compile(0), self._compile(1)]
@@ -615,6 +631,8 @@ class GrammarPool(unittest.TestCase):
         self.assertTrue(
             self._mask_matches(pool, batch, [remap[1], remap[3]], survivors)
         )
+
+    @NEEDS_CAPTURE
 
     def test_a_recorded_graph_is_not_replayed_after_compaction(self):
         pool = self.DeviceGrammar()
@@ -669,6 +687,8 @@ class DraftWalk(unittest.TestCase):
             device="cuda",
         )
 
+    @NEEDS_CAPTURE
+
     def test_every_position_agrees_with_the_matcher(self):
         batch = 4
         pieces = [b'{"', b"name", b'":', b'"']
@@ -691,6 +711,8 @@ class DraftWalk(unittest.TestCase):
                     f"position {position} row {row}",
                 )
 
+    @NEEDS_CAPTURE
+
     def test_the_walk_leaves_the_parse_where_it_found_it(self):
         device = self.pool.new_batch(2)
         matcher = self.compiled.matcher(0)
@@ -700,6 +722,8 @@ class DraftWalk(unittest.TestCase):
         device.walk_draft(self._draft([b'{"', b"name", b'":'], 2))
         after = [sorted(device.configurations(row)) for row in (0, 1)]
         self.assertEqual(before, after)
+
+    @NEEDS_CAPTURE
 
     def test_a_draft_the_grammar_refuses_does_not_poison_the_rest(self):
         """A rejected position must not leave the sequence broken."""
@@ -841,6 +865,8 @@ class ArenaPaging(unittest.TestCase):
         self.assertEqual(again, keep[1], "a freed slot should be reused")
         self.assertEqual(keep[2], 2, "the survivors must keep their identifiers")
 
+    @NEEDS_CAPTURE
+
     def test_a_recorded_graph_survives_churn(self):
         """The property the whole design is for.
 
@@ -976,6 +1002,8 @@ class FusedStep(unittest.TestCase):
     and a decode step is one replay. What has to hold is that it produces the
     masks the two graphs produce.
     """
+
+    @NEEDS_CAPTURE
 
     def test_a_fused_step_masks_what_the_two_graphs_mask(self):
         import torch

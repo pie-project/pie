@@ -10,6 +10,7 @@ exercised by its own internals is not an API.
 from __future__ import annotations
 
 import json
+import os
 import unittest
 
 import gpugrammar
@@ -42,6 +43,15 @@ def _requirements():
     if not HAVE_CUDA:
         raise unittest.SkipTest("no CUDA device")
 
+
+
+# A differential run compares the two backends on the host, so nothing in it
+# can be recorded into a graph. Tests whose subject *is* the recording have
+# nothing to say in that mode.
+NEEDS_CAPTURE = unittest.skipIf(
+    os.environ.get("GPUGRAMMAR_BACKEND", "").strip().lower() == "differential",
+    "differential mode compares on the host and cannot capture",
+)
 
 class PublicApi(unittest.TestCase):
     def setUp(self):
@@ -111,6 +121,8 @@ class PublicApi(unittest.TestCase):
         # the other a number.
         self.assertFalse(torch.equal(masks[0], masks[1]))
         self.assertTrue(torch.equal(masks[0], masks[2]))
+
+    @NEEDS_CAPTURE
 
     def test_a_captured_batch_replays_the_same_mask(self):
         """The property the whole design is for."""
@@ -212,6 +224,8 @@ class Approximations(unittest.TestCase):
 class FusedStepThroughTheLibrary(unittest.TestCase):
     """`Batch.step` is the decode path, so the library has to expose it."""
 
+    @NEEDS_CAPTURE
+
     def test_step_agrees_with_advance_then_fill(self):
         import torch
 
@@ -257,6 +271,8 @@ class WhatARehearsalMustNotLeaveBehind(unittest.TestCase):
         _requirements()
         self.engine = gpugrammar.Engine(VOCABULARY)
         self.grammar = self.engine.compile_json_schema(SCHEMA)
+
+    @NEEDS_CAPTURE
 
     def test_capture_leaves_no_sequence_terminated(self):
         batch = self.engine.batch(size=4)
@@ -358,6 +374,8 @@ class ABatchThePoolOutgrew(unittest.TestCase):
             "properties": {name: {"type": "string"} for name in "abcdefghijklmnop"},
             "required": list("abcdefgh"),
         }))
+
+    @NEEDS_CAPTURE
 
     def test_a_wider_grammar_makes_a_live_batch_refuse(self):
         narrow = self.engine.compile_json_schema(json.dumps({"type": "boolean"}))

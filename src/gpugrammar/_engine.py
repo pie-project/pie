@@ -43,6 +43,36 @@ _GROUP_BLOCK = 64
 # what a CUDA graph needs and what a batch of mixed grammars would need. It also
 # bounds the replay scratch, which is now one window per block rather than one
 # per (sequence, configuration, group).
+# Which implementation of the step runs. Triton is what everything has been
+# measured and verified with; CUDA is the port in progress; `differential`
+# runs both on the same input and refuses to continue if they disagree, which
+# is the only check that can catch a difference the reference matcher would
+# not - because a wrong answer both backends share is not a disagreement.
+_TRITON, _CUDA, _DIFFERENTIAL = "triton", "cuda", "differential"
+_BACKENDS = (_TRITON, _CUDA, _DIFFERENTIAL)
+
+# Which paths the CUDA backend actually implements. Empty while the port is
+# starting: `cuda` then delegates to Triton for everything, which is what lets
+# the whole suite run under either name from the first day and makes each
+# kernel's arrival a one-line change here rather than a switch of everything at
+# once. Anything not named is Triton, honestly and by construction.
+_PORTED: frozenset[str] = frozenset()
+
+
+def ported() -> frozenset[str]:
+    """Which step paths the CUDA backend really runs. For tests and reports."""
+    return _PORTED
+
+
+def _chosen_backend() -> str:
+    name = os.environ.get("GPUGRAMMAR_BACKEND", _TRITON).strip().lower()
+    if name not in _BACKENDS:
+        raise ValueError(
+            f"GPUGRAMMAR_BACKEND={name!r} is not one of {', '.join(_BACKENDS)}"
+        )
+    return name
+
+
 # Rows below which one block counting and scanning beats three launches. Set
 # from measurement rather than reasoning: at 4,096 rows the fused kernel is
 # 2 us against 15, and by 65,536 the parallel scan has caught up.
@@ -3257,6 +3287,9 @@ class DeviceBatch:
         # See the note on `DeviceGrammar.device`: everything below allocates
         # against the current device, and the pool's arrays are on the pool's.
         self.device = grammar.device
+        # Read once per batch rather than per step: a mode that changed under a
+        # recorded graph would replay one backend while claiming another.
+        self.backend = _chosen_backend()
         with torch.cuda.device(self.device):
             self._build(grammar, batch, rollback)
 
@@ -3781,6 +3814,19 @@ class DeviceBatch:
                 "told which one each sequence is under: call set_grammars first"
             )
 
+    def _refuse_capture_in_differential(self) -> None:
+        """A differential run compares on the host, which a graph cannot hold.
+
+        Recording it would capture whichever backend happened to run last and
+        drop the comparison entirely - a graph that silently checks nothing,
+        which is worse than not having the mode.
+        """
+        if self.backend == _DIFFERENTIAL:
+            raise RuntimeError(
+                "GPUGRAMMAR_BACKEND=differential compares the two backends on "
+                "the host, so it cannot be captured: run it eagerly"
+            )
+
     def _snapshot_live(self) -> dict[str, torch.Tensor]:
         """Everything a rehearsal disturbs and a caller can observe.
 
@@ -3817,6 +3863,7 @@ class DeviceBatch:
         one does not. The live state is put back afterwards, and the history the
         rehearsal wrote is discarded with it.
         """
+        self._refuse_capture_in_differential()
         held = self._snapshot_live()
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
@@ -3847,6 +3894,7 @@ class DeviceBatch:
         The rehearsal runs the advance, and an advance moves the parse, so the
         live state is put back afterwards exactly as `capture_advance` does.
         """
+        self._refuse_capture_in_differential()
         held = self._snapshot_live()
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
@@ -3883,7 +3931,7 @@ class DeviceBatch:
         self._advance()
         return self._fill()
 
-    def _advance(self) -> None:
+    def _advance_triton(self) -> None:
         grammar = self.grammar
         rows = self.batch * self.configs
         # One entry per live configuration, enumerated the way the fill
@@ -4089,6 +4137,7 @@ class DeviceBatch:
         batching needs, since a batch changes composition every step and
         re-recording per composition is not a thing a serving loop can do.
         """
+        self._refuse_capture_in_differential()
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
@@ -4247,6 +4296,118 @@ class DeviceBatch:
         torch.cumsum(counts, 0, out=offsets[1:])
 
     def _fill(self) -> torch.Tensor:
+        """The mask, through whichever backend this batch was built with."""
+        if self.backend == _TRITON:
+            return self._fill_triton()
+        if self.backend == _CUDA:
+            return self._fill_cuda()
+        return self._differential("fill")
+
+    def _advance(self) -> None:
+        """One token per sequence, through whichever backend."""
+        if self.backend == _TRITON:
+            self._advance_triton()
+        elif self.backend == _CUDA:
+            self._advance_cuda()
+        else:
+            self._differential("advance")
+
+    def _fill_cuda(self) -> torch.Tensor:
+        if "fill" not in _PORTED:
+            return self._fill_triton()
+        raise NotImplementedError("unreachable while `fill` is not in _PORTED")
+
+    def _advance_cuda(self) -> None:
+        if "advance" not in _PORTED:
+            self._advance_triton()
+            return
+        raise NotImplementedError("unreachable while `advance` is not in _PORTED")
+
+    # What each path is allowed to change, and therefore what a differential
+    # run has to put back between the two and compare afterwards. Naming them
+    # is the whole mechanism: a tensor missing from here is one the comparison
+    # cannot see, which is exactly how a port ships a difference nobody caught.
+    _FILL_OUTPUTS = ("mask",)
+    _ADVANCE_OUTPUTS = (
+        "lexer_state",
+        "stack",
+        "depth",
+        "config_count",
+        "widest",
+        "terminated",
+        "overflow",
+    )
+
+    def _differential(self, path: str):
+        """Run both backends on the same input and compare what they produced.
+
+        The port's safety net, and the only thing that can catch a CUDA-only
+        difference: the verifications compare a backend against the reference
+        matcher, which finds a wrong answer but not a wrong answer both
+        backends would have to agree on. This finds any disagreement at all.
+
+        Eager only. Two backends and a host-side comparison cannot go in a
+        graph, so `capture` refuses this mode rather than recording half of it.
+
+        Note what this does *not* prove while only one backend exists: running
+        Triton against Triton always agrees. It is still worth doing then,
+        because it is a real test of the snapshot and restore below - and if
+        those are incomplete, every later comparison is meaningless.
+        """
+        outputs = self._FILL_OUTPUTS if path == "fill" else self._ADVANCE_OUTPUTS
+        entry = self._snapshot_live()
+        # The memo answers a repeated state for free, so the second backend
+        # would read the first one's answer instead of computing its own.
+        memo = self.memo_hash.clone()
+        # And the advance writes a rollback entry, so running it twice would
+        # write two - which the first version of this did, and which the
+        # rollback tests caught immediately. Anything a path *writes* has to be
+        # put back, not just what a caller reads.
+        history = None
+        if self.rollback_depth > 0:
+            history = {
+                name: getattr(self, name).clone()
+                for name in (
+                    "hist_lexer",
+                    "hist_depth",
+                    "hist_stack",
+                    "hist_count",
+                    "hist_slot",
+                )
+            }
+
+        first = self._fill_triton() if path == "fill" else self._advance_triton()
+        theirs = {name: getattr(self, name).clone() for name in outputs}
+        after = None
+        if history is not None:
+            after = {name: getattr(self, name).clone() for name in history}
+
+        self._restore_live(entry)
+        self.memo_hash.copy_(memo)
+        if history is not None:
+            for name, value in history.items():
+                getattr(self, name).copy_(value)
+        second = self._fill_cuda() if path == "fill" else self._advance_cuda()
+        del first, second
+
+        wrong = []
+        for name in outputs:
+            mine = getattr(self, name)
+            if not bool(torch.equal(mine, theirs[name])):
+                differing = int((mine != theirs[name]).sum())
+                wrong.append(f"{name} differs in {differing} of {mine.numel()} entries")
+        # The history is an output too: a backend that recorded a different
+        # rollback entry would pass every mask comparison and then undo wrongly.
+        for name, value in (after or {}).items():
+            if not bool(torch.equal(getattr(self, name), value)):
+                wrong.append(f"{name} differs")
+        if wrong:
+            raise AssertionError(
+                f"the backends disagree on {path}: " + "; ".join(wrong)
+            )
+        return self.mask if path == "fill" else None
+
+    def _fill_triton(self) -> torch.Tensor:
         grammar = self.grammar
         # The mask is not cleared here. The probe knows which rows the scatter
         # will build up - the ones with no answer anywhere - and clears only
