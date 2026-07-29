@@ -5055,3 +5055,394 @@ per-step decode advantage at this width is ~1.1% (§20.13), so **removing the
 boundary entirely is worth about 1.01x at conc 512, not more.** The reason
 conc 1024 wins comfortably is arithmetic: the same 4096 requests turn over
 three times instead of seven, against waves of identical width (§20.18).
+
+## §20.30 — the conc-512 account closes: pie's GPU work is already 2.4% under vLLM's wall
+
+§20.29 said the boundary ran at "7.9 of 13.6 cores, 58% parallel efficiency"
+and concluded half the gap was a dependency chain. **That is wrong**, and the
+error was in the instrument, not the reasoning: the `cpu_census` only meters
+tasks that were wrapped in `CpuMetered`, so every driver thread, scheduler
+thread and runtime worker outside those three classes was invisible. Metering
+the whole process instead — `/proc/<pid>/task/*/schedstat` summed by thread
+class at 200 Hz — says the opposite.
+
+### The boundary is CPU-THROUGHPUT bound, and it is already near the ceiling
+
+```
+                        cores busy   runqueue wait
+  steady state          3.9 - 4.8        0.00
+  cohort boundary      12.1 - 12.5       0.00 - 0.48
+```
+
+(`/root/p512/thr_sampler.py PID OUT`, 5 ms period; the analysis is
+`/root/p512/parpar.py ERR TXT`.) Read against the container's cgroup
+accounting for the same windows (`/root/p512/thr2.py`, analysis
+`/root/p512/thran.py`) the picture is unambiguous:
+
+```
+  cgroup quota                    13.6 CPUs (cfs_quota 1360000 / period 100000)
+  nr_throttled during a whole run 0
+  throttled_time during a run     0.000 s
+  cgroup cores in a boundary      12.6 - 18.6      (whole container, incl. foreign load)
+  cgroup cores in steady state     5.5 -  6.3
+```
+
+So: no quota throttling, no OS runqueue wait, and the boundary already burns
+three times the steady-state core count. The boundary is not waiting on a
+dependency chain and not waiting for a core — **it is executing a fixed lump
+of CPU as fast as the runtime's threads can retire it.**
+
+The lump, from the `cpu_census` over the seven boundary windows of one run:
+
+```
+  process   2.844 core-s     794 us per turnover   (Process includes Guest)
+  guest     1.880 core-s     525 us per turnover
+  teardown  0.471 core-s     131 us per turnover
+  distinct  3.315 core-s     925 us per turnover
+```
+
+474 core-ms per boundary. At the ~12 cores the runtime actually reaches that is
+39 ms, and the measured boundaries are 34-53 ms. **There is no headroom to
+find; there is only work to remove.**
+
+Largest identified single items, per turnover, from the lifecycle records:
+
+```
+  drop(store)   (wasmtime Store, on the Process task)   129 us p50   0.866 core-s / run
+  table_drop    (ResourceTable, on the teardown task)    75 us p50   0.537 core-s / run
+  permit release / terminate / detach / close_post      ~20 us       0.100 core-s / run
+```
+
+### `--worker-threads` is closed for the fourth and final time, with a mechanism
+
+Previous sweeps only ever reported tok/s. Metered, the reason more workers
+lose is dramatic and has nothing to do with the boundary:
+
+```
+                 tok/s          guest CPU / run   boundary idle
+  wt 13 (stock)  31344 / 31847     36.20 core-s      0.360 s
+  wt 32          31061 / 31698     79.63 core-s      0.443 s
+```
+
+**Identical work costs the guest tasks 2.2x the CPU at 32 workers**, and the
+boundary gets *worse*, not better. Whatever the contention is (guest futures
+share `ChannelCell`/`fires` mutexes and the scheduler mailbox), adding workers
+buys spin, not parallelism. Stock sizing — `available_parallelism()` = 13 — is
+correct and this lever should not be re-opened.
+
+### The complete conc-512 wall account
+
+Splitting the wave log by whether a wave carries prefill
+(`/root/p512/wsplit2.py`), and the run's wall by the first dispatch and the
+last completion (`/root/p512/ht2.py`):
+
+```
+  pie wall                    16.31 s
+    startup head               0.151 s   spawn -> first dispatch
+    GPU busy                  15.70 s     prefill  1.31 s  (24 waves, 118k tok/s)
+                                          decode  14.39 s  (504 waves, 35.9k tok/s)
+    GPU idle                   0.384 s   7 cohort boundaries, 97.6% busy overall
+    tail                       0.076 s   last wave -> last teardown -> harness
+  vLLM wall                   16.08 s
+```
+
+**pie's GPU work is 15.70 s against vLLM's 16.08 s of wall — pie is already
+2.4% ahead on the part that does the inference.** The entire deficit is
+0.384 s of boundary idle plus 0.227 s of head and tail. There is no kernel
+gap and no scheduling gap to find: prefill runs at 118k tok/s (~142 TFLOPS
+bf16 on an L40S, near roofline) and decode at 35.9k tok/s, which is the same
+rate vLLM sustains.
+
+That fixes the ceiling arithmetically: **removing every host overhead at
+conc 512 yields 16.31 -> 15.70 s = 1.024x, and each individual lever inside it
+is worth 0.2-0.6%.** Recovering half of the 0.61 s — which would be a large
+amount of work spread over a dozen unrelated micro-optimisations — lands on a
+tie, not a win.
+
+### The head, measured for the first time
+
+```
+  4096 process_spawned         -151.0 .. -16.6 ms  (bench submits the whole run up front)
+  first 512 process_admitted   -130.5 ..  -1.0 ms
+  first wave dispatch                       0.0 ms   (460 fires, prefill)
+  instantiations STARTED in the head    1053
+  instantiations FINISHED in the head   1024        <- two cohorts, not one
+```
+
+The prewarm conveyor is instantiating the *second* cohort inside the window in
+which the *first* cohort is still trying to reach its first dispatch, on the
+same 13 cores. That is the one structural finding in the head, and it is worth
+at most ~0.25% (vLLM's intercept is 73 ms against pie's ~151 ms).
+
+### Standing, on the pushed build, interleaved, one process at a time
+
+```
+  conc 1024 @ 16384   pie 32472 32404 32448   vLLM 31458 31102 31439   = 1.035   WON
+  conc  512 @  8192   pie 31447 31832 31548   vLLM 32622 32626 32583   = 0.969
+```
+
+conc 512 varies 2.6% run to run while vLLM varies 0.13%, and the variance is
+this box: pie's boundary demands ~12 cores against a 13.6-core quota shared
+with other tenants, so pie loses whatever the neighbours take and vLLM (which
+is GPU-bound and never exceeds ~3 cores) does not. On a quiet box pie measures
+0.98-0.99 at conc 512.
+
+### Conclusion for conc 512
+
+The gap is understood completely and is not a defect. pie spends 3.7% of its
+wall on per-request programmability — bringing a WASM guest up and tearing it
+down — and buys back 2.4% in inference efficiency. At conc 1024 the same
+4096 requests turn over three times instead of seven and pie wins by 3.5-4.6%.
+At conc 512 the turnover count doubles and the account inverts. **The benchmark
+makes every request identical, so every boundary is fleet-wide; the deficit is
+a property of that shape, not of the engine's steady state, and any workload
+with varied request lengths never forms the boundary at all.**
+
+## §20.31 — a 1.6% measurement artifact, two refuted levers, and the guest CPU decomposed
+
+This section corrects §20.24's noise-floor claim, closes two more levers, lands
+one provably-exact reduction that measures neutral, and — for the first time —
+says where the guest's per-fire CPU actually goes.
+
+### ★ THE A/B PROTOCOL WAS WRONG (this corrects §20.24)
+
+§20.24 recorded a 0.3% noise floor after mimalloc landed. That number is real
+but it only describes **back-to-back identical runs**:
+
+```
+  9 identical runs, consecutive:  32145 32103 32156 32030 32054 32139 31937 32116 32036
+                                  mean 32079, sd 0.21%, spread 0.68%
+```
+
+Arm *means* drift much further than that. `PIE_TURNAROUND_WAVES=4` is a
+**provable no-op** at the default frame size — `frames_in_flight()` is
+`1 + turnaround_waves().div_ceil(k)`, and at k=2 both 3 and 4 give F=3, W=7 —
+yet in four fixed-order rounds it beat its own baseline **4 times out of 4 by
+1.59%**:
+
+```
+  base 31547 31528 31400 31922   mean 31599
+  R=4  32120 32009 32200 32075   mean 32101   +1.59%, 4/4
+  R=5  31931 32094 31398 32006   mean 31857
+```
+
+All twelve runs have identical wave structure (528 batches, batch-size
+histogram `[0,0,0,0,0,0,2,526]`, 1024-row waves, GPU pinned at 2520 MHz), so
+nothing in the engine changed. Reversing the order settles it: run R=4 first
+and base second and they measure **31987 vs 31985 — identical**.
+
+The box is shared; a ~20-minute window drifts by up to 1.6%.
+
+```
+  RULES, from now on
+    (a) every sweep carries a null control (a change that provably does nothing)
+    (b) alternate arm order (ABBA), never fixed-order rounds
+    (c) treat anything under 2% as unresolvable by tok/s alone — read
+        `cpu_census` core-seconds instead, which are far more stable
+```
+
+Two of this session's earlier readings were this artifact and nothing else.
+
+### ★ LEVER CLOSED: wasmtime pooling warm slots
+
+The pooling allocator keeps `max_unused_warm_slots` (default 100) instantiated
+stores per module for reuse. The bench runs 512 concurrent processes against
+`wasm_max_instances = 16384`, so the hypothesis was that 100 warm slots starve
+the boundary. Added `PIE_BENCH_WARM_SLOTS` / `PIE_BENCH_WARM_MB` overrides and
+A/B'd three interleaved pairs at conc 512:
+
+```
+  warm 100    31863 32055 31490   mean 31803
+  warm 16384  31940 31607 31930   mean 31826   +0.07%
+  store_drop_us p50 139/135 -> 125/140 (unchanged)
+```
+
+**No lever.** With one component every pooled slot is already module-affine, so
+the warm-slot list buys nothing that the pool does not already give.
+
+### ★ LEVER CLOSED: run-ahead window R and frame size, re-checked post-mimalloc
+
+`PIE_TURNAROUND_WAVES=4` is a no-op by construction (above). `R=5` (W 7 -> 9) is
+inside the noise once the drift is accounted for. `PIE_FRAME_SIZE` 1 and 3 at
+conc 512 measure 30852/31887 and 31541 against a base band of 31600-32100 — no
+signal in either direction.
+
+### ★ THE BOUNDARY IS THE GUESTS' SUBMIT PATH
+
+Re-measured on today's build (conc 512, 4096x128, 8192 pages):
+
+```
+  span 16.09 s | GPU busy 15.69 s (97.5%) | GPU idle 0.403 s over 7 boundaries
+  prefill  24 waves  1.329 s  116k tok/s
+  decode  504 waves 14.362 s   35.9k tok/s (1024-row waves)
+
+  per turnover: guest 616 us | process 900 us (INCLUDES guest) | teardown 118 us
+  whole run:    guest 35.4 core-s | process 40.3 | teardown 0.54
+```
+
+`35.4 core-s / 524288 fires = 67 us per fire`, which is exactly §20.15's
+post-fix submit cost. At a boundary each successor issues one prefill plus its
+run-ahead window (7 fires) ~= 470 us, which *is* the measured 616 us guest term.
+Boundary idle is that CPU divided by the ~12 cores §20.30 measured.
+
+### ★ WHERE THE 67 us ACTUALLY GOES (new instrumentation)
+
+`PHASE_NAMES` / `phase_add` in `scheduler.rs` meter the guest submit path and
+emit one `submit_phase` record per phase in the `cpu_census` dump, gated on
+`fire_timing_enabled()` like every other counter. Conc 512, whole run:
+
+```
+  phase              us/fire   core-s    share of submit
+  hp_bind_geometry      1.56     0.82        13.7%
+  hp_declare            1.86     0.98        16.3%
+  hp_grant              1.37     0.72        12.0%
+  hp_launch             5.64     2.96        49.5%
+  submit_total         11.39     5.97       100.0%
+  HostShadow::advance  11.18     5.86    (after submit, not inside it)
+  ------------------------------------------------------------------
+  guest CPU census                35.41
+```
+
+**Submit is 11.4 us and `advance` is another 11.2 us — together 33% of the
+guest's per-fire CPU. The other 45 us per fire (23.6 core-s, 67%) is outside
+both**: the WASM guest body, the WIT crossings, the channel puts and takes, and
+`drain_settled` / `wire_channels_to_pipeline` ahead of the metered region. That
+is the largest unattacked term in the whole boundary and it has never been
+measured before.
+
+Inside submit, `hp_launch` is half the cost. That is **not** the
+`kv_translation` clone it looks like: the translation carries one entry per
+working-set page and a lane holds ~16 of them at conc 512, so the `to_vec()` is
+64 bytes. `hp_launch` is the scheduler submit itself — building the ticket
+reservation and moving a 1280-byte `LaunchPlan` onto the loop's queue.
+
+**TRAP THAT COST AN HOUR.** `fire.rs` has **two** production `advance` call
+sites, not one: `:1194` on the host-geometry path and `:2332` on the
+device-geometry path. This benchmark takes the **host** path exclusively;
+`devgeo_total` counts **zero** calls over a whole run. Instrumentation placed on
+`fire_device_geometry` reads zero and looks like a broken counter.
+
+### ★ SHADOW FOLD DEMOTION: provably exact, throughput neutral
+
+`HostShadow::advance` folds the trace's channel-writing stages once per fire.
+§20.15 already dropped every `ChanPut`-free stage as a provable no-op. This
+section adds the second exact reduction and moves the whole decision off the
+per-instance shadow.
+
+`pie_eval::pareval::geometry_taint` computes `device_decided`, a whole-trace
+taint fixpoint: a value is tainted iff its backward slice contains a
+`KernelCall`, an `IntrinsicVal`, an `Rng`, or a device-decided channel — all of
+which `fold_stage` blocks **unconditionally**. So a statically tainted put is
+`Err` on *every* fire, and a stage whose every put is tainted can commit those
+channels unknown directly: that is the same commit the fold would make, and it
+is exactly what the existing fault path already does. Cross-stage reads are
+unaffected (`pending.get(chan) == Some(Err(_))` makes `known` return `None`
+either way) and `advance` discards the blocker kind (`slot.ok()`), so
+`UnknownChannel` versus `Kernel` is unobservable.
+
+**The demotion must not be applied to `eval_descriptor_ports`, which does
+surface blocker kinds per port.**
+
+Landed as `ShadowPlan`: `taken_per_pass` plus a `Vec<Phase>` where
+`Phase::Fold(stage)` still folds and `Phase::Unknown(chans)` commits unknown.
+The plan is derived once per program and cached on `RegisteredProgram` behind a
+`OnceLock`, so 512 instances share one derivation instead of each rebuilding
+the filter. `geometry_taint` moved to the same cache — `forward.rs:695` was
+recomputing the whole-trace fixpoint on every `ForwardPass`.
+
+`PIE_SHADOW_FOLD=full` restores the old behaviour for a one-build A/B:
+
+```
+                        folds/call   ns/call   tok/s
+  PIE_SHADOW_FOLD=full     1.0000     11576    32203
+  default (demoted)        0.9922     11656    31818
+```
+
+On this trace only the **prefill** program's put is statically device-decided,
+so the demotion removes 4096 folds of 524288 — 0.8%, and the cost is identical.
+**Kept anyway**: it is strictly less work, it is provably exact, the per-program
+caching removes a real per-instance derivation, and on traces whose decode
+epilogue is sampler-fed it removes the last whole-trace evaluation entirely.
+
+### ★ STANDING (final, ABBA-interleaved, one process at a time)
+
+```
+  conc 1024 @16384   pie 32843 32603 32518   vLLM 31001 31187 31194   = 1.049  WON
+  conc  512 @ 8192   pie 31537 31595 31633   vLLM 32752 32696 32740   = 0.965
+  conc  512 @ 8192   pie 32334 31444 32205   vLLM 32697 32677 32648   = 0.979 (earlier)
+```
+
+The two conc-512 rows are the same build class measured hours apart. vLLM reads
+**within 0.2%** across both (32648-32752) while pie moves 1.3%, and
+`/proc/loadavg` was 14.1 against this container's 13.6-CPU quota during the
+second. That is the §20.30 sensitivity, directly observed: pie's boundary wants
+~12 of 13.6 cores and the box is shared, so pie alone degrades when a co-tenant
+runs. vLLM is a usable control for exactly this reason, and CPU census
+core-seconds are the reading to trust — the instrumentation added in this
+section cost **nothing** (guest 37.36 -> 36.59 core-s across the two builds).
+
+conc 512 remains bounded by the arithmetic of §20.30: pie's GPU work (15.69 s)
+is already 2.4% under vLLM's entire wall (16.06 s), so the ceiling is 1.024x and
+the whole remaining deficit is 0.403 s of cohort-boundary idle plus 0.227 s of
+head and tail. Every individual lever inside that 3.9% is worth 0.2-0.6%, and
+the ranked list of what is left is now, for the first time, measured:
+
+```
+  1. the 41 us/fire still outside every meter   21.4 core-s   see below
+  2. HostShadow::advance                         5.9 core-s   backward-slice the fold
+  3. hp_launch (the scheduler submit)            2.9 core-s
+```
+
+### ★ THE 45 us: TWO CANDIDATES METERED, BOTH SMALL
+
+The two named suspects were the settlement drain ahead of the metered submit
+region and the receive path (`take`). Both were instrumented and both are
+small. Phases 1 and 7-10 are new here; `rx_*` wraps `materialize_channel`.
+
+```
+  phase          calls      per call     total     what it is
+  ----------------------------------------------------------------------------
+  hp_preamble    524288      1.60 us     0.84 s    drain_settled + wire_channels
+  rx_poll       2096860      0.61 us     1.28 s    poll_channel, 4x per take
+  rx_finalize    524288      8.42 ms       wall    finalize_op_await (the wait)
+  rx_wall        524288     15.56 ms       wall    whole take, incl. the wait
+  rx_wait        261998     14.28 ms       wall    await_channel_progress
+```
+
+`drain_settled` is **not** the hidden cost: 1.6 us per fire. Neither is the
+receive path: its whole synchronous CPU is `rx_poll`, 1.28 core-s.
+
+Two things worth keeping from those numbers. `rx_poll` runs **4 times per
+take** — the loop re-polls after the finalize gate and again after each wake,
+and each poll re-resolves the channel resource. And `rx_wait` fires on only
+**half** the takes (261,998 of 524,288): the other half find the value already
+published, which is the run-ahead window doing exactly its job.
+
+Running total, conc 512, whole run:
+
+```
+  submit_total          5.97 core-s
+  hp_preamble           0.84
+  HostShadow::advance   5.91
+  rx_poll               1.28
+  -----------------------------
+  accounted            14.00
+  guest CPU census     35.41       -> 21.4 core-s (41 us/fire) still unmetered
+```
+
+What is left is the WASM body itself plus wasmtime's async machinery: every
+host call that awaits costs a fiber switch out of and back into the guest
+stack, and the steady loop makes a `take`, a `submit` and a `reserve` per
+frame. Splitting that further needs `Store::call_hook`, which meters the
+wasm/host boundary directly — not yet done.
+
+**Why this matters for the wall clock, precisely.** Steady state uses 3.9-4.8
+of the 13.6-core quota, so per-fire CPU is free there; the GPU is 97.5% busy
+and there is nothing to convert saved CPU into. It matters only at the cohort
+boundary, which §20.30 measured as CPU-throughput bound at 12.1-12.5 cores.
+A successor fills a `window_fires = 6` run-ahead window on admission, so
+~6 fires x 67 us = 400 us of the 525 us of guest CPU per turnover is per-fire
+cost. Halving per-fire guest CPU would take the boundary's 474 core-ms to
+~370 and its 39 ms floor to ~30 ms — about **0.4% of wall** across seven
+boundaries. That is the honest ceiling on this whole line of work, and it is
+why it is documented rather than pursued further.
