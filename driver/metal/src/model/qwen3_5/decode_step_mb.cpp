@@ -476,6 +476,16 @@ void encode_prefill_dags_mb(StepEncoder& se,
                         grid.z = uint32_t(n);
                     }
                     break;
+                case Kernel::GdnInA:
+                case Kernel::GdnInB:
+                    // grid is (32, N_out, 1): the simdgroup lane, the output row,
+                    // and -- once strided -- the prompt row.  Worth 1.4% of the
+                    // fire: 18 GDN layers x 2 is 42% of its per-row dispatches.
+                    if (d0.grid.z == 1) {
+                        strided = mb_psos.dense_gemv_strided;
+                        grid.z = uint32_t(n);
+                    }
+                    break;
                 default:
                     break;
             }

@@ -1210,6 +1210,10 @@ bool MetalExecutor::Impl::bind_paged_dag(std::string* err) {
                         case Kernel::GatedRms:
                             ctx_->arg_bind_ordinal(d.ordinal, 5, prefill_row_stride_);
                             break;
+                        case Kernel::GdnInA:
+                        case Kernel::GdnInB:
+                            ctx_->arg_bind_ordinal(d.ordinal, 5, prefill_row_stride_);
+                            break;
 
                         default:
                             break;
@@ -1834,6 +1838,11 @@ bool MetalExecutor::Impl::run_prefill_step(
     }
     // One command buffer, request-major token order.  Every complete layer DAG
     // ends in a barrier, so token t+1 observes token t's GDN and paged KV writes.
+    // Alternate the arms fire by fire so both see the same machine, exactly as
+    // the decode step does -- prefill fires are few, so without interleaving a
+    // single contended window decides the answer.
+    static bool prefill_ab_flip = false;
+    if (ab_enabled()) ab_set_arm(prefill_ab_flip = !prefill_ab_flip);
     const StepTiming timing = ctx_->run_step([&](StepEncoder& se) {
         if (ptir != nullptr) {
             for (const auto& callbacks : *ptir)
@@ -1849,6 +1858,25 @@ bool MetalExecutor::Impl::run_prefill_step(
     });
     if (!timing.succeeded())
         return fail("Metal command timed out before its completion fence");
+    // Prefill meter.  Prefill fires are few and long, so the per-row cost is what
+    // compares across arms -- a raw total confuses "faster" with "shorter prompt".
+    if (std::getenv("PIE_METAL_GPU_METER") != nullptr) {
+        static double ms[2] = {};
+        static double rows[2] = {};
+        static double enc[2] = {};
+        static int n[2] = {};
+        const int arm = ab_enabled() && ab_arm() ? 1 : 0;
+        ms[arm] += timing.gpu_exec_ms;
+        enc[arm] += timing.encode_ms;
+        rows[arm] += double(schedule.N);
+        ++n[arm];
+        std::fprintf(stderr,
+                     "[prefill] A n=%d %.2f ms %.4f ms/row | B n=%d %.2f ms %.4f ms/row"
+                     " | enc A %.2f B %.2f ms\n",
+                     n[0], n[0] ? ms[0] / n[0] : 0.0, rows[0] > 0 ? ms[0] / rows[0] : 0.0,
+                     n[1], n[1] ? ms[1] / n[1] : 0.0, rows[1] > 0 ? ms[1] / rows[1] : 0.0,
+                     n[0] ? enc[0] / n[0] : 0.0, n[1] ? enc[1] / n[1] : 0.0);
+    }
     if (golden_taps_enabled()) {
         // Every prefill token walks its own copy of the DAG, and bind_scratch lays
         // token t's row at t * (widest * sizeof(bf16)) inside each pool slot — so one

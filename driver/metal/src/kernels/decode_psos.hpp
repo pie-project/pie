@@ -67,6 +67,7 @@ struct MultiBatchPsos {
     Pso rms_strided{};
     Pso silu_mul_strided{};
     Pso gated_rms_strided{};
+    Pso dense_gemv_strided{};
     // GDN over a whole prompt in one dispatch (prep is token-parallel, the
     // recurrent scan runs in registers) instead of one serialized pair per token.
     Pso gdn_prep_prefill{};
