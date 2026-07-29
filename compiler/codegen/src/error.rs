@@ -233,10 +233,9 @@ impl fmt::Display for EmitError {
                 }
             },
             EmitError::RegionNodesUnordered(form) => match form {
-                // The CUDA validator folds "out of range" and "unordered" into
-                // one message; Metal separates them.
-                RegionForm::Fused | RegionForm::GroupedFused => {
-                    f.write_str("generated region nodes are invalid or unordered")
+                RegionForm::Fused => f.write_str("fused region nodes are not strictly ordered"),
+                RegionForm::GroupedFused => {
+                    f.write_str("grouped fused region nodes are not strictly ordered")
                 }
                 RegionForm::GroupedTopK => f.write_str("TopK library node is invalid"),
                 RegionForm::GroupedNucleus | RegionForm::Unnamed => {
@@ -388,7 +387,7 @@ mod tests {
             ),
             (
                 EmitError::RegionNodesUnordered(RegionForm::Fused),
-                "generated region nodes are invalid or unordered",
+                "fused region nodes are not strictly ordered",
             ),
             (
                 EmitError::RegionNodesUnordered(RegionForm::GroupedTopK),

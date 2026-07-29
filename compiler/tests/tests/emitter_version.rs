@@ -20,26 +20,34 @@
 #[path = "common/msl_corpus.rs"]
 mod msl_corpus;
 
-use msl_corpus::{corpus_bound, corpus_stages};
+use msl_corpus::{corpus_bound, corpus_stages, extended_stages};
 use pie_codegen::cuda::CUDA_GENERATED_EMITTER_VERSION;
 use pie_codegen::metal::METAL_M1_EMITTER_VERSION;
 use pie_codegen::program::{Backend, emit_program};
 
-/// `(version, fingerprint)` for each backend.
+/// `(backend, version, fingerprint)`, both numbers written out as literals.
 ///
-/// Update both halves together. A change that leaves the fingerprint alone did
-/// not change the emitted bytes and must not move the version either — a
-/// gratuitous bump throws away every driver's cache.
+/// The version is a literal rather than the constant itself so that the two sit
+/// on one line and neither can be updated without looking at the other.
+/// Substituting the constant would make the version half true by construction,
+/// and the minimal way to get a green test after changing an emitter would be
+/// to paste a new fingerprint and leave the version alone — which is the exact
+/// failure this file exists to prevent.
+///
+/// A change that leaves the fingerprint alone did not change the emitted bytes
+/// and must not move the version either: a gratuitous bump throws away every
+/// driver's cache.
 const PINNED: &[(&str, u16, u64)] = &[
-    (
-        "cuda",
-        CUDA_GENERATED_EMITTER_VERSION,
-        0x0977_b2ba_53d8_6682,
-    ),
-    ("metal", METAL_M1_EMITTER_VERSION, 0xa20e_c47b_00d3_f732),
+    ("cuda", 19, 0xe378_da9c_00f6_fda5),
+    ("metal", 35, 0x16e9_a27d_8fc5_3b4b),
 ];
 
-/// Everything a driver receives for the corpus, hashed.
+/// Everything a driver receives for both corpora, hashed.
+///
+/// The extended corpus is included because it exists to reach what the base one
+/// does not — further ops, further intrinsics, the hierarchical-row schedule —
+/// and the emitters have per-op arms, so a change confined to those paths would
+/// otherwise leave this hash untouched while changing what a driver runs.
 ///
 /// Refusals are hashed alongside sources because a region that stops being
 /// emittable changes what the driver runs just as much as one whose source
@@ -47,6 +55,7 @@ const PINNED: &[(&str, u16, u64)] = &[
 fn fingerprint(backend: Backend) -> u64 {
     let stages: Vec<_> = corpus_stages()
         .into_iter()
+        .chain(extended_stages())
         .map(|stage| stage.plan)
         .collect();
     let mut bytes = Vec::new();
@@ -67,6 +76,24 @@ fn backend_of(name: &str) -> Backend {
         "cuda" => Backend::Cuda,
         "metal" => Backend::Metal,
         other => panic!("no backend named `{other}`"),
+    }
+}
+
+/// The pinned version literals are the constants the drivers are compiled
+/// against, so `PINNED` describes this compiler rather than a past one.
+#[test]
+fn the_pinned_versions_are_the_compiled_ones() {
+    for (name, version, _) in PINNED {
+        let constant = match backend_of(name) {
+            Backend::Cuda => CUDA_GENERATED_EMITTER_VERSION,
+            Backend::Metal => METAL_M1_EMITTER_VERSION,
+        };
+        assert_eq!(
+            *version, constant,
+            "the {name} emitter version constant is {constant}, but PINNED still says {version}. \
+             If the emitted bytes changed, update both; if they did not, the constant moved for \
+             nothing and every driver's cache was discarded."
+        );
     }
 }
 
