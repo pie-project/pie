@@ -44,6 +44,40 @@ jobs:
       - name: format check
         run: uvx ruff format --check --diff src/gpugrammar
 
+  # The library shipped as a wheel that installed and then failed to import,
+  # because the build backend was plain setuptools and the extension is a Rust
+  # cdylib. Nothing caught it, so this builds the wheel and imports it in a
+  # clean environment - which needs no GPU, since compiling is host work.
+  packaging:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: astral-sh/setup-uv@v5
+      - name: build the wheel
+        run: uvx maturin build --release --out dist
+      - name: install it somewhere clean and use it
+        run: |
+          uv venv /tmp/clean
+          uv pip install --python /tmp/clean/bin/python dist/*.whl
+          uv run --python /tmp/clean/bin/python python - <<'PY'
+          import json
+          import gpugrammar
+          engine = gpugrammar.Engine([bytes([i]) for i in range(256)])
+          grammar = engine.compile_json_schema(
+              json.dumps({"type": "object", "properties": {"a": {"type": "string"}}})
+          )
+          assert grammar.approximations is not None
+          # The budget on the regex path, which is the one a request supplies.
+          try:
+              engine.compile_regex("(a|b)*a" + "(a|b)" * 24)
+          except gpugrammar.CompileError as refusal:
+              assert refusal.stage == "lexer", refusal.stage
+          else:
+              raise SystemExit("an exponential pattern was not refused")
+          print("the wheel imports and compiles")
+          PY
+
   # The one thing a hosted runner cannot do. Everything here needs a real
   # device: the kernels are Triton, the step is a CUDA graph, and the
   # verifications compare the device against the reference matcher row by row.
@@ -56,11 +90,10 @@ jobs:
       - uses: astral-sh/setup-uv@v5
       - name: build the extension
         run: |
-          cargo build --release -p gpugrammar-py --manifest-path rust/Cargo.toml
+          uvx maturin build --release --out dist
           uv venv
           uv pip install torch triton numpy
-          cp rust/target/release/lib_gpugrammar.so \
-            "$(uv run python -c 'import site; print(site.getsitepackages()[0])')/_gpugrammar.abi3.so"
+          uv pip install --no-deps dist/*.whl
       - name: tests
         run: uv run --with numpy python -m unittest discover -s tests
         env:

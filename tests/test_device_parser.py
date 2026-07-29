@@ -58,7 +58,7 @@ class DeviceParserAgreement(unittest.TestCase):
 
     def setUp(self):
         _requirements()
-        from gpu_lr1.device_parser import DeviceGrammar
+        from gpugrammar._engine import DeviceGrammar
 
         self.DeviceGrammar = DeviceGrammar
         self.compiler = gpugrammar.Compiler(VOCABULARY)
@@ -203,7 +203,7 @@ class MixedGrammarBatch(unittest.TestCase):
 
     def setUp(self):
         _requirements()
-        from gpu_lr1.device_parser import DeviceGrammar
+        from gpugrammar._engine import DeviceGrammar
 
         self.DeviceGrammar = DeviceGrammar
         self.compiler = gpugrammar.Compiler(VOCABULARY)
@@ -301,7 +301,7 @@ class RandomWalkAgreement(unittest.TestCase):
 
     def setUp(self):
         _requirements()
-        from gpu_lr1.device_parser import DeviceGrammar
+        from gpugrammar._engine import DeviceGrammar
 
         self.DeviceGrammar = DeviceGrammar
         self.compiler = gpugrammar.Compiler(VOCABULARY)
@@ -387,7 +387,7 @@ class Rollback(unittest.TestCase):
 
     def setUp(self):
         _requirements()
-        from gpu_lr1.device_parser import DeviceGrammar
+        from gpugrammar._engine import DeviceGrammar
 
         self.DeviceGrammar = DeviceGrammar
         self.compiler = gpugrammar.Compiler(VOCABULARY)
@@ -534,7 +534,7 @@ class GrammarPool(unittest.TestCase):
 
     def setUp(self):
         _requirements()
-        from gpu_lr1.device_parser import DeviceGrammar
+        from gpugrammar._engine import DeviceGrammar
 
         self.DeviceGrammar = DeviceGrammar
         self.compiler = gpugrammar.Compiler(VOCABULARY)
@@ -648,7 +648,7 @@ class DraftWalk(unittest.TestCase):
 
     def setUp(self):
         _requirements()
-        from gpu_lr1.device_parser import DeviceGrammar
+        from gpugrammar._engine import DeviceGrammar
 
         self.compiler = gpugrammar.Compiler(VOCABULARY)
         self.compiled = self.compiler.compile_json_schema(
@@ -729,7 +729,7 @@ class PrecomputedVerdicts(unittest.TestCase):
 
     def setUp(self):
         _requirements()
-        from gpu_lr1.device_parser import DeviceGrammar
+        from gpugrammar._engine import DeviceGrammar
 
         self.DeviceGrammar = DeviceGrammar
         self.compiler = gpugrammar.Compiler(VOCABULARY)
@@ -792,7 +792,7 @@ class ArenaPaging(unittest.TestCase):
 
     def setUp(self):
         _requirements()
-        from gpu_lr1.device_parser import DeviceGrammar
+        from gpugrammar._engine import DeviceGrammar
 
         self.DeviceGrammar = DeviceGrammar
         self.compiler = gpugrammar.Compiler(VOCABULARY)
@@ -934,7 +934,7 @@ class CorpusAgreement(unittest.TestCase):
             raise unittest.SkipTest("the JSONSchemaBench corpus is not in results/")
 
     def test_first_schemas_agree_byte_by_byte(self):
-        from gpu_lr1.device_parser import DeviceGrammar
+        from gpugrammar._engine import DeviceGrammar
 
         instances = json.loads(INSTANCES.read_text())["instances"]
         # Bytes rather than a tokenizer: the corpus check that uses the real
@@ -980,7 +980,7 @@ class FusedStep(unittest.TestCase):
     def test_a_fused_step_masks_what_the_two_graphs_mask(self):
         import torch
 
-        from gpu_lr1.device_parser import DeviceGrammar, DeviceBatch
+        from gpugrammar._engine import DeviceGrammar, DeviceBatch
 
         compiler = gpugrammar.Compiler([bytes([b]) for b in range(256)])
         grammar = compiler.compile_json_schema(
@@ -1036,7 +1036,7 @@ class SizedForTheMachine(unittest.TestCase):
     def test_the_grid_follows_the_batch_and_stays_inside_the_machine(self):
         import torch
 
-        from gpu_lr1.device_parser import _MIN_SWEEP_BLOCKS, _sweep_blocks
+        from gpugrammar._engine import _MIN_SWEEP_BLOCKS, _sweep_blocks
 
         device = torch.cuda.get_device_properties(torch.cuda.current_device())
         ceiling = 1 << max(device.multi_processor_count * 64 - 1, 1).bit_length()
@@ -1050,7 +1050,7 @@ class SizedForTheMachine(unittest.TestCase):
         self.assertGreater(widths[-1], widths[0], "and not the same number for all")
 
     def test_the_memo_is_sized_by_what_an_entry_costs(self):
-        from gpu_lr1.device_parser import _MEMO_SLOTS, _memo_slots
+        from gpugrammar._engine import _MEMO_SLOTS, _memo_slots
 
         # A larger entry buys fewer of them, and neither end runs away.
         self.assertGreaterEqual(_memo_slots(1 << 10), _memo_slots(1 << 20))
@@ -1058,7 +1058,7 @@ class SizedForTheMachine(unittest.TestCase):
         self.assertGreaterEqual(_memo_slots(1 << 30), 32)
 
     def test_a_narrow_grammar_is_not_charged_for_a_wide_one(self):
-        from gpu_lr1.device_parser import DeviceBatch, DeviceGrammar
+        from gpugrammar._engine import DeviceBatch, DeviceGrammar
 
         compiler = gpugrammar.Compiler([bytes([b]) for b in range(256)])
         grammar = compiler.compile_json_schema(

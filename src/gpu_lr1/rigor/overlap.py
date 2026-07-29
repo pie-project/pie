@@ -71,7 +71,7 @@ def measure(
     import xgrammar as xg
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    from ..device_parser import DeviceBatch, DeviceGrammar
+    from gpugrammar._engine import DeviceBatch, DeviceGrammar
 
     tokenizer = AutoTokenizer.from_pretrained(model)
     vocabulary = load_vocabulary(model)

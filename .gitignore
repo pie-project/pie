@@ -7,7 +7,7 @@ __pycache__/
 results/smoke.json
 
 
-# recorded trajectories are large; regenerate with gpu-lr1-collect-real-rows
+# recorded trajectories are large
 results/jsonschemabench-rows.npz
 results/jsonschemabench-rows.json
 results/rows-*.npz
@@ -16,3 +16,7 @@ results/jsonschemabench-instances.json
 
 # rust build artifacts
 rust/target/
+
+# the compiled extension, built into the package by `maturin develop`
+src/gpugrammar/_gpugrammar*.so
+build/

@@ -37,7 +37,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
 
-from _gpugrammar import (
+from gpugrammar._gpugrammar import (
     CompiledGrammar,
     CompileError,
     Compiler,

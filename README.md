@@ -18,9 +18,23 @@ a serving engine can reach without returning to the host.
 Needs an NVIDIA GPU, PyTorch with CUDA, and a Rust toolchain.
 
 ```bash
-cargo build --release -p gpugrammar-py --manifest-path rust/Cargo.toml
-cp rust/target/release/lib_gpugrammar.so "$(python -c 'import site; print(site.getsitepackages()[0])')/_gpugrammar.abi3.so"
-export PYTHONPATH="$PWD/src:$PYTHONPATH"
+pip install .
+```
+
+To work on it, build the extension into the source tree instead, so an edit
+to a kernel takes effect without a reinstall:
+
+```bash
+maturin develop --release
+```
+
+The measurement suite and the device verifications are `gpu_lr1`, which is
+research code and is not in the wheel; run them from a checkout with
+`PYTHONPATH=src`:
+
+```bash
+python -m gpu_lr1.verify              # every device check against the matcher
+python -m gpu_lr1.rigor.latency       # the step, against XGrammar and llguidance
 ```
 
 ## Use

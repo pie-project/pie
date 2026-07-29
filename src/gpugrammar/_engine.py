@@ -139,6 +139,8 @@ def _memo_slots(per_slot: int) -> int:
     device = torch.cuda.get_device_properties(torch.cuda.current_device())
     budget = min(_MEMO_BUDGET, device.total_memory // 1024)
     return max(32, min(_MEMO_SLOTS, budget // max(per_slot, 1)))
+
+
 ACCEPT = -(2**31)
 SPARSE, COMPLEMENT, DENSE = 0, 1, 2
 
@@ -334,11 +336,16 @@ def _replay_group(
                                     pick = rest % count
                                     rest = rest // count
                                     if pick > 0:
-                                        value = tl.load(action_extra_ptr + low + pick - 1)
+                                        value = tl.load(
+                                            action_extra_ptr + low + pick - 1
+                                        )
                             if value == _ACCEPT:
                                 alive = 0
                             elif value > 0:
-                                if copy_depth >= STACK_STRIDE or copy_depth - floor >= WINDOW:
+                                if (
+                                    copy_depth >= STACK_STRIDE
+                                    or copy_depth - floor >= WINDOW
+                                ):
                                     alive = 0
                                     tl.store(overflow_ptr + sequence, 1)
                                 else:
@@ -386,7 +393,8 @@ def _replay_group(
                                     else:
                                         top = tl.load(goto_targets_ptr + target)
                                         tl.store(
-                                            scratch_ptr + scratch + copy_depth - floor, top
+                                            scratch_ptr + scratch + copy_depth - floor,
+                                            top,
                                         )
                                         copy_depth = copy_depth + 1
                 if settled == 0:
@@ -439,21 +447,27 @@ def _replay_group(
                                     value = tl.load(action_values_ptr + entry)
                                     if PATHS > 1:
                                         low = tl.load(action_extra_offsets_ptr + entry)
-                                        high = tl.load(action_extra_offsets_ptr + entry + 1)
+                                        high = tl.load(
+                                            action_extra_offsets_ptr + entry + 1
+                                        )
                                         count = 1 + high - low
                                         if count > 1:
                                             radix = radix * count
                                             pick = probe_rest % count
                                             probe_rest = probe_rest // count
                                             if pick > 0:
-                                                value = tl.load(action_extra_ptr + low + pick - 1)
+                                                value = tl.load(
+                                                    action_extra_ptr + low + pick - 1
+                                                )
                                     if value == _ACCEPT:
                                         probe_settled = 1
                                     elif value > 0:
                                         probe_settled = 1
                                     else:
                                         production = -value - 1
-                                        arity = tl.load(production_arity_ptr + production)
+                                        arity = tl.load(
+                                            production_arity_ptr + production
+                                        )
                                         if probe_depth <= arity:
                                             probe_alive = 0
                                         else:
@@ -466,7 +480,9 @@ def _replay_group(
                                                 base,
                                                 scratch_ptr + scratch,
                                                 floor,
-                                                tl.minimum(probe_depth - 1, copy_depth - 1),
+                                                tl.minimum(
+                                                    probe_depth - 1, copy_depth - 1
+                                                ),
                                             )
                                             held = tl.load(
                                                 scratch_ptr
@@ -476,15 +492,22 @@ def _replay_group(
                                                 )
                                             )
                                             exposed = tl.where(
-                                                probe_depth - 1 >= probe_floor, held, under
+                                                probe_depth - 1 >= probe_floor,
+                                                held,
+                                                under,
                                             )
-                                            lhs = tl.load(production_lhs_ptr + production)
+                                            lhs = tl.load(
+                                                production_lhs_ptr + production
+                                            )
                                             grow = tl.load(goto_offsets_ptr + exposed)
                                             grow_end = tl.load(
                                                 goto_offsets_ptr + exposed + 1
                                             )
                                             target = _search(
-                                                goto_nonterminals_ptr, grow, grow_end, lhs
+                                                goto_nonterminals_ptr,
+                                                grow,
+                                                grow_end,
+                                                lhs,
                                             )
                                             if target < 0:
                                                 probe_alive = 0
@@ -507,7 +530,8 @@ def _replay_group(
                                                 )
                                                 probe_depth = probe_depth + 1
                                 high_water = tl.maximum(
-                                    high_water, probe_depth - tl.minimum(probe_floor, floor)
+                                    high_water,
+                                    probe_depth - tl.minimum(probe_floor, floor),
                                 )
                         if probe_alive == 1 and probe_settled == 1:
                             any_ok = 1
@@ -637,13 +661,17 @@ def _mask_kernel(
         # and there is nothing to replay.
         settled = 0
         if HAS_VERDICTS == 1:
-            stride = tl.load(verdict_stride_ptr + tl.load(at + _B_VERDICT_STRIDE) + state)
+            stride = tl.load(
+                verdict_stride_ptr + tl.load(at + _B_VERDICT_STRIDE) + state
+            )
             if stride > 0:
                 top = tl.load(stack_ptr + row_index * STACK_STRIDE + depth - 1)
                 word = (
                     verdicts_ptr
                     + tl.load(at + _B_VERDICTS)
-                    + tl.load(verdict_offsets_ptr + tl.load(at + _B_VERDICT_OFFSETS) + state)
+                    + tl.load(
+                        verdict_offsets_ptr + tl.load(at + _B_VERDICT_OFFSETS) + state
+                    )
                     + top * stride
                     + slot // 16
                 )
@@ -887,7 +915,9 @@ def _history_kernel(
         )
         tl.store(
             hist_stack_ptr + (at + row_index) * STACK_STRIDE + lane,
-            tl.load(stack_ptr + row_index * STACK_STRIDE + lane, mask=lane < depth, other=0),
+            tl.load(
+                stack_ptr + row_index * STACK_STRIDE + lane, mask=lane < depth, other=0
+            ),
             mask=lane < depth,
         )
         item = item + programs
@@ -938,7 +968,9 @@ def _restore_kernel(
     for start in range(0, STACK_STRIDE):
         tl.store(
             stack_ptr + row * STACK_STRIDE + start,
-            tl.load(hist_stack_ptr + (at + row) * STACK_STRIDE + start, mask=live, other=0),
+            tl.load(
+                hist_stack_ptr + (at + row) * STACK_STRIDE + start, mask=live, other=0
+            ),
             mask=live,
         )
 
@@ -1207,29 +1239,32 @@ def _locate_kernel(
             old_stack_ptr + row_index * STACK_STRIDE + lane,
             tl.load(stack_ptr + row_index * STACK_STRIDE + lane),
         )
-        tl.store(found_ptr + row_index, _locate_one(
-            group_offsets_ptr,
-            group_set_kind_ptr,
-            group_set_offset_ptr,
-            group_set_length_ptr,
-            set_payload_ptr,
-            verdict_offsets_ptr,
-            verdicts_ptr,
-            verdict_stride_ptr,
-            lexer_state_ptr,
-            stack_ptr,
-            stack_depth_ptr,
-            token_ptr,
-            grammar_ptr,
-            bases_ptr,
-            sequence,
-            row_index,
-            GROUP_BLOCK=GROUP_BLOCK,
-            SEARCH_STEPS=SEARCH_STEPS,
-            STACK_STRIDE=STACK_STRIDE,
-            HAS_VERDICTS=HAS_VERDICTS,
-            NO_GROUP=NO_GROUP,
-        ))
+        tl.store(
+            found_ptr + row_index,
+            _locate_one(
+                group_offsets_ptr,
+                group_set_kind_ptr,
+                group_set_offset_ptr,
+                group_set_length_ptr,
+                set_payload_ptr,
+                verdict_offsets_ptr,
+                verdicts_ptr,
+                verdict_stride_ptr,
+                lexer_state_ptr,
+                stack_ptr,
+                stack_depth_ptr,
+                token_ptr,
+                grammar_ptr,
+                bases_ptr,
+                sequence,
+                row_index,
+                GROUP_BLOCK=GROUP_BLOCK,
+                SEARCH_STEPS=SEARCH_STEPS,
+                STACK_STRIDE=STACK_STRIDE,
+                HAS_VERDICTS=HAS_VERDICTS,
+                NO_GROUP=NO_GROUP,
+            ),
+        )
         slot = slot + programs
 
 
@@ -1333,9 +1368,10 @@ def _locate_one(
             hi = tl.where(active & (value > token), middle, hi)
         found = hit >= 0
         complement = kind == _COMPLEMENT
-        inside = tl.where(
-            dense, in_dense, tl.where(complement, found == 0, found)
-        ) & live_lane
+        inside = (
+            tl.where(dense, in_dense, tl.where(complement, found == 0, found))
+            & live_lane
+        )
         # A group the tables already refused for this parser state cannot be
         # the one that advances, and on real grammars 91% of them are. Applied
         # to the decision rather than to the loads, because the loads are
@@ -1344,9 +1380,7 @@ def _locate_one(
         if HAS_VERDICTS == 1:
             if verdict_stride > 0 and depth > 0:
                 at_slot = group - first
-                packed = tl.load(
-                    verdict_row + at_slot // 16, mask=live_lane, other=0
-                )
+                packed = tl.load(verdict_row + at_slot // 16, mask=live_lane, other=0)
                 inside = inside & (((packed >> (2 * (at_slot % 16))) & 3) != 1)
 
         if tl.sum(inside.to(tl.int32)) != 0:
@@ -1500,7 +1534,9 @@ def _candidate_kernel(
                             if settled == 0 and alive == 1:
                                 row = tl.load(action_offsets + top)
                                 row_end = tl.load(action_offsets + top + 1)
-                                entry = _search(action_terminals, row, row_end, terminal)
+                                entry = _search(
+                                    action_terminals, row, row_end, terminal
+                                )
                                 if entry < 0:
                                     alive = 0
                                 else:
@@ -1514,16 +1550,24 @@ def _candidate_kernel(
                                             pick = rest % count
                                             rest = rest // count
                                             if pick > 0:
-                                                value = tl.load(action_extra + low + pick - 1)
+                                                value = tl.load(
+                                                    action_extra + low + pick - 1
+                                                )
                                     if value == _ACCEPT:
                                         alive = 0
                                     elif value > 0:
-                                        if copy_depth >= STACK_STRIDE or copy_depth - floor >= WINDOW:
+                                        if (
+                                            copy_depth >= STACK_STRIDE
+                                            or copy_depth - floor >= WINDOW
+                                        ):
                                             alive = 0
                                             tl.store(overflow_ptr + sequence, 1)
                                         else:
                                             tl.store(
-                                                scratch_ptr + scratch + copy_depth - floor,
+                                                scratch_ptr
+                                                + scratch
+                                                + copy_depth
+                                                - floor,
                                                 value - 1,
                                             )
                                             copy_depth = copy_depth + 1
@@ -1546,7 +1590,9 @@ def _candidate_kernel(
                                             )
                                             lhs = tl.load(production_lhs + production)
                                             grow = tl.load(goto_offsets + exposed)
-                                            grow_end = tl.load(goto_offsets + exposed + 1)
+                                            grow_end = tl.load(
+                                                goto_offsets + exposed + 1
+                                            )
                                             target = _search(
                                                 goto_nonterminals, grow, grow_end, lhs
                                             )
@@ -1561,7 +1607,11 @@ def _candidate_kernel(
                                             else:
                                                 top = tl.load(goto_targets + target)
                                                 tl.store(
-                                                    scratch_ptr + scratch + copy_depth - floor, top
+                                                    scratch_ptr
+                                                    + scratch
+                                                    + copy_depth
+                                                    - floor,
+                                                    top,
                                                 )
                                                 copy_depth = copy_depth + 1
                         if settled == 0:
@@ -1591,29 +1641,44 @@ def _candidate_kernel(
                                     probe_spins = probe_spins + 1
                                     if probe_settled == 0 and probe_alive == 1:
                                         row = tl.load(action_offsets + probe_top)
-                                        row_end = tl.load(action_offsets + probe_top + 1)
-                                        entry = _search(action_terminals, row, row_end, terminal)
+                                        row_end = tl.load(
+                                            action_offsets + probe_top + 1
+                                        )
+                                        entry = _search(
+                                            action_terminals, row, row_end, terminal
+                                        )
                                         if entry < 0:
                                             probe_alive = 0
                                         else:
                                             value = tl.load(action_values + entry)
                                             if PATHS > 1:
-                                                low = tl.load(action_extra_offsets + entry)
-                                                high = tl.load(action_extra_offsets + entry + 1)
+                                                low = tl.load(
+                                                    action_extra_offsets + entry
+                                                )
+                                                high = tl.load(
+                                                    action_extra_offsets + entry + 1
+                                                )
                                                 count = 1 + high - low
                                                 if count > 1:
                                                     radix = radix * count
                                                     pick = probe_rest % count
                                                     probe_rest = probe_rest // count
                                                     if pick > 0:
-                                                        value = tl.load(action_extra + low + pick - 1)
+                                                        value = tl.load(
+                                                            action_extra
+                                                            + low
+                                                            + pick
+                                                            - 1
+                                                        )
                                             if value == _ACCEPT:
                                                 probe_settled = 1
                                             elif value > 0:
                                                 probe_settled = 1
                                             else:
                                                 production = -value - 1
-                                                arity = tl.load(production_arity + production)
+                                                arity = tl.load(
+                                                    production_arity + production
+                                                )
                                                 if probe_depth <= arity:
                                                     probe_alive = 0
                                                 else:
@@ -1626,34 +1691,56 @@ def _candidate_kernel(
                                                         base,
                                                         scratch_ptr + scratch,
                                                         floor,
-                                                        tl.minimum(probe_depth - 1, copy_depth - 1),
+                                                        tl.minimum(
+                                                            probe_depth - 1,
+                                                            copy_depth - 1,
+                                                        ),
                                                     )
                                                     held = tl.load(
                                                         scratch_ptr
                                                         + probe
                                                         + tl.maximum(
-                                                            probe_depth - 1 - probe_floor, 0
+                                                            probe_depth
+                                                            - 1
+                                                            - probe_floor,
+                                                            0,
                                                         )
                                                     )
                                                     exposed = tl.where(
-                                                        probe_depth - 1 >= probe_floor, held, under
+                                                        probe_depth - 1 >= probe_floor,
+                                                        held,
+                                                        under,
                                                     )
-                                                    lhs = tl.load(production_lhs + production)
-                                                    grow = tl.load(goto_offsets + exposed)
-                                                    grow_end = tl.load(goto_offsets + exposed + 1)
+                                                    lhs = tl.load(
+                                                        production_lhs + production
+                                                    )
+                                                    grow = tl.load(
+                                                        goto_offsets + exposed
+                                                    )
+                                                    grow_end = tl.load(
+                                                        goto_offsets + exposed + 1
+                                                    )
                                                     target = _search(
-                                                        goto_nonterminals, grow, grow_end, lhs
+                                                        goto_nonterminals,
+                                                        grow,
+                                                        grow_end,
+                                                        lhs,
                                                     )
                                                     if target < 0:
                                                         probe_alive = 0
                                                     elif (
                                                         probe_depth >= STACK_STRIDE
-                                                        or probe_depth - probe_floor >= WINDOW
+                                                        or probe_depth - probe_floor
+                                                        >= WINDOW
                                                     ):
                                                         probe_alive = 0
-                                                        tl.store(overflow_ptr + sequence, 1)
+                                                        tl.store(
+                                                            overflow_ptr + sequence, 1
+                                                        )
                                                     else:
-                                                        probe_top = tl.load(goto_targets + target)
+                                                        probe_top = tl.load(
+                                                            goto_targets + target
+                                                        )
                                                         tl.store(
                                                             scratch_ptr
                                                             + probe
@@ -1773,7 +1860,10 @@ def _commit_kernel(
                 source = 0
                 while source < count and written < CONFIGS:
                     if 1 == 1:
-                        if tl.load(old_lexer_ptr + sequence * CONFIGS + source) == state:
+                        if (
+                            tl.load(old_lexer_ptr + sequence * CONFIGS + source)
+                            == state
+                        ):
                             base = (sequence * CONFIGS + source) * MAX_READINGS
                             made = tl.load(cand_count_ptr + sequence * CONFIGS + source)
                             index = 0
@@ -1782,7 +1872,9 @@ def _commit_kernel(
                                     saturated = 1
                                 if written < CONFIGS:
                                     if 1 == 1:
-                                        next_state = tl.load(cand_lexer_ptr + base + index)
+                                        next_state = tl.load(
+                                            cand_lexer_ptr + base + index
+                                        )
                                         depth = tl.load(cand_depth_ptr + base + index)
                                         # The candidate's stack, put back
                                         # together: everything below its floor
@@ -1811,29 +1903,33 @@ def _commit_kernel(
                                         duplicate = 0
                                         done = 0
                                         while done < written:
-                                                out = sequence * CONFIGS + done
+                                            out = sequence * CONFIGS + done
+                                            if (
+                                                tl.load(lexer_state_ptr + out)
+                                                == next_state
+                                            ) and (
+                                                tl.load(stack_depth_ptr + out) == depth
+                                            ):
+                                                held = tl.load(
+                                                    stack_ptr
+                                                    + out * STACK_STRIDE
+                                                    + lane,
+                                                    mask=lane < depth,
+                                                    other=0,
+                                                )
                                                 if (
-                                                    tl.load(lexer_state_ptr + out)
-                                                    == next_state
-                                                ) and (
-                                                    tl.load(stack_depth_ptr + out)
-                                                    == depth
-                                                ):
-                                                    held = tl.load(
-                                                        stack_ptr + out * STACK_STRIDE + lane,
-                                                        mask=lane < depth,
-                                                        other=0,
-                                                    )
-                                                    if tl.sum(
+                                                    tl.sum(
                                                         tl.where(
                                                             (lane < depth)
                                                             & (held != values),
                                                             1,
                                                             0,
                                                         )
-                                                    ) == 0:
-                                                        duplicate = 1
-                                                done = done + 1
+                                                    )
+                                                    == 0
+                                                ):
+                                                    duplicate = 1
+                                            done = done + 1
                                         if duplicate == 0:
                                             out = sequence * CONFIGS + written
                                             tl.store(lexer_state_ptr + out, next_state)
@@ -1937,7 +2033,9 @@ def _hash_kernel(
         row = sequence * CONFIGS + config
         depth = tl.load(stack_depth_ptr + row)
         lane = tl.arange(0, STACK_STRIDE)
-        values = tl.load(stack_ptr + row * STACK_STRIDE + lane, mask=lane < depth, other=0)
+        values = tl.load(
+            stack_ptr + row * STACK_STRIDE + lane, mask=lane < depth, other=0
+        )
         kept = tl.minimum(depth, width)
         floor = depth - kept
         inside = (lane[None, :] >= floor[:, None]) & (lane[None, :] < depth)
@@ -2568,8 +2666,6 @@ def _nullable_chain(arrays: dict) -> int:
     return longest
 
 
-
-
 # Which base each uploaded array is addressed through.
 _ARENA = {
     "group_offsets": _B_GROUP_OFFSETS,
@@ -2598,6 +2694,7 @@ _ARENA = {
     "verdicts": _B_VERDICTS,
     "verdict_stride": _B_VERDICT_STRIDE,
 }
+
 
 @dataclass
 class ResidentTables:
@@ -2744,9 +2841,7 @@ class DeviceGrammar:
         )
 
         if compiled is not None:
-            for item in (
-                compiled if isinstance(compiled, (list, tuple)) else [compiled]
-            ):
+            for item in compiled if isinstance(compiled, (list, tuple)) else [compiled]:
                 self.admit(item)
 
     @property
@@ -2926,8 +3021,8 @@ class DeviceGrammar:
         serving engine wanting cheap re-admission after an eviction keeps the
         latter.
         """
-        tables = compiled if isinstance(compiled, ResidentTables) else self.prepare(
-            compiled
+        tables = (
+            compiled if isinstance(compiled, ResidentTables) else self.prepare(compiled)
         )
         if self.count == 0 and not self.vocab_size:
             self.vocab_size = tables.vocab_size
@@ -2981,9 +3076,7 @@ class DeviceGrammar:
             self.max_groups_per_state, tables.max_groups_per_state
         )
         self.max_readings = max(self.max_readings, tables.max_readings)
-        self.max_reading_terms = max(
-            self.max_reading_terms, tables.max_reading_terms
-        )
+        self.max_reading_terms = max(self.max_reading_terms, tables.max_reading_terms)
         self.nullable_chain = max(self.nullable_chain, tables.nullable_chain)
         # A conflicted cell holds up to `max_actions` actions and a reading
         # meets several, so the product is what enumerating them all would
@@ -3240,9 +3333,7 @@ class DeviceBatch:
         self.memo_configs = min(self.configs, _MEMO_CONFIGS)
         self.memo_stride = min(grammar.max_stack, _MEMO_DEPTH)
         self.memo_slots = _memo_slots(
-            grammar.mask_words * 4
-            + self.memo_configs * (8 + self.memo_stride * 4)
-            + 16
+            grammar.mask_words * 4 + self.memo_configs * (8 + self.memo_stride * 4) + 16
         )
         held = self.memo_slots * self.memo_configs
         self.memo_hash = torch.full(
@@ -3270,9 +3361,7 @@ class DeviceBatch:
         )
         # What each entry was keyed on: `k` entries from the top, or -1 for the
         # whole stack.
-        self.memo_read = torch.zeros(
-            self.memo_slots, dtype=torch.int32, device="cuda"
-        )
+        self.memo_read = torch.zeros(self.memo_slots, dtype=torch.int32, device="cuda")
         self.memo_slot = torch.full((batch,), -1, dtype=torch.int32, device="cuda")
         self.memo_store = torch.full((batch,), -1, dtype=torch.int32, device="cuda")
         self.memo_want = torch.full((batch,), -2, dtype=torch.int32, device="cuda")
@@ -3332,9 +3421,7 @@ class DeviceBatch:
             dtype=torch.int32,
             device="cuda",
         )
-        self.found = torch.full(
-            (rows,), _NO_GROUP, dtype=torch.int32, device="cuda"
-        )
+        self.found = torch.full((rows,), _NO_GROUP, dtype=torch.int32, device="cuda")
 
         # How many steps of parse state to keep so they can be undone.
         #
@@ -3418,9 +3505,9 @@ class DeviceBatch:
         if int(values.max()) >= self.grammar.count:
             raise ValueError("grammar id past the end of the pool")
         self.grammar_of.copy_(values.cuda())
-        starts = torch.tensor(
-            self.grammar.start_parser_states, dtype=torch.int32
-        )[values.long()]
+        starts = torch.tensor(self.grammar.start_parser_states, dtype=torch.int32)[
+            values.long()
+        ]
         rows = self.stack.reshape(self.batch, self.configs, -1)
         rows[:, :, 0] = starts.reshape(self.batch, 1).cuda()
         self.depth.fill_(1)

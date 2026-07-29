@@ -1,6 +1,6 @@
 """The public API, exercised the way the documentation says to use it.
 
-Everything else in this suite tests the engine through `gpu_lr1.device_parser`,
+Everything else in this suite tests the engine through `gpugrammar._engine`,
 which is the research entry point. These tests go through `gpugrammar.Engine`
 and `gpugrammar.Batch` instead, because that is what an artifact reviewer will
 type and what a serving integration will call, and an API that is only ever

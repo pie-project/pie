@@ -80,7 +80,7 @@ def measure_ours(
     """Fill and advance for the device-resident parser."""
     import torch
 
-    from ..device_parser import DeviceBatch, DeviceGrammar
+    from gpugrammar._engine import DeviceBatch, DeviceGrammar
 
     device_grammar = DeviceGrammar(grammar)
     device_batch = DeviceBatch(device_grammar, batch)
@@ -239,7 +239,7 @@ def measure_step(
 
     import xgrammar as xg
 
-    from gpu_lr1.device_parser import DeviceBatch, DeviceGrammar
+    from gpugrammar._engine import DeviceBatch, DeviceGrammar
 
     window = tokens[: max(2, min(len(tokens), 24))]
 

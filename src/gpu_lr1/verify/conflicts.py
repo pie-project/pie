@@ -26,7 +26,7 @@ def main() -> None:
     import gpugrammar
     from transformers import AutoTokenizer
 
-    from gpu_lr1.device_parser import DeviceGrammar
+    from gpugrammar._engine import DeviceGrammar
 
     want = int(sys.argv[1]) if len(sys.argv) > 1 else 8
     scan = int(sys.argv[2]) if len(sys.argv) > 2 else 200

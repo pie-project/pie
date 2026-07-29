@@ -114,7 +114,7 @@ def under_load(
     import xgrammar as xg
     from transformers import AutoTokenizer
 
-    from ..device_parser import DeviceBatch, DeviceGrammar
+    from gpugrammar._engine import DeviceBatch, DeviceGrammar
 
     tokenizer = AutoTokenizer.from_pretrained(model)
     vocabulary = load_vocabulary(model)
@@ -201,7 +201,7 @@ def capturability(model: str, schema_index: int, batch: int) -> Answer:
     import xgrammar as xg
     from transformers import AutoTokenizer
 
-    from ..device_parser import DeviceBatch, DeviceGrammar
+    from gpugrammar._engine import DeviceBatch, DeviceGrammar
 
     tokenizer = AutoTokenizer.from_pretrained(model)
     vocabulary = load_vocabulary(model)
