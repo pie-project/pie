@@ -3797,6 +3797,12 @@ impl BatchScheduler {
     /// settled/stale, assemble the v14 frame submission, and post it as ONE
     /// launch. Returns (progress, posted-a-frame).
     #[allow(clippy::too_many_arguments)]
+    /// Cached so the frame path does not pay an environment lookup per frame.
+    fn frame_shape_trace() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("PIE_FRAME_SHAPE").is_some())
+    }
+
     /// Whether a queued fire still belongs in the frame being built; settles
     /// it with a rejection if not.
     fn admits_to_frame(
@@ -3939,8 +3945,26 @@ impl BatchScheduler {
                 }
             }
         }
+        let nonempty_waves = survivors.iter().filter(|w| !w.is_empty()).count();
         let (submission, requests) =
             batch::build_frame_submission(survivors, limits, page_size, stats);
+        // How many waves a sealed frame actually carries. ABI v14 has a frame
+        // carry k steps the driver runs as one closed system, and the guest does
+        // submit `live_slots` fires per frame -- but this reports
+        // `nonempty_waves=1` at every k, so each fire becomes its own frame and
+        // every decode step pays a host round trip (2.31ms of a 25.6ms step at
+        // 32 lanes, measured driver-side with PIE_METAL_GPU_METER).
+        if Self::frame_shape_trace() {
+            use std::sync::atomic::{AtomicU64, Ordering as O};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, O::Relaxed) + 1;
+            if n % 256 == 0 {
+                eprintln!(
+                    "[frame-shape] n={n} nonempty_waves={nonempty_waves} steps={}",
+                    submission.steps.len()
+                );
+            }
+        }
         let batch_size = requests.len() as u64;
         let total_tokens = requests
             .iter()
