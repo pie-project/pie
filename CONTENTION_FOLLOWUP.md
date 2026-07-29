@@ -3881,3 +3881,119 @@ decode-wave scheduler-empty idle is 0.00 s in every run ever measured here —
 but it cannot hide it for a process's FIRST frame, which has nothing queued
 ahead of it. Extending run-ahead to cover the first frame of a newly admitted
 process is the fix, and it involves no predicted quantity.
+
+## 20.21 First-frame run-ahead: BUILT, MEASURED, REFUTED — and it relocated the root cause
+
+§20.20 ended by proposing the one surviving fix: extend run-ahead to cover a
+newly admitted process's FIRST frame, so a successor prepares and submits it
+while its predecessor still executes. That was built and measured. It is a
+clean **-5.7% regression**, and the reason it fails overturns §20.18-§20.20's
+attribution of the idle.
+
+### What was built
+
+`ensure_execution_admitted` swapped its unconditional `acquire_owned().await`
+for a `try_acquire_owned()`; on failure a bind-admitted process was allowed to
+submit its FIRST frame on its bind permit alone and only then park for a seat.
+One `forward.submit` carries every `frame-size` slot, so a single pass is
+exactly one whole frame and can never strand a partial one. Sizing needed no
+new constant: the bind pool is already 2x the execution limit ("the executing
+cohort plus ONE staged cohort"), which bounds run-ahead occupancy to exactly
+one cohort. The park posted `notify_process_suspend` so the wait-all quorum
+would not wait on a lane that was itself waiting for a seat, and
+`ProcessCtx::drop` was widened to post the Terminate leave for a process that
+retires having only ever run ahead (it reached the wait-set but owes no slot
+release). The frame policy needed no change at all: `on_execution_slot_consumed`
+already guards its `joins_in_flight` insert on `staged`, and a lane that has
+fired is no longer staged.
+
+The mechanism worked exactly as designed. `runahead_first_frames = 3584` =
+4096 - 512, i.e. every process except the seated first cohort; the entries
+arrive in bursts (p50 +32, max +247) and the first 512 complete by t = 0.26 s,
+while cohort A still has 2.1 s of decode left. Prefill really was prepared and
+submitted an entire generation early, and `planner_parks_total = 0` — the extra
+resident KV never starved the pool.
+
+### The measurement
+
+Homogeneous conc 512, 8192 pages, alternating arms, n=2:
+
+| arm | run 1 | run 2 |
+| --- | ----: | ----: |
+| off | 31450 | 31210 |
+| on  | 28927 | 28385 |
+
+Wave decomposition of a separate instrumented pair (30831 off / 29067 on):
+
+| | waves | tok/wave | TRUE idle | before prefill | decode |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| off | 528 | 1270 | 1.03 s (6.2%) | 0.89 s | **0.13 s** |
+| on  | 559 | 1200 | 2.26 s (12.8%) | 1.15 s | **1.10 s** |
+
+Identical total tokens (670,634). Scheduler-loop cost is unchanged
+(`loop_mailbox` 0.97 -> 1.08 s, `loop_park` 9.30 -> 9.28 s), so the suspend /
+resume churn is NOT the cost. The engine simply idles more.
+
+### Why it fails — and what that proves about the root cause
+
+Two facts kill the premise.
+
+**1. The boundary hole did not move.** In the OFF arm every one of the 8 top
+gaps precedes a fat prefill wave (8398 tokens / 442 fires), 39-203 ms each,
+0.93 s of the 1.03 s total. In the ON arm the boundary gaps are still there and
+still the same size — 88, 100, 106, 118, 172 ms — but they now precede a
+**decode** wave (1024 tokens / 1024 fires), because the prefill had already run
+2 seconds earlier. Prefetching the prefill moved the prefill and left the hole
+untouched.
+
+**2. The hole followed the join.** 93% of the ON arm's 2.26 s of idle lands
+within 350 ms of a run-ahead burst. Every fleet-wide arrival of new lanes
+bought its own hole, so the run bought two per cohort instead of one.
+
+That relocates the cause. §20.18 measured that 100%/88%/82% of GPU idle sits
+immediately before a prefill wave and concluded the idle IS prefill
+preparation. It is not: a cohort boundary is simply where the fleet-wide JOIN
+and the prefill coincide, and the idle belongs to the join. The cost is 512
+guest exits plus 512 admissions plus 512 first submits — a fleet-wide host
+round trip that the wait-all seal converts into a GPU hole, and it costs the
+same 100-ish ms whenever it happens. §20.13's "turnover barrier" was closer to
+right than §20.18 gave it credit for; what §20.13 got wrong was the fix shape,
+not the location.
+
+This is the same wall §20.14 #6/#7 and §20.18's two share-based designs hit
+from the other side. A fleet-wide join is a GPU hole *because* the seal is
+wait-for-all; relaxing the quorum removes the hole but splits the fleet into
+sub-cohorts that never re-merge (run-ahead lead is hysteretic, frame.rs
+:1804-1820), and all four quorum designs measured worse. Moving the join
+earlier, as here, just moves the hole. Both levers on the same joint are now
+closed by measurement.
+
+### Why a parked successor cannot help, structurally
+
+A lane's run-ahead lead IS queued work. A successor that submits one frame and
+then parks has its queue drained within a wave or two and rejoins lead-less —
+exactly as it would have without the change — so it pays a SECOND fleet-wide
+host round trip at the boundary anyway. Letting it keep submitting instead of
+parking is not an option either: with 4096 processes spawned and a 1024 bind
+pool that is precisely a 2x execution cap, which §20.14 #2 measured at
+26543 vs 30402. And it cannot queue more than one frame regardless: frame N+1
+needs frame N's sampled token, so the maximum possible pre-staged reserve is
+one prefill.
+
+### The one variant this leaves open (NOT built)
+
+The prefill wave is 83.6 ms of GPU (p50) against a boundary hole of ~114 ms.
+So a successor's prefill frame could cover most of the hole — but only if it is
+submitted early and **held undispatched** until the seat opens, instead of
+dispatching on arrival as it did here. That needs a new lane state in the frame
+policy (frames present, not awaited, not dispatch-eligible, released on seat
+acquisition and on terminate). Ceiling is 8 boundaries x 83.6 ms = 0.67 s of
+16.5 s = **+4.1%**, which is ~32100 against vLLM's 32755 — still short of
+parity on this arm, and it lands in the deadlock-prone part of the scheduler.
+Recorded, not attempted.
+
+### Status
+
+REVERTED — the tree carries none of this. `park_census` /
+`planner_parks_total` from §20.20 stay; `runahead_first_frames` went with the
+experiment.
