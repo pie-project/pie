@@ -23,13 +23,22 @@ impl crate::pipeline::fire::FireContext for TeardownFireContext {
     }
 }
 
+/// Remove a process's scratch directory. `None` means the sandbox denied the
+/// filesystem, so no directory was ever created — skipping it keeps a
+/// cohort-boundary teardown herd from issuing 512 pointless `openat`s.
+fn remove_scratch(dir: Option<&std::path::Path>) {
+    if let Some(dir) = dir {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
 pub(crate) fn defer_resource_teardown(
     process_id: uuid::Uuid,
     resources: wasmtime::component::ResourceTable,
     residency: Arc<Mutex<crate::inferlet::process::ProcessResidency>>,
     terminate_fences: Option<Vec<crate::scheduler::worker::TerminateFence>>,
     bind_permit: Option<tokio::sync::OwnedSemaphorePermit>,
-    scratch_dir: std::path::PathBuf,
+    scratch_dir: Option<std::path::PathBuf>,
 ) {
     let capped_execution = terminate_fences.is_some();
     let snapshot = residency.lock().unwrap().teardown_snapshot();
@@ -47,7 +56,7 @@ pub(crate) fn defer_resource_teardown(
     {
         crate::inferlet::process::release_bind_permit(context.bind_permit.take());
         drop(context);
-        let _ = std::fs::remove_dir_all(&scratch_dir);
+        remove_scratch(scratch_dir.as_deref());
         return;
     }
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {
@@ -60,7 +69,7 @@ pub(crate) fn defer_resource_teardown(
         // POOLED RESOURCES are preserved here, never admission capacity.
         crate::inferlet::process::release_bind_permit(context.bind_permit.take());
         std::mem::forget(context);
-        let _ = std::fs::remove_dir_all(&scratch_dir);
+        remove_scratch(scratch_dir.as_deref());
         // `ProcessCtx::drop` already released the execution permit and
         // broadcast the release, so the semaphore's capacity is intact and
         // the policy's departure is resolved. (Before the permit moved out
@@ -128,8 +137,13 @@ pub(crate) fn defer_resource_teardown(
             .sum::<usize>();
         crate::inferlet::process::release_bind_permit(context.bind_permit.take());
         drop(context);
-        let _ = std::fs::remove_dir_all(&scratch_dir);
         let dropped_us = if timing {
+            crate::scheduler::fire_timing_now_us()
+        } else {
+            0
+        };
+        remove_scratch(scratch_dir.as_deref());
+        let scratch_removed_us = if timing {
             crate::scheduler::fire_timing_now_us()
         } else {
             0
@@ -162,7 +176,8 @@ pub(crate) fn defer_resource_teardown(
                 // The wasmtime `ResourceTable` drop: previously invisible,
                 // because the record was written before it.
                 "table_drop_us": dropped_us - detached_us,
-                "close_post_us": quiesced_us - dropped_us,
+                "scratch_rm_us": scratch_removed_us - dropped_us,
+                "close_post_us": quiesced_us - scratch_removed_us,
                 "channels": channels,
                 "released_us": quiesced_us,
             }));

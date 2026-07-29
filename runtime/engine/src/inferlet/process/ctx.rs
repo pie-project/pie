@@ -52,8 +52,11 @@ pub struct ProcessCtx {
     /// parity with the wasi:http linker which is only wired when allowed).
     network_allowed: bool,
 
-    /// Per-instance scratch directory, deleted on Drop.
-    scratch_dir: PathBuf,
+    /// Per-instance scratch directory, deleted on Drop. `None` when the
+    /// sandbox denies the filesystem: nothing was created, so there is
+    /// nothing to remove — and with `allow_fs` off `base_dir` is empty, so
+    /// the joined path would be a *relative* `./<pid>` under the server's CWD.
+    scratch_dir: Option<PathBuf>,
 
     // Dynamic linking support for proxy resources
     /// Maps host rep → guest ResourceAny for dynamic linking
@@ -247,15 +250,17 @@ impl ProcessCtx {
             }
         }
 
-        let scratch_dir = policy.fs.base_dir.join(id.to_string());
-
-        if policy.fs.allow {
+        let scratch_dir = if policy.fs.allow {
+            let scratch_dir = policy.fs.base_dir.join(id.to_string());
             std::fs::create_dir_all(&scratch_dir).expect("failed to create scratch dir");
 
             builder
                 .preopened_dir(&scratch_dir, "/scratch", DirPerms::all(), FilePerms::all())
                 .expect("failed to preopen scratch dir");
-        }
+            Some(scratch_dir)
+        } else {
+            None
+        };
 
         // Set up Python runtime environment if py-runtime directory is available.
         // Layout: py-runtime/runtime/{python,bundled}, py-runtime/site-packages
