@@ -20,3 +20,6 @@ gpugrammar-run = { path = "../gpugrammar-run" }
 gpugrammar-tables = { path = "../gpugrammar-tables" }
 rustc-hash.workspace = true
 pyo3 = { version = "0.27", features = ["extension-module", "abi3-py310"] }
+
+[lints]
+workspace = true

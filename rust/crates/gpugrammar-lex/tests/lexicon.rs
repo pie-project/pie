@@ -1,7 +1,7 @@
 use gpugrammar_ir::grammar::Grammar;
 use gpugrammar_lex::lexicon::{SkeletonExpr, extract, terminal_automata};
 use gpugrammar_lex::regular::analyze;
-use gpugrammar_lex::{START, build_lexer, group_vocabulary};
+use gpugrammar_lex::{START, build_lexer};
 
 const JSON: &str = r#"
 value ::= object | array | string | number

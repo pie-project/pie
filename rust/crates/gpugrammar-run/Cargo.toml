@@ -16,3 +16,6 @@ gpugrammar-tables = { path = "../gpugrammar-tables" }
 rustc-hash.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+[lints]
+workspace = true

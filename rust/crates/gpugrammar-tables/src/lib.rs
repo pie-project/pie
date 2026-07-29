@@ -147,9 +147,9 @@ pub struct Artifact {
     ///
     /// A group's readings run against the parser state on top of the stack. A
     /// reading that only shifts never looks below the top, so its answer is a
-    /// function of `(lexer state, parser state)` alone and can be settled here
-    /// - and measured on real grammars **92.5% of replays are settled that
-    /// way**, 91.0% refused and 1.5% admitted. Only the 7.5% that reduce need
+    /// function of `(lexer state, parser state)` alone and can be settled here.
+    /// Measured on real grammars, **92.5% of replays are settled that way**,
+    /// 91.0% refused and 1.5% admitted. Only the 7.5% that reduce need
     /// the stack, and those are the ones the runtime still replays.
     ///
     /// Two bits per (pair, group), packed into `u32` words: 0 undecided, 1

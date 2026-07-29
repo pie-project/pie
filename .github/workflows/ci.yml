@@ -1,0 +1,75 @@
+name: ci
+
+# What can be checked without a GPU, which is the front end and the lint. The
+# device parser needs CUDA and is checked by `gpu.yml` on a self-hosted runner;
+# splitting them keeps a front-end regression from waiting on hardware.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      # The workspace builds with no warnings, so a new one is a failure
+      # rather than something to scroll past.
+      - name: build
+        run: cargo build --release --manifest-path rust/Cargo.toml
+        env:
+          RUSTFLAGS: -D warnings
+      - name: clippy
+        run: cargo clippy --release --manifest-path rust/Cargo.toml --all-targets -- -D warnings
+      - name: test
+        run: cargo test --release --manifest-path rust/Cargo.toml
+
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: lint
+        run: uvx ruff check src tests
+      - name: format check
+        run: uvx ruff format --check --diff src/gpugrammar
+
+  # The one thing a hosted runner cannot do. Everything here needs a real
+  # device: the kernels are Triton, the step is a CUDA graph, and the
+  # verifications compare the device against the reference matcher row by row.
+  gpu:
+    runs-on: [self-hosted, cuda]
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: astral-sh/setup-uv@v5
+      - name: build the extension
+        run: |
+          cargo build --release -p gpugrammar-py --manifest-path rust/Cargo.toml
+          uv venv
+          uv pip install torch triton numpy
+          cp rust/target/release/lib_gpugrammar.so \
+            "$(uv run python -c 'import site; print(site.getsitepackages()[0])')/_gpugrammar.abi3.so"
+      - name: tests
+        run: uv run --with numpy python -m unittest discover -s tests
+        env:
+          PYTHONPATH: src
+      # Not unit tests. Each walks real documents through the device and
+      # compares the mask word for word against the reference matcher, which
+      # is the only thing that can see a mask that narrowed - and it is what
+      # has caught every kernel bug in this project. `--quick` is ~80 s.
+      - name: verify against the reference matcher
+        run: uv run python -m gpu_lr1.verify --quick
+        env:
+          PYTHONPATH: src

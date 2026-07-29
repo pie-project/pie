@@ -887,7 +887,7 @@ pub fn group_state(lexer: &Lexer, vocabulary: &[Vec<u8>], state: LexState) -> (V
             }
         }
     }
-    groups.sort_by(|a, b| b.tokens.len().cmp(&a.tokens.len()));
+    groups.sort_by_key(|group| std::cmp::Reverse(group.tokens.len()));
     (groups, rejected)
 }
 
@@ -1026,6 +1026,6 @@ fn group_one(
             held_flat.extend_from_slice(&scratch.flat);
         }
     }
-    groups.sort_by(|a, b| b.tokens.len().cmp(&a.tokens.len()));
+    groups.sort_by_key(|group| std::cmp::Reverse(group.tokens.len()));
     (groups, refused)
 }

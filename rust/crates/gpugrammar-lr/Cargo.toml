@@ -11,3 +11,6 @@ anyhow.workspace = true
 gpugrammar-ir = { path = "../gpugrammar-ir" }
 gpugrammar-lex = { path = "../gpugrammar-lex" }
 rustc-hash.workspace = true
+
+[lints]
+workspace = true

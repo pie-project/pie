@@ -15,6 +15,19 @@ edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/ingim/gpu-lr1"
 
+# Clippy gates in CI, so what is deliberate is named here rather than left as
+# noise for a reader to learn to scroll past.
+[workspace.lints.clippy]
+# A loop that indexes several arrays by the same state number is what these
+# passes mean - a lexer state addresses its transitions, its flags and its
+# closure at once - and `zip`ping three iterators to avoid the index reads
+# worse than the thing it replaces.
+needless_range_loop = "allow"
+# `emit` takes the six products of the pipeline and the vocabulary size.
+# Bundling them into a struct would exist only to satisfy the count.
+too_many_arguments = "allow"
+type_complexity = "allow"
+
 [workspace.dependencies]
 anyhow = "1.0"
 rustc-hash = "2.1"

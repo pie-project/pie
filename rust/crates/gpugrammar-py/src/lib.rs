@@ -49,9 +49,10 @@ fn refusal(failure: Failure) -> PyErr {
     };
     Python::attach(|python| {
         let error = CompileError::new_err(format!("{failure}"));
-        if let Ok(value) = error.value(python).setattr("stage", stage) {
-            let _ = value;
-        }
+        // A failure here would mean the exception object refused an attribute,
+        // which cannot happen for a Python-level class; the message still
+        // carries the stage either way, so this must not itself raise.
+        let _ = error.value(python).setattr("stage", stage);
         error
     })
 }
