@@ -24,12 +24,7 @@ public:
               ops::CublasHandle& cublas,
               const ForwardFn::ForwardInputs& in) override;
 
-    ModelCapabilities capabilities() const override {
-        // SSD expert page-ins need host routing; CUDA graphs cannot capture.
-        ModelCapabilities caps;
-        caps.graph_safe = fwd_cfg_.expert_cache == nullptr;
-        return caps;
-    }
+    ModelCapabilities capabilities() const override {}
 
 private:
     const MixtralWeights& weights_;

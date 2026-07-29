@@ -5,6 +5,7 @@
 // Keyed by the compile cache key. Path: `{compile_cache_dir}/{key}.experts`.
 // Pack build appends one expert at a time so peak VRAM stays O(one expert).
 
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -12,6 +13,8 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#include <unistd.h>
 
 #include "expert_stream_cache.hpp"
 #include "loader/safetensors.hpp"
@@ -45,9 +48,16 @@ inline std::filesystem::path expert_pack_path(const std::string& cache_key)
     return expert_pack_dir() / (cache_key + ".experts");
 }
 
+// Unique per builder so concurrent cold builds of the same cache_key do not
+// truncate each other's in-progress temps. Final publish still renames to
+// expert_pack_path(cache_key).
 inline std::filesystem::path expert_pack_tmp_path(const std::string& cache_key)
 {
-    return expert_pack_dir() / (cache_key + ".experts.tmp");
+    static std::atomic<std::uint64_t> seq{0};
+    const auto n = seq.fetch_add(1, std::memory_order_relaxed);
+    return expert_pack_dir() /
+           (cache_key + "." + std::to_string(static_cast<long long>(::getpid())) +
+            "." + std::to_string(n) + ".experts.tmp");
 }
 
 inline std::uint64_t expert_pack_header_bytes(
@@ -77,12 +87,53 @@ inline void remap_streamed_table_to_expert_pack(
 
 inline std::uint64_t expert_pack_body_bytes(const StreamedExpertTable& table)
 {
-    const std::uint64_t slot =
-        table.slot_bytes > 0
-            ? table.slot_bytes
-            : table.payload_bytes_per_expert();
-    return slot * static_cast<std::uint64_t>(table.num_layers) *
+    if (table.slot_bytes == 0) {
+        throw std::runtime_error(
+            "expert pack: slot_bytes must be > 0 (aligned slot stride from "
+            "the stream plan); refusing to infer size from raw section "
+            "payloads");
+    }
+    return table.slot_bytes * static_cast<std::uint64_t>(table.num_layers) *
            static_cast<std::uint64_t>(table.num_experts);
+}
+
+// Canonical body checksum (weight_codec::kChunkBytes folds) so warm-path
+// verify matches finalize regardless of how append_bytes was chunked.
+inline bool expert_pack_hash_body_file(
+    const std::filesystem::path& path,
+    std::uint64_t header_bytes,
+    std::uint64_t body_bytes,
+    std::uint64_t* out_hash)
+{
+    if (out_hash == nullptr) return false;
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
+    in.seekg(static_cast<std::streamoff>(header_bytes));
+    if (!in) return false;
+    std::uint64_t sum = weight_codec::kBlobHashSeed;
+    if (body_bytes == 0) {
+        *out_hash = sum;
+        return true;
+    }
+    std::vector<char> buf(static_cast<std::size_t>(
+        std::min(weight_codec::kChunkBytes, body_bytes)));
+    std::uint64_t left = body_bytes;
+    while (left > 0) {
+        const std::uint64_t n =
+            std::min<std::uint64_t>(left, weight_codec::kChunkBytes);
+        if (buf.size() < static_cast<std::size_t>(n)) {
+            buf.resize(static_cast<std::size_t>(n));
+        }
+        in.read(buf.data(), static_cast<std::streamsize>(n));
+        if (!in || static_cast<std::uint64_t>(in.gcount()) != n) {
+            return false;
+        }
+        sum = weight_codec::blob_hash_update(
+            sum, buf.data(), static_cast<std::size_t>(n));
+        left -= n;
+    }
+    *out_hash = sum;
+    return true;
 }
 
 class ExpertPackWriter {
@@ -117,7 +168,6 @@ public:
         std::vector<char> pad(header_bytes_, 0);
         os_.write(pad.data(), static_cast<std::streamsize>(pad.size()));
         body_cursor_ = 0;
-        hash_ = weight_codec::kBlobHashSeed;
     }
 
     void append_bytes(const void* data, std::uint64_t nbytes)
@@ -128,8 +178,6 @@ public:
         if (!os_) {
             throw std::runtime_error("expert pack: write failed");
         }
-        hash_ = weight_codec::blob_hash_update(
-            hash_, data, static_cast<std::size_t>(nbytes));
         body_cursor_ += nbytes;
     }
 
@@ -154,21 +202,40 @@ public:
                 std::to_string(body_cursor_) + ", expected " +
                 std::to_string(expected) + ")");
         }
-        os_.seekp(0);
-        os_.write(kExpertPackMagic, static_cast<std::streamsize>(kExpertPackMagicBytes));
-        write_u32(kExpertPackVersion);
-        write_u32(static_cast<std::uint32_t>(cache_key_.size()));
-        os_.write(cache_key_.data(),
-                  static_cast<std::streamsize>(cache_key_.size()));
-        write_u32(static_cast<std::uint32_t>(table_.num_layers));
-        write_u32(static_cast<std::uint32_t>(table_.num_experts));
-        write_u32(static_cast<std::uint32_t>(table_.sections_per_expert));
-        for (std::uint64_t b : table_.section_bytes) {
-            write_u64(b);
-        }
-        write_u64(hash_);
         os_.flush();
         os_.close();
+        std::uint64_t hash = 0;
+        if (!expert_pack_hash_body_file(
+                tmp_, header_bytes_, expected, &hash)) {
+            throw std::runtime_error(
+                "expert pack: failed to hash body in " + tmp_.string());
+        }
+        std::fstream out(
+            tmp_, std::ios::binary | std::ios::in | std::ios::out);
+        if (!out) {
+            throw std::runtime_error(
+                "expert pack: failed to reopen " + tmp_.string() +
+                " for header write");
+        }
+        out.seekp(0);
+        out.write(kExpertPackMagic,
+                  static_cast<std::streamsize>(kExpertPackMagicBytes));
+        write_u32(out, kExpertPackVersion);
+        write_u32(out, static_cast<std::uint32_t>(cache_key_.size()));
+        out.write(cache_key_.data(),
+                  static_cast<std::streamsize>(cache_key_.size()));
+        write_u32(out, static_cast<std::uint32_t>(table_.num_layers));
+        write_u32(out, static_cast<std::uint32_t>(table_.num_experts));
+        write_u32(out, static_cast<std::uint32_t>(table_.sections_per_expert));
+        for (std::uint64_t b : table_.section_bytes) {
+            write_u64(out, b);
+        }
+        write_u64(out, hash);
+        out.flush();
+        if (!out) {
+            throw std::runtime_error("expert pack: header write failed");
+        }
+        out.close();
         std::filesystem::rename(tmp_, path_);
     }
 
@@ -221,19 +288,36 @@ public:
                     static_cast<std::streamsize>(kExpertPackSectionBytesEntry));
             if (!in || b != expect) return false;
         }
-        return static_cast<bool>(in);
+        std::uint64_t stored_hash = 0;
+        in.read(reinterpret_cast<char*>(&stored_hash),
+                static_cast<std::streamsize>(kExpertPackHashBytes));
+        if (!in) return false;
+        in.close();
+
+        const std::uint64_t hdr = expert_pack_header_bytes(
+            cache_key, table.section_bytes.size());
+        const std::uint64_t body = expert_pack_body_bytes(table);
+        std::error_code ec;
+        const auto actual = std::filesystem::file_size(path, ec);
+        if (ec || actual != hdr + body) return false;
+
+        std::uint64_t got_hash = 0;
+        if (!expert_pack_hash_body_file(path, hdr, body, &got_hash)) {
+            return false;
+        }
+        return got_hash == stored_hash;
     }
 
 private:
-    void write_u32(std::uint32_t v)
+    static void write_u32(std::ostream& os, std::uint32_t v)
     {
-        os_.write(reinterpret_cast<const char*>(&v),
-                  static_cast<std::streamsize>(sizeof(std::uint32_t)));
+        os.write(reinterpret_cast<const char*>(&v),
+                 static_cast<std::streamsize>(sizeof(std::uint32_t)));
     }
-    void write_u64(std::uint64_t v)
+    static void write_u64(std::ostream& os, std::uint64_t v)
     {
-        os_.write(reinterpret_cast<const char*>(&v),
-                  static_cast<std::streamsize>(sizeof(std::uint64_t)));
+        os.write(reinterpret_cast<const char*>(&v),
+                 static_cast<std::streamsize>(sizeof(std::uint64_t)));
     }
 
     std::string cache_key_;
@@ -243,7 +327,6 @@ private:
     std::ofstream os_;
     std::uint64_t header_bytes_ = 0;
     std::uint64_t body_cursor_ = 0;
-    std::uint64_t hash_ = 0;
 };
 
 bool ensure_gpt_oss_native_expert_pack(

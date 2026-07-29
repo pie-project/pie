@@ -64,6 +64,32 @@ struct GptOssEagerBf16PackTraits {
         ctx.intermediate = fused_rows / 2;
         ctx.hidden = gu_groups * 32;
 
+        // Match Rust gpt_oss_eager_bf16_section_bytes: I*H*2 BF16 payloads.
+        const std::uint64_t gate =
+            static_cast<std::uint64_t>(ctx.intermediate) *
+            static_cast<std::uint64_t>(ctx.hidden) * 2;
+        const std::uint64_t down =
+            static_cast<std::uint64_t>(ctx.hidden) *
+            static_cast<std::uint64_t>(ctx.intermediate) * 2;
+        const std::uint64_t expect[kSections] = {gate, gate, down};
+        if (sb.size() != static_cast<std::size_t>(kSections)) {
+            throw std::runtime_error(
+                "expert pack: eager BF16 expected " +
+                std::to_string(kSections) + " section_bytes, got " +
+                std::to_string(sb.size()));
+        }
+        for (int i = 0; i < kSections; ++i) {
+            if (sb[static_cast<std::size_t>(i)] != expect[i]) {
+                throw std::runtime_error(
+                    "expert pack: eager BF16 section_bytes[" +
+                    std::to_string(i) + "]=" +
+                    std::to_string(sb[static_cast<std::size_t>(i)]) +
+                    " != expected " + std::to_string(expect[i]) +
+                    " (I=" + std::to_string(ctx.intermediate) +
+                    " H=" + std::to_string(ctx.hidden) + ")");
+            }
+        }
+
         const auto gu_w_store = checkpoint.storage_info(gu_w_name);
         const auto gu_s_store = checkpoint.storage_info(
             "model.layers.0.mlp.experts.gate_up_proj_scales");

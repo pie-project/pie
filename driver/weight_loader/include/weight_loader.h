@@ -14,7 +14,7 @@
 
 namespace pie_weight_loader {
 
-constexpr static const uint32_t STORAGE_PROGRAM_VERSION = 4;
+constexpr static const uint32_t STORAGE_PROGRAM_VERSION = 5;
 
 enum class PieLoaderBackendKind {
   Cuda = 0,

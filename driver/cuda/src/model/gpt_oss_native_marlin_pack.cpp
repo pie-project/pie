@@ -141,6 +141,40 @@ struct GptOssNativeMarlinPackTraits {
         ctx.hidden = ctx.gu_groups * 32;
         ctx.down_groups = static_cast<int>(dn_w_info.shape[2]);
 
+        // Match Rust gpt_oss_native_section_bytes / stream plan layout.
+        const std::uint64_t gate_w =
+            static_cast<std::uint64_t>(ctx.intermediate_native) *
+            static_cast<std::uint64_t>(ctx.hidden) / 2;
+        const std::uint64_t gate_s =
+            static_cast<std::uint64_t>(ctx.intermediate_native) *
+            static_cast<std::uint64_t>(ctx.gu_groups);
+        const std::uint64_t down_w =
+            static_cast<std::uint64_t>(ctx.hidden) *
+            static_cast<std::uint64_t>(ctx.intermediate_native) / 2;
+        const std::uint64_t down_s =
+            static_cast<std::uint64_t>(ctx.hidden) *
+            static_cast<std::uint64_t>(ctx.intermediate_native / 32);
+        const std::uint64_t expect[kSections] = {
+            gate_w, gate_s, gate_w, gate_s, down_w, down_s};
+        if (sb.size() != static_cast<std::size_t>(kSections)) {
+            throw std::runtime_error(
+                "expert pack: native Marlin expected " +
+                std::to_string(kSections) + " section_bytes, got " +
+                std::to_string(sb.size()));
+        }
+        for (int i = 0; i < kSections; ++i) {
+            if (sb[static_cast<std::size_t>(i)] != expect[i]) {
+                throw std::runtime_error(
+                    "expert pack: native Marlin section_bytes[" +
+                    std::to_string(i) + "]=" +
+                    std::to_string(sb[static_cast<std::size_t>(i)]) +
+                    " != expected " + std::to_string(expect[i]) +
+                    " (I_native=" + std::to_string(ctx.intermediate_native) +
+                    " H=" + std::to_string(ctx.hidden) +
+                    " groups=" + std::to_string(ctx.gu_groups) + ")");
+            }
+        }
+
         const auto gu_w_store = checkpoint.storage_info(gu_w_name);
         const auto gu_s_store = checkpoint.storage_info(gu_s_name);
         const auto dn_w_store = checkpoint.storage_info(dn_w_name);

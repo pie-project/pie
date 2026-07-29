@@ -25,12 +25,22 @@ void expert_pack_emit_slot_sections(
 {
     // Lay out sections at the same offsets the stream template expects, then
     // pad to a full slot so every (layer, expert) occupies `slot_bytes`.
+    if (table.slot_bytes == 0) {
+        throw std::runtime_error(
+            "expert pack: refuse to emit with slot_bytes == 0");
+    }
     const auto& sb = table.section_bytes;
     const std::uint64_t slot = table.slot_bytes;
     std::uint64_t cursor = 0;
     for (int s = 0; s < num_sections; ++s) {
         const std::uint64_t off =
             table.section_offsets[static_cast<std::size_t>(s)];
+        if (off < cursor) {
+            throw std::runtime_error(
+                "expert pack: section_offsets[" + std::to_string(s) +
+                "]=" + std::to_string(off) +
+                " is before write cursor " + std::to_string(cursor));
+        }
         if (off > cursor) {
             writer.append_zeros(off - cursor);
             cursor = off;

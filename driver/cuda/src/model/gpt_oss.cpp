@@ -581,7 +581,7 @@ MixtralWeights bind_gpt_oss(const LoadedModel& engine) {
         }
     }
 
-    if (use_mxfp4_packed_experts) {
+    if (use_mxfp4_packed_experts || (streaming && eager_bf16)) {
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
     }

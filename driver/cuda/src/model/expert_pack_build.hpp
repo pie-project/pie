@@ -88,6 +88,10 @@ bool ensure_expert_pack(
             std::to_string(Traits::kSections) + " sections, got " +
             std::to_string(table.sections_per_expert));
     }
+    if (table.slot_bytes == 0) {
+        throw std::runtime_error(
+            "expert pack: stream table slot_bytes must be > 0");
+    }
     // Warm path: pack already on disk for this cache key + layout.
     if (ExpertPackWriter::exists_and_matches(cache_key, table)) {
         if (verbose) {
