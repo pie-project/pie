@@ -468,17 +468,55 @@ pub struct ScanOption {
 struct FlatVocabulary {
     bytes: Vec<u8>,
     ends: Vec<u32>,
+    /// Every token in order, for the states that have to try them all.
+    all: Vec<u32>,
+    /// Token identifiers ordered by first byte, and where each byte's run
+    /// begins. A state that cannot take a byte and cannot settle refuses every
+    /// token starting with it, and at a structural position that is nearly the
+    /// whole vocabulary - so the run is what to skip rather than what to test.
+    by_first: Vec<u32>,
+    starts: [u32; 257],
 }
 
 impl FlatVocabulary {
     fn of(vocabulary: &[Vec<u8>]) -> Self {
         let mut bytes = Vec::with_capacity(vocabulary.iter().map(Vec::len).sum());
         let mut ends = Vec::with_capacity(vocabulary.len());
+        let mut counts = [0u32; 257];
         for token in vocabulary {
             bytes.extend_from_slice(token);
             ends.push(bytes.len() as u32);
+            // The empty token has no first byte and is refused everywhere; it
+            // gets a bucket of its own at the end rather than a branch here.
+            counts[token.first().map_or(256, |b| *b as usize)] += 1;
         }
-        FlatVocabulary { bytes, ends }
+        let mut starts = [0u32; 257];
+        let mut running = 0u32;
+        for (slot, count) in counts.iter().enumerate() {
+            starts[slot] = running;
+            running += count;
+        }
+        let mut cursor = starts;
+        let mut by_first = vec![0u32; vocabulary.len()];
+        for (token, bytes_of) in vocabulary.iter().enumerate() {
+            let slot = bytes_of.first().map_or(256, |b| *b as usize);
+            by_first[cursor[slot] as usize] = token as u32;
+            cursor[slot] += 1;
+        }
+        FlatVocabulary {
+            bytes,
+            ends,
+            all: (0..vocabulary.len() as u32).collect(),
+            by_first,
+            starts,
+        }
+    }
+
+    /// The tokens beginning with `byte`.
+    fn beginning_with(&self, byte: u8) -> &[u32] {
+        let from = self.starts[byte as usize] as usize;
+        let to = self.starts[byte as usize + 1] as usize;
+        &self.by_first[from..to]
     }
 
     fn len(&self) -> usize {
@@ -833,6 +871,14 @@ pub fn group_vocabulary(lexer: &Lexer, vocabulary: &[Vec<u8>]) -> VocabularyGrou
     // embarrassingly parallel - and the one that dominates it. It is also
     // where residency is paid for: this is precisely the work a host-side
     // matcher repeats at every decode step instead of doing once.
+    //
+    // Asking only the states a scan can *rest* at was tried and is worse. A
+    // configuration's lexer state is always the end of some token, so
+    // following the ends the groups report does find a smaller set - but only
+    // 16% smaller, and computing it means grouping in waves, the first of
+    // which is one state on one core while the rest of the machine waits. It
+    // came out 1.78x slower.
+    //
     // Built once and shared by every state. A state that can settle restarts
     // the scan from the start state, and doing that again for each of a
     // thousand states was most of what this cost.
@@ -840,49 +886,73 @@ pub fn group_vocabulary(lexer: &Lexer, vocabulary: &[Vec<u8>]) -> VocabularyGrou
     let start_scans = StartScans::build(lexer, &flat);
     let (per_state, rejected): (Vec<Vec<Group>>, Vec<u32>) = (0..lexer.num_states())
         .into_par_iter()
-        .map(|state| {
-            let from = LexState(state as u32);
-            let mut refused = 0u32;
-            // Keyed by the readings as bytes rather than by a `Scan`, so a
-            // token that reads like one already seen costs a lookup and a
-            // push. Building and hashing a `Scan` per token was the cost.
-            let mut buckets: FxHashMap<Box<[u8]>, usize> = FxHashMap::default();
-            let mut groups: Vec<Group> = Vec::new();
-            let mut scratch = ScanScratch::default();
-            for token_id in 0..flat.len() {
-                let bytes = flat.get(token_id);
-                if bytes.is_empty() {
-                    refused += 1;
-                    continue;
-                }
-                if !lexer.scan_into_with(
-                    bytes,
-                    from,
-                    &mut scratch,
-                    Some((&start_scans, token_id)),
-                ) {
-                    refused += 1;
-                    continue;
-                }
-                match buckets.get(scratch.key()) {
-                    Some(&at) => groups[at].tokens.push(token_id as u32),
-                    None => {
-                        buckets
-                            .insert(scratch.key.clone().into_boxed_slice(), groups.len());
-                        groups.push(Group {
-                            scan: scratch.take(),
-                            tokens: vec![token_id as u32],
-                        });
-                    }
-                }
-            }
-            groups.sort_by(|a, b| b.tokens.len().cmp(&a.tokens.len()));
-            (groups, refused)
-        })
+        .map(|state| group_one(lexer, &flat, &start_scans, state))
         .unzip();
 
     VocabularyGroups {
         per_state,
         rejected,
     }
+}
+
+/// One state's grouping of the vocabulary.
+fn group_one(
+    lexer: &Lexer,
+    flat: &FlatVocabulary,
+    start_scans: &StartScans,
+    state: usize,
+) -> (Vec<Group>, u32) {
+    let from = LexState(state as u32);
+    let mut refused = 0u32;
+    // Keyed by the readings as bytes rather than by a `Scan`, so a token that
+    // reads like one already seen costs a lookup and a push. Building and
+    // hashing a `Scan` per token was the cost.
+    let mut buckets: FxHashMap<Box<[u8]>, usize> = FxHashMap::default();
+    let mut groups: Vec<Group> = Vec::new();
+    let mut scratch = ScanScratch::default();
+    // A state that can settle restarts the scan from the start state, so a
+    // byte it cannot take may still be readable and every token has to be
+    // tried. A state that cannot settle refuses every token whose first byte
+    // it cannot take - and at a structural position that is most of the
+    // vocabulary, which is worth knowing before the token is fetched.
+    // Measured over 945 states of eight schemas: 21% settle and must try
+    // everything, and across all states only 39.5% of tokens have a first byte
+    // their state can take. The skipped visits are the cheap ones - they were
+    // one table lookup inside the scan - so this is worth about 4%, which is
+    // the honest size of it.
+    let settles = !lexer.accepting(from).is_empty();
+    let mut visit: Vec<u32> = Vec::new();
+    if !settles {
+        for byte in 0..=255u8 {
+            if lexer.step(from, byte).is_some() {
+                visit.extend_from_slice(flat.beginning_with(byte));
+            }
+        }
+        refused += (flat.len() - visit.len()) as u32;
+    }
+    let order: &[u32] = if settles { &flat.all } else { &visit };
+    for &id in order {
+        let token_id = id as usize;
+        let bytes = flat.get(token_id);
+        if bytes.is_empty() {
+            refused += 1;
+            continue;
+        }
+        if !lexer.scan_into_with(bytes, from, &mut scratch, Some((start_scans, token_id))) {
+            refused += 1;
+            continue;
+        }
+        match buckets.get(scratch.key()) {
+            Some(&at) => groups[at].tokens.push(token_id as u32),
+            None => {
+                buckets.insert(scratch.key.clone().into_boxed_slice(), groups.len());
+                groups.push(Group {
+                    scan: scratch.take(),
+                    tokens: vec![token_id as u32],
+                });
+            }
+        }
+    }
+    groups.sort_by(|a, b| b.tokens.len().cmp(&a.tokens.len()));
+    (groups, refused)
 }

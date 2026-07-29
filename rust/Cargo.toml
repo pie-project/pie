@@ -20,3 +20,12 @@ anyhow = "1.0"
 rustc-hash = "2.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+
+# Compile time is our worst metric against both baselines - 152 ms at the
+# median where llguidance takes 1.1 - and three quarters of it is one stage.
+# Before touching that stage, take what the toolchain gives for nothing: the
+# default release profile inlines across a crate but not between them, and
+# splits each crate into sixteen units that optimise separately.
+[profile.release]
+lto = "fat"
+codegen-units = 1
