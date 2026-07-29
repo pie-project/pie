@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 pub(crate) struct TeardownFireContext {
     process_id: uuid::Uuid,
     resources: wasmtime::component::ResourceTable,
-    _bind_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    bind_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl crate::pipeline::fire::FireContext for TeardownFireContext {
@@ -34,7 +34,7 @@ pub(crate) fn defer_resource_teardown(
     let mut context = TeardownFireContext {
         process_id,
         resources,
-        _bind_permit: bind_permit,
+        bind_permit,
     };
     if !capped_execution
         && snapshot.departed_pipeline_ids.is_empty()
@@ -43,6 +43,7 @@ pub(crate) fn defer_resource_teardown(
             .iter()
             .all(|fires| fires.lock().unwrap().is_empty())
     {
+        crate::inferlet::process::release_bind_permit(context.bind_permit.take());
         drop(context);
         return;
     }
@@ -52,18 +53,21 @@ pub(crate) fn defer_resource_teardown(
             "process teardown found pending fires without a Tokio runtime; preserving the \
              ResourceTable to avoid recycling pages under native work"
         );
+        // The seat and the bind permit both leave before the leak: only
+        // POOLED RESOURCES are preserved here, never admission capacity.
+        crate::inferlet::process::release_bind_permit(context.bind_permit.take());
         std::mem::forget(context);
-        // Only POOLED RESOURCES leak here, not the seat: `ProcessCtx::drop`
-        // already released the execution permit and broadcast the release, so
-        // the semaphore's capacity is intact and the policy's departure is
-        // resolved. (Before the permit moved out of this context the leak took
-        // the seat with it, which is what the forfeit broadcast existed to
-        // announce.) The terminate tombstone stays: with the pending fires
-        // forgotten, late items for this pid remain possible.
+        // `ProcessCtx::drop` already released the execution permit and
+        // broadcast the release, so the semaphore's capacity is intact and
+        // the policy's departure is resolved. (Before the permit moved out
+        // of this context the leak took the seat with it, which is what the
+        // forfeit broadcast existed to announce.) The terminate tombstone
+        // stays: with the pending fires forgotten, late items for this pid
+        // remain possible.
         return;
     };
-    runtime.spawn(async move {
-        let timing = crate::scheduler::fire_timing_enabled();
+    let timing = crate::scheduler::fire_timing_enabled();
+    let task = async move {
         let task_started_us = if timing {
             crate::scheduler::fire_timing_now_us()
         } else {
@@ -118,6 +122,7 @@ pub(crate) fn defer_resource_teardown(
             .iter()
             .map(|(_, ids)| ids.len())
             .sum::<usize>();
+        crate::inferlet::process::release_bind_permit(context.bind_permit.take());
         drop(context);
         let dropped_us = if timing {
             crate::scheduler::fire_timing_now_us()
@@ -157,5 +162,13 @@ pub(crate) fn defer_resource_teardown(
                 "released_us": quiesced_us,
             }));
         }
-    });
+    };
+    if timing {
+        runtime.spawn(crate::scheduler::CpuMetered::new(
+            crate::scheduler::CpuClass::Teardown,
+            task,
+        ));
+    } else {
+        runtime.spawn(task);
+    }
 }

@@ -4746,3 +4746,209 @@ time — this box carries foreign load, so only interleaved ratios are usable):
 why: 4096 requests at 1024 lanes is 4 cohorts (3 boundaries), at 512 lanes it
 is 8 cohorts (7 boundaries), against a nearly identical wall. conc 512 pays
 the boundary tax twice as often. The boundary is the whole remaining deficit.
+
+## §20.28 — cohort-boundary and startup: three admission fixes plus the
+## queue-walk fix; the boundary is guest-CPU bound, not loop bound
+
+Four changes land here. Three (A, B, D) attack the cohort boundary and the
+startup ramp through the spawn admission ladder; one (E) removes two O(n)
+queue walks from the worker loop. Two more (H, and pacing) were built or
+designed, measured, and rejected.
+
+Each of A/B/D carries an env switch (default on) so the arms can be A/B'd in
+one build: `PIE_BIND_DEFER`, `PIE_PREWARM_HOLD`, `PIE_BIND_STAGE_LAZY`.
+
+### A — hold bind releases across a joining boundary
+
+`ProcessCtx::drop` frees the execution seat synchronously (§20.14) and hands
+the bind permit to `defer_resource_teardown`. Releasing that bind permit
+immediately admits the *next* cohort's bind at exactly the moment the frame
+is trying to seal, so the driver lane and the loop carry a fleet-wide bring-up
+storm in front of the wave that is holding everything up.
+
+The permit is now parked in `HELD_BIND_PERMITS` while
+`FramePolicy::is_joining()` holds, and released when it clears. The hold is
+asserted once per scheduler pass in `worker.rs` and cleared unconditionally on
+any pass with no progress, no `in_flight_launches` and no `in_flight_control`,
+so it can never be the last thing standing.
+
+*Liveness*: a process parked on bind admission can never be what a join is
+waiting for. `joins_in_flight` is populated at `on_execution_slot_consumed`,
+which is downstream of bind admission on the same task — bind is always
+acquired before execution.
+
+This also fixed a pre-existing **bind-permit leak**: the `std::mem::forget`
+no-runtime path in `teardown.rs` dropped the context without ever returning
+the permit.
+
+```
+  binds now land 10-35 ms AFTER their cohort's admissions (were simultaneous)
+  main boundary gap  78 -> 53 ms
+```
+
+### B — the prewarm permit is held through bind admission
+
+`ensure_bind_admitted` released the prewarm permit *before* parking for a bind
+seat, so the prewarm pool was a starting gun rather than a conveyor: all 4096
+processes instantiated and compiled at t=0, smearing cohort 0's prologue
+across the whole ramp. The permit is now released *after* the bind permit is
+won, and the pool is sized to one cohort instead of `min(n, 64)`.
+
+```
+  instantiations in the first second   4096 -> 1536
+  instantiate complete                 0.309 -> 0.095 s
+  first GPU wave                       0.295 -> 0.226 s
+```
+
+### D — the staged half of the bind pool opens lazily
+
+Bind admission is sized at `n * (1 + STAGED_COHORTS)` so a staged cohort can
+build while the current one runs. At t=0 there is no current cohort, so the
+1024-deep pool let the staged half run its reserve and prefill build alongside
+cohort 0 and pushed cohort 0's own bind->execution-admit delta to 155 ms p50.
+
+The semaphore now starts at one cohort; the staged half is parked in
+`BIND_STAGED_RESERVE` and added by `open_staged_bind_pool()` the first time
+execution admission finds `available_permits() == 0` — i.e. exactly when a
+staged cohort first has something to stage behind.
+
+```
+  cohort 0 bind -> execution admit    155 -> ~50 ms
+  first GPU wave                      0.226 -> 0.157 s   (0.295 originally)
+```
+
+### A+B+D measured together
+
+Interleaved 3-arm A/B, 3 reps each, conc 512 @ 8192, one process at a time:
+
+```
+  off (all three disabled)  31918.8  30915.0  31442.0   mean 31425
+  bd  (B+D only)            31790.5  31187.0  31255.0   mean 31411
+  all (A+B+D)               32097.6  32060.0  31963.7   mean 32040   +2.0%
+```
+
+The arms do not overlap, and the `off` arm reproduces the historical
+pre-change baseline (31123-31767), so it is a valid control. **B+D alone
+measures as `off`** — the startup fix only converts once A stops the bring-up
+storm from re-filling the boundary.
+
+```
+  conc 512 @ 8192   pie 31686 (n=3)   vLLM 32602 (n=3)   0.960 -> 0.972
+```
+
+### E — two O(n) queue walks per worker pass
+
+`rotate_launch_for_wave_work` asked `pending.iter().skip(1).find(|i| !Launch)`
+on *every* pass, and `queue_bind_control` asked
+`pending.iter().position(first close)` on every queued control. At a cohort
+boundary `pending` is a run of ~2200 launches held back by an unsealed frame,
+and the loop makes ~12,000 passes across the seven boundaries, so the first
+walk alone was ~208 ms/run — measured as the largest single per-pass cost.
+
+`PendingQueue` now caches both offsets against the same epoch that guards
+`ScanCache`, and the launch-run rotation is one `VecDeque::rotate_left`
+instead of thousands of individual `pop_front`/`push_back` pairs.
+`insert_before_closes` updates the close offset in place (an insert shifts the
+close run right by one), so a burst of 512 binds does not rescan.
+
+```
+                          run total    7 boundaries
+  dispatch walk   before    325 ms        241 ms
+                  after     181 ms        131 ms     -44% / -46%
+  loop_dispatch   before   1663 ms        341 ms
+                  after    1588 ms        227 ms            -33%
+```
+
+*** AND THE BOUNDARY GAP DID NOT MOVE ***
+
+```
+  boundary cluster sums (ms), 7 per run, sorted
+    before   38 40 43 44 52 60 110  |  35 38 41 43 52 52 111
+    after    36 38 41 44 45 57 110  |  34 35 38 41 41 51 127
+  loop passes at the boundaries   11-14 k  ->  15-17 k   (UP)
+```
+
+The loop made *more* passes for less work: at a boundary it is spinning while
+it waits for guests, not falling behind. This is the third independent
+confirmation (with §20.25's `loop_lag` result) that **shaving the scheduler
+loop is a closed lever**. Kept anyway — it is strictly less work, provably
+equivalent, and it returns ~150 ms of a core to a 13.6-CPU budget.
+
+### ★ WHAT THE BOUNDARY ACTUALLY IS (CPU census, conc 512)
+
+Per-class CPU inside the seven boundary windows, from the `cpu_census`
+records (10 ms buckets):
+
+```
+  bnd   gap    guest  teardown  process   cores used
+    1    57 ms  290 ms   55 ms   527 ms      9.3
+    2    38     229      45      327         8.5
+    3    45     335      38      439         9.8
+    4    44     244      48      346         7.8
+    5   110     510      60      638         5.8
+    6    41     210      59      308         7.5
+    7    36     224      61      328         9.2
+  SUM  370 ms  2041 ms  365 ms  2913 ms      7.9 of 13.6
+```
+
+Three facts follow, and they redirect the search:
+
+1. **The boundary is CPU, not latency.** 2.91 core-s of real work compressed
+   into 370 ms. Runqueue wait is zero (§20.25), so nothing is *waiting* on the
+   OS.
+2. **74% of it is guest CPU** — 2.04 core-s, ~285 us per process turnover.
+   Teardown is 0.37 core-s and the loop is the remainder.
+3. **Parallel efficiency is 58%** (7.9 of 13.6 cores). Half the gap is the
+   dependency chain, half is the CPU itself.
+
+Successors are *not* cold: at every boundary they entered `guest_main` ~4 s
+earlier and were bind-admitted ~2 s earlier, so the prologue up to the
+admission gate is long done. What lands in the window is the post-gate submit
+work of 512 successors and the epilogue of 512 predecessors.
+
+### H — REJECTED: yielding after each frame submit
+
+Hypothesis: a guest resuming at a boundary fills its whole `channel-capacity()`
+window (7 cells = 3 frames at k=2) in one uninterrupted poll, but the frame it
+is holding up seals on the *first* frame of every lane; so lane 512 does not
+submit frame 1 until lane 511 has submitted all three. 512 x 6 x 66 us of the
+census's 293 ms/boundary of guest CPU matched.
+
+Built as a `tokio::task::yield_now()` after `submit_frame` (a fairness rule,
+not a tuned constant; `submit` always carries a whole frame so a yield can
+never split one). **Both metrics got worse:**
+
+```
+                  boundary gaps (ms)              guest CPU   total CPU
+  yield off   39 40 41 41 41 49 104  med 41       2048 ms     2764 ms
+  yield on    38 48 49 50 52 60 276  med 50       2700 ms     3814 ms
+```
+
+The per-submit reschedule costs more than the reordering saves (~200 k yields
+per run), and the boundary gap grew with it. The hypothesis is refuted, not
+merely unprofitable: if the seal had been waiting on the window fill, guest CPU
+inside the window would have *fallen*. Reverted; the tree carries none of it.
+
+### Also considered and not built: pacing A's drain
+
+A's gate drains all 512 held permits at once when it opens, and at the first
+boundary of one trace that burst pushed two waves'
+`launch_returned - dispatch_started` to 154 and 172 ms (steady state ~12 ms).
+Worth up to ~1.1%. Every constant-free pacing rule tried fails: one-per-pass
+is too slow (~360 passes per generation against 512 permits); gating on
+`has_pending_binds()` does not help because the permits are already out when
+the gate opens; one-per-`on_bind_completed` is fully serial. Left open.
+
+### Where the remaining ~2.8% at conc 512 is
+
+```
+  7 boundary clusters   ~355 ms   2.2%
+  startup ramp          ~ 85 ms   0.5%    (first wave 0.157 s vs vLLM 0.073 s)
+  everything else       GPU-bound parity (92.7% busy, decode +1.1% vs vLLM)
+```
+
+Removing the boundary entirely is worth ~1.01x, not more: pie's per-step
+advantage over vLLM at this width is the whole remaining margin. The lever
+that is still open and now correctly aimed is **cut per-turnover guest CPU**
+(285 us x 1024 processes per boundary), and raise the boundary's parallel
+efficiency above 58%.

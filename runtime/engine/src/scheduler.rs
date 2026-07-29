@@ -33,7 +33,7 @@ pub mod worker;
 pub use frame::FrameStamp;
 
 use std::collections::HashMap;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use anyhow::{Result, anyhow};
@@ -559,6 +559,148 @@ pub(crate) fn fire_timing_write(record: &serde_json::Value) {
 }
 
 // =============================================================================
+// Wall-bucketed CPU census
+// =============================================================================
+//
+// A cohort boundary is a CPU BUDGET problem (CONTENTION_FOLLOWUP §20.26): the
+// boundary window demands more cores than the cgroup quota grants, and most of
+// the demand was uninstrumented because it is spent INSIDE a guest task, where
+// no host timer sees it. Per-event wall timings cannot find it — a task that is
+// descheduled looks identical to one that is running.
+//
+// So census CPU, not wall: each task class accumulates
+// `CLOCK_THREAD_CPUTIME_ID` deltas across its own polls into a 10 ms bucket of
+// wall time. Summing a boundary's buckets gives the core-ms that landed in it,
+// split by class, with no sampling error.
+
+const CPU_CENSUS_BUCKET_US: u64 = 10_000;
+const CPU_CENSUS_BUCKETS: usize = 8192;
+
+/// Task classes the census separates. Kept tiny: every poll indexes it.
+#[derive(Clone, Copy)]
+pub(crate) enum CpuClass {
+    /// The guest `main` future: guest WASM plus the host functions it calls.
+    Guest = 0,
+    Teardown = 1,
+    /// The whole per-process task, `Guest` included — the difference is the
+    /// bring-up and retirement the guest future does not cover.
+    Process = 2,
+}
+const CPU_CLASSES: usize = 3;
+
+static CPU_CENSUS: [[AtomicU64; CPU_CENSUS_BUCKETS]; CPU_CLASSES] =
+    [const { [const { AtomicU64::new(0) }; CPU_CENSUS_BUCKETS] }; CPU_CLASSES];
+static CPU_CENSUS_EPOCH_US: AtomicU64 = AtomicU64::new(0);
+
+/// Per-thread CPU time. Unlike `CLOCK_MONOTONIC` this stops while the thread
+/// is off-core, so a poll that waits for a core costs the census nothing.
+pub(crate) fn thread_cpu_ns() -> u64 {
+    let mut value = std::mem::MaybeUninit::<libc::timespec>::uninit();
+    let status = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, value.as_mut_ptr()) };
+    if status != 0 {
+        return 0;
+    }
+    let value = unsafe { value.assume_init() };
+    (value.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(value.tv_nsec as u64)
+}
+
+pub(crate) fn record_task_cpu(class: CpuClass, at_us: u64, cpu_ns: u64) {
+    if cpu_ns == 0 {
+        return;
+    }
+    let mut epoch = CPU_CENSUS_EPOCH_US.load(Ordering::Relaxed);
+    if epoch == 0 {
+        epoch = match CPU_CENSUS_EPOCH_US.compare_exchange(
+            0,
+            at_us,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => at_us,
+            Err(existing) => existing,
+        };
+    }
+    let bucket = (at_us.saturating_sub(epoch) / CPU_CENSUS_BUCKET_US) as usize;
+    if bucket < CPU_CENSUS_BUCKETS {
+        CPU_CENSUS[class as usize][bucket].fetch_add(cpu_ns, Ordering::Relaxed);
+    }
+}
+
+/// Emit the census as one record per class. Called on scheduler shutdown, so
+/// the arrays are read once and never on a hot path.
+pub(crate) fn fire_timing_dump_cpu_census() {
+    if !fire_timing_enabled() {
+        return;
+    }
+    let epoch = CPU_CENSUS_EPOCH_US.load(Ordering::Relaxed);
+    if epoch == 0 {
+        return;
+    }
+    for (index, name) in [
+        (CpuClass::Guest as usize, "guest"),
+        (CpuClass::Teardown as usize, "teardown"),
+        (CpuClass::Process as usize, "process"),
+    ] {
+        let buckets: Vec<u64> = CPU_CENSUS[index]
+            .iter()
+            .map(|slot| slot.load(Ordering::Relaxed) / 1_000)
+            .collect();
+        let last = buckets.iter().rposition(|&value| value != 0);
+        let Some(last) = last else { continue };
+        fire_timing_write(&serde_json::json!({
+            "schema": 1,
+            "source": "runtime",
+            "event": "cpu_census",
+            "class": name,
+            "epoch_us": epoch,
+            "bucket_us": CPU_CENSUS_BUCKET_US,
+            "cpu_us": &buckets[..=last],
+        }));
+    }
+}
+
+/// Accumulates the CPU its inner future burns, per poll, into the census.
+///
+/// A guest task's poll runs guest WASM *and* the host functions it calls, so
+/// this is exactly "CPU attributable to this process" — the term §20.26 could
+/// not see.
+pub(crate) struct CpuMetered<F> {
+    inner: F,
+    class: CpuClass,
+}
+
+impl<F> CpuMetered<F> {
+    pub(crate) fn new(class: CpuClass, inner: F) -> Self {
+        Self { inner, class }
+    }
+}
+
+impl<F: Future> Future for CpuMetered<F> {
+    type Output = F::Output;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        // Structural pinning: `inner` is never moved out, and `Self` is only
+        // ever polled through this projection.
+        let this = unsafe { self.get_unchecked_mut() };
+        let class = this.class;
+        let inner = unsafe { std::pin::Pin::new_unchecked(&mut this.inner) };
+        let started = thread_cpu_ns();
+        let outcome = inner.poll(cx);
+        record_task_cpu(
+            class,
+            fire_timing_now_us(),
+            thread_cpu_ns().saturating_sub(started),
+        );
+        outcome
+    }
+}
+
+// =============================================================================
 // Public API: spawn/get_stats/shutdown plain scheduler surfaces (no actor)
 // =============================================================================
 
@@ -616,6 +758,7 @@ impl SchedulerShutdownHandle {
         // `BatchScheduler::drop` joins the worker thread and clears the
         // handle registry; dropping the Vec here shuts every driver down.
         drop(self.schedulers);
+        fire_timing_dump_cpu_census();
         fire_timing_flush();
         Ok(())
     }

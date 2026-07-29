@@ -626,6 +626,15 @@ impl FramePolicy {
         !self.pending_binds.is_empty()
     }
 
+    /// Whether the seal is waiting on a successor's arrival: a swap is
+    /// earmarked (a slot was released or a holder is departing, with a
+    /// staged taker for it) or an admitted successor's first fire is still
+    /// in flight. This is exactly the cohort-boundary window.
+    pub fn is_joining(&self) -> bool {
+        !self.joins_in_flight.is_empty()
+            || ((self.pending_slots > 0 || !self.departing.is_empty()) && !self.staged.is_empty())
+    }
+
     pub fn on_bind_completed(&mut self, pid: Option<ProcessId>) {
         if let Some(pid) = pid
             && let Some(count) = self.pending_binds.get_mut(&pid)
@@ -1073,9 +1082,7 @@ impl FramePolicy {
                     }
                 }
             }
-            let joining = !self.joins_in_flight.is_empty()
-                || ((self.pending_slots > 0 || !self.departing.is_empty())
-                    && !self.staged.is_empty());
+            let joining = self.is_joining();
             let mode = rebind_escape_mode();
             // Mode 2 escapes only from the deadlock shape itself: every missing
             // lane is EMPTY and nothing is executing, so nothing the engine
