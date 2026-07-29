@@ -38,6 +38,7 @@ pub struct LexState(pub u32);
 /// Where a scan begins when no lexeme is in progress.
 pub const START: LexState = LexState(0);
 
+
 const NO_STATE: u32 = u32::MAX;
 
 /// A terminal's byte-level pattern, supplied as an automaton over bytes.
@@ -361,7 +362,7 @@ impl Lexer {
 
     /// The readings of `token[index..]` from `state`, into the caller's
     /// buffers. `scan_into_with` is this at index zero.
-    fn readings_from(
+        fn readings_from(
         &self,
         token: &[u8],
         index: usize,
@@ -369,16 +370,19 @@ impl Lexer {
         scratch: &mut ScanScratch,
         memo: Option<(&StartScans, usize)>,
     ) {
-        scratch.clear();
         // Nothing to do if the first byte cannot be taken and nothing can be
         // settled here, which is most of the vocabulary at a structural
-        // position. One transition lookup rather than a call and a recursion.
+        // position. One transition lookup rather than a call and a recursion -
+        // and *before* the scratch is cleared, because clearing four vectors
+        // for a scan that is about to return is four writes a token.
         if let Some(&first) = token.get(index)
             && self.step(state, first).is_none()
             && self.accepting(state).is_empty()
         {
+            scratch.ends.clear();
             return;
         }
+        scratch.clear();
         let mut budget = MAX_STEPS;
         let mut emitted = std::mem::take(&mut scratch.emitted);
         self.readings(token, index, state, &mut emitted, scratch, &mut budget, memo);
