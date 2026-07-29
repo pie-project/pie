@@ -408,6 +408,17 @@ impl FramePolicy {
         tokens: usize,
         rows: usize,
     ) {
+        if Self::stamp_trace() {
+            use std::sync::atomic::{AtomicU64, Ordering as O};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, O::Relaxed) + 1;
+            if n % 256 == 0 {
+                eprintln!(
+                    "[stamp] n={n} k={} slot={} fires={} seq={}",
+                    self.k, stamp.slot, stamp.fires, stamp.seq
+                );
+            }
+        }
         self.record_arrival(
             stamp,
             owner,
@@ -424,6 +435,17 @@ impl FramePolicy {
     /// toward its frame's arrival completeness so the frame can seal (its
     /// surviving fires execute; the guest observed the rejection).
     pub fn on_fire_rejected_at_admission(&mut self, stamp: FrameStamp, owner: Option<ProcessId>) {
+        if Self::stamp_trace() {
+            use std::sync::atomic::{AtomicU64, Ordering as O};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, O::Relaxed) + 1;
+            if n % 256 == 0 {
+                eprintln!(
+                    "[stamp] n={n} k={} slot={} fires={} seq={}",
+                    self.k, stamp.slot, stamp.fires, stamp.seq
+                );
+            }
+        }
         self.record_arrival(
             stamp,
             owner,
@@ -535,6 +557,11 @@ impl FramePolicy {
                 self.staged.insert(pid);
             }
         }
+    }
+
+    fn stamp_trace() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("PIE_FRAME_SHAPE").is_some())
     }
 
     /// Bootstrap: seed the slot balance with the execution pool's initial
