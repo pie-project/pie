@@ -181,7 +181,21 @@ bool validate_request_local_positions(
 // number, so the two can never drift (they were separate 4096 literals).
 inline constexpr std::uint32_t kMetalMaxCtxTokens = 32768;
 
-inline constexpr std::uint32_t kPhase1bRsSlots = 16;
+// Concurrent recurrent-state slots, and through `kPagedMaxForwardRequests` the
+// driver's advertised `max_forward_requests` -- which bootstrap also adopts as
+// the process admission cap, so this one number decides how wide a decode batch
+// can get AND how many requests may be in flight.
+//
+// A slot is 21.4MB here (18 GDN layers x (2 x conv + recurrent)), so 32 costs
+// 684MB against a 405MB checkpoint on a 34GB machine.  Worth it: 32 lanes turn
+// in 812 tok/s against 16 lanes' 698 on the same binary, bit-identical output.
+//
+// It also has to be >= any concurrency the deployment expects: asking for more
+// concurrent requests than this hangs the cold-start seal rather than queueing
+// (32 requests at concurrency 16 are fine; 17 at concurrency 17 never starts).
+// That is a separate defect -- oversubscription should queue -- but until it is
+// fixed this bound is also a floor on usable concurrency.
+inline constexpr std::uint32_t kPhase1bRsSlots = 32;
 inline constexpr std::uint32_t kPagedMaxForwardRequests = kPhase1bRsSlots;
 // How many prompt rows one fire may carry.
 //
