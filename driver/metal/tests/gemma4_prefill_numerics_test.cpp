@@ -449,6 +449,41 @@ int main(int argc, char** argv) {
         expect(argmax == 3821, "and the prefill's last row agrees with decode and mlx-lm");
     }
 
+    // ── The same prompt, one row at a time ──
+    //
+    // A decode step is a fire of one row, so the engine drives the M>1 path for
+    // both. That only holds if replaying the prompt token by token through
+    // 1-row fires lands on the same answer as firing it whole.
+    if (default_prompt) {
+        for (int L = 0; L < g.n_layers; ++L) {
+            if (g.is_kv_shared(L)) continue;
+            std::memset(kpages[std::size_t(L)].contents(), 0, kpages[std::size_t(L)].size);
+            std::memset(vpages[std::size_t(L)].contents(), 0, vpages[std::size_t(L)].size);
+        }
+        for (int t = 0; t < N; ++t) {
+            fill_io({ids[std::size_t(t)]}, {0u}, g.total_pages);
+            // `fill_io` restarts positions per request, which is right for a
+            // prefill and wrong for a continuation: row 0 of THIS fire is at
+            // absolute position t.
+            write_u32s(b.io[int(IoSlot::Position)], {std::uint32_t(t)});
+            write_u32s(b.io[int(IoSlot::WPage)], {std::uint32_t(t / g.kv_page_size)});
+            write_u32s(b.io[int(IoSlot::WOff)], {std::uint32_t(t % g.kv_page_size)});
+            bind_gemma4_consts(*ctx, dag, g, 1, /*paged=*/true);
+            ctx->run_step([&](StepEncoder& se) {
+                encode_gemma4_step_mb(se, dag, g, 1, base, mb, psos);
+            });
+        }
+        int bi = -1;
+        float bv = -1e30f;
+        for (int i = 0; i < g.vocab; ++i) {
+            const float v = from_bf16(logits[i]);
+            if (v > bv) { bv = v; bi = i; }
+        }
+        std::printf("    (one row at a time: argmax %d)\n", bi);
+        expect(bi == 3821, "a decode step is a fire of one row, and lands where the whole "
+                           "prompt does");
+    }
+
     // ── Two requests in one fire ──
     //
     // This is what a mixed prefill+decode batch is made of: several sequences

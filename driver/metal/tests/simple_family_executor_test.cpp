@@ -137,6 +137,14 @@ int main() {
             cfg.gemma4.full_attn_interval = 5;
             cfg.gemma4.double_wide_mlp = true;
             cfg.gemma4.final_softcap = 30.0f;
+            // The sharpest case first: one <bos> at position 0, whose answer
+            // the raw path pins at 236761. It isolates the engine from the
+            // replay -- one fire, one row, no KV history.
+            std::vector<std::uint32_t> one;
+            if (run_family("gemma4/bos", cfg, {2}, 1, one)) {
+                std::printf("    gemma4 <bos> -> %u\n", one[0]);
+                expect(one[0] == 236761, "gemma4's <bos> logits match the raw path");
+            }
             std::vector<std::uint32_t> got;
             // <bos>, then the eight-token prompt the forward test teacher-forces.
             if (run_family("gemma4", cfg, {2, 818, 3821, 563, 529, 476, 3625, 506}, 2, got)) {
