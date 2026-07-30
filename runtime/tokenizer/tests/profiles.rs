@@ -2,7 +2,7 @@ mod common;
 
 use std::sync::Arc;
 
-use common::{MergeFormat, byte_level_json, gemma_json};
+use common::{MergeFormat, byte_level_json, gemma_json, phi3_json};
 use pie_tokenizer::Tokenizer;
 use serde_json::json;
 use tokenizers::Tokenizer as HfTokenizer;
@@ -118,6 +118,70 @@ fn gemma_byte_fallback_profile_is_exact() {
 }
 
 #[test]
+fn phi3_sentencepiece_profile_is_exact() {
+    let tokenizer = phi3_json();
+    assert_exact(
+        &tokenizer,
+        &[
+            "",
+            "a b",
+            " a",
+            "a ",
+            "  a  b  ",
+            "a\tb",
+            "叫",
+            "a叫b",
+            "<s>a b",
+            "<|end|>a",
+            "a <|end|>  b",
+            "a<|assistant|> a",
+            "<s><|end|>",
+        ],
+    );
+
+    let pie: Tokenizer = tokenizer.to_string().parse().unwrap();
+    // Dummy prefix on encode, Strip undoing it on decode.
+    assert_eq!(pie.encode("a b"), vec![5, 6]);
+    assert_eq!(pie.decode(&[5, 6], false), "a b");
+    // rstrip'd added tokens consume the following whitespace.
+    assert_eq!(pie.encode("a <|end|>  b"), vec![5, 2, 263, 6]);
+    // Byte fallback still round-trips.
+    assert_eq!(pie.decode(&pie.encode("叫"), false), "叫");
+}
+
+#[test]
+fn phi3_shape_variants_are_rejected() {
+    // A sentencepiece decoder without the trailing Strip is not this profile.
+    let mut tokenizer = phi3_json();
+    tokenizer["decoder"]["decoders"]
+        .as_array_mut()
+        .unwrap()
+        .pop();
+    let error = tokenizer.to_string().parse::<Tokenizer>().err().unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("must contain Replace, ByteFallback, Fuse, Strip")
+    );
+
+    // The Prepend marker must match the Replace marker.
+    let mut tokenizer = phi3_json();
+    tokenizer["normalizer"]["normalizers"][0]["prepend"] = json!("_");
+    let error = tokenizer.to_string().parse::<Tokenizer>().err().unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("Prepend must inject the Replace marker")
+    );
+
+    // Sentencepiece requires byte fallback.
+    let mut tokenizer = phi3_json();
+    tokenizer["model"]["byte_fallback"] = json!(false);
+    let error = tokenizer.to_string().parse::<Tokenizer>().err().unwrap();
+    assert!(error.to_string().contains("requires byte_fallback"));
+}
+
+#[test]
 fn unsupported_legacy_shapes_are_rejected() {
     let mut tokenizer = byte_level_json(
         serde_json::Value::Null,
@@ -135,12 +199,12 @@ fn unsupported_legacy_shapes_are_rejected() {
     );
 
     let mut tokenizer = gemma_json();
-    tokenizer["added_tokens"][0]["lstrip"] = json!(true);
+    tokenizer["added_tokens"][0]["single_word"] = json!(true);
     let error = tokenizer.to_string().parse::<Tokenizer>().err().unwrap();
     assert!(
         error
             .to_string()
-            .contains("unsupported added-token boundary flags")
+            .contains("unsupported added-token single_word flag")
     );
 
     let mut tokenizer = gemma_json();
