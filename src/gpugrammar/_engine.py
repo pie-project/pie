@@ -63,7 +63,7 @@ _BACKENDS = (_TRITON, _CUDA, _DIFFERENTIAL)
 # the whole suite run under either name from the first day and makes each
 # kernel's arrival a one-line change here rather than a switch of everything at
 # once. Anything not named is Triton, honestly and by construction.
-_PORTED: frozenset[str] = frozenset({"candidate", "commit"})
+_PORTED: frozenset[str] = frozenset({"candidate", "commit", "mask"})
 
 
 def ported() -> frozenset[str]:
@@ -3498,12 +3498,20 @@ class DeviceBatch:
         self.work_offsets = torch.zeros(rows + 1, dtype=torch.int32, device="cuda")
         self.live_counts = torch.zeros(rows, dtype=torch.int32, device="cuda")
         self.live_offsets = torch.zeros(rows + 1, dtype=torch.int32, device="cuda")
+        replayers = max(
+            self.sweep_blocks,
+            (self.sweep_blocks + _CANDIDATE_THREADS - 1)
+            // _CANDIDATE_THREADS
+            * _CANDIDATE_THREADS,
+        )
         # Two windows per block: one for the reading being replayed, one for
         # probing what a pending lexeme could still become. Per *block*, not per
         # program - which is the point of the sweep. This used to be one per
         # (sequence, configuration, group) and reach 1.7 GB at batch 512.
+        # Rounded up to the CUDA launch's thread count, for the same reason as
+        # `advance_scratch`: that backend gives a replay to a thread.
         self.scratch = torch.zeros(
-            (self.sweep_blocks, 2 * grammar.window), dtype=torch.int32, device="cuda"
+            (replayers, 2 * grammar.window), dtype=torch.int32, device="cuda"
         )
         # The advance indexes its scratch by block, like the sweep, so it too
         # stops depending on the batch. It cannot share the sweep's buffer:
@@ -3515,12 +3523,6 @@ class DeviceBatch:
         # lever - and a grid of `ceil(blocks/threads) * threads` is a little
         # wider than `blocks`. Sizing for the smaller of the two would let the
         # last few threads write past the end.
-        replayers = max(
-            self.sweep_blocks,
-            (self.sweep_blocks + _CANDIDATE_THREADS - 1)
-            // _CANDIDATE_THREADS
-            * _CANDIDATE_THREADS,
-        )
         self.advance_scratch = torch.zeros(
             (replayers, 2 * grammar.window),
             dtype=torch.int32,
@@ -4096,6 +4098,89 @@ class DeviceBatch:
             ],
         )
 
+    def _mask_triton(self, grammar, rows) -> None:
+        _mask_kernel[(self.sweep_blocks,)](
+            grammar.group_offsets,
+            grammar.group_set_kind,
+            grammar.group_set_offset,
+            grammar.group_set_length,
+            grammar.set_payload,
+            grammar.reading_offsets,
+            grammar.reading_index,
+            grammar.reading_next_state,
+            grammar.reading_term_offsets,
+            grammar.reading_terminals,
+            grammar.action_offsets,
+            grammar.action_terminals,
+            grammar.action_values,
+            grammar.action_extra_offsets,
+            grammar.action_extra,
+            grammar.goto_offsets,
+            grammar.goto_nonterminals,
+            grammar.goto_targets,
+            grammar.production_lhs,
+            grammar.production_arity,
+            grammar.pending_offsets,
+            grammar.pending_terminals,
+            grammar.verdict_offsets,
+            grammar.verdicts,
+            grammar.verdict_stride,
+            self.lexer_state,
+            self.stack,
+            self.depth,
+            self.work_offsets,
+            self.grammar_of,
+            grammar.bases,
+            self.scratch,
+            self.admitted,
+            self.overflow,
+            self.high_water,
+            self.row_floor,
+            ROWS=rows,
+            CONFIGS=self.configs,
+            STACK_STRIDE=grammar.max_stack,
+            MAX_REDUCTIONS=grammar.max_reductions,
+            WINDOW=grammar.window,
+            PATHS=grammar.paths,
+            HAS_VERDICTS=grammar.has_verdicts,
+            num_warps=1,
+        )
+
+    def _mask_cuda(self, grammar, rows) -> None:
+        """`gg_mask`: one thread per (configuration, group) item.
+
+        Sized like the candidate: total threads equal the block count Triton
+        used, since the scratch is two windows per replayer.
+        """
+        from gpugrammar import _gpugrammar
+
+        threads = _CANDIDATE_THREADS
+        blocks = max(1, (self.sweep_blocks + threads - 1) // threads)
+        _gpugrammar.cuda_launch(
+            "gg_mask",
+            blocks,
+            threads,
+            torch.cuda.current_stream().cuda_stream,
+            [
+                self.grammar.arena_struct().data_ptr(),
+                self.state_struct().data_ptr(),
+                self.work_offsets.data_ptr(),
+                self.scratch.data_ptr(),
+                self.admitted.data_ptr(),
+                self.high_water.data_ptr(),
+                self.row_floor.data_ptr(),
+            ],
+            [
+                rows,
+                self.configs,
+                grammar.max_stack,
+                grammar.max_reductions,
+                grammar.window,
+                grammar.paths,
+                grammar.has_verdicts,
+            ],
+        )
+
     def _advance_triton(self) -> None:
         grammar = self.grammar
         rows = self.batch * self.configs
@@ -4521,9 +4606,15 @@ class DeviceBatch:
             self._differential("advance")
 
     def _fill_cuda(self) -> torch.Tensor:
-        if "fill" not in _PORTED:
+        """The fill with each kernel taken from CUDA where it is ported.
+
+        Only the sweep so far; the memo and the scatter are still Triton, and
+        the dispatch is written out rather than flagged inside `_fill_triton`
+        so the two paths can run the same input independently.
+        """
+        if not (_PORTED & {"mask"}):
             return self._fill_triton()
-        raise NotImplementedError("unreachable while `fill` is not in _PORTED")
+        return self._fill_triton(mask=self._mask_cuda)
 
     def _advance_cuda(self) -> None:
         """The advance with each kernel taken from CUDA where it is ported.
@@ -4629,7 +4720,7 @@ class DeviceBatch:
             )
         return self.mask if path == "fill" else None
 
-    def _fill_triton(self) -> torch.Tensor:
+    def _fill_triton(self, mask=None) -> torch.Tensor:
         grammar = self.grammar
         # The mask is not cleared here. The probe knows which rows the scatter
         # will build up - the ones with no answer anywhere - and clears only
@@ -4685,52 +4776,7 @@ class DeviceBatch:
         self._count_and_scan(
             grammar, rows, self.counts, self.work_offsets, skip=1, unit=0
         )
-        _mask_kernel[(self.sweep_blocks,)](
-            grammar.group_offsets,
-            grammar.group_set_kind,
-            grammar.group_set_offset,
-            grammar.group_set_length,
-            grammar.set_payload,
-            grammar.reading_offsets,
-            grammar.reading_index,
-            grammar.reading_next_state,
-            grammar.reading_term_offsets,
-            grammar.reading_terminals,
-            grammar.action_offsets,
-            grammar.action_terminals,
-            grammar.action_values,
-            grammar.action_extra_offsets,
-            grammar.action_extra,
-            grammar.goto_offsets,
-            grammar.goto_nonterminals,
-            grammar.goto_targets,
-            grammar.production_lhs,
-            grammar.production_arity,
-            grammar.pending_offsets,
-            grammar.pending_terminals,
-            grammar.verdict_offsets,
-            grammar.verdicts,
-            grammar.verdict_stride,
-            self.lexer_state,
-            self.stack,
-            self.depth,
-            self.work_offsets,
-            self.grammar_of,
-            grammar.bases,
-            self.scratch,
-            self.admitted,
-            self.overflow,
-            self.high_water,
-            self.row_floor,
-            ROWS=rows,
-            CONFIGS=self.configs,
-            STACK_STRIDE=grammar.max_stack,
-            MAX_REDUCTIONS=grammar.max_reductions,
-            WINDOW=grammar.window,
-            PATHS=grammar.paths,
-            HAS_VERDICTS=grammar.has_verdicts,
-            num_warps=1,
-        )
+        (mask or self._mask_triton)(grammar, rows)
         _scatter_kernel[(self.sweep_blocks,)](
             grammar.group_offsets,
             grammar.group_set_kind,

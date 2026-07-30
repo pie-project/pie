@@ -145,18 +145,24 @@ struct Replay {
 
 /// What a replay is being asked.
 ///
-/// This is the one real difference between the two copies of the chain in the
-/// Triton engine, and it is easy to miss among the naming: the *mask* only
-/// wants to know whether a terminal can be read at all, so a shift and an
-/// accept both mean yes and neither is recorded. The *candidate* wants to know
-/// where the parse lands, so a shift has to be pushed and an accept means the
-/// parse is finished and cannot read on.
+/// The distinction is between a *replay* and a *probe*, and not - as the first
+/// version of this had it - between the mask and the candidate. Both of those
+/// replay their reading the same way. It is what runs after them that differs.
 ///
-/// Porting the mask's answer into the candidate path produced zero candidates
-/// where there should have been two, on a grammar with no conflicts at all.
+/// A **replay** walks a reading's terminals and has to end up somewhere: a
+/// shift is pushed onto the window and becomes the new top, and an accept
+/// means the parse is complete and cannot read on, so it dies.
+///
+/// A **probe** asks only whether a pending lexeme could still continue from
+/// where the replay left off. It never has to land, so a shift and an accept
+/// both mean yes and neither is written down.
+///
+/// Getting this backwards is quiet in both directions: as `ADMISSIBLE` a
+/// replay produced zero candidates where there should have been two, and as
+/// `LANDING` a probe changed which groups the mask admitted.
 enum Asking : int32_t {
-    ADMISSIBLE = 0,  // the mask sweep, and the pending probe
-    LANDING = 1,     // the candidate replay
+    ADMISSIBLE = 0,  // a pending probe: can this continue?
+    LANDING = 1,     // a reading replay: where does it end up?
 };
 
 /// Run the LALR automaton on one terminal until it shifts, accepts, or dies.

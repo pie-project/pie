@@ -15,3 +15,4 @@
 #include "locate.cuh"
 #include "candidate.cuh"
 #include "commit.cuh"
+#include "mask.cuh"

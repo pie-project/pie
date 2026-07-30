@@ -675,5 +675,105 @@ class TheCudaCandidateAgreesWithTriton(unittest.TestCase):
         )
 
 
+
+class TheCudaMaskSweepAgreesWithTriton(unittest.TestCase):
+    """`gg_mask` against `_mask_kernel`, over real parse states.
+
+    The sweep is the other caller of `replay_chain`, so with the candidate
+    already ported this kernel is mostly the group enumeration and the verdict
+    shortcut. Three outputs, and `row_floor` is the subtle one: it is the
+    lowest stack entry any reading looked at, which is what the cross-step memo
+    keys on, so getting it too shallow would silently reuse a mask.
+    """
+
+    def setUp(self):
+        if not HAVE_CUDA or not _gpugrammar.cuda_available():
+            raise unittest.SkipTest("no CUDA device or no kernels in this build")
+        import json
+
+        import gpugrammar
+
+        self.engine = gpugrammar.Engine([bytes([i]) for i in range(256)])
+        self.grammars = [
+            self.engine.compile_json_schema(json.dumps(schema))
+            for schema in (
+                {"type": "string"},
+                {
+                    "type": "object",
+                    "properties": {"a": {"type": "string"}, "b": {"type": "integer"}},
+                    "required": ["a"],
+                },
+                {"type": "array", "items": {"type": "boolean"}},
+            )
+        ]
+
+    def test_both_sweeps_admit_the_same_groups_and_read_as_deep(self):
+        fields = ("admitted", "high_water", "row_floor", "overflow")
+        items = 0
+        for sequences in (4, 16):
+            batch = self.engine.batch(size=sequences)
+            batch.set_grammars([self.grammars[i % 3] for i in range(sequences)])
+            raw = batch.raw
+            grammar = raw.grammar
+            rows = raw.batch * raw.configs
+            matchers = [self.grammars[i % 3].matcher(0) for i in range(sequences)]
+            for step in range(5):
+                raw._count_and_scan(
+                    grammar, rows, raw.counts, raw.work_offsets, skip=1, unit=0
+                )
+                raw.row_floor.fill_(2**30)
+                raw.high_water.zero_()
+                torch.cuda.synchronize()
+                before = {name: getattr(raw, name).clone() for name in fields}
+
+                raw._mask_triton(grammar, rows)
+                torch.cuda.synchronize()
+                theirs = {name: getattr(raw, name).clone() for name in fields}
+                live = int(raw.work_offsets[rows])
+                items += live
+
+                for name, value in before.items():
+                    getattr(raw, name).copy_(value)
+                raw._mask_cuda(grammar, rows)
+                torch.cuda.synchronize()
+                for name in fields:
+                    mine = getattr(raw, name)
+                    expected = theirs[name]
+                    if name == "admitted":
+                        # Only the live prefix is written; past it is whatever
+                        # the previous step left, deliberately - clearing the
+                        # ceiling was 13 MB a step at batch 512.
+                        mine, expected = mine[:live], expected[:live]
+                    self.assertTrue(
+                        bool(torch.equal(mine, expected)),
+                        f"batch {sequences} step {step}: {name} differs in "
+                        f"{int((mine != expected).sum())} of {mine.numel()}",
+                    )
+
+                for name, value in theirs.items():
+                    getattr(raw, name).copy_(value)
+                tokens = []
+                for index in range(sequences):
+                    allowed = matchers[index].allowed_tokens()
+                    tokens.append(allowed[step % len(allowed)] if allowed else 0)
+                raw.token.copy_(
+                    torch.tensor(tokens, dtype=torch.int32, device="cuda")
+                )
+                raw._advance_triton()
+                torch.cuda.synchronize()
+                for index in range(sequences):
+                    matchers[index].accept_token(tokens[index])
+        self.assertGreater(items, 0, "the sweep never had anything to do")
+
+    def test_the_two_backends_fill_the_same_mask(self):
+        batch = self.engine.batch(size=16)
+        batch.set_grammars([self.grammars[i % 3] for i in range(16)])
+        raw = batch.raw
+        theirs = raw._fill_triton().clone()
+        raw.memo_hash.fill_(-1)  # or the second fill answers from the first
+        mine = raw._fill_cuda().clone()
+        self.assertTrue(bool(torch.equal(mine, theirs)))
+
+
 if __name__ == "__main__":
     unittest.main()
