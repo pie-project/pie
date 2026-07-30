@@ -2310,6 +2310,70 @@ The rounding fix costs nothing measurable. Attention is untouched (437.81 vs
 remaining non-overlapped host cost is ~0.38 ms -- but the 3.41 ms forward it
 was measured against is now roughly 0.61 ms shorter, which is the whole gap.
 
+### 10.2.14 A recurrent fire may take the decode template
+
+The device-composed decode template — the graph-bucketed `enqueue_fixed_decode`
+path that composes a whole decode step's geometry on device — refused any fire
+carrying recurrent state (`dispatch.cu`, the `rs_slot_ids`/`rs_fold_lens`/
+`rs_buffer_slot_ids` clauses in `try_device_composed_template`). Every hybrid
+decode therefore fell to the wire-composed path.
+
+The refusal expressed nothing that was true of the fold-all case. What the
+template replaces is the PTIR compose kernels that build KV/token geometry; the
+RS wire arrays are a separate host-side product of composition (`ComposedBatch`,
+frame.cpp:1189–1250) which the model forward reads directly, so they pass
+through untouched. Padding was already handled: both compose kernels write
+`rs_slot_ids[request] = -1` for an inactive lane (dispatch.cu:752, :1119), which
+is exactly the encoding the forward already reads as "this row has no state".
+And `frame.cpp` already wired `pi.slot_ids` into `FixedDecodeDeviceBuffers`
+(:1770, :1814, :1843) behind `s.use_slots`.
+
+Two shapes still cannot come along, for opposite reasons:
+
+* **Buffered rows** (`rs_buffer_slot_ids`) — the buffer's addressing is
+  per-request ragged and sized to the REAL request count, not the graph bucket,
+  so a padded lane would index past the end.
+* **A device-resident fold length** (`PIE_RS_FLAG_FOLD_LEN_DEVICE`) — its value
+  is substituted during descriptor resolution and clamped against a host bound.
+  The template resolves nothing, so the wire array would still hold the
+  placeholder, which folds the WHOLE buffer instead of the accepted prefix.
+  frame.cpp:1205 already refuses this combination; tokens absorbed into the
+  recurrence are unrecoverable, so it has to be refused here too.
+
+Result, one L40S:
+
+| case | before | after | vLLM | delta |
+|---|---|---|---|---|
+| hybrid latency 16x128 | 318.95 | **327.2** (326.5/327.3/327.8) | 318.14 | +2.8% |
+| hybrid tput 256x128 | 15127 | ~14900 (median 14710 over 7) | 11408 | flat |
+| attention latency 16x128 | 437.81 | 437.9 (437.5/438.4) | 376.43 | unchanged |
+| attention tput 256x128 | 26527 | 26542–29356 | 27484 | unchanged |
+
+Latency is the win; throughput is flat because at 256 requests the per-lane
+template saving is diluted and the run-to-run band (13658–16510) swamps it.
+
+**Two things this cost, both worth recording.**
+
+*The guard is not a place to add conditions on a hunch.* The first cut also
+required `rs_buffer_slot_indptr` to be empty, which reads like a companion to
+the slot-ids check. It is not: an indptr is `rows + 1` entries and carries its
+leading zero even with no buffer (scheduler/wire.rs:185), so the clause was
+false for EVERY fire, including pure attention. That silently pushed attention
+decode off the template — a 4% latency regression and a hard failure at 256
+requests ("descriptor channel 0 not ready", 256/256 failed). Caught by A/B
+against a stashed build; the attention benchmarks are not optional when
+touching this guard, even for a change that looks RS-only.
+
+*An env read on the decode path is not free.* The diagnostic added to observe
+the template calls `getenv` once per decode step. As a plain `if
+(std::getenv(...))` it cost ~1.5% of single-request tok/s (attention 437 → 417).
+It is a function-local `static const bool` now.
+
+`PIE_FIXED_DECODE_TRACE=1` prints one line per process saying whether the
+template is active and whether it is carrying recurrent state. It exists because
+the effect of this change is that a slower path is NOT taken, which nothing
+downstream can assert: `DispatchStats` is wired only into fire-timing debug.
+
 
 ## 11. The boundary model — ratified after Step B, supersedes §3.3/§3.4 fold modes
 

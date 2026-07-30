@@ -6192,6 +6192,27 @@ bool Dispatch::enqueue_fixed_decode(
         ++state.stats.fixed_decode_batches;
         state.stats.fixed_decode_lanes += programs;
     }
+    // One line per process, on the first templated batch: whether this build's
+    // decode template is carrying recurrent state. There is no cheaper way to
+    // observe it -- `DispatchStats` is wired only into fire-timing debug, and
+    // the whole effect of admitting an RS fire here is that a slower path is
+    // NOT taken, which no assertion downstream can see. If the RS guard above
+    // is ever re-tightened, this is what says so.
+    //
+    // The env read is a function-local static, not a per-batch `getenv`: this
+    // runs once per decode step on the latency path, and reading the
+    // environment there measurably costs (~1.5% of single-request tok/s).
+    static const bool trace_template =
+        std::getenv("PIE_FIXED_DECODE_TRACE") != nullptr;
+    if (trace_template) {
+        static std::once_flag once;
+        std::call_once(once, [&] {
+            std::cerr << "[pie-driver-cuda] fixed-decode template active: "
+                      << "programs=" << programs << " recurrent_state="
+                      << (buffers.rs_slot_ids != nullptr ? "yes" : "no")
+                      << "\n";
+        });
+    }
     return true;
 }
 
@@ -6333,6 +6354,44 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
         }
     }
 
+    // A recurrent fire may take the template, but only in its UNBUFFERED,
+    // HOST-KNOWN form. What the template replaces is the PTIR compose kernels
+    // that build the KV/token geometry; the RS wire arrays are a separate,
+    // host-side product of composition (`ComposedBatch`, frame.cpp:1189-1250)
+    // that the model forward reads directly, so they survive the substitution
+    // untouched. Pad rows are already handled -- both compose kernels write
+    // `rs_slot_ids[request] = -1` for an inactive lane (:752, :1119), which is
+    // exactly the "this row has no recurrent state" encoding the forward
+    // already understands.
+    //
+    // Two RS shapes still cannot come along, and for opposite reasons:
+    //
+    //   * BUFFERED rows (`rs_buffer_slot_ids`). The buffer's addressing is
+    //     per-request ragged and its indptr is sized to the REAL request
+    //     count, not the graph bucket. A padded lane has no row in it, so the
+    //     template's device-side padding would index past the end. Note this
+    //     tests the SLOT IDS, not the indptr: an indptr is `rows + 1` entries
+    //     and carries its leading zero even when the buffer is empty
+    //     (scheduler/wire.rs:185), so "no indptr" is not a thing to test for.
+    //   * A DEVICE-RESIDENT fold length (`PIE_RS_FLAG_FOLD_LEN_DEVICE`). Its
+    //     value is substituted during descriptor resolution and clamped
+    //     against a host bound; the template resolves nothing, so the wire
+    //     array would still hold the placeholder -- which folds the WHOLE
+    //     buffer instead of the accepted prefix. frame.cpp:1205 refuses this
+    //     combination outright, and tokens absorbed into the recurrence are
+    //     unrecoverable, so it must be refused here too rather than later.
+    //
+    // What is left is the fold-all decode: one state slot per request, fold
+    // this fire's single token, no buffer. That is the shape an ordinary
+    // hybrid decode step takes, and it is the one that wanted the template.
+    const bool rs_takes_template =
+        view.rs_buffer_slot_ids.empty() &&
+        std::none_of(
+            view.rs_slot_flags.data(),
+            view.rs_slot_flags.data() + view.rs_slot_flags.size(),
+            [](std::uint8_t f) {
+                return (f & PIE_RS_FLAG_FOLD_LEN_DEVICE) != 0;
+            });
     auto try_device_composed_template = [&]() {
         // Any all-decode lane count qualifies: graph-lattice padding
         // (frame.cpp) takes the composed batch from R to its request
@@ -6340,9 +6399,7 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
         // requires R to sit exactly on the lattice.
         if (staged == nullptr ||
             page_size == 0 || device_pages == 0 ||
-            !view.rs_slot_ids.empty() ||
-            !view.rs_fold_lens.empty() ||
-            !view.rs_buffer_slot_ids.empty() ||
+            !rs_takes_template ||
             view.kv_translation_indptr.size() != n_prog + 1 ||
             view.kv_translation_indptr.data()[0] != 0 ||
             view.kv_translation_indptr.data()[n_prog] !=
