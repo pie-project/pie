@@ -72,12 +72,7 @@ _PORTED: frozenset[str] = frozenset(
         "probe",
         "copy",
         "advance_fused",
-        # `fill_fused` is written and reaches the same mask when the memo is
-        # emptied between steps - and *narrows* it when the memo is live, which
-        # is the one failure this engine must never make. Not shipped until
-        # that is understood: the difference is in what it stores, not in what
-        # it computes, so the suspect is `memo_want` or the floors the claim
-        # reads. `_fill_fused_cuda` stays callable for the investigation.
+        "fill_fused",
     }
 )
 
@@ -4404,7 +4399,7 @@ class DeviceBatch:
         _gpugrammar.cuda_launch(
             "gg_fill_fused",
             self.batch,
-            min(1024, max(32, (grammar.max_stack + 31) // 32 * 32)),
+            self._fused_threads(grammar),
             torch.cuda.current_stream().cuda_stream,
             [
                 self.grammar.arena_struct().data_ptr(),
@@ -4442,18 +4437,32 @@ class DeviceBatch:
             ],
         )
 
-    def _fused_scratch(self, grammar) -> torch.Tensor:
-        """Two replay windows per (sequence, configuration).
+    def _fused_threads(self, grammar) -> int:
+        """Threads per block for the fused kernels.
 
-        Made on first use rather than at construction: the fused shape is for
-        small batches - where the graph-node dispatch is 44% of a step - and a
-        batch that never takes it should not pay `batch * configs` windows for
-        the possibility. At batch 8 that is 262 KiB; at 512 it would be 17 MiB.
+        A thread owns a stack entry in the commit phase, so the block covers
+        the stride; rounded to a warp and capped at a block's maximum.
+        """
+        return min(1024, max(32, (grammar.max_stack + 31) // 32 * 32))
+
+    def _fused_scratch(self, grammar) -> torch.Tensor:
+        """Two replay windows per *thread*, since a thread owns a replay.
+
+        Made on first use rather than at construction: the fused shape earns
+        most at small batches - where graph-node dispatch is 44% of a step -
+        and a batch that never takes it should not pay for the possibility.
         """
         held = getattr(self, "_fused_scratch_buffer", None)
         if held is None:
             held = torch.zeros(
-                (self.batch * self.configs, 2 * grammar.window),
+                # The fill indexes by thread and the advance by configuration,
+                # and either can be the wider of the two, so the buffer covers
+                # both rather than whichever the caller happens to be.
+                (
+                    self.batch
+                    * max(self._fused_threads(grammar), self.configs),
+                    2 * grammar.window,
+                ),
                 dtype=torch.int32,
                 device=self.device,
             )
@@ -4472,10 +4481,7 @@ class DeviceBatch:
         _gpugrammar.cuda_launch(
             "gg_advance_fused",
             self.batch,
-            # A thread owns a stack entry in the commit phase and a
-            # configuration in the replay, so the block has to cover the
-            # stride. Rounded to a warp and capped at a block's maximum.
-            min(1024, max(32, (grammar.max_stack + 31) // 32 * 32)),
+            self._fused_threads(grammar),
             torch.cuda.current_stream().cuda_stream,
             [
                 self.grammar.arena_struct().data_ptr(),

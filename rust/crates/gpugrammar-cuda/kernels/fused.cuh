@@ -400,9 +400,16 @@ extern "C" __global__ void gg_fill_fused(
     }
     __syncthreads();
 
-    // Phase two: sweep this sequence's groups. A configuration whose lexer
-    // state an earlier one already carried adds nothing - the groups are the
-    // same and so is the answer.
+    // Phase two: sweep every live configuration's groups.
+    //
+    // *Every* one. The Triton work list's `SKIP_DUPLICATES` skips whole
+    // sequences - those with a neighbour, and those the table answered - and
+    // says nothing about configurations. Skipping a configuration whose lexer
+    // state an earlier one already carried looks safe and is not: a replay
+    // depends on the stack, and a sequence can hold several configurations at
+    // one lexer state with different stacks. Measured on a schema that does:
+    // eight configurations at lexer states 6, 0, 6, 0, ... with depths 14, 16,
+    // 14, 17 - and the mask came out one bit narrow.
     int32_t group_base = gg::base_of(arena, grammar, gg::B_GROUP_OFFSETS);
     int32_t groups = gg::base_of(arena, grammar, gg::B_GROUPS);
     int32_t payload_base = gg::base_of(arena, grammar, gg::B_SET_PAYLOAD);
@@ -412,15 +419,6 @@ extern "C" __global__ void gg_fill_fused(
     for (int32_t config = 0; config < count; ++config) {
         int32_t row = sequence * configs + config;
         int32_t lexer = state->lexer_state[row];
-        bool seen = false;
-        for (int32_t earlier = 0; earlier < config; ++earlier) {
-            if (state->lexer_state[sequence * configs + earlier] == lexer) {
-                seen = true;
-            }
-        }
-        if (seen) {
-            continue;
-        }
         int32_t first = arena->group_offsets[group_base + lexer];
         int32_t last = arena->group_offsets[group_base + lexer + 1];
         int32_t depth = state->depth[row];
@@ -445,8 +443,14 @@ extern "C" __global__ void gg_fill_fused(
             if (settled != 0) {
                 continue;
             }
-            int32_t* mine = scratch + (int64_t)(sequence * configs + (slot % configs))
-                                          * 2 * window;
+            // Indexed by the *thread*, not by the slot. A thread walks slots
+            // `blockDim.x` apart, so `slot % configs` gave two of them the
+            // same window whenever the block was wider than `configs` - a
+            // race that only shows where a sequence holds many
+            // configurations, which is where the corpus does and a unit test
+            // does not.
+            int32_t* mine =
+                scratch + (int64_t)(sequence * blockDim.x + lane) * 2 * window;
             gg::Verdict v = gg::replay_group(t, state->stack, base, mine, mine + window,
                                              depth, group, max_reductions, paths,
                                              stack_stride, window, state->overflow,
