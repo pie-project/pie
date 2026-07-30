@@ -1114,10 +1114,19 @@ void linear_attn_layer_body(
         commit_len == nullptr &&
         // STOPGAP: skip warp-tiled when it must PERSIST state (the buggy fold).
         (!write_state || warp_tiled_state_persist_ok);
+    // V_h == K_h is the repeat=1 case, not a separate shape: the GQA kernel
+    // computes h_k = h/1 = h and indexes q at (r*K_h + h)*K_d, which is the
+    // non-GQA kernel's (r*V_h + h)*K_d exactly. The two branches also hand it
+    // the same pointer, since `q_recur_full` IS `la.q_pre` when V_h == K_h and
+    // the repeat_interleave above is skipped. Excluding equal head counts
+    // therefore bought nothing and cost everything: the tuned SMEM step kernel
+    // is reachable only through this launcher, so a model with equal linear
+    // key/value head counts (Qwen3.5-0.8B: 16 and 16) silently fell back to
+    // the legacy 2R/2W-per-element step. Measured on one L40S at R=1:
+    // 41.6 us/layer -> 10.4 us/layer, 18 linear layers, ~22% of the decode.
     const bool use_decode_gqa_recurrent =
         linear_decode &&
         slot_ids_d != nullptr &&
-        V_h != K_h &&
         V_h % K_h == 0;
     // The batched FLA prefill path (the high-concurrency verify/repair kernel)
     // is now GQA-aware: it reads the compact K_h-head q/k directly, so it too

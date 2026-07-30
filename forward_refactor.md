@@ -2238,6 +2238,79 @@ decoder needs because its drafts are device-produced) and for latency only
 second, where the ceiling is about 10%.
 
 
+#### 10.2.13 Where the hybrid latency gap actually was — a kernel nobody could reach
+
+The conclusion above ("it is GDN kernel work") was right, but the kernel in
+question was not slow for any interesting reason. It was slow because the fast
+version of it was unreachable.
+
+`nsys` on a 1-token hybrid decode put `recurrent_step_batched_kernel` at 20.5%
+of all GPU time: 3348 launches, **41.6 us each**, standard deviation under 1 us.
+At 18 linear layers that is 749 us per decode step. The state is only 512 KB
+per layer (16 heads x 128 x 128, bf16), so two reads and two writes of it is
+2 MB, which an L40S moves in 2.4 us. The kernel was 17x off, and the reason is
+visible in its launch: `dim3 grid(R, V_h)` with R=1 is **16 blocks on a
+142-SM GPU**.
+
+A tuned replacement already existed and was already the default --
+`recurrent_step_batched_gqa_smem_kernel`, which stages the state tile into
+shared memory once and reads it from there in both phases. It was reachable
+only through the GQA launcher, and the dense forward gated that launcher on
+
+```
+const bool use_decode_gqa_recurrent = ... && V_h != K_h && V_h % K_h == 0;
+```
+
+`V_h != K_h` was not expressing a real constraint. Repeat-1 is just the
+degenerate grouped case: the GQA kernel computes `h_k = h/1 = h` and indexes q
+at `(r*K_h + h)*K_d`, which is the non-GQA kernel's `(r*V_h + h)*K_d`, and the
+two call sites hand it the same pointer, because `q_recur_full` IS `la.q_pre`
+when `V_h == K_h`. So a model with equal linear key and value head counts --
+Qwen3.5-0.8B has 16 and 16 -- silently took the slow path. Dropping the
+clause: **41.6 us -> 7.57 us per layer**, 20.5% -> 4.5% of GPU time.
+
+**The trap.** That change alone made `cuda_mtp_stage1` fail its golden, and
+the golden is not a self-captured regression baseline -- it is the HF
+transformers trajectory for the same prompt. The legacy kernel reproduced all
+24 tokens; the SMEM kernel diverged at the **second** one. Both kernels are
+correct: a new CPU-reference parity test
+(`driver/cuda/tests/gdn_recurrent_step_parity.cu`, 13 shapes across R and
+repeat) put the SMEM kernel within 3e-6 of an fp32 reference where the legacy
+kernel sat at 1.7e-3. The SMEM kernel was the *more* accurate of the two and
+still produced different text.
+
+The difference was one rounding point. The legacy kernel stores `state*g` to
+HBM in its first phase and reloads it in its second, so its phase-2 base is
+bf16-rounded; the SMEM kernel keeps the value in a register and stays in fp32.
+Under argmax that is enough to pick a different token as soon as two logits
+are close -- and at the second decoded token there is no accumulated drift to
+blame, just a near-tie. So the fix is to round in the same place:
+
+```
+const float sg = __bfloat162float(__float2bfloat16(
+    __bfloat162float(s_state[k * BV + threadIdx.x]) * g_h));
+```
+
+**Kernel selection is an implementation detail and must not be observable in
+model output.** The parity test now holds every kernel to the legacy rounding
+so this class of difference cannot land silently again -- which matters beyond
+this bug, because the SMEM kernel was already the production default for every
+grouped-head Qwen3.5 model, and nothing was checking it against the dense one.
+
+Result on one L40S, against vLLM 0.25.1:
+
+| case | before | after | vLLM | delta |
+|---|---|---|---|---|
+| hybrid latency 16x128 | 266.44 | **318.95** | 318.14 | +0.3% |
+| hybrid tput 256x128 | 13539 | **15127** | 11408 | +32.6% |
+
+Latency was -16.2% and is now parity; throughput went from +18.7% to +32.6%.
+The rounding fix costs nothing measurable. Attention is untouched (437.81 vs
+437.72 tok/s). The forward-time arithmetic in §10.2.12 still stands -- pie's
+remaining non-overlapped host cost is ~0.38 ms -- but the 3.41 ms forward it
+was measured against is now roughly 0.61 ms shorter, which is the whole gap.
+
+
 ## 11. The boundary model — ratified after Step B, supersedes §3.3/§3.4 fold modes
 
 Step B shipped the fold modes as three sibling methods because that is the

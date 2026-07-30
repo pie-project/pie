@@ -1185,10 +1185,16 @@ void linear_attn_body(
         N <= qwen35_gdn_warp_tiled_max_tokens() &&
         K_d <= 256 &&
         commit_len == nullptr;
+    // Same reasoning as the dense forward: V_h == K_h is the repeat=1 case,
+    // not a shape the GQA kernel cannot express, and excluding it only hid
+    // the tuned SMEM step kernel from models with equal linear key/value
+    // head counts. See qwen3_5_forward.cpp for the full argument and
+    // driver/cuda/tests/gdn_recurrent_step_parity.cu for the guard. No
+    // Qwen3.5 MoE checkpoint that fits this box has equal head counts, so
+    // this arm rides on the equivalence proof rather than a local measurement.
     const bool use_decode_gqa_recurrent =
         linear_decode &&
         slot_ids_d != nullptr &&
-        V_h != K_h &&
         V_h % K_h == 0;
     profile_cuda_detail_stage(
         profile, profile ? &profile->linear_prep_ms : nullptr,

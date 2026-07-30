@@ -1677,10 +1677,23 @@ __global__ void recurrent_step_batched_gqa_smem_kernel(
 
     // Phase 2: recompute s = state*g + sk*delta; accumulate out_v;
     // write the updated state straight to HBM (skips SMEM writeback).
+    //
+    // `state*g` is rounded to bf16 before delta is added, which looks
+    // gratuitous when the value is already in a register — but it is what
+    // makes this kernel a drop-in for the legacy one. The legacy kernel
+    // STORES state*g to HBM in its first phase and RELOADS it in its second,
+    // so its phase-2 base is bf16-rounded; carrying full fp32 through here
+    // instead is more accurate per step and still changes the greedy
+    // trajectory, because argmax turns any perturbation into a different
+    // token the moment two logits are close. Qwen3.5-0.8B diverged from the
+    // HF reference trajectory at the SECOND decoded token that way. Kernel
+    // selection is an implementation detail and must not be observable in
+    // the output, so match the legacy rounding exactly.
     float out_v = 0.f;
     for (int k = 0; k < K_d; ++k) {
-        float s = __bfloat162float(s_state[k * BV + threadIdx.x]) * g_h
-                + sk[k] * delta;
+        const float sg = __bfloat162float(__float2bfloat16(
+            __bfloat162float(s_state[k * BV + threadIdx.x]) * g_h));
+        float s = sg + sk[k] * delta;
         out_v += s * sq[k];
         // Each thread owns column `threadIdx.x` for every k, so rewriting
         // its own SMEM slot races with nothing. Costing a SMEM round trip
