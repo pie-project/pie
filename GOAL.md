@@ -163,10 +163,54 @@ number came from a heavier sampling baseline; the smaller one is the one to
 publish, and it is still the argument, because nothing that hands a mask back
 to the host can make it at all.
 
-The dense regime — a JSON string body, most of the vocabulary allowed — is
-*not* re-measured here. `counts` reports the true size so a caller can fall
-back to the mask, but the claim that fusion "does not lose" there is currently
-untested against the shipped path.
+**The dense regime was then measured, and the claim above that fusion "does
+not lose" there is false.** A JSON string body admits 147,346 of 151,669
+tokens, and gathering them costs more than never leaving the mask:
+
+| batch | no constraint | XGrammar mask + sample | allowed set + sample |
+|---:|---:|---:|---:|
+| 1 | 240.5 | 249.0 | 400.4 (**0.62×**) |
+| 128 | 480.6 | 611.2 | 1,654.4 (**0.37×**) |
+| 512 | 1,195.9 | 1,719.4 | 5,670.0 (**0.30×**) |
+
+Swept over set size at a fixed batch, the set path is flat at ~210 µs while
+the set is small and then grows linearly. It stops winning at **43% of the
+vocabulary at batch 128 and 11% at batch 512**:
+
+| allowed | % vocab | b128 mask / set | b512 mask / set |
+|---:|---:|---:|---:|
+| 64 | 0.0% | 627.7 / 209.5 → 3.00× | 1,809.9 / 210.2 → 8.61× |
+| 1,024 | 0.7% | 643.2 / 210.2 → 3.06× | 1,882.1 / 214.3 → 8.78× |
+| 4,096 | 2.7% | 660.3 / 184.4 → 3.58× | 1,975.1 / 213.0 → 9.27× |
+| 16,384 | 10.8% | 671.8 / 192.8 → 3.48× | 2,017.1 / 544.3 → 3.71× |
+| 65,536 | 43.2% | 669.3 / 584.0 → 1.15× | 1,959.4 / 2,034.4 → **0.96×** |
+| 147,346 | 97.1% | 615.9 / 1,680.5 → **0.37×** | 1,735.4 / 5,752.5 → **0.30×** |
+
+### How often is a real step sparse?
+
+Measured over 11,892 decoding steps from 120 JSON Schema Bench documents,
+walking each document token by token under its own schema:
+
+    allowed tokens per step:  p50 147,234   p90 147,354   p99 151,669
+    steps admitting <  4k tokens:  49.3%
+    steps admitting < 16k tokens:  49.3%
+    steps admitting < 64k tokens:  49.9%
+
+**The distribution is bimodal, not sparse.** Half of all steps are structural
+and admit a few hundred tokens; the other half are inside string bodies and
+admit essentially the whole vocabulary. There is almost nothing in between.
+
+So "always use the set" is a **net loss** — 0.61–0.67× against always using the
+mask. What wins is choosing, which `counts` already makes possible:
+
+| batch | always mask | always set | **choose per step** |
+|---:|---:|---:|---:|
+| 128 | 637.8 | 947.1 (0.67×) | **407.3 (1.57×)** |
+| 512 | 1,853.6 | 3,021.5 (0.61×) | **984.9 (1.88×)** |
+
+**1.88× at batch 512 on the real distribution, not 8.87×.** That is the number
+to publish. It is smaller than either single-regime figure and it is the only
+one that describes decoding rather than a position within it.
 
 ### Example 2: speculative decoding, withdrawn, re-measured, and now possible
 
