@@ -144,6 +144,15 @@ public:
         prefetch_enabled_ =
             !loader_config::env_present("PIE_CUDA_STREAM_NO_PREFETCH");
         allocate_slab();
+        if (cudaStreamCreateWithFlags(&prefetch_stream_, cudaStreamNonBlocking)
+            != cudaSuccess) {
+            prefetch_stream_ = nullptr;
+        }
+        slot_ready_.assign(slots, nullptr);
+        slot_pending_.assign(slots, false);
+        for (auto& ev : slot_ready_) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
+        }
         allocate_host_tier(host_budget_bytes, total_instances);
         warm_host_tier();
     }
@@ -157,6 +166,10 @@ public:
         }
         free_slab();
         free_host_tier();
+        for (auto& ev : slot_ready_) {
+            if (ev != nullptr) cudaEventDestroy(ev);
+        }
+        if (prefetch_stream_ != nullptr) cudaStreamDestroy(prefetch_stream_);
     }
 
     /// What paging actually cost, in the terms the next decision needs.
@@ -194,7 +207,9 @@ public:
                             : static_cast<double>(s.bytes_paged_in) / 1048576.0 / secs)
             << " MiB/s), " << (static_cast<double>(s.evict_wait_ns) / 1e6)
             << " ms waiting to evict, " << s.prefetches
-            << " prefetched, " << s.host_tier_hits << " from host tier of "
+            << " prefetched, " << s.speculations << " speculative ("
+            << s.speculation_hits << " read before eviction), "
+            << s.host_tier_hits << " from host tier of "
             << host_slots_ << " slots; of the page-in, alloc " << s.alloc_ms
             << " ms, transfer " << s.transfer_ms << " ms, transform "
             << s.transform_ms << " ms\n";
@@ -255,6 +270,16 @@ public:
         if (found != GroupSlotIndex::kAbsent) {
             const auto slot = static_cast<std::uint32_t>(found);
             index_.touch_and_pin(slot);
+            // A speculative page-in ran on its own stream so that it could
+            // overlap the compute in front of it. This is where that bet is
+            // collected: the reader waits for the copy, on the device, without
+            // the host blocking on either.
+            if (slot_pending_[slot]) {
+                CUDA_CHECK(cudaStreamWaitEvent(
+                    compute_stream, slot_ready_[slot], 0));
+                slot_pending_[slot] = false;
+                ++stats_.speculation_hits;
+            }
             ++stats_.hits;
             verify_fill(slot, key, compute_stream);
             return slot_stores_[slot];
@@ -262,6 +287,7 @@ public:
 
         const auto acquired = index_.acquire(key);
         ++stats_.misses;
+        drain_prefetch(acquired.slot);
         if (acquired.evicted) {
             const auto started = Clock::now();
             sync_stream(compute_stream);
@@ -272,6 +298,47 @@ public:
         fill(acquired.slot, group, instance, key, compute_stream);
         verify_fill(acquired.slot, key, compute_stream);
         return slot_stores_[acquired.slot];
+    }
+
+    /// Page `instance` in now, against a guess, on a stream of its own.
+    ///
+    /// The same work `ensure_resident` does, moved earlier and off the compute
+    /// stream. Both halves matter: issuing it early is what gives the copy
+    /// something to hide behind, and issuing it elsewhere is what lets it
+    /// actually hide -- a copy queued on the compute stream runs between that
+    /// stream's kernels, not beside them.
+    ///
+    /// Speculative, so it is allowed to be wrong. A prediction that misses
+    /// costs one slot's worth of bandwidth and nothing else; the reader still
+    /// pages the right instance in on demand. Nothing here may block the host,
+    /// because the whole point is to return before the bytes have moved.
+    void prefetch_resident(
+        std::size_t group,
+        std::uint32_t instance,
+        cudaStream_t compute_stream)
+    {
+        if (prefetch_stream_ == nullptr) return;
+        const std::uint32_t key = flatten(group, instance);
+        if (index_.find(key) != GroupSlotIndex::kAbsent) return;
+        // Only when the bytes can actually move without the host.
+        //
+        // A page-in that reads the checkpoint runs the group's plan, and that
+        // flushes its copy streams -- it blocks the host whichever stream it is
+        // handed. Speculating on one does not overlap anything; it just moves
+        // the same stall earlier and adds the cost of every guess that was
+        // wrong. Measured on gpt-oss-20b reading from SSD, predicting made the
+        // run 30% slower. From the host tier the copy is one async DMA out of
+        // pinned memory, which is the case this is for.
+        if (host_of_.count(key) == 0) return;
+        const auto acquired = index_.acquire(key);
+        ++stats_.misses;
+        ++stats_.speculations;
+        drain_prefetch(acquired.slot);
+        if (acquired.evicted) sync_stream(compute_stream);
+        fill(acquired.slot, group, instance, key, prefetch_stream_);
+        CUDA_CHECK(cudaEventRecord(slot_ready_[acquired.slot], prefetch_stream_));
+        slot_pending_[acquired.slot] = true;
+        index_.release(acquired.slot);
     }
 
     /// Say that `instance` will be wanted, without waiting for it.
@@ -339,6 +406,11 @@ public:
         /// are still misses -- the slab did not hold the instance -- but they
         /// cost one H2D instead of a read, a plan and a transform.
         std::uint64_t host_tier_hits = 0;
+        /// Page-ins issued against a prediction, and how many were read before
+        /// being evicted. The ratio is the prediction's accuracy as the cache
+        /// sees it, which is the only form of it that pays.
+        std::uint64_t speculations = 0;
+        std::uint64_t speculation_hits = 0;
     };
 
     Stats stats() const noexcept {
@@ -701,6 +773,18 @@ private:
         }
     }
 
+    /// Wait out any speculative copy still landing in `slot`.
+    ///
+    /// Blocking, unlike the reader's wait, because the caller is about to
+    /// overwrite these bytes from the host side and there is no kernel to
+    /// order against.
+    void drain_prefetch(std::uint32_t slot)
+    {
+        if (slot >= slot_pending_.size() || !slot_pending_[slot]) return;
+        CUDA_CHECK(cudaEventSynchronize(slot_ready_[slot]));
+        slot_pending_[slot] = false;
+    }
+
     void free_host_tier() noexcept
     {
         if (host_tier_ != nullptr) {
@@ -744,6 +828,11 @@ private:
     std::uint8_t* host_tier_ = nullptr;
     std::uint32_t host_slots_ = 0;
     std::unordered_map<std::uint32_t, std::uint32_t> host_of_;
+
+    /// Where speculative page-ins run, and how a reader learns one has landed.
+    cudaStream_t prefetch_stream_ = nullptr;
+    std::vector<cudaEvent_t> slot_ready_;
+    std::vector<bool> slot_pending_;
 
     GroupSlotIndex index_;
     std::vector<WeightStore> slot_stores_;

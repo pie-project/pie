@@ -110,6 +110,18 @@ public:
         return out;
     }
 
+    /// Give back the pin an `acquire` took, leaving the slot's contents and
+    /// its recency alone.
+    ///
+    /// For a speculative page-in, which must not hold a slot against the
+    /// reader that actually knows what it needs. A batch that guesses wrong
+    /// would otherwise pin its wrong guesses alongside its right ones and run
+    /// the cache out of slots -- which is a failure, not a slowdown, since
+    /// `acquire` has nothing to evict.
+    void release(std::uint32_t slot) noexcept {
+        if (slot < slots_.size()) slots_[slot].pinned = false;
+    }
+
     /// End the batch. Until this is called every slot the batch touched is
     /// off limits as a victim.
     void unpin_all() noexcept {
