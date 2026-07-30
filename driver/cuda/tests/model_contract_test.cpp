@@ -49,6 +49,7 @@
 #include "model/contract.hpp"
 #include "model/csm/csm_contract.hpp"
 #include "model/deepseek_v4/deepseek_v4_contract.hpp"
+#include "model/mixtral/mixtral_contract.hpp"
 #include "model/kimi/kimi_contract.hpp"
 #include "model/nemotron_h/nemotron_h_contract.hpp"
 #include "model/qwen3_5/qwen3_5_contract.hpp"
@@ -763,6 +764,151 @@ void test_qwen3_moe_streams_experts_as_a_group() {
         }
         check(pv.memory.persistent_bytes < one_expert * kExperts,
               "the experts left the resident plan");
+    } catch (const std::exception& error) {
+        check(false, std::string("compiling: ") + error.what());
+    }
+}
+
+/// GPT-OSS streams its experts out of a fused bank, which is what `select` is.
+///
+/// The counterpart to the Qwen test and the other half of what a group has to
+/// cover: there the checkpoint names a tensor per expert and an instance is
+/// picked by substituting into a template; here one tensor per layer holds all
+/// of them and an instance is a band whose start is the only thing the index
+/// decides. The type of that band cannot depend on the index -- a slice of
+/// fixed length has a fixed shape -- so interchangeability is structural, and
+/// the compile is the proof.
+void test_gpt_oss_streams_experts_as_a_group() {
+    constexpr std::int64_t kExperts = 4;
+    constexpr std::int64_t kHidden = 64;
+    constexpr std::int64_t kInter = 32;
+    constexpr std::int64_t kLayers = 2;
+
+    std::vector<TypedTensor> tensors{
+        {"model.embed_tokens.weight", {16, kHidden}, "BF16"},
+        {"model.norm.weight", {kHidden}, "BF16"},
+        {"lm_head.weight", {16, kHidden}, "BF16"},
+    };
+    for (int layer = 0; layer < kLayers; ++layer) {
+        const std::string ep =
+            "model.layers." + std::to_string(layer) + ".mlp.experts.";
+        tensors.push_back({ep + "gate_up_proj_blocks",
+                           {kExperts, 2 * kInter, kHidden / 32, 16}, "U8"});
+        tensors.push_back({ep + "gate_up_proj_scales",
+                           {kExperts, 2 * kInter, kHidden / 32}, "U8"});
+        tensors.push_back({ep + "gate_up_proj_bias", {kExperts, 2 * kInter}, "BF16"});
+        tensors.push_back({ep + "down_proj_blocks",
+                           {kExperts, kHidden, kInter / 32, 16}, "U8"});
+        tensors.push_back({ep + "down_proj_scales",
+                           {kExperts, kHidden, kInter / 32}, "U8"});
+        tensors.push_back({ep + "down_proj_bias", {kExperts, kHidden}, "BF16"});
+    }
+    const std::filesystem::path dir =
+        write_typed_checkpoint("gpt_oss_streamed", tensors);
+
+    std::string open_error;
+    pie_loader::Checkpoint checkpoint = pie_loader::Checkpoint::open(dir.string(), &open_error);
+    check(static_cast<bool>(checkpoint), "the synthetic checkpoint opens: " + open_error);
+    if (!checkpoint) return;
+
+    const pie_cuda_driver::model::ModelFacts facts{
+        .model_type = "gpt_oss",
+        .quant_method = "",
+        .num_hidden_layers = kLayers,
+        .num_experts = kExperts,
+        .head_dim = 0,
+        .mamba_groups = 0,
+    };
+    namespace model = pie_cuda_driver::model;
+
+    pie_loader::ModelContract contract;
+    try {
+        model::ContractBuilder builder(checkpoint, facts,
+                                       pie_cuda_driver::cuda_device_target(), "",
+                                       model::Mxfp4MoeRequest::RoutedDecode,
+                                       model::Component::Full,
+                                       /*stream_routed_experts=*/true, contract);
+        model::author_gpt_oss_contract(builder);
+        builder.finish();
+    } catch (const std::exception& error) {
+        check(false, std::string("authoring: ") + error.what());
+        return;
+    }
+
+    const auto v = contract.view();
+    check(v.groups.len == kLayers, "one group per layer");
+    if (v.groups.len != kLayers) return;
+
+    for (std::size_t layer = 0; layer < v.groups.len; ++layer) {
+        const auto& g = v.groups.ptr[layer];
+        const std::string at = " (layer " + std::to_string(layer) + ")";
+        check(view_of(g.name) ==
+                  "model.layers." + std::to_string(layer) + ".mlp.experts",
+              "the group is named where the bind looks for it" + at);
+        check(g.arity == kExperts, "one instance per expert" + at);
+
+        std::map<std::string_view, std::vector<std::int64_t>> declared;
+        for (std::size_t i = 0; i < g.tensors.len; ++i) {
+            const auto& t = g.tensors.ptr[i];
+            declared[view_of(t.name)] =
+                std::vector<std::int64_t>(t.shape.ptr, t.shape.ptr + t.shape.len);
+        }
+        check(declared.size() == 4, "weights and scales, both halves" + at);
+        // The leading 1 survives: a `Select` lowers to a `Slice`, and a slice
+        // keeps its rank.
+        check(declared["gate_up_proj.weight"] ==
+                  std::vector<std::int64_t>{1, 2 * kInter, kHidden / 32, 16},
+              "one expert's packed gate/up band" + at);
+        check(declared["down_proj.weight"] ==
+                  std::vector<std::int64_t>{1, kHidden, kInter / 32, 16},
+              "one expert's packed down band" + at);
+        check(declared["gate_up_proj.weight_scale"] ==
+                  std::vector<std::int64_t>{1, 2 * kInter, kHidden / 32},
+              "its factors come with it" + at);
+    }
+
+    // The biases are small and need a de-interleave the contract has no node
+    // for, so they stay resident under the names the bind already reads.
+    bool bias_resident = false;
+    for (std::size_t i = 0; i < v.tensors.len; ++i) {
+        const auto name = view_of(v.tensors.ptr[i].name);
+        if (name == "model.layers.0.mlp.experts.gate_up_proj.bias") {
+            bias_resident = true;
+        }
+        check(name.find("_blocks") == std::string_view::npos &&
+                  name.find("_scales") == std::string_view::npos,
+              "no expert bank is published outside the group");
+    }
+    check(bias_resident, "the expert biases stayed resident");
+
+    try {
+        const pie_loader::PieLoaderContractRequest request =
+            pie_loader::build_contract_request(
+                checkpoint, pie_cuda_driver::cuda_device_target(), v);
+        // Compiling is the interchangeability proof, and for `select` it is
+        // also the bounds check: an arity wider than the bank fails here
+        // rather than producing a slot of whatever followed it.
+        const pie_loader::LoadPlan plan = pie_loader::LoadPlan::compile(request);
+        plan.verify(request);
+
+        const auto& pv = plan.view();
+        check(pv.groups.len == kLayers, "the plan carries every group");
+        if (pv.groups.len != kLayers) return;
+        const std::uint64_t one_expert = static_cast<std::uint64_t>(
+            2 * kInter * (kHidden / 32) * 16 + 2 * kInter * (kHidden / 32) +
+            kHidden * (kInter / 32) * 16 + kHidden * (kInter / 32));
+        for (std::size_t layer = 0; layer < pv.groups.len; ++layer) {
+            const auto& pg = pv.groups.ptr[layer];
+            const std::string at = " (layer " + std::to_string(layer) + ")";
+            check(pg.arity == kExperts, "the plan agrees on the arity" + at);
+            check(pg.bindings.len ==
+                      pg.bindings_per_instance * static_cast<std::size_t>(kExperts),
+                  "every instance is bound" + at);
+            check(pg.plan->memory.persistent_bytes >= one_expert &&
+                      pg.plan->memory.persistent_bytes < one_expert + 4096,
+                  "a slot is priced at one expert, not " +
+                      std::to_string(kExperts) + at);
+        }
     } catch (const std::exception& error) {
         check(false, std::string("compiling: ") + error.what());
     }
@@ -1630,6 +1776,7 @@ int main() {
     test_nemotron_h_mamba_splits_on_unit_boundaries();
     test_qwen3_5_gdn_splits_by_block();
     test_qwen3_moe_streams_experts_as_a_group();
+    test_gpt_oss_streams_experts_as_a_group();
 
     const char* snapshot = std::getenv("PIE_TEST_SNAPSHOT");
     if (snapshot != nullptr) {
