@@ -170,6 +170,13 @@ void prepare_llama_like_decode_plan(
 std::uint32_t llama_like_decode_graph_layout(
     const LlamaLikePlanState& state);
 
+// PIE_CUDA_DECODE_FUSED_POST kill switch for the fused decode QKV
+// postprocess (default on; the A/B rationale is at the definition).
+// Exposed so the declared executor's peephole (declared_forward.cpp) and
+// the hand-written `fused_decode_qkv_post` branch read ONE gate — the two
+// paths must fuse, or not, together.
+bool decode_fused_post_enabled();
+
 // Wire-driven forward body, plus a `cfg` knob block and an
 // externally-owned `LlamaLikePlanState`. The body never plans — it only
 // reads `state.decode_plan` (already populated by the prepare hook) which

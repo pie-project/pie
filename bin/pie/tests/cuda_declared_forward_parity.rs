@@ -13,11 +13,14 @@
 //! * single request — co-batched decode is not batch-invariant (bf16
 //!   reduction order flips argmax near ties; `cuda_contention.rs`), so the
 //!   comparison never mixes batch compositions;
-//! * both invocations set `PIE_CUDA_DECODE_FUSED_POST=0` — the declared
-//!   executor's v0 vocabulary is the hand-written UNFUSED path, and the
-//!   fused decode postprocess rounds differently. When the executor grows
-//!   the fused peephole, this override goes away and that removal is the
-//!   proof it matched.
+//! * both invocations run the full fast-path vocabulary, fused decode
+//!   postprocess included. The v0 harness pinned
+//!   `PIE_CUDA_DECODE_FUSED_POST=0` on both sides because the declared
+//!   executor spoke only the hand-written UNFUSED path and the fused
+//!   postprocess rounds differently; the executor now carries the fused
+//!   decode-QKV peephole (declared_forward.cpp), and this file's DELETION
+//!   of that override is the proof the peephole matched — parity now holds
+//!   with both sides fused, under the environment's default gates.
 //!
 //! `#[ignore]`, driver-cuda. Run OFF then ON, the second invocation gates:
 //!   cargo test -p pie-bin --no-default-features --features driver-cuda \
@@ -82,12 +85,6 @@ async fn declared_forward_token_parity() -> Result<()> {
     let declared = std::env::var("PIE_DECLARED_FORWARD")
         .map(|v| !v.is_empty() && v != "0")
         .unwrap_or(false);
-    // SAFETY: set before any worker thread spawns. Both invocations run the
-    // unfused decode postprocess so the two paths share one kernel
-    // vocabulary — see the module comment.
-    unsafe {
-        std::env::set_var("PIE_CUDA_DECODE_FUSED_POST", "0");
-    }
 
     let pie = common::boot_4090().await?;
     eprintln!(

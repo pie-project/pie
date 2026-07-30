@@ -81,6 +81,60 @@ const DeviceTensor* require(const DeviceTensor* t, std::string_view name) {
     return t;
 }
 
+// Cursor advance for the fused decode-QKV peephole: the ONE kernel just
+// launched (`launch_qkv_decode_qk_norm_rope_write_kv_bf16`) computed the
+// plan ops
+//   SplitQkv, RmsnormPerHead(q_norm), RmsnormPerHead(k_norm),
+//   Rope(Standard), KvAppend(layer)
+// so the walk must not launch them again. family.rs's layer body emits
+// exactly this run after Matmul(qkv) whenever fused_qkv && qk_norm — both
+// of which the peephole's predicate requires — so the adjacency is checked
+// op by op, kinds AND payloads, and a mismatch throws: a trace whose shape
+// drifted must fail, not silently half-fuse (the kernel's side effects are
+// already in ws.q and the paged cache).
+//
+// Returns the index of the KvAppend; the loop's `++i` then lands on
+// Attention.
+std::size_t skip_fused_decode_qkv_ops(
+    const pie_forward::ForwardPlan& plan, std::size_t i, int layer)
+{
+    const auto expect = [&](std::size_t at, PieForwardOpKind kind,
+                            const char* what) -> const PieForwardOp& {
+        if (at >= plan.op_count() || plan.op(at).kind != kind) {
+            throw std::runtime_error(
+                std::string("declared forward: fused decode-QKV peephole "
+                            "expected ") + what +
+                " at op " + std::to_string(at) +
+                " after Matmul(qkv); the trace's shape drifted from "
+                "family.rs's fused_qkv layer body");
+        }
+        return plan.op(at);
+    };
+    expect(i + 1, PieForwardOpKind::SplitQkv, "SplitQkv");
+    const PieForwardOp& qn = expect(
+        i + 2, PieForwardOpKind::RmsnormPerHead, "RmsnormPerHead(q_norm)");
+    const PieForwardOp& kn = expect(
+        i + 3, PieForwardOpKind::RmsnormPerHead, "RmsnormPerHead(k_norm)");
+    const PieForwardOp& rope = expect(
+        i + 4, PieForwardOpKind::Rope, "Rope(Standard)");
+    const PieForwardOp& append = expect(
+        i + 5, PieForwardOpKind::KvAppend, "KvAppend");
+    const ParsedWeightName qn_nm = parse_weight_name(plan.weight_name(qn));
+    const ParsedWeightName kn_nm = parse_weight_name(plan.weight_name(kn));
+    if (qn_nm.field != "q_norm" || qn_nm.layer != layer ||
+        kn_nm.field != "k_norm" || kn_nm.layer != layer ||
+        rope.param0 !=
+            static_cast<std::uint32_t>(PieForwardRopeKind::Standard) ||
+        static_cast<int>(append.param0) != layer) {
+        throw std::runtime_error(
+            "declared forward: fused decode-QKV peephole matched op kinds "
+            "but not their payloads at layer " + std::to_string(layer) +
+            "; the trace's shape drifted from family.rs's fused_qkv "
+            "layer body");
+    }
+    return i + 5;
+}
+
 }  // namespace
 
 LlamaLikeDeclaredPlan build_llama_like_declared_plan(
@@ -237,6 +291,14 @@ void llama_like_forward_declared(
     // `use_fused_gu` pairing).
     bool gate_up_used_fused = false;
 
+    // Rope-table state for the fused decode-QKV peephole: built once per
+    // fire on the first layer whose peephole fires (the hand-written
+    // `rope_table_ready` latch), reused by every later layer. Stays null
+    // when the workspace carries no table — the fused kernel then derives
+    // cos/sin from theta itself, exactly as the hand-written branch does.
+    bool rope_table_ready = false;
+    const float* rope_table = nullptr;
+
     const std::size_t op_count = plan.op_count();
     for (std::size_t i = 0; i < op_count; ++i) {
         const PieForwardOp& op = plan.op(i);
@@ -285,10 +347,80 @@ void llama_like_forward_declared(
             const auto& layer = layer_of(w, nm, name);
             const float beta = op.param0 != 0 ? 1.f : 0.f;
             if (nm.field == "qkv") {
+                // Fused decode-QKV peephole. The trace deliberately stays
+                // unfused: fusion is the EMITTER's decision, never the
+                // author's or the trace's (pie-application-plan.md §5.1 —
+                // "a fused edge cannot be a merge point", so fusion and
+                // merging must be chosen together, by the planner; and
+                // stage1-notes.md, where `fused_decode_qkv_post` became a
+                // row-count gate for exactly that reason). This is the
+                // knowledge the trace does not carry, so the emitter
+                // re-derives it here: when the adjacency Matmul(qkv) +
+                // SplitQkv + RmsnormPerHead x2 + Rope + KvAppend holds AND
+                // the hand-written predicate holds, launch the ONE fused
+                // kernel the hand-written path would.
+                //
+                // The predicate is the hand-written `fused_decode_qkv_post`
+                // (llama_like.cpp), term for term. Two of its terms are
+                // resolved by this path's caller gate rather than dropped:
+                //   * `fast_rows > 0` — hooks are null here (gate), so
+                //     Stage 1's hook-free prefix is every row: fast_rows ==
+                //     R, the unfused tail is empty, and the all-fused case
+                //     is the only one this executor needs.
+                //   * `!has_custom_mask` — the gate excludes custom masks.
+                const bool q_norm_is_per_head =
+                    layer.q_norm && layer.q_norm->shape().size() == 1 &&
+                    layer.q_norm->shape()[0] == d;
+                const bool k_norm_is_per_head =
+                    layer.k_norm && layer.k_norm->shape().size() == 1 &&
+                    layer.k_norm->shape()[0] == d;
+                const bool use_fused_qkv =
+                    layer.qkv_proj_fused != nullptr && !ws.qkv_fused.empty();
+                const bool fused_decode_qkv_post =
+                    use_fused_qkv &&
+                    R > 0 &&  // fast_rows > 0, with fast_rows == R (above)
+                    decode_fused_post_enabled() &&
+                    is_pure_decode &&
+                    (!has_write_desc ||
+                     (w_page_d != nullptr && w_off_d != nullptr)) &&
+                    cache.format().is_native_bf16() &&
+                    cfg.head_dim == cfg.head_dim_kernel &&  // !padded
+                    !fwd_cfg.use_qkv_bias &&
+                    fwd_cfg.use_qk_norm &&
+                    q_norm_is_per_head && k_norm_is_per_head &&
+                    fwd_cfg.rope_kind == RopeKind::Standard;
                 ops::gemm_act_x_w(cublas.handle(),
                     ws.norm_x.data(),
                     ops::WeightView(*require(layer.qkv_proj_fused, name)),
                     ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+                if (fused_decode_qkv_post) {
+                    if (!rope_table_ready && !ws.rope_table.empty()) {
+                        kernels::launch_rope_standard_table(
+                            positions,
+                            static_cast<float*>(ws.rope_table.data()),
+                            N, d, cfg.rope_theta, stream);
+                        rope_table =
+                            static_cast<const float*>(ws.rope_table.data());
+                        rope_table_ready = true;
+                    }
+                    kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+                        ws.qkv_fused.data(),
+                        ws.q.data(),
+                        cache.k(nm.layer), cache.v(nm.layer),
+                        layer.q_norm->data(), layer.k_norm->data(),
+                        positions,
+                        rope_table,
+                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                        has_write_desc ? w_page_d : nullptr,
+                        has_write_desc ? w_off_d : nullptr,
+                        row_valid_d,
+                        R, num_q_heads, num_kv_heads, d,
+                        cache.page_size(), cache.hnd_layout(),
+                        cfg.rope_theta, eps, stream);
+                    // The kernel owns everything through the KV write;
+                    // advance past those plan ops (validated, or throw).
+                    i = skip_fused_decode_qkv_ops(plan, i, nm.layer);
+                }
             } else if (nm.field == "q_proj") {
                 ops::gemm_act_x_w(cublas.handle(),
                     ws.norm_x.data(),
@@ -408,11 +540,12 @@ void llama_like_forward_declared(
             break;
         }
         case PieForwardOpKind::Rope: {
-            // Reached only when the peephole did not consume it (no qk-norm
-            // in the trace). Positions go straight to the kernel, as the
-            // hand-written `apply_rope` does for RopeKind::Standard; the
-            // rope_table exists only for the fused decode postprocess this
-            // path deliberately does not implement.
+            // Reached only when neither peephole consumed it (no qk-norm
+            // in the trace, so the fused decode-QKV predicate — which
+            // requires qk-norm — cannot hold either). Positions go straight
+            // to the kernel, as the hand-written `apply_rope` does for
+            // RopeKind::Standard; the rope_table serves only the fused
+            // decode postprocess above.
             if (op.param0 !=
                 static_cast<std::uint32_t>(PieForwardRopeKind::Standard)) {
                 throw std::runtime_error(

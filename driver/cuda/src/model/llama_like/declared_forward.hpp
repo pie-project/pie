@@ -7,15 +7,20 @@
 // here generates a kernel — op→kernel selection is this driver's knowledge,
 // exactly as `contract.hpp` states for the loader's specs.
 //
-// Scope (v0): the hand-written UNFUSED path only. The fused decode
-// postprocess (`launch_qkv_decode_qk_norm_rope_write_kv_bf16`) is a later
-// peephole; the one peephole taken here is RmsnormPerHead x2 + Rope →
-// `launch_qk_rmsnorm_rope_bf16`, because that is what the hand-written
-// `fuse_qk_norm_rope` branch launches and bit-parity requires the same
-// kernel. Everything the trace cannot express yet (hooks, custom masks,
-// TP, vision, quantized projections, non-standard rope, post-norm, qkv
-// bias, padded head_dim) falls back to `llama_like_forward_paged` — the
-// caller gates, `build` refuses.
+// Scope: the hand-written path's full kernel vocabulary, reached through
+// two emitter peepholes over the deliberately-unfused trace:
+//   * RmsnormPerHead x2 + Rope → `launch_qk_rmsnorm_rope_bf16`, the
+//     hand-written `fuse_qk_norm_rope` branch;
+//   * Matmul(qkv) + SplitQkv + RmsnormPerHead x2 + Rope + KvAppend →
+//     `launch_qkv_decode_qk_norm_rope_write_kv_bf16`, the hand-written
+//     `fused_decode_qkv_post` branch, under the SAME predicate (including
+//     the PIE_CUDA_DECODE_FUSED_POST gate).
+// Bit-parity requires the same launches, not just the same math — the
+// fused kernels round differently from their unfused sequences.
+// Everything the trace cannot express yet (hooks, custom masks, TP,
+// vision, quantized projections, non-standard rope, post-norm, qkv bias,
+// padded head_dim) falls back to `llama_like_forward_paged` — the caller
+// gates, `build` refuses.
 //
 // Explicit KV-write descriptors ARE handled (the hand-written
 // `has_write_desc` branch, verbatim): every pure-decode fire that replays a

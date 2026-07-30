@@ -63,22 +63,6 @@ bool decode_full_attention_variant_enabled() {
     return enabled;
 }
 
-// Bug#2 A/B: the fused decode QKV+qk-norm+rope+KV-write kernel
-// (`launch_qkv_decode_qk_norm_rope_write_kv_bf16`) is the R>1 concurrent-decode
-// suspect (the standalone BatchDecode attention is proven per-request-correct,
-// so the corruption is upstream in KV/Q production). PIE_CUDA_DECODE_FUSED_POST=0
-// falls back to the non-fused split-qkv + separate rope + `write_kv_to_pages`
-// (the verified `resolve_dst` path). If the fleet goes 8/8 with it off, the
-// fused kernel is the bug. Default on.
-bool decode_fused_post_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_CUDA_DECODE_FUSED_POST");
-        if (v == nullptr || v[0] == '\0') return true;
-        return v[0] != '0';
-    }();
-    return enabled;
-}
-
 inline void apply_rope(
     const LlamaLikeForwardCfg& fwd_cfg,
     const HfConfig& cfg,
@@ -117,6 +101,26 @@ inline void apply_rope(
 }
 
 }  // namespace
+
+// Bug#2 A/B: the fused decode QKV+qk-norm+rope+KV-write kernel
+// (`launch_qkv_decode_qk_norm_rope_write_kv_bf16`) is the R>1 concurrent-decode
+// suspect (the standalone BatchDecode attention is proven per-request-correct,
+// so the corruption is upstream in KV/Q production). PIE_CUDA_DECODE_FUSED_POST=0
+// falls back to the non-fused split-qkv + separate rope + `write_kv_to_pages`
+// (the verified `resolve_dst` path). If the fleet goes 8/8 with it off, the
+// fused kernel is the bug. Default on.
+//
+// External linkage (declared in llama_like.hpp) because the declared
+// executor's fused decode-QKV peephole (declared_forward.cpp) must read the
+// SAME gate: the peephole fires exactly when this branch would.
+bool decode_fused_post_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_CUDA_DECODE_FUSED_POST");
+        if (v == nullptr || v[0] == '\0') return true;
+        return v[0] != '0';
+    }();
+    return enabled;
+}
 
 void prepare_llama_like_decode_plan(
     LlamaLikePlanState& state,
