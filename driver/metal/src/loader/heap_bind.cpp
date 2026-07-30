@@ -99,17 +99,20 @@ void copy_extent(
 
 }  // namespace
 
-BoundDecode stage_decode_storage(
+// Stage every tensor the plan names into the heap, keyed by its runtime name.
+//
+// Driven entirely by the LoadPlan -- which the model contract authors -- and so
+// by nothing family-specific. Both families' staging calls this rather than
+// carrying a copy: the transforms (dequantize, fill, band copies) are where a
+// second implementation would quietly diverge, and a checkpoint staged two
+// slightly different ways is a model that works for one family and produces
+// plausible wrong tokens for the other.
+StagedWeights stage_plan_weights(
     RawMetalContext& ctx,
     const pie_loader::CheckpointSource& view,
     const pie_loader::LoadPlan& load,
-    const DecodeGeometry& g,
-    const HeapPlan& heap_plan) {
-    BoundDecode b;
-    b.plan = heap_plan;
-    b.gdn.resize(g.n_layers);
-    b.kv.resize(g.n_layers);
-
+    std::size_t weights_bytes) {
+    StagedWeights b;
     // Backend and tile-map transforms are no longer re-checked: this driver
     // supplied both in the request it compiled from (`architecture.md` §9).
     const auto load_plan = load.view();
@@ -126,8 +129,7 @@ BoundDecode stage_decode_storage(
         }
     }
     b.weights_region = ctx.heap_alloc(
-        heap_plan.weights_bytes,
-        std::max<std::size_t>(1, load.preferred_alignment()));
+        weights_bytes, std::max<std::size_t>(1, load.preferred_alignment()));
     if (!b.weights_region.valid()) {
         throw std::runtime_error("heap_alloc failed for program-owned weights region");
     }
@@ -229,6 +231,27 @@ BoundDecode stage_decode_storage(
             throw std::runtime_error(
                 "metal storage executor: compiler emitted an unsupported load-time transform");
         }
+    }
+
+    return b;
+}
+
+BoundDecode stage_decode_storage(
+    RawMetalContext& ctx,
+    const pie_loader::CheckpointSource& view,
+    const pie_loader::LoadPlan& load,
+    const DecodeGeometry& g,
+    const HeapPlan& heap_plan) {
+    BoundDecode b;
+    b.plan = heap_plan;
+    b.gdn.resize(g.n_layers);
+    b.kv.resize(g.n_layers);
+
+    {
+        StagedWeights staged =
+            stage_plan_weights(ctx, view, load, heap_plan.weights_bytes);
+        b.weights_region = staged.weights_region;
+        b.weights = std::move(staged.weights);
     }
 
     // ── KV region: k/v pages per full-attn layer (append-only, I4) ──

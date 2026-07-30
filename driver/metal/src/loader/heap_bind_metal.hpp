@@ -54,6 +54,20 @@ struct BoundDecode {
 
 // Stage all weights/state/KV/IO/scratch into the single resident heap (allocation order
 // follows the region plan). The view must outlive nothing (zero-copy mmap is read here).
+/// The weights a load plan names, staged into the heap and keyed by runtime
+/// name. Family-independent: the plan is authored by the model contract, and
+/// the transforms it carries (dequantize, fill, band copies) are exactly where a
+/// second implementation would quietly diverge.
+struct StagedWeights {
+    SlotHandle weights_region{};
+    std::unordered_map<std::string, SlotHandle> weights;
+};
+StagedWeights stage_plan_weights(
+    RawMetalContext& ctx,
+    const pie_loader::CheckpointSource& view,
+    const pie_loader::LoadPlan& load,
+    std::size_t weights_bytes);
+
 BoundDecode stage_decode_storage(
     RawMetalContext& ctx,
     const pie_loader::CheckpointSource& view,
