@@ -11,7 +11,6 @@
 #include <stdexcept>
 
 #include "../../batch/decode_abi.hpp"
-#include "../../batch/scratch_color.hpp"
 #include "encode.hpp"
 
 namespace pie::metal::gemma4 {
@@ -23,26 +22,6 @@ void bind_slot(RawMetalContext& ctx, int ord, std::uint8_t idx, const SlotHandle
 }
 
 }  // namespace
-
-ScratchColoring color_gemma4_scratch(const std::vector<Dispatch>& dag, const ScratchPlan& plan,
-                                     bool no_recycle) {
-    std::vector<pie::metal::scratch::Use> uses;
-    uses.reserve(plan.uses.size());
-    for (const Use& u : plan.uses) {
-        uses.push_back({u.ordinal, u.bind_index, u.value, u.is_write});
-    }
-    const auto colored = pie::metal::scratch::color_live_ranges(uses, gemma4_run_ends(dag),
-                                                               plan.value_count, no_recycle);
-    ScratchColoring out;
-    out.colors_used = colored.colors_used;
-    out.hazard_free = colored.hazard_free;
-    out.per_dispatch.resize(dag.size());
-    for (const Use& u : plan.uses) {
-        out.per_dispatch[std::size_t(u.ordinal)].push_back(
-            {u.bind_index, colored.color[std::size_t(u.value)]});
-    }
-    return out;
-}
 
 void bind_gemma4_dag(RawMetalContext& ctx, const BoundGemma4& b, const std::vector<Dispatch>& dag,
                      const Gemma4Geometry& g, const ScratchColoring& scratch,
