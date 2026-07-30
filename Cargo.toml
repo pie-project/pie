@@ -63,6 +63,7 @@ members = [
     # (plan = trace(declaration, config facts); C ABI later). See
     # pie-application-plan.md §4/§5 and stage1-notes.md.
     "forward",
+    "forward/cbindgen",
     "sdk/python-server",
     # Thin binary shells composing the `startup` skeleton + role lib(s). `bin/pie` is the
     # composition root (deps all three role libs; the standalone).

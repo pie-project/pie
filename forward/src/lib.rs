@@ -11,7 +11,7 @@
 //! The shape mirrors `loader/`:
 //!
 //! ```text
-//! declaration  ──trace──▶  forward plan  ──(C ABI, later)──▶  driver executes
+//! declaration  ──trace──▶  forward plan  ──(C ABI, `ffi/`)──▶  driver executes
 //! (what a pass    (the ops to run,          (committed header,
 //!  computes)       in what order)            generated)
 //! ```
@@ -30,6 +30,7 @@
 
 pub mod facts;
 pub mod family;
+pub mod ffi;
 pub mod trace;
 
 pub use facts::LlamaLikeFacts;
