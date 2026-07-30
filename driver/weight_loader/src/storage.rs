@@ -6,7 +6,7 @@ use crate::types::{
     TensorDecl, TensorId,
 };
 
-pub const STORAGE_PROGRAM_VERSION: u32 = 5;
+pub const STORAGE_PROGRAM_VERSION: u32 = 6;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryPlan {
@@ -190,6 +190,8 @@ pub enum ExpertPackKind {
     None = 0,
     GptOssNativeMarlin = 1,
     GptOssEagerBf16 = 2,
+    /// Contiguous TP-local HF MXFP4 sections (RoutedDecode under tp_size>1).
+    GptOssRoutedMxfp4 = 3,
 }
 
 /// One deferred source extent for a streamed expert section.

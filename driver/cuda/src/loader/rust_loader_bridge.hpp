@@ -138,7 +138,7 @@ inline std::string rust_loader_compile_cache_key(
     // content-hashes the loader source), so this no longer needs bumping per
     // code change.
     constexpr const char* cache_version =
-        "pie-cuda-rust-storage-program-cache-v11";
+        "pie-cuda-rust-storage-program-cache-v12";
     h.update_bytes(cache_version, std::char_traits<char>::length(cache_version));
     // Auto-invalidate when the Rust compiler logic changes (build.rs content-
     // hashes the loader source into this weak FFI symbol). Weak-guarded so the

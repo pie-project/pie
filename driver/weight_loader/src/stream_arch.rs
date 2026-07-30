@@ -65,6 +65,7 @@ pub(crate) fn parse_dsv4_expert_section(name: &str) -> Option<(u32, u32, usize)>
 
 fn dsv4_collect_bindings(
     metadata: &CheckpointMetadata,
+    _target: &StorageTarget,
     num_layers: u32,
     num_experts: u32,
 ) -> Result<Vec<StreamBinding>, CompileError> {
@@ -130,6 +131,7 @@ fn gpt_oss_find_tensor<'a>(
 
 fn gpt_oss_collect_bindings(
     metadata: &CheckpointMetadata,
+    _target: &StorageTarget,
     num_layers: u32,
     num_experts: u32,
 ) -> Result<Vec<StreamBinding>, CompileError> {
@@ -212,10 +214,25 @@ fn align_up_u64(v: u64, a: u64) -> u64 {
     (v + a - 1) / a * a
 }
 
+fn tp_local_range(full: i64, target: &StorageTarget) -> Result<(i64, i64), CompileError> {
+    let world = i64::from(target.tp_size.max(1));
+    let rank = i64::from(target.tp_rank);
+    if full % world != 0 {
+        return Err(CompileError::InvalidInput(format!(
+            "dimension {full} is not divisible by tp_size {}",
+            target.tp_size
+        )));
+    }
+    let local = full / world;
+    Ok((rank * local, local))
+}
+
 /// Marlin per-expert section byte sizes from GPT-OSS fused HF bank shapes.
+/// Uses TP-local intermediate (`I_full / tp_size`), then pads to 128 for Marlin.
 pub(crate) fn gpt_oss_native_section_bytes(
     gate_up_blocks: &RawTensor,
     down_blocks: &RawTensor,
+    target: &StorageTarget,
 ) -> Result<[u64; 6], CompileError> {
     if gate_up_blocks.shape.len() != 4 || down_blocks.shape.len() != 4 {
         return Err(CompileError::InvalidInput(
@@ -234,13 +251,21 @@ pub(crate) fn gpt_oss_native_section_bytes(
             gate_up_blocks.shape
         )));
     }
-    let intermediate = fused_rows / 2;
-    let intermediate_native = align_up_u64(intermediate, 128);
+    let full_intermediate = (fused_rows / 2) as i64;
+    let (_local_start, local_intermediate) =
+        tp_local_range(full_intermediate, target)?;
+    if local_intermediate % 32 != 0 {
+        return Err(CompileError::InvalidInput(format!(
+            "stream_routed_experts: GPT-OSS native TP shard I_local={local_intermediate} \
+             must be divisible by 32"
+        )));
+    }
+    let intermediate_native = align_up_u64(local_intermediate as u64, 128);
     let hidden = gu_groups * 32;
     let down_hidden = down_blocks.shape[1] as u64;
     let down_groups = down_blocks.shape[2] as u64;
     let down_lanes = down_blocks.shape[3] as u64;
-    if down_lanes != 16 || down_hidden != hidden || down_groups * 32 != intermediate {
+    if down_lanes != 16 || down_hidden != hidden || down_groups * 32 != full_intermediate as u64 {
         return Err(CompileError::InvalidInput(format!(
             "stream_routed_experts: GPT-OSS native down shape mismatch \
              (gate_up {:?}, down {:?})",
@@ -257,6 +282,7 @@ pub(crate) fn gpt_oss_native_section_bytes(
 
 fn gpt_oss_native_collect_bindings(
     metadata: &CheckpointMetadata,
+    target: &StorageTarget,
     num_layers: u32,
     num_experts: u32,
 ) -> Result<Vec<StreamBinding>, CompileError> {
@@ -282,7 +308,7 @@ fn gpt_oss_native_collect_bindings(
         // Still require scales to exist (consumed / validated by ABI skip).
         let _ = gpt_oss_find_tensor(metadata, &format!("{prefix}gate_up_proj_scales"))?;
         let _ = gpt_oss_find_tensor(metadata, &format!("{prefix}down_proj_scales"))?;
-        let bytes = gpt_oss_native_section_bytes(gate_up_w, down_w)?;
+        let bytes = gpt_oss_native_section_bytes(gate_up_w, down_w, target)?;
         if let Some(prev) = section_bytes {
             if prev != bytes {
                 return Err(CompileError::InvalidInput(format!(
@@ -322,14 +348,135 @@ pub(crate) const GPT_OSS_NATIVE_STREAM_ARCH: StreamArchDesc = StreamArchDesc {
 };
 
 /// GPT-OSS stream recipe depends on `mxfp4_moe`: HF packs (routed_dequant),
-/// Marlin pack (native), or offline BF16 pack (eager_bf16).
+/// Marlin pack (native), or offline BF16 pack (eager_bf16). Under TP,
+/// RoutedDecode switches to a per-rank MXFP4 pack (strided down shards).
 pub(crate) fn select_gpt_oss(target: &StorageTarget) -> Option<StreamArchDesc> {
     match target.mxfp4_moe {
         Mxfp4MoePolicy::NativeGemm => Some(GPT_OSS_NATIVE_STREAM_ARCH),
         Mxfp4MoePolicy::EagerBf16 => Some(GPT_OSS_EAGER_BF16_STREAM_ARCH),
-        Mxfp4MoePolicy::RoutedDecode => Some(GPT_OSS_STREAM_ARCH),
+        Mxfp4MoePolicy::RoutedDecode => {
+            if target.tp_size > 1 {
+                Some(GPT_OSS_ROUTED_TP_STREAM_ARCH)
+            } else {
+                Some(GPT_OSS_STREAM_ARCH)
+            }
+        }
     }
 }
+
+/// TP-local HF MXFP4 section sizes for RoutedDecode packs.
+pub(crate) fn gpt_oss_routed_tp_section_bytes(
+    gate_up_blocks: &RawTensor,
+    down_blocks: &RawTensor,
+    target: &StorageTarget,
+) -> Result<[u64; 4], CompileError> {
+    if gate_up_blocks.shape.len() != 4 || down_blocks.shape.len() != 4 {
+        return Err(CompileError::InvalidInput(
+            "stream_routed_experts: GPT-OSS RoutedDecode TP pack expects 4-D \
+             gate_up/down _blocks tensors"
+                .to_string(),
+        ));
+    }
+    let fused_rows = gate_up_blocks.shape[1] as u64;
+    let gu_groups = gate_up_blocks.shape[2] as u64;
+    let gu_lanes = gate_up_blocks.shape[3] as u64;
+    if fused_rows % 2 != 0 || gu_lanes != 16 {
+        return Err(CompileError::InvalidInput(format!(
+            "stream_routed_experts: GPT-OSS RoutedDecode gate_up expected \
+             [E, 2I, H/32, 16], got {:?}",
+            gate_up_blocks.shape
+        )));
+    }
+    let full_intermediate = (fused_rows / 2) as i64;
+    let (_local_start, local_intermediate) = tp_local_range(full_intermediate, target)?;
+    if local_intermediate % 32 != 0 {
+        return Err(CompileError::InvalidInput(format!(
+            "stream_routed_experts: GPT-OSS RoutedDecode TP shard \
+             I_local={local_intermediate} must be divisible by 32"
+        )));
+    }
+    let i_local = local_intermediate as u64;
+    let hidden = gu_groups * 32;
+    let down_hidden = down_blocks.shape[1] as u64;
+    let down_groups = down_blocks.shape[2] as u64;
+    let down_lanes = down_blocks.shape[3] as u64;
+    if down_lanes != 16 || down_hidden != hidden || down_groups * 32 != full_intermediate as u64 {
+        return Err(CompileError::InvalidInput(format!(
+            "stream_routed_experts: GPT-OSS RoutedDecode down shape mismatch \
+             (gate_up {:?}, down {:?})",
+            gate_up_blocks.shape, down_blocks.shape
+        )));
+    }
+    // Dense local HF MXFP4: gate_up rows 2*I_local; down groups I_local/32.
+    let gu_w = i_local * hidden; // 2*I_local * (H/32) * 16
+    let gu_s = 2 * i_local * (hidden / 32);
+    let dn_w = hidden * i_local / 2; // H * (I_local/32) * 16
+    let dn_s = hidden * (i_local / 32);
+    Ok([gu_w, gu_s, dn_w, dn_s])
+}
+
+fn gpt_oss_routed_tp_collect_bindings(
+    metadata: &CheckpointMetadata,
+    target: &StorageTarget,
+    num_layers: u32,
+    num_experts: u32,
+) -> Result<Vec<StreamBinding>, CompileError> {
+    let e = num_experts as u64;
+    if e == 0 {
+        return Err(CompileError::InvalidInput(
+            "stream_routed_experts: GPT-OSS num_experts must be > 0".to_string(),
+        ));
+    }
+    const SECTION_ALIGN: u64 = 256;
+    let mut bindings = Vec::with_capacity(
+        (num_layers as usize) * (num_experts as usize) * GPT_OSS_EXPERT_SECTIONS.len(),
+    );
+    let mut section_bytes: Option<[u64; 4]> = None;
+    let mut section_offsets = [0u64; 4];
+    let mut slot_bytes = 0u64;
+    for layer in 0..num_layers {
+        let prefix = format!("model.layers.{layer}.mlp.experts.");
+        let gate_up_w = gpt_oss_find_tensor(metadata, &format!("{prefix}gate_up_proj_blocks"))?;
+        let down_w = gpt_oss_find_tensor(metadata, &format!("{prefix}down_proj_blocks"))?;
+        let _ = gpt_oss_find_tensor(metadata, &format!("{prefix}gate_up_proj_scales"))?;
+        let _ = gpt_oss_find_tensor(metadata, &format!("{prefix}down_proj_scales"))?;
+        let bytes = gpt_oss_routed_tp_section_bytes(gate_up_w, down_w, target)?;
+        if let Some(prev) = section_bytes {
+            if prev != bytes {
+                return Err(CompileError::InvalidInput(format!(
+                    "stream_routed_experts: GPT-OSS RoutedDecode TP section \
+                     sizes differ across layers (layer {layer})"
+                )));
+            }
+        } else {
+            let mut off = 0u64;
+            for s in 0..4 {
+                section_offsets[s] = off;
+                off = align_up_u64(off + bytes[s], SECTION_ALIGN);
+            }
+            slot_bytes = off;
+            section_bytes = Some(bytes);
+        }
+        for expert in 0..e {
+            let base = (layer as u64 * e + expert) * slot_bytes;
+            for s in 0..4 {
+                bindings.push(StreamBinding {
+                    file_id: crate::types::FileId(0),
+                    file_offset: base + section_offsets[s],
+                    span_bytes: bytes[s],
+                });
+            }
+        }
+    }
+    Ok(bindings)
+}
+
+pub(crate) const GPT_OSS_ROUTED_TP_STREAM_ARCH: StreamArchDesc = StreamArchDesc {
+    sections: GPT_OSS_EXPERT_SECTIONS,
+    is_streamed: is_gpt_oss_streamed_expert_tensor,
+    collect_bindings: gpt_oss_routed_tp_collect_bindings,
+    pack_kind: ExpertPackKind::GptOssRoutedMxfp4,
+};
 
 /// Eager-BF16 stream sections — offline dequant pack; biases stay resident.
 /// Must match `gpt_oss_expert_sections.hpp` BF16 helpers.
@@ -339,6 +486,7 @@ pub const GPT_OSS_EAGER_BF16_EXPERT_SECTIONS: &[&str] =
 fn gpt_oss_eager_bf16_section_bytes(
     gate_up_blocks: &RawTensor,
     down_blocks: &RawTensor,
+    target: &StorageTarget,
 ) -> Result<[u64; 3], CompileError> {
     if gate_up_blocks.shape.len() != 4 || down_blocks.shape.len() != 4 {
         return Err(CompileError::InvalidInput(
@@ -357,19 +505,21 @@ fn gpt_oss_eager_bf16_section_bytes(
             gate_up_blocks.shape
         )));
     }
-    let intermediate = fused_rows / 2;
+    let full_intermediate = (fused_rows / 2) as i64;
+    let (_local_start, local_intermediate) = tp_local_range(full_intermediate, target)?;
+    let intermediate = local_intermediate as u64;
     let hidden = gu_groups * 32;
     let down_hidden = down_blocks.shape[1] as u64;
     let down_groups = down_blocks.shape[2] as u64;
     let down_lanes = down_blocks.shape[3] as u64;
-    if down_lanes != 16 || down_hidden != hidden || down_groups * 32 != intermediate {
+    if down_lanes != 16 || down_hidden != hidden || down_groups * 32 != full_intermediate as u64 {
         return Err(CompileError::InvalidInput(format!(
             "stream_routed_experts: GPT-OSS eager BF16 down shape mismatch \
              (gate_up {:?}, down {:?})",
             gate_up_blocks.shape, down_blocks.shape
         )));
     }
-    // BF16: rows * cols * 2.
+    // BF16: rows * cols * 2 (TP-local intermediate).
     let gate = intermediate * hidden * 2;
     let down = hidden * intermediate * 2;
     Ok([gate, gate, down])
@@ -377,6 +527,7 @@ fn gpt_oss_eager_bf16_section_bytes(
 
 fn gpt_oss_eager_bf16_collect_bindings(
     metadata: &CheckpointMetadata,
+    target: &StorageTarget,
     num_layers: u32,
     num_experts: u32,
 ) -> Result<Vec<StreamBinding>, CompileError> {
@@ -401,7 +552,7 @@ fn gpt_oss_eager_bf16_collect_bindings(
         let down_w = gpt_oss_find_tensor(metadata, &format!("{prefix}down_proj_blocks"))?;
         let _ = gpt_oss_find_tensor(metadata, &format!("{prefix}gate_up_proj_scales"))?;
         let _ = gpt_oss_find_tensor(metadata, &format!("{prefix}down_proj_scales"))?;
-        let bytes = gpt_oss_eager_bf16_section_bytes(gate_up_w, down_w)?;
+        let bytes = gpt_oss_eager_bf16_section_bytes(gate_up_w, down_w, target)?;
         if let Some(prev) = section_bytes {
             if prev != bytes {
                 return Err(CompileError::InvalidInput(format!(
@@ -472,6 +623,7 @@ pub(crate) fn parse_mixtral_expert_section(name: &str) -> Option<(u32, u32, usiz
 
 fn mixtral_collect_bindings(
     metadata: &CheckpointMetadata,
+    _target: &StorageTarget,
     num_layers: u32,
     num_experts: u32,
 ) -> Result<Vec<StreamBinding>, CompileError> {
@@ -544,6 +696,7 @@ pub(crate) fn parse_qwen3_moe_expert_section(name: &str) -> Option<(u32, u32, us
 
 fn qwen3_moe_collect_bindings(
     metadata: &CheckpointMetadata,
+    _target: &StorageTarget,
     num_layers: u32,
     num_experts: u32,
 ) -> Result<Vec<StreamBinding>, CompileError> {
@@ -607,6 +760,7 @@ fn qwen35_moe_find_tensor<'a>(
 
 fn qwen35_moe_collect_bindings(
     metadata: &CheckpointMetadata,
+    _target: &StorageTarget,
     num_layers: u32,
     num_experts: u32,
 ) -> Result<Vec<StreamBinding>, CompileError> {

@@ -33,9 +33,11 @@ pub struct StreamArchDesc {
     /// Which checkpoint tensors are streamed (and skipped from the resident ABI).
     pub is_streamed: fn(&str) -> bool,
     /// Build flat bindings `[L * E * sections.len()]` in layer-major, then
-    /// expert, then section order.
+    /// expert, then section order. `target` carries TP geometry for recipes
+    /// that emit per-rank local-I section sizes.
     pub collect_bindings: fn(
         &CheckpointMetadata,
+        &crate::storage::StorageTarget,
         num_layers: u32,
         num_experts: u32,
     ) -> Result<Vec<StreamBinding>, CompileError>,
@@ -154,7 +156,8 @@ pub fn attach_stream_plan(
     let sections = arch.sections.len();
     let expected = (num_layers as usize) * (num_experts_u as usize) * sections;
 
-    let bindings = (arch.collect_bindings)(metadata, num_layers, num_experts_u)?;
+    let bindings =
+        (arch.collect_bindings)(metadata, &program.target, num_layers, num_experts_u)?;
     if bindings.len() != expected {
         return Err(CompileError::InvalidInput(format!(
             "stream_routed_experts: collect_bindings returned {} entries, \
@@ -294,6 +297,7 @@ mod tests {
 
     fn fake_collect(
         metadata: &CheckpointMetadata,
+        _target: &crate::storage::StorageTarget,
         num_layers: u32,
         num_experts: u32,
     ) -> Result<Vec<StreamBinding>, CompileError> {
