@@ -2069,6 +2069,61 @@ test `discarding_buffered_tokens_releases_content_but_not_capacity`;
 `--all-targets` clean. Metal needs no refusal: `discard` never reaches a
 driver.
 
+#### 10.2.11 Review of the north-star work — three real defects
+
+A full review of §10.2.8–§10.2.10 found three things that were wrong rather
+than merely untidy. All three share a shape: a check or an obligation that was
+correct only because some OTHER layer happened to make it so.
+
+**A commit shipped an unclamped fold length.** `fold-len` is documented as
+CLAMPED to `B+T`, so "fold everything" is written `u32::MAX`. Under the old
+`fold_len <= buffered` classifier a commit was only ever SELECTED when its
+length already fit, so passing the raw guest value through was invisibly safe.
+`t == 0 -> Commit` removed that coupling: a commit may now carry any length,
+and `u32::MAX` reached `validate_fold` and was refused. The planner already
+computed the clamped `fold_tokens`; the commit arm simply did not use it.
+`empty_commit` gained an arm that folds `u32::MAX` through an empty row.
+
+**The deferred fold and the in-flight hold leaked on four error paths.**
+`publish_batch` returns a `#[must_use]` `RsPendingFolds` plus a receipt, and
+the wire arrays are built between the publish and `commit_folds`. That window
+has four fallible steps, one of them guest-reachable. On any of them the
+pending folds were dropped — leaving the boundary where nothing expects it —
+and `out.txn` was dropped without `settle`, so `in_flight` never decremented,
+and `retire_idle` gates ALL pool retirement on `in_flight == 0`: one such
+error wedged RS slot recycling for the life of the process. `#[must_use]` does
+not catch this, because the value is bound to a local. The window is now a
+closure whose result is inspected only AFTER both obligations are discharged.
+
+**`validate_fold` measured page capacity, not live tokens.** A two-page buffer
+holding three live tokens accepted a fold of six, gathering slab tokens that
+were never written into the recurrent state — silent corruption, not a visible
+failure. Nothing hit it because the planner pre-clamps, which is exactly what
+makes it a trap for the next caller. The bound is now the LIVE extent, and the
+intent says what that means: a REPLAY (a commit) may reach `buffer_fill`; a
+WRITE may reach `start + len`, because the fire's own new tokens are part of
+the extended space it folds through. Capacity is still checked on top, because
+the gather is physical.
+
+Also fixed, all smaller: `discard_buffered` did not rebase `buffer_head` when
+it emptied the buffer (`advance_fold` and `free_buffer` both do, and without it
+a repeatedly-drained buffer walks its head up until a fresh window cannot hold
+its own tokens); the zero-token truncation was an unconditional `truncate`,
+which quietly absorbed the ABI's exact-length invariant for EVERY fire instead
+of only the padded one; three Metal refusals were wrapped in a shape test, so
+an unexpected array shape SKIPPED the safety check rather than failing;
+`PIE_RS_SPLIT_TRACE` gated on `layer_idx == 0`, which on a hybrid stack may be
+an attention layer the linear body never runs for; `RsPendingFolds` carried a
+positional `(ws, tokens, is_bound)` tuple; and `Qwen3_5RsFoldSplit::qo_h` was
+assigned and never read.
+
+##### Verified
+
+`cuda_gdn_foldcommit` 8/8, `mtp_logits_value_verify` (`steps=13 fires=13`),
+`a_device_resident_fold_length_decodes_identically` (`steps=13 fires=26`),
+engine lib 377 pass / 2 known timing, `cargo check --workspace --all-targets`
+clean, Metal syntax-checks.
+
 ## 11. The boundary model — ratified after Step B, supersedes §3.3/§3.4 fold modes
 
 Step B shipped the fold modes as three sibling methods because that is the

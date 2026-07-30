@@ -880,10 +880,11 @@ async fn empty_commit(prompt: &[u32]) -> Result<String> {
 
     let (mut a, g0) = Arm::open(prompt, max_pages, &pipe).await?;
     let (mut b, _) = Arm::open(prompt, max_pages, &pipe).await?;
+    let (mut c, _) = Arm::open(prompt, max_pages, &pipe).await?;
     let cont: Vec<u32> = vec![g0 as u32; T];
     let slabs = (T as u32 + 1).div_ceil(a.rs_page).max(1);
 
-    for arm in [&a, &b] {
+    for arm in [&a, &b, &c] {
         arm.rs
             .alloc_buffer(slabs)
             .map_err(|e| format!("alloc_buffer: {e}"))?;
@@ -892,11 +893,22 @@ async fn empty_commit(prompt: &[u32]) -> Result<String> {
     a.pos += T as u32;
     b.fire(&cont, Some((0, 0)), &pipe, "B-append").await?;
     b.pos += T as u32;
+    c.fire(&cont, Some((0, 0)), &pipe, "C-append").await?;
+    c.pos += T as u32;
 
     // The whole point: a fire whose row carries no tokens at all.
     a.build_empty_fire(&Channel::from(vec![HALF]), "A-commit")?
         .submit(&pipe)
         .map_err(|e| format!("A-commit submit: {e}"))?;
+    // Arm C folds EVERYTHING through an empty row. `u32::MAX` is the
+    // fire-invariant spelling of "fold everything", and the WIT promises it
+    // is CLAMPED to the tail. Under the old rule a commit was selected by
+    // `fold-len <= buffered`, so the value reaching the plan was clamped by
+    // construction; a row that carries no tokens is a commit whatever its
+    // fold length says, so nothing but an explicit clamp keeps this legal.
+    c.build_empty_fire(&Channel::from(vec![u32::MAX]), "C-commit")?
+        .submit(&pipe)
+        .map_err(|e| format!("C-commit submit: {e}"))?;
     // Arm B does not fold. Folding is a no-op -- it trades optionality for
     // memory, never meaning -- so a context that folded half its buffer and
     // one that folded none of it must decode identically. If the empty row
@@ -905,7 +917,7 @@ async fn empty_commit(prompt: &[u32]) -> Result<String> {
 
     let next = vec![g0 as u32];
     let mut peaks = Vec::new();
-    for (arm, tag) in [(&mut a, "A"), (&mut b, "B")] {
+    for (arm, tag) in [(&mut a, "A"), (&mut b, "B"), (&mut c, "C")] {
         arm.fire(&next, Some((0, u32::MAX)), &pipe, tag).await?;
         arm.pos += 1;
         let live = arm.rs.buffer_size();
@@ -920,11 +932,12 @@ async fn empty_commit(prompt: &[u32]) -> Result<String> {
     }
     pipe.close();
 
-    let agree = close(peaks[0], peaks[1]);
+    let agree = close(peaks[0], peaks[1]) && close(peaks[0], peaks[2]);
     let result = format!(
-        "emptycommit folded={HALF} a_next={:.4} b_next={:.4} agree={}",
+        "emptycommit folded={HALF} a_next={:.4} b_next={:.4} c_next={:.4} agree={}",
         peaks[0],
         peaks[1],
+        peaks[2],
         if agree { "yes" } else { "no" }
     );
     eprintln!("[GDN_FOLDCOMMIT] {result}");

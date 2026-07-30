@@ -482,7 +482,6 @@ void maybe_print_forward_profile(const ForwardProfile& p) {
 // no special case.
 struct Qwen3_5RsFoldSplit {
     int segments = 0;                            // 2R
-    const std::uint32_t* qo_h = nullptr;         // [2R+1]
     const std::uint32_t* qo_d = nullptr;
     const std::int32_t*  slot_head_d = nullptr;  // [2R]
     const std::int32_t*  slot_tail_d = nullptr;  // [2R]
@@ -1474,7 +1473,10 @@ void linear_attn_layer_body(
     // The interior-boundary split is the only path that writes the state from
     // a segment that is not the row's own end, so a divergence shows up HERE
     // (in the state the fire leaves behind) long before it reaches a logit.
-    if (std::getenv("PIE_RS_SPLIT_TRACE") != nullptr && layer_idx == 0 &&
+    // Gated on the compact LINEAR index, like every sibling trace here: on a
+    // hybrid stack layer 0 may be an attention layer, and this body would then
+    // never run for it.
+    if (std::getenv("PIE_RS_SPLIT_TRACE") != nullptr && linear_idx == 0 &&
         [&] {
             cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
             return cudaStreamIsCapturing(stream, &st) == cudaSuccess &&
@@ -2110,7 +2112,6 @@ void qwen3_5_forward_paged(
                 split_mask_head_h.size() * sizeof(std::uint8_t),
                 cudaMemcpyHostToDevice, stream));
             fold_split.segments = segs;
-            fold_split.qo_h = qo_split_h.data();
             fold_split.qo_d = la_ws.qo_split.data();
             fold_split.slot_head_d = la_ws.split_slot_head.data();
             fold_split.slot_tail_d = la_ws.split_slot_tail.data();

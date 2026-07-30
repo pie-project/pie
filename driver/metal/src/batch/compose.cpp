@@ -102,9 +102,18 @@ pie_native::LaunchView build_launch_view(const pie_native::StepLaunch& launch) {
     // it again. This driver issues one call per fire and would fold the whole
     // row, leaving the host believing tokens are still buffered that the
     // device has already absorbed -- a double fold on the next fire.
+    // The per-row refusals below are SAFETY checks, so an unexpected shape
+    // must fail rather than skip them: silently admitting a fire because its
+    // arrays did not line up is exactly the outcome the checks exist to
+    // prevent.
     if (launch.rs_fold_lens.len != 0 &&
-        launch.rs_slot_flags.len == launch.rs_fold_lens.len &&
-        launch.qo_indptr.len == launch.rs_fold_lens.len + 1) {
+        (launch.rs_slot_flags.len != launch.rs_fold_lens.len ||
+         launch.qo_indptr.len != launch.rs_fold_lens.len + 1)) {
+        throw std::runtime_error(
+            "malformed RS launch: per-row fold lengths, slot flags and the "
+            "token CSR must agree on the row count");
+    }
+    if (launch.rs_fold_lens.len != 0) {
         for (std::size_t r = 0; r < launch.rs_fold_lens.len; ++r) {
             if ((launch.rs_slot_flags.ptr[r] & kRsFlagBufferWrite) == 0) continue;
             const std::uint32_t n = launch.rs_fold_lens.ptr[r];
@@ -123,8 +132,7 @@ pie_native::LaunchView build_launch_view(const pie_native::StepLaunch& launch) {
     // move the recurrent boundary". This driver has no replay path at all
     // (the read refusal above), so such a row would run an empty forward and
     // move nothing, leaving the host believing a fold happened.
-    if (launch.rs_fold_lens.len != 0 &&
-        launch.qo_indptr.len == launch.rs_fold_lens.len + 1) {
+    if (launch.rs_fold_lens.len != 0) {
         for (std::size_t r = 0; r < launch.rs_fold_lens.len; ++r) {
             if (launch.qo_indptr.ptr[r + 1] == launch.qo_indptr.ptr[r]) {
                 throw std::runtime_error(
@@ -141,7 +149,12 @@ pie_native::LaunchView build_launch_view(const pie_native::StepLaunch& launch) {
     // row or none of them. Either way one row's state is wrong and the error
     // is unrecoverable once folded.
     if (launch.rs_slot_flags.len != 0 &&
-        launch.rs_buffer_slot_indptr.len == launch.rs_slot_flags.len + 1) {
+        launch.rs_buffer_slot_indptr.len != launch.rs_slot_flags.len + 1) {
+        throw std::runtime_error(
+            "malformed RS launch: the buffer-slot CSR and the per-row slot "
+            "flags must agree on the row count");
+    }
+    if (launch.rs_slot_flags.len != 0) {
         const auto persists = [&](std::size_t r) {
             const bool buffered =
                 launch.rs_buffer_slot_indptr.ptr[r + 1] >

@@ -1,7 +1,7 @@
 //! Unit tests for the RS store.
 
 use super::write::RsBufferTarget;
-use super::{RsError, RsGeometry, RsStore, RsWorkingSetId};
+use super::{RsBufferIntent, RsError, RsGeometry, RsStore, RsWorkingSetId};
 
 fn geom() -> RsGeometry {
     RsGeometry {
@@ -349,22 +349,58 @@ fn fold_validates_granularity_and_capacity() {
     let mut s = store();
     let ws = s.create_working_set(geom());
     s.alloc_buffer(ws, 2).unwrap(); // capacity 8 tokens
-    assert_eq!(s.validate_fold(ws, 0), Err(RsError::FoldZero));
+    let write = |t, b| s.validate_fold(ws, t, Some(b), RsBufferIntent::Write);
+    assert_eq!(write(0, (0, 8)), Err(RsError::FoldZero));
     assert_eq!(
-        s.validate_fold(ws, 6),
+        write(6, (0, 8)),
         Err(RsError::FoldGranularity {
             tokens: 6,
             granularity: 4
         })
     );
     assert_eq!(
-        s.validate_fold(ws, 12),
+        write(12, (0, 12)),
         Err(RsError::FoldExceedsBuffer {
             tokens: 12,
             capacity: 8
         })
     );
-    assert_eq!(s.validate_fold(ws, 8), Ok(()));
+    assert_eq!(write(8, (0, 8)), Ok(()));
+}
+
+#[test]
+fn a_fold_may_not_reach_past_the_tokens_that_exist() {
+    // Two pages of four hold capacity for eight, but only four tokens are
+    // live. Bounding on capacity would accept a fold of eight and gather
+    // four slab tokens that were never written.
+    let mut s = store();
+    let ws = s.create_working_set(geom());
+    s.alloc_buffer(ws, 2).unwrap();
+    let prepared = s
+        .prepare_general(
+            ws,
+            false,
+            None,
+            Some((0, 4)),
+            RsBufferIntent::Write,
+        )
+        .unwrap();
+    settled(&mut s, prepared);
+    assert_eq!(s.buffer_tokens(ws), Ok(4));
+    // A commit replays only what is buffered.
+    assert_eq!(
+        s.validate_fold(ws, 8, None, RsBufferIntent::Replay),
+        Err(RsError::FoldExceedsBuffer {
+            tokens: 8,
+            capacity: 4
+        })
+    );
+    assert_eq!(s.validate_fold(ws, 4, None, RsBufferIntent::Replay), Ok(()));
+    // A write extends the live space by its own new tokens.
+    assert_eq!(
+        s.validate_fold(ws, 8, Some((4, 4)), RsBufferIntent::Write),
+        Ok(())
+    );
 }
 
 #[test]

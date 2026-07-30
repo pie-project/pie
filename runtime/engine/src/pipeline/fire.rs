@@ -632,7 +632,15 @@ fn rs_plan_for(
         },
         Position::Commit => rs::RsPlan::FoldBuffered {
             fold_len_is_device: false,
-            tokens: fold_len.to_vec(),
+            // `fold_tokens`, not the raw `fold_len`: the WIT promises the
+            // length is CLAMPED to the tail, which is what makes "fold
+            // everything" a fire-invariant `u32::MAX`. Under the old rule a
+            // commit was selected by `fold_len <= buffered`, so the raw value
+            // was already clamped by construction and the distinction never
+            // showed. A row that carries no tokens is a commit whatever its
+            // fold length says, so an unclamped `u32::MAX` would now reach
+            // `validate_fold` and be REFUSED as exceeding capacity.
+            tokens: fold_tokens,
         },
     })
 }

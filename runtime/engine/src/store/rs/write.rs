@@ -135,7 +135,17 @@ impl RsPreparedWrite {
 /// against the pre-fold buffer they describe.
 #[derive(Debug, Default)]
 #[must_use = "a deferred fold that is never committed leaves the boundary behind"]
-pub struct RsPendingFolds(pub(crate) Vec<(super::RsWorkingSetId, u32, bool)>);
+pub struct RsPendingFolds(pub(crate) Vec<RsPendingFold>);
+
+/// One deferred fold. `tokens` is exact unless `len_is_bound`, in which case
+/// the length lives on the device and was never read back — the store may
+/// then only narrow its bound on the live buffer, never state it.
+#[derive(Debug, Clone, Copy)]
+pub struct RsPendingFold {
+    pub(crate) ws: super::RsWorkingSetId,
+    pub(crate) tokens: u32,
+    pub(crate) len_is_bound: bool,
+}
 
 /// The receipt for one fire's published RS rows. The mapping is already
 /// authoritative when this exists; it only carries what settlement needs —

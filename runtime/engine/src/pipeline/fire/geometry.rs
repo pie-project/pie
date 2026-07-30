@@ -682,27 +682,33 @@ pub fn map_geometry_evaluated(
     let lanes = g.qo_indptr.len().saturating_sub(1);
     g.position_ids = required_u32(Port::Positions)?;
 
-    // The token CSR is the truth about how many rows this fire computes; a
-    // per-token channel may carry elements past its end. That is not
-    // sloppiness to tolerate but the only way to say "this lane spans no
-    // tokens": the IR has no zero-sized tensor (`Shape::new` refuses a 0
-    // dim), so an empty span cannot be expressed by an empty channel. It is
-    // expressed in the geometry, and the unreferenced tail is dropped here.
+    // A fire that spans NO TOKENS AT ALL is a pure replay: "compute nothing,
+    // only move the recurrent boundary". Its per-token channels cannot be
+    // empty, because the IR has no zero-sized tensor (`Shape::new` refuses a
+    // 0 dim), so the emptiness lives in the token CSR and the channels carry
+    // one unreferenced element that is dropped here.
+    //
+    // ONLY in that case. Everywhere else a per-token channel that disagrees
+    // with the CSR is a guest bug, and it used to be caught -- by the ABI,
+    // which requires `qo_indptr[rows] == token_ids.len` exactly. Truncating
+    // unconditionally would have swallowed that check for every fire in
+    // order to serve the one shape that needs it.
     let spanned = g.qo_indptr.last().copied().unwrap_or(0) as usize;
     for (port, tokens) in [
         (Port::EmbedTokens, &mut g.token_ids),
         (Port::Positions, &mut g.position_ids),
     ] {
-        if tokens.len() < spanned {
+        if spanned == 0 {
+            tokens.clear();
+        } else if tokens.len() != spanned {
             return Err(EvaluatedGeometryError::BadValue {
                 port,
                 reason: format!(
-                    "the token CSR spans {spanned} rows but only {} were supplied",
+                    "the token CSR spans {spanned} rows but {} were supplied",
                     tokens.len()
                 ),
             });
         }
-        tokens.truncate(spanned);
     }
 
     // Read-out rows distribute over lanes as LANE-RELATIVE indices (the

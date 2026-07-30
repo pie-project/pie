@@ -466,84 +466,102 @@ fn prepare_many_impl(
     let (published, pending_folds) = store
         .publish_batch(prepared_rows)
         .map_err(|error| error.to_string())?;
-    out.txn = Some(RsTxn { published });
-
-    // Built AFTER the publish, so it reflects the pages this fire just
-    // materialized or privatized rather than the mapping the guest saw.
-    out.translation_indptr.push(0);
-    let page_tokens_of = |ws| -> Result<u32, String> {
-        store
-            .geometry(ws)
-            .map(|g| g.buffer_page_tokens.max(1))
-            .map_err(|error| error.to_string())
-    };
-    let mut any_read = false;
-    out.buffer_read_indptr.push(0);
-    for (index, &ws) in working_sets.iter().enumerate() {
-        let row = store
-            .buffer_translation(ws)
-            .map_err(|error| error.to_string())?;
-
-        let head = if buffered {
-            store.buffer_head(ws).map_err(|error| error.to_string())?
-        } else {
-            0
+    // Everything from here to `commit_folds` runs inside a closure so that a
+    // failure cannot skip it. Once `publish_batch` returns, the store has
+    // ALREADY committed this fire's mapping and taken an in-flight hold, and
+    // two obligations outlive any error below: the deferred fold must be
+    // applied (dropping it would leave the boundary where no one expects it)
+    // and the hold must be settled (`retire_idle` gates ALL pool retirement
+    // on `in_flight == 0`, so leaking one wedges slot recycling for the rest
+    // of the process). `#[must_use]` does not help here -- the value is bound
+    // to a local, and the lint only catches a discarded temporary.
+    let read_side = (|out: &mut PreparedRs| -> Result<(), String> {
+        // Built AFTER the publish, so it reflects the pages this fire just
+        // materialized or privatized rather than the mapping the guest saw.
+        out.translation_indptr.push(0);
+        let page_tokens_of = |ws| -> Result<u32, String> {
+            store
+                .geometry(ws)
+                .map(|g| g.buffer_page_tokens.max(1))
+                .map_err(|error| error.to_string())
         };
-        if buffered {
-            out.buffer_heads.push(head);
-        }
+        let mut any_read = false;
+        out.buffer_read_indptr.push(0);
+        for (index, &ws) in working_sets.iter().enumerate() {
+            let row = store
+                .buffer_translation(ws)
+                .map_err(|error| error.to_string())?;
 
-        // The read prefix is the row's PRE-EXISTING occupancy, which is
-        // exactly where its own tokens begin.
-        let read_tokens = match plan.row(index).2 {
-            Some((start, _)) => start,
-            None => 0,
-        };
-        out.buffer_read_lens.push(read_tokens);
-        if read_tokens > 0 {
-            any_read = true;
-            let page = page_tokens_of(ws)?;
-            // Physical, not logical: the replay starts at `head`, which a
-            // mid-page fold leaves non-zero.
-            let first = (head / page) as usize;
-            let last = ((head + read_tokens - 1) / page) as usize;
-            for p in first..=last {
-                match row.get(p) {
-                    Some(&slot) if slot != crate::store::rs::RS_TRANSLATION_UNMAPPED => {
-                        out.buffer_read_slot_ids.push(slot);
-                    }
-                    // Reserved-but-unmaterialized, or off the end. Either way
-                    // the recurrence would replay activations that were never
-                    // written, which is silent corruption of the state rather
-                    // than a visible failure -- so refuse.
-                    _ => {
-                        return Err(format!(
-                            "request row {index} must replay {read_tokens} buffered \
-                             token(s), but buffer page {p} of its working set \
-                             is not materialized"
-                        ));
+            let head = if buffered {
+                store.buffer_head(ws).map_err(|error| error.to_string())?
+            } else {
+                0
+            };
+            if buffered {
+                out.buffer_heads.push(head);
+            }
+
+            // The read prefix is the row's PRE-EXISTING occupancy, which is
+            // exactly where its own tokens begin.
+            let read_tokens = match plan.row(index).2 {
+                Some((start, _)) => start,
+                None => 0,
+            };
+            out.buffer_read_lens.push(read_tokens);
+            if read_tokens > 0 {
+                any_read = true;
+                let page = page_tokens_of(ws)?;
+                // Physical, not logical: the replay starts at `head`, which a
+                // mid-page fold leaves non-zero.
+                let first = (head / page) as usize;
+                let last = ((head + read_tokens - 1) / page) as usize;
+                for p in first..=last {
+                    match row.get(p) {
+                        Some(&slot) if slot != crate::store::rs::RS_TRANSLATION_UNMAPPED => {
+                            out.buffer_read_slot_ids.push(slot);
+                        }
+                        // Reserved-but-unmaterialized, or off the end. Either way
+                        // the recurrence would replay activations that were never
+                        // written, which is silent corruption of the state rather
+                        // than a visible failure -- so refuse.
+                        _ => {
+                            return Err(format!(
+                                "request row {index} must replay {read_tokens} buffered \
+                                 token(s), but buffer page {p} of its working set \
+                                 is not materialized"
+                            ));
+                        }
                     }
                 }
             }
-        }
-        out.buffer_read_indptr
-            .push(out.buffer_read_slot_ids.len() as u32);
+            out.buffer_read_indptr
+                .push(out.buffer_read_slot_ids.len() as u32);
 
-        out.translation.extend_from_slice(&row);
-        out.translation_indptr.push(out.translation.len() as u32);
-    }
-    // Keep the wire quiet for the overwhelmingly common empty-buffer fire: an
-    // all-zero read side is the same statement as an absent one, and the
-    // driver's shape checks are simpler when "no read" is literally no data.
-    if !any_read {
-        out.buffer_read_slot_ids.clear();
-        out.buffer_read_indptr.clear();
-        out.buffer_read_lens.clear();
-    }
+            out.translation.extend_from_slice(&row);
+            out.translation_indptr.push(out.translation.len() as u32);
+        }
+        // Keep the wire quiet for the overwhelmingly common empty-buffer fire: an
+        // all-zero read side is the same statement as an absent one, and the
+        // driver's shape checks are simpler when "no read" is literally no data.
+        if !any_read {
+            out.buffer_read_slot_ids.clear();
+            out.buffer_read_indptr.clear();
+            out.buffer_read_lens.clear();
+        }
+        Ok(())
+    })(&mut out);
+
     // Every wire array is now built against the pre-fold buffer, so the
     // boundary can finally move. A row that folds through its own new tokens
     // sees its head advance here and NOT one array earlier.
     store.commit_folds(pending_folds);
+    if let Err(error) = read_side {
+        // The mapping is committed and cannot be taken back, but the hold on
+        // pool retirement can and must be.
+        store.settle(published);
+        return Err(error);
+    }
+    out.txn = Some(RsTxn { published });
     Ok(out)
 }
 

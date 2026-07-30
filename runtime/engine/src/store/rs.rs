@@ -60,7 +60,8 @@ use std::collections::HashMap;
 use crate::store::genmap::{GenKey, GenMap};
 use crate::store::pool::{Pool, PoolId};
 use write::{
-    RsBufferIntent, RsBufferTarget, RsPendingFolds, RsPreparedWrite, RsPublished, RsStateTarget,
+    RsBufferIntent, RsBufferTarget, RsPendingFold, RsPendingFolds, RsPreparedWrite, RsPublished,
+    RsStateTarget,
 };
 
 /// Marker for RS WorkingSet ids.
@@ -343,6 +344,16 @@ impl RsStore {
         // it a bound. It does not RESTORE exactness — only the guest saying
         // "I am done with this window" does that — so the flag survives.
         entry.buffer_fill -= count;
+        // Nothing survives to hold in place, so the head may rebase and the
+        // next append starts at physical 0 -- the same reasoning
+        // `advance_fold` uses when a fold absorbs the whole buffer. Without
+        // it the head creeps forward across windows and the reservation
+        // grows to match. A bound of zero also pins the live buffer at
+        // exactly zero, which is what `buffer_fill_is_bound` was waiting for.
+        if entry.buffer_fill == 0 {
+            entry.buffer_head = 0;
+            entry.buffer_fill_is_bound = false;
+        }
         Ok(())
     }
 
@@ -462,7 +473,22 @@ impl RsStore {
     // Fold validation
     // ------------------------------------------------------------------
 
-    pub fn validate_fold(&self, ws: RsWorkingSetId, tokens: u32) -> Result<(), RsError> {
+    /// `buffer_tokens` / `intent` are the prepare's own, and they decide what
+    /// the fold is allowed to reach. Page capacity is NOT the answer: a
+    /// two-page buffer holding three live tokens would happily accept a fold
+    /// of six and gather three slab tokens that were never written, which is
+    /// silent corruption of the recurrent state rather than a visible
+    /// failure. The live extent is `buffer_fill` for a REPLAY (a commit
+    /// gathers only what is already buffered) and `start + len` for a WRITE
+    /// (the fire's own new tokens are part of the extended space it folds
+    /// through). Capacity is still checked, because the gather is physical.
+    pub fn validate_fold(
+        &self,
+        ws: RsWorkingSetId,
+        tokens: u32,
+        buffer_tokens: Option<(u32, u32)>,
+        intent: RsBufferIntent,
+    ) -> Result<(), RsError> {
         let entry = self.entry(ws)?;
         if tokens == 0 {
             return Err(RsError::FoldZero);
@@ -479,6 +505,21 @@ impl RsStore {
             .saturating_sub(entry.buffer_head);
         if tokens > capacity {
             return Err(RsError::FoldExceedsBuffer { tokens, capacity });
+        }
+        // `buffer_fill` may be an UPPER BOUND (a device-resident fold length
+        // was never read back). Bounding against it is then permissive but
+        // still sound -- it can only admit a fold the exact fill would too.
+        let live = match (intent, buffer_tokens) {
+            (RsBufferIntent::Write, Some((start, len))) => {
+                entry.buffer_fill.max(start.saturating_add(len))
+            }
+            _ => entry.buffer_fill,
+        };
+        if tokens > live {
+            return Err(RsError::FoldExceedsBuffer {
+                tokens,
+                capacity: live,
+            });
         }
         Ok(())
     }
@@ -523,7 +564,7 @@ impl RsStore {
         buffer_intent: RsBufferIntent,
     ) -> Result<RsPreparedWrite, RsError> {
         if let Some(tokens) = fold_tokens {
-            self.validate_fold(ws, tokens)?;
+            self.validate_fold(ws, tokens, buffer_tokens, buffer_intent)?;
         }
         self.prepare(ws, write_state, fold_tokens, buffer_tokens, buffer_intent, None)
     }
@@ -540,7 +581,7 @@ impl RsStore {
         granted: &mut Vec<RsSlotId>,
     ) -> Result<RsPreparedWrite, RsError> {
         if let Some(tokens) = fold_tokens {
-            self.validate_fold(ws, tokens)?;
+            self.validate_fold(ws, tokens, buffer_tokens, buffer_intent)?;
         }
         self.prepare(
             ws,
@@ -600,7 +641,7 @@ impl RsStore {
         ws: RsWorkingSetId,
         tokens: u32,
     ) -> Result<RsPreparedWrite, RsError> {
-        self.validate_fold(ws, tokens)?;
+        self.validate_fold(ws, tokens, None, RsBufferIntent::Replay)?;
         self.prepare(ws, true, Some(tokens), None, RsBufferIntent::Replay, None)
     }
 
@@ -773,7 +814,12 @@ impl RsStore {
     /// interior boundary). An interior fold is neither.
     pub fn commit_folds(&mut self, folds: RsPendingFolds) {
         let epoch = self.seq;
-        for (ws, tokens, is_bound) in folds.0 {
+        for RsPendingFold {
+            ws,
+            tokens,
+            len_is_bound: is_bound,
+        } in folds.0
+        {
             if is_bound {
                 // `tokens` is only an upper bound here. Advancing by it would
                 // drop pages the fold may still need; advancing by less would
@@ -849,7 +895,11 @@ impl RsStore {
             .as_ref()
             .and_then(|state| state.fold_tokens)
         {
-            folds.0.push((ws, tokens, prepared.fold_len_is_bound));
+            folds.0.push(RsPendingFold {
+                ws,
+                tokens,
+                len_is_bound: prepared.fold_len_is_bound,
+            });
         }
     }
 
