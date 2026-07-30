@@ -130,21 +130,26 @@ fn bind_window(
     pool_pages: u32,
     readout: &[u32],
 ) -> Result<()> {
+    // `count == 0` is a row that spans NO TOKENS: "compute nothing, only move
+    // the recurrent boundary". The emptiness lives in the token CSR, not in
+    // the channels -- the IR has no zero-sized tensor -- so every per-token
+    // channel carries one unreferenced element and the indptr says zero.
+    let pad = count.max(1);
     let embed_indptr = Channel::from(vec![0u32, count]).named("w_embed_indptr");
     let positions =
-        Channel::from((first_pos..first_pos + count).collect::<Vec<_>>()).named("w_positions");
+        Channel::from((first_pos..first_pos + pad).collect::<Vec<_>>()).named("w_positions");
     let pages = Channel::from((0..pool_pages).collect::<Vec<_>>()).named("w_pages");
     let page_indptr =
         Channel::from(vec![0u32, (first_pos + count).div_ceil(PAGE_T).min(pool_pages)])
             .named("w_page_indptr");
     let w_slot = Channel::from(
-        (first_pos..first_pos + count)
+        (first_pos..first_pos + pad)
             .map(|p| p / PAGE_T)
             .collect::<Vec<_>>(),
     )
     .named("w_w_slot");
     let w_off = Channel::from(
-        (first_pos..first_pos + count)
+        (first_pos..first_pos + pad)
             .map(|p| p % PAGE_T)
             .collect::<Vec<_>>(),
     )
@@ -327,32 +332,31 @@ fn build_verify(
 ///
 /// Two consequences shape this function.
 ///
-/// **It re-runs the FULL window, not the accepted prefix.** The prefix is not
-/// host-known here, so its length cannot appear in the KV geometry. That costs
-/// nothing: the verify fire already wrote KV for this exact span with these
-/// exact tokens at these exact positions, so re-writing it is bit-identical,
-/// and the rejected tail is overwritten by the next window regardless. The
-/// recurrent side ignores these tokens completely and replays the buffered
-/// activations, folding only as far as the device says.
+/// **It carries NO TOKENS AT ALL.** It used to re-run the full window, because
+/// the accepted prefix is not host-known here and so its length could not
+/// appear in the KV geometry -- and re-running was free, the verify fire
+/// having already written KV for exactly that span. But a row spanning no
+/// tokens says the same thing without the pretence: this fire computes
+/// nothing, it only moves the boundary. That is now also the ONLY way to say
+/// it, since the planner reads a pure replay off the empty row rather than
+/// off `fold-len <= buffered`.
 ///
 /// **It is CONSTRUCTED before the verify fire is submitted.** A channel a
 /// later pass consumes as a descriptor must be claimed by that pass first, or
 /// the producer infers it as a terminal host-read output and the two
 /// declarations conflict at bind. Construction order, not annotation.
 fn build_commit(
-    ws: &WorkingSet,
     rs: &RsWorkingSet,
-    window: &[i32],
+    ws: &WorkingSet,
     seq_len: u32,
     max_pages: u32,
     fold_len: &Channel,
 ) -> Result<ForwardPass> {
-    let count = window.len() as u32;
-    let toks = Channel::from(window.to_vec()).named("c_toks");
+    let toks = Channel::from(vec![0i32]).named("c_toks");
 
     let fwd = ForwardPass::new();
-    let kv_len = Channel::from(vec![seq_len + count]).named("c_kv_len");
-    bind_window(&fwd, ws, &toks, &kv_len, seq_len, count, max_pages, &[])?;
+    let kv_len = Channel::from(vec![seq_len]).named("c_kv_len");
+    bind_window(&fwd, ws, &toks, &kv_len, seq_len, 0, max_pages, &[])?;
 
     fwd.recurrent_with(std::slice::from_ref(rs), fold_len, ..)
         .map_err(|e| format!("commit recurrent binding: {e}"))?;
@@ -424,8 +428,6 @@ async fn main(input: String) -> Result<String> {
         rs.alloc_buffer(window_slabs)
             .map_err(|e| format!("rs.alloc_buffer: {e}"))?;
 
-        let window: Vec<i32> = std::iter::once(seed).chain(draft.iter().copied()).collect();
-
         // The device path builds the COMMIT first -- it must claim `clen`
         // before the verify fire that fills it is submitted -- then enqueues
         // both fires back to back with nothing awaited in between. The host
@@ -440,9 +442,7 @@ async fn main(input: String) -> Result<String> {
         // also take its KV pages out of the working set ahead of the verify's,
         // which is a different trace.
         let device_commit = match &clen_ch {
-            Some(ch) => Some(build_commit(
-                &ws, &rs, &window, seq_len, max_pages, ch,
-            )?),
+            Some(ch) => Some(build_commit(&rs, &ws, seq_len, max_pages, ch)?),
             None => None,
         };
 
@@ -504,7 +504,7 @@ async fn main(input: String) -> Result<String> {
             // The host path can only trace its commit NOW, with `clen` in
             // hand, which is exactly the round-trip the device path removes.
             let fold = Channel::from(vec![clen as u32]).named("c_fold_len");
-            let pass = build_commit(&ws, &rs, &window[..clen], seq_len, max_pages, &fold)?;
+            let pass = build_commit(&rs, &ws, seq_len, max_pages, &fold)?;
             pass.submit(&pipeline)
                 .map_err(|e| format!("commit submit: {e}"))?;
         }

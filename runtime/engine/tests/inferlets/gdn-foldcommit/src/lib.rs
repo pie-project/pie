@@ -124,6 +124,37 @@ impl Arm {
         Ok(fwd)
     }
 
+    /// A fire whose row spans NO TOKENS.
+    ///
+    /// The IR has no zero-sized tensor (`Shape::new` refuses a 0 dim), so the
+    /// emptiness cannot live in the channels. It lives where it belongs
+    /// anyway: in the GEOMETRY. Every indptr declares a span of zero, and the
+    /// channels carry one unreferenced element to stay well-formed.
+    fn build_empty_fire(&self, fold_len: &Channel, tag: &str) -> Result<ForwardPass> {
+        let base = self.pos;
+        let ps = self.page_size;
+        let ch = |v: Vec<u32>| Channel::from(v);
+
+        let fwd = ForwardPass::new();
+        fwd.embed(&Channel::from(vec![0i32]), &ch(vec![0, 0]))?;
+        fwd.attention(
+            &self.ws,
+            ..,
+            ..,
+            &ch(vec![base]),
+            &ch((0..self.max_pages).collect()),
+            &ch(vec![0, base.div_ceil(ps)]),
+            &ch(vec![0]),
+            &ch(vec![0]),
+            &ch(vec![0]),
+            None,
+        )?;
+        fwd.recurrent_with(std::slice::from_ref(&self.rs), fold_len, ..)
+            .map_err(|e| format!("{tag} recurrent binding: {e}"))?;
+        fwd.epilogue(|| {});
+        Ok(fwd)
+    }
+
     /// One fire over `toks`.
     ///
     /// `buffered` is `Some((buffer_start, fold_len))`: the fire scatters its
@@ -564,6 +595,120 @@ async fn fold_inside_new_tokens(prompt: &[u32]) -> Result<String> {
     Ok(result)
 }
 
+/// The fold boundary lands BEHIND the fire's own new tokens.
+///
+/// `0 < n < b` with `t > 0` — the shape the north star needs. A speculative
+/// decoder learns window `k`'s accepted length only after window `k`'s verify
+/// has run, so it cannot fold that prefix in the fire that produced it. It
+/// CAN fold it in the fire that writes window `k + 1`, which collapses the
+/// steady state from two fires per window to one.
+///
+/// The planner used to refuse this, not deliberately but by accident: it
+/// classified a row as a pure commit whenever `n <= b`, and this shape
+/// satisfies that condition while meaning the opposite. Now that a commit is
+/// a row carrying NO TOKENS, `n <= b` is free to mean what it says, and the
+/// driver's 2R-segment split already handles a cut anywhere in `(0, b + t)`.
+///
+/// Arm A folds behind while writing ahead in ONE fire. Arm B does the same
+/// two things in two fires — an empty commit, then a plain append. Their
+/// written tokens' logits and their resulting state must both agree. Arm C
+/// folds a DIFFERENT prefix in its single fire; folding is a no-op, so it too
+/// must converge, and the assertion is that the boundary's placement never
+/// changes what the context means.
+async fn fold_behind_new_tokens(prompt: &[u32]) -> Result<String> {
+    const W: usize = 4;
+    const T: usize = 3;
+    const BEHIND: u32 = 2;
+
+    let n = prompt.len() as u32;
+    let pipe = Pipeline::new();
+    let probe = WorkingSet::new();
+    let max_pages = (n + 3 * (W + T) as u32).div_ceil(probe.page_size());
+    drop(probe);
+
+    let (mut a, g0) = Arm::open(prompt, max_pages, &pipe).await?;
+    let (mut b, _) = Arm::open(prompt, max_pages, &pipe).await?;
+    let (mut c, _) = Arm::open(prompt, max_pages, &pipe).await?;
+
+    // Distinct tokens: a window of repeats makes a fold LENGTH nearly
+    // unobservable, which has silently emptied three earlier tests.
+    let window = wit_model::encode("alpha beta gamma delta");
+    let window: Vec<u32> = if window.len() < W {
+        vec![g0 as u32; W]
+    } else {
+        window[..W].to_vec()
+    };
+    let ahead = wit_model::encode("epsilon zeta eta");
+    let ahead: Vec<u32> = if ahead.len() < T {
+        vec![g0 as u32; T]
+    } else {
+        ahead[..T].to_vec()
+    };
+    let slabs = ((W + T) as u32 + 1).div_ceil(a.rs_page).max(1);
+
+    for (arm, tag) in [(&a, "A"), (&b, "B"), (&c, "C")] {
+        arm.rs
+            .alloc_buffer(slabs)
+            .map_err(|e| format!("{tag} alloc_buffer: {e}"))?;
+    }
+
+    // Every arm buffers the same window, folding nothing.
+    for (arm, tag) in [(&mut a, "A"), (&mut b, "B"), (&mut c, "C")] {
+        arm.fire(&window, Some((0, 0)), &pipe, tag).await?;
+        arm.pos += W as u32;
+    }
+
+    // ── Arm A: fold BEHIND while writing AHEAD, in one fire ───────────────
+    let (_, a_ahead) = a.fire(&ahead, Some((0, BEHIND)), &pipe, "A-behind").await?;
+    a.pos += T as u32;
+
+    // ── Arm B: the same two things, in two fires ──────────────────────────
+    b.build_empty_fire(&Channel::from(vec![BEHIND]), "B-commit")?
+        .submit(&pipe)
+        .map_err(|e| format!("B-commit submit: {e}"))?;
+    let (_, b_ahead) = b.fire(&ahead, Some((0, 0)), &pipe, "B-append").await?;
+    b.pos += T as u32;
+
+    // ── Arm C: a different boundary behind ────────────────────────────────
+    let (_, c_ahead) = c.fire(&ahead, Some((0, 1)), &pipe, "C-behind").await?;
+    c.pos += T as u32;
+
+    let next = vec![g0 as u32];
+    let mut nexts = Vec::new();
+    for (arm, tag) in [(&mut a, "A"), (&mut b, "B"), (&mut c, "C")] {
+        arm.fire(&next, Some((0, u32::MAX)), &pipe, tag).await?;
+        arm.pos += 1;
+        let live = arm.rs.buffer_size();
+        if live > 0 {
+            arm.rs
+                .free_buffer(&(0..live).collect::<Vec<_>>())
+                .map_err(|e| format!("{tag} free_buffer: {e}"))?;
+        }
+        let (_, peak) = arm.fire(&next, None, &pipe, tag).await?;
+        arm.pos += 1;
+        nexts.push(peak);
+    }
+    pipe.close();
+
+    let agree = close(a_ahead, b_ahead)
+        && close(a_ahead, c_ahead)
+        && close(nexts[0], nexts[1])
+        && close(nexts[0], nexts[2]);
+    let result = format!(
+        "behind a_ahead={a_ahead:.4} b_ahead={b_ahead:.4} c_ahead={c_ahead:.4} \
+a_next={:.4} b_next={:.4} c_next={:.4} agree={}",
+        nexts[0],
+        nexts[1],
+        nexts[2],
+        if agree { "yes" } else { "no" }
+    );
+    eprintln!("[GDN_FOLDCOMMIT] {result}");
+    if !agree {
+        return Err(result);
+    }
+    Ok(result)
+}
+
 /// The fold boundary lands STRICTLY INSIDE the fire's own new tokens.
 ///
 /// `b < n < b + t` — the last RS position the planner refused. `commit_len`
@@ -653,7 +798,7 @@ async fn fold_interior_boundary(prompt: &[u32]) -> Result<String> {
     // buffered span. Its own token is a placeholder at a position the drain
     // fire immediately overwrites; the recurrence ignores those rows and
     // replays the buffer instead.
-    d.build_fire(&[g0 as u32], Some(&Channel::from(vec![HALF])), "D-commit", || {})?
+    d.build_empty_fire(&Channel::from(vec![HALF]), "D-commit")?
         .submit(&pipe)
         .map_err(|e| format!("D-commit submit: {e}"))?;
 
@@ -705,6 +850,85 @@ async fn fold_interior_boundary(prompt: &[u32]) -> Result<String> {
     );
     eprintln!("[GDN_FOLDCOMMIT] {result}");
     if !ok {
+        return Err(result);
+    }
+    Ok(result)
+}
+
+/// A commit that carries NO TOKENS OF ITS OWN.
+///
+/// The pure replay -- "I have nothing to compute, only move the boundary" --
+/// said directly instead of inferred. The planner used to read it off the
+/// incidental fact that `fold-len <= buffered`, which is why a fire could not
+/// fold BEHIND its own new tokens while writing them: the same condition
+/// meant two different things. A row spanning zero tokens says it
+/// unambiguously, and it is the only way to say it -- the IR has no
+/// zero-sized tensor, so the emptiness lives in the token CSR and the
+/// channels carry an unreferenced tail.
+///
+/// Arm A folds half its buffer through an empty row; arm B folds nothing at
+/// all. Folding is a no-op, so they must decode identically.
+async fn empty_commit(prompt: &[u32]) -> Result<String> {
+    const T: usize = 4;
+    const HALF: u32 = 2;
+
+    let n = prompt.len() as u32;
+    let pipe = Pipeline::new();
+    let probe = WorkingSet::new();
+    let max_pages = (n + 2 * T as u32 + 4).div_ceil(probe.page_size());
+    drop(probe);
+
+    let (mut a, g0) = Arm::open(prompt, max_pages, &pipe).await?;
+    let (mut b, _) = Arm::open(prompt, max_pages, &pipe).await?;
+    let cont: Vec<u32> = vec![g0 as u32; T];
+    let slabs = (T as u32 + 1).div_ceil(a.rs_page).max(1);
+
+    for arm in [&a, &b] {
+        arm.rs
+            .alloc_buffer(slabs)
+            .map_err(|e| format!("alloc_buffer: {e}"))?;
+    }
+    a.fire(&cont, Some((0, 0)), &pipe, "A-append").await?;
+    a.pos += T as u32;
+    b.fire(&cont, Some((0, 0)), &pipe, "B-append").await?;
+    b.pos += T as u32;
+
+    // The whole point: a fire whose row carries no tokens at all.
+    a.build_empty_fire(&Channel::from(vec![HALF]), "A-commit")?
+        .submit(&pipe)
+        .map_err(|e| format!("A-commit submit: {e}"))?;
+    // Arm B does not fold. Folding is a no-op -- it trades optionality for
+    // memory, never meaning -- so a context that folded half its buffer and
+    // one that folded none of it must decode identically. If the empty row
+    // were doing anything other than moving the boundary, this is where it
+    // would show.
+
+    let next = vec![g0 as u32];
+    let mut peaks = Vec::new();
+    for (arm, tag) in [(&mut a, "A"), (&mut b, "B")] {
+        arm.fire(&next, Some((0, u32::MAX)), &pipe, tag).await?;
+        arm.pos += 1;
+        let live = arm.rs.buffer_size();
+        if live > 0 {
+            arm.rs
+                .free_buffer(&(0..live).collect::<Vec<_>>())
+                .map_err(|e| format!("{tag} free_buffer: {e}"))?;
+        }
+        let (_, peak) = arm.fire(&next, None, &pipe, tag).await?;
+        arm.pos += 1;
+        peaks.push(peak);
+    }
+    pipe.close();
+
+    let agree = close(peaks[0], peaks[1]);
+    let result = format!(
+        "emptycommit folded={HALF} a_next={:.4} b_next={:.4} agree={}",
+        peaks[0],
+        peaks[1],
+        if agree { "yes" } else { "no" }
+    );
+    eprintln!("[GDN_FOLDCOMMIT] {result}");
+    if !agree {
         return Err(result);
     }
     Ok(result)
@@ -789,7 +1013,7 @@ async fn device_fold_length(prompt: &[u32]) -> Result<String> {
     // The commit sits one window PAST the append, so build it at that
     // position and put the arm back until the append has actually run.
     a.pos += W;
-    let a_commit = a.build_fire(&[g0 as u32], Some(&n_dev), "A-commit", || {})?;
+    let a_commit = a.build_empty_fire(&n_dev, "A-commit")?;
     a.pos -= W;
     a_append
         .submit(&pipe)
@@ -825,10 +1049,10 @@ async fn device_fold_length(prompt: &[u32]) -> Result<String> {
     a_commit
         .submit(&pipe)
         .map_err(|e| format!("A-commit submit: {e}"))?;
-    b.build_fire(&[g0 as u32], Some(&Channel::from(vec![expected])), "B-commit", || {})?
+    b.build_empty_fire(&Channel::from(vec![expected]), "B-commit")?
         .submit(&pipe)
         .map_err(|e| format!("B-commit submit: {e}"))?;
-    c.build_fire(&[g0 as u32], Some(&Channel::from(vec![other])), "C-commit", || {})?
+    c.build_empty_fire(&Channel::from(vec![other]), "C-commit")?
         .submit(&pipe)
         .map_err(|e| format!("C-commit submit: {e}"))?;
     for arm in [&mut a, &mut b, &mut c] {
@@ -893,6 +1117,18 @@ async fn main(input: String) -> Result<String> {
         let prompt = wit_model::encode("hello world");
         let prompt: Vec<u32> = if prompt.is_empty() { vec![0] } else { prompt };
         return mixed_positions(&prompt).await;
+    }
+
+    if input.trim() == "behind" {
+        let prompt = wit_model::encode("hello world");
+        let prompt: Vec<u32> = if prompt.is_empty() { vec![0] } else { prompt };
+        return fold_behind_new_tokens(&prompt).await;
+    }
+
+    if input.trim() == "empty" {
+        let prompt = wit_model::encode("hello world");
+        let prompt: Vec<u32> = if prompt.is_empty() { vec![0] } else { prompt };
+        return empty_commit(&prompt).await;
     }
 
     if input.trim() == "device" {

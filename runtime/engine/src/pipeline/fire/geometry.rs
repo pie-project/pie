@@ -682,6 +682,29 @@ pub fn map_geometry_evaluated(
     let lanes = g.qo_indptr.len().saturating_sub(1);
     g.position_ids = required_u32(Port::Positions)?;
 
+    // The token CSR is the truth about how many rows this fire computes; a
+    // per-token channel may carry elements past its end. That is not
+    // sloppiness to tolerate but the only way to say "this lane spans no
+    // tokens": the IR has no zero-sized tensor (`Shape::new` refuses a 0
+    // dim), so an empty span cannot be expressed by an empty channel. It is
+    // expressed in the geometry, and the unreferenced tail is dropped here.
+    let spanned = g.qo_indptr.last().copied().unwrap_or(0) as usize;
+    for (port, tokens) in [
+        (Port::EmbedTokens, &mut g.token_ids),
+        (Port::Positions, &mut g.position_ids),
+    ] {
+        if tokens.len() < spanned {
+            return Err(EvaluatedGeometryError::BadValue {
+                port,
+                reason: format!(
+                    "the token CSR spans {spanned} rows but only {} were supplied",
+                    tokens.len()
+                ),
+            });
+        }
+        tokens.truncate(spanned);
+    }
+
     // Read-out rows distribute over lanes as LANE-RELATIVE indices (the
     // multi-row wire contract; identical to the envelope template). Absent
     // readout samples each lane's last row.
@@ -689,9 +712,14 @@ pub fn map_geometry_evaluated(
         Some(readout) => readout,
         None => {
             g.readout_defaulted = true;
+            // A lane spanning no rows has no last row to sample. That is
+            // not a degenerate case to paper over: a row carrying zero
+            // tokens is how a guest says "compute nothing, only move the
+            // recurrent boundary".
             g.qo_indptr
                 .windows(2)
-                .map(|lane| lane[1].saturating_sub(1))
+                .filter(|lane| lane[1] > lane[0])
+                .map(|lane| lane[1] - 1)
                 .collect()
         }
     };

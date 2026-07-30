@@ -119,6 +119,21 @@ pie_native::LaunchView build_launch_view(const pie_native::StepLaunch& launch) {
             }
         }
     }
+    // A row spanning NO TOKENS is how a guest says "compute nothing, only
+    // move the recurrent boundary". This driver has no replay path at all
+    // (the read refusal above), so such a row would run an empty forward and
+    // move nothing, leaving the host believing a fold happened.
+    if (launch.rs_fold_lens.len != 0 &&
+        launch.qo_indptr.len == launch.rs_fold_lens.len + 1) {
+        for (std::size_t r = 0; r < launch.rs_fold_lens.len; ++r) {
+            if (launch.qo_indptr.ptr[r + 1] == launch.qo_indptr.ptr[r]) {
+                throw std::runtime_error(
+                    "this driver cannot replay a buffered prefix, so a request "
+                    "row carrying no tokens would fold nothing; fold in a fire "
+                    "that computes");
+            }
+        }
+    }
     // And likewise for a MIXED fire, where one row folds its recurrence while
     // another only buffers. The two shapes are the same dispatch and differ
     // only in whether the state persists, which CUDA expresses as a per-row

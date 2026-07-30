@@ -287,3 +287,46 @@ async fn the_fold_boundary_can_land_inside_a_fires_own_tokens() -> Result<()> {
     eprintln!("[gdn-foldcommit] {result}");
     Ok(())
 }
+
+/// A commit that carries no tokens of its own.
+///
+/// "I have nothing to compute, only move the boundary" said DIRECTLY. The
+/// planner currently infers it from `fold-len <= buffered`, which is an
+/// incidental fact rather than a statement of intent — and it is the reason a
+/// fire cannot fold BEHIND its own new tokens while writing them, since that
+/// shape satisfies the same condition while meaning the opposite. A row with
+/// zero tokens is unambiguous, and it frees `n <= b` to mean what it says.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires CUDA + a local Qwen3.5 checkout"]
+async fn a_commit_may_carry_no_tokens_of_its_own() -> Result<()> {
+    let result = run_foldcommit("empty")
+        .await?
+        .map_err(|error| anyhow::anyhow!("empty commit failed: {error}"))?;
+    anyhow::ensure!(
+        result.contains("agree=yes"),
+        "a commit with an empty row must land the same folded state as one \
+         padded with a placeholder token: {result}"
+    );
+    eprintln!("[gdn-foldcommit] {result}");
+    Ok(())
+}
+
+/// A fire folds BEHIND its own new tokens while writing them.
+///
+/// The shape the fused speculative loop needs: window `k`'s accepted prefix
+/// is only known after window `k` ran, so it is folded by the fire that
+/// writes window `k + 1`. One fire per window in steady state instead of two.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires CUDA + a local Qwen3.5 checkout"]
+async fn a_fire_may_fold_behind_the_tokens_it_is_writing() -> Result<()> {
+    let result = run_foldcommit("behind")
+        .await?
+        .map_err(|error| anyhow::anyhow!("fold-behind failed: {error}"))?;
+    anyhow::ensure!(
+        result.contains("agree=yes"),
+        "folding a prefix in the same fire that appends past it must match \
+         doing the two in sequence: {result}"
+    );
+    eprintln!("[gdn-foldcommit] {result}");
+    Ok(())
+}

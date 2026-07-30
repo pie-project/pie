@@ -519,7 +519,26 @@ fn rs_plan_for(
         let (b, t) = (buffered[row], row_tokens[row]);
         let n = fold_len[row].min(b + t);
         fold_tokens[row] = n;
-        let here = if n == 0 {
+        let here = if t == 0 {
+            // The guest said, in the only way that cannot be confused with
+            // anything else, "I have nothing to compute; only move the
+            // boundary". A row spanning no tokens is a PURE REPLAY: the
+            // linear layers gather the buffered prefix [0, n) out of the
+            // slabs and return before the output projection.
+            //
+            // This used to be inferred from `n <= b`, which is an incidental
+            // property of a commit rather than a statement of intent -- and
+            // it is exactly the condition a fire folding BEHIND its own new
+            // tokens satisfies while meaning the opposite. Reading the
+            // emptiness of the row directly frees `n <= b` to mean what it
+            // says.
+            if n == 0 {
+                return Err(format!(
+                    "request row {row} carries no tokens and folds nothing: it neither                      computes nor moves the boundary, so the fire has no effect. A row                      spanning no tokens means \"replay the buffered prefix and stop\",                      which needs a fold length"
+                ));
+            }
+            Position::Commit
+        } else if n == 0 {
             // A pure append. Still the extended layout when b > 0, but the
             // folded boundary does not move.
             Position::Buffer
@@ -535,12 +554,6 @@ fn rs_plan_for(
             } else {
                 Position::Buffer
             }
-        } else if n <= b {
-            // A pure commit: the LINEAR layers ignore this fire's own token
-            // rows entirely and replay the buffered prefix [0, n) straight
-            // from the slabs. (The rows still exist -- the attention layers
-            // and the KV write need them.)
-            Position::Commit
         } else {
             // Everything else runs over the extended `[b | t]` layout, which
             // IS the row's buffer token space. The driver replays the b
@@ -549,8 +562,10 @@ fn rs_plan_for(
             // scatters all t new ones into the buffer, and snapshots the
             // recurrent state at extended token n. So one shape covers the
             // append (n == 0), the fold through a non-empty buffer
-            // (n == b + t), and the boundary landing strictly INSIDE this
-            // fire's own new tokens (b < n < b + t).
+            // (n == b + t), the boundary landing strictly INSIDE this fire's
+            // own new tokens (b < n < b + t), and the boundary landing BEHIND
+            // them (n < b) -- folding a previous window's accepted prefix in
+            // the very fire that writes the next one.
             //
             // The interior case is not `commit_len`: that TRUNCATES the
             // sequence, and a fire folding at an interior boundary still owes

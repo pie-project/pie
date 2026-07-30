@@ -1897,6 +1897,92 @@ carried the precise version; the imprecise restatement is what shipped. Where a
 rule has a mechanical form -- here `mode == BufferFold` -- the code should name
 that form and not a paraphrase of it.
 
+#### 10.2.9 A commit is a row that carries no tokens — LANDED
+
+The planner had three RS positions: `Fold`, `Buffer`, `Commit`. The first two
+mix freely; the third does not, because a commit replays buffered activations
+out of the slabs instead of computing them. It was selected by the condition
+`fold_len <= buffered`.
+
+That condition is not a statement of intent. It is an *incidental property* of
+a commit that happens to hold — and it is also, exactly, the property of a
+fire that folds BEHIND its own new tokens while writing them. One condition,
+two opposite meanings, and the planner had no way to tell them apart. So the
+shape the north star needs (`0 < n < b` with `t > 0`) was refused not by a
+decision but by an ambiguity.
+
+**A row that spans no tokens is the unambiguous form.** "I have nothing to
+compute; only move the boundary", said directly. It adds no flag, no field and
+no WIT surface: the guest simply declares an empty token span.
+
+##### Why it has to live in the geometry, not in a channel
+
+The obvious encoding — an empty token channel — does not exist. `Shape::new`
+(`compiler/ir/src/types.rs`) refuses a `0` dim: the IR has no zero-sized
+tensor, and adding one is a change to the whole type system for the sake of
+one degenerate row. `bind_window` in `mtp-native-verify` had already hit this
+for `readout` and worked around it by *omitting the port entirely*.
+
+The emptiness therefore lives where it already belongs: in `qo_indptr`. Every
+per-token channel carries at least one element, and the CSR says how many of
+them this fire actually spans. Two consequences, both now enforced host-side
+in `pipeline/fire/geometry.rs`:
+
+  * **The token CSR is the truth.** `token_ids` and `position_ids` are
+    truncated to `qo_indptr.last()`, and refused if they are shorter. The ABI
+    requires `qo_indptr[rows] == token_ids.len` exactly (`validate_csr`), so
+    the unreferenced tail must be dropped before the wire, not on it.
+  * **An empty lane samples nothing.** The defaulted readout was
+    `lane[1].saturating_sub(1)` per lane, which for `[0, 0)` yields row 0 —
+    outside the lane — and the sampling CSR then failed to partition. Empty
+    lanes are now filtered out of the default.
+
+##### What the classifier became
+
+```
+t == 0            -> Commit   (and n == 0 is refused: the fire would do nothing)
+n == 0            -> Buffer
+n == b + t, b == 0-> Fold
+otherwise         -> Buffer
+```
+
+`n <= b` no longer appears. Every row that computes anything is a `Buffer`
+row with a cut at `n`, and the driver's 2R-segment split (§10.2.8) already
+handles a cut anywhere in `(0, b + t)` — including behind the new tokens. So
+**fold-behind-while-writing-ahead came for free**; it was only ever blocked by
+the classifier.
+
+##### The blast radius is the point
+
+Every existing commit passed a *placeholder token* to satisfy the old shape,
+and under the new rule that token is no longer ignored — it is a real token,
+buffered and written to KV. Three GPU tests changed their answer the moment
+the classifier did, which is precisely the evidence that the old encoding was
+carrying meaning it never declared. All commit sites (`gdn-foldcommit`'s four
+arms, `mtp-native-verify`'s `build_commit`) now use the empty row, and
+`build_commit` lost its "re-run the full window" apology along with it.
+
+Verified: `cuda_gdn_foldcommit` 8/8 one process each, including the new
+`a_commit_may_carry_no_tokens_of_its_own` (an empty-row fold vs no fold at
+all — folding is a no-op, so they must agree) and
+`a_fire_may_fold_behind_the_tokens_it_is_writing` (one fire vs two);
+`mtp_logits_value_verify` and `a_device_resident_fold_length_decodes_identically`
+decode identically to before. Metal refuses a zero-token row.
+
+##### What still stands between this and one fire per window
+
+Everything the *planner* needed is now in place. What remains is not a
+programming-model question but a device-geometry one, and it is worth stating
+precisely so it is not rediscovered:
+
+A window's buffer holds `[accepted | rejected]`. Folding `clen` in the NEXT
+window's fire leaves the REJECTED tail sitting between the boundary and the
+new tokens, and the recurrence would replay it. Removing it needs the buffer
+READ LENGTH to be device-resolved from the same number as the fold length —
+`clen` — since the host may not know it. That is one more substitution in
+`batch_compose::append_rs`, in the same place `PIE_RS_FLAG_FOLD_LEN_DEVICE`
+already substitutes, and it is the last piece.
+
 ## 11. The boundary model — ratified after Step B, supersedes §3.3/§3.4 fold modes
 
 Step B shipped the fold modes as three sibling methods because that is the
