@@ -571,3 +571,66 @@ class TheAllowedSetIsTheMask(unittest.TestCase):
         _, batch, _ = self._filled(size=2)
         with self.assertRaises(ValueError):
             batch.allowed(0)
+
+
+class TheShortlistIsWhicheverListIsShorter(unittest.TestCase):
+    """`shortlist` must name the forbidden tokens when those are fewer.
+
+    A row inside a JSON string body admits nearly the whole vocabulary, so its
+    allowed list is useless and its forbidden list is small. Getting the two
+    the wrong way round would hand a sampler the complement of what the
+    grammar permits, which is the worst possible failure and would still look
+    like a plausible list.
+    """
+
+    def _batch(self, admits_most: bool):
+        _requirements()
+        wide = [bytes([byte]) for byte in range(256)]
+        engine = gpugrammar.Engine(wide)
+        grammar = engine.compile_json_schema(
+            json.dumps(
+                {
+                    "type": "object",
+                    "properties": {"s": {"type": "string"}},
+                    "required": ["s"],
+                }
+            )
+        )
+        batch = engine.batch(size=3)
+        batch.set_grammars([grammar] * 3)
+        matcher = grammar.matcher(0)
+        if admits_most:
+            # Into the string body, where almost every byte is a legal
+            # continuation.
+            for piece in b'{"s": "':
+                matcher.accept_token(piece)
+        batch.set_matchers([matcher] * 3)
+        return engine, batch, batch.fill_mask(), len(wide)
+
+    def _check(self, admits_most):
+        _, batch, mask, size = self._batch(admits_most)
+        ids, counts, kind = batch.raw.compact(4096, both=True)
+        torch.cuda.synchronize()
+        words = mask.view(batch.size, -1).cpu()
+        for row in range(batch.size):
+            bits = [
+                token
+                for token in range(size)
+                if (int(words[row][token >> 5]) >> (token & 31)) & 1
+            ]
+            wanted = bits if int(kind[row]) == 0 else [
+                token for token in range(size) if token not in set(bits)
+            ]
+            self.assertEqual(ids[row, : int(counts[row])].tolist(), wanted)
+            # And it really is the shorter one.
+            self.assertLessEqual(int(counts[row]) * 2, size + 1)
+        return int(kind[0]), int(counts[0])
+
+    def test_a_structural_position_lists_what_it_admits(self):
+        kind, _ = self._check(admits_most=False)
+        self.assertEqual(kind, 0)
+
+    def test_a_string_body_lists_what_it_forbids(self):
+        kind, count = self._check(admits_most=True)
+        self.assertEqual(kind, 1)
+        self.assertGreater(count, 0)

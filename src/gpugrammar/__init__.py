@@ -248,6 +248,28 @@ class Batch:
         """
         return self._batch.fill_mask()
 
+    def shortlist(self, capacity: int = 8192):
+        """The shorter of the two lists per sequence: `(ids, counts, kind)`.
+
+        `kind[i]` is 0 when `ids[i]` names the tokens the sequence *admits* and
+        1 when it names the ones it *forbids*. Which one is smaller is a
+        property of where the parse is, and it is bimodal rather than spread:
+        a structural position admits a few hundred of a hundred and fifty
+        thousand, a position inside a string body forbids a few thousand, and
+        almost nothing sits between them.
+
+        This is what makes a constrained step cheap at *both* ends. Gathering
+        the allowed set is 8.9x the mask path when the set is small and 0.30x
+        when it is not, so a caller that always gathers is worse off than one
+        that never does. Here the short list is always short, so applying the
+        constraint is always a small operation.
+
+        Decided on the device. A caller choosing for itself would have to read
+        a count on the host, which is the synchronisation this engine exists
+        not to make.
+        """
+        return self._batch.compact(capacity, both=True)
+
     def allowed(self, capacity: int = 4096):
         """The allowed tokens as sorted ids, `(ids, counts)`, on the device.
 
@@ -265,7 +287,8 @@ class Batch:
 
         Call after `fill_mask` or `step`; it reads the mask those produced.
         """
-        return self._batch.compact(capacity)
+        ids, counts, _ = self._batch.compact(capacity)
+        return ids, counts
 
     def advance(self, tokens) -> None:
         """Consume one sampled token per sequence, `(batch,)` on the device.

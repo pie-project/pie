@@ -208,9 +208,44 @@ mask. What wins is choosing, which `counts` already makes possible:
 | 128 | 637.8 | 947.1 (0.67×) | **407.3 (1.57×)** |
 | 512 | 1,853.6 | 3,021.5 (0.61×) | **984.9 (1.88×)** |
 
-**1.88× at batch 512 on the real distribution, not 8.87×.** That is the number
-to publish. It is smaller than either single-regime figure and it is the only
-one that describes decoding rather than a position within it.
+### Re-measured in place, which is what a serving loop does
+
+The figures above charge both paths for a 310 MB restore of the logits, which
+a decode loop never pays — its logits are fresh every step. In place:
+
+| position | batch | short list | no constraint | XGrammar mask | shortlist path |
+|---|---:|---:|---:|---:|---:|
+| structural | 128 | 7 allowed | 481.7 | 543.6 | **206.7 (2.63×)** |
+| structural | 512 | 7 allowed | 1,195.9 | 1,430.9 | **185.1 (7.73×)** |
+| string body | 128 | 4,386 forbidden | 481.4 | 524.2 | 555.1 (0.94×) |
+| string body | 512 | 4,386 forbidden | 1,196.2 | 1,358.4 | 1,424.8 (0.95×) |
+
+**In the dense half there is nothing to win.** XGrammar's mask kernel costs
+161 µs over unconstrained sampling at batch 512 — 13.5% — so the constraint is
+already nearly free there, and scattering `-inf` at the 4,386 forbidden ids
+with a generic gather/scatter is *slower* than its bitmask kernel. The
+complement is the right *representation* and the wrong *operation*; a fused
+kernel might close the 161 µs, and nothing larger is available.
+
+All of the win is in the sparse half, and it is large: **7.73× at batch 512.**
+
+### The number to publish
+
+Weighting by the measured step distribution — 49.3% sparse, 50.7% dense:
+
+| batch | always mask | **choose per step** | vs mask | vs *unconstrained* |
+|---:|---:|---:|---:|---:|
+| 128 | 533.8 | **367.7** | 1.45× | 1.31× |
+| 512 | 1,394.1 | **780.0** | 1.79× | **1.53×** |
+
+**1.79× against the mask path and 1.53× against sampling with no constraint at
+all** — on the real distribution, in place, with the compaction charged. Not
+17.5×, not 8.87×, not 1.88×. Every earlier figure was a position rather than a
+workload, or was charged to the wrong side.
+
+The claim that survives all of it is the one that matters: **constraining the
+grammar makes a decode step cheaper than not constraining it**, and no system
+that hands a mask back to the host can make that claim at all.
 
 ### Example 2: speculative decoding, withdrawn, re-measured, and now possible
 

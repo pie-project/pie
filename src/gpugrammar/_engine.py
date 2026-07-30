@@ -5111,7 +5111,9 @@ class DeviceBatch:
             return self.mask
         return self._fill()
 
-    def compact(self, capacity: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def compact(
+        self, capacity: int, both: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """The mask as sorted token ids, `(ids, counts)`, both on the device.
 
         A sampler that is handed a vocabulary-wide mask sorts, scans and
@@ -5138,6 +5140,9 @@ class DeviceBatch:
             self._allowed_count = torch.zeros(
                 self.batch, dtype=torch.int32, device=self.device
             )
+            self._allowed_kind = torch.zeros(
+                self.batch, dtype=torch.int32, device=self.device
+            )
         _gpugrammar.cuda_launch(
             "gg_compact",
             self.batch,
@@ -5147,10 +5152,16 @@ class DeviceBatch:
                 self.mask.data_ptr(),
                 self._allowed.data_ptr(),
                 self._allowed_count.data_ptr(),
+                self._allowed_kind.data_ptr(),
             ],
-            [self.grammar.mask_words, capacity, self.grammar.vocab_size],
+            [
+                self.grammar.mask_words,
+                capacity,
+                self.grammar.vocab_size,
+                1 if both else 0,
+            ],
         )
-        return self._allowed, self._allowed_count
+        return self._allowed, self._allowed_count, self._allowed_kind
 
     def _count_and_scan(self, grammar, rows, counts, offsets, skip, unit) -> None:
         """Count each configuration's work and prefix-sum it.

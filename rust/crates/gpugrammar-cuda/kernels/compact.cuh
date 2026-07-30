@@ -55,7 +55,12 @@ __device__ __forceinline__ int32_t block_scan(int32_t value, int32_t* room,
 
 }  // namespace gg
 
-/// Every token a sequence admits, as sorted ids rather than as a bitmask.
+/// Every token a sequence admits - or every one it forbids, whichever list is
+/// shorter - as sorted ids rather than as a bitmask.
+///
+/// `kind[i]` says which: 0 for the allowed list, 1 for the forbidden one. With
+/// `both` off the allowed list is always emitted, which is what a caller that
+/// only wants to gather asks for.
 ///
 /// `counts` is written whatever `capacity` is, so a caller always learns the
 /// true size of the set even when the buffer could not hold it. A sequence
@@ -72,15 +77,55 @@ extern "C" __global__ void gg_compact(
     const int32_t* mask,
     int32_t* allowed,
     int32_t* counts,
+    int32_t* kind,
     int32_t mask_words,
     int32_t capacity,
-    int32_t vocabulary) {
+    int32_t vocabulary,
+    int32_t both) {
     int32_t sequence = blockIdx.x;
     const int32_t* row = mask + (int64_t)sequence * mask_words;
 
     __shared__ int32_t room[32];
     __shared__ int32_t total;
+    __shared__ int32_t admits;
     int32_t written = 0;
+
+    // Which of the two lists is the short one. A state inside a JSON string
+    // body admits 147,346 of 151,669 tokens: the allowed list is the whole
+    // vocabulary and the forbidden list is four thousand. A structural state
+    // is the mirror. Nothing sits in between - the distribution over real
+    // documents is bimodal, half under four thousand and half over a hundred
+    // and forty thousand - so *one* of the two lists is always small, and
+    // which one is a property of the row that the row can decide for itself.
+    //
+    // Decided here rather than by the caller, because the caller would have to
+    // read a count on the host to decide and that is the synchronisation this
+    // engine exists not to make.
+    int32_t inverted = 0;
+    if (both) {
+        int32_t mine = 0;
+        for (int32_t at = threadIdx.x; at < mask_words; at += blockDim.x) {
+            int32_t word = row[at];
+            int32_t over = vocabulary - at * 32;
+            if (over < 32) {
+                word &= over <= 0 ? 0 : (int32_t)((1u << over) - 1u);
+            }
+            mine += __popc(word);
+        }
+        __syncthreads();
+        int32_t held = gg::block_scan(mine, room, &total);
+        (void)held;
+        if (threadIdx.x == 0) {
+            admits = total;
+        }
+        __syncthreads();
+        inverted = admits * 2 > vocabulary;
+        if (threadIdx.x == 0) {
+            kind[sequence] = inverted;
+        }
+    } else if (threadIdx.x == 0) {
+        kind[sequence] = 0;
+    }
 
     for (int32_t tile = 0; tile < mask_words; tile += blockDim.x) {
         int32_t at = tile + threadIdx.x;
@@ -90,9 +135,8 @@ extern "C" __global__ void gg_compact(
             // The last word of a row runs past the vocabulary; the bits above
             // it are nobody's token and must not be handed to a sampler.
             int32_t over = vocabulary - at * 32;
-            if (over < 32) {
-                word &= over <= 0 ? 0 : (int32_t)((1u << over) - 1u);
-            }
+            int32_t live = over >= 32 ? -1 : (over <= 0 ? 0 : (int32_t)((1u << over) - 1u));
+            word = (inverted ? ~word : word) & live;
         }
         int32_t mine = __popc(word);
         __syncthreads();
