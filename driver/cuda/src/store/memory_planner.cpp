@@ -1,4 +1,5 @@
 #include "memory_planner.hpp"
+#include "../batch/planner_calibration.hpp"
 #include "planner_profile_cache.hpp"
 #include "recurrent_state_cache.hpp"
 #include "kv_cache.hpp"
@@ -834,20 +835,31 @@ CudaMemoryPlan plan_cuda_memory(
     // measure stay zero and match anything.
     bool selected_from_profile = false;
     auto best_it = candidates.end();
-    if (auto_profile) {
+    // Two guards beyond `auto_profile`, matching the fingerprint overrides
+    // below:
+    //   * `forced_prefill == 0` — an explicit `PIE_CUDA_PREFILL_TOKENS` is an
+    //     operator instruction. Every other override defers to it; the cache
+    //     must too, or a stale file silently discards what was asked for.
+    //   * not calibrating — the sweep can only explore up to the arena this
+    //     plan builds. Seeding a calibration run from its OWN previous answer
+    //     makes the budget a one-way ratchet: once it lowers, no later sweep
+    //     can look above the lowered value. A calibration run therefore plans
+    //     from the rule path, so every sweep starts from the same ceiling.
+    const bool use_profile_cache =
+        auto_profile && forced_prefill == 0 && !planner_calibration_requested();
+    if (use_profile_cache) {
         std::string cache_error;
         const auto measured =
             planner_profile_cache_lookup(
                 make_planner_profile_key(prop, hf, tp_size, kv_format),
                 &cache_error);
-        if (!cache_error.empty() && verbose) {
+        if (!cache_error.empty()) {
             std::cerr << "[pie-driver-cuda] memory planner: ignored profile "
                       << "cache " << planner_profile_cache_path().string()
                       << ": " << cache_error << "\n";
         }
         if (measured.has_value()) {
-            for (auto it = candidates.begin(); it != candidates.end(); ++it) {
-                if (!measured->policy_profile.empty() &&
+            for (auto it = candidates.begin(); it != candidates.end(); ++it) {                if (!measured->policy_profile.empty() &&
                     it->policy_profile != measured->policy_profile) {
                     continue;
                 }
@@ -871,6 +883,18 @@ CudaMemoryPlan plan_cuda_memory(
                     best_it = it;
                     selected_from_profile = true;
                 }
+            }
+            if (!selected_from_profile) {
+                // A measured entry that lands on no feasible candidate is the
+                // worst failure mode this cache has: it looks exactly like no
+                // cache at all. Say so rather than falling through silently.
+                std::cerr << "[pie-driver-cuda] memory planner: profile cache "
+                          << "pins max_forward_tokens="
+                          << measured->max_forward_tokens
+                          << " but no candidate layout matches it; falling "
+                          << "back to the scored rule. Delete "
+                          << planner_profile_cache_path().string()
+                          << " to re-calibrate.\n";
             }
         }
     }

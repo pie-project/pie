@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <numeric>
 #include <span>
 #include <string>
@@ -228,22 +229,53 @@ std::size_t calibrate_memory_planner(BatchEngine& engine,
     // of the device and the model and can be cached. If it moves with L, then
     // no startup sweep can pick a budget without knowing the workload, and
     // saying so is more useful than picking one anyway.
+    // The ladder of budgets we are scoring. Kept separate from `measured`
+    // because a budget does NOT get its own measurement once it saturates —
+    // see `effective_requests` below.
+    std::vector<int> budgets;
+    for (int N = R; N <= max_tokens; N *= 2) budgets.push_back(N);
+    if (budgets.empty()) return refuse("no budget rung fits the built arena");
+
+    // At prompt length L a budget can only fund `min(R, N/L)` requests. Once
+    // `N/L >= R` the REQUEST cap binds, not the budget, and every larger budget
+    // executes a byte-identical shape. Measuring those rungs again does not
+    // measure the budget — it measures the host's noise, and then the maximin
+    // below compares noise against noise. So each distinct shape is measured
+    // once and every saturated budget reads that same sample.
+    const auto effective_requests = [R](int budget, int L) {
+        return std::min(R, budget / L);
+    };
     for (int L : {1, 4, 16, 64, 256}) {
-        for (int N = R; N <= max_tokens; N *= 2) {
-            const int requests = std::min(R, N / L);
+        int last_requests = 0;
+        for (int N : budgets) {
+            const int requests = effective_requests(N, L);
             if (requests < 1) continue;
             const int tokens = requests * L;
             if (tokens > max_tokens) continue;
+            if (requests == last_requests) continue;  // saturated: same shape
+            last_requests = requests;
             Timing timing;
             std::string error;
-            if (!run_shape(engine, requests, L, iters, warmup, &timing,
-                           &error)) {
+            bool ok = false;
+            try {
+                ok = run_shape(engine, requests, L, iters, warmup, &timing,
+                               &error);
+            } catch (const std::exception& e) {
+                // A CUDA error is sticky, so one bad rung poisons the rest of
+                // the sweep AND the process. Calibration is an opt-in
+                // measurement; it must not be able to fail `load_model`.
+                std::cerr << "[pie-driver-cuda] planner calibration: N=" << N
+                          << " L=" << L << " threw (" << e.what()
+                          << "); abandoning the sweep\n";
+                return refuse("a rung faulted");
+            }
+            if (!ok) {
                 std::cerr << "[pie-driver-cuda] planner calibration: N=" << N
                           << " L=" << L << " failed (" << error << ")\n";
                 continue;
             }
             PlannerShapeSample sample;
-            sample.max_forward_tokens = N;
+            sample.max_forward_tokens = tokens;
             sample.max_forward_requests = requests;
             sample.tokens_per_request = L;
             sample.step_ms = timing.mean_ms;
@@ -270,20 +302,22 @@ std::size_t calibrate_memory_planner(BatchEngine& engine,
     // budget's rate by the best rate seen at that same prompt length, then
     // score the budget by its WORST normalised rate. A budget only wins if it
     // is near-best for every prompt length, so no workload assumption enters.
-    std::vector<int> budgets;
-    for (const auto& s : measured) budgets.push_back(s.max_forward_tokens);
-    std::sort(budgets.begin(), budgets.end());
-    budgets.erase(std::unique(budgets.begin(), budgets.end()), budgets.end());
-
     std::vector<int> prompt_lens;
     for (const auto& s : measured) prompt_lens.push_back(s.tokens_per_request);
     std::sort(prompt_lens.begin(), prompt_lens.end());
     prompt_lens.erase(std::unique(prompt_lens.begin(), prompt_lens.end()),
                       prompt_lens.end());
 
-    const auto rate_at = [&measured](int budget, int L) -> const PlannerShapeSample* {
+    // A budget resolves to the shape it can actually fund at this prompt
+    // length, so saturated budgets all read the one sample that was taken
+    // there instead of each carrying an independent noise draw.
+    const auto rate_at = [&measured, &effective_requests](
+                             int budget, int L) -> const PlannerShapeSample* {
+        const int requests = effective_requests(budget, L);
+        if (requests < 1) return nullptr;
         for (const auto& s : measured) {
-            if (s.max_forward_tokens == budget && s.tokens_per_request == L) {
+            if (s.tokens_per_request == L &&
+                s.max_forward_requests == requests) {
                 return &s;
             }
         }
@@ -295,7 +329,12 @@ std::size_t calibrate_memory_planner(BatchEngine& engine,
     double chosen_tolerance = 0.0;
     std::vector<std::pair<int, double>> budget_scores;
     for (int budget : budgets) {
-        double worst = 1.0;
+        // Seeded above 1.0 so the argmin is recorded even when the budget is
+        // best at EVERY prompt length. Leaving it at 1.0 meant a dominant
+        // budget never entered the branch below, so its tolerance stayed 0 and
+        // the arena-saving step-down could never fire — exactly the case where
+        // it matters most.
+        double worst = std::numeric_limits<double>::max();
         double worst_rel_sigma = 0.0;
         bool complete = true;
         for (int L : prompt_lens) {
