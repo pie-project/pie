@@ -52,6 +52,17 @@ pub fn cuda_toml_for(snapshot_path: &str) -> String {
     // Context::save/open over `/scratch`) work; harmless for fs-free inferlets.
     let scratch = std::env::temp_dir().join("pie-cuda-test-scratch");
     let _ = std::fs::create_dir_all(&scratch);
+    // Weight streaming is off unless asked for. A run with it on must produce
+    // the same tokens as a run with it off, which is the whole point of
+    // comparing across two processes -- one boot per process is the harness's
+    // standing constraint.
+    let streaming = if std::env::var("PIE_CUDA_TEST_STREAM_EXPERTS").as_deref() == Ok("1") {
+        let gb = std::env::var("PIE_CUDA_TEST_EXPERT_CACHE_GB")
+            .unwrap_or_else(|_| "0".to_string());
+        format!("stream_routed_experts = true\nexpert_cache_gb = {gb}\n")
+    } else {
+        String::new()
+    };
     format!(
         "[server]\n\
          host = \"127.0.0.1\"\n\
@@ -74,7 +85,8 @@ pub fn cuda_toml_for(snapshot_path: &str) -> String {
          \n\
          [model.driver.options]\n\
          gpu_mem_utilization = 0.90\n\
-         memory_profile = \"latency\"\n",
+         memory_profile = \"latency\"\n\
+         {streaming}",
         scratch = scratch.display(),
     )
 }
@@ -116,6 +128,15 @@ pub fn load_curated_inferlet(name: &str) -> (Vec<u8>, Manifest, ProgramName) {
     let wasm_path = dir
         .join("target/wasm32-wasip2/release")
         .join(format!("{}.wasm", name.replace('-', "_")));
+    // `tests/inferlets` is a cargo workspace, so a member's artifact lands in
+    // the shared target dir one level up, not beside its manifest. Non-members
+    // build in place. Accept either rather than caring which this one is.
+    let wasm_path = if wasm_path.exists() {
+        wasm_path
+    } else {
+        dir.join("../target/wasm32-wasip2/release")
+            .join(format!("{}.wasm", name.replace('-', "_")))
+    };
     let wasm =
         std::fs::read(&wasm_path).unwrap_or_else(|e| panic!("read {}: {e}", wasm_path.display()));
     let manifest =
