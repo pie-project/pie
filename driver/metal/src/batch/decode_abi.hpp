@@ -138,6 +138,11 @@ enum class SdpaPaged : uint8_t {
     KvPageIndptr = 8,    // IoSlot::KvPageIndptr
     PageSize = 9, NKvHeads = 10, Scale = 11,
     AttnMask = 12, AttnMaskStride = 13, AttnMaskEnabled = 14,
+    // Sliding window, in positions. <=0 is full attention. Full-attention
+    // families must still BIND it -- one kernel serves both, so an unbound slot
+    // is a window read out of uninitialized memory, which is wrong attention
+    // rather than a crash.
+    Window = 15,
 };
 
 // rms_single_row: group=(row/N_READS), grid=(1,1,1). Buffer 3 is a packed

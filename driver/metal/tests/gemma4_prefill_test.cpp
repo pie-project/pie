@@ -18,6 +18,8 @@
 #include "mtl4_context.hpp"
 #include "batch/decode_abi.hpp"
 #include "model/gemma4/kernels.hpp"
+#include "kernels/decode_psos.hpp"
+#include "model/qwen3_5/decode_dispatch_mb.hpp"
 
 using namespace pie::metal;
 using namespace pie::metal::gemma4;
@@ -262,6 +264,151 @@ void the_elementwise_kernels_are_already_batched(RawMetalContext& ctx,
     expect(bad == 0, "geglu_tanh over M*N equals M launches over N");
 }
 
+// The paged kernel and the contiguous one must agree.
+//
+// Two independent implementations of sliding attention is exactly the situation
+// that produces a model which works at decode and quietly does something else at
+// prefill. With one kv head and one page, the paged layout
+// [pages, page_size, kv_heads, D] and the contiguous [kv_heads, max_ctx, D]
+// coincide, so the same bytes can be fed to both and the outputs compared.
+void the_paged_kernel_agrees_with_the_contiguous_one(RawMetalContext& ctx,
+                                                     const Gemma4Psos& psos,
+                                                     const DecodeStepPsos& base,
+                                                     const MultiBatchPsos& mb,
+                                                     int window, const char* label) {
+    std::printf("[paged == contiguous, window=%s]\n", label);
+    const int M = 4;
+    const int n_keys = 600;
+
+    SlotHandle q = ctx.heap_alloc(std::size_t(M) * kHeads * kD * 2);
+    SlotHandle k = ctx.heap_alloc(std::size_t(kMaxCtx) * kD * 2);
+    SlotHandle v = ctx.heap_alloc(std::size_t(kMaxCtx) * kD * 2);
+    SlotHandle out = ctx.heap_alloc(std::size_t(M) * kHeads * kD * 2 * 2);
+    SlotHandle pos = ctx.heap_alloc(std::size_t(M) * 4);
+    SlotHandle req = ctx.heap_alloc(std::size_t(M) * 4);
+    SlotHandle pidx = ctx.heap_alloc(4);
+    SlotHandle pptr = ctx.heap_alloc(8);
+    SlotHandle mask_on = ctx.heap_alloc(std::size_t(M));
+    SlotHandle mask = ctx.heap_alloc(std::size_t(M));
+    if (!q.valid() || !k.valid() || !out.valid() || !pptr.valid()) {
+        expect(false, "fixture allocates");
+        return;
+    }
+    auto* qp = static_cast<std::uint16_t*>(q.contents());
+    for (int i = 0; i < M * kHeads * kD; ++i) qp[i] = to_bf16(noise(i + 5) * 0.5f);
+    auto* kp = static_cast<std::uint16_t*>(k.contents());
+    auto* vp = static_cast<std::uint16_t*>(v.contents());
+    for (int i = 0; i < kMaxCtx * kD; ++i) {
+        kp[i] = to_bf16(noise(i + 7777) * 0.5f);
+        vp[i] = to_bf16(noise(i + 4242) * 0.5f);
+    }
+    std::memset(out.contents(), 0, out.size);
+    // Row m holds the token at position n_keys-M+m, matching the contiguous
+    // kernel's own N-(M-1-m).
+    for (int m = 0; m < M; ++m) {
+        static_cast<std::int32_t*>(pos.contents())[m] = n_keys - M + m;
+        static_cast<std::int32_t*>(req.contents())[m] = 0;
+    }
+    static_cast<std::uint32_t*>(pidx.contents())[0] = 0;
+    static_cast<std::uint32_t*>(pptr.contents())[0] = 0;
+    static_cast<std::uint32_t*>(pptr.contents())[1] = 1;
+    std::memset(mask_on.contents(), 0, mask_on.size);  // no mask
+    std::memset(mask.contents(), 1, mask.size);
+
+    const int q_stride = kHeads * kD;
+    const std::size_t second = std::size_t(M) * kHeads * kD;
+
+    auto i32 = [&](int ord, std::uint8_t idx, std::int32_t val) {
+        SlotHandle sl = ctx.heap_alloc(4);
+        *static_cast<std::int32_t*>(sl.contents()) = val;
+        ctx.arg_bind_ordinal(ord, idx, sl);
+    };
+    auto f32 = [&](int ord, std::uint8_t idx, float val) {
+        SlotHandle sl = ctx.heap_alloc(4);
+        *static_cast<float*>(sl.contents()) = val;
+        ctx.arg_bind_ordinal(ord, idx, sl);
+    };
+    auto u64 = [&](int ord, std::uint8_t idx, std::uint64_t val) {
+        SlotHandle sl = ctx.heap_alloc(8);
+        *static_cast<std::uint64_t*>(sl.contents()) = val;
+        ctx.arg_bind_ordinal(ord, idx, sl);
+    };
+
+    // Paged, into the first half of `out`.
+    {
+        using B = bind::SdpaPaged;
+        const int o = 700;
+        ctx.arg_bind_ordinal(o, (std::uint8_t)B::Q, q);
+        ctx.arg_bind_ordinal(o, (std::uint8_t)B::KPages, k);
+        ctx.arg_bind_ordinal(o, (std::uint8_t)B::VPages, v);
+        ctx.arg_bind_ordinal(o, (std::uint8_t)B::Out, out);
+        i32(o, (std::uint8_t)B::GqaFactor, kHeads / kKvHeads);
+        ctx.arg_bind_ordinal(o, (std::uint8_t)B::PositionIds, pos);
+        ctx.arg_bind_ordinal(o, (std::uint8_t)B::ReqOfToken, req);
+        ctx.arg_bind_ordinal(o, (std::uint8_t)B::KvPageIndices, pidx);
+        ctx.arg_bind_ordinal(o, (std::uint8_t)B::KvPageIndptr, pptr);
+        i32(o, (std::uint8_t)B::PageSize, kMaxCtx);
+        i32(o, (std::uint8_t)B::NKvHeads, kKvHeads);
+        f32(o, (std::uint8_t)B::Scale, 1.0f / std::sqrt(float(kD)));
+        ctx.arg_bind_ordinal(o, (std::uint8_t)B::AttnMask, mask);
+        u64(o, (std::uint8_t)B::AttnMaskStride, 1);
+        ctx.arg_bind_ordinal(o, (std::uint8_t)B::AttnMaskEnabled, mask_on);
+        i32(o, (std::uint8_t)B::Window, window);
+    }
+    // Contiguous, into the second half.
+    {
+        using B = bind::SdpaSliding;
+        const int o = 701;
+        ctx.arg_bind_ordinal(o, (std::uint8_t)B::Q, q);
+        ctx.arg_bind_ordinal(o, (std::uint8_t)B::K, k);
+        ctx.arg_bind_ordinal(o, (std::uint8_t)B::V, v);
+        ctx.arg_bind_ordinal(o, (std::uint8_t)B::Out, out, second * 2);
+        i32(o, (std::uint8_t)B::GqaFactor, kHeads / kKvHeads);
+        i32(o, (std::uint8_t)B::N, n_keys);
+        u64(o, (std::uint8_t)B::KHeadStride, std::uint64_t(kMaxCtx) * kD);
+        u64(o, (std::uint8_t)B::KSeqStride, kD);
+        u64(o, (std::uint8_t)B::VHeadStride, std::uint64_t(kMaxCtx) * kD);
+        u64(o, (std::uint8_t)B::VSeqStride, kD);
+        f32(o, (std::uint8_t)B::Scale, 1.0f / std::sqrt(float(kD)));
+        i32(o, (std::uint8_t)B::Window, window);
+        i32(o, (std::uint8_t)B::QRowStride, q_stride);
+        i32(o, (std::uint8_t)B::ORowStride, q_stride);
+    }
+    ctx.make_resident();
+
+    ctx.run_step([&](StepEncoder& se) {
+        Grid g; Threadgroup t;
+        sdpa_paged_dispatch(kHeads, M, g, t);
+        se.set_pso(mb.sdpa_paged);
+        se.set_argtable_ordinal(700);
+        se.dispatch(g, t);
+        se.barrier();
+    });
+    ctx.run_step([&](StepEncoder& se) {
+        Grid g; Threadgroup t;
+        sdpa_sliding_dispatch(kHeads, g, t, M);
+        se.set_pso(psos.sdpa_swa_d256);
+        se.set_argtable_ordinal(701);
+        se.dispatch(g, t);
+        se.barrier();
+    });
+
+    const auto* op = static_cast<const std::uint16_t*>(out.contents());
+    int nz = 0, bad = 0;
+    float worst = 0.0f;
+    for (int i = 0; i < M * kHeads * kD; ++i) {
+        nz += op[i] != 0 ? 1 : 0;
+        const float a = from_bf16(op[i]), b = from_bf16(op[second + i]);
+        worst = std::fabs(a - b) > worst ? std::fabs(a - b) : worst;
+        bad += op[i] != op[second + i] ? 1 : 0;
+    }
+    std::printf("    (nonzero %d/%d, mismatched %d, worst %.3e)\n", nz,
+                M * kHeads * kD, bad, worst);
+    expect(nz > 0, "the paged kernel wrote output");
+    expect(bad == 0, "paged sliding == contiguous sliding, element for element");
+    (void)base;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -285,6 +432,17 @@ int main(int argc, char** argv) {
     a_prefill_row_matches_the_decode_step_that_would_have_made_it(*ctx, psos, 512, "512");
     a_prefill_row_matches_the_decode_step_that_would_have_made_it(*ctx, psos, 0, "0 (full)");
     the_elementwise_kernels_are_already_batched(*ctx, psos);
+
+    DecodeStepPsos base;
+    MultiBatchPsos mb;
+    std::string berr;
+    if (load_decode_psos(*ctx, kernels_dir, base, /*with_argmax=*/true, &berr) &&
+        load_multibatch_psos(*ctx, kernels_dir, mb, /*with_d512=*/false, &berr)) {
+        the_paged_kernel_agrees_with_the_contiguous_one(*ctx, psos, base, mb, 512, "512");
+        the_paged_kernel_agrees_with_the_contiguous_one(*ctx, psos, base, mb, 0, "0 (full)");
+    } else {
+        expect(false, "the shared PSOs compile: " + berr);
+    }
 
     std::printf("\n==== gemma4_prefill_test: %s ====\n",
                 failures == 0 ? "all passed" : "FAILURES");

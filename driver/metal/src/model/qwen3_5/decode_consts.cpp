@@ -224,6 +224,10 @@ int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                 bind_const<int>(ctx, ord, (uint8_t)bind::SdpaPaged::NKvHeads,
                                 g.n_kv_heads, &count);
                 bind_const<float>(ctx, ord, (uint8_t)bind::SdpaPaged::Scale, sdpa_scale, &count);
+                // qwen3.5's attention layers are all full, but the kernel they
+                // share now takes a window. Binding 0 says so; leaving it
+                // unbound would read a window out of uninitialized memory.
+                bind_const<int>(ctx, ord, (uint8_t)bind::SdpaPaged::Window, 0, &count);
                 break;
 
             case Kernel::AttnGate:
