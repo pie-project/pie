@@ -9,6 +9,7 @@
 // download stays green while the machine that has it gets the real answer.
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -105,22 +106,23 @@ bool tap_for(const gemma4::Dispatch& d, const Gemma4Geometry& g, Tap& out) {
         case Kind::RopeK:            out = {"rope_k",       0, kv_dim};    return true;
         case Kind::Sdpa:             out = {"sdpa",         3, q_dim};     return true;
         case Kind::QmvO:             out = {"o_proj",       4, g.hidden};  return true;
-        case Kind::PostAttnNorm:     out = {"attn_postnorm", 2, g.hidden}; return true;
-        case Kind::AttnResidual:     out = {"attn_resid",   2, g.hidden};  return true;
+        // The fused kinds produce the RESIDUAL, so they are named for it; the
+        // norm they contain is no longer a tensor anything can observe.
+        case Kind::PostAttnResidual: out = {"attn_resid",   2, g.hidden};  return true;
 
         case Kind::FfnNorm:          out = {"ffn_norm",     2, g.hidden};  return true;
         case Kind::QmvGate:          out = {"gate_proj",    4, inter};     return true;
         case Kind::QmvUp:            out = {"up_proj",      4, inter};     return true;
         case Kind::GegluTanh:        out = {"geglu",        2, inter};     return true;
         case Kind::QmvDown:          out = {"down_proj",    4, g.hidden};  return true;
-        case Kind::PostFfnNorm:      out = {"ffn_postnorm", 2, g.hidden};  return true;
-        case Kind::FfnResidual:      out = {"ffn_resid",    2, g.hidden};  return true;
+        case Kind::PostFfnResidual:  out = {"ffn_resid",    2, g.hidden};  return true;
 
         case Kind::PleGateGemv:      out = {"ple_gate",     4, g.per_layer_emb_dim}; return true;
         case Kind::PleGeglu:         out = {"ple_act",      2, g.per_layer_emb_dim}; return true;
         case Kind::PleProjLayerGemv: out = {"ple_back",     4, g.hidden};  return true;
-        case Kind::PleNorm:          out = {"ple_norm",     2, g.hidden};  return true;
-        case Kind::PleResidual:      out = {"ple_resid",    2, g.hidden};  return true;
+        // Norm, residual add and the learned gain in one -- so its output is
+        // exactly mlx-lm's `layer_out`.
+        case Kind::PleResidualScaled: out = {"layer_out",   2, g.hidden};  return true;
         case Kind::LayerScalar:      out = {"layer_out",    2, g.hidden};  return true;
 
         case Kind::FinalRms:         out = {"final_norm",   2, g.hidden};  return true;
@@ -131,8 +133,7 @@ bool tap_for(const gemma4::Dispatch& d, const Gemma4Geometry& g, Tap& out) {
 }
 
 void dump_gemma4_taps(const std::vector<gemma4::Dispatch>& dag, const Gemma4Geometry& g,
-                      const ScratchColoring& coloring, const std::vector<SlotHandle>& pool) {
-    const int n_pool = static_cast<int>(pool.size());
+                      const ScratchColoring& coloring, const std::vector<SlotHandle>& pool) {    const int n_pool = static_cast<int>(pool.size());
     auto color_of = [&](std::size_t di, std::uint8_t bind_index) {
         for (const auto& sb : coloring.per_dispatch[di]) {
             if (sb.bind_index == bind_index) return int(sb.color);
@@ -161,6 +162,49 @@ void dump_gemma4_taps(const std::vector<gemma4::Dispatch>& dag, const Gemma4Geom
     }
 }
 
+// How many barriers the step is made of, as a measurement rather than a claim.
+//
+// The shipped walk drops a barrier inside a concurrency run; `all` forces one
+// after every dispatch and `none` drops them entirely. `none` is NOT correct --
+// it races every RAW edge in the DAG -- but the three numbers together price
+// what barrier drain actually costs on this step, which is the only honest way
+// to decide whether fusing dispatches is worth anything. Phase 51 priced
+// qwen3.5's at 5.4 us each by the same method.
+enum class BarrierMode { Runs, All, None };
+
+BarrierMode barrier_mode_from_env() {
+    const char* e = std::getenv("PIE_G4_BARRIERS");
+    if (e == nullptr) return BarrierMode::Runs;
+    if (std::string(e) == "all") return BarrierMode::All;
+    if (std::string(e) == "none") return BarrierMode::None;
+    return BarrierMode::Runs;
+}
+
+int encode_gemma4_variant(StepEncoder& se, const std::vector<gemma4::Dispatch>& dag,
+                          const Gemma4Geometry& g, const DecodeStepPsos& base,
+                          const Gemma4Psos& g4, BarrierMode mode) {
+    const std::vector<int> run_ends = gemma4_run_ends(dag);
+    int barriers = 0;
+    for (std::size_t i = 0; i < dag.size(); ++i) {
+        const gemma4::Dispatch& d = dag[i];
+        Grid grid;
+        Threadgroup tg;
+        launch_shape(d, g, grid, tg);
+        se.set_pso(pso_for(d, base, g4));
+        se.set_argtable_ordinal(d.ordinal);
+        se.dispatch(grid, tg);
+        const bool last = i + 1 >= dag.size();
+        bool want = last || run_ends[i] == static_cast<int>(i);
+        if (mode == BarrierMode::All) want = true;
+        if (mode == BarrierMode::None) want = last;
+        if (want) {
+            se.barrier();
+            ++barriers;
+        }
+    }
+    return barriers;
+}
+
 // How many argument-table slots each kind's kernel actually reads.
 //
 // The counterpart of `decode_step_mb_test.cpp`'s `required_slots`, and the gate
@@ -176,14 +220,14 @@ int required_slots(Kind k) {
         case Kind::LmHead:
         case Kind::PleProjGemv: case Kind::PleGateGemv:
         case Kind::PleProjLayerGemv:    return 7;
-        case Kind::AttnNorm: case Kind::PostAttnNorm: case Kind::FfnNorm:
-        case Kind::PostFfnNorm: case Kind::FinalRms: case Kind::QNorm:
-        case Kind::KNorm: case Kind::PleNorm: case Kind::PleProjNorm: return 4;
+        case Kind::AttnNorm: case Kind::FfnNorm: case Kind::FinalRms:
+        case Kind::QNorm: case Kind::KNorm: case Kind::PleProjNorm: return 4;
+        case Kind::PostAttnResidual: case Kind::PostFfnResidual: return 5;
+        case Kind::PleResidualScaled: return 6;
         case Kind::VNorm:               return 3;
         case Kind::RopeQ: case Kind::RopeK: return 5;
         case Kind::KvAppend:            return 8;
         case Kind::Sdpa:                return 14;
-        case Kind::AttnResidual: case Kind::FfnResidual: case Kind::PleResidual:
         case Kind::GegluTanh: case Kind::PleGeglu:
         case Kind::LayerScalar: case Kind::PleCombine: return 4;
         case Kind::FinalSoftcap:        return 3;
@@ -382,6 +426,45 @@ int main(int argc, char** argv) {
     if (golden_taps_enabled()) {
         dump_gemma4_taps(dag, g, coloring, b.pool);
         std::printf("    (taps -> %s)\n", golden_tap_dir().c_str());
+    }
+
+    // ── decode rate ──
+    // The same step, timed. `PIE_G4_BENCH=N` runs N more of them past the
+    // prompt and reports the split the plan's measurement discipline asks for:
+    // GPU execution and host encode separately, because at one lane this step
+    // is barrier-bound and the two move independently.
+    if (const char* env = std::getenv("PIE_G4_BENCH"); env != nullptr && *env != '\0') {
+        const int steps = std::max(1, std::atoi(env));
+        const BarrierMode bmode = barrier_mode_from_env();
+        int n_barriers = 0;
+        std::vector<double> gpu, enc;
+        gpu.reserve(std::size_t(steps));
+        enc.reserve(std::size_t(steps));
+        const auto t_begin = std::chrono::steady_clock::now();
+        for (int s = 0; s < steps; ++s) {
+            const int pos = int(ids.size()) + s;
+            *static_cast<std::int32_t*>(b.io[int(IoSlot::TokenId)].contents()) = 106;
+            *static_cast<std::int32_t*>(b.io[int(IoSlot::Position)].contents()) = pos;
+            *static_cast<std::int32_t*>(b.io[int(IoSlot::SeqLen)].contents()) = pos + 1;
+            const StepTiming t = ctx->run_step([&](StepEncoder& se) {
+                n_barriers = encode_gemma4_variant(se, dag, g, base, psos, bmode);
+            });
+            gpu.push_back(t.gpu_exec_ms);
+            enc.push_back(t.encode_ms);
+        }
+        const double wall_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_begin)
+                .count() / double(steps);
+        std::sort(gpu.begin(), gpu.end());
+        std::sort(enc.begin(), enc.end());
+        const double gpu_p50 = gpu[gpu.size() / 2];
+        const double enc_p50 = enc[enc.size() / 2];
+        // Wall is the quantity comparable against another implementation; the
+        // gpu/encode split is what says where to attack.
+        std::printf("    [bench] %d steps, %zu dispatches, %d barriers: gpu %.4f  encode %.4f"
+                    "  wall %.4f ms/tok  %.1f tok/s\n",
+                    steps, dag.size(), n_barriers, gpu_p50, enc_p50, wall_ms,
+                    1000.0 / wall_ms);
     }
 
     // ── did it compute anything? ──

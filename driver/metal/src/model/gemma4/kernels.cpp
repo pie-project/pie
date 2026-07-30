@@ -28,6 +28,8 @@ bool build_gemma4_psos(RawMetalContext& ctx, const std::string& kernels_dir, Gem
         {"embed_gather.metal", "embed_gather_scaled_mb_4bit_bfloat16_gs_64_b_4",
          &out.embed_scaled_mb},
         {"rope.metal", "rope_neox_prop_mb_bfloat16", &out.rope_prop_mb},
+        {"rms_norm.metal", "rms_residual_bfloat16", &out.rms_residual},
+        {"rms_norm.metal", "rms_residual_scaled_bfloat16", &out.rms_residual_scaled},
     };
     for (const Spec& spec : specs) {
         std::string compile_error;

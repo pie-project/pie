@@ -101,21 +101,19 @@ Kernel shared_kind(Kind k) {
         case Kind::PleGateGemv:         return Kernel::G4PleGateGemv;
         case Kind::PleProjLayerGemv:    return Kernel::G4PleProjLayerGemv;
         case Kind::AttnNorm:            return Kernel::Rms;
-        case Kind::PostAttnNorm:        return Kernel::G4AttnPostNorm;
+        case Kind::PostAttnResidual:    return Kernel::G4AttnPostResidual;
         case Kind::FfnNorm:             return Kernel::G4FfnPreNorm;
-        case Kind::PostFfnNorm:         return Kernel::G4FfnPostNorm;
+        case Kind::PostFfnResidual:     return Kernel::G4FfnPostResidual;
+        case Kind::PleResidualScaled:   return Kernel::G4PleResidualScaled;
         case Kind::FinalRms:            return Kernel::FinalRms;
         case Kind::QNorm:               return Kernel::QNorm;
         case Kind::KNorm:               return Kernel::KNorm;
-        case Kind::PleNorm:             return Kernel::G4PleNorm;
+
         case Kind::PleProjNorm:         return Kernel::G4PleProjNorm;
         case Kind::RopeQ:               return Kernel::Rope;
         case Kind::RopeK:               return Kernel::RopeK;
         case Kind::KvAppend:            return Kernel::KvAppend;
         case Kind::Sdpa:                return Kernel::Sdpa;
-        case Kind::AttnResidual:        return Kernel::Residual;
-        case Kind::FfnResidual:         return Kernel::LayerOut;
-        case Kind::PleResidual:         return Kernel::G4PleResidual;
         case Kind::VNorm:               return Kernel::G4VNorm;
         case Kind::GegluTanh:           return Kernel::G4Geglu;
         case Kind::PleGeglu:            return Kernel::G4PleGeglu;
@@ -135,16 +133,12 @@ Kernel shared_kind(Kind k) {
 /// qwen3.5's loader and only has entries for its kinds, so this maps onto those.
 Kernel pso_kind(Kind k) {
     switch (k) {
-        case Kind::PostAttnNorm:
         case Kind::FfnNorm:
-        case Kind::PostFfnNorm:
-        case Kind::PleNorm:
         case Kind::PleProjNorm:      return Kernel::Rms;
         case Kind::PleTokenGather:   return Kernel::EmbedGather;
         case Kind::PleProjGemv:
         case Kind::PleGateGemv:
         case Kind::PleProjLayerGemv: return Kernel::QmvGate;
-        case Kind::PleResidual:      return Kernel::Residual;
         default:                     return shared_kind(k);
     }
 }
@@ -214,6 +208,10 @@ Pso pso_for(const Dispatch& d, const DecodeStepPsos& base, const Gemma4Psos& g4)
         // Partial rotary over the whole head; see rope.metal.
         case Kind::RopeQ:
         case Kind::RopeK:        return g4.rope_prop;
+        // The norm sandwich's closing norm and its residual add, in one.
+        case Kind::PostAttnResidual:
+        case Kind::PostFfnResidual:  return g4.rms_residual;
+        case Kind::PleResidualScaled: return g4.rms_residual_scaled;
         // The one place the attention type picks the pipeline rather than a
         // constant: the two head widths are separate instantiations.
         case Kind::Sdpa:         return d.sliding ? g4.sdpa_swa_d256 : g4.sdpa_swa_d512;
@@ -259,8 +257,9 @@ void launch_shape_mb(const Dispatch& d, const Gemma4Geometry& g, int rows, Grid&
         case Kind::PleTokenGather:
             embed_mb_dispatch(g.n_layers * g.per_layer_emb_dim, N, grid, tg);
             return;
-        case Kind::AttnNorm: case Kind::PostAttnNorm: case Kind::FfnNorm:
-        case Kind::PostFfnNorm: case Kind::FinalRms:
+        case Kind::AttnNorm: case Kind::FfnNorm: case Kind::FinalRms:
+        case Kind::PostAttnResidual: case Kind::PostFfnResidual:
+        case Kind::PleResidualScaled:
             rms_mb_dispatch(g.hidden, 1, N, grid, tg);
             return;
         case Kind::QNorm:
@@ -268,9 +267,6 @@ void launch_shape_mb(const Dispatch& d, const Gemma4Geometry& g, int rows, Grid&
             return;
         case Kind::KNorm:
             rms_mb_dispatch(hd, g.n_kv_heads, N, grid, tg);
-            return;
-        case Kind::PleNorm:
-            rms_mb_dispatch(g.hidden, 1, N, grid, tg);
             return;
         case Kind::PleProjNorm:
             rms_mb_dispatch(g.per_layer_emb_dim, g.n_layers, N, grid, tg);
@@ -290,7 +286,6 @@ void launch_shape_mb(const Dispatch& d, const Gemma4Geometry& g, int rows, Grid&
         case Kind::Sdpa:
             sdpa_sliding_dispatch(g.n_q_heads, grid, tg, N);
             return;
-        case Kind::AttnResidual: case Kind::FfnResidual: case Kind::PleResidual:
         case Kind::LayerScalar:
             elementwise_mb_dispatch(g.hidden, N, grid, tg);
             return;
@@ -343,8 +338,9 @@ void launch_shape(const Dispatch& d, const Gemma4Geometry& g, Grid& grid, Thread
         case Kind::PleTokenGather:
             elementwise_dispatch(g.n_layers * g.per_layer_emb_dim, grid, tg);
             return;
-        case Kind::AttnNorm: case Kind::PostAttnNorm: case Kind::FfnNorm:
-        case Kind::PostFfnNorm: case Kind::FinalRms: {
+        case Kind::AttnNorm: case Kind::FfnNorm: case Kind::FinalRms:
+        case Kind::PostAttnResidual: case Kind::PostFfnResidual:
+        case Kind::PleResidualScaled: {
             const int threads = (g.hidden + 3) / 4;
             grid = Grid{std::uint32_t(threads), 1, 1};
             tg = Threadgroup{std::uint32_t(threads), 1, 1};
@@ -362,14 +358,9 @@ void launch_shape(const Dispatch& d, const Gemma4Geometry& g, Grid& grid, Thread
             tg = Threadgroup{std::uint32_t(threads), 1, 1};
             return;
         }
-        // `post_per_layer_input_norm` is hidden-wide and runs once; only
-        // `per_layer_projection_norm` is the ple_dim-wide one, over n_layers rows.
-        case Kind::PleNorm: {
-            const int threads = (g.hidden + 3) / 4;
-            grid = Grid{std::uint32_t(threads), 1, 1};
-            tg = Threadgroup{std::uint32_t(threads), 1, 1};
-            return;
-        }
+        // Only `per_layer_projection_norm` is the ple_dim-wide norm, over
+        // n_layers rows; `post_per_layer_input_norm` is hidden-wide and now
+        // rides inside `PleResidualScaled`.
         case Kind::PleProjNorm: {
             const int threads = (g.per_layer_emb_dim + 3) / 4;
             grid = Grid{std::uint32_t(threads) * std::uint32_t(g.n_layers), 1, 1};
@@ -397,7 +388,6 @@ void launch_shape(const Dispatch& d, const Gemma4Geometry& g, Grid& grid, Thread
         case Kind::Sdpa:
             sdpa_sliding_dispatch(g.n_q_heads, grid, tg);
             return;
-        case Kind::AttnResidual: case Kind::FfnResidual: case Kind::PleResidual:
         case Kind::LayerScalar:
             elementwise_dispatch(g.hidden, grid, tg);
             return;

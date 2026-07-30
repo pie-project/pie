@@ -337,6 +337,16 @@ enum class PleCombine : uint8_t { Proj = 0, Token = 1, Out = 2, Params = 3 };
 // before the KV write. Distinct from bind::Rms, which always has one.
 enum class VNorm : uint8_t { X = 0, Out = 1, Params = 2 };
 
+// rms_norm.metal `rms_residual` / `rms_residual_scaled` (gemma4): the norm
+// sandwich's second half and the residual add it always precedes, in one
+// dispatch. `bind::Rms`'s four slots verbatim, so the weight bind is shared,
+// plus the residual and (scaled variant only) the learned per-layer gain.
+//
+//   out = rms_norm(x) * w + r            [* s[0]]
+enum class RmsResidual : uint8_t {
+    X = 0, W = 1, Out = 2, Params = 3, Residual = 4, Scalar = 5,
+};
+
 }  // namespace bind
 
 // Argmax kernel constant (argmax.metal:struct ArgmaxParams) — replicated EXACTLY.
@@ -398,6 +408,11 @@ enum class Kernel : uint8_t {
     G4PleProjLayerGemv,  // per_layer_projection
     G4PleNorm,           // post_per_layer_input_norm
     G4PleResidual,       // hidden += ple
+    // Fused: the norm sandwich's closing norm and the residual add it always
+    // precedes. Three per layer, so three barriers a layer at ~5.8 us each.
+    G4AttnPostResidual,  // rms(block)*post_attention_layernorm + resid
+    G4FfnPostResidual,   // rms(block)*post_feedforward_layernorm + resid
+    G4PleResidualScaled, // (rms(ple)*post_per_layer_input_norm + resid)*layer_scalar
 };
 
 // ── Bucketed command-buffer key (relaxes "byte-identical CB" → "byte-identical

@@ -112,10 +112,13 @@ int bind_gemma4_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
         switch (d.kind) {
             // ── norms ──
             case Kind::AttnNorm:
-            case Kind::PostAttnNorm:
             case Kind::FfnNorm:
-            case Kind::PostFfnNorm:
             case Kind::FinalRms:
+            // The fused norm+residual reads the identical RmsParams at the
+            // identical slot; only the buffers after it are new.
+            case Kind::PostAttnResidual:
+            case Kind::PostFfnResidual:
+            case Kind::PleResidualScaled:
                 bind_const<RmsParams>(ctx, ord, (std::uint8_t)bind::Rms::Params,
                                       rms_params(g, g.hidden), &count);
                 break;
@@ -129,10 +132,6 @@ int bind_gemma4_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
             // runs over a ple_dim-wide row (once per layer, on the [n_layers,
             // ple_dim] table); `post_per_layer_input_norm` is `RMSNorm(hidden)`
             // and runs on the projection's output, back in the residual stream.
-            case Kind::PleNorm:
-                bind_const<RmsParams>(ctx, ord, (std::uint8_t)bind::Rms::Params,
-                                      rms_params(g, g.hidden), &count);
-                break;
             case Kind::PleProjNorm:
                 bind_const<RmsParams>(ctx, ord, (std::uint8_t)bind::Rms::Params,
                                       rms_params(g, g.per_layer_emb_dim), &count);
@@ -261,12 +260,6 @@ int bind_gemma4_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                 bind_const<SoftcapParams>(ctx, ord, (std::uint8_t)bind::Softcap::Params, p, &count);
                 break;
             }
-            case Kind::AttnResidual:
-            case Kind::FfnResidual:
-            case Kind::PleResidual:
-                bind_const<std::int32_t>(ctx, ord, (std::uint8_t)bind::Residual::Width,
-                                         std::int32_t(R) * g.hidden, &count);
-                break;
 
             // Embed's `Hidden` is a row PITCH, not a count -- the mb kernel
             // indexes (channel, token) -- so it does NOT scale with rows.

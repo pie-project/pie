@@ -31,6 +31,8 @@ constexpr std::uint8_t SdpaQ = 0, SdpaOut = 3;
 constexpr std::uint8_t KvAppendK = 0, KvAppendV = 1;
 constexpr std::uint8_t GegluGate = 0, GegluUp = 1, GegluOut = 2;
 constexpr std::uint8_t ResidX = 0, ResidR = 1, ResidOut = 2;
+// The fused norm+residual keeps bind::Rms's prefix and appends the residual.
+constexpr std::uint8_t RRX = 0, RROut = 2, RRResid = 4;
 constexpr std::uint8_t VNormX = 0, VNormOut = 1;
 constexpr std::uint8_t ScalarX = 0, ScalarOut = 2;
 constexpr std::uint8_t CombineProj = 0, CombineToken = 1, CombineOut = 2;
@@ -142,17 +144,13 @@ ScratchPlan build_gemma4_scratch(const std::vector<Dispatch>& dag, const Gemma4G
                 rd(o, bi::QmvX, attn);
                 wr(o, bi::QmvOut, block);
                 break;
-            case Kind::PostAttnNorm:
-                // The sandwich's second half: normalise the BLOCK's output
-                // before it rejoins the stream.
-                rd(o, bi::RmsX, block);
-                wr(o, bi::RmsOut, block);
-                break;
-            case Kind::AttnResidual: {
+            case Kind::PostAttnResidual: {
+                // The sandwich's second half and the add it always precedes:
+                // normalise the BLOCK's output, then rejoin the stream.
                 const int next = fresh();
-                rd(o, bi::ResidX, block);
-                rd(o, bi::ResidR, resid);
-                wr(o, bi::ResidOut, next);
+                rd(o, bi::RRX, block);
+                rd(o, bi::RRResid, resid);
+                wr(o, bi::RROut, next);
                 resid = next;
                 break;
             }
@@ -184,15 +182,11 @@ ScratchPlan build_gemma4_scratch(const std::vector<Dispatch>& dag, const Gemma4G
                 rd(o, bi::QmvX, act);
                 wr(o, bi::QmvOut, block);
                 break;
-            case Kind::PostFfnNorm:
-                rd(o, bi::RmsX, block);
-                wr(o, bi::RmsOut, block);
-                break;
-            case Kind::FfnResidual: {
+            case Kind::PostFfnResidual: {
                 const int next = fresh();
-                rd(o, bi::ResidX, block);
-                rd(o, bi::ResidR, resid);
-                wr(o, bi::ResidOut, next);
+                rd(o, bi::RRX, block);
+                rd(o, bi::RRResid, resid);
+                wr(o, bi::RROut, next);
                 resid = next;
                 break;
             }
@@ -215,15 +209,11 @@ ScratchPlan build_gemma4_scratch(const std::vector<Dispatch>& dag, const Gemma4G
                 rd(o, bi::QmvX, ple_act);
                 wr(o, bi::QmvOut, ple_back);
                 break;
-            case Kind::PleNorm:
-                rd(o, bi::RmsX, ple_back);
-                wr(o, bi::RmsOut, ple_back);
-                break;
-            case Kind::PleResidual: {
+            case Kind::PleResidualScaled: {
                 const int next = fresh();
-                rd(o, bi::ResidX, ple_back);
-                rd(o, bi::ResidR, resid);
-                wr(o, bi::ResidOut, next);
+                rd(o, bi::RRX, ple_back);
+                rd(o, bi::RRResid, resid);
+                wr(o, bi::RROut, next);
                 resid = next;
                 break;
             }

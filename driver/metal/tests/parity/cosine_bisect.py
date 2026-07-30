@@ -25,6 +25,10 @@ MLP_ORDER = ["ffn_norm", "gate_proj", "up_proj", "swiglu", "down_proj", "layer_o
 # gemma4: the norm sandwich, the per-layer-embedding residual and the layer
 # scalar are all extra, and the whole PLE stream runs once before the stack.
 G4_PRE = ["embed", "ple_tok", "ple_proj", "ple_projnorm", "ple"]
+# `attn_postnorm`/`ffn_postnorm`/`ple_norm`/`ple_resid` are reference-only: the
+# driver fuses each closing norm into the residual add that always follows it,
+# so those intermediates are no longer tensors anything can observe. Taps only
+# one side emits are skipped.
 G4_LAYER = ["attn_norm", "q_proj", "k_proj", "v_proj", "q_norm", "k_norm",
             "v_norm", "rope_q", "rope_k", "sdpa", "o_proj", "attn_postnorm",
             "attn_resid", "ffn_norm", "gate_proj", "up_proj", "geglu",

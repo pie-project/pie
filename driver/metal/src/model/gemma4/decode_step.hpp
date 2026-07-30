@@ -37,23 +37,29 @@ enum class Kind : std::uint8_t {
     KvAppend,
     Sdpa,
     QmvO,
-    PostAttnNorm,
-    AttnResidual,
+    /// `rms(block)*w + resid`, fused. Gemma's norm sandwich puts a norm
+    /// immediately before every residual add, and the threadgroup that computes
+    /// the row's inverse RMS already holds the whole row -- so the add is one
+    /// extra load and no synchronisation, against ~5.8 us for the barrier the
+    /// second dispatch would have cost.
+    PostAttnResidual,
 
     // FFN, GeGLU-tanh, with the other half of the sandwich.
     FfnNorm,
     QmvGate, QmvUp,
     GegluTanh,
     QmvDown,
-    PostFfnNorm,
-    FfnResidual,
+    PostFfnResidual,
 
     // Per-layer embedding residual and the learned layer scalar.
     PleGateGemv,
     PleGeglu,
     PleProjLayerGemv,
-    PleNorm,
-    PleResidual,
+    /// The same fusion, plus the learned per-layer gain that followed it:
+    /// `(rms(ple)*w + resid) * layer_scalar`.
+    PleResidualScaled,
+    /// The gain on its own, for a config with no per-layer embeddings -- there
+    /// is then no PLE residual for it to ride on.
     LayerScalar,
 
     // Tail.
@@ -116,25 +122,23 @@ inline std::vector<Dispatch> build_gemma4_dag(const Gemma4Geometry& g, bool with
         }
         emit(Kind::Sdpa, L, sliding);
         emit(Kind::QmvO, L, sliding);
-        emit(Kind::PostAttnNorm, L, sliding);
-        emit(Kind::AttnResidual, L, sliding);
+        emit(Kind::PostAttnResidual, L, sliding);
 
         emit(Kind::FfnNorm, L, sliding);
         emit(Kind::QmvGate, L, sliding);
         emit(Kind::QmvUp, L, sliding);
         emit(Kind::GegluTanh, L, sliding);
         emit(Kind::QmvDown, L, sliding);
-        emit(Kind::PostFfnNorm, L, sliding);
-        emit(Kind::FfnResidual, L, sliding);
+        emit(Kind::PostFfnResidual, L, sliding);
 
         if (g.per_layer_emb_dim > 0) {
             emit(Kind::PleGateGemv, L, sliding);
             emit(Kind::PleGeglu, L, sliding);
             emit(Kind::PleProjLayerGemv, L, sliding);
-            emit(Kind::PleNorm, L, sliding);
-            emit(Kind::PleResidual, L, sliding);
+            emit(Kind::PleResidualScaled, L, sliding);
+        } else {
+            emit(Kind::LayerScalar, L, sliding);
         }
-        emit(Kind::LayerScalar, L, sliding);
     }
 
     emit(Kind::FinalRms, -1, false);

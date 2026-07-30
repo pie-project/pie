@@ -435,6 +435,22 @@ std::vector<WeightBind> weight_binds(
         weights.push_back(
             {(std::uint8_t)bind::Rms::W, prefix + "post_per_layer_input_norm.weight"});
         break;
+    // The fused norm+residual kinds. `bind::RmsResidual` keeps bind::Rms's
+    // prefix, so the norm weight lands at the same slot; the scaled variant also
+    // carries the learned gain the separate `LayerScalar` dispatch used to.
+    case Kernel::G4AttnPostResidual:
+        weights.push_back(
+            {(std::uint8_t)bind::RmsResidual::W, prefix + "post_attention_layernorm.weight"});
+        break;
+    case Kernel::G4FfnPostResidual:
+        weights.push_back(
+            {(std::uint8_t)bind::RmsResidual::W, prefix + "post_feedforward_layernorm.weight"});
+        break;
+    case Kernel::G4PleResidualScaled:
+        weights.push_back(
+            {(std::uint8_t)bind::RmsResidual::W, prefix + "post_per_layer_input_norm.weight"});
+        weights.push_back({(std::uint8_t)bind::RmsResidual::Scalar, prefix + "layer_scalar"});
+        break;
     case Kernel::G4PleProjNorm:
         weights.push_back({(std::uint8_t)bind::Rms::W, "per_layer_projection_norm.weight"});
         break;

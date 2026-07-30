@@ -66,12 +66,17 @@ struct Gemma4Psos {
     /// whose MEANING differs rather than only their shape.
     Pso embed_scaled_mb{};
     Pso rope_prop_mb{};
+    /// The norm sandwich's closing norm and the residual add it always precedes,
+    /// in one dispatch. Three a layer, so 105 of the step's barriers.
+    Pso rms_residual{};
+    Pso rms_residual_scaled{};
 
     bool valid() const {
         return sdpa_swa_d256.valid() && sdpa_swa_d512.valid() && geglu_tanh.valid() &&
                logit_softcap.valid() && layer_scalar.valid() && ple_combine.valid() &&
                vnorm.valid() && embed_scaled.valid() && qmv_narrow.valid() &&
-               rope_prop.valid() && embed_scaled_mb.valid() && rope_prop_mb.valid();
+               rope_prop.valid() && embed_scaled_mb.valid() && rope_prop_mb.valid() &&
+               rms_residual.valid() && rms_residual_scaled.valid();
     }
 };
 

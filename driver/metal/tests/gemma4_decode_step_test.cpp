@@ -95,22 +95,26 @@ void the_dag_skips_what_a_shared_layer_does_not_have() {
     }
     // Everything on the query side, and the whole FFN, runs on every layer.
     for (Kind k : {Kind::AttnNorm, Kind::QmvQ, Kind::QNorm, Kind::RopeQ, Kind::Sdpa,
-                   Kind::QmvO, Kind::PostAttnNorm, Kind::AttnResidual, Kind::FfnNorm,
+                   Kind::QmvO, Kind::PostAttnResidual, Kind::FfnNorm,
                    Kind::QmvGate, Kind::QmvUp, Kind::GegluTanh, Kind::QmvDown,
-                   Kind::PostFfnNorm, Kind::FfnResidual, Kind::LayerScalar}) {
+                   Kind::PostFfnResidual}) {
         expect_eq(count(dag, k), 35, "one per layer");
     }
-    // PLE: five layer-less precompute dispatches, five more per layer.
+    // PLE: four layer-less precompute dispatches, four more per layer -- the
+    // per-layer norm, its residual add and the learned scalar are one dispatch.
     expect_eq(count(dag, Kind::PleCombine), 1, "PLE precompute runs once");
-    expect_eq(count(dag, Kind::PleResidual), 35, "PLE residual runs per layer");
+    expect_eq(count(dag, Kind::PleResidualScaled), 35,
+              "the PLE residual, its norm and the layer scalar are one dispatch");
+    expect_eq(count(dag, Kind::LayerScalar), 0,
+              "so the standalone scalar does not run when there is a PLE to ride on");
 
     // The tail.
     expect_eq(count(dag, Kind::FinalRms), 1, "one final norm");
     expect_eq(count(dag, Kind::LmHead), 1, "one logits matvec");
     expect_eq(count(dag, Kind::FinalSoftcap), 1, "gemma4 softcaps its logits");
 
-    // 1 embed + 4 PLE precompute + 35*(21 shared-safe) + owning extras + tail.
-    const int per_layer_always = 16 + 5;  // attention/FFN/scalar + per-layer PLE
+    // 1 embed + 4 PLE precompute + 35*(17 shared-safe) + owning extras + tail.
+    const int per_layer_always = 13 + 4;  // attention/FFN + per-layer PLE
     const int owning_extra = 6;           // k/v proj, k/v norm, rope_k, append
     const int want = 1 + 4 + g.n_layers * per_layer_always + 15 * owning_extra + 4;
     expect_eq(s.total, want, "the whole step is exactly this many dispatches");
@@ -138,7 +142,9 @@ void a_family_without_ple_or_softcap_drops_those_dispatches() {
     g.num_kv_shared_layers = 0;
     const std::vector<Dispatch> dag = build_gemma4_dag(g, /*with_argmax=*/false);
     expect_eq(count(dag, Kind::PleCombine), 0, "no PLE precompute without a PLE table");
-    expect_eq(count(dag, Kind::PleResidual), 0, "and no per-layer PLE");
+    expect_eq(count(dag, Kind::PleResidualScaled), 0, "and no per-layer PLE");
+    expect_eq(count(dag, Kind::LayerScalar), 35,
+              "the layer scalar then runs on its own, with no PLE residual to ride on");
     expect_eq(count(dag, Kind::FinalSoftcap), 0, "no softcap when the config has none");
     expect_eq(count(dag, Kind::QmvK), 35, "every layer owns its KV when none is shared");
     expect_eq(count(dag, Kind::Argmax), 0, "argmax is opt-in");

@@ -58,14 +58,14 @@ int required_slots_mb(pie::metal::gemma4::Kind k) {
         case Kind::LmHead:
         case Kind::PleProjGemv: case Kind::PleGateGemv:
         case Kind::PleProjLayerGemv:    return 8;  // Qmv's seven, plus M
-        case Kind::AttnNorm: case Kind::PostAttnNorm: case Kind::FfnNorm:
-        case Kind::PostFfnNorm: case Kind::FinalRms: case Kind::QNorm:
-        case Kind::KNorm: case Kind::PleNorm: case Kind::PleProjNorm: return 4;
+        case Kind::AttnNorm: case Kind::FfnNorm: case Kind::FinalRms:
+        case Kind::QNorm: case Kind::KNorm: case Kind::PleProjNorm: return 4;
+        case Kind::PostAttnResidual: case Kind::PostFfnResidual: return 5;
+        case Kind::PleResidualScaled: return 6;
         case Kind::VNorm:               return 3;
         case Kind::RopeQ: case Kind::RopeK: return 5;
         case Kind::KvAppend:            return 15;  // kv_append_paged
         case Kind::Sdpa:                return 16;  // sdpa_paged, window included
-        case Kind::AttnResidual: case Kind::FfnResidual: case Kind::PleResidual:
         case Kind::GegluTanh: case Kind::PleGeglu:
         case Kind::LayerScalar: case Kind::PleCombine: return 4;
         case Kind::FinalSoftcap:        return 3;
