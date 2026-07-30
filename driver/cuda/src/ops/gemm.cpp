@@ -96,13 +96,18 @@ std::size_t cublaslt_bf16_workspace_bytes() {
     return bytes;
 }
 
+// Per-thread cuBLASLt handle + workspace. TP ranks are separate threads
+// that each `cudaSetDevice` to a different GPU; a process-wide static
+// would allocate the workspace on the first rank's device and IMA on the
+// others (commonly at the wide lm_head GEMM that is the first shape to
+// enter the Lt path under GPT-OSS TP).
 struct Bf16LtCtx {
     cublasLtHandle_t handle = nullptr;
     void* workspace = nullptr;
     std::size_t workspace_bytes = cublaslt_bf16_workspace_bytes();
 
     static Bf16LtCtx& instance() {
-        static Bf16LtCtx ctx;
+        thread_local Bf16LtCtx ctx;
         return ctx;
     }
 
@@ -919,12 +924,11 @@ struct LtMatmulPref {
 };
 
 #ifdef PIE_CUDA_HAS_MARLIN
-// Per-process marlin workspace. Marlin's split-K reduce uses one int32
-// per SM as a barrier counter; we allocate generously (16 KiB) to cover
-// every realistic SM count without per-call allocation. Lazy-init on
-// first INT4_PACKED dispatch.
+// Per-thread marlin workspace. TP ranks are separate threads that each
+// `cudaSetDevice` to a different GPU; a process-wide static would allocate
+// on the first rank's device and IMA on the others.
 void* marlin_workspace_() {
-    static void* ws = nullptr;
+    thread_local void* ws = nullptr;
     static const std::size_t ws_bytes = 16 * 1024;
     if (!ws) {
         if (cudaMalloc(&ws, ws_bytes) != cudaSuccess) {
@@ -936,7 +940,7 @@ void* marlin_workspace_() {
 }
 
 void* marlin_fp32_reduce_scratch_() {
-    static void* ws = nullptr;
+    thread_local void* ws = nullptr;
     static const std::size_t ws_bytes = 32 * 1024 * 1024;
     if (!ws) {
         if (cudaMalloc(&ws, ws_bytes) != cudaSuccess) {
@@ -947,13 +951,13 @@ void* marlin_fp32_reduce_scratch_() {
     return ws;
 }
 
-// Per-process bf16 residual scratch — used when the INT4 dispatcher is
+// Per-thread bf16 residual scratch — used when the INT4 dispatcher is
 // called with beta=1 (the residual-add fusion the bf16/fp8 paths handle
 // natively via cuBLAS's beta param). Marlin overwrites C, so we run it
 // into a scratch and add into y in a second pass. Grows monotonically.
 void* marlin_residual_scratch_(std::size_t bytes) {
-    static void* buf = nullptr;
-    static std::size_t buf_bytes = 0;
+    thread_local void* buf = nullptr;
+    thread_local std::size_t buf_bytes = 0;
     if (bytes <= buf_bytes) return buf;
     if (buf) cudaFree(buf);
     if (cudaMalloc(&buf, bytes) != cudaSuccess) {
@@ -1013,7 +1017,7 @@ struct LtCtx {
 
     // Grow-on-demand device scratch. Caller passes byte size; returns
     // a pointer valid until the next `ensure(bigger_size)` on the same
-    // buffer. Cleared at process exit (LtCtx is a static singleton).
+    // buffer. Cleared at process exit (LtCtx is thread_local per TP rank).
     struct GrowScratch {
         void*       p = nullptr;
         std::size_t bytes = 0;
