@@ -41,6 +41,10 @@ _GROUP_BLOCK = 64
 # Threads per block for the CUDA kernels that give a warp to a configuration.
 # Four warps, which is what the Triton locate uses, so the two are comparable.
 _LOCATE_THREADS = 128
+# A thread replays a configuration, so the launch is sized by threads and the
+# scratch follows it. 128 keeps the block small enough that a heavy row does
+# not hold a whole multiprocessor.
+_CANDIDATE_THREADS = 128
 # Blocks that drain the sweep. Fixed, and deliberately so: the grid no longer
 # depends on the batch, on how wide its parses are, or on the grammar, which is
 # what a CUDA graph needs and what a batch of mixed grammars would need. It also
@@ -59,7 +63,7 @@ _BACKENDS = (_TRITON, _CUDA, _DIFFERENTIAL)
 # the whole suite run under either name from the first day and makes each
 # kernel's arrival a one-line change here rather than a switch of everything at
 # once. Anything not named is Triton, honestly and by construction.
-_PORTED: frozenset[str] = frozenset({"commit"})
+_PORTED: frozenset[str] = frozenset({"candidate", "commit"})
 
 
 def ported() -> frozenset[str]:
@@ -3505,8 +3509,20 @@ class DeviceBatch:
         # stops depending on the batch. It cannot share the sweep's buffer:
         # both may be in flight on the same stream and they would write over
         # each other's replays.
+        #
+        # Rounded up to the CUDA launch's thread count, because that backend
+        # gives a *thread* a replay rather than a block - which is the 3.42x
+        # lever - and a grid of `ceil(blocks/threads) * threads` is a little
+        # wider than `blocks`. Sizing for the smaller of the two would let the
+        # last few threads write past the end.
+        replayers = max(
+            self.sweep_blocks,
+            (self.sweep_blocks + _CANDIDATE_THREADS - 1)
+            // _CANDIDATE_THREADS
+            * _CANDIDATE_THREADS,
+        )
         self.advance_scratch = torch.zeros(
-            (self.sweep_blocks, 2 * grammar.window),
+            (replayers, 2 * grammar.window),
             dtype=torch.int32,
             device="cuda",
         )
@@ -4041,11 +4057,71 @@ class DeviceBatch:
             ],
         )
 
+    def _candidate_cuda(self, grammar, rows) -> None:
+        """`gg_candidate`: one thread per configuration.
+
+        The launch is sized so that the *total thread count* equals the block
+        count Triton used, because the replay scratch is two windows per
+        replayer and Triton's replayer is a block. Thread-per-item is the
+        3.42x lever, and this is what buys it without buying memory too.
+        """
+        from gpugrammar import _gpugrammar
+
+        threads = _CANDIDATE_THREADS
+        blocks = max(1, (self.sweep_blocks + threads - 1) // threads)
+        _gpugrammar.cuda_launch(
+            "gg_candidate",
+            blocks,
+            threads,
+            torch.cuda.current_stream().cuda_stream,
+            [
+                self.grammar.arena_struct().data_ptr(),
+                self.state_struct().data_ptr(),
+                self.found.data_ptr(),
+                self.advance_scratch.data_ptr(),
+                self.cand_count.data_ptr(),
+                self.cand_lexer.data_ptr(),
+                self.cand_depth.data_ptr(),
+                self.cand_floor.data_ptr(),
+                self.cand_window.data_ptr(),
+            ],
+            [
+                rows,
+                self.configs,
+                self.max_readings,
+                grammar.max_stack,
+                grammar.max_reductions,
+                grammar.window,
+                grammar.paths,
+            ],
+        )
+
     def _advance_triton(self) -> None:
         grammar = self.grammar
         rows = self.batch * self.configs
         self._advance_prepare_triton(grammar, rows)
         self._commit_triton(grammar)
+
+    def _advance_prepare_cuda(self, grammar, rows) -> None:
+        """The front half with each kernel taken from CUDA where it is ported.
+
+        Written out rather than flagged inside the Triton path, for the reason
+        the differential exists: the two have to be able to run the same input
+        independently, or the comparison is a backend against itself.
+        """
+        self._count_and_scan(
+            grammar, rows, self.live_counts, self.live_offsets, skip=0, unit=1
+        )
+        if self.rollback_depth > 0:
+            self._history_triton(grammar, rows)
+        if "locate" in _PORTED:
+            self._locate_cuda(grammar, rows)
+        else:
+            self._locate_triton(grammar, rows)
+        if "candidate" in _PORTED:
+            self._candidate_cuda(grammar, rows)
+        else:
+            self._candidate_triton(grammar, rows)
 
     def _advance_prepare_triton(self, grammar, rows) -> None:
         """Everything the advance does before the commit: the history entry,
@@ -4066,6 +4142,13 @@ class DeviceBatch:
         # After the running sum, so the history knows which configurations are
         # in play: before it, `live_offsets` still describes the previous step.
         if self.rollback_depth > 0:
+            self._history_triton(grammar, rows)
+        self._locate_triton(grammar, rows)
+        self._candidate_triton(grammar, rows)
+
+        self._commit_triton(grammar)
+
+    def _history_triton(self, grammar, rows) -> None:
             _history_kernel[(self.sweep_blocks,)](
                 self.lexer_state,
                 self.stack,
@@ -4083,6 +4166,7 @@ class DeviceBatch:
                 DEPTH=self.rollback_depth,
             )
             self.hist_slot += 1
+    def _locate_triton(self, grammar, rows) -> None:
         _locate_kernel[(self.sweep_blocks,)](
             grammar.group_offsets,
             grammar.group_set_kind,
@@ -4113,6 +4197,8 @@ class DeviceBatch:
             HAS_VERDICTS=grammar.has_verdicts,
             NO_GROUP=_NO_GROUP,
         )
+
+    def _candidate_triton(self, grammar, rows) -> None:
         _candidate_kernel[(self.sweep_blocks,)](
             grammar.group_offsets,
             grammar.reading_offsets,
@@ -4155,7 +4241,6 @@ class DeviceBatch:
             PATHS=grammar.paths,
             num_warps=1,
         )
-        self._commit_triton(grammar)
 
     def _commit_triton(self, grammar) -> None:
         _commit_kernel[(self.batch,)](
@@ -4454,7 +4539,7 @@ class DeviceBatch:
         if not _PORTED:
             self._advance_triton()
             return
-        self._advance_prepare_triton(grammar, rows)
+        self._advance_prepare_cuda(grammar, rows)
         if "commit" in _PORTED:
             self._commit_cuda(grammar)
         else:

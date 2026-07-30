@@ -529,5 +529,151 @@ class TheCudaCommitAgreesWithTriton(unittest.TestCase):
         self.assertGreater(int(raw.config_count[0]), 0)
 
 
+
+class TheCudaCandidateAgreesWithTriton(unittest.TestCase):
+    """`gg_candidate` against `_candidate_kernel`.
+
+    The largest kernel of the port and the one it is for: a thread replays a
+    configuration rather than a block, which is the 3.42x lever, and the
+    reduction chain is a device function called from both the reading walk and
+    the pending probe rather than written out twice.
+
+    Only the *defined* part of each array is compared. `cand_lexer` and its
+    friends hold a row's candidates in `[0, cand_count[row])`; past that they
+    are whatever the previous step left, and the two kernels leave different
+    rubbish there.
+    """
+
+    def setUp(self):
+        if not HAVE_CUDA or not _gpugrammar.cuda_available():
+            raise unittest.SkipTest("no CUDA device or no kernels in this build")
+        import json
+
+        import gpugrammar
+
+        self.engine = gpugrammar.Engine([bytes([i]) for i in range(256)])
+        self.grammars = [
+            self.engine.compile_json_schema(json.dumps(schema))
+            for schema in (
+                {"type": "string"},
+                {
+                    "type": "object",
+                    "properties": {"a": {"type": "string"}, "b": {"type": "integer"}},
+                    "required": ["a"],
+                },
+                {"type": "array", "items": {"type": "boolean"}},
+            )
+        ]
+
+    SNAPSHOT = (
+        "cand_count",
+        "cand_lexer",
+        "cand_depth",
+        "cand_floor",
+        "cand_window",
+        "overflow",
+    )
+
+    def _defined_differences(self, raw, theirs, max_readings, window):
+        counts = theirs["cand_count"]
+        wrong = 0
+        for row in range(counts.numel()):
+            made = int(counts[row])
+            if made == 0:
+                continue
+            base = row * max_readings
+            for field in ("cand_lexer", "cand_depth", "cand_floor"):
+                mine = getattr(raw, field)[base : base + made]
+                wrong += int((mine != theirs[field][base : base + made]).sum())
+            for index in range(made):
+                depth = int(theirs["cand_depth"][base + index])
+                floor = int(theirs["cand_floor"][base + index])
+                live = max(0, depth - floor)
+                at = (base + index) * window
+                mine = raw.cand_window[at : at + live]
+                wrong += int((mine != theirs["cand_window"][at : at + live]).sum())
+        return wrong
+
+    def test_both_kernels_produce_the_same_candidates(self):
+        made = 0
+        for sequences in (4, 16):
+            batch = self.engine.batch(size=sequences)
+            batch.set_grammars([self.grammars[i % 3] for i in range(sequences)])
+            raw = batch.raw
+            grammar = raw.grammar
+            rows = raw.batch * raw.configs
+            matchers = [self.grammars[i % 3].matcher(0) for i in range(sequences)]
+            for step in range(6):
+                tokens = []
+                for index in range(sequences):
+                    allowed = matchers[index].allowed_tokens()
+                    tokens.append(allowed[step % len(allowed)] if allowed else 0)
+                raw.token.copy_(
+                    torch.tensor(tokens, dtype=torch.int32, device="cuda")
+                )
+                raw._count_and_scan(
+                    grammar, rows, raw.live_counts, raw.live_offsets, skip=0, unit=1
+                )
+                raw._locate_triton(grammar, rows)
+                torch.cuda.synchronize()
+                before = {n: getattr(raw, n).clone() for n in self.SNAPSHOT}
+
+                raw._candidate_triton(grammar, rows)
+                torch.cuda.synchronize()
+                theirs = {n: getattr(raw, n).clone() for n in self.SNAPSHOT}
+                made += int(theirs["cand_count"].sum())
+
+                for name, value in before.items():
+                    getattr(raw, name).copy_(value)
+                raw._candidate_cuda(grammar, rows)
+                torch.cuda.synchronize()
+
+                self.assertTrue(
+                    bool(torch.equal(raw.cand_count, theirs["cand_count"])),
+                    f"batch {sequences} step {step}: "
+                    f"{int((raw.cand_count != theirs['cand_count']).sum())} rows differ",
+                )
+                self.assertTrue(bool(torch.equal(raw.overflow, theirs["overflow"])))
+                self.assertEqual(
+                    self._defined_differences(
+                        raw, theirs, raw.max_readings, grammar.window
+                    ),
+                    0,
+                )
+
+                for name, value in theirs.items():
+                    getattr(raw, name).copy_(value)
+                raw._commit_triton(grammar)
+                torch.cuda.synchronize()
+                for index in range(sequences):
+                    matchers[index].accept_token(tokens[index])
+        self.assertGreater(made, 0, "no candidate was ever produced")
+
+    def test_the_mask_and_the_landing_ask_different_questions(self):
+        # The one real semantic difference between the two copies of the chain
+        # in the Triton engine, and the bug this port made: for the mask a
+        # shift and an accept both mean "readable" and neither is recorded; for
+        # a candidate a shift has to be pushed and an accept means the parse is
+        # finished and cannot read on. Porting the mask's answer into the
+        # candidate path produced zero candidates where there should have been
+        # two, on a grammar with no conflicts at all.
+        sequences = 8
+        batch = self.engine.batch(size=sequences)
+        batch.set_grammars([self.grammars[1]] * sequences)
+        raw = batch.raw
+        grammar = raw.grammar
+        rows = raw.batch * raw.configs
+        raw.token.fill_(self.grammars[1].matcher(0).allowed_tokens()[0])
+        raw._count_and_scan(
+            grammar, rows, raw.live_counts, raw.live_offsets, skip=0, unit=1
+        )
+        raw._locate_triton(grammar, rows)
+        raw._candidate_cuda(grammar, rows)
+        torch.cuda.synchronize()
+        self.assertGreater(
+            int(raw.cand_count.sum()), 0, "a readable token produced no candidate"
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
