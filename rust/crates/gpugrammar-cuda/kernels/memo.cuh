@@ -1,0 +1,277 @@
+// The cross-step mask memo: a hash table keyed on a sequence's parse state.
+//
+// Not a parser. Nothing here replays anything - it is a fingerprint, a table
+// lookup, a search for a sequence in the same batch that will compute the same
+// answer, and two copies. It is worth 92-96% hit rates at every batch size
+// including one, because dedup within a step only sees the step it is in.
+//
+// The keys are the interesting part. A mask depends on the stack only as far
+// down as its replay looked, which the sweep measures into `row_floor`, so an
+// entry saved under the *suffix* it actually needs is found again by whatever
+// agrees on that much however different the two stacks are underneath. On a
+// grammar that nests, the stack grows with the document and the answer does
+// not.
+
+#pragma once
+#include "arena.cuh"
+
+namespace gg {
+
+constexpr int32_t MEMO_EMPTY = -1;
+constexpr uint32_t FNV_OFFSET = 2166136261u;
+constexpr uint32_t FNV_PRIME = 16777619u;
+
+__device__ __forceinline__ int32_t fold(int32_t digest, int32_t with) {
+    return (int32_t)((((uint32_t)digest) ^ (uint32_t)with) * FNV_PRIME);
+}
+
+/// Every thread in the block computes the same scalar answer from the same
+/// loads, which is what Triton generates too; the threads earn their keep on
+/// the stack folds and comparisons below.
+struct Sequence {
+    int32_t count;
+    int32_t grammar;
+};
+
+}  // namespace gg
+
+/// A fingerprint of a sequence's whole parse state, and one per suffix width.
+///
+/// One *warp* per sequence, not a block. The fold is a sum over a stack whose
+/// depth is single digits on real documents, and a block-wide tree reduction
+/// pays seven `__syncthreads` for it - which measured slower than the Triton
+/// kernel at batch 1 and 8, where there is nothing else to hide the barriers
+/// behind. A warp shuffle needs none.
+///
+/// Both digests in one pass over the configurations: a pass apiece reads the
+/// stack `suffixes` times over, and a sequence can hold sixty-four
+/// configurations - which cost more than the suffix key buys, 40 to 146 us at
+/// batch 32 on the widest schema.
+__device__ __forceinline__ int32_t warp_sum(int32_t value) {
+    for (int32_t half = 16; half > 0; half >>= 1) {
+        value += __shfl_down_sync(0xffffffffu, value, half);
+    }
+    return __shfl_sync(0xffffffffu, value, 0);
+}
+
+extern "C" __global__ void gg_hash(
+    const gg::BatchState* state,
+    int32_t* hash,
+    int32_t* suffix_hash,
+    int32_t configs,
+    int32_t stack_stride,
+    int32_t suffixes) {
+    int32_t sequence = blockIdx.x;
+    int32_t lane = threadIdx.x;
+    int32_t count = state->config_count[sequence];
+    int32_t grammar = state->grammar_of[sequence];
+
+    // The grammar is part of the state: two sequences under different schemas
+    // can sit at the same parser state with the same stack and still admit
+    // different tokens, so sharing a mask between them would be wrong.
+    int32_t digest = gg::fold(gg::fold((int32_t)gg::FNV_OFFSET, grammar), count);
+    for (int32_t config = 0; config < count; ++config) {
+        int32_t row = sequence * configs + config;
+        int32_t depth = state->depth[row];
+        digest = gg::fold(digest, state->lexer_state[row]);
+        digest = gg::fold(digest, depth);
+        // Order matters, so fold with a position-dependent weight rather than
+        // a plain sum. Reduced across the block because the stack is wider
+        // than a warp.
+        int32_t part = 0;
+        for (int32_t at = lane; at < depth; at += 32) {
+            part += state->stack[(int64_t)row * stack_stride + at] * (at + 1);
+        }
+        digest = gg::fold(digest, warp_sum(part));
+    }
+    if (lane == 0) {
+        hash[sequence] = digest;
+    }
+
+    for (int32_t width = 1; width <= suffixes; ++width) {
+        int32_t d = gg::fold((int32_t)gg::FNV_OFFSET, grammar);
+        d = gg::fold(gg::fold(d, count), width);
+        for (int32_t config = 0; config < count; ++config) {
+            int32_t row = sequence * configs + config;
+            int32_t depth = state->depth[row];
+            int32_t kept = min(depth, width);
+            int32_t floor = depth - kept;
+            int32_t part = 0;
+            for (int32_t at = floor + lane; at < depth; at += 32) {
+                part += state->stack[(int64_t)row * stack_stride + at] * (at - floor + 1);
+            }
+            int32_t folded = warp_sum(part);
+            d = gg::fold(d, state->lexer_state[row]);
+            d = gg::fold(d, kept);
+            // A stack shorter than `k` is folded whole, so it can never look
+            // like a longer one that happens to end the same way.
+            d = gg::fold(d, depth <= width ? 1 : 0);
+            d = gg::fold(d, folded);
+        }
+        if (lane == 0) {
+            suffix_hash[sequence * suffixes + width - 1] = d;
+        }
+    }
+}
+
+/// Look the state up, then look for a neighbour that will compute it anyway.
+///
+/// One warp, for the reason `gg_hash` is one warp: the comparisons are over a
+/// stack whose depth is single digits, and `__syncthreads_or` is a barrier
+/// where `__any_sync` is an instruction.
+///
+/// One lookup and two places, because the question is the same one: has this
+/// answer been produced, in an earlier step or by an earlier sequence in this
+/// one? Equal states share a fingerprint and probe the same slot, so a
+/// neighbour that matches is one that missed the table too - nothing ends up
+/// following a follower.
+extern "C" __global__ void gg_probe(
+    const gg::BatchState* state,
+    const int32_t* hash,
+    const int32_t* suffix_hash,
+    const int32_t* memo_hash,
+    const int32_t* memo_lexer,
+    const int32_t* memo_stack,
+    const int32_t* memo_depth,
+    const int32_t* memo_count,
+    const int32_t* memo_grammar,
+    const int32_t* memo_read,
+    int32_t* mask,
+    int32_t* memo_slot,
+    int32_t* representative,
+    int32_t* row_floor,
+    int32_t batch,
+    int32_t configs,
+    int32_t stack_stride,
+    int32_t slots,
+    int32_t memo_configs,
+    int32_t memo_stride,
+    int32_t suffixes,
+    int32_t mask_words) {
+    int32_t sequence = blockIdx.x;
+    int32_t lane = threadIdx.x;
+    int32_t count = state->config_count[sequence];
+    int32_t mine = state->grammar_of[sequence];
+
+    int32_t found = -1;
+    for (int32_t attempt = 0; attempt <= suffixes && found < 0; ++attempt) {
+        int32_t want = attempt == 0 ? -1 : attempt;
+        int32_t digest = attempt == 0
+            ? hash[sequence]
+            : suffix_hash[sequence * suffixes + attempt - 1];
+        int32_t slot = (int32_t)(((uint32_t)digest & 0x7fffffffu) % (uint32_t)slots);
+        if (count > memo_configs) {
+            continue;
+        }
+        bool same = memo_hash[slot] == digest && memo_read[slot] == want
+                    && memo_count[slot] == count && memo_grammar[slot] == mine;
+        for (int32_t config = 0; config < count && same; ++config) {
+            int32_t row = sequence * configs + config;
+            int64_t held = (int64_t)slot * memo_configs + config;
+            int32_t depth = state->depth[row];
+            int32_t kept = want > 0 ? min(depth, want) : depth;
+            if (state->lexer_state[row] != memo_lexer[held]
+                || kept != memo_depth[held]) {
+                same = false;
+            }
+            int32_t differs = 0;
+            for (int32_t at = lane; at < kept && at < memo_stride; at += 32) {
+                if (state->stack[(int64_t)row * stack_stride + depth - kept + at]
+                    != memo_stack[held * memo_stride + at]) {
+                    differs = 1;
+                }
+            }
+            if (__any_sync(0xffffffffu, differs)) {
+                same = false;
+            }
+        }
+        if (same) {
+            found = slot;
+        }
+    }
+    if (lane == 0) {
+        memo_slot[sequence] = found;
+    }
+
+    // Every sequence walks every earlier one, so this is quadratic - which is
+    // why the candidates are screened by fingerprint before any stack is read.
+    int32_t neighbour = sequence;
+    if (found < 0) {
+        int32_t digest = hash[sequence];
+        for (int32_t other = 0; other < sequence && neighbour == sequence; ++other) {
+            if (hash[other] != digest || state->config_count[other] != count
+                || state->grammar_of[other] != mine) {
+                continue;
+            }
+            bool same = true;
+            for (int32_t config = 0; config < count && same; ++config) {
+                int32_t a = sequence * configs + config;
+                int32_t b = other * configs + config;
+                int32_t depth = state->depth[a];
+                if (state->lexer_state[a] != state->lexer_state[b]
+                    || depth != state->depth[b]) {
+                    same = false;
+                }
+                int32_t differs = 0;
+                for (int32_t at = lane; at < depth; at += 32) {
+                    if (state->stack[(int64_t)a * stack_stride + at]
+                        != state->stack[(int64_t)b * stack_stride + at]) {
+                        differs = 1;
+                    }
+                }
+                if (__any_sync(0xffffffffu, differs)) {
+                    same = false;
+                }
+            }
+            if (same) {
+                neighbour = other;
+            }
+        }
+    }
+    if (lane == 0) {
+        representative[sequence] = neighbour;
+    }
+
+    // Only what computes has to start empty; everything else is written whole
+    // by the copy. Clearing all of them was 9.7 MB a step to make room for
+    // 0.6 MB of answers.
+    if (found < 0 && neighbour == sequence) {
+        for (int32_t at = lane; at < mask_words; at += 32) {
+            mask[(int64_t)sequence * mask_words + at] = 0;
+        }
+    }
+
+    // Seed the floors the sweep reduces.
+    for (int32_t config = lane; config < count; config += 32) {
+        int32_t row = sequence * configs + config;
+        row_floor[row] = state->depth[row];
+    }
+}
+
+/// Give every sequence that did not compute the mask it was promised.
+///
+/// Two sources and one pass, because the probe already decided which: a table
+/// slot for a state an earlier step masked, or a neighbour's row for one this
+/// step is masking anyway.
+///
+/// **Before the store**, so a sequence reading a slot reads the entry it
+/// matched rather than one a provider has since replaced.
+extern "C" __global__ void gg_copy(
+    int32_t* mask,
+    const int32_t* memo_slot,
+    const int32_t* representative,
+    const int32_t* memo_mask,
+    int32_t mask_words) {
+    int32_t sequence = blockIdx.y;
+    int32_t slot = memo_slot[sequence];
+    int32_t source = representative[sequence];
+    if (slot < 0 && source == sequence) {
+        return;
+    }
+    for (int32_t at = blockIdx.x * blockDim.x + threadIdx.x; at < mask_words;
+         at += gridDim.x * blockDim.x) {
+        mask[(int64_t)sequence * mask_words + at] =
+            slot >= 0 ? memo_mask[(int64_t)slot * mask_words + at]
+                      : mask[(int64_t)source * mask_words + at];
+    }
+}

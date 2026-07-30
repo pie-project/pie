@@ -63,7 +63,9 @@ _BACKENDS = (_TRITON, _CUDA, _DIFFERENTIAL)
 # the whole suite run under either name from the first day and makes each
 # kernel's arrival a one-line change here rather than a switch of everything at
 # once. Anything not named is Triton, honestly and by construction.
-_PORTED: frozenset[str] = frozenset({"candidate", "commit", "mask"})
+_PORTED: frozenset[str] = frozenset(
+    {"candidate", "commit", "mask", "hash", "probe", "copy"}
+)
 
 
 def ported() -> frozenset[str]:
@@ -3978,6 +3980,11 @@ class DeviceBatch:
     # The per-batch state as the CUDA kernels want it, in the order
     # `gg::BatchState` declares. Built once: these buffers do not move, which
     # is the same property that lets a recorded graph hold their addresses.
+    # `token` and `mask` are deliberately not here: they are rebound - the
+    # draft walk points them at a row of its own arrays per position - and a
+    # struct cached past that aims a kernel at the wrong tensor, while
+    # rebuilding it inside a capture is a host-to-device copy a capture
+    # forbids. They are passed per launch instead.
     _BATCH_FIELDS = (
         "lexer_state",
         "stack",
@@ -3985,13 +3992,17 @@ class DeviceBatch:
         "config_count",
         "widest",
         "grammar_of",
-        "token",
         "terminated",
         "overflow",
-        "mask",
     )
 
     def state_struct(self) -> torch.Tensor:
+        """Device memory holding one `gg::BatchState`. Built once.
+
+        Everything in it is a buffer made at construction whose address a
+        recorded graph holds, so it never moves. What does move is passed per
+        launch - see `_BATCH_FIELDS`.
+        """
         held = getattr(self, "_state_struct", None)
         if held is None:
             held = torch.tensor(
@@ -4014,6 +4025,7 @@ class DeviceBatch:
             [
                 self.grammar.arena_struct().data_ptr(),
                 self.state_struct().data_ptr(),
+                self.token.data_ptr(),
                 self.live_offsets.data_ptr(),
                 self.found.data_ptr(),
                 self.old_lexer.data_ptr(),
@@ -4179,6 +4191,143 @@ class DeviceBatch:
                 grammar.paths,
                 grammar.has_verdicts,
             ],
+        )
+
+    # A power of two, because the digest folds a stack with a tree reduction
+    # over the block. 128 covers the common stack depth without giving a
+    # sequence a whole multiprocessor.
+    _MEMO_THREADS = 128
+
+    def _hash_triton(self, grammar) -> None:
+        _hash_kernel[(self.batch,)](
+            self.lexer_state,
+            self.stack,
+            self.depth,
+            self.config_count,
+            self.grammar_of,
+            self.state_hash,
+            self.suffix_hash,
+            CONFIGS=self.configs,
+            STACK_STRIDE=grammar.max_stack,
+            SUFFIXES=_MEMO_SUFFIXES,
+            num_warps=1,
+        )
+
+    def _hash_cuda(self, grammar) -> None:
+        from gpugrammar import _gpugrammar
+
+        _gpugrammar.cuda_launch(
+            "gg_hash",
+            self.batch,
+            32,  # one warp: the fold is a shuffle, not a block reduction
+            torch.cuda.current_stream().cuda_stream,
+            [
+                self.state_struct().data_ptr(),
+                self.state_hash.data_ptr(),
+                self.suffix_hash.data_ptr(),
+            ],
+            [self.configs, grammar.max_stack, _MEMO_SUFFIXES],
+        )
+
+    def _probe_triton(self, grammar) -> None:
+        _probe_kernel[(self.batch,)](
+            self.lexer_state,
+            self.stack,
+            self.depth,
+            self.config_count,
+            self.grammar_of,
+            self.state_hash,
+            self.suffix_hash,
+            self.memo_hash,
+            self.memo_lexer,
+            self.memo_stack,
+            self.memo_depth,
+            self.memo_count,
+            self.memo_grammar,
+            self.memo_read,
+            self.memo_slot,
+            self.representative,
+            self.memo_store,
+            self.row_floor,
+            self.mask,
+            grammar.mask_words,
+            BATCH=triton.next_power_of_2(self.batch),
+            CONFIGS=self.configs,
+            STACK_STRIDE=grammar.max_stack,
+            SLOTS=self.memo_slots,
+            MEMO_CONFIGS=self.memo_configs,
+            MEMO_STRIDE=self.memo_stride,
+            SUFFIXES=_MEMO_SUFFIXES,
+            BLOCK=128,
+            num_warps=4,
+        )
+
+    def _probe_cuda(self, grammar) -> None:
+        from gpugrammar import _gpugrammar
+
+        _gpugrammar.cuda_launch(
+            "gg_probe",
+            self.batch,
+            32,  # one warp, as `gg_hash`: `__any_sync` instead of a barrier
+            torch.cuda.current_stream().cuda_stream,
+            [
+                self.state_struct().data_ptr(),
+                self.state_hash.data_ptr(),
+                self.suffix_hash.data_ptr(),
+                self.memo_hash.data_ptr(),
+                self.memo_lexer.data_ptr(),
+                self.memo_stack.data_ptr(),
+                self.memo_depth.data_ptr(),
+                self.memo_count.data_ptr(),
+                self.memo_grammar.data_ptr(),
+                self.memo_read.data_ptr(),
+                self.mask.data_ptr(),
+                self.memo_slot.data_ptr(),
+                self.representative.data_ptr(),
+                self.row_floor.data_ptr(),
+            ],
+            [
+                self.batch,
+                self.configs,
+                grammar.max_stack,
+                self.memo_slots,
+                self.memo_configs,
+                self.memo_stride,
+                _MEMO_SUFFIXES,
+                grammar.mask_words,
+            ],
+        )
+
+    def _copy_triton(self, grammar) -> None:
+        _copy_kernel[(self.batch, (grammar.mask_words + 511) // 512)](
+            self.memo_slot,
+            self.representative,
+            self.memo_mask,
+            self.mask,
+            grammar.mask_words,
+            BLOCK=512,
+            num_warps=4,
+        )
+
+    def _copy_cuda(self, grammar) -> None:
+        from gpugrammar import _gpugrammar
+
+        # One row is up to 19 KiB, so this is bandwidth and wants width. The
+        # second grid dimension is the sequence, which is why `cuda_launch`
+        # takes a pair here.
+        _gpugrammar.cuda_launch(
+            "gg_copy",
+            max(1, (grammar.mask_words + 255) // 256),
+            256,
+            torch.cuda.current_stream().cuda_stream,
+            [
+                self.mask.data_ptr(),
+                self.memo_slot.data_ptr(),
+                self.representative.data_ptr(),
+                self.memo_mask.data_ptr(),
+            ],
+            [grammar.mask_words],
+            grid_y=self.batch,
         )
 
     def _advance_triton(self) -> None:
@@ -4612,9 +4761,14 @@ class DeviceBatch:
         the dispatch is written out rather than flagged inside `_fill_triton`
         so the two paths can run the same input independently.
         """
-        if not (_PORTED & {"mask"}):
+        if not _PORTED:
             return self._fill_triton()
-        return self._fill_triton(mask=self._mask_cuda)
+        return self._fill_triton(
+            mask=self._mask_cuda if "mask" in _PORTED else None,
+            hash=self._hash_cuda if "hash" in _PORTED else None,
+            probe=self._probe_cuda if "probe" in _PORTED else None,
+            copy=self._copy_cuda if "copy" in _PORTED else None,
+        )
 
     def _advance_cuda(self) -> None:
         """The advance with each kernel taken from CUDA where it is ported.
@@ -4720,55 +4874,13 @@ class DeviceBatch:
             )
         return self.mask if path == "fill" else None
 
-    def _fill_triton(self, mask=None) -> torch.Tensor:
+    def _fill_triton(self, mask=None, hash=None, probe=None, copy=None) -> torch.Tensor:
         grammar = self.grammar
         # The mask is not cleared here. The probe knows which rows the scatter
         # will build up - the ones with no answer anywhere - and clears only
         # those; the rest are overwritten whole by the copy.
-        _hash_kernel[(self.batch,)](
-            self.lexer_state,
-            self.stack,
-            self.depth,
-            self.config_count,
-            self.grammar_of,
-            self.state_hash,
-            self.suffix_hash,
-            CONFIGS=self.configs,
-            STACK_STRIDE=grammar.max_stack,
-            SUFFIXES=_MEMO_SUFFIXES,
-            num_warps=1,
-        )
-        _probe_kernel[(self.batch,)](
-            self.lexer_state,
-            self.stack,
-            self.depth,
-            self.config_count,
-            self.grammar_of,
-            self.state_hash,
-            self.suffix_hash,
-            self.memo_hash,
-            self.memo_lexer,
-            self.memo_stack,
-            self.memo_depth,
-            self.memo_count,
-            self.memo_grammar,
-            self.memo_read,
-            self.memo_slot,
-            self.representative,
-            self.memo_store,
-            self.row_floor,
-            self.mask,
-            grammar.mask_words,
-            BATCH=triton.next_power_of_2(self.batch),
-            CONFIGS=self.configs,
-            STACK_STRIDE=grammar.max_stack,
-            SLOTS=self.memo_slots,
-            MEMO_CONFIGS=self.memo_configs,
-            MEMO_STRIDE=self.memo_stride,
-            SUFFIXES=_MEMO_SUFFIXES,
-            BLOCK=128,
-            num_warps=4,
-        )
+        (hash or self._hash_triton)(grammar)
+        (probe or self._probe_triton)(grammar)
         rows = self.batch * self.configs
         # The running sum turns an item back into a configuration and a group.
         # It is a device op on a device value, so the total never comes to the
@@ -4807,15 +4919,7 @@ class DeviceBatch:
             SUFFIXES=_MEMO_SUFFIXES,
             num_warps=1,
         )
-        _copy_kernel[(self.batch, words)](
-            self.memo_slot,
-            self.representative,
-            self.memo_mask,
-            self.mask,
-            grammar.mask_words,
-            BLOCK=512,
-            num_warps=4,
-        )
+        (copy or self._copy_triton)(grammar)
         _store_kernel[(self.batch, words)](
             self.lexer_state,
             self.stack,

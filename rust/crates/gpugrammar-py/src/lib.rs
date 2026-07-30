@@ -686,7 +686,7 @@ fn cuda_fatbin_bytes() -> usize {
 /// Launch one kernel by name. The bring-up path, and the shape every later
 /// launch site will take.
 #[pyfunction]
-#[pyo3(signature = (name, grid, block, stream, pointers, scalars, shared_bytes = 0))]
+#[pyo3(signature = (name, grid, block, stream, pointers, scalars, shared_bytes = 0, grid_y = 1))]
 fn cuda_launch(
     name: &str,
     grid: u32,
@@ -695,6 +695,10 @@ fn cuda_launch(
     pointers: Vec<u64>,
     scalars: Vec<i32>,
     shared_bytes: u32,
+    // A copy wants the sequence in a second dimension: one row is up to 19 KiB
+    // and a grid of one block per sequence leaves a batch of 32 running 32
+    // blocks on 108 multiprocessors.
+    grid_y: u32,
 ) -> PyResult<()> {
     let kernel = gpugrammar_cuda::Kernel::named(name).map_err(PyRuntimeError::new_err)?;
     // The driver takes an array of pointers *to* the arguments, so the values
@@ -716,7 +720,7 @@ fn cuda_launch(
     // the type system - see the note on `Kernel::launch`.
     unsafe {
         kernel
-            .launch((grid, 1, 1), (block, 1, 1), shared_bytes, stream, &mut arguments)
+            .launch((grid, grid_y, 1), (block, 1, 1), shared_bytes, stream, &mut arguments)
             .map_err(PyRuntimeError::new_err)
     }
 }

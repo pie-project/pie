@@ -97,13 +97,14 @@ __device__ __forceinline__ int32_t locate_one(
     const Arena* arena,
     const BatchState* state,
     const Shape shape,
+    const int32_t* token_of,
     int32_t sequence,
     int32_t row,
     int32_t lane,
     bool has_verdicts) {
     int32_t grammar = state->grammar_of[sequence];
     int32_t lexer = state->lexer_state[row];
-    int32_t token = state->token[sequence];
+    int32_t token = token_of[sequence];
 
     int32_t group_base = base_of(arena, grammar, B_GROUP_OFFSETS);
     int32_t groups = base_of(arena, grammar, B_GROUPS);
@@ -167,6 +168,7 @@ __device__ __forceinline__ int32_t locate_one(
 extern "C" __global__ void gg_locate(
     const gg::Arena* arena,
     const gg::BatchState* state,
+    const int32_t* token,
     const int32_t* live_offsets,
     int32_t* found,
     int32_t* old_lexer,
@@ -210,7 +212,7 @@ extern "C" __global__ void gg_locate(
         }
 
         int32_t best =
-            gg::locate_one(arena, state, shape, sequence, row, lane, has_verdicts != 0);
+            gg::locate_one(arena, state, shape, token, sequence, row, lane, has_verdicts != 0);
         if (lane == 0) {
             found[row] = best;
         }
@@ -223,6 +225,7 @@ extern "C" __global__ void gg_locate(
 extern "C" __global__ void gg_locate_no_copy(
     const gg::Arena* arena,
     const gg::BatchState* state,
+    const int32_t* token,
     const int32_t* live_offsets,
     int32_t* found,
     int32_t* old_lexer,
@@ -241,7 +244,7 @@ extern "C" __global__ void gg_locate_no_copy(
     for (int32_t slot = warp; slot < total; slot += warps) {
         int32_t row = gg::owner(live_offsets, rows, slot);
         int32_t sequence = row / configs;
-        int32_t best = gg::locate_one(arena, state, shape, sequence, row, lane, has_verdicts != 0);
+        int32_t best = gg::locate_one(arena, state, shape, token, sequence, row, lane, has_verdicts != 0);
         if (lane == 0) { found[row] = best; }
     }
 }

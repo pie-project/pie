@@ -99,11 +99,17 @@ struct BatchState {
     int32_t* config_count;
     int32_t* widest;
     int32_t* grammar_of;
-    int32_t* token;
     int32_t* terminated;
     int32_t* overflow;
-    int32_t* mask;
 };
+
+// `token` and `mask` are deliberately *not* in here. Everything above is a
+// buffer made once whose address a recorded graph holds; those two are
+// rebound - the draft walk points them at a row of its own arrays for each
+// position of the speculative walk. A struct cached past that aims a kernel at
+// the wrong tensor, and rebuilding it inside a capture is a host-to-device
+// copy, which a capture forbids. So they are passed per launch, where they
+// belong: they are what a step is *about*, not what a batch is made of.
 
 constexpr int BATCH_SLOTS = sizeof(BatchState) / sizeof(int32_t*);
 
