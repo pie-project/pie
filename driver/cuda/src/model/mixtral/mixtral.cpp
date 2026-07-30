@@ -124,44 +124,6 @@ ExpertRouting build_routing(
 
 namespace {
 
-/// The distinct experts a bf16 router-logit block would route to.
-///
-/// Host-side because its consumer is host-side: a page-in is chosen by slot
-/// bookkeeping the device knows nothing about. For decode the block is one
-/// row of `num_experts`, so this is cheaper than a kernel launch.
-std::vector<int> top_k_of(const std::vector<std::uint16_t>& logits,
-                          int rows, int num_experts, int top_k)
-{
-    std::vector<int> out;
-    std::vector<char> taken(static_cast<std::size_t>(num_experts), 0);
-    std::vector<std::pair<float, int>> scored;
-    for (int r = 0; r < rows; ++r) {
-        scored.clear();
-        scored.reserve(num_experts);
-        for (int e = 0; e < num_experts; ++e) {
-            const std::uint32_t bits =
-                static_cast<std::uint32_t>(
-                    logits[static_cast<std::size_t>(r) * num_experts + e])
-                << 16;
-            float f;
-            std::memcpy(&f, &bits, sizeof(f));
-            scored.emplace_back(f, e);
-        }
-        std::partial_sort(scored.begin(), scored.begin() + top_k, scored.end(),
-                          [](const auto& a, const auto& b) {
-                              return a.first > b.first;
-                          });
-        for (int k = 0; k < top_k; ++k) {
-            const int e = scored[k].second;
-            if (!taken[e]) {
-                taken[e] = 1;
-                out.push_back(e);
-            }
-        }
-    }
-    return out;
-}
-
 }  // namespace
 
 void mixtral_forward_paged(
@@ -313,35 +275,6 @@ void mixtral_forward_paged(
         DeviceBuffer<std::uint16_t>::alloc(gemv_routes * I);
     auto d_mxfp4_route_out =
         DeviceBuffer<std::uint16_t>::alloc(gemv_routes * H);
-    // Speculative routing, measured before it is trusted.
-    //
-    // Layer L+1's router will read a normalization of the residual stream. The
-    // stream as it stands at the end of layer L differs from that only by
-    // layer L+1's attention output, so running L+1's own router on it early is
-    // a prediction that costs one [N,H]x[H,E] matmul and no training. It is
-    // worth building the asynchronous page-in it would drive only if the
-    // predicted set actually covers the routed one, which is what this counts.
-    // Off by default, because on this path it buys nothing yet.
-    //
-    // The prediction itself is good: measured against the real router a layer
-    // later it names 92% of the experts actually routed to, with no training
-    // and no change to the model. What it cannot do is help a run that is not
-    // waiting on the transfer. With the host tier warm, a slab big enough to
-    // hold every expert still takes 2.1-2.9 s against 887 ms resident while
-    // moving only 616 slots -- half a second of DMA at most. The rest is the
-    // per-layer host work the streamed path adds, and prefetching has nothing
-    // to hide behind until that is gone.
-    //
-    // Kept, rather than deleted, because it is the only mechanism that can
-    // address a compulsory miss, and because being wrong about which of two
-    // costs dominates is exactly the mistake this feature has already made
-    // twice.
-    const bool predict_next =
-        loader_config::env_truthy("PIE_CUDA_STREAM_PREDICT");
-    const bool predict_probe = predict_next;
-    std::vector<int> predicted_next;
-    std::uint64_t predict_hit = 0, predict_total = 0, predict_layers = 0;
-
     // Where the streamed path's per-layer host time actually goes. The sync is
     // split out from the bookkeeping because they mean opposite things: time
     // in the synchronize is the host waiting for a GPU that is still busy,
@@ -359,15 +292,6 @@ void mixtral_forward_paged(
 
     auto d_mxfp4_moe_out = DeviceBuffer<std::uint16_t>::alloc(
         use_mxfp4_decode_gemv ? static_cast<std::size_t>(N) * H : 0);
-    // The speculative router needs its own normed activations: `ws.norm_y`
-    // still holds this layer's, which its expert GEMV has not read yet.
-    const bool any_streamed = std::any_of(
-        w.layers.begin(), w.layers.end(),
-        [](const auto& l) { return l.expert_cache != nullptr; });
-    auto d_pred_norm = DeviceBuffer<std::uint16_t>::alloc(
-        (predict_next && any_streamed) ? static_cast<std::size_t>(N) * H : 0);
-    std::vector<std::uint16_t> pred_logits;
-
     for (int L = 0; L < cfg.num_hidden_layers; ++L) {
         const auto& layer = w.layers[L];
 
@@ -599,44 +523,6 @@ void mixtral_forward_paged(
             streamed_fused = true;
         } else if (layer.expert_cache != nullptr && use_mxfp4_decode_gemv &&
             !layer.expert_gate_up_packed_ptrs.empty()) {
-            // Speculate on the next layer while reading this one's routing.
-            //
-            // The residual stream here is missing this layer's MoE output and
-            // the next layer's attention, so the next router will not see quite
-            // this vector -- but it is close enough that its top-k mostly
-            // agrees, and being a layer early is what makes the copy free.
-            //
-            // It rides the D2H below rather than adding a sync of its own.
-            // That matters more than it sounds: with page-ins served from
-            // pinned DRAM the host runs whole layers ahead of the device, and a
-            // second synchronize per layer gives that up. Measured, predicting
-            // from a later and more accurate point but paying one extra
-            // synchronize was *slower* than not predicting at all.
-            // Decode only. A prefill step routes to most of the experts at
-            // once, so there is nothing to predict and no idle copy engine to
-            // predict onto -- and its routed set alone can already be most of
-            // the slab.
-            const bool speculate =
-                predict_next && N == 1 && L + 1 < cfg.num_hidden_layers &&
-                w.layers[L + 1].expert_cache != nullptr;
-            if (speculate) {
-                const auto& nxt = w.layers[L + 1];
-                kernels::launch_rmsnorm_bf16(
-                    ws.y.data(), nxt.mlp_norm->data(), d_pred_norm.data(),
-                    N, H, eps, stream);
-                // `ws.gate` held this layer's router logits, which the top-k
-                // above has already consumed.
-                ops::gemm_act_x_wt_bias_bf16(cublas.handle(),
-                    d_pred_norm.data(), nxt.router->data(),
-                    nxt.router_bias ? nxt.router_bias->data() : nullptr,
-                    ws.gate.data(), N, num_experts, H, stream);
-                pred_logits.resize(
-                    static_cast<std::size_t>(N) * num_experts);
-                CUDA_CHECK(cudaMemcpyAsync(
-                    pred_logits.data(), ws.gate.data(),
-                    pred_logits.size() * sizeof(std::uint16_t),
-                    cudaMemcpyDeviceToHost, stream));
-            }
             std::vector<std::int32_t> idx_h(static_cast<std::size_t>(N) * top_k);
             const std::uint64_t t_d2h0 = phase_probe ? now_ns() : 0;
             CUDA_CHECK(cudaMemcpyAsync(idx_h.data(), d_topk_idx.data(),
@@ -646,36 +532,6 @@ void mixtral_forward_paged(
             const std::uint64_t t_sync0 = phase_probe ? now_ns() : 0;
             CUDA_CHECK(cudaStreamSynchronize(stream));
             if (phase_probe) ph_sync += now_ns() - t_sync0;
-            if (speculate) {
-                const auto& nxt = w.layers[L + 1];
-                if (predict_probe && predict_layers > 0) {
-                    std::vector<char> want(
-                        static_cast<std::size_t>(num_experts), 0);
-                    for (const std::int32_t e : idx_h) {
-                        if (e >= 0 && e < num_experts) want[e] = 1;
-                    }
-                    for (int e = 0; e < num_experts; ++e) {
-                        if (!want[e]) continue;
-                        ++predict_total;
-                        if (std::find(predicted_next.begin(),
-                                      predicted_next.end(), e) !=
-                            predicted_next.end()) {
-                            ++predict_hit;
-                        }
-                    }
-                }
-                predicted_next = top_k_of(pred_logits, N, num_experts, top_k);
-                // Issue now, on the cache's own stream, so the bytes move
-                // beside the next layer's attention instead of in front of its
-                // experts. A wrong guess costs one slot of bandwidth; the real
-                // router still pages in whatever it actually wants.
-                for (const int e : predicted_next) {
-                    nxt.expert_cache->prefetch_resident(
-                        nxt.expert_group, static_cast<std::uint32_t>(e),
-                        stream);
-                }
-                ++predict_layers;
-            }
             std::vector<int> routed;
             std::vector<char> seen(static_cast<std::size_t>(num_experts), 0);
             for (const std::int32_t e : idx_h) {
@@ -1058,15 +914,6 @@ void mixtral_forward_paged(
             lm_head_rows, V, H);
         return;
     }
-    if (predict_probe && predict_total > 0) {
-        std::cerr << "[pie-driver-cuda] speculative routing: "
-                  << (100.0 * static_cast<double>(predict_hit) /
-                      static_cast<double>(predict_total))
-                  << "% of routed experts were predicted a layer ahead ("
-                  << predict_hit << " of " << predict_total << " over "
-                  << predict_layers << " layers)\n";
-    }
-
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), w.final_norm->data(), ws.norm_x.data(),
         N, H, eps, stream);
