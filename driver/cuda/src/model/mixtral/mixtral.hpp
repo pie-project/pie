@@ -115,6 +115,12 @@ struct MixtralLayerWeights {
     DeviceBuffer<const std::uint8_t*> expert_down_packed_ptrs;
     DeviceBuffer<const std::uint8_t*> expert_down_scale_ptrs;
     DeviceBuffer<const void*>         expert_down_bias_ptrs;
+
+    /// Set once the layer's experts can no longer move: the pointer arrays
+    /// above then describe every expert permanently, so the forward stops
+    /// reading back the routed set to rebuild them. Mutable because it is a
+    /// memo of the cache's state, not part of the weights.
+    mutable bool expert_ptrs_static = false;
 };
 
 struct MixtralWeights {

@@ -153,8 +153,18 @@ public:
         for (auto& ev : slot_ready_) {
             CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
         }
-        allocate_host_tier(host_budget_bytes, total_instances);
-        warm_host_tier();
+        if (fully_resident()) {
+            // The budget can hold the group outright, so there is nothing to
+            // decide at runtime and no reason to pay for deciding. Fill every
+            // slot now and the forward never calls back into the host: no
+            // routed-set readback, no pointer rebuild, no eviction. A host
+            // tier would only be a second copy of what the slab already holds,
+            // so it is neither allocated nor warmed.
+            place_all();
+        } else {
+            allocate_host_tier(host_budget_bytes, total_instances);
+            warm_host_tier();
+        }
     }
 
     ~GroupStreamCache() {
@@ -253,6 +263,34 @@ public:
         return num_slots() == total_instances();
     }
 
+    /// True once the slab both *can* hold the whole group and actually does:
+    /// every instance has been placed, so every one has a permanent slot and
+    /// no eviction can ever follow.
+    ///
+    /// This is the state worth special-casing. The per-layer D2H that reads
+    /// the routed set exists only so the host can decide which slots to page
+    /// in and where the kernel should look; once nothing can move, both
+    /// answers are fixed and the whole barrier is dead weight. Measured on
+    /// gpt-oss-20b, that barrier is the entire steady-state cost of streaming
+    /// -- a warm slab decodes in 4.64 ms against 3.93 ms resident, and the
+    /// difference is the host waiting for a routing it no longer needs.
+    bool all_placed() const noexcept {
+        return fully_resident() && placed_ == total_instances();
+    }
+
+    /// The tensors of an instance that is already resident, or null.
+    ///
+    /// No pin, no page-in, no statistics: this is for a caller that has
+    /// established by other means -- `all_placed()` -- that residency cannot
+    /// change under it, and only wants the pointers.
+    const WeightStore* store_of(
+        std::size_t group, std::uint32_t instance) const noexcept
+    {
+        const auto found = index_.find(flatten(group, instance));
+        if (found == GroupSlotIndex::kAbsent) return nullptr;
+        return &slot_stores_[static_cast<std::uint32_t>(found)];
+    }
+
     /// Make `instance` resident and return its tensors, keyed by the runtime
     /// names its plan finalizes.
     ///
@@ -287,6 +325,7 @@ public:
 
         const auto acquired = index_.acquire(key);
         ++stats_.misses;
+        if (!acquired.evicted) ++placed_;
         drain_prefetch(acquired.slot);
         if (acquired.evicted) {
             const auto started = Clock::now();
@@ -333,6 +372,7 @@ public:
         const auto acquired = index_.acquire(key);
         ++stats_.misses;
         ++stats_.speculations;
+        if (!acquired.evicted) ++placed_;
         drain_prefetch(acquired.slot);
         if (acquired.evicted) sync_stream(compute_stream);
         fill(acquired.slot, group, instance, key, prefetch_stream_);
@@ -729,6 +769,43 @@ private:
     /// group here in exchange for every later page-in being a PCIe transfer
     /// rather than a disk read, which the numbers price at roughly 4 GB/s
     /// against 15 GB/s.
+    /// Give every instance its permanent slot, at load.
+    ///
+    /// Only called when `fully_resident()`, where the index hands out a
+    /// distinct slot per key and never evicts, so after this every `find`
+    /// hits and `all_placed()` is true for the rest of the process. The bytes
+    /// cost the same as loading the group resident would have -- which is what
+    /// a budget this large asked for -- and buy back the per-layer barrier.
+    void place_all()
+    {
+        if (slot_stores_.empty()) return;
+        const auto started = Clock::now();
+        for (std::size_t g = 0; g < groups_.len; ++g) {
+            const std::uint32_t arity = groups_.ptr[g].arity;
+            for (std::uint32_t i = 0; i < arity; ++i) {
+                const std::uint32_t key = flatten(g, i);
+                if (index_.find(key) != GroupSlotIndex::kAbsent) continue;
+                const auto acquired = index_.acquire(key);
+                if (!acquired.evicted) ++placed_;
+                fill(acquired.slot, g, i, key, /*stream=*/nullptr);
+                index_.release(acquired.slot);
+            }
+        }
+        CUDA_CHECK(cudaStreamSynchronize(nullptr));
+        index_.unpin_all();
+        // Placement is not a miss: it is the load the budget asked for, and
+        // counting it would make every later hit rate meaningless.
+        stats_ = Stats{};
+        if (verbose_) {
+            std::cerr << "[pie-driver-cuda] group stream cache: placed "
+                      << placed_ << " instances in "
+                      << std::chrono::duration_cast<std::chrono::milliseconds>(
+                             Clock::now() - started).count()
+                      << " ms; the slab holds the whole group, so the forward "
+                         "will not call back into the host\n";
+        }
+    }
+
     void warm_host_tier()
     {
         if (host_tier_ == nullptr || host_slots_ == 0 || slot_stores_.empty()) {
@@ -834,6 +911,9 @@ private:
     std::vector<cudaEvent_t> slot_ready_;
     std::vector<bool> slot_pending_;
 
+    /// Distinct instances that have ever been given a slot. Only meaningful
+    /// alongside `fully_resident()`, where a slot is never taken back.
+    std::uint32_t placed_ = 0;
     GroupSlotIndex index_;
     std::vector<WeightStore> slot_stores_;
     std::vector<bool> slot_filled_;

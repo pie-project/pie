@@ -288,9 +288,16 @@ void test_a_paged_expert_equals_the_stacked_one() {
 /// A cache big enough for the group stops paging, and says so.
 ///
 /// This is the case that lets streaming be left on by default: when the slab
-/// holds everything, the second sweep is all hits, `fully_resident` is true,
-/// and the driver keeps CUDA graph capture. If this ever regressed to misses,
+/// holds everything, every sweep is all hits, `fully_resident` is true, and
+/// the driver keeps CUDA graph capture. If this ever regressed to misses,
 /// turning the feature on would cost throughput on cards that never needed it.
+///
+/// The paging happens at construction rather than on the first sweep. A slab
+/// that fits has no residency decision left to make, so `place_all` makes it
+/// once and `all_placed` lets the forward drop the routed-set readback it
+/// would otherwise need every layer -- which is the whole steady-state cost of
+/// streaming. That is why this asserts zero misses rather than one sweep of
+/// them, and why it checks `all_placed`.
 void test_a_slab_that_fits_stops_missing() {
     using namespace pie_cuda_driver;
 
@@ -324,11 +331,20 @@ void test_a_slab_that_fits_stops_missing() {
         cache.end_batch();
     }
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    check(cache.stats().misses == static_cast<std::uint64_t>(kLayers * kExperts),
-          "the first sweep paged, and only the first");
-    check(cache.stats().hits == static_cast<std::uint64_t>(kLayers * kExperts),
-          "the second sweep hit every time");
+    check(cache.stats().misses == 0,
+          "construction placed the group, so no sweep paged");
+    check(cache.stats().hits == static_cast<std::uint64_t>(2 * kLayers * kExperts),
+          "both sweeps hit every time");
     check(cache.evictions() == 0, "nothing was evicted");
+    check(cache.all_placed(),
+          "a slab that fits reports the group placed, so the forward can stop "
+          "reading back the routed set");
+    for (std::size_t g = 0; g < groups.len; ++g) {
+        for (std::uint32_t e = 0; e < kExperts; ++e) {
+            check(cache.store_of(g, e) != nullptr,
+                  "every instance resolves to a slot without a page-in");
+        }
+    }
     CUDA_CHECK(cudaStreamDestroy(stream));
 }
 

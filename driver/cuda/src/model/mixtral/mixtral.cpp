@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <chrono>
 
 #include <cuda_runtime.h>
 
@@ -341,6 +342,21 @@ void mixtral_forward_paged(
     std::vector<int> predicted_next;
     std::uint64_t predict_hit = 0, predict_total = 0, predict_layers = 0;
 
+    // Where the streamed path's per-layer host time actually goes. The sync is
+    // split out from the bookkeeping because they mean opposite things: time
+    // in the synchronize is the host waiting for a GPU that is still busy,
+    // which costs nothing on its own, while time after it is the GPU going
+    // idle behind a host that is not issuing.
+    const bool phase_probe = loader_config::env_truthy("PIE_CUDA_STREAM_PHASES");
+    std::uint64_t ph_sync = 0, ph_pagein = 0, ph_upload = 0;
+    std::uint64_t ph_d2h = 0, ph_block = 0;
+    const auto now_ns = [] {
+        return static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+    };
+    const std::uint64_t ph_t0 = phase_probe ? now_ns() : 0;
+
     auto d_mxfp4_moe_out = DeviceBuffer<std::uint16_t>::alloc(
         use_mxfp4_decode_gemv ? static_cast<std::size_t>(N) * H : 0);
     // The speculative router needs its own normed activations: `ws.norm_y`
@@ -524,7 +540,64 @@ void mixtral_forward_paged(
         // against its own pins.
         bool streamed_fused = false;
         std::vector<int> routed_for_probe;
+        const std::uint64_t t_blk0 = phase_probe ? now_ns() : 0;
+        // Once the slab holds the whole group, nothing about residency can
+        // change again: every expert owns a slot for the rest of the process.
+        // The routed set was only ever read back so the host could decide what
+        // to page in and where to point the kernel, and both answers are now
+        // fixed -- so write the pointer array once, for every expert, and stop
+        // reading anything back.
+        //
+        // This is the difference between streaming costing 18% and costing
+        // nothing. The D2H is a full stream drain, so it converts a pipeline
+        // that ran the host a whole token ahead of the device into one that
+        // serialises at every layer; deleting it puts the pipeline back.
         if (layer.expert_cache != nullptr && use_mxfp4_decode_gemv &&
+            !layer.expert_gate_up_packed_ptrs.empty() &&
+            !layer.expert_ptrs_static && layer.expert_cache->all_placed()) {
+            std::vector<const std::uint8_t*> gu(num_experts, nullptr);
+            std::vector<const std::uint8_t*> gs(num_experts, nullptr);
+            std::vector<const std::uint8_t*> dn(num_experts, nullptr);
+            std::vector<const std::uint8_t*> ds(num_experts, nullptr);
+            bool complete = true;
+            for (int e = 0; e < num_experts; ++e) {
+                const WeightStore* slot = layer.expert_cache->store_of(
+                    layer.expert_group, static_cast<std::uint32_t>(e));
+                if (slot == nullptr) { complete = false; break; }
+                gu[e] = static_cast<const std::uint8_t*>(
+                    slot->get("gate_up_proj.weight").data());
+                gs[e] = static_cast<const std::uint8_t*>(
+                    slot->get("gate_up_proj.weight_scale").data());
+                dn[e] = static_cast<const std::uint8_t*>(
+                    slot->get("down_proj.weight").data());
+                ds[e] = static_cast<const std::uint8_t*>(
+                    slot->get("down_proj.weight_scale").data());
+            }
+            if (complete) {
+                const std::size_t nb =
+                    static_cast<std::size_t>(num_experts) * sizeof(const void*);
+                const auto up = [&](const DeviceBuffer<const std::uint8_t*>& d,
+                                    const std::vector<const std::uint8_t*>& h) {
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        const_cast<void*>(static_cast<const void*>(d.data())),
+                        h.data(), nb, cudaMemcpyHostToDevice, stream));
+                };
+                up(layer.expert_gate_up_packed_ptrs, gu);
+                up(layer.expert_gate_up_scale_ptrs, gs);
+                up(layer.expert_down_packed_ptrs, dn);
+                up(layer.expert_down_scale_ptrs, ds);
+                // The kernels below read the array on the same stream, so the
+                // upload is ordered ahead of them; but a later forward will
+                // not re-issue it, so make sure it has landed before the flag
+                // says it did.
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                layer.expert_ptrs_static = true;
+            }
+        }
+        if (layer.expert_cache != nullptr && layer.expert_ptrs_static &&
+            use_mxfp4_decode_gemv && !layer.expert_gate_up_packed_ptrs.empty()) {
+            streamed_fused = true;
+        } else if (layer.expert_cache != nullptr && use_mxfp4_decode_gemv &&
             !layer.expert_gate_up_packed_ptrs.empty()) {
             // Speculate on the next layer while reading this one's routing.
             //
@@ -565,10 +638,14 @@ void mixtral_forward_paged(
                     cudaMemcpyDeviceToHost, stream));
             }
             std::vector<std::int32_t> idx_h(static_cast<std::size_t>(N) * top_k);
+            const std::uint64_t t_d2h0 = phase_probe ? now_ns() : 0;
             CUDA_CHECK(cudaMemcpyAsync(idx_h.data(), d_topk_idx.data(),
                                        idx_h.size() * sizeof(std::int32_t),
                                        cudaMemcpyDeviceToHost, stream));
+            if (phase_probe) ph_d2h += now_ns() - t_d2h0;
+            const std::uint64_t t_sync0 = phase_probe ? now_ns() : 0;
             CUDA_CHECK(cudaStreamSynchronize(stream));
+            if (phase_probe) ph_sync += now_ns() - t_sync0;
             if (speculate) {
                 const auto& nxt = w.layers[L + 1];
                 if (predict_probe && predict_layers > 0) {
@@ -609,6 +686,7 @@ void mixtral_forward_paged(
             }
             routed_for_probe = routed;
             if (routed.size() <= layer.expert_cache->num_slots()) {
+                const std::uint64_t t_pg0 = phase_probe ? now_ns() : 0;
                 for (const int e : routed) {
                     layer.expert_cache->prefetch(layer.expert_group,
                                                  static_cast<std::uint32_t>(e));
@@ -629,9 +707,11 @@ void mixtral_forward_paged(
                     ds[e] = static_cast<const std::uint8_t*>(
                         slot.get("down_proj.weight_scale").data());
                 }
+                if (phase_probe) ph_pagein += now_ns() - t_pg0;
                 // Pageable source, so the driver stages it before returning and
                 // these vectors may die at the end of the block; the DMA that
                 // follows is ordered on `stream` ahead of the kernels.
+                const std::uint64_t t_up0 = phase_probe ? now_ns() : 0;
                 const std::size_t nbytes =
                     static_cast<std::size_t>(num_experts) * sizeof(const void*);
                 CUDA_CHECK(cudaMemcpyAsync(
@@ -650,9 +730,11 @@ void mixtral_forward_paged(
                     const_cast<void*>(static_cast<const void*>(
                         layer.expert_down_scale_ptrs.data())), ds.data(), nbytes,
                     cudaMemcpyHostToDevice, stream));
+                if (phase_probe) ph_upload += now_ns() - t_up0;
                 streamed_fused = true;
             }
         }
+        if (phase_probe && layer.expert_cache != nullptr) ph_block += now_ns() - t_blk0;
         if ((layer.expert_cache == nullptr || streamed_fused) &&
             use_mxfp4_decode_gemv &&
             !layer.expert_gate_up_packed_ptrs.empty()) {
@@ -932,6 +1014,23 @@ void mixtral_forward_paged(
             kernels::launch_residual_add_bf16(
                 ws.y.data(), ws.norm_x.data(), N * H, stream);
         }
+    }
+
+    if (phase_probe) {
+        // Issue time is how long the host took to walk the loop; total adds
+        // the wait for the device to finish what the loop queued. Their
+        // difference is the only honest way to say whether the streamed path
+        // is slow because the host is not issuing or because the GPU is busy.
+        const std::uint64_t t_issue = now_ns() - ph_t0;
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        const std::uint64_t t_total = now_ns() - ph_t0;
+        std::cerr << "[pie-driver-cuda] MoE forward N=" << N << " issue "
+                  << (t_issue / 1e6) << " ms, total " << (t_total / 1e6)
+                  << " ms | streamed host: sync " << (ph_sync / 1e6)
+                  << " ms, page-in+ptrs " << (ph_pagein / 1e6)
+                  << " ms, upload " << (ph_upload / 1e6) << " ms, d2h "
+                  << (ph_d2h / 1e6) << " ms, whole block " << (ph_block / 1e6)
+                  << " ms\n";
     }
 
     if (!fwd_cfg.emit_logits) {
