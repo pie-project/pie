@@ -49,6 +49,11 @@ const MODELS: &[Model] = &[
         fixture: "phi3",
         revision: "f39ac1d28e925b323eae81227eaba4464caced4e",
     },
+    Model {
+        id: "mistralai/Mistral-7B-Instruct-v0.3",
+        fixture: "mistral7b",
+        revision: "c170c708c41dac9275d15a8fff4eca08d52bab71",
+    },
 ];
 
 #[test]
@@ -63,10 +68,20 @@ fn official_hf_models_match_exactly() {
 /// runs in a default `cargo test` wherever the model is already cached.
 #[test]
 fn official_phi3_matches_exactly_when_cached() {
+    assert_matches_exactly_when_cached("phi3");
+}
+
+/// Metaspace-profile parity for Mistral-7B-v0.3, gated the same way.
+#[test]
+fn official_mistral_matches_exactly_when_cached() {
+    assert_matches_exactly_when_cached("mistral7b");
+}
+
+fn assert_matches_exactly_when_cached(fixture: &str) {
     let model = MODELS
         .iter()
-        .find(|model| model.fixture == "phi3")
-        .expect("phi3 model entry");
+        .find(|model| model.fixture == fixture)
+        .expect("model entry");
     let path = PathBuf::from(std::env::var_os("HOME").expect("HOME is not set"))
         .join(".cache/huggingface/hub")
         .join(format!("models--{}", model.id.replace('/', "--")))

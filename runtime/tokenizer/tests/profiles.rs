@@ -2,7 +2,7 @@ mod common;
 
 use std::sync::Arc;
 
-use common::{MergeFormat, byte_level_json, gemma_json, phi3_json};
+use common::{MergeFormat, byte_level_json, gemma_json, mistral_json, phi3_json};
 use pie_tokenizer::Tokenizer;
 use serde_json::json;
 use tokenizers::Tokenizer as HfTokenizer;
@@ -147,6 +147,121 @@ fn phi3_sentencepiece_profile_is_exact() {
     assert_eq!(pie.encode("a <|end|>  b"), vec![5, 2, 263, 6]);
     // Byte fallback still round-trips.
     assert_eq!(pie.decode(&pie.encode("叫"), false), "叫");
+}
+
+#[test]
+fn mistral_metaspace_profile_is_exact() {
+    let tokenizer = mistral_json();
+    assert_exact(
+        &tokenizer,
+        &[
+            "",
+            "a b",
+            " a",
+            "a ",
+            "  a  b  ",
+            "▁a",
+            "a\tb",
+            "叫",
+            "a叫b",
+            "<s>a b",
+            "<s> a",
+            "[INST]a",
+            "a [INST] b",
+            "[INST]a b[INST]",
+            "<s>[INST]",
+        ],
+    );
+
+    let pie: Tokenizer = tokenizer.to_string().parse().unwrap();
+    // Dummy prefix at the input start, Strip undoing it on decode.
+    assert_eq!(pie.encode("a b"), vec![5, 6]);
+    assert_eq!(pie.decode(&[5, 6], false), "a b");
+    // A leading space already produces the marker → no extra prefix.
+    assert_eq!(pie.encode(" a"), vec![5]);
+    // Segments after a special token receive no prefix.
+    assert_eq!(pie.encode("[INST]a b"), vec![263, 3, 6]);
+    // Byte fallback still round-trips.
+    assert_eq!(pie.decode(&pie.encode("叫"), false), "叫");
+}
+
+#[test]
+fn metaspace_shape_variants_are_rejected() {
+    // Metaspace splitting has different segmentation semantics.
+    let mut tokenizer = mistral_json();
+    tokenizer["pre_tokenizer"]["split"] = json!(true);
+    let error = tokenizer.to_string().parse::<Tokenizer>().err().unwrap();
+    assert!(error.to_string().contains("Metaspace.split must be false"));
+
+    // Only the "first" prepend scheme is this profile.
+    for scheme in ["always", "never"] {
+        let mut tokenizer = mistral_json();
+        tokenizer["pre_tokenizer"]["prepend_scheme"] = json!(scheme);
+        let error = tokenizer.to_string().parse::<Tokenizer>().err().unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("unsupported Metaspace prepend_scheme: {scheme}"))
+        );
+    }
+
+    // A missing prepend_scheme defaults to "always" in HF → reject.
+    let mut tokenizer = mistral_json();
+    tokenizer["pre_tokenizer"]
+        .as_object_mut()
+        .unwrap()
+        .remove("prepend_scheme");
+    let error = tokenizer.to_string().parse::<Tokenizer>().err().unwrap();
+    assert!(error.to_string().contains("requires prepend_scheme"));
+
+    // Legacy serializations carrying add_prefix_space are ambiguous → reject.
+    let mut tokenizer = mistral_json();
+    tokenizer["pre_tokenizer"]["add_prefix_space"] = json!(true);
+    let error = tokenizer.to_string().parse::<Tokenizer>().err().unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("add_prefix_space is unsupported")
+    );
+
+    // An active normalizer is not part of the Metaspace profile.
+    let mut tokenizer = mistral_json();
+    tokenizer["normalizer"] = json!({"type": "NFC"});
+    let error = tokenizer.to_string().parse::<Tokenizer>().err().unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("unsupported metaspace normalizer: NFC")
+    );
+
+    // The decoder must end in the dummy-prefix Strip.
+    let mut tokenizer = mistral_json();
+    tokenizer["decoder"]["decoders"]
+        .as_array_mut()
+        .unwrap()
+        .pop();
+    let error = tokenizer.to_string().parse::<Tokenizer>().err().unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("must contain Replace, ByteFallback, Fuse, Strip")
+    );
+
+    // The decoder Replace must reverse the Metaspace replacement.
+    let mut tokenizer = mistral_json();
+    tokenizer["decoder"]["decoders"][0]["pattern"]["String"] = json!("_");
+    let error = tokenizer.to_string().parse::<Tokenizer>().err().unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("decoder Replace must reverse the normalizer")
+    );
+
+    // Metaspace requires byte fallback.
+    let mut tokenizer = mistral_json();
+    tokenizer["model"]["byte_fallback"] = json!(false);
+    let error = tokenizer.to_string().parse::<Tokenizer>().err().unwrap();
+    assert!(error.to_string().contains("requires byte_fallback"));
 }
 
 #[test]

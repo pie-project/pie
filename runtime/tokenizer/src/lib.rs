@@ -51,6 +51,22 @@ impl BpeMode {
     }
 }
 
+/// How the sentencepiece dummy prefix (`normalizer_to` marker) is injected
+/// while encoding a `ByteFallbackReplace` pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DummyPrefix {
+    /// No marker is prepended (Gemma).
+    None,
+    /// Prepend one marker to every encoded text segment, unconditionally
+    /// (HF `Prepend` normalizer; the legacy Llama-2/Phi-3 shape).
+    EverySegment,
+    /// Prepend one marker only to a segment that starts the input, and only
+    /// when it does not already begin with the marker after space
+    /// replacement (HF `Metaspace` pre-tokenizer with
+    /// `prepend_scheme: "first"`; Mistral).
+    FirstSegment,
+}
+
 /// Compiled tokenizer behavior for the modern model families supported by Pie.
 #[derive(Debug)]
 pub(crate) enum Pipeline {
@@ -61,16 +77,16 @@ pub(crate) enum Pipeline {
         bpe_mode: BpeMode,
     },
     /// Sentencepiece-style space marker normalization with byte fallback on
-    /// decode. Covers Gemma (`prepend_marker: false`) and the legacy
-    /// Llama-2/Phi-3 shape (`prepend_marker: true`, dummy prefix + decoder
+    /// decode. Covers Gemma (`DummyPrefix::None`), the legacy Llama-2/Phi-3
+    /// shape (`DummyPrefix::EverySegment` + decoder `Strip`), and the
+    /// Mistral Metaspace shape (`DummyPrefix::FirstSegment` + decoder
     /// `Strip`).
     ByteFallbackReplace {
         normalizer_from: String,
         normalizer_to: String,
         unk_token_id: Option<u32>,
-        /// Prepend one `normalizer_to` marker to every encoded text segment
-        /// (the sentencepiece dummy prefix, HF `Prepend` normalizer).
-        prepend_marker: bool,
+        /// Dummy-prefix injection mode for encoded text segments.
+        dummy_prefix: DummyPrefix,
         /// Remove one leading `normalizer_from` from the decoded stream
         /// (HF decoder `Strip { start: 1 }`, undoing the dummy prefix).
         strip_decoder_marker: bool,
@@ -264,7 +280,7 @@ impl Tokenizer {
             return;
         }
         let Some(matcher) = &self.added_token_matcher else {
-            self.encode_text(text, ids);
+            self.encode_text(text, true, ids);
             return;
         };
 
@@ -278,7 +294,9 @@ impl Tokenizer {
                 segment_end = last_end + segment.trim_end_matches(char::is_whitespace).len();
             }
             if segment_end > last_end {
-                self.encode_text(&text[last_end..segment_end], ids);
+                // A segment starts the input iff it begins at byte 0; any
+                // segment after an added token cannot.
+                self.encode_text(&text[last_end..segment_end], last_end == 0, ids);
             }
             ids.push(token.id);
             last_end = last_end.max(matched.end());
@@ -289,7 +307,7 @@ impl Tokenizer {
             }
         }
         if last_end < text.len() {
-            self.encode_text(&text[last_end..], ids);
+            self.encode_text(&text[last_end..], last_end == 0, ids);
         }
     }
 
@@ -315,7 +333,7 @@ impl Tokenizer {
         }
     }
 
-    fn encode_text(&self, text: &str, ids: &mut Vec<u32>) {
+    fn encode_text(&self, text: &str, starts_input: bool, ids: &mut Vec<u32>) {
         match &self.pipeline {
             Pipeline::ByteLevelRegex { nfc, splitters, .. } => {
                 let text = if *nfc && is_nfc_quick(text.chars()) != IsNormalized::Yes {
@@ -328,7 +346,7 @@ impl Tokenizer {
             Pipeline::ByteFallbackReplace {
                 normalizer_from,
                 normalizer_to,
-                prepend_marker,
+                dummy_prefix,
                 ..
             } => {
                 let text = if text.contains(normalizer_from.as_str()) {
@@ -336,7 +354,17 @@ impl Tokenizer {
                 } else {
                     Cow::Borrowed(text)
                 };
-                if *prepend_marker {
+                let prepend = match dummy_prefix {
+                    DummyPrefix::None => false,
+                    DummyPrefix::EverySegment => true,
+                    // Metaspace `prepend_scheme: "first"`: only the segment
+                    // starting the input, and only when the replaced text
+                    // does not already begin with the marker.
+                    DummyPrefix::FirstSegment => {
+                        starts_input && !text.starts_with(normalizer_to.as_str())
+                    }
+                };
+                if prepend {
                     let mut prefixed = String::with_capacity(normalizer_to.len() + text.len());
                     prefixed.push_str(normalizer_to);
                     prefixed.push_str(&text);
@@ -876,13 +904,13 @@ mod tests {
     }
 
     fn make_byte_fallback_tokenizer(vocab: &[(&str, u32)], merges: &[(&str, &str)]) -> Tokenizer {
-        make_sentencepiece_tokenizer(vocab, merges, false, vec![])
+        make_sentencepiece_tokenizer(vocab, merges, DummyPrefix::None, vec![])
     }
 
     fn make_sentencepiece_tokenizer(
         vocab: &[(&str, u32)],
         merges: &[(&str, &str)],
-        prepend_and_strip: bool,
+        dummy_prefix: DummyPrefix,
         added_tokens: Vec<AddedToken>,
     ) -> Tokenizer {
         let vocab_map: HashMap<String, u32> =
@@ -896,14 +924,15 @@ mod tests {
             bpe.insert_added(at.content.as_bytes().to_vec(), at.id)
                 .unwrap();
         }
+        let strip_decoder_marker = dummy_prefix != DummyPrefix::None;
         Tokenizer::new(
             bpe,
             Pipeline::ByteFallbackReplace {
                 normalizer_from: " ".into(),
                 normalizer_to: "▁".into(),
                 unk_token_id: None,
-                prepend_marker: prepend_and_strip,
-                strip_decoder_marker: prepend_and_strip,
+                dummy_prefix,
+                strip_decoder_marker,
             },
             added_tokens,
         )
@@ -1100,7 +1129,7 @@ mod tests {
 
     #[test]
     fn sentencepiece_prepend_and_strip_roundtrip() {
-        let tok = make_sentencepiece_tokenizer(SP_VOCAB, SP_MERGES, true, vec![]);
+        let tok = make_sentencepiece_tokenizer(SP_VOCAB, SP_MERGES, DummyPrefix::EverySegment, vec![]);
         // Dummy prefix: "a b" → "▁a▁b" → [▁a, ▁b]; Strip undoes it on decode.
         let ids = tok.encode("a b");
         assert_eq!(ids, vec![3, 4]);
@@ -1117,7 +1146,7 @@ mod tests {
         let tok = make_sentencepiece_tokenizer(
             SP_VOCAB,
             SP_MERGES,
-            true,
+            DummyPrefix::EverySegment,
             vec![sp_added(5, "<s>", false, false)],
         );
         // First decoded char is not the marker → nothing is stripped.
@@ -1131,7 +1160,7 @@ mod tests {
         let tok = make_sentencepiece_tokenizer(
             SP_VOCAB,
             SP_MERGES,
-            true,
+            DummyPrefix::EverySegment,
             vec![sp_added(5, "<e>", false, true), sp_added(6, "<l>", true, false)],
         );
         // rstrip: the whitespace after <e> joins the match and is not encoded.
@@ -1143,7 +1172,7 @@ mod tests {
         let plain = make_sentencepiece_tokenizer(
             SP_VOCAB,
             SP_MERGES,
-            true,
+            DummyPrefix::EverySegment,
             vec![sp_added(5, "<e>", false, false)],
         );
         assert_eq!(plain.encode("a <e> b"), vec![3, 1, 5, 1, 4]);
@@ -1154,7 +1183,7 @@ mod tests {
         let tokenizer = Arc::new(make_sentencepiece_tokenizer(
             SP_VOCAB,
             SP_MERGES,
-            true,
+            DummyPrefix::EverySegment,
             vec![sp_added(5, "<s>", false, false)],
         ));
         let mut decoder = tokenizer.decoder(false);
@@ -1170,5 +1199,26 @@ mod tests {
         incremental.push_str(&decoder.finish());
         assert_eq!(incremental, tokenizer.decode(&[5, 3, 4], false));
         assert_eq!(incremental, "<s> a b");
+    }
+
+    #[test]
+    fn metaspace_first_prefixes_only_the_input_start() {
+        let tok = make_sentencepiece_tokenizer(
+            SP_VOCAB,
+            SP_MERGES,
+            DummyPrefix::FirstSegment,
+            vec![sp_added(5, "<s>", false, false)],
+        );
+        // Dummy prefix at the very start of the input.
+        assert_eq!(tok.encode("a b"), vec![3, 4]);
+        // Already starts with the marker after space replacement → no prefix.
+        assert_eq!(tok.encode(" a"), vec![3]);
+        assert_eq!(tok.encode("▁a"), vec![3]);
+        // Segments after an added token never receive the prefix.
+        assert_eq!(tok.encode("<s>a"), vec![5, 0]);
+        assert_eq!(tok.encode("<s> a"), vec![5, 3]);
+        assert_eq!(tok.encode("a<s>a"), vec![3, 5, 0]);
+        // Strip still removes one leading space on decode.
+        assert_eq!(tok.decode(&[3, 4], false), "a b");
     }
 }
