@@ -182,7 +182,8 @@ LoadedModel LoadedModel::load(
         model::ContractBuilder builder(
             checkpoint, facts, device_target,
             model::resolve_runtime_quant(runtime_quant, fp8_native),
-            mxfp4_moe, component, contract);
+            mxfp4_moe, component, boot_cfg.model.stream_routed_experts,
+            contract);
         arch->author_contract(builder);
         builder.finish();
         mxfp4_moe_policy = builder.mxfp4_moe();

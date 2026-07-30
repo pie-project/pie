@@ -431,13 +431,15 @@ class ContractBuilder {
 public:
     ContractBuilder(const Checkpoint& checkpoint, const ModelFacts& facts,
                     const pie_loader::DeviceTarget& target, std::string_view runtime_quant,
-                    Mxfp4MoeRequest mxfp4_moe, Component component, ModelContract& out)
+                    Mxfp4MoeRequest mxfp4_moe, Component component,
+                    bool stream_routed_experts, ModelContract& out)
         : facts_(facts),
           target_(target),
           runtime_quant_(runtime_quant),
           mxfp4_moe_request_(mxfp4_moe),
           mxfp4_moe_(resolve_mxfp4_moe(mxfp4_moe, target.native_mxfp4_moe)),
           component_(component),
+          stream_routed_experts_(stream_routed_experts),
           tensors_(checkpoint.tensors()),
           contract_(out) {
         out.align(std::max<std::uint32_t>(1, target_.preferred_alignment));
@@ -463,6 +465,19 @@ public:
     /// Only an author with a reason to disagree with the device rule needs
     /// this, and the reason belongs in that author's file.
     Mxfp4MoeRequest mxfp4_moe_request() const noexcept { return mxfp4_moe_request_; }
+    /// Whether the operator asked for routed experts to be paged rather than
+    /// made resident.
+    ///
+    /// It reaches the author because it changes what the contract *says*, not
+    /// just what the driver does with it: a streamed family declares its
+    /// experts as a `group` of one expert each rather than as one stacked slab
+    /// per layer, and only the file that knows the family can say which of its
+    /// tensors constitute one instance. Every other consequence -- the slab,
+    /// the eviction, the graph gate -- follows from the driver reading that
+    /// group back, and the loader never learns which reading was meant.
+    ///
+    /// A family with nothing worth paging may ignore it.
+    bool stream_routed_experts() const noexcept { return stream_routed_experts_; }
     ModelContract& contract() noexcept { return contract_; }
     const std::vector<SourceTensor>& tensors() const noexcept { return tensors_; }
 
@@ -1245,6 +1260,7 @@ private:
     Mxfp4MoeRequest mxfp4_moe_request_;
     Mxfp4MoePolicy mxfp4_moe_;
     Component component_;
+    bool stream_routed_experts_ = false;
     std::vector<SourceTensor> tensors_;
     std::unordered_map<std::string_view, const SourceTensor*> by_name_;
     std::unordered_set<std::uint32_t> consumed_;
