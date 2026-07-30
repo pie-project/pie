@@ -125,7 +125,19 @@ public:
             static_cast<std::uint32_t>(slots));
         slot_stores_.resize(slots);
         slot_filled_.assign(slots, false);
-        copy_engine_.prefer_small_transfers();
+        // A page-in is one slot, and how big that is decides which engine
+        // is the right one. The default engine spreads a copy over a pool of
+        // streams and stages it through host reader lanes -- machinery that
+        // buys throughput on a whole model and is pure setup on a few hundred
+        // kilobytes, which is where the 175-to-18-microsecond result came
+        // from. But a GPT-OSS slot is 12 MiB, not 192 KiB, and there that same
+        // machinery is what the transfer needs. So pick by measurement rather
+        // than by family: below a lane's staging buffer there is nothing for a
+        // lane to do.
+        constexpr std::uint64_t kSmallSlot = 2u << 20;
+        if (slot_bytes_ < kSmallSlot) {
+            copy_engine_.prefer_small_transfers();
+        }
         // A knob because prefetching is only visibly worth anything against a
         // cold page cache, and telling whether it helped means running the
         // same thing without it.
@@ -255,7 +267,7 @@ public:
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     Clock::now() - started).count());
         }
-        fill(acquired.slot, group, instance, key);
+        fill(acquired.slot, group, instance, key, compute_stream);
         return slot_stores_[acquired.slot];
     }
 
@@ -405,14 +417,21 @@ private:
     /// interchangeable with another's byte for byte. Nothing has to be
     /// re-planned, re-allocated or re-transformed; a tier hit is one H2D of
     /// bytes that are already in the form the kernels read.
-    bool fill_from_host(std::uint32_t slot, std::uint32_t key)
+    bool fill_from_host(std::uint32_t slot, std::uint32_t key, cudaStream_t stream)
     {
         if (host_tier_ == nullptr || !slot_filled_[slot]) return false;
         const auto found = host_of_.find(key);
         if (found == host_of_.end()) return false;
-        CUDA_CHECK(cudaMemcpy(
+        // Async, on the stream that is about to read the slot. A blocking
+        // `cudaMemcpy` would be correct too, but it synchronizes the whole
+        // device, and at a slot of any size that costs more than the copy: on
+        // GPT-OSS it turned a 1.5 ms page-in into a 3.2 ms one. Stream order
+        // is all the ordering this needs, because the kernels that read the
+        // slot are queued on the same stream and the eviction that made the
+        // slot free already synchronized it.
+        CUDA_CHECK(cudaMemcpyAsync(
             slot_base(slot), host_slot(found->second), slot_bytes_,
-            cudaMemcpyHostToDevice));
+            cudaMemcpyHostToDevice, stream));
         ++stats_.host_tier_hits;
         stats_.bytes_paged_in += slot_bytes_;
         return true;
@@ -426,13 +445,19 @@ private:
     /// the whole policy. Which instances win is arrival order, which for a
     /// routed model is the first step's routing, and no worse a guess than
     /// any other before a run has been observed.
-    void keep_in_host(std::uint32_t slot, std::uint32_t key)
+    void keep_in_host(std::uint32_t slot, std::uint32_t key, cudaStream_t stream)
     {
         if (host_tier_ == nullptr || host_of_.count(key) != 0) return;
         if (host_of_.size() >= host_slots_) return;
         const std::uint32_t at = static_cast<std::uint32_t>(host_of_.size());
-        CUDA_CHECK(cudaMemcpy(
-            host_slot(at), slot_base(slot), slot_bytes_, cudaMemcpyDeviceToHost));
+        // Async for the same reason the hit is: a blocking copy here
+        // synchronizes the device once per fill, which on a slot of any size
+        // costs more than the copy itself. Nobody reads this host slot until
+        // a later `fill_from_host` on this same stream, so stream order is
+        // the whole of the ordering it needs.
+        CUDA_CHECK(cudaMemcpyAsync(
+            host_slot(at), slot_base(slot), slot_bytes_,
+            cudaMemcpyDeviceToHost, stream));
         host_of_.emplace(key, at);
     }
 
@@ -441,10 +466,10 @@ private:
     }
 
     void fill(std::uint32_t slot, std::size_t group_index,
-              std::uint32_t instance, std::uint32_t key)
+              std::uint32_t instance, std::uint32_t key, cudaStream_t stream)
     {
         const auto started_total = Clock::now();
-        if (fill_from_host(slot, key)) {
+        if (fill_from_host(slot, key, stream)) {
             stats_.page_in_ns += static_cast<std::uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     Clock::now() - started_total).count());
@@ -494,7 +519,7 @@ private:
         } else {
             check_layout_held(slot, scratch, flatten(group_index, instance));
         }
-        keep_in_host(slot, key);
+        keep_in_host(slot, key, stream);
     }
 
     /// The invariant the whole design rests on: a page-in replaces bytes, not
