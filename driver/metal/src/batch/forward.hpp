@@ -260,6 +260,18 @@ inline std::uint32_t paged_max_forward_tokens(std::uint32_t vocab,
                                      kPagedMaxForwardTokensCeiling);
 }
 
+/// The row budget for the families `SimpleFamilyEngine` serves.
+///
+/// They allocate their activation pool for `max_forward_tokens` ROWS at setup,
+/// so what is advertised and what is allocated have to be the SAME number --
+/// advertise more and the driver accepts a fire it cannot hold; allocate more
+/// and an 11.8 GB checkpoint fails to create its heap over a fire nobody asked
+/// for. One function, called from both places.
+inline std::uint32_t simple_family_max_forward_tokens(std::uint32_t requested) {
+    if (requested == 0) return 1;
+    return std::min(requested, kPagedMaxForwardTokensCeiling);
+}
+
 struct SetupConfig {
     std::string checkpoint_dir;  // HF snapshot dir (config.json + safetensors)
     std::string kernels_dir;     // compiled .metal library search dir

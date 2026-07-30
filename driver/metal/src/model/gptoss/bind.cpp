@@ -81,6 +81,10 @@ void bind_gptoss_dag(RawMetalContext& ctx, const BoundGptOss& b, const std::vect
                 bind_slot(ctx, ord, (std::uint8_t)bind::SdpaSink::N, io(IoSlot::SeqLen));
                 break;
             }
+            case Kind::RowGather:
+                bind_slot(ctx, ord, (std::uint8_t)bind::RowGather::Rows,
+                          io(IoSlot::SampleRows));
+                break;
             case Kind::Argmax:
                 bind_slot(ctx, ord, 1, io(IoSlot::TokenId));
                 break;
@@ -165,6 +169,10 @@ void bind_gptoss_dag_paged(RawMetalContext& ctx, const BoundGptOss& b,
                           io(IoSlot::AttnMaskEnabled));
                 break;
             }
+            case Kind::RowGather:
+                bind_slot(ctx, ord, (std::uint8_t)bind::RowGather::Rows,
+                          io(IoSlot::SampleRows));
+                break;
             case Kind::Argmax:
                 bind_slot(ctx, ord, 1, io(IoSlot::TokenId));
                 break;

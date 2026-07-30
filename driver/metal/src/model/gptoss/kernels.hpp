@@ -24,6 +24,10 @@ namespace pie::metal::gptoss {
 
 /// Params structs, replicated EXACTLY from the .metal sources. A mismatch here
 /// is silent: the GPU reads whatever bytes are at the offset.
+struct RowGatherParams {   // row_gather.metal (buffer 3)
+    std::uint32_t width;
+    std::uint32_t count;
+};
 struct RouterParams {          // gptoss.metal
     std::uint32_t n_experts;
     std::uint32_t experts_per_token;
@@ -57,6 +61,12 @@ struct GptOssPsos {
     Pso sdpa_sink_paged{};
     /// YaRN, as a frequency table the host computed once.
     Pso rope_freqs{};
+    /// The M>1 counterparts: the two kernels whose ROW indexing differs, rather
+    /// than only their launch width.
+    Pso rope_freqs_mb{};
+    /// The sampled rows, compacted before the tail. Family-agnostic: the same
+    /// kernel gemma4 uses.
+    Pso row_gather{};
 
     bool valid() const {
         return qmv_tail.valid() && qmv_tail_bias.valid() && qmv_routed_bias.valid() &&
@@ -92,22 +102,25 @@ inline void elementwise_dispatch(int n, Grid& g, Threadgroup& tg) {
 
 /// `router_topk`: one threadgroup, one lane per expert. 32 on this family, so a
 /// single simdgroup holds the whole distribution.
-inline void router_topk_dispatch(int n_experts, Grid& g, Threadgroup& tg) {
+inline void router_topk_dispatch(int n_experts, Grid& g, Threadgroup& tg, int rows = 1) {
     const std::uint32_t w = std::uint32_t(n_experts < 32 ? 32 : n_experts);
-    g = Grid{w, 1, 1};
+    g = Grid{w, std::uint32_t(rows < 1 ? 1 : rows), 1};
     tg = Threadgroup{w, 1, 1};
 }
 
 /// `affine_qmv_u8_bias`: one simdgroup per output row.
-inline void qmv_u8_dispatch(int N, Grid& g, Threadgroup& tg) {
-    g = Grid{32u, std::uint32_t(N > 0 ? N : 1), 1};
+inline void qmv_u8_dispatch(int N, Grid& g, Threadgroup& tg, int rows = 1) {
+    g = Grid{32u, std::uint32_t(N > 0 ? N : 1), std::uint32_t(rows < 1 ? 1 : rows)};
     tg = Threadgroup{32, 1, 1};
 }
 
 /// The 4-bit matvec. `slots` is 1 for an ordinary projection and
 /// `experts_per_token` for a routed one, on the third grid axis.
-inline void qmv_dispatch(int N, int slots, Grid& g, Threadgroup& tg) {
-    g = Grid{32, std::uint32_t(N) / 4, std::uint32_t(slots < 1 ? 1 : slots)};
+/// `rows` folds onto the x axis, which the kernel already reads as the token
+/// row: the grid is in THREADS, so one threadgroup of 32 per row.
+inline void qmv_dispatch(int N, int slots, Grid& g, Threadgroup& tg, int rows = 1) {
+    g = Grid{32u * std::uint32_t(rows < 1 ? 1 : rows), std::uint32_t(N) / 4,
+             std::uint32_t(slots < 1 ? 1 : slots)};
     tg = Threadgroup{32, 2, 1};
 }
 

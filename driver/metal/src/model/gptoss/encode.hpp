@@ -31,6 +31,19 @@ void launch_shape(const Dispatch& d, const GptOssGeometry& g, Grid& grid, Thread
 std::vector<int> gptoss_run_ends(const std::vector<Dispatch>& dag);
 
 /// Walk the DAG with a real encoder.
+/// The pipeline a dispatch runs on at M>1, its launch shape, and the walk.
+///
+/// `head_rows` is how many rows the fire SAMPLES -- what `Kind::RowGather`
+/// compacts, and what the tail after it runs on. 0 means every row.
+Pso pso_for_mb(const Dispatch& d, const DecodeStepPsos& base, const MultiBatchPsos& mb,
+               const GptOssPsos& go);
+void launch_shape_mb(const Dispatch& d, const GptOssGeometry& g, int rows, Grid& grid,
+                     Threadgroup& tg, int head_rows = 0);
+void encode_gptoss_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
+                           const GptOssGeometry& g, int rows, const DecodeStepPsos& base,
+                           const MultiBatchPsos& mb, const GptOssPsos& go,
+                           int ordinal_base = 0, int head_rows = 0);
+
 /// Encode the step against paged KV. One row -- gpt-oss has no M>1 path -- but
 /// the row's history is a page list, so several sequences coexist.
 void encode_gptoss_step_paged(StepEncoder& se, const std::vector<Dispatch>& dag,

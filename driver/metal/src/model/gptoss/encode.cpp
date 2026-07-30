@@ -10,6 +10,7 @@
 #include "encode.hpp"
 
 #include "../../batch/decode_abi.hpp"
+#include "../qwen3_5/decode_dispatch_mb.hpp"
 #include "decode_consts.hpp"
 
 namespace pie::metal::gptoss {
@@ -65,6 +66,8 @@ std::vector<int> gptoss_run_ends(const std::vector<Dispatch>& dag) {
 
 Kernel shared_kind(Kind k) {
     switch (k) {
+        // No weights: the gather is pure dataflow.
+        case Kind::RowGather:     return Kernel::G4RowGather;
         case Kind::EmbedGather:   return Kernel::GoEmbed;
         case Kind::AttnNorm:      return Kernel::Rms;        // input_layernorm
         case Kind::FfnNorm:       return Kernel::FfnRms;     // post_attention_layernorm
@@ -106,6 +109,7 @@ Pso pso_for(const Dispatch& d, const DecodeStepPsos& base, const GptOssPsos& go)
         case Kind::ExpertGate: case Kind::ExpertUp: case Kind::ExpertDown:
             return go.qmv_routed_bias;
         case Kind::RouterTopK:    return go.router_topk;
+        case Kind::RowGather:     return go.row_gather;
         case Kind::ExpertSwiGlu:  return go.swiglu;
         case Kind::ExpertCombine: return go.expert_combine;
         case Kind::SdpaSink:      return go.sdpa_sink;
@@ -141,6 +145,10 @@ void launch_shape(const Dispatch& d, const GptOssGeometry& g, Grid& grid, Thread
     switch (d.kind) {
         case Kind::EmbedGather:
             elementwise_dispatch(g.hidden, grid, tg);
+            return;
+        case Kind::RowGather:
+            grid = Grid{std::uint32_t(g.hidden), 1, 1};
+            tg = Threadgroup{64, 1, 1};
             return;
         case Kind::AttnNorm: case Kind::FfnNorm: case Kind::FinalRms: {
             const int threads = (g.hidden + 3) / 4;
@@ -191,6 +199,117 @@ Pso pso_for_paged(const Dispatch& d, const DecodeStepPsos& base, const MultiBatc
         case Kind::KvAppend:  return mb.kv_append_paged;
         case Kind::SdpaSink:  return go.sdpa_sink_paged;
         default:              return pso_for(d, base, go);
+    }
+}
+
+/// The pipeline a dispatch runs on at M>1.
+///
+/// Differs from `pso_for_paged` for exactly the two kinds whose ROW indexing
+/// differs, not merely their launch width. Everything else in this family is
+/// row-strided already: the matvecs read `tid.x` as the token, the norms and
+/// the elementwise kernels are flat over `rows * width`, and the paged
+/// attention takes the row on its second grid axis. What that leaves is the
+/// embedding gather (a different weight layout at M>1) and the YaRN rope (which
+/// must read `position[row]` and stride by a width its grid does not carry).
+Pso pso_for_mb(const Dispatch& d, const DecodeStepPsos& base, const MultiBatchPsos& mb,
+               const GptOssPsos& go) {
+    switch (d.kind) {
+        case Kind::EmbedGather: return mb.embed_mb;
+        case Kind::RopeQ:
+        case Kind::RopeK:       return go.rope_freqs_mb;
+        case Kind::RowGather:   return go.row_gather;
+        default:                return pso_for_paged(d, base, mb, go);
+    }
+}
+
+void launch_shape_mb(const Dispatch& d, const GptOssGeometry& g, int rows, Grid& grid,
+                     Threadgroup& tg, int head_rows) {
+    const int N = rows < 1 ? 1 : rows;
+    // The tail runs on the rows the fire will SAMPLE, which `RowGather`
+    // compacted. The LM head is `hidden * vocab` per row, so on a prefill it is
+    // most of the fire's cost and all of its logits memory.
+    const int S = head_rows < 1 ? N : (head_rows < N ? head_rows : N);
+
+    if (const KN kn = qmv_kn(d.kind, g); kn.N != 0) {
+        if (d.kind == Kind::RouterGemv) {
+            qmv_u8_dispatch(kn.N, grid, tg, N);
+            return;
+        }
+        const bool routed = d.kind == Kind::ExpertGate || d.kind == Kind::ExpertUp ||
+                            d.kind == Kind::ExpertDown;
+        const int m = d.kind == Kind::LmHead ? S : N;
+        qmv_dispatch(kn.N, routed ? g.experts_per_token : 1, grid, tg, m);
+        return;
+    }
+
+    switch (d.kind) {
+        case Kind::EmbedGather:
+            embed_mb_dispatch(g.hidden, N, grid, tg);
+            return;
+        case Kind::AttnNorm: case Kind::FfnNorm:
+            rms_mb_dispatch(g.hidden, 1, N, grid, tg);
+            return;
+        case Kind::RowGather:
+            grid = Grid{std::uint32_t(g.hidden), std::uint32_t(S), 1};
+            tg = Threadgroup{64, 1, 1};
+            return;
+        case Kind::FinalRms:
+            rms_mb_dispatch(g.hidden, 1, S, grid, tg);
+            return;
+        case Kind::RopeQ:
+            grid = Grid{std::uint32_t(g.head_dim / 2), std::uint32_t(g.n_q_heads),
+                        std::uint32_t(N)};
+            tg = Threadgroup{std::uint32_t(g.head_dim / 2), 1, 1};
+            return;
+        case Kind::RopeK:
+            grid = Grid{std::uint32_t(g.head_dim / 2), std::uint32_t(g.n_kv_heads),
+                        std::uint32_t(N)};
+            tg = Threadgroup{std::uint32_t(g.head_dim / 2), 1, 1};
+            return;
+        case Kind::KvAppend:
+            kv_append_mb_dispatch(g.head_dim, g.n_kv_heads, N, grid, tg);
+            return;
+        case Kind::SdpaSink:
+            sdpa_sink_dispatch(g.n_q_heads, grid, tg, N);
+            return;
+        case Kind::RouterTopK:
+            router_topk_dispatch(g.n_experts, grid, tg, N);
+            return;
+        case Kind::ExpertSwiGlu:
+            elementwise_mb_dispatch(g.experts_per_token * g.intermediate, N, grid, tg);
+            return;
+        case Kind::ExpertCombine:
+            // One thread per (channel, row): `y` is [rows, k, hidden], so the
+            // row is a real axis rather than a fold onto x.
+            grid = Grid{std::uint32_t(g.hidden), std::uint32_t(N), 1};
+            tg = Threadgroup{256, 1, 1};
+            return;
+        case Kind::AttnResidual:
+        case Kind::FfnResidual:
+            elementwise_mb_dispatch(g.hidden, N, grid, tg);
+            return;
+        default:
+            launch_shape(d, g, grid, tg);
+            return;
+    }
+}
+
+void encode_gptoss_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
+                           const GptOssGeometry& g, int rows, const DecodeStepPsos& base,
+                           const MultiBatchPsos& mb, const GptOssPsos& go, int ordinal_base,
+                           int head_rows) {
+    // Deliberately the same walk as `encode_gptoss_step`: the DAG, its order
+    // and its concurrency runs belong to the MODEL, not to the batch size.
+    const std::vector<int> run_ends = concurrent_run_ends(dag);
+    for (std::size_t i = 0; i < dag.size(); ++i) {
+        const Dispatch& d = dag[i];
+        Grid grid;
+        Threadgroup tg;
+        launch_shape_mb(d, g, rows, grid, tg, head_rows);
+        se.set_pso(pso_for_mb(d, base, mb, go));
+        se.set_argtable_ordinal(ordinal_base + d.ordinal);
+        se.dispatch(grid, tg);
+        if (i + 1 >= dag.size() || run_ends[i] == static_cast<int>(i)) se.barrier();
     }
 }
 

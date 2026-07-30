@@ -173,6 +173,17 @@ ScratchPlan build_gptoss_scratch(const std::vector<Dispatch>& dag, const GptOssG
             }
 
             // ── tail ──
+            // The sampled rows, compacted: everything after this is [S, *]. It
+            // writes a value of its own rather than in place, because its input
+            // is [N, hidden] and its output is [S, hidden] -- aliasing them
+            // would make the pool's slot sizing a lie.
+            case Kind::RowGather: {
+                const int gathered = fresh();
+                rd(o, 0, resid);
+                wr(o, 1, gathered);
+                resid = gathered;
+                break;
+            }
             case Kind::FinalRms:
                 normed = fresh();
                 rd(o, bi::RmsX, resid);

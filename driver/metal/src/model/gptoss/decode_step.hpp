@@ -58,6 +58,10 @@ enum class Kind : std::uint8_t {
     FfnResidual,
 
     // Tail.
+    /// The rows this fire will sample, compacted. A prefill computes every row
+    /// of the body and reads one per request, and the LM head is `hidden *
+    /// vocab` per row -- so on a prefill this is most of the fire's cost.
+    RowGather,
     FinalRms,
     LmHead,
     Argmax,
@@ -111,6 +115,7 @@ inline std::vector<Dispatch> build_gptoss_dag(const GptOssGeometry& g, bool with
         emit(Kind::FfnResidual, L, sliding);
     }
 
+    emit(Kind::RowGather, -1, false);
     emit(Kind::FinalRms, -1, false);
     emit(Kind::LmHead, -1, false);
     if (with_argmax) emit(Kind::Argmax, -1, false);

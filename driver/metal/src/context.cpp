@@ -514,10 +514,25 @@ std::string build_caps_json(const Config& cfg,
         rs_cache_required ? std::min(cfg.batching.max_forward_requests,
                                      kMetalPagedMaxForwardRequests)
                           : cfg.batching.max_forward_requests;
+    // The families `SimpleFamilyEngine` serves allocate their activation pool
+    // for `max_forward_tokens` ROWS at setup, so echoing the config's value
+    // advertises a fire the driver then cannot allocate -- gpt-oss's pool at
+    // 10240 rows is 1.6 GB on top of an 11.8 GB checkpoint, and the heap
+    // creation fails with no mention of which row budget caused it. `512` is
+    // `kPagedMaxForwardTokensCeiling`, the same bound qwen3.5's paged path
+    // measured its way to; a longer prompt is chunked, exactly as it is there.
+    const bool simple_family_engine =
+        pie::metal::model::model_family_of(facts.model_type) ==
+            pie::metal::model::ModelFamily::Gemma4 ||
+        pie::metal::model::model_family_of(facts.model_type) ==
+            pie::metal::model::ModelFamily::GptOss;
     const std::uint32_t max_forward_tokens =
         rs_cache_required
             ? std::min(cfg.batching.max_forward_tokens, kMetalPagedMaxForwardTokens)
-            : cfg.batching.max_forward_tokens;
+            : (simple_family_engine
+                   ? executor::simple_family_max_forward_tokens(
+                         cfg.batching.max_forward_tokens)
+                   : cfg.batching.max_forward_tokens);
     const std::uint32_t max_model_len =
         rs_cache_required ? std::min(facts.max_model_len, kMetalPhase1aMaxCtxTokens)
                           : facts.max_model_len;
@@ -2113,7 +2128,14 @@ class Context::Impl {
         // over a pool bigger or smaller than what the driver claims to have.
         setup_cfg.total_pages = effective_total_pages(cfg_, facts_.has_linear_attn);
         setup_cfg.kv_page_size = cfg_.batching.kv_page_size;
-        setup_cfg.max_forward_tokens = cfg_.batching.max_forward_tokens;
+        // The same bound the capabilities advertised, from the same function:
+        // these families allocate their pool for this many rows.
+        const auto setup_family = pie::metal::model::model_family_of(facts_.model_type);
+        setup_cfg.max_forward_tokens =
+            (setup_family == pie::metal::model::ModelFamily::Gemma4 ||
+             setup_family == pie::metal::model::ModelFamily::GptOss)
+                ? executor::simple_family_max_forward_tokens(cfg_.batching.max_forward_tokens)
+                : cfg_.batching.max_forward_tokens;
         setup_cfg.max_forward_requests = cfg_.batching.max_forward_requests;
         setup_cfg.snapshot_dir = cfg_.model.hf_path;
         setup_cfg.model_type = facts_.model_type;
