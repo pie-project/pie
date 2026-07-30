@@ -9,6 +9,7 @@ namespace pie_cuda_driver::model {
 struct AttentionObservation;
 struct AttentionScores;
 struct AttentionMaskSink;
+class HookSidebandArena;
 
 enum class StageHookPoint : std::uint8_t {
     OnAttnProj = 1,
@@ -82,6 +83,15 @@ struct StageHooks {
     // slow path is always correct. See
     // `Dispatch::launch_hook_free_prefix_rows`.
     std::uint32_t hook_free_prefix_rows = 0;
+
+    // The grow-only device arena the fire's sideband captures draw their
+    // buffers from (`hook_sideband_arena.hpp`). Engine-lifetime, owned beside
+    // `model::Workspace` in context.cpp and carried on the hooks because the
+    // sidebands only exist when hooks fire — the constructors that used to
+    // cudaMallocAsync per layer (`ScoreBuffers`, `FirePageMask`) acquire from
+    // it instead. Null means the launch path forgot to wire it; the captures
+    // then refuse loudly rather than silently reintroducing the churn.
+    HookSidebandArena* sideband_arena = nullptr;
 
     // The fire's KV geometry. Set by `ForwardFn::invoke_body` -- the single
     // choke point every family passes through -- on its own copy of the

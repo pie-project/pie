@@ -6,12 +6,23 @@
 
 #include "kernels/page_compact.hpp"
 #include "model/attn_observation.hpp"
+#include "model/hook_sideband_arena.hpp"
 #include "model/stage_hooks.hpp"
 
 namespace pie_cuda_driver::model {
 
-FirePageMask::FirePageMask(const StageHooks* hooks, cudaStream_t stream)
-    : stream_(stream) {
+namespace {
+
+// Sub-buffer alignment inside the arena's mask slot (mirrors attn_score.cu).
+constexpr std::size_t kSidebandAlign = 256;
+
+constexpr std::size_t align_up(std::size_t n) noexcept {
+    return (n + kSidebandAlign - 1) & ~(kSidebandAlign - 1);
+}
+
+}  // namespace
+
+FirePageMask::FirePageMask(const StageHooks* hooks, cudaStream_t stream) {
     if (hooks == nullptr || !hooks->wants_page_mask) return;
 
     const AttentionObservation* obs = hooks->observation;
@@ -52,36 +63,35 @@ FirePageMask::FirePageMask(const StageHooks* hooks, cudaStream_t stream)
     const std::size_t lens_bytes =
         static_cast<std::size_t>(requests) * sizeof(std::uint32_t);
 
-    std::uint8_t* keep = nullptr;
-    const bool allocated =
-        cudaMallocAsync(
-            reinterpret_cast<void**>(&keep), keep_bytes, stream) ==
-            cudaSuccess &&
-        cudaMallocAsync(
-            reinterpret_cast<void**>(&out_indices_), idx_bytes, stream) ==
-            cudaSuccess &&
-        cudaMallocAsync(
-            reinterpret_cast<void**>(&out_indptr_), indptr_bytes, stream) ==
-            cudaSuccess &&
-        cudaMallocAsync(
-            reinterpret_cast<void**>(&counts_), lens_bytes, stream) ==
-            cudaSuccess &&
-        cudaMallocAsync(
-            reinterpret_cast<void**>(&out_last_lens_), lens_bytes, stream) ==
-            cudaSuccess;
-    if (!allocated) {
-        if (keep != nullptr) cudaFreeAsync(keep, stream);
-        if (out_indices_ != nullptr) cudaFreeAsync(out_indices_, stream);
-        if (out_indptr_ != nullptr) cudaFreeAsync(out_indptr_, stream);
-        if (out_last_lens_ != nullptr) cudaFreeAsync(out_last_lens_, stream);
-        if (counts_ != nullptr) cudaFreeAsync(counts_, stream);
-        out_indices_ = nullptr;
-        out_indptr_ = nullptr;
-        out_last_lens_ = nullptr;
-        counts_ = nullptr;
+    // One arena slot for all five buffers, acquired once per fire and carved
+    // by offset: the u32 outputs first, the u8 keep rows last, each aligned.
+    // Reuse across fires is safe because every buffer is (re)written before
+    // it is read — `begin_layer` re-seeds `keep` every layer, and the
+    // compaction outputs are written by `compact` before attention reads
+    // them; nothing here needs a fresh-allocation guarantee.
+    if (hooks->sideband_arena == nullptr) {
         throw std::runtime_error(
-            "attn_page_mask could not allocate its page buffers");
+            "attn_page_mask fire carries no hook sideband arena");
     }
+    auto* base = static_cast<std::uint8_t*>(hooks->sideband_arena->acquire(
+        HookSidebandArena::Region::Mask,
+        align_up(idx_bytes) + align_up(indptr_bytes) + 2 * align_up(lens_bytes) +
+            keep_bytes,
+        stream));
+    if (base == nullptr) {
+        throw std::runtime_error(
+            "attn_page_mask could not acquire its page buffers");
+    }
+    arena_ = hooks->sideband_arena;
+    out_indices_ = reinterpret_cast<std::uint32_t*>(base);
+    base += align_up(idx_bytes);
+    out_indptr_ = reinterpret_cast<std::uint32_t*>(base);
+    base += align_up(indptr_bytes);
+    counts_ = reinterpret_cast<std::uint32_t*>(base);
+    base += align_up(lens_bytes);
+    out_last_lens_ = reinterpret_cast<std::uint32_t*>(base);
+    base += align_up(lens_bytes);
+    std::uint8_t* keep = base;
 
     sink_.keep = keep;
     sink_.num_requests = requests;
@@ -122,15 +132,17 @@ void FirePageMask::compact(
 }
 
 FirePageMask::~FirePageMask() {
-    if (sink_.keep != nullptr) cudaFreeAsync(sink_.keep, stream_);
-    if (out_indices_ != nullptr) cudaFreeAsync(out_indices_, stream_);
-    if (out_indptr_ != nullptr) cudaFreeAsync(out_indptr_, stream_);
-    if (out_last_lens_ != nullptr) cudaFreeAsync(out_last_lens_, stream_);
-    if (counts_ != nullptr) cudaFreeAsync(counts_, stream_);
+    // Nothing to free: the bytes belong to the arena and are handed back for
+    // the next fire's mask to reuse.
+    if (arena_ != nullptr) {
+        arena_->release(HookSidebandArena::Region::Mask);
+    }
+    arena_ = nullptr;
     sink_ = AttentionMaskSink{};
     out_indices_ = nullptr;
     out_indptr_ = nullptr;
     out_last_lens_ = nullptr;
+    counts_ = nullptr;
     active_ = false;
 }
 

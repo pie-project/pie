@@ -30,6 +30,7 @@
 #include "kernels/pack_dense_mask.hpp"
 #include "model/loaded_model.hpp"
 #include "model/attn_score.hpp"
+#include "model/hook_sideband_arena.hpp"
 #include "model/lora.hpp"
 #include "model/stage_hooks.hpp"
 #include "store/kv_cache.hpp"
@@ -2305,6 +2306,7 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
             engine.dispatch->launch_wants_page_mask(s.dispatch_view),
         .hook_free_prefix_rows =
             engine.dispatch->launch_hook_free_prefix_rows(s.dispatch_view),
+        .sideband_arena = engine.sideband_arena,
         .execute = [](
             void* opaque,
             model::StageHookPoint point,
@@ -2329,6 +2331,11 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
                 sideband);
         },
     };
+    // Fire boundary for the sideband arena's PIE_SIDEBAND_TRACE counters —
+    // only hook fires draw from it, so only they mark the boundary.
+    if (s.has_attention_stages && engine.sideband_arena != nullptr) {
+        engine.sideband_arena->begin_fire();
+    }
     run_forward_dispatch(
         engine, ForwardDispatchInputs{
             .forward_R = s.forward_R,

@@ -440,6 +440,7 @@ set(PIE_CUDA_MODEL_SOURCES
   src/model/glm5/glm5.cpp
   src/model/glm5/glm5_forward.cpp
   src/model/glm5/glm5_model.cpp
+  src/model/hook_sideband_arena.cpp
   src/model/kimi/kimi.cpp
   src/model/kimi/kimi_forward.cpp
   src/model/kimi/kimi_model.cpp

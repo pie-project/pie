@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "model/attn_observation.hpp"
+#include "model/hook_sideband_arena.hpp"
 #include "model/stage_hooks.hpp"
 #include "ops/attention_flashinfer.hpp"
 #include "store/kv_cache.hpp"
@@ -32,34 +33,58 @@ thread_local int g_capture_depth = 0;
 // than evicting on a row that could not be produced.
 constexpr std::uint64_t kMaxScoreBytes = 1ull << 30;  // 1 GiB
 
+// Sub-buffer alignment inside an arena slot. 256 covers every dtype the
+// sidebands carve (and matches cudaMalloc's own guarantee).
+constexpr std::size_t kSidebandAlign = 256;
+
+constexpr std::size_t align_up(std::size_t n) noexcept {
+    return (n + kSidebandAlign - 1) & ~(kSidebandAlign - 1);
+}
+
 }  // namespace
 
 namespace detail {
 
-bool ScoreBuffers::allocate(
+bool ScoreBuffers::acquire(
+    HookSidebandArena* arena,
     std::uint64_t raw_elems,
     std::uint64_t folded_elems,
     const std::int32_t* indptr_h,
     std::uint32_t num_requests,
     cudaStream_t stream) noexcept {
-    // `cudaMallocAsync` (not a pool) because the extent is a function of the
-    // live context length and changes every fire; the sizes are small relative
-    // to the KV read the same layer already does.
-    if (cudaMallocAsync(
-            reinterpret_cast<void**>(&raw),
-            static_cast<std::size_t>(raw_elems) * sizeof(float),
-            stream) != cudaSuccess) {
-        raw = nullptr;
+    if (arena == nullptr) {
+        // The launch path always wires the arena onto the fire's hooks
+        // (batch/frame.cpp); reaching here means a new call site forgot.
+        // Refusing takes the same path as an allocation failure: the capture
+        // stands down and the PTIR side fails loudly at the hook.
+        std::fprintf(
+            stderr,
+            "[pie-driver-cuda] score capture has no hook sideband arena; "
+            "refusing the capture\n");
         return false;
     }
-    if (cudaMallocAsync(
-            reinterpret_cast<void**>(&folded),
-            static_cast<std::size_t>(folded_elems) * sizeof(float),
-            stream) != cudaSuccess) {
-        folded = nullptr;
-        release(stream);
+    // One slot for all three buffers: raw, then folded, then the CSR, each
+    // aligned. The extent is a function of the live context length and
+    // changes every fire, but the arena only ever GROWS — steady state is a
+    // capacity check, not an allocation.
+    const std::size_t raw_bytes =
+        static_cast<std::size_t>(raw_elems) * sizeof(float);
+    const std::size_t folded_bytes =
+        static_cast<std::size_t>(folded_elems) * sizeof(float);
+    const std::size_t indptr_bytes =
+        (static_cast<std::size_t>(num_requests) + 1) * sizeof(std::int32_t);
+    auto* base = static_cast<std::uint8_t*>(arena->acquire(
+        HookSidebandArena::Region::Score,
+        align_up(raw_bytes) + align_up(folded_bytes) + align_up(indptr_bytes),
+        stream));
+    if (base == nullptr) {
         return false;
     }
+    arena_ = arena;
+    raw = reinterpret_cast<float*>(base);
+    folded = reinterpret_cast<float*>(base + align_up(raw_bytes));
+    indptr_d = reinterpret_cast<std::int32_t*>(
+        base + align_up(raw_bytes) + align_up(folded_bytes));
     // The host CSR that sized these is an UPPER BOUND, not the exact geometry.
     // The frame layer is free to hand the body a conservative host-side page
     // CSR (graph lattice padding, the decode-envelope KV bound in `frame.cpp`),
@@ -73,36 +98,28 @@ bool ScoreBuffers::allocate(
     // but the intrinsic's defined value: those positions do not exist, and a
     // position that does not exist received no attention. Without this the
     // padding is live garbage, which is the difference between "never evict a
-    // position that isn't there" and "evict a real one instead".
-    if (cudaMemsetAsync(
-            folded, 0,
-            static_cast<std::size_t>(folded_elems) * sizeof(float),
-            stream) != cudaSuccess) {
-        release(stream);
-        return false;
-    }
-    const std::size_t indptr_bytes =
-        (static_cast<std::size_t>(num_requests) + 1) * sizeof(std::int32_t);
-    if (cudaMallocAsync(
-            reinterpret_cast<void**>(&indptr_d), indptr_bytes, stream) !=
-        cudaSuccess) {
-        indptr_d = nullptr;
-        release(stream);
+    // position that isn't there" and "evict a real one instead". With a
+    // reused slot the garbage would be the PREVIOUS layer's folded row — a
+    // plausible attention distribution, the worst kind of wrong — so the
+    // memset happens on every acquire, never just on growth.
+    if (cudaMemsetAsync(folded, 0, folded_bytes, stream) != cudaSuccess) {
+        release();
         return false;
     }
     if (cudaMemcpyAsync(
             indptr_d, indptr_h, indptr_bytes, cudaMemcpyHostToDevice,
             stream) != cudaSuccess) {
-        release(stream);
+        release();
         return false;
     }
     return true;
 }
 
-void ScoreBuffers::release(cudaStream_t stream) noexcept {
-    if (raw != nullptr) cudaFreeAsync(raw, stream);
-    if (folded != nullptr) cudaFreeAsync(folded, stream);
-    if (indptr_d != nullptr) cudaFreeAsync(indptr_d, stream);
+void ScoreBuffers::release() noexcept {
+    if (arena_ != nullptr) {
+        arena_->release(HookSidebandArena::Region::Score);
+    }
+    arena_ = nullptr;
     raw = nullptr;
     folded = nullptr;
     indptr_d = nullptr;
@@ -189,8 +206,9 @@ LayerScoreCapture::LayerScoreCapture(
 
     g_raw_offsets_i32.assign(g_raw_offsets.begin(), g_raw_offsets.end());
 
-    if (!buf_.allocate(raw_total, folded_total, g_raw_offsets_i32.data(),
-                       static_cast<std::uint32_t>(requests), stream)) {
+    if (!buf_.acquire(hooks->sideband_arena, raw_total, folded_total,
+                      g_raw_offsets_i32.data(),
+                      static_cast<std::uint32_t>(requests), stream)) {
         return;
     }
 
@@ -226,7 +244,7 @@ void LayerScoreCapture::publish(
 
 void LayerScoreCapture::release() noexcept {
     if (active_) --g_capture_depth;
-    buf_.release(stream_);
+    buf_.release();
     active_ = false;
 }
 
@@ -316,8 +334,9 @@ LayerPrefillScoreCapture::LayerPrefillScoreCapture(
         return;
     }
 
-    if (!buf_.allocate(raw_total, folded_total, g_pf_raw_offsets_i32.data(),
-                       static_cast<std::uint32_t>(requests), stream)) {
+    if (!buf_.acquire(hooks->sideband_arena, raw_total, folded_total,
+                      g_pf_raw_offsets_i32.data(),
+                      static_cast<std::uint32_t>(requests), stream)) {
         return;
     }
 
@@ -340,7 +359,7 @@ void LayerPrefillScoreCapture::publish() {
 
 void LayerPrefillScoreCapture::release() noexcept {
     if (active_) --g_pf_capture_depth;
-    buf_.release(stream_);
+    buf_.release();
     active_ = false;
 }
 

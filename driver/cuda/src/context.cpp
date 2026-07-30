@@ -56,6 +56,7 @@
 #include "model/gemma4/gemma4_audio_adapter.hpp"
 #include "model/gemma4/gemma4_vision_adapter.hpp"
 #include "model/glm5/glm5_forward.hpp"
+#include "model/hook_sideband_arena.hpp"
 #include "model/kimi/kimi_forward.hpp"
 #include "model/llama_like/llama_like.hpp"
 #include "model/loaded_model.hpp"
@@ -1083,6 +1084,15 @@ int Context::Impl::load_model(
     }
     auto& ws = *ws_p;
 
+    // Grow-only device arena for the hook sidebands (per-layer score capture
+    // + per-fire page mask). Owned here, beside the Workspace whose lifetime
+    // it mirrors, and wired onto the batch engine below; it replaces the
+    // per-fire/per-layer cudaMallocAsync churn those captures used to pay.
+    // It allocates lazily on the first hook fire (nothing for the many
+    // configurations whose programs never observe attention), so it is not
+    // charged to the workspace arena allocator.
+    auto* sideband_arena_p = own_emplace<model::HookSidebandArena>();
+
     // KV-cache shape genuinely differs per family (MLA-backed families use
     // a 1x1 placeholder KvCache; Gemma-4 has per-layer head_dim + KV
     // sharing; Nemotron-H only allocates pages for its attention layers).
@@ -1600,6 +1610,7 @@ int Context::Impl::load_model(
                   ));
     }
     executor_p->dispatch = &registry_->dispatch();
+    executor_p->sideband_arena = sideband_arena_p;
     executor_ = executor_p;
     const bool has_usable_mtp_logits =
         has_mtp_logits && static_cast<bool>(executor_p->system_drafter);

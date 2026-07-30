@@ -55,12 +55,17 @@ struct AttentionMaskSink {
 };
 
 struct StageHooks;
+class HookSidebandArena;
 
 /// Fire-scoped owner of the page mask and of the compacted CSR it produces.
 ///
 /// One instance brackets the whole layer loop: the keep buffer and the
-/// compaction outputs are allocated once and reused by every layer, because the
-/// page geometry is a property of the fire, not of the layer.
+/// compaction outputs are acquired once and reused by every layer, because the
+/// page geometry is a property of the fire, not of the layer. The bytes come
+/// from the fire's `HookSidebandArena` mask slot (via `hooks`), so across
+/// fires there is no allocation at all once the arena has grown to the
+/// workload's max — and the addresses stay stable while it suffices, the
+/// increment-4 graph-capture precondition (hook_sideband_arena.hpp).
 ///
 /// Usage per layer:
 ///
@@ -114,10 +119,12 @@ class FirePageMask {
     std::uint32_t* out_indices_ = nullptr;
     std::uint32_t* out_indptr_ = nullptr;
     std::uint32_t* out_last_lens_ = nullptr;
-    // Scratch for the compaction's per-request survivor counts. Allocated once
+    // Scratch for the compaction's per-request survivor counts. Acquired once
     // per fire and reused by all 28-odd layers, rather than once per layer.
     std::uint32_t* counts_ = nullptr;
-    cudaStream_t stream_ = nullptr;
+    // The arena the mask slot was acquired from; null when the fire wants no
+    // mask. Released (not freed) in the destructor.
+    HookSidebandArena* arena_ = nullptr;
     bool active_ = false;
 };
 

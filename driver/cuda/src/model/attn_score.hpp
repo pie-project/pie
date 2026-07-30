@@ -47,31 +47,50 @@ struct AttentionScores {
 std::uint32_t default_attn_score_window() noexcept;
 
 struct StageHooks;
+class HookSidebandArena;
 
 namespace detail {
 
 // The three device buffers every score capture needs: the raw per-head rows the
 // kernel writes, the head-folded row a PTIR program reads, and the ragged CSR
 // both are addressed by. Shared by the decode and prefill captures so the two
-// cannot drift in how they allocate, zero, or release -- the failure mode of a
+// cannot drift in how they acquire, zero, or release -- the failure mode of a
 // drift here is a program reading a row that was never zeroed, which looks like
 // a plausible attention distribution rather than like a bug.
+//
+// The bytes live in the fire's `HookSidebandArena` score slot rather than in a
+// fresh `cudaMallocAsync` per layer: every layer of a fire has identical
+// geometry and at most one capture is live at a time, so one slot sized on the
+// first layer serves the whole fire, and the addresses stay stable across
+// layers AND across same-geometry fires (the increment-4 graph-capture
+// precondition — see hook_sideband_arena.hpp).
 struct ScoreBuffers {
     float* raw = nullptr;
     float* folded = nullptr;
     std::int32_t* indptr_d = nullptr;
 
-    // `folded` is zeroed but `raw` is not: every element of `folded` that the
-    // fold kernel skips must still read as "this position received no
-    // attention", whereas `raw` is only ever read back by the fold kernel over
-    // exactly the region the capture kernel wrote.
-    bool allocate(
+    // Carve raw/folded/indptr out of the arena's score slot and stage the
+    // host CSR into `indptr_d`.
+    //
+    // `folded` is zeroed but `raw` is not — and because the slot is REUSED,
+    // that asymmetry is now load-bearing across layers too: every element of
+    // `folded` that the fold kernel skips must still read as "this position
+    // received no attention" (so it is re-zeroed on every acquire), whereas
+    // `raw` is only ever read back by the fold kernel over exactly the region
+    // the capture kernel wrote this layer, so the previous layer's leftovers
+    // in it are dead bytes by construction.
+    bool acquire(
+        HookSidebandArena* arena,
         std::uint64_t raw_elems,
         std::uint64_t folded_elems,
         const std::int32_t* indptr_h,
         std::uint32_t num_requests,
         cudaStream_t stream) noexcept;
-    void release(cudaStream_t stream) noexcept;
+    void release() noexcept;
+
+  private:
+    // The arena the slot was acquired from; null while nothing is held.
+    HookSidebandArena* arena_ = nullptr;
 };
 
 }  // namespace detail

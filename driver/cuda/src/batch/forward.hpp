@@ -44,6 +44,7 @@ struct Workspace;
 class IModel;
 struct StageHooks;
 struct LoraTable;
+class HookSidebandArena;
 }  // namespace model
 
 namespace ops {
@@ -414,6 +415,13 @@ struct BatchEngine {
     // persistent per-instance execution contexts keyed by the bound
     // instance id. Never null once the driver has finished composing.
     pipeline::Dispatch* dispatch = nullptr;
+
+    // Grow-only device arena for the hook sidebands (score capture + page
+    // mask; `model/hook_sideband_arena.hpp`). Owned by the context beside
+    // `model::Workspace` and wired here after construction, mirroring
+    // `dispatch`; `batch/frame.cpp` puts it on each hook fire's `StageHooks`.
+    // Null only for a context that never composed one.
+    model::HookSidebandArena* sideband_arena = nullptr;
 };
 
 // Pre-capture the pure-decode CUDA graph lattice for graph-safe forwards.
