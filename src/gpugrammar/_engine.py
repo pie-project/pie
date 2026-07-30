@@ -150,6 +150,11 @@ _MEMO_SUFFIXES = 1
 # So it is the ceiling the hardware allows, and it has nothing to do with the
 # stack depth that sizes the advance.
 _FILL_THREADS = 256
+
+# How much the fill's replay windows may take. The sweep spreads a sequence
+# over several blocks and a thread owns two windows, so this is what decides
+# how many blocks a sequence may have. See `_fill_chunks`.
+_FILL_SCRATCH_BUDGET = 64 * 1024 * 1024
 _MEMO_CONFIGS = 64
 _MEMO_DEPTH = 64
 # No real fingerprint is asked to be this, and an empty entry has to miss.
@@ -4357,8 +4362,16 @@ class DeviceBatch:
                 self.memo_slot.data_ptr(),
                 self.representative.data_ptr(),
                 self.memo_mask.data_ptr(),
+                self.state_struct().data_ptr(),
+                self.row_floor.data_ptr(),
+                self.memo_want.data_ptr(),
             ],
-            [grammar.mask_words],
+            [
+                grammar.mask_words,
+                self.configs,
+                self.memo_stride,
+                _MEMO_SUFFIXES,
+            ],
             grid_y=self.batch,
         )
 
@@ -4522,6 +4535,86 @@ class DeviceBatch:
             ],
         )
 
+    def _fill_split_cuda(self, grammar) -> None:
+        """The fill as a probe and a sweep, so a wide sequence is not one block.
+
+        Two nodes rather than one. The probe keeps a block per sequence, which
+        is right for it - a table probe and a scan over earlier sequences is
+        O(configs x depth) and every sequence costs about the same. The sweep
+        is O(configs x groups) and does not, so it takes a second grid
+        dimension and a sequence spreads over as many blocks as the scratch
+        will pay for.
+
+        They cannot be one kernel with a second dimension, because the probe
+        clears the rows that will be built up and a block clearing a row while
+        another is already OR-ing into it loses bits.
+        """
+        from gpugrammar import _gpugrammar
+
+        _gpugrammar.cuda_launch(
+            "gg_fill_probe",
+            self.batch,
+            self._fill_threads(grammar),
+            torch.cuda.current_stream().cuda_stream,
+            [
+                self.grammar.arena_struct().data_ptr(),
+                self.state_struct().data_ptr(),
+                self.mask.data_ptr(),
+                self.state_hash.data_ptr(),
+                self.suffix_hash.data_ptr(),
+                self.memo_hash.data_ptr(),
+                self.memo_lexer.data_ptr(),
+                self.memo_stack.data_ptr(),
+                self.memo_depth.data_ptr(),
+                self.memo_count.data_ptr(),
+                self.memo_grammar.data_ptr(),
+                self.memo_read.data_ptr(),
+                self.memo_slot.data_ptr(),
+                self.representative.data_ptr(),
+                self.memo_store.data_ptr(),
+                self.memo_want.data_ptr(),
+                self.row_floor.data_ptr(),
+            ],
+            [
+                self.configs,
+                grammar.max_stack,
+                self.memo_slots,
+                self.memo_configs,
+                self.memo_stride,
+                _MEMO_SUFFIXES,
+                grammar.mask_words,
+            ],
+        )
+        _gpugrammar.cuda_launch(
+            "gg_fill_sweep",
+            self.batch,
+            self._fill_threads(grammar),
+            torch.cuda.current_stream().cuda_stream,
+            [
+                self.grammar.arena_struct().data_ptr(),
+                self.state_struct().data_ptr(),
+                self.mask.data_ptr(),
+                self.memo_slot.data_ptr(),
+                self.representative.data_ptr(),
+                self.row_floor.data_ptr(),
+                self._fused_scratch(grammar).data_ptr(),
+                self.high_water.data_ptr(),
+            ],
+            [
+                self.configs,
+                grammar.max_stack,
+                grammar.max_reductions,
+                grammar.window,
+                grammar.paths,
+                grammar.has_verdicts,
+                grammar.mask_words,
+            ],
+            # One offset per configuration and a total, built per block instead
+            # of by a counting kernel and a scan.
+            shared_bytes=(self.configs + 1) * 4,
+            grid_y=self._fill_chunks(grammar),
+        )
+
     def _fused_threads(self, grammar) -> int:
         """Threads per block for the fused kernels.
 
@@ -4541,6 +4634,24 @@ class DeviceBatch:
         """
         return _FILL_THREADS
 
+    def _fill_chunks(self, grammar) -> int:
+        """How many blocks share one sequence's sweep.
+
+        One block per sequence made the fill cost the *widest* sequence rather
+        than the total, and a serving batch is skewed by construction - every
+        request sits at its own point in its own document. Chunking is what the
+        global work list used to buy, without the counting kernel and the
+        prefix sum on a grid of one that paid for it.
+
+        Bounded by the scratch, not by the batch: a thread owns two replay
+        windows, so the buffer is `batch x chunks x threads` and would be
+        268 MB at batch 512 with eight chunks. A budget keeps it flat and lets
+        the small batches - the ones with too few blocks to fill the machine,
+        and so the ones that need chunking most - have the most.
+        """
+        rows = _FILL_SCRATCH_BUDGET // max(1, 2 * grammar.window * 4)
+        return max(1, min(32, rows // max(1, self.batch * self._fill_threads(grammar))))
+
     def _fused_scratch(self, grammar) -> torch.Tensor:
         """Two replay windows per *thread*, since a thread owns a replay.
 
@@ -4558,7 +4669,7 @@ class DeviceBatch:
                     self.batch
                     * max(
                         self._fused_threads(grammar),
-                        self._fill_threads(grammar),
+                        self._fill_threads(grammar) * self._fill_chunks(grammar),
                         self.configs,
                     ),
                     2 * grammar.window,
@@ -5056,7 +5167,7 @@ class DeviceBatch:
         if "fill_fused" in _PORTED:
             grammar = self.grammar
             self._hash_cuda(grammar)
-            self._fill_fused_cuda(grammar)
+            self._fill_split_cuda(grammar)
             self._copy_cuda(grammar)
             (self._store_cuda if "store" in _PORTED else self._store_triton)(grammar)
             return self.mask

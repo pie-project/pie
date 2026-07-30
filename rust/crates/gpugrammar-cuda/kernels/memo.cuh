@@ -275,10 +275,37 @@ extern "C" __global__ void gg_copy(
     const int32_t* memo_slot,
     const int32_t* representative,
     const int32_t* memo_mask,
-    int32_t mask_words) {
+    const gg::BatchState* state,
+    const int32_t* row_floor,
+    int32_t* memo_want,
+    int32_t mask_words,
+    int32_t configs,
+    int32_t memo_stride,
+    int32_t suffixes) {
     int32_t sequence = blockIdx.y;
     int32_t slot = memo_slot[sequence];
     int32_t source = representative[sequence];
+
+    // How much of the stack the answer turned out to need - the fill's last
+    // phase, which has to see every `row_floor` the sweep wrote. The sweep now
+    // spreads one sequence over several blocks, so it cannot decide this
+    // itself, and this is the next kernel in the chain rather than a node of
+    // its own. `gg_store` is too late: its rival scan reads *other* sequences'
+    // answers, and nothing orders those against a block that has not run.
+    if (blockIdx.x == 0 && threadIdx.x == 0 && slot < 0 && source == sequence) {
+        int32_t count = state->config_count[sequence];
+        int32_t need = 1;
+        bool keep = true;
+        for (int32_t config = 0; config < count; ++config) {
+            int32_t row = sequence * configs + config;
+            int32_t depth = state->depth[row];
+            need = max(need, depth - row_floor[row] + 1);
+            if (depth > memo_stride) {
+                keep = false;
+            }
+        }
+        memo_want[sequence] = (keep && need <= suffixes) ? need : (keep ? -1 : -2);
+    }
     if (slot < 0 && source == sequence) {
         return;
     }
