@@ -61,6 +61,10 @@ enum class PieForwardOpKind : uint32_t {
   Attention = 7,
   Swiglu = 8,
   LmHead = 9,
+  /// `residual += x` (post-norm placement's separate landing). Appended
+  /// per the discipline above — the nine kinds before it keep their
+  /// wire values.
+  ResidualAdd = 10,
 };
 
 /// Mirrors [`crate::trace::NormVariant`].
@@ -74,6 +78,24 @@ enum class PieForwardRopeKind : uint32_t {
   Standard = 0,
   /// Llama3/YaRN-style frequency scaling.
   Yarn = 1,
+};
+
+/// Mirrors [`crate::facts::NormPlacement`].
+enum class PieForwardNormPlacement : uint32_t {
+  Pre = 0,
+  /// OLMo-2/3: norm the sub-layer OUTPUT, then a separate residual add.
+  Post = 1,
+};
+
+/// Mirrors [`crate::facts::QkNorm`]. `Off`/`PerHead` keep the wire values
+/// the field had as a bool (0/1), so a caller that treated it as "non-zero
+/// is per-head qk-norm" still states the same facts.
+enum class PieForwardQkNorm : uint32_t {
+  Off = 0,
+  PerHead = 1,
+  /// One RMSNorm over the flattened `[heads * head_dim]` q/k projection
+  /// (OLMo-2) — different arithmetic from per-head.
+  Global = 2,
 };
 
 /// The llama_like facts, as C states them. Mirrors
@@ -101,8 +123,11 @@ struct PieForwardLlamaLikeFacts {
   uint32_t rope;
   /// A [`super::types::PieForwardNormVariant`] value.
   uint32_t norm_variant;
-  /// Per-head RMSNorm on Q/K before rope; non-zero is true.
-  uint8_t qk_norm;
+  /// A [`super::types::PieForwardNormPlacement`] value.
+  uint32_t norm_placement;
+  /// A [`super::types::PieForwardQkNorm`] value. (Formerly a 0/1 bool;
+  /// `Off`/`PerHead` keep those wire values.)
+  uint32_t qk_norm;
   /// The deployment bound one packed QKV projection; non-zero is true.
   uint8_t fused_qkv;
   /// The lm_head weight is the embedding table; non-zero is true.
@@ -161,6 +186,7 @@ struct PieForwardIdRange {
 /// | `Attention`      | none                 | cache layer                  | —          |
 /// | `Swiglu`         | none                 | `inter`                      | —          |
 /// | `LmHead`         | weight               | —                            | —          |
+/// | `ResidualAdd`    | none                 | —                            | —          |
 ///
 /// `KvAppend`/`Attention` restate the layer their kind addresses even though
 /// `layer` carries the bracketing layer, because the trace states both

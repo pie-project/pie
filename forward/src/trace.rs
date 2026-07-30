@@ -87,6 +87,13 @@ pub enum OpKind {
     Swiglu { inter: u32 },
     /// Gather the sampled rows and project to logits.
     LmHead { weight: String },
+    /// `residual += x`, elementwise. The post-norm residual landing
+    /// (`NormPlacement::Post`): the sub-layer's normed output is added to
+    /// the residual stream by its own launch, because the norm between the
+    /// projection GEMM and the add is what makes the pre-norm `beta=1`
+    /// fold impossible. A separate op because it is a separate launch in
+    /// the hand-written pass (`launch_residual_add_bf16`).
+    ResidualAdd,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -308,6 +315,19 @@ impl TraceBuilder {
             OpKind::Swiglu { inter },
             vec![packed],
             vec![(Shape(vec![rows, Dim::Const(inter)]), DType::BF16)],
+        )[0]
+    }
+
+    /// The post-norm residual landing: `residual += x`. Operand order
+    /// mirrors [`Self::matmul_add`] — the freshly computed value first,
+    /// the residual stream it lands on appended — and the result is the
+    /// (new SSA id of the) accumulated stream.
+    pub fn residual_add(&mut self, x: ValueId, residual: ValueId) -> ValueId {
+        let shape = self.values[residual as usize].shape.clone();
+        self.push(
+            OpKind::ResidualAdd,
+            vec![x, residual],
+            vec![(shape, DType::BF16)],
         )[0]
     }
 

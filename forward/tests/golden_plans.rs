@@ -83,6 +83,20 @@ fn mistral_7b_v03() {
     check("mistral_7b_v03", &LlamaLikeFacts::mistral_7b_v03());
 }
 
+/// The fourth declared configuration (OLMo-2-0425-1B-Instruct), and the
+/// first that extends the declaration itself: post-norm placement (each
+/// sub-layer's matmul(beta=0) → rmsnorm → residual_add triplet replaces the
+/// pre-norm accumulate GEMM) and the global qk-norm (a plain row Rmsnorm
+/// over the flattened `[heads * head_dim]` q/k — the checkpoint's
+/// q_norm/k_norm are `[2048]`, not `[128]`). Unfused QKV because
+/// `bind_olmo3` binds the per-projection views, never the dense join's
+/// fused bank; untied lm_head; rope theta 5e5 and `attention_bias: false`
+/// are backend cfg / absent branches, invisible here by design.
+#[test]
+fn olmo2_1b() {
+    check("olmo2_1b", &LlamaLikeFacts::olmo2_1b());
+}
+
 /// The unfused-binding variant: three projection matmuls, no SplitQkv. Kept
 /// golden so the binding-driven divergence stays a reviewed artifact rather
 /// than an emergent one.

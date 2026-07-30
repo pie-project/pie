@@ -19,7 +19,7 @@
 //!   there is no diagnostics channel to carry, and the status is the whole
 //!   answer.
 
-use crate::facts::LlamaLikeFacts;
+use crate::facts::{LlamaLikeFacts, NormPlacement, QkNorm};
 use crate::trace::{NormVariant, RopeKind};
 
 use super::arena;
@@ -61,8 +61,11 @@ pub struct PieForwardLlamaLikeFacts {
     pub rope: u32,
     /// A [`super::types::PieForwardNormVariant`] value.
     pub norm_variant: u32,
-    /// Per-head RMSNorm on Q/K before rope; non-zero is true.
-    pub qk_norm: u8,
+    /// A [`super::types::PieForwardNormPlacement`] value.
+    pub norm_placement: u32,
+    /// A [`super::types::PieForwardQkNorm`] value. (Formerly a 0/1 bool;
+    /// `Off`/`PerHead` keep those wire values.)
+    pub qk_norm: u32,
     /// The deployment bound one packed QKV projection; non-zero is true.
     pub fused_qkv: u8,
     /// The lm_head weight is the embedding table; non-zero is true.
@@ -78,6 +81,10 @@ fn read_facts(facts: &PieForwardLlamaLikeFacts) -> Result<LlamaLikeFacts, PieFor
     let rope = RopeKind::try_from(facts.rope).map_err(|_| PieForwardStatus::InvalidArgument)?;
     let norm_variant =
         NormVariant::try_from(facts.norm_variant).map_err(|_| PieForwardStatus::InvalidArgument)?;
+    let norm_placement = NormPlacement::try_from(facts.norm_placement)
+        .map_err(|_| PieForwardStatus::InvalidArgument)?;
+    let qk_norm =
+        QkNorm::try_from(facts.qk_norm).map_err(|_| PieForwardStatus::InvalidArgument)?;
     Ok(LlamaLikeFacts {
         hidden: facts.hidden,
         layers: facts.layers,
@@ -88,7 +95,8 @@ fn read_facts(facts: &PieForwardLlamaLikeFacts) -> Result<LlamaLikeFacts, PieFor
         vocab: facts.vocab,
         rope,
         norm_variant,
-        qk_norm: facts.qk_norm != 0,
+        norm_placement,
+        qk_norm,
         fused_qkv: facts.fused_qkv != 0,
         tied_embeddings: facts.tied_embeddings != 0,
     })

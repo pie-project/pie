@@ -19,6 +19,7 @@
 //! so [`PieForwardOp`] stays a plain struct and the per-kind meaning of the
 //! params is documented on it.
 
+use crate::facts::{NormPlacement, QkNorm};
 use crate::trace::{DType, Dim, NormVariant, RopeKind};
 
 /// `PieForwardOp::weight_name` when the op references no weight.
@@ -50,6 +51,10 @@ pub enum PieForwardOpKind {
     Attention = 7,
     Swiglu = 8,
     LmHead = 9,
+    /// `residual += x` (post-norm placement's separate landing). Appended
+    /// per the discipline above — the nine kinds before it keep their
+    /// wire values.
+    ResidualAdd = 10,
 }
 
 /// Mirrors [`crate::trace::DType`]; same appended-only discriminant rule as
@@ -113,6 +118,70 @@ impl TryFrom<u32> for NormVariant {
         Ok(match value {
             0 => Self::Plain,
             1 => Self::Gemma,
+            other => return Err(other),
+        })
+    }
+}
+
+/// Mirrors [`crate::facts::NormPlacement`].
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PieForwardNormPlacement {
+    Pre = 0,
+    /// OLMo-2/3: norm the sub-layer OUTPUT, then a separate residual add.
+    Post = 1,
+}
+
+impl From<NormPlacement> for PieForwardNormPlacement {
+    fn from(value: NormPlacement) -> Self {
+        match value {
+            NormPlacement::Pre => Self::Pre,
+            NormPlacement::Post => Self::Post,
+        }
+    }
+}
+
+impl TryFrom<u32> for NormPlacement {
+    type Error = u32;
+    fn try_from(value: u32) -> Result<Self, u32> {
+        Ok(match value {
+            0 => Self::Pre,
+            1 => Self::Post,
+            other => return Err(other),
+        })
+    }
+}
+
+/// Mirrors [`crate::facts::QkNorm`]. `Off`/`PerHead` keep the wire values
+/// the field had as a bool (0/1), so a caller that treated it as "non-zero
+/// is per-head qk-norm" still states the same facts.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PieForwardQkNorm {
+    Off = 0,
+    PerHead = 1,
+    /// One RMSNorm over the flattened `[heads * head_dim]` q/k projection
+    /// (OLMo-2) — different arithmetic from per-head.
+    Global = 2,
+}
+
+impl From<QkNorm> for PieForwardQkNorm {
+    fn from(value: QkNorm) -> Self {
+        match value {
+            QkNorm::Off => Self::Off,
+            QkNorm::PerHead => Self::PerHead,
+            QkNorm::Global => Self::Global,
+        }
+    }
+}
+
+impl TryFrom<u32> for QkNorm {
+    type Error = u32;
+    fn try_from(value: u32) -> Result<Self, u32> {
+        Ok(match value {
+            0 => Self::Off,
+            1 => Self::PerHead,
+            2 => Self::Global,
             other => return Err(other),
         })
     }
@@ -279,6 +348,7 @@ pub struct PieForwardIdRange {
 /// | `Attention`      | none                 | cache layer                  | —          |
 /// | `Swiglu`         | none                 | `inter`                      | —          |
 /// | `LmHead`         | weight               | —                            | —          |
+/// | `ResidualAdd`    | none                 | —                            | —          |
 ///
 /// `KvAppend`/`Attention` restate the layer their kind addresses even though
 /// `layer` carries the bracketing layer, because the trace states both

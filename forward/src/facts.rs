@@ -10,12 +10,49 @@ use serde::{Deserialize, Serialize};
 
 use crate::trace::{NormVariant, RopeKind};
 
-/// The llama_like family's facts: covers qwen3, mistral3, phi3, olmo3
+/// Where each sub-layer's norm sits relative to the residual add.
+///
+/// `Pre` is the standard Llama shape: norm the residual stream *into* the
+/// sub-layer, accumulate the sub-layer's projection straight back onto the
+/// stream (the `beta=1` GEMM). `Post` is the OLMo-2/OLMo-3 shape: the
+/// sub-layer reads the residual stream raw, the norm applies to the
+/// sub-layer's OUTPUT, and only then does a separate residual add land it —
+/// a genuinely different op ORDER, which is why it is a fact and not an
+/// emitter choice. Mirrors the driver's `NormPlacement`
+/// (`driver/cuda/src/model/llama_like/llama_like.hpp`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NormPlacement {
+    #[default]
+    Pre,
+    Post,
+}
+
+/// Which q/k-norm convention the checkpoint ships, if any.
+///
+/// Two conventions exist in the wild (the driver's `rmsnorm_qk` dispatch,
+/// `llama_like.cpp`): *per-head* (qwen3, gemma-3 — weight shape
+/// `[head_dim]`, each head's channels normalised independently) and
+/// *global* (OLMo-2, OLMo-3 — weight shape `[heads * head_dim]`, ONE
+/// RMSNorm over the flattened projection). They are different arithmetic —
+/// the global form shares one scale across heads — so the tri-state is a
+/// fact, and the traced ops differ: per-head traces `RmsnormPerHead`,
+/// global traces a plain row `Rmsnorm` (which is exactly what the kernel
+/// launches: `launch_rmsnorm_bf16` over `[N, heads * head_dim]`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum QkNorm {
+    #[default]
+    Off,
+    PerHead,
+    Global,
+}
+
+/// The llama_like family's facts: covers qwen3, mistral3, phi3, olmo2/3
 /// (pie-application-plan.md §7 stage 3 scope). Declared so far: the qwen3
 /// configuration — pre-norm, per-head qk-norm, standard rope, fused QKV
 /// binding, dense MLP — the phi3 one, which drops the qk-norm and the
-/// embedding tie, and the mistral (7B v0.3) one, which pairs the fused
-/// binding with no qk-norm.
+/// embedding tie, the mistral (7B v0.3) one, which pairs the fused
+/// binding with no qk-norm, and the olmo2 (1B) one — the first to change
+/// the declaration itself: post-norm placement and the global qk-norm.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LlamaLikeFacts {
     pub hidden: u32,
@@ -27,8 +64,14 @@ pub struct LlamaLikeFacts {
     pub vocab: u32,
     pub rope: RopeKind,
     pub norm_variant: NormVariant,
-    /// Per-head RMSNorm on Q/K before rope (qwen3, olmo2-small).
-    pub qk_norm: bool,
+    /// Norm-vs-residual order per sub-layer; `Pre` for every configuration
+    /// before olmo2. Serde-defaulted so pre-olmo facts JSON (none is
+    /// persisted today, but the goldens' discipline applies) reads back
+    /// unchanged.
+    #[serde(default)]
+    pub norm_placement: NormPlacement,
+    /// RMSNorm on Q/K before rope: off, per-head (qwen3) or global (olmo2).
+    pub qk_norm: QkNorm,
     /// The deployment bound one packed `[q + 2kv, hidden]` projection.
     /// This is a *binding* fact, not an architecture fact: the declaration
     /// writes one matmul either way, and with `false` it traces three.
@@ -58,7 +101,8 @@ impl LlamaLikeFacts {
             vocab: 151_936,
             rope: RopeKind::Standard,
             norm_variant: NormVariant::Plain,
-            qk_norm: true,
+            norm_placement: NormPlacement::Pre,
+            qk_norm: QkNorm::PerHead,
             fused_qkv: true,
             tied_embeddings: true,
         }
@@ -91,7 +135,8 @@ impl LlamaLikeFacts {
             vocab: 32_064,
             rope: RopeKind::Standard,
             norm_variant: NormVariant::Plain,
-            qk_norm: false,
+            norm_placement: NormPlacement::Pre,
+            qk_norm: QkNorm::Off,
             fused_qkv: false,
             tied_embeddings: false,
         }
@@ -126,8 +171,56 @@ impl LlamaLikeFacts {
             vocab: 32_768,
             rope: RopeKind::Standard,
             norm_variant: NormVariant::Plain,
-            qk_norm: false,
+            norm_placement: NormPlacement::Pre,
+            qk_norm: QkNorm::Off,
             fused_qkv: true,
+            tied_embeddings: false,
+        }
+    }
+
+    /// OLMo-2-0425-1B-Instruct (allenai/OLMo-2-0425-1B-Instruct
+    /// config.json): the fourth llama_like configuration, and the first
+    /// that extends the declaration itself rather than recombining
+    /// existing branches. Two genuinely new facts:
+    ///
+    /// * `norm_placement: Post` — the checkpoint ships
+    ///   `post_attention_layernorm` + `post_feedforward_layernorm` and NO
+    ///   `input_layernorm`; each sub-layer reads the residual stream raw,
+    ///   norms its own output, and a separate residual add lands it
+    ///   (`launch_residual_add_bf16` in the hand-written post-norm walk).
+    /// * `qk_norm: Global` — the checkpoint's `q_norm`/`k_norm` weights
+    ///   are shape `[2048]` = heads x head_dim (verified against the
+    ///   safetensors header), NOT `[128]`: one RMSNorm over the flattened
+    ///   projection, the `rmsnorm_qk` global branch. (The "per-head for
+    ///   OLMo-2 small" note in llama_like.cpp is wrong for this 1B
+    ///   checkpoint — the tensor shape is the truth.)
+    ///
+    /// MHA (16 q = 16 kv heads), head_dim 128 (hidden 2048 / 16 — no
+    /// config `head_dim` key; the derivation matches the driver's),
+    /// untied lm_head (`tie_word_embeddings: false`, `lm_head.weight`
+    /// ships). `attention_bias: false`, so no qkv-bias branch is needed.
+    /// `rope_theta: 5e5` and null rope scaling are backend cfg the trace
+    /// deliberately lacks. `fused_qkv: false` is the binding fact:
+    /// although the dense join re-fuses the raw q/k/v into
+    /// `qkv_proj.fused`, `bind_olmo3` (qwen3.cpp) never reads the fused
+    /// names — it binds the per-projection views — so the deployment runs
+    /// three projection GEMMs and the trace writes three matmuls. (Same
+    /// for gate/up: bound unfused, but that is emitter dispatch on the
+    /// single traced `gate_up` matmul, not a fact.)
+    pub fn olmo2_1b() -> Self {
+        Self {
+            hidden: 2048,
+            layers: 16,
+            q_heads: 16,
+            kv_heads: 16,
+            head_dim: 128,
+            intermediate: 8192,
+            vocab: 100_352,
+            rope: RopeKind::Standard,
+            norm_variant: NormVariant::Plain,
+            norm_placement: NormPlacement::Post,
+            qk_norm: QkNorm::Global,
+            fused_qkv: false,
             tied_embeddings: false,
         }
     }

@@ -18,9 +18,13 @@
 // Bit-parity requires the same launches, not just the same math — the
 // fused kernels round differently from their unfused sequences.
 // Everything the trace cannot express yet (hooks, custom masks, TP,
-// vision, quantized projections, non-standard rope, post-norm, qkv bias)
+// vision, quantized projections, non-standard rope, qkv bias)
 // falls back to `llama_like_forward_paged` — the caller gates, `build`
-// refuses. Padded head_dim (Phi-3-mini's 96 → 128) is IN scope: the
+// refuses. Post-norm placement (olmo2) and the global qk-norm convention
+// ARE in scope: the trace states both as facts (the matmul(beta=0) →
+// rmsnorm → residual_add triplet; plain row Rmsnorm on q/k), and this
+// executor launches the hand-written post-norm / `rmsnorm_qk`-global
+// kernels for them. Padded head_dim (Phi-3-mini's 96 → 128) is IN scope: the
 // pad/strip staging around KV-write/attention is emitter knowledge, not
 // trace vocabulary — the trace speaks the logical head_dim throughout.
 //

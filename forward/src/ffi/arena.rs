@@ -134,6 +134,7 @@ fn flatten_kind(
         }
         OpKind::Swiglu { inter } => (PieForwardOpKind::Swiglu, PIE_FORWARD_NO_NAME, *inter, 0),
         OpKind::LmHead { weight } => (PieForwardOpKind::LmHead, name(arena, weight), 0, 0),
+        OpKind::ResidualAdd => (PieForwardOpKind::ResidualAdd, PIE_FORWARD_NO_NAME, 0, 0),
     }
 }
 

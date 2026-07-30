@@ -28,7 +28,8 @@ fn c_facts_qwen3() -> PieForwardLlamaLikeFacts {
         vocab: facts.vocab,
         rope: PieForwardRopeKind::from(facts.rope) as u32,
         norm_variant: PieForwardNormVariant::from(facts.norm_variant) as u32,
-        qk_norm: u8::from(facts.qk_norm),
+        norm_placement: PieForwardNormPlacement::from(facts.norm_placement) as u32,
+        qk_norm: PieForwardQkNorm::from(facts.qk_norm) as u32,
         fused_qkv: u8::from(facts.fused_qkv),
         tied_embeddings: u8::from(facts.tied_embeddings),
     }
@@ -49,6 +50,7 @@ fn expect_kind(kind: &OpKind) -> PieForwardOpKind {
         OpKind::Attention { .. } => PieForwardOpKind::Attention,
         OpKind::Swiglu { .. } => PieForwardOpKind::Swiglu,
         OpKind::LmHead { .. } => PieForwardOpKind::LmHead,
+        OpKind::ResidualAdd => PieForwardOpKind::ResidualAdd,
     }
 }
 
@@ -195,7 +197,75 @@ fn entry_rejects_out_of_range_enums() {
         unsafe { pie_forward_trace_llama_like(&facts, &mut out) },
         PieForwardStatus::InvalidArgument
     );
+
+    let mut facts = c_facts_qwen3();
+    facts.norm_placement = 2;
+    assert_eq!(
+        unsafe { pie_forward_trace_llama_like(&facts, &mut out) },
+        PieForwardStatus::InvalidArgument
+    );
+
+    let mut facts = c_facts_qwen3();
+    facts.qk_norm = 3;
+    assert_eq!(
+        unsafe { pie_forward_trace_llama_like(&facts, &mut out) },
+        PieForwardStatus::InvalidArgument
+    );
     assert!(out.owner.is_null());
+}
+
+/// The olmo2 facts cross the boundary: post-norm placement and the global
+/// qk-norm reach the tracer as enum wire values, and the traced form that
+/// comes back is the post-norm walk — ResidualAdd ops present, no beta=1
+/// accumulates, no RmsnormPerHead (the global convention is a plain
+/// Rmsnorm), 16 ops per layer.
+#[test]
+fn entry_honours_post_norm_and_global_qk_norm() {
+    let facts = LlamaLikeFacts::olmo2_1b();
+    let c_facts = PieForwardLlamaLikeFacts {
+        hidden: facts.hidden,
+        layers: facts.layers,
+        q_heads: facts.q_heads,
+        kv_heads: facts.kv_heads,
+        head_dim: facts.head_dim,
+        intermediate: facts.intermediate,
+        vocab: facts.vocab,
+        rope: PieForwardRopeKind::from(facts.rope) as u32,
+        norm_variant: PieForwardNormVariant::from(facts.norm_variant) as u32,
+        norm_placement: PieForwardNormPlacement::from(facts.norm_placement) as u32,
+        qk_norm: PieForwardQkNorm::from(facts.qk_norm) as u32,
+        fused_qkv: u8::from(facts.fused_qkv),
+        tied_embeddings: u8::from(facts.tied_embeddings),
+    };
+    let mut out = PieForwardPlan::default();
+    assert_eq!(
+        unsafe { pie_forward_trace_llama_like(&c_facts, &mut out) },
+        PieForwardStatus::Ok
+    );
+    let ops = view::ops(&out);
+    assert_eq!(ops.len(), 16 * facts.layers as usize + 3);
+    let layer0_adds = ops
+        .iter()
+        .filter(|op| op.layer == 0 && op.kind == PieForwardOpKind::ResidualAdd)
+        .count();
+    assert_eq!(layer0_adds, 2);
+    assert!(
+        !ops.iter()
+            .any(|op| op.kind == PieForwardOpKind::Matmul && op.param0 != 0)
+    );
+    assert!(
+        !ops.iter()
+            .any(|op| op.kind == PieForwardOpKind::RmsnormPerHead)
+    );
+    // ResidualAdd references no weight; its two inputs (normed output,
+    // residual stream) crossed intact.
+    let add = ops
+        .iter()
+        .find(|op| op.kind == PieForwardOpKind::ResidualAdd)
+        .unwrap();
+    assert_eq!(add.weight_name, PIE_FORWARD_NO_NAME);
+    assert_eq!(add.inputs.len, 2);
+    unsafe { pie_forward_release(&mut out) };
 }
 
 /// The unfused binding crosses the boundary too: three per-layer projection

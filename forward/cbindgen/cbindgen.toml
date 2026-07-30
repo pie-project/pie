@@ -15,12 +15,17 @@ parse_deps = false
 
 [export]
 # cbindgen's `export.include` is *additive*: it forces items into the header
-# that are not otherwise reachable. These two are the enums behind the
+# that are not otherwise reachable. These four are the enums behind the
 # `uint32_t` fields of `PieForwardLlamaLikeFacts` — inputs the *caller*
 # writes, so no exported struct holds one by type and cbindgen has no path
 # to them. The same situation, and the same fix, as `PieLoaderExprKind` in
 # `loader/cbindgen/cbindgen.toml`.
-include = ["PieForwardNormVariant", "PieForwardRopeKind"]
+include = [
+    "PieForwardNormVariant",
+    "PieForwardRopeKind",
+    "PieForwardNormPlacement",
+    "PieForwardQkNorm",
+]
 
 [enum]
 prefix_with_name = false

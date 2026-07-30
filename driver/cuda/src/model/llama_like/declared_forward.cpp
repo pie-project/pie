@@ -14,6 +14,7 @@
 #include "kernels/gather_rows.hpp"
 #include "kernels/head_dim_pad.hpp"
 #include "kernels/kv_paged.hpp"
+#include "kernels/residual_add.hpp"
 #include "kernels/rmsnorm.hpp"
 #include "kernels/rope.hpp"
 #include "kernels/split_packed.hpp"
@@ -26,9 +27,11 @@ namespace pie_cuda_driver::model {
 
 namespace {
 
+using pie_forward::PieForwardNormPlacement;
 using pie_forward::PieForwardNormVariant;
 using pie_forward::PieForwardOp;
 using pie_forward::PieForwardOpKind;
+using pie_forward::PieForwardQkNorm;
 using pie_forward::PieForwardRopeKind;
 
 // A plan weight name split into its layer index and field: "layer.3.qkv" →
@@ -150,7 +153,9 @@ LlamaLikeDeclaredPlan build_llama_like_declared_plan(
     // returns empty and the model keeps the hand-written path. Each line
     // names the hand-written feature it stands in for.
     if (fwd_cfg.rope_kind != RopeKind::Standard) return out;   // YaRN/M-RoPE
-    if (fwd_cfg.norm_placement != NormPlacement::Pre) return out;  // OLMo-3
+    // Post-norm placement (olmo2/olmo3) is admitted: the trace carries the
+    // matmul(beta=0) → rmsnorm → residual_add triplet and the executor
+    // launches the hand-written post-norm block's kernels.
     if (fwd_cfg.use_qkv_bias) return out;                      // Qwen-2 bias
     if (fwd_cfg.tp_size > 1) return out;                       // all-reduces
     // Padded head_dim (Phi-3-mini, 96 → 128) is admitted: the pad/strip
@@ -173,17 +178,35 @@ LlamaLikeDeclaredPlan build_llama_like_declared_plan(
         }
         if ((layer.qkv_proj_fused != nullptr) != fused_qkv) return out;
     }
+    // q/k-norm convention, from the bound tensor shape — the same evidence
+    // the hand-written `rmsnorm_qk` dispatches on, resolved once here
+    // because the trace states the convention as a fact:
+    //   * per-head (qwen3): weight `[head_dim]` → RmsnormPerHead ops;
+    //   * global (olmo2): weight `[heads * head_dim]` → plain row Rmsnorm
+    //     over the flattened projection.
+    // Anything else (mixed conventions across layers, an unexpected shape)
+    // falls back to the hand-written path.
+    PieForwardQkNorm qk_norm = PieForwardQkNorm::Off;
     if (fwd_cfg.use_qk_norm) {
-        // The trace's RmsnormPerHead is the per-head convention (weight
-        // shape [head_dim]); the global-norm convention (OLMo-2 7B+) is a
-        // different op the family does not declare yet.
-        const DeviceTensor* qn = w.layers[0].q_norm;
-        const DeviceTensor* kn = w.layers[0].k_norm;
-        const bool per_head =
-            qn != nullptr && kn != nullptr &&
-            qn->shape().size() == 1 && qn->shape()[0] == cfg.head_dim &&
-            kn->shape().size() == 1 && kn->shape()[0] == cfg.head_dim;
-        if (!per_head) return out;
+        const int Hq_w = cfg.num_attention_heads * cfg.head_dim;
+        const int Hk_w = cfg.num_key_value_heads * cfg.head_dim;
+        const auto convention_of =
+            [&](const DeviceTensor* t, int flat) -> PieForwardQkNorm {
+            if (t == nullptr || t->shape().size() != 1) {
+                return PieForwardQkNorm::Off;  // no representable convention
+            }
+            if (t->shape()[0] == cfg.head_dim) return PieForwardQkNorm::PerHead;
+            if (t->shape()[0] == flat) return PieForwardQkNorm::Global;
+            return PieForwardQkNorm::Off;
+        };
+        qk_norm = convention_of(w.layers[0].q_norm, Hq_w);
+        if (qk_norm == PieForwardQkNorm::Off) return out;
+        for (const auto& layer : w.layers) {
+            if (convention_of(layer.q_norm, Hq_w) != qk_norm ||
+                convention_of(layer.k_norm, Hk_w) != qk_norm) {
+                return out;
+            }
+        }
     }
 
     pie_forward::PieForwardLlamaLikeFacts facts{};
@@ -197,7 +220,11 @@ LlamaLikeDeclaredPlan build_llama_like_declared_plan(
     facts.rope = static_cast<std::uint32_t>(PieForwardRopeKind::Standard);
     facts.norm_variant =
         static_cast<std::uint32_t>(PieForwardNormVariant::Plain);
-    facts.qk_norm = fwd_cfg.use_qk_norm ? 1 : 0;
+    facts.norm_placement = static_cast<std::uint32_t>(
+        fwd_cfg.norm_placement == NormPlacement::Post
+            ? PieForwardNormPlacement::Post
+            : PieForwardNormPlacement::Pre);
+    facts.qk_norm = static_cast<std::uint32_t>(qk_norm);
     facts.fused_qkv = fused_qkv ? 1 : 0;
     // A binding fact, like fused_qkv: bind_llama_like aliases lm_head to
     // embed when the checkpoint ties them, so pointer equality is the truth.
@@ -261,6 +288,10 @@ void llama_like_forward_declared(
     const int num_q_heads = cfg.num_attention_heads;
     const int num_kv_heads = cfg.num_key_value_heads;
     const float eps = cfg.rms_norm_eps;
+    // Post-norm placement (olmo2): decides which buffer each projection
+    // reads/writes and how the block norms route — the same buffer walk as
+    // the hand-written `post_norm` branches, stated once here.
+    const bool post_norm = fwd_cfg.norm_placement == NormPlacement::Post;
     // Inherit cublas's stream so every launch lands on the captured graph,
     // for the reason llama_like_forward_paged states at its stream setup.
     cudaStream_t stream = cublas.stream();
@@ -342,14 +373,43 @@ void llama_like_forward_declared(
             const ParsedWeightName nm = parse_weight_name(name);
             if (nm.field == "attn_norm") {
                 const auto& layer = layer_of(w, nm, name);
-                kernels::launch_rmsnorm_bf16(
-                    ws.y.data(), require(layer.attn_norm, name)->data(),
-                    ws.norm_x.data(), N, H, eps, stream);
+                if (post_norm) {
+                    // Post-norm: the o_proj OUTPUT (in norm_x, the
+                    // hand-written scratch) is normed into norm_y; the
+                    // following ResidualAdd lands it on the stream.
+                    kernels::launch_rmsnorm_bf16(
+                        ws.norm_x.data(), require(layer.attn_norm, name)->data(),
+                        ws.norm_y.data(), N, H, eps, stream);
+                } else {
+                    kernels::launch_rmsnorm_bf16(
+                        ws.y.data(), require(layer.attn_norm, name)->data(),
+                        ws.norm_x.data(), N, H, eps, stream);
+                }
             } else if (nm.field == "mlp_norm") {
                 const auto& layer = layer_of(w, nm, name);
+                if (post_norm) {
+                    // Post-norm: the down_proj OUTPUT (in norm_x) → norm_y.
+                    kernels::launch_rmsnorm_bf16(
+                        ws.norm_x.data(), require(layer.mlp_norm, name)->data(),
+                        ws.norm_y.data(), N, H, eps, stream);
+                } else {
+                    kernels::launch_rmsnorm_bf16(
+                        ws.y.data(), require(layer.mlp_norm, name)->data(),
+                        ws.norm_y.data(), N, H, eps, stream);
+                }
+            } else if (nm.field == "q_norm") {
+                // Global qk-norm (olmo2): ONE row RMSNorm over the
+                // flattened [N, heads * head_dim] projection, in place —
+                // the hand-written `rmsnorm_qk` global branch, verbatim.
+                const auto& layer = layer_of(w, nm, name);
                 kernels::launch_rmsnorm_bf16(
-                    ws.y.data(), require(layer.mlp_norm, name)->data(),
-                    ws.norm_y.data(), N, H, eps, stream);
+                    ws.q.data(), require(layer.q_norm, name)->data(),
+                    ws.q.data(), N, Hq, eps, stream);
+            } else if (nm.field == "k_norm") {
+                const auto& layer = layer_of(w, nm, name);
+                kernels::launch_rmsnorm_bf16(
+                    ws.k.data(), require(layer.k_norm, name)->data(),
+                    ws.k.data(), N, Hk, eps, stream);
             } else if (nm.layer < 0 && nm.field == "final_norm") {
                 // Deferred to LmHead: the hand-written epilogue interleaves
                 // the final norm with the logit-row gather (norm is row-wise,
@@ -366,6 +426,14 @@ void llama_like_forward_declared(
             const ParsedWeightName nm = parse_weight_name(name);
             const auto& layer = layer_of(w, nm, name);
             const float beta = op.param0 != 0 ? 1.f : 0.f;
+            // What the attention/MLP projections read: pre-norm reads the
+            // normed copies (norm_x for QKV, norm_y for gate/up), post-norm
+            // reads the residual stream raw — the hand-written `qkv_in` /
+            // `mlp_in` indirections.
+            const void* const qkv_in =
+                post_norm ? ws.y.data() : ws.norm_x.data();
+            const void* const mlp_in =
+                post_norm ? ws.y.data() : ws.norm_y.data();
             if (nm.field == "qkv") {
                 // Fused decode-QKV peephole. The trace deliberately stays
                 // unfused: fusion is the EMITTER's decision, never the
@@ -410,7 +478,7 @@ void llama_like_forward_declared(
                     q_norm_is_per_head && k_norm_is_per_head &&
                     fwd_cfg.rope_kind == RopeKind::Standard;
                 ops::gemm_act_x_w(cublas.handle(),
-                    ws.norm_x.data(),
+                    qkv_in,
                     ops::WeightView(*require(layer.qkv_proj_fused, name)),
                     ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
                 if (fused_decode_qkv_post) {
@@ -443,30 +511,43 @@ void llama_like_forward_declared(
                 }
             } else if (nm.field == "q_proj") {
                 ops::gemm_act_x_w(cublas.handle(),
-                    ws.norm_x.data(),
+                    qkv_in,
                     make_weight_view(require(layer.q_proj, name),
                                      layer.q_proj_quant),
                     ws.q.data(), N, Hq, H);
             } else if (nm.field == "k_proj") {
                 ops::gemm_act_x_w(cublas.handle(),
-                    ws.norm_x.data(),
+                    qkv_in,
                     make_weight_view(require(layer.k_proj, name),
                                      layer.k_proj_quant),
                     ws.k.data(), N, Hk, H);
             } else if (nm.field == "v_proj") {
                 ops::gemm_act_x_w(cublas.handle(),
-                    ws.norm_x.data(),
+                    qkv_in,
                     make_weight_view(require(layer.v_proj, name),
                                      layer.v_proj_quant),
                     ws.v.data(), N, Hk, H);
             } else if (nm.field == "o_proj") {
-                // Residual accumulate folded into the GEMM (beta from the
-                // trace's beta_one), exactly the hand-written T==1 branch.
-                ops::gemm_act_x_w(cublas.handle(),
-                    ws.attn_out.data(),
-                    make_weight_view(require(layer.o_proj, name),
-                                     layer.o_proj_quant),
-                    ws.y.data(), N, H, Hq, beta);
+                if (post_norm) {
+                    // Post-norm: o_proj lands in the norm_x scratch (the
+                    // trace's beta_one is 0 here); Rmsnorm(attn_norm) +
+                    // ResidualAdd land it on the stream — the hand-written
+                    // post-norm block, same buffers, same order.
+                    ops::gemm_act_x_w(cublas.handle(),
+                        ws.attn_out.data(),
+                        make_weight_view(require(layer.o_proj, name),
+                                         layer.o_proj_quant),
+                        ws.norm_x.data(), N, H, Hq, beta);
+                } else {
+                    // Residual accumulate folded into the GEMM (beta from
+                    // the trace's beta_one), exactly the hand-written T==1
+                    // branch.
+                    ops::gemm_act_x_w(cublas.handle(),
+                        ws.attn_out.data(),
+                        make_weight_view(require(layer.o_proj, name),
+                                         layer.o_proj_quant),
+                        ws.y.data(), N, H, Hq, beta);
+                }
             } else if (nm.field == "gate_up") {
                 // The trace declares one packed matmul either way; whether
                 // the binding materialised it fused is this emitter's call,
@@ -476,27 +557,37 @@ void llama_like_forward_declared(
                     !ws.gate_up_fused.empty();
                 if (gate_up_used_fused) {
                     ops::gemm_act_x_w(cublas.handle(),
-                        ws.norm_y.data(),
+                        mlp_in,
                         ops::WeightView(*layer.gate_up_proj_fused),
                         ws.gate_up_fused.data(), N, 2 * I, H);
                 } else {
                     ops::gemm_act_x_w(cublas.handle(),
-                        ws.norm_y.data(),
+                        mlp_in,
                         make_weight_view(require(layer.gate_proj, name),
                                          layer.gate_proj_quant),
                         ws.gate.data(), N, I, H);
                     ops::gemm_act_x_w(cublas.handle(),
-                        ws.norm_y.data(),
+                        mlp_in,
                         make_weight_view(require(layer.up_proj, name),
                                          layer.up_proj_quant),
                         ws.up.data(), N, I, H);
                 }
             } else if (nm.field == "down") {
-                ops::gemm_act_x_w(cublas.handle(),
-                    ws.gate.data(),
-                    make_weight_view(require(layer.down_proj, name),
-                                     layer.down_proj_quant),
-                    ws.y.data(), N, H, I, beta);
+                if (post_norm) {
+                    // Post-norm: down_proj → norm_x scratch (beta 0), then
+                    // Rmsnorm(mlp_norm) + ResidualAdd — as o_proj above.
+                    ops::gemm_act_x_w(cublas.handle(),
+                        ws.gate.data(),
+                        make_weight_view(require(layer.down_proj, name),
+                                         layer.down_proj_quant),
+                        ws.norm_x.data(), N, H, I, beta);
+                } else {
+                    ops::gemm_act_x_w(cublas.handle(),
+                        ws.gate.data(),
+                        make_weight_view(require(layer.down_proj, name),
+                                         layer.down_proj_quant),
+                        ws.y.data(), N, H, I, beta);
+                }
             } else {
                 throw_unknown_weight(name);
             }
@@ -701,6 +792,17 @@ void llama_like_forward_declared(
                     ws.gate.data(), ws.up.data(), ws.gate.data(),
                     N * I, stream);
             }
+            break;
+        }
+        case PieForwardOpKind::ResidualAdd: {
+            // The post-norm landing: `y += norm_y` — the sub-layer's
+            // normed output (Rmsnorm above wrote norm_y) accumulated onto
+            // the residual stream by its own launch, exactly the
+            // hand-written `launch_residual_add_bf16` calls after the
+            // attn_norm and mlp_norm blocks.
+            kernels::launch_residual_add_bf16(
+                ws.y.data(), ws.norm_y.data(),
+                static_cast<std::size_t>(N) * H, stream);
             break;
         }
         case PieForwardOpKind::LmHead: {

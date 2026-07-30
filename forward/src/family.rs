@@ -6,7 +6,7 @@
 //! matmuls and no split, and the traced forms differ the way two compiled
 //! programs differ, not the way two runtime paths do.
 
-use crate::facts::LlamaLikeFacts;
+use crate::facts::{LlamaLikeFacts, NormPlacement, QkNorm};
 use crate::trace::{ForwardPlan, TraceBuilder};
 
 /// The llama_like decode/prefill body (no structural divergence, so one
@@ -17,10 +17,21 @@ use crate::trace::{ForwardPlan, TraceBuilder};
 /// (`llama_like_forward_paged`) op for op; the golden test pins that
 /// correspondence and the comment there maps each op to the kernel(s) the
 /// hand-written pass would launch.
+///
+/// Norm placement branches the block structure itself (the first fact to
+/// do so):
+///
+/// * `Pre` — norm the stream into the sub-layer, accumulate the output
+///   projection straight back (`matmul_add`, the `beta=1` GEMM).
+/// * `Post` (olmo2) — the sub-layer reads the stream raw, its output
+///   projection lands in scratch (`beta=0`), the norm applies to THAT, and
+///   a separate `ResidualAdd` lands it — the hand-written post-norm walk's
+///   gemm → `launch_rmsnorm_bf16` → `launch_residual_add_bf16` triplet.
 pub fn llama_like(facts: &LlamaLikeFacts) -> ForwardPlan {
     let mut t = TraceBuilder::new("llama_like");
     let q_w = facts.q_width();
     let kv_w = facts.kv_width();
+    let post_norm = facts.norm_placement == NormPlacement::Post;
 
     let mut y = t.embed("embed", facts.hidden);
 
@@ -28,9 +39,13 @@ pub fn llama_like(facts: &LlamaLikeFacts) -> ForwardPlan {
         y = t.layer(l, |t| {
             let w = |name: &str| format!("layer.{l}.{name}");
 
-            // Attention block: norm -> qkv -> (per-head norms) -> rope ->
-            // append -> attention -> o_proj accumulated into the residual.
-            let x = t.rmsnorm(y, &w("attn_norm"), facts.norm_variant);
+            // Attention block: (pre-norm) -> qkv -> (q/k norms) -> rope ->
+            // append -> attention -> o_proj landed on the residual.
+            let x = if post_norm {
+                y
+            } else {
+                t.rmsnorm(y, &w("attn_norm"), facts.norm_variant)
+            };
             let (q, k, v) = if facts.fused_qkv {
                 let packed = t.matmul(x, &w("qkv"), q_w + 2 * kv_w);
                 t.split_qkv(packed, q_w, kv_w)
@@ -41,24 +56,49 @@ pub fn llama_like(facts: &LlamaLikeFacts) -> ForwardPlan {
                     t.matmul(x, &w("v_proj"), kv_w),
                 )
             };
-            let (q, k) = if facts.qk_norm {
-                (
+            let (q, k) = match facts.qk_norm {
+                QkNorm::Off => (q, k),
+                QkNorm::PerHead => (
                     t.rmsnorm_per_head(q, &w("q_norm"), facts.head_dim),
                     t.rmsnorm_per_head(k, &w("k_norm"), facts.head_dim),
-                )
-            } else {
-                (q, k)
+                ),
+                // The global convention IS a plain row RMSNorm over the
+                // flattened `[rows, heads * head_dim]` projection — the
+                // same op (and kernel) as the block norms, applied to q/k.
+                QkNorm::Global => (
+                    t.rmsnorm(q, &w("q_norm"), facts.norm_variant),
+                    t.rmsnorm(k, &w("k_norm"), facts.norm_variant),
+                ),
             };
             let (q, k) = t.rope(q, k, facts.rope);
             t.kv_append(l, k, v);
             let attn = t.attention(l, q, q_w);
-            let y_attn = t.matmul_add(attn, &w("o_proj"), y, facts.hidden);
+            let y_attn = if post_norm {
+                // Post-norm: o_proj to scratch, norm the OUTPUT, then the
+                // separate residual add — norm placement is an op-order
+                // fact, so the trace states all three.
+                let o = t.matmul(attn, &w("o_proj"), facts.hidden);
+                let o = t.rmsnorm(o, &w("attn_norm"), facts.norm_variant);
+                t.residual_add(o, y)
+            } else {
+                t.matmul_add(attn, &w("o_proj"), y, facts.hidden)
+            };
 
-            // MLP block: norm -> gate‖up -> swiglu -> down accumulated.
-            let m = t.rmsnorm(y_attn, &w("mlp_norm"), facts.norm_variant);
+            // MLP block: (pre-norm) -> gate‖up -> swiglu -> down landed.
+            let m = if post_norm {
+                y_attn
+            } else {
+                t.rmsnorm(y_attn, &w("mlp_norm"), facts.norm_variant)
+            };
             let packed = t.matmul(m, &w("gate_up"), 2 * facts.intermediate);
             let act = t.swiglu(packed, facts.intermediate);
-            t.matmul_add(act, &w("down"), y_attn, facts.hidden)
+            if post_norm {
+                let d = t.matmul(act, &w("down"), facts.hidden);
+                let d = t.rmsnorm(d, &w("mlp_norm"), facts.norm_variant);
+                t.residual_add(d, y_attn)
+            } else {
+                t.matmul_add(act, &w("down"), y_attn, facts.hidden)
+            }
         });
     }
 
@@ -293,6 +333,142 @@ mod tests {
         assert_eq!(
             plan.values[logits as usize].shape.0,
             vec![Dim::Requests, Dim::Const(facts.vocab)]
+        );
+    }
+
+    /// OLMo-2-1B's traced form: the post-norm walk. No pre-norm before the
+    /// projections — QKV reads the residual stream raw — and each
+    /// sub-layer ends with the matmul(beta=0) → rmsnorm → residual_add
+    /// triplet instead of one accumulate GEMM. The global qk-norm traces
+    /// as plain row Rmsnorm on q and k (weight `[heads * head_dim]`, the
+    /// hand-written `rmsnorm_qk` global branch), so no RmsnormPerHead
+    /// appears and neither fused peephole (qk-norm+rope, decode-QKV) can
+    /// ever fire — both predicates require the per-head convention.
+    #[test]
+    fn olmo2_layer_op_sequence() {
+        let plan = llama_like(&LlamaLikeFacts::olmo2_1b());
+        let kinds: Vec<&'static str> = plan
+            .layer_ops(0)
+            .map(|op| match op.kind {
+                OpKind::Rmsnorm { .. } => "rmsnorm",
+                OpKind::Matmul { beta_one: false, .. } => "matmul",
+                OpKind::Matmul { beta_one: true, .. } => "matmul+res",
+                OpKind::SplitQkv { .. } => "split_qkv",
+                OpKind::RmsnormPerHead { .. } => "rmsnorm_per_head",
+                OpKind::Rope { .. } => "rope",
+                OpKind::KvAppend { .. } => "kv_append",
+                OpKind::Attention { .. } => "attention",
+                OpKind::Swiglu { .. } => "swiglu",
+                OpKind::ResidualAdd => "residual_add",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "matmul",        // q_proj — reads y raw: no attn pre-norm
+                "matmul",        // k_proj
+                "matmul",        // v_proj
+                "rmsnorm",       // q_norm (global: row norm over [N, Hq])
+                "rmsnorm",       // k_norm
+                "rope",
+                "kv_append",
+                "attention",
+                "matmul",        // o_proj, beta=0 — scratch, not the stream
+                "rmsnorm",       // attn_norm on the o_proj OUTPUT
+                "residual_add",  // y += norm(o_proj(attn))
+                "matmul",        // gate_up — reads y raw: no mlp pre-norm
+                "swiglu",
+                "matmul",        // down, beta=0
+                "rmsnorm",       // mlp_norm on the down OUTPUT
+                "residual_add",  // y += norm(down(act))
+            ]
+        );
+    }
+
+    #[test]
+    fn olmo2_full_plan_shape() {
+        let facts = LlamaLikeFacts::olmo2_1b();
+        let plan = llama_like(&facts);
+        // 16 ops per layer + embed + final norm + lm_head.
+        assert_eq!(plan.ops.len(), 16 * facts.layers as usize + 3);
+        // Untied embeddings: the lm head names its own weight.
+        assert!(matches!(
+            &plan.ops.last().unwrap().kind,
+            OpKind::LmHead { weight } if weight == "lm_head"
+        ));
+        let logits = plan.ops.last().unwrap().outputs[0];
+        assert_eq!(
+            plan.values[logits as usize].shape.0,
+            vec![Dim::Requests, Dim::Const(facts.vocab)]
+        );
+        // No RmsnormPerHead anywhere: the global convention is a plain
+        // Rmsnorm, and mistaking one for the other is different arithmetic.
+        assert!(
+            !plan
+                .ops
+                .iter()
+                .any(|op| matches!(op.kind, OpKind::RmsnormPerHead { .. }))
+        );
+    }
+
+    /// The global qk-norm's traced Rmsnorm ops carry the q/k projection
+    /// shapes (`[Tokens, heads * head_dim]`) — one norm over the flattened
+    /// heads, not `heads` norms of `head_dim` — and name the q/k norm
+    /// weights.
+    #[test]
+    fn olmo2_global_qk_norm_is_row_rmsnorm_over_projection_width() {
+        let facts = LlamaLikeFacts::olmo2_1b();
+        let plan = llama_like(&facts);
+        let qk_norms: Vec<_> = plan
+            .layer_ops(0)
+            .filter(|op| {
+                matches!(&op.kind, OpKind::Rmsnorm { weight, .. }
+                    if weight.ends_with("q_norm") || weight.ends_with("k_norm"))
+            })
+            .collect();
+        assert_eq!(qk_norms.len(), 2);
+        for (op, width) in qk_norms.iter().zip([facts.q_width(), facts.kv_width()]) {
+            assert_eq!(
+                plan.values[op.outputs[0] as usize].shape.0,
+                vec![Dim::Tokens, Dim::Const(width)]
+            );
+        }
+    }
+
+    /// Post-norm residual dataflow: every ResidualAdd consumes the normed
+    /// sub-layer output AND the residual stream it lands on, in that order
+    /// (the matmul_add convention), and its input really is the Rmsnorm's
+    /// output — the norm sits BETWEEN the projection and the add.
+    #[test]
+    fn olmo2_post_norm_residual_dataflow() {
+        let plan = llama_like(&LlamaLikeFacts::olmo2_1b());
+        let layer0: Vec<_> = plan.layer_ops(0).collect();
+        let adds: Vec<_> = layer0
+            .iter()
+            .filter(|op| matches!(op.kind, OpKind::ResidualAdd))
+            .collect();
+        assert_eq!(adds.len(), 2);
+        for add in adds {
+            assert_eq!(add.inputs.len(), 2, "residual missing on {add:?}");
+            let normed = add.inputs[0];
+            let norm_op = layer0
+                .iter()
+                .find(|op| op.outputs.contains(&normed))
+                .expect("producer of the add's first operand");
+            assert!(
+                matches!(&norm_op.kind, OpKind::Rmsnorm { weight, .. }
+                    if weight.ends_with("attn_norm") || weight.ends_with("mlp_norm")),
+                "post-norm add must consume a block-norm output, got {norm_op:?}"
+            );
+        }
+        // And no beta=1 accumulate anywhere: the residual fold is illegal
+        // when a norm sits between the GEMM and the stream.
+        assert!(
+            !plan
+                .ops
+                .iter()
+                .any(|op| matches!(op.kind, OpKind::Matmul { beta_one: true, .. }))
         );
     }
 
