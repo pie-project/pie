@@ -394,3 +394,40 @@ extern "C" __global__ void gg_store(
         memo_mask[(int64_t)slot * mask_words + at] = mask[(int64_t)sequence * mask_words + at];
     }
 }
+
+/// Put a kept parse state back. The slot is known on the host here.
+///
+/// Unlike the advance, a rollback is not part of a captured decode step - it
+/// happens when a draft is rejected, which the host already knows about - so
+/// the slot may be an argument.
+extern "C" __global__ void gg_restore(
+    int32_t* lexer_state,
+    int32_t* stack,
+    int32_t* stack_depth,
+    int32_t* config_count,
+    int32_t* widest,
+    const int32_t* hist_lexer,
+    const int32_t* hist_stack,
+    const int32_t* hist_depth,
+    const int32_t* hist_count,
+    int32_t slot,
+    int32_t rows,
+    int32_t configs,
+    int32_t stack_stride) {
+    int32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= rows) {
+        return;
+    }
+    int64_t at = (int64_t)slot * rows;
+    lexer_state[row] = hist_lexer[at + row];
+    int32_t depth = hist_depth[at + row];
+    stack_depth[row] = depth;
+    if (row < rows / configs) {
+        int32_t count = hist_count[slot * (rows / configs) + row];
+        config_count[row] = count;
+        atomicMax(widest, count);
+    }
+    for (int32_t up = 0; up < stack_stride; ++up) {
+        stack[(int64_t)row * stack_stride + up] = hist_stack[(at + row) * stack_stride + up];
+    }
+}

@@ -72,6 +72,7 @@ _PORTED: frozenset[str] = frozenset(
         "probe",
         "copy",
         "store",
+        "restore",
         "advance_fused",
         "fill_fused",
     }
@@ -3591,6 +3592,11 @@ class DeviceBatch:
             )
         rows = self.batch * self.configs
         slot = (int(self.hist_slot.item()) - steps) % self.rollback_depth
+        if "restore" in _PORTED:
+            self._restore_cuda(rows, slot)
+            self.hist_slot.fill_(slot)
+            self.history_length -= steps
+            return
         _restore_kernel[((rows + 255) // 256,)](
             self.lexer_state,
             self.stack,
@@ -4387,6 +4393,28 @@ class DeviceBatch:
             BATCH=triton.next_power_of_2(self.batch),
             BLOCK=512,
             num_warps=4,
+        )
+
+    def _restore_cuda(self, rows, slot) -> None:
+        from gpugrammar import _gpugrammar
+
+        _gpugrammar.cuda_launch(
+            "gg_restore",
+            max(1, (rows + 255) // 256),
+            256,
+            torch.cuda.current_stream().cuda_stream,
+            [
+                self.lexer_state.data_ptr(),
+                self.stack.data_ptr(),
+                self.depth.data_ptr(),
+                self.config_count.data_ptr(),
+                self.widest.data_ptr(),
+                self.hist_lexer.data_ptr(),
+                self.hist_stack.data_ptr(),
+                self.hist_depth.data_ptr(),
+                self.hist_count.data_ptr(),
+            ],
+            [slot, rows, self.configs, self.grammar.max_stack],
         )
 
     def _store_cuda(self, grammar) -> None:
