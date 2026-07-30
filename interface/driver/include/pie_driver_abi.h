@@ -334,6 +334,11 @@
  */
 #define PIE_STAGE_GROUPED_VALID (1 << 6)
 
+/**
+ * The stage writes the `lora` sink.
+ */
+#define PIE_STAGE_REQUIRES_LORA (1 << 7)
+
 #define CHANNEL_TICKET_NONE UINT64_MAX
 
 #define RS_FLAG_RESET 1

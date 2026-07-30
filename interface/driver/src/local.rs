@@ -897,6 +897,8 @@ pub const PIE_STAGE_REQUIRES_MTP_ROWS: u32 = 1 << 5;
 /// intrinsics and runtime extents are ones that path supports. When clear,
 /// `error` says why and the stage must take the fused path.
 pub const PIE_STAGE_GROUPED_VALID: u32 = 1 << 6;
+/// The stage writes the `lora` sink.
+pub const PIE_STAGE_REQUIRES_LORA: u32 = 1 << 7;
 
 /// The per-program launch plan for one stage: the normalized program the
 /// emitted kernels were generated from, its region partitions, and the

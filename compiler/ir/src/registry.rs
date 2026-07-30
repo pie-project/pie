@@ -241,6 +241,15 @@ pub struct ModelProfile {
     /// every backend and then fail at its first fire on the ones that cannot
     /// enforce it -- the opposite of the bind-time contract.
     pub has_attn_page_mask: bool,
+    /// The backend honours a `lora` sink: it advertises that it can consume
+    /// the sink's A/B/SITES configuration and apply the low-rank delta at the
+    /// declared projection sites. Same shape of contract as
+    /// `has_attn_page_mask` -- `lora` is a first-party name (its
+    /// [`KNOWN_SINKS`] entry, reserved until now, is live), so a program
+    /// naming it type-checks against every backend, and the backend's ability
+    /// to HONOUR it must be a bind-time refusal rather than a silent no-op
+    /// adapter.
+    pub has_lora: bool,
     /// Available second-party kernels + sinks, by name.
     pub kernels: Vec<KernelInfo>,
 }
@@ -264,6 +273,7 @@ impl ModelProfile {
             has_value_head: true,
             has_attn_score: true,
             has_attn_page_mask: true,
+            has_lora: true,
             kernels: Vec::new(),
         }
     }

@@ -223,6 +223,30 @@ fn lint_sink_misplacement_in_epilogue() {
     assert!(msg.contains("attn_page_mask"), "message:\n{msg}");
 }
 
+/// The pass-wide `lora` sink is prologue-only (T11): an attn-proj placement is
+/// legal for an attention-scoped sink but not for one the whole forward
+/// consumes, so the pre-lint must refuse it before bind even sees it.
+#[test]
+fn lint_lora_sink_misplacement_outside_prologue() {
+    let la: &'static Channel = leak(Channel::from_shaped([2u32, 2, 4], vec![0.0f32; 16]));
+    let lb: &'static Channel = leak(Channel::from_shaped([2u32, 4, 2], vec![0.0f32; 16]));
+
+    let mut b = Builder::new(VOCAB, PAGE);
+    b.stage(Stage::OnAttnProj, move || {
+        intrinsics::kernel::lora(la.read(), lb.read(), Tensor::constant([0u32, 1]));
+    });
+
+    let err = b.build().expect_err("a pass-wide sink at attn-proj must fail");
+    let msg = err.to_string();
+    assert!(
+        err.0
+            .iter()
+            .any(|e| matches!(e, TraceError::SinkMisplacement { .. })),
+        "expected a SinkMisplacement, got:\n{msg}"
+    );
+    assert!(msg.contains("lora"), "message:\n{msg}");
+}
+
 // ---------------------------------------------------------------------------
 // beam search (the second exit gate): reorder = gathers,
 // divergence = freeze. Exercises the full op set (top_k, log_softmax, gather,

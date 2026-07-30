@@ -29,24 +29,40 @@ pub fn second_party_region_supported(stage: &CompiledStage, region: &Region) -> 
     };
     let value_types = &stage.normalized.value_types;
 
-    // `attn_page_mask(mask)` — a configuration sink. One argument, no result.
-    // The mask is a per-page vector over the request's page list, so the only
-    // structural claim that holds is rank 1; its extent is the program's own
-    // page ceiling, which the runtime checks against the lane's page count.
+    // Configuration sinks. Two first-party shapes are launchable:
+    //
+    // `attn_page_mask(mask)` — one argument, no result. The mask is a
+    // per-page vector over the request's page list, so the only structural
+    // claim that holds is rank 1; its extent is the program's own page
+    // ceiling, which the runtime checks against the lane's page count.
+    //
+    // `lora(a, b, sites)` — exactly three arguments, no result, prologue only
+    // (pass-wide: the whole forward consumes it). The A/B extents are the
+    // adapter's own trace-known geometry and `sites` is a constant over the
+    // model's site vocabulary — none of them relate to a shape this gate
+    // knows, so arity is the structural claim that holds.
+    //
+    // Everything else is refused here rather than mid-fire.
     if let Op::SinkCall { name, args } = op {
         let Some(sink) = stage.normalized.names.get(*name as usize) else {
             return false;
         };
-        if sink != "attn_page_mask" || args.len() != 1 {
+        if !region.outputs.is_empty() || region.inputs.len() != args.len() {
             return false;
         }
-        if !region.outputs.is_empty() || region.inputs.len() != 1 {
-            return false;
-        }
-        let Some(mask) = value_types.get(region.inputs[0] as usize) else {
-            return false;
+        return match sink.as_str() {
+            "attn_page_mask" => {
+                if args.len() != 1 {
+                    return false;
+                }
+                let Some(mask) = value_types.get(region.inputs[0] as usize) else {
+                    return false;
+                };
+                mask.dims.len() == 1 && stage.normalized.stage == Stage::OnAttnProj
+            }
+            "lora" => args.len() == 3 && stage.normalized.stage == Stage::Prologue,
+            _ => false,
         };
-        return mask.dims.len() == 1 && stage.normalized.stage == Stage::OnAttnProj;
     }
 
     let Op::KernelCall { name, args, .. } = op else {
@@ -98,4 +114,80 @@ pub fn validate_generated_region(stage: &CompiledStage, region: &Region) -> Resu
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::second_party_region_supported;
+    use alloc::string::ToString;
+    use alloc::vec;
+    use alloc::vec::Vec;
+    use pie_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
+    use pie_ir::op::Op;
+    use pie_ir::registry::{ModelProfile, Stage};
+    use pie_ir::types::{DType, Shape};
+    use pie_ir::validate::bind;
+    use pie_plan::{LibraryOp, RegionKind, compile_bound};
+
+    /// A prologue `lora` container: three peeked channels feeding the sink,
+    /// with an optional argument dropped to model a malformed call.
+    fn lora_container(args: usize) -> TraceContainer {
+        let chan = |shape| ChannelDecl {
+            shape,
+            dtype: ChanDType::Concrete(DType::F32),
+            capacity: 1,
+            host_role: HostRole::None,
+            seeded: true,
+        };
+        TraceContainer {
+            names: vec!["lora".to_string()],
+            channels: vec![
+                chan(Shape::new(&[2, 2, 4]).unwrap()), // A [num_layers, R, d]
+                chan(Shape::new(&[2, 4, 2]).unwrap()), // B [num_layers, d_out, R]
+                chan(Shape::vector(4)),                // SITES
+            ],
+            ports: vec![],
+            stages: vec![StageProgram {
+                stage: Stage::Prologue,
+                ops: vec![
+                    Op::ChanRead(0),
+                    Op::ChanRead(1),
+                    Op::ChanRead(2),
+                    Op::SinkCall {
+                        name: 0,
+                        args: (0..args as u32).collect(),
+                    },
+                ],
+            }],
+            externs: Vec::new(),
+        }
+    }
+
+    /// The lone second-party region of the container's prologue stage,
+    /// answered by the gate.
+    fn prologue_sink_supported(container: TraceContainer) -> bool {
+        let bound = bind(container, ModelProfile::dummy()).expect("the lora prologue binds");
+        let stages = compile_bound(&bound);
+        let stage = stages
+            .iter()
+            .find(|s| s.normalized.stage == Stage::Prologue)
+            .expect("prologue stage");
+        let region = stage
+            .fused
+            .regions
+            .iter()
+            .find(|r| matches!(r.kind, RegionKind::Library(LibraryOp::SecondParty)))
+            .expect("the sink call partitions into its own second-party region");
+        second_party_region_supported(stage, region)
+    }
+
+    /// `lora(a, b, sites)` is exactly three arguments: the scale is folded
+    /// into B's contents and the placement into SITES, so any other arity is
+    /// a program disagreeing with the sink's ABI and is refused at bind
+    /// rather than mid-fire.
+    #[test]
+    fn lora_region_gate_holds_the_three_argument_shape() {
+        assert!(prologue_sink_supported(lora_container(3)));
+        assert!(!prologue_sink_supported(lora_container(2)));
+    }
 }

@@ -130,6 +130,14 @@ pub struct DriverCapabilities {
     /// one without the other.
     #[serde(default)]
     pub has_attn_page_mask: bool,
+    /// The driver can HONOUR a `lora` sink: it consumes the sink's A/B/SITES
+    /// configuration and applies the low-rank delta at the declared projection
+    /// sites for the whole forward. First-party name, so like
+    /// `has_attn_page_mask` this must gate at bind -- a backend that cannot
+    /// apply the delta would otherwise run the program as a silent no-op
+    /// adapter.
+    #[serde(default)]
+    pub has_lora: bool,
     /// Descriptor-port tags the driver can resolve on-device for decode envelopes.
     #[serde(default)]
     pub device_geometry_port_mask: u32,

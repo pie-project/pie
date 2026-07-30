@@ -158,6 +158,8 @@ pub struct PtirCaps {
     pub has_attn_score: bool,
     /// Backend honours the `attn_page_mask` sink (page-granular eviction).
     pub has_attn_page_mask: bool,
+    /// Backend honours the `lora` sink (pass-wide low-rank adapter delta).
+    pub has_lora: bool,
 }
 
 impl std::fmt::Debug for Model {

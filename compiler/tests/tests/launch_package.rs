@@ -22,9 +22,13 @@ use msl_corpus::{GOLDEN_NAMES, golden_container, golden_profile, synthetic_trace
 use pie_driver_abi::plan::LaunchStagePlan;
 use pie_driver_abi::{
     PIE_STAGE_GROUPED_VALID, PIE_STAGE_REQUIRES_ATTN_SCORE, PIE_STAGE_REQUIRES_KERNEL_CALL,
-    PIE_STAGE_REQUIRES_LAYER, PIE_STAGE_REQUIRES_MTP_ROWS, PIE_STAGE_REQUIRES_PAGE_MASK,
-    PIE_STAGE_REQUIRES_QUERY,
+    PIE_STAGE_REQUIRES_LAYER, PIE_STAGE_REQUIRES_LORA, PIE_STAGE_REQUIRES_MTP_ROWS,
+    PIE_STAGE_REQUIRES_PAGE_MASK, PIE_STAGE_REQUIRES_QUERY,
 };
+use pie_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
+use pie_ir::op::Op;
+use pie_ir::registry::{ModelProfile, Stage};
+use pie_ir::types::{DType, Shape};
 use pie_ir::validate::bind;
 use pie_plan::compile_bound;
 
@@ -55,7 +59,8 @@ const DECLARED_FLAGS: u32 = PIE_STAGE_GROUPED_VALID
     | PIE_STAGE_REQUIRES_ATTN_SCORE
     | PIE_STAGE_REQUIRES_MTP_ROWS
     | PIE_STAGE_REQUIRES_KERNEL_CALL
-    | PIE_STAGE_REQUIRES_PAGE_MASK;
+    | PIE_STAGE_REQUIRES_PAGE_MASK
+    | PIE_STAGE_REQUIRES_LORA;
 
 #[test]
 fn every_plan_the_driver_receives_is_well_formed() {
@@ -171,6 +176,91 @@ fn the_grouped_path_accepts_the_same_stages_it_always_has() {
 }
 
 const EXPECTED_GROUPED_VALID: usize = 17;
+
+/// A prologue `lora` sink raises its own stage flag, and only its own.
+///
+/// The sink-flag derivation used to set `PIE_STAGE_REQUIRES_PAGE_MASK` for
+/// every `sink_call`; now that two first-party sinks exist it dispatches on
+/// the resolved name, and this is what notices if that dispatch regresses in
+/// either direction — a lora stage flagged as a page mask would have the
+/// driver look for a page selection that never comes, and vice versa.
+#[test]
+fn the_lora_sink_raises_its_own_stage_flag() {
+    let chan = |shape| ChannelDecl {
+        shape,
+        dtype: ChanDType::Concrete(DType::F32),
+        capacity: 1,
+        host_role: HostRole::None,
+        seeded: true,
+    };
+    let container = TraceContainer {
+        names: vec!["lora".to_string()],
+        channels: vec![
+            chan(Shape::new(&[2, 2, 4]).unwrap()), // A [num_layers, R, d]
+            chan(Shape::new(&[2, 4, 2]).unwrap()), // B [num_layers, d_out, R]
+            chan(Shape::vector(4)),                // SITES
+        ],
+        ports: vec![],
+        stages: vec![StageProgram {
+            stage: Stage::Prologue,
+            ops: vec![
+                Op::ChanRead(0),
+                Op::ChanRead(1),
+                Op::ChanRead(2),
+                Op::SinkCall {
+                    name: 0,
+                    args: vec![0, 1, 2],
+                },
+            ],
+        }],
+        externs: Vec::new(),
+    };
+    let bound = bind(container, ModelProfile::dummy()).expect("the lora prologue binds");
+    let stages = compile_bound(&bound);
+    let package = pie_codegen::launch::build(&bound, &stages);
+    let plan = &package.plans[0];
+    assert_ne!(
+        plan.flags & PIE_STAGE_REQUIRES_LORA,
+        0,
+        "a stage writing the lora sink must tell the driver so"
+    );
+    assert_eq!(
+        plan.flags & PIE_STAGE_REQUIRES_PAGE_MASK,
+        0,
+        "a lora stage is not a page-mask stage"
+    );
+
+    // Over the corpus: whichever sink flag a plan raises, its name table
+    // holds the sink that earns it — and both flags still occur (the quest
+    // traces' page mask, `synthetic_sink_call`'s lora).
+    let (mut page_mask_plans, mut lora_plans) = (0usize, 0usize);
+    for (name, stage_plans) in &packages() {
+        for plan in stage_plans {
+            if plan.flags & PIE_STAGE_REQUIRES_PAGE_MASK != 0 {
+                page_mask_plans += 1;
+                assert!(
+                    plan.names.iter().any(|n| n == "attn_page_mask"),
+                    "{name}: a page-mask flag with no attn_page_mask in the name table"
+                );
+            }
+            if plan.flags & PIE_STAGE_REQUIRES_LORA != 0 {
+                lora_plans += 1;
+                assert!(
+                    plan.names.iter().any(|n| n == "lora"),
+                    "{name}: a lora flag with no lora in the name table"
+                );
+            }
+        }
+    }
+    assert!(
+        page_mask_plans > 0,
+        "the corpus has quest traces; their page-mask flag went missing"
+    );
+    assert!(
+        lora_plans > 0,
+        "the corpus's synthetic lora sink lost its flag"
+    );
+}
 
 /// Both refusals are the same rule: the grouped runtime binds only the
 /// intrinsics its lane table describes, so a stage reading one it does not know

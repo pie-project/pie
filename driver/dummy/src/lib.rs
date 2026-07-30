@@ -339,6 +339,9 @@ impl DummyDriver {
                 // over keys it does not have.
                 has_kv_envelopes: false,
                 has_attn_page_mask: false,
+                // No real projection GEMMs either, so no low-rank delta to
+                // apply: the `lora` sink is not honoured.
+                has_lora: false,
                 device_geometry_port_mask: pie_driver_abi::PIE_DEVICE_GEOMETRY_PORTS
                     | pie_driver_abi::PIE_DEVICE_PORT_ATTN_MASK,
                 max_forward_tokens: options.max_forward_tokens,
@@ -1131,6 +1134,7 @@ impl DummyDriver {
             has_value_head: self.capabilities.has_value_head,
             has_attn_score: self.capabilities.has_attn_score,
             has_attn_page_mask: false,
+            has_lora: false,
             kernels: vec![KernelInfo {
                 name: "boom".to_string(),
                 sink_scope: None,
