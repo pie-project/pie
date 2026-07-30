@@ -243,9 +243,52 @@ all** — on the real distribution, in place, with the compaction charged. Not
 17.5×, not 8.87×, not 1.88×. Every earlier figure was a position rather than a
 workload, or was charged to the wrong side.
 
+### And then the ragged case, which is what continuous batching gives
+
+Every figure above is a *homogeneous* batch — every row at the same kind of
+position. A serving batch is not: some requests are between fields and some are
+inside string bodies, at the same step. Batch 512, varying the fraction of rows
+that are dense:
+
+| dense rows | always mask | fixed shapes, no sync | sized calls, one sync |
+|---:|---:|---:|---:|
+| 0% | 1,430.4 | 1,595.3 (0.90×) | **533.3 (2.68×)** |
+| 25% | 1,412.1 | 1,606.8 (0.88×) | 1,197.1 (1.18×) |
+| 50% | 1,394.1 | 1,607.4 (0.87×) | 1,333.3 (**1.05×**) |
+| 75% | 1,376.9 | 1,609.8 (0.86×) | 1,515.7 (0.91×) |
+| 100% | 1,357.7 | 1,609.0 (0.84×) | 1,324.1 (1.03×) |
+
+**The sparse win does not survive a mixed batch.** At the measured steady state
+— about half the rows dense — it is 1.05×, not 1.79×. The 1.79× assumed sparse
+steps could be batched together, and continuous batching does not do that.
+
+Two structural causes, both in the surrounding APIs rather than in the parser:
+
+- **XGrammar's `apply_token_bitmask_inplace` takes `indices: List[int]`** — a
+  *host* list. Restricting the mask apply to the dense rows means building a
+  Python list of row numbers every step, which costs more than masking rows
+  whose answer is discarded.
+- **A sampler's output shape is its row count**, so any scheme that samples a
+  subset needs that count on the host. The fixed-shape alternative — sample
+  both ways and select — needs no sync and loses outright (0.84–0.90×),
+  because it pays for the full-vocabulary call anyway.
+
+So the honest claim is narrower than the headline and still worth making:
+
+- On a **homogeneous sparse** batch: **2.68×** against the mask path.
+- On a **realistically mixed** batch: **1.05×** — parity.
+- The fixed-shape, sync-free scheme: **0.86×** — a loss.
+
+What is needed to recover it is not a faster parser. It is a sampler that
+accepts a device-side row count, and a mask-apply that accepts device-side
+indices. Both are small changes to code we do not own, and naming them is
+part of the contribution: **the allowed set being resident is necessary and
+not sufficient; the sampler has to be able to ask for it raggedly.**
+
 The claim that survives all of it is the one that matters: **constraining the
-grammar makes a decode step cheaper than not constraining it**, and no system
-that hands a mask back to the host can make that claim at all.
+grammar makes a decode step cheaper than not constraining it** — on a sparse
+batch by 2.68×, and no system that hands a mask back to the host can make the
+claim at all.
 
 ### Example 2: speculative decoding, withdrawn, re-measured, and now possible
 
