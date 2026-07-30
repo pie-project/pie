@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -169,7 +170,10 @@ void mixtral_forward_paged(
     const int V  = cfg.vocab_size;
     const int d  = cfg.head_dim;
     const float eps = cfg.rms_norm_eps;
-    cudaStream_t stream = nullptr;
+    // Match llama_like: kernels and NCCL must share cuBLAS's stream so
+    // GEMMs, custom kernels, and TP all-reduces stay ordered. nullptr here
+    // races whenever cuBLAS is bound to a non-default stream.
+    cudaStream_t stream = cublas.stream();
     NcclComm* tp = (T > 1) ? fwd_cfg.tp_comm : nullptr;
     const bool tp_is_leader = (T == 1) || (tp != nullptr && tp->rank() == 0);
 
@@ -255,10 +259,36 @@ void mixtral_forward_paged(
         if (layer.v_bias) kernels::launch_add_bias_bf16(
             ws.v.data(), layer.v_bias->data(), N, Hk, stream);
 
-        kernels::launch_rope_bf16(
-            ws.q.data(), ws.k.data(), positions,
-            N, num_q_heads_local, num_kv_heads_local, d,
-            cfg.rope_theta, stream);
+        // GPT-OSS uses YaRN-original; Mixtral uses standard RoPE. Dispatch
+        // from fwd_cfg so TP+streaming GPT-OSS does not silently fall back
+        // to the wrong kernel.
+        if (fwd_cfg.rope_kind == RopeKind::YaRN) {
+            kernels::launch_rope_yarn_bf16(
+                ws.q.data(), ws.k.data(), positions,
+                N, num_q_heads_local, num_kv_heads_local, d,
+                cfg.rope_theta,
+                fwd_cfg.yarn_factor,
+                fwd_cfg.yarn_low_freq_factor,
+                fwd_cfg.yarn_high_freq_factor,
+                fwd_cfg.yarn_original_max_position,
+                stream);
+        } else if (fwd_cfg.rope_kind == RopeKind::YaRNOriginal) {
+            kernels::launch_rope_yarn_original_bf16(
+                ws.q.data(), ws.k.data(), positions,
+                N, num_q_heads_local, num_kv_heads_local, d,
+                cfg.rope_theta,
+                fwd_cfg.yarn_factor,
+                fwd_cfg.yarn_beta_fast,
+                fwd_cfg.yarn_beta_slow,
+                fwd_cfg.yarn_attention_factor,
+                fwd_cfg.yarn_original_max_position,
+                stream);
+        } else {
+            kernels::launch_rope_bf16(
+                ws.q.data(), ws.k.data(), positions,
+                N, num_q_heads_local, num_kv_heads_local, d,
+                cfg.rope_theta, stream);
+        }
 
         auto kv_view = cache.layer_view(L);
         kernels::launch_write_kv_to_pages(
@@ -918,14 +948,42 @@ void mixtral_forward_paged(
             kernels::launch_residual_add_bf16(
                 ws.y.data(), ws.norm_x.data(), N * H, stream);
         }
+
+        // Localize sticky CUDA illegal-memory-access errors (common under
+        // TP+streaming) to the layer that first faulted.
+        if (const char* sync = std::getenv("PIE_CUDA_SYNC_LAYERS");
+            sync != nullptr && sync[0] != '\0' && sync[0] != '0') {
+            const cudaError_t pe = cudaPeekAtLastError();
+            if (pe != cudaSuccess) {
+                throw std::runtime_error(
+                    std::string("mixtral/gpt_oss: CUDA error after MoE layer ") +
+                    std::to_string(L) + ": " + cudaGetErrorString(pe));
+            }
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            CUDA_CHECK(cudaDeviceSynchronize());
+        }
     }
 
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), w.final_norm->data(), ws.norm_x.data(),
         N, H, eps, stream);
+    if (static_cast<std::size_t>(N) >
+        (ws.logits.shape().empty()
+             ? 0
+             : static_cast<std::size_t>(ws.logits.shape()[0]))) {
+        throw std::runtime_error(
+            "mixtral/gpt_oss: lm_head rows N=" + std::to_string(N) +
+            " exceed logits capacity");
+    }
     ops::gemm_act_x_wt_bf16(cublas.handle(),
         ws.norm_x.data(), w.lm_head->data(), ws.logits.data(),
         N, V, H);
+    if (const char* sync = std::getenv("PIE_CUDA_SYNC_LAYERS");
+        sync != nullptr && sync[0] != '\0' && sync[0] != '0') {
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
 }
 
 }  // namespace pie_cuda_driver::model

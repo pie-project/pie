@@ -341,6 +341,12 @@ bool ensure_gpt_oss_eager_bf16_expert_pack(
     SafetensorsCheckpointSource& checkpoint,
     bool verbose);
 
+bool ensure_gpt_oss_routed_mxfp4_expert_pack(
+    StreamedExpertTable& table,
+    const std::string& cache_key,
+    SafetensorsCheckpointSource& checkpoint,
+    bool verbose);
+
 // Dispatch offline pack builders from `table.pack_kind` (set by the stream
 // arch recipe). No-op when pack_kind is None.
 inline void ensure_streamed_expert_pack(
@@ -359,6 +365,10 @@ inline void ensure_streamed_expert_pack(
         return;
     case PieLoaderExpertPackKind::GptOssEagerBf16:
         ensure_gpt_oss_eager_bf16_expert_pack(
+            table, cache_key, checkpoint, verbose);
+        return;
+    case PieLoaderExpertPackKind::GptOssRoutedMxfp4:
+        ensure_gpt_oss_routed_mxfp4_expert_pack(
             table, cache_key, checkpoint, verbose);
         return;
     }

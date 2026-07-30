@@ -14,7 +14,7 @@
 
 namespace pie_weight_loader {
 
-constexpr static const uint32_t STORAGE_PROGRAM_VERSION = 5;
+constexpr static const uint32_t STORAGE_PROGRAM_VERSION = 6;
 
 enum class PieLoaderBackendKind {
   Cuda = 0,
@@ -52,6 +52,7 @@ enum class PieLoaderExpertPackKind {
   None = 0,
   GptOssNativeMarlin = 1,
   GptOssEagerBf16 = 2,
+  GptOssRoutedMxfp4 = 3,
 };
 
 enum class PieLoaderMxfp4MoePolicy {

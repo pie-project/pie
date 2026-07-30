@@ -187,6 +187,9 @@ impl FfiArena {
                     crate::storage::ExpertPackKind::GptOssEagerBf16 => {
                         PieLoaderExpertPackKind::GptOssEagerBf16
                     }
+                    crate::storage::ExpertPackKind::GptOssRoutedMxfp4 => {
+                        PieLoaderExpertPackKind::GptOssRoutedMxfp4
+                    }
                 },
             },
         }
