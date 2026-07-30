@@ -1,0 +1,156 @@
+// Gemma 4's decode DAG and geometry, checked with no GPU.
+//
+// The same thing qwen3.5's "363 dispatches verified" bought: the shape of the
+// step is a pure function, so the schedule can be wrong here and be caught here
+// rather than as a wrong token forty kernels later.
+
+#include <cstdio>
+#include <string>
+#include <vector>
+
+#include "model/gemma4/decode_step.hpp"
+#include "model/gemma4/geometry.hpp"
+
+using namespace pie::metal::gemma4;
+
+namespace {
+
+int g_failures = 0;
+
+bool expect(bool ok, const std::string& what) {
+    std::printf("  %s  %s\n", ok ? "PASS" : "FAIL", what.c_str());
+    if (!ok) ++g_failures;
+    return ok;
+}
+
+bool expect_eq(long long got, long long want, const std::string& what) {
+    return expect(got == want,
+                  what + " (got " + std::to_string(got) + ", want " + std::to_string(want) + ")");
+}
+
+int count(const std::vector<Dispatch>& dag, Kind k) {
+    int n = 0;
+    for (const Dispatch& d : dag) n += d.kind == k ? 1 : 0;
+    return n;
+}
+
+// The E2B checkpoint's schedule, read from its config.json: `layer_types` lists
+// full attention at exactly 4, 9, 14, 19, 24, 29, 34.
+void the_attention_schedule_matches_the_checkpoint() {
+    std::printf("[attention schedule]\n");
+    const Gemma4Geometry g;
+    std::vector<int> full;
+    for (int L = 0; L < g.n_layers; ++L) {
+        if (g.is_full_attn(L)) full.push_back(L);
+    }
+    expect(full == std::vector<int>{4, 9, 14, 19, 24, 29, 34},
+           "full attention lands on the layers config.json names");
+    expect_eq(g.n_full_attn(), 7, "seven full-attention layers");
+    expect(g.is_sliding(0) && !g.is_sliding(4), "sliding is the complement of full");
+
+    // head_dim, rope base and the rotated fraction all follow the type.
+    expect_eq(g.head_dim_of(0), 256, "sliding layers use head_dim");
+    expect_eq(g.head_dim_of(4), 512, "full layers use global_head_dim");
+    expect_eq(g.rotary_dims_of(0), 256, "sliding layers rotate the whole head");
+    expect_eq(g.rotary_dims_of(4), 128, "full layers rotate a quarter of it");
+    expect(g.rope_theta_of(0) == 1.0e4f && g.rope_theta_of(4) == 1.0e6f,
+           "each attention type carries its own rope base");
+}
+
+void kv_sharing_covers_the_tail_of_the_stack() {
+    std::printf("[kv sharing]\n");
+    const Gemma4Geometry g;
+    expect_eq(g.first_kv_shared(), 15, "layers 15+ share KV (35 - 20)");
+    expect(!g.is_kv_shared(14) && g.is_kv_shared(15), "the split is where the config puts it");
+    expect_eq(g.n_kv_owning(), 15, "fifteen layers own KV pages");
+
+    // A shared layer reads the most recent earlier owner of its own type.
+    expect_eq(g.kv_source(14), 14, "an owning layer is its own source");
+    expect_eq(g.kv_source(19), 14, "a shared FULL layer reads the last owning full layer");
+    const int src15 = g.kv_source(15);
+    expect(src15 >= 0 && src15 < 15 && g.is_sliding(src15),
+           "a shared SLIDING layer reads an owning sliding layer");
+
+    // The MLP doubles over exactly the shared range.
+    expect_eq(g.intermediate_of(14), 6144, "the base MLP width below the split");
+    expect_eq(g.intermediate_of(15), 12288, "double-wide at and above it");
+}
+
+void the_dag_skips_what_a_shared_layer_does_not_have() {
+    std::printf("[dag shape]\n");
+    const Gemma4Geometry g;
+    const std::vector<Dispatch> dag = build_gemma4_dag(g);
+    const DagStats s = dag_stats(dag, g);
+
+    expect_eq(s.kv_owning_layers, 15, "stats agree with the geometry on ownership");
+    expect_eq(s.kv_shared_layers, 20, "and on sharing");
+
+    // The five KV-side dispatches exist only on layers that own their KV.
+    for (Kind k : {Kind::QmvK, Kind::QmvV, Kind::KNorm, Kind::VNorm, Kind::RopeK,
+                   Kind::KvAppend}) {
+        expect_eq(count(dag, k), 15, "one per KV-owning layer");
+    }
+    // Everything on the query side, and the whole FFN, runs on every layer.
+    for (Kind k : {Kind::AttnNorm, Kind::QmvQ, Kind::QNorm, Kind::RopeQ, Kind::Sdpa,
+                   Kind::QmvO, Kind::PostAttnNorm, Kind::AttnResidual, Kind::FfnNorm,
+                   Kind::QmvGate, Kind::QmvUp, Kind::GegluTanh, Kind::QmvDown,
+                   Kind::PostFfnNorm, Kind::FfnResidual, Kind::LayerScalar}) {
+        expect_eq(count(dag, k), 35, "one per layer");
+    }
+    // PLE: five layer-less precompute dispatches, five more per layer.
+    expect_eq(count(dag, Kind::PleCombine), 1, "PLE precompute runs once");
+    expect_eq(count(dag, Kind::PleResidual), 35, "PLE residual runs per layer");
+
+    // The tail.
+    expect_eq(count(dag, Kind::FinalRms), 1, "one final norm");
+    expect_eq(count(dag, Kind::LmHead), 1, "one logits matvec");
+    expect_eq(count(dag, Kind::FinalSoftcap), 1, "gemma4 softcaps its logits");
+
+    // 1 embed + 4 PLE precompute + 35*(21 shared-safe) + owning extras + tail.
+    const int per_layer_always = 16 + 5;  // attention/FFN/scalar + per-layer PLE
+    const int owning_extra = 6;           // k/v proj, k/v norm, rope_k, append
+    const int want = 1 + 4 + g.n_layers * per_layer_always + 15 * owning_extra + 4;
+    expect_eq(s.total, want, "the whole step is exactly this many dispatches");
+
+    // Ordinals are dense and in order — they are the argument-table keys.
+    bool dense = true;
+    for (std::size_t i = 0; i < dag.size(); ++i) {
+        dense = dense && dag[i].ordinal == static_cast<int>(i);
+    }
+    expect(dense, "ordinals are a dense 0..N-1 run");
+
+    // Every layer dispatch carries its own attention type.
+    bool typed = true;
+    for (const Dispatch& d : dag) {
+        if (d.layer >= 0) typed = typed && d.sliding == g.is_sliding(d.layer);
+    }
+    expect(typed, "each dispatch carries its layer's attention type");
+}
+
+void a_family_without_ple_or_softcap_drops_those_dispatches() {
+    std::printf("[optional stages]\n");
+    Gemma4Geometry g;
+    g.per_layer_emb_dim = 0;
+    g.final_softcap = 0.0f;
+    g.num_kv_shared_layers = 0;
+    const std::vector<Dispatch> dag = build_gemma4_dag(g, /*with_argmax=*/false);
+    expect_eq(count(dag, Kind::PleCombine), 0, "no PLE precompute without a PLE table");
+    expect_eq(count(dag, Kind::PleResidual), 0, "and no per-layer PLE");
+    expect_eq(count(dag, Kind::FinalSoftcap), 0, "no softcap when the config has none");
+    expect_eq(count(dag, Kind::QmvK), 35, "every layer owns its KV when none is shared");
+    expect_eq(count(dag, Kind::Argmax), 0, "argmax is opt-in");
+}
+
+}  // namespace
+
+int main() {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    std::printf("gemma4 decode DAG + geometry\n");
+    the_attention_schedule_matches_the_checkpoint();
+    kv_sharing_covers_the_tail_of_the_stack();
+    the_dag_skips_what_a_shared_layer_does_not_have();
+    a_family_without_ple_or_softcap_drops_those_dispatches();
+    std::printf("\n==== gemma4_decode_step_test: %s ====\n",
+                g_failures == 0 ? "all passed" : "FAILURES");
+    return g_failures == 0 ? 0 : 1;
+}

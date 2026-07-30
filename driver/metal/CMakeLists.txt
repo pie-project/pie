@@ -389,6 +389,13 @@ else()
     "`cargo rustc -p pie-loader --lib --crate-type staticlib`)")
 endif()
 
+# Pure geometry + DAG shape: no Metal, no checkpoint, no GPU.
+add_executable(gemma4_decode_step_test tests/gemma4_decode_step_test.cpp)
+target_compile_features(gemma4_decode_step_test PRIVATE cxx_std_20)
+target_include_directories(gemma4_decode_step_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+add_test(NAME gemma4_decode_step_test COMMAND gemma4_decode_step_test)
+
 add_executable(heap_layout_slot_test tests/heap_layout_slot_test.cpp)
 target_include_directories(heap_layout_slot_test PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
