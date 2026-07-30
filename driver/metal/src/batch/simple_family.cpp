@@ -164,9 +164,12 @@ class Gemma4Engine final : public SimpleFamilyEngine {
         // prompt does, so there is no reason to carry a second, M=1-only DAG
         // whose only distinction is that it cannot batch.
         g_.paged_kv_enabled = true;
-        g_.kv_page_size = kPageSize;
-        g_.kv_max_ctx = ((max_ctx_ + kPageSize - 1) / kPageSize) * kPageSize;
-        g_.total_pages = g_.kv_max_ctx / kPageSize;
+        // The runtime allocates pages and hands their PHYSICAL ids down, so the
+        // engine's page size has to be the one the runtime was configured with.
+        g_.kv_page_size = cfg.kv_page_size > 0 ? int(cfg.kv_page_size) : kPageSize;
+        const int ps = g_.kv_page_size;
+        g_.kv_max_ctx = ((max_ctx_ + ps - 1) / ps) * ps;
+        g_.total_pages = g_.kv_max_ctx / ps;
         max_rows_ = cfg.max_forward_tokens > 0 ? cfg.max_forward_tokens : 1;
 
         try {
@@ -273,24 +276,54 @@ class Gemma4Engine final : public SimpleFamilyEngine {
 
     StepTiming step(RawMetalContext& ctx, std::uint32_t token_id,
                     std::uint32_t position) override {
-        // A decode step is a fire of one row: position `position`, writing the
-        // page its absolute position falls in.
-        write_u32s(b_.io[int(IoSlot::TokenId)], {token_id});
-        write_u32s(b_.io[int(IoSlot::Position)], {position});
-        write_u32s(b_.io[int(IoSlot::ReqOfToken)], {0u});
-        write_u32s(b_.io[int(IoSlot::WPage)], {position / std::uint32_t(g_.kv_page_size)});
-        write_u32s(b_.io[int(IoSlot::WOff)], {position % std::uint32_t(g_.kv_page_size)});
-        write_u32s(b_.io[int(IoSlot::QoIndptr)], {0u, 1u});
-        write_i32(b_.io[int(IoSlot::SeqLen)], std::int32_t(position) + 1);
-        if (b_.io[int(IoSlot::AttnMaskEnabled)].contents() != nullptr) {
-            std::memset(b_.io[int(IoSlot::AttnMaskEnabled)].contents(), 0, 1);
+        // A decode step is a fire of one row, owned by one request whose
+        // history is the whole (identity) page list.
+        FireCsr csr;
+        csr.token_ids = {token_id};
+        csr.position_ids = {position};
+        csr.req_of_token = {0u};
+        csr.w_page = {position / std::uint32_t(g_.kv_page_size)};
+        csr.w_off = {position % std::uint32_t(g_.kv_page_size)};
+        csr.qo_indptr = {0u, 1u};
+        csr.kv_page_indices.resize(std::size_t(g_.total_pages));
+        for (int p = 0; p < g_.total_pages; ++p) {
+            csr.kv_page_indices[std::size_t(p)] = std::uint32_t(p);
         }
-        if (bound_rows_ != 1) {
-            gemma4::bind_gemma4_consts(ctx, dag_, g_, /*rows=*/1, /*paged=*/true);
-            bound_rows_ = 1;
+        csr.kv_page_indptr = {0u, std::uint32_t(g_.total_pages)};
+        return fire(ctx, csr);
+    }
+
+    bool paged() const override { return true; }
+    int max_rows() const override { return max_rows_; }
+    int page_size() const override { return g_.kv_page_size; }
+    int total_pages() const override { return g_.total_pages; }
+
+    StepTiming fire(RawMetalContext& ctx, const FireCsr& csr) override {
+        const int rows = int(csr.token_ids.size());
+        if (rows <= 0 || rows > max_rows_) return StepTiming{};
+        write_u32s(b_.io[int(IoSlot::TokenId)], csr.token_ids);
+        write_u32s(b_.io[int(IoSlot::Position)], csr.position_ids);
+        write_u32s(b_.io[int(IoSlot::ReqOfToken)], csr.req_of_token);
+        write_u32s(b_.io[int(IoSlot::WPage)], csr.w_page);
+        write_u32s(b_.io[int(IoSlot::WOff)], csr.w_off);
+        write_u32s(b_.io[int(IoSlot::QoIndptr)], csr.qo_indptr);
+        write_u32s(b_.io[int(IoSlot::KvPageIndices)], csr.kv_page_indices);
+        write_u32s(b_.io[int(IoSlot::KvPageIndptr)], csr.kv_page_indptr);
+        // The causal bound at M>1 comes from PositionIds, and the window from
+        // the layer's own constant, so no dense mask is needed. SeqLen is the
+        // M=1 ring's port and is set for the ABI's sake, not because the paged
+        // kernels read it.
+        write_i32(b_.io[int(IoSlot::SeqLen)],
+                  std::int32_t(csr.position_ids.back()) + 1);
+        if (b_.io[int(IoSlot::AttnMaskEnabled)].contents() != nullptr) {
+            std::memset(b_.io[int(IoSlot::AttnMaskEnabled)].contents(), 0, std::size_t(rows));
+        }
+        if (bound_rows_ != rows) {
+            gemma4::bind_gemma4_consts(ctx, dag_, g_, rows, /*paged=*/true);
+            bound_rows_ = rows;
         }
         return ctx.run_step([&](StepEncoder& se) {
-            gemma4::encode_gemma4_step_mb(se, dag_, g_, /*rows=*/1, base_, mb_, psos_);
+            gemma4::encode_gemma4_step_mb(se, dag_, g_, rows, base_, mb_, psos_);
         });
     }
 

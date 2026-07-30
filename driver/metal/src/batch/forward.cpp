@@ -566,6 +566,12 @@ struct MetalExecutor::Impl {
     model::ModelFamily family_ = model::ModelFamily::Qwen35;
     std::unique_ptr<SimpleFamilyEngine> simple_{};
     bool is_simple() const { return simple_ != nullptr; }
+    SimpleFamilyEngine* simple_engine() const { return simple_.get(); }
+    StepTiming fire_simple(const SimpleFamilyEngine::FireCsr& csr) {
+        const StepTiming t = simple_->fire(*ctx_, csr);
+        if (golden_taps_enabled()) simple_->dump_taps(int(csr.token_ids.size()));
+        return t;
+    }
 
     /// Build one of those, and the context it lives in.
     bool setup_simple(model::ModelFamily family, const std::string& kernels_dir,
@@ -742,21 +748,22 @@ bool MetalExecutor::Impl::setup_simple(model::ModelFamily family,
     if (!ensure_ptir_logits_rows(1, err)) return false;
     ctx_->arg_bind_ordinal(kPtirLogitsCopyOrdinal, 0, simple_->logits_slot());
 
-    // A KV pool the engine can plan against, with no pages behind it.
+    // The KV pool the engine plans against.
     //
-    // These families hold their KV as a position-indexed ring of `max_ctx_`
-    // tokens per layer, so a page is not a thing they store into -- but the
-    // engine's admission control counts pages, and refusing to report any at
-    // all makes every launch fail with "KV pool is unavailable". So the pool is
-    // reported at the capacity the RING actually has. It is not a lie about
-    // storage: `ensure_kv_pages` below bounds the demand against the same
-    // number, so a sequence the ring cannot hold is still refused. What is
-    // genuinely absent -- moving pages around, which is what prefix sharing and
-    // forking need -- is refused as absent.
-    const std::uint32_t page = cfg.kv_page_size > 0 ? cfg.kv_page_size : 1u;
+    // A paged family reports the pages it really allocated, which is what makes
+    // the runtime's physical page ids mean something: they index the engine's
+    // per-layer pools directly. A ring-backed one reports the capacity the RING
+    // has -- not a lie about storage, since `ensure_kv_pages` bounds demand
+    // against the same number, but a page is not a thing it stores into. What
+    // is genuinely absent for both -- moving pages around, which is what prefix
+    // sharing and forking need -- is refused as absent.
+    const std::uint32_t page =
+        simple_->paged() ? std::uint32_t(simple_->page_size())
+                         : (cfg.kv_page_size > 0 ? cfg.kv_page_size : 1u);
     kv_pool_.enabled = true;
     kv_pool_.page_size = page;
-    kv_pool_.total_pages = std::uint32_t(max_ctx_) / page;
+    kv_pool_.total_pages = simple_->paged() ? std::uint32_t(simple_->total_pages())
+                                            : std::uint32_t(max_ctx_) / page;
     kv_pool_.capacity_pages = kv_pool_.total_pages;
     kv_pool_.committed_pages = kv_pool_.total_pages;
     kv_pool_.layers.clear();
@@ -2050,8 +2057,13 @@ bool MetalExecutor::Impl::ensure_ptir_logits_rows(
     SlotHandle old = ptir_logits_;
     ptir_logits_ = replacement;
     ptir_logits_capacity_rows_ = rows;
-    ctx_->arg_bind_ordinal(
-        kPtirLogitsCopyOrdinal, 0, b_.io[int(IoSlot::Logits)]);
+    // The copy's SOURCE. `b_.io[Logits]` is qwen3.5's; a simple family's tail
+    // writes a slot of its own, and rebinding qwen's here would leave the copy
+    // reading an unallocated buffer -- which is silent, and reads downstream as
+    // logits of exactly zero. Only reachable on GROWTH, so it survived every
+    // single-row fire.
+    ctx_->arg_bind_ordinal(kPtirLogitsCopyOrdinal, 0,
+                           is_simple() ? simple_->logits_slot() : b_.io[int(IoSlot::Logits)]);
     ctx_->arg_bind_ordinal(kPtirLogitsCopyOrdinal, 1, ptir_logits_);
     ctx_->arg_bind_ordinal(
         kPtirLogitsCopyOrdinal, 2, ptir_logits_copy_params_);
@@ -2547,6 +2559,20 @@ bool MetalExecutor::forward(const MemberForwardDesc& desc, LogitsOut& out, std::
     // `validate_linear_sequence_geometry` below is what actually enforces the
     // one-resident-sequence invariant the ring needs.
     if (impl_->is_simple()) {
+        SimpleFamilyEngine* eng = impl_->simple_engine();
+        if (eng != nullptr && eng->paged()) {
+            // One member is a batch of one: the same fire, the same CSR.
+            std::vector<LogitsOut> outs(1);
+            std::vector<std::uint8_t> ok(1, 0);
+            std::vector<std::string> errs(1);
+            run_simple_batch_forward({desc}, outs, ok, errs);
+            if (ok[0] != 0) {
+                out = std::move(outs[0]);
+                return true;
+            }
+            if (err != nullptr) *err = errs[0].empty() ? "Metal forward failed" : errs[0];
+            return false;
+        }
         if (desc.has_write_desc) {
             if (err != nullptr) {
                 *err = "this family stores KV as a position-indexed ring, so an explicit "
@@ -2562,9 +2588,9 @@ bool MetalExecutor::forward(const MemberForwardDesc& desc, LogitsOut& out, std::
         // generic message is qwen3.5's and names a phase rather than a gap.
         if (err != nullptr) {
             *err = member_err +
-                   " [gemma4/gpt-oss serve one sequence at a time: their M>1 prefill kernels "
-                   "and paged binds exist but have never been through a numerics walk, so "
-                   "the paged multi-sequence path is not enabled for them]";
+                   " [this family serves one sequence at a time: its KV is a "
+                   "position-indexed ring, so a second resident sequence would clobber the "
+                   "first]";
         }
         return false;
     }
@@ -2618,6 +2644,17 @@ void MetalExecutor::forward_batch(const std::vector<MemberForwardDesc>& descs,
     // first. Refused per member rather than per batch, which is what the caller
     // poisons on.
     if (impl_->is_simple()) {
+        SimpleFamilyEngine* eng = impl_->simple_engine();
+        if (eng != nullptr && eng->paged()) {
+            run_simple_batch_forward(descs, outs, success, errors, ptir);
+            for (std::size_t i = 0; i < descs.size(); ++i) {
+                if (success[i] == 0 && !errors[i].empty()) {
+                    std::cerr << "[pie-driver-metal] member forward rejected: " << errors[i]
+                              << "\n";
+                }
+            }
+            return;
+        }
         if (descs.size() != 1) {
             for (auto& e : errors) {
                 e = "this family's KV is a single-sequence ring, so a batch of " +
@@ -3060,6 +3097,199 @@ bool MetalExecutor::run_paged_batch_forward(const std::vector<MemberForwardDesc>
             slot_states_, d, request.local_request);
     }
     return true;
+}
+
+bool MetalExecutor::run_simple_batch_forward(const std::vector<MemberForwardDesc>& descs,
+                                            std::vector<LogitsOut>& outs,
+                                            std::vector<std::uint8_t>& success,
+                                            std::vector<std::string>& errors,
+                                            const std::vector<PtirCommandCallbacks>* ptir) {
+    SimpleFamilyEngine* eng = impl_->simple_engine();
+    if (eng == nullptr || !eng->paged()) {
+        for (auto& e : errors) e = "this family has no paged batch path";
+        return false;
+    }
+    const int page_size = eng->page_size();
+    const std::uint32_t total_pages = std::uint32_t(eng->total_pages());
+
+    // ── Build one fire out of every member that validates ──
+    //
+    // A member may carry several requests (its own CSR); each becomes a request
+    // of the fire, so the fire's request ids are global and its `qo_indptr`
+    // spans them all.
+    SimpleFamilyEngine::FireCsr csr;
+    csr.qo_indptr.push_back(0);
+    csr.kv_page_indptr.push_back(0);
+    struct Accepted {
+        std::size_t member = 0;
+        std::uint32_t row0 = 0;  // this member's first row in the fire
+    };
+    std::vector<Accepted> accepted;
+    bool any_rejected = false;
+    const auto reject = [&](std::size_t i, const std::string& why) {
+        errors[i] = why;
+        any_rejected = true;
+    };
+
+    for (std::size_t i = 0; i < descs.size(); ++i) {
+        const MemberForwardDesc& d = descs[i];
+        if (d.token_ids.empty() || d.token_ids.size() != d.position_ids.size()) {
+            reject(i, "forward token/position count mismatch or empty span");
+            continue;
+        }
+        if (d.qo_indptr.size() < 2 || d.qo_indptr.front() != 0 ||
+            d.qo_indptr.back() != d.token_ids.size() ||
+            d.kv_page_indptr.size() != d.qo_indptr.size() ||
+            d.kv_page_indptr.front() != 0 ||
+            d.kv_page_indptr.back() != d.kv_pages.size()) {
+            reject(i, "member CSR is malformed");
+            continue;
+        }
+        if (d.has_write_desc &&
+            (d.w_page.size() != d.token_ids.size() || d.w_off.size() != d.token_ids.size())) {
+            reject(i, "explicit w_page/w_off must have one entry per token");
+            continue;
+        }
+        if (d.has_attention_mask || d.structured_mask) {
+            reject(i, "this family's attention is bounded by position, and has no dense "
+                      "mask port");
+            continue;
+        }
+        bool bad = false;
+        for (const std::uint32_t p : d.kv_pages) {
+            if (p >= total_pages) {
+                reject(i, "a KV page id (" + std::to_string(p) + ") is outside the pool's " +
+                              std::to_string(total_pages) + " pages");
+                bad = true;
+                break;
+            }
+        }
+        if (bad) continue;
+        for (const std::uint32_t local : d.readout_local_indices) {
+            if (local >= d.token_ids.size()) {
+                reject(i, "readout index exceeds this fire's token span");
+                bad = true;
+                break;
+            }
+        }
+        if (bad) continue;
+
+        // Per-request: positions are absolute within the sequence, so the page
+        // a token lands in is its position's page IN THIS REQUEST'S LIST.
+        const std::size_t requests = d.qo_indptr.size() - 1;
+        const std::uint32_t row0 = std::uint32_t(csr.token_ids.size());
+        SimpleFamilyEngine::FireCsr add;
+        for (std::size_t r = 0; r < requests && !bad; ++r) {
+            const std::uint32_t q0 = d.qo_indptr[r], q1 = d.qo_indptr[r + 1];
+            const std::uint32_t k0 = d.kv_page_indptr[r], k1 = d.kv_page_indptr[r + 1];
+            const std::uint32_t req_id =
+                std::uint32_t(csr.kv_page_indptr.size() - 1 + add.qo_indptr.size());
+            for (std::uint32_t t = q0; t < q1; ++t) {
+                const std::uint32_t pos = d.position_ids[t];
+                const std::uint32_t page_ix = pos / std::uint32_t(page_size);
+                if (k0 + page_ix >= k1) {
+                    reject(i, "a token at position " + std::to_string(pos) +
+                                  " has no page in its request's list");
+                    bad = true;
+                    break;
+                }
+                add.token_ids.push_back(d.token_ids[t]);
+                add.position_ids.push_back(pos);
+                add.req_of_token.push_back(req_id);
+                add.w_page.push_back(d.has_write_desc ? d.w_page[t] : d.kv_pages[k0 + page_ix]);
+                add.w_off.push_back(d.has_write_desc ? d.w_off[t]
+                                                     : pos % std::uint32_t(page_size));
+            }
+            add.qo_indptr.push_back(std::uint32_t(add.token_ids.size()));
+            for (std::uint32_t p = k0; p < k1; ++p) add.kv_page_indices.push_back(d.kv_pages[p]);
+            add.kv_page_indptr.push_back(std::uint32_t(add.kv_page_indices.size()));
+        }
+        if (bad) continue;
+        if (csr.token_ids.size() + add.token_ids.size() > std::size_t(eng->max_rows())) {
+            reject(i, "this fire would exceed the driver's " +
+                          std::to_string(eng->max_rows()) + "-row forward budget");
+            continue;
+        }
+        // `add`'s indptrs are this member's own cumulative counts, one entry
+        // per request and no leading zero; the fire's carry a leading zero and
+        // continue from where the previous member left off.
+        const std::uint32_t token_base = csr.qo_indptr.back();
+        const std::uint32_t page_base = csr.kv_page_indptr.back();
+        for (std::size_t k = 0; k < add.qo_indptr.size(); ++k) {
+            csr.qo_indptr.push_back(token_base + add.qo_indptr[k]);
+            csr.kv_page_indptr.push_back(page_base + add.kv_page_indptr[k]);
+        }
+        csr.token_ids.insert(csr.token_ids.end(), add.token_ids.begin(), add.token_ids.end());
+        csr.position_ids.insert(csr.position_ids.end(), add.position_ids.begin(),
+                                add.position_ids.end());
+        csr.req_of_token.insert(csr.req_of_token.end(), add.req_of_token.begin(),
+                                add.req_of_token.end());
+        csr.w_page.insert(csr.w_page.end(), add.w_page.begin(), add.w_page.end());
+        csr.w_off.insert(csr.w_off.end(), add.w_off.begin(), add.w_off.end());
+        csr.kv_page_indices.insert(csr.kv_page_indices.end(), add.kv_page_indices.begin(),
+                                   add.kv_page_indices.end());
+        accepted.push_back({i, row0});
+    }
+    if (accepted.empty()) return !any_rejected;
+
+    // Reserve every accepted member's readout rows BEFORE the fire: the staging
+    // copy runs after it, and the row a member's logits land in has to be
+    // stable across the whole batch.
+    for (const Accepted& a : accepted) {
+        LogitsOut& out = outs[a.member];
+        out.vocab = vocab_;
+        out.rows = std::uint32_t(descs[a.member].readout_local_indices.size());
+        out.device_row_offset = impl_->reserve_ptir_logits_rows(out.rows);
+        impl_->attach_ptir_logits_view(out);
+    }
+
+    const StepTiming timing = impl_->fire_simple(csr);
+    if (!timing.succeeded()) {
+        for (const Accepted& a : accepted) {
+            errors[a.member] = "Metal forward timed out before its completion fence";
+        }
+        return false;
+    }
+
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> copies;
+    for (const Accepted& a : accepted) {
+        const MemberForwardDesc& d = descs[a.member];
+        const bool direct = ptir != nullptr && (*ptir)[a.member].consumes_logits_directly;
+        for (std::uint32_t r = 0; r < d.readout_local_indices.size(); ++r) {
+            if (direct) continue;
+            copies.push_back({a.row0 + d.readout_local_indices[r],
+                              outs[a.member].device_row_offset + r});
+        }
+    }
+    // `stage_ptir_logits_rows` fires one copy dispatch per call, bounded by
+    // `kPtirLogitsCopyMaxRows`; a large batch needs several.
+    for (std::size_t off = 0; off < copies.size(); off += kPtirLogitsCopyMaxRows) {
+        const std::size_t n = std::min<std::size_t>(kPtirLogitsCopyMaxRows, copies.size() - off);
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> chunk(copies.begin() + off,
+                                                                  copies.begin() + off + n);
+        std::string stage_err;
+        if (!impl_->stage_ptir_logits_rows(chunk, &stage_err)) {
+            for (const Accepted& a : accepted) errors[a.member] = stage_err;
+            return false;
+        }
+    }
+
+    for (const Accepted& a : accepted) {
+        const MemberForwardDesc& d = descs[a.member];
+        const std::uint32_t slot = d.has_rs_slot ? d.rs_slot_id : 0u;
+        LinearSequenceState& state = slot_states_[slot];
+        state.has_resident = true;
+        state.resident_sequence_id = d.sequence_id;
+        state.resident_slot = slot;
+        state.resident_next_position = d.position_ids.back() + 1;
+        state.resident_pages = d.kv_pages;
+        // Paged, not ring-backed: several sequences are resident at once, each
+        // in its own pages, so nothing here is exclusive.
+        state.ring_backed = false;
+        state.paged_backed = true;
+        success[a.member] = 1;
+    }
+    return !any_rejected;
 }
 
 bool MetalExecutor::run_member_forward(const MemberForwardDesc& desc, LogitsOut& out,

@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "mtl4_context.hpp"
 #include "loader/load_plan.hpp"
@@ -51,8 +52,47 @@ class SimpleFamilyEngine {
     static std::size_t extra_heap_bytes(model::ModelFamily family, const SetupConfig& cfg,
                                         int max_ctx);
 
+    /// One fire: several requests' new tokens sharing a command buffer.
+    ///
+    /// This is the shape a mixed prefill+decode batch has. A prefill request
+    /// contributes its whole prompt; a decode request contributes one token.
+    /// Nothing in the fire distinguishes them — `qo_indptr` says who owns which
+    /// rows, and that is the only difference.
+    ///
+    /// `w_page` is PHYSICAL (the page the runtime allocated), matching
+    /// `kv_append_paged`'s port; `kv_page_indices`/`kv_page_indptr` are the CSR
+    /// the attention walks for each request's history.
+    struct FireCsr {
+        std::vector<std::uint32_t> token_ids;
+        std::vector<std::uint32_t> position_ids;
+        std::vector<std::uint32_t> req_of_token;
+        std::vector<std::uint32_t> w_page;
+        std::vector<std::uint32_t> w_off;
+        std::vector<std::uint32_t> qo_indptr;
+        std::vector<std::uint32_t> kv_page_indices;
+        std::vector<std::uint32_t> kv_page_indptr;
+    };
+
     virtual int vocab() const = 0;
     virtual int n_layers() const = 0;
+
+    /// Whether this family stores its KV in pages the runtime allocates, and so
+    /// can hold several sequences at once. False means a single-sequence ring:
+    /// `fire` is refused and `step` replays one token at a time.
+    virtual bool paged() const { return false; }
+
+    /// The most rows one `fire` may carry, and the page geometry the runtime
+    /// must allocate against. Meaningless unless `paged()`.
+    virtual int max_rows() const { return 1; }
+    virtual int page_size() const { return 1; }
+    virtual int total_pages() const { return 0; }
+
+    /// Fire `csr`. The logits slot holds one row per token, in `csr` order.
+    virtual StepTiming fire(RawMetalContext& ctx, const FireCsr& csr) {
+        (void)ctx;
+        (void)csr;
+        return StepTiming{};
+    }
 
     /// A fresh sequence: the KV is the only thing carried between tokens, so
     /// zeroing it is the whole reset.

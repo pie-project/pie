@@ -36,7 +36,65 @@ bool exists(const std::string& dir) {
     return true;
 }
 
-/// One sequence, greedily continued, through the executor's own API.
+/// The argmax of a staged logits row, read the way the sampler reads it: a
+/// bf16 view of PTIR staging, not `LogitsOut::data` (which production leaves
+/// empty on purpose).
+int argmax_of(const LogitsOut& out, std::uint32_t row) {
+    const auto* bf = static_cast<const std::uint16_t*>(out.device_contents) +
+                     std::size_t(out.device_row_offset + row) * std::size_t(out.vocab);
+    const auto f32 = [&](std::uint32_t i) {
+        const std::uint32_t bits = std::uint32_t(bf[i]) << 16;
+        float f;
+        std::memcpy(&f, &bits, 4);
+        return f;
+    };
+    int best = 0;
+    float bv = f32(0);
+    for (std::uint32_t i = 1; i < out.vocab; ++i) {
+        const float v = f32(i);
+        if (v > bv) {
+            bv = v;
+            best = int(i);
+        }
+    }
+    return best;
+}
+
+/// A sequence the harness is driving: its tokens, and the pages it owns.
+struct Seq {
+    std::uint64_t id = 0;
+    std::vector<std::uint32_t> tokens;
+    std::vector<std::uint32_t> pages;
+    std::uint32_t next_position = 0;
+    std::vector<std::uint32_t> sampled;
+};
+
+/// The descriptor for this sequence's next fire: `n` new tokens starting at
+/// `next_position`, reading only the last row.
+///
+/// The page list is the whole history's, flashinfer's CSR convention, and it
+/// grows as the sequence does -- which is what the runtime does for real.
+MemberForwardDesc desc_for(Seq& s, std::uint32_t n, std::uint32_t page_size,
+                           std::uint32_t& next_free_page) {
+    MemberForwardDesc d;
+    d.sequence_id = s.id;
+    d.requires_paged = true;
+    const std::uint32_t end = s.next_position + n;
+    while (std::uint64_t(s.pages.size()) * page_size < end) s.pages.push_back(next_free_page++);
+    for (std::uint32_t i = 0; i < n; ++i) {
+        d.token_ids.push_back(s.tokens[s.next_position + i]);
+        d.position_ids.push_back(s.next_position + i);
+    }
+    d.qo_indptr = {0u, n};
+    d.kv_pages = s.pages;
+    d.kv_page_indptr = {0u, std::uint32_t(s.pages.size())};
+    d.kv_last_page_lens = {end % page_size == 0 ? page_size : end % page_size};
+    d.readout_local_indices = {n - 1};
+    d.sampling_indptr = {0u, 1u};
+    return d;
+}
+
+/// One sequence: the whole prompt in ONE fire, then greedy decode.
 bool run_family(const std::string& tag, const SetupConfig& cfg,
                 const std::vector<std::uint32_t>& prompt, int n_gen,
                 std::vector<std::uint32_t>& got) {
@@ -49,23 +107,19 @@ bool run_family(const std::string& tag, const SetupConfig& cfg,
     }
     expect(exec.ready(), tag + ": the executor reports ready");
     expect(exec.vocab() > 0, tag + ": and a vocabulary");
+    const std::uint32_t page_size = exec.kv_pool_page_size();
+    std::uint32_t next_free_page = 0;
 
-    std::vector<std::uint32_t> tokens = prompt;
-    for (int s = 0; s < n_gen; ++s) {
-        MemberForwardDesc desc;
-        desc.sequence_id = 1;
-        desc.token_ids = tokens;
-        desc.position_ids.clear();
-        for (std::size_t i = 0; i < tokens.size(); ++i) {
-            desc.position_ids.push_back(static_cast<std::uint32_t>(i));
-        }
-        // Only the last row is read: this is a prompt replay, and the sampler
-        // wants the token that follows it.
-        desc.readout_local_indices = {static_cast<std::uint32_t>(tokens.size() - 1)};
-
+    Seq s;
+    s.id = 1;
+    s.tokens = prompt;
+    for (int step = 0; step <= n_gen; ++step) {
+        const std::uint32_t n = std::uint32_t(s.tokens.size()) - s.next_position;
+        if (n == 0) break;
+        MemberForwardDesc d = desc_for(s, n, page_size, next_free_page);
         LogitsOut out;
         std::string ferr;
-        if (!exec.forward(desc, out, &ferr)) {
+        if (!exec.forward(d, out, &ferr)) {
             std::printf("  FAIL  %s forward: %s\n", tag.c_str(), ferr.c_str());
             ++failures;
             return false;
@@ -75,30 +129,70 @@ bool run_family(const std::string& tag, const SetupConfig& cfg,
             ++failures;
             return false;
         }
-        // The production readout: a bf16 view of the staged row, which is what
-        // the sampler binds. `LogitsOut::data` is the test-only f32 copy and
-        // stays empty here on purpose -- reading it would test a path the engine
-        // does not take.
-        const auto* bf = static_cast<const std::uint16_t*>(out.device_contents) +
-                         std::size_t(out.device_row_offset) * std::size_t(out.vocab);
-        const auto f32 = [&](std::uint32_t i) {
-            const std::uint32_t bits = std::uint32_t(bf[i]) << 16;
-            float f;
-            std::memcpy(&f, &bits, 4);
-            return f;
-        };
-        int best = 0;
-        float bv = f32(0);
-        for (std::uint32_t i = 1; i < out.vocab; ++i) {
-            const float v = f32(i);
-            if (v > bv) {
-                bv = v;
-                best = int(i);
-            }
+        s.next_position += n;
+        const int best = argmax_of(out, 0);
+        if (step < n_gen) {
+            got.push_back(std::uint32_t(best));
+            s.tokens.push_back(std::uint32_t(best));
         }
-        got.push_back(std::uint32_t(best));
-        tokens.push_back(std::uint32_t(best));
     }
+    return true;
+}
+
+/// Two sequences, resident at once, sharing every fire.
+///
+/// This is the property the whole paged path exists for. Sequence B's prompt is
+/// a PREFIX of sequence A's, so a fire that leaked pages or positions between
+/// them would give one answer twice; they must each get their own.
+///
+/// Fire 1 prefills both (a 12-row mixed fire). Fire 2 decodes both (a 2-row
+/// one). So prefill and decode rows share a command buffer in the first fire
+/// and the batch shrinks in the second, which is what a real frame does.
+bool run_two_sequences(const SetupConfig& cfg, const std::vector<std::uint32_t>& a_prompt,
+                       const std::vector<std::uint32_t>& b_prompt,
+                       std::vector<std::uint32_t>& a_out, std::vector<std::uint32_t>& b_out) {
+    MetalExecutor exec;
+    std::string err;
+    if (!exec.setup(cfg, &err)) {
+        std::printf("  FAIL  two-sequence setup: %s\n", err.c_str());
+        ++failures;
+        return false;
+    }
+    const std::uint32_t page_size = exec.kv_pool_page_size();
+    std::uint32_t next_free_page = 0;
+    Seq a, b;
+    a.id = 11;
+    a.tokens = a_prompt;
+    b.id = 22;
+    b.tokens = b_prompt;
+
+    for (int fire = 0; fire < 2; ++fire) {
+        std::vector<MemberForwardDesc> descs;
+        for (Seq* s : {&a, &b}) {
+            const std::uint32_t n = std::uint32_t(s->tokens.size()) - s->next_position;
+            descs.push_back(desc_for(*s, n, page_size, next_free_page));
+        }
+        std::vector<LogitsOut> outs(descs.size());
+        std::vector<std::uint8_t> ok(descs.size(), 0);
+        std::vector<std::string> errs(descs.size());
+        exec.forward_batch(descs, outs, ok, errs);
+        int i = 0;
+        for (Seq* s : {&a, &b}) {
+            if (ok[i] == 0) {
+                std::printf("  FAIL  two-sequence fire %d member %d: %s\n", fire, i,
+                            errs[i].c_str());
+                ++failures;
+                return false;
+            }
+            s->next_position += std::uint32_t(descs[i].token_ids.size());
+            const int best = argmax_of(outs[i], 0);
+            s->sampled.push_back(std::uint32_t(best));
+            s->tokens.push_back(std::uint32_t(best));
+            ++i;
+        }
+    }
+    a_out = a.sampled;
+    b_out = b.sampled;
     return true;
 }
 
@@ -126,8 +220,10 @@ int main() {
             cfg.snapshot_dir = dir;
             cfg.model_type = "gemma4";
             cfg.vocab_size = 262144;
-            cfg.max_forward_tokens = 1;
-            cfg.max_forward_requests = 1;
+            // A fire now carries a whole prompt, and two of them at once.
+            cfg.max_forward_tokens = 32;
+            cfg.max_forward_requests = 4;
+            cfg.kv_page_size = 32;
             cfg.gemma4.n_layers = 35;
             cfg.gemma4.hidden = 1536;
             cfg.gemma4.intermediate = 6144;
@@ -158,6 +254,25 @@ int main() {
                 // point: the same numbers, one layer up.
                 expect(!got.empty() && got[0] == 3821,
                        "gemma4's first sampled token is mlx-lm's, through the executor");
+            }
+
+            // ── Two sequences, resident at once ──
+            //
+            // The eight-token prompt and its own four-token prefix, prefilled
+            // in ONE 12-row fire and then decoded together in a 2-row one.
+            // `gemma4_prefill_numerics_test` pins those two answers on the raw
+            // path (3821 and 496); getting them from a batch, through the
+            // executor, is what "serves more than one sequence" means.
+            std::vector<std::uint32_t> ta, tb;
+            if (!taps && run_two_sequences(cfg, {2, 818, 3821, 563, 529, 476, 3625, 506},
+                                           {2, 818, 3821, 563}, ta, tb)) {
+                std::printf("    two sequences: A %u %u   B %u %u\n", ta[0], ta[1], tb[0],
+                            tb[1]);
+                expect(ta[0] == 3821,
+                       "a sequence's answer is unchanged by a sibling sharing its fire");
+                expect(tb[0] == 496,
+                       "and the shorter one gets its OWN answer, from its own pages and "
+                       "positions");
             }
         }
     }
