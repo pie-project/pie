@@ -458,3 +458,48 @@ class WrongMasksThatWouldNotRaise(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ATokenOutsideTheVocabulary(unittest.TestCase):
+    """A sampled id the vocabulary does not have must refuse, not corrupt.
+
+    The tokens are never read on the host - that is the whole design - so a
+    caller that passes an id past the end of the vocabulary cannot be caught
+    there. A dense group set is indexed *by* the id, so one too large read
+    past its payload and took the CUDA context with it: not a wrong mask, a
+    dead process, and every other sequence in the batch with it.
+    """
+
+    def _batch(self):
+        _requirements()
+        engine = gpugrammar.Engine(VOCABULARY)
+        grammar = engine.compile_json_schema(SCHEMA)
+        batch = engine.batch(size=4)
+        batch.set_grammars([grammar] * 4)
+        return engine, grammar, batch
+
+    def test_a_huge_id_refuses_and_leaves_the_others_alone(self):
+        _, grammar, batch = self._batch()
+        good = grammar.matcher(0).allowed_tokens()[0]
+        batch.advance(
+            torch.tensor([good, 10**9, -5, good], dtype=torch.int32, device="cuda")
+        )
+        torch.cuda.synchronize()
+        terminated, overflow = batch.problems()
+        self.assertEqual(terminated.tolist(), [0, 1, 1, 0])
+        # Not an overflow: nothing hit a ceiling, the token simply is not in
+        # the grammar. Reporting it as one would send a caller looking for a
+        # buffer to enlarge.
+        self.assertEqual(overflow.tolist(), [0, 0, 0, 0])
+
+    def test_the_batch_still_fills_afterwards(self):
+        _, grammar, batch = self._batch()
+        good = grammar.matcher(0).allowed_tokens()[0]
+        batch.advance(
+            torch.tensor([good, 2**31 - 1, good, good], dtype=torch.int32, device="cuda")
+        )
+        mask = batch.fill_mask()
+        torch.cuda.synchronize()
+        rows = mask.to(torch.int32).view(4, -1).ne(0).sum(1).tolist()
+        self.assertGreater(rows[0], 0)
+        self.assertEqual(rows[0], rows[2])

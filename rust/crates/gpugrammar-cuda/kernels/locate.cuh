@@ -33,7 +33,17 @@ __device__ __forceinline__ bool set_holds(
     int32_t kind,
     int32_t offset,
     int32_t length,
-    int32_t token) {
+    int32_t token,
+    int32_t vocabulary) {
+    // A token id outside the vocabulary is in no group. Bounded here rather
+    // than on the host because the sampled tokens are never read there - that
+    // is the whole design - and a dense set is indexed by the id, so a caller
+    // passing one too large read past the payload and took the CUDA context
+    // with it. Refusing is the right answer as well as the safe one: the
+    // sequence terminates and `problems()` says so.
+    if (token < 0 || token >= vocabulary) {
+        return false;
+    }
     const int32_t* payload = arena->set_payload + payload_base + offset;
     if (kind == DENSE) {
         return ((payload[token >> 5] >> (token & 31)) & 1) == 1;
@@ -101,7 +111,8 @@ __device__ __forceinline__ int32_t locate_one(
     int32_t sequence,
     int32_t row,
     int32_t lane,
-    bool has_verdicts) {
+    bool has_verdicts,
+    int32_t vocabulary) {
     int32_t grammar = state->grammar_of[sequence];
     int32_t lexer = state->lexer_state[row];
     int32_t token = token_of[sequence];
@@ -139,7 +150,7 @@ __device__ __forceinline__ int32_t locate_one(
         int32_t kind = arena->group_set_kind[groups + group];
         int32_t offset = arena->group_set_offset[groups + group];
         int32_t length = arena->group_set_length[groups + group];
-        if (!set_holds(arena, payload_base, kind, offset, length, token)) {
+        if (!set_holds(arena, payload_base, kind, offset, length, token, vocabulary)) {
             continue;
         }
         if (verdict_of(arena, verdict_row, stride, group - first) == 1) {
@@ -178,7 +189,8 @@ extern "C" __global__ void gg_locate(
     int32_t configs,
     int32_t stack_stride,
     int32_t rows,
-    int32_t has_verdicts) {
+    int32_t has_verdicts,
+    int32_t vocabulary) {
     gg::Shape shape{batch, configs, stack_stride, 0, rows};
     int32_t lane = threadIdx.x & 31;
     int32_t warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
@@ -212,7 +224,8 @@ extern "C" __global__ void gg_locate(
         }
 
         int32_t best =
-            gg::locate_one(arena, state, shape, token, sequence, row, lane, has_verdicts != 0);
+            gg::locate_one(arena, state, shape, token, sequence, row, lane, has_verdicts != 0,
+                           vocabulary);
         if (lane == 0) {
             found[row] = best;
         }
@@ -235,7 +248,8 @@ extern "C" __global__ void gg_locate_no_copy(
     int32_t configs,
     int32_t stack_stride,
     int32_t rows,
-    int32_t has_verdicts) {
+    int32_t has_verdicts,
+    int32_t vocabulary) {
     gg::Shape shape{batch, configs, stack_stride, 0, rows};
     int32_t lane = threadIdx.x & 31;
     int32_t warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
@@ -244,7 +258,9 @@ extern "C" __global__ void gg_locate_no_copy(
     for (int32_t slot = warp; slot < total; slot += warps) {
         int32_t row = gg::owner(live_offsets, rows, slot);
         int32_t sequence = row / configs;
-        int32_t best = gg::locate_one(arena, state, shape, token, sequence, row, lane, has_verdicts != 0);
+        int32_t best =
+            gg::locate_one(arena, state, shape, token, sequence, row, lane, has_verdicts != 0,
+                           vocabulary);
         if (lane == 0) { found[row] = best; }
     }
 }

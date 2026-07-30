@@ -47,7 +47,8 @@ extern "C" __global__ void gg_advance_fused(
     int32_t window,
     int32_t paths,
     int32_t has_verdicts,
-    int32_t rollback) {
+    int32_t rollback,
+    int32_t vocabulary) {
     int32_t sequence = blockIdx.x;
     int32_t lane = threadIdx.x;
     int32_t count = state->config_count[sequence];
@@ -116,7 +117,7 @@ extern "C" __global__ void gg_advance_fused(
     for (int32_t config = warp; config < count; config += warps) {
         int32_t row = sequence * configs + config;
         int32_t best = gg::locate_one(arena, state, shape, token, sequence, row, in_warp,
-                                      has_verdicts != 0);
+                                      has_verdicts != 0, vocabulary);
         if (in_warp == 0) {
             found[row] = best;
         }

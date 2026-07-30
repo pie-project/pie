@@ -1253,6 +1253,7 @@ def _locate_kernel(
     STACK_STRIDE: tl.constexpr,
     HAS_VERDICTS: tl.constexpr,
     NO_GROUP: tl.constexpr,
+    VOCAB: tl.constexpr,
 ):
     """Which group holds the sampled token, for each live configuration.
 
@@ -1311,6 +1312,7 @@ def _locate_kernel(
                 STACK_STRIDE=STACK_STRIDE,
                 HAS_VERDICTS=HAS_VERDICTS,
                 NO_GROUP=NO_GROUP,
+                VOCAB=VOCAB,
             ),
         )
         slot = slot + programs
@@ -1339,6 +1341,7 @@ def _locate_one(
     STACK_STRIDE: tl.constexpr,
     HAS_VERDICTS: tl.constexpr,
     NO_GROUP: tl.constexpr,
+    VOCAB: tl.constexpr,
 ):
     """Search one configuration's groups for the sampled token."""
     state = tl.load(lexer_state_ptr + row_index)
@@ -1363,6 +1366,11 @@ def _locate_one(
     # loads for the whole block, which is the difference this kernel is made
     # of: it is bound by how many scattered loads it issues, not by arithmetic.
     token = tl.load(token_ptr + sequence)
+    # A token id outside the vocabulary is in no group. Bounded here rather
+    # than on the host because the sampled tokens are never read there, and a
+    # dense set is indexed by the id: one too large read past the payload and
+    # took the CUDA context with it.
+    in_vocabulary = (token >= 0) & (token < VOCAB)
     verdict_row = verdicts_ptr
     verdict_stride = 0
     if HAS_VERDICTS == 1:
@@ -1390,7 +1398,11 @@ def _locate_one(
         length = tl.load(group_set_length_ptr + groups + group, mask=live_lane, other=1)
 
         dense = kind == _DENSE
-        word = tl.load(payload + offset + token // 32, mask=live_lane & dense, other=0)
+        word = tl.load(
+            payload + offset + token // 32,
+            mask=live_lane & dense & in_vocabulary,
+            other=0,
+        )
         in_dense = ((word >> (token % 32)) & 1) == 1
 
         # A sorted list's ends are its bounds, so most lanes are decided without a
@@ -1419,6 +1431,7 @@ def _locate_one(
         inside = (
             tl.where(dense, in_dense, tl.where(complement, found == 0, found))
             & live_lane
+            & in_vocabulary
         )
         # A group the tables already refused for this parser state cannot be
         # the one that advances, and on real grammars 91% of them are. Applied
@@ -4074,6 +4087,7 @@ class DeviceBatch:
                 grammar.max_stack,
                 rows,
                 grammar.has_verdicts,
+                grammar.vocab_size,
             ],
         )
 
@@ -4727,6 +4741,7 @@ class DeviceBatch:
                 grammar.paths,
                 grammar.has_verdicts,
                 self.rollback_depth,
+                grammar.vocab_size,
             ],
         )
         if self.rollback_depth > 0:
@@ -4835,6 +4850,7 @@ class DeviceBatch:
             STACK_STRIDE=grammar.max_stack,
             HAS_VERDICTS=grammar.has_verdicts,
             NO_GROUP=_NO_GROUP,
+            VOCAB=grammar.vocab_size,
         )
 
     def _candidate_triton(self, grammar, rows) -> None:

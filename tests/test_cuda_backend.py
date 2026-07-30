@@ -380,6 +380,7 @@ class TheCudaLocateAgreesWithTriton(unittest.TestCase):
             ROWS=rows, CONFIGS=raw.configs, GROUP_BLOCK=_engine._GROUP_BLOCK,
             SEARCH_STEPS=grammar.search_steps, STACK_STRIDE=grammar.max_stack,
             HAS_VERDICTS=grammar.has_verdicts, NO_GROUP=_engine._NO_GROUP,
+            VOCAB=grammar.vocab_size,
         )
         torch.cuda.synchronize()
         theirs = {
