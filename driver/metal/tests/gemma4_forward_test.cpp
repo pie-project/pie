@@ -214,6 +214,27 @@ int main(int argc, char** argv) {
     }
     std::printf("gemma4 forward (%s)\n", ckpt.c_str());
 
+    // The token sequence to teacher-force. The default is a real prompt, not a
+    // lone <bos>: at position 0 every rotation is the identity, so a one-token
+    // pass is the one case that proves nothing about RoPE, the KV strides or the
+    // attention's key count. Both ends are checked -- the argmax after the first
+    // step and after the last. `PIE_G4_TOKENS` overrides it for a tap walk.
+    std::vector<int> ids{2, 818, 3821, 563, 529, 476, 3625, 506};
+    bool default_prompt = true;
+    if (const char* env = std::getenv("PIE_G4_TOKENS"); env != nullptr && *env != '\0') {
+        ids.clear();
+        for (const char* p = env; *p != '\0';) {
+            char* end = nullptr;
+            const long v = std::strtol(p, &end, 10);
+            if (end == p) break;
+            ids.push_back(int(v));
+            p = (*end == ',') ? end + 1 : end;
+        }
+        if (ids.empty()) ids.push_back(2);
+        default_prompt = false;
+    }
+    std::printf("    (teacher-forcing %zu tokens)\n", ids.size());
+
     Gemma4Geometry g;
     std::string err;
     if (!geometry_from_facts(Facts{}, g, &err)) {
@@ -284,7 +305,7 @@ int main(int argc, char** argv) {
     // Token 2 (<bos> in gemma's vocabulary) at position 0. `SeqLen` is what the
     // attention reads as its key count -- left at 0 it attends nothing and the
     // whole sublayer returns zeros, which the tap walk names as `0.sdpa`.
-    *static_cast<std::int32_t*>(b.io[int(IoSlot::TokenId)].contents()) = 2;
+    *static_cast<std::int32_t*>(b.io[int(IoSlot::TokenId)].contents()) = ids.front();
     *static_cast<std::int32_t*>(b.io[int(IoSlot::Position)].contents()) = 0;
     *static_cast<std::int32_t*>(b.io[int(IoSlot::SeqLen)].contents()) = 1;
 
@@ -323,19 +344,10 @@ int main(int argc, char** argv) {
 
     ctx->make_resident();
 
-    ctx->run_step([&](StepEncoder& se) {
-        encode_gemma4_step(se, dag, g, base, psos);
-    });
-
-    if (golden_taps_enabled()) {
-        dump_gemma4_taps(dag, g, coloring, b.pool);
-        std::printf("    (taps -> %s)\n", golden_tap_dir().c_str());
-    }
-
-    // ── did it compute anything? ──
-    // Read the softcap's OUTPUT, named by its bind index rather than by
-    // position -- `front()` is the input, and reading it would compare the wrong
-    // tensor against mlx while looking like it worked.
+    // ── where the logits land ──
+    // The softcap's OUTPUT, named by its bind index rather than by position --
+    // `front()` is the input, and reading it would compare the wrong tensor
+    // against mlx while looking like it worked.
     int logits_color = -1;
     for (const auto& sb : coloring.per_dispatch.back()) {
         if (sb.bind_index == (std::uint8_t)bind::Softcap::Out) logits_color = sb.color;
@@ -343,6 +355,36 @@ int main(int argc, char** argv) {
     expect(logits_color >= 0, "the final dispatch has an output to read");
     if (logits_color < 0) return 1;
     const auto* logits = static_cast<const std::uint16_t*>(b.pool[logits_color].contents());
+    const auto argmax_now = [&] {
+        int best_i = -1;
+        float best_v = -1e30f;
+        for (int i = 0; i < g.vocab; ++i) {
+            const float v = from_bf16(logits[i]);
+            if (v > best_v) { best_v = v; best_i = i; }
+        }
+        return best_i;
+    };
+
+    // Teacher-forced: one decode step per token, each reading the KV the ones
+    // before it wrote. The taps are dumped from the LAST step, so what they
+    // compare against is mlx-lm's last row.
+    int argmax_first = -1;
+    for (std::size_t t = 0; t < ids.size(); ++t) {
+        *static_cast<std::int32_t*>(b.io[int(IoSlot::TokenId)].contents()) = ids[t];
+        *static_cast<std::int32_t*>(b.io[int(IoSlot::Position)].contents()) = int(t);
+        *static_cast<std::int32_t*>(b.io[int(IoSlot::SeqLen)].contents()) = int(t) + 1;
+        ctx->run_step([&](StepEncoder& se) {
+            encode_gemma4_step(se, dag, g, base, psos);
+        });
+        if (t == 0) argmax_first = argmax_now();
+    }
+
+    if (golden_taps_enabled()) {
+        dump_gemma4_taps(dag, g, coloring, b.pool);
+        std::printf("    (taps -> %s)\n", golden_tap_dir().c_str());
+    }
+
+    // ── did it compute anything? ──
     int nonzero = 0, nan_or_inf = 0;
     float best = -1e30f;
     int argmax = -1;
@@ -373,12 +415,21 @@ int main(int argc, char** argv) {
     expect(nan_or_inf == 0, "and finite everywhere");
     expect(std::fabs(best) <= 30.0f + 1e-3f,
            "within the final softcap, so the tail of the graph ran");
-    // mlx-lm's answer for this checkpoint, <bos> at position 0. It is the whole
+    // mlx-lm's answers for this checkpoint and this prompt. This is the whole
     // point of the test: "it ran" was true while every projection was summing a
     // thirty-second of its row. Per-kernel cosine against mlx-lm is >0.9989 at
-    // every one of the 35 layers' taps (tests/parity/gemma4_mlx_taps.py +
-    // cosine_bisect.py --family gemma4); the argmax is what that buys.
-    expect(argmax == 236761, "and the argmax is mlx-lm's for the same checkpoint");
+    // every one of the 35 layers' taps at BOTH ends (tests/parity/
+    // gemma4_mlx_taps.py + cosine_bisect.py --family gemma4); the argmaxes are
+    // what that buys.
+    //
+    // Both are asserted because they cover different things. Position 0 is the
+    // one step with no RoPE and no KV to read, so it isolates the stack itself;
+    // position 7 is the one that has rotated queries and keys, seven cached
+    // positions, and a real key count.
+    if (default_prompt) {
+        expect(argmax_first == 236761, "the first step's argmax is mlx-lm's (position 0)");
+        expect(argmax == 3821, "and so is the eighth's, with seven positions of KV behind it");
+    }
 
     std::printf("\n==== gemma4_forward_test: %s ====\n",
                 failures == 0 ? "all passed" : "FAILURES");

@@ -85,6 +85,14 @@ def main():
         n = min(r.shape[0], m.shape[0])
         if row is not None:
             r, m = r[row:row + 1], m[row:row + 1]
+        elif r.shape[0] != m.shape[0]:
+            # A teacher-forced decode candidate has ONE row -- the step just
+            # run -- against a reference that ran the whole prompt at once. The
+            # rows that line up are the last of each; taking `[:n]` instead
+            # would compare the reference's FIRST position, which at position 0
+            # is the one place RoPE is the identity and so the one place this
+            # comparison proves nothing.
+            r, m = r[-1:], m[-1:]
         else:
             r, m = r[:n], m[:n]
         if r.shape[1] != m.shape[1]:
