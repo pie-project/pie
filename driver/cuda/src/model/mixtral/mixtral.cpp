@@ -487,6 +487,18 @@ void mixtral_forward_paged(
         const auto routing = build_routing(topk_idx_h, topk_w_h,
                                            N, top_k, num_experts);
 
+        // The router has spoken, and the dispatch below is a serial walk over
+        // what it chose. Tell the page cache the whole set now, so the reads
+        // for expert 7 are in flight while expert 0's GEMMs run.
+        if (layer.expert_cache != nullptr) {
+            for (int e = 0; e < num_experts; ++e) {
+                if (!routing.token_idx[e].empty()) {
+                    layer.expert_cache->prefetch(layer.expert_group,
+                                                 static_cast<std::uint32_t>(e));
+                }
+            }
+        }
+
         // Under TP every rank computes 1/T of every expert's down_proj.
         // Each scatter_add accumulates a *partial* contribution; we
         // collect those in ws.norm_x (zero-initialised), all-reduce after
@@ -524,7 +536,34 @@ void mixtral_forward_paged(
                 Ne, H, stream);
 
             // SwiGLU MLP.
-            const auto& expert = layer.experts[e];
+            //
+            // When the layer's experts are streamed, the resident entry holds
+            // only the biases; page this one in and read its weights and
+            // factors out of the slot. Everything else below is unchanged,
+            // because the slot holds exactly what one stride of the bank held
+            // -- the group's plan is the bank's expression with the expert
+            // axis fixed at one.
+            MixtralExpertWeights paged_in;
+            if (layer.expert_cache != nullptr) {
+                const WeightStore& slot = layer.expert_cache->ensure_resident(
+                    layer.expert_group, static_cast<std::uint32_t>(e), stream);
+                paged_in = layer.experts[e];
+                paged_in.w_gate_up = &slot.get("gate_up_proj.weight");
+                paged_in.w_gate_up_scale = &slot.get("gate_up_proj.weight_scale");
+                paged_in.w_down_packed = &slot.get("down_proj.weight");
+                paged_in.w_down_scale = &slot.get("down_proj.weight_scale");
+            }
+            const auto& expert = layer.expert_cache != nullptr
+                                     ? paged_in
+                                     : layer.experts[e];
+            // Unpin where the loop leaves, so the pin covers exactly the
+            // launches that read the slot and no more. A later page-in that
+            // wants this slot syncs `stream` before overwriting it, so nothing
+            // races with the kernels queued above.
+            struct Unpin {
+                GroupStreamCache* cache;
+                ~Unpin() { if (cache != nullptr) cache->end_batch(); }
+            } unpin{layer.expert_cache};
             const void* gate_w = nullptr;
             const void* up_w = nullptr;
             const void* down_w = nullptr;
