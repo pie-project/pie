@@ -62,41 +62,21 @@ void ForwardFn::invoke_prepare(AttentionWorkspace& aws,
     if (model) model->prepare(aws, in);
 }
 
-namespace {
-
-thread_local const model::AttentionObservation* g_attention_observation = nullptr;
-
-}  // namespace
-
-namespace model {
-
-const AttentionObservation* active_attention_observation() noexcept {
-    return g_attention_observation;
-}
-
-ScopedAttentionObservation::ScopedAttentionObservation(
-    const AttentionObservation* observation) noexcept
-    : previous_(g_attention_observation) {
-    g_attention_observation = observation;
-}
-
-ScopedAttentionObservation::~ScopedAttentionObservation() noexcept {
-    g_attention_observation = previous_;
-}
-
-}  // namespace model
-
 void ForwardFn::invoke_body(model::Workspace& ws,
                             KvCache& kv,
                             AttentionWorkspace& aws,
                             ops::CublasHandle& cublas,
                             const ForwardInputs& in) {
     if (model) {
-        model::ScopedStageHooks hooks(in.stage_hooks);
-        // Publish the fire's KV geometry for the duration of the body so an
-        // attention-stage PTIR program can score the cache it is about to
-        // attend over. Scoped to the body, so a stage hook can never observe a
-        // page table from a different fire.
+        if (in.stage_hooks == nullptr) {
+            model->body(ws, kv, aws, cublas, in);
+            return;
+        }
+        // Attach the fire's KV geometry to the hooks for the duration of the
+        // body so an attention-stage PTIR program can score the cache it is
+        // about to attend over. The observation rides on a body-local copy of
+        // the hooks — never ambient state — so a stage hook can only ever see
+        // the page table of the fire that invoked it.
         const model::AttentionObservation observation{
             .kv = &kv,
             .kv_page_indices_d = in.kv_page_indices_d,
@@ -108,9 +88,11 @@ void ForwardFn::invoke_body(model::Workspace& ws,
             .num_requests = in.num_requests,
             .total_tokens = in.total_tokens,
         };
-        model::ScopedAttentionObservation observed(
-            in.stage_hooks != nullptr ? &observation : nullptr);
-        model->body(ws, kv, aws, cublas, in);
+        model::StageHooks hooks = *in.stage_hooks;
+        hooks.observation = &observation;
+        ForwardInputs body_in = in;
+        body_in.stage_hooks = &hooks;
+        model->body(ws, kv, aws, cublas, body_in);
     }
 }
 

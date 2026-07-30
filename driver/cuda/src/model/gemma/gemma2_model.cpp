@@ -22,7 +22,8 @@ void Gemma2Model::body(Workspace& ws,
         in.kv_page_indptr_d, in.kv_last_page_lens_d,
         in.qo_indptr_h, in.kv_page_indptr_h,
         in.total_tokens, in.num_requests, in.is_pure_decode,
-        in.custom_mask_d, in.custom_mask_indptr_d);
+        in.custom_mask_d, in.custom_mask_indptr_d,
+        in.stage_hooks);
 }
 
 }  // namespace pie_cuda_driver::model

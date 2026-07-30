@@ -385,7 +385,8 @@ void attention_layer(
     const void* next_norm_w,
     float eps,
     cudaStream_t stream,
-    bool* produced_next_norm)
+    bool* produced_next_norm,
+    const StageHooks* hooks)
 {
     if (produced_next_norm != nullptr) *produced_next_norm = false;
     const int T = std::max(1, fwd_cfg.tp_size);
@@ -413,6 +414,7 @@ void attention_layer(
         // post-rope -- compares in the same space. Placing it on the raw
         // projection instead would silently mis-rank pages for Quest.
     invoke_stage_hook(
+        hooks,
         StageHookPoint::OnAttnProj, ws.q.data(),
         static_cast<std::uint32_t>(N),
         static_cast<std::uint32_t>(Hq),
@@ -466,6 +468,7 @@ void attention_layer(
             N, R, num_q_heads_local, attn_ws, stream);
     }
     invoke_stage_hook(
+        hooks,
         StageHookPoint::OnAttn, ws.q.data(),
         static_cast<std::uint32_t>(N),
         static_cast<std::uint32_t>(Hq),
@@ -1405,7 +1408,8 @@ void nemotron_h_forward_paged(
     const std::int32_t* slot_ids_d,
     const std::uint8_t* is_fresh_d,
     const std::int32_t* logit_row_indices_d,
-    int num_logit_rows)
+    int num_logit_rows,
+    const StageHooks* hooks)
 {
     const int H = cfg.hidden_size;
     const int V = cfg.vocab_size;
@@ -1474,7 +1478,7 @@ void nemotron_h_forward_paged(
                     static_cast<int>(li),
                     N, R, is_pure_decode, row_valid_d,
                     custom_mask_d, custom_mask_indptr_d,
-                    next_norm_w, eps, stream, &produced_next_norm);
+                    next_norm_w, eps, stream, &produced_next_norm, hooks);
             });
         } else {
             ++profile.moe_layers;

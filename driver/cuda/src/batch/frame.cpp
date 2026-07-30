@@ -2299,7 +2299,8 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
             std::uint32_t query_columns,
             std::uint32_t layer,
             cudaStream_t stream,
-            bool query_is_f32) {
+            bool query_is_f32,
+            const model::StageHookSideband& sideband) {
             auto& context =
                 *static_cast<StageHookContext*>(opaque);
             context.dispatch->execute_attention_phase(
@@ -2310,7 +2311,8 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
                 query_columns,
                 layer,
                 stream,
-                query_is_f32);
+                query_is_f32,
+                sideband);
         },
     };
     run_forward_dispatch(

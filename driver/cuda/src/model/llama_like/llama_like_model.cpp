@@ -71,7 +71,9 @@ void LlamaLikeModel::body(Workspace& ws,
         in.logit_row_indices_d, in.num_logit_rows,
         in.custom_mask_d, in.custom_mask_indptr_d,
         in.w_page_d, in.w_off_d, in.row_valid_d, in.has_write_desc,
-        in.runtime_window_left);
+        in.runtime_window_left,
+        /*vision=*/nullptr,
+        in.stage_hooks);
 }
 
 std::uint32_t LlamaLikeModel::graph_layout() {

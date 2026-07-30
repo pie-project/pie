@@ -46,21 +46,7 @@ struct AttentionScores {
 // is strictly more evidence, averaged.
 std::uint32_t default_attn_score_window() noexcept;
 
-// Null unless a model body is inside an `OnAttn` hook for a layer whose scores
-// were captured.
-const AttentionScores* active_attention_scores() noexcept;
-
-class ScopedAttentionScores {
-  public:
-    explicit ScopedAttentionScores(const AttentionScores* scores) noexcept;
-    ~ScopedAttentionScores() noexcept;
-
-    ScopedAttentionScores(const ScopedAttentionScores&) = delete;
-    ScopedAttentionScores& operator=(const ScopedAttentionScores&) = delete;
-
-  private:
-    const AttentionScores* previous_ = nullptr;
-};
+struct StageHooks;
 
 namespace detail {
 
@@ -97,7 +83,7 @@ struct ScoreBuffers {
 // model family therefore pays nothing when no program observes scores, and the
 // call site reads as a plain substitution of one attention dispatch for another:
 //
-//     model::LayerScoreCapture capture(L, num_q_heads, stream);
+//     model::LayerScoreCapture capture(hooks, L, num_q_heads, stream);
 //     if (capture.active()) {
 //         ops::dispatch_attention_flashinfer_decode_capture(
 //             ..., capture.raw(), capture.indptr_d(), ...);
@@ -105,8 +91,9 @@ struct ScoreBuffers {
 //     } else {
 //         ops::dispatch_attention_flashinfer_decode(...);
 //     }
+//     invoke_stage_hook(hooks, OnAttn, ..., {.scores = capture.scores()});
 //
-// The publication lives until the object is destroyed, which must be after the
+// The payload lives until the object is destroyed, which must be after the
 // layer's `OnAttn` hook has run.
 class LayerScoreCapture {
   public:
@@ -116,6 +103,7 @@ class LayerScoreCapture {
     // describe all of it, so a windowed layer passes false and the PTIR side
     // then fails loudly instead of ranking positions the kernel never scored.
     LayerScoreCapture(
+        const StageHooks* hooks,
         std::uint32_t layer,
         std::uint32_t num_q_heads,
         bool capturable,
@@ -129,12 +117,18 @@ class LayerScoreCapture {
     float* raw() const noexcept { return buf_.raw; }
     const std::int32_t* indptr_d() const noexcept { return buf_.indptr_d; }
 
-    // Fold heads and publish. `page_size` and the two CSR arrays must be the
-    // ones the capture dispatch itself was given.
+    // Fold heads and finalise the payload. `page_size` and the two CSR arrays
+    // must be the ones the capture dispatch itself was given.
     void publish(
         const std::uint32_t* kv_page_indptr_d,
         const std::uint32_t* kv_last_page_lens_d,
         int page_size);
+
+    // The published payload, for the layer's `OnAttn` sideband; null until
+    // `publish()` ran.
+    const AttentionScores* scores() const noexcept {
+        return published_ ? &payload_ : nullptr;
+    }
 
   private:
     void release() noexcept;
@@ -145,6 +139,10 @@ class LayerScoreCapture {
     std::uint32_t layer_ = 0;
     std::uint32_t num_q_heads_ = 0;
 
+    // Borrowed from the constructor; outlives the capture (the fire's hooks
+    // bracket the whole body).
+    const StageHooks* hooks_ = nullptr;
+
     detail::ScoreBuffers buf_{};
 
     // `raw` element offsets (host), `num_requests + 1`; the folded offsets are
@@ -152,7 +150,6 @@ class LayerScoreCapture {
     const std::uint32_t* folded_offsets_h_ = nullptr;
 
     AttentionScores payload_{};
-    ScopedAttentionScores* binding_ = nullptr;
 };
 
 // RAII capture of one layer's PREFILL scores -- SnapKV's observation window.
@@ -178,6 +175,7 @@ class LayerScoreCapture {
 class LayerPrefillScoreCapture {
   public:
     LayerPrefillScoreCapture(
+        const StageHooks* hooks,
         std::uint32_t layer,
         std::uint32_t num_q_heads,
         std::uint32_t window,
@@ -195,11 +193,15 @@ class LayerPrefillScoreCapture {
     const std::int32_t* indptr_d() const noexcept { return buf_.indptr_d; }
     int window() const noexcept { return static_cast<int>(window_); }
 
-    // Bind the folded row for the layer's `OnAttn` hook. Unlike the decode
-    // capture this launches nothing: normalisation and folding are part of the
-    // capture dispatch, because the causal limit of each window row is only
-    // derivable there.
+    // Finalise the folded row for the layer's `OnAttn` sideband. Unlike the
+    // decode capture this launches nothing: normalisation and folding are part
+    // of the capture dispatch, because the causal limit of each window row is
+    // only derivable there.
     void publish();
+
+    const AttentionScores* scores() const noexcept {
+        return published_ ? &payload_ : nullptr;
+    }
 
   private:
     void release() noexcept;
@@ -216,7 +218,6 @@ class LayerPrefillScoreCapture {
     const std::uint32_t* folded_offsets_h_ = nullptr;
 
     AttentionScores payload_{};
-    ScopedAttentionScores* binding_ = nullptr;
 };
 
 }  // namespace model

@@ -6,30 +6,15 @@
 
 #include "kernels/page_compact.hpp"
 #include "model/attn_observation.hpp"
+#include "model/stage_hooks.hpp"
 
 namespace pie_cuda_driver::model {
-namespace {
 
-thread_local AttentionMaskSink* g_mask_sink = nullptr;
-
-}  // namespace
-
-AttentionMaskSink* active_attention_mask_sink() noexcept { return g_mask_sink; }
-
-ScopedAttentionMaskSink::ScopedAttentionMaskSink(AttentionMaskSink* sink) noexcept
-    : previous_(g_mask_sink) {
-    g_mask_sink = sink;
-}
-
-ScopedAttentionMaskSink::~ScopedAttentionMaskSink() noexcept {
-    g_mask_sink = previous_;
-}
-
-FirePageMask::FirePageMask(bool wanted, cudaStream_t stream)
+FirePageMask::FirePageMask(const StageHooks* hooks, cudaStream_t stream)
     : stream_(stream) {
-    if (!wanted) return;
+    if (hooks == nullptr || !hooks->wants_page_mask) return;
 
-    const AttentionObservation* obs = active_attention_observation();
+    const AttentionObservation* obs = hooks->observation;
     if (obs == nullptr || !obs->usable()) {
         throw std::runtime_error(
             "attn_page_mask needs a fire with kv geometry");
@@ -102,21 +87,6 @@ FirePageMask::FirePageMask(bool wanted, cudaStream_t stream)
     sink_.num_requests = requests;
     sink_.stride = stride;
     sink_.written_layer = -1;
-
-    binding_ = new (std::nothrow) ScopedAttentionMaskSink(&sink_);
-    if (binding_ == nullptr) {
-        cudaFreeAsync(keep, stream);
-        cudaFreeAsync(out_indices_, stream);
-        cudaFreeAsync(out_indptr_, stream);
-        cudaFreeAsync(out_last_lens_, stream);
-        cudaFreeAsync(counts_, stream);
-        sink_ = AttentionMaskSink{};
-        out_indices_ = nullptr;
-        out_indptr_ = nullptr;
-        out_last_lens_ = nullptr;
-        throw std::runtime_error(
-            "attn_page_mask could not publish its destination");
-    }
     active_ = true;
 }
 
@@ -152,8 +122,6 @@ void FirePageMask::compact(
 }
 
 FirePageMask::~FirePageMask() {
-    delete binding_;
-    binding_ = nullptr;
     if (sink_.keep != nullptr) cudaFreeAsync(sink_.keep, stream_);
     if (out_indices_ != nullptr) cudaFreeAsync(out_indices_, stream_);
     if (out_indptr_ != nullptr) cudaFreeAsync(out_indptr_, stream_);

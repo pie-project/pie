@@ -56,6 +56,8 @@ struct PrecomputedEmbeddingInputs;
 
 namespace pie_cuda_driver::model {
 
+struct StageHooks;
+
 struct Gemma4LayerWeights {
     // Four RMSNorms — same placement as Gemma-2/3.
     const DeviceTensor* attn_norm_pre  = nullptr;  // input_layernorm
@@ -408,7 +410,10 @@ void gemma4_forward_paged(
     // Multimodal: encode + scatter audio soft tokens after the embed step.
     // nullptr / 0 clips for non-audio passes. See gemma4_audio_forward.hpp.
     const Gemma4AudioInputs* audio_in = nullptr,
-    const ::pie_cuda_driver::PrecomputedEmbeddingInputs* precomputed_embeddings = nullptr);
+    const ::pie_cuda_driver::PrecomputedEmbeddingInputs* precomputed_embeddings = nullptr,
+    // The fire's stage hooks (`ForwardInputs::stage_hooks`). Null = no
+    // program attached; hook-conditional paths fold to their fast form.
+    const StageHooks* hooks = nullptr);
 
 // Gemma4 MoE workspace byte budget. Returns 0 if the config has no MoE
 // block configured.

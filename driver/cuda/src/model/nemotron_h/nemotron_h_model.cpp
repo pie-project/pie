@@ -73,7 +73,8 @@ void NemotronHModel::body(Workspace& ws,
         in.row_valid_d,
         in.custom_mask_d, in.custom_mask_indptr_d,
         in.slot_ids_h, in.is_fresh_h, in.slot_ids_d, in.is_fresh_d,
-        in.logit_row_indices_d, in.num_logit_rows);
+        in.logit_row_indices_d, in.num_logit_rows,
+        in.stage_hooks);
 }
 
 std::uint32_t NemotronHModel::graph_layout() {

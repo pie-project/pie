@@ -16,8 +16,6 @@ namespace model {
 
 namespace {
 
-thread_local const AttentionScores* g_attention_scores = nullptr;
-
 // Per-fire scratch for the ragged CSR. A `thread_local` vector rather than a
 // fresh allocation per layer: the geometry is identical for every layer of a
 // fire, and the host CSR has to outlive the hook that reads it.
@@ -128,27 +126,14 @@ std::uint32_t default_attn_score_window() noexcept {
     return value;
 }
 
-const AttentionScores* active_attention_scores() noexcept {
-    return g_attention_scores;
-}
-
-ScopedAttentionScores::ScopedAttentionScores(
-    const AttentionScores* scores) noexcept
-    : previous_(g_attention_scores) {
-    g_attention_scores = scores;
-}
-
-ScopedAttentionScores::~ScopedAttentionScores() noexcept {
-    g_attention_scores = previous_;
-}
-
 LayerScoreCapture::LayerScoreCapture(
+    const StageHooks* hooks,
     std::uint32_t layer,
     std::uint32_t num_q_heads,
     bool capturable,
     cudaStream_t stream) noexcept
-    : stream_(stream), layer_(layer), num_q_heads_(num_q_heads) {
-    const StageHooks* hooks = active_stage_hooks;
+    : stream_(stream), layer_(layer), num_q_heads_(num_q_heads),
+      hooks_(hooks) {
     if (hooks == nullptr || !hooks->wants_attn_score || !capturable ||
         num_q_heads == 0) {
         return;
@@ -164,7 +149,7 @@ LayerScoreCapture::LayerScoreCapture(
             "supported; the inner capture is disabled\n");
         return;
     }
-    const AttentionObservation* obs = active_attention_observation();
+    const AttentionObservation* obs = hooks->observation;
     if (obs == nullptr || !obs->usable()) {
         return;
     }
@@ -219,7 +204,8 @@ void LayerScoreCapture::publish(
     const std::uint32_t* kv_last_page_lens_d,
     int page_size) {
     if (!active_ || published_) return;
-    const AttentionObservation* obs = active_attention_observation();
+    const AttentionObservation* obs =
+        hooks_ != nullptr ? hooks_->observation : nullptr;
     if (obs == nullptr || !obs->usable()) {
         throw std::runtime_error(
             "attention score capture lost its fire geometry mid-layer");
@@ -235,12 +221,7 @@ void LayerScoreCapture::publish(
         .num_requests = static_cast<std::uint32_t>(obs->num_requests),
         .layer = layer_,
     };
-    binding_ = new (std::nothrow) ScopedAttentionScores(&payload_);
-    published_ = binding_ != nullptr;
-    if (!published_) {
-        throw std::runtime_error(
-            "attention score capture could not publish its payload");
-    }
+    published_ = true;
 }
 
 void LayerScoreCapture::release() noexcept {
@@ -250,8 +231,6 @@ void LayerScoreCapture::release() noexcept {
 }
 
 LayerScoreCapture::~LayerScoreCapture() {
-    delete binding_;
-    binding_ = nullptr;
     published_ = false;
     release();
 }
@@ -273,6 +252,7 @@ thread_local int g_pf_capture_depth = 0;
 }  // namespace
 
 LayerPrefillScoreCapture::LayerPrefillScoreCapture(
+    const StageHooks* hooks,
     std::uint32_t layer,
     std::uint32_t num_q_heads,
     std::uint32_t window,
@@ -280,7 +260,6 @@ LayerPrefillScoreCapture::LayerPrefillScoreCapture(
     cudaStream_t stream) noexcept
     : stream_(stream), layer_(layer), num_q_heads_(num_q_heads),
       window_(window) {
-    const StageHooks* hooks = active_stage_hooks;
     if (hooks == nullptr || !hooks->wants_attn_score || !capturable ||
         num_q_heads == 0 || window == 0) {
         return;
@@ -292,7 +271,7 @@ LayerPrefillScoreCapture::LayerPrefillScoreCapture(
             "supported; the inner capture is disabled\n");
         return;
     }
-    const AttentionObservation* obs = active_attention_observation();
+    const AttentionObservation* obs = hooks->observation;
     if (obs == nullptr || !obs->usable()) {
         return;
     }
@@ -356,12 +335,7 @@ void LayerPrefillScoreCapture::publish() {
         .num_requests = num_requests_,
         .layer = layer_,
     };
-    binding_ = new (std::nothrow) ScopedAttentionScores(&payload_);
-    published_ = binding_ != nullptr;
-    if (!published_) {
-        throw std::runtime_error(
-            "prefill score capture could not publish its payload");
-    }
+    published_ = true;
 }
 
 void LayerPrefillScoreCapture::release() noexcept {
@@ -371,8 +345,6 @@ void LayerPrefillScoreCapture::release() noexcept {
 }
 
 LayerPrefillScoreCapture::~LayerPrefillScoreCapture() {
-    delete binding_;
-    binding_ = nullptr;
     published_ = false;
     release();
 }

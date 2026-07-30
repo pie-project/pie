@@ -284,7 +284,8 @@ void dsv4_forward_paged(
     bool is_pure_decode,
     const std::uint8_t* row_valid_d,
     const std::int32_t* logit_row_indices_d,
-    int num_logit_rows)
+    int num_logit_rows,
+    const StageHooks* hooks)
 {
     const int N = total_tokens;
     const int H = cfg.hidden_size;
@@ -653,6 +654,7 @@ void dsv4_forward_paged(
         act_dump_bf16(act_dump_layer_tag("q_b", li).c_str(),
             ws.q.data(), N, num_heads * head_dim, stream);
         invoke_stage_hook(
+            hooks,
             StageHookPoint::OnAttnProj, ws.q.data(),
             static_cast<std::uint32_t>(N),
             static_cast<std::uint32_t>(num_heads * head_dim),
@@ -830,6 +832,7 @@ void dsv4_forward_paged(
                     N, num_heads, head_dim, stream);
             }
             invoke_stage_hook(
+                hooks,
                 StageHookPoint::OnAttn, ws.q.data(),
                 static_cast<std::uint32_t>(N),
                 static_cast<std::uint32_t>(num_heads * head_dim),

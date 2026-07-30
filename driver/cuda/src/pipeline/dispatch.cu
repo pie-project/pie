@@ -3732,9 +3732,9 @@ GroupedLaneEnvelope resolve_lane_envelope(
     const StagedLane& lane,
     const float* query_base,
     std::uint32_t query_columns,
-    std::uint32_t layer) {
-    const model::AttentionObservation* obs =
-        model::active_attention_observation();
+    std::uint32_t layer,
+    const model::StageHookSideband& sideband) {
+    const model::AttentionObservation* obs = sideband.observation;
     if (obs == nullptr || !obs->usable()) {
         throw std::runtime_error(
             "envelope_dot ran outside a model body with kv geometry");
@@ -3845,14 +3845,14 @@ GroupedLaneEnvelope resolve_lane_envelope(
 // "keep everything" before each layer's hook.
 GroupedLanePageMask resolve_lane_page_mask(
     const StagedLane& lane,
-    std::uint32_t layer) {
-    model::AttentionMaskSink* sink = model::active_attention_mask_sink();
+    std::uint32_t layer,
+    const model::StageHookSideband& sideband) {
+    model::AttentionMaskSink* sink = sideband.mask_sink;
     if (sink == nullptr || !sink->usable()) {
         throw std::runtime_error(
             "attn_page_mask ran on a fire with no page-mask destination");
     }
-    const model::AttentionObservation* obs =
-        model::active_attention_observation();
+    const model::AttentionObservation* obs = sideband.observation;
     if (obs == nullptr || !obs->usable()) {
         throw std::runtime_error(
             "attn_page_mask ran outside a model body with kv geometry");
@@ -3897,8 +3897,9 @@ const float* resolve_lane_attn_score(
     std::uint32_t layer,
     std::uint64_t declared_kv_max,
     cudaStream_t stream,
-    std::vector<void*>& temporaries) {
-    const model::AttentionScores* scores = model::active_attention_scores();
+    std::vector<void*>& temporaries,
+    const model::StageHookSideband& sideband) {
+    const model::AttentionScores* scores = sideband.scores;
     if (scores == nullptr || !scores->usable()) {
         throw std::runtime_error(
             "attn_score ran on a fire that captured no attention scores");
@@ -3907,8 +3908,7 @@ const float* resolve_lane_attn_score(
         throw std::runtime_error(
             "attn_score saw a capture from a different layer");
     }
-    const model::AttentionObservation* obs =
-        model::active_attention_observation();
+    const model::AttentionObservation* obs = sideband.observation;
     if (obs == nullptr || !obs->usable()) {
         throw std::runtime_error(
             "attn_score ran outside a model body with kv geometry");
@@ -4021,6 +4021,7 @@ void execute_declared_phase(
     std::uint32_t query_columns,
     std::uint32_t layer,
     cudaStream_t stream,
+    const model::StageHookSideband& sideband = {},
     Dispatch::FinishBreakdown* breakdown = nullptr) {
     const bool probing = breakdown != nullptr;
     std::int64_t assemble_total = 0;
@@ -4140,10 +4141,11 @@ void execute_declared_phase(
                 query_base, query_columns, launch.device_layer);
             if (stage_calls_kernel(stage, "envelope_dot")) {
                 binding.envelope = resolve_lane_envelope(
-                    lane, query_base, query_columns, layer);
+                    lane, query_base, query_columns, layer, sideband);
             }
             if (stage_calls_sink(stage, "attn_page_mask")) {
-                binding.page_mask = resolve_lane_page_mask(lane, layer);
+                binding.page_mask =
+                    resolve_lane_page_mask(lane, layer, sideband);
             }
             std::uint64_t attn_score_kv_max = 0;
             std::uint32_t value_base = 0;
@@ -4183,7 +4185,7 @@ void execute_declared_phase(
             if (attn_score_kv_max != 0) {
                 binding.attn_score_base = resolve_lane_attn_score(
                     lane, layer, attn_score_kv_max, stream,
-                    phase_temporaries.pointers);
+                    phase_temporaries.pointers, sideband);
             }
             tasks.push_back(Task{
                 .lane = &lane,
@@ -4818,7 +4820,8 @@ void Dispatch::execute_attention_phase(
     std::uint32_t query_columns,
     std::uint32_t layer,
     cudaStream_t stream,
-    bool query_is_f32) {
+    bool query_is_f32,
+    const model::StageHookSideband& sideband) {
     if (phase != PTIR_STAGE_ON_ATTN_PROJ &&
         phase != PTIR_STAGE_ON_ATTN) {
         throw std::runtime_error("model hook invoked a non-attention PTIR phase");
@@ -4860,7 +4863,7 @@ void Dispatch::execute_attention_phase(
     try {
         execute_declared_phase(
             state, phase, nullptr, 0, query_f32,
-            query_rows, query_columns, layer, stream);
+            query_rows, query_columns, layer, stream, sideband);
     } catch (...) {
         if (query_f32 != nullptr && !query_is_f32) {
             cudaFreeAsync(query_f32, stream);
@@ -5005,6 +5008,7 @@ bool Dispatch::finish(
             0,
             0,
             stream,
+            /*sideband=*/{},
             trace_fire_timing ? breakdown : nullptr);
     } catch (...) {
         state.failed = true;

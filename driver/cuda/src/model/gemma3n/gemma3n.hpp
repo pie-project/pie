@@ -55,6 +55,8 @@
 
 namespace pie_cuda_driver::model {
 
+struct StageHooks;
+
 struct Gemma3nLayerWeights {
     // Standard pre-norm + post-norm RMSNorms (Gemma-2/3/4 placement).
     const DeviceTensor* attn_norm_pre  = nullptr;  // input_layernorm
@@ -170,6 +172,9 @@ void gemma3n_forward_paged(
     int num_requests,
     bool is_pure_decode,
     const std::uint8_t* custom_mask_d = nullptr,
-    const std::int32_t* custom_mask_indptr_d = nullptr);
+    const std::int32_t* custom_mask_indptr_d = nullptr,
+    // The fire's stage hooks (`ForwardInputs::stage_hooks`). Null = no
+    // program attached.
+    const StageHooks* hooks = nullptr);
 
 }  // namespace pie_cuda_driver::model

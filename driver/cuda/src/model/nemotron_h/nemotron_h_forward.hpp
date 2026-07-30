@@ -14,6 +14,8 @@
 
 namespace pie_cuda_driver::model {
 
+struct StageHooks;
+
 struct NemotronHWorkspace {
     DeviceBuffer<std::uint16_t> mamba_projected;
     DeviceBuffer<std::uint16_t> mamba_gate;
@@ -105,6 +107,9 @@ void nemotron_h_forward_paged(
     const std::int32_t* slot_ids_d,
     const std::uint8_t* is_fresh_d,
     const std::int32_t* logit_row_indices_d,
-    int num_logit_rows);
+    int num_logit_rows,
+    // The fire's stage hooks (`ForwardInputs::stage_hooks`). Null = no
+    // program attached.
+    const StageHooks* hooks = nullptr);
 
 }  // namespace pie_cuda_driver::model

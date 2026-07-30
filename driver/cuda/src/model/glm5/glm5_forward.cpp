@@ -269,7 +269,8 @@ void glm5_forward_paged(
     bool is_pure_decode,
     const std::uint8_t* row_valid_d,
     const std::int32_t* logit_row_indices_d,
-    int num_logit_rows)
+    int num_logit_rows,
+    const StageHooks* hooks)
 {
     (void)qo_indptr_h;
     (void)kv_page_indptr_h;
@@ -378,6 +379,7 @@ void glm5_forward_paged(
             make_weight_view(Lw.q_b_proj, Lw.q_b_proj_quant),
             ws.q_b.data(), total_tokens, heads * (q_nope + q_rope), q_lora);
         invoke_stage_hook(
+            hooks,
             StageHookPoint::OnAttnProj, ws.q_b.data(),
             static_cast<std::uint32_t>(total_tokens),
             static_cast<std::uint32_t>(heads * (q_nope + q_rope)),
@@ -486,6 +488,7 @@ void glm5_forward_paged(
             ws.attn_v.data(),
             total_tokens, heads, q_nope, v_dim, kv_lora);
         invoke_stage_hook(
+            hooks,
             StageHookPoint::OnAttn, ws.q_b.data(),
             static_cast<std::uint32_t>(total_tokens),
             static_cast<std::uint32_t>(heads * (q_nope + q_rope)),

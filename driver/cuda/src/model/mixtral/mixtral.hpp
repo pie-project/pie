@@ -28,6 +28,8 @@
 
 namespace pie_cuda_driver::model {
 
+struct StageHooks;
+
 enum class MixtralExpertWeightFormat {
     Bf16,
     Mxfp4RoutedDequant,
@@ -164,6 +166,9 @@ void mixtral_forward_paged(
     int num_logit_rows = 0,
     const std::uint8_t* custom_mask_d = nullptr,
     const std::int32_t* custom_mask_indptr_d = nullptr,
-    const std::uint8_t* row_valid_d = nullptr);
+    const std::uint8_t* row_valid_d = nullptr,
+    // The fire's stage hooks (`ForwardInputs::stage_hooks`). Null = no
+    // program attached.
+    const StageHooks* hooks = nullptr);
 
 }  // namespace pie_cuda_driver::model

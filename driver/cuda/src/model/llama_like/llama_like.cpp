@@ -331,7 +331,8 @@ void llama_like_forward_paged(
     const std::uint8_t* row_valid_d,
     bool has_write_desc,
     int runtime_window_left,
-    const LlamaLikeVisionInputs* vision)
+    const LlamaLikeVisionInputs* vision,
+    const StageHooks* hooks)
 {
     // Tensor-parallel local dims. tp_size == 1 reverts to single-GPU
     // shapes; the local *_local fields just shadow the unsharded value.
@@ -449,9 +450,7 @@ void llama_like_forward_paged(
     // constructor is where a fire that cannot safely honour a mask is refused
     // -- loudly, before any layer runs, rather than by quietly attending over
     // the wrong pages.
-    const model::StageHooks* fire_hooks = model::active_stage_hooks;
-    model::FirePageMask page_mask(
-        fire_hooks != nullptr && fire_hooks->wants_page_mask, stream);
+    model::FirePageMask page_mask(hooks, stream);
 
     const bool post_norm = fwd_cfg.norm_placement == NormPlacement::Post;
     bool have_next_attn_norm = false;
@@ -491,7 +490,7 @@ void llama_like_forward_paged(
                                    !ws.qkv_fused.empty();
         const bool fused_decode_qkv_post =
             use_fused_qkv &&
-            active_stage_hooks == nullptr &&
+            hooks == nullptr &&
             decode_fused_post_enabled() &&
             is_pure_decode &&
             !has_custom_mask &&
@@ -630,12 +629,15 @@ void llama_like_forward_paged(
         page_mask.begin_layer(stream);
 
         invoke_stage_hook(
+            hooks,
             StageHookPoint::OnAttnProj,
             ws.q.data(),
             static_cast<std::uint32_t>(N),
             static_cast<std::uint32_t>(Hq),
             static_cast<std::uint32_t>(L),
-            stream);
+            stream,
+            /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
 
         // Pad Q/K/V to `dk` when the model's head_dim isn't a flashinfer
         // dispatch value. The padded buffers are zero on the trailing
@@ -749,11 +751,13 @@ void llama_like_forward_paged(
         const bool prefill_capture_eligible =
             use_prefill_score_path && layer_window_left < 0;
         model::LayerScoreCapture score_capture(
+            hooks,
             static_cast<std::uint32_t>(L),
             static_cast<std::uint32_t>(num_q_heads_local),
             /*capturable=*/layer_window_left < 0 && !prefill_capture_eligible,
             stream);
         model::LayerPrefillScoreCapture prefill_score_capture(
+            hooks,
             static_cast<std::uint32_t>(L),
             static_cast<std::uint32_t>(num_q_heads_local),
             plan_state.prefill_score_window,
@@ -845,12 +849,17 @@ void llama_like_forward_paged(
                 /*logits_soft_cap=*/0.f, sm_scale_override);
         }
         invoke_stage_hook(
+            hooks,
             StageHookPoint::OnAttn,
             ws.q.data(),
             static_cast<std::uint32_t>(N),
             static_cast<std::uint32_t>(Hq),
             static_cast<std::uint32_t>(L),
-            stream);
+            stream,
+            /*query_is_f32=*/false,
+            {.scores = score_capture.scores() != nullptr
+                           ? score_capture.scores()
+                           : prefill_score_capture.scores()});
 
         // Strip the trailing pad cols off the attention output before
         // it feeds the o_proj GEMM (which expects `[N, num_q*head_dim]`,

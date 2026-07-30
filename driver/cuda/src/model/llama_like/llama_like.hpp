@@ -26,6 +26,8 @@
 
 namespace pie_cuda_driver::model {
 
+struct StageHooks;
+
 enum class RopeKind {
     Standard,      // pure theta-based, used by Qwen 2/3, Phi-3, Mistral
     YaRN,          // Llama-3 smoothed-interpolation YaRN
@@ -205,7 +207,11 @@ void llama_like_forward_paged(
     bool has_write_desc = false,
     int runtime_window_left = -2,
     // Qwen3-VL multimodal side-inputs (nullptr = plain text forward).
-    const LlamaLikeVisionInputs* vision = nullptr);
+    const LlamaLikeVisionInputs* vision = nullptr,
+    // The fire's stage hooks (`ForwardInputs::stage_hooks`, observation
+    // attached by `invoke_body`). Null = no program attached, and every
+    // hook-conditional path in the body then folds to its fast form.
+    const StageHooks* hooks = nullptr);
 
 // Map HF's rope_scaling_kind enum onto the driver's RopeKind. Llama3-style
 // frequency scaling maps to YaRN; the "original_yarn" branch keeps

@@ -29,6 +29,8 @@
 
 #include "pie_native/fire/fire_geometry.hpp"
 
+#include "model/stage_hooks.hpp"
+
 namespace pie_cuda_driver::pipeline {
 
 // Shared pure-host PTIR decode model (trace/op-table/container/bound/
@@ -222,6 +224,11 @@ class Dispatch {
         const pie_native::LaunchView& resolved_view,
         std::span<const std::uint32_t> program_token_starts);
 
+    // `sideband` carries what the model body published for exactly this hook
+    // invocation — the fire's KV geometry, the layer's captured scores, the
+    // page-mask destination. An empty sideband is "the body published
+    // nothing", and a program that then names the corresponding intrinsic
+    // fails loudly in the lane resolvers.
     void execute_attention_phase(
         StagedLaunch& launch,
         std::uint8_t phase,
@@ -230,7 +237,8 @@ class Dispatch {
         std::uint32_t query_columns,
         std::uint32_t layer,
         cudaStream_t stream,
-        bool query_is_f32 = false);
+        bool query_is_f32 = false,
+        const model::StageHookSideband& sideband = {});
 
     // Fire-timing sub-breakdown of `finish` (microseconds; -1 = not
     // measured): per-lane epilogue kernel enqueue, settlement-mutex
