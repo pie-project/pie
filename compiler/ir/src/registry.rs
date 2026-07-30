@@ -133,15 +133,24 @@ crate::declare_tagged_enum! {
         // device-resident, so it comes back not as something the guest states
         // but as something the device writes and the host reads as an upper
         // bound. `FireGeometry::rs_buffer_lens` is already staged for it.
+        /// RESERVED. The buffer's page pool. Derived by the runtime.
         RsBufferPages = 10, "rs_buffer_pages";
+        /// RESERVED. Row offsets splitting `rs_buffer_pages` per request.
+        /// Derived by the runtime.
         RsBufferIndptr = 11, "rs_buffer_indptr";
+        /// RESERVED, and inverting: the live buffered token count, which t15
+        /// makes device-resident. Staged as `FireGeometry::rs_buffer_lens`.
         RsBufferLen = 12, "rs_buffer_len";
+        /// RESERVED. Each buffered token's slab. Derived by the runtime.
         RsWSlot = 13, "rs_w_slot";
+        /// RESERVED. Each buffered token's offset within its slab. Derived by
+        /// the runtime.
         RsWOff = 14, "rs_w_off";
-        // How far the folded boundary advances, per request. Unlike 10-14 this
-        // is a real guest decision, and the only RS port whose value the host
-        // is allowed not to know: a device-computed accepted count reaches the
-        // recurrence through here instead of round-tripping through the host.
+        /// How far the folded boundary advances, per request. Unlike 10-14
+        /// this is a real guest decision, and the only RS port whose value the
+        /// host is allowed not to know: a device-computed accepted count
+        /// reaches the recurrence through here instead of round-tripping
+        /// through the host. Read.
         RsFoldLen = 15, "rs_fold_len";
     }
 }
