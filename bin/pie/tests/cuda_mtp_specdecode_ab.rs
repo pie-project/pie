@@ -1,28 +1,35 @@
-//! **(b) device-resident MTP spec-decode A/B** (charlie) — the accepted-tok/s
-//! value-verify of the drafts-channel swap on the REAL 4090 + Qwen3.5-0.8B:
+//! **Two independent `forward-hybrid` spec-decoders, run back to back** on the
+//! REAL 4090 + Qwen3.5-0.8B:
 //!
-//!   A = `mtp-specdecode`     (device-resident: drafts read via the `MtpDrafts`
-//!                             intrinsic — charlie's CUDA source-select — + the
-//!                             `[k+1]` `[seed, drafts]` window retained/injected
-//!                             by `carrier::next_inputs_drafts`; out[0]-only host
-//!                             read, partial-residency n_acc)
-//!   B = `mtp-native-verify`  (baseline: host round-trips out[1] drafts → submits
-//!                             them as the next `draft` operand every step)
+//!   A = `mtp-specdecode`     B = `mtp-native-verify` (host mode)
 //!
-//! Both run the SAME prompt + k on the SAME booted model; the drafts channel is
-//! the only difference. VALUE signal = `mean_accept` (A must MATCH B — the
-//! device-resident drafts feed the verify identically to the host round-trip).
-//! PERF signal = decode wall-time per step (A avoids the host `[k]`-drafts
-//! round-trip → ≥ B tok/s). The `MtpDrafts` source-select firing correctly is
-//! proven by A producing the SAME acceptance as B with zero host draft submits.
+//! This began as a device-resident A/B: A was to read its drafts through a
+//! `Binding::MtpDrafts` intrinsic plus a `carrier::next_inputs_drafts`
+//! retain/inject command, so the `[k]` drafts never round-tripped through the
+//! host. Both halves of that capability were REMOVED in the ptir refactor, so A
+//! and B are now the SAME algorithm reached through two independently written
+//! call sites. The decode times printed below are therefore NOT a
+//! device-residency signal — A runs first and absorbs warm-up — and must not be
+//! read as a delta. Do not restore the "device-resident is faster" claim without
+//! restoring the intrinsic.
 //!
-//! ⚠️ GPU-only (the `MtpLogits`/`MtpDrafts` intrinsics are disabled in the mock
-//! profile) + the known FLA commit-advance fold (rs_cache T1 xfail) may glitch
-//! absolute decode values until bravo's fix — but the A-vs-B DELTA is the signal.
+//! What the pair is still worth, and why it is kept:
 //!
-//! `#[ignore]`, driver-cuda + ptir. Run:
-//!   PIE_MTP_DRAFT_TOKENS=4 PIE_COMPILER_LAUNCHER=env cargo test -p pie-bin \
-//!     --features driver-cuda,ptir --test cuda_mtp_specdecode_ab -- --ignored --nocapture
+//!   * **Trajectory equality.** Both decoders drive the same fold-behind +
+//!     `discard-buffered` boundary from independently written inferlet code, so
+//!     a boundary regression that flips one and not the other surfaces as a
+//!     divergence in `committed` / `accepted_lengths`. That is a sharper signal
+//!     than either inferlet alone can give.
+//!   * **A second `pie:inferlet/forward-hybrid` client.** `mtp-specdecode` used
+//!     to build through the generic `pie:inferlet/forward`, which the host now
+//!     refuses on a model with a folded recurrent state; it was ported with the
+//!     interface split.
+//!
+//! ⚠️ GPU-only (the `MtpLogits` intrinsic is disabled in the mock profile).
+//!
+//! `#[ignore]`, driver-cuda. Run:
+//!   PIE_MTP_DRAFT_TOKENS=4 cargo test -p pie-bin \
+//!     --features driver-cuda --test cuda_mtp_specdecode_ab -- --ignored --nocapture
 
 use std::path::Path;
 use std::process::Command;
@@ -136,18 +143,16 @@ async fn mtp_specdecode_device_ab() -> Result<()> {
     }
     drop(setup);
 
-    // A = device-resident swap (charlie's MtpDrafts source-select).
     let (a_json, a_dt) = run_inferlet(&pie.listen_addr, "mtp-specdecode@0.1.0", k).await?;
-    eprintln!("[specdecode-ab] A (device-resident) [{a_dt:?}]: {a_json}");
-    // B = host round-trip baseline.
+    eprintln!("[specdecode-ab] A (mtp-specdecode) [{a_dt:?}]: {a_json}");
     let (b_json, b_dt) = run_inferlet(&pie.listen_addr, "mtp-native-verify@0.1.0", k).await?;
-    eprintln!("[specdecode-ab] B (host round-trip) [{b_dt:?}]: {b_json}");
+    eprintln!("[specdecode-ab] B (mtp-native-verify) [{b_dt:?}]: {b_json}");
 
     pie.shutdown().await;
 
     anyhow::ensure!(
         a_json.contains("mtp-specdecode"),
-        "A (mtp-specdecode) did not return the device-resident result (fire error / seam?): {a_json}"
+        "A (mtp-specdecode) did not return (fire error / seam?): {a_json}"
     );
     anyhow::ensure!(
         b_json.contains("mtp-native-verify"),
@@ -157,29 +162,35 @@ async fn mtp_specdecode_device_ab() -> Result<()> {
     let (a_mean, a_commit) = parse_metrics(&a_json);
     let (b_mean, b_commit) = parse_metrics(&b_json);
     eprintln!(
-        "═══════════════════ (b) device-resident MTP swap A/B — 4090 / Qwen3.5-0.8B ═══════════════════"
+        "═══════════════════ MTP spec-decode A/B — 4090 / Qwen3.5-0.8B ═══════════════════"
     );
     eprintln!(
-        "  A device-resident : mean_accept={a_mean:.2}  committed={a_commit}  decode={a_dt:?}"
+        "  A mtp-specdecode    : mean_accept={a_mean:.2}  committed={a_commit}  decode={a_dt:?}"
     );
     eprintln!(
-        "  B host round-trip : mean_accept={b_mean:.2}  committed={b_commit}  decode={b_dt:?}"
+        "  B mtp-native-verify : mean_accept={b_mean:.2}  committed={b_commit}  decode={b_dt:?}"
     );
-    eprintln!(
-        "  VALUE  Δmean_accept = {:.2}  (≈0 ⇒ the MtpDrafts source-select feeds the verify \
-         identically to the host round-trip — the swap is value-correct)",
-        a_mean - b_mean
-    );
-    eprintln!(
-        "  PERF   decode A/B = {:.2}×  (device-resident avoids the host [k]-drafts round-trip)",
-        b_dt.as_secs_f64() / a_dt.as_secs_f64().max(1e-9)
-    );
+    eprintln!("  (the decode times are NOT comparable: A runs first and absorbs warm-up)");
 
-    // VALUE gate: the device-resident swap must feed the verify the same drafts →
-    // same acceptance (within a small tolerance for near-tie / FLA glitch).
+    // Both decoders must produce the SAME trajectory. They implement the same
+    // algorithm over the same boundary primitives on the same weights in the
+    // same engine boot, so anything but equality means one of the two call sites
+    // drove the fold/discard boundary differently — exactly the regression this
+    // pair exists to catch.
+    //
+    // Safe to assert despite bf16 reduction-order noise forking argmax ties
+    // across RUNS: A and B trace identical graphs, so they take the identical
+    // reduction order. (The noise is real — see `mtp-native-verify`'s comment on
+    // why host-mode and device-mode decodes cannot be compared token-for-token —
+    // but it does not separate two identical graphs.)
     anyhow::ensure!(
         a_mean.is_finite() && b_mean.is_finite(),
         "could not parse mean_accept from both runs (A={a_json}, B={b_json})"
+    );
+    anyhow::ensure!(
+        a_commit == b_commit && (a_mean - b_mean).abs() < 1e-9,
+        "the two forward-hybrid decoders diverged: A committed={a_commit} \
+         mean_accept={a_mean} vs B committed={b_commit} mean_accept={b_mean}"
     );
     Ok(())
 }

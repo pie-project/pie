@@ -1,31 +1,40 @@
-//! **MTP Stage-2 — spec-decode, drafts-channel swap of `mtp-native-verify`**
-//! (`inferlet::ptir` bridge rewrite). The ORIGINAL classic-WIT design read this
-//! window's drafts DEVICE-RESIDENT via a `Binding::MtpDrafts` intrinsic + a
-//! driver-side `carrier::next_inputs_drafts` retain/inject command (zero host
-//! round-trip on the `[k]` drafts). Both that intrinsic's author-facing eDSL
-//! wrapper and the retain/inject WIT command have been REMOVED in the ptir
-//! refactor (there is no `intrinsics::mtp_drafts()` in `pie-dsl`, and no
-//! `pipeline_source_kind`/retain surface anywhere in the current `forward`/
-//! `pipeline` WIT interfaces) — this is a genuine capability gap, not a stale
-//! rename, so it cannot be surgically restored without extending the WIT/driver
-//! surface (out of this migration's scope).
+//! **MTP Stage-2 — spec-decode, drafts-channel swap of `mtp-native-verify`.**
 //!
-//! This inferlet is therefore, for now, IMPLEMENTATION-IDENTICAL to
-//! `mtp-native-verify`'s host-round-trip baseline (see that inferlet's module
-//! docs for the full dataflow): the `[k+1]` window is a host-writer channel
-//! re-`put` each iteration from the host's running commit/draft bookkeeping,
-//! and the draft is device-alias read (`toks.read()`, non-consuming peek) off
-//! the SAME embedded window tokens. `cuda_mtp_specdecode_ab.rs`'s hard gate is
-//! only that both A and B return a finite `mean_accept` and their own name in
-//! the result string — both hold here. The PERF/VALUE A-vs-B commentary in that
-//! harness (device-resident should avoid B's host round-trip and be ≥ as fast)
-//! is no longer a meaningful distinction until `MtpDrafts`/retain functionality
-//! is reintroduced on the `inferlet::ptir` surface; that harness is `#[ignore]`d
-//! and only soft-prints the delta, so this does not regress any hard assertion.
+//! The ORIGINAL design read this window's drafts DEVICE-RESIDENT via a
+//! `Binding::MtpDrafts` intrinsic plus a driver-side `carrier::next_inputs_drafts`
+//! retain/inject command, so the `[k]` drafts never touched the host. Both the
+//! author-facing eDSL wrapper and the retain/inject WIT command were REMOVED in
+//! the ptir refactor (there is no `intrinsics::mtp_drafts()` in `pie-dsl`, and no
+//! `pipeline_source_kind`/retain surface in the current `forward*`/`pipeline` WIT
+//! interfaces). That is a genuine capability gap, not a stale rename.
+//!
+//! So the A-vs-B comparison in `cuda_mtp_specdecode_ab.rs` is, for now, a
+//! comparison of two host-round-trip decoders, and its perf delta is noise. What
+//! this inferlet still earns its keep for is COVERAGE: it is a second, independent
+//! `pie:inferlet/forward-hybrid` client driving the same fold/discard boundary
+//! machinery, so a boundary regression has to break two call sites to go unnoticed.
+//!
+//! **This is a LINEAR model, so the window is one fire, not a staircase.** It used
+//! to build a `k+1`-REQUEST staircase through `pie:inferlet/forward`. That is
+//! inexpressible here on two counts: the generic `forward` interface refuses a
+//! model with a folded recurrent state, and a linear model carries one recurrent
+//! state per REQUEST, so `k+1` rows would demand `k+1` divergent copies of a single
+//! sequence's state. The shape that has a single state to advance is ONE request
+//! row of `k+1` causal tokens.
+//!
+//! Each window is a single fire because the fold looks BACKWARD:
+//!
+//!   * `fold-len` = the PREVIOUS window's accepted prefix, which is known by now
+//!     and still sits in the buffer behind this fire's new tokens;
+//!   * this fire does NOT fold its own `k` drafts — how many are real is decided
+//!     by its own logits, and a fold is irreversible;
+//!   * the rejected tail is dropped with `discard-buffered`, which moves the live
+//!     end left without emptying the buffer, leaving the accepted prefix parked
+//!     for the NEXT fire to fold.
 //!
 //! JSON/plain input: optional draft window `k` (default 4).
 
-use inferlet::ptir::attention::prelude::*;
+use inferlet::ptir::hybrid::prelude::*;
 use inferlet::{Result, model as wit_model};
 
 const PROMPT: &str = "The quick brown fox jumps over";
@@ -78,43 +87,44 @@ fn bind_single_sequence(
     )
 }
 
-fn bind_verify_rows(
+/// One request row of `count` tokens starting at absolute position `first_pos`,
+/// reading out the rows named by `readout` (row indices within the window).
+fn bind_window(
     pass: &ForwardPass,
     ws: &WorkingSet,
     toks: &Channel,
     kv_len: &Channel,
-    seq_len: u32,
-    rows: u32,
+    first_pos: u32,
+    count: u32,
     pool_pages: u32,
+    readout: &[u32],
 ) -> Result<()> {
-    let embed_indptr = Channel::from((0u32..=rows).collect::<Vec<_>>()).named("embed_indptr");
-    let positions = Channel::from((seq_len..seq_len + rows).collect::<Vec<_>>()).named("positions");
-    let lengths: Vec<u32> = (1..=rows).map(|row| seq_len + row).collect();
-    let mut page_values = Vec::new();
-    let mut page_indptr_values = vec![0u32];
-    for length in &lengths {
-        page_values.extend(0..length.div_ceil(PAGE_T).min(pool_pages));
-        page_indptr_values.push(page_values.len() as u32);
-    }
-    let pages = Channel::from(page_values).named("pages");
-    let page_indptr = Channel::from(page_indptr_values).named("page_indptr");
+    let embed_indptr = Channel::from(vec![0u32, count]).named("w_embed_indptr");
+    let positions =
+        Channel::from((first_pos..first_pos + count).collect::<Vec<_>>()).named("w_positions");
+    let pages = Channel::from((0..pool_pages).collect::<Vec<_>>()).named("w_pages");
+    let page_indptr =
+        Channel::from(vec![0u32, (first_pos + count).div_ceil(PAGE_T).min(pool_pages)])
+            .named("w_page_indptr");
     let w_slot = Channel::from(
-        (seq_len..seq_len + rows)
+        (first_pos..first_pos + count)
             .map(|p| p / PAGE_T)
             .collect::<Vec<_>>(),
     )
-    .named("w_slot");
+    .named("w_w_slot");
     let w_off = Channel::from(
-        (seq_len..seq_len + rows)
+        (first_pos..first_pos + count)
             .map(|p| p % PAGE_T)
             .collect::<Vec<_>>(),
     )
-    .named("w_off");
+    .named("w_w_off");
+    let readout = Channel::from(readout.to_vec()).named("w_readout");
+    pass.readout(&readout)?;
     pass.embed(toks, &embed_indptr)?;
     pass.attention(
         ws,
         ..,
-        (seq_len / PAGE_T)..,
+        ..,
         kv_len,
         &pages,
         &page_indptr,
@@ -130,6 +140,7 @@ fn bind_verify_rows(
 /// (native MTP argmax) for window 1.
 async fn bootstrap(
     ws: &WorkingSet,
+    rs: &RsWorkingSet,
     pipeline: &Pipeline,
     prompt: &[u32],
     k: u32,
@@ -149,6 +160,8 @@ async fn bootstrap(
     let fwd = ForwardPass::new();
     let kv_len = Channel::from(vec![n]).named("b_kv_len");
     bind_single_sequence(&fwd, ws, &toks, &kv_len, n, max_pages, &readout)?;
+    // The prompt is final by construction, so the bootstrap folds all of it.
+    fwd.recurrent(std::slice::from_ref(rs))?;
     fwd.epilogue(move || {
         let picked = reduce_argmax(intrinsics::logits());
         let seed = gather(&picked, Tensor::constant(vec![0u32]));
@@ -169,32 +182,45 @@ async fn bootstrap(
     Ok((seed, drafts))
 }
 
-/// One `[k+1]`-wide verify window: embed `[seed, draft]` at positions derived
-/// from the pre-envelope `seq_len` cursor, verify `draft`
-/// (device-alias peeked off the SAME embedded tokens) against the target's
-/// per-row argmax, and draft the NEXT window natively off `mtp_logits`.
+/// One `[k+1]`-wide verify window, in ONE fire: embed `[seed, draft]` at
+/// positions derived from the pre-envelope `seq_len` cursor, fold the PREVIOUS
+/// window's accepted prefix (`fold_len`, already buffered behind these tokens),
+/// verify `draft` (device-alias peeked off the SAME embedded tokens) against the
+/// target's per-row argmax, and draft the NEXT window natively off `mtp_logits`.
 /// Returns `(commit [k+1], next_drafts [k])`.
+#[allow(clippy::too_many_arguments)]
 async fn verify_window(
     ws: &WorkingSet,
+    rs: &RsWorkingSet,
     pipeline: &Pipeline,
     k: u32,
     seed: i32,
     draft: &[i32],
     seq_len: u32,
     max_pages: u32,
+    fold_len: u32,
 ) -> Result<(Vec<i32>, Vec<i32>)> {
     let kp1 = k + 1;
     let mut window: Vec<i32> = vec![seed];
     window.extend_from_slice(draft);
 
-    let toks = Channel::new([kp1], dtype::i32).named("v_toks");
+    let toks = Channel::from(window).named("v_toks");
     let commit_out = Channel::new([kp1], dtype::i32).named("v_commit");
     let drafts_out = Channel::new([k], dtype::i32).named("v_drafts");
+    let commit_out_h = commit_out.clone();
+    let drafts_out_h = drafts_out.clone();
 
     let fwd = ForwardPass::new();
-    let kv_len =
-        Channel::from((1..=kp1).map(|row| seq_len + row).collect::<Vec<_>>()).named("v_kv_len");
-    bind_verify_rows(&fwd, ws, &toks, &kv_len, seq_len, kp1, max_pages)?;
+    let kv_len = Channel::from(vec![seq_len + kp1]).named("v_kv_len");
+    let readout: Vec<u32> = (0..kp1).collect();
+    bind_window(&fwd, ws, &toks, &kv_len, seq_len, kp1, max_pages, &readout)?;
+
+    // Fold BEHIND, never ahead: `fold_len` is the previous window's accepted
+    // prefix, whose finality is settled. This fire's own k drafts land in the
+    // buffer with the boundary held still, so a rejected tail stays abandonable.
+    let fold_len = Channel::from(vec![fold_len]).named("v_fold_len");
+    fwd.recurrent_with(std::slice::from_ref(rs), &fold_len, ..)
+        .map_err(|e| format!("verify recurrent binding: {e}"))?;
     fwd.epilogue(move || {
         let win = toks.read().tensor(); // [k+1] i32 device-alias peek
         let draft_v = gather(&win, Tensor::constant((1..=k).collect::<Vec<u32>>()));
@@ -216,18 +242,27 @@ async fn verify_window(
         drafts_out.put(&next_drafts);
     });
 
-    toks.put(window);
     fwd.submit(pipeline)
         .map_err(|e| format!("verify submit: {e}"))?;
-    let commit = get_i32(commit_out.take()).await?;
-    let drafts = get_i32(drafts_out.take()).await?;
+    let commit = get_i32(commit_out_h.take()).await?;
+    let drafts = get_i32(drafts_out_h.take()).await?;
     Ok((commit, drafts))
 }
 
 #[inferlet::main]
 async fn main(input: String) -> Result<String> {
     let k: u32 = input.trim().parse().unwrap_or(4).max(2);
+    if !wit_model::is_linear() {
+        // Same guard as `mtp-native-verify`: the buffer this decoder's accept
+        // step depends on only exists on a linear model.
+        return Ok("skipped: mtp-specdecode needs a linear model".to_string());
+    }
     let ws = WorkingSet::new();
+    let rs = RsWorkingSet::new();
+    let rs_page = rs.buffer_page_size();
+    if rs_page == 0 {
+        return Err("linear model reports no RS buffer page size".to_string());
+    }
 
     let mut prompt = wit_model::encode(PROMPT);
     if prompt.is_empty() {
@@ -244,7 +279,7 @@ async fn main(input: String) -> Result<String> {
     // final drain instead of a final-submit marker.
     let pipeline = Pipeline::new();
 
-    let (seed0, draft0) = bootstrap(&ws, &pipeline, &prompt, k, max_pages).await?;
+    let (seed0, draft0) = bootstrap(&ws, &rs, &pipeline, &prompt, k, max_pages).await?;
     let mut seq_len: u32 = prompt.len() as u32 + k - 1;
 
     let mut committed: Vec<u32> = prompt.clone();
@@ -254,14 +289,51 @@ async fn main(input: String) -> Result<String> {
     let mut accepted_lengths: Vec<usize> = Vec::new();
     let mut generated: u32 = 1;
 
+    let kp1 = k + 1;
+    let window_slabs = kp1.div_ceil(rs_page);
+    // The previous window's accepted prefix, still buffered, waiting for the
+    // next fire to fold it. Zero on the first pass: nothing precedes it.
+    let mut pending_fold: u32 = 0;
     while generated < MAX_TOKENS {
-        let (commit, drafts) =
-            verify_window(&ws, &pipeline, k, seed, &draft, seq_len, max_pages).await?;
+        // The buffer never empties: it carries the previous window's accepted
+        // prefix into this fire, which folds it while appending its own tokens
+        // past it. `advance_fold` releases the head pages the fold covers, so
+        // this reservation stays bounded instead of growing once per window.
+        let live = pending_fold + kp1 + rs_page;
+        while rs.buffer_size() * rs_page < live {
+            rs.alloc_buffer(window_slabs.max(1))
+                .map_err(|e| format!("rs.alloc_buffer: {e}"))?;
+        }
+
+        let (commit, drafts) = verify_window(
+            &ws,
+            &rs,
+            &pipeline,
+            k,
+            seed,
+            &draft,
+            seq_len,
+            max_pages,
+            pending_fold,
+        )
+        .await?;
         let clen = committed_len(&commit);
-        seq_len += clen as u32;
         let n_acc = clen.saturating_sub(1);
         accepted_lengths.push(n_acc);
         let commit_toks: Vec<u32> = commit.iter().take(clen).map(|&t| t as u32).collect();
+
+        // The rejected tail never touched the recurrent state, so it is enough
+        // to say it never happened. The accepted prefix stays buffered --
+        // unfolded -- and the NEXT window's fire folds it while writing its own
+        // tokens over the slots just released.
+        let rejected = kp1 - clen as u32;
+        if rejected > 0 {
+            rs.discard_buffered(rejected)
+                .map_err(|e| format!("discard_buffered: {e}"))?;
+        }
+        pending_fold = clen as u32;
+
+        seq_len += clen as u32;
         committed.extend(&commit_toks);
         generated += clen.max(1) as u32;
 
@@ -279,10 +351,11 @@ async fn main(input: String) -> Result<String> {
         0.0
     };
     let result = format!(
-        "mtp-specdecode: k={k} steps={steps} accepted_lengths={accepted_lengths:?} \
-         mean_accept={mean_acc:.2} committed={} (host round-trip drafts — the device-resident \
-         MtpDrafts/carrier-retain path is unavailable on the current inferlet::ptir surface; \
-         see the module docs)",
+        "mtp-specdecode: k={k} steps={steps} fires={steps} \
+         accepted_lengths={accepted_lengths:?} mean_accept={mean_acc:.2} committed={} \
+         (forward-hybrid, one fire per window: fold-behind + discard-buffered; host \
+         round-trip drafts — the device-resident MtpDrafts/carrier-retain path is \
+         unavailable on the current inferlet::ptir surface, see the module docs)",
         committed.len()
     );
     eprintln!("{result}");

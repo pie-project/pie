@@ -15,9 +15,13 @@
 //! glitch until bravo's FLA fix lands. The PLUMBING signal (draft head fires +
 //! produces non-aliasing rows) is independent of decode value-correctness.
 //!
-//! `#[ignore]`, driver-cuda. Run:
+//! `#[ignore]`, driver-cuda. **ONE TEST PER PROCESS** — each test boots its own
+//! embedded worker and only the first boot in a process succeeds, so running the
+//! file unfiltered fails every test after the first with "boot embedded worker".
+//! Run each by name:
 //!   PIE_MTP_DRAFT_TOKENS=4 PIE_MTP_LOGITS_TRACE=1 cargo test -p pie-bin \
-//!     --features driver-cuda --test cuda_mtp_native_verify -- --ignored --nocapture
+//!     --features driver-cuda --test cuda_mtp_native_verify <name> \
+//!     -- --ignored --exact --nocapture
 
 use std::path::Path;
 use std::process::Command;
@@ -263,8 +267,8 @@ async fn a_device_resident_fold_length_decodes_identically() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs the RTX 4090; PIE_MTP_DRAFT_TOKENS=0 checks an MTP model with \
-            drafting disabled, any positive value checks a model with no MTP head"]
+#[ignore = "needs the RTX 4090; boots the MTP model with drafting disabled and \
+            checks that the mtp_logits intrinsic is then refused"]
 async fn mtp_logits_capability_false() -> Result<()> {
     common::init_trace();
     let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/engine/tests/inferlets");
@@ -281,15 +285,19 @@ async fn mtp_logits_capability_false() -> Result<()> {
         .success();
     anyhow::ensure!(ok, "wasm build failed for mtp-native-verify");
 
-    let drafts_disabled = std::env::var("PIE_MTP_DRAFT_TOKENS")
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok())
-        == Some(0);
-    let pie = if drafts_disabled {
-        common::boot_4090_mtp().await?
-    } else {
-        common::boot_4090().await?
-    };
+    // This used to have a second arm: boot the pure-attention Qwen3 (a model
+    // with no MTP head at all) and expect the same refusal. That arm is no
+    // longer expressible. `mtp-native-verify` builds its pass through
+    // `pie:inferlet/forward-hybrid` and returns "skipped: needs a linear model"
+    // on an attention model, so it never reaches the intrinsic and the harness
+    // saw a successful return instead of the refusal. Drafting-disabled on the
+    // hybrid model gates the SAME intrinsic through the SAME validator path, so
+    // nothing is lost by pinning this test to the reachable configuration.
+    //
+    // Read once at driver init (entry.cpp:106), so it must be set before boot.
+    // Safe here because a test process boots exactly one worker.
+    unsafe { std::env::set_var("PIE_MTP_DRAFT_TOKENS", "0") };
+    let pie = common::boot_4090_mtp().await?;
     let endpoint = format!("ws://{}/v1/ws", pie.listen_addr);
     let setup = Client::connect_with_identity(&endpoint, "test-user")
         .await
