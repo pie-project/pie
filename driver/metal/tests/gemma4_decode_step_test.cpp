@@ -365,6 +365,34 @@ void the_kv_region_is_sized_per_owning_layer() {
     expect(gdn_rule != want, "the full-attn-count rule would size this wrongly");
 }
 
+// The prefill DAG must describe the same model as the decode DAG.
+//
+// It is the same dispatch list with argument-table ordinals shifted clear, so
+// the two paths cannot come to describe different models -- which is the failure
+// that produces an engine whose prefill and decode disagree.
+void the_prefill_dag_is_the_decode_dag_with_room_for_its_own_binds() {
+    std::printf("[prefill DAG]\n");
+    Gemma4Geometry g;
+    const auto decode = build_gemma4_dag(g);
+    const int base = 100000;
+    const auto prefill = build_gemma4_dag_mb(g, base);
+
+    expect_eq(static_cast<long long>(prefill.size()),
+              static_cast<long long>(decode.size()), "same dispatch count");
+    int wrong_kind = 0, wrong_ordinal = 0, collides = 0;
+    for (std::size_t i = 0; i < decode.size(); ++i) {
+        if (prefill[i].kind != decode[i].kind || prefill[i].layer != decode[i].layer ||
+            prefill[i].sliding != decode[i].sliding) {
+            ++wrong_kind;
+        }
+        if (prefill[i].ordinal != decode[i].ordinal + base) ++wrong_ordinal;
+        if (prefill[i].ordinal <= decode.back().ordinal) ++collides;
+    }
+    expect(wrong_kind == 0, "every dispatch is the same kind, layer and attention type");
+    expect(wrong_ordinal == 0, "every ordinal is shifted by exactly the base");
+    expect(collides == 0, "and no prefill ordinal lands on a decode one");
+}
+
 }  // namespace
 
 int main() {
@@ -380,6 +408,7 @@ int main() {
     kv_redirect_stays_within_an_attention_type();
     a_config_either_describes_a_schedulable_shape_or_is_refused();
     the_kv_region_is_sized_per_owning_layer();
+    the_prefill_dag_is_the_decode_dag_with_room_for_its_own_binds();
     std::printf("\n==== gemma4_decode_step_test: %s ====\n",
                 g_failures == 0 ? "all passed" : "FAILURES");
     return g_failures == 0 ? 0 : 1;

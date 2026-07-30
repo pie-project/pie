@@ -23,7 +23,10 @@ KN qmv_kn(Kind k, const Gemma4Geometry& g, int layer);
 
 /// Bind every constant the DAG's dispatches read. Returns how many were bound,
 /// which is the number a test can pin.
+/// `rows` is the token count: a GEMM must be told M, and an elementwise
+/// kernel over a contiguous [rows, width] buffer counts rows*width. Defaults to
+/// the decode path's single row.
 int bind_gemma4_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
-                       const Gemma4Geometry& g);
+                       const Gemma4Geometry& g, int rows = 1);
 
 }  // namespace pie::metal::gemma4

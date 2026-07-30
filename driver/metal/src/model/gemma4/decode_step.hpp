@@ -175,4 +175,15 @@ inline DagStats dag_stats(const std::vector<Dispatch>& dag, const Gemma4Geometry
     return s;
 }
 
+/// The same DAG, with argument-table ordinals shifted clear of the decode
+/// path's. The dispatch LIST does not depend on the batch size -- only the
+/// shapes and pipelines do -- so this offsets rather than rebuilds, and the two
+/// paths cannot describe different models.
+inline std::vector<Dispatch> build_gemma4_dag_mb(const Gemma4Geometry& g, int ordinal_base,
+                                                 bool with_argmax = true) {
+    std::vector<Dispatch> dag = build_gemma4_dag(g, with_argmax);
+    for (Dispatch& d : dag) d.ordinal += ordinal_base;
+    return dag;
+}
+
 }  // namespace pie::metal::gemma4

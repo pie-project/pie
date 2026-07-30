@@ -413,4 +413,26 @@ void encode_gemma4_step(StepEncoder& se, const std::vector<Dispatch>& dag,
     }
 }
 
+void encode_gemma4_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
+                           const Gemma4Geometry& g, int rows,
+                           const DecodeStepPsos& base, const MultiBatchPsos& mb,
+                           const Gemma4Psos& g4, int ordinal_base) {
+    // Deliberately the same walk as `encode_gemma4_step`, differing only in
+    // which shape and which pipeline each dispatch gets. The DAG, the ordering
+    // and the concurrency runs are properties of the MODEL, not of the batch
+    // size, so re-deriving them here would be a second answer to a question that
+    // already has one.
+    const std::vector<int> run_ends = concurrent_run_ends(dag);
+    for (std::size_t i = 0; i < dag.size(); ++i) {
+        const Dispatch& d = dag[i];
+        Grid grid;
+        Threadgroup tg;
+        launch_shape_mb(d, g, rows, grid, tg);
+        se.set_pso(pso_for_mb(d, g, rows, base, mb, g4));
+        se.set_argtable_ordinal(ordinal_base + d.ordinal);
+        se.dispatch(grid, tg);
+        if (i + 1 >= dag.size() || run_ends[i] == static_cast<int>(i)) se.barrier();
+    }
+}
+
 }  // namespace pie::metal::gemma4

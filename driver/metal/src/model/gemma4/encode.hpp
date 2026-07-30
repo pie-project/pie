@@ -41,6 +41,14 @@ Pso pso_for_mb(const Dispatch& d, const Gemma4Geometry& g, int rows,
                const DecodeStepPsos& base, const MultiBatchPsos& mb,
                const Gemma4Psos& g4);
 
+/// Encode the step for a batch of `rows` tokens. Same walk as
+/// `encode_gemma4_step` -- the DAG, its order and its concurrency runs belong to
+/// the model, not to the batch size -- differing only in shape and pipeline.
+void encode_gemma4_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
+                           const Gemma4Geometry& g, int rows,
+                           const DecodeStepPsos& base, const MultiBatchPsos& mb,
+                           const Gemma4Psos& g4, int ordinal_base = 0);
+
 /// `run_ends[i]`: the last ordinal of the concurrency run containing `i`. What
 /// the colourer needs to know about which barriers the encoder will drop.
 std::vector<int> gemma4_run_ends(const std::vector<Dispatch>& dag);

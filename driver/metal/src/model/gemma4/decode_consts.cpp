@@ -78,7 +78,11 @@ KN qmv_kn(Kind k, const Gemma4Geometry& g, int layer) {
 }
 
 int bind_gemma4_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
-                       const Gemma4Geometry& g) {
+                       const Gemma4Geometry& g, int rows) {
+    // `rows` is the token count. Only two kinds of constant depend on it: a
+    // GEMM needs to be told M, and an elementwise kernel over a contiguous
+    // [rows, width] buffer counts rows*width. Everything else is geometry.
+    const std::uint32_t R = std::uint32_t(rows < 1 ? 1 : rows);
     int count = 0;
     for (const Dispatch& d : dag) {
         const int ord = d.ordinal;
@@ -88,6 +92,12 @@ int bind_gemma4_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
         if (const KN kn = qmv_kn(d.kind, g, L); kn.N != 0) {
             bind_const<std::int32_t>(ctx, ord, (std::uint8_t)bind::Qmv::K, kn.K, &count);
             bind_const<std::int32_t>(ctx, ord, (std::uint8_t)bind::Qmv::N, kn.N, &count);
+            // The GEMM shares Qmv's ordinals 0-6 and appends M. Bound
+            // unconditionally: at rows==1 the matvec simply never reads slot 7,
+            // and an unbound slot on the prefill path is a row count read out of
+            // uninitialized memory.
+            bind_const<std::int32_t>(ctx, ord, (std::uint8_t)bind::Qmm::M,
+                                     std::int32_t(R), &count);
             continue;
         }
 
@@ -158,24 +168,25 @@ int bind_gemma4_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
 
             // ── elementwise ──
             case Kind::GegluTanh: {
-                const GegluParams p{std::uint32_t(L >= 0 ? g.intermediate_of(L) : g.intermediate)};
+                const GegluParams p{R * std::uint32_t(L >= 0 ? g.intermediate_of(L)
+                                                                : g.intermediate)};
                 bind_const<GegluParams>(ctx, ord, (std::uint8_t)bind::Geglu::Params, p, &count);
                 break;
             }
             case Kind::PleGeglu: {
-                const GegluParams p{std::uint32_t(g.per_layer_emb_dim)};
+                const GegluParams p{R * std::uint32_t(g.per_layer_emb_dim)};
                 bind_const<GegluParams>(ctx, ord, (std::uint8_t)bind::Geglu::Params, p, &count);
                 break;
             }
             case Kind::LayerScalar: {
-                const LayerScalarParams p{std::uint32_t(g.hidden)};
+                const LayerScalarParams p{R * std::uint32_t(g.hidden)};
                 bind_const<LayerScalarParams>(ctx, ord, (std::uint8_t)bind::LayerScalar::Params, p,
                                               &count);
                 break;
             }
             case Kind::PleCombine: {
                 const PleCombineParams p{0.70710678118654752f,
-                                         std::uint32_t(g.n_layers * g.per_layer_emb_dim)};
+                                         R * std::uint32_t(g.n_layers * g.per_layer_emb_dim)};
                 bind_const<PleCombineParams>(ctx, ord, (std::uint8_t)bind::PleCombine::Params, p,
                                              &count);
                 break;
@@ -188,10 +199,12 @@ int bind_gemma4_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
             case Kind::AttnResidual:
             case Kind::FfnResidual:
             case Kind::PleResidual:
-                bind_const<std::int32_t>(ctx, ord, (std::uint8_t)bind::Residual::Width, g.hidden,
-                                         &count);
+                bind_const<std::int32_t>(ctx, ord, (std::uint8_t)bind::Residual::Width,
+                                         std::int32_t(R) * g.hidden, &count);
                 break;
 
+            // Embed's `Hidden` is a row PITCH, not a count -- the mb kernel
+            // indexes (channel, token) -- so it does NOT scale with rows.
             case Kind::EmbedGather:
                 bind_const<std::int32_t>(ctx, ord, (std::uint8_t)bind::Embed::Hidden, g.hidden,
                                          &count);
