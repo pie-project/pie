@@ -343,6 +343,47 @@ enum class VNorm : uint8_t { X = 0, Out = 1, Params = 2 };
 // plus the residual and (scaled variant only) the learned per-layer gain.
 //
 //   out = rms_norm(x) * w + r            [* s[0]]
+// ── GPT-OSS ────────────────────────────────────────────────────────────────
+// The matvec, plus the two things every projection in this family has that no
+// other one does: an additive bias, and (for the MoE) an expert index the GPU
+// picked. `bind::Qmv`'s seven slots verbatim, so the weight binds are shared.
+enum class GoQmv : uint8_t {
+    W = 0, Scales = 1, Biases = 2, X = 3, Out = 4, K = 5, N = 6,
+    Bias = 7,        // the Linear's additive bias -- NOT `Biases`, the zero point
+    ExpertIds = 8,   // routed projections only: [experts_per_token] from the router
+    // Whether the INPUT is per-expert as well as the weight. `gate` and `up`
+    // read one shared norm output (0); `down` reads the SwiGLU's k-wide stack
+    // (K). Stated rather than inferred from the kind, because a kernel that
+    // guessed would read four copies of the first expert's activation and
+    // produce a plausible wrong token.
+    XSlotStride = 9,
+};
+
+// router_topk: top-k over the router's logits, then a softmax over the k that
+// survive. Emits both halves of the routing decision.
+enum class GoRouterTopK : uint8_t { Logits = 0, Ids = 1, Weights = 2, Params = 3 };
+
+// gptoss_swiglu: gate*sigmoid(alpha*gate) * (up+1), both operands clamped.
+enum class GoSwiGlu : uint8_t { Gate = 0, Up = 1, Out = 2, Params = 3 };
+
+// expert_combine: the weighted sum of the k experts' outputs.
+enum class GoExpertCombine : uint8_t { Y = 0, Weights = 1, Out = 2, Params = 3 };
+
+// sdpa_vector_decode_sink: bind::SdpaSliding verbatim plus the per-head sink.
+enum class SdpaSink : uint8_t {
+    Q = 0, K = 1, V = 2, Out = 3, GqaFactor = 4, N = 5,
+    KHeadStride = 6, KSeqStride = 7, VHeadStride = 8, VSeqStride = 9, Scale = 10,
+    Window = 11, QRowStride = 12, ORowStride = 13,
+    Sinks = 14,
+};
+
+// rope_neox_freqs_decode: the frequencies are a TABLE, not a base. Whatever
+// closed form produced them (YaRN here) is the host's arithmetic, done once.
+enum class RopeFreqs : uint8_t {
+    X = 0, Position = 1, Scale = 2, InvFreq = 3, HeadDim = 4,
+    MScale = 5,  // YaRN's attention-temperature correction on q and k
+};
+
 enum class RmsResidual : uint8_t {
     X = 0, W = 1, Out = 2, Params = 3, Residual = 4, Scalar = 5,
 };
@@ -413,6 +454,15 @@ enum class Kernel : uint8_t {
     G4AttnPostResidual,  // rms(block)*post_attention_layernorm + resid
     G4FfnPostResidual,   // rms(block)*post_feedforward_layernorm + resid
     G4PleResidualScaled, // (rms(ple)*post_per_layer_input_norm + resid)*layer_scalar
+    // ── GPT-OSS. Its embedding and head are separate tensors, and every
+    // projection is biased, so none of the shared kinds' weight maps fit.
+    GoEmbed,             // model.embed_tokens (quantized, NOT tied)
+    GoLmHead,            // lm_head (quantized, its own tensor)
+    GoQmvQ, GoQmvK, GoQmvV, GoQmvO,
+    GoSdpaSink,          // self_attn.sinks
+    GoRouter,            // mlp.router (8-bit affine) + its bias
+    GoExpertGate, GoExpertUp, GoExpertDown,
+    GoRouterTopK, GoSwiGlu, GoExpertCombine
 };
 
 // ── Bucketed command-buffer key (relaxes "byte-identical CB" → "byte-identical

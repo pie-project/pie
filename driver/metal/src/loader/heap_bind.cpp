@@ -446,6 +446,61 @@ std::vector<WeightBind> weight_binds(
         weights.push_back(
             {(std::uint8_t)bind::RmsResidual::W, prefix + "post_feedforward_layernorm.weight"});
         break;
+    // ── GPT-OSS ──
+    // The embedding and the head are separate tensors here, and every
+    // projection carries an additive bias at slot 7 alongside its quantized
+    // triplet. `.bias` and `.biases` differ by one character and mean nothing
+    // alike; the triplet's zero point is the latter.
+    case Kernel::GoEmbed:
+        push_quant(weights, "embed_tokens");
+        break;
+    case Kernel::GoLmHead:
+        push_quant(weights, "lm_head");
+        break;
+    case Kernel::GoQmvQ:
+        push_quant(weights, prefix + "self_attn.q_proj");
+        weights.push_back({(std::uint8_t)bind::GoQmv::Bias, prefix + "self_attn.q_proj.bias"});
+        break;
+    case Kernel::GoQmvK:
+        push_quant(weights, prefix + "self_attn.k_proj");
+        weights.push_back({(std::uint8_t)bind::GoQmv::Bias, prefix + "self_attn.k_proj.bias"});
+        break;
+    case Kernel::GoQmvV:
+        push_quant(weights, prefix + "self_attn.v_proj");
+        weights.push_back({(std::uint8_t)bind::GoQmv::Bias, prefix + "self_attn.v_proj.bias"});
+        break;
+    case Kernel::GoQmvO:
+        push_quant(weights, prefix + "self_attn.o_proj");
+        weights.push_back({(std::uint8_t)bind::GoQmv::Bias, prefix + "self_attn.o_proj.bias"});
+        break;
+    case Kernel::GoSdpaSink:
+        weights.push_back({(std::uint8_t)bind::SdpaSink::Sinks, prefix + "self_attn.sinks"});
+        break;
+    case Kernel::GoRouter:
+        push_quant(weights, prefix + "mlp.router");
+        weights.push_back({(std::uint8_t)bind::GoQmv::Bias, prefix + "mlp.router.bias"});
+        break;
+    case Kernel::GoExpertGate:
+        push_quant(weights, prefix + "mlp.experts.gate_proj");
+        weights.push_back(
+            {(std::uint8_t)bind::GoQmv::Bias, prefix + "mlp.experts.gate_proj.bias"});
+        break;
+    case Kernel::GoExpertUp:
+        push_quant(weights, prefix + "mlp.experts.up_proj");
+        weights.push_back({(std::uint8_t)bind::GoQmv::Bias, prefix + "mlp.experts.up_proj.bias"});
+        break;
+    case Kernel::GoExpertDown:
+        push_quant(weights, prefix + "mlp.experts.down_proj");
+        weights.push_back(
+            {(std::uint8_t)bind::GoQmv::Bias, prefix + "mlp.experts.down_proj.bias"});
+        break;
+    // Weightless: the routing decision and the two elementwise stages read
+    // activations only.
+    case Kernel::GoRouterTopK:
+    case Kernel::GoSwiGlu:
+    case Kernel::GoExpertCombine:
+        break;
+
     case Kernel::G4PleResidualScaled:
         weights.push_back(
             {(std::uint8_t)bind::RmsResidual::W, prefix + "post_per_layer_input_norm.weight"});

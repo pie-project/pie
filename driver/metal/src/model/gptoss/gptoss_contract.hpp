@@ -144,12 +144,11 @@ inline void author_model_contract(const Checkpoint& checkpoint, std::string_view
         if (!output.has_value()) {
             continue;
         }
-        // `.scales`/`.biases` are consumed by the `.weight` that owns them, so
-        // they are not declared on their own. `.bias` is NOT one of them -- it
-        // is the Linear's additive bias, and is declared directly.
-        if (ends_with(raw.name, ".scales") || ends_with(raw.name, ".biases")) {
-            continue;
-        }
+        // `.scales` and `.biases` are declared in their own right, under their
+        // own runtime names, and fall through to `push_direct` below -- the
+        // matvec binds all three slots, so all three have to be findable. The
+        // `.weight` declaration below describes the PACKING; it does not consume
+        // its partners.
         if (ends_with(raw.name, ".weight") && is_raw(raw.encoding, PieLoaderDType::U32)) {
             const std::string base = std::string(
                 raw.name.substr(0, raw.name.size() - std::string_view(".weight").size()));
@@ -173,14 +172,29 @@ inline void author_model_contract(const Checkpoint& checkpoint, std::string_view
             }
             // Width comes from the tensors, not from the config: `mlx_lm`'s
             // quantization predicate leaves the router at 8 bits while
-            // everything around it goes to 4, and the packing factor is the
-            // only thing that says so.
+            // everything around it goes to 4, and nothing but the packing tells
+            // you which is which.
+            //
+            // Solved rather than guessed. This driver's kernels are group-64, so
+            // `logical_cols = groups * 64`, and a word holds `32/bits` values:
+            //
+            //     bits = 32 * packed_cols / (groups * 64) = packed_cols / (2*groups)
+            //
+            // A checkpoint quantized at another group size lands on a non-integer
+            // or an out-of-range width and is refused here, which is better than
+            // being refused later as "g128" -- the number that comes out of
+            // assuming the width and solving for the group instead.
             const std::int64_t packed_cols = raw.shape.back();
-            const std::int64_t rows_last = scales->shape.back();
-            const int bits = (packed_cols * 8) % rows_last == 0 &&
-                                     (packed_cols * 8) / rows_last >= 32
-                                 ? 4
-                                 : 8;
+            const std::int64_t groups = scales->shape.back();
+            if (groups <= 0 || packed_cols % (2 * groups) != 0) {
+                fail("Metal GptOss: '" + std::string(raw.name) +
+                     "' is not quantized in groups of 64, which is what these kernels read");
+            }
+            const int bits = int(packed_cols / (2 * groups));
+            if (bits != 4 && bits != 8) {
+                fail("Metal GptOss: '" + std::string(raw.name) + "' is " +
+                     std::to_string(bits) + "-bit, and only 4 and 8 are described here");
+            }
             push_mlx_affine_stacked(out, raw, *scales, *biases, bits, std::move(*output));
         } else {
             push_direct(out, raw, std::move(*output));

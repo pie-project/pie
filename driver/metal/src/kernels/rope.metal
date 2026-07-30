@@ -195,3 +195,55 @@ template <typename T>
 instantiate_rope_prop_mb(float32, float)
 instantiate_rope_prop_mb(float16, half)
 instantiate_rope_prop_mb(bfloat16, bfloat)
+
+// ── RoPE from a supplied frequency table (gpt-oss / YaRN) ───────────────────
+//
+// gpt-oss scales its rotary frequencies by YaRN: a per-dimension interpolation
+// between the original and extended context, parameterised by beta_fast,
+// beta_slow, a factor and the original window. That is a closed form over
+// `head_dim/2` values -- 32 of them here -- and it does not depend on the
+// position, so it is arithmetic the host does once at setup rather than
+// arithmetic every head redoes every token.
+//
+// So this variant reads `inv_freq[i]` instead of deriving it from a base. It is
+// also the general shape: any rope whose frequencies are a table rather than a
+// geometric series (YaRN, llama3, longrope) binds here without a new kernel.
+template <typename T>
+[[kernel]] void rope_neox_freqs_decode(
+    device T* x                       [[buffer(0)]],  // in-place [n_head, head_dim]
+    const device int* position        [[buffer(1)]],
+    const constant float& scale       [[buffer(2)]],
+    const device float* inv_freq      [[buffer(3)]],  // [rotary_dims/2]
+    const constant int& head_dim      [[buffer(4)]],
+    // YaRN's `mscale`: an attention-temperature correction that scales q and k
+    // by `0.1*log(factor)+1` -- 1.3466 at factor 32. It rides here rather than
+    // in a dispatch of its own because rotation is linear, so scaling before
+    // the rotation and scaling after it are the same thing.
+    const constant float& mscale      [[buffer(5)]],
+    uint2 pos  [[thread_position_in_grid]],
+    uint2 grid [[threads_per_grid]]) {
+  const int i = int(pos.x);
+  const int h = int(pos.y);
+  const int half_rd = int(grid.x);
+
+  const float theta = scale * static_cast<float>(position[0]) * inv_freq[i];
+  const float costheta = fast::cos(theta);
+  const float sintheta = fast::sin(theta);
+
+  const int i1 = h * head_dim + i;
+  const int i2 = i1 + half_rd;
+  const float x1 = static_cast<float>(x[i1]);
+  const float x2 = static_cast<float>(x[i2]);
+  x[i1] = static_cast<T>(mscale * (x1 * costheta - x2 * sintheta));
+  x[i2] = static_cast<T>(mscale * (x1 * sintheta + x2 * costheta));
+}
+
+#define instantiate_rope_freqs(name, itype)                        \
+  template [[host_name("rope_neox_freqs_decode_" #name)]]          \
+  [[kernel]] void rope_neox_freqs_decode<itype>(                   \
+      device itype*, const device int*, const constant float&,     \
+      const device float*, const constant int&, const constant float&, uint2, uint2);
+
+instantiate_rope_freqs(float32, float)
+instantiate_rope_freqs(float16, half)
+instantiate_rope_freqs(bfloat16, bfloat)

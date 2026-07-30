@@ -36,12 +36,25 @@ G4_LAYER = ["attn_norm", "q_proj", "k_proj", "v_proj", "q_norm", "k_norm",
             "ple_back", "ple_norm", "ple_resid", "layer_out"]
 G4_TAIL = ["final_norm", "logits_raw", "logits"]
 
+# gpt-oss: sparse MoE every layer, attention sinks, no QK-norm.
+GO_LAYER = ["attn_norm", "q_proj", "k_proj", "v_proj", "rope_q", "rope_k",
+            "sdpa", "o_proj", "attn_resid", "ffn_norm", "router",
+            "expert_gate", "expert_up", "expert_act", "expert_out", "moe",
+            "layer_out"]
+
 
 def taps_qwen3_5(n_layers=24):
     taps = [(-1, "embed")]
     for L in range(n_layers):
         block = ATTN_ORDER if (L % 4) == 3 else GDN_ORDER
         taps += [(L, k) for k in block] + [(L, k) for k in MLP_ORDER]
+    return taps + [(-1, "final_norm"), (-1, "logits")]
+
+
+def taps_gptoss(n_layers=24):
+    taps = [(-1, "embed")]
+    for L in range(n_layers):
+        taps += [(L, k) for k in GO_LAYER]
     return taps + [(-1, "final_norm"), (-1, "logits")]
 
 
@@ -72,7 +85,12 @@ def main():
     if "--family" in sys.argv:
         family = sys.argv[sys.argv.index("--family") + 1]
 
-    taps = taps_gemma4() if family == "gemma4" else taps_qwen3_5()
+    if family == "gemma4":
+        taps = taps_gemma4()
+    elif family == "gptoss":
+        taps = taps_gptoss()
+    else:
+        taps = taps_qwen3_5()
 
     print(f"{'tap':<22} {'cos':>10} {'rel_l2':>10} {'ref_rms':>10} {'mtl_rms':>10}")
     print("-" * 66)
