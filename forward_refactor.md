@@ -2186,17 +2186,56 @@ Two consequences worth stating plainly:
 **Measured against vLLM 0.25.1** (one L40S, driver 550, shared
 `benches/common.py` metrics, `VLLM_USE_FLASHINFER_SAMPLER=0`):
 
+Steady state, after merging `origin/dev` (which brought a chunked argmax
+accumulator and two vec2 alignment fixes). Throughput is the mean of three
+runs -- pie's first run after a cold start is an outlier, vLLM's spread is
+under 2%:
+
 | case | pie | vLLM | delta |
 |---|---|---|---|
-| attention latency 16x128 | 436.45 tok/s | 377.24 | +15.7% |
-| attention tput 256x128 | 25648.12 | 27231.68 | -5.8% |
-| hybrid latency 16x128 | 266.33 | 318.21 | -16.3% |
-| hybrid tput 256x128 | 12955.35 | 11431.70 | +13.3% |
+| attention latency 16x128 | 437.72 tok/s | 376.43 | **+16.3%** |
+| attention tput 256x128 | 27683 | 27484 | **+0.7%** |
+| hybrid latency 16x128 | 266.44 | 318.14 | **-16.2%** |
+| hybrid tput 256x128 | 13539 | 11408 | **+18.7%** |
 
-The hybrid throughput number moved from 11717.80 to 12955.35 purely because
-the model now runs at the default frame size. The remaining hybrid latency
-gap is NOT host overhead: pie's own forward time for that step is 3.41 ms
-against vLLM's 3.14 ms end-to-end, so it is GDN kernel work.
+pie leads in three of the four. Two things moved it there: the frame-size fix
+above took hybrid throughput from 11717.80 (handicapped at
+`PIE_FRAME_SIZE=1`) to ~13539, and dev's argmax/alignment work took attention
+throughput from 24795 to ~27683, closing what had been a -8.9% gap.
+
+The one remaining gap is hybrid latency, and it is NOT host overhead. The
+arithmetic: pie's measured forward time for a 1-token hybrid decode step is
+3.41 ms, against vLLM's 3.14 ms END-TO-END. Host work adds only the
+non-overlapped remainder -- prepare's 3131 us is spent WAITING on that same
+forward, so total step time (3.79 ms) is forward time plus about 0.38 ms of
+enqueue and settle. Even with zero host overhead pie would sit at 3.41 ms,
+i.e. ~293 tok/s against 318. The gap is GDN kernel work, not plumbing.
+
+**On relaxing the template's RS guard.** Investigated, and it looks
+conservative rather than intrinsic:
+
+* The compose kernels ALREADY know about RS -- both the envelope and
+  fixed-decode compose paths carry an `output.rs_slot_ids` and write `-1` into
+  it for inactive (padded) rows (`dispatch.cu:752-754`, `1119-1121`).
+* The RS wire arrays are consumed by the MODEL FORWARD
+  (`driver/cuda/src/model/qwen3_5/qwen3_5_forward.cpp`), reached through
+  `ComposedBatch` (`driver/cuda/src/batch/batch_compose.hpp`), not by the PTIR
+  compose kernels the template replaces. They are host-known: the engine's
+  `RsStore` produces them.
+* `git log -S "rs_slot_ids.empty"` turns up only the original PTIR fusion
+  commit and two `update`s -- no commit that revisits the guard deliberately.
+
+What is genuinely RS-specific is `rs_launch_requires_readiness_settlement`
+(`driver/cuda/src/batch/rs_metadata.hpp:20`), which forces two D2H readiness
+settlements per RS launch because "stateful model launches cannot discover a
+ticket miss after the recurrent-state kernels have already mutated their
+slots". That is sound and costs about 230 us of the enqueue phase -- it is not
+the 3131 us.
+
+So relaxing the guard is worth doing, but for PROGRAMMABILITY first (it is
+what would let a buffered RS decode stay device-carried, which a speculative
+decoder needs because its drafts are device-produced) and for latency only
+second, where the ceiling is about 10%.
 
 
 ## 11. The boundary model — ratified after Step B, supersedes §3.3/§3.4 fold modes
