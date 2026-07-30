@@ -139,8 +139,8 @@ inline void dsv4_bf16_expert_stacks(ContractBuilder& b) {
     // the checkpoint, and a config-driven loop would ask for tensors that this
     // process was never given.
     for (std::uint32_t layer = 0;; ++layer) {
-        const std::string ffn =
-            "model.layers." + std::to_string(layer) + ".ffn.";
+        const std::string ffn = std::string(b.decoder_layer_prefix()) +
+                                std::to_string(layer) + ".ffn.";
         if (b.find(b.source_name(ffn + "experts.0.w1.weight")) == nullptr) {
             break;
         }
@@ -312,8 +312,8 @@ inline void dsv4_streamed_expert_groups(ContractBuilder& b) {
     constexpr std::int64_t kGroup = 32;
 
     for (std::uint32_t layer = 0;; ++layer) {
-        const std::string ffn =
-            "model.layers." + std::to_string(layer) + ".ffn.";
+        const std::string ffn = std::string(b.decoder_layer_prefix()) +
+                                std::to_string(layer) + ".ffn.";
         if (b.find(b.source_name(ffn + "experts.0.w1.weight")) == nullptr) {
             break;
         }
@@ -396,7 +396,10 @@ inline void dsv4_streamed_expert_groups(ContractBuilder& b) {
                 .first;
         };
 
-        auto group = c.group(ffn + "experts", experts);
+        // Named the way every bound tensor is named -- prefix stripped --
+        // because the driver looks a group up beside the weights it binds, and
+        // one naming convention for both is one less thing to get wrong.
+        auto group = c.group(b.output_name(ffn + "experts"), experts);
         // Same structure as the stack, one rank lower: with no expert axis to
         // stack along, `w1`/`w3` concatenate along the intermediate dim they
         // were already sharded on, and the scale groups run along the last
@@ -456,6 +459,14 @@ inline void dsv4_streamed_expert_groups(ContractBuilder& b) {
 /// nothing about this family. The choice here is between eager and per-step,
 /// so anything short of an explicit `RoutedDecode` takes the eager path.
 inline void author_deepseek_v4_contract(ContractBuilder& b) {
+    // Ask where the layers are rather than declare it. This family's released
+    // checkpoints name them `layers.<L>.`, not the HF `model.layers.<L>.` the
+    // default assumes, and the two expert passes below select by that prefix --
+    // so with it wrong they matched nothing and the forward pass's packed
+    // fallback quietly covered for them, dequantizing every routed expert on
+    // every layer of every step. That is the failure `decoder_layer_prefix_any_of`
+    // was written for, and the same silence would have hidden it here.
+    b.decoder_layer_prefix_any_of({"model.layers.", "layers."});
     b.shard_axis_fn(contract_detail::dsv4_shard_axis);
     b.decide_mxfp4_moe(b.mxfp4_moe_request() == Mxfp4MoeRequest::RoutedDecode
                            ? Mxfp4MoePolicy::RoutedDecode

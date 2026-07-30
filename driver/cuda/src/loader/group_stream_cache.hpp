@@ -36,6 +36,7 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -126,6 +127,26 @@ public:
     GroupStreamCache& operator=(const GroupStreamCache&) = delete;
 
     std::size_t num_groups() const noexcept { return groups_.len; }
+    /// The group named `name`, or `kNoGroup`. A bind path holds names, not
+    /// indices, and resolving once at bind keeps the forward pass indexing.
+    static constexpr std::size_t kNoGroup = static_cast<std::size_t>(-1);
+    std::size_t find_group(std::string_view name) const noexcept {
+        for (std::size_t g = 0; g < groups_.len; ++g) {
+            const auto& group = groups_.ptr[g];
+            if (std::string_view(
+                    reinterpret_cast<const char*>(group.name.ptr),
+                    group.name.len) == name) {
+                return g;
+            }
+        }
+        return kNoGroup;
+    }
+    std::uint32_t arity(std::size_t group) const {
+        if (group >= groups_.len) {
+            throw std::out_of_range("group stream cache: no such group");
+        }
+        return groups_.ptr[group].arity;
+    }
     /// Every instance of every group, which is what the slab is sized against.
     std::uint32_t total_instances() const noexcept { return index_.arity(); }
     std::uint32_t num_slots() const noexcept { return index_.num_slots(); }

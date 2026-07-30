@@ -561,7 +561,8 @@ void test_deepseek_v4_streams_experts_as_a_group() {
             check(v.groups.len == 1, "one group, for the one layer" + at);
             if (v.groups.len != 1) continue;
             const auto& g = v.groups.ptr[0];
-            check(view_of(g.name) == ffn + "experts", "the group is named for its layer" + at);
+            check(view_of(g.name) == ffn + "experts",
+                  "the group is named for its layer" + at);
             check(g.arity == kExperts, "one instance per expert" + at);
 
             std::map<std::string_view, std::vector<std::int64_t>> declared;
