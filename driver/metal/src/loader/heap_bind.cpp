@@ -234,7 +234,7 @@ BoundDecode stage_decode_storage(
     // ── KV region: k/v pages per full-attn layer (append-only, I4) ──
     const size_t kv_one = heap_plan.kv_per_layer / 2;  // bytes for k (== v)
     for (int L = 0; L < g.n_layers; ++L) {
-        if (!DecodeGeometry::is_full_attn(L)) continue;
+        if (!g.is_full_attn(L)) continue;
         const size_t initial = std::min(kv_one, size_t{2} << 20);
         b.kv[L].k_pages = alloc_zeroed(ctx, kv_one, true, initial);
         b.kv[L].v_pages = alloc_zeroed(ctx, kv_one, true, initial);
@@ -249,7 +249,7 @@ BoundDecode stage_decode_storage(
     const size_t recur_state = size_t(g.gdn_v_heads) * g.gdn_v_dim * g.gdn_k_dim * 4 * slots;
     const size_t conv_bias = size_t(g.gdn_conv_dim) * 2;                       // bf16, all-zero
     for (int L = 0; L < g.n_layers; ++L) {
-        if (DecodeGeometry::is_full_attn(L)) continue;
+        if (g.is_full_attn(L)) continue;
         const size_t conv_initial =
             std::min(conv_state, size_t(g.gdn_conv_dim) * g.gdn_conv_k * 4);
         const size_t recur_initial =

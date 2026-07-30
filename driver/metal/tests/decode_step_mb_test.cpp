@@ -130,7 +130,7 @@ int main() {
     }
     for (int i = 0; i < kIoSlotCount; ++i) b.io[i] = ctx->heap_alloc(4096);
     for (int l = 0; l < g.n_layers; ++l) {
-        if (!DecodeGeometry::is_full_attn(l)) {
+        if (!g.is_full_attn(l)) {
             b.gdn[l].conv_state = ctx->heap_alloc(4096);
             b.gdn[l].conv_state_out = ctx->heap_alloc(4096);
             b.gdn[l].recurrent_state = ctx->heap_alloc(4096);
@@ -138,7 +138,7 @@ int main() {
         }
     }
     std::vector<SlotHandle> kp(size_t(g.n_layers)), vp(size_t(g.n_layers));
-    for (int l = 0; l < g.n_layers; ++l) if (DecodeGeometry::is_full_attn(l)) {
+    for (int l = 0; l < g.n_layers; ++l) if (g.is_full_attn(l)) {
         kp[l] = ctx->heap_alloc(4096); vp[l] = ctx->heap_alloc(4096);
     }
     bind_decode_dag_mb(*ctx, b, mb4, g, kp, vp, true);

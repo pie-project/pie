@@ -1062,7 +1062,7 @@ bool MetalExecutor::Impl::setup_kv_pool(uint32_t total_pages, uint32_t page_size
     }
     int n_full = 0;
     for (int L = 0; L < g_.n_layers; ++L) {
-        if (DecodeGeometry::is_full_attn(L)) ++n_full;
+        if (g_.is_full_attn(L)) ++n_full;
     }
     if (n_full == 0) {
         if (err) {
@@ -1076,7 +1076,7 @@ bool MetalExecutor::Impl::setup_kv_pool(uint32_t total_pages, uint32_t page_size
     KvPagePool pool;
     pool.layers.resize(size_t(g_.n_layers));
     for (int L = 0; L < g_.n_layers; ++L) {
-        if (!DecodeGeometry::is_full_attn(L)) continue;
+        if (!g_.is_full_attn(L)) continue;
         const size_t initial = std::min(layer_bytes, size_t{2} << 20);
         pool.layers[size_t(L)].k_pages =
             ctx_->create_elastic_buffer(layer_bytes, initial);
@@ -1133,7 +1133,7 @@ bool MetalExecutor::Impl::bind_paged_dag(std::string* err) {
         std::vector<SlotHandle> k_pages(size_t(g_.n_layers));
         std::vector<SlotHandle> v_pages(size_t(g_.n_layers));
         for (int L = 0; L < g_.n_layers; ++L) {
-            if (!DecodeGeometry::is_full_attn(L)) continue;
+            if (!g_.is_full_attn(L)) continue;
             k_pages[size_t(L)] = kv_pool_.layers[size_t(L)].k_pages;
             v_pages[size_t(L)] = kv_pool_.layers[size_t(L)].v_pages;
         }
@@ -1272,7 +1272,7 @@ bool MetalExecutor::Impl::copy_kv_pages(const std::vector<uint32_t>& src_pages,
     // independent; the caller sequences non-conflicting moves, or issues them as
     // separate calls when a true swap/rotate is needed).
     for (int L = 0; L < g_.n_layers; ++L) {
-        if (!DecodeGeometry::is_full_attn(L)) continue;
+        if (!g_.is_full_attn(L)) continue;
         const auto& lp = kv_pool_.layers[size_t(L)];
         for (size_t i = 0; i < src_pages.size(); ++i) {
             const size_t src_off = size_t(src_pages[i]) * page_bytes;
@@ -1322,7 +1322,7 @@ bool MetalExecutor::Impl::copy_kv_cells(const std::vector<KvMoveCell>& cells, st
     const size_t row_bytes = kv_pool_row_bytes(g_);
     const size_t page_bytes = size_t(kv_pool_.page_size) * row_bytes;
     for (int L = 0; L < g_.n_layers; ++L) {
-        if (!DecodeGeometry::is_full_attn(L)) continue;
+        if (!g_.is_full_attn(L)) continue;
         const auto& lp = kv_pool_.layers[size_t(L)];
         for (const auto& c : cells) {
             const size_t src_off = size_t(c.src_page_id) * page_bytes +
@@ -1384,7 +1384,7 @@ bool MetalExecutor::Impl::resize_kv_pool(uint32_t new_total_pages, bool unmapped
     const size_t committed_bytes =
         size_t(new_total_pages) * size_t(kv_pool_.page_size) * row_bytes;
     for (int L = 0; L < g_.n_layers; ++L) {
-        if (!DecodeGeometry::is_full_attn(L)) continue;
+        if (!g_.is_full_attn(L)) continue;
         auto& layer = kv_pool_.layers[size_t(L)];
         if (!ctx_->ensure_elastic_buffer(layer.k_pages, committed_bytes) ||
             !ctx_->ensure_elastic_buffer(layer.v_pages, committed_bytes)) {
@@ -2161,14 +2161,16 @@ std::uint32_t MetalExecutor::argmax_native() const {
 }
 
 bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
-    // Phase 1a targets exactly the shipped qwen3.6 (GDN-hybrid) geometry —
-    // refuse truthfully rather than let caps advertise a forward that does
-    // not exist (metal_ptir_plan.md §5.5, §12 "Caps honesty").
+    // The geometry below still comes from the shipped qwen3.5 defaults, so a
+    // checkpoint that is not that one is refused — but the refusal is now about
+    // the GEOMETRY not matching, not about the family lacking linear attention.
+    // `full_attn_interval` and the vocab are what actually decide whether the
+    // built DAG describes this checkpoint; `has_linear_attn` never did.
     if (!cfg.has_linear_attn) {
         if (err != nullptr) {
-            *err = "Metal PTIR forward requires the qwen3.6 (GDN-hybrid) checkpoint "
-                   "geometry in this increment (config '" +
-                   cfg.arch_name + "' has no linear-attention layers)";
+            *err = "Metal has no model family for config '" + cfg.arch_name +
+                   "' yet: the only decode DAG this driver builds is the qwen3.5 "
+                   "GDN hybrid's";
         }
         return false;
     }
@@ -2214,15 +2216,12 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
     geom.total_pages = static_cast<int>(cfg.total_pages);
     geom.paged_kv_enabled = cfg.total_pages > 0 && cfg.kv_page_size > 0 &&
                             geom.max_tokens > 0 && geom.max_requests > 0;
-    if (cfg.vocab_size != 0 &&
-        cfg.vocab_size != static_cast<std::uint32_t>(geom.vocab)) {
-        if (err != nullptr) {
-            *err = "checkpoint vocab_size (" + std::to_string(cfg.vocab_size) +
-                   ") does not match the shipped qwen3.6 geometry (" +
-                   std::to_string(geom.vocab) +
-                   "); only the qwen3.6 checkpoint is supported in this increment";
-        }
-        return false;
+    // The vocabulary is a property of the checkpoint, so take it from the
+    // checkpoint. It used to be cross-checked against the hard-coded 248320 and
+    // REFUSED on mismatch, which meant even another size of the same family
+    // could not load. Every consumer reads `geom.vocab`; nothing else pinned it.
+    if (cfg.vocab_size != 0) {
+        geom.vocab = static_cast<int>(cfg.vocab_size);
     }
     std::string derr;
     if (!impl->setup(

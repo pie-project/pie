@@ -363,7 +363,7 @@ std::string build_caps_json(const Config& cfg,
         const std::uint64_t recur_stride = g.gdn_recurrent_stride_bytes();
         int gdn_layers = 0;
         for (int l = 0; l < g.n_layers; ++l) {
-            if (!backend::DecodeGeometry::is_full_attn(l)) ++gdn_layers;
+            if (!g.is_full_attn(l)) ++gdn_layers;
         }
         rs_cache_slot_bytes = static_cast<std::uint32_t>(
             std::uint64_t(gdn_layers) * (2 * conv_stride + recur_stride));

@@ -65,7 +65,7 @@ std::vector<Dispatch> build_decode_dag(const DecodeGeometry& g, bool with_argmax
     { LD l; embed_dispatch(g.hidden, l.grid, l.tg); emit(Kernel::EmbedGather, -1, l); }
 
     for (int L = 0; L < g.n_layers; ++L) {
-        if (DecodeGeometry::is_full_attn(L)) {
+        if (g.is_full_attn(L)) {
             // Full-attn (20): attn_norm, q_proj(4096), q_split, k_proj, v_proj, q_norm,
             // k_norm, rope_q, rope_k, kv_append, sdpa, attn_gate, o_proj, attn_resid + MLP(6).
             emit(Kernel::Rms,    L, rms(g.hidden, 1));
