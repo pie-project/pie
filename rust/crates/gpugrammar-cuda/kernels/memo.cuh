@@ -62,53 +62,78 @@ extern "C" __global__ void gg_hash(
     int32_t stack_stride,
     int32_t suffixes) {
     int32_t sequence = blockIdx.x;
-    int32_t lane = threadIdx.x;
+    int32_t lane = threadIdx.x & 31;
+    int32_t warp = threadIdx.x >> 5;
+    int32_t warps = blockDim.x >> 5;
     int32_t count = state->config_count[sequence];
     int32_t grammar = state->grammar_of[sequence];
 
-    // The grammar is part of the state: two sequences under different schemas
-    // can sit at the same parser state with the same stack and still admit
-    // different tokens, so sharing a mask between them would be wrong.
-    int32_t digest = gg::fold(gg::fold((int32_t)gg::FNV_OFFSET, grammar), count);
-    for (int32_t config = 0; config < count; ++config) {
+    // The fold is sequential in configuration order - it has to be, the digest
+    // of one feeds the next - but the stack sums it folds are not. A sequence
+    // can hold sixty-four configurations, and one warp doing sixty-four
+    // reductions in a row was 65.8 us against Triton's 32.8 at batch 32 on the
+    // widest schema. So the warps compute the sums in parallel and one thread
+    // folds the results, which is the only part that must be in order.
+    extern __shared__ int32_t parts[];
+
+    for (int32_t config = warp; config < count; config += warps) {
         int32_t row = sequence * configs + config;
         int32_t depth = state->depth[row];
-        digest = gg::fold(digest, state->lexer_state[row]);
-        digest = gg::fold(digest, depth);
-        // Order matters, so fold with a position-dependent weight rather than
-        // a plain sum. Reduced across the block because the stack is wider
-        // than a warp.
         int32_t part = 0;
         for (int32_t at = lane; at < depth; at += 32) {
             part += state->stack[(int64_t)row * stack_stride + at] * (at + 1);
         }
-        digest = gg::fold(digest, warp_sum(part));
+        int32_t folded = warp_sum(part);
+        if (lane == 0) {
+            parts[config] = folded;
+        }
     }
-    if (lane == 0) {
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        // The grammar is part of the state: two sequences under different
+        // schemas can sit at the same parser state with the same stack and
+        // still admit different tokens, so sharing a mask between them would
+        // be wrong.
+        int32_t digest = gg::fold(gg::fold((int32_t)gg::FNV_OFFSET, grammar), count);
+        for (int32_t config = 0; config < count; ++config) {
+            int32_t row = sequence * configs + config;
+            digest = gg::fold(digest, state->lexer_state[row]);
+            digest = gg::fold(digest, state->depth[row]);
+            digest = gg::fold(digest, parts[config]);
+        }
         hash[sequence] = digest;
     }
 
     for (int32_t width = 1; width <= suffixes; ++width) {
-        int32_t d = gg::fold((int32_t)gg::FNV_OFFSET, grammar);
-        d = gg::fold(gg::fold(d, count), width);
-        for (int32_t config = 0; config < count; ++config) {
+        __syncthreads();
+        for (int32_t config = warp; config < count; config += warps) {
             int32_t row = sequence * configs + config;
             int32_t depth = state->depth[row];
-            int32_t kept = min(depth, width);
-            int32_t floor = depth - kept;
+            int32_t floor = depth - min(depth, width);
             int32_t part = 0;
             for (int32_t at = floor + lane; at < depth; at += 32) {
                 part += state->stack[(int64_t)row * stack_stride + at] * (at - floor + 1);
             }
             int32_t folded = warp_sum(part);
-            d = gg::fold(d, state->lexer_state[row]);
-            d = gg::fold(d, kept);
-            // A stack shorter than `k` is folded whole, so it can never look
-            // like a longer one that happens to end the same way.
-            d = gg::fold(d, depth <= width ? 1 : 0);
-            d = gg::fold(d, folded);
+            if (lane == 0) {
+                parts[config] = folded;
+            }
         }
-        if (lane == 0) {
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            int32_t d = gg::fold((int32_t)gg::FNV_OFFSET, grammar);
+            d = gg::fold(gg::fold(d, count), width);
+            for (int32_t config = 0; config < count; ++config) {
+                int32_t row = sequence * configs + config;
+                int32_t depth = state->depth[row];
+                d = gg::fold(d, state->lexer_state[row]);
+                d = gg::fold(d, min(depth, width));
+                // A stack shorter than `k` is folded whole, so it can never
+                // look like a longer one that happens to end the same way.
+                d = gg::fold(d, depth <= width ? 1 : 0);
+                d = gg::fold(d, parts[config]);
+            }
             suffix_hash[sequence * suffixes + width - 1] = d;
         }
     }

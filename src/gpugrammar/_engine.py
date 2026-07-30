@@ -4255,7 +4255,10 @@ class DeviceBatch:
         _gpugrammar.cuda_launch(
             "gg_hash",
             self.batch,
-            32,  # one warp: the fold is a shuffle, not a block reduction
+            # A warp per configuration rather than one per sequence: the fold
+            # is sequential in configuration order but the stack sums it folds
+            # are not, and a sequence can hold sixty-four configurations.
+            256,
             torch.cuda.current_stream().cuda_stream,
             [
                 self.state_struct().data_ptr(),
@@ -4263,6 +4266,7 @@ class DeviceBatch:
                 self.suffix_hash.data_ptr(),
             ],
             [self.configs, grammar.max_stack, _MEMO_SUFFIXES],
+            shared_bytes=self.configs * 4,
         )
 
     def _probe_triton(self, grammar) -> None:
