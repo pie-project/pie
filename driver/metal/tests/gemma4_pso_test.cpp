@@ -140,6 +140,43 @@ int main(int argc, char** argv) {
             expect(proj_same == 0,
                    "and the projections really do differ, so a matmul PSO is required "
                    "for them at M>1");
+
+            // And that matmul PSO must exist. A dispatch whose grid was computed
+            // for one tiling and whose pipeline was compiled for another is not
+            // a crash -- it is wrong numbers -- so every M>1 dispatch has to
+            // resolve, and resolve to something other than the M=1 pipeline
+            // wherever the kernel genuinely changes.
+            pie::metal::MultiBatchPsos mb;
+            std::string mb_err;
+            const bool mb_ok = pie::metal::load_multibatch_psos(
+                *ctx, kernels_dir, mb, /*with_d512=*/true, &mb_err);
+            expect(mb_ok, "the multi-batch PSOs compile: " + (mb_ok ? std::string("ok")
+                                                                    : mb_err));
+            if (mb_ok) {
+                int unresolved = 0, still_m1 = 0;
+                for (const auto& d : dag) {
+                    const pie::metal::Pso p =
+                        pie::metal::gemma4::pso_for_mb(d, g, 128, base, mb, psos);
+                    if (!p.valid()) ++unresolved;
+                    const bool changes =
+                        pie::metal::gemma4::qmv_kn(d.kind, g, d.layer).N != 0 ||
+                        d.kind == pie::metal::gemma4::Kind::EmbedGather ||
+                        d.kind == pie::metal::gemma4::Kind::PleTokenGather ||
+                        d.kind == pie::metal::gemma4::Kind::RopeQ ||
+                        d.kind == pie::metal::gemma4::Kind::RopeK ||
+                        d.kind == pie::metal::gemma4::Kind::KvAppend ||
+                        d.kind == pie::metal::gemma4::Kind::Sdpa;
+                    if (changes) {
+                        const pie::metal::Pso m1 =
+                            pie::metal::gemma4::pso_for(d, base, psos);
+                        if (p.obj == m1.obj) ++still_m1;
+                    }
+                }
+                expect(unresolved == 0, "every M>1 dispatch resolves to a pipeline");
+                expect(still_m1 == 0,
+                       "and every kind whose kernel changes at M>1 got a different one (" +
+                           std::to_string(still_m1) + " did not)");
+            }
         }
     }
 

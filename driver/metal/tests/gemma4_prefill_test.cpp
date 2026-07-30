@@ -409,6 +409,68 @@ void the_paged_kernel_agrees_with_the_contiguous_one(RawMetalContext& ctx,
     (void)base;
 }
 
+// Exactly `window` positions, including the query's own.
+//
+// vLLM, mlx-lm and llama.cpp all settled on `q - k < window` (strict), so a
+// window of W covers [q-W+1, q] -- W keys counting self. An off-by-one here is
+// the single most-cited pitfall in all three, and it is invisible in output:
+// attending W-1 or W+1 keys produces a plausible number.
+//
+// Pinned at the boundary rather than in the middle, where a fencepost hides: a
+// window of exactly N must equal full attention, and N-1 must not.
+void the_window_covers_exactly_that_many_positions_counting_self(
+    RawMetalContext& ctx, const Gemma4Psos& psos) {
+    std::printf("[window boundary: W keys including self]\n");
+    const int n_keys = 64;
+
+    SlotHandle q = ctx.heap_alloc(std::size_t(kHeads) * kD * 2);
+    SlotHandle k = ctx.heap_alloc(std::size_t(kMaxCtx) * kD * 2);
+    SlotHandle v = ctx.heap_alloc(std::size_t(kMaxCtx) * kD * 2);
+    SlotHandle out = ctx.heap_alloc(std::size_t(kHeads) * kD * 2 * 3);
+    if (!q.valid() || !out.valid()) {
+        expect(false, "fixture allocates");
+        return;
+    }
+    auto* qp = static_cast<std::uint16_t*>(q.contents());
+    for (int i = 0; i < kHeads * kD; ++i) qp[i] = to_bf16(noise(i + 13) * 0.5f);
+    auto* kp = static_cast<std::uint16_t*>(k.contents());
+    auto* vp = static_cast<std::uint16_t*>(v.contents());
+    for (int i = 0; i < kMaxCtx * kD; ++i) {
+        kp[i] = to_bf16(noise(i + 7777) * 0.5f);
+        vp[i] = to_bf16(noise(i + 4242) * 0.5f);
+    }
+    std::memset(out.contents(), 0, out.size);
+
+    const int stride = kHeads * kD;
+    Fixture f{ctx, q, k, v, out};
+    // arm 0: full attention. arm 1: window == n_keys. arm 2: window == n_keys-1.
+    f.bind(600, n_keys, 0, stride, stride, 0, 0);
+    f.bind(601, n_keys, n_keys, stride, stride, 0, std::size_t(stride));
+    f.bind(602, n_keys, n_keys - 1, stride, stride, 0, std::size_t(2) * stride);
+    ctx.make_resident();
+    for (int arm = 0; arm < 3; ++arm) {
+        ctx.run_step([&](StepEncoder& se) {
+            Grid g; Threadgroup t;
+            sdpa_sliding_dispatch(kHeads, g, t, 1);
+            se.set_pso(psos.sdpa_swa_d256);
+            se.set_argtable_ordinal(600 + arm);
+            se.dispatch(g, t);
+            se.barrier();
+        });
+    }
+
+    const auto* op = static_cast<const std::uint16_t*>(out.contents());
+    int full_vs_exact = 0, full_vs_short = 0;
+    for (int i = 0; i < stride; ++i) {
+        full_vs_exact += op[i] != op[stride + i] ? 1 : 0;
+        full_vs_short += op[i] != op[2 * stride + i] ? 1 : 0;
+    }
+    expect(full_vs_exact == 0,
+           "a window of exactly N is full attention (so N keys, counting self)");
+    expect(full_vs_short > 0,
+           "a window of N-1 is not (so the boundary is where it should be)");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -431,6 +493,7 @@ int main(int argc, char** argv) {
 
     a_prefill_row_matches_the_decode_step_that_would_have_made_it(*ctx, psos, 512, "512");
     a_prefill_row_matches_the_decode_step_that_would_have_made_it(*ctx, psos, 0, "0 (full)");
+    the_window_covers_exactly_that_many_positions_counting_self(*ctx, psos);
     the_elementwise_kernels_are_already_batched(*ctx, psos);
 
     DecodeStepPsos base;

@@ -35,6 +35,12 @@ void launch_shape(const Dispatch& d, const Gemma4Geometry& g, Grid& grid, Thread
 void launch_shape_mb(const Dispatch& d, const Gemma4Geometry& g, int rows, Grid& grid,
                      Threadgroup& tg);
 
+/// The pipeline a dispatch runs on at M>1. Differs from `pso_for` only where the
+/// kernel itself changes with the batch; everything else falls through.
+Pso pso_for_mb(const Dispatch& d, const Gemma4Geometry& g, int rows,
+               const DecodeStepPsos& base, const MultiBatchPsos& mb,
+               const Gemma4Psos& g4);
+
 /// `run_ends[i]`: the last ordinal of the concurrency run containing `i`. What
 /// the colourer needs to know about which barriers the encoder will drop.
 std::vector<int> gemma4_run_ends(const std::vector<Dispatch>& dag);

@@ -145,6 +145,53 @@ Kernel pso_kind(Kind k) {
     }
 }
 
+/// The pipeline a gemma4 dispatch runs on at M>1.
+///
+/// Distinct from `pso_for` for exactly the kinds whose KERNEL changes with the
+/// batch -- the projections (matvec at M=1, matmul at M>1) and the four that
+/// read per-row IO (embed, rope, kv append, attention). Everything else is the
+/// identical kernel at a wider `n`, so it falls through to `pso_for` rather than
+/// being restated here, where a copy could drift.
+///
+/// The tile choice mirrors `launch_shape_mb`'s exactly, because a grid computed
+/// for one tiling against a pipeline compiled for another is not a crash -- it
+/// is wrong numbers.
+Pso pso_for_mb(const Dispatch& d, const Gemma4Geometry& g, int rows,
+               const DecodeStepPsos& base, const MultiBatchPsos& mb,
+               const Gemma4Psos& g4) {
+    const int N = rows < 1 ? 1 : rows;
+
+    if (const KN kn = qmv_kn(d.kind, g, d.layer); kn.N != 0) {
+        const int bm = qmm_bm(N);
+        const int bn = qmm_bn(kn.N, N);
+        const int wide = bm == kQmmBMWide ? 1 : 0;
+        const int split = bn > 0 ? qmm_split_k(kn.N, N, kn.K, bm) : 0;
+        if (split > 1 && mb.qmm_t_splitk[wide].valid()) return mb.qmm_t_splitk[wide];
+        if (bn > 0) {
+            const int slot = bn == 64 ? 2 : (bn == 32 ? 1 : 0);
+            if (mb.qmm_t[wide][slot].valid()) return mb.qmm_t[wide][slot];
+        }
+        return pso_for(d, base, g4);  // the matvec, when no tiling applies
+    }
+
+    switch (d.kind) {
+        case Kind::EmbedGather:
+        case Kind::PleTokenGather:
+            return mb.embed_mb;
+        case Kind::RopeQ:
+        case Kind::RopeK:
+            return mb.rope_mb;
+        case Kind::KvAppend:
+            return mb.kv_append_paged;
+        // Paged, and windowed by the same slot for both attention types -- the
+        // head width is still what picks the instantiation.
+        case Kind::Sdpa:
+            return d.sliding ? mb.sdpa_paged : mb.sdpa_paged_d512;
+        default:
+            return pso_for(d, base, g4);
+    }
+}
+
 Pso pso_for(const Dispatch& d, const DecodeStepPsos& base, const Gemma4Psos& g4) {
     switch (d.kind) {
         // The gemma4-only kernels, which the shared table has no entry for.
