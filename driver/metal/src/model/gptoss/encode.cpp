@@ -211,6 +211,42 @@ Pso pso_for_paged(const Dispatch& d, const DecodeStepPsos& base, const MultiBatc
 /// attention takes the row on its second grid axis. What that leaves is the
 /// embedding gather (a different weight layout at M>1) and the YaRN rope (which
 /// must read `position[row]` and stride by a width its grid does not carry).
+/// How many rows a DENSE projection's GEMM runs over.
+///
+/// Padded up to a whole BM tile so the GEMM engages at any batch rather than
+/// only at exact multiples of one; the padding computes discardable values into
+/// pool rows the fire does not use. Below the shared selector's minimum the
+/// per-row matvec is genuinely the faster kernel.
+int gptoss_qmm_rows(int rows) {
+    const int n = rows < 1 ? 1 : rows;
+    if (n < kQmmMinBatch) return n;
+    const int bm = qmm_bm(n);
+    return ((n + bm - 1) / bm) * bm;
+}
+
+int gptoss_qmm_pool_rows(int max_rows) {
+    const int n = max_rows < 1 ? 1 : max_rows;
+    return ((n + kQmmBMWide - 1) / kQmmBMWide) * kQmmBMWide;
+}
+
+/// The dense projections, which are the ones a batched GEMM can serve.
+///
+/// NOT the routed three: each row picks its own experts, so their weight is
+/// chosen on the GPU and a tile spanning rows would span weights. That is the
+/// MoE's whole difficulty and it is not a launch shape.
+bool gptoss_is_dense_proj(Kind k) {
+    return k == Kind::QmvQ || k == Kind::QmvK || k == Kind::QmvV || k == Kind::QmvO ||
+           k == Kind::LmHead;
+}
+
+/// The GEMM's tile for a dense projection, or 0 to keep the matvec.
+int gptoss_qmm_bn(Kind k, const GptOssGeometry& g, int rows) {
+    if (!gptoss_is_dense_proj(k)) return 0;
+    const KN kn = qmv_kn(k, g);
+    if (kn.N == 0) return 0;
+    return qmm_bn(kn.N, gptoss_qmm_rows(rows));
+}
+
 Pso pso_for_mb(const Dispatch& d, const DecodeStepPsos& base, const MultiBatchPsos& mb,
                const GptOssPsos& go) {
     switch (d.kind) {
@@ -220,6 +256,27 @@ Pso pso_for_mb(const Dispatch& d, const DecodeStepPsos& base, const MultiBatchPs
         case Kind::RowGather:   return go.row_gather;
         default:                return pso_for_paged(d, base, mb, go);
     }
+}
+
+/// The pipeline for a dispatch whose tiling depends on the batch. Split from
+/// `pso_for_mb` because the tile choice must mirror `launch_shape_mb`'s
+/// EXACTLY: a grid computed for one tiling against a pipeline compiled for
+/// another is not a crash, it is wrong numbers.
+Pso pso_for_mb_rows(const Dispatch& d, const GptOssGeometry& g, int rows,
+                    const DecodeStepPsos& base, const MultiBatchPsos& mb,
+                    const GptOssPsos& go, int head_rows) {
+    const int N = rows < 1 ? 1 : rows;
+    const int S = head_rows < 1 ? N : (head_rows < N ? head_rows : N);
+    const int m = d.kind == Kind::LmHead ? S : N;
+    if (const int bn = gptoss_qmm_bn(d.kind, g, m); bn > 0) {
+        const int padded = gptoss_qmm_rows(m);
+        const int wide = qmm_bm(padded) == kQmmBMWide ? 1 : 0;
+        const int slot = bn == 64 ? 2 : (bn == 32 ? 1 : 0);
+        // The LM head has no bias; every other projection here does.
+        const auto& table = d.kind == Kind::LmHead ? mb.qmm_t : mb.qmm_t_bias;
+        if (table[wide][slot].valid()) return table[wide][slot];
+    }
+    return pso_for_mb(d, base, mb, go);
 }
 
 void launch_shape_mb(const Dispatch& d, const GptOssGeometry& g, int rows, Grid& grid,
@@ -238,6 +295,14 @@ void launch_shape_mb(const Dispatch& d, const GptOssGeometry& g, int rows, Grid&
         const bool routed = d.kind == Kind::ExpertGate || d.kind == Kind::ExpertUp ||
                             d.kind == Kind::ExpertDown;
         const int m = d.kind == Kind::LmHead ? S : N;
+        // A dense projection becomes a matmul once the batch fills a tile: the
+        // matvec re-reads the whole weight PER ROW, which on this checkpoint is
+        // 318 MB a layer.
+        if (const int bn = gptoss_qmm_bn(d.kind, g, m); bn > 0) {
+            const int padded = gptoss_qmm_rows(m);
+            qmm_t_dispatch(kn.N, padded, bn, qmm_bm(padded), grid, tg);
+            return;
+        }
         qmv_dispatch(kn.N, routed ? g.experts_per_token : 1, grid, tg, m);
         return;
     }
@@ -306,7 +371,7 @@ void encode_gptoss_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
         Grid grid;
         Threadgroup tg;
         launch_shape_mb(d, g, rows, grid, tg, head_rows);
-        se.set_pso(pso_for_mb(d, base, mb, go));
+        se.set_pso(pso_for_mb_rows(d, g, rows, base, mb, go, head_rows));
         se.set_argtable_ordinal(ordinal_base + d.ordinal);
         se.dispatch(grid, tg);
         if (i + 1 >= dag.size() || run_ends[i] == static_cast<int>(i)) se.barrier();

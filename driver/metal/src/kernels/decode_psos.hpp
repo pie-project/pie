@@ -48,6 +48,10 @@ struct MultiBatchPsos {
     // [bm_wide][bn]: 16/32 rows per block x 16/32/64 columns.
     Pso qmm_t[2][3]{};
     Pso qmm_t_residual[2][3]{};
+    /// The same GEMM with a Linear's additive bias broadcast down the tile.
+    /// gpt-oss biases every projection, so without it the batched path is a
+    /// GEMM plus a dispatch that rewrites the whole output to add one vector.
+    Pso qmm_t_bias[2][3]{};
     // affine_qmm_t_strided: the same GEMM with an explicit row pitch, for the
     // prefill, whose scratch rows are laid at a uniform `scratch_widest_elems`
     // rather than packed at `K`.

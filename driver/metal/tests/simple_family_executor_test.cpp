@@ -355,7 +355,12 @@ int main() {
                 expect(ta[0] == 40510,
                        "gpt-oss: a sequence's answer is unchanged by a sibling sharing its "
                        "fire");
-                expect(tb[0] != ta[0] || tb[1] != ta[1],
+                // "The capital of France is" -> " Paris". Pinned rather than
+                // merely "different from A": a 17-row fire takes the wide GEMM
+                // block, and when that pipeline was mis-selected B's last row
+                // was never computed -- which reads as a different token, so a
+                // difference test passed on output nothing had written.
+                expect(tb[0] == 12650,
                        "gpt-oss: and the shorter one is answered from its OWN pages, not its "
                        "neighbour's");
             }

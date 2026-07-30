@@ -249,7 +249,7 @@ int main(int argc, char** argv) {
     }
     g.vocab = 262144;
     g.kv_page_size = 32;
-    g.total_pages = 4;              // one request's worth; 16 tokens fit in one
+    g.total_pages = 4;              // one request's worth; 32 tokens fit in one
     g.kv_max_ctx = g.kv_page_size * g.total_pages;
     // `PIE_G4MB_ENGINELIKE` reproduces the executor engine's configuration of
     // this same path, so the difference between them can be bisected here
@@ -337,7 +337,7 @@ int main(int argc, char** argv) {
     // The 16-row case below fires more rows than the default prompt has, and a
     // projection pads its batch up to a whole GEMM tile on top of that, so the
     // pool is sized for the widest fire this file makes rather than for `N`.
-    const int pool_rows = gemma4_qmm_pool_rows(std::max(N, 16));
+    const int pool_rows = gemma4_qmm_pool_rows(std::max(N, 32));
     for (int c = 0; c < coloring.colors_used; ++c) {
         const std::size_t w = slot_elems[std::size_t(c)] > 0 ? slot_elems[std::size_t(c)]
                                                              : std::size_t(g.hidden);
@@ -555,6 +555,42 @@ int main(int argc, char** argv) {
             std::printf("    (16 rows, the GEMM's batch: argmax %d)\n", bi);
             expect(bi == 476, "the GEMM path agrees with mlx-lm");
         }
+    }
+
+    // ── Thirty-two rows: the WIDE row block ──
+    //
+    // Above 32 rows the GEMM switches to BM=32, and `qmm_bn` takes the widest
+    // column tile that divides the output -- which for every projection in this
+    // checkpoint is 64. That pair was never instantiated: the loader aliased it
+    // onto the BM=16 pipeline, so the grid was built for 32 rows per block and
+    // the pipeline computed 16, and HALF the batch was never written. At 32 rows
+    // this model's logits came back all zero.
+    //
+    // 16 rows does not catch it (BM=16 there) and 12 does not either, so the
+    // wide block needs a case of its own.
+    if (default_prompt) {
+        std::vector<std::uint32_t> ids32;
+        for (int rep = 0; rep < 4; ++rep) ids32.insert(ids32.end(), ids.begin(), ids.end());
+        const int rows32 = int(ids32.size());
+        for (int L = 0; L < g.n_layers; ++L) {
+            if (g.is_kv_shared(L)) continue;
+            std::memset(kpages[std::size_t(L)].contents(), 0, kpages[std::size_t(L)].size);
+            std::memset(vpages[std::size_t(L)].contents(), 0, vpages[std::size_t(L)].size);
+        }
+        fill_io(ids32, {0u}, g.total_pages);
+        bind_gemma4_consts(*ctx, dag, g, rows32, /*paged=*/true);
+        ctx->run_step([&](StepEncoder& se) {
+            encode_gemma4_step_mb(se, dag, g, rows32, base, mb, psos);
+        });
+        const auto* r = logits + std::size_t(rows32 - 1) * std::size_t(g.vocab);
+        int bi = -1;
+        float bv = -1e30f;
+        for (int i = 0; i < g.vocab; ++i) {
+            const float v = from_bf16(r[i]);
+            if (v > bv) { bv = v; bi = i; }
+        }
+        std::printf("    (32 rows, the wide row block: argmax %d)\n", bi);
+        expect(bi == 818, "the wide-BM GEMM agrees with mlx-lm");
     }
 
     // ── Two requests in one fire ──

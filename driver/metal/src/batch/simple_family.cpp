@@ -634,8 +634,11 @@ class GptOssEngine final : public SimpleFamilyEngine {
         // as many rows of its own width as the widest dispatch that touches it.
         // Sizing them all at the vocabulary costs 70x on the body's tensors.
         b_.pool.resize(std::size_t(coloring_.colors_used));
+        // The dense projections pad their row count to a whole GEMM tile, so
+        // the pool has to hold the padded count -- the padding rows are written.
         const std::vector<std::size_t> elems =
-            go_pool_elems(dag_, g_, coloring_, max_rows_, max_sampled_);
+            go_pool_elems(dag_, g_, coloring_, gptoss::gptoss_qmm_pool_rows(max_rows_),
+                          gptoss::gptoss_qmm_pool_rows(max_sampled_));
         for (int c = 0; c < coloring_.colors_used; ++c) {
             b_.pool[std::size_t(c)] = ctx.heap_alloc(elems[std::size_t(c)] * 2);
         }
@@ -650,7 +653,8 @@ class GptOssEngine final : public SimpleFamilyEngine {
         // landed -- otherwise a later member's prompt overwrites an earlier
         // member's answer, which reads as that member being answered from its
         // neighbour's prompt.
-        logits_ = ctx.heap_alloc(std::size_t(max_sampled_ + 1) * std::size_t(g_.vocab) * 2);
+        logits_ = ctx.heap_alloc(std::size_t(gptoss::gptoss_qmm_pool_rows(max_sampled_)) *
+                                 std::size_t(g_.vocab) * 2);
         if (!logits_.valid()) {
             if (err) *err = "gpt-oss logits allocation failed";
             return false;
@@ -830,6 +834,8 @@ std::size_t SimpleFamilyEngine::extra_heap_bytes(pie::metal::model::ModelFamily 
         const gptoss::ScratchPlan sp = gptoss::build_gptoss_scratch(dag, g);
         const gptoss::ScratchColoring col =
             gptoss::color_gptoss_scratch(dag, sp, /*no_recycle=*/golden_taps_enabled());
+        rows = gptoss::gptoss_qmm_pool_rows(rows);
+        sampled = gptoss::gptoss_qmm_pool_rows(sampled);
         for (const std::size_t e : go_pool_elems(dag, g, col, rows, sampled)) bytes += e * 2;
         bytes += std::size_t(sampled) * std::size_t(g.vocab) * 2;  // the logits slot
     }

@@ -37,6 +37,12 @@ std::vector<int> gptoss_run_ends(const std::vector<Dispatch>& dag);
 /// compacts, and what the tail after it runs on. 0 means every row.
 Pso pso_for_mb(const Dispatch& d, const DecodeStepPsos& base, const MultiBatchPsos& mb,
                const GptOssPsos& go);
+Pso pso_for_mb_rows(const Dispatch& d, const GptOssGeometry& g, int rows,
+                    const DecodeStepPsos& base, const MultiBatchPsos& mb,
+                    const GptOssPsos& go, int head_rows = 0);
+/// How many rows the activation pool must hold for `max_rows` to be paddable to
+/// a whole GEMM tile.
+int gptoss_qmm_pool_rows(int max_rows);
 void launch_shape_mb(const Dispatch& d, const GptOssGeometry& g, int rows, Grid& grid,
                      Threadgroup& tg, int head_rows = 0);
 void encode_gptoss_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
