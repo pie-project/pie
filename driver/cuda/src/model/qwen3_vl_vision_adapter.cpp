@@ -50,7 +50,9 @@ struct VisAttnRes {
     std::uint32_t *qo_d = nullptr, *kvpi_d = nullptr, *kvidx_d = nullptr, *klpl_d = nullptr;
     std::mutex mu;
 };
-VisAttnRes& vis_attn() { static VisAttnRes v; return v; }
+// Per-thread: TP ranks are separate threads on different GPUs; a process-wide
+// singleton would cudaMalloc the workspace/indices on the first rank's device.
+VisAttnRes& vis_attn() { thread_local VisAttnRes v; return v; }
 constexpr int kVisPageSize = 16;  // image patch counts are multiples; flashinfer-friendly
 }  // namespace
 

@@ -1096,8 +1096,9 @@ int tensor_rows(const DeviceTensor& t) {
 }
 
 std::int32_t* sampled_pinned_buf(std::size_t want_elems) {
-    static std::int32_t* buf = nullptr;
-    static std::size_t buf_capacity = 0;
+    // Per-thread pinned scratch: TP ranks are separate threads in one process.
+    thread_local std::int32_t* buf = nullptr;
+    thread_local std::size_t buf_capacity = 0;
     if (want_elems > buf_capacity) {
         if (buf) cudaFreeHost(buf);
         CUDA_CHECK(cudaMallocHost(&buf, want_elems * sizeof(std::int32_t)));

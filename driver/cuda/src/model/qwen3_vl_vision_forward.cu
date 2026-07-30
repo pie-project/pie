@@ -30,7 +30,6 @@
 #include <cublas_v2.h>
 #include <map>
 #include <math_constants.h>
-#include <mutex>
 #include <stdexcept>
 #include <tuple>
 #include <string>
@@ -494,19 +493,17 @@ void scatter_qwen3vl_vision(const Qwen3VLVisionInputs& vin, bf* hidden,
 
     // The abs pos-embed table is a constant model weight. Cache the host-side
     // fp32 copy (keyed by the device pointer) so we don't re-do the ~5 MB D2H +
-    // convert on every forward pass. Forward passes for one model are serialized
-    // by the engine; the mutex guards the (rare) first-touch.
+    // convert on every forward pass. Per-thread: TP ranks own different devices /
+    // weight pointers; a process-wide static would D2H from the wrong GPU.
     auto t_tbl0=clk::now();
-    static std::mutex tbl_mu; static const void* tbl_key=nullptr; static std::vector<float> tbl_cache;
-    {
-        std::lock_guard<std::mutex> lk(tbl_mu);
-        if(tbl_key != w.pos_embed){
-            std::vector<bf> tbf((long)w.num_pos_embed*Hd);
-            QCK(cudaMemcpy(tbf.data(),w.pos_embed,(long)w.num_pos_embed*Hd*sizeof(bf),cudaMemcpyDeviceToHost));
-            tbl_cache.resize(tbf.size());
-            for(size_t i=0;i<tbf.size();++i) tbl_cache[i]=__bfloat162float(tbf[i]);
-            tbl_key = w.pos_embed;
-        }
+    thread_local const void* tbl_key=nullptr;
+    thread_local std::vector<float> tbl_cache;
+    if(tbl_key != w.pos_embed){
+        std::vector<bf> tbf((long)w.num_pos_embed*Hd);
+        QCK(cudaMemcpy(tbf.data(),w.pos_embed,(long)w.num_pos_embed*Hd*sizeof(bf),cudaMemcpyDeviceToHost));
+        tbl_cache.resize(tbf.size());
+        for(size_t i=0;i<tbf.size();++i) tbl_cache[i]=__bfloat162float(tbf[i]);
+        tbl_key = w.pos_embed;
     }
     const std::vector<float>& table = tbl_cache;
     if(VTIM) fprintf(stderr,"[vtim] num_images=%d  pos_embed table = %.1fms\n", vin.num_images, MS(t_tbl0,clk::now()));
@@ -517,10 +514,10 @@ void scatter_qwen3vl_vision(const Qwen3VLVisionInputs& vin, bf* hidden,
     // rope positions + interpolated pos-embed are a deterministic function of the
     // grid — identical for every same-size image. Cache the device buffers by grid
     // so the CPU interp + bf16 convert + H2D run ONCE, not per image.
-    static std::mutex pe_mu;
-    static std::map<std::tuple<int,int,int>, std::pair<float*,bf*>> pe_cache;
+    // thread_local: buffers are device memory; a process-wide map would IMA under
+    // multi-GPU TP threads.
+    thread_local std::map<std::tuple<int,int,int>, std::pair<float*,bf*>> pe_cache;
     auto grid_rope_pe = [&](int gt,int gh,int gw)->std::pair<float*,bf*>{
-        std::lock_guard<std::mutex> lk(pe_mu);
         auto key=std::make_tuple(gt,gh,gw); auto it=pe_cache.find(key);
         if(it!=pe_cache.end()) return it->second;
         auto c0=clk::now();

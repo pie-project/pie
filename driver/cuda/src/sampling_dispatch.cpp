@@ -34,8 +34,10 @@ void upload_async(DeviceBuffer<T>& dst, std::span<const T> src,
 // Pinned host scratch for the topk+top-p seed widening. Allocated once
 // per process so we can keep upload_sampling_inputs allocation-free.
 std::uint64_t* seed64_pinned_buf(std::size_t want_elems) {
-    static std::uint64_t* buf = nullptr;
-    static std::size_t buf_capacity = 0;
+    // Per-thread pinned scratch: TP ranks are separate threads; a process-wide
+    // static races if both ranks ever widen seeds concurrently.
+    thread_local std::uint64_t* buf = nullptr;
+    thread_local std::size_t buf_capacity = 0;
     if (want_elems > buf_capacity) {
         if (buf) cudaFreeHost(buf);
         CUDA_CHECK(cudaMallocHost(&buf, want_elems * sizeof(std::uint64_t)));

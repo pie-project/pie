@@ -905,8 +905,10 @@ void launch_lm_head_gemv_argmax_int8(
 
     const std::size_t pairs_elems =
         static_cast<std::size_t>(num_blocks_x) * num_rows;
-    static std::uint64_t* s_partial_pairs = nullptr;
-    static std::size_t s_pairs_cap = 0;
+    // TP ranks are separate threads on different devices; process-wide
+    // static device pointers IMA across ranks.
+    thread_local std::uint64_t* s_partial_pairs = nullptr;
+    thread_local std::size_t s_pairs_cap = 0;
     if (pairs_elems > s_pairs_cap) {
         if (s_partial_pairs) cudaFree(s_partial_pairs);
         cudaMalloc(&s_partial_pairs, pairs_elems * sizeof(std::uint64_t));
@@ -1024,8 +1026,8 @@ void launch_lm_head_gemv_argmax_bf16(
 
     const std::size_t pairs_elems =
         static_cast<std::size_t>(num_blocks_x) * num_rows;
-    static std::uint64_t* s_partial_pairs_bf16 = nullptr;
-    static std::size_t s_pairs_cap_bf16 = 0;
+    thread_local std::uint64_t* s_partial_pairs_bf16 = nullptr;
+    thread_local std::size_t s_pairs_cap_bf16 = 0;
     if (pairs_elems > s_pairs_cap_bf16) {
         if (s_partial_pairs_bf16) cudaFree(s_partial_pairs_bf16);
         cudaMalloc(&s_partial_pairs_bf16, pairs_elems * sizeof(std::uint64_t));
