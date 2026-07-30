@@ -14,6 +14,8 @@
 
 #include "decode_consts.hpp"
 
+#include "encode.hpp"
+
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
@@ -105,7 +107,10 @@ int bind_gemma4_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
         if (const KN kn = qmv_kn(d.kind, g, L); kn.N != 0) {
             bind_const<std::int32_t>(ctx, ord, (std::uint8_t)bind::Qmv::K, kn.K, &count);
             bind_const<std::int32_t>(ctx, ord, (std::uint8_t)bind::Qmv::N, kn.N, &count);
-            const std::uint32_t m = d.kind == Kind::LmHead ? S : R;
+            // The padded row count, matching `launch_shape_mb`: the GEMM is
+            // dispatched over whole tiles, and M is what bounds its inner loop.
+            const std::uint32_t m = std::uint32_t(
+                gemma4_qmm_rows(int(d.kind == Kind::LmHead ? S : R)));
             // The GEMM shares Qmv's ordinals 0-6 and appends M. Bound
             // unconditionally: at rows==1 the matvec simply never reads slot 7,
             // and an unbound slot on the prefill path is a row count read out of

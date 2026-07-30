@@ -23,6 +23,24 @@
 
 namespace pie::metal::gemma4 {
 
+int gemma4_qmm_rows(int rows) {
+    const int n = rows < 1 ? 1 : rows;
+    // Below the shared selector's minimum the GEMV is genuinely faster (it is
+    // one pass over the weight either way, and the GEMM's tile setup is not
+    // free), so leave those alone.
+    if (n < kQmmMinBatch) return n;
+    const int bm = qmm_bm(n);
+    return ((n + bm - 1) / bm) * bm;
+}
+
+int gemma4_qmm_pool_rows(int max_rows) {
+    const int n = max_rows < 1 ? 1 : max_rows;
+    // Any row count up to `n` pads to at most this.
+    const int bm = kQmmBMWide;
+    return ((n + bm - 1) / bm) * bm;
+}
+
+
 namespace {
 
 /// Dispatches that may run together: same layer, mutually independent, all
@@ -163,11 +181,12 @@ Pso pso_for_mb(const Dispatch& d, const Gemma4Geometry& g, int rows,
     const int S = head_rows < 1 ? N : (head_rows < N ? head_rows : N);
 
     if (const KN kn = qmv_kn(d.kind, g, d.layer); kn.N != 0) {
-        const int M = d.kind == Kind::LmHead ? S : N;
+        const int M = gemma4_qmm_rows(d.kind == Kind::LmHead ? S : N);
         const int bm = qmm_bm(M);
         const int bn = qmm_bn(kn.N, M);
         const int wide = bm == kQmmBMWide ? 1 : 0;
-        const int split = bn > 0 ? qmm_split_k(kn.N, M, kn.K, bm) : 0;
+        // No split-K here either; see `launch_shape_mb`.
+        const int split = 0;
         if (split > 1 && mb.qmm_t_splitk[wide].valid()) return mb.qmm_t_splitk[wide];
         if (bn > 0) {
             const int slot = bn == 64 ? 2 : (bn == 32 ? 1 : 0);
@@ -247,12 +266,28 @@ void launch_shape_mb(const Dispatch& d, const Gemma4Geometry& g, int rows, Grid&
     const int S = head_rows < 1 ? N : (head_rows < N ? head_rows : N);
 
     // The projections become matmuls. Tiling is chosen by the shared selectors,
-    // so gemma4 gets whatever qwen3.5's prefill measured its way to.
+    // so gemma4 gets whatever qwen3.5's prefill measured its way to -- except
+    // for the row count, which is PADDED to a whole tile here.
+    //
+    // `qmm_bn` refuses a batch that does not fill one (`N % bm != 0`), and the
+    // fallback is a per-row GEMV that re-reads the whole weight for every row.
+    // On a 2.6 GB model that is the difference between amortizing the weights
+    // and not: measured at 8 lanes, this family's throughput was 1.12x its
+    // single-stream rate, and the GEMM only engaged at a batch of exactly 16.
+    // The padding rows compute discardable values into pool rows the fire does
+    // not use, which is the same trade the prefill's strided GEMM already makes.
     if (const KN kn = qmv_kn(d.kind, g, L); kn.N != 0) {
-        const int M = d.kind == Kind::LmHead ? S : N;
+        const int M = gemma4_qmm_rows(d.kind == Kind::LmHead ? S : N);
         const int bm = qmm_bm(M);
         const int bn = qmm_bn(kn.N, M);
-        const int split = bn > 0 ? qmm_split_k(kn.N, M, kn.K, bm) : 0;
+        // NO split-K. The split GEMM accumulates partial sums into a split
+        // buffer and needs a reduce pass to fold them; qwen3.5 has both, this
+        // family has neither -- so a split dispatch here wrote partials nobody
+        // summed. It never showed up because the split only engages at
+        // `qmm_bn != 0`, which needed a batch of exactly 16, and no test fired
+        // one: measured against mlx-lm, a 16-row prefill answered 147040 where
+        // the oracle says 476.
+        const int split = 0;
         if (split > 1) {
             qmm_t_splitk_dispatch(kn.N, M, bm, split, grid, tg);
         } else if (bn > 0) {

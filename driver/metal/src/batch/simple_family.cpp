@@ -256,8 +256,11 @@ class Gemma4Engine final : public SimpleFamilyEngine {
         // Every activation is [rows, width] row-major at M>1, so a pool slot is
         // as many rows of its own width as the widest dispatch that touches it.
         b_.pool.resize(std::size_t(coloring_.colors_used));
+        // The projections pad their row count to a whole GEMM tile, so the pool
+        // has to hold the padded count -- the padding rows are written.
         const std::vector<std::size_t> elems =
-            g4_pool_elems(dag_, g_, coloring_, max_rows_, max_sampled_);
+            g4_pool_elems(dag_, g_, coloring_, gemma4::gemma4_qmm_pool_rows(max_rows_),
+                          gemma4::gemma4_qmm_pool_rows(max_sampled_));
         for (int c = 0; c < coloring_.colors_used; ++c) {
             b_.pool[std::size_t(c)] = ctx.heap_alloc(elems[std::size_t(c)] * 2);
         }
@@ -269,7 +272,8 @@ class Gemma4Engine final : public SimpleFamilyEngine {
         // The logits leave the pool: the sampler reads a slot of its own, so the
         // tail writes there and nothing copies afterwards. One row per SAMPLED
         // row, which is what the tail produces.
-        logits_ = ctx.heap_alloc(std::size_t(max_sampled_) * std::size_t(g_.vocab) * 2);
+        logits_ = ctx.heap_alloc(std::size_t(gemma4::gemma4_qmm_pool_rows(max_sampled_)) *
+                                 std::size_t(g_.vocab) * 2);
         if (!logits_.valid()) {
             if (err) *err = "gemma4 logits allocation failed";
             return false;
@@ -545,6 +549,8 @@ std::size_t SimpleFamilyEngine::extra_heap_bytes(pie::metal::model::ModelFamily 
         const gemma4::ScratchPlan sp = gemma4::build_gemma4_scratch(dag, pg);
         const gemma4::ScratchColoring col =
             gemma4::color_gemma4_scratch(dag, sp, /*no_recycle=*/golden_taps_enabled());
+        rows = gemma4::gemma4_qmm_pool_rows(rows);
+        sampled = gemma4::gemma4_qmm_pool_rows(sampled);
         for (const std::size_t e : g4_pool_elems(dag, pg, col, rows, sampled)) bytes += e * 2;
         bytes += std::size_t(sampled) * std::size_t(g.vocab) * 2;  // the logits slot
     } else if (family == pie::metal::model::ModelFamily::GptOss) {

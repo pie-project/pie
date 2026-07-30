@@ -32,6 +32,16 @@ void launch_shape(const Dispatch& d, const Gemma4Geometry& g, Grid& grid, Thread
 
 /// The same, for a batch of `rows` tokens. At rows==1 it must agree with
 /// `launch_shape` exactly -- one path, checked, rather than two that drift.
+/// How many rows a projection's GEMM runs over, given the fire's `rows`.
+///
+/// Padded up to a whole `BM` tile so the GEMM engages at any batch instead of
+/// only at exact multiples of it. The pool holds `gemma4_qmm_pool_rows(max)`
+/// rows so the padding always lands somewhere allocated.
+int gemma4_qmm_rows(int rows);
+
+/// How many rows the activation pool must hold for `max_rows` to be paddable.
+int gemma4_qmm_pool_rows(int max_rows);
+
 /// `head_rows` is how many rows the fire SAMPLES -- what `Kind::RowGather`
 /// compacts, and what the tail after it runs on. 0 means every row.
 void launch_shape_mb(const Dispatch& d, const Gemma4Geometry& g, int rows, Grid& grid,
