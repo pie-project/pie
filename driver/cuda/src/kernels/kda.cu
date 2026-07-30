@@ -1,5 +1,7 @@
 #include "kernels/kda.hpp"
 
+#include <algorithm>
+
 #include <cuda_bf16.h>
 #include <cstdint>
 
@@ -290,7 +292,15 @@ void launch_kda_prefill_batched(
 {
     if (R <= 0 || H <= 0 || D <= 0) return;
     const dim3 grid(static_cast<unsigned>(R), static_cast<unsigned>(H));
-    const int threads = 256;
+    // The recurrence serializes over tokens, so the only parallelism a block
+    // has is across the state's `v` rows -- one warp each, `D / warps` rows per
+    // warp per token. At 256 threads a 128-row state gives every warp 16 rows
+    // to walk in sequence, and with a grid of only R*H blocks the whole kernel
+    // was using a tenth of the machine. Widening the block is the entire fix:
+    // 2.2x at T=2048 (26.2 ms -> 12.0 ms per layer, measured at K3's widths).
+    // One warp per row is the useful limit; beyond that warps sit idle.
+    const int warps = std::min(32, D);
+    const int threads = warps * 32;
     const std::size_t shmem = static_cast<std::size_t>(3 * D) * sizeof(float);
     kda_prefill_batched_kernel<<<grid, threads, shmem, stream>>>(
         q_norm, k_norm, v, gate, beta, state_base, slot_ids, qo_indptr,
