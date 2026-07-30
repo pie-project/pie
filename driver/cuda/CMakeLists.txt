@@ -1071,6 +1071,12 @@ pie_add_cuda_target(test_tp_gate
   LIBS Threads::Threads)
 pie_add_cuda_target(test_grouped_copy
   SOURCES tests/grouped_copy_test.cpp)
+# The non-compact ExtentWrite path. Header-only: it builds its own one-file
+# plan, so it needs the loader's headers but not the staticlib.
+pie_add_cuda_target(test_strided_copy
+  SOURCES tests/strided_copy_test.cu
+  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/src ${PIE_LOADER_INCLUDE_DIR}
+  LIBS CUDA::cudart)
 pie_add_cuda_target(test_nucleus_region
   SOURCES tests/nucleus_region_test.cpp
   INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/../abi/include ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include ${PIE_DRIVER_ABI_INCLUDE_DIR} ${PIE_LOADER_INCLUDE_DIR}
