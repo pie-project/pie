@@ -23,6 +23,24 @@
 
 namespace pie::metal::gemma4 {
 
+int gemma4_qmm_rows(int rows) {
+    const int n = rows < 1 ? 1 : rows;
+    // Below the shared selector's minimum the GEMV is genuinely faster (it is
+    // one pass over the weight either way, and the GEMM's tile setup is not
+    // free), so leave those alone.
+    if (n < kQmmMinBatch) return n;
+    const int bm = qmm_bm(n);
+    return ((n + bm - 1) / bm) * bm;
+}
+
+int gemma4_qmm_pool_rows(int max_rows) {
+    const int n = max_rows < 1 ? 1 : max_rows;
+    // Any row count up to `n` pads to at most this.
+    const int bm = kQmmBMWide;
+    return ((n + bm - 1) / bm) * bm;
+}
+
+
 namespace {
 
 /// Dispatches that may run together: same layer, mutually independent, all
@@ -84,6 +102,8 @@ std::vector<int> gemma4_run_ends(const std::vector<Dispatch>& dag) {
 /// and those are per ordinal.
 Kernel shared_kind(Kind k) {
     switch (k) {
+        // No weights: the gather is pure dataflow.
+        case Kind::RowGather:           return Kernel::G4RowGather;
         case Kind::EmbedGather:         return Kernel::EmbedGather;
         // NOT EmbedGather: that key binds `shared_embedding`, and this gathers
         // the SECOND table. Sharing the key silently read the token embedding
@@ -156,14 +176,17 @@ Kernel pso_kind(Kind k) {
 /// is wrong numbers.
 Pso pso_for_mb(const Dispatch& d, const Gemma4Geometry& g, int rows,
                const DecodeStepPsos& base, const MultiBatchPsos& mb,
-               const Gemma4Psos& g4) {
+               const Gemma4Psos& g4, int head_rows) {
     const int N = rows < 1 ? 1 : rows;
+    const int S = head_rows < 1 ? N : (head_rows < N ? head_rows : N);
 
     if (const KN kn = qmv_kn(d.kind, g, d.layer); kn.N != 0) {
-        const int bm = qmm_bm(N);
-        const int bn = qmm_bn(kn.N, N);
+        const int M = gemma4_qmm_rows(d.kind == Kind::LmHead ? S : N);
+        const int bm = qmm_bm(M);
+        const int bn = qmm_bn(kn.N, M);
         const int wide = bm == kQmmBMWide ? 1 : 0;
-        const int split = bn > 0 ? qmm_split_k(kn.N, N, kn.K, bm) : 0;
+        // No split-K here either; see `launch_shape_mb`.
+        const int split = 0;
         if (split > 1 && mb.qmm_t_splitk[wide].valid()) return mb.qmm_t_splitk[wide];
         if (bn > 0) {
             const int slot = bn == 64 ? 2 : (bn == 32 ? 1 : 0);
@@ -201,6 +224,7 @@ Pso pso_for(const Dispatch& d, const DecodeStepPsos& base, const Gemma4Psos& g4)
         case Kind::PleGeglu:     return g4.geglu_tanh;
         case Kind::LayerScalar:  return g4.layer_scalar;
         case Kind::FinalSoftcap: return g4.logit_softcap;
+        case Kind::RowGather:    return g4.row_gather;
         case Kind::PleCombine:   return g4.ple_combine;
         case Kind::VNorm:        return g4.vnorm;
         // Both gathers are scaled -- by sqrt(hidden) and sqrt(ple_dim) -- and
@@ -233,23 +257,43 @@ Pso pso_for(const Dispatch& d, const DecodeStepPsos& base, const Gemma4Psos& g4)
 /// `rows` is the token count in the batch. At rows==1 each case reduces to
 /// `launch_shape`'s, which the test asserts rather than assuming.
 void launch_shape_mb(const Dispatch& d, const Gemma4Geometry& g, int rows, Grid& grid,
-                     Threadgroup& tg) {
+                     Threadgroup& tg, int head_rows) {
     const int L = d.layer;
     const int hd = L >= 0 ? g.head_dim_of(L) : g.head_dim;
     const int N = rows < 1 ? 1 : rows;
+    // The tail's row count: what `RowGather` compacted. 0 means every row, for
+    // a caller that reads them all.
+    const int S = head_rows < 1 ? N : (head_rows < N ? head_rows : N);
 
     // The projections become matmuls. Tiling is chosen by the shared selectors,
-    // so gemma4 gets whatever qwen3.5's prefill measured its way to.
+    // so gemma4 gets whatever qwen3.5's prefill measured its way to -- except
+    // for the row count, which is PADDED to a whole tile here.
+    //
+    // `qmm_bn` refuses a batch that does not fill one (`N % bm != 0`), and the
+    // fallback is a per-row GEMV that re-reads the whole weight for every row.
+    // On a 2.6 GB model that is the difference between amortizing the weights
+    // and not: measured at 8 lanes, this family's throughput was 1.12x its
+    // single-stream rate, and the GEMM only engaged at a batch of exactly 16.
+    // The padding rows compute discardable values into pool rows the fire does
+    // not use, which is the same trade the prefill's strided GEMM already makes.
     if (const KN kn = qmv_kn(d.kind, g, L); kn.N != 0) {
-        const int bm = qmm_bm(N);
-        const int bn = qmm_bn(kn.N, N);
-        const int split = bn > 0 ? qmm_split_k(kn.N, N, kn.K, bm) : 0;
+        const int M = gemma4_qmm_rows(d.kind == Kind::LmHead ? S : N);
+        const int bm = qmm_bm(M);
+        const int bn = qmm_bn(kn.N, M);
+        // NO split-K. The split GEMM accumulates partial sums into a split
+        // buffer and needs a reduce pass to fold them; qwen3.5 has both, this
+        // family has neither -- so a split dispatch here wrote partials nobody
+        // summed. It never showed up because the split only engages at
+        // `qmm_bn != 0`, which needed a batch of exactly 16, and no test fired
+        // one: measured against mlx-lm, a 16-row prefill answered 147040 where
+        // the oracle says 476.
+        const int split = 0;
         if (split > 1) {
-            qmm_t_splitk_dispatch(kn.N, N, bm, split, grid, tg);
+            qmm_t_splitk_dispatch(kn.N, M, bm, split, grid, tg);
         } else if (bn > 0) {
-            qmm_t_dispatch(kn.N, N, bn, bm, grid, tg);
+            qmm_t_dispatch(kn.N, M, bn, bm, grid, tg);
         } else {
-            qmv_mb_dispatch(kn.N, N, grid, tg);
+            qmv_mb_dispatch(kn.N, M, grid, tg);
         }
         return;
     }
@@ -261,10 +305,18 @@ void launch_shape_mb(const Dispatch& d, const Gemma4Geometry& g, int rows, Grid&
         case Kind::PleTokenGather:
             embed_mb_dispatch(g.n_layers * g.per_layer_emb_dim, N, grid, tg);
             return;
-        case Kind::AttnNorm: case Kind::FfnNorm: case Kind::FinalRms:
+        case Kind::AttnNorm: case Kind::FfnNorm:
         case Kind::PostAttnResidual: case Kind::PostFfnResidual:
         case Kind::PleResidualScaled:
             rms_mb_dispatch(g.hidden, 1, N, grid, tg);
+            return;
+        // The tail runs on the SAMPLED rows, which `RowGather` compacted.
+        case Kind::FinalRms:
+            rms_mb_dispatch(g.hidden, 1, S, grid, tg);
+            return;
+        case Kind::RowGather:
+            grid = Grid{std::uint32_t(g.hidden), std::uint32_t(S), 1};
+            tg = Threadgroup{64, 1, 1};
             return;
         case Kind::QNorm:
             rms_mb_dispatch(hd, g.n_q_heads, N, grid, tg);
@@ -307,13 +359,13 @@ void launch_shape_mb(const Dispatch& d, const Gemma4Geometry& g, int rows, Grid&
             elementwise_mb_dispatch(g.n_layers * g.per_layer_emb_dim, N, grid, tg);
             return;
         case Kind::FinalSoftcap:
-            // Every row, not just the first. This used to cap one row on the
-            // grounds that only the sampled one matters -- but the row a prefill
-            // samples is the LAST, and the dispatch started at offset 0, so it
-            // capped a row nobody reads and left the one everybody does
-            // uncapped. Capping all of them costs M*vocab of tanh against an LM
-            // head that already computed M*vocab logits.
-            elementwise_mb_dispatch(g.vocab, N, grid, tg);
+            // Every SAMPLED row. This used to cap one row on the grounds that
+            // only the sampled one matters -- but the row a prefill samples is
+            // the LAST, and the dispatch started at offset 0, so it capped a row
+            // nobody reads and left the one everybody does uncapped. `RowGather`
+            // has since made "the sampled rows" a dense range, so all of them
+            // and only them is now the same statement.
+            elementwise_mb_dispatch(g.vocab, S, grid, tg);
             return;
         case Kind::Argmax:
             grid = Grid{1024, 1, 1};
@@ -349,6 +401,10 @@ void launch_shape(const Dispatch& d, const Gemma4Geometry& g, Grid& grid, Thread
             return;
         case Kind::PleTokenGather:
             elementwise_dispatch(g.n_layers * g.per_layer_emb_dim, grid, tg);
+            return;
+        case Kind::RowGather:
+            grid = Grid{std::uint32_t(g.hidden), 1, 1};
+            tg = Threadgroup{64, 1, 1};
             return;
         case Kind::AttnNorm: case Kind::FfnNorm: case Kind::FinalRms:
         case Kind::PostAttnResidual: case Kind::PostFfnResidual:
@@ -447,7 +503,7 @@ void encode_gemma4_step(StepEncoder& se, const std::vector<Dispatch>& dag,
 void encode_gemma4_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
                            const Gemma4Geometry& g, int rows,
                            const DecodeStepPsos& base, const MultiBatchPsos& mb,
-                           const Gemma4Psos& g4, int ordinal_base) {
+                           const Gemma4Psos& g4, int ordinal_base, int head_rows) {
     // Deliberately the same walk as `encode_gemma4_step`, differing only in
     // which shape and which pipeline each dispatch gets. The DAG, the ordering
     // and the concurrency runs are properties of the MODEL, not of the batch
@@ -458,8 +514,8 @@ void encode_gemma4_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
         const Dispatch& d = dag[i];
         Grid grid;
         Threadgroup tg;
-        launch_shape_mb(d, g, rows, grid, tg);
-        se.set_pso(pso_for_mb(d, g, rows, base, mb, g4));
+        launch_shape_mb(d, g, rows, grid, tg, head_rows);
+        se.set_pso(pso_for_mb(d, g, rows, base, mb, g4, head_rows));
         se.set_argtable_ordinal(ordinal_base + d.ordinal);
         se.dispatch(grid, tg);
         if (i + 1 >= dag.size() || run_ends[i] == static_cast<int>(i)) se.barrier();

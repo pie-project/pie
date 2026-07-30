@@ -185,6 +185,35 @@ void launch_shape(const Dispatch& d, const GptOssGeometry& g, Grid& grid, Thread
     }
 }
 
+Pso pso_for_paged(const Dispatch& d, const DecodeStepPsos& base, const MultiBatchPsos& mb,
+                  const GptOssPsos& go) {
+    switch (d.kind) {
+        case Kind::KvAppend:  return mb.kv_append_paged;
+        case Kind::SdpaSink:  return go.sdpa_sink_paged;
+        default:              return pso_for(d, base, go);
+    }
+}
+
+void encode_gptoss_step_paged(StepEncoder& se, const std::vector<Dispatch>& dag,
+                              const GptOssGeometry& g, const DecodeStepPsos& base,
+                              const MultiBatchPsos& mb, const GptOssPsos& go,
+                              int ordinal_base) {
+    // The same walk and the same shapes as the contiguous encoder: only the KV
+    // layout changed, and a layout is not a launch geometry. Both attention
+    // kernels are one threadgroup per query head either way.
+    const std::vector<int> run_ends = concurrent_run_ends(dag);
+    for (std::size_t i = 0; i < dag.size(); ++i) {
+        const Dispatch& d = dag[i];
+        Grid grid;
+        Threadgroup tg;
+        launch_shape(d, g, grid, tg);
+        se.set_pso(pso_for_paged(d, base, mb, go));
+        se.set_argtable_ordinal(ordinal_base + d.ordinal);
+        se.dispatch(grid, tg);
+        if (i + 1 >= dag.size() || run_ends[i] == static_cast<int>(i)) se.barrier();
+    }
+}
+
 void encode_gptoss_step(StepEncoder& se, const std::vector<Dispatch>& dag,
                         const GptOssGeometry& g, const DecodeStepPsos& base,
                         const GptOssPsos& go, int ordinal_base) {

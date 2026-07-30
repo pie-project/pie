@@ -249,15 +249,24 @@ int main(int argc, char** argv) {
     }
     g.vocab = 262144;
     g.kv_page_size = 32;
-    g.total_pages = 4;              // one request's worth; 8 tokens fit in one
+    g.total_pages = 4;              // one request's worth; 16 tokens fit in one
     g.kv_max_ctx = g.kv_page_size * g.total_pages;
+    // `PIE_G4MB_ENGINELIKE` reproduces the executor engine's configuration of
+    // this same path, so the difference between them can be bisected here
+    // instead of through three layers of the engine.
+    if (std::getenv("PIE_G4MB_ENGINELIKE") != nullptr) {
+        g.kv_max_ctx = 8192;
+        g.total_pages = g.kv_max_ctx / g.kv_page_size;
+    }
     g.max_tokens = N;
     g.max_requests = 1;
     g.paged_kv_enabled = true;
 
     // Under a tap dump every activation VALUE gets its own [N, vocab] slot, so
     // the pool is the budget rather than the weights.
-    auto ctx = RawMetalContext::create(std::size_t(golden_taps_enabled() ? 14 : 8) << 30);
+    // Under a tap dump every activation VALUE gets its own slot, so the pool
+    // scales with the row count. 8 rows fit in 14 GB; 16 do not.
+    auto ctx = RawMetalContext::create(std::size_t(golden_taps_enabled() ? 12 : 8) << 30);
     if (!ctx) {
         std::printf("  FAIL  RawMetalContext::create\n");
         return 1;
@@ -311,13 +320,32 @@ int main(int argc, char** argv) {
     expect(coloring.hazard_free, "the activation colouring is hazard-free");
 
     // Every activation is [N, width] row-major at M>1, so a pool slot is N rows
-    // of the widest one.
+    // of its OWN width -- not of the vocabulary. Under a tap dump there is one
+    // slot per dispatch, and sizing them all at the widest costs 8 GB at 16
+    // rows for a model whose activations are mostly 1536 wide.
     b.pool.resize(std::size_t(coloring.colors_used));
-    const std::size_t slot_bytes = std::size_t(N) * std::size_t(g.vocab) * 2;
-    for (int c = 0; c < coloring.colors_used; ++c) b.pool[std::size_t(c)] = ctx->heap_alloc(slot_bytes);
+    std::vector<std::size_t> slot_elems(std::size_t(coloring.colors_used), 0);
+    for (std::size_t di = 0; di < dag.size(); ++di) {
+        Tap t{};
+        if (!tap_for(dag[di], g, t)) continue;
+        for (const auto& sb : coloring.per_dispatch[di]) {
+            if (sb.color < 0 || sb.color >= coloring.colors_used) continue;
+            slot_elems[std::size_t(sb.color)] =
+                std::max(slot_elems[std::size_t(sb.color)], std::size_t(t.width));
+        }
+    }
+    // The 16-row case below fires more rows than the default prompt has, and a
+    // projection pads its batch up to a whole GEMM tile on top of that, so the
+    // pool is sized for the widest fire this file makes rather than for `N`.
+    const int pool_rows = gemma4_qmm_pool_rows(std::max(N, 16));
+    for (int c = 0; c < coloring.colors_used; ++c) {
+        const std::size_t w = slot_elems[std::size_t(c)] > 0 ? slot_elems[std::size_t(c)]
+                                                             : std::size_t(g.hidden);
+        b.pool[std::size_t(c)] = ctx->heap_alloc(std::size_t(pool_rows) * w * 2);
+    }
 
     b.io.resize(kIoSlotCount);
-    for (int i = 0; i < kIoSlotCount; ++i) b.io[i] = ctx->heap_alloc(4096);
+    for (int i = 0; i < kIoSlotCount; ++i) b.io[i] = ctx->heap_alloc(8192);
 
     // Per-row IO and the page table. `starts` gives each request's first token
     // row, so one fire can carry several of them -- which is what a mixed
@@ -361,6 +389,13 @@ int main(int argc, char** argv) {
         write_u32s(b.io[int(IoSlot::KvPageIndices)], page_indices);
         write_u32s(b.io[int(IoSlot::KvPageIndptr)], indptr);
         write_u32s(b.io[int(IoSlot::QoIndptr)], qo);
+        // This test samples EVERY row -- it compares all of them against mlx-lm
+        // -- so the tail's gather is the identity and the rows keep the indices
+        // the taps and the assertions below use.
+        std::vector<std::uint32_t> sample;
+        sample.resize(std::size_t(rows));
+        for (int i = 0; i < rows; ++i) sample[std::size_t(i)] = std::uint32_t(i);
+        write_u32s(b.io[int(IoSlot::SampleRows)], sample);
         std::memset(b.io[int(IoSlot::AttnMaskEnabled)].contents(), 0, std::size_t(rows));
     };
     fill_io(ids, {0u}, g.total_pages);
@@ -482,6 +517,44 @@ int main(int argc, char** argv) {
         std::printf("    (one row at a time: argmax %d)\n", bi);
         expect(bi == 3821, "a decode step is a fire of one row, and lands where the whole "
                            "prompt does");
+    }
+
+    // ── Sixteen rows: the batch where the GEMM engages ──
+    //
+    // Below twelve rows the projections are a per-row GEMV, and `qmm_bn`
+    // refuses any batch that does not fill a whole 16-row tile -- so every
+    // earlier case in this file, and every executor test, ran the GEMV. The
+    // first fire that took the GEMM answered 147040 where mlx-lm says 476: the
+    // split-K variant was dispatched and its partial sums never reduced,
+    // because this family has no reduce pass and no split buffer.
+    //
+    // So the GEMM's batch needs a case of its own, or the next one to engage it
+    // is a user's prompt.
+    if (default_prompt) {
+        const std::vector<std::uint32_t> ids16{2, 818, 3821, 563, 529, 476, 3625, 506,
+                                               529, 476, 3625, 506, 818, 3821, 563, 529};
+        const int rows16 = int(ids16.size());
+        if (rows16 <= g.max_tokens || true) {
+            for (int L = 0; L < g.n_layers; ++L) {
+                if (g.is_kv_shared(L)) continue;
+                std::memset(kpages[std::size_t(L)].contents(), 0, kpages[std::size_t(L)].size);
+                std::memset(vpages[std::size_t(L)].contents(), 0, vpages[std::size_t(L)].size);
+            }
+            fill_io(ids16, {0u}, g.total_pages);
+            bind_gemma4_consts(*ctx, dag, g, rows16, /*paged=*/true);
+            ctx->run_step([&](StepEncoder& se) {
+                encode_gemma4_step_mb(se, dag, g, rows16, base, mb, psos);
+            });
+            const auto* r = logits + std::size_t(rows16 - 1) * std::size_t(g.vocab);
+            int bi = -1;
+            float bv = -1e30f;
+            for (int i = 0; i < g.vocab; ++i) {
+                const float v = from_bf16(r[i]);
+                if (v > bv) { bv = v; bi = i; }
+            }
+            std::printf("    (16 rows, the GEMM's batch: argmax %d)\n", bi);
+            expect(bi == 476, "the GEMM path agrees with mlx-lm");
+        }
     }
 
     // ── Two requests in one fire ──

@@ -638,6 +638,17 @@ class MetalExecutor {
     bool run_member_forward(const MemberForwardDesc& desc, LogitsOut& out,
                             bool batch_serialized, std::string* err,
                             const PtirCommandCallbacks* ptir = nullptr);
+    /// The paged batch path for the families `SimpleFamilyEngine` serves.
+    ///
+    /// Several requests share ONE fire: their tokens are concatenated, the CSR
+    /// says who owns which rows, and each request's history is its own page
+    /// list. Prefill rows and decode rows differ only in how many a request
+    /// contributes, so a mixed batch needs nothing further.
+    bool run_simple_batch_forward(const std::vector<MemberForwardDesc>& descs,
+                                  std::vector<LogitsOut>& outs,
+                                  std::vector<std::uint8_t>& success,
+                                  std::vector<std::string>& errors,
+                                  const std::vector<PtirCommandCallbacks>* ptir = nullptr);
     bool run_paged_batch_forward(const std::vector<MemberForwardDesc>& descs,
                                  std::vector<LogitsOut>& outs,
                                  std::vector<std::uint8_t>& success,

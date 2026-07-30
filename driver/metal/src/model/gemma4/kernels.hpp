@@ -42,6 +42,10 @@ struct PleCombineParams {   // ple_combine.metal:15   (buffer 3)
     float inv_sqrt2;
     std::uint32_t n;
 };
+struct RowGatherParams {    // row_gather.metal       (buffer 3)
+    std::uint32_t width;
+    std::uint32_t count;
+};
 struct VNormParams {        // vnorm.metal:14         (buffer 2)
     float eps;
     std::uint32_t axis_size;
@@ -58,6 +62,8 @@ struct Gemma4Psos {
     Pso layer_scalar{};
     Pso ple_combine{};
     Pso vnorm{};
+    /// The sampled rows, compacted before the tail.
+    Pso row_gather{};
     /// gemma4 scales the gathered embedding (by sqrt(hidden), and sqrt(ple_dim)
     /// for the per-layer table). The scale must NOT be folded into the weights:
     /// the LM head reads the very same tied table unscaled.

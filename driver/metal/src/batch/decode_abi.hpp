@@ -93,9 +93,13 @@ enum class IoSlot : uint8_t {
     AttnMask       = 15, // u8[N,mask_stride] dense allow mask
     AttnMaskStride = 16, // u32[1] dense mask row stride
     AttnMaskEnabled= 17, // u8[N] 1 iff row consumes AttnMask
+    // Which rows the fire will SAMPLE, in readout order. The tail runs over
+    // these and no others: a prefill computes every row of the body but reads
+    // one per request, and the LM head is the step's most expensive dispatch.
+    SampleRows     = 18, // u32[S] — row indices into the body's [N, hidden]
 };
 inline constexpr int kIoSlotCount =
-    static_cast<int>(IoSlot::AttnMaskEnabled) + 1;
+    static_cast<int>(IoSlot::SampleRows) + 1;
 
 // ── Per-kernel binding indices (arg order the encoder binds into MTL4ArgumentTable) ──
 // Grounded in MLX's host-side dispatch arg order, adjusted for I1 (scalars→buffers).
@@ -143,6 +147,10 @@ enum class SdpaPaged : uint8_t {
     // is a window read out of uninitialized memory, which is wrong attention
     // rather than a crash.
     Window = 15,
+    // gpt-oss's learned per-head scalar, which joins the softmax denominator as
+    // though it were one more key. Bound only by the family that has one; the
+    // `sink` instantiation is a separate pipeline, so the others never read it.
+    Sinks = 16,
 };
 
 // rms_single_row: group=(row/N_READS), grid=(1,1,1). Buffer 3 is a packed
@@ -327,6 +335,9 @@ enum class Geglu : uint8_t { Gate = 0, Up = 1, Out = 2, Params = 3 };
 // logit_softcap.metal: out = cap * tanh(logits / cap), over the vocabulary.
 enum class Softcap : uint8_t { Logits = 0, Out = 1, Params = 2 };
 
+// row_gather.metal: out[i,:] = in[rows[i],:] — the fire's sampled rows, dense.
+enum class RowGather : uint8_t { In = 0, Out = 1, Rows = 2, Params = 3 };
+
 // layer_scalar.metal: out = x * scalar[0]. A learned per-layer gain, broadcast.
 enum class LayerScalar : uint8_t { X = 0, Scalar = 1, Out = 2, Params = 3 };
 
@@ -438,6 +449,7 @@ enum class Kernel : uint8_t {
     G4Geglu,             // gelu_tanh(gate) * up
     G4LayerScalar,       // learned per-layer gain
     G4Softcap,           // cap * tanh(logits / cap)
+    G4RowGather,         // the sampled rows, compacted before the tail
     G4SdpaSliding,       // sliding-window decode attention
     // Per-Layer Embeddings.
     G4PleTokenGather,    // embed_tokens_per_layer

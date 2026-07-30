@@ -52,6 +52,9 @@ struct GptOssPsos {
     Pso expert_combine{};
     /// head_dim 64, with the per-head sink in the softmax denominator.
     Pso sdpa_sink{};
+    /// The same attention against page-addressed KV, which is what lets several
+    /// sequences be resident at once.
+    Pso sdpa_sink_paged{};
     /// YaRN, as a frequency table the host computed once.
     Pso rope_freqs{};
 

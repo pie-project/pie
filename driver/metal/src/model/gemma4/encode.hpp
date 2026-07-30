@@ -32,14 +32,26 @@ void launch_shape(const Dispatch& d, const Gemma4Geometry& g, Grid& grid, Thread
 
 /// The same, for a batch of `rows` tokens. At rows==1 it must agree with
 /// `launch_shape` exactly -- one path, checked, rather than two that drift.
+/// How many rows a projection's GEMM runs over, given the fire's `rows`.
+///
+/// Padded up to a whole `BM` tile so the GEMM engages at any batch instead of
+/// only at exact multiples of it. The pool holds `gemma4_qmm_pool_rows(max)`
+/// rows so the padding always lands somewhere allocated.
+int gemma4_qmm_rows(int rows);
+
+/// How many rows the activation pool must hold for `max_rows` to be paddable.
+int gemma4_qmm_pool_rows(int max_rows);
+
+/// `head_rows` is how many rows the fire SAMPLES -- what `Kind::RowGather`
+/// compacts, and what the tail after it runs on. 0 means every row.
 void launch_shape_mb(const Dispatch& d, const Gemma4Geometry& g, int rows, Grid& grid,
-                     Threadgroup& tg);
+                     Threadgroup& tg, int head_rows = 0);
 
 /// The pipeline a dispatch runs on at M>1. Differs from `pso_for` only where the
 /// kernel itself changes with the batch; everything else falls through.
 Pso pso_for_mb(const Dispatch& d, const Gemma4Geometry& g, int rows,
                const DecodeStepPsos& base, const MultiBatchPsos& mb,
-               const Gemma4Psos& g4);
+               const Gemma4Psos& g4, int head_rows = 0);
 
 /// Encode the step for a batch of `rows` tokens. Same walk as
 /// `encode_gemma4_step` -- the DAG, its order and its concurrency runs belong to
@@ -47,7 +59,7 @@ Pso pso_for_mb(const Dispatch& d, const Gemma4Geometry& g, int rows,
 void encode_gemma4_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
                            const Gemma4Geometry& g, int rows,
                            const DecodeStepPsos& base, const MultiBatchPsos& mb,
-                           const Gemma4Psos& g4, int ordinal_base = 0);
+                           const Gemma4Psos& g4, int ordinal_base = 0, int head_rows = 0);
 
 /// `run_ends[i]`: the last ordinal of the concurrency run containing `i`. What
 /// the colourer needs to know about which barriers the encoder will drop.

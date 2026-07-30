@@ -269,6 +269,11 @@ class Dispatch {
         std::uint32_t direct_bf16_row_capacity = 0,
         const std::uint8_t* row_valid = nullptr,
         std::span<const std::uint32_t> row_valid_offsets = {},
+        // Base of the forward's `[max_tokens]` i32 token buffer, non-null only
+        // when the forward reduced the vocabulary as it produced it and so
+        // never wrote `direct_bf16_logits` (§20.37). Must be paired with a
+        // launch that `launch_epilogue_is_greedy_argmax` accepted.
+        const std::int32_t* presampled_tokens = nullptr,
         FinishBreakdown* breakdown = nullptr);
 
     void abort(StagedLaunch& launch, cudaStream_t stream) noexcept;
@@ -288,6 +293,18 @@ class Dispatch {
     // it pay the per-layer compaction.
     bool launch_wants_page_mask(
         const pie_native::LaunchView& view) const;
+
+    // Whether every epilogue in this launch is a bare greedy argmax over
+    // `logits` that only publishes its token to a channel. That is the one
+    // shape whose logits can be reduced while the LM head GEMM produces them
+    // instead of being materialised (§20.37), because nothing else in the
+    // stage can observe the values. Asked before the forward runs, since the
+    // forward is what decides whether to materialise them. `vocab` is the
+    // weight's row count: a program declaring a narrower one is rejected,
+    // because the fused reduction cannot honour it.
+    bool launch_epilogue_is_greedy_argmax(
+        const pie_native::LaunchView& view,
+        std::uint32_t vocab) const;
 
     // Whether this model's decode path can honour a page mask: the plan must
     // not depend on the page counts it was planned against, or substituting a

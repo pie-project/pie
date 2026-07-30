@@ -941,6 +941,100 @@ generated_compact_argmax_value(
     return argmax_value;
 }
 
+// Whether the vocabulary can be reduced to a token id inside the LM head
+// instead of being materialised for this stage to scan (§20.37).
+//
+// The condition is narrow but it is NOT "the stage does nothing else": a decode
+// epilogue also advances its own KV geometry and republishes half a dozen
+// channels, and none of that touches `logits`. What must hold is only that the
+// stage's single `logits` intrinsic has exactly one consumer and that consumer
+// is a direct greedy argmax -- then no reader of the raw vocabulary remains,
+// and `ptir_fast_argmax_intrinsic` can hand back an already-reduced token.
+//
+// Deliberately the launch path's own predicate rather than a second one: the
+// forward decides whether to materialise logits and the launch decides how to
+// bind them, and if those two disagreed the epilogue would sample a buffer
+// nobody wrote.
+inline std::optional<std::uint32_t>
+generated_presampled_argmax_value(
+    const plan::StagePlan& stage,
+    const std::vector<std::uint32_t>& bases,
+    const FusedStageExecutable& executable) {
+    std::vector<std::uint32_t> aliases(stage.value_types.size());
+    for (std::uint32_t value = 0; value < aliases.size(); ++value) {
+        aliases[value] = value;
+    }
+    auto resolve_alias = [&](std::uint32_t value) {
+        while (aliases[value] != value) value = aliases[value];
+        return value;
+    };
+    // Pass 1: fold reshape chains and find the one `logits` intrinsic.
+    std::uint32_t intrinsic_value = UINT32_MAX;
+    for (std::size_t node = 0; node < stage.ops.size(); ++node) {
+        const auto& op = stage.ops[node].op;
+        if (op.tag == PTIR_OP_RESHAPE && op.results == 1 &&
+            !op.args.empty()) {
+            aliases[bases[node]] = resolve_alias(op.args[0]);
+            continue;
+        }
+        if (op.tag == PTIR_OP_INTRINSIC_VAL &&
+            op.intr == PTIR_INTR_LOGITS && op.results == 1) {
+            if (intrinsic_value != UINT32_MAX) return std::nullopt;
+            intrinsic_value = bases[node];
+        }
+    }
+    if (intrinsic_value == UINT32_MAX) return std::nullopt;
+    const std::uint32_t logits_root = resolve_alias(intrinsic_value);
+
+    // Pass 2: every consumer of the vocabulary, reshapes seen through.
+    std::size_t consumers = 0;
+    std::size_t argmax_node = 0;
+    std::uint32_t argmax_value = UINT32_MAX;
+    for (std::size_t node = 0; node < stage.ops.size(); ++node) {
+        const auto& op = stage.ops[node].op;
+        // A reshape is an alias link, not a reader: it was already folded.
+        if (op.tag == PTIR_OP_RESHAPE && op.results == 1) continue;
+        for (const std::uint32_t arg : op.args) {
+            if (arg >= aliases.size() || resolve_alias(arg) != logits_root) {
+                continue;
+            }
+            if (++consumers > 1) return std::nullopt;
+            if (op.tag != PTIR_OP_REDUCE_ARGMAX || op.results != 1) {
+                return std::nullopt;
+            }
+            argmax_node = node;
+            argmax_value = bases[node];
+        }
+    }
+    if (consumers != 1 || argmax_value == UINT32_MAX) return std::nullopt;
+
+    // And the compiler must have rewritten that argmax into the direct
+    // `logits` fast path -- a generic reduction would read the vocabulary
+    // element by element and there would be nothing to hand it.
+    for (const StageRegionAnalysis& analysis : executable.region_analysis) {
+        const StageRegionArgmax* record =
+            analysis.argmax_for(static_cast<std::uint32_t>(argmax_node));
+        if (record != nullptr && record->intrinsic == PTIR_INTR_LOGITS) {
+            return argmax_value;
+        }
+    }
+    return std::nullopt;
+}
+
+inline bool generated_stage_is_compact_argmax(
+    const plan::StagePlan& stage,
+    const FusedStageExecutable& executable) {
+    if (executable.region_analysis.empty()) return false;
+    std::vector<std::uint32_t> bases(stage.ops.size());
+    std::uint32_t planned_values = 0;
+    for (std::size_t node = 0; node < stage.ops.size(); ++node) {
+        bases[node] = planned_values;
+        planned_values += stage.ops[node].op.results;
+    }
+    return generated_presampled_argmax_value(stage, bases, executable)
+        .has_value();
+}
+
 inline GroupedLaunchResult run_generated_stage(
     const std::vector<GroupedLaneBinding>& lanes,
     const FusedStageExecutable& executable,
@@ -1420,7 +1514,30 @@ inline GroupedLaunchResult run_generated_stage(
     std::vector<std::uint32_t> bf16_row_offsets(lane_count, UINT32_MAX);
     std::vector<std::uint64_t> host_mtp_rows;
     std::vector<std::uint32_t> mtp_row_offsets(lane_count, UINT32_MAX);
+    std::vector<std::uint64_t> host_presampled_rows;
+    std::vector<std::uint32_t> presampled_row_offsets(lane_count, UINT32_MAX);
+    // Loop-invariant: the verdict is a property of the stage, not the lane, and
+    // at high concurrency this loop runs hundreds of times per fire. Evaluated
+    // lazily so a launch with no presampled lane never pays for it at all.
+    std::optional<bool> stage_takes_presampled;
     for (std::uint32_t lane = 0; lane < lane_count; ++lane) {
+        if (lanes[lane].presampled_token_rows != nullptr) {
+            if (!stage_takes_presampled.has_value()) {
+                stage_takes_presampled =
+                    generated_stage_is_compact_argmax(stage, executable);
+            }
+            if (!*stage_takes_presampled) {
+                throw std::runtime_error(
+                    "presampled tokens bound to a stage that reads logits for "
+                    "more than a greedy argmax");
+            }
+            presampled_row_offsets[lane] =
+                static_cast<std::uint32_t>(host_presampled_rows.size());
+            host_presampled_rows.insert(
+                host_presampled_rows.end(),
+                lanes[lane].presampled_token_rows->begin(),
+                lanes[lane].presampled_token_rows->end());
+        }
         if (lanes[lane].logits_bf16_rows != nullptr) {
             bf16_row_offsets[lane] =
                 static_cast<std::uint32_t>(host_bf16_rows.size());
@@ -1440,6 +1557,13 @@ inline GroupedLaunchResult run_generated_stage(
     }
     std::uint64_t* device_bf16_rows = nullptr;
     std::uint64_t* device_mtp_rows = nullptr;
+    std::uint64_t* device_presampled_rows = nullptr;
+    if (!host_presampled_rows.empty()) {
+        device_presampled_rows =
+            allocations.allocate<std::uint64_t>(host_presampled_rows.size());
+        detail::upload_generated(
+            device_presampled_rows, host_presampled_rows, stream);
+    }
     if (!host_bf16_rows.empty()) {
         device_bf16_rows =
             allocations.allocate<std::uint64_t>(host_bf16_rows.size());
@@ -1473,7 +1597,18 @@ inline GroupedLaunchResult run_generated_stage(
             host_intrinsic_widths[index] =
                 descriptor.last;
             if (op.intr == PTIR_INTR_LOGITS) {
-                if (bf16_row_offsets[lane] != UINT32_MAX) {
+                if (presampled_row_offsets[lane] != UINT32_MAX) {
+                    // Mode 3: already-reduced token ids. Same row-pointer table
+                    // shape as mode 2, but each row holds a single i32 token
+                    // rather than a vocabulary, so the per-row element count is
+                    // 1 where mode 2 carries `vocab`.
+                    host_intrinsic_bases[index] =
+                        reinterpret_cast<std::uint64_t>(
+                            device_presampled_rows +
+                            presampled_row_offsets[lane]);
+                    host_intrinsic_modes[index] = 3;
+                    host_intrinsic_strides[index] = 1;
+                } else if (bf16_row_offsets[lane] != UINT32_MAX) {
                     host_intrinsic_bases[index] =
                         reinterpret_cast<std::uint64_t>(
                             device_bf16_rows + bf16_row_offsets[lane]);

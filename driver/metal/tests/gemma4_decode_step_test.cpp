@@ -109,6 +109,8 @@ void the_dag_skips_what_a_shared_layer_does_not_have() {
               "so the standalone scalar does not run when there is a PLE to ride on");
 
     // The tail.
+    expect_eq(count(dag, Kind::RowGather), 1,
+              "the sampled rows are compacted once, before the tail");
     expect_eq(count(dag, Kind::FinalRms), 1, "one final norm");
     expect_eq(count(dag, Kind::LmHead), 1, "one logits matvec");
     expect_eq(count(dag, Kind::FinalSoftcap), 1, "gemma4 softcaps its logits");
@@ -116,7 +118,9 @@ void the_dag_skips_what_a_shared_layer_does_not_have() {
     // 1 embed + 4 PLE precompute + 35*(17 shared-safe) + owning extras + tail.
     const int per_layer_always = 13 + 4;  // attention/FFN + per-layer PLE
     const int owning_extra = 6;           // k/v proj, k/v norm, rope_k, append
-    const int want = 1 + 4 + g.n_layers * per_layer_always + 15 * owning_extra + 4;
+    // Tail: row gather, final norm, LM head, softcap, and the argmax this DAG
+    // was built with.
+    const int want = 1 + 4 + g.n_layers * per_layer_always + 15 * owning_extra + 5;
     expect_eq(s.total, want, "the whole step is exactly this many dispatches");
 
     // Ordinals are dense and in order — they are the argument-table keys.

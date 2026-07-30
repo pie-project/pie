@@ -1,5 +1,7 @@
 #include "model/workspace.hpp"
 
+#include "kernels/argmax.hpp"
+
 #include <algorithm>
 
 namespace pie_cuda_driver::model {
@@ -43,6 +45,14 @@ Workspace Workspace::allocate_full(
     ws.mtp_draft_row_base = workspace_mtp_draft_row_base(N);
     ws.mtp_draft_row_capacity = D;
     ws.probs         = DeviceTensor::allocate(DType::FP32, {O, V});
+    ws.sampled_tokens = DeviceTensor::allocate(
+        DType::INT32, {workspace_logits_rows(N, D), 1});
+    ws.argmax_acc_val = DeviceTensor::allocate(
+        DType::FP32,
+        {workspace_logits_rows(N, D), kernels::kArgmaxAccumSlots});
+    ws.argmax_acc_idx = DeviceTensor::allocate(
+        DType::INT32,
+        {workspace_logits_rows(N, D), kernels::kArgmaxAccumSlots});
     // Padded q/k/v/attn_out only when head_dim != head_dim_kernel
     // (currently only Phi-3 at 96 → 128). Empty allocations otherwise
     // — the forward path detects the empty-state and aliases the
@@ -83,6 +93,7 @@ std::size_t workspace_bytes(const HfConfig& cfg,
                                   int max_mtp_draft_rows) {
     const auto bf16 = [](std::size_t elems) { return elems * 2; };
     const auto fp32 = [](std::size_t elems) { return elems * 4; };
+    const auto i32  = [](std::size_t elems) { return elems * 4; };
     const std::size_t n = static_cast<std::size_t>(N);
     const std::size_t o = static_cast<std::size_t>(std::max(1, output_rows));
     std::size_t bytes = 0;
@@ -105,6 +116,18 @@ std::size_t workspace_bytes(const HfConfig& cfg,
                  std::max(0, max_mtp_draft_rows))) *
         cfg.vocab_size);
     bytes += fp32(o * cfg.vocab_size);
+    // `sampled_tokens` + `argmax_acc_val` + `argmax_acc_idx`. `allocate_full`
+    // creates these for every family, not only the two that can fuse, so they
+    // belong in the estimate unconditionally -- this function is the planner's
+    // arena figure (`memory_planner.cpp`) and every byte missing from it is a
+    // byte handed to the KV pool instead.
+    {
+        const std::size_t logits_rows = static_cast<std::size_t>(
+            workspace_logits_rows(N, max_mtp_draft_rows));
+        bytes += i32(logits_rows);
+        bytes += fp32(logits_rows * kernels::kArgmaxAccumSlots);
+        bytes += i32(logits_rows * kernels::kArgmaxAccumSlots);
+    }
     if (cfg.head_dim != cfg.head_dim_kernel) {
         const int q_heads = max_Hq / std::max(1, cfg.head_dim);
         const int kv_heads = max_Hk / std::max(1, cfg.head_dim);
