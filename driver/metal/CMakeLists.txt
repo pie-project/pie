@@ -102,6 +102,7 @@ if(APPLE)
     src/model/gptoss/scratch.cpp
     src/model/gptoss/encode.cpp
     src/model/gptoss/bind.cpp
+    src/batch/simple_family.cpp
     src/model/qwen3_5/decode_step.cpp
     src/model/qwen3_5/decode_step_mb.cpp
     src/kernels/decode_psos.cpp
@@ -479,6 +480,9 @@ if(APPLE)
     PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
   add_metal_linked_test(gptoss_forward_test tests/gptoss_forward_test.cpp NEEDS_LOADER)
   target_compile_definitions(gptoss_forward_test PRIVATE
+    PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
+  add_metal_linked_test(simple_family_executor_test tests/simple_family_executor_test.cpp NEEDS_LOADER)
+  target_compile_definitions(simple_family_executor_test PRIVATE
     PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
   add_metal_linked_test(gemma4_prefill_test tests/gemma4_prefill_test.cpp)
   target_compile_definitions(gemma4_prefill_test PRIVATE

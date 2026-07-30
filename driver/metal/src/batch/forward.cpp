@@ -20,6 +20,7 @@
 #include "model/contract.hpp"
 #include "model/gemma4/decode_step.hpp"
 #include "model/gemma4/geometry.hpp"
+#include "simple_family.hpp"
 #include "decode_consts.hpp"
 #include "decode_dispatch_mb.hpp"
 #include "decode_psos.hpp"
@@ -557,6 +558,20 @@ struct MetalExecutor::Impl {
     std::vector<GdnDisp> gdn_disp_{};
     LinearStateSlots linear_state_slots_{};
 
+    // ── Families with no recurrent state ──
+    // gemma4 and gpt-oss share none of the machinery above -- no GDN slots, no
+    // conv ping-pong, no split-K -- so their family-shaped half lives in
+    // `SimpleFamilyEngine` and everything that is NOT family-shaped (this
+    // context, the logits staging, the sequence bookkeeping) stays here.
+    model::ModelFamily family_ = model::ModelFamily::Qwen35;
+    std::unique_ptr<SimpleFamilyEngine> simple_{};
+    bool is_simple() const { return simple_ != nullptr; }
+
+    /// Build one of those, and the context it lives in.
+    bool setup_simple(model::ModelFamily family, const std::string& kernels_dir,
+                      const SetupConfig& cfg, const pie_loader::LoadPlan& load_plan,
+                      std::string* err);
+
     static constexpr bool gdn_prep_ = true;
     // Folds the block/MLP residual add into the projection that feeds it,
     // dropping 48 of the DAG's 411 dispatches. The decode DAG is launch-bound
@@ -578,7 +593,7 @@ struct MetalExecutor::Impl {
         std::size_t storage_page_size,
         std::string* error);
     bool ready() const { return ctx_ != nullptr; }
-    int vocab() const { return g_.vocab; }
+    int vocab() const { return simple_ ? simple_->vocab() : g_.vocab; }
     const DecodeGeometry& geometry() const { return g_; }
     bool setup_kv_pool(
         std::uint32_t total_pages,
@@ -683,6 +698,72 @@ void write_u32(const SlotHandle& s, uint32_t v) {
 }
 
 }  // namespace
+
+bool MetalExecutor::Impl::setup_simple(model::ModelFamily family,
+                                       const std::string& kernels_dir,
+                                       const SetupConfig& cfg,
+                                       const pie_loader::LoadPlan& load_plan,
+                                       std::string* err) {
+    family_ = family;
+    // The heap: the weights the plan already sized, plus what the family needs
+    // on top of them. `plan_heap` is not consulted -- it is `DecodeGeometry`'s.
+    const std::size_t weights = load_plan.view().memory.persistent_bytes;
+    const std::size_t heap_bytes =
+        weights + SimpleFamilyEngine::extra_heap_bytes(family, cfg, max_ctx_);
+    ctx_ = RawMetalContext::create(heap_bytes);
+    if (!ctx_) {
+        if (err) *err = "RawMetalContext::create failed";
+        return false;
+    }
+    simple_ = SimpleFamilyEngine::create(family, *ctx_, kernels_dir, cfg, load_plan, max_ctx_,
+                                         err);
+    if (!simple_) return false;
+
+    // The sampler reads through the same staging path qwen3.5 uses, so the
+    // engine's logits slot takes the place of `b_.io[Logits]` at its ordinal --
+    // and the copy that fills it needs its own pipeline, which qwen's `setup`
+    // builds and this one bypasses.
+    g_.vocab = simple_->vocab();
+    std::string pso_err;
+    ptir_logits_copy_pso_ = ctx_->compile_ptir_pso_from_file(
+        (std::filesystem::path(kernels_dir) / "ptir_logits_copy.metal").string(),
+        "ptir_copy_logits_bf16", &pso_err);
+    if (!ptir_logits_copy_pso_.valid()) {
+        if (err) *err = "compiling the logits staging copy: " + pso_err;
+        return false;
+    }
+    ptir_logits_copy_params_ =
+        ctx_->create_standalone_buffer(sizeof(PtirLogitsCopyParams) * kPtirLogitsCopyMaxRows);
+    if (!ptir_logits_copy_params_.valid()) {
+        if (err) *err = "allocating the logits staging params";
+        return false;
+    }
+    ctx_->arg_bind_ordinal(kPtirLogitsCopyOrdinal, 2, ptir_logits_copy_params_);
+    if (!ensure_ptir_logits_rows(1, err)) return false;
+    ctx_->arg_bind_ordinal(kPtirLogitsCopyOrdinal, 0, simple_->logits_slot());
+
+    // A KV pool the engine can plan against, with no pages behind it.
+    //
+    // These families hold their KV as a position-indexed ring of `max_ctx_`
+    // tokens per layer, so a page is not a thing they store into -- but the
+    // engine's admission control counts pages, and refusing to report any at
+    // all makes every launch fail with "KV pool is unavailable". So the pool is
+    // reported at the capacity the RING actually has. It is not a lie about
+    // storage: `ensure_kv_pages` below bounds the demand against the same
+    // number, so a sequence the ring cannot hold is still refused. What is
+    // genuinely absent -- moving pages around, which is what prefix sharing and
+    // forking need -- is refused as absent.
+    const std::uint32_t page = cfg.kv_page_size > 0 ? cfg.kv_page_size : 1u;
+    kv_pool_.enabled = true;
+    kv_pool_.page_size = page;
+    kv_pool_.total_pages = std::uint32_t(max_ctx_) / page;
+    kv_pool_.capacity_pages = kv_pool_.total_pages;
+    kv_pool_.committed_pages = kv_pool_.total_pages;
+    kv_pool_.layers.clear();
+
+    ctx_->make_resident();
+    return true;
+}
 
 bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
                             const DecodeGeometry& geom,
@@ -857,6 +938,13 @@ void MetalExecutor::Impl::reset_state() {
 // this slot's own ping-pong step parity (Phase 1b state-slot fix) so a fresh sequence on
 // `slot` always starts at parity 0, independent of any other slot's step history.
 void MetalExecutor::Impl::reset_state(uint32_t slot) {
+    if (is_simple()) {
+        // The KV is the only thing these families carry between tokens, so
+        // zeroing it is the whole reset. There is no conv history to ping-pong
+        // and no recurrent state to clear.
+        simple_->reset();
+        return;
+    }
     const size_t conv_stride  = g_.gdn_conv_stride_bytes();
     const size_t recur_stride = g_.gdn_recurrent_stride_bytes();
     const size_t conv_off  = size_t(slot) * conv_stride;
@@ -1457,6 +1545,13 @@ StepTiming MetalExecutor::Impl::step(
     uint32_t position,
     uint32_t slot,
     const PtirCommandCallbacks* ptir) {
+    if (is_simple()) {
+        // No elastic commit, no state slot, no ping-pong: the engine owns one
+        // DAG and a contiguous KV, and `slot` has nothing to select.
+        (void)slot;
+        (void)ptir;
+        return simple_->step(*ctx_, token_id, position);
+    }
     std::string commit_error;
     if (!ensure_elastic_storage(
             0,
@@ -2170,49 +2265,12 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
     switch (model::model_family_of(cfg.model_type)) {
     case model::ModelFamily::Qwen35:
         break;
-    case model::ModelFamily::Gemma4: {
-        // Build the geometry before refusing, so the refusal is a fact about
-        // this checkpoint and not a guess. A shape this driver cannot schedule
-        // is reported as such; a shape it can is reported as the one thing that
-        // is genuinely missing, which is not the shape.
-        gemma4::Gemma4Geometry g4;
-        std::string why;
-        if (!gemma4::geometry_from_facts(cfg.gemma4, g4, &why)) {
-            if (err != nullptr) *err = why;
-            return false;
-        }
-        if (err != nullptr) {
-            // What is missing is now the executor, and nothing below it. The
-            // model computes: `gemma4_forward_test` runs this checkpoint through
-            // the decode DAG and gets mlx-lm's argmax at position 0 and again at
-            // position 7 with seven positions of KV behind it, every tap of all
-            // 35 layers above 0.9989 cosine. Both paths have pipelines, launch
-            // shapes, constants and binders; `gemma4_pso_test` proves the M>1
-            // side resolves and that every slot it reads is bound.
-            //
-            // `Impl` is what does not: its state is `DecodeGeometry`, qwen3.5's
-            // `Dispatch`, `ScratchSchedule` and `BoundDecode`, plus a KV pool
-            // and the linear-attention slots, and gemma4's types feed none of
-            // them.
-            *err = "Metal computes gemma4 (" +
-                   std::to_string(gemma4::build_gemma4_dag(g4).size()) +
-                   " dispatches over " + std::to_string(g4.n_layers) +
-                   " layers, decode and prefill, numerics verified against "
-                   "mlx-lm) but MetalExecutor::Impl is still qwen3.5-shaped, so "
-                   "there is nothing to run it through";
-        }
-        return false;
-    }
+    // gemma4 and gpt-oss run through `SimpleFamilyEngine`: one DAG, contiguous
+    // KV, no recurrent state. `MetalExecutor::Impl`'s own machinery is
+    // qwen3.5's and stays untouched.
+    case model::ModelFamily::Gemma4:
     case model::ModelFamily::GptOss:
-        if (err != nullptr) {
-            // Same gap as gemma4's, and stated without a shape: `SetupConfig`
-            // carries no gpt-oss facts, so this cannot honestly report a
-            // dispatch count for THIS checkpoint the way the gemma4 arm does.
-            *err = "Metal computes gpt-oss (24 layers of sparse MoE, decode "
-                   "verified against mlx-lm) but MetalExecutor::Impl is still "
-                   "qwen3.5-shaped, so there is nothing to run it through";
-        }
-        return false;
+        break;
     case model::ModelFamily::Unknown:
         if (err != nullptr) {
             *err = "Metal has no model family for config '" + cfg.arch_name +
@@ -2270,6 +2328,17 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
         geom.vocab = static_cast<int>(cfg.vocab_size);
     }
     std::string derr;
+    const model::ModelFamily family = model::model_family_of(cfg.model_type);
+    if (family != model::ModelFamily::Qwen35) {
+        if (!impl->setup_simple(family, cfg.kernels_dir, cfg, load_plan, &derr)) {
+            if (err != nullptr) *err = "Metal forward setup failed: " + derr;
+            return false;
+        }
+        impl_ = std::move(impl);
+        vocab_ = static_cast<std::uint32_t>(impl_->vocab());
+        slot_states_.clear();
+        return true;
+    }
     if (!impl->setup(
             cfg.kernels_dir,
             geom,
@@ -2358,6 +2427,20 @@ std::uint32_t MetalExecutor::kv_pool_page_size() const {
 bool MetalExecutor::ensure_kv_pages(
     std::uint32_t pages,
     std::string* error) {
+    if (ready() && impl_->is_simple()) {
+        // Nothing to commit: the ring is allocated whole at setup. The demand is
+        // still checked, against the capacity that ring actually has.
+        if (pages > impl_->kv_pool().total_pages) {
+            if (error != nullptr) {
+                *error = "this family's KV ring holds " +
+                         std::to_string(impl_->kv_pool().total_pages) +
+                         " pages' worth of tokens, and this fire asked for " +
+                         std::to_string(pages);
+            }
+            return false;
+        }
+        return true;
+    }
     if (!ready() || !impl_->kv_pool().enabled) {
         if (error != nullptr) *error = "Metal KV pool is unavailable";
         return false;
@@ -2451,6 +2534,34 @@ bool MetalExecutor::forward(const MemberForwardDesc& desc, LogitsOut& out, std::
     }
     const std::uint32_t slot = desc.has_rs_slot ? desc.rs_slot_id : 0u;
     const auto state = slot_states_.find(slot);
+    // gemma4 and gpt-oss hold their KV as a contiguous per-layer ring indexed by
+    // position, which is qwen3.5's M=1 fast path and not its paged one. The
+    // engine still marks a fire `requires_paged` because the POOL is configured;
+    // for these families that says nothing about how the KV is stored, and
+    // `validate_linear_sequence_geometry` below is what actually enforces the
+    // one-resident-sequence invariant the ring needs.
+    if (impl_->is_simple()) {
+        if (desc.has_write_desc) {
+            if (err != nullptr) {
+                *err = "this family stores KV as a position-indexed ring, so an explicit "
+                       "page-write descriptor has nothing to address";
+            }
+            return false;
+        }
+        std::string member_err;
+        if (run_member_forward(desc, out, /*batch_serialized=*/false, &member_err, nullptr)) {
+            return true;
+        }
+        // The ring holds one sequence. Say what would lift that, since the
+        // generic message is qwen3.5's and names a phase rather than a gap.
+        if (err != nullptr) {
+            *err = member_err +
+                   " [gemma4/gpt-oss serve one sequence at a time: their M>1 prefill kernels "
+                   "and paged binds exist but have never been through a numerics walk, so "
+                   "the paged multi-sequence path is not enabled for them]";
+        }
+        return false;
+    }
     if (desc.requires_paged || desc.has_write_desc ||
         (state != slot_states_.end() && state->second.paged_backed)) {
         std::vector<LogitsOut> outs;
@@ -2496,6 +2607,31 @@ void MetalExecutor::forward_batch(const std::vector<MemberForwardDesc>& descs,
         return;
     }
     impl_->ptir_logits_next_row_ = 0;
+    // One member at a time for the families on the ring: it holds exactly one
+    // sequence's history, so a second member in the same fire would clobber the
+    // first. Refused per member rather than per batch, which is what the caller
+    // poisons on.
+    if (impl_->is_simple()) {
+        if (descs.size() != 1) {
+            for (auto& e : errors) {
+                e = "this family's KV is a single-sequence ring, so a batch of " +
+                    std::to_string(descs.size()) + " members cannot be forwarded together";
+            }
+            return;
+        }
+        std::string member_err;
+        if (run_member_forward(descs[0], outs[0], /*batch_serialized=*/false, &member_err,
+                               ptir != nullptr ? &(*ptir)[0] : nullptr)) {
+            success[0] = 1;
+        } else {
+            // A rejected member becomes a poison epoch by the time the client
+            // sees it, which says nothing about why. This is the only place the
+            // reason exists.
+            std::cerr << "[pie-driver-metal] member forward rejected: " << member_err << "\n";
+            errors[0] = member_err;
+        }
+        return;
+    }
     if (descs.size() == 1 && !descs[0].requires_paged && !descs[0].has_write_desc) {
         if (ptir != nullptr) {
             if ((*ptir)[0].set_logits_row)
