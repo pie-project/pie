@@ -14,13 +14,20 @@
 #include <cstdlib>
 #include <string>
 
+#include "model/gemma4/bind.hpp"
 #include "model/gemma4/decode_step.hpp"
 #include "model/gemma4/encode.hpp"
 #include "model/gemma4/decode_consts.hpp"
 #include "model/gemma4/geometry.hpp"
 #include "model/gemma4/kernels.hpp"
+#include "model/gemma4/scratch.hpp"
+#include "batch/decode_abi.hpp"
+#include "loader/heap_bind.hpp"
 #include "decode_psos.hpp"
 #include "mtl4_context.hpp"
+
+#include <unordered_set>
+#include <vector>
 
 using pie::metal::RawMetalContext;
 using pie::metal::gemma4::build_gemma4_psos;
@@ -33,6 +40,38 @@ int g_failures = 0;
 void expect(bool ok, const std::string& what) {
     std::printf("  %s  %s\n", ok ? "PASS" : "FAIL", what.c_str());
     if (!ok) ++g_failures;
+}
+
+/// How many argument-table slots each kind's M>1 kernel reads.
+///
+/// Deliberately not the decode counts: four kinds change kernel with the batch,
+/// and two of them grow a page table where the contiguous ABI had cache
+/// strides. The counterpart of `gemma4_forward_test`'s `required_slots`, which
+/// found 172 unbound slots the first time it ran.
+int required_slots_mb(pie::metal::gemma4::Kind k) {
+    using Kind = pie::metal::gemma4::Kind;
+    switch (k) {
+        case Kind::EmbedGather:
+        case Kind::PleTokenGather:      return 7;  // + the gemma4 embed scale
+        case Kind::QmvQ: case Kind::QmvK: case Kind::QmvV: case Kind::QmvO:
+        case Kind::QmvGate: case Kind::QmvUp: case Kind::QmvDown:
+        case Kind::LmHead:
+        case Kind::PleProjGemv: case Kind::PleGateGemv:
+        case Kind::PleProjLayerGemv:    return 8;  // Qmv's seven, plus M
+        case Kind::AttnNorm: case Kind::PostAttnNorm: case Kind::FfnNorm:
+        case Kind::PostFfnNorm: case Kind::FinalRms: case Kind::QNorm:
+        case Kind::KNorm: case Kind::PleNorm: case Kind::PleProjNorm: return 4;
+        case Kind::VNorm:               return 3;
+        case Kind::RopeQ: case Kind::RopeK: return 5;
+        case Kind::KvAppend:            return 15;  // kv_append_paged
+        case Kind::Sdpa:                return 16;  // sdpa_paged, window included
+        case Kind::AttnResidual: case Kind::FfnResidual: case Kind::PleResidual:
+        case Kind::GegluTanh: case Kind::PleGeglu:
+        case Kind::LayerScalar: case Kind::PleCombine: return 4;
+        case Kind::FinalSoftcap:        return 3;
+        case Kind::Argmax:              return 4;
+    }
+    return 0;
 }
 
 }  // namespace
@@ -173,6 +212,63 @@ int main(int argc, char** argv) {
                 expect(still_m1 == 0,
                        "and every kind whose kernel changes at M>1 got a different one (" +
                            std::to_string(still_m1) + " did not)");
+
+                // ── and every slot those pipelines read is bound ──
+                //
+                // Structural, with placeholder buffers: what is being checked is
+                // that `bind_gemma4_dag_mb` + `bind_gemma4_consts(paged)` reach
+                // every slot, which is the class of defect that cost this family
+                // 172 unbound slots on the decode path. No checkpoint needed --
+                // the binder does not care what the bytes are.
+                std::printf("[M>1 bind coverage]\n");
+                namespace g4 = pie::metal::gemma4;
+                const int rows = 4;
+                const auto mb_dag = g4::build_gemma4_dag_mb(g, /*ordinal_base=*/100000,
+                                                            /*with_argmax=*/false);
+                g4::BoundGemma4 b;
+                std::unordered_set<std::string> names;
+                for (const auto& d : mb_dag) {
+                    for (const auto& wb : pie::metal::weight_binds(
+                             g4::shared_kind(d.kind), d.layer, pie::metal::DecodeGeometry{},
+                             false)) {
+                        names.insert(wb.tensor);
+                    }
+                }
+                for (const std::string& n : names) b.weights.emplace(n, ctx->heap_alloc(256));
+                b.io.resize(pie::metal::kIoSlotCount);
+                for (int i = 0; i < pie::metal::kIoSlotCount; ++i)
+                    b.io[i] = ctx->heap_alloc(4096);
+                std::vector<pie::metal::SlotHandle> kp(std::size_t(g.n_layers));
+                std::vector<pie::metal::SlotHandle> vp(std::size_t(g.n_layers));
+                for (int L = 0; L < g.n_layers; ++L) {
+                    kp[std::size_t(L)] = ctx->heap_alloc(4096);
+                    vp[std::size_t(L)] = ctx->heap_alloc(4096);
+                }
+                const g4::ScratchPlan sp = g4::build_gemma4_scratch(mb_dag, g);
+                const g4::ScratchColoring col = g4::color_gemma4_scratch(mb_dag, sp);
+                b.pool.resize(std::size_t(col.colors_used));
+                for (auto& s : b.pool) s = ctx->heap_alloc(4096);
+
+                g4::bind_gemma4_dag_mb(*ctx, b, mb_dag, g, col, kp, vp);
+                const int consts = g4::bind_gemma4_consts(*ctx, mb_dag, g, rows,
+                                                          /*paged=*/true);
+                int mb_missing = 0;
+                for (const auto& d : mb_dag) {
+                    const int n = required_slots_mb(d.kind);
+                    for (int slot = 0; slot < n; ++slot) {
+                        if (!ctx->arg_slot_is_bound(d.ordinal, std::uint8_t(slot))) {
+                            if (mb_missing < 12) {
+                                std::printf("    missing ord=%d kind=%d layer=%d slot=%d\n",
+                                            d.ordinal, int(d.kind), d.layer, slot);
+                            }
+                            ++mb_missing;
+                        }
+                    }
+                }
+                std::printf("  (%zu dispatches, %d constants)\n", mb_dag.size(), consts);
+                expect(mb_missing == 0,
+                       "every slot the M>1 kernels read is bound (" +
+                           std::to_string(mb_missing) + " are not)");
             }
         }
     }

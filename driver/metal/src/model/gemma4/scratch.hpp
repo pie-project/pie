@@ -14,8 +14,14 @@
 namespace pie::metal::gemma4 {
 
 /// One buffer of one dispatch, and the activation value it carries.
+///
+/// `index` is the dispatch's POSITION in the DAG, not its argument-table
+/// ordinal. The two coincide on the decode path and diverge on the prefill one,
+/// whose ordinals are shifted clear of it -- and position is what this means:
+/// the colouring uses it as a time axis, alongside concurrency runs that are
+/// themselves indexed by position.
 struct Use {
-    int ordinal = 0;
+    int index = 0;
     std::uint8_t bind_index = 0;
     int value = 0;
     bool is_write = false;

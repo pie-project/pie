@@ -188,11 +188,11 @@ void the_dataflow_never_reads_an_unwritten_value() {
     // read-before-write.
     std::vector<bool> written(std::size_t(plan.value_count), false);
     int read_before_write = 0;
-    int last_ordinal = -1;
+    int last_index = -1;
     bool ordered = true;
     for (const Use& u : plan.uses) {
-        ordered = ordered && u.ordinal >= last_ordinal;
-        last_ordinal = u.ordinal;
+        ordered = ordered && u.index >= last_index;
+        last_index = u.index;
         if (u.is_write) {
             written[std::size_t(u.value)] = true;
         } else if (!written[std::size_t(u.value)]) {
@@ -217,17 +217,19 @@ void the_dataflow_never_reads_an_unwritten_value() {
 
     // The residual stream has to be threaded, not reset: the last layer's
     // scalar output must reach the final norm.
-    int final_rms_ord = -1;
-    for (const Dispatch& d : dag) {
-        if (d.kind == Kind::FinalRms) final_rms_ord = d.ordinal;
+    // Positions, not ordinals: `Use::index` is the DAG position, which is what
+    // the dataflow's time axis means.
+    int final_rms_at = -1;
+    for (std::size_t i = 0; i < dag.size(); ++i) {
+        if (dag[i].kind == Kind::FinalRms) final_rms_at = int(i);
     }
     int final_rms_input = -2;
     for (const Use& u : plan.uses) {
-        if (u.ordinal == final_rms_ord && !u.is_write) final_rms_input = u.value;
+        if (u.index == final_rms_at && !u.is_write) final_rms_input = u.value;
     }
     int last_scalar_out = -3;
     for (const Use& u : plan.uses) {
-        if (u.ordinal < final_rms_ord && u.is_write) last_scalar_out = u.value;
+        if (u.index < final_rms_at && u.is_write) last_scalar_out = u.value;
     }
     expect_eq(final_rms_input, last_scalar_out,
               "the final norm reads what the last layer wrote");

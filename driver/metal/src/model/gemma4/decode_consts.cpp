@@ -86,7 +86,7 @@ KN qmv_kn(Kind k, const Gemma4Geometry& g, int layer) {
 }
 
 int bind_gemma4_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
-                       const Gemma4Geometry& g, int rows) {
+                       const Gemma4Geometry& g, int rows, bool paged) {
     // `rows` is the token count. Only two kinds of constant depend on it: a
     // GEMM needs to be told M, and an elementwise kernel over a contiguous
     // [rows, width] buffer counts rows*width. Everything else is geometry.
@@ -158,8 +158,25 @@ int bind_gemma4_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                 break;
 
             // ── attention ──
+            //
+            // Two ABIs, one kind. The paged shader puts a page table where the
+            // contiguous one puts cache strides, so which set is bound is
+            // decided by the caller and not guessed from `rows`: the executor
+            // may run the paged kernel at one token.
             case Kind::Sdpa: {
                 const std::int32_t gqa = g.n_kv_heads > 0 ? g.n_q_heads / g.n_kv_heads : 1;
+                if (paged) {
+                    using P = bind::SdpaPaged;
+                    bind_const<std::int32_t>(ctx, ord, (std::uint8_t)P::GqaFactor, gqa, &count);
+                    bind_const<std::int32_t>(ctx, ord, (std::uint8_t)P::PageSize,
+                                             g.kv_page_size, &count);
+                    bind_const<std::int32_t>(ctx, ord, (std::uint8_t)P::NKvHeads,
+                                             g.n_kv_heads, &count);
+                    bind_const<float>(ctx, ord, (std::uint8_t)P::Scale, 1.0f, &count);
+                    bind_const<std::int32_t>(ctx, ord, (std::uint8_t)P::Window,
+                                             d.sliding ? g.sliding_window : 0, &count);
+                    break;
+                }
                 bind_const<std::int32_t>(ctx, ord, (std::uint8_t)bind::Sdpa::GqaFactor, gqa,
                                          &count);
                 // 1.0, not 1/sqrt(head_dim): gemma4 folds the attention scale
@@ -201,6 +218,17 @@ int bind_gemma4_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                                         k_head_stride(g, L), &count);
                 bind_const<std::size_t>(ctx, ord, (std::uint8_t)bind::KvAppend::KSeqStride,
                                         std::size_t(hd), &count);
+                if (paged) {
+                    // The paged scatter keeps the contiguous prefix verbatim and
+                    // appends its own two; both are bound so no declared slot is
+                    // left holding whatever the table had.
+                    bind_const<std::int32_t>(ctx, ord,
+                                             (std::uint8_t)bind::KvAppendPaged::PageSize,
+                                             g.kv_page_size, &count);
+                    bind_const<std::int32_t>(ctx, ord,
+                                             (std::uint8_t)bind::KvAppendPaged::NKvHeads,
+                                             g.n_kv_heads, &count);
+                }
                 break;
 
             // ── elementwise ──

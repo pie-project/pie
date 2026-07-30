@@ -54,8 +54,11 @@ ScratchPlan build_gemma4_scratch(const std::vector<Dispatch>& dag, const Gemma4G
     int ple_tok = -1, ple_proj = -1, ple = -1;
     int ple_gate = -1, ple_act = -1, ple_back = -1;
 
-    for (const Dispatch& d : dag) {
-        const int o = d.ordinal;
+    for (std::size_t di = 0; di < dag.size(); ++di) {
+        const Dispatch& d = dag[di];
+        // Position, not `d.ordinal`: the prefill DAG shifts its ordinals clear
+        // of the decode path's, and this is a time axis.
+        const int o = static_cast<int>(di);
         switch (d.kind) {
             case Kind::EmbedGather:
                 resid = fresh();
