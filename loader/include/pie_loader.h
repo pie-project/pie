@@ -207,6 +207,14 @@ enum class PieLoaderExprKind : uint32_t {
   Repack = 9,
   Cast = 10,
   Scale = 11,
+  /// The two group nodes. Both stand for an index the contract does not
+  /// name, so both are an error outside a
+  /// [`GroupContract`](crate::contract::GroupContract) -- which the C ABI
+  /// cannot declare yet, so a C++ author has no use for these today. They are
+  /// numbered here because the numbering is the ABI, and appending later
+  /// would be a second decision to get right.
+  SrcIndexed = 12,
+  Select = 13,
 };
 
 /// Which slice of a tensor-parallel world an expression is being read for.
@@ -833,6 +841,45 @@ struct PieLoaderQuantAttachmentView {
 
 using PieLoaderQuantAttachmentSlice = PieLoaderSlice<PieLoaderQuantAttachmentView>;
 
+/// Where one instruction of a group's plan reads, for one instance.
+///
+/// The whole of what distinguishes instance `i` from instance 0: a group did
+/// not compile unless every other field of every instruction agreed across all
+/// of them. `instr_id` names the instruction in
+/// [`PieLoaderGroupView::plan`](PieLoaderGroupView) whose source extent these
+/// three fields replace.
+struct PieLoaderSourceBindingView {
+  uint32_t instr_id;
+  uint32_t file_id;
+  uint32_t tensor_id;
+  uint64_t file_offset;
+};
+
+using PieLoaderSourceBindingSlice = PieLoaderSlice<PieLoaderSourceBindingView>;
+
+/// A set of interchangeable tensors: one plan, `arity` instances.
+///
+/// The driver decides what to do with it. Running `plan` `arity` times into
+/// `arity` destinations makes the group resident, which is what a driver that
+/// has never heard of streaming should do; running it on demand into a bounded
+/// set of slots is streaming. The loader states only that the two are the same
+/// program.
+struct PieLoaderGroupView {
+  PieLoaderBytes name;
+  uint32_t arity;
+  /// The program one instance runs, compiled at index 0. A whole plan, so it
+  /// goes to the same executor the resident load already uses.
+  const PieLoaderPlan *plan;
+  /// `arity * bindings_per_instance` entries, instance-major. Instance `i`
+  /// owns `[i * bindings_per_instance, (i + 1) * bindings_per_instance)`.
+  PieLoaderSourceBindingSlice bindings;
+  /// How many instructions of `plan` name a source. Zero only if the group's
+  /// plan reads nothing, which no group does.
+  size_t bindings_per_instance;
+};
+
+using PieLoaderGroupSlice = PieLoaderSlice<PieLoaderGroupView>;
+
 /// The compiled plan, as the driver sees it.
 ///
 /// The leading members reproduce the old `LoadPlanView` in order, so an executor
@@ -866,6 +913,9 @@ struct PieLoaderPlan {
   /// dump. Rendered by the loader so no driver keeps a second table of
   /// instruction names to fall out of step with this one.
   PieLoaderBytes stats_json;
+  /// Interchangeable tensor sets, each compiled once. Empty for a plan whose
+  /// contract declared no group, which is every contract that predates them.
+  PieLoaderGroupSlice groups;
   void *owner;
 };
 

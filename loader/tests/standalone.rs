@@ -171,6 +171,7 @@ fn a_plan_compiles_from_a_value_with_no_checkpoint_anywhere() {
             vec![2, 2],
             Encoding::Raw(DType::F32),
         )],
+        groups: Vec::new(),
     };
 
     let plan = compile_load_plan(&metadata, &contract, StorageTarget::default())

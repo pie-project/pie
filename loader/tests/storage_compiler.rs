@@ -137,6 +137,7 @@ fn metal_qwen35_schema_emits_canonical_affine_u4_arena() {
                 Encoding::Raw(DType::BF16),
             ),
         ],
+        groups: Vec::new(),
     };
 
     let program = compile_load_plan(&metadata, &contract, target).unwrap();
@@ -180,6 +181,7 @@ fn buffer_join_tile_maps_carry_destination_offsets() {
                 Encoding::Raw(DType::BF16),
             ),
         ],
+        groups: Vec::new(),
     };
 
     let program = compile_load_plan(&metadata(), &contract, StorageTarget::default()).unwrap();
@@ -237,6 +239,7 @@ fn direct_copy_lowers_to_identity_extent_write() {
             vec![2, 2],
             Encoding::Raw(DType::BF16),
         )],
+        groups: Vec::new(),
     };
 
     let program = compile_load_plan(&metadata, &contract, StorageTarget::default()).unwrap();
@@ -280,6 +283,7 @@ fn packed_quant_row_select_uses_byte_exact_offsets() {
             vec![1, 8],
             Encoding::Quant(quant(QuantScheme::AwqInt4, DType::BF16)),
         )],
+        groups: Vec::new(),
     };
 
     let program =
@@ -318,6 +322,7 @@ fn an_expression_may_not_outgrow_the_tensor_it_is_declared_for() {
             vec![1, 4],
             Encoding::Quant(quant(QuantScheme::AwqInt4, DType::BF16)),
         )],
+        groups: Vec::new(),
     };
 
     let err = compile_load_plan(&quant_metadata(), &contract, StorageTarget::default())
@@ -337,6 +342,7 @@ fn target_support_rejects_cuda_decode_at_compile_time() {
             vec![4],
             Encoding::Raw(DType::BF16),
         )],
+        groups: Vec::new(),
     };
 
     let err = compile_load_plan(
@@ -374,6 +380,7 @@ fn packed_quant_source_requires_exact_affine_size() {
             vec![4, 8],
             Encoding::Quant(quant(QuantScheme::GgufQ4_0, DType::BF16)),
         )],
+        groups: Vec::new(),
     };
 
     let err = compile_load_plan(&metadata, &contract, StorageTarget::default())
@@ -716,6 +723,7 @@ fn a_contract_that_declares_a_name_twice_is_rejected() {
     let contract = pie_loader::contract::ModelContract {
         alignment: 256,
         tensors: vec![one("dup"), one("dup")],
+        groups: Vec::new(),
     };
     let error = compile_load_plan(&metadata(), &contract, StorageTarget::default())
         .unwrap_err()
@@ -733,6 +741,7 @@ fn a_contract_whose_declared_shape_is_wrong_is_rejected() {
             vec![4],
             Encoding::Raw(DType::F32),
         )],
+        groups: Vec::new(),
     };
     let error = compile_load_plan(&metadata(), &contract, StorageTarget::default())
         .unwrap_err()
@@ -779,6 +788,7 @@ fn a_head_boundary_shard_is_one_contiguous_run() {
             vec![4, 2],
             Encoding::Raw(DType::F32),
         )],
+        groups: Vec::new(),
     };
     let target = StorageTarget {
         tp_rank: 1,
@@ -824,6 +834,7 @@ fn a_head_boundary_shard_rejects_an_indivisible_world() {
             vec![4, 2],
             Encoding::Raw(DType::F32),
         )],
+        groups: Vec::new(),
     };
     let target = StorageTarget {
         tp_rank: 1,
@@ -869,6 +880,7 @@ fn scale_contract(factor: f32, source: &str, dtype: DType) -> ModelContract {
             vec![2],
             Encoding::Raw(dtype),
         )],
+        groups: Vec::new(),
     }
 }
 
@@ -922,6 +934,7 @@ fn a_scale_over_quantized_elements_is_rejected_at_compile_time() {
             vec![4, 8],
             Encoding::Quant(quant(QuantScheme::AwqInt4, DType::BF16)),
         )],
+        groups: Vec::new(),
     };
     let error = compile_load_plan(&quant_metadata(), &contract, StorageTarget::default())
         .unwrap_err()
@@ -939,6 +952,7 @@ fn a_scale_whose_declared_shape_is_wrong_is_rejected() {
             vec![4],
             Encoding::Raw(DType::F32),
         )],
+        groups: Vec::new(),
     };
     let error = compile_load_plan(&metadata(), &contract, StorageTarget::default())
         .unwrap_err()
@@ -1004,6 +1018,7 @@ fn block_scaled_contract(factors: &str, group: u32, axis: u8) -> ModelContract {
                 Encoding::Raw(DType::BF16),
             ),
         ],
+        groups: Vec::new(),
     }
 }
 
@@ -1082,6 +1097,7 @@ fn a_sharded_block_scaled_dequant_scales_only_its_own_rank() {
                 Encoding::Raw(DType::BF16),
             ),
         ],
+        groups: Vec::new(),
     };
     let target = StorageTarget {
         tp_size: 2,
@@ -1201,6 +1217,7 @@ fn a_scale_by_an_undeclared_expression_is_rejected() {
             vec![4, 32],
             Encoding::Raw(DType::BF16),
         )],
+        groups: Vec::new(),
     };
     let error = compile_load_plan(
         &block_scaled_metadata(),
@@ -1571,6 +1588,7 @@ fn a_block_scaled_fp8_source_carries_its_scale_tensor() {
             vec![64, 64],
             Encoding::Quant(quant(QuantScheme::Mxfp4E2M1E8M0, DType::BF16)),
         )],
+        groups: Vec::new(),
     };
     let program = compile_load_plan(&metadata, &contract, target).unwrap();
     let encodes: Vec<_> = program
@@ -1616,6 +1634,7 @@ fn a_source_without_a_scale_sibling_names_none() {
             vec![64, 64],
             Encoding::Quant(quant(QuantScheme::Mxfp4E2M1E8M0, DType::BF16)),
         )],
+        groups: Vec::new(),
     };
     let program = compile_load_plan(&metadata, &contract, target).unwrap();
     for instr in &program.instrs {
@@ -1662,6 +1681,7 @@ fn a_padded_head_dim_zeroes_the_buffer_before_it_writes_the_rows() {
             vec![4, 5],
             Encoding::Raw(DType::BF16),
         )],
+        groups: Vec::new(),
     };
 
     let program = compile_load_plan(&metadata, &contract, StorageTarget::default()).unwrap();
@@ -1743,6 +1763,7 @@ fn an_e8m0_block_scale_read_as_fp32_lowers_to_a_cast() {
             vec![8, 8],
             Encoding::Raw(DType::F32),
         )],
+        groups: Vec::new(),
     };
     let program = compile_load_plan(&metadata, &contract, target).unwrap();
     let casts = program
@@ -1804,6 +1825,7 @@ fn scales_the_loader_writes_while_encoding_mxfp4_stay_raw_e8m0() {
             vec![64, 64],
             Encoding::Quant(quant(QuantScheme::Mxfp4E2M1E8M0, DType::BF16)),
         )],
+        groups: Vec::new(),
     };
     let program = compile_load_plan(&metadata, &contract, scale_target()).unwrap();
     assert_eq!(program.attachments.len(), 1, "{:#?}", program.attachments);
@@ -1840,6 +1862,7 @@ fn scales_the_loader_writes_while_encoding_fp8_are_f32_factors() {
             vec![64, 64],
             Encoding::Quant(quant(QuantScheme::Fp8E4M3, DType::BF16)),
         )],
+        groups: Vec::new(),
     };
     let program = compile_load_plan(&metadata, &contract, scale_target()).unwrap();
     assert_eq!(program.attachments.len(), 1, "{:#?}", program.attachments);
@@ -1896,6 +1919,7 @@ fn scales_the_checkpoint_shipped_are_paired_by_the_contract() {
                 form: ScaleForm::F32Factors,
             }),
         ],
+        groups: Vec::new(),
     };
     let program = compile_load_plan(&metadata, &contract, scale_target()).unwrap();
     assert_eq!(program.attachments.len(), 1, "{:#?}", program.attachments);
@@ -1956,6 +1980,7 @@ fn scales_named_for_a_weight_the_loader_quantizes_are_a_contract_error() {
                 form: ScaleForm::F32Factors,
             }),
         ],
+        groups: Vec::new(),
     };
     let err = compile_load_plan(&metadata, &contract, scale_target())
         .unwrap_err()
@@ -1991,6 +2016,7 @@ fn scales_naming_an_undeclared_tensor_are_a_contract_error() {
                 form: ScaleForm::F32Factors,
             }),
         ],
+        groups: Vec::new(),
     };
     let error = compile_load_plan(&metadata, &contract, scale_target())
         .unwrap_err()
@@ -2042,6 +2068,7 @@ fn scales_may_name_a_tensor_declared_after_them() {
                 Encoding::Raw(DType::F8E4M3),
             ),
         ],
+        groups: Vec::new(),
     };
     let program = compile_load_plan(&metadata, &contract, scale_target()).unwrap();
     assert_eq!(program.attachments.len(), 1, "{:#?}", program.attachments);
@@ -2085,6 +2112,7 @@ fn encode_to(
             shape.to_vec(),
             Encoding::Quant(quant(scheme, DType::BF16)),
         )],
+        groups: Vec::new(),
     };
     compile_load_plan(&metadata, &contract, scale_target())
 }
@@ -2146,6 +2174,7 @@ fn re_encoding_one_quantized_scheme_as_another_is_refused() {
             vec![64, 64],
             Encoding::Quant(quant(QuantScheme::Mxfp4E2M1E8M0, DType::BF16)),
         )],
+        groups: Vec::new(),
     };
     let err = compile_load_plan(&metadata, &contract, scale_target()).unwrap_err();
     assert!(err.to_string().contains("re-encodes Fp8E4M3"), "{err}");
@@ -2178,6 +2207,7 @@ fn a_declaration_that_disagrees_with_its_expression_is_a_mistake_not_a_kernel() 
             vec![64, 64],
             Encoding::Quant(quant(QuantScheme::Fp8E4M3, DType::BF16)),
         )],
+        groups: Vec::new(),
     };
     let err = compile_load_plan(&metadata, &contract, scale_target())
         .unwrap_err()

@@ -650,6 +650,49 @@ pub struct PieLoaderQuantAttachmentView {
 
 pub type PieLoaderQuantAttachmentSlice = PieLoaderSlice<PieLoaderQuantAttachmentView>;
 
+/// Where one instruction of a group's plan reads, for one instance.
+///
+/// The whole of what distinguishes instance `i` from instance 0: a group did
+/// not compile unless every other field of every instruction agreed across all
+/// of them. `instr_id` names the instruction in
+/// [`PieLoaderGroupView::plan`](PieLoaderGroupView) whose source extent these
+/// three fields replace.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PieLoaderSourceBindingView {
+    pub instr_id: u32,
+    pub file_id: u32,
+    pub tensor_id: u32,
+    pub file_offset: u64,
+}
+
+pub type PieLoaderSourceBindingSlice = PieLoaderSlice<PieLoaderSourceBindingView>;
+
+/// A set of interchangeable tensors: one plan, `arity` instances.
+///
+/// The driver decides what to do with it. Running `plan` `arity` times into
+/// `arity` destinations makes the group resident, which is what a driver that
+/// has never heard of streaming should do; running it on demand into a bounded
+/// set of slots is streaming. The loader states only that the two are the same
+/// program.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct PieLoaderGroupView {
+    pub name: PieLoaderBytes,
+    pub arity: u32,
+    /// The program one instance runs, compiled at index 0. A whole plan, so it
+    /// goes to the same executor the resident load already uses.
+    pub plan: *const PieLoaderPlan,
+    /// `arity * bindings_per_instance` entries, instance-major. Instance `i`
+    /// owns `[i * bindings_per_instance, (i + 1) * bindings_per_instance)`.
+    pub bindings: PieLoaderSourceBindingSlice,
+    /// How many instructions of `plan` name a source. Zero only if the group's
+    /// plan reads nothing, which no group does.
+    pub bindings_per_instance: usize,
+}
+
+pub type PieLoaderGroupSlice = PieLoaderSlice<PieLoaderGroupView>;
+
 /// Which on-disk format a checkpoint file uses.
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -922,6 +965,9 @@ pub struct PieLoaderPlan {
     /// dump. Rendered by the loader so no driver keeps a second table of
     /// instruction names to fall out of step with this one.
     pub stats_json: PieLoaderBytes,
+    /// Interchangeable tensor sets, each compiled once. Empty for a plan whose
+    /// contract declared no group, which is every contract that predates them.
+    pub groups: PieLoaderGroupSlice,
     pub owner: *mut std::ffi::c_void,
 }
 

@@ -1058,6 +1058,7 @@ fn a_contract_naming_a_tensor_the_plan_does_not_deliver_is_a_violation() {
             &ModelContract {
                 alignment: 256,
                 tensors: Vec::new(),
+                groups: Vec::new(),
             },
         );
         assert_eq!(status, PieLoaderStatus::ContractViolation);
@@ -1237,6 +1238,7 @@ fn minimal_contract() -> crate::contract::ModelContract {
             Expr::Src("a.weight".to_string()),
             Encoding::Raw(DType::BF16),
         )],
+        groups: Vec::new(),
     }
 }
 
@@ -1257,6 +1259,7 @@ fn fused_contract() -> crate::contract::ModelContract {
             vec![4, 4],
             Encoding::Raw(DType::BF16),
         )],
+        groups: Vec::new(),
     }
 }
 
@@ -1288,6 +1291,7 @@ fn scaled_contract() -> crate::contract::ModelContract {
                 form: ScaleForm::F32Factors,
             }),
         ],
+        groups: Vec::new(),
     }
 }
 
@@ -1651,6 +1655,7 @@ fn a_gather_carries_its_indices_across_the_ffi() {
             Expr::src("a.weight").gather(0, vec![3, 0, 7, 0]),
             Encoding::Raw(DType::BF16),
         )],
+        groups: Vec::new(),
     };
     let owned = crate::testkit::contract_writer::write_contract(&contract);
     let read = unsafe { super::contract::read_contract(&owned.view()) }.expect("reads back");

@@ -63,6 +63,14 @@ pub enum PieLoaderExprKind {
     Repack = 9,
     Cast = 10,
     Scale = 11,
+    /// The two group nodes. Both stand for an index the contract does not
+    /// name, so both are an error outside a
+    /// [`GroupContract`](crate::contract::GroupContract) -- which the C ABI
+    /// cannot declare yet, so a C++ author has no use for these today. They are
+    /// numbered here because the numbering is the ABI, and appending later
+    /// would be a second decision to get right.
+    SrcIndexed = 12,
+    Select = 13,
 }
 
 impl TryFrom<u32> for PieLoaderExprKind {
@@ -81,6 +89,8 @@ impl TryFrom<u32> for PieLoaderExprKind {
             9 => Self::Repack,
             10 => Self::Cast,
             11 => Self::Scale,
+            12 => Self::SrcIndexed,
+            13 => Self::Select,
             other => return Err(other),
         })
     }
@@ -533,6 +543,17 @@ fn read_expr(node: &PieLoaderExprNode, index: usize, done: &[Expr]) -> Result<Ex
     Ok(match kind {
         PieLoaderExprKind::Src => Expr::Src(unsafe { text(&node.name, &what) }?),
         PieLoaderExprKind::Out => Expr::Out(unsafe { text(&node.name, &what) }?),
+        PieLoaderExprKind::SrcIndexed => Expr::SrcIndexed(unsafe { text(&node.name, &what) }?),
+        PieLoaderExprKind::Select => Expr::Select {
+            src: src()?,
+            axis,
+            // `start` carries the stride: a `Select` is the `Slice` whose start
+            // is `index * stride`, so the field that would have been the start
+            // is the multiplier instead. Reusing the slot keeps the node POD
+            // one shape rather than growing a field only two kinds can use.
+            stride: node.start,
+            len: node.len,
+        },
         PieLoaderExprKind::Slice => Expr::Slice {
             src: src()?,
             axis,
@@ -648,6 +669,11 @@ pub unsafe fn read_contract(view: &PieLoaderModelContractView) -> Result<ModelCo
     Ok(ModelContract {
         alignment: view.alignment,
         tensors: declared,
+        // No group authoring over the C ABI yet: the driver work that consumes
+        // group plans lands with it, and a surface with no caller is a surface
+        // nothing checks. The JSON contract path carries groups today, which is
+        // what the golden plans and `pie-loader` exercise them through.
+        groups: Vec::new(),
     })
 }
 

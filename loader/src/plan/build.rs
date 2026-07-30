@@ -65,12 +65,31 @@ pub fn build(
     contract: &ModelContract,
     target: StorageTarget,
 ) -> Result<LoadPlan> {
+    build_instance(metadata, contract, target, None)
+}
+
+/// [`build`], resolved as one instance of a group.
+///
+/// `instance` is what the group's index nodes stand for. `None` is the resident
+/// contract, where an index node is a contract error rather than a number --
+/// which is why this takes an `Option` instead of defaulting to zero.
+pub fn build_instance(
+    metadata: &CheckpointMetadata,
+    contract: &ModelContract,
+    target: StorageTarget,
+    instance: Option<u32>,
+) -> Result<LoadPlan> {
     let sources = Sources::new(metadata);
     let partition = Partition::new(target.tp_rank, target.tp_size);
+    let resolver = Resolver::new(&sources, partition);
+    let resolver = match instance {
+        Some(index) => resolver.for_instance(index),
+        None => resolver,
+    };
     let mut builder = Builder {
         sources: &sources,
         program: LoadPlan::empty(target),
-        resolver: Resolver::new(&sources, partition),
+        resolver,
         values: HashMap::new(),
         finalized: HashSet::new(),
         alignment: contract.alignment.max(1),

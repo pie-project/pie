@@ -897,6 +897,7 @@ mod tests {
                 vec![2, 5],
                 Encoding::Raw(DType::U8),
             )],
+            groups: Vec::new(),
         };
 
         let plan = crate::plan::compile(&metadata, &contract, StorageTarget::default()).unwrap();
@@ -956,6 +957,7 @@ mod tests {
                 vec![4],
                 Encoding::Raw(DType::F32),
             )],
+            groups: Vec::new(),
         };
 
         let plan = crate::plan::compile(&metadata, &contract, StorageTarget::default()).unwrap();
@@ -1076,6 +1078,7 @@ mod tests {
                     Encoding::Raw(DType::BF16),
                 ),
             ],
+            groups: Vec::new(),
         };
 
         let plan = crate::plan::compile(&metadata, &contract, StorageTarget::default()).unwrap();
@@ -1184,6 +1187,7 @@ mod tests {
                     Encoding::Raw(DType::BF16),
                 ),
             ],
+            groups: Vec::new(),
         };
         let declare_scales = || {
             TensorContract::new(
@@ -1325,6 +1329,7 @@ mod tests {
                     Encoding::Raw(DType::BF16),
                 ),
             ],
+            groups: Vec::new(),
         };
 
         let plan = crate::plan::compile(&metadata, &contract, StorageTarget::default()).unwrap();

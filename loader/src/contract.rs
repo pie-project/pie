@@ -184,6 +184,49 @@ pub enum Expr {
     /// the arithmetic — and so that it composes: a shard of one leg of a
     /// [`Expr::Concat`] is expressible, which a whole-expression flag cannot say.
     Shard { src: Box<Expr>, axis: Axis },
+    /// A checkpoint tensor whose name carries this group instance's index:
+    /// `Src(template.replace("{}", index))`.
+    ///
+    /// The second and last node whose meaning depends on something outside the
+    /// expression, and it is the [`Expr::Shard`] of a [`GroupContract`]: a
+    /// group is written once for the whole grid, and
+    /// [`Resolver::specialize`](crate::contract::infer::Resolver::specialize)
+    /// substitutes the instance before lowering, because a tensor name cannot
+    /// be symbolic any more than a byte offset can.
+    ///
+    /// Exactly one `{}`, substituted with the index in decimal, and no other
+    /// placeholder syntax. That is deliberate: the loader must never *parse* a
+    /// checkpoint name — the whole point of a contract is that naming is the
+    /// author's business — and a template with formatting options is a small
+    /// language whose evaluator would be exactly that parser.
+    ///
+    /// Only for grids whose members are separate checkpoint tensors, the way
+    /// DeepSeek-V4 ships one tensor per expert. A fused `[E, ..]` bank is a
+    /// single tensor and its member is a band, which is [`Expr::Select`].
+    SrcIndexed(String),
+    /// This group instance's band: [`Expr::Slice`] at `start = index * stride`.
+    ///
+    /// What [`Expr::SrcIndexed`] is for a grid of separate tensors, this is for
+    /// a fused one: the expert axis of a GPT-OSS `[E, rows, cols]` bank is
+    /// `stride = len = 1`, and a bank that flattened the same grid into
+    /// `[E * rows, cols]` is `stride = len = rows`.
+    ///
+    /// Affine in the index rather than an arbitrary function of it, because
+    /// that is what makes every instance the *same* extent at a different
+    /// offset — which is the property a cache slot rests on. A general
+    /// index expression could denote members of differing size, and then
+    /// "interchangeable" would be a claim nothing checks.
+    ///
+    /// Its type does not mention the index at all: `len` along `axis`, whatever
+    /// the instance. Uniformity is therefore structural here, and only
+    /// [`Expr::SrcIndexed`] — which can name tensors that genuinely differ —
+    /// needs the per-instance check.
+    Select {
+        src: Box<Expr>,
+        axis: Axis,
+        stride: i64,
+        len: i64,
+    },
     /// Escape hatch: a backend-specific layout swizzle. Opaque to the type
     /// checker, so it must declare its own output type.
     Repack {
@@ -435,6 +478,45 @@ pub struct ModelContract {
     /// property; there is no reason to repeat it per tensor.
     pub alignment: u32,
     pub tensors: Vec<TensorContract>,
+    /// Grids of interchangeable tensors, declared once and instantiated
+    /// `arity` times. See [`GroupContract`].
+    ///
+    /// Defaulted on the way in, so every contract written before groups
+    /// existed reads as having none — which is what each of them meant.
+    #[serde(default)]
+    pub groups: Vec<GroupContract>,
+}
+
+/// A grid of interchangeable tensor sets, written once.
+///
+/// A mixture-of-experts checkpoint holds thousands of expert weights that
+/// differ only in *which* expert they are: same shape, same encoding, same
+/// expression, one index apart. Declared one by one they are thousands of
+/// [`TensorContract`]s; declared as a group they are one, plus an `arity`.
+///
+/// The compression is the smaller half of the point. The larger half is that a
+/// group *states* what a list cannot: that its members are the same size and
+/// therefore interchangeable. That is exactly the claim a bounded cache of
+/// slots rests on — page one member out, page another in, the slot fits either
+/// way — and stating it lets the type checker prove it instead of leaving a
+/// driver to assume it (see [`Expr::SrcIndexed`]).
+///
+/// What a group is *not* is a residency decision. It says these tensors form
+/// `arity` interchangeable instances and how to build one; it does not say
+/// where they live or when. A driver may materialize all `arity` of them and
+/// keep them resident — which is the ordinary load, one member at a time
+/// instead of all at once, and so at a fraction of the peak — or it may keep a
+/// few slots and page. The contract reads the same either way, because where
+/// bytes live at run time is the driver's business and not the checkpoint's.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupContract {
+    /// Names this grid for diagnostics and for the driver's own bookkeeping.
+    pub name: String,
+    /// How many instances the grid has. The index runs `0..arity`.
+    pub arity: u32,
+    /// The tensors one instance is made of, as expressions that may mention
+    /// the index through [`Expr::SrcIndexed`] and [`Expr::Select`].
+    pub tensors: Vec<TensorContract>,
 }
 
 /// Which slice of a tensor-parallel world an expression is being read for.
@@ -571,6 +653,22 @@ impl Expr {
         Expr::Out(name.into())
     }
 
+    /// A checkpoint tensor named by substituting the group index into
+    /// `template`. See [`Expr::SrcIndexed`].
+    pub fn src_indexed(template: impl Into<String>) -> Self {
+        Expr::SrcIndexed(template.into())
+    }
+
+    /// This instance's band of a fused grid. See [`Expr::Select`].
+    pub fn select(self, axis: u8, stride: i64, len: i64) -> Self {
+        Expr::Select {
+            src: Box::new(self),
+            axis: Axis(axis),
+            stride,
+            len,
+        }
+    }
+
     pub fn slice(self, axis: u8, start: i64, len: i64) -> Self {
         Expr::Slice {
             src: Box::new(self),
@@ -670,13 +768,13 @@ impl Expr {
     /// compiles to byte spans with no kernel and no intermediate buffer.
     pub fn is_affine(&self) -> bool {
         match self {
-            Expr::Src(_) | Expr::Out(_) | Expr::Fill { .. } => true,
+            Expr::Src(_) | Expr::Out(_) | Expr::Fill { .. } | Expr::SrcIndexed(_) => true,
             Expr::Slice { src, .. }
             | Expr::Stride { src, .. }
             | Expr::Gather { src, .. }
             | Expr::Transmute { src, .. } => src.is_affine(),
             Expr::Concat { parts, .. } => parts.iter().all(Expr::is_affine),
-            Expr::Shard { src, .. } => src.is_affine(),
+            Expr::Shard { src, .. } | Expr::Select { src, .. } => src.is_affine(),
             Expr::Repack { .. } | Expr::Cast { .. } | Expr::Scale { .. } => false,
         }
     }
@@ -712,13 +810,14 @@ impl Expr {
     fn visit<'a>(&'a self, seen: &mut impl FnMut(&'a Expr)) {
         seen(self);
         match self {
-            Expr::Src(_) | Expr::Out(_) | Expr::Fill { .. } => {}
+            Expr::Src(_) | Expr::Out(_) | Expr::Fill { .. } | Expr::SrcIndexed(_) => {}
             Expr::Slice { src, .. }
             | Expr::Stride { src, .. }
             | Expr::Gather { src, .. }
             | Expr::Transmute { src, .. }
             | Expr::Repack { src, .. }
             | Expr::Shard { src, .. }
+            | Expr::Select { src, .. }
             | Expr::Cast { src, .. } => src.visit(seen),
             Expr::Scale { src, factor } => {
                 src.visit(seen);
@@ -753,7 +852,7 @@ impl Expr {
     ) -> Result<Expr, Error> {
         let mut boxed = |src: Box<Expr>| -> Result<Box<Expr>, Error> { Ok(Box::new(f(*src)?)) };
         Ok(match self {
-            Expr::Src(_) | Expr::Out(_) | Expr::Fill { .. } => self,
+            Expr::Src(_) | Expr::Out(_) | Expr::Fill { .. } | Expr::SrcIndexed(_) => self,
             Expr::Slice {
                 src,
                 axis,
@@ -782,6 +881,17 @@ impl Expr {
                 src: boxed(src)?,
                 axis,
                 indices,
+            },
+            Expr::Select {
+                src,
+                axis,
+                stride,
+                len,
+            } => Expr::Select {
+                src: boxed(src)?,
+                axis,
+                stride,
+                len,
             },
             Expr::Transmute { src, to } => Expr::Transmute {
                 src: boxed(src)?,

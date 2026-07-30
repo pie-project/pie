@@ -14,6 +14,7 @@ use crate::types::{
 
 pub mod build;
 pub(crate) mod geometry;
+pub mod group;
 pub mod index;
 pub mod pass;
 pub mod passes;
@@ -52,13 +53,17 @@ pub fn compile(
     contract: &crate::contract::ModelContract,
     target: StorageTarget,
 ) -> Result<LoadPlan> {
-    let contract =
+    let rewritten =
         crate::contract::rewrite::coalesce_direct_row_shards(contract, metadata, &target)?;
-    let mut plan = build::build(metadata, &contract, target)?;
+    let mut plan = build::build(metadata, &rewritten, target.clone())?;
     plan.passes = pass::run_all(&mut plan)?;
     // Runs last, so a plan is never observable in a state where its tiling and
     // fusion fields are still placeholders.
     passes::tile::lower(&mut plan);
+    // Compiled from the *unrewritten* contract, because `groups` is not what
+    // the row-shard rewrite looks at; each group is rewritten on its own inside
+    // `group::compile_all`, where the sub-contract it applies to exists.
+    plan.groups = group::compile_all(metadata, contract, &target)?;
     Ok(plan)
 }
 
@@ -375,6 +380,48 @@ pub struct LoadPlan {
     pub memory: MemoryPlan,
     /// Quantized tensors paired with the tensors holding their scales.
     pub attachments: Vec<QuantAttachment>,
+    /// Interchangeable sets of tensors, each compiled once.
+    ///
+    /// Empty for every contract that declares no group, and elided when it is:
+    /// a plan recorded before groups existed still reads, and one compiled from
+    /// a contract without groups still records identically.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<GroupPlan>,
+}
+
+/// One plan, `arity` instances, differing only in which bytes they read.
+///
+/// See [`plan::group`](crate::plan::group) for what that sentence is worth and
+/// how it is proved. The driver decides what a group is *for*; the plan only
+/// says the instances are substitutable and where each one's bytes live.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupPlan {
+    pub name: String,
+    pub arity: u32,
+    /// The program one instance runs, compiled at index 0.
+    ///
+    /// A whole [`LoadPlan`] rather than a bare instruction list: an instance is
+    /// a self-contained load, with its own buffers and its own memory
+    /// accounting, and the driver runs it with the executor it already has.
+    pub plan: LoadPlan,
+    /// `bindings[i]` is what instance `i` reads instead of what
+    /// [`plan`](Self::plan) says. Indexed by instance, then by the
+    /// source-naming instructions of `plan` in order.
+    pub bindings: Vec<Vec<SourceBinding>>,
+}
+
+/// Where one instruction's bytes come from, for one instance of a group.
+///
+/// Exactly the three fields that locate bytes in a checkpoint. Everything else
+/// about the read -- how many bytes, with what stride, read as what dtype --
+/// is in the template, because a group whose instances disagreed about any of
+/// those would not have compiled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceBinding {
+    pub instr: InstrId,
+    pub file_id: FileId,
+    pub tensor_id: TensorId,
+    pub file_offset: u64,
 }
 
 impl LoadPlan {
@@ -391,6 +438,7 @@ impl LoadPlan {
             schedule: Vec::new(),
             memory: MemoryPlan::default(),
             attachments: Vec::new(),
+            groups: Vec::new(),
         }
     }
 }

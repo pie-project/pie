@@ -128,6 +128,24 @@ impl OwnedContract {
                 node.kind = PieLoaderExprKind::Out as u32;
                 node.name = self.name(name);
             }
+            Expr::SrcIndexed(template) => {
+                node.kind = PieLoaderExprKind::SrcIndexed as u32;
+                node.name = self.name(template);
+            }
+            Expr::Select {
+                src,
+                axis,
+                stride,
+                len,
+            } => {
+                let src = self.write_expr(src);
+                node.kind = PieLoaderExprKind::Select as u32;
+                node.src = src;
+                node.axis = axis.0;
+                // The stride rides in `start`; see `read_expr`.
+                node.start = *stride;
+                node.len = *len;
+            }
             Expr::Slice {
                 src,
                 axis,
