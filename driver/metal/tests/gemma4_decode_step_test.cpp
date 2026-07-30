@@ -324,6 +324,47 @@ void a_config_either_describes_a_schedulable_shape_or_is_refused() {
            "a stack where nothing owns KV is refused");
 }
 
+// The KV region is sized by which layers OWN kv and how wide each one's head is
+// -- not by counting full-attention layers, which is the other family's rule and
+// wrong here twice over.
+void the_kv_region_is_sized_per_owning_layer() {
+    std::printf("[kv region]\n");
+    Gemma4Geometry g;
+    std::string err;
+    expect(geometry_from_facts(Facts{}, g, &err), "geometry: " + err);
+
+    const int max_ctx = 4096;
+    const int act = 2;  // bf16
+
+    // 15 owning layers: 12 sliding at head_dim 256, 3 full at 512.
+    int owning_sliding = 0, owning_full = 0;
+    for (int L = 0; L < g.n_layers; ++L) {
+        if (g.is_kv_shared(L)) continue;
+        (g.is_full_attn(L) ? owning_full : owning_sliding) += 1;
+    }
+    expect_eq(owning_sliding + owning_full, g.n_kv_owning(), "owning count");
+    expect_eq(g.n_kv_owning(), 15, "E2B owns kv on 15 of 35 layers");
+
+    const std::size_t want =
+        std::size_t(2) * g.n_kv_heads * max_ctx * act *
+        (std::size_t(owning_sliding) * 256 + std::size_t(owning_full) * 512);
+    expect_eq(static_cast<long long>(gemma4_kv_region_bytes(g, max_ctx, act)),
+              static_cast<long long>(want), "region bytes");
+
+    // A full layer's cache really is twice a sliding layer's.
+    expect_eq(static_cast<long long>(gemma4_kv_bytes_per_layer(g, 4, max_ctx, act)),
+              2 * static_cast<long long>(gemma4_kv_bytes_per_layer(g, 0, max_ctx, act)),
+              "a full layer's head is twice a sliding layer's");
+
+    // The other family's rule, for contrast: counting full-attn layers at one
+    // head width asks for a region that is wrong in both factors.
+    int n_full = 0;
+    for (int L = 0; L < g.n_layers; ++L) n_full += g.is_full_attn(L) ? 1 : 0;
+    const std::size_t gdn_rule =
+        std::size_t(2) * n_full * g.n_kv_heads * max_ctx * g.head_dim * act;
+    expect(gdn_rule != want, "the full-attn-count rule would size this wrongly");
+}
+
 }  // namespace
 
 int main() {
@@ -338,6 +379,7 @@ int main() {
     colouring_is_hazard_free_and_small();
     kv_redirect_stays_within_an_attention_type();
     a_config_either_describes_a_schedulable_shape_or_is_refused();
+    the_kv_region_is_sized_per_owning_layer();
     std::printf("\n==== gemma4_decode_step_test: %s ====\n",
                 g_failures == 0 ? "all passed" : "FAILURES");
     return g_failures == 0 ? 0 : 1;

@@ -54,4 +54,32 @@ void bind_gemma4_dag(RawMetalContext& ctx, const BoundGemma4& b, const std::vect
                      const Gemma4Geometry& g, const ScratchColoring& scratch,
                      int ordinal_base = 0);
 
+
+/// Bytes of k (== bytes of v) one KV-owning layer needs for `max_ctx` tokens.
+///
+/// Sized per LAYER, not once for the stack: gemma 4's full-attention layers
+/// carry head_dim 512 against the sliding layers' 256, so one number for all of
+/// them either wastes half the region or truncates half the cache. Shared
+/// layers own nothing and are not asked.
+inline std::size_t gemma4_kv_bytes_per_layer(const Gemma4Geometry& g, int layer,
+                                             int max_ctx, int act_dtype_bytes) {
+    return std::size_t(g.n_kv_heads) * std::size_t(max_ctx) *
+           std::size_t(g.head_dim_of(layer)) * std::size_t(act_dtype_bytes);
+}
+
+/// The whole KV region: k and v over the layers that own KV.
+///
+/// `n_kv_owning()` is 15 of E2B's 35 layers, so sizing this the way the GDN
+/// family does -- count full-attention layers -- would ask for the wrong region
+/// twice over: wrong count, and wrong per-layer size.
+inline std::size_t gemma4_kv_region_bytes(const Gemma4Geometry& g, int max_ctx,
+                                          int act_dtype_bytes) {
+    std::size_t total = 0;
+    for (int L = 0; L < g.n_layers; ++L) {
+        if (g.is_kv_shared(L)) continue;
+        total += 2 * gemma4_kv_bytes_per_layer(g, L, max_ctx, act_dtype_bytes);
+    }
+    return total;
+}
+
 }  // namespace pie::metal::gemma4

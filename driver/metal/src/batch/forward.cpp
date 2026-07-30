@@ -17,6 +17,9 @@
 
 #if defined(__APPLE__)
 #include "batch_schedule.hpp"
+#include "model/contract.hpp"
+#include "model/gemma4/decode_step.hpp"
+#include "model/gemma4/geometry.hpp"
 #include "decode_consts.hpp"
 #include "decode_dispatch_mb.hpp"
 #include "decode_psos.hpp"
@@ -2161,16 +2164,38 @@ std::uint32_t MetalExecutor::argmax_native() const {
 }
 
 bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
-    // The geometry below still comes from the shipped qwen3.5 defaults, so a
-    // checkpoint that is not that one is refused — but the refusal is now about
-    // the GEOMETRY not matching, not about the family lacking linear attention.
-    // `full_attn_interval` and the vocab are what actually decide whether the
-    // built DAG describes this checkpoint; `has_linear_attn` never did.
-    if (!cfg.has_linear_attn) {
+    // Which family is this? Answered from the config's own `model_type`, so a
+    // checkpoint gets a diagnosis about ITSELF rather than about the family that
+    // happens to be wired up.
+    switch (model::model_family_of(cfg.model_type)) {
+    case model::ModelFamily::Qwen35:
+        break;
+    case model::ModelFamily::Gemma4: {
+        // Build the geometry before refusing, so the refusal is a fact about
+        // this checkpoint and not a guess. A shape this driver cannot schedule
+        // is reported as such; a shape it can is reported as the one thing that
+        // is genuinely missing, which is not the shape.
+        gemma4::Gemma4Geometry g4;
+        std::string why;
+        if (!gemma4::geometry_from_facts(cfg.gemma4, g4, &why)) {
+            if (err != nullptr) *err = why;
+            return false;
+        }
+        if (err != nullptr) {
+            *err = "Metal has gemma4's decode DAG (" +
+                   std::to_string(gemma4::build_gemma4_dag(g4).size()) +
+                   " dispatches over " + std::to_string(g4.n_layers) +
+                   " layers) but not its prefill: the family's own kernels "
+                   "(sdpa_sliding, geglu_tanh, ple_combine, layer_scalar, "
+                   "logit_softcap) exist only in their M=1 form, so a prompt "
+                   "cannot be processed";
+        }
+        return false;
+    }
+    case model::ModelFamily::Unknown:
         if (err != nullptr) {
             *err = "Metal has no model family for config '" + cfg.arch_name +
-                   "' yet: the only decode DAG this driver builds is the qwen3.5 "
-                   "GDN hybrid's";
+                   "' (model_type '" + cfg.model_type + "')";
         }
         return false;
     }

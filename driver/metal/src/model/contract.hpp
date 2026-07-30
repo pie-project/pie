@@ -26,6 +26,19 @@ struct ContractFacts {
     int first_kv_shared_layer = -1;
 };
 
+/// Which storage schema and decode DAG a checkpoint asks for.
+///
+/// One place answers this. The contract, the geometry and the executor all need
+/// the same answer, and three independent readings of `model_type` would be
+/// three chances to disagree.
+enum class ModelFamily { Unknown, Qwen35, Gemma4 };
+
+inline ModelFamily model_family_of(std::string_view model_type) {
+    if (qwen3_5::is_supported_model_type(model_type)) return ModelFamily::Qwen35;
+    if (gemma4::is_supported_model_type(model_type)) return ModelFamily::Gemma4;
+    return ModelFamily::Unknown;
+}
+
 inline bool is_supported_model_type(std::string_view model_type) {
     return qwen3_5::is_supported_model_type(model_type) ||
            gemma4::is_supported_model_type(model_type);
