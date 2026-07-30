@@ -56,6 +56,9 @@ struct FireGeometry {
     std::vector<std::uint32_t> rs_buffer_slot_ids;
     std::vector<std::uint32_t> rs_buffer_slot_indptr;
     std::vector<std::uint32_t> rs_buffer_lens;
+    // How far each request's folded boundary advances. Channel-resolved, so
+    // the host need never have seen it — the whole point of t15.
+    std::vector<std::uint32_t> rs_fold_lens;
     std::vector<std::uint32_t> rs_w_slot;         // rs_w_slot (buffered slab per token)
     std::vector<std::uint32_t> rs_w_off;          // rs_w_off (offset within that slab)
     StructuredMaskDescriptor structured_mask;
@@ -64,6 +67,7 @@ struct FireGeometry {
     bool has_mask = false;                        // attn_mask present
     bool has_rs_buffer_family = false;            // rs_buffer_pages/indptr present
     bool has_rs_write_desc = false;               // rs_w_slot/rs_w_off present
+    bool has_rs_fold_len = false;                 // rs_fold_len port bound
 };
 
 // Pre-forward descriptor resolution over a whole batch: one entry per

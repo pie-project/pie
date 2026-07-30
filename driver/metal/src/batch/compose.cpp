@@ -9,6 +9,7 @@ namespace pie::metal::batch {
 namespace {
 
 constexpr std::uint8_t kRsFlagFold = 2;
+constexpr std::uint8_t kRsFlagFoldLenDevice = 8;
 constexpr std::uint8_t kRsFlagReset = 1;
 
 template <typename T>
@@ -67,6 +68,21 @@ pie_native::LaunchView build_launch_view(const pie_native::StepLaunch& launch) {
         throw std::runtime_error(
             "this driver cannot replay buffered recurrent tokens; fold the "
             "buffer before appending to it");
+    }
+    // A device-resident fold length is CUDA-only too, and it fails in the
+    // quietest way of all: the wire slot carries the host's UPPER BOUND, so
+    // this driver would read a perfectly well-formed number and fold the whole
+    // buffer instead of the prefix the device actually accepted. There is no
+    // descriptor resolution here to substitute the real value.
+    if (launch.rs_slot_flags.len != 0 &&
+        std::any_of(launch.rs_slot_flags.ptr,
+                    launch.rs_slot_flags.ptr + launch.rs_slot_flags.len,
+                    [](std::uint8_t f) {
+                        return (f & kRsFlagFoldLenDevice) != 0;
+                    })) {
+        throw std::runtime_error(
+            "this driver cannot resolve a device-resident fold length; read "
+            "the length back to the host and pass it as a constant");
     }
     // Likewise for a mid-page fold: this driver's buffer gather/scatter treat
     // logical buffer token 0 as physical offset 0, so a non-zero head would

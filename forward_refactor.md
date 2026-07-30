@@ -1459,6 +1459,112 @@ The test still cannot be RUN here (`bin/pie/tests/cuda_mtp_native_verify.rs` is
 validated by construction and by matching `gdn-foldcommit`, which drives the
 same two-fire shape.
 
+### 10.2.7 The fold boundary can live on the device — LANDED
+
+The last host round-trip in a speculative linear-model decode was not a
+transfer of tokens. It was ONE NUMBER: the accepted count. The verify fire
+computes it on device; the commit fire consumes it as `fold-len`. Between them
+the host had to await, read the count back, and only then trace the commit —
+serializing two fires that could have been enqueued together.
+
+`fold-len` was already a channel, so the guest could always *hand over* a
+device-computed value. What made it unusable is that the HOST plans the fire,
+and the host's plan depends on where the boundary lands.
+
+**The host keeps a bound, the driver keeps the value.** A row's fold length is
+constrained to `[1, b]`, where `b` is its live buffer occupancy — a quantity
+the host knows exactly at submission. So the host plans against `b` and the
+wire slot carries `b`; a new per-row flag `PIE_RS_FLAG_FOLD_LEN_DEVICE` (ABI
+23 -> 24) says "this is an UPPER BOUND, substitute the resolved value and clamp
+it". The driver does exactly that, in `batch_compose::append_rs`, BEFORE
+`plan_rs_execution` — so nothing downstream ever sees the placeholder and
+`fold_qo_indptr` is shaped from the real length.
+
+Carrying the bound rather than a sentinel is what keeps the change small. It
+preserves the existing ABI invariant `folds == (fold_len != 0)`, it gives the
+clamp something to clamp against, and a resolved `0` is refused outright — a
+speculative commit folds at least the bonus token it is guaranteed to accept.
+
+**Every value the device can name is the same dispatch.** The path initially
+required the fire to carry no new tokens. It does not have to: because the
+driver clamps to `b`, every reachable length lies inside the buffer, and every
+such fold is the same `FoldBuffered` replay over slabs. The fire's own tokens
+are as irrelevant here as they are to any commit. The price is that the
+INTERIOR boundary (`b < n < b+t`) is structurally unreachable under a device
+length — which costs nothing, since it is refused for host-known lengths too
+(§10.2.3).
+
+**The host must then stop believing it knows `F`.** This is the whole
+correctness content. After a device fold the host cannot advance the boundary:
+assuming MORE drops pages that are still live; assuming LESS replays tokens
+already absorbed, which is a double fold and unrecoverable. So `advance_fold`
+is SUPPRESSED, every page is retained, `buffer_fill` degrades to an upper
+bound, and `RsStore::buffer_tokens` REFUSES
+(`BufferOccupancyIndeterminate { bound }`) rather than returning a number that
+might be wrong. `buffer_tokens_bound` and `buffer_tokens_exact` expose the
+weaker fact for callers that can use it.
+
+Indeterminacy is recoverable, not terminal: the guest's own `free_buffer`
+empties the buffer and restores exactness. That is already the shape a
+speculative loop has — buffer a window, commit its accepted prefix, free the
+window, start the next. `mtp-native-verify` needs no restructuring to fit it.
+A fork inherits the indeterminacy, since it shares the buffer.
+
+**Why this needed the §10.2.6 rebalance first.** Under the old `rs-geometry`
+the guest computed `w-slot`/`w-off` from a host-side `start`. If `F` is only
+bounded, `start` is unknowable at trace time and that arithmetic becomes
+unwritable. The rebalance deleted it, so there is nothing left for the guest to
+have to lie about.
+
+**Two things the driver had to learn.**
+
+- **Wire programs can have ports.** `resolve_descriptors` only resolved ports
+  for programs classified DEVICE-GEOMETRY; a commit fire is an ordinary
+  host-geometry wire program with exactly one device-resolved number, so its
+  port was never read and composition saw `has_rs_fold_len = 0`. There was
+  already a precedent for the narrow case — an otherwise host-geometry
+  attention pass gets its MASK resolved and nothing else — so `rs_fold_len`
+  takes the same shape: `resolve_rs_fold_len` reads that one port and
+  `is_device_geometry` stays `0`. Promoting the whole program would have been a
+  far larger claim than the truth.
+- **Port arrays are indexed by TAG.** `descriptor_resolve` sized its port
+  arrays `[15]`. Since the rebalance reserved tags 10-14, "highest tag" is no
+  longer "number of ports", and tag 15 wrote out of bounds. Now sized from
+  `kPortRsFoldLen + 1` with an explicit guard.
+
+**And one thing the GUEST had to learn: construction order.** A channel a later
+pass consumes as a descriptor must be claimed by that pass BEFORE the producing
+pass is submitted. Otherwise the producer infers it as a terminal host-read
+output (`HostRole::Reader`) while the consumer declares `HostRole::None`, and
+the registry rejects the conflicting re-bind. This is the SDK's existing F8
+eager-claim rule; the device handoff is simply the first thing that depends on
+it, so the test inferlet grew `Arm::build_fire`, which constructs without
+submitting.
+
+Metal refuses the flag. It fails in the quietest way of all there: with no
+descriptor resolution, Metal would read a perfectly well-formed number — the
+bound — and fold the entire buffer instead of the accepted prefix.
+
+**Verified on GPU**: `cuda_gdn_foldcommit` 5/5, including the new
+`the_fold_length_can_live_on_device`, whose device arm and constant-control arm
+agree one token PAST the commit (so agreement pins the folded STATE, not the
+logits along the way) while a third arm folding a DIFFERENT count genuinely
+diverges — `a_next=271 b_next=271 c_next=2`. Also `mtp_logits_value_verify`,
+`cuda_plain_gen`, engine lib 371 pass (2 known timing failures).
+
+**A tolerance bug surfaced and was fixed on the way.** The mixed-position test
+(§10.2.5) compared peak logits with an ABSOLUTE tolerance of `1e-2`. Its
+reference arms are solo fires while the mixed arm is a two-row batch, so they
+reduce in different orders — and at a peak logit of ~14 the bf16 ULP is
+`0.0625`, six times the tolerance. The test was asserting a state divergence on
+noise finer than the format can represent. The tolerance is now relative, and
+the "the references must genuinely disagree" guard is measured on the same
+scale so it stays meaningful.
+
+**Still open**: the fully fused single-fire verify+commit of §11.4 needs the
+interior fold boundary as well. Device-boundary alone delivers the smaller and
+more valuable half — two fires, zero host round-trips between them.
+
 ### 10.4 E — Python / JavaScript SDKs
 
 Larger than §7 implies, and larger than "a port" implies either. Three

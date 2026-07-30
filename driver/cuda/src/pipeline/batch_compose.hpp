@@ -230,9 +230,23 @@ inline bool validate_folded_rs_bindings(
     for (std::size_t request = 0; request < slot_flags.size(); ++request) {
         const std::uint8_t flags = slot_flags[request];
         if ((flags & ~(PIE_RS_FLAG_RESET | PIE_RS_FLAG_FOLD |
-                       PIE_RS_FLAG_BUFFER_WRITE)) != 0) {
+                       PIE_RS_FLAG_BUFFER_WRITE |
+                       PIE_RS_FLAG_FOLD_LEN_DEVICE)) != 0) {
             if (error != nullptr) {
                 *error = "folded RS flags contain unknown bits";
+            }
+            return false;
+        }
+        // The bit survives composition (the flags are copied verbatim) but its
+        // WORK is done there: `fold_lens[request]` is no longer the host's
+        // placeholder by the time this runs. A row that still claims a
+        // device-resident length here without a fold is malformed.
+        if ((flags & PIE_RS_FLAG_FOLD_LEN_DEVICE) != 0 &&
+            (flags & PIE_RS_FLAG_FOLD) == 0) {
+            if (error != nullptr) {
+                *error =
+                    "a folded RS row claims a device-resident fold length but "
+                    "does not fold";
             }
             return false;
         }
@@ -685,6 +699,7 @@ inline bool compose_forward_batch(const pie_native::LaunchView& view,
     auto append_rs = [&](std::size_t program) -> bool {
         const std::uint32_t begin = input_request_starts[program];
         const std::uint32_t count = input_request_counts[program];
+        const FireGeometry& geom = resolved.per_program[program];
         if (has_folded_rs) {
             out.rs_slot_ids.insert(
                 out.rs_slot_ids.end(),
@@ -694,11 +709,49 @@ inline bool compose_forward_batch(const pie_native::LaunchView& view,
                 out.rs_slot_flags.end(),
                 input_rs_flags.begin() + begin,
                 input_rs_flags.begin() + begin + count);
+            // The fold length is the ONE RS quantity the host is allowed not
+            // to know. A row flagged FOLD_LEN_DEVICE carries, on the wire, the
+            // host's UPPER BOUND on its own buffer occupancy -- not garbage --
+            // and the real length comes from the resolved `rs_fold_len` port.
+            // Clamping the resolved value to that bound is what makes the
+            // whole scheme safe: the device may name a count the host never
+            // saw, but it can never name one the buffer cannot supply.
+            //
+            // This substitution happens BEFORE `plan_rs_execution` and before
+            // `validate_folded_rs_bindings`, so nothing downstream -- the
+            // replay CSR shape, the pure-decode classifier, the model's
+            // `commit_len` -- ever sees the placeholder. The flag does not
+            // need to escape composition.
             if (!input_rs_fold_lens.empty()) {
-                out.rs_fold_lens.insert(
-                    out.rs_fold_lens.end(),
-                    input_rs_fold_lens.begin() + begin,
-                    input_rs_fold_lens.begin() + begin + count);
+                for (std::uint32_t r = 0; r < count; ++r) {
+                    const std::uint32_t bound = input_rs_fold_lens[begin + r];
+                    const std::uint8_t flags = input_rs_flags[begin + r];
+                    if ((flags & PIE_RS_FLAG_FOLD_LEN_DEVICE) == 0) {
+                        out.rs_fold_lens.push_back(bound);
+                        continue;
+                    }
+                    if (!geom.has_rs_fold_len || geom.rs_fold_lens.size() < count) {
+                        if (err) *err =
+                            "ptir compose: a row claims a device-resident fold "
+                            "length but its program resolved no fold length"
+                            " (program " + std::to_string(program) + ": " +
+                            std::to_string(geom.rs_fold_lens.size()) +
+                            " resolved for " + std::to_string(count) +
+                            " rows)";
+                        return false;
+                    }
+                    const std::uint32_t folded =
+                        std::min(geom.rs_fold_lens[r], bound);
+                    if (folded == 0) {
+                        if (err) *err =
+                            "ptir compose: a device-resident fold length "
+                            "resolved to 0, which is not a dispatchable "
+                            "commit -- a speculative commit must fold at "
+                            "least the bonus token it is guaranteed to accept";
+                        return false;
+                    }
+                    out.rs_fold_lens.push_back(folded);
+                }
             }
         }
         for (std::uint32_t request = begin; request < begin + count; ++request) {
@@ -727,7 +780,6 @@ inline bool compose_forward_batch(const pie_native::LaunchView& view,
         // per REQUEST, not per program: a pass binds one RS working set per
         // request, so there is no single table for the fire the way there is
         // for KV.
-        const FireGeometry& geom = resolved.per_program[program];
         // `rs_w_slot`/`rs_w_off` describe where each token's buffered
         // activations land. The driver's scatter walks a row's listed slabs
         // page-major and contiguously -- it has no per-token indirection --

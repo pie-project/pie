@@ -6540,6 +6540,17 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
     out.is_device_geometry.assign(n_prog, 0);
     const bool resolve_device_mask =
         view.has_user_mask && view.flattened_masks.empty();
+    // The fold length is the one RS quantity the host may never have seen, so
+    // a program that is otherwise ORDINARY -- host geometry, wire-composed --
+    // still has one port that must be read off the device. Resolve just that
+    // port for such a program, exactly as a device mask is resolved for an
+    // otherwise host-geometry attention pass.
+    const bool resolve_device_fold_len = std::any_of(
+        view.rs_slot_flags.data(),
+        view.rs_slot_flags.data() + view.rs_slot_flags.size(),
+        [](std::uint8_t f) {
+            return (f & PIE_RS_FLAG_FOLD_LEN_DEVICE) != 0;
+        });
     bool resolved_mask = false;
     std::vector<detail::PortCellCache> cached_cells(n_prog);
     // Pull host-writer rings on the descriptor stream: the readback pack
@@ -6617,11 +6628,12 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
             view.ptir_program_instances.data()[p];
         auto it = s.instances.find(iid);
         const Trace* trace = it->second.trace;
-        const bool mask_only =
-            it->second.geometry_class == PIE_GEOMETRY_CLASS_HOST &&
-            resolve_device_mask;
-        if (it->second.geometry_class == PIE_GEOMETRY_CLASS_HOST &&
-            !mask_only) {
+        const bool host_class =
+            it->second.geometry_class == PIE_GEOMETRY_CLASS_HOST;
+        const bool mask_only = host_class && resolve_device_mask;
+        const bool fold_len_only =
+            host_class && !mask_only && resolve_device_fold_len;
+        if (host_class && !mask_only && !fold_len_only) {
             continue;
         }
         const std::unordered_set<std::uint32_t>* pending_slots =
@@ -6631,6 +6643,7 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
         for (const PortBinding& binding : trace->ports) {
             if (binding.is_const) continue;
             if (mask_only && binding.port != kPortAttnMask) continue;
+            if (fold_len_only && binding.port != kPortRsFoldLen) continue;
             ChannelView& channel_view = it->second.instance->view();
             const std::uint32_t slot =
                 channel_view.slot(binding.channel);
@@ -6730,7 +6743,7 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
             const auto& instance =
                 s.instances.at(view.ptir_program_instances.data()[p]);
             if (instance.geometry_class == PIE_GEOMETRY_CLASS_HOST &&
-                !resolve_device_mask) {
+                !resolve_device_mask && !resolve_device_fold_len) {
                 continue;
             }
             if (snapshot_offsets[p] ==
@@ -6786,11 +6799,12 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
         const std::uint64_t iid = view.ptir_program_instances.data()[p];
         auto it = s.instances.find(iid);
         const Trace* trace = it->second.trace;
-        const bool mask_only =
-            it->second.geometry_class == PIE_GEOMETRY_CLASS_HOST &&
-            resolve_device_mask;
-        if (it->second.geometry_class == PIE_GEOMETRY_CLASS_HOST &&
-            !mask_only) {
+        const bool host_class =
+            it->second.geometry_class == PIE_GEOMETRY_CLASS_HOST;
+        const bool mask_only = host_class && resolve_device_mask;
+        const bool fold_len_only =
+            host_class && !mask_only && resolve_device_fold_len;
+        if (host_class && !mask_only && !fold_len_only) {
             continue;
         }
 
@@ -6813,6 +6827,19 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
                 return false;
             }
             resolved_mask = true;
+            continue;
+        }
+        if (fold_len_only) {
+            // ONE port, and nothing else: this program's geometry is host
+            // composed and correct already. `is_device_geometry` stays 0 so
+            // composition keeps taking the wire arrays for everything except
+            // the fold length, which it substitutes per flagged row.
+            if (!resolve_rs_fold_len(
+                    *trace, it->second.instance->view(), fg, err,
+                    pending_slots, &cached_cells[p])) {
+                return false;
+            }
+            if (fg.has_rs_fold_len) resolved_mask = true;
             continue;
         }
         if (!resolve_fire_geometry(

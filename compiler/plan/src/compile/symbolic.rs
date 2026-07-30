@@ -329,7 +329,7 @@ pub(crate) fn symbolic_port_type(port: Port, value_type: ValueType) -> SymbolicT
         // bounds and per-row live length are row-indexed, and the write
         // descriptor is token-indexed.
         Port::RsBufferPages => set_first_symbolic(&mut ty, SymbolicExtent::PageCount),
-        Port::RsBufferIndptr | Port::RsBufferLen => {
+        Port::RsBufferIndptr | Port::RsBufferLen | Port::RsFoldLen => {
             set_first_symbolic(&mut ty, SymbolicExtent::RowCount)
         }
         Port::RsWSlot | Port::RsWOff => {

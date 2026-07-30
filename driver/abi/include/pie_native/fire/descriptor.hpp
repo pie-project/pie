@@ -34,6 +34,11 @@ inline constexpr std::uint8_t kPortRsBufferIndptr = PTIR_PORT_RS_BUFFER_INDPTR;
 inline constexpr std::uint8_t kPortRsBufferLen = PTIR_PORT_RS_BUFFER_LEN;
 inline constexpr std::uint8_t kPortRsWSlot = PTIR_PORT_RS_W_SLOT;
 inline constexpr std::uint8_t kPortRsWOff = PTIR_PORT_RS_W_OFF;
+// How far each request's folded boundary advances. The one RS port a guest
+// still binds, and the only one whose value the HOST may not know: a
+// speculative decode computes its accepted count on device, and this is the
+// path that count takes to the recurrence without a host round-trip.
+inline constexpr std::uint8_t kPortRsFoldLen = PTIR_PORT_RS_FOLD_LEN;
 
 inline bool is_device_geometry_trace(const Trace& trace) {
     bool has_write_desc = false;

@@ -538,7 +538,7 @@ impl ProcessCtx {
         container_bytes: Vec<u8>,
         channels: Vec<Resource<Channel>>,
     ) -> Anyhow<Result<(), String>> {
-        let (embed, attention, readout, rs_working_sets, rs_fold_len) = {
+        let (embed, attention, readout, rs_working_sets, rs_fold_len, rs_fold_len_rep) = {
             let pass = self.ctx().table.get(&this)?;
             if pass.is_bound() {
                 return Ok(Err("forward pass program is already attached".to_string()));
@@ -564,6 +564,7 @@ impl ProcessCtx {
                     .map(Resource::new_borrow)
                     .collect::<Vec<Resource<RsWorkingSet>>>(),
                 pass.bindings.rs_fold_len.clone(),
+                pass.bindings.rs_geom.map(|geom| geom.fold_len),
             )
         };
         let kv_working_set: Resource<KvWorkingSet> = Resource::new_borrow(attention.kv_ws);
@@ -637,6 +638,18 @@ impl ProcessCtx {
                 validate_descriptor_bindings(&prog.bound.container, &channel_reps, &expected)
             {
                 return Ok(Err(error));
+            }
+            // Optional: a pass that folds everything unconditionally has
+            // nothing to compute and claims no port, so the traced program
+            // legitimately lacks this binding.
+            if let Some(fold_len) = rs_fold_len_rep {
+                if let Err(error) = validate_optional_descriptor_bindings(
+                    &prog.bound.container,
+                    &channel_reps,
+                    &[(Port::RsFoldLen, Some(fold_len))],
+                ) {
+                    return Ok(Err(error));
+                }
             }
             let mut cells: BoundCells = Vec::with_capacity(channels.len());
             for (i, ch) in channels.iter().enumerate() {
@@ -1181,17 +1194,20 @@ impl ProcessCtx {
     /// The host-known value of `rs-geometry.fold-len`, one entry per bound
     /// working set.
     ///
-    /// Only trace-known constants are readable today: a `fold-len` a stage
-    /// computes on device is invisible here, and accepting it would mean the
-    /// host publishing a folded boundary it cannot see. That is the point of
-    /// making the field a channel, and it is deliberately the NEXT increment
-    /// (`.wiki/designs/linear-state-programming-model.md` §4.2) rather than a
-    /// silent fallback to "fold nothing".
+    /// `Ok(None)` when the channel carries no host-known seed. That is not an
+    /// error: it means a stage computes the fold length ON DEVICE, and the
+    /// value reaches the driver through the `rs_fold_len` descriptor port
+    /// instead of through this host. The host then keeps only an UPPER BOUND
+    /// on the folded boundary — see `RsEntry::buffer_fill_is_bound` — which is
+    /// the whole point of making the field a channel
+    /// (`.wiki/designs/linear-state-programming-model.md` §4.2): a speculative
+    /// decode's accepted count never round-trips through the host between the
+    /// fire that computes it and the fire that folds it.
     fn read_fold_len(
         &mut self,
         geometry: &RsGeometryBinding,
         rows: usize,
-    ) -> Anyhow<Result<Vec<u32>, String>> {
+    ) -> Anyhow<Result<Option<Vec<u32>>, String>> {
         let resource: Resource<Channel> = Resource::new_borrow(geometry.fold_len);
         let cell = self.ctx().table.get(&resource)?.cell.clone();
         let cell = cell.lock().unwrap();
@@ -1202,13 +1218,7 @@ impl ProcessCtx {
             )));
         }
         let Ok(bytes) = cell.peek_seed() else {
-            return Ok(Err(
-                "forward pass: rs-geometry.fold-len has no host-known value. A device-computed \
-                 fold length is not supported yet -- it requires the folded boundary to become \
-                 device-resident state, see .wiki/designs/linear-state-programming-model.md \
-                 section 4.2. Seed the channel with a constant for now."
-                    .to_string(),
-            ));
+            return Ok(Ok(None));
         };
         if bytes.len() % 4 != 0 {
             return Ok(Err(format!(
@@ -1231,7 +1241,7 @@ impl ProcessCtx {
                 lens.len()
             )));
         }
-        Ok(Ok(lens))
+        Ok(Ok(Some(lens)))
     }
 
     async fn core_drop(&mut self, this: Resource<ForwardPass>) -> Anyhow<()> {

@@ -229,6 +229,7 @@ enum PtirPort : uint8_t {
   PTIR_PORT_RS_BUFFER_LEN = 12,
   PTIR_PORT_RS_W_SLOT = 13,
   PTIR_PORT_RS_W_OFF = 14,
+  PTIR_PORT_RS_FOLD_LEN = 15,
 };
 
 // ── first-party value intrinsics (op 0xA0 payload) ──

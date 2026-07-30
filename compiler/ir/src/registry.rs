@@ -113,6 +113,11 @@ crate::declare_tagged_enum! {
         RsBufferLen = 12, "rs_buffer_len";
         RsWSlot = 13, "rs_w_slot";
         RsWOff = 14, "rs_w_off";
+        // How far the folded boundary advances, per request. Unlike 10-14 this
+        // is a real guest decision, and the only RS port whose value the host
+        // is allowed not to know: a device-computed accepted count reaches the
+        // recurrence through here instead of round-tripping through the host.
+        RsFoldLen = 15, "rs_fold_len";
     }
 }
 

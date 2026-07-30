@@ -686,6 +686,11 @@ struct KvBind {
 /// A recorded `rs-geometry`: where the bound recurrent state lives for this
 /// fire and where its folded boundary lands.
 struct RsGeometryBind {
+    /// The fold-len channel as a descriptor port, or `None` for the
+    /// synthesized fold-everything geometry. Claiming it is what lets a stage
+    /// COMPUTE the fold length: the driver resolves the port on device, so a
+    /// speculative decode's accepted count never round-trips through the host.
+    port: Option<(Port, Channel)>,
     fold_len: Rc<wit_channel::Channel>,
     /// Capacity grant, not an address. The buffer's addressing is derived by
     /// the runtime from its own occupancy; a guest copy of it could only
@@ -916,6 +921,9 @@ impl PassCore {
         }
         let mut inner = self.inner.borrow_mut();
         inner.rs_working_sets = working_sets.iter().map(|rs| rs.rs.clone()).collect();
+        if let Some((port, channel)) = geom.port {
+            inner.ports.push((port, claim_port(port, &channel)));
+        }
         inner.rs_bind = Some(geom);
         Ok(())
     }
@@ -1729,6 +1737,7 @@ where
     B: RangeBounds<u32>,
 {
     Ok(RsGeometryBind {
+        port: Some((Port::RsFoldLen, *fold_len)),
         fold_len: fold_len.wit(),
         buffer: PageDeclaration::from_range(buffer)?,
     })
@@ -1746,7 +1755,14 @@ fn rs_geometry_fold_all() -> Result<RsGeometryBind, String> {
         /// channel every time the request set changes.
         static FOLD_ALL: Channel = Channel::from(vec![u32::MAX]);
     }
-    FOLD_ALL.with(|fold_len| rs_geometry_bind(fold_len, 0..0))
+    FOLD_ALL.with(|fold_len| {
+        let mut geom = rs_geometry_bind(fold_len, 0..0)?;
+        // A pass that folds everything unconditionally has nothing to compute,
+        // so claiming the port would put a dead one in every plain recurrent
+        // trace.
+        geom.port = None;
+        Ok(geom)
+    })
 }
 
 #[cfg(test)]

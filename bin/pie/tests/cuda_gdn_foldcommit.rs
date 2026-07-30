@@ -224,3 +224,36 @@ async fn one_fire_can_fold_one_request_while_another_only_buffers() -> Result<()
     eprintln!("[gdn-foldcommit] {result}");
     Ok(())
 }
+
+/// A fold whose LENGTH the host never learns — `t15`.
+///
+/// A speculative decode's accepted count is produced by the verify fire, on
+/// device. Reading it back to choose the commit's `fold-len` puts a host
+/// round-trip between two fires that could otherwise have been enqueued
+/// together. So the count stays in a channel: the host plans against its own
+/// UPPER BOUND (the row's whole live buffer) and the driver resolves the real
+/// value and CLAMPS it to that bound.
+///
+/// Arm A commits from a channel it never awaits, computed as `1 + (argmax %
+/// W)` over the append fire's own logits. Arm B awaits that argmax and commits
+/// the identical count as a plain constant — the path that already worked. The
+/// two must agree one token PAST the commit, which pins the folded STATE
+/// rather than the logits along the way.
+///
+/// Arm C is the negative control: it folds a DIFFERENT count and must diverge,
+/// or the equivalence holds vacuously and a dropped device value would pass
+/// unnoticed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a GPU + Qwen3.5-0.8B (GDN backbone) in the HF cache"]
+async fn the_fold_length_can_live_on_device() -> Result<()> {
+    let result = run_foldcommit("device")
+        .await?
+        .map_err(|error| anyhow::anyhow!("device fold length failed: {error}"))?;
+    anyhow::ensure!(
+        result.contains("agree=yes"),
+        "a commit whose fold length the host never saw must land the folded \
+         boundary exactly where the same count as a constant lands it: {result}"
+    );
+    eprintln!("[gdn-foldcommit] {result}");
+    Ok(())
+}

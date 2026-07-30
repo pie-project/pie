@@ -750,3 +750,91 @@ fn emptying_the_buffer_rebases_the_head_so_the_next_window_starts_at_zero() {
         );
     }
 }
+
+/// A fold whose length lived on the device makes the boundary INDETERMINATE.
+///
+/// The host planned against an upper bound, so after the fire it knows only
+/// that `F` moved somewhere into `[F, F+b]`. Guessing either way is
+/// unrecoverable: guessing MORE drops pages that are still live, guessing LESS
+/// replays tokens already absorbed into the state — a double fold. So the
+/// store advances nothing, retains every page, and REFUSES to report an exact
+/// occupancy until the guest empties the buffer itself.
+#[test]
+fn a_device_fold_length_suspends_the_boundary_rather_than_guessing() {
+    let mut s = store();
+    let ws = s.create_working_set(geom());
+    s.alloc_buffer(ws, 2).unwrap();
+    let prepared = s.prepare_write(ws, false, Some((0, 8))).unwrap();
+    settled(&mut s, prepared);
+    assert_eq!(s.buffer_tokens(ws).unwrap(), 8);
+    assert!(s.buffer_tokens_exact(ws));
+
+    let mut prepared = s.prepare_fold(ws, 8).unwrap();
+    prepared.mark_fold_len_device();
+    assert!(prepared.fold_len_is_bound());
+    settled(&mut s, prepared);
+
+    // Every page is retained: the boundary may not have moved at all.
+    assert_eq!(s.buffer_size(ws).unwrap(), 2);
+    assert!(!s.buffer_tokens_exact(ws));
+    assert_eq!(
+        s.buffer_tokens_bound(ws).unwrap(),
+        8,
+        "the pre-fold occupancy is now only an upper bound"
+    );
+    assert!(
+        matches!(
+            s.buffer_tokens(ws),
+            Err(RsError::BufferOccupancyIndeterminate { bound: 8 })
+        ),
+        "an exact read must refuse rather than return the bound"
+    );
+}
+
+/// ...and freeing the buffer restores exactness, which is what makes the
+/// suspension recoverable instead of terminal. This is the shape a speculative
+/// loop already has: buffer a window, commit its accepted prefix, free the
+/// window, start the next one.
+#[test]
+fn freeing_the_buffer_restores_an_exact_occupancy_after_a_device_fold() {
+    let mut s = store();
+    let ws = s.create_working_set(geom());
+    s.alloc_buffer(ws, 2).unwrap();
+    let prepared = s.prepare_write(ws, false, Some((0, 8))).unwrap();
+    settled(&mut s, prepared);
+
+    let mut prepared = s.prepare_fold(ws, 8).unwrap();
+    prepared.mark_fold_len_device();
+    settled(&mut s, prepared);
+    assert!(s.buffer_tokens(ws).is_err());
+
+    s.free_buffer(ws, &[0, 1], 0).unwrap();
+    assert!(s.buffer_tokens_exact(ws));
+    assert_eq!(
+        s.buffer_tokens(ws).unwrap(),
+        0,
+        "no pages left, so the occupancy is knowable again"
+    );
+
+    s.alloc_buffer(ws, 1).unwrap();
+    assert_eq!(s.buffer_tokens(ws).unwrap(), 0);
+}
+
+/// A fork shares the buffer, so it inherits the indeterminacy too — otherwise
+/// the child would read a stale exact occupancy and plan a second fold over
+/// tokens the parent's device fold may already have absorbed.
+#[test]
+fn a_fork_inherits_an_indeterminate_buffer() {
+    let mut s = store();
+    let ws = s.create_working_set(geom());
+    s.alloc_buffer(ws, 2).unwrap();
+    let prepared = s.prepare_write(ws, false, Some((0, 8))).unwrap();
+    settled(&mut s, prepared);
+    let mut prepared = s.prepare_fold(ws, 8).unwrap();
+    prepared.mark_fold_len_device();
+    settled(&mut s, prepared);
+
+    let child = s.fork(ws).unwrap();
+    assert!(!s.buffer_tokens_exact(child));
+    assert!(s.buffer_tokens(child).is_err());
+}

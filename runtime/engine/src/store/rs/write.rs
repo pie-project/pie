@@ -84,11 +84,28 @@ pub struct RsPreparedWrite {
     pub(crate) buffer_span: Option<(u32, u32, RsBufferIntent)>,
     /// Submission sequence stamped at prepare (see `KvPreparedWrite::seq`).
     pub(crate) seq: u64,
+    /// The fold this write commits has a length the HOST never learned: the
+    /// device computed it and only the driver resolved it. The state target
+    /// still carries a `fold_tokens`, but it is an upper bound, so publishing
+    /// it must not advance the boundary by that much or retire pages against
+    /// it — see `RsEntry::buffer_fill_is_bound`.
+    pub(crate) fold_len_is_bound: bool,
 }
 
 impl RsPreparedWrite {
     pub fn working_set(&self) -> RsWorkingSetId {
         self.ws
+    }
+
+    /// Declare that this write's fold length is device-resident. The caller
+    /// supplied the host's upper bound so the allocation and the CSR had a
+    /// shape; the real length reaches only the driver.
+    pub fn mark_fold_len_device(&mut self) {
+        self.fold_len_is_bound = true;
+    }
+
+    pub fn fold_len_is_bound(&self) -> bool {
+        self.fold_len_is_bound
     }
 
     /// Submission sequence for epoch retirement at finalize.

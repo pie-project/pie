@@ -109,7 +109,16 @@ pub enum RsPlan {
         in_forward: Vec<bool>,
     },
     /// Replay `tokens[r]` buffered tokens of row `r` into its folded state.
-    FoldBuffered { tokens: Vec<u32> },
+    ///
+    /// When `fold_len_is_device` the host never learned the count: `tokens[r]`
+    /// is its own UPPER BOUND (the whole live buffer), the real value comes
+    /// from the `rs_fold_len` descriptor port, and the driver clamps one to
+    /// the other. The host's boundary then becomes indeterminate until the
+    /// guest frees the buffer.
+    FoldBuffered {
+        tokens: Vec<u32>,
+        fold_len_is_device: bool,
+    },
 }
 
 impl RsPlan {
@@ -143,7 +152,7 @@ impl RsPlan {
             }
             // A fold gathers the buffered PREFIX: the driver walks the CSR
             // from slab zero, so the span always starts at buffer token 0.
-            RsPlan::FoldBuffered { tokens } => {
+            RsPlan::FoldBuffered { tokens, .. } => {
                 let n = tokens.get(index).copied().unwrap_or(0);
                 (true, Some(n), Some((0, n)), RsBufferIntent::Replay)
             }
@@ -354,7 +363,23 @@ fn prepare_many_impl(
             ),
         };
         let prepared = match prepared {
-            Ok(prepared) => prepared,
+            Ok(mut prepared) => {
+                if matches!(
+                    plan,
+                    RsPlan::FoldBuffered {
+                        fold_len_is_device: true,
+                        ..
+                    }
+                ) {
+                    // The fold length that reached `prepare` is the host's own
+                    // upper bound, good enough to size the allocation and to
+                    // shape the replay CSR. Publishing it as if it were the
+                    // truth would move the boundary too far, so say so here
+                    // and let `publish_batch` hold the boundary instead.
+                    prepared.mark_fold_len_device();
+                }
+                prepared
+            }
             Err(error) => {
                 store.cancel_batch(prepared_rows);
                 return Err(error.to_string());
@@ -375,6 +400,14 @@ fn prepare_many_impl(
                 };
                 if state.fold_tokens.is_some() {
                     flags |= crate::driver::RS_FLAG_FOLD;
+                }
+                // The wire `fold_lens[r]` this row is about to carry is the
+                // host's upper bound, not the fold length. The driver replaces
+                // it with the resolved `rs_fold_len` port CLAMPED to the bound,
+                // which is what keeps a device-named count inside the buffer
+                // that can supply it.
+                if prepared.fold_len_is_bound() {
+                    flags |= crate::driver::RS_FLAG_FOLD_LEN_DEVICE;
                 }
                 // Orthogonal to FOLD. A pass that both writes the buffer and
                 // folds a prefix of the result runs the extended layout and
@@ -731,7 +764,7 @@ mod tests {
 
         // Fold the first 8 buffered tokens = slabs 0 and 1.
         let out =
-            prepare_many(&mut store, &[ws], &RsPlan::FoldBuffered { tokens: vec![8] }).unwrap();
+            prepare_many(&mut store, &[ws], &RsPlan::FoldBuffered { tokens: vec![8], fold_len_is_device: false }).unwrap();
         assert_eq!(out.fold_lens, vec![8]);
         assert_eq!(out.buffer_slot_indptr, vec![0, 2]);
         assert_eq!(
@@ -762,7 +795,7 @@ mod tests {
         let error = prepare_many(&mut store, &[ws], &buffer_plan(0, vec![4])).unwrap_err();
         assert!(error.contains("no folded state"), "{error}");
         let error =
-            prepare_many(&mut store, &[ws], &RsPlan::FoldBuffered { tokens: vec![4] }).unwrap_err();
+            prepare_many(&mut store, &[ws], &RsPlan::FoldBuffered { tokens: vec![4], fold_len_is_device: false }).unwrap_err();
         assert!(error.contains("no folded state"), "{error}");
         assert_eq!(store.available_slots(), 4, "nothing leaked");
     }
@@ -774,7 +807,7 @@ mod tests {
         store.alloc_buffer(ws, 1).unwrap(); // capacity 4 tokens
         let free = store.available_slots();
         assert!(
-            prepare_many(&mut store, &[ws], &RsPlan::FoldBuffered { tokens: vec![8] }).is_err()
+            prepare_many(&mut store, &[ws], &RsPlan::FoldBuffered { tokens: vec![8], fold_len_is_device: false }).is_err()
         );
         assert_eq!(store.available_slots(), free, "nothing leaked");
     }

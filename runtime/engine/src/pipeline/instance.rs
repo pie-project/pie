@@ -204,7 +204,11 @@ pub struct ForwardBindings {
     /// Host-known `rs-geometry.fold-len`, one per bound working set, read from
     /// the channel when the state was bound. Empty when no recurrent state is
     /// bound. See [`RsGeometryBinding::fold_len`].
-    pub rs_fold_len: Vec<u32>,
+    ///
+    /// `None` when the channel had no seed: a stage computes the fold length
+    /// ON DEVICE and only the driver ever resolves it. The host then plans
+    /// against its own upper bound and marks the boundary indeterminate.
+    pub rs_fold_len: Option<Vec<u32>>,
 }
 
 /// Where a fire's folded boundary lands — the host mirror of WIT
@@ -352,8 +356,9 @@ pub struct BoundForwardPass {
     pub rs_ws: Vec<u32>,
     /// How this pass treats that recurrent state: fold in-forward (default),
     /// buffer without folding, or replay buffered tokens into the fold.
-    /// Host-known `fold-len` per bound working set (see `ForwardBindings`).
-    pub rs_fold_len: Vec<u32>,
+    /// Host-known `fold-len` per bound working set (see `ForwardBindings`);
+    /// `None` when it is device-resident.
+    pub rs_fold_len: Option<Vec<u32>>,
     /// Whether the currently bound writable declaration has performed its
     /// one-shot COW against the sharing shape visible at first submit.
     pub kv_declaration_realized: bool,
@@ -1153,7 +1158,7 @@ mod tests {
                 kv_ws: 0,
                 kv_declaration: KvDeclaration::all(),
                 rs_ws: Vec::new(),
-                rs_fold_len: Vec::new(),
+                rs_fold_len: None,
                 kv_declaration_realized: false,
                 failed: None,
                 devgeo: None,

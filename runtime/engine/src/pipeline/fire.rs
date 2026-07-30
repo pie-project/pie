@@ -415,7 +415,7 @@ fn bound_rs_working_set_ids<C: FireContext>(
 /// the guest still wanted, and folding late silently drops them from the
 /// context.
 fn rs_plan_for(
-    fold_len: &[u32],
+    fold_len: &Option<Vec<u32>>,
     stores: &crate::store::registry::Stores,
     ids: &[crate::store::rs::RsWorkingSetId],
     qo_indptr: &[u32],
@@ -424,11 +424,13 @@ fn rs_plan_for(
     if rows == 0 {
         return Ok(rs::RsPlan::Fold);
     }
-    if fold_len.len() != rows {
-        return Err(format!(
-            "rs-geometry.fold-len supplied {} length(s) for {rows} request row(s)",
-            fold_len.len()
-        ));
+    if let Some(lens) = fold_len {
+        if lens.len() != rows {
+            return Err(format!(
+                "rs-geometry.fold-len supplied {} length(s) for {rows} request row(s)",
+                lens.len()
+            ));
+        }
     }
     let mut row_tokens: Vec<u32> = (0..rows)
         .map(|row| {
@@ -448,10 +450,55 @@ fn rs_plan_for(
     // span, so `buffer_tokens` is exact.
     let mut buffered: Vec<u32> = {
         let store = stores.rs.lock().unwrap();
-        ids.iter()
-            .map(|id| store.buffer_tokens(*id).unwrap_or(0))
-            .collect()
+        let mut out = Vec::with_capacity(rows);
+        for (row, id) in ids.iter().enumerate() {
+            match store.buffer_tokens(*id) {
+                Ok(tokens) => out.push(tokens),
+                // A working set whose last fold had a device-resident length
+                // has no exact occupancy any more, and classifying a fire
+                // against a bound would either replay absorbed tokens (a
+                // double fold) or drop live ones. The store says so; say it
+                // back with the row that tripped it.
+                Err(crate::store::rs::RsError::BufferOccupancyIndeterminate { bound }) => {
+                    return Err(format!(
+                        "request row {row} needs its exact buffer occupancy, but the working \
+                         set's last fold had a device-resident length: at most {bound} token(s) \
+                         remain and the true count reached only the driver. Free the buffer to \
+                         settle the boundary before a fire that must replay it"
+                    ));
+                }
+                Err(_) => out.push(0),
+            }
+        }
+        out
     };
+
+    // The fold length lives on device: only the driver will ever resolve it.
+    // The host can still PLAN, because the driver CLAMPS the resolved count to
+    // the bound the host publishes — the row's whole live buffer `b`. That
+    // clamp is what makes the dispatch knowable in advance: every value the
+    // device can name lies in `[1, b]`, and every value in `[1, b]` is the
+    // same `FoldBuffered` replay. The fire's own new tokens are irrelevant to
+    // the choice for the same reason they are irrelevant to any commit — the
+    // linear layers do not compute them, they replay the slabs.
+    //
+    // The price is that the boundary can never land INSIDE this fire's own new
+    // tokens under a device-resident length, because the clamp forbids it.
+    // That is the interior-boundary case, which is refused for host-known
+    // lengths too, so nothing is lost here that is available elsewhere.
+    if fold_len.is_none() {
+        if let Some(row) = (0..rows).find(|row| buffered[*row] == 0) {
+            return Err(format!(
+                "rs-geometry.fold-len is device-resident, but request row {row} has an empty \
+                 buffer: there is nothing for the device's count to name"
+            ));
+        }
+        return Ok(rs::RsPlan::FoldBuffered {
+            tokens: buffered,
+            fold_len_is_device: true,
+        });
+    }
+    let fold_len = fold_len.as_deref().expect("checked above");
 
     // Classify each row independently, then decide what the PASS can be.
     // `Fold` and `Buffer` mix freely: both run this fire's own tokens through
@@ -568,6 +615,7 @@ fn rs_plan_for(
             in_forward,
         },
         Position::Commit => rs::RsPlan::FoldBuffered {
+            fold_len_is_device: false,
             tokens: fold_len.to_vec(),
         },
     })

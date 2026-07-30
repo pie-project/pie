@@ -670,7 +670,15 @@ inline int validate_step_desc(const PieStepDesc* desc,
     for (std::size_t i = 0; i < desc->rs_slot_flags.len; ++i) {
         const std::uint8_t flags = desc->rs_slot_flags.ptr[i];
         if ((flags & ~(PIE_RS_FLAG_RESET | PIE_RS_FLAG_FOLD |
-                       PIE_RS_FLAG_BUFFER_WRITE)) != 0) {
+                       PIE_RS_FLAG_BUFFER_WRITE |
+                       PIE_RS_FLAG_FOLD_LEN_DEVICE)) != 0) {
+            return PIE_STATUS_INVALID_ARGUMENT;
+        }
+        // A device-resident fold length is only meaningful on a folding row,
+        // and its wire slot must carry the host's non-zero upper bound so the
+        // clamp in composition has something to clamp against.
+        if ((flags & PIE_RS_FLAG_FOLD_LEN_DEVICE) != 0 &&
+            (flags & PIE_RS_FLAG_FOLD) == 0) {
             return PIE_STATUS_INVALID_ARGUMENT;
         }
         const bool folds = (flags & PIE_RS_FLAG_FOLD) != 0;

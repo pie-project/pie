@@ -112,10 +112,14 @@ inline bool resolve_fire_geometry(const Trace& trace, ChannelView& view,
                                   const detail::PortCellCache*
                                       cached_cells = nullptr) {
     // Index the channel-bound ports by tag.
-    ChannelId ch[15];
-    bool has[15] = {false};
+    // Sized by the HIGHEST port tag, not by the port COUNT: tags 10-14 are
+    // reserved holes left by the rs-geometry rebalance, so the two are no
+    // longer the same number.
+    constexpr std::size_t kPortSlots = kPortRsFoldLen + 1;
+    ChannelId ch[kPortSlots];
+    bool has[kPortSlots] = {false};
     for (const PortBinding& pb : trace.ports) {
-        if (pb.is_const || pb.port > kPortRsWOff) continue;
+        if (pb.is_const || pb.port >= kPortSlots) continue;
         ch[pb.port] = pb.channel;
         has[pb.port] = true;
     }
@@ -144,6 +148,10 @@ inline bool resolve_fire_geometry(const Trace& trace, ChannelView& view,
                 break;
             case kPortRsBufferIndptr: out.rs_buffer_slot_indptr = values; break;
             case kPortRsBufferLen: out.rs_buffer_lens = values; break;
+            case kPortRsFoldLen:
+                out.rs_fold_lens = values;
+                out.has_rs_fold_len = true;
+                break;
             case kPortRsWSlot:
                 out.rs_w_slot = values;
                 out.has_rs_write_desc = true;
@@ -290,6 +298,17 @@ inline bool resolve_fire_geometry(const Trace& trace, ChannelView& view,
                 cached_cells)) return false;
         out.rs_buffer_lens = detail::as_u32(b);
     }
+    // Read LAST among the RS ports, and unconditionally: this is the one whose
+    // value the host may never have seen, so there is no wire array to fall
+    // back on if the cell is not ready.
+    if (has[kPortRsFoldLen]) {
+        std::vector<std::uint8_t> b;
+        if (!detail::read_port_cell(
+                view, ch[kPortRsFoldLen], b, err, pending_slots,
+                cached_cells)) return false;
+        out.rs_fold_lens = detail::as_u32(b);
+        out.has_rs_fold_len = true;
+    }
     if (has[kPortRsWSlot]) {
         std::vector<std::uint8_t> b;
         if (!detail::read_port_cell(
@@ -391,6 +410,40 @@ inline bool resolve_fire_geometry(const Trace& trace, ChannelView& view,
                     out.mask.size() / out.token_ids.size());
             }
         }
+    }
+    return true;
+}
+
+/// Resolve ONLY the `rs_fold_len` port, for a program whose geometry is
+/// otherwise host-composed. A commit fire is an ordinary wire program in every
+/// respect except this one number, which the host may never have learned --
+/// so promoting the whole program to device geometry to reach it would be a
+/// far larger claim than the truth.
+///
+/// Absent port is NOT an error: a fire may carry a mix of rows, and only the
+/// flagged ones need this. Composition refuses a flagged row whose program
+/// left `has_rs_fold_len` false, which is where that mistake is caught.
+inline bool resolve_rs_fold_len(
+    const Trace& trace, ChannelView& view, FireGeometry& out,
+    std::string* err,
+    const std::unordered_set<std::uint32_t>* pending_slots = nullptr,
+    const detail::PortCellCache* cached_cells = nullptr) {
+    for (const PortBinding& candidate : trace.ports) {
+        if (candidate.port != kPortRsFoldLen) continue;
+        if (candidate.is_const) {
+            out.rs_fold_lens = detail::as_u32(candidate.const_data);
+            out.has_rs_fold_len = true;
+            return true;
+        }
+        std::vector<std::uint8_t> b;
+        if (!detail::read_port_cell(
+                view, candidate.channel, b, err, pending_slots,
+                cached_cells)) {
+            return false;
+        }
+        out.rs_fold_lens = detail::as_u32(b);
+        out.has_rs_fold_len = true;
+        return true;
     }
     return true;
 }

@@ -1196,6 +1196,22 @@ void prepare_step(
         ? std::span<const std::uint32_t>(s.composed.rs_fold_lens)
         : view.rs_fold_lens.as<std::uint32_t>();
     std::string rs_binding_error;
+    // A device-resident fold length is SUBSTITUTED during composition, where
+    // the resolved `rs_fold_len` port is clamped to the host's bound. If the
+    // fire never went through composition, that substitution never happened
+    // and the wire array still holds the placeholder -- which would fold the
+    // entire buffer instead of the accepted prefix. Refuse rather than fold
+    // too much: the tokens are unrecoverable once absorbed.
+    if (!s.composed_ready &&
+        std::any_of(
+            s.rs_flag_view.begin(), s.rs_flag_view.end(),
+            [](std::uint8_t f) {
+                return (f & PIE_RS_FLAG_FOLD_LEN_DEVICE) != 0;
+            })) {
+        throw std::runtime_error(
+            "a fire claims a device-resident RS fold length but was not "
+            "descriptor-composed, so the resolved value never reached it");
+    }
     if (!pipeline::validate_folded_rs_bindings(
             s.rs_slot_view,
             s.rs_flag_view,

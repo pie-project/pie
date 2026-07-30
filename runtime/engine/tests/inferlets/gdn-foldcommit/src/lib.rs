@@ -70,6 +70,60 @@ impl Arm {
         Ok((arm, g0.unwrap_or(0)))
     }
 
+    /// One fire over `toks` whose fold length comes from a CHANNEL the caller
+    /// owns, with a caller-supplied epilogue.
+    ///
+    /// The channel is the point: `fold_len` may carry no host-known seed at
+    /// all, in which case a stage computes it on device and only the driver
+    /// ever resolves the value. `None` is the plain in-forward fold.
+    /// CONSTRUCTS the pass without submitting it. A channel a later pass
+    /// consumes as a descriptor must be claimed by that pass BEFORE the
+    /// producing pass is submitted (the SDK's F8 eager claim), or the producer
+    /// infers it as a terminal host-read output and the two declarations
+    /// conflict at bind. So a device handoff needs the consumer BUILT first —
+    /// construction order, not annotation.
+    fn build_fire(
+        &self,
+        toks: &[u32],
+        fold_len: Option<&Channel>,
+        tag: &str,
+        epilogue: impl Fn() + 'static,
+    ) -> Result<ForwardPass> {
+        let t = toks.len() as u32;
+        let base = self.pos;
+        let end = base + t;
+        let ps = self.page_size;
+        let ch = |v: Vec<u32>| Channel::from(v);
+
+        let fwd = ForwardPass::new();
+        fwd.embed(
+            &Channel::from(toks.iter().map(|&x| x as i32).collect::<Vec<_>>()),
+            &ch(vec![0, t]),
+        )?;
+        fwd.attention(
+            &self.ws,
+            ..,
+            ..,
+            &ch(vec![end]),
+            &ch((0..self.max_pages).collect()),
+            &ch(vec![0, end.div_ceil(ps)]),
+            &ch((base..end).map(|p| p / ps).collect()),
+            &ch((base..end).map(|p| p % ps).collect()),
+            &ch((base..end).collect()),
+            None,
+        )?;
+        match fold_len {
+            None => fwd.recurrent(std::slice::from_ref(&self.rs))?,
+            Some(channel) => fwd
+                .recurrent_with(std::slice::from_ref(&self.rs), channel, ..)
+                .map_err(|e| format!("{tag} recurrent binding: {e}"))?,
+        }
+        // An EMPTY epilogue, not an absent one: a pass with no stages has no
+        // PTIR program at all. A commit samples nothing, so empty is right.
+        fwd.epilogue(epilogue);
+        Ok(fwd)
+    }
+
     /// One fire over `toks`.
     ///
     /// `buffered` is `Some((buffer_start, fold_len))`: the fire scatters its
@@ -149,10 +203,23 @@ impl Arm {
 /// disagree with each other -- a buffered row's state does not move, a folded
 /// row's does -- so the test asserts that first. A mask that was ignored in
 /// either direction collapses one row onto the wrong reference.
-/// How far two peak logits may drift and still count as the same state. The
-/// two sides run the same math on the same inputs in the same batch shape, so
-/// this is slack against reduction-order noise, not against a real difference.
+/// How far two peak logits may drift and still count as the same state, as a
+/// fraction of their magnitude. This is slack against reduction-order noise,
+/// not against a real difference: the two sides run the same math on the same
+/// inputs, but not always in the same BATCH SHAPE -- a solo reference fire and
+/// a two-row mixed fire reduce in different orders.
+///
+/// It has to be relative because the activations are bf16, whose ULP at a peak
+/// logit of ~14 is 0.0625. An absolute tolerance below that is finer than the
+/// format can represent, so it fails on a single ULP of legitimate noise while
+/// claiming a state divergence.
 const TOL: f32 = 1e-2;
+
+/// `a` and `b` are the same value up to `TOL` of their magnitude (floored at
+/// 1, so small logits keep an absolute tolerance).
+fn close(a: f32, b: f32) -> bool {
+    (a - b).abs() <= TOL * a.abs().max(b.abs()).max(1.0)
+}
 
 /// TWO recurrent contexts in ONE fire, so a single pass can land their folded
 /// boundaries in DIFFERENT places.
@@ -376,7 +443,10 @@ async fn mixed_positions(prompt: &[u32]) -> Result<String> {
 
     let (buf_ref, fold_ref, mixed) = (next[0], next[1], next[2]);
     let spread = (fold_ref[0] - buf_ref[0]).abs();
-    if spread <= 16.0 * TOL {
+    // The references must disagree by much more than the agreement tolerance,
+    // or "agree" carries no information. 8x, measured on the same relative
+    // scale `close` uses.
+    if spread <= 8.0 * TOL * fold_ref[0].abs().max(buf_ref[0].abs()).max(1.0) {
         return Err(format!(
             "buffering and folding leave indistinguishable states \
              (buffer={:.4} fold={:.4}); this prompt cannot witness a per-row fold \
@@ -384,8 +454,7 @@ async fn mixed_positions(prompt: &[u32]) -> Result<String> {
             buf_ref[0], fold_ref[0]
         ));
     }
-    let agree =
-        (mixed[0] - buf_ref[0]).abs() <= TOL && (mixed[1] - fold_ref[1]).abs() <= TOL;
+    let agree = close(mixed[0], buf_ref[0]) && close(mixed[1], fold_ref[1]);
     let result = format!(
         "mixed tokens={t} row0={:.4} buf_ref={:.4} row1={:.4} fold_ref={:.4} \
          spread={spread:.4} agree={}",
@@ -480,6 +549,152 @@ async fn fold_inside_new_tokens(prompt: &[u32]) -> Result<String> {
     Ok(result)
 }
 
+/// A fold whose LENGTH the host never learns.
+///
+/// The point of `t15`: a speculative decode's accepted count is produced by
+/// the verify fire, on device. Reading it back to choose the commit's
+/// `fold-len` puts a host round-trip between two fires that could otherwise
+/// have been enqueued together. So the count stays in a channel, the guest
+/// hands that channel to `recurrent_with`, and the host plans against its own
+/// UPPER BOUND -- the row's whole live buffer -- while the driver resolves the
+/// real value and CLAMPS it to that bound.
+///
+/// The test computes a genuinely device-derived count: `1 + (argmax % W)` over
+/// the append fire's own logits. The host cannot know it without awaiting, and
+/// arm A never does. Arm B awaits the same argmax and passes the identical
+/// count as a plain constant, which is the path that already worked. The two
+/// commits must land the folded boundary in the same place, and the check is
+/// drawn one token PAST the commit so it pins the folded STATE rather than the
+/// logits along the way.
+///
+/// The negative control is the disagreement assertion: folding a DIFFERENT
+/// count must produce a different continuation, or the equivalence is vacuous
+/// and a dropped device value would pass unnoticed.
+async fn device_fold_length(prompt: &[u32]) -> Result<String> {
+    const W: u32 = 4;
+
+    let n = prompt.len() as u32;
+    let pipe = Pipeline::new();
+    let probe = WorkingSet::new();
+    let max_pages = (n + 2 * W + 4).div_ceil(probe.page_size());
+    drop(probe);
+
+    let (mut a, g0) = Arm::open(prompt, max_pages, &pipe).await?;
+    let (mut b, g0b) = Arm::open(prompt, max_pages, &pipe).await?;
+    let (mut c, _) = Arm::open(prompt, max_pages, &pipe).await?;
+    if g0 != g0b {
+        return Err(format!("arms disagree on the prefill token: {g0} vs {g0b}"));
+    }
+    let window: Vec<u32> = vec![g0 as u32; W as usize];
+
+    for arm in [&a, &b, &c] {
+        arm.rs
+            .alloc_buffer(W.div_ceil(arm.rs_page).max(1))
+            .map_err(|e| format!("alloc_buffer: {e}"))?;
+    }
+
+    // ── 1. APPEND: fill the buffer, and compute the count ON DEVICE ────────
+    // `n_dev` is never awaited by arm A. `raw` carries the same argmax back to
+    // the host so arms B and C can name the same number as a constant -- that
+    // is the CONTROL, not the mechanism.
+    //
+    // Arm A's COMMIT is constructed here, before the append is submitted: the
+    // commit's claim on `n_dev` is what stops the append from inferring it as
+    // a terminal host-read output, which is a different endpoint role and a
+    // conflicting declaration.
+    let n_dev = Channel::new([1], dtype::u32).named("n_dev");
+    let raw = Channel::new([1], dtype::i32).named("raw_argmax");
+    let a_append = {
+        let sink = n_dev.clone();
+        let raw_sink = raw.clone();
+        a.build_fire(&window, Some(&Channel::from(vec![0u32])), "A-append", move || {
+            let t = reduce_argmax(&intrinsics::logits());
+            raw_sink.put(&t);
+            // In [1, W]: a real function of the logits, bounded by the window.
+            sink.put(&cast(add(rem(t, W), 1u32), dtype::u32));
+        })?
+    };
+    // The commit sits one window PAST the append, so build it at that
+    // position and put the arm back until the append has actually run.
+    a.pos += W;
+    let a_commit = a.build_fire(&[g0 as u32], Some(&n_dev), "A-commit", || {})?;
+    a.pos -= W;
+    a_append
+        .submit(&pipe)
+        .map_err(|e| format!("A-append submit: {e}"))?;
+
+    let b_append = b.build_fire(&window, Some(&Channel::from(vec![0u32])), "B-append", || {})?;
+    b_append
+        .submit(&pipe)
+        .map_err(|e| format!("B-append submit: {e}"))?;
+    let c_append = c.build_fire(&window, Some(&Channel::from(vec![0u32])), "C-append", || {})?;
+    c_append
+        .submit(&pipe)
+        .map_err(|e| format!("C-append submit: {e}"))?;
+
+    let argmax = raw
+        .take()
+        .get::<i32>()
+        .await
+        .map_err(|e| format!("raw take: {e}"))?[0];
+    let expected = 1 + (argmax.rem_euclid(W as i32)) as u32;
+    let other = if expected == W { 1 } else { expected + 1 };
+
+    for arm in [&mut a, &mut b, &mut c] {
+        arm.pos += W;
+    }
+
+    // ── 2. COMMIT: A from the device channel, B and C from constants ───────
+    // A commit replays buffered activations and stops at the recurrence, so it
+    // produces no logits and carries an empty epilogue. Arm A's `n_dev` has no
+    // host-known seed, which is exactly what routes it down the device path.
+    a_commit
+        .submit(&pipe)
+        .map_err(|e| format!("A-commit submit: {e}"))?;
+    b.build_fire(&[g0 as u32], Some(&Channel::from(vec![expected])), "B-commit", || {})?
+        .submit(&pipe)
+        .map_err(|e| format!("B-commit submit: {e}"))?;
+    c.build_fire(&[g0 as u32], Some(&Channel::from(vec![other])), "C-commit", || {})?
+        .submit(&pipe)
+        .map_err(|e| format!("C-commit submit: {e}"))?;
+    for arm in [&mut a, &mut b, &mut c] {
+        arm.pos += 1;
+        // The commit settles the boundary the only way the host can: the guest
+        // says it is done with the window. Until then arm A's occupancy is a
+        // bound, and a fire that needed the exact value would be refused.
+        arm.rs
+            .free_buffer(&(0..W.div_ceil(arm.rs_page).max(1)).collect::<Vec<_>>())
+            .map_err(|e| format!("free_buffer: {e}"))?;
+    }
+
+    // ── 3. PROBE: one token past the commit pins the folded STATE ──────────
+    let next = vec![g0 as u32];
+    let a_next = a.fire(&next, None, &pipe, "A-next").await?.unwrap_or(0);
+    let b_next = b.fire(&next, None, &pipe, "B-next").await?.unwrap_or(0);
+    let c_next = c.fire(&next, None, &pipe, "C-next").await?.unwrap_or(0);
+
+    pipe.close();
+
+    if b_next == c_next {
+        return Err(format!(
+            "folding {expected} and {other} token(s) leave indistinguishable \
+             continuations ({b_next} vs {c_next}); this prompt cannot witness a \
+             fold length and the test would pass vacuously"
+        ));
+    }
+    let agree = a_next == b_next;
+    let result = format!(
+        "devicefold window={W} expected={expected} other={other} a_next={a_next} \
+         b_next={b_next} c_next={c_next} agree={}",
+        if agree { "yes" } else { "no" }
+    );
+    eprintln!("[GDN_FOLDCOMMIT] {result}");
+    if !agree {
+        return Err(result);
+    }
+    Ok(result)
+}
+
 #[inferlet::main]
 async fn main(input: String) -> Result<String> {
     // `chain` folds a strict prefix so the buffer keeps an unfolded tail, then
@@ -500,6 +715,12 @@ async fn main(input: String) -> Result<String> {
         let prompt = wit_model::encode("hello world");
         let prompt: Vec<u32> = if prompt.is_empty() { vec![0] } else { prompt };
         return mixed_positions(&prompt).await;
+    }
+
+    if input.trim() == "device" {
+        let prompt = wit_model::encode("hello world");
+        let prompt: Vec<u32> = if prompt.is_empty() { vec![0] } else { prompt };
+        return device_fold_length(&prompt).await;
     }
 
     if input.trim() == "inside" {

@@ -118,8 +118,17 @@
  * `rs_fold_lens[r]`) apart from a pure commit (whose rows ARE the replay).
  * No struct grew, but an older driver rejects the unknown bit, so drivers and
  * workers ship together.
+ * v24: `PIE_RS_FLAG_FOLD_LEN_DEVICE` — a new bit in `rs_slot_flags` marking a
+ * row whose fold length the WORKER DOES NOT KNOW. The value lives in the
+ * `rs_fold_len` descriptor port, which the driver resolves at compose time,
+ * so a speculative decode's accepted count never has to round-trip through
+ * the host between the fire that computes it and the fire that folds it.
+ * `rs_fold_lens[r]` is a placeholder for such a row and MUST be ignored; the
+ * driver clamps the resolved value to the row's replay length. No struct
+ * grew, but an older driver rejects the unknown bit, so drivers and workers
+ * ship together.
  */
-#define PIE_DRIVER_ABI_VERSION 23
+#define PIE_DRIVER_ABI_VERSION 24
 
 #define PIE_MODEL_COMPONENT_FULL 0
 
@@ -210,6 +219,14 @@
  * straight from the slabs).
  */
 #define PIE_RS_FLAG_BUFFER_WRITE 4
+
+/**
+ * This row's fold length is NOT host-known. `rs_fold_lens[r]` is a
+ * placeholder and must be ignored; the real value comes from the
+ * `rs_fold_len` descriptor port, which the driver resolves once the fire that
+ * computes it has completed, and clamps to the row's replay length.
+ */
+#define PIE_RS_FLAG_FOLD_LEN_DEVICE 8
 
 /**
  * Concrete F32 channel element type.
@@ -401,6 +418,12 @@
 #define RS_FLAG_FOLD 2
 
 #define RS_FLAG_BUFFER_WRITE 4
+
+/**
+ * This row's fold length is not host-known; it comes from the `rs_fold_len`
+ * descriptor port and `rs_fold_lens[r]` is a placeholder.
+ */
+#define RS_FLAG_FOLD_LEN_DEVICE 8
 
 #define REMOTE_WIRE_VERSION 8
 

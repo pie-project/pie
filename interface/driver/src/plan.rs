@@ -108,6 +108,9 @@ pub struct LaunchPlan {
 pub const RS_FLAG_RESET: u8 = 1;
 pub const RS_FLAG_FOLD: u8 = 2;
 pub const RS_FLAG_BUFFER_WRITE: u8 = 4;
+/// This row's fold length is not host-known; it comes from the `rs_fold_len`
+/// descriptor port and `rs_fold_lens[r]` is a placeholder.
+pub const RS_FLAG_FOLD_LEN_DEVICE: u8 = 8;
 
 #[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProgramRegistration {

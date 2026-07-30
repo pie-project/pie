@@ -51,7 +51,16 @@ use crate::geometry::GeometryClass;
 /// `rs_fold_lens[r]`) apart from a pure commit (whose rows ARE the replay).
 /// No struct grew, but an older driver rejects the unknown bit, so drivers and
 /// workers ship together.
-pub const PIE_DRIVER_ABI_VERSION: u32 = 23;
+/// v24: `PIE_RS_FLAG_FOLD_LEN_DEVICE` — a new bit in `rs_slot_flags` marking a
+/// row whose fold length the WORKER DOES NOT KNOW. The value lives in the
+/// `rs_fold_len` descriptor port, which the driver resolves at compose time,
+/// so a speculative decode's accepted count never has to round-trip through
+/// the host between the fire that computes it and the fire that folds it.
+/// `rs_fold_lens[r]` is a placeholder for such a row and MUST be ignored; the
+/// driver clamps the resolved value to the row's replay length. No struct
+/// grew, but an older driver rejects the unknown bit, so drivers and workers
+/// ship together.
+pub const PIE_DRIVER_ABI_VERSION: u32 = 24;
 pub const PIE_MODEL_COMPONENT_FULL: u32 = 0;
 pub const PIE_MODEL_COMPONENT_TEXT: u32 = 1;
 pub const PIE_MODEL_COMPONENT_ENCODE: u32 = 2;
@@ -106,6 +115,11 @@ pub const PIE_RS_FLAG_FOLD: u8 = 2;
 /// `rs_fold_lens[r]`) from a pure commit (whose rows ARE the replay, gathered
 /// straight from the slabs).
 pub const PIE_RS_FLAG_BUFFER_WRITE: u8 = 4;
+/// This row's fold length is NOT host-known. `rs_fold_lens[r]` is a
+/// placeholder and must be ignored; the real value comes from the
+/// `rs_fold_len` descriptor port, which the driver resolves once the fire that
+/// computes it has completed, and clamps to the row's replay length.
+pub const PIE_RS_FLAG_FOLD_LEN_DEVICE: u8 = 8;
 
 /// Concrete F32 channel element type.
 pub const PIE_CHANNEL_DTYPE_F32: u8 = 0;
@@ -2353,7 +2367,10 @@ pub unsafe fn validate_step_desc(desc: &PieStepDesc, roster_len: usize) -> PieAb
             unsafe { std::slice::from_raw_parts(desc.rs_slot_flags.ptr, desc.rs_slot_flags.len) };
         if flags
             .iter()
-            .any(|flag| flag & !(PIE_RS_FLAG_RESET | PIE_RS_FLAG_FOLD | PIE_RS_FLAG_BUFFER_WRITE) != 0)
+            .any(|flag| flag & !(PIE_RS_FLAG_RESET
+                    | PIE_RS_FLAG_FOLD
+                    | PIE_RS_FLAG_BUFFER_WRITE
+                    | PIE_RS_FLAG_FOLD_LEN_DEVICE) != 0)
         {
             return Err(invalid_argument(
                 "launch rs_slot_flags contains unknown bits",

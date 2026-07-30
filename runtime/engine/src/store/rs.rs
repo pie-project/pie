@@ -121,6 +121,14 @@ pub enum RsError {
     DuplicateIndex { index: u32 },
     #[error("rs batch contains the same working set more than once")]
     DuplicateWorkingSet,
+    /// A fold committed with a device-resident length, so the host holds only
+    /// an upper bound on the live buffer. Cleared by `free_buffer`.
+    #[error(
+        "the folded boundary is device-resident: at most {bound} buffered token(s) remain, but \
+         the exact count is not host-known. Free the buffer to settle it before a fire that \
+         must replay it"
+    )]
+    BufferOccupancyIndeterminate { bound: u32 },
     #[error("rs working set: permutation is not a bijection over 0..{size}")]
     BadPermutation { size: u32 },
     #[error(
@@ -154,6 +162,22 @@ struct RsEntry {
     /// upper bound; classifying fires against that bound made every freshly
     /// allocated buffer look full and rejected the legal empty-buffer append.
     buffer_fill: u32,
+    /// True once a fold committed whose LENGTH the host never learned — the
+    /// device computed it and only the driver ever saw the value.
+    ///
+    /// `buffer_fill` then stops being exact and becomes an UPPER BOUND: the
+    /// fold absorbed somewhere between 1 and `buffer_fill` tokens, so the
+    /// live buffer is somewhere between 0 and `buffer_fill`. Retaining the
+    /// bound is safe for MEMORY (no live page is dropped) but NOT for the
+    /// READ PATH: a later fire that replayed the bound would replay tokens
+    /// the fold already absorbed, which is a double fold and unrecoverable.
+    ///
+    /// So the store refuses to state an exact occupancy while this is set,
+    /// and `free_buffer` — the guest's explicit "I am done with this window"
+    /// — is what restores exactness. That is not a limitation bolted on: it
+    /// is the shape `mtp-native-verify` already has (buffer a window, commit
+    /// the accepted prefix, free the buffer, open the next window).
+    buffer_fill_is_bound: bool,
     /// Where logical buffer token 0 physically sits, in tokens from the start
     /// of page 0. Always `< buffer_page_tokens`.
     ///
@@ -216,6 +240,7 @@ impl RsStore {
             folded: None,
             buffer: Vec::new(),
             buffer_fill: 0,
+            buffer_fill_is_bound: false,
             buffer_head: 0,
         })
     }
@@ -223,13 +248,14 @@ impl RsStore {
     /// Fork: shares the folded slot and every materialized buffered slot by
     /// reference; the first write on a shared slot copies it.
     pub fn fork(&mut self, ws: RsWorkingSetId) -> Result<RsWorkingSetId, RsError> {
-        let (geom, folded, buffer, buffer_fill, buffer_head) = {
+        let (geom, folded, buffer, buffer_fill, buffer_fill_is_bound, buffer_head) = {
             let entry = self.entry(ws)?;
             (
                 entry.geom,
                 entry.folded,
                 entry.buffer.clone(),
                 entry.buffer_fill,
+                entry.buffer_fill_is_bound,
                 entry.buffer_head,
             )
         };
@@ -244,6 +270,7 @@ impl RsStore {
             folded,
             buffer,
             buffer_fill,
+            buffer_fill_is_bound,
             buffer_head,
         }))
     }
@@ -315,6 +342,14 @@ impl RsStore {
             // place either. Either way the next append starts at physical 0.
             if remove[0] || entry.buffer.is_empty() {
                 entry.buffer_head = 0;
+            }
+            // Discarding pages is the guest saying which tokens it no longer
+            // needs, which is exactly the statement an indeterminate boundary
+            // was missing. Freeing everything empties the buffer outright, so
+            // the occupancy is exactly 0 and exact again.
+            if entry.buffer.is_empty() {
+                entry.buffer_fill = 0;
+                entry.buffer_fill_is_bound = false;
             }
             let capacity = (entry.buffer.len() as u32)
                 .saturating_mul(entry.geom.buffer_page_tokens.max(1))
@@ -621,6 +656,7 @@ impl RsStore {
         self.seq += 1;
         self.in_flight += 1;
         Ok(RsPreparedWrite {
+            fold_len_is_bound: false,
             ws,
             state,
             buffers,
@@ -729,7 +765,20 @@ impl RsStore {
             .as_ref()
             .and_then(|state| state.fold_tokens)
         {
-            self.advance_fold(ws, tokens, epoch);
+            if prepared.fold_len_is_bound {
+                // `tokens` is only an upper bound here. Advancing by it would
+                // drop pages the fold may still need; advancing by less would
+                // leave the host thinking tokens are live that the fold has
+                // already absorbed, and the next fire would replay them — a
+                // double fold. Neither is recoverable, so the boundary simply
+                // stops being a host-side number: retain every page, keep
+                // `buffer_fill` as the bound it now is, and refuse to state an
+                // exact occupancy until `free_buffer` settles it.
+                let entry = self.entry_mut(ws).expect("batch prevalidated");
+                entry.buffer_fill_is_bound = true;
+            } else {
+                self.advance_fold(ws, tokens, epoch);
+            }
         }
     }
 
@@ -816,7 +865,26 @@ impl RsStore {
     /// "append onto an empty buffer" fire was refused as an append onto a full
     /// one.
     pub fn buffer_tokens(&self, ws: RsWorkingSetId) -> Result<u32, RsError> {
+        let entry = self.entry(ws)?;
+        if entry.buffer_fill_is_bound {
+            return Err(RsError::BufferOccupancyIndeterminate {
+                bound: entry.buffer_fill,
+            });
+        }
+        Ok(entry.buffer_fill)
+    }
+
+    /// The upper bound on buffered tokens, which is always known. Use this
+    /// only where an over-count is safe (capacity and allocation); anything
+    /// that REPLAYS the buffer must go through `buffer_tokens` and take the
+    /// refusal, because replaying an over-count double-folds.
+    pub fn buffer_tokens_bound(&self, ws: RsWorkingSetId) -> Result<u32, RsError> {
         Ok(self.entry(ws)?.buffer_fill)
+    }
+
+    /// Whether this working set's folded boundary is known exactly.
+    pub fn buffer_tokens_exact(&self, ws: RsWorkingSetId) -> bool {
+        self.entry(ws).map(|e| !e.buffer_fill_is_bound).unwrap_or(true)
     }
 
     /// Physical offset of logical buffer token 0 within page 0. The driver
