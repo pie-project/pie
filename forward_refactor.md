@@ -1727,6 +1727,15 @@ compounding facts, in increasing order of severity:
    generated bindings) have to be rewritten against a different shape, and the
    epilogue eDSL has no Python/JS equivalent at all today.
 
+   The sharper form of this, found while scoping: the old SDKs exposed a FIXED
+   host-side sampler (`Sampler.argmax()`, probes, `Generator`), so their whole
+   job was marshalling a variant. The new guest ships canonical PTIR container
+   BYTES, which `ptir.rs` produces via `compiler/dsl` (the tracing eDSL, 5.1k
+   ln) and `compiler/ir` (the container encoder, 6.8k ln). A port therefore
+   carries an encoder that must agree with the Rust one byte for byte — per
+   language. WIT binding generation, which was the feared part, is the easy
+   part. Regenerating both trees turned out to be a non-event.
+
 3. **Nothing would have told us.** Neither SDK is in `scripts/sync-wit.sh`, so
    they do not track WIT drift; and neither appears in any CI workflow — the
    only references are `release-pypi.yml` and `release-npm.yml`, which are
@@ -1737,23 +1746,79 @@ compounding facts, in increasing order of severity:
    port lands.
 
 Sequencing: (3) is a small, standalone change and should not wait for (1)/(2),
-so it is DONE. `scripts/check-sdk-interfaces.sh` resolves the interface names
-each SDK references against `interface/inferlet/`, and both release workflows
-run it for their SDK package. It needs no componentize-py or jco — just the
-names, which is what actually drifted. It currently fails, correctly:
+so it landed first, and the cleanup that follows from it has now landed too.
+The port itself has NOT been done and is still its own project.
 
-- Python references `adapter`, `inference`, `runtime`, `tool-use`, `zo`.
-- Every JavaScript binding is `pie-core-*` / `pie-instruct-*` / `pie-zo-*`; the
-  only pie package that exists is `pie:inferlet`. For JS the PACKAGE is the
-  sharper signal — bindings whose interface name happens to have survived the
-  move (`model`, `session`, `chat`, ...) are just as unreachable as
-  `inference`.
+**What landed.**
 
-It is deliberately NOT in `ci.yml`: the breakage predates this work, and
-red-lighting all of CI for it would be someone else's emergency. Gating the
-publishes stops it from reaching users, which is the actual harm.
+*Bindings.* Both generated trees were regenerated in place against the current
+world — Python via `componentize-py -d interface/inferlet -w inferlet bindings`,
+JavaScript via `npm run generate-bindings`. This was the main unknown and it
+turned out to be a non-event: both generators accept the split world as-is.
 
-The port itself is its own project and should not be smuggled into this one.
+*Dead modules deleted, not left importing a ghost.* Everything built on the
+removed interface is gone rather than kept as a shim: Python `context`,
+`forward`, `generation`, `sample`, `grammar`, `tools`, `adapter`, `runtime`,
+`zo`, `spec`; the same list in JavaScript. `grammar` and `tools` DO exist in
+the new world, but under different shapes than the modules of those names
+targeted, so they come back with the port. A shim that raised on use would
+have been worse than deletion: it would have made the gate green over a
+package that still cannot run a model.
+
+*The surviving surface was repointed and now actually builds.* The non-forward
+interfaces came through the split intact, so `model`, `session`, `chat`,
+`reasoning` needed only retargeting (`pie:core/*`, `pie:instruct/*` ->
+`pie:inferlet/*`). One real change: the tokenizer half of `model` moved to its
+own `tokenizer` interface, so both SDKs gained a `tokenizer` module and `model`
+gained the memory-shaping capability getters it had never exposed.
+
+**The gate is now two checks, and the second is the point.**
+
+Making check 1 (every referenced interface is defined) pass is exactly what
+deleting the dead modules does — and that alone would have left a GREEN gate
+over an unpublishable package. So `check-sdk-interfaces.sh` also asserts that
+each SDK reaches a forward-pass surface at all: one of `forward` /
+`forward-recurrent` / `forward-hybrid`, plus `channel`, `working-set` and
+`pipeline`. It fails today, deliberately and with an explanation, and it will
+go green on its own when the port lands. Both release workflows still run it,
+so neither SDK can publish.
+
+While fixing the scanner: its Python side read only the FIRST name out of
+`from wit_world.imports import a, b, c`. Harmless for check 1 (a stale import
+is rarely alone on its line) but wrong for check 2, which would have reported a
+bound surface as missing.
+
+**Verification, in increasing order of what it proves.**
+
+- Unit tests. Rewritten for the surviving surface: 31 Python, 23 JavaScript.
+  The JavaScript suite did not previously exist — `package.json` ran
+  `vitest run src/__tests__` against a directory that was never created, so
+  `npm test` passed by testing nothing. Both suites stub the WIT layer, so they
+  prove marshalling and nothing about the world; the OLD Python suite passed
+  for months against a mock of the deleted `pie:core/inference`.
+- `npm run build`. tsc resolves every specifier through tsconfig's `paths` map,
+  so a member the host stopped offering is a compile error. That map was itself
+  hand-maintained and had drifted the same way the SDKs did (it still listed
+  `pie:core/inference`); it is now generated by
+  `sdk/javascript/scripts/gen-tsconfig-paths.mjs` from the world file jco
+  writes, as part of `generate-bindings`.
+- **A component actually builds.** `componentize-py ... componentize` against
+  `interface/inferlet` resolves every WIT import for real. This is the check
+  `release-pypi.yml` commented it could not run; componentize-py installs from
+  PyPI, so it now runs there. Verified locally: a 20 MB component that calls
+  `model`, `tokenizer`, `chat`, `reasoning`, `session`.
+- Bindings freshness. `release-npm.yml` regenerates and `git diff
+  --exit-code`s. Note `jco types` writes into its output directory but never
+  prunes it, so a binding for a dropped interface survived regeneration AND
+  survived the diff; `generate-bindings` now clears the directory first, which
+  is what makes that diff mean anything.
+
+**Root cause, unfixed.** Neither SDK is in `scripts/sync-wit.sh`. Adding them
+is not just a path: the Rust SDK vendors `.wit` files, whereas these two vendor
+GENERATED bindings, so "sync" means running two toolchains that are not
+otherwise build dependencies. The release-time freshness checks above cover the
+harm; the drift itself can still happen between releases.
+
 
 ### 10.5 D — per-stage PTIR containers  *(separate PR)*
 
