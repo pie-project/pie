@@ -7,7 +7,7 @@
 /// recurrent slots and the ping-pong that advances them. gemma4 and gpt-oss
 /// share none of that, and both are the same simpler shape:
 ///
-///   * one DAG, one activation pool, paged per-layer KV;
+///   * one DAG, one activation pool, per-layer KV;
 ///   * no state to carry between tokens beyond the KV itself, so a fresh
 ///     sequence is a memset and nothing else.
 ///
@@ -15,10 +15,19 @@
 /// `Impl` keeps everything that is not family-shaped: the context, the logits
 /// staging, the sequence bookkeeping.
 ///
-/// ONE schedule serves decode and prefill. `gemma4_prefill_numerics_test`
-/// measures that a decode step is a fire of one row and lands exactly where
-/// firing the whole prompt at once does, so there is no reason to carry a
-/// second M=1-only DAG whose only distinction is that it cannot batch.
+/// The two families are not at the same place. gemma4 is PAGED: one schedule
+/// serves decode and prefill, several sequences are resident at once, and a
+/// fire carries as many rows as the batch has —
+/// `gemma4_prefill_numerics_test` measures that a decode step is a fire of one
+/// row and lands exactly where firing the whole prompt at once does, which is
+/// what lets one schedule do both.
+///
+/// gpt-oss is not: its KV is a position-indexed ring holding ONE sequence, and
+/// it has no M>1 path at all. Its MoE picks experts per ROW, so a batched
+/// routed matmul is a different kernel rather than a wider launch, and its
+/// attention sink has no paged variant. `paged()` says which a family is, and
+/// `MetalExecutor` refuses a second resident sequence for the ring-backed one
+/// rather than serving it wrongly.
 
 #include <cstdint>
 #include <functional>
