@@ -32,18 +32,6 @@
       "rewrites": 0
     },
     {
-      "pass": "group-shared-source-reads",
-      "instrs_before": 27,
-      "instrs_after": 27,
-      "rewrites": 0
-    },
-    {
-      "pass": "merge-adjacent-extent-writes",
-      "instrs_before": 27,
-      "instrs_after": 27,
-      "rewrites": 0
-    },
-    {
       "pass": "recompute-memory-plan",
       "instrs_before": 27,
       "instrs_after": 27,

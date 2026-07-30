@@ -1083,10 +1083,12 @@ private:
     // Stage the bytes a Repack reads, reusing the block staged for the tile map
     // before it when both read the same extent.
     //
-    // The compiler puts tile maps that share a source next to each other (see
-    // `group-shared-source-reads`), so remembering one block is enough to serve
-    // them all: GPT-OSS cuts its gate and up projections from a single
-    // `gate_up_proj` block and would otherwise stage every one of them twice.
+    // Written when GPT-OSS cut its gate and up projections out of a single
+    // `gate_up_proj` block that both halves had to name in full, so each block
+    // was staged twice. The contract now narrows each half's read to its own
+    // rows, so that case no longer arises and the reuse is opportunistic: it
+    // costs one comparison and still covers any future pair of repacks that
+    // land on identical bytes.
     //
     // Reuse is safe because the staging copy and the repack kernel that reads it
     // both run on stream 0, so the copy has landed before any kernel that sees

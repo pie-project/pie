@@ -53,16 +53,6 @@ pub fn all() -> &'static [Pass] {
             run: rewrite::hoist_bulk_extent_writes,
         },
         Pass {
-            name: "group-shared-source-reads",
-            stage: Stage::Rewrite,
-            run: rewrite::group_shared_source_reads,
-        },
-        Pass {
-            name: "merge-adjacent-extent-writes",
-            stage: Stage::Rewrite,
-            run: rewrite::merge_adjacent_extent_writes,
-        },
-        Pass {
             name: "recompute-memory-plan",
             stage: Stage::Rewrite,
             run: memory::recompute_memory_plan,

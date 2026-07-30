@@ -1,15 +1,21 @@
 //! Physical-layout rewrite passes: coalesce per-buffer writes into
-//! arena-relative bulk copies, hoist them ahead of the transforms, and merge
-//! adjacent extent writes.
+//! arena-relative bulk copies and hoist them ahead of the transforms.
+//!
+//! Both passes merge adjacent writes, and both do it through
+//! [`try_merge_bulk_extent_write`], because by the time anything here has run
+//! an `ExtentWrite` that *could* be merged is already a `BulkExtentWrite`. A
+//! second merger over the leftovers was carried here until it was measured:
+//! across all eighteen shipping contracts, every surviving `ExtentWrite` is
+//! strided, so its byte-run guard rejected all of them and it rewrote nothing.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use crate::error::{Error, OrOverflow, Result};
 use crate::extent::Extent;
 use crate::plan::geometry::extent_storage_bytes;
 use crate::plan::index::{instr_by_id, set_instr_id};
 use crate::plan::{LoadPlan, SourceExtent, StorageInstr};
-use crate::types::{BufferId, FileId, InstrId};
+use crate::types::{BufferId, InstrId};
 
 pub(super) fn coalesce_persistent_arena_writes(program: &mut LoadPlan) -> Result<usize> {
     if program.schedule.is_empty() {
@@ -240,31 +246,6 @@ pub(super) fn try_merge_bulk_extent_write(
     Ok(true)
 }
 
-pub(super) fn merge_adjacent_extent_writes(program: &mut LoadPlan) -> Result<usize> {
-    if program.schedule.len() < 2 {
-        return Ok(0);
-    }
-
-    let old_instrs = program.instrs.clone();
-    let mut merged: Vec<StorageInstr> = Vec::with_capacity(old_instrs.len());
-    let mut rewrites = 0_u64;
-
-    for instr_id in &program.schedule {
-        let instr = instr_by_id(&old_instrs, *instr_id)?;
-
-        if let Some(previous) = merged.last_mut()
-            && try_merge_extent_write(previous, instr)?
-        {
-            rewrites += 1;
-            continue;
-        }
-        merged.push(instr.clone());
-    }
-
-    rewrite_program_instrs(program, merged)?;
-    Ok(usize::try_from(rewrites).unwrap_or(usize::MAX))
-}
-
 pub(super) fn rewrite_program_instrs(
     program: &mut LoadPlan,
     merged: Vec<StorageInstr>,
@@ -283,204 +264,4 @@ pub(super) fn rewrite_program_instrs(
         program.instrs.push(instr);
     }
     Ok(())
-}
-
-pub(super) fn try_merge_extent_write(
-    previous: &mut StorageInstr,
-    current: &StorageInstr,
-) -> Result<bool> {
-    let (
-        StorageInstr::ExtentWrite {
-            source: prev_source,
-            dest: prev_dest,
-            ..
-        },
-        StorageInstr::ExtentWrite {
-            source: cur_source,
-            dest: cur_dest,
-            ..
-        },
-    ) = (previous, current)
-    else {
-        return Ok(false);
-    };
-
-    if prev_source.file_id != cur_source.file_id
-        || prev_dest.buffer != cur_dest.buffer
-        || !prev_source.stride.is_byte_run()
-        || !cur_source.stride.is_byte_run()
-        || !prev_dest.stride.is_byte_run()
-        || !cur_dest.stride.is_byte_run()
-    {
-        return Ok(false);
-    }
-
-    let prev_source_start = prev_source
-        .file_offset
-        .checked_add(prev_source.stride.base_offset)
-        .or_overflow("source offset overflow")?;
-    let cur_source_start = cur_source
-        .file_offset
-        .checked_add(cur_source.stride.base_offset)
-        .or_overflow("source offset overflow")?;
-    let prev_dest_start = prev_dest
-        .offset
-        .checked_add(prev_dest.stride.base_offset)
-        .or_overflow("destination offset overflow")?;
-    let cur_dest_start = cur_dest
-        .offset
-        .checked_add(cur_dest.stride.base_offset)
-        .or_overflow("destination offset overflow")?;
-
-    if prev_source_start
-        .checked_add(prev_source.span_bytes)
-        .or_overflow("source span overflow")?
-        != cur_source_start
-        || prev_dest_start
-            .checked_add(prev_source.span_bytes)
-            .or_overflow("destination span overflow")?
-            != cur_dest_start
-    {
-        return Ok(false);
-    }
-
-    let span_bytes = prev_source
-        .span_bytes
-        .checked_add(cur_source.span_bytes)
-        .or_overflow("merged extent overflow")?;
-    prev_source.file_offset = prev_source_start;
-    prev_source.span_bytes = span_bytes;
-    prev_source.stride = Extent::byte_run(span_bytes);
-    prev_dest.offset = prev_dest_start;
-    prev_dest.stride = Extent::byte_run(span_bytes);
-    Ok(true)
-}
-
-/// Tile maps that read the *same* checkpoint bytes are put side by side.
-///
-/// One source block can feed two runtime tensors. GPT-OSS ships each expert's
-/// gate and up projections interleaved in a single `gate_up_proj` block, and the
-/// contract states one `Repack` per half — even rows and odd rows. Neither half
-/// can narrow its read, because the rows it wants are interleaved with the other
-/// half's, so both name the whole block and the block is read twice.
-///
-/// The two cannot be folded into one instruction — they repack different rows
-/// into different buffers, and no kernel writes both. What the compiler can do
-/// is put them next to each other. An executor materialises a repack source into
-/// a scratch buffer anyway, and one that keeps the block it just read serves the
-/// second tile map without touching the checkpoint again. That is the bargain
-/// [`hoist_bulk_extent_writes`] already makes for sequential reads: shape the
-/// plan so that the simple driver policy is the fast one, rather than ship the
-/// driver a complicated one.
-///
-/// Only exact duplicates move. A run with no shared source is left alone, which
-/// is every model but this one.
-pub(super) fn group_shared_source_reads(program: &mut LoadPlan) -> Result<usize> {
-    if program.schedule.len() < 2 {
-        return Ok(0);
-    }
-    let old_instrs = program.instrs.clone();
-    let mut result: Vec<StorageInstr> = Vec::with_capacity(old_instrs.len());
-    let mut run: Vec<ReadUnit> = Vec::new();
-    let mut rewrites = 0_u64;
-
-    for instr_id in &program.schedule {
-        let instr = instr_by_id(&old_instrs, *instr_id)?;
-        if let Some(source) = checkpoint_reading_tile_map(instr) {
-            run.push(ReadUnit {
-                source: source.clone(),
-                instrs: vec![instr.clone()],
-            });
-            continue;
-        }
-        // A `Finalize` publishes the buffer the tile map before it just wrote,
-        // so it travels with it. One that names anything else is not part of
-        // this run and ends it, rather than being carried somewhere its
-        // producer is not.
-        if let StorageInstr::Finalize { tensor, .. } = instr
-            && let Some(unit) = run.last_mut()
-            && unit.produces(*tensor)
-        {
-            unit.instrs.push(instr.clone());
-            continue;
-        }
-        flush_shared_source_run(&mut result, &mut run, &mut rewrites);
-        result.push(instr.clone());
-    }
-    flush_shared_source_run(&mut result, &mut run, &mut rewrites);
-
-    rewrite_program_instrs(program, result)?;
-    Ok(usize::try_from(rewrites).unwrap_or(usize::MAX))
-}
-
-/// A tile map that reads the checkpoint, and everything that travels with it.
-struct ReadUnit {
-    source: SourceExtent,
-    instrs: Vec<StorageInstr>,
-}
-
-impl ReadUnit {
-    fn produces(&self, buffer: BufferId) -> bool {
-        matches!(
-            self.instrs.first(),
-            Some(StorageInstr::TileMap { outputs, .. }) if outputs.contains(&buffer)
-        )
-    }
-}
-
-/// The source a tile map reads from the checkpoint, if it reads one at all.
-///
-/// A tile map with `inputs` consumes another instruction's output, and moving it
-/// past that instruction would be reordering a dependency rather than a read.
-fn checkpoint_reading_tile_map(instr: &StorageInstr) -> Option<&SourceExtent> {
-    match instr {
-        StorageInstr::TileMap { source, inputs, .. } if inputs.is_empty() => source.as_ref(),
-        _ => None,
-    }
-}
-
-/// Emit a run with the units that share a source grouped together, in the order
-/// each source was first read.
-fn flush_shared_source_run(
-    result: &mut Vec<StorageInstr>,
-    run: &mut Vec<ReadUnit>,
-    rewrites: &mut u64,
-) {
-    if run.len() < 2 {
-        for unit in run.drain(..) {
-            result.extend(unit.instrs);
-        }
-        return;
-    }
-    // `SourceExtent` carries a `Vec<Dim>` and is not hashable, so the index is
-    // keyed on the extent's scalar identity and the few units that collide are
-    // compared in full.
-    let mut groups: Vec<Vec<ReadUnit>> = Vec::new();
-    let mut index: HashMap<(FileId, u64, u64), Vec<usize>> = HashMap::new();
-    for unit in run.drain(..) {
-        let key = (
-            unit.source.file_id,
-            unit.source.file_offset,
-            unit.source.span_bytes,
-        );
-        let candidates = index.entry(key).or_default();
-        match candidates
-            .iter()
-            .find(|at| groups[**at][0].source == unit.source)
-        {
-            Some(at) => {
-                *rewrites += 1;
-                groups[*at].push(unit);
-            }
-            None => {
-                candidates.push(groups.len());
-                groups.push(vec![unit]);
-            }
-        }
-    }
-    for group in groups {
-        for unit in group {
-            result.extend(unit.instrs);
-        }
-    }
 }
