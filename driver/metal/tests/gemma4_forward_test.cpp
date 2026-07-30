@@ -8,6 +8,7 @@
 // Skipped (not failed) when the checkpoint is absent, so CI without a 2.5 GB
 // download stays green while the machine that has it gets the real answer.
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -167,11 +168,16 @@ int main(int argc, char** argv) {
     });
 
     // ── did it compute anything? ──
-    const auto* logits =
-        static_cast<const std::uint16_t*>(b.pool[coloring.per_dispatch.empty()
-                                                     ? 0
-                                                     : coloring.per_dispatch.back().front().color]
-                                              .contents());
+    // Read the softcap's OUTPUT, named by its bind index rather than by
+    // position -- `front()` is the input, and reading it would compare the wrong
+    // tensor against mlx while looking like it worked.
+    int logits_color = -1;
+    for (const auto& sb : coloring.per_dispatch.back()) {
+        if (sb.bind_index == (std::uint8_t)bind::Softcap::Out) logits_color = sb.color;
+    }
+    expect(logits_color >= 0, "the final dispatch has an output to read");
+    if (logits_color < 0) return 1;
+    const auto* logits = static_cast<const std::uint16_t*>(b.pool[logits_color].contents());
     int nonzero = 0, nan_or_inf = 0;
     float best = -1e30f;
     int argmax = -1;
@@ -186,6 +192,18 @@ int main(int argc, char** argv) {
     }
     std::printf("    (nonzero %d/%d, argmax %d, max logit %.4f)\n", nonzero, g.vocab,
                 argmax, best);
+    // The five the model actually prefers, so the comparison against mlx-lm is
+    // about the distribution and not just its peak.
+    std::vector<int> idx(g.vocab);
+    for (int i = 0; i < g.vocab; ++i) idx[i] = i;
+    std::partial_sort(idx.begin(), idx.begin() + 5, idx.end(), [&](int a, int c) {
+        return from_bf16(logits[a]) > from_bf16(logits[c]);
+    });
+    std::printf("    top5");
+    for (int i = 0; i < 5; ++i) {
+        std::printf(" (%d, %.4f)", idx[i], from_bf16(logits[idx[i]]));
+    }
+    std::printf("\n");
     expect(nonzero > g.vocab / 2, "the logits are populated, not a zeroed buffer");
     expect(nan_or_inf == 0, "and finite everywhere");
     expect(std::fabs(best) <= 30.0f + 1e-3f,
