@@ -1983,6 +1983,92 @@ READ LENGTH to be device-resolved from the same number as the fold length —
 `batch_compose::append_rs`, in the same place `PIE_RS_FLAG_FOLD_LEN_DEVICE`
 already substitutes, and it is the last piece.
 
+#### 10.2.10 `discard` is the missing dual of `fold` — THE NORTH STAR, LANDED
+
+One fire per speculative window. The thing §11.4 wanted and could not have in
+the form it asked for.
+
+##### The buffer only had one movable end
+
+```
+folded[0, F)              buffer[F, F+B)
+        `-- fold(n): F moves RIGHT.  Commit. Irreversible.
+                              discard(n): F+B moves LEFT.  Abandon. Free.
+```
+
+The boundary model gave the guest one of these. The other did not exist: the
+only way to get rid of buffered tokens was `free-buffer`, which empties the
+buffer WHOLESALE.
+
+That single asymmetry is the entire reason a speculative decode needed two
+fires. A verify fire buffers `k+1` tokens, of which a prefix is accepted.
+Dropping the rejected tail meant `free-buffer`, which would take the accepted
+prefix with it — so the prefix had to be folded away FIRST, and it could not
+be folded by the verify fire itself, because its length is not known until
+that fire's own logits come back. Hence a second fire whose only job was to
+move the boundary so the buffer could be emptied.
+
+The commit fire was never a goal. It was a workaround for a missing verb.
+
+##### Why not in `rs-geometry`
+
+`fold-len` lives in the geometry because it changes what the DEVICE does: it
+is where the recurrent-state snapshot lands. `discard` changes nothing on the
+device at all — the slots it releases are simply overwritten by the next
+append. Putting a device-side no-op in the geometry would make the geometry
+mean two things, "what to compute" and "what to forget".
+
+The WIT already records the precedent, in the comment that buried
+`start-token`: *"letting the guest state a runtime-owned value is what made
+multi-chunk buffering expressible and wrong."* The buffer's live extent is
+runtime-owned in exactly that sense. `discard-buffered` does not STATE it; it
+SHRINKS it, which is what a resource method is for. It is also the
+token-granular sibling of `free-buffer`, and the two now divide cleanly:
+**`free-buffer` releases CAPACITY, `discard-buffered` releases CONTENT.**
+
+There is a phase argument too. `fold` is something a fire does — the boundary
+lands where the device writes state. `discard` must happen before the fire is
+even planned, since the new tokens overwrite the discarded slots. A record
+field has no way to carry "this one applies before everything else here".
+
+##### The loop
+
+```
+read window k's outputs      (the loop already does this -- it needs the drafts)
+rs.discard_buffered(k+1 - clen_k)
+fire(window k+1 tokens, fold_len = clen_k)      <- ONE fire
+```
+
+`b = clen_k`, `t = k+1`, `n = clen_k`: exactly the fold-behind-while-writing-
+ahead shape §10.2.9 opened. No ABI change, no new descriptor, no
+device-resolved read length.
+
+##### The device path deliberately does NOT fuse
+
+This inverts the assumption §11.4 was written under. A device-resident
+`fold-len` is never read back, so the store holds only an UPPER BOUND on the
+live buffer and refuses to plan a replay against it — and a fused fire must
+replay the very prefix it is folding. So:
+
+  * **device-residency** buys back-to-back enqueue WITHOUT a host read;
+  * **reading back** — which this loop does anyway, for the next drafts —
+    buys the fusion.
+
+They are alternatives, not a ladder. `mtp-native-verify` now runs both:
+`fires=14` on the host path against `fires=28` on the device path, over
+`steps=14` windows, decoding the identical stream.
+
+##### Verified
+
+`mtp_logits_value_verify` (host, fused) and
+`a_device_resident_fold_length_decodes_identically` (device, two-fire) produce
+identical token streams; the harness asserts `steps == fires` on the host path,
+because a regression to two fires would not change a single token. Store unit
+test `discarding_buffered_tokens_releases_content_but_not_capacity`;
+`cuda_gdn_foldcommit` 8/8; engine lib 376 pass / 2 known timing;
+`--all-targets` clean. Metal needs no refusal: `discard` never reaches a
+driver.
+
 ## 11. The boundary model — ratified after Step B, supersedes §3.3/§3.4 fold modes
 
 Step B shipped the fold modes as three sibling methods because that is the

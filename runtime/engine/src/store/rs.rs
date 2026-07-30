@@ -117,6 +117,8 @@ pub enum RsError {
     FoldExceedsBuffer { tokens: u32, capacity: u32 },
     #[error("fold: {tokens} tokens is not a positive multiple of fold granularity {granularity}")]
     FoldGranularity { tokens: u32, granularity: u32 },
+    #[error("discard: {count} tokens exceed the {buffered} buffered")]
+    DiscardExceedsBuffer { count: u32, buffered: u32 },
     #[error("rs working set: index {index} out of range (size {size})")]
     IndexOutOfRange { index: u32, size: u32 },
     #[error("rs working set: duplicate index {index}")]
@@ -299,6 +301,49 @@ impl RsStore {
         let start = entry.buffer.len() as u32;
         entry.buffer.resize(entry.buffer.len() + n as usize, None);
         Ok(PageRange { start, len: n })
+    }
+
+    /// Forget the last `count` buffered tokens: they never happened.
+    ///
+    /// The twin of a fold, on the other end of the buffer. `fold` moves the
+    /// folded boundary F to the RIGHT and is irreversible; this moves the
+    /// live end F+B to the LEFT and costs nothing, because the slots it
+    /// releases are simply overwritten by the next append. Between them they
+    /// are the two ways a buffer shrinks, and until now only one of them
+    /// existed.
+    ///
+    /// That asymmetry is why a speculative decode needs two fires per window.
+    /// A verify fire buffers `k+1` tokens, of which a prefix is accepted; the
+    /// only way to get rid of the rejected tail was `free_buffer`, which
+    /// empties the buffer WHOLESALE and therefore forces the accepted prefix
+    /// to be folded away first — in its own fire, since the accepted length
+    /// is not known until the verify has run. With the tail discardable, the
+    /// next window's fire folds the previous window's prefix while writing
+    /// its own tokens (§10.2.9's fold-behind shape) and the commit fire
+    /// disappears.
+    ///
+    /// Capacity is untouched: this releases TOKENS, not pages. `free_buffer`
+    /// remains the capacity operation, and the two now divide cleanly —
+    /// content versus capacity.
+    pub fn discard_buffered(
+        &mut self,
+        ws: RsWorkingSetId,
+        count: u32,
+    ) -> Result<(), RsError> {
+        let entry = self.entry_mut(ws)?;
+        if count > entry.buffer_fill {
+            return Err(RsError::DiscardExceedsBuffer {
+                count,
+                buffered: entry.buffer_fill,
+            });
+        }
+        // Legal even while the boundary is device-resident. The uncertainty
+        // there is how many tokens a fold absorbed off the FRONT; discarding
+        // from the TAIL shifts the bound down by exactly `count` and leaves
+        // it a bound. It does not RESTORE exactness — only the guest saying
+        // "I am done with this window" does that — so the flag survives.
+        entry.buffer_fill -= count;
+        Ok(())
     }
 
     /// Remove the buffered slots at `indices` and densely compact the array.

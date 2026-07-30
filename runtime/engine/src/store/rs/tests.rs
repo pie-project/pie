@@ -888,3 +888,35 @@ fn publishing_a_fold_leaves_the_boundary_for_commit_folds() {
     assert_eq!(s.buffer_tokens(ws).unwrap(), 2);
     s.settle(published);
 }
+
+/// `discard` is the twin of a fold on the other end of the buffer: a fold
+/// moves the folded boundary right and cannot be undone, this moves the live
+/// end left and costs nothing. It releases CONTENT; `free_buffer` releases
+/// CAPACITY. Having only the second is why a speculative window needed two
+/// fires — dropping a rejected tail meant emptying the buffer, which forced
+/// the accepted prefix to be folded away first.
+#[test]
+fn discarding_buffered_tokens_releases_content_but_not_capacity() {
+    let mut s = store();
+    let ws = s.create_working_set(geom());
+    s.alloc_buffer(ws, 3).unwrap();
+    let prepared = s.prepare_write(ws, false, Some((0, 10))).unwrap();
+    settled(&mut s, prepared);
+    assert_eq!(s.buffer_tokens(ws).unwrap(), 10);
+
+    s.discard_buffered(ws, 4).unwrap();
+    assert_eq!(s.buffer_tokens(ws).unwrap(), 6);
+    assert_eq!(s.buffer_size(ws).unwrap(), 3); // pages untouched
+
+    // It may take the whole live buffer, and not one token more.
+    assert_eq!(
+        s.discard_buffered(ws, 7),
+        Err(RsError::DiscardExceedsBuffer {
+            count: 7,
+            buffered: 6
+        })
+    );
+    s.discard_buffered(ws, 6).unwrap();
+    assert_eq!(s.buffer_tokens(ws).unwrap(), 0);
+    assert_eq!(s.buffer_size(ws).unwrap(), 3);
+}

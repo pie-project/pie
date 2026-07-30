@@ -122,6 +122,25 @@ async fn mtp_logits_value_verify() -> Result<()> {
         json.contains("mtp-native-verify"),
         "unexpected inferlet result (did the fire error?): {json}"
     );
+    // ONE FIRE PER WINDOW. The host path folds the previous window's accepted
+    // prefix in the fire that writes the next one and discards the rejected
+    // tail from the buffer, so there is no commit fire left to submit. A
+    // regression here would not change a single token -- the two-fire shape
+    // decodes identically -- which is exactly why it is asserted as a count.
+    let field = |name: &str| -> Option<usize> {
+        json.split(&format!("{name}="))
+            .nth(1)?
+            .split_whitespace()
+            .next()?
+            .parse()
+            .ok()
+    };
+    let (steps, fires) = (field("steps"), field("fires"));
+    anyhow::ensure!(
+        steps.is_some() && steps == fires,
+        "the host path must submit exactly one fire per window, got steps={steps:?} \
+         fires={fires:?}: {json}"
+    );
     eprintln!(
         "[mtp-native-verify] VALUE-VERIFY: inspect PIE_MTP_LOGITS_TRACE [mtp-logits] lines above \
          — each draft row's argmax should DIFFER from the target greedy (wired, not aliasing). \

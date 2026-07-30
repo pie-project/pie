@@ -93,6 +93,23 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
         Ok(out)
     }
 
+    async fn discard_buffered(
+        &mut self,
+        this: Resource<RsWorkingSet>,
+        count: u32,
+    ) -> Result<Result<(), String>> {
+        crate::inferlet::process::gate::residency_gate(self).await?;
+        let ws = self.ctx().table.get(&this)?.clone();
+        let stores = store_registry::get(ws.model, ws.driver as usize);
+        let out = stores
+            .rs
+            .lock()
+            .unwrap()
+            .discard_buffered(ws.id, count)
+            .map_err(|e| e.to_string());
+        Ok(out)
+    }
+
     async fn reorder_buffer(
         &mut self,
         this: Resource<RsWorkingSet>,

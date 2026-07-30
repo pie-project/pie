@@ -253,6 +253,7 @@ fn build_verify(
     draft: &[i32],
     seq_len: u32,
     max_pages: u32,
+    fold_len: u32,
     clen_out: Option<&Channel>,
 ) -> Result<(ForwardPass, Channel, Channel, Option<Channel>)> {
     let kp1 = k + 1;
@@ -273,14 +274,20 @@ fn build_verify(
     let readout: Vec<u32> = (0..kp1).collect();
     bind_window(&fwd, ws, &toks, &kv_len, seq_len, kp1, max_pages, &readout)?;
 
-    // BUFFER, do not fold. The verify window is `seed + k drafts`, and how
-    // many of those k are real is not known until this fire's own logits come
-    // back. Folding them would advance the recurrent state through a tail that
-    // may be rejected, and a fold is irreversible — unlike KV, there are no
-    // slots to discard. So the window's pre-recurrence activations are parked
-    // in the buffer with the folded boundary held still, and the NEXT fire
-    // moves it through exactly the accepted prefix.
-    let fold_len = Channel::from(vec![0u32]).named("v_fold_len");
+    // This fire does NOT fold its own tokens. The window is `seed + k
+    // drafts`, and how many of those k are real is not known until this
+    // fire's own logits come back. Folding them would advance the recurrent
+    // state through a tail that may be rejected, and a fold is irreversible.
+    // So the window's pre-recurrence activations are parked in the buffer
+    // with its own boundary held still.
+    //
+    // `fold_len` is the PREVIOUS window's accepted prefix, which by now IS
+    // known — it sits behind this fire's new tokens in the buffer, the
+    // rejected tail between them having been discarded before the fire was
+    // built. Folding it here is what makes the commit fire unnecessary: one
+    // fire per window instead of two. (§10.2.9's fold-behind shape:
+    // `0 < n <= b` with `t > 0`.)
+    let fold_len = Channel::from(vec![fold_len]).named("v_fold_len");
     fwd.recurrent_with(std::slice::from_ref(rs), &fold_len, ..)
     .map_err(|e| format!("verify recurrent binding: {e}"))?;
     fwd.epilogue(move || {
@@ -415,26 +422,57 @@ async fn main(input: String) -> Result<String> {
     let mut generated: u32 = 1;
 
     // North-star spec-decode loop: verify the embedded drafts against the
-    // target with the fold SUPPRESSED → fold exactly the accepted prefix and
-    // abandon the rest → take the fresh native-MTP drafts as the NEXT
+    // target while folding the PREVIOUS window's accepted prefix → discard
+    // the rejected tail → take the fresh native-MTP drafts as the next
     // window's proposals → repeat.
+    //
+    // The fold and the discard are the two ends of the buffer, and having
+    // both is what collapses a window to ONE fire. `fold-len` moves the
+    // folded boundary right through the tokens the previous window earned;
+    // `discard-buffered` moves the live end left over the tokens it did not.
+    // Until the second existed, dropping the rejected tail meant
+    // `free_buffer`, which empties the buffer wholesale — so the accepted
+    // prefix had to be folded away first, in a fire of its own, because its
+    // length is not knowable until the verify has run.
+    //
+    // The DEVICE path cannot fuse, and the reason is worth stating: its fold
+    // length is never read back, so the store holds only an upper bound on
+    // the live buffer and refuses to plan a replay against it. A fused fire
+    // must replay the accepted prefix it is folding. Device-residency buys
+    // back-to-back enqueue WITHOUT a host read; reading back — which this
+    // loop does anyway, for the drafts — buys the fusion. They are
+    // alternatives, not a ladder.
     let window_slabs = (k + 1).div_ceil(rs_page);
+    let kp1 = k + 1;
+    // The previous window's accepted prefix, still buffered, waiting for the
+    // next fire to fold it. Zero on the first pass: nothing precedes it.
+    let mut pending_fold: u32 = 0;
     while generated < MAX_TOKENS {
-        // Each window buffers k+1 tokens and ends with an empty buffer, so
-        // the slabs are reserved per window rather than held across the loop.
-        // They must be reserved fresh: appending onto a buffer that still held
-        // the previous window's tail would ask the recurrence to read what is
-        // already buffered, which it cannot do.
-        rs.alloc_buffer(window_slabs)
-            .map_err(|e| format!("rs.alloc_buffer: {e}"))?;
+        if device {
+            // Two fires, an empty buffer between windows.
+            rs.alloc_buffer(window_slabs)
+                .map_err(|e| format!("rs.alloc_buffer: {e}"))?;
+        } else {
+            // One fire. The buffer never empties: it carries the previous
+            // window's accepted prefix into this fire, which folds it while
+            // appending its own tokens past it. Reserve only what the live
+            // content plus this window actually needs -- `advance_fold`
+            // releases the head pages the fold covers, so the reservation
+            // stays bounded instead of growing once per window.
+            let live = pending_fold + kp1 + rs_page;
+            while rs.buffer_size() * rs_page < live {
+                rs.alloc_buffer(window_slabs.max(1))
+                    .map_err(|e| format!("rs.alloc_buffer: {e}"))?;
+            }
+        }
 
         // The device path builds the COMMIT first -- it must claim `clen`
         // before the verify fire that fills it is submitted -- then enqueues
         // both fires back to back with nothing awaited in between. The host
-        // path cannot: its commit is untraceable until `clen` is known.
+        // path has no commit to build.
         let clen_ch = device.then(|| Channel::new([1], dtype::u32).named("v_clen"));
         let (verify, commit_out, drafts_out, clen_echo) = build_verify(
-            &ws, &rs, k, seed, &draft, seq_len, max_pages, clen_ch.as_ref(),
+            &ws, &rs, k, seed, &draft, seq_len, max_pages, pending_fold, clen_ch.as_ref(),
         )?;
         // The commit is CONSTRUCTED here -- after the verify pass is built but
         // before it is submitted. F8 only requires the consumer to claim the
@@ -490,28 +528,29 @@ async fn main(input: String) -> Result<String> {
         accepted_lengths.push(n_acc);
         let commit_toks: Vec<u32> = commit.iter().take(clen).map(|&t| t as u32).collect();
 
-        // Only NOW is the accepted length known, so only now can the folded
-        // boundary move. It advances through exactly `clen` of the k+1
-        // buffered tokens; the rejected tail is abandoned by freeing its
-        // slabs, having never touched the recurrent state.
-        //
-        // The commit re-runs the WINDOW's first `clen` tokens, which is the
-        // span the verify fire already wrote KV for. `commit_toks` is the
-        // window shifted by one (each entry is what the target predicted
-        // AFTER the corresponding window token), so feeding it here would
-        // corrupt exactly the prefix being committed.
-        if !device {
-            // The host path can only trace its commit NOW, with `clen` in
-            // hand, which is exactly the round-trip the device path removes.
-            let fold = Channel::from(vec![clen as u32]).named("c_fold_len");
-            let pass = build_commit(&rs, &ws, seq_len, max_pages, &fold)?;
-            pass.submit(&pipeline)
-                .map_err(|e| format!("commit submit: {e}"))?;
-        }
-        let remaining = rs.buffer_size();
-        if remaining > 0 {
-            rs.free_buffer(&(0..remaining).collect::<Vec<_>>())
-                .map_err(|e| format!("free_buffer: {e}"))?;
+        // Only NOW is the accepted length known, so only now can anything be
+        // said about this window's tokens.
+        if device {
+            // The commit fire has already folded `clen` from the device-side
+            // channel. Everything still buffered is the rejected tail, and
+            // freeing it wholesale is also what restores the store's exact
+            // occupancy after a device-resident fold.
+            let remaining = rs.buffer_size();
+            if remaining > 0 {
+                rs.free_buffer(&(0..remaining).collect::<Vec<_>>())
+                    .map_err(|e| format!("free_buffer: {e}"))?;
+            }
+        } else {
+            // The rejected tail never touched the recurrent state, so it is
+            // enough to say it never happened. The accepted prefix stays
+            // buffered -- unfolded -- and the NEXT window's fire folds it
+            // while writing its own tokens over the slots just released.
+            let rejected = kp1 - clen as u32;
+            if rejected > 0 {
+                rs.discard_buffered(rejected)
+                    .map_err(|e| format!("discard_buffered: {e}"))?;
+            }
+            pending_fold = clen as u32;
         }
 
         seq_len += clen as u32;
@@ -531,8 +570,12 @@ async fn main(input: String) -> Result<String> {
     } else {
         0.0
     };
+    // The point of the fusion, stated as a number: one fire per window on the
+    // host path, two on the device path.
+    let fires = if device { 2 * steps } else { steps };
     let result = format!(
-        "mtp-native-verify: mode={} k={k} steps={steps} accepted_lengths={accepted_lengths:?} \
+        "mtp-native-verify: mode={} k={k} steps={steps} fires={fires} \
+         accepted_lengths={accepted_lengths:?} \
          mean_accept={mean_acc:.2} committed={} fold_len_checked={clen_agreements} \
          fold_len_nontrivial={clen_nontrivial} (PTIR-native verify+draft: verify vs embedded \
          drafts, next-drafts from mtp_logits argmax, [k+1] bonus tail, all traced)",

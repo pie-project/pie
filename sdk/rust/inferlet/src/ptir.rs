@@ -605,6 +605,23 @@ impl RsWorkingSet {
         self.rs.free_buffer(indices)
     }
 
+    /// Forget the last `count` buffered tokens: they never happened.
+    ///
+    /// The twin of `fold-len` on the other end of the buffer. A fold moves the
+    /// folded boundary RIGHT and cannot be undone; this moves the live end
+    /// LEFT and is free, because the slots it releases are overwritten by the
+    /// next append. `free_buffer` is the CAPACITY operation; this is the
+    /// CONTENT one.
+    ///
+    /// It is what collapses a speculative window to one fire. The rejected
+    /// tail is discarded here, and the NEXT window's fire folds the accepted
+    /// prefix while writing its own tokens — instead of a separate commit
+    /// fire whose only job was to empty the buffer so `free_buffer` could
+    /// take the tail with it.
+    pub fn discard_buffered(&self, count: u32) -> Result<(), String> {
+        self.rs.discard_buffered(count)
+    }
+
     /// Reorder the buffered slots by the full bijection `perm`.
     pub fn reorder_buffer(&self, perm: &[u32]) -> Result<(), String> {
         self.rs.reorder_buffer(perm)
