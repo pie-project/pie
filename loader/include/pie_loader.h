@@ -5,6 +5,10 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+namespace pie_loader {
+struct PieLoaderPlan;
+}
+
 
 namespace pie_loader {
 
@@ -539,6 +543,25 @@ struct PieLoaderTensorContractView {
 
 using PieLoaderTensorContractSlice = PieLoaderSlice<PieLoaderTensorContractView>;
 
+/// A set of interchangeable declarations: the same tensors, `arity` times.
+///
+/// The expressions live in the same node pool as everything else and may use
+/// the two index-parametric nodes, [`PieLoaderExprKind::SrcIndexed`] and
+/// [`PieLoaderExprKind::Select`], which stand for the instance and are an error
+/// anywhere but here.
+struct PieLoaderGroupContractView {
+  PieLoaderBytes name;
+  /// How many instances. The loader compiles every one of them and requires
+  /// them to agree, so this is a claim being checked and not a hint.
+  uint32_t arity;
+  /// The declarations one instance publishes. `Expr::Out` inside a group
+  /// names an earlier declaration *of the same group*: an instance is a
+  /// self-contained load, so it cannot read the resident contract's outputs.
+  PieLoaderTensorContractSlice tensors;
+};
+
+using PieLoaderGroupContractSlice = PieLoaderSlice<PieLoaderGroupContractView>;
+
 /// Everything one driver rank declares.
 struct PieLoaderModelContractView {
   /// Byte alignment every materialized buffer must satisfy.
@@ -548,6 +571,9 @@ struct PieLoaderModelContractView {
   PieLoaderExprNodeSlice nodes;
   /// The declarations, in order. `Expr::Out` may only name an earlier one.
   PieLoaderTensorContractSlice tensors;
+  /// Interchangeable declaration sets. Empty for a contract that has none,
+  /// which is every contract that predates them.
+  PieLoaderGroupContractSlice groups;
 };
 
 /// A compile request that carries its own contract.

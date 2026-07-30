@@ -1661,3 +1661,51 @@ fn a_gather_carries_its_indices_across_the_ffi() {
     let read = unsafe { super::contract::read_contract(&owned.view()) }.expect("reads back");
     assert_eq!(read, contract);
 }
+
+/// A group is the one thing on the contract ABI that is not a flat list: the
+/// C++ side keeps its declarations in storage of its own, and the flattened
+/// form has to say which of the shared tensor entries belong to which group.
+/// Both index nodes ride along, `Select`'s stride in the `start` field, so a
+/// whole-contract equality is the check that pins that encoding down.
+#[test]
+fn a_group_survives_the_contract_ffi() {
+    use crate::contract::{Expr, GroupContract, ModelContract, TensorContract};
+    let contract = ModelContract {
+        alignment: 256,
+        tensors: vec![TensorContract::inferred(
+            "norm",
+            Expr::src("model.norm.weight"),
+            Encoding::Raw(DType::BF16),
+        )],
+        groups: vec![
+            GroupContract {
+                name: "experts".to_string(),
+                arity: 128,
+                tensors: vec![
+                    TensorContract::inferred(
+                        "gate_up",
+                        Expr::select(Expr::src("experts.gate_up_blocks"), 0, 1, 1),
+                        Encoding::Raw(DType::BF16),
+                    ),
+                    TensorContract::inferred(
+                        "down",
+                        Expr::src_indexed("model.layers.0.experts.{}.down.weight"),
+                        Encoding::Raw(DType::BF16),
+                    ),
+                ],
+            },
+            GroupContract {
+                name: "layers".to_string(),
+                arity: 4,
+                tensors: vec![TensorContract::inferred(
+                    "attn",
+                    Expr::src_indexed("model.layers.{}.attn.weight"),
+                    Encoding::Raw(DType::BF16),
+                )],
+            },
+        ],
+    };
+    let owned = crate::testkit::contract_writer::write_contract(&contract);
+    let read = unsafe { super::contract::read_contract(&owned.view()) }.expect("reads back");
+    assert_eq!(read, contract);
+}

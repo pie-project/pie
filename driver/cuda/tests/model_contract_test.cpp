@@ -106,6 +106,65 @@ void test_expect_states_a_shape() {
     check(v.tensors.ptr[0].shape.ptr[1] == 8, "the stated extents come back");
 }
 
+// A group is `arity` interchangeable declarations. What the builder owes is
+// that they land in storage of their own -- a `define` on a group must not
+// reach the contract's tensor list -- and that `expect` and `internal` still
+// address the declaration they were chained onto once there are two lists they
+// could mean.
+void test_a_group_declares_its_own_tensors() {
+    pie_loader::ModelContract c;
+    c.define("norm", c.src("norm"), pie_loader::raw(pie_loader::PieLoaderDType::BF16));
+
+    auto experts = c.group("experts", 128);
+    auto bank = c.src("experts.gate_up");
+    experts.define("gate_up", c.select(bank, 0, 1, 1),
+                   pie_loader::raw(pie_loader::PieLoaderDType::BF16))
+        .expect({1, 64, 128});
+    experts.define("down", c.index_src("experts.{}.down"),
+                   pie_loader::raw(pie_loader::PieLoaderDType::BF16))
+        .internal();
+
+    const auto v = c.view();
+    check(v.tensors.len == 1, "a group's declarations stay out of the contract's");
+    check(v.groups.len == 1, "one group");
+    check(view_of(v.groups.ptr[0].name) == "experts", "group name");
+    check(v.groups.ptr[0].arity == 128, "group arity");
+    check(v.groups.ptr[0].tensors.len == 2, "two declarations in the group");
+    check(v.groups.ptr[0].tensors.ptr[0].shape.len == 3,
+          "expect on a group's declaration reaches that declaration");
+    check(v.groups.ptr[0].tensors.ptr[1].visibility ==
+              pie_loader::PieLoaderVisibility::Internal,
+          "internal on a group's declaration reaches that declaration");
+    // The index nodes share the one node pool, as every other node does.
+    std::size_t indexed = 0;
+    for (std::size_t i = 0; i < v.nodes.len; ++i) {
+        const std::uint32_t kind = v.nodes.ptr[i].kind;
+        if (kind == static_cast<std::uint32_t>(pie_loader::PieLoaderExprKind::SrcIndexed) ||
+            kind == static_cast<std::uint32_t>(pie_loader::PieLoaderExprKind::Select)) {
+            ++indexed;
+        }
+    }
+    check(indexed == 2, "both index nodes are in the shared pool");
+}
+
+// A group whose declarations were added after the view was taken must not be
+// read through the stale view -- but a view taken *after* must see them, which
+// is the growth rule the contract's own tensors already have.
+void test_a_group_view_survives_growth() {
+    pie_loader::ModelContract c;
+    for (int i = 0; i < 64; ++i) {
+        auto g = c.group("g" + std::to_string(i), 4);
+        g.define("w", c.index_src("t.{}.w"), pie_loader::raw(pie_loader::PieLoaderDType::BF16));
+    }
+    const auto v = c.view();
+    check(v.groups.len == 64, "every group is in the view");
+    for (std::size_t i = 0; i < v.groups.len; ++i) {
+        check(v.groups.ptr[i].tensors.len == 1, "each group kept its declaration");
+        check(view_of(v.groups.ptr[i].name) == "g" + std::to_string(i),
+              "each group kept its name");
+    }
+}
+
 // A scale tensor states which weight it scales. The name it states is stored
 // by the builder, not borrowed from the caller, so it has to outlive the
 // argument it came from.
@@ -1269,6 +1328,8 @@ int main() {
     test_scaling_states_the_weight();
     test_scale_carries_its_factor();
     test_the_view_survives_growth();
+    test_a_group_declares_its_own_tensors();
+    test_a_group_view_survives_growth();
     test_csm_narrows_fp32_weights_to_bf16();
     test_deepseek_v4_stacks_experts_as_bf16();
     test_kimi_stacks_experts_as_bf16();

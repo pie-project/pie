@@ -30,7 +30,7 @@
 //! field the caller forgot is a zero, not garbage from another variant.
 
 use crate::contract::{
-    Expr, ModelContract, ScaleFactor, Scales, TensorContract, TensorType, Visibility,
+    Expr, GroupContract, ModelContract, ScaleFactor, Scales, TensorContract, TensorType, Visibility,
 };
 use crate::ffi::types::{
     PieLoaderBytes, PieLoaderDType, PieLoaderEncodingKind, PieLoaderI64Slice,
@@ -379,6 +379,27 @@ pub struct PieLoaderScalesView {
 
 pub type PieLoaderTensorContractSlice = PieLoaderSlice<PieLoaderTensorContractView>;
 
+/// A set of interchangeable declarations: the same tensors, `arity` times.
+///
+/// The expressions live in the same node pool as everything else and may use
+/// the two index-parametric nodes, [`PieLoaderExprKind::SrcIndexed`] and
+/// [`PieLoaderExprKind::Select`], which stand for the instance and are an error
+/// anywhere but here.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PieLoaderGroupContractView {
+    pub name: PieLoaderBytes,
+    /// How many instances. The loader compiles every one of them and requires
+    /// them to agree, so this is a claim being checked and not a hint.
+    pub arity: u32,
+    /// The declarations one instance publishes. `Expr::Out` inside a group
+    /// names an earlier declaration *of the same group*: an instance is a
+    /// self-contained load, so it cannot read the resident contract's outputs.
+    pub tensors: PieLoaderTensorContractSlice,
+}
+
+pub type PieLoaderGroupContractSlice = PieLoaderSlice<PieLoaderGroupContractView>;
+
 /// Everything one driver rank declares.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -390,6 +411,9 @@ pub struct PieLoaderModelContractView {
     pub nodes: PieLoaderExprNodeSlice,
     /// The declarations, in order. `Expr::Out` may only name an earlier one.
     pub tensors: PieLoaderTensorContractSlice,
+    /// Interchangeable declaration sets. Empty for a contract that has none,
+    /// which is every contract that predates them.
+    pub groups: PieLoaderGroupContractSlice,
 }
 
 unsafe fn slice_of<'a, T>(ptr: *const T, len: usize) -> &'a [T] {
@@ -627,7 +651,7 @@ fn read_expr(node: &PieLoaderExprNode, index: usize, done: &[Expr]) -> Result<Ex
 pub unsafe fn read_contract(view: &PieLoaderModelContractView) -> Result<ModelContract, String> {
     let nodes = unsafe { slice_of(view.nodes.ptr, view.nodes.len) };
     let tensors = unsafe { slice_of(view.tensors.ptr, view.tensors.len) };
-    if tensors.is_empty() {
+    if tensors.is_empty() && view.groups.len == 0 {
         return Err(
             "contract.tensors is empty; a contract that declares nothing \
                     would compile to a plan that loads nothing"
@@ -644,9 +668,47 @@ pub unsafe fn read_contract(view: &PieLoaderModelContractView) -> Result<ModelCo
         built.push(expr);
     }
 
+    let declared = unsafe { read_tensors(tensors, &built, "contract.tensors") }?;
+
+    let mut groups = Vec::with_capacity(view.groups.len);
+    for (index, group) in unsafe { slice_of(view.groups.ptr, view.groups.len) }
+        .iter()
+        .enumerate()
+    {
+        let what = format!("contract.groups[{index}]");
+        let name = unsafe { text(&group.name, &what) }?;
+        let tensors = unsafe { slice_of(group.tensors.ptr, group.tensors.len) };
+        groups.push(GroupContract {
+            arity: group.arity,
+            tensors: unsafe { read_tensors(tensors, &built, &format!("{what}.tensors")) }?,
+            name,
+        });
+    }
+
+    Ok(ModelContract {
+        alignment: view.alignment,
+        tensors: declared,
+        groups,
+    })
+}
+
+/// Materialize a run of declarations against the node pool they share.
+///
+/// Shared by the contract's own tensors and each group's, because a group's
+/// declarations are declarations -- the only thing that differs is that their
+/// expressions may name the instance.
+///
+/// # Safety
+///
+/// Every pointer in `tensors` must be valid for the duration of the call.
+unsafe fn read_tensors(
+    tensors: &[PieLoaderTensorContractView],
+    built: &[Expr],
+    whose: &str,
+) -> Result<Vec<TensorContract>, String> {
     let mut declared = Vec::with_capacity(tensors.len());
     for (index, tensor) in tensors.iter().enumerate() {
-        let what = format!("contract.tensors[{index}]");
+        let what = format!("{whose}[{index}]");
         let name = unsafe { text(&tensor.name, &what) }?;
         let expr = built
             .get(tensor.root as usize)
@@ -665,16 +727,7 @@ pub unsafe fn read_contract(view: &PieLoaderModelContractView) -> Result<ModelCo
                 .into(),
         });
     }
-
-    Ok(ModelContract {
-        alignment: view.alignment,
-        tensors: declared,
-        // No group authoring over the C ABI yet: the driver work that consumes
-        // group plans lands with it, and a surface with no caller is a surface
-        // nothing checks. The JSON contract path carries groups today, which is
-        // what the golden plans and `pie-loader` exercise them through.
-        groups: Vec::new(),
-    })
+    Ok(declared)
 }
 
 // ── writing PODs the loader owns ───────────────────────
