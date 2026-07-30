@@ -175,7 +175,12 @@ enum class Rope : uint8_t { X = 0, Position = 1, Scale = 2, Base = 3, HeadDim = 
 // embedding gather (4-bit dequant of the shared lm_head bundle; tied). TokenId is
 // IO::TokenId (I1). Matches embed_gather.metal: W/Scales/Biases (same 4-bit packing
 // as Qmv) + token id + out + hidden. Bound to the SAME lm_head slots as QmvLmHead.
-enum class Embed : uint8_t { W = 0, Scales = 1, Biases = 2, TokenId = 3, Out = 4, Hidden = 5 };
+enum class Embed : uint8_t {
+    W = 0, Scales = 1, Biases = 2, TokenId = 3, Out = 4, Hidden = 5,
+    // gemma4's `embed_gather_scaled_4bit` only. qwen3.5 runs the unscaled
+    // instantiation, which has no buffer 6 to bind.
+    Scale = 6,
+};
 
 // KV append (in-place write at position): Pos is IO::Position (I1). Matches kv_append.metal:
 //   0=k_new, 1=v_new, 2=k_cache, 3=v_cache, 4=pos(IO), 5=head_dim, 6=k_head_stride

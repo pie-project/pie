@@ -106,13 +106,16 @@ int main(int argc, char** argv) {
             expect(oversized == 0, "no threadgroup exceeds what this device allows");
             expect(empty_grid == 0, "no dispatch has an empty grid");
 
-            // The same dispatches at M>1. A shape may legitimately differ from
-            // decode's only where the KERNEL differs -- the projections, which
-            // are a matvec at M=1 and a matmul at M>1. Anywhere else a
-            // difference means prefill and decode are two implementations of one
-            // thing, so the set of differing kinds is asserted, not the count.
+            // The same dispatches at M>1. At rows==1 EVERY one of them must
+            // reduce to the decode shape -- including the projections, whose
+            // `qmv_mb_dispatch(N, 1)` is `qmv_dispatch(N)` by construction. This
+            // used to assert the opposite for projections, which passed only
+            // because decode's matvec shape was itself wrong: `Grid{1, N/8, 1}`
+            // against tg `{64,1,1}` gave every threadgroup one thread, so half
+            // the output rows were never written and the rest summed 1/32 of K.
+            // A rows==1 divergence between the two paths is the symptom.
             std::printf("[M>1 launch shapes]\n");
-            int mb_empty = 0, mb_oversized = 0, unexpected_diff = 0, proj_same = 0;
+            int mb_empty = 0, mb_oversized = 0, unexpected_diff = 0;
             for (int rows : {1, 2, 17, 128}) {
                 for (const auto& d : dag) {
                     pie::metal::Grid mg{}; pie::metal::Threadgroup mt{};
@@ -126,20 +129,14 @@ int main(int argc, char** argv) {
                     pie::metal::gemma4::launch_shape(d, g, dg, dt);
                     const bool same = mg.x == dg.x && mg.y == dg.y && mg.z == dg.z &&
                                       mt.x == dt.x && mt.y == dt.y && mt.z == dt.z;
-                    const bool is_proj =
-                        pie::metal::gemma4::qmv_kn(d.kind, g, d.layer).N != 0;
-                    if (!same && !is_proj) ++unexpected_diff;
-                    if (same && is_proj) ++proj_same;
+                    if (!same) ++unexpected_diff;
                 }
             }
             expect(mb_empty == 0, "no M>1 dispatch has an empty grid");
             expect(mb_oversized == 0, "no M>1 threadgroup exceeds what this device allows");
             expect(unexpected_diff == 0,
-                   "at rows==1 only the projections differ from decode (" +
-                       std::to_string(unexpected_diff) + " others do)");
-            expect(proj_same == 0,
-                   "and the projections really do differ, so a matmul PSO is required "
-                   "for them at M>1");
+                   "at rows==1 every M>1 shape reduces to decode's (" +
+                       std::to_string(unexpected_diff) + " do not)");
 
             // And that matmul PSO must exist. A dispatch whose grid was computed
             // for one tiling and whose pipeline was compiled for another is not

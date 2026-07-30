@@ -22,6 +22,12 @@ bool build_gemma4_psos(RawMetalContext& ctx, const std::string& kernels_dir, Gem
         {"layer_scalar.metal", "layer_scalar_mul_bfloat16", &out.layer_scalar},
         {"ple_combine.metal", "ple_combine_bfloat16", &out.ple_combine},
         {"vnorm.metal", "vnorm_single_row_bfloat16", &out.vnorm},
+        {"embed_gather.metal", "embed_gather_scaled_4bit_bfloat16_gs_64_b_4", &out.embed_scaled},
+        {"quantized_qmv.metal", "affine_qmv_narrow_bfloat16_gs_64_b_4", &out.qmv_narrow},
+        {"rope.metal", "rope_neox_prop_decode_bfloat16", &out.rope_prop},
+        {"embed_gather.metal", "embed_gather_scaled_mb_4bit_bfloat16_gs_64_b_4",
+         &out.embed_scaled_mb},
+        {"rope.metal", "rope_neox_prop_mb_bfloat16", &out.rope_prop_mb},
     };
     for (const Spec& spec : specs) {
         std::string compile_error;

@@ -441,7 +441,7 @@ std::vector<WeightBind> weight_binds(
     // The PLE table is gathered exactly like the token embedding, and the three
     // PLE projections are ordinary quantized matvecs.
     case Kernel::G4PleTokenGather:
-        push_quant(weights, "per_layer_embedding");
+        push_quant(weights, "embed_tokens_per_layer");
         break;
     case Kernel::G4PleProjGemv:
         push_quant(weights, "per_layer_model_projection");

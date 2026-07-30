@@ -50,6 +50,14 @@ RmsParams rms_params(const Gemma4Geometry& g, int axis) {
     return RmsParams{g.eps, std::uint32_t(axis), 1u, g.norm_plus_one ? 1u : 0u};
 }
 
+/// The KV cache is [n_kv_heads, max_ctx, head_dim] per owning layer, so the head
+/// stride depends on this layer's head width -- gemma4's two attention types do
+/// not share one.
+std::size_t k_head_stride(const Gemma4Geometry& g, int layer) {
+    const int hd = layer >= 0 ? g.head_dim_of(layer) : g.head_dim;
+    return std::size_t(g.kv_max_ctx) * std::size_t(hd);
+}
+
 }  // namespace
 
 KN qmv_kn(Kind k, const Gemma4Geometry& g, int layer) {
@@ -117,7 +125,14 @@ int bind_gemma4_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                 bind_const<RmsParams>(ctx, ord, (std::uint8_t)bind::Rms::Params,
                                       rms_params(g, hd), &count);
                 break;
+            // The two PLE norms are NOT the same width. `per_layer_projection_norm`
+            // runs over a ple_dim-wide row (once per layer, on the [n_layers,
+            // ple_dim] table); `post_per_layer_input_norm` is `RMSNorm(hidden)`
+            // and runs on the projection's output, back in the residual stream.
             case Kind::PleNorm:
+                bind_const<RmsParams>(ctx, ord, (std::uint8_t)bind::Rms::Params,
+                                      rms_params(g, g.hidden), &count);
+                break;
             case Kind::PleProjNorm:
                 bind_const<RmsParams>(ctx, ord, (std::uint8_t)bind::Rms::Params,
                                       rms_params(g, g.per_layer_emb_dim), &count);
@@ -133,8 +148,12 @@ int bind_gemma4_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
             case Kind::RopeQ:
             case Kind::RopeK:
                 bind_const<float>(ctx, ord, (std::uint8_t)bind::Rope::Scale, 1.0f, &count);
+                // `base` is log2(theta), not theta -- the kernel raises 2 to it.
+                // Bound as theta, `exp2(-d * 1e6)` is 0 for every frequency but
+                // the first, which is a rope that does nothing at all.
                 bind_const<float>(ctx, ord, (std::uint8_t)bind::Rope::Base,
-                                  L >= 0 ? g.rope_theta_of(L) : g.rope_theta_global, &count);
+                                  std::log2(L >= 0 ? g.rope_theta_of(L) : g.rope_theta_global),
+                                  &count);
                 bind_const<std::int32_t>(ctx, ord, (std::uint8_t)bind::Rope::HeadDim, hd, &count);
                 break;
 
@@ -143,8 +162,22 @@ int bind_gemma4_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                 const std::int32_t gqa = g.n_kv_heads > 0 ? g.n_q_heads / g.n_kv_heads : 1;
                 bind_const<std::int32_t>(ctx, ord, (std::uint8_t)bind::Sdpa::GqaFactor, gqa,
                                          &count);
-                bind_const<float>(ctx, ord, (std::uint8_t)bind::Sdpa::Scale,
-                                  1.0f / std::sqrt(float(hd)), &count);
+                // 1.0, not 1/sqrt(head_dim): gemma4 folds the attention scale
+                // into the q-norm's learned weights, so mlx-lm's `Attention`
+                // sets `self.scale = 1.0`. Dividing again is a second scaling
+                // of an already-scaled query.
+                bind_const<float>(ctx, ord, (std::uint8_t)bind::Sdpa::Scale, 1.0f, &count);
+                // The cache layout, [n_kv_heads, max_ctx, head_dim]. Never bound
+                // before: four `constant size_t&` slots read out of whatever the
+                // argument table held, which is wrong attention, not a crash.
+                bind_const<std::size_t>(ctx, ord, (std::uint8_t)bind::Sdpa::KHeadStride,
+                                        k_head_stride(g, L), &count);
+                bind_const<std::size_t>(ctx, ord, (std::uint8_t)bind::Sdpa::KSeqStride,
+                                        std::size_t(hd), &count);
+                bind_const<std::size_t>(ctx, ord, (std::uint8_t)bind::Sdpa::VHeadStride,
+                                        k_head_stride(g, L), &count);
+                bind_const<std::size_t>(ctx, ord, (std::uint8_t)bind::Sdpa::VSeqStride,
+                                        std::size_t(hd), &count);
                 // Both attention types run an `sdpa_vector_decode_swa`
                 // instantiation -- they differ by head width, not by kernel --
                 // so BOTH read this slot. Binding it only for sliding layers
@@ -164,6 +197,10 @@ int bind_gemma4_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
             case Kind::KvAppend:
                 bind_const<std::int32_t>(ctx, ord, (std::uint8_t)bind::KvAppend::HeadDim, hd,
                                          &count);
+                bind_const<std::size_t>(ctx, ord, (std::uint8_t)bind::KvAppend::KHeadStride,
+                                        k_head_stride(g, L), &count);
+                bind_const<std::size_t>(ctx, ord, (std::uint8_t)bind::KvAppend::KSeqStride,
+                                        std::size_t(hd), &count);
                 break;
 
             // ── elementwise ──
@@ -208,10 +245,17 @@ int bind_gemma4_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
             case Kind::EmbedGather:
                 bind_const<std::int32_t>(ctx, ord, (std::uint8_t)bind::Embed::Hidden, g.hidden,
                                          &count);
+                // Gemma scales its embedding by sqrt(hidden_size). It cannot be
+                // folded into the table: the LM head reads the same tied
+                // weights, unscaled.
+                bind_const<float>(ctx, ord, (std::uint8_t)bind::Embed::Scale,
+                                  std::sqrt(float(g.hidden)), &count);
                 break;
             case Kind::PleTokenGather:
                 bind_const<std::int32_t>(ctx, ord, (std::uint8_t)bind::Embed::Hidden,
                                          g.n_layers * g.per_layer_emb_dim, &count);
+                bind_const<float>(ctx, ord, (std::uint8_t)bind::Embed::Scale,
+                                  std::sqrt(float(g.per_layer_emb_dim)), &count);
                 break;
 
             default:

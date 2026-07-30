@@ -18,8 +18,24 @@ namespace pie::metal::gemma4 {
 
 namespace {
 
-void bind_slot(RawMetalContext& ctx, int ord, std::uint8_t idx, const SlotHandle& s) {
-    if (s.valid()) ctx.arg_bind_ordinal(ord, idx, s);
+void bind_slot(RawMetalContext& ctx, int ord, std::uint8_t idx, const SlotHandle& s,
+               std::size_t offset = 0) {
+    if (s.valid()) ctx.arg_bind_ordinal(ord, idx, s, offset);
+}
+
+/// Where inside a shared activation buffer this dispatch's operand starts.
+///
+/// One case, and it is the PLE table: `PleCombine` writes all
+/// `n_layers * ple_dim` of it once, and every layer's `PleGeglu` consumes its
+/// own `ple_dim`-wide slice. Bound at offset 0 for all of them, all 35 layers
+/// gate on layer 0's slice — which is not a crash, and not even implausible
+/// numbers.
+std::size_t slice_offset(const Dispatch& d, const Gemma4Geometry& g, std::uint8_t bind_index) {
+    constexpr std::size_t kActBytes = 2;  // bf16
+    if (d.kind == Kind::PleGeglu && bind_index == (std::uint8_t)bind::Geglu::Up && d.layer > 0) {
+        return std::size_t(d.layer) * std::size_t(g.per_layer_emb_dim) * kActBytes;
+    }
+    return 0;
 }
 
 }  // namespace
@@ -107,7 +123,8 @@ void bind_gemma4_dag(RawMetalContext& ctx, const BoundGemma4& b, const std::vect
         if (std::size_t(d.ordinal) < scratch.per_dispatch.size()) {
             for (const auto& sb : scratch.per_dispatch[std::size_t(d.ordinal)]) {
                 if (sb.color >= 0 && std::size_t(sb.color) < b.pool.size()) {
-                    bind_slot(ctx, ord, sb.bind_index, b.pool[std::size_t(sb.color)]);
+                    bind_slot(ctx, ord, sb.bind_index, b.pool[std::size_t(sb.color)],
+                              slice_offset(d, g, sb.bind_index));
                 }
             }
         }

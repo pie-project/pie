@@ -51,11 +51,27 @@ struct Gemma4Psos {
     Pso layer_scalar{};
     Pso ple_combine{};
     Pso vnorm{};
+    /// gemma4 scales the gathered embedding (by sqrt(hidden), and sqrt(ple_dim)
+    /// for the per-layer table). The scale must NOT be folded into the weights:
+    /// the LM head reads the very same tied table unscaled.
+    Pso embed_scaled{};
+    /// `per_layer_projection` is K=256, the one projection whose K is not a
+    /// multiple of `affine_qmv_fast`'s 512-wide reduction block.
+    Pso qmv_narrow{};
+    /// Partial rotary over the whole head, which is what gemma4's full-attention
+    /// layers mean by "a quarter of it". See rope.metal.
+    Pso rope_prop{};
+    /// The M>1 counterparts. The prefill path shares this family's semantics,
+    /// not qwen3.5's, so it needs its own pipelines for exactly the two kernels
+    /// whose MEANING differs rather than only their shape.
+    Pso embed_scaled_mb{};
+    Pso rope_prop_mb{};
 
     bool valid() const {
         return sdpa_swa_d256.valid() && sdpa_swa_d512.valid() && geglu_tanh.valid() &&
                logit_softcap.valid() && layer_scalar.valid() && ple_combine.valid() &&
-               vnorm.valid();
+               vnorm.valid() && embed_scaled.valid() && qmv_narrow.valid() &&
+               rope_prop.valid() && embed_scaled_mb.valid() && rope_prop_mb.valid();
     }
 };
 

@@ -84,8 +84,11 @@ std::vector<int> gemma4_run_ends(const std::vector<Dispatch>& dag) {
 /// and those are per ordinal.
 Kernel shared_kind(Kind k) {
     switch (k) {
-        case Kind::EmbedGather:
-        case Kind::PleTokenGather:      return Kernel::EmbedGather;
+        case Kind::EmbedGather:         return Kernel::EmbedGather;
+        // NOT EmbedGather: that key binds `shared_embedding`, and this gathers
+        // the SECOND table. Sharing the key silently read the token embedding
+        // with the PLE table's row pitch, which is 8960 wide against 1536.
+        case Kind::PleTokenGather:      return Kernel::G4PleTokenGather;
         case Kind::QmvQ:                return Kernel::QmvQ;
         case Kind::QmvK:                return Kernel::QmvK;
         case Kind::QmvV:                return Kernel::QmvV;
@@ -137,6 +140,7 @@ Kernel pso_kind(Kind k) {
         case Kind::PostFfnNorm:
         case Kind::PleNorm:
         case Kind::PleProjNorm:      return Kernel::Rms;
+        case Kind::PleTokenGather:   return Kernel::EmbedGather;
         case Kind::PleProjGemv:
         case Kind::PleGateGemv:
         case Kind::PleProjLayerGemv: return Kernel::QmvGate;
@@ -177,10 +181,10 @@ Pso pso_for_mb(const Dispatch& d, const Gemma4Geometry& g, int rows,
     switch (d.kind) {
         case Kind::EmbedGather:
         case Kind::PleTokenGather:
-            return mb.embed_mb;
+            return g4.embed_scaled_mb;
         case Kind::RopeQ:
         case Kind::RopeK:
-            return mb.rope_mb;
+            return g4.rope_prop_mb;
         case Kind::KvAppend:
             return mb.kv_append_paged;
         // Paged, and windowed by the same slot for both attention types -- the
@@ -201,6 +205,15 @@ Pso pso_for(const Dispatch& d, const DecodeStepPsos& base, const Gemma4Psos& g4)
         case Kind::FinalSoftcap: return g4.logit_softcap;
         case Kind::PleCombine:   return g4.ple_combine;
         case Kind::VNorm:        return g4.vnorm;
+        // Both gathers are scaled -- by sqrt(hidden) and sqrt(ple_dim) -- and
+        // the scale cannot be folded into the weights, which the LM head shares.
+        case Kind::EmbedGather:
+        case Kind::PleTokenGather: return g4.embed_scaled;
+        // K=256: `affine_qmv_fast` reduces in 512-wide blocks.
+        case Kind::PleProjLayerGemv: return g4.qmv_narrow;
+        // Partial rotary over the whole head; see rope.metal.
+        case Kind::RopeQ:
+        case Kind::RopeK:        return g4.rope_prop;
         // The one place the attention type picks the pipeline rather than a
         // constant: the two head widths are separate instantiations.
         case Kind::Sdpa:         return d.sliding ? g4.sdpa_swa_d256 : g4.sdpa_swa_d512;
@@ -257,7 +270,7 @@ void launch_shape_mb(const Dispatch& d, const Gemma4Geometry& g, int rows, Grid&
             rms_mb_dispatch(hd, g.n_kv_heads, N, grid, tg);
             return;
         case Kind::PleNorm:
-            rms_mb_dispatch(g.per_layer_emb_dim, 1, N, grid, tg);
+            rms_mb_dispatch(g.hidden, 1, N, grid, tg);
             return;
         case Kind::PleProjNorm:
             rms_mb_dispatch(g.per_layer_emb_dim, g.n_layers, N, grid, tg);
@@ -311,9 +324,15 @@ void launch_shape(const Dispatch& d, const Gemma4Geometry& g, Grid& grid, Thread
     const int hd = L >= 0 ? g.head_dim_of(L) : g.head_dim;
 
     if (const KN kn = qmv_kn(d.kind, g, L); kn.N != 0) {
-        // affine_qmv_fast: 2 simdgroups x 4 rows each, so 8 output rows per group.
-        grid = Grid{1, std::uint32_t((kn.N + 7) / 8), 1};
-        tg = Threadgroup{64, 1, 1};
+        // The shared `qmv_dispatch`, deliberately, rather than a second answer:
+        // `affine_qmv_fast` is 2 simdgroups of 4 rows each and reduces K with
+        // `simd_sum`, so it needs tg {32,2,1} against a grid of TOTAL THREADS.
+        // Stating it as "one threadgroup per 8 output rows" -- grid {1,N/8,1},
+        // tg {64,1,1} -- gives every threadgroup exactly one thread: `simd_gid`
+        // is always 0, so rows 4..7 of every 8 are never written, and `simd_lid`
+        // is always 0, so the reduction covers 1/32 of K. That is the defect
+        // behind "half the vocabulary is exactly zero".
+        qmv_dispatch(kn.N, grid, tg);
         return;
     }
 
@@ -343,16 +362,26 @@ void launch_shape(const Dispatch& d, const Gemma4Geometry& g, Grid& grid, Thread
             tg = Threadgroup{std::uint32_t(threads), 1, 1};
             return;
         }
-        case Kind::PleNorm: case Kind::PleProjNorm: {
+        // `post_per_layer_input_norm` is hidden-wide and runs once; only
+        // `per_layer_projection_norm` is the ple_dim-wide one, over n_layers rows.
+        case Kind::PleNorm: {
+            const int threads = (g.hidden + 3) / 4;
+            grid = Grid{std::uint32_t(threads), 1, 1};
+            tg = Threadgroup{std::uint32_t(threads), 1, 1};
+            return;
+        }
+        case Kind::PleProjNorm: {
             const int threads = (g.per_layer_emb_dim + 3) / 4;
-            const int rows = d.kind == Kind::PleProjNorm ? g.n_layers : 1;
-            grid = Grid{std::uint32_t(threads) * std::uint32_t(rows), 1, 1};
+            grid = Grid{std::uint32_t(threads) * std::uint32_t(g.n_layers), 1, 1};
             tg = Threadgroup{std::uint32_t(threads), 1, 1};
             return;
         }
         case Kind::VNorm:
             vnorm_dispatch(g.n_kv_heads, hd, grid, tg);
             return;
+        // `rope_neox_prop_decode` takes the ROTATED PAIR COUNT as grid.x and
+        // reads the pair offset off head_dim, so a full-attention layer rotates
+        // 64 pairs of a 512-wide head rather than 64 pairs of a 128-wide prefix.
         case Kind::RopeQ:
             grid = Grid{std::uint32_t(g.rotary_dims_of(L) / 2), std::uint32_t(g.n_q_heads), 1};
             tg = Threadgroup{std::uint32_t(g.rotary_dims_of(L) / 2), 1, 1};
