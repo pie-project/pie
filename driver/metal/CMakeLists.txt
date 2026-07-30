@@ -138,6 +138,22 @@ target_compile_options(pie_driver_metal_lib PRIVATE
   $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Wno-unused-parameter>
   $<$<COMPILE_LANGUAGE:OBJCXX>:-Wall -Wextra -Wno-unused-parameter>)
 
+# `-Werror=switch` on forward.cpp alone.
+#
+# `MetalExecutor::setup` switches on the model family with no `default:`, so
+# adding a family without teaching the executor about it must not compile. It
+# was a plain warning first, and a warning is exactly what a gpt-oss checkpoint
+# fell through: it matched no case, ran on past the switch, and was set up as
+# qwen3.5 -- surfacing as "unstaged weight shared_embedding.weight", a tensor
+# belonging to a different family entirely.
+#
+# Scoped to this file rather than the target: the switches over the shared
+# `Kernel` enum are legitimately partial (a family handles its own kinds and
+# falls through for the rest), and making those an error would only buy a
+# forest of `default:` labels that turn the check back off.
+set_source_files_properties(src/batch/forward.cpp
+  PROPERTIES COMPILE_OPTIONS "-Werror=switch")
+
 # Compiled-in fallback for the native .metal kernel sources (runtime PSO
 # compilation). Overridable at run time via PIE_METAL_KERNELS_DIR. PUBLIC so
 # every target linking pie_driver_metal_lib (e.g. ptir_checkpoint_e2e_test,

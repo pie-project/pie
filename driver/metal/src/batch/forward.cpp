@@ -2203,6 +2203,16 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
         }
         return false;
     }
+    case model::ModelFamily::GptOss:
+        if (err != nullptr) {
+            // Same gap as gemma4's, and stated without a shape: `SetupConfig`
+            // carries no gpt-oss facts, so this cannot honestly report a
+            // dispatch count for THIS checkpoint the way the gemma4 arm does.
+            *err = "Metal computes gpt-oss (24 layers of sparse MoE, decode "
+                   "verified against mlx-lm) but MetalExecutor::Impl is still "
+                   "qwen3.5-shaped, so there is nothing to run it through";
+        }
+        return false;
     case model::ModelFamily::Unknown:
         if (err != nullptr) {
             *err = "Metal has no model family for config '" + cfg.arch_name +
