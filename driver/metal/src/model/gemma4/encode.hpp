@@ -30,6 +30,11 @@ Pso pso_for(const Dispatch& d, const DecodeStepPsos& base, const Gemma4Psos& g4)
 /// Its grid and threadgroup, from the geometry and this dispatch's layer.
 void launch_shape(const Dispatch& d, const Gemma4Geometry& g, Grid& grid, Threadgroup& tg);
 
+/// The same, for a batch of `rows` tokens. At rows==1 it must agree with
+/// `launch_shape` exactly -- one path, checked, rather than two that drift.
+void launch_shape_mb(const Dispatch& d, const Gemma4Geometry& g, int rows, Grid& grid,
+                     Threadgroup& tg);
+
 /// `run_ends[i]`: the last ordinal of the concurrency run containing `i`. What
 /// the colourer needs to know about which barriers the encoder will drop.
 std::vector<int> gemma4_run_ends(const std::vector<Dispatch>& dag);

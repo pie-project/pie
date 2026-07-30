@@ -16,6 +16,8 @@
 
 #include "encode.hpp"
 
+#include "../qwen3_5/decode_dispatch_mb.hpp"
+
 #include "../../batch/decode_abi.hpp"
 #include "decode_consts.hpp"
 
@@ -156,6 +158,104 @@ Pso pso_for(const Dispatch& d, const DecodeStepPsos& base, const Gemma4Psos& g4)
         // constant: the two head widths are separate instantiations.
         case Kind::Sdpa:         return d.sliding ? g4.sdpa_swa_d256 : g4.sdpa_swa_d512;
         default:                 return base[pso_kind(d.kind)];
+    }
+}
+
+/// The M>1 (prefill) launch shape for a gemma4 dispatch.
+///
+/// Every kernel gemma4 needs at M>1 already exists: the shared ones in
+/// qwen3.5's `decode_dispatch_mb.hpp`, and gemma4's own five, which carry no row
+/// structure and widen by counting M*width. So this is a shape function, not a
+/// second set of kernels -- the arithmetic is the same one the decode path runs.
+///
+/// `rows` is the token count in the batch. At rows==1 each case reduces to
+/// `launch_shape`'s, which the test asserts rather than assuming.
+void launch_shape_mb(const Dispatch& d, const Gemma4Geometry& g, int rows, Grid& grid,
+                     Threadgroup& tg) {
+    const int L = d.layer;
+    const int hd = L >= 0 ? g.head_dim_of(L) : g.head_dim;
+    const int N = rows < 1 ? 1 : rows;
+
+    // The projections become matmuls. Tiling is chosen by the shared selectors,
+    // so gemma4 gets whatever qwen3.5's prefill measured its way to.
+    if (const KN kn = qmv_kn(d.kind, g, L); kn.N != 0) {
+        const int bm = qmm_bm(N);
+        const int bn = qmm_bn(kn.N, N);
+        const int split = bn > 0 ? qmm_split_k(kn.N, N, kn.K, bm) : 0;
+        if (split > 1) {
+            qmm_t_splitk_dispatch(kn.N, N, bm, split, grid, tg);
+        } else if (bn > 0) {
+            qmm_t_dispatch(kn.N, N, bn, bm, grid, tg);
+        } else {
+            qmv_mb_dispatch(kn.N, N, grid, tg);
+        }
+        return;
+    }
+
+    switch (d.kind) {
+        case Kind::EmbedGather:
+            embed_mb_dispatch(g.hidden, N, grid, tg);
+            return;
+        case Kind::PleTokenGather:
+            embed_mb_dispatch(g.n_layers * g.per_layer_emb_dim, N, grid, tg);
+            return;
+        case Kind::AttnNorm: case Kind::PostAttnNorm: case Kind::FfnNorm:
+        case Kind::PostFfnNorm: case Kind::FinalRms:
+            rms_mb_dispatch(g.hidden, 1, N, grid, tg);
+            return;
+        case Kind::QNorm:
+            rms_mb_dispatch(hd, g.n_q_heads, N, grid, tg);
+            return;
+        case Kind::KNorm:
+            rms_mb_dispatch(hd, g.n_kv_heads, N, grid, tg);
+            return;
+        case Kind::PleNorm:
+            rms_mb_dispatch(g.per_layer_emb_dim, 1, N, grid, tg);
+            return;
+        case Kind::PleProjNorm:
+            rms_mb_dispatch(g.per_layer_emb_dim, g.n_layers, N, grid, tg);
+            return;
+        case Kind::VNorm:
+            rms_mb_dispatch(hd, g.n_kv_heads, N, grid, tg);
+            return;
+        case Kind::RopeQ:
+            rope_mb_dispatch(g.rotary_dims_of(L), g.n_q_heads, N, grid, tg);
+            return;
+        case Kind::RopeK:
+            rope_mb_dispatch(g.rotary_dims_of(L), g.n_kv_heads, N, grid, tg);
+            return;
+        case Kind::KvAppend:
+            kv_append_mb_dispatch(hd, g.n_kv_heads, N, grid, tg);
+            return;
+        case Kind::Sdpa:
+            sdpa_sliding_dispatch(g.n_q_heads, grid, tg, N);
+            return;
+        case Kind::AttnResidual: case Kind::FfnResidual: case Kind::PleResidual:
+        case Kind::LayerScalar:
+            elementwise_mb_dispatch(g.hidden, N, grid, tg);
+            return;
+        case Kind::GegluTanh:
+            elementwise_mb_dispatch(L >= 0 ? g.intermediate_of(L) : g.intermediate, N, grid, tg);
+            return;
+        case Kind::PleGeglu:
+            elementwise_mb_dispatch(g.per_layer_emb_dim, N, grid, tg);
+            return;
+        case Kind::PleCombine:
+            elementwise_mb_dispatch(g.n_layers * g.per_layer_emb_dim, N, grid, tg);
+            return;
+        case Kind::FinalSoftcap:
+            // Only the sampled row is capped, so this stays one row wide even at
+            // M>1 -- capping the whole prefill would be M*vocab of wasted tanh.
+            elementwise_dispatch(g.vocab, grid, tg);
+            return;
+        case Kind::Argmax:
+            grid = Grid{1024, 1, 1};
+            tg = Threadgroup{1024, 1, 1};
+            return;
+        default:
+            grid = Grid{1, 1, 1};
+            tg = Threadgroup{1, 1, 1};
+            return;
     }
 }
 

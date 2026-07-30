@@ -16,6 +16,7 @@
 
 #include "model/gemma4/decode_step.hpp"
 #include "model/gemma4/encode.hpp"
+#include "model/gemma4/decode_consts.hpp"
 #include "model/gemma4/geometry.hpp"
 #include "model/gemma4/kernels.hpp"
 #include "decode_psos.hpp"
@@ -104,6 +105,41 @@ int main(int argc, char** argv) {
             expect(missing == 0, "every dispatch resolves to a compiled pipeline");
             expect(oversized == 0, "no threadgroup exceeds what this device allows");
             expect(empty_grid == 0, "no dispatch has an empty grid");
+
+            // The same dispatches at M>1. A shape may legitimately differ from
+            // decode's only where the KERNEL differs -- the projections, which
+            // are a matvec at M=1 and a matmul at M>1. Anywhere else a
+            // difference means prefill and decode are two implementations of one
+            // thing, so the set of differing kinds is asserted, not the count.
+            std::printf("[M>1 launch shapes]\n");
+            int mb_empty = 0, mb_oversized = 0, unexpected_diff = 0, proj_same = 0;
+            for (int rows : {1, 2, 17, 128}) {
+                for (const auto& d : dag) {
+                    pie::metal::Grid mg{}; pie::metal::Threadgroup mt{};
+                    pie::metal::gemma4::launch_shape_mb(d, g, rows, mg, mt);
+                    if (mg.x == 0 || mg.y == 0 || mg.z == 0) ++mb_empty;
+                    const pie::metal::Pso p = pie::metal::gemma4::pso_for(d, base, psos);
+                    const std::uint32_t threads = mt.x * mt.y * mt.z;
+                    if (p.valid() && threads > ctx->pso_max_threads(p)) ++mb_oversized;
+                    if (rows != 1) continue;
+                    pie::metal::Grid dg{}; pie::metal::Threadgroup dt{};
+                    pie::metal::gemma4::launch_shape(d, g, dg, dt);
+                    const bool same = mg.x == dg.x && mg.y == dg.y && mg.z == dg.z &&
+                                      mt.x == dt.x && mt.y == dt.y && mt.z == dt.z;
+                    const bool is_proj =
+                        pie::metal::gemma4::qmv_kn(d.kind, g, d.layer).N != 0;
+                    if (!same && !is_proj) ++unexpected_diff;
+                    if (same && is_proj) ++proj_same;
+                }
+            }
+            expect(mb_empty == 0, "no M>1 dispatch has an empty grid");
+            expect(mb_oversized == 0, "no M>1 threadgroup exceeds what this device allows");
+            expect(unexpected_diff == 0,
+                   "at rows==1 only the projections differ from decode (" +
+                       std::to_string(unexpected_diff) + " others do)");
+            expect(proj_same == 0,
+                   "and the projections really do differ, so a matmul PSO is required "
+                   "for them at M>1");
         }
     }
 
