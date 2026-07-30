@@ -14,7 +14,11 @@
 #include <cstdlib>
 #include <string>
 
+#include "model/gemma4/decode_step.hpp"
+#include "model/gemma4/encode.hpp"
+#include "model/gemma4/geometry.hpp"
 #include "model/gemma4/kernels.hpp"
+#include "decode_psos.hpp"
 #include "mtl4_context.hpp"
 
 using pie::metal::RawMetalContext;
@@ -59,6 +63,48 @@ int main(int argc, char** argv) {
         expect(psos.ple_combine.valid(), "ple_combine (per-layer embeddings)");
         expect(psos.vnorm.valid(), "vnorm_single_row (weightless V-norm)");
         expect(psos.valid(), "the table reports itself complete");
+    }
+
+    // Every dispatch in the step has to resolve to a pipeline that exists and a
+    // grid the hardware will accept. `pso_max_threads` is 832 on an M1 Max, and
+    // exceeding it is NOT an error — it silently computes something else.
+    if (built) {
+        std::printf("[whole step resolves]\n");
+        pie::metal::DecodeStepPsos base;
+        std::string base_err;
+        const bool base_ok = pie::metal::load_decode_psos(*ctx, kernels_dir, base,
+                                                          /*with_argmax=*/true, &base_err);
+        expect(base_ok, "the shared decode PSOs compile: " + (base_ok ? std::string("ok")
+                                                                     : base_err));
+        if (base_ok) {
+            const pie::metal::gemma4::Gemma4Geometry g;
+            const auto dag = pie::metal::gemma4::build_gemma4_dag(g);
+            int missing = 0, oversized = 0, empty_grid = 0;
+            std::uint32_t worst_cap = 0;
+            for (const auto& d : dag) {
+                const auto pso = pie::metal::gemma4::pso_for(d, base, psos);
+                if (!pso.valid()) {
+                    ++missing;
+                    continue;
+                }
+                pie::metal::Grid grid;
+                pie::metal::Threadgroup tg;
+                pie::metal::gemma4::launch_shape(d, g, grid, tg);
+                const std::uint32_t threads = tg.x * tg.y * tg.z;
+                // Per PIPELINE, not per device: the cap depends on the kernel's
+                // register use, and exceeding it is not an error — it silently
+                // computes something else.
+                const std::uint32_t cap = ctx->pso_max_threads(pso);
+                if (cap > worst_cap) worst_cap = cap;
+                if (threads == 0 || threads > cap) ++oversized;
+                if (grid.x == 0 || grid.y == 0 || grid.z == 0) ++empty_grid;
+            }
+            std::printf("  (%zu dispatches, widest pipeline allows %u threads)\n", dag.size(),
+                        worst_cap);
+            expect(missing == 0, "every dispatch resolves to a compiled pipeline");
+            expect(oversized == 0, "no threadgroup exceeds what this device allows");
+            expect(empty_grid == 0, "no dispatch has an empty grid");
+        }
     }
 
     std::printf("\n==== gemma4_pso_test: %s ====\n", g_failures == 0 ? "all passed" : "FAILURES");
