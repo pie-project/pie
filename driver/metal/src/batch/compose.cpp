@@ -9,6 +9,7 @@ namespace pie::metal::batch {
 namespace {
 
 constexpr std::uint8_t kRsFlagFold = 2;
+constexpr std::uint8_t kRsFlagBufferWrite = 4;
 constexpr std::uint8_t kRsFlagFoldLenDevice = 8;
 constexpr std::uint8_t kRsFlagReset = 1;
 
@@ -94,6 +95,29 @@ pie_native::LaunchView build_launch_view(const pie_native::StepLaunch& launch) {
         throw std::runtime_error(
             "this driver cannot address a buffer whose first live token is "
             "mid-page; fold whole pages only");
+    }
+    // A fold boundary landing strictly INSIDE a fire's own new tokens needs
+    // the 2R-segment two-call shape: the row is cut at the boundary, the head
+    // persists the state there and the tail continues from it without moving
+    // it again. This driver issues one call per fire and would fold the whole
+    // row, leaving the host believing tokens are still buffered that the
+    // device has already absorbed -- a double fold on the next fire.
+    if (launch.rs_fold_lens.len != 0 &&
+        launch.rs_slot_flags.len == launch.rs_fold_lens.len &&
+        launch.qo_indptr.len == launch.rs_fold_lens.len + 1) {
+        for (std::size_t r = 0; r < launch.rs_fold_lens.len; ++r) {
+            if ((launch.rs_slot_flags.ptr[r] & kRsFlagBufferWrite) == 0) continue;
+            const std::uint32_t n = launch.rs_fold_lens.ptr[r];
+            // Reads are refused above, so the extended row IS the fire's own
+            // tokens and the boundary is directly comparable to their count.
+            const std::uint32_t rows =
+                launch.qo_indptr.ptr[r + 1] - launch.qo_indptr.ptr[r];
+            if (n != 0 && n < rows) {
+                throw std::runtime_error(
+                    "this driver cannot land a fold boundary inside a fire's "
+                    "own tokens; fold the whole row or none of it");
+            }
+        }
     }
     // And likewise for a MIXED fire, where one row folds its recurrence while
     // another only buffers. The two shapes are the same dispatch and differ

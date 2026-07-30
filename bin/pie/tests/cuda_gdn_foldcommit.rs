@@ -257,3 +257,33 @@ async fn the_fold_length_can_live_on_device() -> Result<()> {
     eprintln!("[gdn-foldcommit] {result}");
     Ok(())
 }
+
+/// The fold boundary lands STRICTLY INSIDE the fire's own new tokens.
+///
+/// `b < n < b + t` — the last RS position the planner refused, and the blocker
+/// for a single-fire speculative verify+commit. `commit_len` cannot express
+/// it: every kernel implements it as `if (c < Nr) Nr = c`, which TRUNCATES the
+/// sequence, so the tokens past the boundary get no outputs at all. The driver
+/// cuts the row into two segments and runs the recurrence twice on one stream
+/// instead — the head persisting its end-of-sequence state onto the boundary,
+/// the tail continuing from that state to produce the rest.
+///
+/// Both halves of that are pinned, because either can fail alone: the tail's
+/// OUTPUTS must match a reference that computed them in a separate fire, and
+/// the STATE the boundary left behind must match too. Arm C folds all four
+/// tokens instead of two and must disagree, or an implementation that ignored
+/// the boundary entirely would pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a GPU + Qwen3.5-0.8B (GDN backbone) in the HF cache"]
+async fn the_fold_boundary_can_land_inside_a_fires_own_tokens() -> Result<()> {
+    let result = run_foldcommit("interior")
+        .await?
+        .map_err(|error| anyhow::anyhow!("interior fold boundary failed: {error}"))?;
+    anyhow::ensure!(
+        result.contains("agree=yes"),
+        "a fold landing inside a fire's own tokens must still produce every \
+         token's outputs AND leave the boundary where it was asked: {result}"
+    );
+    eprintln!("[gdn-foldcommit] {result}");
+    Ok(())
+}

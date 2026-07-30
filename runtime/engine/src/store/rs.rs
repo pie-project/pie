@@ -59,7 +59,9 @@ use std::collections::HashMap;
 
 use crate::store::genmap::{GenKey, GenMap};
 use crate::store::pool::{Pool, PoolId};
-use write::{RsBufferIntent, RsBufferTarget, RsPreparedWrite, RsPublished, RsStateTarget};
+use write::{
+    RsBufferIntent, RsBufferTarget, RsPendingFolds, RsPreparedWrite, RsPublished, RsStateTarget,
+};
 
 /// Marker for RS WorkingSet ids.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -673,7 +675,9 @@ impl RsStore {
     /// boundary, release displaced slots. Physical content arrives later on
     /// the same pipeline stream; only pool retirement waits for the device.
     pub fn publish_prepared(&mut self, prepared: RsPreparedWrite) -> Result<RsPublished, RsError> {
-        self.publish_batch(vec![prepared])
+        let (published, folds) = self.publish_batch(vec![prepared])?;
+        self.commit_folds(folds);
+        Ok(published)
     }
 
     /// Atomically publish every recurrent-state row of one forward fire.
@@ -684,7 +688,7 @@ impl RsStore {
     pub fn publish_batch(
         &mut self,
         prepared: Vec<RsPreparedWrite>,
-    ) -> Result<RsPublished, RsError> {
+    ) -> Result<(RsPublished, RsPendingFolds), RsError> {
         let validation = (|| {
             let mut seen = Vec::with_capacity(prepared.len());
             for write in &prepared {
@@ -706,13 +710,48 @@ impl RsStore {
             .map(RsPreparedWrite::seq)
             .max()
             .unwrap_or(self.seq);
+        let mut folds = RsPendingFolds::default();
         for write in prepared {
-            self.publish_prevalidated(write);
+            self.publish_prevalidated(write, &mut folds);
         }
-        Ok(RsPublished::new(seq, rows))
+        Ok((RsPublished::new(seq, rows), folds))
     }
 
-    fn publish_prevalidated(&mut self, prepared: RsPreparedWrite) {
+    /// Apply the fold advances a `publish_batch` deferred.
+    ///
+    /// The fold is deferred, and MUST be, because the wire arrays describe the
+    /// buffer as this fire's own rows are laid out: extended row `j` is
+    /// physical `buffer_head + j`. Advancing the boundary first would report a
+    /// head — and a page list — from AFTER the fold to a fire whose rows were
+    /// built before it, which is only invisible when the fold either moves
+    /// nothing or empties the buffer (the two cases that existed before the
+    /// interior boundary). An interior fold is neither.
+    pub fn commit_folds(&mut self, folds: RsPendingFolds) {
+        let epoch = self.seq;
+        for (ws, tokens, is_bound) in folds.0 {
+            if is_bound {
+                // `tokens` is only an upper bound here. Advancing by it would
+                // drop pages the fold may still need; advancing by less would
+                // leave the host thinking tokens are live that the fold has
+                // already absorbed, and the next fire would replay them — a
+                // double fold. Neither is recoverable, so the boundary simply
+                // stops being a host-side number: retain every page, keep
+                // `buffer_fill` as the bound it now is, and refuse to state an
+                // exact occupancy until `free_buffer` settles it.
+                if let Ok(entry) = self.entry_mut(ws) {
+                    entry.buffer_fill_is_bound = true;
+                }
+            } else {
+                self.advance_fold(ws, tokens, epoch);
+            }
+        }
+    }
+
+    fn publish_prevalidated(
+        &mut self,
+        prepared: RsPreparedWrite,
+        folds: &mut RsPendingFolds,
+    ) {
         let ws = prepared.ws;
         // Displaced slots are recycled against the current submission
         // sequence; `retire_idle` is what actually hands them back, and it
@@ -765,20 +804,7 @@ impl RsStore {
             .as_ref()
             .and_then(|state| state.fold_tokens)
         {
-            if prepared.fold_len_is_bound {
-                // `tokens` is only an upper bound here. Advancing by it would
-                // drop pages the fold may still need; advancing by less would
-                // leave the host thinking tokens are live that the fold has
-                // already absorbed, and the next fire would replay them — a
-                // double fold. Neither is recoverable, so the boundary simply
-                // stops being a host-side number: retain every page, keep
-                // `buffer_fill` as the bound it now is, and refuse to state an
-                // exact occupancy until `free_buffer` settles it.
-                let entry = self.entry_mut(ws).expect("batch prevalidated");
-                entry.buffer_fill_is_bound = true;
-            } else {
-                self.advance_fold(ws, tokens, epoch);
-            }
+            folds.0.push((ws, tokens, prepared.fold_len_is_bound));
         }
     }
 

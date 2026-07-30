@@ -65,7 +65,7 @@ impl Arm {
             max_pages,
             pos: 0,
         };
-        let g0 = arm.fire(prompt, None, pipe, "prefill").await?;
+        let (g0, _) = arm.fire(prompt, None, pipe, "prefill").await?;
         arm.pos = prompt.len() as u32;
         Ok((arm, g0.unwrap_or(0)))
     }
@@ -138,7 +138,7 @@ impl Arm {
         buffered: Option<(u32, u32)>,
         pipe: &Pipeline,
         tag: &str,
-    ) -> Result<Option<i32>> {
+    ) -> Result<(Option<i32>, f32)> {
         let t = toks.len() as u32;
         let base = self.pos;
         let end = base + t;
@@ -172,9 +172,17 @@ impl Arm {
             }
         }
         let out = Channel::new([1], dtype::i32).named("arm_out");
+        let peak = Channel::new([1], dtype::f32).named("arm_peak");
         let sink = out.clone();
+        let peak_sink = peak.clone();
         fwd.epilogue(move || {
-            sink.put(&reduce_argmax(&intrinsics::logits()));
+            let logits = intrinsics::logits();
+            sink.put(&reduce_argmax(&logits));
+            // The greedy token is far too coarse to witness a state
+            // difference on this model -- it has strong attractors and two
+            // genuinely different states routinely pick the same argmax --
+            // whereas the peak logit VALUE moves with the state continuously.
+            peak_sink.put(&reduce_max(&logits));
         });
         fwd.submit(pipe)
             .map_err(|e| format!("{tag} submit: {e}"))?;
@@ -183,7 +191,12 @@ impl Arm {
             .get::<i32>()
             .await
             .map_err(|e| format!("{tag} take: {e}"))?[0];
-        Ok(Some(token))
+        let peak_v = peak
+            .take()
+            .get::<f32>()
+            .await
+            .map_err(|e| format!("{tag} peak take: {e}"))?[0];
+        Ok((Some(token), peak_v))
     }
 }
 
@@ -515,6 +528,7 @@ async fn fold_inside_new_tokens(prompt: &[u32]) -> Result<String> {
             "A-append-and-fold",
         )
         .await?
+        .0
         .unwrap_or(0);
     a.pos += HALF;
 
@@ -524,6 +538,7 @@ async fn fold_inside_new_tokens(prompt: &[u32]) -> Result<String> {
     let b_last = b
         .fire(&cont[HALF as usize..], None, &pipe, "B-fold-2")
         .await?
+        .0
         .unwrap_or(0);
     b.pos += HALF;
 
@@ -531,8 +546,8 @@ async fn fold_inside_new_tokens(prompt: &[u32]) -> Result<String> {
     // token further. If arm A's fold had missed the buffered pair (or replayed
     // it twice) this is where it shows.
     let next = vec![b_last as u32];
-    let a_next = a.fire(&next, None, &pipe, "A-next").await?.unwrap_or(0);
-    let b_next = b.fire(&next, None, &pipe, "B-next").await?.unwrap_or(0);
+    let a_next = a.fire(&next, None, &pipe, "A-next").await?.0.unwrap_or(0);
+    let b_next = b.fire(&next, None, &pipe, "B-next").await?.0.unwrap_or(0);
 
     pipe.close();
 
@@ -544,6 +559,152 @@ async fn fold_inside_new_tokens(prompt: &[u32]) -> Result<String> {
     );
     eprintln!("[GDN_FOLDCOMMIT] {result}");
     if !agree {
+        return Err(result);
+    }
+    Ok(result)
+}
+
+/// The fold boundary lands STRICTLY INSIDE the fire's own new tokens.
+///
+/// `b < n < b + t` — the last RS position the planner refused. `commit_len`
+/// cannot express it: the kernels implement it as `if (c < Nr) Nr = c`, which
+/// TRUNCATES the sequence, so the tokens past the boundary would get no
+/// outputs at all. The driver cuts the row into two segments instead and runs
+/// the recurrence twice on one stream — the head persisting its
+/// end-of-sequence state onto the boundary, the tail continuing from that
+/// state to produce the remaining outputs without moving it again.
+///
+/// The test pins BOTH halves of that claim, because either can fail alone:
+///
+///  * **the outputs past the boundary are still correct.** Arm A runs all four
+///    continuation tokens in ONE fire folding only the first two. Arm B runs
+///    the same four as a two-token in-forward fold followed by a two-token
+///    pure append. Their LAST token is the same token at the same position
+///    continuing from the same folded state, so its peak logit must match. A
+///    truncating implementation produces nothing here; one that folded the
+///    whole row produces the wrong thing.
+///
+///  * **the boundary landed on token 2, not token 4.** Both arms then drain
+///    their buffer with a fold-everything fire and probe one token further,
+///    which pins the STATE rather than the logits along the way. Arm C folds
+///    all four in its single fire — the boundary at the END — and must
+///    DISAGREE, or the equivalence is vacuous and an implementation that
+///    ignored `n` entirely would pass.
+async fn fold_interior_boundary(prompt: &[u32]) -> Result<String> {
+    const T: usize = 4;
+    const HALF: u32 = 2;
+
+    let n = prompt.len() as u32;
+    let pipe = Pipeline::new();
+    let probe = WorkingSet::new();
+    let max_pages = (n + 2 * T as u32 + 2).div_ceil(probe.page_size());
+    drop(probe);
+
+    let (mut a, g0) = Arm::open(prompt, max_pages, &pipe).await?;
+    let (mut b, g0b) = Arm::open(prompt, max_pages, &pipe).await?;
+    let (mut c, g0c) = Arm::open(prompt, max_pages, &pipe).await?;
+    let (mut d, _) = Arm::open(prompt, max_pages, &pipe).await?;
+    if g0 != g0b || g0 != g0c {
+        return Err(format!(
+            "arms disagree on the prefill token: {g0} vs {g0b} vs {g0c}"
+        ));
+    }
+    let cont: Vec<u32> = vec![g0 as u32; T];
+    let slabs = (T as u32 + 1).div_ceil(a.rs_page).max(1);
+
+    // ── Arm A: ONE fire over four tokens, folding only the first two ──────
+    a.rs.alloc_buffer(slabs)
+        .map_err(|e| format!("A alloc_buffer: {e}"))?;
+    let (_, a_inside) = a
+        .fire(&cont, Some((0, HALF)), &pipe, "A-fold-inside")
+        .await?;
+    a.pos += T as u32;
+
+    // ── Arm C: the SAME fire, boundary one token earlier ──────────────────
+    // A different interior cut. `fold(n)` is a no-op for every legal n, so C
+    // must converge on A: the boundary may land anywhere inside the fire's
+    // own tokens without changing what the context means.
+    c.rs.alloc_buffer(slabs)
+        .map_err(|e| format!("C alloc_buffer: {e}"))?;
+    let (_, c_inside) = c.fire(&cont, Some((0, 1)), &pipe, "C-fold-one").await?;
+    c.pos += T as u32;
+
+    // ── Arm B: two folded, then two appended — the reference ──────────────
+    b.fire(&cont[..HALF as usize], None, &pipe, "B-fold").await?;
+    b.pos += HALF;
+    b.rs.alloc_buffer(slabs)
+        .map_err(|e| format!("B alloc_buffer: {e}"))?;
+    let (_, b_inside) = b
+        .fire(&cont[HALF as usize..], Some((0, 0)), &pipe, "B-append")
+        .await?;
+    b.pos += HALF;
+
+    // ── Arm D: A's exact STORE state reached the trusted way ─────────────
+    // Buffer all four with the boundary held still, then move it two forward
+    // with an ordinary commit. D ends with the same `fill=4, head=2` A does,
+    // but never uses the split. It separates "the split is wrong" from "a
+    // buffer holding its already-folded prefix behaves differently from one
+    // that never held it" -- which is what arm B would otherwise conflate.
+    d.rs.alloc_buffer(slabs)
+        .map_err(|e| format!("D alloc_buffer: {e}"))?;
+    d.fire(&cont, Some((0, 0)), &pipe, "D-append").await?;
+    d.pos += T as u32;
+    // An ordinary COMMIT moves the boundary two tokens into an ALREADY
+    // buffered span. Its own token is a placeholder at a position the drain
+    // fire immediately overwrites; the recurrence ignores those rows and
+    // replays the buffer instead.
+    d.build_fire(&[g0 as u32], Some(&Channel::from(vec![HALF])), "D-commit", || {})?
+        .submit(&pipe)
+        .map_err(|e| format!("D-commit submit: {e}"))?;
+
+    // Drain: fold whatever is still buffered, then free the slabs so the
+    // probe below is a plain in-forward fold on both arms.
+    let next = vec![g0 as u32];
+    let mut peaks = Vec::new();
+    for (arm, tag) in [(&mut a, "A"), (&mut b, "B"), (&mut c, "C"), (&mut d, "D")] {
+        // `u32::MAX` is the fire-invariant "fold everything" — it is clamped
+        // to this row's own `b + t`, which only the runtime knows.
+        arm.fire(&next, Some((0, u32::MAX)), &pipe, tag).await?;
+        arm.pos += 1;
+        let live = arm.rs.buffer_size();
+        if live > 0 {
+            arm.rs
+                .free_buffer(&(0..live).collect::<Vec<_>>())
+                .map_err(|e| format!("{tag} free_buffer: {e}"))?;
+        }
+        let (_, peak) = arm.fire(&next, None, &pipe, tag).await?;
+        arm.pos += 1;
+        peaks.push(peak);
+    }
+    let (a_next, b_next, c_next, d_next) = (peaks[0], peaks[1], peaks[2], peaks[3]);
+
+    pipe.close();
+
+    // The tail's outputs, and then the state the boundary left behind.
+    //
+    // There is deliberately NO "different fold lands a different state"
+    // control here, unlike the other arms. Folding IS a no-op: every legal
+    // boundary has to converge, so any arm that disagreed would be evidence
+    // against the model rather than for the test. What gives these assertions
+    // teeth is that they caught a real defect — the wire's `buffer_head` was
+    // sampled AFTER the fold advance, so a fire whose rows straddle the
+    // boundary was handed a head from the other side of it. Before the fix A
+    // read `a_next=17.2500` against `b_next=16.8750`, and D — which reaches
+    // A's exact store state by a path that predates the split — was wrong too.
+    let outputs_agree = close(a_inside, b_inside) && close(a_inside, c_inside);
+    let states_agree =
+        close(a_next, d_next) && close(a_next, b_next) && close(a_next, c_next);
+    let ok = outputs_agree && states_agree;
+    let result = format!(
+        "interior tokens={T} fold={HALF} a_inside={a_inside:.4} b_inside={b_inside:.4} \
+         c_inside={c_inside:.4} a_next={a_next:.4} b_next={b_next:.4} \
+         c_next={c_next:.4} d_next={d_next:.4} outputs={} states={} agree={}",
+        if outputs_agree { "ok" } else { "BAD" },
+        if states_agree { "ok" } else { "BAD" },
+        if ok { "yes" } else { "no" }
+    );
+    eprintln!("[GDN_FOLDCOMMIT] {result}");
+    if !ok {
         return Err(result);
     }
     Ok(result)
@@ -585,7 +746,18 @@ async fn device_fold_length(prompt: &[u32]) -> Result<String> {
     if g0 != g0b {
         return Err(format!("arms disagree on the prefill token: {g0} vs {g0b}"));
     }
-    let window: Vec<u32> = vec![g0 as u32; W as usize];
+    // DISTINCT tokens, unlike the other arms' repeated `g0`. The negative
+    // control below turns on folding `expected` tokens versus `other` leaving
+    // materially different contexts, and `free_buffer` discards whatever the
+    // fold did not absorb -- so a window of four identical tokens makes the
+    // difference between folding one of them and two nearly unobservable.
+    let mut window: Vec<u32> = wit_model::encode("alpha beta gamma delta")
+        .into_iter()
+        .take(W as usize)
+        .collect();
+    while window.len() < W as usize {
+        window.push(g0 as u32 + window.len() as u32);
+    }
 
     for arm in [&a, &b, &c] {
         arm.rs
@@ -638,7 +810,9 @@ async fn device_fold_length(prompt: &[u32]) -> Result<String> {
         .await
         .map_err(|e| format!("raw take: {e}"))?[0];
     let expected = 1 + (argmax.rem_euclid(W as i32)) as u32;
-    let other = if expected == W { 1 } else { expected + 1 };
+    // As far from `expected` as the window allows: the control has to be a
+    // clearly different context, not an adjacent one.
+    let other = if expected == 1 { W } else { 1 };
 
     for arm in [&mut a, &mut b, &mut c] {
         arm.pos += W;
@@ -669,23 +843,27 @@ async fn device_fold_length(prompt: &[u32]) -> Result<String> {
 
     // ── 3. PROBE: one token past the commit pins the folded STATE ──────────
     let next = vec![g0 as u32];
-    let a_next = a.fire(&next, None, &pipe, "A-next").await?.unwrap_or(0);
-    let b_next = b.fire(&next, None, &pipe, "B-next").await?.unwrap_or(0);
-    let c_next = c.fire(&next, None, &pipe, "C-next").await?.unwrap_or(0);
+    // PEAK LOGITS, not greedy tokens. The argmax is far too coarse to witness
+    // a fold length on this model: two genuinely different folded states pick
+    // the same token, and the control below then reads as vacuous when it is
+    // really just under-resolved. Same lesson as the mixed-position arm.
+    let a_next = a.fire(&next, None, &pipe, "A-next").await?.1;
+    let b_next = b.fire(&next, None, &pipe, "B-next").await?.1;
+    let c_next = c.fire(&next, None, &pipe, "C-next").await?.1;
 
     pipe.close();
 
-    if b_next == c_next {
+    if close(b_next, c_next) {
         return Err(format!(
             "folding {expected} and {other} token(s) leave indistinguishable \
-             continuations ({b_next} vs {c_next}); this prompt cannot witness a \
+             continuations ({b_next:.4} vs {c_next:.4}); this prompt cannot witness a \
              fold length and the test would pass vacuously"
         ));
     }
-    let agree = a_next == b_next;
+    let agree = close(a_next, b_next);
     let result = format!(
-        "devicefold window={W} expected={expected} other={other} a_next={a_next} \
-         b_next={b_next} c_next={c_next} agree={}",
+        "devicefold window={W} expected={expected} other={other} a_next={a_next:.4} \
+         b_next={b_next:.4} c_next={c_next:.4} agree={}",
         if agree { "yes" } else { "no" }
     );
     eprintln!("[GDN_FOLDCOMMIT] {result}");
@@ -721,6 +899,12 @@ async fn main(input: String) -> Result<String> {
         let prompt = wit_model::encode("hello world");
         let prompt: Vec<u32> = if prompt.is_empty() { vec![0] } else { prompt };
         return device_fold_length(&prompt).await;
+    }
+
+    if input.trim() == "interior" {
+        let prompt = wit_model::encode("hello world");
+        let prompt: Vec<u32> = if prompt.is_empty() { vec![0] } else { prompt };
+        return fold_interior_boundary(&prompt).await;
     }
 
     if input.trim() == "inside" {

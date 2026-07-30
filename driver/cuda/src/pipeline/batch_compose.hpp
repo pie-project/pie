@@ -237,10 +237,11 @@ inline bool validate_folded_rs_bindings(
             }
             return false;
         }
-        // The bit survives composition (the flags are copied verbatim) but its
-        // WORK is done there: `fold_lens[request]` is no longer the host's
-        // placeholder by the time this runs. A row that still claims a
-        // device-resident length here without a fold is malformed.
+        // This runs on the pre-composition wire row, where the bit is still
+        // an instruction to `append_rs` rather than a property of the row:
+        // once the resolved length is substituted the row is an ordinary
+        // buffered fold and `append_rs` CLEARS the bit. A row that claims a
+        // device-resident length without a fold is malformed.
         if ((flags & PIE_RS_FLAG_FOLD_LEN_DEVICE) != 0 &&
             (flags & PIE_RS_FLAG_FOLD) == 0) {
             if (error != nullptr) {

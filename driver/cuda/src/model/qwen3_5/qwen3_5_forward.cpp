@@ -67,6 +67,10 @@ Qwen3_5LinearAttnWorkspace Qwen3_5LinearAttnWorkspace::allocate(
     ws.fa_gate      = DeviceBuffer<std::uint16_t>::alloc(N * (std::size_t)hq);
     ws.qo_ext       = DeviceBuffer<std::uint32_t>::alloc(N + 1);
     ws.rs_write_state_mask = DeviceBuffer<std::uint8_t>::alloc(N + 1);
+    ws.qo_split        = DeviceBuffer<std::uint32_t>::alloc(2 * N + 1);
+    ws.split_slot_head = DeviceBuffer<std::int32_t>::alloc(2 * N);
+    ws.split_slot_tail = DeviceBuffer<std::int32_t>::alloc(2 * N);
+    ws.split_mask_head = DeviceBuffer<std::uint8_t>::alloc(2 * N);
     ws.max_tokens   = max_tokens;
     return ws;
 }
@@ -454,6 +458,37 @@ void maybe_print_forward_profile(const ForwardProfile& p) {
 // device memory respectively. When both are nullptr (parity /
 // single-request callers), every kernel takes its legacy single-request
 // path against slot 0 — matches the R=1 layout exactly.
+// The 2R-segment split that lets a fold boundary land STRICTLY INSIDE a
+// fire's own tokens.
+//
+// `commit_len` cannot express this: the kernels implement it as
+// `if (c < Nr) Nr = c`, which TRUNCATES the sequence. That is right for a
+// state-only commit replay, which discards its outputs, but a fire folding at
+// an interior boundary still owes logits for every token it carries, and the
+// ones past the boundary would get none.
+//
+// So the row is cut in two instead. Segment `2r` is `[qo[r], qo[r]+n_r)` and
+// segment `2r+1` is `[qo[r]+n_r, qo[r+1])`; together they tile the extended
+// array exactly, so `core_out` is filled once and completely. The HEAD call
+// runs with `slot_tail` negated and `write_state=true`, so its ordinary
+// end-of-sequence writeback lands on the boundary. The TAIL call then runs on
+// the same stream with `slot_head` negated and `write_state=false`, reading
+// the state the head just wrote -- which is exactly the folded state its
+// tokens must continue from -- and producing their outputs without moving the
+// boundary again.
+//
+// A row with no interior boundary sets `n_r = T_r`: its tail segment is empty
+// and the head call is byte-for-byte the single-call path, so mixed fires need
+// no special case.
+struct Qwen3_5RsFoldSplit {
+    int segments = 0;                            // 2R
+    const std::uint32_t* qo_h = nullptr;         // [2R+1]
+    const std::uint32_t* qo_d = nullptr;
+    const std::int32_t*  slot_head_d = nullptr;  // [2R]
+    const std::int32_t*  slot_tail_d = nullptr;  // [2R]
+    const std::uint8_t*  mask_head_d = nullptr;  // [2R]
+};
+
 void linear_attn_layer_body(
     const Qwen3_5LayerWeights& Lw,
     const HfConfig& cfg,
@@ -500,7 +535,10 @@ void linear_attn_layer_body(
     // MIXED pass only: one byte per request, non-zero where this row's
     // recurrent/conv state must persist. Null means every row agrees and
     // `write_state` alone decides.
-    const std::uint8_t* rs_write_state_mask = nullptr)
+    const std::uint8_t* rs_write_state_mask = nullptr,
+    // INTERIOR fold boundary only. Null on every other path, and when null
+    // this function is unchanged.
+    const Qwen3_5RsFoldSplit* fold_split = nullptr)
 {
     // ── The linear layers run over an EXTENDED token layout ───────────
     // A recurrence cannot start in the middle of a sequence: its initial
@@ -918,16 +956,35 @@ void linear_attn_layer_body(
             // into the request's slot. Falls back to host-loop for the
             // legacy single-request parity entrypoint.
             if (slot_ids_d != nullptr && qo_indptr_d != nullptr) {
-                kernels::launch_causal_conv1d_prefill_batched_bf16(
-                    qkv_in_base, Lw.la_conv1d_w->data(),
-                    Lw.la_conv1d_b ? Lw.la_conv1d_b->data() : nullptr,
-                    qkv_post_base,
-                    state_cache.conv_state(layer_idx, /*slot=*/0),
-                    slot_ids_d, qo_indptr_d,
-                    static_cast<long long>(state_cache.conv_kernel()) *
-                        state_cache.conv_dim(),
-                    R, conv_dim, conv_K, stream, write_state, commit_len,
-                    rs_write_state_mask);
+                auto conv_pass = [&](int R, const std::int32_t* slot_ids_d,
+                                     const std::uint32_t* qo_indptr_d,
+                                     bool write_state,
+                                     const std::uint8_t* rs_write_state_mask) {
+                    kernels::launch_causal_conv1d_prefill_batched_bf16(
+                        qkv_in_base, Lw.la_conv1d_w->data(),
+                        Lw.la_conv1d_b ? Lw.la_conv1d_b->data() : nullptr,
+                        qkv_post_base,
+                        state_cache.conv_state(layer_idx, /*slot=*/0),
+                        slot_ids_d, qo_indptr_d,
+                        static_cast<long long>(state_cache.conv_kernel()) *
+                            state_cache.conv_dim(),
+                        R, conv_dim, conv_K, stream, write_state, commit_len,
+                        rs_write_state_mask);
+                };
+                if (fold_split != nullptr) {
+                    // Head then tail, same stream. The tail's left context is
+                    // the trailing K-window the head just persisted, which the
+                    // kernel reads out of the slot for `src_t < 0` -- so the
+                    // cut is invisible to the convolution's arithmetic.
+                    conv_pass(fold_split->segments, fold_split->slot_head_d,
+                              fold_split->qo_d, /*write_state=*/true,
+                              fold_split->mask_head_d);
+                    conv_pass(fold_split->segments, fold_split->slot_tail_d,
+                              fold_split->qo_d, /*write_state=*/false, nullptr);
+                } else {
+                    conv_pass(R, slot_ids_d, qo_indptr_d, write_state,
+                              rs_write_state_mask);
+                }
             } else {
                 for (int r = 0; r < R; ++r) {
                     const int t0 = static_cast<int>(qo_indptr_h[r]);
@@ -1237,6 +1294,10 @@ void linear_attn_layer_body(
                 }
             } else {
                 if (slot_ids_d != nullptr && qo_indptr_d != nullptr) {
+                    auto fla_pass = [&](int R, const std::int32_t* slot_ids_d,
+                                        const std::uint32_t* qo_indptr_d,
+                                        bool write_state,
+                                        const std::uint8_t* rs_write_state_mask) {
                     if (use_warp_tiled_recurrent && V_h != K_h) {
                         if (state_bf16) {
                             kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16(
@@ -1356,6 +1417,21 @@ void linear_attn_layer_body(
                                 commit_len, rs_write_state_mask);
                         }
                     }
+                    };
+                    if (fold_split != nullptr) {
+                        // The head writes the state AT the boundary; the tail
+                        // reads it back as its own initial state and produces
+                        // the outputs past it without moving it again.
+                        fla_pass(fold_split->segments, fold_split->slot_head_d,
+                                 fold_split->qo_d, /*write_state=*/true,
+                                 fold_split->mask_head_d);
+                        fla_pass(fold_split->segments, fold_split->slot_tail_d,
+                                 fold_split->qo_d, /*write_state=*/false,
+                                 nullptr);
+                    } else {
+                        fla_pass(R, slot_ids_d, qo_indptr_d, write_state,
+                                 rs_write_state_mask);
+                    }
                 } else {
                     for (int r = 0; r < R; ++r) {
                         const int t0 = static_cast<int>(qo_indptr_h[r]);
@@ -1392,6 +1468,67 @@ void linear_attn_layer_body(
             }
         }
     });
+    // ── PIE_RS_SPLIT_TRACE: post-recurrence state probe ──────────────
+    // Never syncs under graph capture -- the decode path captures this stream
+    // and a sync there is an outright CUDA error, not just a stall.
+    // The interior-boundary split is the only path that writes the state from
+    // a segment that is not the row's own end, so a divergence shows up HERE
+    // (in the state the fire leaves behind) long before it reaches a logit.
+    if (std::getenv("PIE_RS_SPLIT_TRACE") != nullptr && layer_idx == 0 &&
+        [&] {
+            cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+            return cudaStreamIsCapturing(stream, &st) == cudaSuccess &&
+                   st == cudaStreamCaptureStatusNone;
+        }()) {
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        auto bf16f = [](std::uint16_t h) {
+            std::uint32_t u = static_cast<std::uint32_t>(h) << 16;
+            float f; std::memcpy(&f, &u, sizeof(f)); return f;
+        };
+        for (int r = 0; r < R; ++r) {
+            const int slot = slot_ids_h != nullptr
+                ? static_cast<int>(slot_ids_h[r]) : 0;
+            if (slot < 0) continue;
+            const long long rs_elems =
+                static_cast<long long>(V_h) * K_d * V_d;
+            void* rs_ptr = state_cache.recurrent_state_raw(layer_idx, slot);
+            double rl1 = 0.0;
+            if (state_cache.recurrent_state_bf16()) {
+                std::vector<std::uint16_t> rh(static_cast<std::size_t>(rs_elems));
+                CUDA_CHECK(cudaMemcpy(rh.data(), rs_ptr,
+                    rh.size() * sizeof(std::uint16_t), cudaMemcpyDeviceToHost));
+                for (auto h : rh) rl1 += std::fabs(static_cast<double>(bf16f(h)));
+            } else {
+                std::vector<float> rh(static_cast<std::size_t>(rs_elems));
+                CUDA_CHECK(cudaMemcpy(rh.data(), rs_ptr,
+                    rh.size() * sizeof(float), cudaMemcpyDeviceToHost));
+                for (float x : rh) rl1 += std::fabs(static_cast<double>(x));
+            }
+            const long long cv_elems =
+                static_cast<long long>(state_cache.conv_kernel()) * conv_dim;
+            std::vector<std::uint16_t> ch(static_cast<std::size_t>(cv_elems));
+            CUDA_CHECK(cudaMemcpy(ch.data(),
+                state_cache.conv_state(layer_idx, slot),
+                ch.size() * sizeof(std::uint16_t), cudaMemcpyDeviceToHost));
+            double cl1 = 0.0;
+            for (auto h : ch) cl1 += std::fabs(static_cast<double>(bf16f(h)));
+            std::cerr << "[rs-split] r=" << r << " slot=" << slot
+                      << " N=" << N << " R=" << R
+                      << " split=" << (fold_split != nullptr ? 1 : 0)
+                      << " qo=[" << (qo_indptr_h ? qo_indptr_h[r] : 0) << ","
+                      << (qo_indptr_h ? qo_indptr_h[r + 1] : 0) << ")"
+                      << " write_state=" << (write_state ? 1 : 0)
+                      << " head=" << head_for(r)
+                      << " read_len=" << read_len_for(r)
+                      << " bwrite=" << (rs_buffer_write ? 1 : 0)
+                      << " bfold=" << (rs_buffer_fold ? 1 : 0)
+                      << " rd_slabs=" << (rs_buffer_read_indptr_h
+                          ? rs_buffer_read_indptr_h[r + 1] - rs_buffer_read_indptr_h[r] : 0)
+                      << " wr_slabs=" << (rs_buffer_slot_indptr_h
+                          ? rs_buffer_slot_indptr_h[r + 1] - rs_buffer_slot_indptr_h[r] : 0)
+                      << " recur.L1=" << rl1 << " conv.L1=" << cl1 << "\n";
+        }
+    }
     invoke_stage_hook(
         StageHookPoint::OnAttn, la.q_pre.data(),
         static_cast<std::uint32_t>(N),
@@ -1894,6 +2031,94 @@ void qwen3_5_forward_paged(
         qo_ext_d = la_ws.qo_ext.data();
     }
 
+    // ── the 2R-segment split for an INTERIOR fold boundary ────────────
+    // A buffered write whose fold length lands strictly inside the extended
+    // row. `rs_fold_lens` is already in extended (buffer-token) space, so the
+    // boundary is simply `n_r` rows into `[qo[r], qo[r+1])`.
+    //
+    // Built once per fire, like `qo_ext`, and only when some row actually
+    // needs it: with no interior boundary the single-call path is left exactly
+    // as it was rather than paying a second launch per layer for nothing.
+    Qwen3_5RsFoldSplit fold_split;
+    const Qwen3_5RsFoldSplit* fold_split_p = nullptr;
+    std::vector<std::uint32_t> qo_split_h;
+    std::vector<std::int32_t> split_slot_head_h;
+    std::vector<std::int32_t> split_slot_tail_h;
+    std::vector<std::uint8_t> split_mask_head_h;
+    const std::uint32_t* qo_pass_h =
+        has_buffer_read ? qo_ext_h.data() : qo_indptr_h;
+    if (rs_buffer_write && rs_fold_lens_h != nullptr && write_folds &&
+        qo_pass_h != nullptr && slot_ids_h != nullptr) {
+        bool any_interior = false;
+        for (int r = 0; r < R; ++r) {
+            const std::uint32_t rows = qo_pass_h[r + 1] - qo_pass_h[r];
+            const std::uint32_t n =
+                static_cast<std::uint32_t>(rs_fold_lens_h[r]);
+            if (n > 0 && n < rows) {
+                any_interior = true;
+                break;
+            }
+        }
+        if (any_interior) {
+            const int segs = 2 * R;
+            qo_split_h.resize(static_cast<std::size_t>(segs) + 1);
+            split_slot_head_h.resize(segs);
+            split_slot_tail_h.resize(segs);
+            split_mask_head_h.resize(segs);
+            qo_split_h[0] = qo_pass_h[0];
+            for (int r = 0; r < R; ++r) {
+                const std::uint32_t lo = qo_pass_h[r];
+                const std::uint32_t hi = qo_pass_h[r + 1];
+                const std::uint32_t n =
+                    static_cast<std::uint32_t>(rs_fold_lens_h[r]);
+                // A row with no interior boundary puts everything in its head
+                // segment and leaves the tail empty, so it runs exactly once
+                // and exactly as it would have without the split.
+                const std::uint32_t cut =
+                    (n > 0 && n < hi - lo) ? lo + n : hi;
+                qo_split_h[2 * r + 1] = cut;
+                qo_split_h[2 * r + 2] = hi;
+                const std::int32_t slot =
+                    static_cast<std::int32_t>(slot_ids_h[r]);
+                split_slot_head_h[2 * r] = slot;
+                split_slot_head_h[2 * r + 1] = -1;
+                split_slot_tail_h[2 * r] = -1;
+                split_slot_tail_h[2 * r + 1] = slot;
+                // The head persists on the same terms as the unsplit pass:
+                // this row folds, or it is a plain in-forward advance riding
+                // along in a buffered fire.
+                split_mask_head_h[2 * r] =
+                    rs_write_mask_h.empty()
+                        ? static_cast<std::uint8_t>(1)
+                        : rs_write_mask_h[r];
+                split_mask_head_h[2 * r + 1] = 0;
+            }
+            CUDA_CHECK(cudaMemcpyAsync(
+                la_ws.qo_split.data(), qo_split_h.data(),
+                qo_split_h.size() * sizeof(std::uint32_t),
+                cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(
+                la_ws.split_slot_head.data(), split_slot_head_h.data(),
+                split_slot_head_h.size() * sizeof(std::int32_t),
+                cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(
+                la_ws.split_slot_tail.data(), split_slot_tail_h.data(),
+                split_slot_tail_h.size() * sizeof(std::int32_t),
+                cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(
+                la_ws.split_mask_head.data(), split_mask_head_h.data(),
+                split_mask_head_h.size() * sizeof(std::uint8_t),
+                cudaMemcpyHostToDevice, stream));
+            fold_split.segments = segs;
+            fold_split.qo_h = qo_split_h.data();
+            fold_split.qo_d = la_ws.qo_split.data();
+            fold_split.slot_head_d = la_ws.split_slot_head.data();
+            fold_split.slot_tail_d = la_ws.split_slot_tail.data();
+            fold_split.mask_head_d = la_ws.split_mask_head.data();
+            fold_split_p = &fold_split;
+        }
+    }
+
     // Per-slot reset for any request whose slot was just (re)assigned.
     // The runtime guarantees a slot is_fresh only on the first fire of a
     // context (which is always a prefill), so zeroing here matches the
@@ -2005,7 +2230,7 @@ void qwen3_5_forward_paged(
                     has_buffer_read ? rs_buffer_read_lens_h : nullptr,
                     rs_buffer_heads_h,
                     has_buffer_read ? qo_ext_h.data() : nullptr,
-                    qo_ext_d, n_ext, rs_write_state_mask_d);
+                    qo_ext_d, n_ext, rs_write_state_mask_d, fold_split_p);
             });
         } else {
             ++profile.full_layers;

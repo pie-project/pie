@@ -65,6 +65,22 @@ struct Qwen3_5LinearAttnWorkspace {
     // pointer null) whenever every row agrees, so the uniform path is
     // byte-identical to before.
     DeviceBuffer<std::uint8_t>  rs_write_state_mask;  // [R] u8
+
+    // INTERIOR fold boundary only (`b < n < b + t`): the 2R-segment layout
+    // that tiles the extended array exactly, splitting each request at its own
+    // boundary into `[qo_ext[r], qo_ext[r]+n_r)` and `[qo_ext[r]+n_r,
+    // qo_ext[r+1])`. Two chained calls then run over it -- the head persisting
+    // its end-of-sequence state (which IS the boundary), the tail continuing
+    // from that state to produce the outputs the head does not cover.
+    //
+    // `slot_head`/`slot_tail` are the SAME slots with the other segment's
+    // entry negated: every recurrent kernel early-returns on a negative slot,
+    // so each call fills only its own half of `core_out` and neither has to
+    // know the other exists.
+    DeviceBuffer<std::uint32_t> qo_split;        // [2R+1] u32
+    DeviceBuffer<std::int32_t>  split_slot_head; // [2R] i32
+    DeviceBuffer<std::int32_t>  split_slot_tail; // [2R] i32
+    DeviceBuffer<std::uint8_t>  split_mask_head; // [2R] u8
     int max_tokens = 0;
 
     static Qwen3_5LinearAttnWorkspace allocate(

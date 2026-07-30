@@ -1169,10 +1169,12 @@ vs. extended layout). A new orthogonal bit `PIE_RS_FLAG_BUFFER_WRITE` marks
 "this row's buffer span is a write", and `plan_rs_execution` gates its fold
 detection on it. ABI 22 -> 23.
 
-#### Why the interior boundary is still refused
+#### Why the interior boundary was refused — LANDED in §10.2.8
 
 `b < n < b + t` — the boundary landing strictly INSIDE the fire's own new
-tokens — stays refused, and the refusal message now says why.
+tokens. This was the last refused RS position; it is now implemented, and the
+sketch below is what got built. Kept here because the reasoning for rejecting
+`commit_len` is the reason the shape looks the way it does.
 
 The obvious implementation is `commit_len`, which the chunked FLA already
 takes. It does not work: `causal_conv1d.cu` and `gated_delta_net.cu` both do
@@ -1189,7 +1191,7 @@ and `write_state=true`, the second with `[-1, slot_r, ...]` and
 `write_state=false`, chained on the same stream through the state the first
 just wrote. Both kernels early-return on a negative slot and leave `out`
 untouched, so each call fills its own half. It costs a second launch per layer
-and has to be replicated across every FLA variant, so it is deferred.
+and has to be replicated across every FLA variant.
 
 #### The read path had never actually run
 
@@ -1632,9 +1634,78 @@ constant `1` would pass, since most windows accept nothing.
 
 The cross-mode EQUALITY claim keeps its home in `gdn-foldcommit::
 the_fold_length_can_live_on_device`, which is a single fire over a fixed input
-and is genuinely deterministic (`a_next=271 b_next=271 agree=yes`). That is the
+and is genuinely deterministic. That is the
 right place for it: equivalence belongs at the primitive, not at the end of a
 chaotic feedback loop.
+
+#### 10.2.8 The interior fold boundary — LANDED
+
+The last refused RS position, and the blocker for a single-fire speculative
+verify+commit: a fold whose boundary lands strictly inside the tokens the fire
+is itself computing.
+
+**The driver shape is the 2R-segment sketch above, built with no kernel edits
+at all.** Row `r` becomes two segments of one `qo_split` array — `[qo[r],
+qo[r]+n_r)` and `[qo[r]+n_r, qo[r+1])` — dispatched twice on the same stream:
+the HEAD with the tail slots negated and `write_state=true`, the TAIL with the
+head slots negated and `write_state=false`. Every GDN and conv kernel already
+early-returns on `slot < 0`, and the conv prefill already sources left context
+out of the slot for `src_t < 0`, so the tail's convolution history is exactly
+the trailing K-window the head persisted. The cut is invisible to the
+arithmetic. A row with NO interior boundary sets `n_r = T_r`, leaving its tail
+empty — so the 2R layout subsumes the 1R one and a mixed fire needs no special
+case. The whole conv dispatch and the whole FLA cascade were wrapped in
+lambdas whose parameters shadow the outer names, so neither body was edited.
+
+No ABI change was needed. `fold_tokens[r]` already travelled as
+`rs_fold_lens[r]` in extended (buffer-token) space; the driver had only ever
+tested it for `!= 0`.
+
+**The real defect was on the host, and it was older than this work.** The first
+GPU run gave `outputs=ok states=BAD` — the tail's logits were right, so the
+split itself was right, but the state the fire left behind was wrong. A
+post-recurrence state probe (`PIE_RS_SPLIT_TRACE`) settled it in one run: the
+folded state at the boundary matched every reference arm to 0.005%, and the
+divergence was entirely in the NEXT fire, which drained the buffer.
+
+`fire::rs` built the wire arrays AFTER `publish_batch`, and `publish_batch`
+advanced the fold boundary. But every wire array describes the buffer as *this
+fire's own rows are laid out* — extended row `j` is physical `buffer_head + j`,
+the write CSR lists the pages that span covers, the read CSR starts at the
+head. That is the PRE-fold frame. So a fire whose rows straddle the boundary
+was handed a head, and a page list, from the far side of it: the interior fire
+scattered its four tokens at physical 2..5 instead of 0..3, and the drain read
+physical 0..1, which had never been written.
+
+It survived this long because until now a fold either moved nothing (`n == 0`,
+head unchanged) or emptied the buffer (`n == b + t`, which rebases the head to
+0 anyway). Those are the only two cases where pre- and post-fold agree. The
+fix is `RsStore::commit_folds`: `publish_batch` returns the fold advances as a
+`#[must_use]` value and the caller applies them once the wire is built.
+
+**It was corrupting the already-landed paths too.** With the head fixed, the
+§10.2.7 device-fold test's negative control stopped differing — because that
+control had been witnessing this same bug. A pure commit's gather had been
+starting at the POST-fold head, so arms folding `n` tokens were folding the
+`n` tokens starting at offset `n`. Its control now rests on a window of
+DISTINCT tokens (it had been four copies of one token, where folding one
+versus two is nearly unobservable) and on peak logits rather than the greedy
+argmax — the same coarseness lesson as §10.2.5 and §10.2.7b, for the third
+time.
+
+**The test has no negative control, deliberately.** Folding IS a no-op: every
+legal boundary must converge, so an arm that disagreed would be evidence
+against the model rather than for the test. Four arms therefore land the same
+context four ways — an interior fold at 2, an interior fold at 1, a reference
+that folds before it buffers, and one that reaches the interior fire's exact
+store state (`fill=4, head=2`) through an ordinary commit — and all four must
+agree on both the tail's outputs and the state left behind. What gives that
+teeth is that it caught the defect above: before the fix, `a_next=17.2500`
+against `b_next=16.8750`, and the trusted-path arm was wrong too.
+
+Metal refuses an interior boundary; it issues one call per fire and would fold
+the whole row, leaving the host believing tokens are buffered that the device
+has already absorbed.
 
 ### 10.4 E — Python / JavaScript SDKs
 

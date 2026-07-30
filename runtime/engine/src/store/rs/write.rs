@@ -130,6 +130,13 @@ impl RsPreparedWrite {
     }
 }
 
+/// The fold advances a `publish_batch` deferred, to be applied with
+/// `RsStore::commit_folds` once the fire's wire arrays have been built
+/// against the pre-fold buffer they describe.
+#[derive(Debug, Default)]
+#[must_use = "a deferred fold that is never committed leaves the boundary behind"]
+pub struct RsPendingFolds(pub(crate) Vec<(super::RsWorkingSetId, u32, bool)>);
+
 /// The receipt for one fire's published RS rows. The mapping is already
 /// authoritative when this exists; it only carries what settlement needs —
 /// the submission sequence and how many prepared rows to release from the

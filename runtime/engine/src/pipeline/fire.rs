@@ -547,18 +547,19 @@ fn rs_plan_for(
             // buffered tokens ahead of the t new ones (every recurrence
             // initializes from `recurrent_state[slot]`, the state at F),
             // scatters all t new ones into the buffer, and snapshots the
-            // recurrent state at extended token n via `commit_len`. So one
-            // shape covers the append (n == 0), the fold through a non-empty
-            // buffer (n == b + t), and the boundary landing strictly INSIDE
-            // this fire's own new tokens (b < n < b + t).
-            return Err(format!(
-                "request row {row} folds {n} token(s) over a {b}-token buffer plus \
-                 {t} new token(s); a boundary strictly INSIDE the new tokens needs \
-                 the recurrence to produce outputs PAST its own state snapshot, \
-                 which `commit_len` does not do (it truncates the sequence). Fold \
-                 all {} or none of them, or split the fire at the boundary",
-                b + t
-            ));
+            // recurrent state at extended token n. So one shape covers the
+            // append (n == 0), the fold through a non-empty buffer
+            // (n == b + t), and the boundary landing strictly INSIDE this
+            // fire's own new tokens (b < n < b + t).
+            //
+            // The interior case is not `commit_len`: that TRUNCATES the
+            // sequence, and a fire folding at an interior boundary still owes
+            // logits for the tokens past it. The driver cuts the row in two
+            // instead and runs the recurrence twice on one stream -- the head
+            // persisting its end-of-sequence state onto the boundary, the tail
+            // continuing from that state to produce the remaining outputs
+            // without moving it again.
+            Position::Buffer
         };
         kinds.push(here);
     }

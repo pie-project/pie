@@ -457,7 +457,13 @@ fn prepare_many_impl(
 
     // Publish before returning: the successor fire's classification must see
     // this fire's decision without waiting for the device.
-    let published = store
+    //
+    // The FOLD advance is deferred (see `RsStore::commit_folds`). Everything
+    // below describes the buffer as THIS fire's rows are laid out — extended
+    // row `j` is physical `buffer_head + j` — and that frame is the pre-fold
+    // one. Advancing first would hand a fire whose rows straddle the boundary
+    // a head, and a page list, from the other side of it.
+    let (published, pending_folds) = store
         .publish_batch(prepared_rows)
         .map_err(|error| error.to_string())?;
     out.txn = Some(RsTxn { published });
@@ -534,6 +540,10 @@ fn prepare_many_impl(
         out.buffer_read_indptr.clear();
         out.buffer_read_lens.clear();
     }
+    // Every wire array is now built against the pre-fold buffer, so the
+    // boundary can finally move. A row that folds through its own new tokens
+    // sees its head advance here and NOT one array earlier.
+    store.commit_folds(pending_folds);
     Ok(out)
 }
 

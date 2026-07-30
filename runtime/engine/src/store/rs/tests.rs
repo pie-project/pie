@@ -458,7 +458,10 @@ fn publish_batch_rejects_a_released_working_set_and_cancels_every_row() {
     let b = s.prepare_write(second, true, None).unwrap();
     s.release_working_set(second, s.current_epoch());
 
-    assert_eq!(s.publish_batch(vec![a, b]), Err(RsError::UnknownWorkingSet));
+    assert_eq!(
+        s.publish_batch(vec![a, b]).err(),
+        Some(RsError::UnknownWorkingSet)
+    );
     assert_eq!(
         s.folded_slot(first).unwrap(),
         None,
@@ -474,8 +477,8 @@ fn publish_batch_rejects_an_aliased_working_set() {
     let a = s.prepare_write(ws, true, None).unwrap();
     let b = s.prepare_write(ws, true, None).unwrap();
     assert_eq!(
-        s.publish_batch(vec![a, b]),
-        Err(RsError::DuplicateWorkingSet)
+        s.publish_batch(vec![a, b]).err(),
+        Some(RsError::DuplicateWorkingSet)
     );
     assert_eq!(s.folded_slot(ws).unwrap(), None);
     assert_eq!(s.available_slots(), 12);
@@ -489,7 +492,8 @@ fn publish_batch_adopts_every_row_of_one_fire() {
     let a = s.prepare_write(first, true, None).unwrap();
     let b = s.prepare_write(second, true, None).unwrap();
     let (a_slot, b_slot) = (a.state().unwrap().slot, b.state().unwrap().slot);
-    let published = s.publish_batch(vec![a, b]).unwrap();
+    let (published, folds) = s.publish_batch(vec![a, b]).unwrap();
+    s.commit_folds(folds);
     assert_eq!(published.rows(), 2);
     assert_eq!(s.folded_slot(first).unwrap(), Some(a_slot));
     assert_eq!(s.folded_slot(second).unwrap(), Some(b_slot));
@@ -837,4 +841,50 @@ fn a_fork_inherits_an_indeterminate_buffer() {
     let child = s.fork(ws).unwrap();
     assert!(!s.buffer_tokens_exact(child));
     assert!(s.buffer_tokens(child).is_err());
+}
+
+/// `publish_batch` must NOT move the fold boundary.
+///
+/// Every wire array a fire carries describes the buffer as that fire's own
+/// rows are laid out: extended row `j` is physical `buffer_head + j`, the
+/// write CSR lists the pages that span holds, and the read CSR starts at the
+/// head. All of it is the PRE-fold frame. Advancing the boundary inside
+/// `publish_batch` therefore handed a fire whose rows straddle the boundary a
+/// head — and a page list — from the far side of it.
+///
+/// It stayed invisible for as long as it did because the only folds that
+/// existed either moved nothing (`n == 0`) or emptied the buffer (`n == b+t`,
+/// which rebases the head to 0 anyway). An INTERIOR fold is neither, and it
+/// read the tokens the fold had just absorbed instead of the ones that
+/// survived it.
+#[test]
+fn publishing_a_fold_leaves_the_boundary_for_commit_folds() {
+    let mut s = store();
+    let ws = s.create_working_set(geom_with_granularity(1));
+    s.alloc_buffer(ws, 2).unwrap();
+
+    // Four tokens in, boundary still at 0.
+    let prepared = s.prepare_write(ws, false, Some((0, 4))).unwrap();
+    settled(&mut s, prepared);
+    assert_eq!(s.buffer_head(ws).unwrap(), 0);
+
+    // A fire that writes its own tokens AND folds a prefix of the result.
+    let prepared = s.prepare_fold(ws, 2).unwrap();
+    let (published, folds) = s.publish_batch(vec![prepared]).unwrap();
+
+    assert_eq!(
+        s.buffer_head(ws).unwrap(),
+        0,
+        "the wire arrays are still being built against the pre-fold buffer"
+    );
+    assert_eq!(s.buffer_tokens(ws).unwrap(), 4, "and against its occupancy");
+
+    s.commit_folds(folds);
+    assert_eq!(
+        s.buffer_head(ws).unwrap(),
+        2,
+        "only now does logical token 0 move to physical offset 2"
+    );
+    assert_eq!(s.buffer_tokens(ws).unwrap(), 2);
+    s.settle(published);
 }
