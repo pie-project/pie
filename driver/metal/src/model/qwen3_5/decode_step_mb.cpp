@@ -46,6 +46,11 @@ namespace {
 bool g_ab_arm = false;
 }  // namespace
 
+bool ab_all_barriers() {
+    static const bool on = std::getenv("PIE_METAL_AB_BARRIERS") != nullptr;
+    return on;
+}
+
 bool ab_enabled() {
     static const bool on = std::getenv("PIE_METAL_AB") != nullptr;
     return on;
@@ -563,12 +568,18 @@ void encode_decode_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
         se.set_pso(mb_pso(d, base_psos, mb_psos));
         se.set_argtable(d.kind, d.ordinal);
         se.dispatch(d.grid, d.tg);
-        // Arm B of the interleaved A/B serializes the concurrency groups, which
-        // is the default question the meter answers: what is running independent
-        // dispatches together actually worth?  (Measured 3.8% at 16 lanes.)
-        // Point this at whatever change is being evaluated instead.
-        if (force_barriers || (ab_enabled() && ab_arm()) ||
-            barrier_after_mb(dag, i, run_ends))
+        // Arm B of the interleaved A/B is a CONTROL by default: identical to
+        // arm A, so a nonzero A-B difference means the harness is biased and
+        // nothing else. Point it at whatever is being evaluated by adding a
+        // term here.
+        //
+        // It used to default to "barrier after EVERY dispatch", which is a fine
+        // question but a terrible default: any other question asked of this
+        // harness came back dominated by it, and one such answer (a 12% win
+        // that was really 0) reached a commit before being caught.
+        // `PIE_METAL_AB_BARRIERS=1` asks the old question explicitly.
+        if (force_barriers || barrier_after_mb(dag, i, run_ends) ||
+            (ab_enabled() && ab_arm() && ab_all_barriers()))
             se.barrier();
     }
 }

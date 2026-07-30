@@ -152,6 +152,11 @@ static int concurrency_group(Kernel k) {
         case Kernel::QmvUp:    return 3;
         case Kernel::QNorm:
         case Kernel::KNorm:    return 4;
+        // Rope rewrites q in place and RopeK rewrites k in place, from
+        // disjoint scratch, exactly like the QNorm/KNorm pair above -- so the
+        // barrier that used to sit between them was ordering nothing.
+        case Kernel::Rope:
+        case Kernel::RopeK:    return 5;
         default:               return 0;  // runs alone
     }
 }
