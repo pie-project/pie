@@ -15,19 +15,19 @@
 /// `Impl` keeps everything that is not family-shaped: the context, the logits
 /// staging, the sequence bookkeeping.
 ///
-/// The two families are not at the same place. gemma4 is PAGED: one schedule
-/// serves decode and prefill, several sequences are resident at once, and a
-/// fire carries as many rows as the batch has —
-/// `gemma4_prefill_numerics_test` measures that a decode step is a fire of one
-/// row and lands exactly where firing the whole prompt at once does, which is
-/// what lets one schedule do both.
+/// Both families are PAGED, so several sequences are resident at once, each
+/// attending its own page list. They differ in what a multi-row fire COSTS.
 ///
-/// gpt-oss is not: its KV is a position-indexed ring holding ONE sequence, and
-/// it has no M>1 path at all. Its MoE picks experts per ROW, so a batched
-/// routed matmul is a different kernel rather than a wider launch, and its
-/// attention sink has no paged variant. `paged()` says which a family is, and
-/// `MetalExecutor` refuses a second resident sequence for the ring-backed one
-/// rather than serving it wrongly.
+/// gemma4 has an M>1 path: one schedule serves decode and prefill, and a fire
+/// of R rows is one wider launch. `gemma4_prefill_numerics_test` measures that
+/// a decode step is a fire of one row and lands exactly where firing the whole
+/// prompt at once does, which is what lets one schedule do both.
+///
+/// gpt-oss does not, and will not soon: its MoE picks experts per ROW, so a
+/// batched routed matmul is a different kernel rather than a wider launch. A
+/// fire of R rows is R PASSES, each a full DAG at M=1. It is correct and it
+/// batches nothing, so concurrency costs it throughput rather than buying any
+/// -- `max_rows()` is a time budget there and a memory one for gemma4.
 
 #include <cstdint>
 #include <functional>

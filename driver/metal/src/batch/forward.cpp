@@ -948,10 +948,15 @@ void MetalExecutor::Impl::reset_state() {
 // `slot` always starts at parity 0, independent of any other slot's step history.
 void MetalExecutor::Impl::reset_state(uint32_t slot) {
     if (is_simple()) {
-        // The KV is the only thing these families carry between tokens, so
-        // zeroing it is the whole reset. There is no conv history to ping-pong
-        // and no recurrent state to clear.
-        simple_->reset();
+        // A PAGED family resets through the runtime's page table -- a fresh
+        // sequence gets fresh pages -- exactly as qwen3.5 does. Zeroing here
+        // would zero EVERY page, which with several sequences resident is not a
+        // reset but the destruction of its neighbours.
+        //
+        // A ring-backed one has nowhere else to put the boundary: the KV is the
+        // only thing it carries between tokens, and there is no conv history to
+        // ping-pong and no recurrent state to clear.
+        if (!simple_->paged()) simple_->reset();
         return;
     }
     const size_t conv_stride  = g_.gdn_conv_stride_bytes();
