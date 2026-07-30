@@ -403,6 +403,15 @@ target_include_directories(gemma4_decode_step_test PRIVATE
 target_link_libraries(gemma4_decode_step_test PRIVATE pie_driver_metal_lib)
 add_test(NAME gemma4_decode_step_test COMMAND gemma4_decode_step_test)
 
+# GPT-OSS: same, and for the same reason.
+add_executable(gptoss_decode_step_test tests/gptoss_decode_step_test.cpp)
+target_compile_features(gptoss_decode_step_test PRIVATE cxx_std_20)
+target_include_directories(gptoss_decode_step_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/batch)
+target_link_libraries(gptoss_decode_step_test PRIVATE pie_driver_metal_lib)
+add_test(NAME gptoss_decode_step_test COMMAND gptoss_decode_step_test)
+
 add_executable(heap_layout_slot_test tests/heap_layout_slot_test.cpp)
 target_include_directories(heap_layout_slot_test PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src

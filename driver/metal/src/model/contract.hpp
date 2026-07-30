@@ -12,6 +12,7 @@
 #include <string_view>
 
 #include "gemma4/gemma4_contract.hpp"
+#include "gptoss/gptoss_contract.hpp"
 #include "qwen3_5/qwen3_5_contract.hpp"
 
 namespace pie::metal::model {
@@ -31,17 +32,19 @@ struct ContractFacts {
 /// One place answers this. The contract, the geometry and the executor all need
 /// the same answer, and three independent readings of `model_type` would be
 /// three chances to disagree.
-enum class ModelFamily { Unknown, Qwen35, Gemma4 };
+enum class ModelFamily { Unknown, Qwen35, Gemma4, GptOss };
 
 inline ModelFamily model_family_of(std::string_view model_type) {
     if (qwen3_5::is_supported_model_type(model_type)) return ModelFamily::Qwen35;
     if (gemma4::is_supported_model_type(model_type)) return ModelFamily::Gemma4;
+    if (gptoss::is_supported_model_type(model_type)) return ModelFamily::GptOss;
     return ModelFamily::Unknown;
 }
 
 inline bool is_supported_model_type(std::string_view model_type) {
     return qwen3_5::is_supported_model_type(model_type) ||
-           gemma4::is_supported_model_type(model_type);
+           gemma4::is_supported_model_type(model_type) ||
+           gptoss::is_supported_model_type(model_type);
 }
 
 inline void author_model_contract(const Checkpoint& checkpoint, std::string_view model_type,
@@ -50,6 +53,10 @@ inline void author_model_contract(const Checkpoint& checkpoint, std::string_view
     if (gemma4::is_supported_model_type(model_type)) {
         gemma4::author_model_contract(checkpoint, model_type, target, out,
                                       facts.first_kv_shared_layer);
+        return;
+    }
+    if (gptoss::is_supported_model_type(model_type)) {
+        gptoss::author_model_contract(checkpoint, model_type, target, out);
         return;
     }
     // Refusal for an unknown family belongs to the schema that would have

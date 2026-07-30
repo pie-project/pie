@@ -100,6 +100,60 @@ inline void push_mlx_affine_u4(ModelContract& out, const SourceTensor& raw,
         .expect(std::vector<std::int64_t>{rows, logical_cols});
 }
 
+/// Declare an MLX affine weight whose leading axes are a STACK.
+///
+/// A sparse-MoE checkpoint stores one tensor per projection with the expert on
+/// axis 0 -- `[n_experts, out, in/pack]` -- rather than `n_experts` matrices.
+/// The quantization is per row of the last two axes exactly as in the 2-D case,
+/// so the only thing that changes is that the row count is the product of every
+/// axis but the last.
+///
+/// `bits` is 4 or 8: `mlx_lm`'s quantization predicate leaves a small, sensitive
+/// projection (gpt-oss's router) at 8 bits while quantizing everything around it
+/// to 4, so a family that declared one width for the whole checkpoint would be
+/// describing a checkpoint that does not exist.
+inline void push_mlx_affine_stacked(ModelContract& out, const SourceTensor& raw,
+                                    const SourceTensor& scales, const SourceTensor& biases,
+                                    int bits, std::string output) {
+    if (raw.shape.size() < 2 || scales.shape.size() != raw.shape.size() ||
+        biases.shape.size() != scales.shape.size() ||
+        !std::equal(biases.shape.begin(), biases.shape.end(), scales.shape.begin())) {
+        fail("MLX affine triplet '" + std::string(raw.name) + "' has incompatible shapes");
+    }
+    if (bits != 4 && bits != 8) {
+        fail("MLX affine triplet '" + std::string(raw.name) + "' has an unsupported width");
+    }
+    const int per_word = 32 / bits;
+    std::int64_t rows = 1;
+    for (std::size_t i = 0; i + 1 < raw.shape.size(); ++i) {
+        if (raw.shape[i] != scales.shape[i]) {
+            fail("MLX affine triplet '" + std::string(raw.name) +
+                 "' disagrees with its scales on the stacked axes");
+        }
+        rows *= raw.shape[i];
+    }
+    const std::int64_t logical_cols = raw.shape.back() * per_word;
+    const std::int64_t groups = scales.shape.back();
+    if (groups <= 0 || logical_cols % groups != 0) {
+        fail("MLX affine triplet '" + std::string(raw.name) + "' cannot derive a group size");
+    }
+    const std::uint32_t group_size =
+        u32_dim(logical_cols / groups, "MLX affine group size");
+
+    PieLoaderQuantSpecView quant = pie_loader::quant_spec(
+        bits == 4 ? PieLoaderQuantScheme::MlxAffineU4 : PieLoaderQuantScheme::Int8Asymmetric,
+        PieLoaderDType::BF16);
+    quant.bits_per_element = static_cast<std::uint32_t>(bits);
+    quant.group_size = group_size;
+    quant.channel_axis = 1;
+    const PieLoaderEncodingSpec encoding = pie_loader::quantized(quant);
+
+    out.define(std::move(output),
+               out.transmute(out.src(std::string(raw.name)), {rows, logical_cols}, encoding),
+               encoding)
+        .expect(std::vector<std::int64_t>{rows, logical_cols});
+}
+
 }  // namespace contract_detail
 
 }  // namespace pie::metal::model
