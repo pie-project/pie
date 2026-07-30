@@ -2011,6 +2011,20 @@ bool moe_block(
                 CUDA_CHECK(cudaMemsetAsync(ws.norm_y.data(), 0,
                     (std::size_t)N * H * sizeof(std::uint16_t), stream));
                 const auto routing = build_routing(topk_idx_h, topk_w_h, N, K, E);
+                if (streamed) {
+                    // Routing is known for the whole layer before any of it
+                    // runs, and the experts are paged one at a time, so say up
+                    // front which ones are wanted. The read for expert e+1 then
+                    // overlaps the GEMMs for expert e instead of following
+                    // them. This is the only point in the pass that knows the
+                    // order, and it is why prefetching is worth stating rather
+                    // than leaving to the page cache's readahead.
+                    for (int e = 0; e < E; ++e) {
+                        if (routing.token_idx[e].empty()) continue;
+                        Lw.expert_cache->prefetch(
+                            Lw.expert_group, static_cast<std::uint32_t>(e));
+                    }
+                }
                 for (int e = 0; e < E; ++e) {
                     const auto& tok_idx = routing.token_idx[e];
                     const auto& wts     = routing.weights[e];

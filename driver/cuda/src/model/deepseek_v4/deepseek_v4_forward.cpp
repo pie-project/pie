@@ -1248,6 +1248,18 @@ void dsv4_forward_paged(
             CUDA_CHECK(cudaStreamSynchronize(stream));
 
             const auto routing = build_routing(topk_idx_h, topk_w_h, N, K, E);
+            if (streamed) {
+                // The whole layer's routing is known before any of it runs, and
+                // experts are paged one at a time, so say which ones are wanted
+                // now: the read for the next overlaps the GEMMs for this one.
+                for (int e = 0; e < E; ++e) {
+                    if (routing.token_idx[static_cast<std::size_t>(e)].empty()) {
+                        continue;
+                    }
+                    Lw.expert_cache->prefetch(
+                        Lw.expert_group, static_cast<std::uint32_t>(e));
+                }
+            }
             for (int e = 0; e < E; ++e) {
                 const auto& tok_idx = routing.token_idx[static_cast<std::size_t>(e)];
                 const int Ne = static_cast<int>(tok_idx.size());

@@ -109,6 +109,7 @@ public:
             }
             group_base_.push_back(total_instances);
             total_instances += group.arity;
+            span_by_instr_.push_back(read_spans(*group.plan));
         }
         if (budget_bytes < slot_bytes_) {
             throw std::runtime_error(
@@ -124,6 +125,11 @@ public:
         slot_stores_.resize(slots);
         slot_filled_.assign(slots, false);
         copy_engine_.prefer_small_transfers();
+        // A knob because prefetching is only visibly worth anything against a
+        // cold page cache, and telling whether it helped means running the
+        // same thing without it.
+        prefetch_enabled_ =
+            !loader_config::env_present("PIE_CUDA_STREAM_NO_PREFETCH");
         allocate_slab();
     }
 
@@ -171,7 +177,8 @@ public:
             << (secs == 0.0 ? 0.0
                             : static_cast<double>(s.bytes_paged_in) / 1048576.0 / secs)
             << " MiB/s), " << (static_cast<double>(s.evict_wait_ns) / 1e6)
-            << " ms waiting to evict; of the page-in, alloc " << s.alloc_ms
+            << " ms waiting to evict, " << s.prefetches
+            << " prefetched; of the page-in, alloc " << s.alloc_ms
             << " ms, transfer " << s.transfer_ms << " ms, transform "
             << s.transform_ms << " ms\n";
     }
@@ -248,6 +255,38 @@ public:
         return slot_stores_[acquired.slot];
     }
 
+    /// Say that `instance` will be wanted, without waiting for it.
+    ///
+    /// Only the host half: it asks the kernel to start faulting in the bytes
+    /// this instance reads. That is the half worth doing cheaply, because it
+    /// is the half the OS cannot do for itself -- a router picks experts at
+    /// runtime and no readahead heuristic will guess the order -- and because
+    /// it needs no stream, no event and no second slab. The device half still
+    /// happens inside `ensure_resident`, against pages that are already there.
+    ///
+    /// Advisory throughout. Calling it is never required and never wrong;
+    /// calling it for an instance that is already resident just wastes a few
+    /// `madvise` calls, which is why it does not check.
+    void prefetch(std::size_t group, std::uint32_t instance) noexcept
+    {
+        if (!prefetch_enabled_ || group >= groups_.len) return;
+        const auto& g = groups_.ptr[group];
+        const std::size_t per_instance = g.bindings_per_instance;
+        if (per_instance == 0) return;
+        const std::size_t start =
+            static_cast<std::size_t>(instance) * per_instance;
+        if (start + per_instance > g.bindings.len) return;
+        for (std::size_t i = 0; i < per_instance; ++i) {
+            const auto& binding = g.bindings.ptr[start + i];
+            const auto span = span_by_instr_[group].find(binding.instr_id);
+            if (span == span_by_instr_[group].end()) continue;
+            loader_.advise_will_need(
+                binding.file_id, binding.file_offset + span->second.base_offset,
+                span->second.bytes);
+        }
+        ++stats_.prefetches;
+    }
+
     /// End the batch: every slot becomes evictable again. Pointers handed out
     /// since the last call must not be used past this point.
     void end_batch() noexcept { index_.unpin_all(); }
@@ -276,6 +315,7 @@ public:
         /// microseconds against a steady-state miss of a few tens it would
         /// otherwise dominate the average and hide what a miss really costs.
         std::uint64_t first_page_in_ns = 0;
+        std::uint64_t prefetches = 0;
     };
 
     Stats stats() const noexcept {
@@ -285,6 +325,48 @@ public:
     std::uint64_t evictions() const noexcept { return index_.evictions(); }
 
 private:
+    /// How much each rebindable instruction reads, by instruction id.
+    ///
+    /// A binding says where an instance reads and not how much, because the
+    /// span is one of the fields the group proved index-independent -- so it
+    /// is on the instruction, once, and this is where the two are put back
+    /// together. The set of instruction kinds carrying a source is exactly
+    /// what the loader binds; a kind missing here prefetches nothing, which
+    /// is slower and not wrong.
+    struct Span {
+        std::uint64_t base_offset = 0;
+        std::uint64_t bytes = 0;
+    };
+    static std::unordered_map<std::uint32_t, Span> read_spans(
+        const pie_loader::LoadPlanView& plan)
+    {
+        std::unordered_map<std::uint32_t, Span> out;
+        using Tag = pie_loader::PieLoaderStorageOp::Tag;
+        for (std::size_t i = 0; i < plan.instrs.len; ++i) {
+            const auto& instr = plan.instrs.ptr[i];
+            const pie_loader::PieLoaderSourceExtentView* source = nullptr;
+            switch (instr.op.tag) {
+            case Tag::ExtentWrite:
+                source = &instr.op.extent_write.source;
+                break;
+            case Tag::BulkExtentWrite:
+                source = &instr.op.bulk_extent_write.source;
+                break;
+            case Tag::TileMap:
+                if (instr.op.tile_map.has_source) {
+                    source = &instr.op.tile_map.source;
+                }
+                break;
+            default:
+                break;
+            }
+            if (source == nullptr) continue;
+            out.emplace(instr.id,
+                        Span{source->stride.base_offset, source->span_bytes});
+        }
+        return out;
+    }
+
     std::uint8_t* slot_base(std::uint32_t slot) const noexcept {
         return slab_ + static_cast<std::uint64_t>(slot) * slot_bytes_;
     }
@@ -415,7 +497,10 @@ private:
     pie_loader::PieLoaderGroupSlice groups_;
     /// Where each group's instances start in the one flat key space.
     std::vector<std::uint64_t> group_base_;
+    /// Per group, what each of its plan's rebindable instructions reads.
+    std::vector<std::unordered_map<std::uint32_t, Span>> span_by_instr_;
     bool verbose_ = false;
+    bool prefetch_enabled_ = true;
 
     std::uint64_t slot_bytes_ = 0;
     std::uint8_t* slab_ = nullptr;
