@@ -61,6 +61,31 @@ fixing the hook body.
 
 Total ≈ 5–7 wks to a hook fire replaying a graph.
 
+## Spike verdict: GO (measured 2026-07-30)
+
+The go/no-go probe ran live (trackb-snapkv, ON_ATTN layer 0 of a 272-token
+prefill fire): the region's NVRTC-compiled kernel, frozen metadata, stable
+addresses — captured (1 launch → 1 graph node, relaxed mode),
+instantiated, replayed twice **byte-identical to eager** (0/14080 scratch
++ 0/1156 channel-cell bytes mismatched, sentinel check proving the graph
+actually wrote), with the probed fire's end-to-end output unperturbed.
+Nothing structural beyond the enumerated host work breaks capture: no
+NVRTC/module misbehavior, no cuLaunchKernel-under-capture issue, no
+stream-legality surprise. Increment 1's 2–3 weeks is the whole cost.
+
+Two additions to increment 1's design, both the cursor-bake class:
+- `k_grouped_stage_readiness` reads live ring head/tail and atomicAnds the
+  commit flag — captured as-is it evaluates stale ring state on replay; it
+  must become device-resolved against per-replay state.
+- The region kernel mutates `pending_flags` inside the metadata buffer, so
+  the "stable metadata buffer" must be reset per replay or the flags made
+  replay-idempotent.
+
+The probe itself is preserved as `stage6-spike-probe.patch` (env-gated
+`PIE_STAGE6_SPIKE=1`, one-shot; reapply onto fused_runtime.cuh to rerun) —
+kept out of the header because 542 experimental lines do not belong in the
+hottest include in the driver.
+
 ## The two risks that gate shipping
 
 - **Channel-cursor bake** (above): any version that does not make the
