@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include "model/gemma4/decode_consts.hpp"
 #include "model/gemma4/decode_step.hpp"
 #include "model/gemma4/geometry.hpp"
 
@@ -141,6 +142,34 @@ void a_family_without_ple_or_softcap_drops_those_dispatches() {
     expect_eq(count(dag, Kind::Argmax), 0, "argmax is opt-in");
 }
 
+// The thing that makes gemma4's consts different from qwen3.5's: they depend on
+// the LAYER, not just the kind. If this ever collapses to one answer per kind,
+// sliding layers get a full layer's head_dim and the model is silently wrong.
+void matvec_shapes_follow_the_layer() {
+    std::printf("[per-layer shapes]\n");
+    const Gemma4Geometry g;
+
+    // q_proj: 8 heads x this layer's head_dim.
+    expect_eq(qmv_kn(Kind::QmvQ, g, 0).N, 8 * 256, "sliding layer's q_proj is 8 x 256");
+    expect_eq(qmv_kn(Kind::QmvQ, g, 4).N, 8 * 512, "full layer's q_proj is 8 x 512");
+    expect_eq(qmv_kn(Kind::QmvO, g, 0).K, 8 * 256, "and o_proj reads back the same width");
+    expect_eq(qmv_kn(Kind::QmvO, g, 4).K, 8 * 512, "per layer");
+
+    // The MLP doubles exactly where the KV is shared.
+    expect_eq(qmv_kn(Kind::QmvGate, g, 14).N, 6144, "gate is base width below the split");
+    expect_eq(qmv_kn(Kind::QmvGate, g, 15).N, 12288, "and double-wide at it");
+    expect_eq(qmv_kn(Kind::QmvDown, g, 15).K, 12288, "down_proj reads the doubled width");
+
+    // PLE: the model projection fans out to the whole table, the per-layer ones
+    // work a slice.
+    expect_eq(qmv_kn(Kind::PleProjGemv, g, -1).N, 35 * 256, "PLE projection covers every layer");
+    expect_eq(qmv_kn(Kind::PleGateGemv, g, 0).N, 256, "the per-layer gate is one slice");
+    expect_eq(qmv_kn(Kind::PleProjLayerGemv, g, 0).K, 256, "and projects that slice back");
+
+    expect_eq(qmv_kn(Kind::LmHead, g, -1).N, 262144, "lm_head is the vocabulary");
+    expect_eq(qmv_kn(Kind::AttnNorm, g, 0).N, 0, "a norm is not a matvec");
+}
+
 }  // namespace
 
 int main() {
@@ -150,6 +179,7 @@ int main() {
     kv_sharing_covers_the_tail_of_the_stack();
     the_dag_skips_what_a_shared_layer_does_not_have();
     a_family_without_ple_or_softcap_drops_those_dispatches();
+    matvec_shapes_follow_the_layer();
     std::printf("\n==== gemma4_decode_step_test: %s ====\n",
                 g_failures == 0 ? "all passed" : "FAILURES");
     return g_failures == 0 ? 0 : 1;

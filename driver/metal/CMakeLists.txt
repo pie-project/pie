@@ -93,6 +93,7 @@ if(APPLE)
     src/batch/scratch.cpp
     src/model/qwen3_5/decode_consts.cpp
     src/model/gemma4/kernels.cpp
+    src/model/gemma4/decode_consts.cpp
     src/model/qwen3_5/decode_step.cpp
     src/model/qwen3_5/decode_step_mb.cpp
     src/kernels/decode_psos.cpp
@@ -394,7 +395,9 @@ endif()
 add_executable(gemma4_decode_step_test tests/gemma4_decode_step_test.cpp)
 target_compile_features(gemma4_decode_step_test PRIVATE cxx_std_20)
 target_include_directories(gemma4_decode_step_test PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/batch)
+target_link_libraries(gemma4_decode_step_test PRIVATE pie_driver_metal_lib)
 add_test(NAME gemma4_decode_step_test COMMAND gemma4_decode_step_test)
 
 add_executable(heap_layout_slot_test tests/heap_layout_slot_test.cpp)

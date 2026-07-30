@@ -394,6 +394,52 @@ std::vector<WeightBind> weight_binds(
             prefix + "linear_attn.in_proj_b.weight",
         });
         break;
+    // ── Gemma 4 ──
+    // The norm sandwich: four per layer, so three of them need their own kind.
+    case Kernel::G4AttnPostNorm:
+        weights.push_back({(std::uint8_t)bind::Rms::W, prefix + "post_attention_layernorm.weight"});
+        break;
+    case Kernel::G4FfnPreNorm:
+        weights.push_back({(std::uint8_t)bind::Rms::W, prefix + "pre_feedforward_layernorm.weight"});
+        break;
+    case Kernel::G4FfnPostNorm:
+        weights.push_back({(std::uint8_t)bind::Rms::W, prefix + "post_feedforward_layernorm.weight"});
+        break;
+    case Kernel::G4LayerScalar:
+        weights.push_back({(std::uint8_t)bind::LayerScalar::Scalar, prefix + "layer_scalar"});
+        break;
+    case Kernel::G4PleNorm:
+        weights.push_back(
+            {(std::uint8_t)bind::Rms::W, prefix + "post_per_layer_input_norm.weight"});
+        break;
+    case Kernel::G4PleProjNorm:
+        weights.push_back({(std::uint8_t)bind::Rms::W, "per_layer_projection_norm.weight"});
+        break;
+    // The PLE table is gathered exactly like the token embedding, and the three
+    // PLE projections are ordinary quantized matvecs.
+    case Kernel::G4PleTokenGather:
+        push_quant(weights, "per_layer_embedding");
+        break;
+    case Kernel::G4PleProjGemv:
+        push_quant(weights, "per_layer_model_projection");
+        break;
+    case Kernel::G4PleGateGemv:
+        push_quant(weights, prefix + "per_layer_input_gate");
+        break;
+    case Kernel::G4PleProjLayerGemv:
+        push_quant(weights, prefix + "per_layer_projection");
+        break;
+    // Weightless: V-norm, both GeGLUs, the softcap, the sliding attention and
+    // the PLE residual all read activations only.
+    case Kernel::G4VNorm:
+    case Kernel::G4Geglu:
+    case Kernel::G4Softcap:
+    case Kernel::G4SdpaSliding:
+    case Kernel::G4PleCombine:
+    case Kernel::G4PleGeglu:
+    case Kernel::G4PleResidual:
+        break;
+
     case Kernel::GdnPrep:
     case Kernel::GdnPrepSlotted:
         weights.push_back({

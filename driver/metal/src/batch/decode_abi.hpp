@@ -289,29 +289,6 @@ enum class GatedRms : uint8_t { X = 0, Z = 1, W = 2, Out = 3, Params = 4 };
 // inert until the resident-loop / M>1 wiring binds them.
 enum class Argmax : uint8_t { Logits = 0, NextToken = 1, Params = 2, EosFlag = 3 };
 
-}  // namespace bind
-
-// Argmax kernel constant (argmax.metal:struct ArgmaxParams) — replicated EXACTLY.
-// EOS ids ride inline (≤8); n_eos=0 ⇒ EosFlag always 0. The slot is Shared storage, so
-// the resident loop / executor can rewrite vocab+eos per generation without a rebind.
-struct ArgmaxParams {
-    uint32_t vocab;        // logits row width
-    uint32_t n_eos;        // count of valid stop-token ids in eos_ids[]
-    uint32_t eos_ids[8];   // stop-token ids; NextToken compared against these → EosFlag
-};
-
-// ── Dispatch DAG kernel kinds (per-step encode order) ──
-// Surface locked vs charlie's authoritative golden tag set (wiki mac-golden-kernel-surface).
-// Every golden tag maps 1:1 to a Kernel kind below; kinds sharing a .metal/PSO differ only
-// by dispatch dims + golden tag (e.g. all Qmv* -> affine_qmv; Rms/FfnRms/QNorm/KNorm/FinalRms
-// -> rms_single_row; RopeQ/RopeK -> rope; AttnResid/LayerOut -> residual_add). Internal
-// (untapped) kinds: QSplit, KvAppend, GdnCore-pre (beta's pre-GatedRms core_out).
-//
-// Counts (qwen3.5, 6 full-attn + 18 GDN + 24 mlp): full-attn layer = 20 dispatches
-// (18 golden taps + QSplit + KvAppend), GDN layer = 15 (14 taps; `gdn_core` tap covers
-// GdnCore+GatedRms = 2 dispatches), layer-less = 3 (embed/final_norm/logits).
-// Total ≈ 3 + 6*20 + 18*15 = 393 dispatches / 363 golden taps. Argmax = optional I3
-// substrate (no golden tag). Metal-4 encode ~0.05ms → GPU-exec is the gate; GdnCore=1 the lever.
 // ── Gemma 4 ────────────────────────────────────────────────────────────────
 // Six kernels shipped with this family's bring-up and were never bound to
 // anything: their .metal sources exist, and nothing named their buffers. These
@@ -345,6 +322,29 @@ enum class PleCombine : uint8_t { Proj = 0, Token = 1, Out = 2, Params = 3 };
 // before the KV write. Distinct from bind::Rms, which always has one.
 enum class VNorm : uint8_t { X = 0, Out = 1, Params = 2 };
 
+}  // namespace bind
+
+// Argmax kernel constant (argmax.metal:struct ArgmaxParams) — replicated EXACTLY.
+// EOS ids ride inline (≤8); n_eos=0 ⇒ EosFlag always 0. The slot is Shared storage, so
+// the resident loop / executor can rewrite vocab+eos per generation without a rebind.
+struct ArgmaxParams {
+    uint32_t vocab;        // logits row width
+    uint32_t n_eos;        // count of valid stop-token ids in eos_ids[]
+    uint32_t eos_ids[8];   // stop-token ids; NextToken compared against these → EosFlag
+};
+
+// ── Dispatch DAG kernel kinds (per-step encode order) ──
+// Surface locked vs charlie's authoritative golden tag set (wiki mac-golden-kernel-surface).
+// Every golden tag maps 1:1 to a Kernel kind below; kinds sharing a .metal/PSO differ only
+// by dispatch dims + golden tag (e.g. all Qmv* -> affine_qmv; Rms/FfnRms/QNorm/KNorm/FinalRms
+// -> rms_single_row; RopeQ/RopeK -> rope; AttnResid/LayerOut -> residual_add). Internal
+// (untapped) kinds: QSplit, KvAppend, GdnCore-pre (beta's pre-GatedRms core_out).
+//
+// Counts (qwen3.5, 6 full-attn + 18 GDN + 24 mlp): full-attn layer = 20 dispatches
+// (18 golden taps + QSplit + KvAppend), GDN layer = 15 (14 taps; `gdn_core` tap covers
+// GdnCore+GatedRms = 2 dispatches), layer-less = 3 (embed/final_norm/logits).
+// Total ≈ 3 + 6*20 + 18*15 = 393 dispatches / 363 golden taps. Argmax = optional I3
+// substrate (no golden tag). Metal-4 encode ~0.05ms → GPU-exec is the gate; GdnCore=1 the lever.
 enum class Kernel : uint8_t {
     EmbedGather,
     // GDN in-projection (4 separate projections: qkv/z 4-bit, a/b DENSE bf16):
@@ -358,6 +358,31 @@ enum class Kernel : uint8_t {
     // Multi-batch-only variants.  APPEND ONLY: all pre-existing serialized
     // Kernel values are part of the M=1 argument-table ABI.
     KvAppendPaged, SdpaPaged, GdnCoreSlotted, GdnPrepSlotted,
+    // ── Gemma 4. APPEND ONLY, same rule as above. ──
+    // Only the kinds whose WEIGHT NAME or ABI differs from a qwen3.5 kind are
+    // here; the rest of the family reuses them, because `self_attn.q_proj` is
+    // `self_attn.q_proj` in both and the consts are bound per ordinal rather
+    // than per kind. The exception is the norm sandwich: gemma4 has four norms
+    // per layer where qwen3.5 has two, so `FfnRms`'s name is already taken by
+    // `post_attention_layernorm` and all three of the others need their own.
+    G4AttnPostNorm,      // post_attention_layernorm
+    G4FfnPreNorm,        // pre_feedforward_layernorm
+    G4FfnPostNorm,       // post_feedforward_layernorm
+    G4VNorm,             // weightless RMS on V, before the KV write
+    G4Geglu,             // gelu_tanh(gate) * up
+    G4LayerScalar,       // learned per-layer gain
+    G4Softcap,           // cap * tanh(logits / cap)
+    G4SdpaSliding,       // sliding-window decode attention
+    // Per-Layer Embeddings.
+    G4PleTokenGather,    // embed_tokens_per_layer
+    G4PleProjGemv,       // per_layer_model_projection
+    G4PleProjNorm,       // per_layer_projection_norm
+    G4PleCombine,        // (proj + token) * 1/sqrt(2)
+    G4PleGateGemv,       // per_layer_input_gate
+    G4PleGeglu,          // gelu_tanh(gate) * ple
+    G4PleProjLayerGemv,  // per_layer_projection
+    G4PleNorm,           // post_per_layer_input_norm
+    G4PleResidual,       // hidden += ple
 };
 
 // ── Bucketed command-buffer key (relaxes "byte-identical CB" → "byte-identical
