@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "model/gemma4/decode_consts.hpp"
+#include "model/gemma4/scratch.hpp"
 #include "model/gemma4/decode_step.hpp"
 #include "model/gemma4/geometry.hpp"
 
@@ -170,6 +171,67 @@ void matvec_shapes_follow_the_layer() {
     expect_eq(qmv_kn(Kind::AttnNorm, g, 0).N, 0, "a norm is not a matvec");
 }
 
+// The dataflow has to be a dataflow: nothing may be read before it is written,
+// and the value the sampler reads has to be the one lm_head produced. A wiring
+// slip here is a wrong token forty kernels later with nothing pointing at it.
+void the_dataflow_never_reads_an_unwritten_value() {
+    std::printf("[dataflow]\n");
+    const Gemma4Geometry g;
+    const std::vector<Dispatch> dag = build_gemma4_dag(g);
+    const ScratchPlan plan = build_gemma4_scratch(dag, g);
+
+    expect(plan.value_count > 0, "the walk produced values");
+    expect(!plan.uses.empty(), "and uses");
+
+    // Uses arrive in DAG order, so a read of a value never seen written is a
+    // read-before-write.
+    std::vector<bool> written(std::size_t(plan.value_count), false);
+    int read_before_write = 0;
+    int last_ordinal = -1;
+    bool ordered = true;
+    for (const Use& u : plan.uses) {
+        ordered = ordered && u.ordinal >= last_ordinal;
+        last_ordinal = u.ordinal;
+        if (u.is_write) {
+            written[std::size_t(u.value)] = true;
+        } else if (!written[std::size_t(u.value)]) {
+            ++read_before_write;
+        }
+    }
+    expect(ordered, "uses come in DAG order");
+    expect_eq(read_before_write, 0, "no dispatch reads a value nothing has written");
+
+    // Every value is read by someone, or producing it was pointless.
+    std::vector<bool> read(std::size_t(plan.value_count), false);
+    for (const Use& u : plan.uses) {
+        if (!u.is_write) read[std::size_t(u.value)] = true;
+    }
+    int dead = 0;
+    for (int v = 0; v < plan.value_count; ++v) {
+        if (!read[std::size_t(v)] && v != plan.logits_value) ++dead;
+    }
+    expect_eq(dead, 0, "every activation produced is consumed");
+
+    expect(plan.logits_value >= 0, "the logits have a value");
+
+    // The residual stream has to be threaded, not reset: the last layer's
+    // scalar output must reach the final norm.
+    int final_rms_ord = -1;
+    for (const Dispatch& d : dag) {
+        if (d.kind == Kind::FinalRms) final_rms_ord = d.ordinal;
+    }
+    int final_rms_input = -2;
+    for (const Use& u : plan.uses) {
+        if (u.ordinal == final_rms_ord && !u.is_write) final_rms_input = u.value;
+    }
+    int last_scalar_out = -3;
+    for (const Use& u : plan.uses) {
+        if (u.ordinal < final_rms_ord && u.is_write) last_scalar_out = u.value;
+    }
+    expect_eq(final_rms_input, last_scalar_out,
+              "the final norm reads what the last layer wrote");
+}
+
 }  // namespace
 
 int main() {
@@ -180,6 +242,7 @@ int main() {
     the_dag_skips_what_a_shared_layer_does_not_have();
     a_family_without_ple_or_softcap_drops_those_dispatches();
     matvec_shapes_follow_the_layer();
+    the_dataflow_never_reads_an_unwritten_value();
     std::printf("\n==== gemma4_decode_step_test: %s ====\n",
                 g_failures == 0 ? "all passed" : "FAILURES");
     return g_failures == 0 ? 0 : 1;
