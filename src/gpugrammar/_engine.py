@@ -64,7 +64,21 @@ _BACKENDS = (_TRITON, _CUDA, _DIFFERENTIAL)
 # kernel's arrival a one-line change here rather than a switch of everything at
 # once. Anything not named is Triton, honestly and by construction.
 _PORTED: frozenset[str] = frozenset(
-    {"candidate", "commit", "mask", "hash", "probe", "copy", "advance_fused"}
+    {
+        "candidate",
+        "commit",
+        "mask",
+        "hash",
+        "probe",
+        "copy",
+        "advance_fused",
+        # `fill_fused` is written and reaches the same mask when the memo is
+        # emptied between steps - and *narrows* it when the memo is live, which
+        # is the one failure this engine must never make. Not shipped until
+        # that is understood: the difference is in what it stores, not in what
+        # it computes, so the suspect is `memo_want` or the floors the claim
+        # reads. `_fill_fused_cuda` stays callable for the investigation.
+    }
 )
 
 
@@ -4331,6 +4345,103 @@ class DeviceBatch:
             grid_y=self.batch,
         )
 
+    def _claim_triton(self, grammar) -> None:
+        _claim_kernel[(self.batch,)](
+            self.depth,
+            self.config_count,
+            self.row_floor,
+            self.memo_store,
+            self.memo_want,
+            CONFIGS=self.configs,
+            MEMO_STRIDE=self.memo_stride,
+            SUFFIXES=_MEMO_SUFFIXES,
+            num_warps=1,
+        )
+
+    def _store_triton(self, grammar) -> None:
+        _store_kernel[(self.batch, (grammar.mask_words + 511) // 512)](
+            self.lexer_state,
+            self.stack,
+            self.depth,
+            self.config_count,
+            self.grammar_of,
+            self.state_hash,
+            self.representative,
+            self.memo_want,
+            self.suffix_hash,
+            self.memo_read,
+            self.memo_hash,
+            self.memo_lexer,
+            self.memo_stack,
+            self.memo_depth,
+            self.memo_count,
+            self.memo_grammar,
+            self.memo_mask,
+            self.mask,
+            grammar.mask_words,
+            CONFIGS=self.configs,
+            STACK_STRIDE=grammar.max_stack,
+            SLOTS=self.memo_slots,
+            MEMO_CONFIGS=self.memo_configs,
+            MEMO_STRIDE=self.memo_stride,
+            SUFFIXES=_MEMO_SUFFIXES,
+            BATCH=triton.next_power_of_2(self.batch),
+            BLOCK=512,
+            num_warps=4,
+        )
+
+    def _fill_fused_cuda(self, grammar) -> None:
+        """Probe, sweep, scatter and claim as one kernel.
+
+        Five graph nodes become one - the count and the scan among them,
+        because a block owns a sequence and its work is its own
+        configurations' groups. `gg_hash` still runs before it, since the
+        neighbour search reads other sequences' fingerprints, and the copy and
+        the store still run after, for the same reason in reverse.
+        """
+        from gpugrammar import _gpugrammar
+
+        _gpugrammar.cuda_launch(
+            "gg_fill_fused",
+            self.batch,
+            min(1024, max(32, (grammar.max_stack + 31) // 32 * 32)),
+            torch.cuda.current_stream().cuda_stream,
+            [
+                self.grammar.arena_struct().data_ptr(),
+                self.state_struct().data_ptr(),
+                self.mask.data_ptr(),
+                self.state_hash.data_ptr(),
+                self.suffix_hash.data_ptr(),
+                self.memo_hash.data_ptr(),
+                self.memo_lexer.data_ptr(),
+                self.memo_stack.data_ptr(),
+                self.memo_depth.data_ptr(),
+                self.memo_count.data_ptr(),
+                self.memo_grammar.data_ptr(),
+                self.memo_read.data_ptr(),
+                self.memo_slot.data_ptr(),
+                self.representative.data_ptr(),
+                self.memo_store.data_ptr(),
+                self.memo_want.data_ptr(),
+                self.row_floor.data_ptr(),
+                self._fused_scratch(grammar).data_ptr(),
+                self.high_water.data_ptr(),
+            ],
+            [
+                self.configs,
+                grammar.max_stack,
+                grammar.max_reductions,
+                grammar.window,
+                grammar.paths,
+                grammar.has_verdicts,
+                self.memo_slots,
+                self.memo_configs,
+                self.memo_stride,
+                _MEMO_SUFFIXES,
+                grammar.mask_words,
+            ],
+        )
+
     def _fused_scratch(self, grammar) -> torch.Tensor:
         """Two replay windows per (sequence, configuration).
 
@@ -4825,6 +4936,13 @@ class DeviceBatch:
         """
         if not _PORTED:
             return self._fill_triton()
+        if "fill_fused" in _PORTED:
+            grammar = self.grammar
+            self._hash_cuda(grammar)
+            self._fill_fused_cuda(grammar)
+            self._copy_cuda(grammar)
+            self._store_triton(grammar)
+            return self.mask
         return self._fill_triton(
             mask=self._mask_cuda if "mask" in _PORTED else None,
             hash=self._hash_cuda if "hash" in _PORTED else None,
@@ -4977,47 +5095,7 @@ class DeviceBatch:
             BLOCK=128,
             num_warps=1,
         )
-        words = (grammar.mask_words + 511) // 512
-        _claim_kernel[(self.batch,)](
-            self.depth,
-            self.config_count,
-            self.row_floor,
-            self.memo_store,
-            self.memo_want,
-            CONFIGS=self.configs,
-            MEMO_STRIDE=self.memo_stride,
-            SUFFIXES=_MEMO_SUFFIXES,
-            num_warps=1,
-        )
+        self._claim_triton(grammar)
         (copy or self._copy_triton)(grammar)
-        _store_kernel[(self.batch, words)](
-            self.lexer_state,
-            self.stack,
-            self.depth,
-            self.config_count,
-            self.grammar_of,
-            self.state_hash,
-            self.representative,
-            self.memo_want,
-            self.suffix_hash,
-            self.memo_read,
-            self.memo_hash,
-            self.memo_lexer,
-            self.memo_stack,
-            self.memo_depth,
-            self.memo_count,
-            self.memo_grammar,
-            self.memo_mask,
-            self.mask,
-            grammar.mask_words,
-            CONFIGS=self.configs,
-            STACK_STRIDE=grammar.max_stack,
-            SLOTS=self.memo_slots,
-            MEMO_CONFIGS=self.memo_configs,
-            MEMO_STRIDE=self.memo_stride,
-            SUFFIXES=_MEMO_SUFFIXES,
-            BATCH=triton.next_power_of_2(self.batch),
-            BLOCK=512,
-            num_warps=4,
-        )
+        self._store_triton(grammar)
         return self.mask

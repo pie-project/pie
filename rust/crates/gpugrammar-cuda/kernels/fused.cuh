@@ -251,3 +251,264 @@ extern "C" __global__ void gg_advance_fused(
         atomicMax(state->widest, written);
     }
 }
+
+/// The fill's middle, as one kernel: probe, sweep, scatter, claim.
+///
+/// Five graph nodes become one - the count and the scan among them, because a
+/// block owns a sequence and its work is its own configurations' groups. There
+/// is nothing to prefix-sum and no owner to search for.
+///
+/// `gg_hash` still runs first: the neighbour search reads *other* sequences'
+/// fingerprints, and a block cannot read what a sibling has not written yet.
+/// `gg_copy` and the store still run after, for the same reason in reverse.
+extern "C" __global__ void gg_fill_fused(
+    const gg::Arena* arena,
+    gg::BatchState* state,
+    int32_t* mask,
+    const int32_t* hash,
+    const int32_t* suffix_hash,
+    const int32_t* memo_hash,
+    const int32_t* memo_lexer,
+    const int32_t* memo_stack,
+    const int32_t* memo_depth,
+    const int32_t* memo_count,
+    const int32_t* memo_grammar,
+    const int32_t* memo_read,
+    int32_t* memo_slot,
+    int32_t* representative,
+    int32_t* memo_store,
+    int32_t* memo_want,
+    int32_t* row_floor,
+    int32_t* scratch,
+    int32_t* high_water,
+    int32_t configs,
+    int32_t stack_stride,
+    int32_t max_reductions,
+    int32_t window,
+    int32_t paths,
+    int32_t has_verdicts,
+    int32_t slots,
+    int32_t memo_configs,
+    int32_t memo_stride,
+    int32_t suffixes,
+    int32_t mask_words) {
+    int32_t sequence = blockIdx.x;
+    int32_t lane = threadIdx.x;
+    int32_t count = state->config_count[sequence];
+    int32_t grammar = state->grammar_of[sequence];
+
+    // Phase one: has this answer been produced, in an earlier step or by an
+    // earlier sequence in this one?
+    int32_t found = -1;
+    for (int32_t attempt = 0; attempt <= suffixes && found < 0; ++attempt) {
+        int32_t want = attempt == 0 ? -1 : attempt;
+        int32_t digest = attempt == 0 ? hash[sequence]
+                                      : suffix_hash[sequence * suffixes + attempt - 1];
+        int32_t slot = (int32_t)(((uint32_t)digest & 0x7fffffffu) % (uint32_t)slots);
+        if (count > memo_configs) {
+            continue;
+        }
+        bool same = memo_hash[slot] == digest && memo_read[slot] == want
+                    && memo_count[slot] == count && memo_grammar[slot] == grammar;
+        for (int32_t config = 0; config < count && same; ++config) {
+            int32_t row = sequence * configs + config;
+            int64_t held = (int64_t)slot * memo_configs + config;
+            int32_t depth = state->depth[row];
+            int32_t kept = want > 0 ? min(depth, want) : depth;
+            if (state->lexer_state[row] != memo_lexer[held] || kept != memo_depth[held]) {
+                same = false;
+            }
+            int32_t differs = 0;
+            for (int32_t at = lane; at < kept && at < memo_stride; at += blockDim.x) {
+                if (state->stack[(int64_t)row * stack_stride + depth - kept + at]
+                    != memo_stack[held * memo_stride + at]) {
+                    differs = 1;
+                }
+            }
+            if (__syncthreads_or(differs)) {
+                same = false;
+            }
+        }
+        if (same) {
+            found = slot;
+        }
+    }
+
+    int32_t neighbour = sequence;
+    if (found < 0) {
+        int32_t digest = hash[sequence];
+        for (int32_t other = 0; other < sequence && neighbour == sequence; ++other) {
+            if (hash[other] != digest || state->config_count[other] != count
+                || state->grammar_of[other] != grammar) {
+                continue;
+            }
+            bool same = true;
+            for (int32_t config = 0; config < count && same; ++config) {
+                int32_t a = sequence * configs + config;
+                int32_t b = other * configs + config;
+                int32_t depth = state->depth[a];
+                if (state->lexer_state[a] != state->lexer_state[b]
+                    || depth != state->depth[b]) {
+                    same = false;
+                }
+                int32_t differs = 0;
+                for (int32_t at = lane; at < depth; at += blockDim.x) {
+                    if (state->stack[(int64_t)a * stack_stride + at]
+                        != state->stack[(int64_t)b * stack_stride + at]) {
+                        differs = 1;
+                    }
+                }
+                if (__syncthreads_or(differs)) {
+                    same = false;
+                }
+            }
+            if (same) {
+                neighbour = other;
+            }
+        }
+    }
+    if (lane == 0) {
+        memo_slot[sequence] = found;
+        representative[sequence] = neighbour;
+    }
+
+    bool computes = found < 0 && neighbour == sequence;
+    if (lane == 0) {
+        memo_store[sequence] = (computes && count <= memo_configs) ? 1 : -1;
+    }
+    if (!computes) {
+        // Nothing to sweep: the copy will give this sequence its row. The
+        // floors still have to be seeded, since the claim reads them.
+        for (int32_t config = lane; config < count; config += blockDim.x) {
+            row_floor[sequence * configs + config] = state->depth[sequence * configs + config];
+        }
+        if (lane == 0) {
+            // -2, not -1: the claim's "this sequence may not store" is a
+            // different answer from "it may, under the whole-stack key".
+            memo_want[sequence] = -2;
+        }
+        return;
+    }
+
+    // Only what computes has to start empty; everything else is written whole
+    // by the copy.
+    for (int32_t at = lane; at < mask_words; at += blockDim.x) {
+        mask[(int64_t)sequence * mask_words + at] = 0;
+    }
+    for (int32_t config = lane; config < count; config += blockDim.x) {
+        row_floor[sequence * configs + config] = state->depth[sequence * configs + config];
+    }
+    __syncthreads();
+
+    // Phase two: sweep this sequence's groups. A configuration whose lexer
+    // state an earlier one already carried adds nothing - the groups are the
+    // same and so is the answer.
+    int32_t group_base = gg::base_of(arena, grammar, gg::B_GROUP_OFFSETS);
+    int32_t groups = gg::base_of(arena, grammar, gg::B_GROUPS);
+    int32_t payload_base = gg::base_of(arena, grammar, gg::B_SET_PAYLOAD);
+    gg::Tables t = gg::tables_of(arena, grammar);
+    int32_t deepest = 0;
+
+    for (int32_t config = 0; config < count; ++config) {
+        int32_t row = sequence * configs + config;
+        int32_t lexer = state->lexer_state[row];
+        bool seen = false;
+        for (int32_t earlier = 0; earlier < config; ++earlier) {
+            if (state->lexer_state[sequence * configs + earlier] == lexer) {
+                seen = true;
+            }
+        }
+        if (seen) {
+            continue;
+        }
+        int32_t first = arena->group_offsets[group_base + lexer];
+        int32_t last = arena->group_offsets[group_base + lexer + 1];
+        int32_t depth = state->depth[row];
+        int64_t base = (int64_t)row * stack_stride;
+
+        for (int32_t slot = lane; slot < last - first; slot += blockDim.x) {
+            int32_t group = first + slot;
+            int32_t settled = 0;
+            if (has_verdicts) {
+                int32_t stride = arena->verdict_stride[
+                    gg::base_of(arena, grammar, gg::B_VERDICT_STRIDE) + lexer];
+                if (stride > 0) {
+                    int32_t top = state->stack[base + depth - 1];
+                    const int32_t* word = arena->verdicts
+                        + gg::base_of(arena, grammar, gg::B_VERDICTS)
+                        + arena->verdict_offsets[
+                            gg::base_of(arena, grammar, gg::B_VERDICT_OFFSETS) + lexer]
+                        + (int64_t)top * stride + (slot >> 4);
+                    settled = (*word >> (2 * (slot & 15))) & 3;
+                }
+            }
+            if (settled != 0) {
+                continue;
+            }
+            int32_t* mine = scratch + (int64_t)(sequence * configs + (slot % configs))
+                                          * 2 * window;
+            gg::Verdict v = gg::replay_group(t, state->stack, base, mine, mine + window,
+                                             depth, group, max_reductions, paths,
+                                             stack_stride, window, state->overflow,
+                                             sequence);
+            if (v.read < depth) {
+                atomicMin(&row_floor[row], v.read);
+            }
+            deepest = max(deepest, v.reach);
+            if (!v.admitted) {
+                continue;
+            }
+            // Phase three, inline: write this group's set. Every kind writes
+            // an OR of a value it decided by itself, so no ordering between
+            // threads can undo it.
+            int32_t kind = arena->group_set_kind[groups + group];
+            int32_t offset = arena->group_set_offset[groups + group];
+            int32_t length = arena->group_set_length[groups + group];
+            const int32_t* payload = arena->set_payload + payload_base + offset;
+            int32_t* row_mask = mask + (int64_t)sequence * mask_words;
+            if (kind == gg::DENSE) {
+                for (int32_t at = 0; at < mask_words; ++at) {
+                    atomicOr(&row_mask[at], payload[at]);
+                }
+            } else if (kind == gg::SPARSE) {
+                for (int32_t at = 0; at < length; ++at) {
+                    int32_t token = payload[at];
+                    atomicOr(&row_mask[token >> 5], 1 << (token & 31));
+                }
+            } else {
+                // Setting the row and punching the exclusions out is only
+                // correct while there is one complement; a sequence at two
+                // lexer states can have two, and the second erased what the
+                // first admitted. So each word is decided before it is written.
+                int32_t cursor = 0;
+                for (int32_t at = 0; at < mask_words; ++at) {
+                    int32_t value = -1;
+                    while (cursor < length && (payload[cursor] >> 5) == at) {
+                        value &= ~(1 << (payload[cursor] & 31));
+                        ++cursor;
+                    }
+                    atomicOr(&row_mask[at], value);
+                }
+            }
+        }
+    }
+    __syncthreads();
+    if (lane == 0) {
+        atomicMax(high_water, deepest);
+    }
+
+    // Phase four: how much of the stack this answer turned out to need.
+    if (lane == 0) {
+        int32_t need = 1;
+        bool keep = true;
+        for (int32_t config = 0; config < count; ++config) {
+            int32_t row = sequence * configs + config;
+            int32_t depth = state->depth[row];
+            need = max(need, depth - row_floor[row] + 1);
+            if (depth > memo_stride) {
+                keep = false;
+            }
+        }
+        memo_want[sequence] = (keep && need <= suffixes) ? need : (keep ? -1 : -2);
+    }
+}
