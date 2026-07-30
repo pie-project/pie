@@ -118,6 +118,42 @@ bool g4_tap_for(const gemma4::Dispatch& d, const Gemma4Geometry& g, G4Tap& out) 
     }
 }
 
+/// How wide each pool colour has to be, in elements.
+///
+/// Sizing every slot at the widest activation -- the vocabulary -- costs
+/// `colors * rows * vocab * 2`, which at a 10240-row fire is 174 GB of address
+/// space for a model whose weights are 2.6. Only the two tail colours are
+/// vocabulary-wide, and only the tail runs at `head_rows`; everything else is
+/// hidden- or PLE-table-wide over every row.
+std::vector<std::size_t> g4_pool_elems(const std::vector<gemma4::Dispatch>& dag,
+                                       const Gemma4Geometry& g,
+                                       const gemma4::ScratchColoring& col, int rows,
+                                       int head_rows) {
+    std::vector<std::size_t> elems(std::size_t(col.colors_used), 0);
+    for (std::size_t di = 0; di < dag.size() && di < col.per_dispatch.size(); ++di) {
+        G4Tap t{};
+        if (!g4_tap_for(dag[di], g, t)) continue;
+        // The tail's tensors have one row per SAMPLED row; the body's have one
+        // per token.
+        const bool tail = dag[di].kind == gemma4::Kind::LmHead ||
+                          dag[di].kind == gemma4::Kind::FinalSoftcap ||
+                          dag[di].kind == gemma4::Kind::FinalRms ||
+                          dag[di].kind == gemma4::Kind::RowGather;
+        const std::size_t need =
+            std::size_t(tail ? head_rows : rows) * std::size_t(t.width);
+        for (const auto& sb : col.per_dispatch[di]) {
+            if (sb.color < 0 || sb.color >= col.colors_used) continue;
+            // Every buffer of the dispatch, not only its output: an input read
+            // at this width must be at least this wide too.
+            elems[std::size_t(sb.color)] = std::max(elems[std::size_t(sb.color)], need);
+        }
+    }
+    for (std::size_t& e : elems) {
+        if (e == 0) e = std::size_t(rows) * std::size_t(g.hidden);
+    }
+    return elems;
+}
+
 /// Only a colour's FINAL writer is named: the in-place kinds share a buffer with
 /// the tap before them, and publishing the earlier tensor under the earlier name
 /// reads as a divergence that is really the dump lying.
@@ -170,7 +206,12 @@ class Gemma4Engine final : public SimpleFamilyEngine {
         const int ps = g_.kv_page_size;
         g_.kv_max_ctx = ((max_ctx_ + ps - 1) / ps) * ps;
         g_.total_pages = g_.kv_max_ctx / ps;
-        max_rows_ = cfg.max_forward_tokens > 0 ? cfg.max_forward_tokens : 1;
+        max_rows_ = cfg.max_forward_tokens > 0 ? int(cfg.max_forward_tokens) : 1;
+        // At most one row per request is sampled -- the last of its span, whose
+        // logits become its next token -- so the tail is bounded by the request
+        // count, not the token count.
+        max_sampled_ = cfg.max_forward_requests > 0 ? int(cfg.max_forward_requests) : 1;
+        if (max_sampled_ > max_rows_) max_sampled_ = max_rows_;
 
         try {
             const auto storage = load_plan.view();
@@ -213,18 +254,22 @@ class Gemma4Engine final : public SimpleFamilyEngine {
             return false;
         }
         // Every activation is [rows, width] row-major at M>1, so a pool slot is
-        // `max_rows` of the widest one.
+        // as many rows of its own width as the widest dispatch that touches it.
         b_.pool.resize(std::size_t(coloring_.colors_used));
-        const std::size_t widest = std::size_t(max_rows_) * std::size_t(g_.vocab) * 2;
-        for (int c = 0; c < coloring_.colors_used; ++c) b_.pool[std::size_t(c)] = ctx.heap_alloc(widest);
+        const std::vector<std::size_t> elems =
+            g4_pool_elems(dag_, g_, coloring_, max_rows_, max_sampled_);
+        for (int c = 0; c < coloring_.colors_used; ++c) {
+            b_.pool[std::size_t(c)] = ctx.heap_alloc(elems[std::size_t(c)] * 2);
+        }
 
         b_.io.resize(kIoSlotCount);
         const std::size_t io_bytes =
             std::max<std::size_t>(4096, std::size_t(g_.total_pages + max_rows_ + 8) * 4);
         for (int i = 0; i < kIoSlotCount; ++i) b_.io[i] = ctx.heap_alloc(io_bytes);
         // The logits leave the pool: the sampler reads a slot of its own, so the
-        // tail writes there and nothing copies afterwards.
-        logits_ = ctx.heap_alloc(widest);
+        // tail writes there and nothing copies afterwards. One row per SAMPLED
+        // row, which is what the tail produces.
+        logits_ = ctx.heap_alloc(std::size_t(max_sampled_) * std::size_t(g_.vocab) * 2);
         if (!logits_.valid()) {
             if (err) *err = "gemma4 logits allocation failed";
             return false;
@@ -234,8 +279,9 @@ class Gemma4Engine final : public SimpleFamilyEngine {
         if (!load_decode_psos(ctx, kernels_dir, base_, /*with_argmax=*/false, err)) return false;
         if (!load_multibatch_psos(ctx, kernels_dir, mb_, /*with_d512=*/true, err)) return false;
 
-        gemma4::bind_gemma4_consts(ctx, dag_, g_, /*rows=*/1, /*paged=*/true);
+        gemma4::bind_gemma4_consts(ctx, dag_, g_, /*rows=*/1, /*paged=*/true, /*head_rows=*/1);
         bound_rows_ = 1;
+        bound_head_rows_ = 1;
         try {
             gemma4::bind_gemma4_dag_mb(ctx, b_, dag_, g_, coloring_, kpages_, vpages_);
         } catch (const std::exception& e) {
@@ -290,15 +336,18 @@ class Gemma4Engine final : public SimpleFamilyEngine {
             csr.kv_page_indices[std::size_t(p)] = std::uint32_t(p);
         }
         csr.kv_page_indptr = {0u, std::uint32_t(g_.total_pages)};
-        return fire(ctx, csr);
+        csr.sample_rows = {0u};
+        return fire(ctx, csr, {}, {});
     }
 
     bool paged() const override { return true; }
     int max_rows() const override { return max_rows_; }
+    int max_sampled_rows() const override { return max_sampled_; }
     int page_size() const override { return g_.kv_page_size; }
     int total_pages() const override { return g_.total_pages; }
 
-    StepTiming fire(RawMetalContext& ctx, const FireCsr& csr) override {
+    StepTiming fire(RawMetalContext& ctx, const FireCsr& csr, const EncodeHook& pre,
+                    const EncodeHook& post) override {
         const int rows = int(csr.token_ids.size());
         if (rows <= 0 || rows > max_rows_) return StepTiming{};
         write_u32s(b_.io[int(IoSlot::TokenId)], csr.token_ids);
@@ -309,6 +358,15 @@ class Gemma4Engine final : public SimpleFamilyEngine {
         write_u32s(b_.io[int(IoSlot::QoIndptr)], csr.qo_indptr);
         write_u32s(b_.io[int(IoSlot::KvPageIndices)], csr.kv_page_indices);
         write_u32s(b_.io[int(IoSlot::KvPageIndptr)], csr.kv_page_indptr);
+        const int head_rows = csr.sample_rows.empty() ? rows : int(csr.sample_rows.size());
+        if (csr.sample_rows.empty()) {
+            std::vector<std::uint32_t> every;
+            every.resize(std::size_t(rows));
+            for (int r = 0; r < rows; ++r) every[std::size_t(r)] = std::uint32_t(r);
+            write_u32s(b_.io[int(IoSlot::SampleRows)], every);
+        } else {
+            write_u32s(b_.io[int(IoSlot::SampleRows)], csr.sample_rows);
+        }
         // The causal bound at M>1 comes from PositionIds, and the window from
         // the layer's own constant, so no dense mask is needed. SeqLen is the
         // M=1 ring's port and is set for the ABI's sake, not because the paged
@@ -318,12 +376,16 @@ class Gemma4Engine final : public SimpleFamilyEngine {
         if (b_.io[int(IoSlot::AttnMaskEnabled)].contents() != nullptr) {
             std::memset(b_.io[int(IoSlot::AttnMaskEnabled)].contents(), 0, std::size_t(rows));
         }
-        if (bound_rows_ != rows) {
-            gemma4::bind_gemma4_consts(ctx, dag_, g_, rows, /*paged=*/true);
+        if (bound_rows_ != rows || bound_head_rows_ != head_rows) {
+            gemma4::bind_gemma4_consts(ctx, dag_, g_, rows, /*paged=*/true, head_rows);
             bound_rows_ = rows;
+            bound_head_rows_ = head_rows;
         }
         return ctx.run_step([&](StepEncoder& se) {
-            gemma4::encode_gemma4_step_mb(se, dag_, g_, rows, base_, mb_, psos_);
+            if (pre) pre(se);
+            gemma4::encode_gemma4_step_mb(se, dag_, g_, rows, base_, mb_, psos_,
+                                          /*ordinal_base=*/0, head_rows);
+            if (post) post(se);
         });
     }
 
@@ -339,7 +401,9 @@ class Gemma4Engine final : public SimpleFamilyEngine {
     gemma4::Gemma4Geometry g_{};
     int max_ctx_ = 0;
     int max_rows_ = 1;
+    int max_sampled_ = 1;
     int bound_rows_ = 0;
+    int bound_head_rows_ = 0;
     std::vector<gemma4::Dispatch> dag_{};
     gemma4::ScratchColoring coloring_{};
     gemma4::BoundGemma4 b_{};
@@ -458,10 +522,6 @@ std::size_t SimpleFamilyEngine::extra_heap_bytes(pie::metal::model::ModelFamily 
     // generous: this is a budget, and a context that is too small fails at
     // `heap_alloc` with no diagnosis of which allocation ran out.
     std::size_t bytes = std::size_t(256) << 20;
-    // Under a tap dump the colouring stops recycling, so the pool is one slot
-    // per dispatch rather than a handful. Debug-only; the budget is address
-    // space, not resident memory.
-    const std::size_t pool_slots = golden_taps_enabled() ? 1024 : 32;
     if (family == pie::metal::model::ModelFamily::Gemma4) {
         gemma4::Gemma4Geometry g;
         std::string ignore;
@@ -471,15 +531,29 @@ std::size_t SimpleFamilyEngine::extra_heap_bytes(pie::metal::model::ModelFamily 
         // total rounds `max_ctx` up to a page. One page's slack per layer.
         bytes += std::size_t(g.n_layers) * 2 * 32 * std::size_t(g.n_kv_heads) *
                  std::size_t(g.global_head_dim > 0 ? g.global_head_dim : g.head_dim) * 2;
-        // The pool's widest slot is the vocabulary; the colouring uses a handful.
-        const std::size_t rows = std::size_t(cfg.max_forward_tokens > 0 ? cfg.max_forward_tokens : 1);
-        bytes += pool_slots * rows * std::size_t(g.vocab) * 2;
+        // The activation pool, summed from the SAME colouring the engine will
+        // build. The DAG, the dataflow and the colouring are pure, so asking
+        // them here costs microseconds and removes the guess -- a fudge factor
+        // that over-counts by 32x on the widest slot is 174 GB at a 10240-row
+        // fire, and one that under-counts fails at `heap_alloc` naming nothing.
+        int rows = cfg.max_forward_tokens > 0 ? int(cfg.max_forward_tokens) : 1;
+        int sampled = cfg.max_forward_requests > 0 ? int(cfg.max_forward_requests) : 1;
+        if (sampled > rows) sampled = rows;
+        gemma4::Gemma4Geometry pg = g;
+        pg.paged_kv_enabled = true;
+        const auto dag = gemma4::build_gemma4_dag_mb(pg, 0, /*with_argmax=*/false);
+        const gemma4::ScratchPlan sp = gemma4::build_gemma4_scratch(dag, pg);
+        const gemma4::ScratchColoring col =
+            gemma4::color_gemma4_scratch(dag, sp, /*no_recycle=*/golden_taps_enabled());
+        for (const std::size_t e : g4_pool_elems(dag, pg, col, rows, sampled)) bytes += e * 2;
+        bytes += std::size_t(sampled) * std::size_t(g.vocab) * 2;  // the logits slot
     } else if (family == pie::metal::model::ModelFamily::GptOss) {
         gptoss::GptOssGeometry g;
         std::string ignore;
         if (!gptoss_geometry(cfg, g, max_ctx, &ignore)) return bytes;
         bytes += std::size_t(g.n_layers) * 2 * gptoss::gptoss_kv_bytes_per_layer(g, max_ctx, 2);
-        bytes += pool_slots * std::size_t(gptoss::gptoss_widest_elems(g)) * 2;
+        bytes += std::size_t(golden_taps_enabled() ? 1024 : 32) *
+                 std::size_t(gptoss::gptoss_widest_elems(g)) * 2;
     }
     return bytes;
 }

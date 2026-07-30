@@ -86,11 +86,16 @@ KN qmv_kn(Kind k, const Gemma4Geometry& g, int layer) {
 }
 
 int bind_gemma4_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
-                       const Gemma4Geometry& g, int rows, bool paged) {
+                       const Gemma4Geometry& g, int rows, bool paged, int head_rows) {
     // `rows` is the token count. Only two kinds of constant depend on it: a
     // GEMM needs to be told M, and an elementwise kernel over a contiguous
     // [rows, width] buffer counts rows*width. Everything else is geometry.
     const std::uint32_t R = std::uint32_t(rows < 1 ? 1 : rows);
+    // The tail runs on the SAMPLED rows, which `RowGather` compacted. Defaulting
+    // to `rows` keeps a caller that samples every row -- the raw tests -- saying
+    // one number instead of two.
+    const std::uint32_t S =
+        head_rows < 1 ? R : std::min(R, std::uint32_t(head_rows));
     int count = 0;
     for (const Dispatch& d : dag) {
         const int ord = d.ordinal;
@@ -100,12 +105,13 @@ int bind_gemma4_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
         if (const KN kn = qmv_kn(d.kind, g, L); kn.N != 0) {
             bind_const<std::int32_t>(ctx, ord, (std::uint8_t)bind::Qmv::K, kn.K, &count);
             bind_const<std::int32_t>(ctx, ord, (std::uint8_t)bind::Qmv::N, kn.N, &count);
+            const std::uint32_t m = d.kind == Kind::LmHead ? S : R;
             // The GEMM shares Qmv's ordinals 0-6 and appends M. Bound
             // unconditionally: at rows==1 the matvec simply never reads slot 7,
             // and an unbound slot on the prefill path is a row count read out of
             // uninitialized memory.
             bind_const<std::int32_t>(ctx, ord, (std::uint8_t)bind::Qmm::M,
-                                     std::int32_t(R), &count);
+                                     std::int32_t(m), &count);
             continue;
         }
 
@@ -272,7 +278,7 @@ int bind_gemma4_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
             }
             case Kind::FinalSoftcap: {
                 // Rows scale it: the cap covers the whole [rows, vocab] block.
-                const SoftcapParams p{g.final_softcap, R * std::uint32_t(g.vocab)};
+                const SoftcapParams p{g.final_softcap, S * std::uint32_t(g.vocab)};
                 bind_const<SoftcapParams>(ctx, ord, (std::uint8_t)bind::Softcap::Params, p, &count);
                 break;
             }
@@ -294,6 +300,13 @@ int bind_gemma4_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                 bind_const<float>(ctx, ord, (std::uint8_t)bind::Embed::Scale,
                                   std::sqrt(float(g.per_layer_emb_dim)), &count);
                 break;
+
+            case Kind::RowGather: {
+                const RowGatherParams p{std::uint32_t(g.hidden), S};
+                bind_const<RowGatherParams>(ctx, ord, (std::uint8_t)bind::RowGather::Params, p,
+                                            &count);
+                break;
+            }
 
             default:
                 break;

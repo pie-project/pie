@@ -21,6 +21,7 @@
 /// second M=1-only DAG whose only distinction is that it cannot batch.
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -71,6 +72,11 @@ class SimpleFamilyEngine {
         std::vector<std::uint32_t> qo_indptr;
         std::vector<std::uint32_t> kv_page_indices;
         std::vector<std::uint32_t> kv_page_indptr;
+        /// Which rows this fire will sample, in readout order. The tail runs
+        /// over these and no others -- a prefill computes every row of the body
+        /// and reads one per request, and the LM head is the step's most
+        /// expensive dispatch by two orders of magnitude.
+        std::vector<std::uint32_t> sample_rows;
     };
 
     virtual int vocab() const = 0;
@@ -84,13 +90,25 @@ class SimpleFamilyEngine {
     /// The most rows one `fire` may carry, and the page geometry the runtime
     /// must allocate against. Meaningless unless `paged()`.
     virtual int max_rows() const { return 1; }
+    /// The most logits rows one fire may produce. Bounded by the request count
+    /// rather than the token count: a request samples one row.
+    virtual int max_sampled_rows() const { return 1; }
     virtual int page_size() const { return 1; }
     virtual int total_pages() const { return 0; }
 
-    /// Fire `csr`. The logits slot holds one row per token, in `csr` order.
-    virtual StepTiming fire(RawMetalContext& ctx, const FireCsr& csr) {
+    /// Fire `csr`. The logits slot holds one row per SAMPLED row, in
+    /// `csr.sample_rows` order.
+    ///
+    /// `pre`/`post` are encoded into the same command buffer, before and after
+    /// the model — PTIR's device program rides along that way rather than in a
+    /// second submission.
+    using EncodeHook = std::function<void(StepEncoder&)>;
+    virtual StepTiming fire(RawMetalContext& ctx, const FireCsr& csr,
+                            const EncodeHook& pre = {}, const EncodeHook& post = {}) {
         (void)ctx;
         (void)csr;
+        (void)pre;
+        (void)post;
         return StepTiming{};
     }
 

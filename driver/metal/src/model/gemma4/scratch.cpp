@@ -37,6 +37,7 @@ constexpr std::uint8_t VNormX = 0, VNormOut = 1;
 constexpr std::uint8_t ScalarX = 0, ScalarOut = 2;
 constexpr std::uint8_t CombineProj = 0, CombineToken = 1, CombineOut = 2;
 constexpr std::uint8_t SoftcapIn = 0, SoftcapOut = 1;
+constexpr std::uint8_t GatherIn = 0, GatherOut = 1;
 }  // namespace bi
 
 ScratchPlan build_gemma4_scratch(const std::vector<Dispatch>& dag, const Gemma4Geometry& g) {
@@ -226,6 +227,18 @@ ScratchPlan build_gemma4_scratch(const std::vector<Dispatch>& dag, const Gemma4G
             }
 
             // ── tail ──
+            // The sampled rows, compacted: everything after this is [S, *].
+            // It writes a value of its own rather than in place, because its
+            // input is the last layer's output at [N, hidden] and its output is
+            // a DIFFERENT shape -- aliasing them would make the pool's slot
+            // sizing a lie.
+            case Kind::RowGather: {
+                const int gathered = fresh();
+                rd(o, bi::GatherIn, resid);
+                wr(o, bi::GatherOut, gathered);
+                resid = gathered;
+                break;
+            }
             case Kind::FinalRms:
                 normed = fresh();
                 rd(o, bi::RmsX, resid);

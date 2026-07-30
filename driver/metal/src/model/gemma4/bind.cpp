@@ -113,6 +113,10 @@ void bind_gemma4_dag(RawMetalContext& ctx, const BoundGemma4& b, const std::vect
                 bind_slot(ctx, ord, (std::uint8_t)bind::Sdpa::N, io(IoSlot::SeqLen));
                 break;
             }
+            case Kind::RowGather:
+                bind_slot(ctx, ord, (std::uint8_t)bind::RowGather::Rows,
+                          io(IoSlot::SampleRows));
+                break;
             case Kind::Argmax:
                 bind_slot(ctx, ord, 1, io(IoSlot::TokenId));
                 break;
@@ -170,6 +174,12 @@ void bind_gemma4_dag_mb(RawMetalContext& ctx, const BoundGemma4& b,
             case Kind::RopeQ:
             case Kind::RopeK:
                 bind_row(ord, (std::uint8_t)bind::Rope::Position, IoSlot::Position);
+                break;
+            // NOT row-offset: it indexes the fire's rows, so it reads the slot
+            // whole.
+            case Kind::RowGather:
+                bind_slot(ctx, ord, (std::uint8_t)bind::RowGather::Rows,
+                          io(IoSlot::SampleRows));
                 break;
             case Kind::KvAppend: {
                 // An owning layer scatters into its OWN pages -- `kv_source` is

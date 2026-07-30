@@ -368,6 +368,13 @@ int main(int argc, char** argv) {
         write_u32s(b.io[int(IoSlot::KvPageIndices)], page_indices);
         write_u32s(b.io[int(IoSlot::KvPageIndptr)], indptr);
         write_u32s(b.io[int(IoSlot::QoIndptr)], qo);
+        // This test samples EVERY row -- it compares all of them against mlx-lm
+        // -- so the tail's gather is the identity and the rows keep the indices
+        // the taps and the assertions below use.
+        std::vector<std::uint32_t> sample;
+        sample.resize(std::size_t(rows));
+        for (int i = 0; i < rows; ++i) sample[std::size_t(i)] = std::uint32_t(i);
+        write_u32s(b.io[int(IoSlot::SampleRows)], sample);
         std::memset(b.io[int(IoSlot::AttnMaskEnabled)].contents(), 0, std::size_t(rows));
     };
     fill_io(ids, {0u}, g.total_pages);

@@ -34,7 +34,11 @@ KN qmv_kn(Kind k, const Gemma4Geometry& g, int layer);
 /// put different meanings at the same slot indices. Binding the contiguous
 /// constants against the paged shader is not a crash: `bind::Sdpa::KHeadStride`
 /// is `bind::SdpaPaged::ReqOfToken`, so it is a stride read as a pointer.
+/// `head_rows` is how many rows the fire will SAMPLE -- what `Kind::RowGather`
+/// compacts, and what the tail after it runs on. 0 means "all of them", which
+/// is what a test that reads every row wants.
 int bind_gemma4_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
-                       const Gemma4Geometry& g, int rows = 1, bool paged = false);
+                       const Gemma4Geometry& g, int rows = 1, bool paged = false,
+                       int head_rows = 0);
 
 }  // namespace pie::metal::gemma4

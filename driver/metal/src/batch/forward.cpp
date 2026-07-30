@@ -567,8 +567,10 @@ struct MetalExecutor::Impl {
     std::unique_ptr<SimpleFamilyEngine> simple_{};
     bool is_simple() const { return simple_ != nullptr; }
     SimpleFamilyEngine* simple_engine() const { return simple_.get(); }
-    StepTiming fire_simple(const SimpleFamilyEngine::FireCsr& csr) {
-        const StepTiming t = simple_->fire(*ctx_, csr);
+    StepTiming fire_simple(const SimpleFamilyEngine::FireCsr& csr,
+                           const SimpleFamilyEngine::EncodeHook& pre = {},
+                           const SimpleFamilyEngine::EncodeHook& post = {}) {
+        const StepTiming t = simple_->fire(*ctx_, csr, pre, post);
         if (golden_taps_enabled()) simple_->dump_taps(int(csr.token_ids.size()));
         return t;
     }
@@ -2396,7 +2398,12 @@ RawMetalContext* MetalExecutor::command_context() {
 }
 
 SlotHandle MetalExecutor::logits_device_slot() const {
-    return ready() ? impl_->b_.io[int(IoSlot::Logits)] : SlotHandle{};
+    if (!ready()) return SlotHandle{};
+    // `b_.io[Logits]` is qwen3.5's. A simple family's tail writes a slot of its
+    // own, and PTIR's device program samples from whatever this names -- so
+    // naming an unallocated buffer is silent, and reads as logits of zero.
+    return impl_->is_simple() ? impl_->simple_engine()->logits_slot()
+                              : impl_->b_.io[int(IoSlot::Logits)];
 }
 
 std::uint32_t MetalExecutor::rs_slots() const {
@@ -3210,6 +3217,14 @@ bool MetalExecutor::run_simple_batch_forward(const std::vector<MemberForwardDesc
                           std::to_string(eng->max_rows()) + "-row forward budget");
             continue;
         }
+        // The tail is allocated per SAMPLED row, not per token, so it has a
+        // bound of its own.
+        if (csr.sample_rows.size() + d.readout_local_indices.size() >
+            std::size_t(eng->max_sampled_rows())) {
+            reject(i, "this fire would read more than the driver's " +
+                          std::to_string(eng->max_sampled_rows()) + " logits rows");
+            continue;
+        }
         // `add`'s indptrs are this member's own cumulative counts, one entry
         // per request and no leading zero; the fire's carry a leading zero and
         // continue from where the previous member left off.
@@ -3228,6 +3243,12 @@ bool MetalExecutor::run_simple_batch_forward(const std::vector<MemberForwardDesc
         csr.w_off.insert(csr.w_off.end(), add.w_off.begin(), add.w_off.end());
         csr.kv_page_indices.insert(csr.kv_page_indices.end(), add.kv_page_indices.begin(),
                                    add.kv_page_indices.end());
+        // Only these rows reach the LM head. A prefill computes every row of the
+        // body and reads one; the head is `hidden * vocab` per row, so this is
+        // most of a prefill's cost and all of its logits memory.
+        for (const std::uint32_t local : d.readout_local_indices) {
+            csr.sample_rows.push_back(row0 + local);
+        }
         accepted.push_back({i, row0});
     }
     if (accepted.empty()) return !any_rejected;
@@ -3243,7 +3264,48 @@ bool MetalExecutor::run_simple_batch_forward(const std::vector<MemberForwardDesc
         impl_->attach_ptir_logits_view(out);
     }
 
-    const StepTiming timing = impl_->fire_simple(csr);
+    // PTIR is told which rows are whose, and its group is finalized, BEFORE the
+    // fire: `post_forward` encodes a program whose descriptors those calls
+    // wrote. Encoding first and describing after leaves the group's lanes
+    // never dispatched -- which reports as `state=0`, a lane that did not run,
+    // rather than as anything about ordering.
+    std::vector<PtirCommandCallbacks> hooks;
+    if (ptir != nullptr) {
+        std::uint32_t ptir_sample = 0;
+        for (const Accepted& a : accepted) {
+            std::vector<std::uint32_t> rows;
+            for (std::size_t r = 0; r < descs[a.member].readout_local_indices.size(); ++r) {
+                // Sample indices, not token rows: the tail produced one row per
+                // SAMPLED row, and PTIR reads the tail's buffer.
+                rows.push_back(ptir_sample++);
+            }
+            PtirCommandCallbacks cb = (*ptir)[a.member];
+            if (cb.set_logits_rows) cb.set_logits_rows(rows);
+            if (cb.set_logits_row && rows.size() == 1) cb.set_logits_row(rows[0]);
+            hooks.push_back(std::move(cb));
+        }
+        for (PtirCommandCallbacks& cb : hooks) {
+            if (cb.finalize_group) cb.finalize_group();
+        }
+    }
+
+    // PTIR's device program is encoded into the SAME command buffer, before and
+    // after the model, which is what makes a sampled token available without a
+    // second submission.
+    SimpleFamilyEngine::EncodeHook pre, post;
+    if (!hooks.empty()) {
+        pre = [&](StepEncoder& se) {
+            for (const PtirCommandCallbacks& cb : hooks) {
+                if (cb.pre_forward) cb.pre_forward(se);
+            }
+        };
+        post = [&](StepEncoder& se) {
+            for (const PtirCommandCallbacks& cb : hooks) {
+                if (cb.post_forward) cb.post_forward(se);
+            }
+        };
+    }
+    const StepTiming timing = impl_->fire_simple(csr, pre, post);
     if (!timing.succeeded()) {
         for (const Accepted& a : accepted) {
             errors[a.member] = "Metal forward timed out before its completion fence";
@@ -3251,14 +3313,17 @@ bool MetalExecutor::run_simple_batch_forward(const std::vector<MemberForwardDesc
         return false;
     }
 
+    // The logits buffer holds one row per SAMPLED row, in `csr.sample_rows`
+    // order -- not one per token. So the copy's source is the sample's index,
+    // which is the order the members were accepted in.
     std::vector<std::pair<std::uint32_t, std::uint32_t>> copies;
+    std::uint32_t sample = 0;
     for (const Accepted& a : accepted) {
         const MemberForwardDesc& d = descs[a.member];
         const bool direct = ptir != nullptr && (*ptir)[a.member].consumes_logits_directly;
-        for (std::uint32_t r = 0; r < d.readout_local_indices.size(); ++r) {
+        for (std::uint32_t r = 0; r < d.readout_local_indices.size(); ++r, ++sample) {
             if (direct) continue;
-            copies.push_back({a.row0 + d.readout_local_indices[r],
-                              outs[a.member].device_row_offset + r});
+            copies.push_back({sample, outs[a.member].device_row_offset + r});
         }
     }
     // `stage_ptir_logits_rows` fires one copy dispatch per call, bounded by
