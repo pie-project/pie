@@ -142,6 +142,32 @@ Context: a 7B decode step at batch 512 is ~8.5 ms (weight streaming lower bound,
 measured 1,648 GB/s). Today's constrained path adds 8.97 ms — it more than
 doubles the step. The fused path adds 0.198 ms, or 2.3%.
 
+**Re-measured on the shipped engine (2026-07-30), and the figures above are
+superseded by these.** `Batch.allowed` and `gg_compact` now exist, so this is
+the artifact's own number rather than a probe's. XGrammar's own
+`apply_token_bitmask_inplace` is the mask baseline, `sampling_from_logits` is
+the sampler throughout, and the compaction is charged to us — without it the
+set is not on hand at all, and leaving it out was how the earlier figure got
+to be larger. 425 of 151,669 tokens allowed:
+
+| batch | no constraint | XGrammar mask + sample | **allowed set + sample** | vs unconstrained | vs mask |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 240.0 | 248.8 | **198.2** | 1.21× | 1.26× |
+| 128 | 480.4 | 634.2 | **209.3** | 2.29× | 3.03× |
+| 512 | 1,194.9 | 1,842.5 | **207.8** | **5.75×** | **8.87×** |
+
+Flat at 190–210 µs at every batch, because the work is the size of the set and
+not of the vocabulary. The claim survives: **a constrained step is cheaper than
+an unconstrained one**, by 5.75× at batch 512 rather than 17.5×. The earlier
+number came from a heavier sampling baseline; the smaller one is the one to
+publish, and it is still the argument, because nothing that hands a mask back
+to the host can make it at all.
+
+The dense regime — a JSON string body, most of the vocabulary allowed — is
+*not* re-measured here. `counts` reports the true size so a caller can fall
+back to the mask, but the claim that fusion "does not lose" there is currently
+untested against the shipped path.
+
 ### Example 2: speculative decoding, withdrawn, re-measured, and now possible
 
 An earlier version of this document claimed 33,367 us against 56 us at batch
