@@ -6324,3 +6324,115 @@ is not the same as choosing one.
 **Phase 3:** move the width into the calibrator and make it default; reclaim
 the ~1.1 GB `ws.logits` arena that the fused path no longer fills; extend past
 `LlamaLikeModel`/`Qwen3VL`.
+
+## 20.39 The workload sweep: arrival rates, the join-gate deadlock, and where pie actually stands
+
+Every number before this section was measured at one point: a burst of short
+prompts at concurrency 512. This section widens that to shape x volume x
+arrival rate against vLLM, and the widening found more than a ranking.
+
+### The harness could not express an arrival rate
+
+Both harnesses offered every request at t=0 and let engine-side admission be
+the only pacing. `arrival_schedule()` / `ArrivalPacer` (`benches/common.py`)
+add poisson/uniform open-loop arrivals driven by one seeded RNG, so pie and
+vLLM see a byte-identical schedule. `arrival_lag_p99_ms` reports how far the
+client fell behind its own schedule: a large lag means the row measured
+asyncio, not the server. pie's was 2.1 ms in every cell below; vLLM's reached
+176 ms at the highest rate, which slightly *understates* pie's margin there.
+
+### Three measurement defects, found before any conclusion was drawn
+
+1. **Ramp-dominated windows.** The first pass ran 256 requests per cell:
+   0.6 s of wall on shape S, 1.6 s on P. A repeat of one rung differed by 51%
+   (2369 vs 3577 tok/s). Volumes are now sized per shape for >=15 s
+   (`MIN_WALL_S`), and the ledger refuses to quote a shorter row.
+2. **Unequal work.** On the prefix-heavy shape pie reported 139,427 prompt
+   tokens against vLLM's 166,036. The ledger now compares `prompt_tokens`
+   and `output_tokens` across engines and flags any row that differs by >2%.
+3. **Failures counted as throughput.** The cause of (2) was pie failing 41 of
+   256 requests on KV starvation; tok/s over the survivors is not a
+   throughput. `failed` is now a first-class ledger field and a hard warning.
+
+### pie's admission is a count; vLLM's is KV-aware
+
+`--concurrency` maps to a fixed-permit semaphore (`inferlet/process.rs:97-104,
+238-242`) with no notion of KV capacity. Past the concurrency the pool can
+fund, pie does not degrade — it collapses. Prefix-heavy shape, 8192 pages:
+
+| conc | pie tok/s | vLLM tok/s | ratio | pie failed |
+|---|---|---|---|---|
+| 64 | 4900 | 5325 | 0.920 | 0 |
+| 128 | 5501 | 5696 | 0.966 | 0 |
+| 256 | (4437) | 5666 | — | **796/1024** |
+| 512 | (4360) | 5667 | — | **802/1024** |
+
+vLLM is flat across the whole range because its scheduler admits only what
+KV can fund and queues the rest. Mixed-phase shape, same sweep:
+
+| conc | pie tok/s | vLLM tok/s | ratio |
+|---|---|---|---|
+| 64 | 10565 | 8624 | **1.225** |
+| 128 | 13159 | 11429 | **1.151** |
+| 256 | 16000 | 14946 | **1.071** |
+| 512 | 14118 | 16371 | 0.862 (5 failed) |
+
+pie peaks at 256 and regresses; vLLM keeps climbing. The crossover is the
+over-admission cost, not a kernel difference. NOTE: §20-era "KV-aware
+admission" was closed as a lever, but it was closed in the decode-only regime
+where it is a no-op. It is not closed for oversubscribed workloads.
+
+### The join-gate deadlock (fixed, see the commit)
+
+Open-loop arrivals wedged the fleet permanently with the GPU at 0%:
+
+```
+frame k=2 lanes=29 awaited=29 sealed=0 pending_binds=99 staged=99
+pending_slots=99 joins_in_flight=0 departing=0   (nothing executing)
+```
+
+Every lane's front frame was COMPLETE, so `missing == 0`; the seal was held
+purely by `is_joining()`. The mode-2 rebind escape could not help because it
+only decrements `missing`. Every staged successor sat behind a bind, and a
+bind commits through the control slot ordered behind the dispatch this
+unsealed boundary holds — the §20.3 cycle by a route with no escape.
+`join_gate_circular()` recognises exactly that state. Density cost: none
+(conc 512 mean 32647 vs the 32700 baseline, -0.16%, inside +-0.8% noise).
+
+### Open loop, concurrency 128, both engines KV-funded
+
+This is the regime a served deployment actually runs in.
+
+| shape | rate | pie tok/s | vLLM | ratio | pie TTFT p50 | vLLM TTFT p50 | pie e2e p99 | vLLM e2e p99 |
+|---|---|---|---|---|---|---|---|---|
+| M | 50 | 6975 | 6960 | 1.002 | 35.0 | 29.7 | **1181** | 1791 |
+| M | 70 | 9647 | 9584 | 1.007 | 36.0 | 39.6 | **1758** | 2534 |
+| M | 85 | 11499 | 10827 | **1.062** | **41.5** | 700.0 | **2463** | 4151 |
+| M | 95 | 12312 | 10869 | **1.133** | **542.5** | 1719.3 | **3231** | 6148 |
+| X | 22 | 2952 | 2947 | 1.001 | 41.6 | 32.7 | 1064 | 1099 |
+| X | 32 | 4241 | 4236 | 1.001 | 60.3 | 39.4 | 1864 | **1527** |
+| X | 40 | 5075 | 5188 | 0.978 | 191.6 | **50.6** | 3685 | **2785** |
+
+Below saturation both engines track the offered rate exactly and throughput
+cannot discriminate; latency can. On the mixed shape pie holds a lower tail at
+every rate and saturates later — at 85 req/s vLLM's TTFT p50 has already blown
+out to 700 ms while pie is still at 41.5 ms. On the prefix-heavy shape the
+order reverses above ~32 req/s.
+
+### What is true, and what is not
+
+- pie **wins** on interleaved prefill+decode: +7% to +22% closed-loop at
+  KV-funded concurrency, +6% to +13% open-loop near saturation, with a tail
+  1.7x-1.9x lower and a later saturation point.
+- pie **loses** on prefix-heavy: -2% to -8%, and its TTFT is worse at every
+  rate measured (32.7 -> 41.6 ms at the lightest load, before any queueing).
+  Part of that is a real extra hop — pie's TTFT includes the guest's `t0`
+  session message, which vLLM has no analogue of — but the gap grows with
+  load, so queueing dominates it. Not investigated.
+- pie **collapses** past the KV-fundable concurrency instead of queueing.
+  This is the largest single gap and it is a policy gap, not a kernel one:
+  fixing the concurrency by hand recovers pie from 2586 to 5150 tok/s on the
+  same shape (vLLM 5566, unassisted).
+- The prefill-heavy shape P is **not** reported. Its first-pass -36% came
+  from a 1.6 s window and did not survive the volume fix; it has not been
+  re-measured at a credible volume.
