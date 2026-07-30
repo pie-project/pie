@@ -17,7 +17,7 @@ pub(super) fn repack_stage_bytes(spec: RepackSpec) -> Result<u64> {
                 .or_overflow("MXFP4 repack stage size overflow")?;
             Ok(elems.div_ceil(2))
         }
-        RepackLayout::MarlinMxfp4Scale | RepackLayout::None => Ok(0),
+        RepackLayout::MarlinMxfp4Scale => Ok(0),
     }
 }
 

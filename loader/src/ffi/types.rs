@@ -233,6 +233,14 @@ impl From<PieLoaderQuantScheme> for QuantScheme {
     }
 }
 
+/// A repack's kernel, across the ABI.
+///
+/// `None` is the wire sentinel for a transform that ends in no kernel, the way
+/// [`PieLoaderQuantScheme::None`] is for a transform that converts nothing. It
+/// is deliberately *not* a member of [`RepackLayout`]: outbound it means "this
+/// tile map is not a repack", and inbound — where the only reader is a contract
+/// node that has already said it is one — it is rejected, because an all-zero
+/// node is the shape a forgotten field has.
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PieLoaderRepackLayout {
@@ -244,19 +252,19 @@ pub enum PieLoaderRepackLayout {
 impl From<RepackLayout> for PieLoaderRepackLayout {
     fn from(value: RepackLayout) -> Self {
         match value {
-            RepackLayout::None => Self::None,
             RepackLayout::MarlinMxfp4Weight => Self::MarlinMxfp4Weight,
             RepackLayout::MarlinMxfp4Scale => Self::MarlinMxfp4Scale,
         }
     }
 }
 
-impl From<PieLoaderRepackLayout> for RepackLayout {
-    fn from(value: PieLoaderRepackLayout) -> Self {
+impl TryFrom<PieLoaderRepackLayout> for RepackLayout {
+    type Error = ();
+    fn try_from(value: PieLoaderRepackLayout) -> Result<Self, ()> {
         match value {
-            PieLoaderRepackLayout::None => Self::None,
-            PieLoaderRepackLayout::MarlinMxfp4Weight => Self::MarlinMxfp4Weight,
-            PieLoaderRepackLayout::MarlinMxfp4Scale => Self::MarlinMxfp4Scale,
+            PieLoaderRepackLayout::None => Err(()),
+            PieLoaderRepackLayout::MarlinMxfp4Weight => Ok(Self::MarlinMxfp4Weight),
+            PieLoaderRepackLayout::MarlinMxfp4Scale => Ok(Self::MarlinMxfp4Scale),
         }
     }
 }

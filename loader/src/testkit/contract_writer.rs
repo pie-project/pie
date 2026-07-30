@@ -78,6 +78,23 @@ impl OwnedContract {
             .position(|tensor| tensor.scales.of.len != 0)
     }
 
+    /// Write a raw integer into a node's `repack_layout`, for the same reason
+    /// [`set_raw_scale_codes`](Self::set_raw_scale_codes) exists.
+    ///
+    /// [`RepackLayout`](crate::types::RepackLayout) has no member for "no
+    /// layout", so a typed builder cannot express the zero an all-zero node
+    /// carries — which is exactly the value the boundary has to reject.
+    pub fn set_raw_repack_layout(&mut self, node: usize, layout: u32) {
+        self.nodes[node].repack_layout = layout;
+    }
+
+    /// Position of the first `Repack` node.
+    pub fn first_repack(&self) -> Option<usize> {
+        self.nodes
+            .iter()
+            .position(|node| node.kind == PieLoaderExprKind::Repack as u32)
+    }
+
     fn name(&mut self, value: &str) -> PieLoaderBytes {
         self.names.push(value.into());
         let stored = self.names.last().unwrap();

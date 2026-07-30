@@ -152,6 +152,23 @@ pub fn build(
     Ok(builder.program)
 }
 
+/// Whether a lowered value *is* the declaration it was lowered for, or an
+/// anonymous intermediate on the way to one.
+///
+/// They differ in exactly one place. A lowering that costs 1 is executed by
+/// aliasing rather than copying, and an alias has to be declared under some
+/// tensor id. The declaration's own is right for [`Role::Declared`] and wrong
+/// for [`Role::Operand`], because the kernel's result is about to claim it. So
+/// an operand's view is anonymous — which is what the staging buffer
+/// [`Builder::allocate`] hands the general case has always been.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Role {
+    /// The value the contract publishes.
+    Declared,
+    /// A value a kernel node reads.
+    Operand,
+}
+
 /// Where a value lives once its contract has been built.
 #[derive(Clone, Debug)]
 pub(crate) enum Value {
@@ -378,12 +395,12 @@ impl Builder<'_> {
             alignment: self.alignment,
             visibility: Visibility::Public,
         };
-        let value = self.copies(&lowering, &decl)?;
+        let value = self.copies(&lowering, &decl, Role::Declared)?;
         Ok((value, decl))
     }
 
     /// Emit the rectangular copies of a solved expression.
-    fn copies(&mut self, lowering: &Lowering, decl: &TensorDecl) -> Result<Value> {
+    fn copies(&mut self, lowering: &Lowering, decl: &TensorDecl, role: Role) -> Result<Value> {
         let output_bytes = encoding_nbytes(&decl.shape, &decl.encoding)
             .or_overflow(format!("'{}' size overflow", decl.name))?;
         let rects = lowering.byte_pieces(&decl.encoding)?;
@@ -419,7 +436,7 @@ impl Builder<'_> {
                     }));
                 }
                 Value::Buffer(buffer) if rect.is_byte_run() => {
-                    let out = self.declare_view_buffer(decl);
+                    let out = self.view_buffer(decl, role == Role::Declared);
                     let instr = self.next_instr();
                     self.program.instrs.push(StorageInstr::CreateView {
                         id: instr,
@@ -582,7 +599,18 @@ impl Builder<'_> {
     /// `U8` are packed elements of a quantization scheme, and that statement is
     /// what tells the kernel to unpack them.
     ///
+    /// The leaves may be earlier contracts as well as checkpoint tensors, so a
+    /// kernel node is closed under the whole affine fragment and under
+    /// [`Expr::Out`]. That is what makes the two-step re-encode
+    /// [`Expr::Cast`]'s doc promises actually spellable: name the decoded
+    /// tensor with a [`Visibility::Internal`] declaration and cast that. The
+    /// only thing still refused is a kernel directly under a kernel, which
+    /// `compile` rejects because it lowers to byte runs and a kernel is not
+    /// one — naming the intermediate is how a contract sequences two.
+    ///
     /// [`Transmute`]: crate::contract::Expr::Transmute
+    /// [`Expr::Out`]: crate::contract::Expr::Out
+    /// [`Expr::Cast`]: crate::contract::Expr::Cast
     fn operand_bytes(&mut self, src: &Expr, decl: &TensorDecl) -> Result<(Value, Encoding)> {
         let ty = self
             .resolver
@@ -592,27 +620,15 @@ impl Builder<'_> {
             return Ok((Value::Source(self.source_view(name)?), ty.encoding));
         }
         let lowering = compile(src, self.resolver.checked(), MAX_RUNS)?;
-        // Reading another contract's output would land in `copies`' aliasing
-        // path, which declares its view under the tensor id it was handed —
-        // this one's, which the output is about to claim. Nothing has asked
-        // for it, and the message is better than the collision.
-        if lowering
-            .leaves
-            .iter()
-            .any(|leaf| matches!(leaf, Leaf::Contract(_)))
-        {
-            return Err(Error::Contract(format!(
-                "'{}' reads another contract's output through an expression; \
-                 transform the checkpoint tensors and publish the result",
-                decl.name
-            )));
-        }
         let operand = TensorDecl {
             shape: ty.shape,
             encoding: ty.encoding.clone(),
             ..decl.clone()
         };
-        Ok((self.copies(&lowering, &operand)?, ty.encoding))
+        Ok((
+            self.copies(&lowering, &operand, Role::Operand)?,
+            ty.encoding,
+        ))
     }
 
     /// The buffer holding a per-group `Scale`'s factors.
@@ -797,7 +813,7 @@ impl Builder<'_> {
             inputs,
             vec![out],
             TransformSpec {
-                repack,
+                repack: Some(repack),
                 scratch_bytes: input_bytes
                     .checked_add(stage_bytes)
                     .or_overflow("Repack scratch bytes")?,
@@ -1109,18 +1125,20 @@ impl Builder<'_> {
     }
 
     /// A buffer that owns no bytes of its own: a window on another one.
-    fn declare_view_buffer(&mut self, decl: &TensorDecl) -> BufferId {
+    fn view_buffer(&mut self, decl: &TensorDecl, declared: bool) -> BufferId {
         let buffer = BufferId(self.next_buffer);
         self.next_buffer += 1;
         self.program.buffers.push(BufferDecl {
             id: buffer,
-            tensor: Some(decl.id),
+            tensor: declared.then_some(decl.id),
             bytes: 0,
             alignment: decl.alignment,
             temporary: false,
             persistent_offset: None,
         });
-        self.declare(decl.clone());
+        if declared {
+            self.declare(decl.clone());
+        }
         buffer
     }
 

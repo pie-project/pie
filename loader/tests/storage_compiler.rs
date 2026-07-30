@@ -353,6 +353,111 @@ fn target_support_rejects_cuda_decode_at_compile_time() {
     assert!(err.contains("does not support Decode"), "{err}");
 }
 
+/// The two-step re-encode [`Expr::Cast`]'s doc promises, actually spelled.
+///
+/// A quantized tensor cannot be cast straight to another scheme -- no kernel
+/// does it, and the destination's scales are not a function of the source's --
+/// so the doc offers the route through a decoded intermediate. That route was
+/// unspellable until the kernel-operand rule stopped refusing an `Expr::Out`:
+/// step two is a `Cast` over the intermediate, and `plan::build` rejected any
+/// kernel operand whose lowering read another contract. The refusal was an
+/// artifact of the aliasing path claiming the declaration's own tensor id, not
+/// anything about the algebra, so the escape route the doc names is the test.
+///
+/// The decode here is a per-group `Scale`, which is what decodes a block-scaled
+/// scheme; `TileMapKind::Decode` is in the plan vocabulary but no backend
+/// implements it yet.
+#[test]
+fn a_quantized_tensor_is_re_encoded_through_a_decoded_intermediate() {
+    let int8 = Encoding::Quant(QuantSpec {
+        scheme: QuantScheme::Int8Symmetric,
+        logical_dtype: DType::BF16,
+        bits_per_element: 8,
+        group_size: 32,
+        channel_axis: Some(Axis(1)),
+    });
+    let mut contract = block_scaled_contract("scales", 32, 1);
+    // `w` is the decoded BF16 tensor the fixture publishes. Make it the
+    // intermediate and re-encode it.
+    contract.tensors[1] = contract.tensors[1].clone().internal();
+    contract.tensors.push(TensorContract::new(
+        "w_int8",
+        Expr::out("w").cast(int8.clone()),
+        vec![4, 32],
+        int8,
+    ));
+
+    let target = StorageTarget {
+        backend: BackendKind::Cuda,
+        tile_map_mask: pie_loader::plan::CUDA_TILE_MAP_MASK,
+        ..StorageTarget::default()
+    };
+    let plan = compile_load_plan(&block_scaled_metadata(), &contract, target)
+        .expect("the documented two-step must compile");
+
+    let kinds: Vec<TileMapKind> = plan
+        .instrs
+        .iter()
+        .filter_map(|instr| match instr {
+            StorageInstr::TileMap { kind, .. } => Some(*kind),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![TileMapKind::Scale, TileMapKind::Encode],
+        "decode then encode, each its own kernel"
+    );
+
+    // 64 payload + 4 exponents, read once. If the encode had gone back to the
+    // checkpoint rather than reading what the decode wrote, this would be more.
+    assert_eq!(plan.memory.checkpoint_read_bytes, 68);
+    // `Finalize` is what puts a name in the driver's bind table, and an
+    // internal declaration gets none. Asserted on the instruction rather than
+    // on `plan.tensors`, which lists internal declarations too so a kernel can
+    // know their type.
+    let bound: Vec<&str> = plan
+        .instrs
+        .iter()
+        .filter_map(|instr| match instr {
+            StorageInstr::Finalize { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        bound,
+        // `w_int8_scale_inv` is the encoder's own factors -- the second half of
+        // what a raw-to-quantized cast publishes. `w`, the decoded
+        // intermediate, is the one name missing, which is the point.
+        vec!["scales", "w_int8_scale_inv", "w_int8"],
+        "the intermediate is not bound"
+    );
+}
+
+/// Casting one quantization scheme straight to another stays refused.
+///
+/// The companion to the test above: the two-step exists because the one-step
+/// does not, so if this ever starts compiling the intermediate is dead weight.
+#[test]
+fn a_quantized_tensor_may_not_be_cast_straight_to_another_scheme() {
+    let err = compile_load_plan(
+        &quant_metadata(),
+        &ModelContract {
+            alignment: 1,
+            tensors: vec![TensorContract::new(
+                "w",
+                Expr::src("q").cast(Encoding::Quant(quant(QuantScheme::Fp8E4M3, DType::BF16))),
+                vec![4, 8],
+                Encoding::Quant(quant(QuantScheme::Fp8E4M3, DType::BF16)),
+            )],
+        },
+        StorageTarget::default(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("no kernel does that in one step"), "{err}");
+}
+
 #[test]
 fn packed_quant_source_requires_exact_affine_size() {
     let mut metadata = quant_metadata();
@@ -409,16 +514,14 @@ fn gpt_oss_native_mxfp4_default_abi_lowers_to_repack_tile_maps() {
     // Six, not eight: the two biases are a row selection and nothing else, so
     // they are affine and never reach a kernel.
     assert_eq!(repacks.len(), 6);
-    assert!(
-        repacks
-            .iter()
-            .any(|spec| spec.repack.layout == RepackLayout::MarlinMxfp4Weight)
-    );
-    assert!(
-        repacks
-            .iter()
-            .any(|spec| spec.repack.layout == RepackLayout::MarlinMxfp4Scale)
-    );
+    assert!(repacks.iter().any(|spec| {
+        spec.repack
+            .is_some_and(|r| r.layout == RepackLayout::MarlinMxfp4Weight)
+    }));
+    assert!(repacks.iter().any(|spec| {
+        spec.repack
+            .is_some_and(|r| r.layout == RepackLayout::MarlinMxfp4Scale)
+    }));
     let names = program
         .tensors
         .iter()

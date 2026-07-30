@@ -201,14 +201,14 @@ fn plan_with_every_instr() -> LoadPlan {
             transform: TransformSpec {
                 from: Some(QuantScheme::MlxAffineU4),
                 to: Some(QuantScheme::Mxfp4E2M1E8M0),
-                repack: RepackSpec {
+                repack: Some(RepackSpec {
                     layout: RepackLayout::MarlinMxfp4Weight,
                     batch: 2,
                     source_rows: 32,
                     target_rows: 64,
                     source_cols: 96,
                     target_cols: 112,
-                },
+                }),
                 scratch_bytes: 8192,
                 fusion: TransformFusion::Fp8ToMxfp4,
                 metadata_source: Some(TensorId(2)),
@@ -1631,4 +1631,32 @@ fn a_gather_carries_its_indices_across_the_ffi() {
     let owned = crate::testkit::contract_writer::write_contract(&contract);
     let read = unsafe { super::contract::read_contract(&owned.view()) }.expect("reads back");
     assert_eq!(read, contract);
+}
+
+/// The rule `RepackLayout` used to state as a variant, now stated where it can
+/// still be violated.
+///
+/// Zero is what an all-zero node carries, and a `Repack` that names no kernel
+/// would otherwise reach the device as a transform that does nothing to bytes
+/// a GEMM is about to read as swizzled.
+#[test]
+fn a_repack_that_names_no_kernel_is_refused_at_the_boundary() {
+    use crate::contract::{Expr, ModelContract, TensorContract, TensorType};
+    use crate::types::RepackLayout;
+    let contract = ModelContract {
+        alignment: 256,
+        tensors: vec![TensorContract::inferred(
+            "packed",
+            Expr::src("blocks").repack(
+                RepackLayout::MarlinMxfp4Weight,
+                TensorType::raw(vec![2, 32, 64], DType::BF16),
+            ),
+            Encoding::Raw(DType::BF16),
+        )],
+    };
+    let mut owned = crate::testkit::contract_writer::write_contract(&contract);
+    let node = owned.first_repack().expect("the contract has a Repack");
+    owned.set_raw_repack_layout(node, PieLoaderRepackLayout::None as u32);
+    let err = unsafe { super::contract::read_contract(&owned.view()) }.unwrap_err();
+    assert!(err.contains("names a kernel"), "{err}");
 }

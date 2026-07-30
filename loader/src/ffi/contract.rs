@@ -402,10 +402,17 @@ fn read_encoding(spec: &PieLoaderEncodingSpec, what: &str) -> Result<Encoding, S
     })
 }
 
+/// The layout of a `Repack` node, which must name a kernel.
+///
+/// Zero is not a layout here even though it is a legal wire value elsewhere: an
+/// all-zero node is what a forgotten field looks like, and a repack that names
+/// no kernel would otherwise be discovered missing on the device.
 fn read_repack(layout: u32, what: &str) -> Result<RepackLayout, String> {
-    PieLoaderRepackLayout::try_from(layout)
-        .map(RepackLayout::from)
-        .map_err(|v| format!("{what}: {v} is not a PieLoaderRepackLayout"))
+    let wire = PieLoaderRepackLayout::try_from(layout)
+        .map_err(|v| format!("{what}: {v} is not a PieLoaderRepackLayout"))?;
+    RepackLayout::try_from(wire).map_err(|()| {
+        format!("{what}: a Repack names a kernel, and PieLoaderRepackLayout_None names none")
+    })
 }
 
 fn read_type(

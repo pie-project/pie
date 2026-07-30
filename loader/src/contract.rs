@@ -32,12 +32,40 @@ pub mod rewrite;
 /// [`Expr::Repack`], [`Expr::Cast`] and [`Expr::Scale`] are the escape
 /// hatches. They need a kernel and are deliberately marked as such.
 ///
-/// The organizing question is what each node *preserves*, not what it is called:
-/// the affine fragment preserves bytes, values and type together and only moves
-/// them; [`Expr::Transmute`] preserves the bytes and renames them;
-/// [`Expr::Scale`] preserves the type and rewrites the values; [`Expr::Cast`]
-/// preserves the values and rewrites their representation. [`Expr::Repack`] is
-/// what is left when none of those hold.
+/// The organizing question is what each node *preserves*, not what it is called.
+/// Two axes classify all eleven: what is preserved, and whether it is free.
+///
+/// |          | free                                       | kernel  |
+/// |----------|--------------------------------------------|---------|
+/// | layout   | `Slice` `Stride` `Gather` `Concat` `Shard` | `Repack`|
+/// | type     | `Transmute`                                | `Cast`  |
+/// | value    | —                                          | `Scale` |
+///
+/// A row says what a node is allowed to change; everything below its row it
+/// preserves. So the affine fragment preserves bytes, values and type together
+/// and only moves them; [`Expr::Transmute`] preserves the bytes and renames
+/// them; [`Expr::Cast`] preserves the values and rewrites their representation;
+/// [`Expr::Scale`] preserves the type and rewrites the values. [`Expr::Repack`]
+/// is not "what is left" -- it is placement priced as a kernel, and it is held
+/// to its row: it may pad, and it may not reinterpret an element.
+///
+/// The empty cell is principled rather than missing. A value cannot be changed
+/// for free, so there is nothing to put there.
+///
+/// Within a row, placement is a strict cost ladder that `infer` enforces in
+/// both directions: a `Stride` expressible as a `Slice` is refused, a `Gather`
+/// expressible as either is refused, and no node may denote exactly its
+/// operand. The cheap node must not be spellable as the expensive one, or the
+/// distinction buys nothing.
+///
+/// **What the placement fragment cannot say.** Every node maps output axis `k`
+/// from operand axis `k`, so as index maps they are the per-axis-diagonal
+/// subgroup: no node permutes axes. A permutation that fixes the innermost
+/// axis is expressible as a `Concat` of `Slice`s, verbosely; a transpose that
+/// moves the innermost axis is not expressible at all, because it is the one
+/// rearrangement that is not a reordering of runs. Nothing needs it today —
+/// every tile swizzle that would want it is inside a [`Expr::Repack`] — and it
+/// is recorded here so that the next node added is measured against it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Expr {
     /// A tensor read from the checkpoint, by its on-disk name.
@@ -205,6 +233,13 @@ pub enum Expr {
     /// has and zero-fills the tail. Stating it as `Concat[src, Fill]` would be
     /// truthful but would materialize the padded operand before the swizzle
     /// that is about to rewrite it anyway.
+    ///
+    /// Padding is the *only* thing it may add. An element is the same width on
+    /// both sides, because this is the kernel-priced member of the placement
+    /// family: it changes where a byte sits and never what a byte means. A
+    /// repack that named a different element width sized its destination
+    /// buffer from a lie, which is [`Expr::Transmute`]'s invariant reached
+    /// from the other side.
     Repack {
         src: Box<Expr>,
         layout: RepackLayout,
@@ -228,8 +263,14 @@ pub enum Expr {
     /// Shape is preserved in every direction: a cast has an opinion about
     /// element representation and none about placement. Re-encoding one
     /// quantized scheme directly as another is refused -- no kernel does it,
-    /// and the two-step is spellable as an [`Visibility::Internal`]
-    /// declaration of the decoded tensor.
+    /// and the destination's scales are not a function of the source's -- so
+    /// the two-step is what a contract says instead: declare the decoded
+    /// tensor [`Visibility::Internal`] and cast *that*. A kernel node reads any
+    /// expression, [`Expr::Out`] included, which is what makes step two
+    /// spellable; what it may not read is another kernel directly, and naming
+    /// the intermediate is how a contract sequences two. Which node decodes
+    /// depends on the scheme -- a cast to the logical dtype where a backend
+    /// implements one, a per-group [`Expr::Scale`] for a block-scaled scheme.
     ///
     /// Stated as a node rather than left implicit in the gap between what an
     /// expression yields and what its declaration says, because that gap hid a
