@@ -33,7 +33,10 @@ pub mod rewrite;
 /// hatches. They need a kernel and are deliberately marked as such.
 ///
 /// The organizing question is what each node *preserves*, not what it is called.
-/// Two axes classify all eleven: what is preserved, and whether it is free.
+/// Two axes classify the nine that have an operand: what is preserved, and
+/// whether it is free. The three leaves — [`Expr::Src`], [`Expr::Out`] and
+/// [`Expr::Fill`] — sit outside the table, because with no operand to preserve
+/// anything *from*, neither axis says anything about them.
 ///
 /// |          | free                                       | kernel  |
 /// |----------|--------------------------------------------|---------|
@@ -57,6 +60,15 @@ pub mod rewrite;
 /// expressible as either is refused, and no node may denote exactly its
 /// operand. The cheap node must not be spellable as the expensive one, or the
 /// distinction buys nothing.
+///
+/// [`Expr::Gather`] has no user today — every selection a driver has needed so
+/// far is a band or an arithmetic progression, and the one place that once
+/// wanted an index list turned out to be a `Stride`. It is kept because it is
+/// the ladder's top rung and the placement fragment's closure: it is what makes
+/// "these elements, in this order" expressible at all, and without it the two
+/// rungs below it are two special cases rather than the cheap ends of one
+/// operation. That is recorded here because nothing else would tell a reader
+/// why a fully implemented node has no callers.
 ///
 /// **What the placement fragment cannot say.** Every node maps output axis `k`
 /// from operand axis `k`, so as index maps they are the per-axis-diagonal

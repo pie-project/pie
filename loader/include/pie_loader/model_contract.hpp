@@ -34,12 +34,17 @@
 /// | `transmute(x, shape, enc)`       | bytes                | Same bytes under a new type; one `-1` is inferred |
 /// | `scale(x, factor)`               | type                 | Multiply every element                      |
 /// | `cast(x, enc)`                   | values               | The same values in another representation   |
-/// | `repack(x, spec, out)`           | --                   | An opaque kernel-specific relayout          |
+/// | `repack(x, spec, out)`           | values, type         | An opaque kernel-specific relayout          |
 ///
 /// The five that preserve all three move bytes and nothing else: what comes out
 /// is a rearrangement of what went in, and every one of them compiles to byte
-/// runs the loader can read straight out of the checkpoint. Everything below
-/// them costs a kernel.
+/// runs the loader can read straight out of the checkpoint.
+///
+/// `transmute` is free as well — it renames bytes without moving them. The
+/// other three cost a kernel. `repack` preserves everything the five do except
+/// placement, and it is held to that: it may pad, and it may not reinterpret an
+/// element. It is a relayout priced as a kernel, not an escape hatch for
+/// whatever a relayout could be made to do.
 ///
 /// `slice`, `stride` and `gather` are three rungs of one cost ladder, and the
 /// author picks the rung. A band leaves every run in the source intact; a
@@ -48,6 +53,10 @@
 /// cheaper node could express, so the ladder cannot be climbed by accident.
 /// For the same reason neither `stride` nor `gather` may touch a quantized
 /// axis, where a `slice` may as long as it lands on group boundaries.
+///
+/// No model has needed `gather` yet. It is the rung that makes the other two
+/// the cheap ends of one operation rather than a pair of special cases, so it
+/// stays; reach for it only when no arithmetic describes the order you want.
 ///
 /// `shard` is the only node that means different things on different ranks, and
 /// it is resolved before anything downstream of it runs — which is why a
