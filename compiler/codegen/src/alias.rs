@@ -14,12 +14,72 @@
 //! view" has one answer rather than one per backend.
 //!
 //! The other condition is a boundary question, and the two backends legitimately
-//! answer it differently — see [`escaping_values`].
+//! answer it differently — see [`escaping_values`]. Once a reshape is elided,
+//! [`AliasTable`] is what carries that decision to every consumer.
 
-use alloc::collections::BTreeSet;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
 use pie_plan::{Dimension, Region, SymbolicType};
+
+/// Which value's bytes each elided reshape's consumers should read instead.
+///
+/// Both fused emitters build one of these while deciding elisions, then resolve
+/// every operand through it before emitting. Sharing the type is what keeps
+/// "elided" meaning the same thing on both backends; the emitters still decide
+/// *which* reshapes to elide themselves, because [`escaping_values`] documents
+/// a boundary they answer differently.
+///
+/// [`Self::resolve`] walks, rather than reading a single entry, because
+/// nothing here constrains the order elisions are recorded in: recording
+/// `b -> c` after `a -> b` leaves `a` one hop short. The walk is bounded by the
+/// number of entries, which is a termination proof rather than a guess — a
+/// chain that took more steps than there are entries would have to revisit one,
+/// and a revisited entry is a cycle. The bound is reached routinely, by every
+/// chain that is as long as the table is large, and reaching it is correct:
+/// after that many hops the walk has followed each entry at most once, so the
+/// value it holds cannot be a key unless the aliases form a cycle. SSA makes
+/// cycles unreachable; the `debug_assert!` after the loop is what a future
+/// caller who breaks that assumption trips, so the failure is a panic in a
+/// debug build rather than a silently wrong offset in a release one.
+#[derive(Debug, Default, Clone)]
+pub struct AliasTable {
+    of: BTreeMap<u32, u32>,
+}
+
+impl AliasTable {
+    /// An empty table: every value holds its own bytes.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record that `result` was elided and its consumers should read `source`.
+    pub fn elide(&mut self, result: u32, source: u32) {
+        let source = self.resolve(source);
+        self.of.insert(result, source);
+    }
+
+    /// The value that actually holds `value`'s bytes — `value` itself unless it
+    /// was elided.
+    pub fn resolve(&self, mut value: u32) -> u32 {
+        for _ in 0..self.of.len() {
+            match self.of.get(&value) {
+                Some(&source) => value = source,
+                None => return value,
+            }
+        }
+        debug_assert!(
+            !self.of.contains_key(&value),
+            "alias chain from {value} outlived the table; the aliases form a cycle"
+        );
+        value
+    }
+
+    /// Whether `value` was elided, and so is not written by any emitted node.
+    pub fn is_elided(&self, value: u32) -> bool {
+        self.of.contains_key(&value)
+    }
+}
 
 /// The values `metal::fused` refuses to elide: this region's outputs and sinks.
 ///
@@ -62,8 +122,13 @@ pub fn escaping_values(region: &Region) -> BTreeSet<u32> {
 /// the IR, where `numel` is compared before symbolic lowering — is exactly the
 /// case this rejects.
 pub fn covers(value_types: &[SymbolicType], source: u32, result: u32) -> bool {
-    let (Some((src_dtype, src_static, src_symbolic)), Some((dst_dtype, dst_static, mut dst_symbolic))) =
-        (footprint(value_types, source), footprint(value_types, result))
+    let (
+        Some((src_dtype, src_static, src_symbolic)),
+        Some((dst_dtype, dst_static, mut dst_symbolic)),
+    ) = (
+        footprint(value_types, source),
+        footprint(value_types, result),
+    )
     else {
         return false;
     };
@@ -108,6 +173,42 @@ mod tests {
             dtype,
             dims: dims.to_vec(),
         }
+    }
+
+    #[test]
+    fn an_untouched_value_holds_its_own_bytes() {
+        let mut table = AliasTable::new();
+        assert_eq!(table.resolve(7), 7);
+        assert!(!table.is_elided(7));
+        table.elide(3, 1);
+        assert_eq!(table.resolve(7), 7);
+    }
+
+    #[test]
+    fn eliding_points_consumers_at_the_source() {
+        let mut table = AliasTable::new();
+        table.elide(4, 2);
+        assert_eq!(table.resolve(4), 2);
+        assert!(table.is_elided(4));
+        assert!(!table.is_elided(2));
+    }
+
+    #[test]
+    fn a_chain_resolves_whichever_order_it_was_recorded_in() {
+        // Recorded source-first, the second `elide` already sees a root.
+        let mut forward = AliasTable::new();
+        forward.elide(2, 1);
+        forward.elide(3, 2);
+
+        // Recorded result-first, `3 -> 2` is one hop short until the walk runs.
+        // Both emitters visit region nodes in an order this module does not
+        // constrain, so the two must agree.
+        let mut backward = AliasTable::new();
+        backward.elide(3, 2);
+        backward.elide(2, 1);
+
+        assert_eq!(forward.resolve(3), 1);
+        assert_eq!(backward.resolve(3), 1);
     }
 
     /// Index 0 is the sampler's source, 1 its result, 2 the reverse reshape's

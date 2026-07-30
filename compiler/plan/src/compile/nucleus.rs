@@ -183,9 +183,11 @@ fn match_softmax(
 
 /// The chain [`pie_ir::expand::nucleus_sample`] emits, read backwards.
 ///
-/// Recovering it and judging it are separate jobs, and they used to be four
-/// unmarked phases of one 276-line function. Three questions are asked of a
-/// `Chain` once [`match_chain`] has it: which values enter the library call
+/// Recovering the chain and judging it are separate jobs, kept separate.
+/// [`match_chain`] does the recovery and answers nothing about whether the
+/// match may be taken; three named predicates do that, so each can be read and
+/// tested on its own rather than as an unmarked phase of one long function.
+/// The three questions asked of a `Chain`: which values enter the library call
 /// ([`nucleus_library_inputs`]), whether the chain is the library's alone to
 /// take ([`chain_is_exclusive`]), and whether the types line up
 /// ([`chain_types_agree`]).

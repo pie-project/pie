@@ -6,7 +6,8 @@
 //! literal lifted verbatim from the C++ oracle; only the four value slots and
 //! the kernel name are interpolated.
 
-use alloc::string::{String, ToString};
+use crate::error::{EmitError, RegionForm};
+use alloc::string::String;
 use core::fmt::Write as _;
 
 use pie_plan::{CompiledStage, LibraryOp, Region};
@@ -302,14 +303,16 @@ pub fn emit_grouped_nucleus(
     function_name: &str,
     stage: &CompiledStage,
     region: &Region,
-) -> Result<String, String> {
+) -> Result<String, EmitError> {
     let scaled = region.inputs.len() == 5;
     if library_op_byte(region) != LibraryOp::NucleusSample as u8
         || !library_region_valid(stage, region)
         || !(region.inputs.len() == 3 || scaled)
         || region.outputs.is_empty()
     {
-        return Err("invalid grouped nucleus library region".to_string());
+        return Err(EmitError::LibraryRegionAbiInvalid(
+            RegionForm::GroupedNucleus,
+        ));
     }
     // The scaled arity carries the pre-division logits and the divisor ahead of
     // the operands this kernel reads. The scaled logits at index 2 are a real

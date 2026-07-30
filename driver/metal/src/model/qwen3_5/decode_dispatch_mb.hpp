@@ -15,7 +15,11 @@
 // decode_dispatch.hpp + RawMetalContext::dispatch).
 
 #include "decode_abi.hpp"
-#include "decode_dispatch.hpp"  // M=1 helpers (qmv_dispatch, rms_dispatch, ...)
+#include <algorithm>
+#include <cstdlib>
+
+#include "decode_dispatch.hpp"
+#include "decode_step_mb.hpp"  // M=1 helpers (qmv_dispatch, rms_dispatch, ...)
 #include "mtl4_context.hpp"     // Grid, Threadgroup
 
 namespace pie::metal {
@@ -26,6 +30,157 @@ namespace pie::metal {
 inline void qmv_mb_dispatch(int out_vec, int N, Grid& g, Threadgroup& tg) {
     g  = Grid{32u * uint32_t(N), uint32_t(out_vec) / 4, 1};
     tg = Threadgroup{32, 2, 1};
+}
+
+// Below this batch the GEMV is the faster kernel: measured, pie's per-step cost
+// beats mlx-lm's at every batch up to 8 with the GEMV and only loses above it.
+inline constexpr int kQmmMinBatch = 12;
+// The ported steel GEMM is instantiated aligned-only, at BM=16 and BK=32. K is
+// not checked: every qwen3.6 projection has K % 512 == 0 (the same fact the
+// GEMV port relies on for its "fast" variant), so K % BK == 0 is free.
+// Rows per threadgroup.  The GEMM dequantizes a weight tile once per row
+// block, so a batch that spans several blocks pays for the same dequantize
+// again in each -- which is why doubling M nearly doubles the time (14.6ms at
+// M=16, 24.4 at 32, 45.7 at 64, measured standalone across the checkpoint's
+// projections).  A taller block halves that work at the cost of halving the
+// threadgroup count, so it is only worth taking once the batch is wide enough
+// to have blocks to spare: at M=32, BM=32 measures 20.4ms against BM=16's 24.4.
+inline constexpr int kQmmBM = 16;
+inline constexpr int kQmmBMWide = 32;
+inline constexpr int kQmmWideMinBatch = 32;
+
+inline int qmm_bm(int N) { return N >= kQmmWideMinBatch ? kQmmBMWide : kQmmBM; }
+
+// Output columns per threadgroup.  This GEMM is occupancy-bound, not bandwidth-
+// bound: measured standalone at the model's shapes it turns in ~380 GFLOP/s at
+// 16 threadgroups, ~900 at 32, ~1600 at 112 and saturates around 2.2-2.6 TFLOP/s
+// past ~200, against a 389 GB/s machine it only ever reaches 11% of.  So take
+// the widest tile -- wider means each x row is loaded fewer times -- that still
+// leaves enough threadgroups to fill the machine, and past that prefer more
+// threadgroups over a wider tile.
+//
+// The measured optimum for every projection in the checkpoint falls out of that
+// one rule: BN=64 for lm_head (3880 tg), 32 for the GDN in-projection (192),
+// 16 for everything else.  The old rule asked only whether `out_vec/64 >= 64`,
+// which handed the GDN in-projection a BN=64 that measured 21% slower.
+//
+// BN partitions output columns only -- every element's K sum is unchanged -- so
+// the choice is bit-exact whichever way it goes.
+
+inline int qmm_bn(int out_vec, int N) {
+    const int bm = qmm_bm(N);
+    if (N < kQmmMinBatch || N % bm != 0) return 0;
+    // Take the WIDEST tile that divides the output, full stop.
+    //
+    // This used to gate on a threadgroup count, and that was right when the
+    // GEMM had nothing else supplying parallelism: measured then, BN=64 lost
+    // everywhere except lm_head and the occupancy rule was worth 677 -> 712
+    // tok/s.  Split-K changed the premise.  The split now supplies the
+    // threadgroups, so the only thing BN still decides is how many times each
+    // weight tile is dequantized -- and wider is strictly fewer.
+    //
+    // Interleaved A/B, decode step, widest against the old 192-threadgroup
+    // rule: 16 lanes 31.57ms to 37.02, 32 lanes 141.18 to 158.45.  The old
+    // rule is a pessimization now.
+    int best = 0;
+    for (int bn : {16, 32, 64})
+        if (out_vec % bn == 0) best = bn;
+    return best;
+}
+
+// Split the K dimension when the output tiles alone leave the machine short.
+// MLX picks the split to land near 512 threadgroups (backend/metal/
+// quantized.cpp:880) and sends every transposed non-batched decode down this
+// path rather than the plain GEMM; `roofline_probe` finds the same saturation
+// point independently.  A projection to hidden (N=1024, 32 tiles) takes a split
+// of 16, gate/up (N=3584, 112 tiles) takes 4, and lm_head has 7760 tiles of its
+// own and takes none.
+// MLX targets 512 threadgroups here, which is right for the hardware it was
+// tuned on and 7% wrong for this one: swept on an M1 Max, the decode step is
+// 29.0ms at 64, 24.7 at 128, 24.7 at 256 and 26.1 at 512, and an interleaved
+// A/B against MLX's value reads 86.85ms to 93.61ms at 32 lanes.  256 sits in
+// the middle of the flat region rather than on its edge.
+//
+// The shape of the curve is the reason: past the point where the machine is
+// full, more partitions only add reduce traffic, and a 32-core M1 Max fills at
+// a lower count than the parts MLX tunes for.
+inline constexpr int kQmmSplitTargetTgs = 256;
+inline constexpr int kQmmSplitBN = 32;
+inline constexpr int kQmmSplitMaxSplits = 16;
+// The widest projection that takes this path.  lm_head has enough output tiles
+// of its own to never need a split, which is what keeps the partials buffer to
+// a few MB instead of the vocabulary's hundreds.
+inline constexpr int kQmmSplitMaxOut = 8192;
+
+// Each partition must be a whole number of BK-wide tiles AND whole quantization
+// groups, or it reads into the next group's scales.
+inline int qmm_split_k(int out_vec, int N, int K, int bm) {
+    if (out_vec % kQmmSplitBN != 0 || bm <= 0) return 1;
+    // Count the batch in units of the NARROW row block, not the one this
+    // dispatch happens to use.  A wide block covers twice the rows in one
+    // threadgroup, so counting by it would call a 32-row batch as parallel as a
+    // 16-row one and split both the same -- measured at 32 lanes that costs
+    // 8% (32.37ms split against 29.86 unsplit), where at 16 lanes splitting
+    // wins 11% (18.29 against 20.50).
+    const int tiles = (out_vec / kQmmSplitBN) * ((N + kQmmBM - 1) / kQmmBM);
+    static const int target = [] {
+        const char* e = std::getenv("PIE_METAL_SPLIT_TGS");
+        return e ? std::atoi(e) : kQmmSplitTargetTgs;
+    }();
+    int split = tiles > 0 ? target / tiles : 1;
+    split = std::min(split, kQmmSplitMaxSplits);
+    const int k_align = 64;  // group_size, and a multiple of BK=32
+    split = std::min(split, K / k_align);
+    while (split > 1 && K % (split * k_align) != 0) --split;
+    return split < 2 ? 1 : split;
+}
+
+inline void qmm_t_splitk_dispatch(int out_vec, int N, int bm, int split, Grid& g,
+                                  Threadgroup& tg) {
+    // dispatchThreads: (tiles_n * 32 lanes, tiles_m * 2, split * 2).
+    g  = Grid{32u * (uint32_t(out_vec) / uint32_t(kQmmSplitBN)),
+              2u * uint32_t((N + bm - 1) / bm), 2u * uint32_t(split)};
+    tg = Threadgroup{32, 2, 2};
+}
+
+inline void qmm_splitk_reduce_dispatch(int out_vec, int N, Grid& g, Threadgroup& tg) {
+    g  = Grid{uint32_t(out_vec), uint32_t(N), 1};
+    tg = Threadgroup{256, 1, 1};
+}
+
+// `out/BN` threadgroups across the output, `M/BM` across the batch, each
+// 32x2x2 = 128 threads (WM=WN=2 simdgroups), which is the shape steel's
+// BlockMMA is written for.
+// The prefill's batched projection. Rows are padded up to a whole BM tile: the
+// scratch pool holds `max_tokens` rows and the tail rows land in ones the fire
+// does not use, so the padding computes discardable values rather than needing
+// a bounds-checked inner loop.
+// A prompt has far more rows than a decode batch, so it can afford the wide
+// row block -- and needs it for the same reason the decode does: the tile is
+// dequantized once per row block, so a 512-row prompt at BM=16 unpacks every
+// weight thirty-two times.
+inline int qmm_strided_bm(int padded_rows) {
+    static const bool off = std::getenv("PIE_METAL_NO_PREFILL_BM32") != nullptr;
+    return (!off && padded_rows >= kQmmWideMinBatch) ? kQmmBMWide : kQmmBM;
+}
+
+inline int qmm_strided_rows(int N, int max_rows) {
+    const int bm = qmm_strided_bm(N);
+    const int padded = ((N + bm - 1) / bm) * bm;
+    return padded <= max_rows ? padded : 0;
+}
+
+inline void qmm_t_strided_dispatch(int out_vec, int padded_rows, Grid& g,
+                                   Threadgroup& tg) {
+    g  = Grid{32u * (uint32_t(out_vec) / 32u),
+              2u * (uint32_t(padded_rows) / uint32_t(qmm_strided_bm(padded_rows))), 2};
+    tg = Threadgroup{32, 2, 2};
+}
+
+inline void qmm_t_dispatch(int out_vec, int N, int bn, int bm, Grid& g, Threadgroup& tg) {
+    g  = Grid{32u * (uint32_t(out_vec) / uint32_t(bn)),
+              2u * (uint32_t(N) / uint32_t(bm)), 2};
+    tg = Threadgroup{32, 2, 2};
 }
 
 // rms_single_row over N tokens × n_rows rows-per-token (e.g. per-head q/k norm). One

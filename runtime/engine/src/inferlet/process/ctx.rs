@@ -52,8 +52,11 @@ pub struct ProcessCtx {
     /// parity with the wasi:http linker which is only wired when allowed).
     network_allowed: bool,
 
-    /// Per-instance scratch directory, deleted on Drop.
-    scratch_dir: PathBuf,
+    /// Per-instance scratch directory, deleted on Drop. `None` when the
+    /// sandbox denies the filesystem: nothing was created, so there is
+    /// nothing to remove — and with `allow_fs` off `base_dir` is empty, so
+    /// the joined path would be a *relative* `./<pid>` under the server's CWD.
+    scratch_dir: Option<PathBuf>,
 
     // Dynamic linking support for proxy resources
     /// Maps host rep → guest ResourceAny for dynamic linking
@@ -63,10 +66,11 @@ pub struct ProcessCtx {
     /// Counter for allocating unique host reps
     next_dynamic_rep: u32,
     residency: Arc<Mutex<ProcessResidency>>,
-    /// Held while this process is in the prewarm cohort (spawn through
-    /// instantiation and guest bring-up). Released before the process
-    /// parks on bind admission — a parked holder would clog the conveyor
-    /// — with the admit paths clearing it again as a safety net.
+    /// Held while this process is in the prewarm cohort: spawn through
+    /// instantiation, guest bring-up and bind admission. Released once the
+    /// bind permit is won, so the conveyor bounds how many processes have
+    /// instantiated without being able to make driver progress. The admit
+    /// paths clear it again as a safety net.
     prewarm_permit: Option<OwnedSemaphorePermit>,
     /// The bind-ahead permit, acquired at the first operation that creates
     /// per-instance driver state (channel registration / instance bind /
@@ -98,13 +102,6 @@ impl Drop for ProcessCtx {
         } else {
             0
         };
-        let _ = std::fs::remove_dir_all(&self.scratch_dir);
-        let scratch_removed_us = if timing {
-            crate::scheduler::fire_timing_now_us()
-        } else {
-            0
-        };
-        let resources = std::mem::replace(&mut self.resource_table, ResourceTable::new());
         let execution_permit = self.execution_permit.take();
         let bind_permit = self.bind_permit.take();
         self.execution_admitted = false;
@@ -119,6 +116,11 @@ impl Drop for ProcessCtx {
         // the Terminate leave is posted first on this same producer, so
         // every driver observes leave-then-release and the policy never
         // credits a slot whose departure it has not yet seen.
+        //
+        // Nothing may precede this. The scratch directory used to be removed
+        // first, which put a filesystem syscall — and, at a cohort boundary,
+        // 512 of them — between the last token and the successor's
+        // admission; it is torn down with the rest of the resources instead.
         let terminate_fences = execution_permit.as_ref().map(|_| {
             let fences = crate::scheduler::worker::post_process_terminate_fenced(self.id);
             crate::scheduler::worker::notify_execution_slot_released(self.id);
@@ -130,12 +132,14 @@ impl Drop for ProcessCtx {
         } else {
             0
         };
+        let resources = std::mem::replace(&mut self.resource_table, ResourceTable::new());
         super::teardown::defer_resource_teardown(
             self.id,
             resources,
             self.residency.clone(),
             terminate_fences,
             bind_permit,
+            std::mem::take(&mut self.scratch_dir),
         );
         if timing {
             crate::scheduler::fire_timing_write(&serde_json::json!({
@@ -144,7 +148,6 @@ impl Drop for ProcessCtx {
                 "event": "process_drop",
                 "process_id": self.id,
                 "drop_entered_us": drop_entered_us,
-                "scratch_rm_us": scratch_removed_us - drop_entered_us,
                 "permit_released_us": permit_released_us.saturating_sub(drop_entered_us),
             }));
         }
@@ -247,15 +250,17 @@ impl ProcessCtx {
             }
         }
 
-        let scratch_dir = policy.fs.base_dir.join(id.to_string());
-
-        if policy.fs.allow {
+        let scratch_dir = if policy.fs.allow {
+            let scratch_dir = policy.fs.base_dir.join(id.to_string());
             std::fs::create_dir_all(&scratch_dir).expect("failed to create scratch dir");
 
             builder
                 .preopened_dir(&scratch_dir, "/scratch", DirPerms::all(), FilePerms::all())
                 .expect("failed to preopen scratch dir");
-        }
+            Some(scratch_dir)
+        } else {
+            None
+        };
 
         // Set up Python runtime environment if py-runtime directory is available.
         // Layout: py-runtime/runtime/{python,bundled}, py-runtime/site-packages
@@ -332,10 +337,10 @@ impl ProcessCtx {
         self.prewarm_permit = permit;
     }
 
-    /// Free the prewarm conveyor slot. Called before parking on bind
-    /// admission — a parked process holding its prewarm permit would clog
-    /// the conveyor and pin the next cohort's instantiation to the
-    /// generation boundary. Idempotent.
+    /// Free the prewarm conveyor slot. Called once bind admission is won —
+    /// the slot spans spawn through bind, so a process that has not bound
+    /// still occupies one and instantiation stays bounded by the conveyor
+    /// rather than by the request count. Idempotent.
     pub(crate) fn release_prewarm_permit(&mut self) {
         self.prewarm_permit = None;
     }

@@ -22,7 +22,19 @@
 // geometry, but kept a constant *buffer* to match the decode_abi I1 convention so
 // the command buffer stays byte-identical step-to-step).
 //
-// Launch: group=(1024,1,1), grid=(n_q_heads,1,1). D=V=256, gqa_factor=8 for gemma4.
+// M>1 (prefill). The kernel already carried a query-row dimension in tid.y; what
+// it lacked was a per-row causal position, so every row would have attended all N
+// keys. Row m of an M-row launch holds the token at logical end N-(M-1-m), which
+// is the ONLY thing that changes -- `kv_start`/`Nw` are then the existing
+// expressions with N replaced by that. Decode is M=1, where N-(M-1-m) == N, so
+// the two paths run the same arithmetic rather than two spellings of it.
+//
+// The query/output row strides are stated by the caller (buffers 12/13) instead
+// of inferred. mlx's original infers [head][row][D] from `q_seq_idx`, but a
+// prefill GEMM writes [row][head][D]; an inferred layout that disagrees with the
+// producer reads plausible garbage rather than failing.
+//
+// Launch: group=(1024,1,1), grid=(n_q_heads,M,1). D=V=256, gqa_factor=8 for gemma4.
 
 #include <metal_simdgroup>
 #include <metal_stdlib>
@@ -42,6 +54,8 @@ template <typename T, int D, int V = D>
     const constant size_t& v_seq_stride [[buffer(9)]],
     const constant float& scale         [[buffer(10)]],
     const constant int& window          [[buffer(11)]],
+    const constant int& q_row_stride    [[buffer(12)]],
+    const constant int& o_row_stride    [[buffer(13)]],
     uint3 tid       [[threadgroup_position_in_grid]],
     uint3 tpg       [[threadgroups_per_grid]],
     uint simd_gid   [[simdgroup_index_in_threadgroup]],
@@ -52,9 +66,14 @@ template <typename T, int D, int V = D>
   constexpr int v_per_thread = V / BD;
   constexpr float NEG_INF = -3.0e38f;
 
+  // Where this row's token sits. The M rows of a prefill are the last M
+  // positions, so row m ends at N-(M-1-m); at decode M==1 and this is N.
+  const int n_rows = int(tpg.y);
+  const int N_row = N - (n_rows - 1 - int(tid.y));
+
   // Sliding window: restrict to the last `window` keys. window<=0 => full attention.
-  const int kv_start = (window > 0 && N > window) ? (N - window) : 0;
-  const int Nw = N - kv_start;
+  const int kv_start = (window > 0 && N_row > window) ? (N_row - window) : 0;
+  const int Nw = N_row - kv_start;
 
   int inner_k_stride = BN * int(k_seq_stride);
   int inner_v_stride = BN * int(v_seq_stride);
@@ -71,16 +90,17 @@ template <typename T, int D, int V = D>
   const int q_batch_head_idx = tid.x;
   const int q_seq_idx = tid.y;  // 0 at decode
   const int kv_head_idx = q_batch_head_idx / gqa_factor;
-  const int o_offset = q_batch_head_idx * tpg.y + q_seq_idx;
-  const int q_offset = o_offset;  // query_transposed == false
+  // Row-major over tokens: row m starts at m*row_stride, head h at h*D within it.
+  const int q_offset = q_seq_idx * q_row_stride + q_batch_head_idx * D;
+  const int o_offset = q_seq_idx * o_row_stride + q_batch_head_idx * V;
 
-  queries += q_offset * D + simd_lid * qk_per_thread;
+  queries += q_offset + simd_lid * qk_per_thread;
   // Advance the K/V base past the keys outside the window, then index within [0, Nw).
   keys += kv_head_idx * k_head_stride + (kv_start + simd_gid) * k_seq_stride +
       simd_lid * qk_per_thread;
   values += kv_head_idx * v_head_stride + (kv_start + simd_gid) * v_seq_stride +
       simd_lid * v_per_thread;
-  out += o_offset * V + simd_gid * v_per_thread;
+  out += o_offset + simd_gid * v_per_thread;
 
   for (int i = 0; i < qk_per_thread; i++) {
     q[i] = static_cast<U>(scale) * queries[i];
@@ -148,6 +168,7 @@ template <typename T, int D, int V = D>
       const constant size_t&, const constant size_t&,                    \
       const constant size_t&, const constant size_t&,                    \
       const constant float&, const constant int&,                        \
+      const constant int&, const constant int&,                          \
       uint3, uint3, uint, uint);
 
 instantiate_sdpa_swa(float32, float, 256, 256)

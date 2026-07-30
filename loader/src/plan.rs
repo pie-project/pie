@@ -38,6 +38,7 @@ pub const TILE_MAP_REBLOCK: u32 = 1 << 4;
 // transcode engine dispatched to `reblock_tile_map` anyway — one transform
 // under two names. The bit stays reserved so the numbering below it is stable.
 pub const TILE_MAP_REPACK: u32 = 1 << 6;
+pub const TILE_MAP_SCALE: u32 = 1 << 7;
 
 /// Transform chains a backend can collapse into one kernel.
 pub const FUSION_FP8_TO_MXFP4: u32 = 1 << 0;
@@ -88,8 +89,8 @@ pub struct StorageTarget {
     /// A capability, not a preference: the driver both knows whether the fused
     /// kernels are built and owns the opt-out that used to be
     /// `PIE_CUDA_DISABLE_FUSED_TRANSCODE`. Reading it here rather than in the
-    /// executor is what makes the choice part of the plan, and therefore part of
-    /// the plan hash (§8.1).
+    /// executor is what makes the choice part of the plan, and therefore part
+    /// of the plan hash (`architecture.md` §8.1).
     pub fusion_mask: u32,
     /// The dtype this target's encode kernels dequantize *through*.
     ///
@@ -139,10 +140,11 @@ pub struct BufferDecl {
 /// A file the plan reads from.
 ///
 /// `SourceTensorDecl::file_id` indexes this table. Before it existed, the table
-/// was an *unwritten* contract: the loader enumerated the shards one way and the
-/// driver re-enumerated them another, and nothing checked that the two agreed on
-/// which file index 3 was. Both sides sorted, so they did agree — but by
-/// coincidence of two implementations, not by construction (§6).
+/// was an *unwritten* contract: the loader enumerated the shards one way and
+/// the driver re-enumerated them another, and nothing checked that the two
+/// agreed on which file index 3 was. Both sides sorted, so they did agree — but
+/// by coincidence of two implementations, not by construction
+/// (`architecture.md` §6).
 ///
 /// Paths are stored exactly as the loader opened them, which makes the plan
 /// non-relocatable. That is the honest representation: the plan was compiled
@@ -195,14 +197,16 @@ pub struct SourceExtent {
     pub span_bytes: u64,
     pub stride: Extent,
     /// The type these bytes are read as, which is not always the type the
-    /// checkpoint declares: `Expr::Bitcast` exists precisely to say that a
+    /// checkpoint declares: [`Expr::Transmute`] exists precisely to say that a
     /// tensor stored as `U8` is to be read as `E8M0`. Looking the dtype up
     /// from `tensor_id` instead would discard that, and the executor would be
     /// asked for a cast from the storage type it was told to stop believing.
     ///
-    /// Only the dtype can differ. `Bitcast` is checked raw-to-raw and
-    /// byte-size preserving (`contract::infer`), so an extent's quantization
-    /// scheme is still whatever `PieLoaderPlan::sources[tensor_id]` says.
+    /// Only the dtype can differ. A transmute preserves the byte count
+    /// (`contract::infer`), so an extent's quantization scheme is still
+    /// whatever `PieLoaderPlan::sources[tensor_id]` says.
+    ///
+    /// [`Expr::Transmute`]: crate::contract::Expr::Transmute
     pub dtype: DType,
 }
 
@@ -221,6 +225,7 @@ pub enum TileMapKind {
     Transcode,
     Reblock,
     Repack,
+    Scale,
 }
 
 impl TileMapKind {
@@ -232,6 +237,7 @@ impl TileMapKind {
             Self::Transcode => TILE_MAP_TRANSCODE,
             Self::Reblock => TILE_MAP_REBLOCK,
             Self::Repack => TILE_MAP_REPACK,
+            Self::Scale => TILE_MAP_SCALE,
         }
     }
 }
@@ -255,7 +261,7 @@ pub struct TileSpec {
 /// Recorded rather than inferred: fusing FP8 → MXFP4 skips a BF16 round-trip
 /// through HBM, and while it is bit-identical to the two-step path, it is a
 /// different kernel sequence. A plan that does not say which one it means
-/// cannot claim to determine execution (§8.1).
+/// cannot claim to determine execution (`architecture.md` §8.1).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TransformFusion {
     #[default]
@@ -268,7 +274,12 @@ pub enum TransformFusion {
 pub struct TransformSpec {
     pub from: Option<QuantScheme>,
     pub to: Option<QuantScheme>,
-    pub repack: RepackSpec,
+    /// The kernel this transform ends in, when it ends in one.
+    ///
+    /// `None` rather than a layout of that name: a transform that does not
+    /// repack has no rows, no columns and no kernel, and a struct of zeros
+    /// standing for that is a value every reader has to know to disbelieve.
+    pub repack: Option<RepackSpec>,
     pub scratch_bytes: u64,
     pub fusion: TransformFusion,
     /// The checkpoint tensor holding this transform's *input* block scales.
@@ -277,9 +288,29 @@ pub struct TransformSpec {
     /// sibling of per-group factors. Only the payload is named by the contract,
     /// so the executor used to rebuild the sibling's name by appending
     /// `_scale_inv` and look it up — the same guess-the-loader's-answer
-    /// anti-pattern `attachments` removed from the output side (§12 row 10).
-    /// The loader reads the tensor table, so the loader answers.
+    /// anti-pattern `attachments` removed from the output side
+    /// (`architecture.md` §12 row 10). The loader reads the tensor table, so
+    /// the loader answers.
     pub metadata_source: Option<TensorId>,
+    /// The multiplier for a [`TileMapKind::Scale`], as [`f32::to_bits`]; zero
+    /// on every other kind.
+    ///
+    /// Bits for the reason [`Expr::Scale`](crate::contract::Expr::Scale) gives:
+    /// a plan is compared and hashed, and `f32` has no total equality. The
+    /// executor's own multiply is done in `f32`, so the loader hands over the
+    /// same 32 bits the contract named rather than a widened value that would
+    /// have to be narrowed again.
+    pub scale_factor_bits: u32,
+    /// Elements per factor along [`scale_axis`](TransformSpec::scale_axis) for
+    /// a per-group [`TileMapKind::Scale`]; zero when the factor is the uniform
+    /// constant in [`scale_factor_bits`](TransformSpec::scale_factor_bits).
+    ///
+    /// Non-zero is what tells the executor to read its factors from the extra
+    /// input buffer instead, so the two cases cannot be confused for one
+    /// another by a field left unset.
+    pub scale_group: u32,
+    /// The axis [`scale_group`](TransformSpec::scale_group) counts along.
+    pub scale_axis: u8,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

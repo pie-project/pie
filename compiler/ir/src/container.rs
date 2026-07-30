@@ -1,14 +1,15 @@
 //! The PTIR **trace container** — the versioned blob carrying one traced
 //! pass: stage-tagged programs, channel declarations, descriptor-port
-//! bindings, and the name table for second-party kernels/sinks. Byte-for-byte
-//! layout in `PTIR-CONTAINER.md` (the C++ driver reads that document).
+//! bindings, and the name table for second-party kernels/sinks. The
+//! byte-for-byte layout is the op table's `wire` column in [`crate::op`];
+//! [`encode`] and [`decode`] walk it rather than restating it.
 //!
 //! Identity = [`crate::container_hash`] (FNV-1a 64) over these canonical
-//! bytes (contract C3). Canonical means: same trace ⟺ same bytes — the
-//! encoder emits deterministically and the validator enforces the sortedness
-//! rules (§2 of the doc), so the hash is a sound compile-cache / batching key.
+//! bytes. Canonical means: same trace ⟺ same bytes — the encoder emits
+//! deterministically and the validator enforces the sortedness rules, so the
+//! hash is a sound compile-cache / batching key.
 //!
-//! **Not in the container** (per-instance data, D2): channel seed *values*,
+//! **Not in the container** (per-instance data): channel seed *values*,
 //! working-set binding, rng seeds. A seeded channel is declared `seeded = 1`
 //! and its value arrives at instantiation.
 
@@ -16,10 +17,11 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
-use super::op::{ChannelIndex, IntrinsicId, Op, tags};
+use super::op::{self, ChannelIndex, IntrinsicId, Op, WireField};
 use super::read::{ReadError, Reader};
 use super::registry::{Port, Stage};
-use crate::types::{DType, Literal, MAX_RANK, Predicate, RngKind, Shape};
+use super::wire::{OpWire, predicate_tags};
+use crate::types::{DType, MAX_RANK, RngKind, Shape};
 use crate::{PTIR_MAGIC, PTIR_VERSION, PTIR_VERSION_EXTERN};
 
 /// Channel element dtype: a concrete scalar type or the late-bound
@@ -27,7 +29,9 @@ use crate::{PTIR_MAGIC, PTIR_VERSION, PTIR_VERSION_EXTERN};
 /// backend's quantized float at bind; in-program it materializes as F32.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ChanDType {
+    /// A scalar type fixed by the trace.
     Concrete(DType),
+    /// The backend's activation type, resolved at bind.
     Act,
 }
 
@@ -35,12 +39,14 @@ pub enum ChanDType {
 pub const DT_ACT: u8 = 4;
 
 impl ChanDType {
+    /// This dtype's wire tag.
     pub fn tag(self) -> u8 {
         match self {
             ChanDType::Concrete(d) => d as u8,
             ChanDType::Act => DT_ACT,
         }
     }
+    /// The dtype tag `t` names, or `None` if no dtype claims it.
     pub fn from_tag(t: u8) -> Option<Self> {
         Some(match t {
             0 => ChanDType::Concrete(DType::F32),
@@ -62,19 +68,21 @@ impl ChanDType {
 }
 
 /// The host endpoint of a channel, if any (the other endpoint is the pass).
-/// SPSC (T2): `Writer` forbids any stage put; `Reader` forbids any stage
+/// SPSC: `Writer` forbids any stage put; `Reader` forbids any stage
 /// take/read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum HostRole {
+    /// Both endpoints are inside the pass; the host never touches it.
     None = 0,
-    /// Host puts, pass consumes (e.g. §3's `mask`).
+    /// Host puts, pass consumes (e.g. an attention `mask`).
     Writer = 1,
-    /// Pass puts, host takes/reads (e.g. §3's `out`).
+    /// Pass puts, host takes/reads (e.g. a sampled `out`).
     Reader = 2,
 }
 
 impl HostRole {
+    /// The role wire byte `v` names, or `None` if no role claims it.
     pub fn from_u8(v: u8) -> Option<Self> {
         Some(match v {
             0 => HostRole::None,
@@ -85,18 +93,21 @@ impl HostRole {
     }
 }
 
-/// One channel declaration (overview §1): GPU-resident ordered memory —
+/// One channel declaration: GPU-resident ordered memory —
 /// a bounded queue of cells with full/empty bits. Capacity is trace-known;
-/// a capacity-N channel lowers to a ring of N+1 cells (§7.1).
+/// a capacity-N channel lowers to a ring of N+1 cells.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChannelDecl {
+    /// The shape of one cell.
     pub shape: Shape,
+    /// The element type of one cell.
     pub dtype: ChanDType,
-    /// Queue capacity ≥ 1 (deeper run-ahead = larger capacity, §3).
+    /// Queue capacity ≥ 1 (deeper run-ahead = larger capacity).
     pub capacity: u32,
+    /// Which endpoint, if either, the host holds.
     pub host_role: HostRole,
     /// `Channel::from(v)`: starts full. The seed *value* is per-instance
-    /// data supplied at instantiation — never in the container (D2).
+    /// data supplied at instantiation — never in the container.
     pub seeded: bool,
 }
 
@@ -105,25 +116,32 @@ pub struct ChannelDecl {
 /// `indptr`).
 #[derive(Clone, Debug, PartialEq)]
 pub enum PortSource {
+    /// Read from a channel at execution time, so the value can change per
+    /// fire.
     Channel(ChannelIndex),
     /// Raw little-endian payload: 4 bytes/element for F32/I32/U32, 1
     /// byte/element for Bool (the packed wire format is the runtime's, D1).
     Const {
+        /// Element type of `data`.
         dtype: DType,
+        /// Shape of the constant; its `numel` fixes `data`'s length.
         shape: Shape,
+        /// The payload bytes.
         data: Vec<u8>,
     },
 }
 
-/// One descriptor-port binding (overview §5.1).
+/// One descriptor-port binding.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PortBinding {
+    /// Which descriptor port is being bound.
     pub port: Port,
+    /// Where the port's value comes from.
     pub source: PortSource,
 }
 
 /// Direction of an extern channel — whose endpoint THIS trace holds.
-/// (v1.1 / wire-version 2; realizes §1's "SPSC pairs may span pipelines".)
+/// (wire-version 2: this is what lets an SPSC pair span two pipelines.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ExternDir {
@@ -137,6 +155,8 @@ pub enum ExternDir {
 }
 
 impl ExternDir {
+    /// The direction wire byte `v` names, or `None` if no direction claims
+    /// it.
     pub fn from_u8(v: u8) -> Option<Self> {
         Some(match v {
             0 => ExternDir::Import,
@@ -153,15 +173,20 @@ impl ExternDir {
 /// match the peer's at pairing time.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExternDecl {
+    /// Index into the container's name table; the pairing key.
     pub name: crate::op::NameIndex,
+    /// Which endpoint this trace holds.
     pub dir: ExternDir,
+    /// The channel whose other endpoint is external.
     pub chan: ChannelIndex,
 }
 
 /// One stage-tagged program: a flat SSA op list (see [`super::op`]).
 #[derive(Clone, Debug, PartialEq)]
 pub struct StageProgram {
+    /// When in the pass this body runs.
     pub stage: Stage,
+    /// The body, in SSA order.
     pub ops: Vec<Op>,
 }
 
@@ -171,6 +196,7 @@ pub struct TraceContainer {
     /// Second-party kernel/sink names ([`Op::KernelCall`]/[`Op::SinkCall`]
     /// reference by index). Sorted + deduped for canonicality.
     pub names: Vec<String>,
+    /// Channel declarations, indexed by [`ChannelIndex`].
     pub channels: Vec<ChannelDecl>,
     /// Sorted by port tag, unique.
     pub ports: Vec<PortBinding>,
@@ -183,9 +209,14 @@ pub struct TraceContainer {
 }
 
 impl TraceContainer {
+    /// This container's canonical bytes; see [`encode`].
     pub fn encode(&self) -> Vec<u8> {
         encode(self)
     }
+    /// The identity hash of this container's canonical bytes.
+    ///
+    /// Taken over the encoding rather than the structure, so two containers
+    /// hash alike exactly when they ship the same bytes.
     pub fn hash(&self) -> u64 {
         super::container_hash(&encode(self))
     }
@@ -195,7 +226,35 @@ impl TraceContainer {
 // Encode
 // ===========================================================================
 
+/// A table length as it goes on the wire.
+///
+/// Every count in the container is narrower than `usize`, and a table that
+/// overflows its width must not encode: the truncated count describes a
+/// shorter table, so the bytes that follow are read as the *next* field and
+/// the result decodes cleanly into a different program. There is no return
+/// path from an infallible encoder, and the ceilings in this module are
+/// several orders of magnitude above anything a traced pass builds, so
+/// overflowing one is a caller that assembled an impossible container.
+///
+/// # Panics
+///
+/// If `len` does not fit the wire width of `table`.
+fn wire_len<T>(len: usize, table: &str) -> T
+where
+    T: TryFrom<usize>,
+{
+    match T::try_from(len) {
+        Ok(value) => value,
+        Err(_) => panic!("{table} table of {len} entries exceeds its wire width"),
+    }
+}
+
 /// Lower a [`TraceContainer`] to its canonical bytes. Does not validate.
+///
+/// # Panics
+///
+/// If any table is longer than the wire width of its count; see
+/// `wire_len`.
 pub fn encode(c: &TraceContainer) -> Vec<u8> {
     let mut w = Vec::new();
     w.extend_from_slice(&PTIR_MAGIC);
@@ -210,15 +269,15 @@ pub fn encode(c: &TraceContainer) -> Vec<u8> {
         },
     );
     put_u16(&mut w, 0); // flags
-    put_u32(&mut w, c.names.len() as u32);
-    put_u32(&mut w, c.channels.len() as u32);
-    put_u32(&mut w, c.ports.len() as u32);
-    put_u32(&mut w, c.stages.len() as u32);
+    put_u32(&mut w, wire_len(c.names.len(), "name"));
+    put_u32(&mut w, wire_len(c.channels.len(), "channel"));
+    put_u32(&mut w, wire_len(c.ports.len(), "port"));
+    put_u32(&mut w, wire_len(c.stages.len(), "stage"));
     if v2 {
-        put_u32(&mut w, c.externs.len() as u32);
+        put_u32(&mut w, wire_len(c.externs.len(), "extern"));
     }
     for n in &c.names {
-        put_u16(&mut w, n.len() as u16);
+        put_u16(&mut w, wire_len(n.len(), "name byte"));
         w.extend_from_slice(n.as_bytes());
     }
     for ch in &c.channels {
@@ -245,7 +304,7 @@ pub fn encode(c: &TraceContainer) -> Vec<u8> {
     }
     for s in &c.stages {
         w.push(s.stage as u8);
-        put_u32(&mut w, s.ops.len() as u32);
+        put_u32(&mut w, wire_len(s.ops.len(), "op"));
         for op in &s.ops {
             encode_op(&mut w, op);
         }
@@ -258,210 +317,88 @@ pub fn encode(c: &TraceContainer) -> Vec<u8> {
     w
 }
 
+/// Append one op's tag byte and body to `w`.
+///
+/// A walk over [`OpSpec::wire`](crate::op::OpSpec::wire), so the field order
+/// here is the field order the decoder reads and the one the op table
+/// declares.
+///
+/// Spelling the order out here instead would make this a third copy, and the
+/// failure that invites — encode and decode agreeing on a layout the table
+/// does not describe — is invisible to a roundtrip test.
 pub fn encode_op(w: &mut Vec<u8>, op: &Op) {
-    w.push(op.tag());
-    match *op {
-        Op::Const(lit) => encode_literal(w, lit),
-
-        Op::Exp(a)
-        | Op::Log(a)
-        | Op::Neg(a)
-        | Op::Recip(a)
-        | Op::Abs(a)
-        | Op::Sign(a)
-        | Op::Not(a)
-        | Op::ReduceSum(a)
-        | Op::ReduceMax(a)
-        | Op::ReduceMin(a)
-        | Op::ReduceArgmax(a)
-        | Op::Transpose(a)
-        | Op::CumSum(a)
-        | Op::CumProd(a)
-        | Op::SortDesc(a) => put_u32(w, a),
-
-        Op::Cast { value, dtype } => {
-            put_u32(w, value);
-            w.push(dtype as u8);
-        }
-
-        Op::Add(a, b)
-        | Op::Sub(a, b)
-        | Op::Mul(a, b)
-        | Op::Div(a, b)
-        | Op::MaxElem(a, b)
-        | Op::MinElem(a, b)
-        | Op::Rem(a, b)
-        | Op::Gt(a, b)
-        | Op::Ge(a, b)
-        | Op::Eq(a, b)
-        | Op::Ne(a, b)
-        | Op::Lt(a, b)
-        | Op::Le(a, b)
-        | Op::And(a, b)
-        | Op::Or(a, b)
-        | Op::MatMul(a, b) => {
-            put_u32(w, a);
-            put_u32(w, b);
-        }
-
-        Op::Select { cond, a, b } => {
-            put_u32(w, cond);
-            put_u32(w, a);
-            put_u32(w, b);
-        }
-
-        Op::Broadcast { value, shape } | Op::Reshape { value, shape } => {
-            put_u32(w, value);
-            encode_shape(w, shape);
-        }
-
-        Op::TopK { input, k } => {
-            put_u32(w, input);
-            put_u32(w, k);
-        }
-
-        Op::PivotThreshold { input, predicate } => {
-            put_u32(w, input);
-            encode_predicate(w, predicate);
-        }
-
-        Op::Gather { src, idx } | Op::GatherRow { src, idx } => {
-            put_u32(w, src);
-            put_u32(w, idx);
-        }
-        Op::MaskApply { logits, mask } => {
-            put_u32(w, logits);
-            put_u32(w, mask);
-        }
-        Op::CausalMask { positions, len } => {
-            put_u32(w, positions);
-            put_u32(w, len);
-        }
-        Op::SlidingWindowMask {
-            positions,
-            len,
-            window,
-        } => {
-            put_u32(w, positions);
-            put_u32(w, len);
-            put_u32(w, window);
-        }
-        Op::SinkWindowMask {
-            positions,
-            len,
-            sink,
-            window,
-        } => {
-            put_u32(w, positions);
-            put_u32(w, len);
-            put_u32(w, sink);
-            put_u32(w, window);
-        }
-        Op::ScatterAdd { base, idx, vals } | Op::ScatterSet { base, idx, vals } => {
-            put_u32(w, base);
-            put_u32(w, idx);
-            put_u32(w, vals);
-        }
-        Op::Iota { len } => put_u32(w, len),
-
-        Op::Rng {
-            stream,
-            shape,
-            kind,
-        } => {
-            put_u32(w, stream);
-            encode_shape(w, shape);
-            w.push(kind as u8);
-        }
-        Op::RngKeyed { state, shape, kind } => {
-            put_u32(w, state);
-            encode_shape(w, shape);
-            w.push(kind as u8);
-        }
-
-        Op::ChanTake(c) | Op::ChanRead(c) => put_u32(w, c),
-        Op::ChanPut { chan, value } => {
-            put_u32(w, chan);
-            put_u32(w, value);
-        }
-
-        Op::IntrinsicVal { intr, shape, dtype } => {
-            put_u16(w, intr as u16);
-            w.push(dtype as u8);
-            encode_shape(w, shape);
-        }
-        Op::KernelCall {
-            name,
-            ref args,
-            shape,
-            dtype,
-        } => {
-            put_u16(w, name);
-            w.push(dtype as u8);
-            encode_shape(w, shape);
-            w.push(args.len() as u8);
-            for &a in args {
-                put_u32(w, a);
+    let wire = OpWire::of(op);
+    w.push(wire.tag);
+    // `tag()` only produces tags `declare_ops!` defines, and every row has a
+    // layout, so this cannot miss.
+    let layout = op::spec(wire.tag).expect("op tag has no OP_TABLE row").wire;
+    let mut value = 0usize;
+    let mut imm = 0usize;
+    for field in layout {
+        match field {
+            WireField::Value => {
+                put_u32(w, wire.args[value]);
+                value += 1;
             }
-        }
-        Op::SinkCall { name, ref args } => {
-            put_u16(w, name);
-            w.push(args.len() as u8);
-            for &a in args {
-                put_u32(w, a);
+            // `chan` is `-1` on every op whose layout has no channel field,
+            // and this arm runs only for the ops whose layout has one.
+            WireField::Chan => put_u32(
+                w,
+                u32::try_from(wire.chan).expect("a chan-carrying op records its channel index"),
+            ),
+            WireField::Imm => {
+                put_u32(w, [wire.imm, wire.imm2, wire.imm3][imm]);
+                imm += 1;
+            }
+            WireField::DType => w.push(wire.dtype),
+            WireField::Shape => {
+                w.push(wire_len(wire.shape.len(), "shape dim"));
+                for &dim in &wire.shape {
+                    put_u32(w, dim);
+                }
+            }
+            WireField::RngKind => w.push(wire.kind),
+            WireField::Predicate => {
+                w.push(wire.pred_tag);
+                put_u32(w, wire.pred_payload);
+            }
+            WireField::Literal => {
+                w.push(wire.lit_dtype);
+                put_u32(w, wire.lit_bits);
+            }
+            WireField::Name => put_u16(w, wire.name_idx),
+            WireField::Intrinsic => put_u16(w, wire.intr),
+            // Variadic, and last by `variadic_args_come_last`: whatever the
+            // fixed `Value` fields did not consume is the argument list.
+            WireField::Args => {
+                let rest = &wire.args[value..];
+                w.push(wire_len(rest.len(), "operand"));
+                for &arg in rest {
+                    put_u32(w, arg);
+                }
             }
         }
     }
 }
 
-fn encode_predicate(w: &mut Vec<u8>, pred: Predicate) {
-    match pred {
-        Predicate::RankLe(v) => {
-            w.push(0);
-            put_u32(w, v);
-        }
-        Predicate::CummassLe(v) => {
-            w.push(1);
-            put_u32(w, v);
-        }
-        Predicate::ProbGe(v) => {
-            w.push(2);
-            put_u32(w, v);
-        }
-    }
-}
-
+/// Appends `shape` as a rank byte followed by that many little-endian `u32`
+/// dims — the encoding [`WireField::Shape`] names.
+///
+/// # Panics
+///
+/// If the rank does not fit a byte; see [`MAX_RANK`].
 pub fn encode_shape(w: &mut Vec<u8>, shape: Shape) {
-    w.push(shape.rank() as u8);
+    w.push(wire_len(shape.rank(), "shape dim"));
     for &d in shape.dims() {
         put_u32(w, d);
     }
 }
 
-fn encode_literal(w: &mut Vec<u8>, lit: Literal) {
-    match lit {
-        Literal::F32(x) => {
-            w.push(0);
-            put_u32(w, x.to_bits());
-        }
-        Literal::I32(x) => {
-            w.push(1);
-            put_u32(w, x as u32);
-        }
-        Literal::U32(x) => {
-            w.push(2);
-            put_u32(w, x);
-        }
-        Literal::Bool(b) => {
-            w.push(3);
-            put_u32(w, b as u32);
-        }
-    }
-}
-
+/// Appends `v` as 2 little-endian bytes.
 pub fn put_u16(w: &mut Vec<u8>, v: u16) {
     w.extend_from_slice(&v.to_le_bytes());
 }
+/// Appends `v` as 4 little-endian bytes.
 pub fn put_u32(w: &mut Vec<u8>, v: u32) {
     w.extend_from_slice(&v.to_le_bytes());
 }
@@ -484,17 +421,43 @@ pub fn const_elem_size(dtype: DType) -> usize {
 
 /// A container decode failure.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ContainerDecodeError {
+    /// The leading bytes are not [`PTIR_MAGIC`], so this
+    /// is not a container at all.
     BadMagic,
+    /// A container version this build cannot read.
     UnsupportedVersion(u16),
+    /// A field ran past the end of the input.
     UnexpectedEof,
+    /// An op tag no [`OP_TABLE`](crate::op::OP_TABLE) row claims.
     UnknownOpcode(u8),
-    UnknownTag { what: &'static str, tag: u8 },
+    /// A tagged enum byte outside its declared set.
+    UnknownTag {
+        /// Which enum the tag was read for, for the diagnostic.
+        what: &'static str,
+        /// The byte that no variant claims.
+        tag: u8,
+    },
+    /// A shape rank above [`MAX_RANK`].
     RankTooLarge(u8),
+    /// A shape dim of `0`; every extent must be at least 1.
     ZeroDimension,
+    /// A name-table entry that is not valid UTF-8.
     BadUtf8,
+    /// Bytes remain after the container ends.
+    ///
+    /// Rejected rather than ignored: a trailing region is a place to hide
+    /// payload that changes nothing this decoder sees, which would let two
+    /// different byte strings present as the same program.
     TrailingBytes,
+    /// A table that the format requires to be sorted and deduplicated is
+    /// not.
+    ///
+    /// Canonicality is what makes the container hash an identity: without
+    /// it, the same program has as many hashes as it has orderings.
     NonCanonical,
+    /// A table length above its ceiling; the payload names which table.
     CountTooLarge(&'static str),
 }
 
@@ -543,9 +506,13 @@ pub const MAX_STAGES: usize = Stage::ALL.len();
 /// Per-stage op ceiling. Planning is linear in this, so it bounds compile time
 /// as well as memory.
 pub const MAX_OPS: usize = 1 << 16;
+/// Channel-table ceiling.
 pub const MAX_CHANNELS: usize = 1 << 12;
+/// Name-table ceiling.
 pub const MAX_NAMES: usize = 1 << 12;
+/// Port-table ceiling.
 pub const MAX_PORTS: usize = 1 << 8;
+/// Extern-table ceiling; one extern per channel is the most that can pair.
 pub const MAX_EXTERNS: usize = MAX_CHANNELS;
 
 /// Parse container bytes back into the model. Does not validate (bind does).
@@ -677,184 +644,92 @@ pub fn decode(bytes: &[u8]) -> Result<TraceContainer, ContainerDecodeError> {
     Ok(container)
 }
 
+/// Read one op's tag byte and body.
+///
+/// The mirror walk of [`encode_op`] over the same [`OpSpec::wire`]
+/// (crate::op::OpSpec::wire) layout. Each field is validated where it is read,
+/// so a malformed byte is named by the field it broke rather than by whatever
+/// the op ended up looking like.
 fn decode_op(r: &mut Reader<'_>) -> Result<Op, ContainerDecodeError> {
     let tag = r.u8()?;
-    let op = match tag {
-        tags::EXP => Op::Exp(r.u32()?),
-        tags::LOG => Op::Log(r.u32()?),
-        tags::NEG => Op::Neg(r.u32()?),
-        tags::RECIP => Op::Recip(r.u32()?),
-        tags::ABS => Op::Abs(r.u32()?),
-        tags::SIGN => Op::Sign(r.u32()?),
-        tags::CAST => Op::Cast {
-            value: r.u32()?,
-            dtype: decode_dtype(r.u8()?)?,
-        },
-        tags::ADD => Op::Add(r.u32()?, r.u32()?),
-        tags::SUB => Op::Sub(r.u32()?, r.u32()?),
-        tags::MUL => Op::Mul(r.u32()?, r.u32()?),
-        tags::DIV => Op::Div(r.u32()?, r.u32()?),
-        tags::MAX_ELEM => Op::MaxElem(r.u32()?, r.u32()?),
-        tags::MIN_ELEM => Op::MinElem(r.u32()?, r.u32()?),
-        tags::GT => Op::Gt(r.u32()?, r.u32()?),
-        tags::GE => Op::Ge(r.u32()?, r.u32()?),
-        tags::EQ => Op::Eq(r.u32()?, r.u32()?),
-        tags::NE => Op::Ne(r.u32()?, r.u32()?),
-        tags::LT => Op::Lt(r.u32()?, r.u32()?),
-        tags::LE => Op::Le(r.u32()?, r.u32()?),
-        tags::AND => Op::And(r.u32()?, r.u32()?),
-        tags::OR => Op::Or(r.u32()?, r.u32()?),
-        tags::NOT => Op::Not(r.u32()?),
-        tags::REM => Op::Rem(r.u32()?, r.u32()?),
-        tags::SELECT => Op::Select {
-            cond: r.u32()?,
-            a: r.u32()?,
-            b: r.u32()?,
-        },
-        tags::REDUCE_SUM => Op::ReduceSum(r.u32()?),
-        tags::REDUCE_MAX => Op::ReduceMax(r.u32()?),
-        tags::REDUCE_MIN => Op::ReduceMin(r.u32()?),
-        tags::REDUCE_ARGMAX => Op::ReduceArgmax(r.u32()?),
-        tags::BROADCAST => Op::Broadcast {
-            value: r.u32()?,
-            shape: decode_shape(r)?,
-        },
-        tags::RESHAPE => Op::Reshape {
-            value: r.u32()?,
-            shape: decode_shape(r)?,
-        },
-        tags::TRANSPOSE => Op::Transpose(r.u32()?),
-        tags::CUMSUM => Op::CumSum(r.u32()?),
-        tags::CUMPROD => Op::CumProd(r.u32()?),
-        tags::SORT_DESC => Op::SortDesc(r.u32()?),
-        tags::TOP_K => Op::TopK {
-            input: r.u32()?,
-            k: r.u32()?,
-        },
-        tags::MATMUL => Op::MatMul(r.u32()?, r.u32()?),
-        tags::PIVOT_THRESHOLD => {
-            let input = r.u32()?;
-            let predicate = match r.u8()? {
-                0 => Predicate::RankLe(r.u32()?),
-                1 => Predicate::CummassLe(r.u32()?),
-                2 => Predicate::ProbGe(r.u32()?),
-                t => {
+    let layout = op::spec(tag)
+        .ok_or(ContainerDecodeError::UnknownOpcode(tag))?
+        .wire;
+    let mut wire = OpWire {
+        tag,
+        chan: -1,
+        ..OpWire::default()
+    };
+    let mut imm = 0usize;
+    for field in layout {
+        match field {
+            WireField::Value => wire.args.push(r.u32()?),
+            WireField::Chan => wire.chan = i64::from(r.u32()?),
+            WireField::Imm => {
+                let value = r.u32()?;
+                match imm {
+                    0 => wire.imm = value,
+                    1 => wire.imm2 = value,
+                    _ => wire.imm3 = value,
+                }
+                imm += 1;
+            }
+            WireField::DType => wire.dtype = decode_dtype(r.u8()?)? as u8,
+            WireField::Shape => wire.shape = decode_shape(r)?.dims().to_vec(),
+            WireField::RngKind => wire.kind = decode_rng_kind(r.u8()?)? as u8,
+            WireField::Predicate => {
+                // The tag is rejected before its payload is consumed, which is
+                // what makes an unknown predicate an `UnknownTag` rather than
+                // an EOF four bytes later.
+                let pred = r.u8()?;
+                if pred > predicate_tags::PROB_GE {
                     return Err(ContainerDecodeError::UnknownTag {
                         what: "predicate",
-                        tag: t,
+                        tag: pred,
                     });
                 }
-            };
-            Op::PivotThreshold { input, predicate }
-        }
-        tags::GATHER => Op::Gather {
-            src: r.u32()?,
-            idx: r.u32()?,
-        },
-        tags::GATHER_ROW => Op::GatherRow {
-            src: r.u32()?,
-            idx: r.u32()?,
-        },
-        tags::SCATTER_ADD => Op::ScatterAdd {
-            base: r.u32()?,
-            idx: r.u32()?,
-            vals: r.u32()?,
-        },
-        tags::SCATTER_SET => Op::ScatterSet {
-            base: r.u32()?,
-            idx: r.u32()?,
-            vals: r.u32()?,
-        },
-        tags::IOTA => Op::Iota { len: r.u32()? },
-        tags::MASK_APPLY_PACKED => Op::MaskApply {
-            logits: r.u32()?,
-            mask: r.u32()?,
-        },
-        tags::CAUSAL_MASK => Op::CausalMask {
-            positions: r.u32()?,
-            len: r.u32()?,
-        },
-        tags::SLIDING_WINDOW_MASK => Op::SlidingWindowMask {
-            positions: r.u32()?,
-            len: r.u32()?,
-            window: r.u32()?,
-        },
-        tags::SINK_WINDOW_MASK => Op::SinkWindowMask {
-            positions: r.u32()?,
-            len: r.u32()?,
-            sink: r.u32()?,
-            window: r.u32()?,
-        },
-        tags::RNG => Op::Rng {
-            stream: r.u32()?,
-            shape: decode_shape(r)?,
-            kind: decode_rng_kind(r.u8()?)?,
-        },
-        tags::RNG_KEYED => Op::RngKeyed {
-            state: r.u32()?,
-            shape: decode_shape(r)?,
-            kind: decode_rng_kind(r.u8()?)?,
-        },
-        tags::CONST => {
-            let dt = r.u8()?;
-            let bits = r.u32()?;
-            Op::Const(match dt {
-                0 => Literal::F32(f32::from_bits(bits)),
-                1 => Literal::I32(bits as i32),
-                2 => Literal::U32(bits),
-                3 => Literal::Bool(bits != 0),
-                t => {
+                wire.pred_tag = pred;
+                wire.pred_payload = r.u32()?;
+            }
+            WireField::Literal => {
+                // Payload first, then the tag check: a truncated literal is an
+                // EOF, not an unknown dtype.
+                let dtype = r.u8()?;
+                wire.lit_bits = r.u32()?;
+                if DType::from_wire(dtype).is_none() {
                     return Err(ContainerDecodeError::UnknownTag {
                         what: "literal dtype",
-                        tag: t,
+                        tag: dtype,
                     });
                 }
-            })
-        }
-        tags::CHAN_TAKE => Op::ChanTake(r.u32()?),
-        tags::CHAN_READ => Op::ChanRead(r.u32()?),
-        tags::CHAN_PUT => Op::ChanPut {
-            chan: r.u32()?,
-            value: r.u32()?,
-        },
-        tags::INTRINSIC_VAL => {
-            let iv = r.u16()?;
-            let intr = IntrinsicId::from_u16(iv).ok_or(ContainerDecodeError::UnknownTag {
-                what: "intrinsic",
-                tag: iv as u8,
-            })?;
-            let dtype = decode_dtype(r.u8()?)?;
-            let shape = decode_shape(r)?;
-            Op::IntrinsicVal { intr, shape, dtype }
-        }
-        tags::KERNEL_CALL => {
-            let name = r.u16()?;
-            let dtype = decode_dtype(r.u8()?)?;
-            let shape = decode_shape(r)?;
-            let n = r.u8()? as usize;
-            let mut args = Vec::with_capacity(n);
-            for _ in 0..n {
-                args.push(r.u32()?);
+                wire.lit_dtype = dtype;
             }
-            Op::KernelCall {
-                name,
-                args,
-                shape,
-                dtype,
+            WireField::Name => wire.name_idx = r.u16()?,
+            WireField::Intrinsic => {
+                let intr = r.u16()?;
+                if IntrinsicId::from_u16(intr).is_none() {
+                    // The diagnostic's `tag` is a byte, so a wide id keeps
+                    // only its low half; naming the field it came from is what
+                    // keeps that from reading as the whole value.
+                    return Err(ContainerDecodeError::UnknownTag {
+                        what: "intrinsic (low byte)",
+                        tag: intr.to_le_bytes()[0],
+                    });
+                }
+                wire.intr = intr;
+            }
+            WireField::Args => {
+                let count = r.u8()? as usize;
+                wire.args.reserve(count);
+                for _ in 0..count {
+                    wire.args.push(r.u32()?);
+                }
             }
         }
-        tags::SINK_CALL => {
-            let name = r.u16()?;
-            let n = r.u8()? as usize;
-            let mut args = Vec::with_capacity(n);
-            for _ in 0..n {
-                args.push(r.u32()?);
-            }
-            Op::SinkCall { name, args }
-        }
-        t => return Err(ContainerDecodeError::UnknownOpcode(t)),
-    };
-    Ok(op)
+    }
+    // Every field the layout names has been read and validated, so the only
+    // way back is the one the roundtrip test pins.
+    wire.to_op().ok_or(ContainerDecodeError::UnknownOpcode(tag))
 }
 
 fn decode_rng_kind(t: u8) -> Result<RngKind, ContainerDecodeError> {
@@ -900,6 +775,7 @@ fn decode_shape(r: &mut Reader<'_>) -> Result<Shape, ContainerDecodeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::Literal;
     use alloc::string::ToString;
     use alloc::vec;
 
@@ -966,7 +842,7 @@ mod tests {
 
     #[test]
     fn round_trip_2d_channel_shape() {
-        // Regression: a §6.2 beam `pages` channel is [B,P] (2D). The container
+        // Regression: a beam-search `pages` channel is [B,P] (2D). The container
         // encode/decode MUST preserve the 2D shape (numel B*P), else validate_seeds
         // rejects the [B,P] seed as a byte-length mismatch.
         let mut c = sample();

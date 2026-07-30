@@ -17,6 +17,7 @@
 #include "model/workspace.hpp"        // universal model::workspace_bytes
 
 #include "model/csm/csm.hpp"
+#include "model/csm/csm_contract.hpp"
 #include "model/csm/csm_model.hpp"
 #include "model/deepseek_v4/deepseek_v4.hpp"
 #include "model/deepseek_v4/deepseek_v4_contract.hpp"
@@ -290,7 +291,6 @@ public:
 
     DsV4Weights weights;
     PlanInfo info;
-    bool eager_bf16_experts = true;
 };
 
 class Glm5Plan final : public ModelPlan {
@@ -437,10 +437,7 @@ std::unique_ptr<ModelPlan> bind_row_nemotron_h(LoadedModel& engine, bool) {
     return std::make_unique<NemotronHPlan>(bind_nemotron_h(engine));
 }
 std::unique_ptr<ModelPlan> bind_row_deepseek_v4(LoadedModel& engine, bool) {
-    auto plan = std::make_unique<DeepSeekV4Plan>(bind_deepseek_v4(engine));
-    plan->eager_bf16_experts = engine.mxfp4_moe_request() !=
-        model::Mxfp4MoeRequest::RoutedDecode;
-    return plan;
+    return std::make_unique<DeepSeekV4Plan>(bind_deepseek_v4(engine));
 }
 std::unique_ptr<ModelPlan> bind_row_kimi(LoadedModel& engine, bool) {
     return std::make_unique<KimiPlan>(bind_kimi(engine));
@@ -546,8 +543,7 @@ std::unique_ptr<IModel> create_deepseek_v4_model(
     return std::make_unique<DsV4Model>(
         std::move(plan.weights), *res.hf_config, *res.dsv4_ws,
         *res.dsv4_comp_cache, *res.kv_cache, res.tp_size,
-        res.tp_rank, res.tp_comm, /*emit_logits=*/true,
-        plan.eager_bf16_experts);
+        res.tp_rank, res.tp_comm, /*emit_logits=*/true);
 }
 
 std::unique_ptr<IModel> create_kimi_model(
@@ -762,7 +758,7 @@ std::vector<ArchEntry> build_arch_table() {
     //    The only family whose config validation hook is non-trivial.
     push("csm", Family::Csm, "csm", validate_csm_config, bind_row_csm,
          create_csm_model,
-         author_dense_contract);
+         author_csm_contract);
 
     return t;
 }

@@ -1,15 +1,14 @@
 //! # CUDA kernel emitters
 //!
-//! A direct port of `driver/cuda/src/pipeline/generated/` (namespace
-//! `pie_cuda_driver::pipeline::generated`). The C++ original is the oracle:
-//! every function here emits the same bytes for the same input, and
-//! `compiler/tests/golden-cuda/` is the checked-in proof (see
-//! `compiler/tests/oracle/README.md`).
+//! The only producer of Pie's generated CUDA. Emission is a pure function of
+//! the plan — no device-architecture inputs — so the same stage emits the same
+//! bytes every time, and `compiler/tests/golden-cuda/` pins them.
 //!
-//! Like the Metal port, the differences from the C++ are mechanical: the
-//! `GeneratedKernelSource` out-struct becomes [`Result`], and the runtime
-//! template is embedded with `include_str!` instead of being rebuilt from a
-//! string literal on every call.
+//! Those goldens started as a dump of an in-driver C++ emitter that no longer
+//! exists, which is why they are formatted as a foreign dump and why
+//! regenerating one is guarded. They are now the contract itself rather than a
+//! transcript of one: nothing can re-derive them, so a diff is a decision to be
+//! justified, not a comparison to be re-run.
 //!
 //! ## Modules
 //!

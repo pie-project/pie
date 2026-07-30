@@ -42,7 +42,7 @@ fn u32_port(port: Port, shape: Shape, values: &[u32]) -> PortBinding {
     }
 }
 
-/// The overview §3 shape: tok (loop), out (host-read), mask (host-fed,
+/// The canonical decode-loop shape: tok (loop), out (host-read), mask (host-fed,
 /// bool), len (counter), rng (state) + greedy-gumbel epilogue.
 fn section3() -> TraceContainer {
     let vocab = 32u32;

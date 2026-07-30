@@ -286,6 +286,10 @@ pub enum StarveCause {
     /// may be evicted for it. When the pages are all held by processes OLDER
     /// than the head, the planner has no legal move.
     NoEligibleVictim,
+    /// Every RS folded slot is held and no admitted process is left running to
+    /// return one. Eviction is not a rung here: it frees KV pages, never
+    /// folded slots, so nothing the planner can do will fund this ask.
+    NoRsSlots,
 }
 
 impl StarveCause {
@@ -295,6 +299,11 @@ impl StarveCause {
             StarveCause::NoEligibleVictim => {
                 "no evictable victim — every page is held by a process OLDER \
                  than the head, which FCFS anti-thrash forbids evicting"
+            }
+            StarveCause::NoRsSlots => {
+                "every RS folded slot is held and no admitted process is still \
+                 running to return one — asking for more concurrent state slots \
+                 than the pool has cannot be waited out"
             }
         }
     }
@@ -409,6 +418,9 @@ pub struct PlannerQueueEntry {
     pub spawn_seq: u64,
     pub kind: &'static str,
     pub pages: u32,
+    /// RS folded slots this ask needs. A head parked with pages available is
+    /// blocked on this instead, and reading only `pages` hid that.
+    pub rs_slots: u32,
 }
 
 /// How many unparked admitted processes [`PlannerDiagnostics::runners`]
@@ -421,6 +433,10 @@ pub struct PlannerDiagnostics {
     pub device_pages_total: u32,
     pub host_slots_free: u32,
     pub host_slots_total: u32,
+    /// `(free, total)` RS folded slots — the other resource an allocation ask
+    /// can park on, and the one a KV-only trace cannot see.
+    pub rs_slots_free: u32,
+    pub rs_slots_total: u32,
     pub accumulation: u32,
     pub queue: Vec<PlannerQueueEntry>,
     /// Registered processes by state: Resident, Evicting, Evicted, Restoring.
@@ -901,6 +917,16 @@ impl ResidencyPlanner {
     /// parks FCFS at the process's spawn position and is served out of the
     /// head-first accumulation. [`Acquired::Yield`] hands control back to
     /// the fire path when this process must settle its own tail (eviction).
+    /// Instrumentation: cumulative parks and the current parked width.
+    /// Sampling the width alone misses parks shorter than the sample
+    /// interval, which is what made an oversubscribed pool look idle.
+    pub fn park_census(&self) -> (u64, usize) {
+        (
+            self.stats.parks.load(Ordering::Relaxed),
+            self.waiters.load(Ordering::Acquire),
+        )
+    }
+
     pub async fn acquire(
         self: &Arc<Self>,
         pid: ProcessId,
@@ -1219,8 +1245,17 @@ impl ResidencyPlanner {
                     let rs = if demand.rs_slots > 0 {
                         match self.port.reserve_rs(demand.rs_slots) {
                             Some(slots) => RsSlotReservation::new(slots, self.port.clone()),
-                            // RS pool short; the next RS free re-plans.
-                            None => return,
+                            // RS pool short; the next RS free re-plans — but
+                            // only a RUNNING process can free one, so if every
+                            // admitted process is parked there is no next free
+                            // and the head waits forever. The page ladder
+                            // cannot catch this: it is entered from a failed
+                            // absorb, and this head's pages are already
+                            // covered, so nothing below reaches the rung.
+                            None => {
+                                self.check_rs_starvation(key, demand);
+                                return;
+                            }
                         }
                     } else {
                         RsSlotReservation::empty()
@@ -1834,6 +1869,68 @@ impl ResidencyPlanner {
         }
     }
 
+    /// The RS analogue of [`Self::check_starvation`], for the one resource the
+    /// eviction ladder cannot fund. A folded slot is released by a process
+    /// finishing work, so the wedge predicate — every admitted process parked —
+    /// is exactly "no slot can ever come back". Reached only from the drain's
+    /// failed `reserve_rs`, so the common case (a transiently empty pool with
+    /// somebody still running) still just waits.
+    ///
+    /// The head is failed, not the youngest: destroying a younger waiter frees
+    /// no slot, because slots are held by RUNNING requests rather than by
+    /// queued ones. This is the deployment asking for more concurrent state
+    /// than the pool has, and saying so is the only honest move.
+    fn check_rs_starvation(self: &Arc<Self>, key: EntryKey, demand: Demand) {
+        if !self.is_wedged() {
+            return;
+        }
+        // The predicate was evaluated after a reservation that already failed,
+        // so re-read the pool before destroying anything: a slot freed in
+        // between makes the whole question moot.
+        let (free, total) = self.port.rs_stats();
+        if free >= demand.rs_slots {
+            self.poke();
+            return;
+        }
+        if !self.is_wedged() {
+            return;
+        }
+        let notify = self.with_inner(|inner| {
+            // Still the same unmet head, still unserved.
+            match inner.unmet_head() {
+                Some((head, _)) if head == key => {}
+                _ => return None,
+            }
+            let waiter = inner.queue.get_mut(&key)?;
+            let WaitKind::Allocation {
+                notify, outcome, ..
+            } = &mut waiter.kind
+            else {
+                return None;
+            };
+            if outcome.is_some() {
+                return None;
+            }
+            *outcome = Some(Err(PlannerError::Starved {
+                need: demand.rs_slots,
+                free,
+                total,
+                cause: StarveCause::NoRsSlots,
+            }));
+            Some(notify.clone())
+        });
+        if let Some(notify) = notify {
+            self.stats.starvations.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                need = demand.rs_slots,
+                free,
+                total,
+                "planner: RS slot pool wedged — failing the head"
+            );
+            notify.notify_waiters();
+        }
+    }
+
     fn check_starvation(self: &Arc<Self>, cause: StarveCause) {
         if !self.is_wedged() {
             return;
@@ -2214,6 +2311,7 @@ impl ResidencyPlanner {
     pub fn diagnostics(&self) -> PlannerDiagnostics {
         let (device_pages_free, device_pages_total) = self.port.device_stats();
         let (host_slots_free, host_slots_total) = self.port.host_stats();
+        let (rs_slots_free, rs_slots_total) = self.port.rs_stats();
         let inner = self.inner.lock();
         let queue = inner
             .queue
@@ -2226,6 +2324,10 @@ impl ResidencyPlanner {
                     WaitKind::Restore { .. } => "restore",
                 },
                 pages: waiter.kv_need(),
+                rs_slots: match &waiter.kind {
+                    WaitKind::Allocation { demand, .. } => demand.rs_slots,
+                    WaitKind::Restore { .. } => 0,
+                },
             })
             .collect();
         let parked: std::collections::HashSet<ProcessId> =
@@ -2265,6 +2367,8 @@ impl ResidencyPlanner {
             device_pages_total,
             host_slots_free,
             host_slots_total,
+            rs_slots_free,
+            rs_slots_total,
             accumulation,
             queue,
             proc_states,

@@ -2,6 +2,7 @@
 name = "pie-plan"
 version = "0.1.0"
 edition = "2024"
+rust-version.workspace = true
 authors = ["In Gim <in.gim@yale.edu>"]
 description = "PTIR execution planning: normalization, stage signatures, value-domain analysis, region partitioning, and the lane-table ABI, produced as in-memory stage plans that emission consumes directly."
 license = "Apache-2.0"

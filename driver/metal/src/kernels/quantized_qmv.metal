@@ -65,7 +65,12 @@ inline U qdot(
   return scale * accum + sum * bias;
 }
 
-template <typename T, int group_size, int bits>
+// `packs_per_thread` is what sets the K stride: block_size = 32 * pack_factor *
+// packs_per_thread, and the reduction loop assumes K is a whole number of blocks.
+// At 4 bits that is 512 for the two-pack default and 256 for one pack, which is
+// why gemma4's `per_layer_projection` (K=256) needs the narrow instantiation --
+// the fast one reads 512 elements of a 256-element row.
+template <typename T, int group_size, int bits, int packs_per_thread_ = 2>
 METAL_FUNC void qmv_fast_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -77,7 +82,7 @@ METAL_FUNC void qmv_fast_impl(
     uint3 tid,
     uint simd_gid,
     uint simd_lid) {
-  constexpr int packs_per_thread = 2;
+  constexpr int packs_per_thread = packs_per_thread_;
   constexpr int num_simdgroups = 2;
   constexpr int results_per_simdgroup = 4;
   constexpr int pack_factor = get_pack_factor<bits, 32>();
@@ -254,3 +259,36 @@ instantiate_qmv_fast(bfloat16, bfloat, 64, 4)
 instantiate_qmv_fast_residual(float32, float, 64, 4)
 instantiate_qmv_fast_residual(float16, half, 64, 4)
 instantiate_qmv_fast_residual(bfloat16, bfloat, 64, 4)
+
+// ── Narrow-K variant (gemma4) ────────────────────────────────────────────────
+// Identical math and identical launch shape; one pack per thread instead of two,
+// so the K-reduction block is 256 rather than 512. gemma4's
+// `per_layer_projection` is Linear(256 -> 1536), the only projection in either
+// family whose K is not a multiple of 512 -- `affine_qmv_fast` would read a
+// whole block past the end of every row and reduce garbage into the result.
+template <typename T, int group_size, int bits>
+[[kernel]] void affine_qmv_narrow(
+    const device uint32_t* w   [[buffer(0)]],
+    const device T* scales     [[buffer(1)]],
+    const device T* biases     [[buffer(2)]],
+    const device T* x          [[buffer(3)]],
+    device T* y                [[buffer(4)]],
+    const constant int& in_vec_size  [[buffer(5)]],
+    const constant int& out_vec_size [[buffer(6)]],
+    uint3 tid       [[threadgroup_position_in_grid]],
+    uint simd_gid   [[simdgroup_index_in_threadgroup]],
+    uint simd_lid   [[thread_index_in_simdgroup]]) {
+  qmv_fast_impl<T, group_size, bits, 1>(
+      w, scales, biases, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+}
+
+#define instantiate_qmv_narrow(name, itype, gs, b)                       \
+  template [[host_name("affine_qmv_narrow_" #name "_gs_" #gs "_b_" #b)]] \
+  [[kernel]] void affine_qmv_narrow<itype, gs, b>(                       \
+      const device uint32_t*, const device itype*, const device itype*,  \
+      const device itype*, device itype*, const constant int&,           \
+      const constant int&, uint3, uint, uint);
+
+instantiate_qmv_narrow(float32, float, 64, 4)
+instantiate_qmv_narrow(float16, half, 64, 4)
+instantiate_qmv_narrow(bfloat16, bfloat, 64, 4)

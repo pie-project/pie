@@ -18,9 +18,14 @@ use super::symbolic::{symbolic_channel_type, symbolic_port_type};
 
 pub(crate) const SIGNATURE_MAGIC: [u8; 4] = *b"PTSG";
 
+/// The canonical bytes and hash that decide a stage's plan identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StageSignature {
+    /// FNV-1a-64 of [`canonical_bytes`](Self::canonical_bytes); the plan cache
+    /// key and the emitted kernel's entry-point name.
     pub hash: u64,
+    /// The canonical encoding two stages must share byte-for-byte to share a
+    /// plan. Runtime extents stay symbolic, so batch shape is absent.
     pub canonical_bytes: Vec<u8>,
 }
 
@@ -66,6 +71,11 @@ pub(crate) fn stage_signature(bound: &BoundTrace, stage: &NormalizedStage) -> St
         match &binding.source {
             PortSource::Channel(global) => {
                 bytes.push(0);
+                // Invariant: `localize_stage` ran before this and put every
+                // channel the stage's ports name into `channel_bindings` —
+                // that is what localization means. Skipping an unfound
+                // channel would drop a port from the signature, so two stages
+                // differing only in that port would share a plan.
                 put_u32(
                     &mut bytes,
                     stage

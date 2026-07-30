@@ -23,8 +23,3 @@ anyhow = "1"
 clap = { version = "4.6", features = ["derive"] }
 # This bin owns the runtime (Model A — the skeleton is runtime-agnostic).
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-# The worker daemon runs the inference runtime (scheduler + chain-extender pool),
-# a burst-allocation pattern that benefits from a thread-caching allocator. The
-# `#[global_allocator]` must live in the final binary crate, so it is set here
-# (preserved from the pre-refactor worker binary), not in the role library.
-mimalloc = "0.1"

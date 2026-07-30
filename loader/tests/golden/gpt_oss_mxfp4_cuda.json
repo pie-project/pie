@@ -6,7 +6,7 @@
     "tp_size": 1,
     "max_tile_bytes": 67108864,
     "preferred_alignment": 256,
-    "tile_map_mask": 85,
+    "tile_map_mask": 213,
     "native_mxfp4_moe": false,
     "fusion_mask": 1,
     "encode_scratch_dtype": "BF16",
@@ -32,18 +32,6 @@
       "rewrites": 5
     },
     {
-      "pass": "group-shared-source-reads",
-      "instrs_before": 13,
-      "instrs_after": 13,
-      "rewrites": 0
-    },
-    {
-      "pass": "merge-adjacent-extent-writes",
-      "instrs_before": 13,
-      "instrs_after": 13,
-      "rewrites": 0
-    },
-    {
       "pass": "recompute-memory-plan",
       "instrs_before": 13,
       "instrs_after": 13,
@@ -57,6 +45,12 @@
     },
     {
       "pass": "validate-target-support",
+      "instrs_before": 13,
+      "instrs_after": 13,
+      "rewrites": 0
+    },
+    {
+      "pass": "validate-scale-factors",
       "instrs_before": 13,
       "instrs_after": 13,
       "rewrites": 0

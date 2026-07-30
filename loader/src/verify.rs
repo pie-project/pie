@@ -11,7 +11,7 @@
 //! There is no driver-side counterpart. `loaded_model.cpp` used to compare a
 //! covered count against a demanded one, which was `if (x != x)` twice over:
 //! first because both were assigned from `view.tensors.len`, and then, once the
-//! contract gave them separate origins, because [`check_contract`] below throws
+//! contract gave them separate origins, because `check_contract` below throws
 //! on the only way they could differ. A driver that calls `verify` has already
 //! been told; counting again on the far side of the FFI only looked like a
 //! check.
@@ -19,11 +19,11 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use crate::types::Encoding;
+use crate::types::{Encoding, Visibility};
 
 /// The plan, reduced to what verification can read.
 ///
-/// Both callers build one: the CLI from a Rust [`LoadPlan`], and the FFI
+/// Both callers build one: the CLI from a Rust [`LoadPlan`](crate::plan::LoadPlan), and the FFI
 /// boundary from the `PieLoaderPlan` the C++ driver is holding. The FFI case is
 /// the one that matters — verifying the *marshalled* view means a bug in the
 /// marshalling is in scope, which it would not be if verification re-read the
@@ -76,14 +76,19 @@ pub struct TensorView<'a> {
     /// different code, so two spellings of the same quantization must not read
     /// as a disagreement.
     pub encoding: Encoding,
+    /// Whether the driver binds this name. An [`Visibility::Internal`]
+    /// declaration is a name the contract needed for itself, so it is typed and
+    /// planned like any other but never finalized.
+    pub visibility: Visibility,
 }
 
 impl<'a> TensorView<'a> {
-    pub fn new(name: &'a str, shape: &[i64], encoding: &Encoding) -> Self {
+    pub fn new(name: &'a str, shape: &[i64], encoding: &Encoding, visibility: Visibility) -> Self {
         Self {
             name,
             shape: shape.to_vec(),
             encoding: crate::types::normalize_encoding(encoding),
+            visibility,
         }
     }
 }
@@ -284,12 +289,17 @@ fn check_schedule(plan: &PlanView<'_>, found: &mut Vec<Violation>) {
     }
 }
 
-/// Every declared tensor must be finalized, under its declared name, exactly
+/// Every public declaration must be finalized, under its declared name, exactly
 /// once — and nothing else may be.
 ///
-/// A `TensorDecl` with no `Finalize` is a weight the driver will look up and
-/// not find. A `Finalize` with no `TensorDecl` is a name the driver was never
-/// told to expect. Both are the plan disagreeing with itself.
+/// A public `TensorDecl` with no `Finalize` is a weight the driver will look up
+/// and not find. A `Finalize` with no `TensorDecl` is a name the driver was
+/// never told to expect. Both are the plan disagreeing with itself.
+///
+/// The declaration table and the bind table are not the same set, which is what
+/// [`Visibility`] says: an internal declaration is a name later expressions
+/// resolve through, and finalizing it would put in the driver's hands the very
+/// tensor the contract asked to keep.
 fn check_coverage(plan: &PlanView<'_>, found: &mut Vec<Violation>) {
     let mut finalized: HashMap<&str, usize> = HashMap::new();
     for name in &plan.finalized {
@@ -304,13 +314,18 @@ fn check_coverage(plan: &PlanView<'_>, found: &mut Vec<Violation>) {
                 "is declared more than once, so a driver's lookup is ambiguous",
             ));
         }
-        match finalized.get(tensor.name) {
-            None => found.push(Violation::tensor(
+        match (tensor.visibility, finalized.get(tensor.name)) {
+            (Visibility::Public, None) => found.push(Violation::tensor(
                 tensor.name,
                 "is declared but never finalized, so the load would leave it absent",
             )),
-            Some(1) => {}
-            Some(count) => found.push(Violation::tensor(
+            (Visibility::Public, Some(1)) | (Visibility::Internal, None) => {}
+            (Visibility::Internal, Some(_)) => found.push(Violation::tensor(
+                tensor.name,
+                "is internal but finalized, so the driver would bind a name the \
+                 contract asked to keep to itself",
+            )),
+            (Visibility::Public, Some(count)) => found.push(Violation::tensor(
                 tensor.name,
                 format!("is finalized {count} times; the last write silently wins"),
             )),
@@ -408,11 +423,11 @@ fn check_files(plan: &PlanView<'_>, found: &mut Vec<Violation>) {
 
 /// Check the plan against what the runtime actually demands.
 ///
-/// This is §8.2's coverage question in full: not "is the plan self-consistent"
-/// but "does it produce what will be asked for, in the form it will be asked
-/// for?". Shape and encoding are checked as well as presence, because a tensor
-/// that exists at the wrong shape fails later, further away, and as garbage
-/// output rather than a missing symbol.
+/// This is `architecture.md` §8.2's coverage question in full: not "is the plan
+/// self-consistent" but "does it produce what will be asked for, in the form it
+/// will be asked for?". Shape and encoding are checked as well as presence,
+/// because a tensor that exists at the wrong shape fails later, further away,
+/// and as garbage output rather than a missing symbol.
 fn check_contract(plan: &PlanView<'_>, contract: &ContractView<'_>, found: &mut Vec<Violation>) {
     let planned: HashMap<&str, &TensorView<'_>> = plan
         .tensors
@@ -452,10 +467,11 @@ fn check_contract(plan: &PlanView<'_>, contract: &ContractView<'_>, found: &mut 
         }
     }
 
-    // The converse is not a violation by symmetry: the loader publishes views
-    // (`nemotron.rs` republishes packed experts under their original names) that
-    // a given driver may never bind. Producing more than was demanded costs a
-    // name, not correctness. Producing less is the failure.
+    // The converse is not a violation by symmetry: a contract may publish views
+    // alongside the buffer they borrow — packed MoE experts republished under
+    // their original names, as `tests/storage_compiler.rs` pins for Nemotron-H —
+    // and a given driver may never bind them. Producing more than was demanded
+    // costs a name, not correctness. Producing less is the failure.
 }
 
 /// Compare two encodings over the fields a plan can actually carry.
@@ -498,6 +514,14 @@ mod tests {
             shape: vec![1],
             encoding: Encoding::Raw(crate::types::DType::U8),
             alignment: 1,
+            visibility: Visibility::Public,
+        }
+    }
+
+    fn internal(decl: TensorDecl) -> TensorDecl {
+        TensorDecl {
+            visibility: Visibility::Internal,
+            ..decl
         }
     }
 
@@ -577,6 +601,23 @@ mod tests {
         let violations = verify_marshalled(&plan, None).unwrap_err();
         assert_eq!(violations[0].tensor.as_deref(), Some("w"));
         assert!(violations[0].message.contains("never finalized"));
+    }
+
+    #[test]
+    fn an_internal_tensor_that_is_never_finalized_verifies() {
+        let plan = plan_with(vec![internal(decl("factors"))], Vec::new());
+        verify_marshalled(&plan, None).expect("an internal name is not a missing weight");
+    }
+
+    #[test]
+    fn finalizing_an_internal_tensor_is_a_violation() {
+        let plan = plan_with(
+            vec![internal(decl("factors"))],
+            vec![finalize(0, "factors")],
+        );
+        let violations = verify_marshalled(&plan, None).unwrap_err();
+        assert_eq!(violations[0].tensor.as_deref(), Some("factors"));
+        assert!(violations[0].message.contains("is internal but finalized"));
     }
 
     #[test]
@@ -673,8 +714,9 @@ mod tests {
         assert!(violations[0].message.contains("BF16"));
     }
 
-    /// Publishing more than was demanded is not a failure: the loader
-    /// republishes views (`arch/nemotron.rs`) that a given driver may not bind.
+    /// Publishing more than was demanded is not a failure: a contract may
+    /// republish a borrowed view — packed MoE experts under their original
+    /// names — that a given driver never binds.
     #[test]
     fn a_plan_delivering_more_than_the_contract_demands_verifies() {
         let plan = plan_with(

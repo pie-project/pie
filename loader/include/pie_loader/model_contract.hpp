@@ -17,36 +17,74 @@
 ///
 /// # The algebra
 ///
-/// Ten node kinds, mirroring `crate::contract::Expr` one for one:
+/// Twelve node kinds, mirroring `crate::contract::Expr` one for one. They are
+/// grouped by the invariant each one preserves, because that -- not the name --
+/// is what tells you which of them to reach for:
 ///
-/// | Node                          | Meaning                                          |
-/// |-------------------------------|--------------------------------------------------|
-/// | `src(name)`                   | A tensor as it appears in the checkpoint          |
-/// | `out(name)`                   | An earlier `define` in this contract              |
-/// | `slice(x, axis, start, len)`  | A contiguous or strided run along one axis        |
-/// | `cat({a, b, c}, axis)`        | Concatenation, in the order given                 |
-/// | `reshape(x, shape)`           | Same bytes, new extents; one `-1` is inferred     |
-/// | `pad(x, axis, before, after)` | Grow an axis with zeros                           |
-/// | `shard(x, axis)`              | This rank's slice of a TP-split axis              |
-/// | `repack(x, spec, out)`        | An opaque kernel-specific relayout                |
-/// | `quantize(x, spec)`           | Encode into a quantized format                    |
-/// | `bitcast(x, out)`             | Reinterpret bytes as another type                 |
+/// | Node                             | Preserves            | Meaning                                     |
+/// |----------------------------------|----------------------|---------------------------------------------|
+/// | `src(name)`                      | --                   | A tensor as it appears in the checkpoint    |
+/// | `out(name)`                      | --                   | An earlier `define` in this contract        |
+/// | `fill(value, shape, enc)`        | --                   | A constant tensor; a `concat` leg that pads |
+/// | `slice(x, axis, start, len)`     | bytes, values, type  | A contiguous band along one axis            |
+/// | `stride(x, axis, start, len, k)` | bytes, values, type  | Every `k`-th element along one axis         |
+/// | `gather(x, axis, {i, j, k})`     | bytes, values, type  | The elements at those indices, in order     |
+/// | `concat({a, b, c}, axis)`        | bytes, values, type  | The parts joined, in the order given        |
+/// | `shard(x, axis)`                 | bytes, values, type  | This rank's slice of a TP-split axis        |
+/// | `transmute(x, shape, enc)`       | bytes                | Same bytes under a new type; one `-1` is inferred |
+/// | `scale(x, factor)`               | type                 | Multiply every element                      |
+/// | `cast(x, enc)`                   | values               | The same values in another representation   |
+/// | `repack(x, spec, out)`           | values, type         | An opaque kernel-specific relayout          |
+///
+/// The five that preserve all three move bytes and nothing else: what comes out
+/// is a rearrangement of what went in, and every one of them compiles to byte
+/// runs the loader can read straight out of the checkpoint.
+///
+/// `transmute` is free as well — it renames bytes without moving them. The
+/// other three cost a kernel. `repack` preserves everything the five do except
+/// placement, and it is held to that: it may pad, and it may not reinterpret an
+/// element. It is a relayout priced as a kernel, not an escape hatch for
+/// whatever a relayout could be made to do.
+///
+/// `slice`, `stride` and `gather` are three rungs of one cost ladder, and the
+/// author picks the rung. A band leaves every run in the source intact; a
+/// stride cuts the source into one run per element; a gather is what is left
+/// when no arithmetic describes the order. The loader refuses a list that a
+/// cheaper node could express, so the ladder cannot be climbed by accident.
+/// For the same reason neither `stride` nor `gather` may touch a quantized
+/// axis, where a `slice` may as long as it lands on group boundaries.
+///
+/// No model has needed `gather` yet. It is the rung that makes the other two
+/// the cheap ends of one operation rather than a pair of special cases, so it
+/// stays; reach for it only when no arithmetic describes the order you want.
 ///
 /// `shard` is the only node that means different things on different ranks, and
 /// it is resolved before anything downstream of it runs — which is why a
 /// contract is written once for the whole TP group rather than once per rank.
 ///
-/// # Shapes are optional, encodings are not
+/// `transmute` and `cast` are duals and are easy to confuse, so: a transmute
+/// keeps the *bytes* and gives them a new name, a cast keeps the *values* and
+/// rewrites them. One is free, the other runs a converter. Rust spells the
+/// same pair `transmute` and `as`.
 ///
-/// `define(name, expr, encoding)` states what the tensor should *be*; the loader
-/// inserts whatever cast, decode or encode reaches it. The shape is different:
-/// it is a prediction the loader checks against what the expression actually
-/// yields, so `expect(shape)` turns a driver whose model of the checkpoint is
-/// wrong into a compile error instead of a plausible-looking wrong buffer.
+/// `scale` and `cast` are the two nodes that change a value, and they change it
+/// in different ways: `scale` by arithmetic the author asked for, `cast` only
+/// by the error of the representation it lands in.
 ///
-/// A prediction may be declined. Omitting `expect` is the honest declaration for
-/// a packed quantized weight, whose on-disk extents belong to the quantizer that
-/// produced the file and not to the model.
+/// # Shapes and encodings are both predictions
+///
+/// `define(name, expr, encoding)` states what the tensor should *be*, and both
+/// halves of that are claims about the expression, checked against what it
+/// actually yields. A driver whose model of the checkpoint is wrong gets a
+/// compile error rather than a plausible-looking wrong buffer.
+///
+/// A conversion is never inferred from a declaration that disagrees. Ask for it
+/// with `cast`, so that a line that runs a kernel does not look like a line that
+/// does not.
+///
+/// The shape half may be declined: omitting `expect` is the honest declaration
+/// for a packed quantized weight, whose on-disk extents belong to the quantizer
+/// that produced the file and not to the model.
 ///
 /// # Ownership
 ///
@@ -62,13 +100,14 @@
 /// auto k = c.src("model.layers.0.self_attn.k_proj.weight");
 /// auto v = c.src("model.layers.0.self_attn.v_proj.weight");
 /// c.define("model.layers.0.self_attn.qkv_proj.weight",
-///          c.shard(c.cat({q, k, v}, 0), 0),
+///          c.shard(c.concat({q, k, v}, 0), 0),
 ///          pie_loader::raw(PieLoaderDType::BF16))
 ///     .expect({(Hq + 2 * Hkv) / tp_size, hidden});
 /// ```
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <initializer_list>
 #include <string>
@@ -84,7 +123,7 @@ namespace pie_loader {
 /// Opaque on purpose: it is an index into the builder that produced it, so
 /// mixing handles from two builders is meaningless. Copying is free and sharing
 /// is free — naming the same handle twice builds one node, not two, which is how
-/// a `cat` of three `slice`s of one `src` reads the source once.
+/// a `concat` of three `slice`s of one `src` reads the source once.
 class Node {
 public:
     Node() = default;
@@ -168,6 +207,23 @@ public:
             return *this;
         }
 
+        /// Keep this tensor out of the driver's bind table.
+        ///
+        /// The algebra has no `let`: using a subexpression twice, or feeding
+        /// one entry into another's `scale_per_group` factors, means giving it
+        /// a name. Left public, such a name is also a runtime weight -- it
+        /// lands in the persistent arena and stays there for the process's
+        /// lifetime, because an arena view reclaims nothing when erased -- and
+        /// the driver gets a bind entry no kernel will ask for.
+        ///
+        /// Say this and it is a name only: still resolved by later
+        /// expressions, never finalized, and a temporary the memory planner
+        /// may reuse.
+        Defined& internal() {
+            owner_->set_internal(index_);
+            return *this;
+        }
+
     private:
         friend class ModelContract;
         Defined(ModelContract* owner, std::size_t index) : owner_(owner), index_(index) {}
@@ -199,15 +255,21 @@ public:
         return push(node);
     }
 
-    /// A contiguous run of `len` along `axis`, starting at `start`.
+    /// A contiguous band of `len` along `axis`, starting at `start`.
     Node slice(Node src, std::uint8_t axis, std::int64_t start, std::int64_t len) {
-        return strided_slice(src, axis, start, len, 1);
+        PieLoaderExprNode node = blank(PieLoaderExprKind::Slice);
+        node.src = src.index_;
+        node.axis = axis;
+        node.start = start;
+        node.len = len;
+        return push(node);
     }
 
-    /// A strided run: `len` elements, every `step`-th one.
-    Node strided_slice(Node src, std::uint8_t axis, std::int64_t start, std::int64_t len,
-                       std::int64_t step) {
-        PieLoaderExprNode node = blank(PieLoaderExprKind::Slice);
+    /// A strided run: `len` elements along `axis`, every `step`-th one. `step`
+    /// must be at least 2 -- a contiguous run is a `slice`.
+    Node stride(Node src, std::uint8_t axis, std::int64_t start, std::int64_t len,
+                std::int64_t step) {
+        PieLoaderExprNode node = blank(PieLoaderExprKind::Stride);
         node.src = src.index_;
         node.axis = axis;
         node.start = start;
@@ -216,39 +278,91 @@ public:
         return push(node);
     }
 
-    /// Concatenation along `axis`, in the order given.
-    Node cat(std::initializer_list<Node> parts, std::uint8_t axis) {
-        return cat(std::vector<Node>(parts), axis);
+    /// An explicit selection: the elements at `indices` along `axis`, in the
+    /// order given.
+    ///
+    /// The third and most general placement. `slice` is a run, `stride` is an
+    /// arithmetic progression, and this is a list nobody can compute -- and the
+    /// loader holds the three apart, refusing a list that either of the cheaper
+    /// two could say. Duplicates are allowed; a quantized axis is not.
+    ///
+    /// Consecutive indices lower to a single byte run, so a permutation of
+    /// contiguous blocks costs one run per block rather than one per element.
+    Node gather(Node src, std::uint8_t axis, std::vector<std::int64_t> indices) {
+        PieLoaderExprNode node = blank(PieLoaderExprKind::Gather);
+        node.src = src.index_;
+        node.axis = axis;
+        node.indices = store_shape(std::move(indices));
+        return push(node);
     }
 
-    Node cat(const std::vector<Node>& parts, std::uint8_t axis) {
+    /// Concatenation along `axis`, in the order given.
+    Node concat(std::initializer_list<Node> parts, std::uint8_t axis) {
+        return concat(std::vector<Node>(parts), axis);
+    }
+
+    Node concat(const std::vector<Node>& parts, std::uint8_t axis) {
         std::vector<std::uint32_t> indices;
         indices.reserve(parts.size());
         for (const Node& part : parts) {
             indices.push_back(part.index_);
         }
         const std::vector<std::uint32_t>& stored = part_lists_.emplace_back(std::move(indices));
-        PieLoaderExprNode node = blank(PieLoaderExprKind::Cat);
+        PieLoaderExprNode node = blank(PieLoaderExprKind::Concat);
         node.axis = axis;
         node.parts = {stored.empty() ? nullptr : stored.data(), stored.size()};
         return push(node);
     }
 
-    /// Same bytes, new extents. At most one extent may be `-1`.
-    Node reshape(Node src, std::vector<std::int64_t> shape) {
-        PieLoaderExprNode node = blank(PieLoaderExprKind::Reshape);
+    /// The same bytes under a new type: new extents, a new encoding, or both.
+    ///
+    /// Nothing moves, so the byte count must balance. At most one extent may be
+    /// `-1`, and it is solved in elements of the type being named -- `{-1}` over
+    /// 64 bytes is 32 elements as bf16 and 128 as a 4-bit code.
+    ///
+    /// Two further rules follow from the fact that this node only renames:
+    ///
+    /// * If the element *width* changes, `src` must be a whole tensor (a `src`
+    ///   or an `out`). An element offset into a partial view stops meaning
+    ///   anything once the element size changes under it.
+    /// * If both sides are quantized, the shape from the channel axis onward
+    ///   must be unchanged -- only leading axes may regroup. A quantized
+    ///   tensor's bytes are packed for the block shape it was quantized at, so
+    ///   `{128,128} -> {256,64}` balances but is not a rename.
+    Node transmute(Node src, std::vector<std::int64_t> out_shape,
+                PieLoaderEncodingSpec out_encoding) {
+        PieLoaderExprNode node = blank(PieLoaderExprKind::Transmute);
         node.src = src.index_;
-        node.shape = store_shape(std::move(shape));
+        node.out_shape = store_shape(std::move(out_shape));
+        node.out_encoding = out_encoding;
         return push(node);
     }
 
-    /// Grow `axis` with zeros.
-    Node pad(Node src, std::uint8_t axis, std::int64_t before, std::int64_t after) {
-        PieLoaderExprNode node = blank(PieLoaderExprKind::Pad);
-        node.src = src.index_;
-        node.axis = axis;
-        node.before = before;
-        node.after = after;
+    /// A constant tensor: the third leaf, and the one with no source.
+    ///
+    /// Zero-extension is written as what it is -- `concat({x, fill(...)}, axis)`
+    /// -- rather than as a `pad` node that was a `concat` with a leg it could not
+    /// name. The padding therefore has a type, and `concat` checks it against the
+    /// data the way it checks every other leg, which a `pad` could not be wrong
+    /// about at all.
+    ///
+    /// One constant is admissible today, and the loader says so rather than
+    /// implying it: a fill is realized by zeroing the destination and never
+    /// writing there, so `value` must be one that a run of zero bytes denotes.
+    /// That rules out `E8M0`, whose zero byte means `2^-127`, and every
+    /// quantized encoding -- a code word means nothing without the block scale
+    /// beside it, and which code reads as zero is scheme-specific.
+    ///
+    /// `shape` must give every extent. There is no operand for a `-1` to be
+    /// solved against, and the rank is what tells a real fill apart from a node
+    /// built by zeroing the struct and never populating it.
+    Node fill(float value, std::vector<std::int64_t> shape, PieLoaderEncodingSpec encoding) {
+        PieLoaderExprNode node = blank(PieLoaderExprKind::Fill);
+        std::uint32_t bits = 0;
+        std::memcpy(&bits, &value, sizeof(bits));
+        node.fill_bits = bits;
+        node.out_shape = store_shape(std::move(shape));
+        node.out_encoding = encoding;
         return push(node);
     }
 
@@ -264,35 +378,102 @@ public:
         return push(node);
     }
 
-    /// An opaque kernel-specific relayout.
+    /// A named hardware layout, applied to whatever `src` selects.
     ///
-    /// The type checker cannot see through a repack, so `out_shape` and
-    /// `out_encoding` are taken on trust and are the driver's responsibility.
-    Node repack(Node src, PieLoaderRepackSpecView spec, std::vector<std::int64_t> out_shape,
+    /// The escape hatch, and only for what genuinely escapes: `layout` names a
+    /// kernel and nothing else. Which rows and columns the kernel sees is
+    /// `src`'s business -- use `slice`, `shard` and `stride` for that -- and the
+    /// loader derives the kernel's geometry from `src`'s inferred type, so a
+    /// contract cannot disagree with the tensor it is reading.
+    ///
+    /// `out_shape` may be *larger* than what `src` holds on either of the last
+    /// two axes; the kernel zero-fills the difference, which is how a Marlin
+    /// tile size is met. It may not be smaller: a truncation is a `slice`.
+    Node repack(Node src, PieLoaderRepackLayout layout, std::vector<std::int64_t> out_shape,
                 PieLoaderEncodingSpec out_encoding) {
         PieLoaderExprNode node = blank(PieLoaderExprKind::Repack);
         node.src = src.index_;
-        node.repack = spec;
+        node.repack_layout = static_cast<std::uint32_t>(layout);
         node.out_shape = store_shape(std::move(out_shape));
         node.out_encoding = out_encoding;
         return push(node);
     }
 
-    /// Encode into a quantized format.
-    Node quantize(Node src, PieLoaderQuantSpecView spec) {
-        PieLoaderExprNode node = blank(PieLoaderExprKind::Quantize);
+    /// The same values in a different representation.
+    ///
+    /// The exact dual of `transmute`, and the pair is worth reading together: a
+    /// transmute preserves the *bytes* and renames them, a cast preserves the
+    /// *values* and rewrites them. One is free; this one is a kernel. Rust
+    /// spells the same distinction `transmute` and `as`.
+    ///
+    /// One node covers all three directions, because they are one question --
+    /// what representation, not what operation: raw to raw is a numeric cast,
+    /// raw to quantized is load-time encoding (and publishes the scale tensor
+    /// the encoder computes), quantized to raw is decoding. Shape is preserved
+    /// in every direction; a cast has an opinion about elements and none about
+    /// placement.
+    ///
+    /// Re-encoding one quantized scheme directly as another is refused: no
+    /// kernel does it. Declare the decoded tensor -- `internal()`, if the
+    /// driver has no use for it -- and cast that.
+    Node cast(Node src, PieLoaderEncodingSpec to) {
+        PieLoaderExprNode node = blank(PieLoaderExprKind::Cast);
         node.src = src.index_;
-        node.quant = spec;
+        node.out_encoding = to;
         return push(node);
     }
 
-    /// Reinterpret the same bytes as another type. Also opaque to the checker.
-    Node bitcast(Node src, std::vector<std::int64_t> out_shape,
-                 PieLoaderEncodingSpec out_encoding) {
-        PieLoaderExprNode node = blank(PieLoaderExprKind::Bitcast);
+    /// Multiply every element by a constant.
+    ///
+    /// The only node that changes a value rather than moving one, and the one
+    /// to reach for whenever a bind step would otherwise copy a tensor to the
+    /// host, do arithmetic on it and upload the result -- arithmetic done that
+    /// way is invisible to the plan, so it is re-done on every load and the
+    /// unscaled original stays resident.
+    ///
+    /// Shape and encoding are preserved, so a scale that also narrows is
+    /// written by declaring the narrower type on `define`: the planner derives
+    /// the cast from the declaration, and no author spells it. The operand must
+    /// be a `src` node -- scaling one leg of a `concat` would have to materialize
+    /// that leg first, and the planner rejects it rather than doing so quietly.
+    ///
+    /// The factor is carried as an fp32 bit pattern. The loader rejects one
+    /// that is not finite, and rejects zero -- zero is what this field reads as
+    /// when a node is built without setting it, and a tensor scaled to nothing
+    /// would otherwise load, cache and run.
+    Node scale(Node src, float factor) {
+        PieLoaderExprNode node = blank(PieLoaderExprKind::Scale);
         node.src = src.index_;
-        node.out_shape = store_shape(std::move(out_shape));
-        node.out_encoding = out_encoding;
+        std::uint32_t bits = 0;
+        std::memcpy(&bits, &factor, sizeof(bits));
+        node.scale_factor_bits = bits;
+        return push(node);
+    }
+
+    /// Multiply by a tensor of factors, one per `group` elements along `axis`.
+    ///
+    /// This is dequantization written as a declaration. Over a `src` the
+    /// planner reinterprets through `bitcast` -- the checkpoint stores packed
+    /// codes as bytes, and the contract is what says they are a quantization
+    /// scheme -- and the result is the scheme's logical type, so `define`
+    /// declares the dtype the driver wants to compute in and nothing else is
+    /// spelled.
+    ///
+    /// `by` must be a node reading a tensor an *earlier* `define` published,
+    /// not a fresh `src`. Scales are published anyway, because a driver reads
+    /// them for whatever consumes the weight; scaling by that name keeps one
+    /// copy of them and makes the pairing something the loader checks rather
+    /// than something it guesses from a suffix.
+    ///
+    /// The loader checks that the factors' shape is the payload's with `axis`
+    /// divided by `group`, so an author who names the wrong tensor, the wrong
+    /// group or the wrong axis is told which. Groups run along the last axis.
+    Node scale_per_group(Node src, Node by, std::uint32_t group, std::uint8_t axis) {
+        PieLoaderExprNode node = blank(PieLoaderExprKind::Scale);
+        node.src = src.index_;
+        node.scale_by = by.index_;
+        node.scale_group = group;
+        node.axis = axis;
         return push(node);
     }
 
@@ -305,6 +486,7 @@ public:
             .shape = {nullptr, 0},
             .encoding = encoding,
             .scales = {},
+            .visibility = PieLoaderVisibility::Public,
         });
         return Defined(this, tensors_.size() - 1);
     }
@@ -329,9 +511,7 @@ private:
         node.src = PIE_LOADER_NO_NODE;
         node.step = 1;
         node.out_encoding = raw(PieLoaderDType::BF16);
-        node.repack.layout = static_cast<std::uint32_t>(PieLoaderRepackLayout::None);
-        node.repack.row_map = static_cast<std::uint32_t>(PieLoaderRowMap::Identity);
-        node.quant = quant_spec(PieLoaderQuantScheme::None, PieLoaderDType::BF16);
+        node.repack_layout = static_cast<std::uint32_t>(PieLoaderRepackLayout::None);
         return node;
     }
 
@@ -350,11 +530,15 @@ private:
         const std::string& stored = names_.emplace_back(std::move(of));
         tensors_[tensor].scales = PieLoaderScalesView{
             .of = {reinterpret_cast<const std::uint8_t*>(stored.data()), stored.size()},
-            .granularity = granularity,
+            .granularity = static_cast<std::uint32_t>(granularity),
             .group_size = group_size,
             .channel_axis = channel_axis,
-            .form = form,
+            .form = static_cast<std::uint32_t>(form),
         };
+    }
+
+    void set_internal(std::size_t tensor) {
+        tensors_[tensor].visibility = PieLoaderVisibility::Internal;
     }
 
     // `deque` rather than `vector` for the backing stores: the POD nodes point

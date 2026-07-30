@@ -75,6 +75,19 @@ fn affects_compilation(name: &str) -> bool {
 
 struct Fnv1a(u64);
 
+/// FNV-1a over a run of bytes.
+///
+/// Not cryptographic: it exists so two byte strings that claim to be the same
+/// tensor can be compared cheaply, which is what the `pie-loader` tool prints
+/// beside each replayed tensor. Deliberately *not* length-prefixed — that is a
+/// property the cache key above needs and a bare checksum does not — which is
+/// why the mixer stays a private method and only this wrapper is published.
+pub fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash = Fnv1a::new();
+    hash.mix_raw(bytes);
+    hash.0
+}
+
 impl Fnv1a {
     fn new() -> Self {
         Self(0xcbf2_9ce4_8422_2325)

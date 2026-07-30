@@ -200,12 +200,20 @@ DsV4Weights bind_deepseek_v4(const LoadedModel& engine) {
         L.router_bias = maybe(engine, fp + "gate.bias");
         L.tid2eid     = maybe(engine, fp + "gate.tid2eid");
 
-        // Routed experts
-        L.experts.resize(static_cast<std::size_t>(E));
-        for (int e = 0; e < E; ++e) {
-            const std::string ep =
-                fp + "experts." + std::to_string(e) + ".";
-            bind_expert(engine, ep, L.experts[static_cast<std::size_t>(e)]);
+        // Routed experts. Which of the two forms is present is the contract's
+        // answer, so both are optional here and the forward pass branches on
+        // whichever it got. `author_deepseek_v4_contract` publishes the stacks
+        // and consumes the packed originals, or publishes the originals and no
+        // stacks -- never both, so there is no second copy to pay for.
+        L.moe_gate_up_bf16 = maybe(engine, fp + "experts.gate_up.weight");
+        L.moe_down_bf16 = maybe(engine, fp + "experts.down.weight");
+        if (L.moe_gate_up_bf16 == nullptr) {
+            L.experts.resize(static_cast<std::size_t>(E));
+            for (int e = 0; e < E; ++e) {
+                const std::string ep =
+                    fp + "experts." + std::to_string(e) + ".";
+                bind_expert(engine, ep, L.experts[static_cast<std::size_t>(e)]);
+            }
         }
 
         // Shared experts

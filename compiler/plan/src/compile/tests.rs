@@ -1,11 +1,11 @@
 //! Planner tests.
 //!
 //! All twenty-nine of them go through `compile_stage`, the public entry point,
-//! and read the whole `CompiledStage` it returns -- normalized ops, both
-//! partitions, the signature. (This used to claim they reached for
-//! `normalize_stage`, `stage_signature` and the partitioners directly; none of
-//! them did, and describing a strategy the file does not follow is worse than
-//! describing none.)
+//! and read the whole `CompiledStage` it returns — normalized ops, both
+//! partitions, the signature. None reach for `normalize_stage`,
+//! `stage_signature` or the partitioners directly, which keeps the tests
+//! pinned to behaviour a caller can observe rather than to the current
+//! decomposition.
 //!
 //! What keeps them in-crate is the fixtures: `program`, `nucleus_program`,
 //! `top_k_program` and friends build `BoundTrace`s at a level of detail that is
@@ -1056,13 +1056,13 @@ fn explicit_candidate_batch_does_not_inherit_sampled_rows() {
     );
 }
 
-// `runtime_extents_do_not_change_signature` used to sit here. It built two
-// `ScheduleBucket`s, asserted they differed, and then asserted
-// `stage.signature == stage.signature.clone()` -- with nothing in between
-// that could have changed it. The property it was named for holds for a
-// better reason: `compile_stage` does not take `RuntimeExtents` at all, so
-// extents cannot reach the signature. That is enforced by the signature of
-// the function, which a test cannot strengthen.
+// There is deliberately no `runtime_extents_do_not_change_signature` test.
+// `compile_stage` does not take `RuntimeExtents` at all, so extents cannot
+// reach the signature — the function's own type enforces it, and a test
+// cannot strengthen that. What such a test can do is look like proof while
+// asserting nothing: build two `ScheduleBucket`s, assert they differ, then
+// assert `stage.signature == stage.signature.clone()` with nothing in between
+// that could have changed it. Prefer the type.
 
 /// The rendering a plan reaches humans through is a pure function of the plan.
 ///

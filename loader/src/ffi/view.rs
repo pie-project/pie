@@ -91,6 +91,7 @@ pub(super) unsafe fn plan_view(
                 .map_err(|err| format!("tensor {}: {err}", tensor.id))?,
             unsafe { slice_of(tensor.shape.ptr, tensor.shape.len) },
             &join_encoding(tensor),
+            tensor.visibility.into(),
         ));
     }
 

@@ -41,7 +41,7 @@
 #include "pie_loader/source_checkpoint.hpp"
 
 #include "loader/load_plan.hpp"
-#include "model/qwen3_5/qwen3_5_contract.hpp"
+#include "model/contract.hpp"
 
 namespace {
 
@@ -128,19 +128,19 @@ void test_affine_u4_authors_the_quant_spec_the_kernels_need() {
           "the group size is derived from the scales, not defaulted");
     check(enc.quant.channel_axis == 1, "the quantized axis is the column axis");
 
-    // Bitcast(Src) and nothing else: the contract renames, it does not compute.
+    // Transmute(Src) and nothing else: the contract renames, it does not compute.
     check(v.nodes.len == 2, "the triplet costs two nodes");
     if (v.nodes.len != 2) return;
     check(kind_of(v.nodes.ptr[0]) == pie_loader::PieLoaderExprKind::Src, "the operand is a Src");
     check(view_of(v.nodes.ptr[0].name) == "w.weight", "the Src names the packed tensor");
-    check(t.root == 1 && kind_of(v.nodes.ptr[1]) == pie_loader::PieLoaderExprKind::Bitcast,
+    check(t.root == 1 && kind_of(v.nodes.ptr[1]) == pie_loader::PieLoaderExprKind::Transmute,
           "the root reinterprets the packed tensor");
-    const auto& cast = v.nodes.ptr[1];
-    check(cast.out_shape.len == 2 && cast.out_shape.ptr[0] == rows &&
-              cast.out_shape.ptr[1] == logical_cols,
-          "the bitcast carries the unpacked extents");
-    check(cast.out_encoding.quant.group_size == static_cast<std::uint32_t>(group) &&
-              cast.out_encoding.quant.bits_per_element == 4,
+    const auto& transmute = v.nodes.ptr[1];
+    check(transmute.out_shape.len == 2 && transmute.out_shape.ptr[0] == rows &&
+              transmute.out_shape.ptr[1] == logical_cols,
+          "the transmute carries the unpacked extents");
+    check(transmute.out_encoding.quant.group_size == static_cast<std::uint32_t>(group) &&
+              transmute.out_encoding.quant.bits_per_element == 4,
           "the node's own encoding agrees with the declaration's");
 }
 
@@ -221,7 +221,7 @@ void test_a_malformed_triplet_is_refused() {
 // throws rather than passing through: a tensor declared under its checkpoint
 // name would be bound by nothing and reported by nothing.
 void test_every_name_is_mapped_or_refused() {
-    namespace detail = pie::metal::model::contract_detail;
+    namespace detail = pie::metal::model::qwen3_5::contract_detail;
     const auto mapped = [](std::string_view from, std::string_view to) {
         const auto got = detail::runtime_name(from);
         check(got.has_value() && *got == to,
@@ -305,7 +305,7 @@ void check_well_formed(const pie_loader::Checkpoint& checkpoint,
             check(n.src < i, "an operand precedes its use");
         }
         for (std::size_t p = 0; p < n.parts.len; ++p) {
-            check(n.parts.ptr[p] < i, "every cat part precedes the cat");
+            check(n.parts.ptr[p] < i, "every concat part precedes the concat");
         }
         if (kind_of(n) == pie_loader::PieLoaderExprKind::Src) {
             ++sources;
@@ -317,8 +317,8 @@ void check_well_formed(const pie_loader::Checkpoint& checkpoint,
         // nothing. Anything else appearing here is a schema that grew a
         // transform the Metal binder has no kernel for.
         check(kind_of(n) == pie_loader::PieLoaderExprKind::Src ||
-                  kind_of(n) == pie_loader::PieLoaderExprKind::Bitcast,
-              "the Metal schema authors only Src and Bitcast");
+                  kind_of(n) == pie_loader::PieLoaderExprKind::Transmute,
+              "the Metal schema authors only Src and Transmute");
     }
     check(sources > 0, "the contract reads the checkpoint");
 }

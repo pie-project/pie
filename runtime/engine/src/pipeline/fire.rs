@@ -1099,12 +1099,19 @@ pub async fn submit_pass_stamped<C: FireContext>(
         // FIFO carries it; NOT synchronous like the deleted host-replay beam
         // branch).
         if ctx.resources().get(&fwd)?.devgeo.is_some() {
-            return fire_device_geometry(ctx, this, fwd, frame).await;
+            let metered = crate::scheduler::phase_start();
+            let out = fire_device_geometry(ctx, this, fwd, frame).await;
+            crate::scheduler::cpu_phase_add(
+                crate::scheduler::CpuPhase::DeviceGeometrySubmit,
+                metered,
+            );
+            return out;
         }
         // Contention-probe marker: when the guest's WIT call reached the
         // host (vs `hp-acquire` below — the delta is the build preamble,
         // including the settlement drain).
         crate::planner::trace_mark!("build", ctx.process_id(), "hp-enter");
+        let preamble_cpu = crate::scheduler::phase_start();
         // W3.1: the PIPELINE owns the in-flight FIFO. Point each of this
         // pass's channels at this pipeline's queue so their `take`/`read`
         // await the right FIFO — enforcing the same-pipeline constraint
@@ -1133,7 +1140,10 @@ pub async fn submit_pass_stamped<C: FireContext>(
         // An RS-binding pass needs no extra serialization here: its mapping
         // publishes at prepare, in submission order, so it runs ahead like
         // any other pass.
+        crate::scheduler::cpu_phase_add(crate::scheduler::CpuPhase::Preamble, preamble_cpu);
         let timing_enabled = ctx.fire_timing_requested();
+        let submit_cpu = crate::scheduler::phase_start();
+        let mut phase_cpu = submit_cpu;
         let (
             geometry,
             cells,
@@ -1230,6 +1240,8 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 p.decode_envelope.clone(),
             )
         };
+        crate::scheduler::cpu_phase_add(crate::scheduler::CpuPhase::BindGeometry, phase_cpu);
+        phase_cpu = crate::scheduler::phase_start();
         let mut req = crate::driver::LaunchPlan::default();
         let readout_defaulted = geometry.readout_defaulted;
         geometry.apply_to(&mut req);
@@ -1318,6 +1330,8 @@ pub async fn submit_pass_stamped<C: FireContext>(
         suppress_defaulted_readout_for_fold(&mut req, readout_defaulted, &rs_plan);
         crate::planner::trace_mark!("build", pid, "hp-acquire");
         let mut attempts = 0;
+        crate::scheduler::cpu_phase_add(crate::scheduler::CpuPhase::Declare, phase_cpu);
+        phase_cpu = crate::scheduler::phase_start();
         let (ws_guard, (copy_src, copy_dst), kvtxn, rs_prepared) = loop {
             let kv_demand = match host_kv_demand(
                 &stores,
@@ -1402,6 +1416,8 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 Err(ReservedError::Fatal(error)) => return Ok(Err(error)),
             }
         };
+        crate::scheduler::cpu_phase_add(crate::scheduler::CpuPhase::Grant, phase_cpu);
+        phase_cpu = crate::scheduler::phase_start();
         rs_prepared.apply_to(&mut req);
         let (rs_copy_src, rs_copy_dst) = rs_prepared.copies.clone();
         let rstxns = RsTxnsGuard::new(model, driver, rs_prepared.txn);
@@ -1449,6 +1465,8 @@ pub async fn submit_pass_stamped<C: FireContext>(
             record_submit_failure(ctx, &fwd, &pipeline_failure, &reason);
             return Ok(Err(reason));
         }
+        crate::scheduler::cpu_phase_add(crate::scheduler::CpuPhase::Launch, phase_cpu);
+        crate::scheduler::cpu_phase_add(crate::scheduler::CpuPhase::SubmitTotal, submit_cpu);
         ctx.commit_fire_timing(timing_enabled);
         ticket_reservation.commit();
 
@@ -1940,6 +1958,9 @@ async fn pipeline_close_inner<C: FireContext>(
         if first_close {
             crate::scheduler::worker::notify_lane_close(pipeline_id, None);
         }
+        // Measured at conc 512: 3 us p50 with zero pending fires, i.e. the
+        // guest's run-ahead window is always already settled by the time it
+        // closes. Close is not a boundary cost.
         drain_settled(ctx, Some(&fires)).await?;
     }
     Ok(())

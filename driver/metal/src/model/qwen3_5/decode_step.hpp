@@ -28,7 +28,12 @@
 namespace pie::metal {
 
 // Number of Kernel kinds (for PSO-by-kind table sizing).
-inline constexpr int kKernelKindCount = static_cast<int>(Kernel::GdnPrepSlotted) + 1;
+// Every kind, including the families appended after qwen3.5's. This sizes the
+// PSO table and the timing arrays, so pinning it to one family's last kind is
+// an out-of-bounds read the moment another family appends — which is exactly
+// what happened, as a segfault with nothing pointing at the cause. Anchored on
+// the enum's actual last member instead.
+inline constexpr int kKernelKindCount = static_cast<int>(Kernel::G4PleResidual) + 1;
 
 // One emitted dispatch in the per-token DAG.
 struct Dispatch {
@@ -40,6 +45,14 @@ struct Dispatch {
     bool        fuse_residual = false;  // QmvO/QmvOut/QmvDown: add the block residual in the
                                         // GEMV epilogue (buffer 7) → drops the following
                                         // Residual/LayerOut dispatch. PIE_FUSE_RESIDUAL.
+    int         qmm_bn = 0;   // output columns per threadgroup when this
+                              // projection runs as the steel GEMM
+                              // (affine_qmm_t); 0 = use the GEMV.
+    int         qmm_split = 1;  // K partitions; >1 adds a reduce dispatch
+    int         qmm_bm = 16;  // rows per threadgroup for that GEMM: a wider
+                              // block dequantizes each weight tile once for
+                              // twice the rows, which only pays once the batch
+                              // has threadgroups to spare.
 };
 
 // PSOs compiled once from src/kernels/*.metal, indexed by Kernel kind.

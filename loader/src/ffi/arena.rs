@@ -6,13 +6,13 @@
 //! equivalent is to allocate each run as its own boxed slice, which is stable by
 //! construction and needs no growth discipline at all.
 //!
-//! [`PlanArena`] is built once, then frozen: [`PlanArena::finish`] leaks it into
+//! [`PlanArena`] is built once, then frozen: `PlanArena::finish` leaks it into
 //! a raw pointer stored in `PieLoaderPlan::owner`, and `pie_loader_release`
 //! reclaims it. Between those two points nothing mutates, so handing the plan to
 //! another thread is sound.
 
 use crate::plan::{DestExtent, Extent, LoadPlan, SourceExtent, StorageInstr};
-use crate::types::{Encoding, QuantGranularity, QuantScheme, ScaleForm};
+use crate::types::{Encoding, QuantScheme, Visibility};
 
 use super::types::*;
 
@@ -288,7 +288,7 @@ fn flatten_instr(arena: &mut PlanArena, instr: &StorageInstr) -> PieLoaderStorag
                 Some(dest) => (arena.dest_extent(dest), true),
                 None => (PieLoaderDestExtentView::default(), false),
             };
-            let repack = &transform.repack;
+            let repack = transform.repack;
             (
                 id,
                 Op::TileMap {
@@ -303,21 +303,19 @@ fn flatten_instr(arena: &mut PlanArena, instr: &StorageInstr) -> PieLoaderStorag
                     transform_fusion: transform.fusion.into(),
                     transform_from: quant_or_none(transform.from),
                     transform_to: quant_or_none(transform.to),
-                    repack_layout: repack.layout.into(),
-                    row_map: repack.row_map.into(),
-                    transform_batch: repack.batch,
-                    transform_source_rows: repack.source_rows,
-                    transform_source_row_offset: repack.source_row_offset,
-                    transform_target_rows: repack.target_rows,
-                    transform_valid_rows: repack.valid_rows,
-                    transform_source_stride_cols: repack.source_stride_cols,
-                    transform_source_col_offset: repack.source_col_offset,
-                    transform_source_cols: repack.source_cols,
-                    transform_target_cols: repack.target_cols,
+                    repack_layout: repack.map_or(PieLoaderRepackLayout::None, |r| r.layout.into()),
+                    transform_batch: repack.map_or(0, |r| r.batch),
+                    transform_source_rows: repack.map_or(0, |r| r.source_rows),
+                    transform_target_rows: repack.map_or(0, |r| r.target_rows),
+                    transform_source_cols: repack.map_or(0, |r| r.source_cols),
+                    transform_target_cols: repack.map_or(0, |r| r.target_cols),
                     transform_scratch_bytes: transform.scratch_bytes,
                     transform_metadata_source: transform
                         .metadata_source
                         .map_or(PIE_LOADER_NO_TENSOR, |id| id.0),
+                    transform_scale_factor_bits: transform.scale_factor_bits,
+                    transform_scale_group: transform.scale_group,
+                    transform_scale_axis: transform.scale_axis,
                 },
             )
         }
@@ -374,6 +372,10 @@ pub fn build(plan: &LoadPlan, cache_key: &str) -> *mut PieLoaderPlan {
             quant_group_size,
             shape,
             alignment: tensor.alignment,
+            visibility: match tensor.visibility {
+                Visibility::Public => PieLoaderVisibility::Public,
+                Visibility::Internal => PieLoaderVisibility::Internal,
+            },
         });
     }
 
@@ -436,16 +438,10 @@ pub fn build(plan: &LoadPlan, cache_key: &str) -> *mut PieLoaderPlan {
         arena.attachments.push(PieLoaderQuantAttachmentView {
             tensor_id: attachment.tensor.0,
             scale_tensor_id: attachment.scale_tensor.0,
-            granularity: match attachment.granularity {
-                QuantGranularity::PerChannel => PieLoaderQuantGranularity::PerChannel,
-                QuantGranularity::PerGroup => PieLoaderQuantGranularity::PerGroup,
-            },
+            granularity: PieLoaderQuantGranularity::from(attachment.granularity),
             group_size: attachment.group_size,
             channel_axis: attachment.channel_axis,
-            scale_form: match attachment.scale_form {
-                ScaleForm::RawE8M0 => PieLoaderScaleForm::RawE8M0,
-                ScaleForm::F32Factors => PieLoaderScaleForm::F32Factors,
-            },
+            scale_form: PieLoaderScaleForm::from(attachment.scale_form),
         });
     }
 

@@ -26,7 +26,6 @@ use std::path::PathBuf;
 
 use pie_loader::checkpoint::{CheckpointFile, CheckpointMetadata, RawTensor};
 use pie_loader::contract::ModelContract;
-use pie_loader::contract_writer::write_contract;
 use pie_loader::ffi::contract::read_contract;
 use pie_loader::ffi::view::verify_marshalled;
 use pie_loader::plan::compile as compile_load_plan;
@@ -34,6 +33,7 @@ use pie_loader::plan::{
     CUDA_TILE_MAP_MASK, FUSION_FP8_TO_MXFP4, HOST_TILE_MAP_MASK, LoadPlan, StorageTarget,
     compiler_version,
 };
+use pie_loader::testkit::contract_writer::write_contract;
 use pie_loader::types::{
     BackendKind, CheckpointFormat, DType, Encoding, FileId, QuantScheme, QuantSpec, TensorId,
 };
@@ -271,6 +271,50 @@ fn gpt_oss_checkpoint() -> CheckpointMetadata {
     ck.finish("gpt_oss")
 }
 
+/// GPT-OSS at the ABI where the driver repacks into Marlin's layout.
+///
+/// The only fixture that reaches [`Expr::Repack`], and the biases are the only
+/// thing that reaches `RepackLayout::DenseRowGather`. Kept separate from
+/// [`gpt_oss_checkpoint`] because that one carries the decoder around the
+/// experts and none of the repack path.
+///
+/// `intermediate` is the *global* size. The stored contracts were authored
+/// against a fixed local size of 64, so the sharded one needs 128 here.
+fn gpt_oss_native_checkpoint(intermediate: i64) -> CheckpointMetadata {
+    let (hidden, experts) = (64, 2);
+    let mut ck = Checkpoint::new();
+    let p = "model.layers.0.mlp.experts";
+    let u8s = Encoding::Raw(DType::U8);
+    ck.push(
+        &format!("{p}.gate_up_proj_blocks"),
+        &[experts, 2 * intermediate, hidden / 32, 16],
+        u8s.clone(),
+    );
+    ck.push(
+        &format!("{p}.gate_up_proj_scales"),
+        &[experts, 2 * intermediate, hidden / 32],
+        u8s.clone(),
+    );
+    ck.push(
+        &format!("{p}.gate_up_proj_bias"),
+        &[experts, 2 * intermediate],
+        bf16(),
+    );
+    ck.push(
+        &format!("{p}.down_proj_blocks"),
+        &[experts, hidden, intermediate / 32, 16],
+        u8s.clone(),
+    );
+    ck.push(
+        &format!("{p}.down_proj_scales"),
+        &[experts, hidden, intermediate / 32],
+        u8s,
+    );
+    ck.push(&format!("{p}.down_proj_bias"), &[experts, hidden], bf16());
+    // The name keys the temp file, and the two sizes must not collide.
+    ck.finish(&format!("gpt_oss_native_{intermediate}"))
+}
+
 /// An AWQ-quantized dense decoder: the same passes as `llama_checkpoint`, but
 /// over a packed 4-bit encoding, so the plan's offsets are constrained by quant
 /// group boundaries rather than element boundaries.
@@ -335,7 +379,7 @@ fn target(backend: BackendKind, tp_rank: u32, tp_size: u32) -> StorageTarget {
 /// is what lets the loader stop knowing what a model is: after `arch/` is gone
 /// there is no function in this crate that could produce one, and there should
 /// not be — authorship is the driver's job. Freezing them here keeps every
-/// construct the real families use (the MXFP4 repacks, the fused QKV `Cat`, the
+/// construct the real families use (the MXFP4 repacks, the fused QKV `Concat`, the
 /// `Out` aliases into a bank, the strided GPTQ slices) under test, expressed as
 /// what they actually are: programs over a checkpoint.
 fn contract_fixture(name: &str) -> ModelContract {
@@ -463,7 +507,7 @@ fn check(name: &str, metadata: &CheckpointMetadata, target: StorageTarget) {
 /// hand in C++ and produce the identical plan; that claim is only checkable if
 /// the FFI representation is known to be lossless for every construct the real
 /// families use. Asserting it here, on every golden, means each family covers
-/// its own constructs — the MXFP4 repacks, the fused QKV `Cat`, the `Out`
+/// its own constructs — the MXFP4 repacks, the fused QKV `Concat`, the `Out`
 /// aliases into a bank, the strided GPTQ slices — instead of on a synthetic
 /// expression that happens to use the ones someone thought of.
 ///
@@ -496,8 +540,9 @@ fn replay(name: &str, plan: &LoadPlan, metadata: &CheckpointMetadata) {
         return;
     }
     let snapshot = PathBuf::from(&metadata.files[0].path);
-    let storage = pie_loader::host_executor::execute_plan(plan, snapshot.parent().unwrap())
-        .unwrap_or_else(|err| panic!("{name}: the plan does not execute: {err}"));
+    let storage =
+        pie_loader::testkit::host_executor::execute_plan(plan, snapshot.parent().unwrap())
+            .unwrap_or_else(|err| panic!("{name}: the plan does not execute: {err}"));
     for tensor in &plan.tensors {
         let materialized = storage
             .tensors
@@ -642,6 +687,36 @@ fn gpt_oss_mxfp4_cuda_native_gemm() {
     check(
         "gpt_oss_mxfp4_cuda_native_gemm",
         &gpt_oss_checkpoint(),
+        target,
+    );
+}
+
+/// The repack path, which no other golden reaches: `MarlinMxfp4Weight`,
+/// `MarlinMxfp4Scale` and `DenseRowGather` all appear in this contract.
+#[test]
+fn gpt_oss_native_mxfp4() {
+    let mut target = target(BackendKind::Cuda, 0, 1);
+    target.native_mxfp4_moe = true;
+    check(
+        "gpt_oss_native_mxfp4",
+        &gpt_oss_native_checkpoint(64),
+        target,
+    );
+}
+
+/// The same at rank 1 of 2.
+///
+/// GPT-OSS is the only family that resolves the rank *inside* the escape hatch,
+/// as `RepackSpec::source_row_offset`, so it is the only family whose contract
+/// differs between one rank and another. Moving that split back out into an
+/// `Expr::Shard` must leave these bytes untouched.
+#[test]
+fn gpt_oss_native_mxfp4_tp1_of_2() {
+    let mut target = target(BackendKind::Cuda, 1, 2);
+    target.native_mxfp4_moe = true;
+    check(
+        "gpt_oss_native_mxfp4_tp1_of_2",
+        &gpt_oss_native_checkpoint(128),
         target,
     );
 }

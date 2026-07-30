@@ -138,6 +138,11 @@ enum class SdpaPaged : uint8_t {
     KvPageIndptr = 8,    // IoSlot::KvPageIndptr
     PageSize = 9, NKvHeads = 10, Scale = 11,
     AttnMask = 12, AttnMaskStride = 13, AttnMaskEnabled = 14,
+    // Sliding window, in positions. <=0 is full attention. Full-attention
+    // families must still BIND it -- one kernel serves both, so an unbound slot
+    // is a window read out of uninitialized memory, which is wrong attention
+    // rather than a crash.
+    Window = 15,
 };
 
 // rms_single_row: group=(row/N_READS), grid=(1,1,1). Buffer 3 is a packed
@@ -170,7 +175,12 @@ enum class Rope : uint8_t { X = 0, Position = 1, Scale = 2, Base = 3, HeadDim = 
 // embedding gather (4-bit dequant of the shared lm_head bundle; tied). TokenId is
 // IO::TokenId (I1). Matches embed_gather.metal: W/Scales/Biases (same 4-bit packing
 // as Qmv) + token id + out + hidden. Bound to the SAME lm_head slots as QmvLmHead.
-enum class Embed : uint8_t { W = 0, Scales = 1, Biases = 2, TokenId = 3, Out = 4, Hidden = 5 };
+enum class Embed : uint8_t {
+    W = 0, Scales = 1, Biases = 2, TokenId = 3, Out = 4, Hidden = 5,
+    // gemma4's `embed_gather_scaled_4bit` only. qwen3.5 runs the unscaled
+    // instantiation, which has no buffer 6 to bind.
+    Scale = 6,
+};
 
 // KV append (in-place write at position): Pos is IO::Position (I1). Matches kv_append.metal:
 //   0=k_new, 1=v_new, 2=k_cache, 3=v_cache, 4=pos(IO), 5=head_dim, 6=k_head_stride
@@ -289,6 +299,54 @@ enum class GatedRms : uint8_t { X = 0, Z = 1, W = 2, Out = 3, Params = 4 };
 // inert until the resident-loop / M>1 wiring binds them.
 enum class Argmax : uint8_t { Logits = 0, NextToken = 1, Params = 2, EosFlag = 3 };
 
+// ── Gemma 4 ────────────────────────────────────────────────────────────────
+// Six kernels shipped with this family's bring-up and were never bound to
+// anything: their .metal sources exist, and nothing named their buffers. These
+// are those ABIs, written against the sources rather than from memory.
+//
+// The params structs they take are mirrored host-side in the gemma4 consts.
+
+// sdpa_sliding.metal `sdpa_vector_decode_swa`. bind::Sdpa's layout plus the
+// window, deliberately: the shared prefix means one binder serves both, and a
+// sliding layer differs from a full one only by that last value.
+enum class SdpaSliding : uint8_t {
+    Q = 0, K = 1, V = 2, Out = 3, GqaFactor = 4, N = 5,
+    KHeadStride = 6, KSeqStride = 7, VHeadStride = 8, VSeqStride = 9, Scale = 10,
+    Window = 11,   // attend the last `window` positions; <=0 means all of them
+    // Stated by the caller rather than inferred: decode's Q is one row, a
+    // prefill's is [M, n_heads*D] from a GEMM, and a kernel that guessed wrong
+    // between them would read plausible garbage instead of failing.
+    QRowStride = 12,
+    ORowStride = 13,
+};
+
+// geglu_tanh.metal: out = gelu_tanh(gate) * up. Gemma's FFN nonlinearity, where
+// qwen3.5 uses SwiGLU — same two operands, different curve.
+enum class Geglu : uint8_t { Gate = 0, Up = 1, Out = 2, Params = 3 };
+
+// logit_softcap.metal: out = cap * tanh(logits / cap), over the vocabulary.
+enum class Softcap : uint8_t { Logits = 0, Out = 1, Params = 2 };
+
+// layer_scalar.metal: out = x * scalar[0]. A learned per-layer gain, broadcast.
+enum class LayerScalar : uint8_t { X = 0, Scalar = 1, Out = 2, Params = 3 };
+
+// ple_combine.metal: out = (proj + token) * 1/sqrt(2), over n_layers*ple_dim.
+enum class PleCombine : uint8_t { Proj = 0, Token = 1, Out = 2, Params = 3 };
+
+// vnorm.metal `vnorm_single_row`: RMS with NO learnable weight, applied to V
+// before the KV write. Distinct from bind::Rms, which always has one.
+enum class VNorm : uint8_t { X = 0, Out = 1, Params = 2 };
+
+// rms_norm.metal `rms_residual` / `rms_residual_scaled` (gemma4): the norm
+// sandwich's second half and the residual add it always precedes, in one
+// dispatch. `bind::Rms`'s four slots verbatim, so the weight bind is shared,
+// plus the residual and (scaled variant only) the learned per-layer gain.
+//
+//   out = rms_norm(x) * w + r            [* s[0]]
+enum class RmsResidual : uint8_t {
+    X = 0, W = 1, Out = 2, Params = 3, Residual = 4, Scalar = 5,
+};
+
 }  // namespace bind
 
 // Argmax kernel constant (argmax.metal:struct ArgmaxParams) — replicated EXACTLY.
@@ -325,6 +383,36 @@ enum class Kernel : uint8_t {
     // Multi-batch-only variants.  APPEND ONLY: all pre-existing serialized
     // Kernel values are part of the M=1 argument-table ABI.
     KvAppendPaged, SdpaPaged, GdnCoreSlotted, GdnPrepSlotted,
+    // ── Gemma 4. APPEND ONLY, same rule as above. ──
+    // Only the kinds whose WEIGHT NAME or ABI differs from a qwen3.5 kind are
+    // here; the rest of the family reuses them, because `self_attn.q_proj` is
+    // `self_attn.q_proj` in both and the consts are bound per ordinal rather
+    // than per kind. The exception is the norm sandwich: gemma4 has four norms
+    // per layer where qwen3.5 has two, so `FfnRms`'s name is already taken by
+    // `post_attention_layernorm` and all three of the others need their own.
+    G4AttnPostNorm,      // post_attention_layernorm
+    G4FfnPreNorm,        // pre_feedforward_layernorm
+    G4FfnPostNorm,       // post_feedforward_layernorm
+    G4VNorm,             // weightless RMS on V, before the KV write
+    G4Geglu,             // gelu_tanh(gate) * up
+    G4LayerScalar,       // learned per-layer gain
+    G4Softcap,           // cap * tanh(logits / cap)
+    G4SdpaSliding,       // sliding-window decode attention
+    // Per-Layer Embeddings.
+    G4PleTokenGather,    // embed_tokens_per_layer
+    G4PleProjGemv,       // per_layer_model_projection
+    G4PleProjNorm,       // per_layer_projection_norm
+    G4PleCombine,        // (proj + token) * 1/sqrt(2)
+    G4PleGateGemv,       // per_layer_input_gate
+    G4PleGeglu,          // gelu_tanh(gate) * ple
+    G4PleProjLayerGemv,  // per_layer_projection
+    G4PleNorm,           // post_per_layer_input_norm
+    G4PleResidual,       // hidden += ple
+    // Fused: the norm sandwich's closing norm and the residual add it always
+    // precedes. Three per layer, so three barriers a layer at ~5.8 us each.
+    G4AttnPostResidual,  // rms(block)*post_attention_layernorm + resid
+    G4FfnPostResidual,   // rms(block)*post_feedforward_layernorm + resid
+    G4PleResidualScaled, // (rms(ple)*post_per_layer_input_norm + resid)*layer_scalar
 };
 
 // ── Bucketed command-buffer key (relaxes "byte-identical CB" → "byte-identical

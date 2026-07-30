@@ -23,6 +23,7 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use msl_corpus::{extended_stages, region_shape};
+use pie_codegen::error::EmitError;
 
 const HEADER: &str = "\
 # A pin of the extended corpus (`msl_corpus::extended_traces`) -- the traces
@@ -53,7 +54,7 @@ fn golden_extended_dir() -> PathBuf {
 /// rather than showing it. For the same reason the hand-written device text is
 /// dropped before hashing — `bytes` counts what the compiler generated, so a
 /// kernel engineer tuning a `.cuh` does not re-pin all 55 ops.
-fn digest(emitted: &Result<String, String>, device: &[String]) -> String {
+fn digest(emitted: &Result<String, EmitError>, device: &[String]) -> String {
     match emitted {
         Ok(source) => {
             let generated = device_text::elide_device_text(source, device);
@@ -122,7 +123,10 @@ fn extended_corpus_emitters_are_pinned() {
                     body,
                     "cuda_validate: ok={} error={}",
                     verdict.is_ok(),
-                    verdict.as_ref().err().map_or("", |error| error.as_str())
+                    verdict
+                        .as_ref()
+                        .err()
+                        .map_or(String::new(), |error| error.to_string())
                 );
                 let _ = writeln!(
                     body,

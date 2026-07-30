@@ -25,6 +25,7 @@
 // (host-testable, no Metal dependency) core of that check.
 
 #include <cstddef>
+#include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -164,28 +165,100 @@ bool validate_request_local_positions(
 // idle memory.  The paged command path uses these four slots concurrently;
 // caps report exactly this value — never a larger, aspirational one — via
 // `MetalExecutor::rs_slots()`.
+
+
+// Concurrent recurrent-state slots, and through `kPagedMaxForwardRequests` the
+// driver's advertised `max_forward_requests` -- which bootstrap also adopts as
+// the process admission cap, so this one number decides how wide a decode batch
+// can get AND how many requests may be in flight.
+//
+// A slot is 21.4MB here (18 GDN layers x (2 x conv + recurrent)), so 32 costs
+// 684MB against a 405MB checkpoint on a 34GB machine.  Worth it: 32 lanes turn
+// in 812 tok/s against 16 lanes' 698 on the same binary, bit-identical output.
+//
+// It also has to be >= any concurrency the deployment expects: asking for more
+// concurrent requests than this hangs the cold-start seal rather than queueing
+// (32 requests at concurrency 16 are fine; 17 at concurrency 17 never starts).
+// That is a separate defect -- oversubscription should queue -- but until it is
+// fixed this bound is also a floor on usable concurrency.
+inline constexpr std::uint32_t kPhase1bRsSlots = 64;
+inline constexpr std::uint32_t kPagedMaxForwardRequests = kPhase1bRsSlots;
+
 // Tokens the resident KV/GDN ring holds, across the WHOLE fleet -- it is one
-// linear ring, not a per-request allocation, so sixteen concurrent requests
-// share it. At 4096 that ceiling was reached by sixteen requests generating
-// ~230 tokens each, and the planner failed them all with `NoSwapRoom`; a
-// concurrent fleet could not run a normal-length generation at all.
+// linear ring, not a per-request allocation, so the whole fleet shares it. At
+// 4096 that ceiling was reached by sixteen requests generating ~230 tokens
+// each, and the planner failed them all with `NoSwapRoom`; a concurrent fleet
+// could not run a normal-length generation at all.
+//
+// Derived from the slot count rather than written down, because the two are the
+// same statement about how many requests this driver serves: a ring sized for
+// sixteen requests starves the moment the slot count allows sixty-four, which
+// is exactly what happened -- 64 x 512 tokens needs ~35k and a 32768 ring
+// failed every request with `NoSwapRoom`.  Each request gets 2048 tokens.
 //
 // The KV region is `n_full_attn * 2 * n_kv_heads * max_ctx * head_dim * 2B`,
-// which is ~100MB for this checkpoint at 4096 and ~800MB at 32768 -- worth it
-// against a 405MB weight set on a machine with tens of GB, and it buys sixteen
-// requests 2048 tokens each.
+// which is ~100MB for this checkpoint at 4096, ~800MB at 32768 and ~3.2GB at
+// 131072 -- worth it against a 405MB weight set on a machine with tens of GB.
 //
 // ADVERTISED and ENFORCED from here: `context.cpp` builds the capabilities page
 // count from this and `validate_fire_geometry` bounds page ids by the same
 // number, so the two can never drift (they were separate 4096 literals).
-inline constexpr std::uint32_t kMetalMaxCtxTokens = 32768;
+inline constexpr std::uint32_t kMetalCtxTokensPerRequest = 2048;
+inline constexpr std::uint32_t kMetalMaxCtxTokens =
+    kPhase1bRsSlots * kMetalCtxTokensPerRequest;
+// How many prompt rows one fire may carry.
+//
+// This is not just an allocation bound: it is advertised through capabilities
+// as `max_forward_tokens`, and `FramePolicy` defers any lane whose fire does
+// not fit the wave budget, so it is also what decides how many of a fleet's
+// prompts can share a prefill.  At 64 -- the value this started at, sized for a
+// single stream -- sixteen 34-token prompts could not pair up and ran as
+// sixteen separate fires.
+//
+// So it has to come from what actually constrains it, which is memory per row.
+// A row costs, per fire:
+//
+//   * `vocab * 2` bytes of logits -- 485KB for this checkpoint, and the term
+//     that dominates every other by two orders of magnitude;
+//   * `scratch_widest_elems * 2` bytes in each of the scratch pool's colors;
+//   * a handful of 4-byte per-row IO scalars.
+//
+// `paged_max_forward_tokens` divides a budget by that, so a small-vocabulary
+// model is allowed more rows and a large one fewer, instead of every model
+// inheriting a number tuned against one checkpoint.  The floor keeps a single
+// long prompt working; the ceiling is where a full fleet stops splitting
+// (measured: sixteen 34-token prompts take 6 fires at 256 and 4 at both 512 and
+// 1024, so nothing above 512 buys anything for a batch this wide) and also
+// bounds prefill DAG construction, which is per row.
+// Sized so this checkpoint lands on its measured optimum: 677KB per row x 512
+// rows is ~340MB, which is what the budget below allows.  A model with a much
+// larger vocabulary pays more per row and is given proportionally fewer, which
+// is the point -- the staging is genuinely allocated either way.
+inline constexpr std::uint32_t kPagedForwardRowBudgetBytes = 384u << 20;
+// The scratch coloring is computed from the DAG, which does not exist yet when
+// capabilities are built.  A generous fixed count is fine here: at 12KB per
+// color against 485KB of logits, the whole scratch term is noise in this
+// division, and over-counting it can only make the answer conservative.
+inline constexpr std::uint32_t kPagedScratchColors = 16;
+inline constexpr std::uint32_t kPagedMinForwardTokens = 64;
+inline constexpr std::uint32_t kPagedMaxForwardTokensCeiling = 512;
+// Every row claims a block of argument-table ordinals, so this ceiling also
+// fixes where the prefill's ordinal space ends and PTIR's may begin; see
+// `kPrefillOrdinalLimit`, which the setup path cross-checks against this.
 
-inline constexpr std::uint32_t kPhase1bRsSlots = 16;
-inline constexpr std::uint32_t kPagedMaxForwardRequests = kPhase1bRsSlots;
-// Paged prompts run one correct N=1 GDN recurrence DAG per token inside one
-// command buffer.  This bounds IO/scratch/logits allocation independently of
-// the four concurrently-addressable recurrent-state slots.
-inline constexpr std::uint32_t kPagedMaxForwardTokens = 64;
+inline std::uint32_t paged_max_forward_tokens(std::uint32_t vocab,
+                                              std::uint32_t scratch_widest_elems,
+                                              std::uint32_t scratch_colors) {
+    const std::uint64_t per_row = std::uint64_t(vocab) * 2u +
+                                  std::uint64_t(scratch_widest_elems) * 2u *
+                                      std::max<std::uint32_t>(1, scratch_colors) +
+                                  64u;  // per-row IO scalars
+    const std::uint64_t rows = per_row == 0 ? kPagedMaxForwardTokensCeiling
+                                            : kPagedForwardRowBudgetBytes / per_row;
+    return std::clamp<std::uint32_t>(static_cast<std::uint32_t>(rows),
+                                     kPagedMinForwardTokens,
+                                     kPagedMaxForwardTokensCeiling);
+}
 
 struct SetupConfig {
     std::string checkpoint_dir;  // HF snapshot dir (config.json + safetensors)
@@ -209,6 +282,27 @@ struct SetupConfig {
     // Which storage schema to author against. It selects a contract on this
     // side of the loader call and never crosses it (§10.4).
     std::string model_type;
+    /// Gemma 4's shape, when `model_type` says so. Zero means "not gemma4", so
+    /// a config that never mentions this family cannot accidentally select it.
+    struct Gemma4Facts {
+        int n_layers = 0;
+        int hidden = 0;
+        int intermediate = 0;
+        int n_q_heads = 0;
+        int n_kv_heads = 0;
+        int head_dim = 0;         // sliding layers
+        int global_head_dim = 0;  // full layers
+        int sliding_window = 0;
+        int num_kv_shared_layers = 0;
+        int per_layer_emb_dim = 0;
+        int full_attn_interval = 0;  // -1: `layer_types` is irregular, refuse
+        bool double_wide_mlp = false;
+        float final_softcap = 0.0f;
+        float rope_theta_full = 1.0e6f;
+        float rope_theta_sliding = 1.0e4f;
+        float full_partial_rotary = 0.25f;
+        bool present() const { return n_layers > 0 && hidden > 0; }
+    } gemma4;
     // `config.json`'s RoPE hyperparameters, read out of the nested
     // `rope_parameters` object this family uses (context.cpp). The defaults
     // below are Qwen3.5's, so a checkpoint that omits them still lands on the

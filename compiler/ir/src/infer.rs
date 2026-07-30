@@ -1,8 +1,8 @@
-//! Per-op shape/dtype inference for PTIR stage bodies — the validator core
-//! and the executable-semantics type table ([`super::interp`] indexes it).
+//! Per-op shape/dtype inference for PTIR stage bodies: the validator core,
+//! and the type table the reference interpreter indexes for its semantics.
 //!
-//! Every op is value → value over trace-known shapes (overview §5.1, D2):
-//! inference is total per op and errors carry the op index. Channel ops type
+//! Every op is value → value over trace-known shapes: inference is total per
+//! op and errors carry the op index. Channel ops type
 //! against the container's channel declarations (`ACT` materializes F32,
 //! [`super::container::ChanDType::program_dtype`]).
 
@@ -15,17 +15,23 @@ use crate::types::{DType, MAX_RANK, Predicate, Shape, ValueId, ValueType};
 /// An inference failure at `op_index`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BodyError {
+    /// Position of the offending op in its stage body.
     pub op_index: u32,
+    /// What inference rejected.
     pub kind: BodyErrorKind,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// What an inference failure was.
+#[non_exhaustive]
 pub enum BodyErrorKind {
     /// Operand id undefined at this point (out of range / forward ref).
     ValueIdOutOfRange(ValueId),
+    /// Operand shapes an op's rule does not accept.
     ShapeMismatch,
     /// Elementwise operand shapes that failed to broadcast (carries both).
     ShapeMismatchBin(Shape, Shape),
+    /// Operand dtypes an op's rule does not accept.
     DTypeMismatch,
     /// Channel index outside the container's declaration table.
     ChannelOutOfRange(u32),
@@ -72,8 +78,15 @@ impl std::error::Error for BodyError {}
 /// Context a body types against: the channel element types (in declaration
 /// order, `ACT` already materialized) and the name-table size.
 pub struct BodyCtx<'a> {
+    /// Program-side channel element types, in declaration order.
     pub channel_types: &'a [ValueType],
-    pub n_names: u16,
+    /// Name-table length; a name index at or above it is out of range.
+    ///
+    /// Wider than the [`NameIndex`](crate::op::NameIndex) it bounds, so that
+    /// a table longer than `u16::MAX` states its real length. Narrowing it to
+    /// the index type instead would make the largest legal index compare as
+    /// out of range.
+    pub n_names: u32,
 }
 
 /// The per-value type table (index = value id) of one stage body, inferring
@@ -82,7 +95,7 @@ pub struct BodyCtx<'a> {
 pub fn body_types(ops: &[Op], ctx: &BodyCtx<'_>) -> Result<Vec<ValueType>, BodyError> {
     let mut types: Vec<ValueType> = Vec::new();
     for (i, op) in ops.iter().enumerate() {
-        match infer(i as u32, op, &types, ctx)? {
+        match infer(u32::try_from(i).unwrap_or(u32::MAX), op, &types, ctx)? {
             Results::None => {}
             Results::One(t) => types.push(t),
             Results::Two(a, b) => {
@@ -181,7 +194,7 @@ fn infer(
             .ok_or(err(op_index, BodyErrorKind::ChannelOutOfRange(c)))
     };
     let name_ok = |n: u16| -> Result<(), BodyError> {
-        if n < ctx.n_names {
+        if u32::from(n) < ctx.n_names {
             Ok(())
         } else {
             Err(err(op_index, BodyErrorKind::NameOutOfRange(n)))
@@ -240,7 +253,7 @@ fn infer(
         Op::Div(a, b) => {
             // Unlike PSIR v4 (F32-only), PTIR `div` is defined on every
             // numeric dtype: F32 division, or truncating integer division
-            // (0 on divide-by-zero) — §6.2's `parent = div(i, V)` is id math.
+            // (0 on divide-by-zero) — a beam `parent = div(i, V)` is id math.
             let (ta, tb) = (g(a)?, g(b)?);
             if !ta.dtype.is_numeric() || ta.dtype != tb.dtype {
                 return Err(dtype_err());
@@ -413,7 +426,7 @@ fn infer(
                     if !kt.dtype.is_int() {
                         return Err(dtype_err());
                     }
-                    let per_row_ok = t.shape.rank() == 2 && *kt.shape.dims() == [t.shape.rows()];
+                    let per_row_ok = t.shape.rank() == 2 && kt.shape.dims() == &t.shape.dims()[..1];
                     if !kt.shape.is_scalar() && !per_row_ok {
                         return Err(shape_err());
                     }
@@ -423,7 +436,7 @@ fn infer(
                     if tt.dtype != DType::F32 {
                         return Err(dtype_err());
                     }
-                    let per_row_ok = t.shape.rank() == 2 && *tt.shape.dims() == [t.shape.rows()];
+                    let per_row_ok = t.shape.rank() == 2 && tt.shape.dims() == &t.shape.dims()[..1];
                     if !tt.shape.is_scalar() && !per_row_ok {
                         return Err(shape_err());
                     }

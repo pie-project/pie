@@ -24,10 +24,17 @@ use crate::op_view::OpView;
 /// The five pointer slots, defaulted to `scratch` the way the C++ does before
 /// the per-tag overrides.
 pub struct Slots {
+    /// Pointer expression for input operand 0, or `"scratch"` when unused.
     pub a0: String,
+    /// Pointer expression for input operand 1. `pivot_threshold` passes its
+    /// predicate payload here instead of a second operand.
     pub a1: String,
+    /// Pointer expression for input operand 2, or `"scratch"` when unused.
     pub a2: String,
+    /// Pointer expression for result 0.
     pub o0: String,
+    /// Pointer expression for result 1 (`base + 1`, since an op's results are
+    /// consecutive value ids).
     pub o1: String,
 }
 

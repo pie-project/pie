@@ -10,7 +10,7 @@ use super::op::IntrinsicId;
 use crate::types::DType;
 
 crate::declare_tagged_enum! {
-    /// Attachment stage of a traced program (overview §5.3). Wire tags stable.
+    /// Attachment stage of a traced program. Wire tags stable.
     /// Boundary stages run once per pass; the anatomical taps run once per layer.
     pub enum Stage {
         /// Before any KV read — weight swap, pass-wide config sinks.
@@ -32,16 +32,21 @@ impl Stage {
 }
 
 /// Execution order of the pass's channel-touching phases — the global
-/// per-channel program order (overview §1) is stage order, then op order
+/// per-channel program order is stage order, then op order
 /// within a stage. The descriptor (port peeks/takes) sits between the
 /// prologue and the per-layer taps. `0xFF` is the descriptor's tag in the
 /// readiness table (it is not a program stage).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Phase {
+    /// Before the forward pass runs.
     Prologue,
+    /// Descriptor-port reads, between the prologue and the layer taps.
     Descriptor,
+    /// At each layer's attention projection.
     OnAttnProj,
+    /// At each layer's attention.
     OnAttn,
+    /// After the forward pass completes.
     Epilogue,
 }
 
@@ -49,6 +54,7 @@ pub enum Phase {
 pub const PHASE_DESCRIPTOR_TAG: u8 = 0xFF;
 
 impl Phase {
+    /// This phase's tag in the readiness table.
     pub fn tag(self) -> u8 {
         match self {
             Phase::Prologue => Stage::Prologue as u8,
@@ -58,6 +64,10 @@ impl Phase {
             Phase::Epilogue => Stage::Epilogue as u8,
         }
     }
+    /// The phase a program stage runs in.
+    ///
+    /// Total, because every stage has one; [`Phase::Descriptor`] is the one
+    /// phase with no stage, since port reads are not a program body.
     pub fn of_stage(s: Stage) -> Phase {
         match s {
             Stage::Prologue => Phase::Prologue,
@@ -77,20 +87,35 @@ impl Phase {
 }
 
 crate::declare_tagged_enum! {
-    /// Descriptor ports (overview §5.1): the forward's ragged-tensor families.
+    /// Descriptor ports: the forward's ragged-tensor families.
     /// Consumption discipline is fixed per port: the token family **takes**
     /// (a token is spent by the pass that embeds it), geometry and masks **read**
     /// (state, not a message).
     pub enum Port {
+        /// The token ids to embed, one flat run per request. Taken.
         EmbedTokens = 0, "embed_tokens";
+        /// Row offsets splitting `embed_tokens` into per-request runs; one
+        /// entry more than there are requests. Taken.
         EmbedIndptr = 1, "embed_indptr";
+        /// Each token's position in its sequence, driving both RoPE and the
+        /// causal masks. Taken.
         Positions = 2, "positions";
+        /// The KV pages each request may address. Read.
         Pages = 3, "pages";
+        /// Row offsets splitting `pages` per request. Read.
         PageIndptr = 4, "page_indptr";
+        /// Per-request readable KV extent after this pass's writes land.
+        /// Read.
         KvLen = 5, "kv_len";
+        /// Which adapter slot each token routes to. Taken.
         WSlot = 6, "w_slot";
+        /// Each token's offset within its adapter slot. Taken.
         WOff = 7, "w_off";
+        /// Which token rows the epilogue reads out; absent means the last
+        /// row of each request. Read.
         Readout = 8, "readout";
+        /// An explicit attention mask replacing the derived causal one.
+        /// Read.
         AttnMask = 9, "attn_mask";
         // ── Recurrent-state buffered-slot family. Wire-additive: tags 0-9 are
         // unmoved, so a pure-attention guest's container is byte-identical.
@@ -123,7 +148,7 @@ crate::declare_tagged_enum! {
 
 impl Port {
     /// True iff a channel bound to this port is **consumed** (take) by the
-    /// pass; false = peeked (read). §5.1: the token-indexed family (embed,
+    /// pass; false = peeked (read). The token-indexed family (embed,
     /// positions, `w_slot`/`w_off`) consumes — a token is spent by the pass
     /// that embeds it; geometry and masks are state, peeked.
     pub fn consumes(self) -> bool {
@@ -155,7 +180,7 @@ pub const KNOWN_SINKS: &[(&str, SinkScope)] = &[
     ("minference_sparse", SinkScope::PassWide),
 ];
 
-/// Intrinsic value scope: which stages may materialize it (overview §5.3).
+/// Intrinsic value scope: which stages may materialize it.
 pub fn intrinsic_stages(intr: IntrinsicId) -> &'static [Stage] {
     match intr {
         IntrinsicId::Logits
@@ -174,12 +199,14 @@ pub fn intrinsic_stages(intr: IntrinsicId) -> &'static [Stage] {
 
 /// Whether `profile` provides `intr`.
 ///
-/// Exhaustive on purpose, and deliberately one function. This used to be two:
-/// a `matches!` here listing which intrinsics are model-gated, and a `match` in
-/// [`crate::validate::bind`] mapping each gated one to its profile flag with a
-/// `_ => true` arm. Adding a gated intrinsic to the first without the second
-/// made it available on every model — a capability check that passes by being
-/// forgotten. With one exhaustive match the compiler asks the question.
+/// Exhaustive on purpose, and deliberately one function.
+///
+/// The tempting split is two: a list of which intrinsics are model-gated, and
+/// a mapping from each gated one to its profile flag with a `_ => true` arm.
+/// Under that shape a new gated intrinsic added to the list but missed in the
+/// mapping is available on every model — a capability check that passes by
+/// being forgotten, which is the worst way for one to fail. One exhaustive
+/// match with no catch-all makes the compiler ask the question instead.
 pub fn intrinsic_available(intr: IntrinsicId, profile: &ModelProfile) -> bool {
     match intr {
         IntrinsicId::MtpLogits => profile.has_mtp_logits,
@@ -190,16 +217,22 @@ pub fn intrinsic_available(intr: IntrinsicId, profile: &ModelProfile) -> bool {
     }
 }
 
-/// A second-party kernel/sink the backend provides (bind-time availability,
-/// overview §4). `replayable = false` violates §1's corollary (a time- or
-/// load-varying return is a register read in disguise) and is rejected at
-/// bind — the T10 lint.
+/// A second-party kernel/sink the backend provides, resolved for
+/// availability at bind time.
+///
+/// `replayable = false` is rejected at bind: a time- or load-varying return
+/// is a register read in disguise, and a trace containing one cannot be
+/// replayed, cached by hash, or batched with an identical trace.
 #[derive(Clone, Debug, PartialEq)]
 pub struct KernelInfo {
+    /// The name a [`KernelCall`](crate::op::Op::KernelCall) or
+    /// [`SinkCall`](crate::op::Op::SinkCall) resolves to.
     pub name: String,
     /// For sinks: where the effect is consumed. `None` = a value-returning
     /// kernel (not a sink).
     pub sink_scope: Option<SinkScope>,
+    /// Whether the same arguments always give the same result. `false` is
+    /// rejected at bind.
     pub replayable: bool,
 }
 
@@ -207,16 +240,22 @@ pub struct KernelInfo {
 /// the model-gated intrinsics, and the second-party registry.
 #[derive(Clone, Debug)]
 pub struct ModelProfile {
+    /// Token-vocabulary size; the trailing extent of a logits row.
     pub vocab: u32,
+    /// Tokens per KV page.
     pub page_size: u32,
+    /// How many transformer layers the per-layer taps fire for.
     pub num_layers: u32,
     /// Concrete dtype `ACT` resolves to (bf16/fp8 quantized types are the
     /// backend's; the *interpreter-visible* materialization is F32).
     pub activation: DType,
+    /// `[k, vocab]` F32 draft logits intrinsic available — a model with a
+    /// multi-token-prediction head.
     pub has_mtp_logits: bool,
     /// `[k]` I32 draft tokens intrinsic ([`IntrinsicId::MtpDrafts`]) available —
     /// a model with an MTP head serving device-resident spec-decode drafts.
     pub has_mtp_drafts: bool,
+    /// A scalar value-head intrinsic is available.
     pub has_value_head: bool,
     /// `[kv_max]` F32 head-folded attention weights
     /// ([`IntrinsicId::AttnScore`]) available. Unlike the MTP flags this is a *backend* property as much as
@@ -234,6 +273,8 @@ pub struct ModelProfile {
 }
 
 impl ModelProfile {
+    /// The registry entry for `name`, or `None` if this backend does not
+    /// offer it.
     pub fn kernel(&self, name: &str) -> Option<&KernelInfo> {
         self.kernels.iter().find(|k| k.name == name)
     }

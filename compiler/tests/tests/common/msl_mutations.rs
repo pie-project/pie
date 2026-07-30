@@ -1,5 +1,7 @@
-//! The plan mutations the `validate_singleton_plan` corpus is built from,
-//! mirroring `kMutations` / `mutate()` in `compiler/tests/oracle/`.
+//! The plan mutations the `validate_singleton_plan` corpus is built from. They
+//! were transcribed from `kMutations` / `mutate()` in an in-driver C++ oracle
+//! that has since been deleted, and are now the definition rather than a copy
+//! of one.
 //!
 //! `validate_singleton_plan` rejects things a well-formed compiler plan never
 //! produces, so almost all of its error paths are only reachable by damaging a
@@ -18,8 +20,8 @@
 use pie_ir::op::Op;
 use pie_ir::types::{DType, Predicate};
 use pie_plan::{
-    ChannelSink, CompiledStage, Dimension, LibraryOp, NodeIndex, PartitionKind, RegionKind,
-    SymbolicType,
+    ChannelSink, ChannelSlot, CompiledStage, Dimension, LibraryOp, NodeIndex, PartitionKind,
+    RegionKind, SymbolicType,
 };
 
 pub const MUTATIONS: &[&str] = &[
@@ -128,7 +130,7 @@ pub fn mutate(stage: &mut CompiledStage, mutation: &str) -> bool {
             if stage.fused.regions.is_empty() {
                 return false;
             }
-            let channel_slot = stage.normalized.channel_bindings.len() as u32;
+            let channel_slot = ChannelSlot(stage.normalized.channel_bindings.len() as u32);
             stage.fused.regions[0].sinks.push(ChannelSink {
                 channel_slot,
                 value: 0,

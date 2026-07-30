@@ -20,25 +20,39 @@ pie_ir::declare_tagged_enum! {
     /// one place: `pie_codegen::launch` bounds the grouped path by its length,
     /// and the C header enumerates it as `PtirSymbolicExtent`.
     pub enum SymbolicExtent {
+        /// Number of live KV-cache entries.
         KvLen = 0, "kv_len";
+        /// Number of KV-cache pages.
         PageCount = 1, "page_count";
+        /// Number of rows (requests) in the batch.
         RowCount = 2, "row_count";
+        /// Number of input tokens in the pass.
         TokenCount = 3, "token_count";
+        /// Number of rows read out for sampling.
         SampledRows = 4, "sampled_rows";
+        /// Attention query length.
         QueryLen = 5, "query_len";
+        /// Attention key length.
         KeyLen = 6, "key_len";
     }
 }
 
+/// One dimension of a [`SymbolicType`]: a fixed size or a runtime extent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Dimension {
+    /// A size known at plan time.
     Static(u32),
+    /// A runtime-varying extent the launch substitutes.
     Symbolic(SymbolicExtent),
 }
 
+/// A planned value's type: a dtype and a per-dimension shape that keeps one
+/// plan valid across batch shapes.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SymbolicType {
+    /// The element type.
     pub dtype: DType,
+    /// The shape, outermost dimension first; empty for a scalar.
     pub dims: Vec<Dimension>,
 }
 
@@ -56,10 +70,12 @@ impl SymbolicType {
         }
     }
 
+    /// The number of dimensions.
     pub fn rank(&self) -> usize {
         self.dims.len()
     }
 
+    /// Whether the type has no dimensions, or every dimension is `1`.
     pub fn is_scalar(&self) -> bool {
         self.dims.is_empty()
             || self
@@ -148,6 +164,11 @@ pub(crate) fn symbolic_result_type(
             let operands = mapped_op.operands();
             let left = &normalized_types[operands[0] as usize];
             let right = &normalized_types[operands[1] as usize];
+            // Invariant: `MatMul` operands are exactly rank 2. `pie_ir`'s
+            // `infer::body_types` matches both shapes against `[m, k]` and
+            // `[k, n]` and returns a shape error otherwise, and
+            // `validate::bind` runs it — so `left.dims[0]` and the last of
+            // `right.dims` both exist.
             SymbolicType {
                 dtype: value_type.dtype,
                 dims: vec![left.dims[0], *right.dims.last().expect("matmul right rank")],

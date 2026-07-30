@@ -1,6 +1,6 @@
-//! Composed ops (overview appendix: `gumbel`, `mask_apply`, `softmax`,
+//! Composed ops (`gumbel`, `mask_apply`, `softmax`,
 //! `log_softmax`, `l2norm`) as **expansions over the core** — sugar the SDK
-//! tracer inlines, first-party by construction (D5). Each helper appends the
+//! tracer inlines, first-party by construction. Each helper appends the
 //! expansion to an op list and returns the result's value id, so builders and
 //! tests share one definition and every backend that fuses the core fuses
 //! these for free.
@@ -45,8 +45,9 @@ pub enum StepShape {
 ///
 /// There are two recorders and they must produce the same op sequence, which
 /// is why the sequence is written once here rather than once per recorder.
-/// `ptir_issues.md` C3 called the two copies drifted; they were not, but only
-/// because someone kept them in step by hand.
+/// Two expansions kept in step by hand can stay identical indefinitely and
+/// still be a latent bug: nothing reports the day one of them is edited
+/// alone, so the cost of the duplication is paid all at once, later.
 pub trait Sink {
     /// Append `op` and return the id of its first result.
     fn push(&mut self, op: Op, shape: StepShape) -> ValueId;

@@ -63,8 +63,6 @@ using pie_loader::PieLoaderQuantGranularity;
 using pie_loader::PieLoaderQuantScheme;
 using pie_loader::PieLoaderQuantSpecView;
 using pie_loader::PieLoaderRepackLayout;
-using pie_loader::PieLoaderRepackSpecView;
-using pie_loader::PieLoaderRowMap;
 using pie_loader::PieLoaderScaleForm;
 
 /// Which half of a multimodal checkpoint to load.
@@ -98,13 +96,15 @@ enum class Mxfp4MoeRequest : std::uint32_t {
     EagerBf16 = 3,
 };
 
+
 /// The config facts a family needs beyond the checkpoint itself.
 ///
-/// Four values. Everything else a contract needs — which tensors exist, what
-/// shape they are, how they are encoded, whether the experts ship stacked or
-/// per-expert — is in the checkpoint, and reading it there rather than
-/// predicting it from `config.json` is why `expect(shape)` can be an assertion
-/// instead of a guess.
+/// A short list, and it grows only when a *partition* of a shape has to be
+/// known that the checkpoint does not record. Everything else — which tensors
+/// exist, what shape they are, how they are encoded, whether the experts ship
+/// stacked or per-expert — is in the checkpoint, and reading it there rather
+/// than predicting it from `config.json` is why `expect(shape)` can be an
+/// assertion instead of a guess.
 struct ModelFacts {
     std::string model_type;
     /// `quantization_config.quant_method`, empty for an unquantized checkpoint.
@@ -115,6 +115,13 @@ struct ModelFacts {
     /// row split lands on a head boundary is not a question the row count can
     /// answer -- see `ContractBuilder::check_head_granularity`.
     std::uint32_t head_dim = 0;
+    /// `mamba_n_groups`, zero for a family without a Mamba mixer.
+    ///
+    /// Here for the same reason `head_dim` is, and it is the only way to know.
+    /// A Mamba mixer's B and C bands are `groups * state` rows of a fused
+    /// tensor, TP splits them by group, and no tensor in the checkpoint has
+    /// either factor as an extent: the product is all that is ever stored.
+    std::uint32_t mamba_groups = 0;
 };
 
 namespace contract_detail {
@@ -202,6 +209,10 @@ inline bool ends_with(std::string_view value, std::string_view tail) {
 
 inline bool contains(std::string_view value, std::string_view needle) {
     return value.find(needle) != std::string_view::npos;
+}
+
+inline bool starts_with(std::string_view value, std::string_view head) {
+    return value.size() >= head.size() && value.compare(0, head.size(), head) == 0;
 }
 
 /// No axis. `std::optional<std::uint8_t>` rather than a sentinel because "not
@@ -301,23 +312,6 @@ inline std::uint32_t u32_dim(std::int64_t value, std::string_view context) {
     return static_cast<std::uint32_t>(value);
 }
 
-/// The `[start, len)` this rank owns of a `full`-long axis.
-///
-/// `what` names the thing being split, because this is the message a user gets
-/// for "tp_size does not divide this model".
-inline std::pair<std::int64_t, std::int64_t> local_range(std::int64_t full,
-                                                         const pie_loader::DeviceTarget& target,
-                                                         const std::string& what) {
-    const std::int64_t world = std::max<std::int64_t>(1, target.tp_size);
-    if (full % world != 0) {
-        fail(what + " is " + std::to_string(full) + ", which tp_size " +
-             std::to_string(target.tp_size) +
-             " does not divide; use a tp_size that divides it or run single-GPU");
-    }
-    const std::int64_t local = full / world;
-    return {static_cast<std::int64_t>(target.tp_rank) * local, local};
-}
-
 inline PieLoaderEncodingSpec mxfp4_encoding(ModelContract& contract, std::uint8_t channel_axis) {
     PieLoaderQuantSpecView quant =
         pie_loader::quant_spec(PieLoaderQuantScheme::Mxfp4E2M1E8M0, PieLoaderDType::BF16);
@@ -329,11 +323,19 @@ inline PieLoaderEncodingSpec mxfp4_encoding(ModelContract& contract, std::uint8_
     return pie_loader::quantized(quant);
 }
 
-inline PieLoaderRepackSpecView repack_spec(PieLoaderRepackLayout layout, PieLoaderRowMap row_map) {
-    PieLoaderRepackSpecView spec{};
-    spec.layout = static_cast<std::uint32_t>(layout);
-    spec.row_map = static_cast<std::uint32_t>(row_map);
-    return spec;
+/// The W4A16 pairing Kimi ships: 4-bit codes biased by 8, eight to a word.
+///
+/// `group_size` is the run of elements one factor covers, and `channel_axis`
+/// names the axis those runs lie along -- the GEMM's K dim in both cases. The
+/// factors themselves are a separate tensor, which is what lets a contract
+/// pair them with `Expr::Scale` instead of leaving the pairing to a name.
+inline PieLoaderEncodingSpec int4b8_encoding(std::uint8_t channel_axis) {
+    PieLoaderQuantSpecView quant =
+        pie_loader::quant_spec(PieLoaderQuantScheme::Int4B8, PieLoaderDType::BF16);
+    quant.bits_per_element = 4;
+    quant.group_size = 32;
+    quant.channel_axis = channel_axis;
+    return pie_loader::quantized(quant);
 }
 
 inline std::vector<std::int64_t> shape_of(const SourceTensor& raw) {
@@ -355,6 +357,36 @@ inline bool is_tower_output(std::string_view name) {
 
 
 // -- the builder --------------------------------------------------------------
+/// Resolve the caller's MoE request against what the device can do.
+///
+/// The driver measured `native_mxfp4_moe`, so the driver is what turns `Auto`
+/// into an answer. It used to be the loader, which meant the loader needed the
+/// three-way request; under a contract it needs neither, because a contract
+/// either declares an MXFP4 expert weight or it does not.
+inline Mxfp4MoePolicy resolve_mxfp4_moe(Mxfp4MoeRequest request,
+                                                 bool native_mxfp4_moe) {
+    switch (request) {
+        case Mxfp4MoeRequest::RoutedDecode:
+            return Mxfp4MoePolicy::RoutedDecode;
+        case Mxfp4MoeRequest::EagerBf16:
+            return Mxfp4MoePolicy::EagerBf16;
+        case Mxfp4MoeRequest::NativeGemm:
+            if (!native_mxfp4_moe) {
+                contract_detail::fail(
+                    "mxfp4_moe=NativeGemm requested, but the target reports "
+                    "native_mxfp4_moe=false");
+            }
+            return Mxfp4MoePolicy::NativeGemm;
+        case Mxfp4MoeRequest::Auto:
+        default:
+            // Auto follows the device: a native MXFP4 GEMM is always the better
+            // path when the kernels exist, and decoding on the routed path is
+            // the fallback that works everywhere.
+            return native_mxfp4_moe ? Mxfp4MoePolicy::NativeGemm
+                                    : Mxfp4MoePolicy::RoutedDecode;
+    }
+}
+
 
 /// Accumulates one family's declarations against one checkpoint.
 ///
@@ -373,11 +405,12 @@ class ContractBuilder {
 public:
     ContractBuilder(const Checkpoint& checkpoint, const ModelFacts& facts,
                     const pie_loader::DeviceTarget& target, std::string_view runtime_quant,
-                    Mxfp4MoePolicy mxfp4_moe, Component component, ModelContract& out)
+                    Mxfp4MoeRequest mxfp4_moe, Component component, ModelContract& out)
         : facts_(facts),
           target_(target),
           runtime_quant_(runtime_quant),
-          mxfp4_moe_(mxfp4_moe),
+          mxfp4_moe_request_(mxfp4_moe),
+          mxfp4_moe_(resolve_mxfp4_moe(mxfp4_moe, target.native_mxfp4_moe)),
           component_(component),
           tensors_(checkpoint.tensors()),
           contract_(out) {
@@ -392,7 +425,18 @@ public:
 
     const ModelFacts& facts() const noexcept { return facts_; }
     const pie_loader::DeviceTarget& target() const noexcept { return target_; }
+    /// How this contract decided to hand MXFP4 experts to the driver.
+    ///
+    /// Starts at the device rule in `resolve_mxfp4_moe` and stays there unless
+    /// the author says otherwise. Read back after authoring, it is what the
+    /// bind path branches on -- one answer, decided once, by the file that
+    /// knows the family.
     Mxfp4MoePolicy mxfp4_moe() const noexcept { return mxfp4_moe_; }
+    /// What the caller asked for, before any rule was applied.
+    ///
+    /// Only an author with a reason to disagree with the device rule needs
+    /// this, and the reason belongs in that author's file.
+    Mxfp4MoeRequest mxfp4_moe_request() const noexcept { return mxfp4_moe_request_; }
     ModelContract& contract() noexcept { return contract_; }
     const std::vector<SourceTensor>& tensors() const noexcept { return tensors_; }
 
@@ -443,17 +487,56 @@ public:
 
     /// Where the decoder's layers are named, up to the layer index.
     ///
-    /// Only the fused-projection pass needs it, and only because it goes
-    /// looking for specific names instead of walking `tensors()`. Matching on
-    /// the `.self_attn.q_proj.weight` suffix alone would be prefix-free but
-    /// wrong: Gemma-4's vision and audio towers have projections of that name
-    /// too, and fusing one would consume weights its bind path still reads.
+    /// Any pass that selects tensors by suffix needs it. Matching on the
+    /// suffix alone would be prefix-free but wrong: Gemma-4's vision and audio
+    /// towers have a `self_attn.q_proj.weight` of their own, and fusing one
+    /// would consume weights its bind path still reads.
     void decoder_layer_prefix(std::string_view prefix) { decoder_layer_prefix_ = prefix; }
+
+    /// The prefix set above, for passes that filter `tensors()` by it.
+    std::string_view decoder_layer_prefix() const noexcept { return decoder_layer_prefix_; }
+
+    /// Adopt whichever of `candidates` the checkpoint names layer 0 with.
+    ///
+    /// The counterpart to `source_prefix`, and for the same reason: a family
+    /// whose released checkpoints nest the decoder under `language_model.` on
+    /// the multimodal variant and not on the text one cannot *declare* where
+    /// its layers are, it has to ask. Declaring it is what Qwen3.5 did, with
+    /// `model.layers.` against checkpoints that say
+    /// `model.language_model.layers.`, and the failure was silent in the worst
+    /// way -- every pass keyed on the prefix simply matched nothing, so the
+    /// blocked GDN shard and the dense projection join both stopped happening
+    /// and the driver's own fallbacks covered for them.
+    ///
+    /// Order is preference: the first candidate the checkpoint uses wins.
+    void decoder_layer_prefix_any_of(std::initializer_list<std::string_view> candidates) {
+        for (const std::string_view candidate : candidates) {
+            const std::string layer_zero = source_name(std::string(candidate) + "0.");
+            for (const SourceTensor& raw : tensors_) {
+                if (contract_detail::starts_with(raw.name, layer_zero)) {
+                    decoder_layer_prefix_ = candidate;
+                    return;
+                }
+            }
+        }
+    }
 
     /// Tensor-parallel shard-axis strategy, keyed by tensor name. Defaults to
     /// the HF convention; a family whose checkpoint names the same operator
     /// differently (DeepSeek-V4's native `.ffn.experts.w*`) registers its own.
     void shard_axis_fn(ShardAxis (*fn)(std::string_view)) { shard_axis_fn_ = fn; }
+
+    /// Answer the caller's MXFP4 MoE request for this family.
+    ///
+    /// `resolve_mxfp4_moe` answers a device question -- are there native MXFP4
+    /// GEMM kernels? -- which is the whole question only for a family that has
+    /// a native path to take. A family that does not is not choosing between
+    /// `NativeGemm` and its fallback at all, and letting the device rule stand
+    /// would pick a path on grounds that do not apply to it.
+    ///
+    /// So the family that knows says so, here, next to the reason. The answer
+    /// this leaves behind is the one the bind path reads.
+    void decide_mxfp4_moe(Mxfp4MoePolicy policy) noexcept { mxfp4_moe_ = policy; }
 
     /// Shard `embed_tokens` on axis 0 under TP, to save per-rank memory.
     void shard_embed_tokens() { shard_embed_tokens_ = true; }
@@ -491,19 +574,6 @@ public:
     /// Claim `id` for a pass that has published it under some other name, so
     /// the generic tail does not publish it a second time.
     void consume(std::uint32_t id) { consumed_.insert(id); }
-
-    /// The `[start, len)` this rank owns of a `full`-long axis, as numbers.
-    ///
-    /// **`Repack` only.** A repack spec carries `source_row_offset` as an
-    /// integer a kernel reads, so the escape hatch has nowhere to put a `Shard`
-    /// node and the rank has to be resolved here. Everything affine must use
-    /// [`band`] or [`split`] instead: baking `start + tp_rank * len` into a
-    /// `Slice` makes the contract a second per-rank input to compilation, and
-    /// §6.3's rank-uniformity guarantee rests on the target being the only one.
-    std::pair<std::int64_t, std::int64_t> local_range(std::int64_t full,
-                                                      const std::string& what) const {
-        return contract_detail::local_range(full, target_, what);
-    }
 
     /// Record that `expr` is split across ranks along `axis`.
     ///
@@ -676,11 +746,16 @@ public:
         consumed_.insert(raw.id);
     }
 
+    /// Publish `src` under `output`, relaid out by `layout`.
+    ///
+    /// `src` is an expression, not a name, because the selection a kernel used
+    /// to carry as integers -- this rank's rows, the interleaved half, the
+    /// column band -- is stated in the algebra now. `consume` the checkpoint
+    /// tensor separately if the generic tail should not republish it.
     std::optional<pie_loader::ModelContract::Defined> push_repack(
-        std::string output, const SourceTensor& raw, PieLoaderEncodingSpec encoding,
-        std::vector<std::int64_t> shape, PieLoaderRepackSpecView spec) {
-        const Node node =
-            contract_.repack(contract_.src(std::string(raw.name)), spec, shape, encoding);
+        std::string output, Node src, PieLoaderRepackLayout layout,
+        PieLoaderEncodingSpec encoding, std::vector<std::int64_t> shape) {
+        const Node node = contract_.repack(src, layout, shape, encoding);
         return define(std::move(output), node, encoding, std::move(shape));
     }
 
@@ -735,7 +810,7 @@ public:
             const Node up = up_part.first;
             const std::int64_t local_i = gate_part.second;
             push_expr(output_name(raw.name), raw, {experts, 2 * local_i, hidden},
-                      contract_.cat(gate_second ? std::vector<Node>{up, gate}
+                      contract_.concat(gate_second ? std::vector<Node>{up, gate}
                                                 : std::vector<Node>{gate, up},
                                     1));
         }
@@ -795,7 +870,7 @@ public:
                 local_rows.push_back(local_extent(raw->shape[0]));
                 rows += local_rows.back();
             }
-            define(candidate.output_name, contract_.cat(parts, 0),
+            define(candidate.output_name, contract_.concat(parts, 0),
                    pie_loader::raw(PieLoaderDType::BF16),
                    std::vector<std::int64_t>{rows, candidate.cols});
 
@@ -818,6 +893,17 @@ public:
         }
     }
 
+    /// Also apply `dense_fused_projection_joins` to a module outside the
+    /// decoder stack.
+    ///
+    /// A speculative-decoding head (Qwen3.5's `mtp.layers.0.`) has the same
+    /// projection names as a decoder layer but sits at its own prefix, so the
+    /// `num_hidden_layers` loop never reaches it. Without this its bind path
+    /// would be the only one left needing a host-side concatenation.
+    void also_join_module(std::string module_prefix) {
+        extra_join_modules_.push_back(std::move(module_prefix));
+    }
+
     /// Fuse q/k/v and gate/up into one buffer each, where the GEMM wants it.
     ///
     /// A CUDA kernel decision, not a fact about any model: the same
@@ -835,6 +921,22 @@ public:
         for (std::uint32_t layer = 0; layer < facts_.num_hidden_layers; ++layer) {
             const std::string p =
                 std::string(decoder_layer_prefix_) + std::to_string(layer) + ".";
+            const std::string s = source_name(p);
+            if (auto candidate = fused_join_candidate(
+                    p + "self_attn.qkv_proj.fused.weight",
+                    {s + "self_attn.q_proj.weight", s + "self_attn.k_proj.weight",
+                     s + "self_attn.v_proj.weight"})) {
+                qkv_bytes += candidate->bytes;
+                qkv.push_back(std::move(*candidate));
+            }
+            if (auto candidate = fused_join_candidate(
+                    p + "mlp.gate_up_proj.fused.weight",
+                    {s + "mlp.gate_proj.weight", s + "mlp.up_proj.weight"})) {
+                gate_up_bytes += candidate->bytes;
+                gate_up.push_back(std::move(*candidate));
+            }
+        }
+        for (const std::string& p : extra_join_modules_) {
             const std::string s = source_name(p);
             if (auto candidate = fused_join_candidate(
                     p + "self_attn.qkv_proj.fused.weight",
@@ -991,6 +1093,8 @@ public:
     }
 
 private:
+    std::vector<std::string> extra_join_modules_;
+
 
     // -- the source-prefix rule ----------------------------------------------
     //
@@ -1093,7 +1197,8 @@ private:
 
         auto [expr, shape] =
             shard(contract_.src(std::string(raw.name)), shape_of(raw), shard_axis(raw.name));
-        define(std::move(output), expr, pie_loader::quantized(quant), std::move(shape));
+        const PieLoaderEncodingSpec encoding = pie_loader::quantized(quant);
+        define(std::move(output), contract_.cast(expr, encoding), encoding, std::move(shape));
     }
 
     bool runtime_quant_allowed(PieLoaderQuantScheme scheme) const {
@@ -1103,6 +1208,7 @@ private:
     const ModelFacts& facts_;
     const pie_loader::DeviceTarget& target_;
     std::string_view runtime_quant_;
+    Mxfp4MoeRequest mxfp4_moe_request_;
     Mxfp4MoePolicy mxfp4_moe_;
     Component component_;
     std::vector<SourceTensor> tensors_;
@@ -1207,23 +1313,23 @@ inline void hf_moe_expert_stacks(
             // per-expert concatenation a stack.
             const Node gate_src = b.contract().src(std::string(g->name));
             const Node up_src = b.contract().src(std::string(u->name));
-            gate_up_parts.push_back(b.contract().reshape(
-                b.contract().cat(gate_second
+            gate_up_parts.push_back(b.contract().transmute(
+                b.contract().concat(gate_second
                                      ? std::vector<Node>{up_src, gate_src}
                                      : std::vector<Node>{gate_src, up_src},
                                  0),
-                {1, 2 * inter, hidden}));
-            down_parts.push_back(b.contract().reshape(
-                b.contract().src(std::string(d->name)), {1, hidden, inter}));
+                {1, 2 * inter, hidden}, pie_loader::raw(dtype)));
+            down_parts.push_back(b.contract().transmute(b.contract().src(std::string(d->name)),
+                                                     {1, hidden, inter}, pie_loader::raw(dtype)));
             consumed.push_back(g->id);
             consumed.push_back(u->id);
             consumed.push_back(d->id);
         }
 
-        b.define(bound + "gate_up_proj", b.contract().cat(gate_up_parts, 0),
+        b.define(bound + "gate_up_proj", b.contract().concat(gate_up_parts, 0),
                pie_loader::raw(dtype),
                std::vector<std::int64_t>{num_experts, 2 * inter, hidden});
-        b.define(bound + "down_proj", b.contract().cat(down_parts, 0), pie_loader::raw(dtype),
+        b.define(bound + "down_proj", b.contract().concat(down_parts, 0), pie_loader::raw(dtype),
                std::vector<std::int64_t>{num_experts, hidden, inter});
         for (std::uint32_t id : consumed) {
             b.consume(id);
@@ -1234,6 +1340,7 @@ inline void hf_moe_expert_stacks(
 }  // namespace contract_detail
 
 using contract_detail::ContractBuilder;
+using contract_detail::resolve_mxfp4_moe;
 using contract_detail::ShardAxis;
 
 
@@ -1251,35 +1358,6 @@ inline std::string_view resolve_runtime_quant(std::string_view request, bool fp8
     return request == "fp8" && !fp8_native ? std::string_view() : request;
 }
 
-/// Resolve the caller's MoE request against what the device can do.
-///
-/// The driver measured `native_mxfp4_moe`, so the driver is what turns `Auto`
-/// into an answer. It used to be the loader, which meant the loader needed the
-/// three-way request; under a contract it needs neither, because a contract
-/// either declares an MXFP4 expert weight or it does not.
-inline Mxfp4MoePolicy resolve_mxfp4_moe(Mxfp4MoeRequest request,
-                                                 bool native_mxfp4_moe) {
-    switch (request) {
-        case Mxfp4MoeRequest::RoutedDecode:
-            return Mxfp4MoePolicy::RoutedDecode;
-        case Mxfp4MoeRequest::EagerBf16:
-            return Mxfp4MoePolicy::EagerBf16;
-        case Mxfp4MoeRequest::NativeGemm:
-            if (!native_mxfp4_moe) {
-                contract_detail::fail(
-                    "mxfp4_moe=NativeGemm requested, but the target reports "
-                    "native_mxfp4_moe=false");
-            }
-            return Mxfp4MoePolicy::NativeGemm;
-        case Mxfp4MoeRequest::Auto:
-        default:
-            // Auto follows the device: a native MXFP4 GEMM is always the better
-            // path when the kernels exist, and decoding on the routed path is
-            // the fallback that works everywhere.
-            return native_mxfp4_moe ? Mxfp4MoePolicy::NativeGemm
-                                    : Mxfp4MoePolicy::RoutedDecode;
-    }
-}
 
 /// The contract for a family that needs nothing beyond the name-pattern rules.
 ///

@@ -4,7 +4,7 @@
     {
       "name": "model.layers.0.mlp.gate_up_proj.fused.weight",
       "expr": {
-        "Cat": {
+        "Concat": {
           "axis": 0,
           "parts": [
             {
@@ -27,7 +27,7 @@
     {
       "name": "model.layers.0.self_attn.q_kv_a_proj.fused.weight",
       "expr": {
-        "Cat": {
+        "Concat": {
           "axis": 0,
           "parts": [
             {

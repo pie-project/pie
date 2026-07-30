@@ -41,6 +41,8 @@
 pub struct FaultClass {
     /// The value written for channel 0. Per-channel classes write `base + channel`.
     pub base: u32,
+    /// The class's symbolic name, matching its `pub const` — the label a reader
+    /// maps a raw fault code back to.
     pub name: &'static str,
     /// Whether the emitter adds a channel index to [`base`](Self::base).
     pub per_channel: bool,

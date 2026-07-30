@@ -1,18 +1,19 @@
 //! Whole-program emission: a bound trace in, one kernel table out.
 //!
-//! The per-region emitters in [`crate::cuda`] and [`crate::metal`] are faithful
-//! ports of what the drivers used to call, one region at a time. This module is
-//! the part that used to live in the drivers' *runtime* files — the walk that
-//! decides which emitter each region goes through, and what the entry point is
-//! called. Keeping that decision here is the point of the whole move: the
-//! driver receives a table and compiles it, instead of re-deriving from the
-//! plan what the host already worked out.
+//! The per-region emitters in [`crate::cuda`] and [`crate::metal`] handle one
+//! region at a time. This module owns the walk above them: which emitter each
+//! region goes through, and what its entry point is called. That decision
+//! belongs here rather than in a driver, so a driver receives a table and
+//! compiles it instead of re-deriving from the plan what the host already
+//! worked out.
 //!
-//! Naming and the emitter-selection rules are reproduced from
+//! Entry names and the emitter-selection rules are shared with
 //! `driver/metal/src/pipeline/m1_runtime.cpp` and
-//! `driver/cuda/src/pipeline/generated/module_cache.hpp`; a driver that reads
-//! this table must find the same entry names it used to generate.
+//! `driver/cuda/src/pipeline/generated/module_cache.hpp` — a driver reading
+//! this table has to find exactly the names it looks up, so the naming scheme
+//! is an ABI and not a formatting choice.
 
+use crate::error::{EmitError, EmitterKind};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -32,11 +33,19 @@ pub use pie_driver_abi::local::{
 /// One emitted kernel, or the reason it could not be emitted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EmittedKernel {
+    /// The `PIE_KERNEL_*` discriminant naming which kernel family this is.
     pub kind: u32,
+    /// The stage this kernel was emitted for.
     pub stage_index: u32,
+    /// The region within that stage this kernel was emitted for.
     pub region_index: u32,
+    /// The entry-point symbol a driver looks the kernel up by; empty when
+    /// emission failed.
     pub entry_name: String,
+    /// The generated kernel source, or empty when emission failed.
     pub source: String,
+    /// The refusal text when emission failed, empty on success; copied across
+    /// the C boundary for a human to read.
     pub error: String,
 }
 
@@ -46,11 +55,13 @@ impl EmittedKernel {
         stage_index: usize,
         region_index: usize,
         entry_name: String,
-        emitted: Result<String, String>,
+        emitted: Result<String, EmitError>,
     ) -> Self {
+        // The typed refusal becomes text here and only here: `error` is ABI,
+        // copied across the C boundary for a human to read.
         let (source, error) = match emitted {
             Ok(source) => (source, String::new()),
-            Err(error) => (String::new(), error),
+            Err(error) => (String::new(), error.to_string()),
         };
         Self {
             kind,
@@ -71,7 +82,9 @@ impl EmittedKernel {
 /// advertises in `DriverCapabilities::codegen_backend`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Backend {
+    /// CUDA, compiled by NVRTC; advertised as `"cuda"`.
     Cuda,
+    /// Metal, compiled from MSL; advertised as `"metal"`.
     Metal,
 }
 
@@ -114,12 +127,14 @@ impl Backend {
 
 /// Emit every kernel a driver needs for `stages`, in stage then region order.
 ///
-/// One `match` owns the whole backend decision. The program-level effect
-/// kernels used to be reached by an `if backend == Backend::Metal` *after* the
-/// loop, which meant a third backend would compile, run, and quietly emit no
-/// readiness or commit kernels at all. Everything a backend does is now in its
-/// arm, so adding one is a compile error here rather than a missing kernel in
-/// a driver.
+/// One `match` owns the whole backend decision, and everything a backend does
+/// lives inside its arm.
+///
+/// Program-level work placed outside the match — an `if backend ==
+/// Backend::Metal` after the loop, say — is invisible to exhaustiveness
+/// checking, so a third backend would compile, run, and quietly emit no
+/// readiness or commit kernels at all. Inside the match, adding a backend is a
+/// compile error here rather than a missing kernel in a driver.
 pub fn emit_program(
     backend: Backend,
     stages: &[CompiledStage],
@@ -207,7 +222,10 @@ fn emit_metal_stage(stage: &CompiledStage, stage_index: usize, out: &mut Vec<Emi
         let emitted = if fused_supported {
             crate::metal::emit_fused_region(&entry, stage, region)
         } else {
-            Err("fused region exceeds the 12-channel direct-binding limit".to_string())
+            Err(EmitError::ChannelLimitExceeded {
+                emitter: EmitterKind::MetalFused,
+                limit: crate::metal::METAL_M2_MAX_FUSED_CHANNELS,
+            })
         };
         out.push(EmittedKernel::new(
             PIE_KERNEL_FUSED,

@@ -1142,7 +1142,11 @@ mod tests {
             cells: Vec<Arc<Mutex<ChannelCell>>>,
         ) -> ForwardPass {
             let program = registered();
-            let host_shadow = crate::pipeline::fire::shadow::HostShadow::new(&program.bound, &[]);
+            let host_shadow = crate::pipeline::fire::shadow::HostShadow::new(
+                &program.bound,
+                program.shadow_plan(),
+                &[],
+            );
             let bound = BoundForwardPass {
                 instance: Instance {
                     program,

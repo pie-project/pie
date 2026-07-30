@@ -99,17 +99,20 @@ void copy_extent(
 
 }  // namespace
 
-BoundDecode stage_decode_storage(
+// Stage every tensor the plan names into the heap, keyed by its runtime name.
+//
+// Driven entirely by the LoadPlan -- which the model contract authors -- and so
+// by nothing family-specific. Both families' staging calls this rather than
+// carrying a copy: the transforms (dequantize, fill, band copies) are where a
+// second implementation would quietly diverge, and a checkpoint staged two
+// slightly different ways is a model that works for one family and produces
+// plausible wrong tokens for the other.
+StagedWeights stage_plan_weights(
     RawMetalContext& ctx,
     const pie_loader::CheckpointSource& view,
     const pie_loader::LoadPlan& load,
-    const DecodeGeometry& g,
-    const HeapPlan& heap_plan) {
-    BoundDecode b;
-    b.plan = heap_plan;
-    b.gdn.resize(g.n_layers);
-    b.kv.resize(g.n_layers);
-
+    std::size_t weights_bytes) {
+    StagedWeights b;
     // Backend and tile-map transforms are no longer re-checked: this driver
     // supplied both in the request it compiled from (`architecture.md` §9).
     const auto load_plan = load.view();
@@ -126,8 +129,7 @@ BoundDecode stage_decode_storage(
         }
     }
     b.weights_region = ctx.heap_alloc(
-        heap_plan.weights_bytes,
-        std::max<std::size_t>(1, load.preferred_alignment()));
+        weights_bytes, std::max<std::size_t>(1, load.preferred_alignment()));
     if (!b.weights_region.valid()) {
         throw std::runtime_error("heap_alloc failed for program-owned weights region");
     }
@@ -231,10 +233,31 @@ BoundDecode stage_decode_storage(
         }
     }
 
+    return b;
+}
+
+BoundDecode stage_decode_storage(
+    RawMetalContext& ctx,
+    const pie_loader::CheckpointSource& view,
+    const pie_loader::LoadPlan& load,
+    const DecodeGeometry& g,
+    const HeapPlan& heap_plan) {
+    BoundDecode b;
+    b.plan = heap_plan;
+    b.gdn.resize(g.n_layers);
+    b.kv.resize(g.n_layers);
+
+    {
+        StagedWeights staged =
+            stage_plan_weights(ctx, view, load, heap_plan.weights_bytes);
+        b.weights_region = staged.weights_region;
+        b.weights = std::move(staged.weights);
+    }
+
     // ── KV region: k/v pages per full-attn layer (append-only, I4) ──
     const size_t kv_one = heap_plan.kv_per_layer / 2;  // bytes for k (== v)
     for (int L = 0; L < g.n_layers; ++L) {
-        if (!DecodeGeometry::is_full_attn(L)) continue;
+        if (!g.is_full_attn(L)) continue;
         const size_t initial = std::min(kv_one, size_t{2} << 20);
         b.kv[L].k_pages = alloc_zeroed(ctx, kv_one, true, initial);
         b.kv[L].v_pages = alloc_zeroed(ctx, kv_one, true, initial);
@@ -249,7 +272,7 @@ BoundDecode stage_decode_storage(
     const size_t recur_state = size_t(g.gdn_v_heads) * g.gdn_v_dim * g.gdn_k_dim * 4 * slots;
     const size_t conv_bias = size_t(g.gdn_conv_dim) * 2;                       // bf16, all-zero
     for (int L = 0; L < g.n_layers; ++L) {
-        if (DecodeGeometry::is_full_attn(L)) continue;
+        if (g.is_full_attn(L)) continue;
         const size_t conv_initial =
             std::min(conv_state, size_t(g.gdn_conv_dim) * g.gdn_conv_k * 4);
         const size_t recur_initial =
@@ -394,6 +417,68 @@ std::vector<WeightBind> weight_binds(
             prefix + "linear_attn.in_proj_b.weight",
         });
         break;
+    // ── Gemma 4 ──
+    // The norm sandwich: four per layer, so three of them need their own kind.
+    case Kernel::G4AttnPostNorm:
+        weights.push_back({(std::uint8_t)bind::Rms::W, prefix + "post_attention_layernorm.weight"});
+        break;
+    case Kernel::G4FfnPreNorm:
+        weights.push_back({(std::uint8_t)bind::Rms::W, prefix + "pre_feedforward_layernorm.weight"});
+        break;
+    case Kernel::G4FfnPostNorm:
+        weights.push_back({(std::uint8_t)bind::Rms::W, prefix + "post_feedforward_layernorm.weight"});
+        break;
+    case Kernel::G4LayerScalar:
+        weights.push_back({(std::uint8_t)bind::LayerScalar::Scalar, prefix + "layer_scalar"});
+        break;
+    case Kernel::G4PleNorm:
+        weights.push_back(
+            {(std::uint8_t)bind::Rms::W, prefix + "post_per_layer_input_norm.weight"});
+        break;
+    // The fused norm+residual kinds. `bind::RmsResidual` keeps bind::Rms's
+    // prefix, so the norm weight lands at the same slot; the scaled variant also
+    // carries the learned gain the separate `LayerScalar` dispatch used to.
+    case Kernel::G4AttnPostResidual:
+        weights.push_back(
+            {(std::uint8_t)bind::RmsResidual::W, prefix + "post_attention_layernorm.weight"});
+        break;
+    case Kernel::G4FfnPostResidual:
+        weights.push_back(
+            {(std::uint8_t)bind::RmsResidual::W, prefix + "post_feedforward_layernorm.weight"});
+        break;
+    case Kernel::G4PleResidualScaled:
+        weights.push_back(
+            {(std::uint8_t)bind::RmsResidual::W, prefix + "post_per_layer_input_norm.weight"});
+        weights.push_back({(std::uint8_t)bind::RmsResidual::Scalar, prefix + "layer_scalar"});
+        break;
+    case Kernel::G4PleProjNorm:
+        weights.push_back({(std::uint8_t)bind::Rms::W, "per_layer_projection_norm.weight"});
+        break;
+    // The PLE table is gathered exactly like the token embedding, and the three
+    // PLE projections are ordinary quantized matvecs.
+    case Kernel::G4PleTokenGather:
+        push_quant(weights, "embed_tokens_per_layer");
+        break;
+    case Kernel::G4PleProjGemv:
+        push_quant(weights, "per_layer_model_projection");
+        break;
+    case Kernel::G4PleGateGemv:
+        push_quant(weights, prefix + "per_layer_input_gate");
+        break;
+    case Kernel::G4PleProjLayerGemv:
+        push_quant(weights, prefix + "per_layer_projection");
+        break;
+    // Weightless: V-norm, both GeGLUs, the softcap, the sliding attention and
+    // the PLE residual all read activations only.
+    case Kernel::G4VNorm:
+    case Kernel::G4Geglu:
+    case Kernel::G4Softcap:
+    case Kernel::G4SdpaSliding:
+    case Kernel::G4PleCombine:
+    case Kernel::G4PleGeglu:
+    case Kernel::G4PleResidual:
+        break;
+
     case Kernel::GdnPrep:
     case Kernel::GdnPrepSlotted:
         weights.push_back({

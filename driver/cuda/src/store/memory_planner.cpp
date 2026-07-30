@@ -1,4 +1,6 @@
 #include "memory_planner.hpp"
+#include "../batch/planner_calibration.hpp"
+#include "planner_profile_cache.hpp"
 #include "recurrent_state_cache.hpp"
 #include "kv_cache.hpp"
 
@@ -9,8 +11,6 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
-#include <filesystem>
-#include <fstream>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -20,7 +20,6 @@
 #include <vector>
 
 #include <cuda_runtime.h>
-#include <nlohmann/json.hpp>
 
 #include "../batch/workspace.hpp"
 #include "../config.hpp"
@@ -267,56 +266,6 @@ int forced_prefill_tokens() {
     return tokens;
 }
 
-std::filesystem::path cuda_planner_profile_path() {
-    if (const char* home = std::getenv("HOME")) {
-        if (home[0] != '\0') {
-            return std::filesystem::path(home) / ".cache" / "pie" /
-                   "cuda_memory_profiles.json";
-        }
-    }
-    return {};
-}
-
-bool json_required_eq(const nlohmann::json& key,
-                      const char* name,
-                      const std::string& expected) {
-    auto it = key.find(name);
-    return it != key.end() && it->is_string() &&
-           it->get<std::string>() == expected;
-}
-
-bool json_required_eq(const nlohmann::json& key,
-                      const char* name,
-                      int expected) {
-    auto it = key.find(name);
-    return it != key.end() && it->is_number_integer() &&
-           it->get<int>() == expected;
-}
-
-bool planner_profile_key_matches(const nlohmann::json& key,
-                                 const cudaDeviceProp& prop,
-                                 const pie_cuda_driver::HfConfig& hf,
-                                 int tp_size,
-                                 const pie_cuda_driver::KvCacheFormat& kv_format) {
-    const auto kv_it = key.find("kv_cache_dtype");
-    const bool kv_matches =
-        (kv_it != key.end() && kv_it->is_string())
-            ? kv_it->get<std::string>() == kv_format.name
-            : kv_format.is_native_bf16();
-    return json_required_eq(key, "gpu_name", std::string(prop.name)) &&
-           json_required_eq(key, "compute_major", prop.major) &&
-           json_required_eq(key, "compute_minor", prop.minor) &&
-           json_required_eq(key, "sm_count", prop.multiProcessorCount) &&
-           kv_matches &&
-           json_required_eq(key, "tp_size", tp_size) &&
-           json_required_eq(key, "model_type", hf.model_type) &&
-           json_required_eq(key, "hidden_size", hf.hidden_size) &&
-           json_required_eq(key, "num_hidden_layers", hf.num_hidden_layers) &&
-           json_required_eq(key, "num_attention_heads", hf.num_attention_heads) &&
-           json_required_eq(key, "num_key_value_heads", hf.num_key_value_heads) &&
-           json_required_eq(key, "head_dim", hf.head_dim_kernel);
-}
-
 
 }  // namespace
 
@@ -431,11 +380,6 @@ CudaMemoryPlan plan_cuda_memory(
         prop.major >= 8 && prop.major < 12 &&
         prop.multiProcessorCount >= 100 &&
         hf.model_type == "qwen3" && hf.hidden_size == 4096;
-    const bool prefer_qwen3_small_ada_prefill_shape =
-        auto_profile && forced_prefill == 0 && tp_size == 1 &&
-        prop.major == 8 && prop.minor == 9 &&
-        prop.multiProcessorCount >= 100 &&
-        hf.model_type == "qwen3" && hf.hidden_size == 1024;
     // The same dense Qwen3-8B shape has a different TP2 knee on Ada/L40:
     // smaller page-16 KV and a ~5.5k token workspace reduce graph/arena
     // pressure enough to beat vLLM, while the generic 8k/6k candidates are
@@ -508,6 +452,8 @@ CudaMemoryPlan plan_cuda_memory(
         int decode_target = 0;
         int prefill_target = 0;
         double score = -std::numeric_limits<double>::infinity();
+        std::size_t arena_bytes = 0;
+        std::size_t kv_tokens = 0;
     };
     std::vector<Candidate> candidates;
 
@@ -868,7 +814,9 @@ CudaMemoryPlan plan_cuda_memory(
                 policy_profile,
                 score_decode_target,
                 score_prefill_target,
-                score});
+                score,
+                arena,
+                kv_tokens});
             }
         }
     }
@@ -880,77 +828,79 @@ CudaMemoryPlan plan_cuda_memory(
             std::to_string(budget / (1024 * 1024)) + " MiB");
     }
 
+    // A measured shape beats a scored one. `calibrate_memory_planner` times the
+    // real forward step across the ladder and records the winner here; when it
+    // has run for this exact (device, model, tp, kv format) we take its answer
+    // and skip the analytic score entirely. Fields the calibrator did not
+    // measure stay zero and match anything.
     bool selected_from_profile = false;
     auto best_it = candidates.end();
-    if (auto_profile) {
-        const auto path = cuda_planner_profile_path();
-        if (!path.empty() && std::filesystem::exists(path)) {
-            try {
-                std::ifstream in(path);
-                nlohmann::json root = nlohmann::json::parse(in);
-                const auto* entries =
-                    root.contains("entries") && root["entries"].is_array()
-                        ? &root["entries"]
-                        : nullptr;
-                if (entries != nullptr) {
-                    for (const auto& entry : *entries) {
-                        if (!entry.contains("key") || !entry.contains("plan")) {
-                            continue;
-                        }
-                        if (!planner_profile_key_matches(
-                                entry["key"], prop, hf, tp_size,
-                                kv_format)) {
-                            continue;
-                        }
-                        const auto& plan = entry["plan"];
-                        const std::string prof =
-                            plan.value("policy_profile", std::string{});
-                        const int page_size =
-                            plan.value("kv_page_size", 0);
-                        const int tokens =
-                            plan.value("max_forward_tokens", 0);
-                        const int requests =
-                            plan.value("max_forward_requests", 0);
-                        for (auto it = candidates.begin();
-                             it != candidates.end(); ++it) {
-                            if (!prof.empty() && it->policy_profile != prof) {
-                                continue;
-                            }
-                            if (page_size > 0 &&
-                                it->plan.kv_page_size != page_size) {
-                                continue;
-                            }
-                            if (tokens > 0 &&
-                                it->plan.max_workspace_tokens != tokens) {
-                                continue;
-                            }
-                            if (requests > 0 &&
-                                it->plan.max_requests != requests) {
-                                continue;
-                            }
-                            best_it = it;
-                            selected_from_profile = true;
-                            break;
-                        }
-                        if (selected_from_profile) break;
-                    }
+    // Two guards beyond `auto_profile`, matching the fingerprint overrides
+    // below:
+    //   * `forced_prefill == 0` — an explicit `PIE_CUDA_PREFILL_TOKENS` is an
+    //     operator instruction. Every other override defers to it; the cache
+    //     must too, or a stale file silently discards what was asked for.
+    //   * not calibrating — the sweep can only explore up to the arena this
+    //     plan builds. Seeding a calibration run from its OWN previous answer
+    //     makes the budget a one-way ratchet: once it lowers, no later sweep
+    //     can look above the lowered value. A calibration run therefore plans
+    //     from the rule path, so every sweep starts from the same ceiling.
+    const bool use_profile_cache =
+        auto_profile && forced_prefill == 0 && !planner_calibration_requested();
+    if (use_profile_cache) {
+        std::string cache_error;
+        const auto measured =
+            planner_profile_cache_lookup(
+                make_planner_profile_key(prop, hf, tp_size, kv_format),
+                &cache_error);
+        if (!cache_error.empty()) {
+            std::cerr << "[pie-driver-cuda] memory planner: ignored profile "
+                      << "cache " << planner_profile_cache_path().string()
+                      << ": " << cache_error << "\n";
+        }
+        if (measured.has_value()) {
+            for (auto it = candidates.begin(); it != candidates.end(); ++it) {                if (!measured->policy_profile.empty() &&
+                    it->policy_profile != measured->policy_profile) {
+                    continue;
                 }
-            } catch (const std::exception& e) {
-                if (verbose) {
-                    std::cerr << "[pie-driver-cuda] memory planner: ignored "
-                              << "profile cache "
-                              << path.string() << ": " << e.what() << "\n";
+                if (measured->kv_page_size > 0 &&
+                    it->plan.kv_page_size != measured->kv_page_size) {
+                    continue;
                 }
+                if (measured->max_forward_tokens > 0 &&
+                    it->plan.max_workspace_tokens !=
+                        measured->max_forward_tokens) {
+                    continue;
+                }
+                if (measured->max_forward_requests > 0 &&
+                    it->plan.max_requests != measured->max_forward_requests) {
+                    continue;
+                }
+                // The cache pins only what was measured; among the candidates
+                // that satisfy it the score still decides, so a sweep over one
+                // axis does not silently freeze the others.
+                if (!selected_from_profile || best_it->score < it->score) {
+                    best_it = it;
+                    selected_from_profile = true;
+                }
+            }
+            if (!selected_from_profile) {
+                // A measured entry that lands on no feasible candidate is the
+                // worst failure mode this cache has: it looks exactly like no
+                // cache at all. Say so rather than falling through silently.
+                std::cerr << "[pie-driver-cuda] memory planner: profile cache "
+                          << "pins max_forward_tokens="
+                          << measured->max_forward_tokens
+                          << " but no candidate layout matches it; falling "
+                          << "back to the scored rule. Delete "
+                          << planner_profile_cache_path().string()
+                          << " to re-calibrate.\n";
             }
         }
     }
     if (best_it == candidates.end()) {
-        if (prefer_qwen3_8b_prefill_shape ||
-            prefer_qwen3_small_ada_prefill_shape) {
-            const int preferred_tokens =
-                prefer_qwen3_small_ada_prefill_shape
-                    ? 8192
-                    : prefill_cap;
+        if (prefer_qwen3_8b_prefill_shape) {
+            const int preferred_tokens = prefill_cap;
             auto preferred_it = candidates.end();
             for (auto it = candidates.begin(); it != candidates.end(); ++it) {
                 if (it->plan.max_workspace_tokens != preferred_tokens ||
@@ -974,6 +924,48 @@ CudaMemoryPlan plan_cuda_memory(
             return a.score < b.score;
         });
     }
+    // Planner introspection: the selected plan alone cannot tell you WHY it
+    // won, nor what the score-ranked runner-up was. Both are needed to judge
+    // whether an override is load-bearing or dead weight.
+    if (const char* dump = std::getenv("PIE_CUDA_PLANNER_DUMP")) {
+        const int want = std::max(1, std::atoi(dump));
+        std::vector<const Candidate*> ranked;
+        ranked.reserve(candidates.size());
+        for (const auto& c : candidates) ranked.push_back(&c);
+        std::stable_sort(ranked.begin(), ranked.end(),
+                         [](const Candidate* a, const Candidate* b) {
+                             return a->score > b->score;
+                         });
+        std::cerr << "[pie-driver-cuda] planner candidates: "
+                  << candidates.size() << " feasible, top "
+                  << std::min<std::size_t>(ranked.size(),
+                                           static_cast<std::size_t>(want))
+                  << " by score (selector="
+                  << (selected_from_profile ? "profiled" : "rule") << ")\n";
+        for (std::size_t i = 0;
+             i < ranked.size() && i < static_cast<std::size_t>(want); ++i) {
+            const Candidate* c = ranked[i];
+            std::cerr << "[pie-driver-cuda]   #" << (i + 1)
+                      << (c == &*best_it ? " *" : "  ")
+                      << " score=" << c->score
+                      << " profile=" << c->policy_profile
+                      << " page=" << c->plan.kv_page_size
+                      << " N=" << c->plan.max_workspace_tokens
+                      << " R=" << c->plan.max_requests
+                      << " arena=" << (c->arena_bytes / (1024 * 1024))
+                      << " MiB persist="
+                      << (c->plan.persistent_input_bytes / (1024 * 1024))
+                      << " MiB kv_tok=" << c->kv_tokens << "\n";
+        }
+        if (&*best_it != ranked.front()) {
+            std::cerr << "[pie-driver-cuda]   selected is NOT the top-scoring "
+                      << "candidate: an override moved it (N="
+                      << best_it->plan.max_workspace_tokens
+                      << " R=" << best_it->plan.max_requests
+                      << " score=" << best_it->score << ")\n";
+        }
+    }
+
     CudaMemoryPlan best_plan = tp_min_plan(cfg, best_it->plan);
     const std::string best_policy_profile = best_it->policy_profile;
     const int selected_decode_target = best_it->decode_target;

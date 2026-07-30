@@ -225,17 +225,22 @@ async fn materialize_channel(
     };
     let mut settle_ready_take = true;
     let mut woke_us = 0u64;
+    let take_wall = crate::scheduler::phase_start();
     loop {
+        let poll_cpu = crate::scheduler::phase_start();
         let state = accessor
             .with(|mut access| poll_channel(access.get(), &this, mode, false, settle_ready_take))?;
+        crate::scheduler::cpu_phase_add(crate::scheduler::CpuPhase::ChannelPoll, poll_cpu);
         let state = match state {
             ChannelPoll::Pending {
                 fires: Some(fires), ..
             } => {
                 let _finalize_guard = fires.finalize_guard().await;
+                let poll_cpu = crate::scheduler::phase_start();
                 let state = accessor.with(|mut access| {
                     poll_channel(access.get(), &this, mode, true, settle_ready_take)
                 })?;
+                crate::scheduler::cpu_phase_add(crate::scheduler::CpuPhase::ChannelPoll, poll_cpu);
                 match state {
                     ChannelPoll::Finalize(op) => {
                         if let Some(pid) = trace_pid {
@@ -257,6 +262,10 @@ async fn materialize_channel(
         match state {
             ChannelPoll::Ready(value) => {
                 accessor.with(|mut access| access.get().note_take_returned(woke_us));
+                crate::scheduler::wait_phase_add(
+                    crate::scheduler::WaitPhase::ChannelTake,
+                    take_wall,
+                );
                 return Ok(value);
             }
             ChannelPoll::Finalize(_) => unreachable!("finalizer gate required before FIFO pop"),
@@ -264,11 +273,16 @@ async fn materialize_channel(
                 settle_ready_take = true;
                 // A plain await: an idle channel wait holds no pooled
                 // state, so the planner can evict around it freely.
+                let progress_wall = crate::scheduler::phase_start();
                 if let Err(error) =
                     crate::pipeline::fire::await_channel_progress(&cell, fires.as_ref()).await
                 {
                     return Ok(Err(error));
                 }
+                crate::scheduler::wait_phase_add(
+                    crate::scheduler::WaitPhase::ChannelProgress,
+                    progress_wall,
+                );
                 if let Some(pid) = trace_pid {
                     crate::planner::trace_mark!("build", pid, "rx-wake");
                 }
@@ -787,7 +801,7 @@ impl ProcessCtx {
                 None => None,
             };
 
-            let taint = pie_eval::pareval::geometry_taint(&prog.bound);
+            let taint = prog.geometry_taint();
             let decode_envelope = if devgeo.is_some() || taint.host_derivable() {
                 None
             } else {
@@ -1030,6 +1044,7 @@ impl ProcessCtx {
             });
             let host_shadow = crate::pipeline::fire::shadow::HostShadow::new(
                 &instance.program.bound,
+                instance.program.shadow_plan(),
                 &instance.seeds,
             );
             let bound = BoundForwardPass {

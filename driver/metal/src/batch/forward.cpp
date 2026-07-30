@@ -17,7 +17,11 @@
 
 #if defined(__APPLE__)
 #include "batch_schedule.hpp"
+#include "model/contract.hpp"
+#include "model/gemma4/decode_step.hpp"
+#include "model/gemma4/geometry.hpp"
 #include "decode_consts.hpp"
+#include "decode_dispatch_mb.hpp"
 #include "decode_psos.hpp"
 #include "decode_step.hpp"
 #include "decode_step_mb.hpp"
@@ -525,6 +529,22 @@ struct MetalExecutor::Impl {
     std::uint64_t paged_bind_generation_ = 0;
     SlotHandle ptir_logits_{};
     SlotHandle ptir_logits_copy_params_{};
+    // The prefill's uniform scratch row pitch, in elements, for the batched
+    // projection (`affine_qmm_t_strided` reads it at buffer 8).
+    SlotHandle prefill_row_stride_{};
+    // One scan-length buffer per prompt row.  A grouped prefill carries several
+    // requests, each with its own scan length, and the row's argument table is
+    // what selects the segment -- so the length has to be per row too.
+    std::vector<SlotHandle> prefill_scan_rows_{};
+    // Split-K partials, shared by every projection on that path: each is
+    // serialized behind its own reduce, so one buffer serves all of them.
+    SlotHandle splitk_partial_{};
+    std::vector<SlotHandle> splitk_split_{};
+    std::vector<SlotHandle> splitk_stride_{};
+    // A slot whose conv history was last written by the prefill's ping-pong may
+    // hold it in ConvStateOut; the paged decode writes in place and always
+    // leaves it in ConvState, so only the handover needs a copy.
+    std::vector<std::uint8_t> conv_in_out_{};
     Pso ptir_logits_copy_pso_{};
     std::uint32_t ptir_logits_capacity_rows_ = 0;
     std::uint32_t ptir_logits_next_row_ = 0;
@@ -617,9 +637,14 @@ struct MetalExecutor::Impl {
     std::uint32_t argmax() const;
     bool ensure_ptir_logits_rows(std::uint32_t rows, std::string* error);
     std::uint32_t reserve_ptir_logits_rows(std::uint32_t rows);
-    bool stage_ptir_logits_row(
-        std::uint32_t source_row,
-        std::uint32_t destination_row,
+    // Rows the forward should copy into the PTIR staging buffer as part of its
+    // OWN command buffer. Staging used to be a second `run_step` -- a whole
+    // command-buffer submit and completion wait per token, for a copy that is
+    // ~1 us of bandwidth. Set before `run_batch_step`, consumed by its encoder.
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> pending_logits_stage_{};
+    bool encode_logits_stage(StepEncoder& encoder, std::string* error);
+    bool stage_ptir_logits_rows(
+        const std::vector<std::pair<std::uint32_t, std::uint32_t>>& rows,
         std::string* error);
     void attach_ptir_logits_view(LogitsOut& output) const;
 
@@ -645,6 +670,13 @@ struct PtirLogitsCopyParams {
 };
 
 inline constexpr int kPtirLogitsCopyOrdinal = 90000;
+// Rows one staging dispatch can carry. Bounded by the paged forward's row
+// capacity, which is what `LogitsOut::rows` is drawn from.
+inline constexpr std::size_t kPtirLogitsCopyMaxRows = kPagedMaxForwardTokensCeiling;
+// The prefill's ordinal blocks and PTIR's allocations share one argument-table
+// namespace, and the ceiling above is what decides where the first ends.
+static_assert(int(kPagedMaxForwardTokensCeiling) <= kPrefillOrdinalMaxRows,
+              "prefill rows would claim ordinals PTIR hands out");
 
 void write_u32(const SlotHandle& s, uint32_t v) {
     std::memcpy(s.contents(), &v, sizeof(v));
@@ -762,7 +794,18 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
         "ptir_copy_logits_bf16",
         &load_err);
     ptir_logits_copy_params_ =
-        ctx_->create_standalone_buffer(sizeof(PtirLogitsCopyParams));
+        ctx_->create_standalone_buffer(
+            sizeof(PtirLogitsCopyParams) * kPtirLogitsCopyMaxRows);
+    prefill_row_stride_ = ctx_->create_standalone_buffer(sizeof(std::int32_t));
+    if (prefill_row_stride_.valid()) {
+        *static_cast<std::int32_t*>(prefill_row_stride_.contents()) =
+            static_cast<std::int32_t>(scratch_widest_elems(g_));
+    }
+    prefill_scan_rows_.clear();
+    // Widest projection row x the widest batch x the largest split.
+    splitk_partial_ = ctx_->create_standalone_buffer(
+        sizeof(std::uint16_t) * std::size_t(pie::metal::kQmmSplitMaxSplits) *
+        std::size_t(kPagedMaxForwardRequests) * std::size_t(pie::metal::kQmmSplitMaxOut));
     if (!ptir_logits_copy_pso_.valid() ||
         !ptir_logits_copy_params_.valid() ||
         !ensure_ptir_logits_rows(1, &load_err)) {
@@ -1022,7 +1065,7 @@ bool MetalExecutor::Impl::setup_kv_pool(uint32_t total_pages, uint32_t page_size
     }
     int n_full = 0;
     for (int L = 0; L < g_.n_layers; ++L) {
-        if (DecodeGeometry::is_full_attn(L)) ++n_full;
+        if (g_.is_full_attn(L)) ++n_full;
     }
     if (n_full == 0) {
         if (err) {
@@ -1036,7 +1079,7 @@ bool MetalExecutor::Impl::setup_kv_pool(uint32_t total_pages, uint32_t page_size
     KvPagePool pool;
     pool.layers.resize(size_t(g_.n_layers));
     for (int L = 0; L < g_.n_layers; ++L) {
-        if (!DecodeGeometry::is_full_attn(L)) continue;
+        if (!g_.is_full_attn(L)) continue;
         const size_t initial = std::min(layer_bytes, size_t{2} << 20);
         pool.layers[size_t(L)].k_pages =
             ctx_->create_elastic_buffer(layer_bytes, initial);
@@ -1093,7 +1136,7 @@ bool MetalExecutor::Impl::bind_paged_dag(std::string* err) {
         std::vector<SlotHandle> k_pages(size_t(g_.n_layers));
         std::vector<SlotHandle> v_pages(size_t(g_.n_layers));
         for (int L = 0; L < g_.n_layers; ++L) {
-            if (!DecodeGeometry::is_full_attn(L)) continue;
+            if (!g_.is_full_attn(L)) continue;
             k_pages[size_t(L)] = kv_pool_.layers[size_t(L)].k_pages;
             v_pages[size_t(L)] = kv_pool_.layers[size_t(L)].v_pages;
         }
@@ -1111,10 +1154,80 @@ bool MetalExecutor::Impl::bind_paged_dag(std::string* err) {
         if (!mb_bound_) {
             bind_scratch(*ctx_, mb_dag_, mb_sched_, pool_.data(), int(pool_.size()));
             bind_decode_consts(*ctx_, mb_dag_, g_, max_ctx_, gdn_prep_);
+            // Decode writes the shifted conv history straight back over the one
+            // it read.  Safe because each channel is read and written by the
+            // same thread, in that order, and prep and recurrent touch disjoint
+            // channels -- which saves copying every slot's whole conv slab back
+            // on the host after every single token.
+            alias_decode_conv_state_out(*ctx_, b_, mb_dag_);
+            // Split-K binds: the partials buffer plus this dispatch's own split
+            // count and slice stride, which depend on its shape.
+            splitk_split_.clear();
+            splitk_stride_.clear();
+            for (const Dispatch& d : mb_dag_) {
+                if (d.qmm_split <= 1 || !splitk_partial_.valid()) continue;
+                SlotHandle sp = ctx_->create_standalone_buffer(sizeof(std::int32_t));
+                SlotHandle st = ctx_->create_standalone_buffer(sizeof(std::int32_t));
+                if (!sp.valid() || !st.valid()) continue;
+                *static_cast<std::int32_t*>(sp.contents()) = d.qmm_split;
+                *static_cast<std::int32_t*>(st.contents()) =
+                    std::int32_t(qmv_out_size(d.kind, g_)) *
+                    std::int32_t(int(d.grid.y / 2u) * d.qmm_bm);
+                ctx_->arg_bind_ordinal(d.ordinal, 8, splitk_partial_);
+                ctx_->arg_bind_ordinal(d.ordinal, 9, sp);
+                ctx_->arg_bind_ordinal(d.ordinal, 10, st);
+                splitk_split_.push_back(sp);
+                splitk_stride_.push_back(st);
+            }
+            prefill_scan_rows_.assign(prefill_dags_.size(), SlotHandle{});
             for (size_t t = 0; t < prefill_dags_.size(); ++t) {
                 bind_scratch(*ctx_, prefill_dags_[t], prefill_sched_, pool_.data(),
                              int(pool_.size()), t * prefill_scratch_row);
                 bind_decode_consts(*ctx_, prefill_dags_[t], g_, max_ctx_, gdn_prep_);
+                // A scan launched off row t's argument table reads its own
+                // length, so every row carries one.
+                prefill_scan_rows_[t] = ctx_->create_standalone_buffer(sizeof(std::int32_t));
+                if (!prefill_scan_rows_[t].valid() || !prefill_row_stride_.valid()) continue;
+                for (const Dispatch& d : prefill_dags_[t]) {
+                    if (d.kind == Kernel::GdnPrepSlotted) {
+                        ctx_->arg_bind_ordinal(d.ordinal, 14, prefill_row_stride_);
+                        ctx_->arg_bind_ordinal(d.ordinal, 15, prefill_scan_rows_[t]);
+                    } else if (d.kind == Kernel::GdnCoreSlotted) {
+                        ctx_->arg_bind_ordinal(d.ordinal, 12, prefill_row_stride_);
+                        ctx_->arg_bind_ordinal(d.ordinal, 13, prefill_scan_rows_[t]);
+                    }
+                }
+            }
+            // The batched projection runs off token 0's argument tables -- they
+            // already point at row 0 of every scratch tensor -- and walks the
+            // rest of the prompt with this pitch.
+            if (prefill_row_stride_.valid() && !prefill_dags_.empty()) {
+                for (const Dispatch& d : prefill_dags_[0]) {
+                    if (qmv_out_size(d.kind, g_) != 0) {
+                        ctx_->arg_bind_ordinal(d.ordinal, 8, prefill_row_stride_);
+                        continue;
+                    }
+                    // The row-blocked elementwise/norm kernels take the same pitch,
+                    // at whichever index follows their own signature.
+                    switch (d.kind) {
+                        case Kernel::Rms:
+                        case Kernel::FfnRms:
+                        case Kernel::FinalRms:
+                        case Kernel::SiluMul:
+                            ctx_->arg_bind_ordinal(d.ordinal, 4, prefill_row_stride_);
+                            break;
+                        case Kernel::GatedRms:
+                            ctx_->arg_bind_ordinal(d.ordinal, 5, prefill_row_stride_);
+                            break;
+                        case Kernel::GdnInA:
+                        case Kernel::GdnInB:
+                            ctx_->arg_bind_ordinal(d.ordinal, 5, prefill_row_stride_);
+                            break;
+
+                        default:
+                            break;
+                    }
+                }
             }
             mb_bound_ = true;
         }
@@ -1162,7 +1275,7 @@ bool MetalExecutor::Impl::copy_kv_pages(const std::vector<uint32_t>& src_pages,
     // independent; the caller sequences non-conflicting moves, or issues them as
     // separate calls when a true swap/rotate is needed).
     for (int L = 0; L < g_.n_layers; ++L) {
-        if (!DecodeGeometry::is_full_attn(L)) continue;
+        if (!g_.is_full_attn(L)) continue;
         const auto& lp = kv_pool_.layers[size_t(L)];
         for (size_t i = 0; i < src_pages.size(); ++i) {
             const size_t src_off = size_t(src_pages[i]) * page_bytes;
@@ -1212,7 +1325,7 @@ bool MetalExecutor::Impl::copy_kv_cells(const std::vector<KvMoveCell>& cells, st
     const size_t row_bytes = kv_pool_row_bytes(g_);
     const size_t page_bytes = size_t(kv_pool_.page_size) * row_bytes;
     for (int L = 0; L < g_.n_layers; ++L) {
-        if (!DecodeGeometry::is_full_attn(L)) continue;
+        if (!g_.is_full_attn(L)) continue;
         const auto& lp = kv_pool_.layers[size_t(L)];
         for (const auto& c : cells) {
             const size_t src_off = size_t(c.src_page_id) * page_bytes +
@@ -1274,7 +1387,7 @@ bool MetalExecutor::Impl::resize_kv_pool(uint32_t new_total_pages, bool unmapped
     const size_t committed_bytes =
         size_t(new_total_pages) * size_t(kv_pool_.page_size) * row_bytes;
     for (int L = 0; L < g_.n_layers; ++L) {
-        if (!DecodeGeometry::is_full_attn(L)) continue;
+        if (!g_.is_full_attn(L)) continue;
         auto& layer = kv_pool_.layers[size_t(L)];
         if (!ctx_->ensure_elastic_buffer(layer.k_pages, committed_bytes) ||
             !ctx_->ensure_elastic_buffer(layer.v_pages, committed_bytes)) {
@@ -1419,9 +1532,19 @@ StepTiming MetalExecutor::Impl::step(
     return t;
 }
 
+namespace {
+// The step meter's `gap` covers everything between one forward's encode and the
+// next's, and `run_batch_step` does a lane-wide preamble before it ever reaches
+// that point.  These two marks split the gap into the caller's share
+// (`forward_batch` composing the batch) and this function's own, which is what
+// separated "the engine is late" from "the driver is busy" -- it is the driver.
+std::chrono::steady_clock::time_point g_forward_batch_t0{};
+}  // namespace
+
 bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const BatchStepInputs& in,
                                      std::string* err,
                                      const std::vector<PtirCommandCallbacks>* ptir) {
+    const auto fn_t0 = std::chrono::steady_clock::now();
     auto fail = [&](const std::string& why) {
         if (err) *err = "MetalExecutor::Impl::run_batch_step: " + why;
         return false;
@@ -1553,7 +1676,24 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
         seq_len[size_t(t)] = schedule.spans[schedule.req_of_token[size_t(t)]].seqlen;
     copy_to(IoSlot::SeqLen, seq_len);
 
-    if (!schedule.is_pure_decode) return run_prefill_step(schedule, in, err, ptir);
+    const auto step_t0 = std::chrono::steady_clock::now();
+    if (!schedule.is_pure_decode) {
+        if (std::getenv("PIE_METAL_PREFILL_TRACE") == nullptr)
+            return run_prefill_step(schedule, in, err, ptir);
+        // Whether prompts are spread out in time or arriving together and just
+        // not being grouped is the difference between a scheduler problem and a
+        // budget one, and only the arrival pattern separates them.
+        using clock = std::chrono::steady_clock;
+        static const auto t_origin = clock::now();
+        const auto t0 = clock::now();
+        const bool ok = run_prefill_step(schedule, in, err, ptir);
+        const auto t1 = clock::now();
+        std::fprintf(
+            stderr, "[pf] at=%.1f ms N=%d R=%d took=%.1f ms\n",
+            std::chrono::duration<double, std::milli>(t0 - t_origin).count(), schedule.N,
+            schedule.R, std::chrono::duration<double, std::milli>(t1 - t0).count());
+        return ok;
+    }
 
     std::vector<uint32_t> active_slots;
     active_slots.reserve(size_t(schedule.R));
@@ -1562,11 +1702,14 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
         if (std::find(active_slots.begin(), active_slots.end(), sp.rs_slot) == active_slots.end())
             active_slots.push_back(sp.rs_slot);
     }
-    // The paged kernels always read ConvState and write ConvStateOut.  Normalize
-    // slots last touched by the M=1 ping-pong path before dispatch, then fold the
-    // completed result back into ConvState for the next paged fire.
+    // The paged decode shifts the conv history in place -- each channel of each
+    // slot is read by exactly one thread before that same thread writes it, and
+    // a pure-decode fire gives every request its own slot -- so there is nothing
+    // to fold back afterwards.  The prefill still ping-pongs per prompt token,
+    // so a slot handed over mid-parity is copied once, here.
     for (uint32_t slot : active_slots) {
-        if ((step_count_for(slot) & 1) == 0) continue;
+        if (slot >= conv_in_out_.size() || conv_in_out_[slot] == 0) continue;
+        conv_in_out_[slot] = 0;
         const size_t off = size_t(slot) * g_.gdn_conv_stride_bytes();
         // copy C -> A (different handles, same offset). A full-attention layer
         // has no GDN slab; skip it exactly as the commit below does.
@@ -1581,6 +1724,11 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
         }
     }
 
+    // Alternate the two arms fire by fire so both see the same machine.
+    static bool ab_flip = false;
+    if (ab_enabled()) ab_set_arm(ab_flip = !ab_flip);
+    std::string stage_err;
+    bool stage_failed = false;
     const std::vector<Dispatch> fire_dag =
         build_decode_dag_mb(g_, schedule.N, kMultiBatchOrdinalBase, fuse_residual_, gdn_prep_);
     const StepTiming timing = ctx_->run_step([&](StepEncoder& se) {
@@ -1593,42 +1741,74 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
             for (const auto& callbacks : *ptir)
                 if (callbacks.post_forward) callbacks.post_forward(se);
         }
+        if (!encode_logits_stage(se, &stage_err)) stage_failed = true;
     });
     if (!timing.succeeded())
         return fail("Metal command timed out before its completion fence");
-
-    for (uint32_t slot : active_slots) {
-        const size_t off = size_t(slot) * g_.gdn_conv_stride_bytes();
-        for (std::size_t layer = 0; layer < b_.gdn.size(); ++layer) {
-            auto& gs = b_.gdn[layer];
-            // A full-attention layer has no GDN slab: `build_bound_decode`
-            // leaves its entry default-constructed. Every other loop over
-            // `b_.gdn` treats that as a no-op (see `copy_state_slot`, whose
-            // comment says so); this one read it as a failure, so committing
-            // the ping-pong after a paged step died on the first full-attn
-            // layer of a hybrid.
-            if (!gs.conv_state.valid() && !gs.conv_state_out.valid()) continue;
-            if (!gs.conv_state.valid() ||
-                !ctx_->copy_buffer_range(
-                    gs.conv_state, off,
-                    gs.conv_state_out, off,
-                    g_.gdn_conv_stride_bytes())) {
-                return fail(
-                    "failed to commit GDN ping-pong state: layer " +
-                    std::to_string(layer) + " slot " + std::to_string(slot) +
-                    " offset " + std::to_string(off) + " stride " +
-                    std::to_string(g_.gdn_conv_stride_bytes()) +
-                    " conv_state " +
-                    (gs.conv_state.valid()
-                         ? "size " + std::to_string(gs.conv_state.size)
-                         : "<invalid>") +
-                    " conv_state_out " +
-                    (gs.conv_state_out.valid()
-                         ? "size " + std::to_string(gs.conv_state_out.size)
-                         : "<invalid>"));
-            }
+    if (stage_failed) return fail(stage_err);
+    // Step meter.  This machine is permanently contended (the agent process
+    // alone runs at ~250% CPU), so wall-clock A/B swings 3x and cannot decide
+    // anything; the command buffer's own execution time can.  Bucketed by lane
+    // count, since the cost is strongly batch-dependent.
+    //
+    // `wall` is this function's own span, so `host` = wall - gpu - encode is the
+    // driver's per-step CPU with nothing else folded in.  It reads 0.013ms at 32
+    // lanes, which is how the search for a throughput gap was steered away from
+    // the driver and into the engine.
+    if (std::getenv("PIE_METAL_GPU_METER") != nullptr) {
+        static double sum[2][33] = {};
+        static double wall[33] = {};
+        static double enc[33] = {};
+        // Gap between one step returning and the next arriving: the GPU is idle
+        // for all of it, and nothing inside this driver can see it otherwise.
+        static double gap[33] = {};
+        // Bucketed, because the mean cannot tell "every step round-trips" from
+        // "only frame boundaries do".
+        static int gap_lt1[33] = {};
+        static int gap_ge1[33] = {};
+        static double gap_max[33] = {};
+        static double pre_fb[33] = {};
+        static double pre_fn[33] = {};
+        static std::chrono::steady_clock::time_point last[33] = {};
+        static int n[2][33] = {};
+        const int lanes = schedule.N < 33 ? schedule.N : 32;
+        const int arm = ab_enabled() && ab_arm() ? 1 : 0;
+        sum[arm][lanes] += timing.gpu_exec_ms;
+        const auto now_tp = std::chrono::steady_clock::now();
+        wall[lanes] += std::chrono::duration<double, std::milli>(now_tp - step_t0).count();
+        enc[lanes] += timing.encode_ms;
+        pre_fb[lanes] +=
+            std::chrono::duration<double, std::milli>(fn_t0 - g_forward_batch_t0).count();
+        pre_fn[lanes] += std::chrono::duration<double, std::milli>(step_t0 - fn_t0).count();
+        if (last[lanes].time_since_epoch().count() != 0) {
+            const double g =
+                std::chrono::duration<double, std::milli>(step_t0 - last[lanes]).count();
+            gap[lanes] += g;
+            if (g < 1.0) ++gap_lt1[lanes]; else ++gap_ge1[lanes];
+            if (g > gap_max[lanes]) gap_max[lanes] = g;
+        }
+        last[lanes] = now_tp;
+        if (++n[arm][lanes] % 128 == 0) {
+            std::fprintf(stderr,
+                         "[gpu] lanes=%d A n=%d %.4f | B n=%d %.4f | wall %.4f enc %.4f "
+                         "host %.4f ms\n",
+                         lanes, n[0][lanes],
+                         n[0][lanes] ? sum[0][lanes] / n[0][lanes] : 0.0, n[1][lanes],
+                         n[1][lanes] ? sum[1][lanes] / n[1][lanes] : 0.0,
+                         wall[lanes] / (n[0][lanes] + n[1][lanes]),
+                         enc[lanes] / (n[0][lanes] + n[1][lanes]),
+                         (wall[lanes] - sum[0][lanes] - sum[1][lanes] - enc[lanes]) /
+                             (n[0][lanes] + n[1][lanes]));
+            std::fprintf(stderr,
+                         "[gap] lanes=%d mean %.4f ms  <1ms=%d  >=1ms=%d  max %.2f ms"
+                         "  | fb_pre %.4f  step_pre %.4f ms\n",
+                         lanes, gap[lanes] / (n[0][lanes] + n[1][lanes]), gap_lt1[lanes],
+                         gap_ge1[lanes], gap_max[lanes],
+                         pre_fb[lanes] / (n[0][lanes] + n[1][lanes]),
+                         pre_fn[lanes] / (n[0][lanes] + n[1][lanes]));
         }
     }
+
     for (uint32_t slot : schedule.slot_of_token) ++step_count_for(slot);
     return true;
 }
@@ -1659,15 +1839,49 @@ bool MetalExecutor::Impl::run_prefill_step(
         ++next_step[slot];
     }
 
+    // The GDN scan replaces the per-token chain only when the prompt is one
+    // request's (a shared recurrent slot) and its length is odd -- the conv
+    // ping-pong alternates per token, so an odd count leaves the history in the
+    // buffer token `scan_rows` reads, and an even prompt keeps one trailing
+    // token on the per-token path.
+    // One scan per request: the rows of a request are contiguous and share its
+    // recurrent slot, so each is its own independent recurrence.  The conv
+    // ping-pong alternates per row, so an odd scan length leaves the history
+    // where the segment's trailing per-token dispatch expects it -- an even
+    // segment keeps its last row on the per-token path.
+    std::vector<GdnScanSegment> gdn_scans;
+    if (prefill_row_stride_.valid() &&
+        prefill_scan_rows_.size() >= size_t(schedule.N)) {
+        int t = 0;
+        while (t < schedule.N) {
+            const uint32_t slot = schedule.slot_of_token[size_t(t)];
+            int end = t;
+            while (end < schedule.N && schedule.slot_of_token[size_t(end)] == slot) ++end;
+            const int len = end - t;
+            int rows = len % 2 == 1 ? len : len - 1;
+            if (rows >= 3) {
+                *static_cast<std::int32_t*>(prefill_scan_rows_[size_t(t)].contents()) =
+                    static_cast<std::int32_t>(rows);
+                gdn_scans.push_back(GdnScanSegment{t, rows});
+            }
+            t = end;
+        }
+    }
     // One command buffer, request-major token order.  Every complete layer DAG
     // ends in a barrier, so token t+1 observes token t's GDN and paged KV writes.
+    // Alternate the arms fire by fire so both see the same machine, exactly as
+    // the decode step does -- prefill fires are few, so without interleaving a
+    // single contended window decides the answer.
+    static bool prefill_ab_flip = false;
+    if (ab_enabled()) ab_set_arm(prefill_ab_flip = !prefill_ab_flip);
     const StepTiming timing = ctx_->run_step([&](StepEncoder& se) {
         if (ptir != nullptr) {
             for (const auto& callbacks : *ptir)
                 if (callbacks.pre_forward) callbacks.pre_forward(se);
         }
         encode_prefill_dags_mb(se, prefill_dags_, schedule.N, psos_, mb_psos_,
-                               force_barriers_, in.row_needs_logits);
+                               force_barriers_, in.row_needs_logits, &g_,
+                               int(prefill_dags_.size()), gdn_scans);
         if (ptir != nullptr) {
             for (const auto& callbacks : *ptir)
                 if (callbacks.post_forward) callbacks.post_forward(se);
@@ -1675,6 +1889,25 @@ bool MetalExecutor::Impl::run_prefill_step(
     });
     if (!timing.succeeded())
         return fail("Metal command timed out before its completion fence");
+    // Prefill meter.  Prefill fires are few and long, so the per-row cost is what
+    // compares across arms -- a raw total confuses "faster" with "shorter prompt".
+    if (std::getenv("PIE_METAL_GPU_METER") != nullptr) {
+        static double ms[2] = {};
+        static double rows[2] = {};
+        static double enc[2] = {};
+        static int n[2] = {};
+        const int arm = ab_enabled() && ab_arm() ? 1 : 0;
+        ms[arm] += timing.gpu_exec_ms;
+        enc[arm] += timing.encode_ms;
+        rows[arm] += double(schedule.N);
+        ++n[arm];
+        std::fprintf(stderr,
+                     "[prefill] A n=%d %.2f ms %.4f ms/row | B n=%d %.2f ms %.4f ms/row"
+                     " | enc A %.2f B %.2f ms\n",
+                     n[0], n[0] ? ms[0] / n[0] : 0.0, rows[0] > 0 ? ms[0] / rows[0] : 0.0,
+                     n[1], n[1] ? ms[1] / n[1] : 0.0, rows[1] > 0 ? ms[1] / rows[1] : 0.0,
+                     n[0] ? enc[0] / n[0] : 0.0, n[1] ? enc[1] / n[1] : 0.0);
+    }
     if (golden_taps_enabled()) {
         // Every prefill token walks its own copy of the DAG, and bind_scratch lays
         // token t's row at t * (widest * sizeof(bf16)) inside each pool slot — so one
@@ -1689,6 +1922,12 @@ bool MetalExecutor::Impl::run_prefill_step(
             schedule.N);
     }
     for (uint32_t slot : schedule.slot_of_token) ++step_count_for(slot);
+    // The prompt's last token decides which half of the ping-pong holds the
+    // history; the paged decode reads ConvState, so record an odd handover.
+    if (conv_in_out_.size() < size_t(g_.max_slots))
+        conv_in_out_.assign(size_t(g_.max_slots), 0);
+    for (uint32_t slot : schedule.slot_of_token)
+        conv_in_out_[slot] = std::uint8_t(step_count_for(slot) & 1);
     return true;
 }
 
@@ -1726,26 +1965,67 @@ std::uint32_t MetalExecutor::Impl::reserve_ptir_logits_rows(
     return base;
 }
 
-bool MetalExecutor::Impl::stage_ptir_logits_row(
-    std::uint32_t source_row,
-    std::uint32_t destination_row,
-    std::string* error) {
-    if (!ptir_logits_copy_pso_.valid() ||
-        destination_row >= ptir_logits_capacity_rows_) {
+bool MetalExecutor::Impl::encode_logits_stage(StepEncoder& encoder, std::string* error) {
+    const auto& rows = pending_logits_stage_;
+    if (rows.empty()) return true;
+    if (!ptir_logits_copy_pso_.valid() || rows.size() > kPtirLogitsCopyMaxRows) {
         if (error != nullptr) *error = "PTIR logits staging is not ready";
         return false;
     }
-    *static_cast<PtirLogitsCopyParams*>(ptir_logits_copy_params_.contents()) = {
-        .source_row = source_row,
-        .destination_row = destination_row,
-        .vocab = static_cast<std::uint32_t>(g_.vocab),
-        .reserved = 0,
-    };
+    auto* params =
+        static_cast<PtirLogitsCopyParams*>(ptir_logits_copy_params_.contents());
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+        if (rows[i].second >= ptir_logits_capacity_rows_) {
+            if (error != nullptr) *error = "PTIR logits staging is not ready";
+            return false;
+        }
+        params[i] = {
+            .source_row = rows[i].first,
+            .destination_row = rows[i].second,
+            .vocab = static_cast<std::uint32_t>(g_.vocab),
+            .reserved = 0,
+        };
+    }
+    // The copy reads the logits the forward just wrote.
+    encoder.barrier();
+    encoder.set_pso(ptir_logits_copy_pso_);
+    encoder.set_argtable_ordinal(kPtirLogitsCopyOrdinal);
+    encoder.dispatch(
+        Grid{static_cast<std::uint32_t>(g_.vocab),
+             static_cast<std::uint32_t>(rows.size()), 1},
+        Threadgroup{256, 1, 1});
+    return true;
+}
+
+bool MetalExecutor::Impl::stage_ptir_logits_rows(
+    const std::vector<std::pair<std::uint32_t, std::uint32_t>>& rows,
+    std::string* error) {
+    if (rows.empty()) return true;
+    if (!ptir_logits_copy_pso_.valid() ||
+        rows.size() > kPtirLogitsCopyMaxRows) {
+        if (error != nullptr) *error = "PTIR logits staging is not ready";
+        return false;
+    }
+    auto* params =
+        static_cast<PtirLogitsCopyParams*>(ptir_logits_copy_params_.contents());
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+        if (rows[i].second >= ptir_logits_capacity_rows_) {
+            if (error != nullptr) *error = "PTIR logits staging is not ready";
+            return false;
+        }
+        params[i] = {
+            .source_row = rows[i].first,
+            .destination_row = rows[i].second,
+            .vocab = static_cast<std::uint32_t>(g_.vocab),
+            .reserved = 0,
+        };
+    }
     const StepTiming timing = ctx_->run_step([&](StepEncoder& encoder) {
         encoder.set_pso(ptir_logits_copy_pso_);
         encoder.set_argtable_ordinal(kPtirLogitsCopyOrdinal);
         encoder.dispatch(
-            Grid{static_cast<std::uint32_t>(g_.vocab), 1, 1},
+            Grid{static_cast<std::uint32_t>(g_.vocab),
+                 static_cast<std::uint32_t>(rows.size()), 1},
             Threadgroup{256, 1, 1});
     });
     if (!timing.succeeded()) {
@@ -1884,14 +2164,49 @@ std::uint32_t MetalExecutor::argmax_native() const {
 }
 
 bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
-    // Phase 1a targets exactly the shipped qwen3.6 (GDN-hybrid) geometry —
-    // refuse truthfully rather than let caps advertise a forward that does
-    // not exist (metal_ptir_plan.md §5.5, §12 "Caps honesty").
-    if (!cfg.has_linear_attn) {
+    // Which family is this? Answered from the config's own `model_type`, so a
+    // checkpoint gets a diagnosis about ITSELF rather than about the family that
+    // happens to be wired up.
+    switch (model::model_family_of(cfg.model_type)) {
+    case model::ModelFamily::Qwen35:
+        break;
+    case model::ModelFamily::Gemma4: {
+        // Build the geometry before refusing, so the refusal is a fact about
+        // this checkpoint and not a guess. A shape this driver cannot schedule
+        // is reported as such; a shape it can is reported as the one thing that
+        // is genuinely missing, which is not the shape.
+        gemma4::Gemma4Geometry g4;
+        std::string why;
+        if (!gemma4::geometry_from_facts(cfg.gemma4, g4, &why)) {
+            if (err != nullptr) *err = why;
+            return false;
+        }
         if (err != nullptr) {
-            *err = "Metal PTIR forward requires the qwen3.6 (GDN-hybrid) checkpoint "
-                   "geometry in this increment (config '" +
-                   cfg.arch_name + "' has no linear-attention layers)";
+            // What is missing is now the executor, and nothing below it. The
+            // model computes: `gemma4_forward_test` runs this checkpoint through
+            // the decode DAG and gets mlx-lm's argmax at position 0 and again at
+            // position 7 with seven positions of KV behind it, every tap of all
+            // 35 layers above 0.9989 cosine. Both paths have pipelines, launch
+            // shapes, constants and binders; `gemma4_pso_test` proves the M>1
+            // side resolves and that every slot it reads is bound.
+            //
+            // `Impl` is what does not: its state is `DecodeGeometry`, qwen3.5's
+            // `Dispatch`, `ScratchSchedule` and `BoundDecode`, plus a KV pool
+            // and the linear-attention slots, and gemma4's types feed none of
+            // them.
+            *err = "Metal computes gemma4 (" +
+                   std::to_string(gemma4::build_gemma4_dag(g4).size()) +
+                   " dispatches over " + std::to_string(g4.n_layers) +
+                   " layers, decode and prefill, numerics verified against "
+                   "mlx-lm) but MetalExecutor::Impl is still qwen3.5-shaped, so "
+                   "there is nothing to run it through";
+        }
+        return false;
+    }
+    case model::ModelFamily::Unknown:
+        if (err != nullptr) {
+            *err = "Metal has no model family for config '" + cfg.arch_name +
+                   "' (model_type '" + cfg.model_type + "')";
         }
         return false;
     }
@@ -1923,7 +2238,7 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
     geom.max_requests = static_cast<int>(std::min(cfg.max_forward_requests,
                                                   kPagedMaxForwardRequests));
     geom.max_tokens = static_cast<int>(std::min(cfg.max_forward_tokens,
-                                                kPagedMaxForwardTokens));
+                                                kPagedMaxForwardTokensCeiling));
     geom.max_slots = std::max(geom.max_slots, geom.max_requests);
     geom.rope_theta = cfg.rope_theta;
     // rope_dims = 2*floor(0.5 * partial_rotary_factor * head_dim), matching
@@ -1937,15 +2252,12 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
     geom.total_pages = static_cast<int>(cfg.total_pages);
     geom.paged_kv_enabled = cfg.total_pages > 0 && cfg.kv_page_size > 0 &&
                             geom.max_tokens > 0 && geom.max_requests > 0;
-    if (cfg.vocab_size != 0 &&
-        cfg.vocab_size != static_cast<std::uint32_t>(geom.vocab)) {
-        if (err != nullptr) {
-            *err = "checkpoint vocab_size (" + std::to_string(cfg.vocab_size) +
-                   ") does not match the shipped qwen3.6 geometry (" +
-                   std::to_string(geom.vocab) +
-                   "); only the qwen3.6 checkpoint is supported in this increment";
-        }
-        return false;
+    // The vocabulary is a property of the checkpoint, so take it from the
+    // checkpoint. It used to be cross-checked against the hard-coded 248320 and
+    // REFUSED on mismatch, which meant even another size of the same family
+    // could not load. Every consumer reads `geom.vocab`; nothing else pinned it.
+    if (cfg.vocab_size != 0) {
+        geom.vocab = static_cast<int>(cfg.vocab_size);
     }
     std::string derr;
     if (!impl->setup(
@@ -2151,6 +2463,7 @@ void MetalExecutor::forward_batch(const std::vector<MemberForwardDesc>& descs,
                                   std::vector<std::uint8_t>& success,
                                   std::vector<std::string>& errors,
                                   const std::vector<PtirCommandCallbacks>* ptir) {
+    g_forward_batch_t0 = std::chrono::steady_clock::now();
     outs.assign(descs.size(), LogitsOut{});
     success.assign(descs.size(), 0);
     errors.assign(descs.size(), std::string{});
@@ -2226,6 +2539,15 @@ bool MetalExecutor::run_paged_batch_forward(const std::vector<MemberForwardDesc>
     }
     in.attention_mask_stride =
         static_cast<std::uint32_t>(mask_stride64);
+    // The dense mask is one byte per addressable KV token per row -- 131072 bytes
+    // here -- so materializing it costs `rows * stride` of zero-fill plus the same
+    // again copying it to the IO slot. `run_batch_step` treats a non-empty
+    // `attention_mask_enabled` as "this batch is masked", so pushing a zero per
+    // token made every batch pay both, for a buffer no kernel reads: 8.4 MB of
+    // memory traffic per step at 32 lanes, growing linearly with lane count.
+    // Nothing downstream needs either vector when no member carries a mask.
+    bool any_attention_mask = false;
+    for (const auto& d : descs) any_attention_mask = any_attention_mask || d.has_attention_mask;
     struct AcceptedRequest {
         std::size_t member = 0;
         std::uint32_t local_request = 0;
@@ -2489,22 +2811,24 @@ bool MetalExecutor::run_paged_batch_forward(const std::vector<MemberForwardDesc>
                     d.has_write_desc
                         ? d.w_off[token]
                         : token_pos % pool.page_size);
-                in.attention_mask_enabled.push_back(
-                    d.has_attention_mask ? 1 : 0);
-                const std::size_t mask_base =
-                    in.attention_mask.size();
-                in.attention_mask.resize(
-                    mask_base + in.attention_mask_stride,
-                    0);
-                if (d.has_attention_mask) {
-                    const auto* source =
-                        d.attention_mask.data() +
-                        token * d.attention_mask_stride;
-                    std::copy(
-                        source,
-                        source + d.attention_mask_stride,
-                        in.attention_mask.begin() +
-                            mask_base);
+                if (any_attention_mask) {
+                    in.attention_mask_enabled.push_back(
+                        d.has_attention_mask ? 1 : 0);
+                    const std::size_t mask_base =
+                        in.attention_mask.size();
+                    in.attention_mask.resize(
+                        mask_base + in.attention_mask_stride,
+                        0);
+                    if (d.has_attention_mask) {
+                        const auto* source =
+                            d.attention_mask.data() +
+                            token * d.attention_mask_stride;
+                        std::copy(
+                            source,
+                            source + d.attention_mask_stride,
+                            in.attention_mask.begin() +
+                                mask_base);
+                    }
                 }
             }
             for (std::uint32_t sample = span.s0;
@@ -2544,13 +2868,13 @@ bool MetalExecutor::run_paged_batch_forward(const std::vector<MemberForwardDesc>
             *ptir);
         dispatch_callbacks = &compacted_callbacks;
     }
-    if (!impl_->run_batch_step(
-            schedule, in, &batch_err, dispatch_callbacks)) {
-        for (const std::size_t member : accepted_members) {
-            errors[member] = batch_err;
-        }
-        return false;
-    }
+    // Every member's rows go in ONE staging dispatch, and that dispatch rides
+    // the forward's OWN command buffer. It used to be a second `run_step`:
+    // another submit and another completion wait, per token, for a copy worth
+    // about a microsecond of bandwidth. Nothing here depends on the forward's
+    // result -- the destination rows are just a bump allocation -- so it can all
+    // be decided first and encoded at the tail of the same buffer.
+    impl_->pending_logits_stage_.clear();
     for (const std::size_t i : accepted_members) {
         LogitsOut& out = outs[i];
         out.vocab = vocab_;
@@ -2559,20 +2883,21 @@ bool MetalExecutor::run_paged_batch_forward(const std::vector<MemberForwardDesc>
         out.device_row_offset =
             impl_->reserve_ptir_logits_rows(out.rows);
         impl_->attach_ptir_logits_view(out);
-        for (uint32_t row = 0; row < out.rows; ++row) {
-            if (ptir != nullptr &&
-                (*ptir)[i].consumes_logits_directly) {
-                continue;
-            }
-            std::string staging_error;
-            if (!impl_->stage_ptir_logits_row(
-                    rows[row],
-                    out.device_row_offset + row,
-                    &staging_error)) {
-                errors[i] = staging_error;
-                continue;
-            }
+        if (ptir != nullptr && (*ptir)[i].consumes_logits_directly) continue;
+        for (uint32_t row = 0; row < out.rows; ++row)
+            impl_->pending_logits_stage_.emplace_back(
+                rows[row], out.device_row_offset + row);
+    }
+    const bool ran = impl_->run_batch_step(
+        schedule, in, &batch_err, dispatch_callbacks);
+    impl_->pending_logits_stage_.clear();
+    if (!ran) {
+        for (const std::size_t member : accepted_members) {
+            errors[member] = batch_err;
         }
+        return false;
+    }
+    for (const std::size_t i : accepted_members) {
         if (!errors[i].empty()) continue;
         success[i] = 1;
     }
@@ -2666,10 +2991,8 @@ bool MetalExecutor::run_member_forward(const MemberForwardDesc& desc, LogitsOut&
         for (std::uint32_t r = 0; r < desc.readout_local_indices.size(); ++r) {
             if (desc.readout_local_indices[r] != static_cast<std::uint32_t>(i)) continue;
             if (ptir != nullptr && ptir->consumes_logits_directly) continue;
-            if (!impl_->stage_ptir_logits_row(
-                    0,
-                    out.device_row_offset + r,
-                    err)) {
+            if (!impl_->stage_ptir_logits_rows(
+                    {{0u, out.device_row_offset + r}}, err)) {
                 return false;
             }
         }

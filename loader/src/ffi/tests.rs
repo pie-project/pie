@@ -121,6 +121,7 @@ fn plan_with_every_instr() -> LoadPlan {
             channel_axis: Some(Axis(0)),
         }),
         alignment: 256,
+        visibility: Default::default(),
     });
     plan.tensors.push(TensorDecl {
         id: TensorId(8),
@@ -128,6 +129,7 @@ fn plan_with_every_instr() -> LoadPlan {
         shape: vec![4096],
         encoding: Encoding::Raw(DType::BF16),
         alignment: 256,
+        visibility: Default::default(),
     });
     plan.sources.push(SourceTensorDecl {
         id: TensorId(7),
@@ -199,22 +201,20 @@ fn plan_with_every_instr() -> LoadPlan {
             transform: TransformSpec {
                 from: Some(QuantScheme::MlxAffineU4),
                 to: Some(QuantScheme::Mxfp4E2M1E8M0),
-                repack: RepackSpec {
+                repack: Some(RepackSpec {
                     layout: RepackLayout::MarlinMxfp4Weight,
-                    row_map: RowMap::Odd,
                     batch: 2,
                     source_rows: 32,
-                    source_row_offset: 4,
                     target_rows: 64,
-                    valid_rows: 30,
-                    source_stride_cols: 128,
-                    source_col_offset: 8,
                     source_cols: 96,
                     target_cols: 112,
-                },
+                }),
                 scratch_bytes: 8192,
                 fusion: TransformFusion::Fp8ToMxfp4,
                 metadata_source: Some(TensorId(2)),
+                scale_factor_bits: 0.5f32.to_bits(),
+                scale_group: 32,
+                scale_axis: 1,
             },
         },
         StorageInstr::CreateView {
@@ -230,7 +230,7 @@ fn plan_with_every_instr() -> LoadPlan {
         },
         // The second tensor decl needs a Finalize of its own: `verify` treats a
         // declared-but-never-finalized tensor as a weight the load would leave
-        // absent, which is the coverage check §8.2 asks for.
+        // absent, which is the coverage check `architecture.md` §8.2 asks for.
         StorageInstr::Finalize {
             id: InstrId(9),
             tensor: BufferId(1),
@@ -336,7 +336,7 @@ fn verify_diagnostics(plan: &LoadPlan) -> String {
     let pod = arena::build(plan, arena::UNKEYED);
     let dir = contract_fixture();
     let handle = open_checkpoint(&dir);
-    let owned = crate::contract_writer::write_contract(&minimal_contract());
+    let owned = crate::testkit::contract_writer::write_contract(&minimal_contract());
     let mut req = contract_request(handle, owned.view());
     req.target.tp_rank = 1;
     req.target.tp_size = 4;
@@ -377,9 +377,9 @@ fn verify_rejects_a_source_that_reads_from_an_undeclared_file() {
 
 #[test]
 fn verify_rejects_a_tensor_the_schedule_never_finalizes() {
-    // §8.2's coverage question, in the half the loader can answer without an
-    // externally-supplied contract: a declared tensor that nothing produces is a
-    // weight the driver will look up and not find.
+    // `architecture.md` §8.2's coverage question, in the half the loader can
+    // answer without an externally-supplied contract: a declared tensor that
+    // nothing produces is a weight the driver will look up and not find.
     let mut plan = plan_with_every_instr();
     plan.instrs.retain(|instr| {
         !matches!(instr, StorageInstr::Finalize { name, .. } if name == "model.norm.weight")
@@ -528,7 +528,6 @@ fn tile_map_carries_the_whole_transform() {
             transform_from,
             transform_to,
             repack_layout,
-            row_map,
         ) = operands!(
             tile,
             TileMap {
@@ -540,7 +539,6 @@ fn tile_map_carries_the_whole_transform() {
                 transform_from,
                 transform_to,
                 repack_layout,
-                row_map,
             }
         );
         assert_eq!(*tile_kind, PieLoaderTileMapKind::Repack);
@@ -551,34 +549,30 @@ fn tile_map_carries_the_whole_transform() {
         assert_eq!(*transform_from, PieLoaderQuantScheme::MlxAffineU4);
         assert_eq!(*transform_to, PieLoaderQuantScheme::Mxfp4E2M1E8M0);
         assert_eq!(*repack_layout, PieLoaderRepackLayout::MarlinMxfp4Weight);
-        assert_eq!(*row_map, PieLoaderRowMap::Odd);
 
-        let (batch, source_rows, row_offset, target_rows, valid_rows) = operands!(
+        let (batch, source_rows, target_rows) = operands!(
             tile,
             TileMap {
                 transform_batch,
                 transform_source_rows,
-                transform_source_row_offset,
                 transform_target_rows,
-                transform_valid_rows,
             }
         );
-        assert_eq!((*batch, *source_rows, *row_offset), (2, 32, 4));
-        assert_eq!((*target_rows, *valid_rows), (64, 30));
+        assert_eq!((*batch, *source_rows, *target_rows), (2, 32, 64));
 
-        let (stride_cols, col_offset, cols, target_cols, scratch, metadata) = operands!(
+        let (cols, target_cols, scratch, metadata, factor) = operands!(
             tile,
             TileMap {
-                transform_source_stride_cols,
-                transform_source_col_offset,
                 transform_source_cols,
                 transform_target_cols,
                 transform_scratch_bytes,
                 transform_metadata_source,
+                transform_scale_factor_bits,
             }
         );
-        assert_eq!((*stride_cols, *col_offset, *cols), (128, 8, 96));
-        assert_eq!((*target_cols, *scratch, *metadata), (112, 8192, 2));
+        assert_eq!((*cols, *target_cols), (96, 112));
+        assert_eq!((*scratch, *metadata), (8192, 2));
+        assert_eq!(f32::from_bits(*factor), 0.5);
     });
 }
 
@@ -751,7 +745,7 @@ fn releasing_null_is_a_no_op() {
 //
 // Every enum-valued field of a request arrives as a `uint32_t` precisely so
 // these cases can be *rejected* rather than being undefined behaviour, so the
-// rejection is the thing worth testing. Since §12 row 12 the request carries no
+// rejection is the thing worth testing. Since `architecture.md` §12 row 12 the request carries no
 // model and no policy, so the target is all there is left to get wrong — and it
 // is the half the loader cannot re-derive, which makes refusing a malformed one
 // the only defence.
@@ -789,7 +783,7 @@ fn target_spec() -> PieLoaderTargetSpec {
 fn compile_with_target(mutate: impl FnOnce(&mut PieLoaderTargetSpec)) -> (PieLoaderStatus, String) {
     let dir = contract_fixture();
     let handle = open_checkpoint(&dir);
-    let owned = crate::contract_writer::write_contract(&fused_contract());
+    let owned = crate::testkit::contract_writer::write_contract(&fused_contract());
     let mut req = contract_request(handle, owned.view());
     mutate(&mut req.target);
 
@@ -816,10 +810,11 @@ fn out_of_range_backend_is_rejected_not_transmuted() {
 
 #[test]
 fn a_target_claiming_an_unknown_tile_map_transform_is_rejected() {
-    // The driver is the authority on what its kernels implement (§9), so it may
-    // claim fewer transforms than the loader knows how to lower. It may not
-    // claim one the loader has never heard of: nothing downstream would notice
-    // until a kernel dispatch failed at load time.
+    // The driver is the authority on what its kernels implement
+    // (`architecture.md` §9), so it may claim fewer transforms than the loader
+    // knows how to lower. It may not claim one the loader has never heard of:
+    // nothing downstream would notice until a kernel dispatch failed at load
+    // time.
     let (status, message) =
         compile_with_target(|t| t.tile_map_mask = CUDA_TILE_MAP_MASK | (1 << 30));
     assert_eq!(status, PieLoaderStatus::InvalidRequest);
@@ -845,9 +840,9 @@ fn a_target_claiming_fewer_transforms_than_the_loader_knows_is_accepted() {
 
 #[test]
 fn a_target_that_states_no_tile_budget_is_rejected_rather_than_guessed_for() {
-    // §9: a device constant the loader cannot measure has no safe default. The
-    // number decides how much scratch every Encode allocates, so guessing it
-    // would be a performance contract nobody signed.
+    // `architecture.md` §9: a device constant the loader cannot measure has no
+    // safe default. The number decides how much scratch every Encode allocates,
+    // so guessing it would be a performance contract nobody signed.
     let (status, message) = compile_with_target(|t| t.max_tile_bytes = 0);
     assert_eq!(status, PieLoaderStatus::InvalidRequest);
     assert!(message.contains("max_tile_bytes"), "got: {message}");
@@ -896,7 +891,7 @@ fn null_arguments_never_dereference() {
 
     let dir = contract_fixture();
     let handle = open_checkpoint(&dir);
-    let owned = crate::contract_writer::write_contract(&fused_contract());
+    let owned = crate::testkit::contract_writer::write_contract(&fused_contract());
     let req = contract_request(handle, owned.view());
 
     let status = unsafe {
@@ -929,10 +924,10 @@ fn verify_rejects_a_plan_compiled_with_a_different_fusion_setting() {
     // Accepting a fused plan on a driver that has fusion disabled would run
     // something the plan does not describe — and, because the driver caches the
     // materialized artifact, would do so from a cache entry the other setting
-    // wrote (§8.1).
+    // wrote (`architecture.md` §8.1).
     let dir = contract_fixture();
     let handle = open_checkpoint(&dir);
-    let owned = crate::contract_writer::write_contract(&fused_contract());
+    let owned = crate::testkit::contract_writer::write_contract(&fused_contract());
     let req = contract_request(handle, owned.view());
 
     let mut plan: *mut PieLoaderPlan = std::ptr::null_mut();
@@ -977,15 +972,15 @@ fn all_messages(diags: *mut PieLoaderDiagnostics) -> String {
 ///
 /// This is the only way a contract and a plan can disagree now: compiling from
 /// a contract makes them agree by construction, so the failure mode left is the
-/// §6.2 one — two ranks, or a cache hit and a fresh compile, holding different
-/// programs and each believing the other's plan.
+/// `architecture.md` §6.2 one — two ranks, or a cache hit and a fresh compile,
+/// holding different programs and each believing the other's plan.
 fn verify_against(
     plan: *const PieLoaderPlan,
     contract: &crate::contract::ModelContract,
 ) -> (PieLoaderStatus, String) {
     let dir = contract_fixture();
     let handle = open_checkpoint(&dir);
-    let owned = crate::contract_writer::write_contract(contract);
+    let owned = crate::testkit::contract_writer::write_contract(contract);
     let req = contract_request(handle, owned.view());
     let mut diags: *mut PieLoaderDiagnostics = std::ptr::null_mut();
     let status = unsafe { super::entry::pie_loader_verify_contract(plan, &req, &mut diags) };
@@ -999,7 +994,7 @@ fn verify_against(
 fn with_fixture_plan(body: impl FnOnce(*mut PieLoaderPlan)) {
     let dir = contract_fixture();
     let handle = open_checkpoint(&dir);
-    let owned = crate::contract_writer::write_contract(&fused_contract());
+    let owned = crate::testkit::contract_writer::write_contract(&fused_contract());
     let req = contract_request(handle, owned.view());
     let mut plan: *mut PieLoaderPlan = std::ptr::null_mut();
     let mut diags: *mut PieLoaderDiagnostics = std::ptr::null_mut();
@@ -1239,7 +1234,7 @@ fn fused_contract() -> crate::contract::ModelContract {
         alignment: 256,
         tensors: vec![TensorContract::new(
             "ab.weight",
-            Expr::Cat {
+            Expr::Concat {
                 axis: Axis(0),
                 parts: vec![
                     Expr::Src("a.weight".to_string()),
@@ -1249,6 +1244,37 @@ fn fused_contract() -> crate::contract::ModelContract {
             vec![4, 4],
             Encoding::Raw(DType::BF16),
         )],
+    }
+}
+
+/// A contract that publishes a weight and declares a second tensor as its
+/// scales, so the `scales` half of the contract ABI has something to carry.
+fn scaled_contract() -> crate::contract::ModelContract {
+    use crate::contract::{Expr, ModelContract, Scales, TensorContract};
+    use crate::types::{QuantGranularity, ScaleForm};
+    ModelContract {
+        alignment: 256,
+        tensors: vec![
+            TensorContract::new(
+                "a.weight",
+                Expr::Src("a.weight".to_string()),
+                vec![2, 4],
+                Encoding::Raw(DType::BF16),
+            ),
+            TensorContract::new(
+                "a.scale",
+                Expr::Src("b.weight".to_string()),
+                vec![2, 4],
+                Encoding::Raw(DType::BF16),
+            )
+            .scaling(Scales {
+                of: "a.weight".to_string(),
+                granularity: QuantGranularity::PerChannel,
+                group_size: 0,
+                channel_axis: 0,
+                form: ScaleForm::F32Factors,
+            }),
+        ],
     }
 }
 
@@ -1278,7 +1304,7 @@ fn an_opened_checkpoint_reports_the_tensors_a_contract_can_name() {
 fn a_contract_compiles_and_verifies_without_naming_a_model() {
     let dir = contract_fixture();
     let handle = open_checkpoint(&dir);
-    let owned = crate::contract_writer::write_contract(&fused_contract());
+    let owned = crate::testkit::contract_writer::write_contract(&fused_contract());
     let req = contract_request(handle, owned.view());
 
     let mut plan: *mut PieLoaderPlan = std::ptr::null_mut();
@@ -1316,7 +1342,7 @@ fn a_contract_naming_a_tensor_the_checkpoint_lacks_is_a_message_not_a_crash() {
     let handle = open_checkpoint(&dir);
     let mut model = fused_contract();
     model.tensors[0].expr = crate::contract::Expr::Src("missing.weight".to_string());
-    let owned = crate::contract_writer::write_contract(&model);
+    let owned = crate::testkit::contract_writer::write_contract(&model);
     let req = contract_request(handle, owned.view());
 
     let mut plan: *mut PieLoaderPlan = std::ptr::null_mut();
@@ -1337,7 +1363,7 @@ fn a_contract_whose_declared_shape_is_wrong_fails_to_compile() {
     let handle = open_checkpoint(&dir);
     let mut model = fused_contract();
     model.tensors[0].shape = Some(vec![8, 4]);
-    let owned = crate::contract_writer::write_contract(&model);
+    let owned = crate::testkit::contract_writer::write_contract(&model);
     let req = contract_request(handle, owned.view());
 
     let mut plan: *mut PieLoaderPlan = std::ptr::null_mut();
@@ -1352,9 +1378,61 @@ fn a_contract_whose_declared_shape_is_wrong_fails_to_compile() {
     unsafe { super::entry::pie_loader_close_checkpoint(handle) };
 }
 
+/// A driver-written enum field is read as an integer and validated, never
+/// transmuted.
+///
+/// `PieLoaderScalesView` sits inside `PieLoaderModelContractView`, which the
+/// *driver* fills in. A Rust enum holding a value outside its variants is
+/// undefined behaviour the moment `read_contract` borrows the tensor slice —
+/// before any `match` could reject it — which is why every input-side enum on
+/// this boundary is spelled `u32`. This is the check that it still is.
+#[test]
+fn an_out_of_range_scale_granularity_is_rejected_not_transmuted() {
+    let dir = contract_fixture();
+    let handle = open_checkpoint(&dir);
+    let mut owned = crate::testkit::contract_writer::write_contract(&scaled_contract());
+    let scaled = owned.first_scaled().expect("the fixture declares scales");
+    owned.set_raw_scale_codes(scaled, 9, 1);
+    let req = contract_request(handle, owned.view());
+
+    let mut plan: *mut PieLoaderPlan = std::ptr::null_mut();
+    let mut diags: *mut PieLoaderDiagnostics = std::ptr::null_mut();
+    let status = unsafe { super::entry::pie_loader_compile_contract(&req, &mut plan, &mut diags) };
+    assert_eq!(status, PieLoaderStatus::InvalidRequest);
+    assert!(plan.is_null());
+    let message = drain(diags);
+    assert!(
+        message.contains("granularity") && message.contains('9'),
+        "the message should name the field and the value: {message}"
+    );
+    unsafe { super::entry::pie_loader_close_checkpoint(handle) };
+}
+
+#[test]
+fn an_out_of_range_scale_form_is_rejected_not_transmuted() {
+    let dir = contract_fixture();
+    let handle = open_checkpoint(&dir);
+    let mut owned = crate::testkit::contract_writer::write_contract(&scaled_contract());
+    let scaled = owned.first_scaled().expect("the fixture declares scales");
+    owned.set_raw_scale_codes(scaled, 0, 4);
+    let req = contract_request(handle, owned.view());
+
+    let mut plan: *mut PieLoaderPlan = std::ptr::null_mut();
+    let mut diags: *mut PieLoaderDiagnostics = std::ptr::null_mut();
+    let status = unsafe { super::entry::pie_loader_compile_contract(&req, &mut plan, &mut diags) };
+    assert_eq!(status, PieLoaderStatus::InvalidRequest);
+    assert!(plan.is_null());
+    let message = drain(diags);
+    assert!(
+        message.contains("form") && message.contains('4'),
+        "the message should name the field and the value: {message}"
+    );
+    unsafe { super::entry::pie_loader_close_checkpoint(handle) };
+}
+
 #[test]
 fn a_contract_request_with_no_checkpoint_is_rejected() {
-    let owned = crate::contract_writer::write_contract(&fused_contract());
+    let owned = crate::testkit::contract_writer::write_contract(&fused_contract());
     let req = contract_request(std::ptr::null(), owned.view());
     let mut plan: *mut PieLoaderPlan = std::ptr::null_mut();
     let mut diags: *mut PieLoaderDiagnostics = std::ptr::null_mut();
@@ -1433,12 +1511,6 @@ fn mirror_enum_discriminants_are_pinned() {
     assert_eq!(PieLoaderRepackLayout::None as u32, 0);
     assert_eq!(PieLoaderRepackLayout::MarlinMxfp4Weight as u32, 1);
     assert_eq!(PieLoaderRepackLayout::MarlinMxfp4Scale as u32, 2);
-    assert_eq!(PieLoaderRepackLayout::DenseRowGather as u32, 3);
-
-    // PieLoaderRowMap
-    assert_eq!(PieLoaderRowMap::Identity as u32, 0);
-    assert_eq!(PieLoaderRowMap::Even as u32, 1);
-    assert_eq!(PieLoaderRowMap::Odd as u32, 2);
 
     // PieLoaderTileMapKind
     assert_eq!(PieLoaderTileMapKind::Cast as u32, 0);
@@ -1504,18 +1576,16 @@ fn storage_op_tags_are_the_wire_values() {
             transform_from: PieLoaderQuantScheme::None,
             transform_to: PieLoaderQuantScheme::None,
             repack_layout: PieLoaderRepackLayout::None,
-            row_map: PieLoaderRowMap::Identity,
             transform_batch: 0,
             transform_source_rows: 0,
-            transform_source_row_offset: 0,
             transform_target_rows: 0,
-            transform_valid_rows: 0,
-            transform_source_stride_cols: 0,
-            transform_source_col_offset: 0,
             transform_source_cols: 0,
             transform_target_cols: 0,
             transform_scratch_bytes: 0,
             transform_metadata_source: PIE_LOADER_NO_TENSOR,
+            transform_scale_factor_bits: 0,
+            transform_scale_group: 0,
+            transform_scale_axis: 0,
         }),
         2
     );
@@ -1542,4 +1612,51 @@ fn storage_op_tags_are_the_wire_values() {
         6
     );
     assert_eq!(tag(Op::Fill { buffer_id: 0 }), 8);
+}
+
+/// A `Gather`'s indices are the first variable-length payload on an expression
+/// node that is neither a shape nor a child list, so they are the one field
+/// whose round trip nothing else would exercise.
+#[test]
+fn a_gather_carries_its_indices_across_the_ffi() {
+    use crate::contract::{Expr, ModelContract, TensorContract};
+    let contract = ModelContract {
+        alignment: 256,
+        tensors: vec![TensorContract::inferred(
+            "permuted",
+            Expr::src("a.weight").gather(0, vec![3, 0, 7, 0]),
+            Encoding::Raw(DType::BF16),
+        )],
+    };
+    let owned = crate::testkit::contract_writer::write_contract(&contract);
+    let read = unsafe { super::contract::read_contract(&owned.view()) }.expect("reads back");
+    assert_eq!(read, contract);
+}
+
+/// The rule `RepackLayout` used to state as a variant, now stated where it can
+/// still be violated.
+///
+/// Zero is what an all-zero node carries, and a `Repack` that names no kernel
+/// would otherwise reach the device as a transform that does nothing to bytes
+/// a GEMM is about to read as swizzled.
+#[test]
+fn a_repack_that_names_no_kernel_is_refused_at_the_boundary() {
+    use crate::contract::{Expr, ModelContract, TensorContract, TensorType};
+    use crate::types::RepackLayout;
+    let contract = ModelContract {
+        alignment: 256,
+        tensors: vec![TensorContract::inferred(
+            "packed",
+            Expr::src("blocks").repack(
+                RepackLayout::MarlinMxfp4Weight,
+                TensorType::raw(vec![2, 32, 64], DType::BF16),
+            ),
+            Encoding::Raw(DType::BF16),
+        )],
+    };
+    let mut owned = crate::testkit::contract_writer::write_contract(&contract);
+    let node = owned.first_repack().expect("the contract has a Repack");
+    owned.set_raw_repack_layout(node, PieLoaderRepackLayout::None as u32);
+    let err = unsafe { super::contract::read_contract(&owned.view()) }.unwrap_err();
+    assert!(err.contains("names a kernel"), "{err}");
 }
