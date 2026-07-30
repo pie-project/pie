@@ -5855,3 +5855,130 @@ ternary (`prop.major >= 12 ? 16384 : 8192`) and a qwen3_5_moe score hack. The
 calibrator is now the mechanism that can retire them — but all three cover
 configurations (Qwen3-8B TP1, Qwen3-8B TP2, Nemotron-H TP2) that cannot be
 validated on a single L40S, so they stay until someone can measure them.
+
+---
+
+## §20.35 — PTIR is already at the bandwidth roof; the fence tax was next door
+
+The remaining gap at conc-512 was **-1.56%** (pie 32052 vs vLLM 32562, ABBA
+3+3, calibrated `N=4096`). The question was whether pie's *programmability*
+machinery — running user programs on the device — is what pays for it, and
+whether any of it can be shaved without giving programmability up.
+
+### Decomposing pie's GPU time
+
+`nsys profile --trace=cuda --cuda-graph-trace=node`, 1024 requests at
+concurrency 512. **The `--cuda-graph-trace=node` flag is mandatory**: without
+it, graphs hide ~90% of kernels and the profile is actively misleading. nsys
+inflates wall time ~1.7x under node tracing, so only WITHIN-trace ratios are
+usable.
+
+| category | ms | % | instances |
+|---|---|---|---|
+| GEMM | 3316.1 | 52.8 | 64950 |
+| attention (`BatchDecodeWithPagedKVCache`) | 2585.2 | 41.2 | 7672 |
+| model elementwise / norm / rope / kv | 233.7 | 3.7 | 32560 |
+| **guest PTIR program** (`ptir_fused_*`) | **78.8** | **1.3** | 276 |
+| **host-channel pipeline** | **62.4** | **1.0** | 1644 |
+
+Two things fell out of this that contradict earlier assumptions in this log:
+
+- **~41% of the decode step is paged attention**, not GEMM. Decode is not
+  launch-bound and not GEMM-bound in the way §20.x assumed.
+- **pie-only machinery was 2.25% of GPU time — LARGER than the 1.56% gap.**
+  So it was, for once, a lever that could actually cover the deficit.
+
+### The PTIR kernel is NOT a pie tax — it is at the hardware roof
+
+`ptir_fused_8cdf1d4e51797f1c_r0` runs `grid=(512,1,1) blk=(1024,1,1)` —
+one block per request — at `REG:55 STACK:96 SHARED:516`, 308 us traced
+(~181 us real). Its job is argmax over the logits: 512 x 151936 bf16 =
+**155.6 MB**, which at 181 us is **~860 GB/s, essentially L40S peak**.
+
+**It is bandwidth-saturated and vLLM must read exactly the same logits to
+sample.** There is nothing to shave, and this corrects the earlier claim that
+the guest program was the top lead. Programmability is not costing anything
+here: the guest program is doing work every engine has to do.
+
+(Aside: PTIR regions are compiled at runtime by NVRTC with `--fmad=false
+--prec-div=true --prec-sqrt=true`. Relaxing those is a real lever but it
+changes numerics, so it was not pursued.)
+
+### THE FINDING — a system release fence per host-channel word
+
+Profiling the pie-specific kernels instead turned up an anomaly:
+`k_settle_host_channels_batch` cost **133.3 us/step** — 4x
+`k_scatter_host_publish_copies` at the *same* geometry (512 blocks x 128
+threads) despite doing strictly less work. The kernel body is trivial
+bookkeeping, but every word was written with a **system-scope release** store.
+
+A microbenchmark at that exact shape (`/root/p512/settle_bench.cu`, best-of-3
+with rotated variant order — GPU idle clocks drop to 210 MHz and can skew a
+run 3.4x):
+
+| tickets | release (was) | rlx+2fence | plain+1fence | rlx+1fence | **rlx+0fence** | speedup |
+|---|---|---|---|---|---|---|
+| 1 | 159.4 | 119.5 | 48.3 | 49.0 | **11.6** | 13.8x |
+| 2 | 273.8 | 189.5 | 50.4 | 50.7 | **12.5** | 21.8x |
+| 4 | 442.8 | 310.6 | 53.8 | 53.8 | **14.9** | 29.8x |
+| 8 | 792.4 | 543.6 | 66.0 | 64.8 | **19.0** | 41.8x |
+
+**The cost is the fence count, not the store count and not PCIe latency.**
+Relaxed and plain stores are nearly flat in ticket count — the writes pipeline
+fine. Release scales linearly, because each store waits. One
+`__threadfence_system()` measures ~37 us on its own in this shape.
+
+### Why relaxed is correct here
+
+Every word this kernel writes is read on the far side of a **kernel-completion
+boundary**, and kernel completion is itself a system-scope release:
+
+- `host_commit[0]`/`[1]` (the mapped commit mirror) are read by the
+  `cudaLaunchHostFunc` completion callback — the unmapped path issues a D2H
+  copy at exactly the same point, which is the proof that no reader is
+  intra-kernel — and by `settle_readiness` after a `cudaStreamSynchronize`.
+- The ring words are read by the guest, which that same callback wakes, and by
+  a later `k_pull_validate_host_channels_batch` on the same stream.
+- The one edge the protocol actually needs — **payload before ring tail** — is
+  supplied by `k_scatter_host_publish_copies` being a **prior kernel**, which
+  `channels.hpp` already documented.
+
+Relaxed system-scope atomics keep atomicity (no torn 64-bit word reaches the
+host, unlike plain stores) and give up only ordering that nothing observes.
+For the same reason `k_scatter_host_publish_copies`'s trailing
+`__threadfence_system()` went too — its own comment already called it
+belt-and-braces over the launch boundary, and it was ~100% of that kernel.
+
+### Result
+
+Per decode step, `nsys --cuda-graph-trace=node`, same workload:
+
+| kernel | before | after | |
+|---|---|---|---|
+| `k_settle_host_channels_batch` | 133.3 us | **37.0 us** | 3.6x |
+| `k_scatter_host_publish_copies` | 35.2 us | **3.5 us** | 10.1x |
+| `k_pull_validate_host_channels_batch` | 28.7 us | 30.4 us | untouched |
+
+The host-channel pipeline drops from **0.86% to 0.33% of pie's GPU time**.
+
+### ⚠ NO THROUGHPUT CLAIM IS MADE
+
+That is ~0.5% of a decode step. The box was at loadavg 15-20 when this landed
+and an ABBA attempt produced a pie sample 34% below its siblings. **0.5% is
+not resolvable in tok/s here**, and per the §20.34 retraction this log does not
+draw directional conclusions from under-powered samples. The GPU-time
+measurement is deterministic and is the evidence; the wall-clock effect is
+still owed a quiet-box (loadavg < 8) ABBA.
+
+### Left on the table
+
+`k_pull_validate_host_channels_batch` (30 us/step) uses `load_system_acquire`
+per word. It was NOT relaxed: unlike the settlement stores, a relaxed load
+there would drop the "tail > head implies the payload at head is valid" edge
+that later kernels in the launch depend on, and the reasoning is subtler than
+the ~0.08% at stake. Worth revisiting only with a proper argument.
+
+After this change pie's remaining pie-only GPU cost is ~0.33% (channels)
+plus a PTIR kernel that is at the memory roof. **There is no longer a
+programmability tax large enough to explain the vLLM gap** — which relocates
+the question back to the shared attention/GEMM path.
