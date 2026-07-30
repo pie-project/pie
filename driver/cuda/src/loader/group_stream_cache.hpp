@@ -255,6 +255,7 @@ public:
             const auto slot = static_cast<std::uint32_t>(found);
             index_.touch_and_pin(slot);
             ++stats_.hits;
+            verify_fill(slot, key, compute_stream);
             return slot_stores_[slot];
         }
 
@@ -268,6 +269,7 @@ public:
                     Clock::now() - started).count());
         }
         fill(acquired.slot, group, instance, key, compute_stream);
+        verify_fill(acquired.slot, key, compute_stream);
         return slot_stores_[acquired.slot];
     }
 
@@ -460,6 +462,59 @@ private:
             cudaMemcpyDeviceToHost, stream));
         host_of_.emplace(key, at);
     }
+
+    /// Diagnostic: a page-in of the same instance must produce the same bytes.
+    ///
+    /// Env-gated because it costs a device sync and a D2H per miss. It answers
+    /// exactly one question -- whether a slot's contents are a function of the
+    /// instance, as the group's uniformity claim says they are -- and that is
+    /// the question any divergence between a streamed and a resident run
+    /// reduces to.
+    void verify_fill(std::uint32_t slot, std::uint32_t key, cudaStream_t stream)
+    {
+        if (!loader_config::env_truthy("PIE_CUDA_STREAM_VERIFY")) return;
+        // Windows spread across the whole slot, not just its ends: a page-in
+        // is many buffers and a wrong one in the middle is exactly what the
+        // ends cannot see.
+        // Over the named tensors, not the raw slot: the gaps a plan leaves
+        // between its buffers are nobody's bytes and nothing reads them, so
+        // hashing them only reports that a slot was previously somebody else.
+        constexpr std::size_t kWindows = 16;
+        constexpr std::size_t kWindow = 4096;
+        std::vector<std::uint8_t> buf(kWindow);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        std::uint64_t h = 1469598103934665603ull;
+        std::vector<std::string> names;
+        for (const auto& entry : slot_stores_[slot]) names.push_back(entry.first);
+        std::sort(names.begin(), names.end());
+        for (const auto& name : names) {
+            const auto& t = slot_stores_[slot].get(name);
+            const std::size_t bytes = t.nbytes();
+            if (bytes < kWindow) continue;
+            const std::size_t stride =
+                std::max<std::size_t>(kWindow, bytes / kWindows);
+            for (std::size_t off = 0; off + kWindow <= bytes; off += stride) {
+                CUDA_CHECK(cudaMemcpy(
+                    buf.data(),
+                    static_cast<const std::uint8_t*>(t.data()) + off, kWindow,
+                    cudaMemcpyDeviceToHost));
+                for (const std::uint8_t b : buf) {
+                    h = (h ^ b) * 1099511628211ull;
+                }
+            }
+        }
+        const auto seen = fill_digest_.find(key);
+        if (seen == fill_digest_.end()) {
+            fill_digest_.emplace(key, h);
+        } else if (seen->second != h) {
+            std::cerr << "[group stream cache] VERIFY instance " << key
+                      << " paged in differently: " << seen->second << " then "
+                      << h << "\n";
+            seen->second = h;
+        }
+    }
+
+    std::unordered_map<std::uint32_t, std::uint64_t> fill_digest_;
 
     std::uint8_t* host_slot(std::uint32_t at) const noexcept {
         return host_tier_ + static_cast<std::uint64_t>(at) * slot_bytes_;

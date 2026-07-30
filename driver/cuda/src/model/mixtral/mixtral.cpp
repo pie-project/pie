@@ -424,7 +424,86 @@ void mixtral_forward_paged(
         // routes while the materializing path's grows with distinct experts.
         // Below `mxfp4_decode_max_routes` the fused path reads strictly
         // less; above it the materializing path amortises better and wins.
-        if (use_mxfp4_decode_gemv &&
+        // Streaming does not have to give the fused path up.
+        //
+        // The kernel wants a device array of per-expert pointers, and a
+        // streamed expert's pointer is wherever its slot is -- but a slot's
+        // pointers are fixed at slot creation and a page-in changes only the
+        // bytes behind them, so the array is a few hundred bytes to rewrite
+        // per layer. Page in the routed set, point the four weight arrays at
+        // their slots, and the same kernel runs. Measured, this is the single
+        // largest number in the whole feature: giving it up cost 5.2x, far
+        // more than any miss rate does.
+        //
+        // Two things it costs. The routed set has to be known on the host, so
+        // the D2H the fused path was written to avoid comes back -- one per
+        // layer, against a kernel worth five times the step. And every routed
+        // expert is pinned at once, so a slab that cannot hold the layer's
+        // routed set falls back to the per-expert loop rather than deadlock
+        // against its own pins.
+        bool streamed_fused = false;
+        if (layer.expert_cache != nullptr && use_mxfp4_decode_gemv &&
+            !layer.expert_gate_up_packed_ptrs.empty()) {
+            std::vector<std::int32_t> idx_h(static_cast<std::size_t>(N) * top_k);
+            CUDA_CHECK(cudaMemcpyAsync(idx_h.data(), d_topk_idx.data(),
+                                       idx_h.size() * sizeof(std::int32_t),
+                                       cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            std::vector<int> routed;
+            std::vector<char> seen(static_cast<std::size_t>(num_experts), 0);
+            for (const std::int32_t e : idx_h) {
+                if (e >= 0 && e < num_experts && !seen[e]) {
+                    seen[e] = 1;
+                    routed.push_back(e);
+                }
+            }
+            if (routed.size() <= layer.expert_cache->num_slots()) {
+                for (const int e : routed) {
+                    layer.expert_cache->prefetch(layer.expert_group,
+                                                 static_cast<std::uint32_t>(e));
+                }
+                std::vector<const std::uint8_t*> gu(num_experts, nullptr);
+                std::vector<const std::uint8_t*> gs(num_experts, nullptr);
+                std::vector<const std::uint8_t*> dn(num_experts, nullptr);
+                std::vector<const std::uint8_t*> ds(num_experts, nullptr);
+                for (const int e : routed) {
+                    const WeightStore& slot = layer.expert_cache->ensure_resident(
+                        layer.expert_group, static_cast<std::uint32_t>(e), stream);
+                    gu[e] = static_cast<const std::uint8_t*>(
+                        slot.get("gate_up_proj.weight").data());
+                    gs[e] = static_cast<const std::uint8_t*>(
+                        slot.get("gate_up_proj.weight_scale").data());
+                    dn[e] = static_cast<const std::uint8_t*>(
+                        slot.get("down_proj.weight").data());
+                    ds[e] = static_cast<const std::uint8_t*>(
+                        slot.get("down_proj.weight_scale").data());
+                }
+                // Pageable source, so the driver stages it before returning and
+                // these vectors may die at the end of the block; the DMA that
+                // follows is ordered on `stream` ahead of the kernels.
+                const std::size_t nbytes =
+                    static_cast<std::size_t>(num_experts) * sizeof(const void*);
+                CUDA_CHECK(cudaMemcpyAsync(
+                    const_cast<void*>(static_cast<const void*>(
+                        layer.expert_gate_up_packed_ptrs.data())), gu.data(), nbytes,
+                    cudaMemcpyHostToDevice, stream));
+                CUDA_CHECK(cudaMemcpyAsync(
+                    const_cast<void*>(static_cast<const void*>(
+                        layer.expert_gate_up_scale_ptrs.data())), gs.data(), nbytes,
+                    cudaMemcpyHostToDevice, stream));
+                CUDA_CHECK(cudaMemcpyAsync(
+                    const_cast<void*>(static_cast<const void*>(
+                        layer.expert_down_packed_ptrs.data())), dn.data(), nbytes,
+                    cudaMemcpyHostToDevice, stream));
+                CUDA_CHECK(cudaMemcpyAsync(
+                    const_cast<void*>(static_cast<const void*>(
+                        layer.expert_down_scale_ptrs.data())), ds.data(), nbytes,
+                    cudaMemcpyHostToDevice, stream));
+                streamed_fused = true;
+            }
+        }
+        if ((layer.expert_cache == nullptr || streamed_fused) &&
+            use_mxfp4_decode_gemv &&
             !layer.expert_gate_up_packed_ptrs.empty()) {
             const int routes = N * top_k;
             kernels::launch_bf16_to_fp16(
@@ -471,6 +550,12 @@ void mixtral_forward_paged(
             }
             kernels::launch_residual_add_bf16(
                 ws.y.data(), d_mxfp4_moe_out.data(), N * H, stream);
+            if (streamed_fused) {
+                // Safe with the kernels above still queued: a page-in that
+                // wants one of these slots synchronizes `stream` before it
+                // overwrites anything.
+                layer.expert_cache->end_batch();
+            }
             continue;
         }
 

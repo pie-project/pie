@@ -72,6 +72,13 @@ pub fn cuda_toml_for(snapshot_path: &str) -> String {
     } else {
         String::new()
     };
+    // The KV cache is otherwise sized from whatever VRAM is left, so changing
+    // the expert slab silently changes the page count -- and with it the
+    // attention plan and its reduction order. Two runs meant to differ only in
+    // residency would then differ in numerics too, which is not a comparison.
+    let kv = std::env::var("PIE_CUDA_TEST_KV_PAGES")
+        .map(|v| format!("total_pages = {v}\n"))
+        .unwrap_or_default();
     format!(
         "[server]\n\
          host = \"127.0.0.1\"\n\
@@ -95,7 +102,7 @@ pub fn cuda_toml_for(snapshot_path: &str) -> String {
          [model.driver.options]\n\
          gpu_mem_utilization = 0.90\n\
          memory_profile = \"latency\"\n\
-         {streaming}",
+         {kv}{streaming}",
         scratch = scratch.display(),
     )
 }

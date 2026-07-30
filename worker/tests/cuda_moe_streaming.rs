@@ -55,12 +55,21 @@ fn cuda_moe_decodes_the_same_tokens_streamed_or_resident() {
         // Temperature 0 is an in-graph argmax, so the emitted tokens are a
         // pure function of the logits. Two runs that route the same experts
         // through the same GEMMs therefore have to emit the same text.
+        let started = std::time::Instant::now();
         let result = common::spawn_inferlet(
             "text-completion-bench",
-            r#"{"prompt":"The capital of France is","max_tokens":16,"temperature":0.0}"#,
+            &std::env::var("PIE_CUDA_TEST_PROMPT_JSON").unwrap_or_else(|_| {
+            r#"{"prompt":"The capital of France is","max_tokens":16,"temperature":0.0}"#.to_string()
+        }),
         )
         .await;
         let text = result.expect("inferlet errored on cuda");
+        // Wall time of the whole request, which is what streaming is finally
+        // judged on: per-miss microseconds only matter through this number.
+        eprintln!(
+            "[cuda_moe_streaming] MOE_STREAM_WALL streaming={streaming} ms={}",
+            started.elapsed().as_millis()
+        );
 
         // The line the two runs are diffed on. Printed rather than asserted
         // because the expected value is whatever the other run produced.

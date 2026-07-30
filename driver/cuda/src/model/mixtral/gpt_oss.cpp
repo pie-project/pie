@@ -550,23 +550,32 @@ MixtralWeights bind_gpt_oss(const LoadedModel& engine) {
             std::vector<const std::uint8_t*> dn_packed(E), dn_scale(E);
             std::vector<const void*> gb(E), ub(E), db(E);
             bool ok = true;
+            // A streamed layer has no weight to point at yet -- the four
+            // weight arrays are rewritten each step from whichever slots the
+            // layer's routed set landed in. The biases are resident and stable,
+            // so those three are final here, which is the whole reason the
+            // per-step upload is 4 arrays and not 7.
+            const bool streamed = L.expert_cache != nullptr;
             for (std::size_t e = 0; e < E; ++e) {
                 const auto& Ew = L.experts[e];
                 if (Ew.format != MixtralExpertWeightFormat::Mxfp4RoutedDequant ||
-                    !Ew.w_gate_up || !Ew.w_gate_up_scale ||
-                    !Ew.w_down_packed || !Ew.w_down_scale ||
-                    !Ew.b_gate || !Ew.b_up || !Ew.b_down) {
+                    !Ew.b_gate || !Ew.b_up || !Ew.b_down ||
+                    (!streamed &&
+                     (!Ew.w_gate_up || !Ew.w_gate_up_scale ||
+                      !Ew.w_down_packed || !Ew.w_down_scale))) {
                     ok = false;
                     break;
                 }
-                gu_packed[e] = static_cast<const std::uint8_t*>(
-                    Ew.w_gate_up->data());
-                gu_scale[e] = static_cast<const std::uint8_t*>(
-                    Ew.w_gate_up_scale->data());
-                dn_packed[e] = static_cast<const std::uint8_t*>(
-                    Ew.w_down_packed->data());
-                dn_scale[e] = static_cast<const std::uint8_t*>(
-                    Ew.w_down_scale->data());
+                if (!streamed) {
+                    gu_packed[e] = static_cast<const std::uint8_t*>(
+                        Ew.w_gate_up->data());
+                    gu_scale[e] = static_cast<const std::uint8_t*>(
+                        Ew.w_gate_up_scale->data());
+                    dn_packed[e] = static_cast<const std::uint8_t*>(
+                        Ew.w_down_packed->data());
+                    dn_scale[e] = static_cast<const std::uint8_t*>(
+                        Ew.w_down_scale->data());
+                }
                 gb[e] = Ew.b_gate->data();
                 ub[e] = Ew.b_up->data();
                 db[e] = Ew.b_down->data();
