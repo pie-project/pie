@@ -131,6 +131,118 @@ async fn mtp_logits_value_verify() -> Result<()> {
     Ok(())
 }
 
+/// The accepted count never touches the host.
+///
+/// This is the payoff of the device-resident fold boundary. The host path has
+/// to await the verify fire, read `clen` back, and only THEN trace the commit
+/// -- serializing two fires that are otherwise back to back. The device path
+/// publishes `clen` into a channel the commit fire already claimed, plans
+/// against the host's own upper bound (the row's whole live buffer), and lets
+/// the driver substitute and clamp the real value.
+///
+/// The assertion is a WITHIN-RUN invariant, not a cross-run diff. Every window
+/// the inferlet echoes the device-computed `clen` back to the host and checks
+/// it against the length the host itself derived from the sentinel tail; a
+/// mismatch fails the inferlet outright. That is the exact property this path
+/// can get wrong -- the driver dropping the resolved value and folding the
+/// whole buffer bound instead -- and it is checked at every single fold.
+///
+/// It deliberately does NOT compare a host-mode decode to a device-mode decode
+/// token for token. That test is not sound on this model: the drafts feed back
+/// into the next window, so one argmax tie broken the other way by ordinary
+/// bf16 reduction-order noise forks the entire trajectory. Three IDENTICAL
+/// host-mode launches inside one engine boot were observed to produce three
+/// different token streams (`committed=23/25/26`, `steps=12/13/9`). Any
+/// equality assertion over that output is reading noise.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs the GPU + Qwen3.5-0.8B (MTP head). Run: \
+            PIE_MTP_DRAFT_TOKENS=4"]
+async fn a_device_resident_fold_length_decodes_identically() -> Result<()> {
+    common::init_trace();
+    let k = draft_k();
+
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/engine/tests/inferlets");
+    let ok = Command::new("cargo")
+        .args([
+            "build",
+            "--target",
+            "wasm32-wasip2",
+            "-p",
+            "mtp-native-verify",
+        ])
+        .current_dir(&ws)
+        .status()?
+        .success();
+    anyhow::ensure!(ok, "wasm build failed for mtp-native-verify");
+
+    let pie = common::boot_4090_mtp().await?;
+    let url = format!("ws://{}/v1/ws", pie.listen_addr);
+
+    let setup = Client::connect_with_identity(&url, "test-user")
+        .await
+        .context("connect setup")?;
+    setup.authenticate("test-user", &None).await?;
+    setup
+        .add_program(
+            &ws.join("target/wasm32-wasip2/debug/mtp_native_verify.wasm"),
+            &ws.join("mtp-native-verify/Pie.toml"),
+            true,
+        )
+        .await
+        .context("add_program mtp-native-verify")?;
+    drop(setup);
+
+    let c = Client::connect_with_identity(&url, "test-user").await?;
+    c.authenticate("test-user", &None).await?;
+    let arg = format!("{k}:device");
+    let json = c
+        .launch_process("mtp-native-verify@0.1.0".to_string(), arg.clone(), true)
+        .await
+        .context("launch mtp-native-verify")?
+        .wait_for_return()
+        .await
+        .with_context(|| format!("wait_for_return ({arg})"))?;
+    eprintln!("[mtp-native-verify] {arg} -> {json}");
+    drop(c);
+    pie.shutdown().await;
+
+    // The inferlet fails itself on the first disagreement, so reaching a
+    // result at all is most of the claim.
+    anyhow::ensure!(
+        json.contains("mtp-native-verify: mode=device"),
+        "the device fold path did not complete: {json}"
+    );
+
+    let field = |name: &str| -> Result<usize> {
+        let at = json
+            .find(&format!("{name}="))
+            .with_context(|| format!("no {name} in {json}"))?
+            + name.len()
+            + 1;
+        let rest = &json[at..];
+        let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+        Ok(rest[..end].parse()?)
+    };
+
+    let steps = field("steps")?;
+    let checked = field("fold_len_checked")?;
+    anyhow::ensure!(
+        checked == steps && steps > 0,
+        "the device fold length was verified at {checked} of {steps} windows: {json}"
+    );
+
+    // And at least one window must have folded MORE than the lone bonus token.
+    // If every `clen` were 1 the check above would pass against a driver that
+    // ignored the resolved value entirely and folded a constant.
+    anyhow::ensure!(
+        field("fold_len_nontrivial")? > 0,
+        "every window folded exactly one token, so a constant fold length would \
+         also have passed: {json}"
+    );
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs the RTX 4090; PIE_MTP_DRAFT_TOKENS=0 checks an MTP model with \
             drafting disabled, any positive value checks a model with no MTP head"]

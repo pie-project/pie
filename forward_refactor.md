@@ -1565,6 +1565,77 @@ scale so it stays meaningful.
 interior fold boundary as well. Device-boundary alone delivers the smaller and
 more valuable half — two fires, zero host round-trips between them.
 
+#### 10.2.7a Wiring it into `mtp-native-verify`
+
+§10.2.7 landed the capability against a purpose-built test. Nothing REAL used
+it, so the speculative decoder that motivated the whole thing still round-
+tripped its accepted count through the host. It no longer does.
+
+`verify_window` became a non-submitting `build_verify`, whose epilogue also
+publishes `n_acc + 1` into a `fold-len` channel; a new `build_commit` consumes
+that channel as a descriptor. The two fires are now enqueued back to back with
+nothing awaited between them. `commit_window`, which could not be traced until
+`clen` was known, is deleted.
+
+**The commit re-runs the FULL window, not the accepted prefix.** The prefix
+length is not host-known, so it cannot appear in the KV geometry. That is free:
+the verify fire already wrote KV for exactly that span, with exactly those
+tokens, at exactly those positions, so re-writing it is bit-identical, and the
+rejected tail is overwritten by the next window regardless. The recurrent side
+ignores the tokens entirely and replays the buffered activations, folding only
+as far as the device says. This is what makes a device-resident commit
+possible at all.
+
+**A compose-time instruction leaked into the kernels.**
+`PIE_RS_FLAG_FOLD_LEN_DEVICE` is an instruction to `append_rs`: *substitute the
+resolved port here*. Once substituted, the row is an ordinary buffered fold and
+must be indistinguishable from one. But the flag byte was copied verbatim into
+`out.rs_slot_flags` and travelled on into the frame and every kernel that reads
+them. It is now cleared immediately after the insert. The general rule: a flag
+that tells a compose pass what to DO is not a property of the composed row, and
+must not survive the pass that consumes it.
+
+#### 10.2.7b The equivalence test that cannot exist
+
+The obvious test — decode the same prompt with a host fold length and a device
+fold length and require identical output — is **not sound on this model**, and
+believing it cost most of a session.
+
+Three IDENTICAL host-mode launches, in ONE engine boot, against ONE model load,
+produced three different token streams: `committed=23 steps=12`,
+`committed=25 steps=13`, `committed=26 steps=9`. The cause is not the fold
+path. The decode is greedy but the model sits in an attractor (its own drafts
+come back as repeated `13477` / `3841`), so the top two logits are frequently
+within a bf16 ULP; ordinary reduction-order variation flips an argmax; and
+because the drafts FEED BACK into the next window, one flip forks the whole
+trajectory. Every cross-run comparison in that regime is reading noise — it
+will "confirm" a fix and then "regress" with no code change, which is exactly
+what happened.
+
+This generalises §10.2.5's lesson. There the fix was a relative tolerance on
+peak logits. Here even that is unavailable, because the quantity under test is
+a token stream, and a token stream downstream of a near-tie argmax has no
+tolerance.
+
+So the assertion is a **within-run invariant** instead. Each window the verify
+epilogue publishes its committed length TWICE: once into the `fold-len`
+descriptor the commit fire consumes, and once into a plain host-readable echo
+channel. (Two channels, not one: a channel claimed as a descriptor declares
+`HostRole::None` and so cannot also be a terminal host-read output — the F8
+rule again.) The loop then checks, at every fold, that the number the driver
+folded is the number the host itself derived from the sentinel tail, and fails
+the inferlet on the first disagreement. The harness additionally requires that
+every window was checked (`fold_len_checked == steps`) and that at least one
+window folded more than the lone bonus token (`fold_len_nontrivial > 0`) —
+without that second guard a driver that ignored the resolved value and folded a
+constant `1` would pass, since most windows accept nothing.
+
+The cross-mode EQUALITY claim keeps its home in `gdn-foldcommit::
+the_fold_length_can_live_on_device`, which is a single fire over a fixed input
+and is genuinely deterministic (`a_next=271 b_next=271 agree=yes`). That is the
+right place for it: equivalence belongs at the primitive, not at the end of a
+chaotic feedback loop.
+
 ### 10.4 E — Python / JavaScript SDKs
 
 Larger than §7 implies, and larger than "a port" implies either. Three

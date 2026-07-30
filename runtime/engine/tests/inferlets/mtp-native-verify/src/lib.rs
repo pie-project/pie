@@ -57,6 +57,12 @@ const MAX_TOKENS: u32 = 16;
 const PAGE_T: u32 = 16;
 
 /// Decode a `[k]`/`[k+1]` i32 host vector.
+async fn get_u32(t: inferlet::ptir::Taken) -> Result<Vec<u32>> {
+    t.get::<u32>()
+        .await
+        .map_err(|e| format!("tensor take: {e}"))
+}
+
 async fn get_i32(t: inferlet::ptir::Taken) -> Result<Vec<i32>> {
     t.get::<i32>()
         .await
@@ -220,17 +226,30 @@ async fn bootstrap(
 /// peeked off the SAME embedded tokens) against the target's per-row argmax,
 /// and draft the NEXT window natively off `mtp_logits`. Returns `(commit
 /// [k+1], next_drafts [k])`.
+///
+/// CONSTRUCTS the pass without submitting it. When `clen_out` is present the
+/// epilogue also publishes the committed length on device, and the commit fire
+/// that consumes it must already have claimed that channel -- so this fire
+/// cannot submit itself.
+///
+/// The returned fourth channel ECHOES that same device-computed length to the
+/// host. It is a separate channel, not the descriptor one: a channel a later
+/// pass claims as a descriptor declares `HostRole::None`, so it cannot also be
+/// a terminal host-read output. The echo exists purely so the loop can assert,
+/// WITHIN one run, that the number the driver folded is the number the host
+/// would have chosen -- an equality that holds regardless of which decode
+/// trajectory this particular run took.
 #[allow(clippy::too_many_arguments)]
-async fn verify_window(
+fn build_verify(
     ws: &WorkingSet,
     rs: &RsWorkingSet,
-    pipeline: &Pipeline,
     k: u32,
     seed: i32,
     draft: &[i32],
     seq_len: u32,
     max_pages: u32,
-) -> Result<(Vec<i32>, Vec<i32>)> {
+    clen_out: Option<&Channel>,
+) -> Result<(ForwardPass, Channel, Channel, Option<Channel>)> {
     let kp1 = k + 1;
     let mut window: Vec<i32> = vec![seed];
     window.extend_from_slice(draft);
@@ -238,6 +257,11 @@ async fn verify_window(
     let toks = Channel::from(window).named("v_toks");
     let commit_out = Channel::new([kp1], dtype::i32).named("v_commit");
     let drafts_out = Channel::new([k], dtype::i32).named("v_drafts");
+    let commit_out_h = commit_out.clone();
+    let drafts_out_h = drafts_out.clone();
+    let clen_sink = clen_out.cloned();
+    let clen_echo = clen_out.map(|_| Channel::new([1], dtype::u32).named("v_clen_echo"));
+    let clen_echo_h = clen_echo.clone();
 
     let fwd = ForwardPass::new();
     let kv_len = Channel::from(vec![seq_len + kp1]).named("v_kv_len");
@@ -273,70 +297,79 @@ async fn verify_window(
         let mtp = intrinsics::mtp_logits(k); // [k, vocab]
         let next_drafts = reduce_argmax(mtp); // [k] fresh drafts — NEXT window
 
+        // The committed length, on device. `n_acc` above is already the whole
+        // computation; the host's `committed_len` is just this number read out
+        // of a sentinel tail. Publishing it directly is what lets the commit
+        // fire be traced BEFORE anyone knows its value.
+        if let Some(sink) = clen_sink {
+            let clen = cast(add(&n_acc, 1u32), dtype::u32);
+            if let Some(echo) = clen_echo {
+                echo.put(&clen);
+            }
+            sink.put(&clen);
+        }
+
         commit_out.put(&commit);
         drafts_out.put(&next_drafts);
     });
 
-    fwd.submit(pipeline)
-        .map_err(|e| format!("verify submit: {e}"))?;
-    let commit = get_i32(commit_out.take()).await?;
-    let drafts = get_i32(drafts_out.take()).await?;
-    Ok((commit, drafts))
+    Ok((fwd, commit_out_h, drafts_out_h, clen_echo_h))
 }
 
-/// Move the folded boundary through the `clen` accepted tokens the verify
-/// window buffered, then drop whatever it did not reach.
+/// The same commit, with the accepted length never read back to the host.
 ///
-/// `window_prefix` is the first `clen` tokens of the VERIFY WINDOW — not the
-/// tokens the verify predicted. The recurrent side ignores them entirely and
-/// replays the buffered activations instead, which is the whole point: the
-/// expensive in-projection is not recomputed. They matter only to the KV side,
-/// which re-runs the same span this window already wrote and must therefore
-/// write back the same values. Feeding the predicted tokens here would shift
-/// the sequence by one and corrupt the accepted prefix's KV.
+/// This is the point of the whole fold-commit path. `commit_window` above
+/// cannot be TRACED until `clen` is known, so the host has to await the verify
+/// fire between two fires that are otherwise back to back. Here `fold_len` is
+/// a channel the verify epilogue fills, the host plans against its own UPPER
+/// BOUND -- the row's whole live buffer -- and the driver substitutes the real
+/// value and clamps it.
 ///
-/// Nothing here is read, and nothing here CAN be read: with a fold boundary
-/// set the linear layers stop after the recurrence and never reach the output
-/// projection, so the driver refuses a fold fire that declares sample rows
-/// ("buffered RS fold is state-only and cannot sample logits"). The fire is
-/// therefore submitted with an empty readout and no epilogue, and it is not
-/// awaited — fires on one pipeline are ordered, so the next window already
-/// observes the advanced boundary, and any driver failure surfaces as channel
-/// poison on that window's first read.
-#[allow(clippy::too_many_arguments)]
-async fn commit_window(
+/// Two consequences shape this function.
+///
+/// **It re-runs the FULL window, not the accepted prefix.** The prefix is not
+/// host-known here, so its length cannot appear in the KV geometry. That costs
+/// nothing: the verify fire already wrote KV for this exact span with these
+/// exact tokens at these exact positions, so re-writing it is bit-identical,
+/// and the rejected tail is overwritten by the next window regardless. The
+/// recurrent side ignores these tokens completely and replays the buffered
+/// activations, folding only as far as the device says.
+///
+/// **It is CONSTRUCTED before the verify fire is submitted.** A channel a
+/// later pass consumes as a descriptor must be claimed by that pass first, or
+/// the producer infers it as a terminal host-read output and the two
+/// declarations conflict at bind. Construction order, not annotation.
+fn build_commit(
     ws: &WorkingSet,
     rs: &RsWorkingSet,
-    pipeline: &Pipeline,
-    window_prefix: &[i32],
+    window: &[i32],
     seq_len: u32,
     max_pages: u32,
-) -> Result<()> {
-    let clen = window_prefix.len() as u32;
-    if clen == 0 {
-        return Ok(());
-    }
-    let toks = Channel::from(window_prefix.to_vec()).named("c_toks");
+    fold_len: &Channel,
+) -> Result<ForwardPass> {
+    let count = window.len() as u32;
+    let toks = Channel::from(window.to_vec()).named("c_toks");
 
     let fwd = ForwardPass::new();
-    let kv_len = Channel::from(vec![seq_len + clen]).named("c_kv_len");
-    bind_window(&fwd, ws, &toks, &kv_len, seq_len, clen, max_pages, &[])?;
+    let kv_len = Channel::from(vec![seq_len + count]).named("c_kv_len");
+    bind_window(&fwd, ws, &toks, &kv_len, seq_len, count, max_pages, &[])?;
 
-    let fold_len = Channel::from(vec![clen]).named("c_fold_len");
-    fwd.recurrent_with(std::slice::from_ref(rs), &fold_len, ..)
-    .map_err(|e| format!("commit recurrent binding: {e}"))?;
-    // A stage-less pass has no PTIR program to register at all, which the
-    // driver rejects. An EMPTY epilogue is the minimal well-formed program: it
-    // samples nothing, so the fold fire declares no readout rows.
+    fwd.recurrent_with(std::slice::from_ref(rs), fold_len, ..)
+        .map_err(|e| format!("commit recurrent binding: {e}"))?;
     fwd.epilogue(|| {});
-    fwd.submit(pipeline)
-        .map_err(|e| format!("commit submit: {e}"))?;
-    Ok(())
+    Ok(fwd)
 }
 
 #[inferlet::main]
 async fn main(input: String) -> Result<String> {
-    let k: u32 = input.trim().parse().unwrap_or(4).max(2);
+    // `k` or `k:device`. The device mode keeps the accepted length on the GPU
+    // instead of reading it back to choose the commit's fold length; both
+    // modes must decode the identical string, which is what the harness pins.
+    let (k_str, device) = match input.trim().split_once(':') {
+        Some((k, "device")) => (k, true),
+        _ => (input.trim(), false),
+    };
+    let k: u32 = k_str.trim().parse().unwrap_or(4).max(2);
     if !wit_model::is_linear() {
         // The buffer this inferlet's accept step depends on only exists on a
         // linear model. On a pure-attention model a rejected tail is discarded
@@ -373,6 +406,8 @@ async fn main(input: String) -> Result<String> {
     let mut seed = seed0;
     let mut draft = draft0;
     let mut accepted_lengths: Vec<usize> = Vec::new();
+    let mut clen_agreements = 0usize;
+    let mut clen_nontrivial = 0usize;
     let mut generated: u32 = 1;
 
     // North-star spec-decode loop: verify the embedded drafts against the
@@ -389,11 +424,68 @@ async fn main(input: String) -> Result<String> {
         rs.alloc_buffer(window_slabs)
             .map_err(|e| format!("rs.alloc_buffer: {e}"))?;
 
-        let (commit, drafts) = verify_window(
-            &ws, &rs, &pipeline, k, seed, &draft, seq_len, max_pages,
-        )
-        .await?;
+        let window: Vec<i32> = std::iter::once(seed).chain(draft.iter().copied()).collect();
+
+        // The device path builds the COMMIT first -- it must claim `clen`
+        // before the verify fire that fills it is submitted -- then enqueues
+        // both fires back to back with nothing awaited in between. The host
+        // path cannot: its commit is untraceable until `clen` is known.
+        let clen_ch = device.then(|| Channel::new([1], dtype::u32).named("v_clen"));
+        let (verify, commit_out, drafts_out, clen_echo) = build_verify(
+            &ws, &rs, k, seed, &draft, seq_len, max_pages, clen_ch.as_ref(),
+        )?;
+        // The commit is CONSTRUCTED here -- after the verify pass is built but
+        // before it is submitted. F8 only requires the consumer to claim the
+        // channel before the producer is submitted; building it earlier would
+        // also take its KV pages out of the working set ahead of the verify's,
+        // which is a different trace.
+        let device_commit = match &clen_ch {
+            Some(ch) => Some(build_commit(
+                &ws, &rs, &window, seq_len, max_pages, ch,
+            )?),
+            None => None,
+        };
+
+        verify
+            .submit(&pipeline)
+            .map_err(|e| format!("verify submit: {e}"))?;
+
+        if let Some(c) = device_commit.as_ref() {
+            c.submit(&pipeline)
+                .map_err(|e| format!("device commit submit: {e}"))?;
+        }
+
+        let commit = get_i32(commit_out.take()).await?;
+        let drafts = get_i32(drafts_out.take()).await?;
         let clen = committed_len(&commit); // n_acc accepted + 1 bonus (≥ 1)
+
+        // The device path's whole claim is that the number the DRIVER folded is
+        // the number the host would have chosen. Assert it here, in the same
+        // run: `clen_echo` is the very expression that fed the `fold-len`
+        // descriptor, so an equality failure means the boundary moved somewhere
+        // the host never sanctioned.
+        //
+        // This is a WITHIN-run invariant on purpose. Comparing a host-mode
+        // decode against a device-mode decode token-for-token does not work on
+        // this model: the drafts feed back into the next window, and a single
+        // argmax tie broken the other way by ordinary bf16 reduction-order
+        // noise forks the whole trajectory. Three identical host-mode launches
+        // in one engine boot produce different token streams.
+        if let Some(echo) = clen_echo {
+            let seen = get_u32(echo.take()).await?;
+            match seen.first().copied() {
+                Some(v) if v as usize == clen => clen_agreements += 1,
+                other => {
+                    return Err(format!(
+                        "device fold length {other:?} disagrees with the host's \
+                         committed length {clen} at seq_len {seq_len}"
+                    ));
+                }
+            }
+            if clen > 1 {
+                clen_nontrivial += 1;
+            }
+        }
         let n_acc = clen.saturating_sub(1);
         accepted_lengths.push(n_acc);
         let commit_toks: Vec<u32> = commit.iter().take(clen).map(|&t| t as u32).collect();
@@ -408,11 +500,14 @@ async fn main(input: String) -> Result<String> {
         // window shifted by one (each entry is what the target predicted
         // AFTER the corresponding window token), so feeding it here would
         // corrupt exactly the prefix being committed.
-        let window_prefix: Vec<i32> = std::iter::once(seed)
-            .chain(draft.iter().copied())
-            .take(clen)
-            .collect();
-        commit_window(&ws, &rs, &pipeline, &window_prefix, seq_len, max_pages).await?;
+        if !device {
+            // The host path can only trace its commit NOW, with `clen` in
+            // hand, which is exactly the round-trip the device path removes.
+            let fold = Channel::from(vec![clen as u32]).named("c_fold_len");
+            let pass = build_commit(&ws, &rs, &window[..clen], seq_len, max_pages, &fold)?;
+            pass.submit(&pipeline)
+                .map_err(|e| format!("commit submit: {e}"))?;
+        }
         let remaining = rs.buffer_size();
         if remaining > 0 {
             rs.free_buffer(&(0..remaining).collect::<Vec<_>>())
@@ -437,9 +532,11 @@ async fn main(input: String) -> Result<String> {
         0.0
     };
     let result = format!(
-        "mtp-native-verify: k={k} steps={steps} accepted_lengths={accepted_lengths:?} \
-         mean_accept={mean_acc:.2} committed={} (PTIR-native verify+draft: verify vs embedded \
+        "mtp-native-verify: mode={} k={k} steps={steps} accepted_lengths={accepted_lengths:?} \
+         mean_accept={mean_acc:.2} committed={} fold_len_checked={clen_agreements} \
+         fold_len_nontrivial={clen_nontrivial} (PTIR-native verify+draft: verify vs embedded \
          drafts, next-drafts from mtp_logits argmax, [k+1] bonus tail, all traced)",
+        if device { "device" } else { "host" },
         committed.len()
     );
     eprintln!("{result}");

@@ -709,6 +709,18 @@ inline bool compose_forward_batch(const pie_native::LaunchView& view,
                 out.rs_slot_flags.end(),
                 input_rs_flags.begin() + begin,
                 input_rs_flags.begin() + begin + count);
+            // FOLD_LEN_DEVICE is an instruction to THIS function, not a
+            // property of the row. Once the resolved length has been
+            // substituted below, the row is an ordinary buffered fold and must
+            // be indistinguishable from one -- so the bit is cleared here
+            // rather than travelling on into the frame and the kernels, where
+            // "does this row carry an unresolved length" is no longer true and
+            // nothing downstream should be able to branch on it.
+            for (std::size_t i = out.rs_slot_flags.size() - count;
+                 i < out.rs_slot_flags.size(); ++i) {
+                out.rs_slot_flags[i] &=
+                    static_cast<std::uint8_t>(~PIE_RS_FLAG_FOLD_LEN_DEVICE);
+            }
             // The fold length is the ONE RS quantity the host is allowed not
             // to know. A row flagged FOLD_LEN_DEVICE carries, on the wire, the
             // host's UPPER BOUND on its own buffer occupancy -- not garbage --
