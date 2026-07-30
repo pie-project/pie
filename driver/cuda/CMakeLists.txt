@@ -515,6 +515,7 @@ add_library(pie_driver_cuda_lib STATIC
   src/batch/frame.cpp
   src/batch/forward.cpp
   src/batch/persistent_inputs.cpp
+  src/batch/planner_calibration.cpp
   src/batch/tp.cpp
   src/batch/workspace.cu
   # pipeline/ -- guest programs (PTIR dispatch, tier0, frame carrier)
@@ -529,6 +530,7 @@ add_library(pie_driver_cuda_lib STATIC
   src/store/kv_cache_format.cpp
   src/store/elastic.cpp
   src/store/memory_planner.cpp
+  src/store/planner_profile_cache.cpp
   src/store/recurrent_state_cache.cpp
   src/store/swap_pool.cpp
   # ops/ -- attention / GEMM / MoE / SSM wrappers
@@ -1086,6 +1088,16 @@ if(PIE_LOADER_STATICLIB)
       ${PIE_LOADER_INCLUDE_DIR}
     LIBS pie_driver_cuda_lib nlohmann_json::nlohmann_json ${PIE_LOADER_STATICLIB} dl pthread)
 endif()
+# The non-compact ExtentWrite path. Header-only: it builds its own one-file
+# plan, so it needs the loader's headers but not the staticlib.
+pie_add_cuda_target(test_strided_copy
+  SOURCES tests/strided_copy_test.cu
+  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/src ${PIE_LOADER_INCLUDE_DIR}
+  LIBS CUDA::cudart)
+pie_add_cuda_target(test_chunked_argmax
+  SOURCES tests/test_chunked_argmax.cu src/kernels/argmax.cu
+  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/src ${PIE_LOADER_INCLUDE_DIR}
+  LIBS CUDA::cudart)
 pie_add_cuda_target(test_nucleus_region
   SOURCES tests/nucleus_region_test.cpp
   INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/../abi/include ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include ${PIE_DRIVER_ABI_INCLUDE_DIR} ${PIE_LOADER_INCLUDE_DIR}

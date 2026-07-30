@@ -34,14 +34,19 @@
 /// | `transmute(x, shape, enc)`       | bytes                | Same bytes under a new type; one `-1` is inferred |
 /// | `scale(x, factor)`               | type                 | Multiply every element                      |
 /// | `cast(x, enc)`                   | values               | The same values in another representation   |
-/// | `repack(x, spec, out)`           | --                   | An opaque kernel-specific relayout          |
+/// | `repack(x, spec, out)`           | values, type         | An opaque kernel-specific relayout          |
 /// | `index_src("a.{}.w")`            | --                   | A checkpoint tensor named for this instance |
 /// | `select(x, axis, stride, len)`   | bytes, values, type  | This instance's band along one axis         |
 ///
 /// The five that preserve all three move bytes and nothing else: what comes out
 /// is a rearrangement of what went in, and every one of them compiles to byte
-/// runs the loader can read straight out of the checkpoint. Everything below
-/// them costs a kernel.
+/// runs the loader can read straight out of the checkpoint.
+///
+/// `transmute` is free as well — it renames bytes without moving them. The
+/// other three cost a kernel. `repack` preserves everything the five do except
+/// placement, and it is held to that: it may pad, and it may not reinterpret an
+/// element. It is a relayout priced as a kernel, not an escape hatch for
+/// whatever a relayout could be made to do.
 ///
 /// `slice`, `stride` and `gather` are three rungs of one cost ladder, and the
 /// author picks the rung. A band leaves every run in the source intact; a
@@ -50,6 +55,10 @@
 /// cheaper node could express, so the ladder cannot be climbed by accident.
 /// For the same reason neither `stride` nor `gather` may touch a quantized
 /// axis, where a `slice` may as long as it lands on group boundaries.
+///
+/// No model has needed `gather` yet. It is the rung that makes the other two
+/// the cheap ends of one operation rather than a pair of special cases, so it
+/// stays; reach for it only when no arithmetic describes the order you want.
 ///
 /// `shard` is the only node that means different things on different ranks, and
 /// it is resolved before anything downstream of it runs — which is why a
@@ -441,15 +450,22 @@ public:
         return push(node);
     }
 
-    /// An opaque kernel-specific relayout.
+    /// A named hardware layout, applied to whatever `src` selects.
     ///
-    /// The type checker cannot see through a repack, so `out_shape` and
-    /// `out_encoding` are taken on trust and are the driver's responsibility.
-    Node repack(Node src, PieLoaderRepackSpecView spec, std::vector<std::int64_t> out_shape,
+    /// The escape hatch, and only for what genuinely escapes: `layout` names a
+    /// kernel and nothing else. Which rows and columns the kernel sees is
+    /// `src`'s business -- use `slice`, `shard` and `stride` for that -- and the
+    /// loader derives the kernel's geometry from `src`'s inferred type, so a
+    /// contract cannot disagree with the tensor it is reading.
+    ///
+    /// `out_shape` may be *larger* than what `src` holds on either of the last
+    /// two axes; the kernel zero-fills the difference, which is how a Marlin
+    /// tile size is met. It may not be smaller: a truncation is a `slice`.
+    Node repack(Node src, PieLoaderRepackLayout layout, std::vector<std::int64_t> out_shape,
                 PieLoaderEncodingSpec out_encoding) {
         PieLoaderExprNode node = blank(PieLoaderExprKind::Repack);
         node.src = src.index_;
-        node.repack = spec;
+        node.repack_layout = static_cast<std::uint32_t>(layout);
         node.out_shape = store_shape(std::move(out_shape));
         node.out_encoding = out_encoding;
         return push(node);
@@ -608,8 +624,7 @@ private:
         node.src = PIE_LOADER_NO_NODE;
         node.step = 1;
         node.out_encoding = raw(PieLoaderDType::BF16);
-        node.repack.layout = static_cast<std::uint32_t>(PieLoaderRepackLayout::None);
-        node.repack.row_map = static_cast<std::uint32_t>(PieLoaderRowMap::Identity);
+        node.repack_layout = static_cast<std::uint32_t>(PieLoaderRepackLayout::None);
         return node;
     }
 

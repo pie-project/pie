@@ -3,10 +3,12 @@
 and the raw-Metal driver taps.
 
 Both trees are written by the PIE_METAL_GOLDEN_DIR hook: the reference by
-tests/mlx/model/qwen3_5.cpp's dump_kernel, the driver by src/batch/golden_tap.cpp.
-Identical names, identical shapes, so the comparison is name-by-name.
+tests/mlx/model/qwen3_5.cpp's dump_kernel (or, for gemma4, by
+tests/parity/gemma4_mlx_taps.py), the driver by src/batch/golden_tap.cpp (or
+tests/gemma4_forward_test.cpp). Identical names, identical shapes, so the
+comparison is name-by-name.
 
-Usage: cosine_bisect.py <ref_dir> <metal_dir> [--row N]
+Usage: cosine_bisect.py <ref_dir> <metal_dir> [--row N] [--family qwen3_5|gemma4]
 """
 import sys
 import os
@@ -19,6 +21,48 @@ GDN_ORDER = ["attn_norm", "gdn_in_qkv", "gdn_in_z", "gdn_in_a", "gdn_in_b",
 ATTN_ORDER = ["attn_norm", "q_proj", "k_proj", "v_proj", "q_norm", "k_norm",
               "rope_q", "rope_k", "sdpa", "attn_gated", "o_proj", "attn_resid"]
 MLP_ORDER = ["ffn_norm", "gate_proj", "up_proj", "swiglu", "down_proj", "layer_out"]
+
+# gemma4: the norm sandwich, the per-layer-embedding residual and the layer
+# scalar are all extra, and the whole PLE stream runs once before the stack.
+G4_PRE = ["embed", "ple_tok", "ple_proj", "ple_projnorm", "ple"]
+# `attn_postnorm`/`ffn_postnorm`/`ple_norm`/`ple_resid` are reference-only: the
+# driver fuses each closing norm into the residual add that always follows it,
+# so those intermediates are no longer tensors anything can observe. Taps only
+# one side emits are skipped.
+G4_LAYER = ["attn_norm", "q_proj", "k_proj", "v_proj", "q_norm", "k_norm",
+            "v_norm", "rope_q", "rope_k", "sdpa", "o_proj", "attn_postnorm",
+            "attn_resid", "ffn_norm", "gate_proj", "up_proj", "geglu",
+            "down_proj", "ffn_postnorm", "ffn_resid", "ple_gate", "ple_act",
+            "ple_back", "ple_norm", "ple_resid", "layer_out"]
+G4_TAIL = ["final_norm", "logits_raw", "logits"]
+
+# gpt-oss: sparse MoE every layer, attention sinks, no QK-norm.
+GO_LAYER = ["attn_norm", "q_proj", "k_proj", "v_proj", "rope_q", "rope_k",
+            "sdpa", "o_proj", "attn_resid", "ffn_norm", "router",
+            "expert_gate", "expert_up", "expert_act", "expert_out", "moe",
+            "layer_out"]
+
+
+def taps_qwen3_5(n_layers=24):
+    taps = [(-1, "embed")]
+    for L in range(n_layers):
+        block = ATTN_ORDER if (L % 4) == 3 else GDN_ORDER
+        taps += [(L, k) for k in block] + [(L, k) for k in MLP_ORDER]
+    return taps + [(-1, "final_norm"), (-1, "logits")]
+
+
+def taps_gptoss(n_layers=24):
+    taps = [(-1, "embed")]
+    for L in range(n_layers):
+        taps += [(L, k) for k in GO_LAYER]
+    return taps + [(-1, "final_norm"), (-1, "logits")]
+
+
+def taps_gemma4(n_layers=35):
+    taps = [(-1, k) for k in G4_PRE]
+    for L in range(n_layers):
+        taps += [(L, k) for k in G4_LAYER]
+    return taps + [(-1, k) for k in G4_TAIL]
 
 
 def cosine(a, b):
@@ -37,13 +81,16 @@ def main():
     row = None
     if "--row" in sys.argv:
         row = int(sys.argv[sys.argv.index("--row") + 1])
+    family = "qwen3_5"
+    if "--family" in sys.argv:
+        family = sys.argv[sys.argv.index("--family") + 1]
 
-    n_layers = 24
-    taps = [(-1, "embed")]
-    for L in range(n_layers):
-        block = ATTN_ORDER if (L % 4) == 3 else GDN_ORDER
-        taps += [(L, k) for k in block] + [(L, k) for k in MLP_ORDER]
-    taps += [(-1, "final_norm"), (-1, "logits")]
+    if family == "gemma4":
+        taps = taps_gemma4()
+    elif family == "gptoss":
+        taps = taps_gptoss()
+    else:
+        taps = taps_qwen3_5()
 
     print(f"{'tap':<22} {'cos':>10} {'rel_l2':>10} {'ref_rms':>10} {'mtl_rms':>10}")
     print("-" * 66)
@@ -60,6 +107,14 @@ def main():
         n = min(r.shape[0], m.shape[0])
         if row is not None:
             r, m = r[row:row + 1], m[row:row + 1]
+        elif r.shape[0] != m.shape[0]:
+            # A teacher-forced decode candidate has ONE row -- the step just
+            # run -- against a reference that ran the whole prompt at once. The
+            # rows that line up are the last of each; taking `[:n]` instead
+            # would compare the reference's FIRST position, which at position 0
+            # is the one place RoPE is the identity and so the one place this
+            # comparison proves nothing.
+            r, m = r[-1:], m[-1:]
         else:
             r, m = r[:n], m[:n]
         if r.shape[1] != m.shape[1]:

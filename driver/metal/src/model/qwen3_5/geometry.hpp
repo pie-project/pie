@@ -37,9 +37,15 @@ struct DecodeGeometry {
     int total_pages = 1;
     bool paged_kv_enabled = false;
 
-    static constexpr int full_attn_interval = 4;
-    static constexpr bool is_full_attn(int layer) {
-        return (layer % full_attn_interval) == (full_attn_interval - 1);
+    // Which layers use full attention rather than linear/sliding. qwen3.5 puts
+    // one every `full_attn_interval`; a family with no linear attention sets the
+    // interval to 1, which makes every layer qualify. Runtime, not `constexpr`,
+    // because the interval is a property of the checkpoint and this driver is no
+    // longer built around exactly one of them.
+    int full_attn_interval = 4;
+    bool is_full_attn(int layer) const {
+        return full_attn_interval <= 1 ||
+               (layer % full_attn_interval) == (full_attn_interval - 1);
     }
 
     std::size_t gdn_conv_stride_bytes() const {

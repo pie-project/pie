@@ -32,8 +32,17 @@
 #include <metal_stdlib>
 using namespace metal;
 
+// The online softmax strides keys by BN=32 simdgroups, so the threadgroup must
+// be exactly BN*BD = 1024 threads: with fewer, the keys belonging to the missing
+// simdgroups are never visited and the attention is silently partial.
+//
+// At D=512 the compiler's default register allocation only admits 896, and a
+// dispatch that exceeds a pipeline's limit does not run AT ALL -- which reads,
+// downstream, as an attention output of exactly zero. gemma4's full-attention
+// layers are 512 wide, so every one of them was skipped. Pinning the bound makes
+// the compiler fit 1024 (spilling if it must) instead of quietly allowing less.
 template <typename T, int D, int V = D>
-[[kernel]] void sdpa_paged_decode(
+[[kernel]] [[max_total_threads_per_threadgroup(1024)]] void sdpa_paged_decode(
     const device T* queries     [[buffer(0)]],   // [N, n_q_heads, D]
     const device T* k_pages     [[buffer(1)]],   // [num_pages, page_size, n_kv_heads, D]
     const device T* v_pages     [[buffer(2)]],
@@ -49,6 +58,7 @@ template <typename T, int D, int V = D>
     const device uchar* attention_mask      [[buffer(12)]],
     const device uint& attention_mask_stride[[buffer(13)]],
     const device uchar* attention_mask_enabled [[buffer(14)]],
+    const constant int& window                 [[buffer(15)]],
     uint3 tid       [[threadgroup_position_in_grid]],
     uint3 tpg       [[threadgroups_per_grid]],
     uint simd_gid   [[simdgroup_index_in_threadgroup]],
@@ -75,7 +85,12 @@ template <typename T, int D, int V = D>
 
   // This query row's request + causal bound + its request's page-list base.
   const int r          = req_of_token[row];
-  const int q_pos      = position_ids[row];   // attends kv positions [0, q_pos]
+  const int q_pos      = position_ids[row];   // attends kv positions [kv_start, q_pos]
+  // Sliding window: the span starts `window-1` before this row's own position
+  // rather than at 0. window<=0 is full attention, which is the same loop with
+  // kv_start==0 -- so one kernel serves both, and a sliding layer cannot drift
+  // from a full one.
+  const int kv_start   = (window > 0 && q_pos >= window) ? (q_pos - window + 1) : 0;
   const int page_base  = int(kv_page_indptr[r]);
   const int kv_row     = n_kv_heads * D;       // elements per token-slot across kv heads
 
@@ -90,7 +105,7 @@ template <typename T, int D, int V = D>
   U sum_exp_score = 0;
 
   // Online-softmax over kv positions kp = simd_gid, +BN, ... up to and including q_pos.
-  for (int kp = simd_gid; kp <= q_pos; kp += BN) {
+  for (int kp = kv_start + simd_gid; kp <= q_pos; kp += BN) {
     if (attention_mask_enabled[row] != 0 &&
         (uint(kp) >= attention_mask_stride ||
          attention_mask[size_t(row) * attention_mask_stride + uint(kp)] == 0)) {
@@ -145,6 +160,7 @@ template <typename T, int D, int V = D>
       const device int*, const device uint*, const device uint*,           \
       const constant int&, const constant int&, const constant float&,     \
       const device uchar*, const device uint&, const device uchar*,        \
+      const constant int&,                                                 \
       uint3, uint3, uint, uint);
 
 instantiate_sdpa_paged(float32, float, 256, 256)

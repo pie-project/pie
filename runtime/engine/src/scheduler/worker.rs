@@ -1742,6 +1742,10 @@ impl QueueScan {
 struct PendingQueue {
     items: VecDeque<QueuedItem>,
     epoch: u64,
+    /// `(epoch, index of the first non-`Launch` item)`.
+    first_other: Option<(u64, Option<usize>)>,
+    /// `(epoch, index of the first queued close)`.
+    first_close: Option<(u64, usize)>,
 }
 
 impl PendingQueue {
@@ -1753,6 +1757,73 @@ impl PendingQueue {
     fn replace(&mut self, items: VecDeque<QueuedItem>) {
         self.items = items;
         self.epoch = self.epoch.wrapping_add(1);
+    }
+
+    /// Offset of the first item that is not a `Launch`, or `None` when the
+    /// queue is all launches.
+    ///
+    /// Both this and [`Self::first_close`] answer "where does the launch run
+    /// end", which every worker pass asks at least once. At a cohort boundary
+    /// the queue is a run of thousands of launches held back by an unsealed
+    /// frame, so the linear search — run once per pass and once per queued
+    /// control — was measured as the loop's single largest per-pass cost
+    /// (~18 us/pass against ~3 us elsewhere). The scan itself is unavoidable;
+    /// repeating it while the queue is unchanged is not, so both are cached
+    /// against the same epoch that guards [`ScanCache`].
+    fn first_other(&mut self) -> Option<usize> {
+        if let Some((epoch, idx)) = self.first_other
+            && epoch == self.epoch
+        {
+            return idx;
+        }
+        let idx = self
+            .items
+            .iter()
+            .position(|item| !matches!(item, QueuedItem::Launch(_)));
+        self.first_other = Some((self.epoch, idx));
+        idx
+    }
+
+    /// Offset of the first queued close, or the length when there is none.
+    fn first_close(&mut self) -> usize {
+        if let Some((epoch, idx)) = self.first_close
+            && epoch == self.epoch
+        {
+            return idx;
+        }
+        let idx = self
+            .items
+            .iter()
+            .position(|item| {
+                matches!(
+                    item,
+                    QueuedItem::CloseInstance { .. } | QueuedItem::CloseChannels { .. }
+                )
+            })
+            .unwrap_or(self.items.len());
+        self.first_close = Some((self.epoch, idx));
+        idx
+    }
+
+    /// Move the leading run of launches behind the rest of the queue.
+    ///
+    /// Equivalent to popping each leading launch off the front and pushing it
+    /// back, but as one rotation rather than thousands of individual moves.
+    fn rotate_launch_run_to_back(&mut self, run_len: usize) {
+        self.items.rotate_left(run_len);
+        self.epoch = self.epoch.wrapping_add(1);
+    }
+
+    /// Insert a bring-up control ahead of the trailing close run.
+    fn insert_before_closes(&mut self, item: QueuedItem) {
+        let index = self.first_close();
+        self.items.insert(index, item);
+        self.epoch = self.epoch.wrapping_add(1);
+        // The insert shifted the close run one to the right and put a
+        // non-close at `index`, so the next control lands after this one and
+        // bind-vs-bind order is preserved without rescanning.
+        self.first_close = Some((self.epoch, index + 1));
+        self.first_other = None;
     }
 }
 
@@ -1772,7 +1843,12 @@ impl std::ops::DerefMut for PendingQueue {
 
 impl From<VecDeque<QueuedItem>> for PendingQueue {
     fn from(items: VecDeque<QueuedItem>) -> Self {
-        Self { items, epoch: 0 }
+        Self {
+            items,
+            epoch: 0,
+            first_other: None,
+            first_close: None,
+        }
     }
 }
 
@@ -1781,6 +1857,8 @@ impl FromIterator<QueuedItem> for PendingQueue {
         Self {
             items: iter.into_iter().collect(),
             epoch: 0,
+            first_other: None,
+            first_close: None,
         }
     }
 }
@@ -2402,6 +2480,19 @@ impl BatchScheduler {
             {
                 break;
             }
+
+            // Cohort-boundary bind deferral: while the seal waits on a
+            // successor's arrival, hold back the bind permits that retiring
+            // processes return, so the staged cohort's working-set
+            // declaration and prefill construction do not compete with the
+            // boundary's own bring-up. Cleared the moment this pass has
+            // nothing left to do, which is what makes the hold incapable of
+            // being the last thing standing.
+            crate::inferlet::process::set_bind_release_hold(
+                !stopping
+                    && frame_policy.is_joining()
+                    && (progress || !in_flight_launches.is_empty() || in_flight_control.is_some()),
+            );
 
             if progress {
                 stall_since = None;
@@ -3146,16 +3237,7 @@ impl BatchScheduler {
         // committed), so binds still jump the close tail and closes drain
         // during the next generation's execution. Bind-vs-bind order is
         // preserved (insertion before the trailing close run).
-        let index = pending
-            .iter()
-            .position(|queued| {
-                matches!(
-                    queued,
-                    QueuedItem::CloseInstance { .. } | QueuedItem::CloseChannels { .. }
-                )
-            })
-            .unwrap_or(pending.len());
-        pending.insert(index, item);
+        pending.insert_before_closes(item);
     }
 
     /// launch that reached the queue front has no queued copy left).
@@ -3163,13 +3245,10 @@ impl BatchScheduler {
         if !matches!(pending.front(), Some(QueuedItem::Launch(_))) {
             return false;
         }
-        let Some(work) = pending
-            .iter()
-            .skip(1)
-            .find(|item| !matches!(item, QueuedItem::Launch(_)))
-        else {
+        let Some(run_len) = pending.first_other() else {
             return false;
         };
+        let work = &pending[run_len];
         if !(Self::standalone_copy(work)
             || (allow_controls
                 && (Self::lifecycle_control(work)
@@ -3177,10 +3256,7 @@ impl BatchScheduler {
         {
             return false;
         }
-        while matches!(pending.front(), Some(QueuedItem::Launch(_))) {
-            let launch = pending.pop_front().expect("launch front");
-            pending.push_back(launch);
-        }
+        pending.rotate_launch_run_to_back(run_len);
         true
     }
 

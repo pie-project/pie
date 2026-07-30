@@ -63,8 +63,6 @@ using pie_loader::PieLoaderQuantGranularity;
 using pie_loader::PieLoaderQuantScheme;
 using pie_loader::PieLoaderQuantSpecView;
 using pie_loader::PieLoaderRepackLayout;
-using pie_loader::PieLoaderRepackSpecView;
-using pie_loader::PieLoaderRowMap;
 using pie_loader::PieLoaderScaleForm;
 
 /// Which half of a multimodal checkpoint to load.
@@ -314,23 +312,6 @@ inline std::uint32_t u32_dim(std::int64_t value, std::string_view context) {
     return static_cast<std::uint32_t>(value);
 }
 
-/// The `[start, len)` this rank owns of a `full`-long axis.
-///
-/// `what` names the thing being split, because this is the message a user gets
-/// for "tp_size does not divide this model".
-inline std::pair<std::int64_t, std::int64_t> local_range(std::int64_t full,
-                                                         const pie_loader::DeviceTarget& target,
-                                                         const std::string& what) {
-    const std::int64_t world = std::max<std::int64_t>(1, target.tp_size);
-    if (full % world != 0) {
-        fail(what + " is " + std::to_string(full) + ", which tp_size " +
-             std::to_string(target.tp_size) +
-             " does not divide; use a tp_size that divides it or run single-GPU");
-    }
-    const std::int64_t local = full / world;
-    return {static_cast<std::int64_t>(target.tp_rank) * local, local};
-}
-
 inline PieLoaderEncodingSpec mxfp4_encoding(ModelContract& contract, std::uint8_t channel_axis) {
     PieLoaderQuantSpecView quant =
         pie_loader::quant_spec(PieLoaderQuantScheme::Mxfp4E2M1E8M0, PieLoaderDType::BF16);
@@ -355,13 +336,6 @@ inline PieLoaderEncodingSpec int4b8_encoding(std::uint8_t channel_axis) {
     quant.group_size = 32;
     quant.channel_axis = channel_axis;
     return pie_loader::quantized(quant);
-}
-
-inline PieLoaderRepackSpecView repack_spec(PieLoaderRepackLayout layout, PieLoaderRowMap row_map) {
-    PieLoaderRepackSpecView spec{};
-    spec.layout = static_cast<std::uint32_t>(layout);
-    spec.row_map = static_cast<std::uint32_t>(row_map);
-    return spec;
 }
 
 inline std::vector<std::int64_t> shape_of(const SourceTensor& raw) {
@@ -616,19 +590,6 @@ public:
     /// the generic tail does not publish it a second time.
     void consume(std::uint32_t id) { consumed_.insert(id); }
 
-    /// The `[start, len)` this rank owns of a `full`-long axis, as numbers.
-    ///
-    /// **`Repack` only.** A repack spec carries `source_row_offset` as an
-    /// integer a kernel reads, so the escape hatch has nowhere to put a `Shard`
-    /// node and the rank has to be resolved here. Everything affine must use
-    /// [`band`] or [`split`] instead: baking `start + tp_rank * len` into a
-    /// `Slice` makes the contract a second per-rank input to compilation, and
-    /// §6.3's rank-uniformity guarantee rests on the target being the only one.
-    std::pair<std::int64_t, std::int64_t> local_range(std::int64_t full,
-                                                      const std::string& what) const {
-        return contract_detail::local_range(full, target_, what);
-    }
-
     /// Record that `expr` is split across ranks along `axis`.
     ///
     /// Left alone when there is nothing to split, so a single-GPU contract is
@@ -800,11 +761,16 @@ public:
         consumed_.insert(raw.id);
     }
 
+    /// Publish `src` under `output`, relaid out by `layout`.
+    ///
+    /// `src` is an expression, not a name, because the selection a kernel used
+    /// to carry as integers -- this rank's rows, the interleaved half, the
+    /// column band -- is stated in the algebra now. `consume` the checkpoint
+    /// tensor separately if the generic tail should not republish it.
     std::optional<pie_loader::ModelContract::Defined> push_repack(
-        std::string output, const SourceTensor& raw, PieLoaderEncodingSpec encoding,
-        std::vector<std::int64_t> shape, PieLoaderRepackSpecView spec) {
-        const Node node =
-            contract_.repack(contract_.src(std::string(raw.name)), spec, shape, encoding);
+        std::string output, Node src, PieLoaderRepackLayout layout,
+        PieLoaderEncodingSpec encoding, std::vector<std::int64_t> shape) {
+        const Node node = contract_.repack(src, layout, shape, encoding);
         return define(std::move(output), node, encoding, std::move(shape));
     }
 

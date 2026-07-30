@@ -41,7 +41,7 @@
 #include "pie_loader/source_checkpoint.hpp"
 
 #include "loader/load_plan.hpp"
-#include "model/qwen3_5/qwen3_5_contract.hpp"
+#include "model/contract.hpp"
 
 namespace {
 
@@ -221,7 +221,7 @@ void test_a_malformed_triplet_is_refused() {
 // throws rather than passing through: a tensor declared under its checkpoint
 // name would be bound by nothing and reported by nothing.
 void test_every_name_is_mapped_or_refused() {
-    namespace detail = pie::metal::model::contract_detail;
+    namespace detail = pie::metal::model::qwen3_5::contract_detail;
     const auto mapped = [](std::string_view from, std::string_view to) {
         const auto got = detail::runtime_name(from);
         check(got.has_value() && *got == to,

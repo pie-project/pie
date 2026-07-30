@@ -92,6 +92,17 @@ if(APPLE)
     src/batch/golden_tap.cpp
     src/batch/scratch.cpp
     src/model/qwen3_5/decode_consts.cpp
+    src/model/gemma4/kernels.cpp
+    src/model/gemma4/decode_consts.cpp
+    src/model/gemma4/scratch.cpp
+    src/model/gemma4/encode.cpp
+    src/model/gemma4/bind.cpp
+    src/model/gptoss/kernels.cpp
+    src/model/gptoss/decode_consts.cpp
+    src/model/gptoss/scratch.cpp
+    src/model/gptoss/encode.cpp
+    src/model/gptoss/bind.cpp
+    src/batch/simple_family.cpp
     src/model/qwen3_5/decode_step.cpp
     src/model/qwen3_5/decode_step_mb.cpp
     src/kernels/decode_psos.cpp
@@ -127,6 +138,22 @@ target_include_directories(pie_driver_metal_lib
 target_compile_options(pie_driver_metal_lib PRIVATE
   $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Wno-unused-parameter>
   $<$<COMPILE_LANGUAGE:OBJCXX>:-Wall -Wextra -Wno-unused-parameter>)
+
+# `-Werror=switch` on forward.cpp alone.
+#
+# `MetalExecutor::setup` switches on the model family with no `default:`, so
+# adding a family without teaching the executor about it must not compile. It
+# was a plain warning first, and a warning is exactly what a gpt-oss checkpoint
+# fell through: it matched no case, ran on past the switch, and was set up as
+# qwen3.5 -- surfacing as "unstaged weight shared_embedding.weight", a tensor
+# belonging to a different family entirely.
+#
+# Scoped to this file rather than the target: the switches over the shared
+# `Kernel` enum are legitimately partial (a family handles its own kinds and
+# falls through for the rest), and making those an error would only buy a
+# forest of `default:` labels that turn the check back off.
+set_source_files_properties(src/batch/forward.cpp
+  PROPERTIES COMPILE_OPTIONS "-Werror=switch")
 
 # Compiled-in fallback for the native .metal kernel sources (runtime PSO
 # compilation). Overridable at run time via PIE_METAL_KERNELS_DIR. PUBLIC so
@@ -389,6 +416,24 @@ else()
     "`cargo rustc -p pie-loader --lib --crate-type staticlib`)")
 endif()
 
+# Pure geometry + DAG shape: no Metal, no checkpoint, no GPU.
+add_executable(gemma4_decode_step_test tests/gemma4_decode_step_test.cpp)
+target_compile_features(gemma4_decode_step_test PRIVATE cxx_std_20)
+target_include_directories(gemma4_decode_step_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/batch)
+target_link_libraries(gemma4_decode_step_test PRIVATE pie_driver_metal_lib)
+add_test(NAME gemma4_decode_step_test COMMAND gemma4_decode_step_test)
+
+# GPT-OSS: same, and for the same reason.
+add_executable(gptoss_decode_step_test tests/gptoss_decode_step_test.cpp)
+target_compile_features(gptoss_decode_step_test PRIVATE cxx_std_20)
+target_include_directories(gptoss_decode_step_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/batch)
+target_link_libraries(gptoss_decode_step_test PRIVATE pie_driver_metal_lib)
+add_test(NAME gptoss_decode_step_test COMMAND gptoss_decode_step_test)
+
 add_executable(heap_layout_slot_test tests/heap_layout_slot_test.cpp)
 target_include_directories(heap_layout_slot_test PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -426,6 +471,25 @@ add_test(NAME executor_worker_test COMMAND executor_worker_test)
 if(APPLE)
   add_metal_linked_test(ptir_m0_device_test tests/ptir_m0_device_test.cpp)
   add_metal_linked_test(kv_append_paged_pso_test tests/kv_append_paged_pso_test.cpp)
+  # The six gemma4 kernels that shipped with no PSO entry and no binder.
+  add_metal_linked_test(gemma4_pso_test tests/gemma4_pso_test.cpp)
+  target_compile_definitions(gemma4_pso_test PRIVATE
+    PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
+  add_metal_linked_test(gemma4_forward_test tests/gemma4_forward_test.cpp NEEDS_LOADER)
+  target_compile_definitions(gemma4_forward_test PRIVATE
+    PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
+  add_metal_linked_test(gptoss_forward_test tests/gptoss_forward_test.cpp NEEDS_LOADER)
+  target_compile_definitions(gptoss_forward_test PRIVATE
+    PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
+  add_metal_linked_test(simple_family_executor_test tests/simple_family_executor_test.cpp NEEDS_LOADER)
+  target_compile_definitions(simple_family_executor_test PRIVATE
+    PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
+  add_metal_linked_test(gemma4_prefill_numerics_test tests/gemma4_prefill_numerics_test.cpp NEEDS_LOADER)
+  target_compile_definitions(gemma4_prefill_numerics_test PRIVATE
+    PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
+  add_metal_linked_test(gemma4_prefill_test tests/gemma4_prefill_test.cpp)
+  target_compile_definitions(gemma4_prefill_test PRIVATE
+    PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
   add_metal_linked_test(decode_step_mb_test tests/decode_step_mb_test.cpp)
   add_metal_linked_test(kv_pool_lifecycle_test tests/kv_pool_lifecycle_test.cpp)
   # `heap_bind.cpp`'s `case K::Fill` on a real heap.

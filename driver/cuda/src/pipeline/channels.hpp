@@ -210,16 +210,35 @@ inline constexpr std::uint32_t kTicketRequireInput = 1u << 4;
         return ref.load(cuda::memory_order_acquire);
     }
 
-    __device__ inline void store_system_release(std::uint64_t* word, std::uint64_t value) {
+    // Relaxed system-scope stores, for words whose ONLY reader is separated
+    // from this kernel by a kernel-completion boundary.
+    //
+    // `memory_order_release` on a system-scope store compiles to a system
+    // release fence per store, and on a discrete GPU that fence serialises the
+    // write against the host interconnect instead of letting the writes
+    // pipeline. Measured on L40S at this kernel's exact launch shape (512
+    // blocks x 128 threads, storing into pinned host memory), per-store
+    // release costs 159 us against 12 us for relaxed with no explicit fence,
+    // and release grows LINEARLY with the number of words (792 us at 8
+    // tickets) while relaxed stays nearly flat (19 us). A single
+    // `__threadfence_system()` is itself ~37 us in this shape, so the fence
+    // count -- not the store count and not PCIe latency -- is the cost.
+    //
+    // Relaxed keeps the atomicity (no torn 64-bit word reaches the host) and
+    // gives up only the ORDERING between these stores, which no reader
+    // observes: see the note on `k_settle_host_channels_batch`.
+    __device__ inline void store_system_relaxed(
+        std::uint64_t* word,
+        std::uint64_t value) {
         cuda::atomic_ref<std::uint64_t, cuda::thread_scope_system> ref(*word);
-        ref.store(value, cuda::memory_order_release);
+        ref.store(value, cuda::memory_order_relaxed);
     }
 
-    __device__ inline void store_system_release(
+    __device__ inline void store_system_relaxed(
         std::uint32_t* word,
         std::uint32_t value) {
         cuda::atomic_ref<std::uint32_t, cuda::thread_scope_system> ref(*word);
-        ref.store(value, cuda::memory_order_release);
+        ref.store(value, cuda::memory_order_relaxed);
     }
 
     __global__ void k_pull_validate_host_channels_batch(
@@ -334,6 +353,27 @@ inline constexpr std::uint32_t kTicketRequireInput = 1u << 4;
         std::uint32_t ticket_count = 0;
     };
 
+    // ORDERING NOTE. Every word this kernel writes is read only AFTER the
+    // kernel completes, so the stores below are relaxed and the kernel carries
+    // no explicit fence:
+    //
+    //   * `host_commit[0]`/`[1]` are the mapped mirror of the commit snapshot.
+    //     Its readers are the `cudaLaunchHostFunc` completion callback (see
+    //     `dispatch.cu`, where the unmapped path instead issues a D2H copy
+    //     after this kernel) and `settle_readiness`, which reads only after a
+    //     `cudaStreamSynchronize`. Both run strictly after completion, so the
+    //     kill-before-commit store order is unobservable.
+    //   * The ring words are read by the guest endpoint, which is woken by
+    //     that same completion callback, and by a later
+    //     `k_pull_validate_host_channels_batch` on this stream. Both are on
+    //     the far side of a kernel boundary.
+    //   * The payload -> tail edge -- the one ordering this protocol actually
+    //     requires -- is supplied by `k_scatter_host_publish_copies` being a
+    //     PRIOR KERNEL on the same stream, not by these stores.
+    //
+    // Kernel completion is itself a system-scope release, so it provides every
+    // edge that matters. Per-store release fences here bought nothing and cost
+    // 13.8x (see `store_system_relaxed`).
     __global__ void k_settle_host_channels_batch(
         const HostChannelSettlementLane* lanes,
         std::uint32_t count) {
@@ -346,8 +386,8 @@ inline constexpr std::uint32_t kTicketRequireInput = 1u << 4;
                 // Mapped snapshot: mirror both words ([0] commit, [1] kill)
                 // so the completion callback classifies the lane without a
                 // D2H copy.
-                store_system_release(lane.host_commit + 1, lane.commit[1]);
-                store_system_release(lane.host_commit, committed);
+                store_system_relaxed(lane.host_commit + 1, lane.commit[1]);
+                store_system_relaxed(lane.host_commit, committed);
             }
             if (committed != 0) {
                 for (std::uint32_t i = 0; i < lane.consume.n; ++i) {
@@ -368,13 +408,13 @@ inline constexpr std::uint32_t kTicketRequireInput = 1u << 4;
             const DeviceHostChannelTicket& ticket =
                 lane.tickets[ticket_index];
             if ((ticket.flags & kTicketConsume) != 0) {
-                store_system_release(
+                store_system_relaxed(
                     ticket.words + 0, ticket.expected_head + 1);
             }
             if ((ticket.flags & kTicketPublish) != 0) {
-                store_system_release(
+                store_system_relaxed(
                     ticket.words + 1, ticket.expected_tail + 1);
-                store_system_release(ticket.words + 2, 0);
+                store_system_relaxed(ticket.words + 2, 0);
             }
         }
     }
@@ -382,7 +422,7 @@ inline constexpr std::uint32_t kTicketRequireInput = 1u << 4;
     // One host-visible output cell on its way to the pinned mirror that the
     // guest reads. `destination` is pinned host memory — device-addressable
     // under UVA, the same property `k_settle_host_channels_batch` already
-    // relies on to release-store the ring words — and `source` is the device
+    // relies on to store the ring words — and `source` is the device
     // cell (or the packed staging cell for bool channels).
     struct HostPublishCopy {
         void* destination = nullptr;
@@ -402,9 +442,11 @@ inline constexpr std::uint32_t kTicketRequireInput = 1u << 4;
     //
     // ORDERING: the caller enqueues this BEFORE
     // `k_settle_host_channels_batch` on the same stream. Kernel completion
-    // makes every mirror write visible system-wide, so the release-store
-    // that publishes the ring tail cannot become visible to the guest ahead
-    // of the payload it announces.
+    // makes every mirror write visible system-wide, so the store that
+    // publishes the ring tail cannot become visible to the guest ahead
+    // of the payload it announces. This launch boundary is the ONLY thing
+    // that provides that edge — the settlement kernel deliberately does not
+    // fence (see its ordering note).
     __global__ void k_scatter_host_publish_copies(
         const HostPublishCopy* __restrict__ copies,
         std::uint32_t count) {
@@ -418,11 +460,14 @@ inline constexpr std::uint32_t kTicketRequireInput = 1u << 4;
              byte += blockDim.x) {
             destination[byte] = source[byte];
         }
-        // Kernel completion already carries a system-scope fence, so this is
-        // belt-and-braces: it states outright that these are host-visible
-        // writes that must land before the settlement kernel's release-store
-        // of the ring tail, rather than leaving that to the launch boundary.
-        __threadfence_system();
+        // NO FENCE. Kernel completion is itself a system-scope release, and
+        // the caller always enqueues `k_settle_host_channels_batch` — which
+        // publishes the ring tail that announces this payload — as a LATER
+        // kernel on the same stream. So this kernel's completion boundary
+        // already orders payload before tail, and an explicit
+        // `__threadfence_system()` here only duplicates it. It is not free:
+        // one system fence measures ~37 us at this launch shape on L40S,
+        // which was ~100% of this kernel's cost.
     }
 
     inline void launch_scatter_host_publish_copies(

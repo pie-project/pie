@@ -145,34 +145,44 @@ impl QuantScheme {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum RowMap {
-    #[default]
-    Identity,
-    Even,
-    Odd,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// Which backend kernel a [`Expr::Repack`](crate::contract::Expr::Repack) names.
+///
+/// The whole of what a repack says in a contract. Everything a kernel also
+/// needs -- how many rows, how many columns, which rows -- is either the
+/// operand's type or the declared output's, so the plan builder derives it and
+/// a contract never repeats it.
+///
+/// Every value here names a kernel, and there is deliberately no `None` and no
+/// [`Default`]: a repack with no layout is not a repack, so the algebra should
+/// not be able to hold one. The discriminants start at 1 for the same reason
+/// the enum is total — zero is what an uninitialized FFI field carries, so it
+/// must decode as an error rather than as the first kernel in the list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RepackLayout {
-    #[default]
-    None,
-    MarlinMxfp4Weight,
-    MarlinMxfp4Scale,
-    DenseRowGather,
+    MarlinMxfp4Weight = 1,
+    MarlinMxfp4Scale = 2,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// A repack as the *executor* needs it: the layout plus the geometry.
+///
+/// Not part of the contract. Every field but `layout` is derived by
+/// [`plan::compile`](crate::plan::compile) from the operand's type and the
+/// declaration, which is what keeps the algebra from restating in integers what
+/// it already says in nodes. A contract selects rows with
+/// [`Expr::Slice`](crate::contract::Expr::Slice),
+/// [`Expr::Shard`](crate::contract::Expr::Shard) and
+/// [`Expr::Stride`](crate::contract::Expr::Stride); by the time a spec exists
+/// the operand is exactly the block the kernel reads.
+///
+/// `target_rows`/`target_cols` may exceed the source's: a layout with a tile
+/// quantum declares the padded shape and the kernel zero-fills the tail, which
+/// is the one geometric fact that is the kernel's and not the algebra's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RepackSpec {
     pub layout: RepackLayout,
-    pub row_map: RowMap,
     pub batch: u32,
     pub source_rows: u32,
-    pub source_row_offset: u32,
     pub target_rows: u32,
-    pub valid_rows: u32,
-    pub source_stride_cols: u32,
-    pub source_col_offset: u32,
     pub source_cols: u32,
     pub target_cols: u32,
 }

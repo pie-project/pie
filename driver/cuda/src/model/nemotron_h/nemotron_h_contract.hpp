@@ -33,6 +33,36 @@ inline bool nemotron_h_tp_mamba_sharding_enabled(int tp_size) {
 
 namespace contract_detail {
 
+/// A rename, written only when there is something to rename.
+///
+/// The algebra refuses a node that denotes its operand, so a fold whose target
+/// is the shape the operand already has must be left out rather than written
+/// and ignored. `from` is the operand's shape and `to` may carry one `-1`,
+/// resolved here the way `infer` resolves it.
+inline Node retype_if_different(ContractBuilder& b, Node node,
+                                const std::vector<std::int64_t>& from,
+                                std::vector<std::int64_t> to, PieLoaderEncodingSpec enc) {
+    std::int64_t total = 1;
+    for (const std::int64_t dim : from) {
+        total *= dim;
+    }
+    std::int64_t known = 1;
+    for (const std::int64_t dim : to) {
+        if (dim >= 0) {
+            known *= dim;
+        }
+    }
+    for (std::int64_t& dim : to) {
+        if (dim < 0 && known > 0) {
+            dim = total / known;
+        }
+    }
+    if (to == from) {
+        return node;
+    }
+    return b.contract().transmute(node, std::move(to), enc);
+}
+
 /// This rank's share of a leading axis that is `units` equal blocks.
 ///
 /// [`ContractBuilder::split`] divides an extent, and an extent cannot say what
@@ -46,13 +76,19 @@ namespace contract_detail {
 /// contiguous run per band -- `a_head_boundary_shard_is_one_contiguous_run` in
 /// `loader/tests/storage_compiler.rs` pins that.
 ///
-/// `out_shape` is the shape the band is published as, with `-1` where the split
-/// axis was, and `enc` is the encoding it keeps throughout -- neither transmute
-/// changes the element type, only how the elements are grouped.
-inline Node split_by_unit(ContractBuilder& b, Node rows, std::int64_t units, std::int64_t block,
-                          std::vector<std::int64_t> out_shape, PieLoaderEncodingSpec enc) {
-    const Node folded = b.contract().transmute(rows, {units, block}, enc);
-    return b.contract().transmute(b.split(folded, 0), std::move(out_shape), enc);
+/// `rows_shape` is the operand's shape, `out_shape` is the shape the band is
+/// published as with `-1` where the split axis was, and `enc` is the encoding
+/// it keeps throughout -- neither transmute changes the element type, only how
+/// the elements are grouped. A band whose unit *is* its row -- `dt`, one scalar
+/// per head -- needs neither rename, and gets neither.
+inline Node split_by_unit(ContractBuilder& b, Node rows,
+                          const std::vector<std::int64_t>& rows_shape, std::int64_t units,
+                          std::int64_t block, std::vector<std::int64_t> out_shape,
+                          PieLoaderEncodingSpec enc) {
+    const std::vector<std::int64_t> folded_shape{units, block};
+    const Node folded = retype_if_different(b, rows, rows_shape, folded_shape, enc);
+    const std::vector<std::int64_t> local_shape{b.local_extent(units), block};
+    return retype_if_different(b, b.split(folded, 0), local_shape, std::move(out_shape), enc);
 }
 
 /// Elements per row of `shape`, i.e. everything but the leading extent.
@@ -128,27 +164,22 @@ inline void nemotron_h_layer_mamba_tp(ContractBuilder& b, const std::string& mp,
 
     // The five bands of `in_proj`, in the order the mixer reads them.
     const std::vector<std::int64_t> band_shape{-1, hidden};
+    const auto in_band = [&](std::int64_t start, std::int64_t rows) {
+        return b.contract().slice(b.contract().src(std::string(in_proj->name)), 0, start, rows);
+    };
+    const std::vector<std::int64_t> z_shape{intermediate, hidden};
+    const std::vector<std::int64_t> bc_shape{group_state, hidden};
     const std::vector<Node> bands{
-        split_by_unit(b,
-                      b.contract().slice(b.contract().src(std::string(in_proj->name)), 0, 0,
-                                         intermediate),
-                      heads, head_dim * hidden, band_shape, in_proj->encoding),
-        split_by_unit(b,
-                      b.contract().slice(b.contract().src(std::string(in_proj->name)), 0, intermediate,
-                                         intermediate),
-                      heads, head_dim * hidden, band_shape, in_proj->encoding),
-        split_by_unit(b,
-                      b.contract().slice(b.contract().src(std::string(in_proj->name)), 0, 2 * intermediate,
-                                         group_state),
-                      groups, state * hidden, band_shape, in_proj->encoding),
-        split_by_unit(b,
-                      b.contract().slice(b.contract().src(std::string(in_proj->name)), 0,
-                                         2 * intermediate + group_state, group_state),
-                      groups, state * hidden, band_shape, in_proj->encoding),
-        split_by_unit(b,
-                      b.contract().slice(b.contract().src(std::string(in_proj->name)), 0,
-                                         2 * intermediate + 2 * group_state, heads),
-                      heads, hidden, band_shape, in_proj->encoding),
+        split_by_unit(b, in_band(0, intermediate), z_shape, heads, head_dim * hidden, band_shape,
+                      in_proj->encoding),
+        split_by_unit(b, in_band(intermediate, intermediate), z_shape, heads, head_dim * hidden,
+                      band_shape, in_proj->encoding),
+        split_by_unit(b, in_band(2 * intermediate, group_state), bc_shape, groups, state * hidden,
+                      band_shape, in_proj->encoding),
+        split_by_unit(b, in_band(2 * intermediate + group_state, group_state), bc_shape, groups,
+                      state * hidden, band_shape, in_proj->encoding),
+        split_by_unit(b, in_band(2 * intermediate + 2 * group_state, heads), {heads, hidden}, heads,
+                      hidden, band_shape, in_proj->encoding),
     };
     const std::int64_t local_heads = b.local_extent(heads);
     const std::int64_t local_groups = b.local_extent(groups);
@@ -165,19 +196,20 @@ inline void nemotron_h_layer_mamba_tp(ContractBuilder& b, const std::string& mp,
         const std::vector<std::int64_t> shape = shape_of(*raw);
         const std::int64_t cols = row_elems(shape);
         const std::vector<std::int64_t> published = rows_inferred(shape);
+        std::vector<std::int64_t> z_band = shape;
+        z_band[0] = intermediate;
+        std::vector<std::int64_t> bc_band = shape;
+        bc_band[0] = group_state;
+        const auto conv_band = [&](std::int64_t start, std::int64_t rows) {
+            return b.contract().slice(b.contract().src(std::string(raw->name)), 0, start, rows);
+        };
         const std::vector<Node> conv_bands{
-            split_by_unit(b,
-                          b.contract().slice(b.contract().src(std::string(raw->name)), 0, 0,
-                                             intermediate),
-                          heads, head_dim * cols, published, raw->encoding),
-            split_by_unit(b,
-                          b.contract().slice(b.contract().src(std::string(raw->name)), 0, intermediate,
-                                             group_state),
-                          groups, state * cols, published, raw->encoding),
-            split_by_unit(b,
-                          b.contract().slice(b.contract().src(std::string(raw->name)), 0,
-                                             intermediate + group_state, group_state),
-                          groups, state * cols, published, raw->encoding),
+            split_by_unit(b, conv_band(0, intermediate), z_band, heads, head_dim * cols, published,
+                          raw->encoding),
+            split_by_unit(b, conv_band(intermediate, group_state), bc_band, groups, state * cols,
+                          published, raw->encoding),
+            split_by_unit(b, conv_band(intermediate + group_state, group_state), bc_band, groups,
+                          state * cols, published, raw->encoding),
         };
         std::vector<std::int64_t> local_shape = shape;
         local_shape[0] = local_intermediate + 2 * local_group_state;
@@ -193,8 +225,8 @@ inline void nemotron_h_layer_mamba_tp(ContractBuilder& b, const std::string& mp,
         b.consume(raw->id);
     }
     b.define(b.output_name(norm_w->name),
-             split_by_unit(b, b.contract().src(std::string(norm_w->name)), heads, head_dim,
-                           std::vector<std::int64_t>{-1}, norm_w->encoding),
+             split_by_unit(b, b.contract().src(std::string(norm_w->name)), {intermediate}, heads,
+                           head_dim, std::vector<std::int64_t>{-1}, norm_w->encoding),
              norm_w->encoding, std::vector<std::int64_t>{local_intermediate});
     b.consume(norm_w->id);
 

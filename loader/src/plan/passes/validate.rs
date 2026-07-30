@@ -18,7 +18,7 @@ use crate::error::{Error, OrOverflow, Result};
 use crate::plan::geometry::extent_storage_bytes;
 use crate::plan::index::instr_by_id;
 use crate::plan::{LoadPlan, StorageInstr, TileMapKind};
-use crate::types::{BufferId, QuantScheme, RepackLayout};
+use crate::types::{BufferId, QuantScheme, RepackLayout, TensorId};
 
 /// Every `Fill` runs before every write to the buffer it zeroes.
 ///
@@ -151,12 +151,13 @@ pub(super) fn validate_target_support(program: &mut LoadPlan) -> Result<usize> {
                     )
                 ))
                 || (*kind == TileMapKind::Repack
-                    && (matches!(transform.repack.layout, RepackLayout::DenseRowGather)
-                        || (program.target.native_mxfp4_moe
-                            && matches!(
-                                transform.repack.layout,
-                                RepackLayout::MarlinMxfp4Weight | RepackLayout::MarlinMxfp4Scale
-                            )))));
+                    && program.target.native_mxfp4_moe
+                    && transform.repack.is_some_and(|repack| {
+                        matches!(
+                            repack.layout,
+                            RepackLayout::MarlinMxfp4Weight | RepackLayout::MarlinMxfp4Scale
+                        )
+                    })));
         if !supported {
             return Err(Error::Unsupported(format!(
                 "{:?} target does not support {:?} TileMap ({:?}->{:?})",
@@ -212,7 +213,25 @@ pub(super) fn validate_scale_factors(program: &mut LoadPlan) -> Result<usize> {
 ///   3. every `CreateView` reads a single backing buffer that exists, and the
 ///      view window lies within it — i.e. packed members stay *internal* to one
 ///      backing buffer, which is what makes (1) safe for packed weights.
+///   4. a declared tensor is claimed by at most one buffer. `BufferDecl.tensor`
+///      says "this buffer *is* that tensor", so two claims are the plan saying
+///      one tensor lives in two places. Nothing checked this while the only way
+///      to provoke it was a rule stated in `plan::build`; the rule is now the
+///      `Role` a lowering is given, and this is what makes that safe rather
+///      than merely untested.
 pub(super) fn validate_persistent_layout(program: &mut LoadPlan) -> Result<usize> {
+    let mut claimed: HashMap<TensorId, BufferId> = HashMap::new();
+    for buffer in &program.buffers {
+        let Some(tensor) = buffer.tensor else {
+            continue;
+        };
+        if let Some(first) = claimed.insert(tensor, buffer.id) {
+            return Err(Error::Contract(format!(
+                "buffers {} and {} both claim tensor {}",
+                first.0, buffer.id.0, tensor.0
+            )));
+        }
+    }
     let mut spans: Vec<(u64, u64, u32)> = Vec::new();
     for buffer in &program.buffers {
         let Some(offset) = buffer.persistent_offset else {

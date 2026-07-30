@@ -108,25 +108,44 @@ pub fn fold_stage(
     };
 
     let mut fold = StageFold::default();
-    // Parallel value tracks: `slots` carries known/unknown, `dense` carries a
-    // dense placeholder vector for `eval_op` (placeholders are never read —
-    // an op with an unknown operand short-circuits before eval_op runs).
-    let mut slots: Vec<Slot> = Vec::with_capacity(types.len());
+    // Parallel value tracks, both indexed by SSA value id: `blocked_at`
+    // carries the first blocker on a value's derivation chain (`None` = the
+    // value is real), `dense` carries the value itself for `eval_op`
+    // (placeholders are never read — an op with an unknown operand
+    // short-circuits before eval_op runs).
+    //
+    // Splitting the blocker off the value, rather than keeping a
+    // `Vec<Result<Value, _>>` beside a `dense` mirror CLONED from it, is what
+    // holds the fold to one allocation per value. The mirror made every
+    // folded value allocate twice on a path that runs once per fire per
+    // channel-writing stage; the only clone left is at `ChanPut`, which is
+    // the fold's sole output. Measured at conc 512 on Qwen3-0.6B / L40S:
+    // `HostShadow::advance` 11.27 -> 9.56 us per fire, 5.91 -> 5.01 core-s
+    // over the run.
+    let mut blocked_at: Vec<Option<EvalBlocker>> = Vec::with_capacity(types.len());
     let mut dense: Vec<Value> = Vec::with_capacity(types.len());
-    let push = |slots: &mut Vec<Slot>, dense: &mut Vec<Value>, id: usize, slot: Slot| {
-        dense.push(match &slot {
-            Ok(value) => value.clone(),
-            Err(_) => placeholder(types[id]),
-        });
-        slots.push(slot);
+    let push = |blocked_at: &mut Vec<Option<EvalBlocker>>,
+                dense: &mut Vec<Value>,
+                id: usize,
+                slot: Slot| {
+        match slot {
+            Ok(value) => {
+                dense.push(value);
+                blocked_at.push(None);
+            }
+            Err(blocker) => {
+                dense.push(placeholder(types[id]));
+                blocked_at.push(Some(blocker));
+            }
+        }
     };
 
     for op in ops {
-        let next_id = slots.len();
+        let next_id = blocked_at.len();
         let blocked = op
             .operands()
             .iter()
-            .find_map(|&arg| slots[arg as usize].as_ref().err().cloned());
+            .find_map(|&arg| blocked_at[arg as usize].clone());
 
         match op {
             Op::ChanTake(chan) | Op::ChanRead(chan) => {
@@ -137,20 +156,25 @@ pub fn fold_stage(
                         .map(Ok)
                         .unwrap_or(Err(EvalBlocker::UnknownChannel(*chan))),
                 };
-                push(&mut slots, &mut dense, next_id, slot);
+                push(&mut blocked_at, &mut dense, next_id, slot);
             }
             Op::ChanPut { chan, value } => {
-                fold.puts.insert(*chan, slots[*value as usize].clone());
+                let id = *value as usize;
+                let put = match &blocked_at[id] {
+                    Some(blocker) => Err(blocker.clone()),
+                    None => Ok(dense[id].clone()),
+                };
+                fold.puts.insert(*chan, put);
             }
             Op::KernelCall { name, .. } => {
                 let blocker = blocked.unwrap_or_else(|| {
                     EvalBlocker::Kernel(bound.container.names[*name as usize].clone())
                 });
-                push(&mut slots, &mut dense, next_id, Err(blocker));
+                push(&mut blocked_at, &mut dense, next_id, Err(blocker));
             }
             Op::IntrinsicVal { intr, .. } => {
                 push(
-                    &mut slots,
+                    &mut blocked_at,
                     &mut dense,
                     next_id,
                     Err(blocked.unwrap_or(EvalBlocker::Intrinsic(intr.name()))),
@@ -162,7 +186,7 @@ pub fn fold_stage(
             // that the real fire does not produce.
             Op::Rng { .. } => {
                 push(
-                    &mut slots,
+                    &mut blocked_at,
                     &mut dense,
                     next_id,
                     Err(blocked.unwrap_or(EvalBlocker::AmbientSeed)),
@@ -195,7 +219,7 @@ pub fn fold_stage(
                 if let Some(blocker) = blocked {
                     for offset in 0..op.result_count() as usize {
                         push(
-                            &mut slots,
+                            &mut blocked_at,
                             &mut dense,
                             next_id + offset,
                             Err(blocker.clone()),
@@ -210,10 +234,10 @@ pub fn fold_stage(
                 let evaled = eval_op(op, &dense, &ty_of, &inputs, 0)
                     .map_err(|error| EvalBlocker::Fault(alloc::format!("{error}")))?;
                 match evaled {
-                    Evaled::One(value) => push(&mut slots, &mut dense, next_id, Ok(value)),
+                    Evaled::One(value) => push(&mut blocked_at, &mut dense, next_id, Ok(value)),
                     Evaled::Two(a, b) => {
-                        push(&mut slots, &mut dense, next_id, Ok(a));
-                        push(&mut slots, &mut dense, next_id + 1, Ok(b));
+                        push(&mut blocked_at, &mut dense, next_id, Ok(a));
+                        push(&mut blocked_at, &mut dense, next_id + 1, Ok(b));
                     }
                     // Channel / kernel / sink ops are matched above.
                     Evaled::Chan(_) | Evaled::Kernel { .. } | Evaled::Sink { .. } => {
@@ -291,6 +315,19 @@ impl GeometryTaint {
     pub fn host_derivable(&self) -> bool {
         self.device_dependent_ports.is_empty()
     }
+}
+
+/// For each channel this stage puts, whether the put's VALUE is statically
+/// device-decided, resolved against a settled [`GeometryTaint::device_decided`].
+///
+/// A statically tainted value is `Err` in `fold_stage` on EVERY fire — taint
+/// sources are kernel calls, device intrinsics and ambient RNG, all of which
+/// the fold blocks unconditionally, and a tainted channel read resolves
+/// through the same set. So a stage whose every put is tainted commits
+/// nothing host-derivable in any fire, and folding it per fire re-derives a
+/// constant.
+pub fn stage_put_taint(ops: &[Op], device_decided: &BTreeSet<u32>) -> BTreeMap<u32, bool> {
+    stage_taint(ops, device_decided).0
 }
 
 /// One taint pass over a stage's ops against the current device-decided set.

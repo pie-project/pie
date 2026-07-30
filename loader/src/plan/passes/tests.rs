@@ -7,6 +7,7 @@
 use super::rewrite::try_merge_bulk_extent_write;
 use super::validate::{validate_fill_order, validate_persistent_layout, validate_target_support};
 use crate::extent::Extent;
+use crate::plan::pass::{Pass, Stage, run_passes};
 use crate::plan::{
     BufferDecl, DestExtent, LoadPlan, SourceExtent, StorageInstr, StorageTarget, TileMapKind,
     TileSpec, TransformSpec,
@@ -189,4 +190,66 @@ fn rejects_a_bulk_write_into_a_buffer_zeroed_after_it() {
 fn accepts_a_bulk_write_beside_a_buffer_zeroed_after_it() {
     let mut plan = fill_order_plan(bulk_into_b(), &[1, 2, 0]);
     assert!(validate_fill_order(&mut plan).is_ok());
+}
+
+/// The pipeline is partitioned: every rewrite, then every check.
+///
+/// A validator proves something about the plan the compiler hands back, and
+/// that proof survives only if nothing rewrites afterwards. The property is
+/// invisible in `all()` — it is just the order the lines happen to be in — so
+/// it is asserted here and enforced in `run_passes`.
+#[test]
+fn every_rewrite_comes_before_every_check() {
+    let stages: Vec<_> = super::all().iter().map(|pass| pass.stage).collect();
+    let first_check = stages.iter().position(|s| *s == Stage::Check);
+    assert!(first_check.is_some(), "the pipeline has no validators");
+    assert!(
+        stages[first_check.unwrap()..]
+            .iter()
+            .all(|s| *s == Stage::Check),
+        "a rewrite runs after a validator: {:?}",
+        super::all()
+            .iter()
+            .map(|p| (p.name, p.stage))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// And the rule is enforced, not merely asserted about today's list.
+#[test]
+fn a_rewrite_scheduled_after_a_check_is_refused() {
+    fn nothing(_: &mut LoadPlan) -> crate::error::Result<usize> {
+        Ok(0)
+    }
+    let bad = [
+        Pass {
+            name: "check",
+            stage: Stage::Check,
+            run: nothing,
+        },
+        Pass {
+            name: "late-rewrite",
+            stage: Stage::Rewrite,
+            run: nothing,
+        },
+    ];
+    let mut plan = fill_order_plan(bulk_into_b(), &[0, 1, 2]);
+    let err = run_passes(&mut plan, &bad).unwrap_err().to_string();
+    assert!(err.contains("late-rewrite"), "{err}");
+}
+
+/// A validator that reports a rewrite is not a validator.
+#[test]
+fn a_check_that_reports_a_rewrite_is_refused() {
+    fn rewrote(_: &mut LoadPlan) -> crate::error::Result<usize> {
+        Ok(1)
+    }
+    let bad = [Pass {
+        name: "lying-check",
+        stage: Stage::Check,
+        run: rewrote,
+    }];
+    let mut plan = fill_order_plan(bulk_into_b(), &[0, 1, 2]);
+    let err = run_passes(&mut plan, &bad).unwrap_err().to_string();
+    assert!(err.contains("lying-check"), "{err}");
 }

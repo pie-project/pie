@@ -25,6 +25,7 @@
 // be rewritten — `Shard(Slice(..))` and a `Slice` with the rank folded into its
 // offset are different graphs — while the plan must not move at all.
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -51,6 +52,7 @@
 #include "model/deepseek_v4/deepseek_v4_contract.hpp"
 #include "model/mixtral/mixtral_contract.hpp"
 #include "model/kimi/kimi_contract.hpp"
+#include "model/mixtral/mixtral_contract.hpp"
 #include "model/nemotron_h/nemotron_h_contract.hpp"
 #include "model/qwen3_5/qwen3_5_contract.hpp"
 #include "model/registry.hpp"
@@ -1398,21 +1400,7 @@ nlohmann::json contract_to_json(const pie_loader::PieLoaderModelContractView& v)
                          {"step", n.step},
                          {"fill_bits", n.fill_bits},
                          {"out_shape", shape_to_json(n.out_shape)},
-                         // A `Repack` carries its offsets as integers, so this
-                         // is where a `tp_rank` can still be baked into a
-                         // contract. Omitting it made the cross-rank diff below
-                         // blind to the one case it must not miss.
-                         {"repack", {{"layout", n.repack.layout},
-                                     {"row_map", n.repack.row_map},
-                                     {"batch", n.repack.batch},
-                                     {"source_rows", n.repack.source_rows},
-                                     {"source_row_offset", n.repack.source_row_offset},
-                                     {"target_rows", n.repack.target_rows},
-                                     {"valid_rows", n.repack.valid_rows},
-                                     {"source_stride_cols", n.repack.source_stride_cols},
-                                     {"source_col_offset", n.repack.source_col_offset},
-                                     {"source_cols", n.repack.source_cols},
-                                     {"target_cols", n.repack.target_cols}}},
+                         {"repack_layout", n.repack_layout},
                          {"out_encoding", {{"kind", n.out_encoding.kind},
                                            {"dtype", n.out_encoding.dtype},
                                            {"quant", quant_to_json(n.out_encoding.quant)}}}});
@@ -1575,10 +1563,9 @@ nlohmann::json plan_to_json(const pie_loader::LoadPlanView& p) {
             entry["repack_layout"] = static_cast<int>(op.repack_layout);
             entry["t_batch"] = op.transform_batch;
             entry["t_source_rows"] = op.transform_source_rows;
-            entry["t_source_row_offset"] = op.transform_source_row_offset;
             entry["t_target_rows"] = op.transform_target_rows;
-            entry["t_valid_rows"] = op.transform_valid_rows;
-            entry["t_source_col_offset"] = op.transform_source_col_offset;
+            entry["t_source_cols"] = op.transform_source_cols;
+            entry["t_target_cols"] = op.transform_target_cols;
             break;
         }
         case Tag::CreateView: {
@@ -1723,22 +1710,17 @@ void author_real_contract(const std::string& snapshot, const char* dest) {
         // every affine site can be written that way and the contract comes out
         // identical on every rank.
         //
-        // `Repack` is the exception and cannot be one of these by accident: it
-        // carries `source_row_offset` as an integer a kernel reads, so there is
-        // nowhere to hang a `Shard`. Naming the exception this precisely is the
-        // point — anything else that starts baking a rank fails here.
+        // `Repack` used to be an exception -- it carried `source_row_offset` as
+        // an integer a kernel reads, so there was nowhere to hang a `Shard` --
+        // and this check had to let a repacking family through. It does not any
+        // more: a repack names a layout and takes an expression, so the shard
+        // goes where every other family puts it. There is no exception left.
         if (by_rank.size() > 1 && by_rank.contains("0")) {
             const auto& first = by_rank["0"]["contract"];
-            bool repacks = false;
-            for (const auto& node : first["nodes"]) {
-                if (node["kind"] ==
-                    static_cast<std::uint32_t>(pie_loader::PieLoaderExprKind::Repack)) repacks = true;
-            }
             for (const auto& [rank, entry] : by_rank.items()) {
-                const bool same = entry["contract"] == first;
-                check(same || repacks,
+                check(entry["contract"] == first,
                       "authoring does not read the rank: tp " + std::to_string(tp) +
-                          " rank " + rank + " authors what rank 0 does, or repacks");
+                          " rank " + rank + " must author what rank 0 does");
             }
         }
         by_tp[std::to_string(tp)] = std::move(by_rank);
@@ -1761,6 +1743,173 @@ void author_real_contract(const std::string& snapshot, const char* dest) {
 
 }  // namespace
 
+/// Does the expression published under `name` contain an `Expr::Shard`?
+///
+/// Walks the whole subtree, not just the spine, because the shard sits under a
+/// `Stride` for the interleaved halves and under nothing for the down columns.
+bool expr_contains_shard(const nlohmann::json& contract, const std::string& name) {
+    const auto& nodes = contract["nodes"];
+    std::int64_t root = -1;
+    for (const auto& tensor : contract["tensors"]) {
+        if (tensor["name"] == name) root = tensor["root"].get<std::int64_t>();
+    }
+    if (root < 0) return false;
+
+    std::vector<std::int64_t> stack{root};
+    while (!stack.empty()) {
+        const std::int64_t at = stack.back();
+        stack.pop_back();
+        if (at < 0 || at >= static_cast<std::int64_t>(nodes.size())) continue;
+        const auto& node = nodes[static_cast<std::size_t>(at)];
+        if (node["kind"] ==
+            static_cast<std::uint32_t>(pie_loader::PieLoaderExprKind::Shard)) {
+            return true;
+        }
+        stack.push_back(node["src"].get<std::int64_t>());
+        for (const auto& part : node["parts"]) stack.push_back(part.get<std::int64_t>());
+    }
+    return false;
+}
+
+/// The escape hatch's last rank.
+///
+/// GPT-OSS's native MXFP4 path was the only place a `tp_rank` reached a
+/// contract: a repack spec carried `source_row_offset` as an integer, so the
+/// driver computed `rank * local` while authoring and the contract was valid for
+/// exactly one rank. The cross-rank check in `author_real_contract` had to let
+/// that through, and it only runs against a real snapshot anyway -- so the one
+/// family that broke the rule was also the one nothing checked by default.
+///
+/// The selection is `Shard` and `Stride` now, so this asserts the rule with no
+/// exception: every rank authors byte-identical bytes, and the rank still
+/// reaches the *plan*, which is where it belongs.
+void test_gpt_oss_native_repack_is_rank_blind() {
+    constexpr std::int64_t kExperts = 2;
+    constexpr std::int64_t kHidden = 64;
+    constexpr std::int64_t kInterFull = 128;
+    constexpr std::int64_t kHiddenGroups = kHidden / 32;
+    constexpr std::int64_t kInterGroups = kInterFull / 32;
+
+    const std::string ep = "model.layers.0.mlp.experts.";
+    const std::vector<TypedTensor> tensors{
+        {"model.embed_tokens.weight", {16, kHidden}, "BF16"},
+        {"model.norm.weight", {kHidden}, "BF16"},
+        {"lm_head.weight", {16, kHidden}, "BF16"},
+        // gate and up are interleaved row by row on the fused axis.
+        {ep + "gate_up_proj_blocks", {kExperts, 2 * kInterFull, kHiddenGroups, 16}, "U8"},
+        {ep + "gate_up_proj_scales", {kExperts, 2 * kInterFull, kHiddenGroups}, "U8"},
+        {ep + "gate_up_proj_bias", {kExperts, 2 * kInterFull}, "BF16"},
+        {ep + "down_proj_blocks", {kExperts, kHidden, kInterGroups, 16}, "U8"},
+        {ep + "down_proj_scales", {kExperts, kHidden, kInterGroups}, "U8"},
+        {ep + "down_proj_bias", {kExperts, kHidden}, "BF16"},
+    };
+    const std::filesystem::path dir = write_typed_checkpoint("gpt_oss_native_mxfp4", tensors);
+
+    std::string open_error;
+    pie_loader::Checkpoint checkpoint = pie_loader::Checkpoint::open(dir.string(), &open_error);
+    check(static_cast<bool>(checkpoint), "the synthetic checkpoint opens: " + open_error);
+    if (!checkpoint) return;
+
+    const pie_cuda_driver::model::ModelFacts facts{
+        .model_type = "gpt_oss",
+        .quant_method = "mxfp4",
+        .num_hidden_layers = 1,
+        .num_experts = kExperts,
+        .head_dim = 0,
+        .mamba_groups = 0,
+    };
+    namespace model = pie_cuda_driver::model;
+
+    for (int tp : {1, 2}) {
+        nlohmann::json first_contract;
+        std::vector<nlohmann::json> reads;
+        for (int rank = 0; rank < tp; ++rank) {
+            const std::string at =
+                " (tp " + std::to_string(tp) + " rank " + std::to_string(rank) + ")";
+            auto target = pie_cuda_driver::cuda_device_target();
+            target.tp_size = static_cast<std::uint32_t>(tp);
+            target.tp_rank = static_cast<std::uint32_t>(rank);
+            target.native_mxfp4_moe = true;
+
+            pie_loader::ModelContract contract;
+            try {
+                model::ContractBuilder builder(checkpoint, facts, target, "",
+                                               model::Mxfp4MoeRequest::NativeGemm,
+                                               model::Component::Full,
+                                               /*stream_routed_experts=*/false, contract);
+                model::author_gpt_oss_contract(builder);
+                builder.finish();
+            } catch (const std::exception& error) {
+                check(false, "authoring" + at + ": " + error.what());
+                return;
+            }
+            const auto v = contract.view();
+            const nlohmann::json dumped = contract_to_json(v);
+
+            if (rank == 0) {
+                // Without this the identity below would pass on a contract that
+                // never took the native path at all.
+                int repacks = 0;
+                for (const auto& node : dumped["nodes"]) {
+                    if (node["kind"] == static_cast<std::uint32_t>(
+                                            pie_loader::PieLoaderExprKind::Repack)) {
+                        ++repacks;
+                    }
+                }
+                check(repacks == 6,
+                      "the native path authors a weight and a scale repack for gate, up "
+                      "and down" + at + ": got " + std::to_string(repacks));
+                first_contract = dumped;
+
+                // Each sharded tensor must carry the shard in its *own*
+                // expression. Comparing whole plans is not enough: down_proj's
+                // column shard alone makes two ranks read different bytes, so a
+                // gate_up that quietly stopped sharding would still pass.
+                if (tp > 1) {
+                    for (const char* leaf : {"gate_proj.weight", "gate_proj.bias",
+                                             "up_proj.weight_scale", "down_proj.weight"}) {
+                        check(expr_contains_shard(dumped, ep + leaf),
+                              std::string(leaf) + " selects this rank's band with a Shard" + at);
+                    }
+                }
+            } else {
+                check(dumped == first_contract,
+                      "every rank authors the same contract" + at);
+            }
+
+            const pie_loader::PieLoaderContractRequest request =
+                pie_loader::build_contract_request(checkpoint, target, v);
+            try {
+                const pie_loader::LoadPlan plan = pie_loader::LoadPlan::compile(request);
+                plan.verify(request);
+                nlohmann::json sources = nlohmann::json::array();
+                const nlohmann::json dumped_plan = plan_to_json(plan.view());
+                for (const auto& instr : dumped_plan["instrs"]) {
+                    if (instr.contains("src_tensor")) {
+                        sources.push_back({instr["src_tensor"], instr["src_offset"],
+                                           instr["src_span"]});
+                    }
+                }
+                std::sort(sources.begin(), sources.end(),
+                          [](const nlohmann::json& a, const nlohmann::json& b) {
+                              return a.dump() < b.dump();
+                          });
+                reads.push_back(std::move(sources));
+            } catch (const std::exception& error) {
+                check(false, "compiling" + at + ": " + error.what());
+                return;
+            }
+        }
+        // ...and the rank is not lost, it moved: the target is what selects the
+        // band now, so two ranks must read two different sets of bytes.
+        if (tp > 1) {
+            check(!reads[0].empty(), "the plan reads the checkpoint at all");
+            check(reads[0] != reads[1],
+                  "tp " + std::to_string(tp) + " ranks read different bytes");
+        }
+    }
+}
+
 int main() {
     test_a_handle_names_one_node();
     test_expect_states_a_shape();
@@ -1775,6 +1924,7 @@ int main() {
     test_kimi_stacks_experts_as_bf16();
     test_nemotron_h_mamba_splits_on_unit_boundaries();
     test_qwen3_5_gdn_splits_by_block();
+    test_gpt_oss_native_repack_is_rank_blind();
     test_qwen3_moe_streams_experts_as_a_group();
     test_gpt_oss_streams_experts_as_a_group();
 

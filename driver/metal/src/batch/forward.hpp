@@ -282,6 +282,50 @@ struct SetupConfig {
     // Which storage schema to author against. It selects a contract on this
     // side of the loader call and never crosses it (§10.4).
     std::string model_type;
+    /// Gemma 4's shape, when `model_type` says so. Zero means "not gemma4", so
+    /// a config that never mentions this family cannot accidentally select it.
+    struct Gemma4Facts {
+        int n_layers = 0;
+        int hidden = 0;
+        int intermediate = 0;
+        int n_q_heads = 0;
+        int n_kv_heads = 0;
+        int head_dim = 0;         // sliding layers
+        int global_head_dim = 0;  // full layers
+        int sliding_window = 0;
+        int num_kv_shared_layers = 0;
+        int per_layer_emb_dim = 0;
+        int full_attn_interval = 0;  // -1: `layer_types` is irregular, refuse
+        bool double_wide_mlp = false;
+        float final_softcap = 0.0f;
+        float rope_theta_full = 1.0e6f;
+        float rope_theta_sliding = 1.0e4f;
+        float full_partial_rotary = 0.25f;
+        bool present() const { return n_layers > 0 && hidden > 0; }
+    } gemma4;
+    /// GPT-OSS's shape, when `model_type` says so. Zero means "not gpt-oss",
+    /// on the same principle: a config that never mentions this family cannot
+    /// accidentally select it.
+    struct GptOssFacts {
+        int n_layers = 0;
+        int hidden = 0;
+        int vocab = 0;
+        int n_q_heads = 0;
+        int n_kv_heads = 0;
+        int head_dim = 0;
+        int sliding_window = 0;
+        int n_experts = 0;
+        int experts_per_token = 0;
+        int intermediate = 0;
+        int rope_original_max_position = 4096;
+        float eps = 1e-5f;
+        float swiglu_limit = 7.0f;
+        float rope_theta = 150000.0f;
+        float rope_factor = 32.0f;
+        float rope_beta_fast = 32.0f;
+        float rope_beta_slow = 1.0f;
+        bool present() const { return n_layers > 0 && hidden > 0; }
+    } gptoss;
     // `config.json`'s RoPE hyperparameters, read out of the nested
     // `rope_parameters` object this family uses (context.cpp). The defaults
     // below are Qwen3.5's, so a checkpoint that omits them still lands on the

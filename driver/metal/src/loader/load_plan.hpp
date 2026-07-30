@@ -5,7 +5,7 @@
 #include <string>
 #include <string_view>
 
-#include "model/qwen3_5/qwen3_5_contract.hpp"
+#include "model/contract.hpp"
 #include "pie_loader/plan.hpp"
 #include "pie_loader/request.hpp"
 #include "pie_loader/source_checkpoint.hpp"
@@ -46,7 +46,8 @@ inline pie_loader::DeviceTarget metal_device_target() {
 inline LoadPlan compile_load_plan(
     std::string_view snapshot_dir,
     const pie_loader::DeviceTarget& target,
-    std::string_view model_type) {
+    std::string_view model_type,
+    const model::ContractFacts& facts = {}) {
     std::string open_error;
     pie_loader::Checkpoint checkpoint =
         pie_loader::Checkpoint::open(snapshot_dir, &open_error);
@@ -55,7 +56,7 @@ inline LoadPlan compile_load_plan(
     }
 
     pie_loader::ModelContract contract;
-    model::author_model_contract(checkpoint, model_type, target, contract);
+    model::author_model_contract(checkpoint, model_type, target, contract, facts);
 
     const auto request =
         pie_loader::build_contract_request(checkpoint, target, contract.view());
