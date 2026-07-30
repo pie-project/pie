@@ -66,6 +66,19 @@ Live mixed workload, 3× naive-baseline + 1× trackb-snapkv, 24–48 tok:
 - quest-attention needs `envelope_dot` (KV envelopes), capability-gated off
   in this config — snapkv/h2o are the hook-path exercisers.
 
+## Stage 5 — why the "dual derivation" of fast_rows stays
+
+`fire_plan.rs` computes a member-count prefix; the driver's
+`launch_hook_free_prefix_rows` independently derives the wire-row prefix
+from the program row CSR. Handing the plan's number across the ABI was
+considered and rejected: the planner's job is the ORDER (which creates the
+prefix), and measuring the prefix off the wire layout it ordered is the
+driver applying device-side knowledge to a device-shaped fact — exactly
+the "emit alternatives, runtime picks" split of plan §4.4. The CSR
+derivation also survives composition (device-geometry placeholders) that a
+scheduler-side row count would have to re-model. Revisit only if a site
+appears whose lowering the driver cannot derive locally.
+
 ## Stage 4 — cache_domain × adapters (why there is no digest fold yet)
 
 The concern: `cache_domain` (runtime/engine/src/store/kv/hash.rs:30) is

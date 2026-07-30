@@ -18,9 +18,11 @@
 // Bit-parity requires the same launches, not just the same math — the
 // fused kernels round differently from their unfused sequences.
 // Everything the trace cannot express yet (hooks, custom masks, TP,
-// vision, quantized projections, non-standard rope, post-norm, qkv bias,
-// padded head_dim) falls back to `llama_like_forward_paged` — the caller
-// gates, `build` refuses.
+// vision, quantized projections, non-standard rope, post-norm, qkv bias)
+// falls back to `llama_like_forward_paged` — the caller gates, `build`
+// refuses. Padded head_dim (Phi-3-mini's 96 → 128) is IN scope: the
+// pad/strip staging around KV-write/attention is emitter knowledge, not
+// trace vocabulary — the trace speaks the logical head_dim throughout.
 //
 // Explicit KV-write descriptors ARE handled (the hand-written
 // `has_write_desc` branch, verbatim): every pure-decode fire that replays a

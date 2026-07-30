@@ -62,6 +62,17 @@ fn qwen3_0_6b() {
     check("qwen3_0_6b", &LlamaLikeFacts::qwen3_0_6b());
 }
 
+/// The second declared configuration (stage 3 rung d): no qk-norm — the
+/// RmsnormPerHead pair vanishes from every layer — an untied lm_head, and
+/// the unfused QKV binding (the contract splits the checkpoint's fused
+/// qkv_proj and the dense join cannot re-fuse the bands). The 96 → 128
+/// head-dim pad, the 2047 sliding window and the null rope scaling are
+/// backend cfg, invisible here by design.
+#[test]
+fn phi3_mini() {
+    check("phi3_mini", &LlamaLikeFacts::phi3_mini());
+}
+
 /// The unfused-binding variant: three projection matmuls, no SplitQkv. Kept
 /// golden so the binding-driven divergence stays a reviewed artifact rather
 /// than an emergent one.

@@ -1,6 +1,7 @@
 #include "model/llama_like/declared_forward.hpp"
 
 #include <charconv>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
@@ -11,6 +12,7 @@
 
 #include "kernels/embed.hpp"
 #include "kernels/gather_rows.hpp"
+#include "kernels/head_dim_pad.hpp"
 #include "kernels/kv_paged.hpp"
 #include "kernels/rmsnorm.hpp"
 #include "kernels/rope.hpp"
@@ -151,7 +153,10 @@ LlamaLikeDeclaredPlan build_llama_like_declared_plan(
     if (fwd_cfg.norm_placement != NormPlacement::Pre) return out;  // OLMo-3
     if (fwd_cfg.use_qkv_bias) return out;                      // Qwen-2 bias
     if (fwd_cfg.tp_size > 1) return out;                       // all-reduces
-    if (cfg.head_dim != cfg.head_dim_kernel) return out;       // Phi-3 pad
+    // Padded head_dim (Phi-3-mini, 96 → 128) is admitted: the pad/strip
+    // launches around KV-write/attention are emitter knowledge (the trace
+    // speaks the logical head_dim throughout), handled in the executor
+    // exactly as the hand-written `head_dim_padded` branches.
     if (w.layers.empty() ||
         w.layers.size() != static_cast<std::size_t>(cfg.num_hidden_layers)) {
         return out;
@@ -250,15 +255,30 @@ void llama_like_forward_declared(
     const int I = cfg.intermediate_size;
     const int V = cfg.vocab_size;
     const int d = cfg.head_dim;
+    const int dk = cfg.head_dim_kernel;  // padded HEAD_DIM the attention
+                                         // kernel runs at (Phi-3: 96 → 128)
+    const bool head_dim_padded = (d != dk);
     const int num_q_heads = cfg.num_attention_heads;
     const int num_kv_heads = cfg.num_key_value_heads;
     const float eps = cfg.rms_norm_eps;
     // Inherit cublas's stream so every launch lands on the captured graph,
     // for the reason llama_like_forward_paged states at its stream setup.
     cudaStream_t stream = cublas.stream();
-    // No head-dim padding on this path (build gate), so the dispatch picks
-    // its own `1/sqrt(head_dim)`.
-    const float sm_scale_override = -1.f;
+    // With padding the attention kernel runs at `dk` but the softmax must
+    // stay scaled to the real head dim — `1/sqrt(d)`, the hand-written
+    // override. Unpadded, -1 lets the dispatch pick `1/sqrt(dk)` (== d).
+    const float sm_scale_override = head_dim_padded
+        ? (1.0f / std::sqrt(static_cast<float>(d)))
+        : -1.f;
+    // Padded Q/K/V staging (the hand-written `attn_q`/... indirection):
+    // GEMM in/out buffers stay at `d`; the KV write and attention consume
+    // the zero-padded `dk` copies, and the o_proj reads the stripped
+    // output. All identity when the model's head_dim is a dispatch value.
+    void* const attn_q = head_dim_padded ? ws.q_padded.data() : ws.q.data();
+    void* const attn_k = head_dim_padded ? ws.k_padded.data() : ws.k.data();
+    void* const attn_v = head_dim_padded ? ws.v_padded.data() : ws.v.data();
+    void* const attn_out_buf =
+        head_dim_padded ? ws.attn_out_padded.data() : ws.attn_out.data();
 
     // Attention path choice: the same booleans the hand-written body derives
     // from the plan_state the (unchanged) prepare hook filled. Custom-mask
@@ -559,6 +579,19 @@ void llama_like_forward_declared(
             break;
         }
         case PieForwardOpKind::KvAppend: {
+            // Padded head_dim: the cache stores `dk`-wide cells, so Q/K/V
+            // are zero-padded to the `*_padded` staging buffers first —
+            // the hand-written pad block, same launch order (q, k, v),
+            // placed exactly where it sits there: after rope, before the
+            // write. Identity when unpadded (`attn_*` alias ws.q/k/v).
+            if (head_dim_padded) {
+                kernels::launch_pad_head_dim_bf16(
+                    ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
+                kernels::launch_pad_head_dim_bf16(
+                    ws.k.data(), attn_k, N, num_kv_heads, d, dk, stream);
+                kernels::launch_pad_head_dim_bf16(
+                    ws.v.data(), attn_v, N, num_kv_heads, d, dk, stream);
+            }
             auto kv_view = cache.layer_view(static_cast<int>(op.param0));
             if (has_write_desc) {
                 // Explicit-descriptor write, N cells (one per query token) —
@@ -569,14 +602,14 @@ void llama_like_forward_declared(
                 // at replay time.
                 kernels::launch_write_kv_explicit_bf16(
                     kv_view,
-                    ws.k.data(), ws.v.data(),
+                    attn_k, attn_v,
                     w_page_d, w_off_d, N, stream, row_valid_d);
             } else {
                 // Page-derived append (the hand-written non-write-desc
                 // branch): position re-derived from the page table.
                 kernels::launch_write_kv_to_pages(
                     kv_view,
-                    ws.k.data(), ws.v.data(),
+                    attn_k, attn_v,
                     qo_indptr, kv_page_indices, kv_page_indptr,
                     kv_last_page_lens,
                     N, R, stream, row_valid_d);
@@ -597,9 +630,9 @@ void llama_like_forward_declared(
                     : fwd_cfg.sliding_window;
             if (use_xqa_decode_path) {
                 ops::launch_attention_xqa_decode_bf16_prepared(
-                    ws.q.data(), kv_view.k_bf16_pages, kv_view.v_bf16_pages,
-                    ws.attn_out.data(),
-                    R, num_q_heads, num_kv_heads, d,
+                    attn_q, kv_view.k_bf16_pages, kv_view.v_bf16_pages,
+                    attn_out_buf,
+                    R, num_q_heads, num_kv_heads, dk,
                     cache.page_size(), plan_state.xqa_max_pages_per_seq,
                     attn_ws, stream, sm_scale_override);
             } else if (use_prefill_decode_path) {
@@ -612,8 +645,8 @@ void llama_like_forward_declared(
                     kv_view, kv_page_indices, num_pages_in_batch, stream);
                 ops::dispatch_attention_flashinfer_prefill_bf16(
                     *prefill_decode_plan,
-                    ws.q.data(), kv_view.k_bf16_pages, kv_view.v_bf16_pages,
-                    ws.attn_out.data(),
+                    attn_q, kv_view.k_bf16_pages, kv_view.v_bf16_pages,
+                    attn_out_buf,
                     qo_indptr, kv_page_indices, kv_page_indptr,
                     kv_last_page_lens,
                     attn_ws, stream, /*logits_soft_cap=*/0.f,
@@ -625,7 +658,7 @@ void llama_like_forward_declared(
                 }
                 ops::dispatch_attention_flashinfer_decode(
                     *decode_plan,
-                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_q, kv_view, attn_out_buf,
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, sm_scale_override);
@@ -635,20 +668,27 @@ void llama_like_forward_declared(
                     kv_view, kv_page_indices, num_pages_in_batch, stream);
                 ops::dispatch_attention_flashinfer_prefill_bf16(
                     *prefill_plan,
-                    ws.q.data(), kv_view.k_bf16_pages, kv_view.v_bf16_pages,
-                    ws.attn_out.data(),
+                    attn_q, kv_view.k_bf16_pages, kv_view.v_bf16_pages,
+                    attn_out_buf,
                     qo_indptr, kv_page_indices, kv_page_indptr,
                     kv_last_page_lens,
                     attn_ws, stream, /*logits_soft_cap=*/0.f,
                     sm_scale_override);
             } else {
                 ops::launch_attention_flashinfer_prefill(
-                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_q, kv_view, attn_out_buf,
                     qo_indptr, kv_page_indices, kv_page_indptr,
                     kv_last_page_lens,
                     qo_indptr_h, kv_page_indptr_h,
                     N, R, num_q_heads, attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, sm_scale_override);
+            }
+            // Strip the trailing pad cols before the o_proj GEMM reads
+            // `[N, num_q*d]` — the hand-written post-attention strip.
+            if (head_dim_padded) {
+                kernels::launch_strip_head_dim_bf16(
+                    attn_out_buf, ws.attn_out.data(),
+                    N, num_q_heads, d, dk, stream);
             }
             break;
         }

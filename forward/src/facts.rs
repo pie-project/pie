@@ -11,9 +11,10 @@ use serde::{Deserialize, Serialize};
 use crate::trace::{NormVariant, RopeKind};
 
 /// The llama_like family's facts: covers qwen3, mistral3, phi3, olmo3
-/// (pie-application-plan.md §7 stage 3 scope). First slice: the qwen3
+/// (pie-application-plan.md §7 stage 3 scope). Declared so far: the qwen3
 /// configuration — pre-norm, per-head qk-norm, standard rope, fused QKV
-/// binding, dense MLP.
+/// binding, dense MLP — and the phi3 one, which drops the qk-norm and the
+/// embedding tie.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LlamaLikeFacts {
     pub hidden: u32,
@@ -59,6 +60,39 @@ impl LlamaLikeFacts {
             qk_norm: true,
             fused_qkv: true,
             tied_embeddings: true,
+        }
+    }
+
+    /// Phi-3-mini-4k-instruct (microsoft/Phi-3-mini-4k-instruct
+    /// config.json): the second llama_like configuration the declaration
+    /// covers. MHA (32 q = 32 kv heads), no qk-norm, untied lm_head
+    /// (`tie_word_embeddings: false`). `head_dim` is the logical 96
+    /// (hidden 3072 / 32 heads); the kernel-side 96 → 128 pad is backend
+    /// knowledge the trace deliberately lacks, as are `sliding_window:
+    /// 2047` and rope scaling (null here) — none of them change WHAT the
+    /// pass computes, only how the driver launches it. `fused_qkv: false`
+    /// is the binding fact, and a mildly surprising one: the checkpoint
+    /// ships `qkv_proj` pre-fused, but the loader contract SPLITS it into
+    /// banded q/k/v views (`llama_like_contract.hpp` phi3_fused_splits)
+    /// and the CUDA dense join only re-fuses raw source tensors — a
+    /// contract-derived band is not one — so the deployment binds three
+    /// projections and the trace writes three matmuls (verified against
+    /// the live binding: the declared-forward trace reports the 387-op
+    /// unfused form, 12 ops x 32 layers + 3).
+    pub fn phi3_mini() -> Self {
+        Self {
+            hidden: 3072,
+            layers: 32,
+            q_heads: 32,
+            kv_heads: 32,
+            head_dim: 96,
+            intermediate: 8192,
+            vocab: 32_064,
+            rope: RopeKind::Standard,
+            norm_variant: NormVariant::Plain,
+            qk_norm: false,
+            fused_qkv: false,
+            tied_embeddings: false,
         }
     }
 }
