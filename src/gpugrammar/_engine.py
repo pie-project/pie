@@ -71,6 +71,7 @@ _PORTED: frozenset[str] = frozenset(
         "hash",
         "probe",
         "copy",
+        "store",
         "advance_fused",
         "fill_fused",
     }
@@ -4385,6 +4386,47 @@ class DeviceBatch:
             num_warps=4,
         )
 
+    def _store_cuda(self, grammar) -> None:
+        from gpugrammar import _gpugrammar
+
+        # The rival scan is over the batch and the mask copy is over the words,
+        # so the block is wide enough for both and the grid carries the row.
+        _gpugrammar.cuda_launch(
+            "gg_store",
+            max(1, (grammar.mask_words + 255) // 256),
+            256,
+            torch.cuda.current_stream().cuda_stream,
+            [
+                self.lexer_state.data_ptr(),
+                self.stack.data_ptr(),
+                self.depth.data_ptr(),
+                self.config_count.data_ptr(),
+                self.grammar_of.data_ptr(),
+                self.state_hash.data_ptr(),
+                self.memo_want.data_ptr(),
+                self.suffix_hash.data_ptr(),
+                self.memo_read.data_ptr(),
+                self.memo_hash.data_ptr(),
+                self.memo_lexer.data_ptr(),
+                self.memo_stack.data_ptr(),
+                self.memo_depth.data_ptr(),
+                self.memo_count.data_ptr(),
+                self.memo_grammar.data_ptr(),
+                self.memo_mask.data_ptr(),
+                self.mask.data_ptr(),
+            ],
+            [
+                grammar.mask_words,
+                self.configs,
+                grammar.max_stack,
+                self.memo_slots,
+                self.memo_configs,
+                self.memo_stride,
+                _MEMO_SUFFIXES,
+            ],
+            grid_y=self.batch,
+        )
+
     def _fill_fused_cuda(self, grammar) -> None:
         """Probe, sweep, scatter and claim as one kernel.
 
@@ -4459,8 +4501,7 @@ class DeviceBatch:
                 # and either can be the wider of the two, so the buffer covers
                 # both rather than whichever the caller happens to be.
                 (
-                    self.batch
-                    * max(self._fused_threads(grammar), self.configs),
+                    self.batch * max(self._fused_threads(grammar), self.configs),
                     2 * grammar.window,
                 ),
                 dtype=torch.int32,
@@ -4562,23 +4603,24 @@ class DeviceBatch:
         self._commit_triton(grammar)
 
     def _history_triton(self, grammar, rows) -> None:
-            _history_kernel[(self.sweep_blocks,)](
-                self.lexer_state,
-                self.stack,
-                self.depth,
-                self.config_count,
-                self.live_offsets,
-                self.hist_slot,
-                self.hist_lexer,
-                self.hist_stack,
-                self.hist_depth,
-                self.hist_count,
-                ROWS=rows,
-                CONFIGS=self.configs,
-                STACK_STRIDE=grammar.max_stack,
-                DEPTH=self.rollback_depth,
-            )
-            self.hist_slot += 1
+        _history_kernel[(self.sweep_blocks,)](
+            self.lexer_state,
+            self.stack,
+            self.depth,
+            self.config_count,
+            self.live_offsets,
+            self.hist_slot,
+            self.hist_lexer,
+            self.hist_stack,
+            self.hist_depth,
+            self.hist_count,
+            ROWS=rows,
+            CONFIGS=self.configs,
+            STACK_STRIDE=grammar.max_stack,
+            DEPTH=self.rollback_depth,
+        )
+        self.hist_slot += 1
+
     def _locate_triton(self, grammar, rows) -> None:
         _locate_kernel[(self.sweep_blocks,)](
             grammar.group_offsets,
@@ -4947,13 +4989,14 @@ class DeviceBatch:
             self._hash_cuda(grammar)
             self._fill_fused_cuda(grammar)
             self._copy_cuda(grammar)
-            self._store_triton(grammar)
+            (self._store_cuda if "store" in _PORTED else self._store_triton)(grammar)
             return self.mask
         return self._fill_triton(
             mask=self._mask_cuda if "mask" in _PORTED else None,
             hash=self._hash_cuda if "hash" in _PORTED else None,
             probe=self._probe_cuda if "probe" in _PORTED else None,
             copy=self._copy_cuda if "copy" in _PORTED else None,
+            store=self._store_cuda if "store" in _PORTED else None,
         )
 
     def _advance_cuda(self) -> None:
@@ -5068,7 +5111,9 @@ class DeviceBatch:
             )
         return self.mask if path == "fill" else None
 
-    def _fill_triton(self, mask=None, hash=None, probe=None, copy=None) -> torch.Tensor:
+    def _fill_triton(
+        self, mask=None, hash=None, probe=None, copy=None, store=None
+    ) -> torch.Tensor:
         grammar = self.grammar
         # The mask is not cleared here. The probe knows which rows the scatter
         # will build up - the ones with no answer anywhere - and clears only
@@ -5103,5 +5148,5 @@ class DeviceBatch:
         )
         self._claim_triton(grammar)
         (copy or self._copy_triton)(grammar)
-        self._store_triton(grammar)
+        (store or self._store_triton)(grammar)
         return self.mask

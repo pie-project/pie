@@ -289,3 +289,108 @@ extern "C" __global__ void gg_copy(
                       : mask[(int64_t)source * mask_words + at];
     }
 }
+
+/// Remember a mask this step had to compute.
+///
+/// Written after the scatter, so what is stored is the finished row. Only a
+/// representative that missed is stored - a hit is already there, and a
+/// duplicate has not computed anything.
+///
+/// A state too wide or too deep for an entry is simply not remembered. The
+/// bound keeps the table small enough to be worth having, and the states that
+/// exceed it are rare; leaving them out costs a recomputation rather than a
+/// wrong answer.
+extern "C" __global__ void gg_store(
+    const int32_t* lexer_state,
+    const int32_t* stack,
+    const int32_t* stack_depth,
+    const int32_t* config_count,
+    const int32_t* grammar_of,
+    const int32_t* state_hash,
+    const int32_t* memo_want,
+    const int32_t* suffix_hash,
+    int32_t* memo_read,
+    int32_t* memo_hash,
+    int32_t* memo_lexer,
+    int32_t* memo_stack,
+    int32_t* memo_depth,
+    int32_t* memo_count,
+    int32_t* memo_grammar,
+    int32_t* memo_mask,
+    const int32_t* mask,
+    int32_t mask_words,
+    int32_t configs,
+    int32_t stack_stride,
+    int32_t slots,
+    int32_t memo_configs,
+    int32_t memo_stride,
+    int32_t suffixes) {
+    int32_t sequence = blockIdx.y;
+    int32_t want = memo_want[sequence];
+    if (want == -2) {
+        return;
+    }
+    int32_t digest =
+        want > 0 ? suffix_hash[sequence * suffixes + want - 1] : state_hash[sequence];
+    int32_t slot = (digest & 0x7FFFFFFF) % slots;
+
+    // One writer per slot. Two sequences whose fingerprints collide would
+    // otherwise interleave and leave an entry holding one state and the other's
+    // mask, which a later probe matches and hands back. Decided by a scan rather
+    // than an atomic so the answer does not depend on block order - and the scan
+    // is over the batch, which is why the whole block joins it.
+    int rival = 0;
+    for (int32_t other = threadIdx.x; other < sequence; other += blockDim.x) {
+        int32_t theirs_k = memo_want[other];
+        if (theirs_k == -2) {
+            continue;
+        }
+        int32_t theirs = theirs_k > 0 ? suffix_hash[other * suffixes + theirs_k - 1]
+                                      : state_hash[other];
+        if (((theirs & 0x7FFFFFFF) % slots) == slot) {
+            rival = 1;
+        }
+    }
+    if (__syncthreads_or(rival)) {
+        return;
+    }
+
+    if (blockIdx.x == 0) {
+        int32_t count = config_count[sequence];
+        for (int32_t config = threadIdx.x; config < count; config += blockDim.x) {
+            int32_t row = sequence * configs + config;
+            int32_t depth = stack_depth[row];
+            int32_t kept = want > 0 && want < depth ? want : depth;
+            memo_lexer[slot * memo_configs + config] = lexer_state[row];
+            memo_depth[slot * memo_configs + config] = kept;
+        }
+        for (int32_t at = threadIdx.x; at < count * memo_stride; at += blockDim.x) {
+            int32_t config = at / memo_stride;
+            int32_t lane = at - config * memo_stride;
+            int32_t row = sequence * configs + config;
+            int32_t depth = stack_depth[row];
+            int32_t kept = want > 0 && want < depth ? want : depth;
+            if (lane < kept) {
+                memo_stack[((int64_t)slot * memo_configs + config) * memo_stride + lane] =
+                    stack[(int64_t)row * stack_stride + depth - kept + lane];
+            }
+        }
+        if (threadIdx.x == 0) {
+            memo_count[slot] = count;
+            memo_grammar[slot] = grammar_of[sequence];
+            memo_read[slot] = want;
+        }
+        // The fingerprint last, so a reader that sees it finds the rest of the
+        // entry already written.
+        __syncthreads();
+        __threadfence();
+        if (threadIdx.x == 0) {
+            memo_hash[slot] = digest;
+        }
+    }
+
+    for (int32_t at = blockIdx.x * blockDim.x + threadIdx.x; at < mask_words;
+         at += gridDim.x * blockDim.x) {
+        memo_mask[(int64_t)slot * mask_words + at] = mask[(int64_t)sequence * mask_words + at];
+    }
+}
