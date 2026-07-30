@@ -3551,23 +3551,26 @@ class DeviceBatch:
         # not speculate should not pay for it.
         self.rollback_depth = rollback
         self.history_length = 0
-        if rollback > 0:
-            self.hist_lexer = torch.zeros(
-                rollback * rows, dtype=torch.int32, device="cuda"
-            )
-            self.hist_depth = torch.ones(
-                rollback * rows, dtype=torch.int32, device="cuda"
-            )
-            self.hist_stack = torch.zeros(
-                rollback * rows * grammar.max_stack, dtype=torch.int32, device="cuda"
-            )
-            self.hist_count = torch.ones(
-                rollback * batch, dtype=torch.int32, device="cuda"
-            )
-            # On the device, so that a captured advance stays valid: a graph
-            # records the arguments it was launched with, and a slot passed as a
-            # scalar would be frozen at whatever it was when it was recorded.
-            self.hist_slot = torch.zeros(1, dtype=torch.int32, device="cuda")
+        # The fused advance writes the entry itself, so it takes these pointers
+        # whether or not there is a ring behind them. A single word each when
+        # there is not, so the launch has one shape rather than two.
+        held = rollback if rollback > 0 else 0
+        self.hist_lexer = torch.zeros(
+            max(1, held * rows), dtype=torch.int32, device="cuda"
+        )
+        self.hist_depth = torch.ones(
+            max(1, held * rows), dtype=torch.int32, device="cuda"
+        )
+        self.hist_stack = torch.zeros(
+            max(1, held * rows * grammar.max_stack), dtype=torch.int32, device="cuda"
+        )
+        self.hist_count = torch.ones(
+            max(1, held * batch), dtype=torch.int32, device="cuda"
+        )
+        # On the device, so that a captured advance stays valid: a graph
+        # records the arguments it was launched with, and a slot passed as a
+        # scalar would be frozen at whatever it was when it was recorded.
+        self.hist_slot = torch.zeros(1, dtype=torch.int32, device="cuda")
 
     def rollback(self, steps: int) -> None:
         """Undo `steps` advances, putting the parse state back where it was.
@@ -4538,6 +4541,11 @@ class DeviceBatch:
                 self.cand_depth.data_ptr(),
                 self.cand_floor.data_ptr(),
                 self.cand_window.data_ptr(),
+                self.hist_slot.data_ptr(),
+                self.hist_lexer.data_ptr(),
+                self.hist_stack.data_ptr(),
+                self.hist_depth.data_ptr(),
+                self.hist_count.data_ptr(),
             ],
             [
                 self.configs,
@@ -4547,8 +4555,13 @@ class DeviceBatch:
                 grammar.window,
                 grammar.paths,
                 grammar.has_verdicts,
+                self.rollback_depth,
             ],
         )
+        if self.rollback_depth > 0:
+            # A device op on a device value, so a captured advance keeps
+            # stepping the ring rather than freezing on the slot it recorded.
+            self.hist_slot += 1
 
     def _advance_triton(self) -> None:
         grammar = self.grammar
@@ -5014,11 +5027,9 @@ class DeviceBatch:
             self._advance_triton()
             return
         if "advance_fused" in _PORTED:
-            if self.rollback_depth > 0:
-                self._count_and_scan(
-                    grammar, rows, self.live_counts, self.live_offsets, skip=0, unit=1
-                )
-                self._history_triton(grammar, rows)
+            # The history entry is written inside the fused kernel, before it
+            # changes anything, so the rollback ring no longer costs a count, a
+            # scan on a grid of one, and a kernel of its own.
             self._advance_fused_cuda(grammar)
             return
         self._advance_prepare_cuda(grammar, rows)

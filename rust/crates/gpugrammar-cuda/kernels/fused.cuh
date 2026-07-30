@@ -35,17 +35,59 @@ extern "C" __global__ void gg_advance_fused(
     int32_t* cand_depth,
     int32_t* cand_floor,
     int32_t* cand_window,
+    int32_t* hist_slot,
+    int32_t* hist_lexer,
+    int32_t* hist_stack,
+    int32_t* hist_depth,
+    int32_t* hist_count,
     int32_t configs,
     int32_t max_readings,
     int32_t stack_stride,
     int32_t max_reductions,
     int32_t window,
     int32_t paths,
-    int32_t has_verdicts) {
+    int32_t has_verdicts,
+    int32_t rollback) {
     int32_t sequence = blockIdx.x;
     int32_t lane = threadIdx.x;
     int32_t count = state->config_count[sequence];
     int32_t grammar = state->grammar_of[sequence];
+
+    // Keep this step's parse state so a later one can be undone - before
+    // anything below changes it. Speculative decoding advances through a draft
+    // and then keeps only the prefix the model accepted, so the parser has to
+    // go back, and going back by asking the host to replay the tokens is the
+    // round trip this design exists not to make.
+    //
+    // The block already holds the sequence whose configurations these are, so
+    // there is no live list to build, no prefix sum over it and no owner search
+    // per item - which is what the unfused path spent two extra kernels and a
+    // grid of one on. The slot is read from the device rather than passed in,
+    // because a graph records the arguments it was given and a slot that
+    // arrived as a scalar would be frozen at whatever it was when recorded.
+    if (rollback > 0) {
+        int32_t slot = *hist_slot % rollback;
+        int64_t at = (int64_t)slot * gridDim.x * configs;
+        if (lane == 0) {
+            hist_count[slot * gridDim.x + sequence] = count;
+        }
+        for (int32_t config = 0; config < count; ++config) {
+            int32_t row = sequence * configs + config;
+            int32_t held = state->depth[row];
+            if (lane == 0) {
+                hist_lexer[at + row] = state->lexer_state[row];
+                hist_depth[at + row] = held;
+            }
+            // Only as deep as the configuration goes. Writing every row to its
+            // full stride is 67 MB a step at batch 512 with 128 configurations,
+            // to preserve the one or two a sequence actually holds.
+            for (int32_t up = lane; up < held; up += blockDim.x) {
+                hist_stack[(at + row) * stack_stride + up] =
+                    state->stack[(int64_t)row * stack_stride + up];
+            }
+        }
+        __syncthreads();
+    }
     gg::Shape shape{0, configs, stack_stride, 0, 0};
 
     // Phase one: save the state the commit will read. The advance writes new
