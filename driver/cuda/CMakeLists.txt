@@ -1077,6 +1077,10 @@ pie_add_cuda_target(test_strided_copy
   SOURCES tests/strided_copy_test.cu
   INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/src ${PIE_LOADER_INCLUDE_DIR}
   LIBS CUDA::cudart)
+pie_add_cuda_target(test_chunked_argmax
+  SOURCES tests/test_chunked_argmax.cu src/kernels/argmax.cu
+  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/src ${PIE_LOADER_INCLUDE_DIR}
+  LIBS CUDA::cudart)
 pie_add_cuda_target(test_nucleus_region
   SOURCES tests/nucleus_region_test.cpp
   INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/../abi/include ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include ${PIE_DRIVER_ABI_INCLUDE_DIR} ${PIE_LOADER_INCLUDE_DIR}

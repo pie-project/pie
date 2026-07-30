@@ -6121,3 +6121,91 @@ hardcoded constant.
 - The non-vocab GEMMs (39.1%, 186 launches/step) are at neither the bandwidth
   roof nor the compute roof. That is a separate, larger pool — and it is
   shared with vLLM, so it is about being *better*, not about catching up.
+
+---
+
+## §20.37 — the chunked argmax accumulator (Phase 1: kernels only)
+
+§20.36 measured the prize; this lands the piece of it that is self-contained.
+**No end-to-end win is claimed here** — nothing calls the new kernels yet. What
+is settled is that the reduction half of the fused scheme exists in the driver,
+is bit-exact, and is covered.
+
+### What the accumulator has to be
+
+Streaming the vocab in slabs only pays if the state carried *between* slabs is
+small. The obvious version — keep each thread's running best, i.e. 1024 slots
+per row — was measured in §20.36 and is **slower than not chunking at all**: at
+R=512 it round-trips ~6 MB of scratch per slab, 19 times per step. So the
+kernel reduces within each warp before it touches memory and carries
+`kArgmaxAccumSlots = 32` pairs per row (131 KB total), and `finalize` collapses
+those with a single warp shuffle.
+
+The tie-break is what makes the result substitutable for the existing sampler.
+`update_argmax` already implements it (strictly-greater wins, so the lowest
+index survives a tie — matching torch/numpy). That is a **total order on
+(value, -index)**, hence associative and commutative, so neither the slab
+boundaries nor the scan order inside a slab can change the answer. The
+accumulator therefore does not merely approximate `launch_argmax_bf16`; it is
+required to equal it exactly, and the test asserts exactly that rather than a
+tolerance.
+
+`acc_val` / `acc_idx` are separate `float` / `int32` arrays on purpose. The
+packed `pack_argmax_pair` representation used elsewhere in this file
+(`value_bits << 32 | token`) compares wrong under unsigned comparison for
+negative floats, and inverts the tie-break to highest-index-wins.
+
+### Two alignment bugs, both found by the test
+
+1. The accumulator's vectorised path (`uint4`, 8 bf16 per load) originally
+   decided vectorisation from the row stride alone, assuming an allocator-
+   aligned slab base. A caller slicing a chunk out of a wider buffer lands on
+   an arbitrary column. Now checks the base pointer too.
+2. **Pre-existing:** `argmax_bf16_vec2_kernel` and
+   `argmax_bf16_compact_scatter_vec2_kernel` index rows as `base + row * vocab`
+   and load through `__nv_bfloat162`. With an **odd vocab** every second row
+   starts on a 2-byte boundary and the load faults. Every production vocab is
+   even, which is why it never fired. `argmax_vec2_usable()` now gates on both
+   the parity and the pointer.
+
+### Dead code removed
+
+`launch_lm_head_argmax_bf16` and `lm_head_argmax_pairs_bf16_kernel` are gone.
+They claimed precisely this optimisation and had **zero call sites**, but
+`LM_HEAD_TILE_TOKENS = 8` made the grid `(num_rows, vocab/8)` — a GEMV in which
+every row re-reads the entire LM head weight matrix. At R=512 that is 512 x
+311 MB. It was only ever viable on the draft path at `num_rows ~ 1`, and left
+in place it is a trap for anyone who greps for the fused shape. The header
+keeps a NOTE saying so.
+
+Kept: `select_lm_head_argmax_pairs_kernel` and `unpack_argmax_*`, which are
+still live on the INT8/BF16 GEMV paths.
+
+### Verification
+
+`driver/cuda/tests/test_chunked_argmax.cu`, R=512 over a 151936 vocab, values
+coarsely quantised so ties are common. Reference is `launch_argmax_bf16`
+itself. Six configurations, all bit-identical: slabs that divide the vocab,
+slabs leaving a ragged remainder, a remainder that is not a multiple of the
+vector width, slabs narrower than one vector load, a single whole-vocab slab,
+and a padded row stride that forces the scalar path. The accumulator is
+poisoned before each run so a missing `init` on the first slab shows up.
+
+Also: 368/0 engine unit tests, contention subset 5/5 with real runtimes, zero
+compiler warnings.
+
+### What Phase 2 needs (not started)
+
+The LM head GEMM is inside the model forward (`llama_like.cpp:1052`) while the
+sampler runs as a separate declared phase (`dispatch.cu:4997`) that receives
+per-row pointers into the materialised logits buffer
+(`lane.logits_bf16_rows`). Interleaving them crosses that boundary, so it needs
+either a model-contract method (`emit_logits_chunk(vocab_begin, vocab_end,
+slab)`) or a compiler-emitted accumulating region kernel. The compiler side is
+already built: `analyze_direct_argmax` (`compiler/codegen/src/cuda/fused.rs`)
+proves the guest's epilogue is a vocab reduction and ships the result through
+`PieDirectArgmax` to `dispatch.cu:90`. Only the lowering is missing.
+
+The chunk width is a real optimum (the GEMM alone prefers 8192, the combined
+pipeline peaks at 16384) and is a device+model property — so it belongs to the
+planner calibrator, **not** to a constant.
