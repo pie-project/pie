@@ -138,6 +138,18 @@ _MEMO_SLOTS = 256
 # thirds to three quarters of configurations, with a long thin tail that the
 # whole-stack key still catches.
 _MEMO_SUFFIXES = 1
+
+# Threads per block for the fused fill. Swept on the skewed draft walk, which
+# is the workload the width shows up in - batch 128, one schema, sequences at
+# six different points of a document:
+#
+#     32 threads   4081 us      256 threads    950 us
+#     64 threads   2315 us      512 threads    launch fails, out of registers
+#    128 threads   1606 us
+#
+# So it is the ceiling the hardware allows, and it has nothing to do with the
+# stack depth that sizes the advance.
+_FILL_THREADS = 256
 _MEMO_CONFIGS = 64
 _MEMO_DEPTH = 64
 # No real fingerprint is asked to be this, and an empty entry has to miss.
@@ -4472,7 +4484,7 @@ class DeviceBatch:
         _gpugrammar.cuda_launch(
             "gg_fill_fused",
             self.batch,
-            self._fused_threads(grammar),
+            self._fill_threads(grammar),
             torch.cuda.current_stream().cuda_stream,
             [
                 self.grammar.arena_struct().data_ptr(),
@@ -4518,6 +4530,17 @@ class DeviceBatch:
         """
         return min(1024, max(32, (grammar.max_stack + 31) // 32 * 32))
 
+    def _fill_threads(self, grammar) -> int:
+        """Threads per block for the fused fill, which has no commit phase.
+
+        The advance's width is set by the stack, because a thread owns a stack
+        entry when the commit runs. The fill has no such phase: a thread owns a
+        *replay*, and what it sweeps is a lexer state's groups - hundreds of
+        them - so sizing it by the stack leaves a narrow grammar sweeping seven
+        hundred groups with one warp.
+        """
+        return _FILL_THREADS
+
     def _fused_scratch(self, grammar) -> torch.Tensor:
         """Two replay windows per *thread*, since a thread owns a replay.
 
@@ -4532,7 +4555,12 @@ class DeviceBatch:
                 # and either can be the wider of the two, so the buffer covers
                 # both rather than whichever the caller happens to be.
                 (
-                    self.batch * max(self._fused_threads(grammar), self.configs),
+                    self.batch
+                    * max(
+                        self._fused_threads(grammar),
+                        self._fill_threads(grammar),
+                        self.configs,
+                    ),
                     2 * grammar.window,
                 ),
                 dtype=torch.int32,
