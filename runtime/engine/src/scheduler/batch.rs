@@ -283,10 +283,15 @@ pub(crate) fn build_frame_submission(
         // Ordered sub-batches: wire (Host-class) members first, the
         // device-resolved envelope suffix last — the driver's offset
         // fixed-decode compose requires the envelope lanes to be a
-        // contiguous program suffix. Stable sort keeps arrival order
-        // within each class.
+        // contiguous program suffix. That contract stays PRIMARY. Within
+        // each class, attention-hook-carrying programs sort last: the
+        // driver's hook-free prefix (`StageHooks::hook_free_prefix_rows`)
+        // is the fused fast path, and a leading hook-free run that spans
+        // ALL hook-free lanes makes that prefix maximal instead of ending
+        // at whichever hook lane happened to arrive first. Stable sort
+        // keeps arrival order otherwise.
         let mut group = group;
-        group.sort_by_key(|req| req.request.device_resolved_geometry);
+        group.sort_by_key(|req| (req.request.device_resolved_geometry, req.hook_program));
         let wire_count = group
             .iter()
             .take_while(|req| !req.request.device_resolved_geometry)
@@ -379,6 +384,7 @@ mod tests {
             process_id: None,
             pipeline_id: None,
             prebuilt,
+            hook_program: false,
             prelaunch_copy: None,
             prelaunch_state_copy: None,
             frame: None,
