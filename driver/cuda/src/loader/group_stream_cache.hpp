@@ -2,6 +2,15 @@
 
 // A bounded slab of group instances, paged in on demand.
 //
+// It holds *several* groups, not one, and that is forced by the contract
+// vocabulary rather than chosen: a name template carries one `{}`, so a
+// checkpoint that names its experts `layers.<L>.experts.<E>.w1` is L groups of
+// arity E, not one group of arity L*E. The slab has to span them anyway --
+// budgeting per layer would size every layer for its worst step -- so the key
+// here is (group, instance) flattened, and every group must agree on the slot
+// stride, which for a real architecture they do because every layer's experts
+// have the same shape.
+//
 // The loader compiles a group to one plan plus `arity` source bindings and
 // says nothing about residency, because running the plan `arity` times into
 // `arity` destinations and running it on demand into a few slots are the same
@@ -55,33 +64,57 @@ public:
     /// budget cannot hold one slot.
     GroupStreamCache(
         pie_loader::CheckpointSource& loader,
-        const pie_loader::PieLoaderGroupView& group,
+        pie_loader::PieLoaderGroupSlice groups,
         std::uint64_t budget_bytes,
         bool verbose = false)
-        : loader_(loader),
-          group_(group),
-          name_(pie_loader::bytes_to_string(group.name)),
-          verbose_(verbose)
+        : loader_(loader), groups_(groups), verbose_(verbose)
     {
-        if (group.plan == nullptr) {
+        if (groups.len == 0) {
             throw std::runtime_error(
-                "group stream cache: group \"" + name_ + "\" has no plan");
+                "group stream cache: nothing to page (no groups)");
         }
-        slot_bytes_ = group.plan->memory.persistent_bytes;
-        if (slot_bytes_ == 0) {
-            throw std::runtime_error(
-                "group stream cache: group \"" + name_ +
-                "\" occupies no persistent memory, so there is nothing to page");
+        std::uint64_t total_instances = 0;
+        for (std::size_t g = 0; g < groups.len; ++g) {
+            const auto& group = groups.ptr[g];
+            const std::string name = pie_loader::bytes_to_string(group.name);
+            if (group.plan == nullptr) {
+                throw std::runtime_error(
+                    "group stream cache: group \"" + name + "\" has no plan");
+            }
+            const std::uint64_t bytes = group.plan->memory.persistent_bytes;
+            if (bytes == 0) {
+                throw std::runtime_error(
+                    "group stream cache: group \"" + name + "\" occupies no "
+                    "persistent memory, so there is nothing to page");
+            }
+            // One stride for the whole slab, so a slot can hold any instance
+            // of any group. Every layer's experts have the same shape, so a
+            // disagreement here means the groups were not meant to share a
+            // cache and sizing one slab for them would be a guess.
+            if (slot_bytes_ == 0) {
+                slot_bytes_ = bytes;
+            } else if (bytes != slot_bytes_) {
+                throw std::runtime_error(
+                    "group stream cache: group \"" + name + "\" wants " +
+                    std::to_string(bytes) + " bytes per instance but \"" +
+                    pie_loader::bytes_to_string(groups.ptr[0].name) +
+                    "\" wants " + std::to_string(slot_bytes_) +
+                    ", so they cannot share a slab");
+            }
+            group_base_.push_back(total_instances);
+            total_instances += group.arity;
         }
         if (budget_bytes < slot_bytes_) {
             throw std::runtime_error(
-                "group stream cache: group \"" + name_ + "\" needs " +
-                std::to_string(slot_bytes_) + " bytes per instance but the "
-                "budget is " + std::to_string(budget_bytes));
+                "group stream cache: one instance needs " +
+                std::to_string(slot_bytes_) + " bytes but the budget is " +
+                std::to_string(budget_bytes));
         }
         std::uint64_t slots = budget_bytes / slot_bytes_;
-        if (slots > group.arity) slots = group.arity;
-        index_ = GroupSlotIndex(group.arity, static_cast<std::uint32_t>(slots));
+        if (slots > total_instances) slots = total_instances;
+        index_ = GroupSlotIndex(
+            static_cast<std::uint32_t>(total_instances),
+            static_cast<std::uint32_t>(slots));
         slot_stores_.resize(slots);
         slot_filled_.assign(slots, false);
         allocate_slab();
@@ -92,8 +125,9 @@ public:
     GroupStreamCache(const GroupStreamCache&) = delete;
     GroupStreamCache& operator=(const GroupStreamCache&) = delete;
 
-    const std::string& name() const noexcept { return name_; }
-    std::uint32_t arity() const noexcept { return group_.arity; }
+    std::size_t num_groups() const noexcept { return groups_.len; }
+    /// Every instance of every group, which is what the slab is sized against.
+    std::uint32_t total_instances() const noexcept { return index_.arity(); }
     std::uint32_t num_slots() const noexcept { return index_.num_slots(); }
     std::uint64_t slot_bytes() const noexcept { return slot_bytes_; }
     std::uint64_t slab_bytes() const noexcept {
@@ -102,7 +136,9 @@ public:
     /// True when the slab holds the whole group, so no page-in can ever miss
     /// after the first sweep. The caller may use this to keep CUDA graph
     /// capture on, since nothing will call into the host mid-forward.
-    bool fully_resident() const noexcept { return num_slots() == group_.arity; }
+    bool fully_resident() const noexcept {
+        return num_slots() == total_instances();
+    }
 
     /// Make `instance` resident and return its tensors, keyed by the runtime
     /// names its plan finalizes.
@@ -112,10 +148,12 @@ public:
     /// instance was pinned. The instance stays pinned -- and its pointers stay
     /// valid -- until `end_batch`.
     const WeightStore& ensure_resident(
+        std::size_t group,
         std::uint32_t instance,
         cudaStream_t compute_stream)
     {
-        const auto found = index_.find(instance);
+        const std::uint32_t key = flatten(group, instance);
+        const auto found = index_.find(key);
         if (found != GroupSlotIndex::kAbsent) {
             const auto slot = static_cast<std::uint32_t>(found);
             index_.touch_and_pin(slot);
@@ -123,12 +161,12 @@ public:
             return slot_stores_[slot];
         }
 
-        const auto acquired = index_.acquire(instance);
+        const auto acquired = index_.acquire(key);
         ++stats_.misses;
         if (acquired.evicted) {
             sync_stream(compute_stream);
         }
-        fill(acquired.slot, instance);
+        fill(acquired.slot, group, instance);
         return slot_stores_[acquired.slot];
     }
 
@@ -161,8 +199,19 @@ private:
     /// becomes the slot's, and afterwards it is checked against it and thrown
     /// away, because the layout is what the loader proved constant, not the
     /// bytes.
-    void fill(std::uint32_t slot, std::uint32_t instance)
+    std::uint32_t flatten(std::size_t group, std::uint32_t instance) const
     {
+        if (group >= groups_.len) {
+            throw std::out_of_range(
+                "group stream cache: group " + std::to_string(group) +
+                " outside " + std::to_string(groups_.len));
+        }
+        return static_cast<std::uint32_t>(group_base_[group]) + instance;
+    }
+
+    void fill(std::uint32_t slot, std::size_t group_index, std::uint32_t instance)
+    {
+        const auto& group = groups_.ptr[group_index];
         WeightStore scratch;
         WeightStoreBuilder builder(scratch);
         LoadPlanExecutor executor(loader_, builder, {});
@@ -170,27 +219,28 @@ private:
         LoadPlanExecution how;
         how.persistent_arena = slot_base(slot);
         how.persistent_arena_bytes = slot_bytes_;
-        const std::size_t per_instance = group_.bindings_per_instance;
+        const std::size_t per_instance = group.bindings_per_instance;
         if (per_instance != 0) {
             const std::size_t start =
                 static_cast<std::size_t>(instance) * per_instance;
-            if (start + per_instance > group_.bindings.len) {
+            if (start + per_instance > group.bindings.len) {
                 throw std::runtime_error(
-                    "group stream cache: group \"" + name_ + "\" instance " +
+                    "group stream cache: group \"" +
+                    pie_loader::bytes_to_string(group.name) + "\" instance " +
                     std::to_string(instance) + " has no bindings");
             }
-            how.source_bindings = group_.bindings.ptr + start;
+            how.source_bindings = group.bindings.ptr + start;
             how.source_binding_count = per_instance;
         }
 
-        const auto stats = executor.execute(*group_.plan, how);
+        const auto stats = executor.execute(*group.plan, how);
         stats_.bytes_paged_in += stats.h2d_copy_bytes;
 
         if (!slot_filled_[slot]) {
             slot_stores_[slot] = std::move(scratch);
             slot_filled_[slot] = true;
         } else {
-            check_layout_held(slot, scratch, instance);
+            check_layout_held(slot, scratch, flatten(group_index, instance));
         }
     }
 
@@ -208,7 +258,7 @@ private:
             const auto it = held.find(name);
             if (it == held.end() || it->second.data() != record.data()) {
                 throw std::runtime_error(
-                    "group stream cache: group \"" + name_ + "\" instance " +
+                    "group stream cache: instance " +
                     std::to_string(instance) + " laid \"" + name +
                     "\" out differently from the instance already in slot " +
                     std::to_string(slot) +
@@ -225,8 +275,8 @@ private:
             slab_ = nullptr;
             throw std::runtime_error(
                 "group stream cache: could not allocate " +
-                std::to_string(slab_bytes()) + " bytes for group \"" + name_ +
-                "\": " + cudaGetErrorString(err));
+                std::to_string(slab_bytes()) + " bytes: " +
+                cudaGetErrorString(err));
         }
     }
 
@@ -248,8 +298,9 @@ private:
     }
 
     pie_loader::CheckpointSource& loader_;
-    const pie_loader::PieLoaderGroupView& group_;
-    std::string name_;
+    pie_loader::PieLoaderGroupSlice groups_;
+    /// Where each group's instances start in the one flat key space.
+    std::vector<std::uint64_t> group_base_;
     bool verbose_ = false;
 
     std::uint64_t slot_bytes_ = 0;
