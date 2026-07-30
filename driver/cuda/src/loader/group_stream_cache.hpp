@@ -123,6 +123,7 @@ public:
             static_cast<std::uint32_t>(slots));
         slot_stores_.resize(slots);
         slot_filled_.assign(slots, false);
+        copy_engine_.prefer_small_transfers();
         allocate_slab();
     }
 

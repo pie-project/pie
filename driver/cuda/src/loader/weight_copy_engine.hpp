@@ -42,6 +42,24 @@ public:
     WeightCopyEngine(const WeightCopyEngine&) = delete;
     WeightCopyEngine& operator=(const WeightCopyEngine&) = delete;
 
+    /// Tune for many small transfers rather than one large load.
+    ///
+    /// Everything this engine does by default trades setup for throughput --
+    /// a pool of copy streams, host reader lanes staging through pinned
+    /// buffers -- and every one of those is amortised over a whole model. A
+    /// page-in moves a few hundred kilobytes, inside a forward pass that is
+    /// blocked on it, so there is nothing to overlap and the setup is the
+    /// cost: a lane per stream to synchronise at each flush, and a thread
+    /// pool dispatch and join to copy from pages that are already mapped.
+    ///
+    /// One stream, straight from the mapping. Must be set before the first
+    /// copy, which is what creates the pool.
+    void prefer_small_transfers() noexcept
+    {
+        stream_limit_ = 1;
+        reader_lanes_ = false;
+    }
+
     // Counter sink for the current load (set to nullptr between loads).
     void set_stats(LoadExecutionStats* stats) noexcept { stats_ = stats; }
 
@@ -240,6 +258,9 @@ private:
         if (streams != 0) {
             count = std::min<std::size_t>(streams, loader_config::kCopyStreamsMax);
         }
+        if (stream_limit_ != 0) {
+            count = std::min(count, stream_limit_);
+        }
         copy_streams_.resize(count);
         stream_used_.assign(count, false);
         for (auto& stream : copy_streams_) {
@@ -369,7 +390,7 @@ private:
         if (pending_copies_.empty()) {
             return;
         }
-        if (loader_config::reader_lane_count() > 0) {
+        if (reader_lanes_ && loader_config::reader_lane_count() > 0) {
             parallel_staged_flush();
             pending_copies_.clear();
             return;
@@ -500,6 +521,9 @@ private:
     std::size_t next_copy_stream_ = 0;
     /// Which streams have had work queued since the last flush.
     std::vector<bool> stream_used_;
+    /// 0 means the default pool.
+    std::size_t stream_limit_ = 0;
+    bool reader_lanes_ = true;
     std::vector<PendingCopy> pending_copies_;
     std::vector<PinnedSlot> pinned_slots_;
     std::size_t next_pinned_slot_ = 0;
