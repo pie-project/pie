@@ -5961,14 +5961,40 @@ Per decode step, `nsys --cuda-graph-trace=node`, same workload:
 
 The host-channel pipeline drops from **0.86% to 0.33% of pie's GPU time**.
 
-### ⚠ NO THROUGHPUT CLAIM IS MADE
+### ⚠ NO THROUGHPUT CLAIM IS MADE — A DIRECT A/B CONFIRMS IT IS UNDETECTABLE
 
-That is ~0.5% of a decode step. The box was at loadavg 15-20 when this landed
-and an ABBA attempt produced a pie sample 34% below its siblings. **0.5% is
-not resolvable in tok/s here**, and per the §20.34 retraction this log does not
-draw directional conclusions from under-powered samples. The GPU-time
-measurement is deterministic and is the evidence; the wall-clock effect is
-still owed a quiet-box (loadavg < 8) ABBA.
+The sharpest possible test was run: **pie(before) vs pie(after)**, same box,
+same session, two prebuilt `_engine.so` binaries hot-swapped between runs so
+there is no rebuild gap, 8 pairs with alternating within-pair order.
+
+| pair | before | after | delta |
+|---|---|---|---|
+| 1 | 31129.3 | 32412.1 | +4.12% |
+| 2 | 26683.8 | 31799.5 | +19.17% |
+| 3 | 30583.8 | 29146.9 | -4.70% |
+| 4 | 31644.7 | 31500.9 | -0.45% |
+| 5 | 31667.1 | 31543.5 | -0.39% |
+| 6 | 31515.8 | 32272.8 | +2.40% |
+| 7 | 30558.3 | 31277.3 | +2.35% |
+| 8 | 31200.2 | 31032.7 | -0.54% |
+
+**after wins 4 of 8 — a coin flip.** Excluding pair 2 (a collapsed `before` run
+at 26684, the load artefact this box produces every few runs) the paired
+log-ratio is **+0.36% +/- 1.09% (SE), t = 0.33**. The point estimate brackets
+the +0.53% predicted from the GPU-time saving, and that is the most that can
+be said: **the confidence interval is 3x the effect, so this neither confirms
+nor refutes it.**
+
+A pie-vs-vLLM ABBA alongside it read 0.983, with pie's own spread at 3.3%
+against vLLM's 0.7% — all the variance is pie's host-CPU sensitivity, not the
+change.
+
+Contrast §20.34's calibrator: ~1.4% effect, 8 of 8 pairs in one direction.
+**At loadavg 15-28 this box resolves ~1.5%, not 0.5%.** Sub-1% GPU-time work
+cannot be validated end-to-end here at all, so changes of this size must be
+argued from deterministic instrument counts rather than tok/s — which is what
+this section does. The wall-clock effect remains owed a quiet-box
+(loadavg < 8) run.
 
 ### Left on the table
 
