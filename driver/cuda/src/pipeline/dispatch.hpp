@@ -29,6 +29,7 @@
 
 #include "pie_native/fire/fire_geometry.hpp"
 
+#include "model/lora.hpp"
 #include "model/stage_hooks.hpp"
 
 namespace pie_cuda_driver::pipeline {
@@ -312,6 +313,26 @@ class Dispatch {
     // not depend on the page counts it was planned against, or substituting a
     // compacted list at launch is silently wrong.
     void set_attn_page_mask_available(bool available);
+
+    // Whether any program in this launch calls the `lora` sink in its
+    // prologue. The frame queries this to decide whether to fetch and thread
+    // the resolved lora table into the model body.
+    bool launch_wants_lora(
+        const pie_native::LaunchView& view) const;
+
+    // Whether the active model's projection path can honour the `lora` sink
+    // (capability `has_lora`). Default FALSE: a program naming the sink is
+    // refused at bind until the model opts in, because a bound-but-ignored
+    // configuration sink is a program whose adapter silently never applied.
+    void set_lora_available(bool available);
+
+    // The launch's begin-time-resolved lora configuration: one entry per lane
+    // whose program carries the sink (empty when none does). A borrowed view
+    // into launch-owned storage — valid until the launch is finished or
+    // aborted. Populated when the prologue executes in `begin`, which is why
+    // the sink cannot use `attn_page_mask`'s body-owned-buffer shape: the
+    // model body does not exist yet at that point.
+    model::LoraTable launch_lora_table(const StagedLaunch& launch) const;
 
     // Whether this model + cache can honour the `envelope_dot` contract.
     // Mirrors the `has_kv_envelopes` driver capability; a program that names

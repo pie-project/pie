@@ -257,7 +257,10 @@ fn lora_traces_to_a_prologue_sink_call_and_gates_on_the_profile() {
     no_lora.has_lora = false;
     let err = bind(t.container().clone(), no_lora).expect_err("must be refused without has_lora");
     let msg = format!("{err:?}").to_lowercase();
-    assert!(msg.contains("lora"), "error should name the sink, got: {msg}");
+    assert!(
+        msg.contains("lora"),
+        "error should name the sink, got: {msg}"
+    );
 }
 
 /// The name table is emitted SORTED, and every `name_idx` follows it.

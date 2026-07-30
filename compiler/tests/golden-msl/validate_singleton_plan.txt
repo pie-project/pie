@@ -3671,3 +3671,11 @@ error: unsupported Metal semantic sink boundary
 operations: 1
 op: node=0 result_base=0 tag=0x91 results=1 chan=0 args=0
 === end
+# appended (not oracle output): `lora_prologue` joined the corpus after the C++
+# oracle was deleted, so this case transcribes the Rust implementation's own
+# verdict -- the same "unsupported Metal semantic sink boundary" refusal the
+# oracle recorded for every other sink-carrying stage (synthetic_sink_call#0).
+=== lora_prologue#0 none
+ok: false
+error: unsupported Metal semantic sink boundary
+=== end

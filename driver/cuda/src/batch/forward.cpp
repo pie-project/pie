@@ -710,6 +710,7 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
     fwd_in.num_clips                    = in.num_clips;
     fwd_in.precomputed_embeddings       = in.precomputed_embeddings;
     fwd_in.stage_hooks                  = in.stage_hooks;
+    fwd_in.lora                         = in.lora;
     forward_fn.invoke_body(ws, kv_cache, attn_ws, cublas, fwd_in);
 }
 

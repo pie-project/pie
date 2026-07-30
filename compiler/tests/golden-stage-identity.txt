@@ -1,10 +1,13 @@
 # GENERATED from driver/cuda/src/pipeline/program_identity.hpp
 # <golden>#<stage_index> <compiled_stage_identity as hex>
+# REGENERATED: the body below is this compiler's output, not the recorded output of the source of truth above
+#   reason: additive corpus growth: new lora_prologue golden (stage-4 lora sink); every pre-existing case's identity and emitted text is unchanged — the new case's prologue has no generated regions beyond its channel reads, and its second-party sink region is answered by the chunk-1 gate
 beam_epilogue#0 6fa999699fa1e06c
 counter_pingpong#0 78e8dae4d9926e8a
 dfa_ingraph#0 8414a1281165a6c6
 extern_contrastive#0 83ca21d81ff4ee4a
 greedy_argmax#0 b746fb9fbb50a53c
+lora_prologue#0 3d4a5f85e633a21e
 matrix_mask_apply_packed#0 4f68e978c570aa5b
 matrix_select_mask#0 af1befaf873fb4f8
 mtp_verify_tail#0 324984c3c6056e02

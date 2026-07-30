@@ -823,6 +823,7 @@ int Context::Impl::load_model(
             {"has_kv_envelopes", false},
             {"has_attn_score", false},
             {"has_attn_page_mask", false},
+            {"has_lora", false},
             {"max_forward_tokens",
              static_cast<std::uint32_t>(std::max(1, c.max_model_len))},
             {"max_forward_requests", 256},
@@ -1680,6 +1681,15 @@ int Context::Impl::load_model(
 
     registry_->dispatch().set_attn_page_mask_available(has_attn_page_mask);
 
+    // `lora`: no model family applies the low-rank delta at its projection
+    // GEMMs yet, so no launch may bind a program that names the sink. This is
+    // the single flip site when llama_like grows the consumer (the same
+    // family gate `has_attn_score` uses above) — flip it together with the
+    // `has_lora` capability rows below or the engine's honour check and this
+    // bind gate will disagree.
+    const bool has_lora = false;
+    registry_->dispatch().set_lora_available(has_lora);
+
     registry_->dispatch().set_kv_envelopes_available(
         has_kv_envelopes,
         has_kv_envelopes
@@ -1923,6 +1933,7 @@ int Context::Impl::load_model(
         {"has_kv_envelopes", has_kv_envelopes},
         {"has_attn_score", has_attn_score},
         {"has_attn_page_mask", has_attn_page_mask},
+        {"has_lora", has_lora},
         // RV-26: PIE_DEVICE_PORT_ATTN_MASK is deliberately NOT advertised.
         // The runtime classifies masked device-carried decode into the
         // DecodeEnvelope class exactly when this mask claims the port, but

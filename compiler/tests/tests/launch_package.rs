@@ -175,7 +175,11 @@ fn the_grouped_path_accepts_the_same_stages_it_always_has() {
     );
 }
 
-const EXPECTED_GROUPED_VALID: usize = 17;
+// 17 → 18: the corpus grew the `lora_prologue` golden (stage-4 lora sink),
+// whose single prologue stage — channel peeks feeding a pass-wide sink — is
+// grouped-valid like any other sink-carrying stage. No existing stage's
+// classification moved.
+const EXPECTED_GROUPED_VALID: usize = 18;
 
 /// A prologue `lora` sink raises its own stage flag, and only its own.
 ///

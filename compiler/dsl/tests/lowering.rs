@@ -236,7 +236,9 @@ fn lint_lora_sink_misplacement_outside_prologue() {
         intrinsics::kernel::lora(la.read(), lb.read(), Tensor::constant([0u32, 1]));
     });
 
-    let err = b.build().expect_err("a pass-wide sink at attn-proj must fail");
+    let err = b
+        .build()
+        .expect_err("a pass-wide sink at attn-proj must fail");
     let msg = err.to_string();
     assert!(
         err.0

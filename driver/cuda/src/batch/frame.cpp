@@ -30,6 +30,7 @@
 #include "kernels/pack_dense_mask.hpp"
 #include "model/loaded_model.hpp"
 #include "model/attn_score.hpp"
+#include "model/lora.hpp"
 #include "model/stage_hooks.hpp"
 #include "store/kv_cache.hpp"
 #include "store/recurrent_state_cache.hpp"
@@ -2277,6 +2278,16 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
     };
     dump_rs("PRE ");
 
+    // The lora table was resolved when the prologue executed inside
+    // `begin_enqueue` above; fetch the view only when some program in this
+    // launch actually carries the sink, so ordinary fires pay one predicate.
+    // The view borrows launch-owned storage, and `s.staged` outlives the
+    // body call below.
+    const model::LoraTable lora_table =
+        engine.dispatch->launch_wants_lora(s.dispatch_view)
+            ? engine.dispatch->launch_lora_table(*s.staged)
+            : model::LoraTable{};
+
     struct StageHookContext {
         pipeline::Dispatch* dispatch = nullptr;
         pipeline::StagedLaunch* launch = nullptr;
@@ -2369,6 +2380,7 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
             .precomputed_embeddings = s.precomputed_embeddings,
             .stage_hooks =
                 s.has_attention_stages ? &stage_hooks : nullptr,
+            .lora = lora_table.usable() ? &lora_table : nullptr,
         });
     dump_rs("POST");
     if (s.ir_trace) {

@@ -377,6 +377,67 @@ fn golden_counter_pingpong() {
     check("counter_pingpong", rep);
 }
 
+/// **§6.5 LoRA prologue — the sink executes, and adds no decode edge.**
+///
+/// `lora(A, B, SITES)` in the pass prologue: A/B are *seeded channel
+/// contents* read with peeks (an adapter swap is a re-seed, never a
+/// re-trace), SITES is a trace-known placement constant. Three properties
+/// this golden pins for every executor — including the dummy driver, which
+/// embeds exactly this interpreter:
+///
+///   - the sink FIRES in the prologue and records the peeked A/B values plus
+///     the SITES constant (the driver-side analogue is the begin-time
+///     harvest of the A/B cell addresses into the launch's lora table);
+///   - executing a lora-carrying prologue is not a crash or a fault on a
+///     backend with no projection GEMMs — the sink is configuration, and an
+///     interpreter that ignores it still commits;
+///   - the reads are peeks, so step 1 sees the SAME values with no re-feed:
+///     application sits on no decode edge, which is what lets the sink ride
+///     every step for free.
+#[test]
+fn golden_lora_prologue() {
+    let chan = |shape| ChannelDecl {
+        shape,
+        dtype: ChanDType::Concrete(DType::F32),
+        capacity: 1,
+        host_role: HostRole::None,
+        seeded: true,
+    };
+    let c = TraceContainer {
+        names: vec!["lora".to_string()],
+        channels: vec![
+            chan(Shape::new(&[2, 1, 2]).unwrap()), // A [num_layers, R, d]
+            chan(Shape::new(&[2, 2, 1]).unwrap()), // B [num_layers, d_out, R]
+        ],
+        ports: vec![],
+        stages: vec![StageProgram {
+            stage: Stage::Prologue,
+            ops: vec![
+                Op::ChanRead(0),                 // 0: A (peek)
+                Op::ChanRead(1),                 // 1: B (peek)
+                Op::Const(Literal::U32(0b1011)), // 2: SITES bitmask (q|k|o)
+                Op::SinkCall {
+                    name: 0,
+                    args: vec![0, 1, 2],
+                },
+            ],
+        }],
+        externs: Vec::new(),
+    };
+    let bound = bind(c.clone(), ModelProfile::dummy()).unwrap();
+    let mut rep = Report::new("lora_prologue", &c).verdict(&Ok(bound.clone()));
+    let seeds = [
+        (0u32, Value::F32(vec![0.5, -0.5, 1.0, -1.0])),
+        (1u32, Value::F32(vec![2.0, 0.25, -2.0, -0.25])),
+    ];
+    rep = seed_lines(rep, &seeds);
+    let mut inst = Instance::new(&bound, &seeds).unwrap();
+    let inputs = PassInputs::default();
+    rep = rep.line(&step_line(0, &mut inst, &bound, &inputs));
+    rep = rep.line(&step_line(1, &mut inst, &bound, &inputs));
+    check("lora_prologue", rep);
+}
+
 #[test]
 fn golden_nucleus_sample() {
     const V: u32 = 8;
