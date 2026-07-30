@@ -4602,6 +4602,9 @@ void execute_declared_phase(
             .finalize = false,
             .time_sections = probing,
         };
+        const bool attention_phase =
+            phase == PTIR_STAGE_ON_ATTN_PROJ ||
+            phase == PTIR_STAGE_ON_ATTN;
         auto execute_group = [&](ExecutionGroup& group,
                                  cudaStream_t target_stream) {
             Task& first = *group.first;
@@ -4615,13 +4618,39 @@ void execute_declared_phase(
                     "registered PTIR stage has no generated execution: " +
                     generated_reason);
             }
-            GroupedLaunchResult result =
-                generated::run_generated_stage(
+            GroupedLaunchResult result;
+            if (attention_phase) {
+                // Stage 6 increment 1 (stage6-plan.md): the attention-phase
+                // hook path runs through the prepare/body seam with stable
+                // per-stage buffers. `prepare_generated_stage` does every
+                // piece of host work (metadata build, channel-cursor reads,
+                // elision analysis, side-table uploads, pack + upload) and
+                // `launch_generated_stage` is a host-work-free body reading
+                // only prepared state — no rotating rings and no
+                // cudaEventSynchronize on this path. Called back-to-back at
+                // the same stream position the combined call occupied, so
+                // behavior and stream ordering are identical this slice; the
+                // seam is what a later slice captures and replays across.
+                const auto prepared = generated::prepare_generated_stage(
+                    group.bindings,
+                    *first.executable,
+                    launch.owner->generated_runtime,
+                    target_stream,
+                    execution_options,
+                    generated::PreparedBufferMode::kStablePerStage);
+                result = generated::launch_generated_stage(*prepared);
+            } else {
+                // TODO(stage6-plan.md increment 1): migrate Prologue and
+                // Epilogue onto the prepared kStablePerStage path too and
+                // retire the rotating rings entirely. They keep the combined
+                // ring-backed call this slice.
+                result = generated::run_generated_stage(
                     group.bindings,
                     *first.executable,
                     launch.owner->generated_runtime,
                     target_stream,
                     execution_options);
+            }
             if (probing && result.t_build_us >= 0) {
                 auto bump = [](std::int64_t& total, std::int64_t part) {
                     total = (total < 0 ? 0 : total) + part;

@@ -86,6 +86,18 @@ The probe itself is preserved as `stage6-spike-probe.patch` (env-gated
 kept out of the header because 542 experimental lines do not belong in the
 hottest include in the driver.
 
+Patch drift note (increment 1, first slice): the prepare/body split moved
+the code under the probe — `run_generated_stage` is now a thin
+prepare+launch wrapper and the ~30 locals the probe reads
+(`host_channels`, `device_metadata`, `mutable_*`, …) are distributed across
+`prepare_generated_stage` and `GeneratedStagePrepared`. The patch no longer
+applies to the split tree and was NOT regenerated (rewriting a throwaway
+probe against the new seam is exactly the 542-line pollution it was
+extracted to avoid). To rerun it, apply onto commit `00b7b845` (the
+pre-split tree it was cut from). A future probe should instead capture from
+`launch_generated_stage`, whose prepared state is the frozen argument block
+the spike hand-rolled.
+
 ## The two risks that gate shipping
 
 - **Channel-cursor bake** (above): any version that does not make the
