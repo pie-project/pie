@@ -1,0 +1,9455 @@
+{
+  "family": "llama_like",
+  "values": [
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Requests",
+        {
+          "Const": 151936
+        }
+      ],
+      "dtype": "F32"
+    }
+  ],
+  "ops": [
+    {
+      "kind": {
+        "Embed": {
+          "weight": "embed"
+        }
+      },
+      "inputs": [],
+      "outputs": [
+        0
+      ],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.0.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        0
+      ],
+      "outputs": [
+        1
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.0.q_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        1
+      ],
+      "outputs": [
+        2
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.0.k_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        1
+      ],
+      "outputs": [
+        3
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.0.v_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        1
+      ],
+      "outputs": [
+        4
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.0.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        2
+      ],
+      "outputs": [
+        5
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.0.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        3
+      ],
+      "outputs": [
+        6
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        5,
+        6
+      ],
+      "outputs": [
+        7,
+        8
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 0
+        }
+      },
+      "inputs": [
+        8,
+        4
+      ],
+      "outputs": [],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 0
+        }
+      },
+      "inputs": [
+        7
+      ],
+      "outputs": [
+        9
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.0.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        9,
+        0
+      ],
+      "outputs": [
+        10
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.0.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        10
+      ],
+      "outputs": [
+        11
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.0.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        11
+      ],
+      "outputs": [
+        12
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        12
+      ],
+      "outputs": [
+        13
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.0.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        13,
+        10
+      ],
+      "outputs": [
+        14
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.1.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        14
+      ],
+      "outputs": [
+        15
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.1.q_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        15
+      ],
+      "outputs": [
+        16
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.1.k_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        15
+      ],
+      "outputs": [
+        17
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.1.v_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        15
+      ],
+      "outputs": [
+        18
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.1.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        16
+      ],
+      "outputs": [
+        19
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.1.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        17
+      ],
+      "outputs": [
+        20
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        19,
+        20
+      ],
+      "outputs": [
+        21,
+        22
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 1
+        }
+      },
+      "inputs": [
+        22,
+        18
+      ],
+      "outputs": [],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 1
+        }
+      },
+      "inputs": [
+        21
+      ],
+      "outputs": [
+        23
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.1.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        23,
+        14
+      ],
+      "outputs": [
+        24
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.1.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        24
+      ],
+      "outputs": [
+        25
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.1.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        25
+      ],
+      "outputs": [
+        26
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        26
+      ],
+      "outputs": [
+        27
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.1.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        27,
+        24
+      ],
+      "outputs": [
+        28
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.2.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        28
+      ],
+      "outputs": [
+        29
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.2.q_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        29
+      ],
+      "outputs": [
+        30
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.2.k_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        29
+      ],
+      "outputs": [
+        31
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.2.v_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        29
+      ],
+      "outputs": [
+        32
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.2.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        30
+      ],
+      "outputs": [
+        33
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.2.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        31
+      ],
+      "outputs": [
+        34
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        33,
+        34
+      ],
+      "outputs": [
+        35,
+        36
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 2
+        }
+      },
+      "inputs": [
+        36,
+        32
+      ],
+      "outputs": [],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 2
+        }
+      },
+      "inputs": [
+        35
+      ],
+      "outputs": [
+        37
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.2.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        37,
+        28
+      ],
+      "outputs": [
+        38
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.2.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        38
+      ],
+      "outputs": [
+        39
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.2.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        39
+      ],
+      "outputs": [
+        40
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        40
+      ],
+      "outputs": [
+        41
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.2.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        41,
+        38
+      ],
+      "outputs": [
+        42
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.3.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        42
+      ],
+      "outputs": [
+        43
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.3.q_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        43
+      ],
+      "outputs": [
+        44
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.3.k_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        43
+      ],
+      "outputs": [
+        45
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.3.v_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        43
+      ],
+      "outputs": [
+        46
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.3.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        44
+      ],
+      "outputs": [
+        47
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.3.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        45
+      ],
+      "outputs": [
+        48
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        47,
+        48
+      ],
+      "outputs": [
+        49,
+        50
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 3
+        }
+      },
+      "inputs": [
+        50,
+        46
+      ],
+      "outputs": [],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 3
+        }
+      },
+      "inputs": [
+        49
+      ],
+      "outputs": [
+        51
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.3.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        51,
+        42
+      ],
+      "outputs": [
+        52
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.3.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        52
+      ],
+      "outputs": [
+        53
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.3.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        53
+      ],
+      "outputs": [
+        54
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        54
+      ],
+      "outputs": [
+        55
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.3.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        55,
+        52
+      ],
+      "outputs": [
+        56
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.4.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        56
+      ],
+      "outputs": [
+        57
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.4.q_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        57
+      ],
+      "outputs": [
+        58
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.4.k_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        57
+      ],
+      "outputs": [
+        59
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.4.v_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        57
+      ],
+      "outputs": [
+        60
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.4.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        58
+      ],
+      "outputs": [
+        61
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.4.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        59
+      ],
+      "outputs": [
+        62
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        61,
+        62
+      ],
+      "outputs": [
+        63,
+        64
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 4
+        }
+      },
+      "inputs": [
+        64,
+        60
+      ],
+      "outputs": [],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 4
+        }
+      },
+      "inputs": [
+        63
+      ],
+      "outputs": [
+        65
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.4.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        65,
+        56
+      ],
+      "outputs": [
+        66
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.4.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        66
+      ],
+      "outputs": [
+        67
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.4.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        67
+      ],
+      "outputs": [
+        68
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        68
+      ],
+      "outputs": [
+        69
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.4.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        69,
+        66
+      ],
+      "outputs": [
+        70
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.5.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        70
+      ],
+      "outputs": [
+        71
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.5.q_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        71
+      ],
+      "outputs": [
+        72
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.5.k_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        71
+      ],
+      "outputs": [
+        73
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.5.v_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        71
+      ],
+      "outputs": [
+        74
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.5.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        72
+      ],
+      "outputs": [
+        75
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.5.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        73
+      ],
+      "outputs": [
+        76
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        75,
+        76
+      ],
+      "outputs": [
+        77,
+        78
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 5
+        }
+      },
+      "inputs": [
+        78,
+        74
+      ],
+      "outputs": [],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 5
+        }
+      },
+      "inputs": [
+        77
+      ],
+      "outputs": [
+        79
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.5.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        79,
+        70
+      ],
+      "outputs": [
+        80
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.5.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        80
+      ],
+      "outputs": [
+        81
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.5.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        81
+      ],
+      "outputs": [
+        82
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        82
+      ],
+      "outputs": [
+        83
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.5.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        83,
+        80
+      ],
+      "outputs": [
+        84
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.6.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        84
+      ],
+      "outputs": [
+        85
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.6.q_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        85
+      ],
+      "outputs": [
+        86
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.6.k_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        85
+      ],
+      "outputs": [
+        87
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.6.v_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        85
+      ],
+      "outputs": [
+        88
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.6.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        86
+      ],
+      "outputs": [
+        89
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.6.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        87
+      ],
+      "outputs": [
+        90
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        89,
+        90
+      ],
+      "outputs": [
+        91,
+        92
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 6
+        }
+      },
+      "inputs": [
+        92,
+        88
+      ],
+      "outputs": [],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 6
+        }
+      },
+      "inputs": [
+        91
+      ],
+      "outputs": [
+        93
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.6.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        93,
+        84
+      ],
+      "outputs": [
+        94
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.6.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        94
+      ],
+      "outputs": [
+        95
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.6.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        95
+      ],
+      "outputs": [
+        96
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        96
+      ],
+      "outputs": [
+        97
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.6.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        97,
+        94
+      ],
+      "outputs": [
+        98
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.7.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        98
+      ],
+      "outputs": [
+        99
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.7.q_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        99
+      ],
+      "outputs": [
+        100
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.7.k_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        99
+      ],
+      "outputs": [
+        101
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.7.v_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        99
+      ],
+      "outputs": [
+        102
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.7.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        100
+      ],
+      "outputs": [
+        103
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.7.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        101
+      ],
+      "outputs": [
+        104
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        103,
+        104
+      ],
+      "outputs": [
+        105,
+        106
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 7
+        }
+      },
+      "inputs": [
+        106,
+        102
+      ],
+      "outputs": [],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 7
+        }
+      },
+      "inputs": [
+        105
+      ],
+      "outputs": [
+        107
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.7.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        107,
+        98
+      ],
+      "outputs": [
+        108
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.7.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        108
+      ],
+      "outputs": [
+        109
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.7.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        109
+      ],
+      "outputs": [
+        110
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        110
+      ],
+      "outputs": [
+        111
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.7.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        111,
+        108
+      ],
+      "outputs": [
+        112
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.8.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        112
+      ],
+      "outputs": [
+        113
+      ],
+      "layer": 8
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.8.q_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        113
+      ],
+      "outputs": [
+        114
+      ],
+      "layer": 8
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.8.k_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        113
+      ],
+      "outputs": [
+        115
+      ],
+      "layer": 8
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.8.v_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        113
+      ],
+      "outputs": [
+        116
+      ],
+      "layer": 8
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.8.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        114
+      ],
+      "outputs": [
+        117
+      ],
+      "layer": 8
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.8.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        115
+      ],
+      "outputs": [
+        118
+      ],
+      "layer": 8
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        117,
+        118
+      ],
+      "outputs": [
+        119,
+        120
+      ],
+      "layer": 8
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 8
+        }
+      },
+      "inputs": [
+        120,
+        116
+      ],
+      "outputs": [],
+      "layer": 8
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 8
+        }
+      },
+      "inputs": [
+        119
+      ],
+      "outputs": [
+        121
+      ],
+      "layer": 8
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.8.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        121,
+        112
+      ],
+      "outputs": [
+        122
+      ],
+      "layer": 8
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.8.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        122
+      ],
+      "outputs": [
+        123
+      ],
+      "layer": 8
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.8.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        123
+      ],
+      "outputs": [
+        124
+      ],
+      "layer": 8
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        124
+      ],
+      "outputs": [
+        125
+      ],
+      "layer": 8
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.8.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        125,
+        122
+      ],
+      "outputs": [
+        126
+      ],
+      "layer": 8
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.9.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        126
+      ],
+      "outputs": [
+        127
+      ],
+      "layer": 9
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.9.q_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        127
+      ],
+      "outputs": [
+        128
+      ],
+      "layer": 9
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.9.k_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        127
+      ],
+      "outputs": [
+        129
+      ],
+      "layer": 9
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.9.v_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        127
+      ],
+      "outputs": [
+        130
+      ],
+      "layer": 9
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.9.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        128
+      ],
+      "outputs": [
+        131
+      ],
+      "layer": 9
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.9.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        129
+      ],
+      "outputs": [
+        132
+      ],
+      "layer": 9
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        131,
+        132
+      ],
+      "outputs": [
+        133,
+        134
+      ],
+      "layer": 9
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 9
+        }
+      },
+      "inputs": [
+        134,
+        130
+      ],
+      "outputs": [],
+      "layer": 9
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 9
+        }
+      },
+      "inputs": [
+        133
+      ],
+      "outputs": [
+        135
+      ],
+      "layer": 9
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.9.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        135,
+        126
+      ],
+      "outputs": [
+        136
+      ],
+      "layer": 9
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.9.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        136
+      ],
+      "outputs": [
+        137
+      ],
+      "layer": 9
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.9.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        137
+      ],
+      "outputs": [
+        138
+      ],
+      "layer": 9
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        138
+      ],
+      "outputs": [
+        139
+      ],
+      "layer": 9
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.9.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        139,
+        136
+      ],
+      "outputs": [
+        140
+      ],
+      "layer": 9
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.10.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        140
+      ],
+      "outputs": [
+        141
+      ],
+      "layer": 10
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.10.q_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        141
+      ],
+      "outputs": [
+        142
+      ],
+      "layer": 10
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.10.k_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        141
+      ],
+      "outputs": [
+        143
+      ],
+      "layer": 10
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.10.v_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        141
+      ],
+      "outputs": [
+        144
+      ],
+      "layer": 10
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.10.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        142
+      ],
+      "outputs": [
+        145
+      ],
+      "layer": 10
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.10.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        143
+      ],
+      "outputs": [
+        146
+      ],
+      "layer": 10
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        145,
+        146
+      ],
+      "outputs": [
+        147,
+        148
+      ],
+      "layer": 10
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 10
+        }
+      },
+      "inputs": [
+        148,
+        144
+      ],
+      "outputs": [],
+      "layer": 10
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 10
+        }
+      },
+      "inputs": [
+        147
+      ],
+      "outputs": [
+        149
+      ],
+      "layer": 10
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.10.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        149,
+        140
+      ],
+      "outputs": [
+        150
+      ],
+      "layer": 10
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.10.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        150
+      ],
+      "outputs": [
+        151
+      ],
+      "layer": 10
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.10.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        151
+      ],
+      "outputs": [
+        152
+      ],
+      "layer": 10
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        152
+      ],
+      "outputs": [
+        153
+      ],
+      "layer": 10
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.10.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        153,
+        150
+      ],
+      "outputs": [
+        154
+      ],
+      "layer": 10
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.11.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        154
+      ],
+      "outputs": [
+        155
+      ],
+      "layer": 11
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.11.q_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        155
+      ],
+      "outputs": [
+        156
+      ],
+      "layer": 11
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.11.k_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        155
+      ],
+      "outputs": [
+        157
+      ],
+      "layer": 11
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.11.v_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        155
+      ],
+      "outputs": [
+        158
+      ],
+      "layer": 11
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.11.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        156
+      ],
+      "outputs": [
+        159
+      ],
+      "layer": 11
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.11.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        157
+      ],
+      "outputs": [
+        160
+      ],
+      "layer": 11
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        159,
+        160
+      ],
+      "outputs": [
+        161,
+        162
+      ],
+      "layer": 11
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 11
+        }
+      },
+      "inputs": [
+        162,
+        158
+      ],
+      "outputs": [],
+      "layer": 11
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 11
+        }
+      },
+      "inputs": [
+        161
+      ],
+      "outputs": [
+        163
+      ],
+      "layer": 11
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.11.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        163,
+        154
+      ],
+      "outputs": [
+        164
+      ],
+      "layer": 11
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.11.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        164
+      ],
+      "outputs": [
+        165
+      ],
+      "layer": 11
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.11.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        165
+      ],
+      "outputs": [
+        166
+      ],
+      "layer": 11
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        166
+      ],
+      "outputs": [
+        167
+      ],
+      "layer": 11
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.11.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        167,
+        164
+      ],
+      "outputs": [
+        168
+      ],
+      "layer": 11
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.12.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        168
+      ],
+      "outputs": [
+        169
+      ],
+      "layer": 12
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.12.q_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        169
+      ],
+      "outputs": [
+        170
+      ],
+      "layer": 12
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.12.k_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        169
+      ],
+      "outputs": [
+        171
+      ],
+      "layer": 12
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.12.v_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        169
+      ],
+      "outputs": [
+        172
+      ],
+      "layer": 12
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.12.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        170
+      ],
+      "outputs": [
+        173
+      ],
+      "layer": 12
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.12.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        171
+      ],
+      "outputs": [
+        174
+      ],
+      "layer": 12
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        173,
+        174
+      ],
+      "outputs": [
+        175,
+        176
+      ],
+      "layer": 12
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 12
+        }
+      },
+      "inputs": [
+        176,
+        172
+      ],
+      "outputs": [],
+      "layer": 12
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 12
+        }
+      },
+      "inputs": [
+        175
+      ],
+      "outputs": [
+        177
+      ],
+      "layer": 12
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.12.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        177,
+        168
+      ],
+      "outputs": [
+        178
+      ],
+      "layer": 12
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.12.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        178
+      ],
+      "outputs": [
+        179
+      ],
+      "layer": 12
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.12.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        179
+      ],
+      "outputs": [
+        180
+      ],
+      "layer": 12
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        180
+      ],
+      "outputs": [
+        181
+      ],
+      "layer": 12
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.12.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        181,
+        178
+      ],
+      "outputs": [
+        182
+      ],
+      "layer": 12
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.13.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        182
+      ],
+      "outputs": [
+        183
+      ],
+      "layer": 13
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.13.q_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        183
+      ],
+      "outputs": [
+        184
+      ],
+      "layer": 13
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.13.k_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        183
+      ],
+      "outputs": [
+        185
+      ],
+      "layer": 13
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.13.v_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        183
+      ],
+      "outputs": [
+        186
+      ],
+      "layer": 13
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.13.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        184
+      ],
+      "outputs": [
+        187
+      ],
+      "layer": 13
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.13.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        185
+      ],
+      "outputs": [
+        188
+      ],
+      "layer": 13
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        187,
+        188
+      ],
+      "outputs": [
+        189,
+        190
+      ],
+      "layer": 13
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 13
+        }
+      },
+      "inputs": [
+        190,
+        186
+      ],
+      "outputs": [],
+      "layer": 13
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 13
+        }
+      },
+      "inputs": [
+        189
+      ],
+      "outputs": [
+        191
+      ],
+      "layer": 13
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.13.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        191,
+        182
+      ],
+      "outputs": [
+        192
+      ],
+      "layer": 13
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.13.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        192
+      ],
+      "outputs": [
+        193
+      ],
+      "layer": 13
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.13.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        193
+      ],
+      "outputs": [
+        194
+      ],
+      "layer": 13
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        194
+      ],
+      "outputs": [
+        195
+      ],
+      "layer": 13
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.13.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        195,
+        192
+      ],
+      "outputs": [
+        196
+      ],
+      "layer": 13
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.14.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        196
+      ],
+      "outputs": [
+        197
+      ],
+      "layer": 14
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.14.q_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        197
+      ],
+      "outputs": [
+        198
+      ],
+      "layer": 14
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.14.k_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        197
+      ],
+      "outputs": [
+        199
+      ],
+      "layer": 14
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.14.v_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        197
+      ],
+      "outputs": [
+        200
+      ],
+      "layer": 14
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.14.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        198
+      ],
+      "outputs": [
+        201
+      ],
+      "layer": 14
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.14.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        199
+      ],
+      "outputs": [
+        202
+      ],
+      "layer": 14
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        201,
+        202
+      ],
+      "outputs": [
+        203,
+        204
+      ],
+      "layer": 14
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 14
+        }
+      },
+      "inputs": [
+        204,
+        200
+      ],
+      "outputs": [],
+      "layer": 14
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 14
+        }
+      },
+      "inputs": [
+        203
+      ],
+      "outputs": [
+        205
+      ],
+      "layer": 14
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.14.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        205,
+        196
+      ],
+      "outputs": [
+        206
+      ],
+      "layer": 14
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.14.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        206
+      ],
+      "outputs": [
+        207
+      ],
+      "layer": 14
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.14.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        207
+      ],
+      "outputs": [
+        208
+      ],
+      "layer": 14
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        208
+      ],
+      "outputs": [
+        209
+      ],
+      "layer": 14
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.14.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        209,
+        206
+      ],
+      "outputs": [
+        210
+      ],
+      "layer": 14
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.15.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        210
+      ],
+      "outputs": [
+        211
+      ],
+      "layer": 15
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.15.q_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        211
+      ],
+      "outputs": [
+        212
+      ],
+      "layer": 15
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.15.k_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        211
+      ],
+      "outputs": [
+        213
+      ],
+      "layer": 15
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.15.v_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        211
+      ],
+      "outputs": [
+        214
+      ],
+      "layer": 15
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.15.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        212
+      ],
+      "outputs": [
+        215
+      ],
+      "layer": 15
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.15.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        213
+      ],
+      "outputs": [
+        216
+      ],
+      "layer": 15
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        215,
+        216
+      ],
+      "outputs": [
+        217,
+        218
+      ],
+      "layer": 15
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 15
+        }
+      },
+      "inputs": [
+        218,
+        214
+      ],
+      "outputs": [],
+      "layer": 15
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 15
+        }
+      },
+      "inputs": [
+        217
+      ],
+      "outputs": [
+        219
+      ],
+      "layer": 15
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.15.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        219,
+        210
+      ],
+      "outputs": [
+        220
+      ],
+      "layer": 15
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.15.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        220
+      ],
+      "outputs": [
+        221
+      ],
+      "layer": 15
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.15.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        221
+      ],
+      "outputs": [
+        222
+      ],
+      "layer": 15
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        222
+      ],
+      "outputs": [
+        223
+      ],
+      "layer": 15
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.15.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        223,
+        220
+      ],
+      "outputs": [
+        224
+      ],
+      "layer": 15
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.16.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        224
+      ],
+      "outputs": [
+        225
+      ],
+      "layer": 16
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.16.q_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        225
+      ],
+      "outputs": [
+        226
+      ],
+      "layer": 16
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.16.k_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        225
+      ],
+      "outputs": [
+        227
+      ],
+      "layer": 16
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.16.v_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        225
+      ],
+      "outputs": [
+        228
+      ],
+      "layer": 16
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.16.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        226
+      ],
+      "outputs": [
+        229
+      ],
+      "layer": 16
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.16.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        227
+      ],
+      "outputs": [
+        230
+      ],
+      "layer": 16
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        229,
+        230
+      ],
+      "outputs": [
+        231,
+        232
+      ],
+      "layer": 16
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 16
+        }
+      },
+      "inputs": [
+        232,
+        228
+      ],
+      "outputs": [],
+      "layer": 16
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 16
+        }
+      },
+      "inputs": [
+        231
+      ],
+      "outputs": [
+        233
+      ],
+      "layer": 16
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.16.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        233,
+        224
+      ],
+      "outputs": [
+        234
+      ],
+      "layer": 16
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.16.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        234
+      ],
+      "outputs": [
+        235
+      ],
+      "layer": 16
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.16.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        235
+      ],
+      "outputs": [
+        236
+      ],
+      "layer": 16
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        236
+      ],
+      "outputs": [
+        237
+      ],
+      "layer": 16
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.16.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        237,
+        234
+      ],
+      "outputs": [
+        238
+      ],
+      "layer": 16
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.17.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        238
+      ],
+      "outputs": [
+        239
+      ],
+      "layer": 17
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.17.q_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        239
+      ],
+      "outputs": [
+        240
+      ],
+      "layer": 17
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.17.k_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        239
+      ],
+      "outputs": [
+        241
+      ],
+      "layer": 17
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.17.v_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        239
+      ],
+      "outputs": [
+        242
+      ],
+      "layer": 17
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.17.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        240
+      ],
+      "outputs": [
+        243
+      ],
+      "layer": 17
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.17.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        241
+      ],
+      "outputs": [
+        244
+      ],
+      "layer": 17
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        243,
+        244
+      ],
+      "outputs": [
+        245,
+        246
+      ],
+      "layer": 17
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 17
+        }
+      },
+      "inputs": [
+        246,
+        242
+      ],
+      "outputs": [],
+      "layer": 17
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 17
+        }
+      },
+      "inputs": [
+        245
+      ],
+      "outputs": [
+        247
+      ],
+      "layer": 17
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.17.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        247,
+        238
+      ],
+      "outputs": [
+        248
+      ],
+      "layer": 17
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.17.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        248
+      ],
+      "outputs": [
+        249
+      ],
+      "layer": 17
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.17.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        249
+      ],
+      "outputs": [
+        250
+      ],
+      "layer": 17
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        250
+      ],
+      "outputs": [
+        251
+      ],
+      "layer": 17
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.17.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        251,
+        248
+      ],
+      "outputs": [
+        252
+      ],
+      "layer": 17
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.18.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        252
+      ],
+      "outputs": [
+        253
+      ],
+      "layer": 18
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.18.q_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        253
+      ],
+      "outputs": [
+        254
+      ],
+      "layer": 18
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.18.k_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        253
+      ],
+      "outputs": [
+        255
+      ],
+      "layer": 18
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.18.v_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        253
+      ],
+      "outputs": [
+        256
+      ],
+      "layer": 18
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.18.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        254
+      ],
+      "outputs": [
+        257
+      ],
+      "layer": 18
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.18.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        255
+      ],
+      "outputs": [
+        258
+      ],
+      "layer": 18
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        257,
+        258
+      ],
+      "outputs": [
+        259,
+        260
+      ],
+      "layer": 18
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 18
+        }
+      },
+      "inputs": [
+        260,
+        256
+      ],
+      "outputs": [],
+      "layer": 18
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 18
+        }
+      },
+      "inputs": [
+        259
+      ],
+      "outputs": [
+        261
+      ],
+      "layer": 18
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.18.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        261,
+        252
+      ],
+      "outputs": [
+        262
+      ],
+      "layer": 18
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.18.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        262
+      ],
+      "outputs": [
+        263
+      ],
+      "layer": 18
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.18.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        263
+      ],
+      "outputs": [
+        264
+      ],
+      "layer": 18
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        264
+      ],
+      "outputs": [
+        265
+      ],
+      "layer": 18
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.18.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        265,
+        262
+      ],
+      "outputs": [
+        266
+      ],
+      "layer": 18
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.19.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        266
+      ],
+      "outputs": [
+        267
+      ],
+      "layer": 19
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.19.q_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        267
+      ],
+      "outputs": [
+        268
+      ],
+      "layer": 19
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.19.k_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        267
+      ],
+      "outputs": [
+        269
+      ],
+      "layer": 19
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.19.v_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        267
+      ],
+      "outputs": [
+        270
+      ],
+      "layer": 19
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.19.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        268
+      ],
+      "outputs": [
+        271
+      ],
+      "layer": 19
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.19.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        269
+      ],
+      "outputs": [
+        272
+      ],
+      "layer": 19
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        271,
+        272
+      ],
+      "outputs": [
+        273,
+        274
+      ],
+      "layer": 19
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 19
+        }
+      },
+      "inputs": [
+        274,
+        270
+      ],
+      "outputs": [],
+      "layer": 19
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 19
+        }
+      },
+      "inputs": [
+        273
+      ],
+      "outputs": [
+        275
+      ],
+      "layer": 19
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.19.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        275,
+        266
+      ],
+      "outputs": [
+        276
+      ],
+      "layer": 19
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.19.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        276
+      ],
+      "outputs": [
+        277
+      ],
+      "layer": 19
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.19.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        277
+      ],
+      "outputs": [
+        278
+      ],
+      "layer": 19
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        278
+      ],
+      "outputs": [
+        279
+      ],
+      "layer": 19
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.19.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        279,
+        276
+      ],
+      "outputs": [
+        280
+      ],
+      "layer": 19
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.20.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        280
+      ],
+      "outputs": [
+        281
+      ],
+      "layer": 20
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.20.q_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        281
+      ],
+      "outputs": [
+        282
+      ],
+      "layer": 20
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.20.k_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        281
+      ],
+      "outputs": [
+        283
+      ],
+      "layer": 20
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.20.v_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        281
+      ],
+      "outputs": [
+        284
+      ],
+      "layer": 20
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.20.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        282
+      ],
+      "outputs": [
+        285
+      ],
+      "layer": 20
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.20.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        283
+      ],
+      "outputs": [
+        286
+      ],
+      "layer": 20
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        285,
+        286
+      ],
+      "outputs": [
+        287,
+        288
+      ],
+      "layer": 20
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 20
+        }
+      },
+      "inputs": [
+        288,
+        284
+      ],
+      "outputs": [],
+      "layer": 20
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 20
+        }
+      },
+      "inputs": [
+        287
+      ],
+      "outputs": [
+        289
+      ],
+      "layer": 20
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.20.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        289,
+        280
+      ],
+      "outputs": [
+        290
+      ],
+      "layer": 20
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.20.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        290
+      ],
+      "outputs": [
+        291
+      ],
+      "layer": 20
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.20.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        291
+      ],
+      "outputs": [
+        292
+      ],
+      "layer": 20
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        292
+      ],
+      "outputs": [
+        293
+      ],
+      "layer": 20
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.20.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        293,
+        290
+      ],
+      "outputs": [
+        294
+      ],
+      "layer": 20
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.21.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        294
+      ],
+      "outputs": [
+        295
+      ],
+      "layer": 21
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.21.q_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        295
+      ],
+      "outputs": [
+        296
+      ],
+      "layer": 21
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.21.k_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        295
+      ],
+      "outputs": [
+        297
+      ],
+      "layer": 21
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.21.v_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        295
+      ],
+      "outputs": [
+        298
+      ],
+      "layer": 21
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.21.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        296
+      ],
+      "outputs": [
+        299
+      ],
+      "layer": 21
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.21.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        297
+      ],
+      "outputs": [
+        300
+      ],
+      "layer": 21
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        299,
+        300
+      ],
+      "outputs": [
+        301,
+        302
+      ],
+      "layer": 21
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 21
+        }
+      },
+      "inputs": [
+        302,
+        298
+      ],
+      "outputs": [],
+      "layer": 21
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 21
+        }
+      },
+      "inputs": [
+        301
+      ],
+      "outputs": [
+        303
+      ],
+      "layer": 21
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.21.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        303,
+        294
+      ],
+      "outputs": [
+        304
+      ],
+      "layer": 21
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.21.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        304
+      ],
+      "outputs": [
+        305
+      ],
+      "layer": 21
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.21.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        305
+      ],
+      "outputs": [
+        306
+      ],
+      "layer": 21
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        306
+      ],
+      "outputs": [
+        307
+      ],
+      "layer": 21
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.21.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        307,
+        304
+      ],
+      "outputs": [
+        308
+      ],
+      "layer": 21
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.22.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        308
+      ],
+      "outputs": [
+        309
+      ],
+      "layer": 22
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.22.q_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        309
+      ],
+      "outputs": [
+        310
+      ],
+      "layer": 22
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.22.k_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        309
+      ],
+      "outputs": [
+        311
+      ],
+      "layer": 22
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.22.v_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        309
+      ],
+      "outputs": [
+        312
+      ],
+      "layer": 22
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.22.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        310
+      ],
+      "outputs": [
+        313
+      ],
+      "layer": 22
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.22.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        311
+      ],
+      "outputs": [
+        314
+      ],
+      "layer": 22
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        313,
+        314
+      ],
+      "outputs": [
+        315,
+        316
+      ],
+      "layer": 22
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 22
+        }
+      },
+      "inputs": [
+        316,
+        312
+      ],
+      "outputs": [],
+      "layer": 22
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 22
+        }
+      },
+      "inputs": [
+        315
+      ],
+      "outputs": [
+        317
+      ],
+      "layer": 22
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.22.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        317,
+        308
+      ],
+      "outputs": [
+        318
+      ],
+      "layer": 22
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.22.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        318
+      ],
+      "outputs": [
+        319
+      ],
+      "layer": 22
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.22.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        319
+      ],
+      "outputs": [
+        320
+      ],
+      "layer": 22
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        320
+      ],
+      "outputs": [
+        321
+      ],
+      "layer": 22
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.22.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        321,
+        318
+      ],
+      "outputs": [
+        322
+      ],
+      "layer": 22
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.23.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        322
+      ],
+      "outputs": [
+        323
+      ],
+      "layer": 23
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.23.q_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        323
+      ],
+      "outputs": [
+        324
+      ],
+      "layer": 23
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.23.k_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        323
+      ],
+      "outputs": [
+        325
+      ],
+      "layer": 23
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.23.v_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        323
+      ],
+      "outputs": [
+        326
+      ],
+      "layer": 23
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.23.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        324
+      ],
+      "outputs": [
+        327
+      ],
+      "layer": 23
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.23.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        325
+      ],
+      "outputs": [
+        328
+      ],
+      "layer": 23
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        327,
+        328
+      ],
+      "outputs": [
+        329,
+        330
+      ],
+      "layer": 23
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 23
+        }
+      },
+      "inputs": [
+        330,
+        326
+      ],
+      "outputs": [],
+      "layer": 23
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 23
+        }
+      },
+      "inputs": [
+        329
+      ],
+      "outputs": [
+        331
+      ],
+      "layer": 23
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.23.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        331,
+        322
+      ],
+      "outputs": [
+        332
+      ],
+      "layer": 23
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.23.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        332
+      ],
+      "outputs": [
+        333
+      ],
+      "layer": 23
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.23.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        333
+      ],
+      "outputs": [
+        334
+      ],
+      "layer": 23
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        334
+      ],
+      "outputs": [
+        335
+      ],
+      "layer": 23
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.23.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        335,
+        332
+      ],
+      "outputs": [
+        336
+      ],
+      "layer": 23
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.24.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        336
+      ],
+      "outputs": [
+        337
+      ],
+      "layer": 24
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.24.q_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        337
+      ],
+      "outputs": [
+        338
+      ],
+      "layer": 24
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.24.k_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        337
+      ],
+      "outputs": [
+        339
+      ],
+      "layer": 24
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.24.v_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        337
+      ],
+      "outputs": [
+        340
+      ],
+      "layer": 24
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.24.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        338
+      ],
+      "outputs": [
+        341
+      ],
+      "layer": 24
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.24.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        339
+      ],
+      "outputs": [
+        342
+      ],
+      "layer": 24
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        341,
+        342
+      ],
+      "outputs": [
+        343,
+        344
+      ],
+      "layer": 24
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 24
+        }
+      },
+      "inputs": [
+        344,
+        340
+      ],
+      "outputs": [],
+      "layer": 24
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 24
+        }
+      },
+      "inputs": [
+        343
+      ],
+      "outputs": [
+        345
+      ],
+      "layer": 24
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.24.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        345,
+        336
+      ],
+      "outputs": [
+        346
+      ],
+      "layer": 24
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.24.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        346
+      ],
+      "outputs": [
+        347
+      ],
+      "layer": 24
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.24.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        347
+      ],
+      "outputs": [
+        348
+      ],
+      "layer": 24
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        348
+      ],
+      "outputs": [
+        349
+      ],
+      "layer": 24
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.24.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        349,
+        346
+      ],
+      "outputs": [
+        350
+      ],
+      "layer": 24
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.25.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        350
+      ],
+      "outputs": [
+        351
+      ],
+      "layer": 25
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.25.q_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        351
+      ],
+      "outputs": [
+        352
+      ],
+      "layer": 25
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.25.k_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        351
+      ],
+      "outputs": [
+        353
+      ],
+      "layer": 25
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.25.v_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        351
+      ],
+      "outputs": [
+        354
+      ],
+      "layer": 25
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.25.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        352
+      ],
+      "outputs": [
+        355
+      ],
+      "layer": 25
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.25.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        353
+      ],
+      "outputs": [
+        356
+      ],
+      "layer": 25
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        355,
+        356
+      ],
+      "outputs": [
+        357,
+        358
+      ],
+      "layer": 25
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 25
+        }
+      },
+      "inputs": [
+        358,
+        354
+      ],
+      "outputs": [],
+      "layer": 25
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 25
+        }
+      },
+      "inputs": [
+        357
+      ],
+      "outputs": [
+        359
+      ],
+      "layer": 25
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.25.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        359,
+        350
+      ],
+      "outputs": [
+        360
+      ],
+      "layer": 25
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.25.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        360
+      ],
+      "outputs": [
+        361
+      ],
+      "layer": 25
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.25.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        361
+      ],
+      "outputs": [
+        362
+      ],
+      "layer": 25
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        362
+      ],
+      "outputs": [
+        363
+      ],
+      "layer": 25
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.25.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        363,
+        360
+      ],
+      "outputs": [
+        364
+      ],
+      "layer": 25
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.26.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        364
+      ],
+      "outputs": [
+        365
+      ],
+      "layer": 26
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.26.q_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        365
+      ],
+      "outputs": [
+        366
+      ],
+      "layer": 26
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.26.k_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        365
+      ],
+      "outputs": [
+        367
+      ],
+      "layer": 26
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.26.v_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        365
+      ],
+      "outputs": [
+        368
+      ],
+      "layer": 26
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.26.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        366
+      ],
+      "outputs": [
+        369
+      ],
+      "layer": 26
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.26.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        367
+      ],
+      "outputs": [
+        370
+      ],
+      "layer": 26
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        369,
+        370
+      ],
+      "outputs": [
+        371,
+        372
+      ],
+      "layer": 26
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 26
+        }
+      },
+      "inputs": [
+        372,
+        368
+      ],
+      "outputs": [],
+      "layer": 26
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 26
+        }
+      },
+      "inputs": [
+        371
+      ],
+      "outputs": [
+        373
+      ],
+      "layer": 26
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.26.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        373,
+        364
+      ],
+      "outputs": [
+        374
+      ],
+      "layer": 26
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.26.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        374
+      ],
+      "outputs": [
+        375
+      ],
+      "layer": 26
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.26.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        375
+      ],
+      "outputs": [
+        376
+      ],
+      "layer": 26
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        376
+      ],
+      "outputs": [
+        377
+      ],
+      "layer": 26
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.26.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        377,
+        374
+      ],
+      "outputs": [
+        378
+      ],
+      "layer": 26
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.27.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        378
+      ],
+      "outputs": [
+        379
+      ],
+      "layer": 27
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.27.q_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        379
+      ],
+      "outputs": [
+        380
+      ],
+      "layer": 27
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.27.k_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        379
+      ],
+      "outputs": [
+        381
+      ],
+      "layer": 27
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.27.v_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        379
+      ],
+      "outputs": [
+        382
+      ],
+      "layer": 27
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.27.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        380
+      ],
+      "outputs": [
+        383
+      ],
+      "layer": 27
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.27.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        381
+      ],
+      "outputs": [
+        384
+      ],
+      "layer": 27
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        383,
+        384
+      ],
+      "outputs": [
+        385,
+        386
+      ],
+      "layer": 27
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 27
+        }
+      },
+      "inputs": [
+        386,
+        382
+      ],
+      "outputs": [],
+      "layer": 27
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 27
+        }
+      },
+      "inputs": [
+        385
+      ],
+      "outputs": [
+        387
+      ],
+      "layer": 27
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.27.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        387,
+        378
+      ],
+      "outputs": [
+        388
+      ],
+      "layer": 27
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.27.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        388
+      ],
+      "outputs": [
+        389
+      ],
+      "layer": 27
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.27.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        389
+      ],
+      "outputs": [
+        390
+      ],
+      "layer": 27
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        390
+      ],
+      "outputs": [
+        391
+      ],
+      "layer": 27
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.27.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        391,
+        388
+      ],
+      "outputs": [
+        392
+      ],
+      "layer": 27
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "final_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        392
+      ],
+      "outputs": [
+        393
+      ],
+      "layer": null
+    },
+    {
+      "kind": {
+        "LmHead": {
+          "weight": "embed"
+        }
+      },
+      "inputs": [
+        393
+      ],
+      "outputs": [
+        394
+      ],
+      "layer": null
+    }
+  ]
+}
