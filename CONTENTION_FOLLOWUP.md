@@ -6209,3 +6209,118 @@ proves the guest's epilogue is a vocab reduction and ships the result through
 The chunk width is a real optimum (the GEMM alone prefers 8192, the combined
 pipeline peaks at 16384) and is a device+model property — so it belongs to the
 planner calibrator, **not** to a constant.
+
+---
+
+## §20.38 — the chunked argmax accumulator (Phase 2: wired end to end)
+
+Phase 1 (§20.37) landed the kernels with **zero call sites**. This wires them
+into the real decode path, behind `PIE_LOGITS_CHUNK_TOKENS`.
+
+### What it deletes
+
+The greedy sampler was a separate kernel from the LM head GEMM, so the logits
+had to exist in HBM purely to get from one to the other: at R=512 and a 151936
+vocabulary that is **156 MB written + 156 MB read per decode step**. vLLM
+cannot remove this — its sampler is PyTorch over a materialised tensor. pie's
+PTIR is a compiler, so when a guest's epilogue is a bare greedy argmax the
+driver can slice the LM head GEMM into vocabulary slabs, fold each slab into a
+running argmax as it lands, and never write the logits at all.
+
+### Measured (autotune OFF, nsys `--cuda-graph-trace=node`, 1024 req / c512)
+
+| chunk | slabs | total kernel ms | delta |
+|---|---|---|---|
+| off | — | 3828.5 | +0.0 |
+| 151936 | 1 | 3829.5 | +1.0 |
+| 32768 | 5 | 3807.0 | −21.5 |
+| 16384 | 10 | 3792.2 | −36.3 |
+| **8192** | **19** | **3777.5** | **−51.0** |
+| 4096 | 38 | 3852.9 | +24.4 |
+| 2048 | 75 | 3905.6 | +77.1 |
+
+A clean U-curve with the knee at 8192 = **−1.33% of GPU kernel time**.
+Attention was 2385.0–2391.1 ms across all seven configs (0.25% spread) — that
+flatness is the validity check; reject any pair where it moves.
+The sampler itself drops 78 → 16 ms; the `accum` kernel costs 32 ms back.
+
+### vs vLLM — parity, NOT a win
+
+| set | pie | vLLM | ratio |
+|---|---|---|---|
+| pre-fix | 32733.9 | 32611.8 | 1.0037 |
+| post-fix | 32666.5 | 32646.1 | 1.0006 |
+| **pooled n=6** | **32700.2** (sd 258) | **32628.9** (sd 56) | **1.0022, t=0.66** |
+
+vLLM as control across two days moved +0.21% while pie moved +2.11%.
+**The −1.56% conc-512 gap is closed. +0.22% is not significant — call it
+parity.** conc 1024 was already +4.91% and was not re-measured.
+
+Note pie's sd is **4.6× vLLM's**. That sensitivity to host CPU load is now the
+most interesting unexplained difference between the two engines.
+
+### The bug this nearly shipped with
+
+The producer and the consumer decided with **different conditions**:
+`settle_step` handed the epilogue `ws.sampled_tokens` whenever the *intent*
+`logits_argmax_chunk_tokens > 0` was set, while the forward could silently fall
+back to the plain GEMM and never write it. Worse, only **2 of 13**
+`IModel::body` implementations read `logits_argmax_chunk_tokens` at all — the
+PTIR epilogue is a property of the **guest program**, not the architecture, so
+a plain greedy inferlet passed the gate on any of the other 11 and published
+un-zeroed `cudaMalloc` memory as int32 token ids, silently, every step.
+
+Fixes, in the order that matters:
+- `ModelCapabilities::supports_fused_lm_head_argmax`, default **false**,
+  mirrored onto `ForwardFn` and ANDed into the gate. Opt-in by the two families
+  that honour the field.
+- `ops::lm_head_argmax_supported()` is the **single shared predicate** for both
+  the capability and the runtime, so the two cannot drift.
+- The forward **throws** instead of falling back. By the time it runs, the
+  graph key and the epilogue's token source are already committed.
+- `run_generated_stage` re-derives the verdict from the actual stage being
+  launched and throws on disagreement — closing the whole "gate and binding
+  drift apart" class rather than one instance of it.
+- Accumulators moved to their own workspace tensors: they could overflow
+  `ws.logits` exactly when `chunk >= vocab` and every row samples. The slab
+  alone now fits by construction, with no padding and no runtime test.
+- `presampled_token_rows` and `logits_bf16_rows` are **exclusive**, with an
+  explicit lane-homogeneity check. Populating both left the grouping invariant
+  resting on an unrelated vector being non-null.
+- `workspace_bytes()` gained the three new tensors. It is the planner's arena
+  figure, and every byte missing from it is a byte handed to the KV pool.
+
+### Traps found the hard way
+
+- **The GEMM autotuner, not batch composition, is what makes tokens differ
+  run to run.** The previous session blamed batch composition; at conc=1 (batch
+  composition constant) the null control still diverged 7/8. With
+  `PIE_GEMM_AUTOTUNE=0`: **0/8 at conc 1, 0/64 at conc 64**, both arms. Any
+  token-identity A/B **must** set it on every arm.
+- **The autotuner also poisons profiles.** nsys covers startup, and `tune_dense`
+  runs ~10 probe kernels per new (M,N,K,beta); the fused path adds 51 slab
+  shapes = >1.5 s of probes attributed to the run. Use `PIE_GEMM_AUTOTUNE=0` on
+  **both** arms or warm the cache first. The disk cache is rewritten each run
+  with only that run's shapes, so interleaving fused and unfused runs leaves
+  both cold.
+- The graph-variant key needed a new flag (`kGvFusedArgmax`). Without it the
+  fused and unfused LM head shapes collide in the cache — the same silent
+  miscompute that `graph_variant.hpp`'s own comments record as bug #24.
+- The pre-existing `generated_compact_argmax_value` is a whole-stage predicate
+  and **rejects the real decode epilogue**, which legitimately advances KV
+  geometry and republishes channels. The new predicate asks only what soundness
+  needs: `logits` has exactly one consumer and it is a `REDUCE_ARGMAX`. The old
+  one is load-bearing elsewhere and was left alone.
+
+### The width is still not chosen by the driver
+
+`PIE_LOGITS_CHUNK_TOKENS` has **no default**, so the feature is off unless asked
+for. The knee is a device+model property and belongs to the planner's
+calibrator (§20.34) — guessing a constant here is exactly what that calibrator
+exists to replace. The env var is validated (must be ≥ the accumulator width and
+fit in an int) but never clamped: rejecting a value the mechanism cannot express
+is not the same as choosing one.
+
+**Phase 3:** move the width into the calibrator and make it default; reclaim
+the ~1.1 GB `ws.logits` arena that the fused path no longer fills; extend past
+`LlamaLikeModel`/`Qwen3VL`.

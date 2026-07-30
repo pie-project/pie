@@ -61,6 +61,13 @@ struct ModelCapabilities {
     bool supports_small_prefill_graph = false;
     bool supports_runtime_window       = false;
     bool supports_media_encode         = false;
+    // Whether `body()` honours `ForwardInputs::logits_argmax_chunk_tokens` and
+    // writes `ws.sampled_tokens` instead of `ws.logits` when it is set
+    // (§20.37). Most families ignore the field, so the default must be false:
+    // the driver commits the epilogue's token source before the forward runs,
+    // and a family that quietly materialised logits anyway would leave the
+    // epilogue publishing uninitialised memory as token ids.
+    bool supports_fused_lm_head_argmax = false;
 };
 
 // Polymorphic per-model interface. Implementations hold refs to per-arch

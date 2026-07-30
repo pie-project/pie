@@ -1467,6 +1467,7 @@ struct StagedLane {
     std::uint32_t logical_vocab = 0;
     std::vector<std::uint64_t> logits_bf16_rows;
     std::vector<std::uint64_t> mtp_logits_bf16_rows;
+    std::vector<std::uint64_t> presampled_token_rows;
     const std::uint8_t* row_valid = nullptr;
     std::uint32_t row_valid_offset = 0;
 };
@@ -3532,6 +3533,67 @@ bool Dispatch::launch_wants_attn_score(
     return false;
 }
 
+bool Dispatch::launch_epilogue_is_greedy_argmax(
+    const pie_native::LaunchView& view,
+    std::uint32_t vocab) const {
+    bool saw_epilogue = false;
+    // The verdict is a property of the program, and a launch is overwhelmingly
+    // the same guest replicated across every lane, so the same hash would
+    // otherwise be re-analysed once per lane -- op scans plus two vector
+    // allocations each, hundreds of times per fire.
+    std::vector<std::uint64_t> analysed;
+    for (std::size_t program = 0;
+         program < view.ptir_program_hashes.size();
+         ++program) {
+        const std::uint64_t hash = view.ptir_program_hashes.data()[program];
+        if (std::find(analysed.begin(), analysed.end(), hash) !=
+            analysed.end()) {
+            continue;
+        }
+        analysed.push_back(hash);
+        const auto* plans = impl_->cache.plans(hash);
+        if (plans == nullptr) return false;
+        const auto generated = impl_->fused_modules.program(hash);
+        if (generated == nullptr ||
+            generated->stages.size() != plans->size()) {
+            return false;
+        }
+        for (std::size_t index = 0; index < plans->size(); ++index) {
+            const plan::StagePlan& stage = (*plans)[index];
+            if (stage.stage != PTIR_STAGE_EPILOGUE) continue;
+            // A program may declare a vocabulary narrower than the weight's,
+            // and the materialising path honours it by scanning only that many
+            // columns. The fused reduction runs over the whole weight, so it
+            // could return a token the narrowed program can never emit.
+            //
+            // `stage_logits_vocab` throws on a malformed program. Declining is
+            // the right answer here rather than propagating: this is a
+            // question about an optimisation, and `finish` still rejects the
+            // same program at the same place it always did.
+            std::uint32_t logical_vocab = 0;
+            try {
+                logical_vocab = stage_logits_vocab(&stage, vocab);
+            } catch (const std::exception&) {
+                return false;
+            }
+            if (logical_vocab != vocab) return false;
+            const auto& executable = generated->stages[index];
+            if (executable == nullptr) return false;
+            std::string unused;
+            if (!generated::generated_stage_supported(
+                    *executable, stage, &unused)) {
+                return false;
+            }
+            if (!generated::generated_stage_is_compact_argmax(
+                    stage, *executable)) {
+                return false;
+            }
+            saw_epilogue = true;
+        }
+    }
+    return saw_epilogue;
+}
+
 bool Dispatch::launch_wants_page_mask(
     const pie_native::LaunchView& view) const {
     for (std::size_t program = 0;
@@ -3990,6 +4052,9 @@ GroupedLaneBinding make_staged_binding(
         .mtp_logits_bf16_rows = lane.mtp_logits_bf16_rows.empty()
             ? nullptr
             : &lane.mtp_logits_bf16_rows,
+        .presampled_token_rows = lane.presampled_token_rows.empty()
+            ? nullptr
+            : &lane.presampled_token_rows,
         .sample_output_channel_mask =
             sample_output_channel_mask(lane, stage),
         .row_valid = lane.row_valid,
@@ -4888,6 +4953,7 @@ bool Dispatch::finish(
     std::uint32_t direct_bf16_row_capacity,
     const std::uint8_t* row_valid,
     std::span<const std::uint32_t> row_valid_offsets,
+    const std::int32_t* presampled_tokens,
     FinishBreakdown* breakdown) {
     const bool trace_fire_timing = fire_timing::enabled();
     if (trace_fire_timing) {
@@ -4947,12 +5013,17 @@ bool Dispatch::finish(
         lane.logical_vocab = logical_vocab == 0 ? vocab : logical_vocab;
         lane.logits_bf16_rows.clear();
         lane.mtp_logits_bf16_rows.clear();
+        lane.presampled_token_rows.clear();
         lane.row_valid = row_valid;
         lane.row_valid_offset =
             row_valid == nullptr ? 0 : row_valid_offsets[program];
         if (direct_bf16_logits != nullptr &&
             direct_row_indices != nullptr) {
-            lane.logits_bf16_rows.reserve(lane.sampled_rows);
+            if (presampled_tokens != nullptr) {
+                lane.presampled_token_rows.reserve(lane.sampled_rows);
+            } else {
+                lane.logits_bf16_rows.reserve(lane.sampled_rows);
+            }
             for (std::uint32_t row = 0; row < lane.sampled_rows; ++row) {
                 const std::uint32_t source =
                     direct_row_indices[lane.row_offset + row];
@@ -4961,10 +5032,21 @@ bool Dispatch::finish(
                     throw std::runtime_error(
                         "direct BF16 sampled row exceeds the logits layout");
                 }
-                lane.logits_bf16_rows.push_back(
-                    reinterpret_cast<std::uint64_t>(
-                        direct_bf16_logits +
-                        static_cast<std::size_t>(source) * vocab));
+                if (presampled_tokens != nullptr) {
+                    // Same `source` row, one token wide instead of a
+                    // vocabulary. Exclusive with the BF16 table rather than
+                    // alongside it: on this path `direct_bf16_logits` holds
+                    // slab scratch, so a row table into it would be a live
+                    // pointer to something nobody wrote.
+                    lane.presampled_token_rows.push_back(
+                        reinterpret_cast<std::uint64_t>(
+                            presampled_tokens + source));
+                } else {
+                    lane.logits_bf16_rows.push_back(
+                        reinterpret_cast<std::uint64_t>(
+                            direct_bf16_logits +
+                            static_cast<std::size_t>(source) * vocab));
+                }
             }
         }
         if (drafts != 0) {
