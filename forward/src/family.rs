@@ -234,6 +234,68 @@ mod tests {
         );
     }
 
+    /// Mistral-7B-v0.3's traced form: the fused-QKV binding keeps
+    /// Matmul(qkv) + SplitQkv, but with no qk-norm the RmsnormPerHead pair
+    /// between SplitQkv and Rope folds away — the one branch combination
+    /// neither qwen3 (fused + qk-norm) nor phi3 (unfused + no qk-norm) had
+    /// run. On this shape the executor's fused decode-QKV peephole can
+    /// never fire (its predicate requires qk-norm), so SplitQkv and Rope
+    /// launch as the standalone kernels.
+    #[test]
+    fn mistral_layer_op_sequence() {
+        let plan = llama_like(&LlamaLikeFacts::mistral_7b_v03());
+        let kinds: Vec<&'static str> = plan
+            .layer_ops(0)
+            .map(|op| match op.kind {
+                OpKind::Rmsnorm { .. } => "rmsnorm",
+                OpKind::Matmul { beta_one: false, .. } => "matmul",
+                OpKind::Matmul { beta_one: true, .. } => "matmul+res",
+                OpKind::SplitQkv { .. } => "split_qkv",
+                OpKind::RmsnormPerHead { .. } => "rmsnorm_per_head",
+                OpKind::Rope { .. } => "rope",
+                OpKind::KvAppend { .. } => "kv_append",
+                OpKind::Attention { .. } => "attention",
+                OpKind::Swiglu { .. } => "swiglu",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "rmsnorm",
+                "matmul",
+                "split_qkv",
+                "rope",
+                "kv_append",
+                "attention",
+                "matmul+res",
+                "rmsnorm",
+                "matmul",
+                "swiglu",
+                "matmul+res",
+            ]
+        );
+    }
+
+    #[test]
+    fn mistral_full_plan_shape() {
+        let facts = LlamaLikeFacts::mistral_7b_v03();
+        let plan = llama_like(&facts);
+        // 11 ops per layer (13 minus the two per-head norms) + embed +
+        // final norm + lm_head.
+        assert_eq!(plan.ops.len(), 11 * facts.layers as usize + 3);
+        // Untied embeddings: the lm head names its own weight.
+        assert!(matches!(
+            &plan.ops.last().unwrap().kind,
+            OpKind::LmHead { weight } if weight == "lm_head"
+        ));
+        let logits = plan.ops.last().unwrap().outputs[0];
+        assert_eq!(
+            plan.values[logits as usize].shape.0,
+            vec![Dim::Requests, Dim::Const(facts.vocab)]
+        );
+    }
+
     #[test]
     fn residual_dataflow_is_recorded() {
         let plan = llama_like(&LlamaLikeFacts::qwen3_0_6b());

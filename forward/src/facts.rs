@@ -13,8 +13,9 @@ use crate::trace::{NormVariant, RopeKind};
 /// The llama_like family's facts: covers qwen3, mistral3, phi3, olmo3
 /// (pie-application-plan.md §7 stage 3 scope). Declared so far: the qwen3
 /// configuration — pre-norm, per-head qk-norm, standard rope, fused QKV
-/// binding, dense MLP — and the phi3 one, which drops the qk-norm and the
-/// embedding tie.
+/// binding, dense MLP — the phi3 one, which drops the qk-norm and the
+/// embedding tie, and the mistral (7B v0.3) one, which pairs the fused
+/// binding with no qk-norm.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LlamaLikeFacts {
     pub hidden: u32,
@@ -92,6 +93,41 @@ impl LlamaLikeFacts {
             norm_variant: NormVariant::Plain,
             qk_norm: false,
             fused_qkv: false,
+            tied_embeddings: false,
+        }
+    }
+
+    /// Mistral-7B-Instruct-v0.3 (mistralai/Mistral-7B-Instruct-v0.3
+    /// config.json): the third llama_like configuration the declaration
+    /// covers, and the first to combine the fused QKV binding with no
+    /// qk-norm — qwen3 is fused + qk-norm, phi3 unfused + no qk-norm, so
+    /// every fact here exercises an existing branch and only the
+    /// combination is new. GQA (32 q / 8 kv heads), head_dim 128 (hidden
+    /// 4096 / 32 — no kernel pad, unlike phi3's 96), untied lm_head
+    /// (`tie_word_embeddings: false`, and the checkpoint ships
+    /// `lm_head.weight`). `rope_theta: 1e6`, null rope scaling and
+    /// `sliding_window: null` are backend cfg the trace deliberately
+    /// lacks. `fused_qkv: true` is the binding fact, the mirror image of
+    /// phi3's: the checkpoint ships three raw BF16 q/k/v projections
+    /// under the canonical names, and the CUDA dense join
+    /// (`contract.hpp::dense_fused_projection_joins`) re-fuses exactly
+    /// such raw source tensors into `qkv_proj.fused` — so the deployment
+    /// binds one packed projection and the trace writes Matmul(qkv) +
+    /// SplitQkv (verified against the live binding: the declared-forward
+    /// trace reports the 355-op fused form, 11 ops x 32 layers + 3).
+    pub fn mistral_7b_v03() -> Self {
+        Self {
+            hidden: 4096,
+            layers: 32,
+            q_heads: 32,
+            kv_heads: 8,
+            head_dim: 128,
+            intermediate: 14_336,
+            vocab: 32_768,
+            rope: RopeKind::Standard,
+            norm_variant: NormVariant::Plain,
+            qk_norm: false,
+            fused_qkv: true,
             tied_embeddings: false,
         }
     }

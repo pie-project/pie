@@ -73,6 +73,16 @@ fn phi3_mini() {
     check("phi3_mini", &LlamaLikeFacts::phi3_mini());
 }
 
+/// The third declared configuration (Mistral-7B-Instruct-v0.3): the fused
+/// QKV binding (the checkpoint's raw q/k/v re-fused by the dense join)
+/// with no qk-norm — the branch combination qwen3 and phi3 between them
+/// never traced. Untied lm_head; rope theta 1e6, null sliding window and
+/// null rope scaling are backend cfg, invisible here by design.
+#[test]
+fn mistral_7b_v03() {
+    check("mistral_7b_v03", &LlamaLikeFacts::mistral_7b_v03());
+}
+
 /// The unfused-binding variant: three projection matmuls, no SplitQkv. Kept
 /// golden so the binding-driven divergence stays a reviewed artifact rather
 /// than an emergent one.
