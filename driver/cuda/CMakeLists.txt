@@ -515,6 +515,7 @@ add_library(pie_driver_cuda_lib STATIC
   src/batch/frame.cpp
   src/batch/forward.cpp
   src/batch/persistent_inputs.cpp
+  src/batch/planner_calibration.cpp
   src/batch/tp.cpp
   src/batch/workspace.cu
   # pipeline/ -- guest programs (PTIR dispatch, tier0, frame carrier)
@@ -529,6 +530,7 @@ add_library(pie_driver_cuda_lib STATIC
   src/store/kv_cache_format.cpp
   src/store/elastic.cpp
   src/store/memory_planner.cpp
+  src/store/planner_profile_cache.cpp
   src/store/recurrent_state_cache.cpp
   src/store/swap_pool.cpp
   # ops/ -- attention / GEMM / MoE / SSM wrappers

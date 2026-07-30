@@ -41,6 +41,7 @@
 #include "batch/frame.hpp"
 #include "batch/fire_timing.hpp"
 #include "batch/forward.hpp"
+#include "batch/planner_calibration.hpp"
 #include "batch/tp.hpp"
 #include "kernels/kv_paged.hpp"
 #include "store/kv_cache.hpp"
@@ -1767,6 +1768,24 @@ int Context::Impl::load_model(
         attention_allocator_->ensure_all();
         state_allocator_->ensure_all();
         capture_forward_graph_lattice(*executor_);
+        if (!is_tp_follower()) {
+            workspace_allocator_->trim_bytes(pie::elastic::kLogicalPageBytes);
+            attention_allocator_->trim_bytes(0);
+            if (tp_size_ == 1) {
+                state_allocator_->trim_bytes(0);
+            }
+        }
+    }
+    // Opt-in: time the forward step across the token-budget ladder and cache
+    // the winner, so the next start selects `max_forward_tokens` from a
+    // measurement on THIS device instead of from the planner's analytic score.
+    // The sweep runs the real forward body, so it needs the arenas resident —
+    // hence the ensure/trim pair here rather than relying on the capture path's.
+    if (planner_calibration_requested()) {
+        workspace_allocator_->ensure_all();
+        attention_allocator_->ensure_all();
+        state_allocator_->ensure_all();
+        calibrate_memory_planner(*executor_, tp_size_, mem_plan.kv_page_size);
         if (!is_tp_follower()) {
             workspace_allocator_->trim_bytes(pie::elastic::kLogicalPageBytes);
             attention_allocator_->trim_bytes(0);
