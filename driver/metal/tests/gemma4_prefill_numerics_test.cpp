@@ -519,6 +519,32 @@ int main(int argc, char** argv) {
                            "prompt does");
     }
 
+    // ── Rebinding the constants must not consume the heap ──
+    //
+    // The row-dependent constants are rebound whenever a fire's row count
+    // changes, which in a real batch is most fires. `bind_const` used to
+    // `heap_alloc` a fresh slot every time, so a varying batch walked the heap
+    // until allocation failed -- and what failed was the NEXT model's setup,
+    // reporting "budget too small" about a request that had nothing to do with
+    // it. gpt-oss hit it at four concurrent lanes.
+    //
+    // The value at a given (ordinal, index) is always the same size, so the
+    // slot is allocated once and rewritten. A thousand alternations here is
+    // far more than any fire sequence and costs milliseconds.
+    {
+        bool threw = false;
+        try {
+            for (int i = 0; i < 1000; ++i) {
+                bind_gemma4_consts(*ctx, dag, g, (i % 2) ? 1 : N, /*paged=*/true);
+            }
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        expect(!threw, "rebinding the constants a thousand times does not exhaust the heap");
+        // And it must still be the right answer afterwards, not merely alive.
+        bind_gemma4_consts(*ctx, dag, g, N, /*paged=*/true);
+    }
+
     // ── Sixteen rows: the batch where the GEMM engages ──
     //
     // Below twelve rows the projections are a per-row GEMV, and `qmm_bn`

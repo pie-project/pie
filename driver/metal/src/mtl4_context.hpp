@@ -157,6 +157,17 @@ class RawMetalContext {
     // offsets in call order. align defaults to 256 (Metal buffer-offset alignment).
     SlotHandle heap_alloc(size_t size, size_t align = 256);
 
+    /// A heap slot MEMOIZED by the argument-table slot it will be bound to.
+    ///
+    /// Constants are rebound whenever the row count changes, and a fresh
+    /// `heap_alloc` per rebind leaks: a batch whose size varies fire to fire
+    /// walks the heap until `heap_alloc` returns nothing, and the model fails
+    /// to set up its NEXT sequence with "budget too small". The value at a
+    /// given (ordinal, index) is always the same size, so the allocation can be
+    /// made once and rewritten -- which is safe because a rebind happens
+    /// between steps, and a step blocks on its completion fence.
+    SlotHandle const_slot(int ordinal, std::uint8_t index, size_t bytes);
+
     // CPU-visible standalone storage for channels, IO staging, and other pools
     // intentionally excluded from elastic arenas.
     SlotHandle create_standalone_buffer(size_t size);

@@ -35,7 +35,7 @@ struct RmsParams {  // rms_norm.metal:22 (buffer 3)
 
 template <class V>
 inline void bind_const(RawMetalContext& ctx, int ord, std::uint8_t idx, const V& val, int* count) {
-    SlotHandle s = ctx.heap_alloc(sizeof(V));
+    SlotHandle s = ctx.const_slot(ord, idx, sizeof(V));
     if (!s.valid()) {
         throw std::runtime_error("gpt-oss consts: heap_alloc failed (budget too small)");
     }
