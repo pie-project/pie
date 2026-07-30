@@ -136,6 +136,24 @@ int bind_gptoss_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                 break;
 
             case Kind::SdpaSink: {
+                if (paged) {
+                    // The paged ABI puts different meanings at the same slots,
+                    // so it is bound as its own thing rather than as a subset:
+                    // `SdpaSink::N` is `SdpaPaged::PositionIds`, a length read
+                    // as a pointer.
+                    using P = bind::SdpaPaged;
+                    bind_const<std::int32_t>(ctx, ord, (std::uint8_t)P::GqaFactor,
+                                             g.gqa_factor(), &count);
+                    bind_const<std::int32_t>(ctx, ord, (std::uint8_t)P::PageSize,
+                                             g.kv_page_size, &count);
+                    bind_const<std::int32_t>(ctx, ord, (std::uint8_t)P::NKvHeads,
+                                             g.n_kv_heads, &count);
+                    bind_const<float>(ctx, ord, (std::uint8_t)P::Scale,
+                                      1.0f / std::sqrt(float(g.head_dim)), &count);
+                    bind_const<std::int32_t>(ctx, ord, (std::uint8_t)P::Window,
+                                             d.sliding ? g.sliding_window : 0, &count);
+                    break;
+                }
                 using S = bind::SdpaSink;
                 bind_const<std::int32_t>(ctx, ord, (std::uint8_t)S::GqaFactor, g.gqa_factor(),
                                          &count);

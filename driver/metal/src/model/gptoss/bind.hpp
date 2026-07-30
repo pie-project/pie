@@ -46,6 +46,17 @@ struct ScratchColoring {
 ScratchColoring color_gptoss_scratch(const std::vector<Dispatch>& dag, const ScratchPlan& plan,
                                      bool no_recycle = false);
 
+/// The paged binder: the same DAG against page-addressed KV and the CSR.
+///
+/// Not an M>1 path -- gpt-oss has none, because its MoE picks experts per ROW.
+/// What paging buys is SEVERAL SEQUENCES: each one's history is its own page
+/// list, so a second resident sequence no longer clobbers the first.
+void bind_gptoss_dag_paged(RawMetalContext& ctx, const BoundGptOss& b,
+                           const std::vector<Dispatch>& dag, const GptOssGeometry& g,
+                           const ScratchColoring& scratch,
+                           const std::vector<SlotHandle>& k_pages,
+                           const std::vector<SlotHandle>& v_pages, int ordinal_base = 0);
+
 void bind_gptoss_dag(RawMetalContext& ctx, const BoundGptOss& b, const std::vector<Dispatch>& dag,
                      const GptOssGeometry& g, const ScratchColoring& scratch,
                      int ordinal_base = 0);

@@ -147,6 +147,10 @@ enum class SdpaPaged : uint8_t {
     // is a window read out of uninitialized memory, which is wrong attention
     // rather than a crash.
     Window = 15,
+    // gpt-oss's learned per-head scalar, which joins the softmax denominator as
+    // though it were one more key. Bound only by the family that has one; the
+    // `sink` instantiation is a separate pipeline, so the others never read it.
+    Sinks = 16,
 };
 
 // rms_single_row: group=(row/N_READS), grid=(1,1,1). Buffer 3 is a packed

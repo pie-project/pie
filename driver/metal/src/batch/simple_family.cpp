@@ -439,15 +439,34 @@ class GptOssEngine final : public SimpleFamilyEngine {
             return false;
         }
 
+        // Paged KV. gpt-oss has no M>1 path -- its MoE picks experts per ROW,
+        // so a batched routed matmul is a different kernel rather than a wider
+        // launch -- but paging is orthogonal to that: what it buys is SEVERAL
+        // SEQUENCES, each attending its own page list, instead of one ring that
+        // the second sequence clobbers.
+        g_.paged_kv_enabled = true;
+        g_.kv_page_size = cfg.kv_page_size > 0 ? int(cfg.kv_page_size) : 32;
+        const int ps = g_.kv_page_size;
+        g_.kv_max_ctx = ((max_ctx_ + ps - 1) / ps) * ps;
+        g_.total_pages = g_.kv_max_ctx / ps;
+        max_sampled_ = cfg.max_forward_requests > 0 ? int(cfg.max_forward_requests) : 1;
+        max_rows_ = cfg.max_forward_tokens > 0 ? int(cfg.max_forward_tokens) : 1;
+        if (max_sampled_ > max_rows_) max_sampled_ = max_rows_;
+
+        kpages_.resize(std::size_t(g_.n_layers));
+        vpages_.resize(std::size_t(g_.n_layers));
         b_.kv.resize(std::size_t(g_.n_layers));
         for (int L = 0; L < g_.n_layers; ++L) {
-            const std::size_t bytes = gptoss::gptoss_kv_bytes_per_layer(g_, max_ctx_, 2);
-            b_.kv[std::size_t(L)].k = ctx.heap_alloc(bytes);
-            b_.kv[std::size_t(L)].v = ctx.heap_alloc(bytes);
-            if (!b_.kv[std::size_t(L)].k.valid() || !b_.kv[std::size_t(L)].v.valid()) {
+            const std::size_t bytes = std::size_t(g_.total_pages) * std::size_t(g_.kv_page_size) *
+                                      std::size_t(g_.n_kv_heads) * std::size_t(g_.head_dim) * 2;
+            kpages_[std::size_t(L)] = ctx.heap_alloc(bytes);
+            vpages_[std::size_t(L)] = ctx.heap_alloc(bytes);
+            if (!kpages_[std::size_t(L)].valid() || !vpages_[std::size_t(L)].valid()) {
                 if (err) *err = "gpt-oss KV allocation failed";
                 return false;
             }
+            b_.kv[std::size_t(L)].k = kpages_[std::size_t(L)];
+            b_.kv[std::size_t(L)].v = vpages_[std::size_t(L)];
         }
 
         dag_ = gptoss::build_gptoss_dag(g_, /*with_argmax=*/false);
@@ -462,8 +481,16 @@ class GptOssEngine final : public SimpleFamilyEngine {
         for (int c = 0; c < coloring_.colors_used; ++c) b_.pool[std::size_t(c)] = ctx.heap_alloc(widest);
 
         b_.io.resize(kIoSlotCount);
-        for (int i = 0; i < kIoSlotCount; ++i) b_.io[i] = ctx.heap_alloc(4096);
-        logits_ = ctx.heap_alloc(std::size_t(g_.vocab) * 2);
+        const std::size_t io_bytes =
+            std::max<std::size_t>(4096, std::size_t(g_.total_pages + 8) * 4);
+        for (int i = 0; i < kIoSlotCount; ++i) b_.io[i] = ctx.heap_alloc(io_bytes);
+        // One row per SAMPLED row, plus one more. The fire runs its rows one at
+        // a time and the tail writes on EVERY one, so the rows nobody reads
+        // need somewhere to land that is not somewhere a sampled row already
+        // landed -- otherwise a later member's prompt overwrites an earlier
+        // member's answer, which reads as that member being answered from its
+        // neighbour's prompt.
+        logits_ = ctx.heap_alloc(std::size_t(max_sampled_ + 1) * std::size_t(g_.vocab) * 2);
         if (!logits_.valid()) {
             if (err) *err = "gpt-oss logits allocation failed";
             return false;
@@ -471,17 +498,22 @@ class GptOssEngine final : public SimpleFamilyEngine {
 
         if (!gptoss::build_gptoss_psos(ctx, kernels_dir, psos_, err)) return false;
         if (!load_decode_psos(ctx, kernels_dir, base_, /*with_argmax=*/false, err)) return false;
+        if (!load_multibatch_psos(ctx, kernels_dir, mb_, /*with_d512=*/false, err)) return false;
 
-        gptoss::bind_gptoss_consts(ctx, dag_, g_);
+        gptoss::bind_gptoss_consts(ctx, dag_, g_, /*rows=*/1, /*paged=*/true);
         try {
-            gptoss::bind_gptoss_dag(ctx, b_, dag_, g_, coloring_);
+            gptoss::bind_gptoss_dag_paged(ctx, b_, dag_, g_, coloring_, kpages_, vpages_);
         } catch (const std::exception& e) {
             if (err) *err = std::string("binding gpt-oss: ") + e.what();
             return false;
         }
-        const int tail = int(dag_.size()) - 1;
-        ctx.arg_bind_ordinal(dag_[std::size_t(tail)].ordinal, (std::uint8_t)bind::GoQmv::Out,
-                             logits_);
+        tail_ordinal_ = dag_.back().ordinal;
+        ctx.arg_bind_ordinal(tail_ordinal_, (std::uint8_t)bind::GoQmv::Out, logits_);
+        bound_logits_row_ = 0;
+        write_u32s(b_.io[int(IoSlot::AttnMaskStride)], {0u});
+        if (b_.io[int(IoSlot::AttnMaskEnabled)].contents() != nullptr) {
+            std::memset(b_.io[int(IoSlot::AttnMaskEnabled)].contents(), 0, 1);
+        }
         return true;
     }
 
@@ -489,20 +521,97 @@ class GptOssEngine final : public SimpleFamilyEngine {
     int n_layers() const override { return g_.n_layers; }
 
     void reset() override {
-        for (auto& kv : b_.kv) {
-            if (kv.k.valid() && kv.k.contents()) std::memset(kv.k.contents(), 0, kv.k.size);
-            if (kv.v.valid() && kv.v.contents()) std::memset(kv.v.contents(), 0, kv.v.size);
+        for (int L = 0; L < g_.n_layers; ++L) {
+            SlotHandle& k = kpages_[std::size_t(L)];
+            SlotHandle& v = vpages_[std::size_t(L)];
+            if (k.valid() && k.contents()) std::memset(k.contents(), 0, k.size);
+            if (v.valid() && v.contents()) std::memset(v.contents(), 0, v.size);
         }
     }
 
     StepTiming step(RawMetalContext& ctx, std::uint32_t token_id,
                     std::uint32_t position) override {
-        write_i32(b_.io[int(IoSlot::TokenId)], std::int32_t(token_id));
-        write_i32(b_.io[int(IoSlot::Position)], std::int32_t(position));
-        write_i32(b_.io[int(IoSlot::SeqLen)], std::int32_t(position) + 1);
-        return ctx.run_step([&](StepEncoder& se) {
-            gptoss::encode_gptoss_step(se, dag_, g_, base_, psos_);
-        });
+        FireCsr csr;
+        csr.token_ids = {token_id};
+        csr.position_ids = {position};
+        csr.req_of_token = {0u};
+        csr.w_page = {position / std::uint32_t(g_.kv_page_size)};
+        csr.w_off = {position % std::uint32_t(g_.kv_page_size)};
+        csr.qo_indptr = {0u, 1u};
+        csr.kv_page_indices.resize(std::size_t(g_.total_pages));
+        for (int p = 0; p < g_.total_pages; ++p) {
+            csr.kv_page_indices[std::size_t(p)] = std::uint32_t(p);
+        }
+        csr.kv_page_indptr = {0u, std::uint32_t(g_.total_pages)};
+        csr.sample_rows = {0u};
+        return fire(ctx, csr, {}, {});
+    }
+
+    bool paged() const override { return true; }
+    /// A fire of R rows is R PASSES, not one wider one: gpt-oss has no M>1
+    /// path, because its MoE picks experts per row. So the row budget costs
+    /// time rather than memory, and what paging buys is that those passes may
+    /// belong to different sequences.
+    int max_rows() const override { return max_rows_; }
+    int max_sampled_rows() const override { return max_sampled_; }
+    int page_size() const override { return g_.kv_page_size; }
+    int total_pages() const override { return g_.total_pages; }
+
+    StepTiming fire(RawMetalContext& ctx, const FireCsr& csr, const EncodeHook& pre,
+                    const EncodeHook& post) override {
+        const int rows = int(csr.token_ids.size());
+        if (rows <= 0 || rows > max_rows()) return StepTiming{};
+        write_u32s(b_.io[int(IoSlot::KvPageIndices)], csr.kv_page_indices);
+        write_u32s(b_.io[int(IoSlot::KvPageIndptr)], csr.kv_page_indptr);
+
+        StepTiming last{};
+        std::size_t next_sample = 0;
+        for (int r = 0; r < rows; ++r) {
+            // Every row is its own pass, so the per-row IO is written as a
+            // SCALAR at index 0 rather than as an array the kernels index --
+            // the contiguous launch shapes read slot[0], and this path keeps
+            // them.
+            write_u32s(b_.io[int(IoSlot::TokenId)], {csr.token_ids[std::size_t(r)]});
+            write_u32s(b_.io[int(IoSlot::Position)], {csr.position_ids[std::size_t(r)]});
+            write_u32s(b_.io[int(IoSlot::SeqLen)],
+                       {csr.position_ids[std::size_t(r)] + 1});
+            // The CSR is rewritten per row too: with one row in flight, request
+            // 0 IS this row's request, and its page list is the slice the
+            // fire's CSR gave it.
+            write_u32s(b_.io[int(IoSlot::ReqOfToken)], {0u});
+            const std::uint32_t req = csr.req_of_token[std::size_t(r)];
+            const std::uint32_t k0 = csr.kv_page_indptr[std::size_t(req)];
+            const std::uint32_t k1 = csr.kv_page_indptr[std::size_t(req) + 1];
+            std::vector<std::uint32_t> pages(csr.kv_page_indices.begin() + k0,
+                                             csr.kv_page_indices.begin() + k1);
+            write_u32s(b_.io[int(IoSlot::KvPageIndices)], pages);
+            write_u32s(b_.io[int(IoSlot::KvPageIndptr)], {0u, std::uint32_t(pages.size())});
+            write_u32s(b_.io[int(IoSlot::WPage)], {csr.w_page[std::size_t(r)]});
+            write_u32s(b_.io[int(IoSlot::WOff)], {csr.w_off[std::size_t(r)]});
+
+            // A sampled row's logits must survive the rest of the fire, so the
+            // tail writes its own row of the logits slot.
+            const bool sampled =
+                next_sample < csr.sample_rows.size() &&
+                csr.sample_rows[next_sample] == std::uint32_t(r);
+            const int want_row = sampled ? int(next_sample) : max_sampled_;
+            if (want_row != bound_logits_row_) {
+                ctx.arg_bind_ordinal(tail_ordinal_, (std::uint8_t)bind::GoQmv::Out, logits_,
+                                     std::size_t(want_row) * std::size_t(g_.vocab) * 2);
+                bound_logits_row_ = want_row;
+            }
+            if (sampled) ++next_sample;
+
+            const bool first = r == 0;
+            const bool final_row = r + 1 == rows;
+            last = ctx.run_step([&](StepEncoder& se) {
+                if (first && pre) pre(se);
+                gptoss::encode_gptoss_step_paged(se, dag_, g_, base_, mb_, psos_);
+                if (final_row && post) post(se);
+            });
+            if (!last.succeeded()) return last;
+        }
+        return last;
     }
 
     SlotHandle logits_slot() const override { return logits_; }
@@ -515,6 +624,13 @@ class GptOssEngine final : public SimpleFamilyEngine {
     gptoss::BoundGptOss b_{};
     gptoss::GptOssPsos psos_{};
     DecodeStepPsos base_{};
+    MultiBatchPsos mb_{};
+    std::vector<SlotHandle> kpages_{};
+    std::vector<SlotHandle> vpages_{};
+    int max_sampled_ = 1;
+    int max_rows_ = 1;
+    int tail_ordinal_ = 0;
+    int bound_logits_row_ = 0;
     SlotHandle logits_{};
 };
 

@@ -25,6 +25,7 @@ bool build_gptoss_psos(RawMetalContext& ctx, const std::string& kernels_dir, Gpt
         {"gptoss.metal", "gptoss_swiglu_bfloat16", &out.swiglu},
         {"gptoss.metal", "expert_combine_bfloat16", &out.expert_combine},
         {"sdpa_sliding.metal", "sdpa_vector_decode_sink_bfloat16_d_64", &out.sdpa_sink},
+        {"sdpa_paged.metal", "sdpa_paged_decode_sink_bfloat16_d_64", &out.sdpa_sink_paged},
         {"rope.metal", "rope_neox_freqs_decode_bfloat16", &out.rope_freqs},
     };
     for (const Spec& spec : specs) {

@@ -288,8 +288,9 @@ int main() {
             cfg.snapshot_dir = dir;
             cfg.model_type = "gpt_oss";
             cfg.vocab_size = 201088;
-            cfg.max_forward_tokens = 1;
-            cfg.max_forward_requests = 1;
+            cfg.max_forward_tokens = 32;
+            cfg.max_forward_requests = 4;
+            cfg.kv_page_size = 32;
             cfg.gptoss.n_layers = 24;
             cfg.gptoss.hidden = 2880;
             cfg.gptoss.vocab = 201088;
@@ -311,6 +312,31 @@ int main() {
                 bool same = got.size() == want.size();
                 for (std::size_t i = 0; same && i < want.size(); ++i) same = got[i] == want[i];
                 expect(same, "gpt-oss's sampled tokens are mlx-lm's, through the executor");
+            }
+
+            // ── Two sequences, resident at once ──
+            //
+            // gpt-oss has no M>1 path -- its MoE picks experts per ROW -- so a
+            // two-member fire is two passes rather than one wider one. Paging
+            // is what makes those passes safe to interleave: before it, the KV
+            // was one ring and the second sequence overwrote the first.
+            //
+            // B's prompt is a PREFIX of A's, so a leak between them would give
+            // one answer twice. A must still answer 40510 ("Tokyo") beside a
+            // sibling.
+            std::vector<std::uint32_t> ta, tb;
+            if (!taps &&
+                run_two_sequences(
+                    cfg, {976, 9029, 328, 10128, 382, 12650, 13, 623, 9029, 328, 10198, 382},
+                    {976, 9029, 328, 10128, 382}, ta, tb)) {
+                std::printf("    two sequences: A %u %u   B %u %u\n", ta[0], ta[1], tb[0],
+                            tb[1]);
+                expect(ta[0] == 40510,
+                       "gpt-oss: a sequence's answer is unchanged by a sibling sharing its "
+                       "fire");
+                expect(tb[0] != ta[0] || tb[1] != ta[1],
+                       "gpt-oss: and the shorter one is answered from its OWN pages, not its "
+                       "neighbour's");
             }
         }
     }
