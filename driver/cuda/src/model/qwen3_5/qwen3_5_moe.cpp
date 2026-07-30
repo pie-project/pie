@@ -27,6 +27,37 @@ const DeviceTensor* maybe(const LoadedModel& e, const std::string& name) {
     return e.has(name) ? &e.get(name) : nullptr;
 }
 
+// Bind this layer's routed experts, whichever form the contract published.
+//
+// A stacking contract publishes one fused `[E, ...]` slab per projection; a
+// streaming contract publishes neither and declares a group instead. It is
+// never both, so there is no second copy to pay for and no ambiguity here.
+void bind_routed_experts(const LoadedModel& engine, const std::string& lp, int experts,
+                         Qwen3_5MoeLayerWeights& Lw) {
+    Lw.moe_gate_up_proj = maybe(engine, lp + "mlp.experts.gate_up_proj");
+    Lw.moe_down_proj = maybe(engine, lp + "mlp.experts.down_proj");
+    if (Lw.moe_gate_up_proj != nullptr && Lw.moe_down_proj != nullptr) {
+        return;
+    }
+    GroupStreamCache* cache = engine.group_cache();
+    const std::string group_name = lp + "mlp.experts";
+    const std::size_t g =
+        cache != nullptr ? cache->find_group(group_name) : GroupStreamCache::kNoGroup;
+    if (g == GroupStreamCache::kNoGroup) {
+        throw std::runtime_error(
+            "qwen3_5_moe: layer has neither fused expert weights nor a '" +
+            group_name + "' group");
+    }
+    if (cache->arity(g) != static_cast<std::uint32_t>(experts)) {
+        throw std::runtime_error(
+            "qwen3_5_moe: group '" + group_name + "' holds " +
+            std::to_string(cache->arity(g)) + " experts but the config says " +
+            std::to_string(experts));
+    }
+    Lw.expert_cache = cache;
+    Lw.expert_group = g;
+}
+
 // The shared expert's scalar gate is a [1, H] projection. Packed onto the
 // gate/up weight it is one extra row of a GEMM that already runs; left on
 // its own it is a whole kernel (`sigmoid_dot_scalar_gate_add`, ~7 us per
@@ -297,8 +328,7 @@ Qwen3_5MoeWeights bind_qwen3_5_moe(const LoadedModel& engine) {
         // The moe_forward block emits a single all-reduce on the
         // combined routed+shared partial sum.
         Lw.moe_router       = &must(engine, lp + "mlp.gate.weight");
-        Lw.moe_gate_up_proj = &must(engine, lp + "mlp.experts.gate_up_proj");
-        Lw.moe_down_proj    = &must(engine, lp + "mlp.experts.down_proj");
+        bind_routed_experts(engine, lp, cfg.num_experts, Lw);
         if (has_shared_expert) {
             Lw.shared_gate_proj = &must(engine, lp + "mlp.shared_expert.gate_proj.weight");
             Lw.shared_up_proj   = &must(engine, lp + "mlp.shared_expert.up_proj.weight");
@@ -361,8 +391,7 @@ Qwen3_5MoeWeights bind_qwen3_5_moe(const LoadedModel& engine) {
         Lw.fa_v_proj_quant = engine.quant_meta(fa + "v_proj.weight");
         Lw.fa_o_proj_quant = engine.quant_meta(fa + "o_proj.weight");
         Lw.moe_router = &must(engine, lp + "mlp.gate.weight");
-        Lw.moe_gate_up_proj = &must(engine, lp + "mlp.experts.gate_up_proj");
-        Lw.moe_down_proj = &must(engine, lp + "mlp.experts.down_proj");
+        bind_routed_experts(engine, lp, cfg.num_experts, Lw);
         if (has_shared_expert) {
             Lw.shared_gate_proj = &must(engine, lp + "mlp.shared_expert.gate_proj.weight");
             Lw.shared_up_proj = &must(engine, lp + "mlp.shared_expert.up_proj.weight");

@@ -642,6 +642,132 @@ void test_deepseek_v4_streams_experts_as_a_group() {
     }
 }
 
+/// Qwen3-MoE declares its per-expert weights as a group when asked to stream.
+///
+/// The plain HF MoE source layout -- one tensor per expert per projection --
+/// is the case `index_src` exists for, and this is the whole of it: the
+/// streaming branch is the stacking pass with the outer concatenation removed,
+/// so the instance it leaves behind is what the stack was already building per
+/// expert. GLM-5 shares the helper, so this covers it too.
+void test_qwen3_moe_streams_experts_as_a_group() {
+    constexpr std::int64_t kExperts = 4;
+    constexpr std::int64_t kHidden = 64;
+    constexpr std::int64_t kInter = 32;
+    constexpr std::int64_t kLayers = 2;
+
+    std::vector<TypedTensor> tensors{
+        {"model.embed_tokens.weight", {16, kHidden}, "BF16"},
+        {"model.norm.weight", {kHidden}, "BF16"},
+        {"lm_head.weight", {16, kHidden}, "BF16"},
+    };
+    for (int layer = 0; layer < kLayers; ++layer) {
+        const std::string lp = "model.layers." + std::to_string(layer) + ".mlp.";
+        tensors.push_back({lp + "gate.weight", {kExperts, kHidden}, "BF16"});
+        for (int e = 0; e < kExperts; ++e) {
+            const std::string ep = lp + "experts." + std::to_string(e) + ".";
+            tensors.push_back({ep + "gate_proj.weight", {kInter, kHidden}, "BF16"});
+            tensors.push_back({ep + "up_proj.weight", {kInter, kHidden}, "BF16"});
+            tensors.push_back({ep + "down_proj.weight", {kHidden, kInter}, "BF16"});
+        }
+    }
+    const std::filesystem::path dir =
+        write_typed_checkpoint("qwen3_moe_streamed", tensors);
+
+    std::string open_error;
+    pie_loader::Checkpoint checkpoint = pie_loader::Checkpoint::open(dir.string(), &open_error);
+    check(static_cast<bool>(checkpoint), "the synthetic checkpoint opens: " + open_error);
+    if (!checkpoint) return;
+
+    const pie_cuda_driver::model::ModelFacts facts{
+        .model_type = "qwen3_moe",
+        .quant_method = "",
+        .num_hidden_layers = kLayers,
+        .num_experts = kExperts,
+        .head_dim = 0,
+        .mamba_groups = 0,
+    };
+    namespace model = pie_cuda_driver::model;
+
+    pie_loader::ModelContract contract;
+    try {
+        model::ContractBuilder builder(checkpoint, facts,
+                                       pie_cuda_driver::cuda_device_target(), "",
+                                       model::Mxfp4MoeRequest::Auto,
+                                       model::Component::Full,
+                                       /*stream_routed_experts=*/true, contract);
+        model::author_qwen3_5_moe_contract(builder);
+        builder.finish();
+    } catch (const std::exception& error) {
+        check(false, std::string("authoring: ") + error.what());
+        return;
+    }
+
+    const auto v = contract.view();
+    // One group per layer, not one for the model: a name template carries a
+    // single `{}` and this checkpoint spells an expert with two indices.
+    check(v.groups.len == kLayers, "one group per layer");
+    if (v.groups.len != kLayers) return;
+
+    for (std::size_t layer = 0; layer < v.groups.len; ++layer) {
+        const auto& g = v.groups.ptr[layer];
+        const std::string at = " (layer " + std::to_string(layer) + ")";
+        check(view_of(g.name) ==
+                  "model.layers." + std::to_string(layer) + ".mlp.experts",
+              "the group is named where the bind looks for it" + at);
+        check(g.arity == kExperts, "one instance per expert" + at);
+
+        std::map<std::string_view, std::vector<std::int64_t>> declared;
+        for (std::size_t i = 0; i < g.tensors.len; ++i) {
+            const auto& t = g.tensors.ptr[i];
+            declared[view_of(t.name)] =
+                std::vector<std::int64_t>(t.shape.ptr, t.shape.ptr + t.shape.len);
+        }
+        check(declared.size() == 2, "two tensors, gate_up and down" + at);
+        // Rank 2, not 3: the stack's leading 1 existed only to make the
+        // per-expert slabs concatenable, and there is no concatenation left.
+        check(declared["gate_up_proj"] == std::vector<std::int64_t>{2 * kInter, kHidden},
+              "gate and up, joined" + at);
+        check(declared["down_proj"] == std::vector<std::int64_t>{kHidden, kInter},
+              "down, as the checkpoint stores it" + at);
+    }
+
+    for (std::size_t i = 0; i < v.tensors.len; ++i) {
+        const auto name = view_of(v.tensors.ptr[i].name);
+        check(name.find("experts.") == std::string_view::npos,
+              "no per-expert tensor is published outside the group");
+    }
+
+    try {
+        const pie_loader::PieLoaderContractRequest request =
+            pie_loader::build_contract_request(
+                checkpoint, pie_cuda_driver::cuda_device_target(), v);
+        // Compiling *is* the interchangeability proof.
+        const pie_loader::LoadPlan plan = pie_loader::LoadPlan::compile(request);
+        plan.verify(request);
+
+        const auto& pv = plan.view();
+        check(pv.groups.len == kLayers, "the plan carries every group");
+        if (pv.groups.len != kLayers) return;
+        const std::uint64_t one_expert =
+            static_cast<std::uint64_t>((2 * kInter * kHidden + kHidden * kInter) * 2);
+        for (std::size_t layer = 0; layer < pv.groups.len; ++layer) {
+            const auto& pg = pv.groups.ptr[layer];
+            const std::string at = " (layer " + std::to_string(layer) + ")";
+            check(pg.arity == kExperts, "the plan agrees on the arity" + at);
+            check(pg.bindings.len ==
+                      pg.bindings_per_instance * static_cast<std::size_t>(kExperts),
+                  "every instance is bound" + at);
+            check(pg.plan->memory.persistent_bytes >= one_expert &&
+                      pg.plan->memory.persistent_bytes < one_expert + 4096,
+                  "a slot is priced at one expert" + at);
+        }
+        check(pv.memory.persistent_bytes < one_expert * kExperts,
+              "the experts left the resident plan");
+    } catch (const std::exception& error) {
+        check(false, std::string("compiling: ") + error.what());
+    }
+}
+
 /// Kimi dequantizes and stacks its routed experts in the contract.
 ///
 /// The checkpoint stores each expert separately as W4A16: `I32` words of eight
@@ -1503,6 +1629,7 @@ int main() {
     test_kimi_stacks_experts_as_bf16();
     test_nemotron_h_mamba_splits_on_unit_boundaries();
     test_qwen3_5_gdn_splits_by_block();
+    test_qwen3_moe_streams_experts_as_a_group();
 
     const char* snapshot = std::getenv("PIE_TEST_SNAPSHOT");
     if (snapshot != nullptr) {

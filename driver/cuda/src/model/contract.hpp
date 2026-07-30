@@ -1291,6 +1291,67 @@ private:
 /// carries companion scale tensors that this stack does not join, so folding
 /// the weights alone would orphan them; families that can ship either layout
 /// set it and fall back to their per-expert path for quantised checkpoints.
+/// The same experts, declared as a group instead of a stack.
+///
+/// Structurally this is `hf_moe_expert_stacks` with the outer concatenation
+/// removed: the stack's per-expert slab was already built as its own subtree,
+/// so what is left after dropping the join is one instance, and the instance is
+/// the group. `src(".../experts.3.gate_proj.weight")` becomes
+/// `index_src(".../experts.{}.gate_proj.weight")` and nothing else moves.
+///
+/// The declared names carry no expert index. There is one plan and it is the
+/// same plan for every expert, which is the whole claim a group makes; the
+/// driver picks the instance at page-in time.
+///
+/// One group per layer, because a name template holds a single `{}`. The
+/// driver's slab spans groups, so this costs nothing.
+inline void hf_moe_streamed_expert_groups(
+    ContractBuilder& b, bool gate_second, std::uint32_t layer,
+    const std::string& bound, const std::string& prefix, std::int64_t num_experts,
+    std::int64_t inter, std::int64_t hidden, PieLoaderDType dtype) {
+    auto& c = b.contract();
+
+    // Claim every tensor the template will read. A group reads through a
+    // template, so no node names these and `publish_remaining` would otherwise
+    // publish all E of them as ordinary resident tensors.
+    std::vector<std::uint32_t> consumed;
+    for (std::int64_t e = 0; e < num_experts; ++e) {
+        const std::string tag = prefix + std::to_string(e) + ".";
+        for (const char* suffix : {"gate_proj.weight", "up_proj.weight", "down_proj.weight"}) {
+            const SourceTensor* part = b.find(tag + suffix);
+            if (part == nullptr) {
+                fail("qwen moe expert group: layer " + std::to_string(layer) + " expert " +
+                     std::to_string(e) + " missing gate/up/down");
+            }
+            consumed.push_back(part->id);
+        }
+    }
+
+    const Node gate_src = c.index_src(prefix + "{}.gate_proj.weight");
+    const Node up_src = c.index_src(prefix + "{}.up_proj.weight");
+    // Named the way the bound tensors beside it are named, minus the trailing
+    // dot: the driver resolves a group next to the weights it binds.
+    auto group = c.group(bound.substr(0, bound.size() - 1),
+                         static_cast<std::uint32_t>(num_experts));
+    // Rank 2, not 3: with no expert axis to stack along there is nothing to
+    // give the leading 1 to. The per-expert GEMM indexes the slab by `e` today
+    // and reads a slot base instead when streaming, so this is the shape it
+    // already wanted.
+    group.define("gate_up_proj",
+                 c.concat(gate_second ? std::vector<Node>{up_src, gate_src}
+                                      : std::vector<Node>{gate_src, up_src},
+                          0),
+                 pie_loader::raw(dtype))
+        .expect({2 * inter, hidden});
+    group.define("down_proj", c.index_src(prefix + "{}.down_proj.weight"),
+                 pie_loader::raw(dtype))
+        .expect({hidden, inter});
+
+    for (std::uint32_t id : consumed) {
+        b.consume(id);
+    }
+}
+
 inline void hf_moe_expert_stacks(
     ContractBuilder& b, bool gate_second, bool float_only = false) {
     if (b.target().tp_size != 1) {
@@ -1329,6 +1390,12 @@ inline void hf_moe_expert_stacks(
         if (!is_dense_addressable(gate0->encoding)) {
             fail("qwen moe expert stack: '" + std::string(gate0->name) +
                  "' has a non-affine packed encoding");
+        }
+
+        if (b.stream_routed_experts()) {
+            hf_moe_streamed_expert_groups(b, gate_second, layer, bound, prefix,
+                                          num_experts, inter, hidden, dtype);
+            continue;
         }
 
         std::vector<Node> gate_up_parts;

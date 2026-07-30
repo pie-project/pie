@@ -87,6 +87,12 @@ struct Qwen3_5MoeLayerWeights {
     const DeviceTensor* moe_gate_up_proj  = nullptr;  // [E, 2*I_moe, H] bf16
     const DeviceTensor* moe_down_proj     = nullptr;  // [E, H, I_moe] bf16
 
+    // Streamed routed experts. Set instead of the two pointers above when the
+    // contract declared the experts as a group: there is no fused slab to
+    // index, so the per-expert path asks the cache for one expert at a time.
+    GroupStreamCache* expert_cache = nullptr;
+    std::size_t expert_group = 0;
+
     // Shared expert (standard SwiGLU MLP, intermediate = shared_I)
     const DeviceTensor* shared_gate_proj  = nullptr;  // [I_shared, H]
     const DeviceTensor* shared_up_proj    = nullptr;  // [I_shared, H]

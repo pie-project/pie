@@ -275,6 +275,11 @@ int qwen35_moe_decode_fast_max_tokens() {
     return max_tokens;
 }
 
+// Force the general (per-expert) dispatch even for shapes the decode fast path
+// would take. Streaming already lands here because it has no fused slab to
+// stride, so this is what makes "same weights, same path" a runnable
+// comparison: without it a resident/streamed diff confounds the residency
+// change with a change of kernel.
 // The routed decode GEMMs are M=1 streaming reads. A dedicated GEMV beats
 // `cublasGemmBatchedEx` on them; see `moe_decode_gemv_bf16_kernel`.
 bool qwen35_moe_gemv_decode_enabled() {
@@ -646,6 +651,14 @@ inline void rmsnorm_bf16_dispatch(
 }
 
 }  // namespace
+
+bool qwen35_moe_force_general_path() {
+    static const bool on = [] {
+        const char* v = std::getenv("PIE_QWEN35_MOE_FORCE_GENERAL");
+        return v != nullptr && v[0] == '1';
+    }();
+    return on;
+}
 
 Qwen3_5MoeMlpWorkspace Qwen3_5MoeMlpWorkspace::allocate(
     int max_tokens, int hidden, int num_experts, int top_k,
@@ -1515,9 +1528,15 @@ bool moe_block(
     // has to apply the sigmoid scalar gate.
     bool moe_shared_folded = false;
     NcclComm* tp = (T > 1) ? fwd_cfg.tp_comm : nullptr;
+    // Streamed experts have no fused slab, so every device-side path that
+    // builds pointer arrays by striding one is off the table. The general
+    // path already dispatches one expert at a time, which is exactly the
+    // granularity a slot has.
+    const bool streamed = Lw.expert_cache != nullptr;
     const bool use_decode_fast_path =
-        is_pure_decode ||
-        (N > 0 && N <= qwen35_moe_decode_fast_max_tokens());
+        !streamed && !qwen35_moe_force_general_path() &&
+        (is_pure_decode ||
+         (N > 0 && N <= qwen35_moe_decode_fast_max_tokens()));
     if (moe_path_log_enabled()) {
         // One line per distinct (N, pure_decode, path) triple, so a whole
         // run reports which shapes took which path without 40 lines per
@@ -2011,9 +2030,26 @@ bool moe_block(
                         moe_ws.expert_in.data(),
                         Ne, H, stream);
 
-                    const auto* gate_up_w = static_cast<const std::uint16_t*>(
-                                                Lw.moe_gate_up_proj->data())
-                                            + e * expert_stride_gu;
+                    const std::uint16_t* gate_up_w = nullptr;
+                    const std::uint16_t* down_w = nullptr;
+                    if (streamed) {
+                        // Page it in. The slot holds exactly what one stride of
+                        // the stack would have held: the group's plan is the
+                        // stack's expression with the expert axis removed.
+                        const WeightStore& slot = Lw.expert_cache->ensure_resident(
+                            Lw.expert_group, static_cast<std::uint32_t>(e), stream);
+                        gate_up_w = static_cast<const std::uint16_t*>(
+                            slot.get("gate_up_proj").data());
+                        down_w = static_cast<const std::uint16_t*>(
+                            slot.get("down_proj").data());
+                    } else {
+                        gate_up_w = static_cast<const std::uint16_t*>(
+                                        Lw.moe_gate_up_proj->data())
+                                    + e * expert_stride_gu;
+                        down_w = static_cast<const std::uint16_t*>(
+                                     Lw.moe_down_proj->data())
+                                 + e * expert_stride_dn;
+                    }
                     ops::gemm_act_x_wt_bf16(cublas.handle(),
                         moe_ws.expert_in.data(), gate_up_w,
                         moe_ws.expert_gate_up.data(), Ne, 2 * Im, H);
@@ -2024,9 +2060,6 @@ bool moe_block(
                         Ne, Im, stream,
                         /*gate_second=*/moe_gate_up_swapped());
 
-                    const auto* down_w = static_cast<const std::uint16_t*>(
-                                             Lw.moe_down_proj->data())
-                                         + e * expert_stride_dn;
                     ops::gemm_act_x_wt_bf16(cublas.handle(),
                         moe_ws.expert_act.data(), down_w,
                         moe_ws.expert_out.data(), Ne, H, Im);
@@ -2035,6 +2068,16 @@ bool moe_block(
                         ws.norm_y.data(), moe_ws.expert_out.data(),
                         moe_ws.expert_idx.data(), moe_ws.expert_w.data(),
                         Ne, H, stream);
+
+                    if (streamed) {
+                        // Unpin per expert, not per layer: the pin then covers
+                        // exactly the launches that read the slot. Holding a
+                        // whole layer's routed set would make the slab's
+                        // minimum size the number of experts a step happens to
+                        // route to. Nothing races -- a later page-in that wants
+                        // this slot syncs `stream` before overwriting it.
+                        Lw.expert_cache->end_batch();
+                    }
                 }
             });
     }
