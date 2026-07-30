@@ -2182,13 +2182,24 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
             return false;
         }
         if (err != nullptr) {
-            *err = "Metal has gemma4's decode DAG (" +
+            // What is missing is now the executor, and nothing below it. The
+            // model computes: `gemma4_forward_test` runs this checkpoint through
+            // the decode DAG and gets mlx-lm's argmax at position 0 and again at
+            // position 7 with seven positions of KV behind it, every tap of all
+            // 35 layers above 0.9989 cosine. Both paths have pipelines, launch
+            // shapes, constants and binders; `gemma4_pso_test` proves the M>1
+            // side resolves and that every slot it reads is bound.
+            //
+            // `Impl` is what does not: its state is `DecodeGeometry`, qwen3.5's
+            // `Dispatch`, `ScratchSchedule` and `BoundDecode`, plus a KV pool
+            // and the linear-attention slots, and gemma4's types feed none of
+            // them.
+            *err = "Metal computes gemma4 (" +
                    std::to_string(gemma4::build_gemma4_dag(g4).size()) +
                    " dispatches over " + std::to_string(g4.n_layers) +
-                   " layers) but not its prefill: the family's own kernels "
-                   "(sdpa_sliding, geglu_tanh, ple_combine, layer_scalar, "
-                   "logit_softcap) exist only in their M=1 form, so a prompt "
-                   "cannot be processed";
+                   " layers, decode and prefill, numerics verified against "
+                   "mlx-lm) but MetalExecutor::Impl is still qwen3.5-shaped, so "
+                   "there is nothing to run it through";
         }
         return false;
     }
