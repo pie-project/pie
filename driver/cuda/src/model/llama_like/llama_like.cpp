@@ -575,6 +575,21 @@ void llama_like_forward_paged(
     std::optional<LoraFireState> lora_state;
     if (has_lora) {
         lora_state.emplace(*lora, cfg, N, H, Hq, Hk, I, T, stream);
+        // Co-batch evidence, PIE_HOOK_PREFIX_TRACE's pattern: one line per
+        // fire proving how many request rows this fire carries (R) and how
+        // many of them are adapter lanes with which token spans. R > lanes'
+        // covered rows means adapter and no-adapter lanes shared the fire.
+        if (std::getenv("PIE_LORA_FIRE_TRACE") != nullptr) {
+            std::string spans;
+            for (std::uint32_t i = 0; i < lora->count; ++i) {
+                const LoraLaneView& lane = lora->lanes[i];
+                spans += (i == 0 ? "" : ",");
+                spans += std::to_string(lane.token_start) + "+" +
+                         std::to_string(lane.token_count);
+            }
+            std::fprintf(stderr, "[lora-fire] R=%d lanes=%u spans=%s\n",
+                         R, lora->count, spans.c_str());
+        }
     }
 
     // When head_dim is padded, the attention kernel runs at `dk`

@@ -65,3 +65,64 @@ Live mixed workload, 3× naive-baseline + 1× trackb-snapkv, 24–48 tok:
   `[hook-prefix] R=.. fast_rows=.. fused=..` once per fire at layer 0.
 - quest-attention needs `envelope_dot` (KV envelopes), capability-gated off
   in this config — snapkv/h2o are the hook-path exercisers.
+
+## Stage 4 — cache_domain × adapters (why there is no digest fold yet)
+
+The concern: `cache_domain` (runtime/engine/src/store/kv/hash.rs:30) is
+per-STORE (boot nonce), adapters are per-INSTANCE, and KV produced under a
+LoRA correction is not the vanilla model's KV — so two instances with
+different adapters (or one with, one without) must never share prefix pages
+through the semantic-hash chain. Recon of every `chain_token_slot_hash`
+caller, verdict first: **adapter-carrying instances cannot reach any
+prefix-sharing path in the production build today**, so an adapter digest
+folded into the slot-hash domain would be unreachable machinery. Documented
+here instead; one latent seam was closed (below).
+
+Evidence, per hashing site:
+
+- The standard PTIR fire path never creates matchable identity. It commits
+  pages via `prepare_explicit_reserved` (pipeline/fire.rs:487) with EMPTY
+  `token_hashes` and no page hash — nothing to index, nothing to match.
+- The prefix-sharing consumer is compiled out of production:
+  `KvStore::lookup_cached_page` is `#[cfg(test)]`; the `#[cfg(not(test))]`
+  body returns `None` (store/kv.rs:1119), so `adopt_cached_prefix` can
+  never hit, and `fire::kv::match_prefix` has no production caller
+  (increment 2a, store tests only).
+- The one production producer of canonical hashes is the prefill-offload
+  path (offload.rs:1356 scratch prepare + `adopt_offloaded_prefix`,
+  store/kv.rs:1247). Its `mutates_context` gate (offload.rs:1279) rejects
+  any program with a non-Epilogue stage carrying ops — the lora prologue is
+  exactly that. The rejection is semantically required, not incidental: the
+  remote surrogate runs a plain context-extension program that does not
+  carry the adapter, so an offloaded lora prefill would compute WRONG KV
+  before hashing even enters the picture.
+- No adapter identity reaches any hashing site anyway. The sites see
+  `store.domain()` only; the adapter contents are per-instance channel
+  seeds ("an adapter swap is a channel re-seed, never a re-trace",
+  driver/cuda/src/model/lora.hpp) and are NOT in the container or the
+  program hash (`ChannelDecl` carries just `seeded: bool`) — two instances
+  with different adapters share one program identity.
+
+The latent seam, closed this chunk: `canonical_kv_shape`
+(pipeline/fire/kv.rs) — the unit-tested bind-time gate that increment 2a
+will wire into the fire path — accepted prologue programs on the claim that
+they "only shape sampling". The lora sink falsified that claim: a prologue
+`SinkCall` folds an adapter delta into the q/v projections (hidden states,
+hence KV at every layer). Had the gate gone live as written, a lora
+instance would have hashed canonically under the bare store domain and its
+KV could impersonate (or adopt) no-adapter KV. The gate now rejects a
+`SinkCall` in any stage (`lora` and `minference_sparse` both perturb KV;
+second-party sinks have unknown semantics and must not be presumed
+canonical); sink-free prologues stay canonical. Boolean gate, unwired in
+production, hash functions untouched — no existing hash moves (pinned by
+the untouched chain/page-hash tests; full engine suite 369/369 green).
+
+When sharing between SAME-adapter instances is actually wanted, the honest
+shape is a derived domain — `blake3(store_domain ‖ adapter_digest)` with
+the digest taken over the instance's seeded lora-channel bytes at
+registration (contents, not program identity) — handed to the hashing
+sites alongside `store.domain()`; no-adapter instances keep the store
+domain byte-for-byte. That needs the seed bytes plumbed from instance
+registration to `fire::kv`, and only pays once lora fires can pass a
+(relaxed, lora-aware) canonical gate — deferred until increment 2a gives
+it a consumer.
