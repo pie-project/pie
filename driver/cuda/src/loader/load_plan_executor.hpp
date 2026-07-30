@@ -67,13 +67,22 @@ struct LoadPlanExecution {
 
 class LoadPlanExecutor {
 public:
+    /// `lent_copy_engine` is for a caller that runs many short plans -- a
+    /// group cache paging one instance per miss. An engine creates its copy
+    /// streams and pinned pool lazily and tears them down with itself, which
+    /// is free amortised over a whole model load and is the dominant cost of
+    /// a page-in that moves a few megabytes. Lending one hoists that setup out
+    /// of the loop. Null means own one, which is the resident load.
     LoadPlanExecutor(
         pie_loader::CheckpointSource& loader,
         WeightStoreBuilder& weights,
-        std::vector<RustQuantAttachment> quant_attachments)
+        std::vector<RustQuantAttachment> quant_attachments,
+        WeightCopyEngine* lent_copy_engine = nullptr)
         : loader_(loader),
           weights_(weights),
-          quant_attachments_(std::move(quant_attachments))
+          quant_attachments_(std::move(quant_attachments)),
+          copy_engine_(lent_copy_engine != nullptr ? *lent_copy_engine
+                                                   : owned_copy_engine_)
     {}
 
     LoadExecutionStats execute(const pie_loader::LoadPlanView& plan)
@@ -611,7 +620,9 @@ private:
     std::uint8_t* persistent_arena_base_ = nullptr;
     std::uint64_t persistent_arena_bytes_ = 0;
     // Host->device copy path (streams, pinned staging, reader lanes, batching).
-    WeightCopyEngine copy_engine_{loader_};
+    // Unused, and so never spun up, when the caller lends one.
+    WeightCopyEngine owned_copy_engine_{loader_};
+    WeightCopyEngine& copy_engine_;
     pie_loader::LoadPlanIndex plan_index_{"load plan executor"};
     BufferResolver resolver_{buffers_, finalized_buffer_names_, weights_};
     TranscodeEngine transcode_{loader_, copy_engine_, plan_index_, resolver_};

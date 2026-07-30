@@ -81,8 +81,7 @@ public:
                     return;
                 }
             }
-            cudaStream_t stream = copy_streams_[next_copy_stream_];
-            next_copy_stream_ = (next_copy_stream_ + 1) % copy_streams_.size();
+            cudaStream_t stream = next_stream();
             if (batched_copies_enabled()) {
                 enqueue_batched_copy(shard_id, file_offset, span_bytes, dst, stream);
             } else {
@@ -135,9 +134,7 @@ public:
     cudaStream_t acquire_stream()
     {
         ensure_copy_streams();
-        cudaStream_t stream = copy_streams_[next_copy_stream_];
-        next_copy_stream_ = (next_copy_stream_ + 1) % copy_streams_.size();
-        return stream;
+        return next_stream();
     }
 #endif
 
@@ -151,8 +148,16 @@ public:
         PhaseTimer _pt(stats_ != nullptr ? &stats_->phase_transfer_ms
                                          : &transfer_ms_sink_);
         flush_batched_copies();
-        for (auto stream : copy_streams_) {
-            CUDA_CHECK(cudaStreamSynchronize(stream));
+        // Only the streams this flush's copies actually landed on. Syncing an
+        // idle stream is not free -- it is a driver round trip of the same
+        // order as a small copy -- and a plan flushes several times, so a
+        // whole-pool sweep costs stream-count times flush-count round trips
+        // whatever the plan moved. Immaterial when a plan moves a model;
+        // most of a page-in when it moves one expert.
+        for (std::size_t i = 0; i < copy_streams_.size(); ++i) {
+            if (!stream_used_[i]) continue;
+            CUDA_CHECK(cudaStreamSynchronize(copy_streams_[i]));
+            stream_used_[i] = false;
         }
         release_inflight_pinned_slots();
         if (stats_ != nullptr) {
@@ -236,9 +241,19 @@ private:
             count = std::min<std::size_t>(streams, loader_config::kCopyStreamsMax);
         }
         copy_streams_.resize(count);
+        stream_used_.assign(count, false);
         for (auto& stream : copy_streams_) {
             CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         }
+    }
+
+    /// The next stream in the rotation, marked as owing a sync at flush.
+    cudaStream_t next_stream()
+    {
+        const std::size_t i = next_copy_stream_;
+        next_copy_stream_ = (next_copy_stream_ + 1) % copy_streams_.size();
+        stream_used_[i] = true;
+        return copy_streams_[i];
     }
 
     void ensure_pinned_slots()
@@ -297,8 +312,7 @@ private:
             pinned_pool_capacity_bytes_ += next_capacity;
         }
 
-        cudaStream_t stream = copy_streams_[next_copy_stream_];
-        next_copy_stream_ = (next_copy_stream_ + 1) % copy_streams_.size();
+        cudaStream_t stream = next_stream();
         loader_.read_storage_bytes_to_host(shard_id, file_offset, span_bytes, slot.ptr);
         CUDA_CHECK(cudaMemcpyAsync(
             dst, slot.ptr, span_bytes, cudaMemcpyHostToDevice, stream));
@@ -484,6 +498,8 @@ private:
 #if PIE_CUDA_WEIGHT_COPY_ENGINE_HAS_CUDA
     std::vector<cudaStream_t> copy_streams_;
     std::size_t next_copy_stream_ = 0;
+    /// Which streams have had work queued since the last flush.
+    std::vector<bool> stream_used_;
     std::vector<PendingCopy> pending_copies_;
     std::vector<PinnedSlot> pinned_slots_;
     std::size_t next_pinned_slot_ = 0;

@@ -34,6 +34,9 @@
 // Single-threaded, like the forward pass that calls it. `ensure_resident`
 // blocks until the instance is there.
 
+#include <chrono>
+#include <ostream>
+#include <iostream>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -52,6 +55,8 @@
 
 #include "loader/group_slot_index.hpp"
 #include "loader/load_plan_executor.hpp"
+#include "loader/loader_config.hpp"
+#include "loader/weight_copy_engine.hpp"
 #include "model/weight_store.hpp"
 #include "tensor.hpp"
 
@@ -121,7 +126,54 @@ public:
         allocate_slab();
     }
 
-    ~GroupStreamCache() { free_slab(); }
+    ~GroupStreamCache() {
+        // Also on a bare env var, not only under the boot config's verbose:
+        // measuring paging is a thing one does to an otherwise ordinary run,
+        // and the rest of verbose is a wall of load-time noise.
+        if (verbose_ || loader_config::env_truthy("PIE_CUDA_STREAM_STATS")) {
+            report(std::cerr);
+        }
+        free_slab();
+    }
+
+    /// What paging actually cost, in the terms the next decision needs.
+    ///
+    /// Hit rate says whether the slab is big enough; ns/miss and MiB/s say
+    /// whether the source is fast enough. They point at different fixes -- a
+    /// larger slab versus a faster tier or a prefetch -- and a run that is
+    /// slow for the second reason will not improve by any amount of the first.
+    void report(std::ostream& out) const {
+        const Stats s = stats();
+        const std::uint64_t accesses = s.hits + s.misses;
+        if (accesses == 0) return;
+        // Warm-up held out of both the rate and the per-miss cost.
+        const std::uint64_t steady_ns =
+            s.page_in_ns > s.first_page_in_ns ? s.page_in_ns - s.first_page_in_ns : 0;
+        const std::uint64_t steady_misses = s.misses > 1 ? s.misses - 1 : 0;
+        const double page_in_ms = static_cast<double>(steady_ns) / 1e6;
+        const double secs = static_cast<double>(steady_ns) / 1e9;
+        out << "[pie-driver-cuda] group stream cache: " << accesses
+            << " accesses, " << (100.0 * static_cast<double>(s.hits) /
+                                 static_cast<double>(accesses))
+            << "% hit, " << s.misses << " page-ins ("
+            << (static_cast<double>(s.first_page_in_ns) / 1e6)
+            << " ms of warm-up held out), "
+            << (steady_misses == 0
+                    ? 0.0
+                    : static_cast<double>(steady_ns) / 1e3 /
+                          static_cast<double>(steady_misses))
+            << " us each, of "
+            << (s.misses == 0 ? 0.0
+                              : static_cast<double>(s.bytes_paged_in) /
+                                    static_cast<double>(s.misses) / 1048576.0)
+            << " MiB in " << page_in_ms << " ms ("
+            << (secs == 0.0 ? 0.0
+                            : static_cast<double>(s.bytes_paged_in) / 1048576.0 / secs)
+            << " MiB/s), " << (static_cast<double>(s.evict_wait_ns) / 1e6)
+            << " ms waiting to evict; of the page-in, alloc " << s.alloc_ms
+            << " ms, transfer " << s.transfer_ms << " ms, transform "
+            << s.transform_ms << " ms\n";
+    }
 
     GroupStreamCache(const GroupStreamCache&) = delete;
     GroupStreamCache& operator=(const GroupStreamCache&) = delete;
@@ -185,7 +237,11 @@ public:
         const auto acquired = index_.acquire(key);
         ++stats_.misses;
         if (acquired.evicted) {
+            const auto started = Clock::now();
             sync_stream(compute_stream);
+            stats_.evict_wait_ns += static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    Clock::now() - started).count());
         }
         fill(acquired.slot, group, instance);
         return slot_stores_[acquired.slot];
@@ -199,6 +255,26 @@ public:
         std::uint64_t hits = 0;
         std::uint64_t misses = 0;
         std::uint64_t bytes_paged_in = 0;
+        /// Wall time inside `fill`, which is the whole of a miss: reading the
+        /// checkpoint, any transform, and the copy. Blocking, so it is time
+        /// the forward pass did not spend computing.
+        std::uint64_t page_in_ns = 0;
+        /// Wall time spent waiting on the compute stream before overwriting a
+        /// slot. Separated because it is the cost of the slab being too small
+        /// rather than of the bytes moving, and the two want different fixes.
+        std::uint64_t evict_wait_ns = 0;
+        /// The page-in split the way a fix would be: allocating the plan's
+        /// buffers, moving the bytes, running the transform. A miss of a few
+        /// megabytes is not bandwidth-bound, so which of these dominates is
+        /// the whole question.
+        double alloc_ms = 0;
+        double transfer_ms = 0;
+        double transform_ms = 0;
+        /// The first page-in, held out of the rest. It pays for the copy
+        /// engine's streams and staging pool, and at a few hundred
+        /// microseconds against a steady-state miss of a few tens it would
+        /// otherwise dominate the average and hide what a miss really costs.
+        std::uint64_t first_page_in_ns = 0;
     };
 
     Stats stats() const noexcept {
@@ -235,7 +311,11 @@ private:
         const auto& group = groups_.ptr[group_index];
         WeightStore scratch;
         WeightStoreBuilder builder(scratch);
-        LoadPlanExecutor executor(loader_, builder, {});
+        // One copy engine for the life of the cache, not one per page-in: it
+        // creates copy streams and a pinned pool on first use and drops them
+        // with itself, and at a few megabytes a miss that setup is most of
+        // the cost.
+        LoadPlanExecutor executor(loader_, builder, {}, &copy_engine_);
 
         LoadPlanExecution how;
         how.persistent_arena = slot_base(slot);
@@ -254,8 +334,17 @@ private:
             how.source_binding_count = per_instance;
         }
 
+        const auto started = Clock::now();
         const auto stats = executor.execute(*group.plan, how);
         stats_.bytes_paged_in += stats.h2d_copy_bytes;
+        const std::uint64_t elapsed_ns = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                Clock::now() - started).count());
+        if (stats_.misses == 1) stats_.first_page_in_ns = elapsed_ns;
+        stats_.alloc_ms += stats.phase_alloc_ms;
+        stats_.transfer_ms += stats.phase_transfer_ms;
+        stats_.transform_ms += stats.phase_transform_ms;
+        stats_.page_in_ns += elapsed_ns;
 
         if (!slot_filled_[slot]) {
             slot_stores_[slot] = std::move(scratch);
@@ -318,7 +407,10 @@ private:
         }
     }
 
+    using Clock = std::chrono::steady_clock;
+
     pie_loader::CheckpointSource& loader_;
+    WeightCopyEngine copy_engine_{loader_};
     pie_loader::PieLoaderGroupSlice groups_;
     /// Where each group's instances start in the one flat key space.
     std::vector<std::uint64_t> group_base_;
