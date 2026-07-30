@@ -92,6 +92,7 @@ if(APPLE)
     src/batch/golden_tap.cpp
     src/batch/scratch.cpp
     src/model/qwen3_5/decode_consts.cpp
+    src/model/gemma4/kernels.cpp
     src/model/qwen3_5/decode_step.cpp
     src/model/qwen3_5/decode_step_mb.cpp
     src/kernels/decode_psos.cpp
@@ -433,6 +434,10 @@ add_test(NAME executor_worker_test COMMAND executor_worker_test)
 if(APPLE)
   add_metal_linked_test(ptir_m0_device_test tests/ptir_m0_device_test.cpp)
   add_metal_linked_test(kv_append_paged_pso_test tests/kv_append_paged_pso_test.cpp)
+  # The six gemma4 kernels that shipped with no PSO entry and no binder.
+  add_metal_linked_test(gemma4_pso_test tests/gemma4_pso_test.cpp)
+  target_compile_definitions(gemma4_pso_test PRIVATE
+    PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
   add_metal_linked_test(decode_step_mb_test tests/decode_step_mb_test.cpp)
   add_metal_linked_test(kv_pool_lifecycle_test tests/kv_pool_lifecycle_test.cpp)
   # `heap_bind.cpp`'s `case K::Fill` on a real heap.

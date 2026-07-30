@@ -312,6 +312,39 @@ struct ArgmaxParams {
 // GdnCore+GatedRms = 2 dispatches), layer-less = 3 (embed/final_norm/logits).
 // Total ≈ 3 + 6*20 + 18*15 = 393 dispatches / 363 golden taps. Argmax = optional I3
 // substrate (no golden tag). Metal-4 encode ~0.05ms → GPU-exec is the gate; GdnCore=1 the lever.
+// ── Gemma 4 ────────────────────────────────────────────────────────────────
+// Six kernels shipped with this family's bring-up and were never bound to
+// anything: their .metal sources exist, and nothing named their buffers. These
+// are those ABIs, written against the sources rather than from memory.
+//
+// The params structs they take are mirrored host-side in the gemma4 consts.
+
+// sdpa_sliding.metal `sdpa_vector_decode_swa`. bind::Sdpa's layout plus the
+// window, deliberately: the shared prefix means one binder serves both, and a
+// sliding layer differs from a full one only by that last value.
+enum class SdpaSliding : uint8_t {
+    Q = 0, K = 1, V = 2, Out = 3, GqaFactor = 4, N = 5,
+    KHeadStride = 6, KSeqStride = 7, VHeadStride = 8, VSeqStride = 9, Scale = 10,
+    Window = 11,   // attend the last `window` positions; <=0 means all of them
+};
+
+// geglu_tanh.metal: out = gelu_tanh(gate) * up. Gemma's FFN nonlinearity, where
+// qwen3.5 uses SwiGLU — same two operands, different curve.
+enum class Geglu : uint8_t { Gate = 0, Up = 1, Out = 2, Params = 3 };
+
+// logit_softcap.metal: out = cap * tanh(logits / cap), over the vocabulary.
+enum class Softcap : uint8_t { Logits = 0, Out = 1, Params = 2 };
+
+// layer_scalar.metal: out = x * scalar[0]. A learned per-layer gain, broadcast.
+enum class LayerScalar : uint8_t { X = 0, Scalar = 1, Out = 2, Params = 3 };
+
+// ple_combine.metal: out = (proj + token) * 1/sqrt(2), over n_layers*ple_dim.
+enum class PleCombine : uint8_t { Proj = 0, Token = 1, Out = 2, Params = 3 };
+
+// vnorm.metal `vnorm_single_row`: RMS with NO learnable weight, applied to V
+// before the KV write. Distinct from bind::Rms, which always has one.
+enum class VNorm : uint8_t { X = 0, Out = 1, Params = 2 };
+
 enum class Kernel : uint8_t {
     EmbedGather,
     // GDN in-projection (4 separate projections: qkv/z 4-bit, a/b DENSE bf16):
