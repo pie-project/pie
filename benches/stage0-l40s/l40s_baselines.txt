@@ -1,0 +1,27 @@
+
+==============================================================================
+all adapters at rank 16 (the case the point solution was built for)
+==============================================================================
+  K    separate      padded        tart   vs separate   vs padded     tok=
+  --------------------------------------------------------------------------
+  2      507.0m      304.7m      304.0m         1.67x       1.00x  100.00%   plan chose batched
+  4      945.4m      303.8m      304.5m         3.11x       1.00x  100.00%   plan chose batched
+  8     1872.0m      306.4m      306.2m         6.11x       1.00x  100.00%   plan chose batched
+ 16     3754.5m      313.2m      307.6m        12.21x       1.02x  100.00%   plan chose batched
+ 32     7521.8m      314.1m      303.9m        24.75x       1.03x  100.00%   plan chose batched
+
+==============================================================================
+ranks 8-128 mixed (what LoRAServe reports in production)
+==============================================================================
+  K    separate      padded        tart   vs separate   vs padded     tok=
+  --------------------------------------------------------------------------
+  2      498.2m      302.9m      302.3m         1.65x       1.00x  100.00%   plan chose padded
+  4      935.6m      305.7m      306.2m         3.06x       1.00x  100.00%   plan chose padded
+  8     1864.2m      307.7m      309.3m         6.03x       0.99x  100.00%   plan chose padded
+ 16     3752.8m      311.5m      311.8m        12.04x       1.00x  100.00%   plan chose padded
+ 32     7406.3m      327.8m      327.8m        22.59x       1.00x  100.00%   plan chose padded
+
+  `vs padded` at 1.0 is the expected and correct result. On the axis punica and
+  S-LoRA cover, the general mechanism does not beat the hand-written kernel --
+  it ADOPTS its strategy and matches it. What it adds is the axes they do
+  not cover at all, where `separate` is the only alternative that exists.

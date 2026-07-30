@@ -271,7 +271,13 @@ class PieClient:
         if not ok:
             raise Exception(f"Username '{username}' rejected by server: {result}")
 
-        if result == "Authenticated (Engine disabled authentication)":
+        if result in (
+            "Authenticated (Engine disabled authentication)",
+            # Gateway-fronted sessions arrive pre-authenticated (the edge
+            # supplied the identity via `x-pie-identity`); the engine answers
+            # identify with this instead of a challenge.
+            "Already authenticated",
+        ):
             return
 
         if private_key is None:
