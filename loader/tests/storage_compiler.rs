@@ -534,6 +534,42 @@ fn gpt_oss_native_mxfp4_default_abi_lowers_to_repack_tile_maps() {
     assert!(program.memory.transform_scratch_peak_bytes > 0);
 }
 
+/// A repack declaration is checked against its transform like every other node.
+///
+/// The `Repack` arm used to be the one path through `Builder::tensor` that
+/// inferred a type and then discarded it, taking `to.shape` as the answer
+/// instead of comparing the two. A declaration that disagreed with the
+/// transform compiled silently, and the plan carried the transform's shape
+/// under the declaration's name. Found by adding 7 to each of gpt-oss's six
+/// repack declarations and watching a clean plan come out; this is that
+/// experiment kept.
+#[test]
+fn a_repack_declaration_is_checked_against_its_transform() {
+    let target = StorageTarget {
+        backend: BackendKind::Cuda,
+        tile_map_mask: pie_loader::plan::CUDA_TILE_MAP_MASK,
+        native_mxfp4_moe: true,
+        ..StorageTarget::default()
+    };
+    let mut contract = stored_contract("gpt_oss_native_mxfp4");
+    let repacked = contract
+        .tensors
+        .iter_mut()
+        .find(|tensor| matches!(tensor.expr, Expr::Repack { .. }))
+        .expect("the gpt-oss contract repacks");
+    let name = repacked.name.clone();
+    repacked
+        .shape
+        .as_mut()
+        .expect("a repack declaration states its shape")[1] += 7;
+
+    let error = compile_load_plan(&gpt_oss_mxfp4_metadata(), &contract, target)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains(&name), "{error}");
+    assert!(error.contains("declares shape"), "{error}");
+}
+
 /// GPT-OSS's gate and up halves are the even and odd rows of one block.
 ///
 /// Each is now an `Expr::Stride`, so each repack reads only the rows it wants:
@@ -993,6 +1029,37 @@ fn a_scale_whose_declared_shape_is_wrong_is_rejected() {
         .unwrap_err()
         .to_string();
     assert!(error.contains("declares shape [4]"), "{error}");
+}
+
+/// Every path through the compiler names the contract its error came from.
+///
+/// `Builder::tensor` used to annotate the affine path at the call site and the
+/// kernel paths call by call, so the same mistake read `'out': declares shape
+/// [4] ...` through one and `declares shape [4] ...` through the other. In a
+/// contract with hundreds of tensors the second message names nothing. The
+/// annotation now happens once, at the boundary, for every path.
+#[test]
+fn every_path_names_the_contract_its_error_came_from() {
+    for expr in [
+        Expr::src("a"),
+        Expr::src("a").scale(0.5),
+        Expr::src("a").cast(Encoding::Raw(DType::F16)),
+    ] {
+        let node = expr.node_name();
+        let contract = ModelContract {
+            alignment: 256,
+            tensors: vec![TensorContract::new(
+                "out",
+                expr,
+                vec![99],
+                Encoding::Raw(DType::F32),
+            )],
+        };
+        let error = compile_load_plan(&metadata(), &contract, StorageTarget::default())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("'out'"), "{node}: {error}");
+    }
 }
 
 /// A checkpoint holding one block-scaled MXFP4 tensor and its factors.

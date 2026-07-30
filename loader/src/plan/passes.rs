@@ -12,8 +12,13 @@
 //! `rewrite` rewrites the schedule, `memory` recounts it, and `validate`
 //! only refuses. Nothing here is re-exported as a prelude — a pass names what
 //! it uses, so moving one is a matter of moving its imports with it.
+//!
+//! That last split is also a [`Stage`]: the validators come last because what
+//! they prove has to hold of the plan the compiler hands back, and a rewrite
+//! scheduled after one would quietly void it. `run_passes` enforces the
+//! ordering rather than leaving it to whoever appends the next line.
 
-use crate::plan::pass::Pass;
+use crate::plan::pass::{Pass, Stage};
 
 mod arena;
 mod memory;
@@ -34,42 +39,52 @@ pub fn all() -> &'static [Pass] {
     &[
         Pass {
             name: "assign-persistent-offsets",
+            stage: Stage::Rewrite,
             run: arena::assign_persistent_offsets,
         },
         Pass {
             name: "coalesce-persistent-arena-writes",
+            stage: Stage::Rewrite,
             run: rewrite::coalesce_persistent_arena_writes,
         },
         Pass {
             name: "hoist-bulk-arena-writes",
+            stage: Stage::Rewrite,
             run: rewrite::hoist_bulk_extent_writes,
         },
         Pass {
             name: "group-shared-source-reads",
+            stage: Stage::Rewrite,
             run: rewrite::group_shared_source_reads,
         },
         Pass {
             name: "merge-adjacent-extent-writes",
+            stage: Stage::Rewrite,
             run: rewrite::merge_adjacent_extent_writes,
         },
         Pass {
             name: "recompute-memory-plan",
+            stage: Stage::Rewrite,
             run: memory::recompute_memory_plan,
         },
         Pass {
             name: "validate-fill-order",
+            stage: Stage::Check,
             run: validate::validate_fill_order,
         },
         Pass {
             name: "validate-target-support",
+            stage: Stage::Check,
             run: validate::validate_target_support,
         },
         Pass {
             name: "validate-scale-factors",
+            stage: Stage::Check,
             run: validate::validate_scale_factors,
         },
         Pass {
             name: "validate-persistent-layout",
+            stage: Stage::Check,
             run: validate::validate_persistent_layout,
         },
     ]

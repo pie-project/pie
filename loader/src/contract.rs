@@ -623,6 +623,28 @@ pub fn resolve_extents(requested: &[i64], total: i64) -> Result<Vec<i64>, Error>
 }
 
 impl Expr {
+    /// The node's name in the algebra, for diagnostics.
+    ///
+    /// This is the constructor's own name, not a description: it is what the
+    /// table in this module's documentation calls the node, so an error can
+    /// say which cell a rejected expression came from.
+    pub fn node_name(&self) -> &'static str {
+        match self {
+            Expr::Src(_) => "Src",
+            Expr::Out(_) => "Out",
+            Expr::Fill { .. } => "Fill",
+            Expr::Slice { .. } => "Slice",
+            Expr::Stride { .. } => "Stride",
+            Expr::Gather { .. } => "Gather",
+            Expr::Concat { .. } => "Concat",
+            Expr::Transmute { .. } => "Transmute",
+            Expr::Shard { .. } => "Shard",
+            Expr::Repack { .. } => "Repack",
+            Expr::Cast { .. } => "Cast",
+            Expr::Scale { .. } => "Scale",
+        }
+    }
+
     pub fn src(name: impl Into<String>) -> Self {
         Expr::Src(name.into())
     }
