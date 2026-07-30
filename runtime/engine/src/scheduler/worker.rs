@@ -236,6 +236,11 @@ pub(crate) struct PendingRequest {
     /// wire class so the driver's hook-free fast prefix
     /// (`StageHooks::hook_free_prefix_rows`) covers every hook-free lane.
     pub(crate) hook_program: bool,
+    /// Whether this fire's program carries the pass-wide `lora`
+    /// configuration sink. Stamped at launch admission from the tracked
+    /// instance, exactly like `hook_program`; fire planning reads it as the
+    /// WEIGHT-class divergence fact (`fire_plan::MemberFacts::lora`).
+    pub(crate) lora_program: bool,
     pub(crate) prelaunch_copy: Option<crate::driver::KvCopyPlan>,
     pub(crate) prelaunch_state_copy: Option<StateCopyPlan>,
     /// Vesuvius frame identity: which lane/frame/slot this fire belongs to.
@@ -315,8 +320,9 @@ impl PendingRequest {
             pipeline_id,
             prebuilt,
             // Not known at construction: stamped at launch admission, where
-            // the tracked instance's program flag is available.
+            // the tracked instance's program flags are available.
             hook_program: false,
+            lora_program: false,
             prelaunch_copy,
             prelaunch_state_copy,
             frame,
@@ -768,6 +774,20 @@ enum LaneReply {
     },
 }
 
+/// Program-lifetime divergence facts, derived once at registration from the
+/// launch package. These are the per-program halves of fire planning's
+/// [`MemberFacts`](super::fire_plan::MemberFacts): stamped onto the tracked
+/// instance at bind commit, and from there onto each fire at launch
+/// admission. A missing registration degrades every flag to `false` — the
+/// row just doesn't join the corresponding fast path.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ProgramFacts {
+    /// Declares an attention-hook stage (OnAttnProj/OnAttn).
+    attention_hooks: bool,
+    /// Carries the pass-wide `lora` configuration sink.
+    lora_sink: bool,
+}
+
 /// The worker-side half of a control that the lane finished executing.
 enum LaneCommit {
     /// Nothing to commit — the lane already sent the response (pure driver
@@ -775,11 +795,11 @@ enum LaneCommit {
     /// closes, failed binds after lane-side rollback).
     None,
     /// A standalone program registration succeeded on the lane: record the
-    /// program's attention-hook flag in the worker's `program_attention` map
+    /// program's divergence facts in the worker's `program_facts` map
     /// (the response already went out lane-side).
     ProgramRegistered {
         program_id: crate::driver::instance::ProgramId,
-        attention_hooks: bool,
+        facts: ProgramFacts,
     },
     /// A successful bind: insert the instance, THEN respond (launch admission
     /// reads `instances` on the worker thread, so respond-after-insert is the
@@ -788,9 +808,9 @@ enum LaneCommit {
         pipeline_id: Option<ProcessId>,
         bound: BoundInstance,
         /// A program this combined control registered on the lane, with its
-        /// attention-hook flag — committed to `program_attention` before the
-        /// instance insert so `TrackedInstance` sees it.
-        registered_program: Option<(crate::driver::instance::ProgramId, bool)>,
+        /// divergence facts — committed to `program_facts` before the
+        /// instance insert so `TrackedInstance` sees them.
+        registered_program: Option<(crate::driver::instance::ProgramId, ProgramFacts)>,
         respond: BindRespond,
     },
     /// A bind control completed without creating an instance.
@@ -1047,6 +1067,34 @@ impl DriverLane {
             .any(|stage| stage.kind == 1 || stage.kind == 2)
     }
 
+    /// Whether the program carries the pass-wide `lora` configuration sink:
+    /// a `SinkCall` op in any stage whose name-table entry is `"lora"`
+    /// (`pie_ir::registry::KNOWN_SINKS`). Read off the launch package's
+    /// stage ops directly (`LaunchOp.code` is the PTIR wire tag,
+    /// `name_index` points into the program-wide name table) rather than
+    /// the grouped-plan `PIE_STAGE_REQUIRES_LORA` flag, whose derivation
+    /// walk can abort early on a stage the grouped path rejects.
+    fn declares_lora_sink(plan: &ProgramRegistration) -> bool {
+        plan.launch.stages.iter().any(|stage| {
+            stage.ops.iter().any(|op| {
+                op.code == u16::from(pie_ir::op::tags::SINK_CALL)
+                    && plan
+                        .launch
+                        .names
+                        .get(op.name_index as usize)
+                        .is_some_and(|name| name == "lora")
+            })
+        })
+    }
+
+    /// The divergence facts a registration commits program-lifetime.
+    fn program_facts(plan: &ProgramRegistration) -> ProgramFacts {
+        ProgramFacts {
+            attention_hooks: Self::declares_attention_hooks(plan),
+            lora_sink: Self::declares_lora_sink(plan),
+        }
+    }
+
     /// The driver half of the old `dispatch_ordered_item`: everything a
     /// control does against the driver and the lane-owned `channels` set,
     /// with worker-map effects returned as a [`LaneCommit`]. Failures respond
@@ -1132,11 +1180,11 @@ impl DriverLane {
                             );
                         }
                         // Even on a cancelled RPC the program stays registered
-                        // driver-lifetime, so its hook flag is still worth
-                        // recording.
+                        // driver-lifetime, so its divergence facts are still
+                        // worth recording.
                         LaneCommit::ProgramRegistered {
                             program_id,
-                            attention_hooks: Self::declares_attention_hooks(&plan),
+                            facts: Self::program_facts(&plan),
                         }
                     }
                     Err(error) => {
@@ -1324,9 +1372,8 @@ impl DriverLane {
                 }
                 let probe_t1 = bind_probe.then(Instant::now);
                 let program_registered = program.is_some();
-                let program_attention_hooks = program
-                    .as_ref()
-                    .map(|plan| Self::declares_attention_hooks(plan));
+                let registered_program_facts =
+                    program.as_ref().map(|plan| Self::program_facts(plan));
                 if let Some(plan) = &program {
                     match driver.register_program(plan) {
                         Ok(program_id) => bind.program_id = program_id,
@@ -1382,8 +1429,8 @@ impl DriverLane {
                         LaneCommit::BindInstance {
                             pipeline_id,
                             bound,
-                            registered_program: program_attention_hooks
-                                .map(|attention_hooks| (bind.program_id, attention_hooks)),
+                            registered_program: registered_program_facts
+                                .map(|facts| (bind.program_id, facts)),
                             respond: BindRespond::ChannelsBind {
                                 registered,
                                 program_id: bind.program_id,
@@ -2344,12 +2391,13 @@ impl BatchScheduler {
         let mut lane_inflight: u64 = 0;
         let mut lane_token: u64 = 0;
         let mut instances = HashMap::new();
-        // Program-lifetime attention-hook flags, mirroring `instances`:
+        // Program-lifetime divergence facts, mirroring `instances`:
         // populated when a registration commits back from the lane, read at
         // bind commit to stamp the tracked instance (and from there each
-        // fire at admission) so the batch layout can sort hook-carrying rows
-        // last within their wire class.
-        let mut program_attention: HashMap<crate::driver::instance::ProgramId, bool> =
+        // fire at admission) so fire planning sees each member's axes —
+        // hook-carrying rows sort last within their wire class, lora rows
+        // mark the WEIGHT-class site.
+        let mut program_facts: HashMap<crate::driver::instance::ProgramId, ProgramFacts> =
             HashMap::new();
         let mut pending = PendingQueue::default();
         let mut scan_cache = ScanCache::default();
@@ -2427,7 +2475,7 @@ impl BatchScheduler {
                             &mut in_flight_launches,
                             &mut in_flight_control,
                             &mut instances,
-                            &mut program_attention,
+                            &mut program_facts,
                             &mut frame_policy,
                             &nudge_tx,
                         );
@@ -2676,7 +2724,7 @@ impl BatchScheduler {
                         &mut in_flight_launches,
                         &mut in_flight_control,
                         &mut instances,
-                        &mut program_attention,
+                        &mut program_facts,
                         &mut frame_policy,
                         &nudge_tx,
                     );
@@ -2916,12 +2964,15 @@ impl BatchScheduler {
                     }
                     launch.completion.reject_unsubmitted(message);
                 } else {
-                    // Stamp the attention-hook flag off the tracked instance
-                    // (admission just validated the id): the batch layout
-                    // sorts hook-carrying rows last within their wire class
-                    // so the driver's hook-free fast prefix is maximal.
+                    // Stamp the program's divergence facts off the tracked
+                    // instance (admission just validated the id): fire
+                    // planning sorts hook-carrying rows last within their
+                    // wire class so the driver's hook-free fast prefix is
+                    // maximal, and reads the lora flag as the WEIGHT-class
+                    // site fact.
                     if let Some(instance) = instances.get(&launch.instance_id) {
-                        launch.hook_program = instance.hook_program;
+                        launch.hook_program = instance.facts.attention_hooks;
+                        launch.lora_program = instance.facts.lora_sink;
                     }
                     // The default single-slot deployment: every tracked fire
                     // IS a one-fire frame. Synthesizing the stamp at accept
@@ -4705,7 +4756,7 @@ impl BatchScheduler {
         in_flight_launches: &mut VecDeque<PendingLaunchBatch>,
         in_flight_control: &mut Option<PendingControl>,
         instances: &mut HashMap<u64, TrackedInstance>,
-        program_attention: &mut HashMap<crate::driver::instance::ProgramId, bool>,
+        program_facts: &mut HashMap<crate::driver::instance::ProgramId, ProgramFacts>,
         frame_policy: &mut FramePolicy,
         rollback_tx: &crossbeam::channel::Sender<SchedulerItem>,
     ) {
@@ -4766,11 +4817,8 @@ impl BatchScheduler {
             }
             LaneReply::ControlDone { token, commit } => match commit {
                 LaneCommit::None => {}
-                LaneCommit::ProgramRegistered {
-                    program_id,
-                    attention_hooks,
-                } => {
-                    program_attention.insert(program_id, attention_hooks);
+                LaneCommit::ProgramRegistered { program_id, facts } => {
+                    program_facts.insert(program_id, facts);
                 }
                 LaneCommit::BindFinished { pipeline_id } => {
                     frame_policy.on_bind_completed(pipeline_id);
@@ -4785,9 +4833,9 @@ impl BatchScheduler {
                     // Record the combined control's program registration
                     // FIRST (even if the bind commit below refuses): the
                     // program is driver-lifetime either way, and the tracked
-                    // instance's flag reads this map.
-                    if let Some((program_id, attention_hooks)) = registered_program {
-                        program_attention.insert(program_id, attention_hooks);
+                    // instance's flags read this map.
+                    if let Some((program_id, facts)) = registered_program {
+                        program_facts.insert(program_id, facts);
                     }
                     if instances.contains_key(&bound.instance_id) {
                         // Practically unreachable: driver-assigned ids are
@@ -4812,13 +4860,14 @@ impl BatchScheduler {
                     }
                     let instance_id = bound.instance_id;
                     // Missing map entry (program registered before this code
-                    // shipped, or an unregistered id) degrades to `false`:
-                    // the row just doesn't join the hook-free fast prefix.
-                    let hook_program = program_attention
+                    // shipped, or an unregistered id) degrades to all-false:
+                    // the row just doesn't join the hook-free fast prefix or
+                    // the lora site.
+                    let facts = program_facts
                         .get(&bound.program_id)
                         .copied()
-                        .unwrap_or(false);
-                    instances.insert(instance_id, TrackedInstance::from_bound(&bound, hook_program));
+                        .unwrap_or_default();
+                    instances.insert(instance_id, TrackedInstance::from_bound(&bound, facts));
                     // Respond AFTER the insert: launch admission reads
                     // `instances` on this thread, so the guest's first fire
                     // (sent only after this response) is always admissible.
@@ -4972,19 +5021,19 @@ struct TrackedInstance {
     wait_slots: Arc<crate::driver::instance::BoundWaitSlots>,
     in_flight: usize,
     next_target_epoch: u64,
-    /// Whether the bound program declares an attention-hook stage
-    /// (OnAttnProj/OnAttn); copied onto each fire at launch admission.
-    hook_program: bool,
+    /// The bound program's divergence facts (attention-hook stage,
+    /// lora sink); copied onto each fire at launch admission.
+    facts: ProgramFacts,
 }
 
 impl TrackedInstance {
-    fn from_bound(bound: &BoundInstance, hook_program: bool) -> Self {
+    fn from_bound(bound: &BoundInstance, facts: ProgramFacts) -> Self {
         Self {
             pacing_wait_id: bound.pacing_wait_id,
             wait_slots: bound.wait_slots(),
             in_flight: 0,
             next_target_epoch: pie_waker::FIRST_COMPLETION_EPOCH,
-            hook_program,
+            facts,
         }
     }
 
@@ -5377,7 +5426,7 @@ mod tests {
         let mut launches = VecDeque::new();
         let mut control = None;
         let mut instances = HashMap::new();
-        let mut program_attention = HashMap::new();
+        let mut program_facts = HashMap::new();
         let mut frame_policy = FramePolicy::new(1, 1, 4096, None);
 
         BatchScheduler::apply_lane_reply(
@@ -5394,7 +5443,7 @@ mod tests {
             &mut launches,
             &mut control,
             &mut instances,
-            &mut program_attention,
+            &mut program_facts,
             &mut frame_policy,
             &rollback_tx,
         );
@@ -5415,6 +5464,54 @@ mod tests {
                 .published(pacing_wait_id)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn program_facts_derive_hooks_and_lora_from_the_launch_package() {
+        use pie_driver_abi::plan::{LaunchOp, LaunchPackage, LaunchStage};
+
+        let plan = ProgramRegistration {
+            launch: LaunchPackage {
+                names: vec!["attn_page_mask".to_string(), "lora".to_string()],
+                stages: vec![
+                    // Prologue carrying the pass-wide lora sink (its one
+                    // T11-legal home).
+                    LaunchStage {
+                        kind: 0,
+                        ops: vec![LaunchOp {
+                            code: u16::from(pie_ir::op::tags::SINK_CALL),
+                            name_index: 1,
+                            ..LaunchOp::default()
+                        }],
+                        ..LaunchStage::default()
+                    },
+                    // An OnAttn hook stage.
+                    LaunchStage {
+                        kind: 2,
+                        ..LaunchStage::default()
+                    },
+                ],
+                ..LaunchPackage::default()
+            },
+            ..ProgramRegistration::default()
+        };
+        let facts = DriverLane::program_facts(&plan);
+        assert!(facts.attention_hooks);
+        assert!(facts.lora_sink);
+
+        // A sink call naming anything but "lora" is a different axis
+        // (the page mask), and a hook-free program stays hook-free.
+        let mut masked = plan.clone();
+        masked.launch.stages.truncate(1);
+        masked.launch.stages[0].ops[0].name_index = 0;
+        let facts = DriverLane::program_facts(&masked);
+        assert!(!facts.attention_hooks);
+        assert!(!facts.lora_sink);
+
+        // An empty registration (no launch package) degrades to all-false.
+        let facts = DriverLane::program_facts(&ProgramRegistration::default());
+        assert!(!facts.attention_hooks);
+        assert!(!facts.lora_sink);
     }
 
     #[tokio::test(flavor = "current_thread")]

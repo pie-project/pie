@@ -24,6 +24,7 @@
 
 pub(crate) mod batch;
 pub(crate) mod dispatch;
+pub(crate) mod fire_plan;
 pub(crate) mod frame;
 pub(crate) mod probe;
 pub(crate) mod stats;

@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use pie_driver_abi::PieTerminalCell;
 
+use super::fire_plan;
 use super::stats::SchedulerStats;
 use super::wire;
 use super::worker::PendingRequest;
@@ -288,10 +289,43 @@ pub(crate) fn build_frame_submission(
         // driver's hook-free prefix (`StageHooks::hook_free_prefix_rows`)
         // is the fused fast path, and a leading hook-free run that spans
         // ALL hook-free lanes makes that prefix maximal instead of ending
-        // at whichever hook lane happened to arrive first. Stable sort
-        // keeps arrival order otherwise.
-        let mut group = group;
-        group.sort_by_key(|req| (req.request.device_resolved_geometry, req.hook_program));
+        // at whichever hook lane happened to arrive first. Stable order
+        // keeps arrival otherwise. The permutation comes from the fire
+        // planner — the same key the inline sort here used to apply,
+        // generalized so the next divergence axis lands as planner data
+        // (`fire_plan::MemberFacts`) instead of a wider sort key; the
+        // plan's per-site lowerings are not consumed yet (v0).
+        let facts: Vec<fire_plan::MemberFacts> = group
+            .iter()
+            .enumerate()
+            .map(|(arrival, req)| fire_plan::MemberFacts {
+                hook_program: req.hook_program,
+                lora: req.lora_program,
+                device_resolved_geometry: req.request.device_resolved_geometry,
+                arrival,
+            })
+            .collect();
+        let plan = fire_plan::plan_fire(&facts);
+        debug_assert_eq!(
+            plan.member_order,
+            {
+                let mut order: Vec<usize> = (0..group.len()).collect();
+                order.sort_by_key(|&i| {
+                    (
+                        group[i].request.device_resolved_geometry,
+                        group[i].hook_program,
+                    )
+                });
+                order
+            },
+            "fire plan order must equal the stable sort it replaced"
+        );
+        let mut slots: Vec<Option<Box<PendingRequest>>> = group.into_iter().map(Some).collect();
+        let group: Vec<Box<PendingRequest>> = plan
+            .member_order
+            .iter()
+            .map(|&index| slots[index].take().expect("member_order is a permutation"))
+            .collect();
         let wire_count = group
             .iter()
             .take_while(|req| !req.request.device_resolved_geometry)
@@ -385,6 +419,7 @@ mod tests {
             pipeline_id: None,
             prebuilt,
             hook_program: false,
+            lora_program: false,
             prelaunch_copy: None,
             prelaunch_state_copy: None,
             frame: None,
