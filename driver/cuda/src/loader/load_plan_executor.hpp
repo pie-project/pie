@@ -145,7 +145,10 @@ public:
                 copy_engine_.flush();
                 {
                     PhaseTimer _pt(&stats.phase_transform_ms);
-                    transcode_.tile_map(instr.op.tile_map, stats);
+                    transcode_.tile_map(
+                        instr.op.tile_map,
+                        resolved_source(instr.id, instr.op.tile_map.source),
+                        stats);
                 }
                 break;
             case Tag::CreateView:
@@ -248,6 +251,7 @@ private:
             }
             persistent_arena_base_ = how.persistent_arena;
             persistent_arena_bytes_ = how.persistent_arena_bytes;
+            external_arena_ = true;
             return;
         }
         if (loader_config::env_truthy("PIE_CUDA_DISABLE_WEIGHT_ARENA")) {
@@ -492,6 +496,10 @@ private:
                    backing != arena_backing_names_.end()) {
             spec.ownership = TensorOwnershipKind::BorrowedView;
             spec.backing_tensor = backing->second;
+        } else if (external_arena_ && !buffer.mapped().owns_memory()) {
+            // Lent arena: nothing in this store owns these bytes, and nothing
+            // in it can, because the arena is the caller's.
+            spec.ownership = TensorOwnershipKind::External;
         }
         stats.loaded_bytes += buffer.mapped().nbytes();
         const std::string runtime_name = pie_loader::bytes_to_string(instr.name);
@@ -599,6 +607,7 @@ private:
     std::unordered_map<std::uint32_t, const pie_loader::PieLoaderSourceBindingView*>
         source_binding_by_instr_;
     std::string persistent_arena_name_;
+    bool external_arena_ = false;
     std::uint8_t* persistent_arena_base_ = nullptr;
     std::uint64_t persistent_arena_bytes_ = 0;
     // Host->device copy path (streams, pinned staging, reader lanes, batching).
