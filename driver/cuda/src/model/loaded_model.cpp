@@ -468,7 +468,10 @@ LoadedModel LoadedModel::load(
         const std::uint64_t budget = group_cache_budget(
             boot_cfg.model.expert_cache_gb, load_view.groups, verbose);
         e.group_cache_ = std::make_unique<GroupStreamCache>(
-            loader, load_view.groups, budget, verbose);
+            loader, load_view.groups, budget,
+            static_cast<std::uint64_t>(
+                boot_cfg.model.expert_host_cache_gb * 1024.0 * 1024.0 * 1024.0),
+            verbose);
         e.stream_source_ = std::move(source);
         e.stream_plan_ = std::make_unique<pie_loader::LoadPlan>(
             std::move(planned_load.plan));

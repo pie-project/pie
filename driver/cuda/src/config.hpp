@@ -38,6 +38,7 @@ struct ModelConfig {
     // one step touches thrashes, and no setting of this rescues that -- it is
     // a property of the model's top-k and the batch.
     double expert_cache_gb = 0.0;
+    double expert_host_cache_gb = 0.0;
 };
 
 struct BatchingConfig {
@@ -122,6 +123,14 @@ inline Config load_config(const std::filesystem::path& path) {
             throw std::runtime_error(
                 "config: [model].expert_cache_gb must not be negative "
                 "(0 = derive one at startup)");
+        }
+        c.model.expert_host_cache_gb =
+            (*m)["expert_host_cache_gb"].value_or<double>(
+                static_cast<double>(c.model.expert_host_cache_gb));
+        if (c.model.expert_host_cache_gb < 0.0) {
+            throw std::runtime_error(
+                "config: [model].expert_host_cache_gb must not be negative "
+                "(0 = no host tier)");
         }
     }
     if (auto b = tbl["batching"].as_table()) {

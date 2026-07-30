@@ -72,6 +72,7 @@ public:
         pie_loader::CheckpointSource& loader,
         pie_loader::PieLoaderGroupSlice groups,
         std::uint64_t budget_bytes,
+        std::uint64_t host_budget_bytes = 0,
         bool verbose = false)
         : loader_(loader), groups_(groups), verbose_(verbose)
     {
@@ -131,6 +132,7 @@ public:
         prefetch_enabled_ =
             !loader_config::env_present("PIE_CUDA_STREAM_NO_PREFETCH");
         allocate_slab();
+        allocate_host_tier(host_budget_bytes, total_instances);
     }
 
     ~GroupStreamCache() {
@@ -141,6 +143,7 @@ public:
             report(std::cerr);
         }
         free_slab();
+        free_host_tier();
     }
 
     /// What paging actually cost, in the terms the next decision needs.
@@ -178,7 +181,8 @@ public:
                             : static_cast<double>(s.bytes_paged_in) / 1048576.0 / secs)
             << " MiB/s), " << (static_cast<double>(s.evict_wait_ns) / 1e6)
             << " ms waiting to evict, " << s.prefetches
-            << " prefetched; of the page-in, alloc " << s.alloc_ms
+            << " prefetched, " << s.host_tier_hits << " from host tier of "
+            << host_slots_ << " slots; of the page-in, alloc " << s.alloc_ms
             << " ms, transfer " << s.transfer_ms << " ms, transform "
             << s.transform_ms << " ms\n";
     }
@@ -251,7 +255,7 @@ public:
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     Clock::now() - started).count());
         }
-        fill(acquired.slot, group, instance);
+        fill(acquired.slot, group, instance, key);
         return slot_stores_[acquired.slot];
     }
 
@@ -316,6 +320,10 @@ public:
         /// otherwise dominate the average and hide what a miss really costs.
         std::uint64_t first_page_in_ns = 0;
         std::uint64_t prefetches = 0;
+        /// Misses served from the host tier rather than the checkpoint. They
+        /// are still misses -- the slab did not hold the instance -- but they
+        /// cost one H2D instead of a read, a plan and a transform.
+        std::uint64_t host_tier_hits = 0;
     };
 
     Stats stats() const noexcept {
@@ -389,8 +397,59 @@ private:
         return static_cast<std::uint32_t>(group_base_[group]) + instance;
     }
 
-    void fill(std::uint32_t slot, std::size_t group_index, std::uint32_t instance)
+    /// Serve a slot from the host tier, if this instance is in it.
+    ///
+    /// A whole-slot copy, which is exactly right and is the point of the
+    /// tier: every instance lays its buffers out identically -- that is what
+    /// the group proved -- so a slot is a flat blob and one instance's is
+    /// interchangeable with another's byte for byte. Nothing has to be
+    /// re-planned, re-allocated or re-transformed; a tier hit is one H2D of
+    /// bytes that are already in the form the kernels read.
+    bool fill_from_host(std::uint32_t slot, std::uint32_t key)
     {
+        if (host_tier_ == nullptr || !slot_filled_[slot]) return false;
+        const auto found = host_of_.find(key);
+        if (found == host_of_.end()) return false;
+        CUDA_CHECK(cudaMemcpy(
+            slot_base(slot), host_slot(found->second), slot_bytes_,
+            cudaMemcpyHostToDevice));
+        ++stats_.host_tier_hits;
+        stats_.bytes_paged_in += slot_bytes_;
+        return true;
+    }
+
+    /// Keep this instance in host memory, if the tier has room.
+    ///
+    /// Fill-once and never evict. A tier that thrashes is worse than no tier
+    /// -- every eviction paid a D2H that bought nothing -- and with the tier
+    /// sized in instances the operator asked for, refusing to overcommit is
+    /// the whole policy. Which instances win is arrival order, which for a
+    /// routed model is the first step's routing, and no worse a guess than
+    /// any other before a run has been observed.
+    void keep_in_host(std::uint32_t slot, std::uint32_t key)
+    {
+        if (host_tier_ == nullptr || host_of_.count(key) != 0) return;
+        if (host_of_.size() >= host_slots_) return;
+        const std::uint32_t at = static_cast<std::uint32_t>(host_of_.size());
+        CUDA_CHECK(cudaMemcpy(
+            host_slot(at), slot_base(slot), slot_bytes_, cudaMemcpyDeviceToHost));
+        host_of_.emplace(key, at);
+    }
+
+    std::uint8_t* host_slot(std::uint32_t at) const noexcept {
+        return host_tier_ + static_cast<std::uint64_t>(at) * slot_bytes_;
+    }
+
+    void fill(std::uint32_t slot, std::size_t group_index,
+              std::uint32_t instance, std::uint32_t key)
+    {
+        const auto started_total = Clock::now();
+        if (fill_from_host(slot, key)) {
+            stats_.page_in_ns += static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    Clock::now() - started_total).count());
+            return;
+        }
         const auto& group = groups_.ptr[group_index];
         WeightStore scratch;
         WeightStoreBuilder builder(scratch);
@@ -435,6 +494,7 @@ private:
         } else {
             check_layout_held(slot, scratch, flatten(group_index, instance));
         }
+        keep_in_host(slot, key);
     }
 
     /// The invariant the whole design rests on: a page-in replaces bytes, not
@@ -473,6 +533,43 @@ private:
         }
     }
 
+    /// Pin `host_budget_bytes` of host memory as a second tier.
+    ///
+    /// Pinned, because unpinned host memory would make every tier hit a staged
+    /// copy through a bounce buffer and give back most of what the tier is
+    /// for. Sized in whole slots and never more than the whole group: a tier
+    /// larger than the group is memory that can never be used.
+    void allocate_host_tier(std::uint64_t host_budget_bytes,
+                            std::uint64_t total_instances)
+    {
+        if (host_budget_bytes < slot_bytes_) return;
+        std::uint64_t slots = host_budget_bytes / slot_bytes_;
+        if (slots > total_instances) slots = total_instances;
+        const cudaError_t err = cudaHostAlloc(
+            reinterpret_cast<void**>(&host_tier_),
+            static_cast<std::size_t>(slots * slot_bytes_), cudaHostAllocDefault);
+        if (err != cudaSuccess) {
+            // Not fatal: without a tier every miss reads the checkpoint, which
+            // is the behaviour this is an optimisation over.
+            host_tier_ = nullptr;
+            if (verbose_) {
+                std::cerr << "[pie-driver-cuda] group stream cache: no host "
+                             "tier (" << cudaGetErrorString(err) << ")\n";
+            }
+            return;
+        }
+        host_slots_ = static_cast<std::uint32_t>(slots);
+        host_of_.reserve(host_slots_);
+    }
+
+    void free_host_tier() noexcept
+    {
+        if (host_tier_ != nullptr) {
+            cudaFreeHost(host_tier_);
+            host_tier_ = nullptr;
+        }
+    }
+
     void free_slab() noexcept
     {
         if (slab_ != nullptr) {
@@ -504,6 +601,10 @@ private:
 
     std::uint64_t slot_bytes_ = 0;
     std::uint8_t* slab_ = nullptr;
+    /// The host tier: pinned, slot-shaped, fill-once.
+    std::uint8_t* host_tier_ = nullptr;
+    std::uint32_t host_slots_ = 0;
+    std::unordered_map<std::uint32_t, std::uint32_t> host_of_;
 
     GroupSlotIndex index_;
     std::vector<WeightStore> slot_stores_;

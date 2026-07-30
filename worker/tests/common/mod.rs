@@ -59,7 +59,16 @@ pub fn cuda_toml_for(snapshot_path: &str) -> String {
     let streaming = if std::env::var("PIE_CUDA_TEST_STREAM_EXPERTS").as_deref() == Ok("1") {
         let gb = std::env::var("PIE_CUDA_TEST_EXPERT_CACHE_GB")
             .unwrap_or_else(|_| "0".to_string());
-        format!("stream_routed_experts = true\nexpert_cache_gb = {gb}\n")
+        {
+            let host = std::env::var("PIE_CUDA_TEST_EXPERT_HOST_CACHE_GB")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(0.0);
+            format!(
+                "stream_routed_experts = true\nexpert_cache_gb = {gb}\n\
+                 expert_host_cache_gb = {host}\n"
+            )
+        }
     } else {
         String::new()
     };

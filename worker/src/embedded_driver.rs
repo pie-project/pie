@@ -321,6 +321,10 @@ pub(crate) fn write_cuda_startup_toml(
         "expert_cache_gb".into(),
         toml::Value::Float(opts.expert_cache_gb),
     );
+    model.insert(
+        "expert_host_cache_gb".into(),
+        toml::Value::Float(opts.expert_host_cache_gb),
+    );
     insert_bool(
         &mut model,
         "enable_system_speculation",
