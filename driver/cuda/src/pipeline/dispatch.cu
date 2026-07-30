@@ -6420,19 +6420,64 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
         // (frame.cpp) takes the composed batch from R to its request
         // bucket with device-side pad rows, so the template no longer
         // requires R to sit exactly on the lattice.
-        if (staged == nullptr ||
-            page_size == 0 || device_pages == 0 ||
-            !view.rs_slot_ids.empty() ||
-            !view.rs_fold_lens.empty() ||
-            !view.rs_buffer_slot_ids.empty() ||
-            view.kv_translation_indptr.size() != n_prog + 1 ||
-            view.kv_translation_indptr.data()[0] != 0 ||
-            view.kv_translation_indptr.data()[n_prog] !=
-                view.kv_translation.size() ||
-            view.ptir_kv_write_lower_bounds.size() != n_prog ||
-            view.ptir_kv_write_upper_bounds.size() != n_prog) {
+        // Plain per-request RS slots ride through untouched: this template
+        // resolves *geometry* (tokens, positions, pages), and the slot->request
+        // attribution is host data that `compose_forward_batch` copies and that
+        // graph padding extends with `graph_pad_slot`. A fold or a buffered
+        // working set is different -- both change the batch's shape -- so those
+        // two still refuse.
+        //
+        // Refusing on `rs_slot_ids` too is what shut every recurrent-state
+        // family out of device composition, which is the only path that can
+        // resolve a chained descriptor: the host readback fallback cannot see a
+        // value the producing fire has not committed yet, so a decode step that
+        // reads the prefill's sampled token never became ready.
+        const bool trace_compose = [] {
+            const char* v = std::getenv("PIE_TRACE_DEVICE_COMPOSE");
+            return v != nullptr && v[0] != '\0' && v[0] != '0';
+        }();
+        auto refuse = [&](const char* why) {
+            if (trace_compose) {
+                std::fprintf(stderr, "[compose] refused: %s\n", why);
+                std::fflush(stderr);
+            }
             return false;
+        };
+        if (staged == nullptr) return refuse("no staged launch");
+        if (page_size == 0 || device_pages == 0) return refuse("no kv pages");
+        // A *bound* fold-length array is not a fold. The runtime carries one
+        // entry per request for every recurrent-state family, and on an
+        // ordinary decode step every entry is zero -- the state advances by
+        // the step's own token, with nothing to replay. Only a non-zero
+        // length reshapes the batch, and only that has to refuse.
+        {
+            const auto folds = view.rs_fold_lens.as<std::uint32_t>();
+            std::size_t nonzero = 0;
+            for (std::size_t i = 0; i < folds.size(); ++i) {
+                if (folds[i] != 0) ++nonzero;
+            }
+            if (nonzero != 0) {
+                if (trace_compose) {
+                    std::fprintf(stderr,
+                                 "[compose] refused: rs fold (%zu/%zu non-zero)\n",
+                                 nonzero, folds.size());
+                    std::fflush(stderr);
+                }
+                return false;
+            }
         }
+        if (!view.rs_buffer_slot_ids.empty()) return refuse("rs buffer");
+        if (view.kv_translation_indptr.size() != n_prog + 1)
+            return refuse("kv_translation_indptr size");
+        if (view.kv_translation_indptr.data()[0] != 0)
+            return refuse("kv_translation_indptr[0]");
+        if (view.kv_translation_indptr.data()[n_prog] !=
+            view.kv_translation.size())
+            return refuse("kv_translation_indptr tail");
+        if (view.ptir_kv_write_lower_bounds.size() != n_prog)
+            return refuse("kv_write_lower_bounds size");
+        if (view.ptir_kv_write_upper_bounds.size() != n_prog)
+            return refuse("kv_write_upper_bounds size");
         ResolvedPrograms candidate;
         candidate.per_program.resize(n_prog);
         candidate.is_device_geometry.assign(n_prog, 0);
@@ -6462,7 +6507,7 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
             if (instance.geometry_class !=
                     PIE_GEOMETRY_CLASS_DECODE_ENVELOPE ||
                 instance.trace == nullptr) {
-                return false;
+                return refuse("geometry class not decode-envelope");
             }
             const Trace& trace = *instance.trace;
             std::array<const PortBinding*, 10> dynamic{};
