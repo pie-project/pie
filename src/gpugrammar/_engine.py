@@ -5111,6 +5111,47 @@ class DeviceBatch:
             return self.mask
         return self._fill()
 
+    def compact(self, capacity: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """The mask as sorted token ids, `(ids, counts)`, both on the device.
+
+        A sampler that is handed a vocabulary-wide mask sorts, scans and
+        normalises the whole vocabulary to draw one token from a few hundred.
+        Handed the set instead it does the work the constraint actually
+        implies - which is why a constrained step can be *cheaper* than an
+        unconstrained one, and why nobody has done it: the set has to already
+        be on the device, and everywhere else it is a mask on its way to the
+        host.
+
+        `counts` is the true size of each set whatever `capacity` is, so a
+        caller can always tell that a list was truncated rather than silently
+        sampling from a prefix of it.
+        """
+        from gpugrammar import _gpugrammar
+
+        if capacity <= 0:
+            raise ValueError("capacity must be positive")
+        held = getattr(self, "_allowed", None)
+        if held is None or held.shape != (self.batch, capacity):
+            self._allowed = torch.zeros(
+                (self.batch, capacity), dtype=torch.int32, device=self.device
+            )
+            self._allowed_count = torch.zeros(
+                self.batch, dtype=torch.int32, device=self.device
+            )
+        _gpugrammar.cuda_launch(
+            "gg_compact",
+            self.batch,
+            256,
+            torch.cuda.current_stream().cuda_stream,
+            [
+                self.mask.data_ptr(),
+                self._allowed.data_ptr(),
+                self._allowed_count.data_ptr(),
+            ],
+            [self.grammar.mask_words, capacity, self.grammar.vocab_size],
+        )
+        return self._allowed, self._allowed_count
+
     def _count_and_scan(self, grammar, rows, counts, offsets, skip, unit) -> None:
         """Count each configuration's work and prefix-sum it.
 

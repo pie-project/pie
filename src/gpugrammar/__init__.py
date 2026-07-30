@@ -20,6 +20,9 @@ The shortest useful program:
     mask = batch.fill_mask()                        # (64, words) on the device
     batch.advance(sampled_tokens)                   # (64,) on the device
 
+    # Or skip the vocabulary-wide mask entirely and sample from the set:
+    ids, counts = batch.allowed()                  # (64, cap), (64,) on device
+
 `fill_mask` and `advance` are both capturable: call `batch.capture()` once and
 every later call replays a recorded graph, with no host work and no
 synchronisation on the path. That is the property the design exists for.
@@ -244,6 +247,25 @@ class Batch:
         called, which is the deployed path.
         """
         return self._batch.fill_mask()
+
+    def allowed(self, capacity: int = 4096):
+        """The allowed tokens as sorted ids, `(ids, counts)`, on the device.
+
+        The set the mask stands for, without the vocabulary-wide detour. A
+        sampler handed this draws from a few hundred candidates instead of
+        sorting a hundred and fifty thousand, which is how a constrained step
+        becomes cheaper than an unconstrained one rather than more expensive.
+
+        `ids` is `(batch, capacity)` and only the first `counts[i]` entries of
+        row `i` mean anything. `counts` is the *true* size of each set even
+        where it exceeds `capacity`, so a caller can see that a row was
+        truncated and fall back to `fill_mask` for it - which is what the dense
+        regime wants anyway, since a JSON string body admits most of the
+        vocabulary and gathering it buys nothing.
+
+        Call after `fill_mask` or `step`; it reads the mask those produced.
+        """
+        return self._batch.compact(capacity)
 
     def advance(self, tokens) -> None:
         """Consume one sampled token per sequence, `(batch,)` on the device.

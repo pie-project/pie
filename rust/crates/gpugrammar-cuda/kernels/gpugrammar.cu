@@ -18,3 +18,4 @@
 #include "mask.cuh"
 #include "memo.cuh"
 #include "fused.cuh"
+#include "compact.cuh"

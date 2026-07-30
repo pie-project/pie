@@ -503,3 +503,71 @@ class ATokenOutsideTheVocabulary(unittest.TestCase):
         rows = mask.to(torch.int32).view(4, -1).ne(0).sum(1).tolist()
         self.assertGreater(rows[0], 0)
         self.assertEqual(rows[0], rows[2])
+
+
+class TheAllowedSetIsTheMask(unittest.TestCase):
+    """`allowed` must name exactly the tokens the mask admits, in order.
+
+    The set is what a fused sampler draws from, so a bit the compaction drops
+    is a token the model can never choose and a bit it invents is one the
+    grammar forbids. Checked against the mask itself rather than against a
+    second implementation of the same idea.
+    """
+
+    def _filled(self, size=6):
+        _requirements()
+        engine = gpugrammar.Engine(VOCABULARY)
+        grammar = engine.compile_json_schema(SCHEMA)
+        batch = engine.batch(size=size)
+        batch.set_grammars([grammar] * size)
+        matchers = []
+        for row in range(size):
+            matcher = grammar.matcher(0)
+            for _ in range(row):
+                allowed = matcher.allowed_tokens()
+                if not allowed or not matcher.accept_token(allowed[0]):
+                    break
+            matchers.append(matcher)
+        batch.set_matchers(matchers)
+        return engine, batch, batch.fill_mask()
+
+    def test_it_names_exactly_the_bits_the_mask_sets(self):
+        engine, batch, mask = self._filled()
+        ids, counts = batch.allowed(4096)
+        torch.cuda.synchronize()
+        words = mask.view(batch.size, -1).cpu()
+        for row in range(batch.size):
+            wanted = [
+                token
+                for token in range(len(VOCABULARY))
+                if (int(words[row][token >> 5]) >> (token & 31)) & 1
+            ]
+            self.assertEqual(ids[row, : int(counts[row])].tolist(), wanted)
+
+    def test_no_bit_above_the_vocabulary_is_named(self):
+        # A row is a whole number of words, so its last one runs past the
+        # vocabulary. Those bits are nobody's token.
+        engine, batch, _ = self._filled()
+        ids, counts = batch.allowed(4096)
+        torch.cuda.synchronize()
+        for row in range(batch.size):
+            held = ids[row, : int(counts[row])]
+            if held.numel():
+                self.assertLess(int(held.max()), len(VOCABULARY))
+
+    def test_the_count_is_true_even_when_the_buffer_is_not(self):
+        # A caller that cannot tell a truncated list from a complete one
+        # samples from a prefix and never knows.
+        engine, batch, mask = self._filled()
+        _, full = batch.allowed(4096)
+        torch.cuda.synchronize()
+        expected = [int(x) for x in full]
+        ids, counts = batch.allowed(2)
+        torch.cuda.synchronize()
+        self.assertEqual([int(x) for x in counts], expected)
+        self.assertEqual(ids.shape[1], 2)
+
+    def test_a_capacity_of_zero_is_refused(self):
+        _, batch, _ = self._filled(size=2)
+        with self.assertRaises(ValueError):
+            batch.allowed(0)
