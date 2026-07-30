@@ -729,6 +729,16 @@ pub struct CudaNativeDriverOptions {
     pub mtp_assistant_snapshot_dir: String,
     /// Maximum number of MTP draft tokens returned per system-spec step.
     pub mtp_num_drafts: u32,
+    /// Page routed MoE experts through a bounded VRAM slab instead of keeping
+    /// every expert resident. Bounds the resident set by the slab rather than
+    /// by the model, which is what lets a large MoE run on a GPU that cannot
+    /// hold it. Off by default: for a model that fits, this is strictly
+    /// slower, and it disables CUDA graph capture besides.
+    pub stream_routed_experts: bool,
+    /// The expert slab, in GiB. 0 = derive one at startup from what is left
+    /// after the resident weights and the KV pool. Ignored unless
+    /// `stream_routed_experts` is set.
+    pub expert_cache_gb: f64,
     /// Operator opt-in for system speculation (MTP). Default false: the runtime
     /// drives the auto-drafter only when this is true. Speculation is a
     /// latency-regime win (helps at low batch, costs at compute saturation), so
@@ -767,6 +777,8 @@ impl Default for CudaNativeDriverOptions {
             mxfp4_moe: "auto".to_string(),
             mtp_assistant_snapshot_dir: String::new(),
             mtp_num_drafts: 3,
+            stream_routed_experts: false,
+            expert_cache_gb: 0.0,
             enable_system_speculation: false,
             ready_timeout_s: 600.0,
             shutdown_timeout_s: 5.0,
@@ -803,6 +815,11 @@ impl CudaNativeDriverOptions {
         ensure!(
             self.mtp_num_drafts <= 32,
             "model.driver.options.mtp_num_drafts must be in 0..=32"
+        );
+        ensure!(
+            self.expert_cache_gb.is_finite() && self.expert_cache_gb >= 0.0,
+            "model.driver.options.expert_cache_gb must be >= 0 (0 = derive one \
+             at startup)"
         );
         Ok(())
     }

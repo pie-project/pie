@@ -24,6 +24,20 @@ struct ModelConfig {
     std::string device = "cuda:0";
     std::string dtype = "bfloat16";
     int mtp_num_drafts = 3;
+
+    // Page routed MoE experts through a bounded VRAM slab instead of keeping
+    // all of them resident. Trades throughput for a resident set that is
+    // bounded by the slab rather than by the model, which is what lets a large
+    // MoE run on a GPU that cannot hold it.
+    //
+    // Off by default: for a model that fits, this is strictly slower.
+    bool stream_routed_experts = false;
+
+    // The slab, in GiB. 0 = derive one at startup from what is left after the
+    // resident weights and the KV pool. A slab too small to hold the experts
+    // one step touches thrashes, and no setting of this rescues that -- it is
+    // a property of the model's top-k and the batch.
+    double expert_cache_gb = 0.0;
 };
 
 struct BatchingConfig {
@@ -98,6 +112,17 @@ inline Config load_config(const std::filesystem::path& path) {
         c.model.dtype         = (*m)["dtype"].value_or(c.model.dtype);
         c.model.mtp_num_drafts = static_cast<int>(
             (*m)["mtp_num_drafts"].value_or<int64_t>(c.model.mtp_num_drafts));
+        c.model.stream_routed_experts =
+            (*m)["stream_routed_experts"].value_or(
+                c.model.stream_routed_experts);
+        c.model.expert_cache_gb =
+            (*m)["expert_cache_gb"].value_or<double>(
+                static_cast<double>(c.model.expert_cache_gb));
+        if (c.model.expert_cache_gb < 0.0) {
+            throw std::runtime_error(
+                "config: [model].expert_cache_gb must not be negative "
+                "(0 = derive one at startup)");
+        }
     }
     if (auto b = tbl["batching"].as_table()) {
         constexpr std::string_view allowed[] = {

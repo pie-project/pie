@@ -314,6 +314,15 @@ pub(crate) fn write_cuda_startup_toml(
     insert_int(&mut model, "mtp_num_drafts", opts.mtp_num_drafts);
     insert_bool(
         &mut model,
+        "stream_routed_experts",
+        opts.stream_routed_experts,
+    );
+    model.insert(
+        "expert_cache_gb".into(),
+        toml::Value::Float(opts.expert_cache_gb),
+    );
+    insert_bool(
+        &mut model,
         "enable_system_speculation",
         opts.enable_system_speculation,
     );
@@ -934,6 +943,13 @@ mod tests {
         assert_eq!(val["batching"]["total_pages"].as_integer().unwrap(), 0);
         assert_eq!(val["batching"].as_table().unwrap().len(), 6);
         assert_eq!(val["batching"]["swap_pool_size"].as_integer().unwrap(), 0);
+        // Expert streaming is off unless an operator asks for it: for a model
+        // that fits it is strictly slower, and it costs graph capture besides.
+        assert_eq!(
+            val["model"]["stream_routed_experts"].as_bool().unwrap(),
+            false
+        );
+        assert_eq!(val["model"]["expert_cache_gb"].as_float().unwrap(), 0.0);
         assert_eq!(val["runtime"]["verbose"].as_bool().unwrap(), false);
     }
 
