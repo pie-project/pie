@@ -3514,6 +3514,47 @@ bool Dispatch::launch_has_attention_stages(
     return false;
 }
 
+std::uint32_t Dispatch::launch_hook_free_prefix_rows(
+    const pie_native::LaunchView& view) const {
+    const std::size_t n_prog = view.ptir_program_hashes.size();
+    // Per-program row attribution is the only way to LOCATE a hook, so its
+    // absence means "no fast prefix", not "no hooks".
+    if (view.ptir_program_row_indptr.size() != n_prog + 1) return 0;
+    const std::uint32_t* row_indptr = view.ptir_program_row_indptr.data();
+    const std::uint32_t total_rows = row_indptr[n_prog];
+    if (total_rows == 0) return 0;
+
+    const auto has_attention_stages = [&](std::size_t program) {
+        const auto* plans =
+            impl_->cache.plans(view.ptir_program_hashes.data()[program]);
+        if (plans == nullptr) return false;
+        return std::any_of(
+            plans->begin(), plans->end(),
+            [](const plan::StagePlan& stage) {
+                return stage.stage == PTIR_STAGE_ON_ATTN_PROJ ||
+                    stage.stage == PTIR_STAGE_ON_ATTN;
+            });
+    };
+
+    std::uint32_t first_hook_row = total_rows;
+    for (std::size_t program = 0; program < n_prog; ++program) {
+        if (!has_attention_stages(program)) continue;
+        const std::uint32_t lo = row_indptr[program];
+        const std::uint32_t hi = row_indptr[program + 1];
+        // A hook-carrying program with an empty wire span (device-resolved
+        // geometry placeholder) cannot be located among the rows, so no row
+        // can be proven hook-free.
+        if (hi <= lo) return 0;
+        first_hook_row = std::min(first_hook_row, lo);
+    }
+    // Every row below the minimum hook-program row start is hook-free by
+    // construction (spans are contiguous [lo, hi)), so the minimum IS the
+    // fast prefix. Hook-free rows that happen to sit above it fall into the
+    // slow tail — a lost optimisation, not a correctness question; making
+    // them fast is the row-ordering half of this work (scheduler-side).
+    return first_hook_row;
+}
+
 bool Dispatch::launch_wants_attn_score(
     const pie_native::LaunchView& view) const {
     for (std::size_t program = 0;

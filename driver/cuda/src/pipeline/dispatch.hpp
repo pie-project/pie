@@ -284,6 +284,17 @@ class Dispatch {
     bool launch_has_attention_stages(
         const pie_native::LaunchView& view) const;
 
+    // How many LEADING wire request rows are covered by no attention-stage
+    // program. Rows [0, n) may take hook-free fast paths; everything at or
+    // after row n must run hook-visible. Returns 0 — "no fast prefix" — when
+    // a hook-carrying program has no wire span to locate it by
+    // (device-resolved geometry) or when per-program row attribution is
+    // absent. The count is in WIRE request rows, and it is conservative by
+    // construction: rows past the wire span (composed device-geometry
+    // suffix) are never counted into the prefix.
+    std::uint32_t launch_hook_free_prefix_rows(
+        const pie_native::LaunchView& view) const;
+
     // Whether any program in this launch reads `AttnScore`. Capture is opt-in
     // per fire because it costs an extra `[num_q_heads, kv_len]` write inside
     // the attention kernel; a launch that does not observe scores must pay

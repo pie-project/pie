@@ -2291,6 +2291,8 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
         .attn_score_window = model::default_attn_score_window(),
         .wants_page_mask =
             engine.dispatch->launch_wants_page_mask(s.dispatch_view),
+        .hook_free_prefix_rows =
+            engine.dispatch->launch_hook_free_prefix_rows(s.dispatch_view),
         .execute = [](
             void* opaque,
             model::StageHookPoint point,

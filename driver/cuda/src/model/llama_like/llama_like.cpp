@@ -40,6 +40,20 @@ inline void maybe_add_bias(
     kernels::launch_add_bias_bf16(out, bias_tensor->data(), N, dim, stream);
 }
 
+// Row `row` of a row-major bf16 buffer of width `width`. Used to hand a
+// kernel the tail of a buffer whose prefix another kernel owns.
+inline void* bf16_row(void* base, int row, int width)
+{
+    return static_cast<std::uint16_t*>(base) +
+           static_cast<std::ptrdiff_t>(row) * width;
+}
+
+inline const void* bf16_row(const void* base, int row, int width)
+{
+    return static_cast<const std::uint16_t*>(base) +
+           static_cast<std::ptrdiff_t>(row) * width;
+}
+
 bool decode_full_attention_variant_enabled() {
     static const bool enabled = [] {
         const char* v = std::getenv("PIE_CUDA_DECODE_FULL_ATTENTION");
@@ -488,9 +502,19 @@ void llama_like_forward_paged(
             layer.k_norm->shape()[0] == d;
         const bool use_fused_qkv = (layer.qkv_proj_fused != nullptr) &&
                                    !ws.qkv_fused.empty();
+        // The hook-free fast prefix. With no hooks every row is it; with
+        // hooks, the dispatch proved rows [0, fast_rows) belong to no
+        // attention-stage program, so they may take the fused postprocess
+        // while the tail runs the hook-visible unfused path — in the same
+        // fire. Pure decode (a predicate condition below) maps request rows
+        // onto token rows 1:1, which is what lets one row count partition
+        // both the QKV postprocess and the KV write.
+        const int fast_rows = hooks == nullptr
+            ? R
+            : std::min(static_cast<int>(hooks->hook_free_prefix_rows), R);
         const bool fused_decode_qkv_post =
             use_fused_qkv &&
-            hooks == nullptr &&
+            fast_rows > 0 &&
             decode_fused_post_enabled() &&
             is_pure_decode &&
             !has_custom_mask &&
@@ -501,6 +525,15 @@ void llama_like_forward_paged(
             fwd_cfg.use_qk_norm &&
             q_norm_is_per_head && k_norm_is_per_head &&
             fwd_cfg.rope_kind == RopeKind::Standard;
+        // The rows the fused postprocess does NOT own. Zero on the classic
+        // all-fused fire; N on the classic all-unfused one. Pure decode has
+        // N == R, so the same count serves token- and request-indexed calls.
+        const int unfused_tail_rows = fused_decode_qkv_post ? N - fast_rows : N;
+        if (L == 0 && hooks != nullptr && std::getenv("PIE_HOOK_PREFIX_TRACE")) {
+            std::fprintf(stderr,
+                         "[hook-prefix] R=%d fast_rows=%d fused=%d\n",
+                         R, fast_rows, fused_decode_qkv_post ? 1 : 0);
+        }
         if (use_fused_qkv) {
             ops::gemm_act_x_w(cublas.handle(),
                 qkv_in, ops::WeightView(*layer.qkv_proj_fused),
@@ -526,9 +559,20 @@ void llama_like_forward_paged(
                     has_write_desc ? w_page_d : nullptr,
                     has_write_desc ? w_off_d : nullptr,
                     row_valid_d,
-                    R, num_q_heads_local, num_kv_heads_local, d,
+                    fast_rows, num_q_heads_local, num_kv_heads_local, d,
                     cache.page_size(), cache.hnd_layout(),
                     cfg.rope_theta, eps, stream);
+                if (unfused_tail_rows > 0) {
+                    // The hook-visible tail: split into ws.q/k/v at their
+                    // ABSOLUTE row offsets, so the full-N hook below still
+                    // observes one contiguous query buffer.
+                    kernels::launch_split_qkv_bf16(
+                        bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
+                        bf16_row(ws.q.data(), fast_rows, Hq),
+                        bf16_row(ws.k.data(), fast_rows, Hk),
+                        bf16_row(ws.v.data(), fast_rows, Hk),
+                        unfused_tail_rows, Hq, Hk, stream);
+                }
             } else {
                 kernels::launch_split_qkv_bf16(
                     ws.qkv_fused.data(),
@@ -586,8 +630,21 @@ void llama_like_forward_paged(
             vision != nullptr && vision->mrope_positions != nullptr &&
             q_norm_is_per_head && k_norm_is_per_head;
         if (fused_decode_qkv_post) {
-            // Q was normalized/rotated and K/V were written directly to the
-            // paged cache by the fused decode postprocess above.
+            // Rows [0, fast_rows): Q was normalized/rotated and K/V were
+            // written directly to the paged cache by the fused decode
+            // postprocess above. The hook-visible tail takes the same
+            // per-head-norm + standard-rope transform the predicate
+            // guaranteed, over its own rows only.
+            if (unfused_tail_rows > 0) {
+                kernels::launch_qk_rmsnorm_rope_bf16(
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    layer.q_norm->data(), layer.k_norm->data(),
+                    positions + fast_rows,
+                    unfused_tail_rows,
+                    num_q_heads_local, num_kv_heads_local, d,
+                    cfg.rope_theta, eps, stream);
+            }
         } else if (use_mrope) {
             // Qwen3-VL: fused per-head q/k RMSNorm + interleaved 3-axis M-RoPE.
             kernels::launch_qk_rmsnorm_mrope_bf16(
@@ -665,7 +722,29 @@ void llama_like_forward_paged(
         }
         auto kv_view = cache.layer_view(L);
         if (fused_decode_qkv_post) {
-            // Already written by launch_qkv_decode_qk_norm_rope_write_kv_bf16.
+            // Rows [0, fast_rows) were already written by
+            // launch_qkv_decode_qk_norm_rope_write_kv_bf16; only the
+            // hook-visible tail still needs its K/V appended.
+            if (unfused_tail_rows > 0) {
+                if (has_write_desc) {
+                    kernels::launch_write_kv_explicit_bf16(
+                        kv_view,
+                        bf16_row(ws.k.data(), fast_rows, Hk),
+                        bf16_row(ws.v.data(), fast_rows, Hk),
+                        w_page_d + fast_rows, w_off_d + fast_rows,
+                        unfused_tail_rows, stream,
+                        row_valid_d != nullptr ? row_valid_d + fast_rows
+                                               : nullptr);
+                } else {
+                    kernels::launch_write_kv_to_pages(
+                        kv_view,
+                        ws.k.data(), ws.v.data(),
+                        qo_indptr, kv_page_indices, kv_page_indptr,
+                        kv_last_page_lens,
+                        N, R, stream, row_valid_d,
+                        /*first_token=*/fast_rows);
+                }
+            }
         } else if (has_write_desc) {
             // B2: explicit-descriptor KV write. Each query TOKEN writes its new
             // K/V into the program-supplied (physical page id `w_page_d[c]`,

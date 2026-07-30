@@ -72,6 +72,17 @@ struct StageHooks {
     // attention call.
     bool wants_page_mask = false;
 
+    // How many LEADING request rows belong to no attention-stage program.
+    // This is what turns "any hook, anywhere, disables the fast path" into a
+    // row count: a model body may run its hook-free fast path over rows
+    // [0, n) and the hook-visible path over the rest, in the same fire. 0
+    // means no row is provably hook-free (today's fire-wide behaviour). The
+    // count is in wire request rows — a body whose request set is not the
+    // wire rows in wire order must clamp it to what it can prove, and the
+    // slow path is always correct. See
+    // `Dispatch::launch_hook_free_prefix_rows`.
+    std::uint32_t hook_free_prefix_rows = 0;
+
     // The fire's KV geometry. Set by `ForwardFn::invoke_body` -- the single
     // choke point every family passes through -- on its own copy of the
     // frame's hooks, so it is valid exactly while the body runs and no model
