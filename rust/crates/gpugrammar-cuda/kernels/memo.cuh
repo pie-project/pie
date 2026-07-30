@@ -140,6 +140,7 @@ extern "C" __global__ void gg_probe(
     int32_t* memo_slot,
     int32_t* representative,
     int32_t* row_floor,
+    int32_t* memo_store,
     int32_t batch,
     int32_t configs,
     int32_t stack_stride,
@@ -245,6 +246,19 @@ extern "C" __global__ void gg_probe(
     for (int32_t config = lane; config < count; config += 32) {
         int32_t row = sequence * configs + config;
         row_floor[row] = state->depth[row];
+    }
+
+    // Whether this sequence may put its answer in the table. Only one that
+    // computed it may - a sequence that copied would store what it was given,
+    // and a chain of followers is how an entry outlives the state it describes.
+    //
+    // Leaving this out is silent and total: the CUDA memo stored nothing at
+    // all, so every step recomputed every mask, and it showed up two kernels
+    // downstream as a *Triton* scatter costing 2.5x - because with nothing to
+    // copy, every row was one the sweep had to build.
+    if (lane == 0) {
+        memo_store[sequence] =
+            (found < 0 && neighbour == sequence && count <= memo_configs) ? 1 : -1;
     }
 }
 

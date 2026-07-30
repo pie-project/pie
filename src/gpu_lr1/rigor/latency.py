@@ -194,8 +194,14 @@ def measure_xgrammar(
     # restores the state so the measurement repeats; a sequence that refuses
     # the token has nothing to roll back, so it is charged the refusal only.
     def advance() -> None:
-        for matcher, token in zip(matchers, tokens, strict=True):
-            if matcher.accept_token(token):
+        # One token per *matcher*, which is what a decode step does. These two
+        # lists are different lengths - `matchers` is the batch, `tokens` is
+        # the document - and a plain `zip` silently truncated to the shorter,
+        # so at batch 512 with a hundred-token document XGrammar was charged
+        # for a hundred advances against our five hundred and twelve. Found by
+        # adding `strict=`, which is the whole reason to add it.
+        for index, matcher in enumerate(matchers):
+            if matcher.accept_token(tokens[index % len(tokens)]):
                 matcher.rollback(1)
 
     return {

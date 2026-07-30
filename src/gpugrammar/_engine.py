@@ -4285,6 +4285,7 @@ class DeviceBatch:
                 self.memo_slot.data_ptr(),
                 self.representative.data_ptr(),
                 self.row_floor.data_ptr(),
+                self.memo_store.data_ptr(),
             ],
             [
                 self.batch,
