@@ -145,6 +145,7 @@ public:
             !loader_config::env_present("PIE_CUDA_STREAM_NO_PREFETCH");
         allocate_slab();
         allocate_host_tier(host_budget_bytes, total_instances);
+        warm_host_tier();
     }
 
     ~GroupStreamCache() {
@@ -640,6 +641,64 @@ private:
         }
         host_slots_ = static_cast<std::uint32_t>(slots);
         host_of_.reserve(host_slots_);
+    }
+
+    /// Read every instance the tier has room for, once, before the first token.
+    ///
+    /// Filling the tier on demand cannot pay for the misses that dominate a
+    /// routed model. Those are compulsory -- the first time a token routes to
+    /// an expert, nothing has seen it yet -- and a cache populated by misses
+    /// only ever serves the *second* miss on a key. Measured on gpt-oss-20b at
+    /// a 6 GB slab, 754 page-ins produced 141 tier hits, because at an 88% hit
+    /// rate almost nothing is fetched twice.
+    ///
+    /// So this is not a cache warm-up but a placement decision, made where the
+    /// resident path makes the same one: at load. It costs a full read of the
+    /// group here in exchange for every later page-in being a PCIe transfer
+    /// rather than a disk read, which the numbers price at roughly 4 GB/s
+    /// against 15 GB/s.
+    void warm_host_tier()
+    {
+        if (host_tier_ == nullptr || host_slots_ == 0 || slot_stores_.empty()) {
+            return;
+        }
+        const auto started = Clock::now();
+        std::uint32_t staged = 0;
+        for (std::size_t g = 0; g < groups_.len && host_of_.size() < host_slots_;
+             ++g) {
+            const std::uint32_t arity = groups_.ptr[g].arity;
+            for (std::uint32_t i = 0; i < arity && host_of_.size() < host_slots_;
+                 ++i) {
+                const std::uint32_t key = flatten(g, i);
+                // Stage through a different slot each time until every slot has
+                // been through one fill, then reuse the first.
+                //
+                // This is not load balancing: a slot serves reads from the host
+                // tier only once its store exists, and the store is built by a
+                // fill. Staging through slot 0 alone would leave every other
+                // slot owing one disk read the first time it is used, which at
+                // a large slab is nearly every page-in the run performs -- 486
+                // of 760, measured. Since the bytes are being read here anyway,
+                // spreading them builds all the stores for free.
+                const std::uint32_t scratch =
+                    staged < num_slots() ? staged : 0;
+                // `fill` stages into the tier itself; this loop only has to
+                // choose where.
+                fill(scratch, g, i, key, nullptr);
+                ++staged;
+            }
+        }
+        CUDA_CHECK(cudaStreamSynchronize(nullptr));
+        // The scratch fills are not misses the operator asked for, and counting
+        // them would report a page-in rate that no token paid for.
+        stats_ = Stats{};
+        if (verbose_ || loader_config::env_truthy("PIE_CUDA_STREAM_STATS")) {
+            std::cerr << "[pie-driver-cuda] group stream cache: warmed "
+                      << host_of_.size() << " host tier slots in "
+                      << std::chrono::duration_cast<std::chrono::milliseconds>(
+                             Clock::now() - started).count()
+                      << " ms\n";
+        }
     }
 
     void free_host_tier() noexcept
