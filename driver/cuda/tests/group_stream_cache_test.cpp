@@ -332,6 +332,72 @@ void test_a_slab_that_fits_stops_missing() {
     CUDA_CHECK(cudaStreamDestroy(stream));
 }
 
+/// A slot's store owns nothing, and says so.
+///
+/// The two tests above exercise `External` only in passing -- they would still
+/// pass if the kind were spelled some other way that happened not to throw.
+/// What it actually asserts is worth pinning directly: every tensor in a slot
+/// points into a slab the cache allocated and will free, so the store must
+/// hold no allocation of its own and must contribute nothing to the memory
+/// accounting. Were these `Owned`, the slab would be freed once per slot on
+/// top of once by the cache, and would be counted `arity` times over.
+void test_a_slot_store_owns_nothing() {
+    using namespace pie_cuda_driver;
+
+    const std::filesystem::path dir = write_checkpoint(dsv4_entries());
+    std::string open_error;
+    pie_loader::Checkpoint checkpoint =
+        pie_loader::Checkpoint::open(dir.string(), &open_error);
+    if (!checkpoint) return;
+
+    const auto target = cuda_device_target();
+    pie_loader::ModelContract contract;
+    const pie_loader::LoadPlan plan =
+        compile_dsv4(checkpoint, target, /*streamed=*/true, contract);
+    const auto groups = plan.view().groups;
+    if (groups.len == 0) return;
+
+    const std::uint64_t slot_bytes = groups.ptr[0].plan->memory.persistent_bytes;
+    pie_loader::CheckpointSource loader(plan.view());
+    GroupStreamCache cache(loader, groups, slot_bytes * 2);
+
+    cudaStream_t stream = nullptr;
+    CUDA_CHECK(cudaStreamCreate(&stream));
+    const WeightStore& store = cache.ensure_resident(0, 0, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    // Finalization is where the invariant is enforced, and reaching this far
+    // means it ran: `ensure_resident` finalizes before it hands the store back.
+    check(store.total_bytes() == 0,
+          "a slot's store is not charged for the slab it was lent");
+
+    std::size_t seen = 0;
+    const std::uint8_t* slab_lo = nullptr;
+    for (const auto& [name, record] : store) {
+        if (record.tensor.empty()) continue;
+        ++seen;
+        check(record.has_spec &&
+                  record.spec.ownership ==
+                      TensorOwnershipKind::External,
+              "'" + name + "' is declared External");
+        check(!record.tensor.owns_memory(),
+              "'" + name + "' does not own the slab it points into");
+        const auto* base = static_cast<const std::uint8_t*>(record.tensor.data());
+        if (slab_lo == nullptr || base < slab_lo) slab_lo = base;
+    }
+    check(seen > 0, "the slot published tensors at all");
+    // And they point into one slot, not wherever: every byte a slot's tensors
+    // touch is inside the stride the cache priced it at.
+    for (const auto& [name, record] : store) {
+        if (record.tensor.empty()) continue;
+        const auto* base = static_cast<const std::uint8_t*>(record.tensor.data());
+        const std::uint64_t end =
+            static_cast<std::uint64_t>(base - slab_lo) + record.tensor.nbytes();
+        check(end <= slot_bytes, "'" + name + "' stays inside its slot");
+    }
+    CUDA_CHECK(cudaStreamDestroy(stream));
+}
+
 }  // namespace
 
 int main() {
@@ -343,6 +409,7 @@ int main() {
     try {
         test_a_paged_expert_equals_the_stacked_one();
         test_a_slab_that_fits_stops_missing();
+        test_a_slot_store_owns_nothing();
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << "\n";
         ++failures;
