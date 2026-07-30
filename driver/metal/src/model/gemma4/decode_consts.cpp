@@ -135,12 +135,20 @@ int bind_gemma4_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                                          &count);
                 bind_const<float>(ctx, ord, (std::uint8_t)bind::Sdpa::Scale,
                                   1.0f / std::sqrt(float(hd)), &count);
-                // The window is what makes a sliding layer sliding; a full
-                // layer's PSO does not read the slot at all.
-                if (d.sliding) {
-                    bind_const<std::int32_t>(ctx, ord, (std::uint8_t)bind::SdpaSliding::Window,
-                                             g.sliding_window, &count);
-                }
+                // Both attention types run an `sdpa_vector_decode_swa`
+                // instantiation -- they differ by head width, not by kernel --
+                // so BOTH read this slot. Binding it only for sliding layers
+                // left layers 4, 9, 14... reading an unbound window, which is
+                // wrong attention rather than a crash. 0 means "attend all".
+                bind_const<std::int32_t>(ctx, ord, (std::uint8_t)bind::SdpaSliding::Window,
+                                         d.sliding ? g.sliding_window : 0, &count);
+                // Row strides, stated rather than inferred. At decode M==1 and
+                // the row index is 0, so these only ever matter for prefill --
+                // but an unbound slot would matter there too.
+                bind_const<std::int32_t>(ctx, ord, (std::uint8_t)bind::SdpaSliding::QRowStride,
+                                         std::int32_t(g.n_q_heads * hd), &count);
+                bind_const<std::int32_t>(ctx, ord, (std::uint8_t)bind::SdpaSliding::ORowStride,
+                                         std::int32_t(g.n_q_heads * hd), &count);
                 break;
             }
             case Kind::KvAppend:

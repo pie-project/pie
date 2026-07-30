@@ -444,6 +444,9 @@ if(APPLE)
   add_metal_linked_test(gemma4_pso_test tests/gemma4_pso_test.cpp)
   target_compile_definitions(gemma4_pso_test PRIVATE
     PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
+  add_metal_linked_test(gemma4_prefill_test tests/gemma4_prefill_test.cpp)
+  target_compile_definitions(gemma4_prefill_test PRIVATE
+    PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
   add_metal_linked_test(decode_step_mb_test tests/decode_step_mb_test.cpp)
   add_metal_linked_test(kv_pool_lifecycle_test tests/kv_pool_lifecycle_test.cpp)
   # `heap_bind.cpp`'s `case K::Fill` on a real heap.

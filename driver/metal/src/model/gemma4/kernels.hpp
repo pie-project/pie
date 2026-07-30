@@ -84,8 +84,15 @@ inline void vnorm_dispatch(int rows, int axis, Grid& g, Threadgroup& tg) {
 
 /// Sliding-window decode attention: one threadgroup per query head, as
 /// `sdpa_vector` does, with BN=32/BD=32 inside.
-inline void sdpa_sliding_dispatch(int n_q_heads, Grid& g, Threadgroup& tg) {
-    g = Grid{1, std::uint32_t(n_q_heads), 1};
+/// One threadgroup of 1024 threads per (head, query row).
+///
+/// The grid is in THREADS -- `StepEncoder::dispatch` calls `dispatchThreads` --
+/// so the head count multiplies the threadgroup width rather than standing alone.
+/// Writing it the other way launches `n_q_heads` threads TOTAL, which is not an
+/// error the hardware reports: the kernel's simd reductions just read lanes that
+/// were never dispatched.
+inline void sdpa_sliding_dispatch(int n_q_heads, Grid& g, Threadgroup& tg, int rows = 1) {
+    g = Grid{std::uint32_t(n_q_heads) * 1024, std::uint32_t(rows < 1 ? 1 : rows), 1};
     tg = Threadgroup{1024, 1, 1};
 }
 

@@ -303,6 +303,11 @@ enum class SdpaSliding : uint8_t {
     Q = 0, K = 1, V = 2, Out = 3, GqaFactor = 4, N = 5,
     KHeadStride = 6, KSeqStride = 7, VHeadStride = 8, VSeqStride = 9, Scale = 10,
     Window = 11,   // attend the last `window` positions; <=0 means all of them
+    // Stated by the caller rather than inferred: decode's Q is one row, a
+    // prefill's is [M, n_heads*D] from a GEMM, and a kernel that guessed wrong
+    // between them would read plausible garbage instead of failing.
+    QRowStride = 12,
+    ORowStride = 13,
 };
 
 // geglu_tanh.metal: out = gelu_tanh(gate) * up. Gemma's FFN nonlinearity, where
