@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "decode_abi.hpp"
+#include "golden_tap.hpp"
 #include "kernels/decode_psos.hpp"
 #include "loader/heap_bind_metal.hpp"
 #include "pie_loader/checkpoint_source.hpp"
@@ -58,6 +59,92 @@ bool gptoss_geometry(const SetupConfig& cfg, gptoss::GptOssGeometry& g, int max_
     return true;
 }
 
+/// Which bind index carries each gemma4 kind's OUTPUT, and how wide it is.
+/// The names are `tests/parity/gemma4_mlx_taps.py`'s, so the engine's dump and
+/// the raw path's diff against the same reference.
+struct G4Tap {
+    const char* name;
+    std::uint8_t out_bind;
+    int width;
+};
+
+bool g4_tap_for(const gemma4::Dispatch& d, const Gemma4Geometry& g, G4Tap& out) {
+    using K = gemma4::Kind;
+    const int L = d.layer;
+    const int hd = L >= 0 ? g.head_dim_of(L) : g.head_dim;
+    const int q_dim = g.n_q_heads * hd;
+    const int kv_dim = g.n_kv_heads * hd;
+    const int inter = L >= 0 ? g.intermediate_of(L) : g.intermediate;
+    const int ple_all = g.n_layers * g.per_layer_emb_dim;
+    switch (d.kind) {
+        case K::EmbedGather:      out = {"embed", 4, g.hidden};          return true;
+        case K::PleTokenGather:   out = {"ple_tok", 4, ple_all};         return true;
+        case K::PleProjGemv:      out = {"ple_proj", 4, ple_all};        return true;
+        case K::PleProjNorm:      out = {"ple_projnorm", 2, ple_all};    return true;
+        case K::PleCombine:       out = {"ple", 2, ple_all};             return true;
+        case K::AttnNorm:         out = {"attn_norm", 2, g.hidden};      return true;
+        case K::QmvQ:             out = {"q_proj", 4, q_dim};            return true;
+        case K::QmvK:             out = {"k_proj", 4, kv_dim};           return true;
+        case K::QmvV:             out = {"v_proj", 4, kv_dim};           return true;
+        case K::QNorm:            out = {"q_norm", 2, q_dim};            return true;
+        case K::KNorm:            out = {"k_norm", 2, kv_dim};           return true;
+        case K::VNorm:            out = {"v_norm", 1, kv_dim};           return true;
+        case K::RopeQ:            out = {"rope_q", 0, q_dim};            return true;
+        case K::RopeK:            out = {"rope_k", 0, kv_dim};           return true;
+        case K::Sdpa:             out = {"sdpa", 3, q_dim};              return true;
+        case K::QmvO:             out = {"o_proj", 4, g.hidden};         return true;
+        case K::PostAttnResidual: out = {"attn_resid", 2, g.hidden};     return true;
+        case K::FfnNorm:          out = {"ffn_norm", 2, g.hidden};       return true;
+        case K::QmvGate:          out = {"gate_proj", 4, inter};         return true;
+        case K::QmvUp:            out = {"up_proj", 4, inter};           return true;
+        case K::GegluTanh:        out = {"geglu", 2, inter};             return true;
+        case K::QmvDown:          out = {"down_proj", 4, g.hidden};      return true;
+        case K::PostFfnResidual:  out = {"ffn_resid", 2, g.hidden};      return true;
+        case K::PleGateGemv:      out = {"ple_gate", 4, g.per_layer_emb_dim}; return true;
+        case K::PleGeglu:         out = {"ple_act", 2, g.per_layer_emb_dim};  return true;
+        case K::PleProjLayerGemv: out = {"ple_back", 4, g.hidden};       return true;
+        case K::PleResidualScaled:
+        case K::LayerScalar:      out = {"layer_out", 2, g.hidden};      return true;
+        case K::FinalRms:         out = {"final_norm", 2, g.hidden};     return true;
+        case K::LmHead:           out = {"logits_raw", 4, g.vocab};      return true;
+        case K::FinalSoftcap:     out = {"logits", 1, g.vocab};          return true;
+        default: return false;
+    }
+}
+
+/// Only a colour's FINAL writer is named: the in-place kinds share a buffer with
+/// the tap before them, and publishing the earlier tensor under the earlier name
+/// reads as a divergence that is really the dump lying.
+void dump_g4_taps(const std::vector<gemma4::Dispatch>& dag, const Gemma4Geometry& g,
+                  const gemma4::ScratchColoring& col, const std::vector<SlotHandle>& pool,
+                  int rows) {
+    const int n_pool = int(pool.size());
+    const auto colour_of = [&](std::size_t di, std::uint8_t bind_index) {
+        for (const auto& sb : col.per_dispatch[di]) {
+            if (sb.bind_index == bind_index) return int(sb.color);
+        }
+        return -1;
+    };
+    std::vector<int> last(std::size_t(n_pool < 0 ? 0 : n_pool), -1);
+    for (std::size_t di = 0; di < dag.size(); ++di) {
+        G4Tap t{};
+        if (!g4_tap_for(dag[di], g, t)) continue;
+        const int c = colour_of(di, t.out_bind);
+        if (c >= 0 && c < n_pool) last[std::size_t(c)] = int(di);
+    }
+    for (std::size_t di = 0; di < dag.size(); ++di) {
+        G4Tap t{};
+        if (!g4_tap_for(dag[di], g, t)) continue;
+        const int c = colour_of(di, t.out_bind);
+        if (c < 0 || c >= n_pool || !pool[std::size_t(c)].valid()) continue;
+        if (last[std::size_t(c)] != int(di)) continue;
+        const std::string name = dag[di].layer < 0
+            ? std::string(t.name)
+            : std::to_string(dag[di].layer) + "." + t.name;
+        dump_golden_bf16(name, pool[std::size_t(c)].contents(), rows, t.width, t.width);
+    }
+}
+
 // ── gemma4 ──────────────────────────────────────────────────────────────────
 
 class Gemma4Engine final : public SimpleFamilyEngine {
@@ -94,7 +181,9 @@ class Gemma4Engine final : public SimpleFamilyEngine {
 
         dag_ = gemma4::build_gemma4_dag(g_, /*with_argmax=*/false);
         const gemma4::ScratchPlan sp = gemma4::build_gemma4_scratch(dag_, g_);
-        coloring_ = gemma4::color_gemma4_scratch(dag_, sp);
+        // Under a tap dump every value needs its own buffer, or a later
+        // dispatch overwrites the one being read.
+        coloring_ = gemma4::color_gemma4_scratch(dag_, sp, /*no_recycle=*/golden_taps_enabled());
         if (!coloring_.hazard_free) {
             if (err) *err = "gemma4's activation colouring is not hazard-free";
             return false;
@@ -155,6 +244,10 @@ class Gemma4Engine final : public SimpleFamilyEngine {
     }
 
     SlotHandle logits_slot() const override { return logits_; }
+
+    void dump_taps(int rows) const override {
+        dump_g4_taps(dag_, g_, coloring_, b_.pool, rows);
+    }
 
   private:
     gemma4::Gemma4Geometry g_{};
@@ -274,19 +367,23 @@ std::size_t SimpleFamilyEngine::extra_heap_bytes(pie::metal::model::ModelFamily 
     // generous: this is a budget, and a context that is too small fails at
     // `heap_alloc` with no diagnosis of which allocation ran out.
     std::size_t bytes = std::size_t(256) << 20;
+    // Under a tap dump the colouring stops recycling, so the pool is one slot
+    // per dispatch rather than a handful. Debug-only; the budget is address
+    // space, not resident memory.
+    const std::size_t pool_slots = golden_taps_enabled() ? 1024 : 32;
     if (family == pie::metal::model::ModelFamily::Gemma4) {
         gemma4::Gemma4Geometry g;
         std::string ignore;
         if (!gemma4_geometry(cfg, g, max_ctx, &ignore)) return bytes;
         bytes += gemma4::gemma4_kv_region_bytes(g, max_ctx, 2);
         // The pool's widest slot is the vocabulary; the colouring uses a handful.
-        bytes += std::size_t(32) * std::size_t(g.vocab) * 2;
+        bytes += pool_slots * std::size_t(g.vocab) * 2;
     } else if (family == pie::metal::model::ModelFamily::GptOss) {
         gptoss::GptOssGeometry g;
         std::string ignore;
         if (!gptoss_geometry(cfg, g, max_ctx, &ignore)) return bytes;
         bytes += std::size_t(g.n_layers) * 2 * gptoss::gptoss_kv_bytes_per_layer(g, max_ctx, 2);
-        bytes += std::size_t(32) * std::size_t(gptoss::gptoss_widest_elems(g)) * 2;
+        bytes += pool_slots * std::size_t(gptoss::gptoss_widest_elems(g)) * 2;
     }
     return bytes;
 }

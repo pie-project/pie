@@ -110,6 +110,10 @@ int main() {
     const char* home = std::getenv("HOME");
     const std::string root = home != nullptr ? std::string(home) + "/.pie-bench" : ".";
     const std::string kernels = PIE_METAL_KERNELS_DIR_FOR_TEST;
+    // A tap dump holds the LAST step's activations, so under one it is worth
+    // running exactly ONE step: <bos> at position 0, the case the raw path
+    // pins. Everything after it would silently overwrite the dump.
+    const bool taps = std::getenv("PIE_METAL_GOLDEN_DIR") != nullptr;
 
     // ── gemma4 ──
     {
@@ -147,7 +151,7 @@ int main() {
             }
             std::vector<std::uint32_t> got;
             // <bos>, then the eight-token prompt the forward test teacher-forces.
-            if (run_family("gemma4", cfg, {2, 818, 3821, 563, 529, 476, 3625, 506}, 2, got)) {
+            if (!taps && run_family("gemma4", cfg, {2, 818, 3821, 563, 529, 476, 3625, 506}, 2, got)) {
                 std::printf("    gemma4 greedy %u %u\n", got[0], got[1]);
                 // mlx-lm's answer for this prompt, which `gemma4_forward_test`
                 // pins on the raw path. Getting it through the EXECUTOR is the
@@ -159,7 +163,7 @@ int main() {
     }
 
     // ── gpt-oss ──
-    {
+    if (!taps) {
         const std::string dir = root + "/gptoss-20b-pie4";
         if (!exists(dir)) {
             std::printf("  gpt-oss: SKIP (no checkpoint at %s)\n", dir.c_str());

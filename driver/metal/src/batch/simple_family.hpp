@@ -68,6 +68,20 @@ class SimpleFamilyEngine {
     /// dispatch writes here directly, so nothing copies between the model and
     /// the sampler.
     virtual SlotHandle logits_slot() const = 0;
+
+    /// Dump every tapped activation of the LAST step, under the names
+    /// `tests/parity/gemma4_mlx_taps.py` writes.
+    ///
+    /// The engine is a second configuration of a path the raw tests already
+    /// check, and a second configuration is exactly where the two can disagree
+    /// while both look reasonable. Every numerical defect in this driver's three
+    /// families was found by walking taps forward to the first disagreement;
+    /// this is that walk pointed at the ENGINE rather than at the raw path.
+    ///
+    /// Requires `PIE_METAL_GOLDEN_DIR` and the pool it names: under a tap dump
+    /// the engine colours with `no_recycle`, so nothing is overwritten before it
+    /// is read. Off, it is not called and costs nothing.
+    virtual void dump_taps(int rows) const { (void)rows; }
 };
 
 }  // namespace pie::metal::batch

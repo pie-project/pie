@@ -1550,7 +1550,13 @@ StepTiming MetalExecutor::Impl::step(
         // DAG and a contiguous KV, and `slot` has nothing to select.
         (void)slot;
         (void)ptir;
-        return simple_->step(*ctx_, token_id, position);
+        const StepTiming t = simple_->step(*ctx_, token_id, position);
+        // The walk, pointed at the ENGINE rather than at the raw path. Off
+        // unless PIE_METAL_GOLDEN_DIR is set; when it is, the LAST step's
+        // activations are what land there, so the caller chooses which step is
+        // examined by choosing the prompt.
+        if (golden_taps_enabled()) simple_->dump_taps(1);
+        return t;
     }
     std::string commit_error;
     if (!ensure_elastic_storage(
