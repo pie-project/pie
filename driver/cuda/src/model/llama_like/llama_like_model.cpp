@@ -92,6 +92,11 @@ void LlamaLikeModel::body(Workspace& ws,
     const bool declared_eligible =
         static_cast<bool>(declared_) &&
         in.stage_hooks == nullptr &&
+        // The declared plan has no correction op yet: a lora fire falls back
+        // to the hand-written body, which applies the delta. Running the
+        // declared executor here would silently drop the adapter — the
+        // honest gate is exclusion.
+        in.lora == nullptr &&
         in.custom_mask_d == nullptr &&
         // Explicit KV-write fires are in scope (declared_forward.hpp says
         // why: every graph-replayed decode fire carries them), but only
@@ -132,7 +137,8 @@ void LlamaLikeModel::body(Workspace& ws,
         in.w_page_d, in.w_off_d, in.row_valid_d, in.has_write_desc,
         in.runtime_window_left,
         /*vision=*/nullptr,
-        in.stage_hooks);
+        in.stage_hooks,
+        in.lora);
 }
 
 std::uint32_t LlamaLikeModel::graph_layout() {

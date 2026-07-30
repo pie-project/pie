@@ -4,6 +4,29 @@
 
 namespace pie_cuda_driver::model {
 
+/// The `lora` sink's SITES vocabulary: one bit per projection site, in the
+/// model's own terms (PTIR overview §6.5 — "placement is structure"). The
+/// vocabulary is model-level; the bit assignment below is the llama-like
+/// family's, fixed here so a traced program and the consuming forward agree
+/// on the same integers.
+///
+/// v0 consumes `q` and `v` only. The others are RESERVED: a lane naming one
+/// of them binds fine (the bind gate checks only `has_lora`) but is refused
+/// loudly at first use in the forward — a silently ignored site would be a
+/// request whose adapter never applied while every sample still returned.
+enum LoraSite : std::uint64_t {
+    kLoraSiteQ      = 1ull << 0,  // q_proj      (consumed)
+    kLoraSiteK      = 1ull << 1,  // k_proj      (reserved)
+    kLoraSiteV      = 1ull << 2,  // v_proj      (consumed)
+    kLoraSiteO      = 1ull << 3,  // o_proj      (reserved)
+    kLoraSiteGateUp = 1ull << 4,  // gate/up     (reserved)
+    kLoraSiteDown   = 1ull << 5,  // down_proj   (reserved)
+};
+inline constexpr std::uint64_t kLoraSitesKnown =
+    kLoraSiteQ | kLoraSiteK | kLoraSiteV | kLoraSiteO |
+    kLoraSiteGateUp | kLoraSiteDown;
+inline constexpr std::uint64_t kLoraSitesConsumed = kLoraSiteQ | kLoraSiteV;
+
 /// One lane's resolved `lora` sink: where this program's adapter weights live
 /// and where the forward should apply them.
 ///
@@ -41,6 +64,21 @@ struct LoraLaneView {
     /// observation, so there is no request CSR to consult yet.
     std::uint32_t token_start = 0;
     std::uint32_t token_count = 0;
+
+    /// Adapter geometry, derived by the resolver from the sink arguments'
+    /// trace-known value types (`A: [num_layers, R, d_in]`,
+    /// `B: [num_layers, d_out, R]` — §6.5). The rank is deliberately NOT a
+    /// sink argument: a different rank is a different traced program, so the
+    /// shape carries it and the resolver throws when the two tensors
+    /// disagree (or when any dim is symbolic). All four are element counts.
+    ///
+    /// Dtype note: `a`/`b` point at channel CELLS, and the PTIR channel
+    /// vocabulary carries f32 (there is no bf16 wire dtype), so the contents
+    /// are f32; a bf16 consumer casts once per fire before its GEMMs.
+    std::uint32_t num_layers = 0;
+    std::uint32_t rank = 0;
+    std::uint32_t d_in = 0;
+    std::uint32_t d_out = 0;
 };
 
 /// The launch's resolved lora configuration: one entry per lane whose program

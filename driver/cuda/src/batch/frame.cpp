@@ -1526,7 +1526,8 @@ void prepare_step(
             s.fR_real,
             s.img_num_images,
             s.aud_num_clips,
-            s.has_attention_stages);
+            s.has_attention_stages,
+            engine.dispatch->launch_wants_lora(s.dispatch_view));
         if (eligible && engine.graph_pad_page >= 0) {
             const int max_requests = std::min(
                 engine.max_forward_requests, engine.max_workspace_tokens);

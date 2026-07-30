@@ -1681,13 +1681,16 @@ int Context::Impl::load_model(
 
     registry_->dispatch().set_attn_page_mask_available(has_attn_page_mask);
 
-    // `lora`: no model family applies the low-rank delta at its projection
-    // GEMMs yet, so no launch may bind a program that names the sink. This is
-    // the single flip site when llama_like grows the consumer (the same
-    // family gate `has_attn_score` uses above) — flip it together with the
-    // `has_lora` capability rows below or the engine's honour check and this
-    // bind gate will disagree.
-    const bool has_lora = false;
+    // `lora`: the llama_like forward applies the low-rank delta at its q/v
+    // projection GEMMs (llama_like.cpp `LoraFireState`), so that family — and
+    // only that family — may bind programs naming the sink. TP is excluded:
+    // the adapter's B is traced against the UNSHARDED projection widths, a TP
+    // rank holds only its head slice, and the lora table is resolved on rank
+    // 0 alone. This one bool feeds both the bind gate here and the `has_lora`
+    // capability rows below, so the engine's honour check and the driver
+    // cannot disagree.
+    const bool has_lora =
+        family == model::Family::LlamaLike && local_tp_size == 1;
     registry_->dispatch().set_lora_available(has_lora);
 
     registry_->dispatch().set_kv_envelopes_available(

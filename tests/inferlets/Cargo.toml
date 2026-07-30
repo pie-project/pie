@@ -14,6 +14,7 @@ members = [
     "greenlist-watermarking",
     "json-schema-constrained-decoding",
     "locally-typical-sampling",
+    "lora-probe",
     "mirostat-v2-sampling",
     "mtp-speculative-decoding",
     "naive-baseline",

@@ -4,14 +4,19 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <optional>
 #include <stdexcept>
 
 #include <cuda_runtime.h>
+
+#include <string>
+#include <vector>
 
 #include "kernels/custom_all_reduce.hpp"
 #include "cuda_check.hpp"
 #include "kernels/add_bias.hpp"
 #include "kernels/argmax.hpp"
+#include "kernels/dtype_cast.hpp"
 #include "kernels/embed.hpp"
 #include "kernels/gather_rows.hpp"
 #include "kernels/head_dim_pad.hpp"
@@ -24,6 +29,7 @@
 #include "model/qwen3_vl/qwen3_vl_vision_forward.hpp"
 #include "model/attn_page_mask.hpp"
 #include "model/attn_score.hpp"
+#include "model/lora.hpp"
 #include "model/stage_hooks.hpp"
 #include "ops/attention_flashinfer.hpp"
 #include "ops/gemm.hpp"
@@ -62,6 +68,184 @@ bool decode_full_attention_variant_enabled() {
     }();
     return enabled;
 }
+
+// Per-fire lora state (§5.1 CORRECTION): validated lanes plus their adapter
+// weights cast to bf16. The channel cells the resolver harvested are f32 —
+// the PTIR channel vocabulary has no bf16 wire dtype — while the projection
+// buffers the delta accumulates into are bf16, so each lane's A/B is cast
+// once per fire here and the per-layer work is then two plain bf16 GEMMs.
+// Re-cast every fire rather than cached: an adapter swap is a channel
+// re-seed (never a re-trace), so the f32 cell contents may change under a
+// cached cast without any signal the body could key invalidation on.
+//
+// The cast buffers are stream-ordered pool allocations (cudaMallocAsync /
+// cudaFreeAsync — the `resolve_lane_attn_score` pattern) rather than
+// Workspace members: rank, d_out, and lane count are program facts unknown
+// when the Workspace is sized at load, and a lora fire never enters CUDA
+// graph capture (`forward_graph_replay_eligible` excludes it), so body-time
+// allocation is legal.
+struct LoraFireState {
+    struct Lane {
+        const LoraLaneView* view = nullptr;
+        void* a_bf16 = nullptr;  // [num_layers, R, d_in]
+        void* b_bf16 = nullptr;  // [num_layers, d_out, R]
+    };
+    std::vector<Lane> lanes;
+    cudaStream_t stream = nullptr;
+
+    LoraFireState(const LoraTable& table,
+                  const HfConfig& cfg,
+                  int N, int H, int Hq, int Hk, int I, int T,
+                  cudaStream_t s)
+        : stream(s)
+    {
+        if (T != 1) {
+            // The site widths below (Hq/Hk) are the UNSHARDED projection
+            // widths B was traced against; a TP rank holds only its slice.
+            // The capability gate keeps lora off TP configs — this is the
+            // per-fire restatement.
+            throw std::runtime_error(
+                "lora is not supported under tensor parallelism");
+        }
+        lanes.reserve(table.count);
+        for (std::uint32_t i = 0; i < table.count; ++i) {
+            const LoraLaneView& lane = table.lanes[i];
+            if (lane.a == nullptr || lane.b == nullptr) {
+                throw std::runtime_error(
+                    "lora lane carries a null adapter address");
+            }
+            if (lane.sites_bits == 0) {
+                throw std::runtime_error("lora lane names no site");
+            }
+            if ((lane.sites_bits & ~kLoraSitesKnown) != 0) {
+                throw std::runtime_error(
+                    "lora SITES names bits outside the site vocabulary "
+                    "(bits " + std::to_string(lane.sites_bits) + ")");
+            }
+            if ((lane.sites_bits & ~kLoraSitesConsumed) != 0) {
+                // Refused loudly at first use, per the vocabulary contract
+                // in model/lora.hpp: v0 consumes q and v only.
+                throw std::runtime_error(
+                    "lora site not implemented by this forward (v0 applies "
+                    "q and v only; SITES bits " +
+                    std::to_string(lane.sites_bits) + ")");
+            }
+            if (lane.num_layers != static_cast<std::uint32_t>(
+                                       cfg.num_hidden_layers)) {
+                throw std::runtime_error(
+                    "lora adapter declares " +
+                    std::to_string(lane.num_layers) + " layers, model has " +
+                    std::to_string(cfg.num_hidden_layers));
+            }
+            if (lane.d_in != static_cast<std::uint32_t>(H)) {
+                throw std::runtime_error(
+                    "lora adapter d_in " + std::to_string(lane.d_in) +
+                    " != hidden size " + std::to_string(H));
+            }
+            auto require_width = [&](std::uint64_t bit, int width,
+                                     const char* site) {
+                if ((lane.sites_bits & bit) != 0 &&
+                    lane.d_out != static_cast<std::uint32_t>(width)) {
+                    throw std::runtime_error(
+                        std::string("lora adapter d_out ") +
+                        std::to_string(lane.d_out) + " != " + site +
+                        " projection width " + std::to_string(width));
+                }
+            };
+            require_width(kLoraSiteQ, Hq, "q");
+            require_width(kLoraSiteV, Hk, "v");
+            if (lane.rank == 0 ||
+                lane.rank > static_cast<std::uint32_t>(I)) {
+                // The xA^T scratch below aliases ws.gate ([max_tokens, I]),
+                // so a rank above the MLP intermediate width would overrun
+                // it. Any real adapter rank is orders of magnitude smaller.
+                throw std::runtime_error(
+                    "lora rank " + std::to_string(lane.rank) +
+                    " is zero or exceeds the scratch width " +
+                    std::to_string(I));
+            }
+            if (lane.token_start > static_cast<std::uint32_t>(N) ||
+                lane.token_count >
+                    static_cast<std::uint32_t>(N) - lane.token_start) {
+                throw std::runtime_error(
+                    "lora lane token span [" +
+                    std::to_string(lane.token_start) + ", +" +
+                    std::to_string(lane.token_count) +
+                    ") exceeds the fire's " + std::to_string(N) + " rows");
+            }
+            if (lane.token_count == 0) continue;
+
+            const std::size_t a_elems = static_cast<std::size_t>(
+                lane.num_layers) * lane.rank * lane.d_in;
+            const std::size_t b_elems = static_cast<std::size_t>(
+                lane.num_layers) * lane.d_out * lane.rank;
+            Lane out{&lane, nullptr, nullptr};
+            CUDA_CHECK(cudaMallocAsync(&out.a_bf16, a_elems * 2, stream));
+            CUDA_CHECK(cudaMallocAsync(&out.b_bf16, b_elems * 2, stream));
+            lanes.push_back(out);  // owned from here — freed by ~LoraFireState
+            kernels::launch_cast_fp32_to_bf16(
+                lane.a, out.a_bf16, a_elems, stream);
+            kernels::launch_cast_fp32_to_bf16(
+                lane.b, out.b_bf16, b_elems, stream);
+        }
+    }
+
+    LoraFireState(const LoraFireState&) = delete;
+    LoraFireState& operator=(const LoraFireState&) = delete;
+
+    ~LoraFireState() {
+        for (const Lane& lane : lanes) {
+            if (lane.a_bf16 != nullptr) cudaFreeAsync(lane.a_bf16, stream);
+            if (lane.b_bf16 != nullptr) cudaFreeAsync(lane.b_bf16, stream);
+        }
+    }
+
+    // The CORRECTION at layer L (§5.1): `x(W+BA)^T = xW^T + (xA^T)B^T`.
+    // Called immediately after the base q/v projections materialize in the
+    // ws buffers, before bias/qk-norm/rope and before the KV append — the
+    // delta lands on the projection output, exactly where `W + BA` would
+    // have put it. Per lane: one [t, R] GEMM into scratch, then one
+    // beta=1 GEMM per named site into that lane's token rows. A plain loop,
+    // deliberately: ranks may differ across lanes (different rank =
+    // different traced program, co-batched), and §3.1 measured bucketing
+    // losing to padding — grouping same-rank lanes is a later planner
+    // decision, not a v0 lowering.
+    void apply(cublasHandle_t handle,
+               int layer,
+               const void* qkv_in, int H, int Hq, int Hk,
+               void* q_out, void* v_out,
+               void* xa_scratch) const
+    {
+        for (const Lane& lane : lanes) {
+            const LoraLaneView& v = *lane.view;
+            const int t = static_cast<int>(v.token_count);
+            const int R = static_cast<int>(v.rank);
+            const auto* a_l = static_cast<const std::uint16_t*>(lane.a_bf16) +
+                static_cast<std::size_t>(layer) * R * v.d_in;
+            const auto* b_l = static_cast<const std::uint16_t*>(lane.b_bf16) +
+                static_cast<std::size_t>(layer) * v.d_out * R;
+            const void* x = bf16_row(
+                qkv_in, static_cast<int>(v.token_start), H);
+            // xA^T -> scratch [t, R]. Lanes reuse the same scratch base:
+            // the stream orders each lane's pair before the next lane's
+            // overwrite.
+            ops::gemm_act_x_wt_bf16(
+                handle, x, a_l, xa_scratch, t, R, H);
+            if ((v.sites_bits & kLoraSiteQ) != 0) {
+                ops::gemm_act_x_wt_bf16(
+                    handle, xa_scratch, b_l,
+                    bf16_row(q_out, static_cast<int>(v.token_start), Hq),
+                    t, static_cast<int>(v.d_out), R, /*beta=*/1.f);
+            }
+            if ((v.sites_bits & kLoraSiteV) != 0) {
+                ops::gemm_act_x_wt_bf16(
+                    handle, xa_scratch, b_l,
+                    bf16_row(v_out, static_cast<int>(v.token_start), Hk),
+                    t, static_cast<int>(v.d_out), R, /*beta=*/1.f);
+            }
+        }
+    }
+};
 
 inline void apply_rope(
     const LlamaLikeForwardCfg& fwd_cfg,
@@ -350,7 +534,8 @@ void llama_like_forward_paged(
     bool has_write_desc,
     int runtime_window_left,
     const LlamaLikeVisionInputs* vision,
-    const StageHooks* hooks)
+    const StageHooks* hooks,
+    const LoraTable* lora)
 {
     // Tensor-parallel local dims. tp_size == 1 reverts to single-GPU
     // shapes; the local *_local fields just shadow the unsharded value.
@@ -380,6 +565,17 @@ void llama_like_forward_paged(
     cudaStream_t stream = cublas.stream();
     NcclComm* tp = (T > 1) ? fwd_cfg.tp_comm : nullptr;
     const bool native_bf16_kv_cache = cache.format().is_native_bf16();
+
+    // §5.1 CORRECTION: validate the fire's lora lanes and stage their
+    // adapter weights (f32 channel cells → bf16) once, before the layer
+    // loop. `has_lora` gates every lora-conditional below; when false the
+    // body is byte-for-byte what it was ("with no adapters the code is
+    // what it was").
+    const bool has_lora = lora != nullptr && lora->usable();
+    std::optional<LoraFireState> lora_state;
+    if (has_lora) {
+        lora_state.emplace(*lora, cfg, N, H, Hq, Hk, I, T, stream);
+    }
 
     // When head_dim is padded, the attention kernel runs at `dk`
     // (e.g. 128) and consumes Q/K/V from the *padded* workspace
@@ -520,6 +716,13 @@ void llama_like_forward_paged(
             use_fused_qkv &&
             fast_rows > 0 &&
             decode_fused_post_enabled() &&
+            // A fused edge cannot be a merge point (§5.1): the fused decode
+            // kernel writes V straight to the paged cache, so there is no
+            // materialized v to accumulate the lora delta into before the
+            // append. When the fire carries lora lanes, q/k/v must
+            // materialize in the ws buffers so the CORRECTION lands before
+            // kv_append; the unfused postprocess below is exactly that path.
+            !has_lora &&
             is_pure_decode &&
             !has_custom_mask &&
             (!has_write_desc || (w_page_d != nullptr && w_off_d != nullptr)) &&
@@ -593,6 +796,23 @@ void llama_like_forward_paged(
             ops::gemm_act_x_w(cublas.handle(),
                 qkv_in, make_weight_view(layer.v_proj, layer.v_proj_quant),
                 ws.v.data(), N, Hk, H);
+        }
+
+        // §5.1 CORRECTION, applied the moment the base q/v projections
+        // exist in ws.q / ws.v and before anything consumes them (bias,
+        // qk-norm, rope, KV append). The fused decode postprocess is
+        // disabled above when `has_lora`, so both the fused-QKV and unfused
+        // branches land here with fully materialized [N, ·] buffers.
+        //
+        // Scratch: xA^T borrows ws.gate. At this point in the layer, gate's
+        // last write was the PREVIOUS layer's swiglu output, consumed by
+        // that layer's down_proj GEMM; nothing reads it again before this
+        // layer's MLP overwrites it, and its [max_tokens, I] extent bounds
+        // every [t, R] use (rank <= I is validated at fire setup).
+        if (has_lora) {
+            lora_state->apply(
+                cublas.handle(), L, qkv_in, H, Hq, Hk,
+                ws.q.data(), ws.v.data(), ws.gate.data());
         }
 
         if (!fused_decode_qkv_post && fwd_cfg.use_qkv_bias) {

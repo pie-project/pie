@@ -4132,12 +4132,68 @@ model::LoraLaneView resolve_lane_lora(
             "lora SITES constant is not an integer site bitmask");
     }
 
+    // Adapter geometry comes from the sink arguments' declared value types —
+    // the same flat SSA numbering the fused runtime types against. The rank
+    // is trace-known shape (a different rank = a different traced program,
+    // §6.5), so the plan carries it; a symbolic or non-rank-3 dim would mean
+    // the trace did not commit to a geometry the forward can loop over, and
+    // is refused here rather than mis-sliced per layer.
+    auto static_dims_3 =
+        [&](std::uint32_t value, const char* which) -> const plan::ValueType& {
+        if (value >= stage.value_types.size()) {
+            throw std::runtime_error(
+                std::string("lora sink ") + which +
+                " argument has no declared value type");
+        }
+        const plan::ValueType& type = stage.value_types[value];
+        if (type.dtype != PTIR_DT_F32) {
+            throw std::runtime_error(
+                std::string("lora sink ") + which +
+                " argument is not f32 (the channel wire dtype the consumer "
+                "expects to cast from)");
+        }
+        if (type.dims.size() != 3) {
+            throw std::runtime_error(
+                std::string("lora sink ") + which +
+                " argument is not rank-3 ([num_layers, R, d_in] / "
+                "[num_layers, d_out, R])");
+        }
+        for (const auto& dim : type.dims) {
+            if (dim.symbolic || dim.value == 0) {
+                throw std::runtime_error(
+                    std::string("lora sink ") + which +
+                    " argument has a symbolic or zero dimension; adapter "
+                    "geometry must be trace-known");
+            }
+        }
+        return type;
+    };
+    const plan::ValueType& a_type = static_dims_3(sink->args[0], "A");
+    const plan::ValueType& b_type = static_dims_3(sink->args[1], "B");
+    const std::uint32_t num_layers = a_type.dims[0].value;
+    const std::uint32_t rank = a_type.dims[1].value;
+    const std::uint32_t d_in = a_type.dims[2].value;
+    const std::uint32_t d_out = b_type.dims[1].value;
+    if (b_type.dims[0].value != num_layers || b_type.dims[2].value != rank) {
+        throw std::runtime_error(
+            "lora sink A and B disagree on num_layers/rank: A is [" +
+            std::to_string(num_layers) + ", " + std::to_string(rank) + ", " +
+            std::to_string(d_in) + "], B is [" +
+            std::to_string(b_type.dims[0].value) + ", " +
+            std::to_string(d_out) + ", " +
+            std::to_string(b_type.dims[2].value) + "]");
+    }
+
     return model::LoraLaneView{
         .a = channel_address(sink->args[0], "A"),
         .b = channel_address(sink->args[1], "B"),
         .sites_bits = sites.lit_bits,
         .token_start = lane.token_start,
         .token_count = lane.token_count,
+        .num_layers = num_layers,
+        .rank = rank,
+        .d_in = d_in,
+        .d_out = d_out,
     };
 }
 

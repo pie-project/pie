@@ -27,6 +27,7 @@
 namespace pie_cuda_driver::model {
 
 struct StageHooks;
+struct LoraTable;
 
 enum class RopeKind {
     Standard,      // pure theta-based, used by Qwen 2/3, Phi-3, Mistral
@@ -218,7 +219,14 @@ void llama_like_forward_paged(
     // The fire's stage hooks (`ForwardInputs::stage_hooks`, observation
     // attached by `invoke_body`). Null = no program attached, and every
     // hook-conditional path in the body then folds to its fast form.
-    const StageHooks* hooks = nullptr);
+    const StageHooks* hooks = nullptr,
+    // The fire's resolved lora configuration (`ForwardInputs::lora`,
+    // "model/lora.hpp"). Null = no program in the launch carries the sink,
+    // and the body is exactly what it was (§5.1: the CORRECTION term
+    // vanishes with no adapters). Non-null: the body applies
+    // `x(W+BA)^T = xW^T + (xA^T)B^T` at each lane's declared sites, scoped
+    // to that lane's token rows.
+    const LoraTable* lora = nullptr);
 
 // Map HF's rope_scaling_kind enum onto the driver's RopeKind. Llama3-style
 // frequency scaling maps to YaRN; the "original_yarn" branch keeps

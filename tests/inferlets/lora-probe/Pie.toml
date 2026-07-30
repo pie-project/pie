@@ -1,0 +1,14 @@
+[package]
+name = "lora-probe"
+version = "0.1.0"
+description = "LoRA configuration-sink probe — naive-baseline plus a kernel::lora prologue with host-seeded adapter channels"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
+prompt = {type = "string", optional = true, description = "Prompt to send to the model"}
+max_tokens = {type = "int", optional = true, description = "Number of generated tokens (default: 32)"}
+seed = {type = "int", optional = true, description = "RNG key for Gumbel-max sampling"}
+adapter_scale = {type = "float", optional = true, description = "Scale folded into the B adapter's seed contents (0.0 = the correction term vanishes; default 0.0)"}

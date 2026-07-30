@@ -1354,7 +1354,10 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
             R,
             /*num_images=*/0,
             /*num_clips=*/0,
-            /*has_stage_hooks=*/false);
+            /*has_stage_hooks=*/false,
+            // lora is capability-gated to tp_size == 1 (context.cpp), so a
+            // TP follower can never see a lora fire.
+            /*has_lora=*/false);
         const std::uint32_t graph_layout =
             engine.forward_fn.invoke_graph_layout();
         const std::uint32_t graph_variant =

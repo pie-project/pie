@@ -558,7 +558,8 @@ bool forward_graph_replay_eligible(
     int forward_R,
     int num_images,
     int num_clips,
-    bool has_stage_hooks) {
+    bool has_stage_hooks,
+    bool has_lora) {
     const bool mask_pointers_stable =
         !have_custom_mask ||
         (engine.inputs.custom_mask.data() != nullptr &&
@@ -579,7 +580,8 @@ bool forward_graph_replay_eligible(
             static_cast<std::size_t>(std::max(forward_R, 0))) &&
         num_images == 0 &&
         num_clips == 0 &&
-        !has_stage_hooks;
+        !has_stage_hooks &&
+        !has_lora;
 }
 
 void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) {
@@ -603,7 +605,8 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
         in.forward_R,
         in.num_images,
         in.num_clips,
-        in.stage_hooks != nullptr);
+        in.stage_hooks != nullptr,
+        in.lora != nullptr);
     if (graph_eligible) {
         const std::uint32_t graph_layout =
             engine.forward_fn.invoke_graph_layout();

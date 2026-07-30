@@ -606,7 +606,12 @@ bool forward_graph_replay_eligible(
     int forward_R,
     int num_images,
     int num_clips,
-    bool has_stage_hooks);
+    bool has_stage_hooks,
+    // A fire carrying a resolved lora table must run the direct body: the
+    // correction GEMMs read per-launch channel-cell addresses (and the graph
+    // key carries no adapter identity), so a replayed capture would either
+    // drop the delta or bake a stale adapter in.
+    bool has_lora);
 
 // Run the per-fire forward body directly against `forward_fn.body`. See
 // `ForwardDispatchInputs` for why this is not a graph-replay dispatcher.
