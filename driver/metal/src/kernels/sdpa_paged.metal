@@ -32,8 +32,17 @@
 #include <metal_stdlib>
 using namespace metal;
 
+// The online softmax strides keys by BN=32 simdgroups, so the threadgroup must
+// be exactly BN*BD = 1024 threads: with fewer, the keys belonging to the missing
+// simdgroups are never visited and the attention is silently partial.
+//
+// At D=512 the compiler's default register allocation only admits 896, and a
+// dispatch that exceeds a pipeline's limit does not run AT ALL -- which reads,
+// downstream, as an attention output of exactly zero. gemma4's full-attention
+// layers are 512 wide, so every one of them was skipped. Pinning the bound makes
+// the compiler fit 1024 (spilling if it must) instead of quietly allowing less.
 template <typename T, int D, int V = D>
-[[kernel]] void sdpa_paged_decode(
+[[kernel]] [[max_total_threads_per_threadgroup(1024)]] void sdpa_paged_decode(
     const device T* queries     [[buffer(0)]],   // [N, n_q_heads, D]
     const device T* k_pages     [[buffer(1)]],   // [num_pages, page_size, n_kv_heads, D]
     const device T* v_pages     [[buffer(2)]],

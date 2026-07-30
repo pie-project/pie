@@ -179,6 +179,10 @@ Pso pso_for_mb(const Dispatch& d, const Gemma4Geometry& g, int rows,
         case Kind::RopeQ:
         case Kind::RopeK:
             return g4.rope_prop_mb;
+        // The PLE gate is the one elementwise kernel whose operands have
+        // different row pitches at M>1.
+        case Kind::PleGeglu:
+            return g4.geglu_strided;
         case Kind::KvAppend:
             return mb.kv_append_paged;
         // Paged, and windowed by the same slot for both attention types -- the
@@ -293,15 +297,23 @@ void launch_shape_mb(const Dispatch& d, const Gemma4Geometry& g, int rows, Grid&
             elementwise_mb_dispatch(L >= 0 ? g.intermediate_of(L) : g.intermediate, N, grid, tg);
             return;
         case Kind::PleGeglu:
-            elementwise_mb_dispatch(g.per_layer_emb_dim, N, grid, tg);
+            // One thread per (channel, token row): the strided kernel indexes
+            // both, because its `up` operand strides by the whole PLE table.
+            grid = Grid{std::uint32_t(g.per_layer_emb_dim), std::uint32_t(N), 1};
+            tg = Threadgroup{std::uint32_t(g.per_layer_emb_dim < 256 ? g.per_layer_emb_dim : 256),
+                             1, 1};
             return;
         case Kind::PleCombine:
             elementwise_mb_dispatch(g.n_layers * g.per_layer_emb_dim, N, grid, tg);
             return;
         case Kind::FinalSoftcap:
-            // Only the sampled row is capped, so this stays one row wide even at
-            // M>1 -- capping the whole prefill would be M*vocab of wasted tanh.
-            elementwise_dispatch(g.vocab, grid, tg);
+            // Every row, not just the first. This used to cap one row on the
+            // grounds that only the sampled one matters -- but the row a prefill
+            // samples is the LAST, and the dispatch started at offset 0, so it
+            // capped a row nobody reads and left the one everybody does
+            // uncapped. Capping all of them costs M*vocab of tanh against an LM
+            // head that already computed M*vocab logits.
+            elementwise_mb_dispatch(g.vocab, N, grid, tg);
             return;
         case Kind::Argmax:
             grid = Grid{1024, 1, 1};

@@ -484,6 +484,9 @@ if(APPLE)
   add_metal_linked_test(simple_family_executor_test tests/simple_family_executor_test.cpp NEEDS_LOADER)
   target_compile_definitions(simple_family_executor_test PRIVATE
     PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
+  add_metal_linked_test(gemma4_prefill_numerics_test tests/gemma4_prefill_numerics_test.cpp NEEDS_LOADER)
+  target_compile_definitions(gemma4_prefill_numerics_test PRIVATE
+    PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
   add_metal_linked_test(gemma4_prefill_test tests/gemma4_prefill_test.cpp)
   target_compile_definitions(gemma4_prefill_test PRIVATE
     PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")

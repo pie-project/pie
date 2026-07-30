@@ -30,6 +30,7 @@ bool build_gemma4_psos(RawMetalContext& ctx, const std::string& kernels_dir, Gem
         {"rope.metal", "rope_neox_prop_mb_bfloat16", &out.rope_prop_mb},
         {"rms_norm.metal", "rms_residual_bfloat16", &out.rms_residual},
         {"rms_norm.metal", "rms_residual_scaled_bfloat16", &out.rms_residual_scaled},
+        {"geglu_tanh.metal", "geglu_tanh_strided_bfloat16", &out.geglu_strided},
     };
     for (const Spec& spec : specs) {
         std::string compile_error;

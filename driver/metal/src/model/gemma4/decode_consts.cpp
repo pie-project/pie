@@ -238,8 +238,23 @@ int bind_gemma4_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                 break;
             }
             case Kind::PleGeglu: {
-                const GegluParams p{R * std::uint32_t(g.per_layer_emb_dim)};
-                bind_const<GegluParams>(ctx, ord, (std::uint8_t)bind::Geglu::Params, p, &count);
+                // At M=1 the flat kernel reads a slice at a byte offset. At M>1
+                // the slice strides by the whole table, so the pitches are
+                // stated -- and the two params structs share slot 3, which is
+                // why `paged` (the prefill's marker) picks between them.
+                if (paged) {
+                    const GegluStridedParams p{
+                        std::uint32_t(g.per_layer_emb_dim), R,
+                        std::uint32_t(g.per_layer_emb_dim),
+                        std::uint32_t(g.n_layers * g.per_layer_emb_dim),
+                        std::uint32_t(g.per_layer_emb_dim)};
+                    bind_const<GegluStridedParams>(ctx, ord, (std::uint8_t)bind::Geglu::Params, p,
+                                                   &count);
+                } else {
+                    const GegluParams p{R * std::uint32_t(g.per_layer_emb_dim)};
+                    bind_const<GegluParams>(ctx, ord, (std::uint8_t)bind::Geglu::Params, p,
+                                            &count);
+                }
                 break;
             }
             case Kind::LayerScalar: {
@@ -256,7 +271,8 @@ int bind_gemma4_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                 break;
             }
             case Kind::FinalSoftcap: {
-                const SoftcapParams p{g.final_softcap, std::uint32_t(g.vocab)};
+                // Rows scale it: the cap covers the whole [rows, vocab] block.
+                const SoftcapParams p{g.final_softcap, R * std::uint32_t(g.vocab)};
                 bind_const<SoftcapParams>(ctx, ord, (std::uint8_t)bind::Softcap::Params, p, &count);
                 break;
             }

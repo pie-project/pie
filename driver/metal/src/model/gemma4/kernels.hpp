@@ -24,6 +24,13 @@ namespace pie::metal::gemma4 {
 struct GegluParams {        // geglu_tanh.metal:15   (buffer 3)
     std::uint32_t n;
 };
+struct GegluStridedParams { // geglu_tanh.metal       (buffer 3)
+    std::uint32_t width;
+    std::uint32_t rows;
+    std::uint32_t gate_pitch;
+    std::uint32_t up_pitch;
+    std::uint32_t out_pitch;
+};
 struct SoftcapParams {      // logit_softcap.metal:13 (buffer 2)
     float cap;
     std::uint32_t n;
@@ -70,13 +77,16 @@ struct Gemma4Psos {
     /// in one dispatch. Three a layer, so 105 of the step's barriers.
     Pso rms_residual{};
     Pso rms_residual_scaled{};
+    /// The PLE gate at M>1, whose `up` operand is one layer's slice of a table
+    /// that is `n_layers * ple_dim` wide per row.
+    Pso geglu_strided{};
 
     bool valid() const {
         return sdpa_swa_d256.valid() && sdpa_swa_d512.valid() && geglu_tanh.valid() &&
                logit_softcap.valid() && layer_scalar.valid() && ple_combine.valid() &&
                vnorm.valid() && embed_scaled.valid() && qmv_narrow.valid() &&
                rope_prop.valid() && embed_scaled_mb.valid() && rope_prop_mb.valid() &&
-               rms_residual.valid() && rms_residual_scaled.valid();
+               rms_residual.valid() && rms_residual_scaled.valid() && geglu_strided.valid();
     }
 };
 
