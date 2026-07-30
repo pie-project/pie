@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "model/gemma4/decode_consts.hpp"
+#include "model/gemma4/bind.hpp"
 #include "model/gemma4/scratch.hpp"
 #include "model/gemma4/decode_step.hpp"
 #include "model/gemma4/geometry.hpp"
@@ -232,6 +233,97 @@ void the_dataflow_never_reads_an_unwritten_value() {
               "the final norm reads what the last layer wrote");
 }
 
+// Colouring turns the dataflow into buffers. Two things must hold: no two values
+// that are live at the same time may share one (that is the whole hazard
+// guarantee), and the pool must be small enough to actually allocate.
+void colouring_is_hazard_free_and_small() {
+    std::printf("[scratch colouring]\n");
+    const Gemma4Geometry g;
+    const std::vector<Dispatch> dag = build_gemma4_dag(g);
+    const ScratchPlan plan = build_gemma4_scratch(dag, g);
+    const ScratchColoring c = color_gemma4_scratch(dag, plan);
+
+    expect(c.hazard_free, "no two overlapping values share a buffer");
+    expect(c.colors_used > 0 && c.colors_used < 32,
+           "the pool is a handful of buffers, not one per value (" +
+               std::to_string(c.colors_used) + ")");
+    expect_eq((long long)c.per_dispatch.size(), (long long)dag.size(),
+              "every dispatch has a binding list");
+
+    // Recycling is the point: 500+ values must not become 500+ buffers.
+    const ScratchColoring nr = color_gemma4_scratch(dag, plan, /*no_recycle=*/true);
+    expect_eq(nr.colors_used, plan.value_count, "no_recycle gives every value its own buffer");
+    expect(c.colors_used < nr.colors_used / 10, "recycling collapses that by >10x");
+}
+
+// A KV-shared layer must read pages an OWNING layer of its own attention type
+// wrote. Getting the type wrong reads a sliding layer's window as a full
+// layer's history, which is wrong in a way no shape check would catch.
+void kv_redirect_stays_within_an_attention_type() {
+    std::printf("[kv redirect]\n");
+    const Gemma4Geometry g;
+    int checked = 0;
+    bool same_type = true, owning = true, earlier = true;
+    for (int L = 0; L < g.n_layers; ++L) {
+        if (!g.is_kv_shared(L)) continue;
+        const int src = g.kv_source(L);
+        same_type = same_type && (g.is_sliding(src) == g.is_sliding(L));
+        owning = owning && !g.is_kv_shared(src);
+        earlier = earlier && src < L;
+        ++checked;
+    }
+    expect_eq(checked, 20, "twenty layers share KV");
+    expect(same_type, "each reads a layer of its own attention type");
+    expect(owning, "which owns its pages");
+    expect(earlier, "and comes earlier in the stack");
+}
+
+// A config either describes a shape this driver can schedule, or it is refused.
+// Filling in defaults for a checkpoint whose shape we guessed at would produce
+// plausible-looking wrong tokens, which is the worst available outcome.
+struct Facts {
+    int n_layers = 35, hidden = 1536, intermediate = 6144;
+    int n_q_heads = 8, n_kv_heads = 1, head_dim = 256, global_head_dim = 512;
+    int sliding_window = 512, num_kv_shared_layers = 20, per_layer_emb_dim = 256;
+    int full_attn_interval = 5;
+    bool double_wide_mlp = true;
+    float final_softcap = 30.0f;
+    float rope_theta_full = 1.0e6f, rope_theta_sliding = 1.0e4f, full_partial_rotary = 0.25f;
+    bool present() const { return n_layers > 0 && hidden > 0; }
+};
+
+void a_config_either_describes_a_schedulable_shape_or_is_refused() {
+    std::printf("[geometry from config]\n");
+    Gemma4Geometry g;
+    std::string err;
+
+    // The real E2B config.
+    expect(geometry_from_facts(Facts{}, g, &err), "E2B's shape builds: " + err);
+    expect_eq(g.n_layers, 35, "layers");
+    expect_eq(g.head_dim_of(0), 256, "sliding head_dim");
+    expect_eq(g.head_dim_of(4), 512, "full head_dim");
+    expect_eq(g.first_kv_shared(), 15, "kv split");
+    expect_eq(g.intermediate_of(15), 12288, "double-wide range");
+    expect(g.final_softcap == 30.0f, "softcap");
+
+    // An empty config is not a gemma4 config.
+    Facts empty;
+    empty.n_layers = 0;
+    expect(!geometry_from_facts(empty, g, &err), "an empty text_config is refused");
+
+    // `layer_types` that is not a regular interval: the DAG's schedule assumes
+    // one, so say so rather than mis-schedule.
+    Facts irregular;
+    irregular.full_attn_interval = -1;
+    expect(!geometry_from_facts(irregular, g, &err), "an irregular layer_types is refused");
+
+    // Every layer shared means no layer owns KV for the shared ones to read.
+    Facts all_shared;
+    all_shared.num_kv_shared_layers = all_shared.n_layers;
+    expect(!geometry_from_facts(all_shared, g, &err),
+           "a stack where nothing owns KV is refused");
+}
+
 }  // namespace
 
 int main() {
@@ -243,6 +335,9 @@ int main() {
     a_family_without_ple_or_softcap_drops_those_dispatches();
     matvec_shapes_follow_the_layer();
     the_dataflow_never_reads_an_unwritten_value();
+    colouring_is_hazard_free_and_small();
+    kv_redirect_stays_within_an_attention_type();
+    a_config_either_describes_a_schedulable_shape_or_is_refused();
     std::printf("\n==== gemma4_decode_step_test: %s ====\n",
                 g_failures == 0 ? "all passed" : "FAILURES");
     return g_failures == 0 ? 0 : 1;

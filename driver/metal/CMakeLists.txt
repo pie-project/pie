@@ -96,6 +96,7 @@ if(APPLE)
     src/model/gemma4/decode_consts.cpp
     src/model/gemma4/scratch.cpp
     src/model/gemma4/encode.cpp
+    src/model/gemma4/bind.cpp
     src/model/qwen3_5/decode_step.cpp
     src/model/qwen3_5/decode_step_mb.cpp
     src/kernels/decode_psos.cpp

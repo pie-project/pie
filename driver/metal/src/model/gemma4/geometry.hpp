@@ -21,6 +21,7 @@
 ///  * **The MLP doubles over exactly that range** (`use_double_wide_mlp`).
 
 #include <cstddef>
+#include <string>
 
 namespace pie::metal::gemma4 {
 
@@ -123,5 +124,51 @@ struct Gemma4Geometry {
         return n;
     }
 };
+
+/// Build the geometry a config describes, or report why it cannot be built.
+///
+/// Returns false rather than filling in defaults: a checkpoint whose shape this
+/// driver silently guessed at would produce plausible-looking wrong tokens.
+template <class Facts>
+inline bool geometry_from_facts(const Facts& f, Gemma4Geometry& out, std::string* err) {
+    if (!f.present()) {
+        if (err) *err = "gemma4 geometry: config carried no text_config shape";
+        return false;
+    }
+    if (f.full_attn_interval < 0) {
+        if (err) {
+            *err = "gemma4 geometry: `layer_types` is not a regular interval, which the "
+                   "decode DAG's schedule assumes";
+        }
+        return false;
+    }
+    out.n_layers = f.n_layers;
+    out.hidden = f.hidden;
+    out.intermediate = f.intermediate;
+    out.n_q_heads = f.n_q_heads;
+    out.n_kv_heads = f.n_kv_heads;
+    out.head_dim = f.head_dim;
+    out.global_head_dim = f.global_head_dim > 0 ? f.global_head_dim : f.head_dim;
+    out.sliding_window = f.sliding_window;
+    out.num_kv_shared_layers = f.num_kv_shared_layers;
+    out.per_layer_emb_dim = f.per_layer_emb_dim;
+    out.double_wide_mlp = f.double_wide_mlp;
+    out.final_softcap = f.final_softcap;
+    out.rope_theta_global = f.rope_theta_full;
+    out.rope_theta_local = f.rope_theta_sliding;
+    out.full_partial_rotary = f.full_partial_rotary;
+    if (f.full_attn_interval > 0) out.full_attn_interval = f.full_attn_interval;
+    // A shared layer with no source is a config this driver cannot schedule.
+    for (int L = 0; L < out.n_layers; ++L) {
+        if (out.is_kv_shared(L) && out.kv_source(L) < 0) {
+            if (err) {
+                *err = "gemma4 geometry: layer " + std::to_string(L) +
+                       " shares KV but no earlier layer of its attention type owns any";
+            }
+            return false;
+        }
+    }
+    return true;
+}
 
 }  // namespace pie::metal::gemma4
