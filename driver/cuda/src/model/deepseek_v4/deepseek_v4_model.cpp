@@ -39,11 +39,17 @@ DsV4Model::DsV4Model(
         bool on = !(v != nullptr && v[0] == '0');
         // Paging experts is host work in the middle of the forward -- a routing
         // table read back off the device, a slot chosen, a plan run -- and none
-        // of it is capturable. When the slab holds the whole group it never
-        // happens after the first sweep, so the question is whether the cache
-        // can miss, not whether streaming is on.
+        // of it is capturable.
+        //
+        // Residency does not decide this. A streamed contract publishes groups
+        // instead of stacks, so `stacked` is false and both device-side
+        // dispatches are off the table; the forward takes the per-expert path,
+        // which reads `topk_idx` back and synchronizes the stream on every
+        // layer whether or not the slab can miss. Under capture that
+        // synchronize is `cudaErrorStreamCaptureUnsupported`. Qwen3.5 already
+        // gates on the cache existing at all; this is the same rule.
         for (const auto& L : weights_.layers) {
-            if (L.expert_cache != nullptr && !L.expert_cache->fully_resident()) {
+            if (L.expert_cache != nullptr) {
                 on = false;
                 break;
             }

@@ -143,7 +143,14 @@ public:
         // same thing without it.
         prefetch_enabled_ =
             !loader_config::env_present("PIE_CUDA_STREAM_NO_PREFETCH");
+        CUDA_CHECK(cudaEventCreateWithFlags(&transform_done_,
+                                            cudaEventDisableTiming));
         allocate_slab();
+        // Everything past the allocation can throw -- a missing binding, a
+        // layout that moved, any CUDA_CHECK. The destructor does not run for
+        // an object whose constructor did not finish, so without this a failed
+        // load leaks the whole slab and the pinned tier.
+        try {
         if (fully_resident()) {
             // The budget can hold the group outright, so there is nothing to
             // decide at runtime and no reason to pay for deciding. Fill every
@@ -156,6 +163,12 @@ public:
             allocate_host_tier(host_budget_bytes, total_instances);
             warm_host_tier();
         }
+        } catch (...) {
+            free_slab();
+            free_host_tier();
+            if (transform_done_ != nullptr) cudaEventDestroy(transform_done_);
+            throw;
+        }
     }
 
     ~GroupStreamCache() {
@@ -167,6 +180,7 @@ public:
         }
         free_slab();
         free_host_tier();
+        if (transform_done_ != nullptr) cudaEventDestroy(transform_done_);
     }
 
     /// What paging actually cost, in the terms the next decision needs.
@@ -270,7 +284,7 @@ public:
     /// established by other means -- `all_placed()` -- that residency cannot
     /// change under it, and only wants the pointers.
     const WeightStore* store_of(
-        std::size_t group, std::uint32_t instance) const noexcept
+        std::size_t group, std::uint32_t instance) const
     {
         const auto found = index_.find(flatten(group, instance));
         if (found == GroupSlotIndex::kAbsent) return nullptr;
@@ -601,6 +615,22 @@ private:
 
         const auto started = Clock::now();
         const auto stats = executor.execute(*group.plan, how);
+        // The executor's `flush` synchronizes its copy streams, but a plan's
+        // transforms -- tile maps, MXFP4 and WNA16 dequants, casts -- launch on
+        // the legacy default stream and nothing has waited for those. The
+        // compute stream is created `cudaStreamNonBlocking`, so it carries no
+        // implicit ordering against stream 0, and without this the caller can
+        // launch a GEMM over a slot whose dequant is still running.
+        //
+        // Groups whose plan is pure `ExtentWrite` -- GPT-OSS's packed experts,
+        // which is what this path was measured on -- never expose it. One that
+        // carries a `scale_per_group`, like DeepSeek-V4's, always would.
+        //
+        // An event rather than a synchronize: the point is to order the two
+        // streams, not to stop the host, and `keep_in_host` below reads the
+        // slot on `stream` and needs the same ordering.
+        CUDA_CHECK(cudaEventRecord(transform_done_, nullptr));
+        CUDA_CHECK(cudaStreamWaitEvent(stream, transform_done_, 0));
         stats_.bytes_paged_in += stats.h2d_copy_bytes;
         const std::uint64_t elapsed_ns = static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -764,6 +794,18 @@ private:
                 // `fill` stages into the tier itself; this loop only has to
                 // choose where.
                 fill(scratch, g, i, key, nullptr);
+                // The staging slot is about to be rewritten by the next
+                // iteration, whose copies run on the engine's own non-blocking
+                // streams -- unordered against the D2H `fill` just queued into
+                // the tier. Without this, instance i's tier entry can be
+                // overwritten by instance i+1's page-in while it is still being
+                // read out, and the corruption is invisible: the layout check
+                // passes because only the bytes are wrong.
+                //
+                // In the steady state the same reuse is safe only because
+                // eviction synchronizes first. This loop evicts nothing, so it
+                // has to say so itself.
+                CUDA_CHECK(cudaStreamSynchronize(nullptr));
                 ++staged;
             }
         }
@@ -823,6 +865,10 @@ private:
     std::uint8_t* host_tier_ = nullptr;
     std::uint32_t host_slots_ = 0;
     std::unordered_map<std::uint32_t, std::uint32_t> host_of_;
+
+    /// Orders a page-in's transforms, which run on the legacy default stream,
+    /// against whichever stream the reader is on.
+    cudaEvent_t transform_done_ = nullptr;
 
     /// Distinct instances that have ever been given a slot. Only meaningful
     /// alongside `fully_resident()`, where a slot is never taken back.
