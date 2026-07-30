@@ -6008,3 +6008,116 @@ After this change pie's remaining pie-only GPU cost is ~0.33% (channels)
 plus a PTIR kernel that is at the memory roof. **There is no longer a
 programmability tax large enough to explain the vLLM gap** — which relocates
 the question back to the shared attention/GEMM path.
+
+---
+
+## §20.36 — THE VOCAB TAIL: the logits round-trip is 1.3% of the decode step
+
+§20.35 ended by relocating the gap "back to the shared attention/GEMM path".
+This section finds a piece of that path that is **not** shared — not because
+vLLM does it differently, but because vLLM *structurally cannot* fix it.
+
+### The decode step is bandwidth-bound end to end
+
+`nsys --cuda-graph-trace=node`, 1024 req / conc 512, 262 decode steps:
+
+| segment | GPU time | at the HBM roof? |
+|---|---|---|
+| paged attention (`BatchDecodeWithPagedKVCache`) | 40.3% | yes — ~4.9 GB of KV per step |
+| non-vocab GEMM (186 launches/step) | 39.1% | no — ~160 GB/s, latency-bound |
+| **LM head GEMM** (`s16816gemm_relu_bf16_64x256`, grid=(16,297)) | **5.6%** | yes |
+| **PTIR sampler** (`ptir_fused_*`) | **1.3%** | yes — 872 GB/s |
+| host-channel pipeline (post-§20.35) | 0.3% | — |
+
+The LM head GEMM was found by grid geometry, not by name: grid=(16,297) is
+4752 blocks x (64x256) = exactly 512 x 151936 outputs. It sits two kernels
+before every `ptir_fused_*` launch (252 of 272 windows), behind a
+`rmsnorm grid=(512,1,1)`. **Do not look for `gridX=1187`** — that tiling
+(1187 = ceil(151936/128)) appears only on prefill steps; 262 of 271
+decode windows contain zero of them.
+
+**Vocab tail = 7.0% of GPU time**, and it moves 622 MB/step:
+
+```
+lm_head W read     311 MB   unavoidable
+logits write       156 MB   \  exists only because the sampler
+logits read        156 MB   /  is a SEPARATE KERNEL
+```
+
+622 MB / 682 us (real) = **912 GB/s ~= L40S peak**. Both kernels are already
+at the roof, so there is no kernel-efficiency win here — **the only lever is
+to move fewer bytes.**
+
+### Half of that traffic is deletable, and only pie can delete it
+
+vLLM's sampler is a PyTorch op over a materialised `logits` tensor, so the
+round-trip is structural for it. pie's PTIR is a *compiler* over the guest's
+sampling program: when that program's use of `logits()` is a vocab-axis
+reduction (argmax / top-k), the round-trip can be scheduled away and anything
+unrecognised falls back to today's path. **Programmability stops being a tax
+and becomes the mechanism.**
+
+### MEASURED PRIZE — `/root/p512/lmhead_bench.cu`
+
+Production shape M=512, K=1024, V=151936, bf16; pie's own cuBLASLt call
+convention (`ops/gemm.cpp:1153`); best-of-N with rotated variant order.
+
+| variant | us/step |
+|---|---|
+| A1 full GEMM + argmax over HBM logits **[baseline]** | 1145.6 |
+| A0 full GEMM alone | ~916 |
+| B0 chunked GEMM alone, C=8192 (reused slab) | ~763 |
+| **C chunked GEMM C=16384 + accumulating sampler** | **958.1** |
+
+Three independent repeats: **187.5 / 181.0 / 187.2 us saved** — mean
+**185.2 us, spread 3.6%**, baseline spread 0.6%. **0 / 512 token-id
+mismatches** (deterministic lowest-index tie-break on both sides).
+
+Against the real 14.04 ms decode step that is **1.3% — about 78% of the
+measured 1.7% vLLM gap** — with no tok/s claim required.
+
+### Why it works — two separate effects, both confirmed
+
+1. **The write never reaches HBM.** A0 (writes 156 MB) 916 us vs B0
+   (same GEMM into a reused L2-resident slab) 763 us = **153 us**, against a
+   predicted 156 MB / 864 GB/s = **180 us**. The slab is overwritten every
+   chunk, so dirty lines die in L2.
+2. **The read becomes an L2 read.** Sampler cost 227 us over HBM vs 18 us
+   over an L2-resident slab — but *only* with a warp-reduced accumulator.
+   The naive version carried 1024 running slots per row (6 MB of scratch
+   round-tripped per chunk, 19 chunks) and was **slower than the baseline**
+   (B1 C=8192 = 1367 us vs 1146). Warp-reducing first drops the carried
+   state to 32 slots/row = 131 KB per chunk.
+
+Chunk width is a real optimum, not a free parameter: the GEMM prefers
+C=8192 while the combined pipeline peaks at C=16384. It is a device+model
+property, so it belongs to the planner calibrator (§20.34), **not** to a
+hardcoded constant.
+
+### Traps for whoever implements this
+
+- `launch_lm_head_argmax_bf16` already exists in `kernels/argmax.hpp:29` and
+  claims exactly this ("returns the argmax without materializing [num_rows,
+  vocab] logits"). It has **zero call sites** and is **not reusable here**:
+  `LM_HEAD_TILE_TOKENS = 8` gives grid=(num_rows, 18992), i.e. a GEMV that
+  re-reads all 311 MB of W *per row*. It is a draft-path kernel for
+  num_rows ~ 1. At R=512 it would be catastrophic.
+- The microbench GEMM (cuBLASLt heuristic) is slower than production's
+  autotuned kernel (~916 us vs ~504 us real for the same work). The *saving*
+  is dominated by kernel-independent bandwidth facts, but chunking may cost
+  the production GEMM more than it cost the bench GEMM. **Re-measure in-engine
+  before claiming the full 185 us.**
+- The remaining write side (a true reduction epilogue that never allocates a
+  slab at all) is worth at most another ~30 us over the chunked scheme; it
+  needs CUTLASS EVT. The cheap 90% is plain cuBLAS + a reused buffer.
+- CUDA 13.3 is the default `nvcc` on this box but the driver is 550.x
+  (CUDA 12.x). Build scratch benchmarks with `/usr/local/cuda-12.8/bin/nvcc`
+  or `cublasCreate` fails with `NOT_INITIALIZED`.
+
+### Also settled here
+
+- Attention (40.3%) is at the KV-bandwidth roof: 512 req x ~83 tok x 28
+  layers x 112 KB/tok ~= 4.9 GB/step. No lever short of a narrower KV dtype.
+- The non-vocab GEMMs (39.1%, 186 launches/step) are at neither the bandwidth
+  roof nor the compute roof. That is a separate, larger pool — and it is
+  shared with vLLM, so it is about being *better*, not about catching up.
