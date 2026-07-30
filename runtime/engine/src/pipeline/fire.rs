@@ -1599,7 +1599,12 @@ fn validate_frame<C: FireContext>(
     // its frame) existed only because `fire` serialized such a pass behind
     // every predecessor's settlement, which a frame can never reach: the
     // frame seals one fire short forever. Both halves are gone.
-    for &(_, rep) in fired {
+    // Slot index of the first fire that binds recurrent state, and the set of
+    // channels each slot publishes, so the RS chaining rule below can name the
+    // exact slot pair that is unsupported.
+    let mut first_rs_slot: Option<usize> = None;
+    let mut published_before: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for (slot, &(_, rep)) in fired.iter().enumerate() {
         let fwd: Resource<ForwardPass> = Resource::new_borrow(rep);
         let pass = ctx.resources().get(&fwd)?;
         let bound = match pass.bound() {
@@ -1607,6 +1612,52 @@ fn validate_frame<C: FireContext>(
             Err(error) => return Ok(Err(format!("pipeline: {error}"))),
         };
         let accesses = &bound.instance.program.channel_accesses;
+
+        // ── The one frame shape the CUDA driver cannot execute.
+        //
+        // FramePrepare runs EVERY step's host work at frame entry, before any
+        // of the frame reaches the stream. A step whose descriptor ports are
+        // device-carried normally escapes that by taking the device-composed
+        // template, which resolves ports at kernel time — but that template
+        // refuses any fire carrying RS rows (`try_device_composed_template`
+        // in `driver/cuda/src/pipeline/dispatch.cu` bails on a non-empty
+        // `rs_slot_ids`). So an RS fire falls back to the host readback path
+        // and demands, at frame entry, a cell that an EARLIER SLOT of the same
+        // frame has not produced yet.
+        //
+        // Left unchecked this surfaced as a cascade — `descriptor channel 0
+        // not ready` from the driver, then a poisoned channel in the guest —
+        // that named neither the slot nor the cause. Refuse it here, where
+        // both are known. See `live_slots()` in the SDK, which keeps a linear
+        // lane from building this frame in the first place.
+        if !bound.rs_ws.is_empty() && first_rs_slot.is_none() {
+            first_rs_slot = Some(slot);
+        }
+        if first_rs_slot.is_some() {
+            for (channel, &(consume, _)) in accesses.iter().enumerate() {
+                if !consume {
+                    continue;
+                }
+                let key = Arc::as_ptr(&bound.cells[channel]) as usize;
+                if published_before.contains(&key) {
+                    return Ok(Err(format!(
+                        "pipeline: frame slot {slot} consumes channel {channel}, which an \
+earlier slot of the same frame publishes, and this frame binds recurrent state \
+(slot {}) — the driver resolves an RS fire's descriptors at frame entry, before \
+any slot has run, so it cannot see that value. Submit the chained fire in a \
+LATER frame (a linear lane should size its run-ahead with `live_slots()`, which \
+is 1 for a recurrent model).",
+                        first_rs_slot.expect("set just above")
+                    )));
+                }
+            }
+        }
+        for (channel, &(_, publish)) in accesses.iter().enumerate() {
+            if publish {
+                published_before.insert(Arc::as_ptr(&bound.cells[channel]) as usize);
+            }
+        }
+
         for (cell, &(consume, publish)) in bound.cells.iter().zip(accesses) {
             let key = Arc::as_ptr(cell) as usize;
             let entry = uses.entry(key).or_insert_with(|| ChannelUse {

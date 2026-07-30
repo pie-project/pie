@@ -1161,7 +1161,35 @@ pub fn channel_capacity() -> usize {
 /// the runtime because its `fold-len` picks the RS execution mode for the whole
 /// composed batch, and that is a property of the fire, not of the model.
 pub fn live_slots() -> usize {
-    frame_size()
+    // k for a dense model, 1 for a recurrent (linear/hybrid) one.
+    //
+    // The RS store no longer forces this — its mapping publishes at prepare,
+    // in slot order, so slot i+1 classifies against slot i's decision without
+    // waiting for it to settle. The DRIVER does. A decode fire escapes
+    // host-side descriptor resolution by taking the device-composed template,
+    // and that template refuses any fire carrying RS rows, so an RS fire
+    // resolves its ports on the HOST AT FRAME ENTRY — before any slot of the
+    // frame has run. A run-ahead lane chains slot i+1's token off slot i, so
+    // filling a frame with recurrent decodes asks the driver for a value that
+    // does not exist yet. The engine refuses that frame by name
+    // (`validate_frame` in `runtime/engine/src/pipeline/fire.rs`); this is
+    // what keeps a well-behaved lane from building it at all.
+    //
+    // The cost is small and measured: intra-frame run-ahead is worth about 1%
+    // of decode latency, because the run-ahead that matters is ACROSS frames
+    // and a linear lane still has all of it.
+    thread_local! {
+        static LIVE: std::cell::OnceCell<usize> = const { std::cell::OnceCell::new() };
+    }
+    LIVE.with(|live| {
+        *live.get_or_init(|| {
+            if crate::model::is_linear() {
+                1
+            } else {
+                frame_size()
+            }
+        })
+    })
 }
 
 /// Max embed tokens in a single pass (C) — the guest-side prefill chunk

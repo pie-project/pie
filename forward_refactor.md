@@ -2124,6 +2124,81 @@ assigned and never read.
 engine lib 377 pass / 2 known timing, `cargo check --workspace --all-targets`
 clean, Metal syntax-checks.
 
+#### 10.2.12 What a recurrent fire costs, and why — measured
+
+Benchmarking against vLLM 0.25.1 on one L40S turned up one hard failure and
+one large, precisely-located cost. They have the SAME root.
+
+**The failure.** Every hybrid request died at the default frame size with a
+cascade — `descriptor channel 0 not ready` from the driver, then a poisoned
+guest channel — while `PIE_FRAME_SIZE=1` passed. The cause is a collision
+between two layers that had each moved:
+
+* `validate_frame` dropped its "an RS pass owns its frame" rule once RS
+  mappings began publishing at prepare (§10.2.x), so `live_slots()` returned
+  k for a linear model and a run-ahead lane happily filled a frame with
+  chained decodes.
+* The CUDA driver never gained the matching ability. `FramePrepare` runs
+  EVERY step's host work at frame entry, before any of the frame reaches the
+  stream. A decode fire normally escapes that by taking the device-composed
+  template, which resolves its ports at kernel time — and
+  `try_device_composed_template` (`driver/cuda/src/pipeline/dispatch.cu`)
+  bails on any non-empty `rs_slot_ids`. So an RS fire resolves its ports on
+  the HOST at frame entry and demands a cell that an earlier slot of the same
+  frame has not produced.
+
+Fixed on both sides of the boundary. `live_slots()` now returns 1 for a
+recurrent model, so a well-behaved lane never builds that frame; and
+`validate_frame` refuses it by name, with the slot pair and the reason, so a
+lane that builds it anyway gets an actionable error at submit instead of a
+device cascade. Regression-tested by the `coframe` arm of
+`bin/pie/tests/cuda_rs_buffer_bench.rs`.
+
+**The cost.** `PIE_STEP_PROFILE=1`, 1-wide decode:
+
+| phase | attention (Qwen3-0.6B) | hybrid (Qwen3.5-0.8B) |
+|---|---|---|
+| prepare | 16.2 us | **3131.2 us** |
+| enqueue | 471.5 us | 701.5 us |
+| settle | 56.6 us | 64.1 us |
+
+The 193x is the same host descriptor readback. It does not merely copy — it
+waits, because the token it reads is produced by the previous fire on the
+device. A recurrent decode lane is therefore serialized through the host on
+every single step.
+
+Two consequences worth stating plainly:
+
+* **The RS buffer's cost today is not its write.** Binding `fold-len` as a
+  channel takes a fire out of the decode-envelope class entirely —
+  `classify_decode_envelope` has no case for ANY RS port, so it falls back to
+  host-evaluated geometry, which then refuses a device-carried token
+  (`EmbedTokens is not host-derivable`). A buffered decode loop cannot be
+  device-carried at all. That is a real programmability gap: a speculative
+  decoder's drafts are device-produced by construction.
+* **Both of these dissolve if `try_device_composed_template` learns to carry
+  RS rows.** The RS wire arrays (`rs_slot_ids`, `rs_fold_lens`,
+  `rs_buffer_slot_ids`) are host-known — they come from the engine's RS
+  store, not from device channels — so the template's refusal looks like a
+  gap in the compose kernels rather than an intrinsic one. That is the single
+  highest-value item left on the linear track.
+
+**Measured against vLLM 0.25.1** (one L40S, driver 550, shared
+`benches/common.py` metrics, `VLLM_USE_FLASHINFER_SAMPLER=0`):
+
+| case | pie | vLLM | delta |
+|---|---|---|---|
+| attention latency 16x128 | 436.45 tok/s | 377.24 | +15.7% |
+| attention tput 256x128 | 25648.12 | 27231.68 | -5.8% |
+| hybrid latency 16x128 | 266.33 | 318.21 | -16.3% |
+| hybrid tput 256x128 | 12955.35 | 11431.70 | +13.3% |
+
+The hybrid throughput number moved from 11717.80 to 12955.35 purely because
+the model now runs at the default frame size. The remaining hybrid latency
+gap is NOT host overhead: pie's own forward time for that step is 3.41 ms
+against vLLM's 3.14 ms end-to-end, so it is GDN kernel work.
+
+
 ## 11. The boundary model — ratified after Step B, supersedes §3.3/§3.4 fold modes
 
 Step B shipped the fold modes as three sibling methods because that is the
