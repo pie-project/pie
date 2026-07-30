@@ -7,20 +7,18 @@
 /// recurrent slots and the ping-pong that advances them. gemma4 and gpt-oss
 /// share none of that, and both are the same simpler shape:
 ///
-///   * one decode DAG, one activation pool, contiguous per-layer KV;
+///   * one DAG, one activation pool, paged per-layer KV;
 ///   * no state to carry between tokens beyond the KV itself, so a fresh
-///     sequence is a memset and nothing else;
-///   * M=1 per dispatch, which is what `run_member_forward` already drives —
-///     it replays a prompt one token at a time and reads the logits after each.
+///     sequence is a memset and nothing else.
 ///
 /// So this is not a second executor. It is the family-shaped part of one, and
 /// `Impl` keeps everything that is not family-shaped: the context, the logits
 /// staging, the sequence bookkeeping.
 ///
-/// What it deliberately does NOT do is the paged multi-request path. That needs
-/// a page table per request and a prefill that fires M>1, and neither family has
-/// been through an M>1 numerics walk yet. `MetalExecutor` refuses those fires
-/// for these families rather than running them untested.
+/// ONE schedule serves decode and prefill. `gemma4_prefill_numerics_test`
+/// measures that a decode step is a fire of one row and lands exactly where
+/// firing the whole prompt at once does, so there is no reason to carry a
+/// second M=1-only DAG whose only distinction is that it cannot batch.
 
 #include <cstdint>
 #include <memory>
