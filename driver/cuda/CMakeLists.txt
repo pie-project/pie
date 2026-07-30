@@ -443,6 +443,7 @@ set(PIE_CUDA_MODEL_SOURCES
   src/model/kimi/kimi.cpp
   src/model/kimi/kimi_forward.cpp
   src/model/kimi/kimi_model.cpp
+  src/model/llama_like/declared_forward.cpp
   src/model/llama_like/llama_like.cpp
   src/model/llama_like/llama_like_model.cpp
   src/model/llama_like/mistral3.cpp
