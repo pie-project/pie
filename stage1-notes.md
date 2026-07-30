@@ -139,3 +139,42 @@ domain byte-for-byte. That needs the seed bytes plumbed from instance
 registration to `fire::kv`, and only pays once lora fires can pass a
 (relaxed, lora-aware) canonical gate — deferred until increment 2a gives
 it a consumer.
+
+## Stage 2 — verdict
+
+Recon result: 4 of the 5 plan claims are obsolete or were never true.
+
+- "Multi-row fires are forced solo": false. `preserves_inner_rows` only
+  solos in conjunction with an empty qo tail
+  (`PendingRequest::requires_solo_submission`, worker.rs — the clause is
+  `preserves_inner_rows() && qo_indptr.last() == Some(0)`); ordinary
+  multi-row fires co-batch.
+- "Quest can't co-batch": false today —
+  `tests/inferlets/test_quest_pages.py::test_quest_two_requests` enforces
+  two quest requests batching together.
+- "Needs per-lane page tables": landed pre-plan in ea3c868b ("Track A/B
+  L4: consume the page mask, so Quest actually evicts") — the mask is
+  honoured by gathering the page table per request.
+- "Fused-QKV tap blocks hooks": fixed in stage 1 (`77446890` —
+  `fused_decode_qkv_post` gates on `hook_free_prefix_rows`; hook lanes run
+  the unfused tail, hook-free lanes keep the fused kernel).
+
+RS-buffer solo relax: rejected. `FoldBuffered` is unbatchable by WIT
+contract (the driver rejects a batch mixing folded and forward rows), and
+`Buffer` has zero callers — there is nothing to relax for.
+
+Remaining real item A — structured device-mask co-batch. Honest cost:
+packing a structured mask sets `has_custom_mask`, and the driver's fused
+paths gate on `!has_custom_mask` (llama_like.cpp ~:636-663), so the WHOLE
+fire loses the fused path. Measure before making it a default. Quest
+enablement note: `PIE_CUDA_KV_ENVELOPES=1` at boot is the only switch.
+
+Item B — the `is_pure_decode` hazard — is fixed at admission (this
+branch): a fire carrying an `attn_page_mask`-writing program throws
+mid-body if the fire is not pure decode (llama_like.cpp ~:1040), and no
+scheduler predicate separated prefill from quest-class decode.
+`ProgramFacts::page_mask_sink` is derived at registration,
+`PendingRequest::page_mask_program` is stamped at admission, and
+`LaunchGrouping::accepts` refuses (defers, order-independently) any
+page-mask + multi-token mix. Hook programs without the sink (snapkv
+prefill capture) stay freely mixable.

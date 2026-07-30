@@ -241,6 +241,12 @@ pub(crate) struct PendingRequest {
     /// instance, exactly like `hook_program`; fire planning reads it as the
     /// WEIGHT-class divergence fact (`fire_plan::MemberFacts::lora`).
     pub(crate) lora_program: bool,
+    /// Whether this fire's program writes the `attn_page_mask` sink.
+    /// Stamped at launch admission from the tracked instance, exactly like
+    /// `hook_program`; `LaunchGrouping` reads it to keep page-mask fires
+    /// out of batches with multi-token rows (and vice versa) — the driver
+    /// throws on a written mask off the pure-decode path.
+    pub(crate) page_mask_program: bool,
     pub(crate) prelaunch_copy: Option<crate::driver::KvCopyPlan>,
     pub(crate) prelaunch_state_copy: Option<StateCopyPlan>,
     /// Vesuvius frame identity: which lane/frame/slot this fire belongs to.
@@ -323,6 +329,7 @@ impl PendingRequest {
             // the tracked instance's program flags are available.
             hook_program: false,
             lora_program: false,
+            page_mask_program: false,
             prelaunch_copy,
             prelaunch_state_copy,
             frame,
@@ -332,6 +339,17 @@ impl PendingRequest {
 
     pub(crate) fn wire_row_count(&self) -> usize {
         self.request.qo_indptr.len().saturating_sub(1)
+    }
+
+    /// Whether any qo row of this fire carries more than one token — i.e.
+    /// the fire is NOT pure decode. Derived from `qo_indptr` the same way
+    /// `wire_row_count` reads it: consecutive entries bound each row's
+    /// token span.
+    fn has_multi_token_row(&self) -> bool {
+        self.request
+            .qo_indptr
+            .windows(2)
+            .any(|w| w[1].saturating_sub(w[0]) > 1)
     }
 
     fn requires_solo_submission(&self) -> bool {
@@ -388,6 +406,11 @@ pub(crate) struct LaunchGrouping {
     has_solo_submission: bool,
     has_user_mask: bool,
     has_device_geometry: bool,
+    /// A member's program writes the `attn_page_mask` sink.
+    has_page_mask: bool,
+    /// A member carries a qo row spanning more than one token (chunk
+    /// prefill / multi-token step).
+    has_multi_token: bool,
 }
 
 fn has_dense_device_mask(request: &crate::driver::LaunchPlan) -> bool {
@@ -441,6 +464,24 @@ impl LaunchGrouping {
         {
             return false;
         }
+        // Invariant: a batch containing an `attn_page_mask`-writing program
+        // is pure decode. The driver honours a written mask only on the
+        // paged decode path and THROWS mid-body otherwise
+        // (llama_like.cpp ~:1040, "attn_page_mask was written but this
+        // layer does not take the paged decode path"), killing every lane
+        // in the fire — so a chunk-prefill lane co-batched with a
+        // quest-class decode lane is a whole-wave failure. This clause
+        // converts that throw into a scheduling decision: page-mask
+        // programs and multi-token rows never share a group, in either
+        // admission order. Deliberately narrow — hook programs WITHOUT the
+        // page-mask sink (e.g. snapkv score capture, which is legal on
+        // prefill) keep co-batching with multi-token fires freely.
+        if self.count != 0
+            && ((request.page_mask_program && self.has_multi_token)
+                || (request.has_multi_token_row() && self.has_page_mask))
+        {
+            return false;
+        }
         if self.count == 0 {
             return true;
         }
@@ -467,6 +508,8 @@ impl LaunchGrouping {
         self.has_solo_submission |= request.requires_solo_submission();
         self.has_user_mask |= request.request.has_user_mask;
         self.has_device_geometry |= request.request.device_resolved_geometry;
+        self.has_page_mask |= request.page_mask_program;
+        self.has_multi_token |= request.has_multi_token_row();
         request.requires_solo_submission()
             || has_dense_device_mask(&request.request)
             || self.count >= limits.max_forward_requests
@@ -786,6 +829,12 @@ pub(crate) struct ProgramFacts {
     attention_hooks: bool,
     /// Carries the pass-wide `lora` configuration sink.
     lora_sink: bool,
+    /// Writes the `attn_page_mask` sink (Quest-class page eviction; the
+    /// sink call sits in an OnAttnProj stage, but placement is not part of
+    /// the fact — any stage counts, mirroring `lora_sink`). The driver only
+    /// honours a written mask on the paged decode path, so this is the
+    /// grouping fact that keeps such programs out of multi-token batches.
+    page_mask_sink: bool,
 }
 
 /// The worker-side half of a control that the lane finished executing.
@@ -1075,6 +1124,22 @@ impl DriverLane {
     /// the grouped-plan `PIE_STAGE_REQUIRES_LORA` flag, whose derivation
     /// walk can abort early on a stage the grouped path rejects.
     fn declares_lora_sink(plan: &ProgramRegistration) -> bool {
+        Self::declares_sink(plan, "lora")
+    }
+
+    /// Whether the program writes the `attn_page_mask` sink. Same
+    /// derivation as `declares_lora_sink`; the sink's T11-legal home is an
+    /// OnAttnProj stage, but the scan deliberately covers every stage — the
+    /// fact is "this program writes the mask", not "where".
+    fn declares_page_mask_sink(plan: &ProgramRegistration) -> bool {
+        Self::declares_sink(plan, "attn_page_mask")
+    }
+
+    /// A `SinkCall` op in any stage whose name-table entry is `sink`
+    /// (`pie_ir::registry::KNOWN_SINKS`). Read off the launch package's
+    /// stage ops directly (`LaunchOp.code` is the PTIR wire tag,
+    /// `name_index` points into the program-wide name table).
+    fn declares_sink(plan: &ProgramRegistration, sink: &str) -> bool {
         plan.launch.stages.iter().any(|stage| {
             stage.ops.iter().any(|op| {
                 op.code == u16::from(pie_ir::op::tags::SINK_CALL)
@@ -1082,7 +1147,7 @@ impl DriverLane {
                         .launch
                         .names
                         .get(op.name_index as usize)
-                        .is_some_and(|name| name == "lora")
+                        .is_some_and(|name| name == sink)
             })
         })
     }
@@ -1092,6 +1157,7 @@ impl DriverLane {
         ProgramFacts {
             attention_hooks: Self::declares_attention_hooks(plan),
             lora_sink: Self::declares_lora_sink(plan),
+            page_mask_sink: Self::declares_page_mask_sink(plan),
         }
     }
 
@@ -2973,6 +3039,7 @@ impl BatchScheduler {
                     if let Some(instance) = instances.get(&launch.instance_id) {
                         launch.hook_program = instance.facts.attention_hooks;
                         launch.lora_program = instance.facts.lora_sink;
+                        launch.page_mask_program = instance.facts.page_mask_sink;
                     }
                     // The default single-slot deployment: every tracked fire
                     // IS a one-fire frame. Synthesizing the stamp at accept
@@ -5498,20 +5565,23 @@ mod tests {
         let facts = DriverLane::program_facts(&plan);
         assert!(facts.attention_hooks);
         assert!(facts.lora_sink);
+        assert!(!facts.page_mask_sink);
 
-        // A sink call naming anything but "lora" is a different axis
-        // (the page mask), and a hook-free program stays hook-free.
+        // A sink call naming "attn_page_mask" flips the page-mask axis and
+        // ONLY that axis; a hook-free program stays hook-free.
         let mut masked = plan.clone();
         masked.launch.stages.truncate(1);
         masked.launch.stages[0].ops[0].name_index = 0;
         let facts = DriverLane::program_facts(&masked);
         assert!(!facts.attention_hooks);
         assert!(!facts.lora_sink);
+        assert!(facts.page_mask_sink);
 
         // An empty registration (no launch package) degrades to all-false.
         let facts = DriverLane::program_facts(&ProgramRegistration::default());
         assert!(!facts.attention_hooks);
         assert!(!facts.lora_sink);
+        assert!(!facts.page_mask_sink);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -7326,6 +7396,75 @@ mod tests {
         assert!(
             !ordinary_group.accepts(&host_on_device, limits, 16),
             "resolved-geometry host masks remain incompatible with reordered wire rows"
+        );
+    }
+
+    /// The page-mask/pure-decode grouping invariant: an
+    /// `attn_page_mask`-writing program shares a batch only with
+    /// single-token (decode) rows — the driver throws on a written mask off
+    /// the paged decode path, so mixing would kill the whole fire.
+    #[test]
+    fn launch_grouping_keeps_page_mask_programs_pure_decode() {
+        let limits = SchedulerLimits {
+            max_forward_requests: 8,
+            max_forward_tokens: 4096,
+            max_page_refs: 4096,
+        };
+        let make_page_mask_decode = |instance| {
+            let mut request = dummy_launch_request(ProcessId::new_v4(), instance);
+            request.page_mask_program = true;
+            request
+        };
+        let make_chunk_prefill = |instance| {
+            let mut request = dummy_launch_request(ProcessId::new_v4(), instance);
+            request.request = dummy_prefill(64);
+            request
+        };
+
+        // Page-mask decode + plain single-token decode co-batch.
+        let quest = make_page_mask_decode(1);
+        let decode = dummy_launch_request(ProcessId::new_v4(), 2);
+        let mut grouping = LaunchGrouping::default();
+        assert!(grouping.accepts(&quest, limits, 16));
+        grouping.push(&quest, limits, 16);
+        assert!(
+            grouping.accepts(&decode, limits, 16),
+            "a page-mask program must keep co-batching with pure-decode lanes"
+        );
+
+        // Page-mask first, chunk prefill second: the prefill is refused
+        // from THIS group (deferred to the next wave), not dropped — a
+        // fresh group takes it.
+        let prefill = make_chunk_prefill(3);
+        assert!(
+            !grouping.accepts(&prefill, limits, 16),
+            "a multi-token fire must not join a page-mask batch: the driver \
+             throws on a written mask off the pure-decode path"
+        );
+        let fresh = LaunchGrouping::default();
+        assert!(
+            fresh.accepts(&prefill, limits, 16),
+            "the refused prefill stays schedulable on its own wave"
+        );
+
+        // Order independence: multi-token first, page-mask second also
+        // splits.
+        let mut grouping = LaunchGrouping::default();
+        assert!(grouping.accepts(&prefill, limits, 16));
+        grouping.push(&prefill, limits, 16);
+        assert!(
+            !grouping.accepts(&make_page_mask_decode(4), limits, 16),
+            "a page-mask program must not join a batch holding multi-token rows"
+        );
+
+        // Narrowness: a hook program WITHOUT the page-mask sink (snapkv
+        // score capture — legal on prefill) still co-batches with
+        // multi-token fires.
+        let mut hook_only = dummy_launch_request(ProcessId::new_v4(), 5);
+        hook_only.hook_program = true;
+        assert!(
+            grouping.accepts(&hook_only, limits, 16),
+            "plain hook programs stay freely mixable with prefill"
         );
     }
 

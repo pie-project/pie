@@ -420,6 +420,7 @@ mod tests {
             prebuilt,
             hook_program: false,
             lora_program: false,
+            page_mask_program: false,
             prelaunch_copy: None,
             prelaunch_state_copy: None,
             frame: None,
