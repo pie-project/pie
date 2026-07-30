@@ -64,7 +64,7 @@ _BACKENDS = (_TRITON, _CUDA, _DIFFERENTIAL)
 # kernel's arrival a one-line change here rather than a switch of everything at
 # once. Anything not named is Triton, honestly and by construction.
 _PORTED: frozenset[str] = frozenset(
-    {"candidate", "commit", "mask", "hash", "probe", "copy"}
+    {"candidate", "commit", "mask", "hash", "probe", "copy", "advance_fused"}
 )
 
 
@@ -4092,7 +4092,7 @@ class DeviceBatch:
                 self.grammar.arena_struct().data_ptr(),
                 self.state_struct().data_ptr(),
                 self.found.data_ptr(),
-                self.advance_scratch.data_ptr(),
+                self._fused_scratch(grammar).data_ptr(),
                 self.cand_count.data_ptr(),
                 self.cand_lexer.data_ptr(),
                 self.cand_depth.data_ptr(),
@@ -4329,6 +4329,67 @@ class DeviceBatch:
             ],
             [grammar.mask_words],
             grid_y=self.batch,
+        )
+
+    def _fused_scratch(self, grammar) -> torch.Tensor:
+        """Two replay windows per (sequence, configuration).
+
+        Made on first use rather than at construction: the fused shape is for
+        small batches - where the graph-node dispatch is 44% of a step - and a
+        batch that never takes it should not pay `batch * configs` windows for
+        the possibility. At batch 8 that is 262 KiB; at 512 it would be 17 MiB.
+        """
+        held = getattr(self, "_fused_scratch_buffer", None)
+        if held is None:
+            held = torch.zeros(
+                (self.batch * self.configs, 2 * grammar.window),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self._fused_scratch_buffer = held
+        return held
+
+    def _advance_fused_cuda(self, grammar) -> None:
+        """The whole advance as one kernel: locate, replay, commit.
+
+        Four graph nodes become one, because a block owns a sequence and its
+        configurations are already its own - there is no global work list to
+        count and prefix-sum, and that scan is what a kernel boundary was for.
+        """
+        from gpugrammar import _gpugrammar
+
+        _gpugrammar.cuda_launch(
+            "gg_advance_fused",
+            self.batch,
+            # A thread owns a stack entry in the commit phase and a
+            # configuration in the replay, so the block has to cover the
+            # stride. Rounded to a warp and capped at a block's maximum.
+            min(1024, max(32, (grammar.max_stack + 31) // 32 * 32)),
+            torch.cuda.current_stream().cuda_stream,
+            [
+                self.grammar.arena_struct().data_ptr(),
+                self.state_struct().data_ptr(),
+                self.token.data_ptr(),
+                self.old_lexer.data_ptr(),
+                self.old_count.data_ptr(),
+                self.old_stack.data_ptr(),
+                self.found.data_ptr(),
+                self._fused_scratch(grammar).data_ptr(),
+                self.cand_count.data_ptr(),
+                self.cand_lexer.data_ptr(),
+                self.cand_depth.data_ptr(),
+                self.cand_floor.data_ptr(),
+                self.cand_window.data_ptr(),
+            ],
+            [
+                self.configs,
+                self.max_readings,
+                grammar.max_stack,
+                grammar.max_reductions,
+                grammar.window,
+                grammar.paths,
+                grammar.has_verdicts,
+            ],
         )
 
     def _advance_triton(self) -> None:
@@ -4784,6 +4845,14 @@ class DeviceBatch:
         rows = self.batch * self.configs
         if not _PORTED:
             self._advance_triton()
+            return
+        if "advance_fused" in _PORTED:
+            if self.rollback_depth > 0:
+                self._count_and_scan(
+                    grammar, rows, self.live_counts, self.live_offsets, skip=0, unit=1
+                )
+                self._history_triton(grammar, rows)
+            self._advance_fused_cuda(grammar)
             return
         self._advance_prepare_cuda(grammar, rows)
         if "commit" in _PORTED:

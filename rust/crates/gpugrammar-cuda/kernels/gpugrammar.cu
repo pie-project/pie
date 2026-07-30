@@ -17,3 +17,4 @@
 #include "commit.cuh"
 #include "mask.cuh"
 #include "memo.cuh"
+#include "fused.cuh"
