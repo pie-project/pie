@@ -319,32 +319,54 @@ int main(int argc, char** argv) {
     b.io.resize(kIoSlotCount);
     for (int i = 0; i < kIoSlotCount; ++i) b.io[i] = ctx->heap_alloc(4096);
 
-    // Per-row IO, and the page table one request needs.
-    std::vector<std::uint32_t> pos, req, wpage, woff;
-    pos.resize(std::size_t(N));
-    req.assign(std::size_t(N), 0u);
-    wpage.resize(std::size_t(N));
-    woff.resize(std::size_t(N));
-    for (int i = 0; i < N; ++i) {
-        pos[std::size_t(i)] = std::uint32_t(i);
-        wpage[std::size_t(i)] = std::uint32_t(i / g.kv_page_size);
-        woff[std::size_t(i)] = std::uint32_t(i % g.kv_page_size);
-    }
-    std::vector<std::uint32_t> page_indices;
-    page_indices.resize(std::size_t(g.total_pages));
-    for (int p = 0; p < g.total_pages; ++p) page_indices[std::size_t(p)] = std::uint32_t(p);
-    write_u32s(b.io[int(IoSlot::TokenId)], ids);
-    write_u32s(b.io[int(IoSlot::Position)], pos);
-    write_u32s(b.io[int(IoSlot::ReqOfToken)], req);
-    write_u32s(b.io[int(IoSlot::WPage)], wpage);
-    write_u32s(b.io[int(IoSlot::WOff)], woff);
-    write_u32s(b.io[int(IoSlot::KvPageIndices)], page_indices);
-    write_u32s(b.io[int(IoSlot::KvPageIndptr)], {0u, std::uint32_t(g.total_pages)});
-    write_u32s(b.io[int(IoSlot::QoIndptr)], {0u, std::uint32_t(N)});
+    // Per-row IO and the page table. `starts` gives each request's first token
+    // row, so one fire can carry several of them -- which is what a mixed
+    // prefill+decode batch is.
+    const auto fill_io = [&](const std::vector<std::uint32_t>& toks,
+                             const std::vector<std::uint32_t>& starts, int pages_per_req) {
+        const int rows = int(toks.size());
+        std::vector<std::uint32_t> pos, req, wpage, woff, qo, indptr, page_indices;
+        pos.resize(std::size_t(rows));
+        req.resize(std::size_t(rows));
+        wpage.resize(std::size_t(rows));
+        woff.resize(std::size_t(rows));
+        for (std::size_t r = 0; r + 1 <= starts.size(); ++r) {
+            const int lo = int(starts[r]);
+            const int hi = (r + 1 < starts.size()) ? int(starts[r + 1]) : rows;
+            for (int i = lo; i < hi; ++i) {
+                const int p = i - lo;                      // position within this request
+                pos[std::size_t(i)] = std::uint32_t(p);
+                req[std::size_t(i)] = std::uint32_t(r);
+                // The page this request's p-th token lands in, in ITS page list.
+                wpage[std::size_t(i)] =
+                    std::uint32_t(int(r) * pages_per_req + p / g.kv_page_size);
+                woff[std::size_t(i)] = std::uint32_t(p % g.kv_page_size);
+            }
+        }
+        for (std::uint32_t v : starts) qo.push_back(v);
+        qo.push_back(std::uint32_t(rows));
+        // Each request owns a contiguous run of physical pages; the page LIST is
+        // walked through `kv_page_indptr`, so the two need not coincide.
+        for (std::size_t r = 0; r < starts.size(); ++r) {
+            indptr.push_back(std::uint32_t(int(r) * pages_per_req));
+        }
+        indptr.push_back(std::uint32_t(int(starts.size()) * pages_per_req));
+        page_indices.resize(std::size_t(g.total_pages));
+        for (int p = 0; p < g.total_pages; ++p) page_indices[std::size_t(p)] = std::uint32_t(p);
+        write_u32s(b.io[int(IoSlot::TokenId)], toks);
+        write_u32s(b.io[int(IoSlot::Position)], pos);
+        write_u32s(b.io[int(IoSlot::ReqOfToken)], req);
+        write_u32s(b.io[int(IoSlot::WPage)], wpage);
+        write_u32s(b.io[int(IoSlot::WOff)], woff);
+        write_u32s(b.io[int(IoSlot::KvPageIndices)], page_indices);
+        write_u32s(b.io[int(IoSlot::KvPageIndptr)], indptr);
+        write_u32s(b.io[int(IoSlot::QoIndptr)], qo);
+        std::memset(b.io[int(IoSlot::AttnMaskEnabled)].contents(), 0, std::size_t(rows));
+    };
+    fill_io(ids, {0u}, g.total_pages);
     // No dense mask: the causal bound comes from PositionIds, and the window
     // from the layer's own constant.
     write_u32s(b.io[int(IoSlot::AttnMaskStride)], {0u});
-    std::memset(b.io[int(IoSlot::AttnMaskEnabled)].contents(), 0, std::size_t(N));
 
     Gemma4Psos psos;
     DecodeStepPsos base;
@@ -425,6 +447,60 @@ int main(int argc, char** argv) {
     // point: the prefill path is the same model.
     if (default_prompt) {
         expect(argmax == 3821, "and the prefill's last row agrees with decode and mlx-lm");
+    }
+
+    // ── Two requests in one fire ──
+    //
+    // This is what a mixed prefill+decode batch is made of: several sequences
+    // sharing a command buffer, each with its own position run and its own page
+    // list. If a request's answer is the same whether it fires alone or beside a
+    // neighbour, the CSR and the page tables keep them apart -- and that is the
+    // property continuous batching rests on.
+    //
+    // Request 1 is a PREFIX of request 0, so its own last row has an answer this
+    // test already knows: firing those four tokens ALONE gives 496 (the shape
+    // the tap walk ran, `PIE_G4MB_TOKENS=2,818,3821,563`). It must give 496
+    // again beside a longer sibling -- a different answer from request 0's, out
+    // of the same fire, is the whole point.
+    if (default_prompt) {
+        const int pages_per_req = g.total_pages / 2;
+        std::vector<std::uint32_t> two;
+        two.insert(two.end(), ids.begin(), ids.end());          // request 0: all 8
+        two.insert(two.end(), ids.begin(), ids.begin() + 4);    // request 1: first 4
+        const int rows2 = int(two.size());
+        // Zero the pages so neither request reads what the previous fire wrote.
+        for (int L = 0; L < g.n_layers; ++L) {
+            if (g.is_kv_shared(L)) continue;
+            std::memset(kpages[std::size_t(L)].contents(), 0, kpages[std::size_t(L)].size);
+            std::memset(vpages[std::size_t(L)].contents(), 0, vpages[std::size_t(L)].size);
+        }
+        fill_io(two, {0u, std::uint32_t(N)}, pages_per_req);
+        bind_gemma4_consts(*ctx, dag, g, rows2, /*paged=*/true);
+        ctx->run_step([&](StepEncoder& se) {
+            encode_gemma4_step_mb(se, dag, g, rows2, base, mb, psos);
+        });
+
+        const auto argmax_of = [&](int row) {
+            const auto* r = logits + std::size_t(row) * std::size_t(g.vocab);
+            int bi = -1;
+            float bv = -1e30f;
+            for (int i = 0; i < g.vocab; ++i) {
+                const float v = from_bf16(r[i]);
+                if (v > bv) {
+                    bv = v;
+                    bi = i;
+                }
+            }
+            return bi;
+        };
+        const int a0 = argmax_of(N - 1);          // request 0's last row
+        const int a1 = argmax_of(rows2 - 1);      // request 1's last row
+        std::printf("    (two requests in one fire: r0 last %d, r1 last %d)\n", a0, a1);
+        expect(a0 == 3821,
+               "a request's answer is unchanged by a sibling sharing its fire");
+        expect(a1 == 496,
+               "and the shorter request gets its OWN answer, from its own pages and "
+               "positions -- not its neighbour's");
     }
 
     std::printf("\n==== gemma4_prefill_numerics_test: %s ====\n",
