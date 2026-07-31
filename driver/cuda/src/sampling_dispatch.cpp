@@ -11,6 +11,9 @@
 #include "kernels/scatter_int32.hpp"
 #include "model/qwen3_forward.hpp"
 #include "executor/persistent_inputs.hpp"
+#include "tls_cuda_resource.hpp"
+
+#include <stdexcept>
 
 namespace pie_cuda_driver {
 
@@ -31,17 +34,14 @@ void upload_async(DeviceBuffer<T>& dst, std::span<const T> src,
                                cudaMemcpyHostToDevice, stream));
 }
 
-// Pinned host scratch for the topk+top-p seed widening. Allocated once
-// per process so we can keep upload_sampling_inputs allocation-free.
+// Pinned host scratch for the topk+top-p seed widening. Per-thread RAII so
+// TP rank threads free on exit without racing a process-wide static.
 std::uint64_t* seed64_pinned_buf(std::size_t want_elems) {
-    static std::uint64_t* buf = nullptr;
-    static std::size_t buf_capacity = 0;
-    if (want_elems > buf_capacity) {
-        if (buf) cudaFreeHost(buf);
-        CUDA_CHECK(cudaMallocHost(&buf, want_elems * sizeof(std::uint64_t)));
-        buf_capacity = want_elems;
+    thread_local TlsHostPinnedBuf<std::uint64_t> scratch;
+    if (!scratch.ensure(want_elems)) {
+        throw std::runtime_error("seed64_pinned_buf: cudaMallocHost failed");
     }
-    return buf;
+    return scratch.ptr;
 }
 
 }  // namespace
