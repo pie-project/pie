@@ -18,6 +18,7 @@ members = [
     "mirostat-v2-sampling",
     "mtp-speculative-decoding",
     "naive-baseline",
+    "naive-masked",
     "prefix-tree-kv-cache",
     "quest-attention",
     "tova-attention",

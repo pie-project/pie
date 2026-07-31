@@ -1,0 +1,15 @@
+[package]
+name = "naive-masked"
+version = "0.1.0"
+description = "MEASUREMENT INSTRUMENT (uncommitted): naive-baseline plus a semantically-causal custom AttnMask, so its decode fires take the driver's custom-mask path"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
+prompt = {type = "string", optional = true, description = "Prompt to send to the model"}
+temperature = {type = "float", optional = true, description = "Temperature applied before the Gumbel-max draw (default: 1.0)"}
+max_tokens = {type = "int", optional = true, description = "Number of generated tokens (default: 32)"}
+seed = {type = "int", optional = true, description = "RNG key for Gumbel-max sampling"}
+mask_mode = {type = "string", optional = true, description = "none | dense | structured (default: dense)"}
