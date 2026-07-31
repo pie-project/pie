@@ -77,22 +77,38 @@ inline void dsv4_block_scales_to_fp32(ContractBuilder& b) {
             continue;
         }
         std::vector<std::int64_t> shape = contract_detail::shape_of(raw);
-        auto [expr, local] = b.shard(
-            b.contract().transmute(b.contract().src(std::string(raw.name)), shape,
-                                 pie_loader::raw(PieLoaderDType::E8M0)),
-            shape, b.shard_axis(raw.name));
-        // The exponents become the fp32 factors the FP8 GEMM reads, and the
-        // widening is spelled. The transmute above only says how to *read* the
-        // stored bytes -- one E8M0 exponent per byte -- so declaring F32 over
-        // it would be a relabel of a 1-byte element as a 4-byte one. This is
-        // the same fact `F32Factors` states below, and the two have to agree:
-        // a contract that declares an encoding its expression does not produce
-        // is rejected, which is how this was found the first time a real
-        // DeepSeek-V4 checkpoint was compiled.
-        const PieLoaderEncodingSpec factors = pie_loader::raw(PieLoaderDType::F32);
-        auto defined = b.define(b.output_name(raw.name),
-                                b.contract().cast(expr, factors), factors,
-                                std::move(local));
+        // Declaring F32 over the transmute was the original bug, and the
+        // reason is worth keeping: the transmute says how to *read* the stored
+        // bytes -- one E8M0 exponent each -- so F32 over it relabels a 1-byte
+        // element as a 4-byte one, and the algebra rejects it. That is how
+        // this was found the first time a real DeepSeek-V4 checkpoint was
+        // compiled.
+        //
+        // Spelling the widening as a `cast` fixes the type and cannot survive
+        // tensor parallelism. A cast is a kernel, so it leaves the affine
+        // fragment that `contract::compile` lowers into byte runs, and a
+        // `Shard` can no longer slice it: nested under the shard, compile
+        // refuses it; hoisted above, the executor casts compact sources only;
+        // routed through an `internal()` tensor, a strided slice of a computed
+        // buffer is refused in turn. At TP=1 there is no shard, so all three
+        // stay hidden.
+        //
+        // The widening does not belong here at all. `scaling(..., F32Factors)`
+        // below is the request, and `LoadPlanExecutor` answers it with
+        // `convert_block_scale_to_f32` once the tensor is materialised,
+        // writing the `.f32` companion the FP8 GEMM binds to. So this pass
+        // publishes the exponent bytes and nothing more -- a rename and a
+        // shard, which shards at any degree.
+        //
+        // U8 rather than E8M0, and that part is not cosmetic: the expansion
+        // dispatches on the tensor's dtype and knows only UINT8 and BF16, so
+        // an E8M0 tensor falls through its `return` and the GEMM is handed
+        // exponent bytes it refuses by name. U8 is what every other E8M0 scale
+        // in the tree is declared as.
+        auto [expr, local] = b.shard(b.contract().src(std::string(raw.name)),
+                                     shape, b.shard_axis(raw.name));
+        auto defined = b.define(b.output_name(raw.name), expr,
+                                pie_loader::raw(PieLoaderDType::U8), std::move(local));
         // The pairing this loop just established, stated rather than dropped.
         // The loader used to rediscover it by appending `_scale_inv` and then
         // `.scale` to every F8E4M3 tensor's name, with `group_size` hardcoded to
