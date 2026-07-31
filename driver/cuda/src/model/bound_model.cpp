@@ -11,6 +11,7 @@ std::size_t BoundCudaModel::num_layers() const noexcept {
     case Kind::Gemma4: return gemma4.layers.size();
     case Kind::Gemma3n: return gemma3n.layers.size();
     case Kind::Mixtral: return mixtral.layers.size();
+    case Kind::GptOss: return mixtral.layers.size();
     case Kind::Qwen3_5: return qwen3_5.layers.size();
     case Kind::Qwen3_5Moe: return qwen3_5_moe.layers.size();
     case Kind::NemotronH: return nemotron_h.layers.size();
@@ -108,7 +109,7 @@ BoundCudaModel bind_cuda_model(LoadedModel& engine, bool verbose) {
         bound.kind = BoundCudaModel::Kind::Gemma3n;
         bound.gemma3n = bind_gemma3n(engine);
     } else if (is_gpt_oss) {
-        bound.kind = BoundCudaModel::Kind::Mixtral;
+        bound.kind = BoundCudaModel::Kind::GptOss;
         bound.mixtral = bind_gpt_oss(engine);
     } else if (mt == "mixtral") {
         bound.kind = BoundCudaModel::Kind::Mixtral;

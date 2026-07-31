@@ -30,7 +30,15 @@ fn empty_compile_returns_empty_program() {
     assert!(error.message.is_null());
 
     let view = unsafe { pie_loader_program_view(handle) };
-    assert_eq!(view.version, 4);
+    // Derived, not restated: this test asserts the FFI view reports the
+    // program's declared version, not what that number happens to be. The
+    // number itself is pinned once in storage_compiler.rs. Upstream #496
+    // bumped the constant to 5 and left this literal at 4, so main was red
+    // on it until this merge.
+    assert_eq!(
+        view.version,
+        pie_weight_loader::storage::STORAGE_PROGRAM_VERSION
+    );
     assert_eq!(view.tensors.len, 0);
     assert_eq!(view.buffers.len, 0);
     assert_eq!(view.instrs.len, 0);

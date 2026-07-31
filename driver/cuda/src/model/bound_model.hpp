@@ -27,6 +27,7 @@ struct BoundCudaModel {
         Gemma4,
         Gemma3n,
         Mixtral,
+        GptOss,
         Qwen3_5,
         Qwen3_5Moe,
         NemotronH,
@@ -78,6 +79,7 @@ struct BoundCudaModel {
     bool is_gemma4() const noexcept { return kind == Kind::Gemma4; }
     bool is_gemma3n() const noexcept { return kind == Kind::Gemma3n; }
     bool is_mixtral() const noexcept { return kind == Kind::Mixtral; }
+    bool is_gpt_oss() const noexcept { return kind == Kind::GptOss; }
     bool is_qwen3_5() const noexcept { return kind == Kind::Qwen3_5; }
     bool is_qwen3_5_moe() const noexcept { return kind == Kind::Qwen3_5Moe; }
     bool is_nemotron_h() const noexcept { return kind == Kind::NemotronH; }

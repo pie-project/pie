@@ -11,10 +11,12 @@
 
 #include "cuda_check.hpp"
 #include "distributed.hpp"
+#include "expert_stream_cache.hpp"
 #include "ops/gemm.hpp"
 #include "loader/rust_loader_bridge.hpp"
 #include "loader/rust_storage_executor.hpp"
 #include "model/weight_artifact_cache.hpp"
+#include "model/expert_pack_cache.hpp"
 #include "tensor.hpp"
 
 namespace pie_cuda_driver {
@@ -73,11 +75,13 @@ Mxfp4MoeLowering select_mxfp4_moe_lowering(
         return Mxfp4MoeLowering::Bf16Dequant;
     }
     if (policy == "native") {
-        if (!target.mxfp4_native_gemm) {
+        // GPT-OSS "native" is Marlin-repacked MXFP4 (W4A16), available whenever
+        // Marlin is linked. Blackwell FP4 hardware is a stricter subset.
+        if (!target.mxfp4_native_gemm && !target.gptq_marlin_int4) {
             throw std::runtime_error(
                 "engine: model.mxfp4_moe='native' requested a true MXFP4 "
                 "MoE GEMM backend, but this build has no registered native "
-                "MXFP4 expert GEMM kernels");
+                "MXFP4 / Marlin expert GEMM kernels");
         }
         return Mxfp4MoeLowering::NativeGemm;
     }
@@ -209,6 +213,7 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
     backend_target.mxfp4_moe =
         select_mxfp4_moe_lowering(boot_cfg.model, backend_target);
     e.mxfp4_moe_lowering_ = backend_target.mxfp4_moe;
+    backend_target.stream_routed_experts = boot_cfg.model.stream_routed_experts;
 
     log_stage("open safetensors begin");
     auto loader = SafetensorsCheckpointSource::open(snapshot);
@@ -355,6 +360,34 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
             std::to_string(rust_plan.runtime_tensor_count) +
             " runtime tensors. Add schema/RuntimeABI coverage before enabling "
             "this model.");
+    }
+
+    // SSD expert streaming: the compiled program excluded routed experts
+    // from the resident schedule and attached a deferred stream plan
+    // (template ExtentWrites + per-expert source bindings). Materialize
+    // that plan into the runtime extent table while the program view is live.
+    if (boot_cfg.model.stream_routed_experts) {
+        log_stage("build streamed expert table begin");
+        e.streamed_experts_ = streamed_expert_table_from_program(rust_view);
+        // Offline packs (native Marlin / eager BF16): build/remap with
+        // bounded staging *before* resident materialize so peak VRAM stays
+        // O(one expert). Kind is set by the stream arch recipe.
+        log_stage("ensure streamed expert pack begin");
+        ensure_streamed_expert_pack(
+            e.streamed_experts_, rust_plan.cache_key, loader, verbose);
+        log_stage("ensure streamed expert pack done");
+        log_stage("build streamed expert table done");
+        if (verbose) {
+            std::cerr << "[pie-driver-cuda] expert streaming: "
+                      << e.streamed_experts_.num_layers << "x"
+                      << e.streamed_experts_.num_experts << " experts, "
+                      << (e.streamed_experts_.payload_bytes_per_expert() /
+                          (1024 * 1024))
+                      << " MiB/expert, "
+                      << (e.streamed_experts_.total_payload_bytes() /
+                          (1024ull * 1024ull * 1024ull))
+                      << " GiB total kept on SSD (deferred loader template)\n";
+        }
     }
 
     // Materialized-weight artifact cache (WEIGHT_LOADER_TODO.md A3.1). The

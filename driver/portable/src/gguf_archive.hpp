@@ -61,6 +61,7 @@ public:
     const StTensor* find(const std::string& name) const noexcept override;
     const StTensor& at(const std::string& name) const override;
     std::size_t num_tensors() const noexcept override { return tensors_.size(); }
+    bool is_gguf() const noexcept override { return true; }
 
     const GgufMeta& meta() const noexcept { return meta_; }
 

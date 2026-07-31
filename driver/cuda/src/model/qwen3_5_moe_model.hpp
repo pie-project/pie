@@ -8,6 +8,10 @@
 #include "model/qwen3_5_moe_forward.hpp"
 #include "recurrent_state_cache.hpp"
 
+namespace pie_cuda_driver {
+class ExpertStreamCache;
+}
+
 namespace pie_cuda_driver::model {
 
 // Qwen3.5-MoE IModel (covers Qwen3.6-35B-A3B). Façade over the existing
@@ -32,7 +36,8 @@ public:
         bool force_prefill_path,
         int small_prefill_naive_attention_max_tokens,
         bool graph_safe,
-        bool supports_small_prefill_graph);
+        bool supports_small_prefill_graph,
+        ExpertStreamCache* expert_cache = nullptr);
 
     void prepare(AttentionWorkspace& attn_ws,
                  const ForwardFn::PrepareInputs& in) override;

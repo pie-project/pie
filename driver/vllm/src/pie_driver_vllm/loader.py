@@ -219,24 +219,35 @@ def _ensure_vllm_distributed(vllm_config: Any, rank: int, local_rank: int) -> No
     from vllm.distributed.parallel_state import set_custom_all_reduce
 
     _debug_stage("set_custom_all_reduce: begin")
-    set_custom_all_reduce(not parallel_config.disable_custom_all_reduce)
+    # A single-GPU (world_size==1) group performs no collectives, so custom
+    # all-reduce is dead weight there. Disable it unconditionally in that case.
+    set_custom_all_reduce(
+        parallel_config.world_size > 1
+        and not parallel_config.disable_custom_all_reduce
+    )
     _debug_stage("set_custom_all_reduce: done")
 
     if not dist.is_initialized() and parallel_config.world_size == 1:
         # Single-rank fallback. FileStore avoids picking a port (no contention).
+        #
+        # Use the gloo (CPU) backend, NOT nccl: on one GPU no GPU-side
+        # collectives ever run (vLLM's tensor_model_parallel_all_reduce
+        # short-circuits at world_size==1), but initializing an NCCL
+        # communicator + vLLM's device communicators here eagerly reserves
+        # ~2.8 GB of GPU memory (NCCL comm buffers + kernel modules) that is
+        # never used single-GPU. On small cards (e.g. a 4 GB RTX 3050 under
+        # WSL2) that overhead alone can leave no room for the KV cache and
+        # trips "Insufficient KV cache budget" (see issue #450). gloo keeps the
+        # group valid for CPU metadata broadcasts while touching no GPU memory.
         store_path = tempfile.mktemp(prefix="pie_vllm_singlerank_")
         store = dist.FileStore(store_path, parallel_config.world_size)
-        device_id = (
-            torch.device(f"cuda:{local_rank}") if torch.cuda.is_available() else None
-        )
         _debug_stage("torch init_process_group: begin")
         dist.init_process_group(
-            backend="nccl" if torch.cuda.is_available() else "gloo",
+            backend="gloo",
             store=store,
             rank=rank,
             world_size=parallel_config.world_size,
             timeout=datetime.timedelta(seconds=300),
-            device_id=device_id,
         )
         _debug_stage("torch init_process_group: done")
 

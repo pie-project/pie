@@ -38,6 +38,8 @@ DeviceTensor tensor_view(
 
 constexpr int kViewsPerExpert = 8;
 constexpr int kNativeMxfp4HandlesPerExpert = 9;
+// Streaming keeps only biases resident (gate, up, down).
+constexpr int kStreamingBiasHandlesPerExpert = 3;
 
 int align_up_int(int value, int alignment) {
     return ((value + alignment - 1) / alignment) * alignment;
@@ -61,8 +63,12 @@ MixtralWeights bind_gpt_oss(const LoadedModel& engine) {
             "gpt_oss: intermediate_size must be divisible by tp_size");
     }
     const int I = I_full / T;
+    const bool streaming =
+        engine.streamed_expert_table().num_layers > 0;
     const bool native_mxfp4 =
         engine.mxfp4_moe_lowering() == Mxfp4MoeLowering::NativeGemm;
+    const bool eager_bf16 =
+        engine.mxfp4_moe_lowering() == Mxfp4MoeLowering::Bf16Dequant;
     const int I_native = native_mxfp4 ? align_up_int(I, 128) : I;
     const int L = cfg.num_hidden_layers;
     const int Hq = (cfg.num_attention_heads * cfg.head_dim) / T;
@@ -85,16 +91,20 @@ MixtralWeights bind_gpt_oss(const LoadedModel& engine) {
     w.owned_expert_buffers.reserve(
         static_cast<std::size_t>(L) * E *
         static_cast<std::size_t>(
-            native_mxfp4 ? kNativeMxfp4HandlesPerExpert : kViewsPerExpert));
+            native_mxfp4 ? kNativeMxfp4HandlesPerExpert
+                         : (streaming ? kStreamingBiasHandlesPerExpert
+                                      : kViewsPerExpert)));
     w.layers.resize(static_cast<std::size_t>(L));
 
     const bool has_routed_mxfp4_experts =
+        !streaming &&
         engine.has("model.layers.0.mlp.experts.gate_up_proj.weight");
     const bool has_native_mxfp4_experts =
+        !streaming &&
         engine.has("model.layers.0.mlp.experts.gate_proj.weight") &&
         engine.has("model.layers.0.mlp.experts.up_proj.weight") &&
         engine.has("model.layers.0.mlp.experts.down_proj.weight");
-    if (native_mxfp4 && !has_native_mxfp4_experts) {
+    if (native_mxfp4 && !streaming && !has_native_mxfp4_experts) {
         throw std::runtime_error(
             "gpt_oss: native MXFP4 selected, but loader did not finalize "
             "native gate/up/down expert tensors");
@@ -105,14 +115,15 @@ MixtralWeights bind_gpt_oss(const LoadedModel& engine) {
             "did not select native MXFP4");
     }
     const bool use_mxfp4_packed_experts =
-        has_routed_mxfp4_experts || has_native_mxfp4_experts;
+        (streaming && !eager_bf16) || has_routed_mxfp4_experts ||
+        has_native_mxfp4_experts;
     if (use_mxfp4_packed_experts) {
         if (H % 32 != 0 || I % 32 != 0) {
             throw std::runtime_error(
                 "gpt_oss: packed MXFP4 expert backend requires hidden and "
                 "tp-local intermediate dimensions divisible by 32");
         }
-        if (has_native_mxfp4_experts) {
+        if (native_mxfp4) {
             if (H % 64 != 0 || I_native % 64 != 0) {
                 throw std::runtime_error(
                     "gpt_oss: native MXFP4/Marlin expert backend requires "
@@ -195,7 +206,47 @@ MixtralWeights bind_gpt_oss(const LoadedModel& engine) {
         Lw.router_bias = &must(engine, p + "mlp.router.bias");
 
         Lw.experts.resize(static_cast<std::size_t>(E));
-        if (use_mxfp4_packed_experts) {
+        if (streaming && eager_bf16) {
+            // BF16 weights live in the offline expert pack; only biases resident.
+            const std::string gate_up_bias_name =
+                p + "mlp.experts.gate_up_proj.bias";
+            const std::string down_bias_name =
+                p + "mlp.experts.down_proj.bias";
+            const auto& b_gate_up_all = must(engine, gate_up_bias_name);
+            const auto& b_down_all = must(engine, down_bias_name);
+            const std::vector<std::int64_t> gate_up_bias_shape = {E, 2 * I};
+            const std::vector<std::int64_t> down_bias_shape = {E, H};
+            if (b_gate_up_all.dtype() != DType::BF16 ||
+                b_down_all.dtype() != DType::BF16 ||
+                b_gate_up_all.shape() != gate_up_bias_shape ||
+                b_down_all.shape() != down_bias_shape) {
+                throw std::runtime_error(
+                    "gpt_oss: eager BF16 streaming bias shape mismatch at layer " +
+                    std::to_string(li));
+            }
+            for (int e = 0; e < E; ++e) {
+                auto& Ew = Lw.experts[e];
+                const auto expert_idx = static_cast<std::size_t>(e);
+                Ew.format = MixtralExpertWeightFormat::Bf16;
+
+                auto gate_bias = DeviceTensor::allocate(DType::BF16, {I});
+                auto up_bias = DeviceTensor::allocate(DType::BF16, {I});
+                kernels::launch_deinterleave_vec_bf16(
+                    static_cast<const std::uint8_t*>(b_gate_up_all.data()) +
+                        expert_idx * mxfp4_gate_up_bias_expert_bytes,
+                    gate_bias.data(), up_bias.data(), I, /*stream=*/0);
+                w.owned_expert_buffers.push_back(std::move(gate_bias));
+                Ew.b_gate = &w.owned_expert_buffers.back();
+                w.owned_expert_buffers.push_back(std::move(up_bias));
+                Ew.b_up = &w.owned_expert_buffers.back();
+
+                w.owned_expert_buffers.push_back(tensor_view(
+                    b_down_all,
+                    expert_idx * down_bias_expert_bytes,
+                    {H}));
+                Ew.b_down = &w.owned_expert_buffers.back();
+            }
+        } else if (use_mxfp4_packed_experts) {
             if (has_native_mxfp4_experts) {
                 const std::string gate_name =
                     p + "mlp.experts.gate_proj.weight";
@@ -301,6 +352,49 @@ MixtralWeights bind_gpt_oss(const LoadedModel& engine) {
                         expert_idx * gate_up_bias_expert_bytes,
                         {I}));
                     Ew.b_up = &w.owned_expert_buffers.back();
+                    w.owned_expert_buffers.push_back(tensor_view(
+                        b_down_all,
+                        expert_idx * down_bias_expert_bytes,
+                        {H}));
+                    Ew.b_down = &w.owned_expert_buffers.back();
+                }
+            } else if (streaming) {
+                // Weights live in the stream cache (HF packs or Marlin pack);
+                // only biases are resident.
+                const std::string gate_up_bias_name =
+                    p + "mlp.experts.gate_up_proj.bias";
+                const std::string down_bias_name =
+                    p + "mlp.experts.down_proj.bias";
+                const auto& b_gate_up_all = must(engine, gate_up_bias_name);
+                const auto& b_down_all = must(engine, down_bias_name);
+                const std::vector<std::int64_t> gate_up_bias_shape = {E, 2 * I};
+                const std::vector<std::int64_t> down_bias_shape = {E, H};
+                if (b_gate_up_all.dtype() != DType::BF16 ||
+                    b_down_all.dtype() != DType::BF16 ||
+                    b_gate_up_all.shape() != gate_up_bias_shape ||
+                    b_down_all.shape() != down_bias_shape) {
+                    throw std::runtime_error(
+                        "gpt_oss: streaming path bias shape mismatch at layer " +
+                        std::to_string(li));
+                }
+                for (int e = 0; e < E; ++e) {
+                    auto& Ew = Lw.experts[e];
+                    const auto expert_idx = static_cast<std::size_t>(e);
+                    Ew.format = native_mxfp4
+                        ? MixtralExpertWeightFormat::Mxfp4NativeGemm
+                        : MixtralExpertWeightFormat::Mxfp4RoutedDequant;
+
+                    auto gate_bias = DeviceTensor::allocate(DType::BF16, {I});
+                    auto up_bias = DeviceTensor::allocate(DType::BF16, {I});
+                    kernels::launch_deinterleave_vec_bf16(
+                        static_cast<const std::uint8_t*>(b_gate_up_all.data()) +
+                            expert_idx * mxfp4_gate_up_bias_expert_bytes,
+                        gate_bias.data(), up_bias.data(), I, /*stream=*/0);
+                    w.owned_expert_buffers.push_back(std::move(gate_bias));
+                    Ew.b_gate = &w.owned_expert_buffers.back();
+                    w.owned_expert_buffers.push_back(std::move(up_bias));
+                    Ew.b_up = &w.owned_expert_buffers.back();
+
                     w.owned_expert_buffers.push_back(tensor_view(
                         b_down_all,
                         expert_idx * down_bias_expert_bytes,
@@ -487,7 +581,7 @@ MixtralWeights bind_gpt_oss(const LoadedModel& engine) {
         }
     }
 
-    if (use_mxfp4_packed_experts) {
+    if (use_mxfp4_packed_experts || (streaming && eager_bf16)) {
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
     }

@@ -5,10 +5,13 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <span>
 #include <stdexcept>
 #include <cublas_v2.h>
 
 #include "model/qwen3.hpp"  // for make_weight_view
+#include "expert_stream_cache.hpp"
+#include "model/dsv4_expert_sections.hpp"
 #include "kernels/dequant_fp4.hpp"
 #include "kernels/dequant_fp8.hpp"
 #include "kernels/embed.hpp"
@@ -204,6 +207,27 @@ void dsv4_forward_paged(
     const float hc_post_alpha = 2.0f;
     const int sinkhorn_iters = 20; // from config hc_sinkhorn_iters
 
+    // Per-layer RoPE parameters. Non-compressed layers use plain RoPE at
+    // the base theta. Compressed (C4/C128) layers use the long-context
+    // base (compress_rope_theta) with YaRN interpolation at 1/factor —
+    // reference `layer_rope_freq_base` / `layer_rope_freq_scale`.
+    const bool has_yarn = cfg.rope_factor > 1.f;
+    struct LayerRope {
+        float theta;
+        float freq_scale;
+        float ext_factor;
+    };
+    auto layer_rope = [&](int compress_ratio) -> LayerRope {
+        if (compress_ratio == 0) {
+            return {cfg.rope_theta, 1.f, 0.f};
+        }
+        const float base = cfg.dsv4_compress_rope_theta > 0.f
+            ? cfg.dsv4_compress_rope_theta
+            : cfg.rope_theta;
+        if (!has_yarn) return {base, 1.f, 0.f};
+        return {base, 1.f / cfg.rope_factor, 1.f};
+    };
+
     cudaStream_t stream = nullptr;  // default stream
 
     // TP all-reduce helper (safe: no-op when tp_comm is null)
@@ -315,11 +339,16 @@ void dsv4_forward_paged(
             ws.kv.data(), Lw.kv_norm->data(), ws.kv.data(),
             N, head_dim, eps, stream);
 
-        // Partial RoPE on last qk_rope dims of Q and KV
+        // Partial RoPE on last qk_rope dims of Q and KV (layer-dependent
+        // base + YaRN scaling on compressed layers)
+        const LayerRope lr = layer_rope(Lw.compress_ratio);
         kernels::launch_rope_partial_last_bf16(
             ws.q.data(), ws.kv.data(),
             positions, N, num_heads, 1, head_dim, qk_rope,
-            cfg.rope_theta, stream);
+            lr.theta, stream, /*inverse=*/false,
+            lr.freq_scale, lr.ext_factor,
+            cfg.rope_beta_fast, cfg.rope_beta_slow,
+            cfg.rope_original_max_position);
 
         {
             // SWA attention on ALL layers (every layer has a sliding window).
@@ -336,7 +365,7 @@ void dsv4_forward_paged(
                 ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 N, num_requests, num_heads, 1, head_dim, lv.page_size, stream,
-                /*window_left=*/-1, /*sm_scale=*/-1.f,
+                /*window_left=*/cfg.sliding_window, /*sm_scale=*/-1.f,
                 /*logits_soft_cap=*/0.f,
                 /*lse_out=*/static_cast<float*>(ws.attn_lse.data()));
 
@@ -530,12 +559,9 @@ void dsv4_forward_paged(
                         static_cast<std::size_t>(total_comp) * sizeof(std::int32_t),
                         cudaMemcpyHostToDevice, stream));
 
-                    // Apply RoPE to compressed KV (single head, partial last dims)
-                    // Use compress_rope_theta if available, else base theta
-                    const float comp_theta =
-                        cfg.dsv4_compress_rope_theta > 0.f
-                            ? cfg.dsv4_compress_rope_theta
-                            : cfg.rope_theta;
+                    // Apply RoPE to compressed KV (single head, partial last
+                    // dims). Same layer params as the raw Q/KV rotation —
+                    // compressed layers use the long-context base + YaRN.
                     kernels::launch_rope_partial_last_bf16(
                         ws.comp_kv.data(),  // "q" — will be rotated
                         ws.comp_kv.data(),  // "k" — dummy (same buffer, 0 heads below)
@@ -545,8 +571,11 @@ void dsv4_forward_paged(
                         0,      // num_kv_heads: 0 means skip K rotation
                         head_dim,
                         qk_rope,
-                        comp_theta,
-                        stream);
+                        lr.theta,
+                        stream, /*inverse=*/false,
+                        lr.freq_scale, lr.ext_factor,
+                        cfg.rope_beta_fast, cfg.rope_beta_slow,
+                        cfg.rope_original_max_position);
 
                     // Step 5: Dense attention over compressed KV entries
                     // Build host-side qo_indptr as int for the compressed attention kernel
@@ -589,11 +618,16 @@ void dsv4_forward_paged(
                     N, num_heads, head_dim, stream);
             }
 
-            // Inverse RoPE on attention output (removes position info before projection)
+            // Inverse RoPE on attention output (removes position info before
+            // projection) — same layer-dependent params as the forward
+            // rotation.
             kernels::launch_rope_partial_last_bf16(
                 ws.attn_out.data(), ws.attn_out.data(),
                 positions, N, num_heads, 0, head_dim, qk_rope,
-                cfg.rope_theta, stream, /*inverse=*/true);
+                lr.theta, stream, /*inverse=*/true,
+                lr.freq_scale, lr.ext_factor,
+                cfg.rope_beta_fast, cfg.rope_beta_slow,
+                cfg.rope_original_max_position);
 
             // Grouped output projection: per-group GEMMs with strided I/O.
             //
@@ -821,13 +855,17 @@ void dsv4_forward_paged(
 
         // MoE routing
         if (Lw.is_hash_layer && Lw.tid2eid != nullptr) {
+            // Experts are chosen by token-id hash, but weighted by the
+            // router's sqrtsoftplus probs (normalized over the selection,
+            // then scaled).
             kernels::launch_hash_route_lookup(
                 token_ids,
                 static_cast<const std::int64_t*>(Lw.tid2eid->data()),
+                ws.router_logits.data(),
                 static_cast<std::int32_t*>(ws.topk_idx.data()),
                 static_cast<float*>(ws.topk_weights.data()),
-                N, cfg.vocab_size, K,
-                1.0f / static_cast<float>(K),
+                N, cfg.vocab_size, E, K,
+                cfg.routed_scaling_factor,
                 stream);
         } else {
             kernels::launch_topk_sqrtsoftplus_bf16(
@@ -843,10 +881,15 @@ void dsv4_forward_paged(
                 stream);
         }
 
-        // Routed expert dispatch (MXFP4 weights, dequant to bf16)
+        // Routed expert dispatch (MXFP4 weights, dequant to bf16). Weights
+        // come either from the resident WeightStore or, when SSD expert
+        // streaming is on, from the bounded ExpertStreamCache slab.
         cudaMemsetAsync(ws.moe_out.data(), 0,
                         static_cast<std::size_t>(N) * H * 2, stream);
-        if (!Lw.experts.empty() && Lw.experts[0].w1 != nullptr) {
+        ExpertStreamCache* const expert_cache = fwd_cfg.expert_cache;
+        const bool experts_resident =
+            !Lw.experts.empty() && Lw.experts[0].w1 != nullptr;
+        if (experts_resident || expert_cache != nullptr) {
             std::vector<std::int32_t> topk_idx_h(
                 static_cast<std::size_t>(N) * K);
             std::vector<float> topk_w_h(static_cast<std::size_t>(N) * K);
@@ -861,25 +904,28 @@ void dsv4_forward_paged(
             CUDA_CHECK(cudaStreamSynchronize(stream));
 
             const auto routing = build_routing(topk_idx_h, topk_w_h, N, K, E);
-            for (int e = 0; e < E; ++e) {
+
+            // Dequant + GEMM + scatter for one routed expert whose packed
+            // MXFP4 sections live at the given device pointers.
+            auto run_expert = [&](int e,
+                                  const std::uint8_t* w1,
+                                  const std::uint8_t* w1_scale,
+                                  const std::uint8_t* w2,
+                                  const std::uint8_t* w2_scale,
+                                  const std::uint8_t* w3,
+                                  const std::uint8_t* w3_scale) {
                 const auto& tok_idx = routing.token_idx[static_cast<std::size_t>(e)];
                 const int Ne = static_cast<int>(tok_idx.size());
-                if (Ne == 0) continue;
-                const auto& ew = Lw.experts[static_cast<std::size_t>(e)];
-                if (!ew.w1 || !ew.w1_scale) continue;
                 const auto& wts = routing.weights[static_cast<std::size_t>(e)];
 
                 kernels::launch_dequant_mxfp4_to_bf16(
-                    static_cast<const std::uint8_t*>(ew.w1->data()),
-                    static_cast<const std::uint8_t*>(ew.w1_scale->data()),
+                    w1, w1_scale,
                     ws.expert_gate_w.data(), local_moe_I, H, stream);
                 kernels::launch_dequant_mxfp4_to_bf16(
-                    static_cast<const std::uint8_t*>(ew.w3->data()),
-                    static_cast<const std::uint8_t*>(ew.w3_scale->data()),
+                    w3, w3_scale,
                     ws.expert_up_w.data(), local_moe_I, H, stream);
                 kernels::launch_dequant_mxfp4_to_bf16(
-                    static_cast<const std::uint8_t*>(ew.w2->data()),
-                    static_cast<const std::uint8_t*>(ew.w2_scale->data()),
+                    w2, w2_scale,
                     ws.expert_down_w.data(), H, local_moe_I, stream);
 
                 CUDA_CHECK(cudaMemcpyAsync(
@@ -905,10 +951,11 @@ void dsv4_forward_paged(
                     ws.expert_in.data(),
                     ops::WeightView::raw(ws.expert_up_w.data(), DType::BF16),
                     ws.expert_up.data(), Ne, local_moe_I, H);
-                kernels::launch_swiglu_bf16(
+                kernels::launch_swiglu_clamped_bf16(
                     ws.expert_gate.data(), ws.expert_up.data(),
                     ws.expert_gate.data(),
-                    static_cast<std::size_t>(Ne) * local_moe_I, stream);
+                    static_cast<std::size_t>(Ne) * local_moe_I,
+                    cfg.swiglu_limit, stream);
                 ops::gemm_act_x_w(cublas.handle(),
                     ws.expert_gate.data(),
                     ops::WeightView::raw(ws.expert_down_w.data(), DType::BF16),
@@ -919,6 +966,56 @@ void dsv4_forward_paged(
                     static_cast<const std::int32_t*>(ws.route_idx.data()),
                     static_cast<const float*>(ws.route_w.data()),
                     Ne, H, stream);
+            };
+
+            if (expert_cache != nullptr) {
+                // Selected experts for this layer, paged in in chunks of at
+                // most the cache's slot count. Pointers stay valid for the
+                // chunk: ensure_resident pins the whole batch, and the next
+                // call drains the compute stream before any eviction upload.
+                std::vector<int> selected;
+                selected.reserve(static_cast<std::size_t>(E));
+                for (int e = 0; e < E; ++e) {
+                    if (!routing.token_idx[static_cast<std::size_t>(e)].empty()) {
+                        selected.push_back(e);
+                    }
+                }
+                std::vector<ExpertSectionPointers> ptrs;
+                const std::size_t max_batch =
+                    static_cast<std::size_t>(expert_cache->num_slots());
+                for (std::size_t off = 0; off < selected.size();
+                     off += max_batch) {
+                    const std::size_t chunk =
+                        std::min(max_batch, selected.size() - off);
+                    expert_cache->ensure_resident(
+                        li,
+                        std::span<const int>(selected.data() + off, chunk),
+                        stream, ptrs);
+                    for (std::size_t j = 0; j < chunk; ++j) {
+                        const auto& p = ptrs[j];
+                        require_dsv4_sections(p);
+                        run_expert(selected[off + j],
+                                   dsv4_w1(p), dsv4_w1_scale(p),
+                                   dsv4_w2(p), dsv4_w2_scale(p),
+                                   dsv4_w3(p), dsv4_w3_scale(p));
+                    }
+                }
+            } else {
+                for (int e = 0; e < E; ++e) {
+                    if (routing.token_idx[static_cast<std::size_t>(e)].empty()) {
+                        continue;
+                    }
+                    const auto& ew = Lw.experts[static_cast<std::size_t>(e)];
+                    if (!ew.w1 || !ew.w1_scale) continue;
+                    run_expert(
+                        e,
+                        static_cast<const std::uint8_t*>(ew.w1->data()),
+                        static_cast<const std::uint8_t*>(ew.w1_scale->data()),
+                        static_cast<const std::uint8_t*>(ew.w2->data()),
+                        static_cast<const std::uint8_t*>(ew.w2_scale->data()),
+                        static_cast<const std::uint8_t*>(ew.w3->data()),
+                        static_cast<const std::uint8_t*>(ew.w3_scale->data()));
+                }
             }
         }
 
@@ -930,10 +1027,11 @@ void dsv4_forward_paged(
             ops::gemm_act_x_w(cublas.handle(),
                 ws.norm_y.data(), make_weight_view(Lw.shared_w3, Lw.shared_w3_quant), ws.shared_up.data(),
                 N, local_shared_I, H);
-            kernels::launch_swiglu_bf16(
+            kernels::launch_swiglu_clamped_bf16(
                 ws.shared_gate.data(), ws.shared_up.data(),
                 ws.shared_act.data(),
-                static_cast<std::size_t>(N) * local_shared_I, stream);
+                static_cast<std::size_t>(N) * local_shared_I,
+                cfg.swiglu_limit, stream);
             ops::gemm_act_x_w(cublas.handle(),
                 ws.shared_act.data(), make_weight_view(Lw.shared_w2, Lw.shared_w2_quant), ws.shared_out.data(),
                 N, H, local_shared_I);

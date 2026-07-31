@@ -42,7 +42,7 @@
 //! `"pretokenizers"`, or `"decoders"` respectively.
 //! [`flatten_sequence`] handles this recursively.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -191,14 +191,19 @@ fn from_hf(hf: HfTokenizerJson) -> Result<Tokenizer> {
         build_pipeline(pre_tokenizer_val, normalizer_val)?;
 
     // Build BPE table.
-    // For ByteLevel models, vocab keys are GPT-2-remapped unicode (e.g. "Ġ" = 0x20).
-    // `raw_byte_keys=true` tells BpeTable to invert the GPT-2 mapping so that
-    // internal lookups work on raw bytes directly.
+    // For ByteLevel models, BPE atom vocab keys are GPT-2-remapped unicode
+    // (e.g. "Ġ" = 0x20). `raw_byte_keys=true` inverts that mapping.
+    //
+    // HF also lists added/special tokens inside `model.vocab`, but those
+    // keys are literal content strings (not GPT-2 remapped). Skip their
+    // ids here and register them below via `insert` with raw UTF-8.
+    let added_ids: HashSet<u32> = hf.added_tokens.iter().map(|t| t.id).collect();
     let mut bpe = BpeTable::from_vocab_and_merges(
         &hf.model.vocab,
         &merge_pairs,
         continuing_subword_prefix,
         is_byte_level, // raw_byte_keys
+        &added_ids,
     );
 
     let byte_fallback = hf.model.byte_fallback;
@@ -226,7 +231,9 @@ fn from_hf(hf: HfTokenizerJson) -> Result<Tokenizer> {
         build_decode_steps(decoder_val)?
     };
 
-    // Insert added tokens into the BPE vocab so they can be encoded/decoded.
+    // Insert added tokens with literal UTF-8 content. Their ids were
+    // skipped during GPT-2 vocab re-keying above, so this is the sole
+    // registration path (matches HF: added tokens are not ByteLevel atoms).
     let mut added_tokens = Vec::with_capacity(hf.added_tokens.len());
     for ht in &hf.added_tokens {
         bpe.insert(ht.content.as_bytes().to_vec(), ht.id);

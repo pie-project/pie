@@ -14,7 +14,27 @@
 
 namespace pie_weight_loader {
 
-constexpr static const uint32_t STORAGE_PROGRAM_VERSION = 4;
+/// Storage program format version. See `spec/storage_program.md` for the
+/// per-version contract.
+///
+/// The lineage forked after version 3 and is linearised here:
+///
+/// - `4` — offline GPTQ/AWQ INT4 lowering (tts-arena fork).
+/// - `5` — deferred routed-expert streaming (upstream, originally numbered 4).
+/// - `6` — offline GPT-OSS expert packs (upstream, originally numbered 5), and
+///   the merged head that carries both branches at once.
+///
+/// Both branches changed the format independently, so neither side's `4` (nor
+/// upstream's `5`) describes what a merged compiler emits. This constant is the
+/// declared format identity: it is stamped into every `StorageProgram` and into
+/// `dump`'s `compiler_version`, and re-exported to C++ in `weight_loader.h`.
+/// Reusing a number an unmerged build already published would make two
+/// different formats indistinguishable to anything that reads it.
+///
+/// The on-disk program cache keys off `pie_loader_compiler_version`, which is
+/// the content hash of `src/` (`PIE_WL_COMPILER_HASH`), so it invalidates on
+/// this merge independently of the number chosen here.
+constexpr static const uint32_t STORAGE_PROGRAM_VERSION = 6;
 
 enum class PieLoaderBackendKind {
   Cuda = 0,
@@ -46,6 +66,12 @@ enum class PieLoaderDType {
 enum class PieLoaderEncodingKind {
   Raw = 0,
   Quant = 1,
+};
+
+enum class PieLoaderExpertPackKind {
+  None = 0,
+  GptOssNativeMarlin = 1,
+  GptOssEagerBf16 = 2,
 };
 
 enum class PieLoaderMxfp4MoePolicy {
@@ -315,6 +341,7 @@ struct PieLoaderBackendTargetView {
   uint32_t preferred_alignment;
   PieLoaderMxfp4MoePolicy mxfp4_moe;
   bool native_mxfp4_moe;
+  bool stream_routed_experts;
 };
 
 struct PieLoaderCompileInput {
@@ -433,6 +460,41 @@ struct PieLoaderOptimizerReportView {
   PieLoaderOptimizerPassStatsSlice passes;
 };
 
+struct PieLoaderStreamBindingView {
+  uint32_t file_id;
+  uint64_t file_offset;
+  uint64_t span_bytes;
+};
+
+struct PieLoaderStreamBindingSlice {
+  const PieLoaderStreamBindingView *ptr;
+  size_t len;
+};
+
+struct PieLoaderBytesSlice {
+  const PieLoaderBytes *ptr;
+  size_t len;
+};
+
+struct PieLoaderU64Slice {
+  const uint64_t *ptr;
+  size_t len;
+};
+
+/// Deferred expert-load plan exposed to the C++ stream cache.
+struct PieLoaderStreamPlanView {
+  PieLoaderU32Slice template_;
+  PieLoaderBytesSlice files;
+  uint32_t num_layers;
+  uint32_t num_experts;
+  uint32_t sections_per_expert;
+  PieLoaderStreamBindingSlice bindings;
+  uint64_t slot_bytes;
+  PieLoaderU64Slice section_offsets;
+  PieLoaderU64Slice section_bytes;
+  PieLoaderExpertPackKind pack_kind;
+};
+
 struct PieLoaderStorageProgramView {
   uint32_t version;
   PieLoaderTensorDeclSlice tensors;
@@ -441,6 +503,7 @@ struct PieLoaderStorageProgramView {
   PieLoaderU32Slice schedule;
   PieLoaderMemoryPlanView memory;
   PieLoaderOptimizerReportView optimizer;
+  PieLoaderStreamPlanView stream;
 };
 
 struct PieLoaderError {

@@ -250,6 +250,7 @@ Qwen3_5MoeWeights bind_qwen3_5_moe(const LoadedModel& engine) {
 
     const int T = std::max(1, engine.distributed().tp_size);
     const int rank = engine.distributed().tp_rank;
+    const bool streaming = engine.streamed_expert_table().num_layers > 0;
     int kv_slot = 0;
     for (int li = 0; li < L; ++li) {
         const std::string lp = p + "layers." + std::to_string(li) + ".";
@@ -342,8 +343,14 @@ Qwen3_5MoeWeights bind_qwen3_5_moe(const LoadedModel& engine) {
         // The moe_forward block emits a single all-reduce on the
         // combined routed+shared partial sum.
         Lw.moe_router       = &must(engine, lp + "mlp.gate.weight");
-        Lw.moe_gate_up_proj = &must(engine, lp + "mlp.experts.gate_up_proj");
-        Lw.moe_down_proj    = &must(engine, lp + "mlp.experts.down_proj");
+        if (streaming) {
+            // Routed expert BF16 weights live in the stream cache.
+            Lw.moe_gate_up_proj = nullptr;
+            Lw.moe_down_proj = nullptr;
+        } else {
+            Lw.moe_gate_up_proj = &must(engine, lp + "mlp.experts.gate_up_proj");
+            Lw.moe_down_proj    = &must(engine, lp + "mlp.experts.down_proj");
+        }
         if (has_shared_expert) {
             Lw.shared_gate_proj = &must(engine, lp + "mlp.shared_expert.gate_proj.weight");
             Lw.shared_up_proj   = &must(engine, lp + "mlp.shared_expert.up_proj.weight");

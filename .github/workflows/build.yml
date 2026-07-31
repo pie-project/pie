@@ -268,9 +268,19 @@ jobs:
         # node24 equivalent of ilammy/msvc-dev-cmd (which is node20-only and
         # warns under the Node-20 deprecation). Sets up vcvars so cl.exe is on
         # PATH for the Ninja CUDA build.
+        #
+        # Pin the VC++ toolset. GitHub's windows runner image periodically adds
+        # an MSVC toolset newer than the pinned CUDA 12.9.1 toolkit supports;
+        # without a pin, vcvars activates the newest one and nvcc's front-end
+        # (cudafe++) crashes during CMake's CUDA compiler probe ("unsupported
+        # Microsoft Visual Studio version" / ACCESS_VIOLATION). 14.44 (VS 2022
+        # 17.14, MSVC 19.44) ships on the image and is within CUDA 12.9's
+        # supported host-compiler range. Bump this when the CUDA toolkit is
+        # bumped (or when the image drops 14.44).
         uses: TheMrMilchmann/setup-msvc-dev@v4.0.0
         with:
           arch: x64
+          toolset: "14.44"
 
       - name: Cache cargo
         uses: actions/cache@v5

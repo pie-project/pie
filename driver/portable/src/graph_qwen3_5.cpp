@@ -67,7 +67,12 @@ ggml_tensor* build_qwen3_5_linear_layer(
         : ggml_cast(ctx, L.lin_dt_bias, GGML_TYPE_F32);
     auto* alpha_dt = ggml_add(ctx, alpha, dt_bias);
     auto* sp_alpha = ggml_softplus(ctx, alpha_dt);
-    auto* A_pos = ggml_exp(ctx, L.lin_A_log);                  // [H]
+    // Metal has no bf16 unary kernel — cast to f32 before `exp` (the cast
+    // itself has a Metal CPY pipeline) so the node stays on the GPU.
+    auto* A_log = (L.lin_A_log->type == GGML_TYPE_F32)
+        ? L.lin_A_log
+        : ggml_cast(ctx, L.lin_A_log, GGML_TYPE_F32);
+    auto* A_pos = ggml_exp(ctx, A_log);                        // [H]
     auto* g = ggml_mul(ctx, sp_alpha, A_pos);                  // [H, n_tokens, n_seqs]
     g = ggml_scale(ctx, g, -1.0f);
 
@@ -102,18 +107,27 @@ ggml_tensor* build_qwen3_5_linear_layer(
     auto* k = ggml_reshape_4d(ctx, k_flat, S, n_kh, n_tokens, n_seqs);
     auto* v = ggml_reshape_4d(ctx, v_flat, S, n_vh, n_tokens, n_seqs);
 
-    // ---- 3a. GQA: repeat_interleave Q/K along the head axis to match V.
-    //   Q' [s, k*f+i, t, b] = Q[s, k, t, b] for all i in [0, f).
-    //   Implemented as reshape→repeat_4d (tile along inserted dim)→reshape.
+    // ---- 3a. GQA: expand Q/K along the head axis to match V's n_vh heads.
+    //   The expansion order must match how V's heads are laid out:
+    //   · grouped (HF safetensors): Q'[s, k*f+i] = Q[s, k]  — repeat_interleave
+    //   · tiled   (GGUF converter): Q'[s, k + n_kh*i] = Q[s, k] — ggml_repeat
+    //   Both via reshape→repeat_4d→reshape; only the inserted-dim position
+    //   differs (before vs after the head axis).
     if (gqa_f > 1) {
-        auto interleave = [&](ggml_tensor* x) {
-            x = ggml_reshape_4d(ctx, x, S, 1, n_kh, n_tokens * n_seqs);
-            x = ggml_repeat_4d(ctx, x, S, gqa_f, n_kh, n_tokens * n_seqs);
+        const bool tiled = h.qwen35_linear_v_tiled;
+        auto expand = [&](ggml_tensor* x) {
+            if (tiled) {
+                x = ggml_reshape_4d(ctx, x, S, n_kh, 1, n_tokens * n_seqs);
+                x = ggml_repeat_4d(ctx, x, S, n_kh, gqa_f, n_tokens * n_seqs);
+            } else {
+                x = ggml_reshape_4d(ctx, x, S, 1, n_kh, n_tokens * n_seqs);
+                x = ggml_repeat_4d(ctx, x, S, gqa_f, n_kh, n_tokens * n_seqs);
+            }
             x = ggml_cont(ctx, x);
             return ggml_reshape_4d(ctx, x, S, H, n_tokens, n_seqs);
         };
-        q = interleave(q);
-        k = interleave(k);
+        q = expand(q);
+        k = expand(k);
     }
 
     // ---- 4. L2-norm. The fused op applies the 1/sqrt(S) Q-scale itself

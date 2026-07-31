@@ -21,6 +21,12 @@ struct BackendTarget {
     // expert GEMM kernels; auto selects it only when `mxfp4_native_gemm` is
     // true for the current build and GPU.
     Mxfp4MoeLowering mxfp4_moe = Mxfp4MoeLowering::Bf16Dequant;
+
+    // SSD expert streaming: routed MoE expert weights are omitted from the
+    // resident schedule (no VRAM at load) and described by the program's
+    // deferred stream plan, which the expert stream cache executes into a
+    // bounded GPU slab on demand at forward time.
+    bool stream_routed_experts = false;
 };
 
 }  // namespace pie_cuda_driver

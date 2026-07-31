@@ -883,7 +883,7 @@ fn load_tiktoken_added_tokens(path: &std::path::Path) -> anyhow::Result<Vec<Adde
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     fn make_byte_tokenizer(
         vocab: &[(&str, u32)],
@@ -899,7 +899,13 @@ mod tests {
             .iter()
             .map(|(a, b)| (a.to_string(), b.to_string()))
             .collect();
-        let mut bpe = bpe::BpeTable::from_vocab_and_merges(&vocab_map, &merge_pairs, "", false);
+        let mut bpe = bpe::BpeTable::from_vocab_and_merges(
+            &vocab_map,
+            &merge_pairs,
+            "",
+            false,
+            &HashSet::new(),
+        );
         for at in &added_tokens {
             bpe.insert(at.content.as_bytes().to_vec(), at.id);
         }
@@ -927,7 +933,13 @@ mod tests {
             .iter()
             .map(|(a, b)| (a.to_string(), b.to_string()))
             .collect();
-        let bpe = bpe::BpeTable::from_vocab_and_merges(&vocab_map, &merge_pairs, "", false);
+        let bpe = bpe::BpeTable::from_vocab_and_merges(
+            &vocab_map,
+            &merge_pairs,
+            "",
+            false,
+            &HashSet::new(),
+        );
         Tokenizer::new(
             bpe,
             VocabType::CharLevel,
@@ -1137,7 +1149,75 @@ mod tests {
         let tok = Tokenizer::from_file(&model_path).unwrap();
         assert_eq!(tok.token_to_id("<|im_user|>"), Some(100));
         assert_eq!(tok.encode("<|im_user|>hi<|im_end|>"), vec![100, 0, 1, 101]);
-        assert_eq!(tok.decode(&[100, 0, 1, 101], false), "<|im_user|>hi<|im_end|>");
+        assert_eq!(
+            tok.decode(&[100, 0, 1, 101], false),
+            "<|im_user|>hi<|im_end|>"
+        );
         assert_eq!(tok.decode(&[100, 0, 1, 101], true), "hi");
+    }
+
+    /// Seam between the tokenizer and constrained decoding.
+    ///
+    /// `sorted_vocab` is the only vocabulary the grammar matcher sees: it is
+    /// what `precompute_token_masks` walks when it decides which token ids a
+    /// DFA state accepts. It is built from `BpeTable::id_to_bytes`, so the
+    /// added-token registration rule directly moves grammar masks.
+    ///
+    /// Upstream #480 changed that rule: ids listed in both `vocab` and
+    /// `added_tokens` are now skipped during GPT-2 re-keying and registered
+    /// from their literal content instead. This pins both halves of the
+    /// consequence — a non-ASCII special now decodes to its literal UTF-8,
+    /// while an ASCII special (every Qwen chat/tool special the TTB serving
+    /// path relies on) is unchanged, because GPT-2 re-keying is the identity
+    /// over printable ASCII.
+    #[test]
+    fn sorted_vocab_registers_added_tokens_by_literal_content() {
+        let mut vocab = HashMap::new();
+        vocab.insert("Ġ".to_string(), 0u32); // GPT-2 remapped space (0x20)
+        // ASCII special, the Qwen shape: identical under either rule.
+        let ascii_special = "<|im_start|>";
+        vocab.insert(ascii_special.to_string(), 1u32);
+        // Non-ASCII special, the DeepSeek shape: only correct under the new rule.
+        let wide_special = "<｜end▁of▁sentence｜>";
+        vocab.insert(wide_special.to_string(), 2u32);
+
+        let added_tokens = vec![
+            AddedToken { id: 1, content: ascii_special.to_string(), special: true },
+            AddedToken { id: 2, content: wide_special.to_string(), special: true },
+        ];
+        let skip: HashSet<u32> = added_tokens.iter().map(|t| t.id).collect();
+        let mut bpe = bpe::BpeTable::from_vocab_and_merges(&vocab, &[], "", true, &skip);
+        for at in &added_tokens {
+            bpe.insert(at.content.as_bytes().to_vec(), at.id);
+        }
+        let tok = Tokenizer::new(
+            bpe,
+            VocabType::ByteLevel,
+            vec![],
+            SplitStep::None,
+            vec![],
+            None,
+            added_tokens,
+        );
+
+        let by_id = |id: u32| {
+            tok.sorted_vocab()
+                .iter()
+                .find(|(tid, _)| *tid == id)
+                .map(|(_, s)| s.clone())
+        };
+        assert_eq!(by_id(1).as_deref(), Some(ascii_special));
+        assert_eq!(by_id(2).as_deref(), Some(wide_special));
+        // The BPE atom still round-trips through the GPT-2 inverse.
+        assert_eq!(by_id(0).as_deref(), Some(" "));
+
+        // No id appears twice and none is empty: a duplicate or blank entry
+        // would silently drop a token from every grammar mask.
+        let mut ids: Vec<u32> = tok.sorted_vocab().iter().map(|(id, _)| *id).collect();
+        ids.sort_unstable();
+        let unique = ids.len();
+        ids.dedup();
+        assert_eq!(ids.len(), unique);
+        assert!(tok.sorted_vocab().iter().all(|(_, s)| !s.is_empty()));
     }
 }

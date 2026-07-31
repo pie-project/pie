@@ -1,5 +1,7 @@
 #include "kernels/rope.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <cuda_bf16.h>
 
 namespace pie_cuda_driver::kernels {
@@ -706,6 +708,15 @@ void launch_rope_partial_bf16_position_delta(
 
 namespace {
 
+// DeepSeek-V4 tail RoPE. Rotates ADJACENT dim pairs (2p, 2p+1) — GPT-J /
+// interleaved convention — matching the checkpoint's native layout and the
+// reference `rope_tail_ext_inplace`. Pair p carries frequency
+// theta^(-2p / rotary_dim).
+//
+// YaRN long-context interpolation (compressed layers): the rotation angle
+// blends between the interpolated angle (pos * freq_scale * freq) and the
+// extrapolated angle (pos * freq) with a per-dim ramp between corr_low and
+// corr_high, weighted by ext_factor.
 __global__ void rope_partial_last_bf16_kernel(
     __nv_bfloat16* __restrict__ q,
     __nv_bfloat16* __restrict__ k,
@@ -715,6 +726,10 @@ __global__ void rope_partial_last_bf16_kernel(
     int head_dim,
     int rotary_dim,
     float theta,
+    float freq_scale,
+    float ext_factor,
+    float corr_low,
+    float corr_high,
     bool inverse)
 {
     const int n = blockIdx.x;
@@ -730,7 +745,17 @@ __global__ void rope_partial_last_bf16_kernel(
         const float freq = powf(theta,
             -2.f * static_cast<float>(dim_pair) /
                    static_cast<float>(rotary_dim));
-        const float ang = (inverse ? -1.f : 1.f) * static_cast<float>(pos) * freq;
+        const float theta_extrap = static_cast<float>(pos) * freq;
+        float ang = freq_scale * theta_extrap;
+        if (ext_factor != 0.f) {
+            // rope_yarn_ramp over pair index.
+            const float y = (static_cast<float>(dim_pair) - corr_low) /
+                            fmaxf(0.001f, corr_high - corr_low);
+            const float ramp =
+                (1.f - fminf(1.f, fmaxf(0.f, y))) * ext_factor;
+            ang = ang * (1.f - ramp) + theta_extrap * ramp;
+        }
+        if (inverse) ang = -ang;
         float cos_v, sin_v;
         __sincosf(ang, &sin_v, &cos_v);
 
@@ -739,13 +764,24 @@ __global__ void rope_partial_last_bf16_kernel(
             ? q + static_cast<long long>(n * num_q_heads + head_idx) * head_dim
             : k + static_cast<long long>(n * num_kv_heads + (head_idx - num_q_heads)) * head_dim;
 
-        const int i = offset + dim_pair;
-        const int j = offset + dim_pair + rope_half;
+        const int i = offset + 2 * dim_pair;
+        const int j = i + 1;
         const float a = __bfloat162float(base[i]);
         const float b = __bfloat162float(base[j]);
         base[i] = __float2bfloat16(a * cos_v - b * sin_v);
         base[j] = __float2bfloat16(b * cos_v + a * sin_v);
     }
+}
+
+// YaRN correction dim (same formula as the reference `rope_yarn_corr_dim`):
+// the rotary index at which a wavelength completes `n_rot` cycles over
+// `orig_ctx` tokens.
+float yarn_corr_dim(int rotary_dim, int orig_ctx, float n_rot, float base)
+{
+    return static_cast<float>(rotary_dim) *
+           std::log(static_cast<float>(orig_ctx) /
+                    (n_rot * 2.0f * 3.14159265358979323846f)) /
+           (2.0f * std::log(base));
 }
 
 }  // namespace
@@ -760,16 +796,34 @@ void launch_rope_partial_last_bf16(
     int rotary_dim,
     float theta,
     cudaStream_t stream,
-    bool inverse)
+    bool inverse,
+    float freq_scale,
+    float ext_factor,
+    float beta_fast,
+    float beta_slow,
+    int original_max_position)
 {
     constexpr int BLOCK = 256;
     dim3 grid(num_tokens);
     dim3 block(BLOCK);
+
+    float corr_low = 0.f;
+    float corr_high = 0.f;
+    if (ext_factor != 0.f) {
+        const float start = std::floor(
+            yarn_corr_dim(rotary_dim, original_max_position, beta_fast, theta));
+        const float end = std::ceil(
+            yarn_corr_dim(rotary_dim, original_max_position, beta_slow, theta));
+        corr_low = std::max(0.f, start);
+        corr_high = std::min(static_cast<float>(rotary_dim - 1), end);
+    }
+
     rope_partial_last_bf16_kernel<<<grid, block, 0, stream>>>(
         static_cast<__nv_bfloat16*>(q),
         static_cast<__nv_bfloat16*>(k),
         positions,
-        num_q_heads, num_kv_heads, head_dim, rotary_dim, theta, inverse);
+        num_q_heads, num_kv_heads, head_dim, rotary_dim, theta,
+        freq_scale, ext_factor, corr_low, corr_high, inverse);
 }
 
 }  // namespace pie_cuda_driver::kernels

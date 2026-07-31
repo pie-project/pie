@@ -221,10 +221,10 @@ __global__ void hc_rmsnorm_to_f32_kernel(
     const __nv_bfloat16* row = input + static_cast<long long>(n) * dim;
     float* out = output + static_cast<long long>(n) * dim;
 
-    // Two-pass: first compute sum-of-squares, then scale
-    __shared__ float shared_sum;
-    if (tid == 0) shared_sum = 0.f;
-    __syncthreads();
+    // Two-pass: first compute sum-of-squares, then scale. The cross-warp
+    // reduction is a fixed-order two-stage tree (not atomicAdd) so the
+    // float sum — and therefore the whole forward — is run-to-run
+    // deterministic.
     float local_sum = 0.f;
     for (int d = tid; d < dim; d += blockDim.x) {
         float v = __bfloat162float(row[d]);
@@ -233,14 +233,21 @@ __global__ void hc_rmsnorm_to_f32_kernel(
     // Warp reduce
     for (int offset = 16; offset > 0; offset >>= 1)
         local_sum += __shfl_down_sync(0xFFFFFFFF, local_sum, offset);
-    if (tid % 32 == 0)
-        atomicAdd(&shared_sum, local_sum);
+
+    __shared__ float warp_sums[32];
+    __shared__ float shared_scale;
+    if ((tid & 31) == 0) warp_sums[tid >> 5] = local_sum;
+    __syncthreads();
+    if (tid < 32) {
+        const int num_warps = (blockDim.x + 31) / 32;
+        float v = (tid < num_warps) ? warp_sums[tid] : 0.f;
+        for (int offset = 16; offset > 0; offset >>= 1)
+            v += __shfl_down_sync(0xFFFFFFFF, v, offset);
+        if (tid == 0) shared_scale = rsqrtf(v / dim + eps);
+    }
     __syncthreads();
 
-    if (tid == 0) shared_sum = rsqrtf(shared_sum / dim + eps);
-    __syncthreads();
-
-    const float scale = shared_sum;
+    const float scale = shared_scale;
     for (int d = tid; d < dim; d += blockDim.x) {
         out[d] = __bfloat162float(row[d]) * scale;
     }

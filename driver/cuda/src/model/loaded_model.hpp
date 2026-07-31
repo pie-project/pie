@@ -9,6 +9,7 @@
 #include <utility>
 
 #include "config.hpp"
+#include "expert_stream_cache.hpp"
 #include "loader/backend_target.hpp"
 #include "loader/hf_config.hpp"
 #include "loader/safetensors.hpp"
@@ -66,6 +67,13 @@ public:
     // the weight is plain bf16/fp16/fp32 (the common case).
     std::optional<QuantMeta> quant_meta(const std::string& name) const;
 
+    // Per-expert file extents from the compiler's deferred stream plan when
+    // `[model].stream_routed_experts` is on (empty otherwise). Feeds the
+    // ExpertStreamCache constructed by the engine after load.
+    const StreamedExpertTable& streamed_expert_table() const noexcept {
+        return streamed_experts_;
+    }
+
 private:
     // Owns runtime-layout tensors produced by the Rust storage-program loader.
     // Some names are non-owning views into packed backing tensors so older
@@ -74,6 +82,7 @@ private:
     HfConfig hf_;
     WeightStore weights_;
     Mxfp4MoeLowering mxfp4_moe_lowering_ = Mxfp4MoeLowering::Bf16Dequant;
+    StreamedExpertTable streamed_experts_;
 };
 
 namespace ops { struct RuntimeQuantScratchSpec; }

@@ -42,6 +42,7 @@ fn compile(input: &PieLoaderCompileInput) -> Result<StorageProgram, CompileError
         preferred_alignment: input.target.preferred_alignment.max(1),
         mxfp4_moe: mxfp4_policy(input.target.mxfp4_moe),
         native_mxfp4_moe: input.target.native_mxfp4_moe,
+        stream_routed_experts: input.target.stream_routed_experts,
     };
     let abi = if input.runtime_abi.tensors.len == 0 {
         crate::abi::RuntimeAbi::default_for_target(&metadata, &model, &target)?

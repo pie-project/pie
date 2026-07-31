@@ -6,7 +6,27 @@ use crate::types::{
     TensorDecl, TensorId,
 };
 
-pub const STORAGE_PROGRAM_VERSION: u32 = 4;
+/// Storage program format version. See `spec/storage_program.md` for the
+/// per-version contract.
+///
+/// The lineage forked after version 3 and is linearised here:
+///
+/// - `4` — offline GPTQ/AWQ INT4 lowering (tts-arena fork).
+/// - `5` — deferred routed-expert streaming (upstream, originally numbered 4).
+/// - `6` — offline GPT-OSS expert packs (upstream, originally numbered 5), and
+///   the merged head that carries both branches at once.
+///
+/// Both branches changed the format independently, so neither side's `4` (nor
+/// upstream's `5`) describes what a merged compiler emits. This constant is the
+/// declared format identity: it is stamped into every `StorageProgram` and into
+/// `dump`'s `compiler_version`, and re-exported to C++ in `weight_loader.h`.
+/// Reusing a number an unmerged build already published would make two
+/// different formats indistinguishable to anything that reads it.
+///
+/// The on-disk program cache keys off `pie_loader_compiler_version`, which is
+/// the content hash of `src/` (`PIE_WL_COMPILER_HASH`), so it invalidates on
+/// this merge independently of the number chosen here.
+pub const STORAGE_PROGRAM_VERSION: u32 = 6;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryPlan {
@@ -26,6 +46,7 @@ pub struct StorageTarget {
     pub preferred_alignment: u32,
     pub mxfp4_moe: Mxfp4MoePolicy,
     pub native_mxfp4_moe: bool,
+    pub stream_routed_experts: bool,
 }
 
 impl Default for StorageTarget {
@@ -38,6 +59,7 @@ impl Default for StorageTarget {
             preferred_alignment: 1,
             mxfp4_moe: Mxfp4MoePolicy::RoutedDecode,
             native_mxfp4_moe: false,
+            stream_routed_experts: false,
         }
     }
 }
@@ -175,6 +197,74 @@ pub enum StorageInstr {
     },
 }
 
+/// Offline expert-pack materialization requested by a stream recipe.
+///
+/// When non-[`Self::None`], the CUDA driver builds (or opens) a transformed
+/// host pack with bounded staging before paging sections through the expert
+/// stream cache. Plain ExtentWrite streams (HF packs / Mixtral BF16) leave
+/// this as `None`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[repr(u32)]
+pub enum ExpertPackKind {
+    #[default]
+    None = 0,
+    GptOssNativeMarlin = 1,
+    GptOssEagerBf16 = 2,
+}
+
+/// One deferred source extent for a streamed expert section.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamBinding {
+    pub file_id: FileId,
+    pub file_offset: u64,
+    pub span_bytes: u64,
+}
+
+/// Deferred expert-load plan: one reusable instruction template plus
+/// per-(layer, expert) source bindings. Empty when streaming is off.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamPlan {
+    /// Instr IDs into [`StorageProgram::instrs`] that are **not** on
+    /// [`StorageProgram::schedule`]. Each is typically an `ExtentWrite`
+    /// whose `dest.offset` is relative to a cache-slot base
+    /// (`dest.buffer == BufferId(u32::MAX)`).
+    pub template: Vec<InstrId>,
+    /// Checkpoint shard paths indexed by `FileId`.
+    pub files: Vec<String>,
+    pub num_layers: u32,
+    pub num_experts: u32,
+    pub sections_per_expert: u32,
+    /// Flat `[num_layers * num_experts * sections_per_expert]` bindings in
+    /// template section order.
+    pub bindings: Vec<StreamBinding>,
+    /// Aligned bytes per expert slot (sum of section sizes with padding).
+    pub slot_bytes: u64,
+    /// Per-section slot-relative offsets (`len == sections_per_expert`).
+    pub section_offsets: Vec<u64>,
+    /// Per-section payload sizes (`len == sections_per_expert`).
+    pub section_bytes: Vec<u64>,
+    /// Offline pack builder selected by the stream arch recipe.
+    #[serde(default)]
+    pub pack_kind: ExpertPackKind,
+}
+
+impl StreamPlan {
+    pub fn is_empty(&self) -> bool {
+        self.template.is_empty()
+    }
+
+    pub fn binding(&self, layer: u32, expert: u32, section: u32) -> Option<&StreamBinding> {
+        if layer >= self.num_layers
+            || expert >= self.num_experts
+            || section >= self.sections_per_expert
+        {
+            return None;
+        }
+        let idx = ((layer * self.num_experts + expert) * self.sections_per_expert + section) as usize;
+        self.bindings.get(idx)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageProgram {
     pub version: u32,
@@ -185,6 +275,7 @@ pub struct StorageProgram {
     pub instrs: Vec<StorageInstr>,
     pub schedule: Vec<InstrId>,
     pub memory: MemoryPlan,
+    pub stream: StreamPlan,
 }
 
 impl StorageProgram {
@@ -198,6 +289,7 @@ impl StorageProgram {
             instrs: Vec::new(),
             schedule: Vec::new(),
             memory: MemoryPlan::default(),
+            stream: StreamPlan::default(),
         }
     }
 
