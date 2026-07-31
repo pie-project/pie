@@ -6,7 +6,7 @@
 //!
 //! Reference: Qwen2.5 Jinja chat template.
 
-use crate::model::instruct::qwen3::{ChatMLConfig, QwenInstruct};
+use crate::model::instruct::qwen3::{ChatMLConfig, QwenInstruct, ToolCallFormat};
 use crate::model::tokenizer::Tokenizer;
 use std::sync::Arc;
 
@@ -78,6 +78,7 @@ pub fn new(tokenizer: Arc<Tokenizer>) -> QwenInstruct {
         ChatMLConfig {
             has_thinking: false,
             has_tools: true,
+            tool_call_format: ToolCallFormat::Json,
             generation_suffix: "",
             stop_tokens: &["<|im_end|>", "<|endoftext|>"],
         },

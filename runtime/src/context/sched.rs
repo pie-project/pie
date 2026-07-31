@@ -147,15 +147,20 @@ pub(crate) struct AuctionResult {
 
 /// A deferred GPU page operation stored on `ctx.deferred_ops`.
 ///
-/// On success, `on_alloc` is called with pre-allocated pages.
+/// On success, `on_complete` is called with pre-allocated pages.
 /// On cancellation (destroy), the struct is dropped — dropping the closure
 /// drops the captured `oneshot::Sender`, closing the channel.
 pub(crate) struct PendingAlloc {
     pub driver: usize,
     pub num_pages: usize,
     pub needs_rs_slot: bool,
-    /// Callback invoked with allocated pages on success.
-    pub on_alloc: Box<dyn FnOnce(&mut ContextManager, Vec<PhysicalPageId>) + Send>,
+    /// Callback invoked with allocated pages or the terminal restoration error.
+    pub on_complete: Box<
+        dyn FnOnce(
+                &mut ContextManager,
+                std::result::Result<Vec<PhysicalPageId>, String>,
+            ) + Send,
+    >,
 }
 
 impl fmt::Debug for PendingAlloc {
@@ -164,7 +169,7 @@ impl fmt::Debug for PendingAlloc {
             .field("driver", &self.driver)
             .field("num_pages", &self.num_pages)
             .field("needs_rs_slot", &self.needs_rs_slot)
-            .field("on_alloc", &"<closure>")
+            .field("on_complete", &"<closure>")
             .finish()
     }
 }
@@ -678,9 +683,11 @@ impl ContextManager {
     pub(crate) fn when_active(
         &mut self,
         ctx_id: ContextId,
-        on_ready: impl FnOnce(&mut ContextManager) + Send + 'static,
+        on_ready: impl FnOnce(&mut ContextManager, std::result::Result<(), String>) + Send + 'static,
     ) {
-        self.when_allocated(ctx_id, 0, 0, move |mgr, _pages| on_ready(mgr));
+        self.when_allocated(ctx_id, 0, 0, move |mgr, result| {
+            on_ready(mgr, result.map(|_| ()))
+        });
     }
 
     /// Universal GPU page contention primitive.
@@ -689,7 +696,7 @@ impl ContextManager {
     /// Goes through: Suspended check → num_pages==0 fast-path →
     /// priority gate → free pool → eviction loop → self-suspend.
     ///
-    /// On success, invokes `on_alloc` with the allocated pages.
+    /// On success, invokes `on_complete` with the allocated pages.
     /// On deferral, the operation is stashed on `ctx.deferred_ops`
     /// and will be replayed when pages become available.
     pub(crate) fn when_allocated(
@@ -697,9 +704,13 @@ impl ContextManager {
         ctx_id: ContextId,
         driver_idx: usize,
         num_pages: usize,
-        on_alloc: impl FnOnce(&mut ContextManager, Vec<PhysicalPageId>) + Send + 'static,
+        on_complete: impl FnOnce(
+                &mut ContextManager,
+                std::result::Result<Vec<PhysicalPageId>, String>,
+            ) + Send
+            + 'static,
     ) {
-        self.when_allocated_inner(ctx_id, driver_idx, num_pages, false, on_alloc);
+        self.when_allocated_inner(ctx_id, driver_idx, num_pages, false, on_complete);
     }
 
     /// Variant for operations such as fork/take that can operate from an
@@ -709,9 +720,13 @@ impl ContextManager {
         ctx_id: ContextId,
         driver_idx: usize,
         num_pages: usize,
-        on_alloc: impl FnOnce(&mut ContextManager, Vec<PhysicalPageId>) + Send + 'static,
+        on_complete: impl FnOnce(
+                &mut ContextManager,
+                std::result::Result<Vec<PhysicalPageId>, String>,
+            ) + Send
+            + 'static,
     ) {
-        self.when_allocated_inner(ctx_id, driver_idx, num_pages, true, on_alloc);
+        self.when_allocated_inner(ctx_id, driver_idx, num_pages, true, on_complete);
     }
 
     fn when_allocated_inner(
@@ -720,7 +735,11 @@ impl ContextManager {
         driver_idx: usize,
         num_pages: usize,
         allow_off_gpu: bool,
-        on_alloc: impl FnOnce(&mut ContextManager, Vec<PhysicalPageId>) + Send + 'static,
+        on_complete: impl FnOnce(
+                &mut ContextManager,
+                std::result::Result<Vec<PhysicalPageId>, String>,
+            ) + Send
+            + 'static,
     ) {
         // RESIDENCY/BUSY CHECK: If the context is off GPU or already pinned
         // by a forward/replay, store the operation and let unpin or
@@ -732,20 +751,23 @@ impl ContextManager {
                     driver: driver_idx,
                     num_pages,
                     needs_rs_slot: false,
-                    on_alloc: Box::new(on_alloc),
+                    on_complete: Box::new(on_complete),
                 };
                 ctx.deferred_ops.push(pending);
                 return;
             }
             off_gpu
         } else {
-            tracing::error!("when_allocated: context not found: {}", ctx_id);
+            on_complete(
+                self,
+                Err(format!("when_allocated: context not found: {ctx_id}")),
+            );
             return;
         };
 
         // Short-circuit: no pages needed.
         if num_pages == 0 {
-            (on_alloc)(self, Vec::new());
+            (on_complete)(self, Ok(Vec::new()));
             return;
         }
 
@@ -762,7 +784,7 @@ impl ContextManager {
                     driver: driver_idx,
                     num_pages,
                     needs_rs_slot: false,
-                    on_alloc: Box::new(on_alloc),
+                    on_complete: Box::new(on_complete),
                 };
                 self.contexts
                     .get_mut(&ctx_id)
@@ -782,7 +804,7 @@ impl ContextManager {
 
         // Step 3: TRY ALLOCATE from free pool.
         if let Some(pages) = self.gpu_stores[driver_idx].alloc(num_pages) {
-            (on_alloc)(self, pages);
+            (on_complete)(self, Ok(pages));
             return;
         }
 
@@ -833,7 +855,7 @@ impl ContextManager {
 
         // Post-loop: handle eviction results.
         if let Some(pages) = alloc_result {
-            (on_alloc)(self, pages);
+            (on_complete)(self, Ok(pages));
             self.drain_queues();
         } else {
             // No pages available — defer the operation.
@@ -841,7 +863,7 @@ impl ContextManager {
                 driver: driver_idx,
                 num_pages,
                 needs_rs_slot: false,
-                on_alloc: Box::new(on_alloc),
+                on_complete: Box::new(on_complete),
             };
             self.contexts
                 .get_mut(&ctx_id)
@@ -1777,5 +1799,32 @@ mod tests {
             mgr.register_process(ProcessId::new_v4(), Some(16)).unwrap();
         }
         assert!(mgr.register_process(ProcessId::new_v4(), Some(16)).is_err());
+    }
+
+    #[test]
+    fn replay_failure_destroys_context_and_fails_waiting_operation() {
+        let (mut mgr, _pid, ctx_id) = fixture(10, 3, 1.0);
+        let (response, mut response_rx) = tokio::sync::oneshot::channel();
+        let ctx = mgr.contexts.get_mut(&ctx_id).expect("context");
+        ctx.state = State::Pinned;
+        ctx.pending_replay = true;
+        ctx.deferred_ops.push(PendingAlloc {
+            driver: 0,
+            num_pages: 0,
+            needs_rs_slot: false,
+            on_complete: Box::new(move |_mgr, result| {
+                let _ = response.send(result.map(|_| ()));
+            }),
+        });
+
+        mgr.replay_failed(ctx_id, "replay capacity exceeded".to_string());
+
+        assert!(!mgr.contexts.contains_key(&ctx_id));
+        assert_eq!(mgr.gpu_stores[0].available(), 10);
+        let error = response_rx
+            .try_recv()
+            .expect("terminal response")
+            .expect_err("replay must fail");
+        assert_eq!(error, "replay capacity exceeded");
     }
 }

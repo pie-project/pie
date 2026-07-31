@@ -1651,13 +1651,20 @@ impl ContextManager {
         let needed = target - physical;
         let driver_idx = ctx.driver.unwrap_or(0) as usize;
 
-        self.when_allocated(id, driver_idx, needed, move |mgr, pages| {
-            if let Some(ctx) = mgr.contexts.get_mut(&id) {
-                ctx.working_pages.extend_from_slice(&pages);
-                ctx.driver = Some(driver_idx);
+        self.when_allocated(id, driver_idx, needed, move |mgr, allocation| {
+            match allocation {
+                Ok(pages) => {
+                    if let Some(ctx) = mgr.contexts.get_mut(&id) {
+                        ctx.working_pages.extend_from_slice(&pages);
+                        ctx.driver = Some(driver_idx);
+                    }
+                    mgr.publish_context_counts(id);
+                    let _ = response.send(Ok(()));
+                }
+                Err(error) => {
+                    let _ = response.send(Err(anyhow::anyhow!(error)));
+                }
             }
-            mgr.publish_context_counts(id);
-            let _ = response.send(Ok(()));
         });
     }
 
@@ -1838,7 +1845,13 @@ impl ContextManager {
         response: oneshot::Sender<Result<PinnedContext>>,
     ) {
         let mut response = Some(response);
-        self.when_active(id, move |mgr| {
+        self.when_active(id, move |mgr, ready| {
+            if let Err(error) = ready {
+                if let Some(response) = response.take() {
+                    let _ = response.send(Err(anyhow::anyhow!(error)));
+                }
+                return;
+            }
             let result = (|| -> Result<Option<PinnedContext>> {
                 // Token-budget gate: refuse to pin for a forward pass when
                 // the owning process has exhausted its compute budget. The
@@ -1871,8 +1884,11 @@ impl ContextManager {
                             driver: driver_idx,
                             num_pages: 0,
                             needs_rs_slot: true,
-                            on_alloc: Box::new(move |mgr, _pages| {
-                                mgr.pin(id, num_input_tokens, pending_response);
+                            on_complete: Box::new(move |mgr, allocation| match allocation {
+                                Ok(_) => mgr.pin(id, num_input_tokens, pending_response),
+                                Err(error) => {
+                                    let _ = pending_response.send(Err(anyhow::anyhow!(error)));
+                                }
                             }),
                         };
                         if let Some(ctx) = mgr.contexts.get_mut(&id) {
@@ -2361,6 +2377,7 @@ pub(crate) enum Message {
         scratch_driver: usize,
         scratch_pages: Vec<PhysicalPageId>,
         registration: Option<ReplayPageRegistration>,
+        error: Option<String>,
     },
     GetStats {
         response: oneshot::Sender<Vec<(usize, usize)>>,
@@ -2483,8 +2500,12 @@ impl ServiceHandler for ContextManager {
                 response,
             } => {
                 let t0 = Instant::now();
-                self.when_active(id, move |mgr| {
-                    let _ = response.send(mgr.commit_working_pages(id, num_pages));
+                self.when_active(id, move |mgr, ready| {
+                    let result = match ready {
+                        Ok(()) => mgr.commit_working_pages(id, num_pages),
+                        Err(error) => Err(anyhow::anyhow!(error)),
+                    };
+                    let _ = response.send(result);
                     mgr.sched_counters.commit_us += t0.elapsed().as_micros() as u64;
                     mgr.sched_counters.commit_count += 1;
                 });
@@ -2538,6 +2559,7 @@ impl ServiceHandler for ContextManager {
                 scratch_driver,
                 scratch_pages,
                 registration,
+                error,
             } => {
                 let t0 = Instant::now();
                 if !scratch_pages.is_empty() {
@@ -2546,7 +2568,7 @@ impl ServiceHandler for ContextManager {
                     }
                 }
                 if let Some(registration) = registration {
-                    if self.contexts.contains_key(&id) {
+                    if error.is_none() && self.contexts.contains_key(&id) {
                         if !registration.hashes.is_empty() {
                             self.gpu_stores[registration.driver].extend(
                                 &registration.prefix,
@@ -2558,7 +2580,11 @@ impl ServiceHandler for ContextManager {
                         store.free(&registration.pages);
                     }
                 }
-                self.replay_complete(id);
+                if let Some(error) = error {
+                    self.replay_failed(id, error);
+                } else {
+                    self.replay_complete(id);
+                }
                 self.sched_counters.replay_us += t0.elapsed().as_micros() as u64;
                 self.sched_counters.replay_count += 1;
             }
