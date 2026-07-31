@@ -171,6 +171,16 @@ class RawMetalContext {
     // CPU-visible standalone storage for channels, IO staging, and other pools
     // intentionally excluded from elastic arenas.
     SlotHandle create_standalone_buffer(size_t size);
+
+    /// A buffer over memory this context does NOT own — an mmap of the
+    /// checkpoint, in practice. `ptr` must be page-aligned and stay mapped for
+    /// the buffer's lifetime.
+    ///
+    /// This is what weight streaming would be on Apple silicon: a file-backed
+    /// mapping wrapped this way is demand-faulted under GPU access and its
+    /// pages stay clean, so the kernel evicts them under pressure instead of
+    /// the driver paying for every weight, resident, forever.
+    SlotHandle wrap_host_memory(void* ptr, size_t size);
     // Private placement-sparse VA backed by lazily-created Shared placement
     // heaps. The VA and gpu_address never change as chunks grow or trim.
     SlotHandle create_elastic_buffer(

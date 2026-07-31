@@ -494,6 +494,32 @@ SlotHandle RawMetalContext::create_standalone_buffer(size_t size) {
     return h;
 }
 
+SlotHandle RawMetalContext::wrap_host_memory(void* ptr, size_t size) {
+    auto& I = *impl_;
+    SlotHandle h;
+    if (ptr == nullptr || size == 0) return h;
+    id<MTLBuffer> buf = [I.dev newBufferWithBytesNoCopy:ptr
+                                                 length:size
+                                                options:MTLResourceStorageModeShared
+                                            deallocator:nil];
+    if (buf == nil) {
+        fprintf(stderr, "[pie-metal] no-copy buffer over host memory failed (%zu bytes)\n",
+                size);
+        return h;
+    }
+    [I.retained addObject:buf];
+    [I.rs addAllocation:buf];
+    [I.rs commit];
+    if (I.resident) [I.rs requestResidency];
+
+    h.buffer       = (__bridge void*)buf;
+    h.contents_ptr = buf.contents;
+    h.gpu_address  = buf.gpuAddress;
+    h.offset       = 0;
+    h.size         = size;
+    return h;
+}
+
 SlotHandle RawMetalContext::create_elastic_buffer(
     size_t size,
     size_t initial_commit_bytes) {

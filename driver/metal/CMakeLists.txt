@@ -472,6 +472,9 @@ if(APPLE)
   add_metal_linked_test(ptir_m0_device_test tests/ptir_m0_device_test.cpp)
   add_metal_linked_test(kv_append_paged_pso_test tests/kv_append_paged_pso_test.cpp)
   # The six gemma4 kernels that shipped with no PSO entry and no binder.
+  add_metal_linked_test(host_buffer_bind_test tests/host_buffer_bind_test.cpp)
+  target_compile_definitions(host_buffer_bind_test PRIVATE
+    PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
   add_metal_linked_test(gemma4_pso_test tests/gemma4_pso_test.cpp)
   target_compile_definitions(gemma4_pso_test PRIVATE
     PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
