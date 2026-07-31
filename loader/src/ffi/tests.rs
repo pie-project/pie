@@ -213,8 +213,7 @@ fn plan_with_every_instr() -> LoadPlan {
                 fusion: TransformFusion::Fp8ToMxfp4,
                 metadata_source: Some(TensorId(2)),
                 scale_factor_bits: 0.5f32.to_bits(),
-                scale_group: 32,
-                scale_axis: 1,
+                scale_blocks: vec![1, 32],
             },
         },
         StorageInstr::CreateView {
@@ -1588,8 +1587,7 @@ fn storage_op_tags_are_the_wire_values() {
             transform_scratch_bytes: 0,
             transform_metadata_source: PIE_LOADER_NO_TENSOR,
             transform_scale_factor_bits: 0,
-            transform_scale_group: 0,
-            transform_scale_axis: 0,
+            transform_scale_blocks: PieLoaderI64Slice::default(),
         }),
         2
     );

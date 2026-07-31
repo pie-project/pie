@@ -289,7 +289,7 @@ fn infer(expr: &Expr, scope: &mut Scope<'_>) -> Result<TensorType, Error> {
             let ty = infer(src, scope)?;
             match factor {
                 ScaleFactor::Uniform(bits) => infer_scale(ty, *bits),
-                ScaleFactor::PerGroup { by, group, axis } => {
+                ScaleFactor::PerBlock { by } => {
                     // The kernel reads the factors out of memory, so they have
                     // to be a tensor that exists rather than an expression the
                     // multiply would have to evaluate on its way past. Declare
@@ -303,7 +303,7 @@ fn infer(expr: &Expr, scope: &mut Scope<'_>) -> Result<TensorType, Error> {
                         ));
                     }
                     let by = infer(by, scope)?;
-                    infer_scale_per_group(ty, by, *group, *axis)
+                    infer_scale_per_block(ty, by)
                 }
             }
         }
@@ -1036,19 +1036,7 @@ fn infer_scale(ty: TensorType, factor_bits: u32) -> Result<TensorType, Error> {
 /// the scales — or applied to both on different axes — is a compile error that
 /// names both shapes. Recovering that pairing from a name convention instead,
 /// below the contract, is unfalsifiable by construction.
-fn infer_scale_per_group(
-    ty: TensorType,
-    by: TensorType,
-    group: u32,
-    axis: Axis,
-) -> Result<TensorType, Error> {
-    if group == 0 {
-        return Err(Error::Contract(
-            "Scale group size is zero, which is also what an unset group field \
-             reads as; state the elements per factor the contract meant"
-                .to_string(),
-        ));
-    }
+fn infer_scale_per_block(ty: TensorType, by: TensorType) -> Result<TensorType, Error> {
     let out_dtype = match &ty.encoding {
         Encoding::Raw(dtype) => *dtype,
         Encoding::Quant(spec) => spec.logical_dtype,
@@ -1069,39 +1057,50 @@ fn infer_scale_per_group(
             )));
         }
     }
-    let index = usize::from(axis.0);
-    if index >= ty.shape.len() {
+    // Rank first, because everything below indexes both shapes together. Equal
+    // rank is what makes the ratio per axis meaningful at all: a factor tensor
+    // of a different rank is not a coarser view of this one, it is a different
+    // tensor the author paired by mistake.
+    if by.shape.len() != ty.shape.len() {
         return Err(Error::Contract(format!(
-            "Scale group axis {index} is out of range for shape {:?}",
-            ty.shape
-        )));
-    }
-    // A group is a run of adjacent elements only on the last axis, and both
-    // executors read it as one. Requiring the axis to be named rather than
-    // assumed is what lets this be a rejection an author sees instead of a
-    // silent mis-scaling, and it is the only line that moves the day a kernel
-    // learns to stride.
-    if index + 1 != ty.shape.len() {
-        return Err(Error::Contract(format!(
-            "Scale groups run along the last axis; axis {index} of {:?} is not it",
-            ty.shape
-        )));
-    }
-    let mut want = ty.shape.clone();
-    let extent = want[index];
-    let group = i64::from(group);
-    if extent % group != 0 {
-        return Err(Error::Contract(format!(
-            "Scale group size {group} does not divide axis {index} of {:?}",
-            ty.shape
-        )));
-    }
-    want[index] = extent / group;
-    if by.shape != want {
-        return Err(Error::Contract(format!(
-            "Scale factors have shape {:?}, but scaling {:?} in groups of \
-             {group} along axis {index} needs {want:?}",
+            "Scale factors have shape {:?}, which is not a blocking of {:?} \
+             -- a factor tensor states its block size by having the same rank \
+             and dividing each axis",
             by.shape, ty.shape
+        )));
+    }
+    let mut blocked = false;
+    for (axis, (&extent, &factors)) in ty.shape.iter().zip(by.shape.iter()).enumerate() {
+        if factors <= 0 {
+            return Err(Error::Contract(format!(
+                "Scale factors have extent {factors} on axis {axis}, so no \
+                 block size divides it"
+            )));
+        }
+        if extent % factors != 0 {
+            return Err(Error::Contract(format!(
+                "Scale factors have shape {:?}, but axis {axis} of {:?} is not \
+                 a whole number of blocks of {}",
+                by.shape,
+                ty.shape,
+                extent / factors
+            )));
+        }
+        if factors != extent {
+            blocked = true;
+        }
+    }
+    // Symmetry rule A: a node may not denote exactly its operand. Factors
+    // shaped like the weight are one number per element, which is a plain
+    // elementwise product and not a blocking -- and, read the other way, a
+    // `Uniform` scale is the rank-0 case this would shadow. Rejecting it keeps
+    // the two spellings of "no blocks" from both being legal.
+    if !blocked && !ty.shape.is_empty() {
+        return Err(Error::Contract(format!(
+            "Scale factors have the operand's own shape {:?}, so they group \
+             nothing; a factor per element is an elementwise product, not a \
+             block scale",
+            ty.shape
         )));
     }
     Ok(TensorType {

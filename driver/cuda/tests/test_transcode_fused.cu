@@ -8,9 +8,11 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
 #include <random>
 #include <vector>
 
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #include "kernels/dequant_fp8.hpp"
@@ -144,10 +146,76 @@ void run_bf16(int rows, int cols) {
 
 }  // namespace
 
+// A rectangular block, checked against a CPU decode of the same bytes.
+//
+// The square case cannot tell `row_block` and `col_block` apart, so it passes
+// with the two swapped or with either used for both. GLM-5.1's `kv_b_proj`
+// under TP is exactly where they diverge: a rank's row band shrinks while its
+// columns do not, so the shipped `[rows/rb, cols/cb]` grid stops being square.
+void run_fp8_blocked(int rows, int cols, int row_block, int col_block) {
+    const int scale_rows = rows / row_block;
+    const int scale_cols = cols / col_block;
+    std::mt19937 rng(0xB10CC ^ (rows * 131 + cols * 17 + row_block * 3 + col_block));
+    std::vector<std::uint8_t> fp8(static_cast<std::size_t>(rows) * cols);
+    for (auto& b : fp8) {
+        std::uint8_t v = static_cast<std::uint8_t>(rng() & 0xFF);
+        if ((v & 0x7F) == 0x7F) v &= 0x7E;  // avoid E4M3 NaN
+        b = v;
+    }
+    // Distinct powers of two, so a factor read from the wrong block is off by
+    // a whole exponent and the BF16 comparison can be exact.
+    std::vector<float> scales(static_cast<std::size_t>(scale_rows) * scale_cols);
+    for (std::size_t i = 0; i < scales.size(); ++i) {
+        scales[i] = std::ldexp(1.0f, static_cast<int>(i % 11) - 5);
+    }
+
+    std::uint8_t* d_fp8 = device_from_host(fp8);
+    float* d_scale = device_from_host(scales);
+    const std::size_t n = static_cast<std::size_t>(rows) * cols;
+    void* d_bf16 = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_bf16, n * 2));
+    K::launch_dequant_fp8_e4m3_to_bf16_blocked(
+        d_fp8, d_bf16, d_scale, rows, cols, row_block, col_block, 0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<std::uint16_t> got(n);
+    CUDA_CHECK(cudaMemcpy(got.data(), d_bf16, n * 2, cudaMemcpyDeviceToHost));
+
+    std::size_t mismatch = 0;
+    for (int r = 0; r < rows; ++r) {
+        for (int c = 0; c < cols; ++c) {
+            const std::uint8_t byte = fp8[static_cast<std::size_t>(r) * cols + c];
+            const float sign = (byte & 0x80) ? -1.0f : 1.0f;
+            const int exponent = (byte >> 3) & 0x0F;
+            const float mantissa = static_cast<float>(byte & 0x07);
+            const float magnitude =
+                exponent == 0 ? mantissa / 8.0f * std::ldexp(1.0f, -6)
+                              : (1.0f + mantissa / 8.0f) * std::ldexp(1.0f, exponent - 7);
+            const float want = sign * magnitude *
+                               scales[static_cast<std::size_t>(r / row_block) * scale_cols +
+                                      c / col_block];
+            const float have = __bfloat162float(
+                *reinterpret_cast<const __nv_bfloat16*>(&got[static_cast<std::size_t>(r) * cols + c]));
+            if (have != want) ++mismatch;
+        }
+    }
+    CHECK(mismatch == 0);
+    std::printf("[blocked] rows=%d cols=%d block=%dx%d: mismatch=%zu/%zu\n",
+                rows, cols, row_block, col_block, mismatch, n);
+
+    for (void* q : {(void*)d_fp8, (void*)d_scale, (void*)d_bf16}) CUDA_CHECK(cudaFree(q));
+}
+
 int main() {
     run_fp8(64, 256, 128);
     run_fp8(128, 512, 128);
     run_fp8(257, 256, 128);  // non-multiple rows
+    // Square, then each extent varied on its own, then one factor per row --
+    // the per-channel case the algebra now says with a block instead of a kind.
+    run_fp8_blocked(128, 256, 128, 128);
+    run_fp8_blocked(64, 256, 64, 128);
+    run_fp8_blocked(128, 256, 32, 256);
+    run_fp8_blocked(96, 64, 1, 64);
     run_bf16(64, 256);
     run_bf16(33, 128);
     if (g_failures == 0) {

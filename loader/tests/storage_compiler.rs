@@ -382,7 +382,7 @@ fn a_quantized_tensor_is_re_encoded_through_a_decoded_intermediate() {
         group_size: 32,
         channel_axis: Some(Axis(1)),
     });
-    let mut contract = block_scaled_contract("scales", 32, 1);
+    let mut contract = block_scaled_contract("scales", "s", vec![4, 1]);
     // `w` is the decoded BF16 tensor the fixture publishes. Make it the
     // intermediate and re-encode it.
     contract.tensors[1] = contract.tensors[1].clone().internal();
@@ -1095,6 +1095,11 @@ fn block_scaled_metadata() -> CheckpointMetadata {
         tensors: vec![
             sized_raw(0, "w", 0, 64, &[4, 16], DType::U8),
             sized_raw(1, "s", 64, 4, &[4, 1], DType::U8),
+            // Two more factor tensors, sized so that the shapes the rejection
+            // tests need are legal renames of *something*: three exponents do
+            // not divide four rows, and 128 give one per element.
+            sized_raw(2, "s3", 68, 3, &[3, 1], DType::U8),
+            sized_raw(3, "s128", 71, 128, &[128], DType::U8),
         ],
     }
 }
@@ -1111,17 +1116,22 @@ fn mxfp4(channel_axis: u8) -> QuantSpec {
 /// `factors` names the tensor holding the exponents, and is the whole point:
 /// the payload and its factors are paired by a name the contract already
 /// checks, not by a suffix the executor appends to a name and hopes for.
-fn block_scaled_contract(factors: &str, group: u32, axis: u8) -> ModelContract {
+///
+/// `from` and `shape` are what the factors are, because **the factors' shape
+/// is the whole statement of how the payload is blocked**. There is no group
+/// size and no axis to pass: `[4, 1]` over `[4, 32]` says one factor per row,
+/// `[2, 2]` says 2x16 tiles. Every rejection below is therefore a shape.
+fn block_scaled_contract(factors: &str, from: &str, shape: Vec<i64>) -> ModelContract {
     ModelContract {
         alignment: 256,
         tensors: vec![
             TensorContract::new(
                 "scales",
-                Expr::src("s").transmute(TensorType {
-                    shape: vec![4, 1],
+                Expr::src(from).transmute(TensorType {
+                    shape: shape.clone(),
                     encoding: Encoding::Raw(DType::E8M0),
                 }),
-                vec![4, 1],
+                shape,
                 Encoding::Raw(DType::E8M0),
             ),
             TensorContract::new(
@@ -1131,7 +1141,7 @@ fn block_scaled_contract(factors: &str, group: u32, axis: u8) -> ModelContract {
                         shape: vec![4, 32],
                         encoding: Encoding::Quant(mxfp4(1)),
                     })
-                    .scale_per_group(Expr::out(factors), group, axis),
+                    .scale_per_block(Expr::out(factors)),
                 vec![4, 32],
                 Encoding::Raw(DType::BF16),
             ),
@@ -1144,7 +1154,7 @@ fn block_scaled_contract(factors: &str, group: u32, axis: u8) -> ModelContract {
 fn a_block_scaled_dequant_is_one_scale_with_its_factors_as_an_operand() {
     let plan = compile_load_plan(
         &block_scaled_metadata(),
-        &block_scaled_contract("scales", 32, 1),
+        &block_scaled_contract("scales", "s", vec![4, 1]),
         StorageTarget::default(),
     )
     .expect("block-scaled dequant should compile");
@@ -1164,8 +1174,7 @@ fn a_block_scaled_dequant_is_one_scale_with_its_factors_as_an_operand() {
         .collect();
     assert_eq!(scales.len(), 1, "{:#?}", plan.instrs);
     let (inputs, transform) = &scales[0];
-    assert_eq!(transform.scale_group, 32);
-    assert_eq!(transform.scale_axis, 1);
+    assert_eq!(transform.scale_blocks, vec![1, 32]);
     assert_eq!(transform.from, Some(QuantScheme::Mxfp4E2M1E8M0));
     assert_eq!(
         transform.scale_factor_bits, 0,
@@ -1210,7 +1219,7 @@ fn a_sharded_block_scaled_dequant_scales_only_its_own_rank() {
                         encoding: Encoding::Quant(mxfp4(1)),
                     })
                     .shard(0)
-                    .scale_per_group(Expr::out("scales"), 32, 1),
+                    .scale_per_block(Expr::out("scales")),
                 vec![2, 32],
                 Encoding::Raw(DType::BF16),
             ),
@@ -1240,7 +1249,7 @@ fn a_sharded_block_scaled_dequant_scales_only_its_own_rank() {
         })
         .unwrap_or_else(|| panic!("no Scale instruction: {:#?}", plan.instrs));
     let (source, inputs, transform) = scale;
-    assert_eq!(transform.scale_group, 32);
+    assert_eq!(transform.scale_blocks, vec![1, 32]);
     assert_eq!(inputs.len(), 1, "the one operand is the factors");
     let source = source.expect("rank 1's rows are contiguous, so they stay a source read");
     assert_eq!(
@@ -1263,7 +1272,7 @@ fn a_sharded_block_scaled_dequant_scales_only_its_own_rank() {
 fn a_scale_by_a_tensor_no_contract_declares_is_rejected() {
     let error = compile_load_plan(
         &block_scaled_metadata(),
-        &block_scaled_contract("absent", 32, 1),
+        &block_scaled_contract("absent", "s", vec![4, 1]),
         StorageTarget::default(),
     )
     .unwrap_err()
@@ -1271,40 +1280,78 @@ fn a_scale_by_a_tensor_no_contract_declares_is_rejected() {
     assert!(error.contains("is declared before this one"), "{error}");
 }
 
+/// Blocks on two axes at once, which one group size could not have said.
+///
+/// `[2, 2]` factors over a `[4, 32]` payload is a 2x16 tile. Nothing in the
+/// contract names either number: both fall out of the ratio, and the plan is
+/// where they first appear as numbers -- which is what makes them checkable
+/// against the two shapes rather than trusted.
 #[test]
-fn a_scale_by_the_wrong_number_of_factors_is_rejected() {
-    let error = compile_load_plan(
+fn a_scale_blocks_every_axis_the_factors_divide() {
+    let plan = compile_load_plan(
         &block_scaled_metadata(),
-        &block_scaled_contract("scales", 16, 1),
+        &block_scaled_contract("scales", "s", vec![2, 2]),
         StorageTarget::default(),
     )
-    .unwrap_err()
-    .to_string();
-    assert!(error.contains("needs [4, 2]"), "{error}");
+    .expect("a two-dimensional blocking should compile");
+
+    let blocks: Vec<_> = plan
+        .instrs
+        .iter()
+        .filter_map(|instr| match instr {
+            StorageInstr::TileMap {
+                kind: TileMapKind::Scale,
+                transform,
+                ..
+            } => Some(transform.scale_blocks.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(blocks, vec![vec![2, 16]]);
 }
 
 #[test]
-fn a_scale_grouped_on_an_axis_that_is_not_the_last_is_rejected() {
+fn a_scale_by_factors_of_a_different_rank_is_rejected() {
     let error = compile_load_plan(
         &block_scaled_metadata(),
-        &block_scaled_contract("scales", 4, 0),
+        &block_scaled_contract("scales", "s", vec![4]),
         StorageTarget::default(),
     )
     .unwrap_err()
     .to_string();
-    assert!(error.contains("last axis"), "{error}");
+    assert!(
+        error.contains("same rank and dividing each axis"),
+        "{error}"
+    );
 }
 
 #[test]
-fn a_scale_by_an_unset_group_is_rejected() {
+fn a_scale_by_factors_that_do_not_divide_the_payload_is_rejected() {
     let error = compile_load_plan(
         &block_scaled_metadata(),
-        &block_scaled_contract("scales", 0, 1),
+        &block_scaled_contract("scales", "s3", vec![3, 1]),
         StorageTarget::default(),
     )
     .unwrap_err()
     .to_string();
-    assert!(error.contains("group size is zero"), "{error}");
+    assert!(
+        error.contains("axis 0 of [4, 32] is not a whole number of blocks"),
+        "{error}"
+    );
+}
+
+/// One factor per element groups nothing, so it is an elementwise product and
+/// not a block scale. Symmetry rule A: a node may not denote its operand.
+#[test]
+fn a_scale_by_one_factor_per_element_is_rejected() {
+    let error = compile_load_plan(
+        &block_scaled_metadata(),
+        &block_scaled_contract("scales", "s128", vec![4, 32]),
+        StorageTarget::default(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("they group nothing"), "{error}");
 }
 
 /// Scaling by an expression, rather than by a tensor some contract published,
@@ -1324,14 +1371,10 @@ fn a_scale_by_an_undeclared_expression_is_rejected() {
                     shape: vec![4, 32],
                     encoding: Encoding::Quant(mxfp4(1)),
                 })
-                .scale_per_group(
-                    Expr::src("s").transmute(TensorType {
-                        shape: vec![4, 1],
-                        encoding: Encoding::Raw(DType::E8M0),
-                    }),
-                    32,
-                    1,
-                ),
+                .scale_per_block(Expr::src("s").transmute(TensorType {
+                    shape: vec![4, 1],
+                    encoding: Encoding::Raw(DType::E8M0),
+                })),
             vec![4, 32],
             Encoding::Raw(DType::BF16),
         )],

@@ -123,7 +123,7 @@ inline void dsv4_block_scales_to_fp32(ContractBuilder& b) {
 ///
 /// Both halves of the gap are sayable. `Bitcast` names the packed bytes as the
 /// quantization they are; `Concat` and `Reshape` build the slab; and
-/// `scale_per_group` multiplies each group of 32 elements by its own factor,
+/// `scale_per_block` multiplies each group of 32 elements by its own factor,
 /// which over a quantized operand *is* the dequantization. Sharding sits
 /// inside all of it, so each rank dequantizes only the slice it keeps.
 ///
@@ -256,7 +256,7 @@ inline void dsv4_bf16_expert_stacks(ContractBuilder& b) {
         }
         const auto experts = static_cast<std::int64_t>(gate_up.size());
 
-        // Named but not bound. `scale_per_group` takes its factors by output
+        // Named but not bound. `scale_per_block` takes its factors by output
         // name -- a scale is a tensor the contract declared, not a companion
         // the lowering guesses at from a suffix -- and the stacked slab is
         // dequantized here, so no kernel ever reads these again. Left public
@@ -278,13 +278,13 @@ inline void dsv4_bf16_expert_stacks(ContractBuilder& b) {
             dn->internal();
         }
         b.define(ffn + "experts.gate_up.weight",
-                 b.contract().scale_per_group(b.contract().concat(gate_up, 0),
-                                              b.contract().out(gu_scale), kGroup, 2),
+                 b.contract().scale_per_block(b.contract().concat(gate_up, 0),
+                                              b.contract().out(gu_scale)),
                  pie_loader::raw(PieLoaderDType::BF16),
                  std::vector<std::int64_t>{experts, 2 * local_inter, hidden});
         b.define(ffn + "experts.down.weight",
-                 b.contract().scale_per_group(b.contract().concat(down, 0),
-                                              b.contract().out(dn_scale), kGroup, 2),
+                 b.contract().scale_per_block(b.contract().concat(down, 0),
+                                              b.contract().out(dn_scale)),
                  pie_loader::raw(PieLoaderDType::BF16),
                  std::vector<std::int64_t>{experts, hidden, local_inter});
         for (std::uint32_t id : consumed) {
@@ -301,7 +301,7 @@ inline void dsv4_bf16_expert_stacks(ContractBuilder& b) {
 /// each `src` replaced by the `index_src` it was a member of. Everything that
 /// made the stack correct is still here in the same order: the transmutes that
 /// name packed nibbles as MXFP4, the shard that keeps only this rank's slice,
-/// and the `scale_per_group` that dequantizes. A group's plan is a whole plan,
+/// and the `scale_per_block` that dequantizes. A group's plan is a whole plan,
 /// so all of it runs on the page-in path; nothing had to be reduced to plain
 /// copies to be streamable.
 ///
@@ -431,17 +431,17 @@ inline void dsv4_streamed_expert_groups(ContractBuilder& b) {
             .internal();
         group.define(
                  "gate_up.weight",
-                 c.scale_per_group(
+                 c.scale_per_block(
                      c.concat({packed("experts.{}.w1.weight", {inter_full, hidden}, 0),
                                packed("experts.{}.w3.weight", {inter_full, hidden}, 0)},
                               0),
-                     c.out("gate_up.scale"), kGroup, 1),
+                     c.out("gate_up.scale")),
                  pie_loader::raw(PieLoaderDType::BF16))
             .expect({2 * inter, hidden});
         group.define("down.weight",
-                     c.scale_per_group(
+                     c.scale_per_block(
                          packed("experts.{}.w2.weight", {down_raw[0], inter_full}, 1),
-                         c.out("down.scale"), kGroup, 1),
+                         c.out("down.scale")),
                      pie_loader::raw(PieLoaderDType::BF16))
             .expect({down_raw[0], inter});
 

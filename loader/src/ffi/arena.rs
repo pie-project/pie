@@ -330,8 +330,7 @@ fn flatten_instr(arena: &mut PlanArena, instr: &StorageInstr) -> PieLoaderStorag
                         .metadata_source
                         .map_or(PIE_LOADER_NO_TENSOR, |id| id.0),
                     transform_scale_factor_bits: transform.scale_factor_bits,
-                    transform_scale_group: transform.scale_group,
-                    transform_scale_axis: transform.scale_axis,
+                    transform_scale_blocks: arena.store_i64(&transform.scale_blocks),
                 },
             )
         }

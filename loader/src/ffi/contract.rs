@@ -210,20 +210,21 @@ pub struct PieLoaderExprNode {
     /// Leaving it unset means zero, which reads as `+0.0`; the loader rejects
     /// that rather than scaling a tensor to nothing.
     pub scale_factor_bits: u32,
-    /// `Scale`: the operand holding one factor per `scale_group` elements along
-    /// `axis`. Same index rule as `src`.
+    /// `Scale`: the operand holding the factors, one per block. Same index
+    /// rule as `src`.
     ///
-    /// [`PIE_LOADER_NO_NODE`] for a uniform factor, which is what an unset
-    /// field reads as.
+    /// [`PIE_LOADER_NO_NODE`] for a uniform factor, and that sentinel is what
+    /// tells the two forms apart. There used to be a separate `scale_group`
+    /// discriminant, on the grounds that a struct zeroed by hand would then
+    /// always read as the uniform case; but `src` has always carried the same
+    /// exposure — node zero is a legal index — so the sentinel is the rule
+    /// everywhere rather than in all places but one, and
+    /// [`PieLoaderExprNode::default`] sets it.
+    ///
+    /// The blocking itself is not stated here. It is the ratio of this
+    /// operand's shape to `src`'s, which is the only place it can be stated
+    /// once.
     pub scale_by: u32,
-    /// `Scale`: elements per factor. Zero selects the uniform factor in
-    /// `scale_factor_bits`.
-    ///
-    /// The two forms are told apart by this field rather than by which of the
-    /// others happens to be set, so a node built by zeroing the struct and
-    /// filling in one field is always the uniform case and never a per-group
-    /// case with a missing operand.
-    pub scale_group: u32,
 }
 
 impl Default for PieLoaderExprNode {
@@ -244,7 +245,6 @@ impl Default for PieLoaderExprNode {
             repack_layout: PieLoaderRepackLayout::None as u32,
             scale_factor_bits: 0,
             scale_by: PIE_LOADER_NO_NODE,
-            scale_group: 0,
         }
     }
 }
@@ -585,13 +585,11 @@ fn read_expr(node: &PieLoaderExprNode, index: usize, done: &[Expr]) -> Result<Ex
         },
         PieLoaderExprKind::Scale => Expr::Scale {
             src: src()?,
-            factor: if node.scale_group == 0 {
+            factor: if node.scale_by == PIE_LOADER_NO_NODE {
                 ScaleFactor::Uniform(node.scale_factor_bits)
             } else {
-                ScaleFactor::PerGroup {
+                ScaleFactor::PerBlock {
                     by: Box::new(child(node.scale_by, "scale_by")?),
-                    group: node.scale_group,
-                    axis,
                 }
             },
         },

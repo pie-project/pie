@@ -250,10 +250,8 @@ impl OwnedContract {
                 node.src = src;
                 match factor {
                     ScaleFactor::Uniform(bits) => node.scale_factor_bits = *bits,
-                    ScaleFactor::PerGroup { by, group, axis } => {
+                    ScaleFactor::PerBlock { by } => {
                         node.scale_by = self.write_expr(by);
-                        node.scale_group = *group;
-                        node.axis = axis.0;
                     }
                 }
             }

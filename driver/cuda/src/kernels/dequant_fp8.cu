@@ -38,20 +38,21 @@ __global__ void dequant_fp8_e4m3_per_channel_kernel(
     }
 }
 
-__global__ void dequant_fp8_e4m3_per_group_kernel(
+__global__ void dequant_fp8_e4m3_blocked_kernel(
     const __nv_fp8_storage_t* __restrict__ src,
     __nv_bfloat16*            __restrict__ dst,
     const float*              __restrict__ scales,
     int                                    cols,
-    int                                    group_size,
+    int                                    row_block,
+    int                                    col_block,
     int                                    scale_cols)
 {
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
-    const int scale_row = row / group_size;
+    const int scale_row = row / row_block;
     const std::size_t off = static_cast<std::size_t>(row) * cols;
     for (int j = tid; j < cols; j += BLOCK) {
-        const int scale_col = j / group_size;
+        const int scale_col = j / col_block;
         const float s = scales[scale_row * scale_cols + scale_col];
         const __half h = __nv_cvt_fp8_to_halfraw(src[off + j], __NV_E4M3);
         dst[off + j] = __float2bfloat16(__half2float(h) * s);
@@ -83,17 +84,26 @@ void launch_dequant_fp8_e4m3_to_bf16_per_channel(
         scale_inv_dev, cols);
 }
 
+void launch_dequant_fp8_e4m3_to_bf16_blocked(
+    const std::uint8_t* fp8_in, void* bf16_out,
+    const float* scale_dev, int rows, int cols,
+    int row_block, int col_block, cudaStream_t stream)
+{
+    if (rows == 0 || cols == 0) return;
+    const int scale_cols = (cols + col_block - 1) / col_block;
+    dequant_fp8_e4m3_blocked_kernel<<<rows, BLOCK, 0, stream>>>(
+        reinterpret_cast<const __nv_fp8_storage_t*>(fp8_in),
+        static_cast<__nv_bfloat16*>(bf16_out),
+        scale_dev, cols, row_block, col_block, scale_cols);
+}
+
 void launch_dequant_fp8_e4m3_to_bf16_per_group(
     const std::uint8_t* fp8_in, void* bf16_out,
     const float* scale_dev, int rows, int cols,
     int group_size, cudaStream_t stream)
 {
-    if (rows == 0 || cols == 0) return;
-    const int scale_cols = (cols + group_size - 1) / group_size;
-    dequant_fp8_e4m3_per_group_kernel<<<rows, BLOCK, 0, stream>>>(
-        reinterpret_cast<const __nv_fp8_storage_t*>(fp8_in),
-        static_cast<__nv_bfloat16*>(bf16_out),
-        scale_dev, cols, group_size, scale_cols);
+    launch_dequant_fp8_e4m3_to_bf16_blocked(
+        fp8_in, bf16_out, scale_dev, rows, cols, group_size, group_size, stream);
 }
 
 }  // namespace pie_cuda_driver::kernels

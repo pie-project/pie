@@ -268,8 +268,8 @@ private:
             instr.has_dest ? instr.dest.offset + instr.dest.stride.base_offset : 0;
         auto* dst = static_cast<std::uint8_t*>(out.data()) + dst_offset;
 
-        if (instr.transform_scale_group != 0) {
-            scale_per_group_tile_map(instr, source, out, dst);
+        if (instr.transform_scale_blocks.len != 0) {
+            scale_per_block_tile_map(instr, source, out, dst);
             return;
         }
 
@@ -319,12 +319,18 @@ private:
         scale_tensor_to_ptr(resolver_.or_finalized(instr.input_buffers.ptr[0]), dst, factor);
     }
 
-    // One factor per `transform_scale_group` elements, read from the operand
-    // the contract paired with the payload rather than from a sibling tensor
-    // whose name was guessed. Dequantization written this way happens once, in
-    // the plan, so the packed original never has to be resident: a weight is a
-    // view into the shared arena, and a view cannot be freed.
-    void scale_per_group_tile_map(
+    // One factor per block, read from the operand the contract paired with the
+    // payload rather than from a sibling tensor whose name was guessed.
+    // Dequantization written this way happens once, in the plan, so the packed
+    // original never has to be resident: a weight is a view into the shared
+    // arena, and a view cannot be freed.
+    //
+    // `transform_scale_blocks` gives the block size on every axis, so a
+    // DeepSeek-style FP8 checkpoint's 128x128 blocks and MXFP4's row-wise 32
+    // are the same statement at different ranks. The loader derived it from the
+    // two shapes it had already checked; this reads it back and checks it
+    // against the destination rather than trusting it.
+    void scale_per_block_tile_map(
         const lp::PieLoaderStorageOp::TileMap_Body& instr,
         const lp::PieLoaderSourceExtentView& source,
         const DeviceTensor& out,
@@ -332,7 +338,7 @@ private:
     {
         if (instr.input_buffers.len < 1) {
             throw std::runtime_error(
-                "rust storage executor: per-group Scale has no factor operand");
+                "rust storage executor: per-block Scale has no factor operand");
         }
         const DeviceTensor& factors =
             resolver_.or_finalized(instr.input_buffers.ptr[instr.input_buffers.len - 1]);
@@ -340,32 +346,37 @@ private:
         const auto& shape = out.shape();
         if (shape.size() < 2) {
             throw std::runtime_error(
-                "rust storage executor: per-group Scale expects a matrix output");
+                "rust storage executor: per-block Scale expects a matrix output");
         }
-        // Groups run along the last axis, which the loader checks, so every
-        // earlier axis is a whole number of rows however many there are.
+        if (instr.transform_scale_blocks.len != shape.size()) {
+            throw std::runtime_error(
+                "rust storage executor: per-block Scale states a block size for " +
+                std::to_string(instr.transform_scale_blocks.len) +
+                " axes, but the output has " + std::to_string(shape.size()));
+        }
+        // Every axis but the last two contributes whole matrices, and both
+        // kernels below take one matrix at a time -- so a block that spans them
+        // is a layout neither can index. The last two are the row block and the
+        // column block.
+        for (std::size_t axis = 0; axis + 2 < shape.size(); ++axis) {
+            if (instr.transform_scale_blocks.ptr[axis] != 1) {
+                throw std::runtime_error(
+                    "rust storage executor: per-block Scale blocks only the two "
+                    "innermost axes; axis " + std::to_string(axis) + " is blocked by " +
+                    std::to_string(instr.transform_scale_blocks.ptr[axis]));
+            }
+        }
+        const std::int64_t row_block =
+            instr.transform_scale_blocks.ptr[shape.size() - 2];
+        const std::int64_t col_block =
+            instr.transform_scale_blocks.ptr[shape.size() - 1];
         const std::int64_t cols = shape.back();
         const std::int64_t rows = out.numel() / cols;
-        if (cols % instr.transform_scale_group != 0) {
+        if (row_block <= 0 || col_block <= 0 || cols % col_block != 0 ||
+            shape[shape.size() - 2] % row_block != 0) {
             throw std::runtime_error(
-                "rust storage executor: per-group Scale group does not divide "
-                "the output row");
-        }
-
-        // The scheme is what says how a stored code becomes a number, and both
-        // schemes below are four bits packed low nibble first -- so reading one
-        // as the other is silent, and the check has to be exact rather than a
-        // width test.
-        const bool mxfp4 = instr.transform_from == lp::PieLoaderQuantScheme::Mxfp4E2M1E8M0;
-        const bool int4b8 = instr.transform_from == lp::PieLoaderQuantScheme::Int4B8;
-        if (!mxfp4 && !int4b8) {
-            throw std::runtime_error(
-                "rust storage executor: per-group Scale is implemented for "
-                "MXFP4 and Int4B8 elements only");
-        }
-        if (instr.transform_scale_group != loader_config::kMxfp4Group) {
-            throw std::runtime_error(
-                "rust storage executor: these block scales come in groups of 32");
+                "rust storage executor: per-block Scale blocks do not divide the "
+                "output");
         }
         if (out.dtype() != DType::BF16) {
             throw std::runtime_error(
@@ -373,10 +384,33 @@ private:
                 "output declares " +
                 std::string(dtype_name(out.dtype())));
         }
+
+        // FP8 is a whole element per byte, so its payload is `rows * cols`
+        // bytes; the four-bit schemes pack two to a byte. The scheme is what
+        // says which, and both nibble schemes are packed low nibble first --
+        // so reading one as the other is silent, and the check has to be exact
+        // rather than a width test.
+        const bool mxfp4 = instr.transform_from == lp::PieLoaderQuantScheme::Mxfp4E2M1E8M0;
+        const bool int4b8 = instr.transform_from == lp::PieLoaderQuantScheme::Int4B8;
+        const bool fp8 = instr.transform_from == lp::PieLoaderQuantScheme::Fp8E4M3;
+        if (!mxfp4 && !int4b8 && !fp8) {
+            throw std::runtime_error(
+                "rust storage executor: per-block Scale is implemented for "
+                "MXFP4, Int4B8 and FP8-E4M3 elements only");
+        }
+        // The nibble kernels index one factor per 32 columns and read the row
+        // block as 1; the FP8 kernel takes both blocks as arguments and is the
+        // only one that can index a block spanning rows.
+        if (!fp8 && (row_block != 1 || col_block != loader_config::kMxfp4Group)) {
+            throw std::runtime_error(
+                "rust storage executor: these block scales come in row-wise "
+                "groups of 32");
+        }
         // MXFP4 pairs E2M1 elements with E8M0 exponents; Int4B8 pairs
-        // biased nibbles with plain BF16 factors. Neither kernel reads the
-        // other's factor format.
-        const DType want_factors = mxfp4 ? DType::E8M0 : DType::BF16;
+        // biased nibbles with plain BF16 factors; FP8 pairs a byte per element
+        // with F32 reciprocal scales. No kernel reads another's factor format.
+        const DType want_factors =
+            mxfp4 ? DType::E8M0 : (int4b8 ? DType::BF16 : DType::FP32);
         if (factors.dtype() != want_factors) {
             throw std::runtime_error(
                 "rust storage executor: this scheme's block scales are " +
@@ -385,8 +419,8 @@ private:
                 std::string(dtype_name(factors.dtype())));
         }
 
-        DeviceTensor scratch =
-            acquire_scale_source(instr, source, rows * cols / 2);
+        DeviceTensor scratch = acquire_scale_source(
+            instr, source, fp8 ? rows * cols : rows * cols / 2);
 #if PIE_CUDA_TRANSCODE_ENGINE_HAS_CUDA
         if (mxfp4) {
             kernels::launch_dequant_mxfp4_to_bf16(
@@ -395,6 +429,16 @@ private:
                 dst,
                 static_cast<int>(rows),
                 static_cast<int>(cols),
+                /*stream=*/0);
+        } else if (fp8) {
+            kernels::launch_dequant_fp8_e4m3_to_bf16_blocked(
+                static_cast<const std::uint8_t*>(scratch.data()),
+                dst,
+                static_cast<const float*>(factors.data()),
+                static_cast<int>(rows),
+                static_cast<int>(cols),
+                static_cast<int>(row_block),
+                static_cast<int>(col_block),
                 /*stream=*/0);
         } else {
             // The kernel reads the payload as 32-bit words. Eight nibbles to a
@@ -408,12 +452,13 @@ private:
                 dst,
                 static_cast<int>(rows),
                 static_cast<int>(cols),
-                static_cast<int>(instr.transform_scale_group),
+                static_cast<int>(col_block),
                 /*stream=*/0);
         }
 #else
         (void)scratch;
         (void)dst;
+        (void)row_block;
         throw std::runtime_error(
             "rust storage executor: CUDA TileMap Scale compiled without CUDA "
             "headers");

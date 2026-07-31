@@ -47,7 +47,7 @@ inline void mla_fused_projection_joins(ContractBuilder& b) {
 /// The batched MoE path wants one dense bf16 slab per layer, `[E, 2I, H]` over
 /// `[E, H, I]`, so a batched GEMM sees a base pointer and a stride. Building it
 /// is `Bitcast` to say what the packed words are, `Concat` to stack, and one
-/// `scale_per_group` per slab to dequantize -- with the sharding inside, so
+/// `scale_per_block` per slab to dequantize -- with the sharding inside, so
 /// each rank dequantizes only the slice it keeps.
 ///
 /// Unlike DeepSeek-V4 this does **not** consume the packed originals. Kimi
@@ -190,10 +190,10 @@ inline void kimi_bf16_expert_stacks(ContractBuilder& b, std::size_t budget) {
         }
 
         // The factors are published rather than kept internal because
-        // `scale_per_group` takes them by output name: a scale is a tensor the
+        // `scale_per_block` takes them by output name: a scale is a tensor the
         // contract declared, not a companion the lowering guesses at from a
         // suffix. They cost two bytes per 32 weights.
-        // Named but not bound. `scale_per_group` takes its factors by output
+        // Named but not bound. `scale_per_block` takes its factors by output
         // name -- a scale is a tensor the contract declared, not a companion
         // the lowering guesses at from a suffix -- and the stacked slab is
         // dequantized here, so no kernel ever reads these again. Left public
@@ -215,13 +215,13 @@ inline void kimi_bf16_expert_stacks(ContractBuilder& b, std::size_t budget) {
             dn->internal();
         }
         b.define(mlp + "experts.gate_up.weight",
-                 b.contract().scale_per_group(b.contract().concat(gate_up, 0),
-                                              b.contract().out(gu_scale), kGroup, 2),
+                 b.contract().scale_per_block(b.contract().concat(gate_up, 0),
+                                              b.contract().out(gu_scale)),
                  pie_loader::raw(PieLoaderDType::BF16),
                  std::vector<std::int64_t>{experts, 2 * local_inter, hidden});
         b.define(mlp + "experts.down.weight",
-                 b.contract().scale_per_group(b.contract().concat(down, 0),
-                                              b.contract().out(dn_scale), kGroup, 2),
+                 b.contract().scale_per_block(b.contract().concat(down, 0),
+                                              b.contract().out(dn_scale)),
                  pie_loader::raw(PieLoaderDType::BF16),
                  std::vector<std::int64_t>{experts, hidden, local_inter});
     }
