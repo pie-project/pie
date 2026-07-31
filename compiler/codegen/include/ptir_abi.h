@@ -264,7 +264,7 @@ enum PtirChannelClass : uint8_t { PTIR_CHAN_FULL_RING = 0, PTIR_CHAN_IN_PLACE = 
 // silently reuse a stale cubin/metallib. They are emitted here rather than
 // retyped in the drivers precisely because the two copies cannot be compared at
 // runtime -- the mismatch shows up as a wrong answer, not as an error.
-#define PTIR_CUDA_EMITTER_VERSION 19
+#define PTIR_CUDA_EMITTER_VERSION 20
 #define PTIR_METAL_M1_EMITTER_VERSION 35
 #define PTIR_METAL_M1_MAX_CHANNELS 29
 #define PTIR_METAL_M2_MAX_FUSED_CHANNELS 12
