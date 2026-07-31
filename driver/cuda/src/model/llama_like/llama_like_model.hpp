@@ -35,6 +35,12 @@ public:
     ModelCapabilities capabilities() const override { return caps_; }
     std::uint32_t graph_layout() override;
 
+    // The validated declared plan (empty → nullptr), for the load-time
+    // capability site summary (imodel.hpp).
+    const pie_forward::ForwardPlan* declared_plan() const override {
+        return declared_ ? &declared_.plan : nullptr;
+    }
+
 private:
     Qwen3Weights weights_;
     const HfConfig& hf_config_;

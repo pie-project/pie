@@ -76,6 +76,11 @@ pub struct DummyDriverOptions {
     pub has_mtp_drafts: bool,
     pub has_value_head: bool,
     pub has_attn_score: bool,
+    /// Test fixture for the declared-plan site summary a real driver derives
+    /// from its traced + validated forward plan (the CUDA driver's
+    /// `model_site_summary` capability row). The dummy has no plan to trace,
+    /// so the summary is whatever the fixture states — empty by default.
+    pub model_site_summary: pie_driver_abi::ModelSiteSummary,
     pub callback_delay_ms: u64,
     pub reject_launches: bool,
     pub reject_launches_remaining: u32,
@@ -108,6 +113,7 @@ impl Default for DummyDriverOptions {
             has_mtp_drafts: true,
             has_value_head: true,
             has_attn_score: true,
+            model_site_summary: pie_driver_abi::ModelSiteSummary::default(),
             callback_delay_ms: 0,
             reject_launches: false,
             reject_launches_remaining: 0,
@@ -334,6 +340,7 @@ impl DummyDriver {
                 has_mtp_drafts: options.has_mtp_drafts,
                 has_value_head: options.has_value_head,
                 has_attn_score: options.has_attn_score,
+                model_site_summary: options.model_site_summary,
                 // The dummy driver has no real KV keys, so it can never honour
                 // the `envelope_dot` contract, nor act on a page selection made
                 // over keys it does not have.
@@ -2282,6 +2289,28 @@ mod tests {
     use pie_ir::types::{Literal, Shape};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
+
+    /// The fixture summary flows into the reported capabilities verbatim —
+    /// the dummy half of the driver→engine site-summary handshake (a real
+    /// driver derives this from its validated declared plan; the dummy
+    /// reports whatever its fixture states, empty by default).
+    #[test]
+    fn fixture_model_site_summary_reaches_capabilities() {
+        let default_driver = DummyDriver::new();
+        assert!(default_driver.capabilities().model_site_summary.is_empty());
+
+        let summary = pie_driver_abi::ModelSiteSummary {
+            expert_sites: vec![pie_driver_abi::ExpertSiteSummary {
+                experts: 256,
+                top_k: 8,
+            }],
+        };
+        let driver = DummyDriver::with_options(DummyDriverOptions {
+            model_site_summary: summary.clone(),
+            ..DummyDriverOptions::default()
+        });
+        assert_eq!(driver.capabilities().model_site_summary, summary);
+    }
 
     #[derive(Clone, Copy, Default)]
     struct PieChannelWait {

@@ -241,6 +241,7 @@ pub(crate) fn build_frame_submission(
     limits: SchedulerLimits,
     page_size: u32,
     stats: &SchedulerStats,
+    model_sites: &[fire_plan::Site],
 ) -> (FrameSubmission, Vec<Box<PendingRequest>>) {
     let mut step_groups: Vec<Vec<Box<PendingRequest>>> = Vec::new();
     for wave in waves {
@@ -305,16 +306,20 @@ pub(crate) fn build_frame_submission(
                 arrival,
             })
             .collect();
-        // TODO(stage5-wiring): call `plan_fire_with_model` with the
-        // model-structural sites (`fire_plan::site_table::derive_sites`)
-        // once the scheduler holds a traced plan. It cannot honestly hold
-        // one yet: the runtime lacks the driver's binding facts, and the
-        // driver already traces + validates at boot — see the site_table
-        // module doc's "why build_frame_submission passes no model sites
-        // yet" for the analysis (the likely route is the driver reporting
-        // its validated plan through capabilities, not an engine-side
-        // re-trace).
-        let plan = fire_plan::plan_fire(&facts);
+        // `model_sites` is the driver's own statement, from its validated
+        // declared plan through the capabilities handshake (the site_table
+        // module doc's wiring; `fire_plan::site_table::summary_sites` maps
+        // the reported summary into the vocabulary). Empty — every dense
+        // model, every driver without a declared plan — reduces this to
+        // the old `plan_fire` exactly. The merged sites stay INFORMATIONAL
+        // this increment: nothing consumes the site vec downstream (v0),
+        // so the assert below is the site's only reader.
+        let plan = fire_plan::plan_fire_with_model(&facts, model_sites);
+        debug_assert_eq!(
+            plan.sites.len(),
+            2 + model_sites.len(),
+            "the merged plan carries both member-fact sites and every model site"
+        );
         debug_assert_eq!(
             plan.member_order,
             {
@@ -451,6 +456,44 @@ mod tests {
             single_token_mode: true,
             ..LaunchPlan::default()
         }
+    }
+
+    /// The driver-reported model sites are INFORMATIONAL this increment
+    /// (nothing consumes a fire plan's site vec downstream — v0): sealing a
+    /// frame with an MoE summary's expert site merged produces a submission
+    /// identical to sealing without it, while the debug assert inside
+    /// `build_frame_submission` pins that the merged plan really carried
+    /// the site through `plan_fire_with_model`.
+    #[test]
+    fn model_sites_are_informational_for_the_submission() {
+        let limits = SchedulerLimits {
+            max_forward_requests: 8,
+            max_forward_tokens: 64,
+            max_page_refs: 64,
+        };
+        let waves = || {
+            vec![vec![
+                pending(wire_decode(11, 3), 1, false),
+                pending(wire_decode(22, 4), 2, false),
+            ]]
+        };
+        let stats = SchedulerStats::default();
+        let (without_sites, retired) = build_frame_submission(waves(), limits, 16, &stats, &[]);
+        assert_eq!(retired.len(), 2);
+
+        let model_sites = [fire_plan::expert_weights_site(256, 8)];
+        let (with_sites, retired) =
+            build_frame_submission(waves(), limits, 16, &stats, &model_sites);
+        assert_eq!(retired.len(), 2);
+        // Terminal cells are per-completion heap pointers, distinct between
+        // the two constructions by nature; everything else must agree.
+        let scrub = |mut submission: FrameSubmission| {
+            for step in &mut submission.steps {
+                step.terminal_cells.clear();
+            }
+            submission
+        };
+        assert_eq!(scrub(without_sites), scrub(with_sites));
     }
 
     #[test]

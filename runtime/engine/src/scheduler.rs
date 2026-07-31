@@ -865,7 +865,8 @@ fn build_driver_scheduler(
     page_size: u32,
     request_timeout_secs: u64,
 ) -> Result<BatchScheduler> {
-    let limits = crate::driver::get_spec(driver_id)?.scheduler_limits();
+    let spec = crate::driver::get_spec(driver_id)?;
+    let limits = spec.scheduler_limits();
     Ok(BatchScheduler::new(
         driver_id,
         driver_id,
@@ -873,6 +874,10 @@ fn build_driver_scheduler(
         limits,
         request_timeout_secs,
         configured_frame_size(),
+        // The driver's validated-plan site summary from the capabilities
+        // handshake: the scheduler maps it into fire-plan sites and merges
+        // them into every sealed frame (`fire_plan::site_table`).
+        spec.model_site_summary,
     ))
 }
 

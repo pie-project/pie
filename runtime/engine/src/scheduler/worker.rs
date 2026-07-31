@@ -2378,7 +2378,20 @@ impl BatchScheduler {
         limits: SchedulerLimits,
         request_timeout_secs: u64,
         frame_size: usize,
+        model_site_summary: pie_driver_abi::ModelSiteSummary,
     ) -> Self {
+        // The driver's validated-plan site summary (capabilities handshake),
+        // mapped into the fire planner's vocabulary once at spawn; every
+        // sealed frame merges these sites via `plan_fire_with_model`.
+        // Informational this increment (nothing consumes the site vec yet).
+        let model_sites = super::fire_plan::site_table::summary_sites(&model_site_summary);
+        if !model_sites.is_empty() {
+            tracing::info!(
+                driver_id,
+                sites = model_sites.len(),
+                "scheduler holds model-structural site(s) from the driver's declared plan"
+            );
+        }
         let (tx, rx) = crossbeam::channel::unbounded::<SchedulerItem>();
         let stats = Arc::new(SchedulerStats::default());
         let handle = SchedulerHandle {
@@ -2407,6 +2420,7 @@ impl BatchScheduler {
                     limits,
                     stats_for_loop,
                     frame_size,
+                    model_sites,
                 );
             })
             .expect("spawn pie-sched thread");
@@ -2436,6 +2450,7 @@ impl BatchScheduler {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run(
         driver_id: DriverId,
         rx: crossbeam::channel::Receiver<SchedulerItem>,
@@ -2444,6 +2459,7 @@ impl BatchScheduler {
         limits: SchedulerLimits,
         stats: Arc<SchedulerStats>,
         frame_size: usize,
+        model_sites: Vec<super::fire_plan::Site>,
     ) {
         let lane_reply_tx = nudge_tx.clone();
         let nudge_waker = std::task::Waker::from(Arc::new(NudgeWaker {
@@ -2589,6 +2605,7 @@ impl BatchScheduler {
                 &mut scan_cache,
                 &mut slot_buffer,
                 stopping,
+                &model_sites,
             );
             progress |= dispatched;
             if probe {
@@ -3453,6 +3470,7 @@ impl BatchScheduler {
         scan_cache: &mut ScanCache,
         slot_buffer: &mut SlotBuffer,
         stopping: bool,
+        model_sites: &[super::fire_plan::Site],
     ) -> (bool, Option<Duration>) {
         let probe_disp = super::fire_timing_enabled();
         let disp_started = probe_disp.then(Instant::now);
@@ -3471,6 +3489,7 @@ impl BatchScheduler {
             limits,
             stats,
             stopping,
+            model_sites,
         );
         if let Some(started) = disp_started {
             super::LOOP_PHASES
@@ -3942,6 +3961,7 @@ impl BatchScheduler {
         limits: SchedulerLimits,
         stats: &Arc<SchedulerStats>,
         stopping: bool,
+        model_sites: &[super::fire_plan::Site],
     ) -> (bool, Option<Duration>) {
         let mut progress = false;
         let mut wait_hint: Option<Duration> = None;
@@ -4026,6 +4046,7 @@ impl BatchScheduler {
                 limits,
                 stats,
                 &waves,
+                model_sites,
             );
             if let Some(post_started) = post_started {
                 super::LOOP_PHASES
@@ -4080,6 +4101,7 @@ impl BatchScheduler {
         true
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn post_frame(
         slot_buffer: &mut SlotBuffer,
         driver_lane: &DriverLane,
@@ -4092,6 +4114,7 @@ impl BatchScheduler {
         limits: SchedulerLimits,
         stats: &Arc<SchedulerStats>,
         waves: &[Vec<u64>],
+        model_sites: &[super::fire_plan::Site],
     ) -> (bool, bool) {
         let mut progress = false;
         let sub = super::fire_timing_enabled().then(Instant::now);
@@ -4200,7 +4223,7 @@ impl BatchScheduler {
         }
         let nonempty_waves = survivors.iter().filter(|w| !w.is_empty()).count();
         let (submission, requests) =
-            batch::build_frame_submission(survivors, limits, page_size, stats);
+            batch::build_frame_submission(survivors, limits, page_size, stats, model_sites);
         // How many waves a sealed frame actually carries. ABI v14 has a frame
         // carry k steps the driver runs as one closed system, and the guest does
         // submit `live_slots` fires per frame -- but this reports
@@ -5308,15 +5331,21 @@ mod tests {
         crate::driver::BoundInstance,
         Vec<Arc<crate::driver::ChannelEndpoint>>,
     )> {
+        // The dummy fixture's site summary stands in for the summary a real
+        // driver's capabilities would report; spawn the scheduler with the
+        // same one, exactly as `scheduler::build_driver_scheduler` reads it
+        // off the registered `DriverSpec`.
+        let summary = options.model_site_summary.clone();
         let driver_id = driver::register_driver_backend(
             DriverSpec {
                 num_kv_pages: 16,
                 limits,
                 device_geometry_port_mask: 0,
+                model_site_summary: summary.clone(),
             },
             DriverBackend::Dummy(crate::driver::DummyDriver::new(options)),
         );
-        let scheduler = BatchScheduler::new(driver_id, driver_id, 16, limits, 1, 1);
+        let scheduler = BatchScheduler::new(driver_id, driver_id, 16, limits, 1, 1, summary);
         let program_id = crate::scheduler::register_program(driver_id, dummy_program()).await?;
         let endpoints = register_test_channels(driver_id, [7, 8]).await?;
         let bound = crate::scheduler::bind_instance(
@@ -5748,6 +5777,53 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|entry| entry.starts_with("launch-shape tokens=2 programs=1"))
+        );
+        Ok(())
+    }
+
+    /// Dummy-path end-to-end for the capabilities site handshake: a
+    /// scheduler spawned from a driver whose fixture reports a populated
+    /// `model_site_summary` (the MoE shape a real CUDA driver would derive
+    /// from its validated plan) seals and launches a real frame. The
+    /// summary maps into fire-plan sites at spawn
+    /// (`site_table::summary_sites`) and `build_frame_submission`'s merge
+    /// assert — active in this debug-build test — verifies the sealed
+    /// frame's plan carried them; the launch completing normally pins that
+    /// a populated summary is informational and changes no scheduling
+    /// behavior.
+    #[tokio::test(flavor = "current_thread")]
+    async fn populated_model_site_summary_flows_through_a_real_launch() -> anyhow::Result<()> {
+        let operation_log = Arc::new(Mutex::new(Vec::new()));
+        let (driver_id, _scheduler, bound, _endpoints) =
+            setup_scheduler_with_options(DummyDriverOptions {
+                model_site_summary: pie_driver_abi::ModelSiteSummary {
+                    expert_sites: vec![pie_driver_abi::ExpertSiteSummary {
+                        experts: 256,
+                        top_k: 8,
+                    }],
+                },
+                operation_log: Some(operation_log.clone()),
+                ..DummyDriverOptions::default()
+            })
+            .await?;
+
+        let completion = bound.reserve_completion();
+        crate::scheduler::submit_async(
+            dummy_launch(),
+            driver_id,
+            bound.instance_id,
+            0,
+            None,
+            completion.clone(),
+        )?;
+        timeout(Duration::from_secs(5), completion).await??;
+        assert!(
+            operation_log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.starts_with("launch-shape tokens=1 programs=1")),
+            "the fire launches exactly as without a summary"
         );
         Ok(())
     }
@@ -6463,6 +6539,7 @@ mod tests {
             &mut ScanCache::default(),
             &mut SlotBuffer::new(),
             false,
+            &[],
         );
         assert!(progress);
         assert!(
@@ -6696,6 +6773,7 @@ mod tests {
                     max_page_refs: 64,
                 },
                 device_geometry_port_mask: 0,
+                model_site_summary: pie_driver_abi::ModelSiteSummary::default(),
             },
             DriverBackend::Dummy(crate::driver::DummyDriver::new(
                 DummyDriverOptions::default(),
@@ -6712,6 +6790,7 @@ mod tests {
             },
             1,
             1,
+            pie_driver_abi::ModelSiteSummary::default(),
         );
         let exporter_bytes = TraceContainer {
             names: vec!["shared".to_string()],
@@ -7624,6 +7703,7 @@ mod tests {
             limits,
             &stats,
             &waves,
+            &[],
         );
         assert!(progress, "the drop is progress");
         assert!(!posted, "nothing launches for a cancelled fire");
@@ -7716,6 +7796,7 @@ mod tests {
             &mut ScanCache::default(),
             &mut SlotBuffer::new(),
             false,
+            &[],
         );
         assert!(progress, "the copy dispatch is progress");
         assert!(
@@ -7953,6 +8034,7 @@ mod tests {
                 &mut ScanCache::default(),
                 &mut SlotBuffer::new(),
                 false,
+                &[],
             );
             pending.len()
         };

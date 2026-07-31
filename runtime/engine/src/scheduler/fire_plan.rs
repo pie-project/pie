@@ -41,9 +41,10 @@
 //!   `pie_forward::ForwardPlan` and emits them once per model, not per
 //!   fire.
 //!
-//! [`plan_fire_with_model`] merges both when the caller holds a traced
-//! plan; `build_frame_submission` does not yet (see the [`site_table`]
-//! module doc for why, honestly, it cannot).
+//! [`plan_fire_with_model`] merges both: `build_frame_submission` passes
+//! the model-structural sites the driver's capabilities handshake reported
+//! from its validated plan ([`site_table::summary_sites`]; the [`site_table`]
+//! module doc records why the driver, not the engine, is the honest source).
 
 pub(crate) mod site_table;
 
@@ -194,10 +195,12 @@ pub(crate) const SITE_PROJECTION_WEIGHTS: &str = "projection_weights";
 /// the TRACED FORM, not about the members — every member of a fire against
 /// an MoE model diverges here, expert assignment being data. It is emitted
 /// by the plan-derived site table ([`site_table::derive_sites`]: walk the
-/// `ForwardPlan`, one Site per distinct selector parameterization) and
-/// merged into a fire's plan by [`plan_fire_with_model`] when the caller
-/// holds a traced plan — which `build_frame_submission` does not yet (the
-/// [`site_table`] module doc records the wiring analysis).
+/// `ForwardPlan`, one Site per distinct selector parameterization; the
+/// driver runs the C++ mirror of that walk over its validated plan and
+/// reports the result through capabilities — [`site_table::summary_sites`])
+/// and merged into a fire's plan by [`plan_fire_with_model`], which
+/// `build_frame_submission` now calls with the reported sites (the
+/// [`site_table`] module doc records the wiring).
 pub(crate) const SITE_EXPERT_WEIGHTS: &str = "expert_weights";
 
 /// The [`SITE_EXPERT_WEIGHTS`] vocabulary entry, as the plan-derived site
@@ -281,10 +284,11 @@ impl FirePlan {
 /// Plan one step group from member facts alone.
 ///
 /// Equivalent to [`plan_fire_with_model`] with no model-structural sites —
-/// the form `build_frame_submission` calls while the scheduler does not yet
-/// hold a traced plan (the [`site_table`] module doc records why). Kept as
-/// the named entry point so that wiring the traced plan through is one call
-/// site's change, not a signature churn across every existing caller.
+/// the form for callers with no model site source (tests, and any driver
+/// whose capabilities reported an empty summary reduces to it through the
+/// merge; `build_frame_submission` itself always calls the merge form with
+/// whatever the handshake reported).
+#[allow(dead_code)] // production always calls the merge form now (capabilities wiring); kept as the named no-sites entry point the tests and the reduce-to-empty equivalence pin.
 pub(crate) fn plan_fire(members: &[MemberFacts]) -> FirePlan {
     plan_fire_with_model(members, &[])
 }
@@ -585,7 +589,7 @@ mod tests {
     }
 
     /// [`plan_fire`] is exactly the no-model-sites merge — the equivalence
-    /// `build_frame_submission` relies on while it passes none.
+    /// an empty capability summary reduces `build_frame_submission` to.
     #[test]
     fn plan_fire_equals_the_empty_model_merge() {
         let members = vec![

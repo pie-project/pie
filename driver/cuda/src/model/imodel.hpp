@@ -21,6 +21,10 @@
 #include "ops/attention_workspace.hpp"
 #include "store/kv_cache.hpp"
 
+namespace pie_forward {
+class ForwardPlan;
+}
+
 namespace pie_cuda_driver {
 
 class LoadedModel;
@@ -111,6 +115,19 @@ public:
 
     // Static-at-construction capability flags.
     virtual ModelCapabilities capabilities() const = 0;
+
+    // Optional: the traced + structurally validated declared-forward plan
+    // this model built at construction (PIE_DECLARED_FORWARD opted in AND
+    // the configuration was representable AND the validation passed).
+    // nullptr otherwise — including for every family without a declared
+    // trace. Read once at load, when the capability payload derives the
+    // plan's model-structural site summary (`model_site_summary` in
+    // context.cpp): the driver is the party holding a VALIDATED plan, so
+    // the summary the engine's fire planner consumes is stated here rather
+    // than re-derived runtime-side from binding facts the engine lacks.
+    virtual const pie_forward::ForwardPlan* declared_plan() const {
+        return nullptr;
+    }
 
     // Optional: per-model recurrent state cache (Mamba2 / linear-attn / MTP
     // hidden snapshot). nullptr = model has no recurrent state.

@@ -117,6 +117,7 @@ fn build_model(
                 has_attn_page_mask: g.caps.has_attn_page_mask,
                 has_lora: g.caps.has_lora,
                 has_attn_score: g.caps.has_attn_score,
+                model_site_summary: g.caps.model_site_summary.clone(),
                 device_geometry_port_mask: g.caps.device_geometry_port_mask,
                 limits: pie_engine::driver::SchedulerLimits {
                     max_forward_requests: g.caps.max_forward_requests as usize,
@@ -173,6 +174,7 @@ mod tests {
             has_attn_page_mask: false,
             has_lora: false,
             has_attn_score: false,
+            model_site_summary: pie_driver_abi::ModelSiteSummary::default(),
             device_geometry_port_mask: pie_driver_abi::PIE_DEVICE_GEOMETRY_PORTS,
             kv_handle: None,
             codegen_backend: String::new(),
@@ -196,6 +198,7 @@ mod tests {
             has_mtp_drafts: caps.has_mtp_drafts,
             has_value_head: caps.has_value_head,
             has_attn_score: caps.has_attn_score,
+            model_site_summary: caps.model_site_summary.clone(),
             callback_delay_ms: 0,
             reject_launches: false,
             reject_launches_remaining: 0,
@@ -260,6 +263,49 @@ arch_name = "qwen3"
             m.drivers[0].device_geometry_port_mask,
             pie_driver_abi::PIE_DEVICE_GEOMETRY_PORTS
         );
+    }
+
+    /// A driver-reported site summary passes through to the engine's
+    /// per-driver config untouched — the capabilities half of the
+    /// driver→engine site-summary handshake.
+    #[test]
+    fn model_site_summary_passes_through_to_driver_config() {
+        let toml_text = r#"
+[model]
+name = "default"
+hf_repo = "Qwen/Qwen3-0.6B"
+
+[model.driver]
+type = "dummy"
+device = ["cpu"]
+
+[model.driver.options]
+vocab_size = 151936
+arch_name = "qwen3"
+"#;
+        let user: config::Config = toml::from_str(toml_text).unwrap();
+        user.validate().unwrap();
+
+        let snap = tempfile::tempdir().unwrap();
+        std::fs::write(snap.path().join("tokenizer.json"), b"{}").unwrap();
+        let mut caps = fixture_caps();
+        caps.snapshot_dir = snap.path().to_string_lossy().into_owned();
+        caps.model_site_summary = pie_driver_abi::ModelSiteSummary {
+            expert_sites: vec![pie_driver_abi::ExpertSiteSummary {
+                experts: 256,
+                top_k: 8,
+            }],
+        };
+        let expected = caps.model_site_summary.clone();
+
+        let cfg = build(
+            &user,
+            ModelDrivers {
+                groups: vec![fixture_group(caps)],
+            },
+        )
+        .unwrap();
+        assert_eq!(cfg.model.drivers[0].model_site_summary, expected);
     }
 
     #[test]

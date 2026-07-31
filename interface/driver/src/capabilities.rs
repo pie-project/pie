@@ -71,6 +71,45 @@ pub struct DeviceFacts {
     pub page_size: u32,
 }
 
+/// One model-structural expert-selection site of the driver's declared
+/// plan: an MoE trace's per-token expert-indexed matmul group, stated as
+/// exactly the parameters the engine's fire planner vocabulary takes
+/// (`expert_weights_site(experts, top_k)`). One entry per distinct
+/// parameterization, in the plan's first-appearance order.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExpertSiteSummary {
+    /// The expert count the per-token selector indexes (the router logits
+    /// width — a plan fact, not the weight-template cardinality).
+    pub experts: u32,
+    /// `k` of the `TopK` op producing the selector.
+    pub top_k: u32,
+}
+
+/// The site summary of the driver's traced + validated declared plan — the
+/// model-structural divergence sites the plan's own structure states,
+/// reported through the capabilities handshake so the engine's scheduler
+/// can thread them to fire planning without re-tracing from binding facts
+/// it does not have (the engine's `fire_plan::site_table` module doc
+/// records that analysis).
+///
+/// Empty (the default) means "no model-structural sites known": the driver
+/// did not trace (`PIE_DECLARED_FORWARD` off), the validation refused the
+/// configuration, or the plan is dense. Absence of the field parses to the
+/// same — old payloads keep today's behavior.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ModelSiteSummary {
+    #[serde(default)]
+    pub expert_sites: Vec<ExpertSiteSummary>,
+}
+
+impl ModelSiteSummary {
+    pub fn is_empty(&self) -> bool {
+        self.expert_sites.is_empty()
+    }
+}
+
 /// Model-derived capabilities returned after the LoadPlan is executed.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -138,6 +177,11 @@ pub struct DriverCapabilities {
     /// adapter.
     #[serde(default)]
     pub has_lora: bool,
+    /// Site summary of the driver's traced + validated declared plan
+    /// ([`ModelSiteSummary`]); empty when no plan was traced/validated or
+    /// the plan declares no model-structural sites (every dense model).
+    #[serde(default)]
+    pub model_site_summary: ModelSiteSummary,
     /// Descriptor-port tags the driver can resolve on-device for decode envelopes.
     #[serde(default)]
     pub device_geometry_port_mask: u32,
@@ -205,10 +249,39 @@ mod tests {
         let caps: DriverCapabilities = serde_json::from_str(caps_json()).unwrap();
         assert!(caps.has_mtp_logits);
         assert!(!caps.has_mtp_drafts);
+        // The fixture predates the site summary; absence parses to empty
+        // ("no model-structural sites known").
+        assert!(caps.model_site_summary.is_empty());
         let json = serde_json::to_string(&caps).unwrap();
         assert_eq!(
             serde_json::from_str::<DriverCapabilities>(&json).unwrap(),
             caps
+        );
+    }
+
+    /// A populated site summary — the shape the CUDA driver emits from its
+    /// validated MoE plan — round-trips, entry order preserved.
+    #[test]
+    fn model_site_summary_round_trips() {
+        let mut caps: DriverCapabilities = serde_json::from_str(caps_json()).unwrap();
+        caps.model_site_summary = ModelSiteSummary {
+            expert_sites: vec![ExpertSiteSummary {
+                experts: 256,
+                top_k: 8,
+            }],
+        };
+        let json = serde_json::to_string(&caps).unwrap();
+        let parsed: DriverCapabilities = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, caps);
+        assert_eq!(parsed.model_site_summary.expert_sites.len(), 1);
+        assert_eq!(parsed.model_site_summary.expert_sites[0].experts, 256);
+        assert_eq!(parsed.model_site_summary.expert_sites[0].top_k, 8);
+
+        // And the driver-side JSON spelling parses to the same summary.
+        let driver_row = r#"{"expert_sites": [{"experts": 256, "top_k": 8}]}"#;
+        assert_eq!(
+            serde_json::from_str::<ModelSiteSummary>(driver_row).unwrap(),
+            caps.model_site_summary
         );
     }
 

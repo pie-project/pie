@@ -62,44 +62,68 @@
 //! from the plan belongs to the increment that wires plans to the
 //! scheduler, on the admission side.
 //!
-//! # Why `build_frame_submission` passes no model sites yet
+//! # How the model sites reach `build_frame_submission` (landed via capabilities)
 //!
-//! Wiring the engine to hold a traced plan and thread it here is the NEXT
-//! increment, and the honest route is not obvious enough to guess at:
+//! The engine does NOT trace. It could seemingly do so at boot —
+//! `bootstrap` holds the `ModelConfig` (an `arch_name`, driver configs)
+//! and `pie-forward` is a direct rlib dep, so calling the family entry fn
+//! is one line — but facts construction is where it breaks: the family fns
+//! take facts the runtime does not have. `LlamaLikeFacts::fused_qkv`,
+//! `Qwen35GdnFacts::fused_in_proj` etc. are BINDING facts — truths about
+//! what the driver's deployment actually bound (contract joins/splits,
+//! env-gated fusions like `PIE_QWEN35_FUSED_GDN_PROJ`) — and the rest come
+//! from the checkpoint's config.json, which the runtime also does not
+//! parse. The DRIVER is the party that traces, from exactly that evidence:
+//! `declared_facts.cpp` builds facts from `HfConfig` plus the model's live
+//! bindings, traces through the ABI, and structurally VALIDATES the traced
+//! form against the real config and bound weight set. A runtime-side trace
+//! built from guessed binding facts would be a second, unvalidated
+//! derivation that can silently diverge from the plan the driver validated
+//! — the exact class of drift this project exists to remove.
 //!
-//! * The engine could seemingly trace at boot: `bootstrap` holds the
-//!   `ModelConfig` (an `arch_name`, driver configs) and `pie-forward` is
-//!   now a direct rlib dep, so calling the family entry fn is one line.
-//! * But facts construction is where it breaks: the family fns take facts
-//!   the runtime does not have. `LlamaLikeFacts::fused_qkv`,
-//!   `Qwen35GdnFacts::fused_in_proj` etc. are BINDING facts — truths about
-//!   what the driver's deployment actually bound (contract joins/splits,
-//!   env-gated fusions like `PIE_QWEN35_FUSED_GDN_PROJ`) — and the rest
-//!   come from the checkpoint's config.json, which the runtime also does
-//!   not parse. The DRIVER is the party that traces today, from exactly
-//!   that evidence: `declared_facts.cpp` builds facts from `HfConfig` plus
-//!   the model's live bindings, traces through the ABI, and structurally
-//!   VALIDATES the traced form against the real config and bound weight
-//!   set.
-//! * A runtime-side trace built from guessed binding facts would therefore
-//!   be a second, unvalidated derivation that can silently diverge from
-//!   the plan the driver validated — the exact class of drift this project
-//!   exists to remove. The honest design is the driver reporting its
-//!   validated plan (or that plan's site summary) to the runtime through
-//!   the capabilities/attach handshake, and the scheduler threading it to
-//!   [`plan_fire_with_model`](super::plan_fire_with_model); this module
-//!   deliberately records that analysis instead of implementing a guess.
+//! So the wiring landed on the honest route this paragraph used to only
+//! analyze: the driver reports its validated plan's SITE SUMMARY through
+//! the capabilities handshake. The CUDA driver walks its declared plan with
+//! the C++ mirror of [`derive_sites`] (`context.cpp`'s
+//! `derive_expert_site_summary`; this module's tests pin the derivation)
+//! and emits a `model_site_summary` capability row
+//! (`pie_driver_abi::ModelSiteSummary` — empty when `PIE_DECLARED_FORWARD`
+//! is off, the validation refused, or the plan is dense). The summary rides
+//! `DriverCapabilities` → worker `translate` → `bootstrap::DriverConfig` →
+//! `DriverSpec`, where the driver's scheduler picks it up at spawn, maps it
+//! through [`summary_sites`], and `build_frame_submission` merges the
+//! result into every fire via
+//! [`plan_fire_with_model`](super::plan_fire_with_model). An empty/absent
+//! summary is exactly today's behavior. The sites remain INFORMATIONAL
+//! this increment — nothing consumes a fire plan's site vec downstream yet
+//! (same as v0), so a populated summary changes no submission bytes.
 
 use pie_forward::{Dim, ForwardPlan, OpKind};
 
 use super::{Site, expert_weights_site};
+
+/// Map a driver-reported site summary (the capabilities handshake's
+/// `model_site_summary` row) into the fire planner's vocabulary: one
+/// [`expert_weights_site`](super::expert_weights_site) per reported entry,
+/// in the driver's (first-appearance) order.
+///
+/// The summary states ONLY what [`derive_sites`] emits from a traced form
+/// today — distinct `(experts, top_k)` parameterizations — so this map is
+/// total; a summary entry the vocabulary cannot express does not exist.
+pub(crate) fn summary_sites(summary: &pie_driver_abi::ModelSiteSummary) -> Vec<Site> {
+    summary
+        .expert_sites
+        .iter()
+        .map(|site| expert_weights_site(site.experts, site.top_k))
+        .collect()
+}
 
 /// Walk the traced form and emit the model-structural divergence sites its
 /// structure declares (module doc: today, one
 /// [`expert_weights_site`](super::expert_weights_site) per distinct
 /// per-token selector parameterization; recurrent-state presence is
 /// deliberately not one).
-#[allow(dead_code)] // consumed by plan_fire_with_model callers once the scheduler holds a traced plan (module doc's wiring analysis); tests pin the derivation.
+#[allow(dead_code)] // the production walk runs driver-side (context.cpp's C++ mirror — the driver holds the validated plan; module doc); this Rust original is the pinned reference the tests exercise.
 pub(crate) fn derive_sites(plan: &ForwardPlan) -> Vec<Site> {
     // Distinct (experts, top_k) parameterizations, first-appearance order.
     // A Vec, not a set: plans have a handful of layers' worth of selector
@@ -214,6 +238,62 @@ mod tests {
             "the 0.8b hybrid has GDN layers"
         );
         assert!(derive_sites(&plan).is_empty());
+    }
+
+    /// The capabilities map: a driver-reported summary lands in the same
+    /// vocabulary [`derive_sites`] emits — entry for entry, order kept,
+    /// empty to empty (absent summary = today's behavior).
+    #[test]
+    fn summary_sites_maps_the_reported_entries() {
+        assert!(summary_sites(&pie_driver_abi::ModelSiteSummary::default()).is_empty());
+
+        let summary = pie_driver_abi::ModelSiteSummary {
+            expert_sites: vec![
+                pie_driver_abi::ExpertSiteSummary {
+                    experts: 256,
+                    top_k: 8,
+                },
+                pie_driver_abi::ExpertSiteSummary {
+                    experts: 64,
+                    top_k: 4,
+                },
+            ],
+        };
+        let sites = summary_sites(&summary);
+        assert_eq!(sites.len(), 2);
+        for site in &sites {
+            assert_eq!(site.name, SITE_EXPERT_WEIGHTS);
+            assert_eq!(site.class, DivClass::Weight);
+            assert_eq!(site.granularity, Granularity::Token);
+            assert_eq!(site.lowering, Lowering::PerLane);
+        }
+        assert!(sites[0].note.contains("top-8 of 256 experts"));
+        assert!(sites[1].note.contains("top-4 of 64 experts"));
+    }
+
+    /// Provenance agreement: the summary a driver would derive from the MoE
+    /// traced form (the C++ mirror of [`derive_sites`]) maps through
+    /// [`summary_sites`] to exactly what [`derive_sites`] emits from the
+    /// same plan on this side — the handshake loses nothing.
+    #[test]
+    fn summary_of_a_moe_trace_round_trips_through_the_vocabulary() {
+        let plan = family::qwen3_5_moe_mlp_block(&Qwen35MoeMlpFacts::qwen3_5_35b_a3b());
+        let derived = derive_sites(&plan);
+        let summary = pie_driver_abi::ModelSiteSummary {
+            expert_sites: vec![pie_driver_abi::ExpertSiteSummary {
+                experts: 256,
+                top_k: 8,
+            }],
+        };
+        let mapped = summary_sites(&summary);
+        assert_eq!(mapped.len(), derived.len());
+        for (mapped, derived) in mapped.iter().zip(&derived) {
+            assert_eq!(mapped.name, derived.name);
+            assert_eq!(mapped.class, derived.class);
+            assert_eq!(mapped.granularity, derived.granularity);
+            assert_eq!(mapped.lowering, derived.lowering);
+            assert_eq!(mapped.note, derived.note);
+        }
     }
 
     /// A MoE-facts hybrid derives exactly one expert site: 24 layers of

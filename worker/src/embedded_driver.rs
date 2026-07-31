@@ -433,6 +433,9 @@ fn dummy_native_options(
         has_mtp_drafts: true,
         has_value_head: true,
         has_attn_score: true,
+        // The dummy driver traces no forward plan; it reports no
+        // model-structural sites (same as a real dense deployment).
+        model_site_summary: pie_driver_abi::ModelSiteSummary::default(),
         callback_delay_ms: 0,
         reject_launches: false,
         reject_launches_remaining: 0,

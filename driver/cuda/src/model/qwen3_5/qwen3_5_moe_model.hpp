@@ -49,6 +49,13 @@ public:
     RecurrentStateCache* state_cache() override { return &state_cache_; }
     std::uint32_t graph_layout() override;
 
+    // The validated declared plan (empty → nullptr), for the load-time
+    // capability site summary (imodel.hpp) — the one family whose plan can
+    // carry expert sites when the facts are MoE.
+    const pie_forward::ForwardPlan* declared_plan() const override {
+        return declared_ ? &declared_.plan : nullptr;
+    }
+
     // Same linear-attention scratch as `Qwen35Model::workspace_bytes`, plus
     // the routed/shared-MoE MLP scratch.
     std::size_t workspace_bytes(const HfConfig& cfg, int max_tokens,

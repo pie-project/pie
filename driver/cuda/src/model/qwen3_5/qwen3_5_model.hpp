@@ -37,6 +37,12 @@ public:
     ModelCapabilities capabilities() const override { return caps_; }
     std::uint32_t graph_layout() override;
 
+    // The validated declared plan (empty → nullptr), for the load-time
+    // capability site summary (imodel.hpp).
+    const pie_forward::ForwardPlan* declared_plan() const override {
+        return declared_ ? &declared_.plan : nullptr;
+    }
+
     // Qwen3.5's linear-attention layers need extra per-fire scratch
     // (mixed_qkv/conv/gating buffers) on top of the universal `Workspace`
     // formula, sized by the model's own runtime tp_size.
