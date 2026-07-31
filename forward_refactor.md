@@ -792,8 +792,28 @@ rediscovered.
   `at_most()` normalizes zero, making `AtMost(0)` unrepresentable — a bound of
   zero pins the true count, which the old code had to remember separately in
   three places. Pinned by `a_bound_driven_to_zero_is_exact_again`.
-- **`free_buffer` clamps rather than computes.** `store/rs.rs:415` does
-  `buffer_fill = buffer_fill.min(capacity)`, and its own comment concedes it is
+- **The engine duplicates the driver's refusal conditions, by hand.**
+  `validate_frame` (`pipeline/fire.rs`) decides whether a fire's descriptors
+  resolve on the host by re-deriving, in Rust, the conditions
+  `try_device_composed_template` (`driver/cuda/src/pipeline/dispatch.cu`)
+  checks in C++. Nothing links them. This is not a hypothetical: §8.4 is the
+  report of that exact drift — `299b76320` relaxed the template, the engine
+  copy was not narrowed to match, and four tests went red for a shape the
+  driver could execute. The copy is correct again today and the SAME BUG WILL
+  RECUR, because the fix restored the value without removing the duplication.
+  It also asks the wrong question: the constraint belongs to ONE driver, but
+  the check runs for all of them, so the dummy driver refuses a frame it could
+  always have executed. The real repair is a driver-declared capability —
+  "which fires can I resolve at kernel time" — asked rather than assumed. Not
+  done here because it is an ABI addition, not a bug fix.
+- **`live_slots()` returns 1 for a reason that no longer exists.**
+  `sdk/rust/inferlet/src/ptir.rs`. Measured cost, on device: the `coframe` arm
+  runs 31.7% faster per fire than the 1-wide arm with an identical trajectory
+  (§8.4). It is left at 1 deliberately — raising it is a scheduling change
+  that must be benchmarked as one — but a constant whose justification has
+  been withdrawn is a constant nobody will dare touch later.
+- **`free_buffer` clamps rather than computes.** `store/rs.rs:486` does
+  `occupancy.map(|n| n.min(capacity))`, and its own comment concedes it is
   "still exact for the cases that matter … and never an under-count". Safe
   direction, but "exact for the cases that matter" is a hope, not an invariant.
 - **Readiness settlement is unconditional.** `rs_metadata.hpp:20` returns true
@@ -807,13 +827,20 @@ rediscovered.
   greedy trajectory bit-stable. The rule it serves — kernel selection must not
   be observable in the output — is right; the cost is that accuracy is now
   hostage to kernel selection.
-- **`V_h != K_h` still gates the prefill path.** `qwen3_5_forward.cpp:1141`
-  keeps the exact clause that was proven vacuous for decode. Here it IS
-  justified — that path exists to skip `repeat_interleave`, which does not
-  happen when the head counts are equal — but nothing in the code says the
-  reason differs, so it reads as the bug we fixed. The neighbouring
+- **`V_h != K_h` still gates the prefill path.**
+  `driver/cuda/src/model/qwen3_5/qwen3_5_forward.cpp:1142` keeps the exact
+  clause that was proven vacuous for decode. Here it IS justified — that path
+  exists to skip `repeat_interleave`, which does not happen when the head
+  counts are equal — but nothing in the code says the reason differs, so it
+  reads as the bug we fixed. The neighbouring
   `N > qwen35_gdn_cached_prefill_max_tokens()` is an unattributed tuning
   threshold.
+
+Two of these — the duplicated refusal conditions and the withdrawn
+justification for `live_slots()` — are the residue of §8.4 and did not exist
+when this section was first written. Neither is a defect today. Both are the
+same failure mode as the bug they came from: **a fact asserted in one place
+about code that lives in another.**
 
 The removed smells shared one shape worth naming: **a condition that expressed
 nothing true.** The decode `V_h != K_h` gate, Metal's `rs_slot_flags[r] != 0`,

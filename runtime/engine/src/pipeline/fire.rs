@@ -1645,16 +1645,34 @@ fn validate_frame<C: FireContext>(
             continue;
         }
         let mut buffered = false;
+        // One lock for the whole pass: `bound_rs_working_set_ids` has already
+        // refused a pass whose rows disagree on (model, driver), so the first
+        // row names the store all of them live in.
+        let first: Resource<RsWorkingSet> = Resource::new_borrow(rs_reps[0]);
+        let (model, driver) = {
+            let rs = ctx.resources().get(&first)?;
+            (rs.model, rs.driver)
+        };
+        let mut ids = Vec::with_capacity(rs_reps.len());
         for &rs_rep in &rs_reps {
             let resource: Resource<RsWorkingSet> = Resource::new_borrow(rs_rep);
-            let rs = ctx.resources().get(&resource)?.clone();
-            let stores = crate::store::registry::get(rs.model, rs.driver);
+            ids.push(ctx.resources().get(&resource)?.id);
+        }
+        {
+            let stores = crate::store::registry::get(model, driver);
             let store = stores.rs.lock().unwrap();
-            // A bound, not the exact count: an indeterminate occupancy must
-            // read as "may be buffered", and `bound()` never refuses.
-            if store.buffer_tokens_bound(rs.id).unwrap_or(0) > 0 {
-                buffered = true;
-                break;
+            for id in ids {
+                // A bound, not the exact count: an indeterminate occupancy
+                // must read as "may be buffered", and `bound()` never refuses.
+                //
+                // An id the store does not know reads as buffered too. This is
+                // a safety guard, so the unknown case fails CLOSED — the worst
+                // it costs is a refusal the guest can retry in a later frame,
+                // where failing open costs a device cascade.
+                if store.buffer_tokens_bound(id).unwrap_or(u32::MAX) > 0 {
+                    buffered = true;
+                    break;
+                }
             }
         }
         rs_host_resolved.push(buffered);
