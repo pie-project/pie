@@ -100,6 +100,30 @@ class ForwardPlan {
         return ForwardPlan(raw);
     }
 
+    /// Trace the qwen3_5 GDN linear-attention block FRAGMENT — the traced
+    /// form carrying the GDN kinds (`SplitGdn`, `CausalConv1d`, `GdnPrep`,
+    /// `GatedDelta`, `RmsnormGated`) and the first ops addressing
+    /// PER-REQUEST state (the conv/recurrent slabs, implicit behind the
+    /// state ops' layer param exactly as the KV cache is behind
+    /// `KvAppend`'s).
+    ///
+    /// Like the MoE fragment above, this wrapper exposes the plan; the
+    /// declared EXECUTORS do not consume it — both emitters' op-kind
+    /// switches end in the loud default arm, and the Metal DAG builder
+    /// refuses the GDN weight names before ever reaching a GDN kind
+    /// (`driver/metal/tests/llama_like_declared_dag_test.cpp` pins both
+    /// refusals). Emitting the GDN core is the driver-side rung, not this
+    /// one.
+    static ForwardPlan trace_qwen3_5_gdn(const PieForwardQwen35GdnFacts& facts) {
+        PieForwardPlan raw{};
+        const PieForwardStatus status = pie_forward_trace_qwen3_5_gdn(&facts, &raw);
+        if (status != PieForwardStatus::Ok) {
+            throw std::runtime_error(
+                "forward plan: gdn trace failed (" + status_name(status) + ")");
+        }
+        return ForwardPlan(raw);
+    }
+
     explicit operator bool() const noexcept { return plan_.owner != nullptr; }
 
     const PieForwardPlan& view() const {

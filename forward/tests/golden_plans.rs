@@ -21,8 +21,8 @@
 
 use std::path::PathBuf;
 
-use pie_forward::family::{llama_like, qwen3_5_moe_mlp_block};
-use pie_forward::{ForwardPlan, LlamaLikeFacts, Qwen35MoeMlpFacts};
+use pie_forward::family::{llama_like, qwen3_5_gdn_block, qwen3_5_moe_mlp_block};
+use pie_forward::{ForwardPlan, LlamaLikeFacts, Qwen35GdnFacts, Qwen35MoeMlpFacts};
 
 fn golden_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -127,5 +127,21 @@ fn qwen3_5_moe_mlp_35b_a3b() {
     check_plan(
         "qwen3_5_moe_mlp_35b_a3b",
         &qwen3_5_moe_mlp_block(&Qwen35MoeMlpFacts::qwen3_5_35b_a3b()),
+    );
+}
+
+/// The second fragment golden: one qwen3_5 GDN linear-attention block
+/// (Qwen3.5-0.8B dims, the default unfused in-proj binding) — attn_norm →
+/// four in-projections → causal conv → gdn prep → gated-delta recurrence →
+/// z-gated norm → o_proj accumulate. The first traced form whose ops
+/// address PER-REQUEST state (the conv/recurrent slabs behind
+/// `CausalConv1d`/`GatedDelta`'s layer, plan §5.4); everything the GDN
+/// vocabulary added appears here and nowhere in the goldens above, which
+/// this change leaves byte-untouched.
+#[test]
+fn qwen3_5_gdn_0_8b() {
+    check_plan(
+        "qwen3_5_gdn_0_8b",
+        &qwen3_5_gdn_block(&Qwen35GdnFacts::qwen3_5_0_8b()),
     );
 }

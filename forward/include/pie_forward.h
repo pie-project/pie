@@ -80,6 +80,23 @@ enum class PieForwardOpKind : uint32_t {
   WeightedSum = 12,
   /// `out = base + sigmoid(gate) * x` (shared-expert landing).
   SigmoidGateAdd = 13,
+  /// Two-way GDN split (`[rows, w0 + w1]` → two results). First of the
+  /// GDN kinds (the `pie_forward_trace_qwen3_5_gdn` fragment) — like the
+  /// dyn kinds above, the declared executors do NOT consume these; their
+  /// op-kind switches throw on them via the loud default arm.
+  SplitGdn = 14,
+  /// Depthwise causal conv1d + fused SiLU against the layer's implicit
+  /// PER-REQUEST conv state.
+  CausalConv1d = 15,
+  /// Post-conv GDN prep: q/k/v/g/beta from the packed conv output and
+  /// the a/b projections plus the a_log/dt_bias parameters (five
+  /// results; the one kind that names TWO weights — see the op table).
+  GdnPrep = 16,
+  /// The gated-delta recurrence against the layer's implicit PER-REQUEST
+  /// recurrent state. Opaque like `Attention`.
+  GatedDelta = 17,
+  /// Per-head gated RMSNorm: `w * rmsnorm(x) * silu(gate)`, plain fold.
+  RmsnormGated = 18,
 };
 
 /// Mirrors [`crate::trace::NormVariant`].
@@ -205,10 +222,21 @@ struct PieForwardIdRange {
 /// | `TopK`           | none                 | `k`                          | —          |
 /// | `WeightedSum`    | none                 | `k`                          | —          |
 /// | `SigmoidGateAdd` | none                 | —                            | —          |
+/// | `SplitGdn`       | none                 | `width0`                     | `width1`   |
+/// | `CausalConv1d`   | conv (weight + bias) | state layer                  | `kernel`   |
+/// | `GdnPrep`        | a_log                | dt_bias NAME index           | —          |
+/// | `GatedDelta`     | none                 | state layer                  | —          |
+/// | `RmsnormGated`   | weight               | —                            | —          |
 ///
 /// `KvAppend`/`Attention` restate the layer their kind addresses even though
 /// `layer` carries the bracketing layer, because the trace states both
-/// separately and the flattening does not get to decide they coincide.
+/// separately and the flattening does not get to decide they coincide; the
+/// GDN state ops (`CausalConv1d`, `GatedDelta`) restate theirs for the same
+/// reason — param0 is the layer of the implicit PER-REQUEST conv/recurrent
+/// slab the op reads and advances (the trace crate's `OpKind::state_ref`
+/// marking, pie-application-plan.md §5.4). `GdnPrep` is the one kind whose
+/// launch reads two parameter tensors, so its param0 is a SECOND
+/// [`PieForwardPlan::names`] index (the dt_bias name), not a width.
 struct PieForwardOp {
   PieForwardOpKind kind;
   /// The layer this op belongs to, or [`PIE_FORWARD_NO_LAYER`] for
@@ -296,6 +324,23 @@ struct PieForwardQwen35MoeMlpFacts {
   uint32_t norm_variant;
 };
 
+/// The qwen3_5 GDN-block facts, as C states them. Mirrors
+/// [`crate::facts::Qwen35GdnFacts`] field for field; same input-side rules
+/// as [`PieForwardLlamaLikeFacts`].
+struct PieForwardQwen35GdnFacts {
+  uint32_t hidden;
+  uint32_t key_heads;
+  uint32_t value_heads;
+  uint32_t key_head_dim;
+  uint32_t value_head_dim;
+  uint32_t conv_kernel;
+  /// The deployment bound the fused `in_proj_qkvz`/`in_proj_ba` banks
+  /// (`PIE_QWEN35_FUSED_GDN_PROJ`); non-zero is true.
+  uint8_t fused_in_proj;
+  /// A [`super::types::PieForwardNormVariant`] value.
+  uint32_t norm_variant;
+};
+
 extern "C" {
 
 /// Trace the llama_like family against `facts` and publish the traced form
@@ -329,9 +374,28 @@ PieForwardStatus pie_forward_trace_llama_like(const PieForwardLlamaLikeFacts *fa
 PieForwardStatus pie_forward_trace_qwen3_5_moe_mlp(const PieForwardQwen35MoeMlpFacts *facts,
                                                    PieForwardPlan *out_plan);
 
+/// Trace the qwen3_5 GDN (gated-deltanet) linear-attention block FRAGMENT
+/// against `facts` and publish the traced form into `*out_plan`.
+///
+/// The result carries the GDN vocabulary (`SplitGdn`, `CausalConv1d`,
+/// `GdnPrep`, `GatedDelta`, `RmsnormGated`) — and the first ops that
+/// address PER-REQUEST state (the conv/recurrent slabs, implicit behind
+/// `CausalConv1d`/`GatedDelta`'s layer, exactly as the KV cache is behind
+/// `KvAppend`'s). The declared executors do NOT consume these — their
+/// op-kind switches throw on any kind past their vocabulary — so this
+/// entry point exists for the toolchain side (planning, tests,
+/// cross-language pinning), not for emission.
+///
+/// # Safety
+///
+/// `facts` is null or points at a readable [`PieForwardQwen35GdnFacts`];
+/// `out_plan` is null or a writable slot.
+PieForwardStatus pie_forward_trace_qwen3_5_gdn(const PieForwardQwen35GdnFacts *facts,
+                                               PieForwardPlan *out_plan);
+
 /// Free the storage behind a plan header filled by
-/// [`pie_forward_trace_llama_like`] or
-/// [`pie_forward_trace_qwen3_5_moe_mlp`], and reset the header to empty.
+/// [`pie_forward_trace_llama_like`], [`pie_forward_trace_qwen3_5_moe_mlp`]
+/// or [`pie_forward_trace_qwen3_5_gdn`], and reset the header to empty.
 ///
 /// Safe to call with null, with a header that was never filled, or twice
 /// with the same header (the first call empties it).

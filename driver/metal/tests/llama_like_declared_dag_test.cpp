@@ -355,6 +355,49 @@ void a_dyn_trace_is_refused() {
            "and the message says why: " + what);
 }
 
+// The GDN (gated-deltanet) fragment — SplitGdn / CausalConv1d / GdnPrep /
+// GatedDelta / RmsnormGated, the first ops addressing PER-REQUEST state —
+// must be refused the same way. As with the MoE fragment, the builder
+// refuses at the first GDN-only weight name (`layer.0.in_proj_qkv`, op 2 of
+// the unfused trace) before any GDN op kind is reached; the switch's
+// default arm ("has no emission rule") backs that up for the kinds
+// themselves. Either way: a throw, with a message naming the reason.
+void a_gdn_trace_is_refused() {
+    std::printf("[gdn (per-request state) trace]\n");
+    pie_forward::PieForwardQwen35GdnFacts f{};
+    // Qwen3.5-0.8B dims (driver/metal/src/model/qwen3_5/geometry.hpp),
+    // matching the qwen3_5_gdn_0_8b golden except the norm variant:
+    // Plain, so the refusal fires on the GDN-only weight name rather than
+    // on the (also-refused) Gemma fold qwen3.5 really uses — this test is
+    // about the GDN vocabulary, not the norm fold.
+    f.hidden = 1024;
+    f.key_heads = 16;
+    f.value_heads = 16;
+    f.key_head_dim = 128;
+    f.value_head_dim = 128;
+    f.conv_kernel = 4;
+    f.fused_in_proj = 0;  // the default binding (PIE_QWEN35_FUSED_GDN_PROJ unset)
+    f.norm_variant = static_cast<std::uint32_t>(pie_forward::PieForwardNormVariant::Plain);
+    const pie_forward::ForwardPlan plan = pie_forward::ForwardPlan::trace_qwen3_5_gdn(f);
+    expect(plan.op_count() == 10, "the ABI hands over the 10-op GDN fragment");
+
+    LlamaLikeGeometry g{};
+    g.layers = 1;
+    g.hidden = 1024;
+    bool threw = false;
+    std::string what;
+    try {
+        build_llama_like_declared_dag(plan, g);
+    } catch (const std::exception& e) {
+        threw = true;
+        what = e.what();
+    }
+    expect(threw, "a GDN (per-request state) trace throws rather than half-emitting");
+    expect(what.find("unknown weight") != std::string::npos ||
+               what.find("no emission rule") != std::string::npos,
+           "and the message says why: " + what);
+}
+
 }  // namespace
 
 int main() {
@@ -381,6 +424,7 @@ int main() {
 
     a_fused_trace_is_refused();
     a_dyn_trace_is_refused();
+    a_gdn_trace_is_refused();
 
     std::printf("\n==== llama_like_declared_dag_test: %s ====\n",
                 g_failures == 0 ? "all passed" : "FAILURES");

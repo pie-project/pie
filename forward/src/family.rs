@@ -6,7 +6,7 @@
 //! matmuls and no split, and the traced forms differ the way two compiled
 //! programs differ, not the way two runtime paths do.
 
-use crate::facts::{LlamaLikeFacts, NormPlacement, QkNorm, Qwen35MoeMlpFacts};
+use crate::facts::{LlamaLikeFacts, NormPlacement, QkNorm, Qwen35GdnFacts, Qwen35MoeMlpFacts};
 use crate::trace::{DType, Dim, ForwardPlan, Shape, TraceBuilder};
 
 /// The llama_like decode/prefill body (no structural divergence, so one
@@ -189,10 +189,120 @@ pub fn qwen3_5_moe_mlp_block(facts: &Qwen35MoeMlpFacts) -> ForwardPlan {
     t.finish()
 }
 
+/// One qwen3_5 GDN (gated-deltanet) linear-attention block, traced
+/// standalone — the second fragment, and the other layer kind of the
+/// qwen3.5 hybrid.
+///
+/// This is a FRAGMENT, not a model: the unit the future qwen3_5 declaration
+/// composes on a `Linear` layer (`y += gdn(l, rmsnorm(y, attn_norm))`,
+/// plan.md Part 1's `match layers[l]`), traced against layer 0 with the
+/// residual stream as a fragment parameter ([`TraceBuilder::input`]),
+/// exactly the MoE fragment's shape. With both fragments the qwen3.5 layer
+/// KINDS are covered, but the hybrid composition is still out of reach: the
+/// FULL-attention layer of this family is not llama_like's — its q_proj is
+/// 2× wide with a per-head `[query | gate]` split
+/// (`launch_split_q_gate_bf16`), the attention output is gated
+/// (`launch_sigmoid_gate_inplace_bf16`, a multiply with no residual — NOT
+/// [`crate::trace::OpKind::SigmoidGateAdd`]), rope is partial
+/// (`partial_rotary_factor`) and the q/k per-head norms fold Gemma-style —
+/// so a `qwen3_5_hybrid` declaration waits on that vocabulary
+/// (`full_attn_layer_body`, `qwen3_5_forward.cpp`).
+///
+/// Mirrors `qwen3_5_forward.cpp::linear_attn_layer_body` launch for launch
+/// on the TP=1 decode fast path (the canonical granularity; the prefill
+/// conv/recurrence walks, the batched slot-indirected variants, the
+/// warp-tiled/cached/FLA recurrence kernels and the GQA
+/// `repeat_interleave` materialization are all LOWERINGS of ops 5–7, the
+/// emitter's per-fire choice — as are the verify-stash and rs-buffer
+/// scatter/gather paths, which are speculative-decode services around the
+/// same ops, not ops of the pass):
+///
+/// | trace op                | hand-written kernel(s)                          |
+/// |-------------------------|--------------------------------------------------|
+/// | Rmsnorm(attn_norm)      | launch_rmsnorm_gemma_bf16                        |
+/// | Matmul(in_proj_qkv)     | ops::gemm_act_x_w                                |
+/// | Matmul(in_proj_z)       | ops::gemm_act_x_w                                |
+/// | Matmul(in_proj_a)       | ops::gemm_act_x_w                                |
+/// | Matmul(in_proj_b)       | ops::gemm_act_x_w                                |
+/// | CausalConv1d            | launch_causal_conv1d_update[_batched]_bf16       |
+/// | GdnPrep                 | launch_qwen_gdn_post_conv_prep_bf16              |
+/// | GatedDelta              | launch_recurrent_gated_delta_step_* (decode)     |
+/// | RmsnormGated            | launch_rmsnorm_gated_fp32_in_bf16                |
+/// | Matmul(o_proj)+res      | ops::gemm_act_x_w beta=1                         |
+///
+/// With the fused binding (`fused_in_proj`, `PIE_QWEN35_FUSED_GDN_PROJ`)
+/// the four projections become two matmuls + two [`SplitGdn`] launches
+/// (`launch_split_bf16_rows`, `launch_split_qwen_gdn_ba_bf16`) — same op
+/// count, different ops, resolved at trace time like llama_like's
+/// `fused_qkv`.
+///
+/// `CausalConv1d` and `GatedDelta` address the layer's PER-REQUEST
+/// conv/recurrent state — implicit, marked by the op kinds themselves
+/// ([`crate::trace::OpKind::state_ref`]); see the trace module doc's "the
+/// per-request state axis" for why the state is not a traced value.
+///
+/// [`SplitGdn`]: crate::trace::OpKind::SplitGdn
+pub fn qwen3_5_gdn_block(facts: &Qwen35GdnFacts) -> ForwardPlan {
+    let mut t = TraceBuilder::new("qwen3_5_gdn_block");
+    let hidden = Dim::Const(facts.hidden);
+    let conv_dim = facts.conv_dim();
+    let v_dim = facts.value_width();
+
+    // The fragment's parameter: the residual stream entering the block.
+    let y = t.input(Shape(vec![Dim::Tokens, hidden]), DType::BF16);
+
+    t.layer(0, |t| {
+        let l = 0;
+        let w = |name: &str| format!("layer.{l}.{name}");
+
+        let x = t.rmsnorm(y, &w("attn_norm"), facts.norm_variant);
+
+        // In-projections. The fused/unfused branch resolves at trace time
+        // (a binding fact); operand packing mirrors the driver's:
+        // qkvz = [mixed_qkv | z], ba = [b | a].
+        let (qkv, z, a, b) = if facts.fused_in_proj {
+            let qkvz = t.matmul(x, &w("in_proj_qkvz"), conv_dim + v_dim);
+            let (qkv, z) = t.split_gdn(qkvz, conv_dim, v_dim);
+            let ba = t.matmul(x, &w("in_proj_ba"), 2 * facts.value_heads);
+            let (b, a) = t.split_gdn(ba, facts.value_heads, facts.value_heads);
+            (qkv, z, a, b)
+        } else {
+            (
+                t.matmul(x, &w("in_proj_qkv"), conv_dim),
+                t.matmul(x, &w("in_proj_z"), v_dim),
+                t.matmul(x, &w("in_proj_a"), facts.value_heads),
+                t.matmul(x, &w("in_proj_b"), facts.value_heads),
+            )
+        };
+
+        // Conv → prep → recurrence: the GDN core, against the layer's
+        // per-request conv/recurrent state.
+        let qkv = t.causal_conv1d(l, qkv, &w("conv"), facts.conv_kernel);
+        let (q, k, v, g, beta) = t.gdn_prep(
+            qkv,
+            a,
+            b,
+            &w("a_log"),
+            &w("dt_bias"),
+            facts.key_heads,
+            facts.key_head_dim,
+            facts.value_heads,
+            facts.value_head_dim,
+        );
+        let core = t.gated_delta(l, q, k, v, g, beta);
+
+        // Gated norm (z-gated, per-head, plain fold) → o_proj landed on
+        // the residual (the beta=1 GEMM).
+        let o = t.rmsnorm_gated(core, z, &w("gate_norm"));
+        t.matmul_add(o, &w("o_proj"), y, facts.hidden)
+    });
+    t.finish()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::trace::{Dim, NormVariant, OpKind};
+    use crate::trace::{Dim, NormVariant, OpKind, StateRef, StateStore};
 
     /// The traced form of one qwen3 layer, mapped op-by-op to the kernel
     /// sequence `llama_like_forward_paged` launches on the unfused path.
@@ -787,5 +897,257 @@ mod tests {
         let dense = serde_json::to_string(&llama_like(&LlamaLikeFacts::qwen3_0_6b())).unwrap();
         assert!(!dense.contains("selector"));
         assert!(!dense.contains("dyn_axis"));
+    }
+
+    /// The GDN block fragment's op sequence, mapped launch for launch to
+    /// `linear_attn_layer_body`'s decode fast path (the table on
+    /// [`qwen3_5_gdn_block`]), on the default (unfused) binding.
+    #[test]
+    fn gdn_block_op_sequence() {
+        let plan = qwen3_5_gdn_block(&Qwen35GdnFacts::qwen3_5_0_8b());
+        let kinds: Vec<&'static str> = plan
+            .layer_ops(0)
+            .map(|op| match &op.kind {
+                OpKind::Rmsnorm { .. } => "rmsnorm",
+                OpKind::Matmul { beta_one: false, .. } => "matmul",
+                OpKind::Matmul { beta_one: true, .. } => "matmul+res",
+                OpKind::SplitGdn { .. } => "split_gdn",
+                OpKind::CausalConv1d { .. } => "causal_conv1d",
+                OpKind::GdnPrep { .. } => "gdn_prep",
+                OpKind::GatedDelta { .. } => "gated_delta",
+                OpKind::RmsnormGated { .. } => "rmsnorm_gated",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "rmsnorm",       // attn_norm (gemma fold)
+                "matmul",        // in_proj_qkv [Tokens, conv_dim]
+                "matmul",        // in_proj_z  [Tokens, v_dim]
+                "matmul",        // in_proj_a  [Tokens, Vh]
+                "matmul",        // in_proj_b  [Tokens, Vh]
+                "causal_conv1d", // per-request conv state, fused silu
+                "gdn_prep",      // q/k/v/g/beta from qkv+a+b (+a_log, dt_bias)
+                "gated_delta",   // per-request recurrent state -> core
+                "rmsnorm_gated", // z-gated per-head norm, plain fold
+                "matmul+res",    // o_proj, beta=1
+            ]
+        );
+        assert_eq!(plan.ops.len(), 10);
+    }
+
+    /// The fused in-proj binding (`PIE_QWEN35_FUSED_GDN_PROJ`) trades the
+    /// four projection matmuls for two matmuls + two SplitGdn launches —
+    /// same count, resolved at trace time — and the ba split's outputs are
+    /// (b, a) in the driver's packing order, so `a` is the split's SECOND
+    /// output while gdn_prep consumes `[qkv, a, b]`.
+    #[test]
+    fn gdn_block_fused_binding_traces_two_splits() {
+        let facts = Qwen35GdnFacts {
+            fused_in_proj: true,
+            ..Qwen35GdnFacts::qwen3_5_0_8b()
+        };
+        let plan = qwen3_5_gdn_block(&facts);
+        assert_eq!(plan.ops.len(), 10);
+        let matmuls = plan
+            .ops
+            .iter()
+            .filter(|op| matches!(op.kind, OpKind::Matmul { .. }))
+            .count();
+        assert_eq!(matmuls, 3); // qkvz, ba, o_proj
+        let splits: Vec<_> = plan
+            .ops
+            .iter()
+            .filter(|op| matches!(op.kind, OpKind::SplitGdn { .. }))
+            .collect();
+        assert_eq!(splits.len(), 2);
+        assert!(matches!(
+            splits[0].kind,
+            OpKind::SplitGdn { width0, width1 }
+                if width0 == facts.conv_dim() && width1 == facts.value_width()
+        ));
+        assert!(matches!(
+            splits[1].kind,
+            OpKind::SplitGdn { width0, width1 }
+                if width0 == facts.value_heads && width1 == facts.value_heads
+        ));
+        // gdn_prep's a operand is the ba split's SECOND output ([b | a]).
+        let prep = plan
+            .ops
+            .iter()
+            .find(|op| matches!(op.kind, OpKind::GdnPrep { .. }))
+            .unwrap();
+        assert_eq!(prep.inputs[1], splits[1].outputs[1]); // a
+        assert_eq!(prep.inputs[2], splits[1].outputs[0]); // b
+    }
+
+    /// Dataflow and shapes of the GDN core: conv is shape-preserving over
+    /// the packed `[Tokens, conv_dim]`, prep emits the compact per-head
+    /// rank-3 f32 forms, the recurrence keeps v's shape, and the gated
+    /// norm flattens to the z gate's `[Tokens, v_dim]` bf16.
+    #[test]
+    fn gdn_block_core_shapes() {
+        let facts = Qwen35GdnFacts::qwen3_5_0_8b();
+        let plan = qwen3_5_gdn_block(&facts);
+        let shape_of = |id: u32| plan.values[id as usize].shape.0.clone();
+        let dtype_of = |id: u32| plan.values[id as usize].dtype;
+
+        // 0.8B geometry sanity, against the metal driver's stated launch
+        // geometry (decode_consts.cpp): 1024 -> 6144, z 1024 -> 2048.
+        assert_eq!(facts.conv_dim(), 6144);
+        assert_eq!(facts.value_width(), 2048);
+
+        let conv = plan
+            .ops
+            .iter()
+            .find(|op| matches!(op.kind, OpKind::CausalConv1d { .. }))
+            .unwrap();
+        assert!(matches!(
+            &conv.kind,
+            OpKind::CausalConv1d { weight, layer: 0, kernel: 4 } if weight == "layer.0.conv"
+        ));
+        assert_eq!(
+            shape_of(conv.outputs[0]),
+            vec![Dim::Tokens, Dim::Const(facts.conv_dim())]
+        );
+
+        let prep = plan
+            .ops
+            .iter()
+            .find(|op| matches!(op.kind, OpKind::GdnPrep { .. }))
+            .unwrap();
+        assert!(matches!(
+            &prep.kind,
+            OpKind::GdnPrep { a_log, dt_bias }
+                if a_log == "layer.0.a_log" && dt_bias == "layer.0.dt_bias"
+        ));
+        assert_eq!(prep.inputs[0], conv.outputs[0]);
+        assert_eq!(prep.outputs.len(), 5);
+        let kh = Dim::Const(facts.key_heads);
+        let kd = Dim::Const(facts.key_head_dim);
+        let vh = Dim::Const(facts.value_heads);
+        let vd = Dim::Const(facts.value_head_dim);
+        assert_eq!(shape_of(prep.outputs[0]), vec![Dim::Tokens, kh, kd]); // q
+        assert_eq!(shape_of(prep.outputs[1]), vec![Dim::Tokens, kh, kd]); // k
+        assert_eq!(shape_of(prep.outputs[2]), vec![Dim::Tokens, vh, vd]); // v
+        assert_eq!(shape_of(prep.outputs[3]), vec![Dim::Tokens, vh]); // g
+        assert_eq!(shape_of(prep.outputs[4]), vec![Dim::Tokens, vh]); // beta
+        for &out in &prep.outputs {
+            assert_eq!(dtype_of(out), DType::F32);
+        }
+
+        let delta = plan
+            .ops
+            .iter()
+            .find(|op| matches!(op.kind, OpKind::GatedDelta { .. }))
+            .unwrap();
+        assert_eq!(delta.inputs, prep.outputs); // [q, k, v, g, beta]
+        assert_eq!(shape_of(delta.outputs[0]), vec![Dim::Tokens, vh, vd]);
+        assert_eq!(dtype_of(delta.outputs[0]), DType::F32);
+
+        // The gated norm consumes the rank-3 core and the z gate, and
+        // lands the flat bf16 form the o_proj GEMM reads.
+        let gated = plan
+            .ops
+            .iter()
+            .find(|op| matches!(op.kind, OpKind::RmsnormGated { .. }))
+            .unwrap();
+        assert_eq!(gated.inputs[0], delta.outputs[0]);
+        let z = plan
+            .ops
+            .iter()
+            .find(|op| {
+                matches!(&op.kind, OpKind::Matmul { weight, .. } if weight == "layer.0.in_proj_z")
+            })
+            .unwrap();
+        assert_eq!(gated.inputs[1], z.outputs[0]);
+        assert_eq!(
+            shape_of(gated.outputs[0]),
+            vec![Dim::Tokens, Dim::Const(facts.value_width())]
+        );
+        assert_eq!(dtype_of(gated.outputs[0]), DType::BF16);
+
+        // o_proj accumulates onto the fragment parameter (value 0).
+        let o_proj = plan.ops.last().unwrap();
+        assert!(matches!(
+            &o_proj.kind,
+            OpKind::Matmul { beta_one: true, weight, .. } if weight == "layer.0.o_proj"
+        ));
+        assert_eq!(o_proj.inputs, vec![gated.outputs[0], 0]);
+    }
+
+    /// The per-request state axis (§5.4), marked by vocabulary: exactly the
+    /// conv and the recurrence address the RecurrentState store at the
+    /// block's layer — the traced-form statement of `touches_rs_buffer` —
+    /// while llama_like's KvAppend/Attention mark KvCache and the MoE
+    /// fragment marks nothing.
+    #[test]
+    fn gdn_block_marks_the_per_request_state() {
+        let plan = qwen3_5_gdn_block(&Qwen35GdnFacts::qwen3_5_0_8b());
+        let marks: Vec<_> = plan
+            .ops
+            .iter()
+            .filter_map(|op| op.kind.state_ref())
+            .collect();
+        assert_eq!(
+            marks,
+            vec![
+                StateRef { store: StateStore::RecurrentState, layer: 0 },
+                StateRef { store: StateStore::RecurrentState, layer: 0 },
+            ]
+        );
+
+        let kv_marks: Vec<_> = llama_like(&LlamaLikeFacts::qwen3_0_6b())
+            .layer_ops(3)
+            .filter_map(|op| op.kind.state_ref())
+            .collect();
+        assert_eq!(
+            kv_marks,
+            vec![
+                StateRef { store: StateStore::KvCache, layer: 3 },
+                StateRef { store: StateStore::KvCache, layer: 3 },
+            ]
+        );
+
+        let moe = qwen3_5_moe_mlp_block(&Qwen35MoeMlpFacts::qwen3_5_35b_a3b());
+        assert!(moe.ops.iter().all(|op| op.kind.state_ref().is_none()));
+    }
+
+    /// The fragment parameter is honest dataflow, MoE-fragment style: value
+    /// 0 is produced by no op, read first by the block norm, and landed on
+    /// by the o_proj accumulate.
+    #[test]
+    fn gdn_block_residual_stream_is_a_fragment_parameter() {
+        let plan = qwen3_5_gdn_block(&Qwen35GdnFacts::qwen3_5_0_8b());
+        assert!(!plan.ops.iter().any(|op| op.outputs.contains(&0)));
+        assert!(matches!(&plan.ops[0].kind, OpKind::Rmsnorm { weight, .. }
+            if weight == "layer.0.attn_norm"));
+        assert_eq!(plan.ops[0].inputs, vec![0]);
+        assert_eq!(*plan.ops.last().unwrap().inputs.last().unwrap(), 0);
+    }
+
+    /// The GDN vocabulary survives serde — new op kinds, rank-3 f32 values,
+    /// two-name GdnPrep — and, per the additive rule, none of it (nor the
+    /// dyn vocabulary) appears in a pre-GDN plan's serialization: the
+    /// existing goldens stay byte-identical.
+    #[test]
+    fn gdn_traced_form_round_trips() {
+        let plan = qwen3_5_gdn_block(&Qwen35GdnFacts::qwen3_5_0_8b());
+        let json = serde_json::to_string(&plan).unwrap();
+        let back: ForwardPlan = serde_json::from_str(&json).unwrap();
+        assert_eq!(plan, back);
+
+        for dense in [
+            serde_json::to_string(&llama_like(&LlamaLikeFacts::qwen3_0_6b())).unwrap(),
+            serde_json::to_string(&qwen3_5_moe_mlp_block(
+                &Qwen35MoeMlpFacts::qwen3_5_35b_a3b(),
+            ))
+            .unwrap(),
+        ] {
+            for token in ["SplitGdn", "CausalConv1d", "GdnPrep", "GatedDelta", "RmsnormGated"] {
+                assert!(!dense.contains(token), "{token} leaked into a pre-GDN plan");
+            }
+        }
     }
 }

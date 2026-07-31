@@ -236,9 +236,8 @@ impl LlamaLikeFacts {
 /// model that does not exist. So these facts describe exactly the unit the
 /// future qwen3_5 declaration composes per layer — `y += moe_mlp(rmsnorm(y))`
 /// — and `family::qwen3_5_moe_mlp_block` traces that unit standalone. The
-/// full declaration needs the GDN op vocabulary (`causal_conv1d`,
-/// `gated_delta`, gated rmsnorm) and per-request recurrent state, which are
-/// a separate rung.
+/// GDN attention half is [`Qwen35GdnFacts`] /
+/// `family::qwen3_5_gdn_block` — its own fragment, same reasoning.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Qwen35MoeMlpFacts {
     pub hidden: u32,
@@ -279,6 +278,105 @@ impl Qwen35MoeMlpFacts {
             top_k: 8,
             moe_intermediate: 512,
             shared_expert_intermediate: 512,
+            norm_variant: NormVariant::Gemma,
+        }
+    }
+}
+
+/// Facts for one qwen3_5 GDN (gated-deltanet) linear-attention block — the
+/// second traced FRAGMENT, and the other layer kind of the qwen3.5 hybrid.
+///
+/// Describes exactly the unit the future qwen3_5 declaration composes on a
+/// `Linear` layer — `y += gdn(l, rmsnorm(y, attn_norm))` (plan.md Part 1's
+/// `match layers[l] { ..., Linear => gdn(l, x, h) }`) — traced standalone by
+/// `family::qwen3_5_gdn_block`, mirroring
+/// `qwen3_5_forward.cpp::linear_attn_layer_body` launch for launch. The
+/// full-attention layer kind is NOT covered here: its gated attention
+/// (q_proj 2× wide, per-head `[query | gate]` split, `attn_out *=
+/// sigmoid(gate)`) and partial rope need vocabulary of their own, so the
+/// hybrid composition stays a later rung.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Qwen35GdnFacts {
+    pub hidden: u32,
+    /// GDN key heads (HF `linear_num_key_heads`).
+    pub key_heads: u32,
+    /// GDN value heads (HF `linear_num_value_heads`); a multiple of
+    /// `key_heads` (GQA share) or equal to it.
+    pub value_heads: u32,
+    /// Per-head key width (HF `linear_key_head_dim`).
+    pub key_head_dim: u32,
+    /// Per-head value width (HF `linear_value_head_dim`).
+    pub value_head_dim: u32,
+    /// Depthwise conv window (HF `linear_conv_kernel_dim`).
+    pub conv_kernel: u32,
+    /// The deployment bound the fused `in_proj_qkvz` + `in_proj_ba` banks.
+    /// A *binding* fact, llama_like's `fused_qkv` precedent: the checkpoint
+    /// ships four raw projections (`in_proj_{qkv,z,b,a}`) and the CUDA
+    /// contract's `gdn_fused_in_proj_joins` re-joins them — but only behind
+    /// `PIE_QWEN35_FUSED_GDN_PROJ` (default OFF,
+    /// `qwen35_fused_gdn_projection_enabled()`), so the default deployment
+    /// binds four projections and the trace writes four matmuls; with the
+    /// join enabled it writes two matmuls + two `SplitGdn`s
+    /// (`qwen3_5_forward.cpp` branches on `la_in_proj_qkvz`/`la_in_proj_ba`
+    /// the same way).
+    pub fused_in_proj: bool,
+    /// qwen3.5/3.6 use the Gemma `(1 + w)` fold for the block norms
+    /// (`launch_rmsnorm_gemma_bf16` on the pre-attention norm). The GATED
+    /// norm inside the block is not governed by this: its weight fold is
+    /// plain by kernel contract (`rmsnorm.hpp`).
+    pub norm_variant: NormVariant,
+}
+
+impl Qwen35GdnFacts {
+    /// `key_heads * key_head_dim` — one leg of the packed conv input.
+    pub fn key_width(&self) -> u32 {
+        self.key_heads * self.key_head_dim
+    }
+
+    /// `value_heads * value_head_dim` — the v leg, the z gate width, and
+    /// the o_proj input width.
+    pub fn value_width(&self) -> u32 {
+        self.value_heads * self.value_head_dim
+    }
+
+    /// The packed `[q | k | v]` conv width: `2 * key_width + value_width`.
+    pub fn conv_dim(&self) -> u32 {
+        2 * self.key_width() + self.value_width()
+    }
+
+    /// Qwen3.5-0.8B, the workspace's linear-attention parity checkpoint
+    /// (`driver/cuda/tests/parity_qwen3_5_multireq.py` defaults to
+    /// `Qwen/Qwen3.5-0.8B-Base`).
+    ///
+    /// No config.json is committed in this tree, so every dimension is
+    /// pinned from the drivers' own statements of this checkpoint:
+    ///
+    /// * `driver/metal/src/model/qwen3_5/geometry.hpp` (`DecodeGeometry`
+    ///   defaults, the Metal driver's 0.8B target): `hidden = 1024`,
+    ///   `gdn_k_heads = 16`, `gdn_v_heads = 16`, `gdn_k_dim = 128`,
+    ///   `gdn_v_dim = 128`, `gdn_conv_k = 4`, `gdn_conv_dim = 6144`,
+    ///   `gdn_v_total = 2048` — and `conv_dim()`/`value_width()` here
+    ///   reproduce those last two (2·2048 + 2048 = 6144, 16·128 = 2048).
+    /// * `driver/metal/src/model/qwen3_5/decode_consts.cpp` corroborates
+    ///   the widths as launch geometry: in-proj 1024 → 6144, z 1024 →
+    ///   2048, out-proj 2048 → 1024, "in_proj_a / in_proj_b — DENSE bf16
+    ///   GEMV [16, 1024]" (= value_heads × hidden).
+    /// * `driver/cuda/src/model/config.hpp:357` pins the conv window: 4.
+    /// * `fused_in_proj: false` is the live default binding
+    ///   (`PIE_QWEN35_FUSED_GDN_PROJ` unset — see the field doc).
+    /// * `norm_variant: Gemma`: `qwen3_5_forward.cpp` launches
+    ///   `launch_rmsnorm_gemma_bf16` for every block norm, and the Metal
+    ///   port states "All RMSNorm gains use the Gemma (1+w) convention"
+    ///   (`driver/metal/tests/mlx/model/qwen3_5.hpp`).
+    pub fn qwen3_5_0_8b() -> Self {
+        Self {
+            hidden: 1024,
+            key_heads: 16,
+            value_heads: 16,
+            key_head_dim: 128,
+            value_head_dim: 128,
+            conv_kernel: 4,
+            fused_in_proj: false,
             norm_variant: NormVariant::Gemma,
         }
     }

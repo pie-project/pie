@@ -41,6 +41,15 @@
 // already owns — is a later, much larger lift, not a switch arm to add
 // casually here.
 //
+// The GDN vocabulary (`SplitGdn`, `CausalConv1d`, `GdnPrep`, `GatedDelta`,
+// `RmsnormGated` — the `pie_forward_trace_qwen3_5_gdn` fragment) is refused
+// by the same default arm, and for a stronger reason than the MoE kinds:
+// `CausalConv1d`/`GatedDelta` address PER-REQUEST conv/recurrent state
+// (`RecurrentStateCache` slots, slot_ids indirection — the reason RS fires
+// are forced solo today), so emitting them means wiring the state cache and
+// its slot plumbing through this walk, not adding launch arms. The Metal
+// test pins this refusal too (same file as the MoE one).
+//
 // Explicit KV-write descriptors ARE handled (the hand-written
 // `has_write_desc` branch, verbatim): every pure-decode fire that replays a
 // forward graph carries them — `forward_graph_replay_eligible` REQUIRES

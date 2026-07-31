@@ -70,6 +70,23 @@ pub enum PieForwardOpKind {
     WeightedSum = 12,
     /// `out = base + sigmoid(gate) * x` (shared-expert landing).
     SigmoidGateAdd = 13,
+    /// Two-way GDN split (`[rows, w0 + w1]` → two results). First of the
+    /// GDN kinds (the `pie_forward_trace_qwen3_5_gdn` fragment) — like the
+    /// dyn kinds above, the declared executors do NOT consume these; their
+    /// op-kind switches throw on them via the loud default arm.
+    SplitGdn = 14,
+    /// Depthwise causal conv1d + fused SiLU against the layer's implicit
+    /// PER-REQUEST conv state.
+    CausalConv1d = 15,
+    /// Post-conv GDN prep: q/k/v/g/beta from the packed conv output and
+    /// the a/b projections plus the a_log/dt_bias parameters (five
+    /// results; the one kind that names TWO weights — see the op table).
+    GdnPrep = 16,
+    /// The gated-delta recurrence against the layer's implicit PER-REQUEST
+    /// recurrent state. Opaque like `Attention`.
+    GatedDelta = 17,
+    /// Per-head gated RMSNorm: `w * rmsnorm(x) * silu(gate)`, plain fold.
+    RmsnormGated = 18,
 }
 
 /// Mirrors [`crate::trace::DType`]; same appended-only discriminant rule as
@@ -367,10 +384,21 @@ pub struct PieForwardIdRange {
 /// | `TopK`           | none                 | `k`                          | —          |
 /// | `WeightedSum`    | none                 | `k`                          | —          |
 /// | `SigmoidGateAdd` | none                 | —                            | —          |
+/// | `SplitGdn`       | none                 | `width0`                     | `width1`   |
+/// | `CausalConv1d`   | conv (weight + bias) | state layer                  | `kernel`   |
+/// | `GdnPrep`        | a_log                | dt_bias NAME index           | —          |
+/// | `GatedDelta`     | none                 | state layer                  | —          |
+/// | `RmsnormGated`   | weight               | —                            | —          |
 ///
 /// `KvAppend`/`Attention` restate the layer their kind addresses even though
 /// `layer` carries the bracketing layer, because the trace states both
-/// separately and the flattening does not get to decide they coincide.
+/// separately and the flattening does not get to decide they coincide; the
+/// GDN state ops (`CausalConv1d`, `GatedDelta`) restate theirs for the same
+/// reason — param0 is the layer of the implicit PER-REQUEST conv/recurrent
+/// slab the op reads and advances (the trace crate's `OpKind::state_ref`
+/// marking, pie-application-plan.md §5.4). `GdnPrep` is the one kind whose
+/// launch reads two parameter tensors, so its param0 is a SECOND
+/// [`PieForwardPlan::names`] index (the dt_bias name), not a width.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct PieForwardOp {

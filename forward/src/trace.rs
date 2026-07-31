@@ -32,6 +32,29 @@
 //! does. The [`DynAxis`] marker on values and the `selector` field on
 //! [`OpKind::Matmul`] are that syntax — present exactly where cost is
 //! incurred, absent everywhere else.
+//!
+//! # The per-request state axis
+//!
+//! The GDN ops (`CausalConv1d`, `GatedDelta`) are the first whose semantics
+//! include a store that is per-layer AND per-request: each request owns a
+//! conv-window slab and a recurrent-state slab that the op reads and
+//! advances in place, across fires (pie-application-plan.md §5.4's
+//! "state[l] is per-request" — the axis the sketch left unmarked, and the
+//! reason RS-touching fires are forced solo today, `touches_rs_buffer()`).
+//! The trace marks it the way the KV cache is already marked: the ops carry
+//! `layer` and the store stays implicit, NOT a traced value. That is a
+//! deliberate design call, justified by the hand-written pass: state never
+//! appears as an activation there — every state-touching kernel takes the
+//! cache base plus a per-request slot indirection (`slot_ids_d`) and
+//! mutates the slab in place — and a traced SSA value is per-fire and
+//! single-assignment, so a first-class state value would misstate both the
+//! lifetime (state outlives the fire) and the dataflow (state is not
+//! produced by any op of this pass). What the planner needs is the FACT
+//! that an op addresses such a store; [`OpKind::state_ref`] derives exactly
+//! that from the vocabulary, so "does this trace touch per-request
+//! recurrent state" is a query, not a name-match. (`DynAxis::PerRequest`
+//! stays un-introduced: `dyn` marks values whose CONTENT selects structure,
+//! and no state value exists to mark.)
 
 use serde::{Deserialize, Serialize};
 
@@ -167,6 +190,105 @@ pub enum OpKind {
     /// gate logit comes from an ordinary `Matmul` the trace states
     /// separately, exactly as the hand-written pass launches it.
     SigmoidGateAdd,
+    /// Split a packed `[rows, w0 + w1]` value at `w0` into two (two
+    /// results). The GDN in-projection splits when the deployment binds the
+    /// fused banks: `in_proj_qkvz` → (mixed qkv, z gate) and `in_proj_ba` →
+    /// (b, a) — `launch_split_bf16_rows` and `launch_split_qwen_gdn_ba_bf16`
+    /// respectively, one op each because each is one launch. Distinct from
+    /// [`OpKind::SplitQkv`], which is the three-way attention split.
+    SplitGdn { width0: u32, width1: u32 },
+    /// Depthwise causal conv1d over the packed `[rows, conv_dim]` qkv, with
+    /// the fused SiLU the hand-written kernels apply
+    /// (`launch_causal_conv1d_{update,prefill}*`). `weight` names the conv
+    /// binding (the driver binds the checkpoint's conv weight AND bias
+    /// under it); `kernel` is the window width (`linear_conv_kernel_dim`).
+    /// `layer` marks the implicit PER-REQUEST conv-state slab the op reads
+    /// and advances — see the module doc's "the per-request state axis" and
+    /// [`OpKind::state_ref`]. Decode-update vs prefill-walk vs batched
+    /// slot-indirected variants are lowerings of this one op, the emitter's
+    /// per-fire choice.
+    CausalConv1d {
+        weight: String,
+        layer: u32,
+        kernel: u32,
+    },
+    /// The post-conv GDN prep (`launch_qwen_gdn_post_conv_prep_bf16`): one
+    /// launch that unpacks the conv output's `[q_raw | k_raw | v_raw]`,
+    /// L2-normalizes q/k into compact per-head fp32, converts v to fp32,
+    /// and folds `a`/`b` with the `a_log`/`dt_bias` parameters into the
+    /// per-head gating log-decay `g` and mixing `beta`. Inputs `[qkv, a,
+    /// b]` (the kernel's operand order); five results: q `[Tokens, Kh,
+    /// Kd]`, k `[Tokens, Kh, Kd]`, v `[Tokens, Vh, Vd]`, g `[Tokens, Vh]`,
+    /// beta `[Tokens, Vh]`, all f32. Two weight names because the launch
+    /// reads two parameter tensors. (The GQA `repeat_interleave` of q/k
+    /// from Kh to Vh heads is NOT an op: most recurrence kernels index the
+    /// compact layout directly, so materializing it is a lowering choice.)
+    GdnPrep { a_log: String, dt_bias: String },
+    /// The gated-delta recurrence: fold this fire's tokens into the layer's
+    /// PER-REQUEST recurrent state and produce the core attention output
+    /// `[Tokens, Vh, Vd]` f32. Inputs `[q, k, v, g, beta]`. Opaque, like
+    /// `Attention`: the decode-step, chunked-prefill, warp-tiled and cached
+    /// kernel families (`launch_{recurrent,chunk}_gated_delta_*`) are all
+    /// lowerings the backend picks per fire. `layer` marks the implicit
+    /// per-request state slab ([`OpKind::state_ref`]).
+    GatedDelta { layer: u32 },
+    /// Gated RMSNorm (`launch_rmsnorm_gated_fp32_in_bf16`): per (row,
+    /// head), `out = w * rmsnorm(x) * silu(gate)`, normalizing the trailing
+    /// head dim of the rank-3 f32 core output and flattening to the gate's
+    /// `[Tokens, Vh * Vd]` bf16 shape (the fp32→bf16 conversion is fused
+    /// into the same launch). Inputs `[x, gate]`. NOT a [`NormVariant`]:
+    /// variants select the weight arithmetic at fixed arity, while gating
+    /// adds an operand and changes the launch — and the kernel's weight
+    /// fold is plain (`rmsnorm.hpp`: "Plain weight (no `1+w` convention)"),
+    /// so there is no variant to state.
+    RmsnormGated { weight: String },
+}
+
+/// Which implicit store an op addresses. Both stores are per-layer and
+/// PER-REQUEST — the axis pie-application-plan.md §5.4 calls out — but they
+/// are different resources with different lowerings: the paged KV cache
+/// grows and is page-table-indirected, the recurrent store is fixed-size
+/// slabs advanced in place (and is why RS fires are forced solo today).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateStore {
+    /// The paged KV cache (`KvAppend` writes, `Attention` reads).
+    KvCache,
+    /// The GDN conv-window + recurrent-state slabs (`CausalConv1d` and
+    /// `GatedDelta` each read AND advance their half).
+    RecurrentState,
+}
+
+/// The state an op addresses: which store, at which layer. Derived from the
+/// vocabulary by [`OpKind::state_ref`] — the honest marking of the
+/// per-request state axis (module doc), with the store implicit exactly as
+/// the KV cache always was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StateRef {
+    pub store: StateStore,
+    pub layer: u32,
+}
+
+impl OpKind {
+    /// The implicit per-layer, per-request store this op addresses, if any.
+    ///
+    /// This is how the planner learns a trace touches per-request state
+    /// without name-matching: `plan.ops.iter().any(|op|
+    /// op.kind.state_ref().is_some_and(|s| s.store ==
+    /// StateStore::RecurrentState))` is the traced-form statement of
+    /// today's hand-maintained `touches_rs_buffer()`.
+    pub fn state_ref(&self) -> Option<StateRef> {
+        match *self {
+            OpKind::KvAppend { layer } | OpKind::Attention { layer } => Some(StateRef {
+                store: StateStore::KvCache,
+                layer,
+            }),
+            OpKind::CausalConv1d { layer, .. } | OpKind::GatedDelta { layer } => Some(StateRef {
+                store: StateStore::RecurrentState,
+                layer,
+            }),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -503,6 +625,130 @@ impl TraceBuilder {
             OpKind::SigmoidGateAdd,
             vec![x, gate, base],
             vec![(shape, DType::BF16)],
+        )[0]
+    }
+
+    /// The two-way GDN split: packed `[rows, w0 + w1]` into `[rows, w0]`
+    /// and `[rows, w1]` at `w0`.
+    pub fn split_gdn(
+        &mut self,
+        packed: ValueId,
+        width0: u32,
+        width1: u32,
+    ) -> (ValueId, ValueId) {
+        let rows = self.values[packed as usize].shape.0[0];
+        let out = self.push(
+            OpKind::SplitGdn { width0, width1 },
+            vec![packed],
+            vec![
+                (Shape(vec![rows, Dim::Const(width0)]), DType::BF16),
+                (Shape(vec![rows, Dim::Const(width1)]), DType::BF16),
+            ],
+        );
+        (out[0], out[1])
+    }
+
+    /// Depthwise causal conv1d (+ fused SiLU) over the packed qkv, against
+    /// layer `layer`'s per-request conv state. Shape-preserving.
+    pub fn causal_conv1d(
+        &mut self,
+        layer: u32,
+        qkv: ValueId,
+        weight: &str,
+        kernel: u32,
+    ) -> ValueId {
+        let shape = self.values[qkv as usize].shape.clone();
+        self.push(
+            OpKind::CausalConv1d {
+                weight: weight.to_string(),
+                layer,
+                kernel,
+            },
+            vec![qkv],
+            vec![(shape, DType::BF16)],
+        )[0]
+    }
+
+    /// The post-conv GDN prep: `(q, k, v, g, beta)`, all f32, with q/k in
+    /// the compact `[Tokens, key_heads, key_dim]` per-head layout and v in
+    /// `[Tokens, value_heads, value_dim]`. Operand order `[qkv, a, b]` is
+    /// the kernel's.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_prep(
+        &mut self,
+        qkv: ValueId,
+        a: ValueId,
+        b: ValueId,
+        a_log: &str,
+        dt_bias: &str,
+        key_heads: u32,
+        key_dim: u32,
+        value_heads: u32,
+        value_dim: u32,
+    ) -> (ValueId, ValueId, ValueId, ValueId, ValueId) {
+        let rows = self.values[qkv as usize].shape.0[0];
+        let qk = Shape(vec![rows, Dim::Const(key_heads), Dim::Const(key_dim)]);
+        let out = self.push(
+            OpKind::GdnPrep {
+                a_log: a_log.to_string(),
+                dt_bias: dt_bias.to_string(),
+            },
+            vec![qkv, a, b],
+            vec![
+                (qk.clone(), DType::F32),
+                (qk, DType::F32),
+                (
+                    Shape(vec![rows, Dim::Const(value_heads), Dim::Const(value_dim)]),
+                    DType::F32,
+                ),
+                (Shape(vec![rows, Dim::Const(value_heads)]), DType::F32),
+                (Shape(vec![rows, Dim::Const(value_heads)]), DType::F32),
+            ],
+        );
+        (out[0], out[1], out[2], out[3], out[4])
+    }
+
+    /// The gated-delta recurrence against layer `layer`'s per-request
+    /// recurrent state. The core output keeps v's `[Tokens, Vh, Vd]` shape.
+    pub fn gated_delta(
+        &mut self,
+        layer: u32,
+        q: ValueId,
+        k: ValueId,
+        v: ValueId,
+        g: ValueId,
+        beta: ValueId,
+    ) -> ValueId {
+        let shape = self.values[v as usize].shape.clone();
+        self.push(
+            OpKind::GatedDelta { layer },
+            vec![q, k, v, g, beta],
+            vec![(shape, DType::F32)],
+        )[0]
+    }
+
+    /// The gated RMSNorm landing: per-head norm of the rank-3 f32 core
+    /// output, silu-gated by `gate`, flattened to `gate`'s `[Tokens,
+    /// Vh * Vd]` bf16 shape (the fused fp32→bf16 conversion).
+    pub fn rmsnorm_gated(&mut self, x: ValueId, gate: ValueId, weight: &str) -> ValueId {
+        let x_elems: u32 = self.values[x as usize].shape.0[1..]
+            .iter()
+            .map(|d| match d {
+                Dim::Const(c) => *c,
+                other => panic!("rmsnorm_gated x must have Const head dims, got {other:?}"),
+            })
+            .product();
+        let gate_shape = self.values[gate as usize].shape.clone();
+        match gate_shape.0[1] {
+            Dim::Const(w) if w == x_elems => {}
+            other => panic!("rmsnorm_gated gate width {other:?} must equal x's flattened {x_elems}"),
+        }
+        self.push(
+            OpKind::RmsnormGated {
+                weight: weight.to_string(),
+            },
+            vec![x, gate],
+            vec![(gate_shape, DType::BF16)],
         )[0]
     }
 

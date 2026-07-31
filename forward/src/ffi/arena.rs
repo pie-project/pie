@@ -201,6 +201,52 @@ fn flatten_kind(
             0,
             PIE_FORWARD_NO_VALUE,
         ),
+        OpKind::SplitGdn { width0, width1 } => (
+            PieForwardOpKind::SplitGdn,
+            PIE_FORWARD_NO_NAME,
+            *width0,
+            *width1,
+            PIE_FORWARD_NO_VALUE,
+        ),
+        OpKind::CausalConv1d {
+            weight,
+            layer,
+            kernel,
+        } => (
+            PieForwardOpKind::CausalConv1d,
+            name(arena, weight),
+            *layer,
+            *kernel,
+            PIE_FORWARD_NO_VALUE,
+        ),
+        // The one kind that names two weights: the a_log name rides in the
+        // weight slot, the dt_bias name as a param0 NAME INDEX (the table
+        // on `PieForwardOp` documents this).
+        OpKind::GdnPrep { a_log, dt_bias } => {
+            let a_log = name(arena, a_log);
+            let dt_bias = name(arena, dt_bias);
+            (
+                PieForwardOpKind::GdnPrep,
+                a_log,
+                dt_bias,
+                0,
+                PIE_FORWARD_NO_VALUE,
+            )
+        }
+        OpKind::GatedDelta { layer } => (
+            PieForwardOpKind::GatedDelta,
+            PIE_FORWARD_NO_NAME,
+            *layer,
+            0,
+            PIE_FORWARD_NO_VALUE,
+        ),
+        OpKind::RmsnormGated { weight } => (
+            PieForwardOpKind::RmsnormGated,
+            name(arena, weight),
+            0,
+            0,
+            PIE_FORWARD_NO_VALUE,
+        ),
     }
 }
 

@@ -30,12 +30,20 @@
 //!   qwen3_5_moe MLP fragment (`family::qwen3_5_moe_mlp_block`) carries the
 //!   first `dyn`: the per-token expert axis, whose lowering (grouped GEMM)
 //!   is data-dependent and therefore the one thing the trace cannot fix —
-//!   see the `trace` module doc's "`dyn`: the first per-token axis".
+//!   see the `trace` module doc's "`dyn`: the first per-token axis". The
+//!   qwen3_5 GDN fragment (`family::qwen3_5_gdn_block`) carries the first
+//!   PER-REQUEST state: the conv/recurrent slabs its ops address, implicit
+//!   behind `layer` exactly as the KV cache is, marked by vocabulary
+//!   (`OpKind::state_ref`) — the trace module doc's "the per-request state
+//!   axis".
 
 pub mod facts;
 pub mod family;
 pub mod ffi;
 pub mod trace;
 
-pub use facts::{LlamaLikeFacts, Qwen35MoeMlpFacts};
-pub use trace::{Dim, DType, DynAxis, ForwardPlan, Op, OpKind, Shape, TraceBuilder, ValueId};
+pub use facts::{LlamaLikeFacts, Qwen35GdnFacts, Qwen35MoeMlpFacts};
+pub use trace::{
+    DType, Dim, DynAxis, ForwardPlan, Op, OpKind, Shape, StateRef, StateStore, TraceBuilder,
+    ValueId,
+};

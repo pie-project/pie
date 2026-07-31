@@ -19,7 +19,7 @@
 //!   there is no diagnostics channel to carry, and the status is the whole
 //!   answer.
 
-use crate::facts::{LlamaLikeFacts, NormPlacement, QkNorm, Qwen35MoeMlpFacts};
+use crate::facts::{LlamaLikeFacts, NormPlacement, QkNorm, Qwen35GdnFacts, Qwen35MoeMlpFacts};
 use crate::trace::{NormVariant, RopeKind};
 
 use super::arena;
@@ -139,6 +139,54 @@ fn read_moe_facts(
     })
 }
 
+/// The qwen3_5 GDN-block facts, as C states them. Mirrors
+/// [`crate::facts::Qwen35GdnFacts`] field for field; same input-side rules
+/// as [`PieForwardLlamaLikeFacts`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct PieForwardQwen35GdnFacts {
+    pub hidden: u32,
+    pub key_heads: u32,
+    pub value_heads: u32,
+    pub key_head_dim: u32,
+    pub value_head_dim: u32,
+    pub conv_kernel: u32,
+    /// The deployment bound the fused `in_proj_qkvz`/`in_proj_ba` banks
+    /// (`PIE_QWEN35_FUSED_GDN_PROJ`); non-zero is true.
+    pub fused_in_proj: u8,
+    /// A [`super::types::PieForwardNormVariant`] value.
+    pub norm_variant: u32,
+}
+
+fn read_gdn_facts(facts: &PieForwardQwen35GdnFacts) -> Result<Qwen35GdnFacts, PieForwardStatus> {
+    let norm_variant =
+        NormVariant::try_from(facts.norm_variant).map_err(|_| PieForwardStatus::InvalidArgument)?;
+    // A GDN block with no heads, zero-width heads or an empty conv window
+    // is not a smaller block, it is a malformed request: the tracer would
+    // emit ops whose dimensions no kernel means anything by. The GQA share
+    // constraint the driver checks at engine load (value heads divide into
+    // key heads) is validated here for the same reason.
+    if facts.key_heads == 0
+        || facts.value_heads == 0
+        || facts.key_head_dim == 0
+        || facts.value_head_dim == 0
+        || facts.conv_kernel == 0
+        || !facts.value_heads.is_multiple_of(facts.key_heads)
+    {
+        return Err(PieForwardStatus::InvalidArgument);
+    }
+    Ok(Qwen35GdnFacts {
+        hidden: facts.hidden,
+        key_heads: facts.key_heads,
+        value_heads: facts.value_heads,
+        key_head_dim: facts.key_head_dim,
+        value_head_dim: facts.value_head_dim,
+        conv_kernel: facts.conv_kernel,
+        fused_in_proj: facts.fused_in_proj != 0,
+        norm_variant,
+    })
+}
+
 /// Run `f`, aborting the process if it panics.
 ///
 /// Equivalent to letting the unwind hit the `extern "C"` boundary — the
@@ -223,9 +271,48 @@ pub unsafe extern "C" fn pie_forward_trace_qwen3_5_moe_mlp(
     })
 }
 
+/// Trace the qwen3_5 GDN (gated-deltanet) linear-attention block FRAGMENT
+/// against `facts` and publish the traced form into `*out_plan`.
+///
+/// The result carries the GDN vocabulary (`SplitGdn`, `CausalConv1d`,
+/// `GdnPrep`, `GatedDelta`, `RmsnormGated`) — and the first ops that
+/// address PER-REQUEST state (the conv/recurrent slabs, implicit behind
+/// `CausalConv1d`/`GatedDelta`'s layer, exactly as the KV cache is behind
+/// `KvAppend`'s). The declared executors do NOT consume these — their
+/// op-kind switches throw on any kind past their vocabulary — so this
+/// entry point exists for the toolchain side (planning, tests,
+/// cross-language pinning), not for emission.
+///
+/// # Safety
+///
+/// `facts` is null or points at a readable [`PieForwardQwen35GdnFacts`];
+/// `out_plan` is null or a writable slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pie_forward_trace_qwen3_5_gdn(
+    facts: *const PieForwardQwen35GdnFacts,
+    out_plan: *mut PieForwardPlan,
+) -> PieForwardStatus {
+    abort_on_panic(|| {
+        if out_plan.is_null() {
+            return PieForwardStatus::InvalidArgument;
+        }
+        unsafe { *out_plan = PieForwardPlan::default() };
+        if facts.is_null() {
+            return PieForwardStatus::InvalidArgument;
+        }
+        let facts = match read_gdn_facts(unsafe { &*facts }) {
+            Ok(facts) => facts,
+            Err(status) => return status,
+        };
+        let plan = crate::family::qwen3_5_gdn_block(&facts);
+        unsafe { *out_plan = arena::build(&plan) };
+        PieForwardStatus::Ok
+    })
+}
+
 /// Free the storage behind a plan header filled by
-/// [`pie_forward_trace_llama_like`] or
-/// [`pie_forward_trace_qwen3_5_moe_mlp`], and reset the header to empty.
+/// [`pie_forward_trace_llama_like`], [`pie_forward_trace_qwen3_5_moe_mlp`]
+/// or [`pie_forward_trace_qwen3_5_gdn`], and reset the header to empty.
 ///
 /// Safe to call with null, with a header that was never filled, or twice
 /// with the same header (the first call empties it).
@@ -256,8 +343,9 @@ unsafe impl Sync for EntryAddr {}
 /// (`loader/src/ffi/entry.rs:637-652`, `loader/architecture.md` §3.4).
 /// `#[used]` keeps the table, and the table keeps the functions.
 #[used]
-static KEEP_ALIVE: [EntryAddr; 3] = [
+static KEEP_ALIVE: [EntryAddr; 4] = [
     EntryAddr(pie_forward_trace_llama_like as *const ()),
     EntryAddr(pie_forward_trace_qwen3_5_moe_mlp as *const ()),
+    EntryAddr(pie_forward_trace_qwen3_5_gdn as *const ()),
     EntryAddr(pie_forward_release as *const ()),
 ];

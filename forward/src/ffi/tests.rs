@@ -8,12 +8,13 @@
 
 use super::arena::{self, view};
 use super::entry::{
-    PieForwardLlamaLikeFacts, PieForwardQwen35MoeMlpFacts, PieForwardStatus, pie_forward_release,
-    pie_forward_trace_llama_like, pie_forward_trace_qwen3_5_moe_mlp,
+    PieForwardLlamaLikeFacts, PieForwardQwen35GdnFacts, PieForwardQwen35MoeMlpFacts,
+    PieForwardStatus, pie_forward_release, pie_forward_trace_llama_like,
+    pie_forward_trace_qwen3_5_gdn, pie_forward_trace_qwen3_5_moe_mlp,
 };
 use super::types::*;
-use crate::facts::{LlamaLikeFacts, Qwen35MoeMlpFacts};
-use crate::family::{llama_like, qwen3_5_moe_mlp_block};
+use crate::facts::{LlamaLikeFacts, Qwen35GdnFacts, Qwen35MoeMlpFacts};
+use crate::family::{llama_like, qwen3_5_gdn_block, qwen3_5_moe_mlp_block};
 use crate::trace::OpKind;
 
 /// The qwen3 parity facts, as a C caller would state them.
@@ -55,17 +56,27 @@ fn expect_kind(kind: &OpKind) -> PieForwardOpKind {
         OpKind::TopK { .. } => PieForwardOpKind::TopK,
         OpKind::WeightedSum { .. } => PieForwardOpKind::WeightedSum,
         OpKind::SigmoidGateAdd => PieForwardOpKind::SigmoidGateAdd,
+        OpKind::SplitGdn { .. } => PieForwardOpKind::SplitGdn,
+        OpKind::CausalConv1d { .. } => PieForwardOpKind::CausalConv1d,
+        OpKind::GdnPrep { .. } => PieForwardOpKind::GdnPrep,
+        OpKind::GatedDelta { .. } => PieForwardOpKind::GatedDelta,
+        OpKind::RmsnormGated { .. } => PieForwardOpKind::RmsnormGated,
     }
 }
 
-/// The weight name each Rust op carries, if any.
+/// The (primary) weight name each Rust op carries, if any. GdnPrep's
+/// second name (dt_bias) crosses as a param0 name index and is asserted
+/// where the GDN fragment is round-tripped.
 fn expect_weight(kind: &OpKind) -> Option<&str> {
     match kind {
         OpKind::Embed { weight }
         | OpKind::Matmul { weight, .. }
         | OpKind::Rmsnorm { weight, .. }
         | OpKind::RmsnormPerHead { weight, .. }
+        | OpKind::CausalConv1d { weight, .. }
+        | OpKind::RmsnormGated { weight }
         | OpKind::LmHead { weight } => Some(weight),
+        OpKind::GdnPrep { a_log, .. } => Some(a_log),
         _ => None,
     }
 }
@@ -384,6 +395,165 @@ fn moe_entry_traces_and_validates() {
     }
     assert_eq!(
         unsafe { pie_forward_trace_qwen3_5_moe_mlp(std::ptr::null(), &mut out) },
+        PieForwardStatus::InvalidArgument
+    );
+}
+
+/// The GDN fragment round-trips: the five appended op kinds, the state
+/// layer + kernel params, GdnPrep's TWO names (a_log in the weight slot,
+/// dt_bias as the param0 name index), the rank-3 f32 prep/core values, and
+/// the five-output prep operand run.
+#[test]
+fn gdn_fragment_round_trips_through_the_arena() {
+    let facts = Qwen35GdnFacts::qwen3_5_0_8b();
+    let plan = qwen3_5_gdn_block(&facts);
+    let mut pod = arena::build(&plan);
+
+    assert_eq!(view::name(&pod, pod.family), "qwen3_5_gdn_block");
+    let ops = view::ops(&pod);
+    assert_eq!(ops.len(), plan.ops.len());
+    for (rust, c) in plan.ops.iter().zip(ops) {
+        assert_eq!(c.kind, expect_kind(&rust.kind), "kind of {rust:?}");
+        assert_eq!(view::ids(&pod, c.inputs), &rust.inputs[..]);
+        assert_eq!(view::ids(&pod, c.outputs), &rust.outputs[..]);
+        assert_eq!(c.selector, PIE_FORWARD_NO_VALUE, "selector of {rust:?}");
+        match expect_weight(&rust.kind) {
+            Some(weight) => assert_eq!(view::name(&pod, c.weight_name), weight),
+            None => assert_eq!(c.weight_name, PIE_FORWARD_NO_NAME),
+        }
+    }
+
+    let conv = ops
+        .iter()
+        .find(|op| op.kind == PieForwardOpKind::CausalConv1d)
+        .unwrap();
+    assert_eq!(view::name(&pod, conv.weight_name), "layer.0.conv");
+    assert_eq!(conv.param0, 0); // state layer
+    assert_eq!(conv.param1, facts.conv_kernel);
+
+    // GdnPrep: a_log in the weight slot, dt_bias as a param0 NAME index.
+    let prep = ops
+        .iter()
+        .find(|op| op.kind == PieForwardOpKind::GdnPrep)
+        .unwrap();
+    assert_eq!(view::name(&pod, prep.weight_name), "layer.0.a_log");
+    assert_eq!(view::name(&pod, prep.param0), "layer.0.dt_bias");
+    let prep_outs = view::ids(&pod, prep.outputs);
+    assert_eq!(prep_outs.len(), 5);
+    let q = view::values(&pod)[prep_outs[0] as usize];
+    assert_eq!(q.dtype, PieForwardDType::F32);
+    assert_eq!(q.rank, 3);
+    assert_eq!(q.dims[0].kind, PieForwardDimKind::Tokens);
+    assert_eq!(q.dims[1].value, facts.key_heads);
+    assert_eq!(q.dims[2].value, facts.key_head_dim);
+
+    let delta = ops
+        .iter()
+        .find(|op| op.kind == PieForwardOpKind::GatedDelta)
+        .unwrap();
+    assert_eq!(delta.param0, 0); // state layer
+    assert_eq!(delta.weight_name, PIE_FORWARD_NO_NAME);
+    assert_eq!(view::ids(&pod, delta.inputs), prep_outs);
+    let core = view::values(&pod)[view::ids(&pod, delta.outputs)[0] as usize];
+    assert_eq!(core.dtype, PieForwardDType::F32);
+    assert_eq!(core.rank, 3);
+    assert_eq!(core.dims[1].value, facts.value_heads);
+    assert_eq!(core.dims[2].value, facts.value_head_dim);
+
+    let gated = ops
+        .iter()
+        .find(|op| op.kind == PieForwardOpKind::RmsnormGated)
+        .unwrap();
+    assert_eq!(view::name(&pod, gated.weight_name), "layer.0.gate_norm");
+    let out = view::values(&pod)[view::ids(&pod, gated.outputs)[0] as usize];
+    assert_eq!(out.dtype, PieForwardDType::BF16);
+    assert_eq!(out.rank, 2);
+    assert_eq!(out.dims[1].value, facts.value_width());
+
+    unsafe { arena::release(&mut pod) };
+}
+
+/// The fused in-proj binding crosses too: two SplitGdn ops carrying their
+/// widths, three matmuls, same 10-op count.
+#[test]
+fn gdn_fragment_fused_binding_round_trips() {
+    let facts = Qwen35GdnFacts {
+        fused_in_proj: true,
+        ..Qwen35GdnFacts::qwen3_5_0_8b()
+    };
+    let plan = qwen3_5_gdn_block(&facts);
+    let mut pod = arena::build(&plan);
+    let ops = view::ops(&pod);
+    assert_eq!(ops.len(), 10);
+    let splits: Vec<_> = ops
+        .iter()
+        .filter(|op| op.kind == PieForwardOpKind::SplitGdn)
+        .collect();
+    assert_eq!(splits.len(), 2);
+    assert_eq!(splits[0].param0, facts.conv_dim());
+    assert_eq!(splits[0].param1, facts.value_width());
+    assert_eq!(splits[1].param0, facts.value_heads);
+    assert_eq!(splits[1].param1, facts.value_heads);
+    assert_eq!(splits[0].weight_name, PIE_FORWARD_NO_NAME);
+    unsafe { arena::release(&mut pod) };
+}
+
+/// The GDN entry point end to end: C facts in, POD plan out; malformed
+/// requests (bad enum, zero heads/dims/kernel, a GQA share that does not
+/// divide) answer InvalidArgument.
+#[test]
+fn gdn_entry_traces_and_validates() {
+    let facts = Qwen35GdnFacts::qwen3_5_0_8b();
+    let c_facts = PieForwardQwen35GdnFacts {
+        hidden: facts.hidden,
+        key_heads: facts.key_heads,
+        value_heads: facts.value_heads,
+        key_head_dim: facts.key_head_dim,
+        value_head_dim: facts.value_head_dim,
+        conv_kernel: facts.conv_kernel,
+        fused_in_proj: u8::from(facts.fused_in_proj),
+        norm_variant: PieForwardNormVariant::from(facts.norm_variant) as u32,
+    };
+    let mut out = PieForwardPlan::default();
+    assert_eq!(
+        unsafe { pie_forward_trace_qwen3_5_gdn(&c_facts, &mut out) },
+        PieForwardStatus::Ok
+    );
+    // The 10-op block `family::tests::gdn_block_op_sequence` pins.
+    assert_eq!(out.ops.len, 10);
+    unsafe { pie_forward_release(&mut out) };
+
+    for bad in [
+        PieForwardQwen35GdnFacts {
+            norm_variant: 9,
+            ..c_facts
+        },
+        PieForwardQwen35GdnFacts {
+            key_heads: 0,
+            ..c_facts
+        },
+        PieForwardQwen35GdnFacts {
+            value_head_dim: 0,
+            ..c_facts
+        },
+        PieForwardQwen35GdnFacts {
+            conv_kernel: 0,
+            ..c_facts
+        },
+        // 16 value heads cannot GQA-share 3 key heads.
+        PieForwardQwen35GdnFacts {
+            key_heads: 3,
+            ..c_facts
+        },
+    ] {
+        assert_eq!(
+            unsafe { pie_forward_trace_qwen3_5_gdn(&bad, &mut out) },
+            PieForwardStatus::InvalidArgument
+        );
+        assert!(out.owner.is_null());
+    }
+    assert_eq!(
+        unsafe { pie_forward_trace_qwen3_5_gdn(std::ptr::null(), &mut out) },
         PieForwardStatus::InvalidArgument
     );
 }
