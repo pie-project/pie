@@ -6660,3 +6660,131 @@ there.** The residual 15-19 failures on this shape are a real limitation of
 pie's memory model (no recompute preemption, `swap_pool_size` 0 by default),
 not an admission-policy bug, and they are bounded: with `--swap-pool-size 8192`
 the same cell completes 1024/1024 at 3138 tok/s.
+
+## §20.41 — the mixed-phase conc-512 regression: five levers, one structure
+
+§20.40 fixed the deaths. This section chases the other half of the ask: the
+cells where pie *loses*. The mixed-phase shape M is the interesting one,
+because unlike X it completes essentially everything (`failed=1-2` of 3072) —
+so the deficit is pure throughput, with no ledger asterisk.
+
+| M, no swap | pie | vLLM | ratio |
+| --- | --- | --- | --- |
+| conc 256 | 15546-16506 | 15044-15198 | **1.03-1.09 (pie wins)** |
+| conc 512 | 14462-15110 | 16371 (§20.39) | 0.89-0.92 |
+
+pie *wins* at 256 and loses at 512. So the question is not "why is pie slow",
+it is "why does pie fall off with concurrency while vLLM is flat".
+
+### Where the wave period goes
+
+`PIE_FIRE_TIMING=waves`, same 1.144M tokens on both sides, p50 of the
+inter-wave phase gaps:
+
+| phase (p50) | conc 256 | conc 512 |
+| --- | --- | --- |
+| prev settled -> next driver started | **-7.95 ms** | **+11.84 ms** |
+| driver started -> dispatch started | -0.73 ms | -1.15 ms |
+| dispatch started -> batch built | 0.68 ms | 1.07 ms |
+| batch built -> launch returned | 5.85 ms | 8.52 ms |
+| launch returned -> settled (device) | 29.38 ms | 37.81 ms |
+| **wave period** | **26.3 ms** | **59.8 ms** |
+
+The first row is the whole story. At 256 the next wave's driver work starts
+8 ms *before* the previous wave settles — run-ahead is working. At 512 it
+starts 11.8 ms *after*. Of the 33.5 ms the period grows, ~20 ms is run-ahead
+that stopped happening; only ~8 ms is the bigger device wave.
+
+Normalised per 1000 tokens, the device got *cheaper* at 512
+(`native_inflight` 26770 -> 23062 us/ktok, `driver_submit` 7119 -> 6413) —
+bigger batches are more efficient, exactly as intended. Device occupancy
+nevertheless fell from 38% to 27% of wall. The host stopped feeding it.
+
+### Why run-ahead stops
+
+`frame.rs:1173-1178`. The boundary seals only once every awaited lane's next
+frame is fully submitted, and:
+
+```rust
+if joining || missing > 0 {
+    if executing { return FramePlan::Park; }
+```
+
+One missing lane suspends *all* further sealing; the dispatcher then runs
+only off frames already in `self.sealed`. That backlog is exactly what
+`HOST_TURNAROUND_WAVES` (R) funds — R waves of cover for the slowest lane's
+host round trip. The wait is infinite by principle and the watchdog is
+report-only, so when the cohort's straggler tail outgrows R waves of backlog,
+the cadence collapses to lockstep on the straggler. A 512-lane cohort's
+slowest turnaround is drawn from twice as many samples as a 256-lane one.
+
+### Five levers, all measured, all rejected
+
+1. **Raise R** (`PIE_TURNAROUND_WAVES`) — the obvious response to "not enough
+   cover". Conc 512 *lost* 5.1% at R=4 (14911 -> 14153) while conc 256 gained
+   3.0% (15646 -> 16116). R is KV-funded: `frames_in_flight() = 1 +
+   ceil(R/k)`, and every extra frame reserves ring cells and pages **per
+   lane**. At conc 512 M already runs at `free=0/8192` with `parks=2846`, so
+   buying cover costs the memory that the cover exists to protect. **This is
+   the structure**: pie's run-ahead window and its KV pool are the same
+   resource, and at high concurrency they are in direct conflict. vLLM has no
+   equivalent because its continuous-batching loop is host-side bookkeeping
+   that costs no device memory at all.
+
+2. **Frame rebind escape mode 1** (`PIE_FRAME_REBIND_ESCAPE=1`) — seal without
+   the missing lane. Null by construction: mode 1 still requires
+   `missing_rebind > 0`, i.e. a missing lane whose owner holds an *in-flight
+   bind*. A KV-parked lane has no bind, so it never fires. Measured anyway,
+   ABBA-interleaved, 3 reps each at conc 512: mode 2 14843 mean, mode 1 14653
+   mean (-1.3%, noise).
+
+3. **KV admission backpressure** — see §20.40. Deadlocks where it is obvious,
+   does nothing where it is safe.
+
+4. **`--concurrency` as a KV-aware cap** — already closed, and re-closed by
+   lever 3's measurement.
+
+5. **The O(queue) dispatcher scan** — a real defect, found and fixed, and
+   *still* not the answer. `scan_queue` read `logical_fire_id` and
+   `frame.is_some()` through `QueuedItem::Launch`'s box, one cache miss per
+   queued item, while the scan itself runs a fixed ~250 times per 1000 tokens
+   regardless of concurrency. Measured 13.9 us/scan at conc 256 against
+   24.1 us at 512 — precisely linear in queue depth, so host scheduling cost
+   grew with concurrency while the work stayed constant. Mirroring both
+   fields inline (`QueuedLaunch`) makes the scan touch only sequential
+   `VecDeque` memory. Post-fix the whole scan is 0.53-0.56 s of an ~80 s run
+   and **flat in concurrency**. End-to-end it is worth +1.7% at conc 512 and
+   +3.0% at 256 — at or under this box's noise floor. **Kept anyway**: it is
+   strictly less work, the mechanism is measured, and the mirror is
+   structurally unfalsifiable (no `DerefMut`, so neither field can be
+   reassigned while queued). It is not, however, the regression.
+
+### Ruled out
+
+- **CPU starvation.** cgroup v1 quota is 13.6 CPUs; sampled `cpu.stat` across
+  60 s of a live conc-512 run: `nr_periods=600 nr_throttled=0`. Guest-class
+  CPU averaged 0.78 cores (peak 11.2). The host is not out of CPU.
+- **Batch size.** `max forward requests` doubles 512 -> 1024 and per-token
+  device cost *falls*. Bigger batches are not the problem.
+- **Guest cost.** `guest_work_us` is 20.2 us/guest at 256 and 19.3 at 512 —
+  flat. `guest_wake_us` and `guest_resume_us` both grow, but both stay at a
+  constant 15% and 7% of the wave period, so they are consequences of the
+  period, not causes.
+
+### Measurement trap found here
+
+Cross-driver-process comparisons on this box are worthless right now. The same
+configuration (mode 2, conc 512) measured 14911, 12356 and 14872 in three
+different driver processes over 40 minutes — 17% spread — while
+ABBA-interleaved reps *inside* one process held to 2%. Every A/B in this
+section is interleaved within a single driver process for that reason. A
+neighbouring tenant holds 18 GiB on the device throughout (invisible in this
+PID namespace, so it cannot be cleared); it sits at 0% utilisation, so it is
+not stealing SMs, but the box is evidently not otherwise quiet.
+
+### What would actually fix it
+
+Decouple run-ahead depth from KV residency, so cover for the straggler stops
+being paid for in pages. That is a design change to the lane ring, not a
+constant to tune, and it is the honest end-state for this deficit — as
+guest-declared working-set budgets (§20.40) are for the death case.

@@ -1590,7 +1590,7 @@ enum QueuedItem {
     /// 1280 bytes — a cohort boundary moved ~800 MB through `VecDeque`
     /// rotations alone. The indirection makes every queue move a pointer
     /// move; the payload itself never moves.
-    Launch(Box<PendingRequest>),
+    Launch(QueuedLaunch),
     PreLaunchCopy {
         plan: PreLaunchCopy,
         logical_completion: WorkItemCompletion,
@@ -1657,6 +1657,51 @@ enum QueuedItem {
     CloseChannels {
         ids: Vec<u64>,
     },
+}
+
+/// A queued launch, plus the only two fields the dispatcher's queue scan
+/// reads, mirrored inline next to the box.
+///
+/// [`BatchScheduler::scan_queue`] walks the whole queue and previously read
+/// both fields *through* the box, which costs one cache miss per queued item.
+/// The scan runs a fixed ~250 times per 1000 tokens no matter how many
+/// processes are admitted, so that per-item miss made the scan's cost linear
+/// in queue depth and therefore the host's scheduling cost linear in
+/// concurrency while the work stayed constant: measured 13.9 us/scan at 256
+/// admitted processes against 24.1 us at 512 (mixed-phase shape, same token
+/// count both sides), 3.9 s vs 6.5 s of loop time for identical work.
+///
+/// The mirror cannot go stale, structurally: `QueuedLaunch` hands out only
+/// `&PendingRequest` (there is deliberately no `DerefMut`), so neither field
+/// can be reassigned while the item is queued. Both are already final by the
+/// time they are mirrored — `logical_fire_id` is assigned at construction and
+/// the frame stamp is synthesized at ACCEPT, before `queue_attempt` hands the
+/// item to the queue.
+struct QueuedLaunch {
+    fire_id: u64,
+    framed: bool,
+    request: Box<PendingRequest>,
+}
+
+impl QueuedLaunch {
+    fn new(request: Box<PendingRequest>) -> Self {
+        Self {
+            fire_id: request.logical_fire_id,
+            framed: request.frame.is_some(),
+            request,
+        }
+    }
+
+    fn into_request(self) -> Box<PendingRequest> {
+        self.request
+    }
+}
+
+impl std::ops::Deref for QueuedLaunch {
+    type Target = PendingRequest;
+    fn deref(&self) -> &Self::Target {
+        &self.request
+    }
 }
 
 /// A posted launch's lane lifecycle: the batch enters `in_flight_launches`
@@ -3089,7 +3134,7 @@ impl BatchScheduler {
         for copy in copies {
             pending.push_back(copy);
         }
-        pending.push_back(QueuedItem::Launch(Box::new(request)));
+        pending.push_back(QueuedItem::Launch(QueuedLaunch::new(Box::new(request))));
     }
 
     /// Whether any queued fire still targets `instance_id` (a queued
@@ -3721,14 +3766,14 @@ impl BatchScheduler {
         scan.clear();
         for item in pending.iter() {
             match item {
-                QueuedItem::Launch(request) => {
+                QueuedItem::Launch(launch) => {
                     if stopping {
-                        scan.drain_eligible.push(request.logical_fire_id);
+                        scan.drain_eligible.push(launch.fire_id);
                     }
-                    if request.frame.is_some() {
-                        scan.queued_ids.push(request.logical_fire_id);
+                    if launch.framed {
+                        scan.queued_ids.push(launch.fire_id);
                     } else if scan.untracked.is_none() {
-                        scan.untracked = Some(request.logical_fire_id);
+                        scan.untracked = Some(launch.fire_id);
                     }
                 }
                 QueuedItem::PreLaunchCopy { pipeline_id, .. } => {
@@ -3958,16 +4003,16 @@ impl BatchScheduler {
         let mut collisions: Vec<(usize, Box<PendingRequest>)> = Vec::new();
         while let Some(item) = pending.pop_front() {
             match item {
-                QueuedItem::Launch(request) => match slot_of.get(&request.logical_fire_id) {
+                QueuedItem::Launch(launch) => match slot_of.get(&launch.fire_id) {
                     Some(&(wave, position)) => {
                         let slot = &mut slot_buffer[wave][position];
                         if slot.is_none() {
-                            *slot = Some(request);
+                            *slot = Some(launch.into_request());
                         } else {
-                            collisions.push((wave, request));
+                            collisions.push((wave, launch.into_request()));
                         }
                     }
-                    None => kept.push_back(QueuedItem::Launch(request)),
+                    None => kept.push_back(QueuedItem::Launch(launch)),
                 },
                 item => kept.push_back(item),
             }
@@ -5682,7 +5727,7 @@ mod tests {
             false,
         );
         let mut pending: PendingQueue =
-            VecDeque::from([QueuedItem::Launch(Box::new(request))]).into();
+            VecDeque::from([QueuedItem::Launch(QueuedLaunch::new(Box::new(request)))]).into();
         completion.request_cancel();
         BatchScheduler::reject_pipeline_queued(&mut pending, pid, Some(&completion));
         assert_eq!(pending.len(), 1);
@@ -6224,7 +6269,9 @@ mod tests {
     #[test]
     fn instance_queued_work_gate_sees_launches() {
         let pid = ProcessId::new_v4();
-        let pending = VecDeque::from([QueuedItem::Launch(dummy_launch_request(pid, 7))]);
+        let pending = VecDeque::from([QueuedItem::Launch(QueuedLaunch::new(
+            dummy_launch_request(pid, 7),
+        ))]);
         assert!(BatchScheduler::instance_has_queued_work(&pending, 7));
         assert!(!BatchScheduler::instance_has_queued_work(&pending, 8));
     }
@@ -7155,9 +7202,15 @@ mod tests {
         let pipeline_a = ProcessId::new_v4();
         let pipeline_b = ProcessId::new_v4();
         let mut pending = PendingQueue::default();
-        pending.push_back(QueuedItem::Launch(dummy_launch_request(pipeline_a, 1)));
-        pending.push_back(QueuedItem::Launch(dummy_launch_request(pipeline_a, 1)));
-        pending.push_back(QueuedItem::Launch(dummy_launch_request(pipeline_b, 2)));
+        pending.push_back(QueuedItem::Launch(QueuedLaunch::new(dummy_launch_request(
+            pipeline_a, 1,
+        ))));
+        pending.push_back(QueuedItem::Launch(QueuedLaunch::new(dummy_launch_request(
+            pipeline_a, 1,
+        ))));
+        pending.push_back(QueuedItem::Launch(QueuedLaunch::new(dummy_launch_request(
+            pipeline_b, 2,
+        ))));
         pending.push_back(QueuedItem::CloseInstance {
             id: 9,
             pacing_wait_id: 0,
@@ -7202,10 +7255,10 @@ mod tests {
     fn launch_rotation_reaches_a_pre_launch_copy() {
         let make_pending = || {
             let mut pending = PendingQueue::default();
-            pending.push_back(QueuedItem::Launch(dummy_launch_request(
+            pending.push_back(QueuedItem::Launch(QueuedLaunch::new(dummy_launch_request(
                 ProcessId::new_v4(),
                 1,
-            )));
+            ))));
             pending.push_back(QueuedItem::PreLaunchCopy {
                 plan: PreLaunchCopy::Kv(crate::driver::KvCopyPlan::default()),
                 logical_completion: WorkItemCompletion::deferred_with_guard(None),
@@ -7266,7 +7319,7 @@ mod tests {
         frame_policy.on_fire_enqueued(stamp, Some(pid), fire_id, 1, 1);
 
         let mut pending: PendingQueue =
-            VecDeque::from([QueuedItem::Launch(Box::new(request))]).into();
+            VecDeque::from([QueuedItem::Launch(QueuedLaunch::new(Box::new(request)))]).into();
         let (lane, _lane_rx) = test_lane(None);
         let mut lane_inflight = 0u64;
         let mut lane_token = 0u64;
@@ -7353,7 +7406,7 @@ mod tests {
 
         let (resize_tx, _resize_rx) = tokio::sync::oneshot::channel();
         let mut pending: PendingQueue = VecDeque::from([
-            QueuedItem::Launch(Box::new(request)),
+            QueuedItem::Launch(QueuedLaunch::new(Box::new(request))),
             QueuedItem::ResizePool {
                 plan: PoolResizePlan::default(),
                 response: resize_tx,
@@ -7442,7 +7495,7 @@ mod tests {
         let (resize_tx, _resize_rx) = tokio::sync::oneshot::channel();
         let (copy_tx, _copy_rx) = tokio::sync::oneshot::channel();
         let pending: PendingQueue = VecDeque::from([
-            QueuedItem::Launch(Box::new(request_a)),
+            QueuedItem::Launch(QueuedLaunch::new(Box::new(request_a))),
             QueuedItem::ResizePool {
                 plan: PoolResizePlan::default(),
                 response: resize_tx,
@@ -7455,7 +7508,7 @@ mod tests {
                 plan: crate::driver::KvCopyPlan::default(),
                 response: copy_tx,
             },
-            QueuedItem::Launch(Box::new(request_b)),
+            QueuedItem::Launch(QueuedLaunch::new(Box::new(request_b))),
             QueuedItem::PreLaunchCopy {
                 plan: PreLaunchCopy::Kv(crate::driver::KvCopyPlan::default()),
                 logical_completion: WorkItemCompletion::deferred_with_guard(None),
@@ -7522,8 +7575,8 @@ mod tests {
         let rider = make(None);
         let (stamped_id, rider_id) = (stamped.logical_fire_id, rider.logical_fire_id);
         let mut pending: PendingQueue = VecDeque::from([
-            QueuedItem::Launch(Box::new(stamped)),
-            QueuedItem::Launch(Box::new(rider)),
+            QueuedItem::Launch(QueuedLaunch::new(Box::new(stamped))),
+            QueuedItem::Launch(QueuedLaunch::new(Box::new(rider))),
         ])
         .into();
 
@@ -7593,7 +7646,7 @@ mod tests {
             let mut frame_policy = FramePolicy::new(1, 1, 4096, None);
             frame_policy.on_fire_enqueued(stamp, Some(pid), fire_id, 1, 1);
             let mut pending: PendingQueue =
-                VecDeque::from([QueuedItem::Launch(Box::new(request))]).into();
+                VecDeque::from([QueuedItem::Launch(QueuedLaunch::new(Box::new(request)))]).into();
             let (lane, _lane_rx) = test_lane(None);
             let mut lane_inflight = 0u64;
             let mut lane_token = 1u64;
