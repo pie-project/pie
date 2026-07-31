@@ -131,7 +131,8 @@ void qwen3_5_forward_declared(
     const std::int32_t* slot_ids_d,
     const std::uint8_t* is_fresh_d,
     const std::int32_t* logit_row_indices_d,
-    int num_logit_rows)
+    int num_logit_rows,
+    const std::int32_t* commit_lens)
 {
     const pie_forward::ForwardPlan& plan = declared.plan;
     if (qwen35_declared_exec_trace_enabled()) {
@@ -190,13 +191,34 @@ void qwen3_5_forward_declared(
         }
     }
 
+    // MTP-adjacent fire shapes (this arc). Both are per-fire SERVICES
+    // around the one traced pass (family.rs's epilogue doc states exactly
+    // this division), so neither changes which ops the plan carries — they
+    // change which arms the walk runs, mirroring where the hand-written
+    // body returns early / branches:
+    //  * commit-advance (`commit_lens != nullptr`): the spec-decode repair
+    //    re-runs ONLY each linear layer's conv+prep+recurrence over the
+    //    confirmed prefix, loading the layer's in-proj activations from the
+    //    verify stash (rs_buffer_fold is gate-excluded, so the stash is the
+    //    only source). No embed/norms/attention/MLP/epilogue.
+    //  * state-only (`num_logit_rows < 0`): the speculative repair's
+    //    whole-backbone flavor — everything runs except the final-norm /
+    //    lm_head epilogue (the hand-written `if (num_logit_rows < 0 ||
+    //    commit_advance) return;`).
+    const bool commit_advance = commit_lens != nullptr;
+    const bool state_only = num_logit_rows < 0;
+
     // Per-slot reset for freshly (re)assigned rs slots — the hand-written
-    // reset stage minus the commit-advance / rs-buffer branches the
-    // caller's gate excluded. (Freshness occurs on a context's first fire,
+    // reset stage minus the rs-buffer branches the caller's gate excluded.
+    // Commit-advance skips the reset whole: it advances the existing
+    // committed state (the hand-written `commit_advance && !rs_buffer_fold`
+    // arm). (Freshness occurs on a context's first fire,
     // a prefill; on a pure-decode fire the runtime guarantees no slot is
     // fresh, but the hand-written body still runs the check on both shapes,
     // so the walk runs it too rather than reasoning it away.)
-    if (slot_ids_h != nullptr && is_fresh_h != nullptr) {
+    if (commit_advance) {
+        // No reset: advancing the existing committed state.
+    } else if (slot_ids_h != nullptr && is_fresh_h != nullptr) {
         if (std::any_of(is_fresh_h, is_fresh_h + R,
                         [](auto fresh) { return fresh != 0; })) {
             if (slot_ids_d != nullptr && is_fresh_d != nullptr) {
@@ -229,15 +251,33 @@ void qwen3_5_forward_declared(
     const bool state_bf16 = state_cache.recurrent_state_bf16();
     const auto slot_stride = static_cast<long long>(
         state_cache.recurrent_slot_stride_floats());
-    // The hand-written body's routing booleans, term for term. Two of its
-    // terms are constants on this slice, resolved by the caller's gate:
+    // The hand-written body's routing booleans, term for term. One of its
+    // terms is a constant on this slice, resolved by the caller's gate:
     // `linear_decode = is_pure_decode && !rs_buffer_write` (rs-buffer fires
-    // excluded) and `commit_len == nullptr` (commit-advance fires
-    // excluded). `write_state = !verify_frozen && !rs_buffer_write`; the
-    // gate excludes frozen-verify too, but the walk mirrors the read
-    // rather than folding the constant.
+    // excluded by the Stage-2 verdict). `write_state = !verify_frozen &&
+    // !rs_buffer_write`: frozen-verify fires run here with
+    // write_state=false — the state-suppressing verify pass whose in-proj
+    // activations the stash-write below captures for the later replay.
     const bool linear_decode = is_pure_decode;
     const bool write_state = !state_cache.verify_frozen();
+
+    // Verify-stash facts (`linear_attn_layer_body`'s stash block, hoisted:
+    // `verify_hidden_stash_layer` is non-null for every layer exactly when
+    // the stash is configured, so the per-layer null checks collapse to
+    // one enabled bit). Layout per linear layer, bf16, max_tokens stride:
+    //   [ mixed_qkv (conv_dim) | a (V_h) | b (V_h) ]
+    // replay_load (commit-advance): load them and SKIP the in-proj GEMMs
+    // and splits entirely. stash_write (frozen verify): cache them after
+    // the in-proj GEMMs/splits, before the conv — same launch position.
+    const bool stash_enabled = state_cache.verify_hidden_stash_enabled();
+    const std::size_t stash_stride =
+        static_cast<std::size_t>(state_cache.verify_stash_max_tokens());
+    const std::size_t stash_a_off = stash_stride * conv_dim;
+    const std::size_t stash_b_off =
+        stash_a_off + stash_stride * static_cast<std::size_t>(V_h);
+    const bool replay_load = commit_advance && stash_enabled;
+    const bool stash_write =
+        state_cache.verify_frozen() && stash_enabled && !commit_advance;
     auto slot_for = [&](int r) -> int {
         return slot_ids_h ? slot_ids_h[r] : 0;
     };
@@ -247,16 +287,18 @@ void qwen3_5_forward_declared(
         slot_ids_d != nullptr && V_h != K_h && V_h % K_h == 0;
     // Prefill recurrence family — the hand-written selection, verbatim:
     // warp-tiled for small-N slotted prefill (STOPGAP: only when it need
-    // not persist state, unless the env re-enables the persisting fold);
-    // else the env-gated cached kernel; else the batched GQA-aware FLA
-    // (the c>=64 spec path). `use_batched_fla_gqa` also decides whether
-    // GdnPrep skips the repeat_interleave materialisation.
+    // not persist state, unless the env re-enables the persisting fold;
+    // never on commit-advance — the FLA path is the only one threading
+    // commit_len); else the env-gated cached kernel; else the batched
+    // GQA-aware FLA (the c>=64 spec path). `use_batched_fla_gqa` also
+    // decides whether GdnPrep skips the repeat_interleave materialisation.
     const bool use_warp_tiled_recurrent =
         !linear_decode &&
         slot_ids_d != nullptr &&
         qo_indptr != nullptr &&
         N <= qwen35_gdn_warp_tiled_max_tokens() &&
         K_d <= 256 &&
+        commit_lens == nullptr &&
         (!write_state || qwen35_gdn_warp_tiled_state_persist_enabled());
     const bool use_batched_fla_gqa =
         !linear_decode &&
@@ -277,9 +319,49 @@ void qwen3_5_forward_declared(
     // fused-vs-unfused pairing in qwen35_dense_mlp_block).
     bool gate_up_used_fused = false;
 
+    // Commit-advance op filter — the walk's mirror of the hand-written
+    // layer loop's `if (commit_advance) { if (!is_linear) continue; ...
+    // }` plus `linear_attn_layer_body`'s replay_load / `if (commit_len !=
+    // nullptr) return;` skips: only conv+prep+recurrence run, preceded by
+    // the in-proj GEMMs+splits ONLY when there is no stash to replay from
+    // (the hand-written `replay_load` false branch — same launches, same
+    // degenerate reliance on whatever norm_x holds).
+    auto commit_advance_runs = [&](const PieForwardOp& op) -> bool {
+        switch (op.kind) {
+        case PieForwardOpKind::CausalConv1d:
+        case PieForwardOpKind::GdnPrep:
+        case PieForwardOpKind::GatedDelta:
+            return true;
+        case PieForwardOpKind::SplitGdn:
+            return !replay_load;
+        case PieForwardOpKind::Matmul: {
+            if (replay_load) return false;
+            const ParsedWeightName nm =
+                parse_weight_name(plan.weight_name(op));
+            return nm.field == "in_proj_qkvz" || nm.field == "in_proj_ba" ||
+                   nm.field == "in_proj_qkv" || nm.field == "in_proj_z" ||
+                   nm.field == "in_proj_a" || nm.field == "in_proj_b";
+        }
+        default:
+            return false;
+        }
+    };
+    // State-only epilogue skip — the hand-written `if (num_logit_rows < 0
+    // || commit_advance) return;` before final norm / lm_head / the final
+    // hidden copy (the copy lives in the LmHead arm, so skipping the arm
+    // skips it too).
+    auto state_only_skips = [&](const PieForwardOp& op) -> bool {
+        if (op.kind == PieForwardOpKind::LmHead) return true;
+        if (op.kind != PieForwardOpKind::Rmsnorm) return false;
+        const ParsedWeightName nm = parse_weight_name(plan.weight_name(op));
+        return nm.layer < 0 && nm.field == "final_norm";
+    };
+
     const std::size_t op_count = plan.op_count();
     for (std::size_t i = 0; i < op_count; ++i) {
         const PieForwardOp& op = plan.op(i);
+        if (commit_advance && !commit_advance_runs(op)) continue;
+        if (state_only && state_only_skips(op)) continue;
         switch (op.kind) {
         case PieForwardOpKind::Embed: {
             const std::string_view name = plan.weight_name(op);
@@ -485,6 +567,59 @@ void qwen3_5_forward_declared(
             }
             const int state_layer = static_cast<int>(op.param0);
             require(layer.la_conv1d_w, name);
+            // Verify-stash service at the hand-written launch position
+            // (after the in-proj GEMMs/splits, before the conv). The stash
+            // is keyed by the COMPACT linear-layer index — storage
+            // knowledge derived from the binding, like KvAppend's kv_layer
+            // — counted over the layer kinds below the traced model layer.
+            if (replay_load || stash_write) {
+                int linear_idx = 0;
+                for (int l = 0; l < state_layer; ++l) {
+                    if (w.layers[l].kind ==
+                        Qwen3_5LayerWeights::Kind::LinearAttn) {
+                        ++linear_idx;
+                    }
+                }
+                auto* stash = static_cast<std::uint16_t*>(
+                    state_cache.verify_hidden_stash_layer(linear_idx));
+                if (replay_load) {
+                    // Commit-advance replay: load [mixed_qkv | a | b] from
+                    // the stash; the in-proj GEMMs and splits were skipped.
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        la.mixed_qkv.data(), stash,
+                        static_cast<std::size_t>(N) * conv_dim *
+                            sizeof(std::uint16_t),
+                        cudaMemcpyDeviceToDevice, stream));
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        la.a.data(), stash + stash_a_off,
+                        static_cast<std::size_t>(N) * V_h *
+                            sizeof(std::uint16_t),
+                        cudaMemcpyDeviceToDevice, stream));
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        la.b.data(), stash + stash_b_off,
+                        static_cast<std::size_t>(N) * V_h *
+                            sizeof(std::uint16_t),
+                        cudaMemcpyDeviceToDevice, stream));
+                } else {
+                    // Frozen verify: cache the cheap in-proj activations
+                    // for the later commit-advance replay.
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        stash, la.mixed_qkv.data(),
+                        static_cast<std::size_t>(N) * conv_dim *
+                            sizeof(std::uint16_t),
+                        cudaMemcpyDeviceToDevice, stream));
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        stash + stash_a_off, la.a.data(),
+                        static_cast<std::size_t>(N) * V_h *
+                            sizeof(std::uint16_t),
+                        cudaMemcpyDeviceToDevice, stream));
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        stash + stash_b_off, la.b.data(),
+                        static_cast<std::size_t>(N) * V_h *
+                            sizeof(std::uint16_t),
+                        cudaMemcpyDeviceToDevice, stream));
+                }
+            }
             // Per-fire lowering of the opaque conv op against the layer's
             // per-request conv state — the hand-written conv stage,
             // verbatim: decode-update on pure-decode fires, the batched
@@ -524,7 +659,7 @@ void qwen3_5_forward_declared(
                         static_cast<long long>(state_cache.conv_kernel()) *
                             state_cache.conv_dim(),
                         R, conv_dim, conv_K, stream, write_state,
-                        /*commit_len=*/nullptr);
+                        commit_lens);
                 } else {
                     for (int r = 0; r < R; ++r) {
                         const int t0 = static_cast<int>(qo_indptr_h[r]);
@@ -639,10 +774,10 @@ void qwen3_5_forward_declared(
                                 R, V_h, K_d, V_d,
                                 stream, write_state);
                         }
-                    } else if (N <= qwen35_gdn_cached_prefill_max_tokens()) {
-                        // (The hand-written branch also requires
-                        // commit_len == nullptr — constant true here, the
-                        // gate excludes commit-advance fires.)
+                    } else if (commit_lens == nullptr &&
+                               N <= qwen35_gdn_cached_prefill_max_tokens()) {
+                        // (Commit-advance falls through to the FLA branch —
+                        // the only kernel family threading commit_len.)
                         if (state_bf16) {
                             kernels::launch_chunk_gated_delta_prefill_batched_cached_state_bf16(
                                 q_recur_full, k_recur_full,
@@ -675,7 +810,7 @@ void qwen3_5_forward_declared(
                                 state_slot0, slot_ids_d, qo_indptr,
                                 slot_stride, la.core_out.data(),
                                 R, K_h, V_h, K_d, V_d, stream, write_state,
-                                /*commit_len=*/nullptr);
+                                commit_lens);
                         } else {
                             kernels::launch_chunk_gated_delta_prefill_batched(
                                 la.q_pre.data(), la.k_pre.data(),
@@ -685,7 +820,7 @@ void qwen3_5_forward_declared(
                                 slot_ids_d, qo_indptr,
                                 slot_stride, la.core_out.data(),
                                 R, K_h, V_h, K_d, V_d, stream, write_state,
-                                /*commit_len=*/nullptr);
+                                commit_lens);
                         }
                     }
                 } else {

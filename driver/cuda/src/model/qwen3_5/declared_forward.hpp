@@ -19,13 +19,24 @@
 //
 // Scope (the honest slice; the caller's gate in qwen3_5_model.cpp encodes
 // it): dense hybrid (0.8b shape), no stage hooks, no lora, no custom
-// masks, no spec-decode services (frozen verify, commit-advance, rs-buffer
-// write/fold all fall back per fire), no state-only fires
-// (num_logit_rows < 0). MTP draft fires never reach `body()` at all (they
-// are the drafter service's own entry points, `qwen3_5_mtp_forward` /
-// `qwen3_5_mtp_process_cache`), so the base pass this executor serves is
-// the same base pass the MTP verify wraps — but verify itself arrives as
-// frozen-verify / commit-advance fires, which the gate excludes.
+// masks, no rs-buffer write/fold fires (excluded by DESIGN per the Stage-2
+// verdict — see the gate comment). The MTP-adjacent fire shapes are
+// DECLARED since this arc: state-only fires (num_logit_rows < 0) skip the
+// final-norm / lm_head epilogue arms exactly as the hand-written body
+// returns early; frozen-verify fires (state_cache.verify_frozen()) run the
+// full pass with write_state=false plus the per-layer in-proj stash-write
+// memcpys; commit-advance fires (commit_lens != nullptr) walk only the
+// linear layers' [stash-load, conv, prep, recurrence] launches with
+// commit_lens threaded into the batched conv prefill and the FLA
+// recurrence — each mirrored launch-for-launch from
+// `linear_attn_layer_body` / `qwen3_5_forward_paged`. MTP draft fires
+// never reach `body()` at all (they are the drafter service's own entry
+// points, `qwen3_5_mtp_forward` / `qwen3_5_mtp_process_cache`); the
+// verify-window fires MTP inferlets route through body() are plain
+// prefill-shaped fires (arc 3), and the frozen/commit/state-only services
+// above currently have no runtime producer — they are mirrored so the
+// declared walk serves the same contract the hand-written body serves,
+// not because a caller exists today.
 //
 // Peepholes: NONE. The hand-written qwen3_5 decode path launches one
 // kernel per trace op (family.rs's table is launch-for-launch); the only
@@ -89,6 +100,11 @@ void qwen3_5_forward_declared(
     const std::int32_t* slot_ids_d,
     const std::uint8_t* is_fresh_d,
     const std::int32_t* logit_row_indices_d,
-    int num_logit_rows);
+    int num_logit_rows,
+    // Recurrent-only commit-advance (spec-decode repair): non-null device
+    // [R] confirmed-prefix lengths — the hand-written `commit_len`
+    // threading (`in.commit_advance_gather_d`; the rs_buffer_fold flavor
+    // stays gate-excluded, so this is always the verify-stash replay).
+    const std::int32_t* commit_lens);
 
 }  // namespace pie_cuda_driver::model

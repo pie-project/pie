@@ -88,19 +88,17 @@ void Qwen35Model::body(Workspace& ws,
             fallback_reason = "lora fire";
         } else if (in.custom_mask_d != nullptr) {
             fallback_reason = "custom mask";
-        } else if (in.commit_advance_gather_d != nullptr) {
-            // Spec-decode commit-advance re-runs only the linear-attn
-            // blocks from the stash — a fire shape, not the base pass.
-            fallback_reason = "commit-advance fire";
         } else if (in.rs_buffer_write || in.rs_buffer_fold) {
-            fallback_reason = "rs-buffer write/fold fire";
-        } else if (in.num_logit_rows < 0) {
-            fallback_reason = "state-only fire (num_logit_rows < 0)";
-        } else if (state_cache_.verify_frozen()) {
-            // Frozen verify stashes in-proj activations and suppresses
-            // state writes inside the layer bodies — spec-decode services
-            // around the pass the walk does not mirror.
-            fallback_reason = "frozen-verify fire";
+            // Excluded by DESIGN, not backlog — the Stage-2 recon verdict
+            // (stage1-notes.md, "RS-buffer solo relax: rejected"):
+            // FoldBuffered is unbatchable by WIT contract (the driver
+            // rejects a batch mixing folded and forward rows) and Buffer
+            // has zero production callers, so the per-slab host-driven
+            // memcpy loops stay a hand-written service the walk does not
+            // mirror.
+            fallback_reason =
+                "rs-buffer write/fold fire (stage-2 verdict: unbatchable "
+                "by contract / zero callers)";
         } else if (in.has_write_desc &&
                    (in.w_page_d == nullptr || in.w_off_d == nullptr)) {
             // Same guard the hand-written explicit-write validation makes.
@@ -116,11 +114,14 @@ void Qwen35Model::body(Workspace& ws,
             // cannot express (the hand-written `use_fused_qgkv` check).
             fallback_reason = "fused qgkv staging buffer unavailable";
         }
-        // (MTP draft fires need no term here: drafting and verify-commit
-        // enter through wire_system_drafter's own entry points, never
-        // body(); the fires MTP *does* route through body() are the
-        // frozen-verify / commit-advance / state-only shapes excluded
-        // above.)
+        // (MTP draft fires need no term here: drafting enters through
+        // wire_system_drafter's own entry points, never body(). The
+        // MTP-adjacent shapes that DO route through body() are declared
+        // since this arc: state-only fires (num_logit_rows < 0), frozen
+        // verify (state_cache_.verify_frozen() read inside the walk), and
+        // commit-advance fires (commit_advance_gather_d threaded below as
+        // the walk's commit_lens; its rs_buffer_fold flavor stays behind
+        // the rs-buffer term above).)
         if (fallback_reason == nullptr) {
             qwen3_5_forward_declared(
                 declared_, weights_, hf_config_, fwd_cfg_, plan_state_,
@@ -132,7 +133,8 @@ void Qwen35Model::body(Workspace& ws,
                 in.total_tokens, in.num_requests, in.is_pure_decode,
                 in.w_page_d, in.w_off_d, in.row_valid_d, in.has_write_desc,
                 in.slot_ids_h, in.is_fresh_h, in.slot_ids_d, in.is_fresh_d,
-                in.logit_row_indices_d, in.num_logit_rows);
+                in.logit_row_indices_d, in.num_logit_rows,
+                in.commit_advance_gather_d);
             return;
         }
         if (qwen35_declared_exec_trace_enabled()) {
