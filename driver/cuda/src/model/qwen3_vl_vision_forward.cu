@@ -33,7 +33,10 @@
 #include <stdexcept>
 #include <tuple>
 #include <string>
+#include <utility>
 #include <vector>
+
+#include "tls_cuda_resource.hpp"
 
 namespace pie_cuda_driver::model {
 
@@ -515,20 +518,62 @@ void scatter_qwen3vl_vision(const Qwen3VLVisionInputs& vin, bf* hidden,
     // grid — identical for every same-size image. Cache the device buffers by grid
     // so the CPU interp + bf16 convert + H2D run ONCE, not per image.
     // thread_local: buffers are device memory; a process-wide map would IMA under
-    // multi-GPU TP threads.
-    thread_local std::map<std::tuple<int,int,int>, std::pair<float*,bf*>> pe_cache;
+    // multi-GPU TP threads. PeEntry frees on map erase / thread exit.
+    struct PeEntry {
+        float* rope = nullptr;
+        bf* pe = nullptr;
+        int device = -1;
+        PeEntry() = default;
+        PeEntry(const PeEntry&) = delete;
+        PeEntry& operator=(const PeEntry&) = delete;
+        PeEntry(PeEntry&& o) noexcept
+            : rope(o.rope), pe(o.pe), device(o.device)
+        {
+            o.rope = nullptr;
+            o.pe = nullptr;
+            o.device = -1;
+        }
+        PeEntry& operator=(PeEntry&& o) noexcept
+        {
+            if (this == &o) return *this;
+            reset();
+            rope = o.rope;
+            pe = o.pe;
+            device = o.device;
+            o.rope = nullptr;
+            o.pe = nullptr;
+            o.device = -1;
+            return *this;
+        }
+        ~PeEntry() { reset(); }
+        void reset() noexcept
+        {
+            tls_cuda_free_device(rope, device);
+            tls_cuda_free_device(pe, device);
+            rope = nullptr;
+            pe = nullptr;
+            device = -1;
+        }
+    };
+    thread_local std::map<std::tuple<int,int,int>, PeEntry> pe_cache;
     auto grid_rope_pe = [&](int gt,int gh,int gw)->std::pair<float*,bf*>{
         auto key=std::make_tuple(gt,gh,gw); auto it=pe_cache.find(key);
-        if(it!=pe_cache.end()) return it->second;
+        if(it!=pe_cache.end()) return {it->second.rope, it->second.pe};
         auto c0=clk::now();
         std::vector<float> rope=vision_rope_positions(gt,gh,gw,MERGE);
         std::vector<float> pe=interp_pos_embed(table,w.num_grid_per_side,Hd,gt,gh,gw,MERGE);
         std::vector<bf> pe_bf(pe.size()); for(size_t i=0;i<pe.size();++i) pe_bf[i]=__float2bfloat16(pe[i]);
         cpu_host_ms+=MS(c0,clk::now());
-        float* rd; bf* pd;
-        QCK(cudaMalloc(&rd,(long)rope.size()*4)); QCK(cudaMemcpy(rd,rope.data(),(long)rope.size()*4,cudaMemcpyHostToDevice));
-        QCK(cudaMalloc(&pd,(long)pe_bf.size()*sizeof(bf))); QCK(cudaMemcpy(pd,pe_bf.data(),(long)pe_bf.size()*sizeof(bf),cudaMemcpyHostToDevice));
-        pe_cache[key]={rd,pd}; return {rd,pd};
+        PeEntry entry;
+        QCK(cudaMalloc(&entry.rope,(long)rope.size()*4));
+        QCK(cudaMemcpy(entry.rope,rope.data(),(long)rope.size()*4,cudaMemcpyHostToDevice));
+        QCK(cudaMalloc(&entry.pe,(long)pe_bf.size()*sizeof(bf)));
+        QCK(cudaMemcpy(entry.pe,pe_bf.data(),(long)pe_bf.size()*sizeof(bf),cudaMemcpyHostToDevice));
+        entry.device = tls_cuda_current_device();
+        auto* rp = entry.rope;
+        auto* pp = entry.pe;
+        pe_cache.emplace(key, std::move(entry));
+        return {rp, pp};
     };
 
     // Uniform batch test: all images share a grid and are page-aligned → encode

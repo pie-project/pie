@@ -14,6 +14,7 @@
 #include "attention_workspace.hpp"
 #include "ops/attention_flashinfer.hpp"
 #include "ops/gemm.hpp"
+#include "tls_cuda_resource.hpp"
 
 namespace pie_cuda_driver::model {
 
@@ -48,10 +49,21 @@ struct VisAttnRes {
     // Vision images in one batch are equal-sized, so this captures the shape.
     int sig_seqs = -1, sig_total = -1, sig_len0 = -1, sig_NH = -1, sig_HD = -1;
     std::uint32_t *qo_d = nullptr, *kvpi_d = nullptr, *kvidx_d = nullptr, *klpl_d = nullptr;
+    int device = -1;
     std::mutex mu;
+
+    ~VisAttnRes() { free_indices(); }
+
+    void free_indices() noexcept {
+        for (void* p : {(void*)qo_d, (void*)kvpi_d, (void*)kvidx_d, (void*)klpl_d}) {
+            tls_cuda_free_device(p, device);
+        }
+        qo_d = kvpi_d = kvidx_d = klpl_d = nullptr;
+    }
 };
 // Per-thread: TP ranks are separate threads on different GPUs; a process-wide
 // singleton would cudaMalloc the workspace/indices on the first rank's device.
+// Destructor frees index buffers; AttentionWorkspace is already RAII.
 VisAttnRes& vis_attn() { thread_local VisAttnRes v; return v; }
 constexpr int kVisPageSize = 16;  // image patch counts are multiples; flashinfer-friendly
 }  // namespace
@@ -69,6 +81,7 @@ void qwen3vl_vis_attn(const void* q, void* k, void* v, void* o,
     if (!st.ready) {
         st.ws = AttentionWorkspace::allocate();
         st.plan = ops::make_prefill_plan();
+        st.device = tls_cuda_current_device();
         st.ready = true;
     }
     // Build host indptr/index arrays for the multi-sequence paged layout.
@@ -86,8 +99,7 @@ void qwen3vl_vis_attn(const void* q, void* k, void* v, void* o,
     const bool changed = st.sig_seqs != num_seqs || st.sig_total != total ||
                          st.sig_len0 != len0 || st.sig_NH != NH || st.sig_HD != HEAD;
     if (changed) {
-        for (void* p : {(void*)st.qo_d, (void*)st.kvpi_d, (void*)st.kvidx_d, (void*)st.klpl_d})
-            if (p) cudaFree(p);
+        st.free_indices();
         std::vector<std::uint32_t> kvidx(total_pages);
         for (int i = 0; i < total_pages; ++i) kvidx[i] = (std::uint32_t)i;
         auto up = [&](std::uint32_t** d, const std::vector<std::uint32_t>& h) {
@@ -95,6 +107,7 @@ void qwen3vl_vis_attn(const void* q, void* k, void* v, void* o,
             cudaMemcpy(*d, h.data(), h.size() * sizeof(std::uint32_t), cudaMemcpyHostToDevice);
         };
         up(&st.qo_d, qo); up(&st.kvpi_d, kvpi); up(&st.kvidx_d, kvidx); up(&st.klpl_d, klpl);
+        if (st.device < 0) st.device = tls_cuda_current_device();
         ops::plan_attention_flashinfer_prefill_bf16(
             *st.plan, qo.data(), kvpi.data(), klpl.data(), /*total_tokens=*/total, num_seqs,
             NH, NH, HEAD, ps, st.ws, S, /*enable_cuda_graph=*/false, /*window_left=*/-1,

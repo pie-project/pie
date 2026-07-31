@@ -29,6 +29,7 @@
 #include "cuda_check.hpp"
 #include "device_buffer.hpp"
 #include "distributed.hpp"
+#include "tls_cuda_resource.hpp"
 #include "model/loaded_model.hpp"
 #include "kv_cache.hpp"
 #include "recurrent_state_cache.hpp"
@@ -1097,14 +1098,12 @@ int tensor_rows(const DeviceTensor& t) {
 
 std::int32_t* sampled_pinned_buf(std::size_t want_elems) {
     // Per-thread pinned scratch: TP ranks are separate threads in one process.
-    thread_local std::int32_t* buf = nullptr;
-    thread_local std::size_t buf_capacity = 0;
-    if (want_elems > buf_capacity) {
-        if (buf) cudaFreeHost(buf);
-        CUDA_CHECK(cudaMallocHost(&buf, want_elems * sizeof(std::int32_t)));
-        buf_capacity = want_elems;
+    // RAII frees on thread exit (raw thread_local pointers would leak).
+    thread_local TlsHostPinnedBuf<std::int32_t> scratch;
+    if (!scratch.ensure(want_elems)) {
+        throw std::runtime_error("sampled_pinned_buf: cudaMallocHost failed");
     }
-    return buf;
+    return scratch.ptr;
 }
 
 std::int32_t masked_argmax_bf16(

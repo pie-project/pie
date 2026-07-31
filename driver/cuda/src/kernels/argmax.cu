@@ -2,8 +2,12 @@
 
 #include <cstddef>
 #include <cstdlib>
+#include <stdexcept>
 
 #include <cuda_bf16.h>
+#include <cuda_runtime.h>
+
+#include "tls_cuda_resource.hpp"
 
 namespace pie_cuda_driver::kernels {
 
@@ -906,13 +910,10 @@ void launch_lm_head_gemv_argmax_int8(
     const std::size_t pairs_elems =
         static_cast<std::size_t>(num_blocks_x) * num_rows;
     // TP ranks are separate threads on different devices; process-wide
-    // static device pointers IMA across ranks.
-    thread_local std::uint64_t* s_partial_pairs = nullptr;
-    thread_local std::size_t s_pairs_cap = 0;
-    if (pairs_elems > s_pairs_cap) {
-        if (s_partial_pairs) cudaFree(s_partial_pairs);
-        cudaMalloc(&s_partial_pairs, pairs_elems * sizeof(std::uint64_t));
-        s_pairs_cap = pairs_elems;
+    // static device pointers IMA across ranks. RAII frees on thread exit.
+    thread_local pie_cuda_driver::TlsDeviceBuf<std::uint64_t> s_partial_pairs;
+    if (!s_partial_pairs.ensure(pairs_elems)) {
+        throw std::runtime_error("lm_head gemv-argmax: cudaMalloc partials failed");
     }
 
     dim3 grid(num_blocks_x, num_rows);
@@ -921,7 +922,7 @@ void launch_lm_head_gemv_argmax_int8(
         static_cast<const __nv_bfloat16*>(hidden_states),
         lm_head_weight,
         scale_inv,
-        s_partial_pairs,
+        s_partial_pairs.ptr,
         num_rows,
         hidden,
         vocab,
@@ -930,7 +931,7 @@ void launch_lm_head_gemv_argmax_int8(
     dim3 sel_block(128);
     dim3 sel_grid((num_rows + sel_block.x - 1) / sel_block.x);
     select_lm_head_argmax_pairs_kernel<<<sel_grid, sel_block, 0, stream>>>(
-        s_partial_pairs, token_ids, num_rows, num_blocks_x);
+        s_partial_pairs.ptr, token_ids, num_rows, num_blocks_x);
 }
 
 // ── BF16 variant of fused GEMV + argmax ──────────────────────────
@@ -1026,12 +1027,10 @@ void launch_lm_head_gemv_argmax_bf16(
 
     const std::size_t pairs_elems =
         static_cast<std::size_t>(num_blocks_x) * num_rows;
-    thread_local std::uint64_t* s_partial_pairs_bf16 = nullptr;
-    thread_local std::size_t s_pairs_cap_bf16 = 0;
-    if (pairs_elems > s_pairs_cap_bf16) {
-        if (s_partial_pairs_bf16) cudaFree(s_partial_pairs_bf16);
-        cudaMalloc(&s_partial_pairs_bf16, pairs_elems * sizeof(std::uint64_t));
-        s_pairs_cap_bf16 = pairs_elems;
+    thread_local pie_cuda_driver::TlsDeviceBuf<std::uint64_t> s_partial_pairs_bf16;
+    if (!s_partial_pairs_bf16.ensure(pairs_elems)) {
+        throw std::runtime_error(
+            "lm_head gemv-argmax bf16: cudaMalloc partials failed");
     }
 
     dim3 grid(num_blocks_x, num_rows);
@@ -1039,7 +1038,7 @@ void launch_lm_head_gemv_argmax_bf16(
     lm_head_gemv_argmax_bf16_kernel<<<grid, block, shmem_bytes, stream>>>(
         static_cast<const __nv_bfloat16*>(hidden_states),
         static_cast<const __nv_bfloat16*>(lm_head_weight),
-        s_partial_pairs_bf16,
+        s_partial_pairs_bf16.ptr,
         num_rows,
         hidden,
         vocab,
@@ -1048,7 +1047,7 @@ void launch_lm_head_gemv_argmax_bf16(
     dim3 sel_block(128);
     dim3 sel_grid((num_rows + sel_block.x - 1) / sel_block.x);
     select_lm_head_argmax_pairs_kernel<<<sel_grid, sel_block, 0, stream>>>(
-        s_partial_pairs_bf16, token_ids, num_rows, num_blocks_x);
+        s_partial_pairs_bf16.ptr, token_ids, num_rows, num_blocks_x);
 }
 
 void launch_argmax_fp32(

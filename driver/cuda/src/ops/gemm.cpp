@@ -20,6 +20,7 @@
 #include "kernels/dequant_fp8.hpp"
 #include "kernels/quant_bf16_to_fp8.hpp"
 #include "kernels/residual_add.hpp"
+#include "tls_cuda_resource.hpp"
 
 #ifdef PIE_CUDA_HAS_MARLIN
 #include "marlin_wrapper.hpp"
@@ -105,16 +106,37 @@ struct Bf16LtCtx {
     cublasLtHandle_t handle = nullptr;
     void* workspace = nullptr;
     std::size_t workspace_bytes = cublaslt_bf16_workspace_bytes();
+    int device = -1;
 
     static Bf16LtCtx& instance() {
         thread_local Bf16LtCtx ctx;
         return ctx;
     }
 
+    ~Bf16LtCtx() {
+        if (workspace != nullptr) {
+            tls_cuda_free_device(workspace, device);
+            workspace = nullptr;
+        }
+        if (handle != nullptr) {
+            int prev = -1;
+            if (device >= 0 && cudaGetDevice(&prev) == cudaSuccess) {
+                (void)cudaSetDevice(device);
+            }
+            (void)cublasLtDestroy(handle);
+            if (device >= 0 && prev >= 0) (void)cudaSetDevice(prev);
+            handle = nullptr;
+        }
+    }
+
     void ensure() {
-        if (!handle) check(cublasLtCreate(&handle), "cublasLtCreate");
+        if (!handle) {
+            check(cublasLtCreate(&handle), "cublasLtCreate");
+            device = tls_cuda_current_device();
+        }
         if (!workspace) {
             CUDA_CHECK(cudaMalloc(&workspace, workspace_bytes));
+            if (device < 0) device = tls_cuda_current_device();
         }
     }
 };
@@ -926,29 +948,29 @@ struct LtMatmulPref {
 #ifdef PIE_CUDA_HAS_MARLIN
 // Per-thread marlin workspace. TP ranks are separate threads that each
 // `cudaSetDevice` to a different GPU; a process-wide static would allocate
-// on the first rank's device and IMA on the others.
+// on the first rank's device and IMA on the others. RAII frees on thread exit.
 void* marlin_workspace_() {
-    thread_local void* ws = nullptr;
-    static const std::size_t ws_bytes = 16 * 1024;
-    if (!ws) {
-        if (cudaMalloc(&ws, ws_bytes) != cudaSuccess) {
+    thread_local TlsDeviceBuf<std::uint8_t> ws;
+    constexpr std::size_t ws_bytes = 16 * 1024;
+    if (ws.capacity < ws_bytes) {
+        if (!ws.ensure(ws_bytes)) {
             throw std::runtime_error("marlin: cudaMalloc workspace failed");
         }
-        cudaMemset(ws, 0, ws_bytes);
+        cudaMemset(ws.ptr, 0, ws_bytes);
     }
-    return ws;
+    return ws.ptr;
 }
 
 void* marlin_fp32_reduce_scratch_() {
-    thread_local void* ws = nullptr;
-    static const std::size_t ws_bytes = 32 * 1024 * 1024;
-    if (!ws) {
-        if (cudaMalloc(&ws, ws_bytes) != cudaSuccess) {
+    thread_local TlsDeviceBuf<std::uint8_t> ws;
+    constexpr std::size_t ws_bytes = 32 * 1024 * 1024;
+    if (ws.capacity < ws_bytes) {
+        if (!ws.ensure(ws_bytes)) {
             throw std::runtime_error(
                 "marlin: cudaMalloc fp32 reduce scratch failed");
         }
     }
-    return ws;
+    return ws.ptr;
 }
 
 // Per-thread bf16 residual scratch — used when the INT4 dispatcher is
@@ -956,17 +978,14 @@ void* marlin_fp32_reduce_scratch_() {
 // natively via cuBLAS's beta param). Marlin overwrites C, so we run it
 // into a scratch and add into y in a second pass. Grows monotonically.
 void* marlin_residual_scratch_(std::size_t bytes) {
-    thread_local void* buf = nullptr;
-    thread_local std::size_t buf_bytes = 0;
-    if (bytes <= buf_bytes) return buf;
-    if (buf) cudaFree(buf);
-    if (cudaMalloc(&buf, bytes) != cudaSuccess) {
+    thread_local TlsDeviceBuf<std::uint8_t> buf;
+    if (bytes <= buf.capacity) return buf.ptr;
+    if (!buf.ensure(bytes)) {
         throw std::runtime_error(
             "marlin: cudaMalloc residual scratch failed (" +
             std::to_string(bytes) + " bytes)");
     }
-    buf_bytes = bytes;
-    return buf;
+    return buf.ptr;
 }
 #endif
 
@@ -983,6 +1002,7 @@ struct LtCtx {
     cublasLtHandle_t handle = nullptr;
     void*            workspace = nullptr;
     std::size_t      workspace_bytes = 0;
+    int              device = -1;
     int              compute_capability_major = 0;  // 0 = unqueried
     bool             fp8_native_supported = false;
 
@@ -991,11 +1011,32 @@ struct LtCtx {
         return ctx;
     }
 
+    ~LtCtx() {
+        // GrowScratch members free themselves first (declaration order).
+        if (workspace != nullptr) {
+            tls_cuda_free_device(workspace, device);
+            workspace = nullptr;
+        }
+        if (handle != nullptr) {
+            int prev = -1;
+            if (device >= 0 && cudaGetDevice(&prev) == cudaSuccess) {
+                (void)cudaSetDevice(device);
+            }
+            (void)cublasLtDestroy(handle);
+            if (device >= 0 && prev >= 0) (void)cudaSetDevice(prev);
+            handle = nullptr;
+        }
+    }
+
     void ensure_init(std::size_t ws_bytes = kDefaultLtWorkspaceBytes) {
-        if (!handle) LT_CHECK(cublasLtCreate(&handle));
+        if (!handle) {
+            LT_CHECK(cublasLtCreate(&handle));
+            device = tls_cuda_current_device();
+        }
         if (!workspace) {
             CUDA_CHECK(cudaMalloc(&workspace, ws_bytes));
             workspace_bytes = ws_bytes;
+            if (device < 0) device = tls_cuda_current_device();
         }
         if (compute_capability_major == 0) {
             int dev = 0;
@@ -1017,12 +1058,20 @@ struct LtCtx {
 
     // Grow-on-demand device scratch. Caller passes byte size; returns
     // a pointer valid until the next `ensure(bigger_size)` on the same
-    // buffer. Cleared at process exit (LtCtx is thread_local per TP rank).
+    // buffer. Freed when the owning LtCtx (thread_local) is destroyed.
     struct GrowScratch {
         void*       p = nullptr;
         std::size_t bytes = 0;
+        int         device = -1;
         bool        sealed = false;
         const char* name = "runtime quant scratch";
+
+        ~GrowScratch() {
+            tls_cuda_free_device(p, device);
+            p = nullptr;
+            bytes = 0;
+            device = -1;
+        }
 
         void reserve(std::size_t want) {
             if (want <= bytes) return;
@@ -1034,9 +1083,15 @@ struct LtCtx {
                     std::to_string(bytes) +
                     " bytes. Increase the planner reserve or disable CUDA graphs.");
             }
-            if (p) CUDA_CHECK(cudaFree(p));
+            if (p) {
+                tls_cuda_free_device(p, device);
+                p = nullptr;
+                bytes = 0;
+                device = -1;
+            }
             CUDA_CHECK(cudaMalloc(&p, want));
             bytes = want;
+            device = tls_cuda_current_device();
         }
 
         void* ensure(std::size_t want) {
