@@ -81,8 +81,18 @@ inline void dsv4_block_scales_to_fp32(ContractBuilder& b) {
             b.contract().transmute(b.contract().src(std::string(raw.name)), shape,
                                  pie_loader::raw(PieLoaderDType::E8M0)),
             shape, b.shard_axis(raw.name));
-        auto defined = b.define(b.output_name(raw.name), expr,
-                                pie_loader::raw(PieLoaderDType::F32), std::move(local));
+        // The exponents become the fp32 factors the FP8 GEMM reads, and the
+        // widening is spelled. The transmute above only says how to *read* the
+        // stored bytes -- one E8M0 exponent per byte -- so declaring F32 over
+        // it would be a relabel of a 1-byte element as a 4-byte one. This is
+        // the same fact `F32Factors` states below, and the two have to agree:
+        // a contract that declares an encoding its expression does not produce
+        // is rejected, which is how this was found the first time a real
+        // DeepSeek-V4 checkpoint was compiled.
+        const PieLoaderEncodingSpec factors = pie_loader::raw(PieLoaderDType::F32);
+        auto defined = b.define(b.output_name(raw.name),
+                                b.contract().cast(expr, factors), factors,
+                                std::move(local));
         // The pairing this loop just established, stated rather than dropped.
         // The loader used to rediscover it by appending `_scale_inv` and then
         // `.scale` to every F8E4M3 tensor's name, with `group_size` hardcoded to

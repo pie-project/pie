@@ -254,6 +254,22 @@ struct TypedTensor {
     std::string dtype;
 };
 
+/// Flush and close, and say so when the bytes did not land.
+///
+/// These fixtures are written to `$TMPDIR`, which on a shared box is a tmpfs
+/// several users are competing for. A stream that runs out of room drops its
+/// whole buffer silently, leaving a zero-byte file, and the test then fails
+/// several frames later reading a header that was never written. Naming the
+/// real cause here is the difference between a two-minute diagnosis and an
+/// afternoon spent suspecting the contract.
+void close_or_throw(std::ofstream& out, const std::filesystem::path& path) {
+    out.close();
+    if (!out) {
+        throw std::runtime_error("could not write the fixture " + path.string() +
+                                 " (is the filesystem holding $TMPDIR full?)");
+    }
+}
+
 /// Write a safetensors file whose tensors do *not* all share a dtype.
 ///
 /// A packed-MXFP4 checkpoint is the case that needs this: the weight is `I8`
@@ -284,6 +300,7 @@ std::filesystem::path write_typed_checkpoint(const std::string& tag,
     out.write(text.data(), static_cast<std::streamsize>(text.size()));
     const std::vector<char> zeros(static_cast<std::size_t>(offset), 0);
     out.write(zeros.data(), static_cast<std::streamsize>(zeros.size()));
+    close_or_throw(out, dir / "model.safetensors");
     return dir;
 }
 
@@ -319,6 +336,7 @@ std::filesystem::path write_synthetic_checkpoint(
     out.write(text.data(), static_cast<std::streamsize>(text.size()));
     const std::vector<char> zeros(static_cast<std::size_t>(offset), 0);
     out.write(zeros.data(), static_cast<std::streamsize>(zeros.size()));
+    close_or_throw(out, dir / "model.safetensors");
     return dir;
 }
 
