@@ -678,6 +678,7 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
     bool run_graph = graph_eligible;
     std::uint64_t hook_fingerprint = 0;
     HookGraphKeyState* hook_state = nullptr;
+    HookGraphKeyState::Entry* hook_entry = nullptr;
     ForwardGraphKey key{};
     if (graph_eligible) {
         const std::uint32_t graph_layout =
@@ -699,7 +700,12 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
                 run_graph = false;
             } else {
                 hook_state = &engine.hook_graph_states[key];
-                if (hook_state->banned) {
+                // Exec storage is partitioned by the fire's program-set hash:
+                // snapkv and h2o at one (R, N, variant) prepare different
+                // baked state, and a single slot would ping-pong recaptures.
+                hook_entry = hook_state->find(in.hook_program_set_hash);
+                if (hook_state->banned ||
+                    (hook_entry != nullptr && hook_entry->banned)) {
                     run_graph = false;
                 } else {
                     hook_fingerprint = in.stage_hooks->prepare_replay(
@@ -740,10 +746,15 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
         }
     }
     if (run_graph) {
-        cudaGraphExec_t exec = engine.graph_cache->get(key);
+        // Hook execs live in the per-program-set entries of
+        // `hook_graph_states`, NOT in the shared shape-keyed cache — two hook
+        // programs at one (R, N, variant) capture different graphs.
+        cudaGraphExec_t exec = has_hooks
+            ? (hook_entry != nullptr ? hook_entry->exec : nullptr)
+            : engine.graph_cache->get(key);
         const bool stale =
             has_hooks && exec != nullptr &&
-            hook_state->fingerprint != hook_fingerprint;
+            hook_entry->fingerprint != hook_fingerprint;
         if (exec == nullptr || stale) {
             if (step_profile_enabled()) {
                 std::fprintf(stderr,
@@ -754,20 +765,23 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
             }
             if (stale) {
                 ++g_hook_graph_counters.recaptures;
-                ++hook_state->mismatches;
-                if (hook_state->mismatches >
+                ++hook_entry->mismatches;
+                if (hook_entry->mismatches >
                     HookGraphKeyState::kMaxMismatches) {
                     // This fire still captures+launches correctly; future
-                    // fires of the key stop paying ~10 ms per capture.
-                    hook_state->banned = true;
+                    // fires of this program set stop paying ~10 ms per
+                    // capture. Other program sets on the key keep replaying.
+                    hook_entry->banned = true;
                     ++g_hook_graph_counters.bans;
                     if (hook_graph_trace_enabled()) {
                         std::fprintf(
                             stderr,
-                            "[hook-graph] BAN R=%d N=%d variant=%u after "
-                            "%u fingerprint churns\n",
+                            "[hook-graph] BAN R=%d N=%d variant=%u "
+                            "ps=%016llx after %u fingerprint churns\n",
                             key.num_requests, key.num_tokens, key.variant,
-                            hook_state->mismatches);
+                            static_cast<unsigned long long>(
+                                in.hook_program_set_hash),
+                            hook_entry->mismatches);
                     }
                 }
             }
@@ -802,29 +816,64 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
                     in.stage_hooks->verify_replay_capture(
                         in.stage_hooks->context);
                 }
-                hook_state->fingerprint = hook_fingerprint;
+                if (hook_entry == nullptr) {
+                    hook_entry =
+                        hook_state->insert(in.hook_program_set_hash);
+                    if (hook_state->banned) {
+                        // Program-set churn ban (LRU thrash — more live
+                        // program sets than entry slots would recapture per
+                        // fire). This exec still launches below; future
+                        // fires of the key go eager.
+                        ++g_hook_graph_counters.bans;
+                        if (hook_graph_trace_enabled()) {
+                            std::fprintf(
+                                stderr,
+                                "[hook-graph] BAN R=%d N=%d variant=%u "
+                                "after %u program-set evictions\n",
+                                key.num_requests, key.num_tokens,
+                                key.variant, hook_state->evictions);
+                        }
+                    }
+                } else if (hook_entry->exec != nullptr) {
+                    // Stale recapture: replace this program set's exec.
+                    cudaGraphExecDestroy(hook_entry->exec);
+                }
+                hook_entry->exec = exec;
+                hook_entry->fingerprint = hook_fingerprint;
                 ++g_hook_graph_counters.captures;
                 if (hook_graph_trace_enabled()) {
                     std::fprintf(
                         stderr,
                         "[hook-graph] capture R=%d N=%d variant=%u "
-                        "fp=%016llx%s (captures=%llu)\n",
+                        "ps=%016llx fp=%016llx%s (captures=%llu)\n",
                         key.num_requests, key.num_tokens, key.variant,
+                        static_cast<unsigned long long>(
+                            in.hook_program_set_hash),
                         static_cast<unsigned long long>(hook_fingerprint),
                         stale ? " (fingerprint recapture)" : "",
                         static_cast<unsigned long long>(
                             g_hook_graph_counters.captures));
                 }
+            } else {
+                engine.graph_cache->put(key, exec);
             }
-            engine.graph_cache->put(key, exec);
         } else if (has_hooks) {
+            // A clean replay proves the entry's baked state is stable again,
+            // so the churn ban only counts CONSECUTIVE stale fires. Without
+            // the reset, the legitimate one-recapture-per-new-instance
+            // cadence (instance churn re-bakes sideband addresses) would
+            // accumulate to a ban after ~kMaxMismatches requests, forcing
+            // eager forever on a healthy key.
+            hook_entry->mismatches = 0;
             ++g_hook_graph_counters.replays;
             if (hook_graph_trace_enabled()) {
                 std::fprintf(
                     stderr,
-                    "[hook-graph] replay R=%d N=%d variant=%u "
+                    "[hook-graph] replay R=%d N=%d variant=%u ps=%016llx "
                     "(replays=%llu)\n",
                     key.num_requests, key.num_tokens, key.variant,
+                    static_cast<unsigned long long>(
+                        in.hook_program_set_hash),
                     static_cast<unsigned long long>(
                         g_hook_graph_counters.replays));
             }

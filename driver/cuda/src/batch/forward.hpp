@@ -426,11 +426,17 @@ struct BatchEngine {
     // Null only for a context that never composed one.
     model::HookSidebandArena* sideband_arena = nullptr;
 
-    // Hook-graph capture bookkeeping (stage 6 increment 4): the baked-state
-    // fingerprint each hook-variant cache entry was captured against, plus
-    // the churn counter that bans a key back to eager. Keys mirror
-    // `graph_cache`; an entry the cache evicted just leaves a stale record
-    // that the next capture overwrites.
+    // Hook-graph capture storage + bookkeeping (stage 6 increment 4). Unlike
+    // plain decode fires, hook execs do NOT live in `graph_cache`: each
+    // (R, N, variant) key here holds a small per-program-set MRU of captured
+    // execs (see `HookGraphKeyState`), because two hook programs sharing one
+    // shape key prepare different baked state and would otherwise alternate
+    // fingerprint-mismatch recaptures until the churn ban. Each entry carries
+    // the baked-state fingerprint it was captured against plus the churn
+    // counter that bans it back to eager. Key population is bounded by the
+    // decode request lattice × hook variants (the same shape population the
+    // plain cache sees), and entries per key are capped, so exec memory stays
+    // bounded under adversarial program churn.
     std::unordered_map<ForwardGraphKey, HookGraphKeyState,
                        ForwardGraphKeyHash> hook_graph_states;
 };
@@ -618,6 +624,11 @@ struct ForwardDispatchInputs {
     int                  num_clips = 0;
     PrecomputedEmbeddingInputs precomputed_embeddings;
     const model::StageHooks* stage_hooks = nullptr;
+    // Order-independent identity of the fire's program set
+    // (`hook_program_set_hash` over the launch's ptir_program_hashes).
+    // Partitions the per-key hook exec storage in `hook_graph_states`;
+    // meaningful only when `stage_hooks` is non-null.
+    std::uint64_t hook_program_set_hash = 0;
     // See `ForwardInputs::lora` — threaded verbatim to the body.
     const model::LoraTable* lora = nullptr;
 };

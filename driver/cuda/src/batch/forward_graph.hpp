@@ -93,20 +93,114 @@ static_assert(forward_graph_request_bucket(257, 512) == 272);
 static_assert(forward_graph_request_bucket(506, 512) == 512);
 static_assert(forward_graph_request_bucket(129, 130) == 130);
 
+// Order-independent identity of the hook programs a fire carries: a
+// commutative combine (sum of splitmix64 mixes) over the launch's
+// `ptir_program_hashes`, plus the lane count. Two fires whose lanes carry the
+// same program multiset — in any order — share it; snapkv and h2o at the same
+// (R, N, variant) do not. Used to partition the per-key hook exec storage
+// below so distinct program sets stop invalidating each other's captures.
+// This is a cache-PARTITIONING hash only; the baked-state fingerprint each
+// entry carries remains the correctness gate.
+constexpr std::uint64_t hook_program_set_hash(
+    const std::uint64_t* hashes, std::size_t count) noexcept {
+    auto mix = [](std::uint64_t x) constexpr {
+        x += 0x9e3779b97f4a7c15ull;
+        x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull;
+        x = (x ^ (x >> 27)) * 0x94d049bb133111ebull;
+        return x ^ (x >> 31);
+    };
+    std::uint64_t h = mix(static_cast<std::uint64_t>(count));
+    for (std::size_t i = 0; i < count; ++i) h += mix(hashes[i]);
+    return h;
+}
+
 // Per-key bookkeeping for HOOK-carrying captures (stage 6 increment 4). A
 // hook graph bakes addresses the plain body does not — stable per-occurrence
 // stage buffers, sideband-arena blocks, channel-ring arrays, the host CSR a
 // captured upload re-reads — so each cached exec carries the fingerprint of
 // what it baked. The prepare pass recomputes the fingerprint before every
 // launch; a mismatch (arena growth, stable-buffer growth, instance churn,
-// data-sized grid drift) invalidates the exec and recaptures. A key whose
-// fingerprint keeps churning is banned back to the eager body: recapturing
-// every fire costs more than it saves (~10 ms per capture).
+// data-sized grid drift) invalidates the exec and recaptures. An entry whose
+// fingerprint churns on CONSECUTIVE fires — recapturing every fire costs more
+// than it saves (~10 ms per capture) — is banned back to the eager body; a
+// clean replay resets the churn count, so the legitimate one-recapture-per-
+// new-instance cadence never accumulates into a ban.
+//
+// Storage is partitioned by `hook_program_set_hash`: two hook programs at one
+// (R, N, variant) — snapkv and h2o alternating at R=1 was the live case —
+// prepare DIFFERENT baked state, so a single exec slot per key ping-pongs
+// fingerprint-mismatch recaptures until the churn ban forces both eager.
+// Each program set gets its own entry (exec + fingerprint + churn counter),
+// held MRU-first and capped at `kMaxProgramSets` per key; eviction destroys
+// the exec, and a key whose program sets churn past `kMaxEvictions` is banned
+// outright — adversarial program churn can neither grow memory nor buy a
+// capture per fire. Unlike the plain lattice, hook execs live HERE, not in
+// `ForwardGraphCache` (the plain-fire cache key must not fragment on program
+// identity).
 struct HookGraphKeyState {
-    std::uint64_t fingerprint = 0;
-    std::uint32_t mismatches = 0;
-    bool banned = false;
+    struct Entry {
+        std::uint64_t program_set = 0;
+        cudaGraphExec_t exec = nullptr;
+        std::uint64_t fingerprint = 0;
+        std::uint32_t mismatches = 0;
+        bool banned = false;
+    };
     static constexpr std::uint32_t kMaxMismatches = 8;
+    static constexpr std::size_t kMaxProgramSets = 4;
+    static constexpr std::uint32_t kMaxEvictions = 16;
+
+    // MRU-first; size <= kMaxProgramSets.
+    std::vector<Entry> entries;
+    std::uint32_t evictions = 0;
+    bool banned = false;
+
+    HookGraphKeyState() = default;
+    HookGraphKeyState(const HookGraphKeyState&) = delete;
+    HookGraphKeyState& operator=(const HookGraphKeyState&) = delete;
+    HookGraphKeyState(HookGraphKeyState&& o) noexcept
+        : entries(std::move(o.entries)),
+          evictions(o.evictions),
+          banned(o.banned) {
+        o.entries.clear();
+    }
+    HookGraphKeyState& operator=(HookGraphKeyState&&) = delete;
+    ~HookGraphKeyState() noexcept {
+        for (Entry& e : entries) {
+            if (e.exec != nullptr) cudaGraphExecDestroy(e.exec);
+        }
+    }
+
+    // Entry for `program_set`, moved to MRU position; nullptr if absent.
+    Entry* find(std::uint64_t program_set) noexcept {
+        for (std::size_t i = 0; i < entries.size(); ++i) {
+            if (entries[i].program_set == program_set) {
+                if (i != 0) {
+                    Entry hit = entries[i];
+                    entries.erase(entries.begin() +
+                                  static_cast<std::ptrdiff_t>(i));
+                    entries.insert(entries.begin(), hit);
+                }
+                return &entries.front();
+            }
+        }
+        return nullptr;
+    }
+
+    // Fresh MRU entry for `program_set` (caller checked find() == nullptr).
+    // Evicts the LRU entry (destroying its exec) at capacity; sets `banned`
+    // when evictions churn past the cap. Returns the inserted entry — valid
+    // even on the banning insert, so the current fire still launches what it
+    // captured (matching the mismatch ban's "this fire is fine" semantics).
+    Entry* insert(std::uint64_t program_set) {
+        if (entries.size() >= kMaxProgramSets) {
+            Entry& victim = entries.back();
+            if (victim.exec != nullptr) cudaGraphExecDestroy(victim.exec);
+            entries.pop_back();
+            if (++evictions > kMaxEvictions) banned = true;
+        }
+        entries.insert(entries.begin(), Entry{program_set});
+        return &entries.front();
+    }
 };
 
 struct ForwardGraphKeyHash {

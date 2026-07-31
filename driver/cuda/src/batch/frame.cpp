@@ -2449,6 +2449,15 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
             .precomputed_embeddings = s.precomputed_embeddings,
             .stage_hooks =
                 s.has_attention_stages ? &stage_hooks : nullptr,
+            // Partitions hook exec storage by the fire's program multiset
+            // (order-independent): distinct hook programs sharing one
+            // (R, N, variant) prepare different baked state and must not
+            // invalidate each other's captures.
+            .hook_program_set_hash = s.has_attention_stages
+                ? hook_program_set_hash(
+                      s.dispatch_view.ptir_program_hashes.data(),
+                      s.dispatch_view.ptir_program_hashes.size())
+                : 0,
             .lora = lora_table.usable() ? &lora_table : nullptr,
         });
     dump_rs("POST");
