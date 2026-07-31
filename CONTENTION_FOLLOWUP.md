@@ -6884,6 +6884,15 @@ tokens, with 122 lanes contributing nothing.
 
 ### The lockstep is pie's, not the workload's
 
+> **⚠ RETRACTED by §20.45.** This subsection's experiment never ran. Both
+> harnesses gated `request_max_tokens` on `--mixed-phase`, and shape `Xs`
+> does not set it, so `--output-spread` was silently dropped by *both*
+> engines: the "X spread 0.5" row below is a second run of plain X, and its
+> byte-identical schedule is the expected result of running the same
+> workload twice, not evidence about destaggering. The hypothesis is
+> **untested**, not killed. Everything downstream that leans on it —
+> including "heterogeneity in output *length* buys nothing" — is withdrawn.
+
 X gives every request the same prompt and exactly 128 output tokens, so the
 obvious reading is that the workload synchronises the fleet and pie merely
 inherits it. That reading is wrong.
@@ -6927,8 +6936,9 @@ by 3.4%.
 
 Levers that are closed, with the measurement that closed them: raising the
 forward token budget (pie's is already 2x vLLM's, and prefill already runs at
-~80% of peak FLOPs), workload destaggering (`--output-spread`, byte-identical
-schedule), decode kernel work (D wins at 550-token context), and host
+~80% of peak FLOPs), ~~workload destaggering~~ (retracted by §20.45 — the
+flag never reached either engine), decode kernel work (D wins at 550-token
+context), and host
 scheduling (92.5% GPU busy, and busy alone exceeds vLLM's wall).
 
 ---
@@ -7082,8 +7092,9 @@ another's decode. Even M crosses over at c512.
 P is the control that proves the axis is program phase and not prompt
 heterogeneity: P is also `--mixed-phase`, but its `--max-tokens 16` equals its
 `--mixed-short-output 16`, so both halves run the *same* program (one prefill,
-sixteen decodes) and differ only in prompt length. That buys nothing, exactly
-as X's `--output-spread` bought nothing.
+sixteen decodes) and differ only in prompt length. That buys nothing. (The
+comparison to X's `--output-spread` that stood here is withdrawn — §20.45
+shows that experiment never ran. P's own control is unaffected.)
 
 ### Status of the fix
 
@@ -7096,8 +7107,8 @@ design change and not a tuning knob. It is not attempted here.
 Levers that remain closed, with the measurement that closed them: forward
 token budget (pie's 4096 is 2x vLLM's 2048), prefill kernel rate (142 TFLOPS,
 78% of dense peak), decode kernel rate (63% of BW peak, and D/Ds both win),
-workload destaggering (`--output-spread`, byte-identical schedule), prefix
-caching (off on both), and host scheduling (92.9% GPU busy).
+~~workload destaggering~~ (retracted by §20.45), prefix caching (off on
+both), and host scheduling (92.9% GPU busy).
 
 ---
 
@@ -7214,9 +7225,10 @@ relaxed. What has to change is **when a guest is allowed to submit**, so that
 at any boundary the fleet holds more than one program point:
 
 1. The execution permit is held from first-fire-submit to process teardown
-   (`ProcessCtx::drop`). Between a lane's last fire settling and its teardown
-   completing it can never submit again, yet its successor cannot start. That
-   window is ~30 ms per cohort, ~1.1 s of the 1.5 s of measured turnover idle.
+   (`ProcessCtx::drop`). **This option is dead, and the ~30 ms window it
+   claimed does not exist**: the same trace puts `guest_main returned -> drop`
+   at a p50 of **0.01 ms**, so the permit is already released essentially at
+   guest-main return. Nothing is recoverable here. Corrected in §20.45.
 2. The bootstrap hands out the whole execution pool in one instant
    (`preload_free_slots(capacity)`), which is what creates the cohort that
    every later turnover inherits. Spreading only the *initial* release is
@@ -7232,3 +7244,159 @@ Everything §20.43 listed, plus: guest CPU work (0.01 ms per wave), guest
 resume (< 1 ms), run-ahead depth (a lane's queue is never the missing member
 — `deferred_pipelines=0`, `missing_pipelines=0` on every wave), and the seal's
 packing rule (it already carries 19.8% of decode rows as passengers).
+
+---
+
+## §20.45 — Two harness bugs: the destagger experiment never ran, and M was never a fair comparison
+
+§20.42 and §20.43 both rest on a workload knob that was silently discarded,
+and one of the ledger's headline shapes was handing the two engines different
+work. Neither is an engine defect. Both invalidate published cells.
+
+### Bug 1 — `--output-spread` reached neither engine
+
+`request_max_tokens` (`benches/common.py:604`) implements two independent
+things: the `--mixed-phase` long/short split and the `--output-spread`
+sawtooth. Its docstring even promises "Both engines call this, so they see
+identical budgets". Both call sites then gated it on the wrong predicate:
+
+```python
+# benches/pie_bench.py:621          # benches/vllm_bench.py:217,380
+if max_tokens is None and getattr(args, "mixed_phase", False):
+    max_tokens = request_max_tokens(args, i)
+```
+
+Shape `Xs` is `X` plus `--output-spread 0.5` and deliberately does **not**
+set `--mixed-phase`, so on both engines the spread was dropped and every
+request got a uniform `--max-tokens 128`.
+
+That fully explains §20.42's "byte-identical schedule": `Xs` *was* `X`. The
+two cells agreeing to within 0.4% (0.962 vs 0.966) is a re-measurement of the
+same workload, not a null result about destaggering. **Hypothesis #4 was never
+tested.** It is reopened, and it is the hypothesis that speaks most directly
+to the §20.44 framing — if the fleet's retirements are what synchronise the
+admission conveyor, fanning the output budgets is the cheapest possible test
+of it, and it requires no engine change at all.
+
+### Bug 2 — vLLM paired every prompt with the wrong output budget
+
+The async serving path indexed the prompt with the absolute request index and
+the sampling params with the *measured-window* index:
+
+```python
+prompts[args.warmup + i],           # absolute
+prompt_counts[args.warmup + i],     # absolute
+sampling_for(i),                    # off by args.warmup
+```
+
+The offline path (`vllm_bench.py:286`) already used `args.warmup + i`, so the
+two paths disagreed with each other. With the default `--warmup 1` the parity
+flips, and since both `make_prompts` and `request_max_tokens` key off `i % 2`,
+the pairing inverts. Enumerated over shape M:
+
+| | pie | vLLM (before) |
+| --- | --- | --- |
+| half A | long prompt, 16 output | **short** prompt, 16 output |
+| half B | short prompt, 256 output | **long** prompt, 256 output |
+
+Totals are preserved — same prompt tokens, same output tokens — so the
+ledger's same-work guard passed and the defect was invisible. But the two
+engines were serving materially different workloads: pie retired every long
+prompt after 16 tokens, while vLLM carried its long prompts through 256
+decode steps at a long context. **All four M cells (c64 1.225, c128 1.151,
+c256 1.071, c512 0.862) are withdrawn.**
+
+Shapes S, D, Ds, X are unaffected (no varying budget). **P is unaffected**:
+its `--mixed-short-output 16` equals its `--max-tokens 16`, so both halves
+have the same budget and the offset is a no-op. §20.43's P analysis stands
+in full.
+
+### The fixes
+
+`request_max_tokens` is now called unconditionally on both sides — it already
+returns `args.max_tokens` when neither knob is set, so the gate was never
+load-bearing — and vLLM's async path indexes sampling with `args.warmup + i`
+like its offline twin. `request_max_tokens_varies` replaces the open-coded
+`mixed_phase` checks that decided whether a per-request sampling object was
+needed at all. Verified by enumerating the (prompt, budget) multiset for M, P
+and Xs on both harnesses: identical after, differing before on M and Xs.
+
+### Correction to §20.44
+
+§20.44's fix option 1 — release the execution permit at the last fire rather
+than at teardown — is **dead**. It claimed a ~30 ms per-cohort window worth
+~1.1 s of the 1.5 s turnover idle. The same trace measures
+`guest_main returned -> drop` at a p50 of **0.01 ms**: the permit is already
+released essentially at guest-main return, and there is no window to reclaim.
+Option 2 (staggering the bootstrap release) is unaffected and remains the
+live candidate.
+
+### Bug 3 (the serious one) — the ledger's worst cells are pre-fix runs the harness had already invalidated
+
+Auditing every run in `/root/sweep_out` for `completed`/`failed` rather than
+`output_tok_per_s` alone:
+
+| cell | pie completed | pie failed | vLLM | quoted ratio |
+| --- | --- | --- | --- | --- |
+| X/c256 | 198, 257 / 1024 | 826, 767 | 1024 / 1024 | **0.783** |
+| X/c512 | 219, 225 / 1024 | 805, 799 | 1024 / 1024 | **0.769** |
+| M/c512 | 3070, 3064 / 3072 | 2, 8 | 3072 / 3072 | **0.862** |
+| D/c512 (n256) | 253 / 256 | 3 | 256 / 256 | — |
+| X/c512 (n256) | 215 / 256 | 41 | 256 / 256 | — |
+
+Every failure is the same error: `KV capacity: KV pool starved: 1 pages
+asked, 0 free of 8192, no host swap room to evict into`.
+
+`sweep.py` had already caught this. The ledger rows carry four warnings each:
+
+```
+X/c256  ratio=0.783
+  ! pie wall 6.6s < 15.0s (ramp-dominated)
+  ! pie FAILED 796/1024 requests — tok/s is over the survivors only
+  ! prompt_tokens differ: pie=147540 vllm=664493 (-77.8%) — not the same work
+  ! output_tokens differ: pie=29120  vllm=131072 (-77.8%) — not the same work
+```
+
+**pie was doing 22% of vLLM's work and the ratio was quoted anyway.** The
+guard fired, was written to disk, and was not read.
+
+And the rows are stale on top of being invalid. Timestamps:
+
+| artifact | when |
+| --- | --- |
+| `X_n1024_c256_r0.0_pie1.json` | 07-30 21:49 |
+| `X_n1024_c512_r0.0_pie1.json` | 07-30 21:52 |
+| `M_n3072_c512_r0.0_pie1.json` | 07-30 22:12 |
+| **`a06b4e31c` "starvation kills must free pages"** | **07-31 00:53** |
+| `P_n4608_c128_r0.0_pie1.json` | 07-31 17:05 |
+
+All three bad cells were measured **before** §20.40's starvation fix, which
+took X/c512 from 203/1024 completed to 1005/1024 and was never re-run into
+the ledger. P — the one cell in the loss column that is both post-fix and
+fully served — is the only one that was ever real.
+
+### What actually survives
+
+| cell | ratio | status |
+| --- | --- | --- |
+| D/c128 | 1.017 | valid, pie wins |
+| Ds/c128 | 1.041 | valid, pie wins |
+| X/c64 | 0.920 | valid |
+| X/c128 | 0.966 | valid |
+| P/c128 | **0.810** | valid, post-fix, fully served |
+| M/c64, c128, c256, c512 | 1.225 / 1.151 / 1.071 / 0.862 | withdrawn (bug 2) |
+| Xs/c128 | 0.962 | withdrawn (bug 1 — it is a duplicate of X) |
+| X/c256, X/c512 | 0.783 / 0.769 | withdrawn (bug 3 — pre-fix, 78% of work missing) |
+
+So §20.41 and §20.42 — both of which take "pie collapses on X at high
+concurrency" as their subject and build a wave-membership account of it —
+were explaining an artifact. Their *mechanism* work (the phase-pure wave
+structure, the seal's join gate) is independently observed on P and stands;
+their *motivation* does not.
+
+The honest statement of pie's remaining deficit is now much narrower:
+**prefill-heavy serving (P, 0.810)**, plus a residual ~1.6% of requests that
+still fail under KV pressure where vLLM fails none — because vLLM preempts by
+recompute and pie, with `--swap-pool-size 0`, has nothing to fall back on.
+That residual is a robustness defect, not a throughput one, and §20.40 named
+it as the remaining work.

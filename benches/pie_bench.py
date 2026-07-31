@@ -618,7 +618,7 @@ async def run(args: argparse.Namespace):
             }
 
         async def launch_one(i: int, *, max_tokens: int | None = None):
-            if max_tokens is None and getattr(args, "mixed_phase", False):
+            if max_tokens is None:
                 max_tokens = request_max_tokens(args, i)
             inp = {
                 **common_input(max_tokens),

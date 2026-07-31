@@ -618,6 +618,13 @@ def request_max_tokens(args: argparse.Namespace, i: int) -> int:
     return args.max_tokens
 
 
+def request_max_tokens_varies(args: argparse.Namespace) -> bool:
+    """True when `request_max_tokens` is not constant across requests."""
+    if getattr(args, "mixed_phase", False):
+        return True
+    return (getattr(args, "output_spread", 0.0) or 0.0) > 0.0
+
+
 def hash_output_tokens(token_ids: list[int]) -> str:
     """SHA-256 over emitted u32 token ids, little-endian.
 
