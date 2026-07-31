@@ -6788,3 +6788,145 @@ Decouple run-ahead depth from KV residency, so cover for the straggler stops
 being paid for in pages. That is a design change to the lane ring, not a
 constant to tune, and it is the honest end-state for this deficit — as
 guest-declared working-set budgets (§20.40) are for the death case.
+
+## §20.42 — the prefix-heavy (X) deficit: the boundary manufactures lockstep
+
+§20.41 accounted for the mixed shape at conc 512. Five of the seven cells pie
+loses are the prefix-heavy shape X, and they lose at *every* concurrency —
+including conc 64, where nothing is oversubscribed and no request fails. That
+is not an admission problem, so it needed its own account.
+
+### The shape scoreboard is not monotone in prefill fraction
+
+All at conc 128, closed loop, 8192 pages, both engines on the identical
+arrival schedule. vLLM here runs at `--gpu-mem-util 0.55`; because
+`--num-gpu-blocks-override` pins the KV pool outright, that only lowers its
+weights-and-activations ceiling, and it reproduces the recorded 0.90 figure to
+0.20% (X/c128: 5707 vs 5696). A foreign tenant holds 18 GiB throughout.
+
+| shape | context | prefill % of tokens | pie | vLLM | ratio |
+| --- | --- | --- | --- | --- | --- |
+| Ds (short decode) | ~165 | 22.3 | 23431 | 22514 | **1.041** |
+| D (long decode) | ~550 | 6.5 | 13888 | 13662 | **1.017** |
+| M (mixed phase) | 286 / 746 | 63.6 | 13159 | 11429 | **1.151** |
+| X (prefix-heavy) | ~713 | 83.5 | 5501 | 5696 | 0.966 |
+
+Two hypotheses die here. **Decode context length is not the axis**: D holds a
+~550-token context in a shape that is 93.5% decode, and pie still wins. **The
+forward token budget is not the axis either**: pie's is `N=4096` and vLLM's own
+log reads `Chunked prefill is enabled with max_num_batched_tokens=2048` — pie's
+batch budget is *twice* vLLM's. And prefill fraction alone cannot order the
+table, because M is at 63.6% and is pie's largest win.
+
+### pie's GPU-busy time on X exceeds vLLM's entire wall
+
+`PIE_FIRE_TIMING=waves`, X at conc 128, GPU occupancy reconstructed as the
+union of the waves (§20.13's tiling):
+
+| | pie X | pie M |
+| --- | --- | --- |
+| span | 25.20 s | 36.32 s |
+| GPU busy | **23.31 s (92.5%)** | 26.55 s (73.1%) |
+
+pie is *more* saturated on the shape it loses. 23.31 s of GPU busy is already
+more than vLLM's whole 22.97 s wall, so no amount of host-side scheduling can
+close this cell — the deficit is GPU work, exactly as §20.33 found for the
+decode-only shape.
+
+Splitting that work by wave kind:
+
+| pie X | waves | GPU | tokens | rate |
+| --- | --- | --- | --- | --- |
+| pure decode | 560 | **17.76 s (76.2%)** | 127252 | 7167 tok/s |
+| prefill-carrying | 177 | 5.55 s (23.8%) | 668063 | 120338 tok/s |
+
+pie's decode phase **alone** — 17.76 s — is 23% faster than vLLM's entire run.
+Per step it is 17.4 ms against vLLM's 18.39 ms intertoken p50. Neither kernel
+path is the problem: prefill runs at ~146 TFLOPS (about 80% of this L40S's
+usable bf16 peak) and decode at ~70% of its 864 GB/s.
+
+**The entire deficit is the 5.55 s of prefill that never overlaps decode.**
+vLLM does not have that line item; chunked prefill folds its prefill into the
+decode steps, which are memory-bound and have the compute to spare.
+
+### The measurement: 1.6% absorbed on X, 19.5% on M
+
+A decode row contributes exactly one token to a wave, so decode tokens that
+rode a prefill wave can be counted directly:
+
+| | decode tokens riding a prefill wave | in their own wave | absorbed |
+| --- | --- | --- | --- |
+| X | 2063 | 127252 | **1.6%** |
+| M | 81445 | 335242 | **19.5%** |
+
+That 12x is the whole result. The X timeline is
+`P1 D63 (P22 D62)x7 P22 D63` — eight phase-pure blocks, and inside a prefill
+block a wave carries 12 rows from 6 guests and 3900 of the 4096 available
+tokens, with 122 lanes contributing nothing.
+
+### Nothing is refusing to mix — nothing is offered
+
+- `LaunchGrouping::accepts` (`scheduler/worker.rs:383-436`) rejects on
+  instance, pipeline, solo, mask geometry and capacity. **Per-request token
+  count is not a criterion**, confirming §20.33: the capability is there.
+- The prefill waves leave 196 tokens and ~240 request slots free, and report
+  `deferred_pipelines=0`, `missing_pipelines=0`, `candidate_count ==
+  batch_size`. No candidate is being turned away.
+- Because wave membership is not the dispatcher's decision.
+  `post_frame_dispatch` takes `waves: &[Vec<u64>]` — the *sealed* fire ids —
+  places each into its slot and pushes everything else back onto the queue
+  (`worker.rs:3962, 4004-4019`); `candidate_count` is just `requests.len()`
+  (`:4110`). **The frame policy decides who is in a wave.** A lane that
+  finished its prefill early has nowhere to put its decode but the next
+  boundary, and the next boundary cannot start until this one drains — 22
+  waves, ~700 ms, later. It is also why pie's TTFT on this shape is 11577 ms
+  against vLLM's 9517: a request waits out its whole cohort's prefill.
+
+### The lockstep is pie's, not the workload's
+
+X gives every request the same prompt and exactly 128 output tokens, so the
+obvious reading is that the workload synchronises the fleet and pie merely
+inherits it. That reading is wrong.
+
+`--output-spread 0.5` (new, `benches/common.py`) fans the per-request output
+budget over [64, 192] on a deterministic sawtooth whose mean is exactly
+`--max-tokens`, so the total work, the ledger's token guard and both engines'
+inputs are unchanged; only the retirement pattern differs. A closed-loop
+client then retires the fleet over a 3x spread of completion times.
+
+pie's schedule does not move **at all**:
+
+| | waves | timeline | prefill rows p50 | GPU busy | ratio vs vLLM |
+| --- | --- | --- | --- | --- | --- |
+| X uniform | 737 | `P1 D63 P22 D62 ...` | 12 | 23.31 s | 0.966 |
+| X spread 0.5 | 737 | `P1 D63 P22 D62 ...` | 12 | 23.50 s | 0.962 |
+
+Byte-identical structure. **The fleet-wide boundary re-synchronises whatever
+the workload destaggers**, because every lane must advance one frame per
+boundary and a joining lane holds the seal (§20.39's join gate). Lockstep is
+manufactured on pie's side, so it cannot be dissolved from the workload side.
+
+M escapes only because its two halves run *different programs*: within one
+boundary, lane A's fire is a prefill and lane B's is a decode, so they mix
+without any lane having to leave the boundary. Heterogeneity in output
+*length* buys nothing; heterogeneity in program *phase* is what pie can use.
+
+### Where this leaves the account
+
+Both loss families now trace to the same object. §20.41: the boundary's
+wait-for-ALL seal collapses run-ahead once the straggler tail outgrows the
+KV-funded backlog. §20.42: the same boundary fixes wave membership to one
+fire per lane, so a homogeneous fleet produces phase-pure waves and prefill
+can never ride with decode. One structure, two independent costs.
+
+The fix is the same in both: wave membership has to stop being a function of
+the fleet-wide boundary. That is the lane-ring change §20.41 named, and it is
+now worth more than that section could justify on its own — on X it is 5.55 s
+of a 23.31 s budget, i.e. pie would win the shape outright rather than lose it
+by 3.4%.
+
+Levers that are closed, with the measurement that closed them: raising the
+forward token budget (pie's is already 2x vLLM's, and prefill already runs at
+~80% of peak FLOPs), workload destaggering (`--output-spread`, byte-identical
+schedule), decode kernel work (D wins at 550-token context), and host
+scheduling (92.5% GPU busy, and busy alone exceeds vLLM's wall).
