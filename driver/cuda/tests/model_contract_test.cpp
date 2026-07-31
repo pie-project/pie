@@ -51,6 +51,7 @@
 #include "model/contract.hpp"
 #include "model/csm/csm_contract.hpp"
 #include "model/deepseek_v4/deepseek_v4_contract.hpp"
+#include "model/glm5/glm5_contract.hpp"
 #include "model/mixtral/mixtral_contract.hpp"
 #include "model/kimi/kimi_contract.hpp"
 #include "model/mixtral/mixtral_contract.hpp"
@@ -670,6 +671,118 @@ void test_deepseek_v4_streams_experts_as_a_group() {
 /// two projections separately, and which path runs is a per-step decision, so
 /// the sources must survive. Sharded on axis 0, so the join's row count has to
 /// follow the rank rather than the checkpoint.
+/// GLM-5.1 ships `kv_b_proj` as FP8 with a two-dimensional block scale, and
+/// the kernels that read it want BF16.
+///
+/// This is the case that forced the scale factor's `group`/`axis` pair to be
+/// replaced by the factors' own shape. A single group size along a single axis
+/// can name a row-wise blocking and nothing else, but the kernel this driver
+/// already ships (`dequant_fp8_e4m3_blocked_kernel`) indexes
+/// `scale[row / row_block][col / col_block]` -- so the checkpoint's actual
+/// layout was one the algebra could not spell.
+///
+/// What the test pins is that the FP8 pair leaves the checkpoint and one BF16
+/// tensor arrives: `kv_b_proj.weight` is declared BF16 at this rank's row
+/// count, and the factors are declared but not bound. `bind_glm5` used to
+/// dequantize into a side buffer and keep the FP8 original resident, so both
+/// halves of that are what changed.
+void test_glm5_dequantizes_kv_b_proj() {
+    constexpr std::int64_t kHidden = 64;
+    constexpr std::int64_t kKvBRows = 128;
+    constexpr std::int64_t kKvLora = 64;
+    // A 64x32 block: deliberately not square and not the whole row, so a
+    // reader that assumes either is wrong about this fixture.
+    constexpr std::int64_t kScaleRows = 2;
+    constexpr std::int64_t kScaleCols = 2;
+
+    const std::string lp = "model.layers.0.";
+    const std::string ap = lp + "self_attn.";
+    std::vector<TypedTensor> tensors{
+        {"model.embed_tokens.weight", {16, kHidden}, "BF16"},
+        {"model.norm.weight", {kHidden}, "BF16"},
+        {"lm_head.weight", {16, kHidden}, "BF16"},
+        {lp + "input_layernorm.weight", {kHidden}, "BF16"},
+        {lp + "post_attention_layernorm.weight", {kHidden}, "BF16"},
+        {ap + "kv_b_proj.weight", {kKvBRows, kKvLora}, "F8_E4M3"},
+        {ap + "kv_b_proj.weight_scale_inv", {kScaleRows, kScaleCols}, "F32"},
+        {ap + "o_proj.weight", {kHidden, kHidden}, "BF16"},
+        {lp + "mlp.gate_proj.weight", {kHidden, kHidden}, "BF16"},
+        {lp + "mlp.up_proj.weight", {kHidden, kHidden}, "BF16"},
+        {lp + "mlp.down_proj.weight", {kHidden, kHidden}, "BF16"},
+    };
+
+    const std::filesystem::path dir = write_typed_checkpoint("glm5_kv_b_fp8", tensors);
+    std::string open_error;
+    pie_loader::Checkpoint checkpoint = pie_loader::Checkpoint::open(dir.string(), &open_error);
+    check(static_cast<bool>(checkpoint), "the synthetic checkpoint opens: " + open_error);
+    if (!checkpoint) {
+        std::filesystem::remove_all(dir);
+        return;
+    }
+
+    const pie_cuda_driver::model::ModelFacts facts{
+        .model_type = "glm5",
+        .quant_method = "",
+        .num_hidden_layers = 1,
+        .num_experts = 0,
+        .head_dim = 0,
+        .mamba_groups = 0,
+    };
+    namespace model = pie_cuda_driver::model;
+
+    for (int tp : {1, 2}) {
+        for (int rank = 0; rank < tp; ++rank) {
+            const std::string at =
+                " (tp " + std::to_string(tp) + " rank " + std::to_string(rank) + ")";
+            auto target = pie_cuda_driver::cuda_device_target();
+            target.tp_size = static_cast<std::uint32_t>(tp);
+            target.tp_rank = static_cast<std::uint32_t>(rank);
+
+            pie_loader::ModelContract contract;
+            try {
+                model::ContractBuilder builder(checkpoint, facts, target, "",
+                                               model::Mxfp4MoeRequest::Auto,
+                                               model::Component::Full,
+                                               /*stream_routed_experts=*/false, contract);
+                model::author_glm5_contract(builder);
+                builder.finish();
+            } catch (const std::exception& error) {
+                check(false, "authoring" + at + ": " + error.what());
+                continue;
+            }
+
+            const auto v = contract.view();
+            bool found = false;
+            for (std::size_t i = 0; i < v.tensors.len; ++i) {
+                const auto& t = v.tensors.ptr[i];
+                if (view_of(t.name) != ap + "kv_b_proj.weight") continue;
+                found = true;
+                const std::vector<std::int64_t> shape(t.shape.ptr, t.shape.ptr + t.shape.len);
+                check(shape == std::vector<std::int64_t>{kKvBRows / tp, kKvLora},
+                      "kv_b_proj is this rank's rows" + at);
+                check(t.encoding.dtype ==
+                          static_cast<std::uint32_t>(pie_loader::PieLoaderDType::BF16),
+                      "kv_b_proj reaches the bind dequantized" + at);
+            }
+            check(found, "kv_b_proj is published" + at);
+
+            try {
+                const pie_loader::PieLoaderContractRequest request =
+                    pie_loader::build_contract_request(checkpoint, target, v);
+                const pie_loader::LoadPlan plan = pie_loader::LoadPlan::compile(request);
+                plan.verify(request);
+                // The factors are consumed by the dequant, so binding them
+                // would pin FP32 bytes nothing reads for the process's life.
+                check(planned_internal(plan, ap + "kv_b_proj.weight_scale_inv"),
+                      "the block scales are not bound" + at);
+            } catch (const std::exception& error) {
+                check(false, "compiling" + at + ": " + error.what());
+            }
+        }
+    }
+    std::filesystem::remove_all(dir);
+}
+
 void test_qwen3_5_moe_joins_the_shared_expert() {
     constexpr std::int64_t kExperts = 4;
     constexpr std::int64_t kHidden = 64;
@@ -2389,6 +2502,7 @@ int main() {
     test_qwen3_5_mtp_int8_lm_head();
     test_gpt_oss_native_repack_is_rank_blind();
     test_qwen3_5_moe_joins_the_shared_expert();
+    test_glm5_dequantizes_kv_b_proj();
     test_qwen3_moe_streams_experts_as_a_group();
     test_gpt_oss_streams_experts_as_a_group();
     test_streamed_expert_groups_follow_the_resident_tp_layout();
