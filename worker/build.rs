@@ -36,7 +36,7 @@ fn main() {
         println!("cargo:rerun-if-changed=../driver/metal/src");
     }
     if cuda || metal {
-            println!("cargo:rerun-if-changed=../driver/abi/include");
+        println!("cargo:rerun-if-changed=../driver/abi/include");
     }
 
     if cuda {

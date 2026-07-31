@@ -260,6 +260,18 @@ inline std::uint32_t paged_max_forward_tokens(std::uint32_t vocab,
                                      kPagedMaxForwardTokensCeiling);
 }
 
+/// The row budget for the families `SimpleFamilyEngine` serves.
+///
+/// They allocate their activation pool for `max_forward_tokens` ROWS at setup,
+/// so what is advertised and what is allocated have to be the SAME number --
+/// advertise more and the driver accepts a fire it cannot hold; allocate more
+/// and an 11.8 GB checkpoint fails to create its heap over a fire nobody asked
+/// for. One function, called from both places.
+inline std::uint32_t simple_family_max_forward_tokens(std::uint32_t requested) {
+    if (requested == 0) return 1;
+    return std::min(requested, kPagedMaxForwardTokensCeiling);
+}
+
 struct SetupConfig {
     std::string checkpoint_dir;  // HF snapshot dir (config.json + safetensors)
     std::string kernels_dir;     // compiled .metal library search dir
@@ -303,6 +315,29 @@ struct SetupConfig {
         float full_partial_rotary = 0.25f;
         bool present() const { return n_layers > 0 && hidden > 0; }
     } gemma4;
+    /// GPT-OSS's shape, when `model_type` says so. Zero means "not gpt-oss",
+    /// on the same principle: a config that never mentions this family cannot
+    /// accidentally select it.
+    struct GptOssFacts {
+        int n_layers = 0;
+        int hidden = 0;
+        int vocab = 0;
+        int n_q_heads = 0;
+        int n_kv_heads = 0;
+        int head_dim = 0;
+        int sliding_window = 0;
+        int n_experts = 0;
+        int experts_per_token = 0;
+        int intermediate = 0;
+        int rope_original_max_position = 4096;
+        float eps = 1e-5f;
+        float swiglu_limit = 7.0f;
+        float rope_theta = 150000.0f;
+        float rope_factor = 32.0f;
+        float rope_beta_fast = 32.0f;
+        float rope_beta_slow = 1.0f;
+        bool present() const { return n_layers > 0 && hidden > 0; }
+    } gptoss;
     // `config.json`'s RoPE hyperparameters, read out of the nested
     // `rope_parameters` object this family uses (context.cpp). The defaults
     // below are Qwen3.5's, so a checkpoint that omits them still lands on the
@@ -615,6 +650,17 @@ class MetalExecutor {
     bool run_member_forward(const MemberForwardDesc& desc, LogitsOut& out,
                             bool batch_serialized, std::string* err,
                             const PtirCommandCallbacks* ptir = nullptr);
+    /// The paged batch path for the families `SimpleFamilyEngine` serves.
+    ///
+    /// Several requests share ONE fire: their tokens are concatenated, the CSR
+    /// says who owns which rows, and each request's history is its own page
+    /// list. Prefill rows and decode rows differ only in how many a request
+    /// contributes, so a mixed batch needs nothing further.
+    bool run_simple_batch_forward(const std::vector<MemberForwardDesc>& descs,
+                                  std::vector<LogitsOut>& outs,
+                                  std::vector<std::uint8_t>& success,
+                                  std::vector<std::string>& errors,
+                                  const std::vector<PtirCommandCallbacks>* ptir = nullptr);
     bool run_paged_batch_forward(const std::vector<MemberForwardDesc>& descs,
                                  std::vector<LogitsOut>& outs,
                                  std::vector<std::uint8_t>& success,

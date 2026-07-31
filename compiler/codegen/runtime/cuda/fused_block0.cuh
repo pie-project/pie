@@ -1102,6 +1102,27 @@ __device__ __forceinline__ void ptir_fast_argmax_intrinsic(
   const m1_u32 lane = threadIdx.x & 31u;
   const m1_u32 warp = threadIdx.x >> 5u;
   const m1_u32 warps = blockDim.x >> 5u;
+  // Mode 3: the reduction already happened. The driver interleaves the LM head
+  // GEMM with the argmax so the logits never reach HBM, and hands us the
+  // finished token ids instead of a vocab to scan. Like mode 2 this is a table
+  // of row pointers, because a lane's sampled rows are not contiguous -- each
+  // entry addresses one i32 rather than one vocabulary row. The epilogue still
+  // runs and still performs every side effect it declared; only where this one
+  // value comes from changed. `mode` is block-uniform, so the early return is
+  // too.
+  //
+  // Safe only because the driver proves every `logits` reader in the stage is
+  // one of these reductions; a stage that also reads the raw values would find
+  // token ids behind the same intrinsic slot.
+  if (mode == 3u) {
+    const m1_u64* rows = reinterpret_cast<const m1_u64*>(input);
+    for (m1_u32 row = threadIdx.x; row < input_desc.rows; row += blockDim.x) {
+      result[row] = *reinterpret_cast<const int*>(
+          rows[(m1_u64)row_offset + row]);
+    }
+    __syncthreads();
+    return;
+  }
   for (m1_u32 row = 0; row < input_desc.rows; ++row) {
     const m1_u8* row_base = m1_intrinsic_row_base(
         input, (m1_u64)row_offset + row, stride, mode);

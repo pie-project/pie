@@ -17,7 +17,7 @@
 ///
 /// # The algebra
 ///
-/// Twelve node kinds, mirroring `crate::contract::Expr` one for one. They are
+/// Fourteen node kinds, mirroring `crate::contract::Expr` one for one. They are
 /// grouped by the invariant each one preserves, because that -- not the name --
 /// is what tells you which of them to reach for:
 ///
@@ -35,6 +35,8 @@
 /// | `scale(x, factor)`               | type                 | Multiply every element                      |
 /// | `cast(x, enc)`                   | values               | The same values in another representation   |
 /// | `repack(x, spec, out)`           | values, type         | An opaque kernel-specific relayout          |
+/// | `index_src("a.{}.w")`            | --                   | A checkpoint tensor named for this instance |
+/// | `select(x, axis, stride, len)`   | bytes, values, type  | This instance's band along one axis         |
 ///
 /// The five that preserve all three move bytes and nothing else: what comes out
 /// is a rearrangement of what went in, and every one of them compiles to byte
@@ -61,6 +63,13 @@
 /// `shard` is the only node that means different things on different ranks, and
 /// it is resolved before anything downstream of it runs — which is why a
 /// contract is written once for the whole TP group rather than once per rank.
+///
+/// `index_src` and `select` are `shard`'s siblings on a second axis: they mean
+/// different things for different *instances* of a `group`, and are resolved
+/// the same way and at the same point. The two axes are independent -- one
+/// picks a tensor, the other a slice of it -- so a sharded group needs no
+/// special care from either side. Both are an error outside a group, where
+/// there is no instance for them to stand for.
 ///
 /// `transmute` and `cast` are duals and are easy to confuse, so: a transmute
 /// keeps the *bytes* and gives them a new name, a cast keeps the *values* and
@@ -180,7 +189,7 @@ public:
         /// 4-way group declares `hidden / 4`, not `hidden`. Declaring the
         /// model-wide shape reports a mismatch on every sharded weight.
         Defined& expect(std::vector<std::int64_t> shape) {
-            owner_->set_shape(index_, std::move(shape));
+            owner_->set_shape(group_, index_, std::move(shape));
             return *this;
         }
 
@@ -202,15 +211,15 @@ public:
         Defined& scaling(std::string of, PieLoaderQuantGranularity granularity,
                          std::uint32_t group_size, std::uint32_t channel_axis,
                          PieLoaderScaleForm form) {
-            owner_->set_scales(index_, std::move(of), granularity, group_size, channel_axis,
-                               form);
+            owner_->set_scales(group_, index_, std::move(of), granularity, group_size,
+                               channel_axis, form);
             return *this;
         }
 
         /// Keep this tensor out of the driver's bind table.
         ///
         /// The algebra has no `let`: using a subexpression twice, or feeding
-        /// one entry into another's `scale_per_group` factors, means giving it
+        /// one entry into another's `scale_per_block` factors, means giving it
         /// a name. Left public, such a name is also a runtime weight -- it
         /// lands in the persistent arena and stays there for the process's
         /// lifetime, because an arena view reclaims nothing when erased -- and
@@ -220,13 +229,41 @@ public:
         /// expressions, never finalized, and a temporary the memory planner
         /// may reuse.
         Defined& internal() {
-            owner_->set_internal(index_);
+            owner_->set_internal(group_, index_);
             return *this;
         }
 
     private:
         friend class ModelContract;
-        Defined(ModelContract* owner, std::size_t index) : owner_(owner), index_(index) {}
+        // The slot is named, not pointed at: a group's declarations live in a
+        // vector of their own, and a pointer into it would dangle the moment
+        // the next `define` grew it.
+        Defined(ModelContract* owner, std::size_t group, std::size_t index)
+            : owner_(owner), group_(group), index_(index) {}
+        ModelContract* owner_;
+        std::size_t group_;
+        std::size_t index_;
+    };
+
+    /// A set of interchangeable declarations, being built.
+    ///
+    /// Every `define` on this handle describes *one* instance; the loader
+    /// compiles all `arity` of them and requires them to differ only in which
+    /// bytes they read. The expressions may use `index_src` and `select`, which
+    /// stand for the instance and are an error anywhere else.
+    ///
+    /// The driver decides what a group is for. Running its plan `arity` times
+    /// into `arity` destinations makes it resident; running it on demand into a
+    /// bounded set of slots is streaming. Neither word appears in a contract.
+    class Group {
+    public:
+        Defined define(std::string name, Node expr, PieLoaderEncodingSpec encoding) {
+            return owner_->define_in(index_, std::move(name), expr, encoding);
+        }
+
+    private:
+        friend class ModelContract;
+        Group(ModelContract* owner, std::size_t index) : owner_(owner), index_(index) {}
         ModelContract* owner_;
         std::size_t index_;
     };
@@ -241,6 +278,41 @@ public:
     Node src(std::string name) {
         PieLoaderExprNode node = blank(PieLoaderExprKind::Src);
         node.name = store_name(std::move(name));
+        return push(node);
+    }
+
+    /// A tensor whose *name* carries the group instance.
+    ///
+    /// `template_name` holds exactly one `{}`, which is replaced by the index
+    /// in decimal. For checkpoints that store each instance as its own tensor:
+    /// `"model.layers.3.mlp.experts.{}.gate_proj.weight"`.
+    ///
+    /// The loader substitutes; it never parses. An author who knows the naming
+    /// scheme writes it down once, and the loader is spared a per-architecture
+    /// plugin whose job is to rediscover it.
+    Node index_src(std::string template_name) {
+        PieLoaderExprNode node = blank(PieLoaderExprKind::SrcIndexed);
+        node.name = store_name(std::move(template_name));
+        return push(node);
+    }
+
+    /// The band this instance occupies: `len` along `axis`, starting at
+    /// `index * stride`.
+    ///
+    /// For checkpoints that store every instance in one fused bank. The type is
+    /// the same whatever the index is, which is what makes the instances
+    /// interchangeable by construction rather than by inspection.
+    ///
+    /// A `slice` whose start is the only thing the index decides. Reach for it
+    /// exactly there: an axis whose extent is the arity.
+    Node select(Node src, std::uint8_t axis, std::int64_t stride, std::int64_t len) {
+        PieLoaderExprNode node = blank(PieLoaderExprKind::Select);
+        node.src = src.index_;
+        node.axis = axis;
+        // The stride rides in `start`, which is the field a `Slice` would have
+        // used; an index-parametric start *is* a stride.
+        node.start = stride;
+        node.len = len;
         return push(node);
     }
 
@@ -450,10 +522,18 @@ public:
         return push(node);
     }
 
-    /// Multiply by a tensor of factors, one per `group` elements along `axis`.
+    /// Multiply by a tensor of factors, one per block.
+    ///
+    /// **The factors' shape is what says how big a block is**, per axis: a
+    /// `[256, 512]` payload with `[2, 4]` factors is blocked 128x128, with
+    /// `[256, 4]` it is 1x128, and with `[256, 1]` it is one factor per row.
+    /// Nothing else states the blocking, so nothing else can contradict it --
+    /// this used to take a `group` and an `axis` beside `by`, which said the
+    /// same thing twice and, being one number, could only say it about one
+    /// axis at all.
     ///
     /// This is dequantization written as a declaration. Over a `src` the
-    /// planner reinterprets through `bitcast` -- the checkpoint stores packed
+    /// planner reinterprets through `transmute` -- the checkpoint stores packed
     /// codes as bytes, and the contract is what says they are a quantization
     /// scheme -- and the result is the scheme's logical type, so `define`
     /// declares the dtype the driver wants to compute in and nothing else is
@@ -465,30 +545,30 @@ public:
     /// copy of them and makes the pairing something the loader checks rather
     /// than something it guesses from a suffix.
     ///
-    /// The loader checks that the factors' shape is the payload's with `axis`
-    /// divided by `group`, so an author who names the wrong tensor, the wrong
-    /// group or the wrong axis is told which. Groups run along the last axis.
-    Node scale_per_group(Node src, Node by, std::uint32_t group, std::uint8_t axis) {
+    /// The loader checks equal rank and that every axis of the payload is a
+    /// whole number of blocks, so an author who names the wrong tensor or
+    /// shards one side and not the other is told which. Factors shaped exactly
+    /// like the payload are refused: that groups nothing, and a factor per
+    /// element is an elementwise product.
+    Node scale_per_block(Node src, Node by) {
         PieLoaderExprNode node = blank(PieLoaderExprKind::Scale);
         node.src = src.index_;
         node.scale_by = by.index_;
-        node.scale_group = group;
-        node.axis = axis;
         return push(node);
     }
 
     /// Publish `expr` under `name`, in the encoding the driver wants it in.
     Defined define(std::string name, Node expr, PieLoaderEncodingSpec encoding) {
-        const std::string& stored = names_.emplace_back(std::move(name));
-        tensors_.push_back(PieLoaderTensorContractView{
-            .name = {reinterpret_cast<const std::uint8_t*>(stored.data()), stored.size()},
-            .root = expr.index_,
-            .shape = {nullptr, 0},
-            .encoding = encoding,
-            .scales = {},
-            .visibility = PieLoaderVisibility::Public,
-        });
-        return Defined(this, tensors_.size() - 1);
+        return define_in(kNoGroup, std::move(name), expr, encoding);
+    }
+
+    /// Open a set of `arity` interchangeable declarations.
+    ///
+    /// `name` is what the driver asks for the group by; it is not a tensor
+    /// name and never reaches the checkpoint.
+    Group group(std::string name, std::uint32_t arity) {
+        groups_.push_back(GroupState{std::move(name), arity, {}});
+        return Group(this, groups_.size() - 1);
     }
 
     std::size_t size() const { return tensors_.size(); }
@@ -501,10 +581,51 @@ public:
         v.alignment = alignment_;
         v.nodes = {nodes_.empty() ? nullptr : nodes_.data(), nodes_.size()};
         v.tensors = {tensors_.empty() ? nullptr : tensors_.data(), tensors_.size()};
+        groups_view_.clear();
+        groups_view_.reserve(groups_.size());
+        for (const GroupState& group : groups_) {
+            groups_view_.push_back(PieLoaderGroupContractView{
+                .name = {reinterpret_cast<const std::uint8_t*>(group.name.data()),
+                         group.name.size()},
+                .arity = group.arity,
+                .tensors = {group.tensors.empty() ? nullptr : group.tensors.data(),
+                            group.tensors.size()},
+            });
+        }
+        v.groups = {groups_view_.empty() ? nullptr : groups_view_.data(),
+                    groups_view_.size()};
         return v;
     }
 
 private:
+    static constexpr std::size_t kNoGroup = static_cast<std::size_t>(-1);
+
+    struct GroupState {
+        std::string name;
+        std::uint32_t arity;
+        std::vector<PieLoaderTensorContractView> tensors;
+    };
+
+    /// The declarations a `Defined` refers to: the contract's, or one group's.
+    std::vector<PieLoaderTensorContractView>& slots(std::size_t group) {
+        return group == kNoGroup ? tensors_ : groups_[group].tensors;
+    }
+
+    Defined define_in(std::size_t group, std::string name, Node expr,
+                      PieLoaderEncodingSpec encoding) {
+        const std::string& stored = names_.emplace_back(std::move(name));
+        std::vector<PieLoaderTensorContractView>& into = slots(group);
+        into.push_back(PieLoaderTensorContractView{
+            .name = {reinterpret_cast<const std::uint8_t*>(stored.data()), stored.size()},
+            .root = expr.index_,
+            .shape = {nullptr, 0},
+            .encoding = encoding,
+            .scales = {},
+            .visibility = PieLoaderVisibility::Public,
+        });
+        return Defined(this, group, into.size() - 1);
+    }
+
     static PieLoaderExprNode blank(PieLoaderExprKind kind) {
         PieLoaderExprNode node{};
         node.kind = static_cast<std::uint32_t>(kind);
@@ -520,15 +641,15 @@ private:
         return Node(static_cast<std::uint32_t>(nodes_.size() - 1));
     }
 
-    void set_shape(std::size_t tensor, std::vector<std::int64_t> shape) {
-        tensors_[tensor].shape = store_shape(std::move(shape));
+    void set_shape(std::size_t group, std::size_t tensor, std::vector<std::int64_t> shape) {
+        slots(group)[tensor].shape = store_shape(std::move(shape));
     }
 
-    void set_scales(std::size_t tensor, std::string of, PieLoaderQuantGranularity granularity,
-                    std::uint32_t group_size, std::uint32_t channel_axis,
-                    PieLoaderScaleForm form) {
+    void set_scales(std::size_t group, std::size_t tensor, std::string of,
+                    PieLoaderQuantGranularity granularity, std::uint32_t group_size,
+                    std::uint32_t channel_axis, PieLoaderScaleForm form) {
         const std::string& stored = names_.emplace_back(std::move(of));
-        tensors_[tensor].scales = PieLoaderScalesView{
+        slots(group)[tensor].scales = PieLoaderScalesView{
             .of = {reinterpret_cast<const std::uint8_t*>(stored.data()), stored.size()},
             .granularity = static_cast<std::uint32_t>(granularity),
             .group_size = group_size,
@@ -537,8 +658,8 @@ private:
         };
     }
 
-    void set_internal(std::size_t tensor) {
-        tensors_[tensor].visibility = PieLoaderVisibility::Internal;
+    void set_internal(std::size_t group, std::size_t tensor) {
+        slots(group)[tensor].visibility = PieLoaderVisibility::Internal;
     }
 
     // `deque` rather than `vector` for the backing stores: the POD nodes point
@@ -560,6 +681,12 @@ private:
     std::deque<std::vector<std::uint32_t>> part_lists_;
     std::vector<PieLoaderExprNode> nodes_;
     std::vector<PieLoaderTensorContractView> tensors_;
+    // `deque`, because a `Defined` outlives the push that follows it and the
+    // group it names must not move.
+    std::deque<GroupState> groups_;
+    // Rebuilt by `view()`, which is why it is mutable: a view is a snapshot,
+    // and the builder's own storage is the group states above.
+    mutable std::vector<PieLoaderGroupContractView> groups_view_;
     std::uint32_t alignment_ = 256;
 };
 

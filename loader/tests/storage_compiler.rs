@@ -137,6 +137,7 @@ fn metal_qwen35_schema_emits_canonical_affine_u4_arena() {
                 Encoding::Raw(DType::BF16),
             ),
         ],
+        groups: Vec::new(),
     };
 
     let program = compile_load_plan(&metadata, &contract, target).unwrap();
@@ -180,6 +181,7 @@ fn buffer_join_tile_maps_carry_destination_offsets() {
                 Encoding::Raw(DType::BF16),
             ),
         ],
+        groups: Vec::new(),
     };
 
     let program = compile_load_plan(&metadata(), &contract, StorageTarget::default()).unwrap();
@@ -237,6 +239,7 @@ fn direct_copy_lowers_to_identity_extent_write() {
             vec![2, 2],
             Encoding::Raw(DType::BF16),
         )],
+        groups: Vec::new(),
     };
 
     let program = compile_load_plan(&metadata, &contract, StorageTarget::default()).unwrap();
@@ -280,6 +283,7 @@ fn packed_quant_row_select_uses_byte_exact_offsets() {
             vec![1, 8],
             Encoding::Quant(quant(QuantScheme::AwqInt4, DType::BF16)),
         )],
+        groups: Vec::new(),
     };
 
     let program =
@@ -318,6 +322,7 @@ fn an_expression_may_not_outgrow_the_tensor_it_is_declared_for() {
             vec![1, 4],
             Encoding::Quant(quant(QuantScheme::AwqInt4, DType::BF16)),
         )],
+        groups: Vec::new(),
     };
 
     let err = compile_load_plan(&quant_metadata(), &contract, StorageTarget::default())
@@ -337,6 +342,7 @@ fn target_support_rejects_cuda_decode_at_compile_time() {
             vec![4],
             Encoding::Raw(DType::BF16),
         )],
+        groups: Vec::new(),
     };
 
     let err = compile_load_plan(
@@ -376,7 +382,7 @@ fn a_quantized_tensor_is_re_encoded_through_a_decoded_intermediate() {
         group_size: 32,
         channel_axis: Some(Axis(1)),
     });
-    let mut contract = block_scaled_contract("scales", 32, 1);
+    let mut contract = block_scaled_contract("scales", "s", vec![4, 1]);
     // `w` is the decoded BF16 tensor the fixture publishes. Make it the
     // intermediate and re-encode it.
     contract.tensors[1] = contract.tensors[1].clone().internal();
@@ -450,6 +456,7 @@ fn a_quantized_tensor_may_not_be_cast_straight_to_another_scheme() {
                 vec![4, 8],
                 Encoding::Quant(quant(QuantScheme::Fp8E4M3, DType::BF16)),
             )],
+            groups: Vec::new(),
         },
         StorageTarget::default(),
     )
@@ -479,6 +486,7 @@ fn packed_quant_source_requires_exact_affine_size() {
             vec![4, 8],
             Encoding::Quant(quant(QuantScheme::GgufQ4_0, DType::BF16)),
         )],
+        groups: Vec::new(),
     };
 
     let err = compile_load_plan(&metadata, &contract, StorageTarget::default())
@@ -801,6 +809,7 @@ fn a_contract_that_declares_a_name_twice_is_rejected() {
     let contract = pie_loader::contract::ModelContract {
         alignment: 256,
         tensors: vec![one("dup"), one("dup")],
+        groups: Vec::new(),
     };
     let error = compile_load_plan(&metadata(), &contract, StorageTarget::default())
         .unwrap_err()
@@ -818,6 +827,7 @@ fn a_contract_whose_declared_shape_is_wrong_is_rejected() {
             vec![4],
             Encoding::Raw(DType::F32),
         )],
+        groups: Vec::new(),
     };
     let error = compile_load_plan(&metadata(), &contract, StorageTarget::default())
         .unwrap_err()
@@ -864,6 +874,7 @@ fn a_head_boundary_shard_is_one_contiguous_run() {
             vec![4, 2],
             Encoding::Raw(DType::F32),
         )],
+        groups: Vec::new(),
     };
     let target = StorageTarget {
         tp_rank: 1,
@@ -909,6 +920,7 @@ fn a_head_boundary_shard_rejects_an_indivisible_world() {
             vec![4, 2],
             Encoding::Raw(DType::F32),
         )],
+        groups: Vec::new(),
     };
     let target = StorageTarget {
         tp_rank: 1,
@@ -954,6 +966,7 @@ fn scale_contract(factor: f32, source: &str, dtype: DType) -> ModelContract {
             vec![2],
             Encoding::Raw(dtype),
         )],
+        groups: Vec::new(),
     }
 }
 
@@ -1007,6 +1020,7 @@ fn a_scale_over_quantized_elements_is_rejected_at_compile_time() {
             vec![4, 8],
             Encoding::Quant(quant(QuantScheme::AwqInt4, DType::BF16)),
         )],
+        groups: Vec::new(),
     };
     let error = compile_load_plan(&quant_metadata(), &contract, StorageTarget::default())
         .unwrap_err()
@@ -1024,6 +1038,7 @@ fn a_scale_whose_declared_shape_is_wrong_is_rejected() {
             vec![4],
             Encoding::Raw(DType::F32),
         )],
+        groups: Vec::new(),
     };
     let error = compile_load_plan(&metadata(), &contract, StorageTarget::default())
         .unwrap_err()
@@ -1054,6 +1069,7 @@ fn every_path_names_the_contract_its_error_came_from() {
                 vec![99],
                 Encoding::Raw(DType::F32),
             )],
+            groups: Vec::new(),
         };
         let error = compile_load_plan(&metadata(), &contract, StorageTarget::default())
             .unwrap_err()
@@ -1079,6 +1095,11 @@ fn block_scaled_metadata() -> CheckpointMetadata {
         tensors: vec![
             sized_raw(0, "w", 0, 64, &[4, 16], DType::U8),
             sized_raw(1, "s", 64, 4, &[4, 1], DType::U8),
+            // Two more factor tensors, sized so that the shapes the rejection
+            // tests need are legal renames of *something*: three exponents do
+            // not divide four rows, and 128 give one per element.
+            sized_raw(2, "s3", 68, 3, &[3, 1], DType::U8),
+            sized_raw(3, "s128", 71, 128, &[128], DType::U8),
         ],
     }
 }
@@ -1095,17 +1116,22 @@ fn mxfp4(channel_axis: u8) -> QuantSpec {
 /// `factors` names the tensor holding the exponents, and is the whole point:
 /// the payload and its factors are paired by a name the contract already
 /// checks, not by a suffix the executor appends to a name and hopes for.
-fn block_scaled_contract(factors: &str, group: u32, axis: u8) -> ModelContract {
+///
+/// `from` and `shape` are what the factors are, because **the factors' shape
+/// is the whole statement of how the payload is blocked**. There is no group
+/// size and no axis to pass: `[4, 1]` over `[4, 32]` says one factor per row,
+/// `[2, 2]` says 2x16 tiles. Every rejection below is therefore a shape.
+fn block_scaled_contract(factors: &str, from: &str, shape: Vec<i64>) -> ModelContract {
     ModelContract {
         alignment: 256,
         tensors: vec![
             TensorContract::new(
                 "scales",
-                Expr::src("s").transmute(TensorType {
-                    shape: vec![4, 1],
+                Expr::src(from).transmute(TensorType {
+                    shape: shape.clone(),
                     encoding: Encoding::Raw(DType::E8M0),
                 }),
-                vec![4, 1],
+                shape,
                 Encoding::Raw(DType::E8M0),
             ),
             TensorContract::new(
@@ -1115,11 +1141,12 @@ fn block_scaled_contract(factors: &str, group: u32, axis: u8) -> ModelContract {
                         shape: vec![4, 32],
                         encoding: Encoding::Quant(mxfp4(1)),
                     })
-                    .scale_per_group(Expr::out(factors), group, axis),
+                    .scale_per_block(Expr::out(factors)),
                 vec![4, 32],
                 Encoding::Raw(DType::BF16),
             ),
         ],
+        groups: Vec::new(),
     }
 }
 
@@ -1127,7 +1154,7 @@ fn block_scaled_contract(factors: &str, group: u32, axis: u8) -> ModelContract {
 fn a_block_scaled_dequant_is_one_scale_with_its_factors_as_an_operand() {
     let plan = compile_load_plan(
         &block_scaled_metadata(),
-        &block_scaled_contract("scales", 32, 1),
+        &block_scaled_contract("scales", "s", vec![4, 1]),
         StorageTarget::default(),
     )
     .expect("block-scaled dequant should compile");
@@ -1147,8 +1174,7 @@ fn a_block_scaled_dequant_is_one_scale_with_its_factors_as_an_operand() {
         .collect();
     assert_eq!(scales.len(), 1, "{:#?}", plan.instrs);
     let (inputs, transform) = &scales[0];
-    assert_eq!(transform.scale_group, 32);
-    assert_eq!(transform.scale_axis, 1);
+    assert_eq!(transform.scale_blocks, vec![1, 32]);
     assert_eq!(transform.from, Some(QuantScheme::Mxfp4E2M1E8M0));
     assert_eq!(
         transform.scale_factor_bits, 0,
@@ -1193,11 +1219,12 @@ fn a_sharded_block_scaled_dequant_scales_only_its_own_rank() {
                         encoding: Encoding::Quant(mxfp4(1)),
                     })
                     .shard(0)
-                    .scale_per_group(Expr::out("scales"), 32, 1),
+                    .scale_per_block(Expr::out("scales")),
                 vec![2, 32],
                 Encoding::Raw(DType::BF16),
             ),
         ],
+        groups: Vec::new(),
     };
     let target = StorageTarget {
         tp_size: 2,
@@ -1222,7 +1249,7 @@ fn a_sharded_block_scaled_dequant_scales_only_its_own_rank() {
         })
         .unwrap_or_else(|| panic!("no Scale instruction: {:#?}", plan.instrs));
     let (source, inputs, transform) = scale;
-    assert_eq!(transform.scale_group, 32);
+    assert_eq!(transform.scale_blocks, vec![1, 32]);
     assert_eq!(inputs.len(), 1, "the one operand is the factors");
     let source = source.expect("rank 1's rows are contiguous, so they stay a source read");
     assert_eq!(
@@ -1245,7 +1272,7 @@ fn a_sharded_block_scaled_dequant_scales_only_its_own_rank() {
 fn a_scale_by_a_tensor_no_contract_declares_is_rejected() {
     let error = compile_load_plan(
         &block_scaled_metadata(),
-        &block_scaled_contract("absent", 32, 1),
+        &block_scaled_contract("absent", "s", vec![4, 1]),
         StorageTarget::default(),
     )
     .unwrap_err()
@@ -1253,40 +1280,78 @@ fn a_scale_by_a_tensor_no_contract_declares_is_rejected() {
     assert!(error.contains("is declared before this one"), "{error}");
 }
 
+/// Blocks on two axes at once, which one group size could not have said.
+///
+/// `[2, 2]` factors over a `[4, 32]` payload is a 2x16 tile. Nothing in the
+/// contract names either number: both fall out of the ratio, and the plan is
+/// where they first appear as numbers -- which is what makes them checkable
+/// against the two shapes rather than trusted.
 #[test]
-fn a_scale_by_the_wrong_number_of_factors_is_rejected() {
-    let error = compile_load_plan(
+fn a_scale_blocks_every_axis_the_factors_divide() {
+    let plan = compile_load_plan(
         &block_scaled_metadata(),
-        &block_scaled_contract("scales", 16, 1),
+        &block_scaled_contract("scales", "s", vec![2, 2]),
         StorageTarget::default(),
     )
-    .unwrap_err()
-    .to_string();
-    assert!(error.contains("needs [4, 2]"), "{error}");
+    .expect("a two-dimensional blocking should compile");
+
+    let blocks: Vec<_> = plan
+        .instrs
+        .iter()
+        .filter_map(|instr| match instr {
+            StorageInstr::TileMap {
+                kind: TileMapKind::Scale,
+                transform,
+                ..
+            } => Some(transform.scale_blocks.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(blocks, vec![vec![2, 16]]);
 }
 
 #[test]
-fn a_scale_grouped_on_an_axis_that_is_not_the_last_is_rejected() {
+fn a_scale_by_factors_of_a_different_rank_is_rejected() {
     let error = compile_load_plan(
         &block_scaled_metadata(),
-        &block_scaled_contract("scales", 4, 0),
+        &block_scaled_contract("scales", "s", vec![4]),
         StorageTarget::default(),
     )
     .unwrap_err()
     .to_string();
-    assert!(error.contains("last axis"), "{error}");
+    assert!(
+        error.contains("same rank and dividing each axis"),
+        "{error}"
+    );
 }
 
 #[test]
-fn a_scale_by_an_unset_group_is_rejected() {
+fn a_scale_by_factors_that_do_not_divide_the_payload_is_rejected() {
     let error = compile_load_plan(
         &block_scaled_metadata(),
-        &block_scaled_contract("scales", 0, 1),
+        &block_scaled_contract("scales", "s3", vec![3, 1]),
         StorageTarget::default(),
     )
     .unwrap_err()
     .to_string();
-    assert!(error.contains("group size is zero"), "{error}");
+    assert!(
+        error.contains("axis 0 of [4, 32] is not a whole number of blocks"),
+        "{error}"
+    );
+}
+
+/// One factor per element groups nothing, so it is an elementwise product and
+/// not a block scale. Symmetry rule A: a node may not denote its operand.
+#[test]
+fn a_scale_by_one_factor_per_element_is_rejected() {
+    let error = compile_load_plan(
+        &block_scaled_metadata(),
+        &block_scaled_contract("scales", "s128", vec![4, 32]),
+        StorageTarget::default(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("they group nothing"), "{error}");
 }
 
 /// Scaling by an expression, rather than by a tensor some contract published,
@@ -1306,17 +1371,14 @@ fn a_scale_by_an_undeclared_expression_is_rejected() {
                     shape: vec![4, 32],
                     encoding: Encoding::Quant(mxfp4(1)),
                 })
-                .scale_per_group(
-                    Expr::src("s").transmute(TensorType {
-                        shape: vec![4, 1],
-                        encoding: Encoding::Raw(DType::E8M0),
-                    }),
-                    32,
-                    1,
-                ),
+                .scale_per_block(Expr::src("s").transmute(TensorType {
+                    shape: vec![4, 1],
+                    encoding: Encoding::Raw(DType::E8M0),
+                })),
             vec![4, 32],
             Encoding::Raw(DType::BF16),
         )],
+        groups: Vec::new(),
     };
     let error = compile_load_plan(
         &block_scaled_metadata(),
@@ -1687,6 +1749,7 @@ fn a_block_scaled_fp8_source_carries_its_scale_tensor() {
             vec![64, 64],
             Encoding::Quant(quant(QuantScheme::Mxfp4E2M1E8M0, DType::BF16)),
         )],
+        groups: Vec::new(),
     };
     let program = compile_load_plan(&metadata, &contract, target).unwrap();
     let encodes: Vec<_> = program
@@ -1732,6 +1795,7 @@ fn a_source_without_a_scale_sibling_names_none() {
             vec![64, 64],
             Encoding::Quant(quant(QuantScheme::Mxfp4E2M1E8M0, DType::BF16)),
         )],
+        groups: Vec::new(),
     };
     let program = compile_load_plan(&metadata, &contract, target).unwrap();
     for instr in &program.instrs {
@@ -1778,6 +1842,7 @@ fn a_padded_head_dim_zeroes_the_buffer_before_it_writes_the_rows() {
             vec![4, 5],
             Encoding::Raw(DType::BF16),
         )],
+        groups: Vec::new(),
     };
 
     let program = compile_load_plan(&metadata, &contract, StorageTarget::default()).unwrap();
@@ -1821,6 +1886,83 @@ fn a_padded_head_dim_zeroes_the_buffer_before_it_writes_the_rows() {
     assert_eq!(program.buffer(filled).unwrap().bytes, 40);
 }
 
+/// And the padding is actually zero when the plan runs.
+///
+/// The test above proves the *plan* says `Fill`; nothing proved that executing
+/// it produces zeros, because no golden carries a `Fill` and the goldens are
+/// what drive the host executor. So `HostExecutor::fill` was reachable code
+/// that no test had ever run. The pad is the one region of a materialized
+/// tensor whose bytes come from no source, which makes it exactly the region a
+/// missing zeroing would leave holding whatever the allocator last had.
+#[test]
+fn a_padded_head_dim_materializes_zeros_where_no_source_covers() {
+    let dir = std::env::temp_dir().join(format!("pie_fill_replay_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let snapshot = dir.join("model.safetensors");
+
+    // Four rows of four bf16 elements, every byte non-zero, so a pad that was
+    // left uninitialised cannot pass by coincidence and a pad written from the
+    // wrong offset shows up as source bytes rather than zeros.
+    let source: Vec<u8> = (0..32).map(|i| (i as u8) | 0x80).collect();
+    std::fs::write(&snapshot, &source).unwrap();
+
+    let metadata = CheckpointMetadata {
+        files: vec![CheckpointFile {
+            id: FileId(0),
+            path: "model.safetensors".to_string(),
+            size_bytes: source.len() as u64,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors: vec![RawTensor {
+            id: TensorId(0),
+            name: "q_proj.weight".to_string(),
+            file_id: FileId(0),
+            file_offset: 0,
+            span_bytes: 32,
+            shape: vec![4, 4],
+            encoding: Encoding::Raw(DType::BF16),
+        }],
+    };
+    let contract = ModelContract {
+        groups: Vec::new(),
+        alignment: 1,
+        tensors: vec![TensorContract::new(
+            "q_proj.weight",
+            Expr::concat(
+                1,
+                vec![
+                    Expr::src("q_proj.weight"),
+                    Expr::fill(0.0, TensorType::raw(vec![4, 1], DType::BF16)),
+                ],
+            ),
+            vec![4, 5],
+            Encoding::Raw(DType::BF16),
+        )],
+    };
+
+    let plan = compile_load_plan(&metadata, &contract, StorageTarget::default()).unwrap();
+    let storage = pie_loader::testkit::host_executor::execute_plan(&plan, &dir)
+        .expect("the padded plan does not execute");
+    let got = storage.tensors.get("q_proj.weight").expect("materialized");
+
+    assert_eq!(got.len(), 40, "four rows of five bf16 elements");
+    for row in 0..4 {
+        let at = row * 10;
+        assert_eq!(
+            &got[at..at + 8],
+            &source[row * 8..row * 8 + 8],
+            "row {row} did not get its source bytes"
+        );
+        assert_eq!(
+            &got[at + 8..at + 10],
+            &[0, 0],
+            "row {row}'s padded column is not zero"
+        );
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// A block scale is bytes in the file and an exponent to the GEMM.
 ///
 /// DeepSeek-V4 pairs FP8-E4M3 weights with OCP Microscaling E8M0 scales --
@@ -1859,6 +2001,7 @@ fn an_e8m0_block_scale_read_as_fp32_lowers_to_a_cast() {
             vec![8, 8],
             Encoding::Raw(DType::F32),
         )],
+        groups: Vec::new(),
     };
     let program = compile_load_plan(&metadata, &contract, target).unwrap();
     let casts = program
@@ -1920,6 +2063,7 @@ fn scales_the_loader_writes_while_encoding_mxfp4_stay_raw_e8m0() {
             vec![64, 64],
             Encoding::Quant(quant(QuantScheme::Mxfp4E2M1E8M0, DType::BF16)),
         )],
+        groups: Vec::new(),
     };
     let program = compile_load_plan(&metadata, &contract, scale_target()).unwrap();
     assert_eq!(program.attachments.len(), 1, "{:#?}", program.attachments);
@@ -1956,6 +2100,7 @@ fn scales_the_loader_writes_while_encoding_fp8_are_f32_factors() {
             vec![64, 64],
             Encoding::Quant(quant(QuantScheme::Fp8E4M3, DType::BF16)),
         )],
+        groups: Vec::new(),
     };
     let program = compile_load_plan(&metadata, &contract, scale_target()).unwrap();
     assert_eq!(program.attachments.len(), 1, "{:#?}", program.attachments);
@@ -2012,6 +2157,7 @@ fn scales_the_checkpoint_shipped_are_paired_by_the_contract() {
                 form: ScaleForm::F32Factors,
             }),
         ],
+        groups: Vec::new(),
     };
     let program = compile_load_plan(&metadata, &contract, scale_target()).unwrap();
     assert_eq!(program.attachments.len(), 1, "{:#?}", program.attachments);
@@ -2072,6 +2218,7 @@ fn scales_named_for_a_weight_the_loader_quantizes_are_a_contract_error() {
                 form: ScaleForm::F32Factors,
             }),
         ],
+        groups: Vec::new(),
     };
     let err = compile_load_plan(&metadata, &contract, scale_target())
         .unwrap_err()
@@ -2107,6 +2254,7 @@ fn scales_naming_an_undeclared_tensor_are_a_contract_error() {
                 form: ScaleForm::F32Factors,
             }),
         ],
+        groups: Vec::new(),
     };
     let error = compile_load_plan(&metadata, &contract, scale_target())
         .unwrap_err()
@@ -2158,6 +2306,7 @@ fn scales_may_name_a_tensor_declared_after_them() {
                 Encoding::Raw(DType::F8E4M3),
             ),
         ],
+        groups: Vec::new(),
     };
     let program = compile_load_plan(&metadata, &contract, scale_target()).unwrap();
     assert_eq!(program.attachments.len(), 1, "{:#?}", program.attachments);
@@ -2201,6 +2350,7 @@ fn encode_to(
             shape.to_vec(),
             Encoding::Quant(quant(scheme, DType::BF16)),
         )],
+        groups: Vec::new(),
     };
     compile_load_plan(&metadata, &contract, scale_target())
 }
@@ -2262,6 +2412,7 @@ fn re_encoding_one_quantized_scheme_as_another_is_refused() {
             vec![64, 64],
             Encoding::Quant(quant(QuantScheme::Mxfp4E2M1E8M0, DType::BF16)),
         )],
+        groups: Vec::new(),
     };
     let err = compile_load_plan(&metadata, &contract, scale_target()).unwrap_err();
     assert!(err.to_string().contains("re-encodes Fp8E4M3"), "{err}");
@@ -2294,6 +2445,7 @@ fn a_declaration_that_disagrees_with_its_expression_is_a_mistake_not_a_kernel() 
             vec![64, 64],
             Encoding::Quant(quant(QuantScheme::Fp8E4M3, DType::BF16)),
         )],
+        groups: Vec::new(),
     };
     let err = compile_load_plan(&metadata, &contract, scale_target())
         .unwrap_err()

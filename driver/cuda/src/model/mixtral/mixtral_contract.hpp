@@ -140,6 +140,99 @@ inline void gpt_oss_native_group(ContractBuilder& b, const SourceTensor& block, 
     }
 }
 
+/// The same MXFP4 experts, declared as a group instead of a bank.
+///
+/// This is the other shape a checkpoint stores experts in, and the reason
+/// `select` exists. Qwen's are one tensor per expert, so an instance is named
+/// by an `index_src` template; GPT-OSS's are one tensor per *layer* with the
+/// experts stacked along axis 0, so an instance is a band of a bank and the
+/// index decides only where the band starts. Everything else about it -- shape,
+/// dtype, destination -- is the same for every expert, which is exactly the
+/// interchangeability a group claims, and here it is true by construction
+/// rather than by inspection.
+///
+/// Weights and scales only. The biases are `E x 2I` and `E x H` of bf16, a few
+/// hundred kilobytes a layer against tens of megabytes of weights, and the
+/// bind de-interleaves the gate/up bias with a kernel -- which is host work a
+/// group plan has no node for. Streaming them would buy nothing and cost a
+/// transform the contract cannot express, so they stay resident.
+///
+/// Rank-blind, and correctly so. The packed resident path publishes these same
+/// blocks with `push_direct`, unsharded: every rank holds the whole expert and
+/// the MoE is replicated rather than split. A group that selected this rank's
+/// band would therefore not match the residency it replaces. Streaming is a
+/// residency decision, so it inherits whatever TP layout the resident path
+/// chose -- here, none. (The native path *is* sharded, and it does not reach
+/// this function.)
+///
+/// Packed only. The native path Marlin-repacks into a layout whose rows are
+/// permuted across the whole bank, so a single expert's repacked bytes are not
+/// a contiguous band of the repacked bank; that needs its own instance-wise
+/// repack spec and is a separate question from this one.
+inline void gpt_oss_streamed_expert_groups(ContractBuilder& b) {
+    const std::int64_t experts = b.facts().num_experts;
+    if (experts <= 0) return;
+    auto& c = b.contract();
+
+    for (std::uint32_t layer = 0; layer < b.facts().num_hidden_layers; ++layer) {
+        const std::string bound =
+            "model.layers." + std::to_string(layer) + ".mlp.experts.";
+        const std::string prefix = b.source_name(bound);
+
+        auto group = c.group(bound.substr(0, bound.size() - 1),
+                             static_cast<std::uint32_t>(experts));
+        bool declared = false;
+        for (const char* half : {"gate_up_proj", "down_proj"}) {
+            const SourceTensor* block = b.find(prefix + half + "_blocks");
+            const SourceTensor* scale = b.find(prefix + half + "_scales");
+            if (block == nullptr || scale == nullptr) continue;
+            if (block->shape.empty() || block->shape[0] != experts ||
+                scale->shape.empty() || scale->shape[0] != experts) {
+                fail(std::string("GPT-OSS expert group '") + half +
+                     "' is not stacked over " + std::to_string(experts) +
+                     " experts");
+            }
+            // One expert's band: `len` 1 along the expert axis, starting at
+            // `index * 1`. The leading 1 stays, because a `Select` is a slice
+            // and a slice keeps its rank -- and the bind reads a slot through
+            // a view anyway, exactly as it read the bank through one.
+            const auto band = [&](const SourceTensor& t) {
+                std::vector<std::int64_t> shape(t.shape.begin(), t.shape.end());
+                shape[0] = 1;
+                return std::pair{c.select(c.src(std::string(t.name)), 0, 1, 1),
+                                 shape};
+            };
+            const auto [block_node, block_shape] = band(*block);
+            const auto [scale_node, scale_shape] = band(*scale);
+
+            group.define(std::string(half) + ".weight", block_node,
+                         pie_loader::raw(PieLoaderDType::U8))
+                .expect(block_shape);
+            std::optional<pie_loader::ModelContract::Defined> scales =
+                group.define(std::string(half) + ".weight_scale", scale_node,
+                             pie_loader::raw(PieLoaderDType::U8))
+                    .expect(scale_shape);
+            // The same pairing the resident path states, for the same reason:
+            // the routed-dequant kernel reads the factors through
+            // `quant_meta`, and a plain tensor leaves that empty.
+            state_mxfp4_block_scales(scales, std::string(half) + ".weight");
+
+            b.consume(block->id);
+            b.consume(scale->id);
+            declared = true;
+        }
+        if (!declared) continue;
+
+        // The biases stay resident, under the names the bind already reads.
+        for (const char* half : {"gate_up_proj", "down_proj"}) {
+            if (const SourceTensor* bias = b.find(prefix + half + "_bias")) {
+                b.push_direct(*bias, bound + half + ".bias", std::nullopt);
+                b.consume(bias->id);
+            }
+        }
+    }
+}
+
 /// Declare GPT-OSS's MXFP4 expert triplets the way this device wants them.
 ///
 /// `_blocks`/`_scales`/`_bias` either pass through as three plain tensors for
@@ -150,6 +243,10 @@ inline void gpt_oss_mxfp4_groups(ContractBuilder& b) {
     const bool native = b.mxfp4_moe() == Mxfp4MoePolicy::NativeGemm;
     if (native && !b.target().native_mxfp4_moe) {
         fail("GPT-OSS native MXFP4 requested, but target does not support native MXFP4 MoE");
+    }
+    if (!native && b.stream_routed_experts()) {
+        gpt_oss_streamed_expert_groups(b);
+        return;
     }
     for (const SourceTensor& raw : b.tensors()) {
         if (!ends_with(raw.name, "_blocks")) {

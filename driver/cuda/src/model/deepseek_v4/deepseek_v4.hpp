@@ -19,6 +19,8 @@
 #include "model/weight_store.hpp"
 #include "tensor.hpp"
 
+namespace pie_cuda_driver { class GroupStreamCache; }
+
 namespace pie_cuda_driver::model {
 
 struct DsV4CompressorWeights {
@@ -105,6 +107,15 @@ struct DsV4LayerWeights {
     // than off a flag carried alongside them.
     const DeviceTensor* moe_gate_up_bf16 = nullptr;  // [E, 2*moe_I, H] BF16
     const DeviceTensor* moe_down_bf16    = nullptr;  // [E, H, moe_I] BF16
+
+    // Or a third form: not here at all, but in a slab this layer shares with
+    // every other, holding whichever experts were routed to recently. Same
+    // bf16 layout as the stacks and the same dequantize produced it -- only
+    // one expert at a time instead of E, and only when a token asks.
+    //
+    // Non-null excludes the two above, the way they exclude each other.
+    GroupStreamCache* expert_cache = nullptr;
+    std::size_t expert_group = 0;
 
     // Shared expert (block-scaled FP8)
     const DeviceTensor* shared_w1       = nullptr;  // gate

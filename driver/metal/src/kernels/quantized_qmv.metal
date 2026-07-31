@@ -292,3 +292,216 @@ template <typename T, int group_size, int bits>
 instantiate_qmv_narrow(float32, float, 64, 4)
 instantiate_qmv_narrow(float16, half, 64, 4)
 instantiate_qmv_narrow(bfloat16, bfloat, 64, 4)
+
+// ── GPT-OSS matvec: arbitrary K, optional bias, optional expert routing ──────
+//
+// Three things this family needs that `affine_qmv_fast` cannot do.
+//
+// **K is 2880.** That is 64*45 -- a whole number of quantization groups, but NOT
+// a multiple of the fast path's 512-wide reduction block, nor of the narrow
+// one's 256. Every projection in the model is K=2880, so the reduction needs a
+// bounds-checked tail: 11 full 256-blocks and 64 elements left over, which lanes
+// 8..31 must sit out rather than read past the row.
+//
+// **Every projection is biased.** `attention_bias: true`, and the experts carry
+// biases too, so the write-back has an additive epilogue.
+//
+// **Three of every layer's matvecs are ROUTED.** The MoE router picks 4 of 32
+// experts ON THE GPU, so the weight this dispatch reads is not something the
+// host can bind. The expert stack is one tensor per projection with the expert
+// on axis 0, so the base offset is `expert_id * N * row_stride` -- and every
+// stride is derivable from K and N, so routing costs one index buffer and no
+// extra constants. `tid.z` selects which of the k slots this threadgroup serves;
+// all of them read the same x and write disjoint rows of y.
+template <typename T, int group_size, int bits, bool BIASED, bool ROUTED>
+METAL_FUNC void qmv_gptoss_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const device T* bias,
+    const device int* expert_ids,
+    int in_vec_size,
+    int out_vec_size,
+    int x_slot_stride,
+    int x_row_stride,
+    int slots_per_row,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  constexpr int packs_per_thread = 1;
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int pack_factor = get_pack_factor<bits, 32>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
+  constexpr int values_per_thread = pack_factor * packs_per_thread;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int scale_step_per_thread = group_size / values_per_thread;
+
+  const device uint8_t* ws = (const device uint8_t*)w;
+  typedef float U;
+
+  thread U x_thread[values_per_thread];
+  thread U result[results_per_simdgroup] = {0};
+
+  const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+  const int in_vec_size_g = in_vec_size / group_size;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+
+  // The routed base. Every stride is N * (per-row stride), so the expert axis
+  // needs no constants of its own.
+  //
+  // `tid.x` is the token ROW. At M=1 it is always 0 and everything below is the
+  // decode path unchanged; at M>1 each row picks its OWN k experts, so the
+  // selection index is (row, slot) rather than slot -- the whole reason a
+  // batched MoE is not just a wider launch.
+  const int row = int(tid.x);
+  const int slot = ROUTED ? int(tid.z) : 0;
+  const int sel = row * slots_per_row + slot;
+  if (ROUTED) {
+    const size_t e = size_t(expert_ids[sel]);
+    ws += e * size_t(out_vec_size) * size_t(in_vec_size_w);
+    scales += e * size_t(out_vec_size) * size_t(in_vec_size_g);
+    biases += e * size_t(out_vec_size) * size_t(in_vec_size_g);
+  }
+
+  const device uint8_t* ws_row = ws + out_row * in_vec_size_w;
+  const device T* sc_row = scales + out_row * in_vec_size_g;
+  const device T* bi_row = biases + out_row * in_vec_size_g;
+  // Whether the INPUT is per-expert too. `gate` and `up` read the one shared
+  // norm output, so their stride is 0; `down` reads the SwiGLU's `[k,
+  // intermediate]` stack, so its stride is K. Reading slot 0 for every expert
+  // is not a crash -- it is four copies of the first expert's activation, which
+  // survives all the way to a plausible wrong token.
+  // `x_row_stride` is stated, not `in_vec_size`: `down` reads the SwiGLU's
+  // [rows, k, intermediate] stack, whose row is k times as wide as its slot.
+  const device T* x_row = x + row * x_row_stride + slot * x_slot_stride;
+
+  for (int k = 0; k < in_vec_size; k += block_size) {
+    const int base = k + int(simd_lid) * values_per_thread;
+    // The tail: 2880 leaves 64 elements after eleven 256-blocks, so most lanes
+    // have nothing to add. They must not read the next row's bytes.
+    if (base + values_per_thread <= in_vec_size) {
+      const device uint8_t* wl =
+          ws_row + size_t(base) * size_t(bytes_per_pack) / size_t(pack_factor);
+      U sum = load_vector<T, U, values_per_thread, bits>(x_row + base, x_thread);
+      const int g = base / group_size;
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        const device uint8_t* wr = wl + row * in_vec_size_w;
+        U s = sc_row[row * in_vec_size_g + g];
+        U b = bi_row[row * in_vec_size_g + g];
+        result[row] += qdot<U, values_per_thread, bits>(wr, x_thread, s, b, sum);
+      }
+    }
+  }
+
+  device T* y_row = y + (ROUTED ? sel : row) * out_vec_size + out_row;
+  const device T* bias_row = bias;
+  if (BIASED && ROUTED) {
+    bias_row += size_t(expert_ids[sel]) * size_t(out_vec_size);
+  }
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    U v = simd_sum(result[row]);
+    if (simd_lid == 0) {
+      if (BIASED) v += U(bias_row[out_row + row]);
+      y_row[row] = static_cast<T>(v);
+    }
+  }
+}
+
+#define gptoss_qmv_kernel(name, BIASED, ROUTED)                                \
+  template <typename T, int group_size, int bits>                              \
+  [[kernel]] void name(                                                        \
+      const device uint32_t* w   [[buffer(0)]],                                \
+      const device T* scales     [[buffer(1)]],                                \
+      const device T* biases     [[buffer(2)]],                                \
+      const device T* x          [[buffer(3)]],                                \
+      device T* y                [[buffer(4)]],                                \
+      const constant int& in_vec_size  [[buffer(5)]],                          \
+      const constant int& out_vec_size [[buffer(6)]],                          \
+      const device T* bias       [[buffer(7)]],                                \
+      const device int* expert_ids [[buffer(8)]],                              \
+      const constant int& x_slot_stride [[buffer(9)]],                         \
+      const constant int& x_row_stride  [[buffer(10)]],                        \
+      const constant int& slots_per_row [[buffer(11)]],                        \
+      uint3 tid       [[threadgroup_position_in_grid]],                        \
+      uint simd_gid   [[simdgroup_index_in_threadgroup]],                      \
+      uint simd_lid   [[thread_index_in_simdgroup]]) {                         \
+    qmv_gptoss_impl<T, group_size, bits, BIASED, ROUTED>(                      \
+        w, scales, biases, x, y, bias, expert_ids, in_vec_size, out_vec_size,  \
+        x_slot_stride, x_row_stride, slots_per_row, tid, simd_gid, simd_lid);  \
+  }
+
+gptoss_qmv_kernel(affine_qmv_tail, false, false)
+gptoss_qmv_kernel(affine_qmv_tail_bias, true, false)
+gptoss_qmv_kernel(affine_qmv_routed_bias, true, true)
+
+#define instantiate_gptoss_qmv(fn, name, itype, gs, b)                       \
+  template [[host_name(#fn "_" #name "_gs_" #gs "_b_" #b)]]                   \
+  [[kernel]] void fn<itype, gs, b>(                                           \
+      const device uint32_t*, const device itype*, const device itype*,       \
+      const device itype*, device itype*, const constant int&,                \
+      const constant int&, const device itype*, const device int*,            \
+      const constant int&, const constant int&, const constant int&,          \
+      uint3, uint, uint);
+
+instantiate_gptoss_qmv(affine_qmv_tail, bfloat16, bfloat, 64, 4)
+instantiate_gptoss_qmv(affine_qmv_tail_bias, bfloat16, bfloat, 64, 4)
+instantiate_gptoss_qmv(affine_qmv_routed_bias, bfloat16, bfloat, 64, 4)
+
+// ── 8-bit affine matvec (gpt-oss's router) ──────────────────────────────────
+//
+// `mlx_lm`'s quantization predicate leaves the router at 8 bits while
+// everything around it goes to 4 -- it is 32 x 2880, small enough that the
+// width costs nothing and sensitive enough that it matters. Rather than
+// generalise the 4-bit dot product, this is the straightforward shape: one
+// simdgroup per output row, lanes striding K.
+template <typename T, int group_size>
+[[kernel]] void affine_qmv_u8_bias(
+    const device uint32_t* w   [[buffer(0)]],
+    const device T* scales     [[buffer(1)]],
+    const device T* biases     [[buffer(2)]],
+    const device T* x          [[buffer(3)]],
+    device T* y                [[buffer(4)]],
+    const constant int& in_vec_size  [[buffer(5)]],
+    const constant int& out_vec_size [[buffer(6)]],
+    const device T* bias       [[buffer(7)]],
+    uint3 tid       [[threadgroup_position_in_grid]],
+    uint simd_lid   [[thread_index_in_simdgroup]]) {
+  const int row = int(tid.y);
+  if (row >= out_vec_size) return;
+  // `tid.z` is the token row: one router per token, and the batch's rows are
+  // independent of one another. Zero at M=1.
+  const int token = int(tid.z);
+  x += size_t(token) * size_t(in_vec_size);
+  y += size_t(token) * size_t(out_vec_size);
+  const int words = in_vec_size / 4;        // four u8 per u32
+  const int groups = in_vec_size / group_size;
+  float acc = 0;
+  for (int i = int(simd_lid); i < words; i += SIMD_SIZE) {
+    const uint32_t word = w[row * words + i];
+    for (int j = 0; j < 4; ++j) {
+      const int col = i * 4 + j;
+      const uint q = (word >> (8 * j)) & 0xff;
+      const int g = col / group_size;
+      const float s = float(scales[row * groups + g]);
+      const float b = float(biases[row * groups + g]);
+      acc += (s * float(q) + b) * float(x[col]);
+    }
+  }
+  acc = simd_sum(acc);
+  if (simd_lid == 0) {
+    y[row] = static_cast<T>(acc + float(bias[row]));
+  }
+}
+
+#define instantiate_qmv_u8(name, itype, gs)                                  \
+  template [[host_name("affine_qmv_u8_bias_" #name "_gs_" #gs)]]              \
+  [[kernel]] void affine_qmv_u8_bias<itype, gs>(                              \
+      const device uint32_t*, const device itype*, const device itype*,       \
+      const device itype*, device itype*, const constant int&,                \
+      const constant int&, const device itype*, uint3, uint);
+
+instantiate_qmv_u8(bfloat16, bfloat, 64)

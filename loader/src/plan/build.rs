@@ -64,12 +64,31 @@ pub fn build(
     contract: &ModelContract,
     target: StorageTarget,
 ) -> Result<LoadPlan> {
+    build_instance(metadata, contract, target, None)
+}
+
+/// [`build`], resolved as one instance of a group.
+///
+/// `instance` is what the group's index nodes stand for. `None` is the resident
+/// contract, where an index node is a contract error rather than a number --
+/// which is why this takes an `Option` instead of defaulting to zero.
+pub fn build_instance(
+    metadata: &CheckpointMetadata,
+    contract: &ModelContract,
+    target: StorageTarget,
+    instance: Option<u32>,
+) -> Result<LoadPlan> {
     let sources = Sources::new(metadata);
     let partition = Partition::new(target.tp_rank, target.tp_size);
+    let resolver = Resolver::new(&sources, partition);
+    let resolver = match instance {
+        Some(index) => resolver.for_instance(index),
+        None => resolver,
+    };
     let mut builder = Builder {
         sources: &sources,
         program: LoadPlan::empty(target),
-        resolver: Resolver::new(&sources, partition),
+        resolver,
         values: HashMap::new(),
         finalized: HashSet::new(),
         alignment: contract.alignment.max(1),
@@ -281,12 +300,19 @@ impl Builder<'_> {
                         },
                         Vec::new(),
                     ),
-                    ScaleFactor::PerGroup { by, group, axis } => {
+                    ScaleFactor::PerBlock { by } => {
+                        // Written down here because here is where both shapes
+                        // are known and neither executor should have to trust
+                        // that it reconstructed the same ratio the type checker
+                        // did. `infer` has already required equal rank and an
+                        // exact division on every axis.
+                        let operand = self.resolver.infer(src, &contract.name)?;
+                        let factor_ty = self.resolver.infer(by, &contract.name)?;
+                        let blocks = block_sizes(&operand.shape, &factor_ty.shape)?;
                         let factors = self.scale_factors(by, &contract.name)?;
                         (
                             TransformSpec {
-                                scale_group: *group,
-                                scale_axis: axis.0,
+                                scale_blocks: blocks,
                                 from: source_scheme(&elements),
                                 ..TransformSpec::default()
                             },
@@ -328,7 +354,13 @@ impl Builder<'_> {
             // `specialize` has already rewritten every shard into this rank's
             // slice, so this case is unreachable. It is listed with the
             // fragment it belongs to rather than made an exception.
-            | Expr::Shard { .. } => (self.affine(&expr, &decl)?, decl),
+            | Expr::Shard { .. }
+            // The two group nodes are unreachable here for the same reason and
+            // one step earlier: `specialize` resolves an instance's name and
+            // its band before typing, so by the time a group plan is lowered
+            // they are a `Src` and a `Slice`.
+            | Expr::SrcIndexed(_)
+            | Expr::Select { .. } => (self.affine(&expr, &decl)?, decl),
         };
 
         check_declared_encoding(contract, &decl)?;
@@ -1191,6 +1223,32 @@ impl Builder<'_> {
 ///
 /// `None` says the elements are already numbers and only the multiply is
 /// wanted; `Some` says they have to be unpacked first, and names how.
+/// Elements of the operand per factor, on each axis.
+///
+/// `infer_scale_per_block` has already checked equal rank and an exact
+/// division, so a failure here is a compiler fault rather than a bad contract.
+fn block_sizes(operand: &[i64], factors: &[i64]) -> Result<Vec<i64>> {
+    if operand.len() != factors.len() {
+        return Err(Error::Internal(
+            "scale factors of a different rank should have been rejected by infer".to_string(),
+        ));
+    }
+    operand
+        .iter()
+        .zip(factors)
+        .map(|(&extent, &count)| {
+            if count <= 0 || extent % count != 0 {
+                return Err(Error::Internal(
+                    "scale factors that do not block the operand should have been \
+                     rejected by infer"
+                        .to_string(),
+                ));
+            }
+            Ok(extent / count)
+        })
+        .collect()
+}
+
 fn source_scheme(encoding: &Encoding) -> Option<QuantScheme> {
     match encoding {
         Encoding::Quant(spec) => Some(spec.scheme),

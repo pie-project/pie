@@ -14,6 +14,8 @@
 
 #include "decode_consts.hpp"
 
+#include "encode.hpp"
+
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
@@ -34,7 +36,7 @@ struct RmsParams {  // rms_norm.metal:22 (buffer 3)
 
 template <class V>
 inline void bind_const(RawMetalContext& ctx, int ord, std::uint8_t idx, const V& val, int* count) {
-    SlotHandle s = ctx.heap_alloc(sizeof(V));
+    SlotHandle s = ctx.const_slot(ord, idx, sizeof(V));
     if (!s.valid()) {
         throw std::runtime_error("gemma4 consts: heap_alloc failed (budget too small)");
     }
@@ -86,11 +88,16 @@ KN qmv_kn(Kind k, const Gemma4Geometry& g, int layer) {
 }
 
 int bind_gemma4_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
-                       const Gemma4Geometry& g, int rows, bool paged) {
+                       const Gemma4Geometry& g, int rows, bool paged, int head_rows) {
     // `rows` is the token count. Only two kinds of constant depend on it: a
     // GEMM needs to be told M, and an elementwise kernel over a contiguous
     // [rows, width] buffer counts rows*width. Everything else is geometry.
     const std::uint32_t R = std::uint32_t(rows < 1 ? 1 : rows);
+    // The tail runs on the SAMPLED rows, which `RowGather` compacted. Defaulting
+    // to `rows` keeps a caller that samples every row -- the raw tests -- saying
+    // one number instead of two.
+    const std::uint32_t S =
+        head_rows < 1 ? R : std::min(R, std::uint32_t(head_rows));
     int count = 0;
     for (const Dispatch& d : dag) {
         const int ord = d.ordinal;
@@ -100,12 +107,16 @@ int bind_gemma4_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
         if (const KN kn = qmv_kn(d.kind, g, L); kn.N != 0) {
             bind_const<std::int32_t>(ctx, ord, (std::uint8_t)bind::Qmv::K, kn.K, &count);
             bind_const<std::int32_t>(ctx, ord, (std::uint8_t)bind::Qmv::N, kn.N, &count);
+            // The padded row count, matching `launch_shape_mb`: the GEMM is
+            // dispatched over whole tiles, and M is what bounds its inner loop.
+            const std::uint32_t m = std::uint32_t(
+                gemma4_qmm_rows(int(d.kind == Kind::LmHead ? S : R)));
             // The GEMM shares Qmv's ordinals 0-6 and appends M. Bound
             // unconditionally: at rows==1 the matvec simply never reads slot 7,
             // and an unbound slot on the prefill path is a row count read out of
             // uninitialized memory.
             bind_const<std::int32_t>(ctx, ord, (std::uint8_t)bind::Qmm::M,
-                                     std::int32_t(R), &count);
+                                     std::int32_t(m), &count);
             continue;
         }
 
@@ -238,8 +249,23 @@ int bind_gemma4_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                 break;
             }
             case Kind::PleGeglu: {
-                const GegluParams p{R * std::uint32_t(g.per_layer_emb_dim)};
-                bind_const<GegluParams>(ctx, ord, (std::uint8_t)bind::Geglu::Params, p, &count);
+                // At M=1 the flat kernel reads a slice at a byte offset. At M>1
+                // the slice strides by the whole table, so the pitches are
+                // stated -- and the two params structs share slot 3, which is
+                // why `paged` (the prefill's marker) picks between them.
+                if (paged) {
+                    const GegluStridedParams p{
+                        std::uint32_t(g.per_layer_emb_dim), R,
+                        std::uint32_t(g.per_layer_emb_dim),
+                        std::uint32_t(g.n_layers * g.per_layer_emb_dim),
+                        std::uint32_t(g.per_layer_emb_dim)};
+                    bind_const<GegluStridedParams>(ctx, ord, (std::uint8_t)bind::Geglu::Params, p,
+                                                   &count);
+                } else {
+                    const GegluParams p{R * std::uint32_t(g.per_layer_emb_dim)};
+                    bind_const<GegluParams>(ctx, ord, (std::uint8_t)bind::Geglu::Params, p,
+                                            &count);
+                }
                 break;
             }
             case Kind::LayerScalar: {
@@ -256,7 +282,8 @@ int bind_gemma4_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                 break;
             }
             case Kind::FinalSoftcap: {
-                const SoftcapParams p{g.final_softcap, std::uint32_t(g.vocab)};
+                // Rows scale it: the cap covers the whole [rows, vocab] block.
+                const SoftcapParams p{g.final_softcap, S * std::uint32_t(g.vocab)};
                 bind_const<SoftcapParams>(ctx, ord, (std::uint8_t)bind::Softcap::Params, p, &count);
                 break;
             }
@@ -278,6 +305,13 @@ int bind_gemma4_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                 bind_const<float>(ctx, ord, (std::uint8_t)bind::Embed::Scale,
                                   std::sqrt(float(g.per_layer_emb_dim)), &count);
                 break;
+
+            case Kind::RowGather: {
+                const RowGatherParams p{std::uint32_t(g.hidden), S};
+                bind_const<RowGatherParams>(ctx, ord, (std::uint8_t)bind::RowGather::Params, p,
+                                            &count);
+                break;
+            }
 
             default:
                 break;

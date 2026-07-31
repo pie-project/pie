@@ -1478,6 +1478,7 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
             make_graph_variant(/*small_spec=*/false,
                                /*rs_verify=*/false,
                                have_custom_mask,
+                               /*fused_argmax=*/false,
                                graph_layout);
         if (try_graphs) {
             const ForwardGraphKey key{R, N, graph_variant};
@@ -1496,7 +1497,10 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
                     pi.w_page.data(),
                     pi.w_off.data(),
                     has_write_desc,
-                    structured_window_left);
+                    structured_window_left,
+                    // The LM head is sharded across ranks and the followers
+                    // never sample, so the fused reduction has no meaning here.
+                    /*logits_argmax_chunk_tokens=*/0);
                 engine.graph_cache->put(key, exec);
             }
             CUDA_CHECK(cudaGraphLaunch(exec, /*stream=*/nullptr));

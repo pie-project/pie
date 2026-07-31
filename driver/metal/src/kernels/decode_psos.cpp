@@ -126,19 +126,16 @@ bool load_multibatch_psos(RawMetalContext& ctx,
         for (int i = 0; i < 3; ++i) {
             const int bn = 16 << i;
             const int bm = w == 0 ? pie::metal::kQmmBM : pie::metal::kQmmBMWide;
-            // Only the tiles the dispatch rule can ask for are instantiated.
-            if (bm == pie::metal::kQmmBMWide && bn == 64) {
-                out.qmm_t[w][i] = out.qmm_t[0][i];
-                out.qmm_t_residual[w][i] = out.qmm_t_residual[0][i];
-                continue;
-            }
             const std::string suffix = "_bfloat16_gs_64_b_4_bm_" + std::to_string(bm) +
                                        "_bn_" + std::to_string(bn);
             out.qmm_t[w][i] = ctx.compile_pso_from_file(
                 dir + "quantized_qmm_t.metal", "affine_qmm_t" + suffix);
             out.qmm_t_residual[w][i] = ctx.compile_pso_from_file(
                 dir + "quantized_qmm_t.metal", "affine_qmm_t_residual" + suffix);
-            if (!out.qmm_t[w][i].valid() || !out.qmm_t_residual[w][i].valid()) {
+            out.qmm_t_bias[w][i] = ctx.compile_pso_from_file(
+                dir + "quantized_qmm_t.metal", "affine_qmm_t_bias" + suffix);
+            if (!out.qmm_t[w][i].valid() || !out.qmm_t_residual[w][i].valid() ||
+                !out.qmm_t_bias[w][i].valid()) {
                 if (err) *err = "affine_qmm_t" + suffix + " (quantized_qmm_t.metal)";
                 return false;
             }

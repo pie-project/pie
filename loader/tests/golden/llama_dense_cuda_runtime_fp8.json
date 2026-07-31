@@ -1519,9 +1519,7 @@
           "scratch_bytes": 0,
           "fusion": "None",
           "metadata_source": null,
-          "scale_factor_bits": 0,
-          "scale_group": 0,
-          "scale_axis": 0
+          "scale_factor_bits": 0
         }
       }
     },
@@ -1583,9 +1581,7 @@
           "scratch_bytes": 0,
           "fusion": "None",
           "metadata_source": null,
-          "scale_factor_bits": 0,
-          "scale_group": 0,
-          "scale_axis": 0
+          "scale_factor_bits": 0
         }
       }
     },
@@ -1647,9 +1643,7 @@
           "scratch_bytes": 0,
           "fusion": "None",
           "metadata_source": null,
-          "scale_factor_bits": 0,
-          "scale_group": 0,
-          "scale_axis": 0
+          "scale_factor_bits": 0
         }
       }
     },
@@ -1711,9 +1705,7 @@
           "scratch_bytes": 0,
           "fusion": "None",
           "metadata_source": null,
-          "scale_factor_bits": 0,
-          "scale_group": 0,
-          "scale_axis": 0
+          "scale_factor_bits": 0
         }
       }
     },
@@ -1782,9 +1774,7 @@
           "scratch_bytes": 0,
           "fusion": "None",
           "metadata_source": null,
-          "scale_factor_bits": 0,
-          "scale_group": 0,
-          "scale_axis": 0
+          "scale_factor_bits": 0
         }
       }
     },
@@ -1846,9 +1836,7 @@
           "scratch_bytes": 0,
           "fusion": "None",
           "metadata_source": null,
-          "scale_factor_bits": 0,
-          "scale_group": 0,
-          "scale_axis": 0
+          "scale_factor_bits": 0
         }
       }
     },
@@ -1910,9 +1898,7 @@
           "scratch_bytes": 0,
           "fusion": "None",
           "metadata_source": null,
-          "scale_factor_bits": 0,
-          "scale_group": 0,
-          "scale_axis": 0
+          "scale_factor_bits": 0
         }
       }
     },
@@ -1981,9 +1967,7 @@
           "scratch_bytes": 0,
           "fusion": "None",
           "metadata_source": null,
-          "scale_factor_bits": 0,
-          "scale_group": 0,
-          "scale_axis": 0
+          "scale_factor_bits": 0
         }
       }
     },
@@ -2045,9 +2029,7 @@
           "scratch_bytes": 0,
           "fusion": "None",
           "metadata_source": null,
-          "scale_factor_bits": 0,
-          "scale_group": 0,
-          "scale_axis": 0
+          "scale_factor_bits": 0
         }
       }
     },
@@ -2109,9 +2091,7 @@
           "scratch_bytes": 0,
           "fusion": "None",
           "metadata_source": null,
-          "scale_factor_bits": 0,
-          "scale_group": 0,
-          "scale_axis": 0
+          "scale_factor_bits": 0
         }
       }
     },
@@ -2173,9 +2153,7 @@
           "scratch_bytes": 0,
           "fusion": "None",
           "metadata_source": null,
-          "scale_factor_bits": 0,
-          "scale_group": 0,
-          "scale_axis": 0
+          "scale_factor_bits": 0
         }
       }
     },
@@ -2244,9 +2222,7 @@
           "scratch_bytes": 0,
           "fusion": "None",
           "metadata_source": null,
-          "scale_factor_bits": 0,
-          "scale_group": 0,
-          "scale_axis": 0
+          "scale_factor_bits": 0
         }
       }
     },
@@ -2308,9 +2284,7 @@
           "scratch_bytes": 0,
           "fusion": "None",
           "metadata_source": null,
-          "scale_factor_bits": 0,
-          "scale_group": 0,
-          "scale_axis": 0
+          "scale_factor_bits": 0
         }
       }
     },
@@ -2372,9 +2346,7 @@
           "scratch_bytes": 0,
           "fusion": "None",
           "metadata_source": null,
-          "scale_factor_bits": 0,
-          "scale_group": 0,
-          "scale_axis": 0
+          "scale_factor_bits": 0
         }
       }
     },

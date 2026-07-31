@@ -1467,6 +1467,7 @@ struct StagedLane {
     std::uint32_t logical_vocab = 0;
     std::vector<std::uint64_t> logits_bf16_rows;
     std::vector<std::uint64_t> mtp_logits_bf16_rows;
+    std::vector<std::uint64_t> presampled_token_rows;
     const std::uint8_t* row_valid = nullptr;
     std::uint32_t row_valid_offset = 0;
 };
@@ -3532,6 +3533,67 @@ bool Dispatch::launch_wants_attn_score(
     return false;
 }
 
+bool Dispatch::launch_epilogue_is_greedy_argmax(
+    const pie_native::LaunchView& view,
+    std::uint32_t vocab) const {
+    bool saw_epilogue = false;
+    // The verdict is a property of the program, and a launch is overwhelmingly
+    // the same guest replicated across every lane, so the same hash would
+    // otherwise be re-analysed once per lane -- op scans plus two vector
+    // allocations each, hundreds of times per fire.
+    std::vector<std::uint64_t> analysed;
+    for (std::size_t program = 0;
+         program < view.ptir_program_hashes.size();
+         ++program) {
+        const std::uint64_t hash = view.ptir_program_hashes.data()[program];
+        if (std::find(analysed.begin(), analysed.end(), hash) !=
+            analysed.end()) {
+            continue;
+        }
+        analysed.push_back(hash);
+        const auto* plans = impl_->cache.plans(hash);
+        if (plans == nullptr) return false;
+        const auto generated = impl_->fused_modules.program(hash);
+        if (generated == nullptr ||
+            generated->stages.size() != plans->size()) {
+            return false;
+        }
+        for (std::size_t index = 0; index < plans->size(); ++index) {
+            const plan::StagePlan& stage = (*plans)[index];
+            if (stage.stage != PTIR_STAGE_EPILOGUE) continue;
+            // A program may declare a vocabulary narrower than the weight's,
+            // and the materialising path honours it by scanning only that many
+            // columns. The fused reduction runs over the whole weight, so it
+            // could return a token the narrowed program can never emit.
+            //
+            // `stage_logits_vocab` throws on a malformed program. Declining is
+            // the right answer here rather than propagating: this is a
+            // question about an optimisation, and `finish` still rejects the
+            // same program at the same place it always did.
+            std::uint32_t logical_vocab = 0;
+            try {
+                logical_vocab = stage_logits_vocab(&stage, vocab);
+            } catch (const std::exception&) {
+                return false;
+            }
+            if (logical_vocab != vocab) return false;
+            const auto& executable = generated->stages[index];
+            if (executable == nullptr) return false;
+            std::string unused;
+            if (!generated::generated_stage_supported(
+                    *executable, stage, &unused)) {
+                return false;
+            }
+            if (!generated::generated_stage_is_compact_argmax(
+                    stage, *executable)) {
+                return false;
+            }
+            saw_epilogue = true;
+        }
+    }
+    return saw_epilogue;
+}
+
 bool Dispatch::launch_wants_page_mask(
     const pie_native::LaunchView& view) const {
     for (std::size_t program = 0;
@@ -3990,6 +4052,9 @@ GroupedLaneBinding make_staged_binding(
         .mtp_logits_bf16_rows = lane.mtp_logits_bf16_rows.empty()
             ? nullptr
             : &lane.mtp_logits_bf16_rows,
+        .presampled_token_rows = lane.presampled_token_rows.empty()
+            ? nullptr
+            : &lane.presampled_token_rows,
         .sample_output_channel_mask =
             sample_output_channel_mask(lane, stage),
         .row_valid = lane.row_valid,
@@ -4888,6 +4953,7 @@ bool Dispatch::finish(
     std::uint32_t direct_bf16_row_capacity,
     const std::uint8_t* row_valid,
     std::span<const std::uint32_t> row_valid_offsets,
+    const std::int32_t* presampled_tokens,
     FinishBreakdown* breakdown) {
     const bool trace_fire_timing = fire_timing::enabled();
     if (trace_fire_timing) {
@@ -4947,12 +5013,17 @@ bool Dispatch::finish(
         lane.logical_vocab = logical_vocab == 0 ? vocab : logical_vocab;
         lane.logits_bf16_rows.clear();
         lane.mtp_logits_bf16_rows.clear();
+        lane.presampled_token_rows.clear();
         lane.row_valid = row_valid;
         lane.row_valid_offset =
             row_valid == nullptr ? 0 : row_valid_offsets[program];
         if (direct_bf16_logits != nullptr &&
             direct_row_indices != nullptr) {
-            lane.logits_bf16_rows.reserve(lane.sampled_rows);
+            if (presampled_tokens != nullptr) {
+                lane.presampled_token_rows.reserve(lane.sampled_rows);
+            } else {
+                lane.logits_bf16_rows.reserve(lane.sampled_rows);
+            }
             for (std::uint32_t row = 0; row < lane.sampled_rows; ++row) {
                 const std::uint32_t source =
                     direct_row_indices[lane.row_offset + row];
@@ -4961,10 +5032,21 @@ bool Dispatch::finish(
                     throw std::runtime_error(
                         "direct BF16 sampled row exceeds the logits layout");
                 }
-                lane.logits_bf16_rows.push_back(
-                    reinterpret_cast<std::uint64_t>(
-                        direct_bf16_logits +
-                        static_cast<std::size_t>(source) * vocab));
+                if (presampled_tokens != nullptr) {
+                    // Same `source` row, one token wide instead of a
+                    // vocabulary. Exclusive with the BF16 table rather than
+                    // alongside it: on this path `direct_bf16_logits` holds
+                    // slab scratch, so a row table into it would be a live
+                    // pointer to something nobody wrote.
+                    lane.presampled_token_rows.push_back(
+                        reinterpret_cast<std::uint64_t>(
+                            presampled_tokens + source));
+                } else {
+                    lane.logits_bf16_rows.push_back(
+                        reinterpret_cast<std::uint64_t>(
+                            direct_bf16_logits +
+                            static_cast<std::size_t>(source) * vocab));
+                }
             }
         }
         if (drafts != 0) {
@@ -6354,60 +6436,87 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
         }
     }
 
-    // A recurrent fire may take the template, but only in its UNBUFFERED,
-    // HOST-KNOWN form. What the template replaces is the PTIR compose kernels
-    // that build the KV/token geometry; the RS wire arrays are a separate,
-    // host-side product of composition (`ComposedBatch`, frame.cpp:1189-1250)
-    // that the model forward reads directly, so they survive the substitution
-    // untouched. Pad rows are already handled -- both compose kernels write
-    // `rs_slot_ids[request] = -1` for an inactive lane (:752, :1119), which is
-    // exactly the "this row has no recurrent state" encoding the forward
-    // already understands.
-    //
-    // Two RS shapes still cannot come along, and for opposite reasons:
-    //
-    //   * BUFFERED rows (`rs_buffer_slot_ids`). The buffer's addressing is
-    //     per-request ragged and its indptr is sized to the REAL request
-    //     count, not the graph bucket. A padded lane has no row in it, so the
-    //     template's device-side padding would index past the end. Note this
-    //     tests the SLOT IDS, not the indptr: an indptr is `rows + 1` entries
-    //     and carries its leading zero even when the buffer is empty
-    //     (scheduler/wire.rs:185), so "no indptr" is not a thing to test for.
-    //   * A DEVICE-RESIDENT fold length (`PIE_RS_FLAG_FOLD_LEN_DEVICE`). Its
-    //     value is substituted during descriptor resolution and clamped
-    //     against a host bound; the template resolves nothing, so the wire
-    //     array would still hold the placeholder -- which folds the WHOLE
-    //     buffer instead of the accepted prefix. frame.cpp:1205 refuses this
-    //     combination outright, and tokens absorbed into the recurrence are
-    //     unrecoverable, so it must be refused here too rather than later.
-    //
-    // What is left is the fold-all decode: one state slot per request, fold
-    // this fire's single token, no buffer. That is the shape an ordinary
-    // hybrid decode step takes, and it is the one that wanted the template.
-    const bool rs_takes_template =
-        view.rs_buffer_slot_ids.empty() &&
-        std::none_of(
-            view.rs_slot_flags.data(),
-            view.rs_slot_flags.data() + view.rs_slot_flags.size(),
-            [](std::uint8_t f) {
-                return (f & PIE_RS_FLAG_FOLD_LEN_DEVICE) != 0;
-            });
     auto try_device_composed_template = [&]() {
         // Any all-decode lane count qualifies: graph-lattice padding
         // (frame.cpp) takes the composed batch from R to its request
         // bucket with device-side pad rows, so the template no longer
         // requires R to sit exactly on the lattice.
-        if (staged == nullptr ||
-            page_size == 0 || device_pages == 0 ||
-            !rs_takes_template ||
-            view.kv_translation_indptr.size() != n_prog + 1 ||
-            view.kv_translation_indptr.data()[0] != 0 ||
-            view.kv_translation_indptr.data()[n_prog] !=
-                view.kv_translation.size() ||
-            view.ptir_kv_write_lower_bounds.size() != n_prog ||
-            view.ptir_kv_write_upper_bounds.size() != n_prog) {
+        // Plain per-request RS slots ride through untouched: this template
+        // resolves *geometry* (tokens, positions, pages), and the slot->request
+        // attribution is host data that `compose_forward_batch` copies and that
+        // graph padding extends with `graph_pad_slot`. A fold or a buffered
+        // working set is different -- both change the batch's shape -- so those
+        // two still refuse.
+        //
+        // Refusing on `rs_slot_ids` too is what shut every recurrent-state
+        // family out of device composition, which is the only path that can
+        // resolve a chained descriptor: the host readback fallback cannot see a
+        // value the producing fire has not committed yet, so a decode step that
+        // reads the prefill's sampled token never became ready.
+        const bool trace_compose = [] {
+            const char* v = std::getenv("PIE_TRACE_DEVICE_COMPOSE");
+            return v != nullptr && v[0] != '\0' && v[0] != '0';
+        }();
+        auto refuse = [&](const char* why) {
+            if (trace_compose) {
+                std::fprintf(stderr, "[compose] refused: %s\n", why);
+                std::fflush(stderr);
+            }
             return false;
+        };
+        if (staged == nullptr) return refuse("no staged launch");
+        if (page_size == 0 || device_pages == 0) return refuse("no kv pages");
+        // A *bound* fold-length array is not a fold. The runtime carries one
+        // entry per request for every recurrent-state family, and on an
+        // ordinary decode step every entry is zero -- the state advances by
+        // the step's own token, with nothing to replay. Only a non-zero
+        // length reshapes the batch, and only that has to refuse.
+        {
+            const auto folds = view.rs_fold_lens.as<std::uint32_t>();
+            std::size_t nonzero = 0;
+            for (std::size_t i = 0; i < folds.size(); ++i) {
+                if (folds[i] != 0) ++nonzero;
+            }
+            if (nonzero != 0) {
+                if (trace_compose) {
+                    std::fprintf(stderr,
+                                 "[compose] refused: rs fold (%zu/%zu non-zero)\n",
+                                 nonzero, folds.size());
+                    std::fflush(stderr);
+                }
+                return false;
+            }
         }
+        if (!view.rs_buffer_slot_ids.empty()) return refuse("rs buffer");
+        // A DEVICE-RESIDENT fold length (`PIE_RS_FLAG_FOLD_LEN_DEVICE`). Its
+        // value is substituted during descriptor resolution and clamped
+        // against a host bound; this template resolves nothing, so the wire
+        // array would still hold that bound -- folding more than the accepted
+        // prefix, and tokens absorbed into the recurrence are unrecoverable.
+        // frame.cpp refuses the combination outright, so it must refuse here
+        // rather than later.
+        //
+        // The non-zero fold check above happens to catch this today, but only
+        // because the host's bound is non-zero. The flag is what actually
+        // carries the rule, so the flag is what is tested.
+        if (std::any_of(view.rs_slot_flags.data(),
+                        view.rs_slot_flags.data() + view.rs_slot_flags.size(),
+                        [](std::uint8_t f) {
+                            return (f & PIE_RS_FLAG_FOLD_LEN_DEVICE) != 0;
+                        })) {
+            return refuse("rs device-resident fold length");
+        }
+        if (view.kv_translation_indptr.size() != n_prog + 1)
+            return refuse("kv_translation_indptr size");
+        if (view.kv_translation_indptr.data()[0] != 0)
+            return refuse("kv_translation_indptr[0]");
+        if (view.kv_translation_indptr.data()[n_prog] !=
+            view.kv_translation.size())
+            return refuse("kv_translation_indptr tail");
+        if (view.ptir_kv_write_lower_bounds.size() != n_prog)
+            return refuse("kv_write_lower_bounds size");
+        if (view.ptir_kv_write_upper_bounds.size() != n_prog)
+            return refuse("kv_write_upper_bounds size");
         ResolvedPrograms candidate;
         candidate.per_program.resize(n_prog);
         candidate.is_device_geometry.assign(n_prog, 0);
@@ -6437,7 +6546,7 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
             if (instance.geometry_class !=
                     PIE_GEOMETRY_CLASS_DECODE_ENVELOPE ||
                 instance.trace == nullptr) {
-                return false;
+                return refuse("geometry class not decode-envelope");
             }
             const Trace& trace = *instance.trace;
             std::array<const PortBinding*, 10> dynamic{};

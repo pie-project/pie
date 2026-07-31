@@ -63,6 +63,10 @@ enum class Kind : std::uint8_t {
     LayerScalar,
 
     // Tail.
+    /// The rows this fire will sample, compacted. A prefill computes every row
+    /// of the body and reads one per request, so everything after this runs on
+    /// `S` rows rather than `N` -- and the LM head is what that saves.
+    RowGather,
     FinalRms,
     LmHead,
     FinalSoftcap,
@@ -141,6 +145,7 @@ inline std::vector<Dispatch> build_gemma4_dag(const Gemma4Geometry& g, bool with
         }
     }
 
+    emit(Kind::RowGather, -1, false);
     emit(Kind::FinalRms, -1, false);
     emit(Kind::LmHead, -1, false);
     if (g.final_softcap > 0.0f) emit(Kind::FinalSoftcap, -1, false);

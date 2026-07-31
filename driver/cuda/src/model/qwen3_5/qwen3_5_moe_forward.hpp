@@ -17,6 +17,11 @@
 
 namespace pie_cuda_driver::model {
 
+/// True when `PIE_QWEN35_MOE_FORCE_GENERAL=1`: take the per-expert dispatch for
+/// every shape. That path syncs the stream, so the model must also declare
+/// itself un-capturable -- same reason streaming does.
+bool qwen35_moe_force_general_path();
+
 // MoE-side workspace. Reuses Qwen3.5's la_ws for the linear-attn
 // staging tensors.
 struct Qwen3_5MoeMlpWorkspace {

@@ -10,6 +10,7 @@
 #include <exception>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <numeric>
 #include <sstream>
 #include <span>
@@ -46,6 +47,10 @@ int tensor_rows(const DeviceTensor& t) {
     if (t.shape().empty()) return 0;
     return static_cast<int>(t.shape()[0]);
 }
+
+// Vocabulary slab width for the fused LM head + greedy argmax (§20.37) lives in
+// batch/forward.cpp: the graph-capture path needs the same value, and a second
+// copy of the `static` here would be a second chance to disagree with it.
 
 struct MtpDraftWork {
     std::size_t program = 0;
@@ -672,6 +677,10 @@ struct PreparedStep::Impl {
     pipeline::FixedDecodeDeviceBuffers fixed_buffers{};
     pipeline::DecodeEnvelopeDeviceBuffers envelope_buffers{};
     bool compact_logits = false;
+    // Vocabulary slab width for the fused LM head + greedy argmax, or 0 when
+    // this fire materializes logits the ordinary way. See
+    // `ForwardInputs::logits_argmax_chunk_tokens`.
+    int logits_argmax_chunk_tokens = 0;
 
     // Masks.
     bool have_custom_mask = false;
@@ -1702,6 +1711,68 @@ void prepare_step(
         s.mtp_plan.work.empty() &&
         num_sampling > 0 &&
         num_sampling < s.fN_real;
+    // Fold the greedy argmax into the LM head GEMM when every epilogue in the
+    // launch is a bare argmax over `logits`, so the vocabulary is reduced as
+    // it is produced instead of making a round trip through HBM (§20.37).
+    // MTP drafts read the logits for their own reasons, so they opt out.
+    //
+    // The slab width is a device+model property with a real optimum, so it has
+    // no default here: the path stays off until something measures one. It
+    // belongs in the planner's calibration, and the environment variable is
+    // the bridge until it lands there.
+    s.logits_argmax_chunk_tokens = 0;
+    // A fire that samples nothing has no logits to fuse into, and is also the
+    // fire whose answer would say nothing about the steady state, so it is
+    // skipped rather than reported on.
+    if (logits_argmax_chunk_tokens() > 0 && num_sampling > 0) {
+        const auto vocab =
+            static_cast<std::uint32_t>(
+                engine.loaded_model.hf_config().vocab_size);
+        // Cheap, launch-shape reasons to decline, checked before the epilogue
+        // analysis so a declining fire never pays for it.
+        const bool shape_ok =
+            s.mtp_plan.work.empty() &&
+            // Under TP the LM head is sharded and the logits are gathered
+            // across ranks, so a rank cannot reduce its own slab to a token id.
+            engine.tp_comm == nullptr &&
+            // Most model families ignore the slab width and materialize logits
+            // regardless. Fusing on one of those would hand the epilogue a
+            // buffer nobody wrote, so the model has to opt in.
+            engine.forward_fn.supports_fused_lm_head_argmax;
+        if (shape_ok && engine.dispatch->launch_epilogue_is_greedy_argmax(
+                            s.dispatch_view, vocab)) {
+            s.logits_argmax_chunk_tokens = logits_argmax_chunk_tokens();
+        }
+        // The request was made explicitly, so say whether it was honoured: a
+        // silent no-op is indistinguishable from a fused run that did nothing.
+        //
+        // Both outcomes get their own latch. The verdict is per-fire -- it
+        // depends on this launch's guest programs -- so a single flag would
+        // report whichever fire happened to be first as if it were the steady
+        // state. Reports only values already in hand; re-deriving the epilogue
+        // verdict here would run the analysis on fires that `shape_ok`
+        // deliberately excluded.
+        const bool engaged = s.logits_argmax_chunk_tokens > 0;
+        static std::once_flag announced_engaged;
+        static std::once_flag announced_declined;
+        std::call_once(engaged ? announced_engaged : announced_declined, [&] {
+            std::cerr << "[pie-driver-cuda] logits argmax chunking "
+                      << (engaged ? "engaged" : "requested but not engaged")
+                      << " chunk=" << logits_argmax_chunk_tokens()
+                      << " sampling=" << num_sampling
+                      << " mtp=" << !s.mtp_plan.work.empty()
+                      << " tp=" << (engine.tp_comm != nullptr)
+                      << " model_supports="
+                      << engine.forward_fn.supports_fused_lm_head_argmax
+                      << " greedy_epilogue=";
+            if (shape_ok) {
+                std::cerr << engaged;
+            } else {
+                std::cerr << "n/a";
+            }
+            std::cerr << "\n";
+        });
+    }
     if (s.rs_is_fold && !s.mtp_plan.work.empty()) {
         throw std::runtime_error(
             "state-only buffered RS fold cannot produce MTP drafts");
@@ -2395,6 +2466,7 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
             .is_pure_decode = s.is_pure_decode,
             .have_custom_mask = s.have_custom_mask,
             .compact_logits = s.compact_logits,
+            .logits_argmax_chunk_tokens = s.logits_argmax_chunk_tokens,
             .structured_window_left = s.structured_window_left,
             .has_write_desc = s.has_write_desc,
             .use_slots = s.use_slots,
@@ -2503,6 +2575,10 @@ void settle_step(
             static_cast<std::uint32_t>(tensor_rows(engine.ws.logits)),
             engine.inputs.row_valid.data(),
             s.program_token_starts,
+            s.logits_argmax_chunk_tokens > 0
+                ? static_cast<const std::int32_t*>(
+                      engine.ws.sampled_tokens.data())
+                : nullptr,
             dbg_fire ? &s.timing.finish_breakdown : nullptr);
     }
     if (dbg_fire) {

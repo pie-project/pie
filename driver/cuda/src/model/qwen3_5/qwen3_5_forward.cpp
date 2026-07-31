@@ -2610,7 +2610,7 @@ void qwen3_5_mtp_forward(
         kernels::launch_lm_head_gemv_argmax_int8(
             ws.norm_x.data(),
             static_cast<const std::int8_t*>(lm_head.data),
-            mtp.lm_head_scale_inv->data(),
+            static_cast<const float*>(mtp.lm_head_scale_inv->data()),
             sampled_token_ids, num_tokens, H, V, stream);
     } else if (sampled_token_ids != nullptr &&
                qwen35_mtp_fused_gemv_enabled() &&

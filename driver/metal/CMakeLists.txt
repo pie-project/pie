@@ -97,6 +97,12 @@ if(APPLE)
     src/model/gemma4/scratch.cpp
     src/model/gemma4/encode.cpp
     src/model/gemma4/bind.cpp
+    src/model/gptoss/kernels.cpp
+    src/model/gptoss/decode_consts.cpp
+    src/model/gptoss/scratch.cpp
+    src/model/gptoss/encode.cpp
+    src/model/gptoss/bind.cpp
+    src/batch/simple_family.cpp
     src/model/qwen3_5/decode_step.cpp
     src/model/qwen3_5/decode_step_mb.cpp
     src/kernels/decode_psos.cpp
@@ -132,6 +138,24 @@ target_include_directories(pie_driver_metal_lib
 target_compile_options(pie_driver_metal_lib PRIVATE
   $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Wno-unused-parameter>
   $<$<COMPILE_LANGUAGE:OBJCXX>:-Wall -Wextra -Wno-unused-parameter>)
+
+# `-Werror=switch` on forward.cpp alone.
+#
+# `MetalExecutor::setup` switches on the model family with no `default:`, so
+# adding a family without teaching the executor about it must not compile. It
+# was a plain warning first, and a warning is exactly what a gpt-oss checkpoint
+# fell through: it matched no case, ran on past the switch, and was set up as
+# qwen3.5 -- surfacing as "unstaged weight shared_embedding.weight", a tensor
+# belonging to a different family entirely.
+#
+# Scoped to this file rather than the target: the switches over the shared
+# `Kernel` enum are legitimately partial (a family handles its own kinds and
+# falls through for the rest), and making those an error would only buy a
+# forest of `default:` labels that turn the check back off.
+set_source_files_properties(src/batch/simple_family.cpp
+  PROPERTIES COMPILE_OPTIONS "-Werror=switch")
+set_source_files_properties(src/batch/forward.cpp
+  PROPERTIES COMPILE_OPTIONS "-Werror=switch")
 
 # Compiled-in fallback for the native .metal kernel sources (runtime PSO
 # compilation). Overridable at run time via PIE_METAL_KERNELS_DIR. PUBLIC so
@@ -450,11 +474,33 @@ if(APPLE)
   add_metal_linked_test(ptir_m0_device_test tests/ptir_m0_device_test.cpp)
   add_metal_linked_test(kv_append_paged_pso_test tests/kv_append_paged_pso_test.cpp)
   # The six gemma4 kernels that shipped with no PSO entry and no binder.
+  add_metal_linked_test(host_buffer_bind_test tests/host_buffer_bind_test.cpp)
+  target_compile_definitions(host_buffer_bind_test PRIVATE
+    PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
   add_metal_linked_test(gemma4_pso_test tests/gemma4_pso_test.cpp)
   target_compile_definitions(gemma4_pso_test PRIVATE
     PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
   add_metal_linked_test(gemma4_forward_test tests/gemma4_forward_test.cpp NEEDS_LOADER)
   target_compile_definitions(gemma4_forward_test PRIVATE
+    PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
+  add_metal_linked_test(gptoss_forward_test tests/gptoss_forward_test.cpp NEEDS_LOADER)
+  target_compile_definitions(gptoss_forward_test PRIVATE
+    PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
+  add_metal_linked_test(simple_family_executor_test tests/simple_family_executor_test.cpp NEEDS_LOADER)
+  target_compile_definitions(simple_family_executor_test PRIVATE
+    PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
+  # The same cases again with the weights STREAMED rather than copied. Streaming
+  # is meant to change what is resident and nothing else, so the assertions are
+  # the same assertions -- if it ever changes an answer, the test that says so
+  # is the one that already knows every answer.
+  if(TARGET simple_family_executor_test)
+    add_test(NAME simple_family_executor_streamed_test
+             COMMAND simple_family_executor_test)
+    set_tests_properties(simple_family_executor_streamed_test PROPERTIES
+      ENVIRONMENT "PIE_METAL_STREAM_EXPERTS=1")
+  endif()
+  add_metal_linked_test(gemma4_prefill_numerics_test tests/gemma4_prefill_numerics_test.cpp NEEDS_LOADER)
+  target_compile_definitions(gemma4_prefill_numerics_test PRIVATE
     PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
   add_metal_linked_test(gemma4_prefill_test tests/gemma4_prefill_test.cpp)
   target_compile_definitions(gemma4_prefill_test PRIVATE

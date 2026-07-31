@@ -695,6 +695,16 @@ impl Builder<'_> {
                  this rank's Slice, and byte offsets cannot be symbolic"
                     .to_string(),
             )),
+            Expr::SrcIndexed(template) => Err(Error::Internal(format!(
+                "SrcIndexed('{template}') reached lowering; Resolver::specialize \
+                 substitutes this instance's index, and a tensor name cannot be \
+                 symbolic"
+            ))),
+            Expr::Select { .. } => Err(Error::Internal(
+                "Select reached lowering; Resolver::specialize rewrites it into \
+                 this instance's Slice, and byte offsets cannot be symbolic"
+                    .to_string(),
+            )),
         }
     }
 
@@ -1174,6 +1184,7 @@ mod tests {
                     Encoding::Raw(DType::BF16),
                 ),
             ],
+            groups: Vec::new(),
         };
         let checked = resolve(&contract, &qwen3());
         let view = compile(&contract.tensors[1].expr, &checked, 1024).unwrap();
@@ -1406,7 +1417,9 @@ mod tests {
             | Expr::Repack { .. }
             | Expr::Cast { .. }
             | Expr::Scale { .. }
-            | Expr::Shard { .. } => {
+            | Expr::Shard { .. }
+            | Expr::SrcIndexed(_)
+            | Expr::Select { .. } => {
                 unreachable!("the oracle covers only Src-rooted affine expressions")
             }
         }
@@ -1832,6 +1845,7 @@ mod tests {
                     Encoding::Raw(DType::BF16),
                 ),
             ],
+            groups: Vec::new(),
         };
         let checked = resolve(&contract, &qwen3());
         let starts: Vec<i64> = contract.tensors[1..]

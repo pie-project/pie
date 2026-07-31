@@ -18,6 +18,16 @@
 #include "heap_bind.hpp"
 #include "heap_bind_metal.hpp"
 
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <filesystem>
+#include <functional>
+#include <memory>
+#include <vector>
+
 #include <algorithm>
 #include <cstring>
 #include <stdexcept>
@@ -97,6 +107,156 @@ void copy_extent(
         max_tile_bytes);
 }
 
+
+/// One buffer's bytes, located in the checkpoint rather than in the arena.
+struct MappedSource {
+    std::uint32_t file_id = 0;
+    std::uint64_t file_offset = 0;
+    std::uint64_t bytes = 0;
+};
+
+/// Which buffers the plan builds as a verbatim slice of ONE file range.
+///
+/// The plan assembles the arena out of `BulkExtentWrite`s: contiguous, verbatim
+/// file ranges. A buffer inside one of them is, on disk, already the bytes the
+/// GPU wants, so its bytes can be taken from the file rather than rebuilt. A
+/// buffer any other op touches is not; this proves the distinction rather than
+/// assuming it.
+std::unordered_map<std::uint32_t, MappedSource> resolve_mappable(
+    const pie_loader::PieLoaderPlan& plan,
+    const pie_loader::LoadPlanIndex& index,
+    const std::function<bool(const std::string&)>& streams) {
+    using Tag = pie_loader::PieLoaderStorageOp::Tag;
+    struct Range {
+        std::uint64_t dest_begin, dest_end, file_offset;
+        std::uint32_t file_id;
+    };
+    std::vector<Range> ranges;
+    std::unordered_map<std::uint32_t, bool> touched_otherwise;
+    std::unordered_map<std::uint32_t, std::string> names;
+    std::vector<std::uint32_t> allocated;
+
+    for (std::size_t step = 0; step < plan.schedule.len; ++step) {
+        const auto& instr = index.instruction(plan.schedule.ptr[step]);
+        switch (instr.op.tag) {
+        case Tag::Allocate:
+            allocated.push_back(instr.op.allocate.buffer_id);
+            break;
+        case Tag::BulkExtentWrite: {
+            const auto& op = instr.op.bulk_extent_write;
+            ranges.push_back({op.dest_offset, op.dest_offset + op.source.span_bytes,
+                              op.source.file_offset + op.source.stride.base_offset,
+                              op.source.file_id});
+            break;
+        }
+        case Tag::Finalize:
+            names[instr.op.finalize.buffer_id] =
+                pie_loader::bytes_to_string(instr.op.finalize.name);
+            break;
+        case Tag::ExtentWrite:
+            touched_otherwise[instr.op.extent_write.dest.buffer_id] = true;
+            break;
+        case Tag::Fill:
+            touched_otherwise[instr.op.fill.buffer_id] = true;
+            break;
+        case Tag::CreateView:
+            touched_otherwise[instr.op.create_view.output_buffer] = true;
+            touched_otherwise[instr.op.create_view.input_buffer] = true;
+            break;
+        default:
+            break;
+        }
+    }
+
+    std::unordered_map<std::uint32_t, MappedSource> out;
+    for (const std::uint32_t id : allocated) {
+        if (touched_otherwise.count(id) != 0) continue;
+        const auto& decl = index.buffer(id);
+        if (!decl.has_persistent_offset || decl.temporary) continue;
+        const auto name = names.find(id);
+        if (name == names.end() || !streams(name->second)) continue;
+        const std::uint64_t begin = decl.persistent_offset;
+        const std::uint64_t end = begin + decl.bytes;
+        for (const Range& r : ranges) {
+            if (begin < r.dest_begin || end > r.dest_end) continue;
+            out[id] = MappedSource{r.file_id, r.file_offset + (begin - r.dest_begin),
+                                   decl.bytes};
+            break;
+        }
+    }
+    return out;
+}
+
+/// A page-aligned copy of the streamable tensors, written once and mapped ever
+/// after. Deterministic layout -- buffers in id order, each starting on a page
+/// -- so nothing about it is stored: the same plan recomputes it. Named for the
+/// plan's cache key, so a plan that would produce different bytes names a
+/// different pack.
+class StreamPack {
+  public:
+    StreamPack(const std::filesystem::path& path, std::uint64_t bytes) {
+        std::error_code ec;
+        const bool exists = std::filesystem::exists(path, ec) &&
+                            std::filesystem::file_size(path, ec) == bytes;
+        fd_ = ::open(path.c_str(), exists ? O_RDONLY : (O_RDWR | O_CREAT | O_TRUNC), 0644);
+        if (fd_ < 0) return;
+        if (!exists && ::ftruncate(fd_, off_t(bytes)) != 0) return;
+        void* p = ::mmap(nullptr, std::size_t(bytes),
+                         exists ? PROT_READ : (PROT_READ | PROT_WRITE), MAP_SHARED, fd_, 0);
+        if (p == MAP_FAILED) return;
+        base_ = p;
+        bytes_ = bytes;
+        fresh_ = !exists;
+    }
+    ~StreamPack() {
+        if (base_ != nullptr) ::munmap(base_, std::size_t(bytes_));
+        if (fd_ >= 0) ::close(fd_);
+    }
+    StreamPack(const StreamPack&) = delete;
+    StreamPack& operator=(const StreamPack&) = delete;
+    bool valid() const { return base_ != nullptr; }
+    bool fresh() const { return fresh_; }
+    void* base() const { return base_; }
+
+  private:
+    int fd_ = -1;
+    void* base_ = nullptr;
+    std::uint64_t bytes_ = 0;
+    bool fresh_ = false;
+};
+
+/// Page-aligned pack offsets, in buffer-id order.
+std::uint64_t pack_layout(const std::unordered_map<std::uint32_t, MappedSource>& mapped,
+                          std::vector<std::uint32_t>& ids,
+                          std::unordered_map<std::uint32_t, std::uint64_t>& offset) {
+    ids.clear();
+    ids.reserve(mapped.size());
+    for (const auto& [id, src] : mapped) ids.push_back(id);
+    std::sort(ids.begin(), ids.end());
+    const std::uint64_t page = std::uint64_t(::getpagesize());
+    std::uint64_t total = 0;
+    for (const std::uint32_t id : ids) {
+        offset[id] = total;
+        total += ((mapped.at(id).bytes + page - 1) / page) * page;
+    }
+    return total;
+}
+
+}  // namespace
+
+std::uint64_t streamable_plan_bytes(const pie_loader::LoadPlan& load,
+                                    const std::function<bool(const std::string&)>& streams) {
+    if (!streams) return 0;
+    const auto plan = load.view();
+    pie_loader::LoadPlanIndex index("metal load executor");
+    index.reset(plan);
+    std::uint64_t total = 0;
+    for (const auto& [id, src] : resolve_mappable(plan, index, streams)) total += src.bytes;
+    return total;
+}
+
+namespace {
+
 }  // namespace
 
 // Stage every tensor the plan names into the heap, keyed by its runtime name.
@@ -112,6 +272,15 @@ StagedWeights stage_plan_weights(
     const pie_loader::CheckpointSource& view,
     const pie_loader::LoadPlan& load,
     std::size_t weights_bytes) {
+    return stage_plan_weights(ctx, view, load, weights_bytes, {});
+}
+
+StagedWeights stage_plan_weights(
+    RawMetalContext& ctx,
+    const pie_loader::CheckpointSource& view,
+    const pie_loader::LoadPlan& load,
+    std::size_t weights_bytes,
+    const std::function<bool(const std::string&)>& streams) {
     StagedWeights b;
     // Backend and tile-map transforms are no longer re-checked: this driver
     // supplied both in the request it compiled from (`architecture.md` §9).
@@ -128,14 +297,90 @@ StagedWeights stage_plan_weights(
                 std::to_string(tensor.quant_bits_per_element));
         }
     }
-    b.weights_region = ctx.heap_alloc(
-        weights_bytes, std::max<std::size_t>(1, load.preferred_alignment()));
-    if (!b.weights_region.valid()) {
-        throw std::runtime_error("heap_alloc failed for program-owned weights region");
-    }
     std::unordered_map<std::uint32_t, SlotHandle> buffers;
     pie_loader::LoadPlanIndex index("metal load executor");
     index.reset(load_plan);
+
+    const auto mapped = streams ? resolve_mappable(load_plan, index, streams)
+                                : std::unordered_map<std::uint32_t, MappedSource>{};
+    // Rebuilding the arena buffer by buffer is what lets the streamed ones be
+    // LEFT OUT of it, and leaving them out is the whole point -- a pack beside
+    // a heap that still holds the same bytes doubles the footprint instead of
+    // halving it. So every buffer must resolve, not just the streamed ones.
+    std::unordered_map<std::uint32_t, MappedSource> all_sources;
+    bool compact = false;
+    if (!mapped.empty()) {
+        all_sources = resolve_mappable(load_plan, index, [](const std::string&) { return true; });
+        compact = true;
+        for (std::size_t step = 0; step < load_plan.schedule.len && compact; ++step) {
+            const auto& instr = index.instruction(load_plan.schedule.ptr[step]);
+            if (instr.op.tag != pie_loader::PieLoaderStorageOp::Tag::Allocate) continue;
+            if (all_sources.count(instr.op.allocate.buffer_id) == 0) compact = false;
+        }
+    }
+
+    SlotHandle pack_slot;
+    std::vector<std::uint32_t> stream_ids;
+    std::unordered_map<std::uint32_t, std::uint64_t> pack_offset;
+    if (compact) {
+        const std::uint64_t pack_bytes = pack_layout(mapped, stream_ids, pack_offset);
+        const char* dir = std::getenv("PIE_METAL_STREAM_DIR");
+        std::error_code ec;
+        const std::filesystem::path root =
+            dir != nullptr ? std::filesystem::path(dir)
+                           : std::filesystem::temp_directory_path() / "pie-metal-stream";
+        std::filesystem::create_directories(root, ec);
+        const std::string key = pie_loader::bytes_to_string(load_plan.cache_key);
+        auto pack = std::make_shared<StreamPack>(root / (key + ".mtlpack"), pack_bytes);
+        if (pack->valid()) {
+            if (pack->fresh()) {
+                for (const std::uint32_t id : stream_ids) {
+                    const auto& src = mapped.at(id);
+                    view.copy_storage_bytes(
+                        src.file_id, src.file_offset, src.bytes,
+                        static_cast<std::uint8_t*>(pack->base()) + pack_offset[id],
+                        load.max_tile_bytes());
+                }
+            }
+            pack_slot = ctx.wrap_host_memory(pack->base(), std::size_t(pack_bytes));
+        }
+        if (pack_slot.valid()) {
+            b.stream_pack = pack;  // must outlive every slot pointing into it
+            for (const std::uint32_t id : stream_ids) b.streamed_bytes += mapped.at(id).bytes;
+        } else {
+            compact = false;
+        }
+    }
+
+    const std::uint64_t align = std::max<std::uint64_t>(1, load.preferred_alignment());
+    std::unordered_map<std::uint32_t, std::uint64_t> compact_offset;
+    std::uint64_t compact_bytes = 0;
+    if (compact) {
+        std::vector<std::uint32_t> ids;
+        for (const auto& [id, src] : all_sources) {
+            if (mapped.count(id) == 0) ids.push_back(id);
+        }
+        std::sort(ids.begin(), ids.end());
+        for (const std::uint32_t id : ids) {
+            compact_offset[id] = compact_bytes;
+            compact_bytes += ((all_sources.at(id).bytes + align - 1) / align) * align;
+        }
+    }
+    b.weights_region = ctx.heap_alloc(compact ? std::size_t(compact_bytes) : weights_bytes,
+                                      std::size_t(align));
+    if (!b.weights_region.valid()) {
+        throw std::runtime_error("heap_alloc failed for program-owned weights region");
+    }
+    if (compact) {
+        // Each buffer pulls its own bytes, so the bulk writes are skipped below:
+        // they address the arena the plan laid out, which no longer exists.
+        for (const auto& [id, off] : compact_offset) {
+            const auto& src = all_sources.at(id);
+            view.copy_storage_bytes(src.file_id, src.file_offset, src.bytes,
+                                    static_cast<std::uint8_t*>(b.weights_region.contents()) + off,
+                                    load.max_tile_bytes());
+        }
+    }
     for (std::size_t step = 0; step < load_plan.schedule.len; ++step) {
         const auto& instr = index.instruction(load_plan.schedule.ptr[step]);
         using Tag = pie_loader::PieLoaderStorageOp::Tag;
@@ -145,6 +390,14 @@ StagedWeights stage_plan_weights(
             if (!decl.has_persistent_offset || decl.temporary) {
                 throw std::runtime_error(
                     "metal storage executor requires arena-resident buffers");
+            }
+            if (compact) {
+                buffers.emplace(decl.id,
+                                mapped.count(decl.id) != 0
+                                    ? slice_slot(pack_slot, pack_offset.at(decl.id), decl.bytes)
+                                    : slice_slot(b.weights_region, compact_offset.at(decl.id),
+                                                 decl.bytes));
+                break;
             }
             buffers.emplace(
                 decl.id,
@@ -170,6 +423,7 @@ StagedWeights stage_plan_weights(
             break;
         }
         case Tag::BulkExtentWrite: {
+            if (compact) break;  // every buffer already pulled its own bytes
             const auto& op = instr.op.bulk_extent_write;
             const std::uint64_t offset = op.dest_offset;
             if (offset > b.weights_region.size ||
@@ -241,7 +495,8 @@ BoundDecode stage_decode_storage(
     const pie_loader::CheckpointSource& view,
     const pie_loader::LoadPlan& load,
     const DecodeGeometry& g,
-    const HeapPlan& heap_plan) {
+    const HeapPlan& heap_plan,
+    const std::function<bool(const std::string&)>& streams) {
     BoundDecode b;
     b.plan = heap_plan;
     b.gdn.resize(g.n_layers);
@@ -249,9 +504,16 @@ BoundDecode stage_decode_storage(
 
     {
         StagedWeights staged =
-            stage_plan_weights(ctx, view, load, heap_plan.weights_bytes);
+            stage_plan_weights(ctx, view, load, heap_plan.weights_bytes, streams);
         b.weights_region = staged.weights_region;
         b.weights = std::move(staged.weights);
+        b.stream_pack = std::move(staged.stream_pack);
+        if (staged.streamed_bytes > 0) {
+            std::fprintf(stderr,
+                         "[pie-metal] %.2f GB of FFN weights streamed from a pack, and out "
+                         "of the heap\n",
+                         double(staged.streamed_bytes) / 1e9);
+        }
     }
 
     // ── KV region: k/v pages per full-attn layer (append-only, I4) ──
@@ -446,6 +708,61 @@ std::vector<WeightBind> weight_binds(
         weights.push_back(
             {(std::uint8_t)bind::RmsResidual::W, prefix + "post_feedforward_layernorm.weight"});
         break;
+    // ── GPT-OSS ──
+    // The embedding and the head are separate tensors here, and every
+    // projection carries an additive bias at slot 7 alongside its quantized
+    // triplet. `.bias` and `.biases` differ by one character and mean nothing
+    // alike; the triplet's zero point is the latter.
+    case Kernel::GoEmbed:
+        push_quant(weights, "embed_tokens");
+        break;
+    case Kernel::GoLmHead:
+        push_quant(weights, "lm_head");
+        break;
+    case Kernel::GoQmvQ:
+        push_quant(weights, prefix + "self_attn.q_proj");
+        weights.push_back({(std::uint8_t)bind::GoQmv::Bias, prefix + "self_attn.q_proj.bias"});
+        break;
+    case Kernel::GoQmvK:
+        push_quant(weights, prefix + "self_attn.k_proj");
+        weights.push_back({(std::uint8_t)bind::GoQmv::Bias, prefix + "self_attn.k_proj.bias"});
+        break;
+    case Kernel::GoQmvV:
+        push_quant(weights, prefix + "self_attn.v_proj");
+        weights.push_back({(std::uint8_t)bind::GoQmv::Bias, prefix + "self_attn.v_proj.bias"});
+        break;
+    case Kernel::GoQmvO:
+        push_quant(weights, prefix + "self_attn.o_proj");
+        weights.push_back({(std::uint8_t)bind::GoQmv::Bias, prefix + "self_attn.o_proj.bias"});
+        break;
+    case Kernel::GoSdpaSink:
+        weights.push_back({(std::uint8_t)bind::SdpaSink::Sinks, prefix + "self_attn.sinks"});
+        break;
+    case Kernel::GoRouter:
+        push_quant(weights, prefix + "mlp.router");
+        weights.push_back({(std::uint8_t)bind::GoQmv::Bias, prefix + "mlp.router.bias"});
+        break;
+    case Kernel::GoExpertGate:
+        push_quant(weights, prefix + "mlp.experts.gate_proj");
+        weights.push_back(
+            {(std::uint8_t)bind::GoQmv::Bias, prefix + "mlp.experts.gate_proj.bias"});
+        break;
+    case Kernel::GoExpertUp:
+        push_quant(weights, prefix + "mlp.experts.up_proj");
+        weights.push_back({(std::uint8_t)bind::GoQmv::Bias, prefix + "mlp.experts.up_proj.bias"});
+        break;
+    case Kernel::GoExpertDown:
+        push_quant(weights, prefix + "mlp.experts.down_proj");
+        weights.push_back(
+            {(std::uint8_t)bind::GoQmv::Bias, prefix + "mlp.experts.down_proj.bias"});
+        break;
+    // Weightless: the routing decision and the two elementwise stages read
+    // activations only.
+    case Kernel::GoRouterTopK:
+    case Kernel::GoSwiGlu:
+    case Kernel::GoExpertCombine:
+        break;
+
     case Kernel::G4PleResidualScaled:
         weights.push_back(
             {(std::uint8_t)bind::RmsResidual::W, prefix + "post_per_layer_input_norm.weight"});

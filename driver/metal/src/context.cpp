@@ -195,6 +195,28 @@ struct ModelFacts {
     // Its shape is per attention type, and `rope_parameters` is nested one
     // level deeper again: `{full_attention: {...}, sliding_attention: {...}}`
     // rather than one object for the whole stack. Defaults are E2B's.
+    // ── GPT-OSS ──
+    // Non-zero marks "this config was read as gpt-oss". Its shape is flat --
+    // no nested text_config -- and its rope is YaRN, whose four parameters sit
+    // in `rope_scaling`.
+    int go_num_hidden_layers = 0;
+    int go_hidden_size = 0;
+    int go_vocab_size = 0;
+    int go_num_attention_heads = 0;
+    int go_num_key_value_heads = 0;
+    int go_head_dim = 0;
+    int go_sliding_window = 0;
+    int go_num_local_experts = 0;
+    int go_num_experts_per_tok = 0;
+    int go_intermediate_size = 0;
+    int go_rope_original_max_position = 4096;
+    float go_rms_norm_eps = 1e-5f;
+    float go_swiglu_limit = 7.0f;
+    float go_rope_theta = 150000.0f;
+    float go_rope_factor = 32.0f;
+    float go_rope_beta_fast = 32.0f;
+    float go_rope_beta_slow = 1.0f;
+
     int g4_num_hidden_layers = 0;   // non-zero marks "this config was read as gemma4"
     int g4_hidden_size = 0;
     int g4_intermediate_size = 0;
@@ -329,6 +351,44 @@ ModelFacts read_model_facts(const std::string& hf_path) {
         facts.model_type = str_of(tc, "model_type");
         if (facts.model_type.empty()) facts.model_type = str_of(j, "model_type");
 
+        // ── GPT-OSS ──
+        // Read only when the config says so, on the same principle. Its shape
+        // is at the TOP level, not in a nested `text_config`, and its rope
+        // parameters are YaRN's four in `rope_scaling`.
+        if (facts.model_type == "gpt_oss") {
+            const auto gi = [](const nlohmann::json& obj, const char* key, int& out) {
+                if (obj.contains(key) && obj[key].is_number_integer()) {
+                    out = obj[key].get<int>();
+                }
+            };
+            const auto gf = [](const nlohmann::json& obj, const char* key, float& out) {
+                if (obj.contains(key) && obj[key].is_number()) {
+                    out = obj[key].get<float>();
+                }
+            };
+            gi(j, "num_hidden_layers", facts.go_num_hidden_layers);
+            gi(j, "hidden_size", facts.go_hidden_size);
+            gi(j, "vocab_size", facts.go_vocab_size);
+            gi(j, "num_attention_heads", facts.go_num_attention_heads);
+            gi(j, "num_key_value_heads", facts.go_num_key_value_heads);
+            gi(j, "head_dim", facts.go_head_dim);
+            gi(j, "sliding_window", facts.go_sliding_window);
+            gi(j, "num_local_experts", facts.go_num_local_experts);
+            gi(j, "num_experts_per_tok", facts.go_num_experts_per_tok);
+            gi(j, "intermediate_size", facts.go_intermediate_size);
+            gf(j, "rms_norm_eps", facts.go_rms_norm_eps);
+            gf(j, "swiglu_limit", facts.go_swiglu_limit);
+            gf(j, "rope_theta", facts.go_rope_theta);
+            if (j.contains("rope_scaling") && j["rope_scaling"].is_object()) {
+                const auto& rs = j["rope_scaling"];
+                gf(rs, "factor", facts.go_rope_factor);
+                gf(rs, "beta_fast", facts.go_rope_beta_fast);
+                gf(rs, "beta_slow", facts.go_rope_beta_slow);
+                gi(rs, "original_max_position_embeddings",
+                   facts.go_rope_original_max_position);
+            }
+        }
+
         // ── Gemma 4 ──
         // Read only when the config says so, so nothing here can perturb the
         // family that already works.
@@ -454,10 +514,25 @@ std::string build_caps_json(const Config& cfg,
         rs_cache_required ? std::min(cfg.batching.max_forward_requests,
                                      kMetalPagedMaxForwardRequests)
                           : cfg.batching.max_forward_requests;
+    // The families `SimpleFamilyEngine` serves allocate their activation pool
+    // for `max_forward_tokens` ROWS at setup, so echoing the config's value
+    // advertises a fire the driver then cannot allocate -- gpt-oss's pool at
+    // 10240 rows is 1.6 GB on top of an 11.8 GB checkpoint, and the heap
+    // creation fails with no mention of which row budget caused it. `512` is
+    // `kPagedMaxForwardTokensCeiling`, the same bound qwen3.5's paged path
+    // measured its way to; a longer prompt is chunked, exactly as it is there.
+    const bool simple_family_engine =
+        pie::metal::model::model_family_of(facts.model_type) ==
+            pie::metal::model::ModelFamily::Gemma4 ||
+        pie::metal::model::model_family_of(facts.model_type) ==
+            pie::metal::model::ModelFamily::GptOss;
     const std::uint32_t max_forward_tokens =
         rs_cache_required
             ? std::min(cfg.batching.max_forward_tokens, kMetalPagedMaxForwardTokens)
-            : cfg.batching.max_forward_tokens;
+            : (simple_family_engine
+                   ? executor::simple_family_max_forward_tokens(
+                         cfg.batching.max_forward_tokens)
+                   : cfg.batching.max_forward_tokens);
     const std::uint32_t max_model_len =
         rs_cache_required ? std::min(facts.max_model_len, kMetalPhase1aMaxCtxTokens)
                           : facts.max_model_len;
@@ -2055,12 +2130,36 @@ class Context::Impl {
         // over a pool bigger or smaller than what the driver claims to have.
         setup_cfg.total_pages = effective_total_pages(cfg_, facts_.has_linear_attn);
         setup_cfg.kv_page_size = cfg_.batching.kv_page_size;
-        setup_cfg.max_forward_tokens = cfg_.batching.max_forward_tokens;
+        // The same bound the capabilities advertised, from the same function:
+        // these families allocate their pool for this many rows.
+        const auto setup_family = pie::metal::model::model_family_of(facts_.model_type);
+        setup_cfg.max_forward_tokens =
+            (setup_family == pie::metal::model::ModelFamily::Gemma4 ||
+             setup_family == pie::metal::model::ModelFamily::GptOss)
+                ? executor::simple_family_max_forward_tokens(cfg_.batching.max_forward_tokens)
+                : cfg_.batching.max_forward_tokens;
         setup_cfg.max_forward_requests = cfg_.batching.max_forward_requests;
         setup_cfg.snapshot_dir = cfg_.model.hf_path;
         setup_cfg.model_type = facts_.model_type;
         setup_cfg.rope_theta = facts_.rope_theta;
         setup_cfg.partial_rotary_factor = facts_.partial_rotary_factor;
+        setup_cfg.gptoss.n_layers = facts_.go_num_hidden_layers;
+        setup_cfg.gptoss.hidden = facts_.go_hidden_size;
+        setup_cfg.gptoss.vocab = facts_.go_vocab_size;
+        setup_cfg.gptoss.n_q_heads = facts_.go_num_attention_heads;
+        setup_cfg.gptoss.n_kv_heads = facts_.go_num_key_value_heads;
+        setup_cfg.gptoss.head_dim = facts_.go_head_dim;
+        setup_cfg.gptoss.sliding_window = facts_.go_sliding_window;
+        setup_cfg.gptoss.n_experts = facts_.go_num_local_experts;
+        setup_cfg.gptoss.experts_per_token = facts_.go_num_experts_per_tok;
+        setup_cfg.gptoss.intermediate = facts_.go_intermediate_size;
+        setup_cfg.gptoss.eps = facts_.go_rms_norm_eps;
+        setup_cfg.gptoss.swiglu_limit = facts_.go_swiglu_limit;
+        setup_cfg.gptoss.rope_theta = facts_.go_rope_theta;
+        setup_cfg.gptoss.rope_factor = facts_.go_rope_factor;
+        setup_cfg.gptoss.rope_beta_fast = facts_.go_rope_beta_fast;
+        setup_cfg.gptoss.rope_beta_slow = facts_.go_rope_beta_slow;
+        setup_cfg.gptoss.rope_original_max_position = facts_.go_rope_original_max_position;
         setup_cfg.gemma4.n_layers = facts_.g4_num_hidden_layers;
         setup_cfg.gemma4.hidden = facts_.g4_hidden_size;
         setup_cfg.gemma4.intermediate = facts_.g4_intermediate_size;

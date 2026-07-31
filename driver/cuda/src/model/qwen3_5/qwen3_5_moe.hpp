@@ -47,6 +47,24 @@ bool qwen35_moe_gate_up_swapped();
 /// contract produced.
 bool qwen35_fused_gdn_projection_enabled();
 
+/// True when the speculative head reads `lm_head` as int8 rather than bf16.
+///
+/// Opt-in (`PIE_QWEN35_MTP_INT8_LM_HEAD`): the draft step's argmax GEMV is
+/// memory-bound over the whole vocabulary, so halving the head pays for the
+/// accuracy the draft can afford to lose -- the verifier re-scores every token
+/// anyway. Read by the contract, which is what publishes the int8 view, and by
+/// the bind, which reads whichever views the contract produced.
+bool qwen35_mtp_int8_lm_head_enabled();
+
+/// True when the shared expert's scalar gate is folded into the fused gate/up
+/// slab as one extra row, giving `[2*Is+1, H]` instead of `[2*Is, H]`.
+///
+/// Opt-in (`PIE_QWEN35_FUSED_SHARED_SCALAR_GATE`): measured a wash to a loss --
+/// the split path wins despite the extra launch, see the definition. Read by
+/// the contract, which is what decides the slab's shape, and by the bind, which
+/// reads whichever slab the contract produced.
+bool qwen35_fused_shared_scalar_gate_enabled();
+
 struct Qwen3_5MoeLayerWeights {
     enum class Kind { LinearAttn, FullAttn };
     Kind kind;
@@ -67,9 +85,8 @@ struct Qwen3_5MoeLayerWeights {
     const DeviceTensor* la_dt_bias     = nullptr;
     // The recurrent kernel and RMSNormGated need fp32 inputs for these
     // two tensors. Qwen3.5-4B ships them as fp32 on disk but
-    // Qwen3.6-35B-A3B ships them as bf16; bind materialises fp32 copies
-    // (owned in `Qwen3_5MoeWeights::owned_fp32_buffers`) so the kernel
-    // signature stays uniform.
+    // Qwen3.6-35B-A3B ships them as bf16; `gdn_fp32_parameters` states the
+    // widening on the contract, so these point straight at the arena.
     const float* la_A_log_fp32  = nullptr;  // [V_h]
     const float* la_norm_w_fp32 = nullptr;  // [head_v_dim]
     const DeviceTensor* la_out_proj    = nullptr;
@@ -86,6 +103,12 @@ struct Qwen3_5MoeLayerWeights {
     const DeviceTensor* moe_router        = nullptr;  // [E, H] bf16
     const DeviceTensor* moe_gate_up_proj  = nullptr;  // [E, 2*I_moe, H] bf16
     const DeviceTensor* moe_down_proj     = nullptr;  // [E, H, I_moe] bf16
+
+    // Streamed routed experts. Set instead of the two pointers above when the
+    // contract declared the experts as a group: there is no fused slab to
+    // index, so the per-expert path asks the cache for one expert at a time.
+    GroupStreamCache* expert_cache = nullptr;
+    std::size_t expert_group = 0;
 
     // Shared expert (standard SwiGLU MLP, intermediate = shared_I)
     const DeviceTensor* shared_gate_proj  = nullptr;  // [I_shared, H]
@@ -116,16 +139,10 @@ struct Qwen3_5MoeWeights {
 
     std::vector<Qwen3_5MoeLayerWeights> layers;
 
-    // Owned fp32 copies of A_log and RMSNormGated.weight materialised at
-    // bind time (Qwen3.6-35B-A3B ships them as bf16 even though the FLA
-    // path consumes them in fp32). One pair per linear-attn layer.
-    std::vector<DeviceBuffer<float>> owned_fp32_buffers;
-
     // Owned bf16 copies of per-rank-sliced linear-attn weights and
     // routed-expert weights. Same role as in Qwen3_5Weights — these
     // tensors have block / fused layouts that don't shard cleanly under
     // uniform axis-0 partitioning, so we slice them by hand at bind time.
-    std::vector<DeviceTensor> owned_bf16_buffers;
 
     struct MtpWeights {
         const DeviceTensor* pre_fc_norm_embedding = nullptr;

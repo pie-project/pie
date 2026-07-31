@@ -101,6 +101,10 @@ public:
     void*  conv_state(int layer, int slot = 0);
     float* recurrent_state(int layer, int slot = 0);
     void*  recurrent_state_raw(int layer, int slot = 0);
+    /// True when `recurrent_state_raw` points at bf16 rather than fp32.
+    bool   recurrent_state_is_bf16() const noexcept {
+        return recurrent_state_bf16_;
+    }
     void*  mtp_pending_hidden(int slot = 0);
 
     // Strides in bytes / fp32 elements between consecutive slots.

@@ -72,6 +72,9 @@ struct StepState {
 
 // ── RawMetalContext::Impl — owns the Metal-4 device objects ───────────────────
 struct RawMetalContext::Impl {
+    // Heap slots memoized by the argument-table slot they are bound to, so a
+    // constant rebound every fire is allocated once. See `const_slot`.
+    std::unordered_map<std::uint64_t, SlotHandle> const_slots;
     id<MTLDevice>            dev   = nil;
     id<MTL4CommandQueue>     queue = nil;
     id<MTL4CommandQueue>     mapping_queue = nil;
@@ -423,6 +426,20 @@ std::unique_ptr<RawMetalContext> RawMetalContext::create(
     return ctx;
 }
 
+SlotHandle RawMetalContext::const_slot(int ordinal, std::uint8_t index, size_t bytes) {
+    const std::uint64_t key =
+        (static_cast<std::uint64_t>(static_cast<std::uint32_t>(ordinal)) << 8) | index;
+    auto& cache = impl_->const_slots;
+    const auto it = cache.find(key);
+    // A different SIZE at the same slot would be a different constant, which
+    // this cache cannot serve; allocate afresh rather than hand back a slot too
+    // small to hold it.
+    if (it != cache.end() && it->second.size >= bytes) return it->second;
+    SlotHandle s = heap_alloc(bytes);
+    if (s.valid()) cache[key] = s;
+    return s;
+}
+
 SlotHandle RawMetalContext::heap_alloc(size_t size, size_t align) {
     auto& I = *impl_;
     SlotHandle h;
@@ -468,6 +485,32 @@ SlotHandle RawMetalContext::create_standalone_buffer(size_t size) {
     if (I.resident) [I.rs requestResidency];
     I.standalone_count += 1;
     I.standalone_bytes += size;
+
+    h.buffer       = (__bridge void*)buf;
+    h.contents_ptr = buf.contents;
+    h.gpu_address  = buf.gpuAddress;
+    h.offset       = 0;
+    h.size         = size;
+    return h;
+}
+
+SlotHandle RawMetalContext::wrap_host_memory(void* ptr, size_t size) {
+    auto& I = *impl_;
+    SlotHandle h;
+    if (ptr == nullptr || size == 0) return h;
+    id<MTLBuffer> buf = [I.dev newBufferWithBytesNoCopy:ptr
+                                                 length:size
+                                                options:MTLResourceStorageModeShared
+                                            deallocator:nil];
+    if (buf == nil) {
+        fprintf(stderr, "[pie-metal] no-copy buffer over host memory failed (%zu bytes)\n",
+                size);
+        return h;
+    }
+    [I.retained addObject:buf];
+    [I.rs addAllocation:buf];
+    [I.rs commit];
+    if (I.resident) [I.rs requestResidency];
 
     h.buffer       = (__bridge void*)buf;
     h.contents_ptr = buf.contents;

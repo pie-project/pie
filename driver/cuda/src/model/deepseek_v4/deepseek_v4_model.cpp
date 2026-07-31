@@ -1,5 +1,7 @@
 #include "model/deepseek_v4/deepseek_v4_model.hpp"
 
+#include "loader/group_stream_cache.hpp"
+
 #include <cstdlib>
 #include <utility>
 
@@ -34,8 +36,34 @@ DsV4Model::DsV4Model(
     // but graphs are only captured for pure-decode shapes.
     {
         const char* v = std::getenv("PIE_DSV4_GRAPH");
-        const bool on = !(v != nullptr && v[0] == '0');
-        caps_.graph_safe = on;
+        bool on = !(v != nullptr && v[0] == '0');
+        // Paging experts is host work in the middle of the forward -- a routing
+        // table read back off the device, a slot chosen, a plan run -- and none
+        // of it is capturable.
+        //
+        // Residency does not decide this. A streamed contract publishes groups
+        // instead of stacks, so `stacked` is false and both device-side
+        // dispatches are off the table; the forward takes the per-expert path,
+        // which reads `topk_idx` back and synchronizes the stream on every
+        // layer whether or not the slab can miss. Under capture that
+        // synchronize is `cudaErrorStreamCaptureUnsupported`. Qwen3.5 already
+        // gates on the cache existing at all; this is the same rule.
+        //
+        // Only the capture cap. `graph_padding_kv_write_safe` says this
+        // family's KV writes are gated on `row_valid`, which is a property of
+        // its kernels and is not changed by where the expert weights live --
+        // and the engine refuses to build a context when a family that aliases
+        // KV page 0 for padding rows does not claim it, so clearing it here
+        // would turn streaming on DeepSeek-V4 into `PIE_STATUS_UNSUPPORTED`
+        // rather than into a lost optimisation.
+        bool capturable = on;
+        for (const auto& L : weights_.layers) {
+            if (L.expert_cache != nullptr) {
+                capturable = false;
+                break;
+            }
+        }
+        caps_.graph_safe = capturable;
         caps_.graph_padding_kv_write_safe = on;
     }
 }

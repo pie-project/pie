@@ -37,6 +37,8 @@
 #include "model/kimi/kimi_contract.hpp"
 #include "model/kimi/kimi_forward.hpp"
 #include "model/kimi/kimi_model.hpp"
+#include "model/kimi_k3/kimi_k3_contract.hpp"
+#include "model/kimi_k3/kimi_k3_model.hpp"
 #include "model/llama_like/llama_like.hpp"
 #include "model/llama_like/llama_like_contract.hpp"
 #include "model/llama_like/llama_like_model.hpp"
@@ -82,6 +84,7 @@ const char* family_name(Family family) noexcept {
     case Family::Qwen3_5Moe: return "qwen3_5_moe";
     case Family::NemotronH:  return "nemotron_h";
     case Family::Kimi:       return "kimi";
+    case Family::KimiK3:     return "kimi_k3";
     case Family::DeepSeekV4: return "deepseek_v4";
     case Family::Glm5:       return "glm5";
     case Family::Qwen3VL:    return "qwen3_vl";
@@ -305,6 +308,23 @@ public:
     PlanInfo info;
 };
 
+class KimiK3Plan final : public ModelPlan {
+public:
+    explicit KimiK3Plan(KimiK3Weights w) : weights(std::move(w)) {
+        info.family = Family::KimiK3;
+        info.num_layers = weights.layers.size();
+        info.layer_is_linear_attn.reserve(weights.layers.size());
+        for (const auto& L : weights.layers) {
+            info.layer_is_linear_attn.push_back(
+                L.kind == KimiK3LayerWeights::Kind::Kda);
+        }
+    }
+    const PlanInfo& plan_info() const override { return info; }
+
+    KimiK3Weights weights;
+    PlanInfo info;
+};
+
 class Qwen3VLPlan final : public ModelPlan {
 public:
     Qwen3VLPlan(Qwen3Weights w, std::optional<Qwen3VLVisionWeights> v)
@@ -442,6 +462,9 @@ std::unique_ptr<ModelPlan> bind_row_deepseek_v4(LoadedModel& engine, bool) {
 std::unique_ptr<ModelPlan> bind_row_kimi(LoadedModel& engine, bool) {
     return std::make_unique<KimiPlan>(bind_kimi(engine));
 }
+std::unique_ptr<ModelPlan> bind_row_kimi_k3(LoadedModel& engine, bool) {
+    return std::make_unique<KimiK3Plan>(bind_kimi_k3(engine));
+}
 std::unique_ptr<ModelPlan> bind_row_glm5(LoadedModel& engine, bool) {
     return std::make_unique<Glm5Plan>(bind_glm5(engine));
 }
@@ -552,6 +575,15 @@ std::unique_ptr<IModel> create_kimi_model(
     return std::make_unique<KimiModel>(
         std::move(plan.weights), *res.hf_config, *res.kimi_ws, *res.mla_cache,
         res.tp_size, res.tp_comm, /*emit_logits=*/true);
+}
+
+std::unique_ptr<IModel> create_kimi_k3_model(
+    std::unique_ptr<ModelPlan> plan_base, ModelResources& res) {
+    auto& plan = plan_cast<KimiK3Plan>(*plan_base, "kimi_k3");
+    return std::make_unique<KimiK3Model>(
+        std::move(plan.weights), *res.hf_config, *res.kimi_k3_ws,
+        *res.mla_cache, *res.kimi_k3_state_cache, res.tp_size, res.tp_comm,
+        /*emit_logits=*/true);
 }
 
 std::unique_ptr<IModel> create_glm5_model(
@@ -726,6 +758,11 @@ std::vector<ArchEntry> build_arch_table() {
              mt == std::string("kimi_k2") ? author_kimi_contract
                                           : author_deepseek_mla_contract);
     }
+
+    // ── Kimi-K3 (hybrid KDA/MLA-NoPE + latent MoE + attention residuals).
+    push("kimi_k3", Family::KimiK3, "kimi_k3", default_validate_config,
+         bind_row_kimi_k3, create_kimi_k3_model,
+         author_kimi_k3_contract);
 
     // ── GLM-5.1 (MLA + DSA indexer + routed/shared MoE).
     push("glm_moe_dsa", Family::Glm5, "glm5", default_validate_config,

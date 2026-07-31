@@ -34,7 +34,7 @@ struct GdnCoreParams {   // gdn_core.metal:39  (buffer 11)
 // Bind a POD constant value into a fresh resident slot at (ordinal, bind_index).
 template <class V>
 inline void bind_const(RawMetalContext& ctx, int ord, uint8_t idx, const V& val, int* count) {
-    SlotHandle s = ctx.heap_alloc(sizeof(V));
+    SlotHandle s = ctx.const_slot(ord, idx, sizeof(V));
     if (!s.valid()) throw std::runtime_error("decode_consts: heap_alloc failed (budget too small)");
     std::memcpy(s.contents(), &val, sizeof(V));
     ctx.arg_bind_ordinal(ord, idx, s);

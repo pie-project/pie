@@ -437,6 +437,9 @@ set(PIE_CUDA_MODEL_SOURCES
   src/model/glm5/glm5.cpp
   src/model/glm5/glm5_forward.cpp
   src/model/glm5/glm5_model.cpp
+  src/model/kimi_k3/kimi_k3.cpp
+  src/model/kimi_k3/kimi_k3_forward.cpp
+  src/model/kimi_k3/kimi_k3_model.cpp
   src/model/kimi/kimi.cpp
   src/model/kimi/kimi_forward.cpp
   src/model/kimi/kimi_model.cpp
@@ -560,6 +563,8 @@ add_library(pie_driver_cuda_lib STATIC
   src/kernels/embed.cu
   src/kernels/envelope.cu
   src/kernels/gated_delta_net.cu
+  src/kernels/kda.cu
+  src/kernels/attn_res.cu
   src/kernels/gather_rows.cu
   src/kernels/gemv.cu
   src/kernels/gather_tokens.cu
@@ -937,6 +942,11 @@ pie_add_cuda_target(test_gather_tokens
 pie_add_cuda_target(test_pack_dense_mask
   SOURCES tests/pack_dense_mask_test.cu
   LIBS pie_driver_cuda_lib)
+# Names three src/ files (kda, attn_res, swiglu), so by the rule above it links
+# the lib rather than hand-maintaining that closure.
+pie_add_cuda_target(test_kimi_k3_kernels
+  SOURCES tests/kimi_k3_kernels_test.cu
+  LIBS pie_driver_cuda_lib)
 pie_add_cuda_target(test_envelope_dot
   SOURCES tests/test_envelope_dot.cu src/kernels/envelope.cu
   LIBS CUDA::cudart)
@@ -1077,6 +1087,23 @@ pie_add_cuda_target(test_tp_gate
   LIBS Threads::Threads)
 pie_add_cuda_target(test_grouped_copy
   SOURCES tests/grouped_copy_test.cpp)
+# The eviction rule for streamed group instances. Header-only and CUDA-free on
+# purpose: whether a slab thrashes is decided here, and that must be checkable
+# without a device.
+pie_add_cuda_target(test_group_slot_index
+  SOURCES tests/group_slot_index_test.cpp)
+# The slab itself, against the residency it replaces: needs a device, a
+# checkpoint on disk and the loader, because the claim it checks is about bytes.
+if(PIE_LOADER_STATICLIB)
+  pie_add_cuda_target(test_group_stream_cache
+    SOURCES tests/group_stream_cache_test.cpp
+    INCLUDE_DIRS
+      ${CMAKE_CURRENT_SOURCE_DIR}/../abi/include
+      ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include
+      ${PIE_DRIVER_ABI_INCLUDE_DIR}
+      ${PIE_LOADER_INCLUDE_DIR}
+    LIBS pie_driver_cuda_lib nlohmann_json::nlohmann_json ${PIE_LOADER_STATICLIB} dl pthread)
+endif()
 # The non-compact ExtentWrite path. Header-only: it builds its own one-file
 # plan, so it needs the loader's headers but not the staticlib.
 pie_add_cuda_target(test_strided_copy

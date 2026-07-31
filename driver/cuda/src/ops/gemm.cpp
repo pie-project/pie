@@ -20,6 +20,7 @@
 #include "kernels/dequant_fp4.hpp"
 #include "kernels/dequant_fp8.hpp"
 #include "kernels/add_bias.hpp"
+#include "kernels/argmax.hpp"
 #include "kernels/gemv.hpp"
 #include "kernels/quant_bf16_to_fp8.hpp"
 #include "kernels/residual_add.hpp"
@@ -1801,9 +1802,15 @@ namespace {
 // device memory the cache may hold (0 disables it).
 class DequantWeightCache {
  public:
+    // Per device, not per process. Every rank of a TP group runs in this one
+    // process with its own current device, and the entries here own device
+    // memory: a shared cache lets one rank's insert evict and `cudaFree` a
+    // pointer belonging to another rank's device, which poisons the context
+    // and surfaces as an illegal access in whatever runs next. The same
+    // reasoning already governs `Bf16LtCtx`, `Bf16LtPlanCache` and
+    // `DenseGemmTuner` a few hundred lines up.
     static DequantWeightCache& instance() {
-        static DequantWeightCache c;
-        return c;
+        return per_device_singleton<DequantWeightCache>();
     }
 
     // The expansion depends on the weight AND on how it is read, so the key
@@ -1876,7 +1883,8 @@ class DequantWeightCache {
         used_ = 0;
     }
 
- private:
+    // Public only so `per_device_singleton` can build one per device; the
+    // instance is still reached exclusively through `instance()`.
     DequantWeightCache() {
         const char* v = std::getenv("PIE_FP8_DEQUANT_CACHE_GB");
         if (v != nullptr && v[0] != '\0') {
@@ -2470,6 +2478,59 @@ void gemm_act_x_w(
         return;
     }
     unsupported("gemm_act_x_w", act_dtype, w.dtype, y_dtype);
+}
+
+bool lm_head_argmax_supported(WeightView w) {
+    return w.data != nullptr && w.dtype == DType::BF16 &&
+        w.scale_data == nullptr;
+}
+
+std::size_t lm_head_argmax_slab_bytes(int M, int N, int chunk) {
+    if (M <= 0 || N <= 0 || chunk <= 0) return 0;
+    const std::size_t width = static_cast<std::size_t>(std::min(chunk, N));
+    return static_cast<std::size_t>(M) * width * sizeof(__nv_bfloat16);
+}
+
+bool lm_head_argmax_chunked(
+    cublasHandle_t handle,
+    const void* act,
+    WeightView w,
+    std::int32_t* token_ids,
+    void* slab,
+    float* acc_val,
+    std::int32_t* acc_idx,
+    int M, int N, int K,
+    int chunk)
+{
+    if (!lm_head_argmax_supported(w)) return false;
+    if (M <= 0 || N <= 0 || K <= 0 || chunk <= 0) return false;
+    if (act == nullptr || slab == nullptr ||
+        token_ids == nullptr || acc_val == nullptr || acc_idx == nullptr) {
+        return false;
+    }
+
+    cudaStream_t stream = nullptr;
+    cublasGetStream(handle, &stream);
+    const auto* weight_rows = static_cast<const std::uint8_t*>(w.data);
+
+    for (int base = 0; base < N; base += chunk) {
+        const int width = std::min(chunk, N - base);
+        // A slab is rows [base, base+width) of W, which are contiguous, and
+        // lands in `slab` as a tightly packed [M, width] -- so the slab's row
+        // stride is `width`, not `chunk`, on the ragged final iteration.
+        gemm_act_x_w(
+            handle, act,
+            WeightView::raw(
+                weight_rows + static_cast<std::size_t>(base) *
+                                  static_cast<std::size_t>(K) * sizeof(__nv_bfloat16),
+                DType::BF16),
+            slab, M, width, K);
+        kernels::launch_argmax_accumulate_bf16(
+            slab, M, width, width, base, acc_val, acc_idx,
+            /*init=*/base == 0, stream);
+    }
+    kernels::launch_argmax_finalize_bf16(acc_val, acc_idx, token_ids, M, stream);
+    return true;
 }
 
 void gemm_act_x_wt_bf16_out_fp32(

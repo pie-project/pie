@@ -119,6 +119,34 @@ class CheckpointSource {
         return checked_file(file_id, file_offset, span_bytes).data + file_offset;
     }
 
+    /// Ask the kernel to start faulting a span in.
+    ///
+    /// Advisory in both directions: it may do nothing, and a reader that skips
+    /// it is still correct, only later. It exists because the one thing the
+    /// page cache cannot work out for itself is which span comes next --
+    /// streaming reads experts in an order a router picks at runtime, and no
+    /// readahead heuristic will guess it. A caller that knows says so.
+    void advise_will_need(
+        std::uint32_t file_id,
+        std::uint64_t file_offset,
+        std::uint64_t span_bytes) const noexcept {
+        if (span_bytes == 0 || file_id >= files_.size()) return;
+        const File& file = files_[file_id];
+        if (file.data == nullptr) return;
+        if (file_offset > file.mapped_size ||
+            span_bytes > file.mapped_size - file_offset) {
+            return;
+        }
+        // Page-align down; madvise wants a page boundary and rounds the length
+        // up itself.
+        const auto start =
+            reinterpret_cast<std::uintptr_t>(file.data + file_offset);
+        const std::uintptr_t from = start - start % page_size_;
+        (void)::madvise(reinterpret_cast<void*>(from),
+                        static_cast<std::size_t>(span_bytes + (start - from)),
+                        MADV_WILLNEED);
+    }
+
     /// Read a span into a caller-owned host buffer.
     ///
     /// `pread` rather than `memcpy` from the mapping: the caller is a pinned

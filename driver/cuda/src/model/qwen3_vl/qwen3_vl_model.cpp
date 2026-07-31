@@ -5,6 +5,7 @@
 
 #include "model/qwen3_vl/qwen3_vl_vision_adapter.hpp"  // to_vis_raw_qwen
 #include "model/qwen3_vl/qwen3_vl_vision_forward.hpp"   // Qwen3VLVisionInputs, scatter
+#include "ops/gemm.hpp"
 
 namespace pie_cuda_driver::model {
 
@@ -32,6 +33,11 @@ Qwen3VLModel::Qwen3VLModel(
     caps_.graph_padding_kv_write_safe = true;
     caps_.supports_compact_logits = true;
     caps_.supports_runtime_window = true;
+    // Same reasoning as LlamaLikeModel: `body()` forwards the slab width, and
+    // only a dense BF16 head can be reduced as it is produced.
+    caps_.supports_fused_lm_head_argmax =
+        weights_.lm_head != nullptr &&
+        ops::lm_head_argmax_supported(*weights_.lm_head);
 }
 
 void Qwen3VLModel::prepare(AttentionWorkspace& attn_ws,
@@ -122,6 +128,7 @@ void Qwen3VLModel::body(Workspace& ws,
     // forward never materializes dense logits over the (large) image span.
     LlamaLikeForwardCfg fwd = fwd_cfg_;
     fwd.emit_logits = in.emit_logits;
+    fwd.logits_argmax_chunk_tokens = in.logits_argmax_chunk_tokens;
 
     llama_like_forward_paged(
         weights_, hf_config_, fwd, plan_,

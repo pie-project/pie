@@ -160,9 +160,7 @@ int main(int argc, char** argv) {
                     pie::metal::Grid mg{}; pie::metal::Threadgroup mt{};
                     pie::metal::gemma4::launch_shape_mb(d, g, rows, mg, mt);
                     if (mg.x == 0 || mg.y == 0 || mg.z == 0) ++mb_empty;
-                    const pie::metal::Pso p = pie::metal::gemma4::pso_for(d, base, psos);
-                    const std::uint32_t threads = mt.x * mt.y * mt.z;
-                    if (p.valid() && threads > ctx->pso_max_threads(p)) ++mb_oversized;
+                    (void)mb_oversized;
                     if (rows != 1) continue;
                     pie::metal::Grid dg{}; pie::metal::Threadgroup dt{};
                     pie::metal::gemma4::launch_shape(d, g, dg, dt);
@@ -189,11 +187,25 @@ int main(int argc, char** argv) {
             expect(mb_ok, "the multi-batch PSOs compile: " + (mb_ok ? std::string("ok")
                                                                     : mb_err));
             if (mb_ok) {
-                int unresolved = 0, still_m1 = 0;
+                int unresolved = 0, still_m1 = 0, over = 0;
                 for (const auto& d : dag) {
                     const pie::metal::Pso p =
                         pie::metal::gemma4::pso_for_mb(d, g, 128, base, mb, psos);
                     if (!p.valid()) ++unresolved;
+                    // The shape must fit the pipeline it will actually RUN on.
+                    // Checked here against `pso_for_mb` rather than earlier
+                    // against `pso_for`: that check passed while gemma4's
+                    // 512-wide PAGED attention allowed 896 threads against a
+                    // 1024-thread launch, and a dispatch over a pipeline's limit
+                    // does not run at all -- so every full-attention layer's
+                    // attention was silently skipped, and the prefill produced a
+                    // plausible wrong token.
+                    if (p.valid()) {
+                        pie::metal::Grid gg{};
+                        pie::metal::Threadgroup tt{};
+                        pie::metal::gemma4::launch_shape_mb(d, g, 128, gg, tt);
+                        if (tt.x * tt.y * tt.z > ctx->pso_max_threads(p)) ++over;
+                    }
                     const bool changes =
                         pie::metal::gemma4::qmv_kn(d.kind, g, d.layer).N != 0 ||
                         d.kind == pie::metal::gemma4::Kind::EmbedGather ||
@@ -209,6 +221,9 @@ int main(int argc, char** argv) {
                     }
                 }
                 expect(unresolved == 0, "every M>1 dispatch resolves to a pipeline");
+                expect(over == 0,
+                       "and fits the threadgroup limit of the pipeline it runs on (" +
+                           std::to_string(over) + " do not)");
                 expect(still_m1 == 0,
                        "and every kind whose kernel changes at M>1 got a different one (" +
                            std::to_string(still_m1) + " did not)");

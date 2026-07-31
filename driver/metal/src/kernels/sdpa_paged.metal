@@ -32,8 +32,22 @@
 #include <metal_stdlib>
 using namespace metal;
 
-template <typename T, int D, int V = D>
-[[kernel]] void sdpa_paged_decode(
+// The online softmax strides keys by BN=32 simdgroups, so the threadgroup must
+// be exactly BN*BD = 1024 threads: with fewer, the keys belonging to the missing
+// simdgroups are never visited and the attention is silently partial.
+//
+// At D=512 the compiler's default register allocation only admits 896, and a
+// dispatch that exceeds a pipeline's limit does not run AT ALL -- which reads,
+// downstream, as an attention output of exactly zero. gemma4's full-attention
+// layers are 512 wide, so every one of them was skipped. Pinning the bound makes
+// the compiler fit 1024 (spilling if it must) instead of quietly allowing less.
+// WITH_SINK adds gpt-oss's learned per-head scalar to the softmax denominator,
+// as though it were one more key with no value to contribute. It is what lets a
+// head attend to nothing. A template parameter rather than a second kernel: the
+// paging, the CSR walk and the online softmax are identical, and two copies of
+// them would be two things to keep true.
+template <typename T, int D, int V = D, bool WITH_SINK = false>
+[[kernel]] [[max_total_threads_per_threadgroup(1024)]] void sdpa_paged_decode(
     const device T* queries     [[buffer(0)]],   // [N, n_q_heads, D]
     const device T* k_pages     [[buffer(1)]],   // [num_pages, page_size, n_kv_heads, D]
     const device T* v_pages     [[buffer(2)]],
@@ -50,6 +64,7 @@ template <typename T, int D, int V = D>
     const device uint& attention_mask_stride[[buffer(13)]],
     const device uchar* attention_mask_enabled [[buffer(14)]],
     const constant int& window                 [[buffer(15)]],
+    const device T* sinks                      [[buffer(16)]],  // [n_q_heads], WITH_SINK only
     uint3 tid       [[threadgroup_position_in_grid]],
     uint3 tpg       [[threadgroups_per_grid]],
     uint simd_gid   [[simdgroup_index_in_threadgroup]],
@@ -131,10 +146,21 @@ template <typename T, int D, int V = D>
   U factor = fast::exp(max_score - new_max);
   sum_exp_score = simd_sum(sum_exp_scores[simd_lid] * factor);
 
+  // Folded in at a shared reference, so a sink larger than every logit does not
+  // overflow the exponential; `orescale` then carries that shift into the
+  // accumulated values, which is why it multiplies `o` and not just the sum.
+  U orescale = 1;
+  if (WITH_SINK) {
+    const U sink = static_cast<U>(sinks[tid.x]);
+    const U m2 = max(new_max, sink);
+    orescale = fast::exp(new_max - m2);
+    sum_exp_score = sum_exp_score * orescale + fast::exp(sink - m2);
+  }
+
   for (int i = 0; i < v_per_thread; i++) {
     outputs[simd_lid * BD + simd_gid] = o[i];
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    o[i] = simd_sum(outputs[simd_gid * BD + simd_lid] * factor);
+    o[i] = simd_sum(outputs[simd_gid * BD + simd_lid] * factor) * orescale;
     o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
@@ -143,18 +169,25 @@ template <typename T, int D, int V = D>
     for (int i = 0; i < v_per_thread; i++) out[i] = static_cast<T>(o[i]);
 }
 
-#define instantiate_sdpa_paged(name, itype, d, v)                          \
-  template [[host_name("sdpa_paged_decode_" #name "_d_" #d)]]               \
-  [[kernel]] void sdpa_paged_decode<itype, d, v>(                          \
+#define instantiate_sdpa_paged_impl(fn, name, itype, d, v, sink)           \
+  template [[host_name(fn "_" #name "_d_" #d)]]                            \
+  [[kernel]] void sdpa_paged_decode<itype, d, v, sink>(                    \
       const device itype*, const device itype*, const device itype*,       \
       device itype*, const constant int&, const device int*,               \
       const device int*, const device uint*, const device uint*,           \
       const constant int&, const constant int&, const constant float&,     \
       const device uchar*, const device uint&, const device uchar*,        \
-      const constant int&,                                                 \
+      const constant int&, const device itype*,                            \
       uint3, uint3, uint, uint);
+
+#define instantiate_sdpa_paged(name, itype, d, v)                          \
+  instantiate_sdpa_paged_impl("sdpa_paged_decode", name, itype, d, v, false)
+
+#define instantiate_sdpa_paged_sink(name, itype, d, v)                     \
+  instantiate_sdpa_paged_impl("sdpa_paged_decode_sink", name, itype, d, v, true)
 
 instantiate_sdpa_paged(float32, float, 256, 256)
 instantiate_sdpa_paged(float16, half, 256, 256)
 instantiate_sdpa_paged(bfloat16, bfloat, 256, 256)
 instantiate_sdpa_paged(bfloat16, bfloat, 512, 512)  // gemma4 full-attn (head_dim 512)
+instantiate_sdpa_paged_sink(bfloat16, bfloat, 64, 64)  // gpt-oss (head_dim 64)

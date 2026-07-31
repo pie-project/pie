@@ -1398,7 +1398,7 @@ struct QuantizedBlockLoader {
 // Aligned-only form of MLX's qmm_t_impl: every tile is full, so there is no
 // `M`/`num_els`/`num_outs` bookkeeping and no safe-load branch.
 template <typename T, int group_size, int bits, int BM, int BK, int BN,
-          bool WITH_RESIDUAL>
+          bool WITH_RESIDUAL, bool WITH_BIAS = false>
 METAL_FUNC void qmm_t_aligned_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -1467,9 +1467,45 @@ METAL_FUNC void qmm_t_aligned_impl(
           float(y[r * static_cast<int64_t>(N) + c]) +
           float(residual[r * static_cast<int64_t>(N) + c]));
     }
+  } else if (WITH_BIAS) {
+    // A Linear's additive bias, broadcast down the tile's rows. gpt-oss biases
+    // every projection, so without this the batched path is a GEMM plus a
+    // dispatch that reads and rewrites the whole output to add one vector.
+    // `residual` carries the bias here -- same slot, same load, one row of it.
+    mma_op.store_result(y, N);
+    threadgroup_barrier(mem_flags::mem_device);
+    for (uint idx = simd_gid * 32u + simd_lid; idx < uint(BM * BN);
+         idx += uint(WM * WN * SIMD_SIZE)) {
+      const int r = int(idx) / BN;
+      const int c = int(idx) % BN;
+      y[r * static_cast<int64_t>(N) + c] = static_cast<T>(
+          float(y[r * static_cast<int64_t>(N) + c]) + float(residual[y_col + c]));
+    }
   } else {
     mma_op.store_result(y, N);
   }
+}
+
+template <typename T, int group_size, int bits, int BM, int BK, int BN>
+[[kernel]] void affine_qmm_t_aligned_bias(
+    const device uint32_t* w   [[buffer(0)]],
+    const device T* scales     [[buffer(1)]],
+    const device T* biases     [[buffer(2)]],
+    const device T* x          [[buffer(3)]],
+    device T* y                [[buffer(4)]],
+    const constant int& K      [[buffer(5)]],
+    const constant int& N      [[buffer(6)]],
+    // Buffer 7 is `bind::GoQmv::Bias`, which gpt-oss's matvec already binds
+    // there -- so the batched path needs no host binding of its own.
+    const device T* bias       [[buffer(7)]],
+    uint3 tid       [[threadgroup_position_in_grid]],
+    uint simd_gid   [[simdgroup_index_in_threadgroup]],
+    uint simd_lid   [[thread_index_in_simdgroup]]) {
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+  threadgroup T Xs[BM * BK_padded];
+  threadgroup T Ws[BN * BK_padded];
+  qmm_t_aligned_impl<T, group_size, bits, BM, BK, BN, false, true>(
+      w, scales, biases, x, y, bias, Xs, Ws, K, N, tid, simd_gid, simd_lid);
 }
 
 template <typename T, int group_size, int bits, int BM, int BK, int BN>
@@ -1521,6 +1557,11 @@ template <typename T, int group_size, int bits, int BM, int BK, int BN>
   [[kernel]] void affine_qmm_t_aligned_residual<bfloat, 64, 4, bm, bk, bn>(    \
       const device uint32_t*, const device bfloat*, const device bfloat*,      \
       const device bfloat*, device bfloat*, const constant int&,               \
+      const constant int&, const device bfloat*, uint3, uint, uint);           \
+  template [[host_name("affine_qmm_t_bias_bfloat16_gs_64_b_4_bm_" #bm "_bn_" #bn)]] \
+  [[kernel]] void affine_qmm_t_aligned_bias<bfloat, 64, 4, bm, bk, bn>(        \
+      const device uint32_t*, const device bfloat*, const device bfloat*,      \
+      const device bfloat*, device bfloat*, const constant int&,               \
       const constant int&, const device bfloat*, uint3, uint, uint);
 
 instantiate_qmm_t(16, 32, 32)
@@ -1528,6 +1569,13 @@ instantiate_qmm_t(16, 32, 64)
 instantiate_qmm_t(16, 32, 16)
 instantiate_qmm_t(32, 32, 16)
 instantiate_qmm_t(32, 32, 32)
+// The wide row block at the widest column tile. `qmm_bn` takes the widest tile
+// that DIVIDES the output, and every projection in these checkpoints is a
+// multiple of 64 -- so a 32-row batch asks for exactly this pair. It used to be
+// left out and aliased onto the BM=16 pipeline, which is not a crash: the grid
+// is built for 32 rows per block and the pipeline computes 16, so HALF the
+// batch is never written. At 32 rows gemma4's logits came back all zero.
+instantiate_qmm_t(32, 32, 64)
 
 // ── Strided form, for the prefill ────────────────────────────────────────────
 // Identical to the aligned kernel above except that the row pitch of `x`, `y`

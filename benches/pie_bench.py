@@ -18,8 +18,10 @@ from typing import Any
 
 from common import (
     ROOT,
+    ArrivalPacer,
     RequestResult,
     add_mode_subcommands,
+    arrival_schedule,
     hash_output_tokens,
     cuda_profiler_start,
     cuda_profiler_stop,
@@ -616,7 +618,7 @@ async def run(args: argparse.Namespace):
             }
 
         async def launch_one(i: int, *, max_tokens: int | None = None):
-            if max_tokens is None and getattr(args, "mixed_phase", False):
+            if max_tokens is None:
                 max_tokens = request_max_tokens(args, i)
             inp = {
                 **common_input(max_tokens),
@@ -830,6 +832,12 @@ async def run(args: argparse.Namespace):
                     for _ in indices
                 ]
 
+        pacer = ArrivalPacer(
+            arrival_schedule(
+                n, args.arrival_rate, args.arrival_process, args.arrival_seed
+            )
+        )
+
         async def one(i: int, *, max_tokens: int | None = None) -> RequestResult:
             return await wait_one(await launch_one(i, max_tokens=max_tokens))
 
@@ -888,6 +896,21 @@ async def run(args: argparse.Namespace):
                     *(wait_one(item) for item in deferred)
                 )
             return await asyncio.gather(*(wait_one(item) for item in launched))
+
+        async def many_paced(indices) -> list[RequestResult]:
+            # Open loop: each request is launched at its scheduled offset and
+            # awaited from there, so a request that arrives while the engine
+            # is full pays the queueing delay in its own latency instead of
+            # having its arrival silently deferred.
+            pacer.start()
+
+            async def offer(k: int, i: int) -> RequestResult:
+                await pacer.wait(k)
+                return await one(i)
+
+            return await asyncio.gather(
+                *(offer(k, i) for k, i in enumerate(indices))
+            )
 
         if args.warmup:
             warmup_max_tokens = args.warmup_max_tokens or args.max_tokens
@@ -949,6 +972,8 @@ async def run(args: argparse.Namespace):
         try:
             if args.mode == "latency":
                 results = [await one(start_idx + i) for i in range(n)]
+            elif pacer.enabled:
+                results = await many_paced(range(start_idx, start_idx + n))
             else:
                 results = await many(range(start_idx, start_idx + n))
         finally:
@@ -1161,6 +1186,9 @@ async def run(args: argparse.Namespace):
             "ignore_eos": args.ignore_eos,
             "unique_prompts": args.unique_prompts,
             "cuda profiler capture": args.cuda_profiler_capture,
+            "arrival_rate": args.arrival_rate,
+            "arrival_process": args.arrival_process,
+            **pacer.stats(),
             **(
                 {
                     "client timing epoch unix s": measured_epoch_unix_s,

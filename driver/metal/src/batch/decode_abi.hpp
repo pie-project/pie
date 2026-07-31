@@ -93,9 +93,13 @@ enum class IoSlot : uint8_t {
     AttnMask       = 15, // u8[N,mask_stride] dense allow mask
     AttnMaskStride = 16, // u32[1] dense mask row stride
     AttnMaskEnabled= 17, // u8[N] 1 iff row consumes AttnMask
+    // Which rows the fire will SAMPLE, in readout order. The tail runs over
+    // these and no others: a prefill computes every row of the body but reads
+    // one per request, and the LM head is the step's most expensive dispatch.
+    SampleRows     = 18, // u32[S] — row indices into the body's [N, hidden]
 };
 inline constexpr int kIoSlotCount =
-    static_cast<int>(IoSlot::AttnMaskEnabled) + 1;
+    static_cast<int>(IoSlot::SampleRows) + 1;
 
 // ── Per-kernel binding indices (arg order the encoder binds into MTL4ArgumentTable) ──
 // Grounded in MLX's host-side dispatch arg order, adjusted for I1 (scalars→buffers).
@@ -143,6 +147,10 @@ enum class SdpaPaged : uint8_t {
     // is a window read out of uninitialized memory, which is wrong attention
     // rather than a crash.
     Window = 15,
+    // gpt-oss's learned per-head scalar, which joins the softmax denominator as
+    // though it were one more key. Bound only by the family that has one; the
+    // `sink` instantiation is a separate pipeline, so the others never read it.
+    Sinks = 16,
 };
 
 // rms_single_row: group=(row/N_READS), grid=(1,1,1). Buffer 3 is a packed
@@ -327,6 +335,9 @@ enum class Geglu : uint8_t { Gate = 0, Up = 1, Out = 2, Params = 3 };
 // logit_softcap.metal: out = cap * tanh(logits / cap), over the vocabulary.
 enum class Softcap : uint8_t { Logits = 0, Out = 1, Params = 2 };
 
+// row_gather.metal: out[i,:] = in[rows[i],:] — the fire's sampled rows, dense.
+enum class RowGather : uint8_t { In = 0, Out = 1, Rows = 2, Params = 3 };
+
 // layer_scalar.metal: out = x * scalar[0]. A learned per-layer gain, broadcast.
 enum class LayerScalar : uint8_t { X = 0, Scalar = 1, Out = 2, Params = 3 };
 
@@ -343,6 +354,59 @@ enum class VNorm : uint8_t { X = 0, Out = 1, Params = 2 };
 // plus the residual and (scaled variant only) the learned per-layer gain.
 //
 //   out = rms_norm(x) * w + r            [* s[0]]
+// ── GPT-OSS ────────────────────────────────────────────────────────────────
+// The matvec, plus the two things every projection in this family has that no
+// other one does: an additive bias, and (for the MoE) an expert index the GPU
+// picked. `bind::Qmv`'s seven slots verbatim, so the weight binds are shared.
+enum class GoQmv : uint8_t {
+    W = 0, Scales = 1, Biases = 2, X = 3, Out = 4, K = 5, N = 6,
+    Bias = 7,        // the Linear's additive bias -- NOT `Biases`, the zero point
+    ExpertIds = 8,   // routed projections only: [experts_per_token] from the router
+    // Whether the INPUT is per-expert as well as the weight. `gate` and `up`
+    // read one shared norm output (0); `down` reads the SwiGLU's k-wide stack
+    // (K). Stated rather than inferred from the kind, because a kernel that
+    // guessed would read four copies of the first expert's activation and
+    // produce a plausible wrong token.
+    XSlotStride = 9,
+    // The token row's pitch in `x`. Stated rather than assumed to be K, because
+    // `down` reads the SwiGLU's [rows, k, intermediate] stack, whose row is k
+    // times as wide as its slot.
+    XRowStride = 10,
+    // How many expert slots each row selects, so a routed dispatch can find
+    // ITS row's ids: at M>1 every row routes independently, which is why a
+    // batched MoE is not one wider matmul.
+    SlotsPerRow = 11,
+};
+
+// router_topk: top-k over the router's logits, then a softmax over the k that
+// survive. Emits both halves of the routing decision.
+enum class GoRouterTopK : uint8_t { Logits = 0, Ids = 1, Weights = 2, Params = 3 };
+
+// gptoss_swiglu: gate*sigmoid(alpha*gate) * (up+1), both operands clamped.
+enum class GoSwiGlu : uint8_t { Gate = 0, Up = 1, Out = 2, Params = 3 };
+
+// expert_combine: the weighted sum of the k experts' outputs.
+enum class GoExpertCombine : uint8_t { Y = 0, Weights = 1, Out = 2, Params = 3 };
+
+// sdpa_vector_decode_sink: bind::SdpaSliding verbatim plus the per-head sink.
+enum class SdpaSink : uint8_t {
+    Q = 0, K = 1, V = 2, Out = 3, GqaFactor = 4, N = 5,
+    KHeadStride = 6, KSeqStride = 7, VHeadStride = 8, VSeqStride = 9, Scale = 10,
+    Window = 11, QRowStride = 12, ORowStride = 13,
+    Sinks = 14,
+};
+
+// rope_neox_freqs_decode: the frequencies are a TABLE, not a base. Whatever
+// closed form produced them (YaRN here) is the host's arithmetic, done once.
+enum class RopeFreqs : uint8_t {
+    X = 0, Position = 1, Scale = 2, InvFreq = 3, HeadDim = 4,
+    MScale = 5,  // YaRN's attention-temperature correction on q and k
+    // `rope_neox_freqs_mb` only: the token row's pitch, `n_heads * head_dim`.
+    // Not derivable from the grid -- q and k have different head counts and
+    // share the kernel.
+    RowStride = 6,
+};
+
 enum class RmsResidual : uint8_t {
     X = 0, W = 1, Out = 2, Params = 3, Residual = 4, Scalar = 5,
 };
@@ -397,6 +461,7 @@ enum class Kernel : uint8_t {
     G4Geglu,             // gelu_tanh(gate) * up
     G4LayerScalar,       // learned per-layer gain
     G4Softcap,           // cap * tanh(logits / cap)
+    G4RowGather,         // the sampled rows, compacted before the tail
     G4SdpaSliding,       // sliding-window decode attention
     // Per-Layer Embeddings.
     G4PleTokenGather,    // embed_tokens_per_layer
@@ -413,6 +478,15 @@ enum class Kernel : uint8_t {
     G4AttnPostResidual,  // rms(block)*post_attention_layernorm + resid
     G4FfnPostResidual,   // rms(block)*post_feedforward_layernorm + resid
     G4PleResidualScaled, // (rms(ple)*post_per_layer_input_norm + resid)*layer_scalar
+    // ── GPT-OSS. Its embedding and head are separate tensors, and every
+    // projection is biased, so none of the shared kinds' weight maps fit.
+    GoEmbed,             // model.embed_tokens (quantized, NOT tied)
+    GoLmHead,            // lm_head (quantized, its own tensor)
+    GoQmvQ, GoQmvK, GoQmvV, GoQmvO,
+    GoSdpaSink,          // self_attn.sinks
+    GoRouter,            // mlp.router (8-bit affine) + its bias
+    GoExpertGate, GoExpertUp, GoExpertDown,
+    GoRouterTopK, GoSwiGlu, GoExpertCombine
 };
 
 // ── Bucketed command-buffer key (relaxes "byte-identical CB" → "byte-identical
