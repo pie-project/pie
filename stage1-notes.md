@@ -236,12 +236,32 @@ kv) the mask-prefill + unfused-QKV loss and the O(R x pool) dense pack
 could reappear; re-measure there before defaulting co-batch on. And two
 liveness seams found while measuring block the relax anyway:
 
-1. At the default `PIE_FRAME_SIZE=2`, EVERY dense-device-mask decode
-   inferlet (chat-completion included) dies at frame slot 1: the pooled
-   device-geometry pass resolves descriptor ports on the host at frame
-   prepare (`descriptor_resolve.hpp` "not ready"), and the producing fire
-   of the same frame has not settled. Frame size 1 is currently the only
-   way to run masked decode at all on this branch head.
+1. FIXED (engine, `fire::submit_frame`). At the default `PIE_FRAME_SIZE=2`,
+   EVERY dense-device-mask decode inferlet (chat-completion included) died
+   at frame slot 1: the pooled device-geometry pass resolves descriptor
+   ports on the host at frame prepare (`descriptor_resolve.hpp` "not
+   ready"), and FramePrepare for every step of a v14 frame runs before ANY
+   step reaches the stream (driver `context.cpp` `launch`) — so a
+   device-geometry fire behind another fire of the same frame read cells
+   whose producing fire (its own previous fire, slot 0) was not even
+   enqueued. Structured mode died the same way on its OTHER ports (tokens/
+   kv-len — the device-composed template covers only mask-free
+   DecodeEnvelope shapes; DeviceGeometry class always host-reads at
+   prepare). The fix: `submit_frame` detects a DeviceGeometry-class pass in
+   any slot after the first and submits the frame's fires as single-slot
+   frames (one frame per lane seals per boundary, so the producer's frame
+   is on-stream before the consumer's prepare readback syncs it — the
+   `PIE_FRAME_SIZE=1` shape, paid only by that lane). Verified: dense
+   12/12, structured 5/5, stock chat-completion clean at default frame
+   size; all modes byte-identical to `PIE_FRAME_SIZE=1`; mixed
+   masked+plain (repro_maskmix) 12/12 clean at BOTH frame sizes; FS=1
+   outputs byte-identical pre/post fix. Note while verifying: dense-mode
+   text diverges from none/structured at ctx≈512 (repro_maskmix --parity)
+   — pre-existing kernel-path numerics, present identically in this
+   session's pre-fix captures and in the item A session's own
+   modes_prefix/postfix_512_104.json captures, NOT a frame-size effect
+   (all three modes byte-identical at the short-prompt config across both
+   frame sizes).
 2. Twice under mixed masked+plain load, the scheduler handed a
    dense-masked fire into a multi-program batch; the driver's v1 mask
    scope throws `RetryableLaunchError` ("dense device mask in a

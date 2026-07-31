@@ -1271,6 +1271,62 @@ pub async fn submit_frame<C: FireContext>(
         let (_, rep) = fired[0];
         return submit_pass_stamped(ctx, this, Resource::new_borrow(rep), None).await;
     }
+    // Same-frame producer hazard (Stage 2 verdict, liveness seam 1): a
+    // DeviceGeometry-class pass resolves its descriptor ports from channel
+    // cells ON THE HOST at the driver's FramePrepare, and FramePrepare for
+    // EVERY step of a v14 frame runs before ANY step reaches the stream
+    // (driver context.cpp `launch`: an admitted frame is atomic, so all
+    // prepares precede all enqueues). A device-geometry fire behind another
+    // fire of the same frame therefore host-reads cells whose producing
+    // fire — in a run-ahead decode loop, its own previous fire, one slot
+    // earlier — is not even enqueued yet: the read fails
+    // (`descriptor_resolve.hpp` "not ready") and the whole frame poisons.
+    // The class is decided at bind (`inferlet::host::forward`, e.g. every
+    // dense-device-mask decode loop routes to pool-owned device geometry),
+    // so the hazard is structural per frame composition. Submit each fire
+    // as its own single-slot frame instead: one frame per lane seals per
+    // boundary, so the producer's frame is enqueued on-stream before the
+    // consumer's FramePrepare descriptor readback (which syncs that
+    // stream) — exactly the `PIE_FRAME_SIZE=1` shape that runs these
+    // passes correctly today, paid only by this lane.
+    let mut device_geometry_tail = false;
+    for &(_, rep) in fired.iter().skip(1) {
+        let fwd: Resource<ForwardPass> = Resource::new_borrow(rep);
+        if ctx.resources().get(&fwd)?.devgeo.is_some() {
+            device_geometry_tail = true;
+            break;
+        }
+    }
+    if device_geometry_tail {
+        for &(slot, rep) in &fired {
+            let (lane, seq) = {
+                let pipeline = ctx.resources().get(&this)?;
+                if pipeline.scope.is_closed() {
+                    return Ok(Err("pipeline: pipeline is closed".to_string()));
+                }
+                (pipeline.scope.scheduler_id(), pipeline.next_frame_seq())
+            };
+            let stamp = crate::scheduler::FrameStamp {
+                lane,
+                seq,
+                slot: 0,
+                fires: 1,
+            };
+            let pipeline: Resource<Pipeline> = Resource::new_borrow(this.rep());
+            let fwd: Resource<ForwardPass> = Resource::new_borrow(rep);
+            match submit_pass_stamped(ctx, pipeline, fwd, Some(stamp)).await {
+                // A single-slot frame is arrival-complete on its own, so a
+                // mid-sequence failure strands nothing: the frames already
+                // submitted seal and drain without truncation bookkeeping.
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    return Ok(Err(format!("pipeline: frame slot {slot}: {error}")));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        return Ok(Ok(()));
+    }
     if let Err(error) = validate_frame(ctx, k, &fired)? {
         return Ok(Err(error));
     }
