@@ -1022,11 +1022,31 @@ void prepare_step(
         effective_structured_masks = s.composed.structured_masks;
     const auto mask_coverage = pipeline::structured_mask_coverage(
         effective_structured_masks);
+    // Stage 2 item A: MIXED coverage — structured-masked lanes co-batched
+    // with mask-free lanes — packs per-lane structured masks instead of
+    // refusing the step. A mask-free decode/prefill lane attends causally
+    // by construction (its KV extent never exceeds position+1), so its
+    // absent descriptor fills with Causal and the per-lane pack kernel
+    // (`launch_pack_structured_mask`, kind==1) reproduces its semantics
+    // exactly. The recon's alternative — admitting the mix only when the
+    // SHARED runtime-window override succeeds — was REJECTED by
+    // measurement (stage1-notes.md, Stage 2 "Measured"): the override was
+    // no cheaper than the packed-mask path end-to-end at these scales, and
+    // one shared window cannot express per-lane structure anyway; a filled
+    // mix therefore always takes the pack path below, never the override.
+    // Genuinely dense device masks cannot reach this seam: the scheduler
+    // batches them solo and `Context::Impl::launch` refuses a violating
+    // step at admission (`Dispatch::dense_mask_scope_violation`).
+    bool filled_causal_coverage = false;
     if (mask_coverage ==
         pipeline::StructuredMaskCoverage::Mixed) {
-        throw pipeline::RetryableLaunchError(
-            "explicit PTIR masks cannot share one runtime override with "
-            "ordinary wire requests");
+        for (auto& descriptor : effective_structured_masks) {
+            if (!descriptor) {
+                descriptor.kind =
+                    pie_native::launch::StructuredMaskKind::Causal;
+            }
+        }
+        filled_causal_coverage = true;
     }
     const auto effective_first = std::find_if(
         effective_structured_masks.begin(),
@@ -1051,18 +1071,23 @@ void prepare_step(
     const std::span<const std::uint32_t> sptr_view  = s.composed_ready ? std::span<const std::uint32_t>(s.composed.sampling_indptr)   : sptr_view_orig;
     if (effective_first != effective_structured_masks.end() &&
         engine.forward_fn.supports_runtime_window) {
-        const auto window = pipeline::runtime_window_for_tail_aligned(
-            effective_structured_masks,
-            pos_view,
-            qo_view,
-            kvpp_view,
-            kvlpl_view,
-            static_cast<std::uint32_t>(kv_cache.page_size()));
-        if (window.has_value()) {
-            use_structured_mask = true;
-            s.structured_window_left = *window;
-        } else {
+        if (filled_causal_coverage) {
+            // Filled mixed coverage packs per lane (rationale above).
             pack_structured_mask = true;
+        } else {
+            const auto window = pipeline::runtime_window_for_tail_aligned(
+                effective_structured_masks,
+                pos_view,
+                qo_view,
+                kvpp_view,
+                kvlpl_view,
+                static_cast<std::uint32_t>(kv_cache.page_size()));
+            if (window.has_value()) {
+                use_structured_mask = true;
+                s.structured_window_left = *window;
+            } else {
+                pack_structured_mask = true;
+            }
         }
     }
     s.dispatch_view = view;
@@ -1303,14 +1328,22 @@ void prepare_step(
     const auto fmask_view  = view.flattened_masks.as<std::uint32_t>();
     const auto mskptr_view = view.mask_indptr.as<std::uint32_t>();
     if (!fmask_view.empty()) {
+        // A SOLO device-geometry program with `has_user_mask` shipped its
+        // host-lowered (BRLE) mask on the wire: decode it against the
+        // RESOLVED geometry. In a MULTI-program device-geometry batch the
+        // wire rows cannot be the device lane's mask — the scheduler keeps
+        // host-lowered device-geometry masks solo
+        // (`wire_mask_on_device_geometry`), and a structured device mask
+        // (item A, the only masked device-geometry shape that co-batches)
+        // ships NO wire rows. The rows are then the WIRE lanes' synthesized
+        // causal masks (mask elision turns off for the whole batch once any
+        // member sets `has_user_mask`), interpreted against the wire
+        // layout: pure causal decodes to nothing and the structured pack
+        // covers the batch. Anything non-causal here is a scheduler breach
+        // — fail loud below rather than silently dropping a mask.
         const bool resolved_custom_wire =
-            s.dg_resolved && view.has_user_mask;
-        if (resolved_custom_wire &&
-            view.ptir_program_hashes.size() > 1) {
-            throw std::runtime_error(
-                "ptir: host-derived masks on device geometry require a "
-                "solo program");
-        }
+            s.dg_resolved && view.has_user_mask &&
+            view.ptir_program_hashes.size() == 1;
         const auto qo_span = std::span<const std::uint32_t>(
             resolved_custom_wire ? qo_view.data() : qo_view_orig.data(),
             resolved_custom_wire ? qo_view.size() : qo_view_orig.size());
@@ -1328,10 +1361,33 @@ void prepare_step(
             resolved_custom_wire
                 ? kvlpl_view.size()
                 : kvlpl_view_orig.size());
+        // In a composed multi-program batch the wire layout ends with the
+        // device-resolved programs' placeholder rows (zero-token rows the
+        // fire plan orders last); they carry no wire masks but would fail
+        // the causal walk structurally (`qo_len <= 0`). Restrict the walk
+        // to the HOST-class prefix — the only rows wire masks can belong
+        // to.
+        std::size_t causal_rows = qo_span.size() - 1;
+        if (s.dg_resolved && !resolved_custom_wire &&
+            view.ptir_program_row_indptr.size() ==
+                s.rpg.is_device_geometry.size() + 1) {
+            std::size_t wire_rows = 0;
+            for (std::size_t p = 0;
+                 p < s.rpg.is_device_geometry.size();
+                 ++p) {
+                if (s.rpg.is_device_geometry[p]) break;
+                wire_rows = view.ptir_program_row_indptr.data()[p + 1];
+            }
+            causal_rows = std::min<std::size_t>(causal_rows, wire_rows);
+        }
         bool pure_causal =
             pie_cuda_driver::brle::is_pure_causal(
                 fmask_view, mskptr_view,
-                qo_span, kvpp_span, kvlpl_span,
+                qo_span.first(causal_rows + 1),
+                kvpp_span.first(
+                    std::min(kvpp_span.size(), causal_rows + 1)),
+                kvlpl_span.first(
+                    std::min(kvlpl_span.size(), causal_rows)),
                 kv_cache.page_size());
         if (!pure_causal && !view.has_user_mask && is_pure_decode) {
             std::vector<std::uint32_t> logical_kv_lens;
@@ -1359,10 +1415,28 @@ void prepare_step(
                 s.mask_indptr_count =
                     static_cast<int>(decoded.mask_indptr.size());
                 s.have_custom_mask = true;
+            } else if (view.has_user_mask) {
+                // Composed multi-program batch carrying NON-causal wire
+                // rows: a wire-masked fire rode a device-geometry batch,
+                // which the composed path cannot honour (rationale above).
+                throw std::runtime_error(
+                    "ptir: non-causal wire masks cannot ride a composed "
+                    "device-geometry batch (scheduler must keep "
+                    "wire-masked fires out)");
             }
         }
     }
 
+    // A wire (BRLE) custom mask and a structured pack target the same
+    // persistent buffers; the scheduler never composes the two, so a
+    // collision is a composition bug that must fail loud, not silently
+    // drop the structured lanes' masks.
+    if (pack_structured_mask && s.have_custom_mask) {
+        throw std::runtime_error(
+            "ptir: structured mask pack collides with staged wire custom "
+            "masks (wire-masked and structured-masked lanes must not "
+            "compose)");
+    }
     if (pack_structured_mask && !s.have_custom_mask) {
         const int lanes = static_cast<int>(qo_view.size()) - 1;
         std::vector<std::uint32_t> klen(

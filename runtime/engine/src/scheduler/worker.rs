@@ -414,7 +414,21 @@ pub(crate) struct LaunchGrouping {
 }
 
 fn has_dense_device_mask(request: &crate::driver::LaunchPlan) -> bool {
-    request.has_user_mask && request.masks.is_empty()
+    request.has_user_mask && request.masks.is_empty() && !request.structured_device_mask
+}
+
+/// Whether this plan's mask keeps it out of composed batches. Wire (BRLE)
+/// masks index the wire request layout composition replaces, and a genuinely
+/// dense device mask has no per-lane compose path — both block. A device
+/// mask that statically recognizes as STRUCTURED
+/// (`structured_device_mask`, the Stage 2 item A relax) does not: the
+/// driver re-recognizes it from the trace at admission
+/// (`Dispatch::dense_mask_scope_violation` returns clean) and lowers it per
+/// lane at prepare, filling mask-free co-batched lanes with causal — one
+/// fire instead of two serialized waves, which the Stage 2 measurement put
+/// at 1.8-2.3x per token for the plain lanes under the old solo regime.
+fn mask_blocks_composition(request: &crate::driver::LaunchPlan) -> bool {
+    request.has_user_mask && !(request.masks.is_empty() && request.structured_device_mask)
 }
 
 impl LaunchGrouping {
@@ -450,7 +464,11 @@ impl LaunchGrouping {
         // request layout, which composition replaces (driver fails loud).
         // A DENSE-masked device-resolved fire is stricter still: unlike a
         // host-derived channel mask, it has no wire BRLE rows and the composed
-        // path cannot merge it with another program.
+        // path cannot merge it with another program. A STRUCTURED device
+        // mask (`mask_blocks_composition` false) is exempt from all of these
+        // clauses — Stage 2 item A: the driver packs per-lane structured
+        // masks for the whole composed batch, so such a fire co-batches like
+        // an unmasked one.
         let masked_device_geometry = has_dense_device_mask(&request.request);
         let wire_mask_on_device_geometry = request.request.has_user_mask
             && !request.request.masks.is_empty()
@@ -459,7 +477,7 @@ impl LaunchGrouping {
             && (masked_device_geometry
                 || wire_mask_on_device_geometry
                 || (self.has_user_mask && self.has_device_geometry)
-                || (request.request.has_user_mask && self.has_device_geometry)
+                || (mask_blocks_composition(&request.request) && self.has_device_geometry)
                 || (request.request.device_resolved_geometry && self.has_user_mask))
         {
             return false;
@@ -506,7 +524,11 @@ impl LaunchGrouping {
         self.forward_tokens = self.forward_tokens.saturating_add(usage.forward_tokens);
         self.page_refs = self.page_refs.saturating_add(usage.page_refs);
         self.has_solo_submission |= request.requires_solo_submission();
-        self.has_user_mask |= request.request.has_user_mask;
+        // A structured device mask never blocks composition (item A), so it
+        // must not poison the group's mask bit either — otherwise a masked
+        // lane admitted first would still exclude every later
+        // device-geometry lane through the group-state clauses.
+        self.has_user_mask |= mask_blocks_composition(&request.request);
         self.has_device_geometry |= request.request.device_resolved_geometry;
         self.has_page_mask |= request.page_mask_program;
         self.has_multi_token |= request.has_multi_token_row();
@@ -7578,6 +7600,125 @@ mod tests {
                  (host_lowered={host_lowered})"
             );
         }
+    }
+
+    /// Stage 2 item A: a pooled device-geometry fire whose device mask
+    /// statically recognizes as STRUCTURED (`structured_device_mask`,
+    /// naive-masked's `mask_mode=structured` shape, attention-sink /
+    /// sliding-window-attention's real producers) CO-BATCHES — with
+    /// envelope decode lanes, wire decode fires, and other structured
+    /// fires, in either admission order. The driver fills the mask-free
+    /// lanes' descriptors with causal and packs per lane. A genuinely
+    /// dense (unrecognized) device mask keeps the solo contract, and wire
+    /// (BRLE) masks stay out of composed batches — both pinned by
+    /// `launch_grouping_refuses_pooled_masked_device_geometry_mixes`; the
+    /// wire-mask exclusion is re-pinned here against a structured group.
+    #[test]
+    fn launch_grouping_co_batches_structured_device_masks() {
+        let limits = SchedulerLimits {
+            max_forward_requests: 8,
+            max_forward_tokens: 4096,
+            max_page_refs: 4096,
+        };
+        let structured_masked = |instance: u64| {
+            let mut request = dummy_launch_request(ProcessId::new_v4(), instance);
+            request.prebuilt = true;
+            request.request = LaunchPlan {
+                qo_indptr: vec![0, 0],
+                has_user_mask: true,
+                structured_device_mask: true,
+                device_resolved_geometry: true,
+                ..LaunchPlan::default()
+            };
+            request
+        };
+        let envelope_decode = |instance: u64| {
+            let mut request = dummy_launch_request(ProcessId::new_v4(), instance);
+            request.request.device_resolved_geometry = true;
+            request
+        };
+
+        // Structured fire first: envelope decode, wire decode, and a second
+        // structured fire all join (the mixed repro's composition, one wave).
+        let mut grouping = LaunchGrouping::default();
+        assert!(grouping.accepts(&structured_masked(1), limits, 16));
+        assert!(
+            !grouping.push(&structured_masked(1), limits, 16),
+            "a structured device mask must not close the group"
+        );
+        assert!(
+            grouping.accepts(&envelope_decode(2), limits, 16),
+            "an envelope decode lane co-batches behind a structured-masked fire"
+        );
+        grouping.push(&envelope_decode(2), limits, 16);
+        assert!(
+            grouping.accepts(&dummy_launch_request(ProcessId::new_v4(), 3), limits, 16),
+            "a wire decode fire co-batches behind a structured-masked fire"
+        );
+        assert!(
+            grouping.accepts(&structured_masked(4), limits, 16),
+            "two structured-masked fires co-batch (per-lane descriptors)"
+        );
+
+        // Envelope decode first: the structured fire joins (the reverse
+        // admission order).
+        let mut grouping = LaunchGrouping::default();
+        grouping.push(&envelope_decode(5), limits, 16);
+        assert!(
+            grouping.accepts(&structured_masked(6), limits, 16),
+            "a structured-masked fire joins envelope decode lanes"
+        );
+        grouping.push(&structured_masked(6), limits, 16);
+        assert!(
+            grouping.accepts(&envelope_decode(7), limits, 16),
+            "later envelope lanes still join after the structured admit"
+        );
+
+        // The structured bit relaxes ONLY the structured shape: a dense
+        // device mask in the same group state still refuses, in both orders.
+        let dense_masked = |instance: u64| {
+            let mut request = dummy_launch_request(ProcessId::new_v4(), instance);
+            request.request = LaunchPlan {
+                qo_indptr: vec![0, 0],
+                has_user_mask: true,
+                device_resolved_geometry: true,
+                ..LaunchPlan::default()
+            };
+            request
+        };
+        assert!(
+            !grouping.accepts(&dense_masked(8), limits, 16),
+            "a dense device mask must not ride a structured co-batch"
+        );
+        let mut grouping = LaunchGrouping::default();
+        grouping.push(&dense_masked(9), limits, 16);
+        assert!(
+            !grouping.accepts(&structured_masked(10), limits, 16),
+            "a structured fire must not join a dense-masked solo group"
+        );
+
+        // Wire (BRLE) masks still index the wire layout: they never join a
+        // structured device-geometry group, in either order.
+        let wire_masked = |instance: u64| {
+            let mut request = dummy_launch_request(ProcessId::new_v4(), instance);
+            request.request.has_user_mask = true;
+            request.request.masks =
+                vec![crate::driver::command::EncodedMask::new(vec![0, 1], 1)];
+            request.request.mask_indptr = vec![0, 1];
+            request
+        };
+        let mut grouping = LaunchGrouping::default();
+        grouping.push(&structured_masked(11), limits, 16);
+        assert!(
+            !grouping.accepts(&wire_masked(12), limits, 16),
+            "a wire-masked fire must not join a structured device-geometry group"
+        );
+        let mut grouping = LaunchGrouping::default();
+        grouping.push(&wire_masked(13), limits, 16);
+        assert!(
+            !grouping.accepts(&structured_masked(14), limits, 16),
+            "a structured fire must not join a wire-masked group"
+        );
     }
 
     /// The page-mask/pure-decode grouping invariant: an

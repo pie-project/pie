@@ -907,13 +907,21 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 let bound = &p.instance.program.bound;
                 let (shadow, shadow_cells) = (&p.host_shadow, &p.cells);
                 let mut known = |chan: u32| shadow.fire_value(bound, shadow_cells, chan);
-                let attn_mask =
-                    match geometry::evaluate_attn_mask(bound, &mut known, &geometry.qo_indptr) {
-                        Ok(mask) => mask,
-                        Err(error) => {
-                            return Ok(Err(format!("pipeline: fire attention mask: {error}")));
-                        }
-                    };
+                // Device-geometry lowering: a statically structured mask
+                // classifies `Device { structured: true }` regardless of
+                // host derivability (item A — the driver re-derives it per
+                // lane from the trace, and wire BRLE rows would force the
+                // fire solo).
+                let attn_mask = match geometry::evaluate_attn_mask_device_geometry(
+                    bound,
+                    &mut known,
+                    &geometry.qo_indptr,
+                ) {
+                    Ok(mask) => mask,
+                    Err(error) => {
+                        return Ok(Err(format!("pipeline: fire attention mask: {error}")));
+                    }
+                };
                 (geometry, attn_mask)
             } else {
                 let bound = &p.instance.program.bound;
@@ -2336,7 +2344,11 @@ async fn fire_device_geometry<C: FireContext>(
         let bound = &p.instance.program.bound;
         let (shadow, shadow_cells) = (&p.host_shadow, &p.cells);
         let mut known = |chan: u32| shadow.fire_value(bound, shadow_cells, chan);
-        geometry::evaluate_attn_mask(bound, &mut known, &mask_qo_indptr)
+        // Recognition precedes evaluation on this device-geometry path
+        // (item A): a structured mask classifies `Device { structured:
+        // true }` and co-batches; host-derivable unrecognized masks keep
+        // wire BRLE + the solo clauses below.
+        geometry::evaluate_attn_mask_device_geometry(bound, &mut known, &mask_qo_indptr)
     };
     let attn_mask = match attn_mask {
         Ok(mask) => mask,
