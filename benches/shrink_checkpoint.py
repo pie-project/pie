@@ -398,11 +398,15 @@ def _rewrite_gpt_oss(cfg: dict, plan: Plan) -> None:
 
 def _rewrite_qwen3_5_moe(cfg: dict, plan: Plan) -> None:
     _rewrite_common(cfg, plan)
+    # Everything below lives in `text_config`, not at the top level: the
+    # checkpoint is a `Qwen3_5MoeForConditionalGeneration` wrapper around the
+    # text tower, and reading `cfg` directly silently rewrites nothing.
+    tc = _text_cfg(cfg, plan)
     # `layer_types` is what makes a layer linear vs full attention, and the
     # pattern has period `full_attention_interval`; a block that is a whole
     # number of periods keeps the ratio the model was trained with.
-    if isinstance(cfg.get("layer_types"), list):
-        cfg["layer_types"] = _slice_list(cfg["layer_types"], plan.src_layers)
+    if isinstance(tc.get("layer_types"), list):
+        tc["layer_types"] = _slice_list(tc["layer_types"], plan.src_layers)
 
 
 FAMILIES: dict[str, dict[str, Any]] = {
