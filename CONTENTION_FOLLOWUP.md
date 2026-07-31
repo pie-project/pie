@@ -6930,3 +6930,171 @@ forward token budget (pie's is already 2x vLLM's, and prefill already runs at
 ~80% of peak FLOPs), workload destaggering (`--output-spread`, byte-identical
 schedule), decode kernel work (D wins at 550-token context), and host
 scheduling (92.5% GPU busy, and busy alone exceeds vLLM's wall).
+
+---
+
+## §20.43 — P falsifies §20.42's prediction and sharpens its mechanism
+
+§20.42 closed with a prediction: the prefill-heavy shape P (96% prefill)
+should land near parity, because with almost no decode neither engine has
+anything to absorb prefill into. That prediction is **wrong**. P is pie's
+worst recorded loss.
+
+```
+shape P, nreq 4608, conc 128, rate 0, ABBA 2+2, vLLM mem-util 0.55
+  pie   3300   3414     mean 3357 tok/s
+  vLLM  4155   4137     mean 4146 tok/s     ratio 0.810
+  wall  pie 21.97 s     vLLM 17.78 s
+  ttft  pie 10873 ms    vLLM 6521 ms  (p50)
+```
+
+The comparison is clean: `--no-prefix-caching` is passed to vLLM
+(`enable_prefix_caching=False` in its own config dump), so P's repeated
+700-word filler body is prefilled in full by both engines. Both read
+1.78 M prompt tokens and write 73728 output tokens.
+
+### The prediction was wrong because decode's cost is not proportional to its token count
+
+`PIE_FIRE_TIMING=waves`, same run shape, decomposed with §20.13's
+non-overlapping tiling:
+
+| | waves | GPU time | tokens | rate |
+|---|---|---|---|---|
+| prefill-carrying | 498 | 15163 ms | 1798917 | 118638 tok/s |
+| pure decode | 224 | 4894 ms | 55446 | 11331 tok/s |
+| **total busy** | 722 | **20057 ms (92.9%)** | 1854363 | |
+| idle | | 1529 ms (7.1%) | | |
+
+Decode is **4.0% of P's token work and 24.4% of its GPU time.**
+
+Both halves are healthy in isolation. Prefill runs at
+`2 x 0.6e9 x 1798917 / 15.163 s` = **142 TFLOPS**, ~78% of the L40S's dense
+bf16 ceiling. The decode waves are bandwidth-bound and near their own floor:
+at 112 KiB of KV per token and a mean context of 387+t, the 55446 rows they
+carry need 2.68 TB, which is 3.10 s at 864 GB/s against 4.89 s measured —
+63% of peak, the shortfall being the per-wave fixed cost (see below).
+
+What is unhealthy is that the two never run together. pie's GPU busy alone
+(20.06 s) already exceeds vLLM's entire wall (17.78 s), so no amount of host
+scheduling could close this: pie does more GPU work for the same tokens.
+
+### The schedule is 37 pure-prefill blocks alternating with 37 pure-decode blocks
+
+Run-length-encoding the wave phase sequence over the whole run:
+
+```
+P1 D7 (P14 D6) x 36
+```
+
+37 P-blocks, 37 D-blocks, against **36 cohorts** (4608 requests / 128 lanes).
+This is §20.42's phase purity, but where X's blocks had to be read out of a
+21-deep prefill run, here the block count *equals* the cohort count exactly.
+The 14 prefill waves per block are the seal's partition loop chopping one
+boundary's 128 x ~387 = 49.5 K tokens into `max_wave_tokens = 4096` pieces.
+
+### Every idle gap is at the prefill re-entry
+
+```
+gaps >= 10 ms: n=47, sum 1511 ms (7.0% of span)
+  next wave is prefill: 47      next wave is decode: 0
+```
+
+Not one of the 47 gaps precedes a decode wave. The idle is exclusively the
+cohort turnover — the fleet retiring and rejoining — which is §20.39's join
+gate, and it is 36 cohorts against 47 gaps.
+
+### What a passenger seat costs, measured
+
+Least squares over the two wave populations (n=498 and n=224):
+
+```
+prefill wave:  dur_ms = 7.064 + 0.006414*tokens + 0.005862*rows   R2 0.695
+decode  wave:  dur_ms = 5.221 + 0.067163*rows                     R2 0.993
+```
+
+The decode wave's **5.22 ms intercept** is the whole reason this shape loses.
+224 dedicated decode waves pay it 224 times = 1.17 s, for waves that carry a
+mean of 248 rows and therefore 248 tokens. A prefill wave carrying 3612
+tokens pays the same class of fixed cost once and amortises it over 14x the
+work.
+
+Do not read the 11x ratio between the two row coefficients as a clean
+counterfactual: the decode rows that ride prefill waves in this run are
+mostly the short-prompt half, so 0.0059 ms/row is biased low, and a
+passenger's KV read does not vanish — it moves under a compute-bound kernel
+where the memory system has slack. The defensible bound is the arithmetic
+above: of the 4.89 s spent in dedicated decode waves, **1.17 s is pure
+per-wave fixed cost that a passenger seat deletes outright**, and the
+remaining 3.72 s is a bandwidth demand that vLLM overlaps with prefill
+compute and pie does not.
+
+Against a 4.19 s deficit: 1.51 s turnover idle, 1.17 s decode-wave fixed
+cost, and the balance the un-overlapped KV bandwidth. All three are the same
+structure.
+
+### Why vLLM does not have this shape
+
+vLLM chunks prefill at `max_num_batched_tokens=2048` and refills from a
+global queue every step. When 128 requests arrive together it spreads their
+prefill over ~26 steps, and the request prefilled in step 1 starts decoding
+in step 2 — riding along with the prefill of requests 5..127. The cohort is
+never phase-pure because there is no cohort.
+
+pie cannot do this, and the reason is one comment in `frame.rs:1061-1070`:
+
+> Boundary: the wait-all frame quorum. Seal only once every awaited lane's
+> next frame is fully submitted (an idle lane between frames is a missing
+> member) and no join is in flight... The wait is INFINITE by principle.
+
+Lane 0 finishes its prefill in partition 1 of 14 and its guest immediately
+submits a decode fire. That fire cannot be sealed until all 128 lanes have
+submitted theirs, i.e. until all 14 partitions have drained. The seal itself
+does not discriminate by phase — `frame.rs:909-926` packs any lane's fires
+into whichever of the `k` waves has room, with no prefill/decode bar, exactly
+as §20.33 established. There is simply never anything of the other phase
+available at seal time, because the barrier holds every lane at the same
+program point.
+
+### This unifies every recorded loss
+
+| cell | ratio | pie prompt tok/s | vLLM prompt tok/s |
+|---|---|---|---|
+| M/c64 | 1.225 | 18414 | 15037 |
+| M/c128 | 1.151 | 22941 | 19929 |
+| M/c256 | 1.071 | 27899 | 26061 |
+| M/c512 | **0.862** | 24641 | 28546 |
+| X/c64 | 0.920 | 24840 | 26994 |
+| X/c128 | 0.966 | 27887 | 28879 |
+| X/c256 | **0.783** | 22499 | 28726 |
+| X/c512 | **0.769** | 22089 | 28728 |
+| P/c128 | **0.810** | 81234 | 100346 |
+
+vLLM's prefill rate is flat in concurrency on X (26994 / 28879 / 28726 /
+28728) — it is saturated by c64 and adding lanes changes nothing. pie's peaks
+at c128 and then **falls 21%**. More lanes in the quorum means a longer
+wait-all and a longer phase-pure block, so pie's throughput is a decreasing
+function of concurrency in exactly the regime where an engine should be flat.
+
+M is the only family pie wins, and M is the only shape whose two halves run
+*different programs*, so a boundary can contain one lane's prefill and
+another's decode. Even M crosses over at c512.
+
+P is the control that proves the axis is program phase and not prompt
+heterogeneity: P is also `--mixed-phase`, but its `--max-tokens 16` equals its
+`--mixed-short-output 16`, so both halves run the *same* program (one prefill,
+sixteen decodes) and differ only in prompt length. That buys nothing, exactly
+as X's `--output-spread` bought nothing.
+
+### Status of the fix
+
+Unchanged from §20.41 and §20.42, and now three times the evidence: wave
+membership must stop being a function of a fleet-wide wait-all boundary. The
+quorum exists to close the `bind -> dispatch -> seal -> bind` cycle (§20.3),
+and four relaxations have already been measured and rejected, so this is a
+design change and not a tuning knob. It is not attempted here.
+
+Levers that remain closed, with the measurement that closed them: forward
+token budget (pie's 4096 is 2x vLLM's 2048), prefill kernel rate (142 TFLOPS,
+78% of dense peak), decode kernel rate (63% of BW peak, and D/Ds both win),
+workload destaggering (`--output-spread`, byte-identical schedule), prefix
+caching (off on both), and host scheduling (92.9% GPU busy).
