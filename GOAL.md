@@ -68,8 +68,16 @@ keeps kilobytes because it recomputes on the host every step. We keep the
 translation from tokens to terminals resident, and the honest number today is
 31 MB for a schema that started at 440 MB. Bringing that to the same order of
 magnitude as XGrammar's cache is the central engineering problem, and the
-measurements say it is reachable: a mask is a pure function of the lexer state,
-and a real document visits 1–4% of the states its grammar can reach.
+measurements say it is *partly* reachable: a mask is a pure function of the
+lexer state, so a state's reading tables can be built on first visit rather than
+at compile time. **[corrected 2026-07-31]** An earlier version of this line
+claimed a real document visits 1-4% of the states its grammar can reach.
+Measured over 116 schemas replayed through their own model-generated document,
+the fraction is **p50 39.2%** (p10 12.1%, p90 68.2%, max 84.7%); for the 67
+schemas with at least 200 lexer states it is p50 21.4%. Laziness is therefore
+worth roughly 2.5x on total work rather than 25-100x, and its real prize is
+moving 80% of compile out of the request's critical path - `groups` is 55.9% of
+the pipeline and `emit` 24.0%, measured with `ENGRAIN_WHY=1` over 60 schemas.
 
 ## Sequencing
 
