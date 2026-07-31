@@ -466,6 +466,7 @@ class StableStageBuffers {
         }
         if (metadata_ != nullptr) cudaFree(metadata_);
         if (scratch_ != nullptr) cudaFree(scratch_);
+        if (side_ != nullptr) cudaFree(side_);
     }
 
     // The pinned staging block, safe for the host to repack.
@@ -533,6 +534,17 @@ class StableStageBuffers {
         return {metadata_, scratch_};
     }
 
+    // A stable per-region side-table block (increment 4): per-lane device
+    // tables the region launches take as KERNEL ARGUMENTS (the page-mask
+    // dest table) live here instead of a per-fire cudaMallocAsync, so a
+    // captured launch's baked table address is the address every later
+    // prepare re-uploads into. Same growth discipline (and the same
+    // generation counter) as the metadata/scratch blocks.
+    std::uint8_t* side_block(std::size_t bytes, cudaStream_t stream) {
+        grow_device(&side_, &side_capacity_, bytes, stream, "side");
+        return side_;
+    }
+
     // Bumped on every device-block growth. See the capture precondition in
     // the class comment (the HookSidebandArena::generation() contract).
     std::uint64_t generation() const noexcept { return generation_; }
@@ -585,6 +597,8 @@ class StableStageBuffers {
     std::size_t metadata_capacity_ = 0;
     std::uint8_t* scratch_ = nullptr;
     std::size_t scratch_capacity_ = 0;
+    std::uint8_t* side_ = nullptr;
+    std::size_t side_capacity_ = 0;
     std::uint64_t generation_ = 0;
 };
 
@@ -665,11 +679,19 @@ class GeneratedRuntimeContext {
     }
 
     // The prepared path's stable buffers (see detail::StableStageBuffers):
-    // one per (stage runtime id, stream), sized on first use.
+    // one per (stage runtime id, stream, slot), sized on first use. `slot`
+    // is 0 on the eager per-layer path (one buffer per stage, repacked
+    // between that stage's occurrences). The hook-graph prepare pass
+    // (stage 6 increment 4) instead hands every prepared (phase, layer,
+    // occurrence, group) its own nonzero slot: all of a fire's prepares run
+    // BEFORE the body launches, so occurrence N+1's repack can no longer
+    // hide behind stream order — distinct occurrences need distinct stable
+    // blocks, and a captured graph bakes each block's address per slot.
     detail::StableStageBuffers& stable_stage_buffers(
         std::uint64_t runtime_id,
-        cudaStream_t stream) {
-        return entry(runtime_id, stream).stable;
+        cudaStream_t stream,
+        std::uint32_t slot = 0) {
+        return entry(runtime_id, stream, slot).stable;
     }
 
     std::optional<detail::PersistentDeviceLease> acquire_device_workspace(
@@ -702,13 +724,17 @@ class GeneratedRuntimeContext {
     }
 
   private:
-    static constexpr std::size_t kMaximumEntries = 1024;
+    // Raised 1024 -> 4096 for increment 4: the hook-graph prepare pass keys
+    // stable buffers per (stage, stream, occurrence slot), so one hook-fire
+    // structure contributes O(model layers) entries per attention stage.
+    static constexpr std::size_t kMaximumEntries = 4096;
     static constexpr std::size_t kMaximumRetainedDeviceBytes =
         512ull * 1024ull * 1024ull;
 
     struct Key {
         std::uint64_t runtime_id = 0;
         cudaStream_t stream = nullptr;
+        std::uint32_t slot = 0;
         bool operator==(const Key&) const = default;
     };
 
@@ -719,7 +745,8 @@ class GeneratedRuntimeContext {
             const std::size_t stream =
                 std::hash<const void*>{}(key.stream);
             return runtime ^ (stream + 0x9e3779b9u +
-                              (runtime << 6) + (runtime >> 2));
+                              (runtime << 6) + (runtime >> 2)) ^
+                   (static_cast<std::size_t>(key.slot) * 0x85ebca6bu);
         }
     };
 
@@ -732,12 +759,13 @@ class GeneratedRuntimeContext {
 
     Entry& entry(
         std::uint64_t runtime_id,
-        cudaStream_t stream) {
+        cudaStream_t stream,
+        std::uint32_t slot = 0) {
         if (runtime_id == 0) {
             throw std::runtime_error(
                 "generated executable has no runtime identity");
         }
-        const Key key{runtime_id, stream};
+        const Key key{runtime_id, stream, slot};
         const auto found = entries_.find(key);
         if (found != entries_.end()) {
             found->second.last_use = ++clock_;
@@ -1344,7 +1372,12 @@ inline std::unique_ptr<GeneratedStagePrepared> prepare_generated_stage(
     GeneratedRuntimeContext& runtime,
     cudaStream_t stream,
     GroupedExecutionOptions options = {},
-    PreparedBufferMode buffer_mode = PreparedBufferMode::kRotatingRing) {
+    PreparedBufferMode buffer_mode = PreparedBufferMode::kRotatingRing,
+    // kStablePerStage only: which stable-buffer slot backs this prepare
+    // (`GeneratedRuntimeContext::stable_stage_buffers`). 0 = the eager
+    // per-layer slot; the hook-graph prepare pass numbers each hoisted
+    // (phase, layer, occurrence, group) distinctly.
+    std::uint32_t stable_slot = 0) {
     if (lanes.empty()) {
         throw std::runtime_error("generated fused launch has no lanes");
     }
@@ -2047,7 +2080,7 @@ inline std::unique_ptr<GeneratedStagePrepared> prepare_generated_stage(
         // sized on first use, grown (rarely) in place of a ring acquire. No
         // slot search, no cudaEventQuery, no lease.
         stable = &runtime.stable_stage_buffers(
-            executable.runtime_id, stream);
+            executable.runtime_id, stream, stable_slot);
         const auto blocks = stable->device_blocks(
             metadata_bytes, total_scratch_bytes, stream);
         device_metadata = blocks.first;
@@ -2461,10 +2494,23 @@ inline std::unique_ptr<GeneratedStagePrepared> prepare_generated_stage(
                     GroupedLanePageMaskDevice* device_dests = nullptr;
                     const std::size_t dest_bytes =
                         host_dests.size() * sizeof(GroupedLanePageMaskDevice);
-                    CUDA_CHECK(cudaMallocAsync(
-                        reinterpret_cast<void**>(&device_dests), dest_bytes,
-                        stream));
-                    allocations.values.push_back(device_dests);
+                    if (stable != nullptr) {
+                        // Stable side table (increment 4): the captured
+                        // launch bakes this address, so it must be the one
+                        // every later prepare re-uploads into. Upload from
+                        // the (stack) host vector is safe: at prepare time
+                        // no capture is active on this stream, and a
+                        // pageable H2D async copy stages synchronously with
+                        // respect to the host source.
+                        device_dests =
+                            reinterpret_cast<GroupedLanePageMaskDevice*>(
+                                stable->side_block(dest_bytes, stream));
+                    } else {
+                        CUDA_CHECK(cudaMallocAsync(
+                            reinterpret_cast<void**>(&device_dests),
+                            dest_bytes, stream));
+                        allocations.values.push_back(device_dests);
+                    }
                     CUDA_CHECK(cudaMemcpyAsync(
                         device_dests, host_dests.data(), dest_bytes,
                         cudaMemcpyHostToDevice, stream));
@@ -2664,8 +2710,15 @@ inline std::unique_ptr<GeneratedStagePrepared> prepare_generated_stage(
 // lives here — this is the code a later slice captures into a CUDA graph
 // (batch/forward_graph.hpp:14-24 is the doctrine being applied).
 inline GroupedLaunchResult launch_generated_stage(
-    GeneratedStagePrepared& prepared) {
-    cudaStream_t stream = prepared.stream;
+    GeneratedStagePrepared& prepared,
+    // Optional launch-stream override (hook-graph mode, stage 6 increment
+    // 4): the prepare pass runs on the fire's submission stream, but the
+    // body's launches must land on the stream the model body hands the hook
+    // — under capture that is the capture stream. The prepared state itself
+    // is stream-agnostic device data; only the launches move.
+    cudaStream_t stream_override = nullptr) {
+    cudaStream_t stream =
+        stream_override != nullptr ? stream_override : prepared.stream;
     // Every lane-derived grid below is sized by the lattice bucket, never
     // the live count (see `generated_lane_grid_bucket`); the live count is
     // device data (`prepared.device_header->lane_count`) and idle blocks

@@ -29,6 +29,7 @@
 #include "kernels/graph_pad.hpp"
 #include "kernels/pack_dense_mask.hpp"
 #include "model/loaded_model.hpp"
+#include "model/attn_observation.hpp"
 #include "model/attn_score.hpp"
 #include "model/hook_sideband_arena.hpp"
 #include "model/lora.hpp"
@@ -1527,7 +1528,11 @@ void prepare_step(
             s.fR_real,
             s.img_num_images,
             s.aud_num_clips,
-            s.has_attention_stages,
+            // Stage 6 increment 4: hook fires that MAY replay a graph pad
+            // to the lattice like plain decode — same lockstep rule as the
+            // dispatcher (`run_forward_dispatch`). Fires the dispatch-side
+            // prepare pass later vetoes just run eagerly, padded.
+            hook_fire_blocks_graph(engine, s.has_attention_stages),
             engine.dispatch->launch_wants_lora(s.dispatch_view));
         if (eligible && engine.graph_pad_page >= 0) {
             const int max_requests = std::min(
@@ -2290,12 +2295,45 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
             ? engine.dispatch->launch_lora_table(*s.staged)
             : model::LoraTable{};
 
+    // Fire-level observation for the hook-graph prepare pass (stage 6
+    // increment 4): the same KV geometry `ForwardFn::invoke_body` attaches
+    // to the body's hooks copy, materialized here because the prepare pass
+    // runs BEFORE the body (and before capture). Host pointers are the
+    // frame's resolved spans, device pointers the persistent inputs — both
+    // outlive the fire.
+    const model::AttentionObservation hook_observation{
+        .kv = &engine.kv_cache,
+        .kv_page_indices_d = reinterpret_cast<const std::uint32_t*>(
+            pi.kv_page_indices.data()),
+        .kv_page_indptr_d = reinterpret_cast<const std::uint32_t*>(
+            pi.kv_page_indptr.data()),
+        .kv_last_page_lens_d = reinterpret_cast<const std::uint32_t*>(
+            pi.kv_last_page_lens.data()),
+        .qo_indptr_h = s.h_qo_forward,
+        .kv_page_indptr_h = s.h_kvpp_forward,
+        .kv_last_page_lens_h = s.h_kvlpl_forward,
+        .num_requests = s.forward_R,
+        .total_tokens = s.forward_N,
+    };
     struct StageHookContext {
         pipeline::Dispatch* dispatch = nullptr;
         pipeline::StagedLaunch* launch = nullptr;
+        const model::AttentionObservation* observation = nullptr;
+        model::HookSidebandArena* arena = nullptr;
+        std::uint32_t num_q_heads = 0;
+        std::uint32_t hook_free_prefix_rows = 0;
+        bool wants_attn_score = false;
+        bool wants_page_mask = false;
     } stage_hook_context{
         engine.dispatch,
         s.staged.get(),
+        &hook_observation,
+        engine.sideband_arena,
+        static_cast<std::uint32_t>(
+            engine.loaded_model.hf_config().num_attention_heads),
+        engine.dispatch->launch_hook_free_prefix_rows(s.dispatch_view),
+        engine.dispatch->launch_wants_attn_score(s.dispatch_view),
+        engine.dispatch->launch_wants_page_mask(s.dispatch_view),
     };
     const model::StageHooks stage_hooks{
         .context = &stage_hook_context,
@@ -2329,6 +2367,29 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
                 stream,
                 query_is_f32,
                 sideband);
+        },
+        .prepare_replay = [](void* opaque, cudaStream_t stream)
+            -> std::uint64_t {
+            auto& context =
+                *static_cast<StageHookContext*>(opaque);
+            return context.dispatch->prepare_attention_phases(
+                *context.launch,
+                pipeline::Dispatch::HookReplayPrepare{
+                    .observation = context.observation,
+                    .arena = context.arena,
+                    .num_q_heads = context.num_q_heads,
+                    .hook_free_prefix_rows =
+                        context.hook_free_prefix_rows,
+                    .wants_attn_score = context.wants_attn_score,
+                    .wants_page_mask = context.wants_page_mask,
+                    .stream = stream,
+                });
+        },
+        .verify_replay_capture = [](void* opaque) {
+            auto& context =
+                *static_cast<StageHookContext*>(opaque);
+            context.dispatch->verify_hook_capture_consumed(
+                *context.launch);
         },
     };
     // Fire boundary for the sideband arena's PIE_SIDEBAND_TRACE counters —

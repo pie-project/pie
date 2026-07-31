@@ -48,6 +48,39 @@ std::uint32_t default_attn_score_window() noexcept;
 
 struct StageHooks;
 class HookSidebandArena;
+struct AttentionObservation;
+
+// Stage 6 increment 4 — the hook-graph prepare pass's fire-level view of the
+// DECODE score capture. A captured hook body replays `LayerScoreCapture`'s
+// stream ops (the CSR upload and the folded memset) with capture-time
+// parameters, so before EVERY replay the prepare pass must (a) refresh the
+// host CSR the captured upload reads — same thread-local storage, same
+// contents the constructor would compute — and (b) pre-grow the arena score
+// slot so the capture-time constructor (and nothing at replay) ever hits the
+// arena's stream-synced growth path. This helper does both and hands back
+// the arena-stable addresses the pass folds into its fingerprint. It
+// enqueues NO stream work and takes NO slot: the arena acquire is released
+// before returning (growth is its only lasting effect).
+struct DecodeScoreCapturePlan {
+    bool ok = false;
+    // Arena-stable device addresses (stable until the score region grows).
+    const float* folded = nullptr;
+    const std::int32_t* indptr_d = nullptr;
+    // The host raw-offset CSR the captured `cudaMemcpyAsync` reads at replay
+    // time. Thread-local storage: the ADDRESS must be fingerprinted, because
+    // a different fire shape may reallocate the vector under the captured
+    // node's recorded source pointer.
+    const void* indptr_h_data = nullptr;
+    // Folded (per-position) offsets, host, `num_requests + 1` entries.
+    const std::uint32_t* folded_offsets_h = nullptr;
+    std::uint32_t num_requests = 0;
+};
+
+DecodeScoreCapturePlan prepare_decode_score_capture(
+    HookSidebandArena* arena,
+    const AttentionObservation& observation,
+    std::uint32_t num_q_heads,
+    cudaStream_t stream);
 
 namespace detail {
 

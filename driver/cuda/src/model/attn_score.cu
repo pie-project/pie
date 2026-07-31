@@ -41,7 +41,125 @@ constexpr std::size_t align_up(std::size_t n) noexcept {
     return (n + kSidebandAlign - 1) & ~(kSidebandAlign - 1);
 }
 
+// The score slot's internal carve — raw, then folded, then the CSR, each
+// aligned. ONE definition shared by `ScoreBuffers::acquire` and the
+// hook-graph prepare helper (`prepare_decode_score_capture`): the helper
+// derives arena-stable addresses a captured graph bakes, so the two going
+// out of step would be a silent replay miscompute, not a crash.
+struct ScoreSlotLayout {
+    std::size_t total = 0;
+    std::size_t folded_offset = 0;
+    std::size_t indptr_offset = 0;
+};
+
+constexpr ScoreSlotLayout score_slot_layout(
+    std::size_t raw_bytes,
+    std::size_t folded_bytes,
+    std::size_t indptr_bytes) noexcept {
+    return ScoreSlotLayout{
+        align_up(raw_bytes) + align_up(folded_bytes) + align_up(indptr_bytes),
+        align_up(raw_bytes),
+        align_up(raw_bytes) + align_up(folded_bytes),
+    };
+}
+
 }  // namespace
+
+namespace {
+
+struct DecodeScoreCsrTotals {
+    std::uint64_t raw_total = 0;
+    std::uint64_t folded_total = 0;
+};
+
+// Fill the decode capture's thread-local CSRs from the fire's KV geometry.
+// ONE definition shared by `LayerScoreCapture`'s constructor (which runs at
+// capture time, inside the recorded body) and `prepare_decode_score_capture`
+// (which runs before every replay): the captured upload node reads
+// `g_raw_offsets_i32`'s storage at replay time, so both sites must compute
+// byte-identical contents into the same vectors or a replayed fire scores
+// against a stale channel view of its KV lengths.
+DecodeScoreCsrTotals compute_decode_score_csr(
+    const AttentionObservation& obs,
+    std::uint32_t num_q_heads) {
+    const int requests = obs.num_requests;
+    const int page_size = obs.kv->page_size();
+    g_raw_offsets.assign(static_cast<std::size_t>(requests) + 1, 0u);
+    g_folded_offsets.assign(static_cast<std::size_t>(requests) + 1, 0u);
+    DecodeScoreCsrTotals totals;
+    for (int r = 0; r < requests; ++r) {
+        const std::uint32_t pages =
+            obs.kv_page_indptr_h[r + 1] - obs.kv_page_indptr_h[r];
+        const std::uint32_t kv_len =
+            pages == 0
+                ? 0u
+                : (pages - 1u) * static_cast<std::uint32_t>(page_size) +
+                      obs.kv_last_page_lens_h[r];
+        g_raw_offsets[static_cast<std::size_t>(r)] =
+            static_cast<std::uint32_t>(totals.raw_total);
+        g_folded_offsets[static_cast<std::size_t>(r)] =
+            static_cast<std::uint32_t>(totals.folded_total);
+        totals.raw_total +=
+            static_cast<std::uint64_t>(kv_len) * num_q_heads;
+        totals.folded_total += kv_len;
+    }
+    g_raw_offsets[static_cast<std::size_t>(requests)] =
+        static_cast<std::uint32_t>(totals.raw_total);
+    g_folded_offsets[static_cast<std::size_t>(requests)] =
+        static_cast<std::uint32_t>(totals.folded_total);
+    return totals;
+}
+
+}  // namespace
+
+DecodeScoreCapturePlan prepare_decode_score_capture(
+    HookSidebandArena* arena,
+    const AttentionObservation& observation,
+    std::uint32_t num_q_heads,
+    cudaStream_t stream) {
+    DecodeScoreCapturePlan plan;
+    if (arena == nullptr || !observation.usable() || num_q_heads == 0) {
+        return plan;
+    }
+    const DecodeScoreCsrTotals totals =
+        compute_decode_score_csr(observation, num_q_heads);
+    // Same validity bounds as the constructor: a fire the constructor would
+    // refuse must not be declared replayable.
+    if (totals.raw_total == 0 || totals.raw_total > 0xffffffffull) {
+        return plan;
+    }
+    g_raw_offsets_i32.assign(g_raw_offsets.begin(), g_raw_offsets.end());
+
+    const std::size_t raw_bytes =
+        static_cast<std::size_t>(totals.raw_total) * sizeof(float);
+    const std::size_t folded_bytes =
+        static_cast<std::size_t>(totals.folded_total) * sizeof(float);
+    const std::size_t indptr_bytes =
+        (static_cast<std::size_t>(observation.num_requests) + 1) *
+        sizeof(std::int32_t);
+    const ScoreSlotLayout layout =
+        score_slot_layout(raw_bytes, folded_bytes, indptr_bytes);
+    // Acquire-and-release: growth (stream-synced free+realloc) is pulled to
+    // HERE, outside any captured region; the capture-time constructor then
+    // finds sufficient capacity and its acquire is a host-side pointer
+    // return. The slot is not held — the busy flag guards overlapping
+    // captures, and this pass holds nothing across the fire.
+    auto* base = static_cast<std::uint8_t*>(arena->acquire(
+        HookSidebandArena::Region::Score, layout.total, stream));
+    if (base == nullptr) {
+        return plan;
+    }
+    arena->release(HookSidebandArena::Region::Score);
+    plan.ok = true;
+    plan.folded = reinterpret_cast<const float*>(base + layout.folded_offset);
+    plan.indptr_d = reinterpret_cast<const std::int32_t*>(
+        base + layout.indptr_offset);
+    plan.indptr_h_data = g_raw_offsets_i32.data();
+    plan.folded_offsets_h = g_folded_offsets.data();
+    plan.num_requests =
+        static_cast<std::uint32_t>(observation.num_requests);
+    return plan;
+}
 
 namespace detail {
 
@@ -73,18 +191,18 @@ bool ScoreBuffers::acquire(
         static_cast<std::size_t>(folded_elems) * sizeof(float);
     const std::size_t indptr_bytes =
         (static_cast<std::size_t>(num_requests) + 1) * sizeof(std::int32_t);
+    const ScoreSlotLayout layout =
+        score_slot_layout(raw_bytes, folded_bytes, indptr_bytes);
     auto* base = static_cast<std::uint8_t*>(arena->acquire(
-        HookSidebandArena::Region::Score,
-        align_up(raw_bytes) + align_up(folded_bytes) + align_up(indptr_bytes),
-        stream));
+        HookSidebandArena::Region::Score, layout.total, stream));
     if (base == nullptr) {
         return false;
     }
     arena_ = arena;
     raw = reinterpret_cast<float*>(base);
-    folded = reinterpret_cast<float*>(base + align_up(raw_bytes));
+    folded = reinterpret_cast<float*>(base + layout.folded_offset);
     indptr_d = reinterpret_cast<std::int32_t*>(
-        base + align_up(raw_bytes) + align_up(folded_bytes));
+        base + layout.indptr_offset);
     // The host CSR that sized these is an UPPER BOUND, not the exact geometry.
     // The frame layer is free to hand the body a conservative host-side page
     // CSR (graph lattice padding, the decode-envelope KV bound in `frame.cpp`),
@@ -174,32 +292,15 @@ LayerScoreCapture::LayerScoreCapture(
     // The ragged layout is derived from the page CSR, which is this driver's
     // single source of truth for sequence length (`kernels/geometry.cu`).
     // Deriving it here rather than taking a second length argument is what
-    // keeps the score row attributable to the right positions.
+    // keeps the score row attributable to the right positions. The
+    // computation is shared with `prepare_decode_score_capture` — under a
+    // captured hook body (stage 6 increment 4) THAT is what refreshes these
+    // thread-locals before every replay, so the two must be one function.
     const int requests = obs->num_requests;
-    const int page_size = obs->kv->page_size();
-    g_raw_offsets.assign(static_cast<std::size_t>(requests) + 1, 0u);
-    g_folded_offsets.assign(static_cast<std::size_t>(requests) + 1, 0u);
-    std::uint64_t raw_total = 0;
-    std::uint64_t folded_total = 0;
-    for (int r = 0; r < requests; ++r) {
-        const std::uint32_t pages =
-            obs->kv_page_indptr_h[r + 1] - obs->kv_page_indptr_h[r];
-        const std::uint32_t kv_len =
-            pages == 0
-                ? 0u
-                : (pages - 1u) * static_cast<std::uint32_t>(page_size) +
-                      obs->kv_last_page_lens_h[r];
-        g_raw_offsets[static_cast<std::size_t>(r)] =
-            static_cast<std::uint32_t>(raw_total);
-        g_folded_offsets[static_cast<std::size_t>(r)] =
-            static_cast<std::uint32_t>(folded_total);
-        raw_total += static_cast<std::uint64_t>(kv_len) * num_q_heads;
-        folded_total += kv_len;
-    }
-    g_raw_offsets[static_cast<std::size_t>(requests)] =
-        static_cast<std::uint32_t>(raw_total);
-    g_folded_offsets[static_cast<std::size_t>(requests)] =
-        static_cast<std::uint32_t>(folded_total);
+    const DecodeScoreCsrTotals totals =
+        compute_decode_score_csr(*obs, num_q_heads);
+    const std::uint64_t raw_total = totals.raw_total;
+    const std::uint64_t folded_total = totals.folded_total;
     if (raw_total == 0 || raw_total > 0xffffffffull) {
         return;
     }

@@ -23,10 +23,15 @@ namespace pie_cuda_driver {
 inline constexpr std::uint32_t kGvSmallSpec   = 1u << 0;
 inline constexpr std::uint32_t kGvRsVerify    = 1u << 1;
 inline constexpr std::uint32_t kGvCustomMask  = 1u << 2;
-inline constexpr int           kGvLayoutShift = 3;
+// Stage 6 increment 4: a capture whose body carried live stage hooks (the
+// per-layer PTIR attention-phase launches are inside the graph). A hook fire
+// and a plain fire of the same (R, N, layout) have different kernel
+// sequences, so they must never share a cache entry. Layout shifts to bit 4.
+inline constexpr std::uint32_t kGvHasHooks    = 1u << 3;
+inline constexpr int           kGvLayoutShift = 4;
 
 inline constexpr std::uint32_t kGvFlagMask =
-    kGvSmallSpec | kGvRsVerify | kGvCustomMask;
+    kGvSmallSpec | kGvRsVerify | kGvCustomMask | kGvHasHooks;
 
 // By construction: every flag is below the layout field, so no `graph_layout`
 // value can ever alias a flag bit.
@@ -36,10 +41,12 @@ static_assert(kGvFlagMask < (1u << kGvLayoutShift),
 constexpr std::uint32_t make_graph_variant(bool small_spec,
                                            bool rs_verify,
                                            bool custom_mask,
-                                           std::uint32_t graph_layout) {
+                                           std::uint32_t graph_layout,
+                                           bool has_hooks = false) {
     return (small_spec  ? kGvSmallSpec  : 0u) |
            (rs_verify   ? kGvRsVerify   : 0u) |
            (custom_mask ? kGvCustomMask : 0u) |
+           (has_hooks   ? kGvHasHooks   : 0u) |
            (graph_layout << kGvLayoutShift);
 }
 
@@ -74,5 +81,17 @@ static_assert(gv_old_encode_for_proof(64u, false, false) ==
 static_assert(make_graph_variant(false, false, false, 64u) !=
                   make_graph_variant(true, false, false, 0u),
               "#24 fix: graph_layout=64 must hash distinctly from small_spec");
+// Increment 4 re-proof at the new boundary (layout shift 3 -> 4): the layout
+// value whose lowest bit would land on the NEW flag (kGvHasHooks, bit 3 =
+// layout 0.5 -- i.e. the first layout value that reaches bit 3 is
+// graph_layout=1 under a hypothetical shift-3 encoding) must stay distinct
+// from the hook flag, and a hook capture must never alias a hookless one.
+static_assert(make_graph_variant(false, false, false, 1u) !=
+                  make_graph_variant(false, false, false, 0u, /*has_hooks=*/true),
+              "#24 discipline: graph_layout=1 must hash distinctly from "
+              "kGvHasHooks after the layout shift moved to 4");
+static_assert(make_graph_variant(false, false, false, 7u, true) !=
+                  make_graph_variant(false, false, false, 7u, false),
+              "kGvHasHooks must separate hook captures from plain ones");
 
 }  // namespace pie_cuda_driver

@@ -93,6 +93,22 @@ static_assert(forward_graph_request_bucket(257, 512) == 272);
 static_assert(forward_graph_request_bucket(506, 512) == 512);
 static_assert(forward_graph_request_bucket(129, 130) == 130);
 
+// Per-key bookkeeping for HOOK-carrying captures (stage 6 increment 4). A
+// hook graph bakes addresses the plain body does not — stable per-occurrence
+// stage buffers, sideband-arena blocks, channel-ring arrays, the host CSR a
+// captured upload re-reads — so each cached exec carries the fingerprint of
+// what it baked. The prepare pass recomputes the fingerprint before every
+// launch; a mismatch (arena growth, stable-buffer growth, instance churn,
+// data-sized grid drift) invalidates the exec and recaptures. A key whose
+// fingerprint keeps churning is banned back to the eager body: recapturing
+// every fire costs more than it saves (~10 ms per capture).
+struct HookGraphKeyState {
+    std::uint64_t fingerprint = 0;
+    std::uint32_t mismatches = 0;
+    bool banned = false;
+    static constexpr std::uint32_t kMaxMismatches = 8;
+};
+
 struct ForwardGraphKeyHash {
     std::size_t operator()(const ForwardGraphKey& k) const noexcept {
         return static_cast<std::size_t>(k.num_requests) ^

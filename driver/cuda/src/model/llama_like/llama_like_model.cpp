@@ -44,6 +44,13 @@ LlamaLikeModel::LlamaLikeModel(
     caps_.graph_padding_kv_write_safe = true;
     caps_.supports_compact_logits = true;
     caps_.supports_runtime_window = true;
+    // Stage 6 increment 4: hook-carrying pure-decode fires may be captured.
+    // The body's hook-adjacent work under capture is stream ops against
+    // stable sideband-arena addresses (LayerScoreCapture on the plain decode
+    // branch); the prefill capture and the page-mask path are excluded by
+    // the batch-engine gate (decode-only + wants_page_mask == false). Same
+    // BF16 gate as graph_safe: the dequant scratch path is not replayable.
+    caps_.supports_hook_graph_capture = caps_.graph_safe;
 
     // Trace the declared plan now rather than on first fire: the facts it
     // needs (config + weight bindings) are all here, and an unrepresentable

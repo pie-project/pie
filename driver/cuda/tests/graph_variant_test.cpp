@@ -64,18 +64,27 @@ int main() {
         root_tp_key == follower_tp_key,
         "TP root/follower keys use identical actual capture flags");
 
-    // ── 3. NEW encoding: exhaustive uniqueness over (3 flags) × (layout 0..255) ──
+    // ── 2b. Increment-4 hook bit (kGvHasHooks, layout shift 3 -> 4) ──
+    check(make_graph_variant(false, false, false, 7u, true) !=
+              make_graph_variant(false, false, false, 7u, false),
+          "NEW: hook and hookless captures have DISTINCT variants");
+    check(make_graph_variant(false, false, false, 1u) !=
+              make_graph_variant(false, false, false, 0u, true),
+          "NEW: graph_layout=1 is DISTINCT from kGvHasHooks (post-shift)");
+
+    // ── 3. NEW encoding: exhaustive uniqueness over (4 flags) × (layout 0..255) ──
     {
         std::set<std::uint32_t> seen;
         bool unique = true;
         for (std::uint32_t layout = 0; layout <= 255u; ++layout) {
-            for (int f = 0; f < 8; ++f) {
+            for (int f = 0; f < 16; ++f) {
                 const std::uint32_t v = make_graph_variant(
-                    (f & 1) != 0, (f & 2) != 0, (f & 4) != 0, layout);
+                    (f & 1) != 0, (f & 2) != 0, (f & 4) != 0, layout,
+                    (f & 8) != 0);
                 if (!seen.insert(v).second) unique = false;
             }
         }
-        check(unique, "NEW: all (3 flags × layout 0..255) graph_variants are UNIQUE");
+        check(unique, "NEW: all (4 flags × layout 0..255) graph_variants are UNIQUE");
     }
 
     // ── 4. OLD encoding MUST collide over the same range (non-degenerate proof:

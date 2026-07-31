@@ -15,6 +15,7 @@
 #include <chrono>
 #include <iostream>
 #include <map>
+#include <unordered_map>
 
 #include "cuda_check.hpp"
 #include "distributed.hpp"
@@ -88,6 +89,8 @@ struct ForwardFn {
     bool supports_compact_logits = false;
     bool supports_small_prefill_graph = false;
     bool supports_runtime_window = false;
+    // See ModelCapabilities::supports_hook_graph_capture (stage 6 inc 4).
+    bool supports_hook_graph_capture = false;
 
     // All metadata needed to execute one forward body call. Bundled as a
     // struct so adding a new field is a one-site addition rather than a
@@ -422,7 +425,27 @@ struct BatchEngine {
     // `dispatch`; `batch/frame.cpp` puts it on each hook fire's `StageHooks`.
     // Null only for a context that never composed one.
     model::HookSidebandArena* sideband_arena = nullptr;
+
+    // Hook-graph capture bookkeeping (stage 6 increment 4): the baked-state
+    // fingerprint each hook-variant cache entry was captured against, plus
+    // the churn counter that bans a key back to eager. Keys mirror
+    // `graph_cache`; an entry the cache evicted just leaves a stale record
+    // that the next capture overwrites.
+    std::unordered_map<ForwardGraphKey, HookGraphKeyState,
+                       ForwardGraphKeyHash> hook_graph_states;
 };
+
+// Whether a fire that carries stage hooks must stay OFF the graph path.
+// ONE predicate shared by the dispatcher (`run_forward_dispatch`) and the
+// composer (`frame.cpp`'s lattice-padding decision) — the same lockstep rule
+// as `forward_graph_replay_eligible` itself. False means the hook fire MAY
+// replay (llama_like's capture-safe body, single rank, kill switch off); the
+// dispatcher still runs the fire eagerly when the dispatch-side prepare pass
+// vetoes it (Query readers, envelope_dot/quest, per-fire-allocating stage
+// shapes, unresolvable sidebands).
+bool hook_fire_blocks_graph(
+    const BatchEngine& engine,
+    bool has_stage_hooks);
 
 // Pre-capture the pure-decode CUDA graph lattice for graph-safe forwards.
 // Returns the number of graph execs inserted into `engine.graph_cache`. Only
@@ -456,7 +479,13 @@ cudaGraphExec_t capture_forward_graph_exec(
     const std::uint32_t* w_page_d,
     const std::uint32_t* w_off_d,
     bool has_write_desc,
-    int runtime_window_left);
+    int runtime_window_left,
+    // Stage 6 increment 4: non-null captures a HOOK-carrying body — the
+    // per-layer attention-phase launches are recorded inside the graph,
+    // against state the fire's `prepare_replay` pass staged. The caller
+    // must have run that pass on this fire first. TP followers and the
+    // upfront lattice always pass nullptr.
+    const model::StageHooks* stage_hooks = nullptr);
 
 // Env-gated (`PIE_STEP_PROFILE`) forward-body wall-clock timer. Declared here
 // (not private to batch/forward.cpp) because `enqueue_step` in

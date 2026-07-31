@@ -30,6 +30,12 @@ namespace pie_cuda_driver::model {
 //    instead of two captures silently sharing bytes.
 //  * `Region::Mask` — ONE slot, acquired once per fire by `FirePageMask` and
 //    held for the whole layer loop.
+//  * `Region::ScoreRows` — ONE slot, acquired transiently per fire by the
+//    hook-graph prepare pass (stage 6 increment 4): the folded-offset device
+//    CSR plus one padded `[kv_max]` f32 row per score-reading (layer, lane).
+//    Acquired and released within the prepare pass — the busy flag only
+//    guards overlapping acquisition; the contents are produced and consumed
+//    in stream order inside one fire's body.
 //
 // "Allocation" is thus a capacity check; the caller carves its sub-buffers as
 // offsets into the returned block. A fire that needs more than the region has
@@ -44,7 +50,7 @@ namespace pie_cuda_driver::model {
 // generation change as invalidation.
 class HookSidebandArena {
   public:
-    enum class Region : int { Score = 0, Mask = 1 };
+    enum class Region : int { Score = 0, Mask = 1, ScoreRows = 2 };
 
     HookSidebandArena() = default;
     ~HookSidebandArena();
@@ -83,7 +89,7 @@ class HookSidebandArena {
 
     static const char* region_name(Region region) noexcept;
 
-    Slot slots_[2];
+    Slot slots_[3];
     std::uint64_t generation_ = 0;
 
     // PIE_SIDEBAND_TRACE=1 evidence counters.

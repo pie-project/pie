@@ -27,7 +27,12 @@ std::size_t round_capacity(std::size_t bytes) noexcept {
 }  // namespace
 
 const char* HookSidebandArena::region_name(Region region) noexcept {
-    return region == Region::Score ? "score" : "mask";
+    switch (region) {
+        case Region::Score: return "score";
+        case Region::Mask: return "mask";
+        case Region::ScoreRows: return "score_rows";
+    }
+    return "unknown";
 }
 
 HookSidebandArena::~HookSidebandArena() {

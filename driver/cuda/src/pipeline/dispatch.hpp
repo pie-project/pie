@@ -225,6 +225,45 @@ class Dispatch {
         const pie_native::LaunchView& resolved_view,
         std::span<const std::uint32_t> program_token_starts);
 
+    // ── Hook-graph replay (stage 6 increment 4) ─────────────────────────
+    // Fire-level prepare pass for a hook fire the batch engine wants to run
+    // via CUDA-graph replay. Hoists EVERY attention-phase prepare — binding
+    // assembly, grouping, `prepare_generated_stage` (stable per-occurrence
+    // buffers), channel-effect application, score-sideband sizing — out of
+    // the body, in the exact (layer-major, OnAttnProj-then-OnAttn) order the
+    // body will consume them. After a nonzero return the launch is in
+    // prepared mode: `execute_attention_phase` becomes a pure launch replay
+    // against the stored cursor (loud throw on any order mismatch), which is
+    // what a captured graph records and what a replayed graph re-executes.
+    //
+    // Returns a fingerprint over every address and grid the captured body
+    // bakes (stable-buffer blocks, channel-ring arrays, sideband-arena
+    // addresses, region launch geometry). The batch engine stores it per
+    // graph key and recaptures when it changes — that is the generation /
+    // growth / instance-churn invalidation in one value. Returns 0 — with NO
+    // side effects on the launch — when this fire cannot replay (a stage
+    // reads Query, writes a page mask, needs per-fire device allocations, …)
+    // and must take the eager body.
+    struct HookReplayPrepare {
+        const model::AttentionObservation* observation = nullptr;
+        model::HookSidebandArena* arena = nullptr;
+        std::uint32_t num_q_heads = 0;
+        std::uint32_t hook_free_prefix_rows = 0;
+        bool wants_attn_score = false;
+        bool wants_page_mask = false;
+        cudaStream_t stream = nullptr;
+    };
+    std::uint64_t prepare_attention_phases(
+        StagedLaunch& launch,
+        const HookReplayPrepare& in);
+
+    // Post-capture structural check: every prepared attention invocation
+    // was consumed by the recorded body. Run by the batch engine right
+    // after a hook-graph capture — the one moment the model's per-layer
+    // hook coverage is observable — and never after a replay (a replayed
+    // body does not touch the cursors). Throws on partial consumption.
+    void verify_hook_capture_consumed(StagedLaunch& launch) const;
+
     // `sideband` carries what the model body published for exactly this hook
     // invocation — the fire's KV geometry, the layer's captured scores, the
     // page-mask destination. An empty sideband is "the body published
