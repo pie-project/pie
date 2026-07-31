@@ -396,7 +396,38 @@ def _rewrite_gpt_oss(cfg: dict, plan: Plan) -> None:
         cfg["experts_per_token"] = min(cfg["experts_per_token"], plan.experts)
 
 
+def _rewrite_qwen3_5_moe(cfg: dict, plan: Plan) -> None:
+    _rewrite_common(cfg, plan)
+    # `layer_types` is what makes a layer linear vs full attention, and the
+    # pattern has period `full_attention_interval`; a block that is a whole
+    # number of periods keeps the ratio the model was trained with.
+    if isinstance(cfg.get("layer_types"), list):
+        cfg["layer_types"] = _slice_list(cfg["layer_types"], plan.src_layers)
+
+
 FAMILIES: dict[str, dict[str, Any]] = {
+    "qwen3_5_moe": dict(
+        layer_prefix="model.language_model.layers.",
+        # Qwen3.5 ships the routed bank already stacked on dim 0 -- one
+        # `gate_up_proj` and one `down_proj` per layer, no per-expert name --
+        # so `router_suffixes` does all the slicing, as it does for gpt-oss.
+        expert_re=None,
+        router_suffixes=(
+            "mlp.gate.weight",
+            "mlp.experts.gate_up_proj",
+            "mlp.experts.down_proj",
+        ),
+        globals_keep=("model.language_model.embed_tokens.weight",
+                      "model.language_model.norm.weight",
+                      "lm_head.weight"),
+        # Period 4: three `linear_attention` layers then one `full_attention`.
+        # Eight layers is two whole periods, so both kernels and both cache
+        # kinds are exercised.
+        default_layers="0-7",
+        config_rewrite=_rewrite_qwen3_5_moe,
+        text_cfg_key="text_config",
+        keep_res=(re.compile(r"^model\.visual\."),),
+    ),
     "glm_moe_dsa": dict(
         layer_prefix="model.layers.",
         expert_re=re.compile(r"\.mlp\.experts\.(\d+)\."),

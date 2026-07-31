@@ -4,6 +4,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <map>
+#include <string>
+#include <utility>
 #include <cstdint>
 #include <stdexcept>
 #include <vector>
@@ -61,6 +64,110 @@ void check_launch(const char* where, int layer) {
             std::to_string(layer) + "): " + cudaGetErrorString(err));
     }
 }
+
+/// Per-phase GPU timing, off unless `PIE_K3_PHASE_PROFILE` is set.
+///
+/// `PIE_STEP_PROFILE` gives the whole forward and `act_dump` gives values;
+/// neither says which phase owns the milliseconds. Events are recorded on the
+/// forward's own stream and read only after the last one has completed, so an
+/// enabled run reorders nothing and a disabled one is a load and a branch.
+class PhaseProfiler {
+  public:
+    static bool enabled() {
+        static const bool on = [] {
+            const char* v = std::getenv("PIE_K3_PHASE_PROFILE");
+            return v != nullptr && v[0] != '\0' && v[0] != '0';
+        }();
+        return on;
+    }
+
+    // Decode fires are captured into a graph, and a capturing stream may not
+    // be synchronised -- `report` would turn a profiling run into a failed
+    // load. Prefill, which is what this is for, is never captured.
+    static bool capturing(cudaStream_t stream) {
+        cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+        return cudaStreamIsCapturing(stream, &status) == cudaSuccess &&
+               status != cudaStreamCaptureStatusNone;
+    }
+
+    void begin(const char* name, cudaStream_t stream) {
+        if (!enabled() || capturing(stream)) return;
+        Slot& slot = slot_for(name);
+        cudaEventRecord(slot.start, stream);
+        open_ = &slot;
+    }
+
+    void end(cudaStream_t stream) {
+        if (!enabled() || open_ == nullptr || capturing(stream)) return;
+        cudaEventRecord(open_->stop, stream);
+        pending_.push_back(open_);
+        open_ = nullptr;
+    }
+
+    void report(int tokens) {
+        if (!enabled() || pending_.empty()) return;
+        for (Slot* s : pending_) {
+            cudaEventSynchronize(s->stop);
+            float ms = 0.f;
+            cudaEventElapsedTime(&ms, s->start, s->stop);
+            s->total += ms;
+        }
+        pending_.clear();
+        std::vector<std::pair<std::string, float>> rows;
+        float total = 0.f;
+        for (auto& entry : slots_) {
+            if (entry.second.total > 0.f) {
+                rows.emplace_back(entry.first, entry.second.total);
+                total += entry.second.total;
+            }
+            entry.second.total = 0.f;
+        }
+        std::sort(rows.begin(), rows.end(),
+                  [](const std::pair<std::string, float>& a,
+                     const std::pair<std::string, float>& b) {
+                      return a.second > b.second;
+                  });
+        std::fprintf(stderr, "[k3-phase] tokens=%d total=%.2f ms\n", tokens, total);
+        for (const auto& row : rows) {
+            std::fprintf(stderr, "[k3-phase]   %-18s %7.2f ms  %5.1f%%\n",
+                         row.first.c_str(), row.second,
+                         100.0 * row.second / (total > 0.f ? total : 1.f));
+        }
+        std::fflush(stderr);
+    }
+
+  private:
+    struct Slot {
+        cudaEvent_t start = nullptr;
+        cudaEvent_t stop = nullptr;
+        float total = 0.f;
+    };
+    // One event pair per phase *name*, reused across layers: a phase that
+    // appears in six layers accumulates six intervals into one row, which is
+    // the number worth reading.
+    Slot& slot_for(const char* name) {
+        auto it = slots_.find(name);
+        if (it == slots_.end()) {
+            Slot s;
+            cudaEventCreate(&s.start);
+            cudaEventCreate(&s.stop);
+            it = slots_.emplace(name, s).first;
+        }
+        return it->second;
+    }
+    std::map<std::string, Slot> slots_;
+    std::vector<Slot*> pending_;
+    Slot* open_ = nullptr;
+};
+
+/// Scoped begin/end, so a phase cannot be left open by an early return.
+struct PhaseScope {
+    PhaseScope(PhaseProfiler& p, const char* name, cudaStream_t s)
+        : prof(p), stream(s) { prof.begin(name, s); }
+    ~PhaseScope() { prof.end(stream); }
+    PhaseProfiler& prof;
+    cudaStream_t stream;
+};
 
 }  // namespace
 
@@ -339,6 +446,7 @@ void kimi_k3_forward_paged(
 
     int open_blocks = 0;
 
+    PhaseProfiler prof;
     for (int li = 0; li < cfg.num_hidden_layers; ++li) {
         const auto& Lw = w.layers[static_cast<std::size_t>(li)];
 
@@ -372,13 +480,16 @@ void kimi_k3_forward_paged(
 
         // ── Attention ──────────────────────────────────────────────
         if (Lw.kind == KimiK3LayerWeights::Kind::Kda) {
+            prof.begin("kda_qkv_proj", stream);
             ops::gemm_act_x_w(cublas.handle(), ws.norm_x.data(), *Lw.kda_q_proj,
                               ws.kda_q.data(), total_tokens, W, H);
             ops::gemm_act_x_w(cublas.handle(), ws.norm_x.data(), *Lw.kda_k_proj,
                               ws.kda_k.data(), total_tokens, W, H);
             ops::gemm_act_x_w(cublas.handle(), ws.norm_x.data(), *Lw.kda_v_proj,
                               ws.kda_v.data(), total_tokens, W, H);
+            prof.end(stream);
 
+            prof.begin("kda_conv_gate", stream);
             // Depthwise causal conv with fused silu, one per projection. The
             // three conv states live side by side in the slot's conv slab.
             // `RecurrentStateCache` indexes by the *model* layer, mapping to
@@ -469,6 +580,7 @@ void kimi_k3_forward_paged(
             // v, so the state carries the small differences the next token
             // reads -- and `RecurrentStateCache` defaults to Qwen3.5's bf16
             // state, which is a different model. Ask for fp32 and say so.
+            prof.end(stream);
             if (kda_cache.recurrent_state_is_bf16()) {
                 throw std::runtime_error(
                     "kimi_k3: the recurrent state cache is bf16; KDA needs fp32. "
@@ -487,6 +599,7 @@ void kimi_k3_forward_paged(
                     rec_stride, static_cast<float*>(ws.kda_o.data()),
                     num_requests, kda_heads, kda_dim, stream);
             } else {
+                PhaseScope ps(prof, "kda_recurrence", stream);
                 kernels::launch_kda_prefill_batched(
                     static_cast<const float*>(ws.kda_qf.data()),
                     static_cast<const float*>(ws.kda_kf.data()),
@@ -505,6 +618,7 @@ void kimi_k3_forward_paged(
             act_dump_f32(act_dump_layer_tag("kda_o", li).c_str(),
                          static_cast<const float*>(ws.kda_o.data()),
                          total_tokens, W, stream);
+            prof.begin("kda_gate_out_proj", stream);
             ops::gemm_act_x_w(cublas.handle(), ws.norm_x.data(), *Lw.kda_g_proj,
                               ws.kda_gproj.data(), total_tokens, W, H);
             kernels::launch_kda_o_norm_gated_bf16(
@@ -515,7 +629,9 @@ void kimi_k3_forward_paged(
                           ws.kda_q.data(), total_tokens, W, stream);
             ops::gemm_act_x_w(cublas.handle(), ws.kda_q.data(), *Lw.kda_o_proj,
                               ws.attn_out.data(), total_tokens, H, W);
+            prof.end(stream);
         } else {
+            prof.begin("mla", stream);
             ops::gemm_act_x_w(cublas.handle(), ws.norm_x.data(), *Lw.q_a_proj,
                               ws.q_a.data(), total_tokens, q_lora, H);
             ops::gemm_act_x_w(cublas.handle(), ws.norm_x.data(),
@@ -588,6 +704,7 @@ void kimi_k3_forward_paged(
         if (T > 1 && tp != nullptr) {
             tp->all_reduce_bf16(ws.attn_out.data(), rows_H, ncclSum, stream);
         }
+        prof.end(stream);
         act_dump_bf16(act_dump_layer_tag("attn_out", li).c_str(),
                       ws.attn_out.data(), total_tokens, H, stream);
 
@@ -618,6 +735,7 @@ void kimi_k3_forward_paged(
                                      stream);
 
         // ── MLP ────────────────────────────────────────────────────
+        prof.begin("mlp", stream);
         if (!Lw.is_moe) {
             ops::gemm_act_x_w(cublas.handle(), ws.norm_y.data(),
                               *Lw.dense_gate_proj, ws.gate.data(), total_tokens,
@@ -863,6 +981,7 @@ void kimi_k3_forward_paged(
         check_launch("mlp", li);
         kernels::launch_residual_add_bf16(ws.y.data(), ws.mlp_out.data(),
                                           rows_H, stream);
+        prof.end(stream);
         act_dump_bf16(act_dump_layer_tag("out", li).c_str(), ws.y.data(),
                       total_tokens, H, stream);
     }
@@ -872,6 +991,7 @@ void kimi_k3_forward_paged(
     }
 
     // ── Tail: one more AttnRes blend, then norm + lm_head ────────────
+    prof.begin("tail_lm_head", stream);
     const void* final_in = ws.y.data();
     if (bs > 0 && open_blocks > 0) {
         kernels::launch_attn_res_blend_bf16(
@@ -904,6 +1024,8 @@ void kimi_k3_forward_paged(
                       rows, V, H);
     act_dump_bf16("logits", logits_out, rows, V, stream);
     check_launch("lm_head", -1);
+    prof.end(stream);
+    prof.report(total_tokens);
 }
 
 }  // namespace pie_cuda_driver::model
