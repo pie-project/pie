@@ -91,10 +91,27 @@ void launch_kda_recurrent_step_batched(
 //     out                     : [N_total, H, D] fp32
 //
 // TODO(perf): the chunked form (`chunk_kda`) blocks the recurrence into
-// 64-token tiles and turns most of the work into GEMMs, the way
+// tiles and turns most of the work into GEMMs, the way
 // `launch_chunk_gated_delta_prefill_batched` does for GDN. Sequential is what
-// the bring-up needs -- it is the definition of the recurrence, so a parity
-// mismatch here is a real mismatch and not a chunking artifact.
+// the bring-up needed -- it is the definition of the recurrence, so a parity
+// mismatch here is a real mismatch and not a chunking artifact -- and parity
+// is settled now, so that reason has expired. It is 30.6% of a 2048-token
+// prefill (`PIE_K3_PHASE_PROFILE=1`).
+//
+// Two things are already known about it, both the hard way:
+//
+//   * The algebra is not GDN's. KDA decays per *key channel*, so the chunk
+//     matrices carry an `exp(c_t[d] - c_s[d])` that depends on both token
+//     indices and cannot be factored out into a GEMM. It must also be
+//     evaluated in that form: the log-gate reaches -5 per step, so the
+//     factored `k / exp(c_s)` overflows fp32 inside a single chunk.
+//   * Writing it as *one* fused kernel is worth only 13% (10.4 ms/layer
+//     against 12.0 at K3's widths). At 1.9 TFLOPS of a 91 TFLOPS peak it is
+//     occupancy-bound; hoisting the exponential tables and splitting the
+//     value dimension across blocks both leave it there. The win needs FLA's
+//     decomposition -- intra-chunk, then the sequential scan, then an output
+//     pass parallel across chunks -- so that output work is not serialised
+//     behind the scan.
 void launch_kda_prefill_batched(
     const float* q_norm,
     const float* k_norm,

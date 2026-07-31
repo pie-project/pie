@@ -126,9 +126,9 @@ struct KimiK3LayerWeights {
     const DeviceTensor* routed_down_proj = nullptr;         // [L, H]
     const DeviceTensor* routed_norm = nullptr;              // [L] or null
     const DeviceTensor* routed_up_proj = nullptr;           // [H, L]
-    // Routed experts, dequantised and stacked per layer. Null when the
-    // contract judged the bf16 slabs too large to hold beside the packed
-    // originals -- which is the whole signal; see `author_kimi_k3_contract`.
+    // Routed experts, dequantised and stacked per layer. Required: the binder
+    // refuses a checkpoint the contract could not stack, because the prefill
+    // GEMM has no per-expert fallback.
     const DeviceTensor* moe_gate_up_bf16 = nullptr;  // [E, 2*I_moe, L] bf16
     const DeviceTensor* moe_down_bf16    = nullptr;  // [E, L, I_moe] bf16
     // The MXFP4 originals, per expert, for the decode GEMV. Decode reads the
@@ -138,10 +138,6 @@ struct KimiK3LayerWeights {
     DeviceBuffer<const std::uint8_t*> expert_gate_up_scale_ptrs;
     DeviceBuffer<const std::uint8_t*> expert_down_packed_ptrs;
     DeviceBuffer<const std::uint8_t*> expert_down_scale_ptrs;
-    // The gate/up halves live in separate source tensors, so the decode GEMV's
-    // `[2I, L]` view is built by interleaving w1 and w3 pointer pairs; these
-    // hold the concatenated per-expert slabs the binder materialises.
-    std::vector<DeviceTensor> owned_expert_gate_up;
 
     // Shared expert: a full-width SiTU MLP over the pre-down-proj hidden.
     const DeviceTensor* shared_gate_proj = nullptr;      // [I_shared, H]
