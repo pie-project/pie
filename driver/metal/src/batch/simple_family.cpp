@@ -543,8 +543,21 @@ int go_kind_width(gptoss::Kind k, const GptOssGeometry& g) {
         case K::ExpertDown:               return std::max(stack, down);
         case K::ExpertCombine:            return std::max(down, g.hidden);
         case K::LmHead:                   return std::max(g.hidden, g.vocab);
-        default:                          return g.hidden;
+        // Everything else writes the residual stream. Enumerated rather than
+        // defaulted, because `-Werror=switch` on this file is what stops a new
+        // kind from silently getting a pool slot too small for it -- and a slot
+        // too small is the quietest bug in this driver: the write lands in the
+        // next colour's buffer.
+        case K::EmbedGather:
+        case K::AttnNorm:
+        case K::FfnNorm:
+        case K::AttnResidual:
+        case K::FfnResidual:
+        case K::RowGather:
+        case K::FinalRms:
+        case K::Argmax:                   return g.hidden;
     }
+    return g.hidden;
 }
 
 std::vector<std::size_t> go_pool_elems(const std::vector<gptoss::Dispatch>& dag,
@@ -808,10 +821,6 @@ std::function<bool(const std::string&)> SimpleFamilyEngine::stream_predicate(
     // gpt-oss's routed expert bank is 10.75 of this checkpoint's 11.8 GB, and a
     // token reads 4 experts in 32 per layer. `.bias` stays resident: 180 KB a
     // layer against 132 MB, and a page of it is read whichever expert runs.
-    if (const char* only = std::getenv("PIE_METAL_STREAM_ONLY"); only != nullptr) {
-        const std::string want(only);
-        return [want](const std::string& n) { return n.find(want) != std::string::npos; };
-    }
     return [](const std::string& n) {
         if (n.find("mlp.experts.") == std::string::npos) return false;
         return !(n.size() > 5 && n.compare(n.size() - 5, 5, ".bias") == 0);

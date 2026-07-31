@@ -215,8 +215,12 @@ Pso pso_for_paged(const Dispatch& d, const DecodeStepPsos& base, const MultiBatc
 ///
 /// Padded up to a whole BM tile so the GEMM engages at any batch rather than
 /// only at exact multiples of one; the padding computes discardable values into
-/// pool rows the fire does not use. Below the shared selector's minimum the
-/// per-row matvec is genuinely the faster kernel.
+/// pool rows the fire does not use.
+///
+/// `kQmmMinBatch` is INHERITED: it is qwen3.5's crossover between the GEMV and
+/// the GEMM, and this family's shapes are not qwen3.5's. The padding was
+/// measured here (4 lanes 49.6 -> 53.2 tok/s); the threshold below which it
+/// does not apply was not.
 int gptoss_qmm_rows(int rows) {
     const int n = rows < 1 ? 1 : rows;
     if (n < kQmmMinBatch) return n;

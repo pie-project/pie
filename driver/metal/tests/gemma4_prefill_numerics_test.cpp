@@ -251,13 +251,6 @@ int main(int argc, char** argv) {
     g.kv_page_size = 32;
     g.total_pages = 4;              // one request's worth; 32 tokens fit in one
     g.kv_max_ctx = g.kv_page_size * g.total_pages;
-    // `PIE_G4MB_ENGINELIKE` reproduces the executor engine's configuration of
-    // this same path, so the difference between them can be bisected here
-    // instead of through three layers of the engine.
-    if (std::getenv("PIE_G4MB_ENGINELIKE") != nullptr) {
-        g.kv_max_ctx = 8192;
-        g.total_pages = g.kv_max_ctx / g.kv_page_size;
-    }
     g.max_tokens = N;
     g.max_requests = 1;
     g.paged_kv_enabled = true;

@@ -152,6 +152,8 @@ target_compile_options(pie_driver_metal_lib PRIVATE
 # `Kernel` enum are legitimately partial (a family handles its own kinds and
 # falls through for the rest), and making those an error would only buy a
 # forest of `default:` labels that turn the check back off.
+set_source_files_properties(src/batch/simple_family.cpp
+  PROPERTIES COMPILE_OPTIONS "-Werror=switch")
 set_source_files_properties(src/batch/forward.cpp
   PROPERTIES COMPILE_OPTIONS "-Werror=switch")
 
