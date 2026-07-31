@@ -388,6 +388,9 @@ pub struct PlannerStats {
     pub hog_failures: AtomicU64,
     /// Youngest asks failed loud by the starvation predicate.
     pub starvations: AtomicU64,
+    /// Subset of `starvations` where the victim had declared itself
+    /// restartable, so its work was re-queued instead of lost.
+    pub starvation_restarts: AtomicU64,
     /// Times the starvation rung found the pool refilled underneath it and
     /// handed the head back to the drain instead of destroying a request.
     /// Nonzero means the fleet reached the state that used to lose requests
@@ -463,6 +466,7 @@ pub struct PlannerDiagnostics {
     pub cancelled_waits_total: u64,
     pub hog_failures_total: u64,
     pub starvations_total: u64,
+    pub starvation_restarts_total: u64,
     pub salvages_total: u64,
     pub hoard_bypasses_total: u64,
     pub e6_relaxations_total: u64,
@@ -651,6 +655,16 @@ struct Inner {
     /// (§20.6). Cleared wholesale the moment host slots are actually
     /// returned — see `clear_host_swap_blocks`.
     host_swap_blocked: HashSet<ProcessId>,
+    /// Victims whose last eviction rolled back because `prepare_suspend`
+    /// deferred (nothing of theirs is movable right now: pinned leases, an
+    /// in-flight fire, shared-only pages). Exactly the same spin as
+    /// `host_swap_blocked` — deterministic re-pick, identical failure — and
+    /// it is a hot one: a wedged fleet logged 674k rollbacks in 60 s, and
+    /// because `evicting` is never empty while that runs, EVERY rung above
+    /// the kill is gated out and the pool can never be unwedged. Cleared
+    /// whenever a process retires or host room returns, i.e. whenever the
+    /// answer could actually have changed.
+    prepare_blocked: HashSet<ProcessId>,
 }
 
 impl Inner {
@@ -830,6 +844,24 @@ impl ResidencyPlanner {
         });
     }
 
+    /// Register `pid` at an *existing* FCFS position rather than the newest
+    /// one — the restart path (see [`crate::inferlet::process::spawn`]).
+    ///
+    /// The clock is not rewound: `next_seq` keeps advancing, so a subsequent
+    /// fresh registration still sorts after everything. Two live processes
+    /// briefly sharing a seq is harmless because queue entries are ordered by
+    /// `EntryKey = (spawn_seq, insertion_order)` and keyed per-process.
+    pub fn register_with_seq(&self, pid: ProcessId, seq: u64) {
+        self.with_inner(|inner| {
+            inner.procs.insert(pid, Proc::new(seq));
+        });
+    }
+
+    /// This process's position in the FCFS clock, if it is still registered.
+    pub fn spawn_seq(&self, pid: ProcessId) -> Option<u64> {
+        self.inner.lock().procs.get(&pid).map(|proc| proc.seq)
+    }
+
     /// `pid` has claimed an execution slot and may now hold pooled pages.
     ///
     /// Until this lands the process is registered (it owns its FCFS seq) but
@@ -853,6 +885,7 @@ impl ResidencyPlanner {
             // Teardown returns this process's host slots (and drops it from
             // the candidate pool either way), so re-arm the parked victims.
             inner.host_swap_blocked.clear();
+            inner.prepare_blocked.clear();
             let keys: Vec<EntryKey> = inner
                 .queue
                 .iter()
@@ -1473,6 +1506,7 @@ impl ResidencyPlanner {
                         && proc.seq > head_seq
                         && proc.state == Residency::Resident
                         && !inner.host_swap_blocked.contains(*pid)
+                        && !inner.prepare_blocked.contains(*pid)
                 })
                 .map(|(pid, proc)| Victim {
                     pid: *pid,
@@ -1689,6 +1723,7 @@ impl ResidencyPlanner {
                             if proc.seq <= head_seq
                                 || proc.state != Residency::Resident
                                 || inner.host_swap_blocked.contains(pid)
+                                || inner.prepare_blocked.contains(pid)
                             {
                                 return None;
                             }
@@ -2034,6 +2069,7 @@ impl ResidencyPlanner {
                 return None;
             }
             let victim = inner.queue.get_mut(&victim_key)?;
+            let victim_pid = victim.pid;
             let WaitKind::Allocation {
                 demand,
                 notify,
@@ -2052,14 +2088,33 @@ impl ResidencyPlanner {
                 total,
                 cause,
             }));
-            Some(notify.clone())
+            Some((notify.clone(), victim_pid))
         });
-        if let Some(notify) = notify {
+        if let Some((notify, victim_pid)) = notify {
             self.stats.starvations.fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(
-                cause = ?cause,
-                "planner: pool starved with no reclaim path — failing the youngest parked ask that holds pages"
-            );
+            // Reclaiming this process's pages is not the same as failing its
+            // request. If the guest declared itself restartable, the work is
+            // re-queued at the same FCFS position instead of being lost; the
+            // caller sees one slower reply rather than an error. A guest that
+            // made no such declaration keeps today's fail-loud behaviour,
+            // because re-running it could duplicate its side effects.
+            let restarting = crate::inferlet::process::request_restart(victim_pid);
+            if restarting {
+                self.stats
+                    .starvation_restarts
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::info!(
+                    cause = ?cause,
+                    pid = %victim_pid,
+                    "planner: pool starved — reclaiming a restartable process, its work is re-queued"
+                );
+            } else {
+                tracing::warn!(
+                    cause = ?cause,
+                    pid = %victim_pid,
+                    "planner: pool starved with no reclaim path — failing the youngest parked ask that holds pages"
+                );
+            }
             notify.notify_waiters();
         }
     }
@@ -2105,22 +2160,50 @@ impl ResidencyPlanner {
         });
         let fallback = candidates.first().map(|(key, _)| *key);
         let (model, driver) = self.port.locus();
-        // Chunked, like `quote_and_pick`: quoting the whole fleet under one
-        // KV-lock hold was the planner's p99 hold (§16). The first holder is
-        // usually within the first chunk or two.
-        for chunk in candidates.chunks(16) {
-            let pids: Vec<ProcessId> = chunk.iter().map(|(_, pid)| *pid).collect();
-            let quotes =
-                crate::inferlet::process::residency::kv_reclaim_quotes(&pids, model, driver);
-            for ((key, _), quote) in chunk.iter().zip(quotes) {
-                if let Some(ReclaimQuote::Pages(pages)) = quote
-                    && pages > 0
-                {
-                    return Some(*key);
+        // Two passes over the same youngest-first order. A restartable
+        // process loses only time when it is reclaimed — its work is
+        // re-queued — while a non-restartable one loses the request itself.
+        // So spend the restartable ones first and only reach for a real
+        // failure when no restartable holder can break the wedge. Within
+        // each pass the youngest-first rule is unchanged.
+        let mut first_holder = None;
+        for restartable_only in [true, false] {
+            // Chunked, like `quote_and_pick`: quoting the whole fleet under
+            // one KV-lock hold was the planner's p99 hold (§16). The first
+            // holder is usually within the first chunk or two.
+            for chunk in candidates.chunks(16) {
+                let pids: Vec<ProcessId> = chunk
+                    .iter()
+                    .filter(|(_, pid)| {
+                        !restartable_only || crate::inferlet::process::is_restartable(*pid)
+                    })
+                    .map(|(_, pid)| *pid)
+                    .collect();
+                if pids.is_empty() {
+                    continue;
+                }
+                let quotes =
+                    crate::inferlet::process::residency::kv_reclaim_quotes(&pids, model, driver);
+                let keys = chunk.iter().filter(|(_, pid)| {
+                    !restartable_only || crate::inferlet::process::is_restartable(*pid)
+                });
+                for ((key, _), quote) in keys.zip(quotes) {
+                    if let Some(ReclaimQuote::Pages(pages)) = quote
+                        && pages > 0
+                    {
+                        if restartable_only {
+                            return Some(*key);
+                        }
+                        first_holder.get_or_insert(*key);
+                        break;
+                    }
+                }
+                if first_holder.is_some() {
+                    break;
                 }
             }
         }
-        fallback
+        first_holder.or(fallback)
     }
 
     /// The hog endgame, as a computed predicate: nothing younger can fund
@@ -2212,7 +2295,16 @@ impl ResidencyPlanner {
     /// An eviction attempt was abandoned before commit; the process stays
     /// resident and the next poke re-plans (possibly picking someone else).
     fn eviction_failed(self: &Arc<Self>, pid: ProcessId) {
-        self.eviction_failed_inner(pid, false);
+        self.eviction_failed_inner(pid, false, false);
+    }
+
+    /// `prepare_suspend` deferred: this victim has nothing movable at this
+    /// instant. Park it for the same reason `HostSwapFull` is parked — the
+    /// re-pick is deterministic — and additionally because a rollback loop
+    /// keeps `evicting` non-empty, which gates out the starvation rung that
+    /// is the designed terminal answer to an unfundable fleet.
+    fn eviction_failed_prepare_deferred(self: &Arc<Self>, pid: ProcessId) {
+        self.eviction_failed_inner(pid, false, true);
     }
 
     /// `HostSwapFull`: this victim's bytes have nowhere to go. Victim
@@ -2227,14 +2319,22 @@ impl ResidencyPlanner {
     /// takes over.
     fn eviction_failed_host_swap_full(self: &Arc<Self>, pid: ProcessId) {
         self.record_host_swap_exhaustion();
-        self.eviction_failed_inner(pid, true);
+        self.eviction_failed_inner(pid, true, false);
     }
 
-    fn eviction_failed_inner(self: &Arc<Self>, pid: ProcessId, host_swap_full: bool) {
+    fn eviction_failed_inner(
+        self: &Arc<Self>,
+        pid: ProcessId,
+        host_swap_full: bool,
+        prepare_deferred: bool,
+    ) {
         let signal = self.with_inner(|inner| {
             inner.evicting.remove(&pid);
             if host_swap_full {
                 inner.host_swap_blocked.insert(pid);
+            }
+            if prepare_deferred {
+                inner.prepare_blocked.insert(pid);
             }
             let proc = inner.procs.get_mut(&pid)?;
             if proc.state == Residency::Evicting {
@@ -2262,10 +2362,11 @@ impl ResidencyPlanner {
     /// release.
     fn clear_host_swap_blocks(&self) {
         let cleared = self.with_inner(|inner| {
-            if inner.host_swap_blocked.is_empty() {
+            if inner.host_swap_blocked.is_empty() && inner.prepare_blocked.is_empty() {
                 return false;
             }
             inner.host_swap_blocked.clear();
+            inner.prepare_blocked.clear();
             true
         });
         if cleared {
@@ -2447,6 +2548,7 @@ impl ResidencyPlanner {
             cancelled_waits_total: self.stats.cancelled_waits.load(Relaxed),
             hog_failures_total: self.stats.hog_failures.load(Relaxed),
             starvations_total: self.stats.starvations.load(Relaxed),
+            starvation_restarts_total: self.stats.starvation_restarts.load(Relaxed),
             salvages_total: self.stats.salvages.load(Relaxed),
             hoard_bypasses_total: self.stats.hoard_bypasses.load(Relaxed),
             e6_relaxations_total: self.stats.e6_relaxations.load(Relaxed),
@@ -2843,5 +2945,58 @@ mod starvation_race_tests {
         assert_eq!(planner.diagnostics().host_swap_unblocks_total, 1);
 
         head_task.abort();
+    }
+
+    /// A restart must re-enter the FCFS clock at the position it lost, not
+    /// as the newest process.
+    ///
+    /// This is the liveness argument for restart-instead-of-kill in one
+    /// assertion. Starvation victims are chosen youngest-first, so a restart
+    /// that took a fresh seq would be the immediate next victim and the
+    /// request would be reclaimed forever. Inheriting the seq means the
+    /// re-run ages exactly as the original would have, reaches the head, and
+    /// the head is never a victim.
+    #[test]
+    fn a_restart_inherits_its_fcfs_position() {
+        let pool = Arc::new(RacePool::new(4));
+        let planner = Arc::new(ResidencyPlanner::new(
+            pool.clone() as Arc<dyn PoolPort>,
+            PlannerConfig::default(),
+        ));
+
+        let victim = ProcessId::new_v4();
+        let younger = ProcessId::new_v4();
+        planner.register(victim);
+        planner.register(younger);
+        let victim_seq = planner.spawn_seq(victim).expect("registered");
+        assert!(
+            victim_seq < planner.spawn_seq(younger).expect("registered"),
+            "registration order must be the seq order"
+        );
+
+        // The victim is reclaimed and re-spawned under a new pid.
+        planner.unregister(victim);
+        assert_eq!(planner.spawn_seq(victim), None);
+        let restarted = ProcessId::new_v4();
+        planner.register_with_seq(restarted, victim_seq);
+
+        assert_eq!(
+            planner.spawn_seq(restarted),
+            Some(victim_seq),
+            "the re-run keeps the position it lost"
+        );
+        assert!(
+            planner.spawn_seq(restarted) < planner.spawn_seq(younger),
+            "the re-run must still outrank a process that arrived after it"
+        );
+
+        // The clock itself is not rewound: anything registering later still
+        // sorts behind both, so seqs stay a total arrival order.
+        let newest = ProcessId::new_v4();
+        planner.register(newest);
+        assert!(
+            planner.spawn_seq(newest) > planner.spawn_seq(younger),
+            "a fresh registration must remain the youngest"
+        );
     }
 }

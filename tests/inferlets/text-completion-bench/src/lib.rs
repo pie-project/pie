@@ -554,6 +554,20 @@ async fn run_one(
 async fn main(input: Input) -> Result<Output> {
     let main_start = std::time::Instant::now();
 
+    // This program is pure: it reads its input, generates, and returns the
+    // token counts in one envelope. Nothing is streamed and nothing outside
+    // the process is touched, so a re-run is indistinguishable from the
+    // first run and the planner may reclaim our KV pages by restarting us
+    // instead of failing the request.
+    //
+    // The `wait_for_start` handshake is the one exception: it hands "ready"
+    // to the harness and waits to be released, and the harness releases each
+    // process exactly once. A restart there would wait forever, so that mode
+    // keeps the fail-loud contract.
+    if !input.wait_for_start {
+        inferlet::runtime::declare_restartable();
+    }
+
     let stop_tokens: Vec<u32> = if input.ignore_eos {
         Vec::new()
     } else {

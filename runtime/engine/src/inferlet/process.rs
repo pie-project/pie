@@ -16,9 +16,9 @@ pub(crate) use ctx::OutputMode;
 pub use ctx::ProcessCtx;
 pub(crate) use residency::ProcessResidency;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
-use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
@@ -35,6 +35,75 @@ use crate::service::{ServiceHandler, ServiceMap};
 
 use super::linker;
 use super::program::ProgramName;
+
+/// Processes whose guest called `system.declare-restartable`, and the ones
+/// the planner has since asked to restart.
+///
+/// Two sets rather than one flag on the actor because both are read from
+/// outside the actor's mailbox: the planner picks a starvation victim while
+/// holding neither the process lock nor the actor, and it must know *before*
+/// it destroys an allocation whether that destruction is recoverable.
+static RESTARTABLE: LazyLock<RwLock<HashSet<ProcessId>>> = LazyLock::new(Default::default);
+static RESTART_REQUESTED: LazyLock<RwLock<HashSet<ProcessId>>> = LazyLock::new(Default::default);
+
+/// The guest declared this run re-runnable (`system.declare-restartable`).
+pub(crate) fn declare_restartable(process_id: ProcessId) {
+    RESTARTABLE.write().unwrap().insert(process_id);
+}
+
+pub(crate) fn is_restartable(process_id: ProcessId) -> bool {
+    RESTARTABLE.read().unwrap().contains(&process_id)
+}
+
+/// Ask that `process_id` be re-run from the beginning once it unwinds,
+/// instead of its failure being delivered to the caller. Returns false if
+/// the process never declared itself restartable, in which case the caller
+/// must fall back to failing it loud.
+pub(crate) fn request_restart(process_id: ProcessId) -> bool {
+    if !is_restartable(process_id) {
+        return false;
+    }
+    RESTART_REQUESTED.write().unwrap().insert(process_id);
+    true
+}
+
+/// Original (client-facing) process id -> the live process currently running
+/// that work, for requests that have been restarted.
+///
+/// A restart cannot reuse the process id: the schedulers keep a terminate
+/// tombstone for a retiring pid until its quiesce lands, so a reused id would
+/// have the re-run's fires rejected by its predecessor's tombstone. The
+/// re-run therefore gets a fresh internal id and inherits only the *external*
+/// one, which is all a client ever sees.
+static RESTART_ALIAS: LazyLock<RwLock<HashMap<ProcessId, ProcessId>>> =
+    LazyLock::new(Default::default);
+
+/// Map a client-supplied process id onto the process that is currently
+/// running that work. The identity for anything that never restarted.
+pub fn resolve(process_id: ProcessId) -> ProcessId {
+    RESTART_ALIAS
+        .read()
+        .unwrap()
+        .get(&process_id)
+        .copied()
+        .unwrap_or(process_id)
+}
+
+fn restart_requested(process_id: ProcessId) -> bool {
+    RESTART_REQUESTED.read().unwrap().contains(&process_id)
+}
+
+fn forget_restart_state(process_id: ProcessId) {
+    RESTARTABLE.write().unwrap().remove(&process_id);
+    RESTART_REQUESTED.write().unwrap().remove(&process_id);
+}
+
+/// Number of restarts honoured since boot; surfaced by the metrics probe.
+static RESTART_TOTAL: AtomicUsize = AtomicUsize::new(0);
+
+pub fn restart_total() -> usize {
+    RESTART_TOTAL.load(Relaxed)
+}
 
 // =============================================================================
 // ProcessEvent
@@ -507,6 +576,36 @@ pub fn spawn(
     capture_outputs: bool,
     result_tx: Option<oneshot::Sender<Result<String, String>>>,
 ) -> Result<ProcessId> {
+    spawn_inner(
+        username,
+        program_name,
+        input,
+        client_id,
+        capture_outputs,
+        Arc::new(Mutex::new(result_tx)),
+        None,
+        None,
+    )
+}
+
+/// `inherit_seq` carries a previous process's position in the planner's FCFS
+/// clock across a restart instead of taking a fresh (youngest) one.
+///
+/// Keeping the position is the whole liveness argument. Starvation victims
+/// are chosen youngest-first, so a restart that re-entered as the youngest
+/// process would be re-chosen immediately and forever. Inheriting the
+/// original position means the restarted run ages exactly as it would have,
+/// eventually becomes the queue head, and the head is never a victim.
+fn spawn_inner(
+    username: String,
+    program_name: ProgramName,
+    input: String,
+    client_id: Option<ClientId>,
+    capture_outputs: bool,
+    result_tx: SharedResultTx,
+    inherit_seq: Option<u64>,
+    inherit_client_pid: Option<ProcessId>,
+) -> Result<ProcessId> {
     let id = Uuid::new_v4();
     if crate::scheduler::fire_timing_enabled() {
         crate::scheduler::fire_timing_write(&serde_json::json!({
@@ -519,10 +618,14 @@ pub fn spawn(
         }));
     }
     if let Some(planner) = crate::planner::planner() {
-        planner.register(id);
+        match inherit_seq {
+            Some(seq) => planner.register_with_seq(id, seq),
+            None => planner.register(id),
+        }
     }
     let process = Process::new(
         id,
+        inherit_client_pid.unwrap_or(id),
         username,
         program_name,
         input,
@@ -542,6 +645,7 @@ pub fn spawn(
 
 /// Attach a client to a process.
 pub async fn attach(process_id: ProcessId, client_id: ClientId) -> Result<()> {
+    let process_id = resolve(process_id);
     let (tx, rx) = oneshot::channel();
     SERVICES.send(
         &process_id,
@@ -555,11 +659,12 @@ pub async fn attach(process_id: ProcessId, client_id: ClientId) -> Result<()> {
 
 /// Detach the current client from a process (fire-and-forget).
 pub fn detach(process_id: ProcessId) {
-    let _ = SERVICES.send(&process_id, Message::DetachClient);
+    let _ = SERVICES.send(&resolve(process_id), Message::DetachClient);
 }
 
 /// Terminate a process (fire-and-forget).
 pub fn terminate(process_id: ProcessId, result: Result<String, String>) {
+    let process_id = resolve(process_id);
     // Early wait-set drop for a LIVE process: the scheduler stops holding
     // waves for this pid immediately instead of at the teardown's own
     // leave. Guarded on registry delivery so a terminate aimed at an
@@ -663,6 +768,10 @@ const OUTPUT_BUFFER_CAP: usize = 4096;
 /// Actor managing a single WASM instance lifecycle.
 struct Process {
     process_id: ProcessId,
+    /// The id this work is known by OUTSIDE the engine. Equal to
+    /// `process_id` except after a restart, where the re-run inherits the
+    /// original so a client's handle keeps resolving to it.
+    client_pid: ProcessId,
     username: String,
     program: ProgramName,
     input: String,
@@ -680,15 +789,14 @@ impl Process {
     /// Creates a new Process, generating a UUID, and spawns its WASM execution task.
     fn new(
         process_id: ProcessId,
+        client_pid: ProcessId,
         username: String,
         program: ProgramName,
         input: String,
         client_id: Option<ClientId>,
         capture_outputs: bool,
-        result_tx: Option<oneshot::Sender<Result<String, String>>>,
+        result_tx: SharedResultTx,
     ) -> Self {
-        let result_tx: SharedResultTx = Arc::new(Mutex::new(result_tx));
-
         let task = Self::run(
             process_id,
             username.clone(),
@@ -708,6 +816,7 @@ impl Process {
 
         Process {
             process_id,
+            client_pid,
             username,
             program,
             input,
@@ -724,7 +833,7 @@ impl Process {
     fn deliver_event(&mut self, event: ProcessEvent) {
         // Deliver to attached client
         if let Some(client_id) = self.client_id {
-            if server::send_event(client_id, self.process_id, &event).is_err() {
+            if server::send_event(client_id, self.client_pid, &event).is_err() {
                 self.client_id = None;
                 self.buffer_event(event);
             }
@@ -748,7 +857,7 @@ impl Process {
             return;
         };
         while let Some(event) = self.output_buffer.pop_front() {
-            if server::send_event(client_id, self.process_id, &event).is_err() {
+            if server::send_event(client_id, self.client_pid, &event).is_err() {
                 self.client_id = None;
                 self.output_buffer.push_front(event);
                 break;
@@ -914,8 +1023,13 @@ impl Process {
         }
 
         // Fire result channel if a parent is waiting (and an external
-        // terminate hasn't already claimed it).
-        if let Some(tx) = result_tx.lock().unwrap().take() {
+        // terminate hasn't already claimed it). A process the planner has
+        // asked to restart leaves the channel in place: its failure is not
+        // this request's outcome, and the actor's `terminate` hands the
+        // channel to the re-run.
+        if !restart_requested(process_id)
+            && let Some(tx) = result_tx.lock().unwrap().take()
+        {
             let _ = tx.send(result.clone());
         }
 
@@ -934,21 +1048,79 @@ impl Process {
         }
     }
 
+    /// Re-run this program from the beginning, carrying the caller's reply
+    /// channel, the client-facing process id and the planner's FCFS position
+    /// across to the new process.
+    ///
+    /// Nothing outside the engine observes the handover: an attached client
+    /// keeps receiving events under the id it launched, and a parent waiting
+    /// on the launch handle still gets exactly one result, because the reply
+    /// cell is shared rather than moved. If the spawn fails the sender is
+    /// still in that cell, so a failed restart degrades to today's fail-loud
+    /// behaviour instead of losing the request.
+    fn restart(&mut self) -> bool {
+        let seq = crate::planner::planner().and_then(|planner| planner.spawn_seq(self.process_id));
+        let spawned = spawn_inner(
+            self.username.clone(),
+            self.program.clone(),
+            self.input.clone(),
+            self.client_id,
+            self.capture_outputs,
+            self.result_tx.clone(),
+            seq,
+            Some(self.client_pid),
+        );
+        match spawned {
+            Ok(new_id) => {
+                // Published before this process finishes tearing down, so a
+                // client message aimed at the original id in the handover
+                // window reaches the re-run rather than the corpse.
+                RESTART_ALIAS
+                    .write()
+                    .unwrap()
+                    .insert(self.client_pid, new_id);
+                RESTART_TOTAL.fetch_add(1, Relaxed);
+                tracing::info!(
+                    old = %self.process_id,
+                    new = %new_id,
+                    client_pid = %self.client_pid,
+                    "process restarted after KV reclaim",
+                );
+                true
+            }
+            Err(error) => {
+                tracing::error!(pid = %self.process_id, %error, "process restart failed");
+                false
+            }
+        }
+    }
+
     /// Abort the WASM execution task, notify any attached client, and unregister.
     fn terminate(&mut self, result: Result<String, String>) {
         self.handle.abort();
 
-        // Deliver `result` to any parent waiting on the launch handle, if the
-        // run loop didn't already send it (e.g., external Terminate fires
-        // before the WASM task finished). First taker wins.
-        if let Some(tx) = self.result_tx.lock().unwrap().take() {
-            let _ = tx.send(result.clone());
-        }
+        // The planner reclaimed this process's pages and asked for a re-run
+        // rather than a failure. A fresh process takes over the caller's
+        // reply channel and this one's FCFS position; nothing is delivered
+        // for the abandoned attempt. Teardown below is unchanged and
+        // unconditional — the restart is only worth anything if this
+        // process's pages actually go back to the pool.
+        let restarted = restart_requested(self.process_id) && self.restart();
+        forget_restart_state(self.process_id);
 
-        // Notify attached client / workflow
-        match result {
-            Ok(output) => self.deliver_event(ProcessEvent::Return(output)),
-            Err(msg) => self.deliver_event(ProcessEvent::Error(msg)),
+        if !restarted {
+            // Deliver `result` to any parent waiting on the launch handle, if
+            // the run loop didn't already send it (e.g., external Terminate
+            // fires before the WASM task finished). First taker wins.
+            if let Some(tx) = self.result_tx.lock().unwrap().take() {
+                let _ = tx.send(result.clone());
+            }
+
+            // Notify attached client / workflow
+            match result {
+                Ok(output) => self.deliver_event(ProcessEvent::Return(output)),
+                Err(msg) => self.deliver_event(ProcessEvent::Error(msg)),
+            }
         }
 
         let _ = server::inbox::clear(self.process_id.to_string());
@@ -964,6 +1136,9 @@ impl Process {
         // wakes gate waiters for teardown, and re-plans — the exiting
         // process's KV frees follow via the WS-drop hook). Single exit
         // funnel: covers natural completion AND external terminate.
+        if !restarted {
+            RESTART_ALIAS.write().unwrap().remove(&self.client_pid);
+        }
         if let Some(planner) = crate::planner::planner() {
             planner.unregister(self.process_id);
         }
