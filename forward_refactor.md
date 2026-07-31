@@ -776,6 +776,50 @@ These are shape-independent and tracked separately:
   and sparsity algorithms have no linear-model analogue. `on-recurrent` creates
   the stage; the intrinsic is a separate addition.
 
+### 8.3 Smells this work leaves behind
+
+Audited over the full `origin/dev..HEAD` diff at the end of the effort. None is
+a live defect — each site reasons correctly today — but each is a place the next
+change is likely to get wrong. Recorded so the reasoning does not have to be
+rediscovered.
+
+- **`buffer_fill` means two different things.** `store/rs.rs:169` is a `u32`
+  whose meaning — exact occupancy, or an UPPER BOUND on it — is decided by the
+  sibling `buffer_fill_is_bound: bool` at `:185`. Every reader has to remember
+  to consult the flag, and the diff carries roughly twenty "UPPER BOUND"
+  comments holding that discipline together. This is the one worth fixing:
+  promote it to `enum Occupancy { Exact(u32), AtMost(u32) }` and the reminders
+  become a type. Cheapest real follow-up to come out of this work.
+- **`free_buffer` clamps rather than computes.** `store/rs.rs:415` does
+  `buffer_fill = buffer_fill.min(capacity)`, and its own comment concedes it is
+  "still exact for the cases that matter … and never an under-count". Safe
+  direction, but "exact for the cases that matter" is a hope, not an invariant.
+- **Readiness settlement is unconditional.** `rs_metadata.hpp:20` returns true
+  for ANY RS launch, costing ~230 us of D2H each time, and takes a
+  `buffer_indptr` argument it does not read — the residue of an intent to be
+  shape-sensitive that never happened.
+- **A kernel is deliberately made less accurate.** `gated_delta_net.cu:1677`
+  rounds `state*g` to bf16 in a register purely because the legacy kernel's
+  HBM round trip rounded there. The faster kernel is the more accurate one
+  (3e-6 vs 1.7e-3 against an fp32 CPU reference) and is held down to keep the
+  greedy trajectory bit-stable. The rule it serves — kernel selection must not
+  be observable in the output — is right; the cost is that accuracy is now
+  hostage to kernel selection.
+- **`V_h != K_h` still gates the prefill path.** `qwen3_5_forward.cpp:1141`
+  keeps the exact clause that was proven vacuous for decode. Here it IS
+  justified — that path exists to skip `repeat_interleave`, which does not
+  happen when the head counts are equal — but nothing in the code says the
+  reason differs, so it reads as the bug we fixed. The neighbouring
+  `N > qwen35_gdn_cached_prefill_max_tokens()` is an unattributed tuning
+  threshold.
+
+The removed smells shared one shape worth naming: **a condition that expressed
+nothing true.** The decode `V_h != K_h` gate, Metal's `rs_slot_flags[r] != 0`,
+"a fold loses its logits" applied to every fold, a bindings freshness diff that
+was vacuous for exactly the drift it was written for, a `npm test` pointed at a
+directory nobody created, and an SDK gate scanner that read only the first name
+out of `from x import a, b, c`.
+
 ---
 
 ## 9. Implementation log — decisions taken while landing Step B
