@@ -18,10 +18,6 @@
 #include "heap_bind.hpp"
 #include "heap_bind_metal.hpp"
 
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <unistd.h>
-
 #include <algorithm>
 #include <filesystem>
 #include <functional>
@@ -37,6 +33,7 @@
 #include "decode_step.hpp"     // beta: Dispatch{kind,ordinal,layer,grid,tg} + build_decode_dag
 #include "mtl4_context.hpp"
 #include "pie_loader/checkpoint_source.hpp"
+#include "pie_loader/stream_pack.hpp"
 
 namespace pie::metal {
 
@@ -113,6 +110,9 @@ struct MappedSource {
     std::uint32_t file_id = 0;
     std::uint64_t file_offset = 0;
     std::uint64_t bytes = 0;
+    /// The runtime name, carried so the pack can be identified by what is in
+    /// it rather than only by which plan produced it.
+    std::string name;
 };
 
 /// Which buffers the plan builds as a verbatim slice of ONE file range.
@@ -180,67 +180,13 @@ std::unordered_map<std::uint32_t, MappedSource> resolve_mappable(
         for (const Range& r : ranges) {
             if (begin < r.dest_begin || end > r.dest_end) continue;
             out[id] = MappedSource{r.file_id, r.file_offset + (begin - r.dest_begin),
-                                   decl.bytes};
+                                   decl.bytes, name->second};
             break;
         }
     }
     return out;
 }
 
-/// A page-aligned copy of the streamable tensors, written once and mapped ever
-/// after. Deterministic layout -- buffers in id order, each starting on a page
-/// -- so nothing about it is stored: the same plan recomputes it. Named for the
-/// plan's cache key, so a plan that would produce different bytes names a
-/// different pack.
-class StreamPack {
-  public:
-    StreamPack(const std::filesystem::path& path, std::uint64_t bytes) {
-        std::error_code ec;
-        const bool exists = std::filesystem::exists(path, ec) &&
-                            std::filesystem::file_size(path, ec) == bytes;
-        fd_ = ::open(path.c_str(), exists ? O_RDONLY : (O_RDWR | O_CREAT | O_TRUNC), 0644);
-        if (fd_ < 0) return;
-        if (!exists && ::ftruncate(fd_, off_t(bytes)) != 0) return;
-        void* p = ::mmap(nullptr, std::size_t(bytes),
-                         exists ? PROT_READ : (PROT_READ | PROT_WRITE), MAP_SHARED, fd_, 0);
-        if (p == MAP_FAILED) return;
-        base_ = p;
-        bytes_ = bytes;
-        fresh_ = !exists;
-    }
-    ~StreamPack() {
-        if (base_ != nullptr) ::munmap(base_, std::size_t(bytes_));
-        if (fd_ >= 0) ::close(fd_);
-    }
-    StreamPack(const StreamPack&) = delete;
-    StreamPack& operator=(const StreamPack&) = delete;
-    bool valid() const { return base_ != nullptr; }
-    bool fresh() const { return fresh_; }
-    void* base() const { return base_; }
-
-  private:
-    int fd_ = -1;
-    void* base_ = nullptr;
-    std::uint64_t bytes_ = 0;
-    bool fresh_ = false;
-};
-
-/// Page-aligned pack offsets, in buffer-id order.
-std::uint64_t pack_layout(const std::unordered_map<std::uint32_t, MappedSource>& mapped,
-                          std::vector<std::uint32_t>& ids,
-                          std::unordered_map<std::uint32_t, std::uint64_t>& offset) {
-    ids.clear();
-    ids.reserve(mapped.size());
-    for (const auto& [id, src] : mapped) ids.push_back(id);
-    std::sort(ids.begin(), ids.end());
-    const std::uint64_t page = std::uint64_t(::getpagesize());
-    std::uint64_t total = 0;
-    for (const std::uint32_t id : ids) {
-        offset[id] = total;
-        total += ((mapped.at(id).bytes + page - 1) / page) * page;
-    }
-    return total;
-}
 
 }  // namespace
 
@@ -323,7 +269,18 @@ StagedWeights stage_plan_weights(
     std::vector<std::uint32_t> stream_ids;
     std::unordered_map<std::uint32_t, std::uint64_t> pack_offset;
     if (compact) {
-        const std::uint64_t pack_bytes = pack_layout(mapped, stream_ids, pack_offset);
+        // Buffer-id order, so the same plan lays the pack out the same way on
+        // every run and the one built last time is the one found this time.
+        for (const auto& [id, src] : mapped) stream_ids.push_back(id);
+        std::sort(stream_ids.begin(), stream_ids.end());
+        std::vector<pie_loader::StreamPackEntry> entries;
+        entries.reserve(stream_ids.size());
+        for (const std::uint32_t id : stream_ids) {
+            entries.push_back({id, mapped.at(id).name, mapped.at(id).bytes, 0});
+        }
+        const auto layout = pie_loader::stream_pack_layout(std::move(entries));
+        for (const auto& e : layout.entries) pack_offset[e.id] = e.offset;
+
         const char* dir = std::getenv("PIE_METAL_STREAM_DIR");
         std::error_code ec;
         const std::filesystem::path root =
@@ -331,18 +288,22 @@ StagedWeights stage_plan_weights(
                            : std::filesystem::temp_directory_path() / "pie-metal-stream";
         std::filesystem::create_directories(root, ec);
         const std::string key = pie_loader::bytes_to_string(load_plan.cache_key);
-        auto pack = std::make_shared<StreamPack>(root / (key + ".mtlpack"), pack_bytes);
+        auto pack = std::make_shared<pie_loader::StreamPack>(
+            pie_loader::StreamPack::open(root.string(), key, layout));
         if (pack->valid()) {
-            if (pack->fresh()) {
-                for (const std::uint32_t id : stream_ids) {
-                    const auto& src = mapped.at(id);
+            if (pack->needs_fill()) {
+                for (const auto& e : layout.entries) {
+                    const auto& src = mapped.at(e.id);
                     view.copy_storage_bytes(
                         src.file_id, src.file_offset, src.bytes,
-                        static_cast<std::uint8_t*>(pack->base()) + pack_offset[id],
+                        static_cast<std::uint8_t*>(pack->base()) + e.offset,
                         load.max_tile_bytes());
                 }
+                // A pack that cannot be published is still this run's pack;
+                // the next run rebuilds it rather than reading half of one.
+                pack->commit();
             }
-            pack_slot = ctx.wrap_host_memory(pack->base(), std::size_t(pack_bytes));
+            pack_slot = ctx.wrap_host_memory(pack->base(), std::size_t(layout.total_bytes));
         }
         if (pack_slot.valid()) {
             b.stream_pack = pack;  // must outlive every slot pointing into it

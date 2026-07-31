@@ -1076,6 +1076,12 @@ pie_add_cuda_target(test_grouped_copy
 # without a device.
 pie_add_cuda_target(test_group_slot_index
   SOURCES tests/group_slot_index_test.cpp)
+# When a pack on disk may be trusted. Header-only, device-free and backend-free
+# on purpose: the pack is a property of the load plan, both drivers can use one,
+# and every check here stands between a mapping and the wrong weights.
+pie_add_cuda_target(test_stream_pack
+  SOURCES tests/stream_pack_test.cpp
+  INCLUDE_DIRS ${PIE_LOADER_INCLUDE_DIR})
 # The slab itself, against the residency it replaces: needs a device, a
 # checkpoint on disk and the loader, because the claim it checks is about bytes.
 if(PIE_LOADER_STATICLIB)
