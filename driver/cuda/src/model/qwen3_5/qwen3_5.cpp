@@ -27,14 +27,6 @@ const DeviceTensor* maybe(const LoadedModel& e, const std::string& name) {
     return e.has(name) ? &e.get(name) : nullptr;
 }
 
-bool mtp_int8_lm_head_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_QWEN35_MTP_INT8_LM_HEAD");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-    return enabled;
-}
-
 bool fused_full_attn_qgkv_weights_enabled() {
     static const bool enabled = [] {
         const char* v = std::getenv("PIE_QWEN35_FUSED_FULL_ATTN_QGKV");
@@ -204,24 +196,15 @@ Qwen3_5Weights bind_qwen3_5(LoadedModel& engine) {
         Lw.gate_up_proj_fused =
             maybe(engine, lp + "mlp.gate_up_proj.fused.weight");
         Lw.kv_layer = kv_slot++;
-        if (mtp_int8_lm_head_enabled() &&
-            mtp.lm_head != nullptr &&
-            mtp.lm_head->dtype() == DType::BF16) {
-            const auto& shape = mtp.lm_head->shape();
-            const int rows = static_cast<int>(shape[0]); // vocab
-            const int cols = static_cast<int>(shape[1]); // hidden
-            w.owned_int8_buffers.push_back(
-                DeviceTensor::allocate(DType::INT8, shape));
-            w.owned_scale_buffers.push_back(
-                DeviceBuffer<float>::alloc(static_cast<std::size_t>(rows)));
-            kernels::quantize_bf16_to_int8_per_channel(
-                mtp.lm_head->data(),
-                static_cast<std::int8_t*>(w.owned_int8_buffers.back().data()),
-                w.owned_scale_buffers.back().data(),
-                rows, cols, /*stream=*/0);
-            CUDA_CHECK(cudaStreamSynchronize(0));
-            mtp.lm_head = &w.owned_int8_buffers.back();
-            mtp.lm_head_scale_inv = &w.owned_scale_buffers.back();
+        // `mtp_int8_lm_head` publishes this beside the bf16 head when
+        // `PIE_QWEN35_MTP_INT8_LM_HEAD` is set; absent, the draft step reads
+        // the same bf16 head as the main path.
+        if (const DeviceTensor* int8_head = maybe(engine, "mtp.lm_head")) {
+            const std::optional<ops::QuantMeta> meta = engine.quant_meta("mtp.lm_head");
+            if (meta.has_value() && meta->scale != nullptr) {
+                mtp.lm_head = int8_head;
+                mtp.lm_head_scale_inv = meta->scale;
+            }
         }
         w.mtp = mtp;
     }

@@ -181,6 +181,47 @@ inline void gdn_fp32_parameters(ContractBuilder& b) {
 
 }  // namespace contract_detail
 
+/// Publish an int8 view of `lm_head` for the speculative head to read.
+///
+/// The draft step and the main path read the *same* head, at different
+/// precisions -- `bind_qwen3_5` sets `mtp.lm_head = w.lm_head`. So this is not
+/// a re-encode: both views are published, and `quantized_view` leaves the bf16
+/// original alone.
+///
+/// The bind used to do it, by allocating an `[V, H]` INT8 tensor plus a scale
+/// vector into `owned_int8_buffers`/`owned_scale_buffers` and running
+/// `quantize_bf16_to_int8_per_channel` over the loaded weight. Stating it here
+/// gets the same bytes from the loader's transcode path, which already has an
+/// `Int8Symmetric` encoder, and puts the second copy in the arena's accounting
+/// instead of outside it.
+///
+/// A tied checkpoint has no `lm_head.weight`; the head is `embed_tokens`, which
+/// is what `bind_qwen3_5` resolves to and therefore what gets quantized.
+inline void mtp_int8_lm_head(ContractBuilder& b) {
+    if (!qwen35_mtp_int8_lm_head_enabled() || b.find("mtp.fc.weight") == nullptr) {
+        return;
+    }
+    // Tied checkpoints omit `lm_head.weight` and alias the head to
+    // `embed_tokens`, which is what `bind_qwen3_5` resolves to; the decoder
+    // prefix varies (the VL checkpoints nest it), so match the suffix.
+    const SourceTensor* head = b.find("lm_head.weight");
+    if (head == nullptr) {
+        for (const SourceTensor& raw : b.tensors()) {
+            if (contract_detail::ends_with(raw.name, ".embed_tokens.weight")) {
+                head = &raw;
+                break;
+            }
+        }
+    }
+    // Only a bf16 source. `quantize_bf16_to_int8_per_channel` was the only
+    // converter the bind had, and a checkpoint that already ships a quantized
+    // head wants that head, not a second encoding of it.
+    if (head == nullptr || !contract_detail::is_raw(head->encoding, PieLoaderDType::BF16)) {
+        return;
+    }
+    b.quantized_view(std::string(head->name), "mtp.lm_head", PieLoaderQuantScheme::Int8Symmetric);
+}
+
 /// qwen3_5, qwen3_5_text: a dense hybrid decoder under the usual names.
 inline void author_qwen3_5_contract(ContractBuilder& b) {
     b.allow_bf16_runtime_quant();
@@ -194,6 +235,7 @@ inline void author_qwen3_5_contract(ContractBuilder& b) {
     // projection names, so it wants the same join. Checkpoints without one make
     // this a no-op.
     b.also_join_module("mtp.layers.0.");
+    mtp_int8_lm_head(b);
     author_dense_contract(b);
 }
 

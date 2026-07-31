@@ -172,6 +172,14 @@ bool qwen35_fused_gdn_projection_enabled() {
     return enabled;
 }
 
+bool qwen35_mtp_int8_lm_head_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_QWEN35_MTP_INT8_LM_HEAD");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return enabled;
+}
+
 bool qwen35_moe_gate_up_swapped() {
     static const bool swapped = [] {
         const char* v = std::getenv("PIE_QWEN35_MOE_FLASHINFER");

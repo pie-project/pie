@@ -47,6 +47,7 @@
 #include "pie_loader/request.hpp"
 #include "pie_loader/source_checkpoint.hpp"
 
+#include "loader/load_plan_bridge.hpp"
 #include "model/contract.hpp"
 #include "model/csm/csm_contract.hpp"
 #include "model/deepseek_v4/deepseek_v4_contract.hpp"
@@ -1278,6 +1279,129 @@ void test_nemotron_h_mamba_splits_on_unit_boundaries() {
 /// its decoder `model.language_model.layers.`: it never fired, and nothing
 /// noticed because the only thing that could have is a test with the real
 /// names in it. Which is what this is.
+/// The speculative head reads the same `lm_head` as the main path, in int8.
+///
+/// Env-gated, so this asserts whichever side of `PIE_QWEN35_MTP_INT8_LM_HEAD`
+/// this process is on. Both are load-bearing: with the flag off there must be
+/// no second view at all, and with it on the bf16 original must survive -- the
+/// main path still reads it, so a re-encode here would be a regression rather
+/// than an optimization.
+void test_qwen3_5_mtp_int8_lm_head() {
+    constexpr std::int64_t kHidden = 8;
+    constexpr std::int64_t kVocab = 32;
+    const std::string p = "model.";
+    const std::string l0 = p + "layers.0.";
+    const std::string m0 = "mtp.layers.0.";
+    const std::filesystem::path dir = write_synthetic_checkpoint(
+        "qwen3_5_mtp_int8", {{p + "embed_tokens.weight", {kVocab, kHidden}},
+                             {p + "norm.weight", {kHidden}},
+                             {"lm_head.weight", {kVocab, kHidden}},
+                             {l0 + "input_layernorm.weight", {kHidden}},
+                             {l0 + "post_attention_layernorm.weight", {kHidden}},
+                             {l0 + "self_attn.q_proj.weight", {kHidden, kHidden}},
+                             {l0 + "self_attn.k_proj.weight", {kHidden, kHidden}},
+                             {l0 + "self_attn.v_proj.weight", {kHidden, kHidden}},
+                             {l0 + "self_attn.o_proj.weight", {kHidden, kHidden}},
+                             {l0 + "mlp.gate_proj.weight", {kHidden, kHidden}},
+                             {l0 + "mlp.up_proj.weight", {kHidden, kHidden}},
+                             {l0 + "mlp.down_proj.weight", {kHidden, kHidden}},
+                             {"mtp.fc.weight", {kHidden, 2 * kHidden}},
+                             {"mtp.norm.weight", {kHidden}},
+                             {"mtp.pre_fc_norm_embedding.weight", {kHidden}},
+                             {"mtp.pre_fc_norm_hidden.weight", {kHidden}},
+                             {m0 + "input_layernorm.weight", {kHidden}},
+                             {m0 + "post_attention_layernorm.weight", {kHidden}},
+                             {m0 + "self_attn.q_proj.weight", {kHidden, kHidden}},
+                             {m0 + "self_attn.k_proj.weight", {kHidden, kHidden}},
+                             {m0 + "self_attn.v_proj.weight", {kHidden, kHidden}},
+                             {m0 + "self_attn.o_proj.weight", {kHidden, kHidden}},
+                             {m0 + "mlp.gate_proj.weight", {kHidden, kHidden}},
+                             {m0 + "mlp.up_proj.weight", {kHidden, kHidden}},
+                             {m0 + "mlp.down_proj.weight", {kHidden, kHidden}}});
+
+    std::string open_error;
+    pie_loader::Checkpoint checkpoint = pie_loader::Checkpoint::open(dir.string(), &open_error);
+    check(static_cast<bool>(checkpoint), "the synthetic checkpoint opens: " + open_error);
+    if (!checkpoint) return;
+
+    const pie_cuda_driver::model::ModelFacts facts{
+        .model_type = "qwen3_5",
+        .quant_method = "",
+        .num_hidden_layers = 1,
+        .num_experts = 0,
+        .head_dim = 0,
+        .mamba_groups = 0,
+    };
+    namespace model = pie_cuda_driver::model;
+
+    auto target = pie_cuda_driver::cuda_device_target();
+    target.tp_size = 1;
+    target.tp_rank = 0;
+
+    pie_loader::ModelContract contract;
+    try {
+        model::ContractBuilder builder(checkpoint, facts, target, "",
+                                       model::Mxfp4MoeRequest::RoutedDecode,
+                                       model::Component::Full, /*stream_routed_experts=*/false,
+                                       contract);
+        model::author_qwen3_5_contract(builder);
+        builder.finish();
+    } catch (const std::exception& error) {
+        check(false, std::string("authoring: ") + error.what());
+        std::filesystem::remove_all(dir);
+        return;
+    }
+
+    const auto v = contract.view();
+    const pie_loader::PieLoaderTensorContractView* head = nullptr;
+    const pie_loader::PieLoaderTensorContractView* original = nullptr;
+    for (std::size_t i = 0; i < v.tensors.len; ++i) {
+        const auto& t = v.tensors.ptr[i];
+        if (view_of(t.name) == "mtp.lm_head") head = &t;
+        if (view_of(t.name) == "lm_head.weight") original = &t;
+    }
+
+    if (model::qwen35_mtp_int8_lm_head_enabled()) {
+        check(head != nullptr, "the int8 speculative head is published");
+        if (head != nullptr) {
+            check(head->encoding.kind ==
+                          static_cast<std::uint32_t>(pie_loader::PieLoaderEncodingKind::Quant) &&
+                      head->encoding.quant.scheme ==
+                          static_cast<std::uint32_t>(pie_loader::PieLoaderQuantScheme::Int8Symmetric),
+                  "the speculative head is int8-symmetric");
+        }
+        // A view, not a re-encode: the main path still reads bf16.
+        check(original != nullptr &&
+                  original->encoding.dtype ==
+                      static_cast<std::uint32_t>(pie_loader::PieLoaderDType::BF16),
+              "the bf16 head survives beside it");
+    } else {
+        check(head == nullptr, "no speculative head without the flag");
+        check(original != nullptr, "the bf16 head is published");
+    }
+
+    try {
+        const pie_loader::PieLoaderContractRequest request =
+            pie_loader::build_contract_request(checkpoint, target, v);
+        const pie_loader::LoadPlan plan = pie_loader::LoadPlan::compile(request);
+        plan.verify(request);
+
+        // The bind reads `engine.quant_meta("mtp.lm_head")`, which the weight
+        // store keys off exactly this table. The scale is named by appending a
+        // suffix to the declaration, and "mtp.lm_head" does not end in
+        // ".weight", so this is the assertion that the name carries.
+        bool attached = false;
+        for (const auto& a : pie_cuda_driver::resolve_quant_attachments(plan.view())) {
+            if (a.tensor_name == "mtp.lm_head") attached = true;
+        }
+        check(attached == model::qwen35_mtp_int8_lm_head_enabled(),
+              "the speculative head's scale reaches the driver's bind table");
+    } catch (const std::exception& error) {
+        check(false, std::string("compiling: ") + error.what());
+    }
+    std::filesystem::remove_all(dir);
+}
+
 void test_qwen3_5_gdn_splits_by_block() {
     constexpr std::int64_t kKey = 8;
     constexpr std::int64_t kValue = 16;
@@ -2156,6 +2280,7 @@ int main() {
     test_kimi_stacks_experts_as_bf16();
     test_nemotron_h_mamba_splits_on_unit_boundaries();
     test_qwen3_5_gdn_splits_by_block();
+    test_qwen3_5_mtp_int8_lm_head();
     test_gpt_oss_native_repack_is_rank_blind();
     test_qwen3_moe_streams_experts_as_a_group();
     test_gpt_oss_streams_experts_as_a_group();

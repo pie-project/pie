@@ -999,6 +999,27 @@ public:
         publish_fused(chosen);
     }
 
+    /// Publish a second, quantized view of a source tensor under another name.
+    ///
+    /// Unlike `publish_remaining`'s runtime quantization this does **not**
+    /// consume the source, so the original encoding stays published beside it.
+    /// That is the difference between re-encoding a weight and adding a cheaper
+    /// copy of it for one path that wants one: Qwen3.5's speculative head reads
+    /// the same `lm_head` as the main path, in int8, while the main path keeps
+    /// reading bf16.
+    ///
+    /// Returns false when the checkpoint has no such tensor, so a caller can
+    /// state an optional view without first proving the source exists.
+    bool quantized_view(const std::string& source, std::string output,
+                        PieLoaderQuantScheme scheme) {
+        const SourceTensor* raw = find(source);
+        if (raw == nullptr) {
+            return false;
+        }
+        push_runtime_quant(*raw, std::move(output), scheme);
+        return true;
+    }
+
     // -- the generic tail ----------------------------------------------------
 
     /// Declare every source tensor no pass has claimed, under its own name.

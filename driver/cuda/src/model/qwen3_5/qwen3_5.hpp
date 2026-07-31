@@ -106,8 +106,6 @@ struct Qwen3_5Weights {
     // [K1 | K2 | V] block layout doesn't shard cleanly under uniform
     // axis-0 partitioning, so we slice per-block here.
     std::vector<DeviceTensor> owned_bf16_buffers;
-    std::vector<DeviceTensor> owned_int8_buffers;
-    std::vector<DeviceBuffer<float>> owned_scale_buffers;
 
     struct MtpWeights {
         const DeviceTensor* pre_fc_norm_embedding = nullptr;
@@ -116,7 +114,7 @@ struct Qwen3_5Weights {
         const DeviceTensor* norm = nullptr;  // final MTP norm
         const DeviceTensor* embed = nullptr; // aliases base embed unless dedicated
         const DeviceTensor* lm_head = nullptr; // aliases base lm_head by default
-        const DeviceBuffer<float>* lm_head_scale_inv = nullptr; // INT8 per-channel
+        const DeviceTensor* lm_head_scale_inv = nullptr;  // INT8 per-channel
         Qwen3_5LayerWeights layer;
     };
     std::optional<MtpWeights> mtp;

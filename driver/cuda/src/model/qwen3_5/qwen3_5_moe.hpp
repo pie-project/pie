@@ -47,6 +47,15 @@ bool qwen35_moe_gate_up_swapped();
 /// contract produced.
 bool qwen35_fused_gdn_projection_enabled();
 
+/// True when the speculative head reads `lm_head` as int8 rather than bf16.
+///
+/// Opt-in (`PIE_QWEN35_MTP_INT8_LM_HEAD`): the draft step's argmax GEMV is
+/// memory-bound over the whole vocabulary, so halving the head pays for the
+/// accuracy the draft can afford to lose -- the verifier re-scores every token
+/// anyway. Read by the contract, which is what publishes the int8 view, and by
+/// the bind, which reads whichever views the contract produced.
+bool qwen35_mtp_int8_lm_head_enabled();
+
 struct Qwen3_5MoeLayerWeights {
     enum class Kind { LinearAttn, FullAttn };
     Kind kind;
