@@ -65,10 +65,11 @@ private:
     KvCache& kv_cache_;
     Qwen3_5ForwardCfg fwd_cfg_;
     ModelCapabilities caps_;
-    // Arc 1 of the declared executor (declared_facts.hpp): the traced +
-    // structurally validated plan, built at construction when
-    // PIE_DECLARED_FORWARD opted in. Stored for arc 2 (the emission arcs);
-    // body() does NOT consume it — cold-start validation only.
+    // The declared executor's plan (declared_facts.hpp): traced +
+    // structurally validated at construction when PIE_DECLARED_FORWARD
+    // opted in. Arc 2 consumes it in body() on eligible PURE-DECODE fires
+    // (declared_forward.hpp's slice); every other fire falls back to the
+    // hand-written path with the reason trace-logged.
     Qwen35DeclaredPlan declared_;
 };
 

@@ -1,6 +1,9 @@
 #include "model/qwen3_5/qwen3_5_model.hpp"
 
+#include <cstdio>
 #include <utility>
+
+#include "model/qwen3_5/declared_forward.hpp"
 
 namespace pie_cuda_driver::model {
 
@@ -35,12 +38,13 @@ Qwen35Model::Qwen35Model(
     caps_.supports_compact_logits      = true;
     caps_.supports_small_prefill_graph = supports_small_prefill_graph;
 
-    // Declared-executor arc 1: trace + structurally validate the hybrid
+    // Declared executor: trace + structurally validate the hybrid
     // declaration against this deployment's config and bindings, now
     // rather than on first fire (the facts are load-time facts —
     // llama_like_model.cpp's reasoning). An unrepresentable config leaves
-    // `declared_` empty with the reason logged once; body() runs the
-    // hand-written path either way — nothing consumes the plan yet.
+    // `declared_` empty with the reason logged once and body() keeps the
+    // hand-written path; a validated plan is consumed by body()'s
+    // decode-slice gate below.
     if (qwen35_declared_forward_enabled()) {
         declared_ = build_qwen3_5_declared_plan(hf_config_, weights_, tp_size);
     }
@@ -60,6 +64,89 @@ void Qwen35Model::body(Workspace& ws,
                        AttentionWorkspace& attn_ws,
                        ops::CublasHandle& cublas,
                        const ForwardFn::ForwardInputs& in) {
+    // Arc-2 decode slice: the declared executor covers exactly the
+    // hand-written TP=1 PURE-DECODE path's vocabulary; anything it cannot
+    // express falls back, per fire, to the hand-written body below.
+    // Build-time exclusions (TP>1, quantized projections, irregular layer
+    // schedule, mixed fused bindings, ...) already left `declared_` empty.
+    // Each term names the hand-written per-fire service the walk does not
+    // yet mirror; `fallback_reason` keeps the exclusion honest in the
+    // trace log (a silent fallback would be indistinguishable from a
+    // passing A/B run).
+    const char* fallback_reason = nullptr;
+    if (static_cast<bool>(declared_)) {
+        const int qgkv_dim =
+            2 * hf_config_.num_attention_heads * hf_config_.head_dim +
+            2 * hf_config_.num_key_value_heads * hf_config_.head_dim;
+        if (!in.is_pure_decode) {
+            // The state-op arms emit only the decode-update lowerings
+            // (conv update, recurrent step); prefill walks are a later arc.
+            fallback_reason = "prefill fire (decode slice only)";
+        } else if (in.stage_hooks != nullptr) {
+            fallback_reason = "stage hooks attached";
+        } else if (in.lora != nullptr) {
+            // The plan has no correction op; running the walk would
+            // silently drop the adapter (llama_like's reasoning). The
+            // hand-written qwen3_5 body ignores lora too, but the honest
+            // gate is exclusion, not shared omission.
+            fallback_reason = "lora fire";
+        } else if (in.custom_mask_d != nullptr) {
+            fallback_reason = "custom mask";
+        } else if (in.commit_advance_gather_d != nullptr) {
+            // Spec-decode commit-advance re-runs only the linear-attn
+            // blocks from the stash — a fire shape, not the base pass.
+            fallback_reason = "commit-advance fire";
+        } else if (in.rs_buffer_write || in.rs_buffer_fold) {
+            fallback_reason = "rs-buffer write/fold fire";
+        } else if (in.num_logit_rows < 0) {
+            fallback_reason = "state-only fire (num_logit_rows < 0)";
+        } else if (state_cache_.verify_frozen()) {
+            // Frozen verify stashes in-proj activations and suppresses
+            // state writes inside the layer bodies — spec-decode services
+            // around the pass the walk does not mirror.
+            fallback_reason = "frozen-verify fire";
+        } else if (in.has_write_desc &&
+                   (in.w_page_d == nullptr || in.w_off_d == nullptr)) {
+            // Same guard the hand-written explicit-write validation makes.
+            fallback_reason = "write descriptors missing";
+        } else if (declared_.fused_full_attn_qgkv &&
+                   (ws.gate_up_fused.empty() ||
+                    ws.gate_up_fused.numel() <
+                        static_cast<std::size_t>(in.total_tokens) *
+                            qgkv_dim)) {
+            // The trace committed to the fused qgkv bank; a workspace that
+            // cannot stage it would make the hand-written body fall back
+            // to the unfused GEMMs per layer — a shape the fused trace
+            // cannot express (the hand-written `use_fused_qgkv` check).
+            fallback_reason = "fused qgkv staging buffer unavailable";
+        }
+        // (MTP draft fires need no term here: drafting and verify-commit
+        // enter through wire_system_drafter's own entry points, never
+        // body(); the fires MTP *does* route through body() are the
+        // frozen-verify / commit-advance / state-only shapes excluded
+        // above.)
+        if (fallback_reason == nullptr) {
+            qwen3_5_forward_declared(
+                declared_, weights_, hf_config_, fwd_cfg_, plan_state_,
+                ws, la_ws_, kv, state_cache_, attn_ws, cublas,
+                in.token_ids, in.positions,
+                in.qo_indptr_d, in.kv_page_indices_d,
+                in.kv_page_indptr_d, in.kv_last_page_lens_d,
+                in.qo_indptr_h, in.kv_page_indptr_h,
+                in.total_tokens, in.num_requests, in.is_pure_decode,
+                in.w_page_d, in.w_off_d, in.row_valid_d, in.has_write_desc,
+                in.slot_ids_h, in.is_fresh_h, in.slot_ids_d, in.is_fresh_d,
+                in.logit_row_indices_d, in.num_logit_rows);
+            return;
+        }
+        if (qwen35_declared_exec_trace_enabled()) {
+            std::fprintf(stderr,
+                         "[declared-qwen35-exec] fallback N=%d R=%d "
+                         "decode=%d reason=%s\n",
+                         in.total_tokens, in.num_requests,
+                         in.is_pure_decode ? 1 : 0, fallback_reason);
+        }
+    }
     qwen3_5_forward_paged(
         weights_, hf_config_, fwd_cfg_, plan_state_,
         ws, la_ws_, kv, state_cache_,

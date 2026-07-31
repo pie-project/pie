@@ -24,8 +24,10 @@
 //   [declared-qwen35] traced ops=.. layers=.. interval=.. validation=OK
 //   [declared-qwen35] traced ops=.. layers=.. interval=.. validation=refused(reason)
 //
-// NOTHING consumes the plan in body() yet — no execution, cold-start
-// validation only. A config the trace cannot express (irregular
+// Arc 2 (declared_forward.hpp) consumes the stored plan in the dense
+// model's body() on eligible pure-decode fires; the validation here stays
+// the cold-start gate in front of it. A config the trace cannot express
+// (irregular
 // layer_types schedule, quantized projections, TP>1, a mixed
 // fused/unfused binding) yields an EMPTY plan with the reason logged once;
 // never an error — the hand-written path is untouched either way, exactly
