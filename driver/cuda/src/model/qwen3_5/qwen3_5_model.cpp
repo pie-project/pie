@@ -44,7 +44,7 @@ Qwen35Model::Qwen35Model(
     // llama_like_model.cpp's reasoning). An unrepresentable config leaves
     // `declared_` empty with the reason logged once and body() keeps the
     // hand-written path; a validated plan is consumed by body()'s
-    // decode-slice gate below.
+    // eligibility gate below.
     if (qwen35_declared_forward_enabled()) {
         declared_ = build_qwen3_5_declared_plan(hf_config_, weights_, tp_size);
     }
@@ -64,25 +64,21 @@ void Qwen35Model::body(Workspace& ws,
                        AttentionWorkspace& attn_ws,
                        ops::CublasHandle& cublas,
                        const ForwardFn::ForwardInputs& in) {
-    // Arc-2 decode slice: the declared executor covers exactly the
-    // hand-written TP=1 PURE-DECODE path's vocabulary; anything it cannot
-    // express falls back, per fire, to the hand-written body below.
-    // Build-time exclusions (TP>1, quantized projections, irregular layer
-    // schedule, mixed fused bindings, ...) already left `declared_` empty.
-    // Each term names the hand-written per-fire service the walk does not
-    // yet mirror; `fallback_reason` keeps the exclusion honest in the
-    // trace log (a silent fallback would be indistinguishable from a
-    // passing A/B run).
+    // The declared executor covers the hand-written TP=1 base pass —
+    // decode AND prefill fires (arc 3; mixed prefill+decode fires are the
+    // same qo_indptr-windowed prefill shape) — anything it cannot express
+    // falls back, per fire, to the hand-written body below. Build-time
+    // exclusions (TP>1, quantized projections, irregular layer schedule,
+    // mixed fused bindings, ...) already left `declared_` empty. Each term
+    // names the hand-written per-fire service the walk does not mirror;
+    // `fallback_reason` keeps the exclusion honest in the trace log (a
+    // silent fallback would be indistinguishable from a passing A/B run).
     const char* fallback_reason = nullptr;
     if (static_cast<bool>(declared_)) {
         const int qgkv_dim =
             2 * hf_config_.num_attention_heads * hf_config_.head_dim +
             2 * hf_config_.num_key_value_heads * hf_config_.head_dim;
-        if (!in.is_pure_decode) {
-            // The state-op arms emit only the decode-update lowerings
-            // (conv update, recurrent step); prefill walks are a later arc.
-            fallback_reason = "prefill fire (decode slice only)";
-        } else if (in.stage_hooks != nullptr) {
+        if (in.stage_hooks != nullptr) {
             fallback_reason = "stage hooks attached";
         } else if (in.lora != nullptr) {
             // The plan has no correction op; running the walk would

@@ -68,6 +68,39 @@ Qwen3_5LinearAttnWorkspace Qwen3_5LinearAttnWorkspace::allocate(
     return ws;
 }
 
+// GDN prefill recurrence-family knobs. NOT in the anonymous namespace: the
+// declared executor (declared_forward.cpp) must select the same prefill
+// lowering the hand-written body selects, so both read these single
+// definitions — a duplicated getenv would be a silent divergence channel.
+int qwen35_gdn_cached_prefill_max_tokens() {
+    static const int max_tokens = [] {
+        const char* v = std::getenv("PIE_QWEN35_GDN_CACHED_PREFILL_MAX_TOKENS");
+        if (v == nullptr || v[0] == '\0') return 0;
+        return std::max(0, std::atoi(v));
+    }();
+    return max_tokens;
+}
+
+int qwen35_gdn_warp_tiled_max_tokens() {
+    static const int max_tokens = [] {
+        const char* v = std::getenv("PIE_QWEN35_GDN_WARP_TILED_MAX_TOKENS");
+        if (v == nullptr || v[0] == '\0') return 64;
+        return std::max(0, std::atoi(v));
+    }();
+    return max_tokens;
+}
+
+// STOPGAP escape hatch (see the warp-tiled STOPGAP note in
+// linear_attn_layer_body): re-enables the warp-tiled recurrent prefill on
+// the state-persisting path once its multi-token fold is fixed.
+bool qwen35_gdn_warp_tiled_state_persist_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_QWEN35_GDN_WARP_TILED_STATE_PERSIST");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return enabled;
+}
+
 namespace {
 
 bool mtp_profile_enabled() {
@@ -104,24 +137,6 @@ std::uint64_t qwen35_forward_profile_print_limit() {
         return parsed > 0 ? static_cast<std::uint64_t>(parsed) : std::uint64_t{0};
     }();
     return limit;
-}
-
-int qwen35_gdn_cached_prefill_max_tokens() {
-    static const int max_tokens = [] {
-        const char* v = std::getenv("PIE_QWEN35_GDN_CACHED_PREFILL_MAX_TOKENS");
-        if (v == nullptr || v[0] == '\0') return 0;
-        return std::max(0, std::atoi(v));
-    }();
-    return max_tokens;
-}
-
-int qwen35_gdn_warp_tiled_max_tokens() {
-    static const int max_tokens = [] {
-        const char* v = std::getenv("PIE_QWEN35_GDN_WARP_TILED_MAX_TOKENS");
-        if (v == nullptr || v[0] == '\0') return 64;
-        return std::max(0, std::atoi(v));
-    }();
-    return max_tokens;
 }
 
 bool qwen35_mtp_fused_gemv_enabled() {
@@ -850,10 +865,8 @@ void linear_attn_layer_body(
     // frozen-verify (write_state=false → persists nothing, so the fold bug cannot
     // manifest) and all decode. Re-enable the warp-tiled state path via
     // PIE_QWEN35_GDN_WARP_TILED_STATE_PERSIST=1 once the kernel's fold is fixed.
-    static const bool warp_tiled_state_persist_ok = [] {
-        const char* v = std::getenv("PIE_QWEN35_GDN_WARP_TILED_STATE_PERSIST");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
+    const bool warp_tiled_state_persist_ok =
+        qwen35_gdn_warp_tiled_state_persist_enabled();
     const bool use_warp_tiled_recurrent =
         !linear_decode &&
         slot_ids_d != nullptr &&

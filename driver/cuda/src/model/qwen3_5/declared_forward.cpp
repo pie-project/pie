@@ -140,14 +140,15 @@ void qwen3_5_forward_declared(
                      total_tokens, num_requests, is_pure_decode ? 1 : 0,
                      plan.op_count());
     }
-    // The decode slice: the caller's gate admits only pure-decode fires,
-    // and every state-op arm below emits the decode-update lowering. A
-    // non-decode fire reaching this walk is a caller bug, not a fallback.
-    if (!is_pure_decode) {
-        throw std::runtime_error(
-            "declared qwen35 forward: non-decode fire reached the decode "
-            "slice (the caller's gate must exclude it)");
-    }
+    // Both fire shapes run here now (arc 3): the trace is decode/prefill-
+    // agnostic by design (forward/src/trace.rs — CausalConv1d / GatedDelta /
+    // Attention are opaque state ops whose lowering the emitter picks per
+    // fire), so the state-op arms below branch on `is_pure_decode` exactly
+    // as the hand-written `linear_attn_layer_body` branches. A MIXED fire
+    // (prefill + decode rows co-batched) is not separate machinery: the
+    // hand-written body treats any `is_pure_decode == false` fire as one
+    // qo_indptr-windowed prefill shape (a decode row is just an Nr == 1
+    // window), and the walk mirrors that single shape.
 
     const int N = total_tokens;
     const int R = num_requests;
@@ -191,10 +192,10 @@ void qwen3_5_forward_declared(
 
     // Per-slot reset for freshly (re)assigned rs slots — the hand-written
     // reset stage minus the commit-advance / rs-buffer branches the
-    // caller's gate excluded. (On a pure-decode fire the runtime guarantees
-    // no slot is fresh — freshness only occurs on a context's first fire, a
-    // prefill — but the hand-written body still runs this check, so the
-    // walk runs it too rather than reasoning it away.)
+    // caller's gate excluded. (Freshness occurs on a context's first fire,
+    // a prefill; on a pure-decode fire the runtime guarantees no slot is
+    // fresh, but the hand-written body still runs the check on both shapes,
+    // so the walk runs it too rather than reasoning it away.)
     if (slot_ids_h != nullptr && is_fresh_h != nullptr) {
         if (std::any_of(is_fresh_h, is_fresh_h + R,
                         [](auto fresh) { return fresh != 0; })) {
@@ -210,7 +211,9 @@ void qwen3_5_forward_declared(
             }
         }
     } else if (!is_pure_decode) {
-        state_cache.reset(stream);  // unreachable on this slice; mirrored
+        // Legacy null-slot prefill: reset all (the parity entry point's
+        // "fresh state before consumption" semantic, max_slots == 1).
+        state_cache.reset(stream);
     }
 
     // Attention plan pointers, read exactly as qwen3_5_forward_paged reads
@@ -226,11 +229,42 @@ void qwen3_5_forward_declared(
     const bool state_bf16 = state_cache.recurrent_state_bf16();
     const auto slot_stride = static_cast<long long>(
         state_cache.recurrent_slot_stride_floats());
-    // Decode GQA lowering choice — the hand-written
-    // `use_decode_gqa_recurrent`, term for term (`linear_decode` is true on
-    // this slice: pure decode, rs_buffer_write excluded by the gate).
+    // The hand-written body's routing booleans, term for term. Two of its
+    // terms are constants on this slice, resolved by the caller's gate:
+    // `linear_decode = is_pure_decode && !rs_buffer_write` (rs-buffer fires
+    // excluded) and `commit_len == nullptr` (commit-advance fires
+    // excluded). `write_state = !verify_frozen && !rs_buffer_write`; the
+    // gate excludes frozen-verify too, but the walk mirrors the read
+    // rather than folding the constant.
+    const bool linear_decode = is_pure_decode;
+    const bool write_state = !state_cache.verify_frozen();
+    auto slot_for = [&](int r) -> int {
+        return slot_ids_h ? slot_ids_h[r] : 0;
+    };
+    // Decode GQA step: indexes the compact K_h-head layout directly.
     const bool use_decode_gqa_recurrent =
+        linear_decode &&
         slot_ids_d != nullptr && V_h != K_h && V_h % K_h == 0;
+    // Prefill recurrence family — the hand-written selection, verbatim:
+    // warp-tiled for small-N slotted prefill (STOPGAP: only when it need
+    // not persist state, unless the env re-enables the persisting fold);
+    // else the env-gated cached kernel; else the batched GQA-aware FLA
+    // (the c>=64 spec path). `use_batched_fla_gqa` also decides whether
+    // GdnPrep skips the repeat_interleave materialisation.
+    const bool use_warp_tiled_recurrent =
+        !linear_decode &&
+        slot_ids_d != nullptr &&
+        qo_indptr != nullptr &&
+        N <= qwen35_gdn_warp_tiled_max_tokens() &&
+        K_d <= 256 &&
+        (!write_state || qwen35_gdn_warp_tiled_state_persist_enabled());
+    const bool use_batched_fla_gqa =
+        !linear_decode &&
+        slot_ids_d != nullptr &&
+        qo_indptr != nullptr &&
+        !use_warp_tiled_recurrent &&
+        V_h != K_h &&
+        N > qwen35_gdn_cached_prefill_max_tokens();
     // What the recurrence consumes when the GQA kernels don't index the
     // compact K_h layout directly (the `q_recur_full` indirection).
     const float* q_recur_full =
@@ -451,27 +485,64 @@ void qwen3_5_forward_declared(
             }
             const int state_layer = static_cast<int>(op.param0);
             require(layer.la_conv1d_w, name);
-            // Decode-update lowering against the layer's per-request conv
-            // state — the hand-written `linear_decode` branch, verbatim
-            // (batched slot-indirected kernel, or the legacy slot-0 path
-            // for the parity entry point).
-            if (slot_ids_d != nullptr) {
-                kernels::launch_causal_conv1d_update_batched_bf16(
-                    la.mixed_qkv.data(), layer.la_conv1d_w->data(),
-                    layer.la_conv1d_b ? layer.la_conv1d_b->data() : nullptr,
-                    state_cache.conv_state(state_layer, /*slot=*/0),
-                    slot_ids_d,
-                    static_cast<long long>(state_cache.conv_kernel()) *
-                        state_cache.conv_dim(),
-                    la.mixed_qkv_post.data(),
-                    R, conv_dim, conv_K, stream);
+            // Per-fire lowering of the opaque conv op against the layer's
+            // per-request conv state — the hand-written conv stage,
+            // verbatim: decode-update on pure-decode fires, the batched
+            // prefill walk (each (C, R) block walking its qo_indptr window
+            // and persisting the trailing K-window) otherwise, with the
+            // legacy slot-0 / host-loop paths for the parity entry point.
+            if (linear_decode) {
+                if (slot_ids_d != nullptr) {
+                    kernels::launch_causal_conv1d_update_batched_bf16(
+                        la.mixed_qkv.data(), layer.la_conv1d_w->data(),
+                        layer.la_conv1d_b ? layer.la_conv1d_b->data()
+                                          : nullptr,
+                        state_cache.conv_state(state_layer, /*slot=*/0),
+                        slot_ids_d,
+                        static_cast<long long>(state_cache.conv_kernel()) *
+                            state_cache.conv_dim(),
+                        la.mixed_qkv_post.data(),
+                        R, conv_dim, conv_K, stream);
+                } else {
+                    kernels::launch_causal_conv1d_update_bf16(
+                        la.mixed_qkv.data(), layer.la_conv1d_w->data(),
+                        layer.la_conv1d_b ? layer.la_conv1d_b->data()
+                                          : nullptr,
+                        state_cache.conv_state(state_layer, 0),
+                        la.mixed_qkv_post.data(),
+                        conv_dim, conv_K, stream);
+                }
             } else {
-                kernels::launch_causal_conv1d_update_bf16(
-                    la.mixed_qkv.data(), layer.la_conv1d_w->data(),
-                    layer.la_conv1d_b ? layer.la_conv1d_b->data() : nullptr,
-                    state_cache.conv_state(state_layer, 0),
-                    la.mixed_qkv_post.data(),
-                    conv_dim, conv_K, stream);
+                if (slot_ids_d != nullptr && qo_indptr != nullptr) {
+                    kernels::launch_causal_conv1d_prefill_batched_bf16(
+                        la.mixed_qkv.data(), layer.la_conv1d_w->data(),
+                        layer.la_conv1d_b ? layer.la_conv1d_b->data()
+                                          : nullptr,
+                        la.mixed_qkv_post.data(),
+                        state_cache.conv_state(state_layer, /*slot=*/0),
+                        slot_ids_d, qo_indptr,
+                        static_cast<long long>(state_cache.conv_kernel()) *
+                            state_cache.conv_dim(),
+                        R, conv_dim, conv_K, stream, write_state,
+                        /*commit_len=*/nullptr);
+                } else {
+                    for (int r = 0; r < R; ++r) {
+                        const int t0 = static_cast<int>(qo_indptr_h[r]);
+                        const int Nr =
+                            static_cast<int>(qo_indptr_h[r + 1]) - t0;
+                        if (Nr <= 0) continue;
+                        const std::size_t off =
+                            static_cast<std::size_t>(t0) * conv_dim;
+                        kernels::launch_causal_conv1d_prefill_bf16(
+                            la.mixed_qkv.data() + off,
+                            layer.la_conv1d_w->data(),
+                            layer.la_conv1d_b ? layer.la_conv1d_b->data()
+                                              : nullptr,
+                            la.mixed_qkv_post.data() + off,
+                            state_cache.conv_state(state_layer, slot_for(r)),
+                            Nr, conv_dim, conv_K, stream);
+                    }
+                }
             }
             break;
         }
@@ -496,13 +567,13 @@ void qwen3_5_forward_declared(
                 la.g_log.data(), la.beta.data(),
                 N, K_h, V_h, K_d, V_d, conv_dim, stream);
             // GQA materialisation is a LOWERING of the recurrence, not a
-            // trace op: the decode GQA step kernel indexes the compact
-            // K_h-head layout directly, so repeat_interleave launches only
-            // when that kernel is not eligible — the hand-written decode
-            // predicate (`V_h != K_h && !use_decode_gqa_recurrent`; the
-            // warp-tiled / batched-FLA terms are prefill-only and false on
-            // this slice).
-            if (V_h != K_h && !use_decode_gqa_recurrent) {
+            // trace op: the decode GQA step, warp-tiled prefill and
+            // batched-FLA-GQA kernels all index the compact K_h-head
+            // layout directly, so repeat_interleave launches only when
+            // none of them is eligible — the hand-written predicate,
+            // all four terms.
+            if (V_h != K_h && !use_warp_tiled_recurrent &&
+                !use_decode_gqa_recurrent && !use_batched_fla_gqa) {
                 kernels::launch_repeat_interleave_heads_fp32(
                     la.q_pre.data(), la.q_norm.data(), N, K_h, V_h, K_d,
                     stream);
@@ -513,13 +584,159 @@ void qwen3_5_forward_declared(
             break;
         }
         case PieForwardOpKind::GatedDelta: {
-            // The decode recurrent step against the layer's per-request
-            // recurrent slab — the hand-written `linear_decode` recurrence
-            // branch, kernel for kernel (batched GQA / batched / legacy
-            // single-request, each in its state dtype).
+            // The recurrent update against the layer's per-request slab —
+            // the hand-written recurrence stage, kernel for kernel. Decode:
+            // the one-token step (batched GQA / batched / legacy
+            // single-request, each in its state dtype). Prefill: the
+            // chunked family selected by the hoisted predicates (warp-tiled
+            // GQA / warp-tiled / env-gated cached / batched GQA-aware FLA),
+            // or the legacy per-request host loop for the parity entry
+            // point.
             const int state_layer = static_cast<int>(op.param0);
             void* state_slot0 =
                 state_cache.recurrent_state_raw(state_layer, /*slot=*/0);
+            if (!linear_decode) {
+                if (slot_ids_d != nullptr && qo_indptr != nullptr) {
+                    if (use_warp_tiled_recurrent && V_h != K_h) {
+                        if (state_bf16) {
+                            kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16(
+                                la.q_pre.data(), la.k_pre.data(),
+                                la.v_fp32.data(), la.g_log.data(),
+                                la.beta.data(),
+                                state_slot0, slot_ids_d, qo_indptr,
+                                slot_stride, la.core_out.data(),
+                                R, K_h, V_h, K_d, V_d,
+                                stream, write_state);
+                        } else {
+                            kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa(
+                                la.q_pre.data(), la.k_pre.data(),
+                                la.v_fp32.data(), la.g_log.data(),
+                                la.beta.data(),
+                                static_cast<float*>(state_slot0),
+                                slot_ids_d, qo_indptr,
+                                slot_stride, la.core_out.data(),
+                                R, K_h, V_h, K_d, V_d,
+                                stream, write_state);
+                        }
+                    } else if (use_warp_tiled_recurrent) {
+                        if (state_bf16) {
+                            kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16(
+                                q_recur_full, k_recur_full,
+                                la.v_fp32.data(), la.g_log.data(),
+                                la.beta.data(),
+                                state_slot0, slot_ids_d, qo_indptr,
+                                slot_stride, la.core_out.data(),
+                                R, V_h, K_d, V_d,
+                                stream, write_state);
+                        } else {
+                            kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled(
+                                q_recur_full, k_recur_full,
+                                la.v_fp32.data(), la.g_log.data(),
+                                la.beta.data(),
+                                static_cast<float*>(state_slot0),
+                                slot_ids_d, qo_indptr,
+                                slot_stride, la.core_out.data(),
+                                R, V_h, K_d, V_d,
+                                stream, write_state);
+                        }
+                    } else if (N <= qwen35_gdn_cached_prefill_max_tokens()) {
+                        // (The hand-written branch also requires
+                        // commit_len == nullptr — constant true here, the
+                        // gate excludes commit-advance fires.)
+                        if (state_bf16) {
+                            kernels::launch_chunk_gated_delta_prefill_batched_cached_state_bf16(
+                                q_recur_full, k_recur_full,
+                                la.v_fp32.data(), la.g_log.data(),
+                                la.beta.data(),
+                                state_slot0, slot_ids_d, qo_indptr,
+                                slot_stride, la.core_out.data(),
+                                R, V_h, K_d, V_d,
+                                stream, write_state);
+                        } else {
+                            kernels::launch_chunk_gated_delta_prefill_batched_cached(
+                                q_recur_full, k_recur_full,
+                                la.v_fp32.data(), la.g_log.data(),
+                                la.beta.data(),
+                                static_cast<float*>(state_slot0),
+                                slot_ids_d, qo_indptr,
+                                slot_stride, la.core_out.data(),
+                                R, V_h, K_d, V_d,
+                                stream, write_state);
+                        }
+                    } else {
+                        // GQA-aware FLA: the compact K_h-head q/k (q_pre ==
+                        // q_recur_full when V_h == K_h), repeat_interleave
+                        // skipped above (use_batched_fla_gqa).
+                        if (state_bf16) {
+                            kernels::launch_chunk_gated_delta_prefill_batched_state_bf16(
+                                la.q_pre.data(), la.k_pre.data(),
+                                la.v_fp32.data(), la.g_log.data(),
+                                la.beta.data(),
+                                state_slot0, slot_ids_d, qo_indptr,
+                                slot_stride, la.core_out.data(),
+                                R, K_h, V_h, K_d, V_d, stream, write_state,
+                                /*commit_len=*/nullptr);
+                        } else {
+                            kernels::launch_chunk_gated_delta_prefill_batched(
+                                la.q_pre.data(), la.k_pre.data(),
+                                la.v_fp32.data(), la.g_log.data(),
+                                la.beta.data(),
+                                static_cast<float*>(state_slot0),
+                                slot_ids_d, qo_indptr,
+                                slot_stride, la.core_out.data(),
+                                R, K_h, V_h, K_d, V_d, stream, write_state,
+                                /*commit_len=*/nullptr);
+                        }
+                    }
+                } else {
+                    // Legacy single-request parity path: per-request
+                    // chunked prefill against slot_for(r).
+                    const std::size_t qk_step =
+                        static_cast<std::size_t>(V_h) * K_d;
+                    const std::size_t v_step =
+                        static_cast<std::size_t>(V_dim);
+                    const std::size_t gh_step =
+                        static_cast<std::size_t>(V_h);
+                    for (int r = 0; r < R; ++r) {
+                        const int t0 = static_cast<int>(qo_indptr_h[r]);
+                        const int Nr =
+                            static_cast<int>(qo_indptr_h[r + 1]) - t0;
+                        if (Nr <= 0) continue;
+                        const std::size_t qk_off =
+                            static_cast<std::size_t>(t0) * qk_step;
+                        const std::size_t v_off =
+                            static_cast<std::size_t>(t0) * v_step;
+                        const std::size_t gh_off =
+                            static_cast<std::size_t>(t0) * gh_step;
+                        void* state_slot = state_cache.recurrent_state_raw(
+                            state_layer, slot_for(r));
+                        if (state_bf16) {
+                            kernels::launch_chunk_gated_delta_prefill_state_bf16(
+                                q_recur_full + qk_off,
+                                k_recur_full + qk_off,
+                                la.v_fp32.data() + v_off,
+                                la.g_log.data() + gh_off,
+                                la.beta.data() + gh_off,
+                                state_slot,
+                                la.core_out.data() + v_off,
+                                Nr, V_h, K_d, V_d, /*chunk_size=*/64,
+                                stream);
+                        } else {
+                            kernels::launch_chunk_gated_delta_prefill(
+                                q_recur_full + qk_off,
+                                k_recur_full + qk_off,
+                                la.v_fp32.data() + v_off,
+                                la.g_log.data() + gh_off,
+                                la.beta.data() + gh_off,
+                                static_cast<float*>(state_slot),
+                                la.core_out.data() + v_off,
+                                Nr, V_h, K_d, V_d, /*chunk_size=*/64,
+                                stream);
+                        }
+                    }
+                }
+                break;
+            }
             if (slot_ids_d != nullptr) {
                 if (use_decode_gqa_recurrent) {
                     if (state_bf16) {
@@ -682,9 +899,10 @@ void qwen3_5_forward_declared(
             auto kv_view = cache.layer_view(w.layers[model_layer].kv_layer);
             // Plan choice is a per-fire LOWERING (family.rs's
             // full_attn_body doc): the same four-way branch as the
-            // hand-written body, same inputs, same order. On a decode fire
-            // the decode plan is the live branch; the others cover the
-            // force_prefill_path parity mode.
+            // hand-written body, same inputs, same order. Decode fires
+            // dispatch the decode plan; prefill fires the prefill plan
+            // `prepare_qwen3_5_decode_plan` staged (or the naive/unplanned
+            // fallbacks on non-bf16 cache layouts / parity modes).
             const bool use_small_prefill_naive =
                 decode_plan == nullptr &&
                 prefill_plan == nullptr &&

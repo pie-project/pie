@@ -1,23 +1,31 @@
 #pragma once
 
-// The qwen3_5 declared EXECUTOR, arc 2's decode slice — the emission arms
-// that walk the arc-1 traced + validated hybrid plan
-// (`declared_facts.hpp::Qwen35DeclaredPlan`) and launch EXACTLY the kernels
-// `qwen3_5_forward_paged` launches on the TP=1 PURE-DECODE path, on the
-// same workspace buffers, in the same order — the same bit-identity
-// argument as `llama_like/declared_forward.hpp`.
+// The qwen3_5 declared EXECUTOR — the emission arms that walk the arc-1
+// traced + validated hybrid plan (`declared_facts.hpp::Qwen35DeclaredPlan`)
+// and launch EXACTLY the kernels `qwen3_5_forward_paged` launches on the
+// TP=1 path, on the same workspace buffers, in the same order — the same
+// bit-identity argument as `llama_like/declared_forward.hpp`. Arc 2 covered
+// pure-decode fires; arc 3 added the PREFILL lowerings — the trace itself
+// is decode/prefill-agnostic (forward/src/trace.rs: CausalConv1d /
+// GatedDelta / Attention are opaque ops whose lowering the emitter picks
+// per fire), so the same 16 arms now branch per fire exactly as the
+// hand-written bodies branch: conv decode-update vs prefill walk, the
+// recurrence step vs the chunked prefill family (warp-tiled / cached /
+// batched GQA-aware FLA, selected by the shared env knobs in
+// qwen3_5_forward.hpp), decode vs prefill attention plans from plan_state.
+// A MIXED fire (prefill + decode rows co-batched) is not separate
+// machinery: the hand-written body runs every `is_pure_decode == false`
+// fire as one qo_indptr-windowed prefill shape, and the walk mirrors that.
 //
 // Scope (the honest slice; the caller's gate in qwen3_5_model.cpp encodes
-// it): dense hybrid (0.8b shape), pure-decode fires only, no stage hooks,
-// no lora, no spec-decode services (frozen verify, commit-advance,
-// rs-buffer write/fold all fall back per fire), no state-only fires
-// (num_logit_rows < 0). Prefill fires fall back to the hand-written body —
-// the prefill lowerings of the conv/recurrence ops are a later arc. MTP
-// draft fires never reach `body()` at all (they are the drafter service's
-// own entry points, `qwen3_5_mtp_forward` / `qwen3_5_mtp_process_cache`),
-// so the base pass this executor serves is the same base pass the MTP
-// verify wraps — but verify itself arrives as frozen-verify /
-// commit-advance fires, which the gate excludes.
+// it): dense hybrid (0.8b shape), no stage hooks, no lora, no custom
+// masks, no spec-decode services (frozen verify, commit-advance, rs-buffer
+// write/fold all fall back per fire), no state-only fires
+// (num_logit_rows < 0). MTP draft fires never reach `body()` at all (they
+// are the drafter service's own entry points, `qwen3_5_mtp_forward` /
+// `qwen3_5_mtp_process_cache`), so the base pass this executor serves is
+// the same base pass the MTP verify wraps — but verify itself arrives as
+// frozen-verify / commit-advance fires, which the gate excludes.
 //
 // Peepholes: NONE. The hand-written qwen3_5 decode path launches one
 // kernel per trace op (family.rs's table is launch-for-launch); the only
@@ -46,7 +54,7 @@ bool qwen35_declared_exec_trace_enabled();
 // Execute one eligible fire by walking `declared.plan`. The caller
 // (Qwen35Model::body) has already applied the eligibility gate; this
 // function additionally throws (never silently diverges) when the plan
-// carries an op or payload outside the decode slice's vocabulary — a trace
+// carries an op or payload outside the executor's vocabulary — a trace
 // whose shape drifted must fail loudly, exactly the llama_like executor's
 // contract.
 void qwen3_5_forward_declared(
