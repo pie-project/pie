@@ -1148,11 +1148,8 @@ pub fn channel_capacity() -> usize {
 /// Live slots per frame for the bound model: how many of the k slots a lane
 /// can actually fill with work.
 ///
-/// Always k. A recurrent-state (linear) model used to get 1 whatever k was,
-/// because its mapping published at FINALIZE: slot i+1's prepare read a stale
-/// mapping unless slot i had already settled, which a frame can never reach.
-/// RS now publishes at prepare, in slot order, so a linear lane fills a frame
-/// exactly like a dense one.
+/// k for a dense model, 1 for a recurrent (linear/hybrid) one. That 1 is now
+/// CONSERVATISM, not a constraint — see the body.
 ///
 /// Kept as its own query rather than folded into [`frame_size`]: it answers
 /// "how much can this lane submit per frame", which is a model property that
@@ -1163,21 +1160,20 @@ pub fn channel_capacity() -> usize {
 pub fn live_slots() -> usize {
     // k for a dense model, 1 for a recurrent (linear/hybrid) one.
     //
-    // The RS store no longer forces this — its mapping publishes at prepare,
-    // in slot order, so slot i+1 classifies against slot i's decision without
-    // waiting for it to settle. The DRIVER does. A decode fire escapes
-    // host-side descriptor resolution by taking the device-composed template,
-    // and that template refuses any fire carrying RS rows, so an RS fire
-    // resolves its ports on the HOST AT FRAME ENTRY — before any slot of the
-    // frame has run. A run-ahead lane chains slot i+1's token off slot i, so
-    // filling a frame with recurrent decodes asks the driver for a value that
-    // does not exist yet. The engine refuses that frame by name
-    // (`validate_frame` in `runtime/engine/src/pipeline/fire.rs`); this is
-    // what keeps a well-behaved lane from building it at all.
+    // The reason this was ever 1 is GONE. A run-ahead lane chains slot i+1's
+    // token off slot i; an RS fire used to resolve its descriptor ports on the
+    // HOST at frame entry, before any slot had run, because the device-composed
+    // template refused every fire carrying RS rows. `299b76320` lifted that:
+    // an unbuffered fold-all recurrent decode — the ordinary shape — takes the
+    // template and resolves at KERNEL time, so the chained value is there. The
+    // engine's refusal was narrowed to match (`validate_frame` in
+    // `runtime/engine/src/pipeline/fire.rs`), and `cuda_rs_buffer_bench`'s
+    // `coframe` arm proves the shape runs on device with an identical
+    // trajectory — and 31.7% faster than the 1-wide arm.
     //
-    // The cost is small and measured: intra-frame run-ahead is worth about 1%
-    // of decode latency, because the run-ahead that matters is ACROSS frames
-    // and a linear lane still has all of it.
+    // It stays 1 only because raising it is a scheduling change that has to be
+    // benchmarked as one, not smuggled in with a correctness fix. A lane that
+    // wants the intra-frame run-ahead can already take it with `submit_frame`.
     thread_local! {
         static LIVE: std::cell::OnceCell<usize> = const { std::cell::OnceCell::new() };
     }

@@ -1622,6 +1622,43 @@ fn validate_frame<C: FireContext>(
     // exact slot pair that is unsupported.
     let mut first_rs_slot: Option<usize> = None;
     let mut published_before: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    // Per slot: does this fire bind recurrent state the driver must resolve on
+    // the HOST? Only those slots are subject to the chaining rule below. See
+    // the comment there for why the answer is not simply "it binds RS".
+    let mut rs_host_resolved: Vec<bool> = Vec::with_capacity(fired.len());
+    for &(_, rep) in fired.iter() {
+        let fwd: Resource<ForwardPass> = Resource::new_borrow(rep);
+        let (rs_reps, fold_len_is_device) = {
+            let pass = ctx.resources().get(&fwd)?;
+            let bound = match pass.bound() {
+                Ok(bound) => bound,
+                Err(error) => return Ok(Err(format!("pipeline: {error}"))),
+            };
+            (bound.rs_ws.clone(), bound.rs_fold_len.is_none())
+        };
+        if rs_reps.is_empty() {
+            rs_host_resolved.push(false);
+            continue;
+        }
+        if fold_len_is_device {
+            rs_host_resolved.push(true);
+            continue;
+        }
+        let mut buffered = false;
+        for &rs_rep in &rs_reps {
+            let resource: Resource<RsWorkingSet> = Resource::new_borrow(rs_rep);
+            let rs = ctx.resources().get(&resource)?.clone();
+            let stores = crate::store::registry::get(rs.model, rs.driver);
+            let store = stores.rs.lock().unwrap();
+            // A bound, not the exact count: an indeterminate occupancy must
+            // read as "may be buffered", and `bound()` never refuses.
+            if store.buffer_tokens_bound(rs.id).unwrap_or(0) > 0 {
+                buffered = true;
+                break;
+            }
+        }
+        rs_host_resolved.push(buffered);
+    }
     for (slot, &(_, rep)) in fired.iter().enumerate() {
         let fwd: Resource<ForwardPass> = Resource::new_borrow(rep);
         let pass = ctx.resources().get(&fwd)?;
@@ -1631,24 +1668,35 @@ fn validate_frame<C: FireContext>(
         };
         let accesses = &bound.instance.program.channel_accesses;
 
-        // ── The one frame shape the CUDA driver cannot execute.
+        // ── The frame shapes the CUDA driver cannot execute.
         //
         // FramePrepare runs EVERY step's host work at frame entry, before any
         // of the frame reaches the stream. A step whose descriptor ports are
         // device-carried normally escapes that by taking the device-composed
-        // template, which resolves ports at kernel time — but that template
-        // refuses any fire carrying RS rows (`try_device_composed_template`
-        // in `driver/cuda/src/pipeline/dispatch.cu` bails on a non-empty
-        // `rs_slot_ids`). So an RS fire falls back to the host readback path
-        // and demands, at frame entry, a cell that an EARLIER SLOT of the same
-        // frame has not produced yet.
+        // template, which resolves ports at kernel time. So a fire that the
+        // template REFUSES falls back to the host readback path and demands,
+        // at frame entry, a cell that an EARLIER SLOT of the same frame has
+        // not produced yet.
+        //
+        // This rule once covered any fire carrying RS rows, because the
+        // template refused all of them. It no longer does: `299b76320` let an
+        // unbuffered fold-all recurrent decode take the template, which is the
+        // ordinary hybrid decode shape. `try_device_composed_template` in
+        // `driver/cuda/src/pipeline/dispatch.cu` now refuses exactly two RS
+        // shapes, and `rs_host_resolved` above mirrors them:
+        //
+        //   * buffered rows — ragged and sized to the real request count, so a
+        //     padded template lane indexes past the end;
+        //   * a device-resident fold length — substituted during descriptor
+        //     resolution against a host bound, and the template resolves
+        //     nothing.
         //
         // Left unchecked this surfaced as a cascade — `descriptor channel 0
         // not ready` from the driver, then a poisoned channel in the guest —
         // that named neither the slot nor the cause. Refuse it here, where
         // both are known. See `live_slots()` in the SDK, which keeps a linear
         // lane from building this frame in the first place.
-        if !bound.rs_ws.is_empty() && first_rs_slot.is_none() {
+        if rs_host_resolved[slot] && first_rs_slot.is_none() {
             first_rs_slot = Some(slot);
         }
         if first_rs_slot.is_some() {
@@ -1660,11 +1708,11 @@ fn validate_frame<C: FireContext>(
                 if published_before.contains(&key) {
                     return Ok(Err(format!(
                         "pipeline: frame slot {slot} consumes channel {channel}, which an \
-earlier slot of the same frame publishes, and this frame binds recurrent state \
-(slot {}) — the driver resolves an RS fire's descriptors at frame entry, before \
-any slot has run, so it cannot see that value. Submit the chained fire in a \
-LATER frame (a linear lane should size its run-ahead with `live_slots()`, which \
-is 1 for a recurrent model).",
+earlier slot of the same frame publishes, and slot {} binds recurrent state the \
+driver must resolve on the host (a buffered row, or a device-resident fold \
+length) — those descriptors are resolved at frame entry, before any slot has \
+run, so they cannot see that value. Submit the chained fire in a LATER frame \
+(a linear lane should size its run-ahead with `live_slots()`).",
                         first_rs_slot.expect("set just above")
                     )));
                 }

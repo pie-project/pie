@@ -2839,3 +2839,56 @@ and synthesizes the fold-everything geometry, so the plain inferlets are
 untouched; `recurrent_with(..)` / `attention_with(..)` state the boundary
 explicitly. `gdn-foldcommit` is the only rewrite: `fold_len = 0` to speculate,
 `fold_len = accepted` to commit.
+
+### 8.4 Regressions this branch carried, found by running the whole suite
+
+`cargo test --workspace` cannot LINK on this branch or on dev:
+`sdk/python-server/Cargo.toml` enables `driver-cuda` unconditionally, and
+workspace feature unification then turns it on for pie-engine's own test
+binaries, which have no CUDA driver library to link against. Use
+`--exclude pie-server-py`. That exclusion is why six failures went unseen.
+
+All six are fixed. Four were one root cause.
+
+**The generated ABI layout contract went stale.** This branch added the RS
+buffer descriptor port family to `PieStepDesc`, growing it 792 -> 888 bytes
+(6 slices x 16), and `interface/driver/tests/support/layout_contract.inc` was
+never regenerated. Regenerate with
+`PIE_REGEN=1 cargo test -p pie-driver-abi --test header_layout`.
+
+**The RS frame-chaining guard outlived its premise.** `cdeef1178` refused any
+frame in which a slot consumes a channel an earlier slot publishes while the
+frame binds recurrent state, because `try_device_composed_template` bailed on
+a non-empty `rs_slot_ids`, so an RS fire resolved its ports on the host at
+frame entry. `299b76320` then let an unbuffered fold-all recurrent fire take
+that template -- and nothing narrowed the guard. It went on refusing a shape
+the driver had learned to execute, which is how `rs_frame.rs`'s two full-width
+tests and `boot_smoke` went red.
+
+The guard now mirrors the template's OWN two remaining refusals: a buffered
+row (ragged, so a padded lane indexes past the end) and a device-resident fold
+length (substituted during resolution, and the template resolves nothing).
+
+Verified on device, not by reading: `cuda_rs_buffer_bench`'s `coframe` arm
+co-frames a prefill with a decode that chains off it. It now RUNS, emits a
+token stream identical to the 1-wide arm, and is 31.7% faster per fire
+(2955.84 us vs 4396.65). Its assertion was inverted -- it asserted the refusal
+-- and now asserts the trajectory match instead, which is the stronger claim.
+
+`live_slots()` still returns 1 for a recurrent model, but its reason is gone.
+Raising it is a scheduling change that has to be benchmarked as one; the
+comment now says so instead of citing the dead constraint.
+
+**One inferlet was mis-ported by the interface split.** `34d38027f` moved
+`direct-channel-e2e` to `ptir::hybrid::prelude`, but it runs on a pure-attention
+model and binds no recurrent state -- its sibling `direct-mixed-e2e` went to
+`attention::prelude` correctly. The split refused it exactly as designed
+("this model's forward pass is `attention`..."); the port was wrong, not the
+refusal. Its trailing `pass.recurrent(&[])` went with it: an in-place pure-RS
+rebind cannot exist on the attention interface, which is the point of the
+split.
+
+KNOWN FLAKE, NOT OURS: `pie-worker`'s
+`executor::tests::cancelled_encodes_hold_admission_until_actor_retirement`
+fails roughly one run in five, on `origin/dev` too. No commit on this branch
+touches `worker/src/executor/mod.rs`.

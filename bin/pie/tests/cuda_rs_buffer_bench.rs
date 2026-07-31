@@ -126,28 +126,33 @@ async fn buffering_a_token_costs_what_it_costs() -> Result<()> {
     let results = run_arms(&["64:fold", "256:fold", "64:coframe"]).await?;
     let fold = results[1].as_ref().expect("the fold arm must run");
 
-    // Regression guard for the frame shape that used to die on the device as
-    // `descriptor channel 0 not ready` and poison the guest's channel. It is
-    // still unsupported — an RS fire resolves its descriptors at frame entry —
-    // but it is now refused at submit, by name, with the slot pair in the
-    // message and no device work attempted.
-    let refusal = results[2]
+    // The frame shape that used to die on the device as `descriptor channel 0
+    // not ready` and poison the guest's channel: slot 1 chains off a value
+    // slot 0 publishes, and both bind recurrent state.
+    //
+    // It is SUPPORTED now, and this arm is what proves it. `299b76320` let an
+    // unbuffered fold-all recurrent fire take the device-composed template,
+    // which resolves descriptor ports at KERNEL time rather than at frame
+    // entry — so the chained value is there by the time the consumer reads it.
+    // The engine-side refusal (`validate_frame` in `runtime/engine/src/
+    // pipeline/fire.rs`) was narrowed to the two shapes the template still
+    // refuses: a buffered row, and a device-resident fold length.
+    //
+    // Correctness first: an intra-frame chain must not change what the model
+    // emits. Same prompt, same steps, so the token streams must be identical.
+    let coframe = results[2]
         .as_ref()
-        .expect_err("a recurrent frame that chains slot 1 off slot 0 must be refused")
-        .clone();
-    for needle in [
-        "frame slot 1 consumes channel 0",
-        "binds recurrent state",
-        "live_slots()",
-    ] {
-        assert!(
-            refusal.contains(needle),
-            "the refusal must name the cause; missing {needle:?} in:\n{refusal}"
-        );
-    }
-    assert!(
-        !refusal.contains("not ready") && !refusal.contains("poisoned"),
-        "the refusal must replace the device cascade, not ride on it:\n{refusal}"
+        .expect("a recurrent frame that chains slot 1 off slot 0 must run");
+    let head_of = |s: &str| {
+        s.split_once("head=")
+            .map(|(_, h)| h.to_string())
+            .unwrap_or_else(|| panic!("no head= in arm output:\n{s}"))
+    };
+    assert_eq!(
+        head_of(coframe),
+        head_of(fold),
+        "co-framing the prefill and the first decode must not change the \
+         trajectory — it moves WHEN descriptors resolve, not what they are"
     );
 
     eprintln!(
