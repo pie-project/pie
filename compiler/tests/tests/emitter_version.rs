@@ -55,7 +55,7 @@ use pie_codegen::program::{Backend, emit_program};
 /// `the_pinned_versions_are_the_compiled_ones` until someone comes here and
 /// says so in the same commit.
 const PINNED: &[(&str, u16, u64)] = &[
-    ("cuda", 19, 0xe378_da9c_00f6_fda5),
+    ("cuda", 20, 0x1938_6b80_52fb_9e7f),
     ("metal", 35, 0x16e9_a27d_8fc5_3b4b),
 ];
 
