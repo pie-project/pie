@@ -10,17 +10,19 @@ are historical record, not results.
 
 | table | what it reports | produced by | date |
 |---|---|---|---|
-| 1 | allowed-set width over real steps | `results/rigorous-summary.json` | 2026-07-29 |
-| 2 | claims and their falsifiers | design, not measurement | — |
-| 3 | full step vs XGrammar and vs our Triton reference | `engrain_lab.rigor.latency` | 2026-07-30 |
-| 4 | heterogeneous batches, and the cost of mixing | `files/probe_mixed_cost.py` | 2026-07-31 |
-| 5 | speculative decoding vs `traverse_draft_tree` | `files/probe_speculative.py` | 2026-07-31 |
-| 6 | cost added to an overlapped decode step | `engrain_lab.rigor.overlap` | 2026-07-31 |
-| 7 | fill under CPU contention, p50 and p99 | `engrain_lab.rigor.serving` | 2026-07-31 |
-| 8 | ablation of the memo and of graph capture | `files/exp_ablation.py` | 2026-07-31 |
-| 9 | fused sampling across regimes | session measurements | 2026-07-30 |
-| 10 | walk completion and over-acceptance, before/after | `files/exp_soundness_split.py` | 2026-07-31 |
-| 11 | compile time, table memory, coverage | `engrain_lab.rigor.cost` | 2026-07-30 |
+| 1 | full step vs XGrammar and llguidance | `files/exp_baselines_latency.py` | 2026-07-31 |
+| 2 | coverage and compile time, three engines | `files/exp_baselines_coverage.py` | 2026-07-31 |
+| 3 | heterogeneous batches, and the cost of mixing | `files/probe_mixed_cost.py` | 2026-07-31 |
+| 4 | ablation of the memo and of graph capture | `files/exp_ablation.py` | 2026-07-31 |
+| 5 | walk completion and over-acceptance, before/after | `files/exp_soundness_split.py` | 2026-07-31 |
+| 6 | resident table memory | `engrain_lab.rigor.cost` | 2026-07-30 |
+
+Reported in prose rather than a table, for space: allowed-set width
+(`results/rigorous-summary.json`), speculative decoding
+(`files/probe_speculative.py`), overlap-adjusted cost
+(`engrain_lab.rigor.overlap`), fill under CPU contention
+(`engrain_lab.rigor.serving`), fused sampling across regimes (session
+measurements, 2026-07-30).
 
 Supporting runs not given their own table:
 
@@ -32,6 +34,29 @@ Supporting runs not given their own table:
   precision level as the cause of over-acceptance.
 - `python -m engrain_lab.verify` — the four differential verifications,
   7,198 rows, zero failures.
+
+## Baselines
+
+Three engines, each given its strongest interface: XGrammar with
+`BatchGrammarMatcher`, the thread count swept over 1/2/4/8/16 and
+**`any_order=True`**; llguidance with `LLExecutor` and its `_par` fill and
+consume; outlines_core in a Python loop, because it has no batch interface.
+
+`any_order=True` is a fairness correction we had to make. XGrammar's default
+fixes object property order at the schema's declaration, so it rejects
+`{"b":2,"a":1}` where engrain accepts it. Since engrain is order-free by
+construction, benchmarking against the default was benchmarking a strictly
+weaker configuration. The flag also compiles *faster* - 0.81 s against 4.89 s
+over 60 schemas - so it is XGrammar's better setting on both axes. Its per-step
+cost is within noise of the default, so the correction did not change any
+conclusion; it was made anyway.
+
+outlines_core cannot be configured out of the same restriction: its lowering
+emits a literal regex with the properties in declared order, so order is a
+property of the language it accepts. It could not be seeded into a live state on
+any of the three model-generated documents the other three engines accept, and
+building its vocabulary-indexed DFA cost 33.8 s over 20 schemas against
+engrain's 1.6 s, XGrammar's 0.5 s and llguidance's 0.0 s.
 
 ## Two measurements that were wrong before they were right
 
