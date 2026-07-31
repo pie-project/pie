@@ -21,8 +21,8 @@
 
 use std::path::PathBuf;
 
-use pie_forward::family::llama_like;
-use pie_forward::LlamaLikeFacts;
+use pie_forward::family::{llama_like, qwen3_5_moe_mlp_block};
+use pie_forward::{ForwardPlan, LlamaLikeFacts, Qwen35MoeMlpFacts};
 
 fn golden_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -31,8 +31,11 @@ fn golden_path(name: &str) -> PathBuf {
 }
 
 fn check(name: &str, facts: &LlamaLikeFacts) {
-    let plan = llama_like(facts);
-    let fresh = serde_json::to_string_pretty(&plan).expect("serialize plan");
+    check_plan(name, &llama_like(facts));
+}
+
+fn check_plan(name: &str, plan: &ForwardPlan) {
+    let fresh = serde_json::to_string_pretty(plan).expect("serialize plan");
     let path = golden_path(name);
     if std::env::var_os("UPDATE_GOLDEN").is_some() {
         std::fs::create_dir_all(path.parent().unwrap()).expect("mkdir golden");
@@ -108,5 +111,21 @@ fn qwen3_0_6b_unfused_qkv() {
             fused_qkv: false,
             ..LlamaLikeFacts::qwen3_0_6b()
         },
+    );
+}
+
+/// The first `dyn` traced form, and the first FRAGMENT golden: one
+/// qwen3_5_moe MoE MLP block (Qwen3.5-35B-A3B dims), router → topk →
+/// grouped gate_up → swiglu → grouped down → weighted sum, plus the
+/// shared-expert path behind its sigmoid scalar gate. Everything the dyn
+/// vocabulary added — `selector` fields, `dyn_axis` markers, rank-3
+/// route-expanded shapes, the `{e}` weight templates — appears here and,
+/// per the serde-additive rule, NOWHERE in the dense goldens above, which
+/// this change leaves byte-untouched.
+#[test]
+fn qwen3_5_moe_mlp_35b_a3b() {
+    check_plan(
+        "qwen3_5_moe_mlp_35b_a3b",
+        &qwen3_5_moe_mlp_block(&Qwen35MoeMlpFacts::qwen3_5_35b_a3b()),
     );
 }

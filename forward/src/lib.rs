@@ -26,12 +26,16 @@
 //!   point.
 //! * **Syntax is required exactly where cost is incurred.** A declaration
 //!   with no structural divergence is an ordinary forward pass; the first
-//!   family here (`llama_like`) has none, so nothing in it is `dyn`.
+//!   family here (`llama_like`) has none, so nothing in it is `dyn`. The
+//!   qwen3_5_moe MLP fragment (`family::qwen3_5_moe_mlp_block`) carries the
+//!   first `dyn`: the per-token expert axis, whose lowering (grouped GEMM)
+//!   is data-dependent and therefore the one thing the trace cannot fix —
+//!   see the `trace` module doc's "`dyn`: the first per-token axis".
 
 pub mod facts;
 pub mod family;
 pub mod ffi;
 pub mod trace;
 
-pub use facts::LlamaLikeFacts;
-pub use trace::{Dim, DType, ForwardPlan, Op, OpKind, Shape, TraceBuilder, ValueId};
+pub use facts::{LlamaLikeFacts, Qwen35MoeMlpFacts};
+pub use trace::{Dim, DType, DynAxis, ForwardPlan, Op, OpKind, Shape, TraceBuilder, ValueId};

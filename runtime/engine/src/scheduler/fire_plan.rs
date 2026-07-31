@@ -59,6 +59,34 @@ impl DivClass {
     }
 }
 
+/// The extent a site's divergence varies over.
+///
+/// Port of the granularity axis `tart/ir.py` carries on WEIGHT-class nodes:
+/// `matmul(x, W[i])` with `i` per-REQUEST is SGMV (adapters — Stage 4's
+/// lora), with `i` per-TOKEN it is MoE grouped GEMM — the same expression,
+/// two hand-written kernels, the syntactic identity plan.md Part 1 is built
+/// on. Request-granularity sites work in member/row spans after the
+/// planner's seriation; token-granularity sites cannot be seriated by
+/// member order at all — their variation lives inside each member's rows,
+/// so the lowering is always data-driven (gather → grouped GEMM →
+/// scatter), never a prefix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Granularity {
+    /// Varies per fire member (request/lane): adapters, hooks, depth.
+    Request,
+    /// Varies per token row within every member: the MoE expert axis.
+    Token,
+}
+
+impl Granularity {
+    fn as_str(self) -> &'static str {
+        match self {
+            Granularity::Request => "per-request",
+            Granularity::Token => "per-token",
+        }
+    }
+}
+
 /// The lowering chosen for one site, named by its compiler analogue
 /// (plan.md Part 2's table).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,9 +102,12 @@ pub(crate) enum Lowering {
     /// later increment hands the plan's answer across instead.
     Prefix { fast_rows: u32 },
     /// Per-lane weights/corrections applied by span — dictionary passing.
-    /// Today this is Stage 4's per-adapter lora loop in the driver; the
-    /// batched-GEMM upgrade (one kernel over a lane-indexed table) is a
-    /// later candidate on the same site.
+    /// This is Stage 4's per-adapter lora correction in the driver. The
+    /// driver additionally groups SAME-SHAPE lanes into one grouped-GEMM
+    /// launch (llama_like's `LoraFireState`); that stays under this
+    /// classification, not a new lowering here, because whether shapes
+    /// share a kernel is device knowledge (§4.4) — the same reason
+    /// `Prefix::fast_rows` is re-derived driver-side.
     PerLane,
     /// Genuinely different operators behind a guard. Reserved for Stage 6's
     /// conditional regions (coalesced, ~250us floor per region —
@@ -103,6 +134,10 @@ pub(crate) struct Site {
     pub(crate) name: &'static str,
     #[allow(dead_code)] // read by report()/tests; the runtime consumer is a later increment.
     pub(crate) class: DivClass,
+    /// The extent the divergence varies over; [`Granularity::Request`] for
+    /// every site the member sort can seriate.
+    #[allow(dead_code)] // read by report()/tests, like `class`.
+    pub(crate) granularity: Granularity,
     pub(crate) lowering: Lowering,
     /// Why this lowering — for `report()`, mirroring `tart/plan.py`.
     pub(crate) note: String,
@@ -118,10 +153,53 @@ pub(crate) const SITE_QKV_POSTPROCESS: &str = "qkv_postprocess";
 
 /// The projection-weights site: a program carrying the pass-wide `lora`
 /// sink wants x(W+BA)^T where its neighbors want xW^T. Weight-class — same
-/// operator, per-member weights. Mirrors Stage 4's hard-coded lowering: the
-/// driver's per-adapter span loop in `llama_like` (applied per lane; the
-/// single batched GEMM over a lane table is the upgrade candidate).
+/// operator, per-member weights. The driver applies corrections by span
+/// (`llama_like`'s `LoraFireState`), sharing one grouped-GEMM launch across
+/// lanes whose shapes already agree — a device-side detail this
+/// classification deliberately does not model (the §4.4 split; see the
+/// grouping comment at that site).
 pub(crate) const SITE_PROJECTION_WEIGHTS: &str = "projection_weights";
+
+/// The expert-weights site: per-TOKEN weight divergence — an MoE trace's
+/// expert-indexed matmuls (`pie_forward`'s `Matmul { selector }`, the
+/// `layer.{l}.expert.{e}.*` templates whose `{e}` a `TopK` value resolves
+/// per token). Weight-class like [`SITE_PROJECTION_WEIGHTS`], at the other
+/// granularity: same operator, per-token weights, no branch.
+///
+/// NOT emitted by [`plan_fire`], and deliberately so: [`MemberFacts`] has
+/// no moe bit and fires do not carry one, because this site is a fact about
+/// the TRACED FORM, not about the members — every member of a fire against
+/// an MoE model diverges here, expert assignment being data. It will be
+/// populated from a plan-derived site table (the Stage 5 "sites come from
+/// the traced form" step: walk the `ForwardPlan`, one Site per
+/// selector-carrying op group), which is why v0 adds the vocabulary and a
+/// constructor rather than a fake member-facts derivation.
+pub(crate) const SITE_EXPERT_WEIGHTS: &str = "expert_weights";
+
+/// The [`SITE_EXPERT_WEIGHTS`] vocabulary entry, as the plan-derived site
+/// table will emit it.
+///
+/// The `PerLane` candidate here means "per selected weight, by span" —
+/// dictionary passing, same as lora — and is deliberately NOT the final
+/// word: the real lowering (grouped GEMM over gathered tokens) already
+/// exists device-side, several families' worth (`qwen3_5_moe`'s
+/// batched/aligned/CUTLASS pipelines, and the deepseek_v4 / kimi / gemma4 /
+/// glm5 / mixtral / nemotron_h MoE paths), and per §4.4 choosing among
+/// those strategies is the runtime/driver's device-knowledge call, exactly
+/// as with the lora span-vs-grouped grouping above.
+#[allow(dead_code)] // vocabulary for the Stage 5 site table; tests pin its shape.
+pub(crate) fn expert_weights_site(experts: u32, top_k: u32) -> Site {
+    Site {
+        name: SITE_EXPERT_WEIGHTS,
+        class: DivClass::Weight,
+        granularity: Granularity::Token,
+        lowering: Lowering::PerLane,
+        note: format!(
+            "top-{top_k} of {experts} experts selected per token; \
+             grouped GEMM over gathered tokens is the device-side lowering"
+        ),
+    }
+}
 
 /// The facts about one step member that planning reads — nothing else.
 /// Device geometry is a wire-format fact, the other two are program facts
@@ -161,9 +239,10 @@ impl FirePlan {
         let mut out = vec![format!("{} members", self.member_order.len())];
         for site in &self.sites {
             out.push(format!(
-                "  {:<20} {:<11} -> {}{}",
+                "  {:<20} {:<11} {:<11} -> {}{}",
                 site.name,
                 site.class.as_str(),
+                site.granularity.as_str(),
                 site.lowering.describe(),
                 if site.note.is_empty() {
                     String::new()
@@ -201,6 +280,7 @@ pub(crate) fn plan_fire(members: &[MemberFacts]) -> FirePlan {
         Site {
             name: SITE_QKV_POSTPROCESS,
             class: DivClass::Structural,
+            granularity: Granularity::Request,
             lowering: Lowering::Uniform,
             note: "no hook lanes; the fused QKV path covers the step".to_string(),
         }
@@ -215,6 +295,7 @@ pub(crate) fn plan_fire(members: &[MemberFacts]) -> FirePlan {
         Site {
             name: SITE_QKV_POSTPROCESS,
             class: DivClass::Structural,
+            granularity: Granularity::Request,
             lowering: Lowering::Prefix { fast_rows },
             note: format!("{hook_members} hook lane(s) peeled off the fused QKV path"),
         }
@@ -225,6 +306,7 @@ pub(crate) fn plan_fire(members: &[MemberFacts]) -> FirePlan {
         Site {
             name: SITE_PROJECTION_WEIGHTS,
             class: DivClass::Weight,
+            granularity: Granularity::Request,
             lowering: Lowering::Uniform,
             note: "no adapters; base weights only".to_string(),
         }
@@ -232,6 +314,7 @@ pub(crate) fn plan_fire(members: &[MemberFacts]) -> FirePlan {
         Site {
             name: SITE_PROJECTION_WEIGHTS,
             class: DivClass::Weight,
+            granularity: Granularity::Request,
             lowering: Lowering::PerLane,
             note: format!("{lora_members} lora lane(s); corrections applied by span"),
         }
@@ -386,5 +469,43 @@ mod tests {
         assert!(report.contains(SITE_PROJECTION_WEIGHTS));
         assert!(report.contains("prefix(fast_rows=1)"));
         assert!(report.contains("per-lane"));
+        assert!(report.contains("per-request"));
+    }
+
+    /// Every site `plan_fire` emits is request-granularity: its divergence
+    /// is a member fact, which is exactly why the member sort can seriate
+    /// it. Token granularity never comes from member facts (that would be
+    /// the fake derivation the expert site's doc rules out).
+    #[test]
+    fn planned_sites_are_request_granularity() {
+        let members = vec![member(true, true, false, 0), member(false, false, false, 1)];
+        let plan = plan_fire(&members);
+        assert_eq!(plan.sites.len(), 2);
+        for site in &plan.sites {
+            assert_eq!(site.granularity, Granularity::Request, "{}", site.name);
+        }
+    }
+
+    /// The expert-weights vocabulary entry: Weight-class at TOKEN
+    /// granularity — `matmul(x, W[i])` with `i` per-token, the grouped-GEMM
+    /// half of the SGMV/MoE identity — with the per-lane dictionary-passing
+    /// candidate and a note pointing at the device-side lowering. Pinned
+    /// here so the Stage 5 site table lands against a reviewed shape.
+    #[test]
+    fn expert_weights_site_vocabulary() {
+        let site = expert_weights_site(256, 8);
+        assert_eq!(site.name, SITE_EXPERT_WEIGHTS);
+        assert_eq!(site.class, DivClass::Weight);
+        assert_eq!(site.granularity, Granularity::Token);
+        assert_eq!(site.lowering, Lowering::PerLane);
+        assert!(site.note.contains("top-8 of 256 experts"));
+        assert!(site.note.contains("grouped GEMM"));
+
+        // And it renders alongside the planned sites' vocabulary.
+        let mut plan = plan_fire(&[member(false, false, false, 0)]);
+        plan.sites.push(site);
+        let report = plan.report();
+        assert!(report.contains(SITE_EXPERT_WEIGHTS));
+        assert!(report.contains("per-token"));
     }
 }

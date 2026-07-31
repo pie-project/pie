@@ -64,7 +64,7 @@ class ForwardPlan {
         pie_forward_release(&plan_);
     }
 
-    /// Trace the llama_like family. The only way in, mirroring
+    /// Trace the llama_like family. Mirroring
     /// `pie_loader::LoadPlan::compile`: the facts are the whole request, and
     /// none of them is a model's name.
     static ForwardPlan trace_llama_like(const PieForwardLlamaLikeFacts& facts) {
@@ -73,6 +73,29 @@ class ForwardPlan {
         if (status != PieForwardStatus::Ok) {
             throw std::runtime_error(
                 "forward plan: trace failed (" + status_name(status) + ")");
+        }
+        return ForwardPlan(raw);
+    }
+
+    /// Trace the qwen3_5_moe MoE MLP-block FRAGMENT — the first traced form
+    /// carrying `dyn` ops (`TopK`, selector-carrying `Matmul`s,
+    /// `WeightedSum`, `SigmoidGateAdd`).
+    ///
+    /// This wrapper exposes the plan; the declared EXECUTORS do not consume
+    /// it. Feeding a dyn trace to either emitter throws rather than
+    /// half-emitting: their op-kind switches end in a loud default arm
+    /// ("op kind N has no emission rule" — the CUDA executor's
+    /// `declared_forward.cpp`, the Metal DAG builder's `declared_dag.hpp`,
+    /// which also refuses the MoE weight names before ever reaching a dyn
+    /// kind; `driver/metal/tests/llama_like_declared_dag_test.cpp` pins the
+    /// refusal). Emitting the grouped-GEMM lowering is a later, much larger
+    /// lift.
+    static ForwardPlan trace_qwen3_5_moe_mlp(const PieForwardQwen35MoeMlpFacts& facts) {
+        PieForwardPlan raw{};
+        const PieForwardStatus status = pie_forward_trace_qwen3_5_moe_mlp(&facts, &raw);
+        if (status != PieForwardStatus::Ok) {
+            throw std::runtime_error(
+                "forward plan: moe mlp trace failed (" + status_name(status) + ")");
         }
         return ForwardPlan(raw);
     }

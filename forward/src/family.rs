@@ -6,8 +6,8 @@
 //! matmuls and no split, and the traced forms differ the way two compiled
 //! programs differ, not the way two runtime paths do.
 
-use crate::facts::{LlamaLikeFacts, NormPlacement, QkNorm};
-use crate::trace::{ForwardPlan, TraceBuilder};
+use crate::facts::{LlamaLikeFacts, NormPlacement, QkNorm, Qwen35MoeMlpFacts};
+use crate::trace::{DType, Dim, ForwardPlan, Shape, TraceBuilder};
 
 /// The llama_like decode/prefill body (no structural divergence, so one
 /// trace serves both; the emitter picks decode vs prefill attention plans
@@ -108,10 +108,91 @@ pub fn llama_like(facts: &LlamaLikeFacts) -> ForwardPlan {
     t.finish()
 }
 
+/// One qwen3_5_moe MoE MLP block, traced standalone — the first `dyn`
+/// fragment.
+///
+/// This is a FRAGMENT, not a model: the unit the future qwen3_5 declaration
+/// composes per layer (`y += moe_mlp(l, rmsnorm(y, mlp_norm))`), traced
+/// against layer 0 with the residual stream as a fragment parameter
+/// ([`TraceBuilder::input`]). A full qwen3_5 declaration also needs the
+/// hybrid GDN attention vocabulary (`causal_conv1d`, `gated_delta`, gated
+/// rmsnorm, per-request recurrent state) — out of scope here, a separate
+/// rung; see [`Qwen35MoeMlpFacts`].
+///
+/// Mirrors `qwen3_5_moe_forward.cpp::run_moe_mlp` launch for launch, in the
+/// decode fast path's one-launch-per-op form (the canonical granularity;
+/// the prefill path's host-routed per-expert gather/GEMM/scatter loop is a
+/// LOWERING of ops 4–7, as is the CUTLASS fused pipeline — both the
+/// emitter's per-fire choice):
+///
+/// | trace op                       | hand-written kernel(s)                      |
+/// |--------------------------------|---------------------------------------------|
+/// | Rmsnorm(mlp_norm)              | launch_rmsnorm_gemma_bf16                   |
+/// | Matmul(router)                 | ops::gemm_act_x_wt_bf16 (router logits)     |
+/// | TopK                           | launch_topk_softmax_bf16                    |
+/// | Matmul(expert.{e}.gate_up, sel)| grouped GEMM (batched/aligned/CUTLASS)      |
+/// | Swiglu                         | launch_chunked_swiglu_bf16 over N*k rows    |
+/// | Matmul(expert.{e}.down, sel)   | grouped GEMM (batched/aligned/CUTLASS)      |
+/// | WeightedSum                    | launch_token_batched_weighted_sum_bf16      |
+/// | Matmul(shared_expert.gate_up)  | ops::gemm_act_x_w                           |
+/// | Swiglu                         | launch_chunked_swiglu_bf16                  |
+/// | Matmul(shared_expert.down)     | ops::gemm_act_x_w                           |
+/// | Matmul(shared_expert_gate)     | ops::gemm_act_x_w ([Tokens, 1] logit)       |
+/// | SigmoidGateAdd                 | launch_sigmoid_scalar_gate_add_bf16         |
+/// | ResidualAdd                    | launch_residual_add_bf16                    |
+///
+/// The five shared-expert ops fold away when the facts say the checkpoint
+/// has none (`shared_expert_intermediate == 0`, the qwen3_moe shape), the
+/// same way llama_like's branches fold: at trace time, leaving no trace.
+pub fn qwen3_5_moe_mlp_block(facts: &Qwen35MoeMlpFacts) -> ForwardPlan {
+    let mut t = TraceBuilder::new("qwen3_5_moe_mlp_block");
+    let hidden = Dim::Const(facts.hidden);
+
+    // The fragment's parameter: the residual stream entering the block.
+    let y = t.input(Shape(vec![Dim::Tokens, hidden]), DType::BF16);
+
+    t.layer(0, |t| {
+        let l = 0;
+        let w = |name: &str| format!("layer.{l}.{name}");
+
+        let m = t.rmsnorm(y, &w("mlp_norm"), facts.norm_variant);
+
+        // Routed experts: router -> topk -> grouped gate_up -> swiglu ->
+        // grouped down -> per-token weighted combine.
+        let logits = t.matmul(m, &w("router"), facts.num_experts);
+        let (experts, weights) = t.topk(logits, facts.top_k);
+        let gate_up = t.matmul_per_token(
+            m,
+            &w("expert.{e}.gate_up"),
+            experts,
+            2 * facts.moe_intermediate,
+        );
+        let act = t.swiglu(gate_up, facts.moe_intermediate);
+        let down = t.matmul_per_token(act, &w("expert.{e}.down"), experts, facts.hidden);
+        let routed = t.weighted_sum(weights, down);
+
+        // Shared expert (qwen3.5/3.6-MoE: always-on dense MLP behind a
+        // per-token sigmoid scalar gate; absent on qwen3_moe).
+        let combined = if facts.shared_expert_intermediate > 0 {
+            let inter = facts.shared_expert_intermediate;
+            let packed = t.matmul(m, &w("shared_expert.gate_up"), 2 * inter);
+            let act = t.swiglu(packed, inter);
+            let shared = t.matmul(act, &w("shared_expert.down"), facts.hidden);
+            let gate = t.matmul(m, &w("shared_expert_gate"), 1);
+            t.sigmoid_gate_add(shared, gate, routed)
+        } else {
+            routed
+        };
+
+        t.residual_add(combined, y)
+    });
+    t.finish()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::trace::{Dim, OpKind};
+    use crate::trace::{Dim, NormVariant, OpKind};
 
     /// The traced form of one qwen3 layer, mapped op-by-op to the kernel
     /// sequence `llama_like_forward_paged` launches on the unfused path.
@@ -493,5 +574,218 @@ mod tests {
         let json = serde_json::to_string(&plan).unwrap();
         let back: ForwardPlan = serde_json::from_str(&json).unwrap();
         assert_eq!(plan, back);
+    }
+
+    /// The MoE block fragment's op sequence, mapped launch for launch to
+    /// `run_moe_mlp`'s decode fast path (the table on
+    /// [`qwen3_5_moe_mlp_block`]).
+    #[test]
+    fn moe_block_op_sequence() {
+        let plan = qwen3_5_moe_mlp_block(&Qwen35MoeMlpFacts::qwen3_5_35b_a3b());
+        let kinds: Vec<&'static str> = plan
+            .layer_ops(0)
+            .map(|op| match &op.kind {
+                OpKind::Rmsnorm { .. } => "rmsnorm",
+                OpKind::Matmul { selector: Some(_), .. } => "matmul_per_token",
+                OpKind::Matmul { .. } => "matmul",
+                OpKind::TopK { .. } => "topk",
+                OpKind::Swiglu { .. } => "swiglu",
+                OpKind::WeightedSum { .. } => "weighted_sum",
+                OpKind::SigmoidGateAdd => "sigmoid_gate_add",
+                OpKind::ResidualAdd => "residual_add",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "rmsnorm",           // mlp_norm (gemma fold)
+                "matmul",            // router logits [Tokens, E]
+                "topk",              // launch_topk_softmax: idx + renormed weights
+                "matmul_per_token",  // grouped gate_up over the selected experts
+                "swiglu",            // chunked swiglu over [Tokens, k, Im]
+                "matmul_per_token",  // grouped down
+                "weighted_sum",      // [Tokens, k, H] -> [Tokens, H]
+                "matmul",            // shared_expert.gate_up
+                "swiglu",
+                "matmul",            // shared_expert.down
+                "matmul",            // shared_expert_gate: [Tokens, 1] logit
+                "sigmoid_gate_add",  // routed + sigmoid(gate) * shared
+                "residual_add",      // y += moe_out
+            ]
+        );
+    }
+
+    /// Without a shared expert (qwen3_moe: `shared_expert_intermediate` 0)
+    /// the five shared ops fold away at trace time, llama_like-branch
+    /// style, and the routed combine lands on the residual directly.
+    #[test]
+    fn moe_block_without_shared_expert_folds_the_shared_ops() {
+        let facts = Qwen35MoeMlpFacts {
+            shared_expert_intermediate: 0,
+            norm_variant: NormVariant::Plain,
+            ..Qwen35MoeMlpFacts::qwen3_5_35b_a3b()
+        };
+        let plan = qwen3_5_moe_mlp_block(&facts);
+        assert_eq!(plan.ops.len(), 8);
+        assert!(
+            !plan
+                .ops
+                .iter()
+                .any(|op| matches!(op.kind, OpKind::SigmoidGateAdd))
+        );
+        assert!(!plan.ops.iter().any(|op| {
+            matches!(&op.kind, OpKind::Matmul { weight, .. } if weight.contains("shared"))
+        }));
+        // The residual add consumes the weighted sum's output directly.
+        let add = plan.ops.last().unwrap();
+        assert!(matches!(add.kind, OpKind::ResidualAdd));
+        let combine = plan
+            .ops
+            .iter()
+            .find(|op| matches!(op.kind, OpKind::WeightedSum { .. }))
+            .unwrap();
+        assert_eq!(add.inputs[0], combine.outputs[0]);
+    }
+
+    /// The dyn dataflow: TopK's index output is the fragment's only
+    /// dyn-marked value, both expert matmuls name it as their selector AND
+    /// their last input, and their weight names are `{e}` templates.
+    #[test]
+    fn moe_block_selector_dataflow() {
+        let plan = qwen3_5_moe_mlp_block(&Qwen35MoeMlpFacts::qwen3_5_35b_a3b());
+        let topk = plan
+            .ops
+            .iter()
+            .find(|op| matches!(op.kind, OpKind::TopK { .. }))
+            .unwrap();
+        let idx = topk.outputs[0];
+        let dyn_values: Vec<_> = plan
+            .values
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| v.dyn_axis.is_some())
+            .map(|(i, _)| i as u32)
+            .collect();
+        assert_eq!(dyn_values, vec![idx]);
+        assert_eq!(plan.values[idx as usize].dtype, DType::I32);
+
+        let grouped: Vec<_> = plan
+            .ops
+            .iter()
+            .filter(|op| matches!(&op.kind, OpKind::Matmul { selector: Some(_), .. }))
+            .collect();
+        assert_eq!(grouped.len(), 2);
+        for op in &grouped {
+            let OpKind::Matmul { weight, selector, .. } = &op.kind else {
+                unreachable!()
+            };
+            assert_eq!(*selector, Some(idx));
+            assert_eq!(*op.inputs.last().unwrap(), idx);
+            assert!(weight.contains("{e}"), "not a template: {weight}");
+        }
+        assert!(matches!(
+            &grouped[0].kind,
+            OpKind::Matmul { weight, .. } if weight == "layer.0.expert.{e}.gate_up"
+        ));
+        assert!(matches!(
+            &grouped[1].kind,
+            OpKind::Matmul { weight, .. } if weight == "layer.0.expert.{e}.down"
+        ));
+    }
+
+    /// Route-expanded shapes: the grouped matmuls and the swiglu between
+    /// them carry the `[Tokens, k, ...]` factored form of the driver's
+    /// `[N*K, ...]` scratch, and the weighted sum collapses it back.
+    #[test]
+    fn moe_block_route_expanded_shapes() {
+        let facts = Qwen35MoeMlpFacts::qwen3_5_35b_a3b();
+        let plan = qwen3_5_moe_mlp_block(&facts);
+        let k = Dim::Const(facts.top_k);
+        let by_kind = |pred: fn(&OpKind) -> bool| {
+            plan.ops
+                .iter()
+                .filter(move |op| pred(&op.kind))
+                .collect::<Vec<_>>()
+        };
+
+        let grouped = by_kind(|k| matches!(k, OpKind::Matmul { selector: Some(_), .. }));
+        assert_eq!(
+            plan.values[grouped[0].outputs[0] as usize].shape.0,
+            vec![Dim::Tokens, k, Dim::Const(2 * facts.moe_intermediate)]
+        );
+        assert_eq!(
+            plan.values[grouped[1].outputs[0] as usize].shape.0,
+            vec![Dim::Tokens, k, Dim::Const(facts.hidden)]
+        );
+
+        // The routed swiglu keeps the route dims; the shared one is the
+        // ordinary dense shape.
+        let swiglus = by_kind(|k| matches!(k, OpKind::Swiglu { .. }));
+        assert_eq!(
+            plan.values[swiglus[0].outputs[0] as usize].shape.0,
+            vec![Dim::Tokens, k, Dim::Const(facts.moe_intermediate)]
+        );
+        assert_eq!(
+            plan.values[swiglus[1].outputs[0] as usize].shape.0,
+            vec![
+                Dim::Tokens,
+                Dim::Const(facts.shared_expert_intermediate)
+            ]
+        );
+
+        let combine = by_kind(|k| matches!(k, OpKind::WeightedSum { .. }));
+        assert!(
+            matches!(combine[0].kind, OpKind::WeightedSum { k } if k == facts.top_k)
+        );
+        assert_eq!(
+            plan.values[combine[0].outputs[0] as usize].shape.0,
+            vec![Dim::Tokens, Dim::Const(facts.hidden)]
+        );
+
+        // The shared gate logit is the [Tokens, 1] scalar-gate GEMM.
+        let gate = plan
+            .ops
+            .iter()
+            .find(|op| {
+                matches!(&op.kind, OpKind::Matmul { weight, .. }
+                    if weight.ends_with("shared_expert_gate"))
+            })
+            .unwrap();
+        assert_eq!(
+            plan.values[gate.outputs[0] as usize].shape.0,
+            vec![Dim::Tokens, Dim::Const(1)]
+        );
+    }
+
+    /// The fragment parameter is honest dataflow: value 0 is produced by no
+    /// op, read by the block's first norm, and landed on by the final
+    /// residual add.
+    #[test]
+    fn moe_block_residual_stream_is_a_fragment_parameter() {
+        let plan = qwen3_5_moe_mlp_block(&Qwen35MoeMlpFacts::qwen3_5_35b_a3b());
+        assert!(!plan.ops.iter().any(|op| op.outputs.contains(&0)));
+        assert!(matches!(&plan.ops[0].kind, OpKind::Rmsnorm { weight, .. }
+            if weight == "layer.0.mlp_norm"));
+        assert_eq!(plan.ops[0].inputs, vec![0]);
+        let add = plan.ops.last().unwrap();
+        assert!(matches!(add.kind, OpKind::ResidualAdd));
+        assert_eq!(*add.inputs.last().unwrap(), 0);
+    }
+
+    /// The dyn vocabulary survives serde — selector fields, dyn markers,
+    /// rank-3 shapes — and, per the additive rule, none of it appears in a
+    /// dyn-free plan's serialization (the goldens pin that byte-for-byte;
+    /// this pins the reason).
+    #[test]
+    fn moe_traced_form_round_trips() {
+        let plan = qwen3_5_moe_mlp_block(&Qwen35MoeMlpFacts::qwen3_5_35b_a3b());
+        let json = serde_json::to_string(&plan).unwrap();
+        let back: ForwardPlan = serde_json::from_str(&json).unwrap();
+        assert_eq!(plan, back);
+
+        let dense = serde_json::to_string(&llama_like(&LlamaLikeFacts::qwen3_0_6b())).unwrap();
+        assert!(!dense.contains("selector"));
+        assert!(!dense.contains("dyn_axis"));
     }
 }

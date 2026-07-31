@@ -316,6 +316,45 @@ void a_fused_trace_is_refused() {
            "and the message says why: " + what);
 }
 
+// The first `dyn` traced form — the qwen3_5_moe MLP-block fragment, whose
+// TopK / selector-carrying Matmuls / WeightedSum the emitters do not
+// consume — must be refused loudly, never half-emitted. The builder
+// refuses at the first MoE-only weight name (`layer.0.router`), before any
+// dyn op kind is even reached; the switch's default arm ("has no emission
+// rule") backs that up for any kind past the v0 vocabulary. Either way:
+// a throw, with a message naming the reason.
+void a_dyn_trace_is_refused() {
+    std::printf("[dyn (moe) trace]\n");
+    pie_forward::PieForwardQwen35MoeMlpFacts f{};
+    f.hidden = 2048;
+    f.num_experts = 256;
+    f.top_k = 8;
+    f.moe_intermediate = 512;
+    f.shared_expert_intermediate = 512;
+    // Plain, so the refusal fires on the MoE-only weight name rather than
+    // on the (also-refused) Gemma norm variant that qwen3.5 really uses —
+    // this test is about the dyn vocabulary, not the norm fold.
+    f.norm_variant = static_cast<std::uint32_t>(pie_forward::PieForwardNormVariant::Plain);
+    const pie_forward::ForwardPlan plan = pie_forward::ForwardPlan::trace_qwen3_5_moe_mlp(f);
+    expect(plan.op_count() == 13, "the ABI hands over the 13-op MoE fragment");
+
+    LlamaLikeGeometry g{};
+    g.layers = 1;
+    g.hidden = 2048;
+    bool threw = false;
+    std::string what;
+    try {
+        build_llama_like_declared_dag(plan, g);
+    } catch (const std::exception& e) {
+        threw = true;
+        what = e.what();
+    }
+    expect(threw, "a dyn (MoE) trace throws rather than half-emitting");
+    expect(what.find("unknown weight") != std::string::npos ||
+               what.find("no emission rule") != std::string::npos,
+           "and the message says why: " + what);
+}
+
 }  // namespace
 
 int main() {
@@ -341,6 +380,7 @@ int main() {
     coloring_is_hazard_free(phi, phi_dag, "phi3-mini");
 
     a_fused_trace_is_refused();
+    a_dyn_trace_is_refused();
 
     std::printf("\n==== llama_like_declared_dag_test: %s ====\n",
                 g_failures == 0 ? "all passed" : "FAILURES");

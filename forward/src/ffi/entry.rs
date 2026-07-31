@@ -19,7 +19,7 @@
 //!   there is no diagnostics channel to carry, and the status is the whole
 //!   answer.
 
-use crate::facts::{LlamaLikeFacts, NormPlacement, QkNorm};
+use crate::facts::{LlamaLikeFacts, NormPlacement, QkNorm, Qwen35MoeMlpFacts};
 use crate::trace::{NormVariant, RopeKind};
 
 use super::arena;
@@ -102,6 +102,43 @@ fn read_facts(facts: &PieForwardLlamaLikeFacts) -> Result<LlamaLikeFacts, PieFor
     })
 }
 
+/// The qwen3_5_moe MLP-block facts, as C states them. Mirrors
+/// [`crate::facts::Qwen35MoeMlpFacts`] field for field; same input-side
+/// rules as [`PieForwardLlamaLikeFacts`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct PieForwardQwen35MoeMlpFacts {
+    pub hidden: u32,
+    pub num_experts: u32,
+    pub top_k: u32,
+    pub moe_intermediate: u32,
+    /// 0 means no shared expert (the qwen3_moe shape).
+    pub shared_expert_intermediate: u32,
+    /// A [`super::types::PieForwardNormVariant`] value.
+    pub norm_variant: u32,
+}
+
+fn read_moe_facts(
+    facts: &PieForwardQwen35MoeMlpFacts,
+) -> Result<Qwen35MoeMlpFacts, PieForwardStatus> {
+    let norm_variant =
+        NormVariant::try_from(facts.norm_variant).map_err(|_| PieForwardStatus::InvalidArgument)?;
+    // A router with no experts or no routes is not a smaller MoE, it is a
+    // malformed request: the tracer would emit ops whose k or E dimension
+    // is zero, which no kernel means anything by.
+    if facts.num_experts == 0 || facts.top_k == 0 || facts.moe_intermediate == 0 {
+        return Err(PieForwardStatus::InvalidArgument);
+    }
+    Ok(Qwen35MoeMlpFacts {
+        hidden: facts.hidden,
+        num_experts: facts.num_experts,
+        top_k: facts.top_k,
+        moe_intermediate: facts.moe_intermediate,
+        shared_expert_intermediate: facts.shared_expert_intermediate,
+        norm_variant,
+    })
+}
+
 /// Run `f`, aborting the process if it panics.
 ///
 /// Equivalent to letting the unwind hit the `extern "C"` boundary — the
@@ -149,8 +186,46 @@ pub unsafe extern "C" fn pie_forward_trace_llama_like(
     })
 }
 
+/// Trace the qwen3_5_moe MoE MLP-block FRAGMENT against `facts` and publish
+/// the traced form into `*out_plan`.
+///
+/// The result is the first traced form carrying `dyn` ops (`TopK`,
+/// expert-selecting `Matmul`s, `WeightedSum`, `SigmoidGateAdd`). The
+/// declared executors do NOT consume these — their op-kind switches throw
+/// on any kind past their vocabulary — so this entry point exists for the
+/// toolchain side (planning, tests, cross-language pinning), not for
+/// emission; the grouped-GEMM emission is a later, much larger lift.
+///
+/// # Safety
+///
+/// `facts` is null or points at a readable [`PieForwardQwen35MoeMlpFacts`];
+/// `out_plan` is null or a writable slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pie_forward_trace_qwen3_5_moe_mlp(
+    facts: *const PieForwardQwen35MoeMlpFacts,
+    out_plan: *mut PieForwardPlan,
+) -> PieForwardStatus {
+    abort_on_panic(|| {
+        if out_plan.is_null() {
+            return PieForwardStatus::InvalidArgument;
+        }
+        unsafe { *out_plan = PieForwardPlan::default() };
+        if facts.is_null() {
+            return PieForwardStatus::InvalidArgument;
+        }
+        let facts = match read_moe_facts(unsafe { &*facts }) {
+            Ok(facts) => facts,
+            Err(status) => return status,
+        };
+        let plan = crate::family::qwen3_5_moe_mlp_block(&facts);
+        unsafe { *out_plan = arena::build(&plan) };
+        PieForwardStatus::Ok
+    })
+}
+
 /// Free the storage behind a plan header filled by
-/// [`pie_forward_trace_llama_like`], and reset the header to empty.
+/// [`pie_forward_trace_llama_like`] or
+/// [`pie_forward_trace_qwen3_5_moe_mlp`], and reset the header to empty.
 ///
 /// Safe to call with null, with a header that was never filled, or twice
 /// with the same header (the first call empties it).
@@ -181,7 +256,8 @@ unsafe impl Sync for EntryAddr {}
 /// (`loader/src/ffi/entry.rs:637-652`, `loader/architecture.md` §3.4).
 /// `#[used]` keeps the table, and the table keeps the functions.
 #[used]
-static KEEP_ALIVE: [EntryAddr; 2] = [
+static KEEP_ALIVE: [EntryAddr; 3] = [
     EntryAddr(pie_forward_trace_llama_like as *const ()),
+    EntryAddr(pie_forward_trace_qwen3_5_moe_mlp as *const ()),
     EntryAddr(pie_forward_release as *const ()),
 ];

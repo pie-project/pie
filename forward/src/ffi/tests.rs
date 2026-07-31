@@ -8,11 +8,12 @@
 
 use super::arena::{self, view};
 use super::entry::{
-    PieForwardLlamaLikeFacts, PieForwardStatus, pie_forward_release, pie_forward_trace_llama_like,
+    PieForwardLlamaLikeFacts, PieForwardQwen35MoeMlpFacts, PieForwardStatus, pie_forward_release,
+    pie_forward_trace_llama_like, pie_forward_trace_qwen3_5_moe_mlp,
 };
 use super::types::*;
-use crate::facts::LlamaLikeFacts;
-use crate::family::llama_like;
+use crate::facts::{LlamaLikeFacts, Qwen35MoeMlpFacts};
+use crate::family::{llama_like, qwen3_5_moe_mlp_block};
 use crate::trace::OpKind;
 
 /// The qwen3 parity facts, as a C caller would state them.
@@ -51,6 +52,9 @@ fn expect_kind(kind: &OpKind) -> PieForwardOpKind {
         OpKind::Swiglu { .. } => PieForwardOpKind::Swiglu,
         OpKind::LmHead { .. } => PieForwardOpKind::LmHead,
         OpKind::ResidualAdd => PieForwardOpKind::ResidualAdd,
+        OpKind::TopK { .. } => PieForwardOpKind::TopK,
+        OpKind::WeightedSum { .. } => PieForwardOpKind::WeightedSum,
+        OpKind::SigmoidGateAdd => PieForwardOpKind::SigmoidGateAdd,
     }
 }
 
@@ -266,6 +270,122 @@ fn entry_honours_post_norm_and_global_qk_norm() {
     assert_eq!(add.weight_name, PIE_FORWARD_NO_NAME);
     assert_eq!(add.inputs.len, 2);
     unsafe { pie_forward_release(&mut out) };
+}
+
+/// The MoE fragment round-trips: dyn op kinds, the selector field (set on
+/// exactly the two expert matmuls, resting at [`PIE_FORWARD_NO_VALUE`]
+/// everywhere else), the weight TEMPLATE crossing verbatim, the rank-3
+/// route-expanded shapes, and the TopK params.
+#[test]
+fn moe_fragment_round_trips_through_the_arena() {
+    let facts = Qwen35MoeMlpFacts::qwen3_5_35b_a3b();
+    let plan = qwen3_5_moe_mlp_block(&facts);
+    let mut pod = arena::build(&plan);
+
+    assert_eq!(view::name(&pod, pod.family), "qwen3_5_moe_mlp_block");
+    let ops = view::ops(&pod);
+    assert_eq!(ops.len(), plan.ops.len());
+    for (rust, c) in plan.ops.iter().zip(ops) {
+        assert_eq!(c.kind, expect_kind(&rust.kind), "kind of {rust:?}");
+        assert_eq!(view::ids(&pod, c.inputs), &rust.inputs[..]);
+        assert_eq!(view::ids(&pod, c.outputs), &rust.outputs[..]);
+        match &rust.kind {
+            OpKind::Matmul {
+                selector: Some(selector),
+                ..
+            } => assert_eq!(c.selector, *selector),
+            _ => assert_eq!(c.selector, PIE_FORWARD_NO_VALUE, "selector of {rust:?}"),
+        }
+    }
+
+    let topk = ops
+        .iter()
+        .find(|op| op.kind == PieForwardOpKind::TopK)
+        .unwrap();
+    assert_eq!(topk.param0, facts.top_k);
+    assert_eq!(topk.weight_name, PIE_FORWARD_NO_NAME);
+    let idx_id = view::ids(&pod, topk.outputs)[0];
+    let idx = view::values(&pod)[idx_id as usize];
+    assert_eq!(idx.dtype, PieForwardDType::I32);
+    assert_eq!(idx.rank, 2);
+    assert_eq!(idx.dims[0].kind, PieForwardDimKind::Tokens);
+    assert_eq!(idx.dims[1].value, facts.top_k);
+
+    let grouped: Vec<_> = ops
+        .iter()
+        .filter(|op| op.selector != PIE_FORWARD_NO_VALUE)
+        .collect();
+    assert_eq!(grouped.len(), 2);
+    for op in &grouped {
+        assert_eq!(op.kind, PieForwardOpKind::Matmul);
+        assert_eq!(op.selector, idx_id);
+        // The selector is also the last input — the field states which
+        // input selects, it does not add an operand.
+        assert_eq!(*view::ids(&pod, op.inputs).last().unwrap(), idx_id);
+    }
+    assert_eq!(
+        view::name(&pod, grouped[0].weight_name),
+        "layer.0.expert.{e}.gate_up"
+    );
+    // Rank-3 route-expanded output: [Tokens, k, 2 * Im].
+    let gu_out = view::values(&pod)[view::ids(&pod, grouped[0].outputs)[0] as usize];
+    assert_eq!(gu_out.rank, 3);
+    assert_eq!(gu_out.dims[0].kind, PieForwardDimKind::Tokens);
+    assert_eq!(gu_out.dims[1].value, facts.top_k);
+    assert_eq!(gu_out.dims[2].value, 2 * facts.moe_intermediate);
+
+    let combine = ops
+        .iter()
+        .find(|op| op.kind == PieForwardOpKind::WeightedSum)
+        .unwrap();
+    assert_eq!(combine.param0, facts.top_k);
+
+    unsafe { arena::release(&mut pod) };
+}
+
+/// The MoE entry point end to end: C facts in, POD plan out; malformed
+/// requests (bad enum, zero experts/k) answer InvalidArgument.
+#[test]
+fn moe_entry_traces_and_validates() {
+    let facts = Qwen35MoeMlpFacts::qwen3_5_35b_a3b();
+    let c_facts = PieForwardQwen35MoeMlpFacts {
+        hidden: facts.hidden,
+        num_experts: facts.num_experts,
+        top_k: facts.top_k,
+        moe_intermediate: facts.moe_intermediate,
+        shared_expert_intermediate: facts.shared_expert_intermediate,
+        norm_variant: PieForwardNormVariant::from(facts.norm_variant) as u32,
+    };
+    let mut out = PieForwardPlan::default();
+    assert_eq!(
+        unsafe { pie_forward_trace_qwen3_5_moe_mlp(&c_facts, &mut out) },
+        PieForwardStatus::Ok
+    );
+    // The 13-op block `family::tests::moe_block_op_sequence` pins.
+    assert_eq!(out.ops.len, 13);
+    unsafe { pie_forward_release(&mut out) };
+
+    for bad in [
+        PieForwardQwen35MoeMlpFacts {
+            norm_variant: 9,
+            ..c_facts
+        },
+        PieForwardQwen35MoeMlpFacts {
+            num_experts: 0,
+            ..c_facts
+        },
+        PieForwardQwen35MoeMlpFacts { top_k: 0, ..c_facts },
+    ] {
+        assert_eq!(
+            unsafe { pie_forward_trace_qwen3_5_moe_mlp(&bad, &mut out) },
+            PieForwardStatus::InvalidArgument
+        );
+        assert!(out.owner.is_null());
+    }
+    assert_eq!(
+        unsafe { pie_forward_trace_qwen3_5_moe_mlp(std::ptr::null(), &mut out) },
+        PieForwardStatus::InvalidArgument
+    );
 }
 
 /// The unfused binding crosses the boundary too: three per-layer projection

@@ -18,7 +18,8 @@ pub mod entry;
 pub mod types;
 
 pub use entry::{
-    PieForwardLlamaLikeFacts, PieForwardStatus, pie_forward_release, pie_forward_trace_llama_like,
+    PieForwardLlamaLikeFacts, PieForwardQwen35MoeMlpFacts, PieForwardStatus, pie_forward_release,
+    pie_forward_trace_llama_like, pie_forward_trace_qwen3_5_moe_mlp,
 };
 pub use types::*;
 

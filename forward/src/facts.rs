@@ -225,3 +225,61 @@ impl LlamaLikeFacts {
         }
     }
 }
+
+/// Facts for one qwen3_5_moe-family MoE MLP block — a traced FRAGMENT, not
+/// a model.
+///
+/// Deliberately narrower than a `Qwen35MoeFacts` would be: the qwen3.5
+/// family alternates GDN linear-attention layers with full-attention layers
+/// (the HYBRID part, `driver/cuda/src/model/qwen3_5/qwen3_5_forward.cpp`),
+/// and declaring the MoE MLP inside the llama_like skeleton would trace a
+/// model that does not exist. So these facts describe exactly the unit the
+/// future qwen3_5 declaration composes per layer — `y += moe_mlp(rmsnorm(y))`
+/// — and `family::qwen3_5_moe_mlp_block` traces that unit standalone. The
+/// full declaration needs the GDN op vocabulary (`causal_conv1d`,
+/// `gated_delta`, gated rmsnorm) and per-request recurrent state, which are
+/// a separate rung.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Qwen35MoeMlpFacts {
+    pub hidden: u32,
+    /// Routed expert count (HF `num_experts` / `num_local_experts`).
+    pub num_experts: u32,
+    /// Experts per token (HF `num_experts_per_tok`) — the router's k.
+    pub top_k: u32,
+    /// Per-expert intermediate width (HF `moe_intermediate_size`).
+    pub moe_intermediate: u32,
+    /// Shared-expert intermediate width (HF
+    /// `shared_expert_intermediate_size`); 0 means no shared expert, which
+    /// is the qwen3_moe shape — the hand-written pass skips the whole
+    /// shared block when the bind wired no `shared_*` pointers.
+    pub shared_expert_intermediate: u32,
+    /// qwen3.5/3.6 use the Gemma `(1 + w)` fold
+    /// (`qwen3_5_moe_forward.cpp::uses_gemma_rmsnorm`: everything but plain
+    /// `qwen3_moe`).
+    pub norm_variant: NormVariant,
+}
+
+impl Qwen35MoeMlpFacts {
+    /// Qwen3.5-35B-A3B, the small qwen3_5_moe checkpoint.
+    ///
+    /// No config.json is committed in this tree, so these dims are pinned
+    /// from the driver's own measured notes on this checkpoint
+    /// (`qwen3_5_moe_forward.cpp`): 256 routed experts ("with 256 experts
+    /// holding only a few routes each"); gate_up bytes per expert 4.2 MB at
+    /// tp=1 / 2.1 MB at tp=2 = `2 * moe_intermediate * hidden * 2B` with
+    /// `moe_intermediate = 512, hidden = 2048`; top-k 8 (the profiled
+    /// N=128 decode step's "352 blocks for ~252 active experts" matches
+    /// the aligned-decode block formula only at `routes = N * 8`); and a
+    /// shared expert with `Is == Im` (the precondition of the shared-fold
+    /// experiment, which rode it along "as one more expert").
+    pub fn qwen3_5_35b_a3b() -> Self {
+        Self {
+            hidden: 2048,
+            num_experts: 256,
+            top_k: 8,
+            moe_intermediate: 512,
+            shared_expert_intermediate: 512,
+            norm_variant: NormVariant::Gemma,
+        }
+    }
+}

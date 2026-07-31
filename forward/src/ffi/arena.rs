@@ -64,8 +64,9 @@ impl Interner {
 /// Flatten one [`ValueInfo`] into the inline-dims POD form.
 ///
 /// Panics if a shape outgrows [`PIE_FORWARD_MAX_DIMS`]. That is a tracer
-/// bug, not caller input — the tracer emits rank-2 shapes today — and the
-/// entry rules turn the panic into an abort rather than a status
+/// bug, not caller input — the tracer emits rank-2 shapes plus the MoE
+/// trace's rank-3 route-expanded values — and the entry rules turn the
+/// panic into an abort rather than a status
 /// (`loader/src/ffi/entry.rs:1-19`).
 fn flatten_value(info: &ValueInfo) -> PieForwardValue {
     assert!(
@@ -84,57 +85,122 @@ fn flatten_value(info: &ValueInfo) -> PieForwardValue {
     }
 }
 
-/// Flatten one [`OpKind`] into (kind tag, weight name, param0, param1).
+/// Flatten one [`OpKind`] into (kind tag, weight name, param0, param1,
+/// selector).
 ///
 /// The mapping is the table documented on [`PieForwardOp`]; keeping the two
-/// adjacent to one match arm each is what keeps the table honest.
+/// adjacent to one match arm each is what keeps the table honest. Only the
+/// expert-indexed `Matmul` carries a selector; everything else rests at
+/// [`PIE_FORWARD_NO_VALUE`].
 fn flatten_kind(
     arena: &mut PlanArena,
     interner: &mut Interner,
     kind: &OpKind,
-) -> (PieForwardOpKind, u32, u32, u32) {
+) -> (PieForwardOpKind, u32, u32, u32, u32) {
     let mut name = |arena: &mut PlanArena, weight: &str| interner.intern(arena, weight);
     match kind {
-        OpKind::Embed { weight } => (PieForwardOpKind::Embed, name(arena, weight), 0, 0),
-        OpKind::Matmul { weight, beta_one } => (
+        OpKind::Embed { weight } => (
+            PieForwardOpKind::Embed,
+            name(arena, weight),
+            0,
+            0,
+            PIE_FORWARD_NO_VALUE,
+        ),
+        OpKind::Matmul {
+            weight,
+            beta_one,
+            selector,
+        } => (
             PieForwardOpKind::Matmul,
             name(arena, weight),
             u32::from(*beta_one),
             0,
+            selector.unwrap_or(PIE_FORWARD_NO_VALUE),
         ),
         OpKind::Rmsnorm { weight, variant } => (
             PieForwardOpKind::Rmsnorm,
             name(arena, weight),
             PieForwardNormVariant::from(*variant) as u32,
             0,
+            PIE_FORWARD_NO_VALUE,
         ),
         OpKind::RmsnormPerHead { weight, head_dim } => (
             PieForwardOpKind::RmsnormPerHead,
             name(arena, weight),
             *head_dim,
             0,
+            PIE_FORWARD_NO_VALUE,
         ),
         OpKind::SplitQkv { q_width, kv_width } => (
             PieForwardOpKind::SplitQkv,
             PIE_FORWARD_NO_NAME,
             *q_width,
             *kv_width,
+            PIE_FORWARD_NO_VALUE,
         ),
         OpKind::Rope { kind } => (
             PieForwardOpKind::Rope,
             PIE_FORWARD_NO_NAME,
             PieForwardRopeKind::from(*kind) as u32,
             0,
+            PIE_FORWARD_NO_VALUE,
         ),
-        OpKind::KvAppend { layer } => {
-            (PieForwardOpKind::KvAppend, PIE_FORWARD_NO_NAME, *layer, 0)
-        }
-        OpKind::Attention { layer } => {
-            (PieForwardOpKind::Attention, PIE_FORWARD_NO_NAME, *layer, 0)
-        }
-        OpKind::Swiglu { inter } => (PieForwardOpKind::Swiglu, PIE_FORWARD_NO_NAME, *inter, 0),
-        OpKind::LmHead { weight } => (PieForwardOpKind::LmHead, name(arena, weight), 0, 0),
-        OpKind::ResidualAdd => (PieForwardOpKind::ResidualAdd, PIE_FORWARD_NO_NAME, 0, 0),
+        OpKind::KvAppend { layer } => (
+            PieForwardOpKind::KvAppend,
+            PIE_FORWARD_NO_NAME,
+            *layer,
+            0,
+            PIE_FORWARD_NO_VALUE,
+        ),
+        OpKind::Attention { layer } => (
+            PieForwardOpKind::Attention,
+            PIE_FORWARD_NO_NAME,
+            *layer,
+            0,
+            PIE_FORWARD_NO_VALUE,
+        ),
+        OpKind::Swiglu { inter } => (
+            PieForwardOpKind::Swiglu,
+            PIE_FORWARD_NO_NAME,
+            *inter,
+            0,
+            PIE_FORWARD_NO_VALUE,
+        ),
+        OpKind::LmHead { weight } => (
+            PieForwardOpKind::LmHead,
+            name(arena, weight),
+            0,
+            0,
+            PIE_FORWARD_NO_VALUE,
+        ),
+        OpKind::ResidualAdd => (
+            PieForwardOpKind::ResidualAdd,
+            PIE_FORWARD_NO_NAME,
+            0,
+            0,
+            PIE_FORWARD_NO_VALUE,
+        ),
+        OpKind::TopK { k } => (
+            PieForwardOpKind::TopK,
+            PIE_FORWARD_NO_NAME,
+            *k,
+            0,
+            PIE_FORWARD_NO_VALUE,
+        ),
+        OpKind::WeightedSum { k } => (
+            PieForwardOpKind::WeightedSum,
+            PIE_FORWARD_NO_NAME,
+            *k,
+            0,
+            PIE_FORWARD_NO_VALUE,
+        ),
+        OpKind::SigmoidGateAdd => (
+            PieForwardOpKind::SigmoidGateAdd,
+            PIE_FORWARD_NO_NAME,
+            0,
+            0,
+            PIE_FORWARD_NO_VALUE,
+        ),
     }
 }
 
@@ -149,7 +215,7 @@ fn store_ids(arena: &mut PlanArena, ids: &[u32]) -> PieForwardIdRange {
 }
 
 fn flatten_op(arena: &mut PlanArena, interner: &mut Interner, op: &Op) -> PieForwardOp {
-    let (kind, weight_name, param0, param1) = flatten_kind(arena, interner, &op.kind);
+    let (kind, weight_name, param0, param1, selector) = flatten_kind(arena, interner, &op.kind);
     let inputs = store_ids(arena, &op.inputs);
     let outputs = store_ids(arena, &op.outputs);
     PieForwardOp {
@@ -158,6 +224,7 @@ fn flatten_op(arena: &mut PlanArena, interner: &mut Interner, op: &Op) -> PieFor
         weight_name,
         param0,
         param1,
+        selector,
         inputs,
         outputs,
     }

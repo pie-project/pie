@@ -11,12 +11,17 @@ namespace pie_forward {
 /// `PieForwardOp::weight_name` when the op references no weight.
 constexpr static const uint32_t PIE_FORWARD_NO_NAME = UINT32_MAX;
 
+/// `PieForwardOp::selector` when the op selects no per-token weights —
+/// every op except the expert-indexed `Matmul`s of an MoE trace.
+constexpr static const uint32_t PIE_FORWARD_NO_VALUE = UINT32_MAX;
+
 /// `PieForwardOp::layer` for prologue/epilogue ops (embed, final norm,
 /// lm_head). Signed so the resting value cannot collide with a real layer.
 constexpr static const int32_t PIE_FORWARD_NO_LAYER = -1;
 
-/// Inline dim capacity of [`PieForwardValue`]. Every shape the tracer emits
-/// today is rank 2; 4 leaves headroom without an arena run per value.
+/// Inline dim capacity of [`PieForwardValue`]. The tracer emits rank-2
+/// shapes plus the MoE trace's rank-3 route-expanded `[Tokens, k, d]`
+/// values; 4 leaves headroom without an arena run per value.
 constexpr static const size_t PIE_FORWARD_MAX_DIMS = 4;
 
 enum class PieForwardStatus : uint32_t {
@@ -65,6 +70,16 @@ enum class PieForwardOpKind : uint32_t {
   /// per the discipline above — the nine kinds before it keep their
   /// wire values.
   ResidualAdd = 10,
+  /// Router top-k + softmax + renormalize (one launch in the hand-written
+  /// MoE pass). First of the `dyn` kinds — the declared executors do NOT
+  /// consume these; their op-kind switches throw on them via the loud
+  /// default arm, which is the intended v0 behaviour (the grouped-GEMM
+  /// emission is a later, much larger lift).
+  TopK = 11,
+  /// Per-token combine of the k routed expert outputs.
+  WeightedSum = 12,
+  /// `out = base + sigmoid(gate) * x` (shared-expert landing).
+  SigmoidGateAdd = 13,
 };
 
 /// Mirrors [`crate::trace::NormVariant`].
@@ -187,6 +202,9 @@ struct PieForwardIdRange {
 /// | `Swiglu`         | none                 | `inter`                      | —          |
 /// | `LmHead`         | weight               | —                            | —          |
 /// | `ResidualAdd`    | none                 | —                            | —          |
+/// | `TopK`           | none                 | `k`                          | —          |
+/// | `WeightedSum`    | none                 | `k`                          | —          |
+/// | `SigmoidGateAdd` | none                 | —                            | —          |
 ///
 /// `KvAppend`/`Attention` restate the layer their kind addresses even though
 /// `layer` carries the bracketing layer, because the trace states both
@@ -201,6 +219,15 @@ struct PieForwardOp {
   uint32_t weight_name;
   uint32_t param0;
   uint32_t param1;
+  /// The per-token selector: for an expert-indexed `Matmul` (whose
+  /// `weight_name` is then a template, `layer.0.expert.{e}.gate_up`) the
+  /// value id of the `TopK` index output that resolves `{e}` per token;
+  /// [`PIE_FORWARD_NO_VALUE`] for every other op. The selector is also
+  /// the op's last input, so a dataflow walk needs no special case; this
+  /// field states which input selects rather than flows. The dyn marker
+  /// crosses the ABI only here and as the producing `TopK` op — a
+  /// per-value flag would duplicate what these two already state.
+  uint32_t selector;
   /// Values consumed, in operand order.
   PieForwardIdRange inputs;
   /// Values produced (`SplitQkv` produces three, `KvAppend` none).
@@ -255,6 +282,20 @@ struct PieForwardPlan {
   void *owner;
 };
 
+/// The qwen3_5_moe MLP-block facts, as C states them. Mirrors
+/// [`crate::facts::Qwen35MoeMlpFacts`] field for field; same input-side
+/// rules as [`PieForwardLlamaLikeFacts`].
+struct PieForwardQwen35MoeMlpFacts {
+  uint32_t hidden;
+  uint32_t num_experts;
+  uint32_t top_k;
+  uint32_t moe_intermediate;
+  /// 0 means no shared expert (the qwen3_moe shape).
+  uint32_t shared_expert_intermediate;
+  /// A [`super::types::PieForwardNormVariant`] value.
+  uint32_t norm_variant;
+};
+
 extern "C" {
 
 /// Trace the llama_like family against `facts` and publish the traced form
@@ -271,8 +312,26 @@ extern "C" {
 PieForwardStatus pie_forward_trace_llama_like(const PieForwardLlamaLikeFacts *facts,
                                               PieForwardPlan *out_plan);
 
+/// Trace the qwen3_5_moe MoE MLP-block FRAGMENT against `facts` and publish
+/// the traced form into `*out_plan`.
+///
+/// The result is the first traced form carrying `dyn` ops (`TopK`,
+/// expert-selecting `Matmul`s, `WeightedSum`, `SigmoidGateAdd`). The
+/// declared executors do NOT consume these — their op-kind switches throw
+/// on any kind past their vocabulary — so this entry point exists for the
+/// toolchain side (planning, tests, cross-language pinning), not for
+/// emission; the grouped-GEMM emission is a later, much larger lift.
+///
+/// # Safety
+///
+/// `facts` is null or points at a readable [`PieForwardQwen35MoeMlpFacts`];
+/// `out_plan` is null or a writable slot.
+PieForwardStatus pie_forward_trace_qwen3_5_moe_mlp(const PieForwardQwen35MoeMlpFacts *facts,
+                                                   PieForwardPlan *out_plan);
+
 /// Free the storage behind a plan header filled by
-/// [`pie_forward_trace_llama_like`], and reset the header to empty.
+/// [`pie_forward_trace_llama_like`] or
+/// [`pie_forward_trace_qwen3_5_moe_mlp`], and reset the header to empty.
 ///
 /// Safe to call with null, with a header that was never filled, or twice
 /// with the same header (the first call empties it).

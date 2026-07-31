@@ -28,6 +28,19 @@
 // pad/strip staging around KV-write/attention is emitter knowledge, not
 // trace vocabulary — the trace speaks the logical head_dim throughout.
 //
+// `dyn` ops are OUT of scope and refused loudly. The forward crate's MoE
+// vocabulary (`TopK`, selector-carrying `Matmul`s over `expert.{e}.*`
+// weight templates, `WeightedSum`, `SigmoidGateAdd` — the
+// `pie_forward_trace_qwen3_5_moe_mlp` fragment) is toolchain-side only for
+// now: this executor's op-kind switch ends in a default arm that throws
+// "op kind N has no emission rule", so a dyn trace can never half-emit.
+// (Tested on the Metal side, whose DAG builder shares the discipline:
+// driver/metal/tests/llama_like_declared_dag_test.cpp traces the MoE
+// fragment through the ABI and pins the refusal.) Emitting the expert
+// axis — grouped GEMM over gathered tokens, the kernels qwen3_5_moe
+// already owns — is a later, much larger lift, not a switch arm to add
+// casually here.
+//
 // Explicit KV-write descriptors ARE handled (the hand-written
 // `has_write_desc` branch, verbatim): every pure-decode fire that replays a
 // forward graph carries them — `forward_graph_replay_eligible` REQUIRES

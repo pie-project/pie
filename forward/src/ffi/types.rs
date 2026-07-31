@@ -15,9 +15,9 @@
 //!
 //! Where the loader's plan needed a tagged union (`PieLoaderStorageOp`
 //! carries per-operation operand structs), the traced form does not: every
-//! op fits `kind + layer + weight name + two u32 params + operand ranges`,
-//! so [`PieForwardOp`] stays a plain struct and the per-kind meaning of the
-//! params is documented on it.
+//! op fits `kind + layer + weight name + two u32 params + selector +
+//! operand ranges`, so [`PieForwardOp`] stays a plain struct and the
+//! per-kind meaning of the params is documented on it.
 
 use crate::facts::{NormPlacement, QkNorm};
 use crate::trace::{DType, Dim, NormVariant, RopeKind};
@@ -25,12 +25,17 @@ use crate::trace::{DType, Dim, NormVariant, RopeKind};
 /// `PieForwardOp::weight_name` when the op references no weight.
 pub const PIE_FORWARD_NO_NAME: u32 = u32::MAX;
 
+/// `PieForwardOp::selector` when the op selects no per-token weights —
+/// every op except the expert-indexed `Matmul`s of an MoE trace.
+pub const PIE_FORWARD_NO_VALUE: u32 = u32::MAX;
+
 /// `PieForwardOp::layer` for prologue/epilogue ops (embed, final norm,
 /// lm_head). Signed so the resting value cannot collide with a real layer.
 pub const PIE_FORWARD_NO_LAYER: i32 = -1;
 
-/// Inline dim capacity of [`PieForwardValue`]. Every shape the tracer emits
-/// today is rank 2; 4 leaves headroom without an arena run per value.
+/// Inline dim capacity of [`PieForwardValue`]. The tracer emits rank-2
+/// shapes plus the MoE trace's rank-3 route-expanded `[Tokens, k, d]`
+/// values; 4 leaves headroom without an arena run per value.
 pub const PIE_FORWARD_MAX_DIMS: usize = 4;
 
 /// The op vocabulary, as stable wire values.
@@ -55,6 +60,16 @@ pub enum PieForwardOpKind {
     /// per the discipline above — the nine kinds before it keep their
     /// wire values.
     ResidualAdd = 10,
+    /// Router top-k + softmax + renormalize (one launch in the hand-written
+    /// MoE pass). First of the `dyn` kinds — the declared executors do NOT
+    /// consume these; their op-kind switches throw on them via the loud
+    /// default arm, which is the intended v0 behaviour (the grouped-GEMM
+    /// emission is a later, much larger lift).
+    TopK = 11,
+    /// Per-token combine of the k routed expert outputs.
+    WeightedSum = 12,
+    /// `out = base + sigmoid(gate) * x` (shared-expert landing).
+    SigmoidGateAdd = 13,
 }
 
 /// Mirrors [`crate::trace::DType`]; same appended-only discriminant rule as
@@ -349,6 +364,9 @@ pub struct PieForwardIdRange {
 /// | `Swiglu`         | none                 | `inter`                      | —          |
 /// | `LmHead`         | weight               | —                            | —          |
 /// | `ResidualAdd`    | none                 | —                            | —          |
+/// | `TopK`           | none                 | `k`                          | —          |
+/// | `WeightedSum`    | none                 | `k`                          | —          |
+/// | `SigmoidGateAdd` | none                 | —                            | —          |
 ///
 /// `KvAppend`/`Attention` restate the layer their kind addresses even though
 /// `layer` carries the bracketing layer, because the trace states both
@@ -365,6 +383,15 @@ pub struct PieForwardOp {
     pub weight_name: u32,
     pub param0: u32,
     pub param1: u32,
+    /// The per-token selector: for an expert-indexed `Matmul` (whose
+    /// `weight_name` is then a template, `layer.0.expert.{e}.gate_up`) the
+    /// value id of the `TopK` index output that resolves `{e}` per token;
+    /// [`PIE_FORWARD_NO_VALUE`] for every other op. The selector is also
+    /// the op's last input, so a dataflow walk needs no special case; this
+    /// field states which input selects rather than flows. The dyn marker
+    /// crosses the ABI only here and as the producing `TopK` op — a
+    /// per-value flag would duplicate what these two already state.
+    pub selector: u32,
     /// Values consumed, in operand order.
     pub inputs: PieForwardIdRange,
     /// Values produced (`SplitQkv` produces three, `KvAppend` none).
