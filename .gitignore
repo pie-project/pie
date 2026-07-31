@@ -18,5 +18,5 @@ results/jsonschemabench-instances.json
 rust/target/
 
 # the compiled extension, built into the package by `maturin develop`
-src/gpugrammar/_gpugrammar*.so
+src/engrain/_engrain*.so
 build/

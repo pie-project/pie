@@ -1,4 +1,4 @@
-# gpugrammar
+# engrain
 
 Constrained decoding whose parser state lives on the GPU.
 
@@ -12,6 +12,10 @@ graph, and replay then reproduces whatever the host buffer happened to hold.
 This library moves the parser onto the device so that it can be captured. That
 is the claim: not that a mask is built faster, but that the state is somewhere
 a serving engine can reach without returning to the host.
+
+*To engrain* is to work something into the fibre of a material rather than lay
+it on the surface, so that it cannot be taken back out. That is the difference
+this library is named for.
 
 ## Install
 
@@ -28,21 +32,21 @@ to a kernel takes effect without a reinstall:
 maturin develop --release
 ```
 
-The measurement suite and the device verifications are `gpu_lr1`, which is
+The measurement suite and the device verifications are `engrain_lab`, which is
 research code and is not in the wheel; run them from a checkout with
 `PYTHONPATH=src`:
 
 ```bash
-python -m gpu_lr1.verify              # every device check against the matcher
-python -m gpu_lr1.rigor.latency       # the step, against XGrammar and llguidance
+python -m engrain_lab.verify              # every device check against the matcher
+python -m engrain_lab.rigor.latency       # the step, against XGrammar and llguidance
 ```
 
 ## Use
 
 ```python
-import gpugrammar, torch
+import engrain, torch
 
-engine = gpugrammar.Engine(vocabulary)            # bytes per token id
+engine = engrain.Engine(vocabulary)            # bytes per token id
 grammar = engine.compile_json_schema(schema)      # or compile_regex(...)
 
 batch = engine.batch(size=64)
@@ -161,13 +165,13 @@ was tried and reverted, with the reason.
 
 | | |
 |---|---|
-| `src/gpugrammar/` | the public library |
-| `src/gpu_lr1/` | the research tree: kernels, benchmarks, earlier prototypes |
-| `rust/crates/gpugrammar-ir` | front ends — JSON Schema, regex, EBNF |
-| `rust/crates/gpugrammar-lex` | lexer construction and vocabulary grouping |
-| `rust/crates/gpugrammar-lr` | LALR(1) table construction |
-| `rust/crates/gpugrammar-tables` | the compile pipeline and the device artifact |
-| `rust/crates/gpugrammar-run` | the reference matcher the device is checked against |
+| `src/engrain/` | the public library |
+| `src/engrain_lab/` | the research tree: kernels, benchmarks, earlier prototypes |
+| `rust/crates/engrain-ir` | front ends — JSON Schema, regex, EBNF |
+| `rust/crates/engrain-lex` | lexer construction and vocabulary grouping |
+| `rust/crates/engrain-lr` | LALR(1) table construction |
+| `rust/crates/engrain-tables` | the compile pipeline and the device artifact |
+| `rust/crates/engrain-run` | the reference matcher the device is checked against |
 | `third_party/vllm` | a vLLM backend, for end-to-end measurement |
 | `GOAL.md` | the research narrative and every measurement |
 | `docs/prototype-history.md` | the earlier prototype, kept for its record |

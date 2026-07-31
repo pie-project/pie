@@ -14,8 +14,8 @@
     {
       "profile": "real",
       "batch_size": 2048,
-      "gpugrammar_eager_us": 5878.2315,
-      "gpugrammar_ragged_us": 5801.532999999999,
+      "engrain_eager_us": 5878.2315,
+      "engrain_ragged_us": 5801.532999999999,
       "flashinfer_unconstrained_us": 13016.972,
       "xgrammar_gpu_mask_us": 14724.9125,
       "xgrammar_full_path_us": 38969.148,

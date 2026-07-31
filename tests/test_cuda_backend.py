@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import unittest
 
-from gpugrammar import _gpugrammar
+from engrain import _engrain
 
 try:
     import torch
@@ -27,25 +27,25 @@ class TheBuildProducedKernels(unittest.TestCase):
 
     def test_a_fatbin_is_embedded(self):
         self.assertTrue(
-            _gpugrammar.cuda_available(),
+            _engrain.cuda_available(),
             "no CUDA kernels in this build; was nvcc found when it was compiled?",
         )
         # Five architectures of SASS plus PTX. A few hundred bytes would mean
         # an empty or truncated fatbin that still technically exists.
-        self.assertGreater(_gpugrammar.cuda_fatbin_bytes(), 1024)
+        self.assertGreater(_engrain.cuda_fatbin_bytes(), 1024)
 
 
 class AKernelReachesTheDevice(unittest.TestCase):
     def setUp(self):
         if not HAVE_CUDA:
             raise unittest.SkipTest("no CUDA device")
-        if not _gpugrammar.cuda_available():
+        if not _engrain.cuda_available():
             raise unittest.SkipTest("this build has no CUDA kernels")
         self.count = 1024
         self.out = torch.zeros(self.count, dtype=torch.int32, device="cuda")
 
     def _launch(self, name, *scalars):
-        _gpugrammar.cuda_launch(
+        _engrain.cuda_launch(
             name,
             (self.count + 255) // 256,
             256,
@@ -55,7 +55,7 @@ class AKernelReachesTheDevice(unittest.TestCase):
         )
 
     def test_an_eager_launch_computes_what_it_says(self):
-        self._launch("gg_probe_identity", self.count, 7)
+        self._launch("en_probe_identity", self.count, 7)
         torch.cuda.synchronize()
         want = torch.arange(self.count, dtype=torch.int32, device="cuda") + 7
         self.assertTrue(bool((self.out == want).all()))
@@ -66,7 +66,7 @@ class AKernelReachesTheDevice(unittest.TestCase):
         # would be a silent no-op - which looks exactly like a fast engine.
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            self._launch("gg_probe_accumulate", self.count, 1)
+            self._launch("en_probe_accumulate", self.count, 1)
         torch.cuda.synchronize()
         self.assertEqual(int(self.out[0]), 0, "the launch ran during capture")
 
@@ -76,20 +76,20 @@ class AKernelReachesTheDevice(unittest.TestCase):
         self.assertEqual(int(self.out[0]), 5, "the recorded graph did not replay")
 
     def test_the_whole_row_is_written_not_just_the_first(self):
-        self._launch("gg_probe_identity", self.count, 0)
+        self._launch("en_probe_identity", self.count, 0)
         torch.cuda.synchronize()
         self.assertEqual(int(self.out[self.count - 1]), self.count - 1)
 
     def test_a_kernel_that_does_not_exist_is_reported(self):
         with self.assertRaises(RuntimeError):
-            self._launch("gg_no_such_kernel", self.count, 0)
+            self._launch("en_no_such_kernel", self.count, 0)
 
 
 
 class TheDifferentialHarnessCanFail(unittest.TestCase):
     """A comparison that has never failed is a comparison nobody has tested.
 
-    `GPUGRAMMAR_BACKEND=differential` runs both backends on the same input and
+    `ENGRAIN_BACKEND=differential` runs both backends on the same input and
     refuses to continue if they disagree. It is the only check that can catch a
     CUDA-only difference - the verifications compare a backend against the
     reference matcher, which finds a wrong answer but not one both backends
@@ -101,10 +101,10 @@ class TheDifferentialHarnessCanFail(unittest.TestCase):
             raise unittest.SkipTest("no CUDA device")
         import json
 
-        import gpugrammar
+        import engrain
 
         vocabulary = [bytes([i]) for i in range(256)]
-        self.engine = gpugrammar.Engine(vocabulary)
+        self.engine = engrain.Engine(vocabulary)
         self.grammar = self.engine.compile_json_schema(
             json.dumps({
                 "type": "object",
@@ -114,7 +114,7 @@ class TheDifferentialHarnessCanFail(unittest.TestCase):
         )
 
     def _batch_that_disagrees(self, path, field):
-        from gpugrammar import _engine
+        from engrain import _engine
 
         batch = self.engine.batch(size=4)
         batch.set_grammars([self.grammar] * 4)
@@ -144,7 +144,7 @@ class TheDifferentialHarnessCanFail(unittest.TestCase):
         self.assertIn("lexer_state", str(caught.exception))
 
     def test_agreeing_backends_do_not_raise(self):
-        from gpugrammar import _engine
+        from engrain import _engine
 
         batch = self.engine.batch(size=4)
         batch.set_grammars([self.grammar] * 4)
@@ -159,7 +159,7 @@ class TheDifferentialHarnessCanFail(unittest.TestCase):
         batch.fill_mask()
 
     def test_differential_refuses_to_be_captured(self):
-        from gpugrammar import _engine
+        from engrain import _engine
 
         batch = self.engine.batch(size=4)
         batch.set_grammars([self.grammar] * 4)
@@ -174,24 +174,24 @@ class TheBackendIsSelectable(unittest.TestCase):
     def test_only_the_three_names_are_accepted(self):
         import os
 
-        from gpugrammar import _engine
+        from engrain import _engine
 
-        held = os.environ.get("GPUGRAMMAR_BACKEND")
+        held = os.environ.get("ENGRAIN_BACKEND")
         try:
             for name in ("triton", "cuda", "differential"):
-                os.environ["GPUGRAMMAR_BACKEND"] = name
+                os.environ["ENGRAIN_BACKEND"] = name
                 self.assertEqual(_engine._chosen_backend(), name)
-            os.environ["GPUGRAMMAR_BACKEND"] = "cudaa"
+            os.environ["ENGRAIN_BACKEND"] = "cudaa"
             with self.assertRaises(ValueError):
                 _engine._chosen_backend()
         finally:
             if held is None:
-                os.environ.pop("GPUGRAMMAR_BACKEND", None)
+                os.environ.pop("ENGRAIN_BACKEND", None)
             else:
-                os.environ["GPUGRAMMAR_BACKEND"] = held
+                os.environ["ENGRAIN_BACKEND"] = held
 
     def test_what_is_ported_is_reported(self):
-        from gpugrammar import _engine
+        from engrain import _engine
 
         # Empty while the port is starting. This exists so that a claim about
         # which paths are CUDA is checkable rather than a comment.
@@ -202,7 +202,7 @@ class TheBackendIsSelectable(unittest.TestCase):
 class TheArenaStructDescribesThePool(unittest.TestCase):
     """Twenty-six pointers, packed by Python, read by a kernel.
 
-    Every later kernel takes `const gg::Arena*` instead of twenty-six
+    Every later kernel takes `const en::Arena*` instead of twenty-six
     arguments, which is the fix for the thing the Triton launches do worst -
     246 argument slots across eleven launches, all of them `int32*`, none of
     them checkable. The cost of that fix is this: if Python packs the fields in
@@ -214,13 +214,13 @@ class TheArenaStructDescribesThePool(unittest.TestCase):
     SLOTS = 10
 
     def setUp(self):
-        if not HAVE_CUDA or not _gpugrammar.cuda_available():
+        if not HAVE_CUDA or not _engrain.cuda_available():
             raise unittest.SkipTest("no CUDA device or no kernels in this build")
         import json
 
-        import gpugrammar
+        import engrain
 
-        self.engine = gpugrammar.Engine([bytes([i]) for i in range(256)])
+        self.engine = engrain.Engine([bytes([i]) for i in range(256)])
         # Three different shapes, so a base that happened to be zero for one
         # grammar cannot hide a wrong field.
         self.grammars = [
@@ -243,8 +243,8 @@ class TheArenaStructDescribesThePool(unittest.TestCase):
             [self.engine.admit(self.grammars[i % 3]) for i in range(sequences)]
         )
         out = torch.zeros(sequences * self.SLOTS, dtype=torch.int32, device="cuda")
-        _gpugrammar.cuda_launch(
-            "gg_arena_readback",
+        _engrain.cuda_launch(
+            "en_arena_readback",
             (sequences + 31) // 32,
             32,
             torch.cuda.current_stream().cuda_stream,
@@ -323,7 +323,7 @@ class TheArenaStructDescribesThePool(unittest.TestCase):
 
 
 class TheCudaLocateAgreesWithTriton(unittest.TestCase):
-    """`gg_locate` against `_locate_kernel`, entry for entry.
+    """`en_locate` against `_locate_kernel`, entry for entry.
 
     The first ported kernel that does real work: arena lookups through a
     grammar's bases and CSR traversal, but not the reduction chain, which is
@@ -333,13 +333,13 @@ class TheCudaLocateAgreesWithTriton(unittest.TestCase):
     """
 
     def setUp(self):
-        if not HAVE_CUDA or not _gpugrammar.cuda_available():
+        if not HAVE_CUDA or not _engrain.cuda_available():
             raise unittest.SkipTest("no CUDA device or no kernels in this build")
         import json
 
-        import gpugrammar
+        import engrain
 
-        self.engine = gpugrammar.Engine([bytes([i]) for i in range(256)])
+        self.engine = engrain.Engine([bytes([i]) for i in range(256)])
         self.grammars = [
             self.engine.compile_json_schema(json.dumps(schema))
             for schema in (
@@ -354,7 +354,7 @@ class TheCudaLocateAgreesWithTriton(unittest.TestCase):
         ]
 
     def _both(self, sequences, token_seed):
-        from gpugrammar import _engine
+        from engrain import _engine
 
         batch = self.engine.batch(size=sequences)
         batch.set_grammars([self.grammars[i % 3] for i in range(sequences)])
@@ -413,7 +413,7 @@ class TheCudaLocateAgreesWithTriton(unittest.TestCase):
             self.assertTrue(bool(torch.equal(getattr(raw, name), expected)), name)
 
     def test_a_token_no_group_holds_is_reported_as_no_group(self):
-        from gpugrammar import _engine
+        from engrain import _engine
 
         batch = self.engine.batch(size=4)
         batch.set_grammars([self.grammars[0]] * 4)
@@ -434,7 +434,7 @@ class TheCudaLocateAgreesWithTriton(unittest.TestCase):
 
 
 class TheCudaCommitAgreesWithTriton(unittest.TestCase):
-    """`gg_commit` against `_commit_kernel`, on candidates a real advance made.
+    """`en_commit` against `_commit_kernel`, on candidates a real advance made.
 
     The collection is serial on purpose: the reference matcher deduplicates in
     a particular order and stops at its ceiling, so a parallel collection
@@ -444,13 +444,13 @@ class TheCudaCommitAgreesWithTriton(unittest.TestCase):
     """
 
     def setUp(self):
-        if not HAVE_CUDA or not _gpugrammar.cuda_available():
+        if not HAVE_CUDA or not _engrain.cuda_available():
             raise unittest.SkipTest("no CUDA device or no kernels in this build")
         import json
 
-        import gpugrammar
+        import engrain
 
-        self.engine = gpugrammar.Engine([bytes([i]) for i in range(256)])
+        self.engine = engrain.Engine([bytes([i]) for i in range(256)])
         self.grammars = [
             self.engine.compile_json_schema(json.dumps(schema))
             for schema in (
@@ -532,7 +532,7 @@ class TheCudaCommitAgreesWithTriton(unittest.TestCase):
 
 
 class TheCudaCandidateAgreesWithTriton(unittest.TestCase):
-    """`gg_candidate` against `_candidate_kernel`.
+    """`en_candidate` against `_candidate_kernel`.
 
     The largest kernel of the port and the one it is for: a thread replays a
     configuration rather than a block, which is the 3.42x lever, and the
@@ -546,13 +546,13 @@ class TheCudaCandidateAgreesWithTriton(unittest.TestCase):
     """
 
     def setUp(self):
-        if not HAVE_CUDA or not _gpugrammar.cuda_available():
+        if not HAVE_CUDA or not _engrain.cuda_available():
             raise unittest.SkipTest("no CUDA device or no kernels in this build")
         import json
 
-        import gpugrammar
+        import engrain
 
-        self.engine = gpugrammar.Engine([bytes([i]) for i in range(256)])
+        self.engine = engrain.Engine([bytes([i]) for i in range(256)])
         self.grammars = [
             self.engine.compile_json_schema(json.dumps(schema))
             for schema in (
@@ -678,7 +678,7 @@ class TheCudaCandidateAgreesWithTriton(unittest.TestCase):
 
 
 class TheCudaMaskSweepAgreesWithTriton(unittest.TestCase):
-    """`gg_mask` against `_mask_kernel`, over real parse states.
+    """`en_mask` against `_mask_kernel`, over real parse states.
 
     The sweep is the other caller of `replay_chain`, so with the candidate
     already ported this kernel is mostly the group enumeration and the verdict
@@ -688,13 +688,13 @@ class TheCudaMaskSweepAgreesWithTriton(unittest.TestCase):
     """
 
     def setUp(self):
-        if not HAVE_CUDA or not _gpugrammar.cuda_available():
+        if not HAVE_CUDA or not _engrain.cuda_available():
             raise unittest.SkipTest("no CUDA device or no kernels in this build")
         import json
 
-        import gpugrammar
+        import engrain
 
-        self.engine = gpugrammar.Engine([bytes([i]) for i in range(256)])
+        self.engine = engrain.Engine([bytes([i]) for i in range(256)])
         self.grammars = [
             self.engine.compile_json_schema(json.dumps(schema))
             for schema in (

@@ -7,7 +7,7 @@ magnitude are all of the form "compute less, differently", and each one is a
 chance to compute less than the grammar allows - which does not crash, it
 quietly forbids a legal token. So this checks bits, not shapes.
 
-Skipped where there is no GPU, no Triton, or no compiled `gpugrammar`, since the
+Skipped where there is no GPU, no Triton, or no compiled `engrain`, since the
 rest of the suite runs without them.
 """
 
@@ -26,11 +26,11 @@ except Exception:  # noqa: BLE001
     HAS_CUDA = False
 
 try:
-    import gpugrammar
+    import engrain
 
-    HAS_GPUGRAMMAR = True
+    HAS_ENGRAIN = True
 except Exception:  # noqa: BLE001
-    HAS_GPUGRAMMAR = False
+    HAS_ENGRAIN = False
 
 INSTANCES = Path(__file__).resolve().parents[1] / "results" / "jsonschemabench-instances.json"
 
@@ -50,8 +50,8 @@ VOCABULARY = [
 def _requirements():
     if not HAS_CUDA:
         raise unittest.SkipTest("no CUDA device")
-    if not HAS_GPUGRAMMAR:
-        raise unittest.SkipTest("gpugrammar is not built")
+    if not HAS_ENGRAIN:
+        raise unittest.SkipTest("engrain is not built")
 
 
 
@@ -59,7 +59,7 @@ def _requirements():
 # can be recorded into a graph. Tests whose subject *is* the recording have
 # nothing to say in that mode.
 NEEDS_CAPTURE = unittest.skipIf(
-    os.environ.get("GPUGRAMMAR_BACKEND", "").strip().lower() == "differential",
+    os.environ.get("ENGRAIN_BACKEND", "").strip().lower() == "differential",
     "differential mode compares on the host and cannot capture",
 )
 
@@ -68,10 +68,10 @@ class DeviceParserAgreement(unittest.TestCase):
 
     def setUp(self):
         _requirements()
-        from gpugrammar._engine import DeviceGrammar
+        from engrain._engine import DeviceGrammar
 
         self.DeviceGrammar = DeviceGrammar
-        self.compiler = gpugrammar.Compiler(VOCABULARY)
+        self.compiler = engrain.Compiler(VOCABULARY)
 
     def _walk(self, schema, document: bytes):
         """Feed `document` a token at a time, checking the mask at every step."""
@@ -213,10 +213,10 @@ class MixedGrammarBatch(unittest.TestCase):
 
     def setUp(self):
         _requirements()
-        from gpugrammar._engine import DeviceGrammar
+        from engrain._engine import DeviceGrammar
 
         self.DeviceGrammar = DeviceGrammar
-        self.compiler = gpugrammar.Compiler(VOCABULARY)
+        self.compiler = engrain.Compiler(VOCABULARY)
         self.schemas = [
             {"type": "object", "properties": {"a": {"type": "integer"}}, "required": ["a"]},
             {"type": "array", "items": {"type": "integer"}},
@@ -313,10 +313,10 @@ class RandomWalkAgreement(unittest.TestCase):
 
     def setUp(self):
         _requirements()
-        from gpugrammar._engine import DeviceGrammar
+        from engrain._engine import DeviceGrammar
 
         self.DeviceGrammar = DeviceGrammar
-        self.compiler = gpugrammar.Compiler(VOCABULARY)
+        self.compiler = engrain.Compiler(VOCABULARY)
 
     def _walk(self, schema, walks=8, length=25):
         import random
@@ -399,10 +399,10 @@ class Rollback(unittest.TestCase):
 
     def setUp(self):
         _requirements()
-        from gpugrammar._engine import DeviceGrammar
+        from engrain._engine import DeviceGrammar
 
         self.DeviceGrammar = DeviceGrammar
-        self.compiler = gpugrammar.Compiler(VOCABULARY)
+        self.compiler = engrain.Compiler(VOCABULARY)
         self.schema = {
             "type": "object",
             "properties": {"name": {"type": "string"}, "id": {"type": "integer"}},
@@ -548,10 +548,10 @@ class GrammarPool(unittest.TestCase):
 
     def setUp(self):
         _requirements()
-        from gpugrammar._engine import DeviceGrammar
+        from engrain._engine import DeviceGrammar
 
         self.DeviceGrammar = DeviceGrammar
-        self.compiler = gpugrammar.Compiler(VOCABULARY)
+        self.compiler = engrain.Compiler(VOCABULARY)
         self.schemas = [
             {"type": "object", "properties": {"a": {"type": "integer"}}, "required": ["a"]},
             {"type": "array", "items": {"type": "integer"}},
@@ -666,9 +666,9 @@ class DraftWalk(unittest.TestCase):
 
     def setUp(self):
         _requirements()
-        from gpugrammar._engine import DeviceGrammar
+        from engrain._engine import DeviceGrammar
 
-        self.compiler = gpugrammar.Compiler(VOCABULARY)
+        self.compiler = engrain.Compiler(VOCABULARY)
         self.compiled = self.compiler.compile_json_schema(
             json.dumps(
                 {
@@ -753,10 +753,10 @@ class PrecomputedVerdicts(unittest.TestCase):
 
     def setUp(self):
         _requirements()
-        from gpugrammar._engine import DeviceGrammar
+        from engrain._engine import DeviceGrammar
 
         self.DeviceGrammar = DeviceGrammar
-        self.compiler = gpugrammar.Compiler(VOCABULARY)
+        self.compiler = engrain.Compiler(VOCABULARY)
 
     def _compiled(self, schema):
         return self.compiler.compile_json_schema(json.dumps(schema))
@@ -816,10 +816,10 @@ class ArenaPaging(unittest.TestCase):
 
     def setUp(self):
         _requirements()
-        from gpugrammar._engine import DeviceGrammar
+        from engrain._engine import DeviceGrammar
 
         self.DeviceGrammar = DeviceGrammar
-        self.compiler = gpugrammar.Compiler(VOCABULARY)
+        self.compiler = engrain.Compiler(VOCABULARY)
 
     def _schema(self, index):
         # Distinguishable, and different enough in size that a hole left by one
@@ -960,14 +960,14 @@ class CorpusAgreement(unittest.TestCase):
             raise unittest.SkipTest("the JSONSchemaBench corpus is not in results/")
 
     def test_first_schemas_agree_byte_by_byte(self):
-        from gpugrammar._engine import DeviceGrammar
+        from engrain._engine import DeviceGrammar
 
         instances = json.loads(INSTANCES.read_text())["instances"]
         # Bytes rather than a tokenizer: the corpus check that uses the real
         # vocabulary lives in the benchmark, and a unit test should not download
         # a model.
         vocabulary = [bytes([value]) for value in range(256)]
-        compiler = gpugrammar.Compiler(vocabulary)
+        compiler = engrain.Compiler(vocabulary)
         checked = 0
         for instance in instances[:3]:
             compiled = compiler.compile_json_schema(instance["schema"])
@@ -1008,9 +1008,9 @@ class FusedStep(unittest.TestCase):
     def test_a_fused_step_masks_what_the_two_graphs_mask(self):
         import torch
 
-        from gpugrammar._engine import DeviceGrammar, DeviceBatch
+        from engrain._engine import DeviceGrammar, DeviceBatch
 
-        compiler = gpugrammar.Compiler([bytes([b]) for b in range(256)])
+        compiler = engrain.Compiler([bytes([b]) for b in range(256)])
         grammar = compiler.compile_json_schema(
             json.dumps(
                 {
@@ -1064,7 +1064,7 @@ class SizedForTheMachine(unittest.TestCase):
     def test_the_grid_follows_the_batch_and_stays_inside_the_machine(self):
         import torch
 
-        from gpugrammar._engine import _MIN_SWEEP_BLOCKS, _sweep_blocks
+        from engrain._engine import _MIN_SWEEP_BLOCKS, _sweep_blocks
 
         device = torch.cuda.get_device_properties(torch.cuda.current_device())
         ceiling = 1 << max(device.multi_processor_count * 64 - 1, 1).bit_length()
@@ -1078,7 +1078,7 @@ class SizedForTheMachine(unittest.TestCase):
         self.assertGreater(widths[-1], widths[0], "and not the same number for all")
 
     def test_the_memo_is_sized_by_what_an_entry_costs(self):
-        from gpugrammar._engine import _MEMO_SLOTS, _memo_slots
+        from engrain._engine import _MEMO_SLOTS, _memo_slots
 
         # A larger entry buys fewer of them, and neither end runs away.
         self.assertGreaterEqual(_memo_slots(1 << 10), _memo_slots(1 << 20))
@@ -1086,9 +1086,9 @@ class SizedForTheMachine(unittest.TestCase):
         self.assertGreaterEqual(_memo_slots(1 << 30), 32)
 
     def test_a_narrow_grammar_is_not_charged_for_a_wide_one(self):
-        from gpugrammar._engine import DeviceBatch, DeviceGrammar
+        from engrain._engine import DeviceBatch, DeviceGrammar
 
-        compiler = gpugrammar.Compiler([bytes([b]) for b in range(256)])
+        compiler = engrain.Compiler([bytes([b]) for b in range(256)])
         grammar = compiler.compile_json_schema(
             json.dumps({"type": "object", "properties": {"a": {"type": "integer"}}})
         )

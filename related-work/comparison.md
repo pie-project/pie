@@ -1,7 +1,7 @@
 # Architecture comparison
 
 This document compares the online execution boundary of the systems most
-relevant to gpu-lr1. "GPU apply" means that a precomputed mask is consumed by a
+relevant to engrain. "GPU apply" means that a precomputed mask is consumed by a
 GPU kernel; it does not imply that the parser or automaton executes on GPU.
 
 ## Core system matrix
@@ -17,9 +17,9 @@ GPU kernel; it does not imply that the parser or automaton executes on GPU.
 | PSC | Parser-stack classifier | All token acceptance conditions merged during preprocessing | Parser stack | **Not stated publicly** | Not stated publicly | Likely parser-dependent; not stated | Not stated | Abstract only |
 | GRID | LALR(1) SQL | Byte-token trie + lexer/parser configuration | Lexer state + LALR stack | **CPU Rust** | vLLM-style mask application/model inference | LALR(1) | CPU request states | Preprint; no public code found |
 | Gram2Token | Deterministic byte grammar -> token categories | Token trie groups equal transition outcomes | Preprocessed grammar state | **GPU claimed** | Category lookup, mask, state update | Not fully specified in public abstract | Schema-diverse continuous batching | Abstract; declared repo unavailable |
-| gpu-lr1 DFA | Canonical acyclic JSON Schema -> byte DFA | Explicit DFA/tokenizer cross-product | Flat global DFA state ID | **GPU Triton** | CSR/bitset selection and next-state write | No | One global state namespace across schemas | Public prototype |
-| gpu-lr1 LR(1) | Canonical LR(1) ACTION/GOTO tables | Already-segmented grammar terminals; no LLM-token bridge yet | Bounded ragged LR state stacks | **GPU Triton** | Sparse terminal selection plus reduce/goto/shift closure | Yes, at terminal level | Global state/production IDs plus per-sequence ragged stacks | Public prototype |
-| gpu-lr1 bounded tokens | Bounded canonical LR(1) configurations | Token terminal trie; real bytes for byte-terminal grammars | Full LR stacks encoded as finite configuration IDs | Offline CPU expansion; **GPU runtime** | CSR token selection plus next-configuration write | Yes up to configured depth | Global configuration IDs across grammars | Public prototype |
+| engrain DFA | Canonical acyclic JSON Schema -> byte DFA | Explicit DFA/tokenizer cross-product | Flat global DFA state ID | **GPU Triton** | CSR/bitset selection and next-state write | No | One global state namespace across schemas | Public prototype |
+| engrain LR(1) | Canonical LR(1) ACTION/GOTO tables | Already-segmented grammar terminals; no LLM-token bridge yet | Bounded ragged LR state stacks | **GPU Triton** | Sparse terminal selection plus reduce/goto/shift closure | Yes, at terminal level | Global state/production IDs plus per-sequence ragged stacks | Public prototype |
+| engrain bounded tokens | Bounded canonical LR(1) configurations | Token terminal trie; real bytes for byte-terminal grammars | Full LR stacks encoded as finite configuration IDs | Offline CPU expansion; **GPU runtime** | CSR token selection plus next-configuration write | Yes up to configured depth | Global configuration IDs across grammars | Public prototype |
 
 ## Device-placement evidence
 
@@ -49,7 +49,7 @@ backend is supplied.
 
 Gram2Token's conference abstract explicitly places token-category lookup,
 masking, and grammar-state update on GPU. This is the closest public claim to
-gpu-lr1. The representation and coverage cannot yet be audited in detail
+engrain. The representation and coverage cannot yet be audited in detail
 because the full implementation was not publicly reachable at the survey
 snapshot.
 
@@ -74,7 +74,7 @@ high-batch sampling.
 
 ### 2. State-to-token indexes
 
-Examples: Outlines, SynCode, the regular subset of gpu-lr1, and gpu-lr1's
+Examples: Outlines, SynCode, the regular subset of engrain, and engrain's
 bounded LR configuration expansion.
 
 Expensive tokenizer/grammar alignment is compiled ahead of inference. Online
@@ -106,7 +106,7 @@ become a throughput bottleneck when:
 Examples: Pre3 and PSC.
 
 These systems attempt to summarize enough stack context during preprocessing
-that online parsing is deterministic or classifier-like. gpu-lr1 now provides a
+that online parsing is deterministic or classifier-like. engrain now provides a
 baseline GPU implementation of ordinary canonical LR(1) ACTION/GOTO execution
 over terminal IDs. Pre3 and PSC remain the most important route to avoiding
 per-token parser work when real tokenizer tokens span multiple grammar
@@ -115,7 +115,7 @@ tokenizer alignment, rollback, and mixed-grammar token masking.
 
 ### 5. GPU-resident grammar state
 
-Examples: Gram2Token by abstract claim and both gpu-lr1 backends by public
+Examples: Gram2Token by abstract claim and both engrain backends by public
 prototype.
 
 The goal is to keep the active grammar state in device tensors and fuse:
@@ -131,7 +131,7 @@ finite state space.
 
 ## Closest comparisons
 
-### gpu-lr1 versus Gram2Token
+### engrain versus Gram2Token
 
 Shared high-level ideas:
 
@@ -140,7 +140,7 @@ Shared high-level ideas:
 - target schema-diverse continuous batching;
 - trade higher preprocessing/TTFT for lower online overhead.
 
-Publicly demonstrated gpu-lr1 details not available in the Gram2Token abstract:
+Publicly demonstrated engrain details not available in the Gram2Token abstract:
 
 - flat relocation of all schema-local states into one global namespace;
 - CSR `(allowed_token, next_state)` rows;
@@ -160,7 +160,7 @@ Potential Gram2Token differences that remain unknown:
 - sampling semantics beyond the reported runtime pipeline;
 - rollback, fork, and speculative tree support.
 
-### gpu-lr1 versus Pre3 and PSC
+### engrain versus Pre3 and PSC
 
 Pre3 and PSC address the hard tokenizer-level form of stack-dependent recursive
 parsing.
@@ -169,21 +169,21 @@ parsing.
   edges.
 - PSC compiles the acceptance conditions of all vocabulary tokens into one
   parser-stack classifier.
-- gpu-lr1's DFA backend eliminates the stack for acyclic canonical JSON.
-- gpu-lr1's direct LR backend executes the stack after input has been segmented
+- engrain's DFA backend eliminates the stack for acyclic canonical JSON.
+- engrain's direct LR backend executes the stack after input has been segmented
   into grammar terminals.
-- gpu-lr1's bounded token backend handles multi-terminal tokenizer tokens by
+- engrain's bounded token backend handles multi-terminal tokenizer tokens by
   enumerating full stack configurations, which is exact within a depth bound but
   can grow exponentially.
 
-A tokenizer-aware recursive gpu-lr1 backend should therefore be framed as a GPU
+A tokenizer-aware recursive engrain backend should therefore be framed as a GPU
 table/kernel realization of stack-aware prior art, not as a new discovery that
 LR reductions depend on the exposed stack state.
 
-### gpu-lr1 versus XGrammar and llguidance
+### engrain versus XGrammar and llguidance
 
 XGrammar and llguidance have broader grammar and JSON Schema support, mature
-error handling, and serving integrations. gpu-lr1's measured advantage is in a
+error handling, and serving integrations. engrain's measured advantage is in a
 narrower execution regime:
 
 - grammar tables are already compiled and resident;
@@ -205,22 +205,22 @@ The repository now includes a controlled Qwen3 comparison with XGrammar:
 - a stronger-than-native XGrammar baseline using fused bitset argmax and a
   captured pinned-H2D-copy CUDA Graph.
 
-Under that isolated constraint-step boundary, gpu-lr1's graphed path is 2.0x
+Under that isolated constraint-step boundary, engrain's graphed path is 2.0x
 faster at batch 1 and 863.5x at batch 2,048 than the optimistic XGrammar path.
 Including XGrammar token acceptance and rollback changes the range to 3.9x
-through 1,468.9x. The non-graphed gpu-lr1 plan is slower at batch 1 and wins
+through 1,468.9x. The non-graphed engrain plan is slower at batch 1 and wins
 from batch 8 onward.
 
-The trade-off reverses at compilation: gpu-lr1 takes 0.856 s versus 0.0032 s for
+The trade-off reverses at compilation: engrain takes 0.856 s versus 0.0032 s for
 XGrammar and uses about 292 KiB of runtime tables versus about 52 KiB of
 XGrammar compiler cache. Model execution is excluded, and XGrammar can overlap
 CPU matching with the model, so these numbers are not end-to-end TPOT speedups.
 
 ## Defensible claims
 
-- gpu-lr1 demonstrates that a useful acyclic JSON Schema subset can execute
+- engrain demonstrates that a useful acyclic JSON Schema subset can execute
   without a per-token CPU grammar dependency.
-- gpu-lr1 also demonstrates sparse canonical LR(1) ACTION/GOTO execution,
+- engrain also demonstrates sparse canonical LR(1) ACTION/GOTO execution,
   heterogeneous global table relocation, and ragged bounded stacks on GPU over a
   terminal stream.
 - Flat global state IDs avoid schema padding and device pointer chasing in a
@@ -234,9 +234,9 @@ CPU matching with the model, so these numbers are not end-to-end TPOT speedups.
 
 ## Claims to avoid
 
-- "gpu-lr1 is the first GPU-native grammar-constrained decoder."
+- "engrain is the first GPU-native grammar-constrained decoder."
   Gram2Token is direct prior art at the claim level.
-- "gpu-lr1 provides unbounded, general-lexer LR(1) constrained decoding."
+- "engrain provides unbounded, general-lexer LR(1) constrained decoding."
   Tokenizer bytes are currently supported for byte-terminal grammars, or through
   explicit terminal sequences, and bounded configuration expansion can time out
   on branching grammars.

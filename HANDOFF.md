@@ -1,6 +1,6 @@
 # Handoff
 
-Where gpugrammar stands, what is proven, and what is known to be broken.
+Where engrain stands, what is proven, and what is known to be broken.
 Written to be read by someone picking this up cold. `GOAL.md` holds the
 project's direction and the reasoning behind the design; this file holds the
 current state.
@@ -13,19 +13,19 @@ lexer, and the vocabulary grouped by what each token does to the lexer.
 
 | crate | what it does |
 | --- | --- |
-| `gpugrammar-ir` | Front end, vendored from pie-grammar: EBNF, JSON Schema, regex, FSMs |
-| `gpugrammar-lex` | Regularity analysis, terminal extraction, lexer determinisation, vocabulary grouping |
-| `gpugrammar-lr` | EBNF-to-BNF flattening, LALR(1) construction, a reference parser |
-| `gpugrammar-tables` | Artifact emission; the `compile`, `coverage` and `explain` binaries |
-| `gpugrammar-run` | Reference matcher over the artifact; the `validate` and `trace` binaries |
-| `gpugrammar-py` | PyO3 bindings |
+| `engrain-ir` | Front end, vendored from pie-grammar: EBNF, JSON Schema, regex, FSMs |
+| `engrain-lex` | Regularity analysis, terminal extraction, lexer determinisation, vocabulary grouping |
+| `engrain-lr` | EBNF-to-BNF flattening, LALR(1) construction, a reference parser |
+| `engrain-tables` | Artifact emission; the `compile`, `coverage` and `explain` binaries |
+| `engrain-run` | Reference matcher over the artifact; the `validate` and `trace` binaries |
+| `engrain-py` | PyO3 bindings |
 
 **A vLLM fork** at `third_party/vllm`, submodule of `ingim/vllm` branch
-`gpugrammar`, branched from upstream `910cc8543`. It registers `gpugrammar` as a
+`engrain`, branched from upstream `910cc8543`. It registers `engrain` as a
 first-class structured-output backend. Run vLLM from there, not from a
 site-packages install.
 
-**A GPU sampler** (`src/gpu_lr1/ragged_sampler.py`, `wide_sampler.py`) that
+**A GPU sampler** (`src/engrain_lab/ragged_sampler.py`, `wide_sampler.py`) that
 fuses masking into sampling. **It is not yet wired to the compiler.** The
 measured GPU wins live here and are not in the serving path.
 
@@ -36,7 +36,7 @@ subprocess and nothing monkeypatched:
 
 ```
 xgrammar    64/64 valid | 1182 tokens in 0.64s = 1858 tok/s
-gpugrammar  64/64 valid | 1222 tokens in 0.88s = 1392 tok/s
+engrain  64/64 valid | 1222 tokens in 0.88s = 1392 tok/s
 ```
 
 The grammar is exact on a small schema: correct documents are accepted, and
@@ -92,7 +92,7 @@ compile the schema, feed the instance one byte at a time. Reproduce a single
 case with:
 
 ```
-cargo run --release --bin gpugrammar-trace -- results/jsonschemabench-instances.json <index>
+cargo run --release --bin engrain-trace -- results/jsonschemabench-instances.json <index>
 ```
 
 It prints, per byte, the lexer state, the terminals the scan emitted, the
@@ -101,7 +101,7 @@ That tool found every bug listed below and is the right place to start.
 
 **2. Coverage went down while correctness went up.** LALR(1) tables: 461 → 434.
 Each correctness fix changed the lexicon, and a coarser lexicon means more
-reduce/reduce conflicts. The conflicts are real and unexamined. `gpugrammar-explain`
+reduce/reduce conflicts. The conflicts are real and unexamined. `engrain-explain`
 dumps the terminals and productions for one schema.
 
 **3. Length bounds explode whatever holds them.** A DFA can only hold a counter by
@@ -181,21 +181,21 @@ cd rust && cargo test --release
 # Coverage over real schemas
 python -c "import json; d=json.load(open('results/jsonschemabench-instances.json')); \
   json.dump([i['schema'] for i in d['instances']], open('/tmp/schemas.json','w'))"
-cargo run --release --bin gpugrammar-coverage -- /tmp/schemas.json 0
+cargo run --release --bin engrain-coverage -- /tmp/schemas.json 0
 
 # Byte-level acceptance against model-generated documents
-GPUGRAMMAR_MAX_LEXER_STATES=4000 \
-  cargo run --release --bin gpugrammar-validate -- results/jsonschemabench-instances.json 5
+ENGRAIN_MAX_LEXER_STATES=4000 \
+  cargo run --release --bin engrain-validate -- results/jsonschemabench-instances.json 5
 
 # Why one document was rejected
-cargo run --release --bin gpugrammar-trace -- results/jsonschemabench-instances.json 2
+cargo run --release --bin engrain-trace -- results/jsonschemabench-instances.json 2
 
 # Python
 python -m unittest discover -s tests
 
 # vLLM, from the submodule
 PATH="$PWD/.venv/bin:$PATH" FLASHINFER_DISABLE_VERSION_CHECK=1 \
-  python src/gpu_lr1/vllm_smoke.py --backend gpugrammar --prompts 64
+  python src/engrain_lab/vllm_smoke.py --backend engrain --prompts 64
 ```
 
 ## Environment

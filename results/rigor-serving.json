@@ -10,7 +10,7 @@
         "rows": [
           {
             "workers": 0,
-            "gpugrammar": {
+            "engrain": {
               "count": 50,
               "p50": 88.79601955413818,
               "p90": 90.43910540640354,
@@ -31,7 +31,7 @@
           },
           {
             "workers": 8,
-            "gpugrammar": {
+            "engrain": {
               "count": 50,
               "p50": 89.24701251089573,
               "p90": 96.4500941336155,
@@ -52,7 +52,7 @@
           },
           {
             "workers": 16,
-            "gpugrammar": {
+            "engrain": {
               "count": 50,
               "p50": 89.71802890300751,
               "p90": 98.40400889515877,
@@ -73,7 +73,7 @@
           },
           {
             "workers": 24,
-            "gpugrammar": {
+            "engrain": {
               "count": 50,
               "p50": 89.24701251089573,
               "p90": 105.6380569934845,
@@ -98,9 +98,9 @@
     },
     {
       "question_id": "q22-capture",
-      "headline": "decode-step CUDA graph can contain the fill: gpugrammar yes, xgrammar no",
+      "headline": "decode-step CUDA graph can contain the fill: engrain yes, xgrammar no",
       "detail": {
-        "gpugrammar": {
+        "engrain": {
           "captured": true,
           "why": ""
         },

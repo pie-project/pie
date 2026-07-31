@@ -1,8 +1,8 @@
 """The public API, exercised the way the documentation says to use it.
 
-Everything else in this suite tests the engine through `gpugrammar._engine`,
-which is the research entry point. These tests go through `gpugrammar.Engine`
-and `gpugrammar.Batch` instead, because that is what an artifact reviewer will
+Everything else in this suite tests the engine through `engrain._engine`,
+which is the research entry point. These tests go through `engrain.Engine`
+and `engrain.Batch` instead, because that is what an artifact reviewer will
 type and what a serving integration will call, and an API that is only ever
 exercised by its own internals is not an API.
 """
@@ -13,7 +13,7 @@ import json
 import os
 import unittest
 
-import gpugrammar
+import engrain
 
 try:
     import torch
@@ -49,14 +49,14 @@ def _requirements():
 # can be recorded into a graph. Tests whose subject *is* the recording have
 # nothing to say in that mode.
 NEEDS_CAPTURE = unittest.skipIf(
-    os.environ.get("GPUGRAMMAR_BACKEND", "").strip().lower() == "differential",
+    os.environ.get("ENGRAIN_BACKEND", "").strip().lower() == "differential",
     "differential mode compares on the host and cannot capture",
 )
 
 class PublicApi(unittest.TestCase):
     def setUp(self):
         _requirements()
-        self.engine = gpugrammar.Engine(VOCABULARY)
+        self.engine = engrain.Engine(VOCABULARY)
 
     def test_the_shortest_useful_program(self):
         """The example in the module docstring has to actually run."""
@@ -95,7 +95,7 @@ class PublicApi(unittest.TestCase):
 
     def test_a_regex_is_a_grammar_too(self):
         """Not only JSON - the same interface takes a pattern."""
-        engine = gpugrammar.Engine([bytes([b]) for b in range(256)])
+        engine = engrain.Engine([bytes([b]) for b in range(256)])
         grammar = engine.compile_regex(r"[0-9]{2}-[0-9]{2}")
         batch = engine.batch(1)
         batch.set_grammars([grammar])
@@ -149,7 +149,7 @@ class PublicApi(unittest.TestCase):
                                                             "^a{0,70000}$": {}}}))
         # The stage is the answer to what a caller should do next: a budget can
         # be raised and retried, a lowering failure cannot.
-        self.assertIsInstance(refusal.exception, gpugrammar.CompileError)
+        self.assertIsInstance(refusal.exception, engrain.CompileError)
         self.assertIn(refusal.exception.stage,
                       {"lowering", "lexer", "productions", "conflict", "emit"})
 
@@ -157,7 +157,7 @@ class PublicApi(unittest.TestCase):
         # A regex is the one grammar a request hands over directly, and its
         # DFA is exponential in the worst case. This path used to build it
         # unbounded, which spends the server's memory instead of refusing.
-        with self.assertRaises(gpugrammar.CompileError) as refusal:
+        with self.assertRaises(engrain.CompileError) as refusal:
             self.engine.compile_regex("(a|b)*a" + "(a|b)" * 24)
         self.assertEqual(refusal.exception.stage, "lexer")
 
@@ -173,7 +173,7 @@ class Approximations(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.engine = gpugrammar.Engine([bytes([b]) for b in range(256)])
+        cls.engine = engrain.Engine([bytes([b]) for b in range(256)])
 
     def accepts(self, grammar, text: str) -> bool:
         matcher = grammar.matcher(0)
@@ -229,7 +229,7 @@ class FusedStepThroughTheLibrary(unittest.TestCase):
     def test_step_agrees_with_advance_then_fill(self):
         import torch
 
-        engine = gpugrammar.Engine([bytes([b]) for b in range(256)])
+        engine = engrain.Engine([bytes([b]) for b in range(256)])
         schema = json.dumps(
             {"type": "object", "properties": {"a": {"type": "integer"}}}
         )
@@ -269,7 +269,7 @@ class WhatARehearsalMustNotLeaveBehind(unittest.TestCase):
 
     def setUp(self):
         _requirements()
-        self.engine = gpugrammar.Engine(VOCABULARY)
+        self.engine = engrain.Engine(VOCABULARY)
         self.grammar = self.engine.compile_json_schema(SCHEMA)
 
     @NEEDS_CAPTURE
@@ -301,7 +301,7 @@ class WhatARehearsalMustNotLeaveBehind(unittest.TestCase):
 class TheEngineDoesNotConfuseTwoGrammars(unittest.TestCase):
     def setUp(self):
         _requirements()
-        self.engine = gpugrammar.Engine(VOCABULARY)
+        self.engine = engrain.Engine(VOCABULARY)
 
     def test_a_dropped_grammar_does_not_lend_its_slot_to_the_next(self):
         # The admission cache is keyed on `id`, and CPython reuses the address
@@ -327,7 +327,7 @@ class TheMatcherRefusesABufferItCannotWriteTo(unittest.TestCase):
 
     def setUp(self):
         _requirements()
-        self.engine = gpugrammar.Engine(VOCABULARY)
+        self.engine = engrain.Engine(VOCABULARY)
         self.grammar = self.engine.compile_json_schema(SCHEMA)
         self.matcher = self.grammar.matcher(32)
         self.words = self.grammar.bitset_words
@@ -366,7 +366,7 @@ class ABatchThePoolOutgrew(unittest.TestCase):
 
     def setUp(self):
         _requirements()
-        self.engine = gpugrammar.Engine(VOCABULARY)
+        self.engine = engrain.Engine(VOCABULARY)
 
     def _wide(self):
         return self.engine.compile_json_schema(json.dumps({
@@ -414,12 +414,12 @@ class WrongMasksThatWouldNotRaise(unittest.TestCase):
 
     def setUp(self):
         _requirements()
-        self.engine = gpugrammar.Engine(VOCABULARY)
+        self.engine = engrain.Engine(VOCABULARY)
 
     def test_a_grammar_from_another_tokenizer_is_refused(self):
         # Same size is not the same tokenizer: a grammar's groups are token
         # ids, so a permuted vocabulary gives a mask wrong token by token.
-        other = gpugrammar.Engine(list(reversed(VOCABULARY)))
+        other = engrain.Engine(list(reversed(VOCABULARY)))
         foreign = other.compile_json_schema(SCHEMA)
         ours = self.engine.compile_json_schema(SCHEMA)
         self.assertNotEqual(foreign.vocabulary_digest, ours.vocabulary_digest)
@@ -472,7 +472,7 @@ class ATokenOutsideTheVocabulary(unittest.TestCase):
 
     def _batch(self):
         _requirements()
-        engine = gpugrammar.Engine(VOCABULARY)
+        engine = engrain.Engine(VOCABULARY)
         grammar = engine.compile_json_schema(SCHEMA)
         batch = engine.batch(size=4)
         batch.set_grammars([grammar] * 4)
@@ -516,7 +516,7 @@ class TheAllowedSetIsTheMask(unittest.TestCase):
 
     def _filled(self, size=6):
         _requirements()
-        engine = gpugrammar.Engine(VOCABULARY)
+        engine = engrain.Engine(VOCABULARY)
         grammar = engine.compile_json_schema(SCHEMA)
         batch = engine.batch(size=size)
         batch.set_grammars([grammar] * size)
@@ -586,7 +586,7 @@ class TheShortlistIsWhicheverListIsShorter(unittest.TestCase):
     def _batch(self, admits_most: bool):
         _requirements()
         wide = [bytes([byte]) for byte in range(256)]
-        engine = gpugrammar.Engine(wide)
+        engine = engrain.Engine(wide)
         grammar = engine.compile_json_schema(
             json.dumps(
                 {

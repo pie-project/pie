@@ -3,7 +3,7 @@ requires = ["maturin>=1.7,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "gpugrammar"
+name = "engrain"
 version = "0.1.0"
 description = "Constrained decoding with the parser state resident on the GPU"
 readme = "README.md"
@@ -26,19 +26,19 @@ dependencies = [
 tokenizers = ["tiktoken>=0.9", "transformers>=4.45"]
 baselines = ["xgrammar>=0.1.29"]
 
-# No console scripts. The wheel is the library - `gpugrammar` and the
-# extension - and the measurement suite is `gpu_lr1`, which is research code
-# run from a checkout (`python -m gpu_lr1.rigor.latency`, `python -m
-# gpu_lr1.verify`). Installing entry points that name a package the wheel does
+# No console scripts. The wheel is the library - `engrain` and the
+# extension - and the measurement suite is `engrain_lab`, which is research code
+# run from a checkout (`python -m engrain_lab.rigor.latency`, `python -m
+# engrain_lab.verify`). Installing entry points that name a package the wheel does
 # not carry is how the previous set came to be broken.
 
 # The extension is a Rust cdylib and the library is Python over it, so the
 # build backend has to produce both. Plain setuptools produced a wheel with
 # the Python half only, which installed and then failed on `import`.
 [tool.maturin]
-manifest-path = "rust/crates/gpugrammar-py/Cargo.toml"
+manifest-path = "rust/crates/engrain-py/Cargo.toml"
 python-source = "src"
-module-name = "gpugrammar._gpugrammar"
+module-name = "engrain._engrain"
 
 [tool.ruff]
 line-length = 88
@@ -54,4 +54,4 @@ ignore = ["E501"]
 [tool.ruff.lint.per-file-ignores]
 # The kernels take the arguments their launch sites pass, whether or not a
 # given specialisation reads them.
-"src/gpugrammar/_engine.py" = ["B905"]
+"src/engrain/_engine.py" = ["B905"]

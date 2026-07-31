@@ -3,15 +3,15 @@
   "answers": [
     {
       "question_id": "q01-sound",
-      "headline": "documents generated under the mask that validate: gpugrammar 178/322 valid (55.3%); xgrammar 321/418 valid (76.8%)",
+      "headline": "documents generated under the mask that validate: engrain 178/322 valid (55.3%); xgrammar 321/418 valid (76.8%)",
       "detail": {
         "schemas": {
-          "gpugrammar": 60,
+          "engrain": 60,
           "xgrammar": 60
         },
         "walks_per_schema": 12,
         "per_engine": {
-          "gpugrammar": {
+          "engrain": {
             "walks": 720,
             "valid": 178,
             "invalid": 144,
@@ -30,7 +30,7 @@
             "unexplained": 73,
             "schema uses unlowered dependencies": 12
           },
-          "gpugrammar": {
+          "engrain": {
             "unexplained": 133,
             "schema uses unlowered dependencies": 11
           }
@@ -200,63 +200,63 @@
     },
     {
       "schema": 6,
-      "engine": "gpugrammar",
+      "engine": "engrain",
       "cause": "unexplained",
       "reason": "'objectType' is a required property",
       "text": "{\n\n\n }\r"
     },
     {
       "schema": 6,
-      "engine": "gpugrammar",
+      "engine": "engrain",
       "cause": "unexplained",
       "reason": "'objectType' is a required property",
       "text": "{  }\n"
     },
     {
       "schema": 6,
-      "engine": "gpugrammar",
+      "engine": "engrain",
       "cause": "unexplained",
       "reason": "'objectType' is a required property",
       "text": "{\n } \r\t\r\t"
     },
     {
       "schema": 6,
-      "engine": "gpugrammar",
+      "engine": "engrain",
       "cause": "unexplained",
       "reason": "'objectType' is a required property",
       "text": "{\"\u074dz\u0489\u013c \u01484qco)\u01efsAw\udbf1\udfc3D}xEiXSQpS\u0194\u0097\"\t  \t\n\r \t \n\t\n\r \t\t \n\t    \n:[\"G\u0507\u3a0f\u0793\u0af6\u8e5d\"]}\r\t"
     },
     {
       "schema": 6,
-      "engine": "gpugrammar",
+      "engine": "engrain",
       "cause": "unexplained",
       "reason": "'objectType' is a required property",
       "text": "{\r\r} "
     },
     {
       "schema": 6,
-      "engine": "gpugrammar",
+      "engine": "engrain",
       "cause": "unexplained",
       "reason": "'objectType' is a required property",
       "text": "{ } \t"
     },
     {
       "schema": 6,
-      "engine": "gpugrammar",
+      "engine": "engrain",
       "cause": "unexplained",
       "reason": "'objectType' is a required property",
       "text": "{\r}\r\n\n\t\t\t\r \n\t"
     },
     {
       "schema": 6,
-      "engine": "gpugrammar",
+      "engine": "engrain",
       "cause": "unexplained",
       "reason": "'objectType' is a required property",
       "text": "{\r\" \uda15\ude65\u00aa$dL^0\u6eccd+gSq)L\u00b8'\uf542w\ub20dF\u00c5\u037d\"\n:4\r\r \t,\t\t\r\t\t\r\"gl6\u06e9\uf389\u07c9qUH!i\u0311U\u0533~Nh\u047d}\u0636%\u0376vZ\"\n\r\r:{}  ,\n\t\"hJ\"\n \t\t  \r\r\r:false\n}\t"
     },
     {
       "schema": 6,
-      "engine": "gpugrammar",
+      "engine": "engrain",
       "cause": "unexplained",
       "reason": "'objectType' is a required property",
       "text": "{ \"o\uece4r<bZ\u0242\udb28\udd0aun!\u06b4\ud993\ude1c\u6213\u02f7\u43ac\u0515eY|\uea73*-\ud36e\uba7b\u7791\u02e7w8\u05ec\u8ed9wxL9}jVY\u022en<\u83e5re\u7fe6.\u0589\ub499i\u02cfksp\u03c9A=\u0209&2HT0jdbUy2J()4}b6\u24b1\u00dd\udbd5\udefb3\u03e3H\uf561g\u05d0kzDb,\u0443egH#\u026dS~\u011a&qE\u91f0r]\u025e\u04ceWo\u5dcf\ud06b\u0b19<\u00eai\u06503$U\u0090x\ud34eU(1N1r\ud8b4\udf01X@\u07b2\u03e3TT\"\t\r\t\t\n\n\n:5251E482056  }\t\t\n\t \t\t"
@@ -347,154 +347,154 @@
     },
     {
       "schema": 8,
-      "engine": "gpugrammar",
+      "engine": "engrain",
       "cause": "unexplained",
       "reason": "'event' is a required property",
       "text": "{\t\t\"goals\":\t\t\r\n{\t\n}\r}"
     },
     {
       "schema": 8,
-      "engine": "gpugrammar",
+      "engine": "engrain",
       "cause": "unexplained",
       "reason": "'event' is a required property",
       "text": "{\n\n \"goals\" \t\t \n : \r \n{\"value\" :-9877e+27, \n \n\r\t\"value\"\t:276E414\n}\t,\t\r \n\r \"goals\":\r\t\r\t\n\r{\"event\":\r \r \r\"rewardCreated\"\r,\n\r\n\"event\"\r\t:\r\r\"rewardRedeemed\"\t\t  }\r, \n\r\n\t\n\n\n\"goals\" : \t\r \t \t\r\t\t\r\t \r\n{}\n\t}\n "
     },
     {
       "schema": 8,
-      "engine": "gpugrammar",
+      "engine": "engrain",
       "cause": "unexplained",
       "reason": "'goals' is a required property",
       "text": "{\t}\r\t\r"
     },
     {
       "schema": 8,
-      "engine": "gpugrammar",
+      "engine": "engrain",
       "cause": "unexplained",
       "reason": "'goals' is a required property",
       "text": "{\r\n}\r\r "
     },
     {
       "schema": 8,
-      "engine": "gpugrammar",
+      "engine": "engrain",
       "cause": "unexplained",
       "reason": "'event' is a required property",
       "text": "{\"goals\"\r \t:\t\t\n{},\"goals\":\r\r{}\r,\n\"goals\"\n:\r\r{\t\t\r\r\"value\":879\t },\r\t\r\t\"goals\" \r:\t\n{\r\n}\r\t}"
     },
     {
       "schema": 8,
-      "engine": "gpugrammar",
+      "engine": "engrain",
       "cause": "unexplained",
       "reason": "'goals' is a required property",
       "text": "{\t\r}  \n \r"
     },
     {
       "schema": 8,
-      "engine": "gpugrammar",
+      "engine": "engrain",
       "cause": "unexplained",
       "reason": "'goals' is a required property",
       "text": "{\t}\n\r"
     },
     {
       "schema": 8,
-      "engine": "gpugrammar",
+      "engine": "engrain",
       "cause": "unexplained",
       "reason": "'value' is a required property",
       "text": "{ \"goals\"\r:{\n\t\r \n\"event\"\t\t:\r\"rewardCreated\" ,\r\r\"value\":557,\n \n\n\"value\"\r\t:828.23\r, \n\t\r\"event\":\"rewardCreated\"\r\t},\t\r\r\n\n\t \"goals\"  \r:\t\n{\n\"event\" \r:\r\"rewardCreated\"\n}} \t\t\r\r  \t\r\r\n"
     },
     {
       "schema": 8,
-      "engine": "gpugrammar",
+      "engine": "engrain",
       "cause": "unexplained",
       "reason": "'goals' is a required property",
       "text": "{  \r}"
     },
     {
       "schema": 8,
-      "engine": "gpugrammar",
+      "engine": "engrain",
       "cause": "unexplained",
       "reason": "'event' is a required property",
       "text": "{\r\"goals\"\n\t \t \n\t\n :\n\r\t\t\t\n \t\r {\r \t\t  \"value\"\r\r\n:3\n\t\t,\n\n\t\t\n\t\r \"value\"\r  \n\t\n :-8\t \t\n \t}\t,\"goals\" \r:{\t\n \"value\"\n\r\n\n  \n\t\n\n:-21\n \n}\n\t}\t"
     },
     {
       "schema": 8,
-      "engine": "gpugrammar",
+      "engine": "engrain",
       "cause": "unexplained",
       "reason": "'value' is a required property",
       "text": "{ \"goals\"\t:\r\r\n\n\t\n\n\t \r\t\r\n     {\r\r\r \r\n\t\r\"event\"\r\t\t \n\n \r\r \t\n\n\n  \n\n\r\t \t\n\r: \t \r\n\n\r\r\n\"rewardRedeemed\"\r\r\r,\r \n\"value\"\t\r\n\r:85 \n\n\r}\n ,\t\n\n\n\n\r\t\r\"goals\" \r:{\"event\" \t\t\r\t\t\r\t\r\r\t  :\n\"rewardCreated\"\n} }\n\n"
     },
     {
       "schema": 8,
-      "engine": "gpugrammar",
+      "engine": "engrain",
       "cause": "unexplained",
       "reason": "'value' is a required property",
       "text": "{\"goals\"\t   \n:{},\t\n\r\"goals\"\t \t\r\n:\r{\t\t\r\r \t\"event\"\r\n\n \n:\r \t  \r\n\r\n\n \"rewardRedeemed\"}\t \t\t\n\t} \t\n"
     },
     {
       "schema": 10,
-      "engine": "gpugrammar",
+      "engine": "engrain",
       "cause": "unexplained",
       "reason": "'token_type' is a required property",
       "text": "{\t  \r\r\t \n\n}\t\r\r \t\n\r  \t\r   "
     },
     {
       "schema": 10,
-      "engine": "gpugrammar",
+      "engine": "engrain",
       "cause": "unexplained",
       "reason": "'access_token' is a required property",
       "text": "{\"expires_in\":\t0.377788\r\t\t\n\t\n\r,\n\r\"token_type\"\t\r\n\n:\"bearer\" }\n\r\n \t\r\n\t "
     },
     {
       "schema": 10,
-      "engine": "gpugrammar",
+      "engine": "engrain",
       "cause": "unexplained",
       "reason": "'access_token' is a required property",
       "text": "{\n\n\"token_type\"\n\r\n\t\n\t  \t\t:\t \"bearer\"}\r\r\r \t\r  \r \t\n\r"
     },
     {
       "schema": 10,
-      "engine": "gpugrammar",
+      "engine": "engrain",
       "cause": "unexplained",
       "reason": "'token_type' is a required property",
       "text": "{\n\t\n\r \t}\t\r"
     },
     {
       "schema": 10,
-      "engine": "gpugrammar",
+      "engine": "engrain",
       "cause": "unexplained",
       "reason": "'token_type' is a required property",
       "text": "{  \n \r }"
     },
     {
       "schema": 10,
-      "engine": "gpugrammar",
+      "engine": "engrain",
       "cause": "unexplained",
       "reason": "'token_type' is a required property",
       "text": "{ \r\r \n\n\r\r}\t\n\t\t\n \t \n\r\r\n  \n\t\t \r "
     },
     {
       "schema": 10,
-      "engine": "gpugrammar",
+      "engine": "engrain",
       "cause": "unexplained",
       "reason": "'expires_in' is a required property",
       "text": "{\r\"access_token\"\n \r\r\r\n\r\r\r\n\n\n:\t  \t\n\r\t\t\t\"ESx\u759b\u014f~X&C\udbf5\udd01J\u03e8\u05e567[\ueb08`-&R\u51eb\udb08\udd40\u0732\u53f0~<\ud87c\uddcc2SW'KI&5`\u0604>TP\u0436b\u02d19dz\ud82c\udfff\u013f}g\u1a4c\ue1e4\udbf4\udf41\u0446r\"\t, \"token_type\":\n\"bearer\" \n\n \r\r,\n\"token_type\":\n  \t\"bearer\"}\t\n \n\t\t \n\n\r \t\n\r\r\n\t\n \t\r\t\r\t\t  \t\r\r\n\n\n\n  \n\r\n\t \n\n \t"
     },
     {
       "schema": 10,
-      "engine": "gpugrammar",
+      "engine": "engrain",
       "cause": "unexplained",
       "reason": "'token_type' is a required property",
       "text": "{\t\t\n}\n\n \r"
     },
     {
       "schema": 10,
-      "engine": "gpugrammar",
+      "engine": "engrain",
       "cause": "unexplained",
       "reason": "'token_type' is a required property",
       "text": "{ }"
     },
     {
       "schema": 10,
-      "engine": "gpugrammar",
+      "engine": "engrain",
       "cause": "unexplained",
       "reason": "'token_type' is a required property",
       "text": "{\t\t}"

@@ -1,20 +1,20 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/gpugrammar-ir",
-    "crates/gpugrammar-lex",
-    "crates/gpugrammar-lr",
-    "crates/gpugrammar-tables",
-    "crates/gpugrammar-run",
-    "crates/gpugrammar-cuda",
-    "crates/gpugrammar-py",
+    "crates/engrain-ir",
+    "crates/engrain-lex",
+    "crates/engrain-lr",
+    "crates/engrain-tables",
+    "crates/engrain-run",
+    "crates/engrain-cuda",
+    "crates/engrain-py",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-repository = "https://github.com/ingim/gpu-lr1"
+repository = "https://github.com/ingim/engrain"
 
 # Clippy gates in CI, so what is deliberate is named here rather than left as
 # noise for a reader to learn to scroll past.

@@ -57,7 +57,7 @@ For each tokenizer report:
 
 ## 3. Schema diversity and heterogeneous batching
 
-The main gpu-lr1 hypothesis is not merely large batch size. It is a large batch
+The main engrain hypothesis is not merely large batch size. It is a large batch
 containing many distinct schemas and active grammar states.
 
 Measure:
@@ -195,7 +195,7 @@ Recommended experiment:
 - use one small model where grammar overhead is visible and one larger model
   where model compute dominates;
 - test continuous batching with dynamic arrivals;
-- compare unconstrained, XGrammar, llguidance, and gpu-lr1 paths;
+- compare unconstrained, XGrammar, llguidance, and engrain paths;
 - separate grammar compile time from decode time;
 - rotate schemas so cache behavior is controlled;
 - report TTFT, TPOT, requests/second, tokens/second, p99 request latency, GPU

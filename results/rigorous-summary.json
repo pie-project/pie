@@ -4,7 +4,7 @@
     "schemas": "50 per JSONSchemaBench config across all 11 configs",
     "replay": "generated text replayed through each tokenizer's grammar; recorded states are the ones that tokenizer would visit",
     "xgrammar_charged": "batch_fill_next_token_bitmask + pinned H2D + mask apply + FlashInfer sampling + batch_accept_token + batch_rollback, with the thread count swept over 1/2/4/8/16/auto and the fastest reported, and its device work CUDA-graphed",
-    "gpugrammar_charged": "fused gather/threshold/sample plus the next-state write, CUDA-graphed"
+    "engrain_charged": "fused gather/threshold/sample plus the next-state write, CUDA-graphed"
   },
   "tokenizers": {
     "llama3": {
@@ -80,8 +80,8 @@
       "benchmarks": [
         {
           "batch_size": 32,
-          "gpugrammar_ragged_us": 222.4205,
-          "gpugrammar_eager_us": 461.0865,
+          "engrain_ragged_us": 222.4205,
+          "engrain_eager_us": 461.0865,
           "flashinfer_unconstrained_us": 299.67600000000004,
           "xgrammar_gpu_mask_us": 287.24699999999996,
           "xgrammar_full_path_us": 1954.834,
@@ -89,8 +89,8 @@
         },
         {
           "batch_size": 128,
-          "gpugrammar_ragged_us": 416.0075,
-          "gpugrammar_eager_us": 489.21950000000004,
+          "engrain_ragged_us": 416.0075,
+          "engrain_eager_us": 489.21950000000004,
           "flashinfer_unconstrained_us": 628.274,
           "xgrammar_gpu_mask_us": 760.0605,
           "xgrammar_full_path_us": 5963.488,
@@ -98,8 +98,8 @@
         },
         {
           "batch_size": 512,
-          "gpugrammar_ragged_us": 1464.2424999999998,
-          "gpugrammar_eager_us": 1540.615,
+          "engrain_ragged_us": 1464.2424999999998,
+          "engrain_eager_us": 1540.615,
           "flashinfer_unconstrained_us": 1984.9155,
           "xgrammar_gpu_mask_us": 2493.6769999999997,
           "xgrammar_full_path_us": 13981.378,
@@ -180,8 +180,8 @@
       "benchmarks": [
         {
           "batch_size": 32,
-          "gpugrammar_ragged_us": 291.159,
-          "gpugrammar_eager_us": 453.84749999999997,
+          "engrain_ragged_us": 291.159,
+          "engrain_eager_us": 453.84749999999997,
           "flashinfer_unconstrained_us": 917.1624999999999,
           "xgrammar_gpu_mask_us": 893.548,
           "xgrammar_full_path_us": 3011.694,
@@ -189,8 +189,8 @@
         },
         {
           "batch_size": 128,
-          "gpugrammar_ragged_us": 771.841,
-          "gpugrammar_eager_us": 842.568,
+          "engrain_ragged_us": 771.841,
+          "engrain_eager_us": 842.568,
           "flashinfer_unconstrained_us": 1755.308,
           "xgrammar_gpu_mask_us": 1979.6464999999998,
           "xgrammar_full_path_us": 6039.516,
@@ -198,8 +198,8 @@
         },
         {
           "batch_size": 512,
-          "gpugrammar_ragged_us": 2234.061,
-          "gpugrammar_eager_us": 2315.548,
+          "engrain_ragged_us": 2234.061,
+          "engrain_eager_us": 2315.548,
           "flashinfer_unconstrained_us": 5697.7685,
           "xgrammar_gpu_mask_us": 6417.652,
           "xgrammar_full_path_us": 13896.595,
@@ -280,8 +280,8 @@
       "benchmarks": [
         {
           "batch_size": 32,
-          "gpugrammar_ragged_us": 310.83500000000004,
-          "gpugrammar_eager_us": 465.094,
+          "engrain_ragged_us": 310.83500000000004,
+          "engrain_eager_us": 465.094,
           "flashinfer_unconstrained_us": 607.385,
           "xgrammar_gpu_mask_us": 606.8889999999999,
           "xgrammar_full_path_us": 2969.738,
@@ -289,8 +289,8 @@
         },
         {
           "batch_size": 128,
-          "gpugrammar_ragged_us": 874.088,
-          "gpugrammar_eager_us": 952.62,
+          "engrain_ragged_us": 874.088,
+          "engrain_eager_us": 952.62,
           "flashinfer_unconstrained_us": 1200.8380000000002,
           "xgrammar_gpu_mask_us": 1407.219,
           "xgrammar_full_path_us": 7826.44,
@@ -298,8 +298,8 @@
         },
         {
           "batch_size": 512,
-          "gpugrammar_ragged_us": 2439.1065,
-          "gpugrammar_eager_us": 2520.303,
+          "engrain_ragged_us": 2439.1065,
+          "engrain_eager_us": 2520.303,
           "flashinfer_unconstrained_us": 4025.1890000000003,
           "xgrammar_gpu_mask_us": 5079.9445,
           "xgrammar_full_path_us": 10937.232,

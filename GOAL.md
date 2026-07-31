@@ -2,9 +2,15 @@
 
 ## Ultimate goal
 
-Build **gpugrammar**: a constrained-decoding engine whose parser state lives on
+Build **engrain**: a constrained-decoding engine whose parser state lives on
 the device, so that a grammar is something a decode step *contains* rather than
 something a decode step *waits for*.
+
+*The name.* To engrain is to work something into the fibre rather than lay it
+on the surface, so that it cannot be taken back out. Renamed from `gpugrammar`
+on 2026-07-31: the old name described the implementation, and the claim here is
+not about which processor runs the parser but about the parser being inside
+what the decode step already is.
 
 Two hard requirements set it apart from the current `gpu-lr1` prototype:
 
@@ -73,7 +79,7 @@ and a real document visits 1–4% of the states its grammar can reach.
 | Core engine + evaluation complete | before submission |
 | **MLSys 2027 submission** | **2026-10-30** (expected deadline, 23:59 PDT) |
 | MLSys 2027 conference | 2027-05-17 – 05-22 |
-| Public source release of `gpugrammar` | after acceptance/decision |
+| Public source release of `engrain` | after acceptance/decision |
 
 Everything in this repository is a feasibility prototype feeding that paper.
 Work that does not either (a) retire a named challenge below or (b) produce a
@@ -81,7 +87,7 @@ figure/table in the paper is out of scope.
 
 ## What "device-resident" must mean concretely
 
-A serving engine should be able to swap XGrammar for gpugrammar and get:
+A serving engine should be able to swap XGrammar for engrain and get:
 
 - **A decode step that never touches the host.** No mask handed in from
   outside, no synchronisation per token. This is the requirement everything
@@ -143,7 +149,7 @@ measured 1,648 GB/s). Today's constrained path adds 8.97 ms — it more than
 doubles the step. The fused path adds 0.198 ms, or 2.3%.
 
 **Re-measured on the shipped engine (2026-07-30), and the figures above are
-superseded by these.** `Batch.allowed` and `gg_compact` now exist, so this is
+superseded by these.** `Batch.allowed` and `en_compact` now exist, so this is
 the artifact's own number rather than a probe's. XGrammar's own
 `apply_token_bitmask_inplace` is the mask baseline, `sampling_from_logits` is
 the sampler throughout, and the compaction is charged to us — without it the
@@ -745,7 +751,7 @@ request is 67.2%, so at most 32.8% of steps can miss.
 If a row costs one XGrammar mask fill (measured p50 6 µs, p99 1,071 µs), the
 amortised construction cost is **0.6 µs per step** warm and 2.0 µs cold,
 against 3.3 µs per sequence for the sampling step itself at batch 128. The
-asymmetry is the point: XGrammar fills a mask on *every* step, gpugrammar only
+asymmetry is the point: XGrammar fills a mask on *every* step, engrain only
 on a cache miss, so including construction still leaves it ahead. The 1,071 µs
 p99 fill also confirms the tail behaviour llguidance criticises.
 
@@ -790,8 +796,8 @@ gathered sampler and wide rows to a complement-masked full-width sampler. This
 is the concrete engineering-and-algorithms problem that makes Example 1 real
 instead of anecdotal.
 
-**Status.** Implemented in `src/gpu_lr1/ragged_sampler.py` and
-`src/gpu_lr1/wide_sampler.py`, verified by `tests/test_ragged_sampler.py`
+**Status.** Implemented in `src/engrain_lab/ragged_sampler.py` and
+`src/engrain_lab/wide_sampler.py`, verified by `tests/test_ragged_sampler.py`
 against a sorted reference. Three findings drove the optimisation, each
 measured rather than assumed:
 
@@ -811,7 +817,7 @@ measured rather than assumed:
 Final measurement on A100 with Qwen3 and XGrammar's builtin JSON grammar,
 graph-replayed, median wall (`results/a100-ragged-sampler.json`):
 
-| profile | batch | gpugrammar | FlashInfer unconstrained | XGrammar full path | vs unconstrained |
+| profile | batch | engrain | FlashInfer unconstrained | XGrammar full path | vs unconstrained |
 |---|---:|---:|---:|---:|---:|
 | narrow | 1 | 28.3 µs | 289.3 µs | 1,041.6 µs | 10.2× |
 | narrow | 512 | 35.3 µs | 3,471.0 µs | 8,985.1 µs | 98.4× |
@@ -831,10 +837,10 @@ path at batch 2,048. C10 is retired.
 Earlier profiles were synthetic in both directions and the comparison charged
 each engine differently. The measurement below fixes both.
 
-**Workload.** `gpu_lr1.generate_instances` has Llama-3-8B-Instruct produce 533
+**Workload.** `engrain_lab.generate_instances` has Llama-3-8B-Instruct produce 533
 JSON values under a real XGrammar constraint — 50 schemas from each of the 11
 JSONSchemaBench configs, sampled at temperature 0.8 / top-p 0.95, up to 256 new
-tokens, mean 125 tokens. `gpu_lr1.replay_tokenizer` then replays that text
+tokens, mean 125 tokens. `engrain_lab.replay_tokenizer` then replays that text
 through each tokenizer's grammar, which is faithful because the state a matcher
 reaches is determined by the bytes consumed. Content and tokenization are
 separated so vocabulary effects are isolated from schema effects.
@@ -860,7 +866,7 @@ WashingtonPost is 46–54%.
 
 **Result** (A100, graph-replayed, median wall):
 
-| tokenizer | batch | gpugrammar | FlashInfer unconstrained | XGrammar full path | gap |
+| tokenizer | batch | engrain | FlashInfer unconstrained | XGrammar full path | gap |
 |---|---:|---:|---:|---:|---:|
 | Llama 3 | 32 | 222.4 µs | 299.7 µs | 1,954.8 µs | 8.8× |
 | Llama 3 | 128 | 416.0 µs | 628.3 µs | 5,963.5 µs | **14.3×** |
@@ -923,9 +929,9 @@ per-step number is the defensible one.
 
 ### vLLM integration
 
-`gpu_lr1/vllm_backend.py` implements vLLM's `StructuredOutputBackend` on top of
+`engrain_lab/vllm_backend.py` implements vLLM's `StructuredOutputBackend` on top of
 the Rust compiler, reached from Python through PyO3 bindings
-(`gpugrammar-py`). vLLM 0.25 dispatches backends with a hardcoded `if/elif` and
+(`engrain-py`). vLLM 0.25 dispatches backends with a hardcoded `if/elif` and
 has no registry, unlike SGLang's `register_grammar_backend`, so `install()`
 substitutes this backend for the name vLLM already knows. That is a measurement
 device; the upstream ask is a registry. The engine also runs in a subprocess by
@@ -1099,7 +1105,7 @@ could still become, and admissibility requires one of them to be acceptable.
 ## Answering the reviewer, with measurements
 
 Twenty questions a referee would ask, and a benchmark for each, in
-`src/gpu_lr1/rigor/`. The rules are deliberately inconvenient: warm up before
+`src/engrain_lab/rigor/`. The rules are deliberately inconvenient: warm up before
 timing, report distributions rather than means, run each baseline in its best
 documented configuration, and report a benchmark that could not run as
 unanswered rather than dropping it. Results below are on one A100 80GB against
@@ -1207,7 +1213,7 @@ A serving engine captures the decode step as a CUDA graph precisely to delete
 that overhead. Measured that way the step is 4.9 ms at batch 1 and 22.1 ms at
 batch 512, and the picture inverts:
 
-| batch | captured step | gpugrammar | XGrammar | end-to-end |
+| batch | captured step | engrain | XGrammar | end-to-end |
 |---|---|---|---|---|
 | 1 | 4.9 ms | 0.5% | 0.4% | 1.00x |
 | 32 | 6.5 ms | 3.2% | 7.3% | 1.04x |
@@ -1723,7 +1729,7 @@ them is reported.
 
 ## Working agreement
 
-- Prototype code in this repository is evidence, not product. `gpugrammar` is a
+- Prototype code in this repository is evidence, not product. `engrain` is a
   clean implementation informed by it.
 - No claim enters README, GOAL, or the paper without a measurement or a proof.
 - At every major milestone: run focused tests and the relevant benchmark, update

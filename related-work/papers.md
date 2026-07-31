@@ -89,8 +89,8 @@ scope and baseline stated by the source.
 - **Limitation:** table size and compile cost grow with grammar and vocabulary
   complexity. Later work also identifies token-boundary and schema-coverage
   pitfalls in regex/FSM implementations.
-- **Relation to gpu-lr1:** this is important prior art for precomputed
-  `state -> token-set` tables. gpu-lr1's distinct focus is heterogeneous
+- **Relation to engrain:** this is important prior art for precomputed
+  `state -> token-set` tables. engrain's distinct focus is heterogeneous
   global-state packing and fused device-side token selection plus next-state
   update.
 
@@ -113,7 +113,7 @@ scope and baseline stated by the source.
 - **Runtime placement:** reference grammar processing and table lookup are
   CPU-side; no GPU parser kernel is described.
 - **Trade-off:** moves substantial work offline. This is structurally close to
-  gpu-lr1's DFA/tokenizer cross-product and reinforces the need to report cold
+  engrain's DFA/tokenizer cross-product and reinforces the need to report cold
   compile time and persistent-cache behavior.
 
 ### Guiding LLMs The Right Way: Fast, Non-Invasive Constrained Generation
@@ -136,7 +136,7 @@ scope and baseline stated by the source.
   automaton kernel. Speculation overlaps constraint work with accelerator
   inference.
 - **Relevance:** tokenizer alignment affects both correctness and model quality,
-  not only speed. gpu-lr1's token cross-product must be tested across tokenizer
+  not only speed. engrain's token cross-product must be tested across tokenizer
   families rather than only one truncated GPT-2 vocabulary.
 
 ### Automata-based Constraints for Language Model Decoding
@@ -156,7 +156,7 @@ scope and baseline stated by the source.
   compilation than the specific prior construction it evaluates.
 - **Runtime placement:** designed to lower into model-independent calculations
   over logits; it is not presented as a GPU-resident parser-stack engine.
-- **Relation to gpu-lr1:** the DFA/tokenizer cross-product should be described as
+- **Relation to engrain:** the DFA/tokenizer cross-product should be described as
   an instance of this broader automata-composition lineage, not as a new
   tokenizer-alignment concept.
 
@@ -173,7 +173,7 @@ scope and baseline stated by the source.
   prior approaches while preserving state-of-the-art online mask efficiency.
 - **Runtime placement:** the contribution is an offline/online algorithmic
   improvement; the paper does not claim a GPU-native parser hot path.
-- **Relevance:** directly targets gpu-lr1's comparatively expensive
+- **Relevance:** directly targets engrain's comparatively expensive
   tokenizer-cross-product compilation. Any production compiler should compare
   against its realizability pruning and cache strategy.
 
@@ -192,7 +192,7 @@ scope and baseline stated by the source.
   sampling.
 - **Trade-off:** the method adds substantial statistical computation and can
   converge slowly.
-- **Relevance:** gpu-lr1 currently benchmarks greedy argmax. A future top-k,
+- **Relevance:** engrain currently benchmarks greedy argmax. A future top-k,
   top-p, or temperature sampler must state whether it implements ordinary hard
   masking or attempts distribution-faithful grammar alignment.
 
@@ -244,7 +244,7 @@ scope and baseline stated by the source.
   2.5x higher throughput than the evaluated Guidance/Outlines baselines.
 - **Runtime placement:** the serving runtime and model are GPU-oriented, but
   grammar-state calculation is not presented as a GPU-resident LR/PDA engine.
-- **Relevance:** forced-path compression is orthogonal to gpu-lr1's faster
+- **Relevance:** forced-path compression is orthogonal to engrain's faster
   branching-state selection and should be part of a production integration.
 
 ### XGrammar: Flexible and Efficient Structured Generation Engine for LLMs
@@ -269,8 +269,8 @@ scope and baseline stated by the source.
 - **Reported result:** up to 100x lower mask-generation latency than evaluated
   predecessors and near-zero serving overhead in configurations where CPU
   grammar work is effectively overlapped with GPU inference.
-- **Relation to gpu-lr1:** it is the most important production baseline and has
-  much broader grammar coverage. gpu-lr1 instead demonstrates a narrower path
+- **Relation to engrain:** it is the most important production baseline and has
+  much broader grammar coverage. engrain instead demonstrates a narrower path
   in which automaton state and next-state updates stay on device.
 
 ### Pre3: Enabling Deterministic Pushdown Automata for Faster Structured LLM Generation
@@ -293,7 +293,7 @@ scope and baseline stated by the source.
   survey.
 - **Artifact note:** LightLLM's README announces the paper, but a search of its
   current main branch did not locate a merged Pre3 parser implementation.
-- **Relation to gpu-lr1:** gpu-lr1 now executes ordinary canonical LR(1)
+- **Relation to engrain:** engrain now executes ordinary canonical LR(1)
   reduce/goto closures over a terminal stream. Pre3 remains the closest formal
   predecessor for compiling tokenizer-level, prefix-conditioned transitions
   that reduce online stack exploration. It directly addresses the stack-exposed
@@ -315,7 +315,7 @@ scope and baseline stated by the source.
 - **Runtime placement:** improves the CPU compiler/matcher/cache architecture;
   the public GPU kernels remain packed-mask application kernels.
 - **Relevance:** cross-grammar reuse is directly important for workloads with
-  many related tool schemas. gpu-lr1's flat global-state packing addresses a
+  many related tool schemas. engrain's flat global-state packing addresses a
   different phase: execution after compilation.
 
 ### Efficient Grammar-Constrained Decoding via Parser Stack Classification
@@ -336,7 +336,7 @@ scope and baseline stated by the source.
 - **Unknowns:** the public abstract does not specify the parser family, CPU/GPU
   placement, batching strategy, classifier representation, memory growth, or
   comparison versions.
-- **Relation to gpu-lr1:** PSC may subsume much of the same "precompute enough
+- **Relation to engrain:** PSC may subsume much of the same "precompute enough
   parser context to make online work table-like" insight for recursive
   grammars. It must be treated as important prior art once the full paper is
   available.
@@ -364,8 +364,8 @@ scope and baseline stated by the source.
 - **Artifact status:** the abstract declares
   `github.com/Paradozile/Gram2Token`, but that URL returned 404 and no public
   repository was found on 2026-07-24.
-- **Relation to gpu-lr1:** this is the closest high-level prior art. Distinctive
-  gpu-lr1 evidence is its public table construction, CSR/bitset density
+- **Relation to engrain:** this is the closest high-level prior art. Distinctive
+  engrain evidence is its public table construction, CSR/bitset density
   crossover, flat heterogeneous state namespace, memory measurements, and
   reproducible Triton kernels. A novelty claim must compare the detailed
   representations once Gram2Token's paper or code becomes available.
@@ -388,7 +388,7 @@ scope and baseline stated by the source.
 - **Limitations:** SQL-specific policy focus, LALR(1)-language boundary, and no
   public implementation located at this snapshot.
 - **Relevance:** demonstrates that highly optimized CPU parser execution can be
-  very competitive, so gpu-lr1 must compare wall-clock and end-to-end serving
+  very competitive, so engrain must compare wall-clock and end-to-end serving
   results rather than CUDA kernel time alone.
 
 ## 5. Different decoding regimes
@@ -426,7 +426,7 @@ scope and baseline stated by the source.
 - **Key finding:** accepting a schema does not imply exact schema semantics.
   Engines differ substantially in unsupported keywords, silent
   under-constraint, compile failures, and tail latency.
-- **Limitation for gpu-lr1:** the published end-to-end comparison is mainly
+- **Limitation for engrain:** the published end-to-end comparison is mainly
   batch 1 and mixes serving backends. Its corpus and correctness taxonomy are
   more reusable than its absolute latency numbers.
 
@@ -444,7 +444,7 @@ scope and baseline stated by the source.
 - **Important result:** median performance alone is misleading. XGrammar is
   extremely fast on simple rows but has much larger p99/p99.9 tails than
   llguidance in the published run.
-- **Relevance:** gpu-lr1 should reproduce MaskBench-style p50-p99.9 wall-clock
+- **Relevance:** engrain should reproduce MaskBench-style p50-p99.9 wall-clock
   distributions on GPU and should report compile errors, invalid acceptance,
   crashes, OOMs, and timeouts alongside speed.
 

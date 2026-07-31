@@ -14,8 +14,8 @@
     {
       "profile": "real",
       "batch_size": 32,
-      "gpugrammar_eager_us": 453.84749999999997,
-      "gpugrammar_ragged_us": 291.159,
+      "engrain_eager_us": 453.84749999999997,
+      "engrain_ragged_us": 291.159,
       "flashinfer_unconstrained_us": 917.1624999999999,
       "xgrammar_gpu_mask_us": 893.548,
       "xgrammar_full_path_us": 3011.694,
@@ -26,8 +26,8 @@
     {
       "profile": "real",
       "batch_size": 128,
-      "gpugrammar_eager_us": 842.568,
-      "gpugrammar_ragged_us": 771.841,
+      "engrain_eager_us": 842.568,
+      "engrain_ragged_us": 771.841,
       "flashinfer_unconstrained_us": 1755.308,
       "xgrammar_gpu_mask_us": 1979.6464999999998,
       "xgrammar_full_path_us": 6039.516,
@@ -38,8 +38,8 @@
     {
       "profile": "real",
       "batch_size": 512,
-      "gpugrammar_eager_us": 2315.548,
-      "gpugrammar_ragged_us": 2234.061,
+      "engrain_eager_us": 2315.548,
+      "engrain_ragged_us": 2234.061,
       "flashinfer_unconstrained_us": 5697.7685,
       "xgrammar_gpu_mask_us": 6417.652,
       "xgrammar_full_path_us": 13896.595,

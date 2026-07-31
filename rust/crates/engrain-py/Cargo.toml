@@ -1,0 +1,26 @@
+[package]
+name = "engrain-py"
+description = "Python bindings for the engrain compiler and reference runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "_engrain"
+crate-type = ["cdylib"]
+
+[dependencies]
+mimalloc = { version = "0.1", default-features = false }
+anyhow.workspace = true
+engrain-cuda = { path = "../engrain-cuda" }
+engrain-ir = { path = "../engrain-ir" }
+engrain-lex = { path = "../engrain-lex" }
+engrain-lr = { path = "../engrain-lr" }
+engrain-run = { path = "../engrain-run" }
+engrain-tables = { path = "../engrain-tables" }
+rustc-hash.workspace = true
+pyo3 = { version = "0.27", features = ["extension-module", "abi3-py310"] }
+
+[lints]
+workspace = true

@@ -30,13 +30,13 @@ Only the third meaning is called **GPU-native grammar execution** here.
   complexity independent of vocabulary size. The public material available at
   this snapshot does not state CPU/GPU placement.
 - [Gram2Token](https://icml.cc/virtual/2026/poster/62392) is the closest direct
-  prior art to the high-level gpu-lr1 idea. It preprocesses deterministic
+  prior art to the high-level engrain idea. It preprocesses deterministic
   byte-level grammar execution into token categories and transition tables,
   then performs category lookup, masking, and state update on the GPU. Its
   abstract reports a 1.38x geometric-mean and 1.85x maximum throughput
   improvement under schema-diverse continuous batching. The declared code URL
   was not publicly reachable at this snapshot.
-- gpu-lr1 now has three execution modes. The JSON Schema backend compiles a
+- engrain now has three execution modes. The JSON Schema backend compiles a
   canonical, acyclic subset into a tokenizer-aware byte DFA. The LR backend
   compiles arbitrary deterministic canonical LR(1) grammars into sparse
   ACTION/GOTO tables and executes stack-dependent reductions on GPU over grammar
