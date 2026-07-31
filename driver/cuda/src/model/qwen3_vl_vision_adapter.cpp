@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "attention_workspace.hpp"
+#include "cuda_check.hpp"
 #include "ops/attention_flashinfer.hpp"
 #include "ops/gemm.hpp"
 #include "tls_cuda_resource.hpp"
@@ -103,10 +104,17 @@ void qwen3vl_vis_attn(const void* q, void* k, void* v, void* o,
         std::vector<std::uint32_t> kvidx(total_pages);
         for (int i = 0; i < total_pages; ++i) kvidx[i] = (std::uint32_t)i;
         auto up = [&](std::uint32_t** d, const std::vector<std::uint32_t>& h) {
-            cudaMalloc(d, h.size() * sizeof(std::uint32_t));
-            cudaMemcpy(*d, h.data(), h.size() * sizeof(std::uint32_t), cudaMemcpyHostToDevice);
+            CUDA_CHECK(cudaMalloc(d, h.size() * sizeof(std::uint32_t)));
+            CUDA_CHECK(cudaMemcpy(*d, h.data(), h.size() * sizeof(std::uint32_t),
+                                 cudaMemcpyHostToDevice));
         };
-        up(&st.qo_d, qo); up(&st.kvpi_d, kvpi); up(&st.kvidx_d, kvidx); up(&st.klpl_d, klpl);
+        try {
+            up(&st.qo_d, qo); up(&st.kvpi_d, kvpi); up(&st.kvidx_d, kvidx); up(&st.klpl_d, klpl);
+        } catch (...) {
+            // Drop any partial uploads so destructor / next rebuild stay consistent.
+            st.free_indices();
+            throw;
+        }
         if (st.device < 0) st.device = tls_cuda_current_device();
         ops::plan_attention_flashinfer_prefill_bf16(
             *st.plan, qo.data(), kvpi.data(), klpl.data(), /*total_tokens=*/total, num_seqs,
