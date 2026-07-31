@@ -1,6 +1,7 @@
 #pragma once
 
 #include "model/imodel.hpp"
+#include "model/qwen3_5/declared_facts.hpp"
 #include "model/qwen3_5/qwen3_5.hpp"
 #include "model/qwen3_5/qwen3_5_forward.hpp"
 
@@ -64,6 +65,11 @@ private:
     KvCache& kv_cache_;
     Qwen3_5ForwardCfg fwd_cfg_;
     ModelCapabilities caps_;
+    // Arc 1 of the declared executor (declared_facts.hpp): the traced +
+    // structurally validated plan, built at construction when
+    // PIE_DECLARED_FORWARD opted in. Stored for arc 2 (the emission arcs);
+    // body() does NOT consume it — cold-start validation only.
+    Qwen35DeclaredPlan declared_;
 };
 
 }  // namespace pie_cuda_driver::model

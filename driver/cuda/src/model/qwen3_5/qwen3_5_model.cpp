@@ -34,6 +34,16 @@ Qwen35Model::Qwen35Model(
     caps_.graph_padding_kv_write_safe  = true;
     caps_.supports_compact_logits      = true;
     caps_.supports_small_prefill_graph = supports_small_prefill_graph;
+
+    // Declared-executor arc 1: trace + structurally validate the hybrid
+    // declaration against this deployment's config and bindings, now
+    // rather than on first fire (the facts are load-time facts —
+    // llama_like_model.cpp's reasoning). An unrepresentable config leaves
+    // `declared_` empty with the reason logged once; body() runs the
+    // hand-written path either way — nothing consumes the plan yet.
+    if (qwen35_declared_forward_enabled()) {
+        declared_ = build_qwen3_5_declared_plan(hf_config_, weights_, tp_size);
+    }
 }
 
 void Qwen35Model::prepare(AttentionWorkspace& attn_ws,

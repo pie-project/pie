@@ -36,6 +36,13 @@ Qwen35MoeModel::Qwen35MoeModel(
     caps_.graph_padding_kv_write_safe  = true;
     caps_.supports_compact_logits      = true;
     caps_.supports_small_prefill_graph = supports_small_prefill_graph;
+
+    // Declared-executor arc 1: same cold-start trace + validation as the
+    // dense model (qwen3_5_model.cpp) — the two classes do not share a
+    // construction site, so each opts in here. Nothing consumes the plan.
+    if (qwen35_declared_forward_enabled()) {
+        declared_ = build_qwen3_5_declared_plan(hf_config_, weights_, tp_size);
+    }
 }
 
 void Qwen35MoeModel::prepare(AttentionWorkspace& attn_ws,
