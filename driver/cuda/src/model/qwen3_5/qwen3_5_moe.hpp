@@ -56,6 +56,15 @@ bool qwen35_fused_gdn_projection_enabled();
 /// the bind, which reads whichever views the contract produced.
 bool qwen35_mtp_int8_lm_head_enabled();
 
+/// True when the shared expert's scalar gate is folded into the fused gate/up
+/// slab as one extra row, giving `[2*Is+1, H]` instead of `[2*Is, H]`.
+///
+/// Opt-in (`PIE_QWEN35_FUSED_SHARED_SCALAR_GATE`): measured a wash to a loss --
+/// the split path wins despite the extra launch, see the definition. Read by
+/// the contract, which is what decides the slab's shape, and by the bind, which
+/// reads whichever slab the contract produced.
+bool qwen35_fused_shared_scalar_gate_enabled();
+
 struct Qwen3_5MoeLayerWeights {
     enum class Kind { LinearAttn, FullAttn };
     Kind kind;
@@ -134,7 +143,6 @@ struct Qwen3_5MoeWeights {
     // routed-expert weights. Same role as in Qwen3_5Weights — these
     // tensors have block / fused layouts that don't shard cleanly under
     // uniform axis-0 partitioning, so we slice them by hand at bind time.
-    std::vector<DeviceTensor> owned_bf16_buffers;
 
     struct MtpWeights {
         const DeviceTensor* pre_fc_norm_embedding = nullptr;

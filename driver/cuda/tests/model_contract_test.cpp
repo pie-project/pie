@@ -664,6 +664,112 @@ void test_deepseek_v4_streams_experts_as_a_group() {
     }
 }
 
+/// The shared expert's gate and up projections are joined by the contract.
+///
+/// Additive, not a replacement: `try_fold_shared_into_routed` still reads the
+/// two projections separately, and which path runs is a per-step decision, so
+/// the sources must survive. Sharded on axis 0, so the join's row count has to
+/// follow the rank rather than the checkpoint.
+void test_qwen3_5_moe_joins_the_shared_expert() {
+    constexpr std::int64_t kExperts = 4;
+    constexpr std::int64_t kHidden = 64;
+    constexpr std::int64_t kInter = 32;
+    constexpr std::int64_t kShared = 16;
+
+    std::vector<TypedTensor> tensors{
+        {"model.embed_tokens.weight", {16, kHidden}, "BF16"},
+        {"model.norm.weight", {kHidden}, "BF16"},
+        {"lm_head.weight", {16, kHidden}, "BF16"},
+    };
+    const std::string lp = "model.layers.0.";
+    tensors.push_back({lp + "input_layernorm.weight", {kHidden}, "BF16"});
+    tensors.push_back({lp + "post_attention_layernorm.weight", {kHidden}, "BF16"});
+    for (const char* proj : {"q_proj", "k_proj", "v_proj", "o_proj"}) {
+        tensors.push_back({lp + "self_attn." + proj + ".weight", {kHidden, kHidden}, "BF16"});
+    }
+    tensors.push_back({lp + "mlp.gate.weight", {kExperts, kHidden}, "BF16"});
+    tensors.push_back({lp + "mlp.experts.gate_up_proj", {kExperts, 2 * kInter, kHidden}, "BF16"});
+    tensors.push_back({lp + "mlp.experts.down_proj", {kExperts, kHidden, kInter}, "BF16"});
+    tensors.push_back({lp + "mlp.shared_expert.gate_proj.weight", {kShared, kHidden}, "BF16"});
+    tensors.push_back({lp + "mlp.shared_expert.up_proj.weight", {kShared, kHidden}, "BF16"});
+    tensors.push_back({lp + "mlp.shared_expert.down_proj.weight", {kHidden, kShared}, "BF16"});
+    tensors.push_back({lp + "mlp.shared_expert_gate.weight", {1, kHidden}, "BF16"});
+
+    const std::filesystem::path dir =
+        write_typed_checkpoint("qwen3_5_moe_shared", tensors);
+
+    std::string open_error;
+    pie_loader::Checkpoint checkpoint = pie_loader::Checkpoint::open(dir.string(), &open_error);
+    check(static_cast<bool>(checkpoint), "the synthetic checkpoint opens: " + open_error);
+    if (!checkpoint) {
+        std::filesystem::remove_all(dir);
+        return;
+    }
+
+    const pie_cuda_driver::model::ModelFacts facts{
+        .model_type = "qwen3_5_moe",
+        .quant_method = "",
+        .num_hidden_layers = 1,
+        .num_experts = kExperts,
+        .head_dim = 0,
+        .mamba_groups = 0,
+    };
+    namespace model = pie_cuda_driver::model;
+    const bool folded = model::qwen35_fused_shared_scalar_gate_enabled();
+    const std::string joined =
+        lp + "mlp.shared_expert." + (folded ? "gate_up_gate_proj.weight" : "gate_up_proj.weight");
+
+    for (std::uint32_t tp : {1u, 2u}) {
+        const std::string at = " (tp " + std::to_string(tp) + ")";
+        auto target = pie_cuda_driver::cuda_device_target();
+        target.tp_size = tp;
+        target.tp_rank = 0;
+
+        pie_loader::ModelContract contract;
+        try {
+            model::ContractBuilder builder(checkpoint, facts, target, "",
+                                           model::Mxfp4MoeRequest::Auto,
+                                           model::Component::Full,
+                                           /*stream_routed_experts=*/false, contract);
+            model::author_qwen3_5_moe_contract(builder);
+            builder.finish();
+        } catch (const std::exception& error) {
+            check(false, "authoring" + at + ": " + error.what());
+            continue;
+        }
+
+        const auto v = contract.view();
+        std::map<std::string_view, std::vector<std::int64_t>> shapes;
+        for (std::size_t i = 0; i < v.tensors.len; ++i) {
+            const auto& t = v.tensors.ptr[i];
+            shapes[view_of(t.name)] =
+                std::vector<std::int64_t>(t.shape.ptr, t.shape.ptr + t.shape.len);
+        }
+
+        const std::int64_t local = kShared / static_cast<std::int64_t>(tp);
+        check(shapes[joined] ==
+                  std::vector<std::int64_t>{2 * local + (folded ? 1 : 0), kHidden},
+              "the join is this rank's two bands, in row order" + at);
+        // Additive: the fold-into-routed path reads these separately.
+        check(shapes.count(lp + "mlp.shared_expert.gate_proj.weight") == 1 &&
+                  shapes.count(lp + "mlp.shared_expert.up_proj.weight") == 1,
+              "the unfused projections survive beside it" + at);
+        check(shapes[lp + "mlp.shared_expert.gate_proj.weight"] ==
+                  std::vector<std::int64_t>{local, kHidden},
+              "and are themselves sharded" + at);
+
+        try {
+            const pie_loader::PieLoaderContractRequest request =
+                pie_loader::build_contract_request(checkpoint, target, v);
+            const pie_loader::LoadPlan plan = pie_loader::LoadPlan::compile(request);
+            plan.verify(request);
+        } catch (const std::exception& error) {
+            check(false, "compiling" + at + ": " + error.what());
+        }
+    }
+    std::filesystem::remove_all(dir);
+}
+
 /// Qwen3-MoE declares its per-expert weights as a group when asked to stream.
 ///
 /// The plain HF MoE source layout -- one tensor per expert per projection --
@@ -2282,6 +2388,7 @@ int main() {
     test_qwen3_5_gdn_splits_by_block();
     test_qwen3_5_mtp_int8_lm_head();
     test_gpt_oss_native_repack_is_rank_blind();
+    test_qwen3_5_moe_joins_the_shared_expert();
     test_qwen3_moe_streams_experts_as_a_group();
     test_gpt_oss_streams_experts_as_a_group();
     test_streamed_expert_groups_follow_the_resident_tp_layout();

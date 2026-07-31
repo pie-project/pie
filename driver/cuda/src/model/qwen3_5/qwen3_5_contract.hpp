@@ -222,6 +222,84 @@ inline void mtp_int8_lm_head(ContractBuilder& b) {
     b.quantized_view(std::string(head->name), "mtp.lm_head", PieLoaderQuantScheme::Int8Symmetric);
 }
 
+namespace contract_detail {
+
+/// Join the shared expert's gate and up projections the MoE forward reads
+/// pre-fused, and optionally the scalar gate row after them.
+///
+/// `qwen3_5_moe_forward` picks one of three shapes for the shared expert:
+/// `[2*Is+1, H]` when the scalar gate is folded in, `[2*Is, H]` when it is not,
+/// and two separate GEMMs when neither fused tensor was bound. The bind used to
+/// build whichever of the first two applied with a pair of device-to-device
+/// copies; it is a `concat` on axis 0, which is what this says.
+///
+/// The sources are **not** consumed. Unlike the Gated DeltaNet join, both
+/// unfused projections stay live: the fold-into-routed path
+/// (`try_fold_shared_into_routed`) reads them separately, and which path runs
+/// is a per-step decision. So this slab is additive, exactly like the Kimi and
+/// DSv4 expert stacks.
+///
+/// Only bf16 sources, because the bind had exactly one converter and a
+/// checkpoint that ships this pair quantized wants the quantized kernels rather
+/// than a second dequantized copy. The scalar gate is replicated, not sharded,
+/// so it is named directly while gate and up take the column-parallel split.
+inline void shared_expert_gate_up_join(ContractBuilder& b, const std::string& layer_prefix) {
+    const std::string lp = layer_prefix + "mlp.shared_expert";
+    const SourceTensor* gate = b.find(b.source_name(lp + ".gate_proj.weight"));
+    const SourceTensor* up = b.find(b.source_name(lp + ".up_proj.weight"));
+    if (gate == nullptr || up == nullptr) return;
+    if (!contract_detail::is_raw(gate->encoding, PieLoaderDType::BF16) ||
+        !contract_detail::is_raw(up->encoding, PieLoaderDType::BF16)) {
+        return;
+    }
+    if (gate->shape.size() != 2 || up->shape.size() != 2 ||
+        gate->shape[1] != up->shape[1]) {
+        return;
+    }
+
+    const Node gate_local = b.split(b.contract().src(std::string(gate->name)), 0);
+    const Node up_local = b.split(b.contract().src(std::string(up->name)), 0);
+    const std::int64_t rows =
+        b.local_extent(gate->shape[0]) + b.local_extent(up->shape[0]);
+
+    const SourceTensor* scalar =
+        qwen35_fused_shared_scalar_gate_enabled()
+            ? b.find(b.source_name(lp + "_gate.weight"))
+            : nullptr;
+    if (scalar != nullptr &&
+        (!contract_detail::is_raw(scalar->encoding, PieLoaderDType::BF16) ||
+         scalar->shape.size() != 2 || scalar->shape[1] != gate->shape[1])) {
+        scalar = nullptr;
+    }
+
+    if (scalar != nullptr) {
+        b.define(b.output_name(lp + ".gate_up_gate_proj.weight"),
+                 b.contract().concat({gate_local, up_local,
+                                      b.contract().src(std::string(scalar->name))},
+                                     0),
+                 gate->encoding,
+                 std::vector<std::int64_t>{rows + scalar->shape[0], gate->shape[1]});
+    } else {
+        b.define(b.output_name(lp + ".gate_up_proj.weight"),
+                 b.contract().concat({gate_local, up_local}, 0), gate->encoding,
+                 std::vector<std::int64_t>{rows, gate->shape[1]});
+    }
+
+}
+
+/// Every module that carries a shared expert: the decoder layers and, when the
+/// checkpoint ships one, the speculative-decoding block. The MTP layer is not
+/// under `decoder_layer_prefix()`, and its bind runs the same fusion.
+inline void shared_expert_gate_up_joins(ContractBuilder& b) {
+    for (std::uint32_t layer = 0; layer < b.facts().num_hidden_layers; ++layer) {
+        shared_expert_gate_up_join(
+            b, std::string(b.decoder_layer_prefix()) + std::to_string(layer) + ".");
+    }
+    shared_expert_gate_up_join(b, "mtp.layers.0.");
+}
+
+}  // namespace contract_detail
+
 /// qwen3_5, qwen3_5_text: a dense hybrid decoder under the usual names.
 inline void author_qwen3_5_contract(ContractBuilder& b) {
     b.allow_bf16_runtime_quant();
@@ -256,6 +334,7 @@ inline void author_qwen3_5_moe_contract(ContractBuilder& b) {
     // order the bound driver expects.
     const bool gate_second = qwen35_moe_gate_up_swapped();
     b.fused_moe_gate_up_tp_slices(gate_second);
+    contract_detail::shared_expert_gate_up_joins(b);
     contract_detail::hf_moe_expert_stacks(b, gate_second);
     b.publish_remaining();
 }

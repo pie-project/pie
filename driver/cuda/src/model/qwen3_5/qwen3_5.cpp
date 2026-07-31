@@ -77,12 +77,6 @@ Qwen3_5Weights bind_qwen3_5(LoadedModel& engine) {
     // ascending order. Linear layers don't occupy KV-cache slots —
     // their state lives in the recurrent/conv caches built by the
     // forward.
-    // owned_bf16_buffers must not reallocate after we hand out pointers
-    // — `Lw.la_in_proj_qkv` etc. are observers into this vector. Reserve
-    // up front for the worst case (3 sliced tensors + 2 fused GDN
-    // tensors + fused full-attn QGKV, plus MTP) so push_back never
-    // moves the storage.
-    w.owned_bf16_buffers.reserve(static_cast<std::size_t>(L) * 6 + 4);
 
     int kv_slot = 0;
     for (int li = 0; li < L; ++li) {

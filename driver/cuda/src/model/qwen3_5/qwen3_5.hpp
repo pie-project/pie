@@ -105,7 +105,6 @@ struct Qwen3_5Weights {
     // engine loader stores these tensors replicated because the
     // [K1 | K2 | V] block layout doesn't shard cleanly under uniform
     // axis-0 partitioning, so we slice per-block here.
-    std::vector<DeviceTensor> owned_bf16_buffers;
 
     struct MtpWeights {
         const DeviceTensor* pre_fc_norm_embedding = nullptr;

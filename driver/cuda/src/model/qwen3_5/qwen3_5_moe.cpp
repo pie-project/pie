@@ -77,7 +77,9 @@ void bind_routed_experts(const LoadedModel& engine, const std::string& lp, int e
 // Padding the fused weight up to a multiple of 8 would recover the saved
 // launch as well -- the swiglu and scalar-gate kernels already take the
 // row stride as an argument -- but is worth only ~0.3 ms more.
-bool fused_shared_scalar_gate_enabled() {
+} // namespace
+
+bool qwen35_fused_shared_scalar_gate_enabled() {
     static const bool enabled = [] {
         const char* v = std::getenv("PIE_QWEN35_FUSED_SHARED_SCALAR_GATE");
         if (v == nullptr || v[0] == '\0') return false;
@@ -85,6 +87,8 @@ bool fused_shared_scalar_gate_enabled() {
     }();
     return enabled;
 }
+
+namespace {
 
 // Qwen 3.5 / 3.6 ship as multimodal containers, so their text-tower
 // weights live under `model.language_model.…`. Qwen3-MoE (Qwen3-30B-A3B)
@@ -95,71 +99,6 @@ const char* select_prefix(const LoadedModel& e) {
         return "model.language_model.";
     }
     return "model.";
-}
-
-DeviceTensor concat_axis0_bf16(
-    const DeviceTensor& first,
-    const DeviceTensor& second,
-    const char* what)
-{
-    if (first.dtype() != DType::BF16 || second.dtype() != DType::BF16) {
-        throw std::runtime_error(std::string(what) + ": expected bf16 tensors");
-    }
-    if (first.shape().empty() || first.shape().size() != second.shape().size()) {
-        throw std::runtime_error(std::string(what) + ": rank mismatch");
-    }
-    for (std::size_t i = 1; i < first.shape().size(); ++i) {
-        if (first.shape()[i] != second.shape()[i]) {
-            throw std::runtime_error(std::string(what) + ": trailing shape mismatch");
-        }
-    }
-
-    std::vector<std::int64_t> shape = first.shape();
-    shape[0] += second.shape()[0];
-    auto fused = DeviceTensor::allocate(DType::BF16, shape);
-    auto* dst = static_cast<std::uint8_t*>(fused.data());
-    CUDA_CHECK(cudaMemcpy(
-        dst, first.data(), first.nbytes(), cudaMemcpyDeviceToDevice));
-    CUDA_CHECK(cudaMemcpy(
-        dst + first.nbytes(), second.data(), second.nbytes(),
-        cudaMemcpyDeviceToDevice));
-    return fused;
-}
-
-DeviceTensor concat_axis0_bf16(
-    const DeviceTensor& first,
-    const DeviceTensor& second,
-    const DeviceTensor& third,
-    const char* what)
-{
-    if (first.dtype() != DType::BF16 || second.dtype() != DType::BF16 ||
-        third.dtype() != DType::BF16) {
-        throw std::runtime_error(std::string(what) + ": expected bf16 tensors");
-    }
-    if (first.shape().empty() || first.shape().size() != second.shape().size() ||
-        first.shape().size() != third.shape().size()) {
-        throw std::runtime_error(std::string(what) + ": rank mismatch");
-    }
-    for (std::size_t i = 1; i < first.shape().size(); ++i) {
-        if (first.shape()[i] != second.shape()[i] ||
-            first.shape()[i] != third.shape()[i]) {
-            throw std::runtime_error(std::string(what) + ": trailing shape mismatch");
-        }
-    }
-
-    std::vector<std::int64_t> shape = first.shape();
-    shape[0] += second.shape()[0] + third.shape()[0];
-    auto fused = DeviceTensor::allocate(DType::BF16, shape);
-    auto* dst = static_cast<std::uint8_t*>(fused.data());
-    CUDA_CHECK(cudaMemcpy(
-        dst, first.data(), first.nbytes(), cudaMemcpyDeviceToDevice));
-    CUDA_CHECK(cudaMemcpy(
-        dst + first.nbytes(), second.data(), second.nbytes(),
-        cudaMemcpyDeviceToDevice));
-    CUDA_CHECK(cudaMemcpy(
-        dst + first.nbytes() + second.nbytes(), third.data(), third.nbytes(),
-        cudaMemcpyDeviceToDevice));
-    return fused;
 }
 
 }  // namespace
@@ -244,7 +183,6 @@ Qwen3_5MoeWeights bind_qwen3_5_moe(const LoadedModel& engine) {
     // Per layer we may push: 3 linear-attn slices (qkv, conv_w, conv_b),
     // 2 fused linear-attn projection tensors, and a fused shared-expert
     // gate/up tensor.
-    w.owned_bf16_buffers.reserve(static_cast<std::size_t>(L) * 8);
 
     int kv_slot = 0;
     for (int li = 0; li < L; ++li) {
@@ -329,25 +267,12 @@ Qwen3_5MoeWeights bind_qwen3_5_moe(const LoadedModel& engine) {
                 engine.quant_meta(lp + "mlp.shared_expert.down_proj.weight");
             Lw.shared_gate_quant =
                 engine.quant_meta(lp + "mlp.shared_expert_gate.weight");
-            if (!Lw.shared_gate_proj_quant.has_value() &&
-                !Lw.shared_up_proj_quant.has_value() &&
-                Lw.shared_gate_proj->dtype() == DType::BF16 &&
-                Lw.shared_up_proj->dtype() == DType::BF16) {
-                if (fused_shared_scalar_gate_enabled() &&
-                    !Lw.shared_gate_quant.has_value() &&
-                    Lw.shared_gate != nullptr &&
-                    Lw.shared_gate->dtype() == DType::BF16) {
-                    w.owned_bf16_buffers.push_back(concat_axis0_bf16(
-                        *Lw.shared_gate_proj, *Lw.shared_up_proj, *Lw.shared_gate,
-                        "qwen3_5_moe: fuse mlp.shared_expert.gate_up_gate_proj"));
-                    Lw.shared_gate_up_gate_proj = &w.owned_bf16_buffers.back();
-                } else {
-                    w.owned_bf16_buffers.push_back(concat_axis0_bf16(
-                        *Lw.shared_gate_proj, *Lw.shared_up_proj,
-                        "qwen3_5_moe: fuse mlp.shared_expert.gate_up_proj"));
-                    Lw.shared_gate_up_proj = &w.owned_bf16_buffers.back();
-                }
-            }
+            // Published by `shared_expert_gate_up_joins`, which decides
+            // between the two shapes; absent when the sources are quantized.
+            Lw.shared_gate_up_gate_proj =
+                maybe(engine, lp + "mlp.shared_expert.gate_up_gate_proj.weight");
+            Lw.shared_gate_up_proj =
+                maybe(engine, lp + "mlp.shared_expert.gate_up_proj.weight");
         }
     }
 
@@ -392,25 +317,12 @@ Qwen3_5MoeWeights bind_qwen3_5_moe(const LoadedModel& engine) {
                 engine.quant_meta(lp + "mlp.shared_expert.down_proj.weight");
             Lw.shared_gate_quant =
                 engine.quant_meta(lp + "mlp.shared_expert_gate.weight");
-            if (!Lw.shared_gate_proj_quant.has_value() &&
-                !Lw.shared_up_proj_quant.has_value() &&
-                Lw.shared_gate_proj->dtype() == DType::BF16 &&
-                Lw.shared_up_proj->dtype() == DType::BF16) {
-                if (fused_shared_scalar_gate_enabled() &&
-                    !Lw.shared_gate_quant.has_value() &&
-                    Lw.shared_gate != nullptr &&
-                    Lw.shared_gate->dtype() == DType::BF16) {
-                    w.owned_bf16_buffers.push_back(concat_axis0_bf16(
-                        *Lw.shared_gate_proj, *Lw.shared_up_proj, *Lw.shared_gate,
-                        "qwen3_5_moe: fuse mtp.shared_expert.gate_up_gate_proj"));
-                    Lw.shared_gate_up_gate_proj = &w.owned_bf16_buffers.back();
-                } else {
-                    w.owned_bf16_buffers.push_back(concat_axis0_bf16(
-                        *Lw.shared_gate_proj, *Lw.shared_up_proj,
-                        "qwen3_5_moe: fuse mtp.shared_expert.gate_up_proj"));
-                    Lw.shared_gate_up_proj = &w.owned_bf16_buffers.back();
-                }
-            }
+            // Published by `shared_expert_gate_up_joins`, which decides
+            // between the two shapes; absent when the sources are quantized.
+            Lw.shared_gate_up_gate_proj =
+                maybe(engine, lp + "mlp.shared_expert.gate_up_gate_proj.weight");
+            Lw.shared_gate_up_proj =
+                maybe(engine, lp + "mlp.shared_expert.gate_up_proj.weight");
         }
         Lw.kv_layer = kv_slot++;
         w.mtp = mtp;
