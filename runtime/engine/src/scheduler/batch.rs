@@ -305,6 +305,15 @@ pub(crate) fn build_frame_submission(
                 arrival,
             })
             .collect();
+        // TODO(stage5-wiring): call `plan_fire_with_model` with the
+        // model-structural sites (`fire_plan::site_table::derive_sites`)
+        // once the scheduler holds a traced plan. It cannot honestly hold
+        // one yet: the runtime lacks the driver's binding facts, and the
+        // driver already traces + validates at boot — see the site_table
+        // module doc's "why build_frame_submission passes no model sites
+        // yet" for the analysis (the likely route is the driver reporting
+        // its validated plan through capabilities, not an engine-side
+        // re-trace).
         let plan = fire_plan::plan_fire(&facts);
         debug_assert_eq!(
             plan.member_order,
