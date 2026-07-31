@@ -35,7 +35,7 @@ struct RmsParams {  // rms_norm.metal:22 (buffer 3)
 
 template <class V>
 inline void bind_const(RawMetalContext& ctx, int ord, std::uint8_t idx, const V& val, int* count) {
-    SlotHandle s = ctx.heap_alloc(sizeof(V));
+    SlotHandle s = ctx.const_slot(ord, idx, sizeof(V));
     if (!s.valid()) {
         throw std::runtime_error("gpt-oss consts: heap_alloc failed (budget too small)");
     }
@@ -70,9 +70,13 @@ KN qmv_kn(Kind k, const GptOssGeometry& g) {
 }
 
 int bind_gptoss_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
-                       const GptOssGeometry& g, int rows, bool paged) {
+                       const GptOssGeometry& g, int rows, bool paged, int head_rows) {
     const std::uint32_t R = std::uint32_t(rows < 1 ? 1 : rows);
     const std::uint32_t K = std::uint32_t(g.experts_per_token);
+    // The tail runs on the SAMPLED rows, which `RowGather` compacted. 0 means
+    // "all of them", which is what a test that reads every row wants.
+    const std::uint32_t S =
+        head_rows < 1 ? R : std::min(R, std::uint32_t(head_rows));
     int count = 0;
 
     // YaRN's frequency table and its temperature correction: computed once, and
@@ -91,12 +95,22 @@ int bind_gptoss_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
         if (const KN kn = qmv_kn(d.kind, g); kn.N != 0) {
             bind_const<std::int32_t>(ctx, ord, (std::uint8_t)bind::GoQmv::K, kn.K, &count);
             bind_const<std::int32_t>(ctx, ord, (std::uint8_t)bind::GoQmv::N, kn.N, &count);
-            if (d.kind == Kind::ExpertGate || d.kind == Kind::ExpertUp ||
-                d.kind == Kind::ExpertDown) {
+            const bool routed = d.kind == Kind::ExpertGate || d.kind == Kind::ExpertUp ||
+                                d.kind == Kind::ExpertDown;
+            if (routed) {
                 // Only `down` reads a per-expert input.
                 bind_const<std::int32_t>(ctx, ord, (std::uint8_t)bind::GoQmv::XSlotStride,
                                          d.kind == Kind::ExpertDown ? kn.K : 0, &count);
             }
+            // The token row's pitch in `x`, and how many expert slots a row
+            // selects. Bound for EVERY matvec, routed or not: at M=1 the row is
+            // 0 and neither is read, and an unbound `constant int&` on the M>1
+            // path is a stride out of uninitialized memory.
+            bind_const<std::int32_t>(
+                ctx, ord, (std::uint8_t)bind::GoQmv::XRowStride,
+                d.kind == Kind::ExpertDown ? std::int32_t(K) * kn.K : kn.K, &count);
+            bind_const<std::int32_t>(ctx, ord, (std::uint8_t)bind::GoQmv::SlotsPerRow,
+                                     routed ? std::int32_t(K) : 1, &count);
             continue;
         }
 
@@ -116,6 +130,11 @@ int bind_gptoss_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                 bind_const<std::int32_t>(ctx, ord, (std::uint8_t)bind::RopeFreqs::HeadDim,
                                          g.head_dim, &count);
                 bind_const<float>(ctx, ord, (std::uint8_t)bind::RopeFreqs::MScale, mscale, &count);
+                // `rope_neox_freqs_mb`'s row pitch. q and k have different head
+                // counts and share the kernel, so its grid cannot supply it.
+                bind_const<std::int32_t>(ctx, ord, (std::uint8_t)bind::RopeFreqs::RowStride,
+                                         d.kind == Kind::RopeQ ? g.q_dim() : g.kv_dim(),
+                                         &count);
                 break;
 
             case Kind::KvAppend:
@@ -187,7 +206,7 @@ int bind_gptoss_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
             case Kind::ExpertSwiGlu:
                 bind_const<SwiGluParams>(
                     ctx, ord, (std::uint8_t)bind::GoSwiGlu::Params,
-                    SwiGluParams{K * std::uint32_t(g.intermediate), g.swiglu_limit,
+                    SwiGluParams{R * K * std::uint32_t(g.intermediate), g.swiglu_limit,
                                  g.swiglu_alpha},
                     &count);
                 break;
@@ -195,7 +214,10 @@ int bind_gptoss_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
             case Kind::ExpertCombine:
                 bind_const<ExpertCombineParams>(
                     ctx, ord, (std::uint8_t)bind::GoExpertCombine::Params,
-                    ExpertCombineParams{R * std::uint32_t(g.hidden), K}, &count);
+                    // A row PITCH, not a count: the kernel takes the row on its
+                    // second grid axis and strides `y`, the weights and `out`
+                    // by it.
+                    ExpertCombineParams{std::uint32_t(g.hidden), K}, &count);
                 break;
 
             case Kind::AttnResidual:
@@ -208,6 +230,12 @@ int bind_gptoss_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                 // A row pitch, not a count: it does not scale with rows.
                 bind_const<std::int32_t>(ctx, ord, (std::uint8_t)bind::Embed::Hidden, g.hidden,
                                          &count);
+                break;
+
+            case Kind::RowGather:
+                bind_const<RowGatherParams>(ctx, ord, (std::uint8_t)bind::RowGather::Params,
+                                            RowGatherParams{std::uint32_t(g.hidden), S},
+                                            &count);
                 break;
 
             default:

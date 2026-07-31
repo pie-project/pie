@@ -238,11 +238,50 @@ template <typename T>
   x[i2] = static_cast<T>(mscale * (x1 * sintheta + x2 * costheta));
 }
 
+// The same rotation over N token rows.
+//
+// `pos.z` is the row: it reads `position[row]` and strides `x` by the row's
+// whole width, which is `n_heads * head_dim` and NOT derivable from this
+// kernel's grid -- q and k have different head counts and share the kernel.
+template <typename T>
+[[kernel]] void rope_neox_freqs_mb(
+    device T* x                       [[buffer(0)]],  // [N, n_head, head_dim]
+    const device int* position        [[buffer(1)]],  // [N]
+    const constant float& scale       [[buffer(2)]],
+    const device float* inv_freq      [[buffer(3)]],  // [rotary_dims/2]
+    const constant int& head_dim      [[buffer(4)]],
+    const constant float& mscale      [[buffer(5)]],
+    const constant int& row_stride    [[buffer(6)]],  // n_heads * head_dim
+    uint3 pos  [[thread_position_in_grid]],
+    uint3 grid [[threads_per_grid]]) {
+  const int i = int(pos.x);
+  const int h = int(pos.y);
+  const int row = int(pos.z);
+  const int half_rd = int(grid.x);
+
+  const float theta = scale * static_cast<float>(position[row]) * inv_freq[i];
+  const float costheta = fast::cos(theta);
+  const float sintheta = fast::sin(theta);
+
+  device T* xr = x + size_t(row) * size_t(row_stride);
+  const int i1 = h * head_dim + i;
+  const int i2 = i1 + half_rd;
+  const float x1 = static_cast<float>(xr[i1]);
+  const float x2 = static_cast<float>(xr[i2]);
+  xr[i1] = static_cast<T>(mscale * (x1 * costheta - x2 * sintheta));
+  xr[i2] = static_cast<T>(mscale * (x1 * sintheta + x2 * costheta));
+}
+
 #define instantiate_rope_freqs(name, itype)                        \
   template [[host_name("rope_neox_freqs_decode_" #name)]]          \
   [[kernel]] void rope_neox_freqs_decode<itype>(                   \
       device itype*, const device int*, const constant float&,     \
-      const device float*, const constant int&, const constant float&, uint2, uint2);
+      const device float*, const constant int&, const constant float&, uint2, uint2); \
+  template [[host_name("rope_neox_freqs_mb_" #name)]]              \
+  [[kernel]] void rope_neox_freqs_mb<itype>(                       \
+      device itype*, const device int*, const constant float&,     \
+      const device float*, const constant int&, const constant float&, \
+      const constant int&, uint3, uint3);
 
 instantiate_rope_freqs(float32, float)
 instantiate_rope_freqs(float16, half)

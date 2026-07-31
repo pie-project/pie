@@ -25,9 +25,12 @@ namespace pie::metal::gemma4 {
 
 int gemma4_qmm_rows(int rows) {
     const int n = rows < 1 ? 1 : rows;
-    // Below the shared selector's minimum the GEMV is genuinely faster (it is
-    // one pass over the weight either way, and the GEMM's tile setup is not
-    // free), so leave those alone.
+    // `kQmmMinBatch` is INHERITED, not measured here: it is qwen3.5's
+    // crossover between the GEMV and the GEMM, and this family's shapes and
+    // weight sizes are not qwen3.5's. It is the one number in this padding
+    // rule that nothing in this driver has checked for gemma4 -- the padding
+    // itself was measured (8 lanes 94.7 -> 160.0 tok/s), the threshold below
+    // which it does not apply was not.
     if (n < kQmmMinBatch) return n;
     const int bm = qmm_bm(n);
     return ((n + bm - 1) / bm) * bm;

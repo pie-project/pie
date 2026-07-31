@@ -716,8 +716,15 @@ bool MetalExecutor::Impl::setup_simple(model::ModelFamily family,
     // The heap: the weights the plan already sized, plus what the family needs
     // on top of them. `plan_heap` is not consulted -- it is `DecodeGeometry`'s.
     const std::size_t weights = load_plan.view().memory.persistent_bytes;
-    const std::size_t heap_bytes =
-        weights + SimpleFamilyEngine::extra_heap_bytes(family, cfg, max_ctx_);
+    // Streamed tensors are bound over a pack, so they must not be counted here:
+    // a heap sized for weights that are then ALSO mapped is the footprint
+    // doubled rather than halved, and on a machine where the model only just
+    // fits that is the difference between running and reading zeros.
+    const auto streams = SimpleFamilyEngine::stream_predicate(family);
+    const std::size_t streamed =
+        streams ? std::size_t(streamable_plan_bytes(load_plan, streams)) : 0;
+    const std::size_t heap_bytes = (weights > streamed ? weights - streamed : weights) +
+                                   SimpleFamilyEngine::extra_heap_bytes(family, cfg, max_ctx_);
     ctx_ = RawMetalContext::create(heap_bytes);
     if (!ctx_) {
         if (err) *err = "RawMetalContext::create failed";

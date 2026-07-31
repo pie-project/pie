@@ -106,12 +106,15 @@ void the_step_is_this_many_dispatches() {
     }
 
     expect_eq(count(dag, Kind::EmbedGather), 1, "one embedding gather");
+    expect_eq(count(dag, Kind::RowGather), 1,
+              "the sampled rows are compacted once, before the tail");
     expect_eq(count(dag, Kind::FinalRms), 1, "one final norm");
     expect_eq(count(dag, Kind::LmHead), 1, "one logits matvec");
     expect_eq(count(dag, Kind::Argmax), 0, "argmax is opt-in");
 
     const int per_layer = 19;
-    expect_eq(s.total, 1 + g.n_layers * per_layer + 2,
+    // Tail: the row gather, the final norm and the LM head.
+    expect_eq(s.total, 1 + g.n_layers * per_layer + 3,
               "the whole step is exactly this many dispatches");
 
     // Three of every layer's matvecs read weights the ROUTER picked, which is

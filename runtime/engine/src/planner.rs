@@ -2021,6 +2021,11 @@ impl ResidencyPlanner {
             );
         }
         let (free, total) = self.port.device_stats();
+        // Pick the victim OUTSIDE the lock: the choice needs reclaim quotes,
+        // and quoting takes store locks (`quote_and_pick` has the same rule).
+        let Some(victim_key) = self.pick_starvation_victim() else {
+            return;
+        };
         let notify = self.with_inner(|inner| {
             // Re-validate: still an unmet head, still no transfers.
             let (_, head) = inner.unmet_head()?;
@@ -2028,11 +2033,7 @@ impl ResidencyPlanner {
             if head_need <= inner.accum.len() as u32 || !inner.evicting.is_empty() {
                 return None;
             }
-            // The youngest parked ALLOCATION (never a restore entry, never
-            // the head unless it stands alone).
-            let (_, victim) = inner.queue.iter_mut().rev().find(|(_, waiter)| {
-                matches!(&waiter.kind, WaitKind::Allocation { outcome: None, .. })
-            })?;
+            let victim = inner.queue.get_mut(&victim_key)?;
             let WaitKind::Allocation {
                 demand,
                 notify,
@@ -2040,8 +2041,11 @@ impl ResidencyPlanner {
                 ..
             } = &mut victim.kind
             else {
-                unreachable!("filtered to allocation entries");
+                return None; // re-typed under the lock: re-plan instead
             };
+            if outcome.is_some() {
+                return None; // served while we were quoting
+            }
             *outcome = Some(Err(PlannerError::Starved {
                 need: demand.kv_pages,
                 free,
@@ -2054,10 +2058,69 @@ impl ResidencyPlanner {
             self.stats.starvations.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
                 cause = ?cause,
-                "planner: pool starved with no reclaim path — failing the youngest parked ask"
+                "planner: pool starved with no reclaim path — failing the youngest parked ask that holds pages"
             );
             notify.notify_waiters();
         }
+    }
+
+    /// Choose which parked ask to destroy, youngest-first, **restricted to
+    /// asks whose destruction actually returns pages to the pool**.
+    ///
+    /// A parked process that holds nothing is not a victim, it is a queue
+    /// entry: it is parked on its FIRST allocation, so it occupies no pool
+    /// capacity and killing it frees exactly zero pages. The wedge therefore
+    /// survives its death and the rung fires again on the next-youngest —
+    /// the destruction cascade. Measured on a 3x-oversubscribed pool
+    /// (§20.40): 752 wedge kills, **737 of them (98%) on
+    /// `NoReclaim::HoldsNothing`**, while the ~190 processes that actually
+    /// held the whole pool were never touched. 752 of 1024 requests were
+    /// destroyed to reclaim nothing.
+    ///
+    /// This is the same lesson [`NoReclaim::HoldsNothing`] already carries
+    /// ("cannot become reclaimable by waiting — only by ALLOCATING; this is
+    /// the case that livelocked the ladder") and that [`Self::quote_and_pick`]
+    /// already applies to EVICTION victims. It was simply never applied at
+    /// the destruction site.
+    ///
+    /// Quoting takes store locks, so the pick happens outside the planner
+    /// lock and the caller re-validates the key under it.
+    ///
+    /// Fallback: if no parked ask holds anything, the wedge cannot be broken
+    /// by any choice, so keep the original rule (youngest) rather than lose
+    /// the deadlock breaker.
+    fn pick_starvation_victim(&self) -> Option<EntryKey> {
+        // Youngest-first parked allocations. Restores are never victims, and
+        // an already-served entry is not parked.
+        let candidates: Vec<(EntryKey, ProcessId)> = self.with_inner(|inner| {
+            inner
+                .queue
+                .iter()
+                .rev()
+                .filter(|(_, waiter)| {
+                    matches!(&waiter.kind, WaitKind::Allocation { outcome: None, .. })
+                })
+                .map(|(key, waiter)| (*key, waiter.pid))
+                .collect()
+        });
+        let fallback = candidates.first().map(|(key, _)| *key);
+        let (model, driver) = self.port.locus();
+        // Chunked, like `quote_and_pick`: quoting the whole fleet under one
+        // KV-lock hold was the planner's p99 hold (§16). The first holder is
+        // usually within the first chunk or two.
+        for chunk in candidates.chunks(16) {
+            let pids: Vec<ProcessId> = chunk.iter().map(|(_, pid)| *pid).collect();
+            let quotes =
+                crate::inferlet::process::residency::kv_reclaim_quotes(&pids, model, driver);
+            for ((key, _), quote) in chunk.iter().zip(quotes) {
+                if let Some(ReclaimQuote::Pages(pages)) = quote
+                    && pages > 0
+                {
+                    return Some(*key);
+                }
+            }
+        }
+        fallback
     }
 
     /// The hog endgame, as a computed predicate: nothing younger can fund

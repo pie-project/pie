@@ -171,6 +171,38 @@ SCENARIOS: list[Scenario] = [
         warmup=1,
         repeat=3,
     ),
+    # ---- the destruction cascade: victims that free nothing ----------------
+    #
+    # PRIVATE (unshared) long prompts, no swap, and a fleet several times
+    # larger than the pool can hold. Every process that gets a prefill in
+    # holds its whole prompt privately; the rest park on their FIRST ask and
+    # therefore hold NOTHING.
+    #
+    # That is the shape that exposed the cascade (§20.40). The starvation
+    # rung picked "the youngest parked allocation" without asking whether
+    # destroying it returns any pages, and the youngest are systematically
+    # the ones parked on their first ask. Measured on a 3x-oversubscribed
+    # pool: 752 wedge kills, 737 of them (98%) on `NoReclaim::HoldsNothing`,
+    # freeing zero pages each, so the wedge survived every one of them and
+    # the rung fired again on the next-youngest. 752 of 1024 requests were
+    # destroyed to reclaim nothing, while the ~190 processes that actually
+    # held the entire pool were never touched.
+    #
+    # The contract is therefore a BOUND ON KILLS, not zero: with no swap the
+    # pool genuinely wedges and a holder must be destroyed to break it. What
+    # must not come back is destroying the waiting queue. `starved` must stay
+    # non-zero so the scenario cannot rot into a run that never reaches the
+    # rung at all.
+    Scenario(
+        name="noswap_cascade",
+        target="starvation victim selection: kills must free pages",
+        args=["--total-pages", "512", "--swap-pool-size", "0",
+              "--num-requests", "192", "--concurrency", "96",
+              "--max-tokens", "64", "--shared-prefix-words", "600"],
+        contract=Contract(max_wall_s=180, min_completed=160, max_failed=32,
+                          require_counters=("parks", "starved")),
+        repeat=2,
+    ),
     # ---- head's own held pages plus its ask exceed the pool ----------------
     Scenario(
         name="hog",

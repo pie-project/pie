@@ -62,6 +62,14 @@ class SimpleFamilyEngine {
     static std::size_t extra_heap_bytes(model::ModelFamily family, const SetupConfig& cfg,
                                         int max_ctx);
 
+    /// Which of this family's tensors are worth streaming, or null if none are.
+    ///
+    /// Streaming binds them over a page-aligned pack instead of copying them
+    /// into the heap, so the heap must be created WITHOUT them -- which is why
+    /// this is answered before the context exists, alongside `extra_heap_bytes`.
+    static std::function<bool(const std::string&)> stream_predicate(
+        model::ModelFamily family);
+
     /// One fire: several requests' new tokens sharing a command buffer.
     ///
     /// This is the shape a mixed prefill+decode batch has. A prefill request

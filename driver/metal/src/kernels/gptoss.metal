@@ -30,11 +30,22 @@ template <typename T>
     device int* expert_ids     [[buffer(1)]],
     device T* expert_weights   [[buffer(2)]],
     constant RouterParams& p   [[buffer(3)]],
-    uint lid [[thread_position_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+    // uint3 rather than uint: Metal requires every position input to have the
+    // same dimensionality, and the threadgroup position below is 3D.
+    uint3 lid3 [[thread_position_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint3 tgid [[threadgroup_position_in_grid]]) {
+  const uint lid = lid3.x;
   const uint n = p.n_experts;
   const uint k = p.experts_per_token;
   constexpr float NEG_INF = -3.0e38f;
+
+  // One threadgroup per token row. Every row routes independently -- which is
+  // the whole reason a batched MoE cannot be one wider matmul.
+  const uint row = tgid.y;
+  logits += size_t(row) * size_t(n);
+  expert_ids += size_t(row) * size_t(k);
+  expert_weights += size_t(row) * size_t(k);
 
   float v = (lid < n) ? float(logits[lid]) : NEG_INF;
 
@@ -75,7 +86,7 @@ template <typename T>
   template [[host_name("router_topk_" #name)]]                     \
   [[kernel]] void router_topk<itype>(                              \
       const device itype*, device int*, device itype*,             \
-      constant RouterParams&, uint, uint);
+      constant RouterParams&, uint3, uint, uint3);
 
 instantiate_router_topk(float32, float)
 instantiate_router_topk(bfloat16, bfloat)
@@ -134,20 +145,27 @@ template <typename T>
     const device T* expert_weights   [[buffer(1)]],
     device T* out                    [[buffer(2)]],
     constant ExpertCombineParams& p  [[buffer(3)]],
-    uint gid [[thread_position_in_grid]]) {
-  if (gid >= p.width) return;
+    uint2 gid [[thread_position_in_grid]]) {
+  const uint c = gid.x;
+  if (c >= p.width) return;
+  // `gid.y` is the token row. `y` is [rows, k, width] -- the routed
+  // down-projection wrote each (row, slot) -- and the weights are [rows, k].
+  const uint row = gid.y;
+  y += size_t(row) * size_t(p.experts_per_token) * size_t(p.width);
+  expert_weights += size_t(row) * size_t(p.experts_per_token);
+  out += size_t(row) * size_t(p.width);
   float acc = 0;
   for (uint e = 0; e < p.experts_per_token; ++e) {
-    acc += float(expert_weights[e]) * float(y[e * p.width + gid]);
+    acc += float(expert_weights[e]) * float(y[e * p.width + c]);
   }
-  out[gid] = static_cast<T>(acc);
+  out[c] = static_cast<T>(acc);
 }
 
 #define instantiate_expert_combine(name, itype)                    \
   template [[host_name("expert_combine_" #name)]]                  \
   [[kernel]] void expert_combine<itype>(                           \
       const device itype*, const device itype*, device itype*,     \
-      constant ExpertCombineParams&, uint);
+      constant ExpertCombineParams&, uint2);
 
 instantiate_expert_combine(float32, float)
 instantiate_expert_combine(bfloat16, bfloat)

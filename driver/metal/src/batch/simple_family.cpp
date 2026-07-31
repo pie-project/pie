@@ -159,7 +159,7 @@ std::vector<std::size_t> g4_pool_elems(const std::vector<gemma4::Dispatch>& dag,
 /// reads as a divergence that is really the dump lying.
 void dump_g4_taps(const std::vector<gemma4::Dispatch>& dag, const Gemma4Geometry& g,
                   const gemma4::ScratchColoring& col, const std::vector<SlotHandle>& pool,
-                  int rows) {
+                  const SlotHandle& logits, int rows, int head_rows) {
     const int n_pool = int(pool.size());
     const auto colour_of = [&](std::size_t di, std::uint8_t bind_index) {
         for (const auto& sb : col.per_dispatch[di]) {
@@ -177,13 +177,27 @@ void dump_g4_taps(const std::vector<gemma4::Dispatch>& dag, const Gemma4Geometry
     for (std::size_t di = 0; di < dag.size(); ++di) {
         G4Tap t{};
         if (!g4_tap_for(dag[di], g, t)) continue;
-        const int c = colour_of(di, t.out_bind);
-        if (c < 0 || c >= n_pool || !pool[std::size_t(c)].valid()) continue;
-        if (last[std::size_t(c)] != int(di)) continue;
+        using K = gemma4::Kind;
+        const bool tail = dag[di].kind == K::RowGather || dag[di].kind == K::FinalRms ||
+                          dag[di].kind == K::LmHead || dag[di].kind == K::FinalSoftcap;
+        // The engine re-points the LAST dispatch at its own logits slot, so its
+        // pool colour is never written; dumping that colour publishes zeros
+        // under the name of the tensor everything downstream depends on.
+        const bool redirected = di + 1 == dag.size();
+        const void* src = nullptr;
+        if (redirected) {
+            src = logits.valid() ? logits.contents() : nullptr;
+        } else {
+            const int c = colour_of(di, t.out_bind);
+            if (c < 0 || c >= n_pool || !pool[std::size_t(c)].valid()) continue;
+            if (last[std::size_t(c)] != int(di)) continue;
+            src = pool[std::size_t(c)].contents();
+        }
+        if (src == nullptr) continue;
         const std::string name = dag[di].layer < 0
             ? std::string(t.name)
             : std::to_string(dag[di].layer) + "." + t.name;
-        dump_golden_bf16(name, pool[std::size_t(c)].contents(), rows, t.width, t.width);
+        dump_golden_bf16(name, src, tail ? head_rows : rows, t.width, t.width);
     }
 }
 
@@ -396,7 +410,7 @@ class Gemma4Engine final : public SimpleFamilyEngine {
     SlotHandle logits_slot() const override { return logits_; }
 
     void dump_taps(int rows) const override {
-        dump_g4_taps(dag_, g_, coloring_, b_.pool, rows);
+        dump_g4_taps(dag_, g_, coloring_, b_.pool, logits_, rows, bound_head_rows_);
     }
 
   private:
@@ -419,6 +433,157 @@ class Gemma4Engine final : public SimpleFamilyEngine {
     SlotHandle logits_{};
 };
 
+/// Which bind index carries each gpt-oss kind's OUTPUT, and how wide it is.
+/// The names are `tests/parity/gptoss_mlx_taps.py`'s, so the engine's dump and
+/// the raw path's diff against the same reference.
+struct GoTap {
+    const char* name;
+    std::uint8_t out_bind;
+    int width;
+};
+
+bool go_tap_for(const gptoss::Dispatch& d, const GptOssGeometry& g, GoTap& out) {
+    using K = gptoss::Kind;
+    switch (d.kind) {
+        case K::EmbedGather:   out = {"embed",       4, g.hidden};   return true;
+        case K::AttnNorm:      out = {"attn_norm",   2, g.hidden};   return true;
+        case K::QmvQ:          out = {"q_proj",      4, g.q_dim()};  return true;
+        case K::QmvK:          out = {"k_proj",      4, g.kv_dim()}; return true;
+        case K::QmvV:          out = {"v_proj",      4, g.kv_dim()}; return true;
+        case K::RopeQ:         out = {"rope_q",      0, g.q_dim()};  return true;
+        case K::RopeK:         out = {"rope_k",      0, g.kv_dim()}; return true;
+        case K::SdpaSink:      out = {"sdpa",        3, g.q_dim()};  return true;
+        case K::QmvO:          out = {"o_proj",      4, g.hidden};   return true;
+        case K::AttnResidual:  out = {"attn_resid",  2, g.hidden};   return true;
+        case K::FfnNorm:       out = {"ffn_norm",    2, g.hidden};   return true;
+        case K::RouterGemv:    out = {"router",      4, g.n_experts}; return true;
+        case K::ExpertGate:
+            out = {"expert_gate", 4, g.experts_per_token * g.intermediate}; return true;
+        case K::ExpertUp:
+            out = {"expert_up",   4, g.experts_per_token * g.intermediate}; return true;
+        case K::ExpertSwiGlu:
+            out = {"expert_act",  2, g.experts_per_token * g.intermediate}; return true;
+        case K::ExpertDown:
+            out = {"expert_out",  4, g.experts_per_token * g.hidden};   return true;
+        case K::ExpertCombine: out = {"moe",         2, g.hidden};   return true;
+        case K::FfnResidual:   out = {"layer_out",   2, g.hidden};   return true;
+        case K::FinalRms:      out = {"final_norm",  2, g.hidden};   return true;
+        case K::LmHead:        out = {"logits",      4, g.vocab};    return true;
+        default: return false;
+    }
+}
+
+/// Only a colour's FINAL writer is named: the in-place kinds (both ropes) share
+/// a buffer with the tap before them, and publishing the earlier tensor under
+/// the earlier name reads as a divergence that is really the dump lying.
+void dump_go_taps(const std::vector<gptoss::Dispatch>& dag, const GptOssGeometry& g,
+                  const gptoss::ScratchColoring& col, const std::vector<SlotHandle>& pool,
+                  const SlotHandle& logits, int rows, int head_rows) {
+    const int n_pool = int(pool.size());
+    const auto colour_of = [&](std::size_t di, std::uint8_t bind_index) {
+        for (const auto& sb : col.per_dispatch[di]) {
+            if (sb.bind_index == bind_index) return int(sb.color);
+        }
+        return -1;
+    };
+    std::vector<int> last(std::size_t(n_pool < 0 ? 0 : n_pool), -1);
+    for (std::size_t di = 0; di < dag.size(); ++di) {
+        GoTap t{};
+        if (!go_tap_for(dag[di], g, t)) continue;
+        const int c = colour_of(di, t.out_bind);
+        if (c >= 0 && c < n_pool) last[std::size_t(c)] = int(di);
+    }
+    for (std::size_t di = 0; di < dag.size(); ++di) {
+        GoTap t{};
+        if (!go_tap_for(dag[di], g, t)) continue;
+        using K = gptoss::Kind;
+        const bool tail = dag[di].kind == K::FinalRms || dag[di].kind == K::LmHead;
+        // The engine re-points the LAST dispatch at its own logits slot, so the
+        // pool colour it was coloured into is never written. Dumping that
+        // colour publishes a buffer of zeros under the name of the tensor
+        // everything downstream depends on -- a divergence that is entirely the
+        // dump lying.
+        const bool redirected = di + 1 == dag.size();
+        const void* src = nullptr;
+        if (redirected) {
+            src = logits.valid() ? logits.contents() : nullptr;
+        } else {
+            const int c = colour_of(di, t.out_bind);
+            if (c < 0 || c >= n_pool || !pool[std::size_t(c)].valid()) continue;
+            if (last[std::size_t(c)] != int(di)) continue;
+            src = pool[std::size_t(c)].contents();
+        }
+        if (src == nullptr) continue;
+        const std::string name = dag[di].layer < 0
+            ? std::string(t.name)
+            : std::to_string(dag[di].layer) + "." + t.name;
+        dump_golden_bf16(name, src, tail ? head_rows : rows, t.width, t.width);
+    }
+}
+
+/// The widest buffer a gpt-oss dispatch touches, in bf16 elements.
+///
+/// Conservative per KIND rather than per bind index -- a colour gets the widest
+/// tensor any dispatch that touches it handles -- which is tight enough to
+/// matter (`hidden` is 2880 against a 201088 vocabulary) and cannot under-count
+/// a buffer the way a per-index table with a missing entry would.
+int go_kind_width(gptoss::Kind k, const GptOssGeometry& g) {
+    using K = gptoss::Kind;
+    const int stack = g.experts_per_token * g.intermediate;
+    const int down = g.experts_per_token * g.hidden;
+    switch (k) {
+        case K::QmvQ: case K::QmvK: case K::QmvV: case K::QmvO:
+        case K::RopeQ: case K::SdpaSink:  return std::max(g.hidden, g.q_dim());
+        case K::RopeK: case K::KvAppend:  return std::max(g.kv_dim(), 1);
+        case K::RouterGemv:               return std::max(g.hidden, g.n_experts);
+        // The ids are 4-byte ints, so they count double against a bf16 slot.
+        case K::RouterTopK:               return std::max(g.n_experts, 2 * g.experts_per_token);
+        case K::ExpertGate: case K::ExpertUp: return std::max(g.hidden, stack);
+        case K::ExpertSwiGlu:             return stack;
+        case K::ExpertDown:               return std::max(stack, down);
+        case K::ExpertCombine:            return std::max(down, g.hidden);
+        case K::LmHead:                   return std::max(g.hidden, g.vocab);
+        // Everything else writes the residual stream. Enumerated rather than
+        // defaulted, because `-Werror=switch` on this file is what stops a new
+        // kind from silently getting a pool slot too small for it -- and a slot
+        // too small is the quietest bug in this driver: the write lands in the
+        // next colour's buffer.
+        case K::EmbedGather:
+        case K::AttnNorm:
+        case K::FfnNorm:
+        case K::AttnResidual:
+        case K::FfnResidual:
+        case K::RowGather:
+        case K::FinalRms:
+        case K::Argmax:                   return g.hidden;
+    }
+    return g.hidden;
+}
+
+std::vector<std::size_t> go_pool_elems(const std::vector<gptoss::Dispatch>& dag,
+                                       const GptOssGeometry& g,
+                                       const gptoss::ScratchColoring& col, int rows,
+                                       int head_rows) {
+    std::vector<std::size_t> elems(std::size_t(col.colors_used), 0);
+    for (std::size_t di = 0; di < dag.size() && di < col.per_dispatch.size(); ++di) {
+        using K = gptoss::Kind;
+        const K kind = dag[di].kind;
+        // The tail's tensors have one row per SAMPLED row; the body's have one
+        // per token.
+        const bool tail = kind == K::RowGather || kind == K::FinalRms || kind == K::LmHead;
+        const std::size_t need = std::size_t(tail ? head_rows : rows) *
+                                 std::size_t(go_kind_width(kind, g));
+        for (const auto& sb : col.per_dispatch[di]) {
+            if (sb.color < 0 || sb.color >= col.colors_used) continue;
+            elems[std::size_t(sb.color)] = std::max(elems[std::size_t(sb.color)], need);
+        }
+    }
+    for (std::size_t& e : elems) {
+        if (e == 0) e = std::size_t(rows) * std::size_t(g.hidden);
+    }
+    return elems;
+}
+
 // ── gpt-oss ─────────────────────────────────────────────────────────────────
 
 class GptOssEngine final : public SimpleFamilyEngine {
@@ -431,9 +596,20 @@ class GptOssEngine final : public SimpleFamilyEngine {
         try {
             const auto storage = load_plan.view();
             pie_loader::CheckpointSource view(storage);
-            StagedWeights staged =
-                stage_plan_weights(ctx, view, load_plan, storage.memory.persistent_bytes);
+            StagedWeights staged = stage_plan_weights(
+                ctx, view, load_plan, storage.memory.persistent_bytes,
+                stream_predicate(pie::metal::model::ModelFamily::GptOss));
             b_.weights = std::move(staged.weights);
+            // The pack must outlive the weights that point into it. Taking only
+            // `staged.weights` and letting `staged` die unmaps it under them,
+            // which reads as weights of exactly zero.
+            stream_pack_ = std::move(staged.stream_pack);
+            if (staged.streamed_bytes > 0) {
+                std::fprintf(stderr,
+                             "[pie-metal] gpt-oss: %.2f GB of experts streamed from a pack, "
+                             "and out of the heap\n",
+                             double(staged.streamed_bytes) / 1e9);
+            }
         } catch (const std::exception& e) {
             if (err) *err = std::string("staging gpt-oss's weights: ") + e.what();
             return false;
@@ -471,14 +647,25 @@ class GptOssEngine final : public SimpleFamilyEngine {
 
         dag_ = gptoss::build_gptoss_dag(g_, /*with_argmax=*/false);
         const gptoss::ScratchPlan sp = gptoss::build_gptoss_scratch(dag_, g_);
-        coloring_ = gptoss::color_gptoss_scratch(dag_, sp);
+        // Under a tap dump every value needs its own buffer, or a later
+        // dispatch overwrites the one being read.
+        coloring_ = gptoss::color_gptoss_scratch(dag_, sp, /*no_recycle=*/golden_taps_enabled());
         if (!coloring_.hazard_free) {
             if (err) *err = "gpt-oss's activation colouring is not hazard-free";
             return false;
         }
+        // Every activation is [rows, width] row-major at M>1, so a pool slot is
+        // as many rows of its own width as the widest dispatch that touches it.
+        // Sizing them all at the vocabulary costs 70x on the body's tensors.
         b_.pool.resize(std::size_t(coloring_.colors_used));
-        const std::size_t widest = std::size_t(gptoss::gptoss_widest_elems(g_)) * 2;
-        for (int c = 0; c < coloring_.colors_used; ++c) b_.pool[std::size_t(c)] = ctx.heap_alloc(widest);
+        // The dense projections pad their row count to a whole GEMM tile, so
+        // the pool has to hold the padded count -- the padding rows are written.
+        const std::vector<std::size_t> elems =
+            go_pool_elems(dag_, g_, coloring_, gptoss::gptoss_qmm_pool_rows(max_rows_),
+                          gptoss::gptoss_qmm_pool_rows(max_sampled_));
+        for (int c = 0; c < coloring_.colors_used; ++c) {
+            b_.pool[std::size_t(c)] = ctx.heap_alloc(elems[std::size_t(c)] * 2);
+        }
 
         b_.io.resize(kIoSlotCount);
         const std::size_t io_bytes =
@@ -490,7 +677,8 @@ class GptOssEngine final : public SimpleFamilyEngine {
         // landed -- otherwise a later member's prompt overwrites an earlier
         // member's answer, which reads as that member being answered from its
         // neighbour's prompt.
-        logits_ = ctx.heap_alloc(std::size_t(max_sampled_ + 1) * std::size_t(g_.vocab) * 2);
+        logits_ = ctx.heap_alloc(std::size_t(gptoss::gptoss_qmm_pool_rows(max_sampled_)) *
+                                 std::size_t(g_.vocab) * 2);
         if (!logits_.valid()) {
             if (err) *err = "gpt-oss logits allocation failed";
             return false;
@@ -500,16 +688,18 @@ class GptOssEngine final : public SimpleFamilyEngine {
         if (!load_decode_psos(ctx, kernels_dir, base_, /*with_argmax=*/false, err)) return false;
         if (!load_multibatch_psos(ctx, kernels_dir, mb_, /*with_d512=*/false, err)) return false;
 
-        gptoss::bind_gptoss_consts(ctx, dag_, g_, /*rows=*/1, /*paged=*/true);
+        gptoss::bind_gptoss_consts(ctx, dag_, g_, /*rows=*/1, /*paged=*/true, /*head_rows=*/1);
+        bound_rows_ = 1;
+        bound_head_rows_ = 1;
         try {
             gptoss::bind_gptoss_dag_paged(ctx, b_, dag_, g_, coloring_, kpages_, vpages_);
         } catch (const std::exception& e) {
             if (err) *err = std::string("binding gpt-oss: ") + e.what();
             return false;
         }
-        tail_ordinal_ = dag_.back().ordinal;
-        ctx.arg_bind_ordinal(tail_ordinal_, (std::uint8_t)bind::GoQmv::Out, logits_);
-        bound_logits_row_ = 0;
+        // The logits leave the pool: the sampler reads a slot of its own, so
+        // the tail writes there and nothing copies afterwards.
+        ctx.arg_bind_ordinal(dag_.back().ordinal, (std::uint8_t)bind::GoQmv::Out, logits_);
         write_u32s(b_.io[int(IoSlot::AttnMaskStride)], {0u});
         if (b_.io[int(IoSlot::AttnMaskEnabled)].contents() != nullptr) {
             std::memset(b_.io[int(IoSlot::AttnMaskEnabled)].contents(), 0, 1);
@@ -561,60 +751,45 @@ class GptOssEngine final : public SimpleFamilyEngine {
                     const EncodeHook& post) override {
         const int rows = int(csr.token_ids.size());
         if (rows <= 0 || rows > max_rows()) return StepTiming{};
+        write_u32s(b_.io[int(IoSlot::TokenId)], csr.token_ids);
+        write_u32s(b_.io[int(IoSlot::Position)], csr.position_ids);
+        write_u32s(b_.io[int(IoSlot::ReqOfToken)], csr.req_of_token);
+        write_u32s(b_.io[int(IoSlot::WPage)], csr.w_page);
+        write_u32s(b_.io[int(IoSlot::WOff)], csr.w_off);
+        write_u32s(b_.io[int(IoSlot::QoIndptr)], csr.qo_indptr);
         write_u32s(b_.io[int(IoSlot::KvPageIndices)], csr.kv_page_indices);
         write_u32s(b_.io[int(IoSlot::KvPageIndptr)], csr.kv_page_indptr);
-
-        StepTiming last{};
-        std::size_t next_sample = 0;
-        for (int r = 0; r < rows; ++r) {
-            // Every row is its own pass, so the per-row IO is written as a
-            // SCALAR at index 0 rather than as an array the kernels index --
-            // the contiguous launch shapes read slot[0], and this path keeps
-            // them.
-            write_u32s(b_.io[int(IoSlot::TokenId)], {csr.token_ids[std::size_t(r)]});
-            write_u32s(b_.io[int(IoSlot::Position)], {csr.position_ids[std::size_t(r)]});
-            write_u32s(b_.io[int(IoSlot::SeqLen)],
-                       {csr.position_ids[std::size_t(r)] + 1});
-            // The CSR is rewritten per row too: with one row in flight, request
-            // 0 IS this row's request, and its page list is the slice the
-            // fire's CSR gave it.
-            write_u32s(b_.io[int(IoSlot::ReqOfToken)], {0u});
-            const std::uint32_t req = csr.req_of_token[std::size_t(r)];
-            const std::uint32_t k0 = csr.kv_page_indptr[std::size_t(req)];
-            const std::uint32_t k1 = csr.kv_page_indptr[std::size_t(req) + 1];
-            std::vector<std::uint32_t> pages(csr.kv_page_indices.begin() + k0,
-                                             csr.kv_page_indices.begin() + k1);
-            write_u32s(b_.io[int(IoSlot::KvPageIndices)], pages);
-            write_u32s(b_.io[int(IoSlot::KvPageIndptr)], {0u, std::uint32_t(pages.size())});
-            write_u32s(b_.io[int(IoSlot::WPage)], {csr.w_page[std::size_t(r)]});
-            write_u32s(b_.io[int(IoSlot::WOff)], {csr.w_off[std::size_t(r)]});
-
-            // A sampled row's logits must survive the rest of the fire, so the
-            // tail writes its own row of the logits slot.
-            const bool sampled =
-                next_sample < csr.sample_rows.size() &&
-                csr.sample_rows[next_sample] == std::uint32_t(r);
-            const int want_row = sampled ? int(next_sample) : max_sampled_;
-            if (want_row != bound_logits_row_) {
-                ctx.arg_bind_ordinal(tail_ordinal_, (std::uint8_t)bind::GoQmv::Out, logits_,
-                                     std::size_t(want_row) * std::size_t(g_.vocab) * 2);
-                bound_logits_row_ = want_row;
-            }
-            if (sampled) ++next_sample;
-
-            const bool first = r == 0;
-            const bool final_row = r + 1 == rows;
-            last = ctx.run_step([&](StepEncoder& se) {
-                if (first && pre) pre(se);
-                gptoss::encode_gptoss_step_paged(se, dag_, g_, base_, mb_, psos_);
-                if (final_row && post) post(se);
-            });
-            if (!last.succeeded()) return last;
+        write_i32(b_.io[int(IoSlot::SeqLen)], std::int32_t(csr.position_ids.back()) + 1);
+        const int head_rows = csr.sample_rows.empty() ? rows : int(csr.sample_rows.size());
+        if (csr.sample_rows.empty()) {
+            std::vector<std::uint32_t> every;
+            every.resize(std::size_t(rows));
+            for (int r = 0; r < rows; ++r) every[std::size_t(r)] = std::uint32_t(r);
+            write_u32s(b_.io[int(IoSlot::SampleRows)], every);
+        } else {
+            write_u32s(b_.io[int(IoSlot::SampleRows)], csr.sample_rows);
         }
-        return last;
+        if (b_.io[int(IoSlot::AttnMaskEnabled)].contents() != nullptr) {
+            std::memset(b_.io[int(IoSlot::AttnMaskEnabled)].contents(), 0, std::size_t(rows));
+        }
+        if (bound_rows_ != rows || bound_head_rows_ != head_rows) {
+            gptoss::bind_gptoss_consts(ctx, dag_, g_, rows, /*paged=*/true, head_rows);
+            bound_rows_ = rows;
+            bound_head_rows_ = head_rows;
+        }
+        return ctx.run_step([&](StepEncoder& se) {
+            if (pre) pre(se);
+            gptoss::encode_gptoss_step_mb(se, dag_, g_, rows, base_, mb_, psos_,
+                                          /*ordinal_base=*/0, head_rows);
+            if (post) post(se);
+        });
     }
 
     SlotHandle logits_slot() const override { return logits_; }
+
+    void dump_taps(int rows) const override {
+        dump_go_taps(dag_, g_, coloring_, b_.pool, logits_, rows, bound_head_rows_);
+    }
 
   private:
     gptoss::GptOssGeometry g_{};
@@ -627,14 +802,30 @@ class GptOssEngine final : public SimpleFamilyEngine {
     MultiBatchPsos mb_{};
     std::vector<SlotHandle> kpages_{};
     std::vector<SlotHandle> vpages_{};
+    /// Keeps the streamed weights' mapping alive; see `init`.
+    std::shared_ptr<void> stream_pack_{};
     int max_sampled_ = 1;
     int max_rows_ = 1;
-    int tail_ordinal_ = 0;
-    int bound_logits_row_ = 0;
+    int bound_rows_ = 0;
+    int bound_head_rows_ = 0;
     SlotHandle logits_{};
 };
 
 }  // namespace
+
+std::function<bool(const std::string&)> SimpleFamilyEngine::stream_predicate(
+    pie::metal::model::ModelFamily family) {
+    const char* on = std::getenv("PIE_METAL_STREAM_EXPERTS");
+    if (on == nullptr || *on == '\0' || std::string(on) == "0") return {};
+    if (family != pie::metal::model::ModelFamily::GptOss) return {};
+    // gpt-oss's routed expert bank is 10.75 of this checkpoint's 11.8 GB, and a
+    // token reads 4 experts in 32 per layer. `.bias` stays resident: 180 KB a
+    // layer against 132 MB, and a page of it is read whichever expert runs.
+    return [](const std::string& n) {
+        if (n.find("mlp.experts.") == std::string::npos) return false;
+        return !(n.size() > 5 && n.compare(n.size() - 5, 5, ".bias") == 0);
+    };
+}
 
 std::size_t SimpleFamilyEngine::extra_heap_bytes(pie::metal::model::ModelFamily family,
                                                  const SetupConfig& cfg, int max_ctx) {
@@ -674,8 +865,19 @@ std::size_t SimpleFamilyEngine::extra_heap_bytes(pie::metal::model::ModelFamily 
         std::string ignore;
         if (!gptoss_geometry(cfg, g, max_ctx, &ignore)) return bytes;
         bytes += std::size_t(g.n_layers) * 2 * gptoss::gptoss_kv_bytes_per_layer(g, max_ctx, 2);
-        bytes += std::size_t(golden_taps_enabled() ? 1024 : 32) *
-                 std::size_t(gptoss::gptoss_widest_elems(g)) * 2;
+        // The activation pool, summed from the SAME colouring the engine will
+        // build. Pure, so asking costs microseconds and removes the guess.
+        int rows = cfg.max_forward_tokens > 0 ? int(cfg.max_forward_tokens) : 1;
+        int sampled = cfg.max_forward_requests > 0 ? int(cfg.max_forward_requests) : 1;
+        if (sampled > rows) sampled = rows;
+        const auto dag = gptoss::build_gptoss_dag(g, /*with_argmax=*/false);
+        const gptoss::ScratchPlan sp = gptoss::build_gptoss_scratch(dag, g);
+        const gptoss::ScratchColoring col =
+            gptoss::color_gptoss_scratch(dag, sp, /*no_recycle=*/golden_taps_enabled());
+        rows = gptoss::gptoss_qmm_pool_rows(rows);
+        sampled = gptoss::gptoss_qmm_pool_rows(sampled);
+        for (const std::size_t e : go_pool_elems(dag, g, col, rows, sampled)) bytes += e * 2;
+        bytes += std::size_t(sampled) * std::size_t(g.vocab) * 2;  // the logits slot
     }
     return bytes;
 }

@@ -368,6 +368,14 @@ enum class GoQmv : uint8_t {
     // guessed would read four copies of the first expert's activation and
     // produce a plausible wrong token.
     XSlotStride = 9,
+    // The token row's pitch in `x`. Stated rather than assumed to be K, because
+    // `down` reads the SwiGLU's [rows, k, intermediate] stack, whose row is k
+    // times as wide as its slot.
+    XRowStride = 10,
+    // How many expert slots each row selects, so a routed dispatch can find
+    // ITS row's ids: at M>1 every row routes independently, which is why a
+    // batched MoE is not one wider matmul.
+    SlotsPerRow = 11,
 };
 
 // router_topk: top-k over the router's logits, then a softmax over the k that
@@ -393,6 +401,10 @@ enum class SdpaSink : uint8_t {
 enum class RopeFreqs : uint8_t {
     X = 0, Position = 1, Scale = 2, InvFreq = 3, HeadDim = 4,
     MScale = 5,  // YaRN's attention-temperature correction on q and k
+    // `rope_neox_freqs_mb` only: the token row's pitch, `n_heads * head_dim`.
+    // Not derivable from the grid -- q and k have different head counts and
+    // share the kernel.
+    RowStride = 6,
 };
 
 enum class RmsResidual : uint8_t {

@@ -24,6 +24,25 @@ use pie_engine::inferlet::process;
 use pie_engine::inferlet::program::{self, ProgramName};
 use tempfile::TempDir;
 
+/// Match production's allocator.
+///
+/// `pie-worker` sets mimalloc for every engine entry point, but a bench target
+/// links neither it nor `startup`, so without this line these numbers come from
+/// glibc malloc -- a machine nobody runs.
+///
+/// Measured at vocab 151936, 400 iterations x 3 rounds, three runs each:
+///
+///     mask_accept_ns   glibc 1299 1315 1316   mimalloc 1215 1251
+///     mask_ns          glibc 1039 1045 2558   mimalloc  987  988
+///
+/// About 6%, with the ranges not overlapping -- real, but far from the 3.8x the
+/// scheduler sees, because a mask reuses one 4748-word bitset instead of
+/// retiring thirty-odd `Vec`s per pass. The variance matters as much as the
+/// mean: glibc threw a 2.5x outlier in three runs and mimalloc landed within
+/// 1ns of itself, so this also makes the bench worth trusting run to run.
+#[global_allocator]
+static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 const INFERLET: &str = "grammar-wit-bench";
 
 struct BenchState {

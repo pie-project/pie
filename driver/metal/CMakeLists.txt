@@ -152,6 +152,8 @@ target_compile_options(pie_driver_metal_lib PRIVATE
 # `Kernel` enum are legitimately partial (a family handles its own kinds and
 # falls through for the rest), and making those an error would only buy a
 # forest of `default:` labels that turn the check back off.
+set_source_files_properties(src/batch/simple_family.cpp
+  PROPERTIES COMPILE_OPTIONS "-Werror=switch")
 set_source_files_properties(src/batch/forward.cpp
   PROPERTIES COMPILE_OPTIONS "-Werror=switch")
 
@@ -472,6 +474,9 @@ if(APPLE)
   add_metal_linked_test(ptir_m0_device_test tests/ptir_m0_device_test.cpp)
   add_metal_linked_test(kv_append_paged_pso_test tests/kv_append_paged_pso_test.cpp)
   # The six gemma4 kernels that shipped with no PSO entry and no binder.
+  add_metal_linked_test(host_buffer_bind_test tests/host_buffer_bind_test.cpp)
+  target_compile_definitions(host_buffer_bind_test PRIVATE
+    PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
   add_metal_linked_test(gemma4_pso_test tests/gemma4_pso_test.cpp)
   target_compile_definitions(gemma4_pso_test PRIVATE
     PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
@@ -484,6 +489,16 @@ if(APPLE)
   add_metal_linked_test(simple_family_executor_test tests/simple_family_executor_test.cpp NEEDS_LOADER)
   target_compile_definitions(simple_family_executor_test PRIVATE
     PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
+  # The same cases again with the weights STREAMED rather than copied. Streaming
+  # is meant to change what is resident and nothing else, so the assertions are
+  # the same assertions -- if it ever changes an answer, the test that says so
+  # is the one that already knows every answer.
+  if(TARGET simple_family_executor_test)
+    add_test(NAME simple_family_executor_streamed_test
+             COMMAND simple_family_executor_test)
+    set_tests_properties(simple_family_executor_streamed_test PROPERTIES
+      ENVIRONMENT "PIE_METAL_STREAM_EXPERTS=1")
+  endif()
   add_metal_linked_test(gemma4_prefill_numerics_test tests/gemma4_prefill_numerics_test.cpp NEEDS_LOADER)
   target_compile_definitions(gemma4_prefill_numerics_test PRIVATE
     PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")

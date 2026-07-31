@@ -1843,6 +1843,83 @@ fn a_padded_head_dim_zeroes_the_buffer_before_it_writes_the_rows() {
     assert_eq!(program.buffer(filled).unwrap().bytes, 40);
 }
 
+/// And the padding is actually zero when the plan runs.
+///
+/// The test above proves the *plan* says `Fill`; nothing proved that executing
+/// it produces zeros, because no golden carries a `Fill` and the goldens are
+/// what drive the host executor. So `HostExecutor::fill` was reachable code
+/// that no test had ever run. The pad is the one region of a materialized
+/// tensor whose bytes come from no source, which makes it exactly the region a
+/// missing zeroing would leave holding whatever the allocator last had.
+#[test]
+fn a_padded_head_dim_materializes_zeros_where_no_source_covers() {
+    let dir = std::env::temp_dir().join(format!("pie_fill_replay_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let snapshot = dir.join("model.safetensors");
+
+    // Four rows of four bf16 elements, every byte non-zero, so a pad that was
+    // left uninitialised cannot pass by coincidence and a pad written from the
+    // wrong offset shows up as source bytes rather than zeros.
+    let source: Vec<u8> = (0..32).map(|i| (i as u8) | 0x80).collect();
+    std::fs::write(&snapshot, &source).unwrap();
+
+    let metadata = CheckpointMetadata {
+        files: vec![CheckpointFile {
+            id: FileId(0),
+            path: "model.safetensors".to_string(),
+            size_bytes: source.len() as u64,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors: vec![RawTensor {
+            id: TensorId(0),
+            name: "q_proj.weight".to_string(),
+            file_id: FileId(0),
+            file_offset: 0,
+            span_bytes: 32,
+            shape: vec![4, 4],
+            encoding: Encoding::Raw(DType::BF16),
+        }],
+    };
+    let contract = ModelContract {
+        groups: Vec::new(),
+        alignment: 1,
+        tensors: vec![TensorContract::new(
+            "q_proj.weight",
+            Expr::concat(
+                1,
+                vec![
+                    Expr::src("q_proj.weight"),
+                    Expr::fill(0.0, TensorType::raw(vec![4, 1], DType::BF16)),
+                ],
+            ),
+            vec![4, 5],
+            Encoding::Raw(DType::BF16),
+        )],
+    };
+
+    let plan = compile_load_plan(&metadata, &contract, StorageTarget::default()).unwrap();
+    let storage = pie_loader::testkit::host_executor::execute_plan(&plan, &dir)
+        .expect("the padded plan does not execute");
+    let got = storage.tensors.get("q_proj.weight").expect("materialized");
+
+    assert_eq!(got.len(), 40, "four rows of five bf16 elements");
+    for row in 0..4 {
+        let at = row * 10;
+        assert_eq!(
+            &got[at..at + 8],
+            &source[row * 8..row * 8 + 8],
+            "row {row} did not get its source bytes"
+        );
+        assert_eq!(
+            &got[at + 8..at + 10],
+            &[0, 0],
+            "row {row}'s padded column is not zero"
+        );
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// A block scale is bytes in the file and an exponent to the GEMM.
 ///
 /// DeepSeek-V4 pairs FP8-E4M3 weights with OCP Microscaling E8M0 scales --

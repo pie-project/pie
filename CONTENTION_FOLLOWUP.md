@@ -6324,3 +6324,339 @@ is not the same as choosing one.
 **Phase 3:** move the width into the calibrator and make it default; reclaim
 the ~1.1 GB `ws.logits` arena that the fused path no longer fills; extend past
 `LlamaLikeModel`/`Qwen3VL`.
+
+## 20.39 The workload sweep: arrival rates, the join-gate deadlock, and where pie actually stands
+
+Every number before this section was measured at one point: a burst of short
+prompts at concurrency 512. This section widens that to shape x volume x
+arrival rate against vLLM, and the widening found more than a ranking.
+
+### The harness could not express an arrival rate
+
+Both harnesses offered every request at t=0 and let engine-side admission be
+the only pacing. `arrival_schedule()` / `ArrivalPacer` (`benches/common.py`)
+add poisson/uniform open-loop arrivals driven by one seeded RNG, so pie and
+vLLM see a byte-identical schedule. `arrival_lag_p99_ms` reports how far the
+client fell behind its own schedule: a large lag means the row measured
+asyncio, not the server. pie's was 2.1 ms in every cell below; vLLM's reached
+176 ms at the highest rate, which slightly *understates* pie's margin there.
+
+### Three measurement defects, found before any conclusion was drawn
+
+1. **Ramp-dominated windows.** The first pass ran 256 requests per cell:
+   0.6 s of wall on shape S, 1.6 s on P. A repeat of one rung differed by 51%
+   (2369 vs 3577 tok/s). Volumes are now sized per shape for >=15 s
+   (`MIN_WALL_S`), and the ledger refuses to quote a shorter row.
+2. **Unequal work.** On the prefix-heavy shape pie reported 139,427 prompt
+   tokens against vLLM's 166,036. The ledger now compares `prompt_tokens`
+   and `output_tokens` across engines and flags any row that differs by >2%.
+3. **Failures counted as throughput.** The cause of (2) was pie failing 41 of
+   256 requests on KV starvation; tok/s over the survivors is not a
+   throughput. `failed` is now a first-class ledger field and a hard warning.
+
+### pie's admission is a count; vLLM's is KV-aware
+
+`--concurrency` maps to a fixed-permit semaphore (`inferlet/process.rs:97-104,
+238-242`) with no notion of KV capacity. Past the concurrency the pool can
+fund, pie does not degrade — it collapses. Prefix-heavy shape, 8192 pages:
+
+| conc | pie tok/s | vLLM tok/s | ratio | pie failed |
+|---|---|---|---|---|
+| 64 | 4900 | 5325 | 0.920 | 0 |
+| 128 | 5501 | 5696 | 0.966 | 0 |
+| 256 | (4437) | 5666 | — | **796/1024** |
+| 512 | (4360) | 5667 | — | **802/1024** |
+
+vLLM is flat across the whole range because its scheduler admits only what
+KV can fund and queues the rest. Mixed-phase shape, same sweep:
+
+| conc | pie tok/s | vLLM tok/s | ratio |
+|---|---|---|---|
+| 64 | 10565 | 8624 | **1.225** |
+| 128 | 13159 | 11429 | **1.151** |
+| 256 | 16000 | 14946 | **1.071** |
+| 512 | 14118 | 16371 | 0.862 (5 failed) |
+
+pie peaks at 256 and regresses; vLLM keeps climbing. The crossover is the
+over-admission cost, not a kernel difference. NOTE: §20-era "KV-aware
+admission" was closed as a lever, but it was closed in the decode-only regime
+where it is a no-op. It is not closed for oversubscribed workloads.
+
+### The join-gate deadlock (fixed, see the commit)
+
+Open-loop arrivals wedged the fleet permanently with the GPU at 0%:
+
+```
+frame k=2 lanes=29 awaited=29 sealed=0 pending_binds=99 staged=99
+pending_slots=99 joins_in_flight=0 departing=0   (nothing executing)
+```
+
+Every lane's front frame was COMPLETE, so `missing == 0`; the seal was held
+purely by `is_joining()`. The mode-2 rebind escape could not help because it
+only decrements `missing`. Every staged successor sat behind a bind, and a
+bind commits through the control slot ordered behind the dispatch this
+unsealed boundary holds — the §20.3 cycle by a route with no escape.
+`join_gate_circular()` recognises exactly that state. Density cost: none
+(conc 512 mean 32647 vs the 32700 baseline, -0.16%, inside +-0.8% noise).
+
+### Open loop, concurrency 128, both engines KV-funded
+
+This is the regime a served deployment actually runs in.
+
+| shape | rate | pie tok/s | vLLM | ratio | pie TTFT p50 | vLLM TTFT p50 | pie e2e p99 | vLLM e2e p99 |
+|---|---|---|---|---|---|---|---|---|
+| M | 50 | 6975 | 6960 | 1.002 | 35.0 | 29.7 | **1181** | 1791 |
+| M | 70 | 9647 | 9584 | 1.007 | 36.0 | 39.6 | **1758** | 2534 |
+| M | 85 | 11499 | 10827 | **1.062** | **41.5** | 700.0 | **2463** | 4151 |
+| M | 95 | 12312 | 10869 | **1.133** | **542.5** | 1719.3 | **3231** | 6148 |
+| X | 22 | 2952 | 2947 | 1.001 | 41.6 | 32.7 | 1064 | 1099 |
+| X | 32 | 4241 | 4236 | 1.001 | 60.3 | 39.4 | 1864 | **1527** |
+| X | 40 | 5075 | 5188 | 0.978 | 191.6 | **50.6** | 3685 | **2785** |
+
+Below saturation both engines track the offered rate exactly and throughput
+cannot discriminate; latency can. On the mixed shape pie holds a lower tail at
+every rate and saturates later — at 85 req/s vLLM's TTFT p50 has already blown
+out to 700 ms while pie is still at 41.5 ms. On the prefix-heavy shape the
+order reverses above ~32 req/s.
+
+### What is true, and what is not
+
+- pie **wins** on interleaved prefill+decode: +7% to +22% closed-loop at
+  KV-funded concurrency, +6% to +13% open-loop near saturation, with a tail
+  1.7x-1.9x lower and a later saturation point.
+- pie **loses** on prefix-heavy: -2% to -8%, and its TTFT is worse at every
+  rate measured (32.7 -> 41.6 ms at the lightest load, before any queueing).
+  Part of that is a real extra hop — pie's TTFT includes the guest's `t0`
+  session message, which vLLM has no analogue of — but the gap grows with
+  load, so queueing dominates it. Not investigated.
+- pie **collapses** past the KV-fundable concurrency instead of queueing.
+  This is the largest single gap and it is a policy gap, not a kernel one:
+  fixing the concurrency by hand recovers pie from 2586 to 5150 tok/s on the
+  same shape (vLLM 5566, unassisted).
+- The prefill-heavy shape P is **not** reported. Its first-pass -36% came
+  from a 1.6 s window and did not survive the volume fix; it has not been
+  re-measured at a credible volume.
+
+---
+
+## §20.40 — WHY PIE DIED: THE DESTRUCTION CASCADE (fixed, `a06b4e31c`)
+
+§20.39 closed with "pie **collapses** past the KV-fundable concurrency
+instead of queueing" and called it a policy gap. That was right about the
+symptom and wrong about the mechanism. Profiled, the collapse is not an
+admission policy at all — it is the planner's last-resort deadlock breaker
+destroying the wrong requests, ~750 times per run, freeing nothing.
+
+### The repro
+
+Shape X (`--shared-prefix-words 600`, 637 prompt tokens, 128 out), 1024
+requests, 8192 pages, `--swap-pool-size 0`, conc 512. Three independent
+runs: `203/1024`, `272/1024`, `205/1024` completed.
+
+### The measurement
+
+`PIE_FIRE_TIMING=waves` gives the park census per wave; `PIE_CONTENTION_TRACE_MS`
+makes `check_starvation` dump `WEDGE-KILL` with a reclaim quote for every
+registered process. Both at once, correlated on the same monotonic clock:
+
+```
+conc 512:  parks_total 1334, parked_now peaks at 512 (= every admitted proc)
+conc 128:  parks_total    0, parked_now 0 for the entire run, 0 failures
+```
+
+The state at every one of the 752 wedges was identical:
+
+```
+queue=512 allocs=512 holders=195 held_pages=8192/8192
+quotes:  828 x Some(Nothing(HoldsNothing))
+         195 x Some(Pages(42))
+```
+
+195 processes hold 42 pages each — **the entire pool** — and each needs one
+more page to take its next decode step. The other 828 are parked on their
+FIRST allocation and hold nothing at all.
+
+### The defect
+
+`check_starvation` picked "the youngest parked ALLOCATION" and failed it
+loud. Under oversubscription the youngest parked asks are systematically the
+ones parked on their first allocation, so **the victim holds nothing**:
+
+```
+752 wedge kills
+737 (98.0%) killed a process quoting NoReclaim::HoldsNothing  -> freed 0 pages
+ 15 ( 2.0%) killed a page holder                              -> freed 42 pages
+holder population across the whole cascade: 195 -> 185.  It never moved.
+```
+
+Killing a page-less process frees nothing, so the wedge survives its death
+and the rung fires again on the next-youngest. The cascade walks the waiting
+queue from the back, destroying it request by request, while the processes
+that actually hold the pool are never touched. 752 of 1024 requests were
+destroyed to reclaim zero pages.
+
+`NoReclaim::HoldsNothing` carries this exact warning in its own doc comment —
+*"cannot become reclaimable by waiting — only by ALLOCATING. This is the case
+that livelocked the ladder"* — and `quote_and_pick` already filters on it when
+choosing EVICTION victims. It was never applied at the destruction site.
+
+### The fix
+
+`pick_starvation_victim` walks parked allocations youngest-first and takes the
+first whose reclaim quote is positive, quoting outside the planner lock in
+chunks (same rule as `quote_and_pick`: quoting the whole fleet under one KV
+lock hold was the p99 hold of §16). If nothing parked holds anything, no
+choice can break the wedge, so the original rule is kept as the fallback and
+the deadlock breaker is never lost.
+
+### Measured
+
+Same repro, no swap, `--total-pages 8192`:
+
+| | completed | failed | tok/s | wall |
+|---|---|---|---|---|
+| before | 203/1024 | 821 | (4504) | 5.8 s |
+| after | **1005/1024** | **19** | **4635** | 27.8 s |
+| after, traced | 1009/1024 | 15 | 4237 | — |
+
+The before-tok/s is in parentheses because it is not a throughput: 80% of the
+work was never done. The after-run does all of it.
+
+Across the concurrency axis (X, 1024 req, no swap):
+
+| conc | before: completed / tok/s | after: completed / tok/s |
+|---|---|---|
+| 128 | 1024 / 5578 | 1024 / 5578 (untouched — 0 parks all run) |
+| 256 | 228 / (4437) | **1007 / 4855** |
+| 384 | — | **1005 / 4787** |
+| 512 | 203 / (4504) | **1005 / 4635** |
+
+With host swap armed (`--swap-pool-size 8192`) the same cell is **1024/1024,
+zero kills, 3138 tok/s** — up 21% from the 2586 measured before this change,
+because the eviction path no longer competes with a destruction cascade.
+
+### The regression test
+
+New contention scenario `noswap_cascade`: private long prompts, no swap, a
+96-wide fleet on a 512-page pool. It bounds kills rather than forbidding them
+(with no swap the pool genuinely wedges and a holder must be destroyed), and
+requires `starved` non-zero so it cannot rot into a run that never reaches the
+rung.
+
+```
+pre-fix:   32/192 completed, 160 failed   FAIL (both attempts)
+post-fix: 186-190/192 completed, 2-6 failed   PASS
+```
+
+### What this does NOT fix, and why
+
+pie at conc 512 is now alive but still at 4635 tok/s against its own 5578 at
+conc 128 and vLLM's 5667 at every concurrency. Three separate mechanisms
+remain, all measured:
+
+1. **pie has no reclamation path that costs no memory.** vLLM's is recompute
+   preemption — it drops a sequence's blocks and re-prefills later, needing
+   zero extra memory. pie's only path is eviction to host swap, and
+   `swap_pool_size` defaults to 0, so the shipped default has *no* way to take
+   a page back from a running process. That is why a holder must be destroyed
+   at all. The 15-19 residual kills are all inside the first 6.4 s ramp; the
+   steady state is clean.
+
+2. **At 100% pool occupancy the planner's fast path is closed for every ask.**
+   `acquire`'s uncontended path (two free-list pops, no planner lock) requires
+   `waiters == 0`. Once the pool is full every decode step of every one of the
+   ~190 resident processes goes through park, queue insert, lane close, drain
+   poke, notify, collect, queue remove. conc 128 never enters this regime (0
+   parks for the whole run), which is most of why it is 20% faster than
+   conc 512 on identical GPU work.
+
+3. **Nothing stops the 190th prefill.** A prefill consumes 42 pages and
+   creates a consumer that will need ~8 more; a decode ask needs 1 page and
+   retires 42 when it completes. FCFS by spawn seq serves them in the same
+   order, so the pool fills with working sets that cannot finish. The exact,
+   constant-free rule ("leave one page per resident process free") only buys
+   16 tokens of runway; the rule that would actually work needs the process's
+   intended output length, which the engine does not know and must not guess
+   (§20.19 closed the predicted form). The clean fix is for the guest to
+   *declare* its working-set budget — vLLM has that as `max_tokens` on the
+   request — which is a WIT/API change, not a planner change.
+
+### Traps found here
+
+- **Failures inflate tok/s.** The pre-fix conc-512 cell reported 4360-4504
+  tok/s while completing 20% of the work. Any cell with `failed > 0` is
+  unquotable as throughput (§20.39's ledger guard exists for exactly this).
+- `--concurrency` means different things to the two engines: for vLLM it is
+  client-side offered concurrency and its scheduler queues behind it; for pie
+  it is a hard count of admitted processes with no KV awareness
+  (`inferlet/process.rs:97-104`). vLLM's tok/s is flat across 64/128/256/512;
+  pie's peaks and then falls off.
+- The sweep runs vLLM with `--no-prefix-caching`, so shape X's shared prefix
+  is shared by NEITHER engine. The 42 private pages per pie process are not a
+  missing-prefix-cache result; the comparison is apples-to-apples and vLLM's
+  advantage on this cell is preemption, not dedup.
+
+### Lever tried and REVERTED: KV-aware admission backpressure
+
+Mechanism 2 above suggests an obvious remedy: stop admitting processes while
+the planner queue is non-empty. A parked ask is *proof* that the pool cannot
+serve the fleet that already exists, so it needs no constant and no per-process
+prediction — the exact objection that closed §20.19 and §20.22. Implemented as
+a `Notify` on `ResidencyPlanner` signalled from `with_inner` whenever the queue
+drains, awaited by the admitting task.
+
+**It deadlocks if placed at execution admission, and does nothing if placed
+where it is safe. Reverted.**
+
+1. *Placed in `ensure_execution_admitted`, in front of the `ADMISSION`
+   semaphore* — the "obvious" spot, since that is the strict-admission gate.
+   Hard deadlock on the first run, all 1024 requests lost:
+
+   ```
+   [pie-sched] driver 0 stalled for 250.000074158s (no progress, work queued)
+   frame k=2 lanes=195 awaited=195 sealed=0 pending_binds=0 staged=315
+              joins_in_flight=0 pending_slots=315 ever_sealed=true
+   ```
+
+   `ensure_execution_admitted` calls `ensure_bind_admitted` **first**
+   (`inferlet/process.rs:448`), and the driver bind is what runs
+   `frame_policy.on_bind_enqueued` (`scheduler/worker.rs:2938,2972`). So by the
+   time the gate is reached the lane is already **staged**, and the frame
+   policy will not seal a frame until every staged lane joins. 315 lanes were
+   staged and gated; the 195 that had joined were all complete and awaiting a
+   seal that could never come; no decode step ran, so no page was ever freed,
+   so the queue never drained, so the gate never opened. **Any KV gate
+   downstream of the bind is a seal deadlock.** This is not specific to this
+   design — it is a property of the staging contract.
+
+2. *Placed at the top of `ensure_bind_admitted`, in front of the
+   `BIND_ADMISSION` permit* — i.e. strictly before staging. Deadlock-free by
+   construction (an unbound process is page-less by `note_admitted`, so no
+   parked ask can be waiting on anything it would release; and with nobody
+   bound the queue is necessarily empty and the gate necessarily open).
+   Confirmed: zero stalls. And confirmed useless. Shape X, conc 512, no swap,
+   three reps each, same build otherwise:
+
+   | | rep 1 | rep 2 | rep 3 | mean |
+   |---|---|---|---|---|
+   | gate off | 4635 (15 failed) | 4767.7 (15) | 4768 (20) | **4723.6** |
+   | gate on | 4737.6 (12) | 4877.9 (13) | 4548.4 (27) | **4721.3** |
+
+   0.05% apart on a box that resolves ~2%, with pie's own spread at 3.5%.
+   Failure counts are equally indistinguishable (12/13/27 vs 15/15/20).
+
+**Why it cannot work, in hindsight.** The gate's predicate is *"is anything
+parked right now"*, and by the time anything is parked the pool is already
+full — the 195 working sets that filled it are resident and the damage is
+done. The gate can only stop the 196th, 197th, ... which were never the
+problem: they hold nothing and cost nothing (that is exactly what the
+`HoldsNothing` fix above established). Backpressure that arrives after the
+pool is full is backpressure that arrives too late. To arrive on time it would
+have to know each process's *eventual* working set before admitting it —
+which returns to mechanism 3 and to the guest-declared budget.
+
+**`--concurrency` is on the closed-lever list for this reason and stays
+there.** The residual 15-19 failures on this shape are a real limitation of
+pie's memory model (no recompute preemption, `swap_pool_size` 0 by default),
+not an admission-policy bug, and they are bounded: with `--swap-pool-size 8192`
+the same cell completes 1024/1024 at 3138 tok/s.

@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "batch/forward.hpp"
+#include "batch/golden_tap.hpp"
 
 using namespace pie::metal;
 using namespace pie::metal::batch;
@@ -208,9 +209,15 @@ int main() {
     // running exactly ONE step: <bos> at position 0, the case the raw path
     // pins. Everything after it would silently overwrite the dump.
     const bool taps = std::getenv("PIE_METAL_GOLDEN_DIR") != nullptr;
+    // The two families' taps share names ("0.attn_norm" is both), so a dump run
+    // does ONE of them. `PIE_SFX_TAPS_FAMILY` picks; gemma4 by default.
+    const char* taps_family_env = std::getenv("PIE_SFX_TAPS_FAMILY");
+    const std::string taps_family = taps_family_env != nullptr ? taps_family_env : "gemma4";
+    const bool g4_taps = taps && taps_family == "gemma4";
+    const bool go_taps = taps && taps_family == "gptoss";
 
     // ── gemma4 ──
-    {
+    if (!go_taps) {
         const std::string dir = root + "/gemma4-e2b-pie";
         if (!exists(dir)) {
             std::printf("  gemma4: SKIP (no checkpoint at %s)\n", dir.c_str());
@@ -241,9 +248,16 @@ int main() {
             // the raw path pins at 236761. It isolates the engine from the
             // replay -- one fire, one row, no KV history.
             std::vector<std::uint32_t> one;
-            if (run_family("gemma4/bos", cfg, {2}, 1, one)) {
-                std::printf("    gemma4 <bos> -> %u\n", one[0]);
-                expect(one[0] == 236761, "gemma4's <bos> logits match the raw path");
+            // Under a tap dump the LAST fire is what lands there, so <bos> is
+            // fired ONCE -- continuing would dump the step after the one the
+            // reference describes.
+            if ((!taps || g4_taps) && run_family("gemma4/bos", cfg, {2}, taps ? 0 : 1, one)) {
+                if (taps) {
+                    std::printf("    (gemma4 <bos> taps -> %s)\n", golden_tap_dir().c_str());
+                } else {
+                    std::printf("    gemma4 <bos> -> %u\n", one[0]);
+                    expect(one[0] == 236761, "gemma4's <bos> logits match the raw path");
+                }
             }
             std::vector<std::uint32_t> got;
             // <bos>, then the eight-token prompt the forward test teacher-forces.
@@ -278,7 +292,7 @@ int main() {
     }
 
     // ── gpt-oss ──
-    if (!taps) {
+    if (!taps || go_taps) {
         const std::string dir = root + "/gptoss-20b-pie4";
         if (!exists(dir)) {
             std::printf("  gpt-oss: SKIP (no checkpoint at %s)\n", dir.c_str());
@@ -303,9 +317,16 @@ int main() {
             cfg.gptoss.intermediate = 2880;
             std::vector<std::uint32_t> got;
             // "The capital of France is Paris. The capital of Japan is"
+            // Under a tap dump the LAST step is what lands there, so only the
+            // prompt runs: one fire, twelve rows, every one of them routed
+            // independently.
             if (run_family("gpt-oss", cfg,
                            {976, 9029, 328, 10128, 382, 12650, 13, 623, 9029, 328, 10198, 382},
-                           3, got)) {
+                           taps ? 0 : 3, got)) {
+                if (taps) {
+                    std::printf("    (gpt-oss taps -> %s)\n", golden_tap_dir().c_str());
+                }
+                if (got.size() < 3) return failures == 0 ? 0 : 1;
                 std::printf("    gpt-oss greedy %u %u %u\n", got[0], got[1], got[2]);
                 // " Tokyo. The" -- mlx-lm's, and the part the prompt forces.
                 const std::vector<std::uint32_t> want{40510, 13, 623};
@@ -325,7 +346,7 @@ int main() {
             // one answer twice. A must still answer 40510 ("Tokyo") beside a
             // sibling.
             std::vector<std::uint32_t> ta, tb;
-            if (!taps &&
+            if (!taps && !go_taps &&
                 run_two_sequences(
                     cfg, {976, 9029, 328, 10128, 382, 12650, 13, 623, 9029, 328, 10198, 382},
                     {976, 9029, 328, 10128, 382}, ta, tb)) {
@@ -334,7 +355,12 @@ int main() {
                 expect(ta[0] == 40510,
                        "gpt-oss: a sequence's answer is unchanged by a sibling sharing its "
                        "fire");
-                expect(tb[0] != ta[0] || tb[1] != ta[1],
+                // "The capital of France is" -> " Paris". Pinned rather than
+                // merely "different from A": a 17-row fire takes the wide GEMM
+                // block, and when that pipeline was mis-selected B's last row
+                // was never computed -- which reads as a different token, so a
+                // difference test passed on output nothing had written.
+                expect(tb[0] == 12650,
                        "gpt-oss: and the shorter one is answered from its OWN pages, not its "
                        "neighbour's");
             }

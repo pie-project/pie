@@ -325,6 +325,8 @@ METAL_FUNC void qmv_gptoss_impl(
     int in_vec_size,
     int out_vec_size,
     int x_slot_stride,
+    int x_row_stride,
+    int slots_per_row,
     uint3 tid,
     uint simd_gid,
     uint simd_lid) {
@@ -350,9 +352,16 @@ METAL_FUNC void qmv_gptoss_impl(
 
   // The routed base. Every stride is N * (per-row stride), so the expert axis
   // needs no constants of its own.
+  //
+  // `tid.x` is the token ROW. At M=1 it is always 0 and everything below is the
+  // decode path unchanged; at M>1 each row picks its OWN k experts, so the
+  // selection index is (row, slot) rather than slot -- the whole reason a
+  // batched MoE is not just a wider launch.
+  const int row = int(tid.x);
   const int slot = ROUTED ? int(tid.z) : 0;
+  const int sel = row * slots_per_row + slot;
   if (ROUTED) {
-    const size_t e = size_t(expert_ids[slot]);
+    const size_t e = size_t(expert_ids[sel]);
     ws += e * size_t(out_vec_size) * size_t(in_vec_size_w);
     scales += e * size_t(out_vec_size) * size_t(in_vec_size_g);
     biases += e * size_t(out_vec_size) * size_t(in_vec_size_g);
@@ -366,7 +375,9 @@ METAL_FUNC void qmv_gptoss_impl(
   // intermediate]` stack, so its stride is K. Reading slot 0 for every expert
   // is not a crash -- it is four copies of the first expert's activation, which
   // survives all the way to a plausible wrong token.
-  const device T* x_row = x + tid.x * in_vec_size + slot * x_slot_stride;
+  // `x_row_stride` is stated, not `in_vec_size`: `down` reads the SwiGLU's
+  // [rows, k, intermediate] stack, whose row is k times as wide as its slot.
+  const device T* x_row = x + row * x_row_stride + slot * x_slot_stride;
 
   for (int k = 0; k < in_vec_size; k += block_size) {
     const int base = k + int(simd_lid) * values_per_thread;
@@ -386,10 +397,10 @@ METAL_FUNC void qmv_gptoss_impl(
     }
   }
 
-  device T* y_row = y + (ROUTED ? slot : int(tid.x)) * out_vec_size + out_row;
+  device T* y_row = y + (ROUTED ? sel : row) * out_vec_size + out_row;
   const device T* bias_row = bias;
   if (BIASED && ROUTED) {
-    bias_row += size_t(expert_ids[slot]) * size_t(out_vec_size);
+    bias_row += size_t(expert_ids[sel]) * size_t(out_vec_size);
   }
   for (int row = 0; row < results_per_simdgroup; row++) {
     U v = simd_sum(result[row]);
@@ -413,12 +424,14 @@ METAL_FUNC void qmv_gptoss_impl(
       const device T* bias       [[buffer(7)]],                                \
       const device int* expert_ids [[buffer(8)]],                              \
       const constant int& x_slot_stride [[buffer(9)]],                         \
+      const constant int& x_row_stride  [[buffer(10)]],                        \
+      const constant int& slots_per_row [[buffer(11)]],                        \
       uint3 tid       [[threadgroup_position_in_grid]],                        \
       uint simd_gid   [[simdgroup_index_in_threadgroup]],                      \
       uint simd_lid   [[thread_index_in_simdgroup]]) {                         \
     qmv_gptoss_impl<T, group_size, bits, BIASED, ROUTED>(                      \
         w, scales, biases, x, y, bias, expert_ids, in_vec_size, out_vec_size,  \
-        x_slot_stride, tid, simd_gid, simd_lid);                               \
+        x_slot_stride, x_row_stride, slots_per_row, tid, simd_gid, simd_lid);  \
   }
 
 gptoss_qmv_kernel(affine_qmv_tail, false, false)
@@ -431,7 +444,8 @@ gptoss_qmv_kernel(affine_qmv_routed_bias, true, true)
       const device uint32_t*, const device itype*, const device itype*,       \
       const device itype*, device itype*, const constant int&,                \
       const constant int&, const device itype*, const device int*,            \
-      const constant int&, uint3, uint, uint);
+      const constant int&, const constant int&, const constant int&,          \
+      uint3, uint, uint);
 
 instantiate_gptoss_qmv(affine_qmv_tail, bfloat16, bfloat, 64, 4)
 instantiate_gptoss_qmv(affine_qmv_tail_bias, bfloat16, bfloat, 64, 4)
@@ -458,6 +472,11 @@ template <typename T, int group_size>
     uint simd_lid   [[thread_index_in_simdgroup]]) {
   const int row = int(tid.y);
   if (row >= out_vec_size) return;
+  // `tid.z` is the token row: one router per token, and the batch's rows are
+  // independent of one another. Zero at M=1.
+  const int token = int(tid.z);
+  x += size_t(token) * size_t(in_vec_size);
+  y += size_t(token) * size_t(out_vec_size);
   const int words = in_vec_size / 4;        // four u8 per u32
   const int groups = in_vec_size / group_size;
   float acc = 0;

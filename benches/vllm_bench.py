@@ -10,8 +10,10 @@ import time
 from typing import Any
 
 from common import (
+    ArrivalPacer,
     RequestResult,
     add_mode_subcommands,
+    arrival_schedule,
     add_output_dump_args,
     cuda_profiler_start,
     cuda_profiler_stop,
@@ -472,6 +474,12 @@ def run_streaming(args: argparse.Namespace):
                 error=f"{type(e).__name__}: {e}",
             )
 
+    pacer = ArrivalPacer(
+        arrival_schedule(
+            n, args.arrival_rate, args.arrival_process, args.arrival_seed
+        )
+    )
+
     async def drive() -> tuple[list[RequestResult], float, float, int]:
         if args.warmup:
             for j, p in enumerate(prompts[: args.warmup]):
@@ -501,20 +509,21 @@ def run_streaming(args: argparse.Namespace):
         else:
             cuda_profiler_start(args.cuda_profiler_capture)
         start = time.perf_counter()
+        pacer.start()
+
+        async def offer(i: int) -> RequestResult:
+            await pacer.wait(i)
+            return await stream_one(
+                f"req-{i}",
+                prompts[args.warmup + i],
+                prompt_counts[args.warmup + i],
+                sampling_for(i),
+                epoch_monotonic_ns,
+            )
+
         try:
             results = list(
-                await asyncio.gather(
-                    *(
-                        stream_one(
-                            f"req-{i}",
-                            prompts[args.warmup + i],
-                            prompt_counts[args.warmup + i],
-                            sampling_for(i),
-                            epoch_monotonic_ns,
-                        )
-                        for i in range(n)
-                    )
-                )
+                await asyncio.gather(*(offer(i) for i in range(n)))
             )
         finally:
             if profiler_task is None:
@@ -555,6 +564,9 @@ def run_streaming(args: argparse.Namespace):
             "ignore_eos": args.ignore_eos,
             "unique_prompts": args.unique_prompts,
             "cpu affinity": cpu_affinity,
+            "arrival_rate": args.arrival_rate,
+            "arrival_process": args.arrival_process,
+            **pacer.stats(),
         },
     )
     return summary, results

@@ -23,7 +23,10 @@ KN qmv_kn(Kind k, const GptOssGeometry& g);
 /// `rows` is the token count. `paged` picks which attention ABI the KV kinds are
 /// bound against — the same choice gemma4's binder makes, for the same reason:
 /// the contiguous and paged shaders put different meanings at the same slots.
+/// `head_rows` is how many rows the fire will SAMPLE -- what `Kind::RowGather`
+/// compacts, and what the tail after it runs on. 0 means "all of them".
 int bind_gptoss_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
-                       const GptOssGeometry& g, int rows = 1, bool paged = false);
+                       const GptOssGeometry& g, int rows = 1, bool paged = false,
+                       int head_rows = 0);
 
 }  // namespace pie::metal::gptoss
