@@ -20,3 +20,10 @@ rust/target/
 # the compiled extension, built into the package by `maturin develop`
 src/engrain/_engrain*.so
 build/
+
+# latex intermediates; the source and the PDF are what matter
+paper/*.aux
+paper/*.log
+paper/*.blg
+paper/*.out
+paper/*.bbl

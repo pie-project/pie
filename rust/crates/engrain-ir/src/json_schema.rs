@@ -11,6 +11,12 @@
 
 mod typed;
 
+/// The number of required properties an order-free object will enumerate
+/// subsets of, past which it gives up counting and widens. Published because a
+/// caller cannot otherwise know which of the two things it was handed: an
+/// object that enforces `required`, or one that does not.
+pub use typed::{UNORDERED_REQUIRED_BUDGET_CLOSED, UNORDERED_REQUIRED_BUDGET_OPEN};
+
 use anyhow::Result;
 use serde_json::Value;
 

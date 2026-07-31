@@ -1,0 +1,47 @@
+{
+  "default": {
+    "attempted": 200,
+    "compiled": 194,
+    "coverage": 0.97,
+    "levels": {
+      "Shadowed": 193,
+      "Merged": 1
+    },
+    "refusals": {
+      "schema uses a construct the front end ": 3,
+      "grammar does not fit the production bu": 3
+    },
+    "walks": 1546,
+    "complete": 811,
+    "valid": 568,
+    "over_accepted": 243,
+    "validity_given_complete": 0.7003699136868065,
+    "compile_ms_p50": 6.136327516287565,
+    "compile_ms_p99": 449.02317109517753,
+    "resident_mib_p50": 0.04293251037597656,
+    "resident_mib_p99": 0.9251632690429688
+  },
+  "exact": {
+    "attempted": 200,
+    "compiled": 194,
+    "coverage": 0.97,
+    "levels": {
+      "Exact": 181,
+      "Shadowed": 12,
+      "Merged": 1
+    },
+    "refusals": {
+      "schema uses a construct the front end ": 3,
+      "grammar does not fit the production bu": 3
+    },
+    "walks": 1546,
+    "complete": 811,
+    "valid": 568,
+    "over_accepted": 243,
+    "validity_given_complete": 0.7003699136868065,
+    "compile_ms_p50": 24.94616841431707,
+    "compile_ms_p99": 834.1152460779995,
+    "resident_mib_p50": 0.08028602600097656,
+    "resident_mib_p99": 0.9251632690429688
+  }
+}

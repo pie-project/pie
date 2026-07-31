@@ -1,0 +1,1074 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% engrain -- MLSys 2027 submission
+%
+% Every number in this paper is produced by a harness in this repository and
+% names its artifact in the caption. Numbers that are stale with respect to the
+% current implementation are not quoted at all; see paper/PROVENANCE.md.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\documentclass{article}
+
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{subfigure}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{multirow}
+\usepackage{hyperref}
+
+\newcommand{\theHalgorithm}{\arabic{algorithm}}
+
+\usepackage{mlsys2025}
+
+\mlsystitlerunning{Engrain: Device-Resident LR(1) Constrained Decoding}
+
+\begin{document}
+
+\twocolumn[
+\mlsystitle{Engrain: Constrained Decoding with the Parser Resident on the GPU}
+
+\begin{mlsysauthorlist}
+\mlsysauthor{Anonymous Authors}{anon}
+\end{mlsysauthorlist}
+
+\mlsysaffiliation{anon}{Anonymous Institution}
+
+\mlsyskeywords{constrained decoding, structured generation, LR parsing, CUDA
+graphs, LLM serving}
+
+\vskip 0.3in
+
+\begin{abstract}
+Constrained decoding restricts a language model to a formal language by masking
+the logits at every step, and every deployed implementation computes that mask
+on the host. This is not an efficiency detail: a CUDA graph is a recorded
+sequence of \emph{device} work, so a component that requires the host mid-step
+cannot be inside the graph a serving engine replays for its decode loop, cannot
+hand an allowed set to a fused sampler, and cannot follow a speculative draft
+without a synchronization per position. We present \textbf{engrain}, a
+constrained-decoding engine whose LALR(1) parser state --- lexer state, parser
+stack, and conflict forks --- lives in GPU memory and advances in device
+kernels, so that the grammar is part of the decode step rather than an input to
+it. The design contributes an exact device encoding of the (lexer
+state $\times$ parser stack) configuration space, a mask fill that is a single
+launch for an arbitrarily heterogeneous batch, and a cross-step memo that
+answers a third of all steps without touching the tables. On an A100 with a
+151{,}669-token vocabulary, a full constrained step (mask \emph{and} parser
+advance) costs 103--327\,\textmu{}s at batch 512 against XGrammar's
+2{,}041--6{,}811\,\textmu{}s, adds 90\,\textmu{}s to an overlapped decode step
+where a host matcher adds 398, holds its p99 flat when the host loses cores to
+other work while the host matcher's p99 rises 7.8$\times$, and is
+1.35--4.22$\times$ cheaper under speculative decoding. Masks are bit-exact
+against a reference matcher over 7{,}198 verified rows. We also report where
+residency is paid for: at batch 1 we are 0.24--0.90$\times$, our compiler is
+7$\times$ slower, our resident tables are 27$\times$ larger at the median, and
+our lowering still accepts documents its schema rejects 19.6\% of the time
+against XGrammar's 5.4\% --- an audit that located and fixed a silent
+\texttt{required}-dropping defect along the way.
+\end{abstract}
+]
+
+\printAffiliationsAndNotice{}
+
+\section{Introduction}
+\label{sec:intro}
+
+Structured generation --- forcing a language model's output to be valid JSON,
+to match a schema, or to parse under a grammar --- is now a standard serving
+feature. It is implemented by \emph{constrained decoding}: before each token is
+sampled, the engine computes a bitmask over the vocabulary marking which tokens
+can extend the output without leaving the language, and sets the rest to
+$-\infty$.
+
+Every widely deployed implementation --- XGrammar~\cite{dong2024xgrammar},
+llguidance, Outlines~\cite{willard2023efficient}, SynCode~\cite{ugare2025syncode}
+--- computes that mask with a CPU automaton and copies it to the device. The
+choice looks reasonable: the mask is small, the automaton step is a few
+microseconds, and the copy overlaps the forward pass. Measured as a fraction of
+a decode step, it is 4.6\% at batch 512 on a 0.6B model, and an engine that
+made it twice as fast would be 2.3\% faster end to end. Treated as a latency
+problem, constrained decoding is nearly finished.
+
+This paper argues that latency is the wrong frame, and that the interesting
+property is \emph{where the state lives}.
+
+Modern serving engines record their decode step as a CUDA graph and replay it,
+because at batch 512 the per-kernel launch cost otherwise dominates. A CUDA
+graph is a fixed, recorded sequence of device work. Anything the host has to
+\emph{produce} in the middle of a step cannot be recorded into it --- attempting
+to capture a host-side mask fill yields a graph that contains none of the work,
+and replaying it reproduces whatever the host buffer happened to hold last.
+Consequently, every deployed constrained decoder sits \emph{outside} the graph
+and hands a buffer in.
+
+Three things follow, and none of them is a speed argument:
+
+\begin{itemize}
+\item \textbf{The decode loop cannot be captured whole.} A host-dependent
+component cannot join a fully graph-resident or megakernel decode loop at all.
+\item \textbf{The sampler cannot be fused with the constraint.} If the allowed
+set is a device object, a sampler can read the few hundred candidates the
+grammar permits instead of all 151{,}669 logits. If it is produced on the host,
+the only interface is a vocabulary-wide mask.
+\item \textbf{Speculative decoding needs a host round trip per draft position},
+or a specialized batch API, because the parser cannot be advanced and rolled
+back inside the same recorded step.
+\end{itemize}
+
+On each of these the comparison is not ``we are faster'' but ``the other design
+cannot participate''. That is the claim this paper makes, and the engineering it
+requires is the paper's substance: moving an LR parser onto a GPU is not a port.
+
+\paragraph{Why an LR parser, and why that is hard.} A grammar-constrained
+decoder must answer, at every step, ``which of the model's tokens may come
+next''. Model tokens are byte strings from a BPE vocabulary; they straddle
+lexeme boundaries, so a token may end in the middle of a number or a string. The
+parser configuration must therefore carry a \emph{lexer} state as well as a
+parser stack. Worse, an LR parser's next state after a reduction depends on the
+stack below the popped states, so \texttt{next[state, token]} is not a function
+of the state alone and no flat per-state table is exact. Prior GPU work avoids
+this by restricting the grammar class: an acyclic schema DFA, a bounded stack
+depth, or a conservative stack abstraction. Restricting the class is precisely
+what makes those systems unable to serve the grammars people write.
+
+\paragraph{Contributions.}
+\begin{enumerate}
+\item An exact device representation of the (lexer state $\times$ parser stack)
+configuration space for LALR(1) grammars, including runtime forking on
+reduce/reduce conflicts, so that no bound truncates the accepted language
+(\S\ref{sec:automaton}).
+\item A mask fill that is a single kernel launch for a batch of arbitrarily
+many distinct grammars at arbitrarily different document positions, built as a
+\emph{probe} that discovers per-sequence work and a \emph{sweep} that
+redistributes it --- and evidence that the obvious single-kernel fusion is
+16.4$\times$ slower on the batch shape serving actually produces
+(\S\ref{sec:fill}).
+\item A cross-step memo, keyed on the configuration set, that answers 35.6\% of
+real decoding steps without reading the tables (\S\ref{sec:memo}).
+\item Fused constrained sampling: the allowed set is compacted on device and
+consumed directly by the sampler (\S\ref{sec:sampling}), together with an
+honest account of why the win does not survive a ragged batch.
+\item A differential correctness methodology, and 7{,}198 verified mask rows
+across four independent verifications (\S\ref{sec:correctness}).
+\item An evaluation that reports the costs of residency --- compile time,
+resident memory, small-batch latency --- as first-class results rather than
+limitations (\S\ref{sec:costs}).
+\end{enumerate}
+
+\section{Background and Motivation}
+\label{sec:background}
+
+\subsection{Constrained decoding}
+
+Given a context-free grammar $G$ over a terminal alphabet and a model vocabulary
+$V$ of byte strings, a constrained decoder maintains, per sequence, an automaton
+state and computes at each step the set
+$A \subseteq V$ of tokens $t$ such that the output so far concatenated with $t$
+is a prefix of some string in $L(G)$. The mask is the indicator of $A$.
+
+XGrammar~\cite{dong2024xgrammar} --- the most widely deployed implementation,
+and our baseline throughout --- compiles the grammar to a pushdown automaton,
+precomputes for each automaton state an ``adaptive token mask'' partitioned into
+accepted and rejected sets, and at each step walks the per-sequence stack on the
+CPU to fill a bitmask, which is copied to the device and applied by a small
+kernel. Its compiler cache is kilobyte-scale and its compile time is
+milliseconds, both of which are properties we do not match and report honestly
+in \S\ref{sec:costs}.
+
+\subsection{The graph boundary}
+
+At batch 512, a decode step of a small model issues hundreds of kernels whose
+individual launch overheads exceed their execution times. Serving engines
+therefore record the step once as a CUDA graph and replay it. Capture is
+\emph{stream capture}: the operations enqueued on a stream between
+\texttt{cudaStreamBeginCapture} and \texttt{cudaStreamEndCapture} become graph
+nodes. Host code executes normally during capture and contributes nothing.
+
+This makes the boundary sharp rather than gradual. A constrained decoder that
+computes its mask on the host is not ``slower inside a graph''; it is absent
+from the graph, and the replayed step silently uses a stale buffer. The only
+sound arrangement is the one deployed today: keep the fill outside, synchronize,
+hand in a buffer. Every property in \S\ref{sec:intro} follows from that
+arrangement, not from the fill's cost.
+
+\subsection{What the workload actually looks like}
+
+Two properties of real constrained decoding shape the design, and both are
+measured over model-generated documents rather than assumed. We generate 533
+JSON values with Llama-3-8B-Instruct under an XGrammar constraint (50 schemas
+from each of the 11 JSONSchemaBench~\cite{geng2025jsonschemabench} configs,
+temperature 0.8, top-$p$ 0.95, mean 125 tokens) and replay the text through
+each tokenizer's grammar, which is faithful because the state a matcher reaches
+is determined by the bytes consumed.
+
+\begin{table}[t]
+\caption{Allowed-set width over real decoding steps. The median step allows a
+few hundred tokens regardless of vocabulary size, but a third of steps allow
+more than 8{,}192 --- the distribution is bimodal, not concentrated.
+Source: \texttt{results/rigorous-summary.json}.}
+\label{tab:width}
+\vskip 0.1in
+\begin{center}
+\begin{small}
+\begin{tabular}{lrrrr}
+\toprule
+tokenizer & $|V|$ & steps & median $|A|$ & $|A|>8$k \\
+\midrule
+Llama 3      & 128{,}256 & 55{,}406 & 396 & 32.9\% \\
+Qwen 3.6     & 248{,}077 & 66{,}557 & 378 & 32.0\% \\
+Gemma 4      & 262{,}144 & 69{,}313 & 107 & 32.3\% \\
+\bottomrule
+\end{tabular}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table}
+
+Table~\ref{tab:width} shows the first property: \textbf{width is set by the
+schema, not the vocabulary}. A structural position (after a comma, inside an
+object) allows a few hundred tokens whatever the vocabulary size, so the ratio
+between an $O(|V|)$ mask and an $O(|A|)$ allowed set \emph{grows} as vocabularies
+grow. The second property is that the distribution is bimodal: string bodies
+allow nearly everything, and a third of all steps are in one. Any design that
+assumes narrow rows --- including our own fused sampler --- meets that third of
+steps, and \S\ref{sec:sampling} reports what happens when it does.
+
+The third property is about batch shape, and it caused the largest single
+regression in this project. A serving batch is \emph{skewed by construction}:
+continuous batching admits requests at different times, so every sequence sits
+at its own position in its own document, and the amount of parser work each
+needs differs by an order of magnitude. Benchmarks that place every sequence in
+the same parse state measure the one arrangement that flatters a design which
+deduplicates. All measurements in this paper seed each sequence at a random
+position in its document.
+
+\section{Design}
+\label{sec:design}
+
+\subsection{The automaton, and where it ends}
+\label{sec:automaton}
+
+A configuration is a pair (lexer DFA state, parser stack). The compiler produces,
+from a JSON Schema, EBNF or regex front end: an LALR(1) ACTION/GOTO table over
+grammar terminals; a byte-level lexer DFA whose accepting states name terminals;
+and a partition of the model vocabulary into \emph{token groups}.
+
+\paragraph{Token groups.} The bridge between BPE tokens and grammar terminals is
+the expensive object. For each lexer state $\ell$ and each token $t$, feeding
+$t$'s bytes from $\ell$ either fails, or ends in some lexer state $\ell'$ having
+emitted a (possibly empty) sequence of terminals. Two tokens that do the same
+thing from \emph{every} lexer state are interchangeable for masking purposes, so
+the vocabulary is quotiented by that equivalence. Real vocabularies collapse
+hard: 151{,}669 Qwen3 tokens become a few hundred groups per grammar. The mask
+fill then works over groups, and expands to tokens only at the end.
+
+\paragraph{Stacks, exactly.} The classical obstacle is that a reduction pops
+$k$ states and the following GOTO depends on what is exposed underneath, so a
+flat \texttt{next[state, token]} table is not exact. Bounding the stack depth
+and enumerating reachable stacks --- the approach a prototype of this system
+took --- both explodes (compile timed out beyond depth 6 at a 4{,}096-token
+vocabulary) and silently makes the accepted language a strict subset of the
+grammar when the bound is exceeded. That is a correctness cliff, not a
+performance one.
+
+Engrain keeps the stack. A sequence's device state is a bounded-capacity array
+of configurations, each holding a lexer state and an explicit parser stack, and
+the advance kernel performs real reductions with real GOTO lookups. What is
+bounded is the number of \emph{simultaneous} configurations, not the depth of
+any stack, and exceeding that bound is reported as a typed refusal at compile
+time rather than silently narrowing the language.
+
+\paragraph{Conflicts, forked at runtime.} LALR(1) construction on lowered JSON
+Schema produces reduce/reduce conflicts --- \texttt{oneOf} in 86\% of the
+conflicted grammars. Rather than refuse those grammars (which would cost a fifth
+of the corpus) or promote the whole system to full GLR, engrain forks the
+conflicted configuration at runtime and carries both, pruning any fork that dies
+on the next terminal. This is GLR-lite: unbounded in principle, bounded by the
+configuration capacity in practice, and the capacity is checked rather than
+assumed.
+
+\subsection{The fill: a probe and a sweep}
+\label{sec:fill}
+
+The mask fill is the step's device-side work. Its input is, per sequence, a set
+of configurations; its output is a bitmask row over the vocabulary. Conceptually
+it is: for each sequence, for each configuration, for each token group reachable
+from that configuration's lexer state, if the group's terminal is accepted by
+ACTION in the configuration's parser state, OR the group's token bits into the
+row.
+
+The iteration space is therefore ragged in three dimensions at once ---
+sequences have different numbers of configurations, configurations have
+different numbers of groups, and groups have different numbers of tokens. Our
+first CUDA implementation fused the whole thing into one kernel with one block
+per sequence. On a balanced batch it was 2.3--4.5$\times$ faster than the Triton
+implementation it replaced. On a \emph{skewed} batch --- the shape serving
+actually produces --- it was \textbf{16.4$\times$ slower} (9{,}883\,\textmu{}s
+against 604\,\textmu{}s), because one block per sequence makes the fill cost the
+\emph{widest} sequence rather than the total work. Measuring a fused kernel on a
+balanced batch is not measuring it.
+
+The fix is two kernels, and the reason it must be two is a hazard rather than a
+preference:
+
+\begin{itemize}
+\item \textbf{Probe} (one block per sequence) clears the sequence's row and
+records how many (configuration, group) items it will contribute.
+\item \textbf{Sweep} (grid $(\text{batch}, \text{chunks})$) walks a
+\emph{flattened} (configuration, group) iteration space, so a sequence with 64
+configurations of one group each is spread over blocks rather than serialized
+into one.
+\end{itemize}
+
+They cannot be merged: the probe clears rows that the sweep ORs into, and a
+block clearing a row while another accumulates into it loses bits. The chunk
+count is bounded by a scratch budget rather than by the batch --- a thread owns
+two replay windows, so the buffer is $\text{batch} \times \text{chunks} \times
+\text{threads}$, which is 268\,MB at batch 512 with 8 chunks. A 64\,MiB budget
+gives 32 chunks at batch 32 and 2 at batch 512.
+
+After the split the skewed step fell from 9{,}883\,\textmu{}s to
+641\,\textmu{}s, a 15.4$\times$ improvement, and the remaining gap to our own
+Triton reference narrowed from 1.16--3.29$\times$ to 1.16--1.31$\times$.
+
+\subsection{The advance}
+
+After a token is sampled, each sequence's configurations must be advanced by it.
+This is the half that cannot be hidden behind the forward pass, because it
+follows the sampled token. Engrain fuses the whole advance --- feeding the
+token's bytes through the lexer, running reductions and GOTOs, forking on
+conflicts, compacting dead configurations, and writing the rollback history
+entry --- into a single kernel. The rollback path went from 16--20 graph nodes
+to 7 by folding the history write inline, removing a counting kernel and a
+$\text{grid}=(1,)$ prefix sum.
+
+\subsection{Cross-step memoisation}
+\label{sec:memo}
+
+Sequences repeat states. Within one request, consecutive steps often reach a
+configuration set that has been seen before; across a batch under one grammar,
+many sequences share one. Engrain hashes the configuration set on device --- one
+warp per configuration, folding stacks in shared memory --- and looks it up in a
+device-resident memo of previously computed rows. Over a real walk the memo
+answers \textbf{35.6\%} of steps without reading a table.
+
+The hash itself was a bottleneck until it was parallelized: one warp performing
+64 sequential stack reductions cost 65.8\,\textmu{}s; one warp per configuration
+costs 16.3\,\textmu{}s, half of the Triton reference's 32.8.
+
+\subsection{Fused constrained sampling}
+\label{sec:sampling}
+
+Because the allowed set is a device object, the sampler can read it directly.
+A \texttt{compact} kernel emits, per row, a sorted list of allowed token ids
+using a block-wide scan. The sampler then gathers a few hundred logits instead
+of reading all 151{,}669.
+
+The honest accounting of this idea is in \S\ref{sec:eval-sampling}, and it is
+not the one this paper originally claimed. Compaction wins by 7.7$\times$ on a
+sparse row and \emph{loses} by 0.95$\times$ on a dense one, so a fixed policy is
+a net loss on the real bimodal distribution; a per-step choice made on device
+(emit whichever of the allowed set and its complement is shorter) recovers
+1.79$\times$; and on a genuinely ragged batch --- half the rows dense, which is
+the measured steady state --- the advantage falls to 1.05$\times$. The reason is
+not in the parser: it is that XGrammar's mask-apply takes its row indices as a
+host \texttt{List[int]}, and a sampler's output shape is its row count, so any
+subset scheme needs a host synchronization that the residency claim exists to
+avoid.
+
+\subsection{Arena and paging}
+
+All grammars the engine has seen live in one device arena, and a sequence
+carries the index of the grammar it is under, which is what makes a batch of
+distinct grammars a single launch. Under continuous batching the arena must
+reclaim memory, and the hard part is doing so \emph{without moving anything}:
+compaction renumbers survivors, and every recorded CUDA graph would have to be
+re-recorded, giving back exactly what residency bought. Engrain therefore gives
+each array a coalescing free list and recycles identifiers rather than
+renumbering them, pinning any grammar a live sequence is running under and
+evicting the rest least-recently-used. Across 400 admissions of 40 schemas at a
+32\,MB budget, 399 evictions cost \textbf{zero} graph re-records.
+
+\section{Implementation}
+\label{sec:impl}
+
+The compiler is 7 Rust crates ($\approx$\,20k lines): front ends (JSON Schema,
+EBNF, regex), lexer construction and vocabulary grouping, LALR(1) table
+construction, artifact emission, and a reference matcher. The device runtime is
+CUDA compiled to a fatbin for sm\_80--100 plus forward-compatible PTX, embedded
+in the extension so that no driver JIT happens at load; the Python layer is
+$\approx$\,5k lines over PyO3 bindings.
+
+The system keeps two complete backends: the CUDA kernels, and a Triton
+implementation of the same algorithms that is retained as an executable
+reference. A third \texttt{differential} backend runs both on every call and
+compares, which is how kernel-level divergence is caught. All results in this
+paper are from the CUDA backend unless stated.
+
+\section{Experimental Design}
+\label{sec:design-exp}
+
+A systems paper's claims are only as good as the angles from which someone
+tried to break them. We state each claim with the measurement that would
+falsify it, and report all of them --- including the two that came out against
+us and the one that found a bug in our own compiler.
+
+\begin{table}[t]
+\caption{The claims, and the measurement designed to falsify each. Every row is
+reported in \S\ref{sec:eval}, including those whose outcome is negative.}
+\label{tab:design}
+\vskip 0.1in
+\begin{center}
+\begin{small}
+\begin{tabular}{p{0.29\columnwidth}p{0.60\columnwidth}}
+\toprule
+claim & what would falsify it \\
+\midrule
+the fill can live in the decode graph &
+a graph recorded on one grammar assignment replaying wrongly on another \\
+residency is worth having &
+XGrammar's fill overlapping the forward pass so completely that its added cost
+equals ours \\
+the host is a liability &
+the host matcher's tail staying flat as CPU cores are taken away \\
+we are cheaper per step &
+llguidance or a better-tuned XGrammar closing the gap \\
+each mechanism earns its place &
+removing the memo, or capture, changing nothing \\
+heterogeneity is affordable &
+cost growing with the number of distinct schemas in the batch \\
+masks are exact &
+a device row differing from the reference matcher \\
+the grammar is the schema &
+documents the grammar accepts that the schema rejects \\
+\bottomrule
+\end{tabular}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table}
+
+Two design rules apply throughout. \textbf{Both halves are charged}: a step is a
+mask fill \emph{and} a parser advance, and reporting only the fill flatters
+whichever engine has the cheaper one. \textbf{Batches are skewed}: every
+sequence is seeded at a random position in its own document, because a balanced
+batch is the single arrangement that flatters a design which deduplicates, and
+measuring an ablation on one would understate every mechanism at once.
+
+\section{Evaluation}
+\label{sec:eval}
+
+\subsection{Setup}
+
+All measurements are on one NVIDIA A100 80GB PCIe with Qwen3-0.6B's
+151{,}669-token vocabulary unless stated, and use three JSONSchemaBench schemas
+of increasing difficulty (schema 0, 1, 2). Both engines are charged for
+\emph{both} halves of a step --- the mask fill and the parser advance --- because
+reporting only the fill flatters whichever engine has the cheaper one.
+XGrammar's thread count is swept over $\{1,2,4,8,16,\text{auto}\}$ and its best
+is reported; its device work is CUDA-graphed, as ours is. Every sequence is
+seeded at a random position in its document. We report medians of 100--200
+repeats after warm-up.
+
+\subsection{Step latency}
+\label{sec:eval-step}
+
+Table~\ref{tab:step} is the paper's central performance result and also its
+clearest limitation. At batch 1 we lose on all three schemas; the crossover is
+between batch 8 and 32 depending on schema; above it the gap widens
+monotonically to 12.8--20.8$\times$ at batch 512.
+
+\begin{table}[t]
+\caption{Full constrained step (fill + advance), median \textmu{}s, three
+schemas. ``Triton'' is our own reference implementation of the same algorithms,
+included so the CUDA work is measured against the engine it replaces and not
+only against the baseline. Source: \texttt{engrain\_lab.rigor.latency}.}
+\label{tab:step}
+\vskip 0.1in
+\begin{center}
+\begin{small}
+\begin{tabular}{rrrrr}
+\toprule
+batch & schema & engrain & Triton & XGrammar \\
+\midrule
+\multirow{3}{*}{1}
+ & 0 & 49 & --- & 12 \\
+ & 1 & 46 & --- & 14 \\
+ & 2 & 41 & --- & 37 \\
+\midrule
+\multirow{3}{*}{16}
+ & 0 & 57 & --- & 70 \\
+ & 1 & 133 & --- & 82 \\
+ & 2 & 162 & --- & 363 \\
+\midrule
+\multirow{3}{*}{32}
+ & 0 & 59 & 83 & 130 \\
+ & 1 & 136 & 116 & 150 \\
+ & 2 & 194 & 147 & 659 \\
+\midrule
+\multirow{3}{*}{128}
+ & 0 & 63 & 123 & 537 \\
+ & 1 & 139 & 156 & 607 \\
+ & 2 & 257 & 204 & 2{,}073 \\
+\midrule
+\multirow{3}{*}{512}
+ & 0 & 103 & 156 & 2{,}041 \\
+ & 1 & 185 & 203 & 2{,}375 \\
+ & 2 & 327 & 247 & 6{,}811 \\
+\bottomrule
+\end{tabular}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table}
+
+Two readings matter. First, the shape is structural rather than incidental:
+XGrammar's cost is per sequence and scales with the batch, ours is a fixed
+number of launches whose work scales with \emph{distinct} parse states, so the
+gap is a property of the two designs and not of tuning. Second, the small-batch
+loss is also structural: a step sweeps every live configuration's groups
+whatever the batch, so our floor is 41--49\,\textmu{}s at batch 1 while
+XGrammar's per-sequence walk costs 12--37\,\textmu{}s. We do not claim a
+small-batch win, and a serving deployment that runs at batch 1 should not use
+this system.
+
+Table~\ref{tab:step} also shows that our CUDA implementation still trails our
+own Triton reference on the hardest schema (1.24--1.32$\times$). The cause is
+per-item throughput in the sweep, not load imbalance, and we report it because
+an implementation that loses to its own reference has not finished.
+
+\subsection{Heterogeneous batches}
+\label{sec:eval-mixed}
+
+The case the design exists for is a batch of \emph{different} grammars, which is
+what continuous batching produces and what should hurt us: our fill deduplicates
+rows that share a grammar, a lexer state and a stack, and a mixture has fewer
+such rows to share, while our buffers are sized by maxima over the whole pool.
+XGrammar's per-sequence host call is schema-agnostic, so mixing costs it nothing
+structurally.
+
+\begin{table}[t]
+\caption{Cost of a batch drawn from $n$ distinct schemas, median \textmu{}s, and
+the cost of mixing itself: the ratio of the mixed batch to the mean of the same
+schemas run alone at the same batch size.
+Source: \texttt{probe\_mixed\_cost}, 2026-07-31.}
+\label{tab:mixed}
+\vskip 0.1in
+\begin{center}
+\begin{small}
+\begin{tabular}{rrrrrr}
+\toprule
+batch & $n$ & engrain & XGrammar & ratio & mix costs us \\
+\midrule
+\multirow{5}{*}{32}
+ & 1  & 82    & 166    & 2.01$\times$ & 0.99$\times$ \\
+ & 2  & 388   & 181    & 0.47$\times$ & 5.00$\times$ \\
+ & 4  & 401   & 398    & 0.99$\times$ & 5.38$\times$ \\
+ & 8  & 442   & 1{,}991 & 4.51$\times$ & 5.50$\times$ \\
+ & 16 & 394   & 1{,}086 & 2.76$\times$ & 5.19$\times$ \\
+\midrule
+\multirow{5}{*}{128}
+ & 1  & 87    & 529    & 6.09$\times$ & 1.00$\times$ \\
+ & 2  & 390   & 663    & 1.70$\times$ & 4.74$\times$ \\
+ & 4  & 406   & 1{,}595 & 3.92$\times$ & 5.11$\times$ \\
+ & 8  & 1{,}614 & 9{,}594 & 5.94$\times$ & 18.60$\times$ \\
+ & 16 & 453   & 7{,}015 & 15.50$\times$ & 5.54$\times$ \\
+\midrule
+\multirow{5}{*}{512}
+ & 1  & 114   & 1{,}930 & 16.89$\times$ & 0.99$\times$ \\
+ & 2  & 419   & 2{,}456 & 5.86$\times$ & 3.79$\times$ \\
+ & 4  & 430   & 6{,}604 & 15.37$\times$ & 4.02$\times$ \\
+ & 8  & 4{,}025 & 35{,}781 & 8.89$\times$ & 33.17$\times$ \\
+ & 16 & 4{,}052 & 44{,}963 & 11.10$\times$ & 35.98$\times$ \\
+\bottomrule
+\end{tabular}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table}
+
+Table~\ref{tab:mixed} reports both the comparison and the control. Three
+findings, one of them against us:
+
+\textbf{Heterogeneity is a step, not a slope.} At batch 32, one grammar costs
+82\,\textmu{}s and two cost 388; but sixteen also cost 394. The 5$\times$ is paid
+once, when the pool stops being homogeneous, and then does not grow with the
+mixture. This is the property that matters for serving, where the mixture is
+never one.
+
+\textbf{We lose at two schemas and small batch.} 0.47$\times$ at batch 32 with
+two schemas is the worst cell in the table, and it is the direct consequence of
+the step above: we pay the full heterogeneity cost while XGrammar still has only
+64 cheap host calls to make.
+
+\textbf{The absolute cost at 8--16 schemas and batch 512 is bad.} 4\,ms is
+33--36$\times$ what the same schemas cost run alone, against 0.82--1.04$\times$
+for XGrammar. We still win the comparison 8.9--11.1$\times$ because their
+absolute cost is 36--45\,ms, but the honest statement is that pool-wide ceilings
+--- the replay window, the readings a group may have --- are sized by the
+largest member and every sequence pays for it. This is the clearest target for
+future work.
+
+\subsection{Speculative decoding}
+\label{sec:eval-spec}
+
+A draft of $k$ tokens must be checked against the grammar and the accepted
+prefix kept. This is the case where a host-side matcher stops being merely
+costly. XGrammar offers \texttt{traverse\_draft\_tree}, which walks the whole
+draft tree in one call and is close to flat in $k$; comparing against its
+per-position path instead --- as an earlier version of this work did --- overstates
+the gap by roughly 46$\times$ and we do not do so.
+
+\begin{table}[t]
+\caption{Speculative step, median \textmu{}s, against
+\texttt{traverse\_draft\_tree}. Every position pays a fill and an advance on our
+side, and the rollback is charged. Source: \texttt{probe\_speculative},
+2026-07-31.}
+\label{tab:spec}
+\vskip 0.1in
+\begin{center}
+\begin{small}
+\begin{tabular}{rrrrr}
+\toprule
+batch & $k$ & engrain & XGrammar & ratio \\
+\midrule
+\multirow{3}{*}{128}
+ & 1 & 102 & 260 & 2.56$\times$ \\
+ & 4 & 219 & 562 & 2.57$\times$ \\
+ & 8 & 361 & 485 & 1.35$\times$ \\
+\midrule
+\multirow{3}{*}{512}
+ & 1 & 278 & 1{,}072 & 3.85$\times$ \\
+ & 4 & 474 & 1{,}999 & 4.22$\times$ \\
+ & 8 & 730 & 1{,}980 & 2.71$\times$ \\
+\bottomrule
+\end{tabular}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table}
+
+We win at every $k$ measured (Table~\ref{tab:spec}), but the trend is against
+us: our cost grows with $k$ (278/474/730 at batch 512) because each draft
+position pays a fill and an advance, while theirs is roughly flat. Extrapolating,
+the advantage closes near $k\approx16$. The structural point survives ---
+our walk is one recorded graph replayed once, with rollback on device, and needs
+no synchronization per position --- but the arithmetic advantage is finite and we
+say so.
+
+\subsection{The two strongest counter-arguments}
+\label{sec:eval-counter}
+
+Per-step numbers invite two objections, and both are stronger than any ratio we
+can quote. We measured them rather than argued with them.
+
+\paragraph{``XGrammar overlaps its fill with the forward pass, so residency buys
+nothing.''} This is the objection that once forced this project to withdraw a
+claim. We measure a real decode forward pass, each engine alone, and the two
+together on one stream, and charge each engine only the time it \emph{adds} to
+the step (Table~\ref{tab:overlap}). At batch 32 the objection holds: we add
+44\,\textmu{}s and XGrammar adds 46, which is parity. It stops holding as the
+batch grows, because what overlaps is bounded by the forward pass and
+XGrammar's cost is not: at batch 512 it adds 398\,\textmu{}s to a
+22\,ms step against our 90.
+
+\begin{table}[t]
+\caption{Cost \emph{added} to a real decode step when the constraint is
+overlapped with the forward pass. The comparison the objection asks for.
+Source: \texttt{engrain\_lab.rigor.overlap}.}
+\label{tab:overlap}
+\vskip 0.1in
+\begin{center}
+\begin{small}
+\begin{tabular}{rrrrr}
+\toprule
+batch & forward & engrain adds & XGrammar adds & ratio \\
+\midrule
+32  & 6{,}559\,\textmu{}s & 44\,\textmu{}s & 46\,\textmu{}s  & 1.05$\times$ \\
+128 & 9{,}394\,\textmu{}s & 60\,\textmu{}s & 112\,\textmu{}s & 1.87$\times$ \\
+512 & 22{,}090\,\textmu{}s & 90\,\textmu{}s & 398\,\textmu{}s & 4.42$\times$ \\
+\bottomrule
+\end{tabular}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table}
+
+\paragraph{``The host is idle anyway.''} A host-side matcher is cheap when it
+has a core to run on. Serving hosts do not offer that guarantee: the same CPUs
+run detokenization, scheduling, request parsing and the API server. We sweep
+the number of busy cores next to the fill (Table~\ref{tab:contention}). Our p50
+and p99 are flat --- 27.8 to 27.9\,\textmu{}s and 51.0 to 56.7 --- because the
+work is on the device. XGrammar's median degrades mildly (1.09$\times$) but its
+\textbf{p99 goes from 449.6 to 3{,}495.3\,\textmu{}s, a 7.8$\times$ tail
+blow-up}. Constrained decoding is a tail-latency business, and this is the
+clearest measurement in the paper of what residency is actually for.
+
+\begin{table}[t]
+\caption{Mask fill at batch 128 while $n$ cores are kept busy beside it.
+Source: \texttt{engrain\_lab.rigor.serving}.}
+\label{tab:contention}
+\vskip 0.1in
+\begin{center}
+\begin{small}
+\begin{tabular}{rrrrr}
+\toprule
+busy & \multicolumn{2}{c}{engrain} & \multicolumn{2}{c}{XGrammar} \\
+cores & p50 & p99 & p50 & p99 \\
+\midrule
+0  & 27.8 & 51.0 & 406.5 & 449.6 \\
+8  & 27.5 & 66.5 & 433.2 & 464.2 \\
+16 & 27.8 & 59.9 & 421.5 & 448.3 \\
+24 & 27.9 & 56.7 & 444.7 & \textbf{3{,}495.3} \\
+\bottomrule
+\end{tabular}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table}
+
+\subsection{Ablation: what each mechanism is worth}
+\label{sec:eval-ablation}
+
+Table~\ref{tab:ablation} removes one mechanism at a time. Both knobs are set
+\emph{before} the step is captured, which matters more than it sounds: our
+first attempt set them afterwards and reported that the memo was worth
+1.00$\times$ while hitting 90\% of steps --- the captured graph had the old
+scalar arguments baked in, so nothing had actually been disabled. An ablation
+of a graph-resident system has to be recorded, not configured.
+
+\begin{table}[t]
+\caption{Ablation on a three-schema batch with sequences at random document
+positions. ``memo'' compares the full memo against a single-slot one; at batch
+1 that is degenerate, since one slot always serves one sequence.
+Source: \texttt{exp\_ablation}.}
+\label{tab:ablation}
+\vskip 0.1in
+\begin{center}
+\begin{small}
+\begin{tabular}{rrrrr}
+\toprule
+batch & full & memo worth & capture worth & memo hit \\
+\midrule
+1   & 49.8\,\textmu{}s    & 1.00$\times$\,$^\dagger$ & 2.56$\times$ & 100.0\% \\
+8   & 59.6\,\textmu{}s    & 6.15$\times$ & 2.34$\times$ & 100.0\% \\
+32  & 408.6\,\textmu{}s   & 1.13$\times$ & 1.04$\times$ & 93.8\% \\
+128 & 448.7\,\textmu{}s   & 1.16$\times$ & 1.04$\times$ & 90.6\% \\
+512 & 3{,}980.4\,\textmu{}s & 1.00$\times$ & 1.00$\times$ & 86.1\% \\
+\bottomrule
+\end{tabular}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table}
+
+The two mechanisms pay in the same place and for the same reason: at small
+batch the step is dispatch-bound and mostly redundant, so capture is worth
+2.3--2.6$\times$ and the memo up to 6.2$\times$; at batch 512 both are
+1.00$\times$ because the step is work-bound and the work is genuinely
+different per sequence. We include the negative half of this result because a
+mechanism that helps only at batch 8 should be described that way.
+
+The third ablation is the fill split (\S\ref{sec:fill}), and it is the one that
+justifies the paper's implementation lesson: on a balanced batch the single
+fused kernel is fine, and on a skewed one it costs 9{,}883\,\textmu{}s against
+691\,\textmu{}s. The regression is invisible to any benchmark that does not
+seed sequences apart.
+
+
+
+\begin{table}[t]
+\caption{Constrained sampling at batch 512, measured in place (no restore of a
+310\,MB logits tensor that a decode loop never pays). ``Shortlist'' emits
+whichever of the allowed set and its complement is shorter, decided on device.
+Source: session measurements, 2026-07-30.}
+\label{tab:sampling}
+\vskip 0.1in
+\begin{center}
+\begin{small}
+\begin{tabular}{lrr}
+\toprule
+regime & vs.\ mask-then-sample & note \\
+\midrule
+all rows sparse           & 7.73$\times$ & upper bound \\
+all rows dense            & 0.95$\times$ & compaction loses \\
+distribution-weighted     & 1.79$\times$ & shortlist, per-step choice \\
+ragged batch, 50\% dense  & 1.05$\times$ & \textbf{measured steady state} \\
+ragged, sync-free scheme  & 0.86$\times$ & fixed shape, no host sync \\
+\bottomrule
+\end{tabular}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table}
+
+Table~\ref{tab:sampling} is the result we most want to be different. Fused
+sampling is the cleanest consequence of residency --- constraining makes sampling
+\emph{cheaper}, which is impossible if the constraint is a host product --- and on
+a homogeneous sparse batch it delivers 7.7$\times$. But the measured steady
+state of a continuously batched workload is about half dense rows
+(\S\ref{sec:background}), and there the advantage is 1.05$\times$: parity.
+
+We report the cause precisely because it is not in our engine. Two interfaces
+prevent the ragged case from paying: XGrammar's
+\texttt{apply\_token\_bitmask\_inplace} takes its row indices as a host
+\texttt{List[int]}, and a sampler's output shape is its row count, so selecting a
+subset of rows requires knowing that count on the host. What is needed is a
+sampler that accepts a device-side row count. Until sampling APIs offer one, the
+fused-sampling benefit is available in principle and 5\% in practice on a mixed
+batch.
+
+\subsection{Correctness, in two layers}
+\label{sec:correctness}
+
+Constrained decoding admits no approximation: one wrong bit either leaks an
+illegal token or removes a legal one, so learned or lossy mask representations
+are out of scope by construction. But ``correct'' names two different
+properties, and conflating them is how this literature reports numbers that
+cannot be acted on:
+
+\begin{description}
+\item[runtime exactness] the device mask equals what the compiled grammar
+allows;
+\item[lowering fidelity] the compiled grammar equals the schema.
+\end{description}
+
+The first is what residency depends on and we verify it exhaustively. The
+second is where every grammar-based system loses ground, and it is where we
+found --- and fixed --- a real defect in our own compiler.
+
+\paragraph{Runtime exactness.} Every mask row the device produces is compared
+bit-for-bit against an independent CPU reference matcher built from the same
+tables. Four verifications run over the real corpus: \textbf{corpus} (619
+rows over model-generated documents), \textbf{walk} (4{,}800 rows over random
+walks, which reach states real documents do not), \textbf{conflicted} (687 rows
+restricted to grammars with reduce/reduce conflicts, i.e.\ where forking is
+live), and \textbf{mixed} (1{,}092 rows over batches of several grammars,
+including a CUDA graph \emph{recorded on one assignment of grammars to
+sequences and replayed on a different one}). All 7{,}198 rows match, with zero
+failures. The graph-replay check is the one the residency claim rests on: a
+recorded step survives the batch composition changing underneath it, which is
+what continuous batching does every step. In addition, 99 unit tests run under
+all three backends, and the \texttt{differential} backend runs the CUDA and
+Triton implementations on every call and compares.
+
+\paragraph{Lowering fidelity, and a metric that was measuring the wrong thing.}
+The aggregate we had been reporting --- ``56.0\% of documents generated under
+our mask validate, against XGrammar's 77.6\%'' --- turns out to conflate two
+unrelated quantities, because a random walk that runs out of byte budget
+produces truncated JSON and was counted as a failure. Decomposing it
+(Table~\ref{tab:soundness}) separates \emph{completion} (did the walk finish a
+document) from \emph{over-acceptance} (given a complete document, does the
+schema accept it). Only the second is a property of the engine.
+
+\begin{table}[t]
+\caption{Random-walk generation under each engine's mask on the 194 schemas
+both engines compile, same seed, same 400-byte budget. ``Before'' and ``after''
+are the compiler defect described below. Source:
+\texttt{exp\_soundness\_split}.}
+\label{tab:soundness}
+\vskip 0.1in
+\begin{center}
+\begin{small}
+\begin{tabular}{lrrr}
+\toprule
+ & completion & valid $|$ complete & aggregate \\
+\midrule
+engrain, before & 52.5\% & 70.0\% & 36.7\% \\
+engrain, after  & 50.5\% & \textbf{80.4\%} & 40.6\% \\
+XGrammar        & 63.7\% & 94.6\% & 60.2\% \\
+\bottomrule
+\end{tabular}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table}
+
+\paragraph{Attributing the gap to a keyword found a bug.} Recording which JSON
+Schema keyword rejected each over-accepted document showed the failure was not
+diffuse: \textbf{219 of 243} over-acceptances were the single keyword
+\texttt{required}, against 8 for XGrammar. That concentration is what made the
+cause findable. It was not the precision level --- forcing the most faithful
+lowering moved 181 of 194 schemas from \texttt{Shadowed} to \texttt{Exact},
+cost 4$\times$ compile time and 2$\times$ tables, and left validity
+\emph{unchanged} at 70.0\%, which ruled out the hypothesis we started with.
+
+The cause was in the order-free object construction. To let properties arrive
+in any order while still enforcing \texttt{required}, the compiler enumerates
+subsets of the required set and carries the subset in the parser state, one
+rule per subset. For the \emph{full} subset --- every required property seen ---
+the rule that picks the next property has no alternatives when the object also
+closes its property names (\texttt{additionalProperties: false}). The code
+treated ``no property may follow'' as a construction failure and fell back to an
+object that does not enforce \texttt{required} at all. The condition is not a
+failure; it means the object must now close. Minimally: an object with one
+declared property, that property required, and \texttt{additional\-Properties:
+false} accepted \texttt{\{\}}. With two properties it did not, which is why no
+unit test caught it.
+
+Fixing it removes 78 of the 243 over-acceptances, eliminates the
+\texttt{oneOf} failures entirely, and moves validity from 70.0\% to 80.4\%
+(Table~\ref{tab:soundness}). We report the before and after because the
+methodology --- attribute, minimize, fix, re-measure --- is the contribution
+here, not the number.
+
+\paragraph{What remains, and the honesty defect behind it.} 141
+\texttt{required} failures remain, and they have a different cause: the subset
+enumeration costs $2^{n}$ rules, so it is bounded at 4 required properties when
+the property names are open and 6 when they are closed. Past that the object
+widens. That is a defensible budget --- the alternative, fixing the property
+order as XGrammar does, rejects valid permutations, which this system's
+contract forbids --- but it was being applied \emph{silently}: 33 of the 34
+corpus schemas whose \texttt{required} was dropped reported no approximation at
+all, because the approximation list was derived from the precision level rather
+than from what the lowering did. The engine now reports it in every case, which
+takes the silent count to zero. We consider a constrained decoder that relaxes
+a schema without saying so to be the more serious of the two defects, and we
+suspect the distinction between coverage, exactness, and \emph{declared}
+exactness is under-reported across this literature.
+
+\subsection{The costs of residency}
+\label{sec:costs}
+
+Residency is not free, and the honest accounting is the following three
+results. All are measured over 528 distinct JSONSchemaBench schemas.
+
+\begin{table}[t]
+\caption{What residency costs. Compile time and table memory are measured over
+528 JSONSchemaBench schemas; XGrammar's figures are for the same schemas.
+Source: \texttt{engrain\_lab.rigor.cost}, 2026-07-30.}
+\label{tab:costs}
+\vskip 0.1in
+\begin{center}
+\begin{small}
+\begin{tabular}{lrrr}
+\toprule
+ & engrain & XGrammar & ratio \\
+\midrule
+compile p50      & 112\,ms   & 16\,ms  & 7.0$\times$ worse \\
+compile p90      & 1.38\,s   & ---     & \\
+compile p99      & 4.63\,s   & 0.6\,s  & 7.7$\times$ worse \\
+compile max      & 12.5\,s   & ---     & \\
+\midrule
+tables p50       & 1.41\,MiB & 52\,KiB & 27$\times$ worse \\
+tables p99       & 37.5\,MiB & ---     & 700$\times$ worse \\
+tables max       & 97.6\,MiB & ---     & \\
+\midrule
+schemas compiled & 502/528 (95.1\%) & $\approx$98\% & $-$3\,pts \\
+\bottomrule
+\end{tabular}
+\end{small}
+\end{center}
+\vskip -0.1in
+\end{table}
+
+\textbf{Compile time} (Table~\ref{tab:costs}) is 7$\times$ XGrammar's at the
+median and worse in the tail. It is, however, \emph{linear} in the number of
+lexer states (slope 1.05, $r=0.94$): there is no algorithmic blow-up, only the
+inherent $O(|V| \times \text{lexer states})$ cost of computing what every token
+does from every lexer state. In a serving context, schemas arrive with requests,
+so this is a stated failure and not a footnote.
+
+\textbf{Memory.} 1.41\,MiB at the median against a 52\,KiB compiler cache. We
+looked for structural sharing and did not find much: whole-array sharing across
+schemas gives 1.0$\times$ (nothing is byte-equal), group sets are already
+interned, and interning reading lists saves 12\%. The one lever with the right
+shape is building a lexer state's reading tables \emph{on demand}, the first
+time a parse reaches that state, since a real document visits only 1--4\% of the
+states its grammar can reach. That would address compile time and memory with
+one mechanism, and it is the main piece of future work.
+
+\textbf{Coverage.} 502 of 528 schemas compile (95.1\%). The 26 refusals are
+typed: 12 the front end cannot lower, 10 exceed the production budget, 4 exceed
+the lexer budget. Separately --- and this is a distinction the constrained
+decoding literature does not usually draw --- 371 of the 502 compiled grammars
+(73.9\%) accept a \emph{relaxation} of their schema rather than exactly the
+schema. The relaxations come from the lowering, not the runtime: \texttt{oneOf}
+becomes a union, and a union is ``at least one'' where \texttt{oneOf} is
+``exactly one''. The runtime only ever narrows. We report bit-exactness against
+\emph{our compiled grammar}, which is a weaker and more precise claim than
+bit-exactness against the schema, and we believe every system in this space owes
+the same distinction.
+
+\section{Limitations}
+\label{sec:limitations}
+
+We state these as results rather than as caveats, because the design's central
+claim is structural and survives them, while a reader deciding whether to deploy
+needs them.
+
+\begin{enumerate}
+\item \textbf{Batch 1 is a loss} (0.24--0.90$\times$). Our floor is set by
+sweeping live configurations, not by the batch.
+\item \textbf{Compile is 7$\times$ slower} and the p99 is seconds. Lazy lexer
+residency is the plausible fix and is unimplemented.
+\item \textbf{Tables are 27--700$\times$ larger} than a host matcher's cache.
+\item \textbf{Our lowering over-accepts 19.6\% of complete documents}, against
+XGrammar's 5.4\%, and 141 of the 153 remaining cases are one keyword,
+\texttt{required}, dropped where the subset enumeration exceeds its budget.
+\item \textbf{Fused sampling is 1.05$\times$ on a ragged batch}, not the
+7.7$\times$ a homogeneous one suggests, and the blocker is in surrounding APIs.
+\item \textbf{Heterogeneous pools of 8--16 schemas cost us 33--36$\times$}
+what those schemas cost alone.
+\item \textbf{The memo and graph capture pay only below batch 32}
+(Table~\ref{tab:ablation}); at batch 512 both are 1.00$\times$.
+\item \textbf{One baseline, one GPU.} We compare against XGrammar; llguidance
+is installed and not yet in the comparison. Every launch shape, memo size and
+chunk count was fitted on an A100.
+\item \textbf{No end-to-end throughput claim.} Grammar work is a few percent of
+a decode step, and a vLLM A/B at batch 256 ranged from 4{,}523 to 13{,}325
+tokens per second across runs --- too noisy to attribute a difference. We report
+the per-step result, which is the defensible one.
+\end{enumerate}
+
+\section{Related Work}
+\label{sec:related}
+
+\paragraph{Host-side constrained decoding.} Outlines~\cite{willard2023efficient}
+indexes a regular-language DFA against the vocabulary;
+SynCode~\cite{ugare2025syncode} and grammar-aligned
+decoding~\cite{park2024grammaraligned} extend to context-free grammars;
+XGrammar~\cite{dong2024xgrammar} makes the pushdown automaton practical with
+adaptive token masks and is the deployed baseline;
+llguidance and Domino~\cite{beurerkellner2024domino} attack the same overhead
+with better host algorithms and speculation. All compute the mask on the CPU,
+which is the property this paper is about.
+
+\paragraph{GPU-side work.} Pre3~\cite{chen2025pre3} and PSC~\cite{li2026psc}
+precompute deterministic pushdown structure to make the host step cheaper or to
+classify parser stacks; Gram2Token~\cite{hua2026gram2token} moves the
+token-to-terminal bridge toward the device. These reduce the cost of the host
+step or move part of it; to our knowledge none keeps the parser stack itself on
+the device across steps, which is what makes graph capture and sampler fusion
+possible.
+
+\paragraph{Automata and tokenizers.} The tokenizer--grammar impedance mismatch
+is treated by~\cite{koo2024automata} and~\cite{park2025flexible};
+CRANE~\cite{banerjee2025crane} studies the expressiveness cost of constraining.
+Our token-group quotient is a device-oriented instance of the same idea.
+
+\paragraph{Serving.} CUDA graph capture of the decode loop is standard in
+vLLM and SGLang~\cite{zheng2024sglang}; our contribution is to make the grammar
+a participant in it.
+
+\section{Conclusion}
+
+Constrained decoding has been treated as a host-side algorithms problem, and by
+that measure it is nearly solved. We argued that the interesting question is
+where the parser's state lives, because a decode step that a serving engine
+records as a CUDA graph can only contain device work. Engrain keeps an LALR(1)
+parser --- lexer state, stack, and conflict forks --- resident on the GPU, which
+makes the constraint capturable, fusable with the sampler, and advanceable
+through a speculative draft without a host round trip. It costs 103--327\,\textmu{}s
+per full step at batch 512 against 2{,}041--6{,}811 for the deployed baseline,
+1.35--4.22$\times$ less under speculation, and is bit-exact over 7{,}198 verified
+rows. It also costs 7$\times$ more to compile and 27$\times$ more memory, loses
+below batch 16, and delivers only parity on fused sampling once the batch is
+ragged. We believe the structural claim is worth those prices, and we have tried
+to report them precisely enough that a reader can disagree.
+
+\bibliography{references}
+\bibliographystyle{mlsys2025}
+
+\end{document}

@@ -1,0 +1,43 @@
+{
+  "schemas": 194,
+  "levels": {
+    "Shadowed": 193,
+    "Merged": 1
+  },
+  "walks_per_schema": 8,
+  "blame": {
+    "engrain": {
+      "required": 141,
+      "anyOf": 10,
+      "dependencies": 2
+    },
+    "xgrammar": {
+      "oneOf": 12,
+      "type": 29,
+      "maxLength": 2,
+      "required": 8,
+      "anyOf": 2
+    }
+  },
+  "budget_bytes": 400,
+  "engines": {
+    "engrain": {
+      "walks": 1546,
+      "complete": 780,
+      "valid": 627,
+      "over_accepted": 153,
+      "completion_rate": 0.5045278137128072,
+      "validity_given_complete": 0.8038461538461539,
+      "aggregate_validity": 0.4055627425614489
+    },
+    "xgrammar": {
+      "walks": 1552,
+      "complete": 988,
+      "valid": 935,
+      "over_accepted": 53,
+      "completion_rate": 0.6365979381443299,
+      "validity_given_complete": 0.9463562753036437,
+      "aggregate_validity": 0.6024484536082474
+    }
+  }
+}

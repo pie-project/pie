@@ -805,16 +805,6 @@ impl<'a> Converter<'a> {
         let mut pending: Vec<(String, Expr)> = Vec::new();
 
         for mask in 0..=full {
-            let more = seq(vec![
-                lit(","),
-                self.ws(),
-                Expr::RuleRef(items[mask as usize].clone()),
-            ]);
-            // Only the full subset may stop: anything less is an object still
-            // missing a property the schema requires.
-            let tail = if mask == full { optional(more) } else { more };
-            pending.push((tails[mask as usize].clone(), tail));
-
             let mut item = Vec::new();
             for (index, property) in known.iter().enumerate() {
                 let next = match required.iter().position(|&r| r == index) {
@@ -833,10 +823,34 @@ impl<'a> Converter<'a> {
                     Expr::RuleRef(tails[mask as usize].clone()),
                 ]));
             }
-            if item.is_empty() {
-                return Ok(None);
+            // Nothing may follow. Once every required property has been seen
+            // that is not a failure, it is the object being closed: a schema
+            // whose properties are all required and whose `additionalProperties`
+            // is false admits exactly one more token, `}`. Treating it as a
+            // failure made the caller fall back to the relaxed object, which
+            // does not enforce `required` at all - and it did so silently, on
+            // the commonest small closed object there is.
+            let tail = if item.is_empty() {
+                if mask != full {
+                    // Required properties are still missing and no property can
+                    // supply them, so the object can never be closed.
+                    return Ok(None);
+                }
+                Expr::Empty
+            } else {
+                let more = seq(vec![
+                    lit(","),
+                    self.ws(),
+                    Expr::RuleRef(items[mask as usize].clone()),
+                ]);
+                // Only the full subset may stop: anything less is an object
+                // still missing a property the schema requires.
+                if mask == full { optional(more) } else { more }
+            };
+            pending.push((tails[mask as usize].clone(), tail));
+            if !item.is_empty() {
+                pending.push((items[mask as usize].clone(), Expr::choice(item)));
             }
-            pending.push((items[mask as usize].clone(), Expr::choice(item)));
         }
         for (name, body) in pending {
             self.define_named(name, body)?;
@@ -883,11 +897,11 @@ impl<'a> Converter<'a> {
 /// of when `additionalProperties` leaves the names open. Each subset is a
 /// parse the matcher may have to carry at once, so this is bounded by its
 /// configuration budget; four covers 96% of the objects in JSONSchemaBench.
-const UNORDERED_REQUIRED_BUDGET_OPEN: usize = 4;
+pub const UNORDERED_REQUIRED_BUDGET_OPEN: usize = 4;
 
 /// The same, for objects whose property names are a closed set. Nothing forks
 /// there, so the only cost is grammar size and the budget can be looser.
-const UNORDERED_REQUIRED_BUDGET_CLOSED: usize = 6;
+pub const UNORDERED_REQUIRED_BUDGET_CLOSED: usize = 6;
 
 #[derive(Clone)]
 struct Property {

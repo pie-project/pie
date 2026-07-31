@@ -3,36 +3,37 @@
   "answers": [
     {
       "question_id": "q01-sound",
-      "headline": "documents generated under the mask that validate: engrain 178/322 valid (55.3%); xgrammar 321/418 valid (76.8%)",
+      "headline": "documents generated under the mask that validate: engrain 292/521 valid (56.0%); xgrammar 531/684 valid (77.6%)",
       "detail": {
         "schemas": {
           "engrain": 60,
           "xgrammar": 60
         },
-        "walks_per_schema": 12,
+        "walks_per_schema": 20,
         "per_engine": {
           "engrain": {
-            "walks": 720,
-            "valid": 178,
-            "invalid": 144,
-            "unfinished": 398
+            "walks": 1200,
+            "valid": 292,
+            "invalid": 229,
+            "unfinished": 679
           },
           "xgrammar": {
-            "walks": 720,
-            "valid": 321,
-            "invalid": 97,
-            "unfinished": 302
+            "walks": 1200,
+            "valid": 531,
+            "invalid": 153,
+            "unfinished": 516
           }
         },
         "causes": {
           "xgrammar": {
-            "schema uses unlowered const": 12,
-            "unexplained": 73,
-            "schema uses unlowered dependencies": 12
+            "schema uses unlowered const": 18,
+            "relaxed anyOf/oneOf: required sets intersected": 2,
+            "unexplained": 113,
+            "schema uses unlowered dependencies": 20
           },
           "engrain": {
-            "unexplained": 133,
-            "schema uses unlowered dependencies": 11
+            "unexplained": 212,
+            "schema uses unlowered dependencies": 17
           }
         },
         "note": "Every document was produced by choosing only bytes the mask admitted, so an invalid one is a byte the mask should have refused. Both engines walk the same schemas over the same 256-byte vocabulary."
@@ -41,12 +42,12 @@
     },
     {
       "question_id": "q02-superset",
-      "headline": "over-acceptance by precision level: Shadowed 55.3% valid of 322",
+      "headline": "over-acceptance by precision level: Shadowed 56.0% valid of 521",
       "detail": {
         "per_level": {
           "Shadowed": {
-            "valid": 178,
-            "invalid": 144
+            "valid": 292,
+            "invalid": 229
           }
         }
       },
@@ -188,7 +189,7 @@
       "unanswered": null
     }
   ],
-  "walks_per_schema": 12,
+  "walks_per_schema": 20,
   "seed": 20260726,
   "invalid_examples": [
     {
@@ -197,6 +198,27 @@
       "cause": "schema uses unlowered const",
       "reason": "{} is valid under each of {'$ref': '#/definitions/second'}, {'$ref': '#/definitions/first'}",
       "text": "{ \"subject\"\t\n \n \n:\t   { }\n\t\t}"
+    },
+    {
+      "schema": 1,
+      "engine": "xgrammar",
+      "cause": "schema uses unlowered const",
+      "reason": "{} is valid under each of {'$ref': '#/definitions/second'}, {'$ref': '#/definitions/first'}",
+      "text": "{\"subject\"  \n   :\n\t\n\t{} }"
+    },
+    {
+      "schema": 5,
+      "engine": "xgrammar",
+      "cause": "relaxed anyOf/oneOf: required sets intersected",
+      "reason": "{} is not valid under any of the given schemas",
+      "text": "{\t\t \t\"requirement\"\n\t:{ \t\t}\n\t  ,\"project-template\":{\n}\n\n\t}"
+    },
+    {
+      "schema": 5,
+      "engine": "xgrammar",
+      "cause": "relaxed anyOf/oneOf: required sets intersected",
+      "reason": "{} is not valid under any of the given schemas",
+      "text": "{\"requirement\"\t \t:null\n,\n \t \t\"project-template\":\t{\n\"acquisitions\"\t\n:  [43,false ,890,3E8392\t\t\n, \t{ \n\n\t},true]\t\t\n\t\t}}"
     },
     {
       "schema": 6,
@@ -260,6 +282,48 @@
       "cause": "unexplained",
       "reason": "'objectType' is a required property",
       "text": "{ \"o\uece4r<bZ\u0242\udb28\udd0aun!\u06b4\ud993\ude1c\u6213\u02f7\u43ac\u0515eY|\uea73*-\ud36e\uba7b\u7791\u02e7w8\u05ec\u8ed9wxL9}jVY\u022en<\u83e5re\u7fe6.\u0589\ub499i\u02cfksp\u03c9A=\u0209&2HT0jdbUy2J()4}b6\u24b1\u00dd\udbd5\udefb3\u03e3H\uf561g\u05d0kzDb,\u0443egH#\u026dS~\u011a&qE\u91f0r]\u025e\u04ceWo\u5dcf\ud06b\u0b19<\u00eai\u06503$U\u0090x\ud34eU(1N1r\ud8b4\udf01X@\u07b2\u03e3TT\"\t\r\t\t\n\n\n:5251E482056  }\t\t\n\t \t\t"
+    },
+    {
+      "schema": 6,
+      "engine": "engrain",
+      "cause": "unexplained",
+      "reason": "'objectType' is a required property",
+      "text": "{  } \n"
+    },
+    {
+      "schema": 6,
+      "engine": "engrain",
+      "cause": "unexplained",
+      "reason": "'objectType' is a required property",
+      "text": "{ \n\n  }\r \r\n\n\n\r "
+    },
+    {
+      "schema": 6,
+      "engine": "engrain",
+      "cause": "unexplained",
+      "reason": "'objectType' is a required property",
+      "text": "{\r}"
+    },
+    {
+      "schema": 6,
+      "engine": "engrain",
+      "cause": "unexplained",
+      "reason": "'objectType' is a required property",
+      "text": "{\r\r\"\u01053P\u0336\u0141'\u02e5f!{wr-\u8d20\ud8ed\udd80\u03ba%ld\u045bT\u66c7b0\u079ev_[|DYb\u024f^\u06a1(M8kM\u09b6\udaf7\udc1f\u0520+\ud5ecT\u02ef\ud8b9\ude9c\u05a1\u5c90\u048c0\u03a2\u0271T\u03f9\u98a3R!aWp\ub567F\ud2c4\u04f4M[u\u03cd2p\u01ec`BRREs\u00cd NeyX_p\udba1\udca4\u04c1\udbda\udfec\u02fb}\u05e5\ucb30r~\u07bbL;\u05cc\u0655C\udbe6\uddd4\u0706n\u02e1\\n`\u02f7c\ua1edA(\u0d8c\uad3aI\u0197\u049b\u07c5\u81858_K\uc9baN\u0570(U}zZt\u050a\u0217[i\u01c5t\u9e76\u0535-*e=-pf}\u0670?\u0407|\u074f~'6\u01650w\u015a_>R\u0667o\u06b4\u0402T\u0678AX'\u01ed\u032ei\u07abZU\u073c\u0101`,PBy\udbee\ude3dh9q\u0565$u?EL"
+    },
+    {
+      "schema": 6,
+      "engine": "engrain",
+      "cause": "unexplained",
+      "reason": "'objectType' is a required property",
+      "text": "{ \t\t}\t\r\n\n"
+    },
+    {
+      "schema": 6,
+      "engine": "engrain",
+      "cause": "unexplained",
+      "reason": "'objectType' is a required property",
+      "text": "{\t}\n\n\r\n\n\r\t\n\r \r"
     },
     {
       "schema": 6,
@@ -346,6 +410,62 @@
       "text": "{\"buyerId\"\t :\n  \n\"\b@\u05fc\u001aD\u0005C\ufffd\ufffd[`W\u0136\u03d5\u0004\u001dOo\udab9\udfc9/P\u0018\u078b\ufffd\ufffd\ufffd\ufffd\f\u4c60\" ,\n\n\"buyerPurchaseOrderNumber\":\"\u0006\u0004\u001f\u06ca\u0165f\udaf0\uded3#P(\u000eR\u01c64h\u001d\" , \t\t\t \t\"objectType\"\t\t  \t\n \n \t :\"orderStatusRequest\",\n\n\n\"orderId\"\t\t\n: \n\t\t\t\n\n\t    \t\n\n\t\"<\u00fcZ<O\ufffd\ufffd\ufffd\ufffd\u1578O\u0015\u0007p\ufd28\u48d8s"
     },
     {
+      "schema": 6,
+      "engine": "xgrammar",
+      "cause": "unexplained",
+      "reason": "not JSON: Invalid control character at: line 3 column 7 (char 25)",
+      "text": "{ \t\"buyerId\":  \t\n\t\n \".arg\u000bl\u5a05>#\ufffd\ufffd\ufffd\ufffd}_\u001aW\u00cc\u0198+\uc570\u001dK\u07ac\u026c^_\u0011\"\n,\t  \n\"buyerPurchaseOrderNumber\":\t\"P\u02212\u2943TYk\u0011FH\u0737\u0017\u020aabN\"\t \t  ,\"objectType\" \t :\"orderStatusRequest\",\n\n\n\t\t\n\"orderId\"\n\t :\n\"N+W{4=\u042b\u0016\u06aaA\u00daL&\ud85d\udeae\u01f7\u63de\u0015t\u001d\u0714\uce1e\u86760r8\u0013r\u0187\u0120u\u0265K\u00166"
+    },
+    {
+      "schema": 6,
+      "engine": "xgrammar",
+      "cause": "unexplained",
+      "reason": "not JSON: Invalid control character at: line 3 column 3 (char 21)",
+      "text": "{ \n\"buyerId\"\t  : \t\n \"\u001c\u046b.A\u001c^S\bn\uda2b\udf2b\u009c\ud075Gk\u0003&\u001dV~2]\ufffd\ufffd\u01e9x\ud8f1\udfbe\"\n\n\n \t\t,\"buyerPurchaseOrderNumber\":\"\u001e\u001e\u01f3\u001e\u0015Lb\u0010RL*Fz\ub51aJY\",\"objectType\"  :\n\t\"orderStatusRequest\"  ,\t\"orderId\"\n:\n \t\t\n\"\u00cd\ufffd\ufffd\u06db?\u0000rN\u0018D\u0644w]\u0361^\u000e\u0745\ud9a9\udd88[\u4e31|J\ub7ecBI\u05fa\ufffd\ufffd\u38fe\u683a\u007fX_Q\u0001\t0`\udb6c\udda3\u0013\u02af"
+    },
+    {
+      "schema": 6,
+      "engine": "xgrammar",
+      "cause": "unexplained",
+      "reason": "not JSON: Invalid control character at: line 5 column 3 (char 19)",
+      "text": "{\n\n \"buyerId\"\n:\t\n\"\u7388\u0007\uda40\udc4fu\u8e61Y\u9ce3/t\ud967\udf9a\u0007\u0112i\u001e\u99c9#|\ufffd\ufffd\ufffd\ufffdKhI\u000bN\u007fq\", \t \t\n\"buyerPurchaseOrderNumber\":   \t\t\n\t\n\"\u6cb2\ufffd\ufffd\ufffd\ufffdd8\u0273NT\u0782\u00b0r?y\u078ff\ue2f35\"\t,\n\n\n  \n\t \n\n\t\t\n\t\n \t \t\"objectType\" \t:\t\"orderStatusRequest\" \t\t\t,\"orderId\"\n\n\t : \t \"\u0001SU\u025e\u2a25\u05e9p\u001d\ufffd\ufffd\ufffd"
+    },
+    {
+      "schema": 6,
+      "engine": "xgrammar",
+      "cause": "unexplained",
+      "reason": "not JSON: Invalid control character at: line 4 column 9 (char 23)",
+      "text": "{ \"buyerId\":\n\n\n\"8DVne~=\u0015sm\u03c6\u0305I_\u07e8\u02a1\ufffd\ufffd\ufffdM\u0493L\u0000\u03cf4\u0005h\",\"buyerPurchaseOrderNumber\"\t\t\n:  \t  \"@\ufffd\ufffd\ufffd5:\u04eb\b>\uabb8\u075fE_\u0566\u0267\u0019P\u0014\"\n ,\"objectType\"\t\t:\"orderStatusRequest\",\"orderId\":\"JI\u007f\u06a7\ufffd\ufffd\ufffd\u6edb\u0007>!\u04b0\u4004ys)\u0012\u0010\ud840\udf83\u0014\u0011S\u0643\" \n, \t\"sellerId\" \n\t\t  \t\n\n\t\t"
+    },
+    {
+      "schema": 6,
+      "engine": "xgrammar",
+      "cause": "unexplained",
+      "reason": "not JSON: Invalid control character at: line 3 column 32 (char 44)",
+      "text": "{\"buyerId\":\n\n\t\t\t\"_5uY\u03844xSe\u0676\u0180\u0325\u2440?fY\u06e2\ufffd\ufffd\ufffd\ufffd!$)9W{\u001a\",\n\"buyerPurchaseOrderNumber\"  \t\t:\t\t \"_g\u000eK\u0112hg\u0018La#jF\u06cdG\u0126\"\n\t \t,\n\n\n\t\n\n \n\t\t\"objectType\"\t\n\n\t:\"orderStatusRequest\", \n\n\n\t\t\t \"orderId\"\n\t\n \t\t\t\t :\"\u1078\u0012b\ube24\u0757\u0005\u0014\u0007T\u0003A\udaa3\ude1a\ufffd\ufffd\ufffd\ufffd\u000e.@"
+    },
+    {
+      "schema": 6,
+      "engine": "xgrammar",
+      "cause": "unexplained",
+      "reason": "not JSON: Invalid control character at: line 3 column 4 (char 18)",
+      "text": "{\"buyerId\" : \n\n\"\u03a6G\bT\uf1d2\u0017W\ub4c3\ufffd\ufffd\"\t   ,\t\t \"buyerPurchaseOrderNumber\":\t\"N\ud79ep /\u0004\u0585\u0019\u000e\u0019\u0003\uffdb\u007feYX\"\n\n, \t  \"objectType\"\t\t \n\t:\"orderStatusRequest\" \n \n \n,\t  \n\"orderId\":\"p\u02b29- `\ud929\udf251\u0649\u007fh?}No\u0018\u0015\uef22Z\ufffd\ufffd\ufffd\ufffd\u0119)fAE\u0016\u0012\u0013\u0013OR\u04beP,\ua884\ufffd\ufffd\ufffd\ufffd\u061c\u1c28\u59730pE\u007f\u0003S\""
+    },
+    {
+      "schema": 6,
+      "engine": "xgrammar",
+      "cause": "unexplained",
+      "reason": "not JSON: Invalid control character at: line 10 column 4 (char 35)",
+      "text": "{\n\n \"buyerId\"\t\t\n\t\n\t\t  \n\t\n :\t\t\n\n\n\"\u1692]\u0002\u115fh\ufffd\ufffd\ufffd\ufffdh\ubcecM\u0002O)\u07fb\u1b76H\u07b3gU1<,F\ufffd\ufffd\ufffd\ufffdUk\"\n,\"buyerPurchaseOrderNumber\" \t:\"x\ufffd\ufffdE&W*\u0532\u0019E,\udb9c\udfc1\u0213\u0010A\u0010.\"  \t\t ,\"objectType\"\n\t: \n \n\n \n\t\n\n \t \"orderStatusRequest\",\n\"orderId\" \n \n \n\t:\"\u2862\uad76\u4c1fiM'\u06d2\u001b^W\u000f"
+    },
+    {
+      "schema": 6,
+      "engine": "xgrammar",
+      "cause": "unexplained",
+      "reason": "not JSON: Invalid control character at: line 1 column 14 (char 13)",
+      "text": "{\"buyerId\":\"&\u001e\u4774R[_\u0013'\u0543\u052f\ufffd\ufffd\ufffd\ufffdH\u007f\u001b\u0762%xMU\u001eZ\u0000\u000f\ufc109\" \n ,\n\n\n\t   \t\"buyerPurchaseOrderNumber\"\t\t\n:\"R@b\u04fd\u02af2w\u00cab\ud812\udc9d|\u001dAY{\u294d\"  \t\t\t ,  \t\"objectType\"  \n  \t \n\t:\n\"orderStatusRequest\",\"orderId\"\n\t\n\n :\t\"X5KB>{`H\u1ee1\u0678i\u0001+\u0018W\u0752\u000bE\u0764\ufffd\ufffd&\u61cb\u0014S\u0160\u1194w"
+    },
+    {
       "schema": 8,
       "engine": "engrain",
       "cause": "unexplained",
@@ -430,6 +550,55 @@
       "text": "{\"goals\"\t   \n:{},\t\n\r\"goals\"\t \t\r\n:\r{\t\t\r\r \t\"event\"\r\n\n \n:\r \t  \r\n\r\n\n \"rewardRedeemed\"}\t \t\t\n\t} \t\n"
     },
     {
+      "schema": 8,
+      "engine": "engrain",
+      "cause": "unexplained",
+      "reason": "'goals' is a required property",
+      "text": "{ }\t\n\r"
+    },
+    {
+      "schema": 8,
+      "engine": "engrain",
+      "cause": "unexplained",
+      "reason": "'goals' is a required property",
+      "text": "{}\t\r"
+    },
+    {
+      "schema": 8,
+      "engine": "engrain",
+      "cause": "unexplained",
+      "reason": "'goals' is a required property",
+      "text": "{\t\r } \r\t\r\n\n \t\n\t\t\r\r   \r\n\t \t  "
+    },
+    {
+      "schema": 8,
+      "engine": "engrain",
+      "cause": "unexplained",
+      "reason": "'event' is a required property",
+      "text": "{\n\n\"goals\" \t\r\r\n \r :\r{\t \"value\"  \r: \n9\n\r\n}\n\n\r\t,\n\r\t \"goals\":\t\n{}\r}\t"
+    },
+    {
+      "schema": 8,
+      "engine": "engrain",
+      "cause": "unexplained",
+      "reason": "'goals' is a required property",
+      "text": "{\n\r}\t"
+    },
+    {
+      "schema": 8,
+      "engine": "engrain",
+      "cause": "unexplained",
+      "reason": "'value' is a required property",
+      "text": "{\"goals\"\r \t \r:\r\r\r\r\n{\n}\t \n \t\n\t\t\r, \n \r\n\r\n\n \n\r\t \t\n\r\n\t\r\n\"goals\":{\r\t}\n\t\r\n\n ,\n\t\t\n\t \r \r\r \n\n\"goals\"\t\t\t\r \r\n\t \r\n\n : \n \n\n{\r\n\t\n\t \"value\":49.0008}\t \t,\"goals\"\n\r \r:  \t\n{\"value\" \t\r \n\n\r\n\t \n\n\n\n\r\n :7234 }\r\r,\"goals\"\n\r \r\t"
+    },
+    {
+      "schema": 8,
+      "engine": "engrain",
+      "cause": "unexplained",
+      "reason": "'event' is a required property",
+      "text": "{\"goals\" \t\n:\t  \r\r{}\r\r\n\n \n\t\t  \r  \r\r ,\r\r \r\t\r\"goals\"\t\r  \r : \r\r{\r}}\n\r\r\r\n\r\r "
+    },
+    {
       "schema": 10,
       "engine": "engrain",
       "cause": "unexplained",
@@ -442,175 +611,7 @@
       "cause": "unexplained",
       "reason": "'access_token' is a required property",
       "text": "{\"expires_in\":\t0.377788\r\t\t\n\t\n\r,\n\r\"token_type\"\t\r\n\n:\"bearer\" }\n\r\n \t\r\n\t "
-    },
-    {
-      "schema": 10,
-      "engine": "engrain",
-      "cause": "unexplained",
-      "reason": "'access_token' is a required property",
-      "text": "{\n\n\"token_type\"\n\r\n\t\n\t  \t\t:\t \"bearer\"}\r\r\r \t\r  \r \t\n\r"
-    },
-    {
-      "schema": 10,
-      "engine": "engrain",
-      "cause": "unexplained",
-      "reason": "'token_type' is a required property",
-      "text": "{\n\t\n\r \t}\t\r"
-    },
-    {
-      "schema": 10,
-      "engine": "engrain",
-      "cause": "unexplained",
-      "reason": "'token_type' is a required property",
-      "text": "{  \n \r }"
-    },
-    {
-      "schema": 10,
-      "engine": "engrain",
-      "cause": "unexplained",
-      "reason": "'token_type' is a required property",
-      "text": "{ \r\r \n\n\r\r}\t\n\t\t\n \t \n\r\r\n  \n\t\t \r "
-    },
-    {
-      "schema": 10,
-      "engine": "engrain",
-      "cause": "unexplained",
-      "reason": "'expires_in' is a required property",
-      "text": "{\r\"access_token\"\n \r\r\r\n\r\r\r\n\n\n:\t  \t\n\r\t\t\t\"ESx\u759b\u014f~X&C\udbf5\udd01J\u03e8\u05e567[\ueb08`-&R\u51eb\udb08\udd40\u0732\u53f0~<\ud87c\uddcc2SW'KI&5`\u0604>TP\u0436b\u02d19dz\ud82c\udfff\u013f}g\u1a4c\ue1e4\udbf4\udf41\u0446r\"\t, \"token_type\":\n\"bearer\" \n\n \r\r,\n\"token_type\":\n  \t\"bearer\"}\t\n \n\t\t \n\n\r \t\n\r\r\n\t\n \t\r\t\r\t\t  \t\r\r\n\n\n\n  \n\r\n\t \n\n \t"
-    },
-    {
-      "schema": 10,
-      "engine": "engrain",
-      "cause": "unexplained",
-      "reason": "'token_type' is a required property",
-      "text": "{\t\t\n}\n\n \r"
-    },
-    {
-      "schema": 10,
-      "engine": "engrain",
-      "cause": "unexplained",
-      "reason": "'token_type' is a required property",
-      "text": "{ }"
-    },
-    {
-      "schema": 10,
-      "engine": "engrain",
-      "cause": "unexplained",
-      "reason": "'token_type' is a required property",
-      "text": "{\t\t}"
-    },
-    {
-      "schema": 13,
-      "engine": "xgrammar",
-      "cause": "unexplained",
-      "reason": "not JSON: Invalid control character at: line 4 column 9 (char 18)",
-      "text": "{\n\n\"name\"\n:\"\ufffd\ufffd\ufffd\ufffdLI\u0011\u0001\u03e5Lr\u07f6\uda15\udf60\"\t, \t\t\t  \n\"jsonSchema\": \t\t\n\n {},\n\n\"uiSchema\"\t :\n\n{}\t}"
-    },
-    {
-      "schema": 13,
-      "engine": "xgrammar",
-      "cause": "unexplained",
-      "reason": "not JSON: Invalid control character at: line 5 column 6 (char 19)",
-      "text": "{\t\n\"name\"\t\n\n\t\n\t:\t\"i\u000f\u5005TQ\u5c78|\u056f\u00b3f\" ,\n\n\t\t \t\n\"jsonSchema\"\n\n\t\n: \n\t\n { \"items\":22\n} \n}"
-    },
-    {
-      "schema": 13,
-      "engine": "xgrammar",
-      "cause": "unexplained",
-      "reason": "not JSON: Invalid control character at: line 2 column 9 (char 18)",
-      "text": "{\"name\": \n\t\"\ud994\udd7aG\u7cb9\u007f\u0660\u0275\u001cB\u06c8\u71f6\" ,\n \"jsonSchema\"  :{\"type\"  \n :   \n\t\"object\"\t\t\n\t\t\t\n\n,\"properties\"\t\n\n \t \t:259.69}\n,\n\n\t \t\n\t\n\"uiSchema\"\t \n \n\t:\t \t\n\t {\t}}"
-    },
-    {
-      "schema": 13,
-      "engine": "xgrammar",
-      "cause": "unexplained",
-      "reason": "not JSON: Invalid control character at: line 3 column 20 (char 24)",
-      "text": "{\t\t\n\n\"name\"\t \t:\"kB\u0328\u7f1c\u0151\ua207ct\u0007\ufffd\ufffd\ufffd\ufffd\",\"jsonSchema\"\n:{},\"uiSchema\"\n  :\t {}}"
-    },
-    {
-      "schema": 13,
-      "engine": "xgrammar",
-      "cause": "unexplained",
-      "reason": "not JSON: Invalid control character at: line 2 column 15 (char 16)",
-      "text": "{\n \"name\": \"5P\u05955\u0017<\u00ca\ud6ff\u0110s\"\n,\n \t\t\"jsonSchema\":\n{\"items\":0,\n\"properties\"\n\t\n :-22}}"
-    },
-    {
-      "schema": 13,
-      "engine": "xgrammar",
-      "cause": "unexplained",
-      "reason": "not JSON: Invalid control character at: line 2 column 16 (char 25)",
-      "text": "{ \t\"name\"\n\t \t :   \"\u02c5ox,H\uf16d\u0003<D\u00e0\",\"jsonSchema\"\n :\t\n{}\t\t,\"uiSchema\": { \"GT\u0567\\uD590f\u9288k\u0b7d\u45d6}\ua9e4\u00fc2F{tQ\u04fa\u0293C(FMr0\u7b5b_\u0322VgNN(i\ufffd\ufffd\ufffd\ufffd\u0402\u0aa19I'}}\u33b3\u0194~4e\uda57\udfc7\" \t\n\t\t\t \n\t:null\t\t\t\t }\t\t \t}"
-    },
-    {
-      "schema": 13,
-      "engine": "xgrammar",
-      "cause": "unexplained",
-      "reason": "not JSON: Invalid control character at: line 2 column 2 (char 14)",
-      "text": "{  \"name\"\t\t:\n\"\u001a\u056e\u0005\ua6f9ha\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffdBK\"\n\n,\n \n\"jsonSchema\"\t:{\"items\" \t:\n66,\"properties\"\t :\t[754942]}   \n\t\n}"
-    },
-    {
-      "schema": 13,
-      "engine": "xgrammar",
-      "cause": "unexplained",
-      "reason": "not JSON: Invalid control character at: line 2 column 13 (char 16)",
-      "text": "{\t \n\t \"name\": \"r\u0013;\u0623A\u4b4c\ufffd\ufffd-\u06fdX\" ,\t \"jsonSchema\"\n \n:{ }\n}"
-    },
-    {
-      "schema": 13,
-      "engine": "xgrammar",
-      "cause": "unexplained",
-      "reason": "'\\u0605\ufffd\ufffd\ufffd\ufffd\uc027\\x8f\ub744\u9860\u68bc\ud83e\udc2f{N' is too long",
-      "text": "{\"name\" :\t\"\u0605\ufffd\ufffd\ufffd\ufffd\uc027\u008f\ub744\u9860\u68bc\ud83e\udc2f{N\" \n\n\n \n\n\t \t\t,\t\"jsonSchema\"\t\n\n\t\n\n:\t{\n\"items\"\n\n\t\t\n:\"W#\u0206s\u046b\u0407{mx9'S#3\u4932)h i7\u0417\ufffd\ufffd\ufffd\ufffd*\u027a\u035f-`\u15d5\u07c2E/\u39cfF\uc44b\ufffd\ufffdJ\u00e0\u9f57@\u0690\u06d0\u0657f\u6c31\ufffd\ufffd\u00da\u05c7\ud9f0\udcd5|\u0446rQ\ue41f%\ud895\udd59O@!\u06be^\u052c\" }\n\n,\n\n\"uiSchema\"\t\n:{\n\t\n \n}}"
-    },
-    {
-      "schema": 14,
-      "engine": "xgrammar",
-      "cause": "unexplained",
-      "reason": "not JSON: Invalid control character at: line 2 column 21 (char 22)",
-      "text": "{\n\"id\" : 54,\"name\":\"o)\u0004\u0194G\u0392@j\u0427GT\u007f;u\uc29dQ\u532c\u0309\u0002\u001c\",\n\n\t \"created\"\t\n  \n:0  , \t \t\"sortOrder\"\t\n:78\t \t\t\t}"
-    },
-    {
-      "schema": 14,
-      "engine": "xgrammar",
-      "cause": "unexplained",
-      "reason": "not JSON: Invalid control character at: line 6 column 3 (char 19)",
-      "text": "{\"name\"\n\t\t\n\t\n\n  \n:\"\u0018\u0c22\f\u0019\u0010kZ\u04d3\ufffd\ufffd\ufffd\ufffd\" \t\n\n}"
-    },
-    {
-      "schema": 14,
-      "engine": "xgrammar",
-      "cause": "unexplained",
-      "reason": "not JSON: Invalid control character at: line 2 column 17 (char 26)",
-      "text": "{\"name\"  \n:\"i oy\ufffd\ufffd\ufffdo\u7efc\u016a\ueea4P\udb19\udd4b\u0644\u0003\u0011\u0277\u01e6\udbf8\udfd7k?\u05d9\"\n}"
-    },
-    {
-      "schema": 14,
-      "engine": "xgrammar",
-      "cause": "unexplained",
-      "reason": "not JSON: Invalid control character at: line 6 column 2 (char 19)",
-      "text": "{\n\n  \"name\"\t\n\t\n: \n\"\u0018\u802d\u000b0=xK<\u0522\u00196/\u007f\u4f32i\u0630|\u000f5x\"\n\t}"
-    },
-    {
-      "schema": 14,
-      "engine": "xgrammar",
-      "cause": "unexplained",
-      "reason": "not JSON: Invalid control character at: line 6 column 4 (char 24)",
-      "text": "{ \t\t\t \"name\"\n\n\n\t\t \n:\n\"\ua62c9\u001c\u07bc@}-#XS\ufffd\ufffd\ufffd\ufffd>\ufffd\ufffd\ufffd\ufffd\u0115T\u00150'\u900dp\" \t\t  \n}"
-    },
-    {
-      "schema": 14,
-      "engine": "xgrammar",
-      "cause": "unexplained",
-      "reason": "not JSON: Invalid control character at: line 4 column 5 (char 16)",
-      "text": "{\"name\"\n\n  \n :\"`\u0012\u03bf\u1631%{(z\uefc8\u01c9\ua4ad\u6e5d\u0224wj\u0015d_Aq\"\n\n,\t\"created\"\t\n\t:7, \n  \"sortOrder\":3\n}"
-    },
-    {
-      "schema": 14,
-      "engine": "xgrammar",
-      "cause": "unexplained",
-      "reason": "not JSON: Invalid control character at: line 11 column 7 (char 46)",
-      "text": "{  \n\n\t\t\t\n \"id\":77 \n\n \n , \n\t  \"name\"\n\n :\n \"O\u07d5ip\u001cG\u00056k\u07f0E\u05c0\ua464yk\ueeeb\ud970\udfa4\u8192\u04ca\u02b3\"}"
     }
   ],
-  "invalid_total": 241
+  "invalid_total": 382
 }

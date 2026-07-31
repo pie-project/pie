@@ -116,6 +116,7 @@ fn approximations(schema: &str, precision: Precision) -> Vec<String> {
         return found;
     };
     let (mut shadowable, mut counted, mut one_of_objects, mut any_of) = (false, false, false, false);
+    let mut asks_counting = false;
     let (mut one_of, mut unique) = (false, false);
     let mut stack = vec![&value];
     while let Some(node) = stack.pop() {
@@ -130,9 +131,34 @@ fn approximations(schema: &str, precision: Precision) -> Vec<String> {
                     .and_then(|properties| properties.as_object())
                     .is_some_and(|properties| !properties.is_empty());
                 shadowable |= declares && open;
-                counted |= ["required", "minProperties", "maxProperties"]
+                // `counted` means the schema asks for counting *and does not
+                // get it*, which is not the same as the schema asking. An
+                // order-free object enumerates subsets of its required set, so
+                // it gives up - and silently widens, per object - when that set
+                // is past its budget, when `maxProperties` is present at all,
+                // or when `minProperties` demands more than `required` names.
+                // Reporting only the precision level missed every one of these,
+                // which is how 141 of 194 corpus schemas came to accept
+                // documents their own `required` forbids without saying so.
+                let required = map
+                    .get("required")
+                    .and_then(|value| value.as_array())
+                    .map_or(0, |names| names.len());
+                let budget = if open {
+                    json_schema::UNORDERED_REQUIRED_BUDGET_OPEN
+                } else {
+                    json_schema::UNORDERED_REQUIRED_BUDGET_CLOSED
+                };
+                let minimum = map
+                    .get("minProperties")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                asks_counting |= ["required", "minProperties", "maxProperties"]
                     .iter()
                     .any(|keyword| map.contains_key(*keyword));
+                counted |= map.contains_key("maxProperties")
+                    || required > budget
+                    || minimum > required as u64;
                 if let Some(branches) = map.get("oneOf").and_then(|value| value.as_array()) {
                     one_of = true;
                     one_of_objects |= branches.len() > 1
@@ -152,7 +178,7 @@ fn approximations(schema: &str, precision: Precision) -> Vec<String> {
     if shadowable && !precision.excludes_declared_names() {
         found.push(json_schema::SHADOWED.to_string());
     }
-    if counted && !precision.enforces_counting() {
+    if asks_counting && (counted || !precision.enforces_counting()) {
         found.push(json_schema::COUNTING.to_string());
     }
     if one_of_objects && precision.merges_objects() {

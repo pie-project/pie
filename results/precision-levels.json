@@ -1,0 +1,43 @@
+{
+  "schemas": 528,
+  "compiled": 502,
+  "levels": {
+    "Shadowed": 497,
+    "Merged": 4,
+    "Branches": 1
+  },
+  "refusals": {
+    "schema uses a construct the front end ca": 12,
+    "grammar does not fit the production budg": 10,
+    "terminals do not fit the lexer budget": 4
+  },
+  "approximations": {
+    "a property whose name the schema declares may also be read a": 355,
+    "oneOf exclusivity is not enforced: a document may satisfy mo": 99,
+    "required, minProperties and maxProperties are not enforced": 5,
+    "anyOf branches do not inherit the keywords beside them": 1,
+    "uniqueItems is not enforced": 11,
+    "branches of a oneOf over objects are merged, so a document m": 1
+  },
+  "validity": {
+    "Shadowed": {
+      "valid": 953,
+      "total": 1239,
+      "rate": 0.7691686844229217,
+      "schemas": 497
+    },
+    "Merged": {
+      "valid": 1,
+      "total": 22,
+      "rate": 0.045454545454545456,
+      "schemas": 4
+    },
+    "Branches": {
+      "valid": 0,
+      "total": 4,
+      "rate": 0.0,
+      "schemas": 1
+    }
+  },
+  "walks_per_schema": 6
+}
