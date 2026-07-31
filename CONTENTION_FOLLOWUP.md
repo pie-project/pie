@@ -7400,3 +7400,80 @@ still fail under KV pressure where vLLM fails none — because vLLM preempts by
 recompute and pie, with `--swap-pool-size 0`, has nothing to fall back on.
 That residual is a robustness defect, not a throughput one, and §20.40 named
 it as the remaining work.
+
+---
+
+## §20.46 — The destagger experiment, run for the first time: it moves everything
+
+With §20.45's plumbing fixed, `--output-spread 0.5` finally reaches both
+engines. Shape `Xs` is `X` with the per-request output budget fanned over
+[64, 192] on a sawtooth whose mean is exactly 128; the total is preserved to
+the token (131072 either way), the prompts are byte-identical, and the only
+thing that changes is *when* requests retire. ABBA 2+2, c256, same session,
+`SWEEP_VLLM_MEM_UTIL=0.55`, prefix caching off both sides.
+
+| cell | pie tok/s | vLLM tok/s | ratio | pie failed | pie ITL p99 |
+| --- | --- | --- | --- | --- | --- |
+| X/c256 (pre-fix, **withdrawn** by §20.45) | 4437 | 5666 | 0.783 | 796 | 625 ms |
+| X/c256 (post-fix, re-measured here) | 4760 | 5682 | **0.838** | 15 | 315 ms |
+| **Xs/c256 (the real experiment)** | **5063** | **5432** | **0.932** | **3** | **113 ms** |
+
+Per run, so the reader can see there is no overlap to argue about:
+
+```
+X  pie  4636  4883      Xs pie  5030  5096
+X  vllm 5681  5682      Xs vllm 5430  5435
+```
+
+All four pairwise comparisons go the same way. Three independent signals move
+together, and they move in *opposite directions* for the two engines:
+
+- **throughput ratio 0.838 -> 0.932**, i.e. pie recovers 11.2% relative;
+- **pie's KV starvation failures 15 -> 3**, an 80% reduction;
+- **pie's inter-token p99 315 ms -> 113 ms**, a 64% reduction;
+- and **vLLM *loses* 4.4%** on the identical change (5682 -> 5432).
+
+That last line is what makes this conclusive. The spread is not a softer
+workload — for vLLM it is a harder one, as expected, since a ragged tail of
+long requests leaves its batch progressively emptier. pie gains 6.4% from
+exactly the thing that costs vLLM 4.4%. Only a synchrony cost behaves that
+way.
+
+### What it proves
+
+§20.42 claimed the opposite ("workload destaggering: byte-identical
+schedule") and used it to argue that the lockstep is manufactured entirely on
+pie's side and cannot be dissolved from the workload side. That experiment
+never ran (§20.45). Run properly, it says: **the fleet's synchronised
+retirement is worth ~11 points of the ratio at c256**, and it is dissolvable.
+
+This is the strongest available confirmation of §20.44's framing — the
+deficit is *when lanes are allowed to submit*, not what the seal does with
+their fires once submitted. The evidence chain is now:
+
+1. lanes are admitted in bursts of exactly `--concurrency` (§20.44);
+2. lane lifetime p50 (581 ms) equals the cohort period (586 ms), so cohorts
+   never overlap and every turnover is a fleet-wide barrier (§20.44);
+3. prefill waves run token-capped with 109190 free row slots while 55446
+   decode rows run in dedicated waves (§20.44);
+4. **breaking the retirement synchrony from outside the engine recovers 11
+   points and 80% of the KV failures** (here).
+
+The KV result is worth calling out separately. The residual starvation
+failures are not a fixed cost of the pool size: the same pool, the same total
+work and the same concurrency produce 15 failures when the fleet retires in
+lockstep and 3 when it does not. Synchronised retirement means synchronised
+*re-admission*, and the whole cohort demands its first prefill pages in the
+same instant. The starvation is a symptom of the herd, not of capacity.
+
+### What it does not prove
+
+The workload cannot be the fix — real clients do not agree to spread their
+output lengths. It establishes the size of the prize and rules out the
+alternative explanations (kernel rate, capacity, host scheduling), because
+none of those can be changed by a client-side budget sawtooth. The engine-side
+equivalent is §20.44's option 2: stagger the bootstrap release of the
+execution pool (`preload_free_slots(capacity)` hands it out in one instant),
+so that a homogeneous fleet is *admitted* staggered and, being homogeneous,
+stays staggered thereafter. That is the next change, and this section is the
+measurement that justifies it.
