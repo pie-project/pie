@@ -124,6 +124,42 @@ class ForwardPlan {
         return ForwardPlan(raw);
     }
 
+    /// Trace the qwen3_5 FULL-attention block FRAGMENT — the traced form
+    /// carrying the gated-attention kinds (`SplitQGate`, `SigmoidGateMul`)
+    /// plus the partial `Rope` (param1 = rotary width) and the Gemma-fold
+    /// `RmsnormPerHead` (param1 = variant), with `KvAppend`/`Attention`
+    /// marking the layer's KV cache exactly as llama_like's do.
+    ///
+    /// Like the fragments above, this wrapper exposes the plan; the
+    /// declared EXECUTORS do not consume it — both emitters' op-kind
+    /// switches end in the loud default arm on the appended kinds
+    /// (`driver/metal/tests/llama_like_declared_dag_test.cpp` pins the
+    /// refusal). Emitting the gated attention is a driver-side rung.
+    static ForwardPlan trace_qwen3_5_full_attn(const PieForwardQwen35FullAttnFacts& facts) {
+        PieForwardPlan raw{};
+        const PieForwardStatus status = pie_forward_trace_qwen3_5_full_attn(&facts, &raw);
+        if (status != PieForwardStatus::Ok) {
+            throw std::runtime_error(
+                "forward plan: full attn trace failed (" + status_name(status) + ")");
+        }
+        return ForwardPlan(raw);
+    }
+
+    /// Trace the full qwen3_5 HYBRID model — embed → per-layer {GDN or
+    /// full attention on the checkpoint's schedule; dense or MoE MLP} →
+    /// final norm → lm_head. Composes every fragment vocabulary, so the
+    /// declared executors refuse it loudly; the wrapper serves the
+    /// toolchain side (planning, tests, cross-language pinning).
+    static ForwardPlan trace_qwen3_5_hybrid(const PieForwardQwen35HybridFacts& facts) {
+        PieForwardPlan raw{};
+        const PieForwardStatus status = pie_forward_trace_qwen3_5_hybrid(&facts, &raw);
+        if (status != PieForwardStatus::Ok) {
+            throw std::runtime_error(
+                "forward plan: hybrid trace failed (" + status_name(status) + ")");
+        }
+        return ForwardPlan(raw);
+    }
+
     explicit operator bool() const noexcept { return plan_.owner != nullptr; }
 
     const PieForwardPlan& view() const {

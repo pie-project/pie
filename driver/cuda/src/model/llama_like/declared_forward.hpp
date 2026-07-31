@@ -50,6 +50,22 @@
 // its slot plumbing through this walk, not adding launch arms. The Metal
 // test pins this refusal too (same file as the MoE one).
 //
+// The full-attention/hybrid vocabulary (`SplitQGate`, `SigmoidGateMul` —
+// the `pie_forward_trace_qwen3_5_full_attn` fragment and the
+// `pie_forward_trace_qwen3_5_hybrid` model) is refused by the same default
+// arm. Two of qwen3.5's four gated-attention pieces ride as APPENDED PARAMS
+// on existing kinds rather than new kinds — `Rope.param1` (partial rotary
+// width) and `RmsnormPerHead.param1` (Gemma fold) — and this executor
+// neither reads nor emits them; that is safe because no trace can reach
+// either op past its refusals: every qwen3_5 trace opens each layer with a
+// GEMMA `Rmsnorm` (refused above by the variant check) and, were the fold
+// Plain, would still hit an unknown qwen3_5-only weight name or the
+// `SplitQGate` default arm before its Rope. Emitting the gated attention
+// (split-q-gate, partial rope, sigmoid output gate — kernels qwen3_5
+// already owns) is a smaller lift than MoE/GDN but still a rung of its
+// own, not a switch arm to add casually here. The Metal test pins the
+// full-attention refusal too (same file).
+//
 // Explicit KV-write descriptors ARE handled (the hand-written
 // `has_write_desc` branch, verbatim): every pure-decode fire that replays a
 // forward graph carries them — `forward_graph_replay_eligible` REQUIRES

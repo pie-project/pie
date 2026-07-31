@@ -6,8 +6,11 @@
 //! matmuls and no split, and the traced forms differ the way two compiled
 //! programs differ, not the way two runtime paths do.
 
-use crate::facts::{LlamaLikeFacts, NormPlacement, QkNorm, Qwen35GdnFacts, Qwen35MoeMlpFacts};
-use crate::trace::{DType, Dim, ForwardPlan, Shape, TraceBuilder};
+use crate::facts::{
+    LlamaLikeFacts, NormPlacement, QkNorm, Qwen35FullAttnFacts, Qwen35GdnFacts, Qwen35HybridFacts,
+    Qwen35MlpKind, Qwen35MoeMlpFacts,
+};
+use crate::trace::{DType, Dim, ForwardPlan, NormVariant, RopeKind, Shape, TraceBuilder, ValueId};
 
 /// The llama_like decode/prefill body (no structural divergence, so one
 /// trace serves both; the emitter picks decode vs prefill attention plans
@@ -59,8 +62,8 @@ pub fn llama_like(facts: &LlamaLikeFacts) -> ForwardPlan {
             let (q, k) = match facts.qk_norm {
                 QkNorm::Off => (q, k),
                 QkNorm::PerHead => (
-                    t.rmsnorm_per_head(q, &w("q_norm"), facts.head_dim),
-                    t.rmsnorm_per_head(k, &w("k_norm"), facts.head_dim),
+                    t.rmsnorm_per_head(q, &w("q_norm"), facts.head_dim, facts.norm_variant),
+                    t.rmsnorm_per_head(k, &w("k_norm"), facts.head_dim, facts.norm_variant),
                 ),
                 // The global convention IS a plain row RMSNorm over the
                 // flattened `[rows, heads * head_dim]` projection — the
@@ -151,62 +154,62 @@ pub fn qwen3_5_moe_mlp_block(facts: &Qwen35MoeMlpFacts) -> ForwardPlan {
     // The fragment's parameter: the residual stream entering the block.
     let y = t.input(Shape(vec![Dim::Tokens, hidden]), DType::BF16);
 
-    t.layer(0, |t| {
-        let l = 0;
-        let w = |name: &str| format!("layer.{l}.{name}");
-
-        let m = t.rmsnorm(y, &w("mlp_norm"), facts.norm_variant);
-
-        // Routed experts: router -> topk -> grouped gate_up -> swiglu ->
-        // grouped down -> per-token weighted combine.
-        let logits = t.matmul(m, &w("router"), facts.num_experts);
-        let (experts, weights) = t.topk(logits, facts.top_k);
-        let gate_up = t.matmul_per_token(
-            m,
-            &w("expert.{e}.gate_up"),
-            experts,
-            2 * facts.moe_intermediate,
-        );
-        let act = t.swiglu(gate_up, facts.moe_intermediate);
-        let down = t.matmul_per_token(act, &w("expert.{e}.down"), experts, facts.hidden);
-        let routed = t.weighted_sum(weights, down);
-
-        // Shared expert (qwen3.5/3.6-MoE: always-on dense MLP behind a
-        // per-token sigmoid scalar gate; absent on qwen3_moe).
-        let combined = if facts.shared_expert_intermediate > 0 {
-            let inter = facts.shared_expert_intermediate;
-            let packed = t.matmul(m, &w("shared_expert.gate_up"), 2 * inter);
-            let act = t.swiglu(packed, inter);
-            let shared = t.matmul(act, &w("shared_expert.down"), facts.hidden);
-            let gate = t.matmul(m, &w("shared_expert_gate"), 1);
-            t.sigmoid_gate_add(shared, gate, routed)
-        } else {
-            routed
-        };
-
-        t.residual_add(combined, y)
-    });
+    t.layer(0, |t| moe_mlp_body(t, 0, facts, y));
     t.finish()
+}
+
+/// The MoE MLP block's op emission at layer `l` — the unit
+/// [`qwen3_5_moe_mlp_block`] traces standalone (at layer 0) and
+/// [`qwen3_5_hybrid`] composes per layer. One body so the hybrid's MLP ops
+/// ARE the fragment's, by construction rather than by parallel maintenance.
+fn moe_mlp_body(t: &mut TraceBuilder, l: u32, facts: &Qwen35MoeMlpFacts, y: ValueId) -> ValueId {
+    let w = |name: &str| format!("layer.{l}.{name}");
+
+    let m = t.rmsnorm(y, &w("mlp_norm"), facts.norm_variant);
+
+    // Routed experts: router -> topk -> grouped gate_up -> swiglu ->
+    // grouped down -> per-token weighted combine.
+    let logits = t.matmul(m, &w("router"), facts.num_experts);
+    let (experts, weights) = t.topk(logits, facts.top_k);
+    let gate_up = t.matmul_per_token(
+        m,
+        &w("expert.{e}.gate_up"),
+        experts,
+        2 * facts.moe_intermediate,
+    );
+    let act = t.swiglu(gate_up, facts.moe_intermediate);
+    let down = t.matmul_per_token(act, &w("expert.{e}.down"), experts, facts.hidden);
+    let routed = t.weighted_sum(weights, down);
+
+    // Shared expert (qwen3.5/3.6-MoE: always-on dense MLP behind a
+    // per-token sigmoid scalar gate; absent on qwen3_moe).
+    let combined = if facts.shared_expert_intermediate > 0 {
+        let inter = facts.shared_expert_intermediate;
+        let packed = t.matmul(m, &w("shared_expert.gate_up"), 2 * inter);
+        let act = t.swiglu(packed, inter);
+        let shared = t.matmul(act, &w("shared_expert.down"), facts.hidden);
+        let gate = t.matmul(m, &w("shared_expert_gate"), 1);
+        t.sigmoid_gate_add(shared, gate, routed)
+    } else {
+        routed
+    };
+
+    t.residual_add(combined, y)
 }
 
 /// One qwen3_5 GDN (gated-deltanet) linear-attention block, traced
 /// standalone — the second fragment, and the other layer kind of the
 /// qwen3.5 hybrid.
 ///
-/// This is a FRAGMENT, not a model: the unit the future qwen3_5 declaration
+/// This is a FRAGMENT, not a model: the unit the qwen3_5 declaration
 /// composes on a `Linear` layer (`y += gdn(l, rmsnorm(y, attn_norm))`,
 /// plan.md Part 1's `match layers[l]`), traced against layer 0 with the
 /// residual stream as a fragment parameter ([`TraceBuilder::input`]),
-/// exactly the MoE fragment's shape. With both fragments the qwen3.5 layer
-/// KINDS are covered, but the hybrid composition is still out of reach: the
-/// FULL-attention layer of this family is not llama_like's — its q_proj is
-/// 2× wide with a per-head `[query | gate]` split
-/// (`launch_split_q_gate_bf16`), the attention output is gated
-/// (`launch_sigmoid_gate_inplace_bf16`, a multiply with no residual — NOT
-/// [`crate::trace::OpKind::SigmoidGateAdd`]), rope is partial
-/// (`partial_rotary_factor`) and the q/k per-head norms fold Gemma-style —
-/// so a `qwen3_5_hybrid` declaration waits on that vocabulary
-/// (`full_attn_layer_body`, `qwen3_5_forward.cpp`).
+/// exactly the MoE fragment's shape. The FULL-attention layer kind of this
+/// family — not llama_like's: q_proj 2× wide with the per-head
+/// `[query | gate]` split, sigmoid output gate, partial rope, Gemma-fold
+/// per-head norms — is its own fragment, [`qwen3_5_full_attn_block`], and
+/// [`qwen3_5_hybrid`] composes all three bodies into the full model.
 ///
 /// Mirrors `qwen3_5_forward.cpp::linear_attn_layer_body` launch for launch
 /// on the TP=1 decode fast path (the canonical granularity; the prefill
@@ -245,57 +248,255 @@ pub fn qwen3_5_moe_mlp_block(facts: &Qwen35MoeMlpFacts) -> ForwardPlan {
 pub fn qwen3_5_gdn_block(facts: &Qwen35GdnFacts) -> ForwardPlan {
     let mut t = TraceBuilder::new("qwen3_5_gdn_block");
     let hidden = Dim::Const(facts.hidden);
-    let conv_dim = facts.conv_dim();
-    let v_dim = facts.value_width();
 
     // The fragment's parameter: the residual stream entering the block.
     let y = t.input(Shape(vec![Dim::Tokens, hidden]), DType::BF16);
 
-    t.layer(0, |t| {
-        let l = 0;
-        let w = |name: &str| format!("layer.{l}.{name}");
+    t.layer(0, |t| gdn_attn_body(t, 0, facts, y));
+    t.finish()
+}
 
-        let x = t.rmsnorm(y, &w("attn_norm"), facts.norm_variant);
+/// The GDN linear-attention block's op emission at layer `l` — the unit
+/// [`qwen3_5_gdn_block`] traces standalone (at layer 0) and
+/// [`qwen3_5_hybrid`] composes on every `Linear` layer. One body so the
+/// hybrid's GDN ops ARE the fragment's, by construction.
+fn gdn_attn_body(t: &mut TraceBuilder, l: u32, facts: &Qwen35GdnFacts, y: ValueId) -> ValueId {
+    let conv_dim = facts.conv_dim();
+    let v_dim = facts.value_width();
+    let w = |name: &str| format!("layer.{l}.{name}");
 
-        // In-projections. The fused/unfused branch resolves at trace time
-        // (a binding fact); operand packing mirrors the driver's:
-        // qkvz = [mixed_qkv | z], ba = [b | a].
-        let (qkv, z, a, b) = if facts.fused_in_proj {
-            let qkvz = t.matmul(x, &w("in_proj_qkvz"), conv_dim + v_dim);
-            let (qkv, z) = t.split_gdn(qkvz, conv_dim, v_dim);
-            let ba = t.matmul(x, &w("in_proj_ba"), 2 * facts.value_heads);
-            let (b, a) = t.split_gdn(ba, facts.value_heads, facts.value_heads);
-            (qkv, z, a, b)
-        } else {
-            (
-                t.matmul(x, &w("in_proj_qkv"), conv_dim),
-                t.matmul(x, &w("in_proj_z"), v_dim),
-                t.matmul(x, &w("in_proj_a"), facts.value_heads),
-                t.matmul(x, &w("in_proj_b"), facts.value_heads),
-            )
-        };
+    let x = t.rmsnorm(y, &w("attn_norm"), facts.norm_variant);
 
-        // Conv → prep → recurrence: the GDN core, against the layer's
-        // per-request conv/recurrent state.
-        let qkv = t.causal_conv1d(l, qkv, &w("conv"), facts.conv_kernel);
-        let (q, k, v, g, beta) = t.gdn_prep(
-            qkv,
-            a,
-            b,
-            &w("a_log"),
-            &w("dt_bias"),
-            facts.key_heads,
-            facts.key_head_dim,
-            facts.value_heads,
-            facts.value_head_dim,
+    // In-projections. The fused/unfused branch resolves at trace time
+    // (a binding fact); operand packing mirrors the driver's:
+    // qkvz = [mixed_qkv | z], ba = [b | a].
+    let (qkv, z, a, b) = if facts.fused_in_proj {
+        let qkvz = t.matmul(x, &w("in_proj_qkvz"), conv_dim + v_dim);
+        let (qkv, z) = t.split_gdn(qkvz, conv_dim, v_dim);
+        let ba = t.matmul(x, &w("in_proj_ba"), 2 * facts.value_heads);
+        let (b, a) = t.split_gdn(ba, facts.value_heads, facts.value_heads);
+        (qkv, z, a, b)
+    } else {
+        (
+            t.matmul(x, &w("in_proj_qkv"), conv_dim),
+            t.matmul(x, &w("in_proj_z"), v_dim),
+            t.matmul(x, &w("in_proj_a"), facts.value_heads),
+            t.matmul(x, &w("in_proj_b"), facts.value_heads),
+        )
+    };
+
+    // Conv → prep → recurrence: the GDN core, against the layer's
+    // per-request conv/recurrent state.
+    let qkv = t.causal_conv1d(l, qkv, &w("conv"), facts.conv_kernel);
+    let (q, k, v, g, beta) = t.gdn_prep(
+        qkv,
+        a,
+        b,
+        &w("a_log"),
+        &w("dt_bias"),
+        facts.key_heads,
+        facts.key_head_dim,
+        facts.value_heads,
+        facts.value_head_dim,
+    );
+    let core = t.gated_delta(l, q, k, v, g, beta);
+
+    // Gated norm (z-gated, per-head, plain fold) → o_proj landed on
+    // the residual (the beta=1 GEMM).
+    let o = t.rmsnorm_gated(core, z, &w("gate_norm"));
+    t.matmul_add(o, &w("o_proj"), y, facts.hidden)
+}
+
+/// One qwen3_5 FULL-attention block, traced standalone — the third
+/// fragment, and the last layer kind the qwen3.5 hybrid needed.
+///
+/// This is a FRAGMENT, not a model: the unit [`qwen3_5_hybrid`] composes on
+/// a `Full` layer (plan.md Part 1's `match layers[l] { Full => full_attn(l,
+/// x), .. }`), traced against layer 0 with the residual stream as a
+/// fragment parameter ([`TraceBuilder::input`]), exactly the MoE and GDN
+/// fragments' shape.
+///
+/// Mirrors `qwen3_5_forward.cpp::full_attn_layer_body` launch for launch on
+/// the TP=1 path (the canonical granularity; decode vs prefill vs
+/// small-naive attention plans, the explicit KV-write descriptor branch and
+/// the TP all-reduce/residual split are all LOWERINGS the emitter picks per
+/// fire), on the default (unfused) binding:
+///
+/// | trace op                  | hand-written kernel(s)                       |
+/// |---------------------------|-----------------------------------------------|
+/// | Rmsnorm(attn_norm)        | launch_rmsnorm_gemma_bf16                     |
+/// | Matmul(q_proj) [2×-wide]  | ops::gemm_act_x_w → [N, 2·Hq]                 |
+/// | Matmul(k_proj)            | ops::gemm_act_x_w → [N, Hk]                   |
+/// | Matmul(v_proj)            | ops::gemm_act_x_w → [N, Hk]                   |
+/// | SplitQGate                | launch_split_q_gate_bf16 (per-head q‖gate)    |
+/// | RmsnormPerHead(q, Gemma)  | launch_rmsnorm_gemma_bf16 over N·Hq rows of d |
+/// | RmsnormPerHead(k, Gemma)  | launch_rmsnorm_gemma_bf16 over N·Hkv rows of d|
+/// | Rope(partial)             | launch_rope_partial_bf16 (rotary_dim chans)   |
+/// | KvAppend                  | launch_write_kv_to_pages / _explicit          |
+/// | Attention                 | dispatch_attention_flashinfer_{decode,prefill}|
+/// | SigmoidGateMul            | launch_sigmoid_gate_inplace_bf16              |
+/// | Matmul(o_proj)+res        | ops::gemm_act_x_w beta=1                      |
+///
+/// With the fused binding (`fused_qkv`, `PIE_QWEN35_FUSED_FULL_ATTN_QGKV`)
+/// the three projections become Matmul(qgkv) + [`SplitQkv`] whose "q" leg
+/// is the 2×-wide `[query | gate]` bank (`use_fused_qgkv`:
+/// `launch_split_qkv_bf16(packed, qg, k, v, N, 2*Hq, Hk)`) — the
+/// [`SplitQGate`] de-interleave still follows, exactly as in the
+/// hand-written body. `KvAppend`/`Attention` mark the layer's KV cache
+/// ([`crate::trace::StateStore::KvCache`] via
+/// [`crate::trace::OpKind::state_ref`]), the same marking llama_like
+/// carries.
+///
+/// [`SplitQkv`]: crate::trace::OpKind::SplitQkv
+/// [`SplitQGate`]: crate::trace::OpKind::SplitQGate
+pub fn qwen3_5_full_attn_block(facts: &Qwen35FullAttnFacts) -> ForwardPlan {
+    let mut t = TraceBuilder::new("qwen3_5_full_attn_block");
+    let hidden = Dim::Const(facts.hidden);
+
+    // The fragment's parameter: the residual stream entering the block.
+    let y = t.input(Shape(vec![Dim::Tokens, hidden]), DType::BF16);
+
+    t.layer(0, |t| full_attn_body(t, 0, facts, y));
+    t.finish()
+}
+
+/// The full-attention block's op emission at layer `l` — the unit
+/// [`qwen3_5_full_attn_block`] traces standalone (at layer 0) and
+/// [`qwen3_5_hybrid`] composes on every `Full` layer.
+///
+/// `KvAppend`/`Attention` carry the MODEL layer `l`. The driver's compact
+/// KV slot (`Qwen3_5LayerWeights::kv_layer`, assigned `kv_slot++` over the
+/// full-attention layers in `qwen3_5.cpp::bind_qwen3_5`) is storage
+/// knowledge derived from the layer-kind schedule — the count of full
+/// layers before `l` — not a fact of what the pass computes, so the trace
+/// states the layer and the emitter derives the slot, exactly as the GDN
+/// ops state `l` while the driver keys its stash on the compact
+/// `linear_idx`.
+fn full_attn_body(t: &mut TraceBuilder, l: u32, facts: &Qwen35FullAttnFacts, y: ValueId) -> ValueId {
+    let q2_w = 2 * facts.q_width();
+    let kv_w = facts.kv_width();
+    let w = |name: &str| format!("layer.{l}.{name}");
+
+    let x = t.rmsnorm(y, &w("attn_norm"), facts.norm_variant);
+
+    // Projections: q is 2× wide (per-head [query | gate]). The fused
+    // binding packs [2q | k | v] into one bank (`qkv_proj.fused`, joined
+    // behind PIE_QWEN35_FUSED_FULL_ATTN_QGKV); the split widths mirror the
+    // driver's launch_split_qkv_bf16(N, 2*Hq, Hk).
+    let (qg, k, v) = if facts.fused_qkv {
+        let packed = t.matmul(x, &w("qgkv"), q2_w + 2 * kv_w);
+        t.split_qkv(packed, q2_w, kv_w)
+    } else {
+        (
+            t.matmul(x, &w("q_proj"), q2_w),
+            t.matmul(x, &w("k_proj"), kv_w),
+            t.matmul(x, &w("v_proj"), kv_w),
+        )
+    };
+    let (q, gate) = t.split_q_gate(qg, facts.q_heads, facts.head_dim);
+
+    // Per-head q/k norms, Gemma fold, then partial rope: only the first
+    // rotary_dim channels of each head rotate.
+    let q = t.rmsnorm_per_head(q, &w("q_norm"), facts.head_dim, facts.norm_variant);
+    let k = t.rmsnorm_per_head(k, &w("k_norm"), facts.head_dim, facts.norm_variant);
+    let (q, k) = t.rope_partial(q, k, RopeKind::Standard, facts.rotary_dim);
+
+    // Paged KV + attention (opaque; the backend owns plan choice), then
+    // the multiply-only output gate and the o_proj accumulate.
+    t.kv_append(l, k, v);
+    let attn = t.attention(l, q, facts.q_width());
+    let gated = t.sigmoid_gate_mul(attn, gate);
+    t.matmul_add(gated, &w("o_proj"), y, facts.hidden)
+}
+
+/// The dense SwiGLU MLP block's op emission at layer `l`
+/// (`qwen3_5_forward.cpp::qwen35_dense_mlp_block`): pre-norm → gate‖up →
+/// swiglu → down landed on the residual (the beta=1 GEMM). The driver's
+/// fused-vs-unfused gate/up banks are emitter dispatch on the single traced
+/// `gate_up` matmul, not a fact — the same call llama_like's olmo2 comment
+/// records for its unfused gate/up binding.
+fn dense_mlp_body(
+    t: &mut TraceBuilder,
+    l: u32,
+    hidden: u32,
+    intermediate: u32,
+    variant: NormVariant,
+    y: ValueId,
+) -> ValueId {
+    let w = |name: &str| format!("layer.{l}.{name}");
+    let m = t.rmsnorm(y, &w("mlp_norm"), variant);
+    let packed = t.matmul(m, &w("gate_up"), 2 * intermediate);
+    let act = t.swiglu(packed, intermediate);
+    t.matmul_add(act, &w("down"), y, hidden)
+}
+
+/// The full qwen3_5 HYBRID declaration — the first whole-model trace beyond
+/// llama_like, composing the three fragment bodies exactly as plan.md Part
+/// 1 sketches:
+///
+/// ```text
+/// let mut y = embed[tok];
+/// for l in 0..layers {
+///     y += match layers[l] {          // static match, resolved at trace time
+///         Full   => full_attn(l, rmsnorm(y, attn_norm)),
+///         Linear => gdn(l, rmsnorm(y, attn_norm)),
+///     };
+///     y += mlp(l, rmsnorm(y, mlp_norm));   // dense or MoE, per the facts
+/// }
+/// lm_head(rmsnorm(y, final_norm))
+/// ```
+///
+/// The `match layers[l]` runs over [`Qwen35HybridFacts::is_full_attn`] —
+/// the checkpoint's `layer_types` schedule stated as the regular interval
+/// (see the facts doc for the provenance chain) — and, like every fact
+/// branch, executes at trace time and vanishes: the traced form is a flat
+/// op list whose layer kinds are baked in. Each layer's attention ops are
+/// EXACTLY the standalone fragment's ([`qwen3_5_gdn_block`] /
+/// [`qwen3_5_full_attn_block`] — one shared body each, pinned by test), so
+/// everything those fragments state about lowerings, per-request state
+/// marking and binding facts holds here per layer.
+///
+/// Mirrors `qwen3_5_forward.cpp::qwen3_5_forward_paged`'s walk: embed
+/// (`launch_embed_bf16`) → per layer {pre-attn norm + attention body,
+/// pre-MLP norm + MLP body} → final norm (`launch_rmsnorm_gemma_bf16`) →
+/// lm_head (`gemm_act_x_w`). The compact-logit gather, the state-only and
+/// commit-advance fires, MTP and the verify/rs-buffer services are
+/// per-fire services around this one pass, not ops of it.
+pub fn qwen3_5_hybrid(facts: &Qwen35HybridFacts) -> ForwardPlan {
+    let hidden = facts.hidden();
+    assert_eq!(
+        facts.gdn.hidden, hidden,
+        "hybrid sub-facts disagree on hidden (gdn)"
+    );
+    if let Qwen35MlpKind::Moe(moe) = &facts.mlp {
+        assert_eq!(
+            moe.hidden, hidden,
+            "hybrid sub-facts disagree on hidden (moe)"
         );
-        let core = t.gated_delta(l, q, k, v, g, beta);
+    }
 
-        // Gated norm (z-gated, per-head, plain fold) → o_proj landed on
-        // the residual (the beta=1 GEMM).
-        let o = t.rmsnorm_gated(core, z, &w("gate_norm"));
-        t.matmul_add(o, &w("o_proj"), y, facts.hidden)
-    });
+    let mut t = TraceBuilder::new("qwen3_5_hybrid");
+    let mut y = t.embed("embed", hidden);
+
+    for l in 0..facts.layers {
+        y = t.layer(l, |t| {
+            let y_attn = if facts.is_full_attn(l) {
+                full_attn_body(t, l, &facts.attn, y)
+            } else {
+                gdn_attn_body(t, l, &facts.gdn, y)
+            };
+            match &facts.mlp {
+                Qwen35MlpKind::Dense { intermediate } => {
+                    dense_mlp_body(t, l, hidden, *intermediate, facts.norm_variant, y_attn)
+                }
+                Qwen35MlpKind::Moe(moe) => moe_mlp_body(t, l, moe, y_attn),
+            }
+        });
+    }
+
+    let final_norm = t.rmsnorm(y, "final_norm", facts.norm_variant);
+    let lm_head = if facts.tied_embeddings { "embed" } else { "lm_head" };
+    t.lm_head(final_norm, lm_head, facts.vocab);
     t.finish()
 }
 
@@ -1125,6 +1326,419 @@ mod tests {
             if weight == "layer.0.attn_norm"));
         assert_eq!(plan.ops[0].inputs, vec![0]);
         assert_eq!(*plan.ops.last().unwrap().inputs.last().unwrap(), 0);
+    }
+
+    /// The full-attention block fragment's op sequence, mapped launch for
+    /// launch to `full_attn_layer_body` (the table on
+    /// [`qwen3_5_full_attn_block`]), on the default (unfused) binding.
+    #[test]
+    fn full_attn_block_op_sequence() {
+        let plan = qwen3_5_full_attn_block(&Qwen35FullAttnFacts::qwen3_5_0_8b());
+        let kinds: Vec<&'static str> = plan
+            .layer_ops(0)
+            .map(|op| match &op.kind {
+                OpKind::Rmsnorm { .. } => "rmsnorm",
+                OpKind::Matmul { beta_one: false, .. } => "matmul",
+                OpKind::Matmul { beta_one: true, .. } => "matmul+res",
+                OpKind::SplitQkv { .. } => "split_qkv",
+                OpKind::SplitQGate { .. } => "split_q_gate",
+                OpKind::RmsnormPerHead { .. } => "rmsnorm_per_head",
+                OpKind::Rope { .. } => "rope",
+                OpKind::KvAppend { .. } => "kv_append",
+                OpKind::Attention { .. } => "attention",
+                OpKind::SigmoidGateMul => "sigmoid_gate_mul",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "rmsnorm",          // attn_norm (gemma fold)
+                "matmul",           // q_proj, 2x wide: [Tokens, 2*Hq]
+                "matmul",           // k_proj [Tokens, Hk]
+                "matmul",           // v_proj [Tokens, Hk]
+                "split_q_gate",     // per-head [query | gate] de-interleave
+                "rmsnorm_per_head", // q_norm (gemma fold)
+                "rmsnorm_per_head", // k_norm
+                "rope",             // partial: first rotary_dim channels
+                "kv_append",
+                "attention",
+                "sigmoid_gate_mul", // attn_out *= sigmoid(gate)
+                "matmul+res",       // o_proj, beta=1
+            ]
+        );
+        assert_eq!(plan.ops.len(), 12);
+    }
+
+    /// The fused qgkv binding (`PIE_QWEN35_FUSED_FULL_ATTN_QGKV`) trades
+    /// the three projections for Matmul(qgkv) + SplitQkv whose "q" leg is
+    /// the 2×-wide `[query | gate]` bank — and the SplitQGate de-interleave
+    /// still follows, consuming that leg, exactly as the hand-written
+    /// `use_fused_qgkv` branch.
+    #[test]
+    fn full_attn_block_fused_binding_traces_qgkv_split() {
+        let facts = Qwen35FullAttnFacts {
+            fused_qkv: true,
+            ..Qwen35FullAttnFacts::qwen3_5_0_8b()
+        };
+        let plan = qwen3_5_full_attn_block(&facts);
+        assert_eq!(plan.ops.len(), 11);
+        let matmuls = plan
+            .ops
+            .iter()
+            .filter(|op| matches!(op.kind, OpKind::Matmul { .. }))
+            .count();
+        assert_eq!(matmuls, 2); // qgkv, o_proj
+        let split = plan
+            .ops
+            .iter()
+            .find(|op| matches!(op.kind, OpKind::SplitQkv { .. }))
+            .unwrap();
+        assert!(matches!(
+            split.kind,
+            OpKind::SplitQkv { q_width, kv_width }
+                if q_width == 2 * facts.q_width() && kv_width == facts.kv_width()
+        ));
+        // SplitQGate consumes the split's first (2x-wide q|gate) leg.
+        let qg_split = plan
+            .ops
+            .iter()
+            .find(|op| matches!(op.kind, OpKind::SplitQGate { .. }))
+            .unwrap();
+        assert_eq!(qg_split.inputs, vec![split.outputs[0]]);
+        // KvAppend consumes the k and v legs.
+        let append = plan
+            .ops
+            .iter()
+            .find(|op| matches!(op.kind, OpKind::KvAppend { .. }))
+            .unwrap();
+        assert_eq!(append.inputs[1], split.outputs[2]); // v (pre-rope)
+    }
+
+    /// Dataflow and params of the gated attention: the interleaved split
+    /// carries head geometry and halves the 2×-wide projection, the
+    /// per-head norms fold Gemma, rope is partial at the fixture's 64
+    /// channels, the output gate multiplies attention's output by the
+    /// split's GATE leg, and o_proj lands the gated value on the residual.
+    #[test]
+    fn full_attn_block_gate_dataflow_and_shapes() {
+        let facts = Qwen35FullAttnFacts::qwen3_5_0_8b();
+        let plan = qwen3_5_full_attn_block(&facts);
+        let shape_of = |id: u32| plan.values[id as usize].shape.0.clone();
+
+        // 0.8B geometry sanity, against the metal driver's stated launch
+        // geometry (decode_consts.cpp): q 1024 -> 4096 (2x-wide), k/v
+        // 1024 -> 512, o 2048 -> 1024.
+        assert_eq!(2 * facts.q_width(), 4096);
+        assert_eq!(facts.kv_width(), 512);
+        assert_eq!(facts.q_width(), 2048);
+
+        let qg_split = plan
+            .ops
+            .iter()
+            .find(|op| matches!(op.kind, OpKind::SplitQGate { .. }))
+            .unwrap();
+        assert!(matches!(
+            qg_split.kind,
+            OpKind::SplitQGate { heads: 8, head_dim: 256 }
+        ));
+        let q_proj = &plan.ops[1];
+        assert!(matches!(
+            &q_proj.kind,
+            OpKind::Matmul { weight, .. } if weight == "layer.0.q_proj"
+        ));
+        assert_eq!(qg_split.inputs, vec![q_proj.outputs[0]]);
+        assert_eq!(
+            shape_of(q_proj.outputs[0]),
+            vec![Dim::Tokens, Dim::Const(4096)]
+        );
+        for &out in &qg_split.outputs {
+            assert_eq!(shape_of(out), vec![Dim::Tokens, Dim::Const(2048)]);
+        }
+
+        // Per-head norms: Gemma fold, head_dim 256, on the QUERY leg.
+        let per_head: Vec<_> = plan
+            .ops
+            .iter()
+            .filter(|op| matches!(op.kind, OpKind::RmsnormPerHead { .. }))
+            .collect();
+        assert_eq!(per_head.len(), 2);
+        assert!(matches!(
+            &per_head[0].kind,
+            OpKind::RmsnormPerHead { weight, head_dim: 256, variant: NormVariant::Gemma }
+                if weight == "layer.0.q_norm"
+        ));
+        assert_eq!(per_head[0].inputs, vec![qg_split.outputs[0]]);
+
+        // Partial rope: the fixture's 64 channels (0.25 x 256).
+        let rope = plan
+            .ops
+            .iter()
+            .find(|op| matches!(op.kind, OpKind::Rope { .. }))
+            .unwrap();
+        assert!(matches!(
+            rope.kind,
+            OpKind::Rope { kind: RopeKind::Standard, partial: Some(64) }
+        ));
+
+        // The output gate: attention's output times the GATE leg — the
+        // gate flows AROUND the norm/rope/attention chain, untouched.
+        let attn = plan
+            .ops
+            .iter()
+            .find(|op| matches!(op.kind, OpKind::Attention { .. }))
+            .unwrap();
+        let gate_mul = plan
+            .ops
+            .iter()
+            .find(|op| matches!(op.kind, OpKind::SigmoidGateMul))
+            .unwrap();
+        assert_eq!(gate_mul.inputs, vec![attn.outputs[0], qg_split.outputs[1]]);
+        assert_eq!(
+            shape_of(gate_mul.outputs[0]),
+            vec![Dim::Tokens, Dim::Const(2048)]
+        );
+
+        // o_proj accumulates the GATED value onto the fragment parameter.
+        let o_proj = plan.ops.last().unwrap();
+        assert!(matches!(
+            &o_proj.kind,
+            OpKind::Matmul { beta_one: true, weight, .. } if weight == "layer.0.o_proj"
+        ));
+        assert_eq!(o_proj.inputs, vec![gate_mul.outputs[0], 0]);
+
+        // KvCache marking: exactly KvAppend + Attention, at the block's
+        // layer — the same marks llama_like carries, none of the GDN ones.
+        let marks: Vec<_> = plan
+            .ops
+            .iter()
+            .filter_map(|op| op.kind.state_ref())
+            .collect();
+        assert_eq!(
+            marks,
+            vec![
+                StateRef { store: StateStore::KvCache, layer: 0 },
+                StateRef { store: StateStore::KvCache, layer: 0 },
+            ]
+        );
+    }
+
+    /// The fragment parameter is honest dataflow, MoE/GDN-fragment style.
+    #[test]
+    fn full_attn_block_residual_stream_is_a_fragment_parameter() {
+        let plan = qwen3_5_full_attn_block(&Qwen35FullAttnFacts::qwen3_5_0_8b());
+        assert!(!plan.ops.iter().any(|op| op.outputs.contains(&0)));
+        assert!(matches!(&plan.ops[0].kind, OpKind::Rmsnorm { weight, .. }
+            if weight == "layer.0.attn_norm"));
+        assert_eq!(plan.ops[0].inputs, vec![0]);
+        assert_eq!(*plan.ops.last().unwrap().inputs.last().unwrap(), 0);
+    }
+
+    /// Rewrite a fragment op's kind from layer 0 to layer `l`: weight names
+    /// re-prefixed, state-layer params re-pointed. What "the hybrid's layer
+    /// ops equal the fragment's" means, made precise.
+    fn relayer(kind: &OpKind, l: u32) -> OpKind {
+        let re = |w: &str| w.replacen("layer.0.", &format!("layer.{l}."), 1);
+        let mut kind = kind.clone();
+        match &mut kind {
+            OpKind::Matmul { weight, .. }
+            | OpKind::Rmsnorm { weight, .. }
+            | OpKind::RmsnormPerHead { weight, .. }
+            | OpKind::CausalConv1d { weight, .. }
+            | OpKind::RmsnormGated { weight }
+            | OpKind::Embed { weight }
+            | OpKind::LmHead { weight } => *weight = re(weight),
+            OpKind::GdnPrep { a_log, dt_bias } => {
+                *a_log = re(a_log);
+                *dt_bias = re(dt_bias);
+            }
+            _ => {}
+        }
+        match &mut kind {
+            OpKind::KvAppend { layer }
+            | OpKind::Attention { layer }
+            | OpKind::CausalConv1d { layer, .. }
+            | OpKind::GatedDelta { layer } => *layer = l,
+            _ => {}
+        }
+        kind
+    }
+
+    /// Assert the hybrid's layer-`l` ATTENTION ops are the standalone
+    /// fragment's, op for op: same kinds (modulo the layer rewrite) and the
+    /// same SSA dataflow under the id mapping {fragment 0 → the layer's
+    /// incoming residual, fragment i → the layer's i-th fresh value}.
+    fn assert_layer_head_matches_fragment(
+        hybrid: &crate::trace::ForwardPlan,
+        l: u32,
+        fragment: &crate::trace::ForwardPlan,
+    ) {
+        let h_ops: Vec<_> = hybrid.layer_ops(l).collect();
+        let f_ops: Vec<_> = fragment.layer_ops(0).collect();
+        assert!(h_ops.len() > f_ops.len(), "layer {l} shorter than fragment");
+        // Fragment value 0 is the parameter; its fresh values start at 1.
+        // The hybrid's layer reads the stream as the first op's input and
+        // allocates fresh values from the first op's output on.
+        let y_in = h_ops[0].inputs[0];
+        let base = h_ops[0].outputs[0];
+        let map = |id: u32| if id == 0 { y_in } else { base + (id - 1) };
+        for (f, h) in f_ops.iter().zip(&h_ops) {
+            assert_eq!(h.kind, relayer(&f.kind, l), "kind at layer {l}");
+            let mapped_in: Vec<u32> = f.inputs.iter().map(|&i| map(i)).collect();
+            let mapped_out: Vec<u32> = f.outputs.iter().map(|&i| map(i)).collect();
+            assert_eq!(h.inputs, mapped_in, "inputs of {:?} at layer {l}", f.kind);
+            assert_eq!(h.outputs, mapped_out, "outputs of {:?} at layer {l}", f.kind);
+        }
+    }
+
+    /// The hybrid's layer-kind schedule is the checkpoint's 3:1 pattern:
+    /// full attention exactly on layers 3, 7, 11, 15, 19, 23 (interval 4,
+    /// end of each block — the Metal geometry's `is_full_attn`), GDN
+    /// everywhere else, and every layer carries the dense MLP.
+    #[test]
+    fn hybrid_layer_kind_sequence_matches_the_pattern() {
+        let facts = Qwen35HybridFacts::qwen3_5_0_8b();
+        let plan = qwen3_5_hybrid(&facts);
+        for l in 0..facts.layers {
+            let ops: Vec<_> = plan.layer_ops(l).collect();
+            let full = ops
+                .iter()
+                .any(|op| matches!(op.kind, OpKind::Attention { .. }));
+            let linear = ops
+                .iter()
+                .any(|op| matches!(op.kind, OpKind::GatedDelta { .. }));
+            assert_eq!(full, l % 4 == 3, "layer {l} full-attention");
+            assert_eq!(linear, l % 4 != 3, "layer {l} linear-attention");
+            assert!(!(full && linear), "layer {l} mixes kinds");
+            // The uniform dense MLP: gate_up + down on every layer.
+            assert!(ops.iter().any(|op| matches!(&op.kind,
+                OpKind::Matmul { weight, .. } if weight.ends_with("gate_up"))));
+        }
+    }
+
+    /// The hybrid's GDN layers ARE the standalone GDN fragment, op for op
+    /// and edge for edge — the shared-body refactor pinned as behaviour.
+    #[test]
+    fn hybrid_gdn_layers_equal_the_standalone_fragment() {
+        let facts = Qwen35HybridFacts::qwen3_5_0_8b();
+        let hybrid = qwen3_5_hybrid(&facts);
+        let fragment = qwen3_5_gdn_block(&facts.gdn);
+        for l in (0..facts.layers).filter(|&l| !facts.is_full_attn(l)) {
+            assert_layer_head_matches_fragment(&hybrid, l, &fragment);
+        }
+    }
+
+    /// The hybrid's full-attention layers ARE the standalone full-attention
+    /// fragment, same pinning.
+    #[test]
+    fn hybrid_full_attn_layers_equal_the_standalone_fragment() {
+        let facts = Qwen35HybridFacts::qwen3_5_0_8b();
+        let hybrid = qwen3_5_hybrid(&facts);
+        let fragment = qwen3_5_full_attn_block(&facts.attn);
+        for l in (0..facts.layers).filter(|&l| facts.is_full_attn(l)) {
+            assert_layer_head_matches_fragment(&hybrid, l, &fragment);
+        }
+    }
+
+    /// The op-count formula: 18 GDN layers x (10 attn + 4 mlp) + 6 full
+    /// layers x (12 attn + 4 mlp) + embed + final norm + lm_head — and the
+    /// epilogue: tied lm_head over the 0.8B vocab.
+    #[test]
+    fn hybrid_full_plan_shape() {
+        let facts = Qwen35HybridFacts::qwen3_5_0_8b();
+        let plan = qwen3_5_hybrid(&facts);
+        assert_eq!(plan.ops.len(), 18 * 14 + 6 * 16 + 3);
+        assert!(matches!(&plan.ops[0].kind, OpKind::Embed { weight } if weight == "embed"));
+        assert!(matches!(
+            &plan.ops.last().unwrap().kind,
+            OpKind::LmHead { weight } if weight == "embed"
+        ));
+        let logits = plan.ops.last().unwrap().outputs[0];
+        assert_eq!(
+            plan.values[logits as usize].shape.0,
+            vec![Dim::Requests, Dim::Const(facts.vocab)]
+        );
+        // Both state stores are marked, on disjoint layer sets: the KV
+        // cache exactly on the full-attention layers (twice each: append +
+        // attention), the recurrent store exactly on the GDN layers
+        // (twice each: conv + recurrence).
+        for l in 0..facts.layers {
+            let stores: Vec<_> = plan
+                .layer_ops(l)
+                .filter_map(|op| op.kind.state_ref())
+                .collect();
+            let store = if facts.is_full_attn(l) {
+                StateStore::KvCache
+            } else {
+                StateStore::RecurrentState
+            };
+            assert_eq!(
+                stores,
+                vec![StateRef { store, layer: l }, StateRef { store, layer: l }]
+            );
+        }
+    }
+
+    /// A MoE-MLP hybrid composes the MoE fragment body per layer (the
+    /// qwen3.5/3.6-MoE shape): every layer carries the router → topk →
+    /// grouped GEMMs → combine block in place of the dense four.
+    #[test]
+    fn hybrid_with_moe_mlp_composes_the_moe_fragment() {
+        let moe = Qwen35MoeMlpFacts {
+            hidden: 1024,
+            ..Qwen35MoeMlpFacts::qwen3_5_35b_a3b()
+        };
+        let facts = Qwen35HybridFacts {
+            layers: 4,
+            mlp: Qwen35MlpKind::Moe(moe),
+            ..Qwen35HybridFacts::qwen3_5_0_8b()
+        };
+        let plan = qwen3_5_hybrid(&facts);
+        // 3 GDN layers x (10 + 13) + 1 full layer x (12 + 13) + 3.
+        assert_eq!(plan.ops.len(), 3 * 23 + 25 + 3);
+        for l in 0..facts.layers {
+            assert_eq!(
+                plan.layer_ops(l)
+                    .filter(|op| matches!(op.kind, OpKind::TopK { .. }))
+                    .count(),
+                1,
+                "layer {l} routes"
+            );
+        }
+    }
+
+    /// The full-attention and hybrid traced forms survive serde — the new
+    /// kinds, the partial rope, the per-head Gemma variant — and, per the
+    /// additive rule, none of the new vocabulary appears in any pre-hybrid
+    /// plan's serialization: the seven existing goldens stay byte-identical.
+    #[test]
+    fn full_attn_and_hybrid_traced_forms_round_trip() {
+        for plan in [
+            qwen3_5_full_attn_block(&Qwen35FullAttnFacts::qwen3_5_0_8b()),
+            qwen3_5_hybrid(&Qwen35HybridFacts::qwen3_5_0_8b()),
+        ] {
+            let json = serde_json::to_string(&plan).unwrap();
+            let back: crate::trace::ForwardPlan = serde_json::from_str(&json).unwrap();
+            assert_eq!(plan, back);
+        }
+
+        for old in [
+            serde_json::to_string(&llama_like(&LlamaLikeFacts::qwen3_0_6b())).unwrap(),
+            serde_json::to_string(&llama_like(&LlamaLikeFacts::olmo2_1b())).unwrap(),
+            serde_json::to_string(&qwen3_5_moe_mlp_block(
+                &Qwen35MoeMlpFacts::qwen3_5_35b_a3b(),
+            ))
+            .unwrap(),
+            serde_json::to_string(&qwen3_5_gdn_block(&Qwen35GdnFacts::qwen3_5_0_8b())).unwrap(),
+        ] {
+            for token in ["SplitQGate", "SigmoidGateMul", "partial"] {
+                assert!(!old.contains(token), "{token} leaked into a pre-hybrid plan");
+            }
+            // RmsnormPerHead's variant field is serde-skipped at its Plain
+            // default, so pre-variant serializations carry no per-head
+            // variant key (Rmsnorm's own always-present variant remains).
+            assert!(!old.contains(r#""head_dim":128,"variant""#));
+        }
     }
 
     /// The GDN vocabulary survives serde — new op kinds, rank-3 f32 values,

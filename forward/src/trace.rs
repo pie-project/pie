@@ -99,10 +99,24 @@ pub enum DynAxis {
 
 /// RMSNorm weight conventions that change the arithmetic, not the kernel
 /// choice. `Gemma` folds `(1 + w)`; `Plain` multiplies `w` directly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Default` is `Plain` so the field can ride serde-additively on ops that
+/// predate it ([`OpKind::RmsnormPerHead`]): a golden that never stated a
+/// variant reads back as the plain fold it always meant.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NormVariant {
+    #[default]
     Plain,
     Gemma,
+}
+
+impl NormVariant {
+    /// Serde helper: `Plain` is the resting value and is skipped on
+    /// serialization, the discipline that keeps pre-variant goldens
+    /// byte-identical (the same rule as `selector`/`dyn_axis`).
+    pub fn is_plain(&self) -> bool {
+        *self == NormVariant::Plain
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -146,11 +160,38 @@ pub enum OpKind {
         variant: NormVariant,
     },
     /// Per-head RMSNorm of packed `[rows, heads * head_dim]` Q or K.
-    RmsnormPerHead { weight: String, head_dim: u32 },
+    /// `variant` selects the weight fold exactly as on [`OpKind::Rmsnorm`]:
+    /// qwen3/olmo-style checkpoints multiply `w` directly (`Plain`), while
+    /// qwen3.5's full-attention q/k norms fold `(1 + w)` (`Gemma` —
+    /// `full_attn_layer_body` launches `launch_rmsnorm_gemma_bf16` over
+    /// `N * heads` rows of `head_dim`). Serde-defaulted to `Plain` and
+    /// skipped there, so every pre-variant golden stays byte-identical.
+    RmsnormPerHead {
+        weight: String,
+        head_dim: u32,
+        #[serde(default, skip_serializing_if = "NormVariant::is_plain")]
+        variant: NormVariant,
+    },
     /// Split packed QKV `[rows, q + 2kv]` into Q, K, V (three results).
     SplitQkv { q_width: u32, kv_width: u32 },
     /// Rotary embedding applied in place to Q and K (two operands).
-    Rope { kind: RopeKind },
+    ///
+    /// `partial` is the partial-rotary width: `Some(rotary_dim)` rotates
+    /// only the first `rotary_dim` channels of each head and passes the
+    /// rest through (qwen3.5 full attention, `launch_rope_partial_bf16`);
+    /// `None` is the full rotation every earlier family traces. The trace
+    /// states the resolved CHANNEL COUNT, not HF's `partial_rotary_factor`,
+    /// for the same reason `SplitQkv` states widths rather than head
+    /// counts: every trace-time constant is already multiplied out, and the
+    /// driver's `max(2, 2 * int(0.5 * factor * head_dim))` derivation is
+    /// config-parsing knowledge that belongs with the facts (the fixture
+    /// pins 0.25 × 256 → 64 with its provenance). Serde-skipped when
+    /// absent, so pre-partial goldens stay byte-identical.
+    Rope {
+        kind: RopeKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        partial: Option<u32>,
+    },
     /// Append this fire's K/V rows to the layer's paged cache.
     KvAppend { layer: u32 },
     /// Paged attention over the layer's cache. Opaque: the backend owns
@@ -242,6 +283,24 @@ pub enum OpKind {
     /// fold is plain (`rmsnorm.hpp`: "Plain weight (no `1+w` convention)"),
     /// so there is no variant to state.
     RmsnormGated { weight: String },
+    /// The interleaved per-head `[query | gate]` split of qwen3.5 full
+    /// attention's 2×-wide gated q projection
+    /// (`launch_split_q_gate_bf16`): the packed `[rows, heads * 2 *
+    /// head_dim]` input carries, PER HEAD, `head_dim` query channels then
+    /// `head_dim` gate channels — `q[n, h*d + i] = packed[n, h*2d + i]`,
+    /// `gate[n, h*d + i] = packed[n, h*2d + d + i]` — so this is NOT a row
+    /// split: [`OpKind::SplitGdn`] cuts a packed row at one offset, while
+    /// this op de-interleaves at head granularity. Two results, q then
+    /// gate, each `[rows, heads * head_dim]`.
+    SplitQGate { heads: u32, head_dim: u32 },
+    /// `out = x * sigmoid(gate)`, elementwise — qwen3.5 full attention's
+    /// output gate (`launch_sigmoid_gate_inplace_bf16`: `attn_out *=
+    /// sigmoid(gate)` before o_proj). Operands `[x, gate]`, same shape.
+    /// A multiply with NO residual and no landing: distinct from
+    /// [`OpKind::SigmoidGateAdd`], whose scalar per-token gate broadcasts
+    /// over the hidden dim and lands on a base stream — here the gate is
+    /// full-width and nothing is added.
+    SigmoidGateMul,
 }
 
 /// Which implicit store an op addresses. Both stores are per-layer and
@@ -512,12 +571,19 @@ impl TraceBuilder {
         )[0]
     }
 
-    pub fn rmsnorm_per_head(&mut self, x: ValueId, weight: &str, head_dim: u32) -> ValueId {
+    pub fn rmsnorm_per_head(
+        &mut self,
+        x: ValueId,
+        weight: &str,
+        head_dim: u32,
+        variant: NormVariant,
+    ) -> ValueId {
         let shape = self.values[x as usize].shape.clone();
         self.push(
             OpKind::RmsnormPerHead {
                 weight: weight.to_string(),
                 head_dim,
+                variant,
             },
             vec![x],
             vec![(shape, DType::BF16)],
@@ -545,10 +611,34 @@ impl TraceBuilder {
 
     /// Rope mutates Q and K in place; SSA-wise it produces two new values.
     pub fn rope(&mut self, q: ValueId, k: ValueId, kind: RopeKind) -> (ValueId, ValueId) {
+        self.rope_inner(q, k, kind, None)
+    }
+
+    /// The partial-rotary form: only the first `rotary_dim` channels of
+    /// each head rotate (`launch_rope_partial_bf16`; qwen3.5's
+    /// `partial_rotary_factor` resolved to a channel count — see
+    /// [`OpKind::Rope`]).
+    pub fn rope_partial(
+        &mut self,
+        q: ValueId,
+        k: ValueId,
+        kind: RopeKind,
+        rotary_dim: u32,
+    ) -> (ValueId, ValueId) {
+        self.rope_inner(q, k, kind, Some(rotary_dim))
+    }
+
+    fn rope_inner(
+        &mut self,
+        q: ValueId,
+        k: ValueId,
+        kind: RopeKind,
+        partial: Option<u32>,
+    ) -> (ValueId, ValueId) {
         let q_shape = self.values[q as usize].shape.clone();
         let k_shape = self.values[k as usize].shape.clone();
         let out = self.push(
-            OpKind::Rope { kind },
+            OpKind::Rope { kind, partial },
             vec![q, k],
             vec![(q_shape, DType::BF16), (k_shape, DType::BF16)],
         );
@@ -646,6 +736,48 @@ impl TraceBuilder {
             ],
         );
         (out[0], out[1])
+    }
+
+    /// The interleaved per-head `[query | gate]` split of a 2×-wide gated
+    /// q projection: packed `[rows, heads * 2 * head_dim]` into (q, gate),
+    /// each `[rows, heads * head_dim]`. See [`OpKind::SplitQGate`] for why
+    /// this is not a [`Self::split_gdn`] row split.
+    pub fn split_q_gate(
+        &mut self,
+        packed: ValueId,
+        heads: u32,
+        head_dim: u32,
+    ) -> (ValueId, ValueId) {
+        let rows = self.values[packed as usize].shape.0[0];
+        match self.values[packed as usize].shape.0[1] {
+            Dim::Const(w) if w == 2 * heads * head_dim => {}
+            other => panic!(
+                "split_q_gate input width {other:?} must be 2 * {heads} * {head_dim}"
+            ),
+        }
+        let half = Shape(vec![rows, Dim::Const(heads * head_dim)]);
+        let out = self.push(
+            OpKind::SplitQGate { heads, head_dim },
+            vec![packed],
+            vec![(half.clone(), DType::BF16), (half, DType::BF16)],
+        );
+        (out[0], out[1])
+    }
+
+    /// The multiply-only output gate: `out = x * sigmoid(gate)`, both
+    /// operands the same shape ([`OpKind::SigmoidGateMul`] — no residual,
+    /// unlike [`Self::sigmoid_gate_add`]).
+    pub fn sigmoid_gate_mul(&mut self, x: ValueId, gate: ValueId) -> ValueId {
+        let shape = self.values[x as usize].shape.clone();
+        assert_eq!(
+            shape, self.values[gate as usize].shape,
+            "sigmoid_gate_mul operands must share a shape"
+        );
+        self.push(
+            OpKind::SigmoidGateMul,
+            vec![x, gate],
+            vec![(shape, DType::BF16)],
+        )[0]
     }
 
     /// Depthwise causal conv1d (+ fused SiLU) over the packed qkv, against

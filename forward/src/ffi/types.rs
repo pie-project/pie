@@ -87,6 +87,17 @@ pub enum PieForwardOpKind {
     GatedDelta = 17,
     /// Per-head gated RMSNorm: `w * rmsnorm(x) * silu(gate)`, plain fold.
     RmsnormGated = 18,
+    /// Interleaved per-head `[query | gate]` split of the 2×-wide gated q
+    /// projection (qwen3.5 full attention; NOT a row split — the halves
+    /// interleave at head granularity). First of the full-attention kinds
+    /// (the `pie_forward_trace_qwen3_5_full_attn` fragment / the
+    /// `pie_forward_trace_qwen3_5_hybrid` model) — like the dyn and GDN
+    /// kinds above, the declared executors do NOT consume these; their
+    /// op-kind switches throw on them via the loud default arm.
+    SplitQGate = 19,
+    /// `out = x * sigmoid(gate)`, elementwise — the full-attention output
+    /// gate. A multiply with NO residual: distinct from `SigmoidGateAdd`.
+    SigmoidGateMul = 20,
 }
 
 /// Mirrors [`crate::trace::DType`]; same appended-only discriminant rule as
@@ -373,9 +384,9 @@ pub struct PieForwardIdRange {
 /// | `Embed`          | embedding table      | —                            | —          |
 /// | `Matmul`         | weight               | `beta_one` (0/1)             | —          |
 /// | `Rmsnorm`        | weight               | [`PieForwardNormVariant`]    | —          |
-/// | `RmsnormPerHead` | weight               | `head_dim`                   | —          |
+/// | `RmsnormPerHead` | weight               | `head_dim`                   | [`PieForwardNormVariant`] |
 /// | `SplitQkv`       | none                 | `q_width`                    | `kv_width` |
-/// | `Rope`           | none                 | [`PieForwardRopeKind`]       | —          |
+/// | `Rope`           | none                 | [`PieForwardRopeKind`]       | partial rotary width (0 = full) |
 /// | `KvAppend`       | none                 | cache layer                  | —          |
 /// | `Attention`      | none                 | cache layer                  | —          |
 /// | `Swiglu`         | none                 | `inter`                      | —          |
@@ -389,6 +400,15 @@ pub struct PieForwardIdRange {
 /// | `GdnPrep`        | a_log                | dt_bias NAME index           | —          |
 /// | `GatedDelta`     | none                 | state layer                  | —          |
 /// | `RmsnormGated`   | weight               | —                            | —          |
+/// | `SplitQGate`     | none                 | `heads`                      | `head_dim` |
+/// | `SigmoidGateMul` | none                 | —                            | —          |
+///
+/// `RmsnormPerHead`'s param1 and `Rope`'s param1 are serde-additive on the
+/// Rust side (default `Plain` / absent) and appended-param-additive here:
+/// both rest at 0 on every trace that predates them, so a pre-qwen3.5
+/// consumer reading only param0 still reads what it always did. A partial
+/// `Rope` (param1 != 0) rotates only the first param1 channels of each
+/// head (`launch_rope_partial_bf16`'s `rotary_dim`).
 ///
 /// `KvAppend`/`Attention` restate the layer their kind addresses even though
 /// `layer` carries the bracketing layer, because the trace states both

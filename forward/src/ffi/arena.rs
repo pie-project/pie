@@ -124,11 +124,15 @@ fn flatten_kind(
             0,
             PIE_FORWARD_NO_VALUE,
         ),
-        OpKind::RmsnormPerHead { weight, head_dim } => (
+        OpKind::RmsnormPerHead {
+            weight,
+            head_dim,
+            variant,
+        } => (
             PieForwardOpKind::RmsnormPerHead,
             name(arena, weight),
             *head_dim,
-            0,
+            PieForwardNormVariant::from(*variant) as u32,
             PIE_FORWARD_NO_VALUE,
         ),
         OpKind::SplitQkv { q_width, kv_width } => (
@@ -138,11 +142,14 @@ fn flatten_kind(
             *kv_width,
             PIE_FORWARD_NO_VALUE,
         ),
-        OpKind::Rope { kind } => (
+        // Partial rope crosses as param1: the rotary channel count, 0 for
+        // the full rotation (no real partial width is 0 — the driver
+        // clamps to >= 2 — so the resting value cannot be mistaken).
+        OpKind::Rope { kind, partial } => (
             PieForwardOpKind::Rope,
             PIE_FORWARD_NO_NAME,
             PieForwardRopeKind::from(*kind) as u32,
-            0,
+            partial.unwrap_or(0),
             PIE_FORWARD_NO_VALUE,
         ),
         OpKind::KvAppend { layer } => (
@@ -243,6 +250,20 @@ fn flatten_kind(
         OpKind::RmsnormGated { weight } => (
             PieForwardOpKind::RmsnormGated,
             name(arena, weight),
+            0,
+            0,
+            PIE_FORWARD_NO_VALUE,
+        ),
+        OpKind::SplitQGate { heads, head_dim } => (
+            PieForwardOpKind::SplitQGate,
+            PIE_FORWARD_NO_NAME,
+            *heads,
+            *head_dim,
+            PIE_FORWARD_NO_VALUE,
+        ),
+        OpKind::SigmoidGateMul => (
+            PieForwardOpKind::SigmoidGateMul,
+            PIE_FORWARD_NO_NAME,
             0,
             0,
             PIE_FORWARD_NO_VALUE,

@@ -97,6 +97,17 @@ enum class PieForwardOpKind : uint32_t {
   GatedDelta = 17,
   /// Per-head gated RMSNorm: `w * rmsnorm(x) * silu(gate)`, plain fold.
   RmsnormGated = 18,
+  /// Interleaved per-head `[query | gate]` split of the 2×-wide gated q
+  /// projection (qwen3.5 full attention; NOT a row split — the halves
+  /// interleave at head granularity). First of the full-attention kinds
+  /// (the `pie_forward_trace_qwen3_5_full_attn` fragment / the
+  /// `pie_forward_trace_qwen3_5_hybrid` model) — like the dyn and GDN
+  /// kinds above, the declared executors do NOT consume these; their
+  /// op-kind switches throw on them via the loud default arm.
+  SplitQGate = 19,
+  /// `out = x * sigmoid(gate)`, elementwise — the full-attention output
+  /// gate. A multiply with NO residual: distinct from `SigmoidGateAdd`.
+  SigmoidGateMul = 20,
 };
 
 /// Mirrors [`crate::trace::NormVariant`].
@@ -211,9 +222,9 @@ struct PieForwardIdRange {
 /// | `Embed`          | embedding table      | —                            | —          |
 /// | `Matmul`         | weight               | `beta_one` (0/1)             | —          |
 /// | `Rmsnorm`        | weight               | [`PieForwardNormVariant`]    | —          |
-/// | `RmsnormPerHead` | weight               | `head_dim`                   | —          |
+/// | `RmsnormPerHead` | weight               | `head_dim`                   | [`PieForwardNormVariant`] |
 /// | `SplitQkv`       | none                 | `q_width`                    | `kv_width` |
-/// | `Rope`           | none                 | [`PieForwardRopeKind`]       | —          |
+/// | `Rope`           | none                 | [`PieForwardRopeKind`]       | partial rotary width (0 = full) |
 /// | `KvAppend`       | none                 | cache layer                  | —          |
 /// | `Attention`      | none                 | cache layer                  | —          |
 /// | `Swiglu`         | none                 | `inter`                      | —          |
@@ -227,6 +238,15 @@ struct PieForwardIdRange {
 /// | `GdnPrep`        | a_log                | dt_bias NAME index           | —          |
 /// | `GatedDelta`     | none                 | state layer                  | —          |
 /// | `RmsnormGated`   | weight               | —                            | —          |
+/// | `SplitQGate`     | none                 | `heads`                      | `head_dim` |
+/// | `SigmoidGateMul` | none                 | —                            | —          |
+///
+/// `RmsnormPerHead`'s param1 and `Rope`'s param1 are serde-additive on the
+/// Rust side (default `Plain` / absent) and appended-param-additive here:
+/// both rest at 0 on every trace that predates them, so a pre-qwen3.5
+/// consumer reading only param0 still reads what it always did. A partial
+/// `Rope` (param1 != 0) rotates only the first param1 channels of each
+/// head (`launch_rope_partial_bf16`'s `rotary_dim`).
 ///
 /// `KvAppend`/`Attention` restate the layer their kind addresses even though
 /// `layer` carries the bracketing layer, because the trace states both
@@ -341,6 +361,54 @@ struct PieForwardQwen35GdnFacts {
   uint32_t norm_variant;
 };
 
+/// The qwen3_5 full-attention block facts, as C states them. Mirrors
+/// [`crate::facts::Qwen35FullAttnFacts`] field for field; same input-side
+/// rules as [`PieForwardLlamaLikeFacts`].
+struct PieForwardQwen35FullAttnFacts {
+  uint32_t hidden;
+  uint32_t q_heads;
+  uint32_t kv_heads;
+  uint32_t head_dim;
+  /// Partial-rotary width: the leading channels of each head that
+  /// rotate. Must be in `1..=head_dim`.
+  uint32_t rotary_dim;
+  /// The deployment bound the fused `[2q | k | v]` bank
+  /// (`PIE_QWEN35_FUSED_FULL_ATTN_QGKV`); non-zero is true.
+  uint8_t fused_qkv;
+  /// A [`super::types::PieForwardNormVariant`] value.
+  uint32_t norm_variant;
+};
+
+/// The qwen3_5 HYBRID model facts, as C states them. Mirrors
+/// [`crate::facts::Qwen35HybridFacts`], with the MLP enum flattened the way
+/// C states a sum type: `mlp_is_moe` selects which of
+/// `dense_intermediate` / `moe` is read (the other is ignored). Same
+/// input-side rules as [`PieForwardLlamaLikeFacts`].
+struct PieForwardQwen35HybridFacts {
+  uint32_t layers;
+  /// One full-attention layer every Nth (at the end of each block);
+  /// `1` means every layer. Must be non-zero.
+  uint32_t full_attn_interval;
+  uint32_t vocab;
+  /// The lm_head weight is the embedding table; non-zero is true.
+  uint8_t tied_embeddings;
+  /// A [`super::types::PieForwardNormVariant`] value (the final norm's
+  /// fold; block norms carry their own inside the sub-facts).
+  uint32_t norm_variant;
+  /// The full-attention layer kind.
+  PieForwardQwen35FullAttnFacts attn;
+  /// The GDN linear-attention layer kind.
+  PieForwardQwen35GdnFacts gdn;
+  /// Non-zero: the MLP is the MoE block (`moe`); zero: dense
+  /// (`dense_intermediate`).
+  uint8_t mlp_is_moe;
+  /// The dense MLP's intermediate width; read only when `mlp_is_moe`
+  /// is zero, and must then be non-zero.
+  uint32_t dense_intermediate;
+  /// The MoE MLP facts; read only when `mlp_is_moe` is non-zero.
+  PieForwardQwen35MoeMlpFacts moe;
+};
+
 extern "C" {
 
 /// Trace the llama_like family against `facts` and publish the traced form
@@ -393,9 +461,46 @@ PieForwardStatus pie_forward_trace_qwen3_5_moe_mlp(const PieForwardQwen35MoeMlpF
 PieForwardStatus pie_forward_trace_qwen3_5_gdn(const PieForwardQwen35GdnFacts *facts,
                                                PieForwardPlan *out_plan);
 
+/// Trace the qwen3_5 FULL-attention block FRAGMENT against `facts` and
+/// publish the traced form into `*out_plan`.
+///
+/// The result carries the full-attention vocabulary (`SplitQGate`,
+/// `SigmoidGateMul`, the partial `Rope` and the Gemma-fold
+/// `RmsnormPerHead`) alongside `KvAppend`/`Attention` marking the layer's
+/// KV cache. The declared executors do NOT consume these — their op-kind
+/// switches throw on any kind past their vocabulary — so, like the MoE and
+/// GDN fragments, this entry point exists for the toolchain side (planning,
+/// tests, cross-language pinning), not for emission.
+///
+/// # Safety
+///
+/// `facts` is null or points at a readable [`PieForwardQwen35FullAttnFacts`];
+/// `out_plan` is null or a writable slot.
+PieForwardStatus pie_forward_trace_qwen3_5_full_attn(const PieForwardQwen35FullAttnFacts *facts,
+                                                     PieForwardPlan *out_plan);
+
+/// Trace the full qwen3_5 HYBRID model against `facts` and publish the
+/// traced form into `*out_plan` — the first whole-model entry point beyond
+/// llama_like: embed → per-layer {GDN or full attention, per the
+/// checkpoint's layer schedule; dense or MoE MLP} → final norm → lm_head.
+///
+/// The result composes every vocabulary the fragments introduced (dyn MoE
+/// ops when the facts say MoE, the GDN per-request-state ops, the
+/// full-attention gate/partial-rope ops), so the declared executors refuse
+/// it loudly; the entry point serves the toolchain side.
+///
+/// # Safety
+///
+/// `facts` is null or points at a readable [`PieForwardQwen35HybridFacts`];
+/// `out_plan` is null or a writable slot.
+PieForwardStatus pie_forward_trace_qwen3_5_hybrid(const PieForwardQwen35HybridFacts *facts,
+                                                  PieForwardPlan *out_plan);
+
 /// Free the storage behind a plan header filled by
-/// [`pie_forward_trace_llama_like`], [`pie_forward_trace_qwen3_5_moe_mlp`]
-/// or [`pie_forward_trace_qwen3_5_gdn`], and reset the header to empty.
+/// [`pie_forward_trace_llama_like`], [`pie_forward_trace_qwen3_5_moe_mlp`],
+/// [`pie_forward_trace_qwen3_5_gdn`],
+/// [`pie_forward_trace_qwen3_5_full_attn`] or
+/// [`pie_forward_trace_qwen3_5_hybrid`], and reset the header to empty.
 ///
 /// Safe to call with null, with a header that was never filled, or twice
 /// with the same header (the first call empties it).

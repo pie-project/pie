@@ -35,14 +35,21 @@
 //!   PER-REQUEST state: the conv/recurrent slabs its ops address, implicit
 //!   behind `layer` exactly as the KV cache is, marked by vocabulary
 //!   (`OpKind::state_ref`) — the trace module doc's "the per-request state
-//!   axis".
+//!   axis". The qwen3_5 full-attention fragment
+//!   (`family::qwen3_5_full_attn_block`) completes the layer kinds — gated
+//!   attention, partial rope — and `family::qwen3_5_hybrid` composes all
+//!   three bodies into the first whole-model declaration beyond
+//!   llama_like, its layer schedule a static match over the facts.
 
 pub mod facts;
 pub mod family;
 pub mod ffi;
 pub mod trace;
 
-pub use facts::{LlamaLikeFacts, Qwen35GdnFacts, Qwen35MoeMlpFacts};
+pub use facts::{
+    LlamaLikeFacts, Qwen35FullAttnFacts, Qwen35GdnFacts, Qwen35HybridFacts, Qwen35MlpKind,
+    Qwen35MoeMlpFacts,
+};
 pub use trace::{
     DType, Dim, DynAxis, ForwardPlan, Op, OpKind, Shape, StateRef, StateStore, TraceBuilder,
     ValueId,

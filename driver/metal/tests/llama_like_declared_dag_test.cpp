@@ -398,6 +398,107 @@ void a_gdn_trace_is_refused() {
            "and the message says why: " + what);
 }
 
+// The full-attention fragment — qwen3.5's gated attention: SplitQGate /
+// SigmoidGateMul plus partial Rope and the Gemma per-head fold riding as
+// appended params — must be refused the same way. This one exercises the
+// switch's DEFAULT arm directly: with a Plain norm variant the walk gets
+// past the block norm and the three projections (q_proj/k_proj/v_proj are
+// llama_like names too, so no weight-name refusal fires first) and lands on
+// SplitQGate, an op kind past the v0 vocabulary — "has no emission rule".
+// That is the appended-kind discipline pinned end to end: kinds 19/20 cross
+// the ABI and cannot half-emit.
+void a_full_attn_trace_is_refused() {
+    std::printf("[full-attn (gated attention) trace]\n");
+    pie_forward::PieForwardQwen35FullAttnFacts f{};
+    // Qwen3.5-0.8B full-attention dims
+    // (driver/metal/src/model/qwen3_5/geometry.hpp), matching the
+    // qwen3_5_full_attn_0_8b golden except the norm variant: Plain, so the
+    // refusal fires on the new op KIND rather than on the (also-refused)
+    // Gemma fold qwen3.5 really uses — this test is about the appended
+    // kinds, not the norm fold.
+    f.hidden = 1024;
+    f.q_heads = 8;
+    f.kv_heads = 2;
+    f.head_dim = 256;
+    f.rotary_dim = 64;  // partial_rotary_factor 0.25 x head_dim 256
+    f.fused_qkv = 0;    // the default binding (PIE_QWEN35_FUSED_FULL_ATTN_QGKV unset)
+    f.norm_variant = static_cast<std::uint32_t>(pie_forward::PieForwardNormVariant::Plain);
+    const pie_forward::ForwardPlan plan = pie_forward::ForwardPlan::trace_qwen3_5_full_attn(f);
+    expect(plan.op_count() == 12, "the ABI hands over the 12-op full-attn fragment");
+
+    LlamaLikeGeometry g{};
+    g.layers = 1;
+    g.hidden = 1024;
+    g.head_dim = 256;  // matches the trace, so no earlier check can mask the kind
+    bool threw = false;
+    std::string what;
+    try {
+        build_llama_like_declared_dag(plan, g);
+    } catch (const std::exception& e) {
+        threw = true;
+        what = e.what();
+    }
+    expect(threw, "a gated-attention trace throws rather than half-emitting");
+    expect(what.find("no emission rule") != std::string::npos,
+           "and the default arm names the reason: " + what);
+}
+
+// The hybrid model composes all three fragment vocabularies; it must be
+// refused before any GDN/full-attention op half-emits. Layer 0 of the 3:1
+// schedule is a GDN layer, so (with the Plain-variant facts this test uses)
+// the walk refuses at the first GDN-only weight name — the same first
+// refusal the standalone GDN fragment hits — after accepting the embed
+// prologue.
+void a_hybrid_trace_is_refused() {
+    std::printf("[hybrid (whole-model) trace]\n");
+    pie_forward::PieForwardQwen35HybridFacts f{};
+    // Qwen3.5-0.8B model dims (geometry.hpp): 24 layers, one full-attention
+    // layer every 4th, dense MLP 3584, tied lm_head over vocab 248320.
+    f.layers = 24;
+    f.full_attn_interval = 4;
+    f.vocab = 248320;
+    f.tied_embeddings = 1;
+    f.norm_variant = static_cast<std::uint32_t>(pie_forward::PieForwardNormVariant::Plain);
+    f.attn.hidden = 1024;
+    f.attn.q_heads = 8;
+    f.attn.kv_heads = 2;
+    f.attn.head_dim = 256;
+    f.attn.rotary_dim = 64;
+    f.attn.fused_qkv = 0;
+    f.attn.norm_variant = static_cast<std::uint32_t>(pie_forward::PieForwardNormVariant::Plain);
+    f.gdn.hidden = 1024;
+    f.gdn.key_heads = 16;
+    f.gdn.value_heads = 16;
+    f.gdn.key_head_dim = 128;
+    f.gdn.value_head_dim = 128;
+    f.gdn.conv_kernel = 4;
+    f.gdn.fused_in_proj = 0;
+    f.gdn.norm_variant = static_cast<std::uint32_t>(pie_forward::PieForwardNormVariant::Plain);
+    f.mlp_is_moe = 0;
+    f.dense_intermediate = 3584;
+    const pie_forward::ForwardPlan plan = pie_forward::ForwardPlan::trace_qwen3_5_hybrid(f);
+    // 18 GDN layers x 14 + 6 full layers x 16 + embed/final norm/lm_head.
+    expect(plan.op_count() == 18 * 14 + 6 * 16 + 3,
+           "the ABI hands over the 351-op hybrid model");
+
+    LlamaLikeGeometry g{};
+    g.layers = 24;
+    g.hidden = 1024;
+    g.head_dim = 256;
+    bool threw = false;
+    std::string what;
+    try {
+        build_llama_like_declared_dag(plan, g);
+    } catch (const std::exception& e) {
+        threw = true;
+        what = e.what();
+    }
+    expect(threw, "a hybrid trace throws rather than half-emitting");
+    expect(what.find("unknown weight") != std::string::npos ||
+               what.find("no emission rule") != std::string::npos,
+           "and the message says why: " + what);
+}
+
 }  // namespace
 
 int main() {
@@ -425,6 +526,8 @@ int main() {
     a_fused_trace_is_refused();
     a_dyn_trace_is_refused();
     a_gdn_trace_is_refused();
+    a_full_attn_trace_is_refused();
+    a_hybrid_trace_is_refused();
 
     std::printf("\n==== llama_like_declared_dag_test: %s ====\n",
                 g_failures == 0 ? "all passed" : "FAILURES");

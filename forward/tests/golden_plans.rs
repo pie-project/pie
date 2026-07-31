@@ -21,8 +21,14 @@
 
 use std::path::PathBuf;
 
-use pie_forward::family::{llama_like, qwen3_5_gdn_block, qwen3_5_moe_mlp_block};
-use pie_forward::{ForwardPlan, LlamaLikeFacts, Qwen35GdnFacts, Qwen35MoeMlpFacts};
+use pie_forward::family::{
+    llama_like, qwen3_5_full_attn_block, qwen3_5_gdn_block, qwen3_5_hybrid,
+    qwen3_5_moe_mlp_block,
+};
+use pie_forward::{
+    ForwardPlan, LlamaLikeFacts, Qwen35FullAttnFacts, Qwen35GdnFacts, Qwen35HybridFacts,
+    Qwen35MoeMlpFacts,
+};
 
 fn golden_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -143,5 +149,37 @@ fn qwen3_5_gdn_0_8b() {
     check_plan(
         "qwen3_5_gdn_0_8b",
         &qwen3_5_gdn_block(&Qwen35GdnFacts::qwen3_5_0_8b()),
+    );
+}
+
+/// The third fragment golden: one qwen3_5 full-attention block
+/// (Qwen3.5-0.8B dims, the default unfused qgkv binding) — attn_norm →
+/// 2×-wide q + k/v projections → per-head [query|gate] de-interleave →
+/// Gemma-fold per-head q/k norms → PARTIAL rope (64 of 256 channels) →
+/// kv-append/attention → sigmoid output gate → o_proj accumulate.
+/// Everything the full-attention vocabulary added — `SplitQGate`,
+/// `SigmoidGateMul`, `Rope.partial`, `RmsnormPerHead.variant` — appears
+/// here and nowhere in the goldens above, which this change leaves
+/// byte-untouched.
+#[test]
+fn qwen3_5_full_attn_0_8b() {
+    check_plan(
+        "qwen3_5_full_attn_0_8b",
+        &qwen3_5_full_attn_block(&Qwen35FullAttnFacts::qwen3_5_0_8b()),
+    );
+}
+
+/// The first whole-model golden beyond llama_like: the qwen3_5 HYBRID
+/// (Qwen3.5-0.8B — 24 layers on the 3:1 linear:full schedule, dense MLP,
+/// tied lm_head over the 248320 vocab). Each layer's attention ops are the
+/// standalone fragments' by construction (one shared body each, pinned by
+/// the family unit tests), so this golden pins the COMPOSITION: the layer
+/// schedule, the per-layer norm/MLP bracketing, and the embed/final-norm/
+/// lm_head frame, 351 ops in all.
+#[test]
+fn qwen3_5_hybrid_0_8b() {
+    check_plan(
+        "qwen3_5_hybrid_0_8b",
+        &qwen3_5_hybrid(&Qwen35HybridFacts::qwen3_5_0_8b()),
     );
 }
