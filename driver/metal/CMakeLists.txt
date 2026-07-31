@@ -487,6 +487,16 @@ if(APPLE)
   add_metal_linked_test(simple_family_executor_test tests/simple_family_executor_test.cpp NEEDS_LOADER)
   target_compile_definitions(simple_family_executor_test PRIVATE
     PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
+  # The same cases again with the weights STREAMED rather than copied. Streaming
+  # is meant to change what is resident and nothing else, so the assertions are
+  # the same assertions -- if it ever changes an answer, the test that says so
+  # is the one that already knows every answer.
+  if(TARGET simple_family_executor_test)
+    add_test(NAME simple_family_executor_streamed_test
+             COMMAND simple_family_executor_test)
+    set_tests_properties(simple_family_executor_streamed_test PROPERTIES
+      ENVIRONMENT "PIE_METAL_STREAM_EXPERTS=1")
+  endif()
   add_metal_linked_test(gemma4_prefill_numerics_test tests/gemma4_prefill_numerics_test.cpp NEEDS_LOADER)
   target_compile_definitions(gemma4_prefill_numerics_test PRIVATE
     PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")

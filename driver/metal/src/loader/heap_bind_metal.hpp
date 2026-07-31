@@ -59,6 +59,12 @@ struct BoundDecode {
 /// the transforms it carries (dequantize, fill, band copies) are exactly where a
 /// second implementation would quietly diverge.
 struct StagedWeights {
+    /// How many bytes were bound over a pack instead of copied into the heap.
+    std::uint64_t streamed_bytes = 0;
+    /// Keeps that pack's mapping alive. It MUST outlive every slot in
+    /// `weights`: they point into it, and unmapping it under them reads as
+    /// weights of exactly zero -- a model that runs and answers nothing.
+    std::shared_ptr<void> stream_pack;
     SlotHandle weights_region{};
     std::unordered_map<std::string, SlotHandle> weights;
 };
@@ -67,6 +73,35 @@ StagedWeights stage_plan_weights(
     const pie_loader::CheckpointSource& view,
     const pie_loader::LoadPlan& load,
     std::size_t weights_bytes);
+
+/// How many bytes `stage_plan_weights` would stream for `streams`.
+///
+/// Pure -- it reads the plan and nothing else -- because the answer is needed
+/// BEFORE the context exists: the heap has to be created without them, and a
+/// heap sized for weights that then also get mapped is the footprint doubled
+/// rather than halved.
+std::uint64_t streamable_plan_bytes(const pie_loader::LoadPlan& load,
+                                    const std::function<bool(const std::string&)>& streams);
+
+/// Stage with weight STREAMING for the tensors `streams` names.
+///
+/// Those tensors are copied ONCE into a page-aligned pack beside the
+/// checkpoint, and thereafter bound over that pack's mapping. The arena is
+/// rebuilt around what is left, so the streamed bytes leave the heap rather
+/// than being duplicated beside it. On Apple silicon the pack's pages are
+/// demand-faulted under GPU access and stay clean, so the kernel evicts them
+/// under pressure: a model reads the weights it touches and pays for no more.
+/// gpt-oss reads 4 of 32 experts per layer.
+///
+/// The pack exists because a stock safetensors checkpoint does not put tensors
+/// where a device pointer may point: of gpt-oss's 400 expert tensors, 196 start
+/// on a 4-byte boundary, 36 on 16, and none on 32.
+StagedWeights stage_plan_weights(
+    RawMetalContext& ctx,
+    const pie_loader::CheckpointSource& view,
+    const pie_loader::LoadPlan& load,
+    std::size_t weights_bytes,
+    const std::function<bool(const std::string&)>& streams);
 
 BoundDecode stage_decode_storage(
     RawMetalContext& ctx,

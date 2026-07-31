@@ -583,9 +583,20 @@ class GptOssEngine final : public SimpleFamilyEngine {
         try {
             const auto storage = load_plan.view();
             pie_loader::CheckpointSource view(storage);
-            StagedWeights staged =
-                stage_plan_weights(ctx, view, load_plan, storage.memory.persistent_bytes);
+            StagedWeights staged = stage_plan_weights(
+                ctx, view, load_plan, storage.memory.persistent_bytes,
+                stream_predicate(pie::metal::model::ModelFamily::GptOss));
             b_.weights = std::move(staged.weights);
+            // The pack must outlive the weights that point into it. Taking only
+            // `staged.weights` and letting `staged` die unmaps it under them,
+            // which reads as weights of exactly zero.
+            stream_pack_ = std::move(staged.stream_pack);
+            if (staged.streamed_bytes > 0) {
+                std::fprintf(stderr,
+                             "[pie-metal] gpt-oss: %.2f GB of experts streamed from a pack, "
+                             "and out of the heap\n",
+                             double(staged.streamed_bytes) / 1e9);
+            }
         } catch (const std::exception& e) {
             if (err) *err = std::string("staging gpt-oss's weights: ") + e.what();
             return false;
@@ -778,6 +789,8 @@ class GptOssEngine final : public SimpleFamilyEngine {
     MultiBatchPsos mb_{};
     std::vector<SlotHandle> kpages_{};
     std::vector<SlotHandle> vpages_{};
+    /// Keeps the streamed weights' mapping alive; see `init`.
+    std::shared_ptr<void> stream_pack_{};
     int max_sampled_ = 1;
     int max_rows_ = 1;
     int bound_rows_ = 0;
@@ -786,6 +799,24 @@ class GptOssEngine final : public SimpleFamilyEngine {
 };
 
 }  // namespace
+
+std::function<bool(const std::string&)> SimpleFamilyEngine::stream_predicate(
+    pie::metal::model::ModelFamily family) {
+    const char* on = std::getenv("PIE_METAL_STREAM_EXPERTS");
+    if (on == nullptr || *on == '\0' || std::string(on) == "0") return {};
+    if (family != pie::metal::model::ModelFamily::GptOss) return {};
+    // gpt-oss's routed expert bank is 10.75 of this checkpoint's 11.8 GB, and a
+    // token reads 4 experts in 32 per layer. `.bias` stays resident: 180 KB a
+    // layer against 132 MB, and a page of it is read whichever expert runs.
+    if (const char* only = std::getenv("PIE_METAL_STREAM_ONLY"); only != nullptr) {
+        const std::string want(only);
+        return [want](const std::string& n) { return n.find(want) != std::string::npos; };
+    }
+    return [](const std::string& n) {
+        if (n.find("mlp.experts.") == std::string::npos) return false;
+        return !(n.size() > 5 && n.compare(n.size() - 5, 5, ".bias") == 0);
+    };
+}
 
 std::size_t SimpleFamilyEngine::extra_heap_bytes(pie::metal::model::ModelFamily family,
                                                  const SetupConfig& cfg, int max_ctx) {
