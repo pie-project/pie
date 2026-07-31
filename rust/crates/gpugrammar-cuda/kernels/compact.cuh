@@ -113,8 +113,9 @@ extern "C" __global__ void gg_compact(
             mine += __popc(word);
         }
         __syncthreads();
-        int32_t held = gg::block_scan(mine, room, &total);
-        (void)held;
+        // Only the total is wanted here; the prefix is what the writing pass
+        // below needs and this pass writes nothing.
+        gg::block_scan(mine, room, &total);
         if (threadIdx.x == 0) {
             admits = total;
         }

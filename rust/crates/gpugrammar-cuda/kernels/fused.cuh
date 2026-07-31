@@ -308,7 +308,6 @@ extern "C" __global__ void gg_advance_fused(
 /// bits, and losing bits is the one failure this engine must never make. In
 /// Triton these were two kernels for exactly this reason.
 extern "C" __global__ void gg_fill_probe(
-    const gg::Arena* arena,
     gg::BatchState* state,
     int32_t* mask,
     const int32_t* hash,

@@ -4449,7 +4449,6 @@ class DeviceBatch:
             self._fill_threads(grammar),
             torch.cuda.current_stream().cuda_stream,
             [
-                self.grammar.arena_struct().data_ptr(),
                 self.state_struct().data_ptr(),
                 self.mask.data_ptr(),
                 self.state_hash.data_ptr(),
