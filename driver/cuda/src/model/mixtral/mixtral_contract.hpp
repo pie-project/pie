@@ -157,6 +157,14 @@ inline void gpt_oss_native_group(ContractBuilder& b, const SourceTensor& block, 
 /// group plan has no node for. Streaming them would buy nothing and cost a
 /// transform the contract cannot express, so they stay resident.
 ///
+/// Rank-blind, and correctly so. The packed resident path publishes these same
+/// blocks with `push_direct`, unsharded: every rank holds the whole expert and
+/// the MoE is replicated rather than split. A group that selected this rank's
+/// band would therefore not match the residency it replaces. Streaming is a
+/// residency decision, so it inherits whatever TP layout the resident path
+/// chose -- here, none. (The native path *is* sharded, and it does not reach
+/// this function.)
+///
 /// Packed only. The native path Marlin-repacks into a layout whose rows are
 /// permuted across the whole bank, so a single expert's repacked bytes are not
 /// a contiguous band of the repacked bank; that needs its own instance-wise
@@ -236,7 +244,7 @@ inline void gpt_oss_mxfp4_groups(ContractBuilder& b) {
     if (native && !b.target().native_mxfp4_moe) {
         fail("GPT-OSS native MXFP4 requested, but target does not support native MXFP4 MoE");
     }
-    if (!native && b.stream_routed_experts() && b.target().tp_size == 1) {
+    if (!native && b.stream_routed_experts()) {
         gpt_oss_streamed_expert_groups(b);
         return;
     }

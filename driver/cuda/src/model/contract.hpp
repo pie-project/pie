@@ -1293,8 +1293,8 @@ inline void hf_moe_streamed_expert_groups(
         }
     }
 
-    const Node gate_src = c.index_src(prefix + "{}.gate_proj.weight");
-    const Node up_src = c.index_src(prefix + "{}.up_proj.weight");
+    const Node gate_src = b.split(c.index_src(prefix + "{}.gate_proj.weight"), 0);
+    const Node up_src = b.split(c.index_src(prefix + "{}.up_proj.weight"), 0);
     // Named the way the bound tensors beside it are named, minus the trailing
     // dot: the driver resolves a group next to the weights it binds.
     auto group = c.group(bound.substr(0, bound.size() - 1),
@@ -1303,15 +1303,25 @@ inline void hf_moe_streamed_expert_groups(
     // give the leading 1 to. The per-expert GEMM indexes the slab by `e` today
     // and reads a slot base instead when streaming, so this is the shape it
     // already wanted.
+    //
+    // Under TP each half is sharded before the join, never after: a shard of
+    // `[gate; up]` on the fused axis would hand rank 0 the whole gate and rank
+    // 1 the whole up. Sharding first is also what `fused_moe_gate_up_tp_slices`
+    // does to the pre-fused form of these same weights, so a rank's slot holds
+    // the bytes its resident counterpart would have held. `down_proj` is the
+    // matching row-parallel half, split on the intermediate axis it contracts
+    // over.
+    const std::int64_t local_inter = b.local_extent(inter);
     group.define("gate_up_proj",
                  c.concat(gate_second ? std::vector<Node>{up_src, gate_src}
                                       : std::vector<Node>{gate_src, up_src},
                           0),
                  pie_loader::raw(dtype))
-        .expect({2 * inter, hidden});
-    group.define("down_proj", c.index_src(prefix + "{}.down_proj.weight"),
+        .expect({2 * local_inter, hidden});
+    group.define("down_proj",
+                 b.split(c.index_src(prefix + "{}.down_proj.weight"), 1),
                  pie_loader::raw(dtype))
-        .expect({hidden, inter});
+        .expect({hidden, local_inter});
 
     for (std::uint32_t id : consumed) {
         b.consume(id);
@@ -1320,11 +1330,6 @@ inline void hf_moe_streamed_expert_groups(
 
 inline void hf_moe_expert_stacks(
     ContractBuilder& b, bool gate_second, bool float_only = false) {
-    if (b.target().tp_size != 1) {
-        // TP>1 per-expert sharding is not wired; the bind then fails loudly
-        // on the missing fused tensor rather than loading silently wrong.
-        return;
-    }
     const std::int64_t num_experts = b.facts().num_experts;
     if (num_experts <= 0) {
         return;
@@ -1361,6 +1366,14 @@ inline void hf_moe_expert_stacks(
         if (b.stream_routed_experts()) {
             hf_moe_streamed_expert_groups(b, gate_second, layer, bound, prefix,
                                           num_experts, inter, hidden, dtype);
+            continue;
+        }
+        if (b.target().tp_size != 1) {
+            // The stack joins E per-expert slabs along a new leading axis, and
+            // nothing downstream slices that join per rank; the bind then fails
+            // loudly on the missing fused tensor rather than loading silently
+            // wrong. The group above has no such join -- one instance is one
+            // expert -- so it shards each half directly and does run under TP.
             continue;
         }
 

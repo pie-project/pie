@@ -1423,9 +1423,28 @@ nlohmann::json contract_to_json(const pie_loader::PieLoaderModelContractView& v)
         }
         tensors.push_back(std::move(entry));
     }
+    // Groups are dumped beside the tensors because the rank-blindness identity
+    // is only as wide as what it compares: a streamed contract declares its
+    // experts *here* and nowhere in `tensors`, so a group that started folding
+    // the rank into its own expression would have gone unseen.
+    nlohmann::json groups = nlohmann::json::array();
+    for (std::size_t i = 0; i < v.groups.len; ++i) {
+        const auto& g = v.groups.ptr[i];
+        nlohmann::json members = nlohmann::json::array();
+        for (std::size_t t = 0; t < g.tensors.len; ++t) {
+            const auto& m = g.tensors.ptr[t];
+            members.push_back({{"name", std::string(view_of(m.name))},
+                               {"root", m.root},
+                               {"shape", shape_to_json(m.shape)}});
+        }
+        groups.push_back({{"name", std::string(view_of(g.name))},
+                          {"arity", g.arity},
+                          {"tensors", std::move(members)}});
+    }
     return {{"alignment", v.alignment},
             {"nodes", std::move(nodes)},
-            {"tensors", std::move(tensors)}};
+            {"tensors", std::move(tensors)},
+            {"groups", std::move(groups)}};
 }
 
 /// Everything that can be checked about a contract without a compiler.
@@ -1773,6 +1792,179 @@ bool expr_contains_shard(const nlohmann::json& contract, const std::string& name
 
 /// The escape hatch's last rank.
 ///
+/// A slot holds this rank's share, and only where the resident path sharded too.
+///
+/// Streaming is a residency decision, so a group under TP has to declare
+/// whatever the resident path would have declared on that rank -- no more and
+/// no less. The two streamed families sit on opposite sides of that:
+///
+///   - Qwen stores a tensor per expert, and the family's TP path bands the
+///     intermediate axis. The group shards each half before the gate/up join,
+///     so a slot is priced at `2*(I/W)*H + H*(I/W)` -- half of what one rank
+///     holds at `tp=1`.
+///   - GPT-OSS packed publishes its expert banks with `push_direct`, unsharded:
+///     every rank holds every expert and the MoE is replicated. A group that
+///     took a band here would *not* match what it replaces, so its slot stays
+///     full width.
+///
+/// Both are rank-blind in the contract: a shard names an axis, and
+/// `Resolver::specialize` is the one pass that knows which rank is asking.
+void test_streamed_expert_groups_follow_the_resident_tp_layout() {
+    constexpr std::int64_t kExperts = 4;
+    constexpr std::int64_t kHidden = 64;
+    constexpr std::int64_t kInter = 32;
+    constexpr std::int64_t kLayers = 2;
+    constexpr std::uint32_t kWorld = 2;
+    constexpr std::int64_t kLocalInter = kInter / kWorld;
+    namespace model = pie_cuda_driver::model;
+
+    std::vector<TypedTensor> common{
+        {"model.embed_tokens.weight", {16, kHidden}, "BF16"},
+        {"model.norm.weight", {kHidden}, "BF16"},
+        {"lm_head.weight", {16, kHidden}, "BF16"},
+    };
+    std::vector<TypedTensor> qwen = common;
+    std::vector<TypedTensor> oss = common;
+    for (int layer = 0; layer < kLayers; ++layer) {
+        const std::string lp = "model.layers." + std::to_string(layer) + ".mlp.";
+        qwen.push_back({lp + "gate.weight", {kExperts, kHidden}, "BF16"});
+        for (int e = 0; e < kExperts; ++e) {
+            const std::string ep = lp + "experts." + std::to_string(e) + ".";
+            qwen.push_back({ep + "gate_proj.weight", {kInter, kHidden}, "BF16"});
+            qwen.push_back({ep + "up_proj.weight", {kInter, kHidden}, "BF16"});
+            qwen.push_back({ep + "down_proj.weight", {kHidden, kInter}, "BF16"});
+        }
+        const std::string ep = lp + "experts.";
+        oss.push_back({ep + "gate_up_proj_blocks",
+                       {kExperts, 2 * kInter, kHidden / 32, 16}, "U8"});
+        oss.push_back({ep + "gate_up_proj_scales",
+                       {kExperts, 2 * kInter, kHidden / 32}, "U8"});
+        oss.push_back({ep + "gate_up_proj_bias", {kExperts, 2 * kInter}, "BF16"});
+        oss.push_back({ep + "down_proj_blocks",
+                       {kExperts, kHidden, kInter / 32, 16}, "U8"});
+        oss.push_back({ep + "down_proj_scales",
+                       {kExperts, kHidden, kInter / 32}, "U8"});
+        oss.push_back({ep + "down_proj_bias", {kExperts, kHidden}, "BF16"});
+    }
+
+    // What one slot is worth on a rank. Spelled from the shapes rather than
+    // from a measured number, so a layout that quietly changed could not drag
+    // the expectation along with it.
+    struct Family {
+        const char* label;
+        const char* model_type;
+        const std::vector<TypedTensor>* tensors;
+        model::Mxfp4MoeRequest mxfp4;
+        void (*author)(model::ContractBuilder&);
+        const char* gate_up_name;
+        const char* down_name;
+        std::vector<std::int64_t> gate_up;
+        std::vector<std::int64_t> down;
+        std::uint64_t slot_bytes;
+    };
+    const Family families[] = {
+        {"qwen3_moe", "qwen3_moe", &qwen, model::Mxfp4MoeRequest::Auto,
+         &model::author_qwen3_5_moe_contract, "gate_up_proj", "down_proj",
+         {2 * kLocalInter, kHidden}, {kHidden, kLocalInter},
+         static_cast<std::uint64_t>(
+             (2 * kLocalInter * kHidden + kHidden * kLocalInter) * 2)},
+        {"gpt_oss", "gpt_oss", &oss, model::Mxfp4MoeRequest::RoutedDecode,
+         &model::author_gpt_oss_contract, "gate_up_proj.weight", "down_proj.weight",
+         {1, 2 * kInter, kHidden / 32, 16}, {1, kHidden, kInter / 32, 16},
+         static_cast<std::uint64_t>(
+             2 * kInter * (kHidden / 32) * 16 + 2 * kInter * (kHidden / 32) +
+             kHidden * (kInter / 32) * 16 + kHidden * (kInter / 32))},
+    };
+
+    for (const Family& family : families) {
+        const std::filesystem::path dir = write_typed_checkpoint(
+            std::string("tp_streamed_") + family.label, *family.tensors);
+        std::string open_error;
+        pie_loader::Checkpoint checkpoint =
+            pie_loader::Checkpoint::open(dir.string(), &open_error);
+        check(static_cast<bool>(checkpoint), std::string(family.label) +
+                  ": the synthetic checkpoint opens: " + open_error);
+        if (!checkpoint) continue;
+
+        const model::ModelFacts facts{
+            .model_type = family.model_type,
+            .quant_method = "",
+            .num_hidden_layers = kLayers,
+            .num_experts = kExperts,
+            .head_dim = 0,
+            .mamba_groups = 0,
+        };
+
+        nlohmann::json first_contract;
+        for (std::uint32_t rank = 0; rank < kWorld; ++rank) {
+            const std::string at = std::string(" (") + family.label + " rank " +
+                                   std::to_string(rank) + " of " +
+                                   std::to_string(kWorld) + ")";
+            auto target = pie_cuda_driver::cuda_device_target();
+            target.tp_size = kWorld;
+            target.tp_rank = rank;
+
+            pie_loader::ModelContract contract;
+            try {
+                model::ContractBuilder builder(checkpoint, facts, target, "",
+                                               family.mxfp4, model::Component::Full,
+                                               /*stream_routed_experts=*/true, contract);
+                family.author(builder);
+                builder.finish();
+            } catch (const std::exception& error) {
+                check(false, "authoring" + at + ": " + error.what());
+                continue;
+            }
+
+            const auto v = contract.view();
+            check(v.groups.len == kLayers, "one group per layer" + at);
+            if (v.groups.len != kLayers) continue;
+            for (std::size_t layer = 0; layer < v.groups.len; ++layer) {
+                std::map<std::string_view, std::vector<std::int64_t>> declared;
+                const auto& g = v.groups.ptr[layer];
+                for (std::size_t i = 0; i < g.tensors.len; ++i) {
+                    const auto& t = g.tensors.ptr[i];
+                    declared[view_of(t.name)] = std::vector<std::int64_t>(
+                        t.shape.ptr, t.shape.ptr + t.shape.len);
+                }
+                check(declared[family.gate_up_name] == family.gate_up,
+                      "gate/up is declared at this rank's width" + at);
+                check(declared[family.down_name] == family.down,
+                      "down is declared at this rank's width" + at);
+            }
+
+            const nlohmann::json dumped = contract_to_json(v);
+            if (rank == 0) {
+                first_contract = dumped;
+            } else {
+                check(dumped == first_contract,
+                      "every rank authors the same contract" + at);
+            }
+
+            try {
+                const pie_loader::PieLoaderContractRequest request =
+                    pie_loader::build_contract_request(checkpoint, target, v);
+                const pie_loader::LoadPlan plan = pie_loader::LoadPlan::compile(request);
+                plan.verify(request);
+                const auto& pv = plan.view();
+                check(pv.groups.len == kLayers, "the plan carries every group" + at);
+                for (std::size_t layer = 0; layer < pv.groups.len; ++layer) {
+                    const auto& pg = pv.groups.ptr[layer];
+                    check(pg.arity == kExperts, "the plan agrees on the arity" + at);
+                    check(pg.plan->memory.persistent_bytes >= family.slot_bytes &&
+                              pg.plan->memory.persistent_bytes <
+                                  family.slot_bytes + 4096,
+                          "a slot is priced at this rank's share: expected " +
+                              std::to_string(family.slot_bytes) + ", got " +
+                              std::to_string(pg.plan->memory.persistent_bytes) + at);
+                }
+            } catch (const std::exception& error) {
+                check(false, std::string("compiling") + at + ": " + error.what());
+            }
+        }
+    }
+}
+
 /// GPT-OSS's native MXFP4 path was the only place a `tp_rank` reached a
 /// contract: a repack spec carried `source_row_offset` as an integer, so the
 /// driver computed `rank * local` while authoring and the contract was valid for
@@ -1927,6 +2119,7 @@ int main() {
     test_gpt_oss_native_repack_is_rank_blind();
     test_qwen3_moe_streams_experts_as_a_group();
     test_gpt_oss_streams_experts_as_a_group();
+    test_streamed_expert_groups_follow_the_resident_tp_layout();
 
     const char* snapshot = std::getenv("PIE_TEST_SNAPSHOT");
     if (snapshot != nullptr) {
