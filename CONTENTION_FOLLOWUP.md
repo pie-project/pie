@@ -7098,3 +7098,137 @@ token budget (pie's 4096 is 2x vLLM's 2048), prefill kernel rate (142 TFLOPS,
 78% of dense peak), decode kernel rate (63% of BW peak, and D/Ds both win),
 workload destaggering (`--output-spread`, byte-identical schedule), prefix
 caching (off on both), and host scheduling (92.9% GPU busy).
+
+---
+
+## §20.44 — It is not the seal. It is when the inferlets are allowed to submit
+
+§20.42 and §20.43 named the fleet-wide wait-all boundary as the object behind
+every loss, and pointed the fix at wave membership. That framing is wrong in
+its conclusion even though its measurements hold. The wait-all quorum is
+correct and stays. What is broken is that the guests are not *allowed* to
+submit at the times that would let the seal do its job.
+
+Every number below comes from the same `PIE_FIRE_TIMING=waves` P/c128 run
+already reported in §20.43. No new runs were needed.
+
+### The seal is not refusing anything — the capacity is sitting idle
+
+Per-wave row occupancy over the whole run, against the largest wave the run
+actually produced (256 rows):
+
+```
+prefill-carrying waves  n=498   rows used 18298   FREE ROW SLOTS 109190
+dedicated decode waves  n=224   rows        55446
+                                => headroom is 2.0x the rows that ran alone
+```
+
+A prefill wave is token-capped, not row-capped: p50 3695 tokens against a
+4096 budget, carried by ~10 prefill rows of ~370 tokens each. Row-wise it is
+almost empty. There is room in the prefill waves for **twice** every decode
+row that pie instead ran in 224 separate waves, and the marginal cost of a
+passenger row is 0.0059 ms against a 5.22 ms fixed cost per dedicated wave
+(§20.43's fits).
+
+And the seal does pack passengers when they exist: 13690 decode rows, 19.8%
+of the run's decode work, already rode a prefill wave. `LaunchGrouping::accepts`
+has no phase bar (§20.33), and `frame.rs:909-926` packs whatever is offered.
+Nothing is being refused. The decode fires simply are not there at seal time.
+
+### The fleet is strictly generational, and that is what makes waves phase-pure
+
+Admission and teardown timestamps from the same log:
+
+```
+process_admitted  4609 events, 75 bursts (gap >= 5 ms), sizes {68: x35, 60: x34}
+process_drop      4609 events, 73 bursts,               sizes p50 60, max 68
+                                                        68 + 60 = 128 = --concurrency
+admitted -> drop (lane lifetime)   p50 581 ms
+cohort period (36 cohorts / 21.1 s)     ~586 ms
+```
+
+Lane lifetime equals the cohort period. The cohorts do not overlap **at all**:
+128 lanes are admitted together, run the same program, and retire together,
+so at any instant the entire fleet is at the same program point. That is the
+phase purity of §20.42 and §20.43, stated at its source.
+
+### The guests are ready 560 ms before they are allowed to submit
+
+The bring-up conveyor, per process:
+
+```
+guest_main -> first pass bind start   p50 580.43 ms   (waiting for the BIND permit)
+both forward passes bound             p50  19.46 ms
+last bind -> execution admitted       p50 560.55 ms   (waiting for the EXEC permit)
+  of which admission_wait_us          p50 560.50 ms
+  of which bind_wait_us               p50   0.00 ms
+instantiate_us                        p50   3.11 ms
+instantiated -> guest_main            p50   0.01 ms
+```
+
+Every stage is one cohort deep by construction (`init_admission`,
+`process.rs:240-300`): prewarm is one cohort, bind is one cohort plus one
+staged cohort, execution is one cohort. So a process finishes binding both of
+its forward passes and then **sits fully built for 560 ms** with nothing left
+to do but submit. Its prompt is tokenized, its PTIR graph is constructed, its
+driver state is bound. It is held at the execution gate.
+
+Guest-side cost is not a factor: `guest_work_us` sums to 0.01 ms per wave and
+`guest_resume_us` to 0.25-0.81 ms. The guests are not slow. They are queued.
+
+### The gate is deliberate, and it batches the release
+
+`FramePolicy::is_joining` (`frame.rs:632-637`) holds the seal while a freed
+slot has a staged taker or an admitted successor's first fire is in flight,
+and `preload_free_slots` (`frame.rs:578`) seeds the same rule at bootstrap so
+that, in its own words, "the first seal waits for the whole co-launched
+fleet's admissions and first fires."
+
+That is the correct thing to do *given* a cohort — a ragged epoch starts
+lead-less lanes and lead is hysteretic. But it is also what makes the cohort
+in the first place, and the cohort is self-perpetuating: 128 admitted
+together, 128 retire together, 128 permits freed together, 128 admitted
+together. For a homogeneous fleet the synchronisation set at t=0 never decays.
+
+### What it costs, measured
+
+```
+idle gaps >= 10 ms   n=47   sum 1511 ms   (7.0% of the 21.6 s span)
+  next wave is prefill  47
+  next wave is decode    0
+```
+
+Not one gap precedes a decode wave. All of it is turnover: ~42 ms per cohort
+in which the GPU has nothing to run because the successor cohort is being
+admitted and is submitting its first fires. That is the direct cost.
+
+The indirect cost is larger and is §20.43's: because the fleet is never at two
+program points at once, 55446 decode rows run in 224 waves of their own (4894
+ms, 24.4% of GPU time for 4.0% of the tokens) instead of riding for free in
+prefill waves that had 109190 free row slots.
+
+### The fix, restated in the right place
+
+Wave membership does not need to change and the quorum does not need to be
+relaxed. What has to change is **when a guest is allowed to submit**, so that
+at any boundary the fleet holds more than one program point:
+
+1. The execution permit is held from first-fire-submit to process teardown
+   (`ProcessCtx::drop`). Between a lane's last fire settling and its teardown
+   completing it can never submit again, yet its successor cannot start. That
+   window is ~30 ms per cohort, ~1.1 s of the 1.5 s of measured turnover idle.
+2. The bootstrap hands out the whole execution pool in one instant
+   (`preload_free_slots(capacity)`), which is what creates the cohort that
+   every later turnover inherits. Spreading only the *initial* release is
+   enough: for a homogeneous fleet, stagger in the joins is stagger in the
+   retirements, and it is preserved exactly thereafter.
+
+Neither touches the seal, the wait-all rule, or wave membership. Both are
+changes to the admission conveyor. Neither is attempted here.
+
+### Levers still closed
+
+Everything §20.43 listed, plus: guest CPU work (0.01 ms per wave), guest
+resume (< 1 ms), run-ahead depth (a lane's queue is never the missing member
+— `deferred_pipelines=0`, `missing_pipelines=0` on every wave), and the seal's
+packing rule (it already carries 19.8% of decode rows as passengers).
