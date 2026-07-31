@@ -302,10 +302,32 @@ void dsv4_forward_paged(
     const int E = cfg.num_experts;
     const int K = cfg.num_experts_per_tok;
     const int moe_I = cfg.moe_intermediate_size;
-    // Shared experts are sharded on intermediate dim (column/row parallel).
-    const int local_shared_I = moe_I / T;
-    // Routed experts are also sharded the same way.
-    const int local_moe_I = moe_I / T;
+    // Read the local extents off the bound weights, not off `moe_I / T`.
+    //
+    // Dividing the config by the TP degree re-derives, here, a decision the
+    // contract already made over there, and nothing checks that the two agree.
+    // When they disagree the shapes still look plausible and every kernel
+    // still launches -- the answer is just wrong, which is the failure this
+    // family had at TP=2. `embed` and `lm_head` in this same function already
+    // read `shape()`; this is that, for the MoE.
+    auto extent_of = [](const DeviceTensor* t, std::size_t axis, int fallback) {
+        return (t != nullptr && axis < t->shape().size())
+                   ? static_cast<int>(t->shape()[axis])
+                   : fallback;
+    };
+    int local_shared_I = moe_I / T;
+    int local_moe_I = moe_I / T;
+    for (const auto& L : w.layers) {
+        // `shared_w1` is `[I_local, H]`; the stacked routed slab is
+        // `[E, 2*I_local, H]`, so its gate and up halves come apart on axis 1.
+        if (L.shared_w1 != nullptr) {
+            local_shared_I = extent_of(L.shared_w1, 0, local_shared_I);
+        }
+        if (L.moe_gate_up_bf16 != nullptr) {
+            local_moe_I = extent_of(L.moe_gate_up_bf16, 1, local_moe_I * 2) / 2;
+        }
+        if (L.shared_w1 != nullptr && L.moe_gate_up_bf16 != nullptr) break;
+    }
     const int M = cfg.dsv4_hc_mult;
     const int mix_hc = (2 + M) * M;
     const float hc_eps = cfg.dsv4_hc_eps;

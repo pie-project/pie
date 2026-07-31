@@ -751,6 +751,26 @@ public:
         if (replicate_lm_head_ && ends_with(name, ".lm_head.weight")) {
             return std::nullopt;
         }
+        // A companion scale splits exactly like the weight it scales, so ask
+        // about the weight -- here, once, rather than in each family. Stating
+        // it as two parallel lists is what `hf_shard_axis` used to do, and the
+        // axis-0 list grew its scale entries while the axis-1 list never did:
+        // `o_proj`, `down_proj` and `w2` handed a rank its slice of the weight
+        // and the whole model's scale beside it. That fix lived inside
+        // `hf_shard_axis`, so a family that supplied its own `shard_axis_fn`
+        // silently opted out of it and had to remember the pairing by hand.
+        // Deriving it before the family is consulted is what makes it
+        // unforgettable.
+        for (const std::string_view suffix :
+             {".weight_scale_inv", ".weight_scale", ".weight_packed", ".scale"}) {
+            if (ends_with(name, suffix)) {
+                const std::string_view base =
+                    name.substr(0, name.size() - suffix.size());
+                const ShardAxis of_weight =
+                    shard_axis_fn_(std::string(base) + ".weight");
+                return of_weight.has_value() ? of_weight : shard_axis_fn_(base);
+            }
+        }
         return shard_axis_fn_(name);
     }
 

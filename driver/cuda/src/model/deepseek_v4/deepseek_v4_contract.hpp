@@ -7,6 +7,8 @@
 /// and the intermediate dim is split within each expert so every rank computes
 /// a partial expert output that an all-reduce combines.
 
+#include <stdexcept>
+
 #include "model/contract.hpp"
 
 namespace pie_cuda_driver::model {
@@ -16,22 +18,44 @@ inline ShardAxis dsv4_shard_axis(std::string_view name) {
     // Routed experts: shard the intermediate dim within each expert. w1/w3 on
     // axis 0 (gate/up out dim), w2 on axis 1 (down in dim). Each rank computes
     // a partial expert output; the results are combined by an all-reduce.
+    // Weights only. A companion scale reaches here already rewritten to the
+    // weight it scales -- `ContractBuilder::shard_axis` strips the suffix
+    // before consulting this -- so listing scales again is how the two lists
+    // drift apart.
     if (contains(name, ".ffn.experts.")) {
-        if (ends_with_any(name, {".w1.weight", ".w1.scale", ".w3.weight", ".w3.scale"})) {
+        if (ends_with_any(name, {".w1.weight", ".w3.weight"})) {
             return std::uint8_t{0};
         }
-        if (ends_with_any(name, {".w2.weight", ".w2.scale"})) {
+        if (ends_with(name, ".w2.weight")) {
             return std::uint8_t{1};
         }
     }
-    if (ends_with_any(name, {".shared_experts.w1.weight", ".shared_experts.w1.scale",
-                             ".shared_experts.w3.weight", ".shared_experts.w3.scale"})) {
+    if (ends_with_any(name, {".shared_experts.w1.weight",
+                             ".shared_experts.w3.weight"})) {
         return std::uint8_t{0};
     }
-    if (ends_with_any(name, {".shared_experts.w2.weight", ".shared_experts.w2.scale"})) {
+    if (ends_with(name, ".shared_experts.w2.weight")) {
         return std::uint8_t{1};
     }
-    // Everything else replicated, which avoids TP communication in the main path.
+    // Inside the FFN, replication is never the answer, so falling through to
+    // it is a bug rather than a default. Every projection here is split and
+    // all-reduced; a name this function does not recognise -- a checkpoint
+    // variant that spells an expert differently, say -- would otherwise be
+    // replicated silently while the forward went on sharding around it, and
+    // the model would answer plausibly and wrongly. Say so instead.
+    //
+    // Scales never reach here: `ContractBuilder::shard_axis` rewrites them to
+    // the weight they scale first.
+    if (contains(name, ".ffn.") && ends_with(name, ".weight") &&
+        !contains(name, ".gate.") && !contains(name, "_norm.") &&
+        !contains(name, "layernorm")) {
+        throw std::runtime_error(
+            "deepseek_v4: no sharding decision for FFN tensor '" +
+            std::string(name) +
+            "'; add it to dsv4_shard_axis rather than letting it replicate");
+    }
+    // Everything outside the FFN is replicated, which avoids TP communication
+    // in the main path.
     return std::nullopt;
 }
 
