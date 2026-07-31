@@ -1143,6 +1143,53 @@ generated_compact_argmax_value(
 // a later slice will capture and replay across.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Lane-grid lattice (stage6-plan.md increment 3 — the capture prerequisite).
+//
+// A captured CUDA graph freezes every kernel's grid dimensions, so any grid
+// derived from the EXACT per-fire lane count would force one graph per lane
+// count. Instead, every lane-derived grid dimension in the body
+// (`launch_generated_stage`) is baked at the lattice ceiling of the fire's
+// lane count, and the LIVE count travels to the device as data: it is
+// `PtirLaneTableHeader::lane_count` in the metadata block that every prepare
+// already re-packs and re-uploads per fire. Idle blocks exit on the guard
+// every kernel on this path already carries as its FIRST action — the
+// grouped kernels (`k_grouped_stage_readiness`, `k_grouped_topk`, the
+// nucleus family in grouped_runtime.cuh), the driver-side region kernels in
+// this file, and the NVRTC-emitted region kernel
+// (compiler/codegen/runtime/cuda/fused_block1.cuh:18-19,
+// `dispatch_lane >= header->lane_count`) all guard before touching any
+// lane-indexed table — so no emitter change and no golden re-bless is
+// needed, and an idle block costs one global read of the header.
+//
+// The ladder is powers of two rather than `forward_graph_request_bucket`'s
+// R lattice (batch/forward_graph.hpp:66: 1,2,4, x8 to 256, then x16). That
+// lattice earns its shape from decode batches in the hundreds, and its
+// "max_requests is a legal bucket" rule needs a planner bound this layer
+// does not have. Lane counts here are the number of programs grouped into
+// one stage fire — tens, not hundreds — so pow2 pads by at most 2x in idle
+// blocks whose whole cost is the guard read, and gives a future capture
+// cache at most ~log2(max lanes) distinct grids per stage.
+constexpr std::uint32_t generated_lane_grid_bucket(
+    std::uint32_t lane_count) noexcept {
+    // 2^31 is the largest u32 power of two; nothing real approaches it
+    // (prepare rejects empty fires and lanes are per-fire programs), but
+    // stay total rather than overflow the shift.
+    if (lane_count > (std::uint32_t{1} << 31)) return lane_count;
+    std::uint32_t bucket = 1;
+    while (bucket < lane_count) bucket <<= 1;
+    return bucket;
+}
+static_assert(generated_lane_grid_bucket(0) == 1);
+static_assert(generated_lane_grid_bucket(1) == 1);
+static_assert(generated_lane_grid_bucket(2) == 2);
+static_assert(generated_lane_grid_bucket(3) == 4);
+static_assert(generated_lane_grid_bucket(4) == 4);
+static_assert(generated_lane_grid_bucket(5) == 8);
+static_assert(generated_lane_grid_bucket(16) == 16);
+static_assert(generated_lane_grid_bucket(17) == 32);
+static_assert(generated_lane_grid_bucket(1000) == 1024);
+
 enum class PreparedBufferMode : std::uint8_t {
     // Rotating pinned/device rings with event-guarded slot reuse — the
     // pre-split storage. Still used by the phases that have not migrated to
@@ -1175,7 +1222,7 @@ struct PreparedRegionLaunch {
     const FusedRegionExecutable* region = nullptr;
     // kNucleus / kNucleusScalable
     GroupedNucleusLaunch nucleus{};
-    std::uint32_t nucleus_segments = 0;      // lane_count * rows
+    std::uint32_t nucleus_segments = 0;      // padded lanes * rows (grid)
     float* partial_maxima = nullptr;         // kNucleusScalable, device
     float* thread_masses = nullptr;          // kNucleusScalable, device
     float* probabilities = nullptr;          // kNucleusScalable, device
@@ -1188,7 +1235,7 @@ struct PreparedRegionLaunch {
     // kScan
     bool scan_f32 = false;
     bool scan_product = false;
-    std::uint32_t scan_blocks = 0;
+    std::uint32_t scan_blocks = 0;           // padded lanes * max_rows (grid)
     GroupedRowShape shape_a{};               // scan input / matmul left / topk rows
     GroupedRowShape shape_b{};               // matmul right
     GroupedDynamicShape dynamic_shape{};     // topk input
@@ -1228,6 +1275,13 @@ struct GeneratedStagePrepared {
     std::optional<detail::PersistentDeviceLease> device_workspace;
 
     std::uint32_t lane_count = 0;
+    // The lane-grid lattice ceiling of `lane_count`
+    // (`generated_lane_grid_bucket`). Every lane-derived grid dimension the
+    // body launches is sized by THIS, never by the live count — the live
+    // count reaches the kernels as `device_header->lane_count` and blocks
+    // beyond it guard-exit. This is what lets a captured body replay across
+    // fires whose lane counts share a bucket.
+    std::uint32_t padded_lane_count = 0;
     std::uint32_t value_count = 0;
 
     // Typed views into the uploaded device metadata block.
@@ -1317,6 +1371,7 @@ inline std::unique_ptr<GeneratedStagePrepared> prepare_generated_stage(
     auto prepared = std::make_unique<GeneratedStagePrepared>(stream);
     prepared->timing = timing;
     prepared->lane_count = lane_count;
+    prepared->padded_lane_count = generated_lane_grid_bucket(lane_count);
     prepared->value_count = value_count;
     detail::AsyncAllocations& allocations = prepared->allocations;
 
@@ -2300,13 +2355,26 @@ inline std::unique_ptr<GeneratedStagePrepared> prepare_generated_stage(
                 }
                 PreparedRegionLaunch record;
                 record.nucleus = launch;
-                record.nucleus_segments = lane_count * rows;
+                // Grid: lane factor at the lattice ceiling (idle lanes
+                // guard-exit on `header->lane_count`); `rows` is the
+                // program's row shape, already maximized over the fire's
+                // lanes above — a data-sized dimension kept exact this
+                // slice (stage6-plan.md increment 3 scopes the lattice to
+                // the lane factor).
+                record.nucleus_segments =
+                    prepared->padded_lane_count * rows;
                 if (grouped_nucleus_library_supported(
                         stage, planned_region)) {
                     record.kind = PreparedRegionLaunch::Kind::kNucleus;
                 } else {
                     record.kind =
                         PreparedRegionLaunch::Kind::kNucleusScalable;
+                    // Workspace stays sized by the LIVE lane count: the
+                    // padded grid's idle blocks return before touching
+                    // `partial_maxima`/`thread_masses`/`probabilities`, so
+                    // padding the allocations would buy nothing. (These are
+                    // per-fire allocations anyway — stable-address
+                    // workspace is increment 2 territory.)
                     const std::uint32_t segments =
                         lane_count * rows;
                     const std::size_t items =
@@ -2491,7 +2559,12 @@ inline std::unique_ptr<GeneratedStagePrepared> prepare_generated_stage(
                 record.kind = PreparedRegionLaunch::Kind::kScan;
                 record.scan_f32 = dtype == PTIR_DT_F32;
                 record.scan_product = op.tag == PTIR_OP_CUMPROD;
-                record.scan_blocks = lane_count * shape.max_rows;
+                // Lane factor at the lattice ceiling; `max_rows` is the
+                // value's data-sized row bound (max over lanes), kept exact
+                // this slice. Idle blocks guard-exit on
+                // `header->lane_count`.
+                record.scan_blocks =
+                    prepared->padded_lane_count * shape.max_rows;
                 record.shape_a = shape;
                 record.value_a = op.args[0];
                 record.out_a = bases[node];
@@ -2514,8 +2587,16 @@ inline std::unique_ptr<GeneratedStagePrepared> prepare_generated_stage(
                     grouped_row_shape(left_type, lanes);
                 const auto right_shape =
                     grouped_row_shape(right_type, lanes);
+                // The matmul kernel is grid-stride: its true bound is
+                // `header->lane_count * per_lane`, computed on the device,
+                // so the grid is only a parallelism cap. Padding the lane
+                // factor keeps the cap a function of the lattice bucket
+                // (surplus blocks find `flat >= total` and fall through);
+                // the row/column factors are data-sized and stay exact
+                // this slice.
                 const std::uint64_t total =
-                    static_cast<std::uint64_t>(lane_count) *
+                    static_cast<std::uint64_t>(
+                        prepared->padded_lane_count) *
                     left_shape.max_rows * right_shape.max_columns;
                 PreparedRegionLaunch record;
                 record.kind = PreparedRegionLaunch::Kind::kMatmul;
@@ -2585,10 +2666,24 @@ inline std::unique_ptr<GeneratedStagePrepared> prepare_generated_stage(
 inline GroupedLaunchResult launch_generated_stage(
     GeneratedStagePrepared& prepared) {
     cudaStream_t stream = prepared.stream;
-    const std::uint32_t lane_count = prepared.lane_count;
+    // Every lane-derived grid below is sized by the lattice bucket, never
+    // the live count (see `generated_lane_grid_bucket`); the live count is
+    // device data (`prepared.device_header->lane_count`) and idle blocks
+    // guard-exit first thing.
+    const std::uint32_t grid_lanes = prepared.padded_lane_count;
     const std::uint32_t value_count = prepared.value_count;
+    // Readiness under padding (stage6-plan.md increment 3, scope 3): the
+    // grid is a function of the bucket alone, so a captured graph's
+    // readiness node is dimension-stable across fires in the bucket. Its
+    // per-thread guard (`lane >= header->lane_count`,
+    // grouped_runtime.cuh:339) already made the surplus threads inert —
+    // this kernel always over-launched to the 128 ceiling. What padding
+    // does NOT fix is the spike caveat that the kernel evaluates live ring
+    // head/tail state: that stays correct while prepare re-runs before
+    // every launch (this slice is eager), and device-resolving it for
+    // replay is deliberately deferred to the capture slice.
     k_grouped_stage_readiness<<<
-        (lane_count + 127) / 128, 128, 0, stream>>>(
+        (grid_lanes + 127) / 128, 128, 0, stream>>>(
         prepared.device_header,
         prepared.device_lanes,
         prepared.device_readiness,
@@ -2674,23 +2769,26 @@ inline GroupedLaunchResult launch_generated_stage(
                 break;
             }
             case PreparedRegionLaunch::Kind::kPageMask: {
+                // One block per PADDED lane; the per-lane dest table is
+                // live-sized, but the kernel guards `lane >=
+                // header->lane_count` before reading `dests[lane]`.
                 if (region.mask_dtype == PTIR_DT_F32) {
                     k_generated_attn_page_mask<float><<<
-                        lane_count, kTier0Block, 0, stream>>>(
+                        grid_lanes, kTier0Block, 0, stream>>>(
                         prepared.device_header, prepared.device_lanes,
                         region.device_dests,
                         prepared.device_value_pointers, value_count,
                         region.value_a);
                 } else if (region.mask_dtype == PTIR_DT_I32) {
                     k_generated_attn_page_mask<std::int32_t><<<
-                        lane_count, kTier0Block, 0, stream>>>(
+                        grid_lanes, kTier0Block, 0, stream>>>(
                         prepared.device_header, prepared.device_lanes,
                         region.device_dests,
                         prepared.device_value_pointers, value_count,
                         region.value_a);
                 } else if (region.mask_dtype == PTIR_DT_U32) {
                     k_generated_attn_page_mask<std::uint32_t><<<
-                        lane_count, kTier0Block, 0, stream>>>(
+                        grid_lanes, kTier0Block, 0, stream>>>(
                         prepared.device_header, prepared.device_lanes,
                         region.device_dests,
                         prepared.device_value_pointers, value_count,
@@ -2702,7 +2800,7 @@ inline GroupedLaunchResult launch_generated_stage(
                     // instantiation, not a reinterpretation of the u32 one.
                     // (Prepare already refused every other dtype.)
                     k_generated_attn_page_mask<std::uint8_t><<<
-                        lane_count, kTier0Block, 0, stream>>>(
+                        grid_lanes, kTier0Block, 0, stream>>>(
                         prepared.device_header, prepared.device_lanes,
                         region.device_dests,
                         prepared.device_value_pointers, value_count,
@@ -2713,8 +2811,14 @@ inline GroupedLaunchResult launch_generated_stage(
                 break;
             }
             case PreparedRegionLaunch::Kind::kEnvelopeDot: {
+                // Lane factor padded; `max_pages` is the program-declared
+                // page-slot bound (data-sized), kept exact this slice —
+                // padding it would multiply idle blocks by the page count
+                // for a dimension the future capture key can carry
+                // exactly. Idle lanes guard-exit before reading
+                // `envelopes[lane]` (live-sized table).
                 k_generated_envelope_dot<kTier0Block><<<
-                    lane_count * region.max_pages,
+                    grid_lanes * region.max_pages,
                     kTier0Block,
                     0,
                     stream>>>(
@@ -2777,8 +2881,12 @@ inline GroupedLaunchResult launch_generated_stage(
                 break;
             }
             case PreparedRegionLaunch::Kind::kTopK: {
+                // Lane factor padded; `topk_rows` is the program's row
+                // bound (data-sized), kept exact this slice. Idle lanes
+                // guard-exit (`k_grouped_topk` reads `header->lane_count`
+                // before any lane table).
                 k_grouped_topk<<<
-                    lane_count * region.topk_rows,
+                    grid_lanes * region.topk_rows,
                     kTier0Block,
                     0,
                     stream>>>(
@@ -2805,9 +2913,14 @@ inline GroupedLaunchResult launch_generated_stage(
                 break;
             }
             case PreparedRegionLaunch::Kind::kGenerated: {
+                // One block per PADDED lane. The NVRTC-emitted region
+                // kernel's first act is the guard
+                // (`dispatch_lane >= header->lane_count`,
+                // compiler/codegen/runtime/cuda/fused_block1.cuh:18-19),
+                // so idle blocks exit before touching any lane table.
                 const CUresult launch_status = cuLaunchKernel(
                     region.region->function,
-                    lane_count, 1, 1,
+                    grid_lanes, 1, 1,
                     static_cast<unsigned>(
                         region.region->block_threads), 1, 1,
                     0,
