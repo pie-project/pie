@@ -69,6 +69,25 @@ bool decode_full_attention_variant_enabled() {
     return enabled;
 }
 
+// PIE_LORA_GROUPED: same-shape lora lanes share one grouped-GEMM launch
+// per correction GEMM instead of per-lane pairs. Default ON.
+//
+// This gate is a PARITY INSTRUMENT, not a permanent tuning knob: grouped
+// GEMM changes the floating-point reduction order versus the per-lane
+// pairs, so byte-identity between the two paths is not a meaningful bar
+// at lane-count > 1 — the A/B this gate affords (same concurrent batch,
+// grouped vs per-lane) is how a divergence gets classified (late/sporadic
+// = reduction noise, immediate+total = bug; the tp_equivalence reasoning).
+// Once the grouped path has soaked, the gate should be deleted, not kept.
+bool lora_grouped_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_LORA_GROUPED");
+        if (v == nullptr || v[0] == '\0') return true;
+        return v[0] != '0';
+    }();
+    return enabled;
+}
+
 // Per-fire lora state (§5.1 CORRECTION): validated lanes plus their adapter
 // weights cast to bf16. The channel cells the resolver harvested are f32 —
 // the PTIR channel vocabulary has no bf16 wire dtype — while the projection
@@ -89,8 +108,43 @@ struct LoraFireState {
         const LoraLaneView* view = nullptr;
         void* a_bf16 = nullptr;  // [num_layers, R, d_in]
         void* b_bf16 = nullptr;  // [num_layers, d_out, R]
+        // Grouped lowering (below): lane's element offset into the shared
+        // xA^T scratch, and whether a group claimed it. Solo lanes keep
+        // offset 0 — they reuse the scratch base sequentially as before.
+        std::size_t xa_offset = 0;
+        bool grouped = false;
     };
+    // One same-shape group: lanes whose (rank, d_in, d_out, num_layers)
+    // agree, lowered through ops::gemm_grouped_act_x_wt_bf16 (shared N/K
+    // per call, per-lane M = token span). Only groups of size >= 2 are
+    // kept; a group of 1 has nothing to share and stays a per-lane pair.
+    struct Group {
+        int rank = 0;
+        int d_in = 0;
+        int d_out = 0;
+        std::vector<std::size_t> members;  // indices into `lanes`
+        // Members carrying the q / v site (subset sizes for the second
+        // grouped GEMM's per-site calls).
+        int nq = 0;
+        int nv = 0;
+        // This group's slot offset (in pointer slots) within one layer's
+        // slice of `ptr_slab`; layout below.
+        std::size_t slab_off = 0;
+    };
+    std::vector<Group> groups;
     std::vector<Lane> lanes;
+    // Device-resident pointer-array storage for the grouped calls,
+    // [num_layers, slab_stride] of void*. cublasGemmGroupedBatchedEx does
+    // NOT consume its A/B/C pointer arrays synchronously at call time:
+    // transient host arrays handed to back-to-back grouped calls produced
+    // illegal-address/misaligned faults on this platform (measured,
+    // scratchpad grouped_repro*.cu — per-call stream syncs or
+    // device-resident arrays both cure it). The nemotron_h MoE consumer
+    // passes device-resident arrays for the same reason; each (layer,
+    // group) here gets its own slot so nothing is ever overwritten while
+    // a prior call may still read it.
+    void* ptr_slab = nullptr;
+    std::size_t slab_stride = 0;  // pointer slots per layer
     cudaStream_t stream = nullptr;
 
     LoraFireState(const LoraTable& table,
@@ -188,6 +242,161 @@ struct LoraFireState {
             kernels::launch_cast_fp32_to_bf16(
                 lane.b, out.b_bf16, b_elems, stream);
         }
+
+        // ── Same-shape lane grouping (Stage 5's consumer increment) ──
+        //
+        // The planner story, honestly: `fire_plan.rs` marks the
+        // projection_weights site PerLane and stops there — the
+        // classification is device-independent (pie-application-plan.md
+        // §4.4). Whether same-shape lanes then SHARE one grouped-GEMM
+        // launch is device knowledge: stage0-l40s.md §3.1 measured
+        // batched matching the hand-written padded kernel at 1.00–1.03×
+        // and beating separate launches by up to 24.75× exactly when
+        // shapes share, and only the driver knows this device offers a
+        // kernel for it (cublasGemmGroupedBatchedEx). Same argument as
+        // fast_rows' dual derivation (stage1-notes "Stage 5"): the
+        // planner owns the order and the class, the driver applies
+        // device-side knowledge to a device-shaped fact. Handing a
+        // "Grouped" lowering across the ABI would force the scheduler to
+        // model a kernel table it cannot see.
+        //
+        // The grouping key is the GEMM-shape tuple (rank, d_in, d_out):
+        // both correction GEMMs share N/K within a group (xA^T: N=rank,
+        // K=d_in; (xA^T)B^T: N=d_out, K=rank). Layer-slice compatibility
+        // (num_layers, the per-layer weight stride) is NOT in the key
+        // because the lane loop above already validated every lane to
+        // cfg.num_hidden_layers — uniform by construction, unlike d_in,
+        // which is also validated uniform today but stays in the key as
+        // the statement of what the grouped calls actually require.
+        //
+        // Precondition: all lanes' token spans pairwise disjoint. One
+        // grouped call runs its lanes' beta=1 accumulations concurrently,
+        // so overlapping projection rows would race — the per-lane pairs
+        // are stream-ordered and tolerate overlap. Lanes are distinct
+        // programs over distinct requests, so overlap is malformed
+        // geometry; if it ever appears, fall back to per-lane (which
+        // stays correct) rather than refuse the fire.
+        if (lora_grouped_enabled() && lanes.size() >= 2 &&
+            lane_spans_disjoint()) {
+            for (std::size_t i = 0; i < lanes.size(); ++i) {
+                const LoraLaneView& v = *lanes[i].view;
+                Group* g = nullptr;
+                for (Group& cand : groups) {
+                    if (cand.rank == static_cast<int>(v.rank) &&
+                        cand.d_in == static_cast<int>(v.d_in) &&
+                        cand.d_out == static_cast<int>(v.d_out)) {
+                        g = &cand;
+                        break;
+                    }
+                }
+                if (g == nullptr) {
+                    groups.push_back(Group{
+                        static_cast<int>(v.rank), static_cast<int>(v.d_in),
+                        static_cast<int>(v.d_out), {}});
+                    g = &groups.back();
+                }
+                g->members.push_back(i);
+            }
+            // Groups of 1 keep the existing per-lane pair.
+            groups.erase(
+                std::remove_if(groups.begin(), groups.end(),
+                               [](const Group& g) {
+                                   return g.members.size() < 2;
+                               }),
+                groups.end());
+            // Scratch layout for the grouped xA^T intermediate: grouped
+            // lanes get exclusive [t, R] regions packed contiguously
+            // (per-lane element offsets), because one grouped call writes
+            // them all concurrently. Bound: disjoint spans give
+            // sum(t_i) <= N, and rank <= I was validated per lane, so
+            // sum(t_i * R_i) <= N * I <= the ws.gate alias's
+            // [max_tokens, I] extent. The check restates the chunk-3
+            // bound verification for the new layout; it is unreachable
+            // given the disjointness precondition, but the scratch is an
+            // alias, so an overrun would corrupt live state silently.
+            std::size_t xa_total = 0;
+            for (const Group& g : groups) {
+                for (std::size_t idx : g.members) {
+                    lanes[idx].grouped = true;
+                    lanes[idx].xa_offset = xa_total;
+                    xa_total += static_cast<std::size_t>(
+                                    lanes[idx].view->token_count) *
+                                lanes[idx].view->rank;
+                }
+            }
+            if (xa_total > static_cast<std::size_t>(N) *
+                               static_cast<std::size_t>(I)) {
+                throw std::runtime_error(
+                    "lora grouped xA^T scratch layout (" +
+                    std::to_string(xa_total) + " elems) exceeds the " +
+                    std::to_string(N) + "x" + std::to_string(I) +
+                    " ws.gate alias bound");
+            }
+            // Pointer-slab layout (see the `ptr_slab` member note for why
+            // the arrays must be device-resident): per layer, per group,
+            // consecutive slot runs [x(n) a(n) xa(n)][q_act q_w q_y](nq
+            // each)[v_act v_w v_y](nv each), n = group size.
+            for (Group& g : groups) {
+                for (std::size_t idx : g.members) {
+                    const std::uint64_t bits = lanes[idx].view->sites_bits;
+                    if ((bits & kLoraSiteQ) != 0) ++g.nq;
+                    if ((bits & kLoraSiteV) != 0) ++g.nv;
+                }
+                g.slab_off = slab_stride;
+                slab_stride += 3 * g.members.size() +
+                               3 * static_cast<std::size_t>(g.nq) +
+                               3 * static_cast<std::size_t>(g.nv);
+            }
+            if (slab_stride > 0) {
+                CUDA_CHECK(cudaMallocAsync(
+                    &ptr_slab,
+                    static_cast<std::size_t>(cfg.num_hidden_layers) *
+                        slab_stride * sizeof(void*),
+                    stream));
+            }
+        }
+    }
+
+    // True iff no two lanes' token spans overlap (lanes with empty spans
+    // were dropped at construction). Precondition for the grouped lowering.
+    bool lane_spans_disjoint() const {
+        std::vector<const LoraLaneView*> by_start;
+        by_start.reserve(lanes.size());
+        for (const Lane& lane : lanes) by_start.push_back(lane.view);
+        std::sort(by_start.begin(), by_start.end(),
+                  [](const LoraLaneView* a, const LoraLaneView* b) {
+                      return a->token_start < b->token_start;
+                  });
+        for (std::size_t i = 1; i < by_start.size(); ++i) {
+            if (by_start[i - 1]->token_start + by_start[i - 1]->token_count >
+                by_start[i]->token_start) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // One-line grouping summary for PIE_LORA_FIRE_TRACE, e.g. "3xr8",
+    // "2xr8+1solo", "none(2 solo)", "off". Verification instrument: a
+    // single-lane fire must read "none(1 solo)" — the grouped path did
+    // not engage.
+    std::string grouping_desc() const {
+        if (!lora_grouped_enabled()) return "off";
+        std::size_t solo = 0;
+        for (const Lane& lane : lanes) {
+            if (!lane.grouped) ++solo;
+        }
+        if (groups.empty()) {
+            return "none(" + std::to_string(solo) + " solo)";
+        }
+        std::string s;
+        for (const Group& g : groups) {
+            s += (s.empty() ? "" : ",") +
+                 std::to_string(g.members.size()) + "xr" +
+                 std::to_string(g.rank);
+        }
+        if (solo > 0) s += "+" + std::to_string(solo) + "solo";
+        return s;
     }
 
     LoraFireState(const LoraFireState&) = delete;
@@ -198,18 +407,33 @@ struct LoraFireState {
             if (lane.a_bf16 != nullptr) cudaFreeAsync(lane.a_bf16, stream);
             if (lane.b_bf16 != nullptr) cudaFreeAsync(lane.b_bf16, stream);
         }
+        if (ptr_slab != nullptr) cudaFreeAsync(ptr_slab, stream);
     }
 
     // The CORRECTION at layer L (§5.1): `x(W+BA)^T = xW^T + (xA^T)B^T`.
     // Called immediately after the base q/v projections materialize in the
     // ws buffers, before bias/qk-norm/rope and before the KV append — the
     // delta lands on the projection output, exactly where `W + BA` would
-    // have put it. Per lane: one [t, R] GEMM into scratch, then one
-    // beta=1 GEMM per named site into that lane's token rows. A plain loop,
-    // deliberately: ranks may differ across lanes (different rank =
-    // different traced program, co-batched), and §3.1 measured bucketing
-    // losing to padding — grouping same-rank lanes is a later planner
-    // decision, not a v0 lowering.
+    // have put it.
+    //
+    // Two lowerings of the same math, chosen at fire setup (see the
+    // grouping block in the constructor for why the choice lives HERE and
+    // not in fire_plan):
+    //   * solo lanes — one [t, R] GEMM into scratch, then one beta=1 GEMM
+    //     per named site into that lane's token rows, stream-ordered;
+    //   * same-shape groups — both GEMMs go through
+    //     ops::gemm_grouped_act_x_wt_bf16 (shared N/K, per-lane M;
+    //     pointer arrays staged into the device-resident `ptr_slab` —
+    //     see its member note), one launch per correction GEMM per group.
+    // Ranks may still differ ACROSS groups (different rank = different
+    // traced program, co-batched); §3.1 measured bucketing losing to
+    // padding, so nothing here pads a lane up to a foreign rank — lanes
+    // group only when the shapes already agree.
+    //
+    // NOTE the grouped path changes the floating-point reduction order vs
+    // the per-lane pairs (different cuBLAS kernel), so byte-identity
+    // between the two is not expected at group size >= 2; PIE_LORA_GROUPED
+    // is the A/B instrument for that comparison.
     void apply(cublasHandle_t handle,
                int layer,
                const void* qkv_in, int H, int Hq, int Hk,
@@ -217,6 +441,7 @@ struct LoraFireState {
                void* xa_scratch) const
     {
         for (const Lane& lane : lanes) {
+            if (lane.grouped) continue;
             const LoraLaneView& v = *lane.view;
             const int t = static_cast<int>(v.token_count);
             const int R = static_cast<int>(v.rank);
@@ -226,9 +451,9 @@ struct LoraFireState {
                 static_cast<std::size_t>(layer) * v.d_out * R;
             const void* x = bf16_row(
                 qkv_in, static_cast<int>(v.token_start), H);
-            // xA^T -> scratch [t, R]. Lanes reuse the same scratch base:
-            // the stream orders each lane's pair before the next lane's
-            // overwrite.
+            // xA^T -> scratch [t, R]. Solo lanes reuse the same scratch
+            // base: the stream orders each lane's pair before the next
+            // lane's overwrite (and before any group's grouped write).
             ops::gemm_act_x_wt_bf16(
                 handle, x, a_l, xa_scratch, t, R, H);
             if ((v.sites_bits & kLoraSiteQ) != 0) {
@@ -242,6 +467,109 @@ struct LoraFireState {
                     handle, xa_scratch, b_l,
                     bf16_row(v_out, static_cast<int>(v.token_start), Hk),
                     t, static_cast<int>(v.d_out), R, /*beta=*/1.f);
+            }
+        }
+        for (const Group& g : groups) {
+            const std::size_t n = g.members.size();
+            // Host staging in slab order: [x(n) a(n) xa(n)] [q_act q_w
+            // q_y](nq each) [v_act v_w v_y](nv each). Uploaded into this
+            // (layer, group)'s device slot; the grouped calls then read
+            // the arrays from device memory (see the `ptr_slab` note).
+            std::vector<const void*> staged;
+            staged.reserve(3 * n + 3 * (g.nq + g.nv));
+            std::vector<const void*> a_run, xa_run;
+            std::vector<const void*> q_act, q_w, q_y, v_act, v_w, v_y;
+            std::vector<int> m;
+            m.reserve(n);
+            for (std::size_t idx : g.members) {
+                const Lane& lane = lanes[idx];
+                const LoraLaneView& v = *lane.view;
+                const int t = static_cast<int>(v.token_count);
+                const auto* a_l =
+                    static_cast<const std::uint16_t*>(lane.a_bf16) +
+                    static_cast<std::size_t>(layer) * g.rank * g.d_in;
+                const auto* b_l =
+                    static_cast<const std::uint16_t*>(lane.b_bf16) +
+                    static_cast<std::size_t>(layer) * g.d_out * g.rank;
+                void* xa = static_cast<std::uint16_t*>(xa_scratch) +
+                           lane.xa_offset;
+                staged.push_back(bf16_row(
+                    qkv_in, static_cast<int>(v.token_start), H));
+                a_run.push_back(a_l);
+                xa_run.push_back(xa);
+                m.push_back(t);
+                if ((v.sites_bits & kLoraSiteQ) != 0) {
+                    q_act.push_back(xa);
+                    q_w.push_back(b_l);
+                    q_y.push_back(bf16_row(
+                        q_out, static_cast<int>(v.token_start), Hq));
+                }
+                if ((v.sites_bits & kLoraSiteV) != 0) {
+                    v_act.push_back(xa);
+                    v_w.push_back(b_l);
+                    v_y.push_back(bf16_row(
+                        v_out, static_cast<int>(v.token_start), Hk));
+                }
+            }
+            auto append = [&staged](const std::vector<const void*>& run) {
+                staged.insert(staged.end(), run.begin(), run.end());
+            };
+            append(a_run); append(xa_run);
+            append(q_act); append(q_w); append(q_y);
+            append(v_act); append(v_w); append(v_y);
+
+            void** slot = static_cast<void**>(ptr_slab) +
+                          static_cast<std::size_t>(layer) * slab_stride +
+                          g.slab_off;
+            // Pageable-source cudaMemcpyAsync returns only after the
+            // source has been staged, so `staged` may die at scope exit;
+            // the device slot is (layer, group)-exclusive, so no later
+            // upload can overwrite it while these calls still read it.
+            CUDA_CHECK(cudaMemcpyAsync(
+                slot, staged.data(), staged.size() * sizeof(void*),
+                cudaMemcpyHostToDevice, stream));
+            const void* const* x_ptrs = slot;
+            const void* const* a_ptrs = x_ptrs + n;
+            const auto* xa_ptrs = x_ptrs + 2 * n;
+            ops::gemm_grouped_act_x_wt_bf16(
+                handle, x_ptrs, a_ptrs,
+                const_cast<void* const*>(xa_ptrs),
+                m.data(), static_cast<int>(n), g.rank, g.d_in);
+            // (xA^T)B^T per site subset: shared N=d_out, K=rank, beta=1.
+            // A lane contributes to the q call, the v call, or both, per
+            // its SITES bits; d_out is shared across the group by the
+            // grouping key, so the subsets keep the shared-N contract.
+            // Per-site M arrays: the site subsets preserve member order,
+            // so the span list is the same prefix-free filter of `m`.
+            if (g.nq > 0) {
+                std::vector<int> mq;
+                mq.reserve(g.nq);
+                for (std::size_t i = 0; i < n; ++i) {
+                    if ((lanes[g.members[i]].view->sites_bits &
+                         kLoraSiteQ) != 0) {
+                        mq.push_back(m[i]);
+                    }
+                }
+                const auto* base = x_ptrs + 3 * n;
+                ops::gemm_grouped_act_x_wt_bf16(
+                    handle, base, base + g.nq,
+                    const_cast<void* const*>(base + 2 * g.nq),
+                    mq.data(), g.nq, g.d_out, g.rank, /*beta=*/1.f);
+            }
+            if (g.nv > 0) {
+                std::vector<int> mv;
+                mv.reserve(g.nv);
+                for (std::size_t i = 0; i < n; ++i) {
+                    if ((lanes[g.members[i]].view->sites_bits &
+                         kLoraSiteV) != 0) {
+                        mv.push_back(m[i]);
+                    }
+                }
+                const auto* base = x_ptrs + 3 * n + 3 * g.nq;
+                ops::gemm_grouped_act_x_wt_bf16(
+                    handle, base, base + g.nv,
+                    const_cast<void* const*>(base + 2 * g.nv),
+                    mv.data(), g.nv, g.d_out, g.rank, /*beta=*/1.f);
             }
         }
     }
@@ -587,8 +915,10 @@ void llama_like_forward_paged(
                 spans += std::to_string(lane.token_start) + "+" +
                          std::to_string(lane.token_count);
             }
-            std::fprintf(stderr, "[lora-fire] R=%d lanes=%u spans=%s\n",
-                         R, lora->count, spans.c_str());
+            std::fprintf(stderr,
+                         "[lora-fire] R=%d lanes=%u spans=%s grouping=%s\n",
+                         R, lora->count, spans.c_str(),
+                         lora_state->grouping_desc().c_str());
         }
     }
 
@@ -822,8 +1152,11 @@ void llama_like_forward_paged(
         // Scratch: xA^T borrows ws.gate. At this point in the layer, gate's
         // last write was the PREVIOUS layer's swiglu output, consumed by
         // that layer's down_proj GEMM; nothing reads it again before this
-        // layer's MLP overwrites it, and its [max_tokens, I] extent bounds
-        // every [t, R] use (rank <= I is validated at fire setup).
+        // layer's MLP overwrites it. Its [max_tokens, I] extent bounds
+        // both layouts the apply uses: every solo lane's [t, R] use
+        // (rank <= I is validated at fire setup), and the grouped
+        // lanes' packed per-lane regions (sum of spans x rank <= N * I,
+        // verified against this alias's bound at fire setup).
         if (has_lora) {
             lora_state->apply(
                 cublas.handle(), L, qkv_in, H, Hq, Hk,
