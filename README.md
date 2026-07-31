@@ -48,18 +48,45 @@ grammar = engine.compile_json_schema(schema)      # or compile_regex(...)
 batch = engine.batch(size=64)
 batch.set_grammars([grammar] * 64)
 
-batch.capture()                                   # record both graphs, once
+batch.capture()                                   # record the graphs, once
 
 while decoding:
-    mask = batch.fill_mask()                      # (64, words), on the device
+    mask = batch.step(sampled)                    # advance + fill, one replay
     logits.masked_fill_(...)                      # your sampler
-    batch.advance(sampled)                        # (64,), on the device
 ```
 
-After `capture()`, `fill_mask` and `advance` are graph replays: no host work, no
+`step` is `advance` then `fill_mask` as a single recording, which is the path a
+decode loop wants: only the sample sits between a fill and the advance that
+follows it, and nothing at all sits between that advance and the next fill.
+The two are also available separately.
+
+After `capture()`, all three are graph replays: no host work, no
 synchronisation, and the recording stays valid however the batch's grammars are
 reassigned between steps. That is what makes it composable with the engine's
 own captured decode step.
+
+### Sampling from the set instead of the mask
+
+A vocabulary-wide mask is the wrong shape for what reads it. At a structural
+position a schema admits a few hundred of a hundred and fifty thousand tokens,
+and the sampler that follows sorts and normalises all of them anyway.
+
+```python
+ids, counts, kind = batch.shortlist()             # all on the device
+```
+
+`kind[i]` is 0 when `ids[i]` names what row `i` *admits* and 1 when it names
+what it *forbids* — whichever list is shorter, decided on the device, because
+a caller choosing for itself would have to read a count on the host.
+
+Measured on Qwen3's vocabulary at batch 512, against applying the mask to every
+row: **2.68x when every row is sparse, 1.05x when half are dense**, and 0.86x
+for the sync-free alternative of sampling both ways and selecting. The step
+distribution is bimodal — half of all steps admit under four thousand tokens
+and half admit nearly everything — so a mixed batch, which is what continuous
+batching gives, sits near parity. Acting on `kind` still costs one host
+synchronisation, because a sampler's output shape is its row count. The set
+being resident is necessary and not sufficient.
 
 A batch may hold sequences under different grammars — which is what a serving
 batch looks like, since requests bring their own — and it is still one launch.
