@@ -145,6 +145,40 @@ inline void gdn_fused_in_proj_joins(ContractBuilder& b) {
     }
 }
 
+/// Widen the two gated-delta-net parameters the kernels read as fp32.
+///
+/// `A_log` and the gated RMSNorm's weight enter `launch_*_gated_delta_net` as
+/// `const float*`, but HF ships them fp32 on Qwen3.5-4B and **bf16** on
+/// Qwen3.6-35B-A3B. The driver used to reconcile that at bind, by copying each
+/// one to a fresh `DeviceBuffer<float>` held in `owned_fp32_buffers` -- a
+/// conversion the contract never heard about, so the bf16 original stayed
+/// resident beside its fp32 copy for the life of the model.
+///
+/// Only these two. `dt_bias` sits beside them in the same module and is read as
+/// bf16, so a suffix match any looser than this list would silently widen it.
+///
+/// The `already fp32` branch is not an optimization; it is required. A `Cast`
+/// to the encoding its operand already has is refused (a node may not denote
+/// exactly its operand), which is what makes the two checkpoint conventions
+/// impossible to paper over with one unconditional cast.
+inline void gdn_fp32_parameters(ContractBuilder& b) {
+    for (const SourceTensor& raw : b.tensors()) {
+        if (!ends_with_any(raw.name, {".linear_attn.A_log", ".linear_attn.norm.weight"})) {
+            continue;
+        }
+        const bool bf16 = is_raw(raw.encoding, PieLoaderDType::BF16);
+        if (!bf16 && !is_raw(raw.encoding, PieLoaderDType::F32)) {
+            continue;
+        }
+        auto [expr, local] = b.shard(b.contract().src(std::string(raw.name)),
+                                     shape_of(raw), b.shard_axis(raw.name));
+        const PieLoaderEncodingSpec f32 = pie_loader::raw(PieLoaderDType::F32);
+        b.define(b.output_name(raw.name), bf16 ? b.contract().cast(expr, f32) : expr, f32,
+                 std::move(local));
+        b.consume(raw.id);
+    }
+}
+
 }  // namespace contract_detail
 
 /// qwen3_5, qwen3_5_text: a dense hybrid decoder under the usual names.
@@ -155,6 +189,7 @@ inline void author_qwen3_5_contract(ContractBuilder& b) {
     b.decoder_layer_prefix_any_of({"model.language_model.layers.", "model.layers."});
     contract_detail::gdn_kkv_blocked_shards(b);
     contract_detail::gdn_fused_in_proj_joins(b);
+    contract_detail::gdn_fp32_parameters(b);
     // The speculative-decoding head is a full-attention layer with the same
     // projection names, so it wants the same join. Checkpoints without one make
     // this a no-op.
@@ -172,6 +207,7 @@ inline void author_qwen3_5_moe_contract(ContractBuilder& b) {
     b.decoder_layer_prefix_any_of({"model.language_model.layers.", "model.layers."});
     contract_detail::gdn_kkv_blocked_shards(b);
     contract_detail::gdn_fused_in_proj_joins(b);
+    contract_detail::gdn_fp32_parameters(b);
     // The MoE decode runs through flashinfer's CUTLASS grouped GEMM, which
     // reads fc1's output as [linear|gate]; the checkpoint stores [gate|up].
     // Both the pre-fused and the per-expert stacking paths publish in the

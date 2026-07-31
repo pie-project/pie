@@ -1345,11 +1345,13 @@ void test_qwen3_5_gdn_splits_by_block() {
             }
 
             std::map<std::string_view, std::vector<std::int64_t>> declared;
+            std::map<std::string_view, std::uint32_t> dtypes;
             const auto v = contract.view();
             for (std::size_t i = 0; i < v.tensors.len; ++i) {
                 const auto& t = v.tensors.ptr[i];
                 declared[view_of(t.name)] =
                     std::vector<std::int64_t>(t.shape.ptr, t.shape.ptr + t.shape.len);
+                dtypes[view_of(t.name)] = t.encoding.dtype;
             }
             const auto shape_is = [&](const std::string& name,
                                       const std::vector<std::int64_t>& want) {
@@ -1357,6 +1359,26 @@ void test_qwen3_5_gdn_splits_by_block() {
                 check(found != declared.end() && found->second == want,
                       "'" + name + "' is this rank's share" + at);
             };
+            // The gated-delta-net kernels take these two as `const float*`.
+            // The checkpoint above is bf16, so the widening has to be the
+            // contract's: bind used to allocate an fp32 copy of each and leave
+            // the bf16 original resident beside it. `dt_bias` is the control --
+            // it sits in the same module, is read as bf16, and must not widen.
+            const auto dtype_is = [&](const std::string& name,
+                                      pie_loader::PieLoaderDType want) {
+                const auto found = dtypes.find(name);
+                check(found != dtypes.end() &&
+                          found->second == static_cast<std::uint32_t>(want),
+                      "'" + name + "' is declared " +
+                          (want == pie_loader::PieLoaderDType::F32 ? "fp32" : "bf16") + at);
+            };
+            dtype_is(la + "A_log", pie_loader::PieLoaderDType::F32);
+            dtype_is(la + "norm.weight", pie_loader::PieLoaderDType::F32);
+            dtype_is(la + "dt_bias", pie_loader::PieLoaderDType::BF16);
+            // A_log is per-value-head, so it shards; the gated norm is over
+            // head_v_dim, which every rank holds whole.
+            shape_is(la + "A_log", {kValue / static_cast<std::int64_t>(tp)});
+            shape_is(la + "norm.weight", {kValue});
             shape_is(la + "conv1d.weight", {local, kConvKernel});
             shape_is(la + "conv1d.bias", {local});
             // Under `PIE_QWEN35_FUSED_GDN_PROJ` the shard is the first leg of

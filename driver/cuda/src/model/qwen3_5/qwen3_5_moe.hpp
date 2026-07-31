@@ -67,9 +67,8 @@ struct Qwen3_5MoeLayerWeights {
     const DeviceTensor* la_dt_bias     = nullptr;
     // The recurrent kernel and RMSNormGated need fp32 inputs for these
     // two tensors. Qwen3.5-4B ships them as fp32 on disk but
-    // Qwen3.6-35B-A3B ships them as bf16; bind materialises fp32 copies
-    // (owned in `Qwen3_5MoeWeights::owned_fp32_buffers`) so the kernel
-    // signature stays uniform.
+    // Qwen3.6-35B-A3B ships them as bf16; `gdn_fp32_parameters` states the
+    // widening on the contract, so these point straight at the arena.
     const float* la_A_log_fp32  = nullptr;  // [V_h]
     const float* la_norm_w_fp32 = nullptr;  // [head_v_dim]
     const DeviceTensor* la_out_proj    = nullptr;
@@ -121,11 +120,6 @@ struct Qwen3_5MoeWeights {
     const DeviceTensor* final_norm = nullptr;
 
     std::vector<Qwen3_5MoeLayerWeights> layers;
-
-    // Owned fp32 copies of A_log and RMSNormGated.weight materialised at
-    // bind time (Qwen3.6-35B-A3B ships them as bf16 even though the FLA
-    // path consumes them in fp32). One pair per linear-attn layer.
-    std::vector<DeviceBuffer<float>> owned_fp32_buffers;
 
     // Owned bf16 copies of per-rank-sliced linear-attn weights and
     // routed-expert weights. Same role as in Qwen3_5Weights — these

@@ -44,27 +44,6 @@ bool fused_full_attn_qgkv_weights_enabled() {
 }
 
 
-// Materialise an owned fp32 copy of `t`, accepting either fp32 or bf16
-// on disk. Copies even when the source is already fp32 so the bound
-// pointer is owned by `Qwen3_5Weights::owned_fp32_buffers` (uniform
-// lifetime).
-DeviceBuffer<float> to_fp32(const DeviceTensor& t) {
-    std::size_t n = 1;
-    for (auto d : t.shape()) n *= static_cast<std::size_t>(d);
-    auto buf = DeviceBuffer<float>::alloc(n);
-    if (t.dtype() == DType::FP32) {
-        CUDA_CHECK(cudaMemcpy(buf.data(), t.data(),
-                              n * sizeof(float),
-                              cudaMemcpyDeviceToDevice));
-    } else if (t.dtype() == DType::BF16) {
-        kernels::launch_bf16_to_fp32(t.data(), buf.data(), n, /*stream=*/0);
-        CUDA_CHECK(cudaDeviceSynchronize());
-    } else {
-        throw std::runtime_error("qwen3_5: unsupported dtype for fp32 conversion");
-    }
-    return buf;
-}
-
 // Qwen3.5 (multimodal config) nests the text tower under
 // `model.language_model.`; the vision tower lives under `model.visual.`
 // and is unused on the text-only path.
@@ -152,13 +131,12 @@ Qwen3_5Weights bind_qwen3_5(LoadedModel& engine) {
             Lw.la_conv1d_w = &must(engine, la + "conv1d.weight");
             Lw.la_conv1d_b = maybe(engine, la + "conv1d.bias");
             Lw.la_dt_bias  = &must(engine, la + "dt_bias");
-            // Materialise fp32 copies of A_log + RMSNormGated.weight.
-            // HF ships these as fp32 on Qwen3.5-4B and bf16 on
-            // Qwen3.6-35B-A3B; the kernels read fp32 either way.
-            w.owned_fp32_buffers.push_back(to_fp32(must(engine, la + "A_log")));
-            Lw.la_A_log_fp32  = w.owned_fp32_buffers.back().data();
-            w.owned_fp32_buffers.push_back(to_fp32(must(engine, la + "norm.weight")));
-            Lw.la_norm_w_fp32 = w.owned_fp32_buffers.back().data();
+            // fp32 by contract (`gdn_fp32_parameters`), so these are the
+            // loaded bytes rather than a bind-time copy of them.
+            Lw.la_A_log_fp32 =
+                static_cast<const float*>(must(engine, la + "A_log").data());
+            Lw.la_norm_w_fp32 =
+                static_cast<const float*>(must(engine, la + "norm.weight").data());
             Lw.la_out_proj = &must(engine, la + "out_proj.weight");
             Lw.kv_layer = -1;
         } else if (kind == "full_attention") {
