@@ -156,33 +156,109 @@ pub enum RsError {
 /// below `u32::MAX`.
 pub const RS_TRANSLATION_UNMAPPED: u32 = u32::MAX;
 
+/// How many tokens the buffer holds — and whether the host knows that number
+/// or merely bounds it.
+///
+/// Buffered occupancy is counted in tokens actually WRITTEN, never as
+/// `buffer.len() * page`: reserving a page does not buffer a token, and
+/// classifying fires against the page-granular bound made every freshly
+/// allocated buffer look full and rejected the legal empty-buffer append.
+///
+/// The host loses the exact count when a fold commits whose LENGTH it never
+/// learned — the device computed it and only the driver ever saw the value.
+/// The fold absorbed somewhere between 1 and `n` tokens, so the live buffer is
+/// somewhere in `0..=n`. Retaining `n` is safe for MEMORY (no live page is
+/// dropped) but NOT for the READ PATH: a later fire that replayed the bound
+/// would replay tokens the fold already absorbed, which is a double fold and
+/// unrecoverable.
+///
+/// Both variants carry a `u32`, so this type buys no arithmetic. What it buys
+/// is that *reading* the number forces the caller to say which guarantee it
+/// needs: [`exact`](Self::exact) refuses when the answer is a bound,
+/// [`bound`](Self::bound) never refuses and is only correct where an
+/// over-count is safe. That distinction used to live in a sibling `bool` that
+/// every reader had to remember to consult.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Occupancy {
+    /// The buffer holds exactly this many tokens.
+    Exact(u32),
+    /// The buffer holds AT MOST this many; the true count is `1..=n`.
+    ///
+    /// Never zero — see [`Occupancy::at_most`].
+    AtMost(u32),
+}
+
+impl Occupancy {
+    const EMPTY: Self = Occupancy::Exact(0);
+
+    /// An upper bound of `n`, normalized.
+    ///
+    /// A bound of zero pins the true count at exactly zero, so `AtMost(0)` is
+    /// not a state the buffer can be in. Answering that here rather than at
+    /// each call site is most of the reason this is a type: the old code asked
+    /// "did this operation drive the bound to zero, and does that restore
+    /// exactness?" separately in `discard_buffered`, `free_buffer` and
+    /// `advance_fold`, and had to get it right three times.
+    fn at_most(n: u32) -> Self {
+        if n == 0 {
+            Occupancy::Exact(0)
+        } else {
+            Occupancy::AtMost(n)
+        }
+    }
+
+    /// The count when the host knows it, `None` when it only bounds it.
+    fn exact(self) -> Option<u32> {
+        match self {
+            Occupancy::Exact(n) => Some(n),
+            Occupancy::AtMost(_) => None,
+        }
+    }
+
+    /// The upper bound, which is always known.
+    ///
+    /// Correct only where an over-count is safe — capacity and allocation.
+    /// Anything that REPLAYS the buffer must go through [`exact`](Self::exact)
+    /// and take the refusal, because replaying an over-count double-folds.
+    fn bound(self) -> u32 {
+        match self {
+            Occupancy::Exact(n) | Occupancy::AtMost(n) => n,
+        }
+    }
+
+    /// Apply `f` to the count, preserving exactness.
+    ///
+    /// Arithmetic on a bound yields a bound: subtracting a known quantity from
+    /// an unknown one leaves it unknown. The exception is a result of zero,
+    /// which [`at_most`](Self::at_most) collapses back to exact.
+    fn map(self, f: impl FnOnce(u32) -> u32) -> Self {
+        match self {
+            Occupancy::Exact(n) => Occupancy::Exact(f(n)),
+            Occupancy::AtMost(n) => Occupancy::at_most(f(n)),
+        }
+    }
+
+    /// Downgrade to a bound: a fold committed whose length the host never
+    /// learned.
+    fn into_bound(self) -> Self {
+        Occupancy::at_most(self.bound())
+    }
+}
+
 struct RsEntry {
     geom: RsGeometry,
     /// Folded composite state; `None` until the first write/fold commits.
     folded: Option<RsSlotId>,
     /// Dense ordered buffered page slots. `None` = reserved, unmaterialized.
     buffer: Vec<Option<RsSlotId>>,
-    /// Buffered tokens actually WRITTEN, exactly — not `buffer.len() * page`.
-    /// Reserving a page does not buffer a token, so the page count is only an
-    /// upper bound; classifying fires against that bound made every freshly
-    /// allocated buffer look full and rejected the legal empty-buffer append.
-    buffer_fill: u32,
-    /// True once a fold committed whose LENGTH the host never learned — the
-    /// device computed it and only the driver ever saw the value.
+    /// Buffered tokens, and whether that count is exact — see [`Occupancy`].
     ///
-    /// `buffer_fill` then stops being exact and becomes an UPPER BOUND: the
-    /// fold absorbed somewhere between 1 and `buffer_fill` tokens, so the
-    /// live buffer is somewhere between 0 and `buffer_fill`. Retaining the
-    /// bound is safe for MEMORY (no live page is dropped) but NOT for the
-    /// READ PATH: a later fire that replayed the bound would replay tokens
-    /// the fold already absorbed, which is a double fold and unrecoverable.
-    ///
-    /// So the store refuses to state an exact occupancy while this is set,
-    /// and `free_buffer` — the guest's explicit "I am done with this window"
-    /// — is what restores exactness. That is not a limitation bolted on: it
-    /// is the shape `mtp-native-verify` already has (buffer a window, commit
-    /// the accepted prefix, free the buffer, open the next window).
-    buffer_fill_is_bound: bool,
+    /// `free_buffer` — the guest's explicit "I am done with this window" — is
+    /// what restores exactness once a device-resident fold has taken it away.
+    /// That is not a limitation bolted on: it is the shape `mtp-native-verify`
+    /// already has (buffer a window, commit the accepted prefix, free the
+    /// buffer, open the next window).
+    occupancy: Occupancy,
     /// Where logical buffer token 0 physically sits, in tokens from the start
     /// of page 0. Always `< buffer_page_tokens`.
     ///
@@ -244,8 +320,7 @@ impl RsStore {
             geom,
             folded: None,
             buffer: Vec::new(),
-            buffer_fill: 0,
-            buffer_fill_is_bound: false,
+            occupancy: Occupancy::EMPTY,
             buffer_head: 0,
         })
     }
@@ -253,14 +328,13 @@ impl RsStore {
     /// Fork: shares the folded slot and every materialized buffered slot by
     /// reference; the first write on a shared slot copies it.
     pub fn fork(&mut self, ws: RsWorkingSetId) -> Result<RsWorkingSetId, RsError> {
-        let (geom, folded, buffer, buffer_fill, buffer_fill_is_bound, buffer_head) = {
+        let (geom, folded, buffer, occupancy, buffer_head) = {
             let entry = self.entry(ws)?;
             (
                 entry.geom,
                 entry.folded,
                 entry.buffer.clone(),
-                entry.buffer_fill,
-                entry.buffer_fill_is_bound,
+                entry.occupancy,
                 entry.buffer_head,
             )
         };
@@ -274,8 +348,7 @@ impl RsStore {
             geom,
             folded,
             buffer,
-            buffer_fill,
-            buffer_fill_is_bound,
+            occupancy,
             buffer_head,
         }))
     }
@@ -332,27 +405,27 @@ impl RsStore {
         count: u32,
     ) -> Result<(), RsError> {
         let entry = self.entry_mut(ws)?;
-        if count > entry.buffer_fill {
+        if count > entry.occupancy.bound() {
             return Err(RsError::DiscardExceedsBuffer {
                 count,
-                buffered: entry.buffer_fill,
+                buffered: entry.occupancy.bound(),
             });
         }
         // Legal even while the boundary is device-resident. The uncertainty
         // there is how many tokens a fold absorbed off the FRONT; discarding
         // from the TAIL shifts the bound down by exactly `count` and leaves
         // it a bound. It does not RESTORE exactness — only the guest saying
-        // "I am done with this window" does that — so the flag survives.
-        entry.buffer_fill -= count;
+        // "I am done with this window" does that — except at zero, which
+        // `Occupancy::at_most` collapses because a bound of zero pins the
+        // true count.
+        entry.occupancy = entry.occupancy.map(|n| n - count);
         // Nothing survives to hold in place, so the head may rebase and the
         // next append starts at physical 0 -- the same reasoning
         // `advance_fold` uses when a fold absorbs the whole buffer. Without
         // it the head creeps forward across windows and the reservation
-        // grows to match. A bound of zero also pins the live buffer at
-        // exactly zero, which is what `buffer_fill_is_bound` was waiting for.
-        if entry.buffer_fill == 0 {
+        // grows to match.
+        if entry.occupancy.bound() == 0 {
             entry.buffer_head = 0;
-            entry.buffer_fill_is_bound = false;
         }
         Ok(())
     }
@@ -403,16 +476,14 @@ impl RsStore {
             }
             // Discarding pages is the guest saying which tokens it no longer
             // needs, which is exactly the statement an indeterminate boundary
-            // was missing. Freeing everything empties the buffer outright, so
-            // the occupancy is exactly 0 and exact again.
-            if entry.buffer.is_empty() {
-                entry.buffer_fill = 0;
-                entry.buffer_fill_is_bound = false;
-            }
+            // was missing. Freeing everything leaves zero surviving capacity,
+            // so the clamp below drives the count to zero and
+            // `Occupancy::at_most` makes it exact again — the guest's "I am
+            // done with this window" settling the boundary.
             let capacity = (entry.buffer.len() as u32)
                 .saturating_mul(entry.geom.buffer_page_tokens.max(1))
                 .saturating_sub(entry.buffer_head);
-            entry.buffer_fill = entry.buffer_fill.min(capacity);
+            entry.occupancy = entry.occupancy.map(|n| n.min(capacity));
         }
         for id in dropped {
             self.decref(id, epoch);
@@ -478,7 +549,7 @@ impl RsStore {
     /// two-page buffer holding three live tokens would happily accept a fold
     /// of six and gather three slab tokens that were never written, which is
     /// silent corruption of the recurrent state rather than a visible
-    /// failure. The live extent is `buffer_fill` for a REPLAY (a commit
+    /// failure. The live extent is the buffer's occupancy for a REPLAY (a commit
     /// gathers only what is already buffered) and `start + len` for a WRITE
     /// (the fire's own new tokens are part of the extended space it folds
     /// through). Capacity is still checked, because the gather is physical.
@@ -506,14 +577,14 @@ impl RsStore {
         if tokens > capacity {
             return Err(RsError::FoldExceedsBuffer { tokens, capacity });
         }
-        // `buffer_fill` may be an UPPER BOUND (a device-resident fold length
+        // Occupancy may be only an UPPER BOUND (a device-resident fold length
         // was never read back). Bounding against it is then permissive but
         // still sound -- it can only admit a fold the exact fill would too.
         let live = match (intent, buffer_tokens) {
             (RsBufferIntent::Write, Some((start, len))) => {
-                entry.buffer_fill.max(start.saturating_add(len))
+                entry.occupancy.bound().max(start.saturating_add(len))
             }
-            _ => entry.buffer_fill,
+            _ => entry.occupancy.bound(),
         };
         if tokens > live {
             return Err(RsError::FoldExceedsBuffer {
@@ -826,11 +897,11 @@ impl RsStore {
                 // leave the host thinking tokens are live that the fold has
                 // already absorbed, and the next fire would replay them — a
                 // double fold. Neither is recoverable, so the boundary simply
-                // stops being a host-side number: retain every page, keep
-                // `buffer_fill` as the bound it now is, and refuse to state an
-                // exact occupancy until `free_buffer` settles it.
+                // stops being a host-side number: retain every page, downgrade
+                // the occupancy to the bound it now is, and refuse to state an
+                // exact count until `free_buffer` settles it.
                 if let Ok(entry) = self.entry_mut(ws) {
-                    entry.buffer_fill_is_bound = true;
+                    entry.occupancy = entry.occupancy.into_bound();
                 }
             } else {
                 self.advance_fold(ws, tokens, epoch);
@@ -887,7 +958,7 @@ impl RsStore {
         // behind, not the one it found.
         if let Some((start, len, RsBufferIntent::Write)) = prepared.buffer_span {
             let entry = self.entry_mut(ws).expect("batch prevalidated");
-            entry.buffer_fill = entry.buffer_fill.max(start.saturating_add(len));
+            entry.occupancy = entry.occupancy.map(|n| n.max(start.saturating_add(len)));
         }
 
         if let Some(tokens) = prepared
@@ -949,17 +1020,17 @@ impl RsStore {
         let head = entry.buffer_head.saturating_add(tokens);
         let drop = ((head / page) as usize).min(entry.buffer.len());
         entry.buffer_head = head - (drop as u32) * page;
-        entry.buffer_fill = entry.buffer_fill.saturating_sub(tokens);
+        entry.occupancy = entry.occupancy.map(|n| n.saturating_sub(tokens));
         // A fold that absorbed the whole buffer leaves no survivor to hold in
         // place, so the head can rebase and the next append starts at 0.
-        if entry.buffer_fill == 0 {
+        if entry.occupancy.bound() == 0 {
             entry.buffer_head = 0;
         }
         let dropped: Vec<RsSlotId> = entry.buffer.drain(..drop).flatten().collect();
         let capacity = (entry.buffer.len() as u32)
             .saturating_mul(page)
             .saturating_sub(entry.buffer_head);
-        entry.buffer_fill = entry.buffer_fill.min(capacity);
+        entry.occupancy = entry.occupancy.map(|n| n.min(capacity));
         for id in dropped {
             self.decref(id, epoch);
         }
@@ -987,12 +1058,12 @@ impl RsStore {
     /// one.
     pub fn buffer_tokens(&self, ws: RsWorkingSetId) -> Result<u32, RsError> {
         let entry = self.entry(ws)?;
-        if entry.buffer_fill_is_bound {
-            return Err(RsError::BufferOccupancyIndeterminate {
-                bound: entry.buffer_fill,
-            });
-        }
-        Ok(entry.buffer_fill)
+        entry
+            .occupancy
+            .exact()
+            .ok_or(RsError::BufferOccupancyIndeterminate {
+                bound: entry.occupancy.bound(),
+            })
     }
 
     /// The upper bound on buffered tokens, which is always known. Use this
@@ -1000,12 +1071,14 @@ impl RsStore {
     /// that REPLAYS the buffer must go through `buffer_tokens` and take the
     /// refusal, because replaying an over-count double-folds.
     pub fn buffer_tokens_bound(&self, ws: RsWorkingSetId) -> Result<u32, RsError> {
-        Ok(self.entry(ws)?.buffer_fill)
+        Ok(self.entry(ws)?.occupancy.bound())
     }
 
     /// Whether this working set's folded boundary is known exactly.
     pub fn buffer_tokens_exact(&self, ws: RsWorkingSetId) -> bool {
-        self.entry(ws).map(|e| !e.buffer_fill_is_bound).unwrap_or(true)
+        self.entry(ws)
+            .map(|e| e.occupancy.exact().is_some())
+            .unwrap_or(true)
     }
 
     /// Physical offset of logical buffer token 0 within page 0. The driver

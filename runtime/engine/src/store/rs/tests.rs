@@ -860,8 +860,50 @@ fn freeing_the_buffer_restores_an_exact_occupancy_after_a_device_fold() {
     assert_eq!(s.buffer_tokens(ws).unwrap(), 0);
 }
 
-/// A fork shares the buffer, so it inherits the indeterminacy too — otherwise
-/// the child would read a stale exact occupancy and plan a second fold over
+/// A bound of zero is not a bound: it pins the true occupancy at exactly zero,
+/// because the live buffer is somewhere in `0..=n` and `n` is zero.
+///
+/// `Occupancy::at_most` collapses that case at construction, so `AtMost(0)` is
+/// unrepresentable. This is the invariant the type exists to hold: the old
+/// pair of fields could spell it, and three separate call sites had to
+/// remember to normalize it away by hand. Discarding the whole bound from the
+/// TAIL is the path that reaches zero without the guest ever freeing a page,
+/// so it is the one that would regress silently.
+#[test]
+fn a_bound_driven_to_zero_is_exact_again() {
+    let mut s = store();
+    let ws = s.create_working_set(geom());
+    s.alloc_buffer(ws, 2).unwrap();
+    let prepared = s.prepare_write(ws, false, Some((0, 8))).unwrap();
+    settled(&mut s, prepared);
+
+    let mut prepared = s.prepare_fold(ws, 8).unwrap();
+    prepared.mark_fold_len_device();
+    settled(&mut s, prepared);
+    assert!(!s.buffer_tokens_exact(ws), "the device fold suspended it");
+
+    // Discarding fewer than the bound leaves it a bound: the uncertainty is
+    // how much the fold took off the FRONT, and this takes from the TAIL.
+    s.discard_buffered(ws, 3).unwrap();
+    assert!(!s.buffer_tokens_exact(ws));
+    assert_eq!(s.buffer_tokens_bound(ws).unwrap(), 5);
+
+    // Discarding the rest drives the bound to zero, which leaves nothing for
+    // the fold to have absorbed that is not already accounted for.
+    s.discard_buffered(ws, 5).unwrap();
+    assert!(
+        s.buffer_tokens_exact(ws),
+        "a bound of zero pins the count, so exactness returns without free_buffer"
+    );
+    assert_eq!(s.buffer_tokens(ws).unwrap(), 0);
+    assert_eq!(
+        s.buffer_size(ws).unwrap(),
+        2,
+        "capacity is untouched: this released TOKENS, not pages"
+    );
+}
+
+/// A fork shares the buffer, so it inherits the indeterminacy too — otherwise/// the child would read a stale exact occupancy and plan a second fold over
 /// tokens the parent's device fold may already have absorbed.
 #[test]
 fn a_fork_inherits_an_indeterminate_buffer() {

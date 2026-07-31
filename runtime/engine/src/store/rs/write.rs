@@ -88,7 +88,7 @@ pub struct RsPreparedWrite {
     /// device computed it and only the driver resolved it. The state target
     /// still carries a `fold_tokens`, but it is an upper bound, so publishing
     /// it must not advance the boundary by that much or retire pages against
-    /// it — see `RsEntry::buffer_fill_is_bound`.
+    /// it — see `store::rs::Occupancy`.
     pub(crate) fold_len_is_bound: bool,
 }
 

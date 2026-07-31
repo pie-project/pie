@@ -1213,7 +1213,7 @@ impl ProcessCtx {
     /// error: it means a stage computes the fold length ON DEVICE, and the
     /// value reaches the driver through the `rs_fold_len` descriptor port
     /// instead of through this host. The host then keeps only an UPPER BOUND
-    /// on the folded boundary — see `RsEntry::buffer_fill_is_bound` — which is
+    /// on the folded boundary — see `store::rs::Occupancy` — which is
     /// the whole point of making the field a channel
     /// (`.wiki/designs/linear-state-programming-model.md` §4.2): a speculative
     /// decode's accepted count never round-trips through the host between the

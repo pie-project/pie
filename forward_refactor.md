@@ -783,13 +783,15 @@ a live defect — each site reasons correctly today — but each is a place the 
 change is likely to get wrong. Recorded so the reasoning does not have to be
 rediscovered.
 
-- **`buffer_fill` means two different things.** `store/rs.rs:169` is a `u32`
-  whose meaning — exact occupancy, or an UPPER BOUND on it — is decided by the
-  sibling `buffer_fill_is_bound: bool` at `:185`. Every reader has to remember
-  to consult the flag, and the diff carries roughly twenty "UPPER BOUND"
-  comments holding that discipline together. This is the one worth fixing:
-  promote it to `enum Occupancy { Exact(u32), AtMost(u32) }` and the reminders
-  become a type. Cheapest real follow-up to come out of this work.
+- ~~**`buffer_fill` means two different things.**~~ FIXED. It was a `u32` whose
+  meaning — exact occupancy, or an UPPER BOUND on it — was decided by a sibling
+  `buffer_fill_is_bound: bool`, with ~20 "UPPER BOUND" comments holding the
+  discipline together. Now `enum Occupancy { Exact(u32), AtMost(u32) }`:
+  `exact()` returns `Option` and refuses on a bound, `bound()` never refuses,
+  and `map()` propagates exactness through arithmetic. The real win is that
+  `at_most()` normalizes zero, making `AtMost(0)` unrepresentable — a bound of
+  zero pins the true count, which the old code had to remember separately in
+  three places. Pinned by `a_bound_driven_to_zero_is_exact_again`.
 - **`free_buffer` clamps rather than computes.** `store/rs.rs:415` does
   `buffer_fill = buffer_fill.min(capacity)`, and its own comment concedes it is
   "still exact for the cases that matter … and never an under-count". Safe
