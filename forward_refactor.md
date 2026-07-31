@@ -651,7 +651,7 @@ Python and JavaScript bindings follow their existing per-interface layouts
 | Adding `on-recurrent` needs a `PTIR_VERSION` bump | Additive method; `forward`'s ABI is unmoved |
 | H2O / Quest / TOVA silently wrong on GDN | Blocked at the `attention::prelude` import |
 | SDK hand-rolls a `required[]` port pre-check | Deleted; the host's `validate_descriptor_bindings` is the only enforcement point (`TraceContainer.ports` is retained — §1.2 note 5) |
-| One pass hash ⇒ compile-cache miss on any change | Sorted `(stage, hash)` pairs ⇒ per-stage caching **(deferred, §7 step D)** |
+| One pass hash ⇒ compile-cache miss on any change | Already per-stage: `StageSignature` keys the driver module cache **(§10.5 — step D withdrawn)** |
 
 ---
 
@@ -702,7 +702,12 @@ commit.
 
 Follow the existing per-interface layouts.
 
-### D — per-stage PTIR containers  *(separate PR, not a dependency)*
+### D — per-stage PTIR containers  *(WITHDRAWN — see §10.5)*
+
+> Superseded. The compile caching this step exists to enable was already
+> delivered by `StageSignature` and the driver's per-stage module cache. The
+> analysis below is kept because it is what led to measuring; the verdict is in
+> §10.5.
 
 Split `TraceContainer.stages` into one container per stage and change pass
 identity to the hash over sorted `(stage-tag, stage-hash)` pairs, enabling
@@ -1820,11 +1825,62 @@ otherwise build dependencies. The release-time freshness checks above cover the
 harm; the drift itself can still happen between releases.
 
 
-### 10.5 D — per-stage PTIR containers  *(separate PR)*
+### 10.5 D — per-stage PTIR containers — WITHDRAWN
 
-Unchanged from §7 / §9.1. D4(a) hooks-as-methods and D4(b) per-stage containers
-must land together; (a) alone would force the host to reassemble and
-canonicalize containers, which is the thing D4 exists to avoid.
+D exists for exactly one stated benefit: per-stage compile caching. **That
+benefit already exists**, one layer down, and was already delivered before D was
+written. Splitting the container buys nothing that is not already bought.
+
+`compile_stage_at` (`compiler/plan/src/compile/mod.rs:159`) already computes a
+`StageSignature` (`compile/signature.rs`) — canonical bytes over the localized,
+normalized stage with runtime extents left symbolic, versioned by
+`COMPILER_VERSION`. That hash is "the plan cache key and the emitted kernel's
+entry-point name", and the CUDA driver uses it as exactly that: `stages_` in
+`driver/cuda/src/pipeline/generated/module_cache.hpp:238` is a per-stage map
+keyed on `stage_key()`, which folds in `signature_hash` plus the device and
+NVRTC versions, with an identity-collision guard, `memory_hits`/`disk_hits`
+counters, and a disk cache keyed on the generating source. An unchanged stage
+already skips NVRTC across *different* containers, and across *process
+restarts*. Metal does the same via `m1_runtime.cpp:1063`.
+
+So the expensive half of compilation — NVRTC/Metal module build, 10^5–10^6 us —
+is already per-stage cached. What a wire split would additionally save is only
+the host-side Rust `compile_bound` + `emit_program` on a `Registry` miss.
+Measured over `compiler/tests/driver-corpus/` (release build, 100 iterations
+each):
+
+| container | stages | compile | emit |
+|---|---|---|---|
+| `staged_dispatch` | 4 | 36 us | 209 us |
+| `beam_epilogue` | 1 | 97 us | 152 us |
+| `structured_masks` | 1 | 32 us | 20 us |
+| `greedy_argmax` | 1 | 5 us | 8 us |
+
+Worst case ~245 us, once per distinct container per process — a `Registry` hit
+costs nothing, and a decode loop resubmits one container, so steady state never
+pays it at all.
+
+The price of collecting that 245 us is the whole reason D was fenced off as the
+only unit with wire risk: a container format change, an identity-hash change
+that invalidates every key in the program LRU
+(`runtime/engine/src/pipeline/program.rs:203`), and relocating the cross-stage
+validations — SPSC direction (T2), sink stage precedence (T11) — out of bind and
+into first `submit()`, which is where whole-pass validation gets *weaker*, not
+just moved.
+
+Microseconds of one-time host CPU is not worth a wire break plus a validation
+regression. D is withdrawn, not deferred. D4(a) hooks-as-methods goes with it:
+§9.1 established that (a) and (b) ship together or not at all, and the surface
+D4(a) would replace — `program(container-bytes, channels)` with host-side
+validation of the container's stage set against the submitting interface — is
+already correct and already enforced.
+
+**If this is ever reopened**, the trigger is not container size; it is a guest
+that ships many *near-identical* containers per second, which nothing in the SDK
+does today (`ptir.rs:940` accumulates every stage and emits one `program()` call
+lazily at first submit). Even then, the cheap fix is a host-side per-stage plan
+cache keyed on the `StageSignature` that already exists — no wire change, no
+hash change, no validation move — not a container split.
 
 ### 10.6 Loose ends
 

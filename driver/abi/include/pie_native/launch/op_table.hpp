@@ -3,15 +3,16 @@
 // The op table — the driver-side view of the closed first-party op set
 // (CUDA-free; consumed by both the CUDA and Metal drivers).
 //
-// SOURCE OF TRUTH: echo's generated `ptir_abi.h` (from pie-sampling-ir
-// `src/ptir/{op,registry}.rs`) — op tag bytes come from its `PTIR_OP_*`
-// constants, NOT hand-copied (echo P0.1 rule: "include the header, don't
-// hand-copy ids"). Container byte layout: `interface/sampling-ir/PTIR-CONTAINER.md`.
-// The header is currently vendored beside this file; once it lands on dev under
-// `interface/sampling-ir/include/`, swap the include to that path (byte-identical,
-// so it is a no-op sync).
+// SOURCE OF TRUTH: the generated `compiler/codegen/include/ptir_abi.h` (from
+// `compiler/ir/src/{op,registry}.rs`; regenerate with
+// `PTIR_REGEN=1 cargo test -p pie-compiler-tests --test ptir_header`) — op tag
+// bytes come from its `PTIR_OP_*` constants, NOT hand-copied ("include the
+// header, don't hand-copy ids"). Container byte layout is defined by the
+// encoder in `compiler/ir/src/container.rs`; there is no prose spec, and no
+// C++ container reader — the driver consumes the LOWERED `PieLaunchPort` /
+// op-table form, not the container.
 //
-// This header adds the driver-side metadata echo's table does not carry:
+// This header adds the driver-side metadata the generated table does not carry:
 // per-op arity and result count, which `op_result_count` and the Rust-side
 // `op_table_drift` test read. It once also carried OpFamily / LaunchClass /
 // ResultKind taxonomies, described as driving launch-shape selection and
@@ -19,8 +20,8 @@
 // consults cannot be wrong loudly, so they were removed rather than kept as a
 // claim about the driver that the driver does not make. Composite ops (softmax,
 // gumbel, …) are NOT container ops — the container carries their core-op
-// expansion (echo's `expand.rs`); we keep them as tier-1 fused-kernel forms at
-// private tags 0xE0+.
+// expansion (the compiler's `expand.rs`); we keep them as tier-1 fused-kernel
+// forms at private tags 0xE0+.
 
 #include <cstdint>
 #include <string_view>
@@ -46,7 +47,7 @@ inline constexpr std::uint32_t dtype_size(DType d) {
 inline constexpr bool dtype_is_float(DType d) { return d == DType::F32 || d == DType::Act; }
 inline constexpr bool dtype_is_int(DType d) { return d == DType::I32 || d == DType::U32; }
 
-// Op codes. Container ops take their byte from echo's ptir_abi.h constants;
+// Op codes. Container ops take their byte from ptir_abi.h constants;
 enum class OpCode : std::uint8_t {
     // map / element-wise
     Exp = PTIR_OP_EXP, Log = PTIR_OP_LOG, Neg = PTIR_OP_NEG, Recip = PTIR_OP_RECIP,
