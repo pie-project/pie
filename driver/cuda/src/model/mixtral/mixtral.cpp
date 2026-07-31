@@ -1,5 +1,4 @@
 #include <cstring>
-#include <iostream>
 #include "model/mixtral/mixtral.hpp"
 #include "model/stage_hooks.hpp"
 
@@ -9,7 +8,6 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
-#include <chrono>
 
 #include <cuda_runtime.h>
 
@@ -294,21 +292,6 @@ void mixtral_forward_paged(
         DeviceBuffer<std::uint16_t>::alloc(gemv_routes * I);
     auto d_mxfp4_route_out =
         DeviceBuffer<std::uint16_t>::alloc(gemv_routes * H);
-    // Where the streamed path's per-layer host time actually goes. The sync is
-    // split out from the bookkeeping because they mean opposite things: time
-    // in the synchronize is the host waiting for a GPU that is still busy,
-    // which costs nothing on its own, while time after it is the GPU going
-    // idle behind a host that is not issuing.
-    const bool phase_probe = loader_config::env_truthy("PIE_CUDA_STREAM_PHASES");
-    std::uint64_t ph_sync = 0, ph_pagein = 0, ph_upload = 0;
-    std::uint64_t ph_d2h = 0, ph_block = 0;
-    const auto now_ns = [] {
-        return static_cast<std::uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count());
-    };
-    const std::uint64_t ph_t0 = phase_probe ? now_ns() : 0;
-
     auto d_mxfp4_moe_out = DeviceBuffer<std::uint16_t>::alloc(
         use_mxfp4_decode_gemv ? static_cast<std::size_t>(N) * H : 0);
     for (int L = 0; L < cfg.num_hidden_layers; ++L) {
@@ -482,7 +465,6 @@ void mixtral_forward_paged(
         // routed set falls back to the per-expert loop rather than deadlock
         // against its own pins.
         bool streamed_fused = false;
-        const std::uint64_t t_blk0 = phase_probe ? now_ns() : 0;
         // Whether the fused decode kernels can run at all: they index the
         // experts through a device-side pointer array, so a layer that has no
         // such array, or is not on the decode path, has nothing to fuse.
@@ -554,14 +536,10 @@ void mixtral_forward_paged(
                 streamed_fused = true;
             } else {
                 std::vector<std::int32_t> idx_h(static_cast<std::size_t>(N) * top_k);
-                const std::uint64_t t_d2h0 = phase_probe ? now_ns() : 0;
                 CUDA_CHECK(cudaMemcpyAsync(idx_h.data(), d_topk_idx.data(),
                                            idx_h.size() * sizeof(std::int32_t),
                                            cudaMemcpyDeviceToHost, stream));
-                if (phase_probe) ph_d2h += now_ns() - t_d2h0;
-                const std::uint64_t t_sync0 = phase_probe ? now_ns() : 0;
                 CUDA_CHECK(cudaStreamSynchronize(stream));
-                if (phase_probe) ph_sync += now_ns() - t_sync0;
                 std::vector<int> routed;
                 std::vector<char> seen(static_cast<std::size_t>(num_experts), 0);
                 for (const std::int32_t e : idx_h) {
@@ -571,7 +549,6 @@ void mixtral_forward_paged(
                     }
                 }
                 if (routed.size() <= layer.expert_cache->num_slots()) {
-                    const std::uint64_t t_pg0 = phase_probe ? now_ns() : 0;
                     for (const int e : routed) {
                         layer.expert_cache->prefetch(layer.expert_group,
                                                      static_cast<std::uint32_t>(e));
@@ -581,19 +558,15 @@ void mixtral_forward_paged(
                             layer.expert_group, static_cast<std::uint32_t>(e),
                             stream));
                     }
-                    if (phase_probe) ph_pagein += now_ns() - t_pg0;
                     // Pageable source, so the driver stages it before
                     // returning and `ptrs` may die at the end of this block;
                     // the DMA that follows is ordered on `stream` ahead of the
                     // kernels.
-                    const std::uint64_t t_up0 = phase_probe ? now_ns() : 0;
                     upload_ptrs();
-                    if (phase_probe) ph_upload += now_ns() - t_up0;
                     streamed_fused = true;
                 }
             }
         }
-        if (phase_probe && layer.expert_cache != nullptr) ph_block += now_ns() - t_blk0;
         if ((layer.expert_cache == nullptr || streamed_fused) &&
             use_mxfp4_decode_gemv &&
             !layer.expert_gate_up_packed_ptrs.empty()) {
@@ -873,23 +846,6 @@ void mixtral_forward_paged(
             kernels::launch_residual_add_bf16(
                 ws.y.data(), ws.norm_x.data(), N * H, stream);
         }
-    }
-
-    if (phase_probe) {
-        // Issue time is how long the host took to walk the loop; total adds
-        // the wait for the device to finish what the loop queued. Their
-        // difference is the only honest way to say whether the streamed path
-        // is slow because the host is not issuing or because the GPU is busy.
-        const std::uint64_t t_issue = now_ns() - ph_t0;
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-        const std::uint64_t t_total = now_ns() - ph_t0;
-        std::cerr << "[pie-driver-cuda] MoE forward N=" << N << " issue "
-                  << (t_issue / 1e6) << " ms, total " << (t_total / 1e6)
-                  << " ms | streamed host: sync " << (ph_sync / 1e6)
-                  << " ms, page-in+ptrs " << (ph_pagein / 1e6)
-                  << " ms, upload " << (ph_upload / 1e6) << " ms, d2h "
-                  << (ph_d2h / 1e6) << " ms, whole block " << (ph_block / 1e6)
-                  << " ms\n";
     }
 
     if (!fwd_cfg.emit_logits) {
