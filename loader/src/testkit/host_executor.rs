@@ -61,6 +61,16 @@ enum Root {
 /// rediscovered the checkpoint by scanning a directory could disagree with the
 /// plan about which file id means which file, and every offset in the plan is
 /// expressed against that table.
+/// What a freshly allocated buffer holds before anything writes to it.
+///
+/// Not zero, and deliberately: `cudaMalloc` does not zero, so an executor that
+/// handed out zeroed memory would silently satisfy any tensor with a region no
+/// source covers -- which is exactly the region [`StorageInstr::Fill`] exists
+/// to cover. With zeroed allocation a missing fill and a working one produce
+/// identical bytes, so no test could tell them apart; this makes the
+/// difference visible.
+const POISON: u8 = 0xAB;
+
 pub fn execute_plan(plan: &LoadPlan, snapshot_dir: &Path) -> Result<HostStorage, Error> {
     if plan.target.tile_map_mask & !HOST_TILE_MAP_MASK != 0 {
         return Err(invalid(
@@ -86,7 +96,7 @@ pub fn execute_plan(plan: &LoadPlan, snapshot_dir: &Path) -> Result<HostStorage,
         plan,
         index: PlanIndex::new(plan),
         files,
-        arena: vec![0; arena_len],
+        arena: vec![POISON; arena_len],
         buffers: HashMap::new(),
         tensors: HashMap::new(),
         max_tile_write_bytes: 0,
@@ -170,7 +180,7 @@ impl HostExecutor<'_> {
             }
             BufferLoc::Arena { offset, len }
         } else {
-            BufferLoc::Owned(vec![0; len])
+            BufferLoc::Owned(vec![POISON; len])
         };
         if self.buffers.insert(id, loc).is_some() {
             return Err(invalid(format!("buffer {} was allocated twice", id.0)));
