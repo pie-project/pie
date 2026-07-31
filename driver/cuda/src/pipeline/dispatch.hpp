@@ -225,9 +225,12 @@ class Dispatch {
         const pie_native::LaunchView& resolved_view,
         std::span<const std::uint32_t> program_token_starts);
 
-    // ── Hook-graph replay (stage 6 increment 4) ─────────────────────────
-    // Fire-level prepare pass for a hook fire the batch engine wants to run
-    // via CUDA-graph replay. Hoists EVERY attention-phase prepare — binding
+    // ── Hook prepared mode (stage 6 increment 4 + eager unification) ────
+    // Fire-level prepare pass for a hook fire. Since the eager-path
+    // unification the batch engine runs it for EVERY pure-decode hook fire
+    // — eager and graph alike — so both modes drive the attention phases
+    // through one prepare-then-launch seam; graph mode adds capture/replay
+    // on top. Hoists EVERY attention-phase prepare — binding
     // assembly, grouping, `prepare_generated_stage` (stable per-occurrence
     // buffers), channel-effect application, score-sideband sizing — out of
     // the body, in the exact (layer-major, OnAttnProj-then-OnAttn) order the
@@ -241,9 +244,9 @@ class Dispatch {
     // addresses, region launch geometry). The batch engine stores it per
     // graph key and recaptures when it changes — that is the generation /
     // growth / instance-churn invalidation in one value. Returns 0 — with NO
-    // side effects on the launch — when this fire cannot replay (a stage
-    // reads Query, writes a page mask, needs per-fire device allocations, …)
-    // and must take the eager body.
+    // side effects on the launch — when this fire cannot run prepared (a
+    // stage reads Query, needs per-fire device allocations, a non-decode
+    // fire, …) and must take the legacy interleaved eager body.
     struct HookReplayPrepare {
         const model::AttentionObservation* observation = nullptr;
         model::HookSidebandArena* arena = nullptr;
@@ -257,11 +260,12 @@ class Dispatch {
         StagedLaunch& launch,
         const HookReplayPrepare& in);
 
-    // Post-capture structural check: every prepared attention invocation
-    // was consumed by the recorded body. Run by the batch engine right
-    // after a hook-graph capture — the one moment the model's per-layer
-    // hook coverage is observable — and never after a replay (a replayed
-    // body does not touch the cursors). Throws on partial consumption.
+    // Structural check: every prepared attention invocation was consumed by
+    // the body that just ran. Run by the batch engine right after a
+    // hook-graph capture AND after every prepared-eager body — the moments
+    // the model's per-layer hook coverage is observable — and never after a
+    // replay (a replayed body does not touch the cursors). Throws on
+    // partial consumption.
     void verify_hook_capture_consumed(StagedLaunch& launch) const;
 
     // `sideband` carries what the model body published for exactly this hook

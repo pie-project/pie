@@ -1483,10 +1483,12 @@ struct StagedLane {
     std::uint32_t row_valid_offset = 0;
 };
 
-// ── Hook-graph prepared mode (stage 6 increment 4) ──────────────────────────
+// ── Hook prepared mode (stage 6 increment 4 + eager unification) ────────────
 // One fire's hoisted attention-phase work, in body order. Filled by
-// `Dispatch::prepare_attention_phases`, consumed by the prepared-mode branch
-// of `execute_attention_phase` — exactly once per invocation, cursor-checked.
+// `Dispatch::prepare_attention_phases` — run by the batch engine for EVERY
+// pure-decode hook fire, eager and graph alike — consumed by the
+// prepared-mode branch of `execute_attention_phase` — exactly once per
+// invocation, cursor-checked.
 
 // A body-side gather that materializes one lane's padded `[kv_max]` AttnScore
 // row from the layer's folded capture. Replaces the eager path's host-sized
@@ -4716,17 +4718,19 @@ void execute_declared_phase(
             }
             GroupedLaunchResult result;
             if (attention_phase) {
-                // Stage 6 increment 1 (stage6-plan.md): the attention-phase
-                // hook path runs through the prepare/body seam with stable
-                // per-stage buffers. `prepare_generated_stage` does every
-                // piece of host work (metadata build, channel-cursor reads,
-                // elision analysis, side-table uploads, pack + upload) and
+                // Attention phases through the prepare/body seam with stable
+                // per-stage buffers (stage 6 increment 1), interleaved at
+                // hook time. Since the eager unification this branch runs
+                // only for fires the fire-level prepare pass VETOED (see
+                // `execute_attention_phase`'s fallback comment) — prepared
+                // pure-decode hook fires consume the fire-level cursor
+                // instead and never come through here. Same seam either way:
+                // `prepare_generated_stage` does every piece of host work
+                // (metadata build, channel-cursor reads, elision analysis,
+                // side-table uploads, pack + upload) and
                 // `launch_generated_stage` is a host-work-free body reading
                 // only prepared state — no rotating rings and no
-                // cudaEventSynchronize on this path. Called back-to-back at
-                // the same stream position the combined call occupied, so
-                // behavior and stream ordering are identical this slice; the
-                // seam is what a later slice captures and replays across.
+                // cudaEventSynchronize on this path.
                 const auto prepared = generated::prepare_generated_stage(
                     group.bindings,
                     *first.executable,
@@ -4736,11 +4740,12 @@ void execute_declared_phase(
                     generated::PreparedBufferMode::kStablePerStage);
                 result = generated::launch_generated_stage(*prepared);
             } else {
-                // TODO(stage6-plan.md increment 1): migrate Prologue and
-                // Epilogue onto the prepared kStablePerStage path too and
-                // retire the rotating rings entirely. They keep the combined
-                // ring-backed call this slice.
-                result = generated::run_generated_stage(
+                // Prologue / Epilogue: the ring-backed combined wrapper,
+                // deliberately untouched by the eager unification.
+                // TODO(stage6-plan.md increment 1): migrate them onto the
+                // prepared kStablePerStage path too and retire the rotating
+                // rings entirely.
+                result = generated::run_generated_stage_ring(
                     group.bindings,
                     *first.executable,
                     launch.owner->generated_runtime,
@@ -5438,6 +5443,16 @@ std::uint64_t Dispatch::prepare_attention_phases(
         return veto("no attention hook coverage");
     }
     const model::AttentionObservation& obs = *in.observation;
+    if (obs.total_tokens != obs.num_requests) {
+        // Decode-only by contract (the caller gates on `is_pure_decode` too;
+        // this is the seam's own restatement): the sideband planners below
+        // are decode-shaped — `prepare_decode_score_capture` sizes one query
+        // row per request, while a prefill fire's body publishes the PREFILL
+        // score capture, whose window-row carve lands the folded row at a
+        // different arena address than the plan would bake. Non-decode hook
+        // fires run the legacy interleaved eager body.
+        return veto("non-decode fire");
+    }
 
     constexpr std::uint8_t kPhases[2] = {
         PTIR_STAGE_ON_ATTN_PROJ, PTIR_STAGE_ON_ATTN};
@@ -6009,9 +6024,11 @@ void Dispatch::execute_attention_phase(
     }
     StagedLaunch::State& state = *launch.state_;
     if (state.hook_graph_prepared) {
-        // Hook-graph prepared mode (stage 6 increment 4): the fire-level
-        // pass already did every piece of host work for this invocation, in
-        // this exact order. What remains — and what a capturing stream
+        // Prepared mode — THE path for pure-decode hook fires, eager and
+        // graph alike (stage 6 increment 4; eager unification in
+        // `run_forward_dispatch`): the fire-level pass already did every
+        // piece of host work for this invocation, in this exact order. What
+        // remains — what an eager body executes and what a capturing stream
         // records — is launches against prepared state, on the stream the
         // model body handed the hook (the capture stream, under capture).
         // Retrieval is exact-order by construction: a cursor per phase,
@@ -6082,6 +6099,15 @@ void Dispatch::execute_attention_phase(
         }
         return;
     }
+    // Legacy interleaved fallback: reached only when the fire-level prepare
+    // pass VETOED this fire (`prepare_attention_phases` returned 0 — Query
+    // readers like quest, lora/envelope_dot, scalable nucleus, non-decode
+    // fires, off-boundary lanes) or when the frame never wired the seam.
+    // Prepared pure-decode hook fires — eager or graph — never reach this
+    // branch. It cannot be deleted while those veto classes exist: a
+    // Query-reading stage is unhoistable by construction (the Query tensor
+    // is produced by THIS layer's kernels, mid-body, and the bf16→f32 cast
+    // below allocates per fire).
     bool needs_query = false;
     for (const auto& lane : state.lanes) {
         for (const plan::StagePlan* stage :

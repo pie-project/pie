@@ -1156,7 +1156,8 @@ generated_compact_argmax_value(
 // ---------------------------------------------------------------------------
 // The prepare/body split (stage6-plan.md increment 1).
 //
-// `run_generated_stage` used to be one eager monolith: per fire it rebuilt
+// `run_generated_stage` (today the Prologue/Epilogue-only
+// `run_generated_stage_ring`) used to be one eager monolith: per fire it rebuilt
 // the host metadata block, leased rotating pinned/device ring slots (with
 // event waits on slot reuse), uploaded, and launched — the same defect the
 // attention planner had before it was hoisted (batch/forward_graph.hpp:14-24:
@@ -1165,10 +1166,12 @@ generated_compact_argmax_value(
 // elision analysis, channel-cursor reads, staging pack, async upload,
 // per-region launch-shape resolution and side-table uploads — into
 // `prepare_generated_stage`, and leaves `launch_generated_stage` a body that
-// only issues kernel launches against prepared state. This slice the two are
-// called back-to-back at the same stream position the old combined call
-// occupied, so behavior and stream ordering are identical; the seam is what
-// a later slice will capture and replay across.
+// only issues kernel launches against prepared state. Attention phases now
+// go through this seam exclusively — hoisted to fire level for prepared
+// pure-decode hook fires (eager and graph alike, since the eager-path
+// unification) or called back-to-back at hook time for prepare-vetoed
+// fires; only Prologue/Epilogue still take the ring-backed combined wrapper
+// (`run_generated_stage_ring`).
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
@@ -3008,12 +3011,15 @@ inline GroupedLaunchResult launch_generated_stage(
     return result;
 }
 
-// The combined path: prepare + launch back-to-back on the rotating rings —
-// byte-for-byte the pre-split behavior. Prologue/Epilogue still come through
-// here.
+// The ring-backed combined path: prepare + launch back-to-back on the
+// rotating rings — byte-for-byte the pre-split behavior. Prologue/Epilogue
+// ONLY: since the eager-path unification, every attention-phase execution
+// (eager or graph, fire-level or veto-fallback) goes through
+// `prepare_generated_stage`(kStablePerStage) + `launch_generated_stage`
+// instead; nothing else may take this wrapper.
 // TODO(stage6-plan.md increment 1): migrate the remaining phases onto the
 // prepared kStablePerStage path and retire the rotating rings entirely.
-inline GroupedLaunchResult run_generated_stage(
+inline GroupedLaunchResult run_generated_stage_ring(
     const std::vector<GroupedLaneBinding>& lanes,
     const FusedStageExecutable& executable,
     GeneratedRuntimeContext& runtime,

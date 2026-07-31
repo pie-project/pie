@@ -110,27 +110,29 @@ struct StageHooks {
         bool query_is_f32,
         const StageHookSideband& sideband) = nullptr;
 
-    // Stage 6 increment 4 — the hook-graph prepare pass. When the batch
-    // engine decides a hook fire may replay a CUDA graph, it calls this
-    // BEFORE the graph launch (and before capture, on the capturing fire):
-    // the dispatch hoists every attention-phase PREPARE — host metadata
-    // build, channel-cursor reads, stable-buffer uploads, score-sideband
-    // sizing — to fire level, leaving the in-body `execute` calls a pure
-    // launch replay against prepared state. Returns a nonzero fingerprint of
-    // every address and grid the captured body would bake (the batch engine
-    // recaptures on change), or 0 when this fire is not replayable and must
-    // run the eager body. A 0 return has NO side effects on the launch.
+    // Stage 6 increment 4 + eager unification — the fire-level prepare
+    // pass. The batch engine calls this for EVERY pure-decode hook fire,
+    // eager and graph alike, BEFORE the body runs (and before capture, on a
+    // capturing fire): the dispatch hoists every attention-phase PREPARE —
+    // host metadata build, channel-cursor reads, stable-buffer uploads,
+    // score-sideband sizing — to fire level, leaving the in-body `execute`
+    // calls a pure launch replay against prepared state; graph mode merely
+    // captures what the eager body would have launched anyway. Returns a
+    // nonzero fingerprint of every address and grid a captured body would
+    // bake (the batch engine recaptures on change), or 0 when this fire
+    // cannot run prepared and must take the legacy interleaved eager body.
+    // A 0 return has NO side effects on the launch.
     // Null when the frame did not wire the seam (non-staged paths).
     std::uint64_t (*prepare_replay)(
         void* context,
         cudaStream_t stream) = nullptr;
 
     // Companion to `prepare_replay`: called by the batch engine right after
-    // CAPTURING a hook fire's body, to assert the recorded body consumed
-    // every prepared attention invocation (i.e. the model really invoked
-    // its hooks at every layer — the prepare pass pre-credits the coverage
-    // counter, so this is the only place the omission is visible). Throws
-    // on violation.
+    // CAPTURING a hook fire's body and right after every prepared-EAGER
+    // body, to assert the body consumed every prepared attention invocation
+    // (i.e. the model really invoked its hooks at every layer — the prepare
+    // pass pre-credits the coverage counter, so this is the only place the
+    // omission is visible). Throws on violation.
     void (*verify_replay_capture)(void* context) = nullptr;
 };
 

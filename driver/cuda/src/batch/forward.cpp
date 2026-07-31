@@ -595,12 +595,14 @@ bool hook_fire_blocks_graph(
     // consumer branch in the model body is host-STRUCTURAL (tagged whenever
     // the program's stage carries the sink — see resolve_lane_page_mask),
     // the mask carve is arena-stable, and the compaction is device-resolved
-    // against the live CSR. Quest stays eager via the dispatch-side prepare
-    // veto on `envelope_dot` (its query envelope needs the body-time Query
-    // cast). TP stays eager: rank 0 replaying a hook graph while followers
-    // replay plain ones has no replay-time branch agreement (`tp.cpp`
-    // hardcodes followers hook-free), and a divergent NCCL op order
-    // deadlocks.
+    // against the live CSR. Quest stays on the legacy interleaved body via
+    // the dispatch-side prepare veto on `envelope_dot` (its query envelope
+    // needs the body-time Query cast). TP stays off GRAPH replay: rank 0
+    // replaying a hook graph while followers replay plain ones has no
+    // replay-time branch agreement (`tp.cpp` hardcodes followers hook-free),
+    // and a divergent NCCL op order deadlocks — but rank 0's hook fires
+    // still run PREPARED, eagerly, through the unified seam (host-side
+    // hoisting only; the device stream sees the same launches).
     if (!engine.forward_fn.supports_hook_graph_capture) return true;
     if (engine.tp_comm != nullptr && engine.tp_comm->world_size() > 1) {
         return true;
@@ -672,11 +674,23 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
         in.num_clips,
         hook_blocks,
         in.lora != nullptr);
-    // Hook fires additionally need the dispatch-side prepare pass to accept
-    // the fire (and its `prepare_replay` seam to be wired at all); a refusal
-    // is a plain eager fire, decided BEFORE the pass touches the launch.
     bool run_graph = graph_eligible;
     std::uint64_t hook_fingerprint = 0;
+    // Eager-path unification (the increment-4 "future point"): the
+    // fire-level `prepare_replay` pass runs for EVERY pure-decode hook fire
+    // — eager and graph alike — so both modes drive the attention phases
+    // through the same prepare-then-launch seam and the in-body
+    // `execute_attention_phase` is a cursor-checked launch replay either
+    // way; graph mode merely adds capture on top. Restricted to pure decode
+    // because that is the fire class the prepare pass's sideband planners
+    // model (`prepare_decode_score_capture` is decode-shaped; a prefill
+    // fire's body publishes the PREFILL score capture, which carves a
+    // different arena block than the plan expects) — exactly the class
+    // graph mode has always prepared. A 0 return (veto: Query readers,
+    // lora/envelope_dot, scalable nucleus, off-boundary lanes, …) has no
+    // side effects and the fire runs the legacy interleaved eager body,
+    // which reproduces any refusal loudly.
+    bool hook_prepared = false;
     HookGraphKeyState* hook_state = nullptr;
     HookGraphKeyState::Entry* hook_entry = nullptr;
     ForwardGraphKey key{};
@@ -695,36 +709,39 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
             in.forward_N,
             graph_variant,
         };
-        if (has_hooks) {
-            if (in.stage_hooks->prepare_replay == nullptr) {
-                run_graph = false;
-            } else {
-                hook_state = &engine.hook_graph_states[key];
-                // Exec storage is partitioned by the fire's program-set hash:
-                // snapkv and h2o at one (R, N, variant) prepare different
-                // baked state, and a single slot would ping-pong recaptures.
-                hook_entry = hook_state->find(in.hook_program_set_hash);
-                if (hook_state->banned ||
-                    (hook_entry != nullptr && hook_entry->banned)) {
-                    run_graph = false;
-                } else {
-                    hook_fingerprint = in.stage_hooks->prepare_replay(
-                        in.stage_hooks->context, cublas.stream());
-                    if (hook_fingerprint == 0) {
-                        run_graph = false;
-                        ++g_hook_graph_counters.prepare_vetoes;
-                        if (hook_graph_trace_enabled()) {
-                            std::fprintf(
-                                stderr,
-                                "[hook-graph] prepare veto R=%d N=%d "
-                                "variant=%u -> eager (vetoes=%llu)\n",
-                                key.num_requests, key.num_tokens,
-                                key.variant,
-                                static_cast<unsigned long long>(
-                                    g_hook_graph_counters.prepare_vetoes));
-                        }
-                    }
+    }
+    if (has_hooks) {
+        if (in.stage_hooks->prepare_replay != nullptr && in.is_pure_decode) {
+            hook_fingerprint = in.stage_hooks->prepare_replay(
+                in.stage_hooks->context, cublas.stream());
+            hook_prepared = hook_fingerprint != 0;
+            if (!hook_prepared) {
+                ++g_hook_graph_counters.prepare_vetoes;
+                if (hook_graph_trace_enabled()) {
+                    std::fprintf(
+                        stderr,
+                        "[hook-graph] prepare veto R=%d N=%d "
+                        "-> legacy eager (vetoes=%llu)\n",
+                        in.forward_R, in.forward_N,
+                        static_cast<unsigned long long>(
+                            g_hook_graph_counters.prepare_vetoes));
                 }
+            }
+        }
+        if (!hook_prepared) {
+            run_graph = false;
+        } else if (run_graph) {
+            hook_state = &engine.hook_graph_states[key];
+            // Exec storage is partitioned by the fire's program-set hash:
+            // snapkv and h2o at one (R, N, variant) prepare different
+            // baked state, and a single slot would ping-pong recaptures.
+            hook_entry = hook_state->find(in.hook_program_set_hash);
+            if (hook_state->banned ||
+                (hook_entry != nullptr && hook_entry->banned)) {
+                // A ban is a capture-cost economy, not a correctness veto:
+                // the fire still runs PREPARED, just eagerly — same
+                // launches, no capture churn.
+                run_graph = false;
             }
         }
     }
@@ -733,9 +750,10 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
         if (eager_logs.fetch_add(1, std::memory_order_relaxed) < 32) {
             std::fprintf(
                 stderr,
-                "[hook-graph] eager hook fire: blocks=%d eligible=%d "
-                "pure_decode=%d custom_mask=%d write_desc=%d window=%d "
-                "slots=%d R=%d N=%d wants_mask=%d cap=%d lora=%d\n",
+                "[hook-graph] eager hook fire: prepared=%d blocks=%d "
+                "eligible=%d pure_decode=%d custom_mask=%d write_desc=%d "
+                "window=%d slots=%d R=%d N=%d wants_mask=%d cap=%d lora=%d\n",
+                hook_prepared ? 1 : 0,
                 hook_blocks ? 1 : 0, graph_eligible ? 1 : 0,
                 in.is_pure_decode ? 1 : 0, in.have_custom_mask ? 1 : 0,
                 in.has_write_desc ? 1 : 0, in.structured_window_left,
@@ -939,6 +957,15 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
     fwd_in.stage_hooks                  = in.stage_hooks;
     fwd_in.lora                         = in.lora;
     forward_fn.invoke_body(ws, kv_cache, attn_ws, cublas, fwd_in);
+    if (hook_prepared && in.stage_hooks->verify_replay_capture != nullptr) {
+        // Prepared-EAGER hook fire (the unified seam, no capture): the same
+        // coverage proof as capture time. The prepare pass pre-credited the
+        // per-layer invocation counters, so a body that stopped invoking its
+        // hooks would otherwise go unnoticed — `finish`'s partial-consumption
+        // check reads 0 consumed as "graph replay" and cannot distinguish a
+        // body that skipped every hook.
+        in.stage_hooks->verify_replay_capture(in.stage_hooks->context);
+    }
 }
 
 }  // namespace pie_cuda_driver
