@@ -2302,6 +2302,31 @@ int Context::Impl::launch(const PieFrameDesc& frame, PieCompletion completion) {
         state_required = std::max(
             state_required, required_state_slots(expansions[i].launch));
     }
+    // v1 mask scope, checked at ADMISSION — before the arena commit and
+    // before any prepare-time mutation, so refusal is a clean status with
+    // NO side effects. A device-geometry program carrying a dense device
+    // mask composes only SOLO; the runtime scheduler batches such fires
+    // alone (`LaunchGrouping`'s mask exclusions), so a violating step is a
+    // scheduler contract breach. The old defence — `prepare_step`'s
+    // resolve-time RetryableLaunchError — fired AFTER `begin_host` had
+    // applied the wave's channel tickets: the failure poisoned every lane
+    // in the frame and the dead instances leaked pages until later frames
+    // hit the physical budget ceiling (Stage 2 verdict, liveness seam 2).
+    if (registry_ != nullptr && executor_ != nullptr) {
+        for (std::size_t i = 0; i < step_count; ++i) {
+            const int offending =
+                registry_->dispatch().dense_mask_scope_violation(
+                    views[i], executor_->forward_fn.supports_runtime_window);
+            if (offending >= 0) {
+                std::cerr << "[pie-driver-cuda] frame admission rejected: "
+                          << "step " << i << " program " << offending
+                          << " carries a dense device mask in a "
+                          << "multi-program batch (v1 mask scope is solo "
+                          << "only; the scheduler must not compose this)\n";
+                return PIE_STATUS_INVALID_ARGUMENT;
+            }
+        }
+    }
     // Folded admission: EXHAUSTED/IMPOSSIBLE return as statuses with no
     // side effects; the engine's lane retries EXHAUSTED in place.
     if (kv_required > kv_cache_->num_pages()) {

@@ -7592,6 +7592,44 @@ std::string describe_uncommitted_lane(
     return message;
 }
 
+int Dispatch::dense_mask_scope_violation(const pie_native::LaunchView& view,
+                                         bool allow_structured_masks) const {
+    const std::size_t n_prog = view.ptir_program_hashes.size();
+    if (n_prog <= 1 || view.ptir_program_instances.size() != n_prog) {
+        return -1;
+    }
+    const Impl& s = *impl_;
+    for (std::size_t p = 0; p < n_prog; ++p) {
+        const std::uint64_t iid = view.ptir_program_instances.data()[p];
+        const auto it = s.instances.find(iid);
+        // Unknown instances / missing traces fail elsewhere with their own
+        // diagnostics; this check answers only the mask-scope question.
+        if (it == s.instances.end() || it->second.trace == nullptr) continue;
+        // The ACK'd class — not a trace sniff — decides which programs
+        // resolve descriptors from device cells (RV-6, mirrors
+        // `resolve_descriptors`).
+        if (it->second.geometry_class == PIE_GEOMETRY_CLASS_HOST) continue;
+        const Trace& trace = *it->second.trace;
+        for (const PortBinding& binding : trace.ports) {
+            if (binding.port != kPortAttnMask || binding.is_const) continue;
+            // Mirror `resolve_attention_mask`: a statically recognized
+            // structured mask lowers to a runtime window override and never
+            // packs a dense device mask.
+            const auto descriptor =
+                structured_mask_descriptor(trace, binding.channel);
+            const bool direct =
+                allow_structured_masks &&
+                (descriptor.kind == StructuredMaskKind::Causal ||
+                 (descriptor.kind == StructuredMaskKind::SlidingWindow &&
+                  descriptor.window > 0) ||
+                 (descriptor.kind == StructuredMaskKind::SinkWindow &&
+                  descriptor.window > 0));
+            if (!direct) return static_cast<int>(p);
+        }
+    }
+    return -1;
+}
+
 bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
                                    std::uint32_t page_size,
                                    std::uint32_t device_pages,

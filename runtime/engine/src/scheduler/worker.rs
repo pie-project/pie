@@ -7478,6 +7478,108 @@ mod tests {
         );
     }
 
+    /// The Stage 2 liveness seam (verdict note, finding 2): a POOLED
+    /// device-geometry masked decode fire (naive-masked's shape — prebuilt,
+    /// zero-row `qo_indptr = [0, 0]`, `AttnMask` channel bound, geometry
+    /// resolved on device) must never share a step with wire fires, in
+    /// EITHER admission order. `fire_device_geometry` builds this plan and
+    /// stamps `device_resolved_geometry`; before that stamp landed, the
+    /// host-lowered (BRLE) shape of the mask classified as an ordinary
+    /// "co-batches freely" wire mask, the scheduler composed it with wire
+    /// fires, and the driver's v1 mask scope threw
+    /// `RetryableLaunchError("ptir: dense device mask in a multi-program
+    /// batch requires solo retry")` — poisoning the wave and leaking the
+    /// dead lanes' pages. Observed twice live under mixed masked+plain
+    /// load.
+    #[test]
+    fn launch_grouping_refuses_pooled_masked_device_geometry_mixes() {
+        let limits = SchedulerLimits {
+            max_forward_requests: 8,
+            max_forward_tokens: 4096,
+            max_page_refs: 4096,
+        };
+        // naive-masked's decode plan, as `fire_device_geometry` builds it:
+        // `host_lowered` selects the two per-fire mask lowerings — the
+        // seed/host-derivable fire ships wire BRLE rows
+        // (`FireAttnMask::Host`), a device-derived fire ships none
+        // (`FireAttnMask::Device`, the dense device mask).
+        let pooled_masked = |instance: u64, host_lowered: bool| {
+            let mut request = dummy_launch_request(ProcessId::new_v4(), instance);
+            request.prebuilt = true;
+            request.request = LaunchPlan {
+                qo_indptr: vec![0, 0],
+                has_user_mask: true,
+                device_resolved_geometry: true,
+                ..LaunchPlan::default()
+            };
+            if host_lowered {
+                request.request.masks =
+                    vec![crate::driver::command::EncodedMask::new(vec![0, 1], 1)];
+                request.request.mask_indptr = vec![0, 1];
+            }
+            assert!(
+                !request.requires_solo_submission(),
+                "the b=1 pooled fire is not structurally solo; only the \
+                 mask clauses keep it out of shared batches"
+            );
+            request
+        };
+        let envelope_decode = |instance: u64| {
+            let mut request = dummy_launch_request(ProcessId::new_v4(), instance);
+            request.request.device_resolved_geometry = true;
+            request
+        };
+
+        for host_lowered in [true, false] {
+            // Masked fire first: no wire fire, prefill chunk, or envelope
+            // decode lane may join behind it.
+            let masked = pooled_masked(1, host_lowered);
+            let mut grouping = LaunchGrouping::default();
+            assert!(grouping.accepts(&masked, limits, 16));
+            grouping.push(&masked, limits, 16);
+            assert!(
+                !grouping.accepts(&dummy_launch_request(ProcessId::new_v4(), 2), limits, 16),
+                "a wire decode fire must not join a pooled masked \
+                 device-geometry fire (host_lowered={host_lowered})"
+            );
+            let mut prefill = dummy_launch_request(ProcessId::new_v4(), 3);
+            prefill.request = dummy_prefill(64);
+            assert!(
+                !grouping.accepts(&prefill, limits, 16),
+                "a chunk-prefill fire must not join a pooled masked \
+                 device-geometry fire (host_lowered={host_lowered})"
+            );
+            assert!(
+                !grouping.accepts(&envelope_decode(4), limits, 16),
+                "an envelope decode lane must not join a pooled masked \
+                 device-geometry fire (host_lowered={host_lowered})"
+            );
+
+            // Wire fire first: the masked fire defers instead of joining —
+            // the exact composition observed live (mixed load, a plain
+            // lane's wire fire already grouped).
+            let mut grouping = LaunchGrouping::default();
+            grouping.push(
+                &dummy_launch_request(ProcessId::new_v4(), 5),
+                limits,
+                16,
+            );
+            assert!(
+                !grouping.accepts(&pooled_masked(6, host_lowered), limits, 16),
+                "a pooled masked device-geometry fire must not join wire \
+                 fires (host_lowered={host_lowered})"
+            );
+
+            // Liveness: the deferred fire still heads its own fresh group.
+            let fresh = LaunchGrouping::default();
+            assert!(
+                fresh.accepts(&pooled_masked(7, host_lowered), limits, 16),
+                "the refused masked fire stays schedulable solo \
+                 (host_lowered={host_lowered})"
+            );
+        }
+    }
+
     /// The page-mask/pure-decode grouping invariant: an
     /// `attn_page_mask`-writing program shares a batch only with
     /// single-token (decode) rows — the driver throws on a written mask off

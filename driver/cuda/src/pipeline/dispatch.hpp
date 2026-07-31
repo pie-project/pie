@@ -435,6 +435,22 @@ class Dispatch {
                              StagedLaunch* launch = nullptr,
                              bool allow_device_composed = false);
 
+    // STATIC v1 mask-scope admission check, run at frame admission — before
+    // the arena commit and before any prepare-time state mutation. A
+    // device-geometry program carrying a dense device `AttnMask` channel
+    // composes only SOLO (batch_compose.hpp "out of scope" v1); the runtime
+    // scheduler batches such fires alone, and `prepare_step`'s resolve-time
+    // throw used to be the only defence — reachable AFTER `begin_host` had
+    // applied the wave's channel tickets, so a violating step poisoned every
+    // lane in the frame and leaked the dead lanes' pages. Returns the
+    // offending program's index in `view.ptir_program_hashes` when the step
+    // is MULTI-program and one of its device-geometry programs binds a
+    // dense device mask, -1 otherwise. `allow_structured_masks` mirrors the
+    // resolve path (`resolve_attention_mask`): a mask the structured-mask
+    // recognizer lowers to a runtime window override is not a dense mask.
+    int dense_mask_scope_violation(const pie_native::LaunchView& view,
+                                   bool allow_structured_masks) const;
+
     // Device-composition lowering, split along the frame pipeline: the
     // `stage_*` half (FramePrepare) validates and builds the lane tables —
     // which read the live registry ring cursors and the wave's channel-

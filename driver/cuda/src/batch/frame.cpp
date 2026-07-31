@@ -934,7 +934,12 @@ void prepare_step(
         if (s.dg_resolved) {
             // v1 mask scope: a dense device mask (AttnMask channel)
             // composes only SOLO — the runtime scheduler batches such
-            // fires alone; fail loud if the contract is violated.
+            // fires alone, and `Context::Impl::launch` refuses a violating
+            // step at ADMISSION (`Dispatch::dense_mask_scope_violation`,
+            // side-effect-free, before any channel ticket is applied).
+            // This resolve-time throw is the unreachable backstop: by now
+            // `begin_host` has mutated wave state, so failing here poisons
+            // the whole frame.
             if (s.rpg.per_program.size() > 1) {
                 for (std::size_t p = 0; p < s.rpg.per_program.size(); ++p) {
                     if (s.rpg.is_device_geometry[p] &&

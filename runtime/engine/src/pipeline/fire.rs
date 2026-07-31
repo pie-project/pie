@@ -2296,6 +2296,16 @@ async fn fire_device_geometry<C: FireContext>(
     req.qo_indptr = resolved_qo_indptr;
     req.kv_translation = kv_translation;
     req.kv_translation_version = kv_translation_version;
+    // This pass's geometry resolves ON DEVICE (the driver reads its port
+    // channels at frame prepare); stamp the plan so the scheduler's
+    // `LaunchGrouping` classifies it as device-resolved. Leaving the flag
+    // unset made a pooled masked decode fire look like an ordinary
+    // wire-masked fire — "custom wire masks co-batch freely" — and the
+    // scheduler co-batched it with wire fires into a multi-program batch
+    // the driver's v1 mask scope must refuse (frame.cpp "dense device mask
+    // in a multi-program batch requires solo retry"): the wave poisoned and
+    // the dead lanes leaked pages (Stage 2 verdict, liveness seam 2).
+    req.device_resolved_geometry = true;
     rs_prepared.apply_to(&mut req);
     attn_mask.apply_to(&mut req);
     let ticket_reservation = TicketReservation::new(&cells, &accesses);
