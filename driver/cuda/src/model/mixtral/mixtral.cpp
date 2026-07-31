@@ -139,10 +139,6 @@ struct ExpertPtrTable {
 
 }  // namespace
 
-namespace {
-
-}  // namespace
-
 void mixtral_forward_paged(
     const MixtralWeights& w,
     const HfConfig& cfg,
@@ -465,6 +461,14 @@ void mixtral_forward_paged(
         // routed set falls back to the per-expert loop rather than deadlock
         // against its own pins.
         bool streamed_fused = false;
+        // The routing table is read back at most once per layer. The fused
+        // paged path below needs it to decide what to page in, and the generic
+        // dispatch further down needs it to build its per-expert lists; when a
+        // layer takes both -- which is exactly the case where the slab is too
+        // small for the routed set -- reading it twice would drain the stream
+        // twice in the configuration already under the most pressure.
+        std::vector<std::int32_t> topk_idx_h;
+        bool topk_idx_read = false;
         // Whether the fused decode kernels can run at all: they index the
         // experts through a device-side pointer array, so a layer that has no
         // such array, or is not on the decode path, has nothing to fuse.
@@ -535,14 +539,15 @@ void mixtral_forward_paged(
             if (layer.expert_ptrs_static) {
                 streamed_fused = true;
             } else {
-                std::vector<std::int32_t> idx_h(static_cast<std::size_t>(N) * top_k);
-                CUDA_CHECK(cudaMemcpyAsync(idx_h.data(), d_topk_idx.data(),
-                                           idx_h.size() * sizeof(std::int32_t),
+                topk_idx_h.resize(static_cast<std::size_t>(N) * top_k);
+                CUDA_CHECK(cudaMemcpyAsync(topk_idx_h.data(), d_topk_idx.data(),
+                                           topk_idx_h.size() * sizeof(std::int32_t),
                                            cudaMemcpyDeviceToHost, stream));
                 CUDA_CHECK(cudaStreamSynchronize(stream));
+                topk_idx_read = true;
                 std::vector<int> routed;
                 std::vector<char> seen(static_cast<std::size_t>(num_experts), 0);
-                for (const std::int32_t e : idx_h) {
+                for (const std::int32_t e : topk_idx_h) {
                     if (e >= 0 && e < num_experts && !seen[e]) {
                         seen[e] = 1;
                         routed.push_back(e);
@@ -625,11 +630,13 @@ void mixtral_forward_paged(
         }
 
         // 2. D2H copy of routing decisions; build per-expert lists.
-        std::vector<std::int32_t> topk_idx_h(static_cast<std::size_t>(N) * top_k);
         std::vector<float>        topk_w_h  (static_cast<std::size_t>(N) * top_k);
-        CUDA_CHECK(cudaMemcpyAsync(topk_idx_h.data(), d_topk_idx.data(),
-                                   topk_idx_h.size() * sizeof(std::int32_t),
-                                   cudaMemcpyDeviceToHost, stream));
+        if (!topk_idx_read) {
+            topk_idx_h.resize(static_cast<std::size_t>(N) * top_k);
+            CUDA_CHECK(cudaMemcpyAsync(topk_idx_h.data(), d_topk_idx.data(),
+                                       topk_idx_h.size() * sizeof(std::int32_t),
+                                       cudaMemcpyDeviceToHost, stream));
+        }
         CUDA_CHECK(cudaMemcpyAsync(topk_w_h.data(), d_topk_w.data(),
                                    topk_w_h.size() * sizeof(float),
                                    cudaMemcpyDeviceToHost, stream));

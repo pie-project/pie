@@ -1242,21 +1242,6 @@ private:
     bool encode_scope_allowed_ = false;
 };
 
-/// Stack per-expert MoE weights into the fused 3-D tensors a fused-MoE
-/// forward consumes. This is the plain HF MoE source layout, not anything
-/// qwen-specific: GLM-5.2 ships it too. Per expert `e`,
-/// `mlp.experts.{e}.gate_proj.weight` / `.up_proj.weight` as `[I, H]` and
-/// `.down_proj.weight` as `[H, I]`. Output:
-///   `mlp.experts.gate_up_proj` -> `[E, 2I, H]`; `gate_second` selects which
-///   half leads, matching what the bound driver's activation reads.
-///   `mlp.experts.down_proj`    -> `[E, H, I]`
-/// Built as an expression over the sources, so no GPU-side duplicate exists.
-/// A no-op when the checkpoint already ships the fused tensors.
-///
-/// `float_only` skips layers whose experts are quantised. A quantised expert
-/// carries companion scale tensors that this stack does not join, so folding
-/// the weights alone would orphan them; families that can ship either layout
-/// set it and fall back to their per-expert path for quantised checkpoints.
 /// The same experts, declared as a group instead of a stack.
 ///
 /// Structurally this is `hf_moe_expert_stacks` with the outer concatenation
@@ -1328,6 +1313,21 @@ inline void hf_moe_streamed_expert_groups(
     }
 }
 
+/// Stack per-expert MoE weights into the fused 3-D tensors a fused-MoE
+/// forward consumes. This is the plain HF MoE source layout, not anything
+/// qwen-specific: GLM-5.2 ships it too. Per expert `e`,
+/// `mlp.experts.{e}.gate_proj.weight` / `.up_proj.weight` as `[I, H]` and
+/// `.down_proj.weight` as `[H, I]`. Output:
+///   `mlp.experts.gate_up_proj` -> `[E, 2I, H]`; `gate_second` selects which
+///   half leads, matching what the bound driver's activation reads.
+///   `mlp.experts.down_proj`    -> `[E, H, I]`
+/// Built as an expression over the sources, so no GPU-side duplicate exists.
+/// A no-op when the checkpoint already ships the fused tensors.
+///
+/// `float_only` skips layers whose experts are quantised. A quantised expert
+/// carries companion scale tensors that this stack does not join, so folding
+/// the weights alone would orphan them; families that can ship either layout
+/// set it and fall back to their per-expert path for quantised checkpoints.
 inline void hf_moe_expert_stacks(
     ContractBuilder& b, bool gate_second, bool float_only = false) {
     const std::int64_t num_experts = b.facts().num_experts;

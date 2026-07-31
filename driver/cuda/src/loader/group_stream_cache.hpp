@@ -168,6 +168,10 @@ public:
         const std::uint64_t steady_ns =
             s.page_in_ns > s.first_page_in_ns ? s.page_in_ns - s.first_page_in_ns : 0;
         const std::uint64_t steady_misses = s.misses > 1 ? s.misses - 1 : 0;
+        const std::uint64_t steady_bytes =
+            s.bytes_paged_in > s.first_page_in_bytes
+                ? s.bytes_paged_in - s.first_page_in_bytes
+                : 0;
         const double page_in_ms = static_cast<double>(steady_ns) / 1e6;
         const double secs = static_cast<double>(steady_ns) / 1e9;
         out << "[pie-driver-cuda] group stream cache: " << accesses
@@ -181,12 +185,12 @@ public:
                     : static_cast<double>(steady_ns) / 1e3 /
                           static_cast<double>(steady_misses))
             << " us each, of "
-            << (s.misses == 0 ? 0.0
-                              : static_cast<double>(s.bytes_paged_in) /
-                                    static_cast<double>(s.misses) / 1048576.0)
+            << (steady_misses == 0 ? 0.0
+                                   : static_cast<double>(steady_bytes) /
+                                         static_cast<double>(steady_misses) / 1048576.0)
             << " MiB in " << page_in_ms << " ms ("
             << (secs == 0.0 ? 0.0
-                            : static_cast<double>(s.bytes_paged_in) / 1048576.0 / secs)
+                            : static_cast<double>(steady_bytes) / 1048576.0 / secs)
             << " MiB/s), " << (static_cast<double>(s.evict_wait_ns) / 1e6)
             << " ms waiting to evict, " << s.prefetches
             << " prefetched, "
@@ -199,7 +203,6 @@ public:
     GroupStreamCache(const GroupStreamCache&) = delete;
     GroupStreamCache& operator=(const GroupStreamCache&) = delete;
 
-    std::size_t num_groups() const noexcept { return groups_.len; }
     /// The group named `name`, or `kNoGroup`. A bind path holds names, not
     /// indices, and resolving once at bind keeps the forward pass indexing.
     static constexpr std::size_t kNoGroup = static_cast<std::size_t>(-1);
@@ -228,8 +231,14 @@ public:
         return slot_bytes_ * num_slots();
     }
     /// True when the slab holds the whole group, so no page-in can ever miss
-    /// after the first sweep. The caller may use this to keep CUDA graph
-    /// capture on, since nothing will call into the host mid-forward.
+    /// after the first sweep.
+    ///
+    /// Not a capture claim. Every family that can stream turns CUDA graph
+    /// capture off on the cache existing at all, because a streamed contract
+    /// publishes groups instead of stacks and the forward then takes the
+    /// per-expert path, which reads the routing table back and synchronizes
+    /// whether or not the slab can miss. What sizing does buy is `all_placed`
+    /// below, and what that buys is a pointer table written once.
     bool fully_resident() const noexcept {
         return num_slots() == total_instances();
     }
@@ -361,6 +370,11 @@ public:
         /// microseconds against a steady-state miss of a few tens it would
         /// otherwise dominate the average and hide what a miss really costs.
         std::uint64_t first_page_in_ns = 0;
+        /// Its bytes, held out for the same reason. Reporting MiB/s over the
+        /// unadjusted byte total against a time total that excludes warm-up
+        /// inflates the rate by exactly the warm-up transfer, and MiB/s is the
+        /// number that decides whether the source is fast enough.
+        std::uint64_t first_page_in_bytes = 0;
         std::uint64_t prefetches = 0;
         /// Misses served from the host tier rather than the checkpoint. They
         /// are still misses -- the slab did not hold the instance -- but they
@@ -537,12 +551,12 @@ private:
     void verify_fill(std::uint32_t slot, std::uint32_t key, cudaStream_t stream)
     {
         if (!verify_fills_) return;
-        // Windows spread across the whole slot, not just its ends: a page-in
-        // is many buffers and a wrong one in the middle is exactly what the
-        // ends cannot see.
-        // Over the named tensors, not the raw slot: the gaps a plan leaves
+        // Over the named tensors rather than the raw slot, and windowed
+        // across each rather than sampled at its ends. The gaps a plan leaves
         // between its buffers are nobody's bytes and nothing reads them, so
-        // hashing them only reports that a slot was previously somebody else.
+        // hashing them would only report that the slot was previously
+        // somebody else; and a page-in is many buffers, so a wrong one in the
+        // middle is exactly what the ends cannot see.
         constexpr std::size_t kWindows = 16;
         constexpr std::size_t kWindow = 4096;
         std::vector<std::uint8_t> buf(kWindow);
@@ -648,7 +662,10 @@ private:
         const std::uint64_t elapsed_ns = static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 Clock::now() - started).count());
-        if (stats_.misses == 1) stats_.first_page_in_ns = elapsed_ns;
+        if (stats_.misses == 1) {
+            stats_.first_page_in_ns = elapsed_ns;
+            stats_.first_page_in_bytes = stats_.bytes_paged_in;
+        }
         stats_.alloc_ms += stats.phase_alloc_ms;
         stats_.transfer_ms += stats.phase_transfer_ms;
         stats_.transform_ms += stats.phase_transform_ms;

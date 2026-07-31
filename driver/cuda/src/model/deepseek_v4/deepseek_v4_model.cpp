@@ -48,13 +48,22 @@ DsV4Model::DsV4Model(
         // layer whether or not the slab can miss. Under capture that
         // synchronize is `cudaErrorStreamCaptureUnsupported`. Qwen3.5 already
         // gates on the cache existing at all; this is the same rule.
+        //
+        // Only the capture cap. `graph_padding_kv_write_safe` says this
+        // family's KV writes are gated on `row_valid`, which is a property of
+        // its kernels and is not changed by where the expert weights live --
+        // and the engine refuses to build a context when a family that aliases
+        // KV page 0 for padding rows does not claim it, so clearing it here
+        // would turn streaming on DeepSeek-V4 into `PIE_STATUS_UNSUPPORTED`
+        // rather than into a lost optimisation.
+        bool capturable = on;
         for (const auto& L : weights_.layers) {
             if (L.expert_cache != nullptr) {
-                on = false;
+                capturable = false;
                 break;
             }
         }
-        caps_.graph_safe = on;
+        caps_.graph_safe = capturable;
         caps_.graph_padding_kv_write_safe = on;
     }
 }

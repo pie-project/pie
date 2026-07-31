@@ -275,11 +275,6 @@ int qwen35_moe_decode_fast_max_tokens() {
     return max_tokens;
 }
 
-// Force the general (per-expert) dispatch even for shapes the decode fast path
-// would take. Streaming already lands here because it has no fused slab to
-// stride, so this is what makes "same weights, same path" a runnable
-// comparison: without it a resident/streamed diff confounds the residency
-// change with a change of kernel.
 // The routed decode GEMMs are M=1 streaming reads. A dedicated GEMV beats
 // `cublasGemmBatchedEx` on them; see `moe_decode_gemv_bf16_kernel`.
 bool qwen35_moe_gemv_decode_enabled() {
@@ -652,6 +647,11 @@ inline void rmsnorm_bf16_dispatch(
 
 }  // namespace
 
+// Force the general (per-expert) dispatch even for shapes the decode fast path
+// would take. Streaming already lands here because it has no fused slab to
+// stride, so this is what makes "same weights, same path" a runnable
+// comparison: without it a resident/streamed diff confounds the residency
+// change with a change of kernel.
 bool qwen35_moe_force_general_path() {
     static const bool on = [] {
         const char* v = std::getenv("PIE_QWEN35_MOE_FORCE_GENERAL");
