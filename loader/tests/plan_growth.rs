@@ -135,7 +135,13 @@ fn llama_checkpoint(layers: usize) -> CheckpointMetadata {
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
-    std::fs::write(&scratch, vec![0_u8; offset as usize]).expect("write checkpoint");
+    // Sparse, not written. Verification only checks that every source extent
+    // lands inside the file it names, so the bytes are never read -- and an
+    // 80-layer fixture is 113 MB, which is real memory on a tmpfs `/tmp` and
+    // enough to exhaust a quota over a few runs. `set_len` costs zero blocks.
+    std::fs::File::create(&scratch)
+        .and_then(|file| file.set_len(offset))
+        .expect("size the checkpoint");
     std::fs::rename(&scratch, &path).expect("publish checkpoint");
 
     CheckpointMetadata {
