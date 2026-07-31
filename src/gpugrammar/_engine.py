@@ -74,7 +74,7 @@ _PORTED: frozenset[str] = frozenset(
         "store",
         "restore",
         "advance_fused",
-        "fill_fused",
+        "fill_split",
     }
 )
 
@@ -1048,43 +1048,6 @@ def _restore_kernel(
 
 
 @triton.jit
-def _snapshot_kernel(
-    lexer_state_ptr,
-    stack_ptr,
-    config_count_ptr,
-    live_offsets_ptr,
-    old_lexer_ptr,
-    old_count_ptr,
-    old_stack_ptr,
-    ROWS: tl.constexpr,
-    CONFIGS: tl.constexpr,
-    STACK_STRIDE: tl.constexpr,
-):
-    """Keep what the commit will overwrite, for the configurations in play.
-
-    A candidate names the stack it came from rather than carrying a copy, and
-    the commit builds the next set in place, so the sources have to survive.
-    Copying the whole buffer was 8.4 MB and 13 us a step to preserve the one or
-    two configurations a sequence actually holds.
-    """
-    program = tl.program_id(0)
-    programs = tl.num_programs(0)
-    total = tl.load(live_offsets_ptr + ROWS)
-    slot = program
-    while slot < total:
-        row_index = _owner(live_offsets_ptr, ROWS, slot)
-        tl.store(old_lexer_ptr + row_index, tl.load(lexer_state_ptr + row_index))
-        sequence = row_index // CONFIGS
-        tl.store(old_count_ptr + sequence, tl.load(config_count_ptr + sequence))
-        lane = tl.arange(0, STACK_STRIDE)
-        tl.store(
-            old_stack_ptr + row_index * STACK_STRIDE + lane,
-            tl.load(stack_ptr + row_index * STACK_STRIDE + lane),
-        )
-        slot = slot + programs
-
-
-@triton.jit
 def _scatter_kernel(
     group_offsets_ptr,
     group_set_kind_ptr,
@@ -1184,43 +1147,6 @@ def _scatter_kernel(
                     value = tl.load(payload + offset + lane, mask=live, other=0)
                     tl.atomic_or(row + lane, value, mask=live)
         item = item + blocks
-
-
-@triton.jit
-def _contains(kind, offset, length, payload_ptr, token):
-    """Is `token` in this group's set?
-
-    The three storages are the three shapes a set of tokens takes when it is
-    stored exactly: a sorted list, a sorted list of exclusions, or a bitset.
-
-    One exit, deliberately. A `return` inside a runtime branch of a jitted
-    helper does not reliably do what it reads as - the branch is a predicate,
-    not a jump - and written that way this silently reported that no group held
-    the token, which stalls the parser instead of failing.
-    """
-    inside = 0
-    if kind == _DENSE:
-        word = tl.load(payload_ptr + offset + token // 32)
-        inside = (word >> (token % 32)) & 1
-    else:
-        # The list is sorted, so its ends are its bounds. Almost every group of
-        # a lexer state fails on them, and two adjacent loads settle that far
-        # sooner than a search does - the search is a chain of dependent loads
-        # into scattered memory, and the cost of this kernel is exactly how
-        # many of those it performs.
-        low = tl.load(payload_ptr + offset)
-        high = tl.load(payload_ptr + offset + length - 1)
-        found = -1
-        if token >= low:
-            if token <= high:
-                found = _search(payload_ptr, offset, offset + length, token)
-        if kind == _COMPLEMENT:
-            if found < 0:
-                inside = 1
-        else:
-            if found >= 0:
-                inside = 1
-    return inside
 
 
 @triton.jit
@@ -4501,58 +4427,6 @@ class DeviceBatch:
             grid_y=self.batch,
         )
 
-    def _fill_fused_cuda(self, grammar) -> None:
-        """Probe, sweep, scatter and claim as one kernel.
-
-        Five graph nodes become one - the count and the scan among them,
-        because a block owns a sequence and its work is its own
-        configurations' groups. `gg_hash` still runs before it, since the
-        neighbour search reads other sequences' fingerprints, and the copy and
-        the store still run after, for the same reason in reverse.
-        """
-        from gpugrammar import _gpugrammar
-
-        _gpugrammar.cuda_launch(
-            "gg_fill_fused",
-            self.batch,
-            self._fill_threads(grammar),
-            torch.cuda.current_stream().cuda_stream,
-            [
-                self.grammar.arena_struct().data_ptr(),
-                self.state_struct().data_ptr(),
-                self.mask.data_ptr(),
-                self.state_hash.data_ptr(),
-                self.suffix_hash.data_ptr(),
-                self.memo_hash.data_ptr(),
-                self.memo_lexer.data_ptr(),
-                self.memo_stack.data_ptr(),
-                self.memo_depth.data_ptr(),
-                self.memo_count.data_ptr(),
-                self.memo_grammar.data_ptr(),
-                self.memo_read.data_ptr(),
-                self.memo_slot.data_ptr(),
-                self.representative.data_ptr(),
-                self.memo_store.data_ptr(),
-                self.memo_want.data_ptr(),
-                self.row_floor.data_ptr(),
-                self._fused_scratch(grammar).data_ptr(),
-                self.high_water.data_ptr(),
-            ],
-            [
-                self.configs,
-                grammar.max_stack,
-                grammar.max_reductions,
-                grammar.window,
-                grammar.paths,
-                grammar.has_verdicts,
-                self.memo_slots,
-                self.memo_configs,
-                self.memo_stride,
-                _MEMO_SUFFIXES,
-                grammar.mask_words,
-            ],
-        )
-
     def _fill_split_cuda(self, grammar) -> None:
         """The fill as a probe and a sweep, so a wide sequence is not one block.
 
@@ -5236,7 +5110,7 @@ class DeviceBatch:
         """
         if not _PORTED:
             return self._fill_triton()
-        if "fill_fused" in _PORTED:
+        if "fill_split" in _PORTED:
             grammar = self.grammar
             self._hash_cuda(grammar)
             self._fill_split_cuda(grammar)

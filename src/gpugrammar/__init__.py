@@ -267,6 +267,15 @@ class Batch:
         Decided on the device. A caller choosing for itself would have to read
         a count on the host, which is the synchronisation this engine exists
         not to make.
+
+        **What this does not solve.** Acting on `kind` still costs a host
+        synchronisation, because a sampler's output shape is its row count and
+        `nonzero` has to be read to get one. Measured at batch 512 against
+        applying the mask to every row: 2.68x when every row is sparse, 1.05x
+        when half are dense - which is the steady state a real workload sits
+        at - and 0.86x for the sync-free alternative of sampling both ways and
+        selecting. The set being resident is necessary and not sufficient; the
+        sampler has to be able to ask for it raggedly, and today it cannot.
         """
         return self._batch.compact(capacity, both=True)
 
@@ -286,6 +295,9 @@ class Batch:
         vocabulary and gathering it buys nothing.
 
         Call after `fill_mask` or `step`; it reads the mask those produced.
+        Prefer `shortlist` unless you know every row is sparse: this always
+        emits the allowed list, and for a row inside a string body that list
+        is nearly the whole vocabulary.
         """
         ids, counts, _ = self._batch.compact(capacity)
         return ids, counts

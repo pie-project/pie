@@ -231,36 +231,3 @@ extern "C" __global__ void gg_locate(
         }
     }
 }
-
-/// The same kernel with the state copy removed, to attribute its cost. Not
-/// used by the engine; kept because "which half is slow" is a question that
-/// comes back every time a kernel is changed.
-extern "C" __global__ void gg_locate_no_copy(
-    const gg::Arena* arena,
-    const gg::BatchState* state,
-    const int32_t* token,
-    const int32_t* live_offsets,
-    int32_t* found,
-    int32_t* old_lexer,
-    int32_t* old_count,
-    int32_t* old_stack,
-    int32_t batch,
-    int32_t configs,
-    int32_t stack_stride,
-    int32_t rows,
-    int32_t has_verdicts,
-    int32_t vocabulary) {
-    gg::Shape shape{batch, configs, stack_stride, 0, rows};
-    int32_t lane = threadIdx.x & 31;
-    int32_t warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
-    int32_t warps = (gridDim.x * blockDim.x) >> 5;
-    int32_t total = live_offsets[rows];
-    for (int32_t slot = warp; slot < total; slot += warps) {
-        int32_t row = gg::owner(live_offsets, rows, slot);
-        int32_t sequence = row / configs;
-        int32_t best =
-            gg::locate_one(arena, state, shape, token, sequence, row, lane, has_verdicts != 0,
-                           vocabulary);
-        if (lane == 0) { found[row] = best; }
-    }
-}
