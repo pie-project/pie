@@ -1,38 +1,50 @@
 // $name — TypeScript inferlet.
 //
-// Demonstrates:
-// - Using Context for chat-style prompt building
-// - Returning the generated response to the caller
+// HEADS UP: this scaffold does not generate text, because the JavaScript SDK
+// cannot yet. The guest forward-pass surface now ships PTIR container bytes,
+// and the encoder that produces them exists only in the Rust SDK, so
+// `@pie-project/inferlet` currently exposes the non-forward interfaces only.
+// `scripts/check-sdk-interfaces.sh` in the pie repo fails on exactly that and
+// blocks publishing until it is ported.
+//
+// Until then, use the Rust template for anything that runs a model:
+//
+//     bakery new $name --rust
+//
+// What this scaffold does show is the part that works today: reading the bound
+// model's capabilities, tokenizing, building a chat prompt with the host's
+// template, and talking to the client.
 
-import {
-    Context, Sampler,
-    session,
-} from '@pie-project/inferlet';
+import { chat, model, session, tokenizer } from '@pie-project/inferlet';
 
 interface Input {
     prompt?: string;
     system?: string;
-    max_tokens?: number;
-    temperature?: number;
-    top_p?: number;
 }
 
 export async function main(input: Input) {
     const prompt = input.prompt ?? 'What is the capital of France?';
     const system = input.system ?? 'You are a helpful, respectful and honest assistant.';
-    const maxTokens = input.max_tokens ?? 256;
-    const temperature = input.temperature ?? 0.6;
-    const topP = input.top_p ?? 0.95;
 
-    // Build a chat context.
-    const ctx = new Context();
-    ctx.system(system);
-    ctx.user(prompt);
+    // Build the prompt with the host's chat template. These are the exact
+    // token sequences a forward pass would embed.
+    const tokens = [
+        ...chat.system(system),
+        ...chat.user(prompt),
+        ...chat.cue(),
+    ];
 
-    const output = await ctx
-        .generate(Sampler.topP(temperature, topP), { maxTokens })
-        .collectText();
+    // `passKind()` is what selects the forward-pass interface a port would
+    // bind: 'attention', 'recurrent', or 'hybrid'. Never derive it by parsing
+    // `architecture()` — that is an open set.
+    const report = {
+        model: model.name(),
+        architecture: model.architecture(),
+        passKind: model.passKind(),
+        promptTokens: tokens.length,
+        roundTrip: tokenizer.decode(Uint32Array.from(tokens)),
+    };
 
-    session.send(output);
-    return output;
+    session.send(report);
+    return JSON.stringify(report);
 }
