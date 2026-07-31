@@ -827,8 +827,17 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
         size_t(std::max({sched_.colors_used, mb_sched_.colors_used,
                          prefill_sched_.colors_used})) *
         plan_.scratch_slot_bytes;
+    // Streamed weights are bound over a pack, so the heap must be created
+    // WITHOUT them: a heap sized for weights that are then also mapped is the
+    // footprint doubled rather than halved, which on a machine where the model
+    // only just fits is the difference between running and reading zeros.
+    const auto streams = SimpleFamilyEngine::stream_predicate(model::ModelFamily::Qwen35);
+    const size_t streamed =
+        streams ? size_t(streamable_plan_bytes(load_plan, streams)) : 0;
+    const size_t resident_weights =
+        plan_.weights_bytes > streamed ? plan_.weights_bytes - streamed : plan_.weights_bytes;
     const size_t heap_bytes =
-        plan_.weights_bytes + plan_.io_bytes + plan_.mb_io_bytes +
+        resident_weights + plan_.io_bytes + plan_.mb_io_bytes +
         consts_budget + (32u << 20);
     const size_t elastic_budget =
         plan_.kv_bytes + plan_.state_bytes + plan_.scratch_bytes +
@@ -841,7 +850,7 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
     }
 
     // ── Stage weights/state/KV/IO; bind weight/state/KV/IO slots by ordinal. ──
-    b_ = stage_decode_storage(*ctx_, view, load_plan, g_, plan_);
+    b_ = stage_decode_storage(*ctx_, view, load_plan, g_, plan_, streams);
     bind_decode_dag(*ctx_, b_, dag_, g_, gdn_prep_);
 
     // ── Scratch pool (colors_used slots) → beta's bind pass. ──

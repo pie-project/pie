@@ -27,6 +27,10 @@ struct Dispatch;  // beta: decode_step.hpp
 struct BoundDecode {
     HeapPlan plan;
     SlotHandle weights_region;
+    /// Keeps any streamed weights' mapping alive. It MUST outlive every slot in
+    /// `weights`: they point into it, and unmapping it under them reads as
+    /// weights of exactly zero.
+    std::shared_ptr<void> stream_pack;
 
     // load-once weights, keyed by HF tensor name (tied lm_head appears once).
     std::unordered_map<std::string, SlotHandle> weights;
@@ -108,7 +112,8 @@ BoundDecode stage_decode_storage(
     const pie_loader::CheckpointSource& view,
     const pie_loader::LoadPlan& load_plan,
     const DecodeGeometry& g,
-    const HeapPlan& heap_plan);
+    const HeapPlan& heap_plan,
+    const std::function<bool(const std::string&)>& streams = {});
 
 // Walk beta's DAG; bind delta's weight/state/KV/IO slots for each dispatch by ordinal.
 void bind_decode_dag(RawMetalContext& ctx, const BoundDecode& b,

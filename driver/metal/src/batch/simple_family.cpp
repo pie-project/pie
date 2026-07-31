@@ -230,9 +230,19 @@ class Gemma4Engine final : public SimpleFamilyEngine {
         try {
             const auto storage = load_plan.view();
             pie_loader::CheckpointSource view(storage);
-            StagedWeights staged =
-                stage_plan_weights(ctx, view, load_plan, storage.memory.persistent_bytes);
+            StagedWeights staged = stage_plan_weights(
+                ctx, view, load_plan, storage.memory.persistent_bytes,
+                stream_predicate(pie::metal::model::ModelFamily::Gemma4));
             b_.weights = std::move(staged.weights);
+            // The pack must outlive the weights that point into it; see the
+            // gpt-oss engine below.
+            stream_pack_ = std::move(staged.stream_pack);
+            if (staged.streamed_bytes > 0) {
+                std::fprintf(stderr,
+                             "[pie-metal] gemma4: %.2f GB of FFN weights streamed from a "
+                             "pack, and out of the heap\n",
+                             double(staged.streamed_bytes) / 1e9);
+            }
         } catch (const std::exception& e) {
             if (err) *err = std::string("staging gemma4's weights: ") + e.what();
             return false;
@@ -417,6 +427,8 @@ class Gemma4Engine final : public SimpleFamilyEngine {
     static constexpr int kPageSize = 32;
 
     gemma4::Gemma4Geometry g_{};
+    /// Keeps the streamed weights' mapping alive; see `init`.
+    std::shared_ptr<void> stream_pack_{};
     int max_ctx_ = 0;
     int max_rows_ = 1;
     int max_sampled_ = 1;
@@ -817,14 +829,49 @@ std::function<bool(const std::string&)> SimpleFamilyEngine::stream_predicate(
     pie::metal::model::ModelFamily family) {
     const char* on = std::getenv("PIE_METAL_STREAM_EXPERTS");
     if (on == nullptr || *on == '\0' || std::string(on) == "0") return {};
-    if (family != pie::metal::model::ModelFamily::GptOss) return {};
-    // gpt-oss's routed expert bank is 10.75 of this checkpoint's 11.8 GB, and a
-    // token reads 4 experts in 32 per layer. `.bias` stays resident: 180 KB a
-    // layer against 132 MB, and a page of it is read whichever expert runs.
-    return [](const std::string& n) {
-        if (n.find("mlp.experts.") == std::string::npos) return false;
-        return !(n.size() > 5 && n.compare(n.size() - 5, 5, ".bias") == 0);
+
+    // What is worth streaming is the per-layer projection bank: it is nearly
+    // all of any checkpoint's bytes, and it is the only class big enough for
+    // the trade to matter.
+    //
+    // The trade differs by how the bank is READ, and both halves are useful:
+    //
+    //   * a SPARSE bank -- gpt-oss's routed experts, of which a token reads 4
+    //     in 32 per layer -- is nearly free to stream. An eighth faults in and
+    //     the kernel evicts the rest. Measured: 10.75 GB out of the heap, same
+    //     tokens, same rate.
+    //   * a DENSE bank is read whole every token, so streaming it does not
+    //     save traffic. What it saves is the requirement that the weights fit
+    //     at all: a model larger than RAM runs, slowly, instead of failing to
+    //     load. For a model that fits comfortably this is the wrong trade,
+    //     which is why it is off by default.
+    //
+    // `.bias` stays resident everywhere: it is three orders of magnitude
+    // smaller than the weight beside it and is read whichever expert runs.
+    const auto is_bias = [](const std::string& n) {
+        return n.size() > 5 && n.compare(n.size() - 5, 5, ".bias") == 0;
     };
+    switch (family) {
+        case pie::metal::model::ModelFamily::GptOss:
+            return [is_bias](const std::string& n) {
+                return n.find("mlp.experts.") != std::string::npos && !is_bias(n);
+            };
+        case pie::metal::model::ModelFamily::Gemma4:
+        case pie::metal::model::ModelFamily::Qwen35:
+            // The dense FFN, which is ~70% of a decoder layer. Named by the
+            // three projections rather than by "mlp." so the per-layer
+            // embedding tensors beside them -- small, and read every token --
+            // stay resident.
+            return [is_bias](const std::string& n) {
+                if (is_bias(n)) return false;
+                return n.find("mlp.gate_proj") != std::string::npos ||
+                       n.find("mlp.up_proj") != std::string::npos ||
+                       n.find("mlp.down_proj") != std::string::npos;
+            };
+        case pie::metal::model::ModelFamily::Unknown:
+            return {};
+    }
+    return {};
 }
 
 std::size_t SimpleFamilyEngine::extra_heap_bytes(pie::metal::model::ModelFamily family,
