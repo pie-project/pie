@@ -62,6 +62,20 @@ class SimpleFamilyEngine {
     static std::size_t extra_heap_bytes(model::ModelFamily family, const SetupConfig& cfg,
                                         int max_ctx);
 
+    /// The most rows per fire this family can afford, for a `budget_bytes`
+    /// activation pool.
+    ///
+    /// Derived by asking `extra_heap_bytes` — the same function that will do
+    /// the allocating — rather than from a per-row price. A price has to be
+    /// guessed once and then goes stale: the shipped one charges every prefill
+    /// row a `vocab * 2` slice of logits, which was true before `RowGather`
+    /// and has not been true since. Bisecting the real function cannot go
+    /// stale, and costs microseconds because the DAG, the dataflow and the
+    /// colouring are all pure.
+    static std::uint32_t max_forward_tokens_for_budget(model::ModelFamily family,
+                                                       const SetupConfig& cfg, int max_ctx,
+                                                       std::uint64_t budget_bytes);
+
     /// Which of this family's tensors are worth streaming, or null if none are.
     ///
     /// Streaming binds them over a page-aligned pack instead of copying them

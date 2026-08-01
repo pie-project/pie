@@ -243,6 +243,16 @@ inline constexpr std::uint32_t kPagedForwardRowBudgetBytes = 384u << 20;
 inline constexpr std::uint32_t kPagedScratchColors = 16;
 inline constexpr std::uint32_t kPagedMinForwardTokens = 64;
 inline constexpr std::uint32_t kPagedMaxForwardTokensCeiling = 512;
+/// The bound for a family whose row budget is DERIVED rather than priced.
+///
+/// 512 is what a per-row price of `vocab * 2` buys, and that price stopped
+/// being true for these families when `Kind::RowGather` moved the LM head onto
+/// the sampled rows only. A prompt longer than the ceiling is refused, not
+/// chunked, so the ceiling is a hard bound on what can be run -- worth deriving
+/// from the pool that will actually be allocated. This caps that derivation:
+/// past a few thousand rows a fire is no longer a prompt, and the argument
+/// tables are per-row.
+inline constexpr std::uint32_t kPagedMaxForwardTokensHardCeiling = 4096;
 // Every row claims a block of argument-table ordinals, so this ceiling also
 // fixes where the prefill's ordinal space ends and PTIR's may begin; see
 // `kPrefillOrdinalLimit`, which the setup path cross-checks against this.
@@ -268,29 +278,9 @@ inline std::uint32_t paged_max_forward_tokens(std::uint32_t vocab,
 /// advertise more and the driver accepts a fire it cannot hold; allocate more
 /// and an 11.8 GB checkpoint fails to create its heap over a fire nobody asked
 /// for. One function, called from both places.
-/// `PIE_METAL_MAX_FORWARD_TOKENS` raises the ceiling.
-///
-/// A prompt longer than this many tokens is REFUSED, not chunked -- measured,
-/// on all three families: a 650-token prompt fails with "forward request has
-/// 650 forward tokens, exceeding driver limit". That is the pre-existing
-/// `kPagedMaxForwardTokensCeiling`, and it is priced for qwen3.5, whose every
-/// prefill row costs a `vocab * 2` slice of logits.
-///
-/// It over-prices the families served here. `Kind::RowGather` means their tail
-/// runs on the SAMPLED rows only, so a prefill row costs its activation
-/// widths -- hidden, not vocabulary -- and the ceiling could be higher. What
-/// the right number is has not been measured, so the default is unchanged and
-/// this exists to lift it for a long-prompt experiment: at 1024 the same
-/// 650-token prompt completes.
-inline std::uint32_t simple_family_max_forward_tokens(std::uint32_t requested) {
-    if (requested == 0) return 1;
-    static const std::uint32_t ceiling = [] {
-        const char* e = std::getenv("PIE_METAL_MAX_FORWARD_TOKENS");
-        const int v = (e != nullptr && *e != '\0') ? std::atoi(e) : 0;
-        return v > 0 ? std::uint32_t(v) : kPagedMaxForwardTokensCeiling;
-    }();
-    return std::min(requested, ceiling);
-}
+// The rows-per-fire bound for a `SimpleFamilyEngine` family is DERIVED from the
+// activation pool it will actually allocate; see `simple_family_row_budget` in
+// context.cpp. There is no fixed ceiling for them to consult here.
 
 struct SetupConfig {
     std::string checkpoint_dir;  // HF snapshot dir (config.json + safetensors)

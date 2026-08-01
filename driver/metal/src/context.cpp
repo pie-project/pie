@@ -35,6 +35,7 @@
 #include "pipeline/registry.hpp"
 #include "batch/compose.hpp"
 #include "batch/forward.hpp"
+#include "batch/simple_family.hpp"
 #include "batch/scratch.hpp"
 #include "batch/worker.hpp"
 #include "decode_abi.hpp"
@@ -457,6 +458,135 @@ ModelFacts read_model_facts(const std::string& hf_path) {
     return facts;
 }
 
+/// How many rows per fire a `SimpleFamilyEngine` family can afford.
+///
+/// Derived from the activation pool that will actually be allocated, not from
+/// a per-row price. The shipped price charges every prefill row a `vocab * 2`
+/// slice of logits, which stopped being true when `Kind::RowGather` moved the
+/// LM head onto the sampled rows -- and it is a HARD bound, because a prompt
+/// longer than this is refused rather than chunked. Measured before this
+/// change: a 650-token prompt failed on all three families.
+///
+/// One function, called by the capabilities pass and by setup, because a
+/// capability advertising more rows than setup allocates is a fire the driver
+/// accepts and cannot hold.
+///
+/// Only these families. qwen3.5's bound is STRUCTURAL, not a memory budget:
+/// its prefill claims `kPrefillOrdinalStride` argument-table ordinals PER ROW,
+/// so `kPrefillOrdinalMaxRows` rows is where that range meets PTIR's base --
+/// a collision that has happened once already and read as "no argument table
+/// bound for ordinal=100038". These families bind ONE DAG and pass the row
+/// count as a launch parameter, so their ordinal use does not grow with rows
+/// and only memory bounds them.
+std::uint32_t simple_family_row_budget(const Config& cfg, const ModelFacts& facts);
+
+/// Fill a SetupConfig's model geometry from the facts read out of config.json.
+///
+/// Shared by the capabilities pass and by setup, because the two must agree
+/// about the SAME model: the row budget below is DERIVED from this geometry,
+/// and a capability advertising more rows than setup allocates is a fire the
+/// driver accepts and cannot hold.
+void fill_family_geometry(pie::metal::batch::SetupConfig& cfg, const ModelFacts& facts) {
+    cfg.model_type = facts.model_type;
+    cfg.rope_theta = facts.rope_theta;
+    cfg.partial_rotary_factor = facts.partial_rotary_factor;
+    cfg.gptoss.n_layers = facts.go_num_hidden_layers;
+    cfg.gptoss.hidden = facts.go_hidden_size;
+    cfg.gptoss.vocab = facts.go_vocab_size;
+    cfg.gptoss.n_q_heads = facts.go_num_attention_heads;
+    cfg.gptoss.n_kv_heads = facts.go_num_key_value_heads;
+    cfg.gptoss.head_dim = facts.go_head_dim;
+    cfg.gptoss.sliding_window = facts.go_sliding_window;
+    cfg.gptoss.n_experts = facts.go_num_local_experts;
+    cfg.gptoss.experts_per_token = facts.go_num_experts_per_tok;
+    cfg.gptoss.intermediate = facts.go_intermediate_size;
+    cfg.gptoss.eps = facts.go_rms_norm_eps;
+    cfg.gptoss.swiglu_limit = facts.go_swiglu_limit;
+    cfg.gptoss.rope_theta = facts.go_rope_theta;
+    cfg.gptoss.rope_factor = facts.go_rope_factor;
+    cfg.gptoss.rope_beta_fast = facts.go_rope_beta_fast;
+    cfg.gptoss.rope_beta_slow = facts.go_rope_beta_slow;
+    cfg.gptoss.rope_original_max_position = facts.go_rope_original_max_position;
+    cfg.gemma4.n_layers = facts.g4_num_hidden_layers;
+    cfg.gemma4.hidden = facts.g4_hidden_size;
+    cfg.gemma4.intermediate = facts.g4_intermediate_size;
+    cfg.gemma4.n_q_heads = facts.g4_num_attention_heads;
+    cfg.gemma4.n_kv_heads = facts.g4_num_key_value_heads;
+    cfg.gemma4.head_dim = facts.g4_head_dim;
+    cfg.gemma4.global_head_dim = facts.g4_global_head_dim;
+    cfg.gemma4.sliding_window = facts.g4_sliding_window;
+    cfg.gemma4.num_kv_shared_layers = facts.g4_num_kv_shared_layers;
+    cfg.gemma4.per_layer_emb_dim = facts.g4_per_layer_emb_dim;
+    cfg.gemma4.full_attn_interval = facts.g4_full_attn_interval;
+    cfg.gemma4.double_wide_mlp = facts.g4_double_wide_mlp;
+    cfg.gemma4.final_softcap = facts.g4_final_softcap;
+    cfg.gemma4.rope_theta_full = facts.g4_rope_theta_full;
+    cfg.gemma4.rope_theta_sliding = facts.g4_rope_theta_sliding;
+    cfg.gemma4.full_partial_rotary = facts.g4_full_partial_rotary;
+}
+
+/// How much heap the activation pool may spend on rows.
+///
+/// 1 GB, against `kPagedForwardRowBudgetBytes`'s 384 MB. That constant was
+/// chosen when a prefill row cost a `vocab * 2` slice of logits; `RowGather`
+/// moved the LM head onto the sampled rows, so the same budget now buys far
+/// fewer rows than it should -- and rows are a HARD bound, since a prompt
+/// longer than the row count is refused rather than chunked. At 384 MB gemma4
+/// admits 256 tokens.
+///
+/// The larger budget is free, which is the reason it can be a default rather
+/// than a flag. Measured, gemma4 through `pie serve`:
+///
+///   budget  rows  pool    peak serve RSS
+///   384 MB   256  351 MB  2.84 GB
+///   1 GB    4096  984 MB  2.84 GB
+///
+/// The pool is a heap reservation, and a fire touches only the rows it has.
+/// `PIE_METAL_ROW_BUDGET_MB` lowers it for a machine where the reservation
+/// itself is the problem.
+std::uint64_t row_budget_bytes() {
+    if (const char* e = std::getenv("PIE_METAL_ROW_BUDGET_MB"); e != nullptr && *e != '\0') {
+        const long v = std::atol(e);
+        if (v > 0) return std::uint64_t(v) << 20;
+    }
+    return std::uint64_t(1) << 30;
+}
+
+std::uint32_t simple_family_row_budget(const Config& cfg, const ModelFacts& facts) {
+    pie::metal::batch::SetupConfig probe;
+    fill_family_geometry(probe, facts);
+    probe.vocab_size = facts.vocab_size;
+    probe.max_forward_requests = cfg.batching.max_forward_requests;
+    const int max_ctx =
+        int(facts.max_model_len > 0 ? facts.max_model_len : kMetalPhase1aMaxCtxTokens);
+    const std::uint32_t derived =
+        pie::metal::batch::SimpleFamilyEngine::max_forward_tokens_for_budget(
+            pie::metal::model::model_family_of(facts.model_type), probe, max_ctx,
+            row_budget_bytes());
+    const std::uint32_t want = cfg.batching.max_forward_tokens;
+    const std::uint32_t rows = std::min(want == 0 ? derived : want, derived);
+    // Said once, because a refused prompt reports only the limit and not how
+    // the limit was arrived at. Caps runs on the calling thread and setup on
+    // the worker, so the guard is a magic static rather than a plain bool.
+    [[maybe_unused]] static const bool announced = [&] {
+        const auto family = pie::metal::model::model_family_of(facts.model_type);
+        pie::metal::batch::SetupConfig at = probe;
+        at.max_forward_tokens = 1;
+        const std::uint64_t floor =
+            pie::metal::batch::SimpleFamilyEngine::extra_heap_bytes(family, at, max_ctx);
+        at.max_forward_tokens = rows;
+        const std::uint64_t full =
+            pie::metal::batch::SimpleFamilyEngine::extra_heap_bytes(family, at, max_ctx);
+        std::fprintf(stderr,
+                     "[pie-metal] rows per fire: %u (activation pool %.0f MB of a %.0f MB "
+                     "budget; a longer prompt is refused, not chunked)\n",
+                     rows, double(full - floor) / (1024.0 * 1024.0),
+                     double(row_budget_bytes()) / (1024.0 * 1024.0));
+        return true;
+    }();
+    return rows;
+}
+
 std::string build_caps_json(const Config& cfg,
                             const ModelFacts& facts) {
     const bool rs_cache_required = facts.has_linear_attn;
@@ -530,8 +660,7 @@ std::string build_caps_json(const Config& cfg,
         rs_cache_required
             ? std::min(cfg.batching.max_forward_tokens, kMetalPagedMaxForwardTokens)
             : (simple_family_engine
-                   ? executor::simple_family_max_forward_tokens(
-                         cfg.batching.max_forward_tokens)
+                   ? simple_family_row_budget(cfg, facts)
                    : cfg.batching.max_forward_tokens);
     const std::uint32_t max_model_len =
         rs_cache_required ? std::min(facts.max_model_len, kMetalPhase1aMaxCtxTokens)
@@ -2136,46 +2265,11 @@ class Context::Impl {
         setup_cfg.max_forward_tokens =
             (setup_family == pie::metal::model::ModelFamily::Gemma4 ||
              setup_family == pie::metal::model::ModelFamily::GptOss)
-                ? executor::simple_family_max_forward_tokens(cfg_.batching.max_forward_tokens)
+                ? simple_family_row_budget(cfg_, facts_)
                 : cfg_.batching.max_forward_tokens;
         setup_cfg.max_forward_requests = cfg_.batching.max_forward_requests;
         setup_cfg.snapshot_dir = cfg_.model.hf_path;
-        setup_cfg.model_type = facts_.model_type;
-        setup_cfg.rope_theta = facts_.rope_theta;
-        setup_cfg.partial_rotary_factor = facts_.partial_rotary_factor;
-        setup_cfg.gptoss.n_layers = facts_.go_num_hidden_layers;
-        setup_cfg.gptoss.hidden = facts_.go_hidden_size;
-        setup_cfg.gptoss.vocab = facts_.go_vocab_size;
-        setup_cfg.gptoss.n_q_heads = facts_.go_num_attention_heads;
-        setup_cfg.gptoss.n_kv_heads = facts_.go_num_key_value_heads;
-        setup_cfg.gptoss.head_dim = facts_.go_head_dim;
-        setup_cfg.gptoss.sliding_window = facts_.go_sliding_window;
-        setup_cfg.gptoss.n_experts = facts_.go_num_local_experts;
-        setup_cfg.gptoss.experts_per_token = facts_.go_num_experts_per_tok;
-        setup_cfg.gptoss.intermediate = facts_.go_intermediate_size;
-        setup_cfg.gptoss.eps = facts_.go_rms_norm_eps;
-        setup_cfg.gptoss.swiglu_limit = facts_.go_swiglu_limit;
-        setup_cfg.gptoss.rope_theta = facts_.go_rope_theta;
-        setup_cfg.gptoss.rope_factor = facts_.go_rope_factor;
-        setup_cfg.gptoss.rope_beta_fast = facts_.go_rope_beta_fast;
-        setup_cfg.gptoss.rope_beta_slow = facts_.go_rope_beta_slow;
-        setup_cfg.gptoss.rope_original_max_position = facts_.go_rope_original_max_position;
-        setup_cfg.gemma4.n_layers = facts_.g4_num_hidden_layers;
-        setup_cfg.gemma4.hidden = facts_.g4_hidden_size;
-        setup_cfg.gemma4.intermediate = facts_.g4_intermediate_size;
-        setup_cfg.gemma4.n_q_heads = facts_.g4_num_attention_heads;
-        setup_cfg.gemma4.n_kv_heads = facts_.g4_num_key_value_heads;
-        setup_cfg.gemma4.head_dim = facts_.g4_head_dim;
-        setup_cfg.gemma4.global_head_dim = facts_.g4_global_head_dim;
-        setup_cfg.gemma4.sliding_window = facts_.g4_sliding_window;
-        setup_cfg.gemma4.num_kv_shared_layers = facts_.g4_num_kv_shared_layers;
-        setup_cfg.gemma4.per_layer_emb_dim = facts_.g4_per_layer_emb_dim;
-        setup_cfg.gemma4.full_attn_interval = facts_.g4_full_attn_interval;
-        setup_cfg.gemma4.double_wide_mlp = facts_.g4_double_wide_mlp;
-        setup_cfg.gemma4.final_softcap = facts_.g4_final_softcap;
-        setup_cfg.gemma4.rope_theta_full = facts_.g4_rope_theta_full;
-        setup_cfg.gemma4.rope_theta_sliding = facts_.g4_rope_theta_sliding;
-        setup_cfg.gemma4.full_partial_rotary = facts_.g4_full_partial_rotary;
+        fill_family_geometry(setup_cfg, facts_);
         setup_cfg.storage_page_size = storage_page_size_;
         // Create + `setup()` the executor ON THE WORKER THREAD (Phase 3, §7):
         // MetalExecutor::setup builds the Metal device/heap/PSOs, which must

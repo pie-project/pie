@@ -825,6 +825,40 @@ class GptOssEngine final : public SimpleFamilyEngine {
 
 }  // namespace
 
+std::uint32_t SimpleFamilyEngine::max_forward_tokens_for_budget(
+    pie::metal::model::ModelFamily family, const SetupConfig& cfg, int max_ctx,
+    std::uint64_t budget_bytes) {
+    // `extra_heap_bytes` covers the KV region and a base slack as well as the
+    // pool, and only the POOL scales with rows -- the other two dominate. So
+    // the budget is spent on the DIFFERENCE from a one-row fire, not on the
+    // total: comparing the total against a pool-sized budget makes every model
+    // answer "one row", which is how this first came out at the floor.
+    SetupConfig probe = cfg;
+    probe.max_forward_tokens = 1;
+    const std::uint64_t floor = extra_heap_bytes(family, probe, max_ctx);
+    const auto rows_cost = [&](std::uint32_t rows) {
+        probe.max_forward_tokens = rows;
+        const std::uint64_t total = extra_heap_bytes(family, probe, max_ctx);
+        return total > floor ? total - floor : 0;
+    };
+
+    // Bisect the real function. Monotone in `max_forward_tokens`, so this is
+    // exact rather than an estimate -- and it stays exact when the DAG changes.
+    if (rows_cost(kPagedMaxForwardTokensHardCeiling) <= budget_bytes) {
+        return kPagedMaxForwardTokensHardCeiling;
+    }
+    std::uint32_t lo = 1, hi = kPagedMaxForwardTokensHardCeiling;
+    while (lo + 1 < hi) {
+        const std::uint32_t mid = lo + (hi - lo) / 2;
+        if (rows_cost(mid) <= budget_bytes) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    return std::max(lo, kPagedMinForwardTokens);
+}
+
 std::function<bool(const std::string&)> SimpleFamilyEngine::stream_predicate(
     pie::metal::model::ModelFamily family) {
     const char* on = std::getenv("PIE_METAL_STREAM_EXPERTS");
