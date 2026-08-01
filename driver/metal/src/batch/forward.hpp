@@ -27,6 +27,7 @@
 #include <cstddef>
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <string>
@@ -267,9 +268,28 @@ inline std::uint32_t paged_max_forward_tokens(std::uint32_t vocab,
 /// advertise more and the driver accepts a fire it cannot hold; allocate more
 /// and an 11.8 GB checkpoint fails to create its heap over a fire nobody asked
 /// for. One function, called from both places.
+/// `PIE_METAL_MAX_FORWARD_TOKENS` raises the ceiling.
+///
+/// A prompt longer than this many tokens is REFUSED, not chunked -- measured,
+/// on all three families: a 650-token prompt fails with "forward request has
+/// 650 forward tokens, exceeding driver limit". That is the pre-existing
+/// `kPagedMaxForwardTokensCeiling`, and it is priced for qwen3.5, whose every
+/// prefill row costs a `vocab * 2` slice of logits.
+///
+/// It over-prices the families served here. `Kind::RowGather` means their tail
+/// runs on the SAMPLED rows only, so a prefill row costs its activation
+/// widths -- hidden, not vocabulary -- and the ceiling could be higher. What
+/// the right number is has not been measured, so the default is unchanged and
+/// this exists to lift it for a long-prompt experiment: at 1024 the same
+/// 650-token prompt completes.
 inline std::uint32_t simple_family_max_forward_tokens(std::uint32_t requested) {
     if (requested == 0) return 1;
-    return std::min(requested, kPagedMaxForwardTokensCeiling);
+    static const std::uint32_t ceiling = [] {
+        const char* e = std::getenv("PIE_METAL_MAX_FORWARD_TOKENS");
+        const int v = (e != nullptr && *e != '\0') ? std::atoi(e) : 0;
+        return v > 0 ? std::uint32_t(v) : kPagedMaxForwardTokensCeiling;
+    }();
+    return std::min(requested, ceiling);
 }
 
 struct SetupConfig {
