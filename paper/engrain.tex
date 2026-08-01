@@ -60,7 +60,7 @@ against XGrammar's 1{,}743--3{,}382 and llguidance's 769--797, adds
 90\,\textmu{}s to an overlapped decode step where a host matcher adds 398, and
 holds its p99 flat when the host loses cores to other work while the host
 matcher's p99 rises 7.8$\times$. Masks are bit-exact against a reference
-matcher over 7{,}198 verified rows. We also report where residency is paid for,
+matcher over 7{,}289 verified rows. We also report where residency is paid for,
 including where it loses: at batch 1 we are 0.4--0.7$\times$, on one of three
 schemas llguidance is 4.8$\times$ cheaper than us at batch 512, our compiler is
 112$\times$ slower than llguidance's at the median, and our lowering accepts
@@ -795,10 +795,10 @@ found --- and fixed --- a real defect in our own compiler.
 against an independent CPU reference matcher built from the same tables, over
 four verifications: \textbf{corpus} (619 rows on model-generated documents),
 \textbf{walk} (4{,}800 rows on random walks, which reach states real documents
-do not), \textbf{conflicted} (687 rows on grammars with reduce/reduce
+do not), \textbf{conflicted} (778 rows on grammars with reduce/reduce
 conflicts, where forking is live), and \textbf{mixed} (1{,}092 rows on batches
 of several grammars, including a CUDA graph \emph{recorded on one assignment of
-grammars to sequences and replayed on a different one}). All 7{,}198 rows match,
+grammars to sequences and replayed on a different one}). All 7{,}289 rows match,
 zero failures. The graph-replay check is the one the residency claim rests on:
 a recorded step survives the batch composition changing underneath it, which is
 what continuous batching does every step. 99 unit tests also run under all
@@ -1000,7 +1000,7 @@ stack, and conflict forks --- resident on the GPU, which makes the constraint
 capturable, fusable with the sampler, and advanceable through a speculative
 draft without a host round trip. It adds 90\,\textmu{}s to an overlapped step
 where a host matcher adds 398, holds its tail flat under CPU contention where a
-host matcher's p99 rises 7.8$\times$, and is bit-exact over 7{,}198 verified
+host matcher's p99 rises 7.8$\times$, and is bit-exact over 7{,}289 verified
 rows. It also compiles 112$\times$ slower than llguidance, holds 27$\times$ more
 memory, loses below batch 32, and loses 4.8$\times$ on one schema of three. We
 believe the structural claim is worth those prices, and we have tried to report
