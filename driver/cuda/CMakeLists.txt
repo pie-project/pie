@@ -1094,6 +1094,13 @@ if(PIE_LOADER_STATICLIB)
       ${PIE_LOADER_INCLUDE_DIR}
     LIBS pie_driver_cuda_lib nlohmann_json::nlohmann_json ${PIE_LOADER_STATICLIB} dl pthread)
 endif()
+# The materialized-weight artifact's round trip and its page alignment. Needs a
+# device because the format's payload is device memory: serializing is a D2H of
+# every owned buffer.
+pie_add_cuda_target(test_weight_store_codec
+  SOURCES tests/weight_store_codec_test.cpp
+  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/src ${PIE_LOADER_INCLUDE_DIR}
+  LIBS pie_driver_cuda_lib CUDA::cudart)
 # The non-compact ExtentWrite path. Header-only: it builds its own one-file
 # plan, so it needs the loader's headers but not the staticlib.
 pie_add_cuda_target(test_strided_copy

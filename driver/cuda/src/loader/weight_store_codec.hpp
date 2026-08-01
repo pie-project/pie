@@ -43,7 +43,19 @@
 namespace pie_cuda_driver::weight_codec {
 
 inline constexpr char kMagic[8] = {'P', 'I', 'E', 'W', 'S', 'T', 'O', 'R'};
-inline constexpr std::uint32_t kFormatVersion = 4;
+inline constexpr std::uint32_t kFormatVersion = 5;
+// Every blob starts here, and so does the blob section. 16 KiB is Apple
+// silicon's page; x86-64's 4 KiB divides it, so one artifact is mappable on
+// both.
+//
+// The point is not tidiness. A blob that begins on a page can be handed to the
+// device as a mapping of the file instead of a copy into device memory, which
+// is what lets a weight be paged in on demand rather than held resident. It has
+// to be a page of its *own*: two blobs sharing one means faulting either drags
+// in the other, and for routed experts -- where the whole point is to fault in
+// the four that routed and not the other twenty-eight -- that would give back
+// everything the paging was for.
+inline constexpr std::uint64_t kBlobAlign = 16384;
 // Blob checksum fold granularity. Boundary-DEPENDENT (see blob_hash_update), so
 // serialize and restore MUST fold in identical chunks; both use this constant.
 inline constexpr std::uint64_t kChunkBytes = 64ull * 1024ull * 1024ull;
@@ -267,10 +279,13 @@ inline bool serialize_weight_store(const WeightStore& store,
         views.push_back(ViewEntry{&rec, root_index, byte_offset});
     }
 
+    const auto round_up = [](std::uint64_t v) {
+        return (v + kBlobAlign - 1) / kBlobAlign * kBlobAlign;
+    };
     std::uint64_t blob_cursor = 0;
     for (auto& r : owned) {
         r.blob_offset = blob_cursor;
-        blob_cursor += r.nbytes;
+        blob_cursor = round_up(blob_cursor + r.nbytes);
     }
     const std::uint64_t blob_section_bytes = blob_cursor;
 
@@ -282,6 +297,13 @@ inline bool serialize_weight_store(const WeightStore& store,
     const auto& qmap = store.quant_meta_map();
     put_scalar<std::uint64_t>(out, qmap.size());
     put_scalar<std::uint64_t>(out, blob_section_bytes);
+    // Where the blob section starts. Recorded rather than inferred from where
+    // the tables happened to end, because the tables are followed by padding
+    // now: a blob's offset within the section is aligned, which only puts the
+    // blob on a page if the section is too, and the section's position depends
+    // on how long every tensor's name is.
+    const std::streampos blob_section_pos_slot = out.tellp();
+    put_scalar<std::uint64_t>(out, std::uint64_t{0});  // patched below
 
     std::vector<std::streampos> checksum_pos(owned.size());
     for (std::uint64_t i = 0; i < owned.size(); ++i) {
@@ -305,6 +327,20 @@ inline bool serialize_weight_store(const WeightStore& store,
         put_str(out, m.zero_point_name);
         put_scalar<std::int32_t>(out, static_cast<std::int32_t>(m.group_size));
         put_scalar<std::int32_t>(out, static_cast<std::int32_t>(m.channel_axis));
+    }
+
+    // Pad to the boundary, then record where that landed.
+    {
+        const auto here = static_cast<std::uint64_t>(out.tellp());
+        const std::uint64_t start = round_up(here);
+        const std::vector<char> pad(static_cast<std::size_t>(start - here), '\0');
+        if (!pad.empty()) {
+            out.write(pad.data(), static_cast<std::streamsize>(pad.size()));
+        }
+        const auto resume = out.tellp();
+        out.seekp(blob_section_pos_slot);
+        put_scalar<std::uint64_t>(out, start);
+        out.seekp(resume);
     }
 
     // Blob section: D2H each owned buffer in chunks, write + checksum.
@@ -331,6 +367,17 @@ inline bool serialize_weight_store(const WeightStore& store,
             done += n;
         }
         checksums[i] = sum;
+        // Padding to the next blob's aligned offset. Not checksummed: it is not
+        // anyone's data, and including it would make the checksum depend on the
+        // alignment constant.
+        const std::uint64_t next = (i + 1 < owned.size())
+                                       ? owned[i + 1].blob_offset
+                                       : blob_section_bytes;
+        const std::uint64_t gap = next - (owned[i].blob_offset + owned[i].nbytes);
+        if (gap > 0) {
+            const std::vector<char> pad(static_cast<std::size_t>(gap), '\0');
+            out.write(pad.data(), static_cast<std::streamsize>(pad.size()));
+        }
     }
     for (std::uint64_t i = 0; i < owned.size(); ++i) {
         out.seekp(checksum_pos[i]);
@@ -373,6 +420,7 @@ inline bool restore_weight_store(const std::uint8_t* data, std::size_t size,
     const auto num_views = get_scalar<std::uint64_t>(is);
     const auto num_quant = get_scalar<std::uint64_t>(is);
     const auto blob_section_bytes = get_scalar<std::uint64_t>(is);
+    const auto blob_section_pos = get_scalar<std::uint64_t>(is);
 
     struct OwnedHdr { TensorDecl spec; std::uint64_t nbytes, blob_offset, checksum; };
     std::vector<OwnedHdr> owned(num_owned);
@@ -405,8 +453,14 @@ inline bool restore_weight_store(const std::uint8_t* data, std::size_t size,
     if (!is) {
         return false;  // truncated metadata
     }
-    const std::uint64_t blob_section_pos =
-        static_cast<std::uint64_t>(is.tellg());
+    // The tables must end at or before where the writer said the blobs begin;
+    // a file claiming otherwise would have the reader parsing padding as data.
+    if (blob_section_pos < static_cast<std::uint64_t>(is.tellg())) {
+        return false;
+    }
+    if (blob_section_pos % kBlobAlign != 0) {
+        return false;  // not mappable; not what this version writes
+    }
     if (blob_section_pos + blob_section_bytes > size) {
         return false;  // truncated blob section
     }
