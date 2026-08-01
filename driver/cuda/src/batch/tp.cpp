@@ -349,18 +349,29 @@ struct TpStallWatchdog {
                 const auto c = consumed.load(std::memory_order_acquire);
                 if (p == last_pub && c == last_con) {
                     const int ph = rank0_phase.load(std::memory_order_acquire);
+                    // Every rank, not just the first two: at tp>2 the whole
+                    // question is *which* rank stopped arriving, and a pair of
+                    // counters cannot name it.
+                    char coll[256];
+                    int off = 0;
+                    for (std::size_t r = 0; r < collectives.size(); ++r) {
+                        const auto n = collectives[r].load();
+                        if (n == 0) continue;
+                        off += std::snprintf(coll + off, sizeof(coll) - off,
+                                             "%sr%zu=%llu", off ? " " : "", r,
+                                             (unsigned long long)n);
+                    }
                     std::fprintf(stderr,
                         "[tp-watchdog] STALLED %ds: published=%llu consumed=%llu "
                         "(delta=%lld) rank0_last_phase=%s seq=%llu "
-                        "follower_forwards=%llu collectives=[r0=%llu r1=%llu]\n",
+                        "follower_forwards=%llu collectives=[%s]\n",
                         (++stuck) * 5,
                         (unsigned long long)p, (unsigned long long)c,
                         (long long)(p - c),
                         (ph >= 0 && ph < 5) ? kPhase[ph] : "none",
                         (unsigned long long)rank0_phase_seq.load(),
                         (unsigned long long)follower_forwards.load(),
-                        (unsigned long long)collectives[0].load(),
-                        (unsigned long long)collectives[1].load());
+                        coll);
                 } else {
                     stuck = 0;
                 }
@@ -1054,6 +1065,7 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
                 pi.row_valid.data(), pi.row_valid.data(),
                 static_cast<std::size_t>(N), ncclChar, 0,
                 comm.comm(), stream));
+        }
         if (!state_only_fold && has_write_desc && N > 0) {
             NCCL_CHECK(ncclBroadcast(
                 pi.w_page.data(), pi.w_page.data(),
@@ -1164,7 +1176,6 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
         }
         NCCL_CHECK_ASYNC(ncclGroupEnd(), comm.comm());
         payload_timer.stop();
-        }
 
         // 3. Host views of the qo/KV layout for the per-arch attention planner
         // (it runs outside the captured kernel sequence). Rank 0 already holds
