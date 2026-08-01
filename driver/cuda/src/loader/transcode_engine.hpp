@@ -455,6 +455,11 @@ private:
                 static_cast<int>(col_block),
                 /*stream=*/0);
         }
+        // A dequant launch that the driver rejects (a grid dimension past its
+        // limit, say) leaves a sticky error behind and writes nothing. Without
+        // this check the weights are silently garbage and the failure surfaces
+        // in whatever unrelated kernel next calls cudaGetLastError().
+        CUDA_CHECK(cudaGetLastError());
 #else
         (void)scratch;
         (void)dst;
