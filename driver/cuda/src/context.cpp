@@ -1866,9 +1866,11 @@ int Context::Impl::load_model(
             // device 0 while dereferencing this rank's pointers.
             const cudaError_t bind = cudaSetDevice(device_ordinal_);
             if (bind != cudaSuccess) {
-                std::cerr << "[pie-driver-cuda] tp follower rank " << tp_rank_
-                          << ": cudaSetDevice(" << device_ordinal_
-                          << ") failed: " << cudaGetErrorString(bind) << "\n";
+                pie_cuda_driver::tp_report_rank_failure(
+                    tp_cpu_gate_key_, tp_rank_,
+                    std::string("cudaSetDevice(") +
+                        std::to_string(device_ordinal_) +
+                        ") failed: " + cudaGetErrorString(bind));
                 return;
             }
             if (verbose) {
@@ -1882,13 +1884,13 @@ int Context::Impl::load_model(
                 pie_cuda_driver::tp_follower_serve(*executor_, tp_follower_stop_);
             } catch (const std::exception& e) {
                 if (!tp_follower_stop_.load()) {
-                   std::cerr << "[pie-driver-cuda] tp follower rank "
-                             << tp_rank_ << " exited: " << e.what() << "\n";
+                    pie_cuda_driver::tp_report_rank_failure(
+                        tp_cpu_gate_key_, tp_rank_, e.what());
                 }
             } catch (...) {
                 if (!tp_follower_stop_.load()) {
-                   std::cerr << "[pie-driver-cuda] tp follower rank "
-                             << tp_rank_ << " exited with unknown error\n";
+                    pie_cuda_driver::tp_report_rank_failure(
+                        tp_cpu_gate_key_, tp_rank_, "unknown error");
                 }
             }
         });
@@ -2359,6 +2361,24 @@ int Context::Impl::launch(const PieFrameDesc& frame, PieCompletion completion) {
         if (runtime_.notify != nullptr && completion.wait_id != 0) {
             runtime_.notify(
                 runtime_.ctx, completion.wait_id, completion.target_epoch);
+        }
+        // A lost TP rank is not a per-frame fault: every later frame fails the
+        // same way, and the requests already admitted never complete, so the
+        // engine serves nothing while still accepting work. There is no
+        // channel to tell the runtime "this driver is finished", and the
+        // failure has now been surfaced to this frame's clients, so stop the
+        // process rather than idle in a state no caller can distinguish from a
+        // hang. `PIE_TP_NO_FAIL_STOP=1` keeps it alive for debugging.
+        if (pie_cuda_driver::detail::g_tp_rank_failed.load(
+                std::memory_order_acquire)) {
+            const char* keep = std::getenv("PIE_TP_NO_FAIL_STOP");
+            if (keep == nullptr || keep[0] == '0' || keep[0] == '\0') {
+                std::cerr << "[pie-driver-cuda] TP group lost a rank; the "
+                             "driver cannot serve again — exiting\n";
+                std::cerr.flush();
+                std::fflush(nullptr);
+                std::_Exit(70);
+            }
         }
         return PIE_STATUS_OK;
     };
