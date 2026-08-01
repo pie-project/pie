@@ -4,7 +4,7 @@
 //! each query attends to the first `sink_size` positions and the most recent
 //! `window_size` positions. Masked KV pages remain allocated in this example.
 
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 use inferlet::{Result, chat, model as wit_model};
 use serde::Deserialize;
 

@@ -27,6 +27,7 @@
 #include <cstddef>
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <string>
@@ -226,35 +227,55 @@ inline constexpr std::uint32_t kMetalMaxCtxTokens =
 // `paged_max_forward_tokens` divides a budget by that, so a small-vocabulary
 // model is allowed more rows and a large one fewer, instead of every model
 // inheriting a number tuned against one checkpoint.  The floor keeps a single
-// long prompt working; the ceiling is where a full fleet stops splitting
-// (measured: sixteen 34-token prompts take 6 fires at 256 and 4 at both 512 and
-// 1024, so nothing above 512 buys anything for a batch this wide) and also
-// bounds prefill DAG construction, which is per row.
-// Sized so this checkpoint lands on its measured optimum: 677KB per row x 512
-// rows is ~340MB, which is what the budget below allows.  A model with a much
-// larger vocabulary pays more per row and is given proportionally fewer, which
-// is the point -- the staging is genuinely allocated either way.
-inline constexpr std::uint32_t kPagedForwardRowBudgetBytes = 384u << 20;
+// long prompt working.
+//
+// The ceiling is not a throughput optimum.  512 was, measured: sixteen 34-token
+// prompts take 6 fires at 256 and 4 at both 512 and 1024, so nothing above 512
+// buys a batch this wide anything.  But rows are also the longest prompt this
+// driver will ACCEPT -- a longer one is refused, not chunked -- so the ceiling
+// has to be sized for the longest prompt, not for the widest batch.  At 512 a
+// 650-token prompt was refused by every family.  1024 is what the 1GB budget
+// below affords this checkpoint (677KB per row), and it is free: measured
+// through `pie serve`, 566 rows and 1024 rows give the same 2.35GB peak RSS and
+// the same wall clock, because the pool is a heap RESERVATION and a fire
+// touches only the rows it has.
+//
+// `kPrefillOrdinalMaxRows` must be raised with this: qwen3.5's prefill builds
+// one DAG per row and claims an ordinal block for each, and PTIR's ordinal base
+// is derived from where that range ends.
+inline constexpr std::uint64_t kPagedForwardRowBudgetBytes = 1024ull << 20;
 // The scratch coloring is computed from the DAG, which does not exist yet when
 // capabilities are built.  A generous fixed count is fine here: at 12KB per
 // color against 485KB of logits, the whole scratch term is noise in this
 // division, and over-counting it can only make the answer conservative.
 inline constexpr std::uint32_t kPagedScratchColors = 16;
 inline constexpr std::uint32_t kPagedMinForwardTokens = 64;
-inline constexpr std::uint32_t kPagedMaxForwardTokensCeiling = 512;
+inline constexpr std::uint32_t kPagedMaxForwardTokensCeiling = 1024;
+/// The bound for a family whose row budget is DERIVED rather than priced.
+///
+/// 512 is what a per-row price of `vocab * 2` buys, and that price stopped
+/// being true for these families when `Kind::RowGather` moved the LM head onto
+/// the sampled rows only. A prompt longer than the ceiling is refused, not
+/// chunked, so the ceiling is a hard bound on what can be run -- worth deriving
+/// from the pool that will actually be allocated. This caps that derivation:
+/// past a few thousand rows a fire is no longer a prompt, and the argument
+/// tables are per-row.
+inline constexpr std::uint32_t kPagedMaxForwardTokensHardCeiling = 4096;
 // Every row claims a block of argument-table ordinals, so this ceiling also
 // fixes where the prefill's ordinal space ends and PTIR's may begin; see
 // `kPrefillOrdinalLimit`, which the setup path cross-checks against this.
 
 inline std::uint32_t paged_max_forward_tokens(std::uint32_t vocab,
                                               std::uint32_t scratch_widest_elems,
-                                              std::uint32_t scratch_colors) {
+                                              std::uint32_t scratch_colors,
+                                              std::uint64_t budget_bytes =
+                                                  kPagedForwardRowBudgetBytes) {
     const std::uint64_t per_row = std::uint64_t(vocab) * 2u +
                                   std::uint64_t(scratch_widest_elems) * 2u *
                                       std::max<std::uint32_t>(1, scratch_colors) +
                                   64u;  // per-row IO scalars
-    const std::uint64_t rows = per_row == 0 ? kPagedMaxForwardTokensCeiling
-                                            : kPagedForwardRowBudgetBytes / per_row;
+    const std::uint64_t rows =
+        per_row == 0 ? kPagedMaxForwardTokensCeiling : budget_bytes / per_row;
     return std::clamp<std::uint32_t>(static_cast<std::uint32_t>(rows),
                                      kPagedMinForwardTokens,
                                      kPagedMaxForwardTokensCeiling);
@@ -267,10 +288,9 @@ inline std::uint32_t paged_max_forward_tokens(std::uint32_t vocab,
 /// advertise more and the driver accepts a fire it cannot hold; allocate more
 /// and an 11.8 GB checkpoint fails to create its heap over a fire nobody asked
 /// for. One function, called from both places.
-inline std::uint32_t simple_family_max_forward_tokens(std::uint32_t requested) {
-    if (requested == 0) return 1;
-    return std::min(requested, kPagedMaxForwardTokensCeiling);
-}
+// The rows-per-fire bound for a `SimpleFamilyEngine` family is DERIVED from the
+// activation pool it will actually allocate; see `simple_family_row_budget` in
+// context.cpp. There is no fixed ceiling for them to consult here.
 
 struct SetupConfig {
     std::string checkpoint_dir;  // HF snapshot dir (config.json + safetensors)

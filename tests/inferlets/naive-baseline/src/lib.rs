@@ -13,7 +13,7 @@
 //! algorithm compute. Running with and without it separates the cost of the
 //! extra host round-trip channels from the cost of the algorithm itself.
 
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 use inferlet::{Result, model as wit_model};
 use serde::{Deserialize, Serialize};
 

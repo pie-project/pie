@@ -21,7 +21,7 @@
 //! Input: an optional token budget (default 5), e.g. `"16"` or `{"lane":N}`
 //! (ignored → default).
 
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 use inferlet::{Result, model as wit_model};
 
 const DEFAULT_MAX_TOKENS: usize = 5;

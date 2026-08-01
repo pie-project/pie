@@ -58,7 +58,8 @@ void tp_publish_fire(const std::string& cpu_gate_key,
                      int structured_window_left,
                      RsExecutionMode rs_mode,
                      int rs_fold_lens_count,
-                     int rs_buffer_ids_count);
+                     int rs_buffer_ids_count,
+                     int rs_buffer_read_ids_count);
 
 // Issue every per-fire broadcast in dependency order. Caller has already
 // refilled `pi.*` with the current fire's data; this just fans them out.
@@ -82,6 +83,7 @@ void tp_broadcast_inputs(NcclComm& comm, PersistentInputs& pi,
                          RsExecutionMode rs_mode,
                          int rs_fold_lens_count,
                          int rs_buffer_ids_count,
+                         int rs_buffer_read_ids_count,
                          cudaStream_t stream);
 
 // Publish an MTP draft step's header into the mailbox and wake the follower.

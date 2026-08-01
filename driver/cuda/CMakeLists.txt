@@ -437,6 +437,9 @@ set(PIE_CUDA_MODEL_SOURCES
   src/model/glm5/glm5.cpp
   src/model/glm5/glm5_forward.cpp
   src/model/glm5/glm5_model.cpp
+  src/model/kimi_k3/kimi_k3.cpp
+  src/model/kimi_k3/kimi_k3_forward.cpp
+  src/model/kimi_k3/kimi_k3_model.cpp
   src/model/kimi/kimi.cpp
   src/model/kimi/kimi_forward.cpp
   src/model/kimi/kimi_model.cpp
@@ -560,6 +563,8 @@ add_library(pie_driver_cuda_lib STATIC
   src/kernels/embed.cu
   src/kernels/envelope.cu
   src/kernels/gated_delta_net.cu
+  src/kernels/kda.cu
+  src/kernels/attn_res.cu
   src/kernels/gather_rows.cu
   src/kernels/gemv.cu
   src/kernels/gather_tokens.cu
@@ -937,6 +942,11 @@ pie_add_cuda_target(test_gather_tokens
 pie_add_cuda_target(test_pack_dense_mask
   SOURCES tests/pack_dense_mask_test.cu
   LIBS pie_driver_cuda_lib)
+# Names three src/ files (kda, attn_res, swiglu), so by the rule above it links
+# the lib rather than hand-maintaining that closure.
+pie_add_cuda_target(test_kimi_k3_kernels
+  SOURCES tests/kimi_k3_kernels_test.cu
+  LIBS pie_driver_cuda_lib)
 pie_add_cuda_target(test_envelope_dot
   SOURCES tests/test_envelope_dot.cu src/kernels/envelope.cu
   LIBS CUDA::cudart)
@@ -958,6 +968,12 @@ pie_add_cuda_target(masked_attention_parity
   LIBS pie_driver_cuda_lib CUDA::cudart)
 pie_add_cuda_target(test_decode_batch_parity
   SOURCES tests/test_decode_batch_parity.cu
+  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/tests
+  LIBS pie_driver_cuda_lib CUDA::cudart)
+# The three GDN recurrent-decode kernels must agree; the SMEM one is the
+# production default wherever the GQA launcher is reached.
+pie_add_cuda_target(gdn_recurrent_step_parity
+  SOURCES tests/gdn_recurrent_step_parity.cu
   INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/tests
   LIBS pie_driver_cuda_lib CUDA::cudart)
 pie_add_cuda_target(test_attn_score_capture

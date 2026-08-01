@@ -30,7 +30,7 @@
 //! The decode epilogue advances its author-bound `KvLen` by each fire's live
 //! token count.
 
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::hybrid::prelude::*;
 use inferlet::{Result, model as wit_model};
 
 const DEFAULT_MAX_TOKENS: usize = 5;
@@ -102,7 +102,7 @@ async fn main(input: String) -> Result<String> {
         None,
     )?;
     if has_rs {
-        fwd_p.rs_working_sets(std::slice::from_ref(&rs))?;
+        fwd_p.recurrent(std::slice::from_ref(&rs))?;
     }
     fwd_p.epilogue(move || {
         let t = reduce_argmax(intrinsics::logits()); // [1] i32 greedy token
@@ -160,7 +160,7 @@ async fn main(input: String) -> Result<String> {
             None,
         )?;
         if has_rs {
-            fwd.rs_working_sets(std::slice::from_ref(&rs))?;
+            fwd.recurrent(std::slice::from_ref(&rs))?;
         }
         fwd.epilogue(move || {
             let length = kv_len.take().tensor();

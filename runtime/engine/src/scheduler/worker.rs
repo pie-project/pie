@@ -322,27 +322,62 @@ impl PendingRequest {
     fn requires_solo_submission(&self) -> bool {
         (self.prebuilt && self.pipeline_id.is_none())
             || (self.preserves_inner_rows() && self.request.qo_indptr.last().copied() == Some(0))
-            || self.touches_rs_buffer()
+            || self.rs_batch_kind() == RsBatchKind::Solo
     }
 
-    /// A fire that buffers recurrent activations, or folds them back, picks
-    /// the driver's RS execution mode for the WHOLE composed batch: the mode
-    /// is read off `rs_slot_flags` and the buffered CSR, and the driver
-    /// rejects a batch that mixes folded and forward rows or that gives a
-    /// plain row no slabs. Coalescing such a fire with an ordinary one would
-    /// therefore fail the whole wave, so it goes out alone.
-    fn touches_rs_buffer(&self) -> bool {
-        !self.request.rs_buffer_slot_ids.is_empty()
-            || self
-                .request
-                .rs_slot_flags
-                .iter()
-                .any(|flags| flags & pie_driver_abi::RS_FLAG_FOLD != 0)
+    /// How this fire's recurrent-state rows constrain the wave it joins.
+    ///
+    /// The driver's RS execution mode is read off `rs_slot_flags` and the
+    /// buffered CSR for the WHOLE composed batch, so a fire that touches the
+    /// RS buffer used to go out alone unconditionally. It no longer has to:
+    /// a row that appends to its buffer and a row that folds in-forward run
+    /// the identical dispatch and differ only in whether the recurrence
+    /// persists, which the driver now expresses per row. What still cannot
+    /// share a batch is a pure COMMIT — it gathers its activations out of the
+    /// slabs instead of computing them, a wholly different dispatch — and an
+    /// RS row cannot share with a row that has no RS binding at all, because
+    /// the RS arrays are one-per-request and a partial batch does not resolve.
+    fn rs_batch_kind(&self) -> RsBatchKind {
+        if self.request.rs_slot_ids.is_empty() {
+            return RsBatchKind::None;
+        }
+        let indptr = &self.request.rs_buffer_slot_indptr;
+        let replays = self
+            .request
+            .rs_slot_flags
+            .iter()
+            .enumerate()
+            .any(|(row, flags)| {
+                let span = indptr
+                    .get(row + 1)
+                    .zip(indptr.get(row))
+                    .is_some_and(|(end, begin)| end > begin);
+                span && flags & pie_driver_abi::RS_FLAG_FOLD != 0
+                    && flags & pie_driver_abi::RS_FLAG_BUFFER_WRITE == 0
+            });
+        if replays {
+            RsBatchKind::Solo
+        } else {
+            RsBatchKind::Composable
+        }
     }
 
     pub(crate) fn preserves_inner_rows(&self) -> bool {
         self.wire_row_count() > 1
     }
+}
+
+/// See [`PendingRequest::rs_batch_kind`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RsBatchKind {
+    /// No recurrent-state rows.
+    None,
+    /// Recurrent rows that compute their own tokens: a plain in-forward fold,
+    /// a buffered append, or a write-and-fold. These compose with each other.
+    Composable,
+    /// A pure commit, which replays buffered activations instead of computing
+    /// them. Goes out alone.
+    Solo,
 }
 
 fn fire_membership_hash<'a>(logical_fire_ids: impl IntoIterator<Item = &'a u64>) -> u64 {
@@ -371,6 +406,7 @@ pub(crate) struct LaunchGrouping {
     forward_tokens: usize,
     page_refs: usize,
     has_solo_submission: bool,
+    has_rs_rows: bool,
     has_user_mask: bool,
     has_device_geometry: bool,
 }
@@ -403,6 +439,14 @@ impl LaunchGrouping {
             return false;
         }
         if self.count != 0 && (request.requires_solo_submission() || self.has_solo_submission) {
+            return false;
+        }
+        // RS rows are one per request across the whole composed batch, so a
+        // fire that binds recurrent state and one that does not cannot share
+        // a wave: the driver would see fewer slot ids than requests.
+        if self.count != 0
+            && (request.rs_batch_kind() == RsBatchKind::None) != !self.has_rs_rows
+        {
             return false;
         }
         // Custom wire masks co-batch freely with other wire-geometry fires —
@@ -450,6 +494,7 @@ impl LaunchGrouping {
         self.forward_tokens = self.forward_tokens.saturating_add(usage.forward_tokens);
         self.page_refs = self.page_refs.saturating_add(usage.page_refs);
         self.has_solo_submission |= request.requires_solo_submission();
+        self.has_rs_rows |= request.rs_batch_kind() != RsBatchKind::None;
         self.has_user_mask |= request.request.has_user_mask;
         self.has_device_geometry |= request.request.device_resolved_geometry;
         request.requires_solo_submission()
@@ -1590,7 +1635,7 @@ enum QueuedItem {
     /// 1280 bytes — a cohort boundary moved ~800 MB through `VecDeque`
     /// rotations alone. The indirection makes every queue move a pointer
     /// move; the payload itself never moves.
-    Launch(Box<PendingRequest>),
+    Launch(QueuedLaunch),
     PreLaunchCopy {
         plan: PreLaunchCopy,
         logical_completion: WorkItemCompletion,
@@ -1657,6 +1702,51 @@ enum QueuedItem {
     CloseChannels {
         ids: Vec<u64>,
     },
+}
+
+/// A queued launch, plus the only two fields the dispatcher's queue scan
+/// reads, mirrored inline next to the box.
+///
+/// [`BatchScheduler::scan_queue`] walks the whole queue and previously read
+/// both fields *through* the box, which costs one cache miss per queued item.
+/// The scan runs a fixed ~250 times per 1000 tokens no matter how many
+/// processes are admitted, so that per-item miss made the scan's cost linear
+/// in queue depth and therefore the host's scheduling cost linear in
+/// concurrency while the work stayed constant: measured 13.9 us/scan at 256
+/// admitted processes against 24.1 us at 512 (mixed-phase shape, same token
+/// count both sides), 3.9 s vs 6.5 s of loop time for identical work.
+///
+/// The mirror cannot go stale, structurally: `QueuedLaunch` hands out only
+/// `&PendingRequest` (there is deliberately no `DerefMut`), so neither field
+/// can be reassigned while the item is queued. Both are already final by the
+/// time they are mirrored — `logical_fire_id` is assigned at construction and
+/// the frame stamp is synthesized at ACCEPT, before `queue_attempt` hands the
+/// item to the queue.
+struct QueuedLaunch {
+    fire_id: u64,
+    framed: bool,
+    request: Box<PendingRequest>,
+}
+
+impl QueuedLaunch {
+    fn new(request: Box<PendingRequest>) -> Self {
+        Self {
+            fire_id: request.logical_fire_id,
+            framed: request.frame.is_some(),
+            request,
+        }
+    }
+
+    fn into_request(self) -> Box<PendingRequest> {
+        self.request
+    }
+}
+
+impl std::ops::Deref for QueuedLaunch {
+    type Target = PendingRequest;
+    fn deref(&self) -> &Self::Target {
+        &self.request
+    }
 }
 
 /// A posted launch's lane lifecycle: the batch enters `in_flight_launches`
@@ -3089,7 +3179,7 @@ impl BatchScheduler {
         for copy in copies {
             pending.push_back(copy);
         }
-        pending.push_back(QueuedItem::Launch(Box::new(request)));
+        pending.push_back(QueuedItem::Launch(QueuedLaunch::new(Box::new(request))));
     }
 
     /// Whether any queued fire still targets `instance_id` (a queued
@@ -3721,14 +3811,14 @@ impl BatchScheduler {
         scan.clear();
         for item in pending.iter() {
             match item {
-                QueuedItem::Launch(request) => {
+                QueuedItem::Launch(launch) => {
                     if stopping {
-                        scan.drain_eligible.push(request.logical_fire_id);
+                        scan.drain_eligible.push(launch.fire_id);
                     }
-                    if request.frame.is_some() {
-                        scan.queued_ids.push(request.logical_fire_id);
+                    if launch.framed {
+                        scan.queued_ids.push(launch.fire_id);
                     } else if scan.untracked.is_none() {
-                        scan.untracked = Some(request.logical_fire_id);
+                        scan.untracked = Some(launch.fire_id);
                     }
                 }
                 QueuedItem::PreLaunchCopy { pipeline_id, .. } => {
@@ -3958,16 +4048,16 @@ impl BatchScheduler {
         let mut collisions: Vec<(usize, Box<PendingRequest>)> = Vec::new();
         while let Some(item) = pending.pop_front() {
             match item {
-                QueuedItem::Launch(request) => match slot_of.get(&request.logical_fire_id) {
+                QueuedItem::Launch(launch) => match slot_of.get(&launch.fire_id) {
                     Some(&(wave, position)) => {
                         let slot = &mut slot_buffer[wave][position];
                         if slot.is_none() {
-                            *slot = Some(request);
+                            *slot = Some(launch.into_request());
                         } else {
-                            collisions.push((wave, request));
+                            collisions.push((wave, launch.into_request()));
                         }
                     }
-                    None => kept.push_back(QueuedItem::Launch(request)),
+                    None => kept.push_back(QueuedItem::Launch(launch)),
                 },
                 item => kept.push_back(item),
             }
@@ -5682,7 +5772,7 @@ mod tests {
             false,
         );
         let mut pending: PendingQueue =
-            VecDeque::from([QueuedItem::Launch(Box::new(request))]).into();
+            VecDeque::from([QueuedItem::Launch(QueuedLaunch::new(Box::new(request)))]).into();
         completion.request_cancel();
         BatchScheduler::reject_pipeline_queued(&mut pending, pid, Some(&completion));
         assert_eq!(pending.len(), 1);
@@ -6224,7 +6314,9 @@ mod tests {
     #[test]
     fn instance_queued_work_gate_sees_launches() {
         let pid = ProcessId::new_v4();
-        let pending = VecDeque::from([QueuedItem::Launch(dummy_launch_request(pid, 7))]);
+        let pending = VecDeque::from([QueuedItem::Launch(QueuedLaunch::new(
+            dummy_launch_request(pid, 7),
+        ))]);
         assert!(BatchScheduler::instance_has_queued_work(&pending, 7));
         assert!(!BatchScheduler::instance_has_queued_work(&pending, 8));
     }
@@ -7155,9 +7247,15 @@ mod tests {
         let pipeline_a = ProcessId::new_v4();
         let pipeline_b = ProcessId::new_v4();
         let mut pending = PendingQueue::default();
-        pending.push_back(QueuedItem::Launch(dummy_launch_request(pipeline_a, 1)));
-        pending.push_back(QueuedItem::Launch(dummy_launch_request(pipeline_a, 1)));
-        pending.push_back(QueuedItem::Launch(dummy_launch_request(pipeline_b, 2)));
+        pending.push_back(QueuedItem::Launch(QueuedLaunch::new(dummy_launch_request(
+            pipeline_a, 1,
+        ))));
+        pending.push_back(QueuedItem::Launch(QueuedLaunch::new(dummy_launch_request(
+            pipeline_a, 1,
+        ))));
+        pending.push_back(QueuedItem::Launch(QueuedLaunch::new(dummy_launch_request(
+            pipeline_b, 2,
+        ))));
         pending.push_back(QueuedItem::CloseInstance {
             id: 9,
             pacing_wait_id: 0,
@@ -7202,10 +7300,10 @@ mod tests {
     fn launch_rotation_reaches_a_pre_launch_copy() {
         let make_pending = || {
             let mut pending = PendingQueue::default();
-            pending.push_back(QueuedItem::Launch(dummy_launch_request(
+            pending.push_back(QueuedItem::Launch(QueuedLaunch::new(dummy_launch_request(
                 ProcessId::new_v4(),
                 1,
-            )));
+            ))));
             pending.push_back(QueuedItem::PreLaunchCopy {
                 plan: PreLaunchCopy::Kv(crate::driver::KvCopyPlan::default()),
                 logical_completion: WorkItemCompletion::deferred_with_guard(None),
@@ -7266,7 +7364,7 @@ mod tests {
         frame_policy.on_fire_enqueued(stamp, Some(pid), fire_id, 1, 1);
 
         let mut pending: PendingQueue =
-            VecDeque::from([QueuedItem::Launch(Box::new(request))]).into();
+            VecDeque::from([QueuedItem::Launch(QueuedLaunch::new(Box::new(request)))]).into();
         let (lane, _lane_rx) = test_lane(None);
         let mut lane_inflight = 0u64;
         let mut lane_token = 0u64;
@@ -7353,7 +7451,7 @@ mod tests {
 
         let (resize_tx, _resize_rx) = tokio::sync::oneshot::channel();
         let mut pending: PendingQueue = VecDeque::from([
-            QueuedItem::Launch(Box::new(request)),
+            QueuedItem::Launch(QueuedLaunch::new(Box::new(request))),
             QueuedItem::ResizePool {
                 plan: PoolResizePlan::default(),
                 response: resize_tx,
@@ -7442,7 +7540,7 @@ mod tests {
         let (resize_tx, _resize_rx) = tokio::sync::oneshot::channel();
         let (copy_tx, _copy_rx) = tokio::sync::oneshot::channel();
         let pending: PendingQueue = VecDeque::from([
-            QueuedItem::Launch(Box::new(request_a)),
+            QueuedItem::Launch(QueuedLaunch::new(Box::new(request_a))),
             QueuedItem::ResizePool {
                 plan: PoolResizePlan::default(),
                 response: resize_tx,
@@ -7455,7 +7553,7 @@ mod tests {
                 plan: crate::driver::KvCopyPlan::default(),
                 response: copy_tx,
             },
-            QueuedItem::Launch(Box::new(request_b)),
+            QueuedItem::Launch(QueuedLaunch::new(Box::new(request_b))),
             QueuedItem::PreLaunchCopy {
                 plan: PreLaunchCopy::Kv(crate::driver::KvCopyPlan::default()),
                 logical_completion: WorkItemCompletion::deferred_with_guard(None),
@@ -7522,8 +7620,8 @@ mod tests {
         let rider = make(None);
         let (stamped_id, rider_id) = (stamped.logical_fire_id, rider.logical_fire_id);
         let mut pending: PendingQueue = VecDeque::from([
-            QueuedItem::Launch(Box::new(stamped)),
-            QueuedItem::Launch(Box::new(rider)),
+            QueuedItem::Launch(QueuedLaunch::new(Box::new(stamped))),
+            QueuedItem::Launch(QueuedLaunch::new(Box::new(rider))),
         ])
         .into();
 
@@ -7593,7 +7691,7 @@ mod tests {
             let mut frame_policy = FramePolicy::new(1, 1, 4096, None);
             frame_policy.on_fire_enqueued(stamp, Some(pid), fire_id, 1, 1);
             let mut pending: PendingQueue =
-                VecDeque::from([QueuedItem::Launch(Box::new(request))]).into();
+                VecDeque::from([QueuedItem::Launch(QueuedLaunch::new(Box::new(request)))]).into();
             let (lane, _lane_rx) = test_lane(None);
             let mut lane_inflight = 0u64;
             let mut lane_token = 1u64;

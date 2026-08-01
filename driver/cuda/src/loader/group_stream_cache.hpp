@@ -651,7 +651,7 @@ private:
         //
         // Groups whose plan is pure `ExtentWrite` -- GPT-OSS's packed experts,
         // which is what this path was measured on -- never expose it. One that
-        // carries a `scale_per_group`, like DeepSeek-V4's, always would.
+        // carries a `scale_per_block`, like DeepSeek-V4's, always would.
         //
         // An event rather than a synchronize: the point is to order the two
         // streams, not to stop the host, and `keep_in_host` below reads the

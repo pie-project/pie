@@ -14,7 +14,7 @@
 //! (interp.rs `Predicate::CummassLe`) without depending on float summation
 //! order.
 
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 use inferlet::{Result, model as wit_model};
 use serde::Deserialize;
 

@@ -42,16 +42,38 @@ jobs:
               ;;
           esac
       
+      # The generated bindings under src/bindings are not checked by
+      # `npm run build`, so an interface the runtime no longer offers would
+      # publish silently. This needs no toolchain and is what would have caught
+      # the actual drift; it also refuses to pass while the SDK reaches no
+      # forward-pass surface at all, which is the state today. See
+      # forward_refactor.md 10.4.
+      - name: Check SDK targets a live WIT surface
+        if: steps.info.outputs.path == 'sdk/javascript'
+        run: scripts/check-sdk-interfaces.sh
+
       - name: Install dependencies
         working-directory: ${{ steps.info.outputs.path }}
         run: npm ci
-      
+
+      # Regenerate and diff, rather than trusting what is checked in. The
+      # committed bindings are an artifact of whatever world they were last
+      # generated from, and `tsc` is happy to typecheck against a stale one --
+      # every specifier still resolves, just to the wrong shapes. This is the
+      # step that makes the build below mean something.
+      - name: Bindings are current with interface/inferlet
+        if: steps.info.outputs.path == 'sdk/javascript'
+        working-directory: ${{ steps.info.outputs.path }}
+        run: |
+          npm run generate-bindings
+          git diff --exit-code -- src/bindings tsconfig.json
+
       - name: Build
         working-directory: ${{ steps.info.outputs.path }}
         run: npm run build --if-present
 
       - name: Test
-        if: steps.info.outputs.path == 'client/javascript'
+        if: steps.info.outputs.path == 'client/javascript' || steps.info.outputs.path == 'sdk/javascript'
         working-directory: ${{ steps.info.outputs.path }}
         run: npm test
 

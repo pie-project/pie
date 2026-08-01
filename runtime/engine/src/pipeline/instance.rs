@@ -162,28 +162,81 @@ impl KvDeclaration {
     }
 }
 
+/// Which WIT forward interface a pass was built through — the host mirror of
+/// `model.forward-kind`. One Rust `ForwardPass` backs all three interfaces
+/// (WIT scopes resource names per interface, so the guest still cannot mix
+/// them), and this field is what makes a mis-selected interface fail loudly at
+/// the first binding call instead of silently running attention-only logic on
+/// a folded recurrent state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PassKind {
+    Attention,
+    Recurrent,
+    Hybrid,
+}
+
+impl PassKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            PassKind::Attention => "attention",
+            PassKind::Recurrent => "recurrent",
+            PassKind::Hybrid => "hybrid",
+        }
+    }
+
+    /// The interface a guest must use for this kind.
+    pub fn interface(self) -> &'static str {
+        match self {
+            PassKind::Attention => "pie:inferlet/forward",
+            PassKind::Recurrent => "pie:inferlet/forward-recurrent",
+            PassKind::Hybrid => "pie:inferlet/forward-hybrid",
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct ForwardBindings {
     pub embed: Option<EmbedBinding>,
     pub attention: Option<AttentionBinding>,
     pub readout: Option<u32>,
     pub rs_ws: Vec<u32>,
-    pub rs_mode: RsMode,
+    pub rs_geom: Option<RsGeometryBinding>,
+    /// Host-known `rs-geometry.fold-len`, one per bound working set, read from
+    /// the channel when the state was bound. Empty when no recurrent state is
+    /// bound. See [`RsGeometryBinding::fold_len`].
+    ///
+    /// `None` when the channel had no seed: a stage computes the fold length
+    /// ON DEVICE and only the driver ever resolves it. The host then plans
+    /// against its own upper bound and marks the boundary indeterminate.
+    pub rs_fold_len: Option<Vec<u32>>,
 }
 
-/// How a pass treats the recurrent state of its bound working sets — the
-/// host mirror of WIT `rs-mode`. See `interface/inferlet/forward.wit`.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub enum RsMode {
-    /// Fold every token in-forward, irreversibly. The default.
-    #[default]
-    Fold,
-    /// Buffer this fire's pre-recurrence activations starting at the given
-    /// buffer-relative token offset; the folded state is untouched.
-    Buffer { start_token: u32 },
-    /// Replay this many buffered tokens per bound working set (request
-    /// order) into the folded state.
-    FoldBuffered { tokens: Vec<u32> },
+/// Where a fire's folded boundary lands — the host mirror of WIT
+/// `rs-geometry`. Absent only when no recurrent state is bound.
+///
+/// Bound together WITH the working sets, not with a fold-mode method: the
+/// buffer is half the state representation, so where its boundary falls is an
+/// input to the recurrence on every fire.
+///
+/// This used to carry six more channels of buffer ADDRESSING. They are gone:
+/// the runtime derives every one of them from the store it is already
+/// authoritative for, and did so even while the guest was sending its own
+/// copy — which the driver then checked and refused on disagreement. Registry
+/// tags 10-14 stay RESERVED so already-compiled containers keep their meaning.
+#[derive(Clone, Copy, Debug)]
+pub struct RsGeometryBinding {
+    /// How far the folded boundary advances, per request, counted over
+    /// `[buffer | this fire's tokens]` — the twin of `kv-len`. The channel rep
+    /// is kept for descriptor lowering; the host-known VALUE lives in
+    /// [`ForwardBindings::rs_fold_len`] because the mapping onto a per-row plan
+    /// also needs the fire's token counts, which arrive later.
+    pub fold_len: u32,
+    /// Capacity grant: how many buffer pages this fire may occupy. The only
+    /// buffer decision left to the guest, because allocation must fail loudly
+    /// rather than be found quietly. Everything else the buffer needs — the
+    /// pages a row holds, the tail each token appends at, how far a replay
+    /// reaches — is derived from the store's own occupancy.
+    pub buffer: KvPageSpan,
 }
 
 #[derive(Clone, Copy)]
@@ -209,13 +262,16 @@ pub struct AttentionBinding {
 /// The WIT forward-pass builder. It starts empty and acquires a native bound
 /// pass only when canonical program bytes are attached.
 pub struct ForwardPass {
+    /// The interface this pass was constructed through.
+    pub kind: PassKind,
     pub bindings: ForwardBindings,
     bound: Option<Box<BoundForwardPass>>,
 }
 
 impl ForwardPass {
-    pub fn new() -> Self {
+    pub fn new(kind: PassKind) -> Self {
         Self {
+            kind,
             bindings: ForwardBindings::default(),
             bound: None,
         }
@@ -243,12 +299,6 @@ impl ForwardPass {
         self.bound
             .as_deref_mut()
             .ok_or_else(|| "forward pass program is not attached".to_string())
-    }
-}
-
-impl Default for ForwardPass {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -306,7 +356,9 @@ pub struct BoundForwardPass {
     pub rs_ws: Vec<u32>,
     /// How this pass treats that recurrent state: fold in-forward (default),
     /// buffer without folding, or replay buffered tokens into the fold.
-    pub rs_mode: RsMode,
+    /// Host-known `fold-len` per bound working set (see `ForwardBindings`);
+    /// `None` when it is device-resident.
+    pub rs_fold_len: Option<Vec<u32>>,
     /// Whether the currently bound writable declaration has performed its
     /// one-shot COW against the sharing shape visible at first submit.
     pub kv_declaration_realized: bool,
@@ -1110,7 +1162,7 @@ mod tests {
                 kv_ws: 0,
                 kv_declaration: KvDeclaration::all(),
                 rs_ws: Vec::new(),
-                rs_mode: RsMode::default(),
+                rs_fold_len: None,
                 kv_declaration_realized: false,
                 failed: None,
                 devgeo: None,
@@ -1118,7 +1170,7 @@ mod tests {
                 dense_mask: false,
                 closed: false,
             };
-            let mut pass = ForwardPass::new();
+            let mut pass = ForwardPass::new(PassKind::Attention);
             pass.attach_bound(bound).unwrap();
             pass
         }

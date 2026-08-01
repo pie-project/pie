@@ -6660,3 +6660,976 @@ there.** The residual 15-19 failures on this shape are a real limitation of
 pie's memory model (no recompute preemption, `swap_pool_size` 0 by default),
 not an admission-policy bug, and they are bounded: with `--swap-pool-size 8192`
 the same cell completes 1024/1024 at 3138 tok/s.
+
+## §20.41 — the mixed-phase conc-512 regression: five levers, one structure
+
+§20.40 fixed the deaths. This section chases the other half of the ask: the
+cells where pie *loses*. The mixed-phase shape M is the interesting one,
+because unlike X it completes essentially everything (`failed=1-2` of 3072) —
+so the deficit is pure throughput, with no ledger asterisk.
+
+| M, no swap | pie | vLLM | ratio |
+| --- | --- | --- | --- |
+| conc 256 | 15546-16506 | 15044-15198 | **1.03-1.09 (pie wins)** |
+| conc 512 | 14462-15110 | 16371 (§20.39) | 0.89-0.92 |
+
+pie *wins* at 256 and loses at 512. So the question is not "why is pie slow",
+it is "why does pie fall off with concurrency while vLLM is flat".
+
+### Where the wave period goes
+
+`PIE_FIRE_TIMING=waves`, same 1.144M tokens on both sides, p50 of the
+inter-wave phase gaps:
+
+| phase (p50) | conc 256 | conc 512 |
+| --- | --- | --- |
+| prev settled -> next driver started | **-7.95 ms** | **+11.84 ms** |
+| driver started -> dispatch started | -0.73 ms | -1.15 ms |
+| dispatch started -> batch built | 0.68 ms | 1.07 ms |
+| batch built -> launch returned | 5.85 ms | 8.52 ms |
+| launch returned -> settled (device) | 29.38 ms | 37.81 ms |
+| **wave period** | **26.3 ms** | **59.8 ms** |
+
+The first row is the whole story. At 256 the next wave's driver work starts
+8 ms *before* the previous wave settles — run-ahead is working. At 512 it
+starts 11.8 ms *after*. Of the 33.5 ms the period grows, ~20 ms is run-ahead
+that stopped happening; only ~8 ms is the bigger device wave.
+
+Normalised per 1000 tokens, the device got *cheaper* at 512
+(`native_inflight` 26770 -> 23062 us/ktok, `driver_submit` 7119 -> 6413) —
+bigger batches are more efficient, exactly as intended. Device occupancy
+nevertheless fell from 38% to 27% of wall. The host stopped feeding it.
+
+### Why run-ahead stops
+
+`frame.rs:1173-1178`. The boundary seals only once every awaited lane's next
+frame is fully submitted, and:
+
+```rust
+if joining || missing > 0 {
+    if executing { return FramePlan::Park; }
+```
+
+One missing lane suspends *all* further sealing; the dispatcher then runs
+only off frames already in `self.sealed`. That backlog is exactly what
+`HOST_TURNAROUND_WAVES` (R) funds — R waves of cover for the slowest lane's
+host round trip. The wait is infinite by principle and the watchdog is
+report-only, so when the cohort's straggler tail outgrows R waves of backlog,
+the cadence collapses to lockstep on the straggler. A 512-lane cohort's
+slowest turnaround is drawn from twice as many samples as a 256-lane one.
+
+### Five levers, all measured, all rejected
+
+1. **Raise R** (`PIE_TURNAROUND_WAVES`) — the obvious response to "not enough
+   cover". Conc 512 *lost* 5.1% at R=4 (14911 -> 14153) while conc 256 gained
+   3.0% (15646 -> 16116). R is KV-funded: `frames_in_flight() = 1 +
+   ceil(R/k)`, and every extra frame reserves ring cells and pages **per
+   lane**. At conc 512 M already runs at `free=0/8192` with `parks=2846`, so
+   buying cover costs the memory that the cover exists to protect. **This is
+   the structure**: pie's run-ahead window and its KV pool are the same
+   resource, and at high concurrency they are in direct conflict. vLLM has no
+   equivalent because its continuous-batching loop is host-side bookkeeping
+   that costs no device memory at all.
+
+2. **Frame rebind escape mode 1** (`PIE_FRAME_REBIND_ESCAPE=1`) — seal without
+   the missing lane. Null by construction: mode 1 still requires
+   `missing_rebind > 0`, i.e. a missing lane whose owner holds an *in-flight
+   bind*. A KV-parked lane has no bind, so it never fires. Measured anyway,
+   ABBA-interleaved, 3 reps each at conc 512: mode 2 14843 mean, mode 1 14653
+   mean (-1.3%, noise).
+
+3. **KV admission backpressure** — see §20.40. Deadlocks where it is obvious,
+   does nothing where it is safe.
+
+4. **`--concurrency` as a KV-aware cap** — already closed, and re-closed by
+   lever 3's measurement.
+
+5. **The O(queue) dispatcher scan** — a real defect, found and fixed, and
+   *still* not the answer. `scan_queue` read `logical_fire_id` and
+   `frame.is_some()` through `QueuedItem::Launch`'s box, one cache miss per
+   queued item, while the scan itself runs a fixed ~250 times per 1000 tokens
+   regardless of concurrency. Measured 13.9 us/scan at conc 256 against
+   24.1 us at 512 — precisely linear in queue depth, so host scheduling cost
+   grew with concurrency while the work stayed constant. Mirroring both
+   fields inline (`QueuedLaunch`) makes the scan touch only sequential
+   `VecDeque` memory. Post-fix the whole scan is 0.53-0.56 s of an ~80 s run
+   and **flat in concurrency**. End-to-end it is worth +1.7% at conc 512 and
+   +3.0% at 256 — at or under this box's noise floor. **Kept anyway**: it is
+   strictly less work, the mechanism is measured, and the mirror is
+   structurally unfalsifiable (no `DerefMut`, so neither field can be
+   reassigned while queued). It is not, however, the regression.
+
+### Ruled out
+
+- **CPU starvation.** cgroup v1 quota is 13.6 CPUs; sampled `cpu.stat` across
+  60 s of a live conc-512 run: `nr_periods=600 nr_throttled=0`. Guest-class
+  CPU averaged 0.78 cores (peak 11.2). The host is not out of CPU.
+- **Batch size.** `max forward requests` doubles 512 -> 1024 and per-token
+  device cost *falls*. Bigger batches are not the problem.
+- **Guest cost.** `guest_work_us` is 20.2 us/guest at 256 and 19.3 at 512 —
+  flat. `guest_wake_us` and `guest_resume_us` both grow, but both stay at a
+  constant 15% and 7% of the wave period, so they are consequences of the
+  period, not causes.
+
+### Measurement trap found here
+
+Cross-driver-process comparisons on this box are worthless right now. The same
+configuration (mode 2, conc 512) measured 14911, 12356 and 14872 in three
+different driver processes over 40 minutes — 17% spread — while
+ABBA-interleaved reps *inside* one process held to 2%. Every A/B in this
+section is interleaved within a single driver process for that reason. A
+neighbouring tenant holds 18 GiB on the device throughout (invisible in this
+PID namespace, so it cannot be cleared); it sits at 0% utilisation, so it is
+not stealing SMs, but the box is evidently not otherwise quiet.
+
+### What would actually fix it
+
+Decouple run-ahead depth from KV residency, so cover for the straggler stops
+being paid for in pages. That is a design change to the lane ring, not a
+constant to tune, and it is the honest end-state for this deficit — as
+guest-declared working-set budgets (§20.40) are for the death case.
+
+## §20.42 — the prefix-heavy (X) deficit: the boundary manufactures lockstep
+
+§20.41 accounted for the mixed shape at conc 512. Five of the seven cells pie
+loses are the prefix-heavy shape X, and they lose at *every* concurrency —
+including conc 64, where nothing is oversubscribed and no request fails. That
+is not an admission problem, so it needed its own account.
+
+### The shape scoreboard is not monotone in prefill fraction
+
+All at conc 128, closed loop, 8192 pages, both engines on the identical
+arrival schedule. vLLM here runs at `--gpu-mem-util 0.55`; because
+`--num-gpu-blocks-override` pins the KV pool outright, that only lowers its
+weights-and-activations ceiling, and it reproduces the recorded 0.90 figure to
+0.20% (X/c128: 5707 vs 5696). A foreign tenant holds 18 GiB throughout.
+
+| shape | context | prefill % of tokens | pie | vLLM | ratio |
+| --- | --- | --- | --- | --- | --- |
+| Ds (short decode) | ~165 | 22.3 | 23431 | 22514 | **1.041** |
+| D (long decode) | ~550 | 6.5 | 13888 | 13662 | **1.017** |
+| M (mixed phase) | 286 / 746 | 63.6 | 13159 | 11429 | **1.151** |
+| X (prefix-heavy) | ~713 | 83.5 | 5501 | 5696 | 0.966 |
+
+Two hypotheses die here. **Decode context length is not the axis**: D holds a
+~550-token context in a shape that is 93.5% decode, and pie still wins. **The
+forward token budget is not the axis either**: pie's is `N=4096` and vLLM's own
+log reads `Chunked prefill is enabled with max_num_batched_tokens=2048` — pie's
+batch budget is *twice* vLLM's. And prefill fraction alone cannot order the
+table, because M is at 63.6% and is pie's largest win.
+
+### pie's GPU-busy time on X exceeds vLLM's entire wall
+
+`PIE_FIRE_TIMING=waves`, X at conc 128, GPU occupancy reconstructed as the
+union of the waves (§20.13's tiling):
+
+| | pie X | pie M |
+| --- | --- | --- |
+| span | 25.20 s | 36.32 s |
+| GPU busy | **23.31 s (92.5%)** | 26.55 s (73.1%) |
+
+pie is *more* saturated on the shape it loses. 23.31 s of GPU busy is already
+more than vLLM's whole 22.97 s wall, so no amount of host-side scheduling can
+close this cell — the deficit is GPU work, exactly as §20.33 found for the
+decode-only shape.
+
+Splitting that work by wave kind:
+
+| pie X | waves | GPU | tokens | rate |
+| --- | --- | --- | --- | --- |
+| pure decode | 560 | **17.76 s (76.2%)** | 127252 | 7167 tok/s |
+| prefill-carrying | 177 | 5.55 s (23.8%) | 668063 | 120338 tok/s |
+
+pie's decode phase **alone** — 17.76 s — is 23% faster than vLLM's entire run.
+Per step it is 17.4 ms against vLLM's 18.39 ms intertoken p50. Neither kernel
+path is the problem: prefill runs at ~146 TFLOPS (about 80% of this L40S's
+usable bf16 peak) and decode at ~70% of its 864 GB/s.
+
+**The entire deficit is the 5.55 s of prefill that never overlaps decode.**
+vLLM does not have that line item; chunked prefill folds its prefill into the
+decode steps, which are memory-bound and have the compute to spare.
+
+### The measurement: 1.6% absorbed on X, 19.5% on M
+
+A decode row contributes exactly one token to a wave, so decode tokens that
+rode a prefill wave can be counted directly:
+
+| | decode tokens riding a prefill wave | in their own wave | absorbed |
+| --- | --- | --- | --- |
+| X | 2063 | 127252 | **1.6%** |
+| M | 81445 | 335242 | **19.5%** |
+
+That 12x is the whole result. The X timeline is
+`P1 D63 (P22 D62)x7 P22 D63` — eight phase-pure blocks, and inside a prefill
+block a wave carries 12 rows from 6 guests and 3900 of the 4096 available
+tokens, with 122 lanes contributing nothing.
+
+### Nothing is refusing to mix — nothing is offered
+
+- `LaunchGrouping::accepts` (`scheduler/worker.rs:383-436`) rejects on
+  instance, pipeline, solo, mask geometry and capacity. **Per-request token
+  count is not a criterion**, confirming §20.33: the capability is there.
+- The prefill waves leave 196 tokens and ~240 request slots free, and report
+  `deferred_pipelines=0`, `missing_pipelines=0`, `candidate_count ==
+  batch_size`. No candidate is being turned away.
+- Because wave membership is not the dispatcher's decision.
+  `post_frame_dispatch` takes `waves: &[Vec<u64>]` — the *sealed* fire ids —
+  places each into its slot and pushes everything else back onto the queue
+  (`worker.rs:3962, 4004-4019`); `candidate_count` is just `requests.len()`
+  (`:4110`). **The frame policy decides who is in a wave.** A lane that
+  finished its prefill early has nowhere to put its decode but the next
+  boundary, and the next boundary cannot start until this one drains — 22
+  waves, ~700 ms, later. It is also why pie's TTFT on this shape is 11577 ms
+  against vLLM's 9517: a request waits out its whole cohort's prefill.
+
+### The lockstep is pie's, not the workload's
+
+> **⚠ RETRACTED by §20.45.** This subsection's experiment never ran. Both
+> harnesses gated `request_max_tokens` on `--mixed-phase`, and shape `Xs`
+> does not set it, so `--output-spread` was silently dropped by *both*
+> engines: the "X spread 0.5" row below is a second run of plain X, and its
+> byte-identical schedule is the expected result of running the same
+> workload twice, not evidence about destaggering. The hypothesis is
+> **untested**, not killed. Everything downstream that leans on it —
+> including "heterogeneity in output *length* buys nothing" — is withdrawn.
+
+X gives every request the same prompt and exactly 128 output tokens, so the
+obvious reading is that the workload synchronises the fleet and pie merely
+inherits it. That reading is wrong.
+
+`--output-spread 0.5` (new, `benches/common.py`) fans the per-request output
+budget over [64, 192] on a deterministic sawtooth whose mean is exactly
+`--max-tokens`, so the total work, the ledger's token guard and both engines'
+inputs are unchanged; only the retirement pattern differs. A closed-loop
+client then retires the fleet over a 3x spread of completion times.
+
+pie's schedule does not move **at all**:
+
+| | waves | timeline | prefill rows p50 | GPU busy | ratio vs vLLM |
+| --- | --- | --- | --- | --- | --- |
+| X uniform | 737 | `P1 D63 P22 D62 ...` | 12 | 23.31 s | 0.966 |
+| X spread 0.5 | 737 | `P1 D63 P22 D62 ...` | 12 | 23.50 s | 0.962 |
+
+Byte-identical structure. **The fleet-wide boundary re-synchronises whatever
+the workload destaggers**, because every lane must advance one frame per
+boundary and a joining lane holds the seal (§20.39's join gate). Lockstep is
+manufactured on pie's side, so it cannot be dissolved from the workload side.
+
+M escapes only because its two halves run *different programs*: within one
+boundary, lane A's fire is a prefill and lane B's is a decode, so they mix
+without any lane having to leave the boundary. Heterogeneity in output
+*length* buys nothing; heterogeneity in program *phase* is what pie can use.
+
+### Where this leaves the account
+
+Both loss families now trace to the same object. §20.41: the boundary's
+wait-for-ALL seal collapses run-ahead once the straggler tail outgrows the
+KV-funded backlog. §20.42: the same boundary fixes wave membership to one
+fire per lane, so a homogeneous fleet produces phase-pure waves and prefill
+can never ride with decode. One structure, two independent costs.
+
+The fix is the same in both: wave membership has to stop being a function of
+the fleet-wide boundary. That is the lane-ring change §20.41 named, and it is
+now worth more than that section could justify on its own — on X it is 5.55 s
+of a 23.31 s budget, i.e. pie would win the shape outright rather than lose it
+by 3.4%.
+
+Levers that are closed, with the measurement that closed them: raising the
+forward token budget (pie's is already 2x vLLM's, and prefill already runs at
+~80% of peak FLOPs), ~~workload destaggering~~ (retracted by §20.45 — the
+flag never reached either engine), decode kernel work (D wins at 550-token
+context), and host
+scheduling (92.5% GPU busy, and busy alone exceeds vLLM's wall).
+
+---
+
+## §20.43 — P falsifies §20.42's prediction and sharpens its mechanism
+
+§20.42 closed with a prediction: the prefill-heavy shape P (96% prefill)
+should land near parity, because with almost no decode neither engine has
+anything to absorb prefill into. That prediction is **wrong**. P is pie's
+worst recorded loss.
+
+```
+shape P, nreq 4608, conc 128, rate 0, ABBA 2+2, vLLM mem-util 0.55
+  pie   3300   3414     mean 3357 tok/s
+  vLLM  4155   4137     mean 4146 tok/s     ratio 0.810
+  wall  pie 21.97 s     vLLM 17.78 s
+  ttft  pie 10873 ms    vLLM 6521 ms  (p50)
+```
+
+The comparison is clean: `--no-prefix-caching` is passed to vLLM
+(`enable_prefix_caching=False` in its own config dump), so P's repeated
+700-word filler body is prefilled in full by both engines. Both read
+1.78 M prompt tokens and write 73728 output tokens.
+
+### The prediction was wrong because decode's cost is not proportional to its token count
+
+`PIE_FIRE_TIMING=waves`, same run shape, decomposed with §20.13's
+non-overlapping tiling:
+
+| | waves | GPU time | tokens | rate |
+|---|---|---|---|---|
+| prefill-carrying | 498 | 15163 ms | 1798917 | 118638 tok/s |
+| pure decode | 224 | 4894 ms | 55446 | 11331 tok/s |
+| **total busy** | 722 | **20057 ms (92.9%)** | 1854363 | |
+| idle | | 1529 ms (7.1%) | | |
+
+Decode is **4.0% of P's token work and 24.4% of its GPU time.**
+
+Both halves are healthy in isolation. Prefill runs at
+`2 x 0.6e9 x 1798917 / 15.163 s` = **142 TFLOPS**, ~78% of the L40S's dense
+bf16 ceiling. The decode waves are bandwidth-bound and near their own floor:
+at 112 KiB of KV per token and a mean context of 387+t, the 55446 rows they
+carry need 2.68 TB, which is 3.10 s at 864 GB/s against 4.89 s measured —
+63% of peak, the shortfall being the per-wave fixed cost (see below).
+
+What is unhealthy is that the two never run together. pie's GPU busy alone
+(20.06 s) already exceeds vLLM's entire wall (17.78 s), so no amount of host
+scheduling could close this: pie does more GPU work for the same tokens.
+
+### The schedule is 37 pure-prefill blocks alternating with 37 pure-decode blocks
+
+Run-length-encoding the wave phase sequence over the whole run:
+
+```
+P1 D7 (P14 D6) x 36
+```
+
+37 P-blocks, 37 D-blocks, against **36 cohorts** (4608 requests / 128 lanes).
+This is §20.42's phase purity, but where X's blocks had to be read out of a
+21-deep prefill run, here the block count *equals* the cohort count exactly.
+The 14 prefill waves per block are the seal's partition loop chopping one
+boundary's 128 x ~387 = 49.5 K tokens into `max_wave_tokens = 4096` pieces.
+
+### Every idle gap is at the prefill re-entry
+
+```
+gaps >= 10 ms: n=47, sum 1511 ms (7.0% of span)
+  next wave is prefill: 47      next wave is decode: 0
+```
+
+Not one of the 47 gaps precedes a decode wave. The idle is exclusively the
+cohort turnover — the fleet retiring and rejoining — which is §20.39's join
+gate, and it is 36 cohorts against 47 gaps.
+
+### What a passenger seat costs, measured
+
+Least squares over the two wave populations (n=498 and n=224):
+
+```
+prefill wave:  dur_ms = 7.064 + 0.006414*tokens + 0.005862*rows   R2 0.695
+decode  wave:  dur_ms = 5.221 + 0.067163*rows                     R2 0.993
+```
+
+The decode wave's **5.22 ms intercept** is the whole reason this shape loses.
+224 dedicated decode waves pay it 224 times = 1.17 s, for waves that carry a
+mean of 248 rows and therefore 248 tokens. A prefill wave carrying 3612
+tokens pays the same class of fixed cost once and amortises it over 14x the
+work.
+
+Do not read the 11x ratio between the two row coefficients as a clean
+counterfactual: the decode rows that ride prefill waves in this run are
+mostly the short-prompt half, so 0.0059 ms/row is biased low, and a
+passenger's KV read does not vanish — it moves under a compute-bound kernel
+where the memory system has slack. The defensible bound is the arithmetic
+above: of the 4.89 s spent in dedicated decode waves, **1.17 s is pure
+per-wave fixed cost that a passenger seat deletes outright**, and the
+remaining 3.72 s is a bandwidth demand that vLLM overlaps with prefill
+compute and pie does not.
+
+Against a 4.19 s deficit: 1.51 s turnover idle, 1.17 s decode-wave fixed
+cost, and the balance the un-overlapped KV bandwidth. All three are the same
+structure.
+
+### Why vLLM does not have this shape
+
+vLLM chunks prefill at `max_num_batched_tokens=2048` and refills from a
+global queue every step. When 128 requests arrive together it spreads their
+prefill over ~26 steps, and the request prefilled in step 1 starts decoding
+in step 2 — riding along with the prefill of requests 5..127. The cohort is
+never phase-pure because there is no cohort.
+
+pie cannot do this, and the reason is one comment in `frame.rs:1061-1070`:
+
+> Boundary: the wait-all frame quorum. Seal only once every awaited lane's
+> next frame is fully submitted (an idle lane between frames is a missing
+> member) and no join is in flight... The wait is INFINITE by principle.
+
+Lane 0 finishes its prefill in partition 1 of 14 and its guest immediately
+submits a decode fire. That fire cannot be sealed until all 128 lanes have
+submitted theirs, i.e. until all 14 partitions have drained. The seal itself
+does not discriminate by phase — `frame.rs:909-926` packs any lane's fires
+into whichever of the `k` waves has room, with no prefill/decode bar, exactly
+as §20.33 established. There is simply never anything of the other phase
+available at seal time, because the barrier holds every lane at the same
+program point.
+
+### This unifies every recorded loss
+
+| cell | ratio | pie prompt tok/s | vLLM prompt tok/s |
+|---|---|---|---|
+| M/c64 | 1.225 | 18414 | 15037 |
+| M/c128 | 1.151 | 22941 | 19929 |
+| M/c256 | 1.071 | 27899 | 26061 |
+| M/c512 | **0.862** | 24641 | 28546 |
+| X/c64 | 0.920 | 24840 | 26994 |
+| X/c128 | 0.966 | 27887 | 28879 |
+| X/c256 | **0.783** | 22499 | 28726 |
+| X/c512 | **0.769** | 22089 | 28728 |
+| P/c128 | **0.810** | 81234 | 100346 |
+
+vLLM's prefill rate is flat in concurrency on X (26994 / 28879 / 28726 /
+28728) — it is saturated by c64 and adding lanes changes nothing. pie's peaks
+at c128 and then **falls 21%**. More lanes in the quorum means a longer
+wait-all and a longer phase-pure block, so pie's throughput is a decreasing
+function of concurrency in exactly the regime where an engine should be flat.
+
+M is the only family pie wins, and M is the only shape whose two halves run
+*different programs*, so a boundary can contain one lane's prefill and
+another's decode. Even M crosses over at c512.
+
+P is the control that proves the axis is program phase and not prompt
+heterogeneity: P is also `--mixed-phase`, but its `--max-tokens 16` equals its
+`--mixed-short-output 16`, so both halves run the *same* program (one prefill,
+sixteen decodes) and differ only in prompt length. That buys nothing. (The
+comparison to X's `--output-spread` that stood here is withdrawn — §20.45
+shows that experiment never ran. P's own control is unaffected.)
+
+### Status of the fix
+
+Unchanged from §20.41 and §20.42, and now three times the evidence: wave
+membership must stop being a function of a fleet-wide wait-all boundary. The
+quorum exists to close the `bind -> dispatch -> seal -> bind` cycle (§20.3),
+and four relaxations have already been measured and rejected, so this is a
+design change and not a tuning knob. It is not attempted here.
+
+Levers that remain closed, with the measurement that closed them: forward
+token budget (pie's 4096 is 2x vLLM's 2048), prefill kernel rate (142 TFLOPS,
+78% of dense peak), decode kernel rate (63% of BW peak, and D/Ds both win),
+~~workload destaggering~~ (retracted by §20.45), prefix caching (off on
+both), and host scheduling (92.9% GPU busy).
+
+---
+
+## §20.44 — It is not the seal. It is when the inferlets are allowed to submit
+
+§20.42 and §20.43 named the fleet-wide wait-all boundary as the object behind
+every loss, and pointed the fix at wave membership. That framing is wrong in
+its conclusion even though its measurements hold. The wait-all quorum is
+correct and stays. What is broken is that the guests are not *allowed* to
+submit at the times that would let the seal do its job.
+
+Every number below comes from the same `PIE_FIRE_TIMING=waves` P/c128 run
+already reported in §20.43. No new runs were needed.
+
+### The seal is not refusing anything — the capacity is sitting idle
+
+Per-wave row occupancy over the whole run, against the largest wave the run
+actually produced (256 rows):
+
+```
+prefill-carrying waves  n=498   rows used 18298   FREE ROW SLOTS 109190
+dedicated decode waves  n=224   rows        55446
+                                => headroom is 2.0x the rows that ran alone
+```
+
+A prefill wave is token-capped, not row-capped: p50 3695 tokens against a
+4096 budget, carried by ~10 prefill rows of ~370 tokens each. Row-wise it is
+almost empty. There is room in the prefill waves for **twice** every decode
+row that pie instead ran in 224 separate waves, and the marginal cost of a
+passenger row is 0.0059 ms against a 5.22 ms fixed cost per dedicated wave
+(§20.43's fits).
+
+And the seal does pack passengers when they exist: 13690 decode rows, 19.8%
+of the run's decode work, already rode a prefill wave. `LaunchGrouping::accepts`
+has no phase bar (§20.33), and `frame.rs:909-926` packs whatever is offered.
+Nothing is being refused. The decode fires simply are not there at seal time.
+
+### The fleet is strictly generational, and that is what makes waves phase-pure
+
+Admission and teardown timestamps from the same log:
+
+```
+process_admitted  4609 events, 75 bursts (gap >= 5 ms), sizes {68: x35, 60: x34}
+process_drop      4609 events, 73 bursts,               sizes p50 60, max 68
+                                                        68 + 60 = 128 = --concurrency
+admitted -> drop (lane lifetime)   p50 581 ms
+cohort period (36 cohorts / 21.1 s)     ~586 ms
+```
+
+Lane lifetime equals the cohort period. The cohorts do not overlap **at all**:
+128 lanes are admitted together, run the same program, and retire together,
+so at any instant the entire fleet is at the same program point. That is the
+phase purity of §20.42 and §20.43, stated at its source.
+
+### The guests are ready 560 ms before they are allowed to submit
+
+The bring-up conveyor, per process:
+
+```
+guest_main -> first pass bind start   p50 580.43 ms   (waiting for the BIND permit)
+both forward passes bound             p50  19.46 ms
+last bind -> execution admitted       p50 560.55 ms   (waiting for the EXEC permit)
+  of which admission_wait_us          p50 560.50 ms
+  of which bind_wait_us               p50   0.00 ms
+instantiate_us                        p50   3.11 ms
+instantiated -> guest_main            p50   0.01 ms
+```
+
+Every stage is one cohort deep by construction (`init_admission`,
+`process.rs:240-300`): prewarm is one cohort, bind is one cohort plus one
+staged cohort, execution is one cohort. So a process finishes binding both of
+its forward passes and then **sits fully built for 560 ms** with nothing left
+to do but submit. Its prompt is tokenized, its PTIR graph is constructed, its
+driver state is bound. It is held at the execution gate.
+
+Guest-side cost is not a factor: `guest_work_us` sums to 0.01 ms per wave and
+`guest_resume_us` to 0.25-0.81 ms. The guests are not slow. They are queued.
+
+### The gate is deliberate, and it batches the release
+
+`FramePolicy::is_joining` (`frame.rs:632-637`) holds the seal while a freed
+slot has a staged taker or an admitted successor's first fire is in flight,
+and `preload_free_slots` (`frame.rs:578`) seeds the same rule at bootstrap so
+that, in its own words, "the first seal waits for the whole co-launched
+fleet's admissions and first fires."
+
+That is the correct thing to do *given* a cohort — a ragged epoch starts
+lead-less lanes and lead is hysteretic. But it is also what makes the cohort
+in the first place, and the cohort is self-perpetuating: 128 admitted
+together, 128 retire together, 128 permits freed together, 128 admitted
+together. For a homogeneous fleet the synchronisation set at t=0 never decays.
+
+### What it costs, measured
+
+```
+idle gaps >= 10 ms   n=47   sum 1511 ms   (7.0% of the 21.6 s span)
+  next wave is prefill  47
+  next wave is decode    0
+```
+
+Not one gap precedes a decode wave. All of it is turnover: ~42 ms per cohort
+in which the GPU has nothing to run because the successor cohort is being
+admitted and is submitting its first fires. That is the direct cost.
+
+The indirect cost is larger and is §20.43's: because the fleet is never at two
+program points at once, 55446 decode rows run in 224 waves of their own (4894
+ms, 24.4% of GPU time for 4.0% of the tokens) instead of riding for free in
+prefill waves that had 109190 free row slots.
+
+### The fix, restated in the right place
+
+Wave membership does not need to change and the quorum does not need to be
+relaxed. What has to change is **when a guest is allowed to submit**, so that
+at any boundary the fleet holds more than one program point:
+
+1. The execution permit is held from first-fire-submit to process teardown
+   (`ProcessCtx::drop`). **This option is dead, and the ~30 ms window it
+   claimed does not exist**: the same trace puts `guest_main returned -> drop`
+   at a p50 of **0.01 ms**, so the permit is already released essentially at
+   guest-main return. Nothing is recoverable here. Corrected in §20.45.
+2. The bootstrap hands out the whole execution pool in one instant
+   (`preload_free_slots(capacity)`), which is what creates the cohort that
+   every later turnover inherits. Spreading only the *initial* release is
+   enough: for a homogeneous fleet, stagger in the joins is stagger in the
+   retirements, and it is preserved exactly thereafter.
+
+Neither touches the seal, the wait-all rule, or wave membership. Both are
+changes to the admission conveyor. Neither is attempted here.
+
+### Levers still closed
+
+Everything §20.43 listed, plus: guest CPU work (0.01 ms per wave), guest
+resume (< 1 ms), run-ahead depth (a lane's queue is never the missing member
+— `deferred_pipelines=0`, `missing_pipelines=0` on every wave), and the seal's
+packing rule (it already carries 19.8% of decode rows as passengers).
+
+---
+
+## §20.45 — Two harness bugs: the destagger experiment never ran, and M was never a fair comparison
+
+§20.42 and §20.43 both rest on a workload knob that was silently discarded,
+and one of the ledger's headline shapes was handing the two engines different
+work. Neither is an engine defect. Both invalidate published cells.
+
+### Bug 1 — `--output-spread` reached neither engine
+
+`request_max_tokens` (`benches/common.py:604`) implements two independent
+things: the `--mixed-phase` long/short split and the `--output-spread`
+sawtooth. Its docstring even promises "Both engines call this, so they see
+identical budgets". Both call sites then gated it on the wrong predicate:
+
+```python
+# benches/pie_bench.py:621          # benches/vllm_bench.py:217,380
+if max_tokens is None and getattr(args, "mixed_phase", False):
+    max_tokens = request_max_tokens(args, i)
+```
+
+Shape `Xs` is `X` plus `--output-spread 0.5` and deliberately does **not**
+set `--mixed-phase`, so on both engines the spread was dropped and every
+request got a uniform `--max-tokens 128`.
+
+That fully explains §20.42's "byte-identical schedule": `Xs` *was* `X`. The
+two cells agreeing to within 0.4% (0.962 vs 0.966) is a re-measurement of the
+same workload, not a null result about destaggering. **Hypothesis #4 was never
+tested.** It is reopened, and it is the hypothesis that speaks most directly
+to the §20.44 framing — if the fleet's retirements are what synchronise the
+admission conveyor, fanning the output budgets is the cheapest possible test
+of it, and it requires no engine change at all.
+
+### Bug 2 — vLLM paired every prompt with the wrong output budget
+
+The async serving path indexed the prompt with the absolute request index and
+the sampling params with the *measured-window* index:
+
+```python
+prompts[args.warmup + i],           # absolute
+prompt_counts[args.warmup + i],     # absolute
+sampling_for(i),                    # off by args.warmup
+```
+
+The offline path (`vllm_bench.py:286`) already used `args.warmup + i`, so the
+two paths disagreed with each other. With the default `--warmup 1` the parity
+flips, and since both `make_prompts` and `request_max_tokens` key off `i % 2`,
+the pairing inverts. Enumerated over shape M:
+
+| | pie | vLLM (before) |
+| --- | --- | --- |
+| half A | long prompt, 16 output | **short** prompt, 16 output |
+| half B | short prompt, 256 output | **long** prompt, 256 output |
+
+Totals are preserved — same prompt tokens, same output tokens — so the
+ledger's same-work guard passed and the defect was invisible. But the two
+engines were serving materially different workloads: pie retired every long
+prompt after 16 tokens, while vLLM carried its long prompts through 256
+decode steps at a long context. **All four M cells (c64 1.225, c128 1.151,
+c256 1.071, c512 0.862) are withdrawn.**
+
+Shapes S, D, Ds, X are unaffected (no varying budget). **P is unaffected**:
+its `--mixed-short-output 16` equals its `--max-tokens 16`, so both halves
+have the same budget and the offset is a no-op. §20.43's P analysis stands
+in full.
+
+### The fixes
+
+`request_max_tokens` is now called unconditionally on both sides — it already
+returns `args.max_tokens` when neither knob is set, so the gate was never
+load-bearing — and vLLM's async path indexes sampling with `args.warmup + i`
+like its offline twin. `request_max_tokens_varies` replaces the open-coded
+`mixed_phase` checks that decided whether a per-request sampling object was
+needed at all. Verified by enumerating the (prompt, budget) multiset for M, P
+and Xs on both harnesses: identical after, differing before on M and Xs.
+
+### Correction to §20.44
+
+§20.44's fix option 1 — release the execution permit at the last fire rather
+than at teardown — is **dead**. It claimed a ~30 ms per-cohort window worth
+~1.1 s of the 1.5 s turnover idle. The same trace measures
+`guest_main returned -> drop` at a p50 of **0.01 ms**: the permit is already
+released essentially at guest-main return, and there is no window to reclaim.
+Option 2 (staggering the bootstrap release) is unaffected and remains the
+live candidate.
+
+### Bug 3 (the serious one) — the ledger's worst cells are pre-fix runs the harness had already invalidated
+
+Auditing every run in `/root/sweep_out` for `completed`/`failed` rather than
+`output_tok_per_s` alone:
+
+| cell | pie completed | pie failed | vLLM | quoted ratio |
+| --- | --- | --- | --- | --- |
+| X/c256 | 198, 257 / 1024 | 826, 767 | 1024 / 1024 | **0.783** |
+| X/c512 | 219, 225 / 1024 | 805, 799 | 1024 / 1024 | **0.769** |
+| M/c512 | 3070, 3064 / 3072 | 2, 8 | 3072 / 3072 | **0.862** |
+| D/c512 (n256) | 253 / 256 | 3 | 256 / 256 | — |
+| X/c512 (n256) | 215 / 256 | 41 | 256 / 256 | — |
+
+Every failure is the same error: `KV capacity: KV pool starved: 1 pages
+asked, 0 free of 8192, no host swap room to evict into`.
+
+`sweep.py` had already caught this. The ledger rows carry four warnings each:
+
+```
+X/c256  ratio=0.783
+  ! pie wall 6.6s < 15.0s (ramp-dominated)
+  ! pie FAILED 796/1024 requests — tok/s is over the survivors only
+  ! prompt_tokens differ: pie=147540 vllm=664493 (-77.8%) — not the same work
+  ! output_tokens differ: pie=29120  vllm=131072 (-77.8%) — not the same work
+```
+
+**pie was doing 22% of vLLM's work and the ratio was quoted anyway.** The
+guard fired, was written to disk, and was not read.
+
+And the rows are stale on top of being invalid. Timestamps:
+
+| artifact | when |
+| --- | --- |
+| `X_n1024_c256_r0.0_pie1.json` | 07-30 21:49 |
+| `X_n1024_c512_r0.0_pie1.json` | 07-30 21:52 |
+| `M_n3072_c512_r0.0_pie1.json` | 07-30 22:12 |
+| **`a06b4e31c` "starvation kills must free pages"** | **07-31 00:53** |
+| `P_n4608_c128_r0.0_pie1.json` | 07-31 17:05 |
+
+All three bad cells were measured **before** §20.40's starvation fix, which
+took X/c512 from 203/1024 completed to 1005/1024 and was never re-run into
+the ledger. P — the one cell in the loss column that is both post-fix and
+fully served — is the only one that was ever real.
+
+### What actually survives
+
+| cell | ratio | status |
+| --- | --- | --- |
+| D/c128 | 1.017 | valid, pie wins |
+| Ds/c128 | 1.041 | valid, pie wins |
+| X/c64 | 0.920 | valid |
+| X/c128 | 0.966 | valid |
+| P/c128 | **0.810** | valid, post-fix, fully served |
+| M/c64, c128, c256, c512 | 1.225 / 1.151 / 1.071 / 0.862 | withdrawn (bug 2) |
+| Xs/c128 | 0.962 | withdrawn (bug 1 — it is a duplicate of X) |
+| X/c256, X/c512 | 0.783 / 0.769 | withdrawn (bug 3 — pre-fix, 78% of work missing) |
+
+So §20.41 and §20.42 — both of which take "pie collapses on X at high
+concurrency" as their subject and build a wave-membership account of it —
+were explaining an artifact. Their *mechanism* work (the phase-pure wave
+structure, the seal's join gate) is independently observed on P and stands;
+their *motivation* does not.
+
+The honest statement of pie's remaining deficit is now much narrower:
+**prefill-heavy serving (P, 0.810)**, plus a residual ~1.6% of requests that
+still fail under KV pressure where vLLM fails none — because vLLM preempts by
+recompute and pie, with `--swap-pool-size 0`, has nothing to fall back on.
+That residual is a robustness defect, not a throughput one, and §20.40 named
+it as the remaining work.
+
+---
+
+## §20.46 — The destagger experiment, run for the first time: it moves everything
+
+With §20.45's plumbing fixed, `--output-spread 0.5` finally reaches both
+engines. Shape `Xs` is `X` with the per-request output budget fanned over
+[64, 192] on a sawtooth whose mean is exactly 128; the total is preserved to
+the token (131072 either way), the prompts are byte-identical, and the only
+thing that changes is *when* requests retire. ABBA 2+2, c256, same session,
+`SWEEP_VLLM_MEM_UTIL=0.55`, prefix caching off both sides.
+
+| cell | pie tok/s | vLLM tok/s | ratio | pie failed | pie ITL p99 |
+| --- | --- | --- | --- | --- | --- |
+| X/c256 (pre-fix, **withdrawn** by §20.45) | 4437 | 5666 | 0.783 | 796 | 625 ms |
+| X/c256 (post-fix, re-measured here) | 4760 | 5682 | **0.838** | 15 | 315 ms |
+| **Xs/c256 (the real experiment)** | **5063** | **5432** | **0.932** | **3** | **113 ms** |
+
+Per run, so the reader can see there is no overlap to argue about:
+
+```
+X  pie  4636  4883      Xs pie  5030  5096
+X  vllm 5681  5682      Xs vllm 5430  5435
+```
+
+All four pairwise comparisons go the same way. Three independent signals move
+together, and they move in *opposite directions* for the two engines:
+
+- **throughput ratio 0.838 -> 0.932**, i.e. pie recovers 11.2% relative;
+- **pie's KV starvation failures 15 -> 3**, an 80% reduction;
+- **pie's inter-token p99 315 ms -> 113 ms**, a 64% reduction;
+- and **vLLM *loses* 4.4%** on the identical change (5682 -> 5432).
+
+That last line is what makes this conclusive. The spread is not a softer
+workload — for vLLM it is a harder one, as expected, since a ragged tail of
+long requests leaves its batch progressively emptier. pie gains 6.4% from
+exactly the thing that costs vLLM 4.4%. Only a synchrony cost behaves that
+way.
+
+### What it proves
+
+§20.42 claimed the opposite ("workload destaggering: byte-identical
+schedule") and used it to argue that the lockstep is manufactured entirely on
+pie's side and cannot be dissolved from the workload side. That experiment
+never ran (§20.45). Run properly, it says: **the fleet's synchronised
+retirement is worth ~11 points of the ratio at c256**, and it is dissolvable.
+
+This is the strongest available confirmation of §20.44's framing — the
+deficit is *when lanes are allowed to submit*, not what the seal does with
+their fires once submitted. The evidence chain is now:
+
+1. lanes are admitted in bursts of exactly `--concurrency` (§20.44);
+2. lane lifetime p50 (581 ms) equals the cohort period (586 ms), so cohorts
+   never overlap and every turnover is a fleet-wide barrier (§20.44);
+3. prefill waves run token-capped with 109190 free row slots while 55446
+   decode rows run in dedicated waves (§20.44);
+4. **breaking the retirement synchrony from outside the engine recovers 11
+   points and 80% of the KV failures** (here).
+
+The KV result is worth calling out separately. The residual starvation
+failures are not a fixed cost of the pool size: the same pool, the same total
+work and the same concurrency produce 15 failures when the fleet retires in
+lockstep and 3 when it does not. Synchronised retirement means synchronised
+*re-admission*, and the whole cohort demands its first prefill pages in the
+same instant. The starvation is a symptom of the herd, not of capacity.
+
+### What it does not prove
+
+The workload cannot be the fix — real clients do not agree to spread their
+output lengths. It establishes the size of the prize and rules out the
+alternative explanations (kernel rate, capacity, host scheduling), because
+none of those can be changed by a client-side budget sawtooth. The engine-side
+equivalent is §20.44's option 2: stagger the bootstrap release of the
+execution pool (`preload_free_slots(capacity)` hands it out in one instant),
+so that a homogeneous fleet is *admitted* staggered and, being homogeneous,
+stays staggered thereafter. That is the next change, and this section is the
+measurement that justifies it.
+
+## §20.47 — Reclaimed inferlets are restarted, not failed (`0d2ceaa44`)
+
+§20.46 left the KV starvation failures at 3-15 per 1024 and called them "a
+symptom of the herd, not of capacity". That is the correct diagnosis of *why*
+they happen and the wrong place to stop, because a starvation failure is not
+a slow request — it is a **lost** one, and every throughput number computed
+over the survivors is not a throughput. `X/c256` reported 4760 tok/s over
+1009 completions; the 15 that died do not appear in any denominator.
+
+The planner's starvation rung existed to break a deadlock: when the pool
+cannot fund the fleet, someone must give their pages back, and pie's only
+way to make a process give pages back was to kill it. The user's objection
+was structural, not cosmetic:
+
+> 당연히 죽이고 알려주는게 아니라, queue에 넣어두고 inferlet자체를 재실행해야지.
+
+An inferlet is not a request. It is a *program* that produces the request's
+work. Killing it to reclaim its pages and then reporting the failure to the
+client discards a re-derivable computation. Re-queueing and re-running it
+reclaims exactly the same pages and loses nothing but the work already done.
+
+### The design
+
+`system.declare-restartable()` — opt-in, and it must be. Re-running a program
+that has already written a file or issued an outbound request would duplicate
+those effects; the runtime cannot know which programs are pure. Undeclared
+processes keep the fail-loud path exactly as before, so nothing regresses for
+programs that never asked.
+
+Two decisions carry the whole thing:
+
+**The FCFS sequence number is inherited; the process id is not.**
+
+Victims are picked youngest-first, so a re-run that entered with a fresh
+`spawn_seq` would be the immediate next victim, forever — a livelock with a
+throughput cost. Inheriting the seq puts the re-run back at the position it
+already held, where it ages toward the head, and *the head is never a
+victim*. That is the termination argument, and it needs no retry counter and
+no timer. `register_with_seq` deliberately does not rewind `next_seq`.
+
+The process id cannot be inherited for the mirror-image reason. A scheduler
+holds a terminate tombstone for a retiring pid until its quiesce lands
+(`scheduler/worker.rs:182`); reusing the id would have the re-run's fires
+rejected by its predecessor's tombstone. So the re-run gets a fresh internal
+pid and a `RESTART_ALIAS` maps the original client-facing id onto it. Every
+externally-visible path — `attach`, `detach`, `terminate`, `inbox::send`,
+and the `client_pid` stamped on outbound events — resolves through the alias,
+so the client never learns that the program it launched is on its second
+life.
+
+**The reply cell is shared, not moved.** `restart()` clones the
+`Arc<Mutex<Option<Sender>>>` into the successor. If the spawn fails, the
+sender is still in place and the caller falls straight back to fail-loud. A
+failed restart therefore cannot lose the request — the worst case is the
+behaviour we already had.
+
+Teardown is unconditional: the restart branch still runs `SERVICES.remove`,
+`planner.unregister` and `residency::unregister_residency`. Reclaiming the
+pages is the entire point of the exercise. Only the reply delivery and the
+client-facing `Return`/`Error` event are suppressed.
+
+### Two bugs found on the way, both invisible without instrumentation
+
+**1. The bench never used the launch handle.** The first probe showed
+`declare_restartable` firing 513 times and `request_restart` returning true,
+while `restart()` returned false every time. It was bailing on `result_tx ==
+None`: the benchmark harness receives results as *client events*, not through
+the launch-handle channel, so the cell it was checking was empty by
+construction. This is also the reason there was no log to read — the embedded
+pyo3 server boots with `skip_tracing` and installs no subscriber, so every
+`tracing::info!` in the engine goes nowhere under the bench. `println!` or
+the `PIE_CONTENTION_TRACE_MS` planner trace are the only channels that work,
+which is why that trace uses `println!` in the first place.
+
+**2. An eviction-rollback livelock that predates this work.**
+`planner/exec.rs:331` handled `KvSuspendPrepare::Deferred` with a bare
+`eviction_failed(pid)` and no parking, unlike its sibling `HostSwapFull`
+branch a few lines below, which parks its victim and documents exactly this
+hazard (§20.6). Victim selection is deterministic, so the re-pick chose the
+same victim and failed identically: **674,536 rollbacks in ~60 s** on the
+`tinyswap` scenario. The consequence is worse than the spin. `evicting` never
+emptied, and `check_starvation` early-returns while it is non-empty, so every
+rung above the kill was gated out and the pool could never be unwedged.
+`tinyswap` hung with all 64 of its requests already complete. The fix mirrors
+the sibling: an `Inner.prepare_blocked` set, excluded from both candidate
+filters and cleared on `unregister` and `clear_host_swap_blocks`.
+
+### Result
+
+| | before | after |
+| --- | --- | --- |
+| contention suite | `tinyswap` **HANG**, `noswap_cascade` 4 failed | **17/17**, `failed=0` everywhere |
+| unit tests | 370 | 371 |
+
+The only scenario that still fails is `impossible`, which asks for a working
+set larger than the pool and must fail loud — there is no re-run of that.
+
+ABBA 2+2 at `X/c256`, same box and same session policy as §20.46, against
+that section's post-fix cell:
+
+| | §20.46 | here |
+| --- | --- | --- |
+| pie tok/s | 4759.7 | **4760.5** |
+| pie completed | 1009 | **1024** |
+| pie failed | **15** | **0** |
+| pie prompt tokens | 654758 | **664493** |
+| pie output tokens | 129152 | **131072** |
+| pie ITL p99 | 315 ms | 309 ms |
+| vLLM tok/s | 5681.7 | 5686.8 |
+| ratio | 0.838 | 0.837 |
+
+```
+pie  4640  4881        vllm 5690  5683
+```
+
+Two things to read off this. First, **the restart is free**: 4759.7 against
+4760.5 is 0.02% on a box whose two-probe spread is 27%, and it bought 15
+requests that used to be lost. The re-run's cost is bounded by construction —
+13 restarts across 1024 requests, each re-doing only the prefill it had
+already done, and the inherited FCFS position means each one is re-run once
+and not repeatedly.
+
+Second, and more useful going forward: `pie_prompt_tokens` and
+`pie_output_tokens` are now **exactly** vLLM's, 664493 and 131072. Every
+previous `X/c256` number in this document was computed over a smaller amount
+of work than vLLM did, because the requests that died took their prompts out
+of the denominator. This is the first cell in the campaign to come back with
+`warnings: []` at this shape — the ratio is finally a comparison of two
+engines doing token-for-token identical work.
+
+### This closes admission control
+
+The open question §20.40 left behind was whether pie should refuse to admit
+work it cannot fund, the way vLLM's scheduler declines to schedule a request
+whose blocks do not fit. The answer here is that pie does not need to,
+because it now has the other half of vLLM's mechanism instead. vLLM's
+admission check is only safe *because* vLLM preempts: it evicts a running
+sequence's blocks and re-runs it from scratch when the pool tightens. pie now
+does exactly that, and does it with the FCFS position preserved, which vLLM
+does not.
+
+The predictive alternative was a guest-declared KV budget in front of
+`BIND_ADMISSION`. It is rejected on two grounds. It cannot be exact — with a
+shared prefix the incremental cost of a process is not a function of its own
+token count, so any per-process declaration double-counts the shared pages
+and caps the fleet below what the pool can actually hold (at `X/c256`, 169
+processes declared against 221 actually resident). And the reactive form of
+the same gate was already measured and was a null: §20.40's watermark at
+bind admission moved throughput 0.05%, because by the time anything parks the
+pool is already full and the gate only stops processes that hold nothing.
+
+Handling the overflow is therefore the mechanism, not a fallback to one. The
+remaining work on this axis is to make the overflow rarer — §20.46 showed
+that breaking the fleet's synchronised retirement removes 80% of the
+starvation events without touching the pool — not to predict it.

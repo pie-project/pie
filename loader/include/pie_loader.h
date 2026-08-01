@@ -444,20 +444,21 @@ struct PieLoaderExprNode {
   /// Leaving it unset means zero, which reads as `+0.0`; the loader rejects
   /// that rather than scaling a tensor to nothing.
   uint32_t scale_factor_bits;
-  /// `Scale`: the operand holding one factor per `scale_group` elements along
-  /// `axis`. Same index rule as `src`.
+  /// `Scale`: the operand holding the factors, one per block. Same index
+  /// rule as `src`.
   ///
-  /// [`PIE_LOADER_NO_NODE`] for a uniform factor, which is what an unset
-  /// field reads as.
+  /// [`PIE_LOADER_NO_NODE`] for a uniform factor, and that sentinel is what
+  /// tells the two forms apart. There used to be a separate `scale_group`
+  /// discriminant, on the grounds that a struct zeroed by hand would then
+  /// always read as the uniform case; but `src` has always carried the same
+  /// exposure — node zero is a legal index — so the sentinel is the rule
+  /// everywhere rather than in all places but one, and
+  /// [`PieLoaderExprNode::default`] sets it.
+  ///
+  /// The blocking itself is not stated here. It is the ratio of this
+  /// operand's shape to `src`'s, which is the only place it can be stated
+  /// once.
   uint32_t scale_by;
-  /// `Scale`: elements per factor. Zero selects the uniform factor in
-  /// `scale_factor_bits`.
-  ///
-  /// The two forms are told apart by this field rather than by which of the
-  /// others happens to be set, so a node built by zeroing the struct and
-  /// filling in one field is always the uniform case and never a per-group
-  /// case with a missing operand.
-  uint32_t scale_group;
 };
 
 using PieLoaderExprNodeSlice = PieLoaderSlice<PieLoaderExprNode>;
@@ -749,16 +750,20 @@ struct PieLoaderStorageOp {
     /// constant the contract named — `__uint_as_float` on the CUDA side
     /// costs nothing and cannot round.
     uint32_t transform_scale_factor_bits;
-    /// Elements per factor along `transform_scale_axis` for a per-group
-    /// [`PieLoaderTileMapKind::Scale`]; zero when the factor is the uniform
-    /// constant above.
+    /// Elements of the operand per factor, on each axis, for a per-block
+    /// [`PieLoaderTileMapKind::Scale`]; empty when the factor is the
+    /// uniform constant above.
     ///
-    /// Non-zero is what tells the executor to read its factors from
+    /// Non-empty is what tells the executor to read its factors from
     /// `input_buffers[0]` — the operand the contract paired with the
     /// payload — instead of from `transform_scale_factor_bits`.
-    uint32_t transform_scale_group;
-    /// The axis `transform_scale_group` counts along.
-    uint8_t transform_scale_axis;
+    ///
+    /// One entry per axis of the destination, so a DeepSeek-style FP8
+    /// checkpoint's two-dimensional block scale is `[128, 128]` and the
+    /// ordinary row-wise case is `[1, 32]`. The executor already knows both
+    /// shapes, so this is a statement it can check rather than one it must
+    /// trust.
+    PieLoaderI64Slice transform_scale_blocks;
   };
 
   struct CreateView_Body {

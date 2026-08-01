@@ -25,7 +25,7 @@
 //! reference packs the same allowed set into the `inferlet::mask` bitmask.
 
 use inferlet::mask::{all_allowed, apply_mask_argmax, bit_allowed, pack_allowed};
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 use inferlet::{Result, model as wit_model, serde_json};
 
 /// Constraint alphabet: the only token ids the grammar ever allows. Small ids

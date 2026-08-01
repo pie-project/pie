@@ -79,7 +79,7 @@ pub use pie_ir::types::{DType, Shape, ValueType};
 
 /// Glob-import surface for the DSL eDSL op/value names.
 /// The author-facing `ForwardPass`/`Pipeline`/`WorkingSet` surface lives in
-/// `inferlet::ptir::prelude`, which re-exports this plus those wrapper types.
+/// `inferlet::ptir::attention::prelude`, which re-exports this plus those wrapper types.
 pub mod prelude {
     pub use crate::builder::{Builder, PortInput};
     pub use crate::channel::Channel;

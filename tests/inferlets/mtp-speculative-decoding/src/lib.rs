@@ -22,7 +22,7 @@
 //! round after a partial acceptance drafts from a stale tail and typically
 //! re-corrects in one round; correctness always comes from verification.
 
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 use inferlet::{Result, chat, model as wit_model};
 use serde::Deserialize;
 

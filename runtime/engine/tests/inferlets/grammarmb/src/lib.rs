@@ -20,7 +20,7 @@
 //! 1-token window re-fired at position 0 forever.
 
 use inferlet::mask::pack_allowed;
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 use inferlet::{Result, model as wit_model, serde_json};
 
 const ALPHABET: [u32; 4] = [10, 11, 12, 13];

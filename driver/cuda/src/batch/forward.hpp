@@ -184,6 +184,14 @@ struct ForwardFn {
         //     recurrent_state[slot_ids[r]].
         const std::uint32_t* rs_buffer_slot_ids_h    = nullptr;  // flattened CSR
         const std::uint32_t* rs_buffer_slot_indptr_h = nullptr;  // R+1, leading 0
+        // Replayed buffered prefix: slabs, row CSR (R+1), tokens per row (R).
+        const std::uint32_t* rs_buffer_read_slot_ids_h = nullptr;
+        const std::uint32_t* rs_buffer_read_indptr_h   = nullptr;
+        const std::uint32_t* rs_buffer_read_lens_h     = nullptr;
+        // Physical offset of logical buffer token 0, per row. A fold that
+        // lands mid-page leaves the survivors where they were, so every
+        // buffer span is `head + logical`.
+        const std::uint32_t* rs_buffer_heads_h          = nullptr;
         const std::uint32_t* rs_fold_lens_h           = nullptr;  // R
         const std::int32_t*  rs_fold_lens_d           = nullptr;  // R
         bool                 rs_buffer_write          = false;
@@ -579,6 +587,17 @@ struct ForwardDispatchInputs {
     // the separate fold-replay dispatch instead (not this path).
     const std::uint32_t* rs_buffer_slot_ids_h = nullptr;
     const std::uint32_t* rs_buffer_slot_indptr_h = nullptr;
+    // The buffered prefix each row REPLAYS ahead of its own tokens, so the
+    // recurrence starts from `folded (+) replay(buffer)` rather than from the
+    // folded boundary alone. Null means nothing is buffered, which is the
+    // common case. The linear layers process `read_len[r] + own tokens` rows
+    // for request r; the extra rows are gathered from these slabs and their
+    // outputs are dropped.
+    const std::uint32_t* rs_buffer_read_slot_ids_h = nullptr;
+    const std::uint32_t* rs_buffer_read_indptr_h = nullptr;
+    const std::uint32_t* rs_buffer_read_lens_h = nullptr;
+    /// Physical offset of logical buffer token 0, per row (see above).
+    const std::uint32_t* rs_buffer_heads_h = nullptr;
     const std::uint32_t* rs_fold_lens_h = nullptr;
     const std::int32_t*  rs_fold_lens_d = nullptr;
     bool                 rs_buffer_write = false;

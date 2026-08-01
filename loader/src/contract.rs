@@ -345,7 +345,7 @@ pub enum Expr {
     /// the alternative — a driver copying the tensor to the host, scaling it
     /// there and uploading the result during bind, outside the plan entirely.
     ///
-    /// With a [`ScaleFactor::PerGroup`] factor this is dequantization, and it
+    /// With a [`ScaleFactor::PerBlock`] factor this is dequantization, and it
     /// overlaps [`Expr::Cast`] into a raw encoding on purpose: a cast decodes
     /// with the scales the *scheme* says are there, while this decodes with
     /// scales an author names. That is the whole difference, and it is why this
@@ -375,23 +375,28 @@ pub enum ScaleFactor {
     /// what an all-zero FFI node carries, so accepting it would turn a
     /// forgotten field into a tensor of zeros that loads and runs.
     Uniform(u32),
-    /// One factor per `group` consecutive elements along `axis`, read from a
-    /// companion expression: `out[.., i, ..] = src[.., i, ..] * by[.., i / group, ..]`.
+    /// One factor per block, read from a companion expression whose shape says
+    /// how big a block is: `out[i0, .., ik] = src[i0, .., ik] * by[i0 / g0, .., ik / gk]`
+    /// where `gj = src.shape[j] / by.shape[j]`.
+    ///
+    /// **The grouping is the shape ratio, and nothing else states it.** A
+    /// `[256, 512]` weight with `[2, 4]` factors is blocked 128x128; with
+    /// `[256, 4]` it is blocked 1x128, which is the one-dimensional case; with
+    /// `[256, 1]` it is one factor per row. This used to carry a `group` and an
+    /// `axis` beside the operand, which said the same thing a second time and
+    /// therefore could disagree with it — and being one number, could only ever
+    /// say it about one axis, so a two-dimensional block scale was not
+    /// expressible at all even though both executors' kernels index one.
     ///
     /// This is how a block-scaled checkpoint is dequantized, and stating it as
     /// an expression is the point. The scales are a tensor like any other, so
     /// they take the same [`Expr::Shard`], [`Expr::Slice`] and [`Expr::Concat`]
-    /// the weight takes, written beside it and checked against `group` by
+    /// the weight takes, written beside it and checked against the weight by
     /// `infer`. The alternative — pairing a weight with its scales by appending
     /// a suffix to its name, somewhere below the contract — cannot be checked
     /// at all: a partition applied to one and not the other is silent, and a
     /// pairing that fails to match simply does nothing.
-    PerGroup {
-        by: Box<Expr>,
-        /// Elements of `src` per element of `by`, along `axis`. Never zero.
-        group: u32,
-        axis: Axis,
-    },
+    PerBlock { by: Box<Expr> },
 }
 
 /// The type of a tensor-valued expression: logical shape plus how its elements
@@ -838,18 +843,14 @@ impl Expr {
         }
     }
 
-    /// Multiply by `by`, one factor per `group` elements along `axis`.
+    /// Multiply by `by`, one factor per block, blocked by the shape ratio.
     ///
     /// Over a quantized `self` this is dequantization, and the result is the
     /// scheme's logical dtype.
-    pub fn scale_per_group(self, by: Expr, group: u32, axis: u8) -> Self {
+    pub fn scale_per_block(self, by: Expr) -> Self {
         Expr::Scale {
             src: Box::new(self),
-            factor: ScaleFactor::PerGroup {
-                by: Box::new(by),
-                group,
-                axis: Axis(axis),
-            },
+            factor: ScaleFactor::PerBlock { by: Box::new(by) },
         }
     }
 
@@ -917,7 +918,7 @@ impl Expr {
             | Expr::Cast { src, .. } => src.visit(seen),
             Expr::Scale { src, factor } => {
                 src.visit(seen);
-                if let ScaleFactor::PerGroup { by, .. } = factor {
+                if let ScaleFactor::PerBlock { by } = factor {
                     by.visit(seen);
                 }
             }
@@ -1005,11 +1006,7 @@ impl Expr {
             Expr::Scale { src, factor } => Expr::Scale {
                 src: boxed(src)?,
                 factor: match factor {
-                    ScaleFactor::PerGroup { by, group, axis } => ScaleFactor::PerGroup {
-                        by: boxed(by)?,
-                        group,
-                        axis,
-                    },
+                    ScaleFactor::PerBlock { by } => ScaleFactor::PerBlock { by: boxed(by)? },
                     uniform => uniform,
                 },
             },

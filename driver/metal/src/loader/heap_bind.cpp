@@ -456,7 +456,8 @@ BoundDecode stage_decode_storage(
     const pie_loader::CheckpointSource& view,
     const pie_loader::LoadPlan& load,
     const DecodeGeometry& g,
-    const HeapPlan& heap_plan) {
+    const HeapPlan& heap_plan,
+    const std::function<bool(const std::string&)>& streams) {
     BoundDecode b;
     b.plan = heap_plan;
     b.gdn.resize(g.n_layers);
@@ -464,9 +465,16 @@ BoundDecode stage_decode_storage(
 
     {
         StagedWeights staged =
-            stage_plan_weights(ctx, view, load, heap_plan.weights_bytes);
+            stage_plan_weights(ctx, view, load, heap_plan.weights_bytes, streams);
         b.weights_region = staged.weights_region;
         b.weights = std::move(staged.weights);
+        b.stream_pack = std::move(staged.stream_pack);
+        if (staged.streamed_bytes > 0) {
+            std::fprintf(stderr,
+                         "[pie-metal] %.2f GB of FFN weights streamed from a pack, and out "
+                         "of the heap\n",
+                         double(staged.streamed_bytes) / 1e9);
+        }
     }
 
     // ── KV region: k/v pages per full-attn layer (append-only, I4) ──

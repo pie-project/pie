@@ -25,6 +25,7 @@ from common import (
     maybe_set_cpu_affinity,
     print_first_output,
     request_max_tokens,
+    request_max_tokens_varies,
     run_timed_warmup_sync,
     summarize,
     visible_cuda_devices,
@@ -215,12 +216,13 @@ def run(args: argparse.Namespace):
     )
 
     def sampling_for(i: int) -> "SamplingParams":
-        if not getattr(args, "mixed_phase", False):
+        mt = request_max_tokens(args, i)
+        if mt == args.max_tokens:
             return sampling
         return SamplingParams(
             temperature=args.temperature,
             top_p=args.top_p,
-            max_tokens=request_max_tokens(args, i),
+            max_tokens=mt,
             ignore_eos=args.ignore_eos,
         )
 
@@ -285,7 +287,7 @@ def run(args: argparse.Namespace):
                     sampling_for(args.warmup + i)
                     for i in range(len(run_prompts))
                 ]
-                if getattr(args, "mixed_phase", False)
+                if request_max_tokens_varies(args)
                 else sampling
             )
             outputs = llm.generate(run_prompts, measured_sampling)
@@ -378,12 +380,13 @@ def run_streaming(args: argparse.Namespace):
     )
 
     def sampling_for(i: int) -> "SamplingParams":
-        if not getattr(args, "mixed_phase", False):
+        mt = request_max_tokens(args, i)
+        if mt == args.max_tokens:
             return sampling
         return SamplingParams(
             temperature=args.temperature,
             top_p=args.top_p,
-            max_tokens=request_max_tokens(args, args.warmup + i),
+            max_tokens=mt,
             ignore_eos=args.ignore_eos,
         )
 
@@ -517,7 +520,7 @@ def run_streaming(args: argparse.Namespace):
                 f"req-{i}",
                 prompts[args.warmup + i],
                 prompt_counts[args.warmup + i],
-                sampling_for(i),
+                sampling_for(args.warmup + i),
                 epoch_monotonic_ns,
             )
 

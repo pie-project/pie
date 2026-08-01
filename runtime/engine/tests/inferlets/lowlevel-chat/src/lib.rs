@@ -51,7 +51,7 @@
 //!
 //! Input: `"<max_tokens> [depth=<k>] [no-rollback-probe]"` (default 8 / 4).
 
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 use inferlet::{Result, chat};
 
 const SYSTEM: &str = "You are a helpful assistant.";

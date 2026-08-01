@@ -6274,6 +6274,27 @@ bool Dispatch::enqueue_fixed_decode(
         ++state.stats.fixed_decode_batches;
         state.stats.fixed_decode_lanes += programs;
     }
+    // One line per process, on the first templated batch: whether this build's
+    // decode template is carrying recurrent state. There is no cheaper way to
+    // observe it -- `DispatchStats` is wired only into fire-timing debug, and
+    // the whole effect of admitting an RS fire here is that a slower path is
+    // NOT taken, which no assertion downstream can see. If the RS guard above
+    // is ever re-tightened, this is what says so.
+    //
+    // The env read is a function-local static, not a per-batch `getenv`: this
+    // runs once per decode step on the latency path, and reading the
+    // environment there measurably costs (~1.5% of single-request tok/s).
+    static const bool trace_template =
+        std::getenv("PIE_FIXED_DECODE_TRACE") != nullptr;
+    if (trace_template) {
+        static std::once_flag once;
+        std::call_once(once, [&] {
+            std::cerr << "[pie-driver-cuda] fixed-decode template active: "
+                      << "programs=" << programs << " recurrent_state="
+                      << (buffers.rs_slot_ids != nullptr ? "yes" : "no")
+                      << "\n";
+        });
+    }
     return true;
 }
 
@@ -6420,19 +6441,82 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
         // (frame.cpp) takes the composed batch from R to its request
         // bucket with device-side pad rows, so the template no longer
         // requires R to sit exactly on the lattice.
-        if (staged == nullptr ||
-            page_size == 0 || device_pages == 0 ||
-            !view.rs_slot_ids.empty() ||
-            !view.rs_fold_lens.empty() ||
-            !view.rs_buffer_slot_ids.empty() ||
-            view.kv_translation_indptr.size() != n_prog + 1 ||
-            view.kv_translation_indptr.data()[0] != 0 ||
-            view.kv_translation_indptr.data()[n_prog] !=
-                view.kv_translation.size() ||
-            view.ptir_kv_write_lower_bounds.size() != n_prog ||
-            view.ptir_kv_write_upper_bounds.size() != n_prog) {
+        // Plain per-request RS slots ride through untouched: this template
+        // resolves *geometry* (tokens, positions, pages), and the slot->request
+        // attribution is host data that `compose_forward_batch` copies and that
+        // graph padding extends with `graph_pad_slot`. A fold or a buffered
+        // working set is different -- both change the batch's shape -- so those
+        // two still refuse.
+        //
+        // Refusing on `rs_slot_ids` too is what shut every recurrent-state
+        // family out of device composition, which is the only path that can
+        // resolve a chained descriptor: the host readback fallback cannot see a
+        // value the producing fire has not committed yet, so a decode step that
+        // reads the prefill's sampled token never became ready.
+        const bool trace_compose = [] {
+            const char* v = std::getenv("PIE_TRACE_DEVICE_COMPOSE");
+            return v != nullptr && v[0] != '\0' && v[0] != '0';
+        }();
+        auto refuse = [&](const char* why) {
+            if (trace_compose) {
+                std::fprintf(stderr, "[compose] refused: %s\n", why);
+                std::fflush(stderr);
+            }
             return false;
+        };
+        if (staged == nullptr) return refuse("no staged launch");
+        if (page_size == 0 || device_pages == 0) return refuse("no kv pages");
+        // A *bound* fold-length array is not a fold. The runtime carries one
+        // entry per request for every recurrent-state family, and on an
+        // ordinary decode step every entry is zero -- the state advances by
+        // the step's own token, with nothing to replay. Only a non-zero
+        // length reshapes the batch, and only that has to refuse.
+        {
+            const auto folds = view.rs_fold_lens.as<std::uint32_t>();
+            std::size_t nonzero = 0;
+            for (std::size_t i = 0; i < folds.size(); ++i) {
+                if (folds[i] != 0) ++nonzero;
+            }
+            if (nonzero != 0) {
+                if (trace_compose) {
+                    std::fprintf(stderr,
+                                 "[compose] refused: rs fold (%zu/%zu non-zero)\n",
+                                 nonzero, folds.size());
+                    std::fflush(stderr);
+                }
+                return false;
+            }
         }
+        if (!view.rs_buffer_slot_ids.empty()) return refuse("rs buffer");
+        // A DEVICE-RESIDENT fold length (`PIE_RS_FLAG_FOLD_LEN_DEVICE`). Its
+        // value is substituted during descriptor resolution and clamped
+        // against a host bound; this template resolves nothing, so the wire
+        // array would still hold that bound -- folding more than the accepted
+        // prefix, and tokens absorbed into the recurrence are unrecoverable.
+        // frame.cpp refuses the combination outright, so it must refuse here
+        // rather than later.
+        //
+        // The non-zero fold check above happens to catch this today, but only
+        // because the host's bound is non-zero. The flag is what actually
+        // carries the rule, so the flag is what is tested.
+        if (std::any_of(view.rs_slot_flags.data(),
+                        view.rs_slot_flags.data() + view.rs_slot_flags.size(),
+                        [](std::uint8_t f) {
+                            return (f & PIE_RS_FLAG_FOLD_LEN_DEVICE) != 0;
+                        })) {
+            return refuse("rs device-resident fold length");
+        }
+        if (view.kv_translation_indptr.size() != n_prog + 1)
+            return refuse("kv_translation_indptr size");
+        if (view.kv_translation_indptr.data()[0] != 0)
+            return refuse("kv_translation_indptr[0]");
+        if (view.kv_translation_indptr.data()[n_prog] !=
+            view.kv_translation.size())
+            return refuse("kv_translation_indptr tail");
+        if (view.ptir_kv_write_lower_bounds.size() != n_prog)
+            return refuse("kv_write_lower_bounds size");
+        if (view.ptir_kv_write_upper_bounds.size() != n_prog)
+            return refuse("kv_write_upper_bounds size");
         ResolvedPrograms candidate;
         candidate.per_program.resize(n_prog);
         candidate.is_device_geometry.assign(n_prog, 0);
@@ -6462,7 +6546,7 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
             if (instance.geometry_class !=
                     PIE_GEOMETRY_CLASS_DECODE_ENVELOPE ||
                 instance.trace == nullptr) {
-                return false;
+                return refuse("geometry class not decode-envelope");
             }
             const Trace& trace = *instance.trace;
             std::array<const PortBinding*, 10> dynamic{};
@@ -6622,6 +6706,17 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
     out.is_device_geometry.assign(n_prog, 0);
     const bool resolve_device_mask =
         view.has_user_mask && view.flattened_masks.empty();
+    // The fold length is the one RS quantity the host may never have seen, so
+    // a program that is otherwise ORDINARY -- host geometry, wire-composed --
+    // still has one port that must be read off the device. Resolve just that
+    // port for such a program, exactly as a device mask is resolved for an
+    // otherwise host-geometry attention pass.
+    const bool resolve_device_fold_len = std::any_of(
+        view.rs_slot_flags.data(),
+        view.rs_slot_flags.data() + view.rs_slot_flags.size(),
+        [](std::uint8_t f) {
+            return (f & PIE_RS_FLAG_FOLD_LEN_DEVICE) != 0;
+        });
     bool resolved_mask = false;
     std::vector<detail::PortCellCache> cached_cells(n_prog);
     // Pull host-writer rings on the descriptor stream: the readback pack
@@ -6699,11 +6794,12 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
             view.ptir_program_instances.data()[p];
         auto it = s.instances.find(iid);
         const Trace* trace = it->second.trace;
-        const bool mask_only =
-            it->second.geometry_class == PIE_GEOMETRY_CLASS_HOST &&
-            resolve_device_mask;
-        if (it->second.geometry_class == PIE_GEOMETRY_CLASS_HOST &&
-            !mask_only) {
+        const bool host_class =
+            it->second.geometry_class == PIE_GEOMETRY_CLASS_HOST;
+        const bool mask_only = host_class && resolve_device_mask;
+        const bool fold_len_only =
+            host_class && !mask_only && resolve_device_fold_len;
+        if (host_class && !mask_only && !fold_len_only) {
             continue;
         }
         const std::unordered_set<std::uint32_t>* pending_slots =
@@ -6713,6 +6809,7 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
         for (const PortBinding& binding : trace->ports) {
             if (binding.is_const) continue;
             if (mask_only && binding.port != kPortAttnMask) continue;
+            if (fold_len_only && binding.port != kPortRsFoldLen) continue;
             ChannelView& channel_view = it->second.instance->view();
             const std::uint32_t slot =
                 channel_view.slot(binding.channel);
@@ -6812,7 +6909,7 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
             const auto& instance =
                 s.instances.at(view.ptir_program_instances.data()[p]);
             if (instance.geometry_class == PIE_GEOMETRY_CLASS_HOST &&
-                !resolve_device_mask) {
+                !resolve_device_mask && !resolve_device_fold_len) {
                 continue;
             }
             if (snapshot_offsets[p] ==
@@ -6868,11 +6965,12 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
         const std::uint64_t iid = view.ptir_program_instances.data()[p];
         auto it = s.instances.find(iid);
         const Trace* trace = it->second.trace;
-        const bool mask_only =
-            it->second.geometry_class == PIE_GEOMETRY_CLASS_HOST &&
-            resolve_device_mask;
-        if (it->second.geometry_class == PIE_GEOMETRY_CLASS_HOST &&
-            !mask_only) {
+        const bool host_class =
+            it->second.geometry_class == PIE_GEOMETRY_CLASS_HOST;
+        const bool mask_only = host_class && resolve_device_mask;
+        const bool fold_len_only =
+            host_class && !mask_only && resolve_device_fold_len;
+        if (host_class && !mask_only && !fold_len_only) {
             continue;
         }
 
@@ -6895,6 +6993,19 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
                 return false;
             }
             resolved_mask = true;
+            continue;
+        }
+        if (fold_len_only) {
+            // ONE port, and nothing else: this program's geometry is host
+            // composed and correct already. `is_device_geometry` stays 0 so
+            // composition keeps taking the wire arrays for everything except
+            // the fold length, which it substitutes per flagged row.
+            if (!resolve_rs_fold_len(
+                    *trace, it->second.instance->view(), fg, err,
+                    pending_slots, &cached_cells[p])) {
+                return false;
+            }
+            if (fg.has_rs_fold_len) resolved_mask = true;
             continue;
         }
         if (!resolve_fire_geometry(

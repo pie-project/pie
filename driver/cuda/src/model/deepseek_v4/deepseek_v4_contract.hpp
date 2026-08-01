@@ -7,6 +7,8 @@
 /// and the intermediate dim is split within each expert so every rank computes
 /// a partial expert output that an all-reduce combines.
 
+#include <stdexcept>
+
 #include "model/contract.hpp"
 
 namespace pie_cuda_driver::model {
@@ -16,22 +18,44 @@ inline ShardAxis dsv4_shard_axis(std::string_view name) {
     // Routed experts: shard the intermediate dim within each expert. w1/w3 on
     // axis 0 (gate/up out dim), w2 on axis 1 (down in dim). Each rank computes
     // a partial expert output; the results are combined by an all-reduce.
+    // Weights only. A companion scale reaches here already rewritten to the
+    // weight it scales -- `ContractBuilder::shard_axis` strips the suffix
+    // before consulting this -- so listing scales again is how the two lists
+    // drift apart.
     if (contains(name, ".ffn.experts.")) {
-        if (ends_with_any(name, {".w1.weight", ".w1.scale", ".w3.weight", ".w3.scale"})) {
+        if (ends_with_any(name, {".w1.weight", ".w3.weight"})) {
             return std::uint8_t{0};
         }
-        if (ends_with_any(name, {".w2.weight", ".w2.scale"})) {
+        if (ends_with(name, ".w2.weight")) {
             return std::uint8_t{1};
         }
     }
-    if (ends_with_any(name, {".shared_experts.w1.weight", ".shared_experts.w1.scale",
-                             ".shared_experts.w3.weight", ".shared_experts.w3.scale"})) {
+    if (ends_with_any(name, {".shared_experts.w1.weight",
+                             ".shared_experts.w3.weight"})) {
         return std::uint8_t{0};
     }
-    if (ends_with_any(name, {".shared_experts.w2.weight", ".shared_experts.w2.scale"})) {
+    if (ends_with(name, ".shared_experts.w2.weight")) {
         return std::uint8_t{1};
     }
-    // Everything else replicated, which avoids TP communication in the main path.
+    // Inside the FFN, replication is never the answer, so falling through to
+    // it is a bug rather than a default. Every projection here is split and
+    // all-reduced; a name this function does not recognise -- a checkpoint
+    // variant that spells an expert differently, say -- would otherwise be
+    // replicated silently while the forward went on sharding around it, and
+    // the model would answer plausibly and wrongly. Say so instead.
+    //
+    // Scales never reach here: `ContractBuilder::shard_axis` rewrites them to
+    // the weight they scale first.
+    if (contains(name, ".ffn.") && ends_with(name, ".weight") &&
+        !contains(name, ".gate.") && !contains(name, "_norm.") &&
+        !contains(name, "layernorm")) {
+        throw std::runtime_error(
+            "deepseek_v4: no sharding decision for FFN tensor '" +
+            std::string(name) +
+            "'; add it to dsv4_shard_axis rather than letting it replicate");
+    }
+    // Everything outside the FFN is replicated, which avoids TP communication
+    // in the main path.
     return std::nullopt;
 }
 
@@ -77,22 +101,38 @@ inline void dsv4_block_scales_to_fp32(ContractBuilder& b) {
             continue;
         }
         std::vector<std::int64_t> shape = contract_detail::shape_of(raw);
-        auto [expr, local] = b.shard(
-            b.contract().transmute(b.contract().src(std::string(raw.name)), shape,
-                                 pie_loader::raw(PieLoaderDType::E8M0)),
-            shape, b.shard_axis(raw.name));
-        // The exponents become the fp32 factors the FP8 GEMM reads, and the
-        // widening is spelled. The transmute above only says how to *read* the
-        // stored bytes -- one E8M0 exponent per byte -- so declaring F32 over
-        // it would be a relabel of a 1-byte element as a 4-byte one. This is
-        // the same fact `F32Factors` states below, and the two have to agree:
-        // a contract that declares an encoding its expression does not produce
-        // is rejected, which is how this was found the first time a real
-        // DeepSeek-V4 checkpoint was compiled.
-        const PieLoaderEncodingSpec factors = pie_loader::raw(PieLoaderDType::F32);
-        auto defined = b.define(b.output_name(raw.name),
-                                b.contract().cast(expr, factors), factors,
-                                std::move(local));
+        // Declaring F32 over the transmute was the original bug, and the
+        // reason is worth keeping: the transmute says how to *read* the stored
+        // bytes -- one E8M0 exponent each -- so F32 over it relabels a 1-byte
+        // element as a 4-byte one, and the algebra rejects it. That is how
+        // this was found the first time a real DeepSeek-V4 checkpoint was
+        // compiled.
+        //
+        // Spelling the widening as a `cast` fixes the type and cannot survive
+        // tensor parallelism. A cast is a kernel, so it leaves the affine
+        // fragment that `contract::compile` lowers into byte runs, and a
+        // `Shard` can no longer slice it: nested under the shard, compile
+        // refuses it; hoisted above, the executor casts compact sources only;
+        // routed through an `internal()` tensor, a strided slice of a computed
+        // buffer is refused in turn. At TP=1 there is no shard, so all three
+        // stay hidden.
+        //
+        // The widening does not belong here at all. `scaling(..., F32Factors)`
+        // below is the request, and `LoadPlanExecutor` answers it with
+        // `convert_block_scale_to_f32` once the tensor is materialised,
+        // writing the `.f32` companion the FP8 GEMM binds to. So this pass
+        // publishes the exponent bytes and nothing more -- a rename and a
+        // shard, which shards at any degree.
+        //
+        // U8 rather than E8M0, and that part is not cosmetic: the expansion
+        // dispatches on the tensor's dtype and knows only UINT8 and BF16, so
+        // an E8M0 tensor falls through its `return` and the GEMM is handed
+        // exponent bytes it refuses by name. U8 is what every other E8M0 scale
+        // in the tree is declared as.
+        auto [expr, local] = b.shard(b.contract().src(std::string(raw.name)),
+                                     shape, b.shard_axis(raw.name));
+        auto defined = b.define(b.output_name(raw.name), expr,
+                                pie_loader::raw(PieLoaderDType::U8), std::move(local));
         // The pairing this loop just established, stated rather than dropped.
         // The loader used to rediscover it by appending `_scale_inv` and then
         // `.scale` to every F8E4M3 tensor's name, with `group_size` hardcoded to
@@ -123,7 +163,7 @@ inline void dsv4_block_scales_to_fp32(ContractBuilder& b) {
 ///
 /// Both halves of the gap are sayable. `Bitcast` names the packed bytes as the
 /// quantization they are; `Concat` and `Reshape` build the slab; and
-/// `scale_per_group` multiplies each group of 32 elements by its own factor,
+/// `scale_per_block` multiplies each group of 32 elements by its own factor,
 /// which over a quantized operand *is* the dequantization. Sharding sits
 /// inside all of it, so each rank dequantizes only the slice it keeps.
 ///
@@ -256,7 +296,7 @@ inline void dsv4_bf16_expert_stacks(ContractBuilder& b) {
         }
         const auto experts = static_cast<std::int64_t>(gate_up.size());
 
-        // Named but not bound. `scale_per_group` takes its factors by output
+        // Named but not bound. `scale_per_block` takes its factors by output
         // name -- a scale is a tensor the contract declared, not a companion
         // the lowering guesses at from a suffix -- and the stacked slab is
         // dequantized here, so no kernel ever reads these again. Left public
@@ -278,13 +318,13 @@ inline void dsv4_bf16_expert_stacks(ContractBuilder& b) {
             dn->internal();
         }
         b.define(ffn + "experts.gate_up.weight",
-                 b.contract().scale_per_group(b.contract().concat(gate_up, 0),
-                                              b.contract().out(gu_scale), kGroup, 2),
+                 b.contract().scale_per_block(b.contract().concat(gate_up, 0),
+                                              b.contract().out(gu_scale)),
                  pie_loader::raw(PieLoaderDType::BF16),
                  std::vector<std::int64_t>{experts, 2 * local_inter, hidden});
         b.define(ffn + "experts.down.weight",
-                 b.contract().scale_per_group(b.contract().concat(down, 0),
-                                              b.contract().out(dn_scale), kGroup, 2),
+                 b.contract().scale_per_block(b.contract().concat(down, 0),
+                                              b.contract().out(dn_scale)),
                  pie_loader::raw(PieLoaderDType::BF16),
                  std::vector<std::int64_t>{experts, hidden, local_inter});
         for (std::uint32_t id : consumed) {
@@ -301,7 +341,7 @@ inline void dsv4_bf16_expert_stacks(ContractBuilder& b) {
 /// each `src` replaced by the `index_src` it was a member of. Everything that
 /// made the stack correct is still here in the same order: the transmutes that
 /// name packed nibbles as MXFP4, the shard that keeps only this rank's slice,
-/// and the `scale_per_group` that dequantizes. A group's plan is a whole plan,
+/// and the `scale_per_block` that dequantizes. A group's plan is a whole plan,
 /// so all of it runs on the page-in path; nothing had to be reduced to plain
 /// copies to be streamable.
 ///
@@ -431,17 +471,17 @@ inline void dsv4_streamed_expert_groups(ContractBuilder& b) {
             .internal();
         group.define(
                  "gate_up.weight",
-                 c.scale_per_group(
+                 c.scale_per_block(
                      c.concat({packed("experts.{}.w1.weight", {inter_full, hidden}, 0),
                                packed("experts.{}.w3.weight", {inter_full, hidden}, 0)},
                               0),
-                     c.out("gate_up.scale"), kGroup, 1),
+                     c.out("gate_up.scale")),
                  pie_loader::raw(PieLoaderDType::BF16))
             .expect({2 * inter, hidden});
         group.define("down.weight",
-                     c.scale_per_group(
+                     c.scale_per_block(
                          packed("experts.{}.w2.weight", {down_raw[0], inter_full}, 1),
-                         c.out("down.scale"), kGroup, 1),
+                         c.out("down.scale")),
                      pie_loader::raw(PieLoaderDType::BF16))
             .expect({down_raw[0], inter});
 

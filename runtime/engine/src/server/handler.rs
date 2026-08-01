@@ -480,7 +480,10 @@ impl Session {
             return;
         }
 
-        if let Err(err) = inbox::send(process_id.to_string(), message) {
+        // A restarted request keeps its original id on the client side; the
+        // inbox belongs to whichever process is currently running that work.
+        let target = crate::inferlet::process::resolve(process_id);
+        if let Err(err) = inbox::send(target.to_string(), message) {
             tracing::error!(
                 process_id = %process_id,
                 error = %err,

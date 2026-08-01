@@ -390,6 +390,16 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
              "Pair with prefix caching on engines that support it.",
     )
     p.add_argument(
+        "--output-spread",
+        type=float,
+        default=0.0,
+        help="Fan per-request output budgets out over "
+             "[max_tokens*(1-F), max_tokens*(1+F)] on a deterministic "
+             "sawtooth with mean exactly max_tokens. Breaks the lockstep a "
+             "uniform shape imposes on a closed-loop client without changing "
+             "the total work.",
+    )
+    p.add_argument(
         "--mixed-phase",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -588,11 +598,31 @@ def _filler_words(count: int) -> str:
     return " ".join(base[i % len(base)] for i in range(count))
 
 
+OUTPUT_SPREAD_PERIOD = 16
+
+
 def request_max_tokens(args: argparse.Namespace, i: int) -> int:
-    """Per-request output budget: uniform unless --mixed-phase."""
+    """Per-request output budget: uniform unless --mixed-phase.
+
+    `--output-spread` fans the budget out around `--max-tokens` on a
+    deterministic sawtooth whose mean over each period is exactly 1, so the
+    total output token count is preserved and the ledger's same-work guard
+    still holds. Both engines call this, so they see identical budgets.
+    """
     if getattr(args, "mixed_phase", False) and i % 2 == 0:
         return args.mixed_short_output
+    spread = getattr(args, "output_spread", 0.0) or 0.0
+    if spread > 0.0:
+        frac = (i % OUTPUT_SPREAD_PERIOD) / (OUTPUT_SPREAD_PERIOD - 1)
+        return max(1, round(args.max_tokens * (1.0 + spread * (2.0 * frac - 1.0))))
     return args.max_tokens
+
+
+def request_max_tokens_varies(args: argparse.Namespace) -> bool:
+    """True when `request_max_tokens` is not constant across requests."""
+    if getattr(args, "mixed_phase", False):
+        return True
+    return (getattr(args, "output_spread", 0.0) or 0.0) > 0.0
 
 
 def hash_output_tokens(token_ids: list[int]) -> str:

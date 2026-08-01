@@ -75,7 +75,7 @@
 //! 3. **Pages, not positions** — see above. This is a property of a paged KV
 //!    cache, not of H2O.
 
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 use inferlet::{Result, model as wit_model};
 use serde::{Deserialize, Serialize};
 

@@ -1,5 +1,5 @@
 use inferlet::Result;
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 
 #[inferlet::main]
 async fn main(_input: String) -> Result<String> {
@@ -61,8 +61,6 @@ async fn main(_input: String) -> Result<String> {
         .await
         .map_err(|error| format!("take: {error}"))?[0];
     pipeline.close();
-    pass.rs_working_sets(&[])
-        .map_err(|error| format!("in-place pure RS rebind: {error}"))?;
 
     Ok(format!("value={value}"))
 }

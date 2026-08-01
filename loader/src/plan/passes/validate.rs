@@ -187,7 +187,7 @@ pub(super) fn validate_scale_factors(program: &mut LoadPlan) -> Result<usize> {
         else {
             continue;
         };
-        if *kind != TileMapKind::Scale || transform.scale_group == 0 {
+        if *kind != TileMapKind::Scale || transform.scale_blocks.is_empty() {
             continue;
         }
         // One operand carries the payload unless it arrives as a source

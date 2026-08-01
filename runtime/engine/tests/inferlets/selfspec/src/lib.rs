@@ -25,7 +25,7 @@
 //!    nonzero, `≠ g[j]`) ⇒ `V == [g0..g_{j-1}, g_j, 0..]` — the accepted
 //!    prefix, the correction `t_j == g[j]` spliced at `j`, then 0s.
 
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 use inferlet::{Result, model as wit_model, serde_json};
 
 const PAGE_T: u32 = 16;

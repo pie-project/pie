@@ -332,7 +332,7 @@ impl HostExecutor<'_> {
             // different width from its input by design: unpacking four-bit
             // codes into `BF16` quadruples the bytes. Every other kind moves
             // the same bytes it read, and the mismatch is a bug worth catching.
-            if transform.scale_group == 0 {
+            if transform.scale_blocks.is_empty() {
                 require_same_byte_count(source_stride, &dest.stride)?;
             }
             if !dest.stride.has_dense_destination() {
@@ -397,11 +397,12 @@ impl HostExecutor<'_> {
                 Err(invalid("host Scale requires a source or input buffer"))
             }
         };
-        if transform.scale_group != 0 {
+        if !transform.scale_blocks.is_empty() {
             let elements = match transform.from {
                 None => decode_values(bytes, payload()?)?,
                 Some(QuantScheme::Mxfp4E2M1E8M0) => decode_mxfp4_elements(bytes),
                 Some(QuantScheme::Int4B8) => decode_int4b8_elements(bytes),
+                Some(QuantScheme::Fp8E4M3) => decode_fp8_e4m3_elements(bytes),
                 Some(other) => {
                     return Err(invalid(format!(
                         "host Scale does not implement {other:?} elements"
@@ -409,8 +410,8 @@ impl HostExecutor<'_> {
                 }
             };
             let output =
-                output.ok_or_else(|| invalid("per-group Scale requires an output buffer"))?;
-            return self.scale_per_group(elements, inputs, self.buffer_dtype(output)?, transform);
+                output.ok_or_else(|| invalid("per-block Scale requires an output buffer"))?;
+            return self.scale_per_block(elements, inputs, output, transform);
         }
         let dtype = payload()?;
         let factor = f32::from_bits(transform.scale_factor_bits);
@@ -421,40 +422,94 @@ impl HostExecutor<'_> {
         encode_values(&values, dtype)
     }
 
-    /// One factor per `scale_group` elements, read from the last input buffer.
+    /// One factor per block, read from the last input buffer.
     ///
-    /// The elements are flattened before the grouping is applied, which is
-    /// exact rather than approximate: `infer_scale_per_group` accepts the
-    /// grouping only on the last axis, and on the last axis the groups of the
-    /// row-major layout and the groups of the logical shape are the same runs.
-    /// Every earlier axis therefore contributes whole rows, and a whole row is
-    /// a whole number of groups.
-    fn scale_per_group(
+    /// The blocking is `transform.scale_blocks`, one entry per axis, so this
+    /// walks the destination's logical shape rather than flattening. Flattening
+    /// was exact while groups were confined to the last axis — there, the runs
+    /// of the row-major layout and the runs of the logical shape are the same —
+    /// but a block that spans rows has its factor at a stride, and chunking
+    /// cannot see it.
+    ///
+    /// The factors' own extents are derived from the two, not read: the shape
+    /// ratio is what defines the blocking, and reading a third statement of it
+    /// would be a third thing to disagree.
+    fn scale_per_block(
         &self,
         mut values: Vec<f64>,
         inputs: &[BufferId],
-        output: DType,
+        output: BufferId,
         transform: &TransformSpec,
     ) -> Result<Vec<u8>, Error> {
         let factors = *inputs
             .last()
-            .ok_or_else(|| invalid("per-group Scale has no factor operand"))?;
+            .ok_or_else(|| invalid("per-block Scale has no factor operand"))?;
         let factors = decode_values(self.buffer_bytes(factors)?, self.buffer_dtype(factors)?)?;
-        let group = transform.scale_group as usize;
-        if values.len() != factors.len() * group {
+        let shape = self
+            .index
+            .buffer_tensor(self.plan, output)
+            .ok_or_else(|| invalid("per-block Scale output has no tensor type"))?
+            .shape
+            .clone();
+        let blocks = &transform.scale_blocks;
+        if shape.len() != blocks.len() {
             return Err(invalid(format!(
-                "per-group Scale has {} elements but {} factors of {group}",
-                values.len(),
+                "per-block Scale blocks {blocks:?} do not match output shape {shape:?}"
+            )));
+        }
+
+        // Extents of the factor tensor, and the row-major strides to index it
+        // by. Both are folded in one reverse pass so the two can never be
+        // computed from different shapes.
+        let mut counts = vec![0i64; shape.len()];
+        let mut strides = vec![0i64; shape.len()];
+        let mut running = 1i64;
+        for axis in (0..shape.len()).rev() {
+            let block = blocks[axis];
+            if block <= 0 || shape[axis] % block != 0 {
+                return Err(invalid(format!(
+                    "per-block Scale block {block} does not divide axis {axis} of {shape:?}"
+                )));
+            }
+            counts[axis] = shape[axis] / block;
+            strides[axis] = running;
+            running *= counts[axis];
+        }
+        let total: i64 = shape.iter().product();
+        if values.len() as i64 != total {
+            return Err(invalid(format!(
+                "per-block Scale has {} elements but shape {shape:?} needs {total}",
+                values.len()
+            )));
+        }
+        if factors.len() as i64 != running {
+            return Err(invalid(format!(
+                "per-block Scale has {} factors but blocking {blocks:?} of {shape:?} \
+                 needs {running}",
                 factors.len()
             )));
         }
-        for (chunk, factor) in values.chunks_mut(group).zip(&factors) {
-            let factor = *factor as f32;
-            for value in chunk {
-                *value = f64::from(*value as f32 * factor);
+
+        // One odometer over the logical shape. `index` is the factor's flat
+        // position, carried alongside so the division happens once per axis
+        // step instead of once per element.
+        let mut coord = vec![0i64; shape.len()];
+        for value in &mut values {
+            let mut index = 0i64;
+            for axis in 0..shape.len() {
+                index += (coord[axis] / blocks[axis]) * strides[axis];
+            }
+            let factor = factors[index as usize] as f32;
+            *value = f64::from(*value as f32 * factor);
+            for axis in (0..shape.len()).rev() {
+                coord[axis] += 1;
+                if coord[axis] < shape[axis] {
+                    break;
+                }
+                coord[axis] = 0;
             }
         }
-        encode_values(&values, output)
+        encode_values(&values, self.buffer_dtype(output)?)
     }
 
     fn cast_bytes(
@@ -735,6 +790,34 @@ fn decode_int4b8_elements(bytes: &[u8]) -> Vec<f64> {
         values.push(f64::from((byte >> 4) as i8 - 8));
     }
     values
+}
+
+/// One `f64` per `Fp8E4M3` byte: sign, four exponent bits, three mantissa
+/// bits, bias 7.
+///
+/// This is the OCP `E4M3` the CUDA side reaches through
+/// `__nv_cvt_fp8_to_halfraw(.., __NV_E4M3)`, which has no infinity: the
+/// all-ones exponent carries ordinary values up to 448 and only `S.1111.111`
+/// is NaN. A subnormal is `mantissa/8 * 2^-6`, which is what makes the two
+/// branches differ by more than the implicit bit.
+fn decode_fp8_e4m3_elements(bytes: &[u8]) -> Vec<f64> {
+    bytes
+        .iter()
+        .map(|&byte| {
+            let sign = if byte & 0x80 != 0 { -1.0f64 } else { 1.0 };
+            let exponent = i32::from((byte >> 3) & 0x0F);
+            let mantissa = f64::from(byte & 0x07);
+            if exponent == 0x0F && mantissa == 7.0 {
+                return f64::NAN;
+            }
+            let magnitude = if exponent == 0 {
+                mantissa / 8.0 * (-6.0f64).exp2()
+            } else {
+                (1.0 + mantissa / 8.0) * f64::from(exponent - 7).exp2()
+            };
+            sign * magnitude
+        })
+        .collect()
 }
 
 fn decode_mxfp4_elements(bytes: &[u8]) -> Vec<f64> {
@@ -1083,7 +1166,7 @@ mod tests {
                             shape: vec![2, 32],
                             encoding: Encoding::Quant(int4b8),
                         })
-                        .scale_per_group(Expr::out("scales"), 32, 1),
+                        .scale_per_block(Expr::out("scales")),
                     vec![2, 32],
                     Encoding::Raw(DType::BF16),
                 ),
@@ -1101,6 +1184,143 @@ mod tests {
                     .extend_from_slice(&bf16::from_f32(6.0 * row_scale).to_bits().to_le_bytes());
                 expected
                     .extend_from_slice(&bf16::from_f32(1.0 * row_scale).to_bits().to_le_bytes());
+            }
+        }
+        assert_eq!(storage.tensors["w"], expected);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A block that spans rows *and* columns -- the shape GLM-5.1's FP8
+    /// `kv_b_proj` ships and the one thing the old `group`/`axis` pair could
+    /// not name.
+    ///
+    /// A single group size along a single axis can only ever describe a
+    /// one-dimensional blocking. Deriving it from the ratio of the two shapes
+    /// makes the two-dimensional case fall out with no new field, so this is
+    /// the test that the generalization is real rather than a rename: the
+    /// factors are `[2, 2]` over a `[4, 4]` payload, i.e. 2x2 tiles, and each
+    /// of the four is distinct so a wrong index cannot land on the right
+    /// number.
+    ///
+    /// FP8 elements on purpose. It is the format the 2-D blocking arrives in,
+    /// and the values (1, 2, 3, ... 16) are exactly representable in E4M3, so
+    /// a decode that is off by an exponent shows up as a factor of two rather
+    /// than a rounding difference.
+    #[test]
+    fn a_two_dimensional_block_indexes_its_factors_by_row_and_column() {
+        use crate::checkpoint::{CheckpointFile, CheckpointMetadata, RawTensor};
+        use crate::contract::{Expr, ModelContract, TensorContract, TensorType};
+        use crate::types::{Axis, QuantSpec};
+
+        let dir = std::env::temp_dir().join(format!("pie_host_block2d_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // E4M3 for 1..=16: exponent = floor(log2(v)) + 7, mantissa = the three
+        // bits below the leading one.
+        let encode = |value: f64| -> u8 {
+            let exponent = value.log2().floor() as i32;
+            let mantissa = (value / f64::from(exponent).exp2() - 1.0) * 8.0;
+            (((exponent + 7) as u8) << 3) | (mantissa.round() as u8)
+        };
+        let payload: Vec<u8> = (1..=16).map(|v| encode(f64::from(v))).collect();
+        let factors: Vec<f32> = vec![1.0, 10.0, 100.0, 1000.0];
+        let mut factor_bytes = Vec::new();
+        for factor in &factors {
+            factor_bytes.extend_from_slice(&factor.to_le_bytes());
+        }
+
+        let header = r#"{"w":{"dtype":"F8_E4M3","shape":[4,4],"data_offsets":[0,16]},"#.to_string()
+            + r#""s":{"dtype":"F32","shape":[2,2],"data_offsets":[16,32]}}"#;
+        let mut file = (header.len() as u64).to_le_bytes().to_vec();
+        file.extend_from_slice(header.as_bytes());
+        let data_offset = file.len() as u64;
+        file.extend_from_slice(&payload);
+        file.extend_from_slice(&factor_bytes);
+        let size_bytes = file.len() as u64;
+        std::fs::write(dir.join("model.safetensors"), &file).unwrap();
+
+        let metadata = CheckpointMetadata {
+            files: vec![CheckpointFile {
+                id: FileId(0),
+                path: "model.safetensors".to_string(),
+                size_bytes,
+                format: crate::types::CheckpointFormat::Safetensors,
+            }],
+            tensors: vec![
+                RawTensor {
+                    id: TensorId(0),
+                    name: "w".to_string(),
+                    file_id: FileId(0),
+                    file_offset: data_offset,
+                    span_bytes: 16,
+                    shape: vec![4, 4],
+                    encoding: Encoding::Raw(DType::F8E4M3),
+                },
+                RawTensor {
+                    id: TensorId(1),
+                    name: "s".to_string(),
+                    file_id: FileId(0),
+                    file_offset: data_offset + 16,
+                    span_bytes: 16,
+                    shape: vec![2, 2],
+                    encoding: Encoding::Raw(DType::F32),
+                },
+            ],
+        };
+
+        let fp8 = QuantSpec {
+            scheme: QuantScheme::Fp8E4M3,
+            logical_dtype: DType::BF16,
+            bits_per_element: 8,
+            group_size: 2,
+            channel_axis: Some(Axis(1)),
+        };
+        let contract = ModelContract {
+            alignment: 1,
+            tensors: vec![
+                TensorContract::new(
+                    "scales",
+                    Expr::src("s"),
+                    vec![2, 2],
+                    Encoding::Raw(DType::F32),
+                )
+                .internal(),
+                TensorContract::new(
+                    "w",
+                    Expr::src("w")
+                        .transmute(TensorType {
+                            shape: vec![4, 4],
+                            encoding: Encoding::Quant(fp8),
+                        })
+                        .scale_per_block(Expr::out("scales")),
+                    vec![4, 4],
+                    Encoding::Raw(DType::BF16),
+                ),
+            ],
+            groups: Vec::new(),
+        };
+
+        let plan = crate::plan::compile(&metadata, &contract, StorageTarget::default()).unwrap();
+        assert!(
+            plan.instrs.iter().any(|instr| matches!(
+                instr,
+                StorageInstr::TileMap { transform, .. } if transform.scale_blocks == vec![2, 2]
+            )),
+            "the blocking is derived at plan time: {:?}",
+            plan.instrs
+        );
+        let storage = execute_plan(&plan, &dir).unwrap();
+
+        let mut expected = Vec::new();
+        for row in 0..4i64 {
+            for col in 0..4i64 {
+                let value = f64::from((row * 4 + col + 1) as i32);
+                let factor = factors[((row / 2) * 2 + col / 2) as usize];
+                expected.extend_from_slice(
+                    &bf16::from_f32(value as f32 * factor)
+                        .to_bits()
+                        .to_le_bytes(),
+                );
             }
         }
         assert_eq!(storage.tensors["w"], expected);
@@ -1192,7 +1412,7 @@ mod tests {
                             shape: vec![2, 32],
                             encoding: Encoding::Quant(int4b8.clone()),
                         })
-                        .scale_per_group(Expr::out("scales"), 32, 1),
+                        .scale_per_block(Expr::out("scales")),
                     vec![2, 32],
                     Encoding::Raw(DType::BF16),
                 ),
@@ -1334,7 +1554,7 @@ mod tests {
                             shape: vec![2, 32],
                             encoding: Encoding::Quant(mxfp4),
                         })
-                        .scale_per_group(Expr::out("scales"), 32, 1),
+                        .scale_per_block(Expr::out("scales")),
                     vec![2, 32],
                     Encoding::Raw(DType::BF16),
                 ),

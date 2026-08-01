@@ -128,6 +128,29 @@ interface working-set {
         // interpretation). Invalid or duplicate indices return `error`.
         free-buffer: func(indices: list<u32>) -> result<_, error>;
 
+        // Forget the last `count` buffered tokens: they never happened.
+        //
+        // The twin of `rs-geometry.fold-len` on the other end of the buffer.
+        // A fold moves the folded boundary RIGHT and is irreversible; this
+        // moves the live end LEFT and is free, because the slots it releases
+        // are simply overwritten by the next append.
+        //
+        // Not part of `rs-geometry`, deliberately. `fold-len` is there because
+        // it changes what the DEVICE does -- it is where the recurrent state
+        // snapshot lands. This changes nothing on the device at all; it is a
+        // statement about the working set, which is what a resource method is
+        // for. It is also the token-granular sibling of `free-buffer`: that
+        // one releases CAPACITY, this one releases CONTENT.
+        //
+        // A speculative decoder is why it exists. A verify fire buffers a
+        // whole window and a prefix of it is accepted; without this, the only
+        // way to drop the rejected tail is `free-buffer`, which empties the
+        // buffer wholesale and so forces the accepted prefix to be folded
+        // away first -- in a second fire, since its length is not known until
+        // the verify has run. Discard the tail instead and the NEXT window's
+        // fire folds the previous prefix while writing its own tokens.
+        discard-buffered: func(count: u32) -> result<_, error>;
+
         // Reorder the buffered slots by the full bijection `perm`.
         reorder-buffer: func(perm: list<u32>) -> result<_, error>;
 

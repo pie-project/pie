@@ -705,6 +705,12 @@ struct PreparedStep::Impl {
     std::span<const std::uint32_t> rs_fold_len_view;
     std::span<const std::uint32_t> rs_buf_id_view;
     std::span<const std::uint32_t> rs_buf_indptr_view;
+    // The buffered prefix replayed ahead of this fire's own tokens.
+    std::span<const std::uint32_t> rs_buf_read_id_view;
+    std::span<const std::uint32_t> rs_buf_read_indptr_view;
+    std::span<const std::uint32_t> rs_buf_read_len_view;
+    std::span<const std::uint32_t> rs_buf_head_view;
+    bool rs_has_buffer_read = false;
     std::vector<std::int32_t> slot_ids_h;
     std::vector<std::uint8_t> is_fresh_h;
 
@@ -777,6 +783,10 @@ struct PreparedStep::Impl {
     DeviceBuffer<std::uint32_t>::StagedUpload up_rs_fold_lens{};
     DeviceBuffer<std::uint32_t>::StagedUpload up_rs_buf_indptr{};
     DeviceBuffer<std::uint32_t>::StagedUpload up_rs_buf_ids{};
+    DeviceBuffer<std::uint32_t>::StagedUpload up_rs_read_ids{};
+    DeviceBuffer<std::uint32_t>::StagedUpload up_rs_read_indptr{};
+    DeviceBuffer<std::uint32_t>::StagedUpload up_rs_read_lens{};
+    DeviceBuffer<std::uint32_t>::StagedUpload up_rs_heads{};
     DeviceBuffer<std::int32_t>::StagedUpload up_sample_idx{};
 
     // Diagnostics. Declared last so its emission (at destruction) runs
@@ -1195,6 +1205,22 @@ void prepare_step(
         ? std::span<const std::uint32_t>(s.composed.rs_fold_lens)
         : view.rs_fold_lens.as<std::uint32_t>();
     std::string rs_binding_error;
+    // A device-resident fold length is SUBSTITUTED during composition, where
+    // the resolved `rs_fold_len` port is clamped to the host's bound. If the
+    // fire never went through composition, that substitution never happened
+    // and the wire array still holds the placeholder -- which would fold the
+    // entire buffer instead of the accepted prefix. Refuse rather than fold
+    // too much: the tokens are unrecoverable once absorbed.
+    if (!s.composed_ready &&
+        std::any_of(
+            s.rs_flag_view.begin(), s.rs_flag_view.end(),
+            [](std::uint8_t f) {
+                return (f & PIE_RS_FLAG_FOLD_LEN_DEVICE) != 0;
+            })) {
+        throw std::runtime_error(
+            "a fire claims a device-resident RS fold length but was not "
+            "descriptor-composed, so the resolved value never reached it");
+    }
     if (!pipeline::validate_folded_rs_bindings(
             s.rs_slot_view,
             s.rs_flag_view,
@@ -1214,6 +1240,29 @@ void prepare_step(
     s.rs_buf_indptr_view = s.composed_ready
         ? std::span<const std::uint32_t>(s.composed.rs_buffer_slot_indptr)
         : view.rs_buffer_slot_indptr.as<std::uint32_t>();
+    // Read side: host-only, so no device staging -- a replay span is a
+    // property of the working set's occupancy, which a channel-resolved
+    // rs-geometry cannot name. It still travels through composition, because
+    // composition REORDERS requests (wire programs first, device-geometry
+    // ones after) and the read rows have to follow their own requests.
+    s.rs_buf_read_id_view = s.composed_ready
+        ? std::span<const std::uint32_t>(s.composed.rs_buffer_read_slot_ids)
+        : view.rs_buffer_read_slot_ids.as<std::uint32_t>();
+    s.rs_buf_read_indptr_view = s.composed_ready
+        ? std::span<const std::uint32_t>(s.composed.rs_buffer_read_indptr)
+        : view.rs_buffer_read_indptr.as<std::uint32_t>();
+    s.rs_buf_read_len_view = s.composed_ready
+        ? std::span<const std::uint32_t>(s.composed.rs_buffer_read_lens)
+        : view.rs_buffer_read_lens.as<std::uint32_t>();
+    s.rs_buf_head_view = s.composed_ready
+        ? std::span<const std::uint32_t>(s.composed.rs_buffer_heads)
+        : view.rs_buffer_heads.as<std::uint32_t>();
+    s.rs_has_buffer_read =
+        !s.rs_buf_read_len_view.empty() &&
+        std::any_of(
+            s.rs_buf_read_len_view.begin(),
+            s.rs_buf_read_len_view.end(),
+            [](std::uint32_t n) { return n != 0; });
     if (!pipeline::plan_rs_execution(
             s.rs_slot_view,
             s.rs_flag_view,
@@ -1607,6 +1656,25 @@ void prepare_step(
         if (!s.rs_buf_id_view.empty()) {
             s.up_rs_buf_ids =
                 pi.rs_buffer_slot_ids.stage_from_host(s.rs_buf_id_view);
+        }
+        // The read side is host-only for the model, but a TP follower never
+        // sees the launch descriptor -- it recovers every per-request array by
+        // reading it back off the device. So it has to be staged like the rest.
+        if (!s.rs_buf_read_id_view.empty()) {
+            s.up_rs_read_ids = pi.rs_buffer_read_slot_ids.stage_from_host(
+                s.rs_buf_read_id_view);
+        }
+        if (!s.rs_buf_read_indptr_view.empty()) {
+            s.up_rs_read_indptr = pi.rs_buffer_read_indptr.stage_from_host(
+                s.rs_buf_read_indptr_view);
+        }
+        if (!s.rs_buf_read_len_view.empty()) {
+            s.up_rs_read_lens = pi.rs_buffer_read_lens.stage_from_host(
+                s.rs_buf_read_len_view);
+        }
+        if (!s.rs_buf_head_view.empty()) {
+            s.up_rs_heads =
+                pi.rs_buffer_heads.stage_from_host(s.rs_buf_head_view);
         }
     }
 
@@ -2111,7 +2179,8 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
             s.structured_window_left,
             s.rs_plan.mode,
             static_cast<int>(s.rs_fold_len_view.size()),
-            static_cast<int>(s.rs_buf_id_view.size()));
+            static_cast<int>(s.rs_buf_id_view.size()),
+            static_cast<int>(s.rs_buf_read_id_view.size()));
         tp_commit.key = &engine.tp_cpu_gate_key;
     }
     if (s.empty_step) {
@@ -2172,6 +2241,10 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
         pi.rs_fold_lens.commit_staged(s.up_rs_fold_lens);
         pi.rs_buffer_slot_indptr.commit_staged(s.up_rs_buf_indptr);
         pi.rs_buffer_slot_ids.commit_staged(s.up_rs_buf_ids);
+        pi.rs_buffer_read_slot_ids.commit_staged(s.up_rs_read_ids);
+        pi.rs_buffer_read_indptr.commit_staged(s.up_rs_read_indptr);
+        pi.rs_buffer_read_lens.commit_staged(s.up_rs_read_lens);
+        pi.rs_buffer_heads.commit_staged(s.up_rs_heads);
     }
     pi.sample_idx.commit_staged(s.up_sample_idx);
     if (engine.rs_cache != nullptr) {
@@ -2253,6 +2326,7 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
                             s.rs_plan.mode,
                             static_cast<int>(s.rs_fold_len_view.size()),
                             static_cast<int>(s.rs_buf_id_view.size()),
+                            static_cast<int>(s.rs_buf_read_id_view.size()),
                             /*stream=*/nullptr);
         tp_commit.completed = true;
         pie_cuda_driver::tp_watchdog_mark_phase(2);
@@ -2411,6 +2485,18 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
                 (s.rs_is_write || s.rs_is_fold)
                     ? s.rs_buf_indptr_view.data()
                     : nullptr,
+            .rs_buffer_read_slot_ids_h = s.rs_has_buffer_read
+                ? s.rs_buf_read_id_view.data()
+                : nullptr,
+            .rs_buffer_read_indptr_h = s.rs_has_buffer_read
+                ? s.rs_buf_read_indptr_view.data()
+                : nullptr,
+            .rs_buffer_read_lens_h = s.rs_has_buffer_read
+                ? s.rs_buf_read_len_view.data()
+                : nullptr,
+            .rs_buffer_heads_h = s.rs_buf_head_view.empty()
+                ? nullptr
+                : s.rs_buf_head_view.data(),
             .rs_fold_lens_h = !s.rs_fold_len_view.empty()
                 ? s.rs_fold_len_view.data()
                 : nullptr,

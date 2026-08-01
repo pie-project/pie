@@ -12,7 +12,7 @@
 //! scalar/`[1]` value) — a `[2]` channel is taken each fire and the ctr lane
 //! advanced (`add(r, iota(2))`) and put back for the next fire.
 
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 use inferlet::{Result, model as wit_model};
 
 const TEMPERATURE: f32 = 0.8;

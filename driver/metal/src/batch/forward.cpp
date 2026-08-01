@@ -599,6 +599,7 @@ struct MetalExecutor::Impl {
         const DecodeGeometry& geometry,
         const pie_loader::LoadPlan& load_plan,
         std::size_t storage_page_size,
+        bool stream_routed_experts,
         std::string* error);
     bool ready() const { return ctx_ != nullptr; }
     int vocab() const { return simple_ ? simple_->vocab() : g_.vocab; }
@@ -720,7 +721,7 @@ bool MetalExecutor::Impl::setup_simple(model::ModelFamily family,
     // a heap sized for weights that are then ALSO mapped is the footprint
     // doubled rather than halved, and on a machine where the model only just
     // fits that is the difference between running and reading zeros.
-    const auto streams = SimpleFamilyEngine::stream_predicate(family, cfg);
+    const auto streams = SimpleFamilyEngine::stream_predicate(family, cfg.stream_routed_experts);
     const std::size_t streamed =
         streams ? std::size_t(streamable_plan_bytes(load_plan, streams)) : 0;
     const std::size_t heap_bytes = (weights > streamed ? weights - streamed : weights) +
@@ -785,6 +786,7 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
                             const DecodeGeometry& geom,
                             const pie_loader::LoadPlan& load_plan,
                             std::size_t storage_page_size,
+                            bool stream_routed_experts,
                             std::string* err) {
     g_ = geom;
 
@@ -827,8 +829,18 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
         size_t(std::max({sched_.colors_used, mb_sched_.colors_used,
                          prefill_sched_.colors_used})) *
         plan_.scratch_slot_bytes;
+    // Streamed weights are bound over a pack, so the heap must be created
+    // WITHOUT them: a heap sized for weights that are then also mapped is the
+    // footprint doubled rather than halved, which on a machine where the model
+    // only just fits is the difference between running and reading zeros.
+    const auto streams = SimpleFamilyEngine::stream_predicate(
+        model::ModelFamily::Qwen35, stream_routed_experts);
+    const size_t streamed =
+        streams ? size_t(streamable_plan_bytes(load_plan, streams)) : 0;
+    const size_t resident_weights =
+        plan_.weights_bytes > streamed ? plan_.weights_bytes - streamed : plan_.weights_bytes;
     const size_t heap_bytes =
-        plan_.weights_bytes + plan_.io_bytes + plan_.mb_io_bytes +
+        resident_weights + plan_.io_bytes + plan_.mb_io_bytes +
         consts_budget + (32u << 20);
     const size_t elastic_budget =
         plan_.kv_bytes + plan_.state_bytes + plan_.scratch_bytes +
@@ -841,7 +853,7 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
     }
 
     // ── Stage weights/state/KV/IO; bind weight/state/KV/IO slots by ordinal. ──
-    b_ = stage_decode_storage(*ctx_, view, load_plan, g_, plan_);
+    b_ = stage_decode_storage(*ctx_, view, load_plan, g_, plan_, streams);
     bind_decode_dag(*ctx_, b_, dag_, g_, gdn_prep_);
 
     // ── Scratch pool (colors_used slots) → beta's bind pass. ──
@@ -2376,6 +2388,7 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
             geom,
             load_plan,
             cfg.storage_page_size,
+            cfg.stream_routed_experts,
             &derr)) {
         if (err != nullptr) *err = "Metal forward setup failed: " + derr;
         return false;
@@ -3305,6 +3318,7 @@ bool MetalExecutor::run_simple_batch_forward(const std::vector<MemberForwardDesc
     // after the model, which is what makes a sampled token available without a
     // second submission.
     SimpleFamilyEngine::EncodeHook pre, post;
+    const auto fire_t0 = std::chrono::steady_clock::now();
     if (!hooks.empty()) {
         pre = [&](StepEncoder& se) {
             for (const PtirCommandCallbacks& cb : hooks) {
@@ -3318,6 +3332,30 @@ bool MetalExecutor::run_simple_batch_forward(const std::vector<MemberForwardDesc
         };
     }
     const StepTiming timing = impl_->fire_simple(csr, pre, post);
+    // Same meter as `run_batch_step`'s, on the path the simple families take.
+    // Without it a question like "what bounds gpt-oss in a batch" can only be
+    // answered from the outside, where the driver's time and the engine's are
+    // added together.
+    if (std::getenv("PIE_METAL_GPU_METER") != nullptr) {
+        static double gpu[33] = {};
+        static double enc[33] = {};
+        static double wall[33] = {};
+        static int n[33] = {};
+        const int rows = int(csr.token_ids.size());
+        const int lanes = rows < 33 ? rows : 32;
+        gpu[lanes] += timing.gpu_exec_ms;
+        enc[lanes] += timing.encode_ms;
+        wall[lanes] +=
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - fire_t0)
+                .count();
+        if (++n[lanes] % 128 == 0) {
+            std::fprintf(stderr,
+                         "[gpu] lanes=%d n=%d gpu %.4f enc %.4f wall %.4f ms"
+                         " | gpu/row %.4f ms\n",
+                         lanes, n[lanes], gpu[lanes] / n[lanes], enc[lanes] / n[lanes],
+                         wall[lanes] / n[lanes], gpu[lanes] / n[lanes] / (rows > 0 ? rows : 1));
+        }
+    }
     if (!timing.succeeded()) {
         for (const Accepted& a : accepted) {
             errors[a.member] = "Metal forward timed out before its completion fence";

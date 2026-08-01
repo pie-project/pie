@@ -806,16 +806,20 @@ pub enum PieLoaderStorageOp {
         /// constant the contract named — `__uint_as_float` on the CUDA side
         /// costs nothing and cannot round.
         transform_scale_factor_bits: u32,
-        /// Elements per factor along `transform_scale_axis` for a per-group
-        /// [`PieLoaderTileMapKind::Scale`]; zero when the factor is the uniform
-        /// constant above.
+        /// Elements of the operand per factor, on each axis, for a per-block
+        /// [`PieLoaderTileMapKind::Scale`]; empty when the factor is the
+        /// uniform constant above.
         ///
-        /// Non-zero is what tells the executor to read its factors from
+        /// Non-empty is what tells the executor to read its factors from
         /// `input_buffers[0]` — the operand the contract paired with the
         /// payload — instead of from `transform_scale_factor_bits`.
-        transform_scale_group: u32,
-        /// The axis `transform_scale_group` counts along.
-        transform_scale_axis: u8,
+        ///
+        /// One entry per axis of the destination, so a DeepSeek-style FP8
+        /// checkpoint's two-dimensional block scale is `[128, 128]` and the
+        /// ordinary row-wise case is `[1, 32]`. The executor already knows both
+        /// shapes, so this is a statement it can check rather than one it must
+        /// trust.
+        transform_scale_blocks: PieLoaderI64Slice,
     } = 2,
     CreateView {
         input_buffer: u32,

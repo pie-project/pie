@@ -9,6 +9,7 @@ members = [
     "generate",
     "generate-gdn",
     "generate-gdn-n1",
+    "rs-buffer-bench",
     "generate-gdn-frame",
     "gdn-foldcommit",
     "grammar",

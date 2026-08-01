@@ -1,5 +1,5 @@
 use inferlet::Result;
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 
 /// One-page working set + a single seeded token.
 const MAX_PAGES: u32 = 1;

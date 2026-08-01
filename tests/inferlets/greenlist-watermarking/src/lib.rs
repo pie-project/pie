@@ -4,7 +4,7 @@
 //! into a green and red list. Green-token logits receive a configurable bias
 //! before Gumbel-max sampling.
 
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 use inferlet::{Result, chat, model as wit_model};
 use serde::Deserialize;
 use std::hash::{DefaultHasher, Hash, Hasher};

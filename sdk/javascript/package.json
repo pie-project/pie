@@ -15,7 +15,7 @@
     "build": "tsc",
     "test": "vitest run src/__tests__",
     "test:watch": "vitest",
-    "generate-bindings": "jco types ../../interface/inferlet -o src/bindings --world-name inferlet"
+    "generate-bindings": "node -e \"require('node:fs').rmSync('src/bindings',{recursive:true,force:true})\" && jco types ../../interface/inferlet -o src/bindings --world-name inferlet && node scripts/gen-tsconfig-paths.mjs"
   },
   "devDependencies": {
     "@bytecodealliance/jco": "^1.23.0",

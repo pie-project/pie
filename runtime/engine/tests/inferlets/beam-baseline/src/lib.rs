@@ -25,7 +25,7 @@
 //! It is also the workspace's only exercise of `WorkingSet::fork` on the
 //! bridge surface (the fused beam reorders inside one working set instead).
 
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 use inferlet::serde_json;
 use inferlet::{Result, model as wit_model};
 

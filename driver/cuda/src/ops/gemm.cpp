@@ -1802,9 +1802,15 @@ namespace {
 // device memory the cache may hold (0 disables it).
 class DequantWeightCache {
  public:
+    // Per device, not per process. Every rank of a TP group runs in this one
+    // process with its own current device, and the entries here own device
+    // memory: a shared cache lets one rank's insert evict and `cudaFree` a
+    // pointer belonging to another rank's device, which poisons the context
+    // and surfaces as an illegal access in whatever runs next. The same
+    // reasoning already governs `Bf16LtCtx`, `Bf16LtPlanCache` and
+    // `DenseGemmTuner` a few hundred lines up.
     static DequantWeightCache& instance() {
-        static DequantWeightCache c;
-        return c;
+        return per_device_singleton<DequantWeightCache>();
     }
 
     // The expansion depends on the weight AND on how it is read, so the key
@@ -1877,7 +1883,8 @@ class DequantWeightCache {
         used_ = 0;
     }
 
- private:
+    // Public only so `per_device_singleton` can build one per device; the
+    // instance is still reached exclusively through `instance()`.
     DequantWeightCache() {
         const char* v = std::getenv("PIE_FP8_DEQUANT_CACHE_GB");
         if (v != nullptr && v[0] != '\0') {

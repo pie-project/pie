@@ -4,7 +4,7 @@
 //! working set, append distinct text, and are each forked again into two leaves.
 //! Generation then continues independently from all four shared-prefix leaves.
 
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 use inferlet::{Result, chat, model as wit_model};
 use serde::Deserialize;
 
