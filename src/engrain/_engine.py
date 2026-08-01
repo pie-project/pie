@@ -2699,6 +2699,10 @@ class ResidentTables:
     mask_words: int
     start_parser_state: int
     max_groups_per_state: int
+    # Every group entry the grammar has, across all lexer states - the bound on
+    # the global group index a sweep writes, and so the width of the per-row
+    # record of which groups it has already been given.
+    num_groups: int
     max_readings: int
     max_reading_terms: int
     nullable_chain: int
@@ -2799,6 +2803,7 @@ class DeviceGrammar:
         self.has_verdicts = 1
         self.search_steps = 2
         self.max_groups_per_state = 1
+        self.num_groups = 1
         self.max_readings = 1
         self.max_reading_terms = 1
         self.nullable_chain = 0
@@ -3004,6 +3009,9 @@ class DeviceGrammar:
             mask_words=int(arrays["bitset_words"]),
             start_parser_state=int(arrays["start_parser_state"]),
             max_groups_per_state=widest("group_offsets"),
+            num_groups=int(
+                np.frombuffer(arrays["group_set_kind"], dtype=np.uint32).size
+            ),
             max_readings=widest("reading_offsets"),
             max_reading_terms=widest("reading_term_offsets"),
             nullable_chain=nullable,
@@ -3093,6 +3101,7 @@ class DeviceGrammar:
         self.max_groups_per_state = max(
             self.max_groups_per_state, tables.max_groups_per_state
         )
+        self.num_groups = max(self.num_groups, tables.num_groups)
         self.max_readings = max(self.max_readings, tables.max_readings)
         self.max_reading_terms = max(self.max_reading_terms, tables.max_reading_terms)
         self.nullable_chain = max(self.nullable_chain, tables.nullable_chain)
@@ -3463,6 +3472,16 @@ class DeviceBatch:
         self.admitted = torch.zeros(
             rows * grammar.max_groups_per_state, dtype=torch.int8, device="cuda"
         )
+        # One bit per group entry per row: has this row already been given this
+        # group's tokens? A group admitted by several configurations writes the
+        # same tokens each time and the row is a union, so only the first write
+        # is work. Measured on the corpus schema that forks hardest, sixty-four
+        # configurations produce four distinct rows and write sixty times the
+        # bits that end up set.
+        self.group_words = (grammar.num_groups + 31) // 32
+        self.group_given = torch.zeros(
+            rows * self.group_words, dtype=torch.int32, device="cuda"
+        )
         self.counts = torch.zeros(rows, dtype=torch.int32, device="cuda")
         self.work_offsets = torch.zeros(rows + 1, dtype=torch.int32, device="cuda")
         self.live_counts = torch.zeros(rows, dtype=torch.int32, device="cuda")
@@ -3797,6 +3816,7 @@ class DeviceBatch:
             grammar.window,
             grammar.max_stack,
             grammar.max_groups_per_state,
+            grammar.num_groups,
         )
 
     def _check_shape(self) -> None:
@@ -4465,6 +4485,7 @@ class DeviceBatch:
                 self.memo_store.data_ptr(),
                 self.memo_want.data_ptr(),
                 self.row_floor.data_ptr(),
+                self.group_given.data_ptr(),
             ],
             [
                 self.configs,
@@ -4474,6 +4495,7 @@ class DeviceBatch:
                 self.memo_stride,
                 _MEMO_SUFFIXES,
                 grammar.mask_words,
+                self.group_words,
             ],
         )
         _engrain.cuda_launch(
@@ -4490,6 +4512,7 @@ class DeviceBatch:
                 self.row_floor.data_ptr(),
                 self._fused_scratch(grammar).data_ptr(),
                 self.high_water.data_ptr(),
+                self.group_given.data_ptr(),
             ],
             [
                 self.configs,
@@ -4499,6 +4522,7 @@ class DeviceBatch:
                 grammar.paths,
                 grammar.has_verdicts,
                 grammar.mask_words,
+                self.group_words,
             ],
             # One offset per configuration and a total, built per block instead
             # of by a counting kernel and a scan.

@@ -324,13 +324,15 @@ extern "C" __global__ void en_fill_probe(
     int32_t* memo_store,
     int32_t* memo_want,
     int32_t* row_floor,
+    int32_t* admitted,
     int32_t configs,
     int32_t stack_stride,
     int32_t slots,
     int32_t memo_configs,
     int32_t memo_stride,
     int32_t suffixes,
-    int32_t mask_words) {
+    int32_t mask_words,
+    int32_t group_words) {
     int32_t sequence = blockIdx.x;
     int32_t lane = threadIdx.x;
     int32_t count = state->config_count[sequence];
@@ -434,6 +436,15 @@ extern "C" __global__ void en_fill_probe(
     for (int32_t at = lane; at < mask_words; at += blockDim.x) {
         mask[(int64_t)sequence * mask_words + at] = 0;
     }
+    // And the record of which groups this row has already been given. A group
+    // admitted by several configurations contributes the same tokens each
+    // time, and the row is a union, so only the first write is work. Measured
+    // on the corpus schema that forks hardest: sixty-four configurations
+    // produce four distinct rows, and the bits written are sixty times the
+    // bits that end up set.
+    for (int32_t at = lane; at < group_words; at += blockDim.x) {
+        admitted[(int64_t)sequence * group_words + at] = 0;
+    }
     for (int32_t config = lane; config < count; config += blockDim.x) {
         row_floor[sequence * configs + config] = state->depth[sequence * configs + config];
     }
@@ -456,13 +467,15 @@ extern "C" __global__ void en_fill_sweep(
     int32_t* row_floor,
     int32_t* scratch,
     int32_t* high_water,
+    int32_t* admitted,
     int32_t configs,
     int32_t stack_stride,
     int32_t max_reductions,
     int32_t window,
     int32_t paths,
     int32_t has_verdicts,
-    int32_t mask_words) {
+    int32_t mask_words,
+    int32_t group_words) {
     int32_t sequence = blockIdx.x;
     int32_t lane = threadIdx.x;
     int32_t count = state->config_count[sequence];
@@ -563,9 +576,24 @@ extern "C" __global__ void en_fill_sweep(
             if (!v.admitted) {
                 continue;
             }
-            // Phase three, inline: write this group's set. Every kind writes
-            // an OR of a value it decided by itself, so no ordering between
-            // threads can undo it.
+            // Phase three, inline: write this group's set - but only if no
+            // other configuration of this row has written it already. The row
+            // is a union and a group contributes the same tokens whichever
+            // configuration admitted it, so every write after the first is
+            // redundant bandwidth. `atomicOr` returns the word as it was, so
+            // exactly one thread sees the bit clear and does the work.
+            //
+            // This is where a forked row's cost was. Admission still has to be
+            // decided per configuration - that is the parse - but a DENSE
+            // group is `mask_words` atomics, and paying that sixty times for
+            // one answer is what made a schema that forks cost 3.6 ms against
+            // 42 us for the same schema seeded where it does not.
+            int32_t bit = 1 << (group & 31);
+            int32_t before = atomicOr(
+                &admitted[(int64_t)sequence * group_words + (group >> 5)], bit);
+            if (before & bit) {
+                continue;
+            }
             int32_t kind = arena->group_set_kind[groups + group];
             int32_t offset = arena->group_set_offset[groups + group];
             int32_t length = arena->group_set_length[groups + group];
