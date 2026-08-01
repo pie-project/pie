@@ -227,6 +227,8 @@ def build_config(args: argparse.Namespace):
             driver_options["runtime_quant"] = args.runtime_quant
         if args.mxfp4_moe:
             driver_options["mxfp4_moe"] = args.mxfp4_moe
+        if getattr(args, "stream_routed_experts", False):
+            driver_options["stream_routed_experts"] = True
         if args.mtp_assistant_snapshot_dir:
             driver_options["mtp_assistant_snapshot_dir"] = (
                 args.mtp_assistant_snapshot_dir
@@ -249,6 +251,10 @@ def build_config(args: argparse.Namespace):
         # `gpu_mem_utilization` has nowhere to go; the batching caps are the
         # only tunables it reads.
         driver_options = {}
+        # Same key, same name, both backends -- the switch is a residency trade
+        # an operator makes about a model, not a backend detail.
+        if getattr(args, "stream_routed_experts", False):
+            driver_options["stream_routed_experts"] = True
         if getattr(args, "max_forward_tokens", 0):
             driver_options["max_forward_tokens"] = args.max_forward_tokens
         if getattr(args, "max_forward_requests", 0):
@@ -1260,6 +1266,15 @@ def build_parser() -> argparse.ArgumentParser:
                  "planner with pool-only reclaim.",
         )
         sp.add_argument("--kv-cache-dtype", choices=KV_CACHE_DTYPES, default="auto")
+        sp.add_argument(
+            "--stream-routed-experts",
+            action="store_true",
+            help="Bind a MoE checkpoint's routed experts over the file instead "
+                 "of copying them into the device heap. Both backends take the "
+                 "same `[model].stream_routed_experts` key; what they do with "
+                 "it differs (cuda stages through a cache, Metal demand-faults "
+                 "a page-aligned pack).",
+        )
         sp.add_argument("--max-forward-tokens", type=int, default=10240)
         sp.add_argument("--max-forward-requests", type=int, default=512)
         sp.add_argument("--runtime-quant", choices=["fp8", "int8"], default=None)
