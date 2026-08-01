@@ -527,29 +527,29 @@ void fill_family_geometry(pie::metal::batch::SetupConfig& cfg, const ModelFacts&
 
 /// How much heap the activation pool may spend on rows.
 ///
-/// 1 GB, against `kPagedForwardRowBudgetBytes`'s 384 MB. That constant was
-/// chosen when a prefill row cost a `vocab * 2` slice of logits; `RowGather`
-/// moved the LM head onto the sampled rows, so the same budget now buys far
-/// fewer rows than it should -- and rows are a HARD bound, since a prompt
-/// longer than the row count is refused rather than chunked. At 384 MB gemma4
-/// admits 256 tokens.
+/// One number for all three families, because rows mean the same thing to all
+/// three: the longest prompt the driver will ACCEPT, since a longer one is
+/// refused rather than chunked. `kPagedForwardRowBudgetBytes` holds it, and
+/// this is the only place it is read.
 ///
-/// The larger budget is free, which is the reason it can be a default rather
-/// than a flag. Measured, gemma4 through `pie serve`:
+/// It is 1 GB rather than the 384 MB it began as, and the difference is free.
+/// Measured through `pie serve`:
 ///
-///   budget  rows  pool    peak serve RSS
-///   384 MB   256  351 MB  2.84 GB
-///   1 GB    4096  984 MB  2.84 GB
+///   gemma4    384 MB ->  256 rows (351 MB pool), 1 GB -> 4096 rows (984 MB)
+///             peak RSS 2.84 GB at BOTH
+///   qwen3.5   384 MB ->  566 rows,               1 GB -> 1024 rows
+///             peak RSS 2.36 vs 2.35 GB, same wall clock
 ///
-/// The pool is a heap reservation, and a fire touches only the rows it has.
-/// `PIE_METAL_ROW_BUDGET_MB` lowers it for a machine where the reservation
-/// itself is the problem.
+/// A Metal heap allocation is a reservation and a fire touches only the rows it
+/// has. `PIE_METAL_ROW_BUDGET_MB` lowers it for a machine where the reservation
+/// is itself the problem -- and lowering it is visible exactly where it should
+/// be: a 650-token prompt that qwen3.5 completes at 1 GB is refused at 384 MB.
 std::uint64_t row_budget_bytes() {
     if (const char* e = std::getenv("PIE_METAL_ROW_BUDGET_MB"); e != nullptr && *e != '\0') {
         const long v = std::atol(e);
         if (v > 0) return std::uint64_t(v) << 20;
     }
-    return std::uint64_t(1) << 30;
+    return pie::metal::batch::kPagedForwardRowBudgetBytes;
 }
 
 std::uint32_t simple_family_row_budget(const Config& cfg, const ModelFacts& facts) {
@@ -609,7 +609,7 @@ std::string build_caps_json(const Config& cfg,
         return executor::paged_max_forward_tokens(
             facts.vocab_size != 0 ? facts.vocab_size : std::uint32_t(g.vocab),
             std::uint32_t(backend::scratch_widest_elems(g)),
-            executor::kPagedScratchColors);
+            executor::kPagedScratchColors, row_budget_bytes());
     }();
     // Phase 1b: the GDN recurrent-state region is genuinely sized for
     // `batch::kPhase1bRsSlots` addressable slots (heap_layout.hpp
