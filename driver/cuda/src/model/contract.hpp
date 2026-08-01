@@ -889,6 +889,29 @@ public:
 
     void publish_fused(const std::vector<FusedCandidate>& candidates) {
         for (const FusedCandidate& candidate : candidates) {
+            // A join is only a fusion of the GEMM if every part is distributed
+            // the same way. Column-parallel parts (q/k/v, gate/up) each hand a
+            // rank its own band and the join of those bands is this rank's
+            // fused weight. Replicated parts (MLA's `q_a_proj` and
+            // `kv_a_proj_with_mqa`, whose outputs feed unsharded per-rank
+            // norms) must stay whole: row-sharding them anyway produced a
+            // fused weight of `(q_lora + kv_lora + q_rope) / tp` rows while the
+            // forward still asked its GEMM for the full width, so every rank
+            // read past the end of the weight and MLA diverged from tp=1 in
+            // the first projection of layer 0 -- with no crash, because the
+            // over-read stayed inside the weight arena.
+            bool all_sharded = true;
+            bool all_replicated = true;
+            for (const SourceTensor* raw : candidate.parts) {
+                const ShardAxis axis = shard_axis(raw->name);
+                const bool row_sharded = axis.has_value() && *axis == 0;
+                all_sharded = all_sharded && row_sharded;
+                all_replicated = all_replicated && !axis.has_value();
+            }
+            // A mixed group has no single fused layout, so leave its parts to
+            // their own bind paths rather than inventing one.
+            if (!all_sharded && !all_replicated) continue;
+
             std::vector<Node> parts;
             std::vector<std::int64_t> local_rows;
             parts.reserve(candidate.parts.size());
@@ -900,9 +923,14 @@ public:
                 // q/k boundary and hand a rank a mix of two projections.
                 // Sharding first gives every rank its own band of each, and
                 // their join is exactly this rank's fused weight.
-                check_head_granularity(raw->name, shape_of(*raw), ShardAxis{0});
-                parts.push_back(split(contract_.src(std::string(raw->name)), 0));
-                local_rows.push_back(local_extent(raw->shape[0]));
+                if (all_sharded) {
+                    check_head_granularity(raw->name, shape_of(*raw), ShardAxis{0});
+                    parts.push_back(split(contract_.src(std::string(raw->name)), 0));
+                    local_rows.push_back(local_extent(raw->shape[0]));
+                } else {
+                    parts.push_back(contract_.src(std::string(raw->name)));
+                    local_rows.push_back(raw->shape[0]);
+                }
                 rows += local_rows.back();
             }
             define(candidate.output_name, contract_.concat(parts, 0),
