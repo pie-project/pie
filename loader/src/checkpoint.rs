@@ -1,3 +1,4 @@
+pub mod align;
 pub mod gguf;
 pub mod read;
 pub mod safetensors;

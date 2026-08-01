@@ -17,8 +17,8 @@
 use crate::contract::{Expr, ModelContract, ScaleFactor, Visibility};
 use crate::ffi::contract::{
     PieLoaderExprKind, PieLoaderExprNode, PieLoaderExprNodeSlice, PieLoaderGroupContractSlice,
-    PieLoaderGroupContractView, PieLoaderModelContractView,
-    PieLoaderScalesView, PieLoaderTensorContractSlice, PieLoaderTensorContractView, write_encoding,
+    PieLoaderGroupContractView, PieLoaderModelContractView, PieLoaderScalesView,
+    PieLoaderTensorContractSlice, PieLoaderTensorContractView, write_encoding,
 };
 use crate::ffi::types::*;
 
