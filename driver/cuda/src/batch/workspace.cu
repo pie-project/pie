@@ -76,13 +76,24 @@ std::size_t attention_float_workspace_bytes(const HfConfig& hf,
     };
 
     const int tp_size = std::max(1, cfg.distributed.tp_size);
+    // DeepSeek-V4 REPLICATES its attention across TP ranks — `dsv4_shard_axis`
+    // shards the FFN and nothing else, so every rank runs every head and
+    // `DsV4Model::prepare` plans with `num_attention_heads` verbatim. Dividing
+    // here undersized the float workspace by exactly `tp_size`, and the plan
+    // then threw mid-decode ("Buffer overflow ... batch_prefill_tmp_v") the
+    // moment a sequence grew long enough to need a second KV chunk. That
+    // throw kills the TP followers while rank 0 keeps publishing fires, which
+    // presents as an unrecoverable hang rather than an error.
+    const bool attention_replicated_across_tp =
+        hf.model_type == "deepseek_v4";
+    const int attn_tp = attention_replicated_across_tp ? 1 : tp_size;
     // Per-rank head counts. tp cancels in tmp_v (qo_heads shrinks, padded_batch
     // grows as num_kv_heads shrinks), so this is tp-invariant — but compute it
     // honestly so a non-divisible split still produces a safe (larger) bound.
     const std::size_t qo_heads =
-        std::max<std::size_t>(1, hf.num_attention_heads / tp_size);
+        std::max<std::size_t>(1, hf.num_attention_heads / attn_tp);
     const std::size_t kv_heads =
-        std::max<std::size_t>(1, hf.num_key_value_heads / tp_size);
+        std::max<std::size_t>(1, hf.num_key_value_heads / attn_tp);
     const std::size_t head_dim = static_cast<std::size_t>(hf.head_dim_kernel);
     const std::size_t num_sm =
         static_cast<std::size_t>(prop.multiProcessorCount);
