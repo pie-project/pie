@@ -83,7 +83,15 @@ void DsV4Model::prepare(AttentionWorkspace& attn_ws,
         *ws_.swa_plan, in.qo_indptr_h, in.kv_page_indptr_h,
         /*kv_last_page_lens_h=*/nullptr,
         in.total_tokens, in.num_requests,
-        hf_config_.num_attention_heads / std::max(1, fwd_cfg_.tp_size),
+        // Full heads, not `/ tp_size`. DeepSeek-V4 replicates its attention
+        // weights -- `dsv4_shard_axis` shards the FFN and nothing else -- so
+        // every rank computes every head, and the forward says so where it
+        // reads `num_attention_heads` straight. Planning for half of them
+        // described a geometry the attention never runs, and the kernel
+        // answered accordingly: identical q and kv, an `attn_out` that
+        // disagreed with TP=1 from the first layer, and both ranks agreeing
+        // with each other on the wrong number.
+        hf_config_.num_attention_heads,
         /*num_kv_heads=*/1, hf_config_.head_dim,
         kv_cache_.page_size(), attn_ws, /*stream=*/nullptr,
         fwd_cfg_.decode_plan_cuda_graph, window_left,

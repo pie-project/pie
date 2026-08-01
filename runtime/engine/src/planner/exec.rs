@@ -328,7 +328,7 @@ async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
         Ok(KvSuspendPrepare::Prepared(txn)) => txn,
         Ok(KvSuspendPrepare::Deferred(disposition)) => {
             step!(pid, "evict rollback: prepare deferred ({disposition:?})");
-            planner.eviction_failed(pid);
+            planner.eviction_failed_prepare_deferred(pid);
             return;
         }
         Err(error @ crate::store::kv::KvStoreError::HostSwapFull { .. }) => {

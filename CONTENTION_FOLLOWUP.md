@@ -7477,3 +7477,159 @@ execution pool (`preload_free_slots(capacity)` hands it out in one instant),
 so that a homogeneous fleet is *admitted* staggered and, being homogeneous,
 stays staggered thereafter. That is the next change, and this section is the
 measurement that justifies it.
+
+## §20.47 — Reclaimed inferlets are restarted, not failed (`0d2ceaa44`)
+
+§20.46 left the KV starvation failures at 3-15 per 1024 and called them "a
+symptom of the herd, not of capacity". That is the correct diagnosis of *why*
+they happen and the wrong place to stop, because a starvation failure is not
+a slow request — it is a **lost** one, and every throughput number computed
+over the survivors is not a throughput. `X/c256` reported 4760 tok/s over
+1009 completions; the 15 that died do not appear in any denominator.
+
+The planner's starvation rung existed to break a deadlock: when the pool
+cannot fund the fleet, someone must give their pages back, and pie's only
+way to make a process give pages back was to kill it. The user's objection
+was structural, not cosmetic:
+
+> 당연히 죽이고 알려주는게 아니라, queue에 넣어두고 inferlet자체를 재실행해야지.
+
+An inferlet is not a request. It is a *program* that produces the request's
+work. Killing it to reclaim its pages and then reporting the failure to the
+client discards a re-derivable computation. Re-queueing and re-running it
+reclaims exactly the same pages and loses nothing but the work already done.
+
+### The design
+
+`system.declare-restartable()` — opt-in, and it must be. Re-running a program
+that has already written a file or issued an outbound request would duplicate
+those effects; the runtime cannot know which programs are pure. Undeclared
+processes keep the fail-loud path exactly as before, so nothing regresses for
+programs that never asked.
+
+Two decisions carry the whole thing:
+
+**The FCFS sequence number is inherited; the process id is not.**
+
+Victims are picked youngest-first, so a re-run that entered with a fresh
+`spawn_seq` would be the immediate next victim, forever — a livelock with a
+throughput cost. Inheriting the seq puts the re-run back at the position it
+already held, where it ages toward the head, and *the head is never a
+victim*. That is the termination argument, and it needs no retry counter and
+no timer. `register_with_seq` deliberately does not rewind `next_seq`.
+
+The process id cannot be inherited for the mirror-image reason. A scheduler
+holds a terminate tombstone for a retiring pid until its quiesce lands
+(`scheduler/worker.rs:182`); reusing the id would have the re-run's fires
+rejected by its predecessor's tombstone. So the re-run gets a fresh internal
+pid and a `RESTART_ALIAS` maps the original client-facing id onto it. Every
+externally-visible path — `attach`, `detach`, `terminate`, `inbox::send`,
+and the `client_pid` stamped on outbound events — resolves through the alias,
+so the client never learns that the program it launched is on its second
+life.
+
+**The reply cell is shared, not moved.** `restart()` clones the
+`Arc<Mutex<Option<Sender>>>` into the successor. If the spawn fails, the
+sender is still in place and the caller falls straight back to fail-loud. A
+failed restart therefore cannot lose the request — the worst case is the
+behaviour we already had.
+
+Teardown is unconditional: the restart branch still runs `SERVICES.remove`,
+`planner.unregister` and `residency::unregister_residency`. Reclaiming the
+pages is the entire point of the exercise. Only the reply delivery and the
+client-facing `Return`/`Error` event are suppressed.
+
+### Two bugs found on the way, both invisible without instrumentation
+
+**1. The bench never used the launch handle.** The first probe showed
+`declare_restartable` firing 513 times and `request_restart` returning true,
+while `restart()` returned false every time. It was bailing on `result_tx ==
+None`: the benchmark harness receives results as *client events*, not through
+the launch-handle channel, so the cell it was checking was empty by
+construction. This is also the reason there was no log to read — the embedded
+pyo3 server boots with `skip_tracing` and installs no subscriber, so every
+`tracing::info!` in the engine goes nowhere under the bench. `println!` or
+the `PIE_CONTENTION_TRACE_MS` planner trace are the only channels that work,
+which is why that trace uses `println!` in the first place.
+
+**2. An eviction-rollback livelock that predates this work.**
+`planner/exec.rs:331` handled `KvSuspendPrepare::Deferred` with a bare
+`eviction_failed(pid)` and no parking, unlike its sibling `HostSwapFull`
+branch a few lines below, which parks its victim and documents exactly this
+hazard (§20.6). Victim selection is deterministic, so the re-pick chose the
+same victim and failed identically: **674,536 rollbacks in ~60 s** on the
+`tinyswap` scenario. The consequence is worse than the spin. `evicting` never
+emptied, and `check_starvation` early-returns while it is non-empty, so every
+rung above the kill was gated out and the pool could never be unwedged.
+`tinyswap` hung with all 64 of its requests already complete. The fix mirrors
+the sibling: an `Inner.prepare_blocked` set, excluded from both candidate
+filters and cleared on `unregister` and `clear_host_swap_blocks`.
+
+### Result
+
+| | before | after |
+| --- | --- | --- |
+| contention suite | `tinyswap` **HANG**, `noswap_cascade` 4 failed | **17/17**, `failed=0` everywhere |
+| unit tests | 370 | 371 |
+
+The only scenario that still fails is `impossible`, which asks for a working
+set larger than the pool and must fail loud — there is no re-run of that.
+
+ABBA 2+2 at `X/c256`, same box and same session policy as §20.46, against
+that section's post-fix cell:
+
+| | §20.46 | here |
+| --- | --- | --- |
+| pie tok/s | 4759.7 | **4760.5** |
+| pie completed | 1009 | **1024** |
+| pie failed | **15** | **0** |
+| pie prompt tokens | 654758 | **664493** |
+| pie output tokens | 129152 | **131072** |
+| pie ITL p99 | 315 ms | 309 ms |
+| vLLM tok/s | 5681.7 | 5686.8 |
+| ratio | 0.838 | 0.837 |
+
+```
+pie  4640  4881        vllm 5690  5683
+```
+
+Two things to read off this. First, **the restart is free**: 4759.7 against
+4760.5 is 0.02% on a box whose two-probe spread is 27%, and it bought 15
+requests that used to be lost. The re-run's cost is bounded by construction —
+13 restarts across 1024 requests, each re-doing only the prefill it had
+already done, and the inherited FCFS position means each one is re-run once
+and not repeatedly.
+
+Second, and more useful going forward: `pie_prompt_tokens` and
+`pie_output_tokens` are now **exactly** vLLM's, 664493 and 131072. Every
+previous `X/c256` number in this document was computed over a smaller amount
+of work than vLLM did, because the requests that died took their prompts out
+of the denominator. This is the first cell in the campaign to come back with
+`warnings: []` at this shape — the ratio is finally a comparison of two
+engines doing token-for-token identical work.
+
+### This closes admission control
+
+The open question §20.40 left behind was whether pie should refuse to admit
+work it cannot fund, the way vLLM's scheduler declines to schedule a request
+whose blocks do not fit. The answer here is that pie does not need to,
+because it now has the other half of vLLM's mechanism instead. vLLM's
+admission check is only safe *because* vLLM preempts: it evicts a running
+sequence's blocks and re-runs it from scratch when the pool tightens. pie now
+does exactly that, and does it with the FCFS position preserved, which vLLM
+does not.
+
+The predictive alternative was a guest-declared KV budget in front of
+`BIND_ADMISSION`. It is rejected on two grounds. It cannot be exact — with a
+shared prefix the incremental cost of a process is not a function of its own
+token count, so any per-process declaration double-counts the shared pages
+and caps the fleet below what the pool can actually hold (at `X/c256`, 169
+processes declared against 221 actually resident). And the reactive form of
+the same gate was already measured and was a null: §20.40's watermark at
+bind admission moved throughput 0.05%, because by the time anything parks the
+pool is already full and the gate only stops processes that hold nothing.
+
+Handling the overflow is therefore the mechanism, not a fallback to one. The
+remaining work on this axis is to make the overflow rarer — §20.46 showed
+that breaking the fleet's synchronised retirement removes 80% of the
+starvation events without touching the pool — not to predict it.
