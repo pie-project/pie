@@ -1767,6 +1767,14 @@ int Context::Impl::load_model(
         const CustomArVote local{
             static_cast<std::uint8_t>(
                 (disabled == nullptr || std::strcmp(disabled, "1") != 0) &&
+                        // The custom all-reduce reads its peers' arenas through
+                        // direct peer mappings, so it needs the same working
+                        // peer path NCCL's P2P transport does. Where that path
+                        // is broken it does not fail loudly -- it reduces
+                        // whatever the mapping yields (zeros) or wedges. Refuse
+                        // it on measured evidence rather than on topology
+                        // claims; NCCL's host-staged fallback still works.
+                        pie_cuda_driver::p2p_transport_usable() &&
                         !tp_group_devices_.empty() && !workspace_bases.empty()
                     ? 1
                     : 0),
@@ -2686,7 +2694,19 @@ int Context::Impl::copy_state(const PieStateCopyDesc& copy, PieCompletion comple
 
 int Context::Impl::resize_pool(const PiePoolResizeDesc& resize, PieCompletion completion) {
     if (executor_ == nullptr) return PIE_STATUS_CLOSED;
-    if (tp_size_ > 1) return PIE_STATUS_UNSUPPORTED;
+    if (tp_size_ > 1) {
+        // UNSUPPORTED is the protocol's "not right now, ask again", so a
+        // permanent refusal here is indistinguishable from backpressure and
+        // the scheduler retries the resize forever. Say it once so the stall
+        // is attributable instead of silent.
+        static std::once_flag once;
+        std::call_once(once, [] {
+            std::cerr << "[pie-driver-cuda] resize_pool: elastic pools are "
+                         "not resizable at tp>1; every request will be "
+                         "refused\n";
+        });
+        return PIE_STATUS_UNSUPPORTED;
+    }
     collect_ready_async_resources();
     if (resize.pool_id > PIE_ELASTIC_POOL_WORKSPACE) {
         return PIE_STATUS_UNSUPPORTED;
