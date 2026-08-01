@@ -78,6 +78,10 @@ struct RuntimeConfig {
 struct ModelConfig {
     std::string hf_path;
     std::string backend = "metal:0";
+    // Page routed experts in from a mapping rather than keeping them
+    // resident. Off by default: it trades resident memory for page faults,
+    // which only pays when the weights do not comfortably fit.
+    bool stream_routed_experts = false;
 };
 
 struct BatchingConfig {
@@ -105,6 +109,9 @@ Config load_config(const std::filesystem::path& path) {
     if (auto model = tbl["model"].as_table()) {
         config.model.hf_path = (*model)["hf_path"].value_or(std::string{});
         config.model.backend = (*model)["backend"].value_or(config.model.backend);
+        config.model.stream_routed_experts =
+            (*model)["stream_routed_experts"].value_or(
+                config.model.stream_routed_experts);
     }
     if (auto batching = tbl["batching"].as_table()) {
         constexpr std::string_view allowed[] = {
@@ -2138,6 +2145,7 @@ class Context::Impl {
                 : cfg_.batching.max_forward_tokens;
         setup_cfg.max_forward_requests = cfg_.batching.max_forward_requests;
         setup_cfg.snapshot_dir = cfg_.model.hf_path;
+        setup_cfg.stream_routed_experts = cfg_.model.stream_routed_experts;
         setup_cfg.model_type = facts_.model_type;
         setup_cfg.rope_theta = facts_.rope_theta;
         setup_cfg.partial_rotary_factor = facts_.partial_rotary_factor;

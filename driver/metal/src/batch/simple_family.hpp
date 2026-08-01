@@ -68,7 +68,7 @@ class SimpleFamilyEngine {
     /// into the heap, so the heap must be created WITHOUT them -- which is why
     /// this is answered before the context exists, alongside `extra_heap_bytes`.
     static std::function<bool(const std::string&)> stream_predicate(
-        model::ModelFamily family);
+        model::ModelFamily family, const SetupConfig& cfg);
 
     /// One fire: several requests' new tokens sharing a command buffer.
     ///

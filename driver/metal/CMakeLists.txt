@@ -497,7 +497,7 @@ if(APPLE)
     add_test(NAME simple_family_executor_streamed_test
              COMMAND simple_family_executor_test)
     set_tests_properties(simple_family_executor_streamed_test PROPERTIES
-      ENVIRONMENT "PIE_METAL_STREAM_EXPERTS=1")
+      ENVIRONMENT "PIE_METAL_TEST_STREAM_EXPERTS=1")
   endif()
   add_metal_linked_test(gemma4_prefill_numerics_test tests/gemma4_prefill_numerics_test.cpp NEEDS_LOADER)
   target_compile_definitions(gemma4_prefill_numerics_test PRIVATE

@@ -291,6 +291,15 @@ struct SetupConfig {
     // itself, because only the driver knows the device
     // (`loader/architecture.md` §3).
     std::string snapshot_dir;
+    // Page this model's routed experts in from a mapping instead of keeping
+    // them resident in the heap.
+    //
+    // The same `[model].stream_routed_experts` the CUDA driver reads. It is
+    // one switch because it is one decision -- a residency trade the operator
+    // makes about a model, not about a backend. It used to be
+    // `PIE_METAL_STREAM_EXPERTS` here, which meant setting the config on a
+    // Metal backend did nothing and said nothing.
+    bool stream_routed_experts = false;
     // Which storage schema to author against. It selects a contract on this
     // side of the loader call and never crosses it (§10.4).
     std::string model_type;

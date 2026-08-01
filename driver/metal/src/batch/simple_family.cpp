@@ -598,7 +598,7 @@ class GptOssEngine final : public SimpleFamilyEngine {
             pie_loader::CheckpointSource view(storage);
             StagedWeights staged = stage_plan_weights(
                 ctx, view, load_plan, storage.memory.persistent_bytes,
-                stream_predicate(pie::metal::model::ModelFamily::GptOss));
+                stream_predicate(pie::metal::model::ModelFamily::GptOss, cfg));
             b_.weights = std::move(staged.weights);
             // The pack must outlive the weights that point into it. Taking only
             // `staged.weights` and letting `staged` die unmaps it under them,
@@ -814,9 +814,8 @@ class GptOssEngine final : public SimpleFamilyEngine {
 }  // namespace
 
 std::function<bool(const std::string&)> SimpleFamilyEngine::stream_predicate(
-    pie::metal::model::ModelFamily family) {
-    const char* on = std::getenv("PIE_METAL_STREAM_EXPERTS");
-    if (on == nullptr || *on == '\0' || std::string(on) == "0") return {};
+    pie::metal::model::ModelFamily family, const SetupConfig& cfg) {
+    if (!cfg.stream_routed_experts) return {};
     if (family != pie::metal::model::ModelFamily::GptOss) return {};
     // gpt-oss's routed expert bank is 10.75 of this checkpoint's 11.8 GB, and a
     // token reads 4 experts in 32 per layer. `.bias` stays resident: 180 KB a

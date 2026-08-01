@@ -15,9 +15,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 
-#[cfg(feature = "driver-metal")]
-use crate::config::MetalDriverOptions;
-use crate::config::{CudaMemoryProfile, CudaNativeDriverOptions, DummyDriverOptions};
+use crate::config::{
+    CudaMemoryProfile, CudaNativeDriverOptions, DummyDriverOptions, MetalDriverOptions,
+};
 use crate::driver_ffi::Flavor;
 
 /// Anchors `pie-loader`'s C entry points into the final binary.
@@ -226,7 +226,11 @@ fn read_hf_config_defaults(snapshot_dir: &Path) -> Result<(u32, String, u32)> {
 /// Emit the metal driver's startup TOML — same `[model]` + `[batching]` +
 /// `[runtime]` layout consumed by `driver/metal/src/config.hpp`. The metal
 /// launch state is identical apart from the `metal:N` backend selector.
-#[cfg(feature = "driver-metal")]
+///
+/// Not gated on `driver-metal`: what it produces is a TOML file, and whether
+/// the operator's settings survive into that file is a question a machine
+/// without a Metal device can still answer. Gating it would put the test out
+/// of reach of every machine that is not a Mac.
 pub fn write_metal_startup_toml(
     out_path: &Path,
     options: &MetalDriverOptions,
@@ -238,6 +242,11 @@ pub fn write_metal_startup_toml(
     let mut model = toml::Table::new();
     insert_str(&mut model, "hf_path", path_string(snapshot_dir));
     insert_str(&mut model, "backend", &options.device);
+    insert_bool(
+        &mut model,
+        "stream_routed_experts",
+        options.stream_routed_experts,
+    );
     insert_table(&mut doc, "model", model);
 
     let mut batching = toml::Table::new();
@@ -955,6 +964,61 @@ mod tests {
         );
         assert_eq!(val["model"]["expert_cache_gb"].as_float().unwrap(), 0.0);
         assert_eq!(val["runtime"]["verbose"].as_bool().unwrap(), false);
+    }
+
+    /// Expert streaming is one decision, so it is one setting, and it has to
+    /// reach both drivers by the same name.
+    ///
+    /// It did not. `[model].stream_routed_experts` was emitted for cuda only,
+    /// and metal read `PIE_METAL_STREAM_EXPERTS` from the environment -- so
+    /// setting the documented option on a Metal backend did nothing, and said
+    /// nothing about doing nothing. The failure mode of a switch nobody wired
+    /// up is silence, which is why it needs a test rather than a reading.
+    #[test]
+    fn metal_startup_toml_carries_expert_streaming() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snap = tmp.path().join("snap");
+
+        let mut off = MetalDriverOptions::default();
+        off.device = "metal:0".to_string();
+        let out_off = tmp.path().join("off.toml");
+        write_metal_startup_toml(&out_off, &off, &snap, 0).unwrap();
+        let val: toml::Value = toml::from_str(&std::fs::read_to_string(&out_off).unwrap()).unwrap();
+        assert_eq!(val["model"]["backend"].as_str().unwrap(), "metal:0");
+        assert_eq!(
+            val["model"]["stream_routed_experts"].as_bool().unwrap(),
+            false,
+            "streaming is off unless asked for: it trades resident memory for \
+             page faults, which only pays when the weights do not fit"
+        );
+
+        let mut on = MetalDriverOptions::default();
+        on.device = "metal:0".to_string();
+        on.stream_routed_experts = true;
+        let out_on = tmp.path().join("on.toml");
+        write_metal_startup_toml(&out_on, &on, &snap, 0).unwrap();
+        let val: toml::Value = toml::from_str(&std::fs::read_to_string(&out_on).unwrap()).unwrap();
+        assert_eq!(
+            val["model"]["stream_routed_experts"].as_bool().unwrap(),
+            true,
+            "the operator asked for streaming and the driver never heard about it"
+        );
+    }
+
+    /// The option is spelled the same in the config an operator writes, not
+    /// just in the file we generate. A metal `[model.driver.options]` block
+    /// carrying it must parse -- `deny_unknown_fields` means a name that only
+    /// cuda knows is a hard error, which is the good failure but not this one.
+    #[test]
+    fn metal_driver_options_accept_expert_streaming_by_the_cuda_name() {
+        let parsed: MetalDriverOptions = toml::from_str("stream_routed_experts = true").unwrap();
+        assert!(parsed.stream_routed_experts);
+
+        let cuda: CudaNativeDriverOptions = toml::from_str("stream_routed_experts = true").unwrap();
+        assert_eq!(
+            parsed.stream_routed_experts, cuda.stream_routed_experts,
+            "the two backends must answer to one name"
+        );
     }
 
     #[test]

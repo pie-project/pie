@@ -215,6 +215,16 @@ int main() {
     const std::string taps_family = taps_family_env != nullptr ? taps_family_env : "gemma4";
     const bool g4_taps = taps && taps_family == "gemma4";
     const bool go_taps = taps && taps_family == "gptoss";
+    // Streaming is a config setting on the driver, not an environment the
+    // driver reads -- so the pairing lives here, in the harness, and is passed
+    // in like any other operator choice. ctest runs this binary twice, once
+    // with this set, and the assertions below are the same assertions: if
+    // streaming ever changes an answer, the test that says so is the one that
+    // already knows every answer.
+    const char* stream_env = std::getenv("PIE_METAL_TEST_STREAM_EXPERTS");
+    const bool stream_experts =
+        stream_env != nullptr && *stream_env != '\0' && std::string(stream_env) != "0";
+    std::printf("  streaming: %s\n", stream_experts ? "on" : "off");
 
     // ── gemma4 ──
     if (!go_taps) {
@@ -225,6 +235,7 @@ int main() {
             SetupConfig cfg;
             cfg.kernels_dir = kernels;
             cfg.snapshot_dir = dir;
+            cfg.stream_routed_experts = stream_experts;
             cfg.model_type = "gemma4";
             cfg.vocab_size = 262144;
             // A fire now carries a whole prompt, and two of them at once.
@@ -300,6 +311,7 @@ int main() {
             SetupConfig cfg;
             cfg.kernels_dir = kernels;
             cfg.snapshot_dir = dir;
+            cfg.stream_routed_experts = stream_experts;
             cfg.model_type = "gpt_oss";
             cfg.vocab_size = 201088;
             cfg.max_forward_tokens = 32;
