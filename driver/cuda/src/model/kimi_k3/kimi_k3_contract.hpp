@@ -309,6 +309,12 @@ inline void kimi_k3_bf16_expert_stacks(ContractBuilder& b, bool gate_second) {
 /// memory, matching the Kimi-K2 row; the decoder lives under
 /// `language_model.model.layers.`.
 inline void author_kimi_k3_contract(ContractBuilder& b) {
+    // The multimodal checkpoints nest the decoder under `language_model.`,
+    // the text-only ones do not. `source_prefix` asks the checkpoint rather
+    // than declaring it, so one row covers both; without it every bind name
+    // misses by exactly that prefix and authoring fails on the first tensor
+    // it looks up by hand (`model.embed_tokens.weight`).
+    b.source_prefix("language_model.");
     b.shard_axis_fn(contract_detail::kimi_k3_shard_axis);
     b.shard_embed_tokens();
     contract_detail::kimi_k3_a_log_bands(b);
