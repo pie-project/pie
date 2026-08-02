@@ -96,7 +96,9 @@ impl Arg {
 }
 
 /// Anything usable as a tensor operand: a `Tensor`, a channel take/read result,
-/// or a scalar literal (`u32` / `f32`; integer literals resolve to `u32`).
+/// or a scalar literal (`u32`, `i32`, `f32` or `bool`). A scalar operand takes
+/// on the dtype of the tensor it is combined with, so the literal's own suffix
+/// only matters when both operands are scalars.
 pub trait AsTensor {
     #[doc(hidden)]
     fn to_arg(&self) -> Arg;
@@ -114,24 +116,16 @@ impl AsTensor for &Tensor {
         (*self).to_arg()
     }
 }
-impl AsTensor for u32 {
-    fn to_arg(&self) -> Arg {
-        Arg::Const(ConstData {
-            shape: Shape::SCALAR,
-            dtype: DType::U32,
-            bytes: self.to_le_bytes().to_vec(),
-        })
-    }
+macro_rules! as_tensor_scalar {
+    ($($t:ty),*) => {$(
+        impl AsTensor for $t {
+            fn to_arg(&self) -> Arg {
+                Arg::Const((*self).into_const())
+            }
+        }
+    )*};
 }
-impl AsTensor for f32 {
-    fn to_arg(&self) -> Arg {
-        Arg::Const(ConstData {
-            shape: Shape::SCALAR,
-            dtype: DType::F32,
-            bytes: self.to_le_bytes().to_vec(),
-        })
-    }
-}
+as_tensor_scalar!(u32, i32, f32, bool);
 
 // ---------------------------------------------------------------------------
 // Constant → IR op materialization
@@ -179,6 +173,23 @@ fn poison_id(detail: alloc::string::String, ty: ValueType) -> ValueId {
         },
         &[ty],
     )
+}
+
+/// [`poison`] for a value produced outside any traced stage: no op can be
+/// emitted there, so the stand-in is a zeroed constant of the same type. The
+/// error still lands (via [`PENDING`](crate::context)) in the trace the channel
+/// belongs to.
+#[track_caller]
+pub(crate) fn poison_const(detail: alloc::string::String, ty: ValueType) -> Tensor {
+    context::record_error(detail, Span::here());
+    let width = if ty.dtype == DType::Bool { 1 } else { 4 };
+    Tensor {
+        inner: TensorInner::Const(ConstData {
+            shape: ty.shape,
+            dtype: ty.dtype,
+            bytes: alloc::vec![0u8; ty.shape.numel() as usize * width],
+        }),
+    }
 }
 
 /// Record an authoring mistake whose recovery is a shape rather than a value.
@@ -295,8 +306,8 @@ fn materialize_const(c: ConstData) -> (ValueId, ValueType) {
 // Constant construction (author-facing)
 // ---------------------------------------------------------------------------
 
-/// Anything convertible to a trace-known [`ConstData`]: scalars and arrays of
-/// `f32` / `i32` / `u32` / `bool`.
+/// Anything convertible to a trace-known [`ConstData`]: scalars, slices,
+/// arrays and vectors of `f32` / `i32` / `u32` / `bool`.
 pub trait IntoConst {
     /// Encodes `self` into a typed [`ConstData`].
     fn into_const(self) -> ConstData;
@@ -322,31 +333,27 @@ macro_rules! num_const {
                 }
             }
         }
-        impl<const N: usize> IntoConst for [$t; N] {
+        impl IntoConst for &[$t] {
             fn into_const(self) -> ConstData {
                 let mut bytes = Vec::new();
-                for x in self {
+                for &x in self {
                     bytes.extend_from_slice(&scalar_bytes_of(x as f64, $dt));
                 }
                 ConstData {
-                    shape: Shape::vector(N as u32),
+                    shape: Shape::vector(self.len() as u32),
                     dtype: $dt,
                     bytes,
                 }
             }
         }
+        impl<const N: usize> IntoConst for [$t; N] {
+            fn into_const(self) -> ConstData {
+                self.as_slice().into_const()
+            }
+        }
         impl IntoConst for Vec<$t> {
             fn into_const(self) -> ConstData {
-                let n = self.len() as u32;
-                let mut bytes = Vec::new();
-                for x in self {
-                    bytes.extend_from_slice(&scalar_bytes_of(x as f64, $dt));
-                }
-                ConstData {
-                    shape: Shape::vector(n),
-                    dtype: $dt,
-                    bytes,
-                }
+                self.as_slice().into_const()
             }
         }
     };
@@ -364,23 +371,23 @@ impl IntoConst for bool {
         }
     }
 }
-impl<const N: usize> IntoConst for [bool; N] {
+impl IntoConst for &[bool] {
     fn into_const(self) -> ConstData {
         ConstData {
-            shape: Shape::vector(N as u32),
+            shape: Shape::vector(self.len() as u32),
             dtype: DType::Bool,
             bytes: self.iter().map(|&b| b as u8).collect(),
         }
     }
 }
+impl<const N: usize> IntoConst for [bool; N] {
+    fn into_const(self) -> ConstData {
+        self.as_slice().into_const()
+    }
+}
 impl IntoConst for Vec<bool> {
     fn into_const(self) -> ConstData {
-        let n = self.len() as u32;
-        ConstData {
-            shape: Shape::vector(n),
-            dtype: DType::Bool,
-            bytes: self.iter().map(|&b| b as u8).collect(),
-        }
+        self.as_slice().into_const()
     }
 }
 
@@ -556,6 +563,83 @@ pub fn max_elem(a: impl AsTensor, b: impl AsTensor) -> Tensor {
 /// Elementwise minimum of `a` and `b`; same dtype/shape rule as [`add`].
 pub fn min_elem(a: impl AsTensor, b: impl AsTensor) -> Tensor {
     emit_binary(&a, &b, Op::MinElem, |d| d)
+}
+
+// -- map: binary, spelled as Rust operators --
+//
+// The five arithmetic intrinsics above are also reachable as `+ - * / %` so
+// that page arithmetic and score math read as arithmetic. Comparisons are not:
+// `PartialOrd` must yield `bool`, so [`lt`] and friends stay functions.
+
+macro_rules! tensor_binop {
+    ($($trait:ident, $method:ident, $intrinsic:ident;)*) => {$(
+        impl<T: AsTensor> core::ops::$trait<T> for Tensor {
+            type Output = Tensor;
+            fn $method(self, rhs: T) -> Tensor {
+                $intrinsic(self, rhs)
+            }
+        }
+        impl<T: AsTensor> core::ops::$trait<T> for &Tensor {
+            type Output = Tensor;
+            fn $method(self, rhs: T) -> Tensor {
+                $intrinsic(self, rhs)
+            }
+        }
+        tensor_binop!(@scalar $trait, $method, $intrinsic, u32, i32, f32);
+    )*};
+    (@scalar $trait:ident, $method:ident, $intrinsic:ident, $($t:ty),*) => {$(
+        impl core::ops::$trait<Tensor> for $t {
+            type Output = Tensor;
+            fn $method(self, rhs: Tensor) -> Tensor {
+                $intrinsic(self, rhs)
+            }
+        }
+        impl core::ops::$trait<&Tensor> for $t {
+            type Output = Tensor;
+            fn $method(self, rhs: &Tensor) -> Tensor {
+                $intrinsic(self, rhs)
+            }
+        }
+    )*};
+}
+
+tensor_binop! {
+    Add, add, add;
+    Sub, sub, sub;
+    Mul, mul, mul;
+    Div, div, div;
+    Rem, rem, rem;
+}
+
+macro_rules! tensor_binop_assign {
+    ($($trait:ident, $method:ident, $intrinsic:ident;)*) => {$(
+        impl<T: AsTensor> core::ops::$trait<T> for Tensor {
+            fn $method(&mut self, rhs: T) {
+                *self = $intrinsic(&*self, rhs);
+            }
+        }
+    )*};
+}
+
+tensor_binop_assign! {
+    AddAssign, add_assign, add;
+    SubAssign, sub_assign, sub;
+    MulAssign, mul_assign, mul;
+    DivAssign, div_assign, div;
+    RemAssign, rem_assign, rem;
+}
+
+impl core::ops::Neg for Tensor {
+    type Output = Tensor;
+    fn neg(self) -> Tensor {
+        neg(self)
+    }
+}
+impl core::ops::Neg for &Tensor {
+    type Output = Tensor;
+    fn neg(self) -> Tensor {
+        neg(self)
+    }
 }
 
 // -- compare / logic (bool results) --

@@ -25,7 +25,7 @@
 //! `compile_profile` (`runtime/tokenizer/src/loader/huggingface.rs`) only accepts the *explicit*
 //! byte-level layout — a `Sequence` of `Split(Regex, Isolated)` + `ByteLevel{use_regex:false}` — not
 //! the classic GPT-2 bare `ByteLevel{use_regex:true}`; and `has_all_byte_atoms` requires all **256**
-//! byte atoms, not just ASCII. `[worker.model.driver.options] vocab_size` must agree, or the
+//! byte atoms, not just ASCII. ``[driver] vocab_size`` must agree, or the
 //! registry rejects the `logits` intrinsic at bind time.
 
 use std::path::PathBuf;
@@ -39,33 +39,28 @@ use pie_bin::{run_standalone};
 use pie_client::client::Client;
 
 /// The one standalone TOML (`[controller]`/`[gateway]`/`[worker]` sections); `derive_standalone`
-/// splits + hands each section to its role lib's `Config::parse`. the config's loopback default pins the client edge
-/// to loopback but keeps the *configured port* (so `pie local` has a predictable address), so the test
-/// must itself request an ephemeral one — `[gateway] listen = 127.0.0.1:0` — else both checks collide on
-/// the `0.0.0.0:8080` default ("Address already in use"). `worker_listen` is already forced ephemeral by
-/// compose. The worker runs the always-linked **dummy** driver against a local snapshot (no GPU, no
+/// splits + hands each section to its role lib's `Config::parse`. The client edge binds
+/// `[server] host:port`, so the test asks for an ephemeral port there — `port = 0` — else two
+/// concurrent tests collide on 8080. It used to ask via `[gateway] listen`, which is what actually
+/// bound before `[server] host` was wired to it; that there were two spellings is why one of them was
+/// silently winning. `worker_listen` is already forced ephemeral by compose. The worker runs the always-linked **dummy** driver against a local snapshot (no GPU, no
 /// download — R3); auth off. The dummy driver's `[..options]` are explicit (`vocab_size = 128`
 /// constrains synthetic samples to valid single-byte UTF-8 IDs from the 128-token fixture;
 /// `arch_name` is kept explicit while the fixture `config.json` supplies the
 /// engine-owned model profile metadata).
 fn standalone_toml(snapshot: &str) -> String {
     format!(
-        "[controller]\n\
+        "         [server]\n\
+         port = 0\n\
          \n\
-         [gateway]\n\
-         listen = \"127.0.0.1:0\"\n\
-         \n\
-         [worker]\n\
-         \n\
-         [worker.model]\n\
+         [model]\n\
          name = \"smoke\"\n\
-         hf_repo = \"{snapshot}\"\n\
+         model = \"{snapshot}\"\n\
          \n\
-         [worker.model.driver]\n\
+         [driver]\n\
          type = \"dummy\"\n\
          device = [\"cpu\"]\n\
          \n\
-         [worker.model.driver.options]\n\
          vocab_size = 256\n\
          arch_name = \"qwen3\"\n"
     )

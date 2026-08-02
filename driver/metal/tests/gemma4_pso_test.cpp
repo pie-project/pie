@@ -31,6 +31,7 @@
 
 using pie::metal::RawMetalContext;
 using pie::metal::gemma4::build_gemma4_psos;
+using pie::metal::gemma4::Gemma4Geometry;
 using pie::metal::gemma4::Gemma4Psos;
 
 namespace {
@@ -91,7 +92,7 @@ int main(int argc, char** argv) {
     expect(true, "RawMetalContext::create succeeds");
 
     Gemma4Psos psos;
-    const bool built = build_gemma4_psos(*ctx, kernels_dir, psos, &error);
+    const bool built = build_gemma4_psos(*ctx, kernels_dir, Gemma4Geometry{}, psos, &error);
     expect(built, "every gemma4 PSO compiles: " + (built ? std::string("ok") : error));
     if (built) {
         // Named individually so a regression says which kernel broke.
@@ -105,6 +106,39 @@ int main(int argc, char** argv) {
         expect(psos.valid(), "the table reports itself complete");
     }
 
+    // The two attention widths used to be literals (256 and 512) while the
+    // geometry read both from the config. A pipeline built for one width and
+    // handed the other's heads does not fail -- it strides past the end of
+    // every head and writes zeros. So the widths have to be the geometry's,
+    // and these three assertions are what says so.
+    {
+        std::printf("[the attention widths come from the geometry]\n");
+
+        // There is no pipeline cache, so identity says nothing. What says the
+        // width was read is the NAME the load fails on: move one field, and the
+        // refusal has to name that field's value. Do it for each field
+        // separately -- a literal left in either slot survives the other probe.
+        auto refusal_for = [&](int head_dim, int global_head_dim) {
+            Gemma4Geometry g;
+            g.head_dim = head_dim;
+            g.global_head_dim = global_head_dim;
+            Gemma4Psos p;
+            std::string e;
+            const bool ok = build_gemma4_psos(*ctx, kernels_dir, g, p, &e);
+            return ok ? std::string("<compiled>") : e;
+        };
+
+        const std::string sliding = refusal_for(96, 512);
+        expect(sliding.find("_d_96") != std::string::npos,
+               "moving head_dim alone is refused, naming d=96 (the sliding layers): " +
+                   sliding);
+
+        const std::string global = refusal_for(256, 96);
+        expect(global.find("_d_96") != std::string::npos,
+               "moving global_head_dim alone is refused, naming d=96 (the full layers): " +
+                   global);
+    }
+
     // Every dispatch in the step has to resolve to a pipeline that exists and a
     // grid the hardware will accept. `pso_max_threads` is 832 on an M1 Max, and
     // exceeding it is NOT an error — it silently computes something else.
@@ -112,8 +146,9 @@ int main(int argc, char** argv) {
         std::printf("[whole step resolves]\n");
         pie::metal::DecodeStepPsos base;
         std::string base_err;
-        const bool base_ok = pie::metal::load_decode_psos(*ctx, kernels_dir, base,
-                                                          /*with_argmax=*/true, &base_err);
+        const bool base_ok = pie::metal::load_decode_psos(
+            *ctx, kernels_dir, base, pie::metal::AffineFormat{4, 64},
+            /*with_argmax=*/true, &base_err);
         expect(base_ok, "the shared decode PSOs compile: " + (base_ok ? std::string("ok")
                                                                      : base_err));
         if (base_ok) {
@@ -122,7 +157,7 @@ int main(int argc, char** argv) {
             int missing = 0, oversized = 0, empty_grid = 0;
             std::uint32_t worst_cap = 0;
             for (const auto& d : dag) {
-                const auto pso = pie::metal::gemma4::pso_for(d, base, psos);
+                const auto pso = pie::metal::gemma4::pso_for(d, g, base, psos);
                 if (!pso.valid()) {
                     ++missing;
                     continue;
@@ -183,7 +218,8 @@ int main(int argc, char** argv) {
             pie::metal::MultiBatchPsos mb;
             std::string mb_err;
             const bool mb_ok = pie::metal::load_multibatch_psos(
-                *ctx, kernels_dir, mb, /*with_d512=*/true, &mb_err);
+                *ctx, kernels_dir, mb, pie::metal::AffineFormat{4, 64},
+                /*with_d512=*/true, &mb_err);
             expect(mb_ok, "the multi-batch PSOs compile: " + (mb_ok ? std::string("ok")
                                                                     : mb_err));
             if (mb_ok) {
@@ -216,7 +252,7 @@ int main(int argc, char** argv) {
                         d.kind == pie::metal::gemma4::Kind::Sdpa;
                     if (changes) {
                         const pie::metal::Pso m1 =
-                            pie::metal::gemma4::pso_for(d, base, psos);
+                            pie::metal::gemma4::pso_for(d, g, base, psos);
                         if (p.obj == m1.obj) ++still_m1;
                     }
                 }

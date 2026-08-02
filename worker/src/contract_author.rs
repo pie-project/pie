@@ -5,10 +5,10 @@
 //! `author_contract` family hook the load path runs and lends the result back
 //! as the marshaled view the loader FFI already speaks; this side converts it
 //! into the loader's own [`ModelContract`] and releases the lease. The caller
-//! — `pie model optimize` — then compiles and executes on the host.
+//! — `pie model import` — then compiles and executes on the host.
 //!
 //! The two device-derived knobs the builder consumes (`fp8_native`,
-//! `native_mxfp4_moe`) are parameters here: an optimize run on the serving
+//! `native_mxfp4_moe`) are parameters here: a convert run on the serving
 //! machine answers them with a device query or its config, and an offline run
 //! answers them with what the serving machine will be.
 

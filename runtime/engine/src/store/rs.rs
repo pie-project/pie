@@ -399,11 +399,7 @@ impl RsStore {
     /// Capacity is untouched: this releases TOKENS, not pages. `free_buffer`
     /// remains the capacity operation, and the two now divide cleanly —
     /// content versus capacity.
-    pub fn discard_buffered(
-        &mut self,
-        ws: RsWorkingSetId,
-        count: u32,
-    ) -> Result<(), RsError> {
+    pub fn discard_buffered(&mut self, ws: RsWorkingSetId, count: u32) -> Result<(), RsError> {
         let entry = self.entry_mut(ws)?;
         if count > entry.occupancy.bound() {
             return Err(RsError::DiscardExceedsBuffer {
@@ -608,7 +604,14 @@ impl RsStore {
         write_state: bool,
         buffer_tokens: Option<(u32, u32)>,
     ) -> Result<RsPreparedWrite, RsError> {
-        self.prepare(ws, write_state, None, buffer_tokens, RsBufferIntent::Write, None)
+        self.prepare(
+            ws,
+            write_state,
+            None,
+            buffer_tokens,
+            RsBufferIntent::Write,
+            None,
+        )
     }
 
     /// Prepare a folded-state write from caller-owned reserved slots,
@@ -637,7 +640,14 @@ impl RsStore {
         if let Some(tokens) = fold_tokens {
             self.validate_fold(ws, tokens, buffer_tokens, buffer_intent)?;
         }
-        self.prepare(ws, write_state, fold_tokens, buffer_tokens, buffer_intent, None)
+        self.prepare(
+            ws,
+            write_state,
+            fold_tokens,
+            buffer_tokens,
+            buffer_intent,
+            None,
+        )
     }
 
     /// [`prepare_general`] from caller-owned reserved slots (the acquisition
@@ -909,11 +919,7 @@ impl RsStore {
         }
     }
 
-    fn publish_prevalidated(
-        &mut self,
-        prepared: RsPreparedWrite,
-        folds: &mut RsPendingFolds,
-    ) {
+    fn publish_prevalidated(&mut self, prepared: RsPreparedWrite, folds: &mut RsPendingFolds) {
         let ws = prepared.ws;
         // Displaced slots are recycled against the current submission
         // sequence; `retire_idle` is what actually hands them back, and it
@@ -961,11 +967,7 @@ impl RsStore {
             entry.occupancy = entry.occupancy.map(|n| n.max(start.saturating_add(len)));
         }
 
-        if let Some(tokens) = prepared
-            .state
-            .as_ref()
-            .and_then(|state| state.fold_tokens)
-        {
+        if let Some(tokens) = prepared.state.as_ref().and_then(|state| state.fold_tokens) {
             folds.0.push(RsPendingFold {
                 ws,
                 tokens,

@@ -5,7 +5,6 @@
 //! same cache at boot, so a CLI with its own idea of the layout would be a
 //! CLI that can hide a program from the thing meant to run it.
 
-use std::io::IsTerminal;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Subcommand};
@@ -13,11 +12,17 @@ use serde::Deserialize;
 
 use pie_engine::inferlet::program::{Manifest, ProgramName, Repository};
 
+use crate::ui::{self, Align, Mark, Palette, Row, Stream, Table};
+
 
 #[derive(Subcommand, Debug)]
 pub enum InferletCmd {
     /// List the inferlets already downloaded.
-    List,
+    List {
+        /// Emit one JSON document instead of the table.
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Show manifest metadata and accepted input parameters.
     Info(InfoArgs),
@@ -41,11 +46,14 @@ pub struct InfoArgs {
     /// Inferlet name, with optional version (e.g. `chat-completion`
     /// or `chat-completion@0.1.0`).
     pub inferlet: String,
+    /// Emit one JSON document instead of the report.
+    #[arg(long)]
+    pub json: bool,
 }
 
 pub async fn run(cmd: InferletCmd, global: &startup::GlobalArgs) -> Result<()> {
     match cmd {
-        InferletCmd::List => list(),
+        InferletCmd::List { json } => list(json),
         InferletCmd::Info(args) => info(args, global).await,
         InferletCmd::Download(args) => download(args, global).await,
         InferletCmd::Remove(args) => remove(args).await,
@@ -66,60 +74,55 @@ fn open(registry_url: String) -> Repository {
     repo
 }
 
-fn list() -> Result<()> {
+fn list(json: bool) -> Result<()> {
     let repo = open(String::new());
     let cached = repo.cached();
+    if json {
+        return ui::emit_json(&serde_json::json!(
+            cached
+                .iter()
+                .map(|(name, manifest, size)| serde_json::json!({
+                    "name": name.name,
+                    "version": name.version,
+                    "description": manifest.package.description,
+                    "bytes": size,
+                }))
+                .collect::<Vec<_>>()
+        ));
+    }
+
     if cached.is_empty() {
-        println!("no inferlets downloaded (they arrive on first use, or with");
-        println!("`pie inferlet download <name>`)");
+        println!("nothing downloaded yet");
+        println!("  inferlets arrive on first use, or with `pie inferlet download <name>`");
         return Ok(());
     }
-    let colorize = std::io::stdout().is_terminal();
-    let (dim, reset) = if colorize { ("\x1b[2m", "\x1b[0m") } else { ("", "") };
-    let width = cached
-        .iter()
-        .map(|(name, _, _)| name.name.len() + name.version.len() + 1)
-        .max()
-        .unwrap_or(0);
+    let palette = Palette::for_stream(Stream::Stdout);
+    let mut table = Table::new([Align::Left, Align::Right, Align::Left], 2);
     for (name, manifest, size) in &cached {
-        let id = format!("{}@{}", name.name, name.version);
-        let description = summarize(manifest.package.description.as_deref().unwrap_or(""));
-        println!("  {id:<width$}  {:>8}  {dim}{description}{reset}", human(*size));
+        // Descriptions are author-written and unbounded -- one in the test set
+        // runs to a paragraph on mask semantics -- so the table cuts the last
+        // column to fit. `pie inferlet info` prints the whole thing.
+        let description = manifest
+            .package
+            .description
+            .as_deref()
+            .unwrap_or("")
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        table.push(Row::new(
+            Mark::Plain,
+            [
+                format!("{}@{}", name.name, name.version),
+                ui::bytes(*size),
+                description,
+            ],
+        ));
     }
+    table.print(&palette);
     Ok(())
-}
-
-/// A manifest description down to one line's worth.
-///
-/// These are author-written and unbounded -- one in the test set runs to a
-/// full paragraph on mask semantics -- so a listing that printed them whole
-/// would wrap into unreadability and bury the rows around it. Cut on a word
-/// boundary; `pie inferlet info` prints the whole thing.
-fn summarize(description: &str) -> String {
-    const WIDTH: usize = 72;
-    let line = description.lines().next().unwrap_or("").trim();
-    if line.chars().count() <= WIDTH {
-        return line.to_string();
-    }
-    let clipped: String = line.chars().take(WIDTH).collect();
-    let cut = clipped.rfind(' ').unwrap_or(clipped.len());
-    format!("{}…", clipped[..cut].trim_end())
-}
-
-/// Bytes as the largest binary unit that leaves a number worth reading.
-fn human(bytes: u64) -> String {
-    const UNITS: [(&str, u64); 3] = [("MiB", 1 << 20), ("KiB", 1 << 10), ("B", 1)];
-    for (suffix, scale) in UNITS {
-        if bytes >= scale {
-            let value = bytes as f64 / scale as f64;
-            return if scale == 1 || value >= 100.0 {
-                format!("{value:.0}{suffix}")
-            } else {
-                format!("{value:.1}{suffix}")
-            };
-        }
-    }
-    "0B".to_string()
 }
 
 async fn download(args: TargetArgs, global: &startup::GlobalArgs) -> Result<()> {
@@ -154,7 +157,10 @@ async fn remove(args: TargetArgs) -> Result<()> {
                 .filter(|name| name.name == args.inferlet)
                 .collect();
             match matching.len() {
-                0 => bail!("{} is not downloaded", args.inferlet),
+                0 => bail!(
+                    "{} is not downloaded; `pie inferlet list` shows what is",
+                    args.inferlet
+                ),
                 1 => matching.into_iter().next().unwrap(),
                 _ => {
                     let versions: Vec<String> =
@@ -189,6 +195,32 @@ async fn info(args: InfoArgs, global: &startup::GlobalArgs) -> Result<()> {
     let program = resolve_inferlet_id(&args.inferlet, &cfg.server.registry).await?;
     let manifest = Manifest::from_url(&cfg.server.registry, &program).await?;
 
+    if args.json {
+        // The manifest as the registry serves it, plus the resolved version --
+        // which is the part the caller could not have known, since a bare name
+        // means "newest".
+        return ui::emit_json(&serde_json::json!({
+            "name": program.name,
+            "version": program.version,
+            "description": manifest.package.description,
+            "authors": manifest.package.authors,
+            "repository": manifest.package.repository,
+            "runtime": manifest.runtime,
+            "dependencies": manifest.dependencies,
+            "parameters": manifest
+                .parameters
+                .iter()
+                .map(|(name, p)| {
+                    serde_json::json!({
+                        "name": name,
+                        "type": format!("{:?}", p.param_type).to_lowercase(),
+                        "optional": p.optional,
+                        "description": p.description,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        }));
+    }
     print_manifest(&program, &manifest);
     Ok(())
 }
@@ -273,12 +305,16 @@ fn validate_bare_inferlet_name(name: &str) -> Result<()> {
 }
 
 fn print_manifest(program: &ProgramName, manifest: &Manifest) {
-    let colorize = std::io::stdout().is_terminal();
-    let (bold, dim, cyan, green, reset) = if colorize {
-        ("\x1b[1m", "\x1b[2m", "\x1b[36m", "\x1b[32m", "\x1b[0m")
-    } else {
-        ("", "", "", "", "")
-    };
+    let palette = Palette::for_stream(Stream::Stdout);
+    let (bold, dim, cyan, green, reset) = (
+        palette.bold(),
+        palette.dim(),
+        // Cyan is this one screen's own accent for parameter names; the shared
+        // palette carries the roles every command uses, not every colour.
+        if palette.enabled() { "\x1b[36m" } else { "" },
+        palette.green(),
+        palette.reset(),
+    );
 
     println!("{bold}{program}{reset}");
     if let Some(description) = &manifest.package.description {
@@ -343,21 +379,6 @@ fn parameter_type_name(param_type: &pie_engine::inferlet::program::ParameterType
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_long_description_is_cut_on_a_word_boundary() {
-        assert_eq!(summarize("short"), "short");
-        // A real one from the test set: a paragraph that would wrap the row
-        // into unreadability and bury the rows around it.
-        let long = "Overview §6.2 beam search, DESIGN B form (logical mask-out \
-                    and lazy compaction): the guest beam epilogue appends each \
-                    survivor's new token";
-        let cut = summarize(long);
-        assert!(cut.chars().count() <= 73, "got {} chars", cut.chars().count());
-        assert!(cut.ends_with('…'));
-        assert!(!cut.contains("  "), "should not end mid-space: {cut:?}");
-        // Only the first line, so a multi-line description cannot break the row.
-        assert_eq!(summarize("first\nsecond"), "first");
-    }
 
     #[test]
     fn latest_version_from_registry_json_uses_first_version() {

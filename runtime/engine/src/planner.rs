@@ -55,6 +55,41 @@ use grant::{DevicePageReservation, RsSlotReservation};
 
 use crate::store::kv::page_table::ReclaimQuote;
 
+/// Opt-in event markers (`PIE_CONTENTION_TRACE_EVENTS=1`): `println!`, not
+/// `tracing` — the embedded (pyo3) server installs no subscriber. The
+/// timestamp shares the fire-timing monotonic clock, which is what lets these
+/// markers be read against the scheduler's own timing records.
+///
+/// **This is a separate switch from the periodic stall sampler**
+/// (`PIE_CONTENTION_TRACE_MS`) on purpose. The markers fire per planner
+/// EVENT — one line per park, serve, restore and eviction step — and a
+/// contended run emits tens of thousands of them. Tying them to the
+/// sampler's variable made `PIE_CONTENTION_TRACE_MS=0`, the natural
+/// spelling of "off", the single most expensive setting there is: the
+/// sampler thread never starts (it needs `ms > 0`) but every marker prints.
+/// Runs taken that way read 25-30% under the same build untraced, which is
+/// larger than most effects this planner is tuned against.
+pub(crate) fn trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("PIE_CONTENTION_TRACE_EVENTS")
+            .map(|raw| !matches!(raw.trim(), "" | "0" | "false" | "off"))
+            .unwrap_or(false)
+    })
+}
+
+macro_rules! ptrace {
+    ($($arg:tt)*) => {
+        if crate::planner::trace_enabled() {
+            println!(
+                "[planner t_us={}] {}",
+                crate::scheduler::fire_timing_now_us(),
+                format_args!($($arg)*)
+            );
+        }
+    };
+}
+
 /// Process identity the planner tracks (FCFS clock key, residency key).
 pub type ProcessId = uuid::Uuid;
 
@@ -1103,123 +1138,123 @@ impl ResidencyPlanner {
             }
             return Ok(Acquired::Granted(AllocationGrant::empty()));
         }
-        loop {
-            // Fast path. Uncontended (no waiters, everyone resident): two
-            // free-list pops, no planner lock. Once anything is queued the
-            // fast path closes and EVERY ask parks FCFS at its process's
-            // spawn position.
-            //
-            // The elder bypass that used to live here — a process older
-            // than the queue head could still reserve directly — was
-            // deleted 2026-07-26 (`rainer_v3.md` §8.5). It was justified by
-            // a 47% inter-batch gap measured 2026-07-25, before the §17
-            // mechanism fixes; re-measured after them it earns nothing:
-            // A4/A6/E3 all land inside their bands with it gone, F2 stays
-            // 12/12, and one ordering rule disappears with it. v2 lists it
-            // under "dies ... derivatives of implicit membership".
-            let uncontended = self.waiters.load(Ordering::Acquire) == 0
-                && self.nonresident.load(Ordering::Acquire) == 0;
-            if !uncontended {
-                // E6 progress: this process is asking to fire again. Under
-                // contention only — the same condition the zero-demand path
-                // uses, and the elder check used to fold this in.
-                self.note_progress(pid);
-            }
-            if uncontended && let Some(grant) = self.try_reserve(demand) {
-                return Ok(Acquired::Granted(grant));
-            }
-            // The reserve failed (or the fast path is closed): run the
-            // exact-arithmetic exhaustion check before parking. Slow path
-            // only — a demand that reserves off the free lists trivially
-            // fits, and reading totals is a store-lock hold the per-fire
-            // hot path must not pay (§16).
-            let (_, kv_total) = self.port.device_stats();
-            if demand.kv_pages > kv_total {
+        // Fast path. Uncontended (no waiters, everyone resident): two
+        // free-list pops, no planner lock. Once anything is queued the
+        // fast path closes and EVERY ask parks FCFS at its process's
+        // spawn position.
+        //
+        // The elder bypass that used to live here — a process older
+        // than the queue head could still reserve directly — was
+        // deleted 2026-07-26 (`rainer_v3.md` §8.5). It was justified by
+        // a 47% inter-batch gap measured 2026-07-25, before the §17
+        // mechanism fixes; re-measured after them it earns nothing:
+        // A4/A6/E3 all land inside their bands with it gone, F2 stays
+        // 12/12, and one ordering rule disappears with it. v2 lists it
+        // under "dies ... derivatives of implicit membership".
+        let uncontended = self.waiters.load(Ordering::Acquire) == 0
+            && self.nonresident.load(Ordering::Acquire) == 0;
+        if !uncontended {
+            // E6 progress: this process is asking to fire again. Under
+            // contention only — the same condition the zero-demand path
+            // uses, and the elder check used to fold this in.
+            self.note_progress(pid);
+        }
+        if uncontended && let Some(grant) = self.try_reserve(demand) {
+            return Ok(Acquired::Granted(grant));
+        }
+        // The reserve failed (or the fast path is closed): run the
+        // exact-arithmetic exhaustion check before parking. Slow path
+        // only — a demand that reserves off the free lists trivially
+        // fits, and reading totals is a store-lock hold the per-fire
+        // hot path must not pay (§16).
+        let (_, kv_total) = self.port.device_stats();
+        if demand.kv_pages > kv_total {
+            return Err(PlannerError::Impossible {
+                need: demand.kv_pages,
+                total: kv_total,
+            });
+        }
+        if demand.rs_slots > 0 {
+            let (_, rs_total) = self.port.rs_stats();
+            if demand.rs_slots > rs_total {
                 return Err(PlannerError::Impossible {
-                    need: demand.kv_pages,
-                    total: kv_total,
+                    need: demand.rs_slots,
+                    total: rs_total,
                 });
             }
-            if demand.rs_slots > 0 {
-                let (_, rs_total) = self.port.rs_stats();
-                if demand.rs_slots > rs_total {
-                    return Err(PlannerError::Impossible {
-                        need: demand.rs_slots,
-                        total: rs_total,
-                    });
-                }
+        }
+        enum Parked {
+            Entry(EntryKey, Arc<Notify>),
+            NotResident,
+            Gone,
+        }
+        let parked = self.with_inner(|inner| {
+            let Some(proc) = inner.procs.get(&pid) else {
+                return Parked::Gone;
+            };
+            if proc.state != Residency::Resident {
+                return Parked::NotResident;
             }
-            enum Parked {
-                Entry(EntryKey, Arc<Notify>),
-                NotResident,
-                Gone,
-            }
-            let parked = self.with_inner(|inner| {
-                let Some(proc) = inner.procs.get(&pid) else {
-                    return Parked::Gone;
-                };
-                if proc.state != Residency::Resident {
-                    return Parked::NotResident;
-                }
-                let key = (proc.seq, inner.next_id);
-                inner.next_id += 1;
-                let notify = Arc::new(Notify::new());
-                inner.queue.insert(
-                    key,
-                    Waiter {
-                        pid,
-                        kind: WaitKind::Allocation {
-                            demand,
-                            notify: notify.clone(),
-                            outcome: None,
-                            yielded: false,
-                        },
+            let key = (proc.seq, inner.next_id);
+            inner.next_id += 1;
+            let notify = Arc::new(Notify::new());
+            inner.queue.insert(
+                key,
+                Waiter {
+                    pid,
+                    kind: WaitKind::Allocation {
+                        demand,
+                        notify: notify.clone(),
+                        outcome: None,
+                        yielded: false,
                     },
-                );
-                Parked::Entry(key, notify)
-            });
-            match parked {
-                Parked::Gone => return Err(PlannerError::Cancelled),
-                Parked::NotResident => {
-                    // Out of the set (or in transfer): the fire path settles
-                    // the process's tail and waits out the eviction.
-                    return Ok(Acquired::Yield);
-                }
-                Parked::Entry(key, notify) => {
-                    self.stats.parks.fetch_add(1, Ordering::Relaxed);
-                    // The park empties this lane's seat in the wait-all
-                    // quorum so frames seal without it; rejoin is implicit
-                    // on the lane's next accepted fire.
-                    crate::scheduler::worker::notify_lane_close(quorum_id, Some(pid));
-                    let mut registration = WaitRegistration {
-                        planner: self,
-                        key,
-                        active: true,
-                    };
-                    self.poke();
-                    loop {
-                        let notified = notify.notified();
-                        tokio::pin!(notified);
-                        notified.as_mut().enable();
-                        match self.collect_outcome(key) {
-                            Collect::Ready(outcome) => {
-                                registration.disarm();
-                                if matches!(outcome, Err(PlannerError::Cancelled)) {
-                                    self.stats.cancelled_waits.fetch_add(1, Ordering::Relaxed);
-                                }
-                                // The collection unblocked the next head.
-                                self.poke();
-                                return outcome.map(Acquired::Granted);
+                },
+            );
+            Parked::Entry(key, notify)
+        });
+        match parked {
+            Parked::Gone => return Err(PlannerError::Cancelled),
+            Parked::NotResident => {
+                // Out of the set (or in transfer): the fire path settles
+                // the process's tail and waits out the eviction.
+                return Ok(Acquired::Yield);
+            }
+            Parked::Entry(key, notify) => {
+                self.stats.parks.fetch_add(1, Ordering::Relaxed);
+                ptrace!("park key={:?} pid={} kv={}", key, pid, demand.kv_pages);
+                // The park empties this lane's seat in the wait-all
+                // quorum so frames seal without it; rejoin is implicit
+                // on the lane's next accepted fire.
+                crate::scheduler::worker::notify_lane_close(quorum_id, Some(pid));
+                let mut registration = WaitRegistration {
+                    planner: self,
+                    key,
+                    active: true,
+                };
+                self.poke();
+                loop {
+                    let notified = notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    match self.collect_outcome(key) {
+                        Collect::Ready(outcome) => {
+                            registration.disarm();
+                            ptrace!("collect key={:?} ok={}", key, outcome.is_ok());
+                            if matches!(outcome, Err(PlannerError::Cancelled)) {
+                                self.stats.cancelled_waits.fetch_add(1, Ordering::Relaxed);
                             }
-                            Collect::Yield => {
-                                registration.disarm();
-                                self.poke();
-                                return Ok(Acquired::Yield);
-                            }
-                            Collect::Wait => {}
+                            // The collection unblocked the next head.
+                            self.poke();
+                            return outcome.map(Acquired::Granted);
                         }
-                        notified.await;
+                        Collect::Yield => {
+                            registration.disarm();
+                            self.poke();
+                            return Ok(Acquired::Yield);
+                        }
+                        Collect::Wait => {}
                     }
+                    notified.await;
                 }
             }
         }

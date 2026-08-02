@@ -50,7 +50,26 @@ impl Config {
     /// IO, no env, no clap — sourcing the string (file locate/read + env merge)
     /// is the bin layer's job (Seam 2). The role lib owns only the
     /// domain parse + validation.
+    /// Parse the operator's file.
+    ///
+    /// The file's sections are not this struct's fields -- see
+    /// [`crate::config_layout`] for why and for the mapping. Reshaping first
+    /// means everything below still sees the shape it was written against, and
+    /// the driver options still land in a `deny_unknown_fields` struct.
     pub fn parse(s: &str) -> Result<Self> {
+        let file: toml::Table = toml::from_str(s).map_err(|e| {
+            if s.contains("[[model]]") {
+                anyhow::anyhow!(
+                    "parse config: {e}\n\
+                     hint: pie serves exactly one model — use a single `[model]` table, \
+                     not a `[[model]]` list."
+                )
+            } else {
+                anyhow::anyhow!("parse config: {e}")
+            }
+        })?;
+        let reshaped = crate::config_layout::reshape(file)?;
+        let s = &toml::to_string(&reshaped).map_err(|e| anyhow::anyhow!("reshape config: {e}"))?;
         let cfg: Config = toml::from_str(s).map_err(|e| {
             if s.contains("[[model]]") {
                 anyhow::anyhow!(
@@ -102,7 +121,7 @@ impl ExecutorConfig {
     fn validate(&self) -> Result<()> {
         ensure!(
             self.max_clients > 0,
-            "executor.max_clients must be greater than zero"
+            "cluster.max_clients must be greater than zero"
         );
         Ok(())
     }
@@ -151,7 +170,7 @@ impl OffloadConfig {
     fn validate(&self) -> Result<()> {
         ensure!(
             self.max_outstanding_per_partner > 0,
-            "offload.max_outstanding_per_partner must be greater than zero"
+            "cluster.max_outstanding_per_partner must be greater than zero"
         );
         Ok(())
     }
@@ -432,7 +451,7 @@ impl Default for ServerConfig {
 impl ServerConfig {
     fn validate(&self) -> Result<()> {
         if let Some(n) = self.max_concurrent_processes {
-            ensure!(n > 0, "server.max_concurrent_processes must be > 0 if set");
+            ensure!(n > 0, "runtime.max_concurrent_processes must be > 0 if set");
         }
         Ok(())
     }
@@ -561,19 +580,19 @@ impl RuntimeConfig {
     fn validate(&self) -> Result<()> {
         ensure!(
             self.worker_threads > 0,
-            "runtime.worker_threads must be > 0"
+            "server.worker_threads must be > 0"
         );
         ensure!(
             self.wasm_max_instances > 0,
-            "runtime.wasm_max_instances must be > 0"
+            "sandbox.max_instances must be > 0"
         );
         ensure!(
             self.wasm_max_memory.as_bytes() > 0,
-            "runtime.wasm_max_memory must be > 0"
+            "sandbox.max_memory must be > 0"
         );
         ensure!(
             self.max_upload.as_bytes() > 0,
-            "runtime.max_upload must be > 0"
+            "server.max_upload must be > 0"
         );
         Ok(())
     }
@@ -620,9 +639,15 @@ pub struct ModelConfig {
     /// What clients ask for this model by. Required, and free-form: it names
     /// the deployment, not the checkpoint.
     pub name: String,
-    /// Hugging Face repo the weights come from. Read out of the local HF
-    /// cache; `pie model download` is what puts it there.
-    pub hf_repo: String,
+    /// What to serve: a store name (`Qwen--Qwen3-0.6B`, as `pie model list`
+    /// prints it) or a path to a `.zt` artifact. See `weights::resolve`.
+    ///
+    /// Named `hf_repo` until the store existed, and still accepted under that
+    /// name — the struct is `deny_unknown_fields`, so a bare rename would greet
+    /// an existing config with *unknown field `hf_repo`* and *missing field
+    /// `model`* at startup rather than with a working boot.
+    #[serde(alias = "hf_repo")]
+    pub model: String,
     /// Which backend runs the model, on what devices.
     pub driver: DriverConfig,
     /// Batching and timeout policy. Every field has a measured default; the
@@ -634,8 +659,11 @@ pub struct ModelConfig {
     /// Per-model rather than process-global because the artifact IS the model:
     /// it is that checkpoint's weights, already laid out for this driver, and
     /// none of it is shared with another model. Empty derives
-    /// `$PIE_HOME/models`, where the rest of pie's per-model state already
-    /// lives (cf. `$PIE_HOME/optimized`).
+    /// `$PIE_HOME/cache/weights` -- a cache, beside the driver's other ones.
+    /// NOT `$PIE_HOME/models`, which is the `.zt` artifact store: an artifact
+    /// is portable and costs a re-download to replace, while these are device
+    /// bytes for one driver, one TP layout and one ABI version, rebuilt by a
+    /// single cold load.
     ///
     /// The artifacts are the size of the weights -- tens to hundreds of GB --
     /// which is why this is a path pie cannot always pick for you. The driver
@@ -650,6 +678,11 @@ impl ModelConfig {
             !self.name.is_empty(),
             "model.name must be a non-empty string"
         );
+        ensure!(
+            !self.model.trim().is_empty(),
+            "model.model must name a stored artifact or a path to one \
+             (`pie model list` shows what is available)"
+        );
         self.driver.validate()?;
         self.scheduler.validate()?;
         // Relative resolves against the driver's working directory, which the
@@ -659,7 +692,7 @@ impl ModelConfig {
             self.weight_cache_dir.is_empty()
                 || Path::new(&self.weight_cache_dir).is_absolute(),
             "model.weight_cache_dir must be an absolute path (got {:?}); \
-             leave it empty for $PIE_HOME/models",
+             leave it empty for $PIE_HOME/cache/weights",
             self.weight_cache_dir
         );
         Ok(())
@@ -919,7 +952,7 @@ impl DriverConfig {
     fn validate(&self) -> Result<()> {
         ensure!(
             !self.device.is_empty(),
-            "model.driver.device must be non-empty"
+            "driver.device must be non-empty"
         );
         match self.kind {
             DriverKind::CudaNative => {
@@ -1062,9 +1095,9 @@ pub struct MetalDriverOptions {
     pub kv_page_size: u32,
     /// KV pages to allocate. Used directly, and 1024 is a real default.
     ///
-    /// Not the CUDA driver's `total_pages`, which it resembles: there the
-    /// field is an optional hard cap over a value derived from
-    /// `gpu_mem_utilization`.
+    /// The CUDA driver's nearest equivalent is `max_total_pages`, which is a
+    /// different quantity with a name that now says so: a ceiling over a
+    /// derived number, usually absent.
     pub total_pages: u32,
     /// Tokens one forward pass may carry, across all requests in the batch.
     pub max_forward_tokens: u32,
@@ -1130,7 +1163,7 @@ impl Default for MetalDriverOptions {
 #[serde(deny_unknown_fields)]
 pub struct DummyDriverOptions {
     /// Vocabulary size advertised in the caps handshake. Should match
-    /// the tokenizer at `hf_repo/tokenizer.json`. When `None` the
+    /// the tokenizer the artifact carries. When `None` the
     /// standalone reads `vocab_size` from `<snapshot_dir>/config.json`
     /// before launching the driver.
     #[serde(default)]
@@ -1160,7 +1193,7 @@ pub struct CudaNativeDriverOptions {
     /// Fraction of each GPU's memory pie may use, weights included.
     ///
     /// What is left after the weights becomes the KV pool, so this is the
-    /// knob that sizes it -- `total_pages` only caps the result.
+    /// knob that sizes it -- `max_total_pages` only caps the result.
     pub gpu_mem_utilization: f64,
     /// Which serving shape the memory planner optimizes its layout for:
     /// `auto` to infer it, `latency` for few concurrent requests, or
@@ -1184,9 +1217,13 @@ pub struct CudaNativeDriverOptions {
     /// for contention/preempt tests + CI, independent of the forward-layout
     /// floor.
     ///
-    /// Note this is NOT the metal driver's `total_pages`, which it resembles:
-    /// there the value is used directly and 1024 is a real default.
-    pub total_pages: Option<u32>,
+    /// Named for what it is rather than for what Metal calls its own field.
+    /// Both were `total_pages` and they are not the same quantity: there the
+    /// value IS the pool and 1024 is a real default; here it is a ceiling over
+    /// a number derived from `gpu_mem_utilization`, and its absence is the
+    /// normal case. One name for two meanings is a question a reader cannot
+    /// answer from the file.
+    pub max_total_pages: Option<u32>,
     /// Dtype weights are materialized in. Separate from `activation_dtype`:
     /// narrower weights and wider compute is a normal combination.
     pub weight_dtype: String,
@@ -1285,7 +1322,7 @@ impl Default for CudaNativeDriverOptions {
             kv_page_size: None,
             kv_cache_dtype: "auto".to_string(),
             swap_pool_size: 0,
-            total_pages: None,
+            max_total_pages: None,
             weight_dtype: "bfloat16".to_string(),
             device: String::new(),
             verbose: false,
@@ -1309,7 +1346,7 @@ impl CudaNativeDriverOptions {
             self.gpu_mem_utilization.is_finite()
                 && self.gpu_mem_utilization > 0.0
                 && self.gpu_mem_utilization <= 1.0,
-            "model.driver.options.gpu_mem_utilization must be finite and in (0.0, 1.0]"
+            "driver.gpu_mem_utilization must be finite and in (0.0, 1.0]"
         );
         const MXFP4: &[&str] = &[
             "auto",
@@ -1322,12 +1359,12 @@ impl CudaNativeDriverOptions {
         ];
         ensure!(
             self.mxfp4_moe.is_empty() || MXFP4.contains(&self.mxfp4_moe.as_str()),
-            "model.driver.options.mxfp4_moe must be one of {:?}",
+            "driver.mxfp4_moe must be one of {:?}",
             MXFP4
         );
         ensure!(
             self.mtp_num_drafts <= 32,
-            "model.driver.options.mtp_num_drafts must be in 0..=32"
+            "driver.mtp_num_drafts must be in 0..=32"
         );
         // Present means the operator chose a size, so a present zero is a
         // contradiction rather than a way to say "derive" -- that is what
@@ -1335,28 +1372,28 @@ impl CudaNativeDriverOptions {
         if let Some(size) = self.expert_cache {
             ensure!(
                 size.as_bytes() > 0,
-                "model.driver.options.expert_cache must be > 0; \
+                "driver.expert_cache must be > 0; \
                  omit it to derive one at startup"
             );
         }
         if let Some(size) = self.expert_host_cache {
             ensure!(
                 size.as_bytes() > 0,
-                "model.driver.options.expert_host_cache must be > 0; \
+                "driver.expert_host_cache must be > 0; \
                  omit it for no host tier"
             );
         }
-        if let Some(pages) = self.total_pages {
+        if let Some(pages) = self.max_total_pages {
             ensure!(
                 pages > 0,
-                "model.driver.options.total_pages must be > 0; \
+                "driver.max_total_pages must be > 0; \
                  omit it to derive from gpu_mem_utilization"
             );
         }
         if let Some(size) = self.kv_page_size {
             ensure!(
                 size > 0,
-                "model.driver.options.kv_page_size must be > 0; \
+                "driver.kv_page_size must be > 0; \
                  omit it to let the memory planner derive one"
             );
         }
@@ -1470,11 +1507,44 @@ device = ["cpu"]
         assert_eq!(cfg.server.port, 8080);
     }
 
+    /// `model` is the name now, `hf_repo` still parses.
+    ///
+    /// Not politeness: the struct is `deny_unknown_fields` and the field is
+    /// required, so without the alias every config `pie config init` ever wrote
+    /// would fail at startup with two errors at once — *unknown field
+    /// `hf_repo`* and *missing field `model`* — instead of booting.
+    #[test]
+    fn the_old_spelling_of_the_model_key_still_parses() {
+        let with_new = MINIMAL_METAL.replace("hf_repo =", "model =");
+        assert_ne!(
+            with_new, MINIMAL_METAL,
+            "the fixture should use the old key"
+        );
+
+        let old: Config = toml::from_str(MINIMAL_METAL).unwrap();
+        let new: Config = toml::from_str(&with_new).unwrap();
+        old.validate().unwrap();
+        new.validate().unwrap();
+        assert_eq!(old.model.model, new.model.model);
+        assert!(!new.model.model.is_empty());
+    }
+
+    /// An empty model is caught at parse rather than at driver boot, where it
+    /// would surface as a path error.
+    #[test]
+    fn an_empty_model_is_refused() {
+        let blank = MINIMAL_METAL.replace("hf_repo = \"Qwen/Qwen3-0.6B\"", "hf_repo = \"\"");
+        let cfg: Config = toml::from_str(&blank).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("model.model"), "{err}");
+    }
+
     #[test]
     fn weight_cache_dir_defaults_to_derived() {
         let cfg: Config = toml::from_str(MINIMAL_METAL).unwrap();
         cfg.validate().unwrap();
-        // Empty means "derive $PIE_HOME/models" at the worker layer, not "off":
+        // Empty means "derive $PIE_HOME/cache/weights" at the worker layer,
+        // not "off":
         // the driver only sees off when it is handed nothing at all.
         assert_eq!(cfg.model.weight_cache_dir, "");
     }
@@ -1732,6 +1802,29 @@ device = "cuda:0"
     }
 
     #[test]
+    fn rejects_the_cuda_total_pages_spelling() {
+        // Metal's `total_pages` IS the pool; CUDA's was a ceiling over a
+        // derived number. Two meanings behind one name is a question a reader
+        // cannot answer from the file, so the CUDA one became
+        // `max_total_pages` -- and an existing config carrying the old
+        // spelling must say so rather than silently losing its cap.
+        let legacy = r#"
+[model]
+name = "a"
+hf_repo = "x"
+[driver]
+type = "cuda_native"
+device = ["cuda:0"]
+total_pages = 512
+"#;
+        let err = Config::parse(legacy).unwrap_err().to_string();
+        assert!(err.contains("total_pages"), "got: {err}");
+        // The rejection lists what IS accepted, which is how the new name is
+        // discoverable without reading this test.
+        assert!(err.contains("max_total_pages"), "got: {err}");
+    }
+
+    #[test]
     fn rejects_legacy_binary_path() {
         // Both driver option structs carried it "for compatibility with the
         // Python wrapper", and nothing anywhere read it -- the drivers are
@@ -1740,10 +1833,9 @@ device = "cuda:0"
 [model]
 name = "a"
 hf_repo = "x"
-[model.driver]
+[driver]
 type = "metal"
 device = ["metal:0"]
-[model.driver.options]
 binary_path = "/opt/pie/driver"
 "#;
         let err = Config::parse(legacy).unwrap_err().to_string();
@@ -1769,9 +1861,9 @@ enabled = true
 [model]
 name = "a"
 hf_repo = "x"
-[model.driver]
+[driver]
 type = "metal"
-device = ["cuda:0"]
+device = ["metal:0"]
 "#;
         let err = Config::parse(legacy).unwrap_err().to_string();
         assert!(err.contains("auth"), "got: {err}");

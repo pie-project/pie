@@ -143,7 +143,7 @@ fn lint_double_endpoint_host_both_ends() {
     let dup: &'static Channel = leak(Channel::new([1], dtype::i32).named("dup"));
     tok.put([1i32]);
     dup.put([0i32]); // host writes
-    let _ = dup.take(); // host also consumes
+    dup.note_host_take(); // host also consumes
 
     let mut b = Builder::new(VOCAB, PAGE);
     b.bind_port(Port::EmbedTokens, tok);

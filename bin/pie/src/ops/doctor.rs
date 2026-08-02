@@ -20,68 +20,129 @@ use std::process::Command;
 
 use anyhow::Result;
 
+use crate::ui::{Mark, Palette, Stream};
+
 /// `pie doctor` entry point. Returns whether pie can boot.
-pub fn doctor(global: &startup::GlobalArgs) -> Result<bool> {
+pub fn doctor(global: &startup::GlobalArgs, json: bool) -> Result<bool> {
     let mut warnings = 0usize;
     let mut passes = 0usize;
     let mut failures = 0usize;
 
-    println!("Pie standalone — environment doctor\n");
-
-    // ── System ────────────────────────────────────────────────────────────
-    println!("[system]");
-    let (key, value, status) = check_platform();
-    print_check(&key, &value, status);
-    tally(status, &mut passes, &mut warnings);
-
-    // ── GPUs ──────────────────────────────────────────────────────────────
-    println!("\n[gpus]");
-    for (key, value, status) in check_gpus() {
-        print_check(&key, &value, status);
-        tally(status, &mut passes, &mut warnings);
+    if !json {
+        println!("Pie standalone — environment doctor\n");
     }
 
-    // ── Embedded drivers ──────────────────────────────────────────────────
-    println!("\n[embedded drivers]");
-    for (name, on) in pie_worker::driver_ffi::compiled_embedded() {
-        let (val, st) = if on {
-            ("compiled in".to_string(), Status::Pass)
-        } else {
-            // A driver you did not build is not a fault until the config asks
-            // for it -- which the section below is what checks.
-            ("not compiled (build with --features driver-{})".replace("{}", &name.replace('_', "-")), Status::Warn)
-        };
-        print_check(name, &val, st);
-        tally(st, &mut passes, &mut warnings);
-    }
+    // Sections collected first, rendered second, so the table and the JSON
+    // cannot drift into disagreeing about the verdict -- which is the one
+    // thing a readiness probe reads.
+    let mut sections: Vec<(&'static str, Vec<(String, String, Status)>)> = Vec::new();
 
-    // ── Config ────────────────────────────────────────────────────────────
-    // Last, because its verdict depends on everything above: whether the
-    // config is servable is a question about this binary and this machine, not
-    // about the file alone.
-    println!("\n[config]");
+    sections.push(("system", vec![check_platform(), check_py_runtime()]));
+    sections.push(("gpus", check_gpus()));
+    sections.push((
+        "drivers",
+        pie_worker::driver_ffi::compiled_embedded()
+            .iter()
+            .map(|(name, on)| {
+                if *on {
+                    (name.to_string(), "compiled in".to_string(), Status::Pass)
+                } else {
+                    // A driver you did not build is not a fault until the
+                    // config asks for it -- which the config section checks.
+                    // The cargo feature, which is NOT the driver name with
+                    // its underscore swapped: `cuda_native` builds from
+                    // `driver-cuda`, and the derived spelling named a feature
+                    // that does not exist.
+                    let feature = match *name {
+                        "cuda_native" => "driver-cuda",
+                        "metal" => "driver-metal",
+                        "dummy" => "driver-dummy",
+                        other => other,
+                    };
+                    (
+                        name.to_string(),
+                        format!("not compiled (build with --features {feature})"),
+                        Status::Warn,
+                    )
+                }
+            })
+            .collect(),
+    ));
+    // Last, because its verdict depends on everything above: whether a config
+    // is servable is a question about this binary and this machine, not about
+    // the file alone.
     let (path, origin) = startup::cli_config_path(global);
-    for (key, value, status) in check_config(&path, origin) {
-        print_check(&key, &value, status);
-        match status {
-            Status::Pass => passes += 1,
-            Status::Warn => warnings += 1,
-            Status::Fail => failures += 1,
+    sections.push(("config", check_config(&path, origin)));
+
+    for (_, checks) in &sections {
+        for (_, _, status) in checks {
+            match status {
+                Status::Pass => passes += 1,
+                Status::Warn => warnings += 1,
+                Status::Fail => failures += 1,
+            }
         }
     }
+    let ready = failures == 0;
 
-    // ── Summary ───────────────────────────────────────────────────────────
-    println!();
-    if failures > 0 {
-        println!("✗ pie cannot boot here ({failures} blocking, {warnings} warnings).");
-        return Ok(false);
+    if json {
+        return crate::ui::emit_json(&serde_json::json!({
+            "ready": ready,
+            "passed": passes,
+            "warnings": warnings,
+            "blocking": failures,
+            "sections": sections
+                .iter()
+                .map(|(name, checks)| serde_json::json!({
+                    "section": name,
+                    "checks": checks
+                        .iter()
+                        .map(|(key, value, status)| serde_json::json!({
+                            "check": key,
+                            "detail": value,
+                            "status": match status {
+                                Status::Pass => "pass",
+                                Status::Warn => "warn",
+                                Status::Fail => "blocking",
+                            },
+                        }))
+                        .collect::<Vec<_>>(),
+                }))
+                .collect::<Vec<_>>(),
+        }))
+        .map(|()| ready);
     }
-    if warnings > 0 {
-        println!("! Ready, with warnings ({passes} passed, {warnings} warnings).");
+
+    let palette = Palette::for_stream(Stream::Stdout);
+    for (name, checks) in &sections {
+        println!("\n{}[{name}]{}", palette.bold(), palette.reset());
+        let mut table = crate::ui::Table::new(
+            [crate::ui::Align::Left, crate::ui::Align::Left],
+            1,
+        );
+        for (key, value, status) in checks {
+            table.push(crate::ui::Row::new(
+                match status {
+                    Status::Pass => Mark::Did,
+                    Status::Warn => Mark::Warn,
+                    Status::Fail => Mark::Blocked,
+                },
+                [key.clone(), value.clone()],
+            ));
+        }
+        table.print(&palette);
+    }
+
+    println!();
+    let plural = if warnings == 1 { "" } else { "s" };
+    if !ready {
+        println!("✗ pie cannot boot here ({failures} blocking, {warnings} warning{plural}).");
+    } else if warnings > 0 {
+        println!("! Ready, with warnings ({passes} passed, {warnings} warning{plural}).");
     } else {
         println!("✓ Ready ({passes} checks).");
     }
-    Ok(true)
+    Ok(ready)
 }
 
 /// Parse the config and say whether this binary could serve it.
@@ -95,13 +156,13 @@ fn check_config(path: &Path, origin: startup::Origin) -> Vec<(String, String, St
         return if origin == startup::Origin::Default {
             vec![(
                 "config".into(),
-                format!("none at {} — running on defaults", path.display()),
+                format!("none at {} — running on defaults", crate::ui::short_path(path)),
                 Status::Warn,
             )]
         } else {
             vec![(
                 "config".into(),
-                format!("{} does not exist ({})", path.display(), origin.describe()),
+                format!("{} does not exist ({})", crate::ui::short_path(path), origin.describe()),
                 Status::Fail,
             )]
         };
@@ -109,22 +170,43 @@ fn check_config(path: &Path, origin: startup::Origin) -> Vec<(String, String, St
 
     let combined = match crate::derive::read_config_file(path) {
         Ok(c) => c,
-        Err(e) => return vec![("config".into(), format!("{}: {e}", path.display()), Status::Fail)],
+        Err(e) => return vec![("config".into(), format!("{}: {e}", crate::ui::short_path(path)), Status::Fail)],
     };
     let worker = match crate::derive::derive_standalone(&combined) {
         Ok((_controller, _gateway, worker)) => worker,
         // `{:#}` so the chain reaches the line and column, which is the whole
         // value of being told the config is bad.
         Err(e) => {
-            return vec![("config".into(), format!("{}: {e:#}", path.display()), Status::Fail)];
+            return vec![("config".into(), format!("{}: {e:#}", crate::ui::short_path(path)), Status::Fail)];
         }
     };
 
     let mut out = vec![(
         "config".into(),
-        format!("{} parses", path.display()),
+        format!("{} parses", crate::ui::short_path(path)),
         Status::Pass,
     )];
+    // A parsing config that names a model pie cannot find is the next thing
+    // that stops a boot, and the check `pie check` could never make: the
+    // artifact store is on this disk, not in the file. `weights::resolve` is
+    // the same call the worker makes, so a pass here means the worker's will
+    // pass too.
+    match pie_worker::weights::resolve(&worker.model.model) {
+        Ok(resolved) => out.push((
+            "weights".into(),
+            match resolved {
+                pie_worker::weights::Model::Artifact(path) => {
+                    format!("artifact {}", crate::ui::short_path(&path))
+                }
+                pie_worker::weights::Model::Snapshot(path) => format!(
+                    "raw snapshot {} — `pie model import` makes an artifact",
+                    crate::ui::short_path(&path)
+                ),
+            },
+            Status::Pass,
+        )),
+        Err(error) => out.push(("weights".into(), format!("{error}"), Status::Fail)),
+    }
     // The check the old `pie check` could not make and `pie smoke` made in
     // isolation: the config names a driver, and this binary either has it or
     // does not.
@@ -162,23 +244,7 @@ enum Status {
     Fail,
 }
 
-fn print_check(key: &str, value: &str, status: Status) {
-    let glyph = match status {
-        Status::Pass => "✓",
-        Status::Warn => "!",
-        Status::Fail => "✗",
-    };
-    println!("  {glyph} {:<20} {}", key, value);
-}
 
-/// Only ever called for checks that cannot fail; the config section counts
-/// its own, because it is the only one that can block.
-fn tally(s: Status, passes: &mut usize, warnings: &mut usize) {
-    match s {
-        Status::Pass => *passes += 1,
-        Status::Warn | Status::Fail => *warnings += 1,
-    }
-}
 
 fn check_platform() -> (String, String, Status) {
     let info = format!(
@@ -188,6 +254,32 @@ fn check_platform() -> (String, String, Status) {
         std::env::consts::ARCH,
     );
     ("Platform".to_string(), info, Status::Pass)
+}
+
+/// Whether Python inferlets can run.
+///
+/// A warning rather than a failure, and it used to be `pie runtime status` --
+/// a top-level command for a question, next to `pie runtime install` for
+/// something `serve` already does on the way up. Both are gone: the answer
+/// belongs with the other "will this work here" answers, and the fix happens
+/// by itself.
+fn check_py_runtime() -> (String, String, Status) {
+    let dir = crate::ops::py_runtime::runtime_dir();
+    if crate::ops::py_runtime::is_installed() {
+        (
+            "python".to_string(),
+            format!("runtime at {}", crate::ui::short_path(&dir)),
+            Status::Pass,
+        )
+    } else {
+        (
+            "python".to_string(),
+            "runtime not installed — `pie serve` fetches it on the way up \
+             (Rust inferlets do not need it)"
+                .to_string(),
+            Status::Warn,
+        )
+    }
 }
 
 fn check_gpus() -> Vec<(String, String, Status)> {

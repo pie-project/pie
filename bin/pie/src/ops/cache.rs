@@ -9,10 +9,16 @@ use anyhow::{Result, anyhow, bail};
 use clap::Subcommand;
 use pie_worker::state::{self, Reclaim};
 
+use crate::ui::{self, Align, Mark, Palette, Row, Stream, Table};
+
 #[derive(Subcommand, Debug)]
 pub enum CacheCmd {
     /// Show what pie has written, where, and how much of it there is.
-    List,
+    List {
+        /// Emit one JSON document instead of the table.
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Delete what pie can rebuild. With no names, everything safe to lose.
     Clear {
@@ -27,42 +33,14 @@ pub enum CacheCmd {
 
 pub fn run(cmd: CacheCmd) -> Result<()> {
     match cmd {
-        CacheCmd::List => list(),
+        CacheCmd::List { json } => list(json),
         CacheCmd::Clear { names, yes } => clear(names, yes),
     }
 }
 
-/// Bytes as the largest binary unit that leaves a number worth reading.
-fn human(bytes: u64) -> String {
-    const UNITS: [(&str, u64); 4] = [
-        ("GiB", 1 << 30),
-        ("MiB", 1 << 20),
-        ("KiB", 1 << 10),
-        ("B", 1),
-    ];
-    for (suffix, scale) in UNITS {
-        if bytes >= scale {
-            let value = bytes as f64 / scale as f64;
-            return if scale == 1 || value >= 100.0 {
-                format!("{value:.0}{suffix}")
-            } else {
-                format!("{value:.1}{suffix}")
-            };
-        }
-    }
-    "0B".to_string()
-}
-
-fn list() -> Result<()> {
-    let entries = state::entries();
+fn list(json: bool) -> Result<()> {
+    let entries = state::entries(Some(hf_hub::resolve_cache_dir()));
     let home = pie_worker::paths::pie_home();
-
-    let colorize = std::io::stdout().is_terminal();
-    let (dim, bold, reset) = if colorize {
-        ("\x1b[2m", "\x1b[1m", "\x1b[0m")
-    } else {
-        ("", "", "")
-    };
 
     // Measured once and reused: the size is what decides whether a row is
     // worth a person's attention, and walking a weight-sized tree twice to
@@ -80,41 +58,6 @@ fn list() -> Result<()> {
         })
         .collect();
 
-    let name_width = measured
-        .iter()
-        .map(|(entry, _, _)| entry.name.len())
-        .max()
-        .unwrap_or(0);
-
-    println!("{bold}{}{reset}", home.display());
-    for (entry, exists, size) in &measured {
-        let relative = entry
-            .path
-            .strip_prefix(&home)
-            .unwrap_or(&entry.path)
-            .display()
-            .to_string();
-        // An absent entry is reported rather than hidden: "pie has not written
-        // this yet" and "pie does not know about this" are different answers,
-        // and only the listing can tell them apart.
-        let size_text = if *exists {
-            human(*size)
-        } else {
-            "—".to_string()
-        };
-        let note = match entry.reclaim {
-            Reclaim::Safe => "",
-            Reclaim::OnRequest => " (kept unless asked)",
-            Reclaim::Never => " (never reclaimed)",
-        };
-        println!(
-            "  {:<name_width$}  {:>8}  {dim}{relative}{note}{reset}",
-            entry.name,
-            size_text,
-            name_width = name_width,
-        );
-    }
-
     let reclaimable: u64 = measured
         .iter()
         .filter(|(entry, _, _)| entry.reclaim == Reclaim::Safe)
@@ -125,12 +68,73 @@ fn list() -> Result<()> {
         .filter(|(entry, _, _)| entry.reclaim == Reclaim::OnRequest)
         .map(|(_, _, size)| *size)
         .sum();
+
+    if json {
+        return ui::emit_json(&serde_json::json!({
+            "home": home,
+            "entries": measured
+                .iter()
+                .map(|(entry, exists, size)| serde_json::json!({
+                    "name": entry.name,
+                    "path": entry.path,
+                    "what": entry.what,
+                    // The word the CLI uses, not the enum's Rust spelling: a
+                    // consumer should be able to pass it back to `clear`.
+                    "reclaim": match entry.reclaim {
+                        Reclaim::Safe => "safe",
+                        Reclaim::OnRequest => "on-request",
+                        Reclaim::Never => "never",
+                    },
+                    "exists": exists,
+                    "bytes": size,
+                }))
+                .collect::<Vec<_>>(),
+            "reclaimable_bytes": reclaimable,
+            "on_request_bytes": on_request,
+        }));
+    }
+
+    let palette = Palette::for_stream(Stream::Stdout);
+    let (dim, bold, reset) = (palette.dim(), palette.bold(), palette.reset());
+
+    println!("{dim}pie writes under{reset} {bold}{}{reset}", ui::short_path(&home));
+    let mut table = Table::new([Align::Left, Align::Right, Align::Left], 2);
+    for (entry, exists, size) in &measured {
+        // An absent entry is reported rather than hidden: "pie has not written
+        // this yet" and "pie does not know about this" are different answers,
+        // and only the listing can tell them apart.
+        let mark = if *exists { Mark::Plain } else { Mark::Absent };
+        let note = match entry.reclaim {
+            Reclaim::Safe => "",
+            Reclaim::OnRequest => "kept unless asked",
+            Reclaim::Never => "never reclaimed",
+        };
+        table.push(Row::new(
+            mark,
+            [
+                entry.name.to_string(),
+                if *exists { ui::bytes(*size) } else { String::new() },
+                // The name already says which directory this is -- five of the
+                // nine rows repeated the same word -- so the note column
+                // carries what deleting it costs instead.
+                note.to_string(),
+            ],
+        ));
+    }
+    table.print(&palette);
+
     println!();
-    println!(
-        "  {} reclaimable, {} more if asked",
-        human(reclaimable),
-        human(on_request)
-    );
+    if reclaimable == 0 && on_request == 0 {
+        // "0B reclaimable, 0B more if asked" reads as a failure to find
+        // something rather than as there being nothing to reclaim.
+        println!("  nothing to reclaim");
+    } else {
+        println!(
+            "  {} reclaimable, {} more if asked",
+            ui::bytes(reclaimable),
+            ui::bytes(on_request)
+        );
+    }
     Ok(())
 }
 
@@ -141,7 +145,7 @@ fn list() -> Result<()> {
 /// flag that sweeps them in -- a single character should not stand between a
 /// person and deleting weight-sized artifacts.
 fn selected(names: &[String]) -> Result<Vec<state::Entry>> {
-    let all = state::entries();
+    let all = state::entries(Some(hf_hub::resolve_cache_dir()));
     if names.is_empty() {
         return Ok(all
             .into_iter()
@@ -159,7 +163,10 @@ fn selected(names: &[String]) -> Result<Vec<state::Entry>> {
             })?
             .clone();
         if entry.reclaim == Reclaim::Never {
-            bail!("{name} is authored, not derived, and is never cleared");
+            bail!(
+                "{name} is authored, not derived, and is never cleared; \
+                 delete it yourself if you mean to"
+            );
         }
         chosen.push(entry);
     }
@@ -184,7 +191,7 @@ fn clear(names: Vec<String>, skip_confirm: bool) -> Result<()> {
 
     let total: u64 = present.iter().map(|(_, size)| *size).sum();
     for (entry, size) in &present {
-        println!("  {:<12} {:>8}  {}", entry.name, human(*size), entry.path.display());
+        println!("  {:<12} {:>8}  {}", entry.name, ui::bytes(*size), entry.path.display());
     }
     println!();
 
@@ -194,7 +201,7 @@ fn clear(names: Vec<String>, skip_confirm: bool) -> Result<()> {
         if !std::io::stdin().is_terminal() {
             bail!("clear requires confirmation; rerun with `pie cache clear --yes`");
         }
-        eprint!("Delete {} from {} entries? [y/N] ", human(total), present.len());
+        eprint!("Delete {} from {} entries? [y/N] ", ui::bytes(total), present.len());
         let _ = std::io::stderr().flush();
         let mut answer = String::new();
         std::io::stdin()
@@ -220,7 +227,7 @@ fn clear(names: Vec<String>, skip_confirm: bool) -> Result<()> {
             Err(error) => eprintln!("  ! {}: {error}", entry.path.display()),
         }
     }
-    println!("freed {}", human(freed));
+    println!("freed {}", ui::bytes(freed));
     Ok(())
 }
 
@@ -235,7 +242,7 @@ mod tests {
         assert!(chosen.iter().all(|e| e.reclaim == Reclaim::Safe));
         // The expensive ones are reachable only by name. This is the whole
         // reason there is no --all.
-        assert!(chosen.iter().all(|e| e.name != "optimized"));
+        assert!(chosen.iter().all(|e| e.name != "models"));
     }
 
     #[test]
@@ -253,18 +260,33 @@ mod tests {
 
     #[test]
     fn naming_an_on_request_entry_selects_it() {
-        let chosen = selected(&["optimized".to_string()]).unwrap();
+        // `models` is the artifact store: reclaimable, but a re-download and a
+        // re-convert rather than a reload, which is why it takes naming.
+        let chosen = selected(&["models".to_string()]).unwrap();
         assert_eq!(chosen.len(), 1);
         assert_eq!(chosen[0].reclaim, Reclaim::OnRequest);
     }
 
     #[test]
+    fn the_store_and_the_weight_cache_are_different_entries() {
+        // They shared `$PIE_HOME/models` until the artifact store took it: the
+        // store scans for `.zt` and silently ignored the `.weights` files
+        // beside them, while `pie cache` reported their size under the store's
+        // name. Different directories, different reclaim grades.
+        let all = state::entries(None);
+        let by = |n: &str| all.iter().find(|e| e.name == n).unwrap_or_else(|| panic!("no {n}"));
+        assert_ne!(by("models").path, by("weights").path);
+        assert_eq!(by("models").reclaim, Reclaim::OnRequest);
+        assert_eq!(by("weights").reclaim, Reclaim::Safe);
+    }
+
+    #[test]
     fn sizes_read_as_the_unit_a_person_would_use() {
-        assert_eq!(human(0), "0B");
-        assert_eq!(human(512), "512B");
-        assert_eq!(human(1 << 10), "1.0KiB");
-        assert_eq!(human(3 << 30), "3.0GiB");
+        assert_eq!(ui::bytes(0), "0B");
+        assert_eq!(ui::bytes(512), "512B");
+        assert_eq!(ui::bytes(1 << 10), "1.0KiB");
+        assert_eq!(ui::bytes(3 << 30), "3.0GiB");
         // Past three digits the fraction is noise.
-        assert_eq!(human(200 << 20), "200MiB");
+        assert_eq!(ui::bytes(200 << 20), "200MiB");
     }
 }

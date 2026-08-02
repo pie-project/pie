@@ -202,6 +202,28 @@ fn path_string(path: &Path) -> String {
     path.display().to_string()
 }
 
+/// Writes an artifact's compiled model config beside the startup TOML and
+/// names it in `[model]`.
+///
+/// Beside rather than inlined: the driver already takes a path, and opening a
+/// second one is less machinery than teaching TOML to carry a JSON document.
+/// Absent for a legacy snapshot, which is exactly the case the drivers'
+/// `config.json` fallback still exists for.
+fn write_descriptor_beside(
+    out_path: &Path,
+    descriptor: Option<&[u8]>,
+    model: &mut toml::Table,
+) -> Result<()> {
+    let Some(descriptor) = descriptor else {
+        return Ok(());
+    };
+    let beside = out_path.with_file_name("model.descriptor.json");
+    std::fs::write(&beside, descriptor)
+        .with_context(|| format!("write model descriptor {beside:?}"))?;
+    insert_str(model, "descriptor", path_string(&beside));
+    Ok(())
+}
+
 fn write_toml_table(out_path: &Path, doc: toml::Table) -> Result<()> {
     let serialized = toml::to_string(&doc).map_err(|e| anyhow!("serialize startup TOML: {e}"))?;
     if let Some(parent) = out_path.parent() {
@@ -360,11 +382,14 @@ pub fn write_metal_startup_toml(
     options: &MetalDriverOptions,
     snapshot_dir: &Path,
     _group_id: usize,
+    descriptor: Option<&[u8]>,
 ) -> Result<()> {
     let mut doc = toml::Table::new();
 
     let mut model = toml::Table::new();
     insert_str(&mut model, "hf_path", path_string(snapshot_dir));
+    // Same arrangement as the CUDA driver.
+    write_descriptor_beside(out_path, descriptor, &mut model)?;
     insert_str(&mut model, "backend", &options.device);
     insert_bool(
         &mut model,
@@ -438,12 +463,14 @@ pub(crate) fn write_cuda_startup_toml(
     snapshot_dir: &Path,
     _group_id: usize,
     tp: Option<&TpLaunch>,
+    descriptor: Option<&[u8]>,
 ) -> Result<()> {
     let mut doc = toml::Table::new();
 
     let mut model = toml::Table::new();
     insert_str(&mut model, "snapshot_dir", path_string(snapshot_dir));
     insert_str(&mut model, "weight_cache_dir", weight_cache_dir());
+    write_descriptor_beside(out_path, descriptor, &mut model)?;
     insert_str(&mut model, "device", &opts.device);
     insert_str(&mut model, "dtype", opts.weight_dtype.clone());
     insert_int(&mut model, "mtp_num_drafts", opts.mtp_num_drafts);
@@ -491,7 +518,7 @@ pub(crate) fn write_cuda_startup_toml(
         insert_int(&mut batching, "kv_page_size", size);
     }
     insert_int(&mut batching, "swap_pool_size", opts.swap_pool_size);
-    if let Some(pages) = opts.total_pages {
+    if let Some(pages) = opts.max_total_pages {
         insert_int(&mut batching, "total_pages", pages);
     }
     insert_str(&mut batching, "kv_cache_dtype", opts.kv_cache_dtype.clone());
@@ -592,29 +619,31 @@ fn dummy_native_options(
     })
 }
 
+/// What a driver may be pointed at: a `.zt` artifact, or a snapshot directory.
+///
+/// The GGUF refusal that used to live here is gone with the reason for it.
+/// It existed because the LoadPlan executors could not decode GGUF's blocked
+/// schemes at load time — but `pie model import` decodes them now,
+/// so what reaches a driver is a `.zt` either way and there is no format left
+/// to refuse. A `.gguf` handed straight to `serve` still fails, one step later
+/// and with a better message: convert it first.
 fn validate_snapshot_dir(snapshot_dir: &Path) -> Result<()> {
-    let is_gguf_file = snapshot_dir.is_file()
-        && snapshot_dir
-            .extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"));
-    if is_gguf_file {
-        return Err(anyhow!(
-            "GGUF model loading is deferred by the LoadPlan executors; \
-             use a Hugging Face safetensors snapshot directory"
-        ));
+    if snapshot_dir.is_dir()
+        || (snapshot_dir.is_file() && crate::weights::is_artifact_path(snapshot_dir))
+    {
+        return Ok(());
     }
-    if !snapshot_dir.is_dir() {
-        return Err(anyhow!(
-            "snapshot_dir {snapshot_dir:?} does not exist or is not a directory"
-        ));
-    }
-    Ok(())
+    Err(anyhow!(
+        "model {snapshot_dir:?} is neither a .zt artifact nor a snapshot directory; \
+         `pie model import` writes the former"
+    ))
 }
 
 #[cfg(feature = "driver-cuda")]
 pub(crate) fn create_driver_backend_group(
     rank_options: &[DriverOptions],
     snapshot_dir: &Path,
+    descriptor: Option<&[u8]>,
     group_id: usize,
     tp_launches: &[TpLaunch],
     component: pie_driver_abi::ModelComponent,
@@ -646,7 +675,7 @@ pub(crate) fn create_driver_backend_group(
         }
         let state_dir = local_driver_state_dir(group_id, Some(tp))?;
         let toml_path = state_dir.join("driver.toml");
-        write_cuda_startup_toml(&toml_path, opts, snapshot_dir, group_id, Some(tp))?;
+        write_cuda_startup_toml(&toml_path, opts, snapshot_dir, group_id, Some(tp), descriptor)?;
         config_blobs.push(toml_path.to_string_lossy().into_owned().into_bytes());
     }
 
@@ -682,11 +711,13 @@ pub(crate) fn create_driver_backend_group(
 pub(crate) fn create_driver_backend(
     options: &DriverOptions,
     snapshot_dir: &Path,
+    descriptor: Option<&[u8]>,
     group_id: usize,
     tp: Option<&TpLaunch>,
     component: pie_driver_abi::ModelComponent,
 ) -> Result<crate::translate::GroupDriver> {
-    let _ = (group_id, tp);
+    // Each is used only inside a `#[cfg(feature = "driver-…")]` arm below.
+    let _ = (group_id, tp, descriptor);
     validate_snapshot_dir(snapshot_dir)?;
 
     let (mut backend, runtime_quant, mxfp4_moe) = match options {
@@ -700,7 +731,7 @@ pub(crate) fn create_driver_backend(
             }
             let state_dir = local_driver_state_dir(group_id, tp)?;
             let toml_path = state_dir.join("driver.toml");
-            write_cuda_startup_toml(&toml_path, opts, snapshot_dir, group_id, tp)?;
+            write_cuda_startup_toml(&toml_path, opts, snapshot_dir, group_id, tp, descriptor)?;
             let config_path = toml_path.to_string_lossy();
             let (backend, _facts) =
                 pie_engine::driver::DriverBackend::cuda_create(config_path.as_bytes())?;
@@ -714,7 +745,7 @@ pub(crate) fn create_driver_backend(
         DriverOptions::Metal(opts) => {
             let state_dir = local_driver_state_dir(group_id, tp)?;
             let toml_path = state_dir.join("driver.toml");
-            write_metal_startup_toml(&toml_path, opts, snapshot_dir, group_id)?;
+            write_metal_startup_toml(&toml_path, opts, snapshot_dir, group_id, descriptor)?;
             let config_path = toml_path.to_string_lossy();
             let (backend, _facts) =
                 pie_engine::driver::DriverBackend::metal_create(config_path.as_bytes())?;
@@ -805,6 +836,7 @@ mod tests {
                 activation_dtype: "f32".to_string(),
             },
             &snapshot,
+            None,
             0,
             None,
             pie_driver_abi::ModelComponent::Full,
@@ -831,6 +863,8 @@ mod tests {
         let mut group = create_driver_backend(
             &options,
             &snapshot,
+            // A test snapshot, not an artifact: no compiled descriptor.
+            None,
             0,
             None,
             pie_driver_abi::ModelComponent::Encode,
@@ -1001,6 +1035,7 @@ mod tests {
         let mut full = create_driver_backend(
             &full_options,
             &snapshot,
+            None,
             1,
             None,
             pie_driver_abi::ModelComponent::Full,
@@ -1025,13 +1060,35 @@ mod tests {
         assert_eq!(inline_audio.output_rows, tower_audio_rows);
     }
 
+    /// What a driver may be handed: an artifact, or a snapshot directory.
+    ///
+    /// This used to pin a GGUF-specific refusal, which existed because the
+    /// LoadPlan executors could not decode GGUF's blocked schemes at load
+    /// time. `pie model import` decodes them now, so a served model
+    /// is a `.zt` whatever it started as, and the refusal has nothing left to
+    /// name. A `.gguf` handed straight to `serve` is still rejected — as one
+    /// of the things that is not an artifact, with the fix in the message.
     #[test]
-    fn gguf_boot_is_rejected_before_compilation() {
+    fn a_driver_takes_an_artifact_or_a_snapshot_and_nothing_else() {
         let tmp = tempfile::tempdir().unwrap();
+
+        let artifact = tmp.path().join("model.zt");
+        std::fs::write(&artifact, b"stand-in").unwrap();
+        validate_snapshot_dir(&artifact).unwrap();
+
+        let snapshot = tmp.path().join("snap");
+        std::fs::create_dir(&snapshot).unwrap();
+        validate_snapshot_dir(&snapshot).unwrap();
+
         let gguf = tmp.path().join("model.gguf");
         std::fs::write(&gguf, b"GGUF").unwrap();
         let error = validate_snapshot_dir(&gguf).unwrap_err().to_string();
-        assert!(error.contains("GGUF model loading is deferred"));
+        assert!(error.contains("pie model import"), "{error}");
+
+        let error = validate_snapshot_dir(&tmp.path().join("nope"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("neither a .zt artifact"), "{error}");
     }
 
     #[cfg(feature = "driver-cuda")]
@@ -1068,7 +1125,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("driver.toml");
         let snap = dir.path().join("snapshot");
-        write_cuda_startup_toml(&out, &CudaNativeDriverOptions::default(), &snap, 0, None)
+        write_cuda_startup_toml(&out, &CudaNativeDriverOptions::default(), &snap, 0, None, None)
             .unwrap();
         let val: toml::Value = toml::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
         assert_eq!(val["cache"]["dir"].as_str().unwrap(), "/pie-home/cache");
@@ -1111,7 +1168,7 @@ mod tests {
         let mut opts = CudaNativeDriverOptions::default();
         opts.device = "cuda:0".to_string();
 
-        write_cuda_startup_toml(&out, &opts, &snap, 0, None).unwrap();
+        write_cuda_startup_toml(&out, &opts, &snap, 0, None, None).unwrap();
 
         // Re-parse the emitted TOML to confirm the schema the cuda
         // driver expects matches what we wrote (driver-side parsing
@@ -1119,7 +1176,7 @@ mod tests {
         let text = std::fs::read_to_string(&out).unwrap();
         let val: toml::Value = toml::from_str(&text).unwrap();
         assert!(
-            val["model"].get("hf_repo").is_none(),
+            val["model"].get("model").is_none(),
             "cuda derives from snapshot_dir"
         );
         assert_eq!(
@@ -1169,7 +1226,7 @@ mod tests {
         let mut off = MetalDriverOptions::default();
         off.device = "metal:0".to_string();
         let out_off = tmp.path().join("off.toml");
-        write_metal_startup_toml(&out_off, &off, &snap, 0).unwrap();
+        write_metal_startup_toml(&out_off, &off, &snap, 0, None).unwrap();
         let val: toml::Value = toml::from_str(&std::fs::read_to_string(&out_off).unwrap()).unwrap();
         assert_eq!(val["model"]["backend"].as_str().unwrap(), "metal:0");
         assert_eq!(
@@ -1183,7 +1240,7 @@ mod tests {
         on.device = "metal:0".to_string();
         on.stream_routed_experts = true;
         let out_on = tmp.path().join("on.toml");
-        write_metal_startup_toml(&out_on, &on, &snap, 0).unwrap();
+        write_metal_startup_toml(&out_on, &on, &snap, 0, None).unwrap();
         let val: toml::Value = toml::from_str(&std::fs::read_to_string(&out_on).unwrap()).unwrap();
         assert_eq!(
             val["model"]["stream_routed_experts"].as_bool().unwrap(),
@@ -1217,7 +1274,7 @@ mod tests {
         opts.device = "cuda:0".to_string();
         opts.verbose = true;
 
-        write_cuda_startup_toml(&out, &opts, &snap, 0, None).unwrap();
+        write_cuda_startup_toml(&out, &opts, &snap, 0, None, None).unwrap();
 
         let text = std::fs::read_to_string(&out).unwrap();
         let val: toml::Value = toml::from_str(&text).unwrap();
@@ -1233,7 +1290,7 @@ mod tests {
         opts.device = "cuda:1".to_string();
         opts.runtime_quant = "fp8".to_string();
 
-        write_cuda_startup_toml(&out, &opts, &snap, 3, None).unwrap();
+        write_cuda_startup_toml(&out, &opts, &snap, 3, None, None).unwrap();
 
         let text = std::fs::read_to_string(&out).unwrap();
         let val: toml::Value = toml::from_str(&text).unwrap();
@@ -1250,7 +1307,7 @@ mod tests {
         opts.device = "cuda:0".to_string();
         opts.mxfp4_moe = "bf16".to_string();
 
-        write_cuda_startup_toml(&out, &opts, &snap, 0, None).unwrap();
+        write_cuda_startup_toml(&out, &opts, &snap, 0, None, None).unwrap();
 
         let text = std::fs::read_to_string(&out).unwrap();
         let val: toml::Value = toml::from_str(&text).unwrap();
@@ -1270,7 +1327,7 @@ mod tests {
             nccl_unique_id_hex: "abcd".to_string(),
         };
 
-        write_cuda_startup_toml(&out, &opts, &snap, 4, Some(&tp)).unwrap();
+        write_cuda_startup_toml(&out, &opts, &snap, 4, Some(&tp), None).unwrap();
 
         let text = std::fs::read_to_string(&out).unwrap();
         let val: toml::Value = toml::from_str(&text).unwrap();
@@ -1283,6 +1340,63 @@ mod tests {
         assert!(
             val["distributed"].get("startup_barrier_path").is_none(),
             "startup_barrier_path no longer emitted (replaced by in-process std::barrier)"
+        );
+    }
+
+    /// The compiled model config travels beside the startup TOML when there is
+    /// one, and the key is absent when there is not.
+    ///
+    /// Both drivers take the same arrangement, so both are pinned here. The
+    /// writer takes the descriptor as an argument rather than deriving it from
+    /// the path — lifting it is the resolver's job, done once — so this test
+    /// is about the *contract*, not about where the bytes came from.
+    #[test]
+    fn the_startup_toml_carries_a_descriptor_only_when_there_is_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = dir.path().join("snap");
+        std::fs::create_dir(&snapshot).unwrap();
+        let body = br#"{"version":"pie.model/1","hidden_size":64}"#;
+
+        let cuda = CudaNativeDriverOptions::default();
+        let metal = MetalDriverOptions::default();
+
+        let carried = |name: &str, write: &dyn Fn(&Path)| -> Option<Vec<u8>> {
+            let out = dir.path().join(name).join("driver.toml");
+            std::fs::create_dir_all(out.parent().unwrap()).unwrap();
+            write(&out);
+            let doc: toml::Value = toml::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+            doc["model"]
+                .get("descriptor")
+                .and_then(|v| v.as_str())
+                .map(|path| std::fs::read(path).unwrap())
+        };
+
+        assert_eq!(
+            carried("cuda-artifact", &|out| {
+                write_cuda_startup_toml(out, &cuda, &snapshot, 0, None, Some(body)).unwrap()
+            })
+            .as_deref(),
+            Some(body.as_slice())
+        );
+        assert_eq!(
+            carried("metal-artifact", &|out| {
+                write_metal_startup_toml(out, &metal, &snapshot, 0, Some(body)).unwrap()
+            })
+            .as_deref(),
+            Some(body.as_slice())
+        );
+        assert!(
+            carried("cuda-legacy", &|out| {
+                write_cuda_startup_toml(out, &cuda, &snapshot, 0, None, None).unwrap()
+            })
+            .is_none(),
+            "a snapshot has no compiled descriptor to point at"
+        );
+        assert!(
+            carried("metal-legacy", &|out| {
+                write_metal_startup_toml(out, &metal, &snapshot, 0, None).unwrap()
+            })
+            .is_none()
         );
     }
 }

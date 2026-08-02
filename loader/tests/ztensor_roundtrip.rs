@@ -202,8 +202,9 @@ fn a_sharded_root_addresses_bytes_in_its_shards() {
             payload.clone(),
         )],
     );
-    let identity = ztensor::shard_identity(&shard_path).unwrap();
-    let shard_object = ztensor::validate::manifest_of(&shard_path)
+    let identity =
+        ztensor::read::shard_identity(&shard_path, ztensor::DigestAlgorithm::Xxh3).unwrap();
+    let shard_object = ztensor::read::manifest_of(&shard_path)
         .unwrap()
         .expect("the shard has a manifest")
         .object("embed.weight")

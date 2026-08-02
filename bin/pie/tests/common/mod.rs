@@ -100,25 +100,28 @@ pub fn cuda_standalone_toml_capped(
         .and_then(|s| s.parse().ok())
         .unwrap_or(512);
     format!(
-        "[controller]\n\
+        "         [server]\n\
+         port = 0\n\
          \n\
-         [gateway]\n\
-         listen = \"127.0.0.1:0\"\n\
-         \n\
-         [worker]\n\
-         \n\
-         [worker.model]\n\
+         [model]\n\
          name = \"qwen3\"\n\
-         hf_repo = \"{hf_repo}\"\n\
+         model = \"{hf_repo}\"\n\
          \n\
-         [worker.model.driver]\n\
+         [driver]\n\
          type = \"cuda_native\"\n\
          device = [\"cuda:0\"]\n\
          \n\
-         [worker.model.driver.options]\n\
          gpu_mem_utilization = {gpu_mem_utilization}\n\
-         total_pages = {total_pages}\n\
-         swap_pool_size = {swap_pool_size}\n"
+         {cap}\
+         swap_pool_size = {swap_pool_size}\n",
+        // Omitted rather than zeroed: `0 = derive` was retired when the
+        // sentinels went, and `max_total_pages` is an Option now -- absence IS
+        // the request to derive from gpu_mem_utilization.
+        cap = if total_pages > 0 {
+            format!("         max_total_pages = {total_pages}\n")
+        } else {
+            String::new()
+        }
     )
 }
 
@@ -131,7 +134,7 @@ pub async fn boot_4090() -> Result<pie_bin::StandaloneHandle> {
     run_standalone(controller, gateway, worker).await
 }
 
-/// [`boot_4090`] at an explicit `[model.scheduler] frame_dispatch_depth` — the
+/// [`boot_4090`] at an explicit `[runtime] frame_dispatch_depth` — the
 /// engine's enqueue horizon in frames. `cuda_deep_coverify` needs the engine's
 /// depth to MATCH the chain depth its carrier submits, and config is the only
 /// way to say so: the depth used to be an env var the engine silently clamped,
@@ -139,7 +142,7 @@ pub async fn boot_4090() -> Result<pie_bin::StandaloneHandle> {
 pub async fn boot_4090_dispatch_depth(depth: u32) -> Result<pie_bin::StandaloneHandle> {
     let snapshot = resolve_qwen3_snapshot()?;
     let toml = format!(
-        "{}\n[worker.model.scheduler]\nframe_dispatch_depth = {depth}\n",
+        "{}\n[runtime]\nframe_dispatch_depth = {depth}\n",
         cuda_standalone_toml(&snapshot)
     );
     let (controller, gateway, worker) = derive_standalone(&toml)?;
@@ -220,22 +223,17 @@ pub fn resolve_qwen35_snapshot() -> Result<String> {
 /// than being pinned to the dense `qwen3` path.
 pub fn cuda_mtp_standalone_toml(hf_repo: &str, mtp_num_drafts: u32) -> String {
     format!(
-        "[controller]\n\
+        "         [server]\n\
+         port = 0\n\
          \n\
-         [gateway]\n\
-         listen = \"127.0.0.1:0\"\n\
-         \n\
-         [worker]\n\
-         \n\
-         [worker.model]\n\
+         [model]\n\
          name = \"default\"\n\
-         hf_repo = \"{hf_repo}\"\n\
+         model = \"{hf_repo}\"\n\
          \n\
-         [worker.model.driver]\n\
+         [driver]\n\
          type = \"cuda_native\"\n\
          device = [\"cuda:0\"]\n\
          \n\
-         [worker.model.driver.options]\n\
          gpu_mem_utilization = 0.85\n\
          mtp_num_drafts = {mtp_num_drafts}\n"
     )
@@ -272,22 +270,17 @@ pub fn mtp_draft_tokens(default_k: u32) -> u32 {
 /// the snapshot for the tokenizer the runtime registers.
 pub fn dummy_standalone_toml(hf_repo: &str) -> String {
     format!(
-        "[controller]\n\
+        "         [server]\n\
+         port = 0\n\
          \n\
-         [gateway]\n\
-         listen = \"127.0.0.1:0\"\n\
-         \n\
-         [worker]\n\
-         \n\
-         [worker.model]\n\
+         [model]\n\
          name = \"qwen3\"\n\
-         hf_repo = \"{hf_repo}\"\n\
+         model = \"{hf_repo}\"\n\
          \n\
-         [worker.model.driver]\n\
+         [driver]\n\
          type = \"dummy\"\n\
          device = [\"cpu\"]\n\
          \n\
-         [worker.model.driver.options]\n\
          vocab_size = 151936\n\
          arch_name = \"qwen3\"\n"
     )

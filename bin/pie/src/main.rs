@@ -10,7 +10,7 @@
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use pie_bin::{compose, derive, ops};
+use pie_bin::{compose, derive, ops, ui};
 /// Top-level `pie` invocation. The shared global flags (`--config`,
 /// `--log-level`, `--metrics-addr`) are flattened from `startup`.
 #[derive(Parser, Debug)]
@@ -32,16 +32,10 @@ enum Command {
     /// Boot the engine. Binds `server.host`, which is loopback by default.
     Serve,
 
-    /// Manage HuggingFace-cached models (list / download / remove / optimize).
+    /// The models pie serves (list / info / import / remove).
     Model {
         #[command(subcommand)]
         cmd: ops::model::ModelCmd,
-    },
-
-    /// Manage the embedded Python-WASM runtime (install / status).
-    Runtime {
-        #[command(subcommand)]
-        cmd: RuntimeCmd,
     },
 
     /// What pie has written under `$PIE_HOME` (list / clear).
@@ -50,7 +44,7 @@ enum Command {
         cmd: ops::cache::CacheCmd,
     },
 
-    /// Manage configuration (list / show / set / unset / init).
+    /// Manage configuration (list / show / set / unset / edit / init).
     Config {
         #[command(subcommand)]
         cmd: ops::config::ConfigCmd,
@@ -63,21 +57,69 @@ enum Command {
     },
 
     /// Will pie run here, and with this config? Exits non-zero if not.
-    Doctor,
+    Doctor {
+        /// Emit one JSON document instead of the report.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
-/// `pie runtime` — provision the embedded Python-WASM runtime. The download IO
-/// lives here (R3), never in the worker daemon.
-#[derive(Subcommand, Debug)]
-enum RuntimeCmd {
-    /// Download + install the runtime into the local cache (idempotent).
-    Install,
-    /// Report whether the runtime is installed and where.
-    Status,
+/// Die quietly when a reader goes away, the way every other CLI does.
+///
+/// Rust masks SIGPIPE at startup, so a `println!` into a closed pipe returns
+/// EPIPE, and `println!` panics on a write error. `pie config list | head` was
+/// therefore printing a panic and exiting non-zero -- for doing exactly what
+/// `head` asks of it. Restoring the default disposition turns that back into
+/// the signal it is.
+#[cfg(unix)]
+fn die_quietly_on_closed_pipe() {
+    // SAFETY: setting a signal disposition to SIG_DFL before any threads that
+    // could observe a different one. This is the documented workaround for
+    // rust-lang/rust#62569.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn die_quietly_on_closed_pipe() {}
+
+/// Render a failure the way the rest of the CLI renders everything else.
+///
+/// anyhow's default is `Error: <context>` followed by a `Caused by:` list,
+/// which puts the least specific line first and in the one position a reader
+/// actually looks. `pie config set worker.server.port abc` led with "setting
+/// worker.server.port = \"abc\"" -- a restatement of the command -- and buried
+/// "invalid type: string" under a heading.
+///
+/// Same glyph vocabulary as everything else: `✗` is what blocks.
+fn report(error: &anyhow::Error) {
+    let palette = ui::Palette::for_stream(ui::Stream::Stderr);
+    eprintln!("{} {error}", ui::Mark::Blocked.render(&palette));
+    for cause in error.chain().skip(1) {
+        // Indented and dim: the chain is why, and the first line is what.
+        // Line by line, because a cause can be several -- a TOML parse error
+        // carries its own snippet, and letting those start at column 0 put the
+        // detail outside the block it belongs to.
+        for line in cause.to_string().lines() {
+            eprintln!("  {}{line}{}", palette.dim(), palette.reset());
+        }
+    }
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<ExitCode> {
+async fn main() -> ExitCode {
+    die_quietly_on_closed_pipe();
+    match run().await {
+        Ok(code) => code,
+        Err(error) => {
+            report(&error);
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
     match cli.command {
         Command::Serve => serve(cli.global).await,
@@ -89,31 +131,11 @@ async fn main() -> anyhow::Result<ExitCode> {
             tokio::task::spawn_blocking(move || ops::model::run(cmd)).await??;
             Ok(ExitCode::SUCCESS)
         }
-        Command::Runtime { cmd } => {
-            startup::init_cli(&cli.global)?;
-            match cmd {
-                RuntimeCmd::Install => {
-                    let dir =
-                        tokio::task::spawn_blocking(|| ops::py_runtime::ensure_installed(false))
-                            .await??;
-                    println!("runtime installed at {}", dir.display());
-                }
-                RuntimeCmd::Status => {
-                    let dir = ops::py_runtime::runtime_dir();
-                    if ops::py_runtime::is_installed() {
-                        println!("runtime installed at {}", dir.display());
-                    } else {
-                        println!("runtime not installed (expected at {})", dir.display());
-                    }
-                }
-            }
-            Ok(ExitCode::SUCCESS)
-        }
-        Command::Doctor => {
+        Command::Doctor { json } => {
             startup::init_cli(&cli.global)?;
             // The exit code IS the answer -- `pie doctor && pie serve` should
             // be a thing an operator can write.
-            Ok(match ops::doctor::doctor(&cli.global)? {
+            Ok(match ops::doctor::doctor(&cli.global, json)? {
                 true => ExitCode::SUCCESS,
                 false => ExitCode::FAILURE,
             })
@@ -125,6 +147,10 @@ async fn main() -> anyhow::Result<ExitCode> {
         }
         Command::Config { cmd } => {
             startup::init_cli(&cli.global)?;
+            // Not `spawn_blocking`: `config init` used to download the
+            // Python-WASM runtime through `reqwest::blocking`, which builds a
+            // tokio runtime and drops it inside this one. Writing a config file
+            // no longer reaches the network, so there is nothing to isolate.
             ops::config::run(cmd, &cli.global)?;
             Ok(ExitCode::SUCCESS)
         }

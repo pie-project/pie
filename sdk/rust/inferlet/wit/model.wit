@@ -14,20 +14,6 @@ interface model {
     // Whether the bound model enables system speculation by default
     default-system-speculation: func() -> bool;
 
-    // Whether the bound model is linear/recurrent — i.e. it carries a fused
-    // recurrent state that folds tokens IRREVERSIBLY (linear-attention / SSM:
-    // Qwen3.5 GDN, Nemotron-H Mamba2), as opposed to pure attention whose KV is
-    // per-token and reversibly discardable. TRUE iff the model has recurrent
-    // state (equivalently `rs-state-size() > 0`). The runtime uses this to pick
-    // the speculative-commit strategy — FOLD-COMMIT (fold only the accepted
-    // prefix, holding the uncertain tail in the RS buffer; folding is
-    // runtime-managed in-forward) for linear models vs KV-SLOT DISCARD for
-    // attention — so the inferlet's spec-decode loop can stay model-agnostic.
-    // Prefer this over
-    // reading `rs-state-size()` as a class flag: this pins the commit CONTRACT
-    // (irreversible fold ⇒ fold-commit), not a byte-accounting accident.
-    is-linear: func() -> bool;
-
     // Which forward-pass kind the bound model requires. A guest may only
     // construct the `forward-pass` of the matching interface; the other
     // interfaces' constructors error immediately.
@@ -36,9 +22,16 @@ interface model {
     // every new model family would break guests. This enum is closed over
     // STATE SEMANTICS, so it does not grow with the model zoo.
     //
-    // Relationship to `is-linear`: `is-linear()` == (`pass-kind()` !=
-    // attention). `is-linear` remains as the commit-policy hint (irreversible
-    // fold ⇒ FOLD-COMMIT); `pass-kind` is what selects the binding surface.
+    // This is also the ONE place the linear/recurrent class is asked about.
+    // `!= attention` means the model carries a fused recurrent state that
+    // folds tokens IRREVERSIBLY (linear-attention / SSM: Qwen3.5 GDN,
+    // Nemotron-H Mamba2), as opposed to pure attention whose KV is per-token
+    // and reversibly discardable. That in turn pins the speculative-commit
+    // CONTRACT — FOLD-COMMIT (fold only the accepted prefix, holding the
+    // uncertain tail in the RS buffer; folding is runtime-managed in-forward)
+    // vs KV-SLOT DISCARD — so a spec-decode loop can stay model-agnostic.
+    // Do not re-derive the class from `rs-state-size() > 0`: that is a
+    // byte-accounting accident that happens to agree.
     enum forward-kind {
         // Per-token, reversibly discardable KV only  -> `forward`
         attention,

@@ -301,6 +301,10 @@ struct Facts {
     bool double_wide_mlp = true;
     float final_softcap = 30.0f;
     float rope_theta_full = 1.0e6f, rope_theta_sliding = 1.0e4f, full_partial_rotary = 0.25f;
+    bool enable_moe = false;
+    int n_experts = 0, experts_per_token = 0, moe_intermediate = 0;
+    bool attention_k_eq_v = false;
+    int n_global_kv_heads = 0;
     bool present() const { return n_layers > 0 && hidden > 0; }
 };
 

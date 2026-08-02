@@ -850,7 +850,7 @@ std::unique_ptr<M1Runtime> M1Runtime::create(
     // no filesystem include lookup, so we splice it in ourselves later.
     const std::filesystem::path rng_path =
         std::filesystem::path(kernels_dir) / "ptir_rng.generated.metal";
-    if (!read_ptir_msl_source(
+    if (!read_metal_source(
             rng_path.string(), impl->ptir_rng_preamble, &error) ||
         impl->ptir_rng_preamble.empty()) {
         return nullptr;

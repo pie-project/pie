@@ -15,20 +15,19 @@
 using namespace metal;
 
 // ── MXFP4 -> BF16 ────────────────────────────────────────────────────────────
+//
+// The format itself is in `mxfp4_codec.h`, which the decode matvec includes
+// too. It used to be written twice -- a table here and a table there -- and
+// the two copies are read on different paths: this one when the loader
+// dequantizes, that one when a kernel reads the published bytes. A drift
+// between them is a driver that is right about a checkpoint it converts and
+// wrong about the same checkpoint read as it shipped.
+#include "mxfp4_codec.h"
 
 struct DequantParams {
     uint blocks;      // E8M0 exponents, one per block
     uint block_size;  // elements per block
 };
-
-/// E2M1: sign, two exponent bits, one mantissa bit, with the zero-exponent
-/// denormal at +-0.5. A table rather than bit surgery because there are only
-/// sixteen of them and the table is what makes the values checkable by eye.
-inline float mxfp4_value(uchar code) {
-    const float magnitude[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
-    const float value = magnitude[code & 7];
-    return (code & 8) != 0 ? -value : value;
-}
 
 /// One thread per block. The block is 32 elements in gpt-oss, so this is 16
 /// bytes read and 64 written -- wide enough that per-thread setup disappears
@@ -41,14 +40,12 @@ kernel void mxfp4_dequant_bf16(
     uint gid [[thread_position_in_grid]]) {
     if (gid >= p.blocks) return;
     const uint pb = p.block_size;
-    const uchar exponent = exponents[gid];
-    // 0xff is E8M0's NaN; ldexp of anything else is exact.
-    const float factor = exponent == 0xff ? NAN : ldexp(1.0f, int(exponent) - 127);
+    const float factor = mxfp4_block_scale(exponents[gid]);
     const uint first = gid * pb;
     for (uint i = 0; i < pb; i += 2) {
         const uchar byte = payload[(first + i) / 2];
-        out[first + i] = bfloat(mxfp4_value(byte & 0xf) * factor);
-        out[first + i + 1] = bfloat(mxfp4_value(byte >> 4) * factor);
+        out[first + i] = bfloat(mxfp4_lo(byte) * factor);
+        out[first + i + 1] = bfloat(mxfp4_hi(byte) * factor);
     }
 }
 
@@ -68,14 +65,21 @@ struct EncodeParams {
 ///
 ///   * the scale is NEGATED unless the group's minimum is the larger in
 ///     magnitude, which puts code 0 on whichever end dominates;
-///   * the ENDPOINT is snapped, not the scale -- `scale = edge / rint(edge /
-///     scale)` -- which keeps the largest magnitude in the group exact.
+///   * the ENDPOINT is snapped, not the scale -- `scale = edge / round(edge /
+///     scale)` -- which keeps the largest magnitude in the group exact;
+///   * `w_max` starts at ZERO, so an all-negative group is quantized over the
+///     range up to zero rather than up to its own largest element.
+///
+/// `round` is half AWAY FROM ZERO. `rint` is half to even, and the difference
+/// between them was an 8.2% disagreement with `mx.quantize` on an MXFP4-derived
+/// expert bank -- every mismatch by exactly one, because those values sit on
+/// half-integers by construction.
 inline float2 mlx_affine_params(float w_min, float w_max) {
     const bool mask = abs(w_min) > abs(w_max);
     float scale = max((w_max - w_min) / 15.0f, 1e-7f);
     if (!mask) scale = -scale;
     const float edge = mask ? w_min : w_max;
-    const float q0 = rint(edge / scale);
+    const float q0 = round(edge / scale);
     float bias = 0.0f;
     if (q0 != 0.0f) {
         scale = edge / q0;
@@ -98,7 +102,7 @@ inline void encode_affine_group(
     const uint first = gid * p.group_size;
 
     float w_min = INFINITY;
-    float w_max = -INFINITY;
+    float w_max = 0.0f;
     for (uint i = 0; i < p.group_size; ++i) {
         const float value = float(input[first + i]);
         w_min = min(w_min, value);
@@ -115,7 +119,7 @@ inline void encode_affine_group(
         uint packed = 0;
         for (uint k = 0; k < 8; ++k) {
             const float value = float(input[first + w * 8 + k]);
-            const float q = rint((value - params.y) / params.x);
+            const float q = round((value - params.y) / params.x);
             packed |= uint(clamp(q, 0.0f, 15.0f)) << (4 * k);
         }
         codes[first / 8 + w] = packed;

@@ -36,7 +36,7 @@
 
 use std::path::Path;
 
-use ztensor::cbor::Value;
+use ztensor::format::cbor::Value;
 use ztensor::{DType as ZDType, Sink, Source, Writer};
 
 use crate::error::Error;
@@ -191,17 +191,19 @@ impl ArtifactWriter {
             Value::Text(tensor.runtime_dtype.clone()),
         )]);
         let nbytes = tensor.nbytes()?;
-        let mut object = self
+        let sink = self
             .writer()
-            .object(&tensor.name)
-            .shape(shape)
-            .attributes(attributes)
-            .part("data")
-            .dtype(dtype);
-        if let Some(ltype) = ltype {
-            object = object.logical(ltype);
-        }
-        self.open = Some(object.length(nbytes).stream().map_err(Error::from)?);
+            .stream(&tensor.name, |o| {
+                o.shape(shape).attributes(attributes).part("data", |mut p| {
+                    p = p.dtype(dtype);
+                    if let Some(ltype) = ltype {
+                        p = p.logical(ltype);
+                    }
+                    p.length(nbytes)
+                })
+            })
+            .map_err(Error::from)?;
+        self.open = Some(sink);
         self.tensors.push(tensor);
         Ok(())
     }
@@ -286,12 +288,14 @@ impl Artifact {
         let attributes = source
             .attributes()
             .ok_or_else(|| Error::Checkpoint("not a weight-store artifact".into()))?;
-        let record = field(attributes, RECORD)
+        let record = attributes
+            .get(RECORD)
             .and_then(Value::as_map)
             .ok_or_else(|| Error::Checkpoint("not a weight-store artifact".into()))?;
         let record = Value::Map(record.to_vec());
 
-        let version = field(&record, "version")
+        let version = record
+            .get("version")
             .and_then(Value::as_u64)
             .ok_or_else(|| Error::Checkpoint("artifact states no schema version".into()))?;
         if version != SCHEMA_VERSION {
@@ -299,7 +303,8 @@ impl Artifact {
                 "artifact schema {version}, expected {SCHEMA_VERSION}"
             )));
         }
-        let key = field(&record, "key")
+        let key = record
+            .get("key")
             .and_then(Value::as_text)
             .ok_or_else(|| Error::Checkpoint("artifact states no key".into()))?;
         if key != expected_key {
@@ -316,7 +321,7 @@ impl Artifact {
                 .map_err(|_| Error::Checkpoint(format!("object {name:?} has no data part")))?;
             let runtime_dtype = tensor
                 .attributes()
-                .and_then(|a| field(a, RUNTIME_DTYPE))
+                .and_then(|a| a.get(RUNTIME_DTYPE))
                 .and_then(Value::as_text)
                 .ok_or_else(|| {
                     Error::Checkpoint(format!("object {name:?} names no runtime dtype"))
@@ -339,12 +344,14 @@ impl Artifact {
             });
         }
 
-        let views = field(&record, "views")
+        let views = record
+            .get("views")
             .and_then(Value::as_array)
             .map(|entries| entries.iter().map(read_view).collect::<Result<Vec<_>, _>>())
             .transpose()?
             .unwrap_or_default();
-        let quants = field(&record, "quant")
+        let quants = record
+            .get("quant")
             .and_then(Value::as_array)
             .map(|entries| {
                 entries
@@ -379,7 +386,7 @@ impl Artifact {
     pub fn bytes(&self, index: usize) -> Result<&[u8], Error> {
         self.source
             .tensor(&self.tensor(index)?.name)
-            .and_then(|t| t.map())
+            .and_then(|t| t.data()?.map())
             .map_err(Error::from)
     }
 
@@ -390,7 +397,7 @@ impl Artifact {
         let name = &self.tensor(index)?.name;
         self.source
             .tensor(name)
-            .and_then(|t| t.locate())
+            .and_then(|t| t.data()?.locate())
             .map(|at| at.offset)
             .map_err(Error::from)
     }
@@ -404,7 +411,7 @@ impl Artifact {
     pub fn verify(&self, index: usize) -> Result<bool, Error> {
         let name = &self.tensor(index)?.name;
         match self.source.tensor(name).and_then(|t| t.verify()) {
-            Ok(verified) => Ok(verified.checked()),
+            Ok(verified) => Ok(verified.is_checked()),
             // A mismatch is a rejected file to zTensor and a cache miss here;
             // both mean the same thing to the caller, which is recompute.
             Err(err) if err.rule() == Some(ztensor::Rule::Digest) => Ok(false),
@@ -419,15 +426,8 @@ impl Artifact {
     }
 }
 
-fn field<'a>(map: &'a Value, key: &str) -> Option<&'a Value> {
-    map.as_map()?
-        .iter()
-        .find(|(k, _)| k.as_text() == Some(key))
-        .map(|(_, v)| v)
-}
-
 fn text(map: &Value, key: &str) -> Result<String, Error> {
-    field(map, key)
+    map.get(key)
         .and_then(Value::as_text)
         .map(str::to_string)
         .ok_or_else(|| Error::Checkpoint(format!("artifact record has no {key:?}")))
@@ -436,7 +436,7 @@ fn text(map: &Value, key: &str) -> Result<String, Error> {
 /// A signed integer as CBOR writes it: either major type 0 or major type 1.
 fn int(map: &Value, key: &str) -> Result<i32, Error> {
     let bad = || Error::Checkpoint(format!("artifact record has no integer {key:?}"));
-    match field(map, key).ok_or_else(bad)? {
+    match map.get(key).ok_or_else(bad)? {
         Value::Uint(n) => i32::try_from(*n).map_err(|_| bad()),
         Value::Nint(n) => i64::try_from(*n)
             .ok()
@@ -447,7 +447,7 @@ fn int(map: &Value, key: &str) -> Result<i32, Error> {
 }
 
 fn shape_of(map: &Value, key: &str) -> Result<Vec<i64>, Error> {
-    field(map, key)
+    map.get(key)
         .and_then(Value::as_array)
         .ok_or_else(|| Error::Checkpoint(format!("artifact record has no {key:?}")))?
         .iter()
@@ -501,7 +501,8 @@ fn read_view(entry: &Value) -> Result<View, Error> {
     Ok(View {
         name: text(entry, "name")?,
         root: text(entry, "root")?,
-        byte_offset: field(entry, "offset")
+        byte_offset: entry
+            .get("offset")
             .and_then(Value::as_u64)
             .ok_or_else(|| Error::Checkpoint("view has no offset".into()))?,
         dtype: dtype_named(&text(entry, "dtype")?)?,

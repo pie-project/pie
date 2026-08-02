@@ -16,6 +16,7 @@
 
 #include "decode_step.hpp"
 #include "decode_dispatch.hpp"
+#include "../shared_kernels.hpp"
 
 namespace pie::metal {
 
@@ -62,7 +63,13 @@ std::vector<Dispatch> build_decode_dag(const DecodeGeometry& g, bool with_argmax
     auto resid = [&]() { LD l; residual_dispatch(g.hidden, l.grid, l.tg); return l; };
 
     // EMBED ×1 (4-bit dequant gather of the shared lm_head bundle).
-    { LD l; embed_dispatch(g.hidden, l.grid, l.tg); emit(Kernel::EmbedGather, -1, l); }
+    // Tied, one table serves both ends of the model and both kinds bind
+    // `shared_embedding`. Untied -- which is every routed member of this
+    // family -- they are two tensors, and a kind is a weight name, so they
+    // are two kinds. Same kernels, same launch shapes, same constants: what
+    // differs is only which tensor is asked for.
+    { LD l; embed_dispatch(g.hidden, l.grid, l.tg);
+      emit(g.tied_embeddings ? Kernel::EmbedGather : Kernel::EmbedUntied, -1, l); }
 
     for (int L = 0; L < g.n_layers; ++L) {
         if (g.is_full_attn(L)) {
@@ -92,8 +99,8 @@ std::vector<Dispatch> build_decode_dag(const DecodeGeometry& g, bool with_argmax
             emit(Kernel::Rms,     L, rms(g.hidden, 1));
             emit(Kernel::QmvIn,   L, qmv(g.gdn_conv_dim));             // 6144, 4-bit
             emit(Kernel::QmvInZ,  L, qmv(g.gdn_v_total));              // 2048, 4-bit (gate z)
-            { LD l; dense_gemv_dispatch(g.gdn_v_heads, l.grid, l.tg); emit(Kernel::GdnInA, L, l); }  // dense bf16 [16,1024]
-            { LD l; dense_gemv_dispatch(g.gdn_v_heads, l.grid, l.tg); emit(Kernel::GdnInB, L, l); }
+            emit(Kernel::GdnInA,  L, qmv(g.gdn_v_heads));              // 1024 → 16, 4-bit
+            emit(Kernel::GdnInB,  L, qmv(g.gdn_v_heads));              // 1024 → 16, 4-bit
             if (gdn_prep) {
                 // Prep-dispatch split: dv-independent q/k path hoisted to GdnPrep (once/head),
                 // then the slimmed recurrent core reads its fp32 scratch (full 128×→1×).
@@ -107,19 +114,84 @@ std::vector<Dispatch> build_decode_dag(const DecodeGeometry& g, bool with_argmax
             if (fuse_residual) dag.back().fuse_residual = true;
             else emit(Kernel::Residual, L, resid());
         }
-        // SwiGLU MLP (6, every layer): ffn_norm, gate_proj, up_proj, swiglu, down_proj, layer_out.
-        emit(Kernel::FfnRms,   L, rms(g.hidden, 1));
-        emit(Kernel::QmvGate,  L, qmv(g.intermediate));
-        emit(Kernel::QmvUp,    L, qmv(g.intermediate));
-        { LD l; silu_mul_dispatch(g.intermediate, l.grid, l.tg); emit(Kernel::SiluMul, L, l); }
-        emit(Kernel::QmvDown,  L, qmv(g.hidden));
-        if (fuse_residual) dag.back().fuse_residual = true;
-        else emit(Kernel::LayerOut, L, resid());
+        // The FFN, in one of two shapes. Everything above this line is the
+        // same either way -- the routed and dense members of this family differ
+        // in the mixture and in nothing else, which is why they are one family
+        // and not two.
+        emit(Kernel::FfnRms, L, rms(g.hidden, 1));
+        if (g.is_moe()) {
+            // The same nine dispatches and the same kernels the llama family's
+            // mixture runs. They are shared `Kernel` values, and the weights
+            // for them are already keyed by kind in `weights_for_kind`, so
+            // what this family was missing was the DAG and not the machinery.
+            //
+            // The sort is what makes the projections tractable: each of the
+            // three reads a DIFFERENT weight matrix per (token, slot) pair, so
+            // grouping the pairs by expert makes one expert's rows contiguous
+            // and a contiguous run against one weight slice is the matmul the
+            // driver already has. At M=1 it is a grouping with no padding and
+            // the projections stay matvecs, which is deliberate: one dataflow
+            // for both, so the batched path is not a second implementation.
+            const int sorted = moe_sorted_rows(g);
+            emit(Kernel::LlRouter, L, qmv(g.n_experts));
+            { LD l; shared_kernels::router_topk_dispatch(g.n_experts, l.grid, l.tg);
+              emit(Kernel::GoRouterTopK, L, l); }
+            { LD l; shared_kernels::moe_route_sort_dispatch(g.n_experts, l.grid, l.tg);
+              emit(Kernel::LlMoeSort, L, l); }
+            { LD l; shared_kernels::moe_route_rows_dispatch(g.hidden, sorted, l.grid, l.tg);
+              emit(Kernel::LlMoeGather, L, l); }
+            { LD l; shared_kernels::routed_qmv_dispatch(g.moe_intermediate, 1, l.grid, l.tg,
+                                                        sorted);
+              emit(Kernel::LlExpertGate, L, l); }
+            { LD l; shared_kernels::routed_qmv_dispatch(g.moe_intermediate, 1, l.grid, l.tg,
+                                                        sorted);
+              emit(Kernel::LlExpertUp, L, l); }
+            { LD l; shared_kernels::moe_route_rows_dispatch(g.moe_intermediate, sorted,
+                                                            l.grid, l.tg);
+              emit(Kernel::LlExpertSiluMul, L, l); }
+            { LD l; shared_kernels::routed_qmv_dispatch(g.hidden, 1, l.grid, l.tg, sorted);
+              emit(Kernel::LlExpertDown, L, l); }
+            { LD l; shared_kernels::moe_route_rows_dispatch(g.hidden, 1, l.grid, l.tg);
+              emit(Kernel::LlMoeCombine, L, l); }
+            // The shared expert. A dense FFN over the SAME `FfnRms` output the
+            // router read, at its own width, added to the mixture under a gate
+            // that is one number per token.
+            //
+            // It is emitted after the mixture rather than before only because
+            // the combine has to see both; nothing here depends on the routed
+            // half, and `parallel_groups` says so, so the two halves overlap on
+            // the GPU. Keeping them textually apart would have hidden that they
+            // are one FFN in two pieces.
+            if (g.has_shared_expert()) {
+                emit(Kernel::LlSharedGate, L, qmv(g.shared_intermediate));
+                emit(Kernel::LlSharedUp,   L, qmv(g.shared_intermediate));
+                { LD l; silu_mul_dispatch(g.shared_intermediate, l.grid, l.tg);
+                  emit(Kernel::SiluMul, L, l); }
+                emit(Kernel::LlSharedDown, L, qmv(g.hidden));
+                // The gate is emitted LAST of the five, immediately before its
+                // only reader. It reads `normed`, which is live the whole way
+                // through, so it could have gone first -- and going first cost
+                // a ninth scratch colour on a pool of eight, because a value
+                // written five dispatches before it is read is live across all
+                // five. It is `hidden -> 1`: the cheapest dispatch in the
+                // layer, and the one with the least to gain from overlapping.
+                emit(Kernel::LlSharedGateProj, L, qmv(1));
+                { LD l; shared_kernels::moe_route_rows_dispatch(g.hidden, 1, l.grid, l.tg);
+                  emit(Kernel::LlSharedCombine, L, l); }
+            }
+        } else {
+            emit(Kernel::QmvGate,  L, qmv(g.intermediate));
+            emit(Kernel::QmvUp,    L, qmv(g.intermediate));
+            { LD l; silu_mul_dispatch(g.intermediate, l.grid, l.tg); emit(Kernel::SiluMul, L, l); }
+            emit(Kernel::QmvDown,  L, qmv(g.hidden));
+            if (fuse_residual) dag.back().fuse_residual = true;
+        }
+        if (!fuse_residual || g.is_moe()) emit(Kernel::LayerOut, L, resid());
     }
 
     // TAIL: final_norm, lm_head (logits ALWAYS produced, I3), [optional] device argmax.
     emit(Kernel::FinalRms,  -1, rms(g.hidden, 1));
-    emit(Kernel::QmvLmHead, -1, qmv(g.vocab));
+    emit(g.tied_embeddings ? Kernel::QmvLmHead : Kernel::LmHeadUntied, -1, qmv(g.vocab));
     if (with_argmax) {
         emit(Kernel::Argmax, -1, LD{ Grid{1024, 1, 1}, Threadgroup{1024, 1, 1} });
     }

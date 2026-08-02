@@ -25,6 +25,16 @@ pub fn driver_cache_dir() -> PathBuf {
     crate::paths::pie_home().join("cache")
 }
 
+/// Where the driver keeps materialized device weights.
+///
+/// Defined once for the same reason `driver_cache_dir` is: this and
+/// `engine::boot` both need it, and when they were two expressions they landed
+/// on two directories -- one of them the artifact store, which is not a cache
+/// at all.
+pub fn weight_cache_dir() -> PathBuf {
+    driver_cache_dir().join("weights")
+}
+
 /// Whether an entry may be deleted to reclaim space.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reclaim {
@@ -53,9 +63,9 @@ pub struct Entry {
 ///
 /// Order is roughly "cheapest to lose" first, so a listing reads top-down as
 /// increasing regret.
-pub fn entries() -> Vec<Entry> {
+pub fn entries(hf_cache: Option<PathBuf>) -> Vec<Entry> {
     let home = crate::paths::pie_home();
-    vec![
+    let mut entries = vec![
         Entry {
             name: "launch",
             path: crate::embedded_driver::launch_state_root(),
@@ -81,23 +91,21 @@ pub fn entries() -> Vec<Entry> {
         Entry {
             name: "py-runtime",
             path: home.join("py-runtime"),
-            what: "The embedded Python-WASM runtime. Reinstallable with \
-                   `pie runtime install`.",
+            what: "The embedded Python-WASM runtime. Re-provisioned by the \
+                   next `pie serve`.",
             reclaim: Reclaim::Safe,
-        },
-        Entry {
-            name: "optimized",
-            path: home.join("optimized"),
-            what: "Optimized checkpoints, keyed by source digest. Re-derivable \
-                   with `pie model optimize`, but the rebuild is minutes and \
-                   the bytes are weight-sized.",
-            reclaim: Reclaim::OnRequest,
         },
         Entry {
             name: "models",
             path: home.join("models"),
-            what: "Materialized-weight artifacts, the size of the weights \
-                   themselves. Re-derived on the next load.",
+            // The artifact store, not a cache. It used to be the driver's
+            // materialized-weight cache, which was re-derived on the next
+            // load; `.zt` artifacts are not. Losing one costs a download and a
+            // conversion, and the file is portable in a way device weights
+            // never are -- a TP layout and an ABI version are baked into
+            // those, and into nothing here.
+            what: "Converted `.zt` artifacts -- the models pie serves. Losing \
+                   one costs a re-download and a re-convert, not a reload.",
             reclaim: Reclaim::OnRequest,
         },
         Entry {
@@ -108,12 +116,39 @@ pub fn entries() -> Vec<Entry> {
             reclaim: Reclaim::OnRequest,
         },
         Entry {
+            name: "weights",
+            path: weight_cache_dir(),
+            what: "Materialized device weights, keyed by checkpoint + config + \
+                   quant scheme + TP layout + ABI version. One cold load to \
+                   rebuild; valid only for this build.",
+            reclaim: Reclaim::Safe,
+        },
+        Entry {
             name: "config",
             path: home.join("config.toml"),
             what: "The config file. Authored, not derived.",
             reclaim: Reclaim::Never,
         },
-    ]
+    ];
+    // Outside `$PIE_HOME`, and the only path this layer cannot resolve -- the
+    // HuggingFace cache location is `bin/pie`'s to know. Passed in rather than
+    // re-derived here, so there is still one description and one reclaim
+    // policy per thing pie writes.
+    //
+    // It is in the list at all because the artifact store demoted it: a
+    // snapshot is now the source a `.zt` was converted FROM, kept so a
+    // re-convert costs no download.
+    if let Some(hf) = hf_cache {
+        entries.push(Entry {
+            name: "snapshots",
+            path: hf,
+            what: "HuggingFace downloads, kept so a re-convert needs no \
+                   network. Not needed to serve an artifact that already \
+                   exists.",
+            reclaim: Reclaim::OnRequest,
+        });
+    }
+    entries
 }
 
 /// Bytes under `path`, following the tree. Returns 0 for a path that does not
@@ -140,13 +175,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_one_entry_outside_pie_home_is_the_one_that_was_passed_in() {
+        // The guard below exists so a typo cannot reclaim something that is
+        // not ours. HuggingFace snapshots ARE outside `$PIE_HOME` and are
+        // still pie's to offer -- so they arrive as a parameter rather than
+        // being derived here, and this pins that as the only way in.
+        let outside = PathBuf::from("/somewhere/else/huggingface");
+        let with = entries(Some(outside.clone()));
+        let without = entries(None);
+        assert_eq!(with.len(), without.len() + 1);
+        let extra: Vec<&Entry> = with
+            .iter()
+            .filter(|e| !e.path.starts_with(crate::paths::pie_home()))
+            .collect();
+        assert_eq!(extra.len(), 1);
+        assert_eq!(extra[0].path, outside);
+        // And never `Never`: an entry pie cannot reach should not be one it
+        // refuses to reclaim on principle.
+        assert_ne!(extra[0].reclaim, Reclaim::Never);
+    }
+
+    #[test]
     fn names_are_unique_and_paths_stay_under_pie_home() {
         // A `--what` selector that matches two entries would delete more than
         // it names; a path outside $PIE_HOME would let a typo here reclaim
         // something that is not ours.
         let home = crate::paths::pie_home();
         let mut seen = std::collections::HashSet::new();
-        for entry in entries() {
+        for entry in entries(None) {
             assert!(seen.insert(entry.name), "duplicate name {}", entry.name);
             assert!(
                 entry.path.starts_with(&home),
@@ -161,7 +217,7 @@ mod tests {
     fn the_authored_files_are_never_reclaimable() {
         // The failure this guards is silent and total: a `pie cache clear`
         // that takes config.toml with it looks like it worked.
-        for entry in entries() {
+        for entry in entries(None) {
             if entry.name == "config" {
                 assert_eq!(
                     entry.reclaim,
@@ -179,13 +235,14 @@ mod tests {
         // reference, so that factoring one apart later fails here rather than
         // silently giving `pie cache` a directory nothing writes to.
         let by_name = |n: &str| {
-            entries()
+            entries(None)
                 .into_iter()
                 .find(|e| e.name == n)
                 .unwrap_or_else(|| panic!("no {n} entry"))
                 .path
         };
         assert_eq!(by_name("driver"), driver_cache_dir());
+        assert_eq!(by_name("weights"), weight_cache_dir());
         assert_eq!(
             by_name("launch"),
             crate::embedded_driver::launch_state_root()

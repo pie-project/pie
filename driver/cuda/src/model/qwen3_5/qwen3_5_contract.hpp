@@ -68,12 +68,6 @@ inline void gdn_kkv_blocked_shards(ContractBuilder& b) {
         const std::int64_t k_dim = (conv_dim - v_dim) / 2;
         for (const char* leaf :
              {"in_proj_qkv.weight", "conv1d.weight", "conv1d.bias"}) {
-            // The fused layout publishes qkv as the first leg of `in_proj_qkvz`
-            // instead; conv1d still wants it under its own name either way.
-            if (qwen35_fused_gdn_projection_enabled() &&
-                std::string_view(leaf) == "in_proj_qkv.weight") {
-                continue;
-            }
             const SourceTensor* raw = b.find(b.source_name(la + leaf));
             if (raw == nullptr || raw->shape.empty() || raw->shape[0] != conv_dim) {
                 continue;
@@ -86,64 +80,6 @@ inline void gdn_kkv_blocked_shards(ContractBuilder& b) {
     }
 }
 
-/// Join the Gated DeltaNet input projections the forward reads pre-fused.
-///
-/// `qwen3_5_forward` branches on `la_in_proj_qkvz`: when the fused layout is
-/// selected it wants `[2K | V | V]` (qkv then z) and `[H | H]` (b then a) as
-/// single tensors. Stating that here rather than concatenating after the load
-/// is what makes the layout free — the earlier bind-time version had to hold
-/// the sources *and* the join, which on Qwen3.6-35B-A3B meant 1.4 GB of
-/// duplicate weights, since arena-backed sources reclaim nothing when erased.
-///
-/// The qkv leg keeps the per-block shard from [`gdn_kkv_blocked_shards`]; z, b
-/// and a shard uniformly on axis 0, so a plain [`ContractBuilder::split`] is
-/// right for them.
-inline void gdn_fused_in_proj_joins(ContractBuilder& b) {
-    if (!qwen35_fused_gdn_projection_enabled()) {
-        return;
-    }
-    for (std::uint32_t layer = 0; layer < b.facts().num_hidden_layers; ++layer) {
-        const std::string la = std::string(b.decoder_layer_prefix()) +
-                               std::to_string(layer) + ".linear_attn.";
-        const SourceTensor* qkv = b.find(b.source_name(la + "in_proj_qkv.weight"));
-        const SourceTensor* z = b.find(b.source_name(la + "in_proj_z.weight"));
-        const SourceTensor* bb = b.find(b.source_name(la + "in_proj_b.weight"));
-        const SourceTensor* aa = b.find(b.source_name(la + "in_proj_a.weight"));
-        if (qkv == nullptr || z == nullptr || bb == nullptr || aa == nullptr) {
-            continue;
-        }
-        if (qkv->shape.empty() || z->shape.empty() || bb->shape.empty() ||
-            aa->shape.empty()) {
-            continue;
-        }
-        const std::int64_t v_dim = z->shape[0];
-        const std::int64_t conv_dim = qkv->shape[0];
-        if (conv_dim <= v_dim || (conv_dim - v_dim) % 2 != 0) {
-            continue;
-        }
-        const std::int64_t k_dim = (conv_dim - v_dim) / 2;
-
-        auto blocked = gdn_kkv_blocked(b, *qkv, k_dim, v_dim);
-        const Node z_local = b.split(b.contract().src(std::string(z->name)), 0);
-        std::vector<std::int64_t> qkvz_shape = blocked.second;
-        qkvz_shape[0] += b.local_extent(v_dim);
-        b.define(b.output_name(la + "in_proj_qkvz.weight"),
-                 b.contract().concat({blocked.first, z_local}, 0), qkv->encoding,
-                 std::move(qkvz_shape));
-        b.consume(qkv->id);
-        b.consume(z->id);
-
-        const Node b_local = b.split(b.contract().src(std::string(bb->name)), 0);
-        const Node a_local = b.split(b.contract().src(std::string(aa->name)), 0);
-        std::vector<std::int64_t> ba_shape = contract_detail::shape_of(*bb);
-        ba_shape[0] = b.local_extent(bb->shape[0]) + b.local_extent(aa->shape[0]);
-        b.define(b.output_name(la + "in_proj_ba.weight"),
-                 b.contract().concat({b_local, a_local}, 0), bb->encoding,
-                 std::move(ba_shape));
-        b.consume(bb->id);
-        b.consume(aa->id);
-    }
-}
 
 /// Widen the two gated-delta-net parameters the kernels read as fp32.
 ///
@@ -307,7 +243,6 @@ inline void author_qwen3_5_contract(ContractBuilder& b) {
     // not. Both are this row, so the prefix is asked for rather than declared.
     b.decoder_layer_prefix_any_of({"model.language_model.layers.", "model.layers."});
     contract_detail::gdn_kkv_blocked_shards(b);
-    contract_detail::gdn_fused_in_proj_joins(b);
     contract_detail::gdn_fp32_parameters(b);
     // The speculative-decoding head is a full-attention layer with the same
     // projection names, so it wants the same join. Checkpoints without one make
@@ -326,7 +261,6 @@ inline void author_qwen3_5_moe_contract(ContractBuilder& b) {
     b.allow_bf16_runtime_quant();
     b.decoder_layer_prefix_any_of({"model.language_model.layers.", "model.layers."});
     contract_detail::gdn_kkv_blocked_shards(b);
-    contract_detail::gdn_fused_in_proj_joins(b);
     contract_detail::gdn_fp32_parameters(b);
     // The MoE decode runs through flashinfer's CUTLASS grouped GEMM, which
     // reads fc1's output as [linear|gate]; the checkpoint stores [gate|up].

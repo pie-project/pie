@@ -182,7 +182,9 @@ inline void qmm_t_dispatch(int out_vec, int N, int bn, int bm, Grid& g, Threadgr
 // rms_single_row over N tokens × n_rows rows-per-token (e.g. per-head q/k norm). One
 // threadgroup per row; rows stack token-major [N*n_rows, row_size]. grid.x = (row_size/4)*n_rows*N.
 inline void rms_mb_dispatch(int row_size, int n_rows, int N, Grid& g, Threadgroup& tg) {
-    const uint32_t t = uint32_t(row_size) / 4;  // N_READS = 4
+    // Rounded up, matching `rms_dispatch`: at N == 1 these two must agree
+    // exactly, because a family that uses this one for both is relying on it.
+    const uint32_t t = (uint32_t(row_size) + 3) / 4;  // N_READS = 4
     g  = Grid{t * uint32_t(n_rows) * uint32_t(N), 1, 1};
     tg = Threadgroup{t, 1, 1};
 }
@@ -213,6 +215,26 @@ inline void rope_mb_dispatch(int rotary_dims, int n_heads, int N, Grid& g, Threa
 // tg=(1024,1,1). Causal bound per row = position_ids[row]; request = req_of_token[row].
 inline void sdpa_paged_dispatch(int n_q_heads, int N, Grid& g, Threadgroup& tg) {
     g  = Grid{uint32_t(n_q_heads) * 1024u, uint32_t(N), 1};
+    tg = Threadgroup{1024, 1, 1};
+}
+
+// Query rows per threadgroup in `sdpa_paged_tiled` -- one per simdgroup, and a
+// threadgroup is 1024 threads. It is the factor by which that kernel divides
+// the K/V traffic, and it must equal the kernel's own QT.
+inline constexpr int kSdpaQueryTile = 32;
+
+// Whether to tile the query rows. The tiled kernel gives a row a simdgroup
+// where the per-row kernel gives it a threadgroup, so below a full tile it is
+// strictly worse: at one row it would run one simdgroup of the thirty-two the
+// other kernel would have used. A fire earns the tiled shape by filling a tile.
+inline bool sdpa_should_tile(int N) { return N >= kSdpaQueryTile; }
+
+// sdpa_paged_tiled: one threadgroup per (q_head, tile of kSdpaQueryTile rows).
+// grid=(n_q_heads*1024, ceil(N/QT), 1), tg=(1024,1,1). The grid rounds UP, so
+// the kernel reads N from bind::SdpaPaged::Rows to retire its partial tile.
+inline void sdpa_paged_tiled_dispatch(int n_q_heads, int N, Grid& g, Threadgroup& tg) {
+    const uint32_t tiles = uint32_t((N + kSdpaQueryTile - 1) / kSdpaQueryTile);
+    g  = Grid{uint32_t(n_q_heads) * 1024u, tiles < 1u ? 1u : tiles, 1};
     tg = Threadgroup{1024, 1, 1};
 }
 

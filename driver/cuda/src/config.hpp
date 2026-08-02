@@ -23,6 +23,18 @@ struct ModelConfig {
     std::string snapshot_dir;     // local path to weights + config.json
     // Materialized-weight artifact cache for THIS model. Empty = disabled.
     std::string weight_cache_dir;
+
+    // Path to a `pie.model/1` descriptor: HuggingFace's `config.json`
+    // normalized once at import, so the driver reads a flat document with
+    // every defaulting rule already resolved rather than re-deriving one at
+    // every boot. The worker writes it beside this TOML.
+    //
+    // Empty for a snapshot that predates the artifact format, in which case
+    // the driver parses `snapshot_dir/config.json` itself. That fallback is
+    // what lets the descriptor land before a forward pass has run against it;
+    // removing it is a separate, deliberate change.
+    std::string descriptor;
+
     std::string device = "cuda:0";
     std::string dtype = "bfloat16";
     int mtp_num_drafts = 3;
@@ -139,6 +151,7 @@ inline Config load_config(const std::filesystem::path& path) {
         // Published before returning: the artifact cache is constructed from
         // somewhere that never sees this Config.
         mutable_weight_cache_dir() = c.model.weight_cache_dir;
+        c.model.descriptor    = (*m)["descriptor"].value_or(std::string{});
         c.model.device        = (*m)["device"].value_or(c.model.device);
         c.model.dtype         = (*m)["dtype"].value_or(c.model.dtype);
         c.model.mtp_num_drafts = static_cast<int>(

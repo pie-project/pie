@@ -8,8 +8,8 @@
 //! while per-lane attention masks isolate their divergent continuations.
 //! Independent Gumbel noise drives top-p sampling in each lane.
 
+use inferlet::chat;
 use inferlet::ptir::attention::prelude::*;
-use inferlet::{Result, chat, model as wit_model};
 use serde::Deserialize;
 use std::time::Instant;
 
@@ -56,7 +56,7 @@ fn decode_text(tokens: &[u32]) -> Result<String> {
     if tokens.is_empty() {
         return Ok(String::new());
     }
-    let mut dec = chat::Decoder::new();
+    let dec = chat::Decoder::new();
     let mut text = String::new();
     match dec.feed(tokens)? {
         chat::Event::Delta(s) | chat::Event::Done(s) => text.push_str(&s),
@@ -78,7 +78,7 @@ async fn main(input: Input) -> Result<String> {
     let b = num_candidates as u32;
 
     let start = Instant::now();
-    let vocab = wit_model::output_vocab_size();
+    let vocab = model::output_vocab_size();
     let stop = chat::stop_tokens();
 
     // Shared prefix: system + question via the deferred-system `system_user`
@@ -103,9 +103,7 @@ async fn main(input: Input) -> Result<String> {
         let pool_pages = (n + b * max_tokens as u32 + 2).div_ceil(PAGE_T);
         let pool = pool_pages * PAGE_T;
         let ws = WorkingSet::new();
-        let slots = ws
-            .reserve(pool_pages)
-            .map_err(|e| format!("ws.reserve: {e}"))?;
+        let slots = ws.reserve(pool_pages).context("ws.reserve")?;
         let pool_ids = slots.ids().to_vec();
 
         // ─────────────── 1. SHARED-PREFIX PREFILL FIRE (N-wide) ───────────────
@@ -114,8 +112,8 @@ async fn main(input: Input) -> Result<String> {
         // Gumbel noise over the shared nucleus keep-mask).
         let prefix_i32: Vec<i32> = prefix.iter().map(|&t| t as i32).collect();
         let toks_p = Channel::from(prefix_i32).named("toks_p"); // [N] i32 (seeded)
-        let embed_indptr_p = Channel::from(vec![0u32, n]).named("embed_indptr_p");
-        let positions_p = Channel::from((0..n).collect::<Vec<_>>()).named("positions_p");
+        let embed_indptr_p = Channel::from([0u32, n]).named("embed_indptr_p");
+        let positions_p = Channel::from_iter(0..n).named("positions_p");
 
         // Explicit N-cell write descriptor: cell c → pool_ids[c/PAGE_T] @ c%PAGE_T.
         let w_slot_pv: Vec<u32> = (0..n).map(|c| pool_ids[(c / PAGE_T) as usize]).collect();
@@ -137,22 +135,24 @@ async fn main(input: Input) -> Result<String> {
             .flat_map(|i| (0..pool).map(move |j| j <= i))
             .collect();
         let mask_p = Channel::from_shaped([n, pool], mask_pv).named("mask_p");
-        let rng_p = Channel::from(vec![0x51ed_u32, 0]).named("rng_p");
+        let rng_p = Channel::from([0x51ed_u32, 0]).named("rng_p");
         let g0s_ch = Channel::new([1], dtype::i32).named("g0s");
 
         let fwd_p = ForwardPass::new();
         fwd_p.embed(&toks_p, &embed_indptr_p)?;
         fwd_p.attention(
             &ws,
-            ..,
-            ..,
-            &klen_p,
-            &pages_p,
-            &page_indptr_p,
-            &w_slot_p,
-            &w_off_p,
-            &positions_p,
-            Some(&mask_p),
+            KvGeometry {
+                readable_pages: ..,
+                writable_pages: ..,
+                kv_len: &klen_p,
+                pages: &pages_p,
+                page_indptr: &page_indptr_p,
+                w_slot: &w_slot_p,
+                w_off: &w_off_p,
+                positions: &positions_p,
+                mask: Some(&mask_p),
+            },
         )?;
         fwd_p.epilogue(move || {
             let r = rng_p.take();
@@ -170,13 +170,13 @@ async fn main(input: Input) -> Result<String> {
             // that elided 4-byte slot, corrupting the sampler's scratch — the
             // failure is silent and yields plausible-looking junk tokens.
             let logits = intrinsics::logits(); // [1, vocab] (single read-out row)
-            let scaled = div(&reshape(&logits, [1, vocab]), temperature);
+            let scaled = &reshape(&logits, [1, vocab]) / temperature;
             let probs = softmax(&scaled);
             let keep = pivot_threshold(&probs, cummass_le(top_p));
             let masked = mask_apply(&scaled, &keep); // [1, vocab]
             let g = gumbel(&r, [1, vocab]);
-            let toks0 = reduce_argmax(add(&masked, &g)); // [1] i32
-            let r_next = add(&r, iota(2)); // advance ctr: [key, ctr+1]
+            let toks0 = reduce_argmax(&masked + &g); // [1] i32
+            let r_next = &r + iota(2); // advance ctr: [key, ctr+1]
             g0s_ch.put(&toks0);
             rng_p.put(&r_next);
         });
@@ -186,14 +186,8 @@ async fn main(input: Input) -> Result<String> {
         // `max_tokens == 1` the prefill's sample IS the whole stream, so
         // finish() lands right after its submit (F7).
         let pipe = Pipeline::new();
-        fwd_p
-            .submit(&pipe)
-            .map_err(|e| format!("prefill submit: {e}"))?;
-        let g0s: Vec<i32> = g0s_ch
-            .take()
-            .get::<i32>()
-            .await
-            .map_err(|e| format!("g0s take: {e}"))?;
+        fwd_p.submit(&pipe).context("prefill submit")?;
+        let g0s: Vec<i32> = g0s_ch.take_host::<Vec<i32>>().await?;
         // All B candidates share the prefill's token; they diverge in the decode
         // loop, where each lane draws its own Gumbel noise.
         let g0s: Vec<i32> = vec![g0s[0]; num_candidates];
@@ -241,44 +235,46 @@ async fn main(input: Input) -> Result<String> {
         let out = Channel::new([b], dtype::i32)
             .capacity(channel_capacity() as u32)
             .named("out");
-        let rng = Channel::from(vec![0x9e37_u32, 0]).named("rng");
+        let rng = Channel::from([0x9e37_u32, 0]).named("rng");
         let lanes = Channel::from((0..=b).collect::<Vec<u32>>()).named("embed_indptr");
 
         let fwd = ForwardPass::new();
         fwd.embed(&tok_in, &lanes)?;
         fwd.attention(
             &ws,
-            ..,
-            (n / ws.page_size())..,
-            &klen,
-            &pages,
-            &page_indptr,
-            &w_slot,
-            &w_off,
-            &pos,
-            Some(&mask),
+            KvGeometry {
+                readable_pages: ..,
+                writable_pages: (n / kv_page_size())..,
+                kv_len: &klen,
+                pages: &pages,
+                page_indptr: &page_indptr,
+                w_slot: &w_slot,
+                w_off: &w_off,
+                positions: &pos,
+                mask: Some(&mask),
+            },
         )?;
         fwd.epilogue(move || {
             // TAKES + compute first, PUTS last (value-id discipline).
-            let base = fill.take().tensor(); // [1] u32 — next fire's first append cell
-            let pids = pool_ids_ch.take().tensor();
+            let base = fill.take(); // [1] u32 — next fire's first append cell
+            let pids = pool_ids_ch.take();
             let r = rng.take();
 
             // Per-lane top-p + temperature sample over [B, vocab] logits
             // (row-wise nucleus, independent Gumbel noise per lane).
             let logits = intrinsics::logits(); // [B, vocab]
-            let scaled = div(&logits, temperature);
+            let scaled = &logits / temperature;
             let probs = softmax(&scaled);
             let keep = pivot_threshold(&probs, cummass_le(top_p));
             let masked = mask_apply(&scaled, &keep);
             let g = gumbel(&r, [b, vocab]);
-            let toks = reduce_argmax(add(&masked, &g)); // [B] i32
-            let r_next = add(&r, iota(2));
+            let toks = reduce_argmax(&masked + &g); // [B] i32
+            let r_next = &r + iota(2);
 
             // Flat append cells for the NEXT fire: wpos = base + lane.
             let lane = iota(b);
             let base_b = broadcast(reshape(&base, [1]), [b]);
-            let wpos = add(&base_b, &lane); // [B]
+            let wpos = &base_b + &lane; // [B]
 
             // Mask evolution: each lane keeps its own ancestry + its new cell.
             let col = broadcast(reshape(iota(pool), [1, pool]), [b, pool]);
@@ -286,20 +282,17 @@ async fn main(input: Input) -> Result<String> {
             let new_mask = or(mask.take(), eq(col, wpos_c)); // [B, POOL]
 
             // Explicit write descriptor via the host-fed pool ids.
-            let w_slot_n = gather(&pids, div(&wpos, PAGE_T)); // [B]
-            let w_off_n = rem(&wpos, PAGE_T); // [B]
-            let filled = add(&base, b); // [1] span after the next fire's appends
+            let w_slot_n = gather(&pids, &wpos / PAGE_T); // [B]
+            let w_off_n = &wpos % PAGE_T; // [B]
+            let filled = &base + b; // [1] span after the next fire's appends
             let klen_n = broadcast(reshape(&filled, [1]), [b]);
-            let pos_n = add(pos.take(), 1u32);
-            let page_count = div(add(&filled, PAGE_T - 1), PAGE_T);
+            let pos_n = pos.take() + 1u32;
+            let page_count = (&filled + (PAGE_T - 1)) / PAGE_T;
             let pages_n = gather(
                 &pids,
-                rem(
-                    iota(b * pool_pages),
-                    broadcast(&page_count, [b * pool_pages]),
-                ),
+                iota(b * pool_pages) % broadcast(&page_count, [b * pool_pages]),
             );
-            let pidx_n = mul(iota(b + 1), broadcast(&page_count, [b + 1]));
+            let pidx_n = iota(b + 1) * broadcast(&page_count, [b + 1]);
 
             // Device-resolved geometry is loop-carried: the host never drains
             // these rings, so the graph has to take before it puts or the
@@ -329,11 +322,7 @@ async fn main(input: Input) -> Result<String> {
             0
         };
         run_ahead(&pipe, &fwd, budget, async || {
-            let step: Vec<i32> = out
-                .take()
-                .get::<i32>()
-                .await
-                .map_err(|e| format!("out.take: {e}"))?;
+            let step: Vec<i32> = out.take_host::<Vec<i32>>().await?;
             for (c, &t) in step.iter().enumerate().take(num_candidates) {
                 if done[c] {
                     continue; // lane keeps firing; its output is ignored

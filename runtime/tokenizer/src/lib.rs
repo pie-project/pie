@@ -7,6 +7,7 @@
 //! pipelines. Unsupported legacy combinations are rejected at load time.
 
 mod bpe;
+pub mod canonical;
 pub mod loader;
 
 use std::borrow::Cow;

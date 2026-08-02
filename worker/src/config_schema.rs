@@ -160,7 +160,17 @@ pub fn fields(driver: DriverKind) -> Vec<Field> {
     let structs = parse_structs();
     let defaults = default_values(driver);
     let mut out = Vec::new();
-    walk(&structs, "Config", "worker", driver, &defaults, &mut out);
+    walk(&structs, "Config", "", driver, &defaults, &mut out);
+    // The struct paths are an implementation detail; what `pie config set`
+    // accepts is what the file spells. One translation, at the boundary, so
+    // the walk stays a walk.
+    for field in &mut out {
+        field.key = crate::config_layout::to_file_path(&field.key);
+    }
+    out.sort_by(|a, b| {
+        let section = |k: &str| k.rsplit_once('.').map(|(s, _)| s.to_string()).unwrap_or_default();
+        section(&a.key).cmp(&section(&b.key))
+    });
     out
 }
 
@@ -179,7 +189,11 @@ fn walk(
         if field.skip {
             continue;
         }
-        let key = format!("{prefix}.{}", field.name);
+        let key = if prefix.is_empty() {
+            field.name.clone()
+        } else {
+            format!("{prefix}.{}", field.name)
+        };
         // `options` is the one field whose shape depends on another field's
         // value, so it is the one place the walk consults the driver kind.
         let nested = if field.ty == "toml::Table" {
@@ -218,7 +232,7 @@ fn walk(
 fn default_values(driver: DriverKind) -> toml::Value {
     let minimal = format!(
         "[model]\nname = \"x\"\nhf_repo = \"x\"\n\
-         [model.driver]\ntype = \"{}\"\ndevice = [\"x\"]\n",
+         [driver]\ntype = \"{}\"\ndevice = [\"x\"]\n",
         driver.as_str()
     );
     let Ok(parsed) = Config::parse(&minimal) else {
@@ -255,7 +269,7 @@ fn default_values(driver: DriverKind) -> toml::Value {
     ) {
         driver_table.insert("options".to_string(), options);
     }
-    toml::Value::Table(toml::map::Map::from_iter([("worker".to_string(), root)]))
+    root
 }
 
 /// Follow a dotted path. Returns `None` for an absent key, which for a
@@ -303,9 +317,10 @@ mod tests {
         let mut serialized = Vec::new();
         collect(&default_values(DriverKind::Dummy), "", &mut serialized);
 
-        let missing: Vec<&String> = serialized
+        let missing: Vec<String> = serialized
             .iter()
-            .filter(|key| !listed.contains(*key))
+            .map(|key| crate::config_layout::to_file_path(key))
+            .filter(|key| !listed.contains(key))
             .collect();
         assert!(missing.is_empty(), "keys serde accepts but the listing omits: {missing:?}");
     }
@@ -316,9 +331,9 @@ mod tests {
         // struct it parses into.
         let cuda = keys(DriverKind::CudaNative);
         let metal = keys(DriverKind::Metal);
-        assert!(cuda.contains(&"worker.model.driver.options.gpu_mem_utilization".to_string()));
-        assert!(!metal.contains(&"worker.model.driver.options.gpu_mem_utilization".to_string()));
-        assert!(metal.contains(&"worker.model.driver.options.total_pages".to_string()));
+        assert!(cuda.contains(&"driver.gpu_mem_utilization".to_string()));
+        assert!(!metal.contains(&"driver.gpu_mem_utilization".to_string()));
+        assert!(metal.contains(&"driver.total_pages".to_string()));
     }
 
     #[test]
@@ -337,7 +352,7 @@ mod tests {
         let fields = fields(DriverKind::CudaNative);
         let threads = fields
             .iter()
-            .find(|f| f.key == "worker.runtime.worker_threads")
+            .find(|f| f.key == "server.worker_threads")
             .expect("worker_threads");
         assert!(threads.doc.starts_with("Tokio worker threads."));
         assert!(
@@ -348,7 +363,7 @@ mod tests {
         // Multi-line summaries are joined rather than cut at the first line.
         let hosts = fields
             .iter()
-            .find(|f| f.key == "worker.runtime.network_allowed_hosts")
+            .find(|f| f.key == "sandbox.network_allowed_hosts")
             .expect("network_allowed_hosts");
         assert!(hosts.doc.ends_with("for any."), "got: {}", hosts.doc);
     }
@@ -356,11 +371,18 @@ mod tests {
     #[test]
     fn fields_pie_populates_itself_are_not_offered() {
         // `device` and `verbose` in the driver options are `#[serde(skip)]`:
-        // they come from `model.driver.device` and `server.verbose`. Listing
-        // them would offer a key `set` cannot honour.
+        // pie fills them from `[driver] device` and `[server] verbose`. After
+        // the options table is flattened into `[driver]`, the skipped `device`
+        // would land on the same path as the real one -- so it has to be the
+        // real one that survives, exactly once.
         let cuda = keys(DriverKind::CudaNative);
-        assert!(!cuda.contains(&"worker.model.driver.options.device".to_string()));
-        assert!(!cuda.contains(&"worker.model.driver.options.verbose".to_string()));
+        assert_eq!(
+            cuda.iter().filter(|k| *k == "driver.device").count(),
+            1,
+            "driver.device must appear once, from DriverConfig"
+        );
+        assert!(!cuda.contains(&"driver.verbose".to_string()));
+        assert!(cuda.contains(&"server.verbose".to_string()));
     }
 
     #[test]
@@ -368,11 +390,11 @@ mod tests {
         let fields = fields(DriverKind::CudaNative);
         let by_key = |k: &str| fields.iter().find(|f| f.key == k).expect(k);
         // `Option` and `None`: absence is the setting.
-        assert!(by_key("worker.server.max_concurrent_processes").default.is_none());
-        assert!(by_key("worker.model.driver.options.kv_page_size").default.is_none());
+        assert!(by_key("runtime.max_concurrent_processes").default.is_none());
+        assert!(by_key("driver.kv_page_size").default.is_none());
         // A concrete default prints as itself.
         assert_eq!(
-            by_key("worker.server.port").default,
+            by_key("server.port").default,
             Some(toml::Value::Integer(8080))
         );
     }

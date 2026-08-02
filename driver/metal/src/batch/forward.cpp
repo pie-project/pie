@@ -20,6 +20,7 @@
 #include "model/contract.hpp"
 #include "model/gemma4/decode_step.hpp"
 #include "model/gemma4/geometry.hpp"
+#include "model/qwen3_5/geometry_facts.hpp"
 #include "simple_family.hpp"
 #include "decode_consts.hpp"
 #include "decode_dispatch_mb.hpp"
@@ -527,6 +528,10 @@ struct MetalExecutor::Impl {
     std::vector<std::vector<Dispatch>> prefill_dags_{};
     ScratchSchedule prefill_sched_{};
     bool mb_bound_ = false;
+    // The token count `mb_dag_`'s width-dependent constants are currently bound
+    // at. Seeded from the setup bind so a first fire at `max_tokens` rebinds
+    // nothing; every other width rebinds once. See the fire path.
+    int mb_bound_tokens_ = 0;
     std::uint64_t paged_bind_generation_ = 0;
     SlotHandle ptir_logits_{};
     SlotHandle ptir_logits_copy_params_{};
@@ -590,7 +595,9 @@ struct MetalExecutor::Impl {
     // with byte-identical output.
     static constexpr bool fuse_residual_ = true;
     static constexpr bool force_barriers_ = false;
-    static constexpr int max_ctx_ = int(kMetalMaxCtxTokens);
+    /// The KV ring, in tokens. `kMetalMaxCtxTokens` unless a `SetupConfig`
+    /// asked for less; see `SetupConfig::max_ctx_tokens`.
+    int max_ctx_ = int(kMetalMaxCtxTokens);
 
     // No checkpoint directory: since §6 the plan declares the files it reads,
     // so staging weights needs the plan and nothing else.
@@ -706,6 +713,52 @@ void write_u32(const SlotHandle& s, uint32_t v) {
     std::memcpy(s.contents(), &v, sizeof(v));
 }
 
+// Both setup paths compute a heap size and an elastic budget, and the line
+// after that is where arithmetic turns into spending. A model that does not
+// fit does NOT fail at that line -- the heap is created, nineteen gigabytes
+// are copied into it over forty-six seconds, every bind succeeds, and the
+// first command buffer comes back with "The operation couldn't be completed",
+// whose real error is three `NSUnderlyingError` levels down:
+// `kIOGPUCommandBufferCallbackErrorOutOfMemory`. Asking the device what it
+// will hold is one call, and it turns three quarters of a minute and an
+// unreadable failure into a sentence with numbers in it.
+//
+// This lives here, rather than at either call site, because it was written at
+// one of them: qwen3.5 got the check when a 35B mixture would not load, and
+// `setup_simple` -- llama, qwen3, gemma and gpt-oss, which is most of what
+// runs -- had none at all. A refusal that only one caller performs is not a
+// refusal the driver makes.
+//
+// On the accuracy of the arithmetic being checked: measured on Qwen3.5-35B-A3B
+// the plan wanted 22.59 GiB and the device reported 22.61 GiB allocated at the
+// first dispatch. The sizing is right to twenty megabytes. What is optimistic
+// is `recommendedMaxWorkingSetSize` itself -- on this M1 Max it is 24.96 GiB,
+// a flat 78% of the 32 GiB the machine has, taking no account of the 6 GiB the
+// kernel had wired down by the time prefill ran. So a plan can clear this bar
+// and still exhaust the machine. The bar is a ceiling, not a promise, and this
+// refusal is written to catch the models that are plainly over it rather than
+// to predict the ones that are close.
+bool fits_on_this_gpu(std::size_t heap_bytes,
+                      std::size_t elastic_bytes,
+                      std::size_t resident_weights,
+                      std::string* err) {
+    const std::size_t limit = RawMetalContext::device_working_set_bytes();
+    if (limit == 0) return true;  // the device would not say; do not invent one
+    const std::size_t want = heap_bytes + elastic_bytes;
+    if (want <= limit) return true;
+    if (err) {
+        const auto gib = [](std::size_t b) {
+            return std::to_string(double(b) / (1024.0 * 1024.0 * 1024.0)).substr(0, 5);
+        };
+        *err = "this model does not fit this GPU: it needs " + gib(want) +
+               " GiB resident (" + gib(resident_weights) + " GiB of weights, " +
+               gib(elastic_bytes) + " GiB of KV, state and scratch) and the device "
+               "will hold " + gib(limit) + " GiB. A shorter context shrinks the KV; "
+               "the weights do not shrink.";
+    }
+    return false;
+}
+
 }  // namespace
 
 bool MetalExecutor::Impl::setup_simple(model::ModelFamily family,
@@ -714,6 +767,9 @@ bool MetalExecutor::Impl::setup_simple(model::ModelFamily family,
                                        const pie_loader::LoadPlan& load_plan,
                                        std::string* err) {
     family_ = family;
+    if (cfg.max_ctx_tokens > 0) {
+        max_ctx_ = int(std::min<std::uint32_t>(cfg.max_ctx_tokens, kMetalMaxCtxTokens));
+    }
     // The heap: the weights the plan already sized, plus what the family needs
     // on top of them. `plan_heap` is not consulted -- it is `DecodeGeometry`'s.
     const std::size_t weights = load_plan.view().memory.persistent_bytes;
@@ -721,11 +777,106 @@ bool MetalExecutor::Impl::setup_simple(model::ModelFamily family,
     // a heap sized for weights that are then ALSO mapped is the footprint
     // doubled rather than halved, and on a machine where the model only just
     // fits that is the difference between running and reading zeros.
-    const auto streams = SimpleFamilyEngine::stream_predicate(family, cfg.stream_routed_experts);
+    // A budget for the routed experts changes BOTH numbers below, in opposite
+    // directions, and that is the whole shape of the feature. The bank leaves
+    // the heap as it does when streamed -- but a slab of the budget's size
+    // joins it, and unlike a mapping the bank never becomes resident at all.
+    // So the ask falls from the model to the dense weights plus the budget,
+    // which is what lets a model bigger than the GPU be admitted.
+    const bool slab = cfg.expert_slab_bytes > 0;
+    // Asked BEFORE the sizing, because the sizing below already believes the
+    // budget: it takes the paging rule for what must be resident on the
+    // strength of this field alone. A family that cannot page then reached the
+    // fit check having had its bank subtracted from the ask and the budget
+    // added to the heap, and refused with "this model does not fit" -- true,
+    // but about the wrong thing, and it never reached the engine that knew the
+    // real reason. One site, before either number is computed, so the message
+    // is the reason.
+    if (slab) {
+        const char* why = nullptr;
+        switch (family) {
+        case model::ModelFamily::Llama:
+            break;
+        case model::ModelFamily::GptOss:
+            // Was refused here for its per-expert bias, which is indexed by
+            // the very buffer paging renumbers. The fix was to page the bias
+            // too, as one more band of the same slot, rather than to keep a
+            // family out -- see `stream_predicate`.
+            break;
+        case model::ModelFamily::Gemma4:
+            // The family has both shapes. E2B/E4B are dense and have no bank to
+            // page; the 26B mixture has 128 experts per layer and pages exactly
+            // as the others do. Asked of the CONFIG rather than of the loaded
+            // tensors because this runs before the engine exists.
+            if (cfg.gemma4.n_experts <= 1) {
+                why = "gemma4: expert_slab_bytes has nothing to page -- this checkpoint is "
+                      "dense and has no routed expert bank";
+            }
+            break;
+        default:
+            why = "expert_slab_bytes is only supported for the llama family";
+            break;
+        }
+        if (why) {
+            if (err) *err = why;
+            return false;
+        }
+    }
+    const auto streams =
+        SimpleFamilyEngine::stream_predicate(cfg.stream_routed_experts || slab, slab);
+    // Not gated on `streams`: a checkpoint that places its tensors where a
+    // device pointer may point has EVERY weight bound over its own mapping,
+    // whether or not anything asked for expert streaming.
+    //
+    // With a slab the mapping is off, so only the routed banks leave the heap.
     const std::size_t streamed =
-        streams ? std::size_t(streamable_plan_bytes(load_plan, streams)) : 0;
-    const std::size_t heap_bytes = (weights > streamed ? weights - streamed : weights) +
+        std::size_t(streamable_plan_bytes(load_plan, streams, slab));
+    // Saturating, not `>` -- when EVERY weight is bound where it lies the two
+    // are equal, and a guard that fell back to the full `weights` on equality
+    // is the one case that matters most: it re-reserved the entire model
+    // alongside its own mapping and the first command buffer came back out of
+    // memory.
+    const std::size_t heap_bytes = (weights >= streamed ? weights - streamed : 0) +
+                                   (slab ? std::size_t(cfg.expert_slab_bytes) : 0) +
                                    SimpleFamilyEngine::extra_heap_bytes(family, cfg, max_ctx_);
+    // What to ALLOCATE and what must be RESIDENT are two numbers, and this
+    // refusal is about the second. Weights bound where they lie leave the heap
+    // but not the working set -- `wrap_host_memory` puts them in the residency
+    // set and asks for them, and paging in Qwen3-30B's mapping costs 9.3 s of
+    // real I/O, which is not what an evictable byte costs. Subtracting them
+    // from the ask made a 17.17 GB model report that it needed 0.326 GiB, so
+    // the one guard meant to say "this will not fit" said nothing at all.
+    //
+    // `create` here takes no elastic budget, so the whole ask is the heap plus
+    // whatever was bound outside it.
+    //
+    // A slab makes `streamed` mean something else: those bytes are read from an
+    // mmap the GPU never sees, so they are neither allocated nor resident, and
+    // adding them here would refuse exactly the models this exists to run.
+    if (!fits_on_this_gpu(slab ? heap_bytes : heap_bytes + streamed, 0,
+                          slab ? heap_bytes : weights, err)) {
+        return false;
+    }
+    // Two marks, because between them lies the answer to "why is loading slow"
+    // and the two halves have completely different causes. Everything up to
+    // `staged` is the driver's own work -- copying, dequantizing, allocating --
+    // and `PIE_METAL_LOAD_TRACE`'s `load:` line breaks it down further. What
+    // follows is `make_resident`, which is the kernel paging the weights in,
+    // and no amount of driver work makes it cheaper.
+    //
+    // Binding a checkpoint where it lies moves the whole cost across that line:
+    // Qwen3-30B off safetensors is 31.3 s of copying and 2.2 s of residency,
+    // and off the same weights in a `.zt` it is 1 ms and 9.3 s. The second
+    // number rose because the pages are now faulted from the file instead of
+    // from a heap that the copy had already warmed -- and the total still fell
+    // from 33.8 s to 9.6 s, because the file is read once instead of twice.
+    const auto _t0 = std::chrono::steady_clock::now();
+    const auto _mark = [&](const char* what) {
+        if (std::getenv("PIE_METAL_LOAD_TRACE") == nullptr) return;
+        std::fprintf(stderr, "[pie-metal] setup: %s %.0f ms\n", what,
+                     std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - _t0).count());
+    };
     ctx_ = RawMetalContext::create(heap_bytes);
     if (!ctx_) {
         if (err) *err = "RawMetalContext::create failed";
@@ -733,6 +884,7 @@ bool MetalExecutor::Impl::setup_simple(model::ModelFamily family,
     }
     simple_ = SimpleFamilyEngine::create(family, *ctx_, kernels_dir, cfg, load_plan, max_ctx_,
                                          err);
+    _mark("staged");
     if (!simple_) return false;
 
     // The sampler reads through the same staging path qwen3.5 uses, so the
@@ -779,6 +931,7 @@ bool MetalExecutor::Impl::setup_simple(model::ModelFamily family,
     kv_pool_.layers.clear();
 
     ctx_->make_resident();
+    _mark("resident");
     return true;
 }
 
@@ -793,7 +946,7 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
     // The mmap is transient: the LoadPlan copies each finalized tensor
     // once into the resident weights region.
     const auto storage = load_plan.view();
-    pie_loader::CheckpointSource view(storage);
+    auto view = std::make_shared<pie_loader::CheckpointSource>(storage);
     plan_ = plan_heap(
         g_,
         storage.memory.persistent_bytes,
@@ -833,18 +986,23 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
     // WITHOUT them: a heap sized for weights that are then also mapped is the
     // footprint doubled rather than halved, which on a machine where the model
     // only just fits is the difference between running and reading zeros.
-    const auto streams = SimpleFamilyEngine::stream_predicate(
-        model::ModelFamily::Qwen35, stream_routed_experts);
-    const size_t streamed =
-        streams ? size_t(streamable_plan_bytes(load_plan, streams)) : 0;
+    const auto streams = SimpleFamilyEngine::stream_predicate(stream_routed_experts);
+    // Not gated on `streams`; see `setup_simple`.
+    const size_t streamed = size_t(streamable_plan_bytes(load_plan, streams));
+    // Saturating; see `setup_simple` on why equality is the case that matters.
     const size_t resident_weights =
-        plan_.weights_bytes > streamed ? plan_.weights_bytes - streamed : plan_.weights_bytes;
+        plan_.weights_bytes >= streamed ? plan_.weights_bytes - streamed : 0;
     const size_t heap_bytes =
         resident_weights + plan_.io_bytes + plan_.mb_io_bytes +
         consts_budget + (32u << 20);
     const size_t elastic_budget =
         plan_.kv_bytes + plan_.state_bytes + plan_.scratch_bytes +
         plan_.kv_pool_bytes + (taps ? 0u : scratch_pool_bytes);
+
+    // Heap plus mapping: see `setup_simple`. What leaves the heap does not
+    // leave the working set.
+    if (!fits_on_this_gpu(heap_bytes + streamed, elastic_budget, plan_.weights_bytes, err))
+        return false;
 
     ctx_ = RawMetalContext::create(heap_bytes, elastic_budget);
     if (!ctx_) {
@@ -853,7 +1011,7 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
     }
 
     // ── Stage weights/state/KV/IO; bind weight/state/KV/IO slots by ordinal. ──
-    b_ = stage_decode_storage(*ctx_, view, load_plan, g_, plan_, streams);
+    b_ = stage_decode_storage(*ctx_, std::move(view), load_plan, g_, plan_, streams);
     bind_decode_dag(*ctx_, b_, dag_, g_, gdn_prep_);
 
     // ── Scratch pool (colors_used slots) → beta's bind pass. ──
@@ -886,14 +1044,16 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
 
     // ── Compile the kernel PSOs. ──
     std::string load_err;
-    if (!load_decode_psos(*ctx_, kernels_dir, psos_, /*with_argmax=*/false, &load_err,
-                          fuse_residual_, gdn_prep_)) {
+    if (!load_decode_psos(*ctx_, kernels_dir, psos_, g_.quant, /*with_argmax=*/false, &load_err,
+                          fuse_residual_, gdn_prep_, g_.is_moe(),
+                          /*untied=*/!g_.tied_embeddings)) {
         if (err) *err = "PSO load failed: " + load_err;
         ctx_.reset();
         return false;
     }
     if (g_.paged_kv_enabled &&
-        !load_multibatch_psos(*ctx_, kernels_dir, mb_psos_, /*with_d512=*/false, &load_err)) {
+        !load_multibatch_psos(*ctx_, kernels_dir, mb_psos_, g_.quant, /*with_d512=*/false,
+                              &load_err, g_.is_moe())) {
         if (err) *err = "multi-batch PSO load failed: " + load_err;
         ctx_.reset();
         return false;
@@ -1068,6 +1228,45 @@ bool MetalExecutor::Impl::copy_state_slot(uint32_t src_slot, uint32_t dst_slot, 
     // parity by coincidence).
     linear_state_slots_.copy(src_slot, dst_slot);
     return true;
+}
+
+/// Why a step did not succeed, in the GPU's own words when it has any.
+///
+/// Every caller used to say "timed out before its completion fence", which is
+/// true of exactly one of the two ways a step fails. The other -- the command
+/// buffer ran and came back with an error -- was reported as a timeout, and
+/// the error itself was printed to stderr and dropped. A nineteen-gigabyte
+/// model whose every fire failed out of memory produced a clean run, token
+/// zero, and four passing checks.
+std::string step_failure_reason(const StepTiming& timing) {
+    if (timing.gpu_error) {
+        return "the GPU rejected this command buffer: " +
+               (timing.gpu_error_text.empty() ? std::string("no reason given")
+                                              : timing.gpu_error_text);
+    }
+    return "Metal command timed out before its completion fence";
+}
+
+std::uint64_t rs_slot_bytes_for(const DecodeGeometry& g) {
+    const std::uint64_t conv = g.gdn_conv_stride_bytes();
+    const std::uint64_t recur = g.gdn_recurrent_stride_bytes();
+    std::uint64_t gdn_layers = 0;
+    for (int l = 0; l < g.n_layers; ++l) {
+        if (!g.is_full_attn(l)) ++gdn_layers;
+    }
+    return gdn_layers * (2 * conv + recur);
+}
+
+std::uint32_t rs_slots_for_budget(const DecodeGeometry& g, std::uint64_t budget_bytes,
+                                  std::uint32_t floor_slots) {
+    const std::uint64_t per_slot = rs_slot_bytes_for(g);
+    // A geometry with no linear-attention layers has no state to slot; the
+    // count is then whatever the caller needs, at no cost.
+    if (per_slot == 0) return std::max<std::uint32_t>(floor_slots, 1);
+    const std::uint64_t affordable = budget_bytes / per_slot;
+    std::uint64_t slots = std::min<std::uint64_t>(affordable, kPhase1bRsSlots);
+    slots = std::max<std::uint64_t>(slots, std::max<std::uint32_t>(floor_slots, 1));
+    return std::uint32_t(slots);
 }
 
 uint64_t MetalExecutor::Impl::rs_slot_bytes() const {
@@ -1274,7 +1473,9 @@ bool MetalExecutor::Impl::bind_paged_dag(std::string* err) {
         }
         if (!mb_bound_) {
             bind_scratch(*ctx_, mb_dag_, mb_sched_, pool_.data(), int(pool_.size()));
-            bind_decode_consts(*ctx_, mb_dag_, g_, max_ctx_, gdn_prep_);
+            bind_decode_consts(*ctx_, mb_dag_, g_, max_ctx_, gdn_prep_,
+                               std::max(1, g_.max_tokens));
+            mb_bound_tokens_ = std::max(1, g_.max_tokens);
             // Decode writes the shifted conv history straight back over the one
             // it read.  Safe because each channel is read and written by the
             // same thread, in that order, and prep and recurrent touch disjoint
@@ -1865,6 +2066,20 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
     bool stage_failed = false;
     const std::vector<Dispatch> fire_dag =
         build_decode_dag_mb(g_, schedule.N, kMultiBatchOrdinalBase, fuse_residual_, gdn_prep_);
+    // The mixture's routing is the one constant this DAG's shape does not
+    // carry: the sort is told how many (token, slot) pairs to place and how
+    // many rows their tile-padded runs occupy, and a value bound at one width
+    // and fired at another sorts pairs the router never wrote. Everything else
+    // here is per-row and was bound once at setup.
+    //
+    // Rebound only when the width actually changes -- a serving loop that
+    // settles at one batch size pays this once. It allocates nothing (const
+    // slots are cached by (ordinal, index)) and moves no encoded byte, since
+    // the argument table already holds the address whose contents change.
+    if (g_.is_moe() && mb_bound_tokens_ != schedule.N) {
+        bind_token_consts(*ctx_, fire_dag, g_, schedule.N);
+        mb_bound_tokens_ = schedule.N;
+    }
     const StepTiming timing = ctx_->run_step([&](StepEncoder& se) {
         if (ptir != nullptr) {
             for (const auto& callbacks : *ptir)
@@ -1878,7 +2093,7 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
         if (!encode_logits_stage(se, &stage_err)) stage_failed = true;
     });
     if (!timing.succeeded())
-        return fail("Metal command timed out before its completion fence");
+        return fail(step_failure_reason(timing));
     if (stage_failed) return fail(stage_err);
     // Step meter.  This machine is permanently contended (the agent process
     // alone runs at ~250% CPU), so wall-clock A/B swings 3x and cannot decide
@@ -2008,6 +2223,15 @@ bool MetalExecutor::Impl::run_prefill_step(
     // single contended window decides the answer.
     static bool prefill_ab_flip = false;
     if (ab_enabled()) ab_set_arm(prefill_ab_flip = !prefill_ab_flip);
+    // The staging copy rides this command buffer, exactly as it rides the
+    // decode step's. It used to ride only the decode step's: a prefill fire
+    // computed its logits, wrote them, and never copied the sampled row out, so
+    // the caller read whatever the staging buffer held from the fire before --
+    // zeros on the first, which reads back as a confident argmax of token 0.
+    // Nothing failed and nothing was slow; the first token of every prompt was
+    // simply the wrong one.
+    std::string stage_err;
+    bool stage_failed = false;
     const StepTiming timing = ctx_->run_step([&](StepEncoder& se) {
         if (ptir != nullptr) {
             for (const auto& callbacks : *ptir)
@@ -2020,9 +2244,11 @@ bool MetalExecutor::Impl::run_prefill_step(
             for (const auto& callbacks : *ptir)
                 if (callbacks.post_forward) callbacks.post_forward(se);
         }
+        if (!encode_logits_stage(se, &stage_err)) stage_failed = true;
     });
     if (!timing.succeeded())
-        return fail("Metal command timed out before its completion fence");
+        return fail(step_failure_reason(timing));
+    if (stage_failed) return fail(stage_err);
     // Prefill meter.  Prefill fires are few and long, so the per-row cost is what
     // compares across arms -- a raw total confuses "faster" with "shorter prompt".
     if constexpr (false) {
@@ -2208,100 +2434,6 @@ uint32_t MetalExecutor::Impl::argmax() const {
 MetalExecutor::MetalExecutor() = default;
 MetalExecutor::~MetalExecutor() = default;
 
-bool MetalExecutor::setup_native(
-    const std::string& checkpoint_dir,
-    const std::string& kernels_dir,
-    const DecodeGeometry& geometry,
-    std::string* error) {
-    if (checkpoint_dir.empty()) {
-        if (error != nullptr) {
-            *error = "native setup requires a checkpoint directory";
-        }
-        return false;
-    }
-    SetupConfig config;
-    config.checkpoint_dir = checkpoint_dir;
-    // `setup()` compiles the plan itself, so the snapshot dir *is* the input.
-    // There is no serialized plan to hand in any more.
-    config.snapshot_dir = checkpoint_dir;
-    config.kernels_dir = kernels_dir;
-    config.arch_name = "qwen3_5";
-    config.vocab_size = static_cast<std::uint32_t>(geometry.vocab);
-    config.has_linear_attn = true;
-    config.total_pages = static_cast<std::uint32_t>(std::max(0, geometry.total_pages));
-    config.kv_page_size = static_cast<std::uint32_t>(std::max(1, geometry.kv_page_size));
-    config.max_forward_tokens =
-        static_cast<std::uint32_t>(std::max(1, geometry.max_tokens));
-    config.max_forward_requests =
-        static_cast<std::uint32_t>(std::max(1, geometry.max_requests));
-    config.storage_page_size =
-        static_cast<std::uint32_t>(std::max<long>(1, ::sysconf(_SC_PAGESIZE)));
-    return setup(config, error);
-}
-
-bool MetalExecutor::setup_kv_pool_native(
-    std::uint32_t total_pages,
-    std::uint32_t page_size,
-    std::string* error) {
-    return ready() && impl_->setup_kv_pool(total_pages, page_size, error);
-}
-
-void MetalExecutor::reset_state_native() {
-    if (ready()) impl_->reset_state();
-}
-
-void MetalExecutor::reset_state_native(std::uint32_t slot) {
-    if (ready()) impl_->reset_state(slot);
-}
-
-bool MetalExecutor::copy_state_slot_native(
-    std::uint32_t src_slot,
-    std::uint32_t dst_slot,
-    std::string* error) {
-    return ready() && impl_->copy_state_slot(src_slot, dst_slot, error);
-}
-
-StepTiming MetalExecutor::step_native(
-    std::uint32_t token_id,
-    std::uint32_t position,
-    std::uint32_t slot) {
-    return ready() ? impl_->step(token_id, position, slot) : StepTiming{};
-}
-
-bool MetalExecutor::run_batch_step_native(
-    const BatchSchedule& schedule,
-    const BatchStepInputs& inputs,
-    std::string* error) {
-    return ready() && impl_->run_batch_step(schedule, inputs, error);
-}
-
-std::uint64_t MetalExecutor::paged_bind_generation_native() const {
-    return ready() ? impl_->paged_bind_generation_ : 0;
-}
-
-const KvPagePool& MetalExecutor::kv_pool_native() const {
-    static const KvPagePool empty;
-    return ready() ? impl_->kv_pool() : empty;
-}
-
-int MetalExecutor::vocab_native() const {
-    return ready() ? impl_->vocab() : 0;
-}
-
-void MetalExecutor::copy_logits_f32_native(float* output) const {
-    if (ready()) impl_->copy_logits_f32(output);
-}
-
-void MetalExecutor::copy_batch_logits_f32_native(
-    std::uint32_t token_row,
-    float* output) const {
-    if (ready()) impl_->copy_batch_logits_f32(token_row, output);
-}
-
-std::uint32_t MetalExecutor::argmax_native() const {
-    return ready() ? impl_->argmax() : 0;
-}
-
 bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
     // Which family is this? Answered from the config's own `model_type`, so a
     // checkpoint gets a diagnosis about ITSELF rather than about the family that
@@ -2314,6 +2446,7 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
     // qwen3.5's and stays untouched.
     case model::ModelFamily::Gemma4:
     case model::ModelFamily::GptOss:
+    case model::ModelFamily::Llama:
         break;
     case model::ModelFamily::Unknown:
         if (err != nullptr) {
@@ -2328,14 +2461,80 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
     // (`loader/architecture.md` §9).
     pie_loader::LoadPlan load_plan;
     try {
-        load_plan = compile_load_plan(cfg.snapshot_dir, metal_device_target(), cfg.model_type);
+        // `tie_word_embeddings` is the one config fact a contract needs and
+        // cannot see: it decides whether the head is its own tensor or the
+        // embedding table read a second time, and a contract only sees tensors.
+        model::ContractFacts contract_facts;
+        // Whichever family this is, its own reading of the flag. They are
+        // separate fields because they are separate configs, and a single
+        // shared one would have made the qwen3.5 half silently inherit
+        // llama's default the moment a checkpoint of either kind loaded.
+        contract_facts.tied_embeddings =
+            model::model_family_of(cfg.model_type) == model::ModelFamily::Qwen35
+                ? cfg.qwen35.tied_embeddings
+                : cfg.llama.tied_embeddings;
+        contract_facts.quant_bits = cfg.quant_bits;
+        contract_facts.quant_group_size = cfg.quant_group_size;
+        load_plan = compile_load_plan(cfg.snapshot_dir, metal_device_target(), cfg.model_type,
+                                      contract_facts);
     } catch (const std::exception& error) {
         if (err != nullptr) {
             *err = std::string("LoadPlan compile failed: ") + error.what();
         }
         return false;
     }
-    DecodeGeometry geom{};  // shipped qwen3.6 defaults
+    // The shape this checkpoint actually has, from its own config.
+    //
+    // This was `DecodeGeometry geom{}` -- default-constructed, with one preview
+    // checkpoint's dimensions compiled in as the defaults. Every other member
+    // of the family therefore ran at the wrong hidden size, layer count and
+    // linear-attention geometry, and said nothing about it: the loader binds by
+    // NAME, and a name carries no dimension to disagree with.
+    DecodeGeometry geom{};
+    const model::ModelFamily family = model::model_family_of(cfg.model_type);
+    // Only this family's. `geometry_from_facts` reads `cfg.qwen35`, which a
+    // llama or gemma4 checkpoint never fills, and it refuses an empty one --
+    // correctly, but it was being asked unconditionally, so every simple
+    // family's setup died on "qwen3.5 geometry: config carried no decoder
+    // shape" before it ever reached `setup_simple`, which builds its own
+    // geometry from its own facts.
+    if (family == model::ModelFamily::Qwen35) {
+        std::string gerr;
+        if (cfg.quant_bits != 0) geom.quant.bits = cfg.quant_bits;
+        if (cfg.quant_group_size != 0) geom.quant.group = cfg.quant_group_size;
+        if (!geometry_from_facts(cfg.qwen35, geom, &gerr)) {
+            if (err != nullptr) *err = gerr;
+            return false;
+        }
+        // The routed FFN is built -- DAG, kernels, launch shapes, constants,
+        // names, pool, and the per-step rebinding of the one constant the
+        // batch width can change (`bind_token_consts`, below). There is no
+        // refusal here any more: what a mixture still cannot have is a SHARED
+        // expert, and `geometry_from_facts` above already refuses that from
+        // the config, before any of this is built.
+
+        // Whether the head is its own tensor is decided ONCE, by the contract,
+        // and read back here rather than decided a second time. The contract's
+        // rule is that a shipped `lm_head` beats whatever the config says --
+        // and the config can say nothing at all: Qwen3.5-35B-A3B is a
+        // multimodal wrapper that spells `tie_word_embeddings` at the TOP
+        // level, outside the `text_config` this family parses, so the facts
+        // defaulted to tied. The contract staged `embed_tokens` and `lm_head`;
+        // the DAG asked for `shared_embedding`; the load stopped on "unstaged
+        // weight shared_embedding.weight" -- two opinions about one fact. The
+        // plan's own tensor list is the only opinion that can be wrong in a
+        // way the binding survives, so it is the one the DAG follows.
+        const auto plan_view = load_plan.view();
+        bool plan_ties = false;
+        for (std::size_t i = 0; i < plan_view.tensors.len; ++i) {
+            if (pie_loader::bytes_to_string(plan_view.tensors.ptr[i].name) ==
+                "shared_embedding.weight") {
+                plan_ties = true;
+                break;
+            }
+        }
+        geom.tied_embeddings = plan_ties;
+    }
     // Phase 1b (review fix B): really allocate `kPhase1bRsSlots` resident
     // GDN conv+recurrent state slots — heap_layout.hpp's `plan_heap` sizes
     // the State region as `slots * per_slot_bytes` and heap_bind.cpp binds
@@ -2343,12 +2542,18 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
     // slot count, so this only grows reserved-but-idle memory; it does not
     // change the sealed M=1 decode path's behavior. `copy_state` operates
     // truthfully over these slots (real memory, not aspirational).
-    geom.max_slots = kPhase1bRsSlots;
+    // As many slots as the budget buys for THIS checkpoint's state, not a
+    // count chosen against a model whose slot was three times smaller. The
+    // floor is the concurrency the caller asked for: a driver that reserves
+    // fewer slots than it accepts requests hangs rather than queues.
+    geom.max_slots = int(rs_slots_for_budget(
+        geom, kRsSlotBudgetBytes,
+        std::min(cfg.max_forward_requests, kPagedMaxForwardRequests)));
     // Bounded, actually allocated/bound multi-batch capacity.  The paged path
     // has no hidden ring fallback: every advertised row/request has an IO,
     // scratch, logits, slot-state, and CSR binding.
-    geom.max_requests = static_cast<int>(std::min(cfg.max_forward_requests,
-                                                  kPagedMaxForwardRequests));
+    geom.max_requests = static_cast<int>(
+        std::min<std::uint32_t>(cfg.max_forward_requests, std::uint32_t(geom.max_slots)));
     geom.max_tokens = static_cast<int>(std::min(cfg.max_forward_tokens,
                                                 kPagedMaxForwardTokensCeiling));
     geom.max_slots = std::max(geom.max_slots, geom.max_requests);
@@ -2362,7 +2567,26 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
             : geom.head_dim;
     geom.kv_page_size = static_cast<int>(cfg.kv_page_size);
     geom.total_pages = static_cast<int>(cfg.total_pages);
-    geom.paged_kv_enabled = cfg.total_pages > 0 && cfg.kv_page_size > 0 &&
+    // `total_pages` and `max_ctx_tokens` are two spellings of one capacity, and
+    // only the simple families read the second: `setup_simple` derives
+    // `total_pages = kv_max_ctx / page_size` for itself. The native path read
+    // the first alone, so a caller that sized its ring in TOKENS -- which is
+    // what the field is for, and what `llama_bench` does -- got zero pages, a
+    // DAG built unpaged, and a pool left disabled. Nothing failed: setup
+    // succeeded and `kv_pool_page_size()` returned zero to a caller with no
+    // reason to expect it. One capacity, one derivation, in both halves.
+    //
+    // Scoped to this family on purpose. The simple engines compute their own
+    // pool from `max_ctx` a few lines into `setup_simple`, and handing them a
+    // second answer here would be two derivations of one fact again.
+    if (family == model::ModelFamily::Qwen35 && geom.total_pages == 0 &&
+        geom.kv_page_size > 0) {
+        const std::uint32_t ctx =
+            cfg.max_ctx_tokens > 0 ? cfg.max_ctx_tokens : kMetalMaxCtxTokens;
+        const std::uint32_t ps = std::uint32_t(geom.kv_page_size);
+        geom.total_pages = static_cast<int>((ctx + ps - 1) / ps);
+    }
+    geom.paged_kv_enabled = geom.total_pages > 0 && geom.kv_page_size > 0 &&
                             geom.max_tokens > 0 && geom.max_requests > 0;
     // The vocabulary is a property of the checkpoint, so take it from the
     // checkpoint. It used to be cross-checked against the hard-coded 248320 and
@@ -2372,7 +2596,6 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
         geom.vocab = static_cast<int>(cfg.vocab_size);
     }
     std::string derr;
-    const model::ModelFamily family = model::model_family_of(cfg.model_type);
     if (family != model::ModelFamily::Qwen35) {
         if (!impl->setup_simple(family, cfg.kernels_dir, cfg, load_plan, &derr)) {
             if (err != nullptr) *err = "Metal forward setup failed: " + derr;
@@ -2400,9 +2623,10 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
     // copy_state) do not depend on the pool at all; only copy_kv/resize_pool
     // would report UNSUPPORTED if this didn't succeed (e.g. total_pages==0
     // in config, the default, deliberately leaves the pool disabled).
-    if (cfg.total_pages > 0 && cfg.kv_page_size > 0) {
+    if (geom.total_pages > 0 && geom.kv_page_size > 0) {
         std::string pool_err;
-        if (!impl->setup_kv_pool(cfg.total_pages, cfg.kv_page_size, &pool_err)) {
+        if (!impl->setup_kv_pool(std::uint32_t(geom.total_pages),
+                                 std::uint32_t(geom.kv_page_size), &pool_err)) {
             std::cerr << "[pie-driver-metal] MetalExecutor::setup: KV page pool allocation "
                          "failed, copy_kv/resize_pool will be UNSUPPORTED: "
                       << pool_err << "\n";
@@ -2417,6 +2641,19 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
 bool MetalExecutor::ready() const { return impl_ != nullptr && impl_->ready(); }
 
 std::uint32_t MetalExecutor::vocab() const { return vocab_; }
+
+WeightBytes MetalExecutor::weight_bytes() const {
+    if (!ready()) return {};
+    // Two decoders live here -- the llama/qwen3 path with its own `BoundDecode`
+    // and everything that runs through a `SimpleFamilyEngine` -- and both stage
+    // the same kind of map. Asking each for its map rather than teaching each
+    // to do the arithmetic keeps the counting rule in one place.
+    if (const SimpleFamilyEngine* eng = impl_->simple_engine(); eng != nullptr) {
+        return eng->weight_bytes();
+    }
+    return pie::metal::weight_bytes(impl_->b_.weights, impl_->g_.n_experts,
+                                    impl_->g_.experts_per_token);
+}
 
 RawMetalContext* MetalExecutor::command_context() {
     return ready() ? impl_->ctx_.get() : nullptr;
@@ -2809,6 +3046,20 @@ bool MetalExecutor::run_paged_batch_forward(const std::vector<MemberForwardDesc>
         }
         const std::size_t request_count =
             d.qo_indptr.size() - 1;
+        // A hybrid family's linear attention state is not in the KV pages. A
+        // member that names no slot is asking a recurrent decoder to run with
+        // no history and to write its own nowhere -- which is exactly what a
+        // caller that never learned about slots sends, and exactly what used
+        // to be accepted. It ran: every member fell to slot zero, the fire
+        // computed each sequence on top of the last one's state, and the
+        // answers came back confident and wrong. The two-member gate caught it
+        // at a relative error of 0.5 only because someone went looking.
+        if (rs_slots() > 0 && !d.has_rs_slot) {
+            reject(i,
+                   "this decoder carries recurrent state, so a paged member "
+                   "must name the slot its state lives in");
+            continue;
+        }
         const bool legacy_single_rs =
             d.has_rs_slot && request_count == 1 &&
             d.request_rs_slot_ids.empty();
