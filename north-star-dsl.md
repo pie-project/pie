@@ -173,8 +173,44 @@ peepholes, eligibility predicates, thresholds.
      lowered traces state the batched kernels only, and the parity
      entry keeps the semantic trace + interpreter. If the harness path
      ever hits a lowered trace, the loud unknown-kernel throw names it.
-5. **Delete** the hand-written arm code and the semantic-only trace path
-   once every consumer reads class traces.
+5. **Delete** the choice-deriving code once every body() fire has a
+   class. Scope, precisely — rung 5 deletes from the DECLARED executors:
+   the semantic-walk cascades (the conv/recurrence/attention/KV-write
+   choice arms), the hoisted `use_*` booleans, and the
+   commit/state-only op filters. It does NOT delete the semantic TRACE
+   (parity reference, site summaries, the Metal emitter's input) nor the
+   hand-written paged bodies (they serve everything the declared gate
+   excludes: hooks, lora, custom masks, TP, quantized projections — the
+   fallback tier is a feature, not a leftover).
+
+   **The mask classes (direction set in review, 2026-08-02).** Custom
+   masks are the other load-bearing per-fire attachment, and they are
+   CLASSES, not guards: a masked decode swaps the attention kernel to
+   the custom-mask prefill dispatch AND breaks the fused decode-QKV
+   arm's predicate — the op list changes. `MaskedDecode` (wire 5) and
+   `MaskedPrefill` (wire 6): the general QKV arm + the fused
+   qk-norm+rope + a DISTINCT stated symbol for the masked attention
+   (`dispatch_attention_flashinfer_prefill_bf16_masked` — the stash
+   pseudo-symbol precedent: same C++ dispatch, different operation,
+   because "bind the mask if present" back in the driver would be the
+   smarts we deleted). Mask data crosses as runtime args of the stated
+   kernel, commit_lens's peer. This EXPANDS the declared gate — masked
+   fires fall back to the hand-written path entirely today — and the
+   item-A harnesses (naive-masked, attention-sink, sliding-window) are
+   the ready-made parity gates. llama_like first, qwen3_5 after.
+
+   **The frozen-verify amendment (decided while 4c-iv landed).** The 4b
+   geometry called `verify_frozen` a kernel parameter — true for
+   `write_state`, but the frozen service ALSO stash-writes (the memcpy
+   trio after the in-proj splits), which changes the op list, and by our
+   own rule that makes it a CLASS: `FireClass::FrozenVerify` (wire 4) =
+   the Prefill body + `verify_stash_store` per linear layer.
+   `write_state` remains the runtime argument it already is — the class
+   carries the op, not the flag. With it, every qwen3_5 body() fire has
+   a class, which is exactly rung 5's precondition. The legacy
+   slot-less parity-entry paths leave the declared executor entirely
+   (fall back to hand-written) — they were a harness convenience, and
+   the harness keeps the hand-written path anyway.
 
 ## What this does not reopen
 

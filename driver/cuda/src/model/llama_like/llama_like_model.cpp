@@ -104,7 +104,6 @@ void LlamaLikeModel::body(Workspace& ws,
         // declared executor here would silently drop the adapter — the
         // honest gate is exclusion.
         in.lora == nullptr &&
-        in.custom_mask_d == nullptr &&
         // Explicit KV-write fires are in scope (declared_forward.hpp says
         // why: every graph-replayed decode fire carries them), but only
         // when the descriptors actually arrived — the same guard the
@@ -128,7 +127,8 @@ void LlamaLikeModel::body(Workspace& ws,
             in.logit_row_indices_d, in.num_logit_rows,
             in.w_page_d, in.w_off_d,
             in.row_valid_d, in.has_write_desc,
-            in.runtime_window_left);
+            in.runtime_window_left,
+            in.custom_mask_d, in.custom_mask_indptr_d);
         return;
     }
     llama_like_forward_paged(

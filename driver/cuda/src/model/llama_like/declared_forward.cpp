@@ -101,6 +101,7 @@ enum class LaunchKernel {
     AttentionFlashinferDecode,
     DequantKvCacheLayerToBf16Active,
     AttentionFlashinferPrefill,
+    AttentionFlashinferPrefillCustom,
     WriteKvExplicit,
     WriteKvToPages,
 };
@@ -126,6 +127,9 @@ LaunchKernel resolve_launch_kernel(std::string_view kernel) {
     }
     if (kernel == "dispatch_attention_flashinfer_prefill_bf16") {
         return LaunchKernel::AttentionFlashinferPrefill;
+    }
+    if (kernel == "dispatch_attention_flashinfer_prefill_custom") {
+        return LaunchKernel::AttentionFlashinferPrefillCustom;
     }
     if (kernel == "launch_write_kv_explicit_bf16") {
         return LaunchKernel::WriteKvExplicit;
@@ -294,10 +298,16 @@ LlamaLikeDeclaredPlan build_llama_like_declared_plan(
         facts, cuda, pie_forward::PieForwardFireClass::Decode);
     out.prefill = pie_forward::ForwardPlan::trace_llama_like_cuda(
         facts, cuda, pie_forward::PieForwardFireClass::Prefill);
+    out.masked_decode = pie_forward::ForwardPlan::trace_llama_like_cuda(
+        facts, cuda, pie_forward::PieForwardFireClass::MaskedDecode);
+    out.masked_prefill = pie_forward::ForwardPlan::trace_llama_like_cuda(
+        facts, cuda, pie_forward::PieForwardFireClass::MaskedPrefill);
     // Drift between the declaration's stated kernels and this executor's
     // registry fails at model load, not mid-fire.
     validate_stated_kernels(out.decode);
     validate_stated_kernels(out.prefill);
+    validate_stated_kernels(out.masked_decode);
+    validate_stated_kernels(out.masked_prefill);
 
     // The digest naming what these traces were taken from — the same
     // format `pie_forward::emit_cuda::facts_digest` embeds in the
@@ -351,7 +361,9 @@ void llama_like_forward_declared(
     const std::uint32_t* w_off_d,
     const std::uint8_t* row_valid_d,
     bool has_write_desc,
-    int runtime_window_left)
+    int runtime_window_left,
+    const std::uint8_t* custom_mask_d,
+    const std::int32_t* custom_mask_indptr_d)
 {
     // Rung 3: the static form, when opted in and emitted for exactly this
     // deployment. Byte-for-byte the same launches as the interpreter walk
@@ -366,7 +378,8 @@ void llama_like_forward_declared(
                      "  live:    %s\n  emitted: %s\n",
                      declared.facts_digest.c_str(), kGeneratedForDigest);
     }
-    if (generated_forward_enabled() &&
+    const bool has_custom_mask = custom_mask_d != nullptr;
+    if (!has_custom_mask && generated_forward_enabled() &&
         declared.facts_digest == kGeneratedForDigest) {
         (is_pure_decode ? generated_llama_like_decode
                         : generated_llama_like_prefill)(
@@ -379,10 +392,16 @@ void llama_like_forward_declared(
             w_page_d, w_off_d, row_valid_d, has_write_desc);
         return;
     }
-    // Rung 2: the fire's class picks its trace, and the trace states every
-    // kernel — nothing below derives a path (north-star-dsl.md).
+    // Rung 2 + the mask classes: the fire's class picks its trace, and
+    // the trace states every kernel — nothing below derives a path
+    // (north-star-dsl.md). A mask is a class axis, not a branch: masked
+    // fires walk traces in which the fused-QKV arm never existed and the
+    // attention IS the custom-mask dispatch.
     const pie_forward::ForwardPlan& plan =
-        is_pure_decode ? declared.decode : declared.prefill;
+        has_custom_mask
+            ? (is_pure_decode ? declared.masked_decode
+                              : declared.masked_prefill)
+            : (is_pure_decode ? declared.decode : declared.prefill);
     // Parity-harness visibility (PIE_HOOK_PREFIX_TRACE's pattern): without
     // it a silent fallback to the hand-written path would be
     // indistinguishable from a passing A/B run.
@@ -856,6 +875,25 @@ void llama_like_forward_declared(
                 const int num_pages_in_batch = kv_page_indptr_h[R];
                 kernels::launch_dequant_kv_cache_layer_to_bf16_active(
                     kv_view, kv_page_indices, num_pages_in_batch, stream);
+                break;
+            }
+            case LaunchKernel::AttentionFlashinferPrefillCustom: {
+                // The hand-written custom-mask branch, minus the choosing
+                // (llama_like.cpp:1457): the custom dispatch takes the
+                // layer view whole (no dequant) and the mask data rides
+                // as runtime args of the stated kernel.
+                if (prefill_plan == nullptr) {
+                    throw std::runtime_error(
+                        "declared forward: trace states the custom-mask "
+                        "prefill kernel but prepare built no plan");
+                }
+                auto kv_view = cache.layer_view(L);
+                ops::dispatch_attention_flashinfer_prefill_custom(
+                    *prefill_plan,
+                    attn_q, kv_view, attn_out_buf,
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
+                    attn_ws, stream);
                 break;
             }
             case LaunchKernel::WriteKvExplicit: {

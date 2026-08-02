@@ -260,12 +260,16 @@ pub fn trace(
             match class {
                 FireClass::Decode => "decode",
                 FireClass::Prefill => "prefill",
+                FireClass::MaskedDecode => "masked_decode",
+                FireClass::MaskedPrefill => "masked_prefill",
                 // The service classes are qwen3_5's; llama_like has no
                 // spec-decode repair pass. The ffi entry rejects them
                 // before tracing; this is the same statement for direct
                 // Rust callers.
-                FireClass::CommitAdvance | FireClass::StateOnly => {
-                    panic!("llama_like has no CommitAdvance/StateOnly class")
+                FireClass::CommitAdvance
+                | FireClass::StateOnly
+                | FireClass::FrozenVerify => {
+                    panic!("llama_like has no MTP service classes")
                 }
             }
         ),
@@ -1124,6 +1128,17 @@ pub mod cuda {
             vec![qkv.id, a.id, b.id],
             None,
         );
+    }
+
+    /// `ops::dispatch_attention_flashinfer_prefill_custom`: the
+    /// custom-mask prefill dispatch — a genuinely distinct launcher, so
+    /// no pseudo-symbol is needed. The mask data (BRLE bytes + indptr)
+    /// crosses as runtime args of the stated kernel, commit_lens's peer;
+    /// stated by the Masked* classes, whose existence is what expresses
+    /// "a masked decode is not a decode" (the fused-QKV arm's predicate
+    /// breaks with it).
+    pub fn attention_flashinfer_prefill_custom(q: &Val, kv: &Kv, q_width: u32) -> Val {
+        attn(q, kv, q_width, "dispatch_attention_flashinfer_prefill_custom")
     }
 
     fn dequant(kv: &Kv) {

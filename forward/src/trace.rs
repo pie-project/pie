@@ -155,6 +155,18 @@ pub enum FireClass {
     /// The speculative repair's whole-backbone flavor: everything except
     /// the final-norm/lm_head epilogue.
     StateOnly,
+    /// The frozen-verify service (qwen3_5 MTP): the prefill body plus a
+    /// verify-stash STORE per linear layer. Reserved by the rung-5
+    /// geometry; its trace is the next qwen3_5 slice.
+    FrozenVerify,
+    /// Decode-shaped fire carrying a custom attention mask: the masked
+    /// attention runs the custom-mask prefill dispatch, and the fused
+    /// decode-QKV arm's predicate (`!has_custom_mask`) breaks — the op
+    /// list changes, so the mask is a CLASS, not a guard
+    /// (north-star-dsl.md, the mask classes).
+    MaskedDecode,
+    /// Prefill-shaped fire carrying a custom attention mask.
+    MaskedPrefill,
 }
 
 // (The short-lived `AttnKernel` enum — rung 1's `Attention.param1` tag —

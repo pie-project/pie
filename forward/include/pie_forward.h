@@ -172,13 +172,14 @@ enum class PieForwardQkNorm : uint32_t {
 enum class PieForwardFireClass : uint32_t {
   Decode = 0,
   Prefill = 1,
-  /// The qwen3_5 spec-decode repair pass (only the linear layers'
-  /// conv+prep+recurrence). Accepted by the qwen3_5 hybrid CUDA entry
-  /// only; llama_like has no service classes and keeps refusing it.
+  /// qwen3_5 MTP service classes (2/3/4); llama_like rejects them.
   CommitAdvance = 2,
-  /// The qwen3_5 backbone-only pass (everything minus the
-  /// final-norm/lm_head epilogue). Same acceptance rule.
   StateOnly = 3,
+  /// Reserved (the frozen-verify slice); both entries reject it today.
+  FrozenVerify = 4,
+  /// The mask classes (llama_like; qwen3_5's masked slice is later).
+  MaskedDecode = 5,
+  MaskedPrefill = 6,
 };
 
 /// Mirrors [`crate::trace::GuardPred`]'s wire KINDS (each arm crosses as

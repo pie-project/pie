@@ -184,7 +184,18 @@ fn llama_like_text(
                 }
                 Some((_, FireClass::Decode)) => cuda::attention_flashinfer_decode(&q, &w.kv, q_w),
                 Some((_, FireClass::Prefill)) => cuda::attention_flashinfer_prefill(&q, &w.kv, q_w),
-                Some((_, FireClass::CommitAdvance | FireClass::StateOnly)) => {
+                // The masked classes: the custom-mask prefill dispatch,
+                // whatever the fire's shape — and the fused decode-QKV
+                // arm never fired above because its predicate is
+                // class == Decode, which is exactly "a masked decode is
+                // not a decode" stated as an op-list difference.
+                Some((_, FireClass::MaskedDecode | FireClass::MaskedPrefill)) => {
+                    cuda::attention_flashinfer_prefill_custom(&q, &w.kv, q_w)
+                }
+                Some((
+                    _,
+                    FireClass::CommitAdvance | FireClass::StateOnly | FireClass::FrozenVerify,
+                )) => {
                     unreachable!("llama_like refuses the service classes at trace start")
                 }
                 None => attention(&q, &w.kv, q_w),
@@ -514,6 +525,9 @@ fn gdn_attn_body(
         Some((_, FireClass::CommitAdvance)) => {
             unreachable!("CommitAdvance traces its own pass, never the layer body")
         }
+        Some((_, FireClass::FrozenVerify | FireClass::MaskedDecode | FireClass::MaskedPrefill)) => {
+            unreachable!("class not yet traced for qwen3_5 (entry rejects)")
+        }
     };
     let (q, k, v, g, beta) = gdn_prep(
         &qkv,
@@ -573,6 +587,9 @@ fn gdn_attn_body(
         }
         Some((_, FireClass::CommitAdvance)) => {
             unreachable!("CommitAdvance traces its own pass, never the layer body")
+        }
+        Some((_, FireClass::FrozenVerify | FireClass::MaskedDecode | FireClass::MaskedPrefill)) => {
+            unreachable!("class not yet traced for qwen3_5 (entry rejects)")
         }
     };
 
@@ -771,6 +788,9 @@ fn full_attn_body(
         Some((_, FireClass::CommitAdvance)) => {
             unreachable!("CommitAdvance traces its own pass, never the layer body")
         }
+        Some((_, FireClass::FrozenVerify | FireClass::MaskedDecode | FireClass::MaskedPrefill)) => {
+            unreachable!("class not yet traced for qwen3_5 (entry rejects)")
+        }
     };
     let gated = sigmoid_gate_mul(&attn, &gate);
     y += matmul(&gated, &w.o_proj);
@@ -897,6 +917,9 @@ fn qwen3_5_hybrid_text(facts: &Qwen35HybridFacts, lower: Qwen35Lower<'_>) -> For
                 FireClass::Prefill => "prefill",
                 FireClass::CommitAdvance => "commit_advance",
                 FireClass::StateOnly => "state_only",
+                FireClass::FrozenVerify | FireClass::MaskedDecode | FireClass::MaskedPrefill => {
+                    unreachable!("class not yet traced for qwen3_5 (entry rejects)")
+                }
             }
         ),
     };

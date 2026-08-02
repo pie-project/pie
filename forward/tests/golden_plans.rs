@@ -337,3 +337,37 @@ fn qwen3_0_6b_cuda_prefill() {
         ),
     );
 }
+
+/// The mask classes (north-star-dsl.md): a masked decode is NOT a decode
+/// — the fused decode-QKV arm's predicate is `class == Decode`, so the
+/// masked trace carries the general QKV arm (with the fused
+/// qk-norm+rope, which masking does not break) and states the
+/// custom-mask prefill dispatch. The golden pins exactly that op-list
+/// difference; the mask DATA never appears — it is a runtime argument
+/// of the stated kernel, commit_lens's peer.
+#[test]
+fn qwen3_0_6b_cuda_masked_decode() {
+    check_plan(
+        "qwen3_0_6b.cuda.masked_decode",
+        &llama_like_cuda(
+            &LlamaLikeFacts::qwen3_0_6b(),
+            &LlamaLikeCudaFacts::qwen3_0_6b_l40s(),
+            FireClass::MaskedDecode,
+        ),
+    );
+}
+
+/// The masked prefill: the prefill body with the attention swapped to
+/// the custom-mask dispatch (and no dequant — the custom dispatch takes
+/// the layer view whole).
+#[test]
+fn qwen3_0_6b_cuda_masked_prefill() {
+    check_plan(
+        "qwen3_0_6b.cuda.masked_prefill",
+        &llama_like_cuda(
+            &LlamaLikeFacts::qwen3_0_6b(),
+            &LlamaLikeCudaFacts::qwen3_0_6b_l40s(),
+            FireClass::MaskedPrefill,
+        ),
+    );
+}

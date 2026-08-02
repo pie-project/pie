@@ -26,10 +26,12 @@
 //     two different kernels — IS expressed now: the declaration's
 //     `HasWriteDesc` Guard states both arms, the first live Guard;
 //     rung 4a.)
-// Everything the trace cannot express yet (hooks, custom masks, TP,
-// vision, quantized projections, non-standard rope, qkv bias)
-// falls back to `llama_like_forward_paged` — the caller gates, `build`
-// refuses. Post-norm placement (olmo2) and the global qk-norm convention
+// Everything the trace cannot express yet (hooks, TP, vision, quantized
+// projections, non-standard rope, qkv bias) falls back to
+// `llama_like_forward_paged` — the caller gates, `build` refuses.
+// Custom masks ARE expressed since the mask classes (north-star-dsl.md):
+// masked fires walk `masked_decode`/`masked_prefill` traces stating the
+// custom-mask prefill dispatch. Post-norm placement (olmo2) and the global qk-norm convention
 // ARE in scope: the trace states both as facts (the matmul(beta=0) →
 // rmsnorm → residual_add triplet; plain row Rmsnorm on q/k), and this
 // executor launches the hand-written post-norm / `rmsnorm_qk`-global
@@ -106,6 +108,12 @@ struct LlamaLikeDeclaredPlan {
     pie_forward::ForwardPlan plan;
     pie_forward::ForwardPlan decode;
     pie_forward::ForwardPlan prefill;
+    // The mask classes (north-star-dsl.md): a masked decode is not a
+    // decode — the fused-QKV arm's predicate breaks and the attention is
+    // the custom-mask prefill dispatch. Masked fires walked these from
+    // the moment they stopped falling back to the hand-written path.
+    pie_forward::ForwardPlan masked_decode;
+    pie_forward::ForwardPlan masked_prefill;
     // What the class traces were taken from, in the format the generated
     // .inc embeds (`emit_cuda::facts_digest`); rung 3's dispatch runs the
     // static form only on exact match.
@@ -168,6 +176,8 @@ void llama_like_forward_declared(
     const std::uint32_t* w_off_d,
     const std::uint8_t* row_valid_d,
     bool has_write_desc,
-    int runtime_window_left);
+    int runtime_window_left,
+    const std::uint8_t* custom_mask_d,
+    const std::int32_t* custom_mask_indptr_d);
 
 }  // namespace pie_cuda_driver::model
