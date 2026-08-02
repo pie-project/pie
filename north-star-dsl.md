@@ -225,6 +225,28 @@ peepholes, eligibility predicates, thresholds.
    declared gate, and it is where the declared world and the
    polymorphic-batching machinery finally meet in one text.
 
+   **HookSite recon findings (2026-08-02, slice begun).** Three facts
+   sharpen the slice:
+   - The MODEL body has exactly TWO sites, not four: `OnAttnProj`
+     (observes q before attention, intervenes through the page-mask
+     sink — `invoke_stage_hook` at llama_like.cpp:1260, preceded by
+     `page_mask.begin_layer`) and `OnAttn` (post-attention, scores via
+     the LayerScoreCapture sideband, :1502). PTIR's Prologue and
+     Epilogue run DISPATCH-side around the logits — the post-logit
+     divergence plan.md measured as nearly free — so they are not trace
+     ops of the forward at all.
+   - The incremental parity target is the ALL-HOOKED fire
+     (fast_rows == 0): the hand-written path runs the general unfused
+     sequence for every row plus the stage rings — exactly a
+     `HookedDecode`/`HookedPrefill` class trace (general QKV arm + the
+     fused qk-norm+rope, which is hook-independent + HookSite ops). The
+     MIXED fire (0 < fast_rows < R) needs the `Peel` op — loop peeling
+     as vocabulary: two regions that BOTH run, over complementary row
+     ranges, `fast_rows` the runtime split — and is its own increment.
+   - Open recon before the driver wiring: the hooked decode's attention
+     kernel under a page-mask intervention (which dispatch consumes the
+     narrowed page list) — the hooked classes must state it.
+
    **The frozen-verify amendment (decided while 4c-iv landed).** The 4b
    geometry called `verify_frozen` a kernel parameter — true for
    `write_state`, but the frozen service ALSO stash-writes (the memcpy
