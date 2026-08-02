@@ -114,6 +114,12 @@ struct LlamaLikeDeclaredPlan {
     // the moment they stopped falling back to the hand-written path.
     pie_forward::ForwardPlan masked_decode;
     pie_forward::ForwardPlan masked_prefill;
+    // The all-hooked classes (the HookSite slice, fast_rows == 0): the
+    // general unfused body + the two per-layer hook sites + the
+    // WantsAttnScore-guarded attention. Mixed fires (0 < fast_rows < R)
+    // stay hand-written until the Peel op.
+    pie_forward::ForwardPlan hooked_decode;
+    pie_forward::ForwardPlan hooked_prefill;
     // What the class traces were taken from, in the format the generated
     // .inc embeds (`emit_cuda::facts_digest`); rung 3's dispatch runs the
     // static form only on exact match.
@@ -178,6 +184,12 @@ void llama_like_forward_declared(
     bool has_write_desc,
     int runtime_window_left,
     const std::uint8_t* custom_mask_d,
-    const std::int32_t* custom_mask_indptr_d);
+    const std::int32_t* custom_mask_indptr_d,
+    // The fire's attached stage programs (the HookSite slice); null on
+    // unhooked fires. The caller's gate admits only all-hooked fires
+    // (hook_free_prefix_rows == 0) — the sites and the score guard are
+    // in the hooked class traces, and the page-mask/score sidebands are
+    // this executor's bracket mechanics.
+    const StageHooks* stage_hooks);
 
 }  // namespace pie_cuda_driver::model

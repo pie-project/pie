@@ -153,6 +153,9 @@ pub enum PieForwardFireClass {
     /// The mask classes (llama_like; qwen3_5's masked slice is later).
     MaskedDecode = 5,
     MaskedPrefill = 6,
+    /// The all-hooked classes (fast_rows == 0; the HookSite slice).
+    HookedDecode = 7,
+    HookedPrefill = 8,
 }
 
 /// The qwen3_5_moe MLP-block facts, as C states them. Mirrors
@@ -496,6 +499,9 @@ pub unsafe extern "C" fn pie_forward_trace_llama_like_cuda(
             // has no MTP, so they stay malformed requests here.
             5 => FireClass::MaskedDecode,
             6 => FireClass::MaskedPrefill,
+            // 7/8: the all-hooked classes (the HookSite slice).
+            7 => FireClass::HookedDecode,
+            8 => FireClass::HookedPrefill,
             _ => return PieForwardStatus::InvalidArgument,
         };
         let plan = crate::family::llama_like_cuda(&facts, &cuda, class);

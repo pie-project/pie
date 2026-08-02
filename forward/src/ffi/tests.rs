@@ -71,6 +71,7 @@ fn expect_kind(kind: &OpKind) -> PieForwardOpKind {
         OpKind::SigmoidGateMul => PieForwardOpKind::SigmoidGateMul,
         OpKind::Launch { .. } => PieForwardOpKind::Launch,
         OpKind::Guard { .. } => PieForwardOpKind::Guard,
+        OpKind::HookSite { .. } => PieForwardOpKind::HookSite,
     }
 }
 

@@ -324,6 +324,19 @@ fn flatten_kind(arena: &mut PlanArena, interner: &mut Interner, kind: &OpKind) -
                 aux_names: aux,
             };
         }
+        // The hook site: stage wire value in param0, layer in param1 (and
+        // the op's own layer field). Observes its input; nothing else
+        // crosses — sidebands are runtime data.
+        OpKind::HookSite { stage, layer } => (
+            PieForwardOpKind::HookSite,
+            PIE_FORWARD_NO_NAME,
+            match stage {
+                crate::trace::HookStage::OnAttnProj => 0,
+                crate::trace::HookStage::OnAttn => 1,
+            },
+            *layer,
+            PIE_FORWARD_NO_VALUE,
+        ),
         // The lowered branch chain over runtime inputs: arm count in
         // param0; the aux run is [kind0, payload0, len0, kind1, payload1,
         // len1, ..., else_len] — three u32s per arm plus the trailing

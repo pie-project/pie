@@ -133,6 +133,12 @@ enum class PieForwardOpKind : uint32_t {
   /// output buffer and record no outputs of their own. The ONLY branch
   /// a class trace carries.
   Guard = 24,
+  /// A model-body hook site (the HookSite slice): stage wire value in
+  /// param0 (0 = OnAttnProj, 1 = OnAttn), layer in param1. The
+  /// executor brackets the site's mechanics (page-mask begin/compact,
+  /// score sideband) and invokes the fire's attached programs; a fire
+  /// with nothing attached passes through by argument.
+  HookSite = 25,
 };
 
 /// Mirrors [`crate::trace::NormVariant`].
@@ -180,6 +186,9 @@ enum class PieForwardFireClass : uint32_t {
   /// The mask classes (llama_like; qwen3_5's masked slice is later).
   MaskedDecode = 5,
   MaskedPrefill = 6,
+  /// The all-hooked classes (fast_rows == 0; the HookSite slice).
+  HookedDecode = 7,
+  HookedPrefill = 8,
 };
 
 /// Mirrors [`crate::trace::GuardPred`]'s wire KINDS (each arm crosses as

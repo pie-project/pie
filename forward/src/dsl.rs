@@ -167,6 +167,12 @@ impl M {
         &self.f
     }
 
+    /// The tape, for the few call sites (value-producing guards) that
+    /// need it directly.
+    pub fn trace(&self) -> &Trace {
+        &self.t
+    }
+
     /// The lowering in hand, if this is a lowered trace: the backend
     /// facts and the fire class the declaration's class arms match on.
     pub fn lowering(&self) -> Option<(&LlamaLikeCudaFacts, FireClass)> {
@@ -262,6 +268,8 @@ pub fn trace(
                 FireClass::Prefill => "prefill",
                 FireClass::MaskedDecode => "masked_decode",
                 FireClass::MaskedPrefill => "masked_prefill",
+                FireClass::HookedDecode => "hooked_decode",
+                FireClass::HookedPrefill => "hooked_prefill",
                 // The service classes are qwen3_5's; llama_like has no
                 // spec-decode repair pass. The ffi entry rejects them
                 // before tracing; this is the same statement for direct
@@ -699,6 +707,20 @@ pub(crate) fn guard_on(
     guarded_on(t).arm(pred, then_f).otherwise(else_f);
 }
 
+/// Record a [`OpKind::HookSite`] (the HookSite slice): the layer's
+/// attached programs run here at fire time, observing `q`; a fire with
+/// nothing attached passes through by argument. Emitted only by the
+/// Hooked* class arms — the semantic trace and the unhooked classes
+/// carry no sites, which is the launch-list truth (the hand-written
+/// invoke is a no-op returning early on null hooks, but the SITES'
+/// bracketing launches — begin_layer, compact — exist only on hooked
+/// fires).
+pub fn hook_site(stage: crate::trace::HookStage, q: &Val, layer: u32) {
+    q.t.with(Some(layer), |b| {
+        b.push_hook_site(stage, layer, q.id);
+    });
+}
+
 // ── Raw kernel signatures ──────────────────────────────────────────────
 
 /// The CUDA launchers a lowered declaration may state, one function per
@@ -1130,6 +1152,48 @@ pub mod cuda {
         );
     }
 
+    /// `ops::dispatch_attention_flashinfer_decode_capture`: the
+    /// score-capturing decode dispatch (the OnAttn sideband's producer;
+    /// its contract includes the capture publish against the possibly
+    /// page-mask-compacted CSR). Region launch of the WantsAttnScore
+    /// guard — output-less; the guard owns the attention output.
+    pub fn attention_flashinfer_decode_capture(q: &Val, kv: &Kv) {
+        record(
+            &q.t,
+            Some(kv.l),
+            "dispatch_attention_flashinfer_decode_capture",
+            vec![],
+            kv_state(kv),
+            vec![q.id],
+            None,
+        );
+    }
+
+    /// `ops::dispatch_attention_flashinfer_prefill_capture_bf16` — the
+    /// prefill counterpart, same guard-region contract.
+    pub fn attention_flashinfer_prefill_capture(q: &Val, kv: &Kv) {
+        record(
+            &q.t,
+            Some(kv.l),
+            "dispatch_attention_flashinfer_prefill_capture_bf16",
+            vec![],
+            kv_state(kv),
+            vec![q.id],
+            None,
+        );
+    }
+
+    /// Output-less plain-dispatch forms for guard regions (the guard owns
+    /// the output; these bind it).
+    pub fn attention_flashinfer_decode_region(q: &Val, kv: &Kv) {
+        record(&q.t, Some(kv.l), "dispatch_attention_flashinfer_decode",
+               vec![], kv_state(kv), vec![q.id], None);
+    }
+    pub fn attention_flashinfer_prefill_region(q: &Val, kv: &Kv) {
+        record(&q.t, Some(kv.l), "dispatch_attention_flashinfer_prefill_bf16",
+               vec![], kv_state(kv), vec![q.id], None);
+    }
+
     /// `ops::dispatch_attention_flashinfer_prefill_custom`: the
     /// custom-mask prefill dispatch — a genuinely distinct launcher, so
     /// no pseudo-symbol is needed. The mask data (BRLE bytes + indptr)
@@ -1139,6 +1203,13 @@ pub mod cuda {
     /// breaks with it).
     pub fn attention_flashinfer_prefill_custom(q: &Val, kv: &Kv, q_width: u32) -> Val {
         attn(q, kv, q_width, "dispatch_attention_flashinfer_prefill_custom")
+    }
+
+    /// The standalone dequant staging launch, for arms whose attention
+    /// lives inside a guard (the dequant is common to both regions, so
+    /// it precedes the guard).
+    pub fn dequant_only(kv: &Kv) {
+        dequant(kv);
     }
 
     fn dequant(kv: &Kv) {

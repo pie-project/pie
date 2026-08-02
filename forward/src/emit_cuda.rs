@@ -187,6 +187,9 @@ fn emit_class_fn(
                 crate::trace::GuardPred::HasWriteDesc => "has_write_desc".to_string(),
                 crate::trace::GuardPred::TokensLE(k) => format!("N <= {k}"),
                 crate::trace::GuardPred::TokensGT(k) => format!("N > {k}"),
+                crate::trace::GuardPred::WantsAttnScore => {
+                    "hooks != nullptr && hooks->wants_attn_score".to_string()
+                }
             };
             let mut region = i + 1;
             for (n, arm) in arms.iter().enumerate() {

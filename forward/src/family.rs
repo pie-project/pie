@@ -17,7 +17,7 @@ use crate::dsl::{
     Trace, Val,
 };
 use crate::trace::{
-    DType, Dim, FireClass, ForwardPlan, GuardPred, NormVariant, RopeKind, Shape,
+    DType, Dim, FireClass, ForwardPlan, GuardPred, HookStage, NormVariant, RopeKind, Shape,
 };
 
 /// The lowering a qwen3_5 body traces under, threaded by value: the CUDA
@@ -170,6 +170,17 @@ fn llama_like_text(
                 }
                 q
             };
+            // The hook sites (HookSite slice): the two model-body points
+            // where an all-hooked fire's programs run — before attention
+            // (page-mask intervention) and after it (score observation).
+            // Only the Hooked* classes carry them; everywhere else the
+            // sites do not exist as launches, which is the truth.
+            if matches!(
+                m.lowering(),
+                Some((_, FireClass::HookedDecode | FireClass::HookedPrefill))
+            ) {
+                dsl::hook_site(HookStage::OnAttnProj, &q, l);
+            }
             let a = match m.lowering() {
                 // The kernel, stated — raw signatures, one per launcher.
                 // XQA overrides force_prefill_path (context.cpp:1427); the
@@ -184,6 +195,48 @@ fn llama_like_text(
                 }
                 Some((_, FireClass::Decode)) => cuda::attention_flashinfer_decode(&q, &w.kv, q_w),
                 Some((_, FireClass::Prefill)) => cuda::attention_flashinfer_prefill(&q, &w.kv, q_w),
+                // The hooked classes (all-hooked fires, fast_rows == 0):
+                // the SAME kernels the shape's class states, wrapped in
+                // the WantsAttnScore guard — the score-capturing dispatch
+                // is a different launcher, and whether the fire's
+                // programs read scores is a runtime input. XQA mirrors
+                // the Decode arm (no capture variant exists for it; a
+                // score-wanting program under XQA fails loudly PTIR-side,
+                // the hand-written contract).
+                Some((c, FireClass::HookedDecode)) if c.xqa_decode => {
+                    cuda::attention_xqa_decode(&q, &w.kv, q_w)
+                }
+                Some((_, FireClass::HookedDecode)) => {
+                    let (g, a) = dsl::guarded_value(
+                        m.trace(),
+                        Some(l),
+                        (
+                            Shape(vec![Dim::Tokens, Dim::Const(q_w)]),
+                            DType::BF16,
+                        ),
+                    );
+                    g.arm(GuardPred::WantsAttnScore, || {
+                        cuda::attention_flashinfer_decode_capture(&q, &w.kv)
+                    })
+                    .otherwise(|| cuda::attention_flashinfer_decode_region(&q, &w.kv));
+                    a
+                }
+                Some((_, FireClass::HookedPrefill)) => {
+                    cuda::dequant_only(&w.kv);
+                    let (g, a) = dsl::guarded_value(
+                        m.trace(),
+                        Some(l),
+                        (
+                            Shape(vec![Dim::Tokens, Dim::Const(q_w)]),
+                            DType::BF16,
+                        ),
+                    );
+                    g.arm(GuardPred::WantsAttnScore, || {
+                        cuda::attention_flashinfer_prefill_capture(&q, &w.kv)
+                    })
+                    .otherwise(|| cuda::attention_flashinfer_prefill_region(&q, &w.kv));
+                    a
+                }
                 // The masked classes: the custom-mask prefill dispatch,
                 // whatever the fire's shape — and the fused decode-QKV
                 // arm never fired above because its predicate is
@@ -200,6 +253,12 @@ fn llama_like_text(
                 }
                 None => attention(&q, &w.kv, q_w),
             };
+            if matches!(
+                m.lowering(),
+                Some((_, FireClass::HookedDecode | FireClass::HookedPrefill))
+            ) {
+                dsl::hook_site(HookStage::OnAttn, &q, l);
+            }
             if post_norm {
                 // Post-norm: o_proj to scratch, norm the OUTPUT, then the
                 // separate residual landing (`+=` of a non-matmul records
@@ -538,7 +597,13 @@ fn gdn_attn_body(
         Some((_, FireClass::CommitAdvance)) => {
             unreachable!("CommitAdvance traces its own pass, never the layer body")
         }
-        Some((_, FireClass::MaskedDecode | FireClass::MaskedPrefill)) => {
+        Some((
+            _,
+            FireClass::MaskedDecode
+            | FireClass::MaskedPrefill
+            | FireClass::HookedDecode
+            | FireClass::HookedPrefill,
+        )) => {
             unreachable!("class not yet traced for qwen3_5 (entry rejects)")
         }
     };
@@ -604,7 +669,13 @@ fn gdn_attn_body(
         Some((_, FireClass::CommitAdvance)) => {
             unreachable!("CommitAdvance traces its own pass, never the layer body")
         }
-        Some((_, FireClass::MaskedDecode | FireClass::MaskedPrefill)) => {
+        Some((
+            _,
+            FireClass::MaskedDecode
+            | FireClass::MaskedPrefill
+            | FireClass::HookedDecode
+            | FireClass::HookedPrefill,
+        )) => {
             unreachable!("class not yet traced for qwen3_5 (entry rejects)")
         }
     };
@@ -804,7 +875,13 @@ fn full_attn_body(
         Some((_, FireClass::CommitAdvance)) => {
             unreachable!("CommitAdvance traces its own pass, never the layer body")
         }
-        Some((_, FireClass::MaskedDecode | FireClass::MaskedPrefill)) => {
+        Some((
+            _,
+            FireClass::MaskedDecode
+            | FireClass::MaskedPrefill
+            | FireClass::HookedDecode
+            | FireClass::HookedPrefill,
+        )) => {
             unreachable!("class not yet traced for qwen3_5 (entry rejects)")
         }
     };
@@ -934,7 +1011,10 @@ fn qwen3_5_hybrid_text(facts: &Qwen35HybridFacts, lower: Qwen35Lower<'_>) -> For
                 FireClass::CommitAdvance => "commit_advance",
                 FireClass::StateOnly => "state_only",
                 FireClass::FrozenVerify => "frozen_verify",
-                FireClass::MaskedDecode | FireClass::MaskedPrefill => {
+                FireClass::MaskedDecode
+                | FireClass::MaskedPrefill
+                | FireClass::HookedDecode
+                | FireClass::HookedPrefill => {
                     unreachable!("class not yet traced for qwen3_5 (entry rejects)")
                 }
             }

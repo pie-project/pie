@@ -159,6 +159,14 @@ pub enum FireClass {
     /// verify-stash STORE per linear layer. Reserved by the rung-5
     /// geometry; its trace is the next qwen3_5 slice.
     FrozenVerify,
+    /// Decode-shaped fire whose EVERY lane carries hook programs
+    /// (fast_rows == 0): the general unfused body plus the two
+    /// [`OpKind::HookSite`]s per layer — the hand-written all-hooked
+    /// path's exact launch list. The MIXED fire (0 < fast_rows < R)
+    /// needs the future Peel op and stays hand-written.
+    HookedDecode,
+    /// Prefill-shaped all-hooked fire.
+    HookedPrefill,
     /// Decode-shaped fire carrying a custom attention mask: the masked
     /// attention runs the custom-mask prefill dispatch, and the fused
     /// decode-QKV arm's predicate (`!has_custom_mask`) breaks — the op
@@ -195,6 +203,11 @@ pub enum GuardPred {
     TokensLE(u32),
     /// `N > k` (the cached-prefill floor). Wire kind 2, payload `k`.
     TokensGT(u32),
+    /// The fire's attached programs read attention scores at `OnAttn`
+    /// (`StageHooks::wants_attn_score`) — the score-capturing attention
+    /// dispatch runs instead of the plain one. Wire kind 3, payload
+    /// unused.
+    WantsAttnScore,
 }
 
 impl GuardPred {
@@ -204,8 +217,26 @@ impl GuardPred {
             GuardPred::HasWriteDesc => (0, 0),
             GuardPred::TokensLE(k) => (1, k),
             GuardPred::TokensGT(k) => (2, k),
+            GuardPred::WantsAttnScore => (3, 0),
         }
     }
+}
+
+/// A model-body hook site's stage (the HookSite slice,
+/// north-star-dsl.md): the TWO points at which a fire's attached PTIR
+/// programs observe and intervene inside the forward. PTIR's Prologue
+/// and Epilogue are dispatch-side post-logits machinery and never trace
+/// ops. Wire values are the ABI (`HookSite.param0`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HookStage {
+    /// Before the layer's attention: observes q, intervenes through the
+    /// page-mask sink (the driver brackets `begin_layer` → invoke →
+    /// compact/pointer-swap; a narrowed page list feeds the SAME stated
+    /// attention kernel as substituted arguments).
+    OnAttnProj,
+    /// After the layer's attention: observes the scores the (possibly
+    /// capturing) attention published through the sideband.
+    OnAttn,
 }
 
 /// One arm of a [`OpKind::Guard`] chain: the first arm whose predicate
@@ -436,6 +467,16 @@ pub enum OpKind {
         arms: Vec<GuardArm>,
         else_ops: u32,
     },
+    /// A hook site ([`HookStage`]; the HookSite slice): the point where
+    /// the fire's attached PTIR programs run against this layer. The op
+    /// observes its input (q — the value `invoke_stage_hook` passes) and
+    /// produces nothing: interventions travel through sidebands (the
+    /// page-mask sink, the score capture) and are ARGUMENT-driven — a
+    /// site with nothing attached is a no-op by argument, not by branch,
+    /// which is what lets the same trace serve every program. WHICH
+    /// program runs is `dyn` (sideband data); this op states only WHERE
+    /// and WHAT IS OBSERVABLE.
+    HookSite { stage: HookStage, layer: u32 },
 }
 
 /// Which implicit store an op addresses. Both stores are per-layer and
@@ -596,6 +637,10 @@ impl TraceBuilder {
 
     pub(crate) fn op_count_now(&self) -> usize {
         self.ops.len()
+    }
+
+    pub(crate) fn push_hook_site(&mut self, stage: HookStage, layer: u32, q: ValueId) {
+        self.push(OpKind::HookSite { stage, layer }, vec![q], vec![]);
     }
 
     pub(crate) fn close_guard(&mut self, guard_idx: usize, arms: Vec<GuardArm>, else_ops: u32) {

@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <optional>
 #include <string_view>
 
 #include <cuda_runtime.h>
@@ -19,6 +20,9 @@
 #include "kernels/rope.hpp"
 #include "kernels/split_packed.hpp"
 #include "kernels/swiglu.hpp"
+#include "model/attn_page_mask.hpp"
+#include "model/attn_score.hpp"
+#include "model/stage_hooks.hpp"
 #include "ops/attention_flashinfer.hpp"
 #include "ops/attention_xqa.hpp"
 #include "ops/gemm.hpp"
@@ -102,6 +106,8 @@ enum class LaunchKernel {
     DequantKvCacheLayerToBf16Active,
     AttentionFlashinferPrefill,
     AttentionFlashinferPrefillCustom,
+    AttentionFlashinferDecodeCapture,
+    AttentionFlashinferPrefillCapture,
     WriteKvExplicit,
     WriteKvToPages,
 };
@@ -130,6 +136,12 @@ LaunchKernel resolve_launch_kernel(std::string_view kernel) {
     }
     if (kernel == "dispatch_attention_flashinfer_prefill_custom") {
         return LaunchKernel::AttentionFlashinferPrefillCustom;
+    }
+    if (kernel == "dispatch_attention_flashinfer_decode_capture") {
+        return LaunchKernel::AttentionFlashinferDecodeCapture;
+    }
+    if (kernel == "dispatch_attention_flashinfer_prefill_capture_bf16") {
+        return LaunchKernel::AttentionFlashinferPrefillCapture;
     }
     if (kernel == "launch_write_kv_explicit_bf16") {
         return LaunchKernel::WriteKvExplicit;
@@ -302,12 +314,18 @@ LlamaLikeDeclaredPlan build_llama_like_declared_plan(
         facts, cuda, pie_forward::PieForwardFireClass::MaskedDecode);
     out.masked_prefill = pie_forward::ForwardPlan::trace_llama_like_cuda(
         facts, cuda, pie_forward::PieForwardFireClass::MaskedPrefill);
+    out.hooked_decode = pie_forward::ForwardPlan::trace_llama_like_cuda(
+        facts, cuda, pie_forward::PieForwardFireClass::HookedDecode);
+    out.hooked_prefill = pie_forward::ForwardPlan::trace_llama_like_cuda(
+        facts, cuda, pie_forward::PieForwardFireClass::HookedPrefill);
     // Drift between the declaration's stated kernels and this executor's
     // registry fails at model load, not mid-fire.
     validate_stated_kernels(out.decode);
     validate_stated_kernels(out.prefill);
     validate_stated_kernels(out.masked_decode);
     validate_stated_kernels(out.masked_prefill);
+    validate_stated_kernels(out.hooked_decode);
+    validate_stated_kernels(out.hooked_prefill);
 
     // The digest naming what these traces were taken from — the same
     // format `pie_forward::emit_cuda::facts_digest` embeds in the
@@ -363,7 +381,8 @@ void llama_like_forward_declared(
     bool has_write_desc,
     int runtime_window_left,
     const std::uint8_t* custom_mask_d,
-    const std::int32_t* custom_mask_indptr_d)
+    const std::int32_t* custom_mask_indptr_d,
+    const StageHooks* stage_hooks)
 {
     // Rung 3: the static form, when opted in and emitted for exactly this
     // deployment. Byte-for-byte the same launches as the interpreter walk
@@ -379,7 +398,8 @@ void llama_like_forward_declared(
                      declared.facts_digest.c_str(), kGeneratedForDigest);
     }
     const bool has_custom_mask = custom_mask_d != nullptr;
-    if (!has_custom_mask && generated_forward_enabled() &&
+    if (!has_custom_mask && stage_hooks == nullptr &&
+        generated_forward_enabled() &&
         declared.facts_digest == kGeneratedForDigest) {
         (is_pure_decode ? generated_llama_like_decode
                         : generated_llama_like_prefill)(
@@ -397,8 +417,11 @@ void llama_like_forward_declared(
     // (north-star-dsl.md). A mask is a class axis, not a branch: masked
     // fires walk traces in which the fused-QKV arm never existed and the
     // attention IS the custom-mask dispatch.
+    const bool hooked = stage_hooks != nullptr;
     const pie_forward::ForwardPlan& plan =
-        has_custom_mask
+        hooked ? (is_pure_decode ? declared.hooked_decode
+                                 : declared.hooked_prefill)
+        : has_custom_mask
             ? (is_pure_decode ? declared.masked_decode
                               : declared.masked_prefill)
             : (is_pure_decode ? declared.decode : declared.prefill);
@@ -447,6 +470,18 @@ void llama_like_forward_declared(
     void* const attn_v = head_dim_padded ? ws.v_padded.data() : ws.v.data();
     void* const attn_out_buf =
         head_dim_padded ? ws.attn_out_padded.data() : ws.attn_out.data();
+
+    // The HookSite slice's fire-level sidebands: the page-mask sink the
+    // OnAttnProj site offers, the per-layer score captures the attention
+    // publishes through, and the per-layer (possibly compacted) page
+    // list the attention handlers consume. All argument-driven — an
+    // unhooked fire constructs an inactive mask and none of it launches.
+    model::FirePageMask page_mask(stage_hooks, stream);
+    const std::uint32_t* attn_page_indices = kv_page_indices;
+    const std::uint32_t* attn_page_indptr = kv_page_indptr;
+    const std::uint32_t* attn_last_page_lens = kv_last_page_lens;
+    std::optional<model::LayerScoreCapture> score_capture;
+    std::optional<model::LayerPrefillScoreCapture> prefill_score_capture;
 
     // The plan caches the (unchanged) prepare hook filled. The executor no
     // longer chooses between them — each stated attention kernel's handler
@@ -738,6 +773,32 @@ void llama_like_forward_declared(
             // Each handler is the corresponding branch of the old path
             // cascade, minus the choosing; the state layer rides param1.
             const int L = static_cast<int>(op.param1);
+            // The page-mask bracket (HookSite mechanics): a written mask
+            // substitutes the layer's page list into the SAME stated
+            // kernel — legal only on the static (page-count-independent)
+            // decode plan, the hand-written contract verbatim.
+            const auto resolve_masked_pages = [&](bool takes_paged_decode) {
+                if (!page_mask.written_for(static_cast<std::uint32_t>(L))) {
+                    return;
+                }
+                if (!takes_paged_decode || decode_plan == nullptr) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            };
             switch (resolve_launch_kernel(plan.weight_name(op))) {
             case LaunchKernel::RopeStandardTable: {
                 if (ws.rope_table.empty()) {
@@ -808,6 +869,7 @@ void llama_like_forward_declared(
                 break;
             }
             case LaunchKernel::AttentionXqaDecodePrepared: {
+                resolve_masked_pages(/*takes_paged_decode=*/false);
                 auto kv_view = cache.layer_view(L);
                 ops::launch_attention_xqa_decode_bf16_prepared(
                     attn_q, kv_view.k_bf16_pages, kv_view.v_bf16_pages,
@@ -833,12 +895,71 @@ void llama_like_forward_declared(
                              fwd_cfg.per_layer_window_left.size()))
                         ? fwd_cfg.per_layer_window_left[L]
                         : fwd_cfg.sliding_window;
+                resolve_masked_pages(/*takes_paged_decode=*/true);
                 ops::dispatch_attention_flashinfer_decode(
                     *decode_plan,
                     attn_q, kv_view, attn_out_buf,
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, sm_scale_override);
+                break;
+            }
+            case LaunchKernel::AttentionFlashinferDecodeCapture: {
+                if (decode_plan == nullptr) {
+                    throw std::runtime_error(
+                        "declared forward: trace states the capture decode "
+                        "kernel but prepare built no decode plan");
+                }
+                if (!score_capture || !score_capture->active()) {
+                    throw std::runtime_error(
+                        "declared forward: capture decode stated but no "
+                        "active score capture (guard/pred drift)");
+                }
+                resolve_masked_pages(/*takes_paged_decode=*/true);
+                auto kv_view = cache.layer_view(L);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *decode_plan,
+                    attn_q, kv_view, attn_out_buf,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, sm_scale_override);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+                break;
+            }
+            case LaunchKernel::AttentionFlashinferPrefillCapture: {
+                const ops::PrefillPlanCache* pp =
+                    is_pure_decode ? prefill_decode_plan : prefill_plan;
+                if (pp == nullptr) {
+                    throw std::runtime_error(
+                        "declared forward: trace states the capture "
+                        "prefill kernel but prepare built no plan");
+                }
+                if (!prefill_score_capture ||
+                    !prefill_score_capture->active()) {
+                    throw std::runtime_error(
+                        "declared forward: capture prefill stated but no "
+                        "active score capture (guard/pred drift)");
+                }
+                resolve_masked_pages(/*takes_paged_decode=*/false);
+                auto kv_view = cache.layer_view(L);
+                ops::dispatch_attention_flashinfer_prefill_capture_bf16(
+                    *pp,
+                    attn_q, kv_view.k_bf16_pages, kv_view.v_bf16_pages,
+                    attn_out_buf,
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, attn_ws, stream,
+                    prefill_score_capture->raw(),
+                    prefill_score_capture->folded(),
+                    prefill_score_capture->indptr_d(),
+                    prefill_score_capture->window(),
+                    /*logits_soft_cap=*/0.f, sm_scale_override);
+                prefill_score_capture->publish();
                 break;
             }
             case LaunchKernel::DequantKvCacheLayerToBf16Active: {
@@ -950,6 +1071,54 @@ void llama_like_forward_declared(
             }
             break;
         }
+        case PieForwardOpKind::HookSite: {
+            const int L = static_cast<int>(op.param1);
+            if (op.param0 == 0) {
+                // OnAttnProj: reset the layer's page view, re-seed the
+                // mask ("keep everything" unless this layer's program
+                // narrows it), stage the score capture the attention
+                // will publish through, and run the programs.
+                attn_page_indices = kv_page_indices;
+                attn_page_indptr = kv_page_indptr;
+                attn_last_page_lens = kv_last_page_lens;
+                page_mask.begin_layer(stream);
+                if (is_pure_decode) {
+                    score_capture.emplace(
+                        stage_hooks, static_cast<std::uint32_t>(L),
+                        static_cast<std::uint32_t>(num_q_heads),
+                        /*capturable=*/true, stream);
+                } else {
+                    prefill_score_capture.emplace(
+                        stage_hooks, static_cast<std::uint32_t>(L),
+                        static_cast<std::uint32_t>(num_q_heads),
+                        plan_state.prefill_score_window,
+                        /*capturable=*/true, stream);
+                }
+                invoke_stage_hook(
+                    stage_hooks, StageHookPoint::OnAttnProj,
+                    ws.q.data(),
+                    static_cast<std::uint32_t>(N),
+                    static_cast<std::uint32_t>(Hq),
+                    static_cast<std::uint32_t>(L),
+                    stream, /*query_is_f32=*/false,
+                    {.mask_sink = page_mask.sink()});
+            } else {
+                // OnAttn: the programs read what the attention published.
+                invoke_stage_hook(
+                    stage_hooks, StageHookPoint::OnAttn,
+                    ws.q.data(),
+                    static_cast<std::uint32_t>(N),
+                    static_cast<std::uint32_t>(Hq),
+                    static_cast<std::uint32_t>(L),
+                    stream, /*query_is_f32=*/false,
+                    {.scores = score_capture && score_capture->scores()
+                                   ? score_capture->scores()
+                                   : (prefill_score_capture
+                                          ? prefill_score_capture->scores()
+                                          : nullptr)});
+            }
+            break;
+        }
         case PieForwardOpKind::Guard: {
             // The one branch a class trace carries — a CHAIN of arms over
             // runtime inputs (closed predicate vocabulary,
@@ -977,6 +1146,9 @@ void llama_like_forward_declared(
                 case static_cast<std::uint32_t>(
                     pie_forward::PieForwardGuardPred::TokensGT):
                     return N > static_cast<int>(payload);
+                case 3:  // WantsAttnScore
+                    return stage_hooks != nullptr &&
+                           stage_hooks->wants_attn_score;
                 default:
                     throw std::runtime_error(
                         "declared forward: guard predicate kind " +

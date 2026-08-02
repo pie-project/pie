@@ -1,5 +1,7 @@
 #include "model/llama_like/llama_like_model.hpp"
 
+#include "model/stage_hooks.hpp"
+
 #include <cstdlib>
 #include <utility>
 
@@ -96,9 +98,17 @@ void LlamaLikeModel::body(Workspace& ws,
     // vocabulary; anything it cannot express falls back, per fire, to the
     // hand-written body below. Build-time exclusions (TP, quantized
     // projections, non-standard rope, ...) already left `declared_` empty.
+    // Hooked fires (the HookSite slice): the ALL-hooked fire
+    // (hook_free_prefix_rows == 0) walks the hooked class traces; a MIXED
+    // fire (0 < fast_rows) needs the future Peel op and keeps the
+    // hand-written path, as does the hooked+masked cross product.
+    const bool hooks_admissible =
+        in.stage_hooks == nullptr ||
+        (in.stage_hooks->hook_free_prefix_rows == 0 &&
+         in.custom_mask_d == nullptr);
     const bool declared_eligible =
         static_cast<bool>(declared_) &&
-        in.stage_hooks == nullptr &&
+        hooks_admissible &&
         // The declared plan has no correction op yet: a lora fire falls back
         // to the hand-written body, which applies the delta. Running the
         // declared executor here would silently drop the adapter — the
@@ -128,7 +138,8 @@ void LlamaLikeModel::body(Workspace& ws,
             in.w_page_d, in.w_off_d,
             in.row_valid_d, in.has_write_desc,
             in.runtime_window_left,
-            in.custom_mask_d, in.custom_mask_indptr_d);
+            in.custom_mask_d, in.custom_mask_indptr_d,
+            in.stage_hooks);
         return;
     }
     llama_like_forward_paged(
