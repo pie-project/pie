@@ -85,9 +85,53 @@ pub struct Kv {
 }
 
 impl Kv {
+    /// The layer's cache handle, for weight namespaces built outside
+    /// [`M::layer`] (the qwen3_5 fragments build their own).
+    pub(crate) fn at(t: &Trace, l: u32) -> Kv {
+        Kv { t: t.clone(), l }
+    }
+
     pub fn append(&self, k: &Val, v: &Val) {
         self.t
             .with(Some(self.l), |b| b.kv_append(self.l, k.id, v.id));
+    }
+}
+
+/// A depthwise causal-conv weight handle: name, kernel width, layer. The
+/// conv addresses the layer's per-request conv state, so the handle's
+/// layer is both the op's tag and the state it touches — a `u32`, not an
+/// `Option`: a conv never records outside a layer.
+#[derive(Clone)]
+pub struct ConvW {
+    pub name: String,
+    pub kernel: u32,
+    pub layer: u32,
+}
+
+/// The GDN prep's weight pair (`a_log` + `dt_bias`) — one op, two names,
+/// so one handle carries both, plus the layer tag they share.
+#[derive(Clone)]
+pub struct GdnPrepW {
+    pub a_log: String,
+    pub dt_bias: String,
+    pub layer: u32,
+}
+
+/// A layer's per-request recurrent state (the GDN delta-rule store) —
+/// the [`Kv`] of linear attention. The state is not a traced value
+/// (see the trace module doc's "the per-request state axis"); the
+/// handle exists so [`gated_delta`] can derive its layer the way
+/// [`attention`] does from [`Kv`].
+#[derive(Clone)]
+pub struct Rs {
+    t: Trace,
+    pub l: u32,
+}
+
+impl Rs {
+    /// The layer's recurrent-state handle, [`Kv::at`]-style.
+    pub(crate) fn at(t: &Trace, l: u32) -> Rs {
+        Rs { t: t.clone(), l }
     }
 }
 
@@ -234,6 +278,57 @@ pub fn trace(
         .finish()
 }
 
+/// Run a declaration under an explicit family name and return its traced
+/// form — the entry for families that are not llama_like-shaped (the
+/// qwen3_5 fragments and hybrid), which carry their own facts and build
+/// their own weight namespaces rather than going through [`M`].
+pub fn trace_named(family: &str, body: impl FnOnce(&Trace)) -> ForwardPlan {
+    let t = Trace {
+        inner: Rc::new(RefCell::new(TraceBuilder::new(family))),
+    };
+    body(&t);
+    Rc::try_unwrap(t.inner)
+        .ok()
+        .expect("declaration must not hold values past its body")
+        .into_inner()
+        .finish()
+}
+
+/// Declare a fragment parameter ([`TraceBuilder::input`]): the residual
+/// stream entering the block, `[Tokens, hidden]` bf16, produced by no op
+/// (layer `None` — the first op that consumes it takes its tag from its
+/// own weight handle).
+pub fn input(t: &Trace, hidden: u32) -> Val {
+    let id = t.with(None, |b| {
+        b.input(Shape(vec![Dim::Tokens, Dim::Const(hidden)]), DType::BF16)
+    });
+    Val {
+        t: t.clone(),
+        id,
+        layer: None,
+    }
+}
+
+/// The embedding gather under an explicit weight name — [`M::embed`] for
+/// traces that run without an [`M`].
+pub fn embed_with(t: &Trace, weight: &str, hidden: u32) -> Val {
+    let id = t.with(None, |b| b.embed(weight, hidden));
+    Val {
+        t: t.clone(),
+        id,
+        layer: None,
+    }
+}
+
+/// The epilogue under an explicit weight name — [`M::logits`] for traces
+/// that run without an [`M`] (the caller resolves the tied-embedding
+/// fact to a name).
+pub fn lm_head_at(t: &Trace, x: &Val, weight: &str, vocab: u32) {
+    t.with(None, |b| {
+        b.lm_head(x.id, weight, vocab);
+    });
+}
+
 // ── The semantic vocabulary, as free functions ─────────────────────────
 
 pub fn matmul(x: &Val, w: &MatW) -> Val {
@@ -297,6 +392,176 @@ pub fn attention(q: &Val, kv: &Kv, q_width: u32) -> Val {
         t: q.t.clone(),
         id,
         layer: Some(kv.l),
+    }
+}
+
+/// The expert-indexed matmul ([`TraceBuilder::matmul_per_token`]): `w` is
+/// an `{e}`-templated bank handle and `selector` a [`topk`] index value.
+/// Layer from the weight handle, like [`matmul`].
+pub fn matmul_per_token(x: &Val, w: &MatW, selector: &Val) -> Val {
+    let id = x.t.with(w.layer, |b| {
+        b.matmul_per_token(x.id, &w.name, selector.id, w.width)
+    });
+    Val {
+        t: x.t.clone(),
+        id,
+        layer: w.layer,
+    }
+}
+
+/// Router top-k: `(indices, weights)`, softmaxed and renormalized
+/// ([`TraceBuilder::topk`]). Weightless — layer from the logits.
+pub fn topk(logits: &Val, k: u32) -> (Val, Val) {
+    let (idx, w) = logits.t.with(logits.layer, |b| b.topk(logits.id, k));
+    let mk = |id| Val {
+        t: logits.t.clone(),
+        id,
+        layer: logits.layer,
+    };
+    (mk(idx), mk(w))
+}
+
+/// The top-k combine: collapse `x` under per-token `weights`
+/// ([`TraceBuilder::weighted_sum`] — operand order weights-then-value is
+/// the builder's). Layer from `weights`, the first input.
+pub fn weighted_sum(weights: &Val, x: &Val) -> Val {
+    let id = weights
+        .t
+        .with(weights.layer, |b| b.weighted_sum(weights.id, x.id));
+    Val {
+        t: weights.t.clone(),
+        id,
+        layer: weights.layer,
+    }
+}
+
+/// The shared-expert landing: `base + sigmoid(gate) * x`. Layer from
+/// `x`, the first input.
+pub fn sigmoid_gate_add(x: &Val, gate: &Val, base: &Val) -> Val {
+    let id = x
+        .t
+        .with(x.layer, |b| b.sigmoid_gate_add(x.id, gate.id, base.id));
+    Val {
+        t: x.t.clone(),
+        id,
+        layer: x.layer,
+    }
+}
+
+/// The multiply-only output gate: `x * sigmoid(gate)`. Layer from `x`.
+pub fn sigmoid_gate_mul(x: &Val, gate: &Val) -> Val {
+    let id = x.t.with(x.layer, |b| b.sigmoid_gate_mul(x.id, gate.id));
+    Val {
+        t: x.t.clone(),
+        id,
+        layer: x.layer,
+    }
+}
+
+/// The two-way GDN row split of a packed projection. Layer from `x`.
+pub fn split_gdn(x: &Val, w0: u32, w1: u32) -> (Val, Val) {
+    let (a, b) = x.t.with(x.layer, |b| b.split_gdn(x.id, w0, w1));
+    let mk = |id| Val {
+        t: x.t.clone(),
+        id,
+        layer: x.layer,
+    };
+    (mk(a), mk(b))
+}
+
+/// The interleaved per-head `[query | gate]` split of a 2×-wide gated q
+/// projection. Layer from `x`.
+pub fn split_q_gate(x: &Val, heads: u32, head_dim: u32) -> (Val, Val) {
+    let (q, gate) = x
+        .t
+        .with(x.layer, |b| b.split_q_gate(x.id, heads, head_dim));
+    let mk = |id| Val {
+        t: x.t.clone(),
+        id,
+        layer: x.layer,
+    };
+    (mk(q), mk(gate))
+}
+
+/// The partial-rotary rope: only the first `rotary_dim` channels of each
+/// head rotate. Layer from `q`, [`rope`]-style.
+pub fn rope_partial(q: &Val, k: &Val, kind: RopeKind, rotary_dim: u32) -> (Val, Val) {
+    let (qo, ko) = q
+        .t
+        .with(q.layer, |b| b.rope_partial(q.id, k.id, kind, rotary_dim));
+    let mk = |id| Val {
+        t: q.t.clone(),
+        id,
+        layer: q.layer,
+    };
+    (mk(qo), mk(ko))
+}
+
+/// Depthwise causal conv1d (+ fused SiLU) against the handle's layer and
+/// that layer's per-request conv state. Layer from the weight handle.
+pub fn causal_conv1d(x: &Val, w: &ConvW) -> Val {
+    let id = x.t.with(Some(w.layer), |b| {
+        b.causal_conv1d(w.layer, x.id, &w.name, w.kernel)
+    });
+    Val {
+        t: x.t.clone(),
+        id,
+        layer: Some(w.layer),
+    }
+}
+
+/// The post-conv GDN prep: `(q, k, v, g, beta)`, all f32, per-head
+/// layouts from the four geometry params ([`TraceBuilder::gdn_prep`]).
+/// Layer from the weight handle.
+pub fn gdn_prep(
+    qkv: &Val,
+    a: &Val,
+    b: &Val,
+    w: &GdnPrepW,
+    key_heads: u32,
+    key_dim: u32,
+    value_heads: u32,
+    value_dim: u32,
+) -> (Val, Val, Val, Val, Val) {
+    let out = qkv.t.with(Some(w.layer), |bld| {
+        bld.gdn_prep(
+            qkv.id, a.id, b.id, &w.a_log, &w.dt_bias, key_heads, key_dim, value_heads, value_dim,
+        )
+    });
+    let mk = |id| Val {
+        t: qkv.t.clone(),
+        id,
+        layer: Some(w.layer),
+    };
+    (mk(out.0), mk(out.1), mk(out.2), mk(out.3), mk(out.4))
+}
+
+/// The gated-delta recurrence against the layer's per-request recurrent
+/// state. Layer from the state handle, [`attention`]-style.
+pub fn gated_delta(rs: &Rs, q: &Val, k: &Val, v: &Val, g: &Val, beta: &Val) -> Val {
+    let id = rs.t.with(Some(rs.l), |b| {
+        b.gated_delta(rs.l, q.id, k.id, v.id, g.id, beta.id)
+    });
+    Val {
+        t: rs.t.clone(),
+        id,
+        layer: Some(rs.l),
+    }
+}
+
+/// The gated RMSNorm landing: per-head norm of the rank-3 f32 core,
+/// silu-gated by `gate`, flattened to `gate`'s bf16 shape. The op's fold
+/// is Plain by construction ([`TraceBuilder::rmsnorm_gated`] takes only
+/// the weight name), so the handle's `variant`/`per_head` are unread —
+/// only its name and layer speak.
+pub fn rmsnorm_gated(x: &Val, gate: &Val, w: &NormW) -> Val {
+    let id = x
+        .t
+        .with(w.layer, |b| b.rmsnorm_gated(x.id, gate.id, &w.name));
+    Val {
+        t: x.t.clone(),
+        id,
+        layer: w.layer,
     }
 }
 

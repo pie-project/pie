@@ -137,7 +137,42 @@ peepholes, eligibility predicates, thresholds.
    interpreter arms over runtime INPUTS, listed in declared_forward.hpp.
 4. **qwen3_5**: same treatment; the 16 executor arms and the GDN
    three-way choice move into the declaration's class arms; thresholds
-   become `Guard`.
+   become `Guard`. Slice 4a (DONE 2026-08-02) birthed the Guard on
+   llama_like's KV-write mechanism, three-way-parity-proven. Slices
+   4b/4c carry the qwen3_5 body.
+
+   **The class geometry (decided, 4b).** The recon found the executor's
+   matrix is not 2-dimensional: beyond decode/prefill, the MTP services
+   change WHICH OPS RUN. The axes settle as follows:
+
+   - `FireClass` grows to four: `Decode`, `Prefill`, and the two
+     service shapes — `CommitAdvance` (the spec-decode repair: ONLY each
+     linear layer's conv+prep+recurrence, fed from the verify stash; no
+     embed/attention/MLP/epilogue — a genuinely different pass, so a
+     genuinely different trace) and `StateOnly` (the whole backbone
+     minus the logits epilogue). These are CLASSES, not guards, because
+     they change the op list, and the toolchain's unit of specialization
+     is the trace. A class per service combination stays bounded because
+     the services do not compose (commit_advance excludes state_only by
+     construction; the driver asserts it).
+   - `verify_frozen` (write_state=false) is NOT a class and NOT a
+     guard: the op list is identical and even the kernels are identical
+     — it is a PARAMETER of the recurrence/conv launches. It crosses as
+     an argument the stated kernel reads at fire time, like `fast_rows`.
+   - The N-thresholds (`warp_tiled_max_tokens`,
+     `cached_prefill_max_tokens`) become `Guard` predicates
+     (`TokensLE(k)` / `TokensGT(k)`) around the stated recurrence
+     kernels — the first VALUE-PRODUCING guards: both regions write the
+     same output buffer, so the Guard op itself carries the output
+     value and the region launches bind it (the design note 4a left
+     open, resolved by "the value is the guard's, the regions are its
+     lowerings").
+   - The legacy slot-less/qo-less paths (`slot_ids_d == nullptr` — the
+     parity entry point's host-loop forms) do NOT move into the
+     declaration: they exist for a harness, not a deployment. The
+     lowered traces state the batched kernels only, and the parity
+     entry keeps the semantic trace + interpreter. If the harness path
+     ever hits a lowered trace, the loud unknown-kernel throw names it.
 5. **Delete** the hand-written arm code and the semantic-only trace path
    once every consumer reads class traces.
 
