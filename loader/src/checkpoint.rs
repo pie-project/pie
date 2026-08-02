@@ -2,6 +2,7 @@ pub mod align;
 pub mod gguf;
 pub mod read;
 pub mod safetensors;
+pub mod write;
 
 use crate::types::{CheckpointFormat, Encoding, FileId, TensorId};
 

@@ -216,6 +216,25 @@ impl QuantSpec {
         }
     }
 
+    /// The block a GGUF-family scheme stores, as `(elements, bytes)`, or
+    /// `None` for a scheme whose payload is a plain bit-packing.
+    ///
+    /// GGUF blocks carry their scales *inside* the payload — Q4_0 is one F16
+    /// scale and sixteen packed bytes per 32 elements — so their size is not
+    /// `elements × bits / 8` and a span computed that way reads short. These
+    /// are the GGML reference layouts, and `gguf.rs` states the same Q4_0
+    /// numbers when it types a checkpoint.
+    pub fn block_layout(&self) -> Option<(u64, u64)> {
+        match self.scheme {
+            QuantScheme::GgufQ4_0 => Some((32, 18)),
+            QuantScheme::GgufQ5_0 => Some((32, 22)),
+            QuantScheme::GgufQ8_0 => Some((32, 34)),
+            QuantScheme::GgufQ4K => Some((256, 144)),
+            QuantScheme::GgufQ5K => Some((256, 176)),
+            _ => None,
+        }
+    }
+
     pub fn normalized_bits(&self) -> u8 {
         if self.bits_per_element == 0 {
             self.scheme.default_bits()
@@ -329,6 +348,12 @@ pub fn encoding_nbytes(shape: &[i64], encoding: &Encoding) -> Option<u64> {
         Encoding::Raw(dtype) => tensor_nbytes(shape, dtype.bytes()),
         Encoding::Quant(spec) => {
             let spec = spec.clone().normalized();
+            // A blocked scheme's scales live inside the payload, so its span
+            // is blocks × block bytes, not elements × bits.
+            if let Some((block_elements, block_bytes)) = spec.block_layout() {
+                let elements = tensor_elements(shape)?;
+                return elements.div_ceil(block_elements).checked_mul(block_bytes);
+            }
             if let Some(element_bytes) = spec.dense_element_bytes() {
                 return tensor_nbytes(shape, element_bytes);
             }

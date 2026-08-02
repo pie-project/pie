@@ -151,6 +151,13 @@ pub(super) fn validate_target_support(program: &mut LoadPlan) -> Result<usize> {
                             | QuantScheme::MlxAffineU4
                     )
                 ))
+                // Decode is implemented for the schemes whose scales live
+                // *inside* the payload — a GGUF block is self-contained, so
+                // decoding needs no factor operand. A separate-scale scheme
+                // spells its dequant as a per-block `Scale` instead, and a
+                // `Decode` of one has no meaning any executor could give it.
+                || (*kind == TileMapKind::Decode
+                    && matches!(transform.from, Some(QuantScheme::GgufQ4_0)))
                 || (*kind == TileMapKind::Repack
                     && program.target.native_mxfp4_moe
                     && transform.repack.is_some_and(|repack| {
