@@ -457,15 +457,28 @@ pub fn parse_gguf_checkpoint(path: &Path) -> Result<CheckpointMetadata, Error> {
 
 /// Decode one GGUF `Q4_0` block (18 bytes → 32 f32 values), ported from the C++
 /// `decode_gguf_q4_0_block`. Kept for parity testing of the block geometry; the
-/// runtime materialization is the driver's job.
+/// runtime materialization is the driver's job — except offline, where
+/// `testkit::host_executor` decodes whole tensors through
+/// [`decode_gguf_q4_0_block_into`].
 pub fn decode_gguf_q4_0_block(block: &[u8]) -> Result<Vec<f32>, Error> {
     if block.len() != 18 {
         return Err(Error::Checkpoint(
             "gguf: Q4_0 block decode expects exactly 18 bytes".to_string(),
         ));
     }
-    let scale = half_to_float(u16::from_le_bytes([block[0], block[1]]));
     let mut values = vec![0.0f32; 32];
+    decode_gguf_q4_0_block_into(
+        block.try_into().expect("length was just checked"),
+        (&mut values[..]).try_into().expect("allocated as 32"),
+    );
+    Ok(values)
+}
+
+/// The allocation-free body of [`decode_gguf_q4_0_block`]: one F16 scale, then
+/// sixteen packed bytes whose low nibbles are elements 0..16 and high nibbles
+/// 16..32, each `(nibble − 8) × scale`.
+pub fn decode_gguf_q4_0_block_into(block: &[u8; 18], values: &mut [f32; 32]) {
+    let scale = half_to_float(u16::from_le_bytes([block[0], block[1]]));
     for i in 0..16 {
         let packed = block[2 + i];
         let lo = (packed & 0x0f) as i32 - 8;
@@ -473,7 +486,6 @@ pub fn decode_gguf_q4_0_block(block: &[u8]) -> Result<Vec<f32>, Error> {
         values[i] = scale * lo as f32;
         values[i + 16] = scale * hi as f32;
     }
-    Ok(values)
 }
 
 /// IEEE-754 half → f32.

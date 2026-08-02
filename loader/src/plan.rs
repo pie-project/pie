@@ -20,7 +20,9 @@ pub mod pass;
 pub mod passes;
 
 pub use crate::extent::{Dim, Extent};
-pub use passes::tile::{CUDA_TILE_MAP_MASK, HOST_TILE_MAP_MASK, METAL_TILE_MAP_MASK};
+pub use passes::tile::{
+    CONVERT_TILE_MAP_MASK, CUDA_TILE_MAP_MASK, HOST_TILE_MAP_MASK, METAL_TILE_MAP_MASK,
+};
 
 /// Which tile-map transforms a target's kernels implement.
 ///

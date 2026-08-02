@@ -36,6 +36,8 @@ pub enum ModelCmd {
         #[arg(long, short = 'y')]
         yes: bool,
     },
+    /// Precompute a model's load-time work (bit-identical to a cold load).
+    Optimize(crate::ops::optimize::OptimizeArgs),
 }
 
 pub fn run(cmd: ModelCmd) -> Result<()> {
@@ -43,6 +45,7 @@ pub fn run(cmd: ModelCmd) -> Result<()> {
         ModelCmd::List => list(),
         ModelCmd::Download { repo_id, all } => download(repo_id, all),
         ModelCmd::Remove { repo_id, yes } => remove(repo_id, yes),
+        ModelCmd::Optimize(args) => crate::ops::optimize::run(args),
     }
 }
 
