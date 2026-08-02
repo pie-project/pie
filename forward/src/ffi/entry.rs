@@ -699,6 +699,7 @@ pub unsafe extern "C" fn pie_forward_trace_qwen3_5_hybrid_cuda(
             1 => FireClass::Prefill,
             2 => FireClass::CommitAdvance,
             3 => FireClass::StateOnly,
+            4 => FireClass::FrozenVerify,
             _ => return PieForwardStatus::InvalidArgument,
         };
         let plan = crate::family::qwen3_5_hybrid_cuda(&facts, &cuda, class);

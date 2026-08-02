@@ -955,10 +955,12 @@ fn lowered_qwen3_5_trace_round_trips_through_the_arena() {
     )));
     unsafe { pie_forward_release(&mut out) };
 
-    // Past the last class (StateOnly = 3): malformed, not defaulted.
+    // Past the last qwen3_5 class (FrozenVerify = 4 accepted since its
+    // slice; the mask classes 5/6 are llama_like's until the qwen3_5
+    // masked slice): malformed, not defaulted.
     let mut out2 = PieForwardPlan::default();
     assert_eq!(
-        unsafe { pie_forward_trace_qwen3_5_hybrid_cuda(&c_facts, &cuda, 4, &mut out2) },
+        unsafe { pie_forward_trace_qwen3_5_hybrid_cuda(&c_facts, &cuda, 5, &mut out2) },
         PieForwardStatus::InvalidArgument
     );
     assert!(out2.owner.is_null());

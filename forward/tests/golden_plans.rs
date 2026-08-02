@@ -371,3 +371,22 @@ fn qwen3_0_6b_cuda_masked_prefill() {
         ),
     );
 }
+
+/// The frozen-verify class (the rung-5 geometry amendment): the prefill
+/// body plus ONE stash store per linear layer — the cheap in-proj
+/// activations cached for the later commit-advance replay, at the
+/// hand-written launch position (after the splits, before the conv).
+/// `write_state=false` is a runtime argument of the stated kernels, not
+/// a trace difference, so the golden differs from prefill by exactly 18
+/// store launches.
+#[test]
+fn qwen3_5_hybrid_cuda_frozen_verify() {
+    check_plan(
+        "qwen3_5_hybrid_0_8b.cuda.frozen_verify",
+        &qwen3_5_hybrid_cuda(
+            &Qwen35HybridFacts::qwen3_5_0_8b(),
+            &Qwen35CudaFacts::qwen3_5_0_8b_synthetic(),
+            FireClass::FrozenVerify,
+        ),
+    );
+}

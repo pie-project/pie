@@ -220,15 +220,21 @@ void qwen3_5_forward_declared(
         state_cache.verify_hidden_stash_enabled() == declared.cuda_verify_stash;
     const pie_forward::ForwardPlan* class_plan = nullptr;
     if (state_dtype_ok && slot_ids_d != nullptr &&
-        (is_pure_decode || qo_indptr != nullptr) &&
-        !state_cache.verify_frozen()) {
-        if (commit_advance && !state_only) {
+        (is_pure_decode || qo_indptr != nullptr)) {
+        const bool frozen = state_cache.verify_frozen();
+        if (frozen && !commit_advance && !state_only) {
+            // The frozen-verify class: stash stores are stated iff the
+            // traced fact says so; a live/fact disagreement falls back.
+            if (declared.frozen_verify && commit_stash_ok) {
+                class_plan = &declared.frozen_verify;
+            }
+        } else if (!frozen && commit_advance && !state_only) {
             if (declared.commit_advance && commit_stash_ok) {
                 class_plan = &declared.commit_advance;
             }
-        } else if (state_only && !commit_advance) {
+        } else if (!frozen && state_only && !commit_advance) {
             if (declared.state_only) class_plan = &declared.state_only;
-        } else if (!commit_advance && !state_only &&
+        } else if (!frozen && !commit_advance && !state_only &&
                    declared.decode && declared.prefill) {
             class_plan =
                 is_pure_decode ? &declared.decode : &declared.prefill;

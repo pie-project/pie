@@ -65,6 +65,11 @@ struct Qwen35DeclaredPlan {
     // is the next slice; frozen fires stay on the semantic walk.)
     pie_forward::ForwardPlan commit_advance;
     pie_forward::ForwardPlan state_only;
+    // The frozen-verify class: the prefill body + a stash store per
+    // linear layer; write_state=false is a runtime arg, not a trace
+    // difference. With it, every batched body() fire has a class —
+    // rung 5's precondition.
+    pie_forward::ForwardPlan frozen_verify;
     // The binding facts the trace committed to (llama_like's `fused_qkv`
     // precedent); arc 2's per-fire gate re-checks them against the live
     // workspace before emitting.

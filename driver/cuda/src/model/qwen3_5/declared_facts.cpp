@@ -596,12 +596,15 @@ Qwen35DeclaredPlan build_impl(const HfConfig& cfg, const W& w, int tp_size) {
         facts, cuda, pie_forward::PieForwardFireClass::CommitAdvance);
     out.state_only = pie_forward::ForwardPlan::trace_qwen3_5_hybrid_cuda(
         facts, cuda, pie_forward::PieForwardFireClass::StateOnly);
+    out.frozen_verify = pie_forward::ForwardPlan::trace_qwen3_5_hybrid_cuda(
+        facts, cuda, pie_forward::PieForwardFireClass::FrozenVerify);
     // Drift between the declaration's stated kernels and the executor's
     // registry fails at model load, not mid-fire.
     qwen35_validate_stated_kernels(out.decode);
     qwen35_validate_stated_kernels(out.prefill);
     qwen35_validate_stated_kernels(out.commit_advance);
     qwen35_validate_stated_kernels(out.state_only);
+    qwen35_validate_stated_kernels(out.frozen_verify);
     return out;
 }
 

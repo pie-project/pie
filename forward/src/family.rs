@@ -508,6 +508,19 @@ fn gdn_attn_body(
 
     let (qkv, z, a, b) = gdn_in_proj(&x, &w, facts);
 
+    // FrozenVerify: the frozen verify pass caches the cheap in-proj
+    // activations for the later commit-advance replay — the stash STORE,
+    // at the hand-written launch position (after the splits, before the
+    // conv). Present iff the deployment configures the stash (the same
+    // engine-owned fact the load consumes); everything else in this body
+    // rides the Prefill arms, and write_state=false is a runtime ARG of
+    // the stated kernels, not a trace difference.
+    if let Some((c, FireClass::FrozenVerify)) = lower {
+        if c.verify_stash {
+            cuda::verify_stash_store(&qkv, &a, &b, &w.rs);
+        }
+    }
+
     // Conv → prep → recurrence: the GDN core, against the layer's
     // per-request conv/recurrent state. A class arm states the conv
     // kernel; the semantic form keeps the opaque op.
@@ -519,13 +532,13 @@ fn gdn_attn_body(
     let qkv = match lower {
         None => causal_conv1d(&qkv, &w.conv),
         Some((_, FireClass::Decode)) => cuda::gdn_conv_update_batched(&qkv, &w.conv, &w.rs),
-        Some((_, FireClass::Prefill | FireClass::StateOnly)) => {
+        Some((_, FireClass::Prefill | FireClass::StateOnly | FireClass::FrozenVerify)) => {
             cuda::gdn_conv_prefill_batched(&qkv, &w.conv, &w.rs)
         }
         Some((_, FireClass::CommitAdvance)) => {
             unreachable!("CommitAdvance traces its own pass, never the layer body")
         }
-        Some((_, FireClass::FrozenVerify | FireClass::MaskedDecode | FireClass::MaskedPrefill)) => {
+        Some((_, FireClass::MaskedDecode | FireClass::MaskedPrefill)) => {
             unreachable!("class not yet traced for qwen3_5 (entry rejects)")
         }
     };
@@ -547,7 +560,10 @@ fn gdn_attn_body(
         Some((c, FireClass::Decode)) => {
             cuda::gdn_step_batched(&q, &k, &v, &g, &beta, &w.rs, gqa, c.state_bf16)
         }
-        Some((c, FireClass::Prefill | FireClass::StateOnly)) => {
+        Some((
+            c,
+            FireClass::Prefill | FireClass::StateOnly | FireClass::FrozenVerify,
+        )) => {
             // The prefill recurrence three-way, as the first
             // VALUE-PRODUCING guard chain (north-star-dsl.md 4b): the
             // guard's output is the recurrence core — the same
@@ -588,7 +604,7 @@ fn gdn_attn_body(
         Some((_, FireClass::CommitAdvance)) => {
             unreachable!("CommitAdvance traces its own pass, never the layer body")
         }
-        Some((_, FireClass::FrozenVerify | FireClass::MaskedDecode | FireClass::MaskedPrefill)) => {
+        Some((_, FireClass::MaskedDecode | FireClass::MaskedPrefill)) => {
             unreachable!("class not yet traced for qwen3_5 (entry rejects)")
         }
     };
@@ -782,13 +798,13 @@ fn full_attn_body(
     let attn = match lower {
         None => attention(&q, &w.kv, facts.q_width()),
         Some((_, FireClass::Decode)) => cuda::attention_flashinfer_decode(&q, &w.kv, facts.q_width()),
-        Some((_, FireClass::Prefill | FireClass::StateOnly)) => {
+        Some((_, FireClass::Prefill | FireClass::StateOnly | FireClass::FrozenVerify)) => {
             cuda::attention_flashinfer_prefill_planned(&q, &w.kv, facts.q_width())
         }
         Some((_, FireClass::CommitAdvance)) => {
             unreachable!("CommitAdvance traces its own pass, never the layer body")
         }
-        Some((_, FireClass::FrozenVerify | FireClass::MaskedDecode | FireClass::MaskedPrefill)) => {
+        Some((_, FireClass::MaskedDecode | FireClass::MaskedPrefill)) => {
             unreachable!("class not yet traced for qwen3_5 (entry rejects)")
         }
     };
@@ -917,7 +933,8 @@ fn qwen3_5_hybrid_text(facts: &Qwen35HybridFacts, lower: Qwen35Lower<'_>) -> For
                 FireClass::Prefill => "prefill",
                 FireClass::CommitAdvance => "commit_advance",
                 FireClass::StateOnly => "state_only",
-                FireClass::FrozenVerify | FireClass::MaskedDecode | FireClass::MaskedPrefill => {
+                FireClass::FrozenVerify => "frozen_verify",
+                FireClass::MaskedDecode | FireClass::MaskedPrefill => {
                     unreachable!("class not yet traced for qwen3_5 (entry rejects)")
                 }
             }
