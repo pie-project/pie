@@ -67,13 +67,16 @@ bool qwen35_declared_exec_trace_enabled();
 // declaration/executor drift fails at model load, not mid-fire.
 void qwen35_validate_stated_kernels(const pie_forward::ForwardPlan& plan);
 
-// Execute one eligible fire by walking `declared.plan`. The caller
+// Execute one eligible fire by walking its CLASS trace (rung 5: the
+// semantic walk is deleted from this executor). Returns false when the
+// fire has no class (legacy harness shapes, live-fact mismatches) — the
+// caller then runs the hand-written path. The caller
 // (Qwen35Model::body) has already applied the eligibility gate; this
 // function additionally throws (never silently diverges) when the plan
 // carries an op or payload outside the executor's vocabulary — a trace
 // whose shape drifted must fail loudly, exactly the llama_like executor's
 // contract.
-void qwen3_5_forward_declared(
+bool qwen3_5_forward_declared(
     const Qwen35DeclaredPlan& declared,
     const Qwen3_5Weights& w,
     const HfConfig& cfg,

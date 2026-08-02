@@ -167,7 +167,7 @@ bool qwen35_declared_exec_trace_enabled() {
     return enabled;
 }
 
-void qwen3_5_forward_declared(
+bool qwen3_5_forward_declared(
     const Qwen35DeclaredPlan& declared,
     const Qwen3_5Weights& w,
     const HfConfig& cfg,
@@ -240,7 +240,22 @@ void qwen3_5_forward_declared(
                 is_pure_decode ? &declared.decode : &declared.prefill;
         }
     }
-    const bool class_walk = class_plan != nullptr;
+    // RUNG 5: the semantic walk is DELETED from this executor. Every
+    // batched fire has a class; anything without one (legacy slot-less
+    // harness fires, live-fact mismatches) falls back to the hand-written
+    // path — the caller runs it when we return false.
+    if (class_plan == nullptr) {
+        if (qwen35_declared_exec_trace_enabled()) {
+            std::fprintf(stderr,
+                         "[declared-qwen35-exec] no class for fire "
+                         "N=%d R=%d decode=%d commit=%d state_only=%d "
+                         "frozen=%d -> hand-written\n",
+                         total_tokens, num_requests, is_pure_decode ? 1 : 0,
+                         commit_advance ? 1 : 0, state_only ? 1 : 0,
+                         state_cache.verify_frozen() ? 1 : 0);
+        }
+        return false;
+    }
     if (!state_dtype_ok) {
         static bool warned = false;
         if (!warned) {
@@ -251,14 +266,13 @@ void qwen3_5_forward_declared(
                          "traces disabled, semantic walk serves\n");
         }
     }
-    const pie_forward::ForwardPlan& plan =
-        class_walk ? *class_plan : declared.plan;
+    const pie_forward::ForwardPlan& plan = *class_plan;
     if (qwen35_declared_exec_trace_enabled()) {
         std::fprintf(stderr,
                      "[declared-qwen35-exec] N=%d R=%d decode=%d ops=%zu "
-                     "class=%d\n",
+                     "class=1\n",
                      total_tokens, num_requests, is_pure_decode ? 1 : 0,
-                     plan.op_count(), class_walk ? 1 : 0);
+                     plan.op_count());
     }
     // Both fire shapes run here now (arc 3): the trace is decode/prefill-
     // agnostic by design (forward/src/trace.rs — CausalConv1d / GatedDelta /
@@ -377,7 +391,6 @@ void qwen3_5_forward_declared(
     // !rs_buffer_write`: frozen-verify fires run here with
     // write_state=false — the state-suppressing verify pass whose in-proj
     // activations the stash-write below captures for the later replay.
-    const bool linear_decode = is_pure_decode;
     const bool write_state = !state_cache.verify_frozen();
 
     // Verify-stash facts (`linear_attn_layer_body`'s stash block, hoisted:
@@ -394,16 +407,10 @@ void qwen3_5_forward_declared(
     const std::size_t stash_a_off = stash_stride * conv_dim;
     const std::size_t stash_b_off =
         stash_a_off + stash_stride * static_cast<std::size_t>(V_h);
-    const bool replay_load = commit_advance && stash_enabled;
-    const bool stash_write =
-        state_cache.verify_frozen() && stash_enabled && !commit_advance;
     auto slot_for = [&](int r) -> int {
         return slot_ids_h ? slot_ids_h[r] : 0;
     };
     // Decode GQA step: indexes the compact K_h-head layout directly.
-    const bool use_decode_gqa_recurrent =
-        linear_decode &&
-        slot_ids_d != nullptr && V_h != K_h && V_h % K_h == 0;
     // Prefill recurrence family — the hand-written selection, verbatim:
     // warp-tiled for small-N slotted prefill (STOPGAP: only when it need
     // not persist state, unless the env re-enables the persisting fold;
@@ -411,21 +418,6 @@ void qwen3_5_forward_declared(
     // commit_len); else the env-gated cached kernel; else the batched
     // GQA-aware FLA (the c>=64 spec path). `use_batched_fla_gqa` also
     // decides whether GdnPrep skips the repeat_interleave materialisation.
-    const bool use_warp_tiled_recurrent =
-        !linear_decode &&
-        slot_ids_d != nullptr &&
-        qo_indptr != nullptr &&
-        N <= qwen35_gdn_warp_tiled_max_tokens() &&
-        K_d <= 256 &&
-        commit_lens == nullptr &&
-        (!write_state || qwen35_gdn_warp_tiled_state_persist_enabled());
-    const bool use_batched_fla_gqa =
-        !linear_decode &&
-        slot_ids_d != nullptr &&
-        qo_indptr != nullptr &&
-        !use_warp_tiled_recurrent &&
-        V_h != K_h &&
-        N > qwen35_gdn_cached_prefill_max_tokens();
     // What the recurrence consumes when the GQA kernels don't index the
     // compact K_h layout directly (the `q_recur_full` indirection).
     const float* q_recur_full =
@@ -445,36 +437,6 @@ void qwen3_5_forward_declared(
     // the in-proj GEMMs+splits ONLY when there is no stash to replay from
     // (the hand-written `replay_load` false branch — same launches, same
     // degenerate reliance on whatever norm_x holds).
-    auto commit_advance_runs = [&](const PieForwardOp& op) -> bool {
-        switch (op.kind) {
-        case PieForwardOpKind::CausalConv1d:
-        case PieForwardOpKind::GdnPrep:
-        case PieForwardOpKind::GatedDelta:
-            return true;
-        case PieForwardOpKind::SplitGdn:
-            return !replay_load;
-        case PieForwardOpKind::Matmul: {
-            if (replay_load) return false;
-            const ParsedWeightName nm =
-                parse_weight_name(plan.weight_name(op));
-            return nm.field == "in_proj_qkvz" || nm.field == "in_proj_ba" ||
-                   nm.field == "in_proj_qkv" || nm.field == "in_proj_z" ||
-                   nm.field == "in_proj_a" || nm.field == "in_proj_b";
-        }
-        default:
-            return false;
-        }
-    };
-    // State-only epilogue skip — the hand-written `if (num_logit_rows < 0
-    // || commit_advance) return;` before final norm / lm_head / the final
-    // hidden copy (the copy lives in the LmHead arm, so skipping the arm
-    // skips it too).
-    auto state_only_skips = [&](const PieForwardOp& op) -> bool {
-        if (op.kind == PieForwardOpKind::LmHead) return true;
-        if (op.kind != PieForwardOpKind::Rmsnorm) return false;
-        const ParsedWeightName nm = parse_weight_name(plan.weight_name(op));
-        return nm.layer < 0 && nm.field == "final_norm";
-    };
 
     const std::size_t op_count = plan.op_count();
     // Guard skip state (class walk): when a chosen region ends, the rest
@@ -492,10 +454,7 @@ void qwen3_5_forward_declared(
             if (i >= op_count) break;
         }
         const PieForwardOp& op = plan.op(i);
-        // The op filters serve the SEMANTIC walk only: a class trace
-        // already contains exactly the service's ops.
-        if (!class_walk && commit_advance && !commit_advance_runs(op)) continue;
-        if (!class_walk && state_only && state_only_skips(op)) continue;
+
         switch (op.kind) {
         case PieForwardOpKind::Embed: {
             const std::string_view name = plan.weight_name(op);
@@ -690,134 +649,10 @@ void qwen3_5_forward_declared(
             break;
         }
         case PieForwardOpKind::CausalConv1d: {
-            if (class_walk) {
-                throw_drift("semantic CausalConv1d in a class trace "
-                            "(the declaration must state the conv kernel)");
-            }
-            const std::string_view name = plan.weight_name(op);
-            const ParsedWeightName nm = parse_weight_name(name);
-            if (nm.field != "conv") throw_unknown_weight(name);
-            const auto& layer = layer_of(w, nm, name);
-            if (op.param1 != static_cast<std::uint32_t>(conv_K)) {
-                throw_drift("CausalConv1d kernel " +
-                            std::to_string(op.param1) + " != config's " +
-                            std::to_string(conv_K));
-            }
-            const int state_layer = static_cast<int>(op.param0);
-            require(layer.la_conv1d_w, name);
-            // Verify-stash service at the hand-written launch position
-            // (after the in-proj GEMMs/splits, before the conv). The stash
-            // is keyed by the COMPACT linear-layer index — storage
-            // knowledge derived from the binding, like KvAppend's kv_layer
-            // — counted over the layer kinds below the traced model layer.
-            if (replay_load || stash_write) {
-                int linear_idx = 0;
-                for (int l = 0; l < state_layer; ++l) {
-                    if (w.layers[l].kind ==
-                        Qwen3_5LayerWeights::Kind::LinearAttn) {
-                        ++linear_idx;
-                    }
-                }
-                auto* stash = static_cast<std::uint16_t*>(
-                    state_cache.verify_hidden_stash_layer(linear_idx));
-                if (replay_load) {
-                    // Commit-advance replay: load [mixed_qkv | a | b] from
-                    // the stash; the in-proj GEMMs and splits were skipped.
-                    CUDA_CHECK(cudaMemcpyAsync(
-                        la.mixed_qkv.data(), stash,
-                        static_cast<std::size_t>(N) * conv_dim *
-                            sizeof(std::uint16_t),
-                        cudaMemcpyDeviceToDevice, stream));
-                    CUDA_CHECK(cudaMemcpyAsync(
-                        la.a.data(), stash + stash_a_off,
-                        static_cast<std::size_t>(N) * V_h *
-                            sizeof(std::uint16_t),
-                        cudaMemcpyDeviceToDevice, stream));
-                    CUDA_CHECK(cudaMemcpyAsync(
-                        la.b.data(), stash + stash_b_off,
-                        static_cast<std::size_t>(N) * V_h *
-                            sizeof(std::uint16_t),
-                        cudaMemcpyDeviceToDevice, stream));
-                } else {
-                    // Frozen verify: cache the cheap in-proj activations
-                    // for the later commit-advance replay.
-                    CUDA_CHECK(cudaMemcpyAsync(
-                        stash, la.mixed_qkv.data(),
-                        static_cast<std::size_t>(N) * conv_dim *
-                            sizeof(std::uint16_t),
-                        cudaMemcpyDeviceToDevice, stream));
-                    CUDA_CHECK(cudaMemcpyAsync(
-                        stash + stash_a_off, la.a.data(),
-                        static_cast<std::size_t>(N) * V_h *
-                            sizeof(std::uint16_t),
-                        cudaMemcpyDeviceToDevice, stream));
-                    CUDA_CHECK(cudaMemcpyAsync(
-                        stash + stash_b_off, la.b.data(),
-                        static_cast<std::size_t>(N) * V_h *
-                            sizeof(std::uint16_t),
-                        cudaMemcpyDeviceToDevice, stream));
-                }
-            }
-            // Per-fire lowering of the opaque conv op against the layer's
-            // per-request conv state — the hand-written conv stage,
-            // verbatim: decode-update on pure-decode fires, the batched
-            // prefill walk (each (C, R) block walking its qo_indptr window
-            // and persisting the trailing K-window) otherwise, with the
-            // legacy slot-0 / host-loop paths for the parity entry point.
-            if (linear_decode) {
-                if (slot_ids_d != nullptr) {
-                    kernels::launch_causal_conv1d_update_batched_bf16(
-                        la.mixed_qkv.data(), layer.la_conv1d_w->data(),
-                        layer.la_conv1d_b ? layer.la_conv1d_b->data()
-                                          : nullptr,
-                        state_cache.conv_state(state_layer, /*slot=*/0),
-                        slot_ids_d,
-                        static_cast<long long>(state_cache.conv_kernel()) *
-                            state_cache.conv_dim(),
-                        la.mixed_qkv_post.data(),
-                        R, conv_dim, conv_K, stream);
-                } else {
-                    kernels::launch_causal_conv1d_update_bf16(
-                        la.mixed_qkv.data(), layer.la_conv1d_w->data(),
-                        layer.la_conv1d_b ? layer.la_conv1d_b->data()
-                                          : nullptr,
-                        state_cache.conv_state(state_layer, 0),
-                        la.mixed_qkv_post.data(),
-                        conv_dim, conv_K, stream);
-                }
-            } else {
-                if (slot_ids_d != nullptr && qo_indptr != nullptr) {
-                    kernels::launch_causal_conv1d_prefill_batched_bf16(
-                        la.mixed_qkv.data(), layer.la_conv1d_w->data(),
-                        layer.la_conv1d_b ? layer.la_conv1d_b->data()
-                                          : nullptr,
-                        la.mixed_qkv_post.data(),
-                        state_cache.conv_state(state_layer, /*slot=*/0),
-                        slot_ids_d, qo_indptr,
-                        static_cast<long long>(state_cache.conv_kernel()) *
-                            state_cache.conv_dim(),
-                        R, conv_dim, conv_K, stream, write_state,
-                        commit_lens);
-                } else {
-                    for (int r = 0; r < R; ++r) {
-                        const int t0 = static_cast<int>(qo_indptr_h[r]);
-                        const int Nr =
-                            static_cast<int>(qo_indptr_h[r + 1]) - t0;
-                        if (Nr <= 0) continue;
-                        const std::size_t off =
-                            static_cast<std::size_t>(t0) * conv_dim;
-                        kernels::launch_causal_conv1d_prefill_bf16(
-                            la.mixed_qkv.data() + off,
-                            layer.la_conv1d_w->data(),
-                            layer.la_conv1d_b ? layer.la_conv1d_b->data()
-                                              : nullptr,
-                            la.mixed_qkv_post.data() + off,
-                            state_cache.conv_state(state_layer, slot_for(r)),
-                            Nr, conv_dim, conv_K, stream);
-                    }
-                }
-            }
-            break;
+            // RUNG 5: the semantic cascade is deleted — a class trace
+            // states this choice site's kernels.
+            throw_drift("semantic CausalConv1d reached the class-trace walk "
+                        "(the declaration states the conv kernel)");
         }
         case PieForwardOpKind::GdnPrep: {
             // The one kind naming TWO weights: a_log in the weight slot,
@@ -845,235 +680,16 @@ void qwen3_5_forward_declared(
             // layout directly, so repeat_interleave launches only when
             // none of them is eligible — the hand-written predicate,
             // all four terms.
-            if (!class_walk && V_h != K_h && !use_warp_tiled_recurrent &&
-                !use_decode_gqa_recurrent && !use_batched_fla_gqa) {
-                // (On a class walk the repeats are STATED — inside the
-                // recurrence guard's cached arm — so this derivation
-                // must not double-launch them.)
-                kernels::launch_repeat_interleave_heads_fp32(
-                    la.q_pre.data(), la.q_norm.data(), N, K_h, V_h, K_d,
-                    stream);
-                kernels::launch_repeat_interleave_heads_fp32(
-                    la.k_pre.data(), la.k_norm.data(), N, K_h, V_h, K_d,
-                    stream);
-            }
+            // RUNG 5: the GQA repeat derivation is deleted — a class
+            // trace STATES the repeats inside the recurrence guard's
+            // cached arm, and nowhere else.
             break;
         }
         case PieForwardOpKind::GatedDelta: {
-            if (class_walk) {
-                throw_drift("semantic GatedDelta in a class trace "
-                            "(the declaration must state the recurrence)");
-            }
-            // The recurrent update against the layer's per-request slab —
-            // the hand-written recurrence stage, kernel for kernel. Decode:
-            // the one-token step (batched GQA / batched / legacy
-            // single-request, each in its state dtype). Prefill: the
-            // chunked family selected by the hoisted predicates (warp-tiled
-            // GQA / warp-tiled / env-gated cached / batched GQA-aware FLA),
-            // or the legacy per-request host loop for the parity entry
-            // point.
-            const int state_layer = static_cast<int>(op.param0);
-            void* state_slot0 =
-                state_cache.recurrent_state_raw(state_layer, /*slot=*/0);
-            if (!linear_decode) {
-                if (slot_ids_d != nullptr && qo_indptr != nullptr) {
-                    if (use_warp_tiled_recurrent && V_h != K_h) {
-                        if (state_bf16) {
-                            kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16(
-                                la.q_pre.data(), la.k_pre.data(),
-                                la.v_fp32.data(), la.g_log.data(),
-                                la.beta.data(),
-                                state_slot0, slot_ids_d, qo_indptr,
-                                slot_stride, la.core_out.data(),
-                                R, K_h, V_h, K_d, V_d,
-                                stream, write_state);
-                        } else {
-                            kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa(
-                                la.q_pre.data(), la.k_pre.data(),
-                                la.v_fp32.data(), la.g_log.data(),
-                                la.beta.data(),
-                                static_cast<float*>(state_slot0),
-                                slot_ids_d, qo_indptr,
-                                slot_stride, la.core_out.data(),
-                                R, K_h, V_h, K_d, V_d,
-                                stream, write_state);
-                        }
-                    } else if (use_warp_tiled_recurrent) {
-                        if (state_bf16) {
-                            kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16(
-                                q_recur_full, k_recur_full,
-                                la.v_fp32.data(), la.g_log.data(),
-                                la.beta.data(),
-                                state_slot0, slot_ids_d, qo_indptr,
-                                slot_stride, la.core_out.data(),
-                                R, V_h, K_d, V_d,
-                                stream, write_state);
-                        } else {
-                            kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled(
-                                q_recur_full, k_recur_full,
-                                la.v_fp32.data(), la.g_log.data(),
-                                la.beta.data(),
-                                static_cast<float*>(state_slot0),
-                                slot_ids_d, qo_indptr,
-                                slot_stride, la.core_out.data(),
-                                R, V_h, K_d, V_d,
-                                stream, write_state);
-                        }
-                    } else if (commit_lens == nullptr &&
-                               N <= qwen35_gdn_cached_prefill_max_tokens()) {
-                        // (Commit-advance falls through to the FLA branch —
-                        // the only kernel family threading commit_len.)
-                        if (state_bf16) {
-                            kernels::launch_chunk_gated_delta_prefill_batched_cached_state_bf16(
-                                q_recur_full, k_recur_full,
-                                la.v_fp32.data(), la.g_log.data(),
-                                la.beta.data(),
-                                state_slot0, slot_ids_d, qo_indptr,
-                                slot_stride, la.core_out.data(),
-                                R, V_h, K_d, V_d,
-                                stream, write_state);
-                        } else {
-                            kernels::launch_chunk_gated_delta_prefill_batched_cached(
-                                q_recur_full, k_recur_full,
-                                la.v_fp32.data(), la.g_log.data(),
-                                la.beta.data(),
-                                static_cast<float*>(state_slot0),
-                                slot_ids_d, qo_indptr,
-                                slot_stride, la.core_out.data(),
-                                R, V_h, K_d, V_d,
-                                stream, write_state);
-                        }
-                    } else {
-                        // GQA-aware FLA: the compact K_h-head q/k (q_pre ==
-                        // q_recur_full when V_h == K_h), repeat_interleave
-                        // skipped above (use_batched_fla_gqa).
-                        if (state_bf16) {
-                            kernels::launch_chunk_gated_delta_prefill_batched_state_bf16(
-                                la.q_pre.data(), la.k_pre.data(),
-                                la.v_fp32.data(), la.g_log.data(),
-                                la.beta.data(),
-                                state_slot0, slot_ids_d, qo_indptr,
-                                slot_stride, la.core_out.data(),
-                                R, K_h, V_h, K_d, V_d, stream, write_state,
-                                commit_lens);
-                        } else {
-                            kernels::launch_chunk_gated_delta_prefill_batched(
-                                la.q_pre.data(), la.k_pre.data(),
-                                la.v_fp32.data(), la.g_log.data(),
-                                la.beta.data(),
-                                static_cast<float*>(state_slot0),
-                                slot_ids_d, qo_indptr,
-                                slot_stride, la.core_out.data(),
-                                R, K_h, V_h, K_d, V_d, stream, write_state,
-                                commit_lens);
-                        }
-                    }
-                } else {
-                    // Legacy single-request parity path: per-request
-                    // chunked prefill against slot_for(r).
-                    const std::size_t qk_step =
-                        static_cast<std::size_t>(V_h) * K_d;
-                    const std::size_t v_step =
-                        static_cast<std::size_t>(V_dim);
-                    const std::size_t gh_step =
-                        static_cast<std::size_t>(V_h);
-                    for (int r = 0; r < R; ++r) {
-                        const int t0 = static_cast<int>(qo_indptr_h[r]);
-                        const int Nr =
-                            static_cast<int>(qo_indptr_h[r + 1]) - t0;
-                        if (Nr <= 0) continue;
-                        const std::size_t qk_off =
-                            static_cast<std::size_t>(t0) * qk_step;
-                        const std::size_t v_off =
-                            static_cast<std::size_t>(t0) * v_step;
-                        const std::size_t gh_off =
-                            static_cast<std::size_t>(t0) * gh_step;
-                        void* state_slot = state_cache.recurrent_state_raw(
-                            state_layer, slot_for(r));
-                        if (state_bf16) {
-                            kernels::launch_chunk_gated_delta_prefill_state_bf16(
-                                q_recur_full + qk_off,
-                                k_recur_full + qk_off,
-                                la.v_fp32.data() + v_off,
-                                la.g_log.data() + gh_off,
-                                la.beta.data() + gh_off,
-                                state_slot,
-                                la.core_out.data() + v_off,
-                                Nr, V_h, K_d, V_d, /*chunk_size=*/64,
-                                stream);
-                        } else {
-                            kernels::launch_chunk_gated_delta_prefill(
-                                q_recur_full + qk_off,
-                                k_recur_full + qk_off,
-                                la.v_fp32.data() + v_off,
-                                la.g_log.data() + gh_off,
-                                la.beta.data() + gh_off,
-                                static_cast<float*>(state_slot),
-                                la.core_out.data() + v_off,
-                                Nr, V_h, K_d, V_d, /*chunk_size=*/64,
-                                stream);
-                        }
-                    }
-                }
-                break;
-            }
-            if (slot_ids_d != nullptr) {
-                if (use_decode_gqa_recurrent) {
-                    if (state_bf16) {
-                        kernels::launch_recurrent_gated_delta_step_batched_gqa_state_bf16(
-                            la.q_pre.data(), la.k_pre.data(),
-                            la.v_fp32.data(), la.g_log.data(),
-                            la.beta.data(),
-                            state_slot0, slot_ids_d, slot_stride,
-                            la.core_out.data(),
-                            R, K_h, V_h, K_d, V_d, stream);
-                    } else {
-                        kernels::launch_recurrent_gated_delta_step_batched_gqa(
-                            la.q_pre.data(), la.k_pre.data(),
-                            la.v_fp32.data(), la.g_log.data(),
-                            la.beta.data(),
-                            static_cast<float*>(state_slot0),
-                            slot_ids_d, slot_stride,
-                            la.core_out.data(),
-                            R, K_h, V_h, K_d, V_d, stream);
-                    }
-                } else {
-                    if (state_bf16) {
-                        kernels::launch_recurrent_gated_delta_step_batched_state_bf16(
-                            q_recur_full, k_recur_full,
-                            la.v_fp32.data(), la.g_log.data(),
-                            la.beta.data(),
-                            state_slot0, slot_ids_d, slot_stride,
-                            la.core_out.data(),
-                            R, V_h, K_d, V_d, stream);
-                    } else {
-                        kernels::launch_recurrent_gated_delta_step_batched(
-                            q_recur_full, k_recur_full,
-                            la.v_fp32.data(), la.g_log.data(),
-                            la.beta.data(),
-                            static_cast<float*>(state_slot0),
-                            slot_ids_d, slot_stride,
-                            la.core_out.data(),
-                            R, V_h, K_d, V_d, stream);
-                    }
-                }
-            } else {
-                if (state_bf16) {
-                    kernels::launch_recurrent_gated_delta_step_state_bf16(
-                        q_recur_full, k_recur_full,
-                        la.v_fp32.data(), la.g_log.data(), la.beta.data(),
-                        state_slot0, la.core_out.data(),
-                        /*B=*/1, V_h, K_d, V_d, stream);
-                } else {
-                    kernels::launch_recurrent_gated_delta_step(
-                        q_recur_full, k_recur_full,
-                        la.v_fp32.data(), la.g_log.data(), la.beta.data(),
-                        static_cast<float*>(state_slot0),
-                        la.core_out.data(),
-                        /*B=*/1, V_h, K_d, V_d, stream);
-                }
-            }
-            break;
+            // RUNG 5: the semantic cascade is deleted — a class trace
+            // states this choice site's kernels.
+            throw_drift("semantic GatedDelta reached the class-trace walk "
+                        "(the declaration states the recurrence)");
         }
         case PieForwardOpKind::RmsnormGated: {
             // core_out (fp32) → fused z-gated RMSNorm → bf16, per (n, h)
@@ -1142,92 +758,16 @@ void qwen3_5_forward_declared(
             break;
         }
         case PieForwardOpKind::KvAppend: {
-            if (class_walk) {
-                throw_drift("semantic KvAppend in a class trace "
-                            "(the declaration must state the KV write)");
-            }
-            // The trace states the MODEL layer; the compact KV slot is
-            // storage knowledge this emitter derives from the binding
-            // (`Qwen3_5LayerWeights::kv_layer` — family.rs's
-            // full_attn_body doc states exactly this division).
-            const int model_layer = static_cast<int>(op.param0);
-            if (model_layer < 0 ||
-                model_layer >= static_cast<int>(w.layers.size()) ||
-                w.layers[model_layer].kv_layer < 0) {
-                throw_drift("KvAppend layer " +
-                            std::to_string(model_layer) +
-                            " has no KV cache slot");
-            }
-            auto kv_view = cache.layer_view(w.layers[model_layer].kv_layer);
-            if (has_write_desc) {
-                kernels::launch_write_kv_explicit_bf16(
-                    kv_view, ws.k.data(), ws.v.data(),
-                    w_page_d, w_off_d, N, stream, row_valid_d);
-            } else {
-                kernels::launch_write_kv_to_pages(
-                    kv_view, ws.k.data(), ws.v.data(),
-                    qo_indptr, kv_page_indices, kv_page_indptr,
-                    kv_last_page_lens, N, R, stream);
-            }
-            break;
+            // RUNG 5: the semantic cascade is deleted — a class trace
+            // states this choice site's kernels.
+            throw_drift("semantic KvAppend reached the class-trace walk "
+                        "(the declaration states the KV write)");
         }
         case PieForwardOpKind::Attention: {
-            if (class_walk) {
-                throw_drift("semantic Attention in a class trace "
-                            "(the declaration must state the attention "
-                            "kernel)");
-            }
-            const int model_layer = static_cast<int>(op.param0);
-            if (model_layer < 0 ||
-                model_layer >= static_cast<int>(w.layers.size()) ||
-                w.layers[model_layer].kv_layer < 0) {
-                throw_drift("Attention layer " +
-                            std::to_string(model_layer) +
-                            " has no KV cache slot");
-            }
-            auto kv_view = cache.layer_view(w.layers[model_layer].kv_layer);
-            // Plan choice is a per-fire LOWERING (family.rs's
-            // full_attn_body doc): the same four-way branch as the
-            // hand-written body, same inputs, same order. Decode fires
-            // dispatch the decode plan; prefill fires the prefill plan
-            // `prepare_qwen3_5_decode_plan` staged (or the naive/unplanned
-            // fallbacks on non-bf16 cache layouts / parity modes).
-            const bool use_small_prefill_naive =
-                decode_plan == nullptr &&
-                prefill_plan == nullptr &&
-                fwd_cfg.small_prefill_naive_attention_max_tokens > 0 &&
-                N <= fwd_cfg.small_prefill_naive_attention_max_tokens &&
-                kv_view.is_native_bf16() && !kv_view.hnd_layout;
-            if (decode_plan) {
-                ops::dispatch_attention_flashinfer_decode(
-                    *decode_plan,
-                    ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    attn_ws, stream);
-            } else if (prefill_plan) {
-                ops::dispatch_attention_flashinfer_prefill_bf16(
-                    *prefill_plan,
-                    ws.q.data(), kv_view.k_bf16_pages, kv_view.v_bf16_pages,
-                    ws.attn_out.data(),
-                    qo_indptr, kv_page_indices, kv_page_indptr,
-                    kv_last_page_lens, attn_ws, stream);
-            } else if (use_small_prefill_naive) {
-                ops::launch_attention_naive_paged_bf16(
-                    ws.q.data(), kv_view.k_bf16_pages, kv_view.v_bf16_pages,
-                    ws.attn_out.data(),
-                    qo_indptr, kv_page_indices, kv_page_indptr,
-                    kv_last_page_lens,
-                    N, R, num_q_heads, num_kv_heads, d,
-                    cache.page_size(), stream);
-            } else {
-                ops::launch_attention_flashinfer_prefill(
-                    ws.q.data(), kv_view, ws.attn_out.data(),
-                    qo_indptr, kv_page_indices, kv_page_indptr,
-                    kv_last_page_lens,
-                    qo_indptr_h, kv_page_indptr_h,
-                    N, R, num_q_heads, attn_ws, stream);
-            }
-            break;
+            // RUNG 5: the semantic cascade is deleted — a class trace
+            // states this choice site's kernels.
+            throw_drift("semantic Attention reached the class-trace walk "
+                        "(the declaration states the attention kernel)");
         }
         case PieForwardOpKind::SigmoidGateMul: {
             // attn_out *= sigmoid(gate) — the full-attention output gate.
@@ -1596,6 +1136,7 @@ case PieForwardOpKind::Launch: {
                 " has no emission rule");
         }
     }
+    return true;
 }
 
 }  // namespace pie_cuda_driver::model

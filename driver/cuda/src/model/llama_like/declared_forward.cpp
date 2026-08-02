@@ -717,42 +717,13 @@ void llama_like_forward_declared(
             break;
         }
         case PieForwardOpKind::KvAppend: {
-            // Padded head_dim: the cache stores `dk`-wide cells, so Q/K/V
-            // are zero-padded to the `*_padded` staging buffers first —
-            // the hand-written pad block, same launch order (q, k, v),
-            // placed exactly where it sits there: after rope, before the
-            // write. Identity when unpadded (`attn_*` alias ws.q/k/v).
-            if (head_dim_padded) {
-                kernels::launch_pad_head_dim_bf16(
-                    ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
-                kernels::launch_pad_head_dim_bf16(
-                    ws.k.data(), attn_k, N, num_kv_heads, d, dk, stream);
-                kernels::launch_pad_head_dim_bf16(
-                    ws.v.data(), attn_v, N, num_kv_heads, d, dk, stream);
-            }
-            auto kv_view = cache.layer_view(static_cast<int>(op.param0));
-            if (has_write_desc) {
-                // Explicit-descriptor write, N cells (one per query token) —
-                // the hand-written `has_write_desc` branch, including why N
-                // and not R (llama_like.cpp's B2 comment). Graph-replayed
-                // decode fires always take this branch: their captures
-                // record the w_page/w_off path so padded rows stay steerable
-                // at replay time.
-                kernels::launch_write_kv_explicit_bf16(
-                    kv_view,
-                    attn_k, attn_v,
-                    w_page_d, w_off_d, N, stream, row_valid_d);
-            } else {
-                // Page-derived append (the hand-written non-write-desc
-                // branch): position re-derived from the page table.
-                kernels::launch_write_kv_to_pages(
-                    kv_view,
-                    attn_k, attn_v,
-                    qo_indptr, kv_page_indices, kv_page_indptr,
-                    kv_last_page_lens,
-                    N, R, stream, row_valid_d);
-            }
-            break;
+            // RUNG 5: the write-mechanism branch is deleted — every
+            // lowered trace states the KV write through the HasWriteDesc
+            // guard's two launches, so the semantic kind cannot reach
+            // this walk.
+            throw std::runtime_error(
+                "declared forward: semantic KvAppend in a class trace "
+                "(the declaration states the KV write)");
         }
         case PieForwardOpKind::Attention: {
             // A class trace states its attention kernel as a Launch op;
@@ -898,6 +869,17 @@ void llama_like_forward_declared(
             }
             case LaunchKernel::WriteKvExplicit: {
                 auto kv_view = cache.layer_view(L);
+                // Mechanical pad staging for padded head dims (the
+                // hand-written pre-write pad block; exactly one write
+                // region runs, so this launches once per layer).
+                if (head_dim_padded) {
+                    kernels::launch_pad_head_dim_bf16(
+                        ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
+                    kernels::launch_pad_head_dim_bf16(
+                        ws.k.data(), attn_k, N, num_kv_heads, d, dk, stream);
+                    kernels::launch_pad_head_dim_bf16(
+                        ws.v.data(), attn_v, N, num_kv_heads, d, dk, stream);
+                }
                 kernels::launch_write_kv_explicit_bf16(
                     kv_view, attn_k, attn_v,
                     w_page_d, w_off_d, N, stream, row_valid_d);
@@ -905,6 +887,17 @@ void llama_like_forward_declared(
             }
             case LaunchKernel::WriteKvToPages: {
                 auto kv_view = cache.layer_view(L);
+                // Mechanical pad staging for padded head dims (the
+                // hand-written pre-write pad block; exactly one write
+                // region runs, so this launches once per layer).
+                if (head_dim_padded) {
+                    kernels::launch_pad_head_dim_bf16(
+                        ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
+                    kernels::launch_pad_head_dim_bf16(
+                        ws.k.data(), attn_k, N, num_kv_heads, d, dk, stream);
+                    kernels::launch_pad_head_dim_bf16(
+                        ws.v.data(), attn_v, N, num_kv_heads, d, dk, stream);
+                }
                 kernels::launch_write_kv_to_pages(
                     kv_view, attn_k, attn_v,
                     qo_indptr, kv_page_indices, kv_page_indptr,

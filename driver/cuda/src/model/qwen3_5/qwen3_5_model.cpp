@@ -123,7 +123,7 @@ void Qwen35Model::body(Workspace& ws,
         // the walk's commit_lens; its rs_buffer_fold flavor stays behind
         // the rs-buffer term above).)
         if (fallback_reason == nullptr) {
-            qwen3_5_forward_declared(
+            const bool handled = qwen3_5_forward_declared(
                 declared_, weights_, hf_config_, fwd_cfg_, plan_state_,
                 ws, la_ws_, kv, state_cache_, attn_ws, cublas,
                 in.token_ids, in.positions,
@@ -135,7 +135,9 @@ void Qwen35Model::body(Workspace& ws,
                 in.slot_ids_h, in.is_fresh_h, in.slot_ids_d, in.is_fresh_d,
                 in.logit_row_indices_d, in.num_logit_rows,
                 in.commit_advance_gather_d);
-            return;
+            if (handled) return;
+            // No class for this fire (rung 5): the hand-written path
+            // below serves it, exactly as before the declared gate.
         }
         if (qwen35_declared_exec_trace_enabled()) {
             std::fprintf(stderr,
