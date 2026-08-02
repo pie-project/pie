@@ -1,0 +1,9371 @@
+{
+  "family": "llama_like.cuda.prefill",
+  "values": [
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4096
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4096
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4096
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4096
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4096
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4096
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4096
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4096
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4096
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4096
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4096
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4096
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4096
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4096
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4096
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4096
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4096
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4096
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4096
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4096
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4096
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4096
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4096
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4096
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4096
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4096
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4096
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4096
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3072
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Requests",
+        {
+          "Const": 151936
+        }
+      ],
+      "dtype": "F32"
+    }
+  ],
+  "ops": [
+    {
+      "kind": {
+        "Embed": {
+          "weight": "embed"
+        }
+      },
+      "inputs": [],
+      "outputs": [
+        0
+      ],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.0.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        0
+      ],
+      "outputs": [
+        1
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.0.qkv",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        1
+      ],
+      "outputs": [
+        2
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "SplitQkv": {
+          "q_width": 2048,
+          "kv_width": 1024
+        }
+      },
+      "inputs": [
+        2
+      ],
+      "outputs": [
+        3,
+        4,
+        5
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.0.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        3
+      ],
+      "outputs": [
+        6
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.0.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        4
+      ],
+      "outputs": [
+        7
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        6,
+        7
+      ],
+      "outputs": [
+        8,
+        9
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 0
+        }
+      },
+      "inputs": [
+        9,
+        5
+      ],
+      "outputs": [],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 0,
+          "kernel": "PrefillPlanned"
+        }
+      },
+      "inputs": [
+        8
+      ],
+      "outputs": [
+        10
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.0.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        10,
+        0
+      ],
+      "outputs": [
+        11
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.0.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        11
+      ],
+      "outputs": [
+        12
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.0.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        12
+      ],
+      "outputs": [
+        13
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        13
+      ],
+      "outputs": [
+        14
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.0.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        14,
+        11
+      ],
+      "outputs": [
+        15
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.1.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        15
+      ],
+      "outputs": [
+        16
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.1.qkv",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        16
+      ],
+      "outputs": [
+        17
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "SplitQkv": {
+          "q_width": 2048,
+          "kv_width": 1024
+        }
+      },
+      "inputs": [
+        17
+      ],
+      "outputs": [
+        18,
+        19,
+        20
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.1.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        18
+      ],
+      "outputs": [
+        21
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.1.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        19
+      ],
+      "outputs": [
+        22
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        21,
+        22
+      ],
+      "outputs": [
+        23,
+        24
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 1
+        }
+      },
+      "inputs": [
+        24,
+        20
+      ],
+      "outputs": [],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 1,
+          "kernel": "PrefillPlanned"
+        }
+      },
+      "inputs": [
+        23
+      ],
+      "outputs": [
+        25
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.1.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        25,
+        15
+      ],
+      "outputs": [
+        26
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.1.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        26
+      ],
+      "outputs": [
+        27
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.1.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        27
+      ],
+      "outputs": [
+        28
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        28
+      ],
+      "outputs": [
+        29
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.1.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        29,
+        26
+      ],
+      "outputs": [
+        30
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.2.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        30
+      ],
+      "outputs": [
+        31
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.2.qkv",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        31
+      ],
+      "outputs": [
+        32
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "SplitQkv": {
+          "q_width": 2048,
+          "kv_width": 1024
+        }
+      },
+      "inputs": [
+        32
+      ],
+      "outputs": [
+        33,
+        34,
+        35
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.2.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        33
+      ],
+      "outputs": [
+        36
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.2.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        34
+      ],
+      "outputs": [
+        37
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        36,
+        37
+      ],
+      "outputs": [
+        38,
+        39
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 2
+        }
+      },
+      "inputs": [
+        39,
+        35
+      ],
+      "outputs": [],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 2,
+          "kernel": "PrefillPlanned"
+        }
+      },
+      "inputs": [
+        38
+      ],
+      "outputs": [
+        40
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.2.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        40,
+        30
+      ],
+      "outputs": [
+        41
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.2.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        41
+      ],
+      "outputs": [
+        42
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.2.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        42
+      ],
+      "outputs": [
+        43
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        43
+      ],
+      "outputs": [
+        44
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.2.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        44,
+        41
+      ],
+      "outputs": [
+        45
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.3.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        45
+      ],
+      "outputs": [
+        46
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.3.qkv",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        46
+      ],
+      "outputs": [
+        47
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "SplitQkv": {
+          "q_width": 2048,
+          "kv_width": 1024
+        }
+      },
+      "inputs": [
+        47
+      ],
+      "outputs": [
+        48,
+        49,
+        50
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.3.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        48
+      ],
+      "outputs": [
+        51
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.3.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        49
+      ],
+      "outputs": [
+        52
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        51,
+        52
+      ],
+      "outputs": [
+        53,
+        54
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 3
+        }
+      },
+      "inputs": [
+        54,
+        50
+      ],
+      "outputs": [],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 3,
+          "kernel": "PrefillPlanned"
+        }
+      },
+      "inputs": [
+        53
+      ],
+      "outputs": [
+        55
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.3.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        55,
+        45
+      ],
+      "outputs": [
+        56
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.3.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        56
+      ],
+      "outputs": [
+        57
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.3.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        57
+      ],
+      "outputs": [
+        58
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        58
+      ],
+      "outputs": [
+        59
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.3.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        59,
+        56
+      ],
+      "outputs": [
+        60
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.4.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        60
+      ],
+      "outputs": [
+        61
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.4.qkv",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        61
+      ],
+      "outputs": [
+        62
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "SplitQkv": {
+          "q_width": 2048,
+          "kv_width": 1024
+        }
+      },
+      "inputs": [
+        62
+      ],
+      "outputs": [
+        63,
+        64,
+        65
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.4.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        63
+      ],
+      "outputs": [
+        66
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.4.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        64
+      ],
+      "outputs": [
+        67
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        66,
+        67
+      ],
+      "outputs": [
+        68,
+        69
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 4
+        }
+      },
+      "inputs": [
+        69,
+        65
+      ],
+      "outputs": [],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 4,
+          "kernel": "PrefillPlanned"
+        }
+      },
+      "inputs": [
+        68
+      ],
+      "outputs": [
+        70
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.4.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        70,
+        60
+      ],
+      "outputs": [
+        71
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.4.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        71
+      ],
+      "outputs": [
+        72
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.4.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        72
+      ],
+      "outputs": [
+        73
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        73
+      ],
+      "outputs": [
+        74
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.4.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        74,
+        71
+      ],
+      "outputs": [
+        75
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.5.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        75
+      ],
+      "outputs": [
+        76
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.5.qkv",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        76
+      ],
+      "outputs": [
+        77
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "SplitQkv": {
+          "q_width": 2048,
+          "kv_width": 1024
+        }
+      },
+      "inputs": [
+        77
+      ],
+      "outputs": [
+        78,
+        79,
+        80
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.5.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        78
+      ],
+      "outputs": [
+        81
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.5.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        79
+      ],
+      "outputs": [
+        82
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        81,
+        82
+      ],
+      "outputs": [
+        83,
+        84
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 5
+        }
+      },
+      "inputs": [
+        84,
+        80
+      ],
+      "outputs": [],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 5,
+          "kernel": "PrefillPlanned"
+        }
+      },
+      "inputs": [
+        83
+      ],
+      "outputs": [
+        85
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.5.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        85,
+        75
+      ],
+      "outputs": [
+        86
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.5.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        86
+      ],
+      "outputs": [
+        87
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.5.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        87
+      ],
+      "outputs": [
+        88
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        88
+      ],
+      "outputs": [
+        89
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.5.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        89,
+        86
+      ],
+      "outputs": [
+        90
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.6.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        90
+      ],
+      "outputs": [
+        91
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.6.qkv",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        91
+      ],
+      "outputs": [
+        92
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "SplitQkv": {
+          "q_width": 2048,
+          "kv_width": 1024
+        }
+      },
+      "inputs": [
+        92
+      ],
+      "outputs": [
+        93,
+        94,
+        95
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.6.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        93
+      ],
+      "outputs": [
+        96
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.6.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        94
+      ],
+      "outputs": [
+        97
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        96,
+        97
+      ],
+      "outputs": [
+        98,
+        99
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 6
+        }
+      },
+      "inputs": [
+        99,
+        95
+      ],
+      "outputs": [],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 6,
+          "kernel": "PrefillPlanned"
+        }
+      },
+      "inputs": [
+        98
+      ],
+      "outputs": [
+        100
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.6.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        100,
+        90
+      ],
+      "outputs": [
+        101
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.6.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        101
+      ],
+      "outputs": [
+        102
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.6.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        102
+      ],
+      "outputs": [
+        103
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        103
+      ],
+      "outputs": [
+        104
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.6.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        104,
+        101
+      ],
+      "outputs": [
+        105
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.7.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        105
+      ],
+      "outputs": [
+        106
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.7.qkv",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        106
+      ],
+      "outputs": [
+        107
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "SplitQkv": {
+          "q_width": 2048,
+          "kv_width": 1024
+        }
+      },
+      "inputs": [
+        107
+      ],
+      "outputs": [
+        108,
+        109,
+        110
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.7.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        108
+      ],
+      "outputs": [
+        111
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.7.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        109
+      ],
+      "outputs": [
+        112
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        111,
+        112
+      ],
+      "outputs": [
+        113,
+        114
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 7
+        }
+      },
+      "inputs": [
+        114,
+        110
+      ],
+      "outputs": [],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 7,
+          "kernel": "PrefillPlanned"
+        }
+      },
+      "inputs": [
+        113
+      ],
+      "outputs": [
+        115
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.7.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        115,
+        105
+      ],
+      "outputs": [
+        116
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.7.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        116
+      ],
+      "outputs": [
+        117
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.7.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        117
+      ],
+      "outputs": [
+        118
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        118
+      ],
+      "outputs": [
+        119
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.7.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        119,
+        116
+      ],
+      "outputs": [
+        120
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.8.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        120
+      ],
+      "outputs": [
+        121
+      ],
+      "layer": 8
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.8.qkv",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        121
+      ],
+      "outputs": [
+        122
+      ],
+      "layer": 8
+    },
+    {
+      "kind": {
+        "SplitQkv": {
+          "q_width": 2048,
+          "kv_width": 1024
+        }
+      },
+      "inputs": [
+        122
+      ],
+      "outputs": [
+        123,
+        124,
+        125
+      ],
+      "layer": 8
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.8.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        123
+      ],
+      "outputs": [
+        126
+      ],
+      "layer": 8
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.8.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        124
+      ],
+      "outputs": [
+        127
+      ],
+      "layer": 8
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        126,
+        127
+      ],
+      "outputs": [
+        128,
+        129
+      ],
+      "layer": 8
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 8
+        }
+      },
+      "inputs": [
+        129,
+        125
+      ],
+      "outputs": [],
+      "layer": 8
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 8,
+          "kernel": "PrefillPlanned"
+        }
+      },
+      "inputs": [
+        128
+      ],
+      "outputs": [
+        130
+      ],
+      "layer": 8
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.8.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        130,
+        120
+      ],
+      "outputs": [
+        131
+      ],
+      "layer": 8
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.8.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        131
+      ],
+      "outputs": [
+        132
+      ],
+      "layer": 8
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.8.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        132
+      ],
+      "outputs": [
+        133
+      ],
+      "layer": 8
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        133
+      ],
+      "outputs": [
+        134
+      ],
+      "layer": 8
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.8.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        134,
+        131
+      ],
+      "outputs": [
+        135
+      ],
+      "layer": 8
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.9.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        135
+      ],
+      "outputs": [
+        136
+      ],
+      "layer": 9
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.9.qkv",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        136
+      ],
+      "outputs": [
+        137
+      ],
+      "layer": 9
+    },
+    {
+      "kind": {
+        "SplitQkv": {
+          "q_width": 2048,
+          "kv_width": 1024
+        }
+      },
+      "inputs": [
+        137
+      ],
+      "outputs": [
+        138,
+        139,
+        140
+      ],
+      "layer": 9
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.9.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        138
+      ],
+      "outputs": [
+        141
+      ],
+      "layer": 9
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.9.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        139
+      ],
+      "outputs": [
+        142
+      ],
+      "layer": 9
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        141,
+        142
+      ],
+      "outputs": [
+        143,
+        144
+      ],
+      "layer": 9
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 9
+        }
+      },
+      "inputs": [
+        144,
+        140
+      ],
+      "outputs": [],
+      "layer": 9
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 9,
+          "kernel": "PrefillPlanned"
+        }
+      },
+      "inputs": [
+        143
+      ],
+      "outputs": [
+        145
+      ],
+      "layer": 9
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.9.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        145,
+        135
+      ],
+      "outputs": [
+        146
+      ],
+      "layer": 9
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.9.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        146
+      ],
+      "outputs": [
+        147
+      ],
+      "layer": 9
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.9.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        147
+      ],
+      "outputs": [
+        148
+      ],
+      "layer": 9
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        148
+      ],
+      "outputs": [
+        149
+      ],
+      "layer": 9
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.9.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        149,
+        146
+      ],
+      "outputs": [
+        150
+      ],
+      "layer": 9
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.10.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        150
+      ],
+      "outputs": [
+        151
+      ],
+      "layer": 10
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.10.qkv",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        151
+      ],
+      "outputs": [
+        152
+      ],
+      "layer": 10
+    },
+    {
+      "kind": {
+        "SplitQkv": {
+          "q_width": 2048,
+          "kv_width": 1024
+        }
+      },
+      "inputs": [
+        152
+      ],
+      "outputs": [
+        153,
+        154,
+        155
+      ],
+      "layer": 10
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.10.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        153
+      ],
+      "outputs": [
+        156
+      ],
+      "layer": 10
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.10.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        154
+      ],
+      "outputs": [
+        157
+      ],
+      "layer": 10
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        156,
+        157
+      ],
+      "outputs": [
+        158,
+        159
+      ],
+      "layer": 10
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 10
+        }
+      },
+      "inputs": [
+        159,
+        155
+      ],
+      "outputs": [],
+      "layer": 10
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 10,
+          "kernel": "PrefillPlanned"
+        }
+      },
+      "inputs": [
+        158
+      ],
+      "outputs": [
+        160
+      ],
+      "layer": 10
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.10.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        160,
+        150
+      ],
+      "outputs": [
+        161
+      ],
+      "layer": 10
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.10.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        161
+      ],
+      "outputs": [
+        162
+      ],
+      "layer": 10
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.10.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        162
+      ],
+      "outputs": [
+        163
+      ],
+      "layer": 10
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        163
+      ],
+      "outputs": [
+        164
+      ],
+      "layer": 10
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.10.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        164,
+        161
+      ],
+      "outputs": [
+        165
+      ],
+      "layer": 10
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.11.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        165
+      ],
+      "outputs": [
+        166
+      ],
+      "layer": 11
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.11.qkv",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        166
+      ],
+      "outputs": [
+        167
+      ],
+      "layer": 11
+    },
+    {
+      "kind": {
+        "SplitQkv": {
+          "q_width": 2048,
+          "kv_width": 1024
+        }
+      },
+      "inputs": [
+        167
+      ],
+      "outputs": [
+        168,
+        169,
+        170
+      ],
+      "layer": 11
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.11.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        168
+      ],
+      "outputs": [
+        171
+      ],
+      "layer": 11
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.11.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        169
+      ],
+      "outputs": [
+        172
+      ],
+      "layer": 11
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        171,
+        172
+      ],
+      "outputs": [
+        173,
+        174
+      ],
+      "layer": 11
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 11
+        }
+      },
+      "inputs": [
+        174,
+        170
+      ],
+      "outputs": [],
+      "layer": 11
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 11,
+          "kernel": "PrefillPlanned"
+        }
+      },
+      "inputs": [
+        173
+      ],
+      "outputs": [
+        175
+      ],
+      "layer": 11
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.11.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        175,
+        165
+      ],
+      "outputs": [
+        176
+      ],
+      "layer": 11
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.11.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        176
+      ],
+      "outputs": [
+        177
+      ],
+      "layer": 11
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.11.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        177
+      ],
+      "outputs": [
+        178
+      ],
+      "layer": 11
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        178
+      ],
+      "outputs": [
+        179
+      ],
+      "layer": 11
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.11.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        179,
+        176
+      ],
+      "outputs": [
+        180
+      ],
+      "layer": 11
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.12.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        180
+      ],
+      "outputs": [
+        181
+      ],
+      "layer": 12
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.12.qkv",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        181
+      ],
+      "outputs": [
+        182
+      ],
+      "layer": 12
+    },
+    {
+      "kind": {
+        "SplitQkv": {
+          "q_width": 2048,
+          "kv_width": 1024
+        }
+      },
+      "inputs": [
+        182
+      ],
+      "outputs": [
+        183,
+        184,
+        185
+      ],
+      "layer": 12
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.12.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        183
+      ],
+      "outputs": [
+        186
+      ],
+      "layer": 12
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.12.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        184
+      ],
+      "outputs": [
+        187
+      ],
+      "layer": 12
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        186,
+        187
+      ],
+      "outputs": [
+        188,
+        189
+      ],
+      "layer": 12
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 12
+        }
+      },
+      "inputs": [
+        189,
+        185
+      ],
+      "outputs": [],
+      "layer": 12
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 12,
+          "kernel": "PrefillPlanned"
+        }
+      },
+      "inputs": [
+        188
+      ],
+      "outputs": [
+        190
+      ],
+      "layer": 12
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.12.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        190,
+        180
+      ],
+      "outputs": [
+        191
+      ],
+      "layer": 12
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.12.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        191
+      ],
+      "outputs": [
+        192
+      ],
+      "layer": 12
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.12.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        192
+      ],
+      "outputs": [
+        193
+      ],
+      "layer": 12
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        193
+      ],
+      "outputs": [
+        194
+      ],
+      "layer": 12
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.12.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        194,
+        191
+      ],
+      "outputs": [
+        195
+      ],
+      "layer": 12
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.13.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        195
+      ],
+      "outputs": [
+        196
+      ],
+      "layer": 13
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.13.qkv",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        196
+      ],
+      "outputs": [
+        197
+      ],
+      "layer": 13
+    },
+    {
+      "kind": {
+        "SplitQkv": {
+          "q_width": 2048,
+          "kv_width": 1024
+        }
+      },
+      "inputs": [
+        197
+      ],
+      "outputs": [
+        198,
+        199,
+        200
+      ],
+      "layer": 13
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.13.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        198
+      ],
+      "outputs": [
+        201
+      ],
+      "layer": 13
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.13.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        199
+      ],
+      "outputs": [
+        202
+      ],
+      "layer": 13
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        201,
+        202
+      ],
+      "outputs": [
+        203,
+        204
+      ],
+      "layer": 13
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 13
+        }
+      },
+      "inputs": [
+        204,
+        200
+      ],
+      "outputs": [],
+      "layer": 13
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 13,
+          "kernel": "PrefillPlanned"
+        }
+      },
+      "inputs": [
+        203
+      ],
+      "outputs": [
+        205
+      ],
+      "layer": 13
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.13.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        205,
+        195
+      ],
+      "outputs": [
+        206
+      ],
+      "layer": 13
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.13.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        206
+      ],
+      "outputs": [
+        207
+      ],
+      "layer": 13
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.13.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        207
+      ],
+      "outputs": [
+        208
+      ],
+      "layer": 13
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        208
+      ],
+      "outputs": [
+        209
+      ],
+      "layer": 13
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.13.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        209,
+        206
+      ],
+      "outputs": [
+        210
+      ],
+      "layer": 13
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.14.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        210
+      ],
+      "outputs": [
+        211
+      ],
+      "layer": 14
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.14.qkv",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        211
+      ],
+      "outputs": [
+        212
+      ],
+      "layer": 14
+    },
+    {
+      "kind": {
+        "SplitQkv": {
+          "q_width": 2048,
+          "kv_width": 1024
+        }
+      },
+      "inputs": [
+        212
+      ],
+      "outputs": [
+        213,
+        214,
+        215
+      ],
+      "layer": 14
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.14.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        213
+      ],
+      "outputs": [
+        216
+      ],
+      "layer": 14
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.14.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        214
+      ],
+      "outputs": [
+        217
+      ],
+      "layer": 14
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        216,
+        217
+      ],
+      "outputs": [
+        218,
+        219
+      ],
+      "layer": 14
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 14
+        }
+      },
+      "inputs": [
+        219,
+        215
+      ],
+      "outputs": [],
+      "layer": 14
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 14,
+          "kernel": "PrefillPlanned"
+        }
+      },
+      "inputs": [
+        218
+      ],
+      "outputs": [
+        220
+      ],
+      "layer": 14
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.14.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        220,
+        210
+      ],
+      "outputs": [
+        221
+      ],
+      "layer": 14
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.14.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        221
+      ],
+      "outputs": [
+        222
+      ],
+      "layer": 14
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.14.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        222
+      ],
+      "outputs": [
+        223
+      ],
+      "layer": 14
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        223
+      ],
+      "outputs": [
+        224
+      ],
+      "layer": 14
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.14.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        224,
+        221
+      ],
+      "outputs": [
+        225
+      ],
+      "layer": 14
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.15.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        225
+      ],
+      "outputs": [
+        226
+      ],
+      "layer": 15
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.15.qkv",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        226
+      ],
+      "outputs": [
+        227
+      ],
+      "layer": 15
+    },
+    {
+      "kind": {
+        "SplitQkv": {
+          "q_width": 2048,
+          "kv_width": 1024
+        }
+      },
+      "inputs": [
+        227
+      ],
+      "outputs": [
+        228,
+        229,
+        230
+      ],
+      "layer": 15
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.15.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        228
+      ],
+      "outputs": [
+        231
+      ],
+      "layer": 15
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.15.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        229
+      ],
+      "outputs": [
+        232
+      ],
+      "layer": 15
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        231,
+        232
+      ],
+      "outputs": [
+        233,
+        234
+      ],
+      "layer": 15
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 15
+        }
+      },
+      "inputs": [
+        234,
+        230
+      ],
+      "outputs": [],
+      "layer": 15
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 15,
+          "kernel": "PrefillPlanned"
+        }
+      },
+      "inputs": [
+        233
+      ],
+      "outputs": [
+        235
+      ],
+      "layer": 15
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.15.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        235,
+        225
+      ],
+      "outputs": [
+        236
+      ],
+      "layer": 15
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.15.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        236
+      ],
+      "outputs": [
+        237
+      ],
+      "layer": 15
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.15.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        237
+      ],
+      "outputs": [
+        238
+      ],
+      "layer": 15
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        238
+      ],
+      "outputs": [
+        239
+      ],
+      "layer": 15
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.15.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        239,
+        236
+      ],
+      "outputs": [
+        240
+      ],
+      "layer": 15
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.16.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        240
+      ],
+      "outputs": [
+        241
+      ],
+      "layer": 16
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.16.qkv",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        241
+      ],
+      "outputs": [
+        242
+      ],
+      "layer": 16
+    },
+    {
+      "kind": {
+        "SplitQkv": {
+          "q_width": 2048,
+          "kv_width": 1024
+        }
+      },
+      "inputs": [
+        242
+      ],
+      "outputs": [
+        243,
+        244,
+        245
+      ],
+      "layer": 16
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.16.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        243
+      ],
+      "outputs": [
+        246
+      ],
+      "layer": 16
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.16.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        244
+      ],
+      "outputs": [
+        247
+      ],
+      "layer": 16
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        246,
+        247
+      ],
+      "outputs": [
+        248,
+        249
+      ],
+      "layer": 16
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 16
+        }
+      },
+      "inputs": [
+        249,
+        245
+      ],
+      "outputs": [],
+      "layer": 16
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 16,
+          "kernel": "PrefillPlanned"
+        }
+      },
+      "inputs": [
+        248
+      ],
+      "outputs": [
+        250
+      ],
+      "layer": 16
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.16.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        250,
+        240
+      ],
+      "outputs": [
+        251
+      ],
+      "layer": 16
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.16.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        251
+      ],
+      "outputs": [
+        252
+      ],
+      "layer": 16
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.16.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        252
+      ],
+      "outputs": [
+        253
+      ],
+      "layer": 16
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        253
+      ],
+      "outputs": [
+        254
+      ],
+      "layer": 16
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.16.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        254,
+        251
+      ],
+      "outputs": [
+        255
+      ],
+      "layer": 16
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.17.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        255
+      ],
+      "outputs": [
+        256
+      ],
+      "layer": 17
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.17.qkv",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        256
+      ],
+      "outputs": [
+        257
+      ],
+      "layer": 17
+    },
+    {
+      "kind": {
+        "SplitQkv": {
+          "q_width": 2048,
+          "kv_width": 1024
+        }
+      },
+      "inputs": [
+        257
+      ],
+      "outputs": [
+        258,
+        259,
+        260
+      ],
+      "layer": 17
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.17.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        258
+      ],
+      "outputs": [
+        261
+      ],
+      "layer": 17
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.17.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        259
+      ],
+      "outputs": [
+        262
+      ],
+      "layer": 17
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        261,
+        262
+      ],
+      "outputs": [
+        263,
+        264
+      ],
+      "layer": 17
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 17
+        }
+      },
+      "inputs": [
+        264,
+        260
+      ],
+      "outputs": [],
+      "layer": 17
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 17,
+          "kernel": "PrefillPlanned"
+        }
+      },
+      "inputs": [
+        263
+      ],
+      "outputs": [
+        265
+      ],
+      "layer": 17
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.17.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        265,
+        255
+      ],
+      "outputs": [
+        266
+      ],
+      "layer": 17
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.17.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        266
+      ],
+      "outputs": [
+        267
+      ],
+      "layer": 17
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.17.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        267
+      ],
+      "outputs": [
+        268
+      ],
+      "layer": 17
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        268
+      ],
+      "outputs": [
+        269
+      ],
+      "layer": 17
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.17.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        269,
+        266
+      ],
+      "outputs": [
+        270
+      ],
+      "layer": 17
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.18.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        270
+      ],
+      "outputs": [
+        271
+      ],
+      "layer": 18
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.18.qkv",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        271
+      ],
+      "outputs": [
+        272
+      ],
+      "layer": 18
+    },
+    {
+      "kind": {
+        "SplitQkv": {
+          "q_width": 2048,
+          "kv_width": 1024
+        }
+      },
+      "inputs": [
+        272
+      ],
+      "outputs": [
+        273,
+        274,
+        275
+      ],
+      "layer": 18
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.18.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        273
+      ],
+      "outputs": [
+        276
+      ],
+      "layer": 18
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.18.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        274
+      ],
+      "outputs": [
+        277
+      ],
+      "layer": 18
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        276,
+        277
+      ],
+      "outputs": [
+        278,
+        279
+      ],
+      "layer": 18
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 18
+        }
+      },
+      "inputs": [
+        279,
+        275
+      ],
+      "outputs": [],
+      "layer": 18
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 18,
+          "kernel": "PrefillPlanned"
+        }
+      },
+      "inputs": [
+        278
+      ],
+      "outputs": [
+        280
+      ],
+      "layer": 18
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.18.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        280,
+        270
+      ],
+      "outputs": [
+        281
+      ],
+      "layer": 18
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.18.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        281
+      ],
+      "outputs": [
+        282
+      ],
+      "layer": 18
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.18.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        282
+      ],
+      "outputs": [
+        283
+      ],
+      "layer": 18
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        283
+      ],
+      "outputs": [
+        284
+      ],
+      "layer": 18
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.18.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        284,
+        281
+      ],
+      "outputs": [
+        285
+      ],
+      "layer": 18
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.19.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        285
+      ],
+      "outputs": [
+        286
+      ],
+      "layer": 19
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.19.qkv",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        286
+      ],
+      "outputs": [
+        287
+      ],
+      "layer": 19
+    },
+    {
+      "kind": {
+        "SplitQkv": {
+          "q_width": 2048,
+          "kv_width": 1024
+        }
+      },
+      "inputs": [
+        287
+      ],
+      "outputs": [
+        288,
+        289,
+        290
+      ],
+      "layer": 19
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.19.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        288
+      ],
+      "outputs": [
+        291
+      ],
+      "layer": 19
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.19.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        289
+      ],
+      "outputs": [
+        292
+      ],
+      "layer": 19
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        291,
+        292
+      ],
+      "outputs": [
+        293,
+        294
+      ],
+      "layer": 19
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 19
+        }
+      },
+      "inputs": [
+        294,
+        290
+      ],
+      "outputs": [],
+      "layer": 19
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 19,
+          "kernel": "PrefillPlanned"
+        }
+      },
+      "inputs": [
+        293
+      ],
+      "outputs": [
+        295
+      ],
+      "layer": 19
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.19.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        295,
+        285
+      ],
+      "outputs": [
+        296
+      ],
+      "layer": 19
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.19.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        296
+      ],
+      "outputs": [
+        297
+      ],
+      "layer": 19
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.19.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        297
+      ],
+      "outputs": [
+        298
+      ],
+      "layer": 19
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        298
+      ],
+      "outputs": [
+        299
+      ],
+      "layer": 19
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.19.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        299,
+        296
+      ],
+      "outputs": [
+        300
+      ],
+      "layer": 19
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.20.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        300
+      ],
+      "outputs": [
+        301
+      ],
+      "layer": 20
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.20.qkv",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        301
+      ],
+      "outputs": [
+        302
+      ],
+      "layer": 20
+    },
+    {
+      "kind": {
+        "SplitQkv": {
+          "q_width": 2048,
+          "kv_width": 1024
+        }
+      },
+      "inputs": [
+        302
+      ],
+      "outputs": [
+        303,
+        304,
+        305
+      ],
+      "layer": 20
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.20.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        303
+      ],
+      "outputs": [
+        306
+      ],
+      "layer": 20
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.20.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        304
+      ],
+      "outputs": [
+        307
+      ],
+      "layer": 20
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        306,
+        307
+      ],
+      "outputs": [
+        308,
+        309
+      ],
+      "layer": 20
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 20
+        }
+      },
+      "inputs": [
+        309,
+        305
+      ],
+      "outputs": [],
+      "layer": 20
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 20,
+          "kernel": "PrefillPlanned"
+        }
+      },
+      "inputs": [
+        308
+      ],
+      "outputs": [
+        310
+      ],
+      "layer": 20
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.20.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        310,
+        300
+      ],
+      "outputs": [
+        311
+      ],
+      "layer": 20
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.20.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        311
+      ],
+      "outputs": [
+        312
+      ],
+      "layer": 20
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.20.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        312
+      ],
+      "outputs": [
+        313
+      ],
+      "layer": 20
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        313
+      ],
+      "outputs": [
+        314
+      ],
+      "layer": 20
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.20.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        314,
+        311
+      ],
+      "outputs": [
+        315
+      ],
+      "layer": 20
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.21.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        315
+      ],
+      "outputs": [
+        316
+      ],
+      "layer": 21
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.21.qkv",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        316
+      ],
+      "outputs": [
+        317
+      ],
+      "layer": 21
+    },
+    {
+      "kind": {
+        "SplitQkv": {
+          "q_width": 2048,
+          "kv_width": 1024
+        }
+      },
+      "inputs": [
+        317
+      ],
+      "outputs": [
+        318,
+        319,
+        320
+      ],
+      "layer": 21
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.21.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        318
+      ],
+      "outputs": [
+        321
+      ],
+      "layer": 21
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.21.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        319
+      ],
+      "outputs": [
+        322
+      ],
+      "layer": 21
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        321,
+        322
+      ],
+      "outputs": [
+        323,
+        324
+      ],
+      "layer": 21
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 21
+        }
+      },
+      "inputs": [
+        324,
+        320
+      ],
+      "outputs": [],
+      "layer": 21
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 21,
+          "kernel": "PrefillPlanned"
+        }
+      },
+      "inputs": [
+        323
+      ],
+      "outputs": [
+        325
+      ],
+      "layer": 21
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.21.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        325,
+        315
+      ],
+      "outputs": [
+        326
+      ],
+      "layer": 21
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.21.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        326
+      ],
+      "outputs": [
+        327
+      ],
+      "layer": 21
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.21.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        327
+      ],
+      "outputs": [
+        328
+      ],
+      "layer": 21
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        328
+      ],
+      "outputs": [
+        329
+      ],
+      "layer": 21
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.21.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        329,
+        326
+      ],
+      "outputs": [
+        330
+      ],
+      "layer": 21
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.22.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        330
+      ],
+      "outputs": [
+        331
+      ],
+      "layer": 22
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.22.qkv",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        331
+      ],
+      "outputs": [
+        332
+      ],
+      "layer": 22
+    },
+    {
+      "kind": {
+        "SplitQkv": {
+          "q_width": 2048,
+          "kv_width": 1024
+        }
+      },
+      "inputs": [
+        332
+      ],
+      "outputs": [
+        333,
+        334,
+        335
+      ],
+      "layer": 22
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.22.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        333
+      ],
+      "outputs": [
+        336
+      ],
+      "layer": 22
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.22.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        334
+      ],
+      "outputs": [
+        337
+      ],
+      "layer": 22
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        336,
+        337
+      ],
+      "outputs": [
+        338,
+        339
+      ],
+      "layer": 22
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 22
+        }
+      },
+      "inputs": [
+        339,
+        335
+      ],
+      "outputs": [],
+      "layer": 22
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 22,
+          "kernel": "PrefillPlanned"
+        }
+      },
+      "inputs": [
+        338
+      ],
+      "outputs": [
+        340
+      ],
+      "layer": 22
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.22.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        340,
+        330
+      ],
+      "outputs": [
+        341
+      ],
+      "layer": 22
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.22.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        341
+      ],
+      "outputs": [
+        342
+      ],
+      "layer": 22
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.22.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        342
+      ],
+      "outputs": [
+        343
+      ],
+      "layer": 22
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        343
+      ],
+      "outputs": [
+        344
+      ],
+      "layer": 22
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.22.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        344,
+        341
+      ],
+      "outputs": [
+        345
+      ],
+      "layer": 22
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.23.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        345
+      ],
+      "outputs": [
+        346
+      ],
+      "layer": 23
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.23.qkv",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        346
+      ],
+      "outputs": [
+        347
+      ],
+      "layer": 23
+    },
+    {
+      "kind": {
+        "SplitQkv": {
+          "q_width": 2048,
+          "kv_width": 1024
+        }
+      },
+      "inputs": [
+        347
+      ],
+      "outputs": [
+        348,
+        349,
+        350
+      ],
+      "layer": 23
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.23.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        348
+      ],
+      "outputs": [
+        351
+      ],
+      "layer": 23
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.23.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        349
+      ],
+      "outputs": [
+        352
+      ],
+      "layer": 23
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        351,
+        352
+      ],
+      "outputs": [
+        353,
+        354
+      ],
+      "layer": 23
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 23
+        }
+      },
+      "inputs": [
+        354,
+        350
+      ],
+      "outputs": [],
+      "layer": 23
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 23,
+          "kernel": "PrefillPlanned"
+        }
+      },
+      "inputs": [
+        353
+      ],
+      "outputs": [
+        355
+      ],
+      "layer": 23
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.23.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        355,
+        345
+      ],
+      "outputs": [
+        356
+      ],
+      "layer": 23
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.23.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        356
+      ],
+      "outputs": [
+        357
+      ],
+      "layer": 23
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.23.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        357
+      ],
+      "outputs": [
+        358
+      ],
+      "layer": 23
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        358
+      ],
+      "outputs": [
+        359
+      ],
+      "layer": 23
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.23.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        359,
+        356
+      ],
+      "outputs": [
+        360
+      ],
+      "layer": 23
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.24.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        360
+      ],
+      "outputs": [
+        361
+      ],
+      "layer": 24
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.24.qkv",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        361
+      ],
+      "outputs": [
+        362
+      ],
+      "layer": 24
+    },
+    {
+      "kind": {
+        "SplitQkv": {
+          "q_width": 2048,
+          "kv_width": 1024
+        }
+      },
+      "inputs": [
+        362
+      ],
+      "outputs": [
+        363,
+        364,
+        365
+      ],
+      "layer": 24
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.24.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        363
+      ],
+      "outputs": [
+        366
+      ],
+      "layer": 24
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.24.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        364
+      ],
+      "outputs": [
+        367
+      ],
+      "layer": 24
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        366,
+        367
+      ],
+      "outputs": [
+        368,
+        369
+      ],
+      "layer": 24
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 24
+        }
+      },
+      "inputs": [
+        369,
+        365
+      ],
+      "outputs": [],
+      "layer": 24
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 24,
+          "kernel": "PrefillPlanned"
+        }
+      },
+      "inputs": [
+        368
+      ],
+      "outputs": [
+        370
+      ],
+      "layer": 24
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.24.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        370,
+        360
+      ],
+      "outputs": [
+        371
+      ],
+      "layer": 24
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.24.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        371
+      ],
+      "outputs": [
+        372
+      ],
+      "layer": 24
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.24.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        372
+      ],
+      "outputs": [
+        373
+      ],
+      "layer": 24
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        373
+      ],
+      "outputs": [
+        374
+      ],
+      "layer": 24
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.24.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        374,
+        371
+      ],
+      "outputs": [
+        375
+      ],
+      "layer": 24
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.25.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        375
+      ],
+      "outputs": [
+        376
+      ],
+      "layer": 25
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.25.qkv",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        376
+      ],
+      "outputs": [
+        377
+      ],
+      "layer": 25
+    },
+    {
+      "kind": {
+        "SplitQkv": {
+          "q_width": 2048,
+          "kv_width": 1024
+        }
+      },
+      "inputs": [
+        377
+      ],
+      "outputs": [
+        378,
+        379,
+        380
+      ],
+      "layer": 25
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.25.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        378
+      ],
+      "outputs": [
+        381
+      ],
+      "layer": 25
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.25.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        379
+      ],
+      "outputs": [
+        382
+      ],
+      "layer": 25
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        381,
+        382
+      ],
+      "outputs": [
+        383,
+        384
+      ],
+      "layer": 25
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 25
+        }
+      },
+      "inputs": [
+        384,
+        380
+      ],
+      "outputs": [],
+      "layer": 25
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 25,
+          "kernel": "PrefillPlanned"
+        }
+      },
+      "inputs": [
+        383
+      ],
+      "outputs": [
+        385
+      ],
+      "layer": 25
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.25.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        385,
+        375
+      ],
+      "outputs": [
+        386
+      ],
+      "layer": 25
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.25.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        386
+      ],
+      "outputs": [
+        387
+      ],
+      "layer": 25
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.25.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        387
+      ],
+      "outputs": [
+        388
+      ],
+      "layer": 25
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        388
+      ],
+      "outputs": [
+        389
+      ],
+      "layer": 25
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.25.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        389,
+        386
+      ],
+      "outputs": [
+        390
+      ],
+      "layer": 25
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.26.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        390
+      ],
+      "outputs": [
+        391
+      ],
+      "layer": 26
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.26.qkv",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        391
+      ],
+      "outputs": [
+        392
+      ],
+      "layer": 26
+    },
+    {
+      "kind": {
+        "SplitQkv": {
+          "q_width": 2048,
+          "kv_width": 1024
+        }
+      },
+      "inputs": [
+        392
+      ],
+      "outputs": [
+        393,
+        394,
+        395
+      ],
+      "layer": 26
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.26.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        393
+      ],
+      "outputs": [
+        396
+      ],
+      "layer": 26
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.26.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        394
+      ],
+      "outputs": [
+        397
+      ],
+      "layer": 26
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        396,
+        397
+      ],
+      "outputs": [
+        398,
+        399
+      ],
+      "layer": 26
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 26
+        }
+      },
+      "inputs": [
+        399,
+        395
+      ],
+      "outputs": [],
+      "layer": 26
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 26,
+          "kernel": "PrefillPlanned"
+        }
+      },
+      "inputs": [
+        398
+      ],
+      "outputs": [
+        400
+      ],
+      "layer": 26
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.26.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        400,
+        390
+      ],
+      "outputs": [
+        401
+      ],
+      "layer": 26
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.26.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        401
+      ],
+      "outputs": [
+        402
+      ],
+      "layer": 26
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.26.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        402
+      ],
+      "outputs": [
+        403
+      ],
+      "layer": 26
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        403
+      ],
+      "outputs": [
+        404
+      ],
+      "layer": 26
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.26.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        404,
+        401
+      ],
+      "outputs": [
+        405
+      ],
+      "layer": 26
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.27.attn_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        405
+      ],
+      "outputs": [
+        406
+      ],
+      "layer": 27
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.27.qkv",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        406
+      ],
+      "outputs": [
+        407
+      ],
+      "layer": 27
+    },
+    {
+      "kind": {
+        "SplitQkv": {
+          "q_width": 2048,
+          "kv_width": 1024
+        }
+      },
+      "inputs": [
+        407
+      ],
+      "outputs": [
+        408,
+        409,
+        410
+      ],
+      "layer": 27
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.27.q_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        408
+      ],
+      "outputs": [
+        411
+      ],
+      "layer": 27
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.27.k_norm",
+          "head_dim": 128
+        }
+      },
+      "inputs": [
+        409
+      ],
+      "outputs": [
+        412
+      ],
+      "layer": 27
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard"
+        }
+      },
+      "inputs": [
+        411,
+        412
+      ],
+      "outputs": [
+        413,
+        414
+      ],
+      "layer": 27
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 27
+        }
+      },
+      "inputs": [
+        414,
+        410
+      ],
+      "outputs": [],
+      "layer": 27
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 27,
+          "kernel": "PrefillPlanned"
+        }
+      },
+      "inputs": [
+        413
+      ],
+      "outputs": [
+        415
+      ],
+      "layer": 27
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.27.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        415,
+        405
+      ],
+      "outputs": [
+        416
+      ],
+      "layer": 27
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.27.mlp_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        416
+      ],
+      "outputs": [
+        417
+      ],
+      "layer": 27
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.27.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        417
+      ],
+      "outputs": [
+        418
+      ],
+      "layer": 27
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        418
+      ],
+      "outputs": [
+        419
+      ],
+      "layer": 27
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.27.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        419,
+        416
+      ],
+      "outputs": [
+        420
+      ],
+      "layer": 27
+    },
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "final_norm",
+          "variant": "Plain"
+        }
+      },
+      "inputs": [
+        420
+      ],
+      "outputs": [
+        421
+      ],
+      "layer": null
+    },
+    {
+      "kind": {
+        "LmHead": {
+          "weight": "embed"
+        }
+      },
+      "inputs": [
+        421
+      ],
+      "outputs": [
+        422
+      ],
+      "layer": null
+    }
+  ]
+}

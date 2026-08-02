@@ -16,14 +16,22 @@
 //!  computes)       in what order)            generated)
 //! ```
 //!
-//! Two rules carried from `pie-application-plan.md` §5:
+//! Two rules, the first REVISED by north-star-dsl.md (2026-08-02):
 //!
-//! * **The declaration says what varies. It never says how to lower it.**
-//!   Ops name operations (`rmsnorm`, `attention`), never kernels. Fusion —
-//!   the hand-written passes' fused QKV+rope+KV-write, fused norm+rope —
-//!   is an emitter decision made where the backend can see both the
-//!   adjacency and the divergence, because a fused edge cannot be a merge
-//!   point.
+//! * **The declaration states the computation and the kernel choice in
+//!   one text, and the driver is dumb.** A SEMANTIC trace (`llama_like`)
+//!   names operations, never kernels — it is the general arm, the thing
+//!   parity holds everything to. A LOWERED trace
+//!   (`family::llama_like_cuda`) is the same declaration traced once per
+//!   [`trace::FireClass`] with the backend facts in hand: its class arms
+//!   state fusions ([`OpKind::QkvDecodeFusedPost`]) and kernels
+//!   ([`trace::AttnKernel`]) as ordinary trace-time matches, and its
+//!   traced form IS the launch form — statically convertible to the C++
+//!   the driver runs. The driver never chooses between two kernels for
+//!   semantic reasons; every choice is spelled in the program it
+//!   received. (The prior reading — fusion as the C++ executor's peephole
+//!   — put that choice on the wrong side of the ABI; the peephole's days
+//!   are numbered by the migration ladder in north-star-dsl.md.)
 //! * **Syntax is required exactly where cost is incurred.** A declaration
 //!   with no structural divergence is an ordinary forward pass; the first
 //!   family here (`llama_like`) has none, so nothing in it is `dyn`. The
@@ -47,10 +55,10 @@ pub mod ffi;
 pub mod trace;
 
 pub use facts::{
-    LlamaLikeFacts, Qwen35FullAttnFacts, Qwen35GdnFacts, Qwen35HybridFacts, Qwen35MlpKind,
-    Qwen35MoeMlpFacts,
+    LlamaLikeCudaFacts, LlamaLikeFacts, Qwen35FullAttnFacts, Qwen35GdnFacts, Qwen35HybridFacts,
+    Qwen35MlpKind, Qwen35MoeMlpFacts,
 };
 pub use trace::{
-    DType, Dim, DynAxis, ForwardPlan, Op, OpKind, Shape, StateRef, StateStore, TraceBuilder,
-    ValueId,
+    AttnKernel, DType, Dim, DynAxis, FireClass, ForwardPlan, Op, OpKind, Shape, StateRef,
+    StateStore, TraceBuilder, ValueId,
 };

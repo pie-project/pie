@@ -8,9 +8,10 @@
 
 use super::arena::{self, view};
 use super::entry::{
-    PieForwardLlamaLikeFacts, PieForwardQwen35FullAttnFacts, PieForwardQwen35GdnFacts,
-    PieForwardQwen35HybridFacts, PieForwardQwen35MoeMlpFacts, PieForwardStatus,
-    pie_forward_release, pie_forward_trace_llama_like, pie_forward_trace_qwen3_5_full_attn,
+    PieForwardLlamaLikeCudaFacts, PieForwardLlamaLikeFacts, PieForwardQwen35FullAttnFacts,
+    PieForwardQwen35GdnFacts, PieForwardQwen35HybridFacts, PieForwardQwen35MoeMlpFacts,
+    PieForwardStatus, pie_forward_release, pie_forward_trace_llama_like,
+    pie_forward_trace_llama_like_cuda, pie_forward_trace_qwen3_5_full_attn,
     pie_forward_trace_qwen3_5_gdn, pie_forward_trace_qwen3_5_hybrid,
     pie_forward_trace_qwen3_5_moe_mlp,
 };
@@ -19,7 +20,7 @@ use crate::facts::{
     LlamaLikeFacts, Qwen35FullAttnFacts, Qwen35GdnFacts, Qwen35HybridFacts, Qwen35MoeMlpFacts,
 };
 use crate::family::{llama_like, qwen3_5_full_attn_block, qwen3_5_gdn_block, qwen3_5_moe_mlp_block};
-use crate::trace::OpKind;
+use crate::trace::{AttnKernel, OpKind};
 
 /// The qwen3 parity facts, as a C caller would state them.
 fn c_facts_qwen3() -> PieForwardLlamaLikeFacts {
@@ -67,6 +68,8 @@ fn expect_kind(kind: &OpKind) -> PieForwardOpKind {
         OpKind::RmsnormGated { .. } => PieForwardOpKind::RmsnormGated,
         OpKind::SplitQGate { .. } => PieForwardOpKind::SplitQGate,
         OpKind::SigmoidGateMul => PieForwardOpKind::SigmoidGateMul,
+        OpKind::QkvDecodeFusedPost { .. } => PieForwardOpKind::QkvDecodeFusedPost,
+        OpKind::RopeTableBuild => PieForwardOpKind::RopeTableBuild,
     }
 }
 
@@ -83,6 +86,7 @@ fn expect_weight(kind: &OpKind) -> Option<&str> {
         | OpKind::RmsnormGated { weight }
         | OpKind::LmHead { weight } => Some(weight),
         OpKind::GdnPrep { a_log, .. } => Some(a_log),
+        OpKind::QkvDecodeFusedPost { q_norm, .. } => Some(q_norm),
         _ => None,
     }
 }
@@ -826,4 +830,74 @@ fn entry_honours_the_unfused_binding() {
         .count();
     assert_eq!(layer0_matmuls, 6);
     unsafe { pie_forward_release(&mut out) };
+}
+
+/// The lowered trace crosses the boundary intact: kind 21/22 wire values,
+/// the two-name slot pattern (q_norm in the weight slot, k_norm as a
+/// param0 NAME INDEX), head_dim in param1, and every `Attention.param1`
+/// carrying the stated kernel's wire value — which this test also PINS
+/// against the Rust enum, so the C mirror cannot drift silently.
+#[test]
+fn lowered_trace_round_trips_through_the_arena() {
+    // The mirror: one assertion per variant, both directions of the pin.
+    assert_eq!(PieForwardAttnKernel::XqaDecode as u32, AttnKernel::XqaDecode as u32);
+    assert_eq!(
+        PieForwardAttnKernel::FlashinferDecode as u32,
+        AttnKernel::FlashinferDecode as u32
+    );
+    assert_eq!(
+        PieForwardAttnKernel::PrefillDequantDecode as u32,
+        AttnKernel::PrefillDequantDecode as u32
+    );
+    assert_eq!(
+        PieForwardAttnKernel::PrefillPlanned as u32,
+        AttnKernel::PrefillPlanned as u32
+    );
+
+    let facts = c_facts_qwen3();
+    let cuda = PieForwardLlamaLikeCudaFacts {
+        xqa_decode: 1,
+        decode_fused_post: 1,
+        rope_table: 1,
+        force_prefill_path: 0,
+    };
+    let mut out = PieForwardPlan::default();
+    assert_eq!(
+        unsafe { pie_forward_trace_llama_like_cuda(&facts, &cuda, /*Decode=*/ 0, &mut out) },
+        PieForwardStatus::Ok
+    );
+    let ops = view::ops(&out);
+    // Layer 0: ... Matmul(qkv) -> RopeTableBuild -> QkvDecodeFusedPost;
+    // later layers carry no table build (the trace-time latch).
+    let fused: Vec<_> = ops
+        .iter()
+        .filter(|op| op.kind == PieForwardOpKind::QkvDecodeFusedPost)
+        .collect();
+    assert_eq!(fused.len(), 28);
+    let post = fused[0];
+    assert_eq!(view::name(&out, post.weight_name), "layer.0.q_norm");
+    assert_eq!(view::name(&out, post.param0), "layer.0.k_norm");
+    assert_eq!(post.param1, 128); // head_dim
+    assert_eq!(
+        ops.iter()
+            .filter(|op| op.kind == PieForwardOpKind::RopeTableBuild)
+            .count(),
+        1
+    );
+    for op in ops.iter().filter(|op| op.kind == PieForwardOpKind::Attention) {
+        assert_eq!(op.param1, PieForwardAttnKernel::XqaDecode as u32);
+    }
+    // No general-arm leftovers in the fused decode class.
+    assert!(!ops.iter().any(|op| matches!(
+        op.kind,
+        PieForwardOpKind::SplitQkv | PieForwardOpKind::Rope | PieForwardOpKind::KvAppend
+    )));
+    unsafe { pie_forward_release(&mut out) };
+
+    // An out-of-range class is a malformed request, not a default.
+    let mut out2 = PieForwardPlan::default();
+    assert_eq!(
+        unsafe { pie_forward_trace_llama_like_cuda(&facts, &cuda, 2, &mut out2) },
+        PieForwardStatus::InvalidArgument
+    );
 }

@@ -98,6 +98,42 @@ pub enum PieForwardOpKind {
     /// `out = x * sigmoid(gate)`, elementwise — the full-attention output
     /// gate. A multiply with NO residual: distinct from `SigmoidGateAdd`.
     SigmoidGateMul = 20,
+    /// The fused decode-QKV epilogue a LOWERED decode-class trace states
+    /// (`launch_qkv_decode_qk_norm_rope_write_kv_bf16`): split + per-head
+    /// Plain q/k norms + Standard rope + KV append, one launch. First of
+    /// the lowered kinds (north-star-dsl.md): a kind the SEMANTIC traces
+    /// never contain, produced only by class-lowered declarations
+    /// (`pie_forward_trace_llama_like_cuda`). Names two weights — q_norm
+    /// in the weight slot, k_norm as a param0 NAME INDEX (GdnPrep's
+    /// pattern); head_dim in param1.
+    QkvDecodeFusedPost = 21,
+    /// Build the fire's rope cos/sin table (`launch_rope_standard_table`);
+    /// stated once, on the first layer whose fused-QKV arm runs. No
+    /// operands, no results, no params.
+    RopeTableBuild = 22,
+}
+
+/// Mirrors [`crate::trace::AttnKernel`] — the values `Attention.param1`
+/// carries; same appended-only discriminant rule as [`PieForwardOpKind`].
+/// `Unspecified` (0) is the semantic trace's resting value: no kernel
+/// stated, the executor derives the path itself, exactly the pre-lowering
+/// contract. A LOWERED trace states one of the rest and a dumb consumer
+/// launches exactly that (north-star-dsl.md).
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PieForwardAttnKernel {
+    #[default]
+    Unspecified = 0,
+    /// `launch_attention_xqa_decode_bf16_prepared` (+ the fire-wide XQA
+    /// prepare, hoisted).
+    XqaDecode = 1,
+    /// `dispatch_attention_flashinfer_decode` against the decode plan.
+    FlashinferDecode = 2,
+    /// Decode-shaped fire on the prefill kernel: dequant-to-bf16 +
+    /// planned FlashInfer prefill (the `force_prefill_path` fallback).
+    PrefillDequantDecode = 3,
+    /// Planned FlashInfer prefill.
+    PrefillPlanned = 4,
 }
 
 /// Mirrors [`crate::trace::DType`]; same appended-only discriminant rule as

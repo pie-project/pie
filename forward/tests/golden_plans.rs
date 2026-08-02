@@ -22,12 +22,12 @@
 use std::path::PathBuf;
 
 use pie_forward::family::{
-    llama_like, qwen3_5_full_attn_block, qwen3_5_gdn_block, qwen3_5_hybrid,
+    llama_like, llama_like_cuda, qwen3_5_full_attn_block, qwen3_5_gdn_block, qwen3_5_hybrid,
     qwen3_5_moe_mlp_block,
 };
 use pie_forward::{
-    ForwardPlan, LlamaLikeFacts, Qwen35FullAttnFacts, Qwen35GdnFacts, Qwen35HybridFacts,
-    Qwen35MoeMlpFacts,
+    FireClass, ForwardPlan, LlamaLikeCudaFacts, LlamaLikeFacts, Qwen35FullAttnFacts,
+    Qwen35GdnFacts, Qwen35HybridFacts, Qwen35MoeMlpFacts,
 };
 
 fn golden_path(name: &str) -> PathBuf {
@@ -181,5 +181,42 @@ fn qwen3_5_hybrid_0_8b() {
     check_plan(
         "qwen3_5_hybrid_0_8b",
         &qwen3_5_hybrid(&Qwen35HybridFacts::qwen3_5_0_8b()),
+    );
+}
+
+/// The first LOWERED goldens (north-star-dsl.md): the SAME llama_like
+/// text, traced with the CUDA backend facts and a fire class in hand, so
+/// the class arms run and the traced form states kernels. Decode: the
+/// fused-QKV arm replaces SplitQkv + RmsnormPerHead×2 + Rope + KvAppend
+/// with one `QkvDecodeFusedPost` per layer (layer 0 preceded by the
+/// once-per-fire `RopeTableBuild` — the hand-written runtime latch, made
+/// trace-time by the unrolled layer loop), and every Attention states
+/// `XqaDecode`. This golden IS the decode launch list — the thing rung 2's
+/// dumb interpreter walks and rung 3's emitter transliterates to C++.
+#[test]
+fn qwen3_0_6b_cuda_decode() {
+    check_plan(
+        "qwen3_0_6b.cuda.decode",
+        &llama_like_cuda(
+            &LlamaLikeFacts::qwen3_0_6b(),
+            &LlamaLikeCudaFacts::qwen3_0_6b_l40s(),
+            FireClass::Decode,
+        ),
+    );
+}
+
+/// The prefill-class lowering of the same text: the general arm
+/// throughout (no fused post — its predicate is decode-only), every
+/// Attention stating `PrefillPlanned`. Structurally the semantic trace
+/// plus kernel statements; the golden pins exactly that relationship.
+#[test]
+fn qwen3_0_6b_cuda_prefill() {
+    check_plan(
+        "qwen3_0_6b.cuda.prefill",
+        &llama_like_cuda(
+            &LlamaLikeFacts::qwen3_0_6b(),
+            &LlamaLikeCudaFacts::qwen3_0_6b_l40s(),
+            FireClass::Prefill,
+        ),
     );
 }

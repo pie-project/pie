@@ -108,6 +108,19 @@ enum class PieForwardOpKind : uint32_t {
   /// `out = x * sigmoid(gate)`, elementwise — the full-attention output
   /// gate. A multiply with NO residual: distinct from `SigmoidGateAdd`.
   SigmoidGateMul = 20,
+  /// The fused decode-QKV epilogue a LOWERED decode-class trace states
+  /// (`launch_qkv_decode_qk_norm_rope_write_kv_bf16`): split + per-head
+  /// Plain q/k norms + Standard rope + KV append, one launch. First of
+  /// the lowered kinds (north-star-dsl.md): a kind the SEMANTIC traces
+  /// never contain, produced only by class-lowered declarations
+  /// (`pie_forward_trace_llama_like_cuda`). Names two weights — q_norm
+  /// in the weight slot, k_norm as a param0 NAME INDEX (GdnPrep's
+  /// pattern); head_dim in param1.
+  QkvDecodeFusedPost = 21,
+  /// Build the fire's rope cos/sin table (`launch_rope_standard_table`);
+  /// stated once, on the first layer whose fused-QKV arm runs. No
+  /// operands, no results, no params.
+  RopeTableBuild = 22,
 };
 
 /// Mirrors [`crate::trace::NormVariant`].
@@ -139,6 +152,34 @@ enum class PieForwardQkNorm : uint32_t {
   /// One RMSNorm over the flattened `[heads * head_dim]` q/k projection
   /// (OLMo-2) — different arithmetic from per-head.
   Global = 2,
+};
+
+/// Mirrors [`crate::trace::FireClass`]; same appended-only discriminant
+/// rule as [`PieForwardOpKind`], same input-side `uint32_t` crossing rule
+/// as every enum here.
+enum class PieForwardFireClass : uint32_t {
+  Decode = 0,
+  Prefill = 1,
+};
+
+/// Mirrors [`crate::trace::AttnKernel`] — the values `Attention.param1`
+/// carries; same appended-only discriminant rule as [`PieForwardOpKind`].
+/// `Unspecified` (0) is the semantic trace's resting value: no kernel
+/// stated, the executor derives the path itself, exactly the pre-lowering
+/// contract. A LOWERED trace states one of the rest and a dumb consumer
+/// launches exactly that (north-star-dsl.md).
+enum class PieForwardAttnKernel : uint32_t {
+  Unspecified = 0,
+  /// `launch_attention_xqa_decode_bf16_prepared` (+ the fire-wide XQA
+  /// prepare, hoisted).
+  XqaDecode = 1,
+  /// `dispatch_attention_flashinfer_decode` against the decode plan.
+  FlashinferDecode = 2,
+  /// Decode-shaped fire on the prefill kernel: dequant-to-bf16 +
+  /// planned FlashInfer prefill (the `force_prefill_path` fallback).
+  PrefillDequantDecode = 3,
+  /// Planned FlashInfer prefill.
+  PrefillPlanned = 4,
 };
 
 /// The llama_like facts, as C states them. Mirrors
@@ -330,6 +371,27 @@ struct PieForwardPlan {
   void *owner;
 };
 
+/// The CUDA backend facts for a LOWERED llama_like trace, as C states
+/// them. Mirrors [`crate::facts::LlamaLikeCudaFacts`] field for field;
+/// same input-side rules as [`PieForwardLlamaLikeFacts`] (the bools are
+/// `uint8_t`, non-zero is true).
+///
+/// The driver fills this from its OWN derivation (env, kernel-support
+/// predicates, binding, cache format) at cold start — the same terms its
+/// executor booleans compute today — and the returned class traces then
+/// STATE every kernel, which is what lets the executor go dumb
+/// (north-star-dsl.md, migration rung 2).
+struct PieForwardLlamaLikeCudaFacts {
+  /// XQA decode eligibility; non-zero is true.
+  uint8_t xqa_decode;
+  /// The fused decode-QKV epilogue's load-time terms hold.
+  uint8_t decode_fused_post;
+  /// The workspace carries a rope table.
+  uint8_t rope_table;
+  /// FlashInfer's decode set lacks this GQA ratio.
+  uint8_t force_prefill_path;
+};
+
 /// The qwen3_5_moe MLP-block facts, as C states them. Mirrors
 /// [`crate::facts::Qwen35MoeMlpFacts`] field for field; same input-side
 /// rules as [`PieForwardLlamaLikeFacts`].
@@ -424,6 +486,25 @@ extern "C" {
 /// `out_plan` is null or a writable slot.
 PieForwardStatus pie_forward_trace_llama_like(const PieForwardLlamaLikeFacts *facts,
                                               PieForwardPlan *out_plan);
+
+/// Trace the LOWERED llama_like — the same text as
+/// [`pie_forward_trace_llama_like`], with the CUDA backend facts and a
+/// fire class in hand, so the class arms run and the traced form states
+/// kernels (`QkvDecodeFusedPost`, `RopeTableBuild`, `Attention.param1`;
+/// north-star-dsl.md). Call once per class the deployment fires; the
+/// semantic entry remains the parity reference.
+///
+/// # Safety
+///
+/// `facts` / `cuda` are null or point at readable
+/// [`PieForwardLlamaLikeFacts`] / [`PieForwardLlamaLikeCudaFacts`];
+/// `out_plan` is null or a writable slot. `class` is a
+/// [`PieForwardFireClass`] value crossed as `uint32_t` (the input-side
+/// enum rule); anything else answers `InvalidArgument`.
+PieForwardStatus pie_forward_trace_llama_like_cuda(const PieForwardLlamaLikeFacts *facts,
+                                                   const PieForwardLlamaLikeCudaFacts *cuda,
+                                                   uint32_t class_,
+                                                   PieForwardPlan *out_plan);
 
 /// Trace the qwen3_5_moe MoE MLP-block FRAGMENT against `facts` and publish
 /// the traced form into `*out_plan`.

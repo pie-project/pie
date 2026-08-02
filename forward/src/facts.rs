@@ -226,6 +226,63 @@ impl LlamaLikeFacts {
     }
 }
 
+/// CUDA backend facts for a LOWERED llama_like trace
+/// (`family::llama_like_cuda`; north-star-dsl.md).
+///
+/// Everything here is load-time — env defaults, kernel-support predicates
+/// over the head geometry, what the deployment's binding materialized —
+/// exactly the terms `context.cpp:1419` and the executor's path booleans
+/// derive today. The declaration's class arms consume them the way they
+/// consume model facts; the driver's job shrinks to VALIDATING at boot
+/// that its own derivation agrees (the `declared_facts.cpp` pattern), not
+/// choosing.
+///
+/// Like every fact struct: measured per deployment, provenance-pinned in
+/// the constructors, never silently derived.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LlamaLikeCudaFacts {
+    /// XQA decode eligibility: `PIE_CUDA_XQA_DECODE` (default on) &&
+    /// `xqa_decode_bf16_supported(heads, head_dim_kernel, page_size,
+    /// window)` && all-full-attention && native-bf16 cache && !HND layout
+    /// (context.cpp:1419-1425, llama_like.cpp:693-701).
+    pub xqa_decode: bool,
+    /// The fused decode-QKV epilogue is live: `decode_fused_post_enabled`
+    /// (env, default on) && native-bf16 cache && unpadded head_dim &&
+    /// no qkv bias — the load-time terms of `fused_decode_qkv_post`
+    /// (declared_forward.cpp:465-479). The trace-time terms (`fused_qkv`,
+    /// per-head qk-norm, Standard rope) live on [`LlamaLikeFacts`] and
+    /// the declaration checks both.
+    pub decode_fused_post: bool,
+    /// The workspace carries a rope table (`ws.rope_table` non-empty), so
+    /// the fused arm's first layer states [`crate::trace::OpKind::RopeTableBuild`];
+    /// without it the fused kernel derives cos/sin from theta in-kernel
+    /// and no table launch exists.
+    pub rope_table: bool,
+    /// FlashInfer's decode kernel set lacks this model's GQA ratio
+    /// (`!flashinfer_decode_supports_gqa`, context.cpp:1413-1414): decode
+    /// fires fall back to dequant + the prefill kernel
+    /// ([`crate::trace::AttnKernel::PrefillDequantDecode`]). XQA, when
+    /// eligible, overrides this (context.cpp:1427).
+    pub force_prefill_path: bool,
+}
+
+impl LlamaLikeCudaFacts {
+    /// Qwen3-0.6B on L40S, default env (measured 2026-08-02, boot with
+    /// `PIE_DECLARED_FORWARD_TRACE=1`): gqa = 2 in the decode set, XQA
+    /// supported (head_dim 128, page 32, no window) and on by default,
+    /// fused post live (native bf16, unpadded, no bias), rope table
+    /// allocated. To be boot-validated against the driver's own
+    /// derivation when the dumb interpreter lands (migration rung 2).
+    pub fn qwen3_0_6b_l40s() -> Self {
+        Self {
+            xqa_decode: true,
+            decode_fused_post: true,
+            rope_table: true,
+            force_prefill_path: false,
+        }
+    }
+}
+
 /// Facts for one qwen3_5_moe-family MoE MLP block — a traced FRAGMENT, not
 /// a model.
 ///

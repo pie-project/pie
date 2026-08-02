@@ -159,11 +159,14 @@ fn flatten_kind(
             0,
             PIE_FORWARD_NO_VALUE,
         ),
-        OpKind::Attention { layer } => (
+        // `param1` is the stated kernel's wire value ([`AttnKernel`]
+        // discriminants), 0 when the semantic trace left it unstated —
+        // the resting value every pre-lowering consumer already reads.
+        OpKind::Attention { layer, kernel } => (
             PieForwardOpKind::Attention,
             PIE_FORWARD_NO_NAME,
             *layer,
-            0,
+            kernel.map_or(0, |k| k as u32),
             PIE_FORWARD_NO_VALUE,
         ),
         OpKind::Swiglu { inter } => (
@@ -263,6 +266,33 @@ fn flatten_kind(
         ),
         OpKind::SigmoidGateMul => (
             PieForwardOpKind::SigmoidGateMul,
+            PIE_FORWARD_NO_NAME,
+            0,
+            0,
+            PIE_FORWARD_NO_VALUE,
+        ),
+        // Names two weights, GdnPrep's pattern: q_norm in the weight
+        // slot, k_norm as a param0 NAME INDEX; head_dim in param1. The
+        // layer rides the op's own `layer` field (and the norm names),
+        // so no slot is spent on it.
+        OpKind::QkvDecodeFusedPost {
+            q_norm,
+            k_norm,
+            layer: _,
+            head_dim,
+        } => {
+            let q_norm = name(arena, q_norm);
+            let k_norm = name(arena, k_norm);
+            (
+                PieForwardOpKind::QkvDecodeFusedPost,
+                q_norm,
+                k_norm,
+                *head_dim,
+                PIE_FORWARD_NO_VALUE,
+            )
+        }
+        OpKind::RopeTableBuild => (
+            PieForwardOpKind::RopeTableBuild,
             PIE_FORWARD_NO_NAME,
             0,
             0,

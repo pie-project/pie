@@ -20,10 +20,10 @@
 //!   answer.
 
 use crate::facts::{
-    LlamaLikeFacts, NormPlacement, QkNorm, Qwen35FullAttnFacts, Qwen35GdnFacts, Qwen35HybridFacts,
-    Qwen35MlpKind, Qwen35MoeMlpFacts,
+    LlamaLikeCudaFacts, LlamaLikeFacts, NormPlacement, QkNorm, Qwen35FullAttnFacts,
+    Qwen35GdnFacts, Qwen35HybridFacts, Qwen35MlpKind, Qwen35MoeMlpFacts,
 };
-use crate::trace::{NormVariant, RopeKind};
+use crate::trace::{FireClass, NormVariant, RopeKind};
 
 use super::arena;
 use super::types::PieForwardPlan;
@@ -103,6 +103,48 @@ fn read_facts(facts: &PieForwardLlamaLikeFacts) -> Result<LlamaLikeFacts, PieFor
         fused_qkv: facts.fused_qkv != 0,
         tied_embeddings: facts.tied_embeddings != 0,
     })
+}
+
+/// The CUDA backend facts for a LOWERED llama_like trace, as C states
+/// them. Mirrors [`crate::facts::LlamaLikeCudaFacts`] field for field;
+/// same input-side rules as [`PieForwardLlamaLikeFacts`] (the bools are
+/// `uint8_t`, non-zero is true).
+///
+/// The driver fills this from its OWN derivation (env, kernel-support
+/// predicates, binding, cache format) at cold start — the same terms its
+/// executor booleans compute today — and the returned class traces then
+/// STATE every kernel, which is what lets the executor go dumb
+/// (north-star-dsl.md, migration rung 2).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct PieForwardLlamaLikeCudaFacts {
+    /// XQA decode eligibility; non-zero is true.
+    pub xqa_decode: u8,
+    /// The fused decode-QKV epilogue's load-time terms hold.
+    pub decode_fused_post: u8,
+    /// The workspace carries a rope table.
+    pub rope_table: u8,
+    /// FlashInfer's decode set lacks this GQA ratio.
+    pub force_prefill_path: u8,
+}
+
+fn read_cuda_facts(facts: &PieForwardLlamaLikeCudaFacts) -> LlamaLikeCudaFacts {
+    LlamaLikeCudaFacts {
+        xqa_decode: facts.xqa_decode != 0,
+        decode_fused_post: facts.decode_fused_post != 0,
+        rope_table: facts.rope_table != 0,
+        force_prefill_path: facts.force_prefill_path != 0,
+    }
+}
+
+/// Mirrors [`crate::trace::FireClass`]; same appended-only discriminant
+/// rule as [`PieForwardOpKind`], same input-side `uint32_t` crossing rule
+/// as every enum here.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PieForwardFireClass {
+    Decode = 0,
+    Prefill = 1,
 }
 
 /// The qwen3_5_moe MLP-block facts, as C states them. Mirrors
@@ -361,6 +403,51 @@ pub unsafe extern "C" fn pie_forward_trace_llama_like(
     })
 }
 
+/// Trace the LOWERED llama_like — the same text as
+/// [`pie_forward_trace_llama_like`], with the CUDA backend facts and a
+/// fire class in hand, so the class arms run and the traced form states
+/// kernels (`QkvDecodeFusedPost`, `RopeTableBuild`, `Attention.param1`;
+/// north-star-dsl.md). Call once per class the deployment fires; the
+/// semantic entry remains the parity reference.
+///
+/// # Safety
+///
+/// `facts` / `cuda` are null or point at readable
+/// [`PieForwardLlamaLikeFacts`] / [`PieForwardLlamaLikeCudaFacts`];
+/// `out_plan` is null or a writable slot. `class` is a
+/// [`PieForwardFireClass`] value crossed as `uint32_t` (the input-side
+/// enum rule); anything else answers `InvalidArgument`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pie_forward_trace_llama_like_cuda(
+    facts: *const PieForwardLlamaLikeFacts,
+    cuda: *const PieForwardLlamaLikeCudaFacts,
+    class: u32,
+    out_plan: *mut PieForwardPlan,
+) -> PieForwardStatus {
+    abort_on_panic(|| {
+        if out_plan.is_null() {
+            return PieForwardStatus::InvalidArgument;
+        }
+        unsafe { *out_plan = PieForwardPlan::default() };
+        if facts.is_null() || cuda.is_null() {
+            return PieForwardStatus::InvalidArgument;
+        }
+        let facts = match read_facts(unsafe { &*facts }) {
+            Ok(facts) => facts,
+            Err(status) => return status,
+        };
+        let cuda = read_cuda_facts(unsafe { &*cuda });
+        let class = match class {
+            0 => FireClass::Decode,
+            1 => FireClass::Prefill,
+            _ => return PieForwardStatus::InvalidArgument,
+        };
+        let plan = crate::family::llama_like_cuda(&facts, &cuda, class);
+        unsafe { *out_plan = arena::build(&plan) };
+        PieForwardStatus::Ok
+    })
+}
+
 /// Trace the qwen3_5_moe MoE MLP-block FRAGMENT against `facts` and publish
 /// the traced form into `*out_plan`.
 ///
@@ -547,8 +634,9 @@ unsafe impl Sync for EntryAddr {}
 /// (`loader/src/ffi/entry.rs:637-652`, `loader/architecture.md` §3.4).
 /// `#[used]` keeps the table, and the table keeps the functions.
 #[used]
-static KEEP_ALIVE: [EntryAddr; 6] = [
+static KEEP_ALIVE: [EntryAddr; 7] = [
     EntryAddr(pie_forward_trace_llama_like as *const ()),
+    EntryAddr(pie_forward_trace_llama_like_cuda as *const ()),
     EntryAddr(pie_forward_trace_qwen3_5_moe_mlp as *const ()),
     EntryAddr(pie_forward_trace_qwen3_5_gdn as *const ()),
     EntryAddr(pie_forward_trace_qwen3_5_full_attn as *const ()),
