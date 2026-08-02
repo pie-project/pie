@@ -1195,10 +1195,12 @@ std::vector<WeightBind> weight_binds(
     // projection carries an additive bias at slot 7 alongside its quantized
     // triplet. `.bias` and `.biases` differ by one character and mean nothing
     // alike; the triplet's zero point is the latter.
-    case Kernel::GoEmbed:
+    // Untied: the embedding table and the head are different tensors. Shared
+    // by gpt-oss and by any llama-family checkpoint that does not tie them.
+    case Kernel::EmbedUntied:
         push_quant(weights, "embed_tokens");
         break;
-    case Kernel::GoLmHead:
+    case Kernel::LmHeadUntied:
         push_quant(weights, "lm_head");
         break;
     case Kernel::GoQmvQ:
@@ -1243,6 +1245,23 @@ std::vector<WeightBind> weight_binds(
     case Kernel::GoRouterTopK:
     case Kernel::GoSwiGlu:
     case Kernel::GoExpertCombine:
+        break;
+
+    // ── The llama family's routed FFN ──
+    // The same tensors gpt-oss's experts use, minus the biases: Qwen's experts
+    // carry none, and asking for `mlp.experts.gate_proj.bias` on a checkpoint
+    // that has no such tensor is a load failure, not a zero.
+    case Kernel::LlRouter:
+        push_quant(weights, prefix + "mlp.gate");
+        break;
+    case Kernel::LlExpertGate:
+        push_quant(weights, prefix + "mlp.experts.gate_proj");
+        break;
+    case Kernel::LlExpertUp:
+        push_quant(weights, prefix + "mlp.experts.up_proj");
+        break;
+    case Kernel::LlExpertDown:
+        push_quant(weights, prefix + "mlp.experts.down_proj");
         break;
 
     case Kernel::G4PleResidualScaled:

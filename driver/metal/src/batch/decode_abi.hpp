@@ -478,15 +478,31 @@ enum class Kernel : uint8_t {
     G4AttnPostResidual,  // rms(block)*post_attention_layernorm + resid
     G4FfnPostResidual,   // rms(block)*post_feedforward_layernorm + resid
     G4PleResidualScaled, // (rms(ple)*post_per_layer_input_norm + resid)*layer_scalar
-    // ── GPT-OSS. Its embedding and head are separate tensors, and every
-    // projection is biased, so none of the shared kinds' weight maps fit.
-    GoEmbed,             // model.embed_tokens (quantized, NOT tied)
-    GoLmHead,            // lm_head (quantized, its own tensor)
+    // ── GPT-OSS, and the untied/routed kinds it happened to introduce first.
+    //
+    // Its projections are all biased, so none of the shared kinds' weight maps
+    // fit and the `Go` prefix is right for those. But an untied embedding, an
+    // untied head and the two weightless routing stages are not gpt-oss's --
+    // llama and the Qwen MoEs need exactly the same ones, and a name is free.
+    // Only the numeric VALUES are ABI, so these were renamed in place rather
+    // than duplicated.
+    EmbedUntied,         // model.embed_tokens (quantized, NOT tied to the head)
+    LmHeadUntied,        // lm_head (quantized, its own tensor)
     GoQmvQ, GoQmvK, GoQmvV, GoQmvO,
     GoSdpaSink,          // self_attn.sinks
     GoRouter,            // mlp.router (8-bit affine) + its bias
     GoExpertGate, GoExpertUp, GoExpertDown,
-    GoRouterTopK, GoSwiGlu, GoExpertCombine
+    GoRouterTopK, GoSwiGlu, GoExpertCombine,
+    // ── Llama family's routed FFN. APPEND ONLY, same rule as above.
+    //
+    // Separate from the `Go*` expert kinds for one reason: those bind a bias at
+    // slot 7 and Qwen's experts have none. Everything else -- the stacked
+    // weights, the `expert_ids` index, the slot axis -- is shared, which is why
+    // the routed matvec is the same kernel with BIASED off.
+    LlRouter,            // mlp.gate  (the routing logits; no bias)
+    LlExpertGate,        // mlp.experts.gate_proj  (stacked over experts)
+    LlExpertUp,          // mlp.experts.up_proj
+    LlExpertDown         // mlp.experts.down_proj
 };
 
 // ── Bucketed command-buffer key (relaxes "byte-identical CB" → "byte-identical

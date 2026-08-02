@@ -21,6 +21,9 @@
 #include <vector>
 
 #include "model/llama/decode_step.hpp"
+#include "model/llama/bind.hpp"
+#include "model/llama/decode_consts.hpp"
+#include "model/llama/encode.hpp"
 #include "model/llama/scratch.hpp"
 
 using pie::metal::llama::Dispatch;
@@ -34,6 +37,13 @@ using pie::metal::llama::ValueExtent;
 using pie::metal::llama::build_llama_scratch;
 using pie::metal::llama::dag_stats;
 using pie::metal::llama::llama_value_extents;
+using pie::metal::Kernel;
+using pie::metal::llama::KN;
+using pie::metal::llama::color_llama_scratch;
+using pie::metal::llama::llama_run_ends;
+using pie::metal::llama::pso_kind;
+using pie::metal::llama::qmv_kn;
+using pie::metal::llama::shared_kind;
 
 namespace {
 
@@ -322,6 +332,120 @@ void check_scratch(const char* who, const LlamaGeometry& g) {
     expect(sized, std::string(who) + ": every value has a positive width");
 }
 
+
+/// The colouring, and the one property that makes it usable: hazard freedom.
+///
+/// A colouring that recycles a buffer while a value still lives in it is not a
+/// crash. It is an activation quietly replaced by a later one, at a point where
+/// the model still produces fluent text -- so it has to be checked rather than
+/// observed.
+void check_coloring(const char* who, const LlamaGeometry& g) {
+    std::printf("\n-- coloring: %s --\n", who);
+    const std::vector<Dispatch> dag = build_llama_dag(g);
+    const ScratchPlan plan = build_llama_scratch(dag, g);
+    const auto colored = color_llama_scratch(dag, plan);
+
+    expect(colored.hazard_free, std::string(who) + ": colouring is hazard-free");
+    expect(colored.colors_used > 0 && colored.colors_used <= plan.value_count,
+           std::string(who) + ": colours are used and never exceed the value count");
+    // Recycling has to actually happen, or the "pool" is just the value list.
+    expect(colored.colors_used < plan.value_count,
+           std::string(who) + ": buffers are reused across the stack");
+    expect_eq(static_cast<long long>(colored.per_dispatch.size()),
+              static_cast<long long>(dag.size()), std::string(who) + ": one entry per dispatch");
+
+    bool assigned = true;
+    for (const auto& binds : colored.per_dispatch) {
+        for (const auto& sb : binds) {
+            if (sb.color < 0 || sb.color >= colored.colors_used) assigned = false;
+        }
+    }
+    expect(assigned, std::string(who) + ": every bind resolved to a real colour");
+
+    // The concurrency runs the colourer was told about must be the ones the
+    // encoder will actually drop barriers for, or the two disagree about when a
+    // value dies. Runs only ever merge same-layer neighbours.
+    const std::vector<int> ends = llama_run_ends(dag);
+    bool runs_ok = ends.size() == dag.size();
+    int merged = 0;
+    for (std::size_t i = 0; i < ends.size(); ++i) {
+        if (ends[i] < static_cast<int>(i) || ends[i] >= static_cast<int>(dag.size())) {
+            runs_ok = false;
+        }
+        if (ends[i] > static_cast<int>(i)) {
+            ++merged;
+            for (int j = static_cast<int>(i); j <= ends[i]; ++j) {
+                if (dag[std::size_t(j)].layer != dag[i].layer) runs_ok = false;
+            }
+        }
+    }
+    expect(runs_ok, std::string(who) + ": runs are forward and stay inside one layer");
+    expect(merged > 0, std::string(who) + ": some dispatches share a barrier");
+}
+
+/// The kernel mapping and the constants.
+void check_encode(const char* who, const LlamaGeometry& g) {
+    std::printf("\n-- encode: %s --\n", who);
+    const std::vector<Dispatch> dag = build_llama_dag(g);
+
+    // The weight key and the pipeline are DIFFERENT questions, and the routed
+    // matvecs are where they disagree: they bind the expert stack but run the
+    // routed kernel. A binder that used `pso_kind` would ask for the wrong
+    // tensor names entirely.
+    expect(shared_kind(Kind::ExpertGate, g) == Kernel::LlExpertGate,
+           std::string(who) + ": ExpertGate's weight key is the expert stack");
+    expect(pso_kind(Kind::ExpertGate) == Kernel::LlExpertGate,
+           std::string(who) + ": ExpertGate runs the routed pipeline");
+    expect(pso_kind(Kind::QmvGate) != pso_kind(Kind::ExpertGate),
+           std::string(who) + ": the dense and routed matvecs are different pipelines");
+
+    // Tied vs untied is a property of the CHECKPOINT, and asking for the wrong
+    // pair is a load failure rather than a wrong number.
+    LlamaGeometry tied = g;
+    tied.tied_embeddings = true;
+    LlamaGeometry untied = g;
+    untied.tied_embeddings = false;
+    expect(shared_kind(Kind::EmbedGather, tied) == Kernel::EmbedGather &&
+               shared_kind(Kind::LmHead, tied) == Kernel::QmvLmHead,
+           std::string(who) + ": a tied model reads one table at both ends");
+    expect(shared_kind(Kind::EmbedGather, untied) == Kernel::EmbedUntied &&
+               shared_kind(Kind::LmHead, untied) == Kernel::LmHeadUntied,
+           std::string(who) + ": an untied model reads two separate tensors");
+
+    // Matvec shapes. The routed ones have the SAME K and N as their dense
+    // counterparts -- the expert axis is a stride into the weight stack, not a
+    // wider matrix -- and that is the fact a reader is most likely to doubt.
+    expect_eq(qmv_kn(Kind::QmvQ, g).N, g.q_width(), std::string(who) + ": q_proj is q_width");
+    expect_eq(qmv_kn(Kind::QmvK, g).N, g.kv_width(), std::string(who) + ": k_proj is kv_width");
+    expect_eq(qmv_kn(Kind::QmvO, g).K, g.q_width(), std::string(who) + ": o_proj reads q_width");
+    expect_eq(qmv_kn(Kind::LmHead, g).N, g.vocab, std::string(who) + ": the head is vocab-wide");
+    if (g.is_moe()) {
+        expect_eq(qmv_kn(Kind::Router, g).N, g.n_experts,
+                  std::string(who) + ": the router is n_experts wide");
+        expect_eq(qmv_kn(Kind::ExpertGate, g).N, g.moe_intermediate,
+                  std::string(who) + ": an expert's gate is the per-expert width");
+        expect_eq(qmv_kn(Kind::ExpertDown, g).K, g.moe_intermediate,
+                  std::string(who) + ": an expert's down reads the per-expert width");
+        expect_eq(qmv_kn(Kind::ExpertGate, g).K, g.hidden,
+                  std::string(who) + ": an expert reads the full hidden vector");
+    }
+
+    // Every dispatch must resolve to some pipeline; a kind that fell through to
+    // a default would run the wrong kernel with plausible-looking arguments.
+    bool mapped = true;
+    for (const Dispatch& d : dag) {
+        if (d.kind == Kind::EmbedGather) continue;
+        const Kernel pk = pso_kind(d.kind);
+        const Kernel wk = shared_kind(d.kind, g);
+        if (pk == Kernel::Rms && d.kind != Kind::AttnNorm && d.kind != Kind::FfnNorm &&
+            d.kind != Kind::FinalRms && d.kind != Kind::QNorm && d.kind != Kind::KNorm) {
+            mapped = false;  // the fall-through value, reached by something else
+        }
+        (void)wk;
+    }
+    expect(mapped, std::string(who) + ": no kind falls through to the default pipeline");
+}
+
 }  // namespace
 
 int main() {
@@ -367,6 +491,11 @@ int main() {
     check_scratch("llama-3", llama3);
     check_scratch("qwen3", qwen3);
     check_scratch("qwen3-moe", qwen3_moe);
+
+    check_coloring("llama-3", llama3);
+    check_coloring("qwen3-moe", qwen3_moe);
+    check_encode("llama-3", llama3);
+    check_encode("qwen3-moe", qwen3_moe);
 
     // Sampling can be off (the caller wants logits, not a token), and that must
     // remove exactly the argmax.

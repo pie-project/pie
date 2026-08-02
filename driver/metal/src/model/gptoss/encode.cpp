@@ -68,7 +68,7 @@ Kernel shared_kind(Kind k) {
     switch (k) {
         // No weights: the gather is pure dataflow.
         case Kind::RowGather:     return Kernel::G4RowGather;
-        case Kind::EmbedGather:   return Kernel::GoEmbed;
+        case Kind::EmbedGather:   return Kernel::EmbedUntied;
         case Kind::AttnNorm:      return Kernel::Rms;        // input_layernorm
         case Kind::FfnNorm:       return Kernel::FfnRms;     // post_attention_layernorm
         case Kind::FinalRms:      return Kernel::FinalRms;
@@ -89,7 +89,7 @@ Kernel shared_kind(Kind k) {
         case Kind::ExpertDown:    return Kernel::GoExpertDown;
         case Kind::ExpertCombine: return Kernel::GoExpertCombine;
         case Kind::FfnResidual:   return Kernel::LayerOut;
-        case Kind::LmHead:        return Kernel::GoLmHead;
+        case Kind::LmHead:        return Kernel::LmHeadUntied;
         case Kind::Argmax:        return Kernel::Argmax;
     }
     return Kernel::Argmax;

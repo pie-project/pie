@@ -113,6 +113,9 @@ if(APPLE)
     src/model/gptoss/encode.cpp
     src/model/gptoss/bind.cpp
     src/model/llama/kernels.cpp
+    src/model/llama/decode_consts.cpp
+    src/model/llama/encode.cpp
+    src/model/llama/bind.cpp
     src/model/llama/scratch.cpp
     src/batch/simple_family.cpp
     src/model/qwen3_5/decode_step.cpp
