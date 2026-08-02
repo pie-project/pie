@@ -50,6 +50,12 @@
 #include <cstdint>
 
 #include "model/qwen3_5/declared_facts.hpp"
+#include "model/qwen3_5/qwen3_5_moe.hpp"
+
+// Forward-declared, not included: the executor only takes a pointer to
+// it, and pulling in the MoE forward header would make every dense
+// translation unit depend on the MoE block.
+namespace pie_cuda_driver::model { struct Qwen3_5MoeMlpWorkspace; }
 #include "model/qwen3_5/qwen3_5.hpp"
 #include "model/qwen3_5/qwen3_5_forward.hpp"
 #include "model/stage_hooks.hpp"
@@ -62,6 +68,11 @@ namespace pie_cuda_driver::model {
 // llama_like executor's `[declared-forward]` line reads, so one flag
 // lights up both families.
 bool qwen35_declared_exec_trace_enabled();
+
+// `PIE_DECLARED_MOE`. Default OFF, unlike the dense arc: the MoE half of
+// the executor is newer, and an unset gate should keep every existing MoE
+// deployment on the hand-written body it has always run.
+bool qwen35_declared_moe_enabled();
 
 // Boot validation (rung 4c-iii): every Launch symbol a class trace
 // states must resolve in this executor's name→launcher registry, so a
@@ -84,6 +95,54 @@ bool qwen3_5_forward_declared(
     const Qwen3_5ForwardCfg& fwd_cfg,
     const Qwen3_5PlanState& plan_state,
     Workspace& ws,
+    Qwen3_5MoeMlpWorkspace* moe_ws,
+    Qwen3_5LinearAttnWorkspace& la,
+    KvCache& cache,
+    RecurrentStateCache& state_cache,
+    AttentionWorkspace& attn_ws,
+    ops::CublasHandle& cublas,
+    const std::int32_t* token_ids,
+    const std::int32_t* positions,
+    const std::uint32_t* qo_indptr,
+    const std::uint32_t* kv_page_indices,
+    const std::uint32_t* kv_page_indptr,
+    const std::uint32_t* kv_last_page_lens,
+    const std::uint32_t* qo_indptr_h,
+    const std::uint32_t* kv_page_indptr_h,
+    int total_tokens,
+    int num_requests,
+    bool is_pure_decode,
+    const std::uint32_t* w_page_d,
+    const std::uint32_t* w_off_d,
+    const std::uint8_t* row_valid_d,
+    bool has_write_desc,
+    const std::int32_t* slot_ids_h,
+    const std::uint8_t* is_fresh_h,
+    const std::int32_t* slot_ids_d,
+    const std::uint8_t* is_fresh_d,
+    const std::int32_t* logit_row_indices_d,
+    int num_logit_rows,
+    // Recurrent-only commit-advance (spec-decode repair): non-null device
+    // [R] confirmed-prefix lengths — the hand-written `commit_len`
+    // threading (`in.commit_advance_gather_d`; the rs_buffer_fold flavor
+    // stays gate-excluded, so this is always the verify-stash replay).
+    const std::int32_t* commit_lens,
+    // A4: the fire's attached stage-hook programs (null = none). The
+    // class traces carry the HookSite ops; qwen3_5's sites are
+    // observation-only, so nothing else crosses.
+    const StageHooks* stage_hooks);
+
+// The same executor over the MoE weights. Two overloads rather than one
+// generic parameter: the caller knows which family it is, and the template
+// that serves both lives in the .cpp.
+bool qwen3_5_forward_declared(
+    const Qwen35DeclaredPlan& declared,
+    const Qwen3_5MoeWeights& w,
+    const HfConfig& cfg,
+    const Qwen3_5ForwardCfg& fwd_cfg,
+    const Qwen3_5PlanState& plan_state,
+    Workspace& ws,
+    Qwen3_5MoeMlpWorkspace* moe_ws,
     Qwen3_5LinearAttnWorkspace& la,
     KvCache& cache,
     RecurrentStateCache& state_cache,

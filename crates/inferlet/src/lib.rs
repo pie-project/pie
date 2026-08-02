@@ -63,31 +63,43 @@ pub use inferlet_macros::main;
 // The generated bindings
 // =============================================================================
 
-/// The raw `pie:inferlet` bindings, as `wit_bindgen` generated them.
-///
-/// This crate is the ergonomic layer; [`inferlet_api`] is the contract. The
-/// generator lives with the WIT it reads because `generate!`'s `path` is a
-/// filesystem path and this crate is published — see that crate's docs for
-/// why the alternative was a mirrored `wit/` tree and a CI drift job.
-///
-/// Everything below re-exports out of here, so an inferlet that was written
-/// against the old in-crate bindings does not change. Reach for `api`
-/// directly only for a binding this crate has no wrapper for.
-pub use inferlet_api as api;
-
-// The generated roots, re-exported at their old names: `crate::pie::…` and
-// `crate::wasi::…` are what the wrappers in this file and in `ptir`/`chat`
-// name, and `exports` + `export!` are what `#[inferlet::main]` expands into.
+// This crate OWNS the `pie:inferlet` WIT package (`wit/`, beside this file)
+// and is the crate that generates from it. That is not a style choice:
+// `generate!`'s `path` is a filesystem path resolved at macro expansion, and
+// a .crate archive can only reach a `wit/` inside its own package directory.
+// This crate is published to crates.io, so the WIT has to live here -- a
+// `path: "../<other-crate>/wit"` compiles in a git checkout and breaks the
+// moment the package is packed. `include` in Cargo.toml keeps `wit/` in the
+// archive; the failure mode of losing it is a broken release, not a build
+// error here.
 //
-// `export!` is `#[macro_export]`ed by the generator with a `with_types_in`
-// parameter; the attribute macro passes `::inferlet::api`, the real crate
-// root, rather than `::inferlet` -- the expansion reaches generator-internal
-// items that only this re-export of the whole crate is guaranteed to carry.
-pub use inferlet_api::{export, exports, pie, wasi};
+// The HOST bindings are a different generator and stay out of this crate:
+// `engine`'s `wasmtime::component::bindgen!` reads `../inferlet/wit` by path.
+// What the two share is the directory, not a rlib -- folding them together
+// would put wasmtime in a wasm guest's dependency graph.
+//
+// With no `async:` option, the WIT's own `async func` annotations drive async
+// generation: only run/execute/receive become `async fn`
+// (component-model-async); sync funcs (model::encode, chat::*, …) stay sync.
+// wit-bindgen generates the wasi:io bindings itself with versioned
+// cabi_realloc symbols so it doesn't collide with std's copy.
+//
+// `pub_export_macro` emits `export!` as a `#[macro_export]` macro taking
+// `with_types_in <path>`, so a leaf inferlet can name `::inferlet` and never
+// has to know where the generator sits. `crate::pie::…` and `crate::wasi::…`
+// are what the wrappers in this file and in `ptir`/`chat` name; `exports` +
+// `export!` are what `#[inferlet::main]` expands into.
+wit_bindgen::generate!({
+    path: "wit",
+    world: "inferlet",
+    pub_export_macro: true,
+    generate_all,
+});
 
 // Re-exported so a guest that writes its own inline `generate!` for a private
-// world uses the same wit-bindgen that produced this one.
-pub use inferlet_api::wit_bindgen;
+// world uses the same wit-bindgen that produced this one: two different
+// wit-bindgen versions emit disagreeing `cabi_realloc`/runtime glue.
+pub use wit_bindgen;
 
 // Re-export types that don't need async wrappers directly
 pub use pie::inferlet::types;

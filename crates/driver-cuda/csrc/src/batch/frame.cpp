@@ -3223,8 +3223,8 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
             // (region_plans.hpp derive_depth_bands) produces the band
             // arrays here; the gate and the planned words can no longer
             // disagree.
-            std::uint32_t bk[3];
-            std::uint32_t brows[3];
+            std::uint32_t bk[pie::driver::fire::kMaxDepthBands];
+            std::uint32_t brows[pie::driver::fire::kMaxDepthBands];
             const std::uint32_t m = pie::driver::fire::derive_depth_bands(
                 s.dispatch_view, bk, brows);
             for (std::uint32_t j = 0; j < m; ++j) {
@@ -3247,7 +3247,7 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
                 // agrees) is the uniform-stamp shape, served without
                 // bands — the region count would misfire on it (caught
                 // by the extended soak: wire hook@k8 + devgeo k8).
-                std::uint32_t k_seen[3] = {0, 0, 0};
+                std::uint32_t k_seen[pie::driver::fire::kMaxDepthBands] = {};
                 std::size_t distinct_k = 0;
                 for (std::size_t r = 0; r < nreg; ++r) {
                     if (rsig[r] & PIE_REGION_SIG_HOOK) seen_hook = true;
@@ -3256,7 +3256,8 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
                         for (std::size_t q = 0; q < distinct_k; ++q) {
                             if (k_seen[q] == rk2[r]) known = true;
                         }
-                        if (!known && distinct_k < 3) {
+                        if (!known &&
+                            distinct_k < pie::driver::fire::kMaxDepthBands) {
                             k_seen[distinct_k++] = rk2[r];
                         }
                     }

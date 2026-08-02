@@ -67,6 +67,12 @@ pub enum Prepare {
     /// XQA's fire-wide prepare — R-shaped, so it cannot be built per row
     /// window. This is why `xqa_decode` is also `whole`.
     FireWide,
+    /// MLA's plan (`ops::plan_attention_mla_bf16`), which is its own kind
+    /// rather than a FlashInfer plan under another name: it is built from
+    /// `kv_lora_rank` and `qk_rope_head_dim` — a latent KV geometry no other
+    /// prepare here has a field for — and it is cached in an `MlaPlanCache`
+    /// the dispatch borrows, not in the shared attention workspace.
+    MlaPlan,
 }
 
 /// One kernel's contract.

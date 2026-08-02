@@ -2,20 +2,22 @@
 #
 # One-way sync of the canonical WIT interface into the vendored SDK copy.
 #
-# Source of truth: crates/inferlet-api/wit/  (the single `pie:inferlet` package —
+# Source of truth: crates/inferlet/wit/  (the single `pie:inferlet` package —
 # world.wit + the sibling interface files + a vendored deps/ tree of the
 # wasi 0.3 packages the wasmtime host implements).
 #
 # Vendored copy (DO NOT hand-edit):
 #   - sdk/inferlet/tools/bakery/src/bakery/wit/
 #
-# It is the LAST one. The Rust guest used to need a second: `inferlet` held the
-# `wit_bindgen::generate!` site, and `generate!`'s `path` is a filesystem path
-# resolved at macro expansion, so a published `.crate` could only reach a `wit/`
-# inside its own package directory. Moving the generator to `inferlet-api` —
-# the crate that owns the WIT — made that path `"wit"` and the bindings a
-# cargo dependency, so the copy had nothing left to do. bakery's copy stays
-# because bakery is a Python package: it can vendor a directory, not link a rlib.
+# It is the LAST one. The Rust guest used to need a second: the canonical WIT
+# lived in a sibling crate while `inferlet` held the `wit_bindgen::generate!`
+# site, and `generate!`'s `path` is a filesystem path resolved at macro
+# expansion, so a published `.crate` could only reach a `wit/` inside its own
+# package directory — hence a byte-identical mirror beside the generator.
+# Putting the canonical package in `inferlet` itself makes that path `"wit"`,
+# a plain subdirectory, so the mirror had nothing left to do. bakery's copy
+# stays because bakery is a Python package: it can vendor a directory, not
+# link a rlib.
 #
 # The copy is a full mirror of the package: the interface *.wit files + world.wit
 # are copied directly, and deps/ (the vendored wasi 0.3 wit) is copied verbatim.
@@ -29,7 +31,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SRC="$ROOT/crates/inferlet-api/wit"
+SRC="$ROOT/crates/inferlet/wit"
 
 # Vendored copies: each entry is the `wit/` directory of a consumer. One left;
 # kept as a list because that is what makes adding the next one a one-line
@@ -54,7 +56,7 @@ done
 
 if [[ "${1:-}" == "--check" ]]; then
   if ! git -C "$ROOT" diff --quiet -- "${COPIES[@]}"; then
-    echo "error: vendored WIT copies are out of sync with crates/inferlet-api/wit." >&2
+    echo "error: vendored WIT copies are out of sync with crates/inferlet/wit." >&2
     echo "Run scripts/sync-wit.sh and commit the result." >&2
     git -C "$ROOT" --no-pager diff --stat -- "${COPIES[@]}" >&2
     exit 1

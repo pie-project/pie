@@ -38,7 +38,7 @@ from common import (
     visible_cuda_devices,
 )
 
-SERVER_SDK = ROOT / "sdk" / "python-server" / "python"
+SERVER_SDK = ROOT / "sdk" / "server" / "python" / "python"
 if str(SERVER_SDK) not in sys.path:
     sys.path.insert(0, str(SERVER_SDK))
 
@@ -151,10 +151,10 @@ def embedded_engine_identity() -> dict[str, str]:
         ROOT / "interface",
         ROOT / "runtime",
         ROOT / "worker",
-        ROOT / "sdk" / "python-server" / "src",
+        ROOT / "sdk" / "server" / "python" / "src",
     ]
     # `driver-metal` is only in the dependency list on Apple-Silicon builds
-    # (sdk/python-server/Cargo.toml), so on Linux its sources cannot have gone
+    # (sdk/server/python/Cargo.toml), so on Linux its sources cannot have gone
     # into this .so. Counting them makes an origin/dev pull that touched only
     # the Metal driver look like a stale CUDA engine.
     skip_roots = () if sys.platform == "darwin" else (ROOT / "driver" / "metal",)
@@ -183,7 +183,7 @@ def embedded_engine_identity() -> dict[str, str]:
         raise RuntimeError(
             f"embedded engine {engine_path} is older than {newest_source}; "
             "rebuild with PIE_COMPILER_LAUNCHER=env CARGO_BUILD_JOBS=2 "
-            "CMAKE_BUILD_PARALLEL_LEVEL=2 uv --project sdk/inferlet/python-server sync "
+            "CMAKE_BUILD_PARALLEL_LEVEL=2 uv --project sdk/server/python sync "
             "--reinstall-package pie-server"
         )
     digest = hashlib.sha256()

@@ -88,9 +88,11 @@ inline AttentionWorkspace& spatial_suffix_ws() {
 
 // ④ Act 1 (banded depth): one dedicated workspace per band slot — the
 // same same-family-planner isolation the suffix workspace exists for,
-// per band. Lazy per slot; band count is capped at 3 (frame gate).
+// per band. Lazy per slot, so a raised ceiling costs nothing until a
+// fire actually bands that deep.
 inline AttentionWorkspace& depth_band_ws(int i) {
-    static std::array<std::unique_ptr<AttentionWorkspace>, 3> pool;
+    static std::array<std::unique_ptr<AttentionWorkspace>,
+                      pie::driver::fire::kMaxDepthBands> pool;
     auto& slot = pool[static_cast<std::size_t>(i)];
     if (!slot) {
         slot = std::make_unique<AttentionWorkspace>(

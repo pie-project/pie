@@ -9,7 +9,7 @@ repository = "https://github.com/pie-project/pie"
 
 # Library half — the engine boot path (serve::start_engine, config types,
 # the supervisors). The `pie` CLI binary below is one consumer; the
-# `pie-server` Python wheel under `sdk/python-server/` is another.
+# `pie-server` Python wheel under `sdk/server/python/` is another.
 [lib]
 name = "worker"
 path = "src/lib.rs"

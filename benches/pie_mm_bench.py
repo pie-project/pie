@@ -42,7 +42,7 @@ from common import (
     summarize,
 )
 
-SERVER_SDK = ROOT / "sdk" / "python-server" / "python"
+SERVER_SDK = ROOT / "sdk" / "server" / "python" / "python"
 if str(SERVER_SDK) not in sys.path:
     sys.path.insert(0, str(SERVER_SDK))
 

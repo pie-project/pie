@@ -5,3 +5,8 @@
 
 #[cfg(feature = "contract")]
 pub mod contract;
+
+/// The declared forward — a mamba / attention / mlp hybrid over an MoE
+/// stack.
+#[cfg(feature = "forward")]
+pub mod forward;

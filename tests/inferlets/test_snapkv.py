@@ -17,7 +17,7 @@ would still hold if the decode path were deleted:
   4. the resulting keep-set is enforced: a 1-page budget must change the text,
      an all-page budget must reproduce the baseline bit for bit.
 
-Run from the repo root with PYTHONPATH=sdk/python-server/python.
+Run from the repo root with PYTHONPATH=sdk/server/python/python.
 """
 
 import json

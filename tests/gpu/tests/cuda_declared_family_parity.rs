@@ -29,15 +29,30 @@
 //! already booted.
 //!
 //! `#[ignore]`, driver-cuda, and each family needs its checkpoint in the
-//! HF cache. Run both polarities; the second invocation gates:
+//! HF cache.
+//!
+//! ONE TEST PER PROCESS, both polarities each. The filter must name a
+//! single test: the engine's `bootstrap` is single-use per process
+//! ("runtime bootstrap is single-use in this process; start a fresh
+//! process for another engine"), so a second test in the same invocation
+//! fails at boot no matter what `--test-threads` says. Running the file
+//! unfiltered therefore CANNOT pass, and reads as four red families when
+//! the failure is the harness. (It also serializes the GPU, which the
+//! 35B-A3B row now needs all of.)
 //!
 //! ```text
-//!   cargo test -p pie-gpu-tests --release --no-default-features \
-//!     --features driver-cuda --test cuda_declared_family_parity \
-//!     -- --ignored --nocapture
-//!   PIE_DECLARED_FORWARD_GEMMA4=0 cargo test ... gemma4 ...   (gemma-4 defaults ON)
-//!   PIE_DECLARED_FORWARD_GPT_OSS=1 cargo test ... gpt_oss ...   (gpt-oss is opt-in)
+//!   for pol in 1 0; do
+//!     PIE_DECLARED_FORWARD_GEMMA4=$pol cargo test -p pie-gpu-tests --release \
+//!       --no-default-features --features driver-cuda \
+//!       --test cuda_declared_family_parity gemma4_declared \
+//!       -- --ignored --nocapture --test-threads=1
+//!   done
 //! ```
+//!
+//! and the same shape for `gemma4_e2b` (same gate), `gpt_oss`
+//! (`PIE_DECLARED_FORWARD_GPT_OSS`) and `qwen35_moe`
+//! (`PIE_DECLARED_MOE`). Note `gemma4_declared` rather than `gemma4` --
+//! the shorter filter matches the e2b row too, which is two tests.
 
 mod common;
 
@@ -91,6 +106,29 @@ const GPT_OSS: Family = Family {
     name: "gpt_oss",
     hub_dir: "models--openai--gpt-oss-20b",
     gate: "PIE_DECLARED_FORWARD_GPT_OSS",
+    default_on: false,
+};
+
+/// qwen3.5's MoE deployment, and the reason it earns a row: it is the
+/// first family whose declaration covers a ROUTED block. The hybrid
+/// attention below it is the same one the dense qwen3.5 rows already
+/// cover, so what this test is actually asking about is the eight-launch
+/// aligned MoE leg -- the routing permutation, the two grouped GEMMs over
+/// the expert bank, the reorder, and the shared expert's sigmoid gate.
+///
+/// 35B-A3B rather than a smaller MoE because the fixture the DSL
+/// declaration is written against IS this geometry: hidden 2048, 256
+/// experts, top_k 8, moe_intermediate 512, shared_expert 512.
+/// NOT YET GREEN, and not because it failed: the checkpoint is ~67G of
+/// bf16 and the machine this was written on has a 46G L40S, so the load
+/// OOMs before the first fire. There is no smaller stand-in -- plain
+/// `qwen3_moe` is refused by `linear-attn dims unset` and an fp8 variant
+/// by `quantized shared-expert projections`. `PIE_DECLARED_MOE` gates
+/// BOTH the plan build and arc 2 until this row runs somewhere.
+const QWEN35_MOE: Family = Family {
+    name: "qwen3_5_moe",
+    hub_dir: "models--Qwen--Qwen3.5-35B-A3B",
+    gate: "PIE_DECLARED_MOE",
     default_on: false,
 };
 
@@ -332,4 +370,10 @@ async fn gpt_oss_declared_forward_parity() -> Result<()> {
 #[ignore = "needs a CUDA GPU + gemma-4-E2B; run gate-OFF then gate-ON"]
 async fn gemma4_e2b_declared_forward_parity() -> Result<()> {
     run_family(&GEMMA4_E2B).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a CUDA GPU with >=80G + Qwen3.5-35B-A3B; run gate-OFF then gate-ON"]
+async fn qwen35_moe_declared_forward_parity() -> Result<()> {
+    run_family(&QWEN35_MOE).await
 }

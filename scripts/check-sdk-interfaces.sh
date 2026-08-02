@@ -3,7 +3,7 @@
 # Gate the Python and JavaScript inferlet SDKs against the WIT world they claim
 # to target. Two questions, in order:
 #
-#   1. Does either SDK reference an interface `crates/inferlet-api/wit/` no longer
+#   1. Does either SDK reference an interface `crates/inferlet/wit/` no longer
 #      defines?  (drift downward: dead code that still looks alive)
 #   2. Does either SDK reach the forward-pass surface at all?
 #      (drift upward: a live-looking package that cannot run a model)
@@ -34,7 +34,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SRC="$ROOT/crates/inferlet-api/wit"
+SRC="$ROOT/crates/inferlet/wit"
 
 # Interfaces the world actually offers: one file per interface, plus whatever
 # `world.wit` imports from the `pie:inferlet` package itself.
@@ -111,7 +111,7 @@ check_defined() {
     # WIT interface files are kebab-case; Python identifiers are snake_case.
     local wit="${ref//_/-}"
     if ! grep -qx -- "$wit" <<<"$known"; then
-      note "$lang references interface '$wit', which crates/inferlet-api/wit/ does not define"
+      note "$lang references interface '$wit', which crates/inferlet/wit/ does not define"
       fail=1
     fi
   done

@@ -1,4 +1,10 @@
 #include "model/qwen3_5/declared_forward.hpp"
+#include "model/qwen3_5/qwen3_5_moe.hpp"
+#include "model/qwen3_5/qwen3_5_moe_forward.hpp"
+#include "kernels/moe_dispatch.hpp"
+#include "kernels/moe_grouped_gemm.hpp"
+#include "kernels/topk_softmax.hpp"
+#include <type_traits>
 #include "model/declared/arms.hpp"
 #include "model/declared/weights.hpp"
 
@@ -46,6 +52,67 @@ using pie_forward::PieForwardRopeKind;
 using declared::ParsedWeightName;
 using declared::parse_weight_name;
 using declared::throw_unknown_weight;
+
+const DeviceTensor* bind_qwen3_5_weight(
+    const void* ctx, const ParsedWeightName& nm, std::string_view name);
+
+// The MoE family's half of `declared::WeightBinder` — the same TRACE
+// vocabulary the dense binder answers, over the MoE struct's own spellings,
+// plus the MoE block's own names.
+const DeviceTensor* bind_qwen3_5_moe_weight(
+    const void* ctx, const ParsedWeightName& nm, std::string_view name)
+{
+    const auto& w = *static_cast<const Qwen3_5MoeWeights*>(ctx);
+    if (nm.layer < 0) {
+        if (nm.field == "embed") return w.embed;
+        if (nm.field == "final_norm") return w.final_norm;
+        if (nm.field == "lm_head") return w.lm_head;
+        throw_unknown_weight(name);
+    }
+    if (nm.layer >= static_cast<int>(w.layers.size())) throw_unknown_weight(name);
+    const Qwen3_5MoeLayerWeights& l = w.layers[static_cast<std::size_t>(nm.layer)];
+    if (nm.field == "attn_norm") return l.attn_norm_pre;
+    if (nm.field == "mlp_norm") return l.mlp_norm_pre;
+    if (nm.field == "in_proj_qkv") return l.la_in_proj_qkv;
+    if (nm.field == "in_proj_z") return l.la_in_proj_z;
+    if (nm.field == "in_proj_b") return l.la_in_proj_b;
+    if (nm.field == "in_proj_a") return l.la_in_proj_a;
+    if (nm.field == "conv") return l.la_conv1d_w;
+    if (nm.field == "conv_bias") return l.la_conv1d_b;
+    if (nm.field == "dt_bias") return l.la_dt_bias;
+    if (nm.field == "out_proj") return l.la_out_proj;
+    if (nm.field == "q_proj") return l.fa_q_proj;
+    if (nm.field == "k_proj") return l.fa_k_proj;
+    if (nm.field == "v_proj") return l.fa_v_proj;
+    // Same rule the dense binder states: `o_proj` is the trace's name for
+    // whichever bank this LAYER KIND projects out of.
+    if (nm.field == "o_proj") {
+        return l.kind == Qwen3_5MoeLayerWeights::Kind::FullAttn ? l.fa_o_proj
+                                                                : l.la_out_proj;
+    }
+    if (nm.field == "q_norm") return l.fa_q_norm;
+    if (nm.field == "k_norm") return l.fa_k_norm;
+    if (nm.field == "router") return l.moe_router;
+    // The `{e}` is literal: the trace names the BANK, spelled the way the
+    // family spells a per-expert weight, and the grouped kernel indexes it
+    // by the block's expert id. There is no per-expert tensor to resolve.
+    if (nm.field == "expert.{e}.gate_up") return l.moe_gate_up_proj;
+    if (nm.field == "expert.{e}.down") return l.moe_down_proj;
+    if (nm.field == "shared_expert.gate_up") return l.shared_gate_up_proj;
+    if (nm.field == "shared_expert.down") return l.shared_down_proj;
+    if (nm.field == "shared_expert_gate") return l.shared_gate_proj;
+    throw_unknown_weight(name);
+}
+
+// Which binder a weights type wants. `WeightBinder` is type-erased, so this
+// is the whole of what the two families need to share.
+template <class W> declared::WeightBinder::Fn binder_for();
+template <> declared::WeightBinder::Fn binder_for<Qwen3_5Weights>() {
+    return &bind_qwen3_5_weight;
+}
+template <> declared::WeightBinder::Fn binder_for<Qwen3_5MoeWeights>() {
+    return &bind_qwen3_5_moe_weight;
+}
 
 // This family's half of `declared::WeightBinder`. Note `attn_norm` /
 // `mlp_norm`: the SAME traced names llama_like binds, spelled `_pre` in
@@ -106,8 +173,9 @@ const DeviceTensor* bind_qwen3_5_weight(
     throw_unknown_weight(name);
 }
 
-const Qwen3_5LayerWeights& layer_of(
-    const Qwen3_5Weights& w, const ParsedWeightName& nm,
+template <class W>
+const auto& layer_of(
+    const W& w, const ParsedWeightName& nm,
     std::string_view name)
 {
     if (nm.layer < 0 || nm.layer >= static_cast<int>(w.layers.size())) {
@@ -159,6 +227,17 @@ enum class Q35Kernel {
     WriteKvToPages,
     ChunkedSwiglu,
     Swiglu,
+    // The aligned MoE leg. Eight launches, in the order the traced form
+    // states them; `launch_chunked_swiglu_bf16` is shared with the dense
+    // leg and already above.
+    TopkSoftmax,
+    MoeAlignDecode,
+    MoeGatherAligned,
+    MoeBuildPtrsAligned,
+    MoeGroupedGemm,
+    MoeReorderAligned,
+    MoeWeightedSum,
+    SigmoidDotScalarGateAdd,
 };
 
 Q35Kernel resolve_q35_kernel(std::string_view k) {
@@ -183,6 +262,14 @@ Q35Kernel resolve_q35_kernel(std::string_view k) {
     if (k == "launch_write_kv_to_pages") return Q35Kernel::WriteKvToPages;
     if (k == "launch_chunked_swiglu_bf16") return Q35Kernel::ChunkedSwiglu;
     if (k == "launch_swiglu_bf16") return Q35Kernel::Swiglu;
+    if (k == "launch_topk_softmax_bf16") return Q35Kernel::TopkSoftmax;
+    if (k == "launch_moe_align_decode") return Q35Kernel::MoeAlignDecode;
+    if (k == "launch_gather_moe_aligned_inputs_bf16") return Q35Kernel::MoeGatherAligned;
+    if (k == "launch_build_moe_ptrs_aligned_bf16") return Q35Kernel::MoeBuildPtrsAligned;
+    if (k == "launch_moe_grouped_gemm_bf16") return Q35Kernel::MoeGroupedGemm;
+    if (k == "launch_reorder_moe_aligned_output_bf16") return Q35Kernel::MoeReorderAligned;
+    if (k == "launch_token_batched_weighted_sum_add_bf16") return Q35Kernel::MoeWeightedSum;
+    if (k == "launch_sigmoid_dot_scalar_gate_add_bf16") return Q35Kernel::SigmoidDotScalarGateAdd;
     throw std::runtime_error(
         "declared qwen3_5: stated kernel '" + std::string(k) +
         "' is not in this executor's registry (the trace and the driver "
@@ -214,19 +301,35 @@ void qwen35_validate_stated_kernels(const pie_forward::ForwardPlan& plan) {
     }
 }
 
+bool qwen35_declared_moe_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_DECLARED_MOE");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return enabled;
+}
+
 bool qwen35_declared_exec_trace_enabled() {
     static const bool enabled =
         std::getenv("PIE_DECLARED_FORWARD_TRACE") != nullptr;
     return enabled;
 }
 
-bool qwen3_5_forward_declared(
+// The executor, over EITHER weights family.
+//
+// A template rather than accessors: every `layer.<field>` below is checked
+// against the struct the fire actually has, so a field the MoE struct spells
+// differently is a compile error rather than a silent read of the wrong
+// tensor. The two families share no base -- this stands in for one.
+template <class W>
+bool forward_declared_tmpl(
     const Qwen35DeclaredPlan& declared,
-    const Qwen3_5Weights& w,
+    const W& w,
     const HfConfig& cfg,
     const Qwen3_5ForwardCfg& fwd_cfg,
     const Qwen3_5PlanState& plan_state,
     Workspace& ws,
+    Qwen3_5MoeMlpWorkspace* moe_ws,
     Qwen3_5LinearAttnWorkspace& la,
     KvCache& cache,
     RecurrentStateCache& state_cache,
@@ -257,7 +360,9 @@ bool qwen3_5_forward_declared(
     const StageHooks* stage_hooks)
 {
     // Weights reach the arms only through the binder (see its header).
-    const declared::WeightBinder wb{&bind_qwen3_5_weight, &w};
+    using LayerW = std::decay_t<decltype(w.layers[0])>;
+    constexpr bool kIsDense = std::is_same_v<W, Qwen3_5Weights>;
+    const declared::WeightBinder wb{binder_for<W>(), &w};
     // Rung 4c-iii: normal decode/prefill fires walk the CLASS trace, in
     // which the declaration stated every kernel; the MTP/verify/legacy
     // service fires keep the semantic walk until 4c-iv brings their
@@ -325,6 +430,9 @@ bool qwen3_5_forward_declared(
     // The static form (decode/prefill classes; the services stay on the
     // interpreter walk). Digest-gated: a mismatch prints once under the
     // trace env and the interpreter serves, loudly recoverable.
+    // The generated bodies are emitted per DENSE deployment digest and take
+    // the dense weights by reference, so only that instantiation has them.
+    if constexpr (kIsDense) {
     if (state_dtype_ok && q35_generated_forward_enabled()) {
         if (declared.facts_digest == kQ35GeneratedDigest_qwen3_5_0_8b) {
             // EVERY class emits (rung 3, second family, full width).
@@ -378,6 +486,7 @@ bool qwen3_5_forward_declared(
                          kQ35GeneratedDigest_qwen3_5_0_8b);
         }
     }
+    }  // if constexpr (dense): the generated bodies
     const pie_forward::ForwardPlan& plan = *class_plan;
     if (qwen35_declared_exec_trace_enabled()) {
         std::fprintf(stderr,
@@ -427,7 +536,7 @@ bool qwen3_5_forward_declared(
     if (has_write_desc) {
         const bool has_full_attention = std::any_of(
             w.layers.begin(), w.layers.end(), [](const auto& layer) {
-                return layer.kind == Qwen3_5LayerWeights::Kind::FullAttn;
+                return layer.kind == LayerW::Kind::FullAttn;
             });
         if (w_page_d == nullptr || w_off_d == nullptr ||
             !cache.format().is_native_bf16() || !has_full_attention) {
@@ -607,7 +716,7 @@ bool qwen3_5_forward_declared(
             const auto& layer = layer_of(w, nm, name);
             const float beta = op.param0 != 0 ? 1.f : 0.f;
             const bool linear =
-                layer.kind == Qwen3_5LayerWeights::Kind::LinearAttn;
+                layer.kind == LayerW::Kind::LinearAttn;
             // ── GDN in-projections (read norm_x, the pre-attn norm) ──
             if (nm.field == "in_proj_qkv") {
                 ops::gemm_act_x_w(cublas.handle(),
@@ -672,11 +781,48 @@ bool qwen3_5_forward_declared(
                                          layer.fa_o_proj_quant),
                         ws.y.data(), N, H, Hq, beta);
                 }
+            // ── MoE: the router and the shared expert ────────────────
+            //
+            // The routed experts have no Matmul of their own -- the two
+            // grouped GEMMs are `Launch`es, because a per-expert bank
+            // indexed by a block id is not what `Matmul` means.
+            } else if (nm.field == "router" ||
+                       nm.field == "shared_expert.gate_up" ||
+                       nm.field == "shared_expert.down") {
+                if constexpr (kIsDense) {
+                    throw_unknown_weight(name);
+                } else {
+                    if (moe_ws == nullptr) {
+                        throw_drift("the MoE leg needs its workspace");
+                    }
+                    Qwen3_5MoeMlpWorkspace& mw = *moe_ws;
+                    const int Is = cfg.shared_expert_intermediate_size;
+                    if (nm.field == "router") {
+                        ops::gemm_act_x_wt_bf16(cublas.handle(),
+                            ws.norm_x.data(), wb.require(name).data(),
+                            mw.router_logits.data(), N, cfg.num_experts, H);
+                    } else if (nm.field == "shared_expert.gate_up") {
+                        ops::gemm_act_x_wt_bf16(cublas.handle(),
+                            ws.norm_x.data(), wb.require(name).data(),
+                            mw.shared_gate_up.data(), N, 2 * Is, H);
+                    } else {
+                        ops::gemm_act_x_w(cublas.handle(),
+                            mw.shared_act.data(),
+                            make_weight_view(&wb.require(name),
+                                             layer.shared_down_proj_quant),
+                            mw.shared_out.data(), N, H, Is);
+                    }
+                }
             // ── Dense MLP ────────────────────────────────────────────
             } else if (nm.field == "gate_up") {
                 // One traced matmul; whether the binding materialised it
                 // fused is this emitter's call — the hand-written
                 // qwen35_dense_mlp_block's dispatch, verbatim.
+                //
+                // The fence is inside the arm, not around the chain: a MoE
+                // layer has no dense MLP bank to name, so the arm is simply
+                // unreachable there and the fields it reads do not exist.
+                if constexpr (kIsDense) {
                 gate_up_used_fused =
                     layer.gate_up_proj_fused != nullptr &&
                     !ws.gate_up_fused.empty();
@@ -699,12 +845,15 @@ bool qwen3_5_forward_declared(
                             layer.up_proj_quant),
                         ws.up.data(), N, I, H);
                 }
+                } else { throw_unknown_weight(name); }
             } else if (nm.field == "down") {
+                if constexpr (kIsDense) {
                 ops::gemm_act_x_w(cublas.handle(),
                     ws.gate.data(),
                     make_weight_view(&wb.require(name),
                                      layer.down_proj_quant),
                     ws.y.data(), N, H, I, beta);
+                } else { throw_unknown_weight(name); }
             } else {
                 throw_unknown_weight(name);
             }
@@ -881,7 +1030,7 @@ case PieForwardOpKind::Launch: {
             // kernels, the MODEL layer for KV-side ones — the compact
             // kv slot derives from the binding, mechanical knowledge).
             const int SL = static_cast<int>(op.param1);
-            const auto conv_weight = [&]() -> const Qwen3_5LayerWeights& {
+            const auto conv_weight = [&]() -> const LayerW& {
                 const auto aux = plan.aux_names(op);
                 if (aux.size != 1) {
                     throw_drift("conv launch names " +
@@ -1042,7 +1191,7 @@ case PieForwardOpKind::Launch: {
                 int linear_idx = 0;
                 for (int l = 0; l < SL; ++l) {
                     if (w.layers[l].kind ==
-                        Qwen3_5LayerWeights::Kind::LinearAttn) {
+                        LayerW::Kind::LinearAttn) {
                         ++linear_idx;
                     }
                 }
@@ -1118,10 +1267,219 @@ case PieForwardOpKind::Launch: {
             // The MLP activation. WHICH of the two runs is the
             // checkpoint's gate_up binding, and the trace states it —
             // the executor no longer reads a workspace to find out.
-            case Q35Kernel::ChunkedSwiglu:
+            case Q35Kernel::ChunkedSwiglu: {
+                // Three callers share this kernel: the dense MLP's, the
+                // routed leg's (block-major rows) and the shared expert's
+                // (token rows). The operand's OWN extent tells them apart --
+                // not a counter, and not the intermediate width, which the
+                // routed and shared banks can and do share.
+                const auto ins = plan.inputs(op);
+                const bool aligned_rows_in =
+                    ins.size > 0 &&
+                    plan.value(ins[0]).dims[0].kind ==
+                        pie_forward::PieForwardDimKind::MoeAlignedRoutes;
+                if constexpr (!kIsDense) {
+                    if (aligned_rows_in || !ins.size) {
+                        if (moe_ws == nullptr) {
+                            throw_drift("the MoE leg needs its workspace");
+                        }
+                        Qwen3_5MoeMlpWorkspace& mw = *moe_ws;
+                        const int Im = cfg.moe_intermediate_size;
+                        const int routes = N * cfg.num_experts_per_tok;
+                        const int block = mw.aligned_block_size;
+                        const int cap = std::min(cfg.num_experts, routes);
+                        const int aligned_rows =
+                            ((routes + cap * (block - 1) + block - 1) / block) *
+                            block;
+                        kernels::launch_chunked_swiglu_bf16(
+                            mw.aligned_gate_up.data(), mw.aligned_act.data(),
+                            aligned_rows, Im, stream);
+                        break;
+                    }
+                    if (moe_ws != nullptr) {
+                        kernels::launch_chunked_swiglu_bf16(
+                            moe_ws->shared_gate_up.data(),
+                            moe_ws->shared_act.data(),
+                            N, cfg.shared_expert_intermediate_size, stream);
+                        break;
+                    }
+                }
                 kernels::launch_chunked_swiglu_bf16(
                     ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
                 break;
+            }
+            // ── The aligned MoE leg ──────────────────────────────────
+            //
+            // MoE-only, so the whole group is fenced: a dense weights type
+            // has no `moe_ws` to drive and no expert bank to bind. The
+            // shapes are transcribed from `qwen3_5_moe_forward.cpp`'s
+            // aligned block rather than re-derived -- this arm's job is to
+            // fire the same launches, not to re-decide them.
+            case Q35Kernel::TopkSoftmax:
+            case Q35Kernel::MoeAlignDecode:
+            case Q35Kernel::MoeGatherAligned:
+            case Q35Kernel::MoeBuildPtrsAligned:
+            case Q35Kernel::MoeGroupedGemm:
+            case Q35Kernel::MoeReorderAligned:
+            case Q35Kernel::MoeWeightedSum:
+            case Q35Kernel::SigmoidDotScalarGateAdd: {
+                if constexpr (kIsDense) {
+                    throw_drift("a MoE launch in a dense fire");
+                } else {
+                    if (moe_ws == nullptr) {
+                        throw_drift("the MoE leg needs its workspace");
+                    }
+                    Qwen3_5MoeMlpWorkspace& mw = *moe_ws;
+                    const int E = cfg.num_experts;
+                    const int Ktop = cfg.num_experts_per_tok;
+                    const int Im = cfg.moe_intermediate_size;
+                    const int routes = N * Ktop;
+                    const int block = mw.aligned_block_size;
+                    const int active_expert_cap = std::min(E, routes);
+                    const int max_blocks =
+                        (routes + active_expert_cap * (block - 1) + block - 1) /
+                        block;
+                    const int aligned_rows = max_blocks * block;
+                    // The shared expert is NOT folded here, matching the
+                    // hand path's `constexpr bool fold_shared = false`.
+                    constexpr int shared_row_begin = -1;
+                    switch (resolve_q35_kernel(plan.weight_name(op))) {
+                    case Q35Kernel::TopkSoftmax:
+                        kernels::launch_topk_softmax_bf16(
+                            mw.router_logits.data(), mw.topk_idx.data(),
+                            mw.topk_weights.data(), N, E, Ktop, stream);
+                        break;
+                    case Q35Kernel::MoeAlignDecode:
+                        kernels::launch_moe_align_decode(
+                            mw.topk_idx.data(), mw.aligned_route_ids.data(),
+                            mw.aligned_expert_ids.data(),
+                            /*route_to_aligned_row=*/nullptr,
+                            routes, E, block, max_blocks,
+                            /*num_tokens_past_padded=*/nullptr, stream);
+                        break;
+                    case Q35Kernel::MoeGatherAligned:
+                        kernels::launch_gather_moe_aligned_inputs_bf16(
+                            ws.norm_x.data(), mw.aligned_route_ids.data(),
+                            mw.aligned_expert_in.data(),
+                            routes, aligned_rows, Ktop, H,
+                            shared_row_begin, N, stream);
+                        break;
+                    case Q35Kernel::MoeBuildPtrsAligned: {
+                        const auto aux = plan.aux_names(op);
+                        if (aux.size != 2) {
+                            throw_drift("the ptr build names " +
+                                        std::to_string(aux.size) +
+                                        " banks, wants 2");
+                        }
+                        kernels::launch_build_moe_ptrs_aligned_bf16(
+                            mw.aligned_expert_ids.data(),
+                            wb.require(plan.name(aux[0])).data(),
+                            wb.require(plan.name(aux[1])).data(),
+                            mw.aligned_expert_in.data(),
+                            mw.aligned_gate_up.data(),
+                            mw.aligned_act.data(),
+                            mw.aligned_out.data(),
+                            reinterpret_cast<const void**>(mw.a_gu_ptrs.data()),
+                            reinterpret_cast<const void**>(mw.b_gu_ptrs.data()),
+                            reinterpret_cast<void**>(mw.c_gu_ptrs.data()),
+                            reinterpret_cast<const void**>(mw.a_dn_ptrs.data()),
+                            reinterpret_cast<const void**>(mw.b_dn_ptrs.data()),
+                            reinterpret_cast<void**>(mw.c_dn_ptrs.data()),
+                            max_blocks, block, H, Im,
+                            /*shared_block_begin=*/max_blocks,
+                            /*shared_gate_up=*/nullptr,
+                            /*shared_down=*/nullptr, stream);
+                        break;
+                    }
+                    case Q35Kernel::MoeGroupedGemm: {
+                        // Which projection this is, read off the BANK the
+                        // statement names -- not off a counter, which is how
+                        // the two would drift once anything reorders them.
+                        const auto aux = plan.aux_names(op);
+                        if (aux.size != 1) {
+                            throw_drift("the grouped GEMM names " +
+                                        std::to_string(aux.size) +
+                                        " banks, wants 1");
+                        }
+                        const std::string_view bank = plan.name(aux[0]);
+                        const bool is_gate_up =
+                            bank.find("gate_up") != std::string_view::npos;
+                        const int out_w = is_gate_up ? 2 * Im : H;
+                        const int in_w = is_gate_up ? H : Im;
+                        const std::uint16_t* src =
+                            is_gate_up ? mw.aligned_expert_in.data()
+                                       : mw.aligned_act.data();
+                        std::uint16_t* dst =
+                            is_gate_up ? mw.aligned_gate_up.data()
+                                       : mw.aligned_out.data();
+                        if (kernels::moe_grouped_gemm_bf16_supported(
+                                block, out_w, in_w)) {
+                            kernels::launch_moe_grouped_gemm_bf16(
+                                src, wb.require(bank).data(), dst,
+                                mw.aligned_expert_ids.data(),
+                                max_blocks, block, out_w, in_w, stream);
+                        } else {
+                            // The batched-cuBLAS fallback the hand path
+                            // takes when the grouped kernel refuses the
+                            // shape; the pointer arrays are already built.
+                            ops::gemm_batched_act_x_wt_bf16(cublas.handle(),
+                                reinterpret_cast<const void* const*>(
+                                    is_gate_up ? mw.b_gu_ptrs.data()
+                                               : mw.b_dn_ptrs.data()),
+                                reinterpret_cast<const void* const*>(
+                                    is_gate_up ? mw.a_gu_ptrs.data()
+                                               : mw.a_dn_ptrs.data()),
+                                reinterpret_cast<void* const*>(
+                                    is_gate_up ? mw.c_gu_ptrs.data()
+                                               : mw.c_dn_ptrs.data()),
+                                block, out_w, in_w, max_blocks);
+                        }
+                        break;
+                    }
+                    case Q35Kernel::MoeReorderAligned:
+                        kernels::launch_reorder_moe_aligned_output_bf16(
+                            mw.aligned_out.data(), mw.aligned_route_ids.data(),
+                            mw.expert_out.data(), routes, aligned_rows, H,
+                            shared_row_begin, N,
+                            /*shared_out=*/nullptr, stream);
+                        break;
+                    case Q35Kernel::MoeWeightedSum:
+                        // The reorder above already put the rows back in
+                        // ROUTE order, so this is the plain token-batched
+                        // sum. `_aligned_` names a kernel that reads
+                        // block-major rows; by here there are none.
+                        // `_add_`, onto `ws.y`: at tp=1 the aligned leg is
+                        // reached only through the decode fast path, where
+                        // the hand body sets `add_to_residual` and `moe_out`
+                        // IS the residual stream. The declaration says the
+                        // same thing, so there is no trailing add to make.
+                        kernels::launch_token_batched_weighted_sum_add_bf16(
+                            ws.y.data(), mw.expert_out.data(),
+                            mw.topk_weights.data(), N, Ktop, H, stream);
+                        break;
+                    case Q35Kernel::SigmoidDotScalarGateAdd: {
+                        const auto aux = plan.aux_names(op);
+                        if (aux.size != 1) {
+                            throw_drift("the shared gate names " +
+                                        std::to_string(aux.size) +
+                                        " weights, wants 1");
+                        }
+                        // (x, gate_weight, ACCUMULATOR, addend) -- the
+                        // hand call's order. Reversing the last two lands
+                        // the gate on the wrong buffer and still compiles.
+                        kernels::launch_sigmoid_dot_scalar_gate_add_bf16(
+                            ws.norm_x.data(),
+                            wb.require(plan.name(aux[0])).data(),
+                            ws.y.data(), mw.shared_out.data(),
+                            N, H, stream);
+                        break;
+                    }
+                    default:
+                        break;
+                    }
+                }
+                break;
+            }
             case Q35Kernel::Swiglu:
                 kernels::launch_swiglu_bf16(
                     ws.gate.data(), ws.up.data(), ws.gate.data(),
@@ -1188,7 +1546,7 @@ case PieForwardOpKind::Launch: {
                 : StageHookPoint::OnAttn;
             const bool full_attn =
                 L >= 0 && L < static_cast<int>(w.layers.size()) &&
-                w.layers[L].kind == Qwen3_5LayerWeights::Kind::FullAttn;
+                w.layers[L].kind == LayerW::Kind::FullAttn;
             // forward-hybrid.wit ruling (2026-08-05): "the attention taps
             // fire on attention layers only" — a HookSite op on a GDN
             // layer is a no-op, and the hook ledger counts the
@@ -1286,6 +1644,66 @@ case PieForwardOpKind::Launch: {
         execute_op(plan.op(at_op));
     }
     return true;
+}
+
+bool qwen3_5_forward_declared(
+    const Qwen35DeclaredPlan& declared, const Qwen3_5Weights& w,
+    const HfConfig& cfg, const Qwen3_5ForwardCfg& fwd_cfg,
+    const Qwen3_5PlanState& plan_state, Workspace& ws,
+    Qwen3_5MoeMlpWorkspace* moe_ws,
+    Qwen3_5LinearAttnWorkspace& la, KvCache& cache,
+    RecurrentStateCache& state_cache, AttentionWorkspace& attn_ws,
+    ops::CublasHandle& cublas,
+    const std::int32_t* token_ids, const std::int32_t* positions,
+    const std::uint32_t* qo_indptr, const std::uint32_t* kv_page_indices,
+    const std::uint32_t* kv_page_indptr, const std::uint32_t* kv_last_page_lens,
+    const std::uint32_t* qo_indptr_h, const std::uint32_t* kv_page_indptr_h,
+    int total_tokens, int num_requests, bool is_pure_decode,
+    const std::uint32_t* w_page_d, const std::uint32_t* w_off_d,
+    const std::uint8_t* row_valid_d, bool has_write_desc,
+    const std::int32_t* slot_ids_h, const std::uint8_t* is_fresh_h,
+    const std::int32_t* slot_ids_d, const std::uint8_t* is_fresh_d,
+    const std::int32_t* logit_row_indices_d, int num_logit_rows,
+    const std::int32_t* commit_lens, const StageHooks* stage_hooks)
+{
+    return forward_declared_tmpl(
+        declared, w, cfg, fwd_cfg, plan_state, ws, moe_ws, la, cache, state_cache,
+        attn_ws, cublas, token_ids, positions, qo_indptr, kv_page_indices,
+        kv_page_indptr, kv_last_page_lens, qo_indptr_h, kv_page_indptr_h,
+        total_tokens, num_requests, is_pure_decode, w_page_d, w_off_d,
+        row_valid_d, has_write_desc, slot_ids_h, is_fresh_h, slot_ids_d,
+        is_fresh_d, logit_row_indices_d, num_logit_rows, commit_lens,
+        stage_hooks);
+}
+
+bool qwen3_5_forward_declared(
+    const Qwen35DeclaredPlan& declared, const Qwen3_5MoeWeights& w,
+    const HfConfig& cfg, const Qwen3_5ForwardCfg& fwd_cfg,
+    const Qwen3_5PlanState& plan_state, Workspace& ws,
+    Qwen3_5MoeMlpWorkspace* moe_ws,
+    Qwen3_5LinearAttnWorkspace& la, KvCache& cache,
+    RecurrentStateCache& state_cache, AttentionWorkspace& attn_ws,
+    ops::CublasHandle& cublas,
+    const std::int32_t* token_ids, const std::int32_t* positions,
+    const std::uint32_t* qo_indptr, const std::uint32_t* kv_page_indices,
+    const std::uint32_t* kv_page_indptr, const std::uint32_t* kv_last_page_lens,
+    const std::uint32_t* qo_indptr_h, const std::uint32_t* kv_page_indptr_h,
+    int total_tokens, int num_requests, bool is_pure_decode,
+    const std::uint32_t* w_page_d, const std::uint32_t* w_off_d,
+    const std::uint8_t* row_valid_d, bool has_write_desc,
+    const std::int32_t* slot_ids_h, const std::uint8_t* is_fresh_h,
+    const std::int32_t* slot_ids_d, const std::uint8_t* is_fresh_d,
+    const std::int32_t* logit_row_indices_d, int num_logit_rows,
+    const std::int32_t* commit_lens, const StageHooks* stage_hooks)
+{
+    return forward_declared_tmpl(
+        declared, w, cfg, fwd_cfg, plan_state, ws, moe_ws, la, cache, state_cache,
+        attn_ws, cublas, token_ids, positions, qo_indptr, kv_page_indices,
+        kv_page_indptr, kv_last_page_lens, qo_indptr_h, kv_page_indptr_h,
+        total_tokens, num_requests, is_pure_decode, w_page_d, w_off_d,
+        row_valid_d, has_write_desc, slot_ids_h, is_fresh_h, slot_ids_d,
+        is_fresh_d, logit_row_indices_d, num_logit_rows, commit_lens,
+        stage_hooks);
 }
 
 }  // namespace pie_cuda_driver::model

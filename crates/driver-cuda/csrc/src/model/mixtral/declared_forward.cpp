@@ -541,6 +541,15 @@ bool gpt_oss_forward_declared(
             }
             break;
         }
+        case PieForwardOpKind::HookSite:
+            // Observation-only, and arc 2 admits no hooked fire
+            // (`in.stage_hooks == nullptr` is an eligibility term), so
+            // there is never a program to invoke. The op is STATED
+            // because the seam is real and its position is checked; this
+            // arm is what makes the trace executable instead of a load
+            // failure. When gpt-oss grows hook support, the invoke goes
+            // here, next to qwen3_5's.
+            break;
         default:
             throw_drift("op kind " +
                         std::to_string(static_cast<std::uint32_t>(op.kind)));

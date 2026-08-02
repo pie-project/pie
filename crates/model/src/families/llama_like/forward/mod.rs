@@ -479,6 +479,16 @@ fn llama_like_cuda_text(
                     // the one QKV-inside-the-arms shape.
                     let hoisted_q =
                         (!fused_post).then(|| general_qkv());
+                    // NOT migrated to `regions`, deliberately. The other
+                    // three sites in the tree are, and the goldens prove
+                    // the surface changes no traced byte — but this one
+                    // branches on `fused_post` in BOTH its arm and its
+                    // rest, so moving it is a restructure rather than a
+                    // rename, and the order it depends on is the order
+                    // the phi3/mistral live-garbage regression was about.
+                    // A restructure whose only gate is a golden it also
+                    // rewrites is not gated; do this one where the
+                    // three-model battery can run.
                     let (g, a) =
                         dsl::guarded_value(m.trace(), Some(l), attn_out_shape.clone());
                     // The masked attention states its SPATIAL SPLIT as
@@ -615,12 +625,18 @@ fn llama_like_cuda_text(
                             // tail — the hand-written mixed fire,
                             // launch for launch.
                             let packed = matmul(&x, &w.qkv);
-                            let q = dsl::by_rows(
+                            // The outer construct is a ROW partition and
+                            // the inner one a FIRE guard, nested — which
+                            // `regions` allows and refuses only to flatten
+                            // into one chain. Migrating the outer one
+                            // leaves the nesting exactly as the text had
+                            // it.
+                            let q = dsl::regions(
                                 m.trace(),
                                 Some(l),
                                 Some(attn_out_shape.clone()),
                                 |r| {
-                                    r.arm(dsl::RowPred::HookFree, || {
+                                    r.arm(dsl::Region::Rows(dsl::RowPred::HookFree), || {
                                         cuda::qkv_decode_qk_norm_rope_write_kv_region(
                                             &packed,
                                             &w.q_norm,
@@ -629,17 +645,17 @@ fn llama_like_cuda_text(
                                             table.as_ref(),
                                         );
                                     });
-                                    r.rest(|| {
-                                        let (qt, kt, vt) = split_qkv(&packed, q_w, kv_w);
-                                        let (_qt, kt) =
-                                            cuda::qk_rmsnorm_rope(&qt, &kt, &w.q_norm, &w.k_norm);
-                                        dsl::guard(
-                                            m.trace(),
-                                            GuardPred::HasWriteDesc,
-                                            || cuda::write_kv_explicit(&kt, &vt, &w.kv),
-                                            || cuda::write_kv_to_pages(&kt, &vt, &w.kv),
-                                        );
-                                    });
+                                },
+                                || {
+                                    let (qt, kt, vt) = split_qkv(&packed, q_w, kv_w);
+                                    let (_qt, kt) =
+                                        cuda::qk_rmsnorm_rope(&qt, &kt, &w.q_norm, &w.k_norm);
+                                    dsl::guard(
+                                        m.trace(),
+                                        GuardPred::HasWriteDesc,
+                                        || cuda::write_kv_explicit(&kt, &vt, &w.kv),
+                                        || cuda::write_kv_to_pages(&kt, &vt, &w.kv),
+                                    );
                                 },
                             )
                             .expect("a value-producing row partition produces its value");

@@ -372,6 +372,21 @@ pub struct Qwen35CudaFacts {
     /// the remaining three legs the pass would have taken.
     #[serde(default)]
     pub moe_cutlass_max_rows: u32,
+    /// `PIE_QWEN35_PREFILL_DECODE` (default ON) AND the cache terms the
+    /// hand-written prepare reads beside it (`is_native_bf16()` and no
+    /// HND layout). With it set, a SINGLE-REQUEST pure-decode fire is
+    /// planned and dispatched through the PREFILL flashinfer path, not
+    /// the decode one -- measured at ~7x on this model's attention shape
+    /// (`prepare_qwen3_5_decode_plan`'s table).
+    ///
+    /// It is a fact rather than a class because the per-fire term is
+    /// `num_requests == 1`, and in a pure-decode fire that IS
+    /// `TokensLE(1)` -- already in the guard vocabulary. Before this
+    /// existed, the decode class stated the decode dispatch
+    /// unconditionally and the prepare built no decode plan, so every
+    /// single-request decode threw a drift and FAILED THE MODEL LOAD.
+    #[serde(default)]
+    pub prefill_decode: bool,
     /// `add_to_residual` — tp==1, so the MoE block's output lands on the
     /// residual stream inside this pass. At tp>1 the block writes to
     /// scratch and an allreduce follows, which is a different (and
@@ -443,6 +458,7 @@ impl Qwen35CudaFacts {
             // of this fixture — the 0.8B checkpoint is dense and reaches
             // none of them; they pin the MoE block's golden form.
             moe_cutlass_max_rows: 512,
+            prefill_decode: false,
             moe_residual_fold: true,
             moe_shared_gate_dot: true,
             moe_streamed_experts: false,

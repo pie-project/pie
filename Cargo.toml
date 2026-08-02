@@ -1,7 +1,7 @@
 # Top-level Cargo workspace for the host-side Rust crates.
 #
 # ONE workspace, ONE lockfile. Every Rust crate in the repo is a member and
-# lives under `crates/`; the only Rust outside it is `sdk/python-server`, which
+# lives under `crates/`; the only Rust outside it is `sdk/server/python`, which
 # stays beside the python package it ships with (maturin convention).
 #
 # Guest-target crates (`crates/inferlet`, wasm32-wasip2) are MEMBERS but sit
@@ -95,18 +95,18 @@ members = [
     "crates/tensor-compiler",
 
     # -- guest-target members (outside default-members, see below) ----------
-    # `inferlet-api` is the canonical `pie:inferlet` WIT package AND the
-    # wit-bindgen site over it. It is a guest crate for the same reason
-    # `inferlet` is -- the generated import shims are wasm -- even though the
+    # `inferlet` owns the canonical `pie:inferlet` WIT package (`wit/`) AND is
+    # the wit-bindgen site over it -- it has to be both, because `generate!`
+    # resolves its path on the filesystem and this crate is published. It is a
+    # guest crate because the generated import shims are wasm, even though the
     # host reads its `wit/` directory by path.
-    "crates/inferlet-api",
     "crates/inferlet",
     "crates/inferlet-macros",
 
     # -- Rust that lives outside crates/ on purpose -------------------------
     # The python SDK's backend: pyo3/maturin want the Rust half beside its
     # product, not in the workspace tree.
-    "sdk/python-server",
+    "sdk/server/python",
     # The engine's on-device end-to-end suite. No code of its own; it exists so
     # that `cargo test -p pie` means the CLI's own tests rather than
     # "compile thirty GPU test binaries". Almost everything in it is `#[ignore]`d
@@ -149,7 +149,7 @@ default-members = [
     "crates/tensor-dsl",
     "crates/tensor-compiler",
     "crates/inferlet-macros",
-    "sdk/python-server",
+    "sdk/server/python",
     "tests/gpu",
 ]
 exclude = [

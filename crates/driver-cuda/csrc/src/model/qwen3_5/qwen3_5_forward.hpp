@@ -135,6 +135,11 @@ struct Qwen3_5PlanState {
 // Refresh the decode plan for the current fire. Caller is expected to
 // invoke this BEFORE either a direct forward call OR a graph replay,
 // outside any capture region. No-op when `is_pure_decode == false`.
+// `PIE_QWEN35_PREFILL_DECODE`, default ON. Public because the declared
+// facts have to state the same answer the prepare acts on -- two reads of
+// one env is how a trace and its executor drift.
+bool qwen35_prefill_decode_enabled();
+
 void prepare_qwen3_5_decode_plan(
     Qwen3_5PlanState& state,
     AttentionWorkspace& attn_ws,

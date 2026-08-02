@@ -62,16 +62,25 @@ inline std::uint32_t hook_region_k(const LaunchView& view) {
 //     needs the full-R paged decode path),
 //   - no truncated region carries LORA (the PQ-tree refusal),
 //   - the truncated regions form one contiguous descending-k suffix
-//     run of 1..3 bands (the walk's cap), and
+//     run of 1..kMaxDepthBands bands (the walk's cap), and
 //   - at m == 1 a full-depth region exists beside the band (an
 //     all-truncated uniform fire keeps the cheaper uniform stamp).
 // PIE_DEPTH_BANDS=0 disarms (same default-on read as everywhere).
 // Returns the band count (0 = not banded); k/rows are the band's
 // truncation and the rows BEFORE its region (the walk's live count
 // above that band's k).
+// How many bands the walk can serve at once. THE ceiling: every array
+// sized by it is spelled with it, so raising it is this line plus
+// whatever preparing an m-th attention plan costs -- not a hunt through
+// four independent literal `3`s that must agree and had no way to say so.
+// (`out_k`/`out_rows` decay to pointers, so the bound here is
+// documentation; the two arrays the CALLER declares are the real ones,
+// and they use this name.)
+inline constexpr std::uint32_t kMaxDepthBands = 3;
+
 inline std::uint32_t derive_depth_bands(const LaunchView& view,
-                                        std::uint32_t out_k[3],
-                                        std::uint32_t out_rows[3]) {
+                                        std::uint32_t out_k[kMaxDepthBands],
+                                        std::uint32_t out_rows[kMaxDepthBands]) {
     static const bool bands_on = [] {
         const char* v = std::getenv("PIE_DEPTH_BANDS");
         return v == nullptr || v[0] != '0';
@@ -96,7 +105,7 @@ inline std::uint32_t derive_depth_bands(const LaunchView& view,
                           PIE_REGION_SIG_HOOK_PAGE_MASK)) {
                 return 0;
             }
-            if (count == 3) return 0;
+            if (count == kMaxDepthBands) return 0;
             if (seen_trunc && rk[r] >= out_k[count - 1]) return 0;
             out_k[count] = rk[r];
             out_rows[count] = ind[r];

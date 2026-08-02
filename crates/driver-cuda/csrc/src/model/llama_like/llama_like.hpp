@@ -24,6 +24,7 @@
 #include "model/loaded_model.hpp"
 #include "model/llama_like/qwen3.hpp"           // Qwen3Weights
 #include "model/workspace.hpp"       // Workspace
+#include "pie/driver/region_plans.hpp"  // kMaxDepthBands
 #include "ops/attention_flashinfer.hpp"
 #include "ops/attention_xqa.hpp"
 #include "store/kv_cache.hpp"
@@ -161,7 +162,8 @@ struct LlamaLikePlanState {
     // distinct-k band (deepest-first), each against its OWN dedicated
     // workspace (the two-plans-one-workspace lesson, per band).
     // count == 0 = unbanded fire.
-    std::array<ops::DecodePlanCachePtr, 3> depth_band_plans;
+    std::array<ops::DecodePlanCachePtr,
+               pie::driver::fire::kMaxDepthBands> depth_band_plans;
     // Prefill-family band plans (force_prefill / prefill-decode
     // deployments — their per-band prefix dispatch is the planned
     // causal prefill, not the decode kernel).

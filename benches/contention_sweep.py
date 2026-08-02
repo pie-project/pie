@@ -245,7 +245,7 @@ def main() -> int:
     ap.add_argument("--max-model-len", type=int, default=2048)
     ap.add_argument("--timeout", type=float, default=2400.0)
     ap.add_argument("--pie-python",
-                    default=str(ROOT / "sdk/inferlet/python-server/.venv/bin/python"))
+                    default=str(ROOT / "sdk/server/python/.venv/bin/python"))
     ap.add_argument("--vllm-python", default="/root/vllm-venv/bin/python")
     ap.add_argument("--cuda-compat", default="",
                     help="prepended to LD_LIBRARY_PATH; needed when running "

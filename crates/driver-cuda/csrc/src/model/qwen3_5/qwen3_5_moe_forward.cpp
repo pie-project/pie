@@ -138,8 +138,6 @@ int qwen35_moe_aligned_decode_block_size(int inter_local, int hidden) {
     return gate_up_bytes <= (std::size_t{3} << 20) ? 16 : 8;
 }
 
-constexpr int kQwen35MoeAlignedDecodeMinRoutes = 64;
-
 // Row count above which a NON-pure-decode step leaves the device-side
 // MoE dispatch for the host-driven one. The host path resolves routing on
 // the CPU, which costs a device sync per layer and then walks all
@@ -159,7 +157,6 @@ constexpr int kQwen35MoeAlignedDecodeMinRoutes = 64;
 // per expert. A real bulk prefill (8192 tokens) still takes the host
 // path. Measured, 128 requests x 256 tokens: 64 gave 918-986 tok/s,
 // everything from 128 up gave 994-1116 (within run-to-run spread).
-constexpr int kQwen35MoeDecodeFastMaxTokens = 1024;
 
 // The routed decode GEMMs are M=1 streaming reads. A dedicated GEMV beats
 // `cublasGemmBatchedEx` on them; see `moe_decode_gemv_bf16_kernel`.

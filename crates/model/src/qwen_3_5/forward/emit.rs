@@ -23,7 +23,7 @@ pub fn facts_digest(facts: &Qwen35HybridFacts, cuda: &Qwen35CudaFacts) -> String
     };
     format!(
         "qwen3_5/l{}/int{}/v{}/te{}/nv{}/ah{}/aqh{}/akvh{}/ahd{}/arot{}/afq{}\
-         /gkh{}/gvh{}/gkd{}/gvd{}/gck{}/gfi{}/moe{}/di{}/sb{}/wt{}/wtm{}/cm{}/vs{}",
+         /gkh{}/gvh{}/gkd{}/gvd{}/gck{}/gfi{}/moe{}/di{}/sb{}/wt{}/wtm{}/cm{}/vs{}/pd{}",
         facts.layers,
         facts.full_attn_interval,
         facts.vocab,
@@ -48,6 +48,10 @@ pub fn facts_digest(facts: &Qwen35HybridFacts, cuda: &Qwen35CudaFacts) -> String
         cuda.warp_tiled_max,
         cuda.cached_max,
         u8::from(cuda.verify_stash),
+        // The prefill-decode redirect changes the decode class's
+        // attention op, so a body emitted with it on must not be
+        // served to a deployment that turned it off.
+        u8::from(cuda.prefill_decode),
     )
 }
 

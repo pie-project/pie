@@ -67,8 +67,8 @@ def _find_pie_binary() -> str | None:
     if env_bin := os.environ.get("PIE_BIN"):
         if Path(env_bin).exists():
             return env_bin
-    # sdk/python-server/python/pie/server.py -> repo root is 4 levels up.
-    root = Path(__file__).resolve().parents[4]
+    # sdk/server/python/python/pie/server.py -> repo root is 5 levels up.
+    root = Path(__file__).resolve().parents[5]
     for profile in ("release", "release-min", "debug"):
         candidate = root / "target" / profile / "pie"
         if candidate.exists():

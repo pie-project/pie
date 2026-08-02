@@ -7,7 +7,7 @@ same statistics. This asks the only question that separates the two: with a
 budget far below the request's page count, does the model produce a DIFFERENT
 continuation than the same model attending over everything?
 
-Run from the repo root with PYTHONPATH=sdk/python-server/python.
+Run from the repo root with PYTHONPATH=sdk/server/python/python.
 """
 
 import asyncio

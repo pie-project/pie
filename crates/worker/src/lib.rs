@@ -1,7 +1,7 @@
 //! `worker` library — engine boot path + supporting modules.
 //!
 //! The `pie` CLI binary (`src/main.rs`) is one consumer; the upcoming
-//! `pie-server` pyo3 wheel under `sdk/python-server/` is another.
+//! `pie-server` pyo3 wheel under `sdk/server/python/` is another.
 //! Both link against this lib, so the engine boot logic
 //! ([`serve::start_engine`]) has a single source of truth.
 //!

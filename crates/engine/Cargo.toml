@@ -110,7 +110,7 @@ default = []
 # which links `pie_driver_cuda_lib`", and that held for the final binary and
 # ONLY for it: `worker` depends on this crate, not the other way round, so
 # THIS crate's own test binaries had the externs and no archive. Any build that
-# turned the feature on workspace-wide -- and `sdk/python-server` turns it on
+# turned the feature on workspace-wide -- and `sdk/server/python` turns it on
 # unconditionally -- could not link `cargo test -p pie-engine`.
 #
 # The crate that declares an `extern "C"` is the crate that owes the symbol.

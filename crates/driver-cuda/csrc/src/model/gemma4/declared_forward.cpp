@@ -50,6 +50,14 @@ enum class G4Kernel {
     TransposeNldToLnd,
     LogitSoftcap,
     ResidualAdd,
+    // The `attn.qv` seam's construct. In the registry because the trace
+    // STATES it -- the seam is real and its position rule is checked --
+    // and a symbol the registry does not know refuses the whole plan at
+    // load. Its arm throws: gemma-4 has no adapter support on either
+    // side, hand-written or declared, so a fire that reached it would be
+    // a lowering bug. `row.lora` is hard 0 below and arc 2 declines lora
+    // fires, which is what keeps it unreachable.
+    LoraQkvCorrection,
 };
 
 G4Kernel resolve_g4_kernel(std::string_view k) {
@@ -81,6 +89,7 @@ G4Kernel resolve_g4_kernel(std::string_view k) {
         return G4Kernel::TransposeNldToLnd;
     if (k == "launch_logit_softcap_bf16") return G4Kernel::LogitSoftcap;
     if (k == "launch_residual_add_bf16") return G4Kernel::ResidualAdd;
+    if (k == "pie_lora_qkv_correction") return G4Kernel::LoraQkvCorrection;
     throw std::runtime_error(
         "declared gemma4: stated kernel '" + std::string(k) +
         "' is not in this executor's registry (the trace and the driver "
@@ -509,6 +518,15 @@ bool gemma4_forward_declared(
                 }
                 break;
             }
+            case G4Kernel::LoraQkvCorrection:
+                // Unreachable by construction: the `HasLora` guard's
+                // then-region needs a lora row, and gemma-4 states none.
+                // Loud rather than silent -- an adapter dropped without a
+                // word is the failure this whole arc exists to prevent.
+                throw std::runtime_error(
+                    "declared gemma4: lora correction reached, but gemma-4 "
+                    "has no adapter support on either side (arc 2 should "
+                    "have declined this fire)");
             case G4Kernel::ResidualAdd:
                 kernels::launch_residual_add_bf16(
                     per_layer_proj, per_layer_token,
@@ -688,6 +706,18 @@ bool gemma4_forward_declared(
             }
             break;
         }
+        case PieForwardOpKind::HookSite:
+            // gemma-4's sites are OBSERVATION-only, and arc 2 admits no
+            // hooked fire at all (`in.stage_hooks == nullptr` is an
+            // eligibility term above), so there is never a program to
+            // invoke here. The op is still STATED, because the seam is
+            // real and its position is checked -- the arm is what makes
+            // the trace executable rather than a load failure.
+            //
+            // A fire that arrived here WITH hooks would be an eligibility
+            // bug, not a site to serve; when gemma-4 grows hook support
+            // this is the arm that gains the invoke, next to qwen3_5's.
+            break;
         default:
             throw_drift("op kind " +
                         std::to_string(static_cast<std::uint32_t>(op.kind)) +

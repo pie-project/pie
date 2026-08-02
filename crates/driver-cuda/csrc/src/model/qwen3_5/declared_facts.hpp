@@ -92,6 +92,14 @@ struct Qwen35DeclaredPlan {
     // cross-checks `verify_hidden_stash_enabled()` per commit fire and
     // falls back to the semantic walk on mismatch.
     bool cuda_verify_stash = false;
+    // `Qwen35CudaFacts::prefill_decode`, kept for the per-fire
+    // cross-check: the fact is the ENV alone, but the prepare also needs
+    // a native-bf16 cache with no HND layout -- terms that are
+    // engine-owned and invisible at build. When they do not hold, the
+    // prepare keeps the decode plan for an R == 1 fire while the trace
+    // took the prefill arm, and that disagreement must DECLINE rather
+    // than throw. (Throwing is what made this a model-LOAD failure.)
+    bool cuda_prefill_decode = false;
     // What the class traces were taken from, in the format the future
     // generated .inc embeds (`emit_qwen35::facts_digest`, the llama
     // mechanism's port); the static-form dispatch runs only on exact

@@ -30,7 +30,7 @@ these is necessary rather than fussy):
   * pin `reserve_tokens` so both endpoints reserve the same page count;
   * turn `report` off so the telemetry readback is not timed.
 
-Run from the repo root with PYTHONPATH=sdk/python-server/python:
+Run from the repo root with PYTHONPATH=sdk/server/python/python:
 
     PIE_CUDA_KV_ENVELOPES=1 python tests/inferlets/bench_trackb.py \
         --driver cuda_native --model <path>

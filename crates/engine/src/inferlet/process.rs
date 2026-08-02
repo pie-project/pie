@@ -38,7 +38,7 @@ use super::program::ProgramName;
 
 /// The versioned component export every inferlet provides. wasmtime's export
 /// name map is semver-aware, so this must be the EXACT package version declared
-/// in `crates/inferlet-api/wit/world.wit` — an unversioned or stale-versioned lookup
+/// in `crates/inferlet/wit/world.wit` — an unversioned or stale-versioned lookup
 /// silently finds nothing and every program fails to start. Kept honest by
 /// `tests::run_interface_version_matches_wit`.
 const RUN_INTERFACE: &str = "pie:inferlet/run@0.3.0";
@@ -1142,9 +1142,9 @@ mod tests {
     fn run_interface_version_matches_wit() {
         let wit = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../inferlet-api/wit/world.wit"),
+                .join("../inferlet/wit/world.wit"),
         )
-        .expect("read crates/inferlet-api/wit/world.wit");
+        .expect("read crates/inferlet/wit/world.wit");
 
         let declared = wit
             .lines()

@@ -9,3 +9,8 @@
 pub mod chat;
 #[cfg(feature = "contract")]
 pub mod contract;
+
+/// The declared forward — MLA over a dense-prefix MoE stack with WNA16
+/// experts.
+#[cfg(feature = "forward")]
+pub mod forward;

@@ -7,3 +7,7 @@
 
 #[cfg(feature = "contract")]
 pub mod contract;
+
+/// The declared forward -- an MLA / KDA hybrid over an MXFP4 MoE stack.
+#[cfg(feature = "forward")]
+pub mod forward;

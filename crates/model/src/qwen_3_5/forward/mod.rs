@@ -9,6 +9,16 @@
 pub mod emit;
 pub mod facts;
 
+/// The MoE aligned path's block size and block ceiling, as the driver picks
+/// them (`kernels::moe_aligned_block`, `kMoeAlignedBlockMin/Max`).
+///
+/// Load-time constants, so a declaration may state them: the driver's own
+/// choice varies with the route count, and the MINIMUM is what a declaration
+/// must assume -- it yields the most blocks, so a plan sized against it fits
+/// whatever the driver picks.
+const MOE_ALIGNED_BLOCK: u32 = 16;
+const MOE_MAX_BLOCKS: u32 = 1024;
+
 use self::facts::{
     Qwen35CudaFacts,
     Qwen35FullAttnFacts, Qwen35GdnFacts, Qwen35HybridFacts, Qwen35MlpKind, Qwen35MoeMlpFacts,
@@ -110,6 +120,102 @@ impl MoeLayerW {
 /// [`qwen3_5_moe_mlp_block`] traces standalone (at layer 0) and
 /// [`qwen3_5_hybrid`] composes per layer. One body so the hybrid's MLP ops
 /// ARE the fragment's, by construction rather than by parallel maintenance.
+/// The MoE block's ALIGNED CUDA reading — the leg every fire outside the
+/// fused CUTLASS bound actually takes.
+///
+/// # The extent that used to make this unstatable
+///
+/// The aligned path buckets every (token, expert) route by expert and pads
+/// each bucket to a whole block, so one batched GEMM covers all experts. Its
+/// intermediates are therefore
+/// `ceil((N·k + min(E, N·k)·(block-1)) / block) · block` rows tall -- not
+/// `Tokens`, not a `Const`, and the north-star doc named exactly this as "an
+/// extent no `Dim` spells". [`Dim::MoeAlignedRoutes`] spells it: every input
+/// but `N` is load-time, so the extent is a function of the fire's own token
+/// count, which is what a symbolic dim has to be.
+///
+/// # What it states
+///
+/// The permutation, the gather into block-major order, the pointer arrays,
+/// the two grouped GEMMs with the activation between them, and the reorder
+/// back to route order. Then the combine -- and WHICH combine is a binding,
+/// so the text states it: a deployment that folds the residual takes the
+/// token-batched aligned form, one that does not takes the per-expert
+/// scatter-add.
+fn moe_mlp_body_aligned_cuda(l: u32, facts: &Qwen35MoeMlpFacts, y: &Val) -> Val {
+    let w = MoeLayerW::new(l, facts);
+    let y = y.clone();
+    let m = rmsnorm(&y, &w.mlp_norm);
+
+    let aligned = model_compiler::trace::Dim::MoeAlignedRoutes {
+        top_k: facts.top_k,
+        experts: facts.num_experts,
+        block: MOE_ALIGNED_BLOCK,
+    };
+
+    let logits = matmul(&m, &w.router);
+    let (experts, weights) = dsl::cuda::topk(&logits, facts.top_k);
+
+    // The permutation, and the three arrays it produces: the sorted route
+    // order, which expert each block belongs to, and the inverse map the
+    // reorder reads back.
+    let (sorted, expert_ids, _inverse) = dsl::cuda::moe_align(
+        &experts,
+        MOE_MAX_BLOCKS,
+        MOE_ALIGNED_BLOCK,
+        facts.top_k,
+    );
+    let aligned_in = dsl::cuda::gather_moe_aligned_inputs(&m, &sorted, aligned, facts.hidden);
+    dsl::cuda::build_moe_ptrs_aligned(
+        &expert_ids,
+        &aligned_in,
+        l,
+        &w.expert_gate_up.name,
+        &w.expert_down.name,
+    );
+
+    // Both projections are the SAME statement -- a grouped GEMM over the
+    // block-major operand -- which is why the selector matmul lowers to one
+    // kernel rather than to a per-expert loop.
+    let gate_up = dsl::cuda::moe_grouped_gemm(
+        &aligned_in,
+        &sorted,
+        aligned,
+        2 * facts.moe_intermediate,
+        &w.expert_gate_up.name,
+    );
+    let act = dsl::cuda::swiglu(&gate_up, facts.moe_intermediate, true);
+    let down = dsl::cuda::moe_grouped_gemm(&act, &sorted, aligned, facts.hidden, &w.expert_down.name);
+
+    let route_out =
+        dsl::cuda::reorder_moe_aligned_output(&down, &sorted, facts.top_k, facts.hidden);
+
+    // The combine, in the form the aligned leg actually fires: the reorder
+    // above already put the rows back in ROUTE order, so what follows is the
+    // ordinary token-batched sum, not the aligned one. Read off
+    // `qwen3_5_moe_forward.cpp`'s aligned block rather than inferred from the
+    // name -- `_aligned_` names a kernel that reads block-major rows, and
+    // this one no longer has any.
+    //
+    // The residual FOLDS into it. At tp=1 the aligned leg is reached only
+    // through the decode fast path, and there `add_to_residual` is set, so
+    // `moe_out` IS the residual stream: the combine fires the `_add_` form
+    // straight onto `y` and the shared expert's gate lands on top of it.
+    // There is no trailing add. An earlier reading of this block stated the
+    // plain combine and a closing `y += combined`, which is the tp>1 /
+    // general-path shape -- one this leg never takes.
+    let routed = dsl::cuda::weighted_sum(&weights, &route_out, facts.hidden, Some(&y));
+
+    if facts.shared_expert_intermediate > 0 {
+        let inter = facts.shared_expert_intermediate;
+        let act = dsl::cuda::swiglu(&matmul(&m, &w.shared_gate_up), inter, true);
+        let shared = matmul(&act, &w.shared_down);
+        dsl::cuda::sigmoid_dot_scalar_gate_add(&m, &w.shared_gate, &shared, &routed, facts.hidden)
+    } else {
+        routed
+    }
+}
+
 fn moe_mlp_body(l: u32, facts: &Qwen35MoeMlpFacts, y: &Val) -> Val {
     let w = MoeLayerW::new(l, facts);
     let mut y = y.clone();
@@ -208,7 +314,7 @@ fn moe_mlp_body_cuda(
         || !cuda.moe_residual_fold
         || (facts.shared_expert_intermediate > 0 && !cuda.moe_shared_gate_dot)
     {
-        return moe_mlp_body(l, facts, y);
+        return moe_mlp_body_aligned_cuda(l, facts, y);
     }
 
     let w = MoeLayerW::new(l, facts);
@@ -527,22 +633,38 @@ fn gdn_attn_body_cuda(
                 ]),
                 DType::F32,
             );
-            let (mut guard, core) = dsl::guarded_value(t, Some(l), out_shape);
-            if c.warp_tiled {
-                guard = guard.arm(GuardPred::TokensLE(c.warp_tiled_max), || {
-                    cuda::gdn_prefill_warp_tiled(&q, &k, &v, &g, &beta, &w.rs, c.state_bf16)
-                });
-            }
-            guard
-                .arm(GuardPred::TokensLE(c.cached_max), || {
-                    if gqa {
-                        cuda::repeat_interleave_heads(&q);
-                        cuda::repeat_interleave_heads(&k);
+            // A CONDITIONAL arm, which is why `regions` takes `&mut`
+            // rather than a builder chain: whether the warp-tiled leg
+            // exists at all is a deployment fact, and a chain would have
+            // to rebind itself to say so.
+            dsl::regions(
+                t,
+                Some(l),
+                Some(out_shape),
+                |ctx| {
+                    if c.warp_tiled {
+                        ctx.arm(
+                            dsl::Region::Fire(GuardPred::TokensLE(c.warp_tiled_max)),
+                            || {
+                                cuda::gdn_prefill_warp_tiled(
+                                    &q, &k, &v, &g, &beta, &w.rs, c.state_bf16,
+                                );
+                            },
+                        );
                     }
-                    cuda::gdn_prefill_cached(&q, &k, &v, &g, &beta, &w.rs, c.state_bf16)
-                })
-                .otherwise(|| cuda::gdn_prefill_fla(&q, &k, &v, &g, &beta, &w.rs, c.state_bf16));
-            core
+                    ctx.arm(dsl::Region::Fire(GuardPred::TokensLE(c.cached_max)), || {
+                        if gqa {
+                            cuda::repeat_interleave_heads(&q);
+                            cuda::repeat_interleave_heads(&k);
+                        }
+                        cuda::gdn_prefill_cached(&q, &k, &v, &g, &beta, &w.rs, c.state_bf16);
+                    });
+                },
+                || {
+                    cuda::gdn_prefill_fla(&q, &k, &v, &g, &beta, &w.rs, c.state_bf16);
+                },
+            )
+            .expect("the guarded recurrence produces its value")
         }
         FireClass::CommitAdvance => {
             unreachable!("CommitAdvance traces its own pass, never the layer body")
@@ -733,6 +855,7 @@ fn full_attn_body_cuda(
     t: &Trace,
     l: u32,
     facts: &Qwen35FullAttnFacts,
+    c: &Qwen35CudaFacts,
     y: &Val,
     class: FireClass,
 ) -> Val {
@@ -764,11 +887,18 @@ fn full_attn_body_cuda(
     // descriptors when the fire steers a graph replay, page-derived
     // otherwise) — the same HasWriteDesc guard llama_like's CUDA text
     // carries, both arms stated.
-    dsl::guard_on(
+    dsl::regions(
         t,
-        GuardPred::HasWriteDesc,
-        || cuda::write_kv_explicit(&k, &v, &w.kv),
-        || cuda::write_kv_to_pages(&k, &v, &w.kv),
+        None,
+        None,
+        |c| {
+            c.arm(dsl::Region::Fire(GuardPred::HasWriteDesc), || {
+                cuda::write_kv_explicit(&k, &v, &w.kv);
+            });
+        },
+        || {
+            cuda::write_kv_to_pages(&k, &v, &w.kv);
+        },
     );
 
     // qwen3_5's cache is bf16-gated, so the prefill arm is the
@@ -777,6 +907,31 @@ fn full_attn_body_cuda(
     // CommitAdvance skips full-attention layers entirely and never enters
     // this body ([`commit_advance_body`]).
     let attn = match class {
+        // The single-request redirect is a GUARD, not a second class: at
+        // `prefill_decode` the prepare plans the prefill path for R == 1
+        // and leaves `decode_plan` null, and in a pure-decode fire one
+        // token per request makes `num_requests == 1` exactly
+        // `TokensLE(1)`. Both arms stated, so neither reading is the
+        // executor's to guess.
+        FireClass::Decode if c.prefill_decode => {
+            let out_shape = (
+                Shape(vec![Dim::Tokens, Dim::Const(facts.q_width())]),
+                DType::BF16,
+            );
+            dsl::regions(
+                t,
+                Some(l),
+                Some(out_shape),
+                |c| {
+                    c.arm(dsl::Region::Fire(GuardPred::TokensLE(1)), || {
+                        cuda::attention_flashinfer_prefill(&q, &w.kv);
+                    });
+                },
+                || {
+                    cuda::attention_flashinfer_decode(&q, &w.kv);
+                },
+            )
+        }
         FireClass::Decode => cuda::attention_flashinfer_decode(&q, &w.kv),
         FireClass::Prefill | FireClass::StateOnly | FireClass::FrozenVerify => {
             // No dequant statement beside it: qwen3_5's full-attention
@@ -972,7 +1127,7 @@ pub fn qwen3_5_hybrid_cuda(
 
         for l in 0..facts.layers {
             let y_attn = if facts.is_full_attn(l) {
-                full_attn_body_cuda(t, l, &facts.attn, &y, class)
+                full_attn_body_cuda(t, l, &facts.attn, cuda, &y, class)
             } else {
                 gdn_attn_body_cuda(t, l, &facts.gdn, &y, cuda, class)
             };

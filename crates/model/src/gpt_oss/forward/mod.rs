@@ -136,6 +136,8 @@ pub fn gpt_oss_cuda(
     );
     let hidden = facts.hidden;
     dsl::trace_named(&family, |t| {
+        // The entry boundary, where device puts and channel reads attach.
+        dsl::seam(t, &dsl::seam::IN, &[], None);
         let mut y = dsl::embed_with(t, "embed", hidden);
 
         for l in 0..facts.layers {
@@ -162,6 +164,25 @@ pub fn gpt_oss_cuda(
             let k = proj(&normed, &w.k_proj, &w.k_bias);
             let v = proj(&normed, &w.v_proj, &w.v_bias);
 
+            // The adapter seam -- and ONLY when the bias is not folded.
+            //
+            // `attn.qv`'s position rule is that the correction lands on the
+            // BASE projection, not on base + bias. When `attention_bias` is
+            // set this family folds the bias into the GEMM's own epilogue
+            // (`gemm_act_x_wt_bias_bf16`), so there is no point in the trace
+            // where the base projection exists as a value: the first thing
+            // that exists is already base + bias.
+            //
+            // So such a deployment states no q/v adapter seam, and that is
+            // the honest answer rather than a limitation being hidden. The
+            // rule found this -- `seam::check_plan` refused the statement
+            // with "value 2 comes from Launch", because a bias-folded
+            // projection is a `Launch` and not a `Matmul`. Stating it anyway
+            // would have put every adapter's delta on the wrong operand.
+            if !facts.attention_bias {
+                dsl::seam(q.trace(), &dsl::seam::ATTN_QV, &[&q, &v], Some(l));
+            }
+
             // gpt-oss scales, and the driver had to be TAUGHT to: this
             // family shares llama_like's cfg, where `apply_rope_config`
             // had already resolved the scaling, and `mixtral.cpp` spelled
@@ -182,6 +203,7 @@ pub fn gpt_oss_cuda(
             //
             // The sink layers ask for the LSE; a layer without sinks
             // takes the one-value dispatch and saves the write.
+            dsl::seam(q.trace(), &dsl::seam::ATTN_Q, &[&q], Some(l));
             let a = if facts.attn_sinks {
                 let (o, lse) = match class {
                     FireClass::Decode => {
@@ -197,6 +219,11 @@ pub fn gpt_oss_cuda(
                 }
                 .expect("the class states its attention")
             };
+
+            // Post-attention observation. On the sink layers this sees the
+            // RESCALED output, not the raw dispatch result -- the rescale
+            // is part of what attention computes here.
+            dsl::seam(a.trace(), &dsl::seam::ATTN_OUT, &[&a], Some(l));
 
             // o_proj folds the RESIDUAL (beta=1) and not its bias: the
             // hand-written tp=1 arm calls the plain gemm and then
@@ -256,6 +283,8 @@ pub fn gpt_oss_cuda(
             },
         );
         let lm_head = if facts.tied_embeddings { "embed" } else { "lm_head" };
-        dsl::lm_head_at(t, &normed, lm_head, facts.vocab);
+        let logits = dsl::lm_head_at(t, &normed, lm_head, facts.vocab);
+        // The exit boundary: sampling and host-visible emits attach here.
+        dsl::seam(t, &dsl::seam::OUT, &[&logits], None);
     })
 }

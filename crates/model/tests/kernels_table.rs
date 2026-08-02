@@ -126,7 +126,41 @@ fn the_table_is_exactly_the_dsl_surface() {
         .skip(1)
         .step_by(2)
         .filter(|s| {
-            ["launch_", "dispatch_", "ops::", "pie_lora", "qwen35_verify"]
+            // The prefixes a kernel symbol can start with. `ops::` and
+            // `marlin_moe::` are C++ NAMESPACES the symbol genuinely carries
+            // -- the launcher lives in the vendored tree, and the table
+            // records the name a caller writes.
+            //
+            // This list is a GUESS about naming, and it has been wrong twice:
+            // once when `marlin_moe::` arrived, and again when
+            // `scripts/kernel-vocabulary-audit.py` found seventeen launchers
+            // named none of these ways (`mla_absorb_*`,
+            // `merge_attention_states_*`, `gemm_*`) by reading the HEADERS
+            // instead of guessing at prefixes.
+            //
+            // It stays a list because the principled alternative -- reading
+            // the symbol out of `record`'s argument slot -- needs a parser to
+            // tell a symbol from an `.expect` message, and got that wrong
+            // when tried. So the division is: this test pins table<->dsl
+            // drift cheaply, and the audit script is the exhaustive check.
+            // Run the script when adding a family; this list alone will not
+            // tell you what is missing.
+            [
+                "launch_",
+                "dispatch_",
+                "ops::",
+                "marlin_moe::",
+                "gemm_",
+                // `mla_absorb_`, not `mla_`: an `.expect` message reading
+                // "mla_prepare states four outputs" matched the shorter one.
+                // Every prefix here is as long as the symbols it must admit
+                // and no longer.
+                "mla_absorb_",
+                "merge_",
+                "flashinfer_",
+                "pie_lora",
+                "qwen35_verify",
+            ]
                 .iter()
                 .any(|p| s.starts_with(p))
         })

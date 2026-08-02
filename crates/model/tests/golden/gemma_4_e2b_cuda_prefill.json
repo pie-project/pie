@@ -5813,6 +5813,35 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasLora",
+              "ops": 1
+            }
+          ],
+          "else_ops": 0
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "pie_lora_qkv_correction"
+        }
+      },
+      "inputs": [
+        12,
+        14
+      ],
+      "outputs": [],
+      "layer": 0
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_rmsnorm_no_scale_bf16"
         }
@@ -5864,6 +5893,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 0
+        }
+      },
+      "inputs": [
+        16
+      ],
+      "outputs": [],
+      "layer": 0
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "ops::launch_attention_flashinfer_prefill",
           "state": {
@@ -5878,6 +5920,19 @@
       "outputs": [
         18
       ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 0
+        }
+      },
+      "inputs": [
+        18
+      ],
+      "outputs": [],
       "layer": 0
     },
     {
@@ -6073,6 +6128,35 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasLora",
+              "ops": 1
+            }
+          ],
+          "else_ops": 0
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "pie_lora_qkv_correction"
+        }
+      },
+      "inputs": [
+        32,
+        34
+      ],
+      "outputs": [],
+      "layer": 1
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_rmsnorm_no_scale_bf16"
         }
@@ -6124,6 +6208,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 1
+        }
+      },
+      "inputs": [
+        36
+      ],
+      "outputs": [],
+      "layer": 1
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "ops::launch_attention_flashinfer_prefill",
           "state": {
@@ -6138,6 +6235,19 @@
       "outputs": [
         38
       ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 1
+        }
+      },
+      "inputs": [
+        38
+      ],
+      "outputs": [],
       "layer": 1
     },
     {
@@ -6333,6 +6443,35 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasLora",
+              "ops": 1
+            }
+          ],
+          "else_ops": 0
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "pie_lora_qkv_correction"
+        }
+      },
+      "inputs": [
+        52,
+        54
+      ],
+      "outputs": [],
+      "layer": 2
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_rmsnorm_no_scale_bf16"
         }
@@ -6384,6 +6523,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 2
+        }
+      },
+      "inputs": [
+        56
+      ],
+      "outputs": [],
+      "layer": 2
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "ops::launch_attention_flashinfer_prefill",
           "state": {
@@ -6398,6 +6550,19 @@
       "outputs": [
         58
       ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 2
+        }
+      },
+      "inputs": [
+        58
+      ],
+      "outputs": [],
       "layer": 2
     },
     {
@@ -6593,6 +6758,35 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasLora",
+              "ops": 1
+            }
+          ],
+          "else_ops": 0
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "pie_lora_qkv_correction"
+        }
+      },
+      "inputs": [
+        72,
+        74
+      ],
+      "outputs": [],
+      "layer": 3
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_rmsnorm_no_scale_bf16"
         }
@@ -6644,6 +6838,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 3
+        }
+      },
+      "inputs": [
+        76
+      ],
+      "outputs": [],
+      "layer": 3
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "ops::launch_attention_flashinfer_prefill",
           "state": {
@@ -6658,6 +6865,19 @@
       "outputs": [
         78
       ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 3
+        }
+      },
+      "inputs": [
+        78
+      ],
+      "outputs": [],
       "layer": 3
     },
     {
@@ -6853,6 +7073,35 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasLora",
+              "ops": 1
+            }
+          ],
+          "else_ops": 0
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "pie_lora_qkv_correction"
+        }
+      },
+      "inputs": [
+        92,
+        94
+      ],
+      "outputs": [],
+      "layer": 4
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_rmsnorm_no_scale_bf16"
         }
@@ -6931,6 +7180,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 4
+        }
+      },
+      "inputs": [
+        98
+      ],
+      "outputs": [],
+      "layer": 4
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "ops::launch_attention_naive_paged",
           "state": {
@@ -6945,6 +7207,19 @@
       "outputs": [
         100
       ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 4
+        }
+      },
+      "inputs": [
+        100
+      ],
+      "outputs": [],
       "layer": 4
     },
     {
@@ -7140,6 +7415,35 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasLora",
+              "ops": 1
+            }
+          ],
+          "else_ops": 0
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "pie_lora_qkv_correction"
+        }
+      },
+      "inputs": [
+        114,
+        116
+      ],
+      "outputs": [],
+      "layer": 5
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_rmsnorm_no_scale_bf16"
         }
@@ -7191,6 +7495,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 5
+        }
+      },
+      "inputs": [
+        118
+      ],
+      "outputs": [],
+      "layer": 5
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "ops::launch_attention_flashinfer_prefill",
           "state": {
@@ -7205,6 +7522,19 @@
       "outputs": [
         120
       ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 5
+        }
+      },
+      "inputs": [
+        120
+      ],
+      "outputs": [],
       "layer": 5
     },
     {
@@ -7400,6 +7730,35 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasLora",
+              "ops": 1
+            }
+          ],
+          "else_ops": 0
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "pie_lora_qkv_correction"
+        }
+      },
+      "inputs": [
+        134,
+        136
+      ],
+      "outputs": [],
+      "layer": 6
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_rmsnorm_no_scale_bf16"
         }
@@ -7451,6 +7810,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 6
+        }
+      },
+      "inputs": [
+        138
+      ],
+      "outputs": [],
+      "layer": 6
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "ops::launch_attention_flashinfer_prefill",
           "state": {
@@ -7465,6 +7837,19 @@
       "outputs": [
         140
       ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 6
+        }
+      },
+      "inputs": [
+        140
+      ],
+      "outputs": [],
       "layer": 6
     },
     {
@@ -7660,6 +8045,35 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasLora",
+              "ops": 1
+            }
+          ],
+          "else_ops": 0
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "pie_lora_qkv_correction"
+        }
+      },
+      "inputs": [
+        154,
+        156
+      ],
+      "outputs": [],
+      "layer": 7
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_rmsnorm_no_scale_bf16"
         }
@@ -7711,6 +8125,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 7
+        }
+      },
+      "inputs": [
+        158
+      ],
+      "outputs": [],
+      "layer": 7
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "ops::launch_attention_flashinfer_prefill",
           "state": {
@@ -7725,6 +8152,19 @@
       "outputs": [
         160
       ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 7
+        }
+      },
+      "inputs": [
+        160
+      ],
+      "outputs": [],
       "layer": 7
     },
     {
@@ -7920,6 +8360,35 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasLora",
+              "ops": 1
+            }
+          ],
+          "else_ops": 0
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "pie_lora_qkv_correction"
+        }
+      },
+      "inputs": [
+        174,
+        176
+      ],
+      "outputs": [],
+      "layer": 8
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_rmsnorm_no_scale_bf16"
         }
@@ -7971,6 +8440,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 8
+        }
+      },
+      "inputs": [
+        178
+      ],
+      "outputs": [],
+      "layer": 8
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "ops::launch_attention_flashinfer_prefill",
           "state": {
@@ -7985,6 +8467,19 @@
       "outputs": [
         180
       ],
+      "layer": 8
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 8
+        }
+      },
+      "inputs": [
+        180
+      ],
+      "outputs": [],
       "layer": 8
     },
     {
@@ -8180,6 +8675,35 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasLora",
+              "ops": 1
+            }
+          ],
+          "else_ops": 0
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "pie_lora_qkv_correction"
+        }
+      },
+      "inputs": [
+        194,
+        196
+      ],
+      "outputs": [],
+      "layer": 9
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_rmsnorm_no_scale_bf16"
         }
@@ -8258,6 +8782,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 9
+        }
+      },
+      "inputs": [
+        200
+      ],
+      "outputs": [],
+      "layer": 9
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "ops::launch_attention_naive_paged",
           "state": {
@@ -8272,6 +8809,19 @@
       "outputs": [
         202
       ],
+      "layer": 9
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 9
+        }
+      },
+      "inputs": [
+        202
+      ],
+      "outputs": [],
       "layer": 9
     },
     {
@@ -8467,6 +9017,35 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasLora",
+              "ops": 1
+            }
+          ],
+          "else_ops": 0
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "pie_lora_qkv_correction"
+        }
+      },
+      "inputs": [
+        216,
+        218
+      ],
+      "outputs": [],
+      "layer": 10
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_rmsnorm_no_scale_bf16"
         }
@@ -8518,6 +9097,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 10
+        }
+      },
+      "inputs": [
+        220
+      ],
+      "outputs": [],
+      "layer": 10
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "ops::launch_attention_flashinfer_prefill",
           "state": {
@@ -8532,6 +9124,19 @@
       "outputs": [
         222
       ],
+      "layer": 10
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 10
+        }
+      },
+      "inputs": [
+        222
+      ],
+      "outputs": [],
       "layer": 10
     },
     {
@@ -8727,6 +9332,35 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasLora",
+              "ops": 1
+            }
+          ],
+          "else_ops": 0
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "pie_lora_qkv_correction"
+        }
+      },
+      "inputs": [
+        236,
+        238
+      ],
+      "outputs": [],
+      "layer": 11
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_rmsnorm_no_scale_bf16"
         }
@@ -8778,6 +9412,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 11
+        }
+      },
+      "inputs": [
+        240
+      ],
+      "outputs": [],
+      "layer": 11
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "ops::launch_attention_flashinfer_prefill",
           "state": {
@@ -8792,6 +9439,19 @@
       "outputs": [
         242
       ],
+      "layer": 11
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 11
+        }
+      },
+      "inputs": [
+        242
+      ],
+      "outputs": [],
       "layer": 11
     },
     {
@@ -8987,6 +9647,35 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasLora",
+              "ops": 1
+            }
+          ],
+          "else_ops": 0
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "pie_lora_qkv_correction"
+        }
+      },
+      "inputs": [
+        256,
+        258
+      ],
+      "outputs": [],
+      "layer": 12
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_rmsnorm_no_scale_bf16"
         }
@@ -9038,6 +9727,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 12
+        }
+      },
+      "inputs": [
+        260
+      ],
+      "outputs": [],
+      "layer": 12
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "ops::launch_attention_flashinfer_prefill",
           "state": {
@@ -9052,6 +9754,19 @@
       "outputs": [
         262
       ],
+      "layer": 12
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 12
+        }
+      },
+      "inputs": [
+        262
+      ],
+      "outputs": [],
       "layer": 12
     },
     {
@@ -9247,6 +9962,35 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasLora",
+              "ops": 1
+            }
+          ],
+          "else_ops": 0
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "pie_lora_qkv_correction"
+        }
+      },
+      "inputs": [
+        276,
+        278
+      ],
+      "outputs": [],
+      "layer": 13
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_rmsnorm_no_scale_bf16"
         }
@@ -9298,6 +10042,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 13
+        }
+      },
+      "inputs": [
+        280
+      ],
+      "outputs": [],
+      "layer": 13
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "ops::launch_attention_flashinfer_prefill",
           "state": {
@@ -9312,6 +10069,19 @@
       "outputs": [
         282
       ],
+      "layer": 13
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 13
+        }
+      },
+      "inputs": [
+        282
+      ],
+      "outputs": [],
       "layer": 13
     },
     {
@@ -9507,6 +10277,35 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasLora",
+              "ops": 1
+            }
+          ],
+          "else_ops": 0
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "pie_lora_qkv_correction"
+        }
+      },
+      "inputs": [
+        296,
+        298
+      ],
+      "outputs": [],
+      "layer": 14
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_rmsnorm_no_scale_bf16"
         }
@@ -9585,6 +10384,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 14
+        }
+      },
+      "inputs": [
+        302
+      ],
+      "outputs": [],
+      "layer": 14
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "ops::launch_attention_naive_paged",
           "state": {
@@ -9599,6 +10411,19 @@
       "outputs": [
         304
       ],
+      "layer": 14
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 14
+        }
+      },
+      "inputs": [
+        304
+      ],
+      "outputs": [],
       "layer": 14
     },
     {
@@ -9794,6 +10619,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 15
+        }
+      },
+      "inputs": [
+        318
+      ],
+      "outputs": [],
+      "layer": 15
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "ops::launch_attention_flashinfer_prefill",
           "state": {
@@ -9809,6 +10647,19 @@
         319
       ],
       "layer": 13
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 15
+        }
+      },
+      "inputs": [
+        319
+      ],
+      "outputs": [],
+      "layer": 15
     },
     {
       "kind": {
@@ -10003,6 +10854,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 16
+        }
+      },
+      "inputs": [
+        333
+      ],
+      "outputs": [],
+      "layer": 16
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "ops::launch_attention_flashinfer_prefill",
           "state": {
@@ -10018,6 +10882,19 @@
         334
       ],
       "layer": 13
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 16
+        }
+      },
+      "inputs": [
+        334
+      ],
+      "outputs": [],
+      "layer": 16
     },
     {
       "kind": {
@@ -10212,6 +11089,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 17
+        }
+      },
+      "inputs": [
+        348
+      ],
+      "outputs": [],
+      "layer": 17
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "ops::launch_attention_flashinfer_prefill",
           "state": {
@@ -10227,6 +11117,19 @@
         349
       ],
       "layer": 13
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 17
+        }
+      },
+      "inputs": [
+        349
+      ],
+      "outputs": [],
+      "layer": 17
     },
     {
       "kind": {
@@ -10421,6 +11324,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 18
+        }
+      },
+      "inputs": [
+        363
+      ],
+      "outputs": [],
+      "layer": 18
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "ops::launch_attention_flashinfer_prefill",
           "state": {
@@ -10436,6 +11352,19 @@
         364
       ],
       "layer": 13
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 18
+        }
+      },
+      "inputs": [
+        364
+      ],
+      "outputs": [],
+      "layer": 18
     },
     {
       "kind": {
@@ -10642,6 +11571,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 19
+        }
+      },
+      "inputs": [
+        379
+      ],
+      "outputs": [],
+      "layer": 19
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "ops::launch_attention_naive_paged",
           "state": {
@@ -10657,6 +11599,19 @@
         380
       ],
       "layer": 14
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 19
+        }
+      },
+      "inputs": [
+        380
+      ],
+      "outputs": [],
+      "layer": 19
     },
     {
       "kind": {
@@ -10851,6 +11806,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 20
+        }
+      },
+      "inputs": [
+        394
+      ],
+      "outputs": [],
+      "layer": 20
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "ops::launch_attention_flashinfer_prefill",
           "state": {
@@ -10866,6 +11834,19 @@
         395
       ],
       "layer": 13
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 20
+        }
+      },
+      "inputs": [
+        395
+      ],
+      "outputs": [],
+      "layer": 20
     },
     {
       "kind": {
@@ -11060,6 +12041,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 21
+        }
+      },
+      "inputs": [
+        409
+      ],
+      "outputs": [],
+      "layer": 21
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "ops::launch_attention_flashinfer_prefill",
           "state": {
@@ -11075,6 +12069,19 @@
         410
       ],
       "layer": 13
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 21
+        }
+      },
+      "inputs": [
+        410
+      ],
+      "outputs": [],
+      "layer": 21
     },
     {
       "kind": {
@@ -11269,6 +12276,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 22
+        }
+      },
+      "inputs": [
+        424
+      ],
+      "outputs": [],
+      "layer": 22
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "ops::launch_attention_flashinfer_prefill",
           "state": {
@@ -11284,6 +12304,19 @@
         425
       ],
       "layer": 13
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 22
+        }
+      },
+      "inputs": [
+        425
+      ],
+      "outputs": [],
+      "layer": 22
     },
     {
       "kind": {
@@ -11478,6 +12511,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 23
+        }
+      },
+      "inputs": [
+        439
+      ],
+      "outputs": [],
+      "layer": 23
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "ops::launch_attention_flashinfer_prefill",
           "state": {
@@ -11493,6 +12539,19 @@
         440
       ],
       "layer": 13
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 23
+        }
+      },
+      "inputs": [
+        440
+      ],
+      "outputs": [],
+      "layer": 23
     },
     {
       "kind": {
@@ -11699,6 +12758,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 24
+        }
+      },
+      "inputs": [
+        455
+      ],
+      "outputs": [],
+      "layer": 24
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "ops::launch_attention_naive_paged",
           "state": {
@@ -11714,6 +12786,19 @@
         456
       ],
       "layer": 14
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 24
+        }
+      },
+      "inputs": [
+        456
+      ],
+      "outputs": [],
+      "layer": 24
     },
     {
       "kind": {
@@ -11908,6 +12993,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 25
+        }
+      },
+      "inputs": [
+        470
+      ],
+      "outputs": [],
+      "layer": 25
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "ops::launch_attention_flashinfer_prefill",
           "state": {
@@ -11923,6 +13021,19 @@
         471
       ],
       "layer": 13
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 25
+        }
+      },
+      "inputs": [
+        471
+      ],
+      "outputs": [],
+      "layer": 25
     },
     {
       "kind": {
@@ -12117,6 +13228,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 26
+        }
+      },
+      "inputs": [
+        485
+      ],
+      "outputs": [],
+      "layer": 26
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "ops::launch_attention_flashinfer_prefill",
           "state": {
@@ -12132,6 +13256,19 @@
         486
       ],
       "layer": 13
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 26
+        }
+      },
+      "inputs": [
+        486
+      ],
+      "outputs": [],
+      "layer": 26
     },
     {
       "kind": {
@@ -12326,6 +13463,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 27
+        }
+      },
+      "inputs": [
+        500
+      ],
+      "outputs": [],
+      "layer": 27
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "ops::launch_attention_flashinfer_prefill",
           "state": {
@@ -12341,6 +13491,19 @@
         501
       ],
       "layer": 13
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 27
+        }
+      },
+      "inputs": [
+        501
+      ],
+      "outputs": [],
+      "layer": 27
     },
     {
       "kind": {
@@ -12535,6 +13698,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 28
+        }
+      },
+      "inputs": [
+        515
+      ],
+      "outputs": [],
+      "layer": 28
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "ops::launch_attention_flashinfer_prefill",
           "state": {
@@ -12550,6 +13726,19 @@
         516
       ],
       "layer": 13
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 28
+        }
+      },
+      "inputs": [
+        516
+      ],
+      "outputs": [],
+      "layer": 28
     },
     {
       "kind": {
@@ -12756,6 +13945,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 29
+        }
+      },
+      "inputs": [
+        531
+      ],
+      "outputs": [],
+      "layer": 29
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "ops::launch_attention_naive_paged",
           "state": {
@@ -12771,6 +13973,19 @@
         532
       ],
       "layer": 14
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 29
+        }
+      },
+      "inputs": [
+        532
+      ],
+      "outputs": [],
+      "layer": 29
     },
     {
       "kind": {
@@ -12965,6 +14180,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 30
+        }
+      },
+      "inputs": [
+        546
+      ],
+      "outputs": [],
+      "layer": 30
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "ops::launch_attention_flashinfer_prefill",
           "state": {
@@ -12980,6 +14208,19 @@
         547
       ],
       "layer": 13
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 30
+        }
+      },
+      "inputs": [
+        547
+      ],
+      "outputs": [],
+      "layer": 30
     },
     {
       "kind": {
@@ -13174,6 +14415,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 31
+        }
+      },
+      "inputs": [
+        561
+      ],
+      "outputs": [],
+      "layer": 31
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "ops::launch_attention_flashinfer_prefill",
           "state": {
@@ -13189,6 +14443,19 @@
         562
       ],
       "layer": 13
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 31
+        }
+      },
+      "inputs": [
+        562
+      ],
+      "outputs": [],
+      "layer": 31
     },
     {
       "kind": {
@@ -13383,6 +14650,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 32
+        }
+      },
+      "inputs": [
+        576
+      ],
+      "outputs": [],
+      "layer": 32
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "ops::launch_attention_flashinfer_prefill",
           "state": {
@@ -13398,6 +14678,19 @@
         577
       ],
       "layer": 13
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 32
+        }
+      },
+      "inputs": [
+        577
+      ],
+      "outputs": [],
+      "layer": 32
     },
     {
       "kind": {
@@ -13592,6 +14885,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 33
+        }
+      },
+      "inputs": [
+        591
+      ],
+      "outputs": [],
+      "layer": 33
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "ops::launch_attention_flashinfer_prefill",
           "state": {
@@ -13607,6 +14913,19 @@
         592
       ],
       "layer": 13
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 33
+        }
+      },
+      "inputs": [
+        592
+      ],
+      "outputs": [],
+      "layer": 33
     },
     {
       "kind": {
@@ -13813,6 +15132,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 34
+        }
+      },
+      "inputs": [
+        607
+      ],
+      "outputs": [],
+      "layer": 34
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "ops::launch_attention_naive_paged",
           "state": {
@@ -13828,6 +15160,19 @@
         608
       ],
       "layer": 14
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 34
+        }
+      },
+      "inputs": [
+        608
+      ],
+      "outputs": [],
+      "layer": 34
     },
     {
       "kind": {
@@ -14028,6 +15373,439 @@
         622
       ],
       "layer": null
+    }
+  ],
+  "seams": [
+    {
+      "seam": "in"
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 0,
+      "op": 13
+    },
+    {
+      "seam": "attn.q",
+      "layer": 0,
+      "op": 18
+    },
+    {
+      "seam": "attn.out",
+      "layer": 0,
+      "op": 20
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 1,
+      "op": 33
+    },
+    {
+      "seam": "attn.q",
+      "layer": 1,
+      "op": 38
+    },
+    {
+      "seam": "attn.out",
+      "layer": 1,
+      "op": 40
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 2,
+      "op": 53
+    },
+    {
+      "seam": "attn.q",
+      "layer": 2,
+      "op": 58
+    },
+    {
+      "seam": "attn.out",
+      "layer": 2,
+      "op": 60
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 3,
+      "op": 73
+    },
+    {
+      "seam": "attn.q",
+      "layer": 3,
+      "op": 78
+    },
+    {
+      "seam": "attn.out",
+      "layer": 3,
+      "op": 80
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 4,
+      "op": 93
+    },
+    {
+      "seam": "attn.q",
+      "layer": 4,
+      "op": 100
+    },
+    {
+      "seam": "attn.out",
+      "layer": 4,
+      "op": 102
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 5,
+      "op": 115
+    },
+    {
+      "seam": "attn.q",
+      "layer": 5,
+      "op": 120
+    },
+    {
+      "seam": "attn.out",
+      "layer": 5,
+      "op": 122
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 6,
+      "op": 135
+    },
+    {
+      "seam": "attn.q",
+      "layer": 6,
+      "op": 140
+    },
+    {
+      "seam": "attn.out",
+      "layer": 6,
+      "op": 142
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 7,
+      "op": 155
+    },
+    {
+      "seam": "attn.q",
+      "layer": 7,
+      "op": 160
+    },
+    {
+      "seam": "attn.out",
+      "layer": 7,
+      "op": 162
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 8,
+      "op": 175
+    },
+    {
+      "seam": "attn.q",
+      "layer": 8,
+      "op": 180
+    },
+    {
+      "seam": "attn.out",
+      "layer": 8,
+      "op": 182
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 9,
+      "op": 195
+    },
+    {
+      "seam": "attn.q",
+      "layer": 9,
+      "op": 202
+    },
+    {
+      "seam": "attn.out",
+      "layer": 9,
+      "op": 204
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 10,
+      "op": 217
+    },
+    {
+      "seam": "attn.q",
+      "layer": 10,
+      "op": 222
+    },
+    {
+      "seam": "attn.out",
+      "layer": 10,
+      "op": 224
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 11,
+      "op": 237
+    },
+    {
+      "seam": "attn.q",
+      "layer": 11,
+      "op": 242
+    },
+    {
+      "seam": "attn.out",
+      "layer": 11,
+      "op": 244
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 12,
+      "op": 257
+    },
+    {
+      "seam": "attn.q",
+      "layer": 12,
+      "op": 262
+    },
+    {
+      "seam": "attn.out",
+      "layer": 12,
+      "op": 264
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 13,
+      "op": 277
+    },
+    {
+      "seam": "attn.q",
+      "layer": 13,
+      "op": 282
+    },
+    {
+      "seam": "attn.out",
+      "layer": 13,
+      "op": 284
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 14,
+      "op": 297
+    },
+    {
+      "seam": "attn.q",
+      "layer": 14,
+      "op": 304
+    },
+    {
+      "seam": "attn.out",
+      "layer": 14,
+      "op": 306
+    },
+    {
+      "seam": "attn.q",
+      "layer": 15,
+      "op": 319
+    },
+    {
+      "seam": "attn.out",
+      "layer": 15,
+      "op": 321
+    },
+    {
+      "seam": "attn.q",
+      "layer": 16,
+      "op": 334
+    },
+    {
+      "seam": "attn.out",
+      "layer": 16,
+      "op": 336
+    },
+    {
+      "seam": "attn.q",
+      "layer": 17,
+      "op": 349
+    },
+    {
+      "seam": "attn.out",
+      "layer": 17,
+      "op": 351
+    },
+    {
+      "seam": "attn.q",
+      "layer": 18,
+      "op": 364
+    },
+    {
+      "seam": "attn.out",
+      "layer": 18,
+      "op": 366
+    },
+    {
+      "seam": "attn.q",
+      "layer": 19,
+      "op": 380
+    },
+    {
+      "seam": "attn.out",
+      "layer": 19,
+      "op": 382
+    },
+    {
+      "seam": "attn.q",
+      "layer": 20,
+      "op": 395
+    },
+    {
+      "seam": "attn.out",
+      "layer": 20,
+      "op": 397
+    },
+    {
+      "seam": "attn.q",
+      "layer": 21,
+      "op": 410
+    },
+    {
+      "seam": "attn.out",
+      "layer": 21,
+      "op": 412
+    },
+    {
+      "seam": "attn.q",
+      "layer": 22,
+      "op": 425
+    },
+    {
+      "seam": "attn.out",
+      "layer": 22,
+      "op": 427
+    },
+    {
+      "seam": "attn.q",
+      "layer": 23,
+      "op": 440
+    },
+    {
+      "seam": "attn.out",
+      "layer": 23,
+      "op": 442
+    },
+    {
+      "seam": "attn.q",
+      "layer": 24,
+      "op": 456
+    },
+    {
+      "seam": "attn.out",
+      "layer": 24,
+      "op": 458
+    },
+    {
+      "seam": "attn.q",
+      "layer": 25,
+      "op": 471
+    },
+    {
+      "seam": "attn.out",
+      "layer": 25,
+      "op": 473
+    },
+    {
+      "seam": "attn.q",
+      "layer": 26,
+      "op": 486
+    },
+    {
+      "seam": "attn.out",
+      "layer": 26,
+      "op": 488
+    },
+    {
+      "seam": "attn.q",
+      "layer": 27,
+      "op": 501
+    },
+    {
+      "seam": "attn.out",
+      "layer": 27,
+      "op": 503
+    },
+    {
+      "seam": "attn.q",
+      "layer": 28,
+      "op": 516
+    },
+    {
+      "seam": "attn.out",
+      "layer": 28,
+      "op": 518
+    },
+    {
+      "seam": "attn.q",
+      "layer": 29,
+      "op": 532
+    },
+    {
+      "seam": "attn.out",
+      "layer": 29,
+      "op": 534
+    },
+    {
+      "seam": "attn.q",
+      "layer": 30,
+      "op": 547
+    },
+    {
+      "seam": "attn.out",
+      "layer": 30,
+      "op": 549
+    },
+    {
+      "seam": "attn.q",
+      "layer": 31,
+      "op": 562
+    },
+    {
+      "seam": "attn.out",
+      "layer": 31,
+      "op": 564
+    },
+    {
+      "seam": "attn.q",
+      "layer": 32,
+      "op": 577
+    },
+    {
+      "seam": "attn.out",
+      "layer": 32,
+      "op": 579
+    },
+    {
+      "seam": "attn.q",
+      "layer": 33,
+      "op": 592
+    },
+    {
+      "seam": "attn.out",
+      "layer": 33,
+      "op": 594
+    },
+    {
+      "seam": "attn.q",
+      "layer": 34,
+      "op": 608
+    },
+    {
+      "seam": "attn.out",
+      "layer": 34,
+      "op": 610
+    },
+    {
+      "seam": "out"
     }
   ]
 }

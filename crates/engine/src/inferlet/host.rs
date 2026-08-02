@@ -45,7 +45,7 @@ impl crate::pipeline::fire::FireContext for ProcessCtx {
 }
 
 wasmtime::component::bindgen!({
-    path: "../inferlet-api/wit",
+    path: "../inferlet/wit",
     world: "inferlet",
     // wasmtime 46 split `wasmtime::Error` from `anyhow::Error`; keep the
     // generated host traits on `anyhow::Result` so the existing host/*.rs

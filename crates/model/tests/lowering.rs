@@ -109,6 +109,38 @@ fn the_qwen3_5_residue_ledger() {
 /// One entry per (kind, reason), counted per DECODE fire.
 const LEDGER_QWEN35_DECODE: &[&str] = &[];
 
+/// The ALIGNED MoE leg lowers — the wall the north-star doc named.
+///
+/// `the_moe_block_covers_itself_only_in_its_cuda_reading` above already
+/// covered the FUSED CUTLASS leg, which is the one a decode fire inside the
+/// row bound takes. Every other fire fell back to the semantic body, and the
+/// semantic body cannot lower — it names no kernels. That was the wall: the
+/// aligned path's intermediates are `ceil((N·k + min(E, N·k)·(block-1)) /
+/// block) · block` rows tall, an extent no `Dim` spelled.
+///
+/// `Dim::MoeAlignedRoutes` spells it, so the leg has a CUDA text and this
+/// asserts what that buys: residue empty, coverage 1.0, on a deployment
+/// whose facts disqualify the fused leg.
+#[test]
+fn the_aligned_moe_leg_lowers() {
+    let facts = model::qwen_3_5::forward::facts::Qwen35MoeMlpFacts::qwen3_5_35b_a3b();
+    // No CUTLASS workspace: the fused leg does not exist for this
+    // deployment, so the text takes the aligned one.
+    let mut cuda = model::qwen_3_5::forward::facts::Qwen35CudaFacts::qwen3_5_0_8b_synthetic();
+    cuda.moe_cutlass_max_rows = 0;
+
+    let plan = model::qwen_3_5::forward::qwen3_5_moe_mlp_block_cuda(&facts, &cuda);
+    let out = lower(&plan, &sampled(4), Fire::default())
+        .unwrap_or_else(|e| panic!("the aligned MoE leg must lower: {e:?}"));
+    assert!(
+        out.residue.is_empty(),
+        "{} aligned-leg statements still owe a declaration: {:#?}",
+        out.residue.len(),
+        out.residue
+    );
+    assert_eq!(out.coverage(), 1.0);
+}
+
 /// THE QWEN3_5 CUTOVER GATE, in the shape llama_like's takes: every
 /// statement a live fire executes is a rectangle in the flat list,
 /// on both geometries and in both classes.
@@ -725,4 +757,189 @@ fn the_arena_is_deterministic() {
     let b = Buffers::assign(&plan, &plain(8));
     assert_eq!(a.offset, b.offset);
     assert_eq!(a.bytes, b.bytes);
+}
+
+/// Not an assertion so much as a printout: `-- --ignored --nocapture` dumps
+/// the aligned MoE leg's op sequence, which is the list the driver's declared
+/// executor has to answer arm for arm.
+#[test]
+#[ignore]
+fn dump_the_aligned_moe_leg() {
+    let facts = model::qwen_3_5::forward::facts::Qwen35MoeMlpFacts::qwen3_5_35b_a3b();
+    let mut cuda = model::qwen_3_5::forward::facts::Qwen35CudaFacts::qwen3_5_0_8b_synthetic();
+    cuda.moe_cutlass_max_rows = 0;
+    let plan = model::qwen_3_5::forward::qwen3_5_moe_mlp_block_cuda(&facts, &cuda);
+    for (i, op) in plan.ops.iter().enumerate() {
+        println!("{i:3}  {:?}", op.kind);
+    }
+}
+
+/// Same printout for gemma-4's CUDA decode text — the driver refuses this
+/// plan on a kernel it does not have an arm for, and the trace is where to
+/// see which.
+#[test]
+#[ignore]
+fn dump_gemma4_cuda_kernels() {
+    let f = model::gemma_4::forward::facts::Gemma4Facts::gemma_4_e4b();
+    let cuda = model::gemma_4::forward::facts::Gemma4CudaFacts::gemma_4_e4b_synthetic();
+    let plan = model::gemma_4::forward::gemma4_cuda(&f, &cuda, FireClass::Decode);
+    let mut names: Vec<String> = plan
+        .ops
+        .iter()
+        .filter_map(|o| match &o.kind {
+            OpKind::Launch { kernel, .. } => Some(kernel.clone()),
+            _ => None,
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    for n in names {
+        println!("KERNEL {n}");
+    }
+}
+
+/// gpt-oss's stated CUDA kernels. The hand-written pass is the broken side
+/// for this family (`.wiki/tart/status.md`), and the declared drive is
+/// clean, so the DIFFERENCE between what the declaration says and what
+/// `mixtral.cpp` fires is the suspect set -- a directed search, where the
+/// env knobs have run out.
+#[test]
+#[ignore]
+fn dump_gpt_oss_cuda_kernels() {
+    let f = model::gpt_oss::forward::facts::GptOssFacts::gpt_oss_20b();
+    let cuda = model::gpt_oss::forward::facts::GptOssCudaFacts::gpt_oss_20b_synthetic();
+    for class in [FireClass::Decode, FireClass::Prefill] {
+        let plan = model::gpt_oss::forward::gpt_oss_cuda(&f, &cuda, class);
+        let mut names: Vec<String> = plan
+            .ops
+            .iter()
+            .filter_map(|o| match &o.kind {
+                OpKind::Launch { kernel, .. } => Some(kernel.clone()),
+                _ => None,
+            })
+            .collect();
+        names.sort();
+        names.dedup();
+        println!("== {class:?}");
+        for n in names {
+            println!("  {n}");
+        }
+    }
+}
+
+/// glm5's CUDA decode text lowers with nothing left over.
+///
+/// The gate every declaration is measured against: residue empty means
+/// the flat list IS the whole of what the fire executes, and only then
+/// could a driver stop walking. glm5 has no declared executor yet, so
+/// this is the check that the TEXT is finished — the executor is the
+/// next question, not this one.
+#[test]
+fn the_glm5_decode_text_lowers() {
+    let facts = model::glm5::forward::facts::Glm5Facts::glm5_106b_a12b();
+    let plan = model::glm5::forward::glm5_cuda(&facts, FireClass::Decode);
+    let out = lower(&plan, &sampled(1), Fire::default())
+        .unwrap_or_else(|e| panic!("glm5's decode text must lower: {e:?}"));
+    assert!(
+        out.residue.is_empty(),
+        "{} glm5 statement(s) still owe a declaration: {:#?}",
+        out.residue.len(),
+        out.residue
+    );
+    assert_eq!(out.coverage(), 1.0);
+}
+
+/// kimi's CUDA decode text lowers with nothing left over — the fused
+/// latent binding and the split one both, since which is bound is a fact
+/// and a fact that only lowers one way is a fact stated wrong.
+#[test]
+fn the_kimi_decode_text_lowers() {
+    use model::kimi_k2::forward::facts::{KimiCudaFacts, KimiFacts};
+    let facts = KimiFacts::kimi_k2();
+    for fused in [true, false] {
+        let cuda = KimiCudaFacts {
+            q_kv_a_fused: fused,
+            ..KimiCudaFacts::kimi_k2_synthetic()
+        };
+        let plan = model::kimi_k2::forward::kimi_cuda(&facts, &cuda, FireClass::Decode);
+        let out = lower(&plan, &sampled(1), Fire::default())
+            .unwrap_or_else(|e| panic!("kimi (fused={fused}) must lower: {e:?}"));
+        assert!(
+            out.residue.is_empty(),
+            "fused={fused}: {} statement(s) still owe a declaration: {:#?}",
+            out.residue.len(),
+            out.residue
+        );
+        assert_eq!(out.coverage(), 1.0);
+    }
+}
+
+/// kimi_k3's CUDA decode text lowers with nothing left over.
+///
+/// The hybrid matters here: the fixture's schedule puts both an MLA layer
+/// and a KDA layer in the plan, so this covers both halves — a text that
+/// only lowered one would pass a single-kind fixture and fail the first
+/// real deployment.
+#[test]
+fn the_kimi_k3_decode_text_lowers() {
+    use model::kimi_k3::forward::facts::KimiK3Facts;
+    let facts = KimiK3Facts::kimi_k3_synthetic();
+    assert!(
+        (0..facts.layers).any(|l| facts.is_full_attn(l))
+            && (0..facts.layers).any(|l| !facts.is_full_attn(l)),
+        "the fixture must exercise BOTH halves of the hybrid"
+    );
+    let plan = model::kimi_k3::forward::kimi_k3_cuda(&facts, FireClass::Decode);
+    let out = lower(&plan, &sampled(1), Fire::default())
+        .unwrap_or_else(|e| panic!("kimi_k3's decode text must lower: {e:?}"));
+    assert!(
+        out.residue.is_empty(),
+        "{} statement(s) still owe a declaration: {:#?}",
+        out.residue.len(),
+        out.residue
+    );
+    assert_eq!(out.coverage(), 1.0);
+}
+
+/// deepseek_v4's CUDA decode text lowers with nothing left over.
+///
+/// The two schemes this family alone carries are what the gate is for:
+/// a rank-K residual that never spells `y += ...`, and a two-pass
+/// attention combined by its LSEs.
+#[test]
+fn the_deepseek_v4_decode_text_lowers() {
+    use model::deepseek_v4::forward::facts::Dsv4Facts;
+    let facts = Dsv4Facts::dsv4_synthetic();
+    let plan = model::deepseek_v4::forward::dsv4_cuda(&facts, FireClass::Decode);
+    let out = lower(&plan, &sampled(1), Fire::default())
+        .unwrap_or_else(|e| panic!("deepseek_v4's decode text must lower: {e:?}"));
+    assert!(
+        out.residue.is_empty(),
+        "{} statement(s) still owe a declaration: {:#?}",
+        out.residue.len(),
+        out.residue
+    );
+    assert_eq!(out.coverage(), 1.0);
+}
+
+/// nemotron_h's CUDA decode text lowers with nothing left over.
+///
+/// The fixture's own test asserts all THREE layer kinds are present, so
+/// this covers the mamba scan, the attention mixer and the mixer-less MLP
+/// layer in one plan — which is the only way to be sure a list-shaped
+/// schedule was read as a list.
+#[test]
+fn the_nemotron_h_decode_text_lowers() {
+    use model::nemotron_h::forward::facts::NemotronHFacts;
+    let facts = NemotronHFacts::nemotron_h_synthetic();
+    let plan = model::nemotron_h::forward::nemotron_h_cuda(&facts, FireClass::Decode);
+    let out = lower(&plan, &sampled(1), Fire::default())
+        .unwrap_or_else(|e| panic!("nemotron_h's decode text must lower: {e:?}"));
+    assert!(
+        out.residue.is_empty(),
+        "{} statement(s) still owe a declaration: {:#?}",
+        out.residue.len(),
+        out.residue
+    );
+    assert_eq!(out.coverage(), 1.0);
 }

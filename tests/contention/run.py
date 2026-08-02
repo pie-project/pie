@@ -17,7 +17,7 @@ driver's copy engine, and a mock driver cannot reproduce it.
 
 Environment:
   PIE_CONTENTION_SUITE_PYTHON   interpreter that has the pie server installed
-                                (default: sdk/python-server/.venv/bin/python)
+                                (default: sdk/server/python/.venv/bin/python)
   PIE_BENCH_INFERLET_DIR        prebuilt bench inferlet
                                 (default: tests/inferlets/text-completion-bench)
   PIE_CUDA_COMPAT_DIR           CUDA forward-compat driver directory to put on
@@ -44,7 +44,7 @@ from scenarios import BY_NAME, SCENARIOS, Scenario  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
 BENCH = ROOT / "benches"
-DEFAULT_PYTHON = ROOT / "sdk" / "python-server" / ".venv" / "bin" / "python"
+DEFAULT_PYTHON = ROOT / "sdk" / "server" / "python" / ".venv" / "bin" / "python"
 
 
 def _cuda_init_works(path: Path) -> bool:
@@ -330,7 +330,7 @@ def main() -> int:
 
     if not Path(args.python).exists():
         print(f"interpreter not found: {args.python}\n"
-              "build it with: uv --project sdk/python-server sync", file=sys.stderr)
+              "build it with: uv --project sdk/server/python sync", file=sys.stderr)
         return 2
 
     failures: list[str] = []

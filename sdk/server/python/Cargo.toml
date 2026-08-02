@@ -21,7 +21,7 @@ path = "src/lib.rs"
 # behavior. Build the embedded drivers into the Python engine so
 # `pie.server.Server` can host the same local flavors as `pie serve`
 # (`driver-metal` is added on Apple-Silicon builds).
-worker = { path = "../../crates/worker", default-features = false, features = ["driver-cuda", "driver-dummy"] }
+worker = { path = "../../../crates/worker", default-features = false, features = ["driver-cuda", "driver-dummy"] }
 pyo3 = { version = "0.29", features = ["extension-module"] }
 tokio = { version = "1.53", features = ["rt-multi-thread"] }
 toml = "1.1"

@@ -19,7 +19,7 @@ use model::qwen_3_5::forward::facts::{Qwen35CudaFacts, Qwen35HybridFacts};
 
 fn write_inc_at(family: &str, name: &str, contents: &str) {
     let dir = format!(
-        "{}/../crates/driver-cuda/csrc/src/model/{family}/generated",
+        "{}/../driver-cuda/csrc/src/model/{family}/generated",
         env!("CARGO_MANIFEST_DIR")
     );
     std::fs::create_dir_all(&dir).unwrap();
@@ -169,6 +169,9 @@ fn main() {
                 warp_tiled_max: 64,
                 cached_max: 0,
                 verify_stash: true,
+                // The live default: PIE_QWEN35_PREFILL_DECODE is on
+                // unless set to 0, and 0.8B's cache is native bf16.
+                prefill_decode: true,
                 // 0.8B is DENSE — it reaches no MoE op, so these are the
                 // "no fused leg" values and the emitted body is unchanged
                 // by them. A MoE emission target would set them live.

@@ -764,7 +764,11 @@ fn semantic(kind: &OpKind, peel_tail: bool) -> Semantic {
             if selector.is_none() {
                 Semantic::Kernels(&["gemm_act_x_w"])
             } else {
-                Semantic::Unlowered("a selector lowers to grouped GEMM, which the trace does not state")
+                // A selector makes the weight per-token, and the grouped
+                // GEMM is that op's lowering. It used to be a refusal
+                // because no text stated the kernel; `moe_mlp_body_cuda`'s
+                // general leg does now.
+                Semantic::Kernels(&["launch_moe_grouped_gemm_bf16"])
             }
         }
 
@@ -793,22 +797,28 @@ fn semantic(kind: &OpKind, peel_tail: bool) -> Semantic {
         // because they share one cause, and a residue ledger that says
         // "no lowering rule for this kind" three times would read as
         // three gaps instead of one missing text.
-        TopK { .. } => Semantic::Unlowered(
-            "the MoE branch has no CUDA text yet (dsl::cuda::topk states the kernel)",
-        ),
-        WeightedSum { .. } => Semantic::Unlowered(
-            "the MoE combine has two forms (token-batched vs per-expert \
-             scatter-add, and a fused +residual); the CUDA text has to \
-             state which, as the swiglu binding does",
-        ),
-        SigmoidGateAdd => Semantic::Unlowered(
-            "the shared-expert landing awaits the MoE branch's CUDA text",
-        ),
+        // The router. One launch, and the semantic reading takes the
+        // softmax form -- a text that wants the sigmoid or sqrt-softplus
+        // router states it as a `Launch` instead.
+        TopK { .. } => Semantic::Kernels(&["launch_topk_softmax_bf16"]),
+        // The combine, in its TOKEN-BATCHED form. The two other forms --
+        // the per-expert scatter-add and the fused +residual -- are what a
+        // CUDA text states as launches when its binding takes them; this
+        // is the reading a SEMANTIC trace gets, the same way `Swiglu`'s
+        // unpacked form is.
+        WeightedSum { .. } => Semantic::Kernels(&["launch_token_batched_weighted_sum_bf16"]),
+        // The shared expert's landing: `sigmoid(x·g)` scaling the shared
+        // output onto the routed sum, one launch.
+        SigmoidGateAdd => Semantic::Kernels(&["launch_sigmoid_dot_scalar_gate_add_bf16"]),
 
         // Handled by `Lowerer::epilogue`, which needs the row counts and
         // so cannot answer from the kind alone.
         LmHead { .. } => Semantic::Structural,
 
+        // A window, not a launch: `Buffers` gives its value an offset
+        // into its operand's, and there is no rectangle to emit. That is
+        // the whole of what `Select` means.
+        Select { .. } => Semantic::Structural,
         _ => Semantic::Unlowered("no lowering rule for this kind"),
     }
 }
@@ -819,6 +829,7 @@ fn kind_name(kind: &OpKind) -> &'static str {
     match kind {
         Embed { .. } => "Embed",
         Matmul { .. } => "Matmul",
+        Select { .. } => "Select",
         Rmsnorm { .. } => "Rmsnorm",
         AddBias { .. } => "AddBias",
         RmsnormPerHead { .. } => "RmsnormPerHead",
@@ -991,6 +1002,27 @@ impl Buffers {
                 free.push((offset[v as usize], size[v as usize]));
                 false
             });
+            // A `Select` allocates nothing: its value IS a window of its
+            // operand's bytes, which is the whole of what the op means.
+            // The source must therefore stay live as long as the window
+            // does — `last_use` already says so, because the window's
+            // readers are the source's readers by dataflow.
+            if let OpKind::Select { index } = op.kind {
+                let src = op.inputs[0];
+                let out = op.outputs[0];
+                let want = value_bytes(plan, out, n_tokens, n_requests);
+                if offset[src as usize] == Self::NAMED {
+                    // A window of a NAMED buffer is still the backend's
+                    // to bind; the arena has no address to offset from.
+                    offset[out as usize] = Self::NAMED;
+                } else {
+                    offset[out as usize] =
+                        offset[src as usize] + index as usize * want;
+                }
+                size[out as usize] = want;
+                live.push(out);
+                continue;
+            }
             for &v in &op.outputs {
                 if pinned.binary_search(&v).is_ok() {
                     // Reachable by name from outside the trace — the
@@ -1035,6 +1067,14 @@ pub fn value_bytes(plan: &ForwardPlan, v: ValueId, n_tokens: usize, n_requests: 
             Dim::Tokens => n_tokens,
             Dim::Requests => n_requests,
             Dim::Const(c) => *c as usize,
+            // The padded route count, which is a function of the fire's
+            // tokens and three load-time numbers -- so a residue ledger
+            // sizing this value gets the real footprint, not an estimate.
+            Dim::MoeAlignedRoutes {
+                top_k,
+                experts,
+                block,
+            } => Dim::moe_aligned_rows(n_tokens as u32, *top_k, *experts, *block) as usize,
         };
     }
     elements

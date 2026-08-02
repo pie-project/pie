@@ -61,7 +61,7 @@ jobs:
       # generated from, and `tsc` is happy to typecheck against a stale one --
       # every specifier still resolves, just to the wrong shapes. This is the
       # step that makes the build below mean something.
-      - name: Bindings are current with crates/inferlet-api/wit
+      - name: Bindings are current with crates/inferlet/wit
         if: steps.info.outputs.path == 'sdk/inferlet/javascript'
         working-directory: ${{ steps.info.outputs.path }}
         run: |

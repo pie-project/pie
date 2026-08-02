@@ -225,6 +225,13 @@ fn flatten_kind(arena: &mut PlanArena, interner: &mut Interner, kind: &OpKind) -
             0,
             PIE_FORWARD_NO_VALUE,
         ),
+        OpKind::Select { index } => (
+            PieForwardOpKind::Select,
+            PIE_FORWARD_NO_NAME,
+            *index,
+            0,
+            PIE_FORWARD_NO_VALUE,
+        ),
         OpKind::ResidualAdd => (
             PieForwardOpKind::ResidualAdd,
             PIE_FORWARD_NO_NAME,

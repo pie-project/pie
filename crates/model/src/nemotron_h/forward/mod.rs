@@ -1,0 +1,222 @@
+//! nemotron_h's forward, declared.
+//!
+//! Transcribed from `nemotron_h_forward.cpp`. The third hybrid, and the
+//! only one whose schedule is a LIST rather than an interval — and the
+//! only one with THREE layer kinds, because a bare `mlp` layer has no
+//! mixer at all. An interval cannot say that, which is why
+//! `layer_types` is carried verbatim.
+//!
+//! Mamba is the new vocabulary. GDN and KDA carry a decaying state over
+//! key/value pairs; mamba's selective scan carries an explicit
+//! `[heads, head_dim, state_size]` state and reads a per-token `dt` that
+//! decides how much of it to keep. `prepare_mamba_dt_da` is its own
+//! statement for that reason — the softplus-and-scale on `dt` and the
+//! decay `A` it pairs with are computed once per token, before the scan,
+//! not inside it.
+//!
+//! ReLU² where the other families have swiglu, and a GATED norm on the
+//! mamba output (`zamba_rmsnorm_gated`) rather than a plain one.
+
+pub mod facts;
+
+use self::facts::{NemotronHFacts, NemotronLayerKind};
+use model_compiler::dsl::{self, matmul, rmsnorm, MatW, NormW};
+use model_compiler::trace::{FireClass, ForwardPlan, NormVariant, RopeKind};
+
+struct NhLayerW {
+    norm: NormW,
+    // mamba
+    in_proj: MatW,
+    out_proj: MatW,
+    gate_norm: NormW,
+    // attention
+    q_proj: MatW,
+    k_proj: MatW,
+    v_proj: MatW,
+    o_proj: MatW,
+    // mlp / moe
+    up_proj: MatW,
+    down_proj: MatW,
+    router: MatW,
+    shared_up: MatW,
+    shared_down: MatW,
+}
+
+impl NhLayerW {
+    fn new(l: u32, f: &NemotronHFacts) -> Self {
+        let w = |name: &str| format!("layer.{l}.{name}");
+        let m = |name: &str, width: u32| MatW {
+            name: w(name),
+            width,
+            layer: Some(l),
+        };
+        let n = |name: &str| NormW {
+            name: w(name),
+            variant: NormVariant::Plain,
+            per_head: None,
+            layer: Some(l),
+        };
+        Self {
+            norm: n("norm"),
+            in_proj: m("mamba_in_proj", f.mamba.in_proj_width()),
+            out_proj: m("mamba_out_proj", f.hidden),
+            gate_norm: n("mamba_norm"),
+            q_proj: m("q_proj", f.attn.q_width()),
+            k_proj: m("k_proj", f.attn.kv_width()),
+            v_proj: m("v_proj", f.attn.kv_width()),
+            o_proj: m("o_proj", f.hidden),
+            // ReLU², so ONE projection up and one down — there is no
+            // gate half to pair with.
+            up_proj: m("up_proj", f.moe.moe_intermediate),
+            down_proj: m("down_proj", f.hidden),
+            router: m("router", f.moe.num_experts),
+            shared_up: m("shared_expert.up", f.moe.shared_intermediate),
+            shared_down: m("shared_expert.down", f.hidden),
+        }
+    }
+}
+
+/// nemotron_h's CUDA text for one fire class.
+pub fn nemotron_h_cuda(facts: &NemotronHFacts, class: FireClass) -> ForwardPlan {
+    let family = format!(
+        "nemotron_h.cuda.{}",
+        match class {
+            FireClass::Decode => "decode",
+            other => panic!("nemotron_h states no {other:?} class yet"),
+        }
+    );
+    let mb = facts.mamba.clone();
+    let at = facts.attn.clone();
+    dsl::trace_named(&family, |t| {
+        dsl::seam(t, &dsl::seam::IN, &[], None);
+        let mut y = dsl::embed_with(t, "embed", facts.hidden);
+
+        for l in 0..facts.layers() {
+            let w = NhLayerW::new(l, facts);
+            let x = rmsnorm(&y, &w.norm);
+
+            match facts.kind(l) {
+                NemotronLayerKind::Mamba => {
+                    // One projection, three things: `[z | conv_dim | dt]`.
+                    let packed = matmul(&x, &w.in_proj);
+                    let (z, conv_in, dt_raw) = dsl::cuda::nemotron_mamba_split(
+                        &packed,
+                        mb.intermediate(),
+                        mb.conv_dim(),
+                        mb.num_heads,
+                    );
+                    let rs = dsl::Rs::at(t, l);
+                    let conv_out = dsl::cuda::gdn_conv_update_batched(
+                        &conv_in,
+                        &dsl::ConvW {
+                            name: format!("layer.{l}.mamba_conv"),
+                            kernel: mb.conv_kernel,
+                            layer: l,
+                        },
+                        &rs,
+                    );
+                    // `dt` and the decay `A` are per-token and computed
+                    // ONCE, before the scan — a separate statement
+                    // because the scan reads them, it does not make them.
+                    let (a_par, _d_par, dt_bias) = dsl::cuda::nemotron_prepare_mamba_params(
+                        t,
+                        l,
+                        &format!("layer.{l}.mamba_a_log"),
+                        &format!("layer.{l}.mamba_d"),
+                        &format!("layer.{l}.mamba_dt_bias"),
+                        mb.num_heads,
+                    );
+                    let _ = dt_bias;
+                    let (dt, _da) =
+                        dsl::cuda::nemotron_prepare_mamba_dt_da(&dt_raw, &a_par, mb.num_heads);
+                    let core =
+                        dsl::cuda::nemotron_mamba_ssm(&conv_out, &dt, l, mb.intermediate());
+                    dsl::seam(core.trace(), &dsl::seam::ATTN_OUT, &[&core], Some(l));
+                    // A GATED norm, not a plain one: `z` is the gate the
+                    // split produced and the norm applies it.
+                    let o = dsl::cuda::zamba_rmsnorm_gated(
+                        &core,
+                        &z,
+                        &w.gate_norm.name,
+                        mb.intermediate(),
+                    );
+                    y += matmul(&o, &w.out_proj);
+                }
+                NemotronLayerKind::Attention => {
+                    let q = matmul(&x, &w.q_proj);
+                    let k = matmul(&x, &w.k_proj);
+                    let v = matmul(&x, &w.v_proj);
+                    let (q, k) = dsl::rope(&q, &k, RopeKind::Standard);
+                    let kv = dsl::Kv::at(t, l);
+                    dsl::cuda::write_kv_to_pages(&k, &v, &kv);
+                    dsl::seam(q.trace(), &dsl::seam::ATTN_Q, &[&q], Some(l));
+                    let o = dsl::cuda::attention_flashinfer_decode(&q, &kv)
+                        .expect("a plain attention statement produces its value");
+                    dsl::seam(o.trace(), &dsl::seam::ATTN_OUT, &[&o], Some(l));
+                    y += matmul(&o, &w.o_proj);
+                }
+                NemotronLayerKind::Mlp => {
+                    // No mixer. The layer IS its MLP, and the norm above
+                    // is the only thing before it.
+                    let up = matmul(&x, &w.up_proj);
+                    let act = dsl::cuda::relu2(&up, facts.moe.moe_intermediate);
+                    y += matmul(&act, &w.down_proj);
+                    continue;
+                }
+            }
+
+            // ── MoE, on the mixer layers ─────────────────────────────
+            let m = rmsnorm(&y, &w.norm);
+            let logits = matmul(&m, &w.router);
+            let (experts, weights) = dsl::cuda::topk_sigmoid_bias(
+                &logits,
+                &format!("layer.{l}.router_bias"),
+                facts.moe.top_k,
+            );
+            let gate_up = dsl::cuda::moe_gate_up_gemv(
+                &m,
+                &MatW {
+                    name: format!("layer.{l}.expert.{{e}}.up"),
+                    width: facts.moe.moe_intermediate,
+                    layer: Some(l),
+                },
+                &experts,
+                facts.moe.top_k,
+            );
+            let act = dsl::cuda::relu2(&gate_up, facts.moe.moe_intermediate);
+            let route_out = dsl::cuda::moe_down_gemv(
+                &act,
+                &MatW {
+                    name: format!("layer.{l}.expert.{{e}}.down"),
+                    width: facts.hidden,
+                    layer: Some(l),
+                },
+                &experts,
+                facts.moe.top_k,
+            );
+            let routed = dsl::cuda::weighted_sum(&weights, &route_out, facts.hidden, None);
+
+            let moe_out = if facts.moe.shared_intermediate > 0 {
+                let sup = matmul(&m, &w.shared_up);
+                let sact = dsl::cuda::relu2(&sup, facts.moe.shared_intermediate);
+                let shared = matmul(&sact, &w.shared_down);
+                dsl::cuda::residual_add(&routed, &shared, facts.hidden)
+            } else {
+                routed
+            };
+            y = dsl::cuda::residual_add(&y, &moe_out, facts.hidden);
+        }
+
+        let normed = rmsnorm(
+            &y,
+            &NormW {
+                name: "final_norm".to_string(),
+                variant: NormVariant::Plain,
+                per_head: None,
+                layer: None,
+            },
+        );
+        let logits = dsl::lm_head_at(t, &normed, "lm_head", facts.vocab);
+        dsl::seam(t, &dsl::seam::OUT, &[&logits], None);
+    })
+}

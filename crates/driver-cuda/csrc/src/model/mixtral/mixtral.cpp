@@ -529,8 +529,18 @@ void mixtral_forward_paged(
     // architecture, so there is no unbuilt case left to ask about and the
     // guard is withdrawn with its declaration. The same bug was reaching
     // Blackwell through this exact path.
-    if (use_decode_path && has_full_layer && R == 1 && page_size > 0 &&
-        custom_mask_d == nullptr) {
+    // PIE_MIXTRAL_FULL_SPLIT=0 takes the path out entirely, which the slice
+    // count cannot do (splits=1 still splits, still merges). Needed because
+    // this path was REFUSED on every non-sm90 device until the merge withdrew
+    // `merge_attention_states_supported()` from the gate above, so on such a
+    // device it has never been differentially tested against the single
+    // dispatch it replaces.
+    static const bool kFullSplitOn = [] {
+        const char* v = std::getenv("PIE_MIXTRAL_FULL_SPLIT");
+        return v == nullptr || v[0] != '0';
+    }();
+    if (kFullSplitOn && use_decode_path && has_full_layer && R == 1 &&
+        page_size > 0 && custom_mask_d == nullptr) {
         const int splits = kMixtralFullSplits;
         split_indptr = DeviceBuffer<std::uint32_t>::alloc(splits + 1);
         split_last = DeviceBuffer<std::uint32_t>::alloc(splits);

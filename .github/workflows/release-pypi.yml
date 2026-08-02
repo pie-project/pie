@@ -87,7 +87,7 @@ jobs:
       # This is the one that checks the world. The wheel's `import inferlet`
       # cannot run outside a componentize-py build (the smoke test below says
       # so), but componentize-py itself can be installed here, and building a
-      # component resolves every WIT import against `crates/inferlet-api/wit/` for
+      # component resolves every WIT import against `crates/inferlet/wit/` for
       # real. An interface, function, or signature the host no longer offers
       # fails at this step.
       - name: Build a component against the SDK
@@ -118,7 +118,7 @@ jobs:
                   session.send(input)
                   return "ok"
           PY
-          componentize-py -d crates/inferlet-api/wit -w inferlet componentize \
+          componentize-py -d crates/inferlet/wit -w inferlet componentize \
             -p "$RUNNER_TEMP/componentize" \
             -p sdk/inferlet/python/src \
             -p sdk/inferlet/python/src/inferlet/bindings \

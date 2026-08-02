@@ -134,6 +134,12 @@ void Gemma4Model::body(Workspace& ws,
         gemma4_declared_drive_enabled() && declared_.usable &&
         !row_decode_shaped &&
         in.custom_mask_d == nullptr && in.stage_hooks == nullptr &&
+        // A lora fire DECLINES rather than running with the adapter
+        // dropped. gemma-4 has no adapter support on either side, so the
+        // hand-written pass ignores it too -- but shared omission is not
+        // a gate, and the declared walk is the one that could be given
+        // one. (qwen3_5's arc 2 says the same about the same thing.)
+        in.lora == nullptr &&
         in.num_images == 0 && in.num_clips == 0 &&
         in.precomputed_embeddings.num_blocks == 0 &&
         fwd_cfg_.tp_size == 1;

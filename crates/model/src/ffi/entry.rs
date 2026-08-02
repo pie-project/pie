@@ -421,6 +421,8 @@ pub struct PieForwardQwen35CudaFacts {
     /// The MoE block's row bound — `kFusedMoeMaxRows` (512) when the
     /// CUTLASS workspace is sized, else 0 (no fused leg, no MoE text).
     pub moe_cutlass_max_rows: u32,
+    /// [`Qwen35CudaFacts::prefill_decode`] as the wire form.
+    pub prefill_decode: u32,
     /// `add_to_residual` (tp==1). Non-zero is true.
     pub moe_residual_fold: u8,
     /// The shared expert's gate takes the fused dot landing.
@@ -441,6 +443,7 @@ fn read_qwen35_cuda_facts(facts: &PieForwardQwen35CudaFacts) -> Qwen35CudaFacts 
         cached_max: facts.cached_max,
         verify_stash: facts.verify_stash != 0,
         moe_cutlass_max_rows: facts.moe_cutlass_max_rows,
+        prefill_decode: facts.prefill_decode != 0,
         moe_residual_fold: facts.moe_residual_fold != 0,
         moe_shared_gate_dot: facts.moe_shared_gate_dot != 0,
         moe_streamed_experts: facts.moe_streamed_experts != 0,

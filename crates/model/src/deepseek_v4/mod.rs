@@ -5,3 +5,8 @@
 
 #[cfg(feature = "contract")]
 pub mod contract;
+
+/// The declared forward — hyper-connections over compressed attention and
+/// an MoE stack.
+#[cfg(feature = "forward")]
+pub mod forward;

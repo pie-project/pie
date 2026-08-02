@@ -29,7 +29,7 @@ module-name = "pie._engine"
 manifest-path = "Cargo.toml"
 
 [tool.uv.sources]
-pie-client = { path = "../client/python", editable = true }
+pie-client = { path = "../../client/python", editable = true }
 
 [tool.uv]
 cache-keys = [
@@ -39,14 +39,14 @@ cache-keys = [
     # The embedded engine compiles the whole runtime + driver + WIT surface;
     # without these keys a source edit there serves a stale cached wheel. Every
     # crate lives under `crates/` now, so this is one glob instead of eleven.
-    { file = "../../crates/**/Cargo.toml" },
-    { file = "../../crates/**/*.rs" },
-    { file = "../../crates/**/*.wit" },
-    { file = "../../crates/**/*.cpp" },
-    { file = "../../crates/**/*.cu" },
-    { file = "../../crates/**/*.cuh" },
-    { file = "../../crates/**/*.hpp" },
-    { file = "../../crates/**/*.h" },
-    { file = "../../crates/**/*.metal" },
-    { file = "../../crates/**/CMakeLists.txt" },
+    { file = "../../../crates/**/Cargo.toml" },
+    { file = "../../../crates/**/*.rs" },
+    { file = "../../../crates/**/*.wit" },
+    { file = "../../../crates/**/*.cpp" },
+    { file = "../../../crates/**/*.cu" },
+    { file = "../../../crates/**/*.cuh" },
+    { file = "../../../crates/**/*.hpp" },
+    { file = "../../../crates/**/*.h" },
+    { file = "../../../crates/**/*.metal" },
+    { file = "../../../crates/**/CMakeLists.txt" },
 ]

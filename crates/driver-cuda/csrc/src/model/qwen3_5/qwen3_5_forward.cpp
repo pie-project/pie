@@ -1483,6 +1483,14 @@ void full_attn_layer_body(
 
 }  // namespace
 
+bool qwen35_prefill_decode_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("PIE_QWEN35_PREFILL_DECODE");
+        return v == nullptr || v[0] != '0';
+    }();
+    return on;
+}
+
 void prepare_qwen3_5_decode_plan(
     Qwen3_5PlanState& state,
     AttentionWorkspace& attn_ws,
@@ -1548,10 +1556,7 @@ void prepare_qwen3_5_decode_plan(
     // takes and the prefill dispatch has no parameter for -- enabling it at
     // c=8 corrupted gemma-4-26B, the one model that passes there.
     // PIE_QWEN35_PREFILL_DECODE=0 reverts.
-    static const bool prefill_decode_on = [] {
-        const char* v = std::getenv("PIE_QWEN35_PREFILL_DECODE");
-        return v == nullptr || v[0] != '0';
-    }();
+    const bool prefill_decode_on = qwen35_prefill_decode_enabled();
     if (prefill_decode_on && num_requests == 1 &&
         cache.format().is_native_bf16() && !cache.hnd_layout() &&
         qo_indptr_h != nullptr) {

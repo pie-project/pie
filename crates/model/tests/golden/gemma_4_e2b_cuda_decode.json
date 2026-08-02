@@ -5278,6 +5278,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 0
+        }
+      },
+      "inputs": [
+        12
+      ],
+      "outputs": [],
+      "layer": 0
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_decode",
           "state": {
@@ -5292,6 +5305,19 @@
       "outputs": [
         13
       ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 0
+        }
+      },
+      "inputs": [
+        13
+      ],
+      "outputs": [],
       "layer": 0
     },
     {
@@ -5492,6 +5518,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 1
+        }
+      },
+      "inputs": [
+        27
+      ],
+      "outputs": [],
+      "layer": 1
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_decode",
           "state": {
@@ -5506,6 +5545,19 @@
       "outputs": [
         28
       ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 1
+        }
+      },
+      "inputs": [
+        28
+      ],
+      "outputs": [],
       "layer": 1
     },
     {
@@ -5706,6 +5758,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 2
+        }
+      },
+      "inputs": [
+        42
+      ],
+      "outputs": [],
+      "layer": 2
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_decode",
           "state": {
@@ -5720,6 +5785,19 @@
       "outputs": [
         43
       ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 2
+        }
+      },
+      "inputs": [
+        43
+      ],
+      "outputs": [],
       "layer": 2
     },
     {
@@ -5920,6 +5998,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 3
+        }
+      },
+      "inputs": [
+        57
+      ],
+      "outputs": [],
+      "layer": 3
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_decode",
           "state": {
@@ -5934,6 +6025,19 @@
       "outputs": [
         58
       ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 3
+        }
+      },
+      "inputs": [
+        58
+      ],
+      "outputs": [],
       "layer": 3
     },
     {
@@ -6129,6 +6233,35 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasLora",
+              "ops": 1
+            }
+          ],
+          "else_ops": 0
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "pie_lora_qkv_correction"
+        }
+      },
+      "inputs": [
+        72,
+        74
+      ],
+      "outputs": [],
+      "layer": 4
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_rmsnorm_no_scale_bf16"
         }
@@ -6207,6 +6340,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 4
+        }
+      },
+      "inputs": [
+        78
+      ],
+      "outputs": [],
+      "layer": 4
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_decode",
           "state": {
@@ -6221,6 +6367,19 @@
       "outputs": [
         80
       ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 4
+        }
+      },
+      "inputs": [
+        80
+      ],
+      "outputs": [],
       "layer": 4
     },
     {
@@ -6421,6 +6580,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 5
+        }
+      },
+      "inputs": [
+        94
+      ],
+      "outputs": [],
+      "layer": 5
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_decode",
           "state": {
@@ -6435,6 +6607,19 @@
       "outputs": [
         95
       ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 5
+        }
+      },
+      "inputs": [
+        95
+      ],
+      "outputs": [],
       "layer": 5
     },
     {
@@ -6635,6 +6820,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 6
+        }
+      },
+      "inputs": [
+        109
+      ],
+      "outputs": [],
+      "layer": 6
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_decode",
           "state": {
@@ -6649,6 +6847,19 @@
       "outputs": [
         110
       ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 6
+        }
+      },
+      "inputs": [
+        110
+      ],
+      "outputs": [],
       "layer": 6
     },
     {
@@ -6849,6 +7060,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 7
+        }
+      },
+      "inputs": [
+        124
+      ],
+      "outputs": [],
+      "layer": 7
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_decode",
           "state": {
@@ -6863,6 +7087,19 @@
       "outputs": [
         125
       ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 7
+        }
+      },
+      "inputs": [
+        125
+      ],
+      "outputs": [],
       "layer": 7
     },
     {
@@ -7063,6 +7300,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 8
+        }
+      },
+      "inputs": [
+        139
+      ],
+      "outputs": [],
+      "layer": 8
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_decode",
           "state": {
@@ -7077,6 +7327,19 @@
       "outputs": [
         140
       ],
+      "layer": 8
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 8
+        }
+      },
+      "inputs": [
+        140
+      ],
+      "outputs": [],
       "layer": 8
     },
     {
@@ -7272,6 +7535,35 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasLora",
+              "ops": 1
+            }
+          ],
+          "else_ops": 0
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "pie_lora_qkv_correction"
+        }
+      },
+      "inputs": [
+        154,
+        156
+      ],
+      "outputs": [],
+      "layer": 9
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_rmsnorm_no_scale_bf16"
         }
@@ -7350,6 +7642,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 9
+        }
+      },
+      "inputs": [
+        160
+      ],
+      "outputs": [],
+      "layer": 9
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_decode",
           "state": {
@@ -7364,6 +7669,19 @@
       "outputs": [
         162
       ],
+      "layer": 9
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 9
+        }
+      },
+      "inputs": [
+        162
+      ],
+      "outputs": [],
       "layer": 9
     },
     {
@@ -7564,6 +7882,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 10
+        }
+      },
+      "inputs": [
+        176
+      ],
+      "outputs": [],
+      "layer": 10
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_decode",
           "state": {
@@ -7578,6 +7909,19 @@
       "outputs": [
         177
       ],
+      "layer": 10
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 10
+        }
+      },
+      "inputs": [
+        177
+      ],
+      "outputs": [],
       "layer": 10
     },
     {
@@ -7778,6 +8122,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 11
+        }
+      },
+      "inputs": [
+        191
+      ],
+      "outputs": [],
+      "layer": 11
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_decode",
           "state": {
@@ -7792,6 +8149,19 @@
       "outputs": [
         192
       ],
+      "layer": 11
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 11
+        }
+      },
+      "inputs": [
+        192
+      ],
+      "outputs": [],
       "layer": 11
     },
     {
@@ -7992,6 +8362,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 12
+        }
+      },
+      "inputs": [
+        206
+      ],
+      "outputs": [],
+      "layer": 12
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_decode",
           "state": {
@@ -8006,6 +8389,19 @@
       "outputs": [
         207
       ],
+      "layer": 12
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 12
+        }
+      },
+      "inputs": [
+        207
+      ],
+      "outputs": [],
       "layer": 12
     },
     {
@@ -8206,6 +8602,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 13
+        }
+      },
+      "inputs": [
+        221
+      ],
+      "outputs": [],
+      "layer": 13
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_decode",
           "state": {
@@ -8220,6 +8629,19 @@
       "outputs": [
         222
       ],
+      "layer": 13
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 13
+        }
+      },
+      "inputs": [
+        222
+      ],
+      "outputs": [],
       "layer": 13
     },
     {
@@ -8415,6 +8837,35 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasLora",
+              "ops": 1
+            }
+          ],
+          "else_ops": 0
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "pie_lora_qkv_correction"
+        }
+      },
+      "inputs": [
+        236,
+        238
+      ],
+      "outputs": [],
+      "layer": 14
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_rmsnorm_no_scale_bf16"
         }
@@ -8493,6 +8944,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 14
+        }
+      },
+      "inputs": [
+        242
+      ],
+      "outputs": [],
+      "layer": 14
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_decode",
           "state": {
@@ -8507,6 +8971,19 @@
       "outputs": [
         244
       ],
+      "layer": 14
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 14
+        }
+      },
+      "inputs": [
+        244
+      ],
+      "outputs": [],
       "layer": 14
     },
     {
@@ -8702,6 +9179,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 15
+        }
+      },
+      "inputs": [
+        258
+      ],
+      "outputs": [],
+      "layer": 15
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_decode",
           "state": {
@@ -8717,6 +9207,19 @@
         259
       ],
       "layer": 13
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 15
+        }
+      },
+      "inputs": [
+        259
+      ],
+      "outputs": [],
+      "layer": 15
     },
     {
       "kind": {
@@ -8911,6 +9414,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 16
+        }
+      },
+      "inputs": [
+        273
+      ],
+      "outputs": [],
+      "layer": 16
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_decode",
           "state": {
@@ -8926,6 +9442,19 @@
         274
       ],
       "layer": 13
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 16
+        }
+      },
+      "inputs": [
+        274
+      ],
+      "outputs": [],
+      "layer": 16
     },
     {
       "kind": {
@@ -9120,6 +9649,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 17
+        }
+      },
+      "inputs": [
+        288
+      ],
+      "outputs": [],
+      "layer": 17
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_decode",
           "state": {
@@ -9135,6 +9677,19 @@
         289
       ],
       "layer": 13
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 17
+        }
+      },
+      "inputs": [
+        289
+      ],
+      "outputs": [],
+      "layer": 17
     },
     {
       "kind": {
@@ -9329,6 +9884,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 18
+        }
+      },
+      "inputs": [
+        303
+      ],
+      "outputs": [],
+      "layer": 18
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_decode",
           "state": {
@@ -9344,6 +9912,19 @@
         304
       ],
       "layer": 13
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 18
+        }
+      },
+      "inputs": [
+        304
+      ],
+      "outputs": [],
+      "layer": 18
     },
     {
       "kind": {
@@ -9550,6 +10131,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 19
+        }
+      },
+      "inputs": [
+        319
+      ],
+      "outputs": [],
+      "layer": 19
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_decode",
           "state": {
@@ -9565,6 +10159,19 @@
         320
       ],
       "layer": 14
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 19
+        }
+      },
+      "inputs": [
+        320
+      ],
+      "outputs": [],
+      "layer": 19
     },
     {
       "kind": {
@@ -9759,6 +10366,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 20
+        }
+      },
+      "inputs": [
+        334
+      ],
+      "outputs": [],
+      "layer": 20
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_decode",
           "state": {
@@ -9774,6 +10394,19 @@
         335
       ],
       "layer": 13
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 20
+        }
+      },
+      "inputs": [
+        335
+      ],
+      "outputs": [],
+      "layer": 20
     },
     {
       "kind": {
@@ -9968,6 +10601,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 21
+        }
+      },
+      "inputs": [
+        349
+      ],
+      "outputs": [],
+      "layer": 21
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_decode",
           "state": {
@@ -9983,6 +10629,19 @@
         350
       ],
       "layer": 13
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 21
+        }
+      },
+      "inputs": [
+        350
+      ],
+      "outputs": [],
+      "layer": 21
     },
     {
       "kind": {
@@ -10177,6 +10836,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 22
+        }
+      },
+      "inputs": [
+        364
+      ],
+      "outputs": [],
+      "layer": 22
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_decode",
           "state": {
@@ -10192,6 +10864,19 @@
         365
       ],
       "layer": 13
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 22
+        }
+      },
+      "inputs": [
+        365
+      ],
+      "outputs": [],
+      "layer": 22
     },
     {
       "kind": {
@@ -10386,6 +11071,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 23
+        }
+      },
+      "inputs": [
+        379
+      ],
+      "outputs": [],
+      "layer": 23
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_decode",
           "state": {
@@ -10401,6 +11099,19 @@
         380
       ],
       "layer": 13
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 23
+        }
+      },
+      "inputs": [
+        380
+      ],
+      "outputs": [],
+      "layer": 23
     },
     {
       "kind": {
@@ -10607,6 +11318,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 24
+        }
+      },
+      "inputs": [
+        395
+      ],
+      "outputs": [],
+      "layer": 24
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_decode",
           "state": {
@@ -10622,6 +11346,19 @@
         396
       ],
       "layer": 14
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 24
+        }
+      },
+      "inputs": [
+        396
+      ],
+      "outputs": [],
+      "layer": 24
     },
     {
       "kind": {
@@ -10816,6 +11553,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 25
+        }
+      },
+      "inputs": [
+        410
+      ],
+      "outputs": [],
+      "layer": 25
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_decode",
           "state": {
@@ -10831,6 +11581,19 @@
         411
       ],
       "layer": 13
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 25
+        }
+      },
+      "inputs": [
+        411
+      ],
+      "outputs": [],
+      "layer": 25
     },
     {
       "kind": {
@@ -11025,6 +11788,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 26
+        }
+      },
+      "inputs": [
+        425
+      ],
+      "outputs": [],
+      "layer": 26
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_decode",
           "state": {
@@ -11040,6 +11816,19 @@
         426
       ],
       "layer": 13
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 26
+        }
+      },
+      "inputs": [
+        426
+      ],
+      "outputs": [],
+      "layer": 26
     },
     {
       "kind": {
@@ -11234,6 +12023,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 27
+        }
+      },
+      "inputs": [
+        440
+      ],
+      "outputs": [],
+      "layer": 27
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_decode",
           "state": {
@@ -11249,6 +12051,19 @@
         441
       ],
       "layer": 13
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 27
+        }
+      },
+      "inputs": [
+        441
+      ],
+      "outputs": [],
+      "layer": 27
     },
     {
       "kind": {
@@ -11443,6 +12258,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 28
+        }
+      },
+      "inputs": [
+        455
+      ],
+      "outputs": [],
+      "layer": 28
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_decode",
           "state": {
@@ -11458,6 +12286,19 @@
         456
       ],
       "layer": 13
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 28
+        }
+      },
+      "inputs": [
+        456
+      ],
+      "outputs": [],
+      "layer": 28
     },
     {
       "kind": {
@@ -11664,6 +12505,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 29
+        }
+      },
+      "inputs": [
+        471
+      ],
+      "outputs": [],
+      "layer": 29
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_decode",
           "state": {
@@ -11679,6 +12533,19 @@
         472
       ],
       "layer": 14
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 29
+        }
+      },
+      "inputs": [
+        472
+      ],
+      "outputs": [],
+      "layer": 29
     },
     {
       "kind": {
@@ -11873,6 +12740,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 30
+        }
+      },
+      "inputs": [
+        486
+      ],
+      "outputs": [],
+      "layer": 30
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_decode",
           "state": {
@@ -11888,6 +12768,19 @@
         487
       ],
       "layer": 13
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 30
+        }
+      },
+      "inputs": [
+        487
+      ],
+      "outputs": [],
+      "layer": 30
     },
     {
       "kind": {
@@ -12082,6 +12975,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 31
+        }
+      },
+      "inputs": [
+        501
+      ],
+      "outputs": [],
+      "layer": 31
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_decode",
           "state": {
@@ -12097,6 +13003,19 @@
         502
       ],
       "layer": 13
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 31
+        }
+      },
+      "inputs": [
+        502
+      ],
+      "outputs": [],
+      "layer": 31
     },
     {
       "kind": {
@@ -12291,6 +13210,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 32
+        }
+      },
+      "inputs": [
+        516
+      ],
+      "outputs": [],
+      "layer": 32
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_decode",
           "state": {
@@ -12306,6 +13238,19 @@
         517
       ],
       "layer": 13
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 32
+        }
+      },
+      "inputs": [
+        517
+      ],
+      "outputs": [],
+      "layer": 32
     },
     {
       "kind": {
@@ -12500,6 +13445,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 33
+        }
+      },
+      "inputs": [
+        531
+      ],
+      "outputs": [],
+      "layer": 33
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_decode",
           "state": {
@@ -12515,6 +13473,19 @@
         532
       ],
       "layer": 13
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 33
+        }
+      },
+      "inputs": [
+        532
+      ],
+      "outputs": [],
+      "layer": 33
     },
     {
       "kind": {
@@ -12721,6 +13692,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 34
+        }
+      },
+      "inputs": [
+        547
+      ],
+      "outputs": [],
+      "layer": 34
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_decode",
           "state": {
@@ -12736,6 +13720,19 @@
         548
       ],
       "layer": 14
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 34
+        }
+      },
+      "inputs": [
+        548
+      ],
+      "outputs": [],
+      "layer": 34
     },
     {
       "kind": {
@@ -12936,6 +13933,379 @@
         562
       ],
       "layer": null
+    }
+  ],
+  "seams": [
+    {
+      "seam": "in"
+    },
+    {
+      "seam": "attn.q",
+      "layer": 0,
+      "op": 13
+    },
+    {
+      "seam": "attn.out",
+      "layer": 0,
+      "op": 15
+    },
+    {
+      "seam": "attn.q",
+      "layer": 1,
+      "op": 28
+    },
+    {
+      "seam": "attn.out",
+      "layer": 1,
+      "op": 30
+    },
+    {
+      "seam": "attn.q",
+      "layer": 2,
+      "op": 43
+    },
+    {
+      "seam": "attn.out",
+      "layer": 2,
+      "op": 45
+    },
+    {
+      "seam": "attn.q",
+      "layer": 3,
+      "op": 58
+    },
+    {
+      "seam": "attn.out",
+      "layer": 3,
+      "op": 60
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 4,
+      "op": 73
+    },
+    {
+      "seam": "attn.q",
+      "layer": 4,
+      "op": 80
+    },
+    {
+      "seam": "attn.out",
+      "layer": 4,
+      "op": 82
+    },
+    {
+      "seam": "attn.q",
+      "layer": 5,
+      "op": 95
+    },
+    {
+      "seam": "attn.out",
+      "layer": 5,
+      "op": 97
+    },
+    {
+      "seam": "attn.q",
+      "layer": 6,
+      "op": 110
+    },
+    {
+      "seam": "attn.out",
+      "layer": 6,
+      "op": 112
+    },
+    {
+      "seam": "attn.q",
+      "layer": 7,
+      "op": 125
+    },
+    {
+      "seam": "attn.out",
+      "layer": 7,
+      "op": 127
+    },
+    {
+      "seam": "attn.q",
+      "layer": 8,
+      "op": 140
+    },
+    {
+      "seam": "attn.out",
+      "layer": 8,
+      "op": 142
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 9,
+      "op": 155
+    },
+    {
+      "seam": "attn.q",
+      "layer": 9,
+      "op": 162
+    },
+    {
+      "seam": "attn.out",
+      "layer": 9,
+      "op": 164
+    },
+    {
+      "seam": "attn.q",
+      "layer": 10,
+      "op": 177
+    },
+    {
+      "seam": "attn.out",
+      "layer": 10,
+      "op": 179
+    },
+    {
+      "seam": "attn.q",
+      "layer": 11,
+      "op": 192
+    },
+    {
+      "seam": "attn.out",
+      "layer": 11,
+      "op": 194
+    },
+    {
+      "seam": "attn.q",
+      "layer": 12,
+      "op": 207
+    },
+    {
+      "seam": "attn.out",
+      "layer": 12,
+      "op": 209
+    },
+    {
+      "seam": "attn.q",
+      "layer": 13,
+      "op": 222
+    },
+    {
+      "seam": "attn.out",
+      "layer": 13,
+      "op": 224
+    },
+    {
+      "seam": "attn.qv",
+      "layer": 14,
+      "op": 237
+    },
+    {
+      "seam": "attn.q",
+      "layer": 14,
+      "op": 244
+    },
+    {
+      "seam": "attn.out",
+      "layer": 14,
+      "op": 246
+    },
+    {
+      "seam": "attn.q",
+      "layer": 15,
+      "op": 259
+    },
+    {
+      "seam": "attn.out",
+      "layer": 15,
+      "op": 261
+    },
+    {
+      "seam": "attn.q",
+      "layer": 16,
+      "op": 274
+    },
+    {
+      "seam": "attn.out",
+      "layer": 16,
+      "op": 276
+    },
+    {
+      "seam": "attn.q",
+      "layer": 17,
+      "op": 289
+    },
+    {
+      "seam": "attn.out",
+      "layer": 17,
+      "op": 291
+    },
+    {
+      "seam": "attn.q",
+      "layer": 18,
+      "op": 304
+    },
+    {
+      "seam": "attn.out",
+      "layer": 18,
+      "op": 306
+    },
+    {
+      "seam": "attn.q",
+      "layer": 19,
+      "op": 320
+    },
+    {
+      "seam": "attn.out",
+      "layer": 19,
+      "op": 322
+    },
+    {
+      "seam": "attn.q",
+      "layer": 20,
+      "op": 335
+    },
+    {
+      "seam": "attn.out",
+      "layer": 20,
+      "op": 337
+    },
+    {
+      "seam": "attn.q",
+      "layer": 21,
+      "op": 350
+    },
+    {
+      "seam": "attn.out",
+      "layer": 21,
+      "op": 352
+    },
+    {
+      "seam": "attn.q",
+      "layer": 22,
+      "op": 365
+    },
+    {
+      "seam": "attn.out",
+      "layer": 22,
+      "op": 367
+    },
+    {
+      "seam": "attn.q",
+      "layer": 23,
+      "op": 380
+    },
+    {
+      "seam": "attn.out",
+      "layer": 23,
+      "op": 382
+    },
+    {
+      "seam": "attn.q",
+      "layer": 24,
+      "op": 396
+    },
+    {
+      "seam": "attn.out",
+      "layer": 24,
+      "op": 398
+    },
+    {
+      "seam": "attn.q",
+      "layer": 25,
+      "op": 411
+    },
+    {
+      "seam": "attn.out",
+      "layer": 25,
+      "op": 413
+    },
+    {
+      "seam": "attn.q",
+      "layer": 26,
+      "op": 426
+    },
+    {
+      "seam": "attn.out",
+      "layer": 26,
+      "op": 428
+    },
+    {
+      "seam": "attn.q",
+      "layer": 27,
+      "op": 441
+    },
+    {
+      "seam": "attn.out",
+      "layer": 27,
+      "op": 443
+    },
+    {
+      "seam": "attn.q",
+      "layer": 28,
+      "op": 456
+    },
+    {
+      "seam": "attn.out",
+      "layer": 28,
+      "op": 458
+    },
+    {
+      "seam": "attn.q",
+      "layer": 29,
+      "op": 472
+    },
+    {
+      "seam": "attn.out",
+      "layer": 29,
+      "op": 474
+    },
+    {
+      "seam": "attn.q",
+      "layer": 30,
+      "op": 487
+    },
+    {
+      "seam": "attn.out",
+      "layer": 30,
+      "op": 489
+    },
+    {
+      "seam": "attn.q",
+      "layer": 31,
+      "op": 502
+    },
+    {
+      "seam": "attn.out",
+      "layer": 31,
+      "op": 504
+    },
+    {
+      "seam": "attn.q",
+      "layer": 32,
+      "op": 517
+    },
+    {
+      "seam": "attn.out",
+      "layer": 32,
+      "op": 519
+    },
+    {
+      "seam": "attn.q",
+      "layer": 33,
+      "op": 532
+    },
+    {
+      "seam": "attn.out",
+      "layer": 33,
+      "op": 534
+    },
+    {
+      "seam": "attn.q",
+      "layer": 34,
+      "op": 548
+    },
+    {
+      "seam": "attn.out",
+      "layer": 34,
+      "op": 550
+    },
+    {
+      "seam": "out"
     }
   ]
 }

@@ -27,7 +27,7 @@ requests` runs two requests of deliberately different lengths concurrently and
 requires the co-batched scores to equal the solo ones -- the offset half of the
 bug, which no single-request test can reach.
 
-Run from the repo root with PYTHONPATH=sdk/python-server/python.
+Run from the repo root with PYTHONPATH=sdk/server/python/python.
 """
 
 import asyncio

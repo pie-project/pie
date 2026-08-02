@@ -7,10 +7,10 @@
 // re-run the A/B battery. Decode + prefill only; the MTP service
 // classes stay on the interpreter walk.
 //
-// Emitted from: qwen3_5/l24/int4/v248320/te1/nv1/ah1024/aqh8/akvh2/ahd256/arot64/afq0/gkh16/gvh16/gkd128/gvd128/gck4/gfi0/moe0/di3584/sb1/wt0/wtm64/cm0/vs1
+// Emitted from: qwen3_5/l24/int4/v248320/te1/nv1/ah1024/aqh8/akvh2/ahd256/arot64/afq0/gkh16/gvh16/gkd128/gvd128/gck4/gfi0/moe0/di3584/sb1/wt0/wtm64/cm0/vs1/pd1
 
 constexpr const char* kQ35GeneratedDigest_qwen3_5_0_8b =
-    "qwen3_5/l24/int4/v248320/te1/nv1/ah1024/aqh8/akvh2/ahd256/arot64/afq0/gkh16/gvh16/gkd128/gvd128/gck4/gfi0/moe0/di3584/sb1/wt0/wtm64/cm0/vs1";
+    "qwen3_5/l24/int4/v248320/te1/nv1/ah1024/aqh8/akvh2/ahd256/arot64/afq0/gkh16/gvh16/gkd128/gvd128/gck4/gfi0/moe0/di3584/sb1/wt0/wtm64/cm0/vs1/pd1";
 
 inline void generated_qwen35_decode_qwen3_5_0_8b(
 const Qwen3_5Weights& w,
@@ -387,16 +387,30 @@ const StageHooks* hooks)
               qo_indptr, kv_page_indices, kv_page_indptr,
               kv_last_page_lens, N, R, stream); }
     }
-    if (decode_plan == nullptr) {
-        throw std::runtime_error(
-            "generated qwen35: no decode plan");
+    if (N <= 1) {
+        if (prefill_plan == nullptr) {
+            throw std::runtime_error(
+                "generated qwen35: no prefill plan");
+        }
+        { auto kv_view = cache.layer_view(w.layers[3].kv_layer);
+          ops::dispatch_attention_flashinfer_prefill_bf16(
+              *prefill_plan,
+              ws.q.data(), kv_view.k_bf16_pages, kv_view.v_bf16_pages,
+              ws.attn_out.data(),
+              qo_indptr, kv_page_indices, kv_page_indptr,
+              kv_last_page_lens, attn_ws, stream); }
+    } else {
+        if (decode_plan == nullptr) {
+            throw std::runtime_error(
+                "generated qwen35: no decode plan");
+        }
+        { auto kv_view = cache.layer_view(w.layers[3].kv_layer);
+          ops::dispatch_attention_flashinfer_decode(
+              *decode_plan,
+              ws.q.data(), kv_view, ws.attn_out.data(),
+              kv_page_indices, kv_page_indptr, kv_last_page_lens,
+              attn_ws, stream); }
     }
-    { auto kv_view = cache.layer_view(w.layers[3].kv_layer);
-      ops::dispatch_attention_flashinfer_decode(
-          *decode_plan,
-          ws.q.data(), kv_view, ws.attn_out.data(),
-          kv_page_indices, kv_page_indptr, kv_last_page_lens,
-          attn_ws, stream); }
     kernels::launch_sigmoid_gate_inplace_bf16(
         ws.attn_out.data(), la.fa_gate.data(), N * Hq, stream);
     if (hooks != nullptr) {
@@ -701,16 +715,30 @@ const StageHooks* hooks)
               qo_indptr, kv_page_indices, kv_page_indptr,
               kv_last_page_lens, N, R, stream); }
     }
-    if (decode_plan == nullptr) {
-        throw std::runtime_error(
-            "generated qwen35: no decode plan");
+    if (N <= 1) {
+        if (prefill_plan == nullptr) {
+            throw std::runtime_error(
+                "generated qwen35: no prefill plan");
+        }
+        { auto kv_view = cache.layer_view(w.layers[7].kv_layer);
+          ops::dispatch_attention_flashinfer_prefill_bf16(
+              *prefill_plan,
+              ws.q.data(), kv_view.k_bf16_pages, kv_view.v_bf16_pages,
+              ws.attn_out.data(),
+              qo_indptr, kv_page_indices, kv_page_indptr,
+              kv_last_page_lens, attn_ws, stream); }
+    } else {
+        if (decode_plan == nullptr) {
+            throw std::runtime_error(
+                "generated qwen35: no decode plan");
+        }
+        { auto kv_view = cache.layer_view(w.layers[7].kv_layer);
+          ops::dispatch_attention_flashinfer_decode(
+              *decode_plan,
+              ws.q.data(), kv_view, ws.attn_out.data(),
+              kv_page_indices, kv_page_indptr, kv_last_page_lens,
+              attn_ws, stream); }
     }
-    { auto kv_view = cache.layer_view(w.layers[7].kv_layer);
-      ops::dispatch_attention_flashinfer_decode(
-          *decode_plan,
-          ws.q.data(), kv_view, ws.attn_out.data(),
-          kv_page_indices, kv_page_indptr, kv_last_page_lens,
-          attn_ws, stream); }
     kernels::launch_sigmoid_gate_inplace_bf16(
         ws.attn_out.data(), la.fa_gate.data(), N * Hq, stream);
     if (hooks != nullptr) {
@@ -1015,16 +1043,30 @@ const StageHooks* hooks)
               qo_indptr, kv_page_indices, kv_page_indptr,
               kv_last_page_lens, N, R, stream); }
     }
-    if (decode_plan == nullptr) {
-        throw std::runtime_error(
-            "generated qwen35: no decode plan");
+    if (N <= 1) {
+        if (prefill_plan == nullptr) {
+            throw std::runtime_error(
+                "generated qwen35: no prefill plan");
+        }
+        { auto kv_view = cache.layer_view(w.layers[11].kv_layer);
+          ops::dispatch_attention_flashinfer_prefill_bf16(
+              *prefill_plan,
+              ws.q.data(), kv_view.k_bf16_pages, kv_view.v_bf16_pages,
+              ws.attn_out.data(),
+              qo_indptr, kv_page_indices, kv_page_indptr,
+              kv_last_page_lens, attn_ws, stream); }
+    } else {
+        if (decode_plan == nullptr) {
+            throw std::runtime_error(
+                "generated qwen35: no decode plan");
+        }
+        { auto kv_view = cache.layer_view(w.layers[11].kv_layer);
+          ops::dispatch_attention_flashinfer_decode(
+              *decode_plan,
+              ws.q.data(), kv_view, ws.attn_out.data(),
+              kv_page_indices, kv_page_indptr, kv_last_page_lens,
+              attn_ws, stream); }
     }
-    { auto kv_view = cache.layer_view(w.layers[11].kv_layer);
-      ops::dispatch_attention_flashinfer_decode(
-          *decode_plan,
-          ws.q.data(), kv_view, ws.attn_out.data(),
-          kv_page_indices, kv_page_indptr, kv_last_page_lens,
-          attn_ws, stream); }
     kernels::launch_sigmoid_gate_inplace_bf16(
         ws.attn_out.data(), la.fa_gate.data(), N * Hq, stream);
     if (hooks != nullptr) {
@@ -1329,16 +1371,30 @@ const StageHooks* hooks)
               qo_indptr, kv_page_indices, kv_page_indptr,
               kv_last_page_lens, N, R, stream); }
     }
-    if (decode_plan == nullptr) {
-        throw std::runtime_error(
-            "generated qwen35: no decode plan");
+    if (N <= 1) {
+        if (prefill_plan == nullptr) {
+            throw std::runtime_error(
+                "generated qwen35: no prefill plan");
+        }
+        { auto kv_view = cache.layer_view(w.layers[15].kv_layer);
+          ops::dispatch_attention_flashinfer_prefill_bf16(
+              *prefill_plan,
+              ws.q.data(), kv_view.k_bf16_pages, kv_view.v_bf16_pages,
+              ws.attn_out.data(),
+              qo_indptr, kv_page_indices, kv_page_indptr,
+              kv_last_page_lens, attn_ws, stream); }
+    } else {
+        if (decode_plan == nullptr) {
+            throw std::runtime_error(
+                "generated qwen35: no decode plan");
+        }
+        { auto kv_view = cache.layer_view(w.layers[15].kv_layer);
+          ops::dispatch_attention_flashinfer_decode(
+              *decode_plan,
+              ws.q.data(), kv_view, ws.attn_out.data(),
+              kv_page_indices, kv_page_indptr, kv_last_page_lens,
+              attn_ws, stream); }
     }
-    { auto kv_view = cache.layer_view(w.layers[15].kv_layer);
-      ops::dispatch_attention_flashinfer_decode(
-          *decode_plan,
-          ws.q.data(), kv_view, ws.attn_out.data(),
-          kv_page_indices, kv_page_indptr, kv_last_page_lens,
-          attn_ws, stream); }
     kernels::launch_sigmoid_gate_inplace_bf16(
         ws.attn_out.data(), la.fa_gate.data(), N * Hq, stream);
     if (hooks != nullptr) {
@@ -1643,16 +1699,30 @@ const StageHooks* hooks)
               qo_indptr, kv_page_indices, kv_page_indptr,
               kv_last_page_lens, N, R, stream); }
     }
-    if (decode_plan == nullptr) {
-        throw std::runtime_error(
-            "generated qwen35: no decode plan");
+    if (N <= 1) {
+        if (prefill_plan == nullptr) {
+            throw std::runtime_error(
+                "generated qwen35: no prefill plan");
+        }
+        { auto kv_view = cache.layer_view(w.layers[19].kv_layer);
+          ops::dispatch_attention_flashinfer_prefill_bf16(
+              *prefill_plan,
+              ws.q.data(), kv_view.k_bf16_pages, kv_view.v_bf16_pages,
+              ws.attn_out.data(),
+              qo_indptr, kv_page_indices, kv_page_indptr,
+              kv_last_page_lens, attn_ws, stream); }
+    } else {
+        if (decode_plan == nullptr) {
+            throw std::runtime_error(
+                "generated qwen35: no decode plan");
+        }
+        { auto kv_view = cache.layer_view(w.layers[19].kv_layer);
+          ops::dispatch_attention_flashinfer_decode(
+              *decode_plan,
+              ws.q.data(), kv_view, ws.attn_out.data(),
+              kv_page_indices, kv_page_indptr, kv_last_page_lens,
+              attn_ws, stream); }
     }
-    { auto kv_view = cache.layer_view(w.layers[19].kv_layer);
-      ops::dispatch_attention_flashinfer_decode(
-          *decode_plan,
-          ws.q.data(), kv_view, ws.attn_out.data(),
-          kv_page_indices, kv_page_indptr, kv_last_page_lens,
-          attn_ws, stream); }
     kernels::launch_sigmoid_gate_inplace_bf16(
         ws.attn_out.data(), la.fa_gate.data(), N * Hq, stream);
     if (hooks != nullptr) {
@@ -1957,16 +2027,30 @@ const StageHooks* hooks)
               qo_indptr, kv_page_indices, kv_page_indptr,
               kv_last_page_lens, N, R, stream); }
     }
-    if (decode_plan == nullptr) {
-        throw std::runtime_error(
-            "generated qwen35: no decode plan");
+    if (N <= 1) {
+        if (prefill_plan == nullptr) {
+            throw std::runtime_error(
+                "generated qwen35: no prefill plan");
+        }
+        { auto kv_view = cache.layer_view(w.layers[23].kv_layer);
+          ops::dispatch_attention_flashinfer_prefill_bf16(
+              *prefill_plan,
+              ws.q.data(), kv_view.k_bf16_pages, kv_view.v_bf16_pages,
+              ws.attn_out.data(),
+              qo_indptr, kv_page_indices, kv_page_indptr,
+              kv_last_page_lens, attn_ws, stream); }
+    } else {
+        if (decode_plan == nullptr) {
+            throw std::runtime_error(
+                "generated qwen35: no decode plan");
+        }
+        { auto kv_view = cache.layer_view(w.layers[23].kv_layer);
+          ops::dispatch_attention_flashinfer_decode(
+              *decode_plan,
+              ws.q.data(), kv_view, ws.attn_out.data(),
+              kv_page_indices, kv_page_indptr, kv_last_page_lens,
+              attn_ws, stream); }
     }
-    { auto kv_view = cache.layer_view(w.layers[23].kv_layer);
-      ops::dispatch_attention_flashinfer_decode(
-          *decode_plan,
-          ws.q.data(), kv_view, ws.attn_out.data(),
-          kv_page_indices, kv_page_indptr, kv_last_page_lens,
-          attn_ws, stream); }
     kernels::launch_sigmoid_gate_inplace_bf16(
         ws.attn_out.data(), la.fa_gate.data(), N * Hq, stream);
     if (hooks != nullptr) {

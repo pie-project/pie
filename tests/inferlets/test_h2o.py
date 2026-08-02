@@ -9,7 +9,7 @@ stale device memory.
 
 Then the same two enforcement questions `test_mask_enforced.py` asks of Quest.
 
-Run from the repo root with PYTHONPATH=sdk/python-server/python.
+Run from the repo root with PYTHONPATH=sdk/server/python/python.
 """
 
 import asyncio

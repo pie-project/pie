@@ -18,7 +18,7 @@ warm-up -- everything that does not scale with the number of decode steps.
 Every configuration is run `reps` times and the MINIMUM is kept: this host is
 shared, so a mean measures the neighbours, while the minimum measures the work.
 
-Run from the repo root with PYTHONPATH=sdk/python-server/python:
+Run from the repo root with PYTHONPATH=sdk/server/python/python:
 
     PIE_CUDA_KV_ENVELOPES=1 python tests/inferlets/bench_quest.py \
         --driver cuda_native --model <path>

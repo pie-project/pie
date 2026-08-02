@@ -24,6 +24,17 @@ bool qwen35_moe_force_general_path();
 
 // MoE-side workspace. Reuses Qwen3.5's la_ws for the linear-attn
 // staging tensors.
+// The route count below which the aligned leg is not worth its
+// permutation. In the header rather than the .cpp because the declared
+// arc has to ask the same question the hand body does -- a second copy of
+// the 64 would be a drift waiting to happen.
+constexpr int kQwen35MoeAlignedDecodeMinRoutes = 64;
+
+// The token count above which a non-pure-decode fire leaves the decode
+// fast path -- and with it `add_to_residual`. Here for the same reason as
+// the bound above: the declared arc asks the same question.
+constexpr int kQwen35MoeDecodeFastMaxTokens = 1024;
+
 struct Qwen3_5MoeMlpWorkspace {
     // Routing.
     DeviceBuffer<std::uint16_t> router_logits;     // [N, E] bf16

@@ -133,6 +133,10 @@ pub fn gemma4_cuda(
     );
     let hidden = facts.hidden;
     dsl::trace_named(&family, |t| {
+        // The entry boundary. A `Put` attachment lands device embeds or
+        // channel reads here, before anything reads the stream.
+        dsl::seam(t, &dsl::seam::IN, &[], None);
+
         // ── Prologue ────────────────────────────────────────────────
         // The token embedding, scaled by sqrt(hidden).
         let mut y = dsl::cuda::scalar_mul(&dsl::embed_with(t, "embed", hidden), "sqrt_hidden");
@@ -229,6 +233,12 @@ pub fn gemma4_cuda(
                         matmul(&normed, &w.v_proj),
                     )
                 };
+                // The adapter seam, and its POSITION is the point: the
+                // correction lands on the RAW projections. `v`'s norm is
+                // the next statement, so anywhere below this is already
+                // different arithmetic -- which is what
+                // `seam::check_plan` refuses.
+                dsl::seam(q.trace(), &dsl::seam::ATTN_QV, &[&q, &v], Some(l));
                 let v = dsl::cuda::rmsnorm_no_scale(&v);
                 let (q, k) = if full {
                     // Partial rope has no fused pair, so the norms are
@@ -253,6 +263,9 @@ pub fn gemma4_cuda(
             // fine. Reading the driver's own test (`d == 512`) is what
             // this states; `is_full_attn` happens to agree on E4B and is
             // not the question asked.
+            // Pre-attention observation, and where a page-mask sink
+            // lands.
+            dsl::seam(attn_in.trace(), &dsl::seam::ATTN_Q, &[&attn_in], Some(l));
             let a = match class {
                 FireClass::Decode => dsl::cuda::attention_flashinfer_decode(&attn_in, &kv),
                 FireClass::Prefill if d == 512 => {
@@ -264,6 +277,11 @@ pub fn gemma4_cuda(
                 other => unreachable!("gemma4 refuses {other:?} at trace start"),
             }
             .expect("the class states its attention");
+            // Post-attention observation. Whether the scores are actually
+            // servable is the dispatch's business -- `attention_naive_paged`
+            // above declares `lacks Scores`, and the table is where that is
+            // written down.
+            dsl::seam(a.trace(), &dsl::seam::ATTN_OUT, &[&a], Some(l));
             let attn_out = matmul(&a, &w.o_proj);
 
             // Post-attention norm, land on the stream, scale, and norm
@@ -330,8 +348,14 @@ pub fn gemma4_cuda(
         );
         let lm_head = if facts.tied_embeddings { "embed" } else { "lm_head" };
         let logits = dsl::lm_head_at(t, &normed, lm_head, facts.vocab);
-        if facts.logit_softcap > 0.0 {
-            dsl::cuda::logit_softcap(&logits, facts.vocab);
-        }
+        let logits = if facts.logit_softcap > 0.0 {
+            dsl::cuda::logit_softcap(&logits, facts.vocab)
+        } else {
+            logits
+        };
+        // The exit boundary: where sampling and host-visible emits attach.
+        // It sees the logits AFTER the softcap, because that is what a
+        // sampler would draw from.
+        dsl::seam(t, &dsl::seam::OUT, &[&logits], None);
     })
 }

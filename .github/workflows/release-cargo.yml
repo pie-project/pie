@@ -3,17 +3,16 @@ name: Release Cargo Package
 on:
   workflow_dispatch:
     inputs:
-      # `inferlet` depends on `inferlet-api` by version, so a release that
-      # bumps the WIT must publish inferlet-api FIRST — cargo rewrites the
-      # path dependency to the registry one and will not publish against a
-      # version that is not there yet.
+      # `inferlet` carries the `pie:inferlet` WIT package itself (crates/
+      # inferlet/wit, kept in the archive by `include`), so a WIT bump is
+      # released by publishing `inferlet` — there is no separate contract
+      # crate to order ahead of it. `inferlet-macros` is still independent.
       package:
         description: 'Package to release'
         required: true
         type: choice
         options:
           - pie-client (crates/client/)
-          - inferlet-api (crates/inferlet-api/)
           - inferlet (crates/inferlet/)
           - inferlet-macros (crates/inferlet-macros/)
       dry_run:
@@ -41,10 +40,6 @@ jobs:
             "pie-client (crates/client/)")
               echo "path=crates/client" >> $GITHUB_OUTPUT
               echo "name=pie-client" >> $GITHUB_OUTPUT
-              ;;
-            "inferlet-api (crates/inferlet-api/)")
-              echo "path=crates/inferlet-api" >> $GITHUB_OUTPUT
-              echo "name=inferlet-api" >> $GITHUB_OUTPUT
               ;;
             "inferlet (crates/inferlet/)")
               echo "path=crates/inferlet" >> $GITHUB_OUTPUT

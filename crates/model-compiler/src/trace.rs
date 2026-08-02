@@ -67,6 +67,39 @@ pub enum Dim {
     Requests,
     /// A load-time constant: hidden size, head count x head dim, vocab.
     Const(u32),
+    /// The MoE ALIGNED path's padded route count.
+    ///
+    /// `ceil((N·k + min(E, N·k)·(block-1)) / block) · block` — routes
+    /// bucketed by expert and each bucket padded to a whole block, so one
+    /// batched GEMM covers every expert. The padding is what makes it not
+    /// `Tokens` and not a `Const`: it grows with the fire AND with how
+    /// many experts a fire happens to touch.
+    ///
+    /// Every input but `N` is load-time (`top_k`, `experts` and the block
+    /// size the driver picks from the route count), so the extent is a
+    /// function of the fire's own token count and nothing else — which is
+    /// exactly what a symbolic dim has to be.
+    ///
+    /// This is the extent the north-star doc said "no `Dim` spells", and
+    /// it is why the aligned leg could not be stated.
+    MoeAlignedRoutes {
+        top_k: u32,
+        experts: u32,
+        block: u32,
+    },
+}
+
+impl Dim {
+    /// The aligned route count for a fire of `n` tokens.
+    ///
+    /// The driver computes the same number from `moe_aligned_block`; this
+    /// is the host-side reading, used when a lowering needs the extent to
+    /// size a rectangle.
+    pub fn moe_aligned_rows(n: u32, top_k: u32, experts: u32, block: u32) -> u32 {
+        let routes = n * top_k;
+        let padded = routes + experts.min(routes) * block.saturating_sub(1);
+        padded.div_ceil(block.max(1)) * block.max(1)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -381,6 +414,24 @@ pub enum OpKind {
     /// fold impossible. A separate op because it is a separate launch in
     /// the hand-written pass (`launch_residual_add_bf16`).
     ResidualAdd,
+    /// The WINDOW of a value along its leading dim — `x[index]`.
+    ///
+    /// Produces a value and launches NOTHING. gemma3n's AltUp is what
+    /// asked for it: `altup_predict` produces all `k` streams and the
+    /// layer body runs on ONE, which in `gemma3n.cpp` is a pointer
+    /// offset — no kernel, no copy, `predictions + active * N * H`.
+    ///
+    /// It is an OP rather than a `Val` method because every value in this
+    /// IR is an op's output, and because the thing it states is real: the
+    /// text says which window the body reads, and a reader following the
+    /// dataflow needs to see it. What it does NOT state is a launch, so
+    /// `lower` emits no rectangle for it and `Buffers` gives its value an
+    /// offset INTO the source's — which is the whole of its meaning.
+    ///
+    /// deepseek_v4's hyper-connections are rank-K too and never state
+    /// this: they mix all K streams and select none. Two rank-K schemes,
+    /// one new question.
+    Select { index: u32 },
     /// Router top-k over per-token logits: for each token row, the `k`
     /// highest-scoring experts, with softmaxed-and-renormalized routing
     /// weights. Two results: the expert indices (`[Tokens, k]` i32, marked
@@ -1466,6 +1517,31 @@ impl TraceBuilder {
             vec![x, residual],
             vec![(shape, DType::BF16)],
         )[0]
+    }
+
+    /// [`OpKind::Select`]: the window of `x` along its leading dim.
+    ///
+    /// The output shape is the input's minus that dim — computed here
+    /// rather than passed, because it is not a choice: a window of
+    /// `[k, Tokens, hidden]` at an index IS `[Tokens, hidden]`, and a
+    /// caller free to say otherwise could state a value the buffer
+    /// arithmetic would then disagree with.
+    pub fn select(&mut self, x: ValueId, index: u32) -> ValueId {
+        let shape = self.value_shape(x);
+        assert!(
+            shape.0.len() >= 2,
+            "select: a rank-{} value has no leading dim to window",
+            shape.0.len()
+        );
+        if let Dim::Const(k) = shape.0[0] {
+            assert!(
+                index < k,
+                "select: index {index} is outside the leading dim's {k}"
+            );
+        }
+        let dtype = self.values[x as usize].dtype;
+        let inner = Shape(shape.0[1..].to_vec());
+        self.push(OpKind::Select { index }, vec![x], vec![(inner, dtype)])[0]
     }
 
     pub fn lm_head(&mut self, hidden: ValueId, weight: &str, vocab: u32) -> ValueId {

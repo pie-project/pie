@@ -9,12 +9,18 @@ repository = "https://github.com/pie-project/pie"
 keywords = ["wasi", "wasm", "pie", "inferlet"]
 categories = ["wasm"]
 
+# The WIT package is part of the crate's payload, not an input the build
+# ignores: `wit_bindgen::generate!` reads `wit/` at macro-expansion time, so a
+# published .crate that lacks it does not compile. Cargo would include `wit/`
+# by default (it is not in .gitignore), but say so, because the failure mode
+# is a broken release rather than a build error here.
+include = ["src/**/*", "wit/**/*"]
+
 [dependencies]
-# The contract and the bindings generated from it. This crate holds no
-# `wit_bindgen::generate!` of its own and no `wit/` -- both live in
-# `inferlet-api`, which is what lets this crate be published without a
-# vendored copy of the WIT package beside it.
-inferlet-api = { version = "0.4.0", path = "../inferlet-api" }
+# The guest bindings are generated here, from this crate's own `wit/` -- see
+# the `generate!` site in src/lib.rs for why the WIT cannot live in a sibling
+# crate while this one is published.
+wit-bindgen = { version = "0.59.0", features = ["async-spawn"] }
 trait-variant = "0.1.2"
 inferlet-macros = { version = "0.4.0", path = "../inferlet-macros" }
 futures = "0.3.33"
